@@ -31,6 +31,10 @@ unsafe impl Sync for Cell {}
 static STATE: Cell = Cell(UnsafeCell::new(State { files: None }));
 static READY: AtomicBool = AtomicBool::new(false);
 static FILES_LOCK: LayerLock = LayerLock::raising();
+pub fn terminals_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+    process_state(|files| Ok(files.terminals_kept_by_fork(out)))
+}
+
 /// Runs `run` holding the lock of the process's files, for the guest probes.
 #[cfg(feature = "thread-probe")]
 pub fn probe_hold(run: impl FnOnce()) {
@@ -127,7 +131,8 @@ fn window() {
 
 /// Runs `run` with the transports and what `fd` names, held: outside the
 /// lock, and a close meanwhile releases the service's description once
-/// `run` is over.
+/// `run` is over. Terminal last-fd close releases the real description
+/// immediately; an armed operation retains its own service pin.
 pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -> Result<R, i32> {
     let (transport, target) =
         process_state(|files| Ok((files.transport(), files.hold(fd).map_err(crate::error)?)))?;
@@ -281,7 +286,9 @@ enum Opened {
 /// Open: the path resolved under the lock, the service's open outside it,
 /// then the descriptor under it again.
 fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
-    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY) != 0
+    if flags
+        & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY | O_NONBLOCK)
+        != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
         return Err(EINVAL);
@@ -304,24 +311,34 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
         // The names of terminals are the layer's to resolve (5f): the
         // process's session with the terminal service serves them, and no
         // request goes to the RAM files.
-        if let Some(terminal) = transport.terminal_of(path).map_err(crate::error)? {
-            if flags & O_DIRECTORY != 0 {
+        let named = match name {
+            "/dev/console" => Some((proto_tty::OPEN_CONSOLE, 0)),
+            "/dev/tty" => Some((proto_tty::OPEN_CONTROLLING, 0)),
+            "/dev/ptmx" => Some((proto_tty::OPEN_MASTER, 0)),
+            _ => name
+                .strip_prefix("/dev/pts/")
+                .and_then(|n| n.parse::<u32>().ok())
+                .map(|n| (proto_tty::OPEN_SLAVE, n)),
+        };
+        if transport.terminal().is_some()
+            && let Some((kind, number)) = named
+        {
+            if flags & O_DIRECTORY != 0 || path.trailing_slash {
                 return Err(ENOTDIR);
             }
-            // /dev/tty is the controlling terminal of the caller's
-            // session, which has to have one (ENXIO).
-            let controlling = name == "/dev/tty";
-            if controlling {
-                crate::terminal::job(transport, terminal, proto_tty::Method::Controlling, None)
-                    .map_err(|e| {
-                        if e == crate::terminal::ENOTTY {
-                            ENXIO
-                        } else {
-                            e
-                        }
-                    })?;
-            }
-            return Ok((transport, Opened::Terminal(terminal, controlling)));
+            let id = crate::terminal::open(
+                transport,
+                kind,
+                (flags & (O_ACCMODE | O_NONBLOCK)) as u32,
+                number,
+            )?;
+            return Ok((
+                transport,
+                Opened::Terminal(
+                    id,
+                    kind == proto_tty::OPEN_CONTROLLING || kind == proto_tty::OPEN_MASTER,
+                ),
+            ));
         }
         let opened = transport
             .open(name, (flags & O_ACCMODE) as u32 | directory)
@@ -346,10 +363,12 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
     {
         let _ = crate::terminal::job(transport, number, proto_tty::Method::Acquire, None);
     }
-    if inserted.is_err()
-        && let Opened::File(fd) = opened
-    {
-        let _ = transport.release(Some(fd));
+    if inserted.is_err() {
+        let target = match opened {
+            Opened::File(target) => target,
+            Opened::Terminal(id, _) => Target::Tty(id),
+        };
+        let _ = transport.release(Some(target));
     }
     inserted.map(u64::from)
 }

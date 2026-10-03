@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 2 of the protocol of the terminal service (5f; spec 2, 2, 3.4
+//! Version 3 of the protocol of the terminal service (5f; spec 2, 2, 3.4
 //! and 3.8; XBD chapter 11). The service keeps the terminals: the console
 //! (terminal CONSOLE) over the console's driver, its line discipline, its
 //! settings (`Termios`, the layout of relibc's struct termios less its
 //! line byte) and the reads and writes that wait. A request names its
-//! terminal; this version serves the console alone. Every number goes
+//! open description, including eight PTY pairs beside the console. Every number goes
 //! low byte first. Read/Write/Drain Start and Take, SetAttr, Flow and
 //! FlushQueues carry blocked u32 after terminal (0/1: applicable TTIN or
 //! TTOU is blocked or ignored by the caller thread), plus its identity in
@@ -92,7 +92,19 @@
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
+/// The side tag of an opaque open description.
+pub const MASTER: u32 = 1 << 31;
+pub const BAD_DESCRIPTION: u32 = 809;
+pub const NO_ENTRY: u32 = 810;
+/// Stat by physical terminal: body u32::MAX followed by terminal, or
+/// u32::MAX for the allocator node itself.
+pub const STAT_PATH: u32 = u32::MAX;
+pub const OPEN_CONSOLE: u32 = 0;
+pub const OPEN_CONTROLLING: u32 = 1;
+pub const OPEN_MASTER: u32 = 2;
+pub const OPEN_SLAVE: u32 = 3;
+pub const CLOCAL: u32 = 0o4000;
 
 /// The terminal of the console.
 pub const CONSOLE: u32 = 0;
@@ -296,10 +308,24 @@ pub enum Method {
     WatchTake = 26,
     WatchCancel = 27,
     Detach = 28,
+    Open = 31,
+    MasterReadStart = 32,
+    MasterReadTake = 33,
+    MasterReadCancel = 34,
+    MasterWriteStart = 35,
+    MasterWriteTake = 36,
+    MasterWriteCancel = 37,
+    Close = 38,
+    Lock = 39,
+    Number = 40,
+    Grant = 41,
+    GetFlags = 42,
+    SetFlags = 43,
+    Stat = 44,
 }
 
 impl Method {
-    pub const ALL: [Method; 25] = [
+    pub const ALL: [Method; 39] = [
         Method::ReadStart,
         Method::ReadTake,
         Method::ReadCancel,
@@ -325,6 +351,20 @@ impl Method {
         Method::WatchTake,
         Method::WatchCancel,
         Method::Detach,
+        Method::Open,
+        Method::MasterReadStart,
+        Method::MasterReadTake,
+        Method::MasterReadCancel,
+        Method::MasterWriteStart,
+        Method::MasterWriteTake,
+        Method::MasterWriteCancel,
+        Method::Close,
+        Method::Lock,
+        Method::Number,
+        Method::Grant,
+        Method::GetFlags,
+        Method::SetFlags,
+        Method::Stat,
     ];
 
     pub const fn number(self) -> u16 {
@@ -341,8 +381,92 @@ impl Method {
 }
 
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 26, 27, 28,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 26, 27, 28, 31,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
 ];
+
+/// Open a fresh description; controlling opens select the caller's exact link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Open {
+    pub kind: u32,
+    pub flags: u32,
+    pub number: u32,
+}
+impl Open {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        Method::Open.header().write(w)?;
+        w.u32(self.kind)?;
+        w.u32(self.flags)?;
+        w.u32(self.number)
+    }
+    pub fn parse(mut r: Reader<'_>) -> Result<Self, Status> {
+        let result = Self {
+            kind: r.u32()?,
+            flags: r.u32()?,
+            number: r.u32()?,
+        };
+        r.finish()?;
+        Ok(result)
+    }
+}
+
+/// All fields are u32. Terminal is physical console 0 or PTY number + 1;
+/// side is 0 slave or 1 master. Mode includes the character device kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stat {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub terminal: u32,
+    pub side: u32,
+}
+impl Stat {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        for field in [self.mode, self.uid, self.gid, self.terminal, self.side] {
+            w.u32(field)?;
+        }
+        Ok(())
+    }
+    pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
+        let result = Self {
+            mode: r.u32()?,
+            uid: r.u32()?,
+            gid: r.u32()?,
+            terminal: r.u32()?,
+            side: r.u32()?,
+        };
+        r.finish()?;
+        Ok(result)
+    }
+}
+
+/// Close, Number, Grant, GetFlags or Stat; Lock/SetFlags add one u32.
+pub fn description(
+    method: Method,
+    id: u32,
+    word: Option<u32>,
+    w: &mut Writer,
+) -> Result<(), Status> {
+    if !matches!(
+        method,
+        Method::Close
+            | Method::Number
+            | Method::Grant
+            | Method::GetFlags
+            | Method::Stat
+            | Method::Lock
+            | Method::SetFlags
+    ) || matches!(method, Method::Lock | Method::SetFlags) != word.is_some()
+    {
+        return Err(Status::BadSize);
+    }
+    method.header().write(w)?;
+    w.u32(id)?;
+    if let Some(word) = word {
+        w.u32(word)?;
+    }
+    Ok(())
+}
 
 /// A request of the controlling terminal (ACQUIRE, SET_PGRP, GET_PGRP,
 /// GET_SID, CONTROLLING): its header, the terminal and, for SET_PGRP, the
@@ -391,13 +515,29 @@ impl Read {
     /// READ_START without a key, READ_TAKE with one: BAD_SIZE for a count
     /// of 0 or past MAX_READ, or a key of 0.
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        self.write_side(w, false)
+    }
+
+    pub fn write_side(&self, w: &mut Writer, master: bool) -> Result<(), Status> {
         if !self.valid() {
             return Err(Status::BadSize);
         }
         match self.key {
-            None => Method::ReadStart.header().write(w)?,
+            None => (if master {
+                Method::MasterReadStart
+            } else {
+                Method::ReadStart
+            })
+            .header()
+            .write(w)?,
             Some(key) => {
-                Method::ReadTake.header().write(w)?;
+                (if master {
+                    Method::MasterReadTake
+                } else {
+                    Method::ReadTake
+                })
+                .header()
+                .write(w)?;
                 w.u64(key)?;
             }
         }
@@ -444,13 +584,29 @@ impl<'a> Write<'a> {
     }
 
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        self.write_side(w, false)
+    }
+
+    pub fn write_side(&self, w: &mut Writer, master: bool) -> Result<(), Status> {
         if !Write::valid(self.bytes.len(), self.key) {
             return Err(Status::BadSize);
         }
         match self.key {
-            None => Method::WriteStart.header().write(w)?,
+            None => (if master {
+                Method::MasterWriteStart
+            } else {
+                Method::WriteStart
+            })
+            .header()
+            .write(w)?,
             Some(key) => {
-                Method::WriteTake.header().write(w)?;
+                (if master {
+                    Method::MasterWriteTake
+                } else {
+                    Method::WriteTake
+                })
+                .header()
+                .write(w)?;
                 w.u64(key)?;
             }
         }
@@ -493,7 +649,11 @@ impl Cancel {
         if self.key == 0
             || !matches!(
                 method,
-                Method::ReadCancel | Method::WriteCancel | Method::DrainCancel
+                Method::ReadCancel
+                    | Method::WriteCancel
+                    | Method::DrainCancel
+                    | Method::MasterReadCancel
+                    | Method::MasterWriteCancel
             )
         {
             return Err(Status::BadSize);
@@ -677,7 +837,7 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed_and_listed() {
-        for number in 0..=25u16 {
+        for number in 0..=45u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(m) = method {

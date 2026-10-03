@@ -26,9 +26,9 @@ use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use proto_init::ServiceArgs;
 use proto_tty::{
-    BAD_TERMINAL, CONSOLE, Cancel, Control, Drain, FLOW_IN_OFF, FLOW_IN_ON, FLOW_OUT_OFF,
-    FLOW_OUT_ON, FLUSH, INVALID, MAX_READ, Method, NO_IDENTITY, OWN, PERMISSION, QUEUE_BOTH,
-    QUEUE_IN, QUEUE_OUT, Read, SetAttr, VERSION, VSTART, VSTOP, WAITERS, Write,
+    CONSOLE, Cancel, Control, Drain, FLOW_IN_OFF, FLOW_IN_ON, FLOW_OUT_OFF, FLOW_OUT_ON, FLUSH,
+    INVALID, MAX_READ, Method, NO_IDENTITY, OWN, PERMISSION, QUEUE_BOTH, QUEUE_IN, QUEUE_OUT, Read,
+    SetAttr, VERSION, VSTART, VSTOP, WAITERS, Write,
 };
 use proto_uart::{ReadKey, ReadRequest, RoomReply, WriteReply, WriteRequest};
 use proto_wire::clones::Clones;
@@ -40,6 +40,7 @@ use rt::service::{
 };
 use rt::{sys, time};
 use tty::discipline::{self, Signal, Terminal};
+use tty::endpoints::{Endpoint, Endpoints, Failure, Holds, Side, TERMINALS};
 use tty::jobs::{self, Caller, Departed, Departures, Jobs};
 use tty::{Driver, Pump, Pumped, Waiter, Waiters};
 
@@ -93,6 +94,7 @@ struct Client {
     /// Who the process of the session is, as the process service vouched
     /// for it (5f, T3).
     who: Option<Who>,
+    holding: usize,
 }
 
 /// What the process service said of a session's process: the index of
@@ -104,6 +106,9 @@ struct Who {
     pid: u32,
     generation: u64,
     loader: bool,
+    uid: u32,
+    euid: u32,
+    egid: u32,
     ctty: Option<(u32, u64)>,
 }
 
@@ -113,12 +118,68 @@ const GENERATIONS_AT: usize = 0x41_0000_0000;
 
 /// The tables of the sessions and long operations and the console's
 /// discipline, in `.bss`: too big for the stack.
+struct HoldSet {
+    label: u64,
+    holds: Holds,
+    retired: bool,
+}
+impl HoldSet {
+    const fn new() -> Self {
+        Self {
+            label: 0,
+            holds: Holds::new(),
+            retired: false,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct Pin {
+    label: u64,
+    key: u64,
+    description: u32,
+    kind: u8,
+}
+
 struct Tables {
     sessions: [Option<Session<Client, 0>>; SESSIONS],
     ops: LongOps<OPERATIONS>,
     watches: watch::Pool<OPERATIONS>,
     clones: Clones<CLONES>,
+    devices: [Device; TERMINALS],
+    endpoints: Endpoints,
+    holdsets: [HoldSet; SESSIONS],
+    pins: [Option<Pin>; OPERATIONS],
+}
+
+struct Device {
     console: Terminal,
+    readers: Waiters<WAITERS>,
+    writers: Waiters<WAITERS>,
+    drainers: Waiters<WAITERS>,
+    master_readers: Waiters<WAITERS>,
+    master_writers: Waiters<WAITERS>,
+    watchers: Waiters<WAITERS>,
+    jobs: Jobs,
+    job_generation: u64,
+    disconnect_pending: bool,
+    departed: Departures,
+}
+impl Device {
+    const fn new() -> Self {
+        Self {
+            console: Terminal::new(),
+            readers: Waiters::new(),
+            writers: Waiters::new(),
+            drainers: Waiters::new(),
+            master_readers: Waiters::new(),
+            master_writers: Waiters::new(),
+            watchers: Waiters::new(),
+            jobs: Jobs::new(),
+            job_generation: 0,
+            disconnect_pending: false,
+            departed: Departures::new(),
+        }
+    }
 }
 struct Bss(UnsafeCell<Tables>);
 // SAFETY: only the main thread reaches it, once (`main`).
@@ -128,7 +189,10 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     ops: LongOps::new(),
     watches: watch::Pool::new(),
     clones: Clones::new(),
-    console: Terminal::new(),
+    devices: [const { Device::new() }; TERMINALS],
+    endpoints: Endpoints::new(),
+    holdsets: [const { HoldSet::new() }; SESSIONS],
+    pins: [None; OPERATIONS],
 }));
 
 fn main(_: u64) -> u64 {
@@ -179,15 +243,15 @@ fn main(_: u64) -> u64 {
         clones: &mut tables.clones,
         ops: &mut tables.ops,
         watches: &mut tables.watches,
-        watchers: Waiters::new(),
         driver,
         room_given: false,
-        console: &mut tables.console,
+        devices: &mut tables.devices,
+        active: 0,
+        endpoints: &mut tables.endpoints,
+        holdsets: &mut tables.holdsets,
+        pins: &mut tables.pins,
         pump: Pump::new(),
         input: Input::Idle,
-        readers: Waiters::new(),
-        writers: Waiters::new(),
-        drainers: Waiters::new(),
         timer,
         _view: view,
         armed: None,
@@ -198,10 +262,8 @@ fn main(_: u64) -> u64 {
         preparation: if notary.is_some() { 1 } else { 3 },
         notary,
         generations: None,
-        jobs: Jobs::new(),
-
-        job_generation: 0,
-        departed: Departures::new(),
+        departure_left: 0,
+        departure_cursor: 0,
     };
     let config = Config {
         issued: 0,
@@ -240,6 +302,19 @@ enum Wait {
     Read(Option<u64>),
     Write,
     Drain,
+    MasterRead,
+    MasterWrite,
+}
+impl Wait {
+    fn number(self) -> u8 {
+        match self {
+            Self::Read(_) => 1,
+            Self::Write => 2,
+            Self::Drain => 3,
+            Self::MasterRead => 4,
+            Self::MasterWrite => 5,
+        }
+    }
 }
 
 /// Where the read of input from the driver stands.
@@ -263,18 +338,17 @@ struct Tty {
     clones: &'static mut Clones<CLONES>,
     ops: &'static mut LongOps<OPERATIONS>,
     watches: &'static mut watch::Pool<OPERATIONS>,
-    watchers: Waiters<WAITERS>,
     /// The session with the console's driver, and whether it keeps the
     /// handle of ROOM.
     driver: Handle<Channel>,
     room_given: bool,
-    console: &'static mut Terminal,
+    devices: &'static mut [Device; TERMINALS],
+    active: usize,
+    endpoints: &'static mut Endpoints,
+    holdsets: &'static mut [HoldSet; SESSIONS],
+    pins: &'static mut [Option<Pin>; OPERATIONS],
     pump: Pump,
     input: Input,
-    readers: Waiters<WAITERS>,
-    writers: Waiters<WAITERS>,
-    /// The drains (tcdrain) that wait for the output to go.
-    drainers: Waiters<WAITERS>,
     /// The timer of VTIME and the deadline it is armed for.
     timer: Handle<Timer>,
     _view: Handle<Channel>,
@@ -292,11 +366,9 @@ struct Tty {
     /// controlling terminal.
     notary: Option<Handle<Channel>>,
     generations: Option<Handle<Memory>>,
-    /// The console as a controlling terminal (5f, T3).
-    jobs: Jobs,
     preparation: u8,
-    job_generation: u64,
-    departed: Departures,
+    departure_left: usize,
+    departure_cursor: usize,
 }
 
 /// The time on the scale of timer_set.
@@ -381,6 +453,373 @@ impl Driver for Port<'_> {
 }
 
 impl Tty {
+    fn select(&mut self, terminal: usize) {
+        assert!(terminal < TERMINALS);
+        self.active = terminal;
+    }
+
+    fn endpoint_error(error: Failure) -> u32 {
+        match error {
+            Failure::BadDescription => proto_tty::BAD_DESCRIPTION,
+            Failure::Invalid => INVALID,
+            Failure::Limit | Failure::Overflow => Status::Kernel(Error::LimitReached).code(),
+            Failure::Locked => PERMISSION,
+        }
+    }
+
+    fn select_description(&mut self, s: &Session<Client, 0>, id: u32) -> Result<Endpoint, u32> {
+        let endpoint = if id == CONSOLE {
+            Endpoint {
+                terminal: 0,
+                generation: 1,
+                side: Side::Slave,
+                flags: 2,
+            }
+        } else {
+            self.endpoints
+                .resolve(&self.holdsets[s.data.holding].holds, id)
+                .map_err(Self::endpoint_error)?
+        };
+        self.select(endpoint.terminal);
+        Ok(endpoint)
+    }
+
+    fn operation(
+        &mut self,
+        s: &Session<Client, 0>,
+        id: u32,
+        key: Option<u64>,
+        kind: u8,
+    ) -> Result<Endpoint, u32> {
+        let endpoint = match key {
+            None => self.select_description(s, id)?,
+            Some(key) => {
+                let pin = self
+                    .pins
+                    .get((key as u32).wrapping_sub(1) as usize)
+                    .and_then(|pin| *pin)
+                    .filter(|pin| {
+                        pin.label == s.label()
+                            && pin.key == key
+                            && pin.description == id
+                            && pin.kind == kind
+                    })
+                    .filter(|_| self.ops.waits(s.label(), key))
+                    .ok_or(Status::Kernel(Error::BadState).code())?;
+                let endpoint = if pin.description == CONSOLE {
+                    Endpoint {
+                        terminal: 0,
+                        generation: 1,
+                        side: Side::Slave,
+                        flags: 2,
+                    }
+                } else {
+                    self.endpoints.pinned(id).map_err(Self::endpoint_error)?
+                };
+                self.select(endpoint.terminal);
+                endpoint
+            }
+        };
+        if (kind >= 4) != (endpoint.side == Side::Master) {
+            return Err(INVALID);
+        }
+        if matches!(kind, 1 | 4) && endpoint.flags & 3 == 1
+            || matches!(kind, 2 | 5) && endpoint.flags & 3 == 0
+        {
+            return Err(proto_tty::BAD_DESCRIPTION);
+        }
+        Ok(endpoint)
+    }
+
+    fn disconnect(&mut self, terminal: usize) {
+        self.select(terminal);
+        self.devices[terminal].console.flush_input();
+        self.devices[terminal].console.flush_output();
+        self.tell_readers();
+        self.tell_output();
+        self.tell_master_readers();
+        self.tell_master_writers();
+        self.devices[terminal].disconnect_pending = self.devices[terminal].job_generation != 0;
+        if self.devices[terminal].disconnect_pending {
+            self.kick();
+        }
+    }
+
+    fn disconnect_link(&mut self) {
+        let Some(notary) = self.notary.as_ref() else {
+            self.kick();
+            return;
+        };
+        let device = &self.devices[self.active];
+        let Some(sid) = device.jobs.session() else {
+            self.devices[self.active].disconnect_pending = false;
+            return;
+        };
+        let generation = device.job_generation;
+        let hup = device.console.termios().cflag & proto_tty::CLOCAL == 0;
+        let mut w = Writer::new();
+        let _ = proto_process::Method::DisconnectCtty.header().write(&mut w);
+        let _ = w.u32(self.active as u32);
+        let _ = w.u32(sid);
+        let _ = w.u64(generation);
+        let _ = w.u32(u32::from(hup));
+        let mut buffer = [0; MESSAGE_MAX];
+        if let Ok(reply) = sys::send(notary, w.as_bytes())
+            && proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() == Ok(0)
+        {
+            self.devices[self.active].disconnect_pending = false;
+            self.departure();
+        } else {
+            self.kick();
+        }
+    }
+
+    fn clear_pin(&mut self, index: usize) {
+        if let Some(pin) = self.pins[index].take() {
+            let terminal = if pin.description == CONSOLE {
+                Some(0)
+            } else {
+                self.endpoints
+                    .pinned(pin.description)
+                    .ok()
+                    .map(|e| e.terminal)
+            };
+            if let Some(terminal) = terminal {
+                let device = &mut self.devices[terminal];
+                device.readers.remove(pin.label, pin.key);
+                device.writers.remove(pin.label, pin.key);
+                device.drainers.remove(pin.label, pin.key);
+                device.master_readers.remove(pin.label, pin.key);
+                device.master_writers.remove(pin.label, pin.key);
+            }
+            if pin.description != CONSOLE {
+                let _ = self.endpoints.unpin(pin.description);
+            }
+        }
+    }
+
+    fn disconnected(&self) -> bool {
+        self.endpoints
+            .instance(self.active)
+            .is_some_and(|i| i.disconnected)
+    }
+
+    fn open(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        let request = match proto_tty::Open::parse(r.body()) {
+            Ok(request) => request,
+            Err(code) => return Answer::Status(code),
+        };
+        if request.flags & !(3 | tty::endpoints::NONBLOCK) != 0 || request.flags & 3 == 3 {
+            return status(INVALID);
+        }
+        let caller = match self.caller(s, r) {
+            Ok(caller) => caller,
+            Err(code) => return status(code),
+        };
+        let flags = request.flags & (3 | 0o4000);
+        let result = match request.kind {
+            proto_tty::OPEN_CONSOLE => self
+                .endpoints
+                .open_console(&mut self.holdsets[s.data.holding].holds, flags),
+            proto_tty::OPEN_MASTER => {
+                let result = self
+                    .endpoints
+                    .open_master(&mut self.holdsets[s.data.holding].holds, flags);
+                if let Ok(id) = result {
+                    let e = self
+                        .endpoints
+                        .resolve(&self.holdsets[s.data.holding].holds, id)
+                        .expect("fresh description");
+                    self.devices[e.terminal] = Device::new();
+                }
+                result
+            }
+            proto_tty::OPEN_SLAVE => {
+                if let Some(who) = s.data.who
+                    && who.euid != 0
+                    && let Some(instance) = self.endpoints.instance(request.number as usize + 1)
+                {
+                    let permissions = if who.euid == instance.uid {
+                        (instance.mode >> 6) & 7
+                    } else if who.egid == 0 {
+                        (instance.mode >> 3) & 7
+                    } else {
+                        instance.mode & 7
+                    };
+                    let required = match flags & 3 {
+                        0 => 4,
+                        1 => 2,
+                        _ => 6,
+                    };
+                    if permissions & required != required {
+                        return status(PERMISSION);
+                    }
+                }
+                self.endpoints.open_slave(
+                    &mut self.holdsets[s.data.holding].holds,
+                    request.number as usize,
+                    flags,
+                )
+            }
+            proto_tty::OPEN_CONTROLLING => {
+                let Some((terminal, generation)) = caller.ctty else {
+                    return status(proto_tty::NOT_CONTROLLING);
+                };
+                let Some(device) = self.devices.get(terminal as usize) else {
+                    return status(proto_tty::NOT_CONTROLLING);
+                };
+                if device.job_generation != generation || device.jobs.session() != Some(caller.sid)
+                {
+                    return status(proto_tty::NOT_CONTROLLING);
+                }
+                if terminal == 0 {
+                    self.endpoints
+                        .open_console(&mut self.holdsets[s.data.holding].holds, flags)
+                } else {
+                    self.endpoints.open_slave(
+                        &mut self.holdsets[s.data.holding].holds,
+                        terminal as usize - 1,
+                        flags,
+                    )
+                }
+            }
+            _ => return status(INVALID),
+        };
+        match result {
+            Ok(id) => {
+                let w = r.reply();
+                let _ = w.u32(0);
+                let _ = w.u32(id);
+                Answer::Reply(Outgoing::new())
+            }
+            Err(error) => status(Self::endpoint_error(error)),
+        }
+    }
+
+    fn description(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        method: Method,
+    ) -> Answer {
+        let mut body = r.body();
+        let Ok(id) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        if method == Method::Stat && id == proto_tty::STAT_PATH && body.left() == 4 {
+            let (Ok(terminal), Ok(())) = (body.u32(), body.finish()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            let info = if terminal == proto_tty::STAT_PATH {
+                proto_tty::Stat {
+                    mode: 0o20666,
+                    uid: 0,
+                    gid: 0,
+                    terminal: 0,
+                    side: 1,
+                }
+            } else {
+                let Some(instance) = self.endpoints.instance(terminal as usize) else {
+                    return status(proto_tty::NO_ENTRY);
+                };
+                proto_tty::Stat {
+                    mode: 0o20000 | instance.mode,
+                    uid: instance.uid,
+                    gid: 0,
+                    terminal,
+                    side: 0,
+                }
+            };
+            let w = r.reply();
+            let _ = w.u32(0);
+            let _ = info.write(w);
+            return Answer::Reply(Outgoing::new());
+        }
+        let word = if matches!(method, Method::Lock | Method::SetFlags) {
+            match body.u32() {
+                Ok(word) => word,
+                Err(code) => return Answer::Status(code),
+            }
+        } else {
+            0
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let endpoint = match self.select_description(s, id) {
+            Ok(e) => e,
+            Err(code) => return status(code),
+        };
+        let mut value = None;
+        let result = match method {
+            Method::Close => self
+                .endpoints
+                .close(&mut self.holdsets[s.data.holding].holds, id)
+                .map(|effect| {
+                    if let Some(effect) = effect {
+                        self.select(effect.terminal);
+                        self.devices[self.active].console.flush_input();
+                        self.tell_readers();
+                        self.tell_output();
+                    }
+                }),
+            Method::Lock if word <= 1 => {
+                self.endpoints
+                    .lock(&self.holdsets[s.data.holding].holds, id, word != 0)
+            }
+            Method::Lock => Err(Failure::Invalid),
+            Method::Number => self
+                .endpoints
+                .number(&self.holdsets[s.data.holding].holds, id)
+                .map(|number| value = Some(number)),
+            Method::Grant => {
+                if let Err(code) = self.caller(s, r) {
+                    return status(code);
+                }
+                let uid = s.data.who.map_or(0, |who| who.uid);
+                self.endpoints
+                    .grant(&self.holdsets[s.data.holding].holds, id, uid)
+            }
+            Method::GetFlags => {
+                value = Some(endpoint.flags);
+                Ok(())
+            }
+            Method::SetFlags => {
+                self.endpoints
+                    .set_flags(&self.holdsets[s.data.holding].holds, id, word)
+            }
+            Method::Stat => {
+                let i = self
+                    .endpoints
+                    .instance(endpoint.terminal)
+                    .expect("live description");
+                let info = proto_tty::Stat {
+                    mode: 0o20000 | i.mode,
+                    uid: i.uid,
+                    gid: 0,
+                    terminal: endpoint.terminal as u32,
+                    side: u32::from(endpoint.side == Side::Master),
+                };
+                let w = r.reply();
+                let _ = w.u32(0);
+                let _ = info.write(w);
+                return Answer::Reply(Outgoing::new());
+            }
+            _ => Err(Failure::Invalid),
+        };
+        match result {
+            Ok(()) => {
+                let w = r.reply();
+                let _ = w.u32(0);
+                if let Some(value) = value {
+                    let _ = w.u32(value);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            Err(error) => status(Self::endpoint_error(error)),
+        }
+    }
+
     fn tell_place(&self, label: u64) {
         if let Ok(place) = sys::handle_label(&self.channel, Rights::NOTIFY, label, self.level) {
             let _ = sys::notify(&place, 1);
@@ -453,7 +892,7 @@ impl Tty {
         };
         let mut w = Writer::new();
         let _ = proto_process::Method::TtyEvents.header().write(&mut w);
-        let _ = w.u32(CONSOLE);
+        let _ = w.u32(self.active as u32);
         let Ok(reply) = sys::send(notary, w.as_bytes()) else {
             return;
         };
@@ -462,23 +901,27 @@ impl Tty {
         if r.u32() != Ok(0) {
             return;
         }
-        let (Ok(sid), Ok(generation)) = (r.u32(), r.u64()) else {
+        let (Ok(sid), Ok(generation), Ok(disconnect)) = (r.u32(), r.u64(), r.u32()) else {
             return;
         };
         if generation == 0 {
             return;
         }
-        if self.job_generation == generation {
+        if self.devices[self.active].job_generation == generation {
             let old = Departed {
                 generation,
                 sid,
-                foreground: self.jobs.foreground(),
+                foreground: if disconnect != 0 {
+                    None
+                } else {
+                    self.devices[self.active].jobs.foreground()
+                },
             };
-            if !self.departed.keep(old) {
+            if !self.devices[self.active].departed.keep(old) {
                 return;
             }
-            self.jobs.release();
-            self.job_generation = 0;
+            self.devices[self.active].jobs.release();
+            self.devices[self.active].job_generation = 0;
         }
         self.finish_departure(generation);
     }
@@ -489,14 +932,14 @@ impl Tty {
             return;
         };
         let mut buffer = [0; MESSAGE_MAX];
-        let old = self.departed.find(generation);
+        let old = self.devices[self.active].departed.find(generation);
         if let Some(old) = old
             && let Some(group) = old.foreground
         {
             for signal in [proto_process::SIGHUP, proto_process::SIGCONT] {
                 let mut w = Writer::new();
                 let _ = proto_process::Method::TtySignal.header().write(&mut w);
-                let _ = w.u32(CONSOLE);
+                let _ = w.u32(self.active as u32);
                 let _ = w.u32(group);
                 let _ = w.u32(signal as u32);
                 let _ = w.u64(generation);
@@ -511,13 +954,19 @@ impl Tty {
         }
         let mut w = Writer::new();
         let _ = proto_process::Method::AckCtty.header().write(&mut w);
-        let _ = w.u32(CONSOLE);
+        let _ = w.u32(self.active as u32);
         let _ = w.u64(generation);
         if let Ok(reply) = sys::send(notary, w.as_bytes())
             && proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() == Ok(0)
         {
-            self.departed.forget(generation);
+            self.devices[self.active].departed.forget(generation);
+            if self.devices[self.active].job_generation == 0
+                && let Some(i) = self.endpoints.instance(self.active)
+            {
+                let _ = self.endpoints.set_link(self.active, i.generation, false);
+            }
         }
+        self.departure_left = TERMINALS;
         self.tell_place(DEPARTURES);
     }
 
@@ -547,8 +996,42 @@ impl Tty {
     /// waits armed, or else a piece of output; a step that took input
     /// leaves the output to the next.
     fn work(&mut self) {
-        if let Some((label, key, _)) = self.watches.cleanup() {
-            self.watchers.remove(label, key);
+        if let Some(slot) = self.holdsets.iter().position(|h| h.retired) {
+            if let Some(id) = self.holdsets[slot].holds.first() {
+                if let Ok(Some(effect)) = self.endpoints.close(&mut self.holdsets[slot].holds, id) {
+                    self.disconnect(effect.terminal);
+                }
+                self.kick();
+            } else {
+                self.holdsets[slot] = HoldSet::new();
+                self.kick();
+            }
+        }
+        if let Some(index) = self
+            .pins
+            .iter()
+            .position(|p| p.is_some_and(|p| !self.ops.waits(p.label, p.key)))
+        {
+            self.clear_pin(index);
+            self.kick();
+        }
+        if let Some(terminal) = self.devices.iter().position(|d| d.disconnect_pending) {
+            self.select(terminal);
+            self.disconnect_link();
+        }
+        self.select(0);
+        if let Some((label, key, id)) = self.watches.cleanup() {
+            let terminal = if id == CONSOLE {
+                Some(0)
+            } else {
+                self.endpoints.pinned(id).ok().map(|e| e.terminal)
+            };
+            if let Some(terminal) = terminal {
+                self.devices[terminal].watchers.remove(label, key);
+            }
+            if id != CONSOLE {
+                let _ = self.endpoints.unpin(id);
+            }
         }
         if self.watches.cleanup_due() {
             self.kick();
@@ -579,7 +1062,10 @@ impl Tty {
             level: self.level,
             room_given: &mut self.room_given,
         };
-        match self.pump.run(self.console, &mut port, WRITES) {
+        match self
+            .pump
+            .run(&mut self.devices[self.active].console, &mut port, WRITES)
+        {
             Ok(Pumped::More) => self.kick(),
             Ok(Pumped::Idle | Pumped::WaitsRoom) => {}
             Err(_) => {
@@ -594,13 +1080,18 @@ impl Tty {
     /// went.
     fn tell_output(&mut self) {
         self.tell_watches();
-        if self.console.writable() {
-            for w in self.writers.iter() {
+        if self.disconnected() || !self.devices[self.active].console.output().is_empty() {
+            for waiter in self.devices[self.active].master_readers.iter() {
+                self.ops.tell(waiter.label, waiter.key);
+            }
+        }
+        if self.disconnected() || self.devices[self.active].console.writable() {
+            for w in self.devices[self.active].writers.iter() {
                 self.ops.tell(w.label, w.key);
             }
         }
-        if self.console.output_len() == 0 {
-            for d in self.drainers.iter() {
+        if self.devices[self.active].console.output_len() == 0 {
+            for d in self.devices[self.active].drainers.iter() {
                 self.ops.tell(d.label, d.key);
             }
         }
@@ -684,9 +1175,12 @@ impl Tty {
                 return false;
             }
         };
-        self.console.input(&bytes[..n], now());
+        self.devices[self.active].console.input(&bytes[..n], now());
         let mut signals = [None; 3];
-        for (place, signal) in signals.iter_mut().zip(self.console.take_signals()) {
+        for (place, signal) in signals
+            .iter_mut()
+            .zip(self.devices[self.active].console.take_signals())
+        {
             *place = Some(signal);
         }
         for signal in signals.into_iter().flatten() {
@@ -695,7 +1189,7 @@ impl Tty {
                 Signal::Quit => ("SIGQUIT", SIGQUIT),
                 Signal::Suspend => ("SIGTSTP", SIGTSTP),
             };
-            match self.jobs.foreground() {
+            match self.devices[self.active].jobs.foreground() {
                 Some(group) => self.signal_group(group, number),
                 None => rt::println!("tty: {name}, no foreground process group"),
             }
@@ -709,15 +1203,45 @@ impl Tty {
     /// changed.
     fn tell_readers(&mut self) {
         self.tell_watches();
-        for reader in self.readers.iter() {
+        for reader in self.devices[self.active].readers.iter() {
             self.ops.tell(reader.label, reader.key);
         }
     }
 
+    fn readiness(&self, id: u32) -> u32 {
+        let endpoint = if id == CONSOLE {
+            Endpoint {
+                terminal: 0,
+                generation: 1,
+                side: Side::Slave,
+                flags: 2,
+            }
+        } else {
+            match self.endpoints.pinned(id) {
+                Ok(e) => e,
+                Err(_) => return watch::NVAL,
+            }
+        };
+        if self
+            .endpoints
+            .instance(endpoint.terminal)
+            .is_some_and(|i| i.disconnected)
+        {
+            return watch::READ | watch::ERR | watch::HUP;
+        }
+        let terminal = &self.devices[endpoint.terminal].console;
+        if endpoint.side == Side::Slave {
+            terminal.readiness(false)
+        } else {
+            (u32::from(!terminal.output().is_empty()) * watch::READ)
+                | (u32::from(terminal.input_room()) * watch::WRITE)
+        }
+    }
+
     fn tell_watches(&mut self) {
-        for waiter in self.watchers.iter() {
+        for waiter in self.devices[self.active].watchers.iter() {
             if let Some(set) = self.watches.get(waiter.label, waiter.key)
-                && set.ready(|_| self.console.readiness(false)).any()
+                && set.ready(|id| self.readiness(id)).any()
             {
                 self.ops.tell(waiter.label, waiter.key);
             }
@@ -726,7 +1250,11 @@ impl Tty {
 
     /// The timer of VTIME at the earliest deadline of the reads that wait.
     fn arm_timer(&mut self) {
-        let deadline = self.readers.deadline();
+        let deadline = self
+            .devices
+            .iter()
+            .filter_map(|d| d.readers.deadline())
+            .min();
         if deadline == self.armed {
             return;
         }
@@ -768,29 +1296,36 @@ impl Tty {
         r: &mut Request<'_>,
         key: Option<u64>,
         kind: Wait,
+        description: u32,
         notify: Option<Handle<Channel>>,
     ) -> Answer {
         let label = s.label();
         let reader = match kind {
             Wait::Read(deadline) => Some(deadline),
-            Wait::Write | Wait::Drain => None,
+            Wait::Write | Wait::Drain | Wait::MasterRead | Wait::MasterWrite => None,
         };
         match key {
             None => {
                 let ops = &self.ops;
-                self.watchers.retain(|label, key| ops.waits(label, key));
-                if self.readers.len()
-                    + self.writers.len()
-                    + self.drainers.len()
-                    + self.watchers.len()
+                self.devices[self.active]
+                    .watchers
+                    .retain(|label, key| ops.waits(label, key));
+                if self.devices[self.active].readers.len()
+                    + self.devices[self.active].writers.len()
+                    + self.devices[self.active].drainers.len()
+                    + self.devices[self.active].watchers.len()
+                    + self.devices[self.active].master_readers.len()
+                    + self.devices[self.active].master_writers.len()
                     >= WAITERS
                 {
                     return Answer::Status(Status::Kernel(Error::LimitReached));
                 }
                 let list = match kind {
-                    Wait::Read(_) => &mut self.readers,
-                    Wait::Write => &mut self.writers,
-                    Wait::Drain => &mut self.drainers,
+                    Wait::Read(_) => &mut self.devices[self.active].readers,
+                    Wait::Write => &mut self.devices[self.active].writers,
+                    Wait::Drain => &mut self.devices[self.active].drainers,
+                    Wait::MasterRead => &mut self.devices[self.active].master_readers,
+                    Wait::MasterWrite => &mut self.devices[self.active].master_writers,
                 };
                 if list.len() == WAITERS {
                     return Answer::Status(Status::Kernel(Error::LimitReached));
@@ -799,6 +1334,26 @@ impl Tty {
                     Ok(key) => key,
                     Err(e) => return Answer::Status(Status::Kernel(e)),
                 };
+                if description != CONSOLE
+                    && let Err(error) = self
+                        .endpoints
+                        .pin(&self.holdsets[s.data.holding].holds, description)
+                {
+                    self.ops.finish(&mut s.data.long, label, key);
+                    return status(Self::endpoint_error(error));
+                }
+                let index = (key as u32 - 1) as usize;
+                if let Some(old) = self.pins[index].take()
+                    && old.description != CONSOLE
+                {
+                    let _ = self.endpoints.unpin(old.description);
+                }
+                self.pins[index] = Some(Pin {
+                    label,
+                    key,
+                    description,
+                    kind: kind.number(),
+                });
                 list.add(Waiter {
                     label,
                     key,
@@ -818,7 +1373,7 @@ impl Tty {
                     None => self.ops.untell(label, key),
                 }
                 if let Some(deadline) = reader
-                    && let Some(waiter) = self.readers.find(label, key)
+                    && let Some(waiter) = self.devices[self.active].readers.find(label, key)
                 {
                     waiter.deadline = deadline;
                 }
@@ -833,19 +1388,44 @@ impl Tty {
         if let Some(key) = key {
             let label = s.label();
             self.ops.finish(&mut s.data.long, label, key);
-            self.readers.remove(label, key);
-            self.writers.remove(label, key);
-            self.drainers.remove(label, key);
+            self.devices[self.active].readers.remove(label, key);
+            self.devices[self.active].writers.remove(label, key);
+            self.devices[self.active].drainers.remove(label, key);
+            self.devices[self.active].master_readers.remove(label, key);
+            self.devices[self.active].master_writers.remove(label, key);
+            if let Some(pin) = self.pins[(key as u32 - 1) as usize].take()
+                && pin.description != CONSOLE
+            {
+                let _ = self.endpoints.unpin(pin.description);
+            }
             self.arm_timer();
         }
     }
 
     /// READ_START (`take` false) or READ_TAKE.
-    fn read(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
+    fn read(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        take: bool,
+        master: bool,
+    ) -> Answer {
         let read = match Read::parse(r.body(), take) {
             Ok(read) => read,
             Err(status) => return Answer::Status(status),
         };
+        let endpoint = match self.operation(s, read.terminal, read.key, if master { 4 } else { 1 })
+        {
+            Ok(endpoint) => endpoint,
+            Err(code) => return status(code),
+        };
+        if master {
+            return self.master_read(s, r, read, endpoint);
+        }
+        if self.disconnected() {
+            self.finish(s, read.key);
+            return long_answer(r, long::Reply::Ready(&[]));
+        }
         let caller = match self.caller(s, r) {
             Ok(caller) => caller,
             Err(code) => return status(code),
@@ -857,38 +1437,57 @@ impl Tty {
             Ok(notify) => notify,
             Err(answer) => return answer,
         };
-        if read.terminal != CONSOLE {
-            return status(BAD_TERMINAL);
-        }
         let at = now();
         let started = match read.key {
-            Some(key) => match self.readers.find(s.label(), key) {
+            Some(key) => match self.devices[self.active].readers.find(s.label(), key) {
                 Some(waiter) => waiter.started,
                 None => return Answer::Status(Status::Kernel(Error::BadState)),
             },
             None => at,
         };
         let mut out = [0; MAX_READ];
-        match self
+        match self.devices[self.active]
             .console
             .read(&mut out[..read.count as usize], started, at)
         {
             discipline::Read::Ready(n) => {
                 self.finish(s, read.key);
+                self.tell_master_writers();
                 long_answer(r, long::Reply::Ready(&out[..n]))
             }
             discipline::Read::Wait(deadline) => {
-                self.wait(s, r, read.key, Wait::Read(deadline), notify)
+                if endpoint.flags & tty::endpoints::NONBLOCK != 0 {
+                    status(Status::Kernel(Error::LimitReached).code())
+                } else {
+                    self.wait(s, r, read.key, Wait::Read(deadline), read.terminal, notify)
+                }
             }
         }
     }
 
     /// WRITE_START (`take` false) or WRITE_TAKE.
-    fn write(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
+    fn write(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        take: bool,
+        master: bool,
+    ) -> Answer {
         let write = match Write::parse(r.body(), take) {
             Ok(write) => write,
             Err(status) => return Answer::Status(status),
         };
+        let endpoint =
+            match self.operation(s, write.terminal, write.key, if master { 5 } else { 2 }) {
+                Ok(endpoint) => endpoint,
+                Err(code) => return status(code),
+            };
+        if master {
+            return self.master_write(s, r, write, endpoint);
+        }
+        if self.disconnected() {
+            return status(proto_tty::IO_ERROR);
+        }
         let caller = match self.caller(s, r) {
             Ok(caller) => caller,
             Err(code) => return status(code),
@@ -900,23 +1499,140 @@ impl Tty {
             Ok(notify) => notify,
             Err(answer) => return answer,
         };
-        if write.terminal != CONSOLE {
-            return status(BAD_TERMINAL);
-        }
         if let Some(key) = write.key
-            && self.writers.find(s.label(), key).is_none()
+            && self.devices[self.active]
+                .writers
+                .find(s.label(), key)
+                .is_none()
         {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         let part = &write.bytes[..write.bytes.len().min(WRITE_STEP)];
-        let n = self.console.write(part);
+        let n = self.devices[self.active].console.write(part);
         if n == 0 {
-            return self.wait(s, r, write.key, Wait::Write, notify);
+            return if endpoint.flags & tty::endpoints::NONBLOCK != 0 {
+                status(Status::Kernel(Error::LimitReached).code())
+            } else {
+                self.wait(s, r, write.key, Wait::Write, write.terminal, notify)
+            };
         }
         self.finish(s, write.key);
         // The output goes to the driver in the next step.
+        self.tell_master_readers();
         self.kick();
         long_answer(r, long::Reply::Ready(&(n as u32).to_le_bytes()))
+    }
+
+    fn master_notify(
+        &self,
+        r: &mut Request<'_>,
+        take: bool,
+    ) -> Result<Option<Handle<Channel>>, Answer> {
+        if r.handles.len() > usize::from(take) {
+            return Err(Answer::Status(Status::BadSize));
+        }
+        if take && !r.handles.is_empty() {
+            r.handles
+                .take::<Channel>(0)
+                .map(Some)
+                .map_err(|error| Answer::Status(Status::Kernel(error)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn master_read(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        read: Read,
+        endpoint: Endpoint,
+    ) -> Answer {
+        let notify = match self.master_notify(r, read.key.is_some()) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        if self.disconnected() {
+            self.finish(s, read.key);
+            return long_answer(r, long::Reply::Ready(&[]));
+        }
+        let part = self.devices[self.active].console.output();
+        let n = part.len().min(read.count as usize).min(WRITE_STEP);
+        if n != 0 {
+            let mut out = [0; WRITE_STEP];
+            out[..n].copy_from_slice(&part[..n]);
+            self.devices[self.active].console.sent(n);
+            self.finish(s, read.key);
+            self.tell_output();
+            return long_answer(r, long::Reply::Ready(&out[..n]));
+        }
+        if endpoint.flags & tty::endpoints::NONBLOCK != 0 {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        }
+        self.wait(s, r, read.key, Wait::MasterRead, read.terminal, notify)
+    }
+
+    fn master_write(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        write: Write<'_>,
+        endpoint: Endpoint,
+    ) -> Answer {
+        let notify = match self.master_notify(r, write.key.is_some()) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        if self.disconnected() {
+            return status(proto_tty::IO_ERROR);
+        }
+        let part = &write.bytes[..write.bytes.len().min(WRITE_STEP)];
+        let n = self.devices[self.active].console.input_some(part, now());
+        if n == 0 {
+            if endpoint.flags & tty::endpoints::NONBLOCK != 0 {
+                return Answer::Status(Status::Kernel(Error::LimitReached));
+            }
+            return self.wait(s, r, write.key, Wait::MasterWrite, write.terminal, notify);
+        }
+        let mut signals = [None; 3];
+        for (out, signal) in signals
+            .iter_mut()
+            .zip(self.devices[self.active].console.take_signals())
+        {
+            *out = Some(signal);
+        }
+        for signal in signals.into_iter().flatten() {
+            if let Some(group) = self.devices[self.active].jobs.foreground() {
+                let number = match signal {
+                    Signal::Interrupt => 2,
+                    Signal::Quit => 3,
+                    Signal::Suspend => 20,
+                };
+                self.signal_group(group, number);
+            }
+        }
+        self.finish(s, write.key);
+        self.tell_readers();
+        self.tell_master_readers();
+        self.tell_output();
+        long_answer(r, long::Reply::Ready(&(n as u32).to_le_bytes()))
+    }
+
+    fn tell_master_readers(&mut self) {
+        self.tell_watches();
+        if self.disconnected() || !self.devices[self.active].console.output().is_empty() {
+            for waiter in self.devices[self.active].master_readers.iter() {
+                self.ops.tell(waiter.label, waiter.key);
+            }
+        }
+    }
+    fn tell_master_writers(&mut self) {
+        self.tell_watches();
+        if self.disconnected() || self.devices[self.active].console.input_room() {
+            for waiter in self.devices[self.active].master_writers.iter() {
+                self.ops.tell(waiter.label, waiter.key);
+            }
+        }
     }
 
     /// DRAIN_START (`take` false) or DRAIN_TAKE: READY once no output is
@@ -926,6 +1642,13 @@ impl Tty {
             Ok(drain) => drain,
             Err(status) => return Answer::Status(status),
         };
+        let _endpoint = match self.operation(s, drain.terminal, drain.key, 3) {
+            Ok(endpoint) => endpoint,
+            Err(code) => return status(code),
+        };
+        if self.disconnected() {
+            return status(proto_tty::IO_ERROR);
+        }
         let caller = match self.caller(s, r) {
             Ok(caller) => caller,
             Err(code) => return status(code),
@@ -937,21 +1660,21 @@ impl Tty {
             Ok(notify) => notify,
             Err(answer) => return answer,
         };
-        if drain.terminal != CONSOLE {
-            return status(BAD_TERMINAL);
-        }
         if let Some(key) = drain.key
-            && self.drainers.find(s.label(), key).is_none()
+            && self.devices[self.active]
+                .drainers
+                .find(s.label(), key)
+                .is_none()
         {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
-        if self.console.output_len() == 0 {
+        if self.devices[self.active].console.output_len() == 0 {
             self.finish(s, drain.key);
             return long_answer(r, long::Reply::Ready(&[]));
         }
         // The output goes to the driver in the step, which tells the drain.
         self.kick();
-        self.wait(s, r, drain.key, Wait::Drain, notify)
+        self.wait(s, r, drain.key, Wait::Drain, drain.terminal, notify)
     }
 
     /// READ_CANCEL, WRITE_CANCEL or DRAIN_CANCEL: the operation goes, with
@@ -965,6 +1688,17 @@ impl Tty {
             || self.watches.get(s.label(), cancel.key).is_some()
         {
             return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        let kind = match Method::from_number(r.method()) {
+            Some(Method::ReadCancel) => 1,
+            Some(Method::WriteCancel) => 2,
+            Some(Method::DrainCancel) => 3,
+            Some(Method::MasterReadCancel) => 4,
+            Some(Method::MasterWriteCancel) => 5,
+            _ => return status(INVALID),
+        };
+        if let Err(code) = self.operation(s, cancel.terminal, Some(cancel.key), kind) {
+            return status(code);
         }
         self.finish(s, Some(cancel.key));
         long_answer(r, long::Reply::Cancelled)
@@ -983,23 +1717,36 @@ impl Tty {
             Ok(set) if r.handles.is_empty() => set,
             _ => return Answer::Status(Status::BadSize),
         };
-        if set
-            .unique()
-            .any(|item| item.description != proto_tty::CONSOLE)
-        {
-            return status(proto_tty::BAD_TERMINAL);
+        let mut terminals = [false; TERMINALS];
+        for item in set.unique() {
+            let endpoint = match self.select_description(s, item.description) {
+                Ok(e) => e,
+                Err(code) => return status(code),
+            };
+            terminals[endpoint.terminal] = true;
         }
         rt::service::step_detail(set.len as u64);
-        let ready = set.ready(|_| self.console.readiness(false));
+        let ready = set.ready(|id| self.readiness(id));
         if ready.any() {
             return Self::watch_ready(r, ready);
         }
-        let ops = &self.ops;
-        self.watchers.retain(|label, key| ops.waits(label, key));
-        if self.readers.len() + self.writers.len() + self.drainers.len() + self.watchers.len()
-            >= WAITERS
-        {
-            return Answer::Status(Status::Kernel(Error::LimitReached));
+        for (n, used) in terminals.iter().enumerate() {
+            if !used {
+                continue;
+            }
+            let ops = &self.ops;
+            let device = &mut self.devices[n];
+            device.watchers.retain(|label, key| ops.waits(label, key));
+            if device.readers.len()
+                + device.writers.len()
+                + device.drainers.len()
+                + device.master_readers.len()
+                + device.master_writers.len()
+                + device.watchers.len()
+                >= WAITERS
+            {
+                return Answer::Status(Status::Kernel(Error::LimitReached));
+            }
         }
         let label = s.label();
         let key = match self.ops.start(&mut s.data.long, label) {
@@ -1010,15 +1757,33 @@ impl Tty {
             self.ops.finish(&mut s.data.long, label, key);
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
-        if !self.watchers.add(Waiter {
-            label,
-            key,
-            started: now(),
-            deadline: None,
-        }) {
-            self.watches.remove(label, key);
-            self.ops.finish(&mut s.data.long, label, key);
-            return Answer::Status(Status::Kernel(Error::LimitReached));
+        for (index, item) in set.items[..set.len].iter().enumerate() {
+            if item.description != CONSOLE
+                && let Err(error) = self
+                    .endpoints
+                    .pin(&self.holdsets[s.data.holding].holds, item.description)
+            {
+                for previous in &set.items[..index] {
+                    if previous.description != CONSOLE {
+                        let _ = self.endpoints.unpin(previous.description);
+                    }
+                }
+                self.watches.remove(label, key);
+                self.ops.finish(&mut s.data.long, label, key);
+                return status(Self::endpoint_error(error));
+            }
+        }
+        // A Watch may reuse the operation place of an already retired I/O.
+        self.clear_pin((key as u32 - 1) as usize);
+        for (n, used) in terminals.iter().enumerate() {
+            if *used {
+                let _ = self.devices[n].watchers.add(Waiter {
+                    label,
+                    key,
+                    started: now(),
+                    deadline: None,
+                });
+            }
         }
         long_answer(r, long::Reply::Wait(key))
     }
@@ -1072,9 +1837,16 @@ impl Tty {
             }
         }
         rt::service::step_detail(set.len as u64);
-        let ready = set.ready(|_| self.console.readiness(false));
+        let ready = set.ready(|id| self.readiness(id));
         if cancel {
-            self.watchers.remove(label, key);
+            for device in self.devices.iter_mut() {
+                device.watchers.remove(label, key);
+            }
+            for item in &set.items[..set.len] {
+                if item.description != CONSOLE {
+                    let _ = self.endpoints.unpin(item.description);
+                }
+            }
             self.watches.remove(label, key);
             self.ops.finish(&mut s.data.long, label, key);
             Self::watch_ready(r, ready)
@@ -1087,46 +1859,88 @@ impl Tty {
 
     /// CLONE: a session of the service's own label for a child of the
     /// client.
-    fn clone_session(&mut self, root: u64, r: &mut Request<'_>) -> Answer {
-        if r.body().finish().is_err() || !r.handles.is_empty() {
+    fn clone_session(&mut self, s: &Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        self.new_clone(root, r)
+        let mut body = r.body();
+        let parent = if body.left() == 0 {
+            self.holdsets[s.data.holding].holds.clone()
+        } else {
+            let Ok(count) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if count as usize > tty::endpoints::HOLDS {
+                return status(INVALID);
+            }
+            let mut ids = [0; tty::endpoints::HOLDS];
+            for id in &mut ids[..count as usize] {
+                match body.u32() {
+                    Ok(word) => *id = word,
+                    Err(code) => return Answer::Status(code),
+                }
+            }
+            if body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            match self.holdsets[s.data.holding]
+                .holds
+                .selected(&ids[..count as usize])
+            {
+                Ok(holds) => holds,
+                Err(error) => return status(Self::endpoint_error(error)),
+            }
+        };
+        self.new_clone(s.data.root, &parent, r)
     }
 
-    fn new_clone(&mut self, root: u64, r: &mut Request<'_>) -> Answer {
+    fn new_clone(&mut self, root: u64, parent: &Holds, r: &mut Request<'_>) -> Answer {
         if self.clones.room_within(root, ROOT_CLONES).is_err() {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
-        self.given += 1;
-        let label = OWN | self.given;
-        let rights = Rights::SEND | Rights::TRANSFER;
-        // Below the service's own places, so that input overtakes the
-        // requests of the clones too.
+        let Some(slot) = self.holdsets.iter().position(|h| h.label == 0) else {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        };
+        let Some(given) = self.given.checked_add(1).filter(|n| *n < 1 << 62) else {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        };
+        let label = OWN | given;
         let priority = self.level.saturating_sub(1).max(1);
-        match sys::handle_label(&self.channel, rights, label, priority) {
-            Ok(session) => {
-                if r.reply().u32(0).is_err() {
-                    return Answer::Status(Status::BadSize);
-                }
-                let _ = self.clones.add_within(label, root, ROOT_CLONES);
-                Answer::Reply([session.erase()].into())
-            }
-            Err(e) => Answer::Status(Status::Kernel(e)),
-        }
+        let session = match sys::handle_label(
+            &self.channel,
+            Rights::SEND | Rights::TRANSFER,
+            label,
+            priority,
+        ) {
+            Ok(session) => session,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        let child = match self.endpoints.clone_holds(parent) {
+            Ok(child) => child,
+            Err(error) => return status(Self::endpoint_error(error)),
+        };
+        self.holdsets[slot] = HoldSet {
+            label,
+            holds: child,
+            retired: false,
+        };
+        self.given = given;
+        let _ = self.clones.add_within(label, root, ROOT_CLONES);
+        let _ = r.reply().u32(0);
+        Answer::Reply([session.erase()].into())
     }
 
     /// GET_ATTR: the settings of the terminal.
-    fn get_attr(&mut self, r: &mut Request<'_>) -> Answer {
+    fn get_attr(&mut self, s: &Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         let terminal = match body.u32().and_then(|t| body.finish().map(|()| t)) {
             Ok(terminal) => terminal,
             Err(status) => return Answer::Status(status),
         };
-        if terminal != CONSOLE {
-            return status(BAD_TERMINAL);
+        if let Err(code) = self.select_description(s, terminal) {
+            return status(code);
         }
-        let termios = *self.console.termios();
+        let termios = *self.devices[self.active].console.termios();
         let w = r.reply();
         if w.u32(0).is_err() || termios.write(w).is_err() {
             return Answer::Status(Status::BadSize);
@@ -1141,6 +1955,9 @@ impl Tty {
             Ok(control) => control,
             Err(status) => return Answer::Status(status),
         };
+        if let Err(code) = self.select_description(s, control.terminal) {
+            return status(code);
+        }
         let caller = match self.caller(s, r) {
             Ok(caller) => caller,
             Err(code) => return status(code),
@@ -1148,18 +1965,15 @@ impl Tty {
         if let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, control.blocked) {
             return status(code);
         }
-        if control.terminal != CONSOLE {
-            return status(BAD_TERMINAL);
-        }
         if !matches!(control.word, QUEUE_IN | QUEUE_OUT | QUEUE_BOTH) {
             return status(INVALID);
         }
         if control.word != QUEUE_OUT {
-            self.console.flush_input();
+            self.devices[self.active].console.flush_input();
             self.tell_readers();
         }
         if control.word != QUEUE_IN {
-            self.console.flush_output();
+            self.devices[self.active].console.flush_output();
             self.tell_output();
         }
         Answer::Status(Status::Ok)
@@ -1172,6 +1986,9 @@ impl Tty {
             Ok(control) => control,
             Err(status) => return Answer::Status(status),
         };
+        if let Err(code) = self.select_description(s, control.terminal) {
+            return status(code);
+        }
         let caller = match self.caller(s, r) {
             Ok(caller) => caller,
             Err(code) => return status(code),
@@ -1179,13 +1996,10 @@ impl Tty {
         if let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, control.blocked) {
             return status(code);
         }
-        if control.terminal != CONSOLE {
-            return status(BAD_TERMINAL);
-        }
         match control.word {
-            FLOW_OUT_OFF => self.console.set_stopped(true),
+            FLOW_OUT_OFF => self.devices[self.active].console.set_stopped(true),
             FLOW_OUT_ON => {
-                self.console.set_stopped(false);
+                self.devices[self.active].console.set_stopped(false);
                 self.kick();
             }
             FLOW_IN_OFF | FLOW_IN_ON => {
@@ -1194,8 +2008,8 @@ impl Tty {
                 } else {
                     VSTART
                 };
-                if self.console.termios().cc[index] != proto_tty::DISABLED
-                    && !self.console.send_control(index)
+                if self.devices[self.active].console.termios().cc[index] != proto_tty::DISABLED
+                    && !self.devices[self.active].console.send_control(index)
                 {
                     return Answer::Status(Status::Kernel(Error::LimitReached));
                 }
@@ -1213,6 +2027,9 @@ impl Tty {
             Ok(set) => set,
             Err(status) => return Answer::Status(status),
         };
+        if let Err(code) = self.select_description(s, set.terminal) {
+            return status(code);
+        }
         let caller = match self.caller(s, r) {
             Ok(caller) => caller,
             Err(code) => return status(code),
@@ -1220,13 +2037,12 @@ impl Tty {
         if let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, set.blocked) {
             return status(code);
         }
-        if set.terminal != CONSOLE {
-            return status(BAD_TERMINAL);
-        }
         if set.action > FLUSH {
             return status(INVALID);
         }
-        self.console.set_termios(set.termios, set.action == FLUSH);
+        self.devices[self.active]
+            .console
+            .set_termios(set.termios, set.action == FLUSH);
         self.tell_readers();
         Answer::Status(Status::Ok)
     }
@@ -1239,7 +2055,7 @@ const SIGTSTP: u32 = 20;
 #[cfg(all(feature = "trust-probe", not(feature = "steps")))]
 const PROBE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28,
+    27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
 ];
 
 impl Tty {
@@ -1249,15 +2065,15 @@ impl Tty {
         let (Ok(target), Ok(())) = (body.u32(), body.finish()) else {
             return Answer::Status(Status::BadSize);
         };
-        let sid = self.jobs.session().unwrap_or(0);
-        let generation = self.job_generation;
+        let sid = self.devices[self.active].jobs.session().unwrap_or(0);
+        let generation = self.devices[self.active].job_generation;
         let Some(notary) = self.notary() else {
             return status(NO_IDENTITY);
         };
         let mut w = Writer::new();
         if r.method() == 21 {
             let _ = proto_process::Method::TtySignal.header().write(&mut w);
-            let _ = w.u32(CONSOLE);
+            let _ = w.u32(self.active as u32);
             let _ = w.u32(target);
             let _ = w.u32(28);
             let _ = w.u64(generation);
@@ -1304,7 +2120,7 @@ impl Tty {
     /// identity the request brought, once and again when the record's
     /// generation moved; its group and session come from the page.
     fn caller(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Result<Caller, u32> {
-        if self.notary().is_none() && self.job_generation == 0 {
+        if self.notary().is_none() && self.devices[self.active].job_generation == 0 {
             return Ok(Caller {
                 pid: 0,
                 pgid: 0,
@@ -1337,6 +2153,9 @@ impl Tty {
                     pid: said.pid,
                     generation: said.generation,
                     loader: said.loader.is_some(),
+                    uid: said.credentials.uid,
+                    euid: said.credentials.euid,
+                    egid: said.credentials.egid,
                     ctty: said.ctty,
                 }
             }
@@ -1379,14 +2198,19 @@ impl Tty {
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        if terminal != CONSOLE {
-            return status(BAD_TERMINAL);
+        if let Err(code) = self.select_description(s, terminal) {
+            return status(code);
+        }
+        if terminal & proto_tty::MASTER != 0 || self.disconnected() {
+            return status(proto_tty::NOT_CONTROLLING);
         }
         let caller = match self.caller(s, r) {
             Ok(caller) => caller,
             Err(code) => return status(code),
         };
-        if method != Method::Acquire && caller.ctty != Some((CONSOLE, self.job_generation)) {
+        if method != Method::Acquire
+            && caller.ctty != Some((self.active as u32, self.devices[self.active].job_generation))
+        {
             return status(proto_tty::NOT_CONTROLLING);
         }
         let result = match method {
@@ -1406,9 +2230,9 @@ impl Tty {
                         sid,
                     )
                 };
-                let mut jobs = self.jobs;
+                let mut jobs = self.devices[self.active].jobs;
                 let set = jobs.set_foreground(caller, group, in_session);
-                self.jobs = jobs;
+                self.devices[self.active].jobs = jobs;
                 #[cfg(feature = "steps")]
                 rt::println!(
                     "tty group scan: group {group} {} ticks code {}",
@@ -1417,9 +2241,15 @@ impl Tty {
                 );
                 set.map(|()| None)
             }
-            Method::GetPgrp => self.jobs.get_foreground(caller).map(Some),
-            Method::GetSid => self.jobs.get_session(caller).map(Some),
-            _ => self.jobs.controlling(caller).map(|()| None),
+            Method::GetPgrp => self.devices[self.active]
+                .jobs
+                .get_foreground(caller)
+                .map(Some),
+            Method::GetSid => self.devices[self.active].jobs.get_session(caller).map(Some),
+            _ => self.devices[self.active]
+                .jobs
+                .controlling(caller)
+                .map(|()| None),
         };
         match result {
             Ok(None) => Answer::Status(Status::Ok),
@@ -1435,17 +2265,18 @@ impl Tty {
     }
 
     fn detach(&mut self, caller: Caller) -> Result<(), u32> {
-        if caller.ctty != Some((CONSOLE, self.job_generation)) {
+        if caller.ctty != Some((self.active as u32, self.devices[self.active].job_generation)) {
             return Err(proto_tty::NOT_CONTROLLING);
         }
-        let generation = self.job_generation;
+        let generation = self.devices[self.active].job_generation;
+        let terminal = self.active as u32;
         let notary = self.notary().ok_or(NO_IDENTITY)?;
         let mut w = Writer::new();
         proto_process::Method::DetachCtty
             .header()
             .write(&mut w)
             .map_err(|_| PERMISSION)?;
-        w.u32(CONSOLE)
+        w.u32(terminal)
             .and_then(|()| w.u32(caller.pid))
             .and_then(|()| w.u64(generation))
             .map_err(|_| PERMISSION)?;
@@ -1455,15 +2286,15 @@ impl Tty {
             return Err(PERMISSION);
         }
         if caller.pid == caller.sid {
-            if !self.departed.keep(Departed {
+            if !self.devices[self.active].departed.keep(Departed {
                 generation,
                 sid: caller.sid,
-                foreground: self.jobs.foreground(),
+                foreground: self.devices[self.active].jobs.foreground(),
             }) {
                 return Err(PERMISSION);
             }
-            self.jobs.release();
-            self.job_generation = 0;
+            self.devices[self.active].jobs.release();
+            self.devices[self.active].job_generation = 0;
             self.finish_departure(generation);
         }
         Ok(())
@@ -1472,15 +2303,18 @@ impl Tty {
     /// ACQUIRE: the process service gives the console to the caller's
     /// session (SetCtty), unless the session has it already.
     fn acquire(&mut self, caller: Caller) -> Result<(), u32> {
-        if !self.jobs.may_acquire(caller)? && caller.ctty == Some((CONSOLE, self.job_generation)) {
+        if !self.devices[self.active].jobs.may_acquire(caller)?
+            && caller.ctty == Some((self.active as u32, self.devices[self.active].job_generation))
+        {
             return Ok(());
         }
+        let terminal = self.active as u32;
         let notary = self.notary().ok_or(PERMISSION)?;
         let mut w = Writer::new();
         let written = proto_process::Method::SetCtty
             .header()
             .write(&mut w)
-            .and_then(|()| w.u32(CONSOLE))
+            .and_then(|()| w.u32(terminal))
             .and_then(|()| w.u32(caller.sid));
         if written.is_err() {
             return Err(PERMISSION);
@@ -1492,27 +2326,35 @@ impl Tty {
             return Err(PERMISSION);
         }
         let generation = r.u64().map_err(|_| PERMISSION)?;
-        if self.job_generation != 0
-            && !self.departed.keep(Departed {
-                generation: self.job_generation,
-                sid: self.jobs.session().unwrap_or(0),
-                foreground: self.jobs.foreground(),
+        if self.devices[self.active].job_generation != 0
+            && !self.devices[self.active].departed.keep(Departed {
+                generation: self.devices[self.active].job_generation,
+                sid: self.devices[self.active].jobs.session().unwrap_or(0),
+                foreground: self.devices[self.active].jobs.foreground(),
             })
         {
             return Err(PERMISSION);
         }
-        self.job_generation = generation;
-        self.jobs.acquired(caller);
+        self.devices[self.active].job_generation = generation;
+        self.devices[self.active].jobs.acquired(caller);
+        let instance = self
+            .endpoints
+            .instance(self.active)
+            .expect("controlling instance")
+            .generation;
+        self.endpoints
+            .set_link(self.active, instance, true)
+            .map_err(Self::endpoint_error)?;
         Ok(())
     }
 
     /// Recheck the current foreground immediately before an actual effect.
     fn background(&mut self, caller: Caller, kind: u32, blocked: u32) -> Result<(), u32> {
-        if caller.ctty != Some((CONSOLE, self.job_generation))
-            || self.jobs.session() != Some(caller.sid)
-            || self.jobs.foreground() == Some(caller.pgid)
+        if caller.ctty != Some((self.active as u32, self.devices[self.active].job_generation))
+            || self.devices[self.active].jobs.session() != Some(caller.sid)
+            || self.devices[self.active].jobs.foreground() == Some(caller.pgid)
             || kind == proto_tty::WRITE_ACCESS
-                && self.console.termios().lflag & proto_tty::TOSTOP == 0
+                && self.devices[self.active].console.termios().lflag & proto_tty::TOSTOP == 0
         {
             return Ok(());
         }
@@ -1533,10 +2375,10 @@ impl Tty {
         };
         let mut w = Writer::new();
         let _ = proto_process::Method::TtySignal.header().write(&mut w);
-        let _ = w.u32(CONSOLE);
+        let _ = w.u32(self.active as u32);
         let _ = w.u32(caller.pgid);
         let _ = w.u32(signal as u32);
-        let _ = w.u64(self.job_generation);
+        let _ = w.u64(self.devices[self.active].job_generation);
         let Ok(reply) = sys::send(notary, w.as_bytes()) else {
             return Err(proto_tty::IO_ERROR);
         };
@@ -1552,7 +2394,8 @@ impl Tty {
     /// (TtySignal) and answers at the walk's end. A group of a session
     /// the console is no longer the controlling terminal of gets none.
     fn signal_group(&mut self, group: u32, number: u32) {
-        let generation = self.job_generation;
+        let generation = self.devices[self.active].job_generation;
+        let terminal = self.active as u32;
         let Some(notary) = self.notary() else {
             return;
         };
@@ -1560,7 +2403,7 @@ impl Tty {
         let written = proto_process::Method::TtySignal
             .header()
             .write(&mut w)
-            .and_then(|()| w.u32(CONSOLE))
+            .and_then(|()| w.u32(terminal))
             .and_then(|()| w.u32(group))
             .and_then(|()| w.u32(number))
             .and_then(|()| w.u64(generation));
@@ -1578,6 +2421,23 @@ impl Tty {
     }
 }
 
+impl Tty {
+    fn abandon(&mut self, s: &mut Session<Client, 0>) {
+        let label = s.label();
+        self.watches.retire(label);
+        self.ops.gone(&mut s.data.long);
+        for device in self.devices.iter_mut() {
+            device.readers.remove_all(label);
+            device.writers.remove_all(label);
+            device.drainers.remove_all(label);
+            device.master_readers.remove_all(label);
+            device.master_writers.remove_all(label);
+        }
+        self.arm_timer();
+        self.kick();
+    }
+}
+
 impl Service<0> for Tty {
     const VERSION: u16 = VERSION;
     const METHODS: &'static [u16] = {
@@ -1585,7 +2445,7 @@ impl Service<0> for Tty {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 30,
+                24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
             ]
         }
         #[cfg(all(feature = "trust-probe", not(feature = "steps")))]
@@ -1596,7 +2456,7 @@ impl Service<0> for Tty {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 26,
-                27, 28, 30,
+                27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
             ]
         }
         #[cfg(all(not(feature = "trust-probe"), not(feature = "steps")))]
@@ -1607,6 +2467,7 @@ impl Service<0> for Tty {
     type Data = Client;
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        self.select(0);
         self.due();
         #[cfg(feature = "steps")]
         if r.method() == 30 {
@@ -1618,24 +2479,55 @@ impl Service<0> for Tty {
         }
         if s.data.root == 0 {
             let label = r.label();
+            let Some(holding) = self
+                .holdsets
+                .iter()
+                .position(|h| h.label == label)
+                .or_else(|| self.holdsets.iter().position(|h| h.label == 0))
+            else {
+                return Answer::Status(Status::Kernel(Error::LimitReached));
+            };
+            if self.holdsets[holding].retired {
+                return Answer::Status(Status::Kernel(Error::BadState));
+            }
+            self.holdsets[holding].label = label;
+            s.data.holding = holding;
             s.data.root = self.clones.client_of(label).unwrap_or(label);
         }
         match Method::from_number(r.method()) {
+            Some(Method::Open) => self.open(s, r),
+            Some(
+                m @ (Method::Close
+                | Method::Lock
+                | Method::Number
+                | Method::Grant
+                | Method::GetFlags
+                | Method::SetFlags
+                | Method::Stat),
+            ) => self.description(s, r, m),
+            Some(Method::MasterReadStart) => self.read(s, r, false, true),
+            Some(Method::MasterReadTake) => self.read(s, r, true, true),
+            Some(Method::MasterWriteStart) => self.write(s, r, false, true),
+            Some(Method::MasterWriteTake) => self.write(s, r, true, true),
             Some(Method::WatchStart) => self.watch_start(s, r),
             Some(Method::WatchTake) => self.watch_keyed(s, r, false),
             Some(Method::WatchCancel) => self.watch_keyed(s, r, true),
-            Some(Method::ReadStart) => self.read(s, r, false),
-            Some(Method::ReadTake) => self.read(s, r, true),
-            Some(Method::WriteStart) => self.write(s, r, false),
-            Some(Method::WriteTake) => self.write(s, r, true),
+            Some(Method::ReadStart) => self.read(s, r, false, false),
+            Some(Method::ReadTake) => self.read(s, r, true, false),
+            Some(Method::WriteStart) => self.write(s, r, false, false),
+            Some(Method::WriteTake) => self.write(s, r, true, false),
             Some(Method::DrainStart) => self.drain(s, r, false),
             Some(Method::DrainTake) => self.drain(s, r, true),
             Some(Method::FlushQueues) => self.flush_queues(s, r),
             Some(Method::Flow) => self.flow(s, r),
-            Some(Method::ReadCancel | Method::WriteCancel | Method::DrainCancel) => {
-                self.cancel(s, r)
-            }
-            Some(Method::Clone) => self.clone_session(s.data.root, r),
+            Some(
+                Method::ReadCancel
+                | Method::WriteCancel
+                | Method::DrainCancel
+                | Method::MasterReadCancel
+                | Method::MasterWriteCancel,
+            ) => self.cancel(s, r),
+            Some(Method::Clone) => self.clone_session(s, r),
             Some(Method::VerifySession) => {
                 if r.body().finish().is_err() || r.handles.len() != 1 {
                     return Answer::Status(Status::BadSize);
@@ -1656,10 +2548,11 @@ impl Service<0> for Tty {
                     // The counterfeit endpoint receives no request or
                     // identity. Return an ordinary unique trusted clone.
                     drop(offered);
-                    self.new_clone(s.data.root, r)
+                    let parent = self.holdsets[s.data.holding].holds.clone();
+                    self.new_clone(s.data.root, &parent, r)
                 }
             }
-            Some(Method::GetAttr) => self.get_attr(r),
+            Some(Method::GetAttr) => self.get_attr(s, r),
             Some(Method::SetAttr) => self.set_attr(s, r),
             Some(
                 m @ (Method::Acquire
@@ -1673,39 +2566,47 @@ impl Service<0> for Tty {
                 if r.body().finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                self.gone(s);
+                self.abandon(s);
                 Answer::Status(Status::Ok)
             }
             None => Answer::Status(Status::UnknownMethod),
         }
     }
 
-    /// The client of `s` went, or abandoned its operations: they go.
     fn gone(&mut self, s: &mut Session<Client, 0>) {
-        let label = s.label();
-        self.watches.retire(label);
-        if self.watches.cleanup_due() {
-            self.kick();
+        self.abandon(s);
+        if let Some(holding) = self.holdsets.iter_mut().find(|h| h.label == s.label()) {
+            holding.retired = true;
         }
-        self.ops.gone(&mut s.data.long);
-        self.readers.remove_all(label);
-        self.writers.remove_all(label);
-        self.drainers.remove_all(label);
-        self.arm_timer();
+        self.kick();
     }
 
-    /// The last copy of a session CLONE gave went.
     fn closed(&mut self, label: u64) {
         self.clones.gone(label);
+        if let Some(holding) = self.holdsets.iter_mut().find(|h| h.label == label) {
+            holding.retired = true;
+        }
+        self.kick();
     }
 
     /// The driver's input (DRIVER_IN) and room (DRIVER_ROOM), the step of
     /// the work left (STEP), and the timer of VTIME.
     fn notification(&mut self, n: Notice) {
+        self.select(0);
         match (n.source, n.label) {
             (Source::Session, DEPARTURES) => {
                 rt::service::step_own();
+                if self.departure_left == 0 {
+                    self.departure_left = TERMINALS;
+                }
+                let terminal = self.departure_cursor;
+                self.departure_cursor = (terminal + 1) % TERMINALS;
+                self.departure_left -= 1;
+                self.select(terminal);
                 self.departure();
+                if self.departure_left != 0 {
+                    self.tell_place(DEPARTURES);
+                }
             }
             (Source::Session, DRIVER_IN) => {
                 rt::service::step_own();
@@ -1725,7 +2626,9 @@ impl Service<0> for Tty {
                 rt::service::step_own();
                 self.armed = None;
                 let ops = &mut *self.ops;
-                self.readers.expire(now(), |w| ops.tell(w.label, w.key));
+                for device in self.devices.iter_mut() {
+                    device.readers.expire(now(), |w| ops.tell(w.label, w.key));
+                }
                 self.arm_timer();
             }
             _ => self.due(),

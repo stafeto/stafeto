@@ -469,6 +469,8 @@ const TCXONC: c_ulong = 0x540A;
 const TCFLSH: c_ulong = 0x540B;
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCNOTTY: c_ulong = 0x5422;
+const TIOCGPTN: c_ulong = 0x80045430;
+const TIOCSPTLCK: c_ulong = 0x40045431;
 const TIOCGPGRP: c_ulong = 0x540F;
 const TIOCSPGRP: c_ulong = 0x5410;
 const TIOCGSID: c_ulong = 0x5429;
@@ -547,6 +549,33 @@ fn terminal_ioctl(
             unsafe { argument.cast::<i32>().write(number as i32) };
             Ok(0)
         }
+        TIOCGPTN => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            let value =
+                terminal::description(transport, terminal, proto_tty::Method::Number, None)?;
+            // SAFETY: the caller supplies writable storage for the number.
+            unsafe { argument.cast::<u32>().write(value) };
+            Ok(0)
+        }
+        TIOCSPTLCK => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            // SAFETY: the caller supplies readable storage for the lock flag.
+            let value = unsafe { argument.cast::<i32>().read() };
+            if !matches!(value, 0 | 1) {
+                return Err(EINVAL);
+            }
+            terminal::description(
+                transport,
+                terminal,
+                proto_tty::Method::Lock,
+                Some(value as u32),
+            )
+            .map(|_| 0)
+        }
         TIOCNOTTY => terminal::job(transport, terminal, proto_tty::Method::Detach, None).map(|_| 0),
         TIOCSCTTY => {
             terminal::job(transport, terminal, proto_tty::Method::Acquire, None).map(|_| 0)
@@ -601,6 +630,21 @@ pub unsafe extern "C" fn stafeto_ioctl(
     result.unwrap_or_else(|errno| -errno)
 }
 
+/// Validate a PTY master and set the slave owner and mode through Grant.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_grantpt(fd: c_int) -> c_int {
+    call(|| {
+        posix_abi::shared::held(number(fd)?, |transport, target| {
+            let Target::Tty(id) = target else {
+                return Err(EINVAL);
+            };
+            posix_abi::terminal::description(transport, id, proto_tty::Method::Grant, None)
+                .map(|_| 0)
+        })
+    })
+    .unwrap_or_else(|errno| -errno)
+}
+
 /// ttyname_r: the name of the terminal `fd` is, NUL-terminated, into the
 /// `len` bytes at `buf`: its length without the NUL; ENOTTY for another
 /// kind of descriptor, ERANGE when the name and its NUL do not fit.
@@ -609,23 +653,39 @@ pub unsafe extern "C" fn stafeto_ioctl(
 /// `buf` is writable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_ttyname(fd: c_int, buf: *mut u8, len: usize) -> isize {
-    let name = number(fd).and_then(|fd| {
+    let mut name = [0u8; 20];
+    let result = number(fd).and_then(|fd| {
         posix_abi::shared::held(fd, |transport, target| {
-            transport
-                .terminal_number(target)
-                .and_then(posix_fs::terminal_path)
-                .ok_or(ENOTTY)
+            let id = transport.terminal_number(target).ok_or(ENOTTY)?;
+            let info = posix_abi::terminal::stat(transport, id)?;
+            let text = if info.side != 0 {
+                b"/dev/ptmx".as_slice()
+            } else if info.terminal == 0 {
+                b"/dev/console".as_slice()
+            } else {
+                b"/dev/pts/".as_slice()
+            };
+            name[..text.len()].copy_from_slice(text);
+            if info.side == 0 && info.terminal != 0 {
+                if info.terminal > 8 {
+                    return Err(ENOTTY);
+                }
+                name[text.len()] = b'0' + (info.terminal - 1) as u8;
+                Ok(text.len() + 1)
+            } else {
+                Ok(text.len())
+            }
         })
     });
-    match name {
+    match result {
         Err(errno) => -(errno as isize),
-        Ok(name) if buf.is_null() || len <= name.len() => -(posix_abi::constants::ERANGE as isize),
-        Ok(name) => {
-            // SAFETY: the caller's promise, and the name and its NUL fit.
-            let out = unsafe { core::slice::from_raw_parts_mut(buf, name.len() + 1) };
-            out[..name.len()].copy_from_slice(name.as_bytes());
-            out[name.len()] = 0;
-            name.len() as isize
+        Ok(n) if buf.is_null() || len <= n => -(posix_abi::constants::ERANGE as isize),
+        Ok(n) => {
+            // SAFETY: the caller provides writable storage and the name fits.
+            let out = unsafe { core::slice::from_raw_parts_mut(buf, n + 1) };
+            out[..n].copy_from_slice(&name[..n]);
+            out[n] = 0;
+            n as isize
         }
     }
 }

@@ -633,7 +633,10 @@ fn sessions() -> Result<Sessions, i32> {
         }
         if let Some(terminal) = crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))?
         {
-            out.terminal = crate::terminal::clone(terminal)?.into_raw().0;
+            let count = crate::shared::terminals_kept_by_fork(&mut ends)?;
+            out.terminal = crate::terminal::clone_kept(terminal, Some(&ends[..count]))?
+                .into_raw()
+                .0;
         }
         if let Some(clone) = entropy_clone() {
             out.entropy = clone.into_raw().0;

@@ -501,7 +501,8 @@ pub const TTY: Record = Record {
     program: "tty",
     priority: 50,
     ceiling: 50,
-    quota: 64 * PAGE,
+    // PT_LOAD 84 pages + stack 8 + generations 1; reserve 35 pages.
+    quota: 128 * PAGE,
     handle_limit: 192,
     restart: Restart::Never,
     connects: &["uart"],

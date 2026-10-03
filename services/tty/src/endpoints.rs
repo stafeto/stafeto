@@ -9,7 +9,7 @@ pub const PTYS: usize = 8;
 pub const TERMINALS: usize = PTYS + 1;
 pub const DESCRIPTIONS: usize = 256;
 pub const HOLDS: usize = 32;
-const ID_GENERATION_MAX: u32 = u32::MAX >> 8;
+const ID_GENERATION_MAX: u32 = u32::MAX >> 9;
 pub const NONBLOCK: u32 = 0o4000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +113,24 @@ impl Holds {
     pub fn first(&self) -> Option<u32> {
         self.ids().next()
     }
+    /// A subset of the caller's descriptions, before references are cloned.
+    pub fn selected(&self, ids: &[u32]) -> Result<Self, Failure> {
+        if ids.len() > HOLDS {
+            return Err(Failure::Limit);
+        }
+        let mut result = Self::new();
+        for &id in ids {
+            if !self.contains(id) {
+                return Err(Failure::BadDescription);
+            }
+            if !result.contains(id) {
+                let slot = result.room()?;
+                result.ids[slot] = Some(id);
+            }
+        }
+        Ok(result)
+    }
+
     fn room(&self) -> Result<usize, Failure> {
         self.ids
             .iter()
@@ -149,7 +167,8 @@ impl Endpoints {
         let index = (id & 255) as usize;
         let d = &self.descriptions[index];
         let i = &self.instances[d.endpoint.terminal];
-        if id >> 8 != d.generation
+        if (id & !proto_tty::MASTER) >> 8 != d.generation
+            || (id & proto_tty::MASTER != 0) != (d.endpoint.side == Side::Master)
             || d.references == 0
             || !i.allocated
             || d.endpoint.generation != i.generation
@@ -179,25 +198,37 @@ impl Endpoints {
         place: usize,
         index: usize,
         endpoint: Endpoint,
-    ) -> u32 {
+    ) -> Result<u32, Failure> {
+        let instance = &self.instances[endpoint.terminal];
+        let count = match endpoint.side {
+            Side::Master => instance.masters,
+            Side::Slave => instance.slaves,
+        };
+        let count = count.checked_add(1).ok_or(Failure::Overflow)?;
         let d = &mut self.descriptions[index];
         d.generation += 1;
         d.references = 1;
         d.pins = 0;
         d.endpoint = endpoint;
-        let id = d.generation << 8 | index as u32;
+        let id = d.generation << 8
+            | index as u32
+            | if endpoint.side == Side::Master {
+                proto_tty::MASTER
+            } else {
+                0
+            };
         holds.ids[place] = Some(id);
         let i = &mut self.instances[endpoint.terminal];
         match endpoint.side {
-            Side::Master => i.masters += 1,
-            Side::Slave => i.slaves += 1,
+            Side::Master => i.masters = count,
+            Side::Slave => i.slaves = count,
         }
-        id
+        Ok(id)
     }
     pub fn open_console(&mut self, holds: &mut Holds, flags: u32) -> Result<u32, Failure> {
         let place = holds.room()?;
         let index = self.free_description()?;
-        Ok(self.publish(
+        self.publish(
             holds,
             place,
             index,
@@ -207,7 +238,7 @@ impl Endpoints {
                 side: Side::Slave,
                 flags,
             },
-        ))
+        )
     }
     pub fn open_master(&mut self, holds: &mut Holds, flags: u32) -> Result<u32, Failure> {
         let place = holds.room()?;
@@ -221,7 +252,7 @@ impl Endpoints {
             allocated: true,
             ..Instance::empty()
         };
-        Ok(self.publish(
+        self.publish(
             holds,
             place,
             index,
@@ -231,7 +262,7 @@ impl Endpoints {
                 side: Side::Master,
                 flags,
             },
-        ))
+        )
     }
     pub fn open_slave(
         &mut self,
@@ -258,7 +289,7 @@ impl Endpoints {
         };
         let place = holds.room()?;
         let index = self.free_description()?;
-        Ok(self.publish(holds, place, index, endpoint))
+        self.publish(holds, place, index, endpoint)
     }
     pub fn master(&self, holds: &Holds, id: u32) -> Result<Endpoint, Failure> {
         let endpoint = self.resolve(holds, id)?;

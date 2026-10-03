@@ -178,6 +178,19 @@ pub fn run_with_identity(
     run_in(service, start, keyed, out, refusal, true, true)
 }
 
+/// Terminal slave requests authenticate; master requests use their owning
+/// service session and a notification in slot zero.
+pub(crate) fn run_terminal(
+    master: bool,
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+) -> Result<usize, i32> {
+    run_in(service, start, keyed, out, refusal, true, !master)
+}
+
 fn run_in(
     service: &Handle<Channel>,
     start: &[u8],
