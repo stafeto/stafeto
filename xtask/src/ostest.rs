@@ -119,6 +119,10 @@ pub fn outcome(log: &str, name: &str) -> Ended {
     let service = |line: &str| {
         line.starts_with("init: ")
             || line.starts_with("ramfs: ")
+            || line.starts_with("pipe: ")
+            || line.starts_with("tty: ")
+            || line.starts_with("virtio-rng: ")
+            || line.starts_with("entropy: ")
             || line.starts_with("posix-process: ")
             || line.starts_with("clock: ")
             || line.starts_with("process fault: ")
@@ -692,6 +696,10 @@ mod tests {
             "init: services started",
             "ramfs: ready",
             "@@os-test begin io/open",
+            "pipe: ready",
+            "tty: ready",
+            "virtio-rng: ready",
+            "entropy: seeded from the device",
             "open: EISDIR",
             "@@os-test end io/open exit 1",
             "@@os-test begin io/silent",
