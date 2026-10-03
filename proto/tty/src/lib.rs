@@ -836,6 +836,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn open_and_metadata_have_unambiguous_widths() {
+        let open = Open {
+            kind: OPEN_MASTER,
+            flags: 2 | 0o4000,
+            number: 0,
+        };
+        let mut w = Writer::new();
+        open.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), HEADER_LEN + 12);
+        assert_eq!(
+            Open::parse(Reader::new(&w.as_bytes()[HEADER_LEN..])),
+            Ok(open)
+        );
+        let info = Stat {
+            mode: 0o20620,
+            uid: 42,
+            gid: 0,
+            terminal: 8,
+            side: 0,
+        };
+        let mut w = Writer::new();
+        info.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 20);
+        assert_eq!(Stat::read(Reader::new(w.as_bytes())), Ok(info));
+        assert_eq!(
+            description(Method::Close, 257, Some(0), &mut Writer::new()),
+            Err(Status::BadSize)
+        );
+    }
+
+    #[test]
     fn method_numbers_are_fixed_and_listed() {
         for number in 0..=45u16 {
             let method = Method::from_number(number);

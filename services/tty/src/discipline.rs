@@ -746,6 +746,30 @@ mod tests {
     use std::vec::Vec;
 
     #[test]
+    fn pty_input_back_pressure_preserves_bytes_and_accepts_signals_at_capacity() {
+        let mut terminal = Terminal::new();
+        let mut settings = *terminal.termios();
+        settings.lflag = ISIG;
+        settings.iflag = 0;
+        terminal.set_termios(settings, true);
+        assert_eq!(terminal.input_some(&[b'x'; MAX_INPUT + 7], 10), MAX_INPUT);
+        assert_eq!(terminal.input_some(b"tail", 11), 0);
+        assert_eq!(terminal.dropped(), 0);
+        assert!(!terminal.input_room());
+        assert_eq!(terminal.input_some(&[3], 12), 1);
+        assert_eq!(
+            terminal.take_signals().collect::<std::vec::Vec<_>>(),
+            [Signal::Interrupt]
+        );
+        assert_eq!(terminal.queued(), (0, 0));
+        assert!(terminal.input_room());
+        assert_eq!(terminal.input_some(b"tail", 13), 4);
+        let mut out = [0; 4];
+        assert_eq!(terminal.read(&mut out, 13, 13), Read::Ready(4));
+        assert_eq!(&out, b"tail");
+    }
+
+    #[test]
     fn readiness_observes_lines_bytes_and_empty_reads_without_consuming() {
         use proto_wire::watch;
         let mut terminal = Terminal::new();

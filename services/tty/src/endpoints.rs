@@ -450,6 +450,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn side_tags_and_publication_overflow_fail_before_mutation() {
+        let mut table = Endpoints::new();
+        let mut holds = Holds::new();
+        let master = table.open_master(&mut holds, 2).unwrap();
+        assert_ne!(master & proto_tty::MASTER, 0);
+        assert_eq!(
+            table.pinned(master ^ proto_tty::MASTER),
+            Err(Failure::BadDescription)
+        );
+        table.instances[0].slaves = u32::MAX;
+        assert_eq!(table.open_console(&mut holds, 2), Err(Failure::Overflow));
+        assert_eq!(holds.ids().count(), 1);
+        assert_eq!(
+            table
+                .descriptions
+                .iter()
+                .filter(|d| d.references != 0)
+                .count(),
+            1
+        );
+        assert_eq!(table.instances[0].slaves, u32::MAX);
+    }
+
+    #[test]
     fn real_clones_keep_the_line_and_pins_only_keep_the_instance() {
         let mut table = Endpoints::new();
         let mut parent = Holds::new();
