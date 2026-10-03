@@ -101,12 +101,14 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stddef.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -131,6 +133,8 @@ int stafeto_probe_commit_early(int *pid);
 int stafeto_probe_loads(void);
 unsigned long long stafeto_probe_pool(void);
 void stafeto_probe_decoy(int on);
+size_t stafeto_probe_memory_map(unsigned long long *out, size_t max);
+unsigned long long stafeto_probe_memory_used(void);
 
 static void expect(const char *what, int got, int want) {
     if (got != want) {
@@ -799,6 +803,92 @@ static int steps_run(void) {
     return failed;
 }
 
+/* The layer's memory map (5d, T1): the regions it keeps handles of, three
+ * words each (address, pages, access: 1 R, 3 RW, 5 RX). */
+#define MAP_MAX 64
+#define PAGE 4096ull
+static unsigned long long regions[3 * MAP_MAX];
+
+static size_t map_read(void) {
+    size_t n = stafeto_probe_memory_map(regions, MAP_MAX);
+    return n > MAP_MAX ? MAP_MAX : n;
+}
+
+static unsigned long long map_pages(size_t n) {
+    unsigned long long pages = 0;
+    for (size_t i = 0; i < n; i++) pages += regions[3 * i + 1];
+    return pages;
+}
+
+/* Three growths of the heap add three regions, each of the pages the
+ * layer took, RW, one after the other in the heap's range, and the bytes
+ * charged to the process grow by at least those pages. */
+static int map_growth(const char *who) {
+    size_t before = map_read();
+    unsigned long long pages = map_pages(before), used = stafeto_probe_memory_used();
+    unsigned long long last_end = 0;
+    if (before > 0 && regions[3 * (before - 1)] >= 0x10000000ull)
+        last_end = regions[3 * (before - 1)] + regions[3 * (before - 1) + 1] * PAGE;
+    void *held[3];
+    for (int i = 0; i < 3; i++) {
+        held[i] = mmap(NULL, 192 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (held[i] == MAP_FAILED) {
+            printf("posix-procs: %s: mmap of 192 KiB gave %d\n", who, errno);
+            return 1;
+        }
+    }
+    size_t after = map_read();
+    unsigned long long grown = map_pages(after) - pages, charged = stafeto_probe_memory_used() - used;
+    if (after != before + 3) {
+        printf("posix-procs: %s: %d regions before, %d after three growths\n", who, (int)before,
+               (int)after);
+        return 2;
+    }
+    for (size_t i = before; i < after; i++) {
+        unsigned long long at = regions[3 * i];
+        if (regions[3 * i + 2] != 3 || at % PAGE != 0 || at < 0x10000000ull || at >= 0x20000000ull ||
+            (last_end != 0 && at != last_end) || regions[3 * i + 1] < 48) {
+            printf("posix-procs: %s: region %d at %llx of %llu pages access %llu\n", who, (int)i, at,
+                   regions[3 * i + 1], regions[3 * i + 2]);
+            return 3;
+        }
+        last_end = at + regions[3 * i + 1] * PAGE;
+    }
+    if (charged < grown * PAGE || charged > (grown + 16) * PAGE) {
+        printf("posix-procs: %s: the map grew %llu pages, the process is charged %llu bytes\n", who,
+               grown, charged);
+        return 4;
+    }
+    for (int i = 0; i < 3; i++) munmap(held[i], 192 * 1024);
+    return 0;
+}
+
+/* What a program from a file starts with: its segments (code RX and data
+ * RW below the layer's addresses), its stack and its start area, all of
+ * them in the map, none past the loader's region or with no pages, and
+ * no more pages than the process is charged for. */
+static int map_start(void) {
+    size_t n = map_read();
+    int code = 0, data = 0, stack = 0, area = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned long long at = regions[3 * i], pages = regions[3 * i + 1], access = regions[3 * i + 2];
+        if (pages == 0 || at % PAGE != 0 || (access != 1 && access != 3 && access != 5)) return 1;
+        if (at + pages * PAGE > 0x0001000000000000ull - 0x1000000ull) return 2;
+        if (at < 0x2000000ull && access == 5) code++;
+        if (at < 0x2000000ull && access == 3) data++;
+        if (at == 0x100000000ull - 64 * 1024 && pages == 16 && access == 3) stack++;
+        if (at == 0xF0000000ull && access == 3) area++;
+    }
+    if (code != 1 || data != 1 || stack != 1 || area != 1) {
+        printf("posix-procs: the start map has %d code, %d data, %d stack, %d area of %d\n", code,
+               data, stack, area, (int)n);
+        return 3;
+    }
+    if (map_pages(n) * PAGE > stafeto_probe_memory_used()) return 4;
+    printf("posix-procs: memory map %d regions %llu pages\n", (int)n, map_pages(n));
+    return 0;
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "steps") == 0) return steps_run();
@@ -839,6 +929,10 @@ static int role(const char *name) {
             return 1;
         }
         return 0;
+    }
+    if (strcmp(name, "memmap") == 0) {
+        int bad = map_start();
+        return bad != 0 ? bad : 10 * map_growth("child");
     }
     if (strcmp(name, "setid") == 0) {
         /* A set-user-ID file of root: the real IDs stay, the secure mode
@@ -1338,6 +1432,24 @@ static void files_nobody(void) {
     refused("spawn under a directory without search", "/sbin/procs-child", child, EACCES);
 }
 
+/* The layer's memory map and mmap (5d, T1). */
+static void memory(void) {
+    /* A shared anonymous mapping must stay shared with a forked child, and
+     * the layer has no shared memory: mmap says it does not support it
+     * (POSIX mmap, ENOTSUP). No kind at all is EINVAL. */
+    void *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    expect("mmap MAP_SHARED", shared == MAP_FAILED ? errno : 0, ENOTSUP);
+    void *none = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS, -1, 0);
+    expect("mmap with no kind", none == MAP_FAILED ? errno : 0, EINVAL);
+    void *own = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    expect("mmap MAP_PRIVATE", own == MAP_FAILED, 0);
+    if (own != MAP_FAILED) munmap(own, 4096);
+    /* This program started from init's table, so its map holds the heap's
+     * chunks alone. */
+    expect("the heap's regions grow with it", map_growth("probe"), 0);
+    run_role("/bin/procs-child", "memmap", NULL);
+}
+
 int main(int argc, char **argv) {
     argc_seen = argc;
     argv_seen = argv;
@@ -1376,6 +1488,8 @@ int main(int argc, char **argv) {
     files_nobody();
     printf("posix-procs: stage execs_nobody\n");
     execs_nobody();
+    printf("posix-procs: stage memory\n");
+    memory();
     printf("posix-procs: stage wave\n");
     wave();
     if (failures != 0) return 1;

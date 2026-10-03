@@ -28,8 +28,8 @@ use abi::{INIT_STACK_TOP, INLINE_MAX, MESSAGE_MAX, Rights, START_CHANNEL, Source
 use bootimg::Part;
 use bootimg::elf::{self, Load};
 use proto_loader::{
-    self as pl, AREA_MAX, BLOCK_MAX, Block, BlockError, LOADER_BASE, Method, PROGRAM_ROOM, SLOTS,
-    STACK_SIZE, START_AREA, Slot,
+    self as pl, AREA_MAX, BLOCK_MAX, Block, BlockError, LOADER_BASE, MAP_ENTRIES, MapEntry, Method,
+    PROGRAM_ROOM, SLOTS, STACK_SIZE, START_AREA, Slot,
 };
 use proto_wire::{Header, Reader, Status, Writer};
 use rt::abi::{Access, Error};
@@ -106,12 +106,58 @@ fn boot(session: &Handle<Channel>, start: &Handle<Channel>, level: u8) -> Result
 }
 
 /// What the parent's requests left: the copy of the block, the program's
-/// entry, the image session and the sessions Handles gave.
+/// entry, the image session, the memory map and the sessions Handles gave.
 struct Loaded {
     block_len: usize,
     entry: u64,
     image: Handle<Channel>,
+    maps: Maps,
     given: [Option<Handle<Channel>>; SLOTS],
+}
+
+/// One object `load` mapped, which the program's memory map keeps (spec 2,
+/// 3.2): where it lies, how many pages, with what access, and a handle
+/// narrowed to MAP_READ, DUPLICATE and TRANSFER, with MAP_WRITE for a
+/// writable part. The handle never carries MAP_EXEC, so the layer cannot
+/// map the code writable or the data executable through it.
+struct Kept {
+    address: u64,
+    pages: u32,
+    access: Access,
+    handle: Handle<Memory>,
+}
+
+/// The program's segments, stack and start area, in the order `load`
+/// mapped them.
+type Maps = [Option<Kept>; MAP_ENTRIES];
+
+/// Keeps a narrowed handle of `m`, which `load` mapped as `len` bytes at
+/// `address` with `access`, for the program's memory map: the rights of
+/// `Kept`. The program's start area has room for MAP_ENTRIES entries, the
+/// three segments, the stack and itself.
+fn keep_region(
+    maps: &mut Maps,
+    m: &Handle<Memory>,
+    address: u64,
+    len: u64,
+    access: Access,
+) -> Result<(), u32> {
+    let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+    if access == Access::ReadWrite {
+        rights = rights | Rights::MAP_WRITE;
+    }
+    let place = maps.iter_mut().find(|place| place.is_none());
+    let (Some(place), Ok(pages)) = (place, u32::try_from(len / PAGE)) else {
+        return Err(pl::TOO_BIG);
+    };
+    let handle = sys::handle_duplicate(m, rights).map_err(code)?;
+    *place = Some(Kept {
+        address,
+        pages,
+        access,
+        handle,
+    });
+    Ok(())
 }
 
 /// The bytes of the copy of the block.
@@ -126,16 +172,17 @@ fn staged(len: usize) -> &'static [u8] {
 /// image is ready and the record too. None when the loader gives up.
 fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Option<Loaded> {
     let mut block_len = None;
-    let mut loaded: Option<(u64, Handle<Channel>)> = None;
+    let mut loaded: Option<(u64, Handle<Channel>, Maps)> = None;
     let mut given: [Option<Handle<Channel>>; SLOTS] = Default::default();
     let mut ready = false;
     let mut buffer = [0; MESSAGE_MAX];
     loop {
-        if ready && let Some((entry, image)) = loaded.take() {
+        if ready && let Some((entry, image, maps)) = loaded.take() {
             return Some(Loaded {
                 block_len: block_len?,
                 entry,
                 image,
+                maps,
                 given,
             });
         }
@@ -324,9 +371,10 @@ fn code(e: Error) -> u32 {
 /// Go: OpenExec of the block's path through the session of the loaders
 /// with a copy of the loader's identity, then the program's segments,
 /// each in a new object filled from the file and mapped with its access,
-/// its stack and its start area: the program's entry and the image
-/// session, or the code of why not.
-fn load(own: &Own, block: &Block<'_>) -> Result<(u64, Handle<Channel>), u32> {
+/// its stack and its start area: the program's entry, the image session
+/// and the memory map (a narrowed handle of each object it mapped), or the
+/// code of why not.
+fn load(own: &Own, block: &Block<'_>) -> Result<(u64, Handle<Channel>, Maps), u32> {
     let mut path = [0; pl::PATH_MAX];
     let path = block.full_path(&mut path).map_err(|e| match e {
         BlockError::NameTooLong => pl::NAME_TOO_LONG,
@@ -338,22 +386,25 @@ fn load(own: &Own, block: &Block<'_>) -> Result<(u64, Handle<Channel>), u32> {
     let read = read_at(&image, 0, &mut head[..size.min(PAGE) as usize])?;
     let layout =
         elf::layout(&head[..read], size, PROGRAM_ROOM.clone()).map_err(|_| pl::NOT_EXEC)?;
+    let mut maps = Maps::default();
     for part in Part::ALL {
         let load = &layout.segments[part as usize];
         if !load.is_empty() {
-            segment(own, &image, load, part)?;
+            segment(own, &image, load, part, &mut maps)?;
         }
     }
     let stack = sys::mem_create(STACK_SIZE).map_err(code)?;
+    let stack_at = INIT_STACK_TOP - STACK_SIZE;
     loader::map_narrowed(
         &own.process,
         &stack,
         0,
         STACK_SIZE,
-        (INIT_STACK_TOP - STACK_SIZE) as usize,
+        stack_at as usize,
         Access::ReadWrite,
     )
     .map_err(code)?;
+    keep_region(&mut maps, &stack, stack_at, STACK_SIZE, Access::ReadWrite)?;
     let area = (pl::area_len(block) as u64).next_multiple_of(PAGE);
     if area > AREA_MAX {
         return Err(pl::TOO_BIG);
@@ -368,7 +419,8 @@ fn load(own: &Own, block: &Block<'_>) -> Result<(u64, Handle<Channel>), u32> {
         Access::ReadWrite,
     )
     .map_err(code)?;
-    Ok((layout.entry, image))
+    keep_region(&mut maps, &start, START_AREA, area, Access::ReadWrite)?;
+    Ok((layout.entry, image, maps))
 }
 
 /// OpenExec of `path`: the image session, or the code of the refusal.
@@ -457,8 +509,15 @@ const fn access(part: Part) -> Access {
 
 /// A segment of the program: a new object of its pages, which the new
 /// process pays for, filled by the file service READ_INTO_MAX bytes a
-/// request (READ_INTO) and mapped at its address with its access.
-fn segment(own: &Own, image: &Handle<Channel>, load: &Load, part: Part) -> Result<(), u32> {
+/// request (READ_INTO) and mapped at its address with its access; its
+/// narrowed handle goes into `maps`.
+fn segment(
+    own: &Own,
+    image: &Handle<Channel>,
+    load: &Load,
+    part: Part,
+    maps: &mut Maps,
+) -> Result<(), u32> {
     let pages = load.pages();
     let len = pages.end - pages.start;
     let m = sys::mem_create(len).map_err(code)?;
@@ -470,7 +529,9 @@ fn segment(own: &Own, image: &Handle<Channel>, load: &Load, part: Part) -> Resul
         }
         at += piece;
     }
-    loader::map_narrowed(&own.process, &m, 0, len, pages.start as usize, access(part)).map_err(code)
+    loader::map_narrowed(&own.process, &m, 0, len, pages.start as usize, access(part))
+        .map_err(code)?;
+    keep_region(maps, &m, pages.start, len, access(part))
 }
 
 /// READ_INTO of the image session: `count` bytes of the file from
@@ -552,6 +613,7 @@ fn finish(
         block_len,
         entry,
         image,
+        mut maps,
         mut given,
     } = loaded;
     let Ok(block) = Block::read(staged(block_len)) else {
@@ -574,11 +636,27 @@ fn finish(
     for slot in [Slot::Files, Slot::Clock, Slot::Uart] {
         handles[slot as usize] = given[slot as usize].take().map_or(0, keep);
     }
+    let mut entries = [MapEntry {
+        address: 0,
+        pages: 0,
+        access: Access::Read,
+        handle: 0,
+    }; MAP_ENTRIES];
+    let mut count = 0;
+    for kept in maps.iter_mut().filter_map(Option::take) {
+        entries[count] = MapEntry {
+            address: kept.address,
+            pages: kept.pages,
+            access: kept.access,
+            handle: keep(kept.handle),
+        };
+        count += 1;
+    }
     let len = pl::area_len(&block);
     // SAFETY: the start area lies at START_AREA, mapped read and write for
     // `len` bytes and more (`load`), and only the loader writes it now.
     let area = unsafe { core::slice::from_raw_parts_mut(START_AREA as *mut u8, len) };
-    if pl::write_area(area, START_AREA, &block, flags, handles).is_err() {
+    if pl::write_area(area, START_AREA, &block, flags, handles, &entries[..count]).is_err() {
         return GAVE_UP;
     }
     let staging = (block_len as u64).next_multiple_of(PAGE);

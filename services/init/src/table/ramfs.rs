@@ -62,9 +62,13 @@ pub const TABLE: &[Record] = &[
 /// A POSIX process: main at the probe's level, the ceiling one above it,
 /// where the holders of the locks of `posix-abi` (buckets, heap, files,
 /// threads, actions) run, so an application thread at main's level never
-/// delays them. BusyBox shares the record and its ceiling.
+/// delays them. BusyBox shares the record and its ceiling. The room for
+/// handles holds the layer's memory map, one handle for each object of the
+/// process's memory (at most 128), beside those of its threads and files; a
+/// table grows by chunks only as far as the process uses it.
 const POSIX: Record = Record {
     ceiling: TABLE[1].priority + 1,
+    handle_limit: 512,
     ..TABLE[1]
 };
 

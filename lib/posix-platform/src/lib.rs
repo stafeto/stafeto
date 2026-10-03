@@ -613,6 +613,36 @@ pub extern "C" fn stafeto_probe_decoy(on: c_int) {
     posix_abi::process::probe_decoy(on != 0);
 }
 
+/// The layer's memory map for the probes (posix_abi::allocation::regions):
+/// the address, the pages and the access (1 R, 3 RW, 5 RX) of each region,
+/// three words each, into `out` for `max` regions at most; the number of
+/// regions the map holds, which may exceed `max`.
+///
+/// # Safety
+/// `out` has room for `3 * max` words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_memory_map(out: *mut u64, max: usize) -> usize {
+    posix_abi::allocation::regions(|map| {
+        for (i, region) in map.iter().take(max).enumerate() {
+            let words = [
+                region.address as u64,
+                region.pages as u64,
+                region.access.raw(),
+            ];
+            // SAFETY: the caller gives room for `3 * max` words.
+            unsafe { out.add(3 * i).copy_from_nonoverlapping(words.as_ptr(), 3) };
+        }
+        map.len()
+    })
+}
+
+/// The bytes charged to the process (object_info PROCESS_MEMORY), for the
+/// probe that compares them with the memory map; 0 when the call fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_memory_used() -> u64 {
+    rt::sys::process_memory(posix_abi::allocation::process()).map_or(0, |memory| memory.used)
+}
+
 const PAGE: usize = 4096;
 
 /// The anonymous mappings relibc holds: (first page, pages) of each, in

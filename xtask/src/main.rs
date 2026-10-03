@@ -2052,6 +2052,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: the child's directory is /bin",
         // Stage 9: exec keeps the PID.
         "posix-procs: after exec pid",
+        // The memory map of a program from a file (5d).
+        "posix-procs: memory map ",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
@@ -2661,6 +2663,8 @@ fn host_tests() -> Result<(), String> {
         "posix-types",
         "--package",
         "posix-heap",
+        "--package",
+        "posix-map",
         "--package",
         "posix-order",
         "--package",
@@ -4189,8 +4193,10 @@ fn text_size(elf: &Path) -> Result<u64, String> {
         .ok_or_else(|| format!("{}: no .text", elf.display()))
 }
 
-/// The bound of the layer's `.data` + `.bss` in a program (step 5a′).
-const LAYER_DATA_LIMIT: u64 = 16 * 1024;
+/// The bound of the layer's `.data` + `.bss` in a program (step 5a′: 16
+/// KiB; 20 KiB since step 5d, which adds the memory map of 128 regions,
+/// 4 KiB).
+const LAYER_DATA_LIMIT: u64 = 20 * 1024;
 
 /// The test hooks of the reply journals went with the journals (spec 6.1):
 /// no Cargo.toml of the workspace names the feature `transport-probe`.
@@ -4246,6 +4252,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-types",
         "--package",
         "posix-heap",
+        "--package",
+        "posix-map",
         "--package",
         "posix-order",
         "--package",

@@ -543,16 +543,18 @@ pub struct Start {
     /// bytes each) and their count.
     pub descriptors: u64,
     pub descriptor_count: u32,
-    _reserved: u32,
+    /// The entries of the memory map the loader hands over (`MapEntry`,
+    /// MAP_ENTRY bytes each) and their count, at most MAP_ENTRIES.
+    pub map_count: u32,
     /// What an exec carried (`Carried`), all 0 for a spawn.
     pub pending: u64,
     pub timers: u64,
     pub alarm: u64,
-    _pad: u64,
+    pub map: u64,
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 1;
+pub const START_VERSION: u32 = 2;
 pub const SECURE: u32 = 1;
 /// The pairs of the auxiliary vector the start may fill.
 pub const AUXV_PAIRS: usize = 8;
@@ -560,30 +562,84 @@ pub const AUXV_PAIRS: usize = 8;
 pub const START_SIZE: usize = core::mem::size_of::<Start>();
 const _: () = assert!(START_SIZE == 160);
 
-/// The bytes of the start area of `block`: the header, the initial stack
-/// and the strings, rounded up to 16.
+/// The entries of the memory map the loader hands over at most: the three
+/// segments of a program, its stack and the start area itself.
+pub const MAP_ENTRIES: usize = 5;
+/// The bytes of an entry: the address u64, the pages u32, the access u32
+/// (abi::Access) and the handle's value u64.
+pub const MAP_ENTRY: usize = 24;
+
+/// One mapped memory object the loader hands the program (spec 2, 3.2):
+/// `pages` whole pages at `address` mapped with `access`, and the value of
+/// a handle to the object that holds MAP_READ, DUPLICATE and TRANSFER
+/// (and MAP_WRITE for a writable part) for the layer's map (posix-map). A
+/// handle never has MAP_EXEC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapEntry {
+    pub address: u64,
+    pub pages: u32,
+    pub access: abi::Access,
+    pub handle: u64,
+}
+
+impl MapEntry {
+    pub fn to_bytes(self) -> [u8; MAP_ENTRY] {
+        let mut out = [0; MAP_ENTRY];
+        out[..8].copy_from_slice(&self.address.to_le_bytes());
+        out[8..12].copy_from_slice(&self.pages.to_le_bytes());
+        out[12..16].copy_from_slice(&(self.access.raw() as u32).to_le_bytes());
+        out[16..].copy_from_slice(&self.handle.to_le_bytes());
+        out
+    }
+
+    /// The entry of `bytes`; None for no pages or an access that is none.
+    pub fn read(bytes: &[u8; MAP_ENTRY]) -> Option<MapEntry> {
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let long = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let access = abi::Access::from_raw(word(12).into())?;
+        (word(8) > 0).then_some(MapEntry {
+            address: long(0),
+            pages: word(8),
+            access,
+            handle: long(16),
+        })
+    }
+}
+
+/// The bytes of the start area of `block`: the header, the initial stack,
+/// room for MAP_ENTRIES entries of the map and the strings, rounded up to
+/// 16.
 pub const fn area_len(block: &Block<'_>) -> usize {
     let stack = 8 * (1 + block.argc + 1 + block.envc + 1 + 2 * AUXV_PAIRS);
     let strings = block.cwd.len() + 1 + block.strings.len() + block.descriptors.len();
-    (START_SIZE + stack + strings).next_multiple_of(16)
+    (START_SIZE + stack + MAP_ENTRIES * MAP_ENTRY + strings).next_multiple_of(16)
 }
 
 /// Writes the start area of `block` into `area`, which lies at `at` in the
 /// program's space: the header with `flags` and `handles`, the initial
-/// stack and the strings it points to. Malformed when `area` is shorter
-/// than `area_len`.
+/// stack, the `maps` entries and the strings it points to. Malformed when
+/// `area` is shorter than `area_len` or `maps` holds more than MAP_ENTRIES.
 pub fn write_area(
     area: &mut [u8],
     at: u64,
     block: &Block<'_>,
     flags: u32,
     handles: [u64; SLOTS],
+    maps: &[MapEntry],
 ) -> Result<(), BlockError> {
     let len = area_len(block);
     let area = area.get_mut(..len).ok_or(BlockError::Malformed)?;
+    if maps.len() > MAP_ENTRIES {
+        return Err(BlockError::Malformed);
+    }
     let stack_at = START_SIZE;
     let words = 1 + block.argc + 1 + block.envc + 1 + 2 * AUXV_PAIRS;
-    let strings_at = stack_at + 8 * words;
+    let maps_at = stack_at + 8 * words;
+    for (i, entry) in maps.iter().enumerate() {
+        area[maps_at + i * MAP_ENTRY..maps_at + (i + 1) * MAP_ENTRY]
+            .copy_from_slice(&entry.to_bytes());
+    }
+    let strings_at = maps_at + MAP_ENTRIES * MAP_ENTRY;
     // The strings: the current directory, then those of the block.
     let cwd_at = strings_at;
     area[cwd_at..cwd_at + block.cwd.len()].copy_from_slice(block.cwd);
@@ -636,11 +692,11 @@ pub fn write_area(
         handles,
         descriptors: at + descriptors_at as u64,
         descriptor_count: (block.descriptors.len() / DESCRIPTOR) as u32,
-        _reserved: 0,
+        map_count: maps.len() as u32,
         pending: block.carried.pending,
         timers: block.carried.timers,
         alarm: block.carried.alarm,
-        _pad: 0,
+        map: at + maps_at as u64,
     };
     // SAFETY: Start is repr(C) of integers and bytes with no padding
     // (START_SIZE is the sum of its fields), so its bytes are its value.
@@ -891,8 +947,8 @@ mod tests {
             let at = START_AREA;
             let mut area = vec![0xAA; area_len(&read)];
             let handles = [1, 2, 3, 4, 5, 6, 0, 8];
-            write_area(&mut area, at, &read, SECURE, handles).unwrap();
-            assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles).is_err());
+            write_area(&mut area, at, &read, SECURE, handles, &[]).unwrap();
+            assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles, &[]).is_err());
             let start = Start::read(&area).unwrap();
             assert_eq!(
                 (start.flags, start.umask, start.handles),
@@ -970,7 +1026,7 @@ mod tests {
         far[at..at + 4].copy_from_slice(&32u32.to_le_bytes());
         assert_eq!(Block::read(&far), Err(BlockError::Malformed), "fd 32");
         let mut area = vec![0; area_len(&read)];
-        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS]).unwrap();
+        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
         assert_eq!(start.descriptor_count, 2);
         let at = (start.descriptors - START_AREA) as usize;
@@ -1002,11 +1058,63 @@ mod tests {
         let read = Block::read(&out[..len]).unwrap();
         assert_eq!(read.carried, carried);
         let mut area = vec![0; area_len(&read)];
-        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS]).unwrap();
+        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
         assert_eq!(
             (start.pending, start.timers, start.alarm),
             (1 << 9, 3, 12_345)
         );
+    }
+
+    /// The memory map the loader hands over reaches the start area: each
+    /// entry with its address, pages, access and handle, inside the area and
+    /// before the strings; MAP_ENTRIES at most.
+    #[test]
+    fn the_memory_map_rides_in_the_start_area() {
+        use abi::Access;
+        let mut out = vec![0; BLOCK_MAX];
+        let len = block(&mut out, &[b"ls", b"-l"], &[b"X=1"]);
+        let read = Block::read(&out[..len]).unwrap();
+        let entry = |i: u32, access| MapEntry {
+            address: 0x1000 * (i as u64 + 1),
+            pages: i + 1,
+            access,
+            handle: 40 + i as u64,
+        };
+        let list = [
+            entry(0, Access::ReadExec),
+            entry(1, Access::Read),
+            entry(2, Access::ReadWrite),
+            entry(3, Access::ReadWrite),
+            entry(4, Access::ReadWrite),
+        ];
+        let mut area = vec![0xAA; area_len(&read)];
+        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &list).unwrap();
+        let start = Start::read(&area).unwrap();
+        assert_eq!(start.map_count as usize, MAP_ENTRIES);
+        let at = (start.map - START_AREA) as usize;
+        assert!(at + MAP_ENTRIES * MAP_ENTRY <= (start.cwd - START_AREA) as usize);
+        let back: Vec<_> = area[at..at + MAP_ENTRIES * MAP_ENTRY]
+            .as_chunks::<MAP_ENTRY>()
+            .0
+            .iter()
+            .filter_map(MapEntry::read)
+            .collect();
+        assert_eq!(back, list);
+        let mut few = vec![0; area_len(&read)];
+        write_area(&mut few, START_AREA, &read, 0, [0; SLOTS], &list[..3]).unwrap();
+        assert_eq!(Start::read(&few).unwrap().map_count, 3);
+        let mut too_many = list.to_vec();
+        too_many.push(entry(5, Access::Read));
+        assert_eq!(
+            write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &too_many),
+            Err(BlockError::Malformed)
+        );
+        let mut bytes = list[0].to_bytes();
+        bytes[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(MapEntry::read(&bytes), None, "no pages");
+        let mut bytes = list[0].to_bytes();
+        bytes[12..16].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(MapEntry::read(&bytes), None, "W and X together");
     }
 }
