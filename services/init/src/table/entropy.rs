@@ -170,8 +170,9 @@ pub const ENTROPY: Record = Record {
     root: false,
 };
 
-/// The probe: a seed and the seeds at once, two fills, CRASH with seeds
-/// while the driver restarts and a fill after it (roles `sfc`).
+/// The probe: seeds that wait for the first bytes, a seed and the seeds at
+/// once, two fills, CRASH with seeds while the driver restarts and a fill
+/// after it (roles `psfc`; `sfc` on VZ, whose service starts at once).
 const PROBE: Record = Record {
     name: "entropy-probe",
     program: "entropy-probe",
@@ -187,7 +188,7 @@ const PROBE: Record = Record {
     windows: &[],
     bindings: &[],
     connects: &["rng", "entropy"],
-    args: b"sfc",
+    args: b"psfc",
     dma: &[],
     quiesce: &[],
     trusted: false,
@@ -195,11 +196,11 @@ const PROBE: Record = Record {
 };
 
 /// A second client of the service: its key differs from the first's; on
-/// QEMU it seeds again after the service's reseed (roles `sw`).
+/// QEMU it seeds again after the service's reseed (roles `psw`).
 const PROBE_B: Record = Record {
     name: "entropy-probe-b",
     connects: &["entropy"],
-    args: b"sw",
+    args: b"psw",
     ..PROBE
 };
 
@@ -212,7 +213,10 @@ pub const VZ_TABLE: &[Record] = &[
     super::vz::CONSOLE,
     RNG_VZ,
     ENTROPY,
-    PROBE,
+    Record {
+        args: b"sfc",
+        ..PROBE
+    },
     Record {
         args: b"s",
         ..PROBE_B

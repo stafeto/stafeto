@@ -788,6 +788,7 @@ name = "virtio-rng"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "posix-random",
  "proto-entropy",
  "proto-init",
  "proto-wire",

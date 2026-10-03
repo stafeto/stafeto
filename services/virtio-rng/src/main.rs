@@ -181,6 +181,11 @@ unsafe impl Hal for Host {
                     buffer.len(),
                 )
             };
+            // The device's bytes leave no copy in the bounce page.
+            // SAFETY: as above; the page is the driver's until the next
+            // `share`.
+            let page = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, buffer.len()) };
+            posix_random::erase(page);
         }
     }
 }
@@ -348,6 +353,9 @@ fn main(_: u64) -> u64 {
         windows = [Some(ecam), Some(bar)];
         pci_transport(at)
     };
+    if let Err(NO_DEVICE) = found {
+        rt::println!("virtio-rng: no entropy device at {at:#x}");
+    }
     let Found {
         mut transport,
         at,
@@ -487,7 +495,7 @@ impl Driver {
             if self.fills.put(f.label, f.key, &self.buffer[..n]) {
                 self.ops.tell(f.label, f.key);
             }
-            self.buffer = [0; proto_entropy::FILL_MAX as usize];
+            posix_random::erase(&mut self.buffer);
         }
         self.kick();
         // The binding lives as long as the driver.
@@ -535,7 +543,9 @@ impl Driver {
         match self.fills.take(label, key, &mut bytes) {
             Taken::Ready(n) => {
                 self.ops.finish(&mut s.data, label, key);
-                long_answer(r, long::Reply::Ready(&bytes[..n]))
+                let answer = long_answer(r, long::Reply::Ready(&bytes[..n]));
+                posix_random::erase(&mut bytes);
+                answer
             }
             Taken::Waits if cancel => {
                 self.fills.cancel(label, key);

@@ -112,6 +112,16 @@ impl Source {
     }
 }
 
+/// Whether bytes of the device look constant: all alike, or the two
+/// halves the same. Such bytes seed nothing.
+pub fn looks_constant(bytes: &[u8]) -> bool {
+    let Some(&first) = bytes.first() else {
+        return true;
+    };
+    let (a, b) = bytes.split_at(bytes.len() / 2);
+    bytes.iter().all(|&x| x == first) || (!a.is_empty() && a == b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +184,18 @@ mod tests {
         let mut b = Source::new();
         b.feed(&bytes);
         assert_ne!(a.take(), b.take());
+    }
+
+    #[test]
+    fn constant_device_bytes_are_seen() {
+        assert!(looks_constant(&[0; 64]));
+        assert!(looks_constant(&[0xa5; 32]));
+        let mut halves = device(32, 5);
+        halves.extend(device(32, 5));
+        assert!(looks_constant(&halves));
+        assert!(looks_constant(&[]));
+        assert!(!looks_constant(&device(64, 5)));
+        assert!(!looks_constant(&device(32, 9)));
     }
 
     #[test]

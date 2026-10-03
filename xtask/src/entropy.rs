@@ -47,7 +47,7 @@ pub const PROGRAMS: [ImageProgram; 4] = [
         "entropy",
         "entropy",
         ENTROPY_STACK_SIZE,
-        &["steps", "report"],
+        &["steps", "report", "slow-start"],
     ),
 ];
 
@@ -83,6 +83,7 @@ const AT_ONCE: &str = "entropy-probe: 16 seeds at once, all distinct";
 const FLAG: &str = "entropy-probe: an unknown flag is refused";
 const DURING_RESTART: &str = "entropy-probe: 32 seeds while the driver restarts";
 const LATER: &str = "entropy-probe: a seed after 61 s";
+const WAITED: &str = "entropy-probe: 16 seeds waited for the first bytes, 16 told";
 const SEEDED: &str = "entropy: seeded from the device";
 const RESEEDED: &str = "entropy: reseeded from the device";
 /// Init's line once the device of the crashed driver stayed silent.
@@ -96,18 +97,23 @@ const ENTROPY_TAG: &str = "11";
 /// step of the interrupt (rt::service::step_own); the kind 64 holds the
 /// heartbeat, a send to init and its reply.
 const RNG_STEP_KINDS: [(usize, &str); 3] = [(1, "FillStart"), (2, "FillTake"), (65, "interrupt")];
-/// The kinds of the service's steps that must come: SEED and its own step
-/// of the feeder's bytes (a seed or a reseed, and the seeds that waited
-/// told). SEED_TAKE comes only when a client asked before the first bytes,
-/// and is checked when it came.
-const ENTROPY_STEP_KINDS: [(usize, &str); 2] = [(5, "Seed"), (65, "the feeder's bytes")];
+/// The kinds of the service's steps that must come: SEED, SEED_TAKE of
+/// the seeds that waited for the first bytes (the service's build
+/// `slow-start`), and its own steps: the feeder's bytes (a seed or a
+/// reseed) and each part of the seeds that waited, told.
+const ENTROPY_STEP_KINDS: [(usize, &str); 3] = [
+    (5, "Seed"),
+    (6, "SeedTake"),
+    (65, "the feeder's bytes and the tells"),
+];
 
 /// What a run of the probe printed, judged: the driver started twice, each
 /// time with the device's status 0 (`driver`), the fills came before and
 /// after the restart; the service was seeded once and gave the two
 /// clients two keys that differ, and keys at once, during the restart too;
-/// with `reseed`, it reseeded and gave a key after it; both clients ended
-/// well.
+/// with `reseed` (the QEMU image, whose service starts late), 16 seeds of
+/// each client waited for the first bytes and were told, and the service
+/// reseeded and gave a key after it; both clients ended well.
 pub fn verdict(lines: &[String], driver: &str, reseed: bool) -> Result<(), String> {
     let starts = lines.iter().filter(|l| l.as_str() == driver).count();
     if starts != 2 {
@@ -131,6 +137,7 @@ pub fn verdict(lines: &[String], driver: &str, reseed: bool) -> Result<(), Strin
     ];
     if reseed {
         wanted.push((LATER, 1));
+        wanted.push((WAITED, 2));
     }
     for (marker, n) in wanted {
         if count(marker) != n {
@@ -333,9 +340,11 @@ mod tests {
     const B: &str =
         "entropy-probe: key 0202020202020202020202020202020202020202020202020202020202020202";
 
-    const GOOD: [&str; 18] = [
+    const GOOD: [&str; 20] = [
         DRIVER_LINE,
         SEEDED,
+        WAITED,
+        WAITED,
         A,
         AT_ONCE,
         FLAG,
@@ -358,7 +367,11 @@ mod tests {
     fn a_good_run_passes() {
         assert_eq!(verdict(&lines(&GOOD), DRIVER_LINE, true), Ok(()));
         // On VZ the second client takes no key after the reseed.
-        let vz: Vec<_> = GOOD.iter().filter(|l| **l != LATER).copied().collect();
+        let vz: Vec<_> = GOOD
+            .iter()
+            .filter(|l| **l != LATER && **l != WAITED)
+            .copied()
+            .collect();
         assert_eq!(verdict(&lines(&vz), DRIVER_LINE, false), Ok(()));
         assert!(verdict(&lines(&vz), DRIVER_LINE, true).is_err());
     }
@@ -381,9 +394,9 @@ mod tests {
 
     #[test]
     fn the_service_must_give_two_clients_two_keys_and_keys_at_once() {
-        assert!(verdict(&with(5, A), DRIVER_LINE, true).is_err());
-        assert!(verdict(&with(5, "entropy-probe: key 02"), DRIVER_LINE, true).is_err());
-        for i in [1, 2, 3, 4, 10, 14, 15, 16] {
+        assert!(verdict(&with(7, A), DRIVER_LINE, true).is_err());
+        assert!(verdict(&with(7, "entropy-probe: key 02"), DRIVER_LINE, true).is_err());
+        for i in [1, 2, 4, 5, 6, 12, 16, 17, 18] {
             assert!(verdict(&without(i), DRIVER_LINE, true).is_err(), "line {i}");
         }
     }
@@ -392,10 +405,10 @@ mod tests {
     fn a_restart_that_finds_the_device_running_fails() {
         // Without init's reset the new instance finds the old status.
         let mut run = GOOD;
-        run[11] = "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0xf";
+        run[13] = "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0xf";
         assert!(verdict(&lines(&run), DRIVER_LINE, true).is_err());
         // One start alone, no fills, or no fill after the restart.
-        for i in [11, 8, 12] {
+        for i in [13, 10, 14] {
             assert!(verdict(&without(i), DRIVER_LINE, true).is_err(), "line {i}");
         }
     }
@@ -411,20 +424,20 @@ mod tests {
             step(10, 65, 3000),
             step(10, 64, 90_000),
             step(11, 5, 1200),
+            step(11, 6, 1300),
             step(11, 65, 2000),
         ];
         assert_eq!(
             steps_verdict(&good).map(|[a, b]| (a.len(), b.len())),
-            Ok((4, 2))
+            Ok((4, 3))
         );
-        // A SEED_TAKE past term B fails, though it need not come.
         let mut long = good.clone();
         long.push(step(11, 6, RAM_STEP_MAX + 1));
         assert!(steps_verdict(&long).is_err());
         let mut long = good.clone();
         long.push(step(10, 65, RAM_STEP_MAX + 1));
         assert!(steps_verdict(&long).is_err());
-        for i in [0, 1, 2, 4, 5] {
+        for i in [0, 1, 2, 4, 5, 6] {
             let mut missing = good.clone();
             missing.remove(i);
             assert!(steps_verdict(&missing).is_err(), "row {i}");

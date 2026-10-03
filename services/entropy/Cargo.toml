@@ -18,10 +18,12 @@ bench = false
 
 # `steps`: each new longest step of the loop goes to the console (rt's
 # feature step-stats), for the measurement under -icount. `report`: a line
-# at each reseed, for the probes.
+# at each reseed, for the probes. `slow-start`: the feeder waits 500 ms
+# before its first fill, so that the probes' seeds wait for it.
 [features]
 steps = ["rt/step-stats"]
 report = []
+slow-start = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

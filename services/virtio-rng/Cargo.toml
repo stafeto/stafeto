@@ -30,6 +30,7 @@ proto-entropy = { path = "../../proto/entropy" }
 proto-init = { path = "../../proto/init" }
 proto-wire = { path = "../../proto/wire" }
 virtio-pci = { path = "../../lib/virtio-pci" }
+posix-random = { path = "../../lib/posix-random" }
 
 # The program alone runs on stafeto: the host tests of the library build
 # without rt and without the device's crate (virtio-drivers, MIT).

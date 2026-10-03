@@ -274,6 +274,14 @@ mod tests {
     }
 
     #[test]
+    fn erase_writes_zeros() {
+        let mut bytes = [0xee; 40];
+        erase(&mut bytes[3..]);
+        assert_eq!(bytes[..3], [0xee; 3]);
+        assert_eq!(bytes[3..], [0; 37]);
+    }
+
+    #[test]
     fn an_unseeded_generator_gives_nothing() {
         let mut g = Generator::<1>::new();
         let mut out = [7; 8];

@@ -17,7 +17,15 @@
 //! FEED and a notification, and sleeps; when the driver ends it connects
 //! again, waiting in init while the driver restarts, and the loop goes on
 //! answering from the generator meanwhile. The number of the device's
-//! reads does not depend on the clients.
+//! reads does not depend on the clients. The seeds that waited for the
+//! first bytes hear of them TELLS a step. CLONE gives a child of a client
+//! a session of the service's own label.
+//!
+//! Every copy of a key or of the device's bytes the service makes is
+//! erased with volatile stores once it went (posix_random::erase): the
+//! generator's, FEED, the feeder's buffers and its message buffer. A reply
+//! of SEED goes in the registers of the reply (40 bytes, inline), which
+//! the kernel copies and the next reply overwrites.
 
 #![no_std]
 #![no_main]
@@ -49,10 +57,23 @@ const CLONES: usize = 320;
 /// The mark of the labels the service gives itself (CLONE): bit 63, which
 /// no label of init has.
 const OWN: u64 = 1 << 63;
-/// The seeds that wait for the device's first bytes, at most.
-const WAITING: usize = 32;
-/// The bit of the feeder's notification on the loop's channel.
+/// The seeds that wait for the device's first bytes, at most; the layer
+/// asks again after a pause when they are all taken.
+const WAITING: usize = 64;
+/// The seeds one step tells that the first bytes came: each tell is a
+/// notify of the kernel (about 470 ticks), so a step stays well under term
+/// B; the loop notifies itself (TELL) for the rest.
+const TELLS: usize = 8;
+/// The bits of the notifications on the loop's channel: the feeder's
+/// bytes, and the rest of the seeds to tell.
 const FED: u64 = 1;
+const TELL: u64 = 2;
+/// The feeder's wait before its first fill in the probes' build
+/// (feature `slow-start`), so that seeds wait for the first bytes.
+#[cfg(feature = "slow-start")]
+const SLOW_START_NS: u64 = 500_000_000;
+/// The code of a service whose feeder could not start its waits.
+const NO_FEEDER_WAITS: u64 = 6;
 /// How long the feeder waits for one fill, and before it connects again
 /// to a driver that broke.
 const FILL_NS: u64 = 1_000_000_000;
@@ -145,6 +166,10 @@ fn main(_: u64) -> u64 {
         ops: LongOps::new(),
         clones: Clones::new(),
         given: 0,
+        telling: [(0, 0); WAITING],
+        told: 0,
+        to_tell: 0,
+        notify: Handle::borrowed(rt::abi::Handle(NOTIFY.load(Ordering::Acquire))),
         channel: Handle::borrowed(channel.raw()),
         level,
         _feeder: feeder,
@@ -174,6 +199,13 @@ struct Entropy {
     /// count of those given so far; the channel they are copies of.
     clones: Clones<CLONES>,
     given: u64,
+    /// The seeds that waited when the first bytes came, told TELLS a step:
+    /// `told` of `to_tell` so far.
+    telling: [(u64, u64); WAITING],
+    told: usize,
+    to_tell: usize,
+    /// The loop's own copy of its channel with NOTIFY (TELL).
+    notify: ManuallyDrop<Handle<Channel>>,
     channel: ManuallyDrop<Handle<Channel>>,
     level: u8,
     _feeder: Handle<Thread>,
@@ -188,7 +220,11 @@ impl Entropy {
             Err(status) => return Answer::Status(status),
         };
         match self.source.start(flags) {
-            Start::Ready(key) => long_answer(r, long::Reply::Ready(&key)),
+            Start::Ready(mut key) => {
+                let answer = long_answer(r, long::Reply::Ready(&key));
+                posix_random::erase(&mut key);
+                answer
+            }
             Start::NotReady => Answer::Status(NOT_READY),
             Start::Wait => match self.ops.start(&mut s.data, r.label()) {
                 Ok(key) => long_answer(r, long::Reply::Wait(key)),
@@ -216,7 +252,10 @@ impl Entropy {
         }
         if let Some(seed) = self.source.take() {
             self.ops.finish(&mut s.data, label, key);
-            return long_answer(r, long::Reply::Ready(&seed));
+            let mut seed = seed;
+            let answer = long_answer(r, long::Reply::Ready(&seed));
+            posix_random::erase(&mut seed);
+            return answer;
         }
         if cancel {
             self.ops.finish(&mut s.data, label, key);
@@ -258,6 +297,21 @@ impl Entropy {
         }
     }
 
+    /// Tells TELLS of the seeds that waited for the first bytes, and
+    /// notifies the loop for the rest; a seed that went meanwhile is
+    /// passed over (LongOps::tell).
+    fn tell(&mut self) {
+        rt::service::step_own();
+        let end = (self.told + TELLS).min(self.to_tell);
+        for &(label, key) in &self.telling[self.told..end] {
+            self.ops.tell(label, key);
+        }
+        self.told = end;
+        if self.told < self.to_tell {
+            let _ = sys::notify(&self.notify, TELL);
+        }
+    }
+
     /// The feeder's bytes came: they seed or reseed the generator, and the
     /// seeds that waited for the first hear of it, WAITING at most.
     fn fed(&mut self) {
@@ -274,15 +328,13 @@ impl Entropy {
         FEED.full.store(false, Ordering::Release);
         if first {
             rt::println!("entropy: seeded from the device");
-            let mut waiting = [(0, 0); WAITING];
-            let mut n = 0;
-            for op in self.ops.keys() {
-                waiting[n] = op;
-                n += 1;
+            self.to_tell = 0;
+            for op in self.ops.keys().take(WAITING) {
+                self.telling[self.to_tell] = op;
+                self.to_tell += 1;
             }
-            for &(label, key) in &waiting[..n] {
-                self.ops.tell(label, key);
-            }
+            self.told = 0;
+            self.tell();
         } else {
             #[cfg(feature = "report")]
             rt::println!(
@@ -328,6 +380,9 @@ impl Service<1> for Entropy {
         if n.source == From::Unlabeled && n.bits & FED != 0 {
             self.fed();
         }
+        if n.source == From::Unlabeled && n.bits & TELL != 0 {
+            self.tell();
+        }
     }
 }
 
@@ -346,13 +401,19 @@ extern "C" fn feed(_: u64) -> ! {
     let parent = Handle::<Channel>::borrowed(abi::Handle(PARENT.load(Ordering::Acquire)));
     let notify = Handle::<Channel>::borrowed(abi::Handle(NOTIFY.load(Ordering::Acquire)));
     let level = LEVEL.load(Ordering::Acquire) as u8;
+    // A feeder that cannot wait ends the service, and init starts it
+    // again: a service without its feeder would keep every SEED waiting.
     let Ok(own) = sys::channel_create(level) else {
-        sys::thread_exit();
+        rt::println!("entropy: the feeder has no channel");
+        sys::process_exit(NO_FEEDER_WAITS);
     };
     let Ok(timer) = Waiter::new(&own, 0, level) else {
-        sys::thread_exit();
+        rt::println!("entropy: the feeder has no timer");
+        sys::process_exit(NO_FEEDER_WAITS);
     };
     let feeder = Feeder { own, timer, level };
+    #[cfg(feature = "slow-start")]
+    feeder.sleep(SLOW_START_NS);
     let mut fed = false;
     let mut bytes = [0; FIRST_BYTES];
     loop {
@@ -368,6 +429,14 @@ extern "C" fn feed(_: u64) -> ! {
             };
             if feeder.fill(&rng, &mut bytes[..n]).is_err() {
                 break;
+            }
+            // A device that gives the same bytes over and over would give
+            // every boot the same keys: its bytes go, and it is asked again.
+            if entropy::looks_constant(&bytes[..n]) {
+                rt::println!("entropy: the device's bytes look constant; asking again");
+                posix_random::erase(&mut bytes);
+                feeder.sleep(RETRY_NS);
+                continue;
             }
             if !FEED.full.load(Ordering::Acquire) {
                 // SAFETY: FULL is clear: the loop does not read the bytes
@@ -468,7 +537,7 @@ fn call(
         Some(n) => sys::send_handles(rng, request, [n.erase()]).map_err(drop)?,
     };
     let mut buffer = [0; MESSAGE_MAX];
-    match long::Reply::read(reply.bytes(&mut buffer)) {
+    let result = match long::Reply::read(reply.bytes(&mut buffer)) {
         Ok(long::Reply::Ready(bytes)) if bytes.len() == out.len() => {
             out.copy_from_slice(bytes);
             Ok((long::READY, 0))
@@ -476,5 +545,14 @@ fn call(
         Ok(long::Reply::Wait(key)) => Ok((long::WAIT, key)),
         Ok(long::Reply::Armed) => Ok((long::ARMED, 0)),
         _ => Err(()),
-    }
+    };
+    // The device's bytes leave no copy behind: the reply in the stack's
+    // buffer, and the part past the inline words in the feeder's message
+    // buffer.
+    posix_random::erase(&mut buffer);
+    // SAFETY: the feeder's message buffer is mapped read and write at
+    // FEEDER_BUFFER for the thread's life, and nothing else uses it.
+    let data = unsafe { core::slice::from_raw_parts_mut(FEEDER_BUFFER as *mut u8, MESSAGE_MAX) };
+    posix_random::erase(data);
+    result
 }

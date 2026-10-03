@@ -137,7 +137,18 @@ pub fn fill(out: &mut [u8], nonblock: bool) -> Result<(), i32> {
     while done < out.len() {
         let wants = with_state(|s| !s.generator.seeded() || s.given >= REKEY_BYTES);
         if wants {
-            let mut new = key(nonblock)?;
+            // EAGAIN of a wait that may wait: every place for a waiting
+            // seed in the service is taken (the boot's first moments); it
+            // comes again once the service answers. The yield lets the
+            // service and its feeder, above every process, go on.
+            let mut new = loop {
+                match key(nonblock) {
+                    Err(EAGAIN) if !nonblock => {
+                        let _ = rt::sys::yield_now();
+                    }
+                    other => break other?,
+                }
+            };
             with_state(|s| {
                 if !s.generator.seeded() {
                     s.generator.seed(&new);

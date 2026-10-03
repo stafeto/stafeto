@@ -5,10 +5,10 @@
 //! `n` bytes a client asked for under the key of its long operation. The
 //! device serves them in the order they came, one request at a time
 //! (`wanted`); its bytes go into the fill (`put`) until it has `n`, and
-//! the client takes them once (`take`), after which the driver holds no
-//! copy. A fill whose client cancelled or went leaves at once; bytes the
-//! device still brings for it find no fill and go nowhere. Each step is
-//! O(FILLS).
+//! the client takes them once (`take`); the fill's bytes are erased with
+//! volatile stores as it goes (taken, cancelled, or its client gone). A
+//! fill whose client cancelled or went leaves at once; bytes the device
+//! still brings for it find no fill and go nowhere. Each step is O(FILLS).
 
 use proto_entropy::FILL_MAX;
 
@@ -18,7 +18,8 @@ pub const FILLS: usize = 4;
 const MAX: usize = FILL_MAX as usize;
 
 /// One fill: its client and key, the bytes asked for and those that came.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Not Copy: a copy of its bytes left on the stack would outlive the fill.
+#[derive(Debug, PartialEq, Eq)]
 struct Fill {
     label: u64,
     key: u64,
@@ -55,7 +56,7 @@ impl Default for Fills {
 impl Fills {
     pub const fn new() -> Fills {
         Fills {
-            fills: [None; FILLS],
+            fills: [const { None }; FILLS],
             next_order: 0,
         }
     }
@@ -63,7 +64,7 @@ impl Fills {
     fn place(&self, label: u64, key: u64) -> Option<usize> {
         self.fills
             .iter()
-            .position(|f| f.is_some_and(|f| f.label == label && f.key == key))
+            .position(|f| f.as_ref().is_some_and(|f| f.label == label && f.key == key))
     }
 
     /// A fill of `n` bytes, 1 to FILL_MAX, for the key `key` of the client
@@ -121,8 +122,7 @@ impl Fills {
         }
         let n = f.n.min(out.len());
         out[..n].copy_from_slice(&f.bytes[..n]);
-        f.bytes = [0; MAX];
-        self.fills[i] = None;
+        self.drop_fill(i);
         Taken::Ready(n)
     }
 
@@ -131,7 +131,7 @@ impl Fills {
     pub fn cancel(&mut self, label: u64, key: u64) -> bool {
         match self.place(label, key) {
             Some(i) => {
-                self.fills[i] = None;
+                self.drop_fill(i);
                 true
             }
             None => false,
@@ -140,10 +140,24 @@ impl Fills {
 
     /// The client `label` went: its fills go.
     pub fn gone(&mut self, label: u64) {
-        for f in self.fills.iter_mut() {
-            if f.is_some_and(|f| f.label == label) {
-                *f = None;
+        for i in 0..FILLS {
+            if self.fills[i].as_ref().is_some_and(|f| f.label == label) {
+                self.drop_fill(i);
             }
+        }
+    }
+
+    /// The fill at `i` goes, its bytes erased first (`wipe`).
+    fn drop_fill(&mut self, i: usize) {
+        self.wipe(i);
+        self.fills[i] = None;
+    }
+
+    /// Erases the bytes of the fill at `i` in place, with volatile stores,
+    /// which no compiler drops as dead.
+    fn wipe(&mut self, i: usize) {
+        if let Some(f) = self.fills[i].as_mut() {
+            posix_random::erase(&mut f.bytes);
         }
     }
 
@@ -180,6 +194,27 @@ mod tests {
         // Taken once: the driver keeps no copy.
         assert_eq!(f.take(7, 1, &mut out), Taken::Unknown);
         assert_eq!(f.len(), 1);
+    }
+
+    /// The bytes of a fill are erased in its place before it goes, however
+    /// it goes (taken, cancelled, its client gone: each through
+    /// `drop_fill`, which wipes first).
+    #[test]
+    fn the_bytes_of_a_fill_are_erased_before_it_goes() {
+        let mut f = Fills::new();
+        assert!(f.add(1, 1, 32));
+        assert!(f.put(1, 1, &[0xee; 32]));
+        f.wipe(0);
+        let kept = f.fills[0].as_ref().map(|fill| fill.bytes[..32].to_vec());
+        assert_eq!(kept, Some(vec![0; 32]));
+        assert!(f.add(1, 2, 32) && f.add(2, 3, 32));
+        let mut out = [0; MAX];
+        assert!(f.put(1, 2, &[0xee; 32]));
+        assert_eq!(f.take(1, 2, &mut out), Taken::Ready(32));
+        assert_eq!(out[..32], [0xee; 32]);
+        assert!(f.cancel(1, 1));
+        f.gone(2);
+        assert!(f.is_empty());
     }
 
     #[test]
