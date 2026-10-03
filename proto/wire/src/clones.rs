@@ -64,6 +64,15 @@ impl<const N: usize> Clones<N> {
         Ok(())
     }
 
+    /// The client the live clone `label` was made for, if it is one.
+    pub fn client_of(&self, label: u64) -> Option<u64> {
+        self.live
+            .iter()
+            .flatten()
+            .find(|(l, _)| *l == label)
+            .map(|(_, c)| *c)
+    }
+
     /// The last copy of the clone `label` went.
     pub fn gone(&mut self, label: u64) {
         if let Some(slot) = self
@@ -96,5 +105,7 @@ mod tests {
             assert_eq!(c.add(2000 + i, 9), Ok(()));
         }
         assert_eq!(c.add(3000, 10), Err(Full), "the service's 64");
+        assert_eq!(c.client_of(1000), Some(7));
+        assert_eq!(c.client_of(100), None, "gone");
     }
 }

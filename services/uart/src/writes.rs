@@ -93,7 +93,7 @@ impl<T> Writes<T> {
         }
         let n = bytes.len().min(WRITE_MAX).min(output.room());
         // `n` fits the room.
-        let _ = output.put(&bytes[..n]);
+        let _ = output.put_raw(&bytes[..n]);
         n
     }
 
@@ -319,6 +319,9 @@ mod tests {
         assert!(w.roomy(&o));
         assert_eq!(w.write_some(&mut o, b"late"), 4);
         assert_eq!(&drain(&mut o)[..], b"waitslate");
+        // Its bytes go out as they are: the terminal made them.
+        assert_eq!(w.write_some(&mut o, b"\nbare\n"), 6);
+        assert_eq!(&drain(&mut o)[..], b"\nbare\n");
     }
 
     /// ROOM arms below the mark and tells once; a client keeps its first

@@ -49,6 +49,10 @@ rt::entry!(main);
 const SESSIONS: usize = 320;
 /// The clones the service keeps alive at most.
 const CLONES: usize = 320;
+/// The live clones of one root at most: one for each record of the process
+/// service, so that a tree of processes has a session each, and the other
+/// roots keep CLONES - ROOT_CLONES of them.
+const ROOT_CLONES: usize = 255;
 /// The long operations that wait in the service at most.
 const OPERATIONS: usize = 128;
 /// The bytes of input one step takes from the driver at most.
@@ -74,10 +78,15 @@ const NO_DRIVER: u64 = 4;
 const NO_PLACES: u64 = 5;
 const STOPPED: u64 = 6;
 
-/// What the service keeps for a client: its long operations.
+/// What the service keeps for a client: its long operations, and the
+/// root of its chain of clones: the label of init's client whose process
+/// forked or spawned it, or its own label for such a client (0 until its
+/// first request). The clones count by the root, as in the pipe service,
+/// so that one process tree cannot take the service from the others.
 #[derive(Default)]
 struct Client {
     long: LongSession,
+    root: u64,
 }
 
 /// The tables of the sessions and long operations and the console's
@@ -158,7 +167,7 @@ fn main(_: u64) -> u64 {
             priority: level,
         }),
     };
-    service.pull();
+    let _ = service.pull();
     rt::println!("tty: ready");
     #[cfg(feature = "steps")]
     rt::service::report_steps(5);
@@ -317,16 +326,17 @@ impl Tty {
 
     fn due(&mut self) {
         if self.step_due && !self.step_told {
-            self.step_due = false;
-            self.work();
+            // The work goes into a step of its own, which the measure sees.
+            self.kick();
         }
     }
 
     /// The work of a step: a chunk of input unless the driver's read
-    /// waits armed, and a message of output.
+    /// waits armed, or else a piece of output; a step that took input
+    /// leaves the output to the next.
     fn work(&mut self) {
-        if !matches!(self.input, Input::Waiting { armed: true, .. }) {
-            self.pull();
+        if !matches!(self.input, Input::Waiting { armed: true, .. }) && self.pull() {
+            return;
         }
         self.push();
     }
@@ -380,14 +390,14 @@ impl Tty {
     /// Input from the driver: a read in two steps, a chunk of CHUNK bytes
     /// at most. Bytes that came go through the discipline, and the next
     /// read starts in the next step; with none, the read waits armed.
-    fn pull(&mut self) {
+    fn pull(&mut self) -> bool {
         let mut bytes = [0; CHUNK as usize];
         let mut buffer = [0; MESSAGE_MAX];
         let mut w = Writer::new();
         let (request, handle) = match self.input {
             Input::Idle => {
                 if (ReadRequest { max: CHUNK }).write_start(&mut w).is_err() {
-                    return;
+                    return false;
                 }
                 (w.as_bytes(), None)
             }
@@ -396,7 +406,7 @@ impl Tty {
                     .write(proto_uart::Method::ReadTake, &mut w)
                     .is_err()
                 {
-                    return;
+                    return false;
                 }
                 let handle = if armed {
                     None
@@ -418,7 +428,7 @@ impl Tty {
             Err(_) => {
                 self.reconnect();
                 self.kick();
-                return;
+                return false;
             }
         };
         let n = match long::Reply::read(reply) {
@@ -432,7 +442,7 @@ impl Tty {
                 self.input = Input::Waiting { key, armed: false };
                 // The take that arms comes in the next step.
                 self.kick();
-                return;
+                return false;
             }
             Ok(long::Reply::Armed) => {
                 if let Input::Waiting { key, armed } = self.input {
@@ -446,13 +456,13 @@ impl Tty {
                         self.kick();
                     }
                 }
-                return;
+                return false;
             }
             _ => {
                 // The read is unknown to the driver: start another.
                 self.input = Input::Idle;
                 self.kick();
-                return;
+                return false;
             }
         };
         self.console.input(&bytes[..n], now());
@@ -468,6 +478,7 @@ impl Tty {
         }
         self.tell_readers();
         self.kick();
+        true
     }
 
     /// Every read that waits looks again: input came, or the settings
@@ -688,11 +699,11 @@ impl Tty {
 
     /// CLONE: a session of the service's own label for a child of the
     /// client.
-    fn clone_session(&mut self, r: &mut Request<'_>) -> Answer {
+    fn clone_session(&mut self, root: u64, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if self.clones.room(r.label()).is_err() {
+        if self.clones.room_within(root, ROOT_CLONES).is_err() {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
         self.given += 1;
@@ -706,7 +717,7 @@ impl Tty {
                 if r.reply().u32(0).is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                let _ = self.clones.add(label, r.label());
+                let _ = self.clones.add_within(label, root, ROOT_CLONES);
                 Answer::Reply([session.erase()].into())
             }
             Err(e) => Answer::Status(Status::Kernel(e)),
@@ -811,6 +822,10 @@ impl Service<0> for Tty {
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         self.due();
+        if s.data.root == 0 {
+            let label = r.label();
+            s.data.root = self.clones.client_of(label).unwrap_or(label);
+        }
         match Method::from_number(r.method()) {
             Some(Method::ReadStart) => self.read(s, r, false),
             Some(Method::ReadTake) => self.read(s, r, true),
@@ -823,7 +838,7 @@ impl Service<0> for Tty {
             Some(Method::ReadCancel | Method::WriteCancel | Method::DrainCancel) => {
                 self.cancel(s, r)
             }
-            Some(Method::Clone) => self.clone_session(r),
+            Some(Method::Clone) => self.clone_session(s.data.root, r),
             Some(Method::GetAttr) => self.get_attr(r),
             Some(Method::SetAttr) => self.set_attr(r),
             Some(Method::Abandon) => {
@@ -858,7 +873,7 @@ impl Service<0> for Tty {
         match (n.source, n.label) {
             (Source::Session, DRIVER_IN) => {
                 rt::service::step_own();
-                self.pull();
+                let _ = self.pull();
             }
             (Source::Session, DRIVER_ROOM) => {
                 rt::service::step_own();

@@ -243,6 +243,12 @@ impl Transcript {
         found.is_some()
     }
 
+    /// Whether the bytes `what` came anywhere, before the last text found
+    /// too; the next search starts where it did.
+    pub fn seen(&self, what: &[u8]) -> bool {
+        self.bytes.windows(what.len().max(1)).any(|w| w == what)
+    }
+
     /// The first whole line that `wanted` takes, a CR before its LF cut,
     /// among those that start after the last text found; the next search
     /// starts after its LF.
@@ -498,6 +504,20 @@ impl Run {
             .write_all(format!("{line}\r").as_bytes())
             .and_then(|()| stdin.flush())
             .map_err(|e| format!("typing {line:?}: {e}"))
+    }
+
+    /// Waits up to `timeout` for the bytes `what` anywhere in the output,
+    /// as they are: the output of a client may come before a line of the
+    /// kernel's log that was found already.
+    pub fn expect_bytes(&mut self, what: &[u8], timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while !self.transcript.seen(what) {
+            self.wait_on(
+                deadline,
+                &format!("{:?} anywhere", String::from_utf8_lossy(what)),
+            )?;
+        }
+        Ok(())
     }
 
     /// Types `bytes` as they are, with no Enter after them.

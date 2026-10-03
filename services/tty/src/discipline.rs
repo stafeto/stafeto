@@ -18,8 +18,16 @@
 //!
 //! The output ring holds OUTPUT bytes for the device: the echo and the
 //! clients' writes after the output processing. A write leaves
-//! ECHO_RESERVE bytes of it to the echo, so that typing shows while the
-//! clients' output waits for the device; echo past a full ring is lost.
+//! ECHO_RESERVE bytes of it to the echo, room for the longest echo of one
+//! byte, so that typing shows while the clients' output waits for the
+//! device. The echo of one byte goes whole or, past a full ring, not at
+//! all.
+//!
+//! The visual erase of ERASE counts the columns of the echo: two for a
+//! control character with ECHOCTL, one for any other byte, TAB among them
+//! (the column of a TAB is not kept). KILL erases its line visually with
+//! ECHOKE, ECHOE and ECHOK together, as Linux does; POSIX leaves ECHOKE to
+//! the implementation.
 
 use proto_tty::{
     DISABLED, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ECHONL, ICANON, ICRNL, IEXTEN, IGNCR, INLCR,
@@ -30,10 +38,11 @@ use proto_tty::{
 /// The bytes of the output ring.
 pub const OUTPUT: usize = 4096;
 /// The bytes of the output ring a write of a client leaves to the echo.
-pub const ECHO_RESERVE: usize = 1024;
+pub const ECHO_RESERVE: usize = 1536;
 /// The most bytes of echo one byte of input makes: KILL erases a line of
 /// MAX_CANON - 1 control characters, "\b\b  \b\b" each.
 pub const ECHO_MAX: usize = 6 * (MAX_CANON - 1);
+const _: () = assert!(ECHO_RESERVE >= ECHO_MAX);
 
 /// An entry of the input queue that ends a line.
 const DELIM: u16 = 0x100;
@@ -429,8 +438,7 @@ impl Terminal {
 
     fn echo_char(&mut self, b: u8) {
         if self.caret(b) {
-            self.put_echo(b'^');
-            self.put_echo(b ^ 0x40);
+            self.put_echo(&[b'^', b ^ 0x40]);
         } else {
             self.post(b, true);
         }
@@ -443,8 +451,7 @@ impl Terminal {
             return;
         }
         if self.local(ECHOE) {
-            self.output
-                .push_slice(&ERASE[..3 * columns.min(2 * MAX_CANON)]);
+            self.put_echo(&ERASE[..3 * columns.min(2 * MAX_CANON)]);
         } else {
             let erase = self.termios.cc[VERASE];
             self.echo_char(erase);
@@ -476,12 +483,13 @@ impl Terminal {
     }
 
     /// KILL: the current line goes; its echo erases it byte by byte with
-    /// ECHOKE and ECHOE, or shows KILL and, with ECHOK, a newline.
+    /// ECHOKE, ECHOE and ECHOK, or shows KILL and, with ECHOK, a newline.
     fn kill(&mut self) {
         if self.line_len() == 0 {
             return;
         }
-        if self.local(ECHO) && self.local(ECHOKE) && self.local(ECHOE) {
+        let visual = self.local(ECHOKE) && self.local(ECHOE) && self.local(ECHOK);
+        if self.local(ECHO) && visual {
             let mut columns = 0;
             while self.line_len() > 0 {
                 let e = self.queue.pop_back().unwrap_or(0);
@@ -585,28 +593,37 @@ impl Terminal {
     /// (XBD 11.2.3): echo when `echo`, the client's write otherwise.
     fn post(&mut self, b: u8, echo: bool) {
         let oflag = self.termios.oflag;
-        let put = |t: &mut Terminal, c: u8| {
-            if echo {
-                t.put_echo(c)
-            } else {
-                t.output.push(c);
-            }
-        };
-        if oflag & OPOST == 0 {
-            put(self, b);
+        let bytes: &[u8] = if oflag & OPOST == 0 {
+            &[b]
         } else if b == b'\n' && oflag & ONLCR != 0 {
-            put(self, b'\r');
-            put(self, b'\n');
+            b"\r\n"
         } else if b == b'\r' && oflag & OCRNL != 0 {
-            put(self, b'\n');
+            b"\n"
         } else {
-            put(self, b);
+            &[b]
+        };
+        if echo {
+            self.put_echo(bytes);
+        } else {
+            self.output.push_slice(bytes);
         }
     }
 
-    /// A byte of echo: lost when the ring is full.
-    fn put_echo(&mut self, b: u8) {
-        self.output.push(b);
+    /// The echo of one byte: whole, or not at all when the ring has no
+    /// room for it.
+    fn put_echo(&mut self, bytes: &[u8]) {
+        if OUTPUT - self.output.len < bytes.len() {
+            return;
+        }
+        // The echo of most bytes is one or two: a copy of a slice costs
+        // more than they do.
+        if bytes.len() <= 2 {
+            for &b in bytes {
+                self.output.push(b);
+            }
+        } else {
+            self.output.push_slice(bytes);
+        }
     }
 
     /// A client's write: the bytes of `bytes` that fit, through the output
@@ -782,6 +799,57 @@ mod tests {
         // KILL on an empty line does nothing.
         t.input(b"\x15", 0);
         assert_eq!(drain(&mut t), b"");
+    }
+
+    /// With ECHO clear (a password), ERASE, WERASE and KILL edit the line
+    /// and show nothing.
+    #[test]
+    fn no_echo_shows_no_erase() {
+        let mut t = Terminal::new();
+        let mut s = Termios::default();
+        s.lflag &= !ECHO;
+        t.set_termios(s, false);
+        t.input(b"abx\x7fc d\x17e\x15fg\x01\x7f\r", 0);
+        assert_eq!(read_bytes(&mut t, 64).unwrap(), b"fg\n");
+        assert_eq!(drain(&mut t), b"");
+    }
+
+    /// KILL erases its line visually only with ECHOK too (Linux): with
+    /// ECHOKE and ECHOE alone it shows ^U.
+    #[test]
+    fn echoke_needs_echok() {
+        let mut t = Terminal::new();
+        let mut s = Termios::default();
+        s.lflag &= !ECHOK;
+        t.set_termios(s, false);
+        t.input(b"ab\x15", 0);
+        assert_eq!(drain(&mut t), b"ab^U");
+    }
+
+    /// The echo of one byte goes whole or not at all: a KILL whose echo
+    /// finds no room shows nothing, and the next echo goes whole.
+    #[test]
+    fn echo_goes_whole_or_not_at_all() {
+        let mut t = Terminal::new();
+        t.input(&[0x01; 200], 0);
+        let echoed = drain(&mut t).len();
+        assert_eq!(echoed, 2 * 200);
+        // Fill the ring to the reserve with output, then echo into it.
+        let taken = t.write(&[b'y'; OUTPUT]);
+        assert_eq!(taken, OUTPUT - ECHO_RESERVE - 2);
+        t.input(&[0x01; 54], 0);
+        let room = OUTPUT - t.output_len();
+        assert!(
+            room < 6 * 254,
+            "the KILL's echo of {} bytes has no room",
+            6 * 254
+        );
+        let before = t.output_len();
+        t.input(b"\x15", 0);
+        assert_eq!(t.output_len(), before, "no part of the KILL's echo");
+        assert_eq!(t.line_len(), 0);
+        t.input(b"k", 0);
+        assert_eq!(t.output_len(), before + 1);
     }
 
     #[test]

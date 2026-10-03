@@ -19,3 +19,4 @@ proto-tty = { path = "../../proto/tty" }
 proto-uart = { path = "../../proto/uart" }
 proto-wire = { path = "../../proto/wire" }
 rt = { path = "../../lib/rt" }
+uart = { path = "../../services/uart" }

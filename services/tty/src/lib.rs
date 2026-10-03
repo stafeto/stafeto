@@ -12,9 +12,15 @@
 pub mod discipline;
 #[cfg(test)]
 mod fuzz;
+#[cfg(test)]
+mod reference;
 
 use discipline::Terminal;
 use proto_uart::WRITE_MAX;
+
+/// The most bytes one WRITE_SOME of the pump carries: half a message, so
+/// that the driver's copy of them fits a step of the service.
+pub const PIECE: usize = WRITE_MAX / 2;
 
 /// The driver's side of the output (proto_uart WRITE_SOME and ROOM).
 pub trait Driver {
@@ -62,8 +68,8 @@ impl Pump {
         self.waits_room
     }
 
-    /// Up to `writes` WRITE_SOME of the terminal's output, each of one
-    /// message at most; ROOM after one the driver took in part. The
+    /// Up to `writes` WRITE_SOME of the terminal's output, each of PIECE
+    /// bytes at most; ROOM after one the driver took in part. The
     /// bytes the driver took leave the terminal, and only they.
     pub fn run<D: Driver>(
         &mut self,
@@ -79,7 +85,7 @@ impl Pump {
                 return Ok(Pumped::WaitsRoom);
             }
             let piece = terminal.output();
-            let piece = &piece[..piece.len().min(WRITE_MAX)];
+            let piece = &piece[..piece.len().min(PIECE)];
             if piece.is_empty() {
                 return Ok(Pumped::Idle);
             }
@@ -248,7 +254,7 @@ mod tests {
     fn output_waits_for_the_driver_and_loses_nothing() {
         let mut t = Terminal::new();
         let mut sent = Vec::new();
-        for i in 0..3000u32 {
+        for i in 0..2500u32 {
             sent.push(b'a' + (i % 26) as u8);
         }
         assert_eq!(t.write(&sent), sent.len());
@@ -277,13 +283,13 @@ mod tests {
     #[test]
     fn a_run_is_bounded() {
         let mut t = Terminal::new();
-        t.write(&[b'x'; 3000]);
+        t.write(&[b'x'; 2500]);
         let mut d = Fake::new(10_000);
         let mut pump = Pump::new();
         assert_eq!(pump.run(&mut t, &mut d, 1), Ok(Pumped::More));
-        assert_eq!(d.ring.len(), WRITE_MAX);
+        assert_eq!(d.ring.len(), PIECE);
         assert_eq!(pump.run(&mut t, &mut d, 8), Ok(Pumped::Idle));
-        assert_eq!(d.ring.len(), 3000);
+        assert_eq!(d.ring.len(), 2500);
     }
 
     /// Stopped output stays in the terminal: the pump gives the driver

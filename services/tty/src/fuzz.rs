@@ -7,9 +7,12 @@
 //! panic and keeps the invariants after each operation: the queue and the
 //! line within their bounds, ERASE never past the start of a line, the
 //! echo of one byte within ECHO_MAX, a read within its count and its
-//! deadline after its time.
+//! deadline after its time. The same programs run on the discipline and
+//! on a reference written apart from it (`reference`): the bytes for the
+//! device, each read's result and its bytes are the same.
 
 use crate::discipline::{ECHO_MAX, OUTPUT, Read, Terminal};
+use crate::reference::{self, Reference};
 use proto_tty::{
     ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ECHONL, ICANON, ICRNL, IEXTEN, IGNCR, INLCR, ISIG, ISTRIP,
     MAX_CANON, MAX_INPUT, NOFLSH, OCRNL, ONLCR, OPOST, Termios, VEOL, VMIN, VTIME,
@@ -186,9 +189,9 @@ impl Rng {
     }
 }
 
-/// 10^5 random bytes, most of them the bytes the discipline cares for.
-#[test]
-fn random_programs_keep_the_invariants() {
+/// 10^5 random bytes of a fixed seed, most of them the bytes the
+/// discipline cares for.
+fn random_program() -> Vec<u8> {
     let mut rng = Rng(0x5f_7474_7931);
     let special = [
         b'\r', b'\n', 0x7f, 0x15, 0x17, 0x04, 0x03, 0x1c, 0x1a, b' ', b'.', 0x01, b'\t',
@@ -207,8 +210,97 @@ fn random_programs_keep_the_invariants() {
         };
         data.push(b);
     }
-    let seen = run(&data);
+    data
+}
+
+#[test]
+fn random_programs_keep_the_invariants() {
+    let seen = run(&random_program());
     assert!(seen.lines > 0 && seen.raw_reads > 0, "{seen:?}");
+}
+
+/// Runs the program `data` on the discipline and on the reference, the
+/// output taken whole after each operation: the same bytes for the device
+/// and the same reads.
+fn differ(data: &[u8]) -> usize {
+    let mut t = Terminal::new();
+    let mut r = Reference::new();
+    let mut now = 0u64;
+    let mut i = 0;
+    let mut reads = 0;
+    let next = |i: &mut usize| {
+        let b = data.get(*i).copied().unwrap_or(0);
+        *i += 1;
+        b
+    };
+    while i < data.len() {
+        let at = i;
+        let op = next(&mut i);
+        match op {
+            READ => {
+                let arg = next(&mut i);
+                let count = usize::from(arg % 64) + 1;
+                let started = now.saturating_sub(u64::from(arg >> 6) * 100_000_000);
+                let mut out = [0u8; 64];
+                let mut want = Vec::new();
+                let got = t.read(&mut out[..count], started, now);
+                let expected = r.read(count, started, now, &mut want);
+                assert_eq!(got, expected, "read at {at}");
+                if let Read::Ready(n) = got {
+                    assert_eq!(out[..n], want[..], "the bytes of the read at {at}");
+                    reads += 1;
+                }
+            }
+            SET => {
+                let b = [next(&mut i), next(&mut i), next(&mut i), next(&mut i)];
+                t.set_termios(settings(b), b[2] & 0x80 != 0);
+                r.set(settings(b), b[2] & 0x80 != 0);
+            }
+            WRITE => {
+                let len = usize::from(next(&mut i));
+                let end = (i + len).min(data.len());
+                let bytes = &data[i.min(end)..end];
+                assert_eq!(t.write(bytes), bytes.len());
+                r.write(bytes);
+                i = end;
+            }
+            TIME => now += u64::from(next(&mut i)) * 10_000_000,
+            LITERAL => {
+                let b = next(&mut i);
+                t.input(&[b], now);
+                r.input(&[b], now);
+            }
+            FLUSH => {
+                t.flush_input();
+                r.flush();
+            }
+            SIGNALS => {
+                t.take_signals().count();
+            }
+            DRAIN => {}
+            b => {
+                t.input(&[b], now);
+                r.input(&[b], now);
+            }
+        }
+        assert_eq!(
+            reference::drain(&mut t),
+            core::mem::take(&mut r.out),
+            "the bytes for the device after the operation at {at}"
+        );
+    }
+    reads
+}
+
+/// The random program and the corpus give what the reference gives.
+#[test]
+fn programs_match_the_reference() {
+    assert!(differ(&random_program()) > 1000);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    for file in std::fs::read_dir(&dir).expect("the corpus") {
+        let data = std::fs::read(file.expect("an entry").path()).expect("a file");
+        differ(&data);
+    }
 }
 
 /// The committed corpus: each file runs whole, and together they reach

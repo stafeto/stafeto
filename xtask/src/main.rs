@@ -2953,6 +2953,8 @@ fn tty_probe(vz: bool) -> Result<(), String> {
             run.expect(&format!("tty-probe: raw read {i} gave {b}"), DIALOG_STEP)?;
         }
         run.expect("tty-probe: raw reads gave each byte", DIALOG_STEP)?;
+        // ONLCR clear: the console's driver adds no CR either.
+        run.expect_bytes(b"\nbare-lf\n", DIALOG_STEP)?;
         run.expect("tty-probe: wrote", DIALOG_STEP)?;
         run.expect("tty-probe: ok", DIALOG_STEP)?;
         run.expect(ENDED_TTY, DIALOG_STEP)

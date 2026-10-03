@@ -5,13 +5,17 @@
 //! for the measure of the terminal service's steps (xtask tty, under
 //! -icount). On QEMU the PL011 sends at once, so the driver's interrupts
 //! at 60 would run inside every step of the service that writes; this
-//! driver takes the bytes and keeps none of them, with no interrupt. It
-//! speaks the methods of proto_uart the service sends:
+//! driver has no interrupt. What the service waits for in its call, it
+//! does as the PL011's driver does: WRITE_SOME puts the bytes into the
+//! driver's ring (uart::writes, uart::output) and the first pass of the
+//! transmission takes TX_PASS bytes from it; then the port has sent the
+//! rest (Output::discard_clients). It speaks the methods of
+//! proto_uart the service sends:
 //!
 //! - READ_START, READ_TAKE, READ_CANCEL: the bytes FEED gave, as the
 //!   PL011's driver gives its input; one read waits at most;
 //! - WRITE_SOME: PART bytes at most, none while HOLD holds; the bytes taken
-//!   are counted and dropped;
+//!   are counted;
 //! - ROOM: armed while HOLD holds, room otherwise; the handle of the first
 //!   ROOM stays;
 //! - FEED (16): bytes of input, after the header;
@@ -28,6 +32,22 @@ use rt::handle::{Channel, Outgoing};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::startup::Startup;
 use rt::{Handle, sys};
+use uart::irq::TX_PASS;
+use uart::output::Output;
+use uart::writes::Writes;
+
+/// The driver's rings, in `.bss`: too big for the stub's stack.
+struct Rings {
+    output: Output,
+    writes: Writes<()>,
+}
+struct Bss(core::cell::UnsafeCell<Rings>);
+// SAFETY: only the stub's one thread reaches it, once (`run`).
+unsafe impl Sync for Bss {}
+static RINGS: Bss = Bss(core::cell::UnsafeCell::new(Rings {
+    output: Output::new(),
+    writes: Writes::new(),
+}));
 
 pub const FEED: u16 = 16;
 pub const HOLD: u16 = 17;
@@ -48,6 +68,7 @@ struct Stub {
     room: Option<Handle<Channel>>,
     armed: bool,
     taken: u64,
+    rings: &'static mut Rings,
 }
 
 impl Stub {
@@ -176,11 +197,19 @@ impl Service<0> for Stub {
                     let Ok(request) = WriteRequest::read(r.body()) else {
                         return Answer::Status(Status::BadSize);
                     };
+                    let part = &request.bytes[..request.bytes.len().min(PART)];
+                    let Rings { output, writes } = &mut *self.rings;
                     let n = if self.hold {
                         0
                     } else {
-                        request.bytes.len().min(PART)
+                        writes.write_some(output, part)
                     };
+                    for _ in 0..TX_PASS {
+                        if output.next_byte().is_none() {
+                            break;
+                        }
+                    }
+                    output.discard_clients();
                     self.taken += n as u64;
                     match (WriteReply { written: n as u32 }).write(r.reply()) {
                         Ok(()) => Answer::Reply(Outgoing::new()),
@@ -228,6 +257,8 @@ pub fn run(s: Startup) -> u64 {
         room: None,
         armed: false,
         taken: 0,
+        // SAFETY: only this thread reaches RINGS, here once.
+        rings: unsafe { &mut *RINGS.0.get() },
     };
     let config = Config {
         issued: 0,

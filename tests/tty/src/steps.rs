@@ -50,6 +50,33 @@ fn fail(_: Status) -> &'static str {
     "a request"
 }
 
+/// The live clones of one root (services/tty ROOT_CLONES).
+const ROOT_CLONES: usize = 255;
+
+/// A chain of clones, each made by the one before, as a chain of forks
+/// makes them: the service counts them all by the root, so the one past
+/// ROOT_CLONES is refused, and a session of another root still clones.
+fn clone_chain(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> {
+    let request = Method::Clone.header().bytes();
+    let mut chain: [Option<Handle<Channel>>; ROOT_CLONES] = [const { None }; ROOT_CLONES];
+    for i in 0..ROOT_CLONES {
+        let from = match i {
+            0 => &probe.tty,
+            _ => chain[i - 1].as_ref().ok_or("a clone of the chain")?,
+        };
+        chain[i] =
+            Some(rt::service::clone_session(from, &request).map_err(|_| "a clone of the chain")?);
+    }
+    let last = chain[ROOT_CLONES - 1].as_ref().ok_or("the chain")?;
+    if rt::service::clone_session(last, &request).is_ok() {
+        return Err("a clone past the root's ROOT_CLONES");
+    }
+    let other = rt::service::connect(parent, "tty").map_err(|_| "a second session")?;
+    let _ = rt::service::clone_session(&other, &request).map_err(|_| "a clone of another root")?;
+    rt::println!("tty-probe: {ROOT_CLONES} clones of one root, then a refusal");
+    Ok(())
+}
+
 pub fn run(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> {
     let stub = rt::service::connect(parent, "uart").map_err(|_| "no session with the driver")?;
     let opened = probe.get_attr().map_err(fail)?;
@@ -189,6 +216,7 @@ pub fn run(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> 
     }
     stub_call(&stub, HOLD, &0u32.to_le_bytes()).map_err(fail)?;
     rt::println!("tty-probe: {written} newlines written past the driver's room");
+    clone_chain(probe, parent)?;
     // The settings, a clone and its abandoned read, the timer of VTIME.
     probe.set_attr(opened, FLUSH).map_err(fail)?;
     let clone =

@@ -12,7 +12,8 @@
 //!    come: INTR drops "lost" and the read gives "ac\n";
 //! 3. with ICANON off, VMIN 1 and VTIME 0, three reads each give the one
 //!    byte xtask typed before it;
-//! 4. LINES numbered lines in writes of MAX_WRITE bytes, which xtask finds
+//! 4. with ONLCR clear, an LF goes out with no CR before it;
+//! 5. LINES numbered lines in writes of MAX_WRITE bytes, which xtask finds
 //!    whole and in their order.
 //!
 //! `S` is a quiet driver of the console (stub.rs) and `s` the client that
@@ -333,8 +334,13 @@ fn run(probe: &Probe) -> Result<(), &'static str> {
         rt::println!("tty-probe: raw read {i} gave {}", want as char);
     }
     rt::println!("tty-probe: raw reads gave each byte");
+    // With ONLCR clear an LF goes out alone (XBD 11.2.3).
+    let mut bare = opened;
+    bare.oflag &= !proto_tty::ONLCR;
+    probe.set_attr(bare, NOW).map_err(|_| "SET_ATTR")?;
+    probe.write(b"\nbare-lf\n").map_err(|_| "a write")?;
     probe.set_attr(opened, NOW).map_err(|_| "SET_ATTR back")?;
-    // 4. Output, on a line of its own after the echo of the raw reads.
+    // 5. Output, on a line of its own.
     probe.write(b"\n").map_err(|_| "a write")?;
     let len = LINES * LINE;
     let (mut at, mut waited) = (0, 0);

@@ -730,6 +730,7 @@ dependencies = [
  "proto-uart",
  "proto-wire",
  "rt",
+ "uart",
 ]
 
 [[package]]

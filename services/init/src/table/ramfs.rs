@@ -516,6 +516,9 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
     Record {
         args: b"s",
         connects: &["tty", "uart"],
+        // A handle for each clone of its chain (tests/tty steps.rs).
+        handle_limit: 320,
+        quota: 64 * PAGE,
         ..TTY_TABLE[2]
     },
 ];
