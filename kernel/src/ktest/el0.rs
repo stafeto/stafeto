@@ -878,6 +878,7 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
                     f.crowd
                         .iter()
                         .flatten()
+                        // SAFETY: The locked fixture retains every crowd thread reference.
                         .all(|t| unsafe { t.as_ref().sched.state() == State::Parked }),
                     "a crowd thread entered EL0 before continuation",
                 )
@@ -4433,12 +4434,14 @@ fn start_suspended_fast_receiver(f: &mut Fixture) -> Result<(), &'static str> {
     let sender = spawn(f, 1, &raw const el0_suspend_send, 0)?;
     let sh = process::insert_handle(f.processes[1].unwrap(), Object::Channel(ch), Rights::SEND)
         .map_err(|_| "no sending handle")?;
+    // SAFETY: Both installed handles retain the channel after its creation reference goes.
     unsafe {
         channel::release(ch, Rights::NONE, CAUSE);
     }
     let judge = spawn(f, 2, &raw const el0_done_at_once, 0)?;
     sched::set_priority(receiver, 20, Policy::Fifo).map_err(|_| "receiver priority failed")?;
     sched::set_priority(judge, 1, Policy::Fifo).map_err(|_| "judge priority failed")?;
+    // SAFETY: The fixture retains both threads, which have not entered EL0 yet.
     unsafe {
         (*receiver.as_ptr()).regs.x[0] = rh.0;
         (*receiver.as_ptr()).regs.x[1] = 0;
@@ -4492,6 +4495,7 @@ fn done_suspended_el0_crowd(f: &Fixture, _: &Thread) -> Result<(), &'static str>
         f.crowd
             .iter()
             .flatten()
+            // SAFETY: The fixture retains every crowd thread until teardown.
             .all(|t| unsafe { t.as_ref().sched.state() == State::Dead }),
         "a crowd thread failed to resume at EL0",
     )

@@ -6136,6 +6136,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
                 threads
                     .iter()
                     .flatten()
+                    // SAFETY: The test retains every crowd thread until teardown.
                     .all(|t| unsafe { t.as_ref().sched.state() == State::Waiting }),
                 "stop changed a wait",
             )?;
@@ -6144,6 +6145,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
                     channel::notify(channels[i].unwrap(), 1, CAUSE)
                         .map_err(|_| "crowd notify failed")?;
                 } else if kind == 3 {
+                    // SAFETY: The test owns this waiting sender and its process.
                     unsafe { sched::interrupt(threads[i].unwrap(), CAUSE) }
                         .map_err(|_| "sender interruption failed")?;
                 } else {
@@ -6171,9 +6173,11 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
         let t = threads[0].unwrap();
         // SAFETY: the test holds the parked thread, with no IPC wait.
         check(
+            // SAFETY: The test retains this parked thread with no IPC wait.
             unsafe { sched::interrupt(t, CAUSE) } == Err(Error::BadState),
             "interrupt took a parked thread",
         )?;
+        // SAFETY: The retained parked thread cannot run during upcall setup.
         unsafe {
             (*t.as_ptr()).upcall.bind(USER_VA as u64).unwrap();
             (*t.as_ptr())
@@ -6182,10 +6186,12 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
                 .unwrap();
         }
         check(
+            // SAFETY: The test retains the parked thread and its bound upcall.
             unsafe { sched::request_upcall(t, CAUSE) } == Ok(()),
             "upcall refused a parked thread",
         )?;
         sched::set_priority(t, 40, Policy::Fifo).map_err(|_| "parked priority failed")?;
+        // SAFETY: The scheduler lock guards this retained thread during boosts.
         sched::locked(|k| unsafe {
             k.s.boost(t, 60, 63);
             k.s.unboost(t);
@@ -6201,6 +6207,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
             threads
                 .iter()
                 .flatten()
+                // SAFETY: The test retains every crowd thread until teardown.
                 .filter(|t| unsafe { t.as_ref().sched.state() == State::Ready })
                 .count()
         };
@@ -6230,6 +6237,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
             process::control(p, false, CAUSE).map_err(|_| "second continue failed")?;
             cleanup::portion();
             // Kill while 64 parked and 64 ready share a continuation item.
+            // SAFETY: The test retains p while ending its process and threads.
             unsafe {
                 process::end(p, ProcessState::Killed, CAUSE);
             }
@@ -6242,6 +6250,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
                 threads
                     .iter()
                     .flatten()
+                    // SAFETY: The test still holds each thread reference after process teardown.
                     .all(|t| unsafe { t.as_ref().sched.state() == State::Dead }),
                 "kill left a parked thread",
             )?;
@@ -6253,6 +6262,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
             )?;
             if kind != 0 {
                 for t in threads.iter().flatten() {
+                    // SAFETY: The test retains each thread; these test threads never enter EL0.
                     let x = unsafe { &t.as_ref().regs.x };
                     let preserved = if kind == 3 {
                         x[0] == Error::Interrupted.code()
@@ -6278,16 +6288,19 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
         ])
     })();
     for tm in alarms.into_iter().flatten() {
+        // SAFETY: Each timer has the reference returned by create, released once here.
         unsafe {
             timers::release(tm, CAUSE);
         }
     }
     for t in threads.into_iter().flatten() {
+        // SAFETY: Each thread has the retained creation reference; exit precedes release.
         unsafe {
             sched::exit(t, CAUSE);
             thread::release(t, CAUSE);
         }
     }
+    // SAFETY: The test releases its retained process creation reference once.
     unsafe {
         process::release(p, CAUSE);
     }
@@ -6318,6 +6331,7 @@ pub fn suspended_reply_keeps_its_result(_: &Boot) -> Result<(), &'static str> {
         )?;
         check(w.has_reply(w.t), "suspended reply was incomplete")?;
         // End the receiver, leaving the client as the sole ready thread.
+        // SAFETY: The reply fixture retains the receiver throughout this closure.
         unsafe {
             sched::exit(w.r, CAUSE);
         }
