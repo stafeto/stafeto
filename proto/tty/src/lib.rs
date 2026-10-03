@@ -1144,17 +1144,25 @@ mod winsize_tests {
         };
         let mut w = Writer::new();
         set.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 20);
-        assert_eq!(SetWinsize::parse(Reader::new(&w.as_bytes()[4..])), Ok(set));
-        assert_eq!(&w.as_bytes()[12..], &[37, 0, 91, 0, 128, 2, 224, 1]);
+        assert_eq!(w.as_bytes().len(), HEADER_LEN + 16);
         assert_eq!(
-            SetWinsize::parse(Reader::new(&w.as_bytes()[4..19])),
+            SetWinsize::parse(Reader::new(&w.as_bytes()[HEADER_LEN..])),
+            Ok(set)
+        );
+        assert_eq!(
+            &w.as_bytes()[HEADER_LEN + 8..],
+            &[37, 0, 91, 0, 128, 2, 224, 1]
+        );
+        assert_eq!(
+            SetWinsize::parse(Reader::new(
+                &w.as_bytes()[HEADER_LEN..w.as_bytes().len() - 1]
+            )),
             Err(Status::BadSize)
         );
         let mut malformed = w.as_bytes().to_vec();
-        malformed[8..12].copy_from_slice(&2u32.to_le_bytes());
+        malformed[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&2u32.to_le_bytes());
         assert_eq!(
-            SetWinsize::parse(Reader::new(&malformed[4..])),
+            SetWinsize::parse(Reader::new(&malformed[HEADER_LEN..])),
             Err(Status::BadSize)
         );
     }
