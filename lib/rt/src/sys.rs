@@ -986,6 +986,12 @@ fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error
     x[1] = flags;
     // SAFETY: receive uses no memory of the program; it writes x0-x11 only.
     unsafe { trap::<{ Call::Receive.number() }, true>(&mut x) };
+    received(x)
+}
+
+/// Decodes the receive registers, retaining the complete message and handles.
+#[inline(always)]
+fn received(x: [u64; 12]) -> Result<Received, Error> {
     if let Some(e) = Error::from_code(x[0]) {
         return Err(strict::<{ Call::Receive.number() }>(e));
     }
@@ -1013,6 +1019,43 @@ fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error
         bits,
         count,
     })
+}
+
+/// Measurement-only receive, stamped immediately after the returning SVC.
+/// The stamp belongs to this result, so nested receives cannot overwrite it.
+/// Kernel receive and idle before its return are outside this interval.
+#[cfg(feature = "step-stats")]
+pub fn receive_measured(channel: &Handle<Channel>) -> (u64, Result<Received, Error>) {
+    let mut x = [0; 12];
+    x[0] = channel.raw().0;
+    #[cfg(feature = "count-calls")]
+    CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let began: u64;
+    // SAFETY: the same Receive ABI as trap; x12 is additionally declared
+    // clobbered for the counter stamp. No program memory is read by the SVC.
+    unsafe {
+        asm!(
+            "svc #{n}",
+            "isb",
+            "mrs x12, cntvct_el0",
+            n = const Call::Receive.number(),
+            inout("x0") x[0],
+            inout("x1") x[1],
+            inout("x2") x[2],
+            inout("x3") x[3],
+            inout("x4") x[4],
+            inout("x5") x[5],
+            inout("x6") x[6],
+            inout("x7") x[7],
+            inout("x8") x[8],
+            inout("x9") x[9],
+            lateout("x10") x[10],
+            lateout("x11") x[11],
+            lateout("x12") began,
+            options(nostack),
+        );
+    }
+    (began, received(x))
 }
 
 /// clock_now: nanoseconds on the counter's scale (spec 10), rounded down;

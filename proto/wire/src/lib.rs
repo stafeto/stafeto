@@ -566,3 +566,5 @@ mod tests {
         assert_eq!(write(&|_| {}), [0u8; 0]);
     }
 }
+
+pub mod watch;

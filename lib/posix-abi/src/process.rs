@@ -151,9 +151,9 @@ pub(crate) fn probe_return_failure() {
     PROBE_RETURN_FAILURE.store(1, Ordering::Release);
 }
 
-/// Return job information through its single publisher. Interrupted sends
+/// Return process information through its single publisher. Interrupted sends
 /// were not accepted and repeat; a stale ticket is acknowledged harmlessly.
-pub(crate) fn return_job_signal(
+pub(crate) fn return_signal(
     signal: i32,
     ticket: u64,
     info: &posix_types::SigInfo,
@@ -161,7 +161,7 @@ pub(crate) fn return_job_signal(
     if PROBE_RETURN_FAILURE.swap(0, Ordering::AcqRel) != 0 {
         return Err(crate::constants::EIO);
     }
-    let mut w = request(proto_process::Method::ReturnJobSignal, &[signal as u32])?;
+    let mut w = request(proto_process::Method::ReturnSignal, &[signal as u32])?;
     w.u64(ticket)
         .and_then(|()| w.u32(info.si_code as u32))
         .and_then(|()| w.u32(info.si_pid as u32))

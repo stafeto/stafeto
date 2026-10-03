@@ -124,11 +124,14 @@ pub fn post(page: &Page, signal: u8, info: Info) -> Posted {
     Posted::Pending
 }
 
-/// Return an assignment only while its epoch is live. This service also
+/// Return a job assignment only while its epoch is live; ordinary signals use ticket 0. This service also
 /// serializes new generations, so no cancellation or new sender can replace
 /// the information between this check and publication. A pending sender wins.
-pub fn return_job(page: &Page, signal: u8, ticket: u64, info: Info) -> Option<Posted> {
-    let c = proto_process::job::class(signal)?;
+pub fn return_signal(page: &Page, signal: u8, ticket: u64, info: Info) -> Option<Posted> {
+    let Some(c) = proto_process::job::class(signal) else {
+        return (ticket == 0 && (1..=31).contains(&signal) && !matches!(signal, SIGKILL | SIGSTOP))
+            .then(|| post(page, signal, info));
+    };
     let word = if signal == SIGCONT {
         &page.cont_word
     } else {
@@ -277,6 +280,35 @@ mod tests {
         assert_eq!(stop, 16);
     }
 
+    #[test]
+    fn ordinary_return_requires_zero_ticket_and_preserves_first_sender() {
+        let p = page();
+        let old = Info {
+            code: 0,
+            pid: 300,
+            uid: 1000,
+            status: 5,
+        };
+        let fresh = Info {
+            pid: 301,
+            uid: 1001,
+            status: 6,
+            ..old
+        };
+        assert_eq!(return_signal(&p, SIGUSR1, 8, old), None);
+        assert_eq!(return_signal(&p, SIGKILL, 0, old), None);
+        assert_eq!(return_signal(&p, SIGUSR1, 0, old), Some(Posted::Pending));
+        assert_eq!(return_signal(&p, SIGUSR1, 0, fresh), Some(Posted::Merged));
+        let slot = &p.info[usize::from(SIGUSR1 - 1)];
+        assert_eq!(slot.pid.load(Ordering::Acquire), old.pid);
+        assert_eq!(slot.uid.load(Ordering::Acquire), old.uid);
+        assert_eq!(slot.status.load(Ordering::Acquire), old.status);
+        p.pending.store(0, Ordering::Release);
+        p.ignored.store(bit(SIGUSR1), Ordering::Release);
+        assert_eq!(return_signal(&p, SIGUSR1, 0, fresh), Some(Posted::Ignored));
+        assert_eq!(p.pending.load(Ordering::Acquire), 0);
+    }
+
     /// Return never changes generations or overwrites a newer/coalesced sender.
     #[test]
     fn returned_job_keeps_live_epoch_and_first_information() {
@@ -289,20 +321,20 @@ mod tests {
         };
         let fresh = Info { pid: 301, ..old };
         let (mut stop, mut cont) = (0, 0);
-        assert_eq!(return_job(&p, SIGTSTP, 0, old), Some(Posted::Pending));
+        assert_eq!(return_signal(&p, SIGTSTP, 0, old), Some(Posted::Pending));
         p.stop_word.fetch_and(!1, Ordering::Relaxed);
         assert_eq!(generation(&mut stop, &mut cont, &p, SIGCONT), Some(0));
         assert_eq!(generation(&mut stop, &mut cont, &p, SIGTSTP), Some(8));
         assert_eq!(post(&p, SIGTSTP, fresh), Posted::Pending);
-        assert_eq!(return_job(&p, SIGTSTP, 0, old), None);
-        assert_eq!(return_job(&p, SIGTSTP, 8, old), Some(Posted::Merged));
+        assert_eq!(return_signal(&p, SIGTSTP, 0, old), None);
+        assert_eq!(return_signal(&p, SIGTSTP, 8, old), Some(Posted::Merged));
         assert_eq!(
             p.info[usize::from(SIGTSTP - 1)].pid.load(Ordering::Relaxed),
             301
         );
         assert_eq!(p.stop_word.load(Ordering::Relaxed), 9);
         p.stop_word.fetch_and(!1, Ordering::Relaxed);
-        assert_eq!(return_job(&p, SIGTSTP, 8, old), Some(Posted::Pending));
+        assert_eq!(return_signal(&p, SIGTSTP, 8, old), Some(Posted::Pending));
         assert_eq!(
             p.info[usize::from(SIGTSTP - 1)].pid.load(Ordering::Relaxed),
             300
@@ -310,7 +342,7 @@ mod tests {
         assert_eq!(p.stop_word.load(Ordering::Relaxed), 9);
         p.ignored.store(bit(SIGTSTP), Ordering::Relaxed);
         p.stop_word.fetch_and(!1, Ordering::Relaxed);
-        assert_eq!(return_job(&p, SIGTSTP, 8, old), Some(Posted::Ignored));
+        assert_eq!(return_signal(&p, SIGTSTP, 8, old), Some(Posted::Ignored));
     }
 
     /// A forked child's page has its parent's classes from its start, so

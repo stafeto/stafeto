@@ -1077,6 +1077,7 @@ fn main() {
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
+        Some("posix-poll") => posix_poll_probe(),
         Some("posix-jobs") => posix_jobs_probe(),
         Some("process-steps") => match &args[1..] {
             [] => process_steps(&qemu::VIRT, 7),
@@ -2305,6 +2306,84 @@ fn relibc_hello_probe() -> Result<(), String> {
 /// The probe of POSIX processes (tests/posix-procs): its checks pass, its
 /// child says the PID the parent's posix_spawn gave and the parent's PID,
 /// and the child that did not load got no process.
+fn posix_poll_probe() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 11] = [
+        ("init", "init", INIT_STACK_SIZE, &["table-posix-poll"]),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        ("tty", "tty", TTY_STACK_SIZE, &["quiet-steps"]),
+        POSIX_PROCS_PROGRAMS[1],
+        ("pipe", "pipe", PIPE_STACK_SIZE, &["quiet-steps"]),
+        POSIX_PROCS_PROGRAMS[3],
+        POSIX_PROCS_PROGRAMS[4],
+        ("posix-poll", "posix-poll", POSIX_STACK_SIZE, &[]),
+        POSIX_PROCS_PROGRAMS[6],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    let image = build_boot_image("boot-posix-poll.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: posix-poll ended: "),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(&output, "posix-poll: ok")?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: posix-poll ended: exit code 0, not restarted",
+    )?;
+    check_watch_steps(&output.lines)
+}
+
+fn check_watch_steps(lines: &[String]) -> Result<(), String> {
+    for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
+        let steps = longest_steps(lines, tag);
+        for &(kind, ticks, _) in &steps {
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!(
+                    "watch service {tag}, kind {kind} exceeded {RAM_STEP_MAX}: {ticks}"
+                ));
+            }
+        }
+        let cases: Vec<String> = lines
+            .iter()
+            .filter(|line| line.starts_with("service case:"))
+            .map(|line| line.replacen("service case:", "service step:", 1))
+            .collect();
+        let full = longest_steps(&cases, tag);
+        for &(_, ticks, _) in &full {
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!("watch full case exceeded {RAM_STEP_MAX}: {ticks}"));
+            }
+        }
+        for method in methods {
+            if !full
+                .iter()
+                .any(|&(kind, ticks, detail)| kind == method && ticks != 0 && detail == 32)
+            {
+                return Err(format!(
+                    "watch method {method} has no full 32-element measurement: {steps:?}"
+                ));
+            }
+        }
+        if ![64, 65].iter().all(|wanted| {
+            steps
+                .iter()
+                .any(|&(kind, ticks, _)| kind == *wanted && ticks != 0)
+        }) {
+            return Err(format!(
+                "watch service {tag} has no heartbeat/notification or Gone measurement"
+            ));
+        }
+    }
+    Ok(())
+}
 fn posix_jobs_probe() -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
@@ -2866,6 +2945,45 @@ fn ash_dialog() -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
+        // Each builtin produces an observed result. The numeric false cases
+        // also check exit status, and command bypasses the function named echo.
+        let builtin_cases: &[(&str, &[&str])] = &[
+            ("echo arithmetic:$((6 * 7))", &["arithmetic:42"]),
+            (
+                "test 7 -eq 7; echo test-true:$?; test 7 -eq 8; echo test-false:$?",
+                &["test-true:0", "test-false:1"],
+            ),
+            (
+                "[ word = word ]; echo bracket-true:$?; [ word = other ]; echo bracket-false:$?",
+                &["bracket-true:0", "bracket-false:1"],
+            ),
+            (
+                "printf 'formatted:%04d:%s\\n' 7 word",
+                &["formatted:0007:word"],
+            ),
+            (
+                "set -- -a -b value; while getopts 'ab:' opt; do echo option:$opt:$OPTARG; done; echo option-index:$OPTIND",
+                &["option:a:", "option:b:value", "option-index:4"],
+            ),
+            ("alias hello='echo alias-ready'", &[]),
+            ("hello", &["alias-ready"]),
+            (
+                "unalias hello; command -v hello >/dev/null; echo unalias:$?",
+                &["unalias:127"],
+            ),
+            (
+                "echo() { printf 'function:%s\\n' \"$1\"; }; echo called; command echo bypassed; unset -f echo",
+                &["function:called", "bypassed"],
+            ),
+            ("command -v printf", &["printf"]),
+        ];
+        for (command, expected) in builtin_cases {
+            run.send(command)?;
+            for expected_line in *expected {
+                run.expect_line(expected_line, |line| line == *expected_line, DIALOG_STEP)?;
+            }
+            run.expect("# ", DIALOG_STEP)?;
+        }
         // The terminal service edits the line before ash reads it (5f):
         // DEL erases the "x" and its echo, and ash gets "echo abc".
         run.send("echo abx\x7fc")?;
@@ -3446,6 +3564,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
+        job("posix-poll", posix_poll_probe),
         // The longest step of the process service with 128 children, under
         // -icount: the host's time changes none of its numbers.
         job("process-steps", || process_steps(&qemu::VIRT, 4)),
@@ -5435,6 +5554,31 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn full_watch_case_survives_a_longer_single_item_maximum() {
+        let mut lines = Vec::new();
+        for (tag, methods) in [(4, [14, 15, 16]), (5, [25, 26, 27])] {
+            for method in methods {
+                lines.push(format!(
+                    "service step: {tag} kind {method} 15000 ticks detail 1"
+                ));
+                lines.push(format!(
+                    "service case: {tag} kind {method} 14000 ticks detail 32"
+                ));
+            }
+            for kind in [64, 65] {
+                lines.push(format!(
+                    "service step: {tag} kind {kind} 1000 ticks detail 0"
+                ));
+            }
+        }
+        assert!(super::check_watch_steps(&lines).is_ok());
+        let mut missing = lines.clone();
+        missing.retain(|line| !line.starts_with("service case: 5 kind 26 "));
+        assert!(super::check_watch_steps(&missing).is_err());
+        lines.push("service case: 5 kind 26 20539 ticks detail 32".into());
+        assert!(super::check_watch_steps(&lines).is_err());
+    }
     use super::*;
 
     /// The check of the layer's names takes every global defined symbol

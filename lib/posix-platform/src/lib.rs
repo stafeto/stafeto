@@ -17,6 +17,7 @@
 
 mod files;
 mod signals;
+mod wait;
 
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
