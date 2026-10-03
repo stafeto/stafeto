@@ -612,7 +612,7 @@ fn sessions() -> Result<Sessions, i32> {
             let clone = pipes_clone(pipes, &ends[..count])?;
             out.pipes = clone.into_raw().0;
         }
-        if let Some(clone) = entropy_clone()? {
+        if let Some(clone) = entropy_clone() {
             out.entropy = clone.into_raw().0;
         }
         Ok(())
@@ -627,18 +627,23 @@ fn sessions() -> Result<Sessions, i32> {
 }
 
 /// A clone of the process's session with the entropy service for a child
-/// (proto_entropy CLONE), when it has one.
-pub(crate) fn entropy_clone() -> Result<Option<Handle<Channel>>, i32> {
-    use crate::process::clone_errno;
-    let Some(entropy) = crate::random::session() else {
-        return Ok(None);
-    };
-    rt::service::clone_session(
+/// (proto_entropy CLONE), when it has one. A refusal (a service that ended
+/// or restarts, or is at its limit) fails no fork or spawn: the child gets
+/// no session, and its getentropy gives ENOSYS; the line says so.
+pub(crate) fn entropy_clone() -> Option<Handle<Channel>> {
+    let entropy = crate::random::session()?;
+    match rt::service::clone_session(
         &Handle::<Channel>::borrowed(entropy),
         &proto_entropy::Method::Clone.header().bytes(),
-    )
-    .map(Some)
-    .map_err(clone_errno)
+    ) {
+        Ok(clone) => Some(clone),
+        Err(status) => {
+            rt::println!(
+                "posix: the entropy service refused a session for a child ({status:?}); the child has none"
+            );
+            None
+        }
+    }
 }
 
 /// Clone of the session `pipes` with the pipe service for a child: a

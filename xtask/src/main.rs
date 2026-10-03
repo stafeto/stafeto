@@ -397,7 +397,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
 /// The probe of the longest step of the process service (xtask
 /// process-steps): the probe in its steps mode, and the process service
 /// that prints each new longest step.
-const POSIX_STEPS_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-steps"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps"]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &["steps"]),
@@ -410,6 +410,8 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 7] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
     ("loader", "loader", 0, &["steps"]),
+    ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
+    ("entropy", "entropy", 32 * 1024, &["steps"]),
 ];
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
@@ -2360,6 +2362,17 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // are no work of the pipe service.
     if let Some(row) = pipe.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
         return Err(format!("the pipe service: a step past term B: {row:?}"));
+    }
+    // The entropy service (tag 11): CLONE for each child of the crowd,
+    // whose cost grows with the live clones (a walk of its table of 320),
+    // and its own steps; every one under term B but the heartbeat.
+    let entropy = longest_steps(&outcome.lines, "11");
+    let clone = entropy.iter().find(|(k, ..)| *k == 8).map_or(0, |r| r.1);
+    if clone == 0 {
+        return Err(format!("the entropy service gave no CLONE: {entropy:?}"));
+    }
+    if let Some(row) = entropy.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+        return Err(format!("the entropy service: a step past term B: {row:?}"));
     }
     // The heartbeat has its own bound, so that a growth of that wait shows:
     // the service answers no client while it waits for init.

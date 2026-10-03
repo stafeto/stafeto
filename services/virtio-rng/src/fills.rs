@@ -9,6 +9,10 @@
 //! volatile stores as it goes (taken, cancelled, or its client gone). A
 //! fill whose client cancelled or went leaves at once; bytes the device
 //! still brings for it find no fill and go nowhere. Each step is O(FILLS).
+//! A reply of FILL_TAKE past its 64 inline bytes goes through the
+//! driver's message buffer, which keeps it until the next reply; the
+//! driver is trusted and holds the device's DMA anyway, and its client,
+//! the entropy service, mixes the bytes into a key that moves on.
 
 use proto_entropy::FILL_MAX;
 

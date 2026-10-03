@@ -156,12 +156,15 @@ Each was applied, the affected set run, then reverted.
   `arc4random` ends the process. Images other than those listed above (for
   instance the POSIX probes of Apple VZ other than rtbench, which have no
   table of files) have no nodes.
-- **The steps image has no entropy service.** `process-steps` measures the
-  steps of the services under `-icount`, where the driver at 45 and the
-  service at 44 preempt the RAM service at 40: with them in the image the
-  READ_INTO step read 23,438 ticks (19,369 without them), past term B, by
-  their boot work alone. The nodes are in that image, and a read of them
-  gives `ENOSYS`.
+- **The steps image runs the driver and the service at 37 and 36**, below
+  the services at 40. `process-steps` measures a step from the service's
+  receive to its reply under -icount; at their own levels (45, 44) the
+  entropy service's CLONE for each child of the crowd ran inside the RAM
+  service's READ_INTO and showed there (23,664 ticks). With them below it
+  READ_INTO reads 19,513 ticks (19,369 with no entropy service at all), so
+  the difference was their work, no cost of the RAM service. Their own
+  steps are measured in the same run: CLONE grows with the live clones and
+  reads 13,414 ticks with the crowd, under term B.
 - **The nodes' mode** is 0666 and the service checks no permission at open.
 - **The reads of the devices do not reach the RAM service**, so its access
   time of them does not move.

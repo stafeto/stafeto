@@ -26,6 +26,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +35,7 @@
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -219,9 +222,91 @@ static int descriptor(void) {
     return 0;
 }
 
+/*
+ * A wait in two steps nested in a signal handler (SA_RESTART) on the
+ * thread whose own wait it interrupted: the service tells both labels,
+ * and the inner wait may take the outer's notification; the outer wait
+ * looks again once a handler ran. Mode 0: getentropy before the first
+ * seed in both. Mode 1: a read of a pipe in both; another thread writes
+ * the outer pipe while the handler waits on the inner one, then the
+ * inner.
+ */
+static volatile sig_atomic_t nested_mode, nested_done;
+static int outer_pipe[2], inner_pipe[2];
+static pthread_t main_thread;
+
+static void on_usr1(int sig) {
+    (void)sig;
+    if (nested_mode == 0) {
+        unsigned char inner[32];
+        nested_done = getentropy(inner, sizeof inner) == 0 && !all_zero(inner, sizeof inner) ? 1 : -1;
+    } else {
+        unsigned char b = 0;
+        nested_done = read(inner_pipe[0], &b, 1) == 1 && b == 'i' ? 1 : -1;
+    }
+}
+
+static void pause_ms(long ms) {
+    struct timespec t = {ms / 1000, (ms % 1000) * 1000000};
+    while (nanosleep(&t, &t) != 0 && errno == EINTR) {
+    }
+}
+
+static void *poker(void *arg) {
+    (void)arg;
+    pause_ms(100);
+    pthread_kill(main_thread, SIGUSR1);
+    if (nested_mode == 1) {
+        pause_ms(100);
+        if (write(outer_pipe[1], "o", 1) != 1) return (void *)1;
+        pause_ms(100);
+        if (write(inner_pipe[1], "i", 1) != 1) return (void *)2;
+    }
+    return NULL;
+}
+
+static int nested(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;
+    sa.sa_flags = SA_RESTART;
+    CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
+    main_thread = pthread_self();
+    unsigned char outer[32];
+    void *poked = NULL;
+    pthread_t t;
+    /* The service's first fill waits 500 ms (slow-start). */
+    errno = 0;
+    CHECK(getrandom(outer, sizeof outer, GRND_NONBLOCK) == -1);
+    CHECK(errno == EAGAIN);
+    printf("posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN\n");
+    nested_mode = 0;
+    nested_done = 0;
+    CHECK(pthread_create(&t, NULL, poker, NULL) == 0);
+    CHECK(getentropy(outer, sizeof outer) == 0);
+    CHECK(pthread_join(t, &poked) == 0 && poked == NULL);
+    CHECK(nested_done == 1);
+    CHECK(!all_zero(outer, sizeof outer));
+    printf("posix-random: getentropy waited for the first seed with another inside a handler\n");
+    CHECK(pipe(outer_pipe) == 0 && pipe(inner_pipe) == 0);
+    nested_mode = 1;
+    nested_done = 0;
+    CHECK(pthread_create(&t, NULL, poker, NULL) == 0);
+    unsigned char b = 0;
+    CHECK(read(outer_pipe[0], &b, 1) == 1);
+    CHECK(b == 'o');
+    CHECK(pthread_join(t, &poked) == 0 && poked == NULL);
+    CHECK(nested_done == 1);
+    CHECK(close(outer_pipe[0]) == 0 && close(outer_pipe[1]) == 0);
+    CHECK(close(inner_pipe[0]) == 0 && close(inner_pipe[1]) == 0);
+    printf("posix-random: a pipe read went on after another inside a handler\n");
+    return 0;
+}
+
 static int first(void) {
     static unsigned char a[256], b[256], big[4096];
     unsigned char c[257], d[64];
+    if (nested() != 0) return 21;
     CHECK(getentropy(a, sizeof a) == 0);
     CHECK(getentropy(b, sizeof b) == 0);
     CHECK(memcmp(a, b, sizeof a) != 0);

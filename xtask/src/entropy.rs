@@ -83,7 +83,7 @@ const AT_ONCE: &str = "entropy-probe: 16 seeds at once, all distinct";
 const FLAG: &str = "entropy-probe: an unknown flag is refused";
 const DURING_RESTART: &str = "entropy-probe: 32 seeds while the driver restarts";
 const LATER: &str = "entropy-probe: a seed after 61 s";
-const WAITED: &str = "entropy-probe: 16 seeds waited for the first bytes, 16 told";
+const WAITED: &str = "entropy-probe: 32 seeds waited for the first bytes, 32 told";
 const SEEDED: &str = "entropy: seeded from the device";
 const RESEEDED: &str = "entropy: reseeded from the device";
 /// Init's line once the device of the crashed driver stayed silent.
@@ -111,8 +111,8 @@ const ENTROPY_STEP_KINDS: [(usize, &str); 3] = [
 /// time with the device's status 0 (`driver`), the fills came before and
 /// after the restart; the service was seeded once and gave the two
 /// clients two keys that differ, and keys at once, during the restart too;
-/// with `reseed` (the QEMU image, whose service starts late), 16 seeds of
-/// each client waited for the first bytes and were told, and the service
+/// with `reseed` (the QEMU image, whose service starts late), 32 seeds of
+/// each client, the service's 64 places, waited for the first bytes and were told, and the service
 /// reseeded and gave a key after it; both clients ended well.
 pub fn verdict(lines: &[String], driver: &str, reseed: bool) -> Result<(), String> {
     let starts = lines.iter().filter(|l| l.as_str() == driver).count();
@@ -285,7 +285,8 @@ pub const RANDOM_PROGRAMS: [ImageProgram; 9] = [
     ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
     ("loader", "loader", 0, &[]),
     ("virtio-rng", "virtio-rng", RNG_STACK_SIZE, &[]),
-    ("entropy", "entropy", ENTROPY_STACK_SIZE, &[]),
+    // The first fill waits 500 ms: the probe meets the wait for it.
+    ("entropy", "entropy", ENTROPY_STACK_SIZE, &["slow-start"]),
     (
         "posix-random",
         "posix-random-probe",
@@ -295,7 +296,10 @@ pub const RANDOM_PROGRAMS: [ImageProgram; 9] = [
 ];
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 12] = [
+const RANDOM_LINES: [&str; 15] = [
+    "posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN",
+    "posix-random: getentropy waited for the first seed with another inside a handler",
+    "posix-random: a pipe read went on after another inside a handler",
     "posix-random: getentropy gave 256 bytes twice, they differ",
     "posix-random: getentropy of 257 bytes gave EINVAL",
     "posix-random: getrandom: GRND_NONBLOCK and GRND_RANDOM give every byte, bad flags EINVAL",

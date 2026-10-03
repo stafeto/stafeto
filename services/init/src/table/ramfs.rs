@@ -281,11 +281,14 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
 ];
 
 /// The probe of the longest step of the process service (tests/posix-procs
-/// in the steps mode, xtask process-steps). The image has no entropy
-/// service (its nodes of random devices give ENOSYS): the steps are
-/// measured under -icount, where the driver at 45 and the service at 44
-/// would preempt the steps of the services at 40 and add their own work to
-/// them. The pool for the crowd of
+/// in the steps mode, xtask process-steps). The entropy device's driver and
+/// the entropy service run here at 37 and 36, below the services at 40 and
+/// above the crowd's ceiling of 31: a step is measured from the service's
+/// receive to its reply under -icount, and at their own levels (45, 44)
+/// their work, CLONE for each child the crowd spawns among it, ran inside
+/// the steps of the RAM service and showed there (READ_INTO 23,664 ticks;
+/// 19,513 with them below it, 19,369 without them). Their own steps are
+/// measured all the same. The pool for the crowd of
 /// children it starts from files, each with the probe's quota, and one
 /// more for the child that execs among them.
 pub const POSIX_STEPS_TABLE: &[Record] = &[
@@ -307,10 +310,20 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
         name: "posix-procs",
         program: "posix-procs",
         args: b"posix-procs\0steps\0",
-        connects: &["ramfs", "pipe", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: STEPS_QUOTA,
         ..POSIX
+    },
+    Record {
+        priority: 37,
+        ceiling: 37,
+        ..super::entropy::RNG
+    },
+    Record {
+        priority: 36,
+        ceiling: 36,
+        ..super::entropy::ENTROPY
     },
 ];
 

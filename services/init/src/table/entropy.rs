@@ -155,7 +155,9 @@ pub const ENTROPY: Record = Record {
     priority: 44,
     ceiling: 44,
     quota: 64 * PAGE,
-    handle_limit: 64,
+    // A handle for each of the 64 seeds that may wait (the copy each
+    // brings), beside the service's own.
+    handle_limit: 96,
     restart: Restart::Always,
     console: true,
     log: false,

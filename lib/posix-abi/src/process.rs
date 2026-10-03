@@ -1215,7 +1215,7 @@ fn commit(
         return Err(EIO);
     }
     // The child's session with the entropy service, in a second Handles.
-    let entropy = crate::fork::entropy_clone()?;
+    let entropy = crate::fork::entropy_clone();
     crate::fork::give_slots(c, &[(Slot::Entropy, entropy.map_or(0, |e| e.into_raw().0))])?;
     ask(&request(proto_process::Method::SpawnCommit, &[pid as u32])?).map(drop)
 }

@@ -41,7 +41,8 @@ fn call(
     };
     let mut buffer = [0; MESSAGE_MAX];
     let bytes = reply.bytes(&mut buffer);
-    match long::Reply::read(bytes) {
+    let len = bytes.len();
+    let result = match long::Reply::read(bytes) {
         Ok(long::Reply::Ready(result)) => {
             let n = result.len().min(out.len());
             out[..n].copy_from_slice(&result[..n]);
@@ -54,7 +55,11 @@ fn call(
         Err(Status::Kernel(Error::LimitReached)) => Err(EAGAIN),
         Err(Status::Kernel(error)) => Err(error.into_errno()),
         Err(_) => Err(EIO),
-    }
+    };
+    // The reply's copy on the stack goes (a key of the entropy service
+    // among them), and a child of fork finds none of it.
+    posix_random::erase(&mut buffer[..len]);
+    result
 }
 
 trait Errno {
@@ -146,8 +151,26 @@ pub fn run_with(
     // the operation waits. A take the kernel took back left the service
     // without it, and the next one brings a new copy.
     let mut armed = false;
+    // The handlers that had run when the operation was last looked at: a
+    // handler's own long operation on this thread receives from the same
+    // channel and may take this one's notification, so once a handler ran
+    // the wait asks again ("take k" with no handle) before it blocks.
+    let mut handled = block.handled.load(Ordering::SeqCst);
     let cancel = 'wait: loop {
+        if armed && block.handled.load(Ordering::SeqCst) != handled {
+            handled = block.handled.load(Ordering::SeqCst);
+            match call(service, take.as_bytes(), None, out, refusal) {
+                Ok((long::READY, n, _)) => return Ok(n),
+                Ok((long::ARMED, _, _)) => {}
+                Ok(_) => break 'wait Some(EIO),
+                Err(EINTR) if ending(&block.flags) => break 'wait None,
+                Err(EINTR) => armed = false,
+                Err(error) => break 'wait Some(error),
+            }
+            continue;
+        }
         if !armed {
+            handled = block.handled.load(Ordering::SeqCst);
             let Ok(labelled) =
                 sys::handle_label(&channel, Rights::NOTIFY | Rights::TRANSFER, key, level)
             else {
@@ -169,6 +192,11 @@ pub fn run_with(
         if ending(&block.flags) {
             drop(guard);
             break 'wait None;
+        }
+        // A handler that ran since the look above: look again first.
+        if block.handled.load(Ordering::SeqCst) != handled {
+            drop(guard);
+            continue;
         }
         let got = sys::receive(&channel);
         drop(guard);

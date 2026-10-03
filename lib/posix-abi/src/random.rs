@@ -129,6 +129,34 @@ fn key(nonblock: bool) -> Result<[u8; KEY], i32> {
     Ok(out)
 }
 
+/// The first pause of `key_waiting` and its longest, in milliseconds.
+const PAUSE_FIRST_MS: i64 = 1;
+const PAUSE_MOST_MS: i64 = 50;
+
+/// A key of the service (`key`). EAGAIN of a request that may wait means
+/// every place for a waiting seed in the service, or of the process's
+/// session, is taken: the request goes again after a pause by the clock,
+/// 1, 2, 4 ms and so on up to 50 ms, which lets every level run. The
+/// pause is a point of cancellation, and a caught signal ends it with
+/// EINTR, as the wait in the service does.
+fn key_waiting(nonblock: bool) -> Result<[u8; KEY], i32> {
+    let mut pause = PAUSE_FIRST_MS;
+    loop {
+        match key(nonblock) {
+            Err(EAGAIN) if !nonblock => {
+                let time = posix_types::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: pause * 1_000_000,
+                };
+                crate::threads::sleep::clock_nanosleep(crate::clock::CLOCK_MONOTONIC, 0, time)
+                    .map_err(|(errno, _)| errno)?;
+                pause = (pause * 2).min(PAUSE_MOST_MS);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Fills `out` from the generator, asking the service for a key first
 /// when there is none or the last gave REKEY_BYTES; a key mixes into the
 /// one before it (posix_random::Generator::reseed).
@@ -152,17 +180,18 @@ pub fn fill(out: &mut [u8], nonblock: bool) -> Result<(), i32> {
             done = end;
             continue;
         }
-        // EAGAIN of a wait that may wait: every place for a waiting seed
-        // in the service is taken (the boot's first moments); it comes
-        // again once the service answers. The yield lets the service and
-        // its feeder, above every process, go on.
-        let mut new = loop {
-            match key(nonblock) {
-                Err(EAGAIN) if !nonblock => {
-                    let _ = rt::sys::yield_now();
-                }
-                other => break other?,
+        let reseed = with_state(|s| s.generator.seeded());
+        let mut new = match key_waiting(nonblock) {
+            Ok(new) => new,
+            // A generator with a key goes on with it when the service does
+            // not answer its reseed (it ended, restarts or refuses): fast
+            // key erasure keeps the bytes before unreadable, and the next
+            // REKEY_BYTES ask again.
+            Err(_) if reseed => {
+                with_state(|s| s.given = 0);
+                continue;
             }
+            Err(errno) => return Err(errno),
         };
         with_state(|s| {
             if !s.generator.seeded() {

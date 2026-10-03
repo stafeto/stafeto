@@ -16,7 +16,7 @@
 //!   and a fill.
 //! - `w`: a wait of 61 s, past the service's reseed, then a SEED with
 //!   NONBLOCK.
-//! - `p`: WAITERS SEED at once before the device's first bytes (the
+//! - `p`: WAITERS SEED at once, on two sessions, before the device's first bytes (the
 //!   service's build `slow-start` delays them), each WAIT k, each armed
 //!   with a labelled copy; the service tells them all once the bytes come,
 //!   and each SEED_TAKE gives a key.
@@ -43,8 +43,11 @@ const N: usize = 64;
 /// The seeds at once after the first, and while the driver restarts.
 const AT_ONCE: usize = 16;
 const DURING_RESTART: usize = 32;
-/// The seeds of `p` that wait at once.
-const WAITERS: usize = 16;
+/// The seeds of `p` that wait at once: 16 on each of two sessions (the
+/// most of one session, rt::service::LONG_SESSION_MAX); two clients fill
+/// the service's 64 places.
+const WAITERS: usize = 32;
+const PER_SESSION: usize = 16;
 /// The wait of `w`: past the service's period of 60 s.
 const WAIT_NS: u64 = 61_000_000_000;
 
@@ -232,23 +235,26 @@ impl Probe<'_> {
     /// Role `p`: WAITERS seeds started before the first bytes, all armed,
     /// all told, all taken; each key differs from every other.
     fn waiters(&mut self) -> Result<(), &'static str> {
-        let entropy =
-            rt::service::connect(self.parent, "entropy").map_err(|_| "connect to entropy")?;
+        let sessions = [
+            rt::service::connect(self.parent, "entropy").map_err(|_| "connect to entropy")?,
+            rt::service::connect(self.parent, "entropy").map_err(|_| "connect again")?,
+        ];
+        let of = |i: usize| &sessions[i / PER_SESSION];
         let mut keys = [0u64; WAITERS];
         let mut w = Writer::new();
         Seed { flags: 0 }
             .write(&mut w)
             .map_err(|_| "seed request")?;
         let mut key = [0; SEED_LEN];
-        for k in keys.iter_mut() {
-            match call(&entropy, w.as_bytes(), None, &mut key) {
+        for (i, k) in keys.iter_mut().enumerate() {
+            match call(of(i), w.as_bytes(), None, &mut key) {
                 Ok(Got::Wait(waits)) => *k = waits,
                 Ok(Got::Ready) => return Err("a seed was ready before the first bytes"),
                 _ => return Err("a refusal of a waiting seed"),
             }
         }
         let mut armed = 0;
-        for &k in &keys {
+        for (i, &k) in keys.iter().enumerate() {
             let mut take = Writer::new();
             Key { key: k }
                 .write(Method::SeedTake, &mut take)
@@ -260,7 +266,7 @@ impl Probe<'_> {
                 self.level,
             )
             .map_err(|_| "labelled copy")?;
-            match call(&entropy, take.as_bytes(), Some(copy), &mut key) {
+            match call(of(i), take.as_bytes(), Some(copy), &mut key) {
                 Ok(Got::Armed) => armed += 1,
                 Ok(Got::Ready) => self.keep(key)?,
                 _ => return Err("a refusal of a take"),
@@ -275,11 +281,12 @@ impl Probe<'_> {
                     bits,
                     ..
                 }) if keys.contains(&label) && bits & 1 != 0 => {
+                    let i = keys.iter().position(|&k| k == label).unwrap_or(0);
                     let mut take = Writer::new();
                     Key { key: label }
                         .write(Method::SeedTake, &mut take)
                         .map_err(|_| "take request")?;
-                    match call(&entropy, take.as_bytes(), None, &mut key) {
+                    match call(of(i), take.as_bytes(), None, &mut key) {
                         Ok(Got::Ready) => self.keep(key)?,
                         _ => return Err("a told seed gave no key"),
                     }
