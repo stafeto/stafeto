@@ -134,7 +134,7 @@ void stafeto_probe_decoy(int on);
 
 static void expect(const char *what, int got, int want) {
     if (got != want) {
-        printf("posix-procs: %s gave %d (%s), not %d\n", what, got, strerror(got), want);
+        printf("posix-procs: %s gave %d (%s), expected %d\n", what, got, strerror(got), want);
         failures++;
     }
 }
@@ -177,11 +177,11 @@ static void reap(const char *what, pid_t pid, int code, int signal) {
         return;
     }
     if (signal == 0 && !(WIFEXITED(status) && WEXITSTATUS(status) == code)) {
-        printf("posix-procs: %s ended with status %#x, not exit %d\n", what, status, code);
+        printf("posix-procs: %s ended with status %#x, expected exit %d\n", what, status, code);
         failures++;
     }
     if (signal != 0 && !(WIFSIGNALED(status) && WTERMSIG(status) == signal)) {
-        printf("posix-procs: %s ended with status %#x, not signal %d\n", what, status, signal);
+        printf("posix-procs: %s ended with status %#x, expected signal %d\n", what, status, signal);
         failures++;
     }
 }
@@ -395,7 +395,7 @@ static void groups(void) {
     expect("the probe's handler before kill(0) returned", handled, 1);
     reap("a child of the probe's group after kill(0)", c, 42, 0);
 
-    /* kill(-1) reaches a child of another group, not the probe. */
+    /* kill(-1) reaches a child of another group and skips the probe. */
     handled = 0;
     expect("a child in a group of its own",
            spawn_in(&c, "catch", POSIX_SPAWN_SETPGROUP, 0), 0);

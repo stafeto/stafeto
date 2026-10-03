@@ -204,7 +204,7 @@ impl ReadRequest {
     }
 }
 
-/// READ_TAKE and READ_CANCEL: the header and the key k of the read, not 0.
+/// READ_TAKE and READ_CANCEL: the header and the key k of the read (k above 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadKey {
     pub key: u64,

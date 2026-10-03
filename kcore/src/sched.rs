@@ -42,7 +42,7 @@ const LEVELS: usize = PRIORITY_LEVELS as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// Created, not started yet.
+    /// Created and waiting for its first start.
     Stopped,
     /// In the list of its level.
     Ready,
@@ -1329,7 +1329,7 @@ mod tests {
         preempt_after(&mut w, 0, MS);
         assert_eq!(node(a).slice_left(), 3 * MS);
         assert_eq!(w.pick(3 * MS), 'a');
-        // The end of the quantum: a whole new one, not the old rest.
+        // The end of the quantum: a whole new one; the old rest is gone.
         assert_eq!(w.tick(6 * MS), 'b');
         assert_eq!(node(a).slice_left(), Q);
         assert_eq!(w.tick(10 * MS), 'a');

@@ -211,7 +211,7 @@ unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
         sys::process_exit(72);
     }
     // A thread made after main was joined has a block of its own: its
-    // signal and its value are its, not main's.
+    // signal and its value are its own.
     let action = crate::layer::signals::SigAction {
         handler: reused_signal as *const () as u64,
         mask: 0,

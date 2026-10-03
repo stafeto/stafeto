@@ -58,7 +58,7 @@ impl UserRegs {
 
 /// A program's FP and SIMD registers, in the layout of fpsimd.S. The
 /// kernel never uses them, so they are saved and loaded only when threads
-/// switch (spec 8), not on every entry.
+/// switch (spec 8).
 #[repr(C, align(16))]
 pub struct FpRegs {
     pub v: [u128; 32],

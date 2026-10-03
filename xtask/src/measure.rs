@@ -14,7 +14,9 @@ struct Report {
     accel: String,
     runs: usize,
     frequency: Option<String>,
-    lines: Vec<String>,
+    /// Each line with the place of the job that printed it (out::order),
+    /// so that the file reads in the same order whatever the pace.
+    lines: Vec<(usize, String)>,
 }
 
 static REPORTS: OnceLock<Mutex<BTreeMap<String, Report>>> = OnceLock::new();
@@ -72,7 +74,9 @@ pub fn record_as(machine: &Machine, lines: &[String], label: &str) {
             report.frequency = Some(hz.to_owned());
         }
         if measured_line(line) {
-            report.lines.push(format!("{label}{line}"));
+            report
+                .lines
+                .push((crate::out::order(), format!("{label}{line}")));
         }
     }
 }
@@ -134,6 +138,9 @@ fn content(
         report.frequency.as_deref().unwrap_or("not reported"),
         report.runs,
     );
+    let mut kept = report.lines.clone();
+    kept.sort_by_key(|(order, _)| *order);
+    let lines: Vec<String> = kept.into_iter().map(|(_, line)| line).collect();
     if report.accel.starts_with("hvf") {
         for (label, prefix) in [
             ("", "ipc round trip ticks: "),
@@ -141,7 +148,7 @@ fn content(
             ("trace ", "trace ipc round trip ticks: "),
         ] {
             for row in ["fast", "slow"] {
-                if let Some((count, min, median, max)) = series(&report.lines, prefix, row) {
+                if let Some((count, min, median, max)) = series(&lines, prefix, row) {
                     text.push_str(&format!(
                         "{label}{row} ticks: samples={count} min={min} median={median} max={max}\n"
                     ));
@@ -149,7 +156,7 @@ fn content(
             }
         }
     }
-    for line in &report.lines {
+    for line in &lines {
         text.push_str(line);
         text.push('\n');
     }
@@ -197,7 +204,10 @@ mod tests {
         let all = reports().lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(
             all["label test"].lines,
-            ["icount KERNEL_STATS: idle=1", "KERNEL_STATS: idle=2"]
+            [
+                (0, "icount KERNEL_STATS: idle=1".to_owned()),
+                (0, "KERNEL_STATS: idle=2".to_owned())
+            ]
         );
     }
 
@@ -211,7 +221,7 @@ mod tests {
                 "normal build ticks: null=271",
                 "ipc round trip ticks: fast=1",
             ]
-            .map(str::to_owned)
+            .map(|line| (0, line.to_owned()))
             .to_vec(),
         };
         assert_eq!(file_name("EL2 GICv3"), "el2-gicv3");

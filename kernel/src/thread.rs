@@ -800,8 +800,8 @@ pub fn run(next: NonNull<Thread>) -> ! {
                 .prepare(thread.regs.elr, thread.regs.spsr, thread.long.is_some())
         {
             thread.regs.elr = entry;
-            // The dispatcher starts a new control flow, rather than completing
-            // an interrupted indirect branch. Return restores the old BTYPE.
+            // The dispatcher starts a new control flow and leaves the
+            // interrupted indirect branch unfinished. Return restores the old BTYPE.
             thread.regs.spsr &= !kcore::upcall::BRANCH_TYPE;
         }
         user::enter(next.as_ptr().cast())

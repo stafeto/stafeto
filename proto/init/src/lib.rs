@@ -339,8 +339,8 @@ impl Connect {
     }
 
     /// The request from `body`, its bytes after the header: BAD_SIZE
-    /// unless they are one name of 16 bytes (Name::from_field), not 16
-    /// zeros.
+    /// unless they are one name of 16 bytes (Name::from_field); 16
+    /// zeros give BAD_SIZE too.
     pub fn read(mut body: Reader<'_>) -> Result<Connect, Status> {
         let name = body.name()?.ok_or(Status::BadSize)?;
         body.finish()?;

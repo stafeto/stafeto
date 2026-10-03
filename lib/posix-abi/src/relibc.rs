@@ -232,8 +232,8 @@ pub fn collect() {
             place.tcb.swap(0, Ordering::Relaxed),
             place.tcb_len.swap(0, Ordering::Relaxed),
         );
-        // A use of the TCB after its end reads this pattern, not stale
-        // values: a joiner's return value, a pthread_t's thread number.
+        // A use of the TCB after its end reads this pattern and finds none of the
+        // stale values: a joiner's return value, a pthread_t's thread number.
         // SAFETY: the TCB is relibc's mapping of tcb_len bytes, which nobody
         // uses any more.
         unsafe { core::ptr::write_bytes(tcb as *mut u8, 0xA5, tcb_len) };

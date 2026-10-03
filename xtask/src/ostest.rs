@@ -20,11 +20,13 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::jobs::Job;
 use crate::{
-    BOOT_PROFILE, ImageProgram, PROGRAM_TARGET, Variant, build, cargo, cargo_output, llvm_tool,
-    qemu, rootfs, target_dir, write_boot_image_files,
+    BOOT_PROFILE, BUILD_LOCK, ImageProgram, PROGRAM_TARGET, Variant, build, cargo, cargo_output,
+    llvm_tool, qemu, rootfs, target_dir, write_boot_image_files,
 };
 
 /// The image of a suite: the RAM files with the tests, the process and
@@ -154,7 +156,8 @@ fn needs_processes(source: &str) -> bool {
     ["fork(", "pipe("].iter().any(|call| source.contains(call))
 }
 
-/// The time `ci` gives the suites.
+/// The time `ci` gives the boots of the suites, counted from the first
+/// one's start (about 150 s on TCG one boot after the other).
 const BUDGET: Duration = Duration::from_secs(300);
 
 /// The tests that pass on stafeto: `ci` fails when one of them does not.
@@ -169,14 +172,85 @@ pub fn licence() -> Result<Vec<u8>, String> {
     std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// The suites within BUDGET (`cargo xtask os-test`, `ci`): the run stops once the budget is
-/// spent, and the tests of PASSING pass.
-pub fn run_in_budget() -> Result<(), String> {
-    let start = Instant::now();
-    let rows = suites(start + BUDGET)?;
-    let took = start.elapsed();
+/// The suites within BUDGET (`cargo xtask os-test`), `jobs` boots at a
+/// time: the run stops once the budget is spent, and the tests of PASSING
+/// pass.
+pub fn run_in_budget(jobs: usize) -> Result<(), String> {
+    let (list, plan) = plan()?;
+    crate::jobs::run_all(list, jobs)?;
+    crate::jobs::run_all(vec![runner_check_job()], 1)?;
+    finish(plan)
+}
+
+/// The rows of a run of the suites: a place for each test, filled as its
+/// job ends.
+type Rows = Arc<Mutex<Vec<Option<Row>>>>;
+
+/// A test's name, its verdict and its outcome.
+type Row = (String, Verdict, String);
+
+/// The suites as a job for each test, and what `finish` needs.
+pub struct Plan {
+    rows: Rows,
+    /// The start of the first test's job: the budget counts from it.
+    started: Arc<OnceLock<Instant>>,
+}
+
+/// The suites as jobs (a boot a suite, the tests started from files), after
+/// the build of os-test's tests. `ci` puts them among its own jobs.
+pub fn plan() -> Result<(Vec<Job>, Plan), String> {
+    crate::relibc()?;
+    crate::run_cmd(
+        std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
+    )?;
+    let work = target_dir().join("os-test");
+    let tests = tests_of(&work)?;
+    let kernel = build(Variant::Normal)?;
+    let mut places: Vec<Option<Row>> = Vec::new();
+    for test in &tests {
+        let source = source_of(&work, test)?;
+        places.push(if needs_processes(&source) {
+            Some((
+                test.name.clone(),
+                Verdict::Unsupported,
+                "needs fork or pipes".to_owned(),
+            ))
+        } else if let Some(failed) = test.built.strip_prefix('!') {
+            // A test that did not compile: os-test's outcome for it.
+            let text = format!("{failed}\n");
+            let verdict = if passes(&work, test, &text)? {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            };
+            Some((test.name.clone(), verdict, text))
+        } else {
+            None
+        });
+    }
+    let rows: Rows = Arc::new(Mutex::new(places));
+    let started = Arc::new(OnceLock::new());
+    let jobs = suite_jobs(&work, tests, &kernel, &rows, &started)?;
+    Ok((jobs, Plan { rows, started }))
+}
+
+/// The end of a run of the suites: the table, the score and the list of
+/// the tests that pass.
+pub fn finish(plan: Plan) -> Result<(), String> {
+    let rows: Vec<Row> = plan
+        .rows
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let path = write(&rows)?;
+    println!("os-test: {}", score(&rows));
+    println!("os-test table: {}", path.display());
+    let took = plan.started.get().map_or(Duration::ZERO, Instant::elapsed);
     println!(
-        "os-test: {} s of its {} s",
+        "os-test boots: {} s of its {} s",
         took.as_secs(),
         BUDGET.as_secs()
     );
@@ -199,7 +273,7 @@ pub fn run_in_budget() -> Result<(), String> {
 
 /// The tests of `list` (one name a line, `#` for a comment) that do not
 /// pass in `rows`, and the passing tests that `list` lacks.
-fn compare(list: &str, rows: &[(String, Verdict, String)]) -> (Vec<String>, Vec<String>) {
+fn compare(list: &str, rows: &[Row]) -> (Vec<String>, Vec<String>) {
     let listed: Vec<&str> = list
         .lines()
         .map(str::trim)
@@ -278,6 +352,9 @@ fn passes(work: &Path, test: &Test, text: &str) -> Result<bool, String> {
 /// into the program os-test-probe, stripped of what the image does not
 /// need, `elfs`/`<name>` kept beside it.
 fn test_elf(test: &Test, object: &str, elfs: &Path) -> Result<Vec<u8>, String> {
+    // The build and the copy of its output go together: another build in
+    // between would leave its own file at the path every build shares.
+    let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let mut cmd = cargo();
     cmd.env("STAFETO_OS_TEST_OBJECT", object)
         .arg("build")
@@ -341,97 +418,85 @@ fn runner_check(kernel: &crate::Artifacts) -> Result<(), String> {
     Ok(())
 }
 
-/// The suites, a row a test; an error once `deadline` passes. The tests of
-/// a suite run in one boot (`boot`); those that need fork or pipes, or did
-/// not compile, do not run.
-fn suites(deadline: Instant) -> Result<Vec<(String, Verdict, String)>, String> {
-    crate::relibc()?;
-    crate::run_cmd(
-        std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
-    )?;
-    let work = target_dir().join("os-test");
-    let elfs = work.join("elfs");
-    std::fs::create_dir_all(&elfs).map_err(|e| format!("{}: {e}", elfs.display()))?;
-    let tests = tests_of(&work)?;
-    let kernel = build(Variant::Normal)?;
-    let left = |what: &str| {
-        deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-            .ok_or_else(|| format!("os-test spent its {} s {what}", BUDGET.as_secs()))
-    };
-    // What each test gave: a verdict and its text, or none yet.
-    let mut rows: Vec<Option<(Verdict, String)>> = Vec::new();
-    for test in &tests {
-        let source = source_of(&work, test)?;
-        rows.push(if needs_processes(&source) {
-            Some((Verdict::Unsupported, "needs fork or pipes".to_owned()))
-        } else if let Some(failed) = test.built.strip_prefix('!') {
-            // A test that did not compile: os-test's outcome for it.
-            let text = format!("{failed}\n");
-            let verdict = if passes(&work, test, &text)? {
-                Verdict::Pass
-            } else {
-                Verdict::Fail
-            };
-            Some((verdict, text))
-        } else {
-            None
-        });
-    }
-    runner_check(&kernel)?;
-    let mut suites: Vec<&str> = Vec::new();
-    for test in &tests {
-        if !suites.contains(&test.suite.as_str()) {
-            suites.push(&test.suite);
+/// The suites as jobs, a boot for each: the rows of its tests go into
+/// `rows` when its job ends. The tests that need fork or pipes, or did not
+/// compile, get their rows before any boot.
+fn suite_jobs(
+    work: &Path,
+    tests: Vec<Test>,
+    kernel: &crate::Artifacts,
+    rows: &Rows,
+    started: &Arc<OnceLock<Instant>>,
+) -> Result<Vec<Job>, String> {
+    let tests = Arc::new(tests);
+    let mut suites: Vec<String> = Vec::new();
+    for test in tests.iter() {
+        if !suites.contains(&test.suite) {
+            suites.push(test.suite.clone());
         }
     }
+    let mut jobs = Vec::new();
     for suite in suites {
-        let mut files = Vec::new();
-        let mut places = Vec::new();
-        for (place, test) in tests.iter().enumerate() {
-            if test.suite == suite && rows[place].is_none() {
-                left(&format!("before {}", test.name))?;
-                files.push((test.name.clone(), test_elf(test, &test.built, &elfs)?));
-                places.push(place);
+        let (work, tests, kernel) = (work.to_path_buf(), Arc::clone(&tests), kernel.clone());
+        let (rows, started) = (Arc::clone(rows), Arc::clone(started));
+        jobs.push(crate::jobs::job(&format!("os-test {suite}"), move || {
+            let deadline = *started.get_or_init(Instant::now) + BUDGET;
+            let left = |what: &str| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|left| !left.is_zero())
+                    .ok_or_else(|| format!("os-test spent its {} s {what}", BUDGET.as_secs()))
+            };
+            let elfs = work.join("elfs");
+            std::fs::create_dir_all(&elfs).map_err(|e| format!("{}: {e}", elfs.display()))?;
+            let mut files = Vec::new();
+            let mut places = Vec::new();
+            for (place, test) in tests.iter().enumerate() {
+                let empty = rows.lock().unwrap_or_else(PoisonError::into_inner)[place].is_none();
+                if test.suite == suite && empty {
+                    left(&format!("before {}", test.name))?;
+                    files.push((test.name.clone(), test_elf(test, &test.built, &elfs)?));
+                    places.push(place);
+                }
             }
-        }
-        if files.is_empty() {
-            continue;
-        }
-        let image = format!("os-test-{suite}.img");
-        let (log, _) = boot(
-            &kernel,
-            &image,
-            rootfs::os_test(&files),
-            left(&format!("in {suite}"))?.min(TIMEOUT),
-        )?;
-        for place in places {
-            let test = &tests[place];
-            rows[place] = Some(match outcome(&log, &test.name) {
-                Ended::Exited(text) if passes(&work, test, &text)? => (Verdict::Pass, text),
-                Ended::Exited(text) | Ended::Failed(text) => (Verdict::Fail, text),
-            });
-        }
+            if files.is_empty() {
+                return Ok(());
+            }
+            let image = format!("os-test-{suite}.img");
+            let (log, _) = boot(
+                &kernel,
+                &image,
+                rootfs::os_test(&files),
+                left(&format!("in {suite}"))?.min(TIMEOUT),
+            )?;
+            for place in places {
+                let test = &tests[place];
+                let (verdict, text) = match outcome(&log, &test.name) {
+                    Ended::Exited(text) if passes(&work, test, &text)? => (Verdict::Pass, text),
+                    Ended::Exited(text) | Ended::Failed(text) => (Verdict::Fail, text),
+                };
+                println!(
+                    "os-test {}: {} ({})",
+                    test.name,
+                    verdict.name(),
+                    first_line(&text)
+                );
+                rows.lock().unwrap_or_else(PoisonError::into_inner)[place] =
+                    Some((test.name.clone(), verdict, text));
+            }
+            Ok(())
+        }));
     }
-    let rows: Vec<(String, Verdict, String)> = tests
-        .iter()
-        .zip(rows)
-        .map(|(test, row)| {
-            let (verdict, text) = row.expect("every test has a row");
-            println!(
-                "os-test {}: {} ({})",
-                test.name,
-                verdict.name(),
-                first_line(&text)
-            );
-            (test.name.clone(), verdict, text)
-        })
-        .collect();
-    let path = write(&rows)?;
-    println!("os-test: {}", score(&rows));
-    println!("os-test table: {}", path.display());
-    Ok(rows)
+    Ok(jobs)
+}
+
+/// The check of the runner as a job for the serial set: it reads the host's
+/// time (a hung test is killed after a second).
+pub fn runner_check_job() -> Job {
+    crate::jobs::job("os-test runner check", || {
+        crate::relibc()?;
+        runner_check(&build(Variant::Normal)?)
+    })
 }
 
 /// `cargo xtask os-test --one NAME`: the test `NAME` alone in a boot of
@@ -490,7 +555,7 @@ fn first_line(text: &str) -> &str {
 }
 
 /// `PASS n, FAIL n, UNSUPPORTED n of n`.
-fn score(rows: &[(String, Verdict, String)]) -> String {
+fn score(rows: &[Row]) -> String {
     let count = |v| rows.iter().filter(|row| row.1 == v).count();
     format!(
         "PASS {}, FAIL {}, UNSUPPORTED {} of {}",
@@ -502,7 +567,7 @@ fn score(rows: &[(String, Verdict, String)]) -> String {
 }
 
 /// target/measure/os-test.txt: the score and a row a test.
-fn write(rows: &[(String, Verdict, String)]) -> Result<PathBuf, String> {
+fn write(rows: &[Row]) -> Result<PathBuf, String> {
     let dir = target_dir().join("measure");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut text = format!(

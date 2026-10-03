@@ -118,7 +118,7 @@ pub struct SpawnParams<'a> {
     /// the program's requests, the CLIENT_GONE of its start channel and
     /// the notification of its end come.
     pub channel: &'a Handle<Channel>,
-    /// The label that names the program there, not 0; the parent gives
+    /// The label above 0 that names the program there; the parent gives
     /// each program its own (init from a 64-bit count, spec 13.4). Its
     /// slot, which the exit notification and CLIENT_GONE go into, has
     /// priority `notice`.

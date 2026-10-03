@@ -20,8 +20,8 @@ positioned and read at EOF, while writes beyond capacity report `NoSpace`.
 Zero-length file reads and writes now reach the service, so it validates
 the descriptor and access mode. Zero-length writes leave the file length
 unchanged, even when the current offset is beyond EOF. Reading a write-only
-file or writing a read-only file now reports `BadFileDescriptor` instead
-of an invalid-request error. Console zero-length operations retain their
+file or writing a read-only file now reports `BadFileDescriptor`, where it once
+reported an invalid-request error. Console zero-length operations retain their
 non-blocking behavior.
 
 Two new RAM host tests and the guest probe verify origins, 64-bit extremes,

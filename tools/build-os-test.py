@@ -101,7 +101,7 @@ def fetch() -> None:
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=SOURCE, capture_output=True,
                           text=True, check=True).stdout.strip()
     if head != COMMIT:
-        raise SystemExit(f"os-test is at {head}, not {COMMIT}")
+        raise SystemExit(f"os-test is at {head}, expected {COMMIT}")
 
 
 def main() -> None:

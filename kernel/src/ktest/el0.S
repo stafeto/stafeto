@@ -395,8 +395,9 @@ el0_take_then_exit:
     svc     #CALL_PROCESS_EXIT
     svc     #SVC_DONE
 
-// As el0_take_then_exit, but instead of the exit receive(x2 another
-// channel, 0), where nothing comes: the service waits until it is killed.
+// As el0_take_then_exit, but it ends in receive(x2 another channel,
+// 0), where nothing comes, and has no exit: the service waits until it is
+// killed.
 .global el0_take_then_wait
 el0_take_then_wait:
     mov     x19, x0

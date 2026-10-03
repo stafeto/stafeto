@@ -1959,7 +1959,7 @@ fn with_timer(
 /// spent with NO_MEMORY for a page of its pool of timers, with nothing
 /// made; with every slot of the channel taken, LIMIT_REACHED comes before
 /// the quota (spec 6.5). A good call returns a handle with
-/// abi::OWNER_RIGHTS to a timer the caller pays for, not armed; timer_set
+/// abi::OWNER_RIGHTS to a timer the caller pays for, unarmed; timer_set
 /// arms it at its deadline in ticks and timer_cancel takes it off the
 /// heap, and timer_set on a closed channel fails with PEER_CLOSED and
 /// leaves the timer armed as it was. The checks of the calls, the

@@ -155,10 +155,10 @@ command line tools for `swiftc` and `codesign`.
 cargo xtask build        # kernel and boot image in target/, checks the 200 KiB budget
 cargo xtask run          # QEMU to the shell prompt (Ctrl-A X quits); --hvf on Apple silicon
 cargo xtask vz           # the shell through Apple Virtualization.framework (Ctrl-C quits)
-cargo xtask test         # host tests, boot checks, shell dialog, init and kernel tests, POSIX probes
-cargo xtask ci           # formatting, clippy, licence checks, then everything test does
+cargo xtask test         # host tests, boot checks, shell dialog, init and kernel tests, POSIX probes; --jobs N boots at a time
+cargo xtask ci           # formatting, clippy, licence checks, then everything test does; --jobs N as in test
 cargo xtask hvf          # the test set under HVF on Apple silicon; skips elsewhere
-cargo xtask rtbench      # throughput and 1 ms timer wakeups on TCG, HVF and VZ
+cargo xtask rtbench      # throughput and 1 ms timer wakeups on TCG, HVF and VZ; --minutes N runs HVF and VZ together
 cargo xtask ash-shell    # interactive BusyBox ash over the QEMU UART
 cargo xtask os-test      # os-test's io and malloc suites on relibc, a table in target/measure/
 cargo xtask gdb          # QEMU halted at the first instruction, debugger on :1234

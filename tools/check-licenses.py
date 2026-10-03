@@ -357,7 +357,7 @@ def relibc() -> None:
 
 def write_notices(notices) -> None:
     """The licence files of each part; a text met before (equal but for
-    spacing) is named, not repeated. A file may be a text of its own."""
+    spacing) is named and written once. A file may be a text of its own."""
     parts = ["Third-party notices: relibc, the crates the layer takes from"
              " outside, and what they link into stafeto programs.\n"]
     seen = {}

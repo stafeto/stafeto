@@ -49,7 +49,7 @@ in a row for it.
 ## Measurements
 
 `cargo xtask rtbench --minutes 10` has rows S10 to S13 (see
-[status](../docs/status.md)). The group of S12 has seven members, not 32:
+[status](../docs/status.md)). The group of S12 has seven members:
 every child is a record of `init`'s table, which holds 16, and a record has
 one live child.
 

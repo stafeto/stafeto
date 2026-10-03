@@ -1772,7 +1772,7 @@ fn process_kill_returns_after_the_teardown() -> Outcome {
     )?;
     check(
         memory.is_ok_and(|m| m.used == 2 * PAGE as u64 && m.used + m.returned == m.quota),
-        "the child's quota was not back but for its two pages of pools when process_kill returned",
+        "the child's quota held more than its two pages of pools when process_kill returned",
     )
 }
 
