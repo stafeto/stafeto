@@ -36,6 +36,7 @@ pub struct Endpoint {
 struct Description {
     generation: u32,
     references: u32,
+    pins: u32,
     endpoint: Endpoint,
 }
 impl Description {
@@ -43,6 +44,7 @@ impl Description {
         Self {
             generation: 0,
             references: 0,
+            pins: 0,
             endpoint: Endpoint {
                 terminal: 0,
                 generation: 0,
@@ -62,6 +64,7 @@ pub struct Instance {
     pub mode: u32,
     masters: u32,
     slaves: u32,
+    pins: u32,
     linked: bool,
 }
 impl Instance {
@@ -75,6 +78,7 @@ impl Instance {
             mode: 0,
             masters: 0,
             slaves: 0,
+            pins: 0,
             linked: false,
         }
     }
@@ -179,6 +183,7 @@ impl Endpoints {
         let d = &mut self.descriptions[index];
         d.generation += 1;
         d.references = 1;
+        d.pins = 0;
         d.endpoint = endpoint;
         let id = d.generation << 8 | index as u32;
         holds.ids[place] = Some(id);
@@ -282,21 +287,34 @@ impl Endpoints {
         d.endpoint.flags = (d.endpoint.flags & !NONBLOCK) | (flags & NONBLOCK);
         Ok(())
     }
-    fn retain(&mut self, id: u32) -> Result<(), Failure> {
+    fn retain(&mut self, id: u32, real: bool) -> Result<(), Failure> {
         let index = self.locate(id)?;
         let d = self.descriptions[index];
         let i = &self.instances[d.endpoint.terminal];
-        let count = match d.endpoint.side {
-            Side::Master => i.masters,
-            Side::Slave => i.slaves,
+        let count = if real {
+            match d.endpoint.side {
+                Side::Master => i.masters,
+                Side::Slave => i.slaves,
+            }
+        } else {
+            i.pins
         };
         let references = d.references.checked_add(1).ok_or(Failure::Overflow)?;
         let count = count.checked_add(1).ok_or(Failure::Overflow)?;
+        let pins = d
+            .pins
+            .checked_add(u32::from(!real))
+            .ok_or(Failure::Overflow)?;
         self.descriptions[index].references = references;
+        self.descriptions[index].pins = pins;
         let i = &mut self.instances[d.endpoint.terminal];
-        match d.endpoint.side {
-            Side::Master => i.masters = count,
-            Side::Slave => i.slaves = count,
+        if real {
+            match d.endpoint.side {
+                Side::Master => i.masters = count,
+                Side::Slave => i.slaves = count,
+            }
+        } else {
+            i.pins = count;
         }
         Ok(())
     }
@@ -324,25 +342,33 @@ impl Endpoints {
             count.checked_add(additional).ok_or(Failure::Overflow)?;
         }
         for id in parent.ids() {
-            self.retain(id)?;
+            self.retain(id, true)?;
         }
         Ok(parent.clone())
     }
     pub fn pin(&mut self, holds: &Holds, id: u32) -> Result<(), Failure> {
         self.resolve(holds, id)?;
-        self.retain(id)
+        self.retain(id, false)
     }
-    fn release(&mut self, id: u32) -> Result<Option<Disconnect>, Failure> {
+    fn release(&mut self, id: u32, real: bool) -> Result<Option<Disconnect>, Failure> {
         let index = self.locate(id)?;
         let d = self.descriptions[index];
+        if (real && d.references == d.pins) || (!real && d.pins == 0) {
+            return Err(Failure::BadDescription);
+        }
         self.descriptions[index].references -= 1;
         let i = &mut self.instances[d.endpoint.terminal];
-        match d.endpoint.side {
-            Side::Master => i.masters -= 1,
-            Side::Slave => i.slaves -= 1,
+        if real {
+            match d.endpoint.side {
+                Side::Master => i.masters -= 1,
+                Side::Slave => i.slaves -= 1,
+            }
+        } else {
+            self.descriptions[index].pins -= 1;
+            i.pins -= 1;
         }
         let disconnected =
-            d.endpoint.terminal != 0 && d.endpoint.side == Side::Master && i.masters == 0;
+            real && d.endpoint.terminal != 0 && d.endpoint.side == Side::Master && i.masters == 0;
         if disconnected {
             i.disconnected = true;
         }
@@ -361,10 +387,10 @@ impl Endpoints {
             .ok_or(Failure::BadDescription)?;
         self.locate(id)?;
         holds.ids[place] = None;
-        self.release(id)
+        self.release(id, true)
     }
     pub fn unpin(&mut self, id: u32) -> Result<Option<Disconnect>, Failure> {
-        self.release(id)
+        self.release(id, false)
     }
     pub fn set_link(
         &mut self,
@@ -382,7 +408,7 @@ impl Endpoints {
     }
     fn recycle(&mut self, terminal: usize) {
         let i = &mut self.instances[terminal];
-        if terminal != 0 && i.masters == 0 && i.slaves == 0 && !i.linked {
+        if terminal != 0 && i.masters == 0 && i.slaves == 0 && i.pins == 0 && !i.linked {
             i.allocated = false;
         }
     }
@@ -393,7 +419,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clone_and_operation_references_delay_last_master_disconnect() {
+    fn real_clones_keep_the_line_and_pins_only_keep_the_instance() {
         let mut table = Endpoints::new();
         let mut parent = Holds::new();
         let master = table.open_master(&mut parent, 2).unwrap();
@@ -403,8 +429,7 @@ mod tests {
         let mut child = table.clone_holds(&parent).unwrap();
         table.pin(&child, master).unwrap();
         assert_eq!(table.close(&mut parent, master), Ok(None));
-        assert_eq!(table.close(&mut child, master), Ok(None));
-        let effect = table.unpin(master).unwrap().unwrap();
+        let effect = table.close(&mut child, master).unwrap().unwrap();
         assert_eq!(effect.terminal, 1);
         assert!(table.instance(1).unwrap().disconnected);
         assert_eq!(
@@ -415,6 +440,9 @@ mod tests {
         assert_eq!(table.close(&mut parent, slave), Ok(None));
         assert!(table.instance(1).is_some());
         assert_eq!(table.close(&mut child, slave), Ok(None));
+        assert!(table.instance(1).is_some());
+        assert!(table.pinned(master).is_ok());
+        assert_eq!(table.unpin(master), Ok(None));
         assert!(table.instance(1).is_none());
         let fresh = table.open_master(&mut parent, 2).unwrap();
         assert_ne!(fresh, master);
