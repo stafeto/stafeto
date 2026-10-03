@@ -268,8 +268,15 @@ Bounded kernel paths and their costs:
 | POSIX: spawn and exec | boot image files in the RAM service, a loader, `posix_spawn` and `exec` from files, set-ID through the file service, os-test from files, measured steps of the process service | ✅ [#78](https://github.com/stafeto/stafeto/pull/78) |
 | POSIX: fork | `fork` with the loader copying the parent; the other threads stop for it; `ash` runs external programs; rtbench rows by memory size | ✅ [#79](https://github.com/stafeto/stafeto/pull/79) |
 | POSIX: pipes | a pipe service, `pipe`, ends across `fork`, `posix_spawn` and `exec`, `SA_RESTART` and `SIGCHLD` in the shell, `setpgid` of a child, `/dev/null`; `ash` runs `ls \| cat`; rtbench rows of pipes | ✅ [#80](https://github.com/stafeto/stafeto/pull/80) |
-| POSIX: terminal | a terminal service with `termios` and job control, `poll` and `select`, Ctrl-C to the foreground group | 🚧 |
-| POSIX: conformance | os-test and Open POSIX in `ci`; then timers, `sigqueue` | ⬜ |
+| POSIX: terminal | a terminal service with `termios`, pseudo-terminals, job control, `poll` and `select`, Ctrl-C to the foreground group, the missing `ash` built-ins | 🚧 |
+| POSIX: random numbers | an entropy service on Virtio entropy, a ChaCha20 generator in the layer, `getentropy`, `/dev/random` and `/dev/urandom` | 🚧 |
+| POSIX: files with writing | the RAM file service creates files and directories, `/tmp`, `fcntl` locks, FIFOs | ⬜ |
+| POSIX: conformance | the full os-test suite and Open POSIX in `ci`, honest headers and `sysconf`, `cargo xtask coverage` checking the standard's interface list against the C library at every step | ⬜ |
+| POSIX: timers and scheduling | POSIX timers, CPU time, `SCHED_FIFO` and `SCHED_RR`, queued signals | ⬜ |
+| POSIX: shared memory | file `mmap`, `mprotect`, `shm_open`, named semaphores | ⬜ |
+| POSIX: rest of the C library | complex and long double math, `fenv`, `iconv`, message catalogues, `wordexp`, user and group databases | ⬜ |
+| POSIX: local sockets | AF_UNIX sockets; IPv4 comes with the network subproject | ⬜ |
+| POSIX: utilities | the POSIX utilities from BusyBox and the missing ones | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |
 
 ### Later subprojects
@@ -277,7 +284,7 @@ Bounded kernel paths and their costs:
 - Graphics and input: virtio-gpu, touch input, a compositor; Doomgeneric started from `ash` as the first playable target.
 - Phone shell: home screen, notifications, settings, a UI toolkit.
 - Packages: package format, signatures, app sandbox.
-- Network: virtio-net and a TCP/IP stack.
+- Network: virtio-net, a TCP/IP stack and IPv4 sockets.
 - SMP: more than one CPU core.
 
 ## License
