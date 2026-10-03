@@ -574,10 +574,11 @@ pub unsafe extern "C" fn stafeto_ioctl(
             if let Some(terminal) = transport.terminal_number(target) {
                 return terminal_ioctl(transport, terminal, request, argument);
             }
-            let info = transport
-                .descriptor_information(target)
-                .map_err(posix_abi::error)?;
-            match (request, info.kind == 3) {
+            let console = matches!(
+                target,
+                posix_fs::Target::Input | posix_fs::Target::Output | posix_fs::Target::Error
+            );
+            match (request, console) {
                 (TCGETS, true) => {
                     if argument.is_null() {
                         return Err(EFAULT);
