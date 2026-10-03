@@ -93,19 +93,22 @@ pub const BUSYBOX_TABLE: &[Record] = &[
 /// services and the launcher (the program of `busybox-probe`, whose
 /// argument `ash-launch` makes it start `/bin/ash` from its file, 5d). The
 /// shell is a child, and so is each command it forks: the pool of the
-/// process service holds the quota of three more processes of the
-/// launcher's size, and the reserve of its loaders.
+/// process service holds the quota of five more processes of the
+/// launcher's size (the shell, the three of a pipeline of three, and a
+/// nested shell's command), and the reserve of its loaders. The pipe service (5e)
+/// serves the shell's pipelines.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     TABLE[0],
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 3 * DIALOG_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota + 5 * DIALOG_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],
+    PIPE,
     Record {
         args: b"ash-launch\0",
-        connects: &["ramfs", "uart", "clock", "posix"],
+        connects: &["ramfs", "uart", "pipe", "clock", "posix"],
         quota: DIALOG_QUOTA,
         ..BUSYBOX_TABLE[3]
     },
@@ -317,19 +320,24 @@ const PROCS_QUOTA: u64 = 512 * PAGE;
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the process and clock services, and
 /// the runner, whose children are the tests, started from their files
-/// (5c), one at a time and one more for the exec of a test that execs.
+/// (5c), one at a time, with room for one more for the exec of a test
+/// that execs, for the processes of a test of groups (a test, its unreaped
+/// child, a grandchild and another child) and for the three that the tests
+/// of an emptied group leave alive for good: their child holds both ends of
+/// its pipe and reads one (5e).
 pub const OS_TEST_TABLE: &[Record] = &[
     TABLE[0],
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 4 * OS_TEST_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota + 10 * OS_TEST_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],
+    PIPE,
     Record {
         name: "os-test-run",
         program: "os-test-run",
         args: b"os-test-run\0",
-        connects: &["ramfs", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix"],
         root: true,
         quota: OS_TEST_QUOTA,
         ..POSIX

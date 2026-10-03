@@ -4,7 +4,8 @@
 # The os-test tests that pass on stafeto (cargo xtask os-test): `ci`
 # fails when one of them does not. A test that starts to pass joins it.
 # Those of basic/ and the exec tests of signal/ run from files (5c); the
-# tests of process/ and the others that call fork run on fork (5d).
+# tests of process/ and the others that call fork run on fork (5d), and
+# those that call pipe on the pipe service (5e).
 io/open-tmpdir-rdonly-append
 io/open-tmpdir-rdonly-creat
 io/open-tmpdir-rdonly-directory
@@ -86,3 +87,42 @@ basic/pthread/pthread_atfork
 basic/sys_wait/wait
 basic/sys_wait/waitid
 basic/sys_wait/waitpid
+io/open-clofork-fork
+process/fork-exec-setpgid-in-parent
+process/fork-setpgid-another-undo-redo
+process/fork-setpgid-another-undo-undo
+process/fork-setpgid-undo-redo
+process/fork-setpgid-undo
+process/fork-setsid-setpgid-in-parent-move
+process/fork-setsid-setpgid-in-parent
+process/fork-setsid-setpgid-move
+process/limbo-getpgid
+process/limbo-setpgid
+basic/unistd/pipe
+basic/unistd/pipe2
+basic/pthread/pthread_cancel
+basic/pthread/pthread_cleanup_pop
+basic/pthread/pthread_cleanup_push
+basic/signal/kill
+basic/signal/killpg
+basic/fmtmsg/fmtmsg
+basic/stdio/dprintf
+basic/stdio/fdopen
+basic/stdio/getchar
+basic/stdio/getchar_unlocked
+basic/stdio/printf
+basic/stdio/putchar
+basic/stdio/putchar_unlocked
+basic/stdio/puts
+basic/stdio/scanf
+basic/stdio/vdprintf
+basic/stdio/vprintf
+basic/stdio/vscanf
+basic/wchar/getwchar
+basic/wchar/putwchar
+basic/wchar/vwprintf
+basic/wchar/wprintf
+process/waitpid-pgid
+process/waitpid-pgid-empty-on-setpgid
+process/waitpid-pgid-empty-on-setpgid-rejoin
+process/waitpid-pgid-empty-on-setsid

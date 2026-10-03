@@ -546,6 +546,35 @@ impl Processes {
         }
     }
 
+    /// A child of the record in `parent` moved between groups (the waits of its parent when it
+    /// moved itself): the waits of `parent` for a
+    /// group are told, for the child that left the group is none of
+    /// theirs now (ECHILD when it was the last). WAITS_OF_RECORD tells at
+    /// most, as the end of a child.
+    fn tell_groups(&mut self, parent: usize) {
+        let ops = &self.ops;
+        let mut list = [None; WAITS_OF_RECORD];
+        let found = self.waits.told(
+            parent,
+            |selector| matches!(selector, Selector::Group(_)),
+            |w| ops.waits(w.label, w.key),
+        );
+        for (place, w) in list.iter_mut().zip(found) {
+            *place = Some(w);
+        }
+        for w in list.into_iter().flatten() {
+            self.ops.tell(w.label, w.key);
+        }
+    }
+
+    /// The record in `index` moved between groups itself: its parent's
+    /// waits for a group are told.
+    fn tell_parent_groups(&mut self, index: usize) {
+        if let Some(parent) = self.records.get(index).and_then(|r| r.parent_index) {
+            self.tell_groups(usize::from(parent));
+        }
+    }
+
     /// What a wait of the record in `parent` with `selector` and `options`
     /// finds now: the first zombie child it takes, which goes unless
     /// WNOWAIT (the parent's other waits that take it are told); ECHILD
@@ -1043,6 +1072,13 @@ impl Processes {
         match self.records.set_pgid(index, pid, pgid) {
             Ok(()) => {
                 self.publish_group(index);
+                // A child moved: the caller's waits; the caller itself: its
+                // parent's.
+                if pid != 0 && Some(pid) != self.records.get(index).map(|r| r.label.pid()) {
+                    self.tell_groups(index);
+                } else {
+                    self.tell_parent_groups(index);
+                }
                 Answer::Status(Status::Ok)
             }
             Err(e) => refuse(group_error(e)),
@@ -1057,6 +1093,7 @@ impl Processes {
         match self.records.set_sid(index) {
             Ok(sid) => {
                 self.publish_group(index);
+                self.tell_parent_groups(index);
                 number(r, sid)
             }
             Err(e) => refuse(group_error(e)),

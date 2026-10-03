@@ -444,10 +444,11 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 7] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -2076,6 +2077,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: pipes within a process and across fork",
         // The signals of the shell and setpgid of a child of fork (5e, T4).
         "posix-procs: shell signals and setpgid of a child",
+        // /dev/null (5e, T5): 1 MiB written, nothing kept.
+        "posix-procs: /dev/null drops 1 MiB",
         // Across spawn, fork and exec: cat on two pipes, the ends' numbers,
         // the waiters of an old image, the loader's refusal, ash's pipeline.
         "posix-procs: ash -c ran ls | cat",
@@ -2444,12 +2447,15 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "4", "ash", busybox.clone()),
-        ("-rwxr-xr-x", "4", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "4", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "4", "ls", busybox),
+        ("-rwxr-xr-x", "5", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "5", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "5", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "5", "ls", busybox.clone()),
+        ("-rwxr-xr-x", "5", "wc", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
+    // The entries of /bin: the table of the image lists them (rootfs.rs).
+    let bin_count = bin_listing.len().to_string();
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
@@ -2590,6 +2596,52 @@ fn ash_dialog() -> Result<(), String> {
             |line| line == "after-cd-error",
             DIALOG_STEP,
         )?;
+        run.expect("# ", DIALOG_STEP)?;
+        // Pipelines (5e): each side a child of the shell, the ends of the
+        // pipe service's pipes as its standard streams.
+        run.send("ls /etc | cat")?;
+        run.expect("ls /etc | cat", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo hello | cat | cat")?;
+        run.expect("echo hello | cat | cat", DIALOG_STEP)?;
+        run.expect_line("hello", |line| line == "hello", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("ls /bin | wc -l")?;
+        run.expect("ls /bin | wc -l", DIALOG_STEP)?;
+        run.expect_line(
+            "the count of /bin",
+            |line| line.trim() == bin_count,
+            DIALOG_STEP,
+        )?;
+        run.expect("# ", DIALOG_STEP)?;
+        // A writer that writes nothing and outlasts its reader's start: the
+        // reader sits in `read` on the empty pipe when the last end of the
+        // writer closes, and that end wakes it.
+        run.send("(/bin/ls /bin > /dev/null) | cat; echo piped $?")?;
+        run.expect_line("piped 0", |line| line == "piped 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ls /nope | /bin/cat; echo status $?")?;
+        run.expect_line("status 0", |line| line == "status 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // A job in the background reads /dev/null; `wait` returns when it
+        // ends and gives its status.
+        run.send("/bin/ls /etc & wait")?;
+        run.expect("/bin/ls /etc & wait", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo job-ended & wait; echo wait $?")?;
+        run.expect_line("job-ended", |line| line == "job-ended", DIALOG_STEP)?;
+        run.expect_line("wait 0", |line| line == "wait 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // Whatever a command writes to /dev/null is gone, and its input
+        // from there is at the end.
+        run.send("echo lost > /dev/null && echo gone; echo more >> /dev/null && echo gone-too")?;
+        run.expect_line("gone", |line| line == "gone", DIALOG_STEP)?;
+        run.expect_line("gone-too", |line| line == "gone-too", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("cat < /dev/null; echo null $?")?;
+        run.expect_line("null 0", |line| line == "null 0", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("exit")?;
         run.expect("exit", DIALOG_STEP)?;

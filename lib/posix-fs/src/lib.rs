@@ -10,7 +10,7 @@ use core::mem::ManuallyDrop;
 pub use posix_fd::Flags as DescriptorFlags;
 use posix_fd::{Error as DescriptorError, Table};
 use posix_path::{MAX_PATH, PathError, PathState};
-pub use proto_fs::{DIRECTORY_ONLY, MAX_READ, NodeInfo, SeekFrom};
+pub use proto_fs::{CHANGES, DIRECTORY_ONLY, MAX_READ, NodeInfo, SeekFrom};
 use proto_wire::Status;
 use rt::Handle;
 use rt::fs::{Files, View};

@@ -170,6 +170,12 @@
  * gives EACCES once the child execed or for a child of posix_spawn, and
  * EPERM for a child that leads its own session.
  *
+ * Stage null device (5e): /dev/null takes 1 MiB in writes of 4 KiB (each
+ * cut at the layer's message) and keeps nothing: every write returns a count, the size stays 0
+ * (fstat, stat, lseek to the end), reads are at the end of the file, and an
+ * ordinary file of the image next to it stays read-only; O_CREAT, O_TRUNC
+ * and O_APPEND open the device (a shell's `> /dev/null`) and refuse the file.
+ *
  * Stage 10: the probe is a record of init's table, and its end is init's
  * line: the probe execs a child's role that exits with 42, and init
  * reports that status (REPLACED), never the old image's 0.
@@ -3300,6 +3306,66 @@ static int setpgid_fork(void) {
     return failures;
 }
 
+/* /dev/null (5e, T5): writes are dropped, reads end at once. */
+static void null_device(void) {
+    char null_block[4096];
+    memset(null_block, 'x', sizeof null_block);
+    int fd = open("/dev/null", O_WRONLY);
+    expect("open of /dev/null for writing", fd >= 0 ? 0 : errno, 0);
+    /* A write of a file is cut at one message of the layer (a short count
+     * POSIX allows); the device takes every byte the layer passes on. */
+    long total = 0;
+    for (int n = 0; n < 256; n++) {
+        size_t left = sizeof null_block;
+        while (left > 0) {
+            ssize_t wrote = write(fd, null_block + (sizeof null_block - left), left);
+            if (wrote <= 0 || (size_t)wrote > left) {
+                printf("posix-procs: write %d to /dev/null gave %ld (%s)\n", n, (long)wrote, strerror(errno));
+                failures++;
+                break;
+            }
+            left -= (size_t)wrote;
+            total += wrote;
+        }
+    }
+    expect("the bytes written to /dev/null", total == 1048576L, 1);
+    struct stat st;
+    memset(&st, 0xff, sizeof st);
+    expect("fstat of /dev/null", fstat(fd, &st), 0);
+    expect("its size after 1 MiB", (int)st.st_size, 0);
+    expect("lseek to its end", (int)lseek(fd, 0, SEEK_END), 0);
+    expect("a write of one byte", (int)write(fd, "y", 1), 1);
+    expect("close of the writer", close(fd), 0);
+    memset(&st, 0xff, sizeof st);
+    expect("stat of /dev/null", stat("/dev/null", &st), 0);
+    expect("its size by path", (int)st.st_size, 0);
+    fd = open("/dev/null", O_RDWR);
+    expect("open of /dev/null for both", fd >= 0 ? 0 : errno, 0);
+    char got[8] = "zzzzzzz";
+    expect("a read of /dev/null", (int)read(fd, got, sizeof got), 0);
+    expect("the buffer a read left", got[0], 'z');
+    expect("a write through O_RDWR", (int)write(fd, null_block, 100), 100);
+    expect("a read after it", (int)read(fd, got, sizeof got), 0);
+    close(fd);
+    fd = open("/dev/null", O_RDONLY);
+    expect("open of /dev/null for reading", fd >= 0 ? 0 : errno, 0);
+    expect("a write to the read end", write(fd, "y", 1) == -1 ? errno : 0, EBADF);
+    close(fd);
+    /* What a shell's `> /dev/null` and `>> /dev/null` open. */
+    fd = open("/dev/null", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    expect("open of /dev/null with O_CREAT and O_TRUNC", fd >= 0 ? 0 : errno, 0);
+    expect("a write after it", (int)write(fd, null_block, 100), 100);
+    close(fd);
+    fd = open("/dev/null", O_WRONLY | O_APPEND);
+    expect("open of /dev/null with O_APPEND", fd >= 0 ? 0 : errno, 0);
+    expect("a write in append mode", (int)write(fd, null_block, 100), 100);
+    close(fd);
+    /* A file of the image beside it is no device. */
+    expect("open of /bin/data with O_TRUNC", open("/bin/data", O_WRONLY | O_TRUNC) == -1 ? errno : 0, EINVAL);
+    expect("open of /bin/data for writing", open("/bin/data", O_WRONLY) == -1 ? errno : 0, EACCES);
+    if (failures == 0) printf("posix-procs: /dev/null drops 1 MiB\n");
+}
+
 int main(int argc, char **argv) {
     argc_seen = argc;
     argv_seen = argv;
@@ -3346,6 +3412,8 @@ int main(int argc, char **argv) {
     pipes();
     printf("posix-procs: stage shell signals\n");
     shell_signals();
+    printf("posix-procs: stage null device\n");
+    null_device();
     printf("posix-procs: stage wave\n");
     wave();
     if (failures != 0) return 1;

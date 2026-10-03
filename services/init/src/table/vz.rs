@@ -143,6 +143,7 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::ramfs::BUSYBOX_DIALOG_TABLE[2],
     super::ramfs::BUSYBOX_DIALOG_TABLE[3],
     super::ramfs::BUSYBOX_DIALOG_TABLE[4],
+    super::ramfs::BUSYBOX_DIALOG_TABLE[5],
 ];
 
 /// The probes of console input and interruption, as

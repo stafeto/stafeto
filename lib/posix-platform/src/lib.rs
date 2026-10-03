@@ -139,7 +139,9 @@ const O_NONBLOCK: c_int = 0o4000;
 /// O_CREAT, O_TRUNC and O_APPEND name a directory as POSIX has it: EISDIR
 /// for O_CREAT without O_DIRECTORY and for O_TRUNC or O_APPEND with write
 /// access; O_APPEND for reading opens the directory; on anything else they
-/// answer EINVAL (the service creates, truncates and appends nothing yet).
+/// go to the service, which takes them for the null device only and
+/// answers EINVAL for any other file (it creates, truncates and appends
+/// nothing yet).
 ///
 /// # Safety
 /// `path` is a live C string.
@@ -163,6 +165,7 @@ pub unsafe extern "C" fn stafeto_openat(
         Ok(name) => name,
         Err(errno) => return -errno,
     };
+    let mut ours_changes = 0;
     if flags & changes != 0 {
         let reads = flags & O_ACCMODE == O_RDONLY;
         let creates = flags & O_CREAT != 0 && flags & O_DIRECTORY == 0;
@@ -170,11 +173,12 @@ pub unsafe extern "C" fn stafeto_openat(
         if directory && (creates || !reads) {
             return -EISDIR;
         }
+        // The null device takes them; the service refuses any other file.
         if !(directory && flags & changes == O_APPEND) {
-            return -EINVAL;
+            ours_changes = posix_abi::constants::O_CHANGES;
         }
     }
-    let mut ours = flags & O_ACCMODE;
+    let mut ours = flags & O_ACCMODE | ours_changes;
     if flags & O_DIRECTORY != 0 {
         ours |= posix_abi::constants::O_DIRECTORY;
     }

@@ -1452,7 +1452,15 @@ mod tests {
         );
         assert_eq!(
             order_of(vz::BUSYBOX_DIALOG_TABLE),
-            ["uart", "ramfs", "posix", "clock", "busybox-probe"]
+            ["uart", "ramfs", "posix", "clock", "pipe", "busybox-probe"]
+        );
+        assert_eq!(
+            order_of(ramfs::BUSYBOX_DIALOG_TABLE),
+            ["uart", "ramfs", "posix", "clock", "pipe", "busybox-probe"]
+        );
+        assert_eq!(
+            order_of(ramfs::OS_TEST_TABLE),
+            ["ramfs", "posix", "clock", "pipe", "os-test-run"]
         );
         assert_eq!(order_of(vz::RTBENCH_TABLE), ["uart", "rtbench"]);
         assert_eq!(

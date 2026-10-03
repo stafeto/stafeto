@@ -237,16 +237,19 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
 /// Open: the path resolved under the lock, the service's open outside it,
 /// then the descriptor under it again.
 fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
-    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK) != 0
+    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES) != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
         return Err(EINVAL);
     }
-    let directory = if flags & O_DIRECTORY != 0 {
+    let mut directory = if flags & O_DIRECTORY != 0 {
         posix_fs::DIRECTORY_ONLY
     } else {
         0
     };
+    if flags & O_CHANGES != 0 {
+        directory |= posix_fs::CHANGES;
+    }
     let (transport, opened) = resolved(path, |transport, path| {
         if path.trailing_slash
             && transport.stat(path).map_err(crate::error)?.kind == posix_fs::FileKind::Regular
