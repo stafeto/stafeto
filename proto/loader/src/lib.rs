@@ -19,9 +19,14 @@
 //!   image is ready", or one of the codes below.
 //! - Handles: body the slot of each handle u32 (`Slot::Files`, `Clock`,
 //!   `Driver`, `Pipes`, `Terminal`, `Entropy`, each once over all Handles) and as many
-//!   handles, sessions with SEND, after "the image is ready" (after Fork for
-//!   a copy); reply its status. One message takes abi::MESSAGE_HANDLES
-//!   handles at most: additional sessions goes in a second Handles.
+//!   handles, sessions with SEND, before Go for spawn and after Go for
+//!   exec or fork; reply its status. One message takes abi::MESSAGE_HANDLES
+//!   handles at most: additional sessions go in a second Handles.
+//! - HandlesDone: empty body and no handles, once after all Handles,
+//!   including an empty bundle. It checks every required slot before
+//!   Commit. Later Handles or HandlesDone are refused. Early Handles
+//!   require HandlesDone before Go. The process service hears Ready once
+//!   both Go and HandlesDone succeeded, before the parent's final reply.
 //! - Fork, in place of Start (spec 2, 3.2; 5d): body `Fork`, the copy of
 //!   the parent's memory the loader makes for a `fork`; reply its status,
 //!   BAD_SIZE past REGIONS_MAX regions or a second Fork or Start.
@@ -60,7 +65,7 @@
 use core::ops::Range;
 use proto_wire::{Header, Reader, Status};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// The region of the loader: 16 MiB under the top of a process's lower
 /// half (spec 2, 3.2), which no program's segment may take.
@@ -183,6 +188,7 @@ pub enum Method {
     Fork = 4,
     Regions = 5,
     TerminalActions = 6,
+    HandlesDone = 7,
 }
 
 impl Method {
@@ -201,6 +207,7 @@ impl Method {
             4 => Some(Method::Fork),
             5 => Some(Method::Regions),
             6 => Some(Method::TerminalActions),
+            7 => Some(Method::HandlesDone),
             _ => None,
         }
     }
@@ -373,8 +380,8 @@ impl<'a> Block<'a> {
     /// The descriptors the child starts with.
     /// Whether the block's descriptors need a session in `slot` to mean
     /// anything: a RAM file needs Files, a pipe needs Pipes (5e), and a
-    /// terminal needs Terminal (5f). The loader answers a Handles that leaves such a
-    /// slot empty with BAD_SIZE.
+    /// terminal needs Terminal (5f). HandlesDone answers BAD_SIZE for a
+    /// required slot left empty.
     pub fn needs(&self, slot: Slot) -> bool {
         self.descriptors().any(|d| {
             matches!(

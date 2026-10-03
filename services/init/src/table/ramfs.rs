@@ -571,12 +571,15 @@ pub const POSIX_RANDOM_TABLE: &[Record] = &[
 
 /// Functional loader channel probe with the process probe's ordinary image.
 pub const LOADER_CHANNELS_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TTY,
     POSIX_PROCS_TABLE[0],
     POSIX_PROCS_TABLE[1],
     POSIX_PROCS_TABLE[2],
     POSIX_PROCS_TABLE[3],
     Record {
         args: b"posix-procs\0loaderchannels\0",
+        connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         ..POSIX_PROCS_TABLE[4]
     },
     POSIX_PROCS_TABLE[5],

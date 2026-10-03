@@ -2302,14 +2302,23 @@ fn loader_channels_probe() -> Result<(), String> {
         relibc()?;
     }
     let kernel = build(Variant::Normal)?;
-    const PROGRAMS: [ImageProgram; 7] = [
+    const PROGRAMS: [ImageProgram; 11] = [
         ("init", "init", INIT_STACK_SIZE, &["table-loader-channels"]),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        ("tty", "tty", TTY_STACK_SIZE, &[]),
         POSIX_PROCS_PROGRAMS[1],
         POSIX_PROCS_PROGRAMS[2],
         POSIX_PROCS_PROGRAMS[3],
         POSIX_PROCS_PROGRAMS[4],
-        POSIX_PROCS_PROGRAMS[5],
+        (
+            "posix-procs",
+            "posix-procs",
+            POSIX_STACK_SIZE,
+            &["terminal"],
+        ),
         POSIX_PROCS_PROGRAMS[6],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
     ];
     let image = build_boot_image("boot-loader-channels.img", &PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));

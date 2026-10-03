@@ -1244,3 +1244,8 @@ pub extern "C" fn stafeto_probe_loader_disable() {
 pub extern "C" fn stafeto_probe_loader_full(slot: u32) -> c_int {
     posix_abi::loader_probe::full(slot)
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_bundle(mode: u32) {
+    posix_abi::loader_probe::bundle_mode(mode);
+}

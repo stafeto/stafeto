@@ -802,6 +802,10 @@ pub(crate) fn give_sessions<const N: usize>(
     sessions: [(proto_loader::Slot, Option<Handle<Channel>>); N],
 ) -> u32 {
     use proto_loader::Method;
+    let sessions = match crate::loader_probe::bundle(sessions) {
+        Ok(sessions) => sessions,
+        Err(_) => return proto_loader::IO,
+    };
     let mut left = sessions
         .into_iter()
         .filter_map(|(slot, s)| s.map(|s| (slot, s)));
@@ -821,7 +825,27 @@ pub(crate) fn give_sessions<const N: usize>(
             }
         }
         if handles.is_empty() {
-            return 0;
+            if crate::loader_probe::omit_completion() {
+                return 0;
+            }
+            let mut done = Writer::new();
+            if Method::HandlesDone.header().write(&mut done).is_err() {
+                return proto_loader::IO;
+            }
+            let code = ask_loader(c, &done, None);
+            if code == 0 && crate::loader_probe::repeat_bundle() {
+                let expected = Status::Kernel(rt::abi::Error::BadState).code();
+                if ask_loader(c, &done, None) != expected {
+                    return proto_loader::IO;
+                }
+                let mut late = Writer::new();
+                if Method::Handles.header().write(&mut late).is_err()
+                    || ask_loader(c, &late, None) != expected
+                {
+                    return proto_loader::IO;
+                }
+            }
+            return code;
         }
         let code = ask_loader(c, &w, Some(handles));
         if code != 0 {
@@ -1081,6 +1105,10 @@ fn exec_stopped<'s>(
         rt::sys::process_exit(127);
     }
     if ask(&request(Method::ExecCommit, &[])?).is_err() {
+        // A distinct probe status witnesses refusal while this image still runs.
+        if crate::loader_probe::omit_completion() {
+            rt::sys::process_exit(126);
+        }
         rt::sys::process_exit(127);
     }
     if let Some(clock) = kept {

@@ -3509,6 +3509,7 @@ unsigned stafeto_probe_loader_listen(void);
 unsigned stafeto_probe_loader_stop(void);
 void stafeto_probe_loader_disable(void);
 int stafeto_probe_loader_full(unsigned slot);
+void stafeto_probe_loader_bundle(unsigned mode);
 
 static void *channel_listener(void *unused) {
     (void)unused;
@@ -3526,6 +3527,27 @@ static int channel_io(int inherited, char expected) {
 }
 
 static int channel_child(const char *name) {
+    if (strcmp(name, "channels_terminal") == 0) return isatty(3) == 1 ? 0 : 15;
+    if (strcmp(name, "channels_missing_exec") == 0 || strcmp(name, "channels_no_done_exec") == 0) {
+        stafeto_probe_loader_bundle(strcmp(name, "channels_missing_exec") == 0 ? 2 : 4);
+        char *next[] = {"posix-procs", "channels_terminal", NULL};
+        execv("/bin/procs-child", next);
+        return 19;
+    }
+    if (strcmp(name, "channels_terminal_exec") == 0) {
+        stafeto_probe_loader_bundle(3);
+        char *next[] = {"posix-procs", "channels_terminal", NULL};
+        execv("/bin/procs-child", next);
+        return 16;
+    }
+    if (strcmp(name, "channels_terminal_fork") == 0) {
+        stafeto_probe_loader_bundle(3);
+        pid_t child = fork();
+        if (child == 0) _exit(isatty(3) == 1 ? 0 : 17);
+        int status = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child || status != 0) return 18;
+        return 0;
+    }
     if (strcmp(name, "channels_clean") == 0) {
         unsigned long handles[2];
         stafeto_start_handles(handles);
@@ -3632,7 +3654,31 @@ static int loader_channels(void) {
     pid_t child = -1;
     expect("spawn handle cleanup probe", spawn(&child, "handles", NULL, NULL), 0);
     if (child > 0) reap("loader roots close", child, 0, 0);
+    int terminal = open("/dev/console", O_RDWR | O_NOCTTY);
+    expect("terminal for the final Handles packet", terminal, 3);
+    stafeto_probe_loader_bundle(3);
+    for (unsigned i = 0; i < 3; i++) {
+        stafeto_probe_loader_bundle(i == 2 ? 0 : 3);
+        pid_t part = -1;
+        expect("five channels in two Handles packets", spawn(&part,
+               i == 0 ? "channels_terminal" : i == 1 ? "channels_terminal_exec" : "channels_terminal_fork", NULL, NULL), 0);
+        if (part > 0) reap("Terminal in the last packet", part, 0, 0);
+    }
+    stafeto_probe_loader_bundle(2);
+    pid_t missing = -1;
+    expect("HandlesDone refuses the missing final Terminal", spawn(&missing, "channels_terminal", NULL, NULL), EIO);
+    stafeto_probe_loader_bundle(4);
+    expect("Go refuses early Handles without Done", spawn(&missing, "channels_terminal", NULL, NULL), EIO);
+    stafeto_probe_loader_bundle(0);
+    pid_t exec_missing = -1;
+    expect("spawn missing exec bundle probe", spawn(&exec_missing, "channels_missing_exec", NULL, NULL), 0);
+    if (exec_missing > 0) reap("missing exec slot stops before Commit", exec_missing, 127, 0);
+    exec_missing = -1;
+    expect("spawn incomplete exec bundle probe", spawn(&exec_missing, "channels_no_done_exec", NULL, NULL), 0);
+    if (exec_missing > 0) reap("Commit before Done is refused", exec_missing, 126, 0);
+    expect("close the packet terminal", close(terminal), 0);
     if (failures) return 1;
+    printf("loader-channels: packets 4+1, final slot and repeated completion checked\n");
     printf("loader-channels: ok (spawn exec fork, RAM/Clock 48, inherited offsets, closed endpoints)\n");
     return 0;
 }

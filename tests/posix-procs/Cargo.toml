@@ -13,5 +13,8 @@ name = "posix-procs"
 test = false
 bench = false
 
+[features]
+terminal = ["posix-crt/uart-input"]
+
 [dependencies]
 posix-crt = { path = "../../lib/posix-crt" }

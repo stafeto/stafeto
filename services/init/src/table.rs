@@ -1524,6 +1524,8 @@ mod tests {
         assert_eq!(
             order_of(ramfs::LOADER_CHANNELS_TABLE),
             [
+                "uart",
+                "tty",
                 "ramfs",
                 "clock",
                 "posix",

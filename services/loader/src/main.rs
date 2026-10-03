@@ -327,10 +327,14 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     let mut given: [Option<Handle<Channel>>; SLOTS] = Default::default();
     let mut ready = false;
     let mut early_given = false;
+    let mut completed = false;
     let mut terminal_actions = false;
     let mut trusted_terminal = None;
     let mut buffer = [0; MESSAGE_MAX];
     loop {
+        if ready && (!completed || (0..SLOTS).any(|i| needed[i] && given[i].is_none())) {
+            return None;
+        }
         if ready && let Some((entry, image, maps)) = loaded.take() {
             return Some(Done::Loaded(Loaded {
                 block_len: block_len?,
@@ -434,9 +438,15 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                         let (body, scratch) = fork.as_mut()?;
                         let regions = scratch.count as u64;
-                        match steps::timed(kind::GO, regions, || copy(own, body, scratch))
-                            .and_then(|()| tell_ready(session))
-                        {
+                        match steps::timed(kind::GO, regions, || copy(own, body, scratch)).and_then(
+                            |()| {
+                                if completed {
+                                    tell_ready(session)
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        ) {
                             Ok(()) => {
                                 copied = true;
                                 0
@@ -462,7 +472,11 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             return None;
                         };
                         let needs = Slot::GIVEN.map(|slot| (slot, block.needs(slot)));
-                        if early_given
+                        if early_given && !completed {
+                            reply(token, Status::Kernel(Error::BadState).code());
+                            return None;
+                        }
+                        if completed
                             && needs
                                 .iter()
                                 .any(|(slot, needs)| *needs && given[*slot as usize].is_none())
@@ -470,8 +484,12 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             reply(token, Status::BadSize.code());
                             return None;
                         }
-                        match load(own, &block).and_then(|done| tell_ready(session).map(|()| done))
-                        {
+                        match load(own, &block).and_then(|done| {
+                            if completed {
+                                tell_ready(session)?;
+                            }
+                            Ok(done)
+                        }) {
                             Ok(done) => {
                                 loaded = Some(done);
                                 for (slot, needs) in needs {
@@ -508,14 +526,40 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             }
                         }
                     }
-                    Some(Method::Handles) if block_len.is_some() || fork.is_some() => {
+                    Some(Method::HandlesDone)
+                        if !completed && (block_len.is_some() || fork.is_some()) =>
+                    {
+                        if r.finish().is_err() || !handles.is_empty() {
+                            Status::BadSize.code()
+                        } else {
+                            if let Some(len) = block_len {
+                                let Ok(block) = Block::read(staged(len)) else {
+                                    reply(token, Status::BadSize.code());
+                                    return None;
+                                };
+                                for slot in Slot::GIVEN {
+                                    needed[slot as usize] = block.needs(slot);
+                                }
+                            }
+                            if (0..SLOTS).any(|i| needed[i] && given[i].is_none()) {
+                                reply(token, Status::BadSize.code());
+                                return None;
+                            }
+                            if (loaded.is_some() || copied)
+                                && let Err(code) = tell_ready(session)
+                            {
+                                reply(token, code);
+                                return None;
+                            }
+                            completed = true;
+                            0
+                        }
+                    }
+                    Some(Method::Handles)
+                        if !completed && (block_len.is_some() || fork.is_some()) =>
+                    {
                         early_given |= loaded.is_none() && block_len.is_some();
                         match take_given(r, &mut handles, &mut given) {
-                            // The end of a pipe or a terminal the block names
-                            // needs the session of the service that serves it.
-                            Ok(()) if (0..SLOTS).any(|i| needed[i] && given[i].is_none()) => {
-                                Status::BadSize.code()
-                            }
                             Ok(()) => {
                                 for slot in [Slot::Files, Slot::Clock] {
                                     if let Some(offered) = given[slot as usize].take() {
