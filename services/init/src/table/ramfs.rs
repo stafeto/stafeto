@@ -605,3 +605,21 @@ pub const POSIX_POLL_TABLE: &[Record] = &[
     LOADER_CHANNELS_TABLE[7],
     LOADER_CHANNELS_TABLE[8],
 ];
+
+/// Functional PTY probe with the process probe's ordinary services.
+pub const POSIX_PTY_TABLE: &[Record] = &[
+    LOADER_CHANNELS_TABLE[0],
+    LOADER_CHANNELS_TABLE[1],
+    LOADER_CHANNELS_TABLE[2],
+    LOADER_CHANNELS_TABLE[3],
+    LOADER_CHANNELS_TABLE[4],
+    LOADER_CHANNELS_TABLE[5],
+    Record {
+        name: "posix-pty",
+        program: "posix-pty",
+        args: b"posix-pty\0",
+        ..LOADER_CHANNELS_TABLE[6]
+    },
+    LOADER_CHANNELS_TABLE[7],
+    LOADER_CHANNELS_TABLE[8],
+];

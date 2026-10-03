@@ -370,6 +370,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-pty"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+ "posix-fs",
+ "proto-tty",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "posix-random"
 version = "0.1.0"
 

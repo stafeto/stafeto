@@ -1,0 +1,22 @@
+[package]
+name = "posix-pty"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The C probe of pseudoterminal descriptions, disconnect and ownership"
+build = "build.rs"
+
+[[bin]]
+name = "posix-pty"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt", features = ["uart-input"] }
+posix-abi = { path = "../../lib/posix-abi" }
+posix-fs = { path = "../../lib/posix-fs" }
+proto-tty = { path = "../../proto/tty" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }
