@@ -537,16 +537,13 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 reply(token, Status::BadSize.code());
                                 return None;
                             };
-                            match sys::handle_duplicate(tty, Rights::SEND) {
-                                Ok(tty) => {
-                                    terminal_actions =
-                                        Some(TerminalLoads::new(tty, block.pending_terminals()))
-                                }
-                                Err(error) => {
-                                    reply(token, code(error));
-                                    return None;
-                                }
-                            }
+                            // The verified client endpoint has SEND|TRANSFER,
+                            // not DUPLICATE. given outlives TerminalLoads on
+                            // every failure; a committed guard does no I/O.
+                            terminal_actions = Some(TerminalLoads::new(
+                                Handle::borrowed(tty.raw()),
+                                block.pending_terminals(),
+                            ));
                         }
                         match terminal_actions.as_mut()?.run(own, block_len?, r) {
                             Ok(()) => 0,
@@ -648,7 +645,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
 /// Only the verified child session sees LoaderOf. It owns the new
 /// descriptions; every failed attempt releases its successful opens.
 struct TerminalLoads {
-    tty: Handle<Channel>,
+    tty: core::mem::ManuallyDrop<Handle<Channel>>,
     plan: pl::TerminalPlan,
     descriptions: [Option<u32>; pl::TERMINAL_OPENS],
     exported: u32,
@@ -656,7 +653,7 @@ struct TerminalLoads {
 }
 
 impl TerminalLoads {
-    fn new(tty: Handle<Channel>, exported: u32) -> Self {
+    fn new(tty: core::mem::ManuallyDrop<Handle<Channel>>, exported: u32) -> Self {
         Self {
             tty,
             plan: pl::TerminalPlan::default(),
