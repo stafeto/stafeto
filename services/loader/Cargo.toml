@@ -23,6 +23,7 @@ small-pieces = []
 steps = []
 
 [dependencies]
+proto-clock = { path = "../../proto/clock" }
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 proto-fs = { path = "../../proto/fs" }

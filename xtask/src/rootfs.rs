@@ -382,6 +382,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        "boot-loader-channels.img" => vec![
+            dir("/bin"),
+            file("/bin/procs-child", 0o755, ROOT, "posix-procs"),
+        ],
         "boot-posix-steps.img" => steps(),
         "boot-posix-tty.img" | "boot-posix-tty-steps.img" | "boot-posix-tty-vz.img" => posix_tty(),
         "rtbench-posix.img" | "rtbench-posix-vz.img" | "rtbench-posix-short.img" => rtbench(),

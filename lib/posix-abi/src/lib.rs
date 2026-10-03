@@ -13,6 +13,7 @@ pub mod allocation;
 pub mod clock;
 pub mod constants;
 pub mod fork;
+pub mod loader_probe;
 pub mod long;
 pub mod metadata;
 pub mod pipes;

@@ -147,6 +147,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "proto-clock",
  "proto-fs",
  "proto-loader",
  "proto-process",

@@ -175,8 +175,8 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         // A process handle for each of its 256 records.
         handle_limit: 1024,
         restart: Restart::Never,
-        // The session of the loaders (5c), which init marks.
-        connects: &["ramfs"],
+        // Loader roots, obtained at startup and narrowed for each loader.
+        connects: &["ramfs", "clock"],
         ..TABLE[0]
     },
     Record {
@@ -567,4 +567,18 @@ pub const POSIX_RANDOM_TABLE: &[Record] = &[
         quota: PROCS_QUOTA,
         ..POSIX
     },
+];
+
+/// Functional loader channel probe with the process probe's ordinary image.
+pub const LOADER_CHANNELS_TABLE: &[Record] = &[
+    POSIX_PROCS_TABLE[0],
+    POSIX_PROCS_TABLE[1],
+    POSIX_PROCS_TABLE[2],
+    POSIX_PROCS_TABLE[3],
+    Record {
+        args: b"posix-procs\0loaderchannels\0",
+        ..POSIX_PROCS_TABLE[4]
+    },
+    POSIX_PROCS_TABLE[5],
+    POSIX_PROCS_TABLE[6],
 ];

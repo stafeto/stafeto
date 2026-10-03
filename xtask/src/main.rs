@@ -989,6 +989,7 @@ commands:
             over the Rust POSIX layer
   posix-procs run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
+  loader-channels verify ordinary loader channel provenance and descriptor transfer
   process-steps run the probe of the longest step of the process service
             under -icount with a crowd of children
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
@@ -1074,6 +1075,7 @@ fn main() {
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("loader-channels") => loader_channels_probe(),
         Some("process-steps") => match &args[1..] {
             [] => process_steps(&qemu::VIRT, 7),
             [n] => n
@@ -2295,6 +2297,34 @@ fn relibc_hello_probe() -> Result<(), String> {
 /// The probe of POSIX processes (tests/posix-procs): its checks pass, its
 /// child says the PID the parent's posix_spawn gave and the parent's PID,
 /// and the child that did not load got no process.
+fn loader_channels_probe() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 7] = [
+        ("init", "init", INIT_STACK_SIZE, &["table-loader-channels"]),
+        POSIX_PROCS_PROGRAMS[1],
+        POSIX_PROCS_PROGRAMS[2],
+        POSIX_PROCS_PROGRAMS[3],
+        POSIX_PROCS_PROGRAMS[4],
+        POSIX_PROCS_PROGRAMS[5],
+        POSIX_PROCS_PROGRAMS[6],
+    ];
+    let image = build_boot_image("boot-loader-channels.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let ended = run.expect_seen(
+        "init: posix-procs ended: exit code 0, not restarted",
+        BOOT_TIMEOUT,
+    );
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    ended?;
+    qemu::expect_marker(&outcome, "loader-channels: ok")
+}
+
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
@@ -3352,6 +3382,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
+        job("loader-channels", loader_channels_probe),
         // The longest step of the process service with 128 children, under
         // -icount: the host's time changes none of its numbers.
         job("process-steps", || process_steps(&qemu::VIRT, 4)),

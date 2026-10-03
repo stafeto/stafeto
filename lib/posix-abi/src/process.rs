@@ -812,6 +812,10 @@ pub(crate) fn give_sessions<const N: usize>(
         }
         let mut handles = rt::handle::Outgoing::new();
         for (slot, session) in left.by_ref().take(rt::abi::MESSAGE_HANDLES) {
+            let session = match crate::loader_probe::replace(slot, session) {
+                Ok(session) => session,
+                Err(_) => return proto_loader::IO,
+            };
             if w.u32(slot as u32).is_err() || handles.push(session.erase()).is_err() {
                 return proto_loader::IO;
             }

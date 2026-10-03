@@ -1218,3 +1218,29 @@ pub unsafe extern "C" fn stafeto_setcanceltype(kind: c_int, old: *mut c_int) -> 
     unsafe { old.write(value) };
     0
 }
+
+/// Controls the loader channel functional probe.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_start(mode: u32) -> c_int {
+    posix_abi::loader_probe::start(mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_listen() -> u32 {
+    posix_abi::loader_probe::listen()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_stop() -> u32 {
+    posix_abi::loader_probe::stop()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_disable() {
+    posix_abi::loader_probe::disable();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_full(slot: u32) -> c_int {
+    posix_abi::loader_probe::full(slot)
+}

@@ -195,6 +195,8 @@ struct Processes {
     loaders: Loaders<Held>,
     loader: Option<loader::Image>,
     files: Option<Handle<Channel>>,
+    /// Trusted Clock root, obtained from init before the request loop.
+    clock: Option<Handle<Channel>>,
     console: Option<Handle<Resource>>,
 }
 impl Processes {
@@ -228,6 +230,7 @@ impl Processes {
             loaders: Loaders::new(),
             loader: None,
             files: None,
+            clock: None,
             console: None,
         }
     }
@@ -290,6 +293,7 @@ fn main(_: u64) -> u64 {
     // table gives one (proto_fs LOADERS): every loader gets a copy.
     if owner.loader.is_some() {
         owner.files = rt::service::connect(&start.parent, "ramfs").ok();
+        owner.clock = rt::service::connect(&start.parent, "clock").ok();
     }
     if adopt::start(&start.process, level).is_err()
         || replace::start(&start.process, level).is_err()
@@ -323,7 +327,7 @@ fn main(_: u64) -> u64 {
     rt::println!("posix-process: ready (records with their processes, root by init's table)");
     rt::println!(
         "posix-process: loader {}",
-        if owner.loader.is_some() && owner.files.is_some() {
+        if owner.loader.is_some() && owner.files.is_some() && owner.clock.is_some() {
             "ready"
         } else {
             "absent"
@@ -1985,7 +1989,7 @@ impl Processes {
     }
 
     /// A request through the session of the loader of the record in
-    /// `child`: Boot or Take; PERMISSION for any other.
+    /// `child`: startup, readiness, final transfer and the trusted loader roots.
     fn loader_request(&mut self, child: usize, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
@@ -1994,13 +1998,18 @@ impl Processes {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
         match r.method() {
-            m if m == Method::LoaderTerminal as u16 => {
+            m if m == Method::LoaderTerminal as u16 || m == Method::LoaderClock as u16 => {
                 if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Loading)
                     || !r.handles.is_empty()
                 {
                     return refuse(proto_process::PERMISSION);
                 }
-                let Some(terminal) = self.loader_terminal.as_ref() else {
+                let root = if m == Method::LoaderClock as u16 {
+                    self.clock.as_ref()
+                } else {
+                    self.loader_terminal.as_ref()
+                };
+                let Some(terminal) = root else {
                     return refuse(proto_process::UNREGISTERED);
                 };
                 let copy = match sys::handle_duplicate(terminal, Rights::SEND | Rights::TRANSFER) {
@@ -2311,6 +2320,7 @@ impl Service<0> for Processes {
             Method::Take,
             Method::SetId,
             Method::LoaderTerminal,
+            Method::LoaderClock,
         ];
         if loaders_own.map(|m| m as u16).contains(&method) {
             return refuse(proto_process::PERMISSION);

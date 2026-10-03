@@ -1203,11 +1203,13 @@ impl Init {
                 mark,
                 duplicate: false,
             }
-        } else if client.name == table::PROCESS_SERVICE
-            && name.as_bytes() == table::RAM_SERVICE.as_bytes()
-        {
+        } else if table::loader_grant(client.name, name.as_bytes()) {
             Grant {
-                mark: proto_fs::LOADERS,
+                mark: if name.as_bytes() == table::RAM_SERVICE.as_bytes() {
+                    proto_fs::LOADERS
+                } else {
+                    0
+                },
                 duplicate: true,
             }
         } else {

@@ -126,6 +126,7 @@ struct Own {
     process: Handle<Process>,
     thread: Handle<Thread>,
     files: Handle<Channel>,
+    clock: Handle<Channel>,
     identity: Handle<Channel>,
     /// The loader's data and stack, which it unmaps at its end.
     data: (u64, u64),
@@ -183,6 +184,7 @@ fn boot(session: &Handle<Channel>, start: &Handle<Channel>, level: u8) -> Result
         thread: reply.handles.take(1)?,
         files: reply.handles.take(2)?,
         identity: reply.handles.take(3)?,
+        clock: loader_clock(session).map_err(|_| Error::BadState)?,
         data,
     })
 }
@@ -515,6 +517,22 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 Status::BadSize.code()
                             }
                             Ok(()) => {
+                                for slot in [Slot::Files, Slot::Clock] {
+                                    if let Some(offered) = given[slot as usize].take() {
+                                        // Fork descriptors live in the copied layer memory.
+                                        let require_fds = fork.is_some()
+                                            || block_len
+                                                .and_then(|len| Block::read(staged(len)).ok())
+                                                .is_some_and(|block| block.needs(Slot::Files));
+                                        match verify_session(own, slot, offered, require_fds) {
+                                            Ok(channel) => given[slot as usize] = Some(channel),
+                                            Err(code) => {
+                                                reply(token, code);
+                                                return None;
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(offered) = given[Slot::Terminal as usize].take() {
                                     if trusted_terminal.is_none() {
                                         trusted_terminal = match loader_terminal(session) {
@@ -596,6 +614,41 @@ fn open_terminals(own: &Own, tty: Option<&Handle<Channel>>, mut r: Reader<'_>) -
         // an ordinary terminal open. A later /dev/tty still verifies it.
     }
     Ok(())
+}
+
+fn loader_clock(session: &Handle<Channel>) -> Result<Handle<Channel>, u32> {
+    let request = proto_process::Method::LoaderClock.header().bytes();
+    let mut reply = sys::send(session, &request).map_err(code)?;
+    let mut buffer = [0; MESSAGE_MAX];
+    if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+        return Err(pl::IO);
+    }
+    reply.handles.take::<Channel>(0).map_err(code)
+}
+
+fn verify_session(
+    own: &Own,
+    slot: Slot,
+    offered: Handle<Channel>,
+    require_fds: bool,
+) -> Result<Handle<Channel>, u32> {
+    let (root, header) = match slot {
+        Slot::Files => (&own.files, proto_fs::Method::VerifySession.header()),
+        Slot::Clock => (&own.clock, proto_clock::Method::VerifySession.header()),
+        _ => return Err(pl::IO),
+    };
+    let mut w = Writer::new();
+    header.write(&mut w).map_err(|s| s.code())?;
+    if slot == Slot::Files {
+        w.u32(u32::from(require_fds)).map_err(|s| s.code())?;
+    }
+    let mut reply = sys::send_handles(root, w.as_bytes(), [offered.erase()])
+        .map_err(|refused| code(refused.error))?;
+    let mut buffer = [0; MESSAGE_MAX];
+    if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+        return Err(pl::IO);
+    }
+    reply.handles.take::<Channel>(0).map_err(code)
 }
 
 fn loader_terminal(session: &Handle<Channel>) -> Result<Option<Handle<Channel>>, u32> {
@@ -1175,7 +1228,7 @@ fn finish(
         return GAVE_UP;
     }
     let staging = (block_len as u64).next_multiple_of(PAGE);
-    drop((image, own.files, own.identity, start, session));
+    drop((image, own.files, own.clock, own.identity, start, session));
     // SAFETY: the copy of the block is read no more.
     let _ = unsafe {
         sys::mem_unmap(
@@ -1224,7 +1277,7 @@ fn finish_fork(
     if pl::write_transfer(out, handles, scratch.map()).is_err() {
         return GAVE_UP;
     }
-    drop((own.files, own.identity, start, session));
+    drop((own.files, own.clock, own.identity, start, session));
     // SAFETY: the scratch is read no more.
     let _ = unsafe {
         sys::mem_unmap(

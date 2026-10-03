@@ -372,14 +372,16 @@ impl<'a> Block<'a> {
 
     /// The descriptors the child starts with.
     /// Whether the block's descriptors need a session in `slot` to mean
-    /// anything: the end of a pipe needs Pipes (5e), a terminal needs
-    /// Terminal (5f). The loader answers a Handles that leaves such a
+    /// anything: a RAM file needs Files, a pipe needs Pipes (5e), and a
+    /// terminal needs Terminal (5f). The loader answers a Handles that leaves such a
     /// slot empty with BAD_SIZE.
     pub fn needs(&self, slot: Slot) -> bool {
         self.descriptors().any(|d| {
             matches!(
                 (slot, d.names),
-                (Slot::Pipes, Names::Pipe(_)) | (Slot::Terminal, Names::Terminal(_))
+                (Slot::Files, Names::File(_))
+                    | (Slot::Pipes, Names::Pipe(_))
+                    | (Slot::Terminal, Names::Terminal(_))
             )
         })
     }
@@ -1421,7 +1423,7 @@ mod tests {
         let read = Block::read(&out[..len]).unwrap();
         assert_eq!(read.descriptors().collect::<Vec<_>>(), list);
         assert_eq!(read.strings(), b"ls\0");
-        assert!(read.needs(Slot::Pipes) && read.needs(Slot::Terminal) && !read.needs(Slot::Files));
+        assert!(read.needs(Slot::Pipes) && read.needs(Slot::Terminal) && read.needs(Slot::Files));
         let mut plain = vec![0; BLOCK_MAX];
         let plain_len = Block::write_with(
             &mut plain,
