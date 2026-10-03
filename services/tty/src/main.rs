@@ -757,10 +757,7 @@ impl Tty {
                 .close(&mut self.holdsets[s.data.holding].holds, id)
                 .map(|effect| {
                     if let Some(effect) = effect {
-                        self.select(effect.terminal);
-                        self.devices[self.active].console.flush_input();
-                        self.tell_readers();
-                        self.tell_output();
+                        self.disconnect(effect.terminal);
                     }
                 }),
             Method::Lock if word <= 1 => {
