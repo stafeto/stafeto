@@ -989,6 +989,7 @@ commands:
             over the Rust POSIX layer
   posix-procs run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
+  posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
   loader-channels verify ordinary loader channel provenance and descriptor transfer
   process-steps run the probe of the longest step of the process service
             under -icount with a crowd of children
@@ -1077,6 +1078,7 @@ fn main() {
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
+        Some("posix-jobs") => posix_jobs_probe(),
         Some("process-steps") => match &args[1..] {
             [] => process_steps(&qemu::VIRT, 7),
             [n] => n
@@ -1982,6 +1984,17 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             "posix-tty: spawned child wrote through the descriptor of a file action",
             DIALOG_STEP,
         )?;
+        run.expect("posix-tty: foreground changed during read", DIALOG_STEP)?;
+        run.send("r")?;
+        run.expect("posix-tty: stopped reader resumed", DIALOG_STEP)?;
+        run.send("j")?;
+        run.expect("posix-tty: job control ok", DIALOG_STEP)?;
+        run.expect("posix-tty: detached reader still uses open fd", DIALOG_STEP)?;
+        run.send("d")?;
+        run.expect(
+            "posix-tty: personal detach and fresh attachment ok",
+            DIALOG_STEP,
+        )?;
         run.expect("posix-tty: sessions ok", DIALOG_STEP)?;
         run.expect("posix-tty: ok", DIALOG_STEP)?;
         run.expect(ENDED, DIALOG_STEP)
@@ -2361,6 +2374,30 @@ fn posix_poll_probe() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn posix_jobs_probe() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 10] = {
+        let mut programs = POSIX_PROCS_PROGRAMS;
+        programs[5].3 = &["jobs"];
+        programs
+    };
+    let image = build_boot_image("boot-posix-jobs.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let ended = run.expect_seen(
+        "init: posix-procs ended: exit code 0, not restarted",
+        BOOT_TIMEOUT,
+    );
+    let outcome = run.stop();
+    ended?;
+    qemu::expect_marker(&outcome, "posix-jobs: ok")
 }
 
 fn loader_channels_probe() -> Result<(), String> {
@@ -2930,6 +2967,27 @@ fn ash_dialog() -> Result<(), String> {
         run.send("echo $?")?;
         run.expect_line("130", |line| line == "130", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
+        run.send("echo stopping; sleep 100")?;
+        run.expect_line("stopping", |line| line == "stopping", DIALOG_STEP)?;
+        std::thread::sleep(Duration::from_secs(1));
+        run.type_raw(b"\x1a")?;
+        run.expect("^Z", DIALOG_STEP)?;
+        run.expect("Stopped", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("jobs")?;
+        run.expect("Stopped", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("bg")?;
+        run.expect("sleep 100", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("fg")?;
+        run.expect("sleep 100", DIALOG_STEP)?;
+        std::thread::sleep(Duration::from_millis(500));
+        run.type_raw(b"\x03")?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo $?")?;
+        run.expect_line("130", |line| line == "130", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
         run.send("ls -1 /")?;
         run.expect("ls -1 /", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
@@ -3457,6 +3515,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
+        job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
         // The longest step of the process service with 128 children, under
         // -icount: the host's time changes none of its numbers.

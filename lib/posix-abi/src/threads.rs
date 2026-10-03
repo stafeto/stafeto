@@ -105,6 +105,10 @@ pub unsafe fn after_fork(own: Handle<Thread>) -> Result<(), i32> {
     block.channel.store(channel.into_raw().0, Ordering::Relaxed);
     block.waker.store(0, Ordering::Relaxed);
     block.pending.store(0, Ordering::Relaxed);
+    block.stop_word.store(0, Ordering::Relaxed);
+    block.cont_word.store(0, Ordering::Relaxed);
+    block.stop_origin.store(0, Ordering::Relaxed);
+    block.cont_origin.store(0, Ordering::Relaxed);
     block.process.store(0, Ordering::Relaxed);
     block.wait_set.store(0, Ordering::Relaxed);
     block.previous.store(0, Ordering::Relaxed);
@@ -156,6 +160,13 @@ pub unsafe fn attach_installed(tcb: *mut posix_thread::Tcb, id: u64) -> Result<(
     }
     // SAFETY: the caller's promise; the register names the TCB.
     unsafe { crate::tls::attach_installed(tcb, id) };
+    // Publish the main mask before enabling an entry already requested by the service.
+    own_block().mask.store(
+        crate::process::page().start_mask.load(Ordering::Acquire)
+            & posix_signals::VALID
+            & !posix_signals::UNBLOCKABLE,
+        Ordering::SeqCst,
+    );
     attach_resources(MAIN_SELF.load(Ordering::Acquire))
 }
 

@@ -20,6 +20,7 @@ fn main() {
         ("libbb/lib.a", "busybox_bb"),
         ("coreutils/lib.a", "busybox_coreutils"),
         ("shell/lib.a", "busybox_shell"),
+        ("procps/lib.a", "busybox_procps"),
     ] {
         let path = root.join(archive);
         assert!(

@@ -104,6 +104,7 @@ struct Who {
     pid: u32,
     generation: u64,
     loader: bool,
+    ctty: Option<(u32, u64)>,
 }
 
 /// Where the service maps the page of the generations (proto_process
@@ -479,11 +480,34 @@ impl Tty {
             self.jobs.release();
             self.job_generation = 0;
         }
+        self.finish_departure(generation);
+    }
+
+    /// Complete the exact old connection even if an earlier departure remains.
+    fn finish_departure(&mut self, generation: u64) {
+        let Some(notary) = self.notary.as_ref() else {
+            return;
+        };
+        let mut buffer = [0; MESSAGE_MAX];
         let old = self.departed.find(generation);
-        // T5 sends SIGHUP here, before AckCtty, to old.foreground. The
-        // process service still authorizes that departed sid at this point.
-        if let Some(old) = old {
-            let _ = (old.sid, old.foreground);
+        if let Some(old) = old
+            && let Some(group) = old.foreground
+        {
+            for signal in [proto_process::SIGHUP, proto_process::SIGCONT] {
+                let mut w = Writer::new();
+                let _ = proto_process::Method::TtySignal.header().write(&mut w);
+                let _ = w.u32(CONSOLE);
+                let _ = w.u32(group);
+                let _ = w.u32(signal as u32);
+                let _ = w.u64(generation);
+                let Ok(reply) = sys::send(notary, w.as_bytes()) else {
+                    return;
+                };
+                let code = proto_wire::Reader::new(reply.bytes(&mut buffer)).u32();
+                if !matches!(code, Ok(0 | proto_process::NO_PROCESS)) {
+                    return;
+                }
+            }
         }
         let mut w = Writer::new();
         let _ = proto_process::Method::AckCtty.header().write(&mut w);
@@ -719,12 +743,17 @@ impl Tty {
     }
 
     /// The handle with NOTIFY a take brought, the first time.
-    fn notify_of(r: &mut Request<'_>, take: bool) -> Result<Option<Handle<Channel>>, Answer> {
-        if !take || r.handles.is_empty() {
+    fn notify_of(
+        &self,
+        r: &mut Request<'_>,
+        take: bool,
+    ) -> Result<Option<Handle<Channel>>, Answer> {
+        let slot = usize::from(self.preparation == 3 && self.notary.is_some());
+        if !take || r.handles.len() <= slot {
             return Ok(None);
         }
         r.handles
-            .take::<Channel>(0)
+            .take::<Channel>(slot)
             .map(Some)
             .map_err(|e| Answer::Status(Status::Kernel(e)))
     }
@@ -817,7 +846,14 @@ impl Tty {
             Ok(read) => read,
             Err(status) => return Answer::Status(status),
         };
-        let notify = match Self::notify_of(r, take) {
+        let caller = match self.caller(s, r) {
+            Ok(caller) => caller,
+            Err(code) => return status(code),
+        };
+        if let Err(code) = self.background(caller, proto_tty::READ_ACCESS, read.blocked) {
+            return status(code);
+        }
+        let notify = match self.notify_of(r, take) {
             Ok(notify) => notify,
             Err(answer) => return answer,
         };
@@ -853,7 +889,14 @@ impl Tty {
             Ok(write) => write,
             Err(status) => return Answer::Status(status),
         };
-        let notify = match Self::notify_of(r, take) {
+        let caller = match self.caller(s, r) {
+            Ok(caller) => caller,
+            Err(code) => return status(code),
+        };
+        if let Err(code) = self.background(caller, proto_tty::WRITE_ACCESS, write.blocked) {
+            return status(code);
+        }
+        let notify = match self.notify_of(r, take) {
             Ok(notify) => notify,
             Err(answer) => return answer,
         };
@@ -883,7 +926,14 @@ impl Tty {
             Ok(drain) => drain,
             Err(status) => return Answer::Status(status),
         };
-        let notify = match Self::notify_of(r, take) {
+        let caller = match self.caller(s, r) {
+            Ok(caller) => caller,
+            Err(code) => return status(code),
+        };
+        if let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, drain.blocked) {
+            return status(code);
+        }
+        let notify = match self.notify_of(r, take) {
             Ok(notify) => notify,
             Err(answer) => return answer,
         };
@@ -1081,11 +1131,18 @@ impl Tty {
 
     /// FLUSH_QUEUES: the input not read, or the output the driver did not
     /// take, goes.
-    fn flush_queues(&mut self, r: &mut Request<'_>) -> Answer {
+    fn flush_queues(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let control = match Control::parse(r.body()) {
             Ok(control) => control,
             Err(status) => return Answer::Status(status),
         };
+        let caller = match self.caller(s, r) {
+            Ok(caller) => caller,
+            Err(code) => return status(code),
+        };
+        if let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, control.blocked) {
+            return status(code);
+        }
         if control.terminal != CONSOLE {
             return status(BAD_TERMINAL);
         }
@@ -1105,11 +1162,18 @@ impl Tty {
 
     /// FLOW: the output stops or goes on, or the STOP or START character
     /// goes out.
-    fn flow(&mut self, r: &mut Request<'_>) -> Answer {
+    fn flow(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let control = match Control::parse(r.body()) {
             Ok(control) => control,
             Err(status) => return Answer::Status(status),
         };
+        let caller = match self.caller(s, r) {
+            Ok(caller) => caller,
+            Err(code) => return status(code),
+        };
+        if let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, control.blocked) {
+            return status(code);
+        }
         if control.terminal != CONSOLE {
             return status(BAD_TERMINAL);
         }
@@ -1139,11 +1203,18 @@ impl Tty {
 
     /// SET_ATTR: new settings at once (DRAIN as NOW, FLUSH dropping the
     /// input not read); the reads that wait look again.
-    fn set_attr(&mut self, r: &mut Request<'_>) -> Answer {
+    fn set_attr(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let set = match SetAttr::parse(r.body()) {
             Ok(set) => set,
             Err(status) => return Answer::Status(status),
         };
+        let caller = match self.caller(s, r) {
+            Ok(caller) => caller,
+            Err(code) => return status(code),
+        };
+        if let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, set.blocked) {
+            return status(code);
+        }
         if set.terminal != CONSOLE {
             return status(BAD_TERMINAL);
         }
@@ -1163,7 +1234,7 @@ const SIGTSTP: u32 = 20;
 #[cfg(all(feature = "trust-probe", not(feature = "steps")))]
 const PROBE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27,
+    27, 28,
 ];
 
 impl Tty {
@@ -1174,6 +1245,7 @@ impl Tty {
             return Answer::Status(Status::BadSize);
         };
         let sid = self.jobs.session().unwrap_or(0);
+        let generation = self.job_generation;
         let Some(notary) = self.notary() else {
             return status(NO_IDENTITY);
         };
@@ -1183,6 +1255,7 @@ impl Tty {
             let _ = w.u32(CONSOLE);
             let _ = w.u32(target);
             let _ = w.u32(28);
+            let _ = w.u64(generation);
         } else if r.method() == 22 {
             let _ = proto_wire::Header::new(42, proto_process::VERSION).write(&mut w);
             let _ = w.u32(target);
@@ -1226,6 +1299,14 @@ impl Tty {
     /// identity the request brought, once and again when the record's
     /// generation moved; its group and session come from the page.
     fn caller(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Result<Caller, u32> {
+        if self.notary().is_none() && self.job_generation == 0 {
+            return Ok(Caller {
+                pid: 0,
+                pgid: 0,
+                sid: 0,
+                ctty: None,
+            });
+        }
         let offered = if r.handles.is_empty() {
             None
         } else {
@@ -1251,6 +1332,7 @@ impl Tty {
                     pid: said.pid,
                     generation: said.generation,
                     loader: said.loader.is_some(),
+                    ctty: said.ctty,
                 }
             }
             (None, None) => return Err(NO_IDENTITY),
@@ -1262,6 +1344,7 @@ impl Tty {
             pid: who.pid,
             pgid,
             sid,
+            ctty: who.ctty,
         })
     }
 
@@ -1280,6 +1363,14 @@ impl Tty {
         } else {
             0
         };
+        let blocked = if method == Method::SetPgrp {
+            match body.u32() {
+                Ok(v) if v <= 1 => v,
+                _ => return status(INVALID),
+            }
+        } else {
+            0
+        };
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
@@ -1290,9 +1381,16 @@ impl Tty {
             Ok(caller) => caller,
             Err(code) => return status(code),
         };
+        if method != Method::Acquire && caller.ctty != Some((CONSOLE, self.job_generation)) {
+            return status(proto_tty::NOT_CONTROLLING);
+        }
         let result = match method {
             Method::Acquire => self.acquire(caller).map(|()| None),
+            Method::Detach => self.detach(caller).map(|()| None),
             Method::SetPgrp => {
+                if let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, blocked) {
+                    return status(code);
+                }
                 #[cfg(feature = "steps")]
                 let began = time::now();
                 let in_session = |pgid, sid| {
@@ -1331,10 +1429,45 @@ impl Tty {
         }
     }
 
+    fn detach(&mut self, caller: Caller) -> Result<(), u32> {
+        if caller.ctty != Some((CONSOLE, self.job_generation)) {
+            return Err(proto_tty::NOT_CONTROLLING);
+        }
+        let generation = self.job_generation;
+        let notary = self.notary().ok_or(NO_IDENTITY)?;
+        let mut w = Writer::new();
+        proto_process::Method::DetachCtty
+            .header()
+            .write(&mut w)
+            .map_err(|_| PERMISSION)?;
+        w.u32(CONSOLE)
+            .and_then(|()| w.u32(caller.pid))
+            .and_then(|()| w.u64(generation))
+            .map_err(|_| PERMISSION)?;
+        let reply = sys::send(notary, w.as_bytes()).map_err(|_| PERMISSION)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+            return Err(PERMISSION);
+        }
+        if caller.pid == caller.sid {
+            if !self.departed.keep(Departed {
+                generation,
+                sid: caller.sid,
+                foreground: self.jobs.foreground(),
+            }) {
+                return Err(PERMISSION);
+            }
+            self.jobs.release();
+            self.job_generation = 0;
+            self.finish_departure(generation);
+        }
+        Ok(())
+    }
+
     /// ACQUIRE: the process service gives the console to the caller's
     /// session (SetCtty), unless the session has it already.
     fn acquire(&mut self, caller: Caller) -> Result<(), u32> {
-        if !self.jobs.may_acquire(caller)? {
+        if !self.jobs.may_acquire(caller)? && caller.ctty == Some((CONSOLE, self.job_generation)) {
             return Ok(());
         }
         let notary = self.notary().ok_or(PERMISSION)?;
@@ -1368,11 +1501,53 @@ impl Tty {
         Ok(())
     }
 
+    /// Recheck the current foreground immediately before an actual effect.
+    fn background(&mut self, caller: Caller, kind: u32, blocked: u32) -> Result<(), u32> {
+        if caller.ctty != Some((CONSOLE, self.job_generation))
+            || self.jobs.session() != Some(caller.sid)
+            || self.jobs.foreground() == Some(caller.pgid)
+            || kind == proto_tty::WRITE_ACCESS
+                && self.console.termios().lflag & proto_tty::TOSTOP == 0
+        {
+            return Ok(());
+        }
+        if blocked != 0 {
+            return if kind == proto_tty::READ_ACCESS {
+                Err(proto_tty::IO_ERROR)
+            } else {
+                Ok(())
+            };
+        }
+        let signal = if kind == proto_tty::READ_ACCESS {
+            proto_process::SIGTTIN
+        } else {
+            proto_process::SIGTTOU
+        };
+        let Some(notary) = self.notary.as_ref() else {
+            return Err(NO_IDENTITY);
+        };
+        let mut w = Writer::new();
+        let _ = proto_process::Method::TtySignal.header().write(&mut w);
+        let _ = w.u32(CONSOLE);
+        let _ = w.u32(caller.pgid);
+        let _ = w.u32(signal as u32);
+        let _ = w.u64(self.job_generation);
+        let Ok(reply) = sys::send(notary, w.as_bytes()) else {
+            return Err(proto_tty::IO_ERROR);
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        match proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() {
+            Ok(0) => Err(proto_tty::RESTART),
+            _ => Err(proto_tty::IO_ERROR),
+        }
+    }
+
     /// The signal `number` of INTR, QUIT or SUSP to the foreground group
     /// `group` (XBD 11.1.9): the process service walks the group
     /// (TtySignal) and answers at the walk's end. A group of a session
     /// the console is no longer the controlling terminal of gets none.
     fn signal_group(&mut self, group: u32, number: u32) {
+        let generation = self.job_generation;
         let Some(notary) = self.notary() else {
             return;
         };
@@ -1382,7 +1557,8 @@ impl Tty {
             .write(&mut w)
             .and_then(|()| w.u32(CONSOLE))
             .and_then(|()| w.u32(group))
-            .and_then(|()| w.u32(number));
+            .and_then(|()| w.u32(number))
+            .and_then(|()| w.u64(generation));
         if written.is_err() {
             return;
         }
@@ -1404,7 +1580,7 @@ impl Service<0> for Tty {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 30,
+                24, 25, 26, 27, 28, 30,
             ]
         }
         #[cfg(all(feature = "trust-probe", not(feature = "steps")))]
@@ -1415,7 +1591,7 @@ impl Service<0> for Tty {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 26,
-                27, 30,
+                27, 28, 30,
             ]
         }
         #[cfg(all(not(feature = "trust-probe"), not(feature = "steps")))]
@@ -1449,8 +1625,8 @@ impl Service<0> for Tty {
             Some(Method::WriteTake) => self.write(s, r, true),
             Some(Method::DrainStart) => self.drain(s, r, false),
             Some(Method::DrainTake) => self.drain(s, r, true),
-            Some(Method::FlushQueues) => self.flush_queues(r),
-            Some(Method::Flow) => self.flow(r),
+            Some(Method::FlushQueues) => self.flush_queues(s, r),
+            Some(Method::Flow) => self.flow(s, r),
             Some(Method::ReadCancel | Method::WriteCancel | Method::DrainCancel) => {
                 self.cancel(s, r)
             }
@@ -1479,13 +1655,14 @@ impl Service<0> for Tty {
                 }
             }
             Some(Method::GetAttr) => self.get_attr(r),
-            Some(Method::SetAttr) => self.set_attr(r),
+            Some(Method::SetAttr) => self.set_attr(s, r),
             Some(
                 m @ (Method::Acquire
                 | Method::SetPgrp
                 | Method::GetPgrp
                 | Method::GetSid
-                | Method::Controlling),
+                | Method::Controlling
+                | Method::Detach),
             ) => self.job(s, r, m),
             Some(Method::Abandon) => {
                 if r.body().finish().is_err() {

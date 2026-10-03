@@ -60,6 +60,7 @@ mod tests {
             generation,
             loader: None,
             index: 0,
+            ctty: None,
         }
     }
 

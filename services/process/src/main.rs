@@ -46,6 +46,7 @@ use rt::{
 mod adopt;
 mod ends;
 mod generations;
+mod jobs;
 mod loader;
 mod make;
 mod pages;
@@ -179,6 +180,7 @@ struct Processes {
     /// The walk of a TtySignal, one at a time: the terminal service waits
     /// for its reply (5f).
     tty_walk: Option<Walking>,
+    orphan_walk: Option<(u32, Walk, bool)>,
     #[cfg(feature = "tty-probe")]
     tty_probe: Option<(usize, u32)>,
     terminal_notice: Option<Handle<Channel>>,
@@ -220,6 +222,7 @@ impl Processes {
             walking: Queue::new(),
             later: [const { None }; LATER],
             tty_walk: None,
+            orphan_walk: None,
             #[cfg(feature = "tty-probe")]
             tty_probe: None,
             terminal_notice: None,
@@ -613,26 +616,21 @@ impl Processes {
     /// WNOWAIT (the parent's other waits that take it are told); ECHILD
     /// with no child it takes; None while it waits. CHILDREN_MAX steps.
     fn found(&mut self, parent: usize, selector: Selector, options: u32) -> Option<WaitResult> {
-        let (zombie, any) = self.records.zombie(parent, selector);
-        let Some(child) = zombie else {
+        let Some((child, result)) = self.records.reported(parent, selector, options) else {
+            let any = self
+                .records
+                .children(parent)
+                .any(|c| self.records.takes(c, selector));
             return (!any).then_some(WaitResult::NoChild);
-        };
-        if options & WEXITED == 0 {
-            return None;
-        }
-        let record = self.records.get(child).expect("a zombie");
-        let State::Zombie(end) = record.state else {
-            return None;
-        };
-        let result = WaitResult::Ended {
-            pid: record.label.pid(),
-            end,
-            uid: record.credentials.uid,
         };
         if options & WNOWAIT == 0 {
             self.tell(parent, child);
-            self.records.reap(child);
-            self.generations.set_groups(child, None);
+            if matches!(result, WaitResult::Ended { .. }) {
+                self.records.reap(child);
+                self.generations.set_groups(child, None);
+            } else {
+                self.records.consume_report(child, result);
+            }
         }
         Some(result)
     }
@@ -783,6 +781,7 @@ impl Processes {
             Method::TtySignal,
             Method::SetCtty,
             Method::DropCtty,
+            Method::DetachCtty,
             Method::TtyEvents,
             Method::AckCtty,
         ];
@@ -831,6 +830,7 @@ impl Processes {
             generation: self.generations.get(index),
             loader,
             index: index as u32,
+            ctty: record.ctty,
         };
         if who.write(r.reply()).is_err() {
             return Answer::Status(Status::BadSize);
@@ -880,10 +880,14 @@ impl Processes {
         let Some(thread) = manages.then(|| r.handles.take::<Thread>(0).ok()).flatten() else {
             return refuse(proto_process::PERMISSION);
         };
-        let waiting = self
-            .pages
-            .page(index)
-            .is_some_and(|p| p.pending.load(core::sync::atomic::Ordering::Acquire) != 0);
+        let waiting = self.pages.page(index).is_some_and(|p| {
+            p.pending.load(core::sync::atomic::Ordering::Acquire)
+                | proto_process::job::bits(
+                    p.stop_word.load(core::sync::atomic::Ordering::Acquire),
+                    p.cont_word.load(core::sync::atomic::Ordering::Acquire),
+                )
+                != 0
+        });
         if waiting {
             let _ = sys::thread_upcall_request(&thread);
         }
@@ -894,6 +898,14 @@ impl Processes {
     /// Posts `signal` with `info` to the process of the record in `target`
     /// and asks for its router's entry when it waits now (O(1)).
     fn signal(&mut self, target: usize, signal: u8, info: Info) {
+        if proto_process::job::class(signal).is_some() || signal == SIGSTOP {
+            if self.generate_job(target, signal).is_none() {
+                return;
+            }
+            if signal == SIGSTOP {
+                return;
+            }
+        }
         let Some(page) = self.pages.page(target) else {
             return;
         };
@@ -908,8 +920,8 @@ impl Processes {
 
     /// Delivers `signal` from the record in `sender` to the process of the
     /// record in `target`: Denied past kill's rule (`signals::may_signal`),
-    /// Refused for a signal the service refuses until stops come
-    /// (`signals::refused`); signal 0 and a zombie take nothing; SIGKILL
+    /// Refused for a signal outside the supported range; signal 0 and a
+    /// zombie take nothing; SIGKILL
     /// ends the process from the service at the target's ceiling
     /// (process_kill_at); any other is posted on the target's page
     /// (`signal`). O(1).
@@ -936,7 +948,7 @@ impl Processes {
         let Some(page) = self.pages.page(target) else {
             return Delivery::Refused;
         };
-        if signals::refused(signal, page) {
+        if signals::refused(signal, page) || !self.can_generate_job(target, signal) {
             return Delivery::Refused;
         }
         let info = Info {
@@ -973,9 +985,12 @@ impl Processes {
             return self.walk_start(index, pid, signal, r);
         }
         let Some(target) = self.records.find_pid(pid as u32).filter(|&t| {
-            self.records
-                .get(t)
-                .is_some_and(|r| r.state != State::Loading)
+            self.records.get(t).is_some_and(|r| {
+                r.state != State::Loading
+                    || signal == SIGKILL
+                    || signal == SIGSTOP
+                    || proto_process::job::class(signal).is_some()
+            })
         }) else {
             return refuse(proto_process::NO_PROCESS);
         };
@@ -987,12 +1002,11 @@ impl Processes {
     }
 
     /// The start of a walk of `index` for `pid` of 0 or below: INVALID for
-    /// a signal past SIGNAL_MAX and SIGSTOP (until stops come, as
-    /// `signals::refused` says for one process); NO_PROCESS at once for a
+    /// a signal past SIGNAL_MAX; NO_PROCESS at once for a
     /// group nobody is in; AGAIN while the sender's other walk is on; else
     /// the request waits for the steps (`walk_step`).
     fn walk_start(&mut self, index: usize, pid: i32, signal: u8, r: &mut Request<'_>) -> Answer {
-        if signal > SIGNAL_MAX || signal == SIGSTOP {
+        if signal > SIGNAL_MAX {
             return refuse(proto_process::INVALID);
         }
         let own = self.records.get(index).expect("the sender").pgid;
@@ -1038,7 +1052,9 @@ impl Processes {
     /// that wait are answered AGAIN, none is left waiting for a step that
     /// never comes.
     fn kick(&mut self) {
-        if !self.step_told && self.tty_walk.is_some() {
+        if !self.step_told
+            && (self.tty_walk.is_some() || self.orphan_walk.is_some() || self.records.has_orphans())
+        {
             if self
                 .step
                 .as_ref()
@@ -1086,6 +1102,12 @@ impl Processes {
         if self.tty_walk.is_some() {
             rt::service::step_own();
             self.tty_walk_step();
+            self.kick();
+            return;
+        }
+        if self.orphan_walk.is_some() || self.records.has_orphans() {
+            rt::service::step_own();
+            self.orphan_step();
             self.kick();
             return;
         }
@@ -1209,6 +1231,33 @@ impl Processes {
             self.terminals.ack(terminal, generation);
             return Answer::Status(Status::Ok);
         }
+        if method == Method::DetachCtty as u16 {
+            let (Ok(pid), Ok(generation), Ok(())) = (body.u32(), body.u64(), body.finish()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            let Some(index) = self.records.find_pid(pid) else {
+                return refuse(proto_process::NO_PROCESS);
+            };
+            let record = self.records.get(index).expect("detaching caller");
+            if record.ctty != Some((terminal as u32, generation))
+                || !self
+                    .terminals
+                    .link(terminal)
+                    .is_some_and(|link| link.sid == record.sid && link.generation == generation)
+            {
+                return refuse(proto_process::PERMISSION);
+            }
+            let leader = pid == record.sid;
+            self.records.get_mut(index).expect("caller").ctty = None;
+            self.generations.raise(index);
+            if leader {
+                self.terminals.drop_terminal(terminal);
+                if let Some(notice) = self.terminal_notice.as_ref() {
+                    let _ = sys::notify(notice, 1);
+                }
+            }
+            return Answer::Status(Status::Ok);
+        }
         if method == Method::DropCtty as u16 {
             if body.finish().is_err() {
                 return Answer::Status(Status::BadSize);
@@ -1233,6 +1282,10 @@ impl Processes {
             };
             return match self.terminals.set(terminal, sid, lives) {
                 Ok(generation) => {
+                    let index = self.records.find_pid(sid).expect("live session leader");
+                    self.records.get_mut(index).expect("leader").ctty =
+                        Some((terminal as u32, generation));
+                    self.generations.raise(index);
                     if r.reply()
                         .u32(0)
                         .and_then(|()| r.reply().u64(generation))
@@ -1245,10 +1298,12 @@ impl Processes {
                 Err(code) => refuse(code),
             };
         }
-        let (Ok(pgid), Ok(signal), Ok(())) = (body.u32(), body.u32(), body.finish()) else {
+        let (Ok(pgid), Ok(signal), Ok(generation), Ok(())) =
+            (body.u32(), body.u32(), body.u64(), body.finish())
+        else {
             return Answer::Status(Status::BadSize);
         };
-        self.tty_signal(terminal, pgid, signal, r)
+        self.tty_signal(terminal, pgid, signal, generation, r)
     }
 
     /// TtySignal: the walk of group `pgid` with `signal`, from the terminal
@@ -1258,6 +1313,7 @@ impl Processes {
         terminal: usize,
         pgid: u32,
         signal: u32,
+        generation: u64,
         r: &mut Request<'_>,
     ) -> Answer {
         let Ok(signal) = u8::try_from(signal) else {
@@ -1269,8 +1325,16 @@ impl Processes {
         let Some(session) = self.records.session_of(pgid) else {
             return refuse(proto_process::NO_PROCESS);
         };
-        if !self.terminals.permits(terminal, session, signal) {
+        if !self
+            .terminals
+            .permits_exact(terminal, session, generation, signal)
+        {
             return refuse(proto_process::PERMISSION);
+        }
+        if matches!(signal, proto_process::SIGTTIN | proto_process::SIGTTOU)
+            && self.records.orphaned(pgid) == Some(true)
+        {
+            return refuse(proto_process::ORPHAN);
         }
         if self.tty_walk.is_some() {
             return refuse(proto_process::AGAIN);
@@ -1310,7 +1374,7 @@ impl Processes {
         let Some(page) = self.pages.page(target) else {
             return Delivery::Refused;
         };
-        if signals::refused(signal, page) {
+        if signals::refused(signal, page) || !self.can_generate_job(target, signal) {
             return Delivery::Refused;
         }
         let info = Info {
@@ -1365,7 +1429,7 @@ impl Processes {
         };
         let record = self.records.get(index).expect("the probe's target");
         let pgid = record.pgid;
-        if !self.terminals.permits(0, record.sid, 28) {
+        if self.terminals.session(0) != Some(record.sid) {
             return refuse(proto_process::PERMISSION);
         }
         if self.tty_walk.is_some() {
@@ -1428,6 +1492,7 @@ impl Processes {
                 } else {
                     self.tell_parent_groups(index);
                 }
+                self.kick();
                 Answer::Status(Status::Ok)
             }
             Err(e) => refuse(group_error(e)),
@@ -1441,9 +1506,11 @@ impl Processes {
         }
         match self.records.set_sid(index) {
             Ok(sid) => {
+                self.generations.raise(index);
                 self.publish_group(index);
                 self.publish_groups(index);
                 self.tell_parent_groups(index);
+                self.kick();
                 number(r, sid)
             }
             Err(e) => refuse(group_error(e)),
@@ -1603,6 +1670,15 @@ impl Processes {
             return refuse(proto_process::PERMISSION);
         };
         let parent = self.records.get(index).expect("the caller");
+        let inherited_ctty = if matches!(join, records::Join::NewSession) {
+            None
+        } else {
+            parent.ctty.filter(|&(terminal, generation)| {
+                self.terminals
+                    .link(terminal as usize)
+                    .is_some_and(|link| link.sid == parent.sid && link.generation == generation)
+            })
+        };
         let create = Create {
             quota: parent.quota,
             handle_limit: parent.handle_limit,
@@ -1650,6 +1726,7 @@ impl Processes {
         if let Some(record) = self.records.get_mut(child) {
             record.quota = create.quota;
             record.handle_limit = create.handle_limit;
+            record.ctty = inherited_ctty;
         }
         self.generations.raise(child);
         self.publish_groups(child);
@@ -1845,6 +1922,10 @@ impl Processes {
         self.generations.raise(index);
         if let Some(page) = self.pages.page(index) {
             page.caught.store(0, core::sync::atomic::Ordering::Release);
+        }
+        if self.records.get(index).is_some_and(|r| r.stopped.is_some()) {
+            let r = self.records.get(index).expect("a stopped record");
+            let _ = sys::process_control(&r.process, true, r.ceiling);
         }
         // The loads the old image started: nobody gives their loaders a
         // block once it is gone.
@@ -2208,6 +2289,11 @@ impl Processes {
         // The services that remember credentials see the new ones before
         // the child runs a request.
         self.generations.raise(child);
+        if let Some(signal) = self.records.get(child).and_then(|r| r.stopped) {
+            let r = self.records.get(child).expect("a committed child");
+            let _ = sys::process_control(&r.process, true, r.ceiling);
+            self.child_report(child, Some(signal));
+        }
         let slot = self.loaders.of(child).expect("a committed place");
         let place = self.loaders.get_mut(slot).expect("a place");
         self.routers[child] = place.held.thread.take();
@@ -2305,6 +2391,7 @@ impl Service<0> for Processes {
             Method::TtySignal,
             Method::SetCtty,
             Method::DropCtty,
+            Method::DetachCtty,
             Method::TtyEvents,
             Method::AckCtty,
         ];
@@ -2380,6 +2467,9 @@ impl Service<0> for Processes {
             n if n == Method::WaitStart as u16 => self.wait_start(index, s, r),
             n if n == Method::WaitCancel as u16 => self.wait_cancel(s, r),
             n if n == Method::Kill as u16 => self.kill(index, r),
+            n if n == Method::SignalGeneration as u16 => self.signal_generation(index, r),
+            n if n == Method::StopSelf as u16 => self.stop_self(index, r),
+            n if n == Method::ReturnJobSignal as u16 => self.return_job_signal(index, r),
             n if n == Method::SetPgid as u16 => self.set_pgid(index, r),
             n if n == Method::SetSid as u16 => self.set_sid(index, r),
             n if n == Method::GetPgid as u16 => self.get_group(index, false, r),
@@ -2489,5 +2579,6 @@ impl Service<0> for Processes {
         if let Exit::Zombie { parent } = exit {
             self.child_ended(parent, index, end);
         }
+        self.kick();
     }
 }

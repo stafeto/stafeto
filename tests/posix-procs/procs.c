@@ -1829,7 +1829,12 @@ static int pipe_ghosts_after(void);
 static int loader_channels(void);
 static int channel_child(const char *name);
 
+#include "jobs.c"
+
 static int role(const char *name) {
+    if (strcmp(name, "jobcontrol") == 0) return job_control();
+    if (strcmp(name, "jobexec-local") == 0) return job_after_exec(0);
+    if (strcmp(name, "jobexec-process") == 0) return job_after_exec(1);
     if (strcmp(name, "loaderchannels") == 0) return loader_channels();
     if (strncmp(name, "channels_", 9) == 0) return channel_child(name);
     if (strcmp(name, "steps") == 0) return steps_run();
@@ -3754,6 +3759,13 @@ int main(int argc, char **argv) {
     argc_seen = argc;
     argv_seen = argv;
     if (argc > 1) return role(argv[1]);
+    if (JOB_CONTROL_PROBE) {
+        pid_t child = -1;
+        expect("spawn job-control probe", spawn(&child, "jobcontrol", NULL, NULL), 0);
+        if (child > 0) reap("job-control probe", child, 0, 0);
+        if (!failures) printf("posix-jobs: ok\n");
+        return failures != 0;
+    }
     pid_t child = 0;
     int e = spawn(&child, "child", NULL, NULL);
     expect("spawn of procs-child", e, 0);

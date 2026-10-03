@@ -117,6 +117,60 @@ pub(crate) fn request(method: proto_process::Method, words: &[u32]) -> Result<Wr
     Ok(w)
 }
 
+/// Obtain the service's authoritative epoch for a directed job signal.
+pub(crate) fn signal_generation(signal: i32) -> Result<u64, i32> {
+    let w = request(proto_process::Method::SignalGeneration, &[signal as u32])?;
+    let mut bytes = [0; rt::abi::MESSAGE_MAX];
+    loop {
+        match rt::sys::send(client().session(), w.as_bytes()) {
+            Err(rt::abi::Error::Interrupted) => continue,
+            Err(_) => return Err(crate::constants::EIO),
+            Ok(reply) => {
+                let mut r = proto_wire::Reader::new(reply.bytes(&mut bytes));
+                let status = r.u32().map_err(|_| crate::constants::EIO)?;
+                if status == proto_process::AGAIN {
+                    return Err(crate::constants::EAGAIN);
+                }
+                if status != 0 {
+                    return Err(crate::constants::EIO);
+                }
+                return r.u64().map_err(|_| crate::constants::EIO);
+            }
+        }
+    }
+}
+
+pub(crate) fn stop_self(signal: i32, ticket: u64) -> Result<(), i32> {
+    let mut w = request(proto_process::Method::StopSelf, &[signal as u32])?;
+    w.u64(ticket).map_err(|_| crate::constants::EIO)?;
+    ask(&w).map(|_| ())
+}
+
+static PROBE_RETURN_FAILURE: AtomicU32 = AtomicU32::new(0);
+pub(crate) fn probe_return_failure() {
+    PROBE_RETURN_FAILURE.store(1, Ordering::Release);
+}
+
+/// Return job information through its single publisher. Interrupted sends
+/// were not accepted and repeat; a stale ticket is acknowledged harmlessly.
+pub(crate) fn return_job_signal(
+    signal: i32,
+    ticket: u64,
+    info: &posix_types::SigInfo,
+) -> Result<(), i32> {
+    if PROBE_RETURN_FAILURE.swap(0, Ordering::AcqRel) != 0 {
+        return Err(crate::constants::EIO);
+    }
+    let mut w = request(proto_process::Method::ReturnJobSignal, &[signal as u32])?;
+    w.u64(ticket)
+        .and_then(|()| w.u32(info.si_code as u32))
+        .and_then(|()| w.u32(info.si_pid as u32))
+        .and_then(|()| w.u32(info.si_uid))
+        .and_then(|()| w.u32(info.si_status as u32))
+        .map_err(|_| crate::constants::EIO)?;
+    ask(&w).map(|_| ())
+}
+
 /// Takes `session`, the process's identity session.
 ///
 /// # Safety
@@ -292,6 +346,8 @@ pub fn getppid() -> i32 {
 pub struct Waited {
     pub pid: i32,
     pub end: Option<proto_process::End>,
+    pub stopped: Option<u8>,
+    pub continued: bool,
     pub uid: u32,
 }
 
@@ -325,11 +381,29 @@ pub fn wait(selector: proto_process::Selector, options: u32) -> Result<Waited, i
         Ok(WaitResult::Ended { pid, end, uid }) => Ok(Waited {
             pid: i32::try_from(pid).map_err(|_| EIO)?,
             end: Some(end),
+            stopped: None,
+            continued: false,
+            uid,
+        }),
+        Ok(WaitResult::Stopped { pid, signal, uid }) => Ok(Waited {
+            pid: i32::try_from(pid).map_err(|_| EIO)?,
+            end: None,
+            stopped: Some(signal),
+            continued: false,
+            uid,
+        }),
+        Ok(WaitResult::Continued { pid, uid }) => Ok(Waited {
+            pid: i32::try_from(pid).map_err(|_| EIO)?,
+            end: None,
+            stopped: None,
+            continued: true,
             uid,
         }),
         Ok(WaitResult::Nothing) => Ok(Waited {
             pid: 0,
             end: None,
+            stopped: None,
+            continued: false,
             uid: 0,
         }),
         Ok(WaitResult::NoChild) => Err(ECHILD),
@@ -1014,7 +1088,12 @@ pub fn exec<'s>(
     let block = crate::threads::own_block();
     // Step 1: every signal of the caller held, the others stopped.
     let mask = block.mask.swap(!0, Ordering::SeqCst);
-    let pending = block.pending.load(Ordering::SeqCst);
+    if let Err(error) = crate::signals::prepare_exec_jobs() {
+        block.mask.store(mask, Ordering::SeqCst);
+        crate::signals::deliver_now();
+        return Err(error);
+    }
+    let pending = block.pending.load(Ordering::SeqCst) & !proto_process::job::MASK;
     let stopped = crate::signals::stop_others();
     let result =
         stopped.and_then(|()| exec_stopped(path, argv, envp, umask, mask, pending, Probe::None));

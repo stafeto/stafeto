@@ -128,14 +128,17 @@ impl Terminals {
         }
     }
 
-    /// Ordinary signals use the active link; HUP can use a pending departure.
-    pub fn permits(&self, terminal: usize, sid: u32, signal: u8) -> bool {
-        self.session(terminal) == Some(sid)
-            || signal == 1
-                && self
-                    .terminals
-                    .get(terminal)
-                    .is_some_and(|t| t.events.iter().flatten().any(|e| e.sid == sid))
+    /// A departure authorizes HUP/CONT only for its exact old connection.
+    pub fn permits_exact(&self, terminal: usize, sid: u32, generation: u64, signal: u8) -> bool {
+        self.link(terminal)
+            .is_some_and(|link| link.sid == sid && link.generation == generation)
+            || matches!(signal, 1 | 18)
+                && self.terminals.get(terminal).is_some_and(|t| {
+                    t.events
+                        .iter()
+                        .flatten()
+                        .any(|e| e.sid == sid && e.generation == generation)
+                })
     }
 
     pub fn drop_terminal(&mut self, terminal: usize) {
@@ -181,10 +184,13 @@ mod tests {
         let mut t = Terminals::new();
         let old = t.set(0, 300, |_| true).unwrap();
         t.leader_ended(300);
-        assert!(!t.permits(0, 300, 2));
-        assert!(t.permits(0, 300, 1));
+        assert!(!t.permits_exact(0, 300, old, 2));
+        assert!(t.permits_exact(0, 300, old, 1));
         let new = t.set(0, 400, |_| true).unwrap();
         assert!(new > old);
+        assert!(t.permits_exact(0, 300, old, 18));
+        assert!(!t.permits_exact(0, 400, old, 18));
+        assert!(!t.permits_exact(0, 300, new, 1));
         assert_eq!(
             t.event(0),
             Some(Link {
@@ -200,8 +206,8 @@ mod tests {
                 generation: new
             })
         );
-        assert!(!t.permits(0, 300, 1));
-        assert!(t.permits(0, 400, 2));
+        assert!(!t.permits_exact(0, 300, old, 1));
+        assert!(t.permits_exact(0, 400, new, 2));
     }
 
     #[test]

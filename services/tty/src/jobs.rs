@@ -18,6 +18,7 @@ pub struct Caller {
     pub pid: u32,
     pub pgid: u32,
     pub sid: u32,
+    pub ctty: Option<(u32, u64)>,
 }
 
 /// A departed connection's foreground is kept until its exact AckCtty.
@@ -170,16 +171,19 @@ mod tests {
         pid: 300,
         pgid: 300,
         sid: 300,
+        ctty: None,
     };
     const MEMBER: Caller = Caller {
         pid: 301,
         pgid: 301,
         sid: 300,
+        ctty: None,
     };
     const OTHER: Caller = Caller {
         pid: 400,
         pgid: 400,
         sid: 400,
+        ctty: None,
     };
 
     #[test]

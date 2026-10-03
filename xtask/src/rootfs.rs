@@ -358,6 +358,7 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
+    "boot-posix-jobs.img",
     "boot-posix-steps.img",
     "boot-posix-tty.img",
     "boot-posix-tty-steps.img",
@@ -372,7 +373,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
     match name {
         "boot-ramfs.img" => ramfs(),
         "boot-ash-dialog.img" => dialog(),
-        "boot-posix-procs.img" => procs(),
+        "boot-posix-procs.img" | "boot-posix-jobs.img" => procs(),
         "boot-posix-poll.img" => vec![
             dir("/bin"),
             file("/bin/posix-poll", 0o755, ROOT, "posix-poll"),
@@ -496,7 +497,7 @@ mod tests {
             let list: &[crate::ImageProgram] = match image {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
-                "boot-posix-procs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
                 "boot-posix-tty.img" => &crate::POSIX_TTY_PROGRAMS,
                 "boot-posix-tty-steps.img" => &crate::POSIX_TTY_STEPS_PROGRAMS,

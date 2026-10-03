@@ -292,6 +292,7 @@ pub fn drain_flush_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &
     Drain {
         key: None,
         terminal: CONSOLE,
+        blocked: 0,
     }
     .write(&mut w)
     .map_err(fail)?;
@@ -302,6 +303,7 @@ pub fn drain_flush_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &
     Drain {
         key: Some(key),
         terminal: CONSOLE,
+        blocked: 0,
     }
     .write(&mut w)
     .map_err(fail)?;
@@ -333,6 +335,7 @@ pub fn drain_flush_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &
         let mut w = Writer::new();
         Control {
             terminal: CONSOLE,
+            blocked: 0,
             word,
         }
         .write(method, &mut w)
@@ -344,6 +347,7 @@ pub fn drain_flush_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &
     Drain {
         key: None,
         terminal: CONSOLE,
+        blocked: 0,
     }
     .write(&mut w)
     .map_err(fail)?;
@@ -363,6 +367,7 @@ pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(
     let mut w = Writer::new();
     Control {
         terminal: CONSOLE,
+        blocked: 0,
         word: FLOW_OUT_OFF,
     }
     .write(Method::Flow, &mut w)
@@ -371,6 +376,7 @@ pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(
     let mut w = Writer::new();
     Control {
         terminal: CONSOLE,
+        blocked: 0,
         word: FLOW_IN_OFF,
     }
     .write(Method::Flow, &mut w)
@@ -408,6 +414,7 @@ pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(
     Drain {
         key: None,
         terminal: CONSOLE,
+        blocked: 0,
     }
     .write(&mut w)
     .map_err(fail)?;
@@ -445,6 +452,7 @@ pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(
     let mut w = Writer::new();
     Control {
         terminal: CONSOLE,
+        blocked: 0,
         word: FLOW_OUT_ON,
     }
     .write(Method::Flow, &mut w)

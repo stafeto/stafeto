@@ -222,3 +222,44 @@ pub extern "C" fn stafeto_getsid(pid: c_int) -> c_int {
 pub extern "C" fn stafeto_thread_kill(id: c_int, signal: c_int) -> c_int {
     -posix_abi::signals::kill_relibc_thread(id as u64, signal)
 }
+
+/// A directed job generation obtained through the caller's own process session.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_job_ticket(signal: c_int) -> u64 {
+    posix_abi::signals::probe_job_ticket(signal)
+}
+
+/// A delayed default stop request carrying the caller's original generation.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_stop_ticket(signal: c_int, ticket: u64) -> c_int {
+    posix_abi::signals::probe_stop_ticket(signal, ticket)
+}
+
+/// Assign a process signal to the current blocked thread for an exec race probe.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_assign_job(signal: c_int) -> c_int {
+    posix_abi::signals::probe_assign_job(signal)
+}
+
+/// Return a captured process signal with its original ticket.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_return_job(signal: c_int, ticket: u64) -> c_int {
+    posix_abi::signals::probe_return_job(signal, ticket)
+}
+
+/// Exercise authenticated return information without manufacturing a generation.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_return_job_info(
+    signal: c_int,
+    ticket: u64,
+    pid: c_int,
+    code: c_int,
+) -> c_int {
+    posix_abi::signals::probe_return_job_info(signal, ticket, pid, code)
+}
+
+/// Refuse the next return before sending, to exercise ownership recovery.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_return_failure() {
+    posix_abi::signals::probe_return_failure();
+}
