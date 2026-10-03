@@ -31,6 +31,10 @@
 //! sets bit 0 through the handle of SEED_TAKE once the device's first bytes
 //! came. Unknown flags get INVALID_ARGS.
 //!
+//! CLONE (8) of the service: the header alone; the reply is status 0 and
+//! one handle, a new session (SEND, TRANSFER) with a label of the
+//! service's own, for a child of the client (posix_spawn, fork, exec).
+//!
 //! | Request | Bytes after the header |
 //! |---|---|
 //! | FILL_START | 0..4 `n`, 4..8 zero |
@@ -66,10 +70,11 @@ pub enum Method {
     Seed = 5,
     SeedTake = 6,
     SeedCancel = 7,
+    Clone = 8,
 }
 
 impl Method {
-    pub const ALL: [Method; 7] = [
+    pub const ALL: [Method; 8] = [
         Method::FillStart,
         Method::FillTake,
         Method::FillCancel,
@@ -77,6 +82,7 @@ impl Method {
         Method::Seed,
         Method::SeedTake,
         Method::SeedCancel,
+        Method::Clone,
     ];
 
     pub const fn number(self) -> u16 {
@@ -203,13 +209,13 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed() {
-        assert_eq!(Method::ALL.map(Method::number), [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(Method::ALL.map(Method::number), [1, 2, 3, 4, 5, 6, 7, 8]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(8), None);
+        assert_eq!(Method::from_number(9), None);
         assert_eq!(Method::Crash.header().bytes(), [4, 0, 1, 0, 0, 0, 0, 0]);
     }
 

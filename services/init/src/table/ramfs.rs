@@ -441,3 +441,28 @@ pub const RTBENCH_POOL: Record = Record {
     quota: POSIX_ABI_TABLE[1].quota + 33 * RTBENCH.quota + 384 * PAGE,
     ..POSIX_ABI_TABLE[1]
 };
+
+/// The probe of getentropy and getrandom (tests/posix-random, step 5e'):
+/// the RAM files, the process and clock services, the pipe service, the
+/// entropy device's driver and the entropy service; the probe starts its
+/// own file once, whose copy forks.
+pub const POSIX_RANDOM_TABLE: &[Record] = &[
+    TABLE[0],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 3 * PROCS_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
+    Record {
+        name: "posix-random",
+        program: "posix-random",
+        args: b"posix-random\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        root: true,
+        quota: PROCS_QUOTA,
+        ..POSIX
+    },
+];

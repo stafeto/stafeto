@@ -194,6 +194,7 @@ dependencies = [
  "posix-heap",
  "posix-map",
  "posix-order",
+ "posix-random",
  "posix-request",
  "posix-signals",
  "posix-sync",
@@ -202,6 +203,7 @@ dependencies = [
  "posix-types",
  "process-client",
  "proto-clock",
+ "proto-entropy",
  "proto-fs",
  "proto-loader",
  "proto-pipe",
@@ -352,6 +354,13 @@ dependencies = [
 [[package]]
 name = "posix-random"
 version = "0.1.0"
+
+[[package]]
+name = "posix-random-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
 
 [[package]]
 name = "posix-request"

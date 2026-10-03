@@ -733,7 +733,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-rtbench-posix") as usize
     + cfg!(feature = "table-rtbench-posix-vz") as usize
     + cfg!(feature = "table-entropy") as usize
-    + cfg!(feature = "table-entropy-vz") as usize;
+    + cfg!(feature = "table-entropy-vz") as usize
+    + cfg!(feature = "table-posix-random") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -764,7 +765,8 @@ const _: () = assert!(
     feature = "table-rtbench-posix",
     feature = "table-rtbench-posix-vz",
     feature = "table-entropy",
-    feature = "table-entropy-vz"
+    feature = "table-entropy-vz",
+    feature = "table-posix-random"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -811,6 +813,8 @@ pub const TABLE: &[Record] = ceiling::TABLE;
 pub const TABLE: &[Record] = entropy::TABLE;
 #[cfg(feature = "table-entropy-vz")]
 pub const TABLE: &[Record] = entropy::VZ_TABLE;
+#[cfg(feature = "table-posix-random")]
+pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -1549,6 +1553,7 @@ mod tests {
             vz::BUSYBOX_DIALOG_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
             vz::RTBENCH_POSIX_TABLE,
+            ramfs::POSIX_RANDOM_TABLE,
         ];
         for table in tables {
             assert!(check(table).is_ok());
@@ -1561,6 +1566,7 @@ mod tests {
                     "relibc-threads",
                     "os-test-run",
                     "rtbench-posix",
+                    "posix-random",
                 ]
                 .contains(&r.program)
             });

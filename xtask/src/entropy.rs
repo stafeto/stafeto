@@ -27,9 +27,9 @@ use crate::{
 /// and the driver's fills.
 const RNG_STACK_SIZE: u32 = 32 * 1024;
 
-/// The stack of the entropy service's loop; its table of sessions lies in
-/// its data.
-const ENTROPY_STACK_SIZE: u32 = 16 * 1024;
+/// The stack of the entropy service's loop: the service with the table of
+/// the clones it gave (8 KiB); its table of sessions lies in its data.
+const ENTROPY_STACK_SIZE: u32 = 32 * 1024;
 
 /// The probe's image on QEMU: the driver with CRASH, the service with the
 /// line of each reseed, both with the count of their steps (feature
@@ -258,6 +258,64 @@ pub fn probe_vz() -> Result<(), String> {
         .map_err(|e| format!("entropy on VZ: {e}"))?;
     println!(
         "entropy on VZ: keys of two clients, keys during a restart of the driver, fills, the device reset and silent: ok"
+    );
+    Ok(())
+}
+
+/// The C probe of the layer's generator (tests/posix-random): the POSIX
+/// services, the loader, the entropy device's driver and service, and the
+/// probe, which starts its own file once.
+pub const RANDOM_PROGRAMS: [ImageProgram; 9] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-random"]),
+    ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
+    ("loader", "loader", 0, &[]),
+    ("virtio-rng", "virtio-rng", RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", ENTROPY_STACK_SIZE, &[]),
+    (
+        "posix-random",
+        "posix-random-probe",
+        crate::POSIX_STACK_SIZE,
+        &[],
+    ),
+];
+
+/// The lines of the C probe, each a check that passed.
+const RANDOM_LINES: [&str; 5] = [
+    "posix-random: getentropy gave 256 bytes twice, they differ",
+    "posix-random: getentropy of 257 bytes gave EINVAL",
+    "posix-random: getrandom: GRND_NONBLOCK and GRND_RANDOM give every byte, bad flags EINVAL",
+    "posix-random: after fork the child's bytes differ from the parent's",
+    "posix-random: ok",
+];
+
+/// `cargo xtask posix-random` and its boot in `test`: getentropy and
+/// getrandom from C on relibc, and a forked child's bytes, on `machine`.
+pub fn random_probe(machine: &qemu::Machine) -> Result<(), String> {
+    crate::relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-posix-random.img", &RANDOM_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    const ENDS: &str = "init: posix-random ended: ";
+    let output = run_until(cmd, crate::BOOT_TIMEOUT, Some(ENDS), &kernel.elf)?;
+    for line in RANDOM_LINES {
+        qemu::expect_marker(&output, line)?;
+    }
+    qemu::expect_stopped_on(
+        &output,
+        "init: posix-random ended: exit code 0, not restarted",
+    )?;
+    println!(
+        "posix-random on {}: getentropy, getrandom and fork: ok",
+        machine.name
     );
     Ok(())
 }

@@ -131,6 +131,9 @@ pub unsafe fn posix_init_process(
     let files = files.map_err(|_| "file connection failed")?;
     // SAFETY: only startup owns file initialization.
     unsafe { posix_abi::shared::init(files) }.map_err(|_| "files failed")?;
+    // The entropy service, when the record names it; none otherwise, and
+    // getentropy gives ENOSYS. SAFETY: startup, on the only thread.
+    unsafe { posix_abi::random::init(rt::service::connect(parent, "entropy").ok()) };
     // SAFETY: startup is single-threaded and its layout reserves the heap ranges.
     unsafe { posix_abi::allocation::init(process) }.map_err(|_| "heap failed")?;
     // CLOCK_REALTIME without IPC; a clock service without its page leaves
@@ -322,6 +325,8 @@ fn loaded_main() -> u64 {
         rt::println!("POSIX startup: {}", why);
         return 125;
     }
+    // SAFETY: still single-threaded.
+    unsafe { posix_abi::random::init(one(Slot::Entropy).map(Handle::from_raw)) };
     if let Some(identity) = one(Slot::PosixId) {
         // SAFETY: still single-threaded, after the process service's init.
         unsafe { posix_abi::process::set_identity(Handle::from_raw(identity)) };

@@ -48,6 +48,8 @@ table-posix-dialog-vz = []
 # The probes of the entropy device's driver (xtask entropy, entropy-vz).
 table-entropy = []
 table-entropy-vz = []
+# The C probe of getentropy and getrandom (xtask posix-random).
+table-posix-random = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

@@ -17,6 +17,7 @@ pub mod long;
 pub mod metadata;
 pub mod pipes;
 pub mod process;
+pub mod random;
 pub mod relibc;
 pub mod shared;
 pub mod signals;

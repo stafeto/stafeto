@@ -333,6 +333,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-ramfs.img" => ramfs(),
         "boot-ash-dialog.img" => dialog(),
         "boot-posix-procs.img" => procs(),
+        "boot-posix-random.img" => vec![
+            dir("/bin"),
+            file("/bin/posix-random", 0o755, ROOT, "posix-random"),
+        ],
         "boot-posix-steps.img" => steps(),
         "rtbench-posix.img" | "rtbench-posix-vz.img" | "rtbench-posix-short.img" => rtbench(),
         _ => Vec::new(),

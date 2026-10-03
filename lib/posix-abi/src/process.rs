@@ -1094,7 +1094,13 @@ fn move_files(c: &Handle<Channel>) -> bool {
     {
         let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
     }
-    ask_loader(c, &w, Some(handles)) == 0
+    if ask_loader(c, &w, Some(handles)) != 0 {
+        return false;
+    }
+    // The session with the entropy service moves too, in a second Handles;
+    // the new image's generator starts with no key.
+    let entropy = crate::random::session().map_or(0, |raw| raw.0);
+    crate::fork::give_slots(c, &[(Slot::Entropy, entropy)]).is_ok()
 }
 
 /// The errno of a refused Clone: EAGAIN for a service at its limit of
@@ -1206,6 +1212,9 @@ fn commit(
     if ask_loader(c, &w, Some(handles)) != 0 {
         return Err(EIO);
     }
+    // The child's session with the entropy service, in a second Handles.
+    let entropy = crate::fork::entropy_clone()?;
+    crate::fork::give_slots(c, &[(Slot::Entropy, entropy.map_or(0, |e| e.into_raw().0))])?;
     ask(&request(proto_process::Method::SpawnCommit, &[pid as u32])?).map(drop)
 }
 

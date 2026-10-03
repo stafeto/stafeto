@@ -917,6 +917,7 @@ commands:
             under -icount: fills, a restart of the driver, its longest
             steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
   entropy-vz run the probe of the entropy device's driver on Apple VZ
+  posix-random run the C probe of getentropy, getrandom and fork in QEMU
   help      this text";
 
 fn main() {
@@ -1017,6 +1018,7 @@ fn main() {
             Some(_) => Err("entropy [--hvf]".to_owned()),
         },
         Some("entropy-vz") => entropy::probe_vz(),
+        Some("posix-random") => entropy::random_probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -2004,6 +2006,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: fread ",
         "relibc-hello: monotonic ",
         "relibc-hello: directories, stat, descriptors, mmap, math",
+        "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
         "Assertion `how == NULL` failed.",
         "RELIBC PANIC: ",
@@ -2885,6 +2888,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         }),
         // The entropy device's driver under -icount, its steps measured.
         job("entropy", || entropy::probe(&qemu::VIRT)),
+        job("posix-random", || entropy::random_probe(&qemu::VIRT)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
@@ -4257,8 +4261,10 @@ fn hvf() -> Result<(), String> {
             relibc_threads_probe(m)?;
             posix_procs_probe(m)?;
         }
-        // The entropy device's DMA through the real processor's caches.
+        // The entropy device's DMA through the real processor's caches,
+        // and the layer's generator across fork.
         entropy::probe(m)?;
+        entropy::random_probe(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let mut kernel = 0;
@@ -4748,6 +4754,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-procs",
         "--package",
         "os-test-run",
+        "--package",
+        "posix-random-probe",
         "--target",
         PROGRAM_TARGET,
         "--",

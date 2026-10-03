@@ -24,10 +24,12 @@
 
 use abi::{Error, MESSAGE_MAX, Rights, Source as From};
 use core::cell::UnsafeCell;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use entropy::{FIRST_BYTES, RESEED_NS, Source, Start};
 use proto_entropy::{Fill, Key, Method, NOT_READY, Seed, VERSION};
 use proto_init::ServiceArgs;
+use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer, long};
 use rt::handle::{Channel, Outgoing, Resource, Thread};
 use rt::service::{
@@ -39,8 +41,14 @@ use rt::{Handle, Stack, sys, time};
 rt::entry!(main);
 
 /// The sessions of the service's channel: every POSIX process may hold
-/// one, and the process service keeps 255 of them.
-const SESSIONS: usize = 256;
+/// one, init's or a clone (CLONE), and the process service keeps 255 of
+/// them; room beside them, as the clock service has.
+const SESSIONS: usize = 320;
+/// The clones the service keeps alive at most, for all its clients.
+const CLONES: usize = 320;
+/// The mark of the labels the service gives itself (CLONE): bit 63, which
+/// no label of init has.
+const OWN: u64 = 1 << 63;
 /// The seeds that wait for the device's first bytes, at most.
 const WAITING: usize = 32;
 /// The bit of the feeder's notification on the loop's channel.
@@ -135,6 +143,10 @@ fn main(_: u64) -> u64 {
     let mut service = Entropy {
         source: Source::new(),
         ops: LongOps::new(),
+        clones: Clones::new(),
+        given: 0,
+        channel: Handle::borrowed(channel.raw()),
+        level,
         _feeder: feeder,
     };
     #[cfg(feature = "steps")]
@@ -158,6 +170,12 @@ fn main(_: u64) -> u64 {
 struct Entropy {
     source: Source,
     ops: LongOps<WAITING>,
+    /// The sessions CLONE gave that live, bounded for each client; the
+    /// count of those given so far; the channel they are copies of.
+    clones: Clones<CLONES>,
+    given: u64,
+    channel: ManuallyDrop<Handle<Channel>>,
+    level: u8,
     _feeder: Handle<Thread>,
 }
 
@@ -215,6 +233,31 @@ impl Entropy {
         long_answer(r, long::Reply::Armed)
     }
 
+    /// CLONE: a new session for a child of the client, a copy of the
+    /// service's channel with SEND, TRANSFER and a label of the service's
+    /// own; LIMIT_REACHED past the clones of the client or of the service.
+    fn clone_session(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if self.clones.room(r.label()).is_err() {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        }
+        self.given += 1;
+        let label = OWN | self.given;
+        let rights = Rights::SEND | Rights::TRANSFER;
+        match sys::handle_label(&self.channel, rights, label, self.level) {
+            Ok(session) => {
+                if r.reply().u32(Status::Ok.code()).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let _ = self.clones.add(label, r.label());
+                Answer::Reply([session.erase()].into())
+            }
+            Err(error) => Answer::Status(Status::Kernel(error)),
+        }
+    }
+
     /// The feeder's bytes came: they seed or reseed the generator, and the
     /// seeds that waited for the first hear of it, WAITING at most.
     fn fed(&mut self) {
@@ -254,6 +297,7 @@ const METHODS: &[u16] = &[
     Method::Seed.number(),
     Method::SeedTake.number(),
     Method::SeedCancel.number(),
+    Method::Clone.number(),
 ];
 
 impl Service<1> for Entropy {
@@ -266,12 +310,18 @@ impl Service<1> for Entropy {
             Some(Method::Seed) => self.seed(s, r),
             Some(Method::SeedTake) => self.take(s, r, false),
             Some(Method::SeedCancel) => self.take(s, r, true),
+            Some(Method::Clone) => self.clone_session(r),
             _ => Answer::Status(Status::UnknownMethod),
         }
     }
 
     fn gone(&mut self, s: &mut Session<LongSession, 1>) {
         self.ops.gone(&mut s.data);
+    }
+
+    /// The last copy of a session CLONE gave went.
+    fn closed(&mut self, label: u64) {
+        self.clones.gone(label);
     }
 
     fn notification(&mut self, n: Notice) {
