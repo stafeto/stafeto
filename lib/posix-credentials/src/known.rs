@@ -59,6 +59,7 @@ mod tests {
             credentials,
             generation,
             loader: None,
+            index: 0,
         }
     }
 

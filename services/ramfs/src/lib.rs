@@ -1555,6 +1555,7 @@ mod tests {
             },
             generation: 1,
             loader: Some(loader),
+            index: 0,
         };
         let loaders = proto_fs::LOADERS | 9;
         assert_eq!(
@@ -1574,6 +1575,7 @@ mod tests {
         assert_eq!(exec_for(loaders, None), refused, "Vouch refused");
         let process = WhoReply {
             loader: None,
+            index: 0,
             ..who
         };
         assert_eq!(exec_for(loaders, Some(process)), refused, "no loader");

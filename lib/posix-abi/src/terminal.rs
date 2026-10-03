@@ -266,3 +266,45 @@ pub fn control(transport: Transport, number: u32, method: Method, word: u32) -> 
 }
 
 const _: () = assert!(QUEUE_BOTH == 2 && CONSOLE == 0);
+
+/// A request of the controlling terminal (5f, T3; proto_tty ACQUIRE,
+/// SET_PGRP, GET_PGRP, GET_SID, CONTROLLING) of the terminal `number`,
+/// with a copy of the process's identity, which the service has the
+/// process service vouch for: the word of the reply (0 for those with
+/// none). EPERM, ENOTTY and EINVAL as the service answers; ENOTTY without
+/// an identity it could use.
+#[inline(never)]
+pub fn job(
+    transport: Transport,
+    number: u32,
+    method: Method,
+    group: Option<u32>,
+) -> Result<u32, i32> {
+    let terminal = transport.terminal().ok_or(EBADF)?;
+    let mut w = Writer::new();
+    proto_tty::job(method, number, group, &mut w).map_err(|_| EINVAL)?;
+    let rights = rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let reply = loop {
+        let identity =
+            crate::process::identity().and_then(|i| rt::sys::handle_duplicate(i, rights).ok());
+        let sent = match identity {
+            Some(copy) => rt::sys::send_handles(&terminal, w.as_bytes(), [copy.erase()])
+                .map_err(|refused| refused.error),
+            None => rt::sys::send(&terminal, w.as_bytes()),
+        };
+        match sent {
+            Err(rt::abi::Error::Interrupted) => continue,
+            other => break other.map_err(|_| EIO)?,
+        }
+    };
+    let bytes = reply.bytes(&mut buffer);
+    let mut r = proto_wire::Reader::new(bytes);
+    let code = r.u32().map_err(|_| EIO)?;
+    match code {
+        0 => Ok(r.u32().unwrap_or(0)),
+        proto_tty::PERMISSION => Err(EPERM),
+        proto_tty::NOT_CONTROLLING | proto_tty::NO_IDENTITY => Err(ENOTTY),
+        code => Err(refusal(Status::from_code(code)).unwrap_or(EIO)),
+    }
+}

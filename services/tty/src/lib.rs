@@ -12,6 +12,7 @@
 pub mod discipline;
 #[cfg(test)]
 mod fuzz;
+pub mod jobs;
 #[cfg(test)]
 mod reference;
 

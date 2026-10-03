@@ -32,7 +32,7 @@ STAMP = WORK / "config"
 A53_ERRATA = "-mfix-cortex-a53-835769"
 # BusyBox's main becomes busybox_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
-PATCH = "echo cat wc ash ls-nofork relibc main-renamed a53-835769"
+PATCH = "echo cat wc sleep ash ls-nofork relibc main-renamed a53-835769"
 
 
 def relibc_commit() -> str:
@@ -53,7 +53,7 @@ OBJECTS = (
     "const_hack.o", "endofname.o", "bb_strtonum.o", "sysconf.o",
     "parse_mode.o", "time.o", "signals.o", "read_printf.o",
     "u_signal_names.o",
-    "safe_poll.o",
+    "safe_poll.o", "single_argv.o",
     "common_bufsiz.o", "concat_path_file.o", "printable_string.o",
     "xreadlink.o", "mode_string.o",
     "last_char_is.o", "auto_string.o",
@@ -137,6 +137,7 @@ def main() -> None:
     replace(config, "# CONFIG_CAT is not set", "CONFIG_CAT=y")
     replace(config, "# CONFIG_LS is not set", "CONFIG_LS=y")
     replace(config, "# CONFIG_WC is not set", "CONFIG_WC=y")
+    replace(config, "# CONFIG_SLEEP is not set", "CONFIG_SLEEP=y")
     replace(config, "# CONFIG_SHOW_USAGE is not set", "CONFIG_SHOW_USAGE=y")
     replace(config, "# CONFIG_FEATURE_VERBOSE_USAGE is not set",
             "CONFIG_FEATURE_VERBOSE_USAGE=y")

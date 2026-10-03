@@ -46,6 +46,28 @@
 //!   FLOW_IN_ON put the STOP and the START character in the output).
 //!   Reply: status.
 //!
+//! The controlling terminal (XBD 11.1.3; 5f, T3). Each request below has
+//! the body the terminal u32 (and a word where named) and brings a copy of
+//! the caller's identity session (proto_process; NOTIFY, TRANSFER), which
+//! the service has the process service vouch for once and again when the
+//! record's generation moves; it reads the caller's group and session
+//! from the page of the generations. NO_IDENTITY without one it can use.
+//! - ACQUIRE (TIOCSCTTY, an open without O_NOCTTY): the terminal becomes
+//!   the controlling terminal of the caller's session, the caller's group
+//!   its foreground group; PERMISSION when the caller leads no session or
+//!   the terminal or the session is taken. Reply: status.
+//! - SET_PGRP (tcsetpgrp): the word, a group of the terminal's session,
+//!   becomes the foreground group; NOT_CONTROLLING when the terminal is no
+//!   controlling terminal of the caller's session, PERMISSION for a group
+//!   of no member in that session, INVALID for 0 or a negative number.
+//!   Reply: status.
+//! - GET_PGRP (tcgetpgrp), GET_SID (tcgetsid): reply status and the
+//!   foreground group u32 (i32::MAX with none), or the session u32;
+//!   NOT_CONTROLLING as for SET_PGRP.
+//! - CONTROLLING (an open of /dev/tty): status 0 when the terminal is the
+//!   controlling terminal of the caller's session; NOT_CONTROLLING
+//!   otherwise.
+//!
 //! BAD_TERMINAL for a terminal the service does not have, INVALID for an
 //! action past FLUSH, a queue past QUEUE_BOTH or an action past
 //! FLOW_IN_ON. A start past the WAITERS operations that wait on a
@@ -79,6 +101,15 @@ pub const WAITERS: usize = 8;
 pub const BAD_TERMINAL: u32 = 801;
 /// EINVAL.
 pub const INVALID: u32 = 803;
+/// EPERM.
+pub const PERMISSION: u32 = 804;
+/// ENOTTY for the requests of the controlling terminal (ENXIO for an open
+/// of /dev/tty).
+pub const NOT_CONTROLLING: u32 = 805;
+/// No identity the service could vouch for came with the request.
+pub const NO_IDENTITY: u32 = 806;
+/// What GET_PGRP gives with no foreground group: a number no group has.
+pub const NO_FOREGROUND: u32 = i32::MAX as u32;
 
 /// The labels the service gives itself: bit 63, which no label of init
 /// has.
@@ -236,10 +267,15 @@ pub enum Method {
     DrainCancel = 13,
     FlushQueues = 14,
     Flow = 15,
+    Acquire = 16,
+    SetPgrp = 17,
+    GetPgrp = 18,
+    GetSid = 19,
+    Controlling = 20,
 }
 
 impl Method {
-    pub const ALL: [Method; 15] = [
+    pub const ALL: [Method; 20] = [
         Method::ReadStart,
         Method::ReadTake,
         Method::ReadCancel,
@@ -255,6 +291,11 @@ impl Method {
         Method::DrainCancel,
         Method::FlushQueues,
         Method::Flow,
+        Method::Acquire,
+        Method::SetPgrp,
+        Method::GetPgrp,
+        Method::GetSid,
+        Method::Controlling,
     ];
 
     pub const fn number(self) -> u16 {
@@ -270,7 +311,33 @@ impl Method {
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+pub const METHODS: &[u16] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+];
+
+/// A request of the controlling terminal (ACQUIRE, SET_PGRP, GET_PGRP,
+/// GET_SID, CONTROLLING): its header, the terminal and, for SET_PGRP, the
+/// group; the caller sends the copy of its identity with it.
+pub fn job(
+    method: Method,
+    terminal: u32,
+    group: Option<u32>,
+    w: &mut Writer,
+) -> Result<(), Status> {
+    if !matches!(
+        method,
+        Method::Acquire | Method::SetPgrp | Method::GetPgrp | Method::GetSid | Method::Controlling
+    ) || (method == Method::SetPgrp) != group.is_some()
+    {
+        return Err(Status::BadSize);
+    }
+    method.header().write(w)?;
+    w.u32(terminal)?;
+    match group {
+        Some(g) => w.u32(g),
+        None => Ok(()),
+    }
+}
 
 /// READ_START or READ_TAKE: the key of a take, the terminal and the count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -533,7 +600,7 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed_and_listed() {
-        for number in 0..=16u16 {
+        for number in 0..=21u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(m) = method {

@@ -29,11 +29,19 @@ unsafe extern "C" {
 }
 
 /// The first argument of the launcher: the program init starts for the
-/// dialog (its record's own arguments). It starts `/bin/ash` as a POSIX
-/// process from its file, the way every child starts, with the console
-/// it reads and writes, and waits for it.
+/// dialog (its record's own arguments). It spawns `/bin/busybox` as the
+/// dialog's getty (5f; a program init starts has no code of its own to
+/// fork, one of the loader has), which makes a session of its own, opens
+/// the console, which becomes the session's controlling terminal with the
+/// getty's group in its foreground, puts it in descriptors 0, 1 and 2 and
+/// execs `/bin/ash -i`; the launcher, in another session, waits for it.
+/// INTR at the console so reaches the shell and its commands and never
+/// the launcher.
 #[cfg(feature = "ash-interactive")]
 const LAUNCHER: &core::ffi::CStr = c"ash-launch";
+/// The first argument of the getty.
+#[cfg(feature = "ash-interactive")]
+const GETTY: &core::ffi::CStr = c"ash-getty";
 
 #[cfg(feature = "ash-interactive")]
 unsafe extern "C" {
@@ -45,25 +53,62 @@ unsafe extern "C" {
         argv: *const *const c_char,
         envp: *const *const c_char,
     ) -> c_int;
+    fn setsid() -> c_int;
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+    fn dup2(old: c_int, new: c_int) -> c_int;
+    fn close(fd: c_int) -> c_int;
+    fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char)
+    -> c_int;
+    fn _exit(status: c_int) -> !;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn __errno_location() -> *mut c_int;
     static environ: *const *const c_char;
 }
 
-/// Starts `/bin/ash -i` and waits for it: its exit status, 128 plus the
-/// signal that ended it, or 125 when it did not start.
+/// The getty: a session of its own, the console as its controlling
+/// terminal on 0, 1 and 2, then `/bin/ash -i`; 126 when a step fails, 127
+/// when the exec does.
+#[cfg(feature = "ash-interactive")]
+fn getty() -> ! {
+    const O_RDWR: c_int = 2;
+    let argv = [c"ash".as_ptr(), c"-i".as_ptr(), core::ptr::null()];
+    // SAFETY: the child of fork, alone in its process; the strings are
+    // NUL-terminated and live on; environ is relibc's.
+    unsafe {
+        if setsid() < 0 {
+            _exit(126);
+        }
+        let console = open(c"/dev/console".as_ptr(), O_RDWR);
+        if console < 0 {
+            _exit(126);
+        }
+        for fd in 0..3 {
+            if dup2(console, fd) < 0 {
+                _exit(126);
+            }
+        }
+        if console > 2 {
+            close(console);
+        }
+        execve(c"/bin/ash".as_ptr(), argv.as_ptr(), environ);
+        _exit(127)
+    }
+}
+
+/// Starts the getty, which becomes the shell, and waits for it: its exit
+/// status, 128 plus the signal that ended it, or 125 when it did not
+/// start.
 #[cfg(feature = "ash-interactive")]
 fn launch_ash() -> c_int {
     const EINTR: c_int = 4;
-    let argv = [c"ash".as_ptr(), c"-i".as_ptr(), core::ptr::null()];
+    let argv = [GETTY.as_ptr(), core::ptr::null()];
     let mut pid: c_int = 0;
     // SAFETY: the path and the arguments are NUL-terminated and live on;
-    // no file actions or attributes (null); relibc's environ is the
-    // process's environment.
+    // no file actions or attributes (null); environ is relibc's.
     let started = unsafe {
         posix_spawn(
             &mut pid,
-            c"/bin/ash".as_ptr(),
+            c"/bin/busybox".as_ptr(),
             core::ptr::null(),
             core::ptr::null(),
             argv.as_ptr(),
@@ -71,7 +116,7 @@ fn launch_ash() -> c_int {
         )
     };
     if started != 0 {
-        rt::println!("ash-launch: cannot start /bin/ash: error {started}");
+        rt::println!("ash-launch: cannot start the getty: error {started}");
         return 125;
     }
     let mut status: c_int = 0;
@@ -98,6 +143,11 @@ extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> 
     // argc is above 0.
     if argc > 0 && unsafe { core::ffi::CStr::from_ptr(*argv) } == LAUNCHER {
         return launch_ash();
+    }
+    #[cfg(feature = "ash-interactive")]
+    // SAFETY: as above.
+    if argc > 0 && unsafe { core::ffi::CStr::from_ptr(*argv) } == GETTY {
+        getty();
     }
     // SAFETY: relibc's start gives argv with argc strings and a final null
     // pointer; BusyBox's dispatcher takes the applet from argv[0].

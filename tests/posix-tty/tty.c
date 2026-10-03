@@ -13,9 +13,12 @@
  * TCSAFLUSH drop the input typed and not read. Output: tcflow stops and
  * starts it and sends STOP and START, tcflush drops what the driver did
  * not take, tcdrain waits for the output to go. Names: /dev/console and
- * /dev/tty open the terminal, which fork carries to a child; stat says a
+ * /dev/tty name the terminal, which fork carries to a child; stat says a
  * character device; the terminal functions give EINVAL, ENOTTY and EBADF
- * where POSIX does.
+ * where POSIX does. Sessions: a process of a session with no controlling
+ * terminal gets ENOTTY from tcgetpgrp and ENXIO from /dev/tty; a leader's
+ * open takes the console, a member's and one with O_NOCTTY do not;
+ * tcsetpgrp takes a group of the session and refuses another session's.
  *
  * The program has three roles: the launcher that init starts, which spawns
  * /bin/posix-tty as "run" (init's own process has no code to fork; a
@@ -29,6 +32,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -301,8 +305,10 @@ static int names(const struct termios *saved) {
     struct termios t;
     CHECK(tcgetattr(fd, &t) == 0 && same(&t, saved));
     CHECK(PUT(fd, "posix-tty: written through /dev/console\n"));
-    int tty = open("/dev/tty", O_RDWR);
-    CHECK(tty > 2 && isatty(tty) == 1 && close(tty) == 0);
+    /* /dev/tty is the controlling terminal of the caller's session, and
+     * this session has none: ENXIO (sessions() opens it with one). */
+    errno = 0;
+    CHECK(open("/dev/tty", O_RDWR) == -1 && errno == ENXIO);
     errno = 0;
     CHECK(open("/dev/console", O_RDONLY | O_DIRECTORY) == -1 && errno == ENOTDIR);
     errno = 0;
@@ -359,6 +365,101 @@ static int names(const struct termios *saved) {
     return 0;
 }
 
+/* TtySignal through the process's own session: the process service takes
+ * it from the terminal service alone. */
+extern int stafeto_probe_tty_signal(int pgid, int signal);
+
+/* The leader A of a new session, a child of "run" (XBD 11.1.3,
+ * tcsetpgrp, tcgetpgrp, tcgetsid): a member of its session that opens the
+ * console takes nothing; A's open with O_NOCTTY takes nothing either; its
+ * open without takes the console, whose foreground group is A's; a group
+ * of another session cannot be the foreground (EPERM), one of A's session
+ * can. The exit code names the check that failed. */
+static int leader(pid_t other_group) {
+    if (setsid() != getpid()) return 51;
+    errno = 0;
+    if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO) return 52;
+    /* A member that opens the console does not make it the session's. */
+    pid_t member = fork();
+    if (member < 0) return 53;
+    if (member == 0) {
+        int fd = open("/dev/console", O_RDWR);
+        if (fd < 0) _exit(1);
+        errno = 0;
+        if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO) _exit(2);
+        _exit(0);
+    }
+    int status = 0;
+    if (waitpid(member, &status, 0) != member || !WIFEXITED(status)) return 54;
+    if (WEXITSTATUS(status) != 0) return 60 + WEXITSTATUS(status);
+    errno = 0;
+    if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO) return 55;
+    int quiet = open("/dev/console", O_RDWR | O_NOCTTY);
+    if (quiet < 0) return 56;
+    errno = 0;
+    if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO) return 57;
+    errno = 0;
+    if (tcgetpgrp(quiet) != -1 || errno != ENOTTY) return 58;
+    /* The leader's open takes the console. */
+    int console = open("/dev/console", O_RDWR);
+    if (console < 0) return 70;
+    int tty = open("/dev/tty", O_RDWR);
+    if (tty < 0) return 71;
+    if (tcgetpgrp(tty) != getpgrp()) return 72;
+    if (tcgetsid(tty) != getpid()) return 73;
+    if (tcgetpgrp(0) != getpgrp()) return 74;
+    /* A process cannot send a signal as the terminal, not even to the
+     * foreground group of its own terminal's session. */
+    if (stafeto_probe_tty_signal(getpgrp(), SIGWINCH) != EPERM) return 59;
+    errno = 0;
+    if (tcsetpgrp(tty, other_group) != -1 || errno != EPERM) return 75;
+    errno = 0;
+    if (tcsetpgrp(tty, 0) != -1 || errno != EINVAL) return 76;
+    /* A group of the session: a child in a group of its own. */
+    int ready[2], go[2];
+    if (pipe(ready) != 0 || pipe(go) != 0) return 77;
+    pid_t child = fork();
+    if (child < 0) return 78;
+    if (child == 0) {
+        char c = 0;
+        if (setpgid(0, 0) != 0) _exit(1);
+        if (write(ready[1], "r", 1) != 1) _exit(2);
+        if (read(go[0], &c, 1) != 1 || c != 'g') _exit(3);
+        _exit(0);
+    }
+    char c = 0;
+    if (read(ready[0], &c, 1) != 1 || c != 'r') return 79;
+    if (tcsetpgrp(tty, child) != 0) return 80;
+    if (tcgetpgrp(tty) != child) return 81;
+    if (tcsetpgrp(tty, getpgrp()) != 0) return 82;
+    if (tcgetpgrp(tty) != getpgrp()) return 83;
+    if (write(go[1], "g", 1) != 1) return 84;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 85;
+    if (WEXITSTATUS(status) != 0) return 90 + WEXITSTATUS(status);
+    return 0;
+}
+
+/* Sessions and the controlling terminal: "run" has none, its child A
+ * (`leader`) makes a session and takes the console; a process cannot
+ * send a signal as the terminal. */
+static int sessions(void) {
+    CHECK(stafeto_probe_tty_signal(getpgrp(), SIGTERM) == EPERM);
+    errno = 0;
+    CHECK(tcgetpgrp(0) == -1 && errno == ENOTTY);
+    errno = 0;
+    CHECK(tcgetsid(0) == -1 && errno == ENOTTY);
+    pid_t a = fork();
+    CHECK(a >= 0);
+    if (a == 0) _exit(leader(getpgrp()));
+    int status = 0;
+    CHECK(waitpid(a, &status, 0) == a && WIFEXITED(status));
+    int code = WEXITSTATUS(status);
+    if (code != 0) say("posix-tty: the leader failed with %d\n", code);
+    CHECK(code == 0);
+    say("posix-tty: sessions ok\n");
+    return 0;
+}
+
 /* The role "spawned": `first` is the descriptor the parent left open,
  * `second` the one a file action opened; both are the terminal. */
 static int spawned(int first, int second) {
@@ -388,6 +489,7 @@ static int run(void) {
     if ((status = flushing(&saved)) != 0) return status;
     if ((status = output()) != 0) return status;
     if ((status = names(&saved)) != 0) return status;
+    if ((status = sessions()) != 0) return status;
     say("posix-tty: ok\n");
     return 0;
 }

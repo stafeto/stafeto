@@ -27,19 +27,20 @@ use core::mem::ManuallyDrop;
 use proto_init::ServiceArgs;
 use proto_tty::{
     BAD_TERMINAL, CONSOLE, Cancel, Control, Drain, FLOW_IN_OFF, FLOW_IN_ON, FLOW_OUT_OFF,
-    FLOW_OUT_ON, FLUSH, INVALID, MAX_READ, Method, OWN, QUEUE_BOTH, QUEUE_IN, QUEUE_OUT, Read,
-    SetAttr, VERSION, VSTART, VSTOP, WAITERS, Write,
+    FLOW_OUT_ON, FLUSH, INVALID, MAX_READ, Method, NO_IDENTITY, OWN, PERMISSION, QUEUE_BOTH,
+    QUEUE_IN, QUEUE_OUT, Read, SetAttr, VERSION, VSTART, VSTOP, WAITERS, Write,
 };
 use proto_uart::{ReadKey, ReadRequest, RoomReply, WriteReply, WriteRequest};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer, long};
 use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
-use rt::handle::{Channel, Handle, Outgoing, Timer};
+use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Timer};
 use rt::service::{
     Answer, Config, Heartbeat, LongOps, LongSession, Notice, Request, Service, Session,
 };
 use rt::{sys, time};
 use tty::discipline::{self, Signal, Terminal};
+use tty::jobs::{self, Caller, Jobs};
 use tty::{Driver, Pump, Pumped, Waiter, Waiters};
 
 rt::entry!(main);
@@ -87,7 +88,24 @@ const STOPPED: u64 = 6;
 struct Client {
     long: LongSession,
     root: u64,
+    /// Who the process of the session is, as the process service vouched
+    /// for it (5f, T3).
+    who: Option<Who>,
 }
+
+/// What the process service said of a session's process: the index of
+/// its record, its PID, and the generation of its credentials then, which
+/// moves when the record goes or execs.
+#[derive(Clone, Copy)]
+struct Who {
+    index: usize,
+    pid: u32,
+    generation: u64,
+}
+
+/// Where the service maps the page of the generations (proto_process
+/// Register), read-only.
+const GENERATIONS_AT: usize = 0x41_0000_0000;
 
 /// The tables of the sessions and long operations and the console's
 /// discipline, in `.bss`: too big for the stack.
@@ -158,6 +176,10 @@ fn main(_: u64) -> u64 {
         step,
         step_told: false,
         step_due: false,
+        process: Handle::borrowed(start.process.raw()),
+        notary: None,
+        generations: None,
+        jobs: Jobs::new(),
     };
     let config = Config {
         issued: 0,
@@ -225,6 +247,15 @@ struct Tty {
     step: Handle<Channel>,
     step_told: bool,
     step_due: bool,
+    /// The service's process, where it maps the page of the generations.
+    process: ManuallyDrop<Handle<Process>>,
+    /// The notary session with the process service (TERMINAL) and the
+    /// page of the generations, asked for at the first request of the
+    /// controlling terminal.
+    notary: Option<Handle<Channel>>,
+    generations: Option<Handle<Memory>>,
+    /// The console as a controlling terminal (5f, T3).
+    jobs: Jobs,
 }
 
 /// The time on the scale of timer_set.
@@ -466,15 +497,20 @@ impl Tty {
             }
         };
         self.console.input(&bytes[..n], now());
-        for signal in self.console.take_signals() {
-            let name = match signal {
-                Signal::Interrupt => "SIGINT",
-                Signal::Quit => "SIGQUIT",
-                Signal::Suspend => "SIGTSTP",
+        let mut signals = [None; 3];
+        for (place, signal) in signals.iter_mut().zip(self.console.take_signals()) {
+            *place = Some(signal);
+        }
+        for signal in signals.into_iter().flatten() {
+            let (name, number) = match signal {
+                Signal::Interrupt => ("SIGINT", SIGINT),
+                Signal::Quit => ("SIGQUIT", SIGQUIT),
+                Signal::Suspend => ("SIGTSTP", SIGTSTP),
             };
-            // Job control (5f, T3) sends it to the foreground process
-            // group; until then the service says it saw it.
-            rt::println!("tty: {name} for the foreground process group");
+            match self.jobs.foreground() {
+                Some(group) => self.signal_group(group, number),
+                None => rt::println!("tty: {name}, no foreground process group"),
+            }
         }
         self.tell_readers();
         self.kick();
@@ -815,6 +851,205 @@ impl Tty {
     }
 }
 
+/// The numbers of the signals of the terminal (Linux's).
+const SIGINT: u32 = 2;
+const SIGQUIT: u32 = 3;
+const SIGTSTP: u32 = 20;
+
+impl Tty {
+    /// The notary session and the page of the generations, asked for once
+    /// (none in an image without the process service).
+    fn notary(&mut self) -> Option<&Handle<Channel>> {
+        if self.notary.is_none() {
+            self.notary = rt::service::connect(&self.parent, "posix").ok();
+        }
+        let notary = self.notary.as_ref()?;
+        if self.generations.is_none() {
+            let request = proto_process::Method::Register.header().bytes();
+            let mut reply = sys::send(notary, &request).ok()?;
+            let mut buffer = [0; MESSAGE_MAX];
+            if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+                return None;
+            }
+            let memory = reply.handles.take::<Memory>(0).ok()?;
+            let access = rt::abi::Access::Read;
+            sys::mem_map(&self.process, &memory, 0, 4096, GENERATIONS_AT, access).ok()?;
+            self.generations = Some(memory);
+        }
+        self.notary.as_ref()
+    }
+
+    /// The word at byte `at` of the page of the generations, once mapped.
+    fn word(&self, at: usize) -> u64 {
+        if self.generations.is_none() || at + 8 > 4096 {
+            return 0;
+        }
+        // SAFETY: the page is mapped readable at GENERATIONS_AT for as long
+        // as the service lives (`notary`); `at` is aligned and in it.
+        let word = unsafe { &*((GENERATIONS_AT + at) as *const core::sync::atomic::AtomicU64) };
+        word.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Who sent `r` through `s`: the process service vouches for the
+    /// identity the request brought, once and again when the record's
+    /// generation moved; its group and session come from the page.
+    fn caller(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Result<Caller, u32> {
+        let offered = if r.handles.is_empty() {
+            None
+        } else {
+            r.handles.take::<Channel>(0).ok()
+        };
+        self.notary().ok_or(NO_IDENTITY)?;
+        let current = s
+            .data
+            .who
+            .filter(|w| self.word(w.index * 8) == w.generation);
+        let who = match (current, offered) {
+            (Some(who), _) => who,
+            (None, Some(identity)) => {
+                let notary = self.notary.as_ref().ok_or(NO_IDENTITY)?;
+                let request = proto_process::Method::Vouch.header().bytes();
+                let reply = sys::send_handles(notary, &request, [identity.erase()])
+                    .map_err(|_| NO_IDENTITY)?;
+                let mut buffer = [0; MESSAGE_MAX];
+                let said = proto_process::WhoReply::read(reply.bytes(&mut buffer))
+                    .map_err(|_| NO_IDENTITY)?;
+                if said.loader.is_some() {
+                    return Err(NO_IDENTITY);
+                }
+                Who {
+                    index: said.index as usize,
+                    pid: said.pid,
+                    generation: said.generation,
+                }
+            }
+            (None, None) => return Err(NO_IDENTITY),
+        };
+        s.data.who = Some(who);
+        let word = self.word(proto_process::GROUPS_AT + who.index * 8);
+        let (pgid, sid) = proto_process::groups_of(word).ok_or(NO_IDENTITY)?;
+        Ok(Caller {
+            pid: who.pid,
+            pgid,
+            sid,
+        })
+    }
+
+    /// A request of the controlling terminal (ACQUIRE, SET_PGRP, GET_PGRP,
+    /// GET_SID, CONTROLLING).
+    fn job(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, method: Method) -> Answer {
+        let mut body = r.body();
+        let Ok(terminal) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        let group = if method == Method::SetPgrp {
+            match body.u32() {
+                Ok(group) => group,
+                Err(status) => return Answer::Status(status),
+            }
+        } else {
+            0
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        if terminal != CONSOLE {
+            return status(BAD_TERMINAL);
+        }
+        let caller = match self.caller(s, r) {
+            Ok(caller) => caller,
+            Err(code) => return status(code),
+        };
+        let result = match method {
+            Method::Acquire => self.acquire(caller).map(|()| None),
+            Method::SetPgrp => {
+                let in_session = |pgid, sid| {
+                    jobs::group_in_session(
+                        proto_process::RECORDS,
+                        |i| self.word(proto_process::GROUPS_AT + i * 8),
+                        pgid,
+                        sid,
+                    )
+                };
+                let mut jobs = self.jobs;
+                let set = jobs.set_foreground(caller, group, in_session);
+                self.jobs = jobs;
+                set.map(|()| None)
+            }
+            Method::GetPgrp => self.jobs.get_foreground(caller).map(Some),
+            Method::GetSid => self.jobs.get_session(caller).map(Some),
+            _ => self.jobs.controlling(caller).map(|()| None),
+        };
+        match result {
+            Ok(None) => Answer::Status(Status::Ok),
+            Ok(Some(word)) => {
+                let w = r.reply();
+                if w.u32(0).is_err() || w.u32(word).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            Err(code) => status(code),
+        }
+    }
+
+    /// ACQUIRE: the process service gives the console to the caller's
+    /// session (SetCtty), unless the session has it already.
+    fn acquire(&mut self, caller: Caller) -> Result<(), u32> {
+        if !self.jobs.may_acquire(caller)? {
+            return Ok(());
+        }
+        let notary = self.notary().ok_or(PERMISSION)?;
+        let mut w = Writer::new();
+        let written = proto_process::Method::SetCtty
+            .header()
+            .write(&mut w)
+            .and_then(|()| w.u32(CONSOLE))
+            .and_then(|()| w.u32(caller.sid));
+        if written.is_err() {
+            return Err(PERMISSION);
+        }
+        let reply = sys::send(notary, w.as_bytes()).map_err(|_| PERMISSION)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+            return Err(PERMISSION);
+        }
+        self.jobs.acquired(caller);
+        Ok(())
+    }
+
+    /// The signal `number` of INTR, QUIT or SUSP to the foreground group
+    /// `group` (XBD 11.1.9): the process service walks the group
+    /// (TtySignal) and answers at the walk's end. A group of a session
+    /// the console is no longer the controlling terminal of gets none.
+    fn signal_group(&mut self, group: u32, number: u32) {
+        let Some(notary) = self.notary() else {
+            return;
+        };
+        let mut w = Writer::new();
+        let written = proto_process::Method::TtySignal
+            .header()
+            .write(&mut w)
+            .and_then(|()| w.u32(CONSOLE))
+            .and_then(|()| w.u32(group))
+            .and_then(|()| w.u32(number));
+        if written.is_err() {
+            return;
+        }
+        let Ok(reply) = sys::send(notary, w.as_bytes()) else {
+            return;
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        let code = proto_wire::Reader::new(reply.bytes(&mut buffer))
+            .u32()
+            .unwrap_or(0);
+        if code == proto_process::PERMISSION {
+            // The session's leader ended: the console is no session's.
+            self.jobs.release();
+        }
+    }
+}
+
 impl Service<0> for Tty {
     const VERSION: u16 = VERSION;
     const METHODS: &'static [u16] = proto_tty::METHODS;
@@ -841,6 +1076,13 @@ impl Service<0> for Tty {
             Some(Method::Clone) => self.clone_session(s.data.root, r),
             Some(Method::GetAttr) => self.get_attr(r),
             Some(Method::SetAttr) => self.set_attr(r),
+            Some(
+                m @ (Method::Acquire
+                | Method::SetPgrp
+                | Method::GetPgrp
+                | Method::GetSid
+                | Method::Controlling),
+            ) => self.job(s, r, m),
             Some(Method::Abandon) => {
                 if r.body().finish().is_err() {
                     return Answer::Status(Status::BadSize);

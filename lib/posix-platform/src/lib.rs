@@ -133,8 +133,9 @@ const O_NONBLOCK: c_int = 0o4000;
 
 /// Opens `path`, relative to the current directory or absolute (any
 /// `dirfd` then). The layer opens files of the RAM file service: the
-/// access mode, O_DIRECTORY and O_CLOEXEC; O_NOCTTY, O_NOFOLLOW (no
-/// symbolic links yet) and O_LARGEFILE change nothing; other flags, and a
+/// access mode, O_DIRECTORY and O_CLOEXEC; O_NOCTTY keeps a terminal from
+/// becoming the controlling terminal (5f); O_NOFOLLOW (no symbolic links
+/// yet) and O_LARGEFILE change nothing; other flags, and a
 /// relative path from a directory other than `AT_FDCWD`, answer EINVAL.
 /// O_CREAT, O_TRUNC and O_APPEND name a directory as POSIX has it: EISDIR
 /// for O_CREAT without O_DIRECTORY and for O_TRUNC or O_APPEND with write
@@ -187,6 +188,9 @@ pub unsafe extern "C" fn stafeto_openat(
     }
     if flags & O_CLOFORK != 0 {
         ours |= posix_abi::constants::O_CLOFORK;
+    }
+    if flags & O_NOCTTY != 0 {
+        ours |= posix_abi::constants::O_NOCTTY;
     }
     value(call(|| posix_abi::open(name, ours)).map(i64::from)) as c_int
 }
@@ -625,6 +629,13 @@ pub unsafe extern "C" fn stafeto_probe_commit_early(pid: *mut c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_probe_loads() -> c_int {
     posix_abi::process::probe_loads()
+}
+
+/// TtySignal through the process's own session
+/// (posix_abi::process::probe_tty_signal): the errno of the refusal.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_tty_signal(pgid: c_int, signal: c_int) -> c_int {
+    posix_abi::process::probe_tty_signal(pgid as u32, signal as u32)
 }
 
 /// The bytes of the process service's quota left for children (Pool),

@@ -1308,6 +1308,17 @@ pub fn probe_loads() -> i32 {
 
 /// The bytes of the service's quota left for children (Pool), for the
 /// probe that the ends of loads give theirs back; 0 on an error.
+/// TtySignal of `signal` to the group `pgid` through the process's own
+/// session, for the probe that the process service takes it from the
+/// notary session of the terminal service alone: the errno of the
+/// refusal, 0 when it was taken.
+pub fn probe_tty_signal(pgid: u32, signal: u32) -> i32 {
+    match request(proto_process::Method::TtySignal, &[0, pgid, signal]).and_then(|w| ask(&w)) {
+        Ok(_) => 0,
+        Err(errno) => errno,
+    }
+}
+
 pub fn probe_pool() -> u64 {
     let Ok(w) = request(proto_process::Method::Pool, &[]) else {
         return 0;

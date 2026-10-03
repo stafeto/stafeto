@@ -165,6 +165,7 @@ fn dialog() -> Vec<RootFile> {
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
         file("/bin/wc", 0o755, ROOT, "busybox-probe"),
+        file("/bin/sleep", 0o755, ROOT, "busybox-probe"),
         file("/bin/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
         null_device(),

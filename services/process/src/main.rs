@@ -25,13 +25,14 @@ use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
 use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
+use posix_process_service::terminals::Terminals;
 use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
 use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
-    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_USER, SIGCHLD, SIGKILL,
-    SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart, WCONTINUED, WEXITED, WNOHANG,
-    WNOWAIT, WSTOPPED, WaitResult, WaitStart,
+    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_KERNEL, SI_USER, SIGCHLD,
+    SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart, WCONTINUED, WEXITED,
+    WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
 };
 use proto_wire::{Status, Writer, long};
 use rt::{
@@ -163,6 +164,11 @@ struct Processes {
     /// The walks that wait for an earlier walk of their sender, with the
     /// sender's index.
     later: [Option<(usize, Walking)>; LATER],
+    /// The walk of a TtySignal, one at a time: the terminal service waits
+    /// for its reply (5f).
+    tty_walk: Option<Walking>,
+    /// The controlling terminals of the sessions (5f).
+    terminals: Terminals,
     /// The place of the service's channel that tells it of the next step
     /// (STEP), and whether a step was told and not taken.
     step: Option<Handle<Channel>>,
@@ -195,6 +201,8 @@ impl Processes {
             walks: [const { None }; RECORDS],
             walking: Queue::new(),
             later: [const { None }; LATER],
+            tty_walk: None,
+            terminals: Terminals::new(),
             step: None,
             step_told: false,
             loaders: Loaders::new(),
@@ -403,6 +411,7 @@ impl Processes {
         self.tickets[index] = create.ticket;
         // A record made in a used index never starts its generation over.
         self.generations.raise(index);
+        self.publish_groups(index);
         let record = self.records.get(index).expect("a new record");
         let identity = [label.pid(), record.parent, record.pgid, record.sid];
         let paged = self
@@ -599,6 +608,7 @@ impl Processes {
         if options & WNOWAIT == 0 {
             self.tell(parent, child);
             self.records.reap(child);
+            self.generations.set_groups(child, None);
         }
         Some(result)
     }
@@ -721,6 +731,13 @@ impl Processes {
         if method == Method::SetId as u16 {
             return self.set_id(r);
         }
+        let terminal = [Method::TtySignal, Method::SetCtty, Method::DropCtty];
+        if terminal.map(|m| m as u16).contains(&method) {
+            if !proto_process::is_terminal(r.label()) {
+                return refuse(proto_process::PERMISSION);
+            }
+            return self.terminal_request(method, r);
+        }
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
@@ -745,6 +762,7 @@ impl Processes {
             credentials: record.credentials,
             generation: self.generations.get(index),
             loader,
+            index: index as u32,
         };
         if who.write(r.reply()).is_err() {
             return Answer::Status(Status::BadSize);
@@ -952,6 +970,20 @@ impl Processes {
     /// that wait are answered AGAIN, none is left waiting for a step that
     /// never comes.
     fn kick(&mut self) {
+        if !self.step_told && self.tty_walk.is_some() {
+            if self
+                .step
+                .as_ref()
+                .is_some_and(|s| sys::notify(s, 1).is_ok())
+            {
+                self.step_told = true;
+            } else if let Some(w) = self.tty_walk.take() {
+                let status = Status::from_code(proto_process::AGAIN);
+                let _ = w
+                    .pending
+                    .answer(&proto_wire::reply(status), Outgoing::new());
+            }
+        }
         while !self.step_told && !self.walking.is_empty() {
             if self
                 .step
@@ -981,6 +1013,13 @@ impl Processes {
     /// and none could be signalled, NO_PROCESS for none.
     fn walk_step(&mut self) {
         self.step_told = false;
+        // A walk of the terminal goes first: the terminal service waits
+        // for it, and its input with it.
+        if self.tty_walk.is_some() {
+            self.tty_walk_step();
+            self.kick();
+            return;
+        }
         let Some(index) = self.walking.pop() else {
             return;
         };
@@ -1047,6 +1086,140 @@ impl Processes {
         }
     }
 
+    /// The group and session of the record in `index` in the second half
+    /// of the page of the generations, where the terminal service reads
+    /// them (5f).
+    fn publish_groups(&self, index: usize) {
+        let groups = self.records.get(index).map(|r| (r.pgid, r.sid));
+        self.generations.set_groups(index, groups);
+    }
+
+    /// TtySignal, SetCtty or DropCtty of the terminal service (5f).
+    fn terminal_request(&mut self, method: u16, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let Ok(terminal) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        let terminal = terminal as usize;
+        if method == Method::DropCtty as u16 {
+            if body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            self.terminals.drop_terminal(terminal);
+            return Answer::Status(Status::Ok);
+        }
+        if method == Method::SetCtty as u16 {
+            let (Ok(sid), Ok(())) = (body.u32(), body.finish()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            let records = &self.records;
+            let lives = |sid: u32| {
+                records.find_pid(sid).is_some_and(|i| {
+                    records
+                        .get(i)
+                        .is_some_and(|r| r.sid == sid && r.state == State::Alive)
+                })
+            };
+            return match self.terminals.set(terminal, sid, lives) {
+                Ok(()) => Answer::Status(Status::Ok),
+                Err(code) => refuse(code),
+            };
+        }
+        let (Ok(pgid), Ok(signal), Ok(())) = (body.u32(), body.u32(), body.finish()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        self.tty_signal(terminal, pgid, signal, r)
+    }
+
+    /// TtySignal: the walk of group `pgid` with `signal`, from the terminal
+    /// whose session the group lies in, with no check of permission.
+    fn tty_signal(
+        &mut self,
+        terminal: usize,
+        pgid: u32,
+        signal: u32,
+        r: &mut Request<'_>,
+    ) -> Answer {
+        let Ok(signal) = u8::try_from(signal) else {
+            return refuse(proto_process::INVALID);
+        };
+        if signal == 0 || signal > SIGNAL_MAX || signal == SIGSTOP {
+            return refuse(proto_process::INVALID);
+        }
+        let Some(session) = self.records.session_of(pgid) else {
+            return refuse(proto_process::NO_PROCESS);
+        };
+        if self.terminals.session(terminal) != Some(session) {
+            return refuse(proto_process::PERMISSION);
+        }
+        if self.tty_walk.is_some() {
+            return refuse(proto_process::AGAIN);
+        }
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::BadSize);
+        };
+        self.tty_walk = Some(Walking {
+            walk: Walk::new(Target::Group(pgid), RECORDS),
+            pending,
+            signal,
+            delivered: false,
+            refused: false,
+            denied: false,
+        });
+        self.kick();
+        Answer::Deferred
+    }
+
+    /// A signal of the terminal to the record in `target` (XBD 11.1.9):
+    /// as `deliver`, with no check of permission and the code SI_KERNEL.
+    fn deliver_terminal(&mut self, target: usize, signal: u8) -> Delivery {
+        let record = self.records.get(target).expect("a target");
+        if matches!(record.state, State::Zombie(_)) {
+            return Delivery::Done;
+        }
+        if signal == SIGKILL {
+            let _ = sys::process_kill_at(&record.process, record.ceiling);
+            return Delivery::Done;
+        }
+        let Some(page) = self.pages.page(target) else {
+            return Delivery::Refused;
+        };
+        if signals::refused(signal, page) {
+            return Delivery::Refused;
+        }
+        let info = Info {
+            code: SI_KERNEL,
+            pid: 0,
+            uid: 0,
+            status: 0,
+        };
+        self.signal(target, signal, info);
+        Delivery::Done
+    }
+
+    /// One step of the walk of a TtySignal; its reply at its end.
+    fn tty_walk_step(&mut self) {
+        let Some(mut w) = self.tty_walk.take() else {
+            return;
+        };
+        match w.walk.step(&self.records) {
+            Step::Found(target) => match self.deliver_terminal(target, w.signal) {
+                Delivery::Done => w.delivered = true,
+                Delivery::Denied => w.denied = true,
+                Delivery::Refused => w.refused = true,
+            },
+            Step::Looked => {}
+            Step::Done => {
+                let code = walk::outcome(w.delivered, w.refused, w.denied);
+                let _ = w
+                    .pending
+                    .answer(&proto_wire::reply(Status::from_code(code)), Outgoing::new());
+                return;
+            }
+        }
+        self.tty_walk = Some(w);
+    }
+
     /// Publishes the group and session of the record in `index` on its
     /// page, where `getpgrp`, `getsid(0)` and waitpid(0) read them.
     fn publish_group(&self, index: usize) {
@@ -1072,6 +1245,14 @@ impl Processes {
         match self.records.set_pgid(index, pid, pgid) {
             Ok(()) => {
                 self.publish_group(index);
+                let target = if pid == 0 {
+                    Some(index)
+                } else {
+                    self.records.find_pid(pid)
+                };
+                if let Some(target) = target {
+                    self.publish_groups(target);
+                }
                 // A child moved: the caller's waits; the caller itself: its
                 // parent's.
                 if pid != 0 && Some(pid) != self.records.get(index).map(|r| r.label.pid()) {
@@ -1093,6 +1274,7 @@ impl Processes {
         match self.records.set_sid(index) {
             Ok(sid) => {
                 self.publish_group(index);
+                self.publish_groups(index);
                 self.tell_parent_groups(index);
                 number(r, sid)
             }
@@ -1140,6 +1322,7 @@ impl Processes {
         self.tell(parent, child);
         if flags & (PAGE_NOCLDWAIT | PAGE_CHLD_IGNORED) != 0 {
             self.records.reap(child);
+            self.generations.set_groups(child, None);
         }
         let info = Info {
             code,
@@ -1301,6 +1484,7 @@ impl Processes {
             record.handle_limit = create.handle_limit;
         }
         self.generations.raise(child);
+        self.publish_groups(child);
         let record = self.records.get(child).expect("a new record");
         let identity = [label.pid(), record.parent, record.pgid, record.sid];
         let paged = self
@@ -1915,6 +2099,12 @@ impl Service<0> for Processes {
         if proto_process::is_notary(r.label()) {
             return self.notary(r);
         }
+        // The signals and controlling terminals of the terminal service
+        // come through its notary session alone (5f).
+        let terminal = [Method::TtySignal, Method::SetCtty, Method::DropCtty];
+        if terminal.map(|m| m as u16).contains(&method) {
+            return refuse(proto_process::PERMISSION);
+        }
         if let Some(child) = self.records.find_loader(r.label()) {
             return self.loader_request(child, r);
         }
@@ -2049,6 +2239,13 @@ impl Service<0> for Processes {
         // before its ExecCommit, by itself or by SIGKILL, takes the new
         // process with it, whose quota comes back to the pool.
         self.abort_load(index, Status::from_code(proto_process::AGAIN));
+        // The end of a session's leader takes its terminal from the
+        // session (XBD 11.1.3).
+        if let Some(r) = self.records.get(index)
+            && r.label.pid() == r.sid
+        {
+            self.terminals.leader_ended(r.sid);
+        }
         let (exit, orphans) = self.records.exited(index, end);
         // An exec that waited for init goes on: its new image is dead.
         self.replace_queue.remove(index);

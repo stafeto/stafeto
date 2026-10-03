@@ -467,6 +467,10 @@ const TCSETSF: c_ulong = 0x5404;
 const TCSBRK: c_ulong = 0x5409;
 const TCXONC: c_ulong = 0x540A;
 const TCFLSH: c_ulong = 0x540B;
+const TIOCSCTTY: c_ulong = 0x540E;
+const TIOCGPGRP: c_ulong = 0x540F;
+const TIOCSPGRP: c_ulong = 0x5410;
+const TIOCGSID: c_ulong = 0x5429;
 const _: () = assert!(TCSETSW - TCSETS == proto_tty::DRAIN as c_ulong);
 const _: () = assert!(TCSETSF - TCSETS == proto_tty::FLUSH as c_ulong);
 const ENOTTY: c_int = 25;
@@ -516,6 +520,35 @@ fn terminal_ioctl(
         }
         TCSBRK if word != 0 => terminal::drain(transport, terminal).map(|()| 0),
         TCSBRK => Ok(0),
+        // The controlling terminal (5f, T3): tcsetpgrp, tcgetpgrp,
+        // tcgetsid, TIOCSCTTY.
+        TIOCSPGRP => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            // SAFETY: the caller's promise: readable for a pid_t.
+            let group = unsafe { argument.cast::<i32>().read() };
+            let group = u32::try_from(group).map_err(|_| EINVAL)?;
+            let method = proto_tty::Method::SetPgrp;
+            terminal::job(transport, terminal, method, Some(group)).map(|_| 0)
+        }
+        TIOCGPGRP | TIOCGSID => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            let method = if request == TIOCGPGRP {
+                proto_tty::Method::GetPgrp
+            } else {
+                proto_tty::Method::GetSid
+            };
+            let number = terminal::job(transport, terminal, method, None)?;
+            // SAFETY: the caller's promise: writable for a pid_t.
+            unsafe { argument.cast::<i32>().write(number as i32) };
+            Ok(0)
+        }
+        TIOCSCTTY => {
+            terminal::job(transport, terminal, proto_tty::Method::Acquire, None).map(|_| 0)
+        }
         _ => Err(ENOTTY),
     }
 }

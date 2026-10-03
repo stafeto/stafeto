@@ -127,7 +127,7 @@ pub unsafe fn path<'a>(pointer: *const c_char) -> Result<&'a [u8], c_int> {
 /// Opens `name` with the access mode, O_DIRECTORY, O_CHANGES and the
 /// close-on-exec and close-on-fork flags of `flags`: the descriptor or an errno.
 pub fn open(name: &[u8], flags: c_int) -> Result<c_int, c_int> {
-    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES) != 0
+    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY) != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
         return Err(EINVAL);

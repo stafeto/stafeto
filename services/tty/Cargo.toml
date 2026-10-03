@@ -25,6 +25,7 @@ steps = ["rt/step-stats"]
 [dependencies]
 abi = { path = "../../lib/abi" }
 proto-init = { path = "../../proto/init" }
+proto-process = { path = "../../proto/process" }
 proto-tty = { path = "../../proto/tty" }
 proto-uart = { path = "../../proto/uart" }
 proto-wire = { path = "../../proto/wire" }

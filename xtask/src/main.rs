@@ -1924,6 +1924,7 @@ fn posix_tty_probe(vz: bool) -> Result<(), String> {
             "posix-tty: spawned child wrote through the descriptor of a file action",
             DIALOG_STEP,
         )?;
+        run.expect("posix-tty: sessions ok", DIALOG_STEP)?;
         run.expect("posix-tty: ok", DIALOG_STEP)?;
         run.expect(ENDED, DIALOG_STEP)
     })();
@@ -2643,11 +2644,12 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "5", "ash", busybox.clone()),
-        ("-rwxr-xr-x", "5", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "5", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "5", "ls", busybox.clone()),
-        ("-rwxr-xr-x", "5", "wc", busybox),
+        ("-rwxr-xr-x", "6", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "6", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "6", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "6", "ls", busybox.clone()),
+        ("-rwxr-xr-x", "6", "wc", busybox.clone()),
+        ("-rwxr-xr-x", "6", "sleep", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
@@ -2683,6 +2685,18 @@ fn ash_dialog() -> Result<(), String> {
         run.send("/bin/ls -1 /etc >/dev/console")?;
         run.expect("/bin/ls -1 /etc >/dev/console", DIALOG_STEP)?;
         run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // The first goal of 5f: INTR at the console reaches the shell's
+        // foreground group, the shell's session's (its getty made it): the
+        // command ends by SIGINT and the shell, which catches it, goes on.
+        run.send("echo sleeping; sleep 100")?;
+        run.expect_line("sleeping", |line| line == "sleeping", DIALOG_STEP)?;
+        std::thread::sleep(Duration::from_secs(2));
+        run.type_raw(b"\x03")?;
+        run.expect("^C", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo $?")?;
+        run.expect_line("130", |line| line == "130", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("ls -1 /")?;
         run.expect("ls -1 /", DIALOG_STEP)?;
@@ -2942,7 +2956,7 @@ fn tty_probe(vz: bool) -> Result<(), String> {
         // INTR drops what was typed before it and asks for SIGINT.
         run.type_raw(b"lost\x03")?;
         run.expect("^C", DIALOG_STEP)?;
-        run.expect("tty: SIGINT for the foreground process group", DIALOG_STEP)?;
+        run.expect("tty: SIGINT, no foreground process group", DIALOG_STEP)?;
         run.send("ab\x7fc")?;
         // The echo: the erase of the "b" and Enter as CR LF.
         run.expect("ab\x08 \x08c\r\n", DIALOG_STEP)?;

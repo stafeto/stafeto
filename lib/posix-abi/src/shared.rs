@@ -260,13 +260,14 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
 #[derive(Clone, Copy)]
 enum Opened {
     File(u32),
-    Terminal(u32),
+    /// A terminal, and whether it was opened as /dev/tty.
+    Terminal(u32, bool),
 }
 
 /// Open: the path resolved under the lock, the service's open outside it,
 /// then the descriptor under it again.
 fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
-    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES) != 0
+    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY) != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
         return Err(EINVAL);
@@ -293,7 +294,20 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
             if flags & O_DIRECTORY != 0 {
                 return Err(ENOTDIR);
             }
-            return Ok((transport, Opened::Terminal(terminal)));
+            // /dev/tty is the controlling terminal of the caller's
+            // session, which has to have one (ENXIO).
+            let controlling = name == "/dev/tty";
+            if controlling {
+                crate::terminal::job(transport, terminal, proto_tty::Method::Controlling, None)
+                    .map_err(|e| {
+                        if e == crate::terminal::ENOTTY {
+                            ENXIO
+                        } else {
+                            e
+                        }
+                    })?;
+            }
+            return Ok((transport, Opened::Terminal(terminal, controlling)));
         }
         let opened = transport
             .open(name, (flags & O_ACCMODE) as u32 | directory)
@@ -304,10 +318,20 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
         let flags = crate::descriptor_flags(flags);
         match opened {
             Opened::File(fd) => files.insert(fd, flags),
-            Opened::Terminal(number) => files.insert_terminal(number, flags),
+            Opened::Terminal(number, _) => files.insert_terminal(number, flags),
         }
         .map_err(crate::error)
     });
+    // A session leader that opens a terminal without O_NOCTTY takes it as
+    // its controlling terminal when its session has none and the terminal
+    // is no other session's (XBD 11.1.3); the open stands either way.
+    if inserted.is_ok()
+        && let Opened::Terminal(number, false) = opened
+        && flags & O_NOCTTY == 0
+        && crate::process::getsid(0) == Ok(crate::process::getpid())
+    {
+        let _ = crate::terminal::job(transport, number, proto_tty::Method::Acquire, None);
+    }
     if inserted.is_err()
         && let Opened::File(fd) = opened
     {

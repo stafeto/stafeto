@@ -80,3 +80,6 @@ pub const ENFILE: i32 = 23;
 pub const EPIPE: i32 = 32;
 /// Linux's O_NONBLOCK on AArch64, relibc's.
 pub const O_NONBLOCK: i32 = 0o4000;
+/// O_NOCTTY (Linux's value): an open of a terminal does not make it the
+/// controlling terminal of the caller's session (5f).
+pub const O_NOCTTY: i32 = 0o400;

@@ -60,10 +60,13 @@ pub const PROCESS_SERVICE: &str = "posix";
 /// The services init gives a notary session of the process service on
 /// CONNECT (proto_process::NOTARY): through it they ask who a client is
 /// (Vouch) and map the page of the credentials generations (Register).
-pub const VOUCHERS: &[&str] = &["clock", RAM_SERVICE];
+pub const VOUCHERS: &[&str] = &["clock", RAM_SERVICE, TERMINAL_SERVICE];
 /// The vouchers whose notary session may tell the process service that a
 /// file is set-ID (proto_process SetId, spec 2, 3.2): the file services.
 pub const SET_ID_VOUCHERS: &[&str] = &[RAM_SERVICE];
+/// The name of the terminal service (5f): its notary session may send
+/// TtySignal, SetCtty and DropCtty (proto_process::TERMINAL).
+pub const TERMINAL_SERVICE: &str = "tty";
 /// The name of the identity session of a POSIX process in its start data
 /// (spec 2, 3.1): the process gives copies of it to the services it asks
 /// something of, which ask the process service who it is.
