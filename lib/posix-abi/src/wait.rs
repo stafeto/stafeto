@@ -462,6 +462,9 @@ pub fn select(
         for fd in 0..nfds as usize {
             let bits = [has(&sets[0], fd), has(&sets[1], fd), has(&sets[2], fd)];
             if bits.iter().any(|&b| b) {
+                if fd >= posix_fs::OPEN_MAX {
+                    return Err(EBADF);
+                }
                 if count == watch::MAX {
                     return Err(EINVAL);
                 }
