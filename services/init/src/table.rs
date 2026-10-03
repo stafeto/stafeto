@@ -740,6 +740,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-procs") as usize
     + cfg!(feature = "table-loader-channels") as usize
     + cfg!(feature = "table-posix-poll") as usize
+    + cfg!(feature = "table-posix-pty") as usize
     + cfg!(feature = "table-posix-steps") as usize
     + cfg!(feature = "table-os-test") as usize
     + cfg!(feature = "table-posix-abi-vz") as usize
@@ -779,6 +780,7 @@ const _: () = assert!(
     feature = "table-posix-procs",
     feature = "table-loader-channels",
     feature = "table-posix-poll",
+    feature = "table-posix-pty",
     feature = "table-posix-steps",
     feature = "table-os-test",
     feature = "table-posix-abi-vz",
@@ -806,6 +808,8 @@ pub const TABLE: &[Record] = ramfs::RELIBC_TABLE;
 pub const TABLE: &[Record] = ramfs::LOADER_CHANNELS_TABLE;
 #[cfg(feature = "table-posix-poll")]
 pub const TABLE: &[Record] = ramfs::POSIX_POLL_TABLE;
+#[cfg(feature = "table-posix-pty")]
+pub const TABLE: &[Record] = ramfs::POSIX_PTY_TABLE;
 #[cfg(feature = "table-posix-procs")]
 pub const TABLE: &[Record] = ramfs::POSIX_PROCS_TABLE;
 #[cfg(feature = "table-posix-steps")]
@@ -1600,6 +1604,8 @@ mod tests {
         assert_eq!(
             order_of(ramfs::OS_TEST_TABLE),
             [
+                "uart",
+                "tty",
                 "ramfs",
                 "clock",
                 "posix",
@@ -1693,6 +1699,7 @@ mod tests {
             ramfs::RELIBC_TABLE,
             ramfs::RELIBC_THREADS_TABLE,
             ramfs::OS_TEST_TABLE,
+            ramfs::POSIX_PTY_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
@@ -1711,6 +1718,7 @@ mod tests {
                     "os-test-run",
                     "rtbench-posix",
                     "posix-random",
+                    "posix-pty",
                 ]
                 .contains(&r.program)
             });

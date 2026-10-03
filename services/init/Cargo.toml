@@ -39,6 +39,7 @@ table-relibc-threads = []
 table-posix-procs = []
 table-loader-channels = []
 table-posix-poll = []
+table-posix-pty = []
 # The probe of the longest step of the process service (posix-procs in the
 # steps mode, xtask process-steps).
 table-posix-steps = []
