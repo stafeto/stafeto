@@ -25,11 +25,11 @@ use crate::{
 
 /// The stack of the entropy device's driver: its loop's table of sessions
 /// and the driver's fills.
-const RNG_STACK_SIZE: u32 = 32 * 1024;
+pub const RNG_STACK_SIZE: u32 = 32 * 1024;
 
 /// The stack of the entropy service's loop: the service with the table of
 /// the clones it gave (8 KiB); its table of sessions lies in its data.
-const ENTROPY_STACK_SIZE: u32 = 32 * 1024;
+pub const ENTROPY_STACK_SIZE: u32 = 32 * 1024;
 
 /// The probe's image on QEMU: the driver with CRASH, the service with the
 /// line of each reseed, both with the count of their steps (feature
@@ -295,11 +295,18 @@ pub const RANDOM_PROGRAMS: [ImageProgram; 9] = [
 ];
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 5] = [
+const RANDOM_LINES: [&str; 12] = [
     "posix-random: getentropy gave 256 bytes twice, they differ",
     "posix-random: getentropy of 257 bytes gave EINVAL",
     "posix-random: getrandom: GRND_NONBLOCK and GRND_RANDOM give every byte, bad flags EINVAL",
     "posix-random: after fork the child's bytes differ from the parent's",
+    "posix-random: /dev/urandom and /dev/random are character devices that give 4096 bytes each, all different",
+    "posix-random: writes to the devices are accepted",
+    "posix-random: a dup of a device reads",
+    "posix-random: arc4random, arc4random_buf and arc4random_uniform",
+    "posix-random: mkstemp gave",
+    "posix-random: a device descriptor crosses posix_spawn, FD_CLOEXEC closes it",
+    "posix-random: a device descriptor crosses fork, the bytes of parent and child differ",
     "posix-random: ok",
 ];
 

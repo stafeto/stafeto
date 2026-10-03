@@ -154,21 +154,37 @@ fn null_device() -> RootFile {
     of("/dev/null", 0o666, ROOT, Source::Bytes("null", b""))
 }
 
+/// `/dev/random` and `/dev/urandom` (5e'): the RAM service serves the
+/// entries of these paths as random devices (writes dropped; the client's
+/// layer reads them from its generator), so the bytes are none. With
+/// `/dev/null` they are the device nodes of an image where POSIX programs
+/// run, and the image has the entropy service for them.
+fn devices() -> [RootFile; 3] {
+    [
+        null_device(),
+        of("/dev/random", 0o666, ROOT, Source::Bytes("random", b"")),
+        of("/dev/urandom", 0o666, ROOT, Source::Bytes("urandom", b"")),
+    ]
+}
+
 /// The shell's image: BusyBox with its applet names (the shell, `ash`,
 /// among them) as hard links, and the service as a set-user-ID file of
 /// another owner.
 fn dialog() -> Vec<RootFile> {
-    vec![
+    let mut files = vec![
         dir("/bin"),
         file("/bin/ash", 0o755, ROOT, "busybox-probe"),
         file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
         file("/bin/wc", 0o755, ROOT, "busybox-probe"),
+        file("/bin/head", 0o755, ROOT, "busybox-probe"),
+        file("/bin/mktemp", 0o755, ROOT, "busybox-probe"),
         file("/bin/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
-        null_device(),
-    ]
+    ];
+    files.extend(devices());
+    files
 }
 
 /// The probe of POSIX processes (5c): BusyBox as `/bin/ls`, the probe as
@@ -178,7 +194,7 @@ fn dialog() -> Vec<RootFile> {
 /// a directory only root may search.
 fn procs() -> Vec<RootFile> {
     const NOBODY_DIR: u32 = 0o700;
-    vec![
+    let mut files = vec![
         dir("/bin"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
@@ -217,36 +233,41 @@ fn procs() -> Vec<RootFile> {
         ),
         of("/bin/data", 0o644, ROOT, Source::Bytes("data", b"data\n")),
         dir("/dev"),
-        null_device(),
         RootFile {
             mode: NOBODY_DIR,
             ..dir("/sbin")
         },
         file("/sbin/procs-child", 0o755, ROOT, "posix-procs"),
-    ]
+    ];
+    files.extend(devices());
+    files
 }
 
 /// The probe of the longest step of the process service (5c): the probe
 /// itself as the file its children run.
 fn steps() -> Vec<RootFile> {
-    vec![
+    let mut files = vec![
         dir("/bin"),
         file("/bin/procs-child", 0o755, ROOT, "posix-procs"),
         dir("/dev"),
-        null_device(),
-    ]
+    ];
+    files.extend(devices());
+    files
 }
 
 /// rtbench 2 (5c): the benchmark's children are files of it, the program
 /// itself under a role its first argument names; BusyBox gives the `ls` and
 /// the `cat` of the pipeline of S22 (5e).
 fn rtbench() -> Vec<RootFile> {
-    vec![
+    let mut files = vec![
         dir("/bin"),
         file("/bin/rtbench-posix", 0o755, ROOT, "rtbench-posix"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
-    ]
+        dir("/dev"),
+    ];
+    files.extend(devices());
+    files
 }
 
 /// The files of an image of os-test (5c): each test `name` (`suite/test`,
@@ -259,7 +280,9 @@ pub fn os_test(tests: &[(String, Vec<u8>)]) -> Vec<RootFile> {
     fn leak(text: String) -> &'static str {
         Box::leak(text.into_boxed_str())
     }
-    let mut files = vec![dir("/dev"), null_device(), dir("/os-test")];
+    let mut files = vec![dir("/dev")];
+    files.extend(devices());
+    files.push(dir("/os-test"));
     let mut list = String::new();
     for (n, (name, elf)) in tests.iter().enumerate() {
         let parts: Vec<&str> = name.split('/').collect();
@@ -333,10 +356,15 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-ramfs.img" => ramfs(),
         "boot-ash-dialog.img" => dialog(),
         "boot-posix-procs.img" => procs(),
-        "boot-posix-random.img" => vec![
-            dir("/bin"),
-            file("/bin/posix-random", 0o755, ROOT, "posix-random"),
-        ],
+        "boot-posix-random.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-random", 0o755, ROOT, "posix-random"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-posix-steps.img" => steps(),
         "rtbench-posix.img" | "rtbench-posix-vz.img" | "rtbench-posix-short.img" => rtbench(),
         _ => Vec::new(),
@@ -499,7 +527,7 @@ mod tests {
         // the directories above them (it refuses a file without its
         // parent).
         let wanted = sources(&files);
-        assert_eq!(wanted.len(), 5);
+        assert_eq!(wanted.len(), 7);
         let bytes = table(&files, 3, 3 + wanted.len() as u32 + 1).unwrap();
         let read = Rootfs::parse(&bytes, 3 + wanted.len() as u32 + 1).unwrap();
         for path in [
@@ -515,6 +543,34 @@ mod tests {
         let check = runner_check();
         assert_eq!(sources(&check).len(), 2);
         assert!(table(&check, 3, 6).is_ok());
+    }
+
+    /// Every image where POSIX programs run has the device nodes of the
+    /// null and the random devices, in a directory `/dev`.
+    #[test]
+    fn the_images_of_posix_programs_have_the_device_nodes() {
+        for name in [
+            "boot-ash-dialog.img",
+            "boot-posix-procs.img",
+            "boot-posix-random.img",
+            "boot-posix-steps.img",
+            "rtbench-posix.img",
+            "rtbench-posix-vz.img",
+            "rtbench-posix-short.img",
+        ] {
+            let files = files_of(name);
+            for path in ["/dev", "/dev/null", "/dev/random", "/dev/urandom"] {
+                assert_eq!(
+                    files.iter().filter(|f| f.path == path).count(),
+                    1,
+                    "{name} {path}"
+                );
+            }
+        }
+        let os_test = os_test(&[]);
+        for path in ["/dev", "/dev/null", "/dev/random", "/dev/urandom"] {
+            assert!(os_test.iter().any(|f| f.path == path), "os-test {path}");
+        }
     }
 
     /// A variant is a file of its own, its data segment grown; bytes of the

@@ -135,43 +135,45 @@ fn key(nonblock: bool) -> Result<[u8; KEY], i32> {
 pub fn fill(out: &mut [u8], nonblock: bool) -> Result<(), i32> {
     let mut done = 0;
     while done < out.len() {
-        let wants = with_state(|s| !s.generator.seeded() || s.given >= REKEY_BYTES);
-        if wants {
-            // EAGAIN of a wait that may wait: every place for a waiting
-            // seed in the service is taken (the boot's first moments); it
-            // comes again once the service answers. The yield lets the
-            // service and its feeder, above every process, go on.
-            let mut new = loop {
-                match key(nonblock) {
-                    Err(EAGAIN) if !nonblock => {
-                        let _ = rt::sys::yield_now();
-                    }
-                    other => break other?,
-                }
-            };
-            with_state(|s| {
-                if !s.generator.seeded() {
-                    s.generator.seed(&new);
-                    s.given = 0;
-                } else if s.given >= REKEY_BYTES {
-                    s.generator.reseed(&new);
-                    s.given = 0;
-                }
-            });
-            posix_random::erase(&mut new);
-        }
         let end = (done + PIECE).min(out.len());
-        let filled = with_state(|s| {
+        // The usual case takes the lock once: a generator with a key that
+        // has not given REKEY_BYTES yet gives its piece.
+        let given = with_state(|s| {
+            if !s.generator.seeded() || s.given >= REKEY_BYTES {
+                return false;
+            }
             let filled = s.generator.fill(&mut out[done..end]);
             if filled {
                 s.given += (end - done) as u64;
             }
             filled
         });
-        // A generator that went unseeded meanwhile asks again.
-        if filled {
+        if given {
             done = end;
+            continue;
         }
+        // EAGAIN of a wait that may wait: every place for a waiting seed
+        // in the service is taken (the boot's first moments); it comes
+        // again once the service answers. The yield lets the service and
+        // its feeder, above every process, go on.
+        let mut new = loop {
+            match key(nonblock) {
+                Err(EAGAIN) if !nonblock => {
+                    let _ = rt::sys::yield_now();
+                }
+                other => break other?,
+            }
+        };
+        with_state(|s| {
+            if !s.generator.seeded() {
+                s.generator.seed(&new);
+                s.given = 0;
+            } else if s.given >= REKEY_BYTES {
+                s.generator.reseed(&new);
+                s.given = 0;
+            }
+        });
+        posix_random::erase(&mut new);
     }
     Ok(())
 }

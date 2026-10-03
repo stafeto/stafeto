@@ -32,7 +32,7 @@ STAMP = WORK / "config"
 A53_ERRATA = "-mfix-cortex-a53-835769"
 # BusyBox's main becomes busybox_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
-PATCH = "echo cat wc ash ls-nofork relibc main-renamed a53-835769"
+PATCH = "echo cat wc head-c mktemp ash-random ash ls-nofork relibc main-renamed a53-835769"
 
 
 def relibc_commit() -> str:
@@ -59,6 +59,7 @@ OBJECTS = (
     "last_char_is.o", "auto_string.o",
     "vfork_daemon_rexec.o",
     "wfopen.o", "fclose_nonstdin.o", "fflush_stdout_and_exit.o",
+    "perror_nomsg_and_die.o", "get_line_from_file.o",
 )
 
 
@@ -137,6 +138,11 @@ def main() -> None:
     replace(config, "# CONFIG_CAT is not set", "CONFIG_CAT=y")
     replace(config, "# CONFIG_LS is not set", "CONFIG_LS=y")
     replace(config, "# CONFIG_WC is not set", "CONFIG_WC=y")
+    # The applets that take bytes or names from the random devices (5e').
+    replace(config, "# CONFIG_HEAD is not set", "CONFIG_HEAD=y")
+    replace(config, "# CONFIG_FEATURE_FANCY_HEAD is not set", "CONFIG_FEATURE_FANCY_HEAD=y")
+    replace(config, "# CONFIG_MKTEMP is not set", "CONFIG_MKTEMP=y")
+    replace(config, "# CONFIG_ASH_RANDOM_SUPPORT is not set", "CONFIG_ASH_RANDOM_SUPPORT=y")
     replace(config, "# CONFIG_SHOW_USAGE is not set", "CONFIG_SHOW_USAGE=y")
     replace(config, "# CONFIG_FEATURE_VERBOSE_USAGE is not set",
             "CONFIG_FEATURE_VERBOSE_USAGE=y")

@@ -105,6 +105,10 @@ pub enum Names {
     /// service the child gets, which holds it (5e). The loader takes the
     /// kind only with a session in the slot Pipes.
     Pipe(u32),
+    /// The open description of this number of a random device (5e'), in
+    /// the same session of the RAM file service as `File`; the child's
+    /// layer serves its reads from its own generator.
+    Random(u32),
 }
 
 /// A descriptor the child starts with.
@@ -122,6 +126,7 @@ impl Descriptor {
             Names::Error => (2, 0),
             Names::File(n) => (3, n),
             Names::Pipe(n) => (4, n),
+            Names::Random(n) => (5, n),
         };
         let mut out = [0; DESCRIPTOR];
         out[..4].copy_from_slice(&self.fd.to_le_bytes());
@@ -141,6 +146,7 @@ impl Descriptor {
             (2, 0) => Names::Error,
             (3, n) => Names::File(n),
             (4, n) => Names::Pipe(n),
+            (5, n) => Names::Random(n),
             _ => return None,
         };
         ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
@@ -1323,6 +1329,10 @@ mod tests {
                 fd: 5,
                 names: Names::Pipe(9),
             },
+            Descriptor {
+                fd: 6,
+                names: Names::Random(11),
+            },
         ];
         let mut out = vec![0; BLOCK_MAX];
         let argv: [&[u8]; 1] = [b"ls"];
@@ -1366,9 +1376,9 @@ mod tests {
         let mut area = vec![0; area_len(&read)];
         write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
-        assert_eq!(start.descriptor_count, 3);
+        assert_eq!(start.descriptor_count, 4);
         let at = (start.descriptors - START_AREA) as usize;
-        let back: Vec<_> = area[at..at + 3 * DESCRIPTOR]
+        let back: Vec<_> = area[at..at + 4 * DESCRIPTOR]
             .as_chunks::<DESCRIPTOR>()
             .0
             .iter()

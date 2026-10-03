@@ -207,6 +207,12 @@ impl Files {
     }
 
     pub fn open(&self, path: &str, flags: u32) -> Result<u32, Status> {
+        self.open_marked(path, flags).map(|(fd, _)| fd)
+    }
+
+    /// OPEN with the mark of the reply: the descriptor, and whether the
+    /// file is a random device, whose reads the caller serves itself.
+    pub fn open_marked(&self, path: &str, flags: u32) -> Result<(u32, bool), Status> {
         valid_path(path.as_bytes())?;
         let mut w = Writer::new();
         Method::Open.header().write(&mut w)?;
@@ -219,8 +225,13 @@ impl Files {
             return Err(Status::BadSize);
         }
         let fd = r.u32()?;
+        let random = match r.u32() {
+            Ok(proto_fs::RANDOM_DEVICE) => true,
+            Ok(_) => return Err(Status::BadSize),
+            Err(_) => false,
+        };
         r.finish()?;
-        Ok(fd)
+        Ok((fd, random))
     }
 
     pub fn read(&self, fd: u32, out: &mut [u8]) -> Result<usize, Status> {

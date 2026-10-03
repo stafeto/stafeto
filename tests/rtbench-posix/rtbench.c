@@ -64,6 +64,10 @@
  * to the end and two waitpid), from before the first pipe to the last
  * waitpid. The time from a write into an empty pipe to the return of the
  * waiting read is half of a round trip of S19 and has no row of its own.
+ * The scenarios of 5e' (the generator of the layer, which serves these with
+ * no request to a service; the rows count the kernel calls): S23 and S24
+ * one getentropy of 32 and of 256 bytes, S25 one read of 4 KiB of
+ * /dev/urandom.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -75,6 +79,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1206,6 +1211,78 @@ static int pipes(void) {
     return run_forker(&s22, 3, 0, 0, 0);
 }
 
+/* --- S23, S24, S25: the generator ---------------------------------------- */
+
+#define RANDOM_SAMPLES 1000
+static struct histogram s23, s24, s25;
+/* The bytes the samples drew, folded: a run whose reads gave nothing but
+ * zeros fails (the reads are compared, so the compiler keeps them). */
+static unsigned char random_fold;
+
+/* One getentropy of `size` bytes, RANDOM_SAMPLES times. */
+static int entropy_samples(struct histogram *h, size_t size) {
+    unsigned char bytes[256];
+    /* The first call asks the entropy service for the key. */
+    if (getentropy(bytes, size) != 0) {
+        fail("S23, S24 getentropy", errno);
+        return 1;
+    }
+    uint64_t calls = rtbench_calls();
+    for (int i = 0; i < RANDOM_SAMPLES; i++) {
+        uint64_t t0 = ticks();
+        int result = getentropy(bytes, size);
+        uint64_t t1 = ticks();
+        if (result != 0) {
+            fail("S23, S24 getentropy", errno);
+            return 1;
+        }
+        random_fold |= bytes[0] | bytes[size - 1];
+        record(h, ticks_ns(t1 - t0));
+    }
+    h->calls += rtbench_calls() - calls;
+    return 0;
+}
+
+/* One read of 4096 bytes of /dev/urandom, RANDOM_SAMPLES times. */
+static int urandom_samples(struct histogram *h) {
+    static unsigned char bytes[4096];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        fail("S25 open", errno);
+        return 1;
+    }
+    uint64_t calls = rtbench_calls();
+    for (int i = 0; i < RANDOM_SAMPLES; i++) {
+        size_t got = 0;
+        uint64_t t0 = ticks();
+        while (got < sizeof bytes) {
+            ssize_t n = read(fd, bytes + got, sizeof bytes - got);
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+        uint64_t t1 = ticks();
+        if (got != sizeof bytes) {
+            fail("S25 read", errno);
+            return 1;
+        }
+        random_fold |= bytes[0] | bytes[sizeof bytes - 1];
+        record(h, ticks_ns(t1 - t0));
+    }
+    h->calls += rtbench_calls() - calls;
+    close(fd);
+    return 0;
+}
+
+static int generator(void) {
+    if (entropy_samples(&s23, 32) || entropy_samples(&s24, 256) || urandom_samples(&s25))
+        return 1;
+    if (random_fold == 0) {
+        fail("S23 all zero bytes", 0);
+        return 1;
+    }
+    return 0;
+}
+
 static int processes(void) {
     probe_fd = open("/tmp/probe", O_RDWR);
     if (probe_fd < 0) {
@@ -1300,7 +1377,7 @@ static int child(uint64_t entered, char **argv) {
 
 static int one_round(void) {
     return mutex_alone() || wake_idle() || futex_slow() || mutex_rivals() || heap_and_table() || signals() || read_ready()
-            || periodic_sleep() || service_round_trip() || processes();
+            || periodic_sleep() || service_round_trip() || generator() || processes();
 }
 
 static void report(void) {
@@ -1348,6 +1425,9 @@ static void report(void) {
     row("s20_pipe_1m_w512", &s20[0], 0);
     row("s20_pipe_1m_w4k", &s20[1], 0);
     row("s22_ls_etc_cat", &s22, 1);
+    row("s23_getentropy_32", &s23, 1);
+    row("s24_getentropy_256", &s24, 1);
+    row("s25_urandom_4k", &s25, 1);
     none("timer_1ms", "POSIX timers come with 5h");
     none("inheritance_chain", "priority inheritance comes with 5h");
     struct line l = { .length = 0 };

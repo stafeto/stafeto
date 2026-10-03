@@ -5,8 +5,8 @@
 """Compile os-test's suites for stafeto (`cargo xtask os-test`): Sortix's
 os-test (ISC) at a pinned commit, its io, malloc, process and signal
 suites and the parts of its basic suite that start programs: basic/spawn,
-the tests of basic/unistd named exec*, and the tests of every part of
-basic/ that call fork; each test with relibc's headers
+the tests of basic/unistd named exec*, basic/unistd/getentropy (5e'), and
+the tests of every part of basic/ that call fork; each test with relibc's headers
 (target/relibc/sysroot, cargo xtask relibc) into an object of its own
 under target/os-test/objects. A test that does not compile gets os-test's
 outcome for it (compile.sh: missing_header, undeclared, ...). Writes
@@ -30,7 +30,8 @@ SUITES = ("io", "malloc", "process", "signal")
 # None for the tests that call fork (5d) or pipe (5e). Tests that need
 # poll or select stay in: `cargo xtask os-test` marks them unsupported
 # until those come (5f).
-BASIC = (("spawn", "*.c"), ("unistd", "*exec*.c"), ("unistd", None),
+BASIC = (("spawn", "*.c"), ("unistd", "*exec*.c"), ("unistd", "getentropy.c"),
+         ("unistd", None),
          ("nl_types", None), ("poll", None), ("pthread", None), ("signal", None),
          ("stdlib", None), ("sys_select", None), ("sys_wait", None), ("termios", None),
          ("fmtmsg", None), ("stdio", None), ("wchar", None))

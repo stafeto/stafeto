@@ -108,10 +108,12 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     PIPE,
     Record {
         args: b"ash-launch\0",
-        connects: &["ramfs", "uart", "pipe", "clock", "posix"],
+        connects: &["ramfs", "uart", "pipe", "clock", "posix", "entropy"],
         quota: DIALOG_QUOTA,
         ..BUSYBOX_TABLE[3]
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The quota of the launcher, which the shell and its children get too.
@@ -268,16 +270,22 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
         name: "posix-procs",
         program: "posix-procs",
         args: b"posix-procs\0",
-        connects: &["ramfs", "pipe", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         root: true,
         // A child from a file gets its parent's quota: room for BusyBox.
         quota: PROCS_QUOTA,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The probe of the longest step of the process service (tests/posix-procs
-/// in the steps mode, xtask process-steps): the pool for the crowd of
+/// in the steps mode, xtask process-steps). The image has no entropy
+/// service (its nodes of random devices give ENOSYS): the steps are
+/// measured under -icount, where the driver at 45 and the service at 44
+/// would preempt the steps of the services at 40 and add their own work to
+/// them. The pool for the crowd of
 /// children it starts from files, each with the probe's quota, and one
 /// more for the child that execs among them.
 pub const POSIX_STEPS_TABLE: &[Record] = &[
@@ -337,11 +345,13 @@ pub const OS_TEST_TABLE: &[Record] = &[
         name: "os-test-run",
         program: "os-test-run",
         args: b"os-test-run\0",
-        connects: &["ramfs", "pipe", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: OS_TEST_QUOTA,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The quota of the runner of os-test, which each test it starts gets too.
@@ -407,7 +417,15 @@ pub const RTBENCH: Record = Record {
     name: "rtbench-posix",
     program: "rtbench-posix",
     args: b"rtbench-posix\0",
-    connects: &["ramfs", "clock", "posix", "pipe", "uart", "rtbench-load"],
+    connects: &[
+        "ramfs",
+        "clock",
+        "posix",
+        "pipe",
+        "uart",
+        "rtbench-load",
+        "entropy",
+    ],
     // Room for a heap of 8 MiB, which a child of fork copies (S15).
     quota: 3072 * PAGE,
     handle_limit: 512,
@@ -431,6 +449,8 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     LONG,
     LOAD,
     RTBENCH,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The process service of rtbench 2: the pool for the children the

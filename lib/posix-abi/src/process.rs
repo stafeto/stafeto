@@ -541,6 +541,7 @@ impl Shadow {
                 posix_fs::Target::Error => Names::Error,
                 posix_fs::Target::Ram(n) => Names::File(n),
                 posix_fs::Target::Pipe(n) => Names::Pipe(n),
+                posix_fs::Target::Random(n) => Names::Random(n),
             };
             out[count] = Descriptor {
                 fd: fd as u32,
@@ -555,10 +556,11 @@ impl Shadow {
     fn shared(&self) -> impl Iterator<Item = u32> + Clone + '_ {
         let (list, count) = self.descriptors();
         (0..count).filter_map(move |i| match list[i].names {
-            proto_loader::Names::File(n)
-                if !list[..i]
-                    .iter()
-                    .any(|d| d.names == proto_loader::Names::File(n)) =>
+            proto_loader::Names::File(n) | proto_loader::Names::Random(n)
+                if !list[..i].iter().any(|d| {
+                    matches!(d.names, proto_loader::Names::File(m)
+                        | proto_loader::Names::Random(m) if m == n)
+                }) =>
             {
                 Some(n)
             }
