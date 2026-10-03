@@ -64,6 +64,63 @@ const PIECE: u64 = 64 << 10;
 /// first, or its wait reports 127 (posix_spawn's fallback, [MUSL-SPAWN]).
 const GAVE_UP: u64 = 127;
 
+/// The steps of a copy under `-icount` (feature `steps`, xtask
+/// process-steps): each kernel call of `copy` and `fill` with its ticks,
+/// the longest of each kind with its detail printed once the console the
+/// service gave the program is there (`report`). Without the feature a
+/// step is its closure.
+#[cfg(feature = "steps")]
+mod steps {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static LONGEST: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    static DETAIL: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+    pub fn timed<T>(kind: usize, detail: u64, step: impl FnOnce() -> T) -> T {
+        let began = rt::time::now();
+        let out = step();
+        let took = rt::time::now().saturating_sub(began);
+        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
+            DETAIL[kind].store(detail, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// One line for each kind that ran, through a copy of `console`.
+    pub fn report(console: &rt::handle::Handle<rt::handle::Resource>) {
+        // The console is the program's: a borrowed name of it prints here.
+        rt::console::set(core::mem::ManuallyDrop::into_inner(
+            rt::handle::Handle::borrowed(console.raw()),
+        ));
+        for kind in 0..LONGEST.len() {
+            let took = LONGEST[kind].load(Ordering::Relaxed);
+            if took != 0 {
+                let detail = DETAIL[kind].load(Ordering::Relaxed);
+                rt::println!("loader step: kind {kind} {took} ticks detail {detail}");
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "steps"))]
+mod steps {
+    pub fn timed<T>(_: usize, _: u64, step: impl FnOnce() -> T) -> T {
+        step()
+    }
+}
+
+/// The kinds of the steps of a copy.
+mod kind {
+    pub const MEM_CREATE: usize = 1;
+    pub const MAP_NEW: usize = 2;
+    pub const MAP_PIECE: usize = 3;
+    pub const COPY_PIECE: usize = 4;
+    pub const UNMAP_PIECE: usize = 5;
+    pub const REMAP: usize = 6;
+    pub const DUPLICATE: usize = 7;
+    pub const REGIONS: usize = 8;
+    pub const GO: usize = 9;
+}
+
 /// What Boot brought: the loader's own handles from the service.
 struct Own {
     process: Handle<Process>,
@@ -91,6 +148,12 @@ fn main(level: u64) -> u64 {
     let Ok(taken) = take(&session) else {
         return GAVE_UP;
     };
+    #[cfg(feature = "steps")]
+    if matches!(done, Done::Copied(_))
+        && let Some(console) = taken.console.as_ref()
+    {
+        steps::report(console);
+    }
     match done {
         Done::Loaded(loaded) => finish(session, start, own, loaded, taken),
         Done::Copied(copied) => finish_fork(session, start, own, copied, taken),
@@ -342,15 +405,22 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         _ => Status::BadSize.code(),
                     },
                     Some(Method::Regions) if !copied => match fork.as_mut() {
-                        Some((_, scratch)) => match take_regions(r, &mut handles, scratch) {
-                            Ok(()) => 0,
-                            Err(status) => status.code(),
-                        },
+                        Some((_, scratch)) => {
+                            match steps::timed(kind::REGIONS, handles.len() as u64, || {
+                                take_regions(r, &mut handles, scratch)
+                            }) {
+                                Ok(()) => 0,
+                                Err(status) => status.code(),
+                            }
+                        }
                         None => Status::Kernel(Error::BadState).code(),
                     },
                     Some(Method::Go) if !copied && fork.is_some() => {
                         let (body, scratch) = fork.as_mut()?;
-                        match copy(own, body, scratch).and_then(|()| tell_ready(session)) {
+                        let regions = scratch.count as u64;
+                        match steps::timed(kind::GO, regions, || copy(own, body, scratch))
+                            .and_then(|()| tell_ready(session))
+                        {
                             Ok(()) => {
                                 copied = true;
                                 0
@@ -479,8 +549,11 @@ fn copy(own: &Own, fork: &Fork, scratch: &mut Scratch) -> Result<(), u32> {
         );
         let len = last.end() - first.address;
         let at = first.address as usize;
-        let m = sys::mem_create(len).map_err(code)?;
-        loader::map_narrowed(&own.process, &m, 0, len, at, Access::ReadWrite).map_err(code)?;
+        let m = steps::timed(kind::MEM_CREATE, len, || sys::mem_create(len)).map_err(code)?;
+        steps::timed(kind::MAP_NEW, len, || {
+            loader::map_narrowed(&own.process, &m, 0, len, at, Access::ReadWrite)
+        })
+        .map_err(code)?;
         for i in group.clone() {
             let region = scratch.regions()[i];
             let parent =
@@ -489,15 +562,18 @@ fn copy(own: &Own, fork: &Fork, scratch: &mut Scratch) -> Result<(), u32> {
             fill(own, &parent, bytes, region.address)?;
         }
         if first.access != Access::ReadWrite {
-            // SAFETY: the new object's mapping, which nothing uses now.
-            unsafe { sys::mem_unmap(&own.process, at, len) }.map_err(code)?;
-            loader::map_narrowed(&own.process, &m, 0, len, at, first.access).map_err(code)?;
+            steps::timed(kind::REMAP, len, || {
+                // SAFETY: the new object's mapping, which nothing uses now.
+                unsafe { sys::mem_unmap(&own.process, at, len) }.map_err(code)?;
+                loader::map_narrowed(&own.process, &m, 0, len, at, first.access).map_err(code)
+            })?;
         }
         let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
         if first.access == Access::ReadWrite {
             rights = rights | Rights::MAP_WRITE;
         }
-        let kept = sys::handle_duplicate(&m, rights).map_err(code)?;
+        let kept = steps::timed(kind::DUPLICATE, len, || sys::handle_duplicate(&m, rights))
+            .map_err(code)?;
         let pages = u32::try_from(len / PAGE).map_err(|_| pl::TOO_BIG)?;
         scratch.map[scratch.kept].write(MapEntry {
             address: first.address,
@@ -517,28 +593,33 @@ fn fill(own: &Own, parent: &Handle<Memory>, bytes: u64, at: u64) -> Result<(), u
     let mut offset = 0;
     while offset < bytes {
         let piece = (bytes - offset).min(PIECE);
-        sys::mem_map(
-            &own.process,
-            parent,
-            offset,
-            piece,
-            WINDOW as usize,
-            Access::Read,
-        )
+        steps::timed(kind::MAP_PIECE, piece, || {
+            sys::mem_map(
+                &own.process,
+                parent,
+                offset,
+                piece,
+                WINDOW as usize,
+                Access::Read,
+            )
+        })
         .map_err(code)?;
         // SAFETY: WINDOW maps `piece` bytes of the parent's object, read
         // only, and the new object is mapped writable at `at` for `bytes`
         // bytes; the two never meet (`admit` keeps every region off the
         // loader's region). The parent waits for Go's reply meanwhile.
-        unsafe {
+        steps::timed(kind::COPY_PIECE, piece, || unsafe {
             core::ptr::copy_nonoverlapping(
                 WINDOW as *const u8,
                 (at + offset) as *mut u8,
                 piece as usize,
             );
-        }
+        });
         // SAFETY: the window's mapping, which nothing uses now.
-        unsafe { sys::mem_unmap(&own.process, WINDOW as usize, piece) }.map_err(code)?;
+        steps::timed(kind::UNMAP_PIECE, piece, || unsafe {
+            sys::mem_unmap(&own.process, WINDOW as usize, piece)
+        })
+        .map_err(code)?;
         offset += piece;
     }
     Ok(())

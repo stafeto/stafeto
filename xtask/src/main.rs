@@ -392,7 +392,7 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
-    ("loader", "loader", 0, &[]),
+    ("loader", "loader", 0, &["steps"]),
 ];
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
@@ -2113,7 +2113,7 @@ const RAM_STEP_KINDS: [(usize, &str); 6] = [
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
-const STEP_KINDS: [(usize, &str); 12] = [
+const STEP_KINDS: [(usize, &str); 15] = [
     (1, "Create"),
     (13, "Kill"),
     (21, "Vouch"),
@@ -2124,8 +2124,26 @@ const STEP_KINDS: [(usize, &str); 12] = [
     (28, "ExecStart"),
     (29, "ExecCommit"),
     (31, "Replace"),
+    (34, "ForkStart"),
+    (35, "ForkCommit"),
+    (36, "ForkAbort"),
     (10, "WaitStart"),
     (64, "notification"),
+];
+
+/// The kinds of the lines `loader step: kind K N ticks detail D` of a
+/// loader that copies a fork (services/loader, feature `steps`), each a
+/// kernel call or the copy of one piece.
+const LOADER_STEP_KINDS: [(usize, &str); 9] = [
+    (1, "mem_create"),
+    (2, "map of the new object"),
+    (3, "mem_map of a piece"),
+    (4, "copy of a piece"),
+    (5, "mem_unmap of a piece"),
+    (6, "remap with the access"),
+    (7, "handle_duplicate"),
+    (8, "Regions"),
+    (9, "Go, the whole copy"),
 ];
 
 /// The longest step of each kind in `lines`: (kind, ticks, detail), the
@@ -2197,6 +2215,14 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
+    // The loader's lines, as the services' with the tag 3.
+    let loader_lines: Vec<String> = outcome
+        .lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("loader step: "))
+        .map(|l| format!("service step: 3 {l}"))
+        .collect();
+    let loader = longest_steps(&loader_lines, "3");
     if rows.is_empty() {
         return Err("the process service printed no step".into());
     }
@@ -2219,7 +2245,33 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the RAM file service: READ_INTO took {read_into} ticks, past {RAM_STEP_MAX}: {ram:?}"
         ));
     }
+    // ForkStart makes a process as SpawnStart does and stays within it
+    // (design 5d, T6); the copy of a fork has run, in steps of the loader.
+    let longest = |kind: usize| rows.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
+    let (spawn, fork_start, fork_commit) = (longest(22), longest(34), longest(35));
+    if fork_start == 0 || fork_commit == 0 || fork_start > spawn {
+        return Err(format!(
+            "ForkStart took {fork_start} ticks and ForkCommit {fork_commit}, SpawnStart {spawn}"
+        ));
+    }
+    if !loader.iter().any(|(k, ..)| *k == 9) {
+        return Err("no loader step of a copy: the forks did not run".into());
+    }
+    // The Clone of a fork copies the descriptions of the whole table.
+    let clone = ram.iter().find(|(k, ..)| *k == 15).map_or(0, |r| r.1);
+    if clone == 0 || clone > RAM_STEP_MAX {
+        return Err(format!(
+            "the RAM file service: Clone took {clone} ticks, past {RAM_STEP_MAX}: {ram:?}"
+        ));
+    }
     let mut text = String::from("kind method ticks detail\n");
+    for (kind, ticks, detail) in &loader {
+        let name = LOADER_STEP_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map_or("other", |(_, n)| n);
+        text += &format!("loader {kind} {name} {ticks} {detail}\n");
+    }
     for (kind, name, ticks, detail) in ram.iter().map(|(k, t, d)| {
         let name = RAM_STEP_KINDS
             .iter()

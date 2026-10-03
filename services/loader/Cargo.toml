@@ -18,6 +18,9 @@ bench = false
 # that the copy of a region past one piece, with an offset into the
 # parent's object, runs within a record's quota of 2 MiB.
 small-pieces = []
+# The steps of a copy with their ticks (rt::println; xtask process-steps,
+# under -icount).
+steps = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

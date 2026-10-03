@@ -44,11 +44,22 @@
  * one write of the child's stamp (an upper bound); S12 killpg to a group
  * of 32, to the last waitpid of its members; S13 posix_spawn from a file
  * to the first statement of the child's main; S14 execve of a child, from
- * the call to the first statement of the new image's main.
+ * the call to the first statement of the new image's main. The scenarios
+ * of 5d (fork; the role forker, a child that measures its own forks and
+ * leaves the samples in /tmp/probe, for the heap it grew and the threads
+ * it made are its own): S15 fork from the call to the first statement of
+ * the child, with the parent's heap at its start size, at 1 MiB and at
+ * 8 MiB; S16 fork, exec of a small file and waitpid, to the return of
+ * waitpid; S17 fork from the call to the child's first statement with N
+ * other threads that sleep or spin (N = 1, 8, 32, 63): the cost of
+ * stopping them (the rows of sleepers count the kernel calls of the
+ * process, which grow as the stop's cost does); S18 execve with N spinning other threads, to the first
+ * statement of the new image's main.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stddef.h>
@@ -165,6 +176,12 @@ static void fail(const char *what, int error) {
     say(&l);
 }
 
+/* The rows come in a burst that the console's log ring may not hold: a
+ * pause after each lets its driver show the one before. */
+static void pace(void) {
+    sleep_ns(10 * MS);
+}
+
 /* --- histograms ------------------------------------------------------ */
 
 /* 32 buckets of one nanosecond, then 32 buckets in each octave from 32. */
@@ -249,6 +266,7 @@ static void row(const char *name, const struct histogram *h, int with_calls) {
         put_number(&l, octaves[i]);
     }
     say(&l);
+    pace();
 }
 
 static void none(const char *name, const char *why) {
@@ -258,6 +276,7 @@ static void none(const char *name, const char *why) {
     put(&l, " none ");
     put(&l, why);
     say(&l);
+    pace();
 }
 
 /* --- threads --------------------------------------------------------- */
@@ -691,9 +710,8 @@ static int clear_stamps(void) {
     return 0;
 }
 
-/* Spawns /bin/rtbench-posix in role `role`. */
-static int spawn_child(pid_t *pid, const char *role, int flags, pid_t group) {
-    char *argv[] = { "rtbench-posix", (char *)role, NULL };
+/* Spawns /bin/rtbench-posix with `argv`. */
+static int spawn_argv(pid_t *pid, char **argv, int flags, pid_t group) {
     char *envp[] = { NULL };
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
@@ -701,8 +719,14 @@ static int spawn_child(pid_t *pid, const char *role, int flags, pid_t group) {
     posix_spawnattr_setpgroup(&attr, group);
     int error = posix_spawn(pid, "/bin/rtbench-posix", NULL, &attr, argv, envp);
     posix_spawnattr_destroy(&attr);
-    if (error) fail(role, error);
+    if (error) fail(argv[1], error);
     return error;
+}
+
+/* Spawns /bin/rtbench-posix in role `role`. */
+static int spawn_child(pid_t *pid, const char *role, int flags, pid_t group) {
+    char *argv[] = { "rtbench-posix", (char *)role, NULL };
+    return spawn_argv(pid, argv, flags, group);
 }
 
 /* The status of `pid` has to be exit 0 (`signal` 0) or that signal. */
@@ -851,6 +875,164 @@ static int kill_group(void) {
     return 0;
 }
 
+/* --- S15-S18: fork ----------------------------------------------------- */
+
+#define FORK_SAMPLES 10
+#define EXEC_SAMPLES 5
+/* Where the role forker leaves its samples in /tmp/probe, 8 bytes each:
+ * FORK_SAMPLES ticks, then the kernel calls its process made in each. */
+#define SAMPLES_AT 64
+#define CALLS_AT (SAMPLES_AT + 8 * FORK_SAMPLES)
+#define THREAD_COUNTS 4
+
+static const int thread_counts[THREAD_COUNTS] = { 1, 8, 32, 63 };
+static struct histogram s15[3], s16, s17[2][THREAD_COUNTS], s18[THREAD_COUNTS];
+
+static void sleep_forever(void);
+
+/* The other threads of a forker: asleep, or running below its level and
+ * yielding to each other (a spinner that never yields starves the threads
+ * behind it at its level: they never reach their entry of signals, and a
+ * stop for fork waits for them without end, as the notes say). */
+static void *stand_by(void *spin) {
+    if (spin) {
+        rtbench_level(10);
+        for (;;) sched_yield();
+    }
+    sleep_forever();
+    return NULL;
+}
+
+static void number_text(char *out, uint64_t value) {
+    char digits[24];
+    int count = 0;
+    do {
+        digits[count++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value);
+    while (count) *out++ = digits[--count];
+    *out = 0;
+}
+
+/* The role forker MODE KIB THREADS SPIN: grows its heap by KIB KiB, makes
+ * THREADS other threads (SPIN: they spin), and then, MODE 0: forks
+ * FORK_SAMPLES times and leaves the ticks from the call to the child's
+ * first statement; MODE 1: the ticks from the call to the return of
+ * waitpid for a child that execs /bin/rtbench-posix `true`; MODE 2:
+ * execs `quick` (the parent reads the stamps S14 reads). */
+static int forker(uint64_t entered, char **argv) {
+    (void)entered;
+    int mode = atoi(argv[2]), spin = atoi(argv[5]), threads = atoi(argv[4]);
+    size_t bytes = (size_t)atoi(argv[3]) * 1024;
+    int fd = open("/tmp/probe", O_RDWR);
+    if (fd < 0) return 2;
+    probe_fd = fd;
+    if (bytes) {
+        volatile char *heap = malloc(bytes);
+        if (!heap) return 3;
+        for (size_t at = 0; at < bytes; at += 4096) heap[at] = 1;
+    }
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32768);
+    for (int i = 0; i < threads; i++) {
+        pthread_t thread;
+        if (pthread_create(&thread, &attr, stand_by, spin ? (void *)1 : NULL)) return 4;
+    }
+    /* The threads run once, so that each has its entry of signals. */
+    if (threads) sleep_ns((uint64_t)(20 + 2 * threads) * MS);
+    if (mode == 2) {
+        char *quick[] = { "rtbench-posix", "quick", NULL };
+        char *envp[] = { NULL };
+        put_stamp(fd, STAMP_EXEC, ticks());
+        close(fd);
+        execve("/bin/rtbench-posix", quick, envp);
+        return 5;
+    }
+    for (int i = 0; i < FORK_SAMPLES; i++) {
+        uint64_t calls = rtbench_calls();
+        uint64_t t0 = ticks();
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (mode == 1) {
+                char *quiet[] = { "rtbench-posix", "true", NULL };
+                char *envp[] = { NULL };
+                execve("/bin/rtbench-posix", quiet, envp);
+                _exit(5);
+            }
+            put_stamp(fd, STAMP_MAIN, ticks());
+            _exit(0);
+        }
+        if (pid < 0) return 6;
+        int status = -1;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 7;
+        uint64_t t1 = ticks();
+        uint64_t used = rtbench_calls() - calls;
+        uint64_t sample = mode == 1 ? t1 - t0 : get_stamp(STAMP_MAIN) - t0;
+        if (put_stamp(fd, SAMPLES_AT + 8 * i, sample) || put_stamp(fd, CALLS_AT + 8 * i, used)) return 8;
+    }
+    return 0;
+}
+
+/* One forker in `mode` with a heap of `kib` and `threads` others, its
+ * FORK_SAMPLES into `h`. */
+static int run_forker(struct histogram *h, int mode, int kib, int threads, int spin) {
+    char text[4][24];
+    number_text(text[0], (uint64_t)mode);
+    number_text(text[1], (uint64_t)kib);
+    number_text(text[2], (uint64_t)threads);
+    number_text(text[3], (uint64_t)spin);
+    char *argv[] = { "rtbench-posix", "forker", text[0], text[1], text[2], text[3], NULL };
+    pid_t pid = -1;
+    if (clear_stamps() || spawn_argv(&pid, argv, 0, 0)) return 1;
+    int got = reaped(pid, 0, 0, "forker");
+    if (got != 1) return 1;
+    for (int i = 0; i < FORK_SAMPLES; i++) {
+        uint64_t sample = get_stamp(SAMPLES_AT + 8 * i);
+        if (!sample) {
+            fail("forker sample", i);
+            return 1;
+        }
+        record(h, ticks_ns(sample));
+        h->calls += get_stamp(CALLS_AT + 8 * i);
+    }
+    return 0;
+}
+
+/* S18: EXEC_SAMPLES forkers that exec with `threads` spinning others. */
+static int exec_with_threads(struct histogram *h, int threads) {
+    char text[24];
+    number_text(text, (uint64_t)threads);
+    for (int i = 0; i < EXEC_SAMPLES; i++) {
+        char *argv[] = { "rtbench-posix", "forker", "2", "0", text, "1", NULL };
+        pid_t pid = -1;
+        if (clear_stamps() || spawn_argv(&pid, argv, 0, 0)) return 1;
+        if (await_stamp(STAMP_MAIN, "S18 new image did not start")) return 1;
+        uint64_t from = get_stamp(STAMP_EXEC), to = get_stamp(STAMP_MAIN);
+        if (from == 0 || to < from) {
+            fail("S18 stamps", 0);
+            return 1;
+        }
+        record(h, ticks_ns(to - from));
+        if (reaped(pid, 0, 0, "S18 waitpid of the new image") != 1) return 1;
+    }
+    return 0;
+}
+
+static int forks(void) {
+    static const int heaps[3] = { 0, 1024, 8192 };
+    for (int i = 0; i < 3; i++)
+        if (run_forker(&s15[i], 0, heaps[i], 0, 0)) return 1;
+    if (run_forker(&s16, 1, 0, 0, 0)) return 1;
+    for (int i = 0; i < THREAD_COUNTS; i++)
+        if (run_forker(&s17[0][i], 0, 0, thread_counts[i], 0)) return 1;
+    for (int i = 0; i < THREAD_COUNTS; i++)
+        if (run_forker(&s17[1][i], 0, 0, thread_counts[i], 1)) return 1;
+    for (int i = 0; i < THREAD_COUNTS; i++)
+        if (exec_with_threads(&s18[i], thread_counts[i])) return 1;
+    return 0;
+}
+
 static int processes(void) {
     probe_fd = open("/tmp/probe", O_RDWR);
     if (probe_fd < 0) {
@@ -864,6 +1046,7 @@ static int processes(void) {
     if (!error) error = exec_to_main();
     if (!error) error = exit_to_wait();
     if (!error) error = kill_group();
+    if (!error) error = forks();
     error |= rtbench_level(MAIN_LEVEL);
     close(probe_fd);
     return error;
@@ -884,7 +1067,10 @@ static void sleep_forever(void) {
     }
 }
 
-static int child(uint64_t entered, const char *role) {
+static int child(uint64_t entered, char **argv) {
+    const char *role = argv[1];
+    if (strcmp(role, "true") == 0) return 0;
+    if (strcmp(role, "forker") == 0) return forker(entered, argv);
     int fd = open("/tmp/probe", O_WRONLY);
     if (fd < 0) return 2;
     if (strcmp(role, "quick") == 0) return put_stamp(fd, STAMP_MAIN, entered) ? 3 : 0;
@@ -952,7 +1138,19 @@ static void report(void) {
     row("s12_killpg_group_32", &s12, 0);
     row("s13_spawn_to_main", &s13, 0);
     row("s14_exec_to_main", &s14, 0);
-    none("fork_exec_waitpid", "fork comes with 5d");
+    row("s15_fork_to_child", &s15[0], 1);
+    row("s15_fork_heap_1m", &s15[1], 1);
+    row("s15_fork_heap_8m", &s15[2], 1);
+    row("s16_fork_exec_waitpid", &s16, 0);
+    static const char *const sleepers[THREAD_COUNTS] = {
+        "s17_fork_sleepers_1", "s17_fork_sleepers_8", "s17_fork_sleepers_32", "s17_fork_sleepers_63" };
+    static const char *const spinners[THREAD_COUNTS] = {
+        "s17_fork_spinners_1", "s17_fork_spinners_8", "s17_fork_spinners_32", "s17_fork_spinners_63" };
+    static const char *const execs[THREAD_COUNTS] = {
+        "s18_exec_spinners_1", "s18_exec_spinners_8", "s18_exec_spinners_32", "s18_exec_spinners_63" };
+    for (int i = 0; i < THREAD_COUNTS; i++) row(sleepers[i], &s17[0][i], 1);
+    for (int i = 0; i < THREAD_COUNTS; i++) row(spinners[i], &s17[1][i], 0);
+    for (int i = 0; i < THREAD_COUNTS; i++) row(execs[i], &s18[i], 0);
     none("timer_1ms", "POSIX timers come with 5h");
     none("inheritance_chain", "priority inheritance comes with 5h");
     struct line l = { .length = 0 };
@@ -966,7 +1164,7 @@ static void report(void) {
 
 int main(int argc, char **argv) {
     uint64_t entered = ticks();
-    if (argc > 1) return child(entered, argv[1]);
+    if (argc > 1) return child(entered, argv);
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
     struct line l = { .length = 0 };
     uint64_t seconds = rtbench_seconds();

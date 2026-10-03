@@ -748,6 +748,26 @@ static void steps_setup(void) {
     close(open("/etc/motd", O_RDONLY));
 }
 
+/* The role stepfork: five forks, each child ends, after the heap grew by
+ * 256 KiB (the child's quota is the steps probe's, 1 MiB). */
+static int steps_fork(void) {
+    char *heap = malloc(256 * 1024);
+    if (!heap) return 60;
+    memset(heap, 1, 256 * 1024);
+    for (int i = 0; i < 5; i++) {
+        pid_t pid = fork();
+        if (pid == 0) _exit(7);
+        if (pid < 0) {
+            printf("posix-procs: steps: fork gave %s\n", strerror(errno));
+            return 61;
+        }
+        int status = -1;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 7) return 62;
+    }
+    free(heap);
+    return 0;
+}
+
 static int steps_armed(void) {
     steps_setup();
     for (;;) pause_ms(1000);
@@ -824,6 +844,11 @@ static int steps_run(void) {
         if (posix_spawn(&pid, "/bin/procs-child", NULL, NULL, exec_argv, envp) != 0) return 5;
         reap("a child that execs among the crowd", pid, 7, 0);
     }
+    /* fork among the crowd, from a child (a program init started cannot
+     * fork): ForkStart, the loader's copy and ForkCommit. */
+    pid_t forker = -1;
+    if (steps_spawn(&forker, "stepfork", "0") != 0) return 5;
+    reap("a child that forks among the crowd", forker, 0, 0);
     /* Volleys: SIGUSR1 to the crowd arms every identity session. A change
      * of the credentials moves their generation, and the clock service
      * asks the process service who the caller is again (Vouch) when
@@ -1585,6 +1610,7 @@ static int role(const char *name) {
     if (strcmp(name, "steps") == 0) return steps_run();
     if (strcmp(name, "branch") == 0) return steps_branch();
     if (strcmp(name, "armed") == 0) return steps_armed();
+    if (strcmp(name, "stepfork") == 0) return steps_fork();
     if (strcmp(name, "child") == 0) {
         sigset_t mask;
         sigprocmask(SIG_BLOCK, NULL, &mask);
