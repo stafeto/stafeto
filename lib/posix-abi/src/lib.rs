@@ -25,6 +25,7 @@ pub mod signals;
 pub mod terminal;
 pub mod threads;
 pub mod tls;
+pub mod wait;
 
 use constants::*;
 use core::ffi::{c_char, c_int};

@@ -427,30 +427,35 @@ pub extern "C" fn stafeto_watch_full_tty(fd: u32, gone: u32) -> i32 {
 /// Reads both quiet service snapshots before printing any measurements.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_watch_stats(pipe: u32, tty: u32) -> i32 {
-    let mut maxima = [[(0u64, 0u64); 66]; 2];
+    let mut maxima = [[[(0u64, 0u64); 66]; 2]; 2];
     for (index, fd) in [pipe, tty].into_iter().enumerate() {
         let outcome = service(fd, |channel, _, terminal| {
-            for (kind, maximum) in maxima[index].iter_mut().enumerate() {
-                let mut request = Writer::new();
-                proto_wire::Header::new(
-                    if terminal { 30 } else { 17 },
-                    if terminal {
-                        proto_tty::VERSION
-                    } else {
-                        proto_pipe::VERSION
-                    },
-                )
-                .write(&mut request)
-                .map_err(|_| 5)?;
-                request.u32(kind as u32).map_err(|_| 5)?;
-                let reply = sys::send(channel, request.as_bytes()).map_err(|_| 5)?;
-                let mut buffer = [0; rt::abi::MESSAGE_MAX];
-                let mut body = Reader::new(reply.bytes(&mut buffer));
-                if body.u32().map_err(|_| 5)? != 0 {
-                    return Err(5);
+            for (case, rows) in maxima[index].iter_mut().enumerate() {
+                for (kind, maximum) in rows.iter_mut().enumerate() {
+                    let mut request = Writer::new();
+                    proto_wire::Header::new(
+                        if terminal { 30 } else { 17 },
+                        if terminal {
+                            proto_tty::VERSION
+                        } else {
+                            proto_pipe::VERSION
+                        },
+                    )
+                    .write(&mut request)
+                    .map_err(|_| 5)?;
+                    request.u32(kind as u32).map_err(|_| 5)?;
+                    if case == 1 {
+                        request.u64(32).map_err(|_| 5)?;
+                    }
+                    let reply = sys::send(channel, request.as_bytes()).map_err(|_| 5)?;
+                    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+                    let mut body = Reader::new(reply.bytes(&mut buffer));
+                    if body.u32().map_err(|_| 5)? != 0 {
+                        return Err(5);
+                    }
+                    *maximum = (body.u64().map_err(|_| 5)?, body.u64().map_err(|_| 5)?);
+                    body.finish().map_err(|_| 5)?;
                 }
-                *maximum = (body.u64().map_err(|_| 5)?, body.u64().map_err(|_| 5)?);
-                body.finish().map_err(|_| 5)?;
             }
             Ok(())
         });
@@ -458,16 +463,19 @@ pub extern "C" fn stafeto_watch_stats(pipe: u32, tty: u32) -> i32 {
             return -error;
         }
     }
-    for (index, rows) in maxima.into_iter().enumerate() {
-        for (kind, (ticks, detail)) in rows.into_iter().enumerate() {
-            if ticks != 0 {
-                rt::println!(
-                    "service step: {} kind {} {} ticks detail {}",
-                    index + 4,
-                    kind,
-                    ticks,
-                    detail
-                );
+    for (index, cases) in maxima.into_iter().enumerate() {
+        for (case, rows) in cases.into_iter().enumerate() {
+            for (kind, (ticks, detail)) in rows.into_iter().enumerate() {
+                if ticks != 0 {
+                    rt::println!(
+                        "service {}: {} kind {} {} ticks detail {}",
+                        if case == 0 { "step" } else { "case" },
+                        index + 4,
+                        kind,
+                        ticks,
+                        detail
+                    );
+                }
             }
         }
     }

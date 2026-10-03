@@ -2343,7 +2343,10 @@ fn posix_poll_probe() -> Result<(), String> {
         &output,
         "init: posix-poll ended: exit code 0, not restarted",
     )?;
-    let lines = &output.lines;
+    check_watch_steps(&output.lines)
+}
+
+fn check_watch_steps(lines: &[String]) -> Result<(), String> {
     for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
         let steps = longest_steps(lines, tag);
         for &(kind, ticks, _) in &steps {
@@ -2353,8 +2356,19 @@ fn posix_poll_probe() -> Result<(), String> {
                 ));
             }
         }
+        let cases: Vec<String> = lines
+            .iter()
+            .filter(|line| line.starts_with("service case:"))
+            .map(|line| line.replacen("service case:", "service step:", 1))
+            .collect();
+        let full = longest_steps(&cases, tag);
+        for &(_, ticks, _) in &full {
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!("watch full case exceeded {RAM_STEP_MAX}: {ticks}"));
+            }
+        }
         for method in methods {
-            if !steps
+            if !full
                 .iter()
                 .any(|&(kind, ticks, detail)| kind == method && ticks != 0 && detail == 32)
             {
@@ -2375,7 +2389,6 @@ fn posix_poll_probe() -> Result<(), String> {
     }
     Ok(())
 }
-
 fn posix_jobs_probe() -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
@@ -3517,6 +3530,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
+        job("posix-poll", posix_poll_probe),
         // The longest step of the process service with 128 children, under
         // -icount: the host's time changes none of its numbers.
         job("process-steps", || process_steps(&qemu::VIRT, 4)),
@@ -5511,6 +5525,31 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn full_watch_case_survives_a_longer_single_item_maximum() {
+        let mut lines = Vec::new();
+        for (tag, methods) in [(4, [14, 15, 16]), (5, [25, 26, 27])] {
+            for method in methods {
+                lines.push(format!(
+                    "service step: {tag} kind {method} 15000 ticks detail 1"
+                ));
+                lines.push(format!(
+                    "service case: {tag} kind {method} 14000 ticks detail 32"
+                ));
+            }
+            for kind in [64, 65] {
+                lines.push(format!(
+                    "service step: {tag} kind {kind} 1000 ticks detail 0"
+                ));
+            }
+        }
+        assert!(super::check_watch_steps(&lines).is_ok());
+        let mut missing = lines.clone();
+        missing.retain(|line| !line.starts_with("service case: 5 kind 26 "));
+        assert!(super::check_watch_steps(&missing).is_err());
+        lines.push("service case: 5 kind 26 20539 ticks detail 32".into());
+        assert!(super::check_watch_steps(&lines).is_err());
+    }
     use super::*;
 
     /// The check of the layer's names takes every global defined symbol

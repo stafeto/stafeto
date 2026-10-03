@@ -485,6 +485,7 @@ mod steps {
     /// Whether the step in progress counts as `OWN`.
     static OWNED: AtomicBool = AtomicBool::new(false);
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static FULL: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static DETAILS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static QUIET: AtomicBool = AtomicBool::new(false);
     /// A number the handler of the step gives (`super::step_detail`), for
@@ -505,6 +506,10 @@ mod steps {
             LONGEST.get(kind)?.load(Ordering::Relaxed),
             DETAILS[kind].load(Ordering::Relaxed),
         ))
+    }
+
+    pub fn full(kind: usize) -> Option<(u64, u64)> {
+        Some((FULL.get(kind)?.load(Ordering::Relaxed), 32))
     }
 
     pub fn detail(value: u64) {
@@ -532,6 +537,9 @@ mod steps {
             kind
         };
         let detail = DETAIL.swap(0, Ordering::Relaxed);
+        if detail == 32 {
+            FULL[kind].fetch_max(took, Ordering::Relaxed);
+        }
         let tag = REPORT.load(Ordering::Relaxed);
         if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
             DETAILS[kind].store(detail, Ordering::Relaxed);
@@ -577,7 +585,7 @@ pub fn step_maximum(kind: usize) -> Option<(u64, u64)> {
     steps::maximum(kind)
 }
 
-/// Measurement-only request: one kind u32, returning ticks and detail u64.
+/// Measurement-only request: kind u32, optional detail u64 (32), then maximum.
 #[cfg(feature = "step-stats")]
 pub fn step_snapshot(r: &mut Request<'_>) -> Answer {
     let mut body = r.body();
@@ -585,7 +593,15 @@ pub fn step_snapshot(r: &mut Request<'_>) -> Answer {
         Ok(kind) if r.handles.is_empty() => kind as usize,
         _ => return Answer::Status(Status::BadSize),
     };
-    let Some((ticks, detail)) = step_maximum(kind).filter(|_| body.finish().is_ok()) else {
+    let maximum = if body.left() == 0 {
+        step_maximum(kind)
+    } else {
+        match body.u64() {
+            Ok(32) => steps::full(kind),
+            _ => None,
+        }
+    };
+    let Some((ticks, detail)) = maximum.filter(|_| body.finish().is_ok()) else {
         return Answer::Status(Status::BadSize);
     };
     if r.reply()
