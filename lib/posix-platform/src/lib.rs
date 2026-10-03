@@ -766,6 +766,14 @@ pub extern "C" fn stafeto_probe_hold(which: c_int, us: u64) -> c_int {
     posix_abi::fork::probe_hold(which as u32, us.saturating_mul(1000))
 }
 
+/// The next anonymous mapping of the layer sleeps `us` microseconds first
+/// (posix_abi::allocation::probe_sleep_next), for the probe of relibc's
+/// allocator across a fork.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_mmap_sleep(us: u64) {
+    posix_abi::allocation::probe_sleep_next(us.saturating_mul(1000));
+}
+
 /// How many threads the process's table holds
 /// (posix_abi::fork::probe_threads).
 #[unsafe(no_mangle)]

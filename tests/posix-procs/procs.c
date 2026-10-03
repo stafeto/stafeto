@@ -122,7 +122,12 @@
  * the service's pool back, and so does a parent that dies in the window
  * of its fork, after Go or after its first Regions. The bare child checks
  * 512 KiB of the parent's heap, past the 64 KiB pieces of the probes'
- * loader (feature small-pieces). BusyBox ash from its file runs `/bin/ls /etc && exit
+ * loader (feature small-pieces). Twenty pairs of forks with no wait
+ * between them park the other threads twice running; a thread in
+ * nanosleep, one in sigsuspend and one in waitpid go on across forks with
+ * no EINTR of theirs, and the forked child has no child; a fork waits for
+ * relibc's allocator lock a thread holds while its mapping sleeps in the
+ * layer. BusyBox ash from its file runs `/bin/ls /etc && exit
  * 3`, which forks.
  *
  * Stage 10: the probe is a record of init's table, and its end is init's
@@ -175,6 +180,7 @@ void stafeto_probe_fork_window(void (*window)(void));
 int stafeto_probe_hold(int which, unsigned long long us);
 int stafeto_probe_threads(void);
 void stafeto_probe_fork_early(void (*window)(void));
+void stafeto_probe_mmap_sleep(unsigned long long us);
 unsigned long long stafeto_probe_pool(void);
 void stafeto_probe_decoy(int on);
 size_t stafeto_probe_memory_map(unsigned long long *out, size_t max);
@@ -1215,9 +1221,9 @@ static int fork_full(void) {
 }
 
 
-/* Role forkthreads: fork from a parent with five more threads, at its
+/* Role forkthreads: fork from a parent with six more threads, at its
  * level under FIFO, so each yields after a turn, which mallocs with no
- * lock of its own, and
+ * lock of its own, execs a file that is no program, and
  * churn the heap under a mutex, open and close files, make and join
  * threads, and hold the layer's locks of the heap, the files and a bucket
  * of the table of waits in turn. Each fork stops them all: in its window
@@ -1275,6 +1281,20 @@ static void *churn_files(void *arg) {
     return NULL;
 }
 
+/* exec of a file that is no program: each stops the process, fails and
+ * resumes it, between the stops of the forks. */
+static void *churn_exec(void *arg) {
+    (void)arg;
+    char *argv[] = {"data", NULL};
+    char *env[] = {NULL};
+    while (!churn_stop) {
+        execve("/bin/data", argv, env);
+        tick();
+        sched_yield();
+    }
+    return NULL;
+}
+
 static void *short_thread(void *arg) {
     tick();
     return arg;
@@ -1322,15 +1342,23 @@ static int threads_child(const char *kept) {
     close(fd);
     if (pthread_mutex_lock(&churn_mutex) != 0 || pthread_mutex_unlock(&churn_mutex) != 0) bad |= 8;
     if (strcmp(kept, "kept") != 0) bad |= 16;
+    /* relibc's table of threads holds the child's one: a thread comes
+     * and goes. */
+    pthread_t t;
+    void *back = NULL;
+    if (pthread_create(&t, NULL, full_thread, (void *)41) != 0 || pthread_join(t, &back) != 0 ||
+        back != (void *)42)
+        bad |= 32;
     return bad;
 }
 
 static int fork_threads(void) {
     pthread_atfork(lock_churn, unlock_churn, unlock_churn);
     char *kept = strdup("kept");
-    pthread_t t[5];
-    void *(*bodies[5])(void *) = {churn_heap, churn_malloc, churn_files, churn_threads, hold_locks};
-    for (int i = 0; i < 5; i++) {
+    pthread_t t[6];
+    void *(*bodies[6])(void *) = {churn_heap,    churn_malloc, churn_files,
+                                  churn_threads, hold_locks,   churn_exec};
+    for (int i = 0; i < 6; i++) {
         expect("a churning thread", pthread_create(&t[i], NULL, bodies[i], NULL), 0);
     }
     pause_ms(20);
@@ -1353,10 +1381,21 @@ static int fork_threads(void) {
         }
     }
     stafeto_probe_fork_window(NULL);
+    /* Two forks one after the other with no wait between: a thread the
+     * first stop parked parks again for the second. */
+    for (int i = 0; i < 20 && failures == 0; i++) {
+        fflush(stdout);
+        pid_t a = fork();
+        if (a == 0) _exit(0);
+        pid_t b = fork();
+        if (b == 0) _exit(0);
+        reap("the first of a pair of forks", a, 0, 0);
+        reap("the second of a pair of forks", b, 0, 0);
+    }
     churn_stop = 1;
-    for (int i = 0; i < 5; i++) pthread_join(t[i], NULL);
+    for (int i = 0; i < 6; i++) pthread_join(t[i], NULL);
     expect("threads that moved in a fork's window", moved_in_window, 0);
-    if (failures == 0) printf("posix-procs: %d forks of a parent with five threads\n", forks);
+    if (failures == 0) printf("posix-procs: %d forks of a parent with six threads\n", forks);
     return failures;
 }
 
@@ -1440,6 +1479,107 @@ static int fork_die(int early) {
     return 1;
 }
 
+
+/* Role forkwaits: the waits of other threads go on across a fork. A
+ * thread in nanosleep of 300 ms gets 0, one in sigsuspend returns only
+ * after its handler ran, one in waitpid of a child that naps gets that
+ * child's status, and the forked child has no child of its own. */
+static volatile int suspend_handled;
+static void on_suspend_usr1(int signal) {
+    (void)signal;
+    suspend_handled++;
+}
+static void *sleep_300(void *arg) {
+    (void)arg;
+    struct timespec t = {0, 300 * 1000000L};
+    return (void *)(long)nanosleep(&t, NULL);
+}
+static void *suspend_usr1(void *arg) {
+    (void)arg;
+    sigset_t none;
+    sigemptyset(&none);
+    sigsuspend(&none);
+    return (void *)(long)suspend_handled;
+}
+static void *wait_nap(void *arg) {
+    pid_t nap = (pid_t)(long)arg;
+    int status = -1;
+    pid_t got = waitpid(nap, &status, 0);
+    return (void *)(long)(got == nap && WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+}
+
+static int fork_waits(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = on_suspend_usr1;
+    sigaction(SIGUSR1, &action, NULL);
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &usr1, NULL);
+    pid_t nap = start("nap");
+    pthread_t sleeper, suspender, waiter;
+    pthread_create(&sleeper, NULL, sleep_300, NULL);
+    pthread_create(&suspender, NULL, suspend_usr1, NULL);
+    pthread_create(&waiter, NULL, wait_nap, (void *)(long)nap);
+    pause_ms(20);
+    for (int i = 0; i < 5; i++) {
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) _exit(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD ? 0 : 1);
+        reap("a fork while threads wait", pid, 0, 0);
+        pause_ms(10);
+    }
+    void *got = NULL;
+    pthread_join(sleeper, &got);
+    expect("nanosleep across forks", (int)(long)got, 0);
+    pthread_join(waiter, &got);
+    expect("waitpid across forks", (int)(long)got, 3);
+    expect("sigsuspend before its signal", suspend_handled, 0);
+    pthread_kill(suspender, SIGUSR1);
+    pthread_join(suspender, &got);
+    expect("sigsuspend returns after its handler", (int)(long)got, 1);
+    return failures;
+}
+
+/* Role forkmalloc: a thread's malloc holds relibc's allocator lock while
+ * its mapping sleeps 300 ms in the layer (outside the layer's sections),
+ * and the main thread forks meanwhile: fork's prepare handler waits for
+ * the lock, so the malloc is over before the copy, and the child's malloc
+ * finds the lock free. */
+static volatile int slow_done;
+static void *malloc_slowly(void *arg) {
+    (void)arg;
+    /* After pthread_create of the main thread is over: it mallocs too. */
+    pause_ms(20);
+    stafeto_probe_mmap_sleep(300000);
+    char *p = malloc(1024 * 1024);
+    slow_done = 1;
+    if (p) memset(p, 1, 1024 * 1024);
+    return p;
+}
+
+static int fork_malloc(void) {
+    pthread_t slow;
+    pthread_create(&slow, NULL, malloc_slowly, NULL);
+    pause_ms(100);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *p = malloc(64 * 1024);
+        _exit(p != NULL ? 0 : 1);
+    }
+    /* The prepare handler waited for the allocator's lock: the slow
+     * malloc was over before the copy. */
+    expect("the slow malloc before the copy", slow_done, 1);
+    reap("a fork while another thread's malloc waits", pid, 0, 0);
+    void *got = NULL;
+    pthread_join(slow, &got);
+    expect("the slow malloc", got != NULL, 1);
+    free(got);
+    return failures;
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "steps") == 0) return steps_run();
@@ -1486,6 +1626,8 @@ static int role(const char *name) {
     if (strcmp(name, "forkfull") == 0) return fork_full();
     if (strcmp(name, "forkthreads") == 0) return fork_threads();
     if (strcmp(name, "forkthread") == 0) return fork_thread();
+    if (strcmp(name, "forkwaits") == 0) return fork_waits();
+    if (strcmp(name, "forkmalloc") == 0) return fork_malloc();
     if (strcmp(name, "forkmany") == 0) return fork_many();
     if (strcmp(name, "forkdie") == 0) return fork_die(0);
     if (strcmp(name, "forkdieearly") == 0) return fork_die(1);
@@ -2018,6 +2160,8 @@ static void forks(void) {
     run_role("/bin/procs-child", "forkfull", NULL);
     run_role("/bin/procs-child", "forkthreads", NULL);
     run_role("/bin/procs-child", "forkthread", NULL);
+    run_role("/bin/procs-child", "forkwaits", NULL);
+    run_role("/bin/procs-child", "forkmalloc", NULL);
     run_role("/bin/procs-child", "forkmany", NULL);
     /* A parent that dies in the window of its fork leaves nothing: its
      * loading child and that child's loader go, and the pool is whole. */

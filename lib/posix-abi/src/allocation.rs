@@ -240,9 +240,24 @@ fn grow(state: &mut State, needed: usize, alignment: usize) -> Result<(), Error>
     Ok(())
 }
 
+/// The nanoseconds the next `map_pages` sleeps before the heap's section,
+/// 0 for none: for the probe of relibc's allocator across a fork (its
+/// lock held by a thread that waits in the kernel outside the layer's
+/// sections).
+static PROBE_SLEEP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The next `map_pages` sleeps `ns` nanoseconds first, for the probes.
+pub fn probe_sleep_next(ns: u64) {
+    PROBE_SLEEP.store(ns, Ordering::Release);
+}
+
 /// Zeroed whole pages for an anonymous mapping (relibc's mmap): no header,
 /// so any whole pages of them go back with `unmap_pages`.
 pub fn map_pages(size: usize) -> Result<NonNull<u8>, i32> {
+    let ns = PROBE_SLEEP.swap(0, Ordering::AcqRel);
+    if ns != 0 {
+        crate::threads::sleep::probe_pause(ns);
+    }
     let pointer = heap(|state| {
         if let Ok(pointer) = state.allocator.allocate_pages(size) {
             return Ok(pointer);

@@ -514,10 +514,16 @@ pub fn suspend(mask: SigSet) -> i32 {
         }
         // An entry between the check and `receive` stays pending and makes
         // `receive` return at once; it runs when the guard goes.
+        let handled = block.handled.load(Ordering::SeqCst);
         let guard = rt::upcall::defer_entries().expect("sigsuspend entry deferral");
         let got = sys::receive(&channel);
         drop(guard);
         match got {
+            // An entry that ran no handler (a stop of exec or fork parked
+            // the thread) leaves the wait on.
+            Err(Error::Interrupted)
+                if block.handled.load(Ordering::SeqCst) == handled
+                    && !threads::cancel::requested() => {}
             Err(Error::Interrupted) => break,
             Ok(sys::Received::Notification {
                 source: Source::Unlabeled,
@@ -699,11 +705,10 @@ pub fn carry_pending(bits: u64) {
 }
 
 /// The thread that stops the others for an exec or a fork (its block's
-/// address), 0 for none; how many parked; the channel the stopper waits
-/// on; and, by place of the table of threads, the channel each parked
-/// thread waits on until it goes on (0 for a thread that is not parked).
+/// address), 0 for none; the channel the stopper waits on; and, by place
+/// of the table of threads, the channel of each parked thread, its own
+/// (0 for a thread that is not parked).
 static STOPPING: AtomicUsize = AtomicUsize::new(0);
-static PARKED: AtomicUsize = AtomicUsize::new(0);
 static STOPPER: AtomicU64 = AtomicU64::new(0);
 static PARKING: [AtomicU64; crate::relibc::PLACES] =
     [const { AtomicU64::new(0) }; crate::relibc::PLACES];
@@ -736,8 +741,8 @@ pub(crate) fn stop_others() -> Result<(), i32> {
         .is_err()
     {
         park();
+        let _ = sys::yield_now();
     }
-    PARKED.store(0, Ordering::Release);
     STOPPER.store(channel.raw().0, Ordering::Release);
     let mut asked = 0u64;
     loop {
@@ -775,8 +780,10 @@ pub(crate) fn stop_others() -> Result<(), i32> {
         }
         let deadline = rt::time::ticks_to_ns(rt::time::now()) + LOOK_AGAIN_NS;
         let _ = sys::timer_set(&timer, deadline);
+        // An interrupted wait looks again: the stop holds until every
+        // other thread is stopped.
         if sys::receive(&channel).is_err() {
-            break;
+            let _ = sys::yield_now();
         }
     }
     // The stopper's channel lives as long as the stop.
@@ -795,7 +802,6 @@ pub(crate) fn stop_others() -> Result<(), i32> {
 /// (crate::threads::after_fork).
 pub(crate) unsafe fn after_fork() -> Result<(), i32> {
     STOPPING.store(0, Ordering::Release);
-    PARKED.store(0, Ordering::Release);
     STOPPER.store(0, Ordering::Release);
     for place in &PARKING {
         place.store(0, Ordering::Relaxed);
@@ -829,33 +835,36 @@ pub(crate) fn resume_others() {
 }
 
 /// Parks the calling thread while another thread stops the process for
-/// an exec or a fork: its process signals go back to the page, it puts a
-/// channel of its own in its place of PARKING, says so to the stopper and
-/// waits there until the stop ends; a successful exec ends the process
-/// meanwhile.
+/// an exec or a fork: its process signals go back to the page, it puts its
+/// own channel in its place of PARKING, says so to the stopper and waits
+/// there until the stopper takes the place back (`resume_others`). A new
+/// stop that began before the thread ran again finds it parked for that
+/// one too: it puts its channel back and tells the new stopper. Its place
+/// is empty when it goes on. A successful exec ends the process meanwhile.
 fn park() {
     let block = own();
     give_back(block, block.process.load(Ordering::SeqCst));
-    let level = block.base_level.load(Ordering::Relaxed) as u8;
-    let Some(place) = (block.thread_id as usize)
+    let raw = block.channel.load(Ordering::Relaxed);
+    let place = (block.thread_id as usize)
         .checked_sub(1)
-        .and_then(|i| PARKING.get(i))
-    else {
+        .and_then(|i| PARKING.get(i));
+    let (Some(place), false) = (place, raw == 0) else {
         return;
     };
-    let Ok(channel) = sys::channel_create(level.max(1)) else {
-        return;
-    };
-    let raw = channel.raw().0;
-    place.store(raw, Ordering::Release);
-    PARKED.fetch_add(1, Ordering::AcqRel);
-    let stopper = STOPPER.load(Ordering::Acquire);
-    if stopper != 0 {
-        let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(stopper)), 1);
-    }
-    while STOPPING.load(Ordering::Acquire) != 0 {
-        if sys::receive(&channel).is_err() {
+    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(raw));
+    loop {
+        place.store(raw, Ordering::SeqCst);
+        if STOPPING.load(Ordering::SeqCst) == 0 {
             break;
+        }
+        let stopper = STOPPER.load(Ordering::Acquire);
+        if stopper != 0 {
+            let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(stopper)), 1);
+        }
+        while place.load(Ordering::SeqCst) == raw && STOPPING.load(Ordering::SeqCst) != 0 {
+            if sys::receive(&channel).is_err() {
+                let _ = sys::yield_now();
+            }
         }
     }
     let _ = place.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Acquire);
@@ -1048,6 +1057,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
                 unsafe { upcall::enable() }.expect("nested signal entry");
             }
             unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
+            block.handled.fetch_add(1, Ordering::SeqCst);
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }
@@ -1065,6 +1075,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
                 unsafe { upcall::enable() }.expect("nested signal entry");
             }
             unsafe { callback(signal) };
+            block.handled.fetch_add(1, Ordering::SeqCst);
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }

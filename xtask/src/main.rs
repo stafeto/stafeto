@@ -2064,7 +2064,7 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: fork with the layer bound",
         "posix-procs: a forked child execs ls",
         "posix-procs: ash -c ran /bin/ls",
-        "posix-procs: 40 forks of a parent with five threads",
+        "posix-procs: 40 forks of a parent with six threads",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
