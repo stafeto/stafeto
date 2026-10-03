@@ -152,6 +152,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pipe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-pipe",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "posix-abi"
 version = "0.1.0"
 dependencies = [
@@ -450,6 +461,14 @@ dependencies = [
 
 [[package]]
 name = "proto-loader"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-wire",
+]
+
+[[package]]
+name = "proto-pipe"
 version = "0.1.0"
 dependencies = [
  "abi",

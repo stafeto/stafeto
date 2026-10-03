@@ -43,6 +43,9 @@ const SVC_STACK_SIZE: u32 = 16 * 1024;
 /// image (services/ramfs/src/tree.rs) on top of the start data, and its
 /// loop holds the table of its sessions.
 const RAMFS_STACK_SIZE: u32 = 48 * 1024;
+/// The pipe service's stack: its state (the pipes, the long operations,
+/// the clones) lies in its `.bss`, and a request copies up to 1 KiB.
+const PIPE_STACK_SIZE: u32 = 32 * 1024;
 /// The stacks of the UART driver (services/uart) and of the shell
 /// (apps/shell), which init's loader maps.
 const UART_STACK_SIZE: u32 = 16 * 1024;
@@ -363,9 +366,10 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
 /// The probe of POSIX processes (5b) and the services it needs, the loader
 /// and BusyBox with its applets, which the table of files names (5c): the
 /// probe's children are files of it.
-const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_PROCS_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -381,9 +385,10 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
 /// The probe of the longest step of the process service (xtask
 /// process-steps): the probe in its steps mode, and the process service
 /// that prints each new longest step.
-const POSIX_STEPS_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_STEPS_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-steps"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps"]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &["steps"]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -2044,6 +2049,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         return Err("an old image set the clock with its record's new rights".into());
     }
     for marker in [
+        // The pipe service (5e) registered with init.
+        "pipe: ready",
         "posix-procs: a child inherits the mask and SIG_IGN",
         "posix-procs: a thread took SIGUSR1 after main left",
         "posix-procs: the last thread ran atexit",
@@ -2796,6 +2803,10 @@ fn host_tests() -> Result<(), String> {
         "proto-wire",
         "--package",
         "proto-clock",
+        "--package",
+        "proto-pipe",
+        "--package",
+        "pipe",
         "--package",
         "shell",
         "--package",
@@ -4380,6 +4391,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "proto-clock",
         "--package",
+        "proto-pipe",
+        "--package",
         "proto-loader",
         "--package",
         "xtask",
@@ -4396,6 +4409,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "init",
         "--package",
         "ramfs",
+        "--package",
+        "pipe",
         "--package",
         "shell",
         "--package",
@@ -4448,6 +4463,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "proto-clock",
         "--package",
+        "proto-pipe",
+        "--package",
         "rt",
         "--package",
         "posix-fs",
@@ -4485,6 +4502,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "init",
         "--package",
         "ramfs",
+        "--package",
+        "pipe",
         "--package",
         "shell",
         "--package",

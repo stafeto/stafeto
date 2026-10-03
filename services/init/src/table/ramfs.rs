@@ -233,10 +233,23 @@ pub const RELIBC_TABLE: &[Record] = &[
     },
 ];
 
+/// The pipe service (5e), beside the RAM file service at its level: its
+/// segments, a stack of 32 KiB, the 64 rings of 4 KiB and the tables of
+/// its 320 sessions, 256 births and 128 long operations in `.bss`; a
+/// handle for each long operation that waits.
+pub const PIPE: Record = Record {
+    name: "pipe",
+    program: "pipe",
+    quota: 160 * PAGE,
+    handle_limit: 192,
+    restart: Restart::Never,
+    ..TABLE[0]
+};
+
 /// The probe of POSIX processes (tests/posix-procs): the RAM files, the
-/// process and clock services and the probe, whose children start from
-/// files (5c): the table has the pool for 33 of them and holds no record
-/// of theirs.
+/// pipes, the process and clock services and the probe, whose children
+/// start from files (5c): the table has the pool for 33 of them and holds
+/// no record of theirs.
 pub const POSIX_PROCS_TABLE: &[Record] = &[
     TABLE[0],
     Record {
@@ -247,6 +260,7 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],
+    PIPE,
     Record {
         name: "posix-procs",
         program: "posix-procs",
@@ -277,6 +291,7 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
         quota: 192 * PAGE,
         ..POSIX_ABI_TABLE[2]
     },
+    PIPE,
     Record {
         name: "posix-procs",
         program: "posix-procs",

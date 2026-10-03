@@ -1473,7 +1473,7 @@ mod tests {
         );
         assert_eq!(
             order_of(ramfs::POSIX_PROCS_TABLE),
-            ["ramfs", "posix", "clock", "posix-procs"]
+            ["ramfs", "posix", "clock", "pipe", "posix-procs"]
         );
         for table in [ramfs::RTBENCH_POSIX_TABLE, vz::RTBENCH_POSIX_TABLE] {
             assert_eq!(
