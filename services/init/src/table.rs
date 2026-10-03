@@ -1716,6 +1716,7 @@ mod tests {
                     "os-test-run",
                     "rtbench-posix",
                     "posix-random",
+                    "posix-pty",
                 ]
                 .contains(&r.program)
             });
