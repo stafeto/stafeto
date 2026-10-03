@@ -627,3 +627,34 @@ nothing to the client's delay. No step allocates memory: the
 rings, the descriptions, the sessions and the waiters live in the
 service's `.bss`. The kernel did not change, and B stays 20,536. Details
 are in [notes/m5e-pipes.md](../notes/m5e-pipes.md).
+
+### Terminal control with live clients
+
+`cargo xtask posix-tty-control-steps` uses a PTY in memory and sixteen live
+clients of the terminal service. The quiet feature collects the full
+service interval from the return of receive through reply and dispatch;
+decode, identity checks and synchronous process-service requests are
+included. All five snapshots are read before any measurement is printed.
+The diagnostic group-scan print is disabled by this quiet feature.
+
+There are two phases. Fifteen existing members stay alive for the
+leader's first Acquire. The accepted late-attach rule keeps their absent
+personal controlling-terminal pair; the probe checks that result.
+After they are reaped, fifteen new members inherit the pair and exercise
+SetPgrp, GetPgrp, GetSid and Controlling while all sixteen clients remain
+alive. Pipe gates keep at most eight waiting readers per pipe. The
+maxima persist across both phases. The C probe uses `-fno-builtin`.
+
+On integrated wiring `11275b9`, all complete intervals remain below B=20,538:
+
+| Terminal method | Full interval under -icount |
+|---|---:|
+| Acquire (16) | 7,410 |
+| SetPgrp (17) | 3,506 |
+| GetPgrp (18) | 3,440 |
+| GetSid (19) | 9,600 |
+| Controlling (20) | 3,389 |
+
+Omitting Controlling deliberately produces a zero snapshot and fails the
+probe. The restored probe passes. Its log is
+`target/measure/posix-tty-control-steps.log`; the command is a CI gate.

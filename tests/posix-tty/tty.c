@@ -910,7 +910,23 @@ static int run(void) {
     return 0;
 }
 
+#ifdef STAFETO_QUIET_CONTROL
+#include "quiet.c"
+#endif
+
 int main(int argc, char **argv) {
+#ifdef STAFETO_QUIET_CONTROL
+    if (argc == 2 && strcmp(argv[1], "quiet-run") == 0) return quiet_run();
+    if (argc == 1) {
+        char *args[] = {"posix-tty", "quiet-run", NULL};
+        char *env[] = {NULL};
+        pid_t pid;
+        CHECK(posix_spawn(&pid, "/bin/posix-tty", NULL, NULL, args, env) == 0);
+        int status;
+        CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status));
+        return WEXITSTATUS(status);
+    }
+#endif
     if (argc == 4 && strcmp(argv[1], "terminal-child") == 0) return terminal_child(atoi(argv[2]), atoi(argv[3]), 1);
     if (argc == 4 && strcmp(argv[1], "terminal-exec") == 0) return terminal_child(atoi(argv[2]), atoi(argv[3]), 0);
     if (argc == 4 && strcmp(argv[1], "spawned") == 0) return spawned(atoi(argv[2]), atoi(argv[3]));

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Compiles tty.c with relibc's headers and links relibc's libc.a, both
+//! Compiles pty.c with relibc's headers and links relibc's libc.a, both
 //! from the sysroot tools/build-relibc.py builds (cargo xtask relibc).
 
 use std::env;
@@ -14,8 +14,7 @@ fn run(cmd: &mut Command) {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=tty.c");
-    println!("cargo:rerun-if-changed=quiet.c");
+    println!("cargo:rerun-if-changed=pty.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     let manifest =
@@ -32,7 +31,7 @@ fn main() {
     let target = env::var("TARGET").expect("Cargo sets TARGET");
     assert_eq!(
         target, "aarch64-unknown-none",
-        "posix-tty is a guest program"
+        "posix-pty is a guest program"
     );
     let lib = sysroot.join("lib");
     assert!(
@@ -61,19 +60,14 @@ fn main() {
             "-isystem",
         ])
         .arg(sysroot.join("include"))
-        .args(if env::var_os("CARGO_FEATURE_QUIET_CONTROL").is_some() {
-            vec!["-DSTAFETO_QUIET_CONTROL"]
-        } else {
-            vec![]
-        })
-        .args(["-c", "tty.c", "-o"])
-        .arg(out.join("tty.o")));
+        .args(["-c", "pty.c", "-o"])
+        .arg(out.join("pty.o")));
     run(Command::new(tools.join("llvm-ar"))
         .arg("crs")
-        .arg(out.join("libposixtty.a"))
-        .arg(out.join("tty.o")));
+        .arg(out.join("libposixpty.a"))
+        .arg(out.join("pty.o")));
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-search=native={}", lib.display());
-    println!("cargo:rustc-link-lib=static=posixtty");
+    println!("cargo:rustc-link-lib=static=posixpty");
     println!("cargo:rustc-link-lib=static=c");
 }
