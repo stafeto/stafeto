@@ -436,7 +436,10 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
         &["ash-probe"],
     ),
 ];
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 6] = [
+/// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
+/// through the process service and the loader, the way every child starts
+/// (5d); the files of /bin are BusyBox's applets build.
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -447,6 +450,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 6] = [
         &[],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
     (
         "busybox-probe",
         "busybox-probe",
@@ -891,8 +895,8 @@ commands:
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
-  os-test [--jobs N] run os-test's io, malloc, signal and basic spawn and exec
-            tests on relibc, a boot a suite with the tests started from
+  os-test [--jobs N] run os-test's io, malloc, process, signal and basic spawn,
+            exec and fork tests on relibc, a boot a suite with the tests started from
             files, N boots at a time;
             the table goes to target/measure/os-test.txt; fails when a
             test of tests/os-test/pass.txt does not pass; with
@@ -2323,9 +2327,10 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "3", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "3", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "3", "ls", busybox),
+        ("-rwxr-xr-x", "4", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "4", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "4", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "4", "ls", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
@@ -2355,7 +2360,7 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("dr-xr-xr-x", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         // The files of the boot image's table: the modes and the sizes of
-        // the ELF files (three links of BusyBox, a set-user-ID file), one
+        // the ELF files (four names of BusyBox, a set-user-ID file), one
         // command each.
         for (mode, links, name, size) in &bin_listing {
             let command = format!("ls -l /bin/{name}");
@@ -2382,11 +2387,46 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("le /?", DIALOG_STEP)?;
         run.expect("ash: le: not found", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
-        // A command with a path is no applet: ash forks for it, which
-        // stafeto refuses (ENOSYS until 5b), and the shell goes on.
+        // A command with a path is no applet: ash forks for it (5d) and
+        // the child execs the file. A file that is missing ends the child
+        // with 127 and the shell goes on.
         run.send("/bin/x")?;
         run.expect("/bin/x", DIALOG_STEP)?;
-        run.expect("ash: can't fork: Function not implemented", DIALOG_STEP)?;
+        run.expect("ash: /bin/x: not found", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo $?")?;
+        run.expect("echo $?", DIALOG_STEP)?;
+        run.expect_line("127", |line| line == "127", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // External programs: fork and exec of a file of /bin, alone, in a
+        // list and with a status.
+        run.send("/bin/ls -la")?;
+        run.expect("/bin/ls -la", DIALOG_STEP)?;
+        run.expect("dr-xr-xr-x", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ls -1 /etc")?;
+        run.expect("/bin/ls -1 /etc", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo hi && ls -1 /etc")?;
+        run.expect("echo hi && ls -1 /etc", DIALOG_STEP)?;
+        run.expect_line("hi", |line| line == "hi", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo hi && /bin/ls -1 /etc")?;
+        run.expect("echo hi && /bin/ls -1 /etc", DIALOG_STEP)?;
+        run.expect_line("hi", |line| line == "hi", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ash -c 'exit 3'")?;
+        run.expect("/bin/ash -c 'exit 3'", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo $?")?;
+        run.expect("echo $?", DIALOG_STEP)?;
+        run.expect_line("3", |line| line == "3", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ash -c '/bin/ash -c \"exit 4\"; echo inner $?'")?;
+        run.expect_line("inner 4", |line| line == "inner 4", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("ls /missing")?;
         run.expect("ls /missing", DIALOG_STEP)?;

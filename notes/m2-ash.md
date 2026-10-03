@@ -35,6 +35,6 @@ For a manual session, use `cargo xtask ash-shell`. Type `exit` to leave
 The pinned BusyBox build also exposes `ls` to `ash` as an in-process
 applet. `cargo xtask ash-dialog` checks `ls /`, `ls /etc`, `ls -la`,
 `ls --help`, `cd etc`, a missing path, and shell recovery after errors.
-This path runs without `fork`; launching a separate ELF program still
-needs a runtime process service. The UART input is byte-oriented, so
+Since 5d the dialog's `ash` is a POSIX process started from `/bin/ash`
+and runs the files of `/bin` through `fork` and `exec`. The UART input is byte-oriented, so
 arrow-key editing and terminal control remain future work.

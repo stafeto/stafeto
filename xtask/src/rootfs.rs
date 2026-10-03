@@ -148,11 +148,13 @@ fn ramfs() -> Vec<RootFile> {
     ]
 }
 
-/// The shell's image: BusyBox with its applet names as hard links, and the
-/// service as a set-user-ID file of another owner.
+/// The shell's image: BusyBox with its applet names (the shell, `ash`,
+/// among them) as hard links, and the service as a set-user-ID file of
+/// another owner.
 fn dialog() -> Vec<RootFile> {
     vec![
         dir("/bin"),
+        file("/bin/ash", 0o755, ROOT, "busybox-probe"),
         file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),

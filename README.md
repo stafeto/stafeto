@@ -61,8 +61,10 @@ service loops and starts children through a start protocol.
 crashes the driver, `init` restarts it and the shell reconnects. Separate
 images run BusyBox 1.37.0 against the RAM file service: `cat`, `ash -c`
 and an interactive `ash` on the UART with `echo` and `ls -la`. BusyBox
-links statically with relibc over the Rust POSIX layer; `ash` reports
-`can't fork` for commands outside BusyBox until `fork` comes.
+links statically with relibc over the Rust POSIX layer. The dialog's
+`ash` is a POSIX process started from `/bin/ash`; it forks and execs the
+files of `/bin` (`/bin/ls -la`, `/bin/ash -c 'exit 3'`). Pipes (`|`) come
+in 5e, the terminal and job control in 5f.
 
 **POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
 interface. The C library is relibc (a fork pinned by
@@ -112,11 +114,12 @@ is not there yet; [notes/m5b-processes.md](notes/m5b-processes.md) and
 
 **C library.** relibc (MIT) is the C library of every POSIX program,
 BusyBox included; its platform is the layer's `stafeto_*` functions.
-os-test's io, malloc, signal, `basic/spawn` and `basic/unistd` `exec*`
-suites run on it in `ci` from files, one boot a suite: 63 pass, 48 fail
-(`mkstemp`, `access`, `sigaltstack`: the RAM service creates no file yet)
-and 9 need `fork` or pipes; `ci` fails when a test that passed stops
-passing. relibc
+os-test's io, malloc, process and signal suites, `basic/spawn`, `basic/unistd`
+`exec*` and the `basic` tests that call `fork` run on it in `ci` from files,
+one boot a suite: 78 pass, 74 fail (`mkstemp`, `access`, `sigaltstack`,
+`posix_openpt`, `setpgid` of a child: the RAM service creates no file yet
+and the terminal and job control wait for 5f) and 26 need pipes (5e); `ci`
+fails when a test that passed stops passing. relibc
 builds at its own level 3: user-space programs have no size limit, only
 the kernel has one. Details are in
 [docs/status.md](docs/status.md).
