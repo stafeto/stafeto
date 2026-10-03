@@ -255,9 +255,9 @@ fn page_word(signal: i32) -> &'static AtomicU64 {
         &p.pending
     }
 }
-fn claim_page(signal: i32) -> Option<u64> {
+fn claim_page(signal: i32, ticket: u64) -> Option<u64> {
     if proto_process::job::class(signal as u8).is_some() {
-        proto_process::job::take(page_word(signal), page_word(signal), signal as u8)
+        proto_process::job::take_ticket(page_word(signal), page_word(signal), signal as u8, ticket)
     } else {
         let bit = posix_signals::bit(signal).ok()?;
         (page_word(signal).fetch_and(!bit, Ordering::AcqRel) & bit != 0).then_some(0)
@@ -312,7 +312,7 @@ fn process_origin(block: &Block, signal: i32, ticket: u64) -> bool {
 /// The information of process signal `signal` on the page, read again
 /// until the bit stayed while it was read (the service writes it before
 /// the bit).
-fn page_info(signal: i32) -> Option<SigInfo> {
+fn page_info(signal: i32) -> Option<(u64, SigInfo)> {
     let page = crate::process::page();
     let bit = posix_signals::bit(signal).ok()?;
     let slot = &page.info[signal as usize - 1];
@@ -332,7 +332,8 @@ fn page_info(signal: i32) -> Option<SigInfo> {
             si_value: 0,
         };
         if page_word(signal).load(Ordering::Acquire) == before {
-            return Some(info);
+            let ticket = proto_process::job::class(signal as u8).map_or(0, |c| before & !c.low);
+            return Some((ticket, info));
         }
     }
 }
@@ -485,6 +486,7 @@ fn give_back(block: &Block, bits: u64) -> Result<(), i32> {
             }
             continue;
         }
+        let _guard = INFO_LOCK.lock();
         let slot = &p.info[signal as usize - 1];
         if process_pending() & bit == 0 {
             slot.code.store(info.si_code, Ordering::Relaxed);
@@ -564,11 +566,11 @@ pub(crate) fn route() {
             if thread_pending(block) & bit != 0 {
                 return;
             }
-            let Some(info) = page_info(signal) else {
+            let Some((ticket, info)) = page_info(signal) else {
                 entry = Some(None);
                 return;
             };
-            let Some(ticket) = claim_page(signal) else {
+            let Some(ticket) = claim_page(signal, ticket) else {
                 // Another thread took it meanwhile.
                 entry = Some(None);
                 return;
@@ -592,8 +594,21 @@ pub(crate) fn route() {
 /// Takes `signal` from the process's page for a thread in sigwait: its
 /// information, or None when it no longer waits there.
 fn take_from_page(signal: i32) -> Option<SigInfo> {
-    let info = page_info(signal)?;
-    claim_page(signal).map(|_| info)
+    let guard = INFO_LOCK.lock();
+    let (ticket, info) = page_info(signal)?;
+    let hook = LOCAL_CLAIM_WINDOW.swap(0, Ordering::AcqRel);
+    let _guard = if hook == 0 {
+        guard
+    } else {
+        // The probe changes the page between its snapshot and claim. Its RPC
+        // runs after releasing INFO; the captured job epoch remains required.
+        drop(guard);
+        // SAFETY: probe_local_claim_window stores this C function signature.
+        let run = unsafe { core::mem::transmute::<usize, extern "C" fn(i32)>(hook) };
+        run(signal);
+        INFO_LOCK.lock()
+    };
+    claim_page(signal, ticket).map(|_| info)
 }
 
 /// The process signals that wait on the page come to the threads that let
@@ -1607,10 +1622,10 @@ pub fn probe_assign_signal(signal: i32) -> i32 {
     if thread_pending(own()) & bit != 0 {
         return EAGAIN;
     }
-    let Some(info) = page_info(signal) else {
+    let Some((ticket, info)) = page_info(signal) else {
         return EAGAIN;
     };
-    let Some(ticket) = claim_page(signal) else {
+    let Some(ticket) = claim_page(signal, ticket) else {
         return EAGAIN;
     };
     keep_taken(own(), signal, &info);

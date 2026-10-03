@@ -213,9 +213,41 @@ static void job_local_claim_information(void) {
     expect("local claim unblock", sigprocmask(SIG_UNBLOCK, &signals, NULL), 0);
 }
 
+static int page_info_gate[2];
+static pid_t page_info_sender;
+static void page_info_replace(int signal_number) {
+    expect("page info cancel old epoch", kill(getpid(), SIGCONT), 0);
+    expect("page info release new sender", write(page_info_gate[1], "s", 1), 1);
+    reap("page info new sender exits", page_info_sender, 0, 0);
+    (void)signal_number;
+}
+static void page_info_epoch_test(void) {
+    sigset_t signals;
+    job_set(&signals);
+    expect("page info block jobs", sigprocmask(SIG_BLOCK, &signals, NULL), 0);
+    expect("page info gate", pipe(page_info_gate), 0);
+    pid_t parent = getpid();
+    page_info_sender = fork();
+    if (page_info_sender == 0) {
+        char byte;
+        if (read(page_info_gate[0], &byte, 1) != 1) _exit(1);
+        _exit(kill(parent, SIGTSTP) == 0 ? 0 : 2);
+    }
+    expect("page info sender exists", page_info_sender > 0, 1);
+    expect("page info first sender", kill(parent, SIGTSTP), 0);
+    stafeto_probe_local_claim(page_info_replace);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    expect("page info take replacement", sigtimedwait(&signals, &info, &zero), SIGTSTP);
+    expect("page info replacement sender", info.si_pid, page_info_sender);
+    close(page_info_gate[0]); close(page_info_gate[1]);
+    expect("page info unblock jobs", sigprocmask(SIG_UNBLOCK, &signals, NULL), 0);
+}
+
 static int job_control(void) {
     expect("zero thread return", stafeto_probe_zero_return(), 0);
     expect("linked job-control group", setpgid(0, 0), 0);
+    page_info_epoch_test();
     sigset_t jobs, pending, chld;
     job_set(&jobs);
     expect("block job signals", sigprocmask(SIG_BLOCK, &jobs, NULL), 0);
