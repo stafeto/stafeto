@@ -18,10 +18,10 @@
 //!   stack and start area, all paid by the new process; reply 0 for "the
 //!   image is ready", or one of the codes below.
 //! - Handles: body the slot of each handle u32 (`Slot::Files`, `Clock`,
-//!   `Driver`, `Pipes`, `Terminal`, each once over all Handles) and as many
+//!   `Driver`, `Pipes`, `Terminal`, `Entropy`, each once over all Handles) and as many
 //!   handles, sessions with SEND, after "the image is ready" (after Fork for
 //!   a copy); reply its status. One message takes abi::MESSAGE_HANDLES
-//!   handles at most: a fifth session goes in a second Handles.
+//!   handles at most: additional sessions goes in a second Handles.
 //! - Fork, in place of Start (spec 2, 3.2; 5d): body `Fork`, the copy of
 //!   the parent's memory the loader makes for a `fork`; reply its status,
 //!   BAD_SIZE past REGIONS_MAX regions or a second Fork or Start.
@@ -109,6 +109,10 @@ pub enum Names {
     /// child's session in the slot Terminal serves (5f); the loader takes
     /// the kind only with that session.
     Terminal(u32),
+    /// The open description of this number of a random device (5e'), in
+    /// the same session of the RAM file service as `File`; the child's
+    /// layer serves its reads from its own generator.
+    Random(u32),
 }
 
 /// A descriptor the child starts with.
@@ -127,6 +131,7 @@ impl Descriptor {
             Names::File(n) => (3, n),
             Names::Pipe(n) => (4, n),
             Names::Terminal(n) => (5, n),
+            Names::Random(n) => (6, n),
         };
         let mut out = [0; DESCRIPTOR];
         out[..4].copy_from_slice(&self.fd.to_le_bytes());
@@ -147,6 +152,7 @@ impl Descriptor {
             (3, n) => Names::File(n),
             (4, n) => Names::Pipe(n),
             (5, n) => Names::Terminal(n),
+            (6, n) => Names::Random(n),
             _ => return None,
         };
         ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
@@ -250,7 +256,7 @@ impl TerminalOpen {
 
 /// The handles of the start area, by their place in `Start::handles`; the
 /// sessions the parent gives with Handles are Files, Clock, Driver (the
-/// console's driver), Pipes (5e) and Terminal (the terminal service, 5f).
+/// console's driver), Pipes (5e) Terminal (the terminal service, 5f), and Entropy (5e').
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Slot {
@@ -264,23 +270,25 @@ pub enum Slot {
     Console = 7,
     Pipes = 8,
     Terminal = 9,
+    Entropy = 10,
 }
 
 /// The handles a start area names.
-pub const SLOTS: usize = 10;
+pub const SLOTS: usize = 11;
 
 impl Slot {
     /// The sessions Handles brings, in their order.
-    pub const GIVEN: [Slot; 5] = [
+    pub const GIVEN: [Slot; 6] = [
         Slot::Files,
         Slot::Clock,
         Slot::Driver,
         Slot::Pipes,
         Slot::Terminal,
+        Slot::Entropy,
     ];
 
     /// The slot of a handle Handles brings: Files, Clock, Driver, Pipes or
-    /// Terminal.
+    /// Terminal or Entropy.
     pub const fn given(n: u32) -> Option<Slot> {
         match n {
             4 => Some(Slot::Files),
@@ -288,6 +296,7 @@ impl Slot {
             6 => Some(Slot::Driver),
             8 => Some(Slot::Pipes),
             9 => Some(Slot::Terminal),
+            10 => Some(Slot::Entropy),
             _ => None,
         }
     }
@@ -647,7 +656,7 @@ pub struct Start {
     pub alarm: u64,
     pub map: u64,
     /// Zero: the initial stack after the header stays on 16 bytes.
-    pub reserved: [u64; 2],
+    pub reserved: u64,
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
@@ -794,7 +803,7 @@ pub fn write_area(
         timers: block.carried.timers,
         alarm: block.carried.alarm,
         map: at + maps_at as u64,
-        reserved: [0; 2],
+        reserved: 0,
     };
     // SAFETY: Start is repr(C) of integers and bytes with no padding
     // (START_SIZE is the sum of its fields), so its bytes are its value.
@@ -1243,7 +1252,14 @@ mod tests {
             handle_slots(Reader::new(w.as_bytes()), 1),
             Ok([Some(Slot::Terminal), None, None, None])
         );
+        let w = body(&[10]);
+        assert_eq!(
+            handle_slots(Reader::new(w.as_bytes()), 1),
+            Ok([Some(Slot::Entropy), None, None, None])
+        );
         for (slots, count) in [
+            (&[11][..], 1),
+            (&[10, 10][..], 2),
             (&[4, 5, 6, 8, 5][..], 5),
             (&[8, 8][..], 2),
             (&[4, 4][..], 2),
@@ -1325,7 +1341,7 @@ mod tests {
             let read = Block::read(&out[..len]).unwrap();
             let at = START_AREA;
             let mut area = vec![0xAA; area_len(&read)];
-            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10];
+            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11];
             write_area(&mut area, at, &read, SECURE, handles, &[]).unwrap();
             assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles, &[]).is_err());
             let start = Start::read(&area).unwrap();
@@ -1385,6 +1401,10 @@ mod tests {
                 fd: 6,
                 names: Names::Terminal(0),
             },
+            Descriptor {
+                fd: 7,
+                names: Names::Random(11),
+            },
         ];
         let mut out = vec![0; BLOCK_MAX];
         let argv: [&[u8]; 1] = [b"ls"];
@@ -1429,9 +1449,9 @@ mod tests {
         let mut area = vec![0; area_len(&read)];
         write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
-        assert_eq!(start.descriptor_count, 4);
+        assert_eq!(start.descriptor_count as usize, list.len());
         let at = (start.descriptors - START_AREA) as usize;
-        let back: Vec<_> = area[at..at + 4 * DESCRIPTOR]
+        let back: Vec<_> = area[at..at + list.len() * DESCRIPTOR]
             .as_chunks::<DESCRIPTOR>()
             .0
             .iter()
@@ -1750,7 +1770,7 @@ mod tests {
                 handle: 100 + i,
             })
             .collect();
-        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10];
+        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11];
         let mut out = vec![0xAA; TRANSFER_SIZE];
         write_transfer(&mut out, handles, &map).unwrap();
         let t = Transfer::read(&out).unwrap();

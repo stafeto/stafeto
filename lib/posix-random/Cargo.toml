@@ -1,0 +1,11 @@
+[package]
+name = "posix-random"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later WITH GCC-exception-3.1"
+description = "ChaCha20 and a generator with fast key erasure for the entropy service and the stafeto POSIX layer"
+
+[lib]
+bench = false

@@ -493,6 +493,17 @@ impl Service<0> for Fs {
                     return Answer::Status(Status::BadSize);
                 };
                 match self.ram.open(&mut s.data, path, flags) {
+                    Ok(fd) if self.ram.is_random(&s.data, fd) => {
+                        let w = r.reply();
+                        if w.u32(0)
+                            .and_then(|()| w.u32(fd))
+                            .and_then(|()| w.u32(proto_fs::RANDOM_DEVICE))
+                            .is_err()
+                        {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
                     Ok(fd) => value(r, fd),
                     Err(code) => status(code),
                 }

@@ -29,9 +29,30 @@ const MOTD: &[u8] = b"stafeto ramfs\n";
 const IMAGE_INODE: u64 = 6;
 /// The path of the entry of the table that is the null device.
 const NULL_DEVICE: &str = "/dev/null";
+/// The paths of the entries of the table that are the random devices (5e'):
+/// the layer of the client reads them from its own generator, the service
+/// only keeps the descriptions (writes are accepted and dropped).
+const RANDOM_DEVICES: [&str; 2] = ["/dev/random", "/dev/urandom"];
 
 pub const DIR: u32 = 1;
 pub const REG: u32 = 2;
+/// A character device: the null and the random devices.
+pub const CHAR: u32 = 3;
+
+/// What entry `n` of the table is: a directory, a device by its path, or a
+/// regular file.
+fn image_file(tree: &Tree<'_>, n: u16) -> File {
+    let path = tree.entry(n).path;
+    if tree.entry(n).is_directory() {
+        File::ImageDir(n)
+    } else if path == NULL_DEVICE {
+        File::Null(n)
+    } else if RANDOM_DEVICES.contains(&path) {
+        File::Random(n)
+    } else {
+        File::ImageRegular(n)
+    }
+}
 
 pub fn directory_entry(path: &str, index: u32) -> Result<Option<(&'static str, u32)>, u32> {
     let entries: &[(&str, u32)] = match path {
@@ -148,6 +169,10 @@ enum File {
     /// The entry `/dev/null` of the table: writes are accepted and
     /// dropped, reads are at the end of the file.
     Null(u16),
+    /// The entries `/dev/random` and `/dev/urandom` of the table: writes
+    /// are accepted and dropped; the bytes of a read come from the
+    /// client's layer, so the service refuses to read them.
+    Random(u16),
 }
 
 #[derive(Clone, Copy)]
@@ -217,6 +242,22 @@ impl File {
         matches!(self, Self::Root | Self::Etc | Self::Tmp | Self::ImageDir(_))
     }
 
+    /// A character device: writes are dropped, and it has no contents.
+    fn is_device(self) -> bool {
+        matches!(self, Self::Null(_) | Self::Random(_))
+    }
+
+    /// The kind of the file as the protocol numbers it.
+    fn kind(self) -> u32 {
+        if self.is_directory() {
+            DIR
+        } else if self.is_device() {
+            CHAR
+        } else {
+            REG
+        }
+    }
+
     /// The place of a file of the fixed tree among its times; the files of
     /// the image are read-only and keep the time the service started.
     fn index(self) -> Option<usize> {
@@ -226,7 +267,7 @@ impl File {
             Self::Tmp => Some(2),
             Self::Motd => Some(3),
             Self::Scratch => Some(4),
-            Self::ImageDir(_) | Self::ImageRegular(_) | Self::Null(_) => None,
+            Self::ImageDir(_) | Self::ImageRegular(_) | Self::Null(_) | Self::Random(_) => None,
         }
     }
 }
@@ -377,15 +418,16 @@ impl<'a> Ram<'a> {
             _ => {
                 let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
                 let n = tree.find(path).ok_or(NO_ENTRY)?;
-                if tree.entry(n).is_directory() {
-                    File::ImageDir(n)
-                } else if tree.entry(n).path == NULL_DEVICE {
-                    File::Null(n)
-                } else {
-                    File::ImageRegular(n)
-                }
+                image_file(tree, n)
             }
         })
+    }
+
+    /// Whether the description `fd` is a random device, whose reads the
+    /// client's layer serves.
+    pub fn is_random(&self, fds: &Fds, fd: u32) -> bool {
+        self.get(fds, fd)
+            .is_ok_and(|open| matches!(open.file, File::Random(_)))
     }
 
     pub fn open(&mut self, fds: &mut Fds, path: &str, flags: u32) -> Result<u32, u32> {
@@ -401,7 +443,7 @@ impl<'a> Ram<'a> {
             Err(NO_ENTRY) if changes => return Err(proto_fs::INVALID_ARGUMENT),
             found => found?,
         };
-        if changes && !matches!(file, File::Null(_)) {
+        if changes && !file.is_device() {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         if file.is_directory() && flags != READ_ONLY {
@@ -436,7 +478,7 @@ impl<'a> Ram<'a> {
             File::Tmp => 3,
             File::Motd => 4,
             File::Scratch => 5,
-            File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) => {
+            File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) | File::Random(n) => {
                 IMAGE_INODE + u64::from(self.tree().canonical(n))
             }
         }
@@ -541,9 +583,9 @@ impl<'a> Ram<'a> {
     fn node_information(&self, file: File) -> NodeInfo {
         let size = self.bytes(file).len() as u64;
         let (kind, links, permissions, uid, gid, times) = match file {
-            File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) => {
+            File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) | File::Random(n) => {
                 let entry = self.tree().entry(n);
-                let kind = if file.is_directory() { DIR } else { REG };
+                let kind = file.kind();
                 let times = FileTimes {
                     access: self.born,
                     modify: self.born,
@@ -633,7 +675,7 @@ impl<'a> Ram<'a> {
         if open.flags == WRITE_ONLY {
             return Err(BAD_FD);
         }
-        if i64::try_from(offset).is_err() {
+        if i64::try_from(offset).is_err() || matches!(open.file, File::Random(_)) {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         let bytes = self.bytes(open.file);
@@ -757,7 +799,7 @@ impl<'a> Ram<'a> {
                 if let Some(&(name, file)) = fixed.get(index) {
                     return Some(DirectoryRecord {
                         name,
-                        kind: if file.is_directory() { DIR } else { REG },
+                        kind: file.kind(),
                         inode: self.inode(file),
                     });
                 }
@@ -768,14 +810,10 @@ impl<'a> Ram<'a> {
                     _ => return None,
                 };
                 let n = *tree.children(parent).get(index - fixed.len())?;
-                let file = if tree.entry(n).is_directory() {
-                    File::ImageDir(n)
-                } else {
-                    File::ImageRegular(n)
-                };
+                let file = image_file(&tree, n);
                 Some(DirectoryRecord {
                     name: name_of(&tree, n),
-                    kind: if file.is_directory() { DIR } else { REG },
+                    kind: file.kind(),
                     inode: self.inode(file),
                 })
             }
@@ -798,17 +836,20 @@ impl<'a> Ram<'a> {
 
     pub fn lookup(&self, path: &str) -> Result<Metadata, u32> {
         let file = self.resolve(path)?;
-        let (kind, size) = if file.is_directory() {
-            (DIR, 0)
-        } else {
-            (REG, self.bytes(file).len() as u32)
-        };
-        Ok(Metadata { kind, size })
+        Ok(Metadata {
+            kind: file.kind(),
+            size: self.bytes(file).len() as u32,
+        })
     }
 
     fn bytes(&self, file: File) -> &[u8] {
         match file {
-            File::Root | File::Etc | File::Tmp | File::ImageDir(_) | File::Null(_) => &[],
+            File::Root
+            | File::Etc
+            | File::Tmp
+            | File::ImageDir(_)
+            | File::Null(_)
+            | File::Random(_) => &[],
             File::Motd => MOTD,
             File::Scratch => &self.scratch[..self.len],
             File::ImageRegular(n) => self.tree().data(n),
@@ -872,6 +913,9 @@ impl<'a> Ram<'a> {
         if open.flags == WRITE_ONLY {
             return Err(BAD_FD);
         }
+        if matches!(open.file, File::Random(_)) {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
         let bytes = self.bytes(open.file);
         let start = open.offset.min(bytes.len() as i64) as usize;
         let n = out.len().min(bytes.len() - start);
@@ -889,7 +933,7 @@ impl<'a> Ram<'a> {
         if open.flags == READ_ONLY || matches!(open.file, File::Motd | File::ImageRegular(_)) {
             return Err(BAD_FD);
         }
-        if bytes.is_empty() || matches!(open.file, File::Null(_)) {
+        if bytes.is_empty() || open.file.is_device() {
             return Ok(bytes.len());
         }
         let offset = usize::try_from(open.offset).map_err(|_| NO_SPACE)?;
@@ -1462,6 +1506,61 @@ mod tests {
             ram.open(&mut fds, "/dev/other", WRITE_ONLY),
             Err(proto_fs::ACCESS_DENIED)
         );
+    }
+
+    /// The random devices: the open says so (the layer reads them), a
+    /// write is dropped, the service refuses to read or pread them, the
+    /// size stays zero, and `/dev/null` and the two are character devices
+    /// by `lookup`, `information` and the directory.
+    #[test]
+    fn the_random_devices_are_characters_the_layer_reads() {
+        let bytes = test_image(&[
+            entry("/dev", DIRECTORY | 0o755, 0),
+            entry("/dev/null", REGULAR | 0o666, 2),
+            entry("/dev/random", REGULAR | 0o666, 2),
+            entry("/dev/urandom", REGULAR | 0o666, 2),
+            entry("/dev/other", REGULAR | 0o666, 2),
+        ]);
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut fds = Fds::default();
+        for path in ["/dev/random", "/dev/urandom"] {
+            let fd = ram.open(&mut fds, path, READ_WRITE).unwrap();
+            assert!(ram.is_random(&fds, fd), "{path}");
+            assert_eq!(ram.write(&mut fds, fd, b"abc"), Ok(3));
+            assert_eq!(ram.write_at(&mut fds, fd, &[1; 4096], 20), Ok(4096));
+            assert_eq!(ram.size(&fds, fd), Ok(0));
+            let mut out = [9u8; 8];
+            assert_eq!(
+                ram.read(&mut fds, fd, &mut out),
+                Err(proto_fs::INVALID_ARGUMENT)
+            );
+            assert_eq!(
+                ram.pread(&fds, fd, 0, &mut out, 22),
+                Err(proto_fs::INVALID_ARGUMENT)
+            );
+            assert_eq!(out, [9u8; 8], "no byte of the service");
+            assert_eq!(ram.lookup(path).map(|m| m.kind), Ok(CHAR));
+            assert_eq!(ram.information(path).map(|i| i.kind), Ok(CHAR));
+            let cut = ram
+                .open(&mut fds, path, WRITE_ONLY | proto_fs::CHANGES)
+                .unwrap();
+            assert!(ram.is_random(&fds, cut));
+        }
+        let null = ram.open(&mut fds, "/dev/null", READ_ONLY).unwrap();
+        assert!(!ram.is_random(&fds, null));
+        assert_eq!(ram.lookup("/dev/null").map(|m| m.kind), Ok(CHAR));
+        let other = ram.open(&mut fds, "/dev/other", READ_ONLY).unwrap();
+        assert!(!ram.is_random(&fds, other));
+        assert_eq!(ram.lookup("/dev/other").map(|m| m.kind), Ok(REG));
+        let kinds: Vec<(&str, u32)> = (0..8)
+            .filter_map(|i| ram.directory_read_path("/dev", i, 30).unwrap())
+            .map(|r| (r.name, r.kind))
+            .collect();
+        assert!(kinds.contains(&("null", CHAR)), "{kinds:?}");
+        assert!(kinds.contains(&("random", CHAR)), "{kinds:?}");
+        assert!(kinds.contains(&("urandom", CHAR)), "{kinds:?}");
+        assert!(kinds.contains(&("other", REG)), "{kinds:?}");
     }
 
     #[test]

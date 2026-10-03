@@ -108,11 +108,13 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     PIPE,
     Record {
         args: b"ash-launch\0",
-        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
+        connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         quota: DIALOG_QUOTA,
         ..BUSYBOX_TABLE[3]
     },
     TTY,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The quota of the launcher, which the shell and its children get too.
@@ -295,16 +297,20 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
         name: "posix-procs",
         program: "posix-procs",
         args: b"posix-procs\0",
-        connects: &["ramfs", "pipe", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         root: true,
         // A child from a file gets its parent's quota: room for BusyBox.
         quota: PROCS_QUOTA,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The probe of the longest step of the process service (tests/posix-procs
-/// in the steps mode, xtask process-steps): the pool for the crowd of
+/// in the steps mode, xtask process-steps), with the entropy device's
+/// driver and the entropy service at their levels 37 and 36, below the
+/// services at 40 it measures. The pool for the crowd of
 /// children it starts from files, each with the probe's quota, and one
 /// more for the child that execs among them.
 pub const POSIX_STEPS_TABLE: &[Record] = &[
@@ -326,11 +332,13 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
         name: "posix-procs",
         program: "posix-procs",
         args: b"posix-procs\0steps\0",
-        connects: &["ramfs", "pipe", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: STEPS_QUOTA,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The children of the steps probe: its 7 branches with their leaves, 32
@@ -364,11 +372,13 @@ pub const OS_TEST_TABLE: &[Record] = &[
         name: "os-test-run",
         program: "os-test-run",
         args: b"os-test-run\0",
-        connects: &["ramfs", "pipe", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: OS_TEST_QUOTA,
         ..POSIX
     },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The quota of the runner of os-test, which each test it starts gets too.
@@ -434,7 +444,15 @@ pub const RTBENCH: Record = Record {
     name: "rtbench-posix",
     program: "rtbench-posix",
     args: b"rtbench-posix\0",
-    connects: &["ramfs", "clock", "posix", "pipe", "uart", "rtbench-load"],
+    connects: &[
+        "ramfs",
+        "clock",
+        "posix",
+        "pipe",
+        "uart",
+        "rtbench-load",
+        "entropy",
+    ],
     // Room for a heap of 8 MiB, which a child of fork copies (S15).
     quota: 3072 * PAGE,
     handle_limit: 512,
@@ -458,6 +476,8 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     LONG,
     LOAD,
     RTBENCH,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// The process service of rtbench 2: the pool for the children the
@@ -521,5 +541,30 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
         handle_limit: 320,
         quota: 64 * PAGE,
         ..TTY_TABLE[2]
+    },
+];
+
+/// The probe of getentropy and getrandom (tests/posix-random, step 5e'):
+/// the RAM files, the process and clock services, the pipe service, the
+/// entropy device's driver and the entropy service; the probe starts its
+/// own file once, whose copy forks.
+pub const POSIX_RANDOM_TABLE: &[Record] = &[
+    TABLE[0],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 3 * PROCS_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
+    Record {
+        name: "posix-random",
+        program: "posix-random",
+        args: b"posix-random\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        root: true,
+        quota: PROCS_QUOTA,
+        ..POSIX
     },
 ];

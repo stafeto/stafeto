@@ -662,6 +662,7 @@ impl Shadow {
                 posix_fs::Target::Ram(n) => Names::File(n),
                 posix_fs::Target::Pipe(n) => Names::Pipe(n),
                 posix_fs::Target::Tty(n) => Names::Terminal(n),
+                posix_fs::Target::Random(n) => Names::Random(n),
             };
             out[count] = Descriptor {
                 fd: fd as u32,
@@ -676,10 +677,11 @@ impl Shadow {
     fn shared(&self) -> impl Iterator<Item = u32> + Clone + '_ {
         let (list, count) = self.descriptors();
         (0..count).filter_map(move |i| match list[i].names {
-            proto_loader::Names::File(n)
-                if !list[..i]
-                    .iter()
-                    .any(|d| d.names == proto_loader::Names::File(n)) =>
+            proto_loader::Names::File(n) | proto_loader::Names::Random(n)
+                if !list[..i].iter().any(|d| {
+                    matches!(d.names, proto_loader::Names::File(m)
+                        | proto_loader::Names::Random(m) if m == n)
+                }) =>
             {
                 Some(n)
             }
@@ -792,12 +794,12 @@ pub(crate) fn ask_loader(
 }
 
 /// Handles of the sessions `sessions` that are there, by their slots, to
-/// the loader `c`: abi::MESSAGE_HANDLES of them a message, so a fifth goes
+/// the loader `c`: abi::MESSAGE_HANDLES of them a message, so further ones go
 /// in a second Handles. The sessions move whatever comes of it; the
 /// loader's code of the first message that failed, 0 once all went.
-pub(crate) fn give_sessions(
+pub(crate) fn give_sessions<const N: usize>(
     c: &Handle<Channel>,
-    sessions: [(proto_loader::Slot, Option<Handle<Channel>>); 5],
+    sessions: [(proto_loader::Slot, Option<Handle<Channel>>); N],
 ) -> u32 {
     use proto_loader::Method;
     let mut left = sessions
@@ -1245,6 +1247,7 @@ fn move_files(c: &Handle<Channel>) -> bool {
             (Slot::Driver, moved(uart)),
             (Slot::Pipes, moved(pipes)),
             (Slot::Terminal, moved(terminal)),
+            (Slot::Entropy, moved(crate::random::session())),
         ],
     ) == 0
 }
@@ -1353,12 +1356,14 @@ fn commit(
     } else {
         terminal
     };
+    let entropy = crate::fork::entropy_clone();
     let sessions = [
         (Slot::Files, Some(files)),
         (Slot::Clock, Some(clock)),
         (Slot::Driver, uart),
         (Slot::Pipes, pipes),
         (Slot::Terminal, terminal),
+        (Slot::Entropy, entropy),
     ];
     if give_sessions(c, sessions) != 0 {
         return Err(EIO);

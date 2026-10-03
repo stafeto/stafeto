@@ -1,0 +1,17 @@
+[package]
+name = "posix-random-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The C probe of getentropy, getrandom and the generator across fork"
+build = "build.rs"
+
+[[bin]]
+name = "posix-random-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }

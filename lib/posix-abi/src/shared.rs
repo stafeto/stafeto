@@ -216,6 +216,19 @@ fn file_reply(
     }
 }
 
+/// The reply of a read of a random device: bytes of the layer's generator,
+/// no request to a service (the generator waits for its first key, and a
+/// signal handler without SA_RESTART ends that wait with EINTR).
+#[inline(never)]
+fn random_reply(count: u32, out: &mut Writer) -> Result<(), i32> {
+    let mut bytes = [0; posix_fs::MAX_READ];
+    let extent = (count as usize).min(bytes.len());
+    crate::random::fill(&mut bytes[..extent], false)?;
+    let reply = Reply::Bytes(&bytes[..extent]).write(out).map_err(|_| EIO);
+    posix_random::erase(&mut bytes[..extent]);
+    reply
+}
+
 /// The reply of a read of a pipe's read end, its bytes once they came.
 #[inline(never)]
 fn pipe_reply(transport: Transport, end: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
@@ -251,6 +264,7 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
             terminal_reply(transport, proto_tty::CONSOLE, count, &mut *out)
         }
         Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
+        Target::Random(_) => random_reply(count, &mut *out),
         target => file_reply(transport, target, count, &mut *out),
     })
 }
@@ -259,7 +273,7 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
 /// a terminal of the terminal service.
 #[derive(Clone, Copy)]
 enum Opened {
-    File(u32),
+    File(Target),
     /// A terminal, and whether it was opened as /dev/tty.
     Terminal(u32, bool),
 }
@@ -335,7 +349,7 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
     if inserted.is_err()
         && let Opened::File(fd) = opened
     {
-        let _ = transport.release(Some(Target::Ram(fd)));
+        let _ = transport.release(Some(fd));
     }
     inserted.map(u64::from)
 }

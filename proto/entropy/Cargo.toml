@@ -1,0 +1,15 @@
+[package]
+name = "proto-entropy"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The protocols of the entropy device's driver and of the entropy service of stafeto: their method numbers and the bodies of their requests"
+
+[lib]
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-wire = { path = "../wire" }

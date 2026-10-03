@@ -31,6 +31,7 @@ proto-init = { path = "../../proto/init" }
 proto-uart = { path = "../../proto/uart" }
 proto-wire = { path = "../../proto/wire" }
 uart = { path = "../uart" }
+virtio-pci = { path = "../../lib/virtio-pci" }
 
 # The program alone runs on stafeto: the host tests of the library build
 # without rt and without the device's crate (virtio-drivers, MIT).

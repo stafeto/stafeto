@@ -143,7 +143,11 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::ramfs::BUSYBOX_DIALOG_TABLE[2],
     super::ramfs::BUSYBOX_DIALOG_TABLE[3],
     super::ramfs::BUSYBOX_DIALOG_TABLE[4],
-    super::ramfs::BUSYBOX_DIALOG_TABLE[5],
+    // The image of this table has no entropy service.
+    Record {
+        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
+        ..super::ramfs::BUSYBOX_DIALOG_TABLE[5]
+    },
     super::ramfs::TTY,
 ];
 
@@ -201,6 +205,8 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     super::ramfs::LONG,
     super::ramfs::LOAD,
     super::ramfs::RTBENCH,
+    super::entropy::RNG_VZ,
+    super::entropy::ENTROPY,
 ];
 
 /// The probe of the terminal service over the Virtio console's driver, as

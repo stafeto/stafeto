@@ -577,6 +577,16 @@ place on a page boundary, one memory object with `MAP_READ` and `MAP_WRITE`,
 room in the object) are `ramfs::read_into_valid`, with a host test that
 fails when any check goes.
 
+### The entropy service
+
+It runs at level 36, below the services at 40, and its CLONE walks the
+table of live clones (`proto_wire::clones`, 320 places), as Clone of the
+clock and pipe services does: its longest step under -icount, with the
+table full (`cargo xtask entropy`, role `x` of tests/entropy), is 14,398
+ticks of term B 20,536. SEED is 5,623 ticks; its own step with 64 seeds
+waiting for the first bytes, 8 told a step, is 10,684. Making the walks of
+the clone tables O(1) in the three services is a task of its own.
+
 ### The pipe service
 
 Its steps run at level 40, beside the RAM file service, and the service

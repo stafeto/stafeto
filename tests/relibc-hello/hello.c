@@ -208,6 +208,16 @@ int main(int argc, char **argv) {
     printf("relibc-hello: monotonic %lld.%09ld\n", (long long)now.tv_sec, now.tv_nsec);
     int status = files();
     if (status) return status;
+    /* No entropy service in this image: getentropy has no source. */
+    unsigned char random_bytes[16];
+    errno = 0;
+    int got_entropy = getentropy(random_bytes, sizeof random_bytes);
+    if (got_entropy != -1 || errno != ENOSYS) {
+        printf("relibc-hello: getentropy without the service gave %d, errno %d\n", got_entropy,
+               errno);
+        return 9;
+    }
+    printf("relibc-hello: getentropy without the service: ENOSYS\n");
     printf("relibc-hello: ok\n");
     return 0;
 }

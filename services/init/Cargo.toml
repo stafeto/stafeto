@@ -52,6 +52,11 @@ table-tty-steps = []
 # The probe of the terminal in C (xtask posix-tty, posix-tty-vz).
 table-posix-tty = []
 table-posix-tty-vz = []
+# The probes of the entropy device's driver (xtask entropy, entropy-vz).
+table-entropy = []
+table-entropy-vz = []
+# The C probe of getentropy and getrandom (xtask posix-random).
+table-posix-random = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

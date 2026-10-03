@@ -78,6 +78,21 @@ pub(crate) fn probe_pause(ns: u64) {
 /// Sleeps on the calling thread's timer until `deadline`: EINTR when an
 /// entry or a request of cancellation ended it before.
 pub(crate) fn sleep_until(deadline: Sleep) -> Result<(), i32> {
+    sleep_in(deadline, true)
+}
+
+/// A relative pause of `nanos` nanoseconds on CLOCK_MONOTONIC inside a
+/// function that is no point of cancellation (crate::random): a caught
+/// signal ends it with EINTR, a request of cancellation leaves it on and
+/// stays for the next point.
+pub(crate) fn pause(nanos: i64) -> Result<(), i32> {
+    let deadline = Sleep::new(crate::clock::CLOCK_MONOTONIC as u32, false, 0, nanos, now())
+        .map_err(|_| EINVAL)?;
+    sleep_in(deadline, false)
+}
+
+/// `sleep_until`, a request of cancellation ending it only when `point`.
+fn sleep_in(deadline: Sleep, point: bool) -> Result<(), i32> {
     let block = own_block();
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
@@ -105,14 +120,15 @@ pub(crate) fn sleep_until(deadline: Sleep) -> Result<(), i32> {
                 source: Source::Unlabeled,
                 bits,
                 ..
-            }) if bits & posix_sync::bit::CANCEL != 0 && cancel::requested() => {
+            }) if point && bits & posix_sync::bit::CANCEL != 0 && cancel::requested() => {
                 break Err(EINTR);
             }
             Ok(_) => {}
             // An entry that ran no handler (a stop of exec or fork parked
             // the thread) leaves the sleep on: EINTR is for a caught signal.
             Err(Error::Interrupted)
-                if block.handled.load(Ordering::SeqCst) == handled && !cancel::requested() => {}
+                if block.handled.load(Ordering::SeqCst) == handled
+                    && !(point && cancel::requested()) => {}
             Err(Error::Interrupted) => break Err(EINTR),
             Err(error) => panic!("sleep receive: {error:?}"),
         }
