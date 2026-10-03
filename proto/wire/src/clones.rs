@@ -32,13 +32,20 @@ impl<const N: usize> Clones<N> {
 
     /// Whether `client` may have one clone more.
     pub fn room(&self, client: u64) -> Result<(), Full> {
+        self.room_within(client, PER_CLIENT)
+    }
+
+    /// Whether `client` may have one clone more with `most` of its own at
+    /// most, for a service that counts its clients otherwise (the pipe
+    /// service counts the clones of a whole tree of processes).
+    pub fn room_within(&self, client: u64, most: usize) -> Result<(), Full> {
         let own = self
             .live
             .iter()
             .flatten()
             .filter(|(_, c)| *c == client)
             .count();
-        if own >= PER_CLIENT || self.live.iter().all(Option::is_some) {
+        if own >= most || self.live.iter().all(Option::is_some) {
             return Err(Full);
         }
         Ok(())
@@ -46,7 +53,12 @@ impl<const N: usize> Clones<N> {
 
     /// The clone `label` of `client` is alive; Full past the limits.
     pub fn add(&mut self, label: u64, client: u64) -> Result<(), Full> {
-        self.room(client)?;
+        self.add_within(label, client, PER_CLIENT)
+    }
+
+    /// `add` with `most` clones of `client` at most (`room_within`).
+    pub fn add_within(&mut self, label: u64, client: u64, most: usize) -> Result<(), Full> {
+        self.room_within(client, most)?;
         let free = self.live.iter_mut().find(|l| l.is_none()).ok_or(Full)?;
         *free = Some((label, client));
         Ok(())

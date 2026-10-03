@@ -56,6 +56,7 @@ fn relibc(manifest: &std::path::Path, tools: &std::path::Path, out: &std::path::
             "-Wall",
             "-Wextra",
             "-Werror",
+            "-fno-builtin",
             "-fno-stack-protector",
             "-fno-pic",
             "-O2",

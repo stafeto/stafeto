@@ -43,6 +43,9 @@ const SVC_STACK_SIZE: u32 = 16 * 1024;
 /// image (services/ramfs/src/tree.rs) on top of the start data, and its
 /// loop holds the table of its sessions.
 const RAMFS_STACK_SIZE: u32 = 48 * 1024;
+/// The pipe service's stack: its state (the pipes, the long operations,
+/// the clones) lies in its `.bss`, and a request copies up to 1 KiB.
+const PIPE_STACK_SIZE: u32 = 32 * 1024;
 /// The stacks of the UART driver (services/uart) and of the shell
 /// (apps/shell), which init's loader maps.
 const UART_STACK_SIZE: u32 = 16 * 1024;
@@ -77,8 +80,9 @@ const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE
 /// process and clock services, the service of long operations (`svc`,
 /// role `l`, under the name `uart`), the load, and the PL011's driver for
 /// the console; the loader, which starts the benchmark's children from the
-/// files of the image (5c).
-const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 9] = [
+/// files of the image (5c); the pipe service and BusyBox, whose `ls` and
+/// `cat` are the stages of S22 (5e).
+const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 11] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -93,9 +97,11 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 9] = [
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    ("busybox-probe", "busybox-probe", 0, &["applets"]),
 ];
 /// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
-const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 9] = [
+const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 11] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -110,6 +116,8 @@ const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 9] = [
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    ("busybox-probe", "busybox-probe", 0, &["applets"]),
 ];
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [
@@ -363,9 +371,10 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
 /// The probe of POSIX processes (5b) and the services it needs, the loader
 /// and BusyBox with its applets, which the table of files names (5c): the
 /// probe's children are files of it.
-const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_PROCS_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -381,9 +390,10 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
 /// The probe of the longest step of the process service (xtask
 /// process-steps): the probe in its steps mode, and the process service
 /// that prints each new longest step.
-const POSIX_STEPS_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_STEPS_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-steps"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps"]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &["steps"]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -439,10 +449,11 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 7] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -2044,6 +2055,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         return Err("an old image set the clock with its record's new rights".into());
     }
     for marker in [
+        // The pipe service (5e) registered with init.
+        "pipe: ready",
         "posix-procs: a child inherits the mask and SIG_IGN",
         "posix-procs: a thread took SIGUSR1 after main left",
         "posix-procs: the last thread ran atexit",
@@ -2065,6 +2078,16 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: a forked child execs ls",
         "posix-procs: ash -c ran /bin/ls",
         "posix-procs: 40 forks of a parent with six threads",
+        // Pipes (5e): within a process and across fork.
+        "posix-procs: pipes within a process and across fork",
+        // The signals of the shell and setpgid of a child of fork (5e).
+        "posix-procs: shell signals and setpgid of a child",
+        // /dev/null (5e): 1 MiB written, nothing kept.
+        "posix-procs: /dev/null drops 1 MiB",
+        // Across spawn, fork and exec: cat on two pipes, the ends' numbers,
+        // the waiters of an old image, the loader's refusal, ash's pipeline.
+        "posix-procs: ash -c ran ls | cat",
+        "posix-procs: pipes across spawn and exec",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
@@ -2109,6 +2132,32 @@ const RAM_STEP_KINDS: [(usize, &str); 6] = [
     (15, "Clone"),
     (17, "ReadInto"),
     (64, "notification"),
+];
+
+/// The longest heartbeat of the pipe service's loop, in ticks under
+/// -icount: a send to init (level 63) and its reply, in which the processes
+/// of higher levels than the service's may run; 200,000 were seen once in
+/// a volley of the steps probe's crowd.
+const HEARTBEAT_STEP_MAX: u64 = 500_000;
+
+/// The kinds of the lines of the pipe service (tag 4), by the numbers of
+/// proto_pipe::Method.
+const PIPE_STEP_KINDS: [(usize, &str); 15] = [
+    (1, "Create"),
+    (2, "ReadStart"),
+    (3, "ReadTake"),
+    (4, "ReadCancel"),
+    (5, "WriteStart"),
+    (6, "WriteTake"),
+    (7, "WriteCancel"),
+    (8, "Close"),
+    (9, "Clone"),
+    (10, "GetFlags"),
+    (11, "SetFlags"),
+    (12, "Stat"),
+    (13, "Abandon"),
+    (64, "heartbeat: a send to init and its reply"),
+    (65, "own step: a description let go of, a session gone"),
 ];
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
@@ -2215,6 +2264,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
+    let pipe = longest_steps(&outcome.lines, "4");
     // The loader's lines, as the services' with the tag 3.
     let loader_lines: Vec<String> = outcome
         .lines
@@ -2264,6 +2314,36 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the RAM file service: Clone took {clone} ticks, past {RAM_STEP_MAX}: {ram:?}"
         ));
     }
+    // Every step of the pipe service (5e) stays under term B: a copy of
+    // one message and up to 8 notifications, one description of a session
+    // that went, a Clone of up to 32 ends, the cancels, the flags, Stat
+    // and Abandon. The probe's role steppipes makes each of them, the
+    // first ones at their longest.
+    for kind in [2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 65] {
+        let ticks = pipe.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
+        if ticks == 0 || ticks > RAM_STEP_MAX {
+            return Err(format!(
+                "the pipe service: kind {kind} took {ticks} ticks, past {RAM_STEP_MAX} or none: {pipe:?}"
+            ));
+        }
+    }
+    // The kind 64 holds the loop's heartbeat alone: the pipe service
+    // counts each of its own notifications (the step of a description, the
+    // departure of a session or of a clone that never sent) as 65. A
+    // heartbeat waits for init's reply, and a volley of the crowd's
+    // processes at a higher level may run in the middle of it: its ticks
+    // are no work of the pipe service.
+    if let Some(row) = pipe.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+        return Err(format!("the pipe service: a step past term B: {row:?}"));
+    }
+    // The heartbeat has its own bound, so that a growth of that wait shows:
+    // the service answers no client while it waits for init.
+    let heartbeat = pipe.iter().find(|(k, ..)| *k == 64).map_or(0, |r| r.1);
+    if heartbeat > HEARTBEAT_STEP_MAX {
+        return Err(format!(
+            "the pipe service: a heartbeat took {heartbeat} ticks, past {HEARTBEAT_STEP_MAX}"
+        ));
+    }
     let mut text = String::from("kind method ticks detail\n");
     for (kind, ticks, detail) in &loader {
         let name = LOADER_STEP_KINDS
@@ -2280,6 +2360,13 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         (k, name, t, d)
     }) {
         text += &format!("ramfs {kind} {name} {ticks} {detail}\n");
+    }
+    for (kind, ticks, detail) in &pipe {
+        let name = PIPE_STEP_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map_or("other", |(_, n)| n);
+        text += &format!("pipe {kind} {name} {ticks} {detail}\n");
     }
     for (kind, ticks, detail) in &rows {
         let name = STEP_KINDS
@@ -2379,12 +2466,15 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "4", "ash", busybox.clone()),
-        ("-rwxr-xr-x", "4", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "4", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "4", "ls", busybox),
+        ("-rwxr-xr-x", "5", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "5", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "5", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "5", "ls", busybox.clone()),
+        ("-rwxr-xr-x", "5", "wc", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
+    // The entries of /bin: the table of the image lists them (rootfs.rs).
+    let bin_count = bin_listing.len().to_string();
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
@@ -2525,6 +2615,52 @@ fn ash_dialog() -> Result<(), String> {
             |line| line == "after-cd-error",
             DIALOG_STEP,
         )?;
+        run.expect("# ", DIALOG_STEP)?;
+        // Pipelines (5e): each side a child of the shell, the ends of the
+        // pipe service's pipes as its standard streams.
+        run.send("ls /etc | cat")?;
+        run.expect("ls /etc | cat", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo hello | cat | cat")?;
+        run.expect("echo hello | cat | cat", DIALOG_STEP)?;
+        run.expect_line("hello", |line| line == "hello", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("ls /bin | wc -l")?;
+        run.expect("ls /bin | wc -l", DIALOG_STEP)?;
+        run.expect_line(
+            "the count of /bin",
+            |line| line.trim() == bin_count,
+            DIALOG_STEP,
+        )?;
+        run.expect("# ", DIALOG_STEP)?;
+        // A writer that writes nothing and outlasts its reader's start: the
+        // reader sits in `read` on the empty pipe when the last end of the
+        // writer closes, and that end wakes it.
+        run.send("(/bin/ls /bin > /dev/null) | cat; echo piped $?")?;
+        run.expect_line("piped 0", |line| line == "piped 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ls /nope | /bin/cat; echo status $?")?;
+        run.expect_line("status 0", |line| line == "status 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // A job in the background reads /dev/null; `wait` returns when it
+        // ends and gives its status.
+        run.send("/bin/ls /etc & wait")?;
+        run.expect("/bin/ls /etc & wait", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo job-ended & wait; echo wait $?")?;
+        run.expect_line("job-ended", |line| line == "job-ended", DIALOG_STEP)?;
+        run.expect_line("wait 0", |line| line == "wait 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // Whatever a command writes to /dev/null is gone, and its input
+        // from there is at the end.
+        run.send("echo lost > /dev/null && echo gone; echo more >> /dev/null && echo gone-too")?;
+        run.expect_line("gone", |line| line == "gone", DIALOG_STEP)?;
+        run.expect_line("gone-too", |line| line == "gone-too", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("cat < /dev/null; echo null $?")?;
+        run.expect_line("null 0", |line| line == "null 0", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("exit")?;
         run.expect("exit", DIALOG_STEP)?;
@@ -2796,6 +2932,10 @@ fn host_tests() -> Result<(), String> {
         "proto-wire",
         "--package",
         "proto-clock",
+        "--package",
+        "proto-pipe",
+        "--package",
+        "pipe",
         "--package",
         "shell",
         "--package",
@@ -4380,6 +4520,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "proto-clock",
         "--package",
+        "proto-pipe",
+        "--package",
         "proto-loader",
         "--package",
         "xtask",
@@ -4396,6 +4538,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "init",
         "--package",
         "ramfs",
+        "--package",
+        "pipe",
         "--package",
         "shell",
         "--package",
@@ -4448,6 +4592,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "proto-clock",
         "--package",
+        "proto-pipe",
+        "--package",
         "rt",
         "--package",
         "posix-fs",
@@ -4485,6 +4631,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "init",
         "--package",
         "ramfs",
+        "--package",
+        "pipe",
         "--package",
         "shell",
         "--package",

@@ -537,3 +537,44 @@ KiB takes about 550. `process-steps` fails when a READ_INTO passes
 place on a page boundary, one memory object with `MAP_READ` and `MAP_WRITE`,
 room in the object) are `ramfs::read_into_valid`, with a host test that
 fails when any check goes.
+
+### The pipe service
+
+Its steps run at level 40, beside the RAM file service, and the service
+sends requests to nobody. `cargo xtask process-steps` boots it with the
+feature `steps` and the role `steppipes` of the probe makes each kind of
+step at its longest: 8 waiters on each end, a Clone of 28 ends, a session
+that goes with 28 ends. Longest steps under -icount, ticks, with 128 and
+248 children live (term B is 20,536):
+
+| Step | 128 | 248 |
+|---|---|---|
+| Clone (up to 32 ends) | 12,914 | 17,382 |
+| WriteStart (a copy of one message, up to 8 notifications) | 9,047 | 9,047 |
+| ReadStart | 8,625 | 8,625 |
+| ReadTake | 7,211 | 7,211 |
+| Close | 6,148 | 6,148 |
+| Abandon (up to 16 operations) | 4,904 | 5,372 |
+| own step (one description let go of, 8 wakes at most) | 3,894 | 5,682 |
+| WriteTake | 3,922 | 3,922 |
+| Create | 5,141 | 5,141 |
+| ReadCancel, WriteCancel | 2,130, 2,175 | 2,130, 2,175 |
+| Stat, GetFlags, SetFlags | 1,432, 1,360, 1,360 | 1,432, 1,360, 1,360 |
+| heartbeat (a send to init and its reply) | 5,630 | 403,468 |
+
+Every step of the service is below B, and none grows with the number of
+processes: the Clone and own-step rows differ between the columns by the
+spread of the volleys of the crowd (they interleave with the step in
+progress), and `process-steps` fails when any of them passes 20,536. Clone has the least
+margin: 17,382 ticks with 248 children, 85 % of B, since it goes through
+the 320 places of the births and of the clones; it is the first to split
+when the tables grow (with the steps of the process service, 5h). The
+heartbeat is the loop's wait for init's reply, in which processes of higher
+levels run (the volley of 248 children); it is no work of the service, and
+the check bounds it at 500,000 ticks apart from B. A thread below level 40
+waits for at most one step of the service's own work that has begun; the
+wait for init's reply goes to threads above the client's level, so it adds
+nothing to the client's delay. No step allocates memory: the
+rings, the descriptions, the sessions and the waiters live in the
+service's `.bss`. The kernel did not change, and B stays 20,536. Details
+are in [notes/m5e-pipes.md](../notes/m5e-pipes.md).

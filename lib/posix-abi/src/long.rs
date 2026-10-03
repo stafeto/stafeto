@@ -20,14 +20,19 @@ use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
 use rt::handle::{Channel, Handle};
 use rt::sys;
 
+/// The errno of a refusal of the service's own, which `run_with` takes;
+/// None leaves the refusal to the kernel's errors (EIO for the rest).
+type Refusal<'a> = &'a dyn Fn(Status) -> Option<i32>;
+
 /// One request to `service` and its long reply, copied into `out`: the
 /// kind and, for READY, the length. EINTR when the kernel interrupted the
-/// request before its reply.
+/// request before its reply; a refusal as `refusal` says.
 fn call(
     service: &Handle<Channel>,
     request: &[u8],
     handle: Option<Handle<Channel>>,
     out: &mut [u8],
+    refusal: Refusal<'_>,
 ) -> Result<(u32, usize, u64), i32> {
     let reply = match handle {
         None => sys::send(service, request).map_err(|e| e.into_errno())?,
@@ -45,6 +50,7 @@ fn call(
         Ok(long::Reply::Wait(key)) => Ok((long::WAIT, 0, key)),
         Ok(long::Reply::Armed) => Ok((long::ARMED, 0, 0)),
         Ok(long::Reply::Cancelled) => Ok((long::CANCELLED, 0, 0)),
+        Err(status) if refusal(status).is_some() => Err(refusal(status).unwrap_or(EIO)),
         Err(Status::Kernel(Error::LimitReached)) => Err(EAGAIN),
         Err(Status::Kernel(error)) => Err(error.into_errno()),
         Err(_) => Err(EIO),
@@ -107,11 +113,23 @@ pub fn run(
     keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
     out: &mut [u8],
 ) -> Result<usize, i32> {
+    run_with(service, start, keyed, out, &|_| None)
+}
+
+/// `run` with the errnos of the service's own refusals, `refusal`: those
+/// of the start, of a take and of a cancel alike.
+pub fn run_with(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+) -> Result<usize, i32> {
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
     let block = crate::threads::own_block();
     let _outer = OuterRestart::enter(&block.flags);
-    let key = match call(service, start, None, out)? {
+    let key = match call(service, start, None, out, refusal)? {
         (long::READY, n, _) => return Ok(n),
         (long::WAIT, _, key) => key,
         _ => return Err(EIO),
@@ -135,7 +153,7 @@ pub fn run(
             else {
                 break 'wait Some(EAGAIN);
             };
-            match call(service, take.as_bytes(), Some(labelled), out) {
+            match call(service, take.as_bytes(), Some(labelled), out, refusal) {
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => armed = true,
                 Ok(_) => break 'wait Some(EIO),
@@ -161,7 +179,7 @@ pub fn run(
                 bits,
                 ..
             }) if label == key && bits & 1 != 0 => {
-                match call(service, take.as_bytes(), None, out) {
+                match call(service, take.as_bytes(), None, out, refusal) {
                     Ok((long::READY, n, _)) => return Ok(n),
                     Ok((long::ARMED, _, _)) => {}
                     Ok(_) => break 'wait Some(EIO),
@@ -194,7 +212,7 @@ pub fn run(
     // error of the way out, EINTR for an entry or a cancellation.
     let request = request(true).map_err(|_| EIO)?;
     loop {
-        match call(service, request.as_bytes(), None, out) {
+        match call(service, request.as_bytes(), None, out, refusal) {
             Ok((long::READY, n, _)) => return Ok(n),
             Ok((long::CANCELLED, _, _)) => return Err(cancel.unwrap_or(EINTR)),
             Err(EINTR) => {}

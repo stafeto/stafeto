@@ -10,8 +10,8 @@
 //! output, then `exit: N` when the output is empty or the status is 2 or
 //! more. A test passes when one of its expectations
 //! (<suite>.expect/<test>.*) is that text; a test of the basic suite, which
-//! has none, when the outcome is `exit: 0`. A test that needs pipes (5e)
-//! is UNSUPPORTED and does not run. A test that faults, is killed or gives
+//! has none, when the outcome is `exit: 0`. A test that needs `poll` or
+//! `select` (5f) is UNSUPPORTED and does not run. A test that faults, is killed or gives
 //! no end within the runner's 10 s FAILs, and the run goes on. The
 //! table goes to target/measure/os-test.txt; `ci` fails when a test of
 //! tests/os-test/pass.txt does not pass. `cargo xtask os-test --one NAME`
@@ -29,11 +29,12 @@ use crate::{
     llvm_tool, qemu, rootfs, target_dir, write_boot_image_files,
 };
 
-/// The image of a suite: the RAM files with the tests, the process and
+/// The image of a suite: the RAM files with the tests, the pipes, the process and
 /// clock services, the loader and the runner.
-const PROGRAMS: [ImageProgram; 6] = [
+const PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", crate::INIT_STACK_SIZE, &["table-os-test"]),
     ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -150,9 +151,12 @@ pub fn expected(expect: &Path, test: &str, outcome: &str) -> Result<bool, String
     Ok(false)
 }
 
-/// Whether the test's source needs what stafeto has not yet: pipes (5e).
-fn needs_pipes(source: &str) -> bool {
-    ["pipe(", "pipe2("].iter().any(|call| source.contains(call))
+/// Whether the test's source needs what stafeto has not yet: `poll` or
+/// `select` (5f), which `ppoll` and `pselect` contain.
+fn needs_poll(source: &str) -> bool {
+    ["poll(", "select("]
+        .iter()
+        .any(|call| source.contains(call))
 }
 
 /// The time `ci` gives the boots of the suites, counted from the first
@@ -209,11 +213,11 @@ pub fn plan() -> Result<(Vec<Job>, Plan), String> {
     let mut places: Vec<Option<Row>> = Vec::new();
     for test in &tests {
         let source = source_of(&work, test)?;
-        places.push(if needs_pipes(&source) {
+        places.push(if needs_poll(&source) {
             Some((
                 test.name.clone(),
                 Verdict::Unsupported,
-                "needs pipes (5e)".to_owned(),
+                "needs poll or select (5f)".to_owned(),
             ))
         } else if let Some(failed) = test.built.strip_prefix('!') {
             // A test that did not compile: os-test's outcome for it.
@@ -419,7 +423,7 @@ fn runner_check(kernel: &crate::Artifacts) -> Result<(), String> {
 }
 
 /// The suites as jobs, a boot for each: the rows of its tests go into
-/// `rows` when its job ends. The tests that need pipes, or did not
+/// `rows` when its job ends. The tests that need poll or select, or did not
 /// compile, get their rows before any boot.
 fn suite_jobs(
     work: &Path,
@@ -700,14 +704,20 @@ mod tests {
     }
 
     #[test]
-    fn pipes_are_unsupported() {
-        assert!(needs_pipes("if (pipe(fds) < 0)"));
-        assert!(needs_pipes("if (pipe2(fds, O_CLOEXEC) < 0)"));
-        assert!(!needs_pipes("int fd = open(path, O_RDWR);"));
-        // Programs started from files run (5c), and fork (5d).
-        assert!(!needs_pipes("execlp(argv[0], argv[0], \"2\", NULL);"));
-        assert!(!needs_pipes("pid_t child = fork();"));
-        assert!(!needs_pipes(
+    fn poll_and_select_are_unsupported() {
+        assert!(needs_poll("int n = poll(fds, 1, 0);"));
+        assert!(needs_poll("int n = ppoll(fds, 1, NULL, NULL);"));
+        assert!(needs_poll("int n = select(1, &set, NULL, NULL, &tv);"));
+        assert!(needs_poll(
+            "int n = pselect(1, &set, NULL, NULL, NULL, NULL);"
+        ));
+        assert!(!needs_poll("int fd = open(path, O_RDWR);"));
+        // Programs started from files run (5c), fork (5d) and pipes (5e).
+        assert!(!needs_poll("execlp(argv[0], argv[0], \"2\", NULL);"));
+        assert!(!needs_poll("pid_t child = fork();"));
+        assert!(!needs_poll("if (pipe(fds) < 0)"));
+        assert!(!needs_poll("if (pipe2(fds, O_CLOEXEC) < 0)"));
+        assert!(!needs_poll(
             "posix_spawn(&pid, program, NULL, NULL, argv, environ);"
         ));
     }

@@ -51,20 +51,21 @@ pub unsafe fn init(files: PosixFs) -> Result<(), rt::abi::Error> {
 }
 
 /// The files of a forked child (posix_fs::PosixFs::after_fork): its own
-/// sessions `files` and `uart`.
+/// sessions `files`, `uart` and `pipes`.
 ///
 /// # Safety
 /// The child's only thread, before anything else of the layer runs.
 pub unsafe fn after_fork(
     files: Handle<rt::handle::Channel>,
     uart: Option<Handle<rt::handle::Channel>>,
+    pipes: Option<Handle<rt::handle::Channel>>,
 ) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
     // SAFETY: the caller's promise gives this borrow alone.
     if let Some(own) = unsafe { (*STATE.0.get()).files.as_mut() } {
-        own.after_fork(files, uart);
+        own.after_fork(files, uart, pipes);
     }
 }
 
@@ -72,6 +73,12 @@ pub unsafe fn after_fork(
 /// shares (posix_fs::PosixFs::kept_by_fork), into `out`; how many.
 pub fn kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
     process_state(|files| Ok(files.kept_by_fork(out)))
+}
+
+/// The ends of pipes a forked child's session shares
+/// (posix_fs::PosixFs::pipes_kept_by_fork), into `out`; how many.
+pub fn pipes_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+    process_state(|files| Ok(files.pipes_kept_by_fork(out)))
 }
 
 /// Runs `run` holding the lock of the process's files, for the probes of
@@ -172,20 +179,29 @@ pub fn abandon_holds() {
 /// Close of the service's open description `fd`, which the table handed
 /// back to release, outside the lock.
 pub fn release(fd: u32) -> Result<(), i32> {
-    let transport = process_state(|files| Ok(files.transport()))?;
-    transport
-        .release(Some(Target::Ram(fd)))
-        .map_err(crate::error)
+    release_target(Target::Ram(fd))
 }
 
+/// Close of what `target` names in its service (a file's description, a
+/// pipe's end), which the table handed back to release, outside the lock.
+pub fn release_target(target: Target) -> Result<(), i32> {
+    let transport = process_state(|files| Ok(files.transport()))?;
+    transport.release(Some(target)).map_err(crate::error)
+}
+
+/// The reply of a read of a file or the console: its bytes, or the
+/// console's route for a read of input in two steps.
 // Keep read buffers out of the frames of the other requests.
 #[inline(never)]
-fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
-    let read = held(fd, |transport, target| {
-        transport
-            .prepare_read(target, count as usize)
-            .map_err(crate::error)
-    })?;
+fn file_reply(
+    transport: Transport,
+    target: Target,
+    count: u32,
+    out: &mut Writer,
+) -> Result<(), i32> {
+    let read = transport
+        .prepare_read(target, count as usize)
+        .map_err(crate::error)?;
     if let Some((input, extent)) = read.input() {
         Reply::Input {
             uart: input.uart().map(|h| h.0),
@@ -199,19 +215,41 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
     }
 }
 
+/// The reply of a read of a pipe's read end, its bytes once they came.
+#[inline(never)]
+fn pipe_reply(transport: Transport, end: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
+    let mut bytes = [0; posix_fs::MAX_READ];
+    let extent = (count as usize).min(bytes.len());
+    let n = crate::pipes::read(transport, end, &mut bytes[..extent])?;
+    Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
+}
+
+/// A read of `fd`: what it names held, outside the lock; the read of a
+/// pipe waits here. Each kind has its own frame: the reads of files stay
+/// as deep as they were (threads with small stacks read files).
+fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
+    held(fd, |transport, target| match target {
+        Target::Pipe(end) => pipe_reply(transport, end, count, &mut *out),
+        target => file_reply(transport, target, count, &mut *out),
+    })
+}
+
 /// Open: the path resolved under the lock, the service's open outside it,
 /// then the descriptor under it again.
 fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
-    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK) != 0
+    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES) != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
         return Err(EINVAL);
     }
-    let directory = if flags & O_DIRECTORY != 0 {
+    let mut directory = if flags & O_DIRECTORY != 0 {
         posix_fs::DIRECTORY_ONLY
     } else {
         0
     };
+    if flags & O_CHANGES != 0 {
+        directory |= posix_fs::CHANGES;
+    }
     let (transport, opened) = resolved(path, |transport, path| {
         if path.trailing_slash
             && transport.stat(path).map_err(crate::error)?.kind == posix_fs::FileKind::Regular
@@ -239,16 +277,22 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
     use Request::*;
     match request {
         Open { path, flags } => open(path, flags as i32),
-        Write { fd, bytes } => held(fd, |transport, target| match target {
-            Target::Output | Target::Error => transport
-                .input()
-                .write(bytes)
-                .map(|n| n as u64)
-                .map_err(|status| crate::error(posix_fs::FsError::from(status))),
-            target => transport
-                .write(target, bytes)
-                .map(|n| n as u64)
-                .map_err(crate::error),
+        Write { fd, bytes } => held(fd, |transport, target| {
+            // A file or the console takes at most one message of it.
+            let extent = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];
+            match target {
+                Target::Output | Target::Error => transport
+                    .input()
+                    .write(extent)
+                    .map(|n| n as u64)
+                    .map_err(|status| crate::error(posix_fs::FsError::from(status))),
+                // The write of a pipe waits here, outside the lock.
+                Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
+                target => transport
+                    .write(target, extent)
+                    .map(|n| n as u64)
+                    .map_err(crate::error),
+            }
         }),
         Seek { fd, offset, origin } => held(fd, |transport, target| {
             transport

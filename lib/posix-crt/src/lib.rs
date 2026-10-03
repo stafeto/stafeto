@@ -206,6 +206,7 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             Names::Output => Target::Output,
             Names::Error => Target::Error,
             Names::File(n) => Target::Ram(n),
+            Names::Pipe(n) => Target::Pipe(n),
         };
         *place = Inherited { fd: d.fd, target };
     }
@@ -303,6 +304,10 @@ fn loaded_main() -> u64 {
                     Some(&inherited[..count.min(inherited.len())]),
                     secure,
                 )
+                .map(|mut fs| {
+                    fs.set_pipes(one(Slot::Pipes).map(Handle::from_raw));
+                    fs
+                })
                 .map_err(|_| "files failed")
             })
             .and_then(|files| posix_abi::shared::init(files).map_err(|_| "files failed"))

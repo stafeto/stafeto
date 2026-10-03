@@ -79,6 +79,10 @@ pub const WRITE_ONLY: u32 = 1;
 pub const READ_WRITE: u32 = 2;
 /// Require a directory atomically when establishing the open description.
 pub const DIRECTORY_ONLY: u32 = 4;
+/// The caller asked for O_CREAT, O_TRUNC or O_APPEND: the null device takes
+/// them (it has no contents to create, cut or follow), any other file
+/// answers INVALID_ARGUMENT.
+pub const CHANGES: u32 = 8;
 
 pub const NO_ENTRY: u32 = 300;
 pub const BAD_FD: u32 = 301;

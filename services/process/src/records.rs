@@ -101,6 +101,10 @@ pub struct Record<P> {
     /// Whether it counts in `Numbers::links` of its group: its parent is
     /// in another group of its session.
     linked: bool,
+    /// Whether its process ran a program of its own: SpawnCommit (the
+    /// child of posix_spawn starts with its file) and ExecCommit set it,
+    /// ForkCommit does not ([P24-SETPGID]: EACCES for a child that did).
+    pub execed: bool,
     /// Its live children, and the first of their list.
     pub children: u32,
     first_child: Option<u16>,
@@ -314,6 +318,7 @@ impl<P> Records<P> {
             sid,
             parent_index: parent.map(|p| p as u16),
             linked,
+            execed: false,
             children: 0,
             first_child: None,
             previous: None,
@@ -449,18 +454,21 @@ impl<P> Records<P> {
     }
 
     /// setpgid ([P24-SETPGID]) for the record in `caller`: `pid` is the
-    /// caller or one of its children (ESRCH otherwise; 0 is the caller),
-    /// `pgid` 0 means the target's own PID. A child is another session's
-    /// (EPERM) or has started: every child came from posix_spawn, which
-    /// executed its program, so EACCES, until fork comes (5g). The
-    /// caller, unless it leads its session (EPERM), joins the group
-    /// `pgid` of its own session, which is its own, new or not (EPERM
-    /// for any other group of another session or none). The links of the
-    /// caller and of its children are counted anew: CHILDREN_MAX steps.
+    /// caller or one of its children, a zombie among them (ESRCH
+    /// otherwise; 0 is the caller), `pgid` 0 means the target's own PID. A
+    /// child that ran a program of its own (`execed`: posix_spawn or exec)
+    /// is EACCES, one of another session or a leader of its session EPERM;
+    /// a child of fork otherwise moves as the caller does. The target,
+    /// unless it leads its session (EPERM), joins the group `pgid` of the
+    /// caller's session, which is the target's own, new or not (EPERM for
+    /// any other group of another session or none). The links of the
+    /// target and of its children are counted anew: CHILDREN_MAX steps.
+    /// A child that execed in another session gets EACCES: POSIX gives the
+    /// errors no order, and Linux checks the session first (EPERM).
     pub fn set_pgid(&mut self, caller: usize, pid: u32, pgid: u32) -> Result<(), GroupError> {
         let me = self.records[caller].as_ref().expect("the caller");
         let (own, sid) = (me.label.pid(), me.sid);
-        if pid != 0 && pid != own {
+        let target = if pid != 0 && pid != own {
             let child = self
                 .target(caller, pid)
                 .filter(|&t| {
@@ -469,22 +477,28 @@ impl<P> Records<P> {
                         .is_some_and(|r| r.parent_index == Some(caller as u16))
                 })
                 .ok_or(GroupError::NoProcess)?;
-            let same = self.records[child].as_ref().is_some_and(|r| r.sid == sid);
-            return Err(if same {
-                GroupError::Access
-            } else {
-                GroupError::Permission
-            });
-        }
-        if sid == own {
+            let r = self.records[child].as_ref().expect("a child");
+            if r.execed {
+                return Err(GroupError::Access);
+            }
+            if r.sid != sid {
+                return Err(GroupError::Permission);
+            }
+            child
+        } else {
+            caller
+        };
+        let record = self.records[target].as_ref().expect("the target");
+        let (pid, current) = (record.label.pid(), record.pgid);
+        if record.sid == pid {
             return Err(GroupError::Permission);
         }
-        let pgid = if pgid == 0 { own } else { pgid };
-        if pgid != own && self.session_of(pgid) != Some(sid) {
+        let pgid = if pgid == 0 { pid } else { pgid };
+        if pgid != pid && self.session_of(pgid) != Some(sid) {
             return Err(GroupError::Permission);
         }
-        if me.pgid != pgid {
-            self.regroup(caller, pgid, sid);
+        if current != pgid {
+            self.regroup(target, pgid, sid);
         }
         Ok(())
     }
@@ -1210,10 +1224,22 @@ mod tests {
             Err(GroupError::Permission),
             "a session leader"
         );
+        // A child of fork moves until it execs; one that ran a program of
+        // its own (posix_spawn or exec) does not.
+        let f = child_in(&mut t, p, Join::Inherit);
+        assert_eq!(t.set_pgid(at(p), f.pid(), 0), Ok(()), "a child of fork");
+        assert_eq!(t.pgid_of(at(p), f.pid()), Some(f.pid()));
+        assert_eq!(
+            t.set_pgid(at(p), f.pid(), p.pid()),
+            Ok(()),
+            "back to the parent's"
+        );
+        assert_eq!(t.pgid_of(at(p), f.pid()), Some(p.pid()));
+        t.get_mut(at(a)).unwrap().execed = true;
         assert_eq!(
             t.set_pgid(at(p), a.pid(), a.pid()),
             Err(GroupError::Access),
-            "a child has started"
+            "a child ran a program of its own"
         );
         assert_eq!(
             t.set_pgid(at(p), b.pid(), 0),

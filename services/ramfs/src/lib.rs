@@ -27,6 +27,8 @@ const MOTD: &[u8] = b"stafeto ramfs\n";
 /// The inode of entry `n` of the table is this plus the number of the
 /// first entry that names its file (the fixed tree has 1 to 5).
 const IMAGE_INODE: u64 = 6;
+/// The path of the entry of the table that is the null device.
+const NULL_DEVICE: &str = "/dev/null";
 
 pub const DIR: u32 = 1;
 pub const REG: u32 = 2;
@@ -143,6 +145,9 @@ enum File {
     /// Entry `n` of the table, a directory or a regular file.
     ImageDir(u16),
     ImageRegular(u16),
+    /// The entry `/dev/null` of the table: writes are accepted and
+    /// dropped, reads are at the end of the file.
+    Null(u16),
 }
 
 #[derive(Clone, Copy)]
@@ -221,7 +226,7 @@ impl File {
             Self::Tmp => Some(2),
             Self::Motd => Some(3),
             Self::Scratch => Some(4),
-            Self::ImageDir(_) | Self::ImageRegular(_) => None,
+            Self::ImageDir(_) | Self::ImageRegular(_) | Self::Null(_) => None,
         }
     }
 }
@@ -374,6 +379,8 @@ impl<'a> Ram<'a> {
                 let n = tree.find(path).ok_or(NO_ENTRY)?;
                 if tree.entry(n).is_directory() {
                     File::ImageDir(n)
+                } else if tree.entry(n).path == NULL_DEVICE {
+                    File::Null(n)
                 } else {
                     File::ImageRegular(n)
                 }
@@ -382,12 +389,21 @@ impl<'a> Ram<'a> {
     }
 
     pub fn open(&mut self, fds: &mut Fds, path: &str, flags: u32) -> Result<u32, u32> {
-        if flags & !7 != 0 || flags & 3 == 3 {
+        if flags & !15 != 0 || flags & 3 == 3 {
             return Err(proto_wire::BAD_SIZE);
         }
         let directory_only = flags & proto_fs::DIRECTORY_ONLY != 0;
+        let changes = flags & proto_fs::CHANGES != 0;
         let flags = flags & 3;
-        let file = self.resolve(path)?;
+        // Creating is not done yet: a file that is missing is as much
+        // refused as one that is no device.
+        let file = match self.resolve(path) {
+            Err(NO_ENTRY) if changes => return Err(proto_fs::INVALID_ARGUMENT),
+            found => found?,
+        };
+        if changes && !matches!(file, File::Null(_)) {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
         if file.is_directory() && flags != READ_ONLY {
             return Err(IS_DIRECTORY);
         }
@@ -420,7 +436,7 @@ impl<'a> Ram<'a> {
             File::Tmp => 3,
             File::Motd => 4,
             File::Scratch => 5,
-            File::ImageDir(n) | File::ImageRegular(n) => {
+            File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) => {
                 IMAGE_INODE + u64::from(self.tree().canonical(n))
             }
         }
@@ -525,7 +541,7 @@ impl<'a> Ram<'a> {
     fn node_information(&self, file: File) -> NodeInfo {
         let size = self.bytes(file).len() as u64;
         let (kind, links, permissions, uid, gid, times) = match file {
-            File::ImageDir(n) | File::ImageRegular(n) => {
+            File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) => {
                 let entry = self.tree().entry(n);
                 let kind = if file.is_directory() { DIR } else { REG };
                 let times = FileTimes {
@@ -639,8 +655,9 @@ impl<'a> Ram<'a> {
     ) -> Result<usize, u32> {
         let file = self.get(fds, fd)?.file;
         let n = self.write(fds, fd, bytes)?;
-        if n > 0 {
-            let times = &mut self.times[file.index().expect("only the scratch file is written")];
+        // The null device keeps no times.
+        if let (true, Some(index)) = (n > 0, file.index()) {
+            let times = &mut self.times[index];
             times.modify = now;
             times.change = now;
         }
@@ -791,7 +808,7 @@ impl<'a> Ram<'a> {
 
     fn bytes(&self, file: File) -> &[u8] {
         match file {
-            File::Root | File::Etc | File::Tmp | File::ImageDir(_) => &[],
+            File::Root | File::Etc | File::Tmp | File::ImageDir(_) | File::Null(_) => &[],
             File::Motd => MOTD,
             File::Scratch => &self.scratch[..self.len],
             File::ImageRegular(n) => self.tree().data(n),
@@ -872,8 +889,8 @@ impl<'a> Ram<'a> {
         if open.flags == READ_ONLY || matches!(open.file, File::Motd | File::ImageRegular(_)) {
             return Err(BAD_FD);
         }
-        if bytes.is_empty() {
-            return Ok(0);
+        if bytes.is_empty() || matches!(open.file, File::Null(_)) {
+            return Ok(bytes.len());
         }
         let offset = usize::try_from(open.offset).map_err(|_| NO_SPACE)?;
         let end = offset.checked_add(bytes.len()).ok_or(NO_SPACE)?;
@@ -1399,6 +1416,52 @@ mod tests {
         let b = ram.open(&mut fds, "/bin/sub/b", READ_ONLY).unwrap();
         assert_eq!(ram.read(&mut fds, b, &mut out), Ok(4));
         assert_eq!(&out[..4], b"beta");
+    }
+
+    /// The null device takes any write whole and drops it, reads end at
+    /// once and the size stays zero, though the file of the table has
+    /// bytes; the other image files stay read-only.
+    #[test]
+    fn the_null_device_drops_writes_and_reads_nothing() {
+        let bytes = test_image(&[
+            entry("/dev", DIRECTORY | 0o755, 0),
+            entry("/dev/null", REGULAR | 0o666, 2),
+            entry("/dev/other", REGULAR | 0o666, 2),
+        ]);
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut fds = Fds::default();
+        let fd = ram.open(&mut fds, "/dev/null", READ_WRITE).unwrap();
+        let block = [7u8; 4096];
+        for _ in 0..512 {
+            assert_eq!(ram.write_at(&mut fds, fd, &block, 20), Ok(4096));
+        }
+        assert_eq!(ram.pwrite(&mut fds, fd, 9, b"abc", 21), Ok(3));
+        assert_eq!(ram.size(&fds, fd), Ok(0));
+        let mut out = [1u8; 8];
+        assert_eq!(ram.read(&mut fds, fd, &mut out), Ok(0));
+        assert_eq!(ram.pread(&fds, fd, 0, &mut out, 22), Ok(0));
+        assert_eq!(ram.information("/dev/null").unwrap().size, 0);
+        let writer = ram.open(&mut fds, "/dev/null", WRITE_ONLY).unwrap();
+        assert_eq!(ram.write(&mut fds, writer, b"x"), Ok(1));
+        // O_CREAT, O_TRUNC and O_APPEND reach the device and nothing else.
+        let cut = ram
+            .open(&mut fds, "/dev/null", WRITE_ONLY | proto_fs::CHANGES)
+            .unwrap();
+        assert_eq!(ram.write(&mut fds, cut, b"z"), Ok(1));
+        assert_eq!(
+            ram.open(&mut fds, "/dev/other", WRITE_ONLY | proto_fs::CHANGES),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            ram.open(&mut fds, "/dev/none", WRITE_ONLY | proto_fs::CHANGES),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        // Another file of the table is no device.
+        assert_eq!(
+            ram.open(&mut fds, "/dev/other", WRITE_ONLY),
+            Err(proto_fs::ACCESS_DENIED)
+        );
     }
 
     #[test]

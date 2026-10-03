@@ -464,14 +464,18 @@ pub fn run_in<S: Service<K>, const K: usize>(
 /// protocol and for notifications. A new longest of a kind goes to the
 /// console as a line `service step: T kind K N ticks detail D` after the step, so that
 /// the print does not count in it (`report_steps` turns it on and gives the tag T); K is the
-/// method, or `NOTICE`.
+/// method, or `NOTICE` (`OWN` for a notification `step_own` marked).
 #[cfg(feature = "step-stats")]
 mod steps {
-    use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
     /// The kinds: methods below this number, and the notifications.
     pub const NOTICE: usize = 64;
-    const KINDS: usize = NOTICE + 1;
+    /// The notifications a service counts apart (`super::step_own`).
+    pub const OWN: usize = NOTICE + 1;
+    const KINDS: usize = OWN + 1;
+    /// Whether the step in progress counts as `OWN`.
+    static OWNED: AtomicBool = AtomicBool::new(false);
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// A number the handler of the step gives (`super::step_detail`), for
     /// the line a new longest prints.
@@ -500,8 +504,17 @@ mod steps {
         super::time::now()
     }
 
+    pub fn own() {
+        OWNED.store(true, Ordering::Relaxed);
+    }
+
     pub fn end(began: u64, kind: usize) {
         let took = super::time::now().saturating_sub(began);
+        let kind = if OWNED.swap(false, Ordering::Relaxed) {
+            OWN
+        } else {
+            kind
+        };
         let detail = DETAIL.swap(0, Ordering::Relaxed);
         let tag = REPORT.load(Ordering::Relaxed);
         if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) && tag != 0 {
@@ -521,6 +534,7 @@ mod steps {
     }
     pub fn end(_: u64, _: usize) {}
     pub fn detail(_: u64) {}
+    pub fn own() {}
     pub fn report(_: u8) {}
 }
 
@@ -529,6 +543,15 @@ mod steps {
 /// that count their steps get the lines of the one that asked.
 pub fn report_steps(tag: u8) {
     steps::report(tag);
+}
+
+/// Counts the notification step in progress apart from the others (feature
+/// `step-stats`; nothing without it): a service's own work in steps, which
+/// its own wake-ups start, is measured on its own, and the heartbeats and
+/// the departures of sessions that come when the processes of higher levels
+/// happen to run are not mixed into it.
+pub fn step_own() {
+    steps::own();
 }
 
 /// Tells the line of the longest step a number of this step, such as the

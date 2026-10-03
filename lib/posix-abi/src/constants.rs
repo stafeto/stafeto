@@ -48,6 +48,9 @@ pub const O_RDWR: i32 = 2;
 pub const O_ACCMODE: i32 = 3;
 pub const O_DIRECTORY: i32 = 65536;
 pub const O_CLOEXEC: i32 = 524288;
+/// What the layer sends for O_CREAT, O_TRUNC or O_APPEND (Linux's own
+/// values are relibc's, platform.rs): the null device takes them.
+pub const O_CHANGES: i32 = 1048576;
 pub const O_CLOFORK: i32 = 16777216;
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
@@ -73,3 +76,7 @@ pub const PTHREAD_MUTEX_NORMAL: i32 = 0;
 pub const PTHREAD_MUTEX_ERRORCHECK: i32 = 1;
 pub const PTHREAD_MUTEX_RECURSIVE: i32 = 2;
 pub const PTHREAD_MUTEX_DEFAULT: i32 = 3;
+pub const ENFILE: i32 = 23;
+pub const EPIPE: i32 = 32;
+/// Linux's O_NONBLOCK on AArch64, relibc's.
+pub const O_NONBLOCK: i32 = 0o4000;

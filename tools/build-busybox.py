@@ -32,7 +32,7 @@ STAMP = WORK / "config"
 A53_ERRATA = "-mfix-cortex-a53-835769"
 # BusyBox's main becomes busybox_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
-PATCH = "echo cat ash ls-nofork relibc main-renamed a53-835769"
+PATCH = "echo cat wc ash ls-nofork relibc main-renamed a53-835769"
 
 
 def relibc_commit() -> str:
@@ -58,6 +58,7 @@ OBJECTS = (
     "xreadlink.o", "mode_string.o",
     "last_char_is.o", "auto_string.o",
     "vfork_daemon_rexec.o",
+    "wfopen.o", "fclose_nonstdin.o", "fflush_stdout_and_exit.o",
 )
 
 
@@ -90,7 +91,7 @@ def tool(name: str, brew_formula: str | None = None) -> Path:
 def main() -> None:
     headers = sorted(COMPAT.rglob("*.h"))
     compatibility = sha256(b"".join(path.read_bytes() for path in headers)).hexdigest()
-    config_stamp = f"{VERSION} {SHA256} {PATCH} {compatibility} relibc {relibc_commit()}\n"
+    config_stamp = f"{VERSION} {SHA256} {PATCH} {sha256(" ".join(OBJECTS).encode()).hexdigest()} {compatibility} relibc {relibc_commit()}\n"
     if (STAMP.exists() and STAMP.read_text() == config_stamp
             and (SOURCE / "libbb/lib.a").exists()
             and (SOURCE / "coreutils/lib.a").exists()
@@ -135,6 +136,7 @@ def main() -> None:
     replace(config, "# CONFIG_ECHO is not set", "CONFIG_ECHO=y")
     replace(config, "# CONFIG_CAT is not set", "CONFIG_CAT=y")
     replace(config, "# CONFIG_LS is not set", "CONFIG_LS=y")
+    replace(config, "# CONFIG_WC is not set", "CONFIG_WC=y")
     replace(config, "# CONFIG_SHOW_USAGE is not set", "CONFIG_SHOW_USAGE=y")
     replace(config, "# CONFIG_FEATURE_VERBOSE_USAGE is not set",
             "CONFIG_FEATURE_VERBOSE_USAGE=y")

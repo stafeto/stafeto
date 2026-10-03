@@ -148,6 +148,12 @@ fn ramfs() -> Vec<RootFile> {
     ]
 }
 
+/// `/dev/null`: the RAM service serves the entry of this path as the null
+/// device (writes dropped, reads at the end), so the bytes are none.
+fn null_device() -> RootFile {
+    of("/dev/null", 0o666, ROOT, Source::Bytes("null", b""))
+}
+
 /// The shell's image: BusyBox with its applet names (the shell, `ash`,
 /// among them) as hard links, and the service as a set-user-ID file of
 /// another owner.
@@ -158,7 +164,10 @@ fn dialog() -> Vec<RootFile> {
         file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
+        file("/bin/wc", 0o755, ROOT, "busybox-probe"),
         file("/bin/ramfs", 0o4750, USER, "ramfs"),
+        dir("/dev"),
+        null_device(),
     ]
 }
 
@@ -172,6 +181,7 @@ fn procs() -> Vec<RootFile> {
     vec![
         dir("/bin"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
+        file("/bin/cat", 0o755, ROOT, "busybox-probe"),
         file("/bin/procs-child", 0o755, ROOT, "posix-procs"),
         of(
             "/bin/procs-setid",
@@ -206,6 +216,8 @@ fn procs() -> Vec<RootFile> {
             Source::Bytes("script", b"#!/bin/sh\necho no\n"),
         ),
         of("/bin/data", 0o644, ROOT, Source::Bytes("data", b"data\n")),
+        dir("/dev"),
+        null_device(),
         RootFile {
             mode: NOBODY_DIR,
             ..dir("/sbin")
@@ -220,15 +232,20 @@ fn steps() -> Vec<RootFile> {
     vec![
         dir("/bin"),
         file("/bin/procs-child", 0o755, ROOT, "posix-procs"),
+        dir("/dev"),
+        null_device(),
     ]
 }
 
 /// rtbench 2 (5c): the benchmark's children are files of it, the program
-/// itself under a role its first argument names.
+/// itself under a role its first argument names; BusyBox gives the `ls` and
+/// the `cat` of the pipeline of S22 (5e).
 fn rtbench() -> Vec<RootFile> {
     vec![
         dir("/bin"),
         file("/bin/rtbench-posix", 0o755, ROOT, "rtbench-posix"),
+        file("/bin/ls", 0o755, ROOT, "busybox-probe"),
+        file("/bin/cat", 0o755, ROOT, "busybox-probe"),
     ]
 }
 
@@ -242,7 +259,7 @@ pub fn os_test(tests: &[(String, Vec<u8>)]) -> Vec<RootFile> {
     fn leak(text: String) -> &'static str {
         Box::leak(text.into_boxed_str())
     }
-    let mut files = vec![dir("/os-test")];
+    let mut files = vec![dir("/dev"), null_device(), dir("/os-test")];
     let mut list = String::new();
     for (n, (name, elf)) in tests.iter().enumerate() {
         let parts: Vec<&str> = name.split('/').collect();
@@ -478,7 +495,7 @@ mod tests {
         // the directories above them (it refuses a file without its
         // parent).
         let wanted = sources(&files);
-        assert_eq!(wanted.len(), 4);
+        assert_eq!(wanted.len(), 5);
         let bytes = table(&files, 3, 3 + wanted.len() as u32 + 1).unwrap();
         let read = Rootfs::parse(&bytes, 3 + wanted.len() as u32 + 1).unwrap();
         for path in [

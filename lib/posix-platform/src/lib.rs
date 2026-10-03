@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 11;
+pub const PLATFORM_INTERFACE: u64 = 12;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -129,6 +129,7 @@ const O_LARGEFILE: c_int = 0o400000;
 const O_CLOEXEC: c_int = 0o2000000;
 /// relibc's O_CLOFORK of stafeto (POSIX 2024; Linux has none).
 const O_CLOFORK: c_int = 0o1_0000_0000;
+const O_NONBLOCK: c_int = 0o4000;
 
 /// Opens `path`, relative to the current directory or absolute (any
 /// `dirfd` then). The layer opens files of the RAM file service: the
@@ -138,7 +139,9 @@ const O_CLOFORK: c_int = 0o1_0000_0000;
 /// O_CREAT, O_TRUNC and O_APPEND name a directory as POSIX has it: EISDIR
 /// for O_CREAT without O_DIRECTORY and for O_TRUNC or O_APPEND with write
 /// access; O_APPEND for reading opens the directory; on anything else they
-/// answer EINVAL (the service creates, truncates and appends nothing yet).
+/// go to the service, which takes them for the null device only and
+/// answers EINVAL for any other file (it creates, truncates and appends
+/// nothing yet).
 ///
 /// # Safety
 /// `path` is a live C string.
@@ -162,6 +165,7 @@ pub unsafe extern "C" fn stafeto_openat(
         Ok(name) => name,
         Err(errno) => return -errno,
     };
+    let mut ours_changes = 0;
     if flags & changes != 0 {
         let reads = flags & O_ACCMODE == O_RDONLY;
         let creates = flags & O_CREAT != 0 && flags & O_DIRECTORY == 0;
@@ -169,11 +173,12 @@ pub unsafe extern "C" fn stafeto_openat(
         if directory && (creates || !reads) {
             return -EISDIR;
         }
+        // The null device takes them; the service refuses any other file.
         if !(directory && flags & changes == O_APPEND) {
-            return -EINVAL;
+            ours_changes = posix_abi::constants::O_CHANGES;
         }
     }
-    let mut ours = flags & O_ACCMODE;
+    let mut ours = flags & O_ACCMODE | ours_changes;
     if flags & O_DIRECTORY != 0 {
         ours |= posix_abi::constants::O_DIRECTORY;
     }
@@ -190,6 +195,42 @@ pub unsafe extern "C" fn stafeto_openat(
 fn is_directory(name: &[u8]) -> bool {
     call(|| posix_abi::open(name, posix_abi::constants::O_DIRECTORY).and_then(posix_abi::close))
         .is_ok()
+}
+
+/// pipe2: the read end into `fds[0]` and the write end into `fds[1]`
+/// (posix_abi::pipe2: O_NONBLOCK, O_CLOEXEC and O_CLOFORK).
+///
+/// # Safety
+/// `fds` is writable for two ints.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_pipe2(fds: *mut c_int, flags: c_int) -> c_int {
+    if fds.is_null() {
+        return -EFAULT;
+    }
+    let mut ours = 0;
+    for (theirs, layer) in [
+        (O_CLOEXEC, posix_abi::constants::O_CLOEXEC),
+        (O_CLOFORK, posix_abi::constants::O_CLOFORK),
+        (O_NONBLOCK, posix_abi::constants::O_NONBLOCK),
+    ] {
+        if flags & theirs != 0 {
+            ours |= layer;
+        }
+    }
+    if flags & !(O_CLOEXEC | O_CLOFORK | O_NONBLOCK) != 0 {
+        return -EINVAL;
+    }
+    match call(|| posix_abi::pipe2(ours)) {
+        Ok(ends) => {
+            // SAFETY: the caller's promise.
+            unsafe {
+                fds.write(ends[0]);
+                fds.add(1).write(ends[1]);
+            }
+            0
+        }
+        Err(errno) => -errno,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -630,6 +671,14 @@ pub unsafe extern "C" fn stafeto_probe_open_exec(path: *const c_char) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_probe_decoy(on: c_int) {
     posix_abi::process::probe_decoy(on != 0);
+}
+
+/// The probe of the loader's refusal of a pipe's end with no session of
+/// the pipe service (posix_abi::process::probe_no_pipes_session): the
+/// next spawns give the loader none.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_no_pipes_session(on: c_int) {
+    posix_abi::process::probe_no_pipes_session(on != 0);
 }
 
 /// The C function a probe of fork runs in the parent between Go and

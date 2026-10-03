@@ -20,7 +20,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from step 5d (`m5d-fork`).
+Numbers below are from step 5e (`m5e-pipes`).
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -63,8 +63,10 @@ images run BusyBox 1.37.0 against the RAM file service: `cat`, `ash -c`
 and an interactive `ash` on the UART with `echo` and `ls -la`. BusyBox
 links statically with relibc over the Rust POSIX layer. The dialog's
 `ash` is a POSIX process started from `/bin/ash`; it forks and execs the
-files of `/bin` (`/bin/ls -la`, `/bin/ash -c 'exit 3'`). Pipes (`|`) come
-in 5e, the terminal and job control in 5f.
+files of `/bin` (`/bin/ls -la`, `/bin/ash -c 'exit 3'`). Pipelines work in
+the dialog (`ls /etc | cat`, a pipeline of three, `ls /bin | wc -l`, a job
+in the background with `wait`), and `/dev/null` takes redirections. The
+terminal and job control come in 5f.
 
 **POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
 interface. The C library is relibc (a fork pinned by
@@ -106,7 +108,7 @@ PID and status to `sigwaitinfo`. Process groups and sessions follow
 `setpgid`, `setsid`, `getpgid` and `getsid`; orphans go to PID 1, which
 the service itself plays. The clock service asks the process service for
 the effective UID before `clock_settime`. The C probe `posix-procs`,
-`cargo xtask process-steps` and `rtbench` rows S10 to S18 check it; on HVF a
+`cargo xtask process-steps` and `rtbench` rows S10 to S22 check it; on HVF a
 `posix_spawn` of a file takes 102 us p50 to the child's `main` and an
 `exec` 113 us (10-minute run of 5c; 121 and 139 us in the run of 5d, at a
 host load of about 2).
@@ -128,13 +130,28 @@ limits, [notes/m5b-processes.md](notes/m5b-processes.md) and
 [notes/m5c-spawn-exec.md](notes/m5c-spawn-exec.md) those of the steps
 before.
 
+Pipes live in their own service (`services/pipe`): 64 pipes with a ring
+of 4 KiB each, `PIPE_BUF` 512, blocking reads and writes as long
+operations in two steps that a signal cancels (`SA_RESTART` continues them),
+`SIGPIPE` before `EPIPE`, `O_NONBLOCK` as a flag of the description. Ends
+cross `fork`, `posix_spawn` (`adddup2`) and `exec`, and the service sees a
+dead process as an end that closes (the reader gets end of file). `/dev/null`
+is a null device of the RAM service. Every step of the service stays below
+the kernel's term B of 20,536 ticks (`cargo xtask process-steps`). On HVF
+(10 minutes, p50) a byte goes through two pipes to another process and back
+in 5.5 us (S19), 1 MiB goes through a pipe at 250 MB/s in writes of 512
+bytes and 432 MB/s in writes of 4 KiB (S20), and `ls /etc | cat` as two
+`fork`s and two `exec`s takes 623 us (S22).
+[notes/m5e-pipes.md](notes/m5e-pipes.md) has the rows, the limits and the
+conformance list.
+
 **C library.** relibc (MIT) is the C library of every POSIX program,
 BusyBox included; its platform is the layer's `stafeto_*` functions.
 os-test's io, malloc, process and signal suites, `basic/spawn`, `basic/unistd`
 `exec*` and the `basic` tests that call `fork` run on it in `ci` from files,
-one boot a suite: 78 pass, 74 fail (`mkstemp`, `access`, `sigaltstack`,
-`posix_openpt`, `setpgid` of a child: the RAM service creates no file yet
-and the terminal and job control wait for 5f) and 26 need pipes (5e); `ci`
+one boot a suite: 120 pass, 73 fail (`mkstemp`, `access`, `sigaltstack`,
+`posix_openpt`: the RAM service creates no file yet and the terminal and
+job control wait for 5f) and 11 need `poll` or `select` (5f) of 204; `ci`
 fails when a test that passed stops passing. relibc
 builds at its own level 3: user-space programs have no size limit, only
 the kernel has one. Details are in
@@ -157,10 +174,14 @@ Apple silicon.
 - `fork` copies everything the layer maps, with no copy on write (about
   70 us a MiB on HVF); shared anonymous memory and mappings made past the
   layer are not in the copy, and a program that `init` starts itself gets
-  `ENOSYS`. Pipes are not there yet, so `ash` runs single external
-  commands and no pipelines.
+  `ENOSYS`.
 - 255 POSIX processes at once: the process service holds 256 records,
   and the RAM file and clock services keep 320 sessions each.
+- Pipes: 64 of 4 KiB in the pipe service; one session (a process) has 16
+  live pipes (`EMFILE`), and a tree of processes under one program
+  `init` started has 48 of them (`ENFILE`), 96 of the 128 blocking reads
+  and writes that may wait (`EAGAIN` past them, and past 8 at one end or
+  16 in one process) and 255 sessions of the service's 320.
 - Files live in RAM; ext4 is read from an image inside the guest, with no
   block driver.
 
@@ -239,14 +260,15 @@ Bounded kernel paths and their costs:
 | Step | What it brings | State |
 |---|---|---|
 | Cleanup after kernel audit 3 | small kernel fixes, Cortex-A53 erratum 835769 workaround, EL2 boot in tests, fresh worst-case measurements | ✅ [#70](https://github.com/stafeto/stafeto/pull/70) |
-| Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | 🚧 |
+| Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | ✅ |
 | Kernel | a DMA memory objects, the Virtio console as a user-space service · b process IDs out of the kernel, thread end notifications, teardown in portions | ✅ [#71](https://github.com/stafeto/stafeto/pull/71), [#72](https://github.com/stafeto/stafeto/pull/72) |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ✅ [#74](https://github.com/stafeto/stafeto/pull/74) |
 | POSIX: C library | relibc on top of the Rust system layer; BusyBox builds with it; the first os-test row | ✅ [#75](https://github.com/stafeto/stafeto/pull/75) |
 | POSIX: process service | process service, `posix_spawn` from the boot image, `waitpid`, `kill`, process groups and sessions | ✅ [#76](https://github.com/stafeto/stafeto/pull/76) |
 | POSIX: spawn and exec | boot image files in the RAM service, a loader, `posix_spawn` and `exec` from files, set-ID through the file service, os-test from files, measured steps of the process service | ✅ [#78](https://github.com/stafeto/stafeto/pull/78) |
-| POSIX: fork | `fork` with the loader copying the parent; the other threads stop for it; `ash` runs external programs; rtbench rows by memory size | 🚧 [#79](https://github.com/stafeto/stafeto/pull/79) |
-| POSIX: shell | pipes, `SA_RESTART`, `SIGCHLD`, a terminal service with `termios` and job control; `ash` runs `ls \| cat` | ⬜ |
+| POSIX: fork | `fork` with the loader copying the parent; the other threads stop for it; `ash` runs external programs; rtbench rows by memory size | ✅ [#79](https://github.com/stafeto/stafeto/pull/79) |
+| POSIX: pipes | a pipe service, `pipe`, ends across `fork`, `posix_spawn` and `exec`, `SA_RESTART` and `SIGCHLD` in the shell, `setpgid` of a child, `/dev/null`; `ash` runs `ls \| cat`; rtbench rows of pipes | ✅ [#80](https://github.com/stafeto/stafeto/pull/80) |
+| POSIX: terminal | a terminal service with `termios` and job control, `poll` and `select`, Ctrl-C to the foreground group | 🚧 |
 | POSIX: conformance | os-test and Open POSIX in `ci`; then timers, `sigqueue` | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |
 

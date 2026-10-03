@@ -162,19 +162,20 @@ struct Work {
 }
 
 /// The values of the sessions a fork gives the child's loader (Handles),
-/// by proto_loader::Slot: Files, Clock and Uart; 0 for none.
+/// by proto_loader::Slot: Files, Clock, Uart and Pipes; 0 for none.
 #[derive(Clone, Copy, Default)]
 pub struct Sessions {
     pub files: u64,
     pub clock: u64,
     pub uart: u64,
+    pub pipes: u64,
 }
 
 impl Sessions {
     /// The parent's own sessions go: those of a fork that never came to
     /// its loader.
     fn close(self) {
-        for raw in [self.files, self.clock, self.uart] {
+        for raw in [self.files, self.clock, self.uart, self.pipes] {
             if raw != 0 {
                 drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
             }
@@ -231,6 +232,7 @@ fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
         (Slot::Files, sessions.files),
         (Slot::Clock, sessions.clock),
         (Slot::Uart, sessions.uart),
+        (Slot::Pipes, sessions.pipes),
     ] {
         if raw != 0 {
             let session = Handle::<Channel>::from_raw(rt::abi::Handle(raw));
@@ -549,7 +551,8 @@ pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
 
 /// Clones of the process's sessions for a child (Clone): the RAM files'
 /// with the descriptions of the descriptors without FD_CLOFORK, the
-/// clock's and the console input's, each the process has.
+/// clock's, the console input's, and the pipe service's with the ends of
+/// the descriptors without FD_CLOFORK, each the process has.
 fn sessions() -> Result<Sessions, i32> {
     use crate::process::clone_errno;
     let mut out = Sessions::default();
@@ -587,6 +590,12 @@ fn sessions() -> Result<Sessions, i32> {
             .map_err(clone_errno)?;
             out.uart = clone.into_raw().0;
         }
+        let mut ends = [0; posix_fs::OPEN_MAX];
+        let count = crate::shared::pipes_kept_by_fork(&mut ends)?;
+        if let Some(pipes) = crate::shared::with_files(|fs| Ok(fs.pipes().map(Handle::raw)))? {
+            let clone = pipes_clone(pipes, &ends[..count])?;
+            out.pipes = clone.into_raw().0;
+        }
         Ok(())
     })();
     match made {
@@ -596,6 +605,24 @@ fn sessions() -> Result<Sessions, i32> {
             Err(errno)
         }
     }
+}
+
+/// Clone of the session `pipes` with the pipe service for a child: a
+/// session that holds the ends `ends` (proto_pipe CLONE).
+pub(crate) fn pipes_clone(pipes: rt::abi::Handle, ends: &[u32]) -> Result<Handle<Channel>, i32> {
+    use crate::process::clone_errno;
+    let mut w = Writer::new();
+    proto_pipe::Method::Clone
+        .header()
+        .write(&mut w)
+        .and_then(|()| w.u32(ends.len() as u32))
+        .map_err(|_| EIO)?;
+    for end in ends {
+        w.u32(*end).map_err(|_| EIO)?;
+    }
+    // The session lives as long as the process's files.
+    rt::service::clone_session(&Handle::<Channel>::borrowed(pipes), w.as_bytes())
+        .map_err(clone_errno)
 }
 
 /// The function the next fork runs in the parent once the loader took the
@@ -655,7 +682,7 @@ fn child() -> Result<(), &'static str> {
         posix_sync::after_fork();
         crate::process::after_fork(posix, handle(raw(Slot::PosixId))).map_err(|_| "its record")?;
         if let Some(files) = handle(raw(Slot::Files)) {
-            crate::shared::after_fork(files, handle(raw(Slot::Uart)));
+            crate::shared::after_fork(files, handle(raw(Slot::Uart)), handle(raw(Slot::Pipes)));
         }
         crate::clock::after_fork(handle(raw(Slot::Clock)), crate::allocation::process())
             .map_err(|_| "its clock")?;
