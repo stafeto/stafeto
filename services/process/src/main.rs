@@ -2469,7 +2469,7 @@ impl Service<0> for Processes {
             n if n == Method::Kill as u16 => self.kill(index, r),
             n if n == Method::SignalGeneration as u16 => self.signal_generation(index, r),
             n if n == Method::StopSelf as u16 => self.stop_self(index, r),
-            n if n == Method::ReturnJobSignal as u16 => self.return_job_signal(index, r),
+            n if n == Method::ReturnSignal as u16 => self.return_signal(index, r),
             n if n == Method::SetPgid as u16 => self.set_pgid(index, r),
             n if n == Method::SetSid as u16 => self.set_sid(index, r),
             n if n == Method::GetPgid as u16 => self.get_group(index, false, r),

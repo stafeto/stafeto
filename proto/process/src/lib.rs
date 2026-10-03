@@ -194,7 +194,7 @@
 use abi::ProcessState;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
-pub const VERSION: u16 = 7;
+pub const VERSION: u16 = 8;
 pub const INVALID: u32 = 500;
 pub const PERMISSION: u32 = 501;
 pub const FULL: u32 = 502;
@@ -458,8 +458,8 @@ pub enum Method {
     StopSelf = 49,
     /// Trusted terminal request: detach one PID, including a leader.
     DetachCtty = 50,
-    /// Return a claimed process-origin job signal without generating a new epoch.
-    ReturnJobSignal = 51,
+    /// Return a claimed process-origin signal; ordinary numbers require ticket 0.
+    ReturnSignal = 51,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -1205,12 +1205,12 @@ mod tests {
             Method::SignalGeneration,
             Method::StopSelf,
             Method::DetachCtty,
-            Method::ReturnJobSignal,
+            Method::ReturnSignal,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
             assert_eq!(*m as u16, METHODS[i]);
-            assert_eq!(m.header().version, 7);
+            assert_eq!(m.header().version, 8);
         }
         for i in 1..=4 {
             assert_eq!(Change::from_number(i).unwrap() as u32, i);

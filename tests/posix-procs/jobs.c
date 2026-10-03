@@ -244,10 +244,69 @@ static void page_info_epoch_test(void) {
     expect("page info unblock jobs", sigprocmask(SIG_UNBLOCK, &signals, NULL), 0);
 }
 
+static void ordinary_return_information(void) {
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGUSR1);
+    expect("ordinary return block", sigprocmask(SIG_BLOCK, &signals, NULL), 0);
+    expect("ordinary return send", kill(getpid(), SIGUSR1), 0);
+    expect("ordinary return assign", stafeto_probe_assign_signal(SIGUSR1), 0);
+    stafeto_probe_return_failure();
+    expect("ordinary failed return mask", sigprocmask(SIG_BLOCK, &signals, NULL), 0);
+    sigset_t pending;
+    expect("ordinary failed return pending", sigpending(&pending), 0);
+    expect("ordinary failed return ownership", sigismember(&pending, SIGUSR1), 1);
+    expect("ordinary return retry", sigprocmask(SIG_BLOCK, &signals, NULL), 0);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    expect("ordinary returned signal", sigtimedwait(&signals, &info, &zero), SIGUSR1);
+    expect("ordinary returned sender", info.si_pid, getpid());
+    expect("ordinary returned code", info.si_code, 0);
+    expect("ordinary coalescing first send", kill(getpid(), SIGUSR1), 0);
+    expect("ordinary coalescing return", stafeto_probe_return_job_info(SIGUSR1, 0, 300, -6), 0);
+    expect("ordinary coalesced accept", sigtimedwait(&signals, &info, &zero), SIGUSR1);
+    expect("ordinary coalesced sender", info.si_pid, getpid());
+    expect("ordinary coalesced code", info.si_code, 0);
+    expect("ordinary nonzero ticket rejected", stafeto_probe_return_job_info(SIGUSR1, 8, 300, 0), EINVAL);
+    signal(SIGUSR1, SIG_IGN);
+    expect("ordinary ignored return ack", stafeto_probe_return_job_info(SIGUSR1, 0, 300, 0), 0);
+    signal(SIGUSR1, SIG_DFL);
+    errno = 0;
+    expect("ordinary ignored return discarded", sigtimedwait(&signals, &info, &zero), -1);
+    expect("ordinary ignored return errno", errno, EAGAIN);
+    expect("ordinary return unblock", sigprocmask(SIG_UNBLOCK, &signals, NULL), 0);
+}
+
+static void ignored_page_information(void) {
+    const int numbers[] = {SIGUSR1, SIGTSTP, SIGTTIN, SIGTTOU, SIGCONT};
+    for (unsigned n = 0; n < sizeof(numbers) / sizeof(numbers[0]); n++) {
+        int number = numbers[n];
+        sigset_t signals;
+        sigemptyset(&signals); sigaddset(&signals, number);
+        expect("ignored Page block", sigprocmask(SIG_BLOCK, &signals, NULL), 0);
+        expect("ignored Page send", kill(getpid(), number), 0);
+        sigset_t pending;
+        expect("ignored Page before disposition", sigpending(&pending), 0);
+        expect("ignored Page initially present", sigismember(&pending, number), 1);
+        signal(number, SIG_IGN);
+        expect("ignored Page after disposition", sigpending(&pending), 0);
+        expect("ignored Page removed", sigismember(&pending, number), 0);
+        signal(number, SIG_DFL);
+        struct timespec zero = {0, 0};
+        siginfo_t info;
+        errno = 0;
+        expect("ignored Page discarded", sigtimedwait(&signals, &info, &zero), -1);
+        expect("ignored Page empty", errno, EAGAIN);
+        expect("ignored Page unblock", sigprocmask(SIG_UNBLOCK, &signals, NULL), 0);
+    }
+}
+
 static int job_control(void) {
     expect("zero thread return", stafeto_probe_zero_return(), 0);
     expect("linked job-control group", setpgid(0, 0), 0);
     page_info_epoch_test();
+    ordinary_return_information();
+    ignored_page_information();
     sigset_t jobs, pending, chld;
     job_set(&jobs);
     expect("block job signals", sigprocmask(SIG_BLOCK, &jobs, NULL), 0);
