@@ -2054,6 +2054,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: after exec pid",
         // The memory map of a program from a file (5d).
         "posix-procs: memory map ",
+        // fork's copy (5d).
+        "posix-procs: a bare fork copied the parent",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }

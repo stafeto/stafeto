@@ -93,6 +93,47 @@ pub fn post(page: &Page, signal: u8, info: Info) -> Posted {
     Posted::Pending
 }
 
+/// The page of a new child: a spawned one's main thread starts with
+/// `mask`, and the parent's SIG_IGN pass but those of `default`
+/// ([P24-SPAWN]); a forked one takes the classes of its parent's actions
+/// and its flags of SIGCHLD, which ForkStart named ([P24-FORK]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageStart {
+    Spawn {
+        mask: u64,
+        default: u64,
+    },
+    Fork {
+        ignored: u64,
+        caught: u64,
+        flags: u64,
+    },
+}
+
+impl PageStart {
+    /// Writes the words of `page`, the child's, from `from`, its parent's;
+    /// the service does so before the record is a target of any walk.
+    pub fn write(self, page: &Page, from: &Page) {
+        use core::sync::atomic::Ordering::{Acquire, Release};
+        match self {
+            PageStart::Spawn { mask, default } => {
+                page.start_mask.store(mask, Release);
+                let ignored = from.ignored.load(Acquire) & !default;
+                page.ignored.store(ignored, Release);
+            }
+            PageStart::Fork {
+                ignored,
+                caught,
+                flags,
+            } => {
+                page.ignored.store(ignored, Release);
+                page.caught.store(caught, Release);
+                page.flags.store(flags, Release);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +219,45 @@ mod tests {
         assert!(!refused(SIGTTIN, &p));
         assert!(refused(SIGTTOU, &p));
         assert!(!refused(SIGCONT, &p));
+    }
+
+    /// A forked child's page has its parent's classes from its start, so
+    /// a signal its parent ignores never waits on it; a spawned child's
+    /// passes the parent's SIG_IGN but those set to the default.
+    #[test]
+    fn a_new_page_takes_what_its_child_starts_with() {
+        use proto_process::{PAGE_NOCLDWAIT, SIGHUP, SIGTERM};
+        let parent = page();
+        parent
+            .ignored
+            .store(bit(SIGHUP) | bit(SIGTERM), Ordering::Relaxed);
+        let forked = page();
+        PageStart::Fork {
+            ignored: bit(SIGHUP),
+            caught: bit(SIGUSR1),
+            flags: PAGE_NOCLDWAIT,
+        }
+        .write(&forked, &parent);
+        assert_eq!(forked.ignored.load(Ordering::Relaxed), bit(SIGHUP));
+        assert_eq!(forked.caught.load(Ordering::Relaxed), bit(SIGUSR1));
+        assert_eq!(forked.flags.load(Ordering::Relaxed), PAGE_NOCLDWAIT);
+        let info = Info {
+            code: 0,
+            pid: 2,
+            uid: 0,
+            status: 0,
+        };
+        assert_eq!(post(&forked, SIGHUP, info), Posted::Ignored);
+        assert_eq!(forked.pending.load(Ordering::Relaxed), 0);
+        assert_eq!(post(&forked, SIGUSR1, info), Posted::Pending);
+        let spawned = page();
+        PageStart::Spawn {
+            mask: 1 << 3,
+            default: bit(SIGTERM),
+        }
+        .write(&spawned, &parent);
+        assert_eq!(spawned.ignored.load(Ordering::Relaxed), bit(SIGHUP));
+        assert_eq!(spawned.start_mask.load(Ordering::Relaxed), 1 << 3);
+        assert_eq!(spawned.caught.load(Ordering::Relaxed), 0);
     }
 }

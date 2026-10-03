@@ -107,6 +107,20 @@
 //! and ends nothing. The identity session carries the image number too:
 //! a copy of an old image's identity vouches for nothing.
 //!
+//! ForkStart, through a session (spec 2, 3.2; 5d): body `ForkStart`. As
+//! SpawnStart with no flags and no group: the child's record (LOADING) in
+//! the caller's group and session with the caller's six credentials, its
+//! process with the caller's quota from the service's pool, the loader at
+//! the caller's level; before the record is a target of any signal, its
+//! page takes the classes of the caller's actions the body names, so a
+//! signal sent to the group while the copy goes on finds what the child
+//! will ignore and catch. The reply waits for Boot: status u32, the
+//! child's PID u32 and the parent's copy of C, whose loader copies the
+//! caller's memory (proto_loader Fork). ForkCommit and ForkAbort, body the
+//! child's PID u32: as SpawnCommit and SpawnAbort, for a child of
+//! ForkStart alone (NO_PROCESS for any other); SpawnCommit and SpawnAbort
+//! take no child of ForkStart.
+//!
 //! Pool, through a session, no body: status u32 and the bytes u64 of the
 //! service's quota left for the children past its reserve, what a probe
 //! reads to see that ended loads gave their quota back.
@@ -156,7 +170,7 @@
 use abi::ProcessState;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 pub const INVALID: u32 = 500;
 pub const PERMISSION: u32 = 501;
 pub const FULL: u32 = 502;
@@ -400,6 +414,9 @@ pub enum Method {
     Replace = 31,
     Ready = 32,
     Pool = 33,
+    ForkStart = 34,
+    ForkCommit = 35,
+    ForkAbort = 36,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -411,7 +428,7 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33,
+    31, 32, 33, 34, 35, 36,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -805,6 +822,51 @@ impl SpawnStart {
     }
 }
 
+/// The body of ForkStart: the caller's level u32, at which the loader
+/// runs, then the words of the page (`Page`) the child starts with: the
+/// signals its actions ignore u64 and catch u64, and its flags of SIGCHLD
+/// u64 (PAGE_NOCLDWAIT, PAGE_NOCLDSTOP, PAGE_CHLD_IGNORED).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForkStart {
+    pub level: u8,
+    pub ignored: u64,
+    pub caught: u64,
+    pub flags: u64,
+}
+
+/// The flags of the page ForkStart takes.
+pub const PAGE_FLAGS: u64 = PAGE_NOCLDWAIT | PAGE_NOCLDSTOP | PAGE_CHLD_IGNORED;
+
+impl ForkStart {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.level.into())?;
+        w.u64(self.ignored)?;
+        w.u64(self.caught)?;
+        w.u64(self.flags)
+    }
+
+    /// BAD_SIZE out of the layout, with a level past 63 or a flag past
+    /// PAGE_FLAGS.
+    pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
+        let level = r.u32()?;
+        let (ignored, caught, flags) = (r.u64()?, r.u64()?, r.u64()?);
+        r.finish()?;
+        let level = u8::try_from(level)
+            .ok()
+            .filter(|&l| l <= 63)
+            .ok_or(Status::BadSize)?;
+        if flags & !PAGE_FLAGS != 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(Self {
+            level,
+            ignored,
+            caught,
+            flags,
+        })
+    }
+}
+
 /// The body of SetId: the ticket of the loader's place u64 (Vouch's
 /// `LoaderOf`), the record's PID u32 and image u32, the user ID u32 and
 /// the group ID u32 the file sets (NO_ID for none).
@@ -1008,11 +1070,14 @@ mod tests {
             Method::Replace,
             Method::Ready,
             Method::Pool,
+            Method::ForkStart,
+            Method::ForkCommit,
+            Method::ForkAbort,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
             assert_eq!(*m as u16, METHODS[i]);
-            assert_eq!(m.header().version, 5);
+            assert_eq!(m.header().version, 6);
         }
         for i in 1..=4 {
             assert_eq!(Change::from_number(i).unwrap() as u32, i);
@@ -1236,6 +1301,18 @@ mod tests {
         let mut w = Writer::new();
         none.write(&mut w).unwrap();
         assert_eq!(SetId::read(Reader::new(w.as_bytes())), Err(Status::BadSize));
+        let fork = ForkStart {
+            level: 30,
+            ignored: 1 << 1,
+            caught: 1 << 9,
+            flags: PAGE_NOCLDSTOP,
+        };
+        let mut w = Writer::new();
+        fork.write(&mut w).unwrap();
+        assert_eq!(ForkStart::read(Reader::new(w.as_bytes())), Ok(fork));
+        let mut bad = w.as_bytes().to_vec();
+        bad[20] = 8;
+        assert_eq!(ForkStart::read(Reader::new(&bad)), Err(Status::BadSize));
         // Only a notary label with SET_ID may send SetId.
         assert!(may_set_id(NOTARY | SET_ID | 7));
         assert!(!may_set_id(NOTARY | 7));

@@ -91,6 +91,20 @@
  * set-ID file that failed to load, the next exec keeps euid 65534; the old
  * image of such an exec is killed at ExecCommit and never sets the clock.
  *
+ * Stage forks (5d): fork by a full copy, which the child's loader makes.
+ * A program init started (this probe) has no segments in its map and gets
+ * ENOSYS. The role forkbare makes bare children, which run on the copy
+ * with nothing of the layer bound and say what they saw by their status:
+ * the parent's .data, heap and stack as they were at the fork, their own
+ * copies of them, none of the parent's writes after it, and a page that
+ * ignores what the parent ignores from its start, so the SIGUSR2 the
+ * parent sends its group while the copy goes on never waits there; the
+ * loader leaves no mapping of the parent's objects. A record has 32
+ * children of fork at most (the 33rd is EAGAIN), the pool of the service
+ * gives no quota past its own (ENOMEM), and a ForkStart that never got
+ * its copy takes neither SpawnCommit nor an early ForkCommit, and leaves
+ * no zombie after ForkAbort.
+ *
  * Stage 10: the probe is a record of init's table, and its end is init's
  * line: the probe execs a child's role that exits with 42, and init
  * reports that status (REPLACED), never the old image's 0.
@@ -131,6 +145,12 @@ int stafeto_probe_exec_then_exit(const char *path, char *const argv[], int code)
 int stafeto_probe_exec_outlive(const char *path, char *const argv[]);
 int stafeto_probe_commit_early(int *pid);
 int stafeto_probe_loads(void);
+int stafeto_probe_fork_bare(int (*child)(void *), void *arg, void (*window)(void));
+unsigned long long stafeto_probe_page(int word);
+void stafeto_probe_yield(void);
+void stafeto_probe_park(void);
+int stafeto_probe_fork_abort(int *pid);
+unsigned long long stafeto_probe_map_mappings(void);
 unsigned long long stafeto_probe_pool(void);
 void stafeto_probe_decoy(int on);
 size_t stafeto_probe_memory_map(unsigned long long *out, size_t max);
@@ -889,6 +909,118 @@ static int map_start(void) {
     return 0;
 }
 
+
+/* Stage forks (5d): a bare child of fork's copy runs on the copy with
+ * nothing of the layer bound, and says what it saw by its exit status. */
+static volatile int bare_data = 1234;
+static volatile int bare_later;
+static volatile int *bare_heap;
+
+/* The child of `fork_bare`: the parent's .data, heap and stack as they
+ * were at the fork, its own copies of them, a page that ignores what the
+ * parent ignores from its start (the group's SIGUSR2 of the window never
+ * waited there), and none of the parent's writes after the fork. */
+static int bare_child(void *arg) {
+    volatile int *stack = arg;
+    int bad = 0;
+    if (bare_data != 5678) bad |= 1;
+    if (bare_heap[0] != 0x5a5a || bare_heap[1023] != 0x6b6b) bad |= 2;
+    if (*stack != 77) bad |= 4;
+    bare_data = 1;
+    bare_heap[0] = 2;
+    *stack = 3;
+    if (bare_data != 1 || bare_heap[0] != 2 || *stack != 3) bad |= 8;
+    unsigned long long usr2 = 1ull << (SIGUSR2 - 1);
+    if (!(stafeto_probe_page(1) & usr2)) bad |= 16;
+    if (stafeto_probe_page(0) & usr2) bad |= 32;
+    for (int i = 0; i < 100; i++) {
+        if (bare_later != 0) bad |= 64;
+        stafeto_probe_yield();
+    }
+    return bad;
+}
+
+/* The window of `fork_bare`: SIGUSR2 to the group, the child's record
+ * among it while it loads. */
+static void bare_window(void) { kill(0, SIGUSR2); }
+
+static int bare_park(void *arg) {
+    (void)arg;
+    stafeto_probe_park();
+    return 1;
+}
+
+/* Role forkbare: a bare fork in a group of its own, which ignores
+ * SIGUSR2. */
+static int fork_bare(void) {
+    expect("setpgid of forkbare", setpgid(0, 0), 0);
+    signal(SIGUSR2, SIG_IGN);
+    bare_heap = malloc(4096 * sizeof(int));
+    volatile int stack = 77;
+    bare_data = 5678;
+    bare_heap[0] = 0x5a5a;
+    bare_heap[1023] = 0x6b6b;
+    int pid = stafeto_probe_fork_bare(bare_child, (void *)&stack, bare_window);
+    if (pid <= 0) {
+        printf("posix-procs: a bare fork gave %d\n", pid);
+        return 1;
+    }
+    bare_later = 1;
+    /* The loader unmapped every piece of the parent's objects. */
+    expect("the mappings of the parent's objects", (int)stafeto_probe_map_mappings(), 1);
+    int status = -1;
+    expect("waitpid of the bare child", waitpid(pid, &status, 0), pid);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("posix-procs: the bare child ended with status %#x\n", status);
+        failures++;
+    }
+    expect("the parent's .data", bare_data, 5678);
+    expect("the parent's heap", bare_heap[0], 0x5a5a);
+    expect("the parent's stack", stack, 77);
+    /* 32 children of the record at once; the 33rd is EAGAIN. */
+    int pids[32], live = 0;
+    for (; live < 32; live++) {
+        pids[live] = stafeto_probe_fork_bare(bare_park, NULL, NULL);
+        if (pids[live] <= 0) {
+            printf("posix-procs: bare child %d of 32 gave %d\n", live + 1, pids[live]);
+            failures++;
+            break;
+        }
+    }
+    if (live == 32) expect("a 33rd bare child", stafeto_probe_fork_bare(bare_park, NULL, NULL), -EAGAIN);
+    for (int i = 0; i < live; i++) kill(pids[i], SIGKILL);
+    for (int i = 0; i < live; i++) reap("one of 32 bare children", pids[i], 0, SIGKILL);
+    /* A load of ForkStart that never got its copy: SpawnCommit takes no
+     * child of ForkStart, ForkCommit no child whose copy is not ready,
+     * and ForkAbort leaves no zombie. */
+    int aborted = -1;
+    expect("ForkCommit before the copy", stafeto_probe_fork_abort(&aborted), 0);
+    expect("a wait for the aborted fork", waitpid(aborted, NULL, WNOHANG), -1);
+    expect("its errno", errno, ECHILD);
+    if (failures == 0) printf("posix-procs: a bare fork copied the parent\n");
+    return failures;
+}
+
+/* Role forkpool, while a sleeper of its parent's lives: 31 bare children
+ * take the rest of the process service's pool (33 quotas of the probe's,
+ * tests/init's table), and the 32nd fork, which the service's limit of
+ * children would take, is ENOMEM. */
+static int fork_pool(void) {
+    int pids[31], live = 0;
+    for (; live < 31; live++) {
+        pids[live] = stafeto_probe_fork_bare(bare_park, NULL, NULL);
+        if (pids[live] <= 0) {
+            printf("posix-procs: bare child %d of 31 gave %d\n", live + 1, pids[live]);
+            failures++;
+            break;
+        }
+    }
+    if (live == 31) expect("a fork past the pool", stafeto_probe_fork_bare(bare_park, NULL, NULL), -ENOMEM);
+    for (int i = 0; i < live; i++) kill(pids[i], SIGKILL);
+    for (int i = 0; i < live; i++) reap("one of 31 bare children", pids[i], 0, SIGKILL);
+    return failures;
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "steps") == 0) return steps_run();
@@ -930,6 +1062,8 @@ static int role(const char *name) {
         }
         return 0;
     }
+    if (strcmp(name, "forkbare") == 0) return fork_bare();
+    if (strcmp(name, "forkpool") == 0) return fork_pool();
     if (strcmp(name, "memmap") == 0) {
         int bad = map_start();
         return bad != 0 ? bad : 10 * map_growth("child");
@@ -1450,6 +1584,19 @@ static void memory(void) {
     run_role("/bin/procs-child", "memmap", NULL);
 }
 
+/* Stage forks (5d). */
+static void forks(void) {
+    /* A program init started has no segments in its map. */
+    expect("a fork of a program init started", stafeto_probe_fork_bare(bare_park, NULL, NULL), -ENOSYS);
+    run_role("/bin/procs-child", "forkbare", NULL);
+    pid_t sleeper = start("sleep");
+    run_role("/bin/procs-child", "forkpool", NULL);
+    if (sleeper > 0) {
+        kill(sleeper, SIGKILL);
+        reap("the sleeper of forkpool", sleeper, 0, SIGKILL);
+    }
+}
+
 int main(int argc, char **argv) {
     argc_seen = argc;
     argv_seen = argv;
@@ -1490,6 +1637,8 @@ int main(int argc, char **argv) {
     execs_nobody();
     printf("posix-procs: stage memory\n");
     memory();
+    printf("posix-procs: stage forks\n");
+    forks();
     printf("posix-procs: stage wave\n");
     wave();
     if (failures != 0) return 1;

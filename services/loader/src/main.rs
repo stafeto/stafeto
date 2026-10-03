@@ -20,6 +20,14 @@
 //! sessions and credentials (Take), writes the start area, closes all that
 //! was its own, the image session, the loaders' session and its identity
 //! among them (condition O6), unmaps its data and stack and jumps to the program.
+//!
+//! For a `fork` (5d) the parent gives Fork in place of Start, then the
+//! objects of its memory map (Regions), and Go makes the copy: each region
+//! goes into an object of the new process at the parent's address with the
+//! parent's access, the parent's bytes read through a window of the
+//! loader's region (`copy`). Once the record is ready the loader writes the
+//! child's handles and map into the layer's transfer and jumps to the
+//! layer's point of return on the parent's stack (`finish_fork`).
 
 #![no_std]
 #![no_main]
@@ -27,9 +35,10 @@
 use abi::{INIT_STACK_TOP, INLINE_MAX, MESSAGE_MAX, Rights, START_CHANNEL, Source};
 use bootimg::Part;
 use bootimg::elf::{self, Load};
+use core::mem::MaybeUninit;
 use proto_loader::{
-    self as pl, AREA_MAX, BLOCK_MAX, Block, BlockError, LOADER_BASE, MAP_ENTRIES, MapEntry, Method,
-    PROGRAM_ROOM, SLOTS, STACK_SIZE, START_AREA, Slot,
+    self as pl, AREA_MAX, BLOCK_MAX, Block, BlockError, Fork, LOADER_BASE, MAP_ENTRIES, MapEntry,
+    Method, PROGRAM_ROOM, REGIONS_MAX, Region, SLOTS, STACK_SIZE, START_AREA, Slot, TRANSFER_SIZE,
 };
 use proto_wire::{Header, Reader, Status, Writer};
 use rt::abi::{Access, Error};
@@ -44,6 +53,10 @@ const PAGE: u64 = 4096;
 const STAGING: u64 = LOADER_BASE + (4 << 20);
 /// Where it maps the parent's block to copy it.
 const BORROWED: u64 = LOADER_BASE + (6 << 20);
+/// Where it maps a piece of an object of the parent's memory to copy it
+/// (Fork), WINDOW bytes at most.
+const WINDOW: u64 = LOADER_BASE + (8 << 20);
+const PIECE: u64 = 4 << 20;
 /// The exit code of a loader that gave up: the parent hears why through C
 /// first, or its wait reports 127 (posix_spawn's fallback, [MUSL-SPAWN]).
 const GAVE_UP: u64 = 127;
@@ -69,13 +82,16 @@ fn main(level: u64) -> u64 {
     let Ok(own) = boot(&session, &start, level) else {
         return GAVE_UP;
     };
-    let Some(loaded) = serve(&session, &start, &own) else {
+    let Some(done) = serve(&session, &start, &own) else {
         return GAVE_UP;
     };
     let Ok(taken) = take(&session) else {
         return GAVE_UP;
     };
-    finish(session, start, own, loaded, taken)
+    match done {
+        Done::Loaded(loaded) => finish(session, start, own, loaded, taken),
+        Done::Copied(copied) => finish_fork(session, start, own, copied, taken),
+    }
 }
 
 /// Boot: the copies of C for the parent (SEND, label 1) and for the
@@ -167,24 +183,97 @@ fn staged(len: usize) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(STAGING as *const u8, len) }
 }
 
+/// What the parent's requests came to: a program loaded from its file
+/// (Start), or a copy of the parent's memory (Fork).
+enum Done {
+    Loaded(Loaded),
+    Copied(Copied),
+}
+
+/// The copy a Fork made: Fork's body, the scratch with the objects of the
+/// child's map, and the sessions Handles gave.
+struct Copied {
+    fork: Fork,
+    scratch: &'static mut Scratch,
+    given: [Option<Handle<Channel>>; SLOTS],
+}
+
+/// The loader's notes of a copy, in an object of its own at STAGING (too
+/// big for its stack): the regions Regions brought and the parent's
+/// handle of each, then the objects of the child's map.
+struct Scratch {
+    count: usize,
+    regions: [MaybeUninit<Region>; REGIONS_MAX],
+    parents: [u64; REGIONS_MAX],
+    kept: usize,
+    map: [MaybeUninit<MapEntry>; REGIONS_MAX],
+}
+
+impl Scratch {
+    /// The regions that came.
+    fn regions(&self) -> &[Region] {
+        // SAFETY: Regions wrote the first `count` regions.
+        unsafe { core::slice::from_raw_parts(self.regions.as_ptr().cast(), self.count) }
+    }
+
+    /// The entries of the child's map.
+    fn map(&self) -> &[MapEntry] {
+        // SAFETY: `copy` wrote the first `kept` entries.
+        unsafe { core::slice::from_raw_parts(self.map.as_ptr().cast(), self.kept) }
+    }
+}
+
+/// The pages of the scratch.
+const SCRATCH_LEN: u64 = (core::mem::size_of::<Scratch>() as u64).next_multiple_of(PAGE);
+
+/// The scratch of a copy: a new object mapped at STAGING, which the new
+/// process pays for, all zeros.
+fn scratch(own: &Own) -> Result<&'static mut Scratch, Status> {
+    let m = sys::mem_create(SCRATCH_LEN).map_err(Status::Kernel)?;
+    sys::mem_map(
+        &own.process,
+        &m,
+        0,
+        SCRATCH_LEN,
+        STAGING as usize,
+        Access::ReadWrite,
+    )
+    .map_err(Status::Kernel)?;
+    // SAFETY: the object is mapped at STAGING for the loader's life, its
+    // zeros are a Scratch with no region (MaybeUninit and integers), and
+    // nothing else reaches it.
+    Ok(unsafe { &mut *(STAGING as *mut Scratch) })
+}
+
 /// The requests of the parent through C and the service's word that the
-/// record is ready: the load once Start and Go came, and the end once the
-/// image is ready and the record too. None when the loader gives up.
-fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Option<Loaded> {
+/// record is ready: the load once Start and Go came, or the copy once
+/// Fork, the regions and Go came, and the end once the image or the copy
+/// is ready and the record too. None when the loader gives up.
+fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Option<Done> {
     let mut block_len = None;
     let mut loaded: Option<(u64, Handle<Channel>, Maps)> = None;
+    let mut fork: Option<(Fork, &'static mut Scratch)> = None;
+    let mut copied = false;
     let mut given: [Option<Handle<Channel>>; SLOTS] = Default::default();
     let mut ready = false;
     let mut buffer = [0; MESSAGE_MAX];
     loop {
         if ready && let Some((entry, image, maps)) = loaded.take() {
-            return Some(Loaded {
+            return Some(Done::Loaded(Loaded {
                 block_len: block_len?,
                 entry,
                 image,
                 maps,
                 given,
-            });
+            }));
+        }
+        if ready && copied {
+            let (fork, scratch) = fork?;
+            return Some(Done::Copied(Copied {
+                fork,
+                scratch,
+                given,
+            }));
         }
         match sys::receive(start).ok()? {
             Received::Notification {
@@ -222,8 +311,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     }
                     _ => None,
                 };
+                let first = block_len.is_none() && fork.is_none();
                 let status = match method {
-                    Some(Method::Start) if block_len.is_none() => {
+                    Some(Method::Start) if first => {
                         let memory = handles.take::<Memory>(0).ok();
                         match (r.u32(), memory, r.finish()) {
                             (Ok(len), Some(memory), Ok(())) => {
@@ -236,6 +326,36 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 }
                             }
                             _ => Status::BadSize.code(),
+                        }
+                    }
+                    Some(Method::Fork) if first => match Fork::read(r) {
+                        Ok(body) if handles.is_empty() => match scratch(own) {
+                            Ok(scratch) => {
+                                fork = Some((body, scratch));
+                                0
+                            }
+                            Err(status) => status.code(),
+                        },
+                        _ => Status::BadSize.code(),
+                    },
+                    Some(Method::Regions) if !copied => match fork.as_mut() {
+                        Some((_, scratch)) => match take_regions(r, &mut handles, scratch) {
+                            Ok(()) => 0,
+                            Err(status) => status.code(),
+                        },
+                        None => Status::Kernel(Error::BadState).code(),
+                    },
+                    Some(Method::Go) if !copied && fork.is_some() => {
+                        let (body, scratch) = fork.as_mut()?;
+                        match copy(own, body, scratch).and_then(|()| tell_ready(session)) {
+                            Ok(()) => {
+                                copied = true;
+                                0
+                            }
+                            Err(code) => {
+                                let _ = token.reply(&proto_wire::reply(Status::from_code(code)));
+                                return None;
+                            }
                         }
                     }
                     Some(Method::Go) if block_len.is_some() && loaded.is_none() => {
@@ -257,7 +377,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             }
                         }
                     }
-                    Some(Method::Handles) if loaded.is_some() => {
+                    Some(Method::Handles) if loaded.is_some() || fork.is_some() => {
                         match take_given(r, &mut handles, &mut given) {
                             Ok(()) => 0,
                             Err(status) => status.code(),
@@ -270,6 +390,153 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
             }
         }
     }
+}
+
+/// Regions: an entry for each handle, a memory object of the parent's
+/// map with MAP_READ at least the entry's pages long, each taken where
+/// `admit` lets it; BAD_SIZE for anything else, and none of the message
+/// is taken then.
+fn take_regions(
+    mut r: Reader<'_>,
+    handles: &mut rt::handle::Incoming,
+    scratch: &mut Scratch,
+) -> Result<(), Status> {
+    let count = handles.len();
+    if count == 0 {
+        return Err(Status::BadSize);
+    }
+    let mut regions = [None; abi::MESSAGE_HANDLES];
+    for (i, region) in regions.iter_mut().enumerate().take(count) {
+        let read = Region::read(&mut r)?;
+        let reads = matches!(handles.info(i), Some((abi::ObjectKind::Memory, rights)) if rights.contains(Rights::MAP_READ));
+        if !reads {
+            return Err(Status::BadSize);
+        }
+        *region = Some(read);
+    }
+    r.finish()?;
+    let held = scratch.count;
+    for (i, region) in regions.iter().enumerate().take(count) {
+        let region = region.ok_or(Status::BadSize)?;
+        let memory = handles.take::<Memory>(i).map_err(Status::Kernel)?;
+        let long =
+            sys::memory_info(&memory).is_ok_and(|info| info.size >= u64::from(region.pages) * PAGE);
+        let admitted = long && pl::admit(scratch.regions(), &region).is_ok();
+        if !admitted {
+            // The regions of this message go again.
+            for parent in &mut scratch.parents[held..scratch.count] {
+                drop(Handle::<Memory>::from_raw(abi::Handle(core::mem::take(
+                    parent,
+                ))));
+            }
+            scratch.count = held;
+            return Err(Status::BadSize);
+        }
+        let at = scratch.count;
+        scratch.regions[at].write(region);
+        scratch.parents[at] = memory.into_raw().0;
+        scratch.count += 1;
+    }
+    Ok(())
+}
+
+/// Go of a Fork: once every region came and `check_fork` holds, each
+/// object of the child (`pl::groups` of the regions sorted by address)
+/// is made, the new process paying, mapped at its address and filled
+/// from the parent's objects through WINDOW; the code and the read-only
+/// data are mapped again with their access once filled (the kernel
+/// cleans the caches for code it maps). Each parent's handle closes once
+/// its region is copied, and a narrowed handle of each new object goes to
+/// the child's map. NO_MEMORY past the child's quota, BAD_SIZE for a copy
+/// that may not go.
+fn copy(own: &Own, fork: &Fork, scratch: &mut Scratch) -> Result<(), u32> {
+    pl::check_fork(fork, scratch.regions()).map_err(|s| s.code())?;
+    // By address: insertion sort, REGIONS_MAX at most.
+    let n = scratch.count;
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && scratch.regions()[j - 1].address > scratch.regions()[j].address {
+            scratch.regions.swap(j - 1, j);
+            scratch.parents.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    let mut next = 0;
+    loop {
+        let Some(first) = pl::groups(&scratch.regions()[next..]).next() else {
+            break;
+        };
+        let group = next + first.start..next + first.end;
+        next = group.end;
+        let (first, last) = (
+            scratch.regions()[group.start],
+            scratch.regions()[group.end - 1],
+        );
+        let len = last.end() - first.address;
+        let at = first.address as usize;
+        let m = sys::mem_create(len).map_err(code)?;
+        loader::map_narrowed(&own.process, &m, 0, len, at, Access::ReadWrite).map_err(code)?;
+        for i in group.clone() {
+            let region = scratch.regions()[i];
+            let parent =
+                Handle::<Memory>::from_raw(abi::Handle(core::mem::take(&mut scratch.parents[i])));
+            let bytes = u64::from(region.pages) * PAGE;
+            fill(own, &parent, bytes, region.address)?;
+        }
+        if first.access != Access::ReadWrite {
+            // SAFETY: the new object's mapping, which nothing uses now.
+            unsafe { sys::mem_unmap(&own.process, at, len) }.map_err(code)?;
+            loader::map_narrowed(&own.process, &m, 0, len, at, first.access).map_err(code)?;
+        }
+        let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+        if first.access == Access::ReadWrite {
+            rights = rights | Rights::MAP_WRITE;
+        }
+        let kept = sys::handle_duplicate(&m, rights).map_err(code)?;
+        let pages = u32::try_from(len / PAGE).map_err(|_| pl::TOO_BIG)?;
+        scratch.map[scratch.kept].write(MapEntry {
+            address: first.address,
+            pages,
+            access: first.access,
+            handle: kept.into_raw().0,
+        });
+        scratch.kept += 1;
+    }
+    Ok(())
+}
+
+/// `bytes` of the parent's object `parent` into the new process at `at`,
+/// mapped writable there: PIECE bytes at a time through WINDOW, each
+/// piece unmapped once copied.
+fn fill(own: &Own, parent: &Handle<Memory>, bytes: u64, at: u64) -> Result<(), u32> {
+    let mut offset = 0;
+    while offset < bytes {
+        let piece = (bytes - offset).min(PIECE);
+        sys::mem_map(
+            &own.process,
+            parent,
+            offset,
+            piece,
+            WINDOW as usize,
+            Access::Read,
+        )
+        .map_err(code)?;
+        // SAFETY: WINDOW maps `piece` bytes of the parent's object, read
+        // only, and the new object is mapped writable at `at` for `bytes`
+        // bytes; the two never meet (`admit` keeps every region off the
+        // loader's region). The parent waits for Go's reply meanwhile.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                WINDOW as *const u8,
+                (at + offset) as *mut u8,
+                piece as usize,
+            );
+        }
+        // SAFETY: the window's mapping, which nothing uses now.
+        unsafe { sys::mem_unmap(&own.process, WINDOW as usize, piece) }.map_err(code)?;
+        offset += piece;
+    }
+    Ok(())
 }
 
 /// Ready: the service hears the image is loaded before the parent does,
@@ -673,6 +940,54 @@ fn finish(
     // SAFETY: the loader's last step: its data and stack go, and the jump
     // runs on registers alone.
     unsafe { leap(process, data, data_len, entry, INIT_STACK_TOP, START_AREA) }
+}
+
+/// The end of a copy: the child's handles (its process, its thread, its
+/// sessions with the services from Take, those Handles gave) and its map
+/// go into the transfer at Fork's address, every handle of the loader's
+/// own closes, and the jump to Fork's `pc` on its `sp` with x0 = 0, where
+/// the layer's point of return takes the parent's registers back.
+fn finish_fork(
+    session: Handle<Channel>,
+    start: Handle<Channel>,
+    own: Own,
+    copied: Copied,
+    taken: Taken,
+) -> u64 {
+    let Copied {
+        fork,
+        scratch,
+        mut given,
+    } = copied;
+    let process = own.process.raw().0;
+    let mut handles = [0; SLOTS];
+    handles[Slot::Process as usize] = keep(own.process);
+    handles[Slot::Thread as usize] = keep(own.thread);
+    handles[Slot::Posix as usize] = keep(taken.posix);
+    handles[Slot::PosixId as usize] = keep(taken.identity);
+    handles[Slot::Console as usize] = taken.console.map_or(0, keep);
+    for slot in [Slot::Files, Slot::Clock, Slot::Uart] {
+        handles[slot as usize] = given[slot as usize].take().map_or(0, keep);
+    }
+    // SAFETY: `check_fork` put the transfer whole in a writable region,
+    // which `copy` mapped read and write at the parent's address; the
+    // child's thread does not run yet.
+    let out = unsafe { core::slice::from_raw_parts_mut(fork.transfer as *mut u8, TRANSFER_SIZE) };
+    if pl::write_transfer(out, handles, scratch.map()).is_err() {
+        return GAVE_UP;
+    }
+    drop((own.files, own.identity, start, session));
+    // SAFETY: the scratch is read no more.
+    let _ = unsafe {
+        sys::mem_unmap(
+            &Handle::<Process>::borrowed(abi::Handle(process)),
+            STAGING as usize,
+            SCRATCH_LEN,
+        )
+    };
+    let (data, data_len) = own.data;
+    // SAFETY: the loader's last step, as for a program from a file.
+    unsafe { leap(process, data, data_len, fork.pc, fork.sp, 0) }
 }
 
 /// Unmaps the loader's data and stack (`mem_unmap` of `len` bytes at
