@@ -492,7 +492,10 @@ impl Service<0> for PipeService {
                     Ok(body) => body,
                     Err(answer) => return answer,
                 };
-                match self.pipes.create(&mut s.data.held, s.data.root, flags) {
+                match self
+                    .pipes
+                    .create(&mut s.data.held, r.label(), s.data.root, flags)
+                {
                     Ok((read, write)) => words(r, &[read, write]),
                     Err(code) => status(code),
                 }

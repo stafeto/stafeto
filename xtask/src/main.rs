@@ -2129,6 +2129,12 @@ const RAM_STEP_KINDS: [(usize, &str); 6] = [
     (64, "notification"),
 ];
 
+/// The longest heartbeat of the pipe service's loop, in ticks under
+/// -icount: a send to init (level 63) and its reply, in which the processes
+/// of higher levels than the service's may run; 200,000 were seen once in
+/// a volley of the steps probe's crowd.
+const HEARTBEAT_STEP_MAX: u64 = 500_000;
+
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
 /// proto_pipe::Method.
 const PIPE_STEP_KINDS: [(usize, &str); 15] = [
@@ -2145,7 +2151,7 @@ const PIPE_STEP_KINDS: [(usize, &str); 15] = [
     (11, "SetFlags"),
     (12, "Stat"),
     (13, "Abandon"),
-    (64, "notification"),
+    (64, "heartbeat: a send to init and its reply"),
     (65, "own step: a description let go of, a session gone"),
 ];
 
@@ -2324,6 +2330,14 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // are no work of the pipe service.
     if let Some(row) = pipe.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
         return Err(format!("the pipe service: a step past term B: {row:?}"));
+    }
+    // The heartbeat has its own bound, so that a growth of that wait shows:
+    // the service answers no client while it waits for init.
+    let heartbeat = pipe.iter().find(|(k, ..)| *k == 64).map_or(0, |r| r.1);
+    if heartbeat > HEARTBEAT_STEP_MAX {
+        return Err(format!(
+            "the pipe service: a heartbeat took {heartbeat} ticks, past {HEARTBEAT_STEP_MAX}"
+        ));
     }
     let mut text = String::from("kind method ticks detail\n");
     for (kind, ticks, detail) in &loader {

@@ -156,8 +156,9 @@
  * with FD_CLOEXEC are gone from the new image. A plain end keeps its number
  * in a spawned child, an FD_CLOEXEC one is closed. Threads of an image
  * that wait in a pipe when it execs leave no waiter behind in the service
- * (role pipeghost, then pipeghost2: eight readers wait, the new image's
- * reader would be the ninth). A spawn that names a pipe's end with no
+ * (role pipeghost, twelve execs in a row, then pipeghost2: eight readers
+ * wait each time, the new image's reader would be the ninth, and the
+ * tree's 96 waits come back each time). A spawn that names a pipe's end with no
  * session of the pipe service to give is refused by the loader. BusyBox ash
  * runs `/bin/ls /etc | /bin/cat`.
  *
@@ -2511,6 +2512,20 @@ static void *read_later(void *arg) {
     return NULL;
 }
 
+/* A process and a delay for the thread that kills it later. */
+struct killer {
+    pid_t pid;
+    long ms;
+};
+
+/* Sends SIGKILL to a process `ms` after its start. */
+static void *kill_later(void *arg) {
+    struct killer *k = arg;
+    pause_ms(k->ms);
+    if (kill(k->pid, SIGKILL) != 0) failures++;
+    return NULL;
+}
+
 /* Fills the empty pipe `fd` but `room` bytes; the bytes written. */
 static int fill(int fd, int room) {
     char bytes[4096];
@@ -2897,10 +2912,19 @@ static void *ghost_reader(void *arg) {
 }
 
 /* Role pipeghost: eight threads wait in a read of one pipe, which is the
- * most the service lets wait at an end, and the process execs. */
+ * most the service lets wait at an end, and the process execs; twelve
+ * times over, its round in argv[2] and the pipe's ends after it, so that
+ * Abandon gives the tree back 96 waits in all, its whole share: had one
+ * exec kept them counted, the read of pipeghost2 would get EAGAIN. */
 static int pipe_ghosts(void) {
+    int round = argc_seen > 2 ? atoi(argv_seen[2]) : 0;
     int p[2];
-    if (pipe(p) != 0) return 1;
+    if (round == 0) {
+        if (pipe(p) != 0) return 1;
+    } else {
+        p[0] = atoi(argv_seen[3]);
+        p[1] = atoi(argv_seen[4]);
+    }
     ghost_fd = p[0];
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -2910,12 +2934,18 @@ static int pipe_ghosts(void) {
         if (pthread_create(&readers[i], &attr, ghost_reader, NULL) != 0) return 2;
     }
     pause_ms(200);
-    char rd[16], wr[16];
+    char rd[16], wr[16], next[16];
     snprintf(rd, sizeof rd, "%d", p[0]);
     snprintf(wr, sizeof wr, "%d", p[1]);
-    char *argv[] = {"procs-child", "pipeghost2", rd, wr, NULL};
+    snprintf(next, sizeof next, "%d", round + 1);
     char *envp[] = {NULL};
-    execve("/bin/procs-child", argv, envp);
+    if (round + 1 < 12) {
+        char *argv[] = {"procs-child", "pipeghost", next, rd, wr, NULL};
+        execve("/bin/procs-child", argv, envp);
+    } else {
+        char *argv[] = {"procs-child", "pipeghost2", rd, wr, NULL};
+        execve("/bin/procs-child", argv, envp);
+    }
     return 3;
 }
 
@@ -3026,9 +3056,12 @@ static int pipe_fork(void) {
 
     /* The writer ends without a close: its end goes with it. */
     expect("pipe of the dying writer", pipe(p), 0);
+    /* The reader waits in its read when the writer ends: only the
+     * service's wake on the end of the last writer ends that read. */
     child = fork();
     if (child == 0) {
         (void)write(p[1], "x", 1);
+        pause_ms(150);
         _exit(0);
     }
     close(p[1]);
@@ -3044,9 +3077,11 @@ static int pipe_fork(void) {
         for (;;) pause_ms(1000);
     }
     close(p[1]);
-    pause_ms(50);
-    expect("SIGKILL of the writer", kill(child, SIGKILL), 0);
+    struct killer k = {child, 150};
+    pthread_t killing;
+    pthread_create(&killing, NULL, kill_later, &k);
     expect("the end of the data after SIGKILL", (int)read(p[0], got, sizeof got), 0);
+    pthread_join(killing, NULL);
     close(p[0]);
     reap("the killed writer", child, 0, SIGKILL);
     /* SIGKILL in the middle of a write of 8 KiB: the 4 KiB that went stay,
@@ -3096,42 +3131,93 @@ static int pipe_fork(void) {
     close(p[0]);
     for (int w = 0; w < 3; w++) reap("a writer of records", writers[w], 0, 0);
 
-    /* A tree of processes has 16 live pipes at most in all (the root of
-     * the pipe service's chain of clones): a child takes what is left,
-     * the parent then gets EMFILE, and once the child is gone it gets one
-     * again. */
+    /* A session has 16 live pipes (EMFILE); a tree of processes, the root
+     * of the pipe service's chain of clones, 48 in all, three quarters of
+     * the pool (ENFILE). Three children take what is left of the tree's
+     * share one after the other, the parent then gets ENFILE, and once
+     * they are gone it gets a pipe again. */
     int sync[2];
     expect("pipe of the tree's count", pipe(sync), 0);
-    child = fork();
-    if (child == 0) {
-        int made = 0, mine[2];
-        while (pipe(mine) == 0) {
-            close(mine[0]);
-            made++;
+    pid_t takers[3];
+    int counts[3] = {0}, errors[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        takers[i] = fork();
+        if (takers[i] == 0) {
+            int made = 0, mine[2];
+            while (pipe(mine) == 0) {
+                close(mine[0]);
+                made++;
+            }
+            unsigned char report[2] = {(unsigned char)made, (unsigned char)errno};
+            if (write(sync[1], report, 2) != 2) _exit(1);
+            for (;;) pause_ms(1000);
         }
-        unsigned char count = (unsigned char)made;
-        if (errno != EMFILE || write(sync[1], &count, 1) != 1) _exit(1);
-        for (;;) pause_ms(1000);
+        unsigned char report[2] = {0, 0};
+        expect("the report of a taker", (int)read(sync[0], report, 2), 2);
+        counts[i] = report[0];
+        errors[i] = report[1];
     }
-    unsigned char made = 0;
-    expect("the count of the child's pipes", (int)read(sync[0], &made, 1), 1);
-    expect("the pipes a child has beside the parent's one", made, 15);
+    expect("the pipes of the first session", counts[0], 16);
+    expect("its error", errors[0], EMFILE);
+    expect("the pipes of the second session", counts[1], 16);
+    expect("the pipes of the third, the tree's last", counts[2], 15);
+    expect("its error", errors[2], ENFILE);
     int more[2];
-    expect("a pipe of the parent with the tree at 16", pipe(more) == -1 ? errno : 0, EMFILE);
-    kill(child, SIGKILL);
-    reap("the child of 15 pipes", child, 0, SIGKILL);
+    expect("a pipe of the parent with the tree at 48", pipe(more) == -1 ? errno : 0, ENFILE);
+    for (int i = 0; i < 3; i++) {
+        kill(takers[i], SIGKILL);
+        reap("a taker of pipes", takers[i], 0, SIGKILL);
+    }
     int again = -1;
     for (int i = 0; i < 100 && again != 0; i++) {
         again = pipe(more);
         if (again != 0) pause_ms(2);
     }
-    expect("a pipe once the child is gone", again, 0);
+    expect("a pipe once the takers are gone", again, 0);
     if (again == 0) {
         close(more[0]);
         close(more[1]);
     }
     close(sync[0]);
     close(sync[1]);
+
+    /* Four processes with eight readers each: 32 waits of the tree, and a
+     * 33rd blocking read still waits until its byte comes. */
+    int groups[4][2];
+    pid_t waiters[4];
+    for (int i = 0; i < 4; i++) {
+        expect("pipe of eight readers", pipe(groups[i]), 0);
+        waiters[i] = fork();
+        if (waiters[i] == 0) {
+            ghost_fd = groups[i][0];
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 32768);
+            pthread_t readers[8];
+            for (int t = 0; t < 8; t++) {
+                if (pthread_create(&readers[t], &attr, ghost_reader, NULL) != 0) _exit(1);
+            }
+            for (;;) pause_ms(1000);
+        }
+    }
+    pause_ms(300);
+    int q[2];
+    expect("pipe of the 33rd read", pipe(q), 0);
+    struct later byte = {q[1], 100, 'q'};
+    pthread_t writer;
+    pthread_create(&writer, NULL, write_later, &byte);
+    char c = 0;
+    int n33 = (int)read(q[0], &c, 1);
+    expect("a 33rd blocking read of a tree", n33 == -1 ? errno : n33, 1);
+    pthread_join(writer, NULL);
+    close(q[0]);
+    close(q[1]);
+    for (int i = 0; i < 4; i++) {
+        kill(waiters[i], SIGKILL);
+        reap("a process of eight readers", waiters[i], 0, SIGKILL);
+        close(groups[i][0]);
+        close(groups[i][1]);
+    }
 
     /* The reader ends: a write is EPIPE, SIGPIPE ignored. */
     expect("pipe of the leaving reader", pipe(p), 0);

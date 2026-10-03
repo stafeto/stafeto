@@ -70,12 +70,13 @@ struct End {
     waiters: [Option<Waiter>; WAITERS],
 }
 
-/// A pipe: its creator's label, where its bytes start in the ring and how
+/// A pipe: its creator's label and root, where its bytes start in the ring and how
 /// many there are, and its ends, the read end first.
 #[derive(Clone, Copy, Debug)]
 struct Pipe {
     live: bool,
     creator: u64,
+    root: u64,
     head: u16,
     len: u16,
     ends: [End; 2],
@@ -111,6 +112,7 @@ impl Pipe {
     const FREE: Pipe = Pipe {
         live: false,
         creator: 0,
+        root: 0,
         head: 0,
         len: 0,
         ends: [End::NONE; 2],
@@ -157,22 +159,28 @@ impl Pipes {
         }
     }
 
-    /// A new pipe of the session `held` of the root `creator`: its read end and its
-    /// write end, which the session holds; NFILE with all pipes in use,
-    /// MFILE past CREATED_MAX live pipes of `creator` or HELD_MAX held.
-    pub fn create(&mut self, held: &mut Held, creator: u64, flags: u32) -> Result<(u32, u32), u32> {
+    /// A new pipe of the session `held`, whose label is `creator` and the
+    /// root of whose chain of clones is `root`: its read end and its write
+    /// end, which the session holds. MFILE past CREATED_MAX live pipes of
+    /// the session or HELD_MAX descriptions held ([pipe]: the process's
+    /// own); NFILE past ROOT_PIPES live pipes of the root, a share of the
+    /// pool that leaves the others' roots room, or with all pipes in use.
+    pub fn create(
+        &mut self,
+        held: &mut Held,
+        creator: u64,
+        root: u64,
+        flags: u32,
+    ) -> Result<(u32, u32), u32> {
         if flags & !NONBLOCK != 0 {
             return Err(INVALID);
         }
-        if held.count() + 2 > HELD_MAX
-            || self
-                .pipes
-                .iter()
-                .filter(|p| p.live && p.creator == creator)
-                .count()
-                >= CREATED_MAX
-        {
+        let live = |f: &dyn Fn(&Pipe) -> bool| self.pipes.iter().filter(|p| p.live && f(p)).count();
+        if held.count() + 2 > HELD_MAX || live(&|p| p.creator == creator) >= CREATED_MAX {
             return Err(MFILE);
+        }
+        if live(&|p| p.root == root) >= ROOT_PIPES {
+            return Err(NFILE);
         }
         let index = self.pipes.iter().position(|p| !p.live).ok_or(NFILE)?;
         let nonblock = flags & NONBLOCK != 0;
@@ -184,6 +192,7 @@ impl Pipes {
         self.pipes[index] = Pipe {
             live: true,
             creator,
+            root,
             head: 0,
             len: 0,
             ends: [end; 2],
@@ -412,10 +421,14 @@ impl Pipes {
 }
 
 /// The long operations that wait for the sessions of one root at most: a
-/// client of init's and the clones of its chain (the processes it forked
-/// and spawned), so that one process tree cannot take all OPERATIONS of
-/// the service; past them, AGAIN.
-pub const ROOT_OPERATIONS: u16 = 32;
+/// client of init and the clones of its chain (the processes it forked
+/// and spawned), three quarters of the service's 128, so that one process
+/// tree cannot take them all from the others; past them, AGAIN.
+pub const ROOT_OPERATIONS: u16 = 96;
+
+/// The live pipes of one root at most: three quarters of the pool, so that
+/// the other roots keep a quarter (NFILE past it).
+pub const ROOT_PIPES: usize = 48;
 
 /// The operations that wait, counted for each root that has some: N
 /// places, one for each operation the service may keep at most, so a root
@@ -498,7 +511,7 @@ mod tests {
     fn the_end_of_the_data_comes_after_the_last_writer_in_another_session() {
         let mut p = pipes();
         let mut a = Held::default();
-        let (rd, wr) = p.create(&mut a, 1, 0).unwrap();
+        let (rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
         let mut b = p.clone_held(&a, &[rd, wr]).unwrap();
         // The parent keeps the write end alone.
         p.close(&mut a, rd, &mut Wakes::default()).unwrap();
@@ -525,8 +538,8 @@ mod tests {
     fn the_end_of_the_data_comes_in_steps_after_the_session_goes() {
         let mut p = pipes();
         let mut a = Held::default();
-        let (rd, wr) = p.create(&mut a, 1, 0).unwrap();
-        let (rd2, wr2) = p.create(&mut a, 1, 0).unwrap();
+        let (rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
+        let (rd2, wr2) = p.create(&mut a, 1, 1, 0).unwrap();
         let b = p.clone_held(&a, &[rd, rd2]).unwrap();
         p.close(&mut a, rd, &mut Wakes::default()).unwrap();
         p.close(&mut a, rd2, &mut Wakes::default()).unwrap();
@@ -560,7 +573,7 @@ mod tests {
     fn a_write_without_a_reader_is_broken() {
         let mut p = pipes();
         let mut a = Held::default();
-        let (rd, wr) = p.create(&mut a, 1, 0).unwrap();
+        let (rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
         assert_eq!(
             p.write(&a, wr, &[1; 1000], &mut Wakes::default()),
             Ok(Some(1000))
@@ -583,7 +596,7 @@ mod tests {
     fn writes_up_to_atomic_go_whole() {
         let mut p = pipes();
         let mut a = Held::default();
-        let (rd, wr) = p.create(&mut a, 1, 0).unwrap();
+        let (rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
         let fill = CAPACITY - (ATOMIC - 1);
         assert_eq!(
             p.write(&a, wr, &vec![1; fill], &mut Wakes::default()),
@@ -629,7 +642,7 @@ mod tests {
     fn nonblock_answers_again() {
         let mut p = pipes();
         let mut a = Held::default();
-        let (rd, wr) = p.create(&mut a, 1, NONBLOCK).unwrap();
+        let (rd, wr) = p.create(&mut a, 1, 1, NONBLOCK).unwrap();
         let b = p.clone_held(&a, &[rd, wr]).unwrap();
         let mut out = [0; 4];
         assert_eq!(p.read(&a, rd, &mut out, &mut Wakes::default()), Err(AGAIN));
@@ -664,7 +677,7 @@ mod tests {
     fn clone_shares_the_counts() {
         let mut p = pipes();
         let mut a = Held::default();
-        let (rd, wr) = p.create(&mut a, 1, 0).unwrap();
+        let (rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
         let mut b = p.clone_held(&a, &[wr]).unwrap();
         assert!(!b.holds(rd));
         assert_eq!(p.clone_held(&b, &[rd]), Err(BAD_FD));
@@ -693,20 +706,24 @@ mod tests {
         let mut sessions = [Held::default(); 4];
         for (i, s) in sessions.iter_mut().enumerate() {
             for _ in 0..CREATED_MAX {
-                let (rd, _) = p.create(s, i as u64, 0).unwrap();
+                let (rd, _) = p.create(s, i as u64, i as u64, 0).unwrap();
                 // The write end keeps the pipe live; the session holds 16.
                 p.close(s, rd, &mut Wakes::default()).unwrap();
             }
             assert_eq!(s.count(), CREATED_MAX);
-            assert_eq!(p.create(s, i as u64, 0), Err(MFILE), "the creator's 17th");
+            assert_eq!(
+                p.create(s, i as u64, i as u64, 0),
+                Err(MFILE),
+                "the creator's 17th"
+            );
         }
         assert_eq!(p.live(), PIPES);
         let mut more = Held::default();
-        assert_eq!(p.create(&mut more, 9, 0), Err(NFILE), "the 65th pipe");
+        assert_eq!(p.create(&mut more, 9, 9, 0), Err(NFILE), "the 65th pipe");
         let mut w = Wakes::default();
         p.close(&mut sessions[0], 1, &mut w).unwrap();
         assert_eq!(p.live(), PIPES - 1);
-        let (rd, _) = p.create(&mut more, 9, 0).unwrap();
+        let (rd, _) = p.create(&mut more, 9, 9, 0).unwrap();
         for k in 0..WAITERS as u64 {
             p.wait(rd, (5, k + 1), |_| true).unwrap();
         }
@@ -720,7 +737,7 @@ mod tests {
             c.bits |= bits.unwrap().bits;
         }
         assert_eq!(c.count(), HELD_MAX);
-        assert_eq!(p.create(&mut c, 77, 0), Err(MFILE));
+        assert_eq!(p.create(&mut c, 77, 77, 0), Err(MFILE));
     }
 
     /// The waiters of an end are a queue: after a read the writer that
@@ -730,7 +747,7 @@ mod tests {
     fn waiters_are_told_in_the_order_they_came() {
         let mut p = pipes();
         let mut a = Held::default();
-        let (rd, wr) = p.create(&mut a, 1, 0).unwrap();
+        let (rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
         assert_eq!(
             p.write(&a, wr, &[0; CAPACITY], &mut Wakes::default()),
             Ok(Some(CAPACITY))
@@ -753,6 +770,33 @@ mod tests {
         let mut w = Wakes::default();
         p.read(&a, rd, &mut out, &mut w).unwrap();
         assert_eq!(woke(&w), [(7, 2), (7, 4), (7, 5)]);
+    }
+
+    /// A session has CREATED_MAX live pipes (MFILE), a root ROOT_PIPES in
+    /// all its sessions (NFILE), and another root takes the rest.
+    #[test]
+    fn a_root_takes_a_share_of_the_pool() {
+        let mut p = pipes();
+        let mut sessions = [Held::default(); 4];
+        for (i, s) in sessions.iter_mut().enumerate().take(3) {
+            for _ in 0..CREATED_MAX {
+                let (rd, _) = p.create(s, 10 + i as u64, 5, 0).unwrap();
+                p.close(s, rd, &mut Wakes::default()).unwrap();
+            }
+            assert_eq!(
+                p.create(s, 10 + i as u64, 5, 0),
+                Err(MFILE),
+                "the session's 17th"
+            );
+        }
+        assert_eq!(p.live(), ROOT_PIPES);
+        assert_eq!(
+            p.create(&mut sessions[3], 13, 5, 0),
+            Err(NFILE),
+            "the root's 49th"
+        );
+        let mut other = Held::default();
+        assert!(p.create(&mut other, 20, 6, 0).is_ok(), "another root");
     }
 
     /// A root has ROOT_OPERATIONS that wait at most, others have theirs.
@@ -781,7 +825,7 @@ mod tests {
     fn a_session_is_one_reference() {
         let mut p = pipes();
         let mut a = Held::default();
-        let (rd, wr) = p.create(&mut a, 1, 0).unwrap();
+        let (rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
         let mut b = p.clone_held(&a, &[wr]).unwrap();
         p.close(&mut b, wr, &mut Wakes::default()).unwrap();
         assert_eq!(p.close(&mut b, wr, &mut Wakes::default()), Err(BAD_FD));

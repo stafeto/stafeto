@@ -463,6 +463,8 @@ impl<P> Records<P> {
     /// caller's session, which is the target's own, new or not (EPERM for
     /// any other group of another session or none). The links of the
     /// target and of its children are counted anew: CHILDREN_MAX steps.
+    /// A child that execed in another session gets EACCES: POSIX gives the
+    /// errors no order, and Linux checks the session first (EPERM).
     pub fn set_pgid(&mut self, caller: usize, pid: u32, pgid: u32) -> Result<(), GroupError> {
         let me = self.records[caller].as_ref().expect("the caller");
         let (own, sid) = (me.label.pid(), me.sid);

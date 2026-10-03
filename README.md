@@ -157,10 +157,14 @@ Apple silicon.
 - `fork` copies everything the layer maps, with no copy on write (about
   70 us a MiB on HVF); shared anonymous memory and mappings made past the
   layer are not in the copy, and a program that `init` starts itself gets
-  `ENOSYS`. Pipes are not there yet, so `ash` runs single external
-  commands and no pipelines.
+  `ENOSYS`.
 - 255 POSIX processes at once: the process service holds 256 records,
   and the RAM file and clock services keep 320 sessions each.
+- Pipes: 64 of 4 KiB in the pipe service; one session (a process) has 16
+  live pipes (`EMFILE`), and a tree of processes under one program
+  `init` started has 48 of them (`ENFILE`), 96 of the 128 blocking reads
+  and writes that may wait (`EAGAIN` past them, and past 8 at one end or
+  16 in one process) and 255 sessions of the service's 320.
 - Files live in RAM; ext4 is read from an image inside the guest, with no
   block driver.
 

@@ -913,7 +913,12 @@ fn exec_stopped<'s>(
     };
     // Step 4: past this point the old image gives its sessions away, and
     // a failure ends it.
-    move_files(&c);
+    if !move_files(&c) {
+        // The loader refused the sessions (a pipe's end without the
+        // session of the pipe service): the new image may not start with
+        // descriptors it cannot use, and this one gave its sessions away.
+        rt::sys::process_exit(127);
+    }
     if ask(&request(Method::ExecCommit, &[])?).is_err() {
         rt::sys::process_exit(127);
     }
@@ -1027,8 +1032,9 @@ fn image_ready(
 /// descriptions with the last of them), then the process's own sessions
 /// with the RAM files, the clock and the console's input move to the
 /// loader (Handles): the new image keeps the descriptions, offsets and
-/// labels. Nothing of this image uses them afterwards.
-fn move_files(c: &Handle<Channel>) {
+/// labels. Nothing of this image uses them afterwards. Whether the loader
+/// took them.
+fn move_files(c: &Handle<Channel>) -> bool {
     use proto_loader::{Method, Slot};
     for fd in 0..posix_fs::OPEN_MAX as u32 {
         let close_on_exec = crate::shared::with_files(|files| {
@@ -1051,7 +1057,7 @@ fn move_files(c: &Handle<Channel>) {
     });
     let clock = crate::clock::session().map(Handle::raw);
     let Ok((files, uart)) = sessions else {
-        return;
+        return false;
     };
     // The session with the pipe service moves as it is, with the ends of
     // the descriptors that stay. The operations that wait in it for the
@@ -1068,7 +1074,7 @@ fn move_files(c: &Handle<Channel>) {
     }
     let mut w = Writer::new();
     if Method::Handles.header().write(&mut w).is_err() {
-        return;
+        return false;
     }
     let mut handles = rt::handle::Outgoing::new();
     for (slot, session) in [
@@ -1088,7 +1094,7 @@ fn move_files(c: &Handle<Channel>) {
     {
         let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
     }
-    let _ = ask_loader(c, &w, Some(handles));
+    ask_loader(c, &w, Some(handles)) == 0
 }
 
 /// The errno of a refused Clone: EAGAIN for a service at its limit of

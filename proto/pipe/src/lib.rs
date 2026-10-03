@@ -10,10 +10,12 @@
 //!
 //! - CREATE: body flags u32 (NONBLOCK alone). Reply: status, the read end
 //!   u32, the write end u32. NFILE with every pipe of the service in use,
-//!   MFILE past CREATED_MAX live pipes of the session's root (a client of
-//!   init and the chain of clones its process tree made) or HELD_MAX
-//!   descriptions the session holds. The waiting operations of a root
-//!   are bounded too: past them READ_START and WRITE_START answer AGAIN.
+//!   MFILE past CREATED_MAX live pipes the session made or HELD_MAX
+//!   descriptions it holds; NFILE past 48 live pipes of the session's
+//!   root (a client of init and the chain of clones its process tree
+//!   made), three quarters of the pool. The waiting operations of a root
+//!   are bounded too (96 of 128): past them READ_START and WRITE_START
+//!   answer AGAIN.
 //! - READ_START: body the end u32, the count u32 (1 to MAX_READ). A long
 //!   operation in two steps (proto_wire::long): READY with the bytes there
 //!   are, at most the count; READY with none at the end of the data, when
@@ -64,8 +66,7 @@ pub const CAPACITY: usize = 4096;
 pub const ATOMIC: usize = 512;
 /// The descriptions one session holds at most (the layer's OPEN_MAX).
 pub const HELD_MAX: usize = 32;
-/// The live pipes the sessions of one root made at most: a client of
-/// init and the clones of its chain.
+/// The live pipes one session made at most.
 pub const CREATED_MAX: usize = 16;
 /// The operations that wait at one end at most; past them, AGAIN.
 pub const WAITERS: usize = 8;
