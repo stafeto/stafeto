@@ -279,6 +279,7 @@ fn rtbench() -> Vec<RootFile> {
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
         dir("/dev"),
+        dir("/dev/pts"),
     ];
     files.extend(devices());
     files

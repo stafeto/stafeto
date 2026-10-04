@@ -1642,12 +1642,13 @@ mod tests {
             assert_eq!(
                 order_of(table),
                 [
-                    "console",
+                    "uart",
+                    "tty",
                     "ramfs",
                     "clock",
                     "posix",
                     "pipe",
-                    "uart",
+                    "bench-uart",
                     "rtbench-load",
                     "rng",
                     "entropy",

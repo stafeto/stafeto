@@ -665,6 +665,7 @@ dependencies = [
  "abi",
  "posix-abi",
  "posix-crt",
+ "posix-fs",
  "posix-sync",
  "proto-uart",
  "proto-wire",
