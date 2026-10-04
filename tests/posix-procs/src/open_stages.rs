@@ -4,7 +4,7 @@
 //! Real paid Open stages; the C supervisor observes the returned failure code.
 use core::sync::atomic::{AtomicU64, Ordering};
 use proto_wire::Status;
-use rt::fs::{Files, PreparedOpen};
+use rt::fs::{Files, OpenOutcome, PreparedOpen};
 static NEXT: AtomicU64 = AtomicU64::new(1);
 fn key() -> proto_fs::OpenKey {
     proto_fs::OpenKey {
@@ -58,6 +58,12 @@ fn raw_start(files: &Files, key: proto_fs::OpenKey) -> Result<rt::sys::Reply, St
     request.bytes(b"/etc/motd")?;
     rt::sys::send(files.sessions().0, request.as_bytes()).map_err(Status::Kernel)
 }
+fn active_query(files: &Files, key: proto_fs::OpenKey) -> Result<(u64, u32), Status> {
+    match files.open_query(key)? {
+        OpenOutcome::Active { job, phase } => Ok((job, phase)),
+        OpenOutcome::Finished(_) => Err(Status::BadSize),
+    }
+}
 fn start_recovery(files: &Files) -> Result<(), i32> {
     let first = proto_fs::OpenKey {
         slot: 1,
@@ -65,7 +71,7 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
     };
     // The genuine accepted reply goes unread; Query recovers its single paid job.
     drop(raw_start(files, first).map_err(|_| 40)?);
-    let (id, phase) = files.open_query(first).map_err(|_| 41)?;
+    let (id, phase) = active_query(files, first).map_err(|_| 41)?;
     if phase != 0 || files.open_start(first, b"/etc/motd", proto_fs::READ_ONLY, 0, 0) != Ok(id) {
         return Err(42);
     }
@@ -109,7 +115,7 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
             return Err(69);
         }
     }
-    if files.open_query(first) != Ok((id, 0)) {
+    if active_query(files, first) != Ok((id, 0)) {
         return Err(47);
     }
     let second = proto_fs::OpenKey {
@@ -159,7 +165,7 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
     let extra_id = files
         .open_start(extra, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
         .map_err(|_| 55)?;
-    if files.open_query(extra) != Ok((extra_id, 0)) {
+    if active_query(files, extra) != Ok((extra_id, 0)) {
         return Err(56);
     }
     for key in keys {
@@ -228,7 +234,7 @@ fn run(files: &Files) -> Result<(), i32> {
         generation: 1,
     };
     posix_abi::process::seteuid(65533).map_err(|_| 65)?;
-    let query = files.open_query(current_key);
+    let query = active_query(files, current_key);
     let changed = files.open_commit(id);
     let restored = posix_abi::process::seteuid(0);
     if query != Ok((id, 3))
@@ -310,8 +316,125 @@ fn run(files: &Files) -> Result<(), i32> {
         Ok(())
     })();
     files.open_cancel(truncate).map_err(|_| 35)?;
-    result
+    result?;
+    finish_recovery(files)
 }
+fn raw_key_request(
+    files: &Files,
+    method: proto_fs::Method,
+    key: proto_fs::OpenKey,
+) -> Result<rt::sys::Reply, Status> {
+    let mut w = proto_wire::Writer::new();
+    method.header().write(&mut w)?;
+    w.u32(key.slot)?;
+    w.u64(key.generation)?;
+    rt::sys::send(files.sessions().0, w.as_bytes()).map_err(Status::Kernel)
+}
+fn finish_recovery(files: &Files) -> Result<(), i32> {
+    let first = proto_fs::OpenKey {
+        slot: 20,
+        generation: 1,
+    };
+    let path = b"/tmp/t3-created";
+    let flags = proto_fs::READ_WRITE | proto_fs::TRUNCATE;
+    let id = files.open_start(first, path, flags, 0, 0).map_err(|_| 70)?;
+    prepared(files, id).map_err(|_| 71)?;
+    if files.open_finish(first) != Err(Status::Unknown(proto_fs::RESOLVING)) {
+        return Err(72);
+    }
+    let held = files.open_commit(id).map_err(|_| 73)?;
+    let ordinary = files
+        .open("/tmp/t3-created", proto_fs::READ_WRITE)
+        .map_err(|_| 74)?;
+    if files.write(ordinary, b"finish once") != Ok(11) {
+        return Err(75);
+    }
+    files.close(ordinary).map_err(|_| 76)?;
+    let before = files.node_information("/tmp/t3-created").map_err(|_| 77)?;
+    // An actual accepted Finish reply is consumed without decoding or saving its result.
+    drop(raw_key_request(files, proto_fs::Method::OpenFinish, first).map_err(|_| 78)?);
+    if files.open_query(first) != Ok(OpenOutcome::Finished(held))
+        || files.open_finish(first) != Ok(held)
+    {
+        return Err(79);
+    }
+    if files.node_information("/tmp/t3-created").map_err(|_| 80)? != before {
+        return Err(81);
+    }
+    posix_abi::process::seteuid(65533).map_err(|_| 82)?;
+    let recovered = files.open_query(first);
+    let finished = files.open_finish(first);
+    let restored = posix_abi::process::seteuid(0);
+    if recovered != Ok(OpenOutcome::Finished(held)) || finished != Ok(held) || restored.is_err() {
+        return Err(83);
+    }
+    let mut reply = raw_key_request(files, proto_fs::Method::OpenQuery, first).map_err(|_| 84)?;
+    for (len, phase, job, fd, padding, generation) in [
+        (16, 5, 0, held.fd, 0, held.generation),
+        (32, 5, id, held.fd, 0, held.generation),
+        (32, 5, 0, held.fd, 1, held.generation),
+        (32, 5, 0, 35, 0, held.generation),
+        (32, 5, 0, held.fd, 0, 0),
+        (32, 0, 0, held.fd, 0, held.generation),
+    ] {
+        reply.len = len;
+        reply.words[0] = phase << 32;
+        reply.words[1] = job;
+        reply.words[2] = fd as u64 | (padding << 32);
+        reply.words[3] = generation;
+        if Files::open_query_reply(&reply) != Err(Status::BadSize) {
+            return Err(85);
+        }
+    }
+    let mut bytes = [0; 11];
+    if files.read(held.fd, &mut bytes) != Ok(11) || &bytes != b"finish once" {
+        return Err(86);
+    }
+    files.close(held.fd).map_err(|_| 87)?;
+    let fresh = files
+        .open("/tmp/t3-created", proto_fs::READ_WRITE)
+        .map_err(|_| 88)?;
+    if fresh != held.fd {
+        return Err(89);
+    }
+    if files.open_query(first) != Err(Status::Unknown(proto_fs::OPEN_RETIRED))
+        || files.open_finish(first) != Err(Status::Unknown(proto_fs::OPEN_RETIRED))
+    {
+        return Err(91);
+    }
+    files.open_cancel_key(first).map_err(|_| 92)?;
+    if files.read(fresh, &mut bytes) != Ok(11) || &bytes != b"finish once" {
+        return Err(93);
+    }
+    files.close(fresh).map_err(|_| 94)?;
+    let second = proto_fs::OpenKey {
+        slot: first.slot,
+        generation: 2,
+    };
+    let next_id = files
+        .open_start(second, path, flags, 0, 0)
+        .map_err(|_| 95)?;
+    prepared(files, next_id).map_err(|_| 96)?;
+    let next = files.open_commit(next_id).map_err(|_| 97)?;
+    if next.fd != held.fd || next.generation == held.generation {
+        return Err(98);
+    }
+    if files.open_finish(second) != Ok(next) {
+        return Err(99);
+    }
+    files.open_cancel_key(first).map_err(|_| 100)?;
+    if files.open_query(second) != Ok(OpenOutcome::Finished(next)) {
+        return Err(101);
+    }
+    files.open_cancel_key(second).map_err(|_| 102)?;
+    files.open_cancel_key(second).map_err(|_| 103)?;
+    if files.open_query(second) != Err(Status::Unknown(proto_fs::OPEN_RETIRED)) {
+        return Err(104);
+    }
+    rt::println!("posix-files: exact Finish receipts ok");
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn files_open_stages() -> i32 {
     let Ok(raw) = posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
