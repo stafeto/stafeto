@@ -1043,6 +1043,7 @@ commands:
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
   loader-abort verify retained file cleanup after genuine exec cancellation
+  loader-abort-steps measure retained cleanup audits at resolver limits
   ramfs-cleanup verify unfinished binding cleanup with a foreign holder
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
@@ -1156,7 +1157,8 @@ fn main() {
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-files") => posix_files_probe(),
         Some("ramfs-cleanup") => ramfs_cleanup_probe(),
-        Some("loader-abort") => loader_abort_probe(),
+        Some("loader-abort") => loader_abort_probe(false),
+        Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
@@ -2648,23 +2650,57 @@ fn loader_channels_probe() -> Result<(), String> {
     qemu::expect_marker(&outcome, "loader-channels: ok")
 }
 
-fn loader_abort_probe() -> Result<(), String> {
+fn loader_abort_probe(measured: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(
-        "boot-loader-abort.img",
-        &LOADER_ABORT_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
+    const MEASURED: [ImageProgram; 6] = {
+        let mut programs = LOADER_ABORT_PROGRAMS;
+        programs[1].3 = &["auth-probe", "steps"];
+        programs
+    };
+    let (name, programs) = if measured {
+        ("boot-loader-abort-steps.img", &MEASURED)
+    } else {
+        ("boot-loader-abort.img", &LOADER_ABORT_PROGRAMS)
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     command.args(qemu::HEADLESS);
+    if measured {
+        command.args(qemu::ICOUNT);
+    }
     let ended = "init: posix-files ended: exit code 0, not restarted";
     let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ended)?;
     qemu::expect_marker(
         &output,
         "posix-files: genuine loader abort releases retained capture ok",
-    )
+    )?;
+    if measured {
+        for count in [16, 96] {
+            qemu::expect_marker(
+                &output,
+                &format!(
+                    "posix-files: cleanup audit {count} jobs preserves retained byte and frontend quota ok"
+                ),
+            )?;
+        }
+        let steps = longest_steps(&output.lines, "2");
+        for kind in [19, 21, 22, 23, 63, 65] {
+            if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
+                return Err(format!(
+                    "RAM cleanup audit has no kind {kind} measurement: {steps:?}"
+                ));
+            }
+        }
+        if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "RAM cleanup audit kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+            ));
+        }
+        println!("RAM cleanup audit dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    }
+    Ok(())
 }
 
 /// C operations observe the real Process identities and Files proofs.
