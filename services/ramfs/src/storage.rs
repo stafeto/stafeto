@@ -757,16 +757,23 @@ impl<'a> Storage<'a> {
             return Err(proto_fs::IS_DIRECTORY);
         }
         let next = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
-        self.overlay(token, root)?;
-        if let Some(i) = (0..self.state.original_len)
-            .find(|&i| self.entry(parent, i).is_some_and(|(n, _)| n == name))
-        {
+        let original = (0..self.state.original_len)
+            .find(|&i| self.entry(parent, i).is_some_and(|(n, _)| n == name));
+        // Reserve the tombstone's name charge before publishing a boot overlay.
+        let original_account = if original.is_some() {
             let a = self.account(root)?;
             if self.state.dentry_len == 0
                 || self.state.accounts[a].unwrap().usage.dentries == DENTRY_SHARE
             {
                 return Err(NO_SPACE);
             }
+            Some(a)
+        } else {
+            None
+        };
+        self.overlay(token, root)?;
+        if let Some(i) = original {
+            let a = original_account.expect("reserved original name");
             self.state.dentry_len -= 1;
             let d = self.state.dentry_free[self.state.dentry_len] as usize;
             self.state.dentries[d] = Dentry {
@@ -928,18 +935,25 @@ impl<'a> Storage<'a> {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let i = self.overlay(token, root)?;
-        let a = self.state.overlays[i].root as usize;
         let first = offset / PAGE;
         let last = (end - 1) / PAGE;
-        let need = (first..=last)
-            .filter(|&p| self.state.overlays[i].pages[p] == NONE)
-            .count();
+        let existing = self.node(token)?.overlay;
+        // A refused first write must leave the boot inode and its quota unchanged.
+        let (a, need) = if existing == NONE {
+            (self.account(root)?, last - first + 1)
+        } else {
+            let overlay = &self.state.overlays[existing as usize];
+            (
+                overlay.root as usize,
+                (first..=last).filter(|&p| overlay.pages[p] == NONE).count(),
+            )
+        };
         if need > self.state.page_len
             || self.state.accounts[a].unwrap().usage.pages as usize + need > PAGE_SHARE as usize
         {
             return Err(NO_SPACE);
         }
+        let i = self.overlay(token, root)?;
         for p in first..=last {
             if self.state.overlays[i].pages[p] != NONE {
                 continue;

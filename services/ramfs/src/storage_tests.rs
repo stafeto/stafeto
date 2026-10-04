@@ -371,3 +371,103 @@ fn boot_copy_preserves_unaligned_offsets_destinations_and_short_tails() {
         }
     }
 }
+
+#[test]
+fn independent_review_first_write_refusal_keeps_unmodified_boot_account() {
+    let mut ram = Ram::new(0);
+    let a = create(&mut ram, FIRST, b"fill-a");
+    let b = create(&mut ram, FIRST, b"fill-b");
+    for i in 0..PAGE_SHARE as usize {
+        ram.storage
+            .write(
+                if i < FILE_PAGES { a } else { b },
+                FIRST,
+                i % FILE_PAGES * PAGE,
+                &[9],
+            )
+            .unwrap();
+    }
+    let original = ram.storage.resolve(b"/tmp/probe").unwrap();
+    let before = ram.storage.usage(FIRST);
+    let epoch = ram.storage.state.epoch;
+    assert_eq!(ram.storage.write(original, FIRST, 0, b"x"), Err(NO_SPACE));
+    std::println!(
+        "refused write: before={before:?}, after={:?}, epoch={epoch}->{}",
+        ram.storage.usage(FIRST),
+        ram.storage.state.epoch
+    );
+    assert_eq!(
+        ram.storage.usage(FIRST),
+        before,
+        "refused first write retained unpaid-effect overlay"
+    );
+    assert_eq!(ram.storage.state.epoch, epoch);
+}
+
+#[test]
+fn independent_review_original_unlink_refusal_preserves_account() {
+    let mut ram = Ram::new(0);
+    let token = create(&mut ram, FIRST, b"existing");
+    for i in 1..DENTRY_SHARE {
+        ram.storage
+            .link(FIRST, ROOT, format!("full-{i}").as_bytes(), token)
+            .unwrap();
+    }
+    let before = ram.storage.usage(FIRST);
+    let epoch = ram.storage.state.epoch;
+    let parent = ram.storage.resolve(b"/etc").unwrap();
+    assert_eq!(ram.storage.unlink(parent, b"motd", FIRST), Err(NO_SPACE));
+    std::println!(
+        "refused unlink: before={before:?}, after={:?}, epoch={epoch}->{}",
+        ram.storage.usage(FIRST),
+        ram.storage.state.epoch
+    );
+    assert_eq!(
+        ram.storage.usage(FIRST),
+        before,
+        "refused unlink retained overlay"
+    );
+    assert_eq!(ram.storage.state.epoch, epoch);
+}
+
+#[test]
+fn independent_review_open_directory_is_an_authorized_relative_base() {
+    let mut ram = Ram::new(0);
+    let pending = ram
+        .storage
+        .reserve(FIRST, ROOT, b"base", (crate::DIR, 0o755, 0, 0))
+        .unwrap();
+    let directory = ram.storage.commit(pending).unwrap();
+    let mut fds = Fds {
+        root: FIRST,
+        ..Fds::default()
+    };
+    let fd = ram.open(&mut fds, "/base", proto_fs::READ_ONLY).unwrap();
+    std::println!(
+        "directory inode={directory:?}, fd={fd}, description={:?}",
+        ram.description_token(&fds, fd).unwrap()
+    );
+    assert!(
+        ram.owns_directory_base(&fds, directory),
+        "genuine open directory denied as relative base"
+    );
+    ram.release(&mut fds);
+}
+
+#[test]
+fn directory_base_rejects_a_colliding_regular_description() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds::default();
+    let first = ram
+        .open(&mut fds, "/etc/motd", proto_fs::READ_ONLY)
+        .unwrap();
+    let second = ram
+        .open(&mut fds, "/etc/motd", proto_fs::READ_ONLY)
+        .unwrap();
+    let directory = ram.storage.resolve(b"/etc").unwrap();
+    assert_eq!(ram.description_token(&fds, second).unwrap(), directory);
+    assert!(!ram.owns_directory_base(&fds, directory));
+    ram.close(&mut fds, first).unwrap();
+    ram.close(&mut fds, second).unwrap();
+    ram.release(&mut fds);
+}

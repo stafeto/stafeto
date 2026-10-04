@@ -550,9 +550,12 @@ impl<'a> Ram<'a> {
             return false;
         }
         fds.cwd.unwrap_or(storage::ROOT) == token
-            || fds
-                .numbers()
-                .any(|fd| self.description_token(fds, fd) == Ok(token))
+            || fds.numbers().any(|fd| {
+                fds.description(fd)
+                    .ok()
+                    .and_then(|slot| self.descriptions[slot].as_ref())
+                    .is_some_and(|description| self.token(description.open.file) == token)
+            })
     }
     pub fn set_cwd_token(&mut self, fds: &mut Fds, token: Token) -> Result<(), u32> {
         if self.storage.node(token)?.kind != DIR {
