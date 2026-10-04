@@ -80,6 +80,20 @@ static int pty_ash_command(struct pty_ash_dialog *d, const char *command, const 
     return 0;
 }
 
+/* The shell starts this external role by exec. Its ready line confirms
+ * that the final executable has entered main before Stop/Ctrl-C. */
+static int pty_ash_worker(void) {
+    const char ready[] = "PTY-CHILD\n";
+    size_t sent = 0;
+    while (sent < sizeof ready - 1) {
+        ssize_t n = write(STDOUT_FILENO, ready + sent, sizeof ready - 1 - sent);
+        if (n < 0 && errno == EINTR) continue;
+        CHECK(n > 0);
+        sent += (size_t)n;
+    }
+    for (;;) pause();
+}
+
 static int pty_ash_dialog(void) {
     struct pair p;
     CHECK(make_pair(&p) == 0);
@@ -102,9 +116,8 @@ static int pty_ash_dialog(void) {
     CHECK(pty_ash_command(&d, "printf '%s\\n' \"$((6*7))\"\n", "42") == 0);
     CHECK(pty_ash_command(&d, "test 3 -gt 2 && printf 'PTY-TEST\\n'\n", "PTY-TEST") == 0);
 
-    /* The marker comes from the foreground external child, after the
-     * shell has allocated its group, rather than from command echo. */
-    const char *sleeping = "/bin/ash -c 'echo PTY-CHILD; exec /bin/sleep 100'\n";
+    /* This marker comes from the external executable's own main. */
+    const char *sleeping = "/bin/posix-pty ash-worker\n";
     CHECK(pty_ash_send(&d, sleeping) == 0);
     CHECK(pty_ash_receive(&d, "PTY-CHILD", 1) == 0);
     CHECK(pty_ash_send(&d, "\003") == 0);
@@ -122,7 +135,8 @@ static int pty_ash_dialog(void) {
     CHECK(pty_ash_command(&d, "jobs\n", NULL) == 0);
     CHECK(strstr(d.output, "Running") != NULL && strstr(d.output, "Stopped") == NULL);
     CHECK(pty_ash_send(&d, "fg\n") == 0);
-    CHECK(pty_ash_receive(&d, "sleep 100", 0) == 0);
+    CHECK(pty_ash_receive(&d, "ash-worker", 0) == 0);
+    CHECK(pause_ms(20) == 0);
     CHECK(pty_ash_send(&d, "\003") == 0);
     CHECK(pty_ash_receive(&d, pty_ash_prompt, 0) == 0);
     CHECK(pty_ash_command(&d, "echo $?\n", "130") == 0);
