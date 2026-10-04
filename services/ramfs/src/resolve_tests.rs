@@ -1758,3 +1758,56 @@ fn append_uses_current_eof_and_positioned_write_preserves_flags_and_offset() {
     assert_eq!(ram.open_descriptions(), 0);
     assert_eq!(ram.storage.node(token).unwrap().pins.iter().sum::<u16>(), 0);
 }
+
+#[test]
+fn created_regular_io_updates_times_only_after_successful_nonempty_transfer() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let token = create(&mut ram, ROOT, b"io-times", REG, 0o600);
+    let held = ram
+        .prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None)
+        .unwrap();
+    let fd = ram.publish_open(&mut fds, held).unwrap();
+    let initial = ram.storage.node(token).unwrap().times;
+    assert_eq!(ram.write_at(&mut fds, fd, b"abc", 10), Ok(3));
+    assert_eq!(ram.storage.node(token).unwrap().times, [initial[0], 10, 10]);
+    assert_eq!(ram.pwrite(&mut fds, fd, 1, b"B", 20), Ok(1));
+    assert_eq!(ram.storage.node(token).unwrap().times, [initial[0], 20, 20]);
+    assert_eq!(ram.write_at(&mut fds, fd, b"", 30), Ok(0));
+    assert_eq!(ram.pwrite(&mut fds, fd, 0, b"", 31), Ok(0));
+    assert_eq!(
+        ram.pwrite(&mut fds, fd, u64::MAX, b"x", 32),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        ram.pwrite(
+            &mut fds,
+            fd,
+            (crate::storage::FILE_PAGES * crate::storage::PAGE) as u64,
+            b"x",
+            33
+        ),
+        Err(proto_fs::NO_SPACE)
+    );
+    assert_eq!(ram.storage.node(token).unwrap().times, [initial[0], 20, 20]);
+    ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    let mut out = [0; 3];
+    assert_eq!(ram.read_at(&mut fds, fd, &mut out, 40), Ok(3));
+    assert_eq!(&out, b"aBc");
+    assert_eq!(ram.storage.node(token).unwrap().times, [40, 20, 20]);
+    assert_eq!(ram.pread(&fds, fd, 0, &mut out, 50), Ok(3));
+    assert_eq!(
+        ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current),
+        Ok(3)
+    );
+    assert_eq!(ram.storage.node(token).unwrap().times, [50, 20, 20]);
+    assert_eq!(ram.read_at(&mut fds, fd, &mut [], 60), Ok(0));
+    assert_eq!(ram.pread(&fds, fd, 0, &mut [], 61), Ok(0));
+    assert_eq!(ram.storage.node(token).unwrap().times, [50, 20, 20]);
+    ram.release(&mut fds);
+    assert_eq!(ram.open_descriptions(), 0);
+}

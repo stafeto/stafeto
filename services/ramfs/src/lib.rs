@@ -957,7 +957,7 @@ impl<'a> Ram<'a> {
     }
 
     fn touch_access(&mut self, file: File, now: u64) {
-        if file.index().is_some() {
+        if file.index().is_some() || matches!(file, File::Node(_) | File::NodeDir(_)) {
             self.storage
                 .node_mut(self.token(file))
                 .expect("live inode")
@@ -1196,8 +1196,8 @@ impl<'a> Ram<'a> {
     ) -> Result<usize, u32> {
         let file = self.get(fds, fd)?.file;
         let n = self.write_position(fds, fd, bytes, None)?;
-        // The null device keeps no times.
-        if n > 0 && file.index().is_some() {
+        // Character devices keep no times.
+        if n > 0 && !file.is_device() {
             let node = self.storage.node_mut(self.token(file)).expect("live inode");
             node.times[1] = now;
             node.times[2] = now;
@@ -1218,7 +1218,7 @@ impl<'a> Ram<'a> {
         i64::try_from(offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
         let file = self.get(fds, fd)?.file;
         let n = self.write_position(fds, fd, bytes, Some(offset))?;
-        if n > 0 && file.index().is_some() {
+        if n > 0 && !file.is_device() {
             let node = self.storage.node_mut(self.token(file)).expect("live inode");
             node.times[1] = now;
             node.times[2] = now;
