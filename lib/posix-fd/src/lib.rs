@@ -2,15 +2,17 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Process-local descriptors sharing backend open descriptions. The owner
-//! serializes mutations; the table deliberately cannot be cloned. Backend
-//! ownership ends after the last local reference: a close or a replacement
-//! hands the backend back to the caller to release, which it does after it
-//! let go of the owner (spec 2, 3.4; 5c). A backend an operation holds
-//! (`hold`) outside the owner's lock ordinarily goes at its last `unhold`.
-//! Early release backends keep operation references at their service; the
-//! local hold records their released generation until the request ends.
+//! serializes table access and releases backends after unlocking. Ordinary
+//! operation holds and resident Open records share the fixed hold budget.
+//! A live Open record preserves its completion through fd replacement.
+//! The caller pins this table's address while records or waiters exist.
 
 #![no_std]
+
+use core::{
+    num::NonZeroU64,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Flags {
@@ -26,14 +28,164 @@ pub enum Error {
     Io,
 }
 
+/// A caller-issued, nonreused lifetime. Detach precedes thread-place reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnerToken(NonZeroU64);
+
+impl OwnerToken {
+    pub fn new(value: u64) -> Result<Self, Error> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(Error::InvalidArgument)
+    }
+
+    pub fn value(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenToken {
+    slot: usize,
+    generation: u64,
+}
+
+impl OpenToken {
+    pub fn slot(self) -> usize {
+        self.slot
+    }
+
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClaimToken {
+    open: OpenToken,
+    serial: u64,
+}
+
+impl ClaimToken {
+    pub fn open(self) -> OpenToken {
+        self.open
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryToken {
+    pub fd: u32,
+    generation: NonZeroU64,
+}
+
+impl EntryToken {
+    pub fn generation(self) -> u64 {
+        self.generation.get()
+    }
+
+    fn new(fd: u32, generation: u64) -> Self {
+        Self {
+            fd,
+            generation: NonZeroU64::new(generation).expect("live entry generation"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Completion {
+    Opened(u32),
+    Failed(i32),
+}
+
+impl Completion {
+    pub fn into_result(self) -> Result<u32, i32> {
+        match self {
+            Self::Opened(fd) => Ok(fd),
+            Self::Failed(errno) => Err(errno),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenPhase {
+    Preparing,
+    Reserved,
+    Committed,
+    Published,
+    Failed,
+    Canceling,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenSnapshot<R> {
+    pub owner: Option<OwnerToken>,
+    pub claimant: Option<OwnerToken>,
+    pub phase: OpenPhase,
+    pub recovery: Option<R>,
+    pub entry: Option<EntryToken>,
+    pub flags: Option<Flags>,
+    pub completion: Option<Completion>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Claim<R> {
+    Acquired {
+        token: ClaimToken,
+        snapshot: OpenSnapshot<R>,
+    },
+    Busy(OwnerToken),
+    Complete(Completion),
+    Canceling(OpenSnapshot<R>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Replacement<T> {
+    Complete { fd: u32, release: Option<T> },
+    Pending(OpenToken),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Abandoned<T, R> {
+    /// The exact unreturned entry has been closed, or its lifetime ended.
+    Discarded {
+        token: OpenToken,
+        release: Option<T>,
+    },
+    /// Canonical remote cleanup remains payable by this resident record.
+    Recover {
+        token: OpenToken,
+        snapshot: OpenSnapshot<R>,
+    },
+    /// A helper lifetime ended. The original caller retains its completion.
+    ClaimReleased(OpenToken),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitValue {
+    Sequence(u32),
+    /// Help or use a bounded timer before rechecking. Futex wait is forbidden.
+    NeverSleep,
+}
+
 #[derive(Clone, Copy)]
 struct Entry<T> {
     backend: T,
     flags: Flags,
 }
 
-/// A backend held by operations outside the owner's lock: how many hold
-/// it, and whether its last descriptor went meanwhile.
+#[derive(Clone, Copy)]
+enum EntryState<T> {
+    Empty,
+    Pending(usize),
+    Open(Entry<T>),
+}
+
+#[derive(Clone, Copy)]
+struct EntrySlot<T> {
+    generation: u64,
+    state: EntryState<T>,
+}
+
 #[derive(Clone, Copy)]
 struct Hold<T> {
     backend: T,
@@ -42,25 +194,171 @@ struct Hold<T> {
     released: bool,
 }
 
-pub struct Table<T: Copy + Eq, const N: usize> {
-    entries: [Option<Entry<T>>; N],
-    holds: [Option<Hold<T>>; N],
+#[derive(Clone, Copy)]
+enum Phase<T, R> {
+    Preparing(R),
+    Reserved {
+        recovery: R,
+        entry: EntryToken,
+        flags: Flags,
+    },
+    Committed {
+        recovery: R,
+        entry: EntryToken,
+        flags: Flags,
+        backend: T,
+    },
+    Published(EntryToken),
+    Failed(i32),
+    Canceling {
+        recovery: R,
+        entry: Option<EntryToken>,
+        backend: Option<T>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct OpenRecord<T, R> {
+    owner: Option<OwnerToken>,
+    claimant: Option<OwnerToken>,
+    serial: u64,
+    phase: Phase<T, R>,
+}
+
+impl<T: Copy, R: Copy> OpenRecord<T, R> {
+    fn snapshot(self) -> OpenSnapshot<R> {
+        let (phase, recovery, entry, flags, completion) = match self.phase {
+            Phase::Preparing(r) => (OpenPhase::Preparing, Some(r), None, None, None),
+            Phase::Reserved {
+                recovery,
+                entry,
+                flags,
+            } => (
+                OpenPhase::Reserved,
+                Some(recovery),
+                Some(entry),
+                Some(flags),
+                None,
+            ),
+            Phase::Committed {
+                recovery,
+                entry,
+                flags,
+                ..
+            } => (
+                OpenPhase::Committed,
+                Some(recovery),
+                Some(entry),
+                Some(flags),
+                None,
+            ),
+            Phase::Published(e) => (
+                OpenPhase::Published,
+                None,
+                Some(e),
+                None,
+                Some(Completion::Opened(e.fd)),
+            ),
+            Phase::Failed(errno) => (
+                OpenPhase::Failed,
+                None,
+                None,
+                None,
+                Some(Completion::Failed(errno)),
+            ),
+            Phase::Canceling {
+                recovery, entry, ..
+            } => (OpenPhase::Canceling, Some(recovery), entry, None, None),
+        };
+        OpenSnapshot {
+            owner: self.owner,
+            claimant: self.claimant,
+            phase,
+            recovery,
+            entry,
+            flags,
+            completion,
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.phase = match self.phase {
+            Phase::Preparing(recovery) => Phase::Canceling {
+                recovery,
+                entry: None,
+                backend: None,
+            },
+            Phase::Reserved {
+                recovery, entry, ..
+            } => Phase::Canceling {
+                recovery,
+                entry: Some(entry),
+                backend: None,
+            },
+            Phase::Committed {
+                recovery,
+                entry,
+                backend,
+                ..
+            } => Phase::Canceling {
+                recovery,
+                entry: Some(entry),
+                backend: Some(backend),
+            },
+            phase => phase,
+        };
+        self.claimant = None;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Held<T, R> {
+    Empty,
+    Io(Hold<T>),
+    Open(OpenRecord<T, R>),
+}
+
+struct HoldSlot<T, R> {
+    generation: u64,
+    changed: AtomicU32,
+    held: Held<T, R>,
+}
+
+impl<T, R> HoldSlot<T, R> {
+    fn change(&self) {
+        let value = self.changed.load(Ordering::Relaxed);
+        self.changed
+            .store(value.saturating_add(1), Ordering::Release);
+    }
+}
+
+pub struct Table<T: Copy + Eq, const N: usize, R: Copy = ()> {
+    entries: [EntrySlot<T>; N],
+    holds: [HoldSlot<T, R>; N],
     release_early: fn(T) -> bool,
 }
 
-impl<T: Copy + Eq, const N: usize> Default for Table<T, N> {
+impl<T: Copy + Eq, const N: usize, R: Copy> Default for Table<T, N, R> {
     fn default() -> Self {
         Self {
-            entries: [None; N],
-            holds: [None; N],
+            entries: [EntrySlot {
+                generation: 0,
+                state: EntryState::Empty,
+            }; N],
+            holds: [const {
+                HoldSlot {
+                    generation: 0,
+                    changed: AtomicU32::new(0),
+                    held: Held::Empty,
+                }
+            }; N],
             release_early: |_| false,
         }
     }
 }
 
-impl<T: Copy + Eq, const N: usize> Table<T, N> {
-    /// Release the real backend when its last fd closes. Operations retain
-    /// their own generation references at the service.
+impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
+    /// Armed early-release operations retain their generations in the service.
     pub fn with_early_release(release_early: fn(T) -> bool) -> Self {
         Self {
             release_early,
@@ -69,11 +367,10 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
     }
 
     fn entry(&self, fd: u32) -> Result<Entry<T>, Error> {
-        self.entries
-            .get(fd as usize)
-            .copied()
-            .flatten()
-            .ok_or(Error::BadFileDescriptor)
+        match self.entries.get(fd as usize).map(|slot| slot.state) {
+            Some(EntryState::Open(entry)) => Ok(entry),
+            _ => Err(Error::BadFileDescriptor),
+        }
     }
 
     pub fn get(&self, fd: u32) -> Result<T, Error> {
@@ -85,20 +382,27 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
     }
 
     pub fn set_flags(&mut self, fd: u32, flags: Flags) -> Result<(), Error> {
-        self.entry(fd)?;
-        self.entries[fd as usize].as_mut().unwrap().flags = flags;
+        let backend = self.get(fd)?;
+        self.entries[fd as usize].state = EntryState::Open(Entry { backend, flags });
         Ok(())
     }
 
-    /// The descriptors that are open, with their backends and flags.
+    pub fn entry_token(&self, fd: u32) -> Result<EntryToken, Error> {
+        self.entry(fd)?;
+        Ok(EntryToken::new(fd, self.entries[fd as usize].generation))
+    }
+
+    /// Published descriptors form the fork and exec snapshot.
     pub fn open(&self) -> impl Iterator<Item = (u32, T, Flags)> + '_ {
         self.entries
             .iter()
             .enumerate()
-            .filter_map(|(fd, e)| e.map(|e| (fd as u32, e.backend, e.flags)))
+            .filter_map(|(fd, slot)| match slot.state {
+                EntryState::Open(e) => Some((fd as u32, e.backend, e.flags)),
+                _ => None,
+            })
     }
 
-    /// Return the lowest free descriptor at least `minimum` without allocating it.
     pub fn vacant(&self, minimum: u32) -> Result<u32, Error> {
         if minimum as usize >= N {
             return Err(Error::InvalidArgument);
@@ -107,16 +411,23 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
             .iter()
             .enumerate()
             .skip(minimum as usize)
-            .find(|(_, entry)| entry.is_none())
-            .map(|(slot, _)| slot as u32)
+            .find(|(_, slot)| matches!(slot.state, EntryState::Empty))
+            .map(|(fd, _)| fd as u32)
             .ok_or(Error::TooManyOpenFiles)
+    }
+
+    fn install(&mut self, fd: u32, backend: T, flags: Flags) -> Result<(), Error> {
+        let slot = &mut self.entries[fd as usize];
+        let generation = slot.generation.checked_add(1).ok_or(Error::Io)?;
+        slot.generation = generation;
+        slot.state = EntryState::Open(Entry { backend, flags });
+        Ok(())
     }
 
     pub fn insert(&mut self, backend: T, flags: Flags) -> Result<u32, Error> {
         self.insert_at_free(backend, 0, flags)
     }
 
-    /// F_DUPFD-style allocation. Flags belong to the descriptor.
     pub fn duplicate(&mut self, fd: u32, minimum: u32, flags: Flags) -> Result<u32, Error> {
         let backend = self.get(fd)?;
         self.insert_at_free(backend, minimum, flags)
@@ -124,28 +435,25 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
 
     fn insert_at_free(&mut self, backend: T, minimum: u32, flags: Flags) -> Result<u32, Error> {
         let fd = self.vacant(minimum)?;
-        self.entries[fd as usize] = Some(Entry { backend, flags });
+        self.install(fd, backend, flags)?;
         Ok(fd)
     }
 
     fn referenced(&self, backend: T) -> bool {
-        self.entries.iter().flatten().any(|e| e.backend == backend)
+        self.entries
+            .iter()
+            .any(|slot| matches!(slot.state, EntryState::Open(e) if e.backend == backend))
     }
 
-    /// `backend` lost a descriptor: the caller releases it when no other
-    /// descriptor names it and no operation holds it; a held one goes at
-    /// its last `unhold`. An early release backend goes at this close,
-    /// and the hold remembers that the release already happened.
     fn left(&mut self, backend: T) -> Option<T> {
         if self.referenced(backend) {
             return None;
         }
-        match self
-            .holds
-            .iter_mut()
-            .flatten()
-            .find(|h| h.backend == backend)
-        {
+        let hold = self.holds.iter_mut().find_map(|slot| match &mut slot.held {
+            Held::Io(h) if h.backend == backend => Some(h),
+            _ => None,
+        });
+        match hold {
             Some(hold) => {
                 hold.closed = true;
                 if (self.release_early)(backend) {
@@ -159,27 +467,21 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         }
     }
 
-    /// The backend of `fd`, held for an operation the caller makes outside
-    /// the owner's lock. Ordinary backends remain open until `unhold`;
-    /// early release backends keep their armed operations in the service.
-    /// TooManyOpenFiles with N backends held.
     pub fn hold(&mut self, fd: u32) -> Result<T, Error> {
         let backend = self.get(fd)?;
-        if let Some(hold) = self
-            .holds
-            .iter_mut()
-            .flatten()
-            .find(|h| h.backend == backend)
-        {
-            hold.count += 1;
+        if let Some(hold) = self.holds.iter_mut().find_map(|slot| match &mut slot.held {
+            Held::Io(h) if h.backend == backend => Some(h),
+            _ => None,
+        }) {
+            hold.count = hold.count.checked_add(1).ok_or(Error::TooManyOpenFiles)?;
             return Ok(backend);
         }
         let free = self
             .holds
             .iter_mut()
-            .find(|h| h.is_none())
+            .find(|slot| matches!(slot.held, Held::Empty))
             .ok_or(Error::TooManyOpenFiles)?;
-        *free = Some(Hold {
+        free.held = Held::Io(Hold {
             backend,
             count: 1,
             closed: false,
@@ -188,30 +490,34 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         Ok(backend)
     }
 
-    /// An operation's hold of `backend` ends: the backend to release when
-    /// it was the last and the backend's last descriptor went meanwhile.
     pub fn unhold(&mut self, backend: T) -> Option<T> {
         let slot = self
             .holds
             .iter_mut()
-            .find(|h| h.is_some_and(|h| h.backend == backend))?;
-        let hold = slot.as_mut().expect("a hold");
+            .find(|slot| matches!(slot.held, Held::Io(h) if h.backend == backend))?;
+        let Held::Io(hold) = &mut slot.held else {
+            unreachable!()
+        };
         hold.count -= 1;
         if hold.count > 0 {
             return None;
         }
         let closed = hold.closed && !hold.released;
-        *slot = None;
+        slot.held = Held::Empty;
         (closed && !self.referenced(backend)).then_some(backend)
     }
 
-    /// The holds of operations that never end go (the other threads of a
-    /// process that execs, stopped for good), one call at a time: the next
-    /// backend whose last descriptor went meanwhile, to release; None once
-    /// no hold is left.
+    /// Discard abandoned ordinary I/O holds one release at a time.
     pub fn abandon_hold(&mut self) -> Option<T> {
-        while let Some(slot) = self.holds.iter_mut().find(|h| h.is_some()) {
-            let hold = slot.take().expect("a hold");
+        while let Some(slot) = self
+            .holds
+            .iter_mut()
+            .find(|slot| matches!(slot.held, Held::Io(_)))
+        {
+            let Held::Io(hold) = slot.held else {
+                unreachable!()
+            };
+            slot.held = Held::Empty;
             if hold.closed && !hold.released && !self.referenced(hold.backend) {
                 return Some(hold.backend);
             }
@@ -219,17 +525,48 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         None
     }
 
-    /// Close: the descriptor goes at once; the backend to release, when it
-    /// was the last that named it and either nothing holds it or its
-    /// service retains armed operation references independently.
     pub fn close(&mut self, fd: u32) -> Result<Option<T>, Error> {
         let backend = self.get(fd)?;
-        self.entries[fd as usize] = None;
+        self.entries[fd as usize].state = EntryState::Empty;
         Ok(self.left(backend))
     }
 
-    pub fn dup2(&mut self, source: u32, target: u32) -> Result<(u32, Option<T>), Error> {
+    /// Close an unreturned result only while its original entry lifetime lives.
+    pub fn close_exact(&mut self, entry: EntryToken) -> Option<T> {
+        if self.entry_token(entry.fd) != Ok(entry) {
+            return None;
+        }
+        self.close(entry.fd).ok().flatten()
+    }
+
+    pub fn pending(&self, fd: u32) -> Option<OpenToken> {
+        let EntryState::Pending(slot) = self.entries.get(fd as usize)?.state else {
+            return None;
+        };
+        let held = self.holds.get(slot)?;
+        matches!(held.held, Held::Open(_)).then_some(OpenToken {
+            slot,
+            generation: held.generation,
+        })
+    }
+
+    pub fn try_dup2(&mut self, source: u32, target: u32) -> Result<Replacement<T>, Error> {
         self.replace(source, target, Flags::default(), true)
+    }
+
+    pub fn try_dup3(
+        &mut self,
+        source: u32,
+        target: u32,
+        flags: Flags,
+    ) -> Result<Replacement<T>, Error> {
+        self.replace(source, target, flags, false)
+    }
+
+    /// Tuple interface for callers whose tables contain ordinary descriptors.
+    /// Reservation-aware callers use `try_dup2` and `try_dup3`.
+    pub fn dup2(&mut self, source: u32, target: u32) -> Result<(u32, Option<T>), Error> {
+        Self::ordinary_replacement(self.try_dup2(source, target)?)
     }
 
     pub fn dup3(
@@ -238,49 +575,423 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         target: u32,
         flags: Flags,
     ) -> Result<(u32, Option<T>), Error> {
-        self.replace(source, target, flags, false)
+        Self::ordinary_replacement(self.try_dup3(source, target, flags)?)
     }
 
-    /// `target` names `source`'s backend with `flags`: the target and the
-    /// backend it named before to release (as `close`).
+    fn ordinary_replacement(result: Replacement<T>) -> Result<(u32, Option<T>), Error> {
+        match result {
+            Replacement::Complete { fd, release } => Ok((fd, release)),
+            Replacement::Pending(_) => Err(Error::Io),
+        }
+    }
+
     fn replace(
         &mut self,
         source: u32,
         target: u32,
         flags: Flags,
         allow_same: bool,
-    ) -> Result<(u32, Option<T>), Error> {
+    ) -> Result<Replacement<T>, Error> {
         let backend = self.get(source)?;
         if target as usize >= N {
             return Err(Error::BadFileDescriptor);
         }
         if source == target {
             return if allow_same {
-                Ok((target, None))
+                Ok(Replacement::Complete {
+                    fd: target,
+                    release: None,
+                })
             } else {
                 Err(Error::InvalidArgument)
             };
         }
-        let old = self.entries[target as usize].replace(Entry { backend, flags });
+        if let Some(token) = self.pending(target) {
+            return Ok(Replacement::Pending(token));
+        }
+        let old = self.entry(target).ok();
+        self.install(target, backend, flags)?;
         let release = old
             .filter(|old| old.backend != backend)
             .and_then(|old| self.left(old.backend));
-        Ok((target, release))
+        Ok(Replacement::Complete {
+            fd: target,
+            release,
+        })
     }
 
-    /// A descriptor at `fd` of `backend` with `flags`, for a table a
-    /// process starts with (its parent's, spec 2, 3.2): BadFileDescriptor
-    /// past N or for a number already open.
     pub fn place(&mut self, fd: u32, backend: T, flags: Flags) -> Result<(), Error> {
         let slot = self
             .entries
-            .get_mut(fd as usize)
+            .get(fd as usize)
             .ok_or(Error::BadFileDescriptor)?;
-        if slot.is_some() {
+        if !matches!(slot.state, EntryState::Empty) {
             return Err(Error::BadFileDescriptor);
         }
-        *slot = Some(Entry { backend, flags });
+        self.install(fd, backend, flags)
+    }
+
+    fn record(&self, token: OpenToken) -> Result<OpenRecord<T, R>, Error> {
+        let slot = self.holds.get(token.slot).ok_or(Error::BadFileDescriptor)?;
+        if slot.generation != token.generation {
+            return Err(Error::BadFileDescriptor);
+        }
+        match slot.held {
+            Held::Open(record) => Ok(record),
+            _ => Err(Error::BadFileDescriptor),
+        }
+    }
+
+    fn claimed(&self, token: ClaimToken) -> Result<OpenRecord<T, R>, Error> {
+        let record = self.record(token.open)?;
+        if record.claimant.is_none() || record.serial != token.serial {
+            return Err(Error::BadFileDescriptor);
+        }
+        Ok(record)
+    }
+
+    fn save(&mut self, token: OpenToken, record: OpenRecord<T, R>) {
+        let slot = &mut self.holds[token.slot];
+        slot.held = Held::Open(record);
+        slot.change();
+    }
+
+    fn free_open(&mut self, token: OpenToken) {
+        let slot = &mut self.holds[token.slot];
+        slot.held = Held::Empty;
+        slot.change();
+    }
+
+    /// Pay a resident record before Prepare or any irreversible effect.
+    pub fn begin_open(
+        &mut self,
+        owner: OwnerToken,
+        recovery: R,
+    ) -> Result<(OpenToken, ClaimToken), Error> {
+        let (index, slot) = self
+            .holds
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| {
+                matches!(slot.held, Held::Empty)
+                    && slot.generation < u64::MAX
+                    && slot.changed.load(Ordering::Relaxed) < u32::MAX
+            })
+            .ok_or(Error::TooManyOpenFiles)?;
+        slot.generation += 1;
+        let open = OpenToken {
+            slot: index,
+            generation: slot.generation,
+        };
+        let claim = ClaimToken { open, serial: 1 };
+        slot.held = Held::Open(OpenRecord {
+            owner: Some(owner),
+            claimant: Some(owner),
+            serial: 1,
+            phase: Phase::Preparing(recovery),
+        });
+        slot.change();
+        Ok((open, claim))
+    }
+
+    pub fn open_snapshot(&self, token: OpenToken) -> Result<OpenSnapshot<R>, Error> {
+        Ok(self.record(token)?.snapshot())
+    }
+
+    pub fn open_tokens(&self) -> impl Iterator<Item = OpenToken> + '_ {
+        self.holds.iter().enumerate().filter_map(|(slot, h)| {
+            matches!(h.held, Held::Open(_)).then_some(OpenToken {
+                slot,
+                generation: h.generation,
+            })
+        })
+    }
+
+    pub fn claim_open(&mut self, token: OpenToken, helper: OwnerToken) -> Result<Claim<R>, Error> {
+        let mut record = self.record(token)?;
+        if let Some(completion) = record.snapshot().completion {
+            return Ok(Claim::Complete(completion));
+        }
+        if matches!(record.phase, Phase::Canceling { .. }) {
+            return Ok(Claim::Canceling(record.snapshot()));
+        }
+        if let Some(owner) = record.claimant {
+            return Ok(Claim::Busy(owner));
+        }
+        let Some(serial) = record.serial.checked_add(1) else {
+            record.cancel();
+            self.save(token, record);
+            return Ok(Claim::Canceling(record.snapshot()));
+        };
+        record.serial = serial;
+        record.claimant = Some(helper);
+        self.save(token, record);
+        Ok(Claim::Acquired {
+            token: ClaimToken {
+                open: token,
+                serial,
+            },
+            snapshot: record.snapshot(),
+        })
+    }
+
+    pub fn release_claim(&mut self, claim: ClaimToken) -> Result<(), Error> {
+        let mut record = self.claimed(claim)?;
+        record.claimant = None;
+        if record.serial == u64::MAX {
+            record.cancel();
+        }
+        self.save(claim.open, record);
         Ok(())
+    }
+
+    pub fn update_open(&mut self, claim: ClaimToken, recovery: R) -> Result<(), Error> {
+        let mut record = self.claimed(claim)?;
+        record.phase = match record.phase {
+            Phase::Preparing(_) => Phase::Preparing(recovery),
+            Phase::Reserved { entry, flags, .. } => Phase::Reserved {
+                recovery,
+                entry,
+                flags,
+            },
+            Phase::Committed {
+                entry,
+                flags,
+                backend,
+                ..
+            } => Phase::Committed {
+                recovery,
+                entry,
+                flags,
+                backend,
+            },
+            _ => return Err(Error::BadFileDescriptor),
+        };
+        self.save(claim.open, record);
+        Ok(())
+    }
+
+    /// Reserve after fallible preparation. Installation reuses this generation.
+    pub fn reserve_open(
+        &mut self,
+        claim: ClaimToken,
+        minimum: u32,
+        flags: Flags,
+    ) -> Result<EntryToken, Error> {
+        let mut record = self.claimed(claim)?;
+        let Phase::Preparing(recovery) = record.phase else {
+            return Err(Error::InvalidArgument);
+        };
+        let fd = self.vacant(minimum)?;
+        let slot = &mut self.entries[fd as usize];
+        let generation = slot.generation.checked_add(1).ok_or(Error::Io)?;
+        let entry = EntryToken::new(fd, generation);
+        slot.generation = generation;
+        slot.state = EntryState::Pending(claim.open.slot);
+        record.phase = Phase::Reserved {
+            recovery,
+            entry,
+            flags,
+        };
+        self.save(claim.open, record);
+        Ok(entry)
+    }
+
+    pub fn stage_committed(&mut self, claim: ClaimToken, backend: T) -> Result<(), Error> {
+        let mut record = self.claimed(claim)?;
+        let Phase::Reserved {
+            recovery,
+            entry,
+            flags,
+        } = record.phase
+        else {
+            return Err(Error::InvalidArgument);
+        };
+        record.phase = Phase::Committed {
+            recovery,
+            entry,
+            flags,
+            backend,
+        };
+        self.save(claim.open, record);
+        Ok(())
+    }
+
+    fn reserved(&self, token: OpenToken, entry: EntryToken) -> bool {
+        self.entries.get(entry.fd as usize).is_some_and(|slot| {
+            slot.generation == entry.generation()
+                && matches!(slot.state, EntryState::Pending(h) if h == token.slot)
+        })
+    }
+
+    /// Install a prepaid backend once. Completion survives fd close and reuse.
+    pub fn publish_open(&mut self, claim: ClaimToken) -> Result<EntryToken, Error> {
+        let mut record = self.claimed(claim)?;
+        if record.owner.is_none() {
+            return Err(Error::InvalidArgument);
+        }
+        let Phase::Committed {
+            entry,
+            flags,
+            backend,
+            ..
+        } = record.phase
+        else {
+            return Err(Error::InvalidArgument);
+        };
+        if !self.reserved(claim.open, entry) {
+            return Err(Error::Io);
+        }
+        self.entries[entry.fd as usize].state = EntryState::Open(Entry { backend, flags });
+        record.phase = Phase::Published(entry);
+        record.claimant = None;
+        self.save(claim.open, record);
+        Ok(entry)
+    }
+
+    /// The original caller copies this saved result before leaving its defer.
+    pub fn ack_open(&mut self, token: OpenToken, owner: OwnerToken) -> Result<Completion, Error> {
+        let record = self.record(token)?;
+        if record.owner != Some(owner) {
+            return Err(Error::BadFileDescriptor);
+        }
+        let completion = record.snapshot().completion.ok_or(Error::InvalidArgument)?;
+        self.free_open(token);
+        Ok(completion)
+    }
+
+    /// Canonical cancellation uses the exact backend operation in recovery.
+    /// The transition revokes all late stage and publication authority.
+    pub fn begin_cancel(&mut self, claim: ClaimToken) -> Result<OpenSnapshot<R>, Error> {
+        let mut record = self.claimed(claim)?;
+        record.cancel();
+        self.save(claim.open, record);
+        Ok(record.snapshot())
+    }
+
+    /// Complete an idempotent exact cancellation after its remote confirmation.
+    /// The returned value is a staged snapshot. The canonical remote outcome
+    /// establishes whether a backend reference remains owned. The caller
+    /// releases only a separately proven, still-owned reference.
+    pub fn finish_cancel(&mut self, token: OpenToken, errno: i32) -> Result<Option<T>, Error> {
+        if errno <= 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let mut record = self.record(token)?;
+        let Phase::Canceling { entry, backend, .. } = record.phase else {
+            return Err(Error::BadFileDescriptor);
+        };
+        if let Some(entry) = entry {
+            if !self.reserved(token, entry) {
+                return Err(Error::Io);
+            }
+            self.entries[entry.fd as usize].state = EntryState::Empty;
+        }
+        if record.owner.is_none() {
+            self.free_open(token);
+        } else {
+            record.phase = Phase::Failed(errno);
+            self.save(token, record);
+        }
+        Ok(backend)
+    }
+
+    /// Discard a completion or detach an unresolved operation for recovery.
+    /// The caller proves that the owner's execution has ended or been revoked.
+    pub fn abandon_open(&mut self, token: OpenToken) -> Result<Abandoned<T, R>, Error> {
+        let mut record = self.record(token)?;
+        match record.phase {
+            Phase::Published(entry) => {
+                let release = self.close_exact(entry);
+                self.free_open(token);
+                Ok(Abandoned::Discarded { token, release })
+            }
+            Phase::Failed(_) => {
+                self.free_open(token);
+                Ok(Abandoned::Discarded {
+                    token,
+                    release: None,
+                })
+            }
+            _ => {
+                record.owner = None;
+                record.claimant = None;
+                if record.serial == u64::MAX {
+                    record.cancel();
+                }
+                self.save(token, record);
+                Ok(Abandoned::Recover {
+                    token,
+                    snapshot: record.snapshot(),
+                })
+            }
+        }
+    }
+
+    /// Detach one original owner or helper claim per call, before slot reuse.
+    pub fn abandon_owner(&mut self, owner: OwnerToken) -> Option<Abandoned<T, R>> {
+        let (slot, record) = self
+            .holds
+            .iter()
+            .enumerate()
+            .find_map(|(slot, h)| match h.held {
+                Held::Open(record)
+                    if record.owner == Some(owner) || record.claimant == Some(owner) =>
+                {
+                    Some((slot, record))
+                }
+                _ => None,
+            })?;
+        let token = OpenToken {
+            slot,
+            generation: self.holds[slot].generation,
+        };
+        if record.owner == Some(owner) {
+            return self.abandon_open(token).ok();
+        }
+        let mut record = record;
+        record.claimant = None;
+        if record.serial == u64::MAX {
+            record.cancel();
+        }
+        self.save(token, record);
+        Some(Abandoned::ClaimReleased(token))
+    }
+
+    /// The fork child drops inherited recovery authority in its private table.
+    /// Published fd references survive. The parent owns every unresolved job.
+    /// The caller establishes child-exclusive access before this operation.
+    pub fn discard_open_after_fork(&mut self) {
+        for entry in &mut self.entries {
+            if matches!(entry.state, EntryState::Pending(_)) {
+                entry.state = EntryState::Empty;
+            }
+        }
+        for slot in &mut self.holds {
+            if matches!(slot.held, Held::Open(_)) {
+                slot.held = Held::Empty;
+                slot.change();
+            }
+        }
+    }
+
+    /// This address remains stable through slot reuse. The caller pins Table.
+    /// Wake occurs after unlocking; every waiter then revalidates its token.
+    pub fn wait_word(&self, token: OpenToken) -> Result<&AtomicU32, Error> {
+        self.holds
+            .get(token.slot)
+            .map(|slot| &slot.changed)
+            .ok_or(Error::BadFileDescriptor)
+    }
+
+    pub fn wait_snapshot(&self, token: OpenToken) -> Result<WaitValue, Error> {
+        self.record(token)?;
+        let sequence = self.holds[token.slot].changed.load(Ordering::Acquire);
+        Ok(if sequence == u32::MAX {
+            WaitValue::NeverSleep
+        } else {
+            WaitValue::Sequence(sequence)
+        })
     }
 }
 
@@ -433,5 +1144,410 @@ mod tests {
         assert_eq!(table.flags(0), Ok(flags));
         assert_eq!(table.set_flags(9, flags), Err(Error::BadFileDescriptor));
         assert_eq!(table.flags(9), Err(Error::BadFileDescriptor));
+    }
+
+    fn owner(value: u64) -> OwnerToken {
+        OwnerToken::new(value).unwrap()
+    }
+
+    fn acquired<R: Copy>(claim: Claim<R>) -> ClaimToken {
+        let Claim::Acquired { token, .. } = claim else {
+            panic!("an acquired claim")
+        };
+        token
+    }
+
+    #[test]
+    fn reserved_fd_is_hidden_and_replacement_waits_then_revalidates() {
+        let mut table = Table::<u32, 4, u64>::default();
+        let source = table.insert(10, Flags::default()).unwrap();
+        let (open, claim) = table.begin_open(owner(1), 70).unwrap();
+        let flags = Flags {
+            close_on_exec: true,
+            close_on_fork: false,
+        };
+        let entry = table.reserve_open(claim, 0, flags).unwrap();
+        assert_eq!(entry.fd, 1);
+        assert_eq!(table.get(entry.fd), Err(Error::BadFileDescriptor));
+        assert_eq!(table.flags(entry.fd), Err(Error::BadFileDescriptor));
+        assert_eq!(
+            table.set_flags(entry.fd, flags),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.close(entry.fd), Err(Error::BadFileDescriptor));
+        assert_eq!(table.vacant(0), Ok(2));
+        assert_eq!(table.open().count(), 1);
+        assert_eq!(
+            table.try_dup2(source, entry.fd),
+            Ok(Replacement::Pending(open))
+        );
+        assert_eq!(
+            table.try_dup3(source, entry.fd, flags),
+            Ok(Replacement::Pending(open))
+        );
+        assert_eq!(table.try_dup2(9, entry.fd), Err(Error::BadFileDescriptor));
+        let before = table.wait_snapshot(open).unwrap();
+        table.begin_cancel(claim).unwrap();
+        table.finish_cancel(open, 5).unwrap();
+        assert_ne!(table.wait_snapshot(open).unwrap(), before);
+        table.close(source).unwrap();
+        assert_eq!(
+            table.try_dup2(source, entry.fd),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.vacant(0), Ok(0));
+        assert_eq!(table.ack_open(open, owner(1)), Ok(Completion::Failed(5)));
+    }
+
+    #[test]
+    fn helper_completion_survives_handler_close_reuse_and_exact_ack() {
+        let mut table = Table::<u32, 2, u64>::default();
+        let (open, original) = table.begin_open(owner(1), 70).unwrap();
+        let entry = table.reserve_open(original, 0, Flags::default()).unwrap();
+        table.release_claim(original).unwrap();
+        let helper = acquired(table.claim_open(open, owner(2)).unwrap());
+        assert_eq!(
+            table.stage_committed(original, 10),
+            Err(Error::BadFileDescriptor)
+        );
+        table.update_open(helper, 71).unwrap();
+        table.stage_committed(helper, 10).unwrap();
+        assert_eq!(table.publish_open(helper), Ok(entry));
+        assert_eq!(table.publish_open(helper), Err(Error::BadFileDescriptor));
+        assert_eq!(
+            table.claim_open(open, owner(3)),
+            Ok(Claim::Complete(Completion::Opened(entry.fd)))
+        );
+        assert_eq!(table.close(entry.fd), Ok(Some(10)));
+        assert_eq!(table.insert(20, Flags::default()), Ok(entry.fd));
+        assert_eq!(
+            table.ack_open(open, owner(2)),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(
+            table.ack_open(open, owner(1)),
+            Ok(Completion::Opened(entry.fd))
+        );
+        assert_eq!(table.get(entry.fd), Ok(20));
+        assert_eq!(
+            table.ack_open(open, owner(1)),
+            Err(Error::BadFileDescriptor)
+        );
+        let (fresh, _) = table.begin_open(owner(1), 72).unwrap();
+        assert_eq!(fresh.slot(), open.slot());
+        assert!(fresh.generation() > open.generation());
+        assert_eq!(table.finish_cancel(open, 5), Err(Error::BadFileDescriptor));
+        assert_eq!(table.open_snapshot(fresh).unwrap().recovery, Some(72));
+    }
+
+    #[test]
+    fn published_pre_ack_cleanup_checks_entry_lifetime_even_for_same_backend() {
+        let mut table = Table::<u32, 3>::default();
+        let source = table.insert(10, Flags::default()).unwrap();
+        let (open, claim) = table.begin_open(owner(1), ()).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        table.stage_committed(claim, 10).unwrap();
+        table.publish_open(claim).unwrap();
+        assert_eq!(table.dup2(source, entry.fd), Ok((entry.fd, None)));
+        let replacement = table.entry_token(entry.fd).unwrap();
+        assert!(replacement.generation() > entry.generation());
+        assert_eq!(
+            table.abandon_owner(owner(1)),
+            Some(Abandoned::Discarded {
+                token: open,
+                release: None
+            })
+        );
+        assert_eq!(table.entry_token(entry.fd), Ok(replacement));
+        assert_eq!(table.get(entry.fd), Ok(10));
+        assert_eq!(table.close(source), Ok(None));
+        assert_eq!(table.close(entry.fd), Ok(Some(10)));
+    }
+
+    #[test]
+    fn unreturned_entry_closes_once_and_acked_fd_survives_owner_death() {
+        let mut table = Table::<u32, 2>::with_early_release(|_| true);
+        let (open, claim) = table.begin_open(owner(1), ()).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        table.stage_committed(claim, 10).unwrap();
+        table.publish_open(claim).unwrap();
+        table.hold(entry.fd).unwrap();
+        assert_eq!(
+            table.abandon_owner(owner(1)),
+            Some(Abandoned::Discarded {
+                token: open,
+                release: Some(10)
+            })
+        );
+        assert_eq!(table.get(entry.fd), Err(Error::BadFileDescriptor));
+        assert_eq!(table.unhold(10), None);
+        assert_eq!(table.abandon_owner(owner(1)), None);
+        let (open, claim) = table.begin_open(owner(1), ()).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        table.stage_committed(claim, 20).unwrap();
+        table.publish_open(claim).unwrap();
+        assert_eq!(
+            table.ack_open(open, owner(1)),
+            Ok(Completion::Opened(entry.fd))
+        );
+        assert_eq!(table.abandon_owner(owner(1)), None);
+        assert_eq!(table.get(entry.fd), Ok(20));
+    }
+
+    #[test]
+    fn owner_and_helper_death_revoke_claims_and_allow_canonical_cleanup() {
+        let mut table = Table::<u32, 2, u64>::default();
+        let (open, first) = table.begin_open(owner(1), 70).unwrap();
+        let entry = table.reserve_open(first, 0, Flags::default()).unwrap();
+        table.release_claim(first).unwrap();
+        let second = acquired(table.claim_open(open, owner(2)).unwrap());
+        assert_eq!(table.claim_open(open, owner(3)), Ok(Claim::Busy(owner(2))));
+        assert_eq!(
+            table.abandon_owner(owner(2)),
+            Some(Abandoned::ClaimReleased(open))
+        );
+        let third = acquired(table.claim_open(open, owner(3)).unwrap());
+        assert_eq!(table.release_claim(second), Err(Error::BadFileDescriptor));
+        table.stage_committed(third, 10).unwrap();
+        let abandoned = table.abandon_owner(owner(1)).unwrap();
+        assert!(
+            matches!(abandoned, Abandoned::Recover { token, snapshot } if token == open && snapshot.owner.is_none())
+        );
+        assert_eq!(table.publish_open(third), Err(Error::BadFileDescriptor));
+        let cleanup = acquired(table.claim_open(open, owner(4)).unwrap());
+        assert_eq!(table.publish_open(cleanup), Err(Error::InvalidArgument));
+        let snapshot = table.begin_cancel(cleanup).unwrap();
+        assert_eq!(snapshot.recovery, Some(70));
+        assert_eq!(table.pending(entry.fd), Some(open));
+        assert_eq!(table.finish_cancel(open, 5), Ok(Some(10)));
+        assert_eq!(table.vacant(0), Ok(entry.fd));
+        assert_eq!(table.open_tokens().count(), 0);
+        assert_eq!(table.finish_cancel(open, 5), Err(Error::BadFileDescriptor));
+        assert!(table.begin_open(owner(5), 80).is_ok());
+    }
+
+    #[test]
+    fn cancel_rejects_stale_publication_and_preserves_failed_completion() {
+        let mut table = Table::<u32, 1, u64>::default();
+        let (open, claim) = table.begin_open(owner(1), 70).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        table.stage_committed(claim, 10).unwrap();
+        table.begin_cancel(claim).unwrap();
+        assert_eq!(table.publish_open(claim), Err(Error::BadFileDescriptor));
+        assert_eq!(
+            table.stage_committed(claim, 20),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.finish_cancel(open, 0), Err(Error::InvalidArgument));
+        assert_eq!(table.pending(entry.fd), Some(open));
+        assert_eq!(table.finish_cancel(open, 5), Ok(Some(10)));
+        assert_eq!(table.finish_cancel(open, 5), Err(Error::BadFileDescriptor));
+        assert_eq!(table.ack_open(open, owner(1)), Ok(Completion::Failed(5)));
+        let (new, claim) = table.begin_open(owner(1), 80).unwrap();
+        table.reserve_open(claim, 0, Flags::default()).unwrap();
+        table.stage_committed(claim, 20).unwrap();
+        table.publish_open(claim).unwrap();
+        assert_eq!(table.finish_cancel(open, 5), Err(Error::BadFileDescriptor));
+        assert_eq!(table.finish_cancel(new, 5), Err(Error::BadFileDescriptor));
+        assert_eq!(table.get(0), Ok(20));
+        assert_eq!(table.ack_open(new, owner(1)), Ok(Completion::Opened(0)));
+    }
+
+    #[test]
+    fn all_32_credits_are_shared_by_io_and_unacked_completions() {
+        let mut table = Table::<u32, 32>::default();
+        for backend in 0..16 {
+            let fd = table.insert(backend, Flags::default()).unwrap();
+            table.hold(fd).unwrap();
+        }
+        let mut opens = [None; 16];
+        for (i, token) in opens.iter_mut().enumerate() {
+            let (open, claim) = table.begin_open(owner(1), ()).unwrap();
+            table.reserve_open(claim, 0, Flags::default()).unwrap();
+            table.stage_committed(claim, (i + 16) as u32).unwrap();
+            table.publish_open(claim).unwrap();
+            *token = Some(open);
+        }
+        assert_eq!(table.begin_open(owner(1), ()), Err(Error::TooManyOpenFiles));
+        assert_eq!(table.hold(31), Err(Error::TooManyOpenFiles));
+        assert_eq!(table.hold(0), Ok(0));
+        assert_eq!(table.close(31), Ok(Some(31)));
+        assert_eq!(table.begin_open(owner(1), ()), Err(Error::TooManyOpenFiles));
+        table.ack_open(opens[15].unwrap(), owner(1)).unwrap();
+        assert!(table.begin_open(owner(1), ()).is_ok());
+        assert_eq!(table.abandon_hold(), None);
+        assert_eq!(table.open_tokens().count(), 16);
+    }
+
+    #[test]
+    fn exhausted_generations_reject_admission_and_existing_cleanup_finishes() {
+        let mut table = Table::<u32, 1>::default();
+        table.holds[0].generation = u64::MAX - 1;
+        table.entries[0].generation = u64::MAX - 1;
+        let (open, claim) = table.begin_open(owner(1), ()).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        assert_eq!(open.generation(), u64::MAX);
+        assert_eq!(entry.generation(), u64::MAX);
+        table.stage_committed(claim, 10).unwrap();
+        table.publish_open(claim).unwrap();
+        assert_eq!(table.ack_open(open, owner(1)), Ok(Completion::Opened(0)));
+        assert_eq!(table.close(0), Ok(Some(10)));
+        assert_eq!(table.insert(20, Flags::default()), Err(Error::Io));
+        assert_eq!(table.begin_open(owner(1), ()), Err(Error::TooManyOpenFiles));
+        let mut table = Table::<u32, 2>::default();
+        table.entries[0].generation = u64::MAX;
+        let (open, claim) = table.begin_open(owner(1), ()).unwrap();
+        assert_eq!(
+            table.reserve_open(claim, 0, Flags::default()),
+            Err(Error::Io)
+        );
+        assert_eq!(
+            table.open_snapshot(open).unwrap().phase,
+            OpenPhase::Preparing
+        );
+        table.begin_cancel(claim).unwrap();
+        table.finish_cancel(open, 5).unwrap();
+        table.abandon_owner(owner(1)).unwrap();
+        assert_eq!(table.open_tokens().count(), 0);
+    }
+
+    #[test]
+    fn terminal_claim_serial_revokes_late_reply_and_cancels_without_new_serial() {
+        let mut table = Table::<u32, 1, u64>::default();
+        let (open, claim) = table.begin_open(owner(1), 70).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        table.stage_committed(claim, 10).unwrap();
+        let Held::Open(record) = &mut table.holds[0].held else {
+            panic!("open")
+        };
+        record.serial = u64::MAX;
+        let last = ClaimToken {
+            open,
+            serial: u64::MAX,
+        };
+        table.release_claim(last).unwrap();
+        assert!(matches!(
+            table.claim_open(open, owner(2)),
+            Ok(Claim::Canceling(_))
+        ));
+        assert_eq!(table.publish_open(last), Err(Error::BadFileDescriptor));
+        assert_eq!(table.pending(entry.fd), Some(open));
+        table.abandon_owner(owner(1)).unwrap();
+        assert_eq!(table.finish_cancel(open, 5), Ok(Some(10)));
+        assert_eq!(table.open_tokens().count(), 0);
+        assert_eq!(table.vacant(0), Ok(0));
+        assert!(table.begin_open(owner(2), 80).is_ok());
+    }
+
+    #[test]
+    fn saturated_wait_word_never_wraps_and_cleanup_keeps_stable_address() {
+        let mut table = Table::<u32, 1>::default();
+        let (open, claim) = table.begin_open(owner(1), ()).unwrap();
+        let address = table.wait_word(open).unwrap() as *const AtomicU32;
+        table.holds[0]
+            .changed
+            .store(u32::MAX - 1, Ordering::Relaxed);
+        let before = table.wait_snapshot(open).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        assert_eq!(before, WaitValue::Sequence(u32::MAX - 1));
+        assert_eq!(table.wait_snapshot(open), Ok(WaitValue::NeverSleep));
+        table.begin_cancel(claim).unwrap();
+        table.abandon_owner(owner(1)).unwrap();
+        table.finish_cancel(open, 5).unwrap();
+        assert_eq!(table.wait_word(open).unwrap() as *const AtomicU32, address);
+        assert_eq!(
+            table.wait_word(open).unwrap().load(Ordering::Acquire),
+            u32::MAX
+        );
+        assert_eq!(table.begin_open(owner(1), ()), Err(Error::TooManyOpenFiles));
+        assert_eq!(table.insert(10, Flags::default()), Ok(entry.fd));
+        assert_eq!(table.hold(entry.fd), Ok(10));
+        assert_eq!(table.close(entry.fd), Ok(None));
+        assert_eq!(table.unhold(10), Some(10));
+        assert_eq!(
+            table.wait_word(open).unwrap().load(Ordering::Acquire),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn fork_discard_preserves_published_refs_and_drops_recovery_authority() {
+        let mut child = Table::<u32, 3, u64>::default();
+        let (published, claim) = child.begin_open(owner(1), 70).unwrap();
+        let live = child.reserve_open(claim, 0, Flags::default()).unwrap();
+        child.stage_committed(claim, 10).unwrap();
+        child.publish_open(claim).unwrap();
+        child.hold(live.fd).unwrap();
+        let (pending, claim) = child.begin_open(owner(2), 80).unwrap();
+        let transient = child.reserve_open(claim, 0, Flags::default()).unwrap();
+        child.stage_committed(claim, 20).unwrap();
+        child.discard_open_after_fork();
+        assert_eq!(child.open_tokens().count(), 0);
+        assert_eq!(
+            child.open_snapshot(published),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(child.open_snapshot(pending), Err(Error::BadFileDescriptor));
+        assert_eq!(child.get(live.fd), Ok(10));
+        assert_eq!(child.pending(transient.fd), None);
+        assert_eq!(child.vacant(0), Ok(transient.fd));
+        assert_eq!(child.abandon_hold(), None);
+        assert_eq!(child.close(live.fd), Ok(Some(10)));
+    }
+
+    #[test]
+    fn flags_and_same_fd_dup_preserve_entry_lifetime() {
+        let mut table = Table::<u32, 1>::default();
+        table.insert(10, Flags::default()).unwrap();
+        let entry = table.entry_token(0).unwrap();
+        table
+            .set_flags(
+                0,
+                Flags {
+                    close_on_exec: true,
+                    close_on_fork: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(table.dup2(0, 0), Ok((0, None)));
+        assert_eq!(table.entry_token(0), Ok(entry));
+        table.entries[0].generation = u64::MAX;
+        let at_max = table.entry_token(0).unwrap();
+        assert_eq!(table.dup2(0, 0), Ok((0, None)));
+        assert_eq!(table.entry_token(0), Ok(at_max));
+    }
+
+    #[test]
+    fn exhausted_replacement_preserves_target_and_owner_death_skips_reused_fd() {
+        let mut table = Table::<u32, 3>::default();
+        let flags = Flags {
+            close_on_exec: true,
+            close_on_fork: true,
+        };
+        table.insert(10, Flags::default()).unwrap();
+        table.insert(20, flags).unwrap();
+        table.entries[1].generation = u64::MAX;
+        let target = table.entry_token(1).unwrap();
+        assert_eq!(table.try_dup2(0, 1), Err(Error::Io));
+        assert_eq!(table.try_dup3(0, 1, Flags::default()), Err(Error::Io));
+        assert_eq!(table.get(1), Ok(20));
+        assert_eq!(table.flags(1), Ok(flags));
+        assert_eq!(table.entry_token(1), Ok(target));
+        let (open, claim) = table.begin_open(owner(1), ()).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        table.stage_committed(claim, 30).unwrap();
+        table.publish_open(claim).unwrap();
+        assert_eq!(table.close(entry.fd), Ok(Some(30)));
+        assert_eq!(table.insert(40, Flags::default()), Ok(entry.fd));
+        let fresh = table.entry_token(entry.fd).unwrap();
+        assert_eq!(
+            table.abandon_owner(owner(1)),
+            Some(Abandoned::Discarded {
+                token: open,
+                release: None
+            })
+        );
+        assert_eq!(table.entry_token(entry.fd), Ok(fresh));
+        assert_eq!(table.get(entry.fd), Ok(40));
     }
 }
