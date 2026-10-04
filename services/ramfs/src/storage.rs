@@ -854,7 +854,7 @@ impl<'a> Storage<'a> {
         Ok(())
     }
 
-    pub fn boot_bytes(&self, token: Token) -> &[u8] {
+    pub fn boot_bytes(&self, token: Token) -> &'a [u8] {
         let n = &self.state.nodes[token.slot as usize];
         if token.slot == 3 {
             crate::MOTD
@@ -963,10 +963,11 @@ impl<'a> Storage<'a> {
             let start = p * PAGE;
             let boot = self.boot_bytes(token);
             let amount = boot.len().saturating_sub(start).min(PAGE);
-            let mut copy = [0; PAGE];
-            copy[..amount]
+            let data = &mut self.data[page as usize * PAGE..(page as usize + 1) * PAGE];
+            data[..amount]
                 .copy_from_slice(&boot[start.min(boot.len())..start.min(boot.len()) + amount]);
-            self.data[page as usize * PAGE..(page as usize + 1) * PAGE].copy_from_slice(&copy);
+            data[amount..].fill(0);
+            // Publish the page only after its boot prefix and zero tail are initialized.
             self.state.overlays[i].pages[p] = page;
             self.state.page_next[page as usize] = self.state.overlays[i].head;
             self.state.page_logical[page as usize] = p as u16;
@@ -1023,5 +1024,78 @@ impl<'a> Storage<'a> {
                 .count()
         };
         (self.boot_bytes(token).len() as u64).div_ceil(512) + pages as u64 * 8
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    const FIRST: Root = Root {
+        id: 11,
+        generation: 7,
+    };
+
+    fn create(storage: &mut Storage<'_>, name: &[u8]) -> Token {
+        let reservation = storage
+            .reserve(FIRST, ROOT, name, (crate::REG, 0o644, 1, 2))
+            .unwrap();
+        storage.commit(reservation).unwrap()
+    }
+
+    fn drain(storage: &mut Storage<'_>) -> usize {
+        let mut steps = 0;
+        while storage.reclaim_step() {
+            steps += 1;
+            assert!(steps <= PAGES + INODES);
+        }
+        steps
+    }
+
+    #[test]
+    fn reused_backing_page_preserves_boot_prefix_and_clears_sparse_tail() {
+        use bootimg::rootfs::{Entry, REGULAR};
+        let image = crate::tree::test_image(&[Entry {
+            path: "/boot",
+            mode: REGULAR | 0o644,
+            uid: 1,
+            gid: 2,
+            file: 1,
+        }]);
+        let mut index = crate::tree::Index::new();
+        let tree = crate::tree::load(&image, &mut index).unwrap();
+        let mut ram = crate::Ram::with_tree(0, tree);
+        let storage = &mut ram.storage;
+        storage.data.fill(0xa5);
+        let dirty = create(storage, b"dirty");
+        storage.write(dirty, FIRST, 0, &[0xa5; PAGE]).unwrap();
+        let dirty_overlay = storage.node(dirty).unwrap().overlay as usize;
+        let physical = storage.state.overlays[dirty_overlay].pages[0];
+        storage.unlink(ROOT, b"dirty", FIRST).unwrap();
+        assert_eq!(drain(storage), 2);
+        assert_eq!(storage.usage(FIRST).pages, 0);
+
+        let boot = storage.resolve(b"/boot").unwrap();
+        storage.write(boot, FIRST, PAGE - 1, b"z").unwrap();
+        let boot_overlay = storage.node(boot).unwrap().overlay as usize;
+        assert_eq!(storage.state.overlays[boot_overlay].pages[0], physical);
+        let mut out = [0xa5; PAGE];
+        assert_eq!(storage.read(boot, 0, &mut out), Ok(PAGE));
+        assert_eq!(&out[..11], b"alpha bytes");
+        assert!(out[11..PAGE - 1].iter().all(|&b| b == 0));
+        assert_eq!(out[PAGE - 1], b'z');
+        assert_eq!(tree.data(0), b"alpha bytes");
+
+        storage.unlink(ROOT, b"boot", FIRST).unwrap();
+        assert_eq!(drain(storage), 2);
+        let sparse = create(storage, b"sparse");
+        storage.write(sparse, FIRST, 2 * PAGE + 7, b"x").unwrap();
+        let sparse_overlay = storage.node(sparse).unwrap().overlay as usize;
+        assert_eq!(storage.state.overlays[sparse_overlay].pages[2], physical);
+        let mut gap = [0xa5; 2 * PAGE + 8];
+        assert_eq!(storage.read(sparse, 0, &mut gap), Ok(gap.len()));
+        assert!(gap[..gap.len() - 1].iter().all(|&b| b == 0));
+        assert_eq!(gap[gap.len() - 1], b'x');
+        assert_eq!(storage.usage(FIRST).pages, 1);
     }
 }
