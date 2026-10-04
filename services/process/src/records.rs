@@ -107,6 +107,8 @@ pub struct Record<P> {
     pub tried: u32,
     /// Exact successful loader ticket of the current image, retained after Take.
     pub committed_loader_ticket: u64,
+    #[cfg(feature = "image-probe")]
+    pub image_probe: crate::image_probe::Observation,
     /// Its process group and session: those of its parent, or its own PID
     /// for a record of init's table.
     pub pgid: u32,
@@ -393,6 +395,8 @@ impl<P> Records<P> {
             image: proto_process::IMAGE,
             tried: proto_process::IMAGE,
             committed_loader_ticket: 0,
+            #[cfg(feature = "image-probe")]
+            image_probe: crate::image_probe::Observation::default(),
             pgid,
             sid,
             ctty: None,

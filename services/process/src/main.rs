@@ -21,6 +21,10 @@
 #![no_std]
 #![no_main]
 use core::cell::UnsafeCell;
+#[cfg(feature = "image-probe")]
+mod image_probe_main;
+#[cfg(feature = "image-probe")]
+use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
 use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
@@ -95,16 +99,30 @@ struct Walking {
 /// The walks of the service that wait for an earlier walk of their sender
 /// at most; past them kill is EAGAIN.
 const LATER: usize = 64;
-#[cfg(feature = "tty-probe")]
-const PROBE_METHODS: [u16; proto_process::METHODS.len() + 2] = {
-    let mut methods = [0; proto_process::METHODS.len() + 2];
+#[cfg(any(feature = "tty-probe", feature = "image-probe"))]
+const PROBE_METHODS: [u16; proto_process::METHODS.len()
+    + if cfg!(feature = "tty-probe") { 2 } else { 0 }
+    + if cfg!(feature = "image-probe") { 3 } else { 0 }] = {
+    let mut methods = [0; proto_process::METHODS.len()
+        + if cfg!(feature = "tty-probe") { 2 } else { 0 }
+        + if cfg!(feature = "image-probe") { 3 } else { 0 }];
     let mut i = 0;
     while i < proto_process::METHODS.len() {
         methods[i] = proto_process::METHODS[i];
         i += 1;
     }
-    methods[i] = 42;
-    methods[i + 1] = 44;
+    #[cfg(feature = "tty-probe")]
+    {
+        methods[i] = 42;
+        methods[i + 1] = 44;
+    }
+    #[cfg(feature = "image-probe")]
+    {
+        let offset = i + if cfg!(feature = "tty-probe") { 2 } else { 0 };
+        methods[offset] = image_probe::ARM;
+        methods[offset + 1] = image_probe::TRACE;
+        methods[offset + 2] = image_probe::CHILD_HANDOFF;
+    }
     methods
 };
 /// The label of the service's own place for the notification that makes
@@ -2176,11 +2194,25 @@ impl Processes {
         Answer::Status(Status::Ok)
     }
 
+    #[cfg(feature = "image-probe")]
+    fn free_observed_loader(
+        &mut self,
+        child: usize,
+        terminal: Terminal,
+    ) -> Option<loaders::Place<Held>> {
+        let observation = &mut self.records.get_mut(child)?.image_probe;
+        image_probe::free(&mut self.loaders, observation, child, terminal)
+    }
+
     /// The load of the record in `child` stops: its process is killed, its
     /// loader's place and SetId go, and a SpawnStart that waits gets
     /// `status`. The record goes with the end of its process.
     fn abort_load(&mut self, child: usize, status: Status) {
-        if let Some(place) = self.loaders.free(child) {
+        #[cfg(feature = "image-probe")]
+        let place = self.free_observed_loader(child, Terminal::Aborted);
+        #[cfg(not(feature = "image-probe"))]
+        let place = self.loaders.free(child);
+        if let Some(place) = place {
             self.generations.invalidate(child);
             if let Some(start) = place.held.start {
                 let _ = start.answer(&proto_wire::reply(status), Outgoing::new());
@@ -2381,6 +2413,9 @@ impl Processes {
         if w.u32(0).is_err() || credentials.words().iter().any(|&id| w.u32(id).is_err()) {
             return Answer::Status(Status::BadSize);
         }
+        #[cfg(feature = "image-probe")]
+        self.free_observed_loader(child, Terminal::Taken);
+        #[cfg(not(feature = "image-probe"))]
         self.loaders.free(child);
         self.generations.invalidate(child);
         Answer::Reply(handles)
@@ -2475,6 +2510,33 @@ impl Processes {
         let Some(child) = self.records.find_pid(set.pid) else {
             return refuse(proto_process::PERMISSION);
         };
+        #[cfg(feature = "image-probe")]
+        {
+            let observation = &mut self
+                .records
+                .get_mut(child)
+                .expect("a live record")
+                .image_probe;
+            match image_probe::set_id(
+                &mut self.loaders,
+                observation,
+                set.ticket,
+                child,
+                set.image,
+                (set.uid, set.gid),
+            ) {
+                Ok(true) => {
+                    let w = r.reply();
+                    if w.u32(0).and_then(|()| w.u32(1)).is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    Answer::Reply(Outgoing::new())
+                }
+                Ok(false) => Answer::Status(Status::Ok),
+                Err(loaders::Refused) => refuse(proto_process::PERMISSION),
+            }
+        }
+        #[cfg(not(feature = "image-probe"))]
         match self
             .loaders
             .set_id(set.ticket, child, set.image, (set.uid, set.gid))
@@ -2487,11 +2549,11 @@ impl Processes {
 impl Service<0> for Processes {
     const VERSION: u16 = proto_process::VERSION;
     const METHODS: &'static [u16] = {
-        #[cfg(feature = "tty-probe")]
+        #[cfg(any(feature = "tty-probe", feature = "image-probe"))]
         {
             &PROBE_METHODS
         }
-        #[cfg(not(feature = "tty-probe"))]
+        #[cfg(not(any(feature = "tty-probe", feature = "image-probe")))]
         {
             proto_process::METHODS
         }
@@ -2562,6 +2624,16 @@ impl Service<0> for Processes {
         let Some(index) = self.records.find(r.label()) else {
             return refuse(proto_process::UNREGISTERED);
         };
+        #[cfg(feature = "image-probe")]
+        if [
+            image_probe::ARM,
+            image_probe::TRACE,
+            image_probe::CHILD_HANDOFF,
+        ]
+        .contains(&method)
+        {
+            return self.image_probe_request(index, r);
+        }
         if method == Method::WaitTake as u16 {
             return self.wait_take(index, s, r);
         }
@@ -2672,6 +2744,9 @@ impl Service<0> for Processes {
                 .and_then(|slot| self.loaders.get(slot))
                 .is_some_and(|p| p.image == image && p.held.incoming.is_some());
             if incoming {
+                #[cfg(feature = "image-probe")]
+                self.abort_ended_load(index, Status::from_code(proto_process::AGAIN));
+                #[cfg(not(feature = "image-probe"))]
                 self.abort_load(index, Status::from_code(proto_process::AGAIN));
             }
             return;
@@ -2692,6 +2767,9 @@ impl Service<0> for Processes {
         // that waited for its Boot gets AGAIN. An old image that ended
         // before its ExecCommit, by itself or by SIGKILL, takes the new
         // process with it, whose quota comes back to the pool.
+        #[cfg(feature = "image-probe")]
+        self.abort_ended_load(index, Status::from_code(proto_process::AGAIN));
+        #[cfg(not(feature = "image-probe"))]
         self.abort_load(index, Status::from_code(proto_process::AGAIN));
         // The end of a session's leader takes its terminal from the
         // session (XBD 11.1.3).

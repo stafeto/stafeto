@@ -98,6 +98,8 @@ pub struct Place<T> {
     /// The user and group IDs the file sets (NO_ID for none), once a file
     /// service said so for this place.
     pub set_id: Option<(u32, u32)>,
+    #[cfg(feature = "image-probe")]
+    pub image_probe_counts: crate::image_probe::Counts,
     /// What the service holds for the loader.
     pub held: T,
 }
@@ -169,6 +171,8 @@ impl<T> Loaders<T> {
             image,
             stage: Stage::Booting,
             set_id: None,
+            #[cfg(feature = "image-probe")]
+            image_probe_counts: crate::image_probe::Counts::default(),
             held,
         });
         self.of_record[record] = Some(index as u8);
