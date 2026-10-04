@@ -125,7 +125,7 @@ def main():
     args.cache.mkdir(parents=True, exist_ok=True)
     index = page(args.cache, "contents.html")
     pages = sorted(set(re.findall(r'href="(?:\.\./functions/)?([A-Za-z0-9_]+\.html)', index)))
-    pages = [name for name in pages if name not in ("CMPLX.html", "V2_chap01.html", "V2_chap02.html", "V2_chap03.html", "contents.html")]
+    pages = [name for name in pages if name not in ("V2_chap01.html", "V2_chap02.html", "V2_chap03.html", "contents.html")]
     with ThreadPoolExecutor(max_workers=8) as pool:
         grouped = list(pool.map(lambda name: entries(args.cache, name), pages))
     rows = sorted((row for group in grouped for row in group), key=lambda row: row[0])

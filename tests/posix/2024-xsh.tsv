@@ -2,6 +2,9 @@
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 # POSIX.1-2024 XSH, https://pubs.opengroup.org/onlinepubs/9799919799/functions/contents.html
 # name	page	requirement	headers	option_codes
+CMPLX	CMPLX	required	complex.h	-
+CMPLXF	CMPLX	required	complex.h	-
+CMPLXL	CMPLX	required	complex.h	-
 _Exit	_Exit	required	stdlib.h,unistd.h	-
 _exit	_Exit	required	stdlib.h,unistd.h	-
 a64l	a64l	option	stdlib.h	XSI

@@ -355,7 +355,13 @@ mod tests {
     #[test]
     fn inventory_keeps_required_and_optional_interfaces() {
         let rows = interfaces(INVENTORY).unwrap();
-        assert!(rows.len() > 1_200);
+        assert_eq!(rows.len(), 1_231);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.requirement == "required")
+                .count(),
+            1_026
+        );
         assert!(
             rows.iter()
                 .any(|r| r.name == "getentropy" && r.requirement == "required")
@@ -364,6 +370,26 @@ mod tests {
             rows.iter()
                 .any(|r| r.name == "mq_open" && r.requirement == "option")
         );
+        for name in ["CMPLX", "CMPLXF", "CMPLXL"] {
+            assert!(
+                rows.iter()
+                    .any(|r| r.name == name && r.requirement == "required")
+            );
+        }
+        for (name, requirement) in [
+            ("errno", "required"),
+            ("tzname", "required"),
+            ("in6addr_any", "option"),
+            ("in6addr_loopback", "option"),
+            ("signgam", "option"),
+            ("daylight", "option"),
+            ("timezone", "option"),
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|row| row.name == name && row.requirement == requirement)
+            );
+        }
     }
 
     #[test]
