@@ -104,6 +104,7 @@ fn run() -> Result<(), Status> {
     if initial[..5] != [1, 0, 1, 1, 0] || initial[7] != 1 || pages(channel)? != baseline + 32 {
         return Err(Status::BadSize);
     }
+    rt::println!("ramfs-gc: prepared binding retained with 32 allocated pages");
     control(channel, 2)?;
     for _ in 0..200 {
         let current = counts(channel)?;
