@@ -43,6 +43,10 @@ struct Table(UnsafeCell<Index>);
 // SAFETY: only the main thread reaches it, once (`image_tree`).
 unsafe impl Sync for Table {}
 static TABLE: Table = Table(UnsafeCell::new(Index::new()));
+struct StorageBss(UnsafeCell<core::mem::MaybeUninit<ramfs::storage::State>>);
+// SAFETY: only the service thread accesses the storage tables.
+unsafe impl Sync for StorageBss {}
+static STORAGE: StorageBss = StorageBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 
 /// The files of the boot image's table: the image is mapped from the
 /// start data (`bootimage`, given to this record by init), and the table is
@@ -73,10 +77,25 @@ fn main(_: u64) -> u64 {
         rt::console::set(console);
     }
     let now = rt::time::ticks_to_ns(rt::time::now());
-    let ram = match image_tree(&mut start) {
-        Some(tree) => Ram::with_tree(now, tree),
-        None => Ram::new(now),
+    let tree = image_tree(&mut start);
+    let Ok(backing) = sys::mem_create((ramfs::storage::PAGES * ramfs::storage::PAGE) as u64) else {
+        return 5;
     };
+    const DATA: usize = 0x54_0000_0000;
+    let size = (ramfs::storage::PAGES * ramfs::storage::PAGE) as u64;
+    if sys::mem_map(&start.process, &backing, 0, size, DATA, Access::ReadWrite).is_err() {
+        return 6;
+    }
+    // SAFETY: the sole service thread owns this fixed data mapping and STORAGE.
+    let data = unsafe { core::slice::from_raw_parts_mut(DATA as *mut u8, size as usize) };
+    let state = unsafe {
+        let pointer = (*STORAGE.0.get()).as_mut_ptr();
+        // State's integer, boolean and Option<Account> fields admit zero values.
+        pointer.write_bytes(0, 1);
+        &mut *pointer
+    };
+    state.initialize();
+    let ram = Ram::with_storage(now, state, data, tree);
     let args = ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
@@ -94,6 +113,13 @@ fn main(_: u64) -> u64 {
         issued: 0,
         heartbeat: Some(heartbeat),
     };
+    rt::println!(
+        "ramfs: storage pages={} tables={} bytes",
+        ramfs::storage::PAGES,
+        core::mem::size_of::<ramfs::storage::State>()
+            + core::mem::size_of::<Tables>()
+            + core::mem::size_of::<Index>()
+    );
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
     let tables = unsafe { &mut *TABLES.0.get() };
@@ -480,6 +506,7 @@ impl Service<0> for Fs {
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        self.ram.storage.reclaim_step();
         if let Some(entry) = proto_fs::image_entry(r.label()) {
             return self.image(entry, r);
         }

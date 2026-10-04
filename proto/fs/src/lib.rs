@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 2 of the RAM file service protocol. All numbers are little endian.
+//! Version 3 of the RAM file service protocol. All numbers are little endian.
 //! OPEN: header, flags u32, UTF-8 absolute path bytes. Reply: status, fd u32,
 //! and for a random device (`/dev/random`, `/dev/urandom`, step 5e') a third
 //! word, RANDOM_DEVICE: the client's layer serves the reads of such a
@@ -69,7 +69,7 @@ pub use info::NodeInfo;
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;

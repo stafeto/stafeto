@@ -19,11 +19,11 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 40,
         ceiling: 40,
-        // Its segments, a stack of 48 KiB, its tables of 320 sessions and
-        // 256 births in `.bss`, and the tables of the image's files.
-        quota: 96 * PAGE,
+        // 4096 data pages + 457 table pages + 21 code/rodata pages
+        // + 12 stack pages + 128 reserve pages, measured with the RAM image.
+        quota: (4096 + 457 + 21 + 12 + 128) * PAGE,
         handle_limit: 32,
-        restart: Restart::Always,
+        restart: Restart::Never,
         console: true,
         log: false,
         trace: false,
@@ -316,7 +316,7 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
 pub const POSIX_STEPS_TABLE: &[Record] = &[
     // Room for the crowd's descriptions in the RAM file service.
     Record {
-        quota: 512 * PAGE,
+        quota: TABLE[0].quota,
         ..TABLE[0]
     },
     Record {
