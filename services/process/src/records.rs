@@ -197,6 +197,9 @@ impl<P> Records<P> {
         id: u32,
         generation: u64,
     ) -> Result<(), u32> {
+        if generation & proto_process::GENERATION_DEAD != 0 {
+            return Err(proto_process::NO_PROCESS);
+        }
         if !proto_process::generation_room(generation, 1) {
             return Err(proto_process::AGAIN);
         }
@@ -1038,7 +1041,7 @@ mod tests {
         let retained = t.get(index).unwrap().credentials;
         assert_eq!(
             t.change_credentials(index, proto_process::Change::EffectiveUid, 0, u64::MAX),
-            Err(proto_process::AGAIN)
+            Err(proto_process::NO_PROCESS)
         );
         assert_eq!(t.get(index).unwrap().credentials, retained);
         assert_eq!(t.exited(index, End::exited(0)).0, Exit::Reaped);

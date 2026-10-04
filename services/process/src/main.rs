@@ -1356,7 +1356,7 @@ impl Processes {
                 return refuse(proto_process::PERMISSION);
             }
             let leader = pid == record.sid;
-            if !self.generations.room(index, 1) {
+            if !self.generations.live_room(index, 1) {
                 return refuse(proto_process::AGAIN);
             }
             self.records.get_mut(index).expect("caller").ctty = None;
@@ -1385,7 +1385,7 @@ impl Processes {
             };
             let records = &self.records;
             if let Some(index) = records.find_pid(sid)
-                && !self.generations.room(index, 1)
+                && !self.generations.live_room(index, 1)
             {
                 return refuse(proto_process::AGAIN);
             }
@@ -1620,7 +1620,7 @@ impl Processes {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        if !self.generations.room(index, 1) {
+        if !self.generations.live_room(index, 1) {
             return refuse(proto_process::AGAIN);
         }
         match self.records.set_sid(index) {
@@ -1923,7 +1923,7 @@ impl Processes {
         if self.loaders.of(index).is_some()
             || !self.loaders.room_for(index)
             || record.tried >= proto_process::IMAGE_MAX
-            || !self.generations.room(index, 3)
+            || !self.generations.live_room(index, 3)
         {
             return refuse(proto_process::AGAIN);
         }
@@ -2012,7 +2012,7 @@ impl Processes {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if !self.generations.room(index, 2) {
+        if !self.generations.live_room(index, 2) {
             return refuse(proto_process::AGAIN);
         }
         let exec = self
@@ -2326,7 +2326,7 @@ impl Processes {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if !self.generations.room(child, 3) {
+        if !self.generations.live_room(child, 3) {
             return refuse(proto_process::AGAIN);
         }
         match self.loaders.loaded(child) {
@@ -2345,7 +2345,7 @@ impl Processes {
         if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Ready) {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         }
-        if !self.generations.room(child, 1) {
+        if !self.generations.live_room(child, 1) {
             return refuse(proto_process::AGAIN);
         }
         let record = self.records.get(child).expect("a ready record");
@@ -2415,7 +2415,7 @@ impl Processes {
         let Some(child) = self.loading_child(index, r, fork) else {
             return refuse(proto_process::NO_PROCESS);
         };
-        if !self.generations.room(child, 2) {
+        if !self.generations.live_room(child, 2) {
             return refuse(proto_process::AGAIN);
         }
         let Ok(set_id) = self.loaders.commit(child) else {

@@ -57,6 +57,11 @@ impl Generations {
         proto_process::generation_room(self.get(index), steps)
     }
 
+    pub fn live_room(&self, index: usize, steps: u64) -> bool {
+        let old = self.get(index);
+        old & proto_process::GENERATION_DEAD == 0 && proto_process::generation_room(old, steps)
+    }
+
     /// Raises the generation of the record in `index`, with Release.
     pub fn raise(&self, index: usize) {
         if let Some(w) = self.word(index) {
