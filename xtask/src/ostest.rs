@@ -185,10 +185,12 @@ fn readiness_group(name: &str) -> bool {
         || name.starts_with("pty/")
 }
 
-/// The time `ci` gives the boots of the suites, counted from the first
-/// one's start: about 230 s on TCG since the suites of `fork` (5d), up to
-/// 241 s seen, with room for the variance of a loaded host.
-const BUDGET: Duration = Duration::from_secs(420);
+/// The time `ci` gives suite builds and boots, counted from the first
+/// one's start. The terminal and readiness suites exhausted the former
+/// 420-second budget while compiling io/basic images. Nine hundred seconds
+/// allow the expanded set to compile and run on a loaded host; each guest
+/// test retains its separate ten-second limit.
+const BUDGET: Duration = Duration::from_secs(900);
 
 /// The tests that pass on stafeto: `ci` fails when one of them does not.
 const PASSING: &str = "tests/os-test/pass.txt";
