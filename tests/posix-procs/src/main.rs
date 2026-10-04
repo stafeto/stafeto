@@ -11,6 +11,8 @@
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
 #[cfg(feature = "loader-abort")]
+mod audit;
+#[cfg(feature = "loader-abort")]
 mod loader_abort;
 
 /// A counterfeit identity capability must leave the already bound session intact.
