@@ -8,7 +8,7 @@ use rt::fs::Files;
 use rt::handle::{Channel, Handle};
 use rt::sys;
 
-fn image_counts(image: &Handle<Channel>) -> Result<[u32; 4], Status> {
+pub(super) fn image_counts(image: &Handle<Channel>) -> Result<[u32; 4], Status> {
     let reply = sys::send(image, &Header::new(0xfffa, proto_fs::VERSION).bytes())
         .map_err(Status::Kernel)?;
     if reply.len != 20 || !reply.handles.is_empty() {
@@ -37,7 +37,7 @@ fn opened(reply: &mut sys::Reply) -> Result<Handle<Channel>, Status> {
     }
     reply.handles.take::<Channel>(0).map_err(Status::Kernel)
 }
-fn elf(image: &Handle<Channel>) -> Result<(), Status> {
+pub(super) fn elf(image: &Handle<Channel>) -> Result<(), Status> {
     let mut request = Writer::new();
     proto_fs::Method::ReadAt.header().write(&mut request)?;
     request.u32(0)?;
@@ -54,7 +54,7 @@ fn elf(image: &Handle<Channel>) -> Result<(), Status> {
     Ok(())
 }
 pub(super) struct CapturedImages {
-    handles: [Handle<Channel>; 2],
+    pub(super) handles: [Handle<Channel>; 2],
     descriptions_after_release: u32,
 }
 pub(super) fn capture(pending: &Handle<Channel>) -> Result<CapturedImages, Status> {

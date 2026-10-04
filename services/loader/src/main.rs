@@ -130,6 +130,8 @@ struct Own {
     identity: Handle<Channel>,
     /// The loader's data and stack, which it unmaps at its end.
     data: (u64, u64),
+    #[cfg(feature = "image-gates")]
+    observer: core::cell::Cell<Option<Handle<Channel>>>,
 }
 
 fn main(level: u64) -> u64 {
@@ -149,6 +151,10 @@ fn main(level: u64) -> u64 {
     let Ok(taken) = take(&session) else {
         return GAVE_UP;
     };
+    #[cfg(feature = "image-gates")]
+    if auth_probe::after_take(&own, &start).is_err() {
+        return GAVE_UP;
+    }
     #[cfg(feature = "steps")]
     if matches!(done, Done::Copied(_))
         && let Some(console) = taken.console.as_ref()
@@ -186,6 +192,8 @@ fn boot(session: &Handle<Channel>, start: &Handle<Channel>, level: u8) -> Result
         identity: reply.handles.take(3)?,
         clock: loader_clock(session).map_err(|_| Error::BadState)?,
         data,
+        #[cfg(feature = "image-gates")]
+        observer: core::cell::Cell::new(None),
     })
 }
 
@@ -388,6 +396,16 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                 }
                 #[cfg(feature = "auth-probe")]
                 if label == pl::PARENT {
+                    #[cfg(feature = "image-gates")]
+                    {
+                        let mut probe = Reader::new(bytes);
+                        if Header::read(&mut probe).is_ok_and(|header| {
+                            header.version == pl::VERSION && header.method == auth_probe::OBSERVE
+                        }) {
+                            auth_probe::observe(own, probe, handles, token);
+                            continue;
+                        }
+                    }
                     let mut probe = Reader::new(bytes);
                     if Header::read(&mut probe).is_ok_and(|header| {
                         header.version == pl::VERSION && header.method == auth_probe::METHOD

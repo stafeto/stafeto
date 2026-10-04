@@ -170,6 +170,29 @@ const LOADER_ABORT_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("loader", "loader", 0, &["auth-probe"]),
 ];
+const IMAGE_GATES_PROGRAMS: [ImageProgram; 6] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-posix-files", "loader-abort"],
+    ),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["image-gates"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &["image-probe"],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    (
+        "posix-files",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["image-gates"],
+    ),
+    ("loader", "loader", 0, &["image-gates"]),
+];
 const RAMFS_GC_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-files"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["auth-probe", "steps"]),
@@ -1059,6 +1082,9 @@ commands:
   posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
+  image-gates verify genuine Take and accepted SetId ambiguity
+  image-gates-steps measure retained image dispatches under icount
+  image-gates-normal-steps measure normal SetId without reply corruption
   loader-abort verify retained file cleanup after genuine exec cancellation
   ramfs-gc verify binding progress during queued page reclamation
   loader-abort-steps measure retained cleanup audits at resolver limits
@@ -1177,6 +1203,9 @@ fn main() {
         Some("posix-files") => posix_files_probe(),
         Some("ramfs-cleanup") => ramfs_cleanup_probe(),
         Some("ramfs-gc") => ramfs_gc_probe(),
+        Some("image-gates") => image_gates_probe(false, false),
+        Some("image-gates-steps") => image_gates_probe(true, false),
+        Some("image-gates-normal-steps") => image_gates_probe(true, true),
         Some("loader-abort") => loader_abort_probe(false),
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
@@ -2701,6 +2730,68 @@ fn ramfs_gc_probe() -> Result<(), String> {
         ));
     }
     println!("RAM GC dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    Ok(())
+}
+
+fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const MEASURED: [ImageProgram; 6] = {
+        let mut programs = IMAGE_GATES_PROGRAMS;
+        programs[1].3 = &["image-gates", "steps"];
+        programs[2].3 = &["image-probe", "steps"];
+        programs
+    };
+    const NORMAL: [ImageProgram; 6] = {
+        let mut programs = MEASURED;
+        programs[4].3 = &["image-gates-normal"];
+        programs
+    };
+    let (name, programs) = if normal {
+        ("boot-image-gates-normal-steps.img", &NORMAL)
+    } else if measured {
+        ("boot-image-gates-steps.img", &MEASURED)
+    } else {
+        ("boot-image-gates.img", &IMAGE_GATES_PROGRAMS)
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    if measured {
+        command.args(qemu::ICOUNT);
+    }
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        if normal {
+            "posix-files: normal SetId same OpenExec branch and genuine Abort ok"
+        } else {
+            "posix-files: actual Take Handoff and ambiguous SetId gates ok"
+        },
+    )?;
+    if measured {
+        let steps = longest_steps(&output.lines, "2");
+        let required: &[usize] = if normal {
+            &[14, 20, 21, 22, 65]
+        } else {
+            &[14, 17, 20, 21, 22, 23, 65]
+        };
+        for &kind in required {
+            if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
+                return Err(format!(
+                    "RAM image probe has no method {kind} measurement: {steps:?}"
+                ));
+            }
+        }
+        if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "RAM image kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+            ));
+        }
+        println!("RAM image dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    }
     Ok(())
 }
 
