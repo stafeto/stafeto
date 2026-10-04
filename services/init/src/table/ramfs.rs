@@ -168,10 +168,30 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
 ];
 
 /// The authentic identity and bounded file proof fixture, before public mutation APIs.
-#[cfg(not(feature = "ramfs-cleanup"))]
+#[cfg(not(any(feature = "ramfs-cleanup", feature = "loader-abort")))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
     TABLE[0],
     POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "clock", "posix"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+];
+
+/// Genuine uncommitted exec attempts with one pending image at a time.
+#[cfg(feature = "loader-abort")]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    TABLE[0],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 2048 * PAGE + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
     POSIX_ABI_TABLE[2],
     Record {
         name: "posix-files",
