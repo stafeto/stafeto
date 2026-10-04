@@ -36,7 +36,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    0xfffc, 0xfffd, 0xfffe,
+    0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// The sessions: one place the image sessions share (they hold nothing),
 /// then the clients', with room for the 255 records of the process
@@ -786,6 +786,37 @@ impl Service<0> for Fs {
             return Answer::Status(Status::Ok);
         }
         #[cfg(feature = "auth-probe")]
+        if r.method() == 0xfffb {
+            if !r.handles.is_empty() || r.body().finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            let (audit, target, audited) = self
+                .identities
+                .get(s.data.authority_index as usize)
+                .and_then(Option::as_ref)
+                .map_or((false, 0, 0), |identity| {
+                    let (target, audited) = identity.audit.generations();
+                    (identity.purpose == BindingPurpose::Audit, target, audited)
+                });
+            let retained = s
+                .data
+                .binding
+                .snapshot_ref()
+                .map_or(0, |who| who.generation);
+            let output = r.reply();
+            let written = output
+                .u32(0)
+                .and_then(|()| output.u32(u32::from(audit)))
+                .and_then(|()| output.u64(target))
+                .and_then(|()| output.u64(audited))
+                .and_then(|()| output.u64(retained));
+            return if written.is_ok() {
+                Answer::Reply(Outgoing::new())
+            } else {
+                Answer::Status(Status::BadSize)
+            };
+        }
+        #[cfg(feature = "auth-probe")]
         if r.method() == 0xfffc {
             return self.auth_probe_gc(&mut s.data, r);
         }
@@ -1385,6 +1416,13 @@ impl Fs {
         let Ok(phase) = body.u32() else {
             return Answer::Status(Status::BadSize);
         };
+        if phase == 3 {
+            return if body.finish().is_ok() {
+                value(r, u32::from(self.ram.storage.usage(fds.root).pages))
+            } else {
+                Answer::Status(Status::BadSize)
+            };
+        }
         let result = match phase {
             0 if body.left() == 0 && fds.auth_probe_gc.is_none() => {
                 let reservation = self.ram.storage.reserve(

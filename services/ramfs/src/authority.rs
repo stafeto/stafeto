@@ -63,6 +63,9 @@ impl CleanupAudit {
     pub fn cached(&self, generation: u64) -> bool {
         generation != 0 && generation == self.audited
     }
+    pub fn generations(&self) -> (u64, u64) {
+        (self.target, self.audited)
+    }
     pub fn start(&mut self, admission: &mut Admission, generation: u64) {
         self.target = generation;
         self.audited = 0;
