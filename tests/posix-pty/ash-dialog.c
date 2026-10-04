@@ -82,3 +82,88 @@ static int pty_ash_command(struct pty_ash_dialog *d, const char *command, const 
 
 /* The shell starts this external role by exec. Its ready line confirms
  * that the final executable has entered main before Stop/Ctrl-C. */
+static int pty_ash_worker(void) {
+    const char ready[] = "PTY-CHILD\n";
+    size_t sent = 0;
+    while (sent < sizeof ready - 1) {
+        ssize_t n = write(STDOUT_FILENO, ready + sent, sizeof ready - 1 - sent);
+        if (n < 0 && errno == EINTR) continue;
+        CHECK(n > 0);
+        sent += (size_t)n;
+    }
+    for (;;) pause();
+}
+
+static int pty_ash_link(void) {
+    sigset_t mask;
+    CHECK(sigprocmask(SIG_SETMASK, NULL, &mask) == 0);
+    printf("PTY-LINK pid %d parent %d sid %d tty-sid %d foreground %d group %d parent-group %d HUP-blocked %d\n", getpid(), getppid(), getsid(0), tcgetsid(0), tcgetpgrp(0), getpgrp(), getpgid(getppid()), sigismember(&mask, SIGHUP));
+    return 0;
+}
+
+static int pty_ash_dialog(int direct_hup) {
+    struct pair p;
+    CHECK(make_pair(&p) == 0);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        if (close(p.master) != 0 || close(p.slave) != 0 || setsid() < 0) _exit(60);
+        int slave = open(p.name, O_RDWR);
+        if (slave < 0 || tcgetsid(slave) != getsid(0)) _exit(61);
+        for (int fd = 0; fd <= 2; fd++) if (dup2(slave, fd) != fd) _exit(62);
+        if (slave > 2 && close(slave) != 0) _exit(63);
+        if (setenv("PATH", "/bin", 1) != 0 || setenv("PS1", pty_ash_prompt, 1) != 0) _exit(64);
+        execl("/bin/ash", "ash", "-i", (char *)NULL);
+        _exit(65);
+    }
+    CHECK(close(p.slave) == 0);
+    CHECK(fcntl(p.master, F_SETFL, fcntl(p.master, F_GETFL) | O_NONBLOCK) == 0);
+    struct pty_ash_dialog d = {.master = p.master, .length = 0};
+    CHECK(pty_ash_receive(&d, pty_ash_prompt, 0) == 0);
+    CHECK(pty_ash_command(&d, "printf '%s\\n' \"$((6*7))\"\n", "42") == 0);
+    CHECK(pty_ash_command(&d, "test 3 -gt 2 && printf 'PTY-TEST\\n'\n", "PTY-TEST") == 0);
+
+    /* This marker comes from the external executable's own main. */
+    const char *sleeping = "/bin/posix-pty ash-worker\n";
+    CHECK(pty_ash_send(&d, sleeping) == 0);
+    CHECK(pty_ash_receive(&d, "PTY-CHILD", 1) == 0);
+    CHECK(pty_ash_send(&d, "\003") == 0);
+    CHECK(pty_ash_receive(&d, pty_ash_prompt, 0) == 0);
+    CHECK(pty_ash_command(&d, "echo $?\n", "130") == 0);
+
+    CHECK(pty_ash_send(&d, sleeping) == 0);
+    CHECK(pty_ash_receive(&d, "PTY-CHILD", 1) == 0);
+    CHECK(pty_ash_send(&d, "\032") == 0);
+    CHECK(pty_ash_receive(&d, pty_ash_prompt, 0) == 0);
+    CHECK(strstr(d.output, "Stopped") != NULL);
+    CHECK(pty_ash_command(&d, "jobs\n", NULL) == 0);
+    CHECK(strstr(d.output, "Stopped") != NULL);
+    CHECK(pty_ash_command(&d, "bg\n", NULL) == 0);
+    CHECK(pty_ash_command(&d, "jobs\n", NULL) == 0);
+    CHECK(strstr(d.output, "Running") != NULL && strstr(d.output, "Stopped") == NULL);
+    CHECK(pty_ash_send(&d, "fg\n") == 0);
+    CHECK(pty_ash_receive(&d, "ash-worker", 0) == 0);
+    CHECK(pause_ms(20) == 0);
+    CHECK(pty_ash_send(&d, "\003") == 0);
+    CHECK(pty_ash_receive(&d, pty_ash_prompt, 0) == 0);
+    CHECK(pty_ash_command(&d, "echo $?\n", "130") == 0);
+    CHECK(pty_ash_command(&d, "trap 'exit 79' HUP; echo PTY-HUP-ARMED\n", "PTY-HUP-ARMED") == 0);
+    CHECK(pty_ash_command(&d, "echo PTY-SHELL-PID=$$; /bin/posix-pty ash-link\n", NULL) == 0);
+    printf("posix-pty: shell link [%s]\n", d.output);
+    CHECK(pty_ash_command(&d, "trap\n", NULL) == 0);
+    printf("posix-pty: installed shell traps [%s]\n", d.output);
+    CHECK(strstr(d.output, "exit 79") != NULL && strstr(d.output, "HUP") != NULL);
+    struct termios attributes;
+    CHECK(tcgetattr(p.master, &attributes) == 0);
+    printf("posix-pty: ash CLOCAL %d, cflag 0x%x\n", !!(attributes.c_cflag & CLOCAL), (unsigned)attributes.c_cflag);
+    CHECK(!(attributes.c_cflag & CLOCAL));
+    if (direct_hup) CHECK(kill(child, SIGHUP) == 0);
+    else CHECK(close(p.master) == 0);
+    int status;
+    CHECK(waitpid(child, &status, 0) == child);
+    printf("posix-pty: ash disconnect status %d, exited %d code %d signal %d\n", status, WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 79);
+    if (direct_hup) CHECK(close(p.master) == 0);
+    printf("posix-pty: ash master Ctrl-C/Ctrl-Z/jobs/bg/fg/HUP via %s ok\n", direct_hup ? "kill" : "master close");
+    return 0;
+}
