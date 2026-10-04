@@ -24,11 +24,28 @@ core::arch::global_asm!(
     "mov x5, #0",
     "svc #0xffe0",
     "cbnz x0, 3f",
+    "cmp x19, #2",
+    "b.ne 4f",
+    "mov x0, #{start}",
+    "mov x1, #20",
+    "mov x2, #0",
+    "mov x3, #1",
+    "mov x4, #1",
+    "lsl x4, x4, #32",
+    "orr x3, x3, x4",
+    "mov x4, #0",
+    "svc #{send}",
+    "cbnz x0, 3f",
+    "cmp x1, #8",
+    "b.ne 3f",
+    "cbnz x2, 3f",
+    "4:",
     "mov x0, #{start}",
     "mov x1, #1",
     "svc #{notify}",
     "cbnz x0, 3f",
-    "cbz x19, 2f",
+    "cmp x19, #1",
+    "b.ne 2f",
     "mov x0, x21",
     "mov x1, #0",
     "svc #{receive}",
@@ -49,6 +66,7 @@ core::arch::global_asm!(
     create = const Call::CreateChannel.number(),
     notify = const Call::Notify.number(),
     receive = const Call::Receive.number(),
+    send = const Call::Send.number(),
     exit = const Call::ProcessExit.number(),
     start = const rt::abi::START_CHANNEL.0,
 );
@@ -101,7 +119,7 @@ fn settled(expected: [u64; 5]) -> bool {
 pub fn run() -> Result<(), i32> {
     let parent = posix_abi::allocation::process();
     let before = live();
-    for case in 0..4 {
+    for case in 0..6 {
         let control = sys::channel_create(1).map_err(|_| 170)?;
         let exit = sys::channel_create(1).map_err(|_| 171)?;
         let label = 9000 + case;
@@ -155,20 +173,61 @@ pub fn run() -> Result<(), i32> {
                 &child,
                 entry,
                 STACK + PAGE as usize,
-                case & 1,
+                if case >= 4 { 2 } else { case & 1 },
                 31,
                 rt::abi::Policy::Fifo,
                 0x30000,
             )
         }
         .map_err(|_| 183)?;
+        let peer = if case == 5 {
+            let memory = sys::mem_create(PAGE).map_err(|_| 191)?;
+            sys::mem_map(&child, &memory, 0, PAGE, 0x40000, Access::ReadWrite).map_err(|_| 192)?;
+            // SAFETY: the peer owns distinct stack/message pages and the same mapped entry.
+            let peer = unsafe {
+                sys::thread_create(
+                    &child,
+                    entry,
+                    0x41000,
+                    0,
+                    31,
+                    rt::abi::Policy::Fifo,
+                    0x50000,
+                )
+            }
+            .map_err(|_| 193)?;
+            if !sys::thread_info(&peer).is_ok_and(|info| info.state == ThreadState::Stopped) {
+                return Err(194);
+            }
+            Some((memory, peer))
+        } else {
+            None
+        };
         sys::thread_start(&thread).map_err(|_| 184)?;
+        if case >= 4 {
+            let sys::Received::Message {
+                len, words, token, ..
+            } = sys::try_receive(&control).map_err(|_| 195)?
+            else {
+                return Err(196);
+            };
+            if len != 20
+                || words[0] != 0
+                || words[1] != (1 | (1_u64 << 32))
+                || words[2] != 0
+                || !sys::thread_info(&thread)
+                    .is_ok_and(|info| info.state == ThreadState::AwaitingReply)
+            {
+                return Err(197);
+            }
+            token.reply(&[0; 8]).map_err(|_| 198)?;
+        }
         let ready = sys::try_receive(&control).map_err(|_| 185)?;
         if !matches!(ready, sys::Received::Notification { bits, .. } if bits & 1 != 0 && bits & 2 == 0)
         {
             return Err(186);
         }
-        if case & 1 != 0 {
+        if case < 4 && case & 1 != 0 {
             if !sys::thread_info(&thread).is_ok_and(|info| info.state == ThreadState::Receiving) {
                 return Err(187);
             }
@@ -191,7 +250,7 @@ pub fn run() -> Result<(), i32> {
         }
         if !notified
             || sys::process_state(&child)
-                != Ok(if case & 1 == 0 {
+                != Ok(if case >= 4 || case & 1 == 0 {
                     ProcessState::Exited { code: 7 }
                 } else {
                     ProcessState::Killed
@@ -199,6 +258,7 @@ pub fn run() -> Result<(), i32> {
         {
             return Err(189);
         }
+        drop(peer);
         drop(thread);
         drop(stop);
         drop(child);
@@ -210,6 +270,8 @@ pub fn run() -> Result<(), i32> {
             return Err(190);
         }
     }
-    rt::println!("posix-files: armed process death returns physical objects ok");
+    rt::println!(
+        "posix-files: armed process death and absent started peer return physical objects ok"
+    );
     Ok(())
 }
