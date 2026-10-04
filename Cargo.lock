@@ -622,6 +622,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ramfs-holder"
+version = "0.1.0"
+dependencies = [
+ "proto-fs",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "ramfs-probe"
 version = "0.1.0"
 dependencies = [

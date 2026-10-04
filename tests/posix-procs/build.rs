@@ -16,6 +16,7 @@ fn run(cmd: &mut Command) {
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=files.c");
+    println!("cargo:rerun-if-changed=cleanup.c");
     println!("cargo:rerun-if-changed=jobs.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
@@ -72,7 +73,9 @@ fn main() {
         .arg(sysroot.join("include"))
         .args([
             "-c",
-            if env::var_os("CARGO_FEATURE_FILES").is_some() {
+            if env::var_os("CARGO_FEATURE_AUTH_PROBE").is_some() {
+                "cleanup.c"
+            } else if env::var_os("CARGO_FEATURE_FILES").is_some() {
                 "files.c"
             } else {
                 "procs.c"

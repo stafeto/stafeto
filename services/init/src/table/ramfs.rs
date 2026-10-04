@@ -168,6 +168,7 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
 ];
 
 /// The authentic identity and bounded file proof fixture, before public mutation APIs.
+#[cfg(not(feature = "ramfs-cleanup"))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
     TABLE[0],
     POSIX_ABI_TABLE[1],
@@ -180,6 +181,41 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         quota: 2048 * PAGE,
         root: true,
         ..POSIX
+    },
+];
+
+/// Owner and retained foreign session holder for the unfinished-binding fixture.
+#[cfg(feature = "ramfs-cleanup")]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    Record {
+        priority: 40,
+        ceiling: 40,
+        ..TABLE[0]
+    },
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 4096 * PAGE + 384 * PAGE,
+        ceiling: 40,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        priority: 30,
+        ceiling: 31,
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+    Record {
+        name: "ramfs-holder",
+        program: "ramfs-holder",
+        priority: 35,
+        ceiling: 40,
+        quota: 64 * PAGE,
+        ..TABLE[0]
     },
 ];
 

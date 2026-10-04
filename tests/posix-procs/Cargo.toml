@@ -15,6 +15,7 @@ bench = false
 
 [features]
 jobs = []
+auth-probe = ["files"]
 files = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt"]
 terminal = ["posix-crt/uart-input"]
 

@@ -147,6 +147,30 @@ const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-files", "posix-procs", POSIX_STACK_SIZE, &["files"]),
 ];
+const RAMFS_CLEANUP_PROGRAMS: [ImageProgram; 7] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-posix-files", "ramfs-cleanup"],
+    ),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["auth-probe"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    (
+        "posix-files",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["auth-probe"],
+    ),
+    ("ramfs-holder", "ramfs-holder", CHILD_STACK_SIZE, &[]),
+    ("loader", "loader", 0, &[]),
+];
 const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -995,6 +1019,7 @@ commands:
   posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
+  ramfs-cleanup verify unfinished binding cleanup with a foreign holder
   posix-files verify authentic file identity and byte path proofs
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
@@ -1105,6 +1130,7 @@ fn main() {
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-files") => posix_files_probe(),
+        Some("ramfs-cleanup") => ramfs_cleanup_probe(),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -2596,6 +2622,22 @@ fn loader_channels_probe() -> Result<(), String> {
 }
 
 /// C operations observe the real Process identities and Files proofs.
+fn ramfs_cleanup_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-ramfs-cleanup.img",
+        &RAMFS_CLEANUP_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(&output, "ramfs-cleanup: ok")
+}
+
 fn posix_files_probe() -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
