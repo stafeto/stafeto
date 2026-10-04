@@ -1420,17 +1420,8 @@ impl Fs {
             };
         }
         let result = match phase {
-            0 if body.left() == 0 && fds.auth_probe_gc.is_none() => {
-                let reservation = self.ram.storage.reserve(
-                    fds.root,
-                    ramfs::storage::ROOT,
-                    b"auth-probe-gc",
-                    (ramfs::REG, 0o600, 0, 0),
-                );
-                reservation
-                    .and_then(|reservation| self.ram.storage.commit(reservation))
-                    .map(|token| fds.auth_probe_gc = Some(token))
-            }
+            0 if body.left() == 0 => self.ram.auth_probe_gc_reserve(fds),
+            4 if body.left() == 0 => self.ram.auth_probe_gc_commit(fds),
             1 => {
                 let offset = body.u32();
                 let bytes = body.bytes(body.left());

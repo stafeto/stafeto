@@ -31,6 +31,100 @@ fn drain(ram: &mut Ram<'_>) -> usize {
     steps
 }
 
+#[cfg(feature = "auth-probe")]
+#[test]
+fn diagnostic_gc_creation_is_paid_unpublished_and_commits_once() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: FIRST,
+        ..Fds::default()
+    };
+    assert_eq!(ram.auth_probe_gc_reserve(&mut fds), Ok(()));
+    assert_eq!(ram.storage.lookup(ROOT, b"auth-probe-gc"), Err(NO_ENTRY));
+    assert_eq!(ram.storage.preparations_used(), 1);
+    assert_eq!(ram.storage.usage(FIRST).inodes, 1);
+    assert_eq!(
+        ram.auth_probe_gc_reserve(&mut fds),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(ram.storage.preparations_used(), 1);
+    assert_eq!(ram.auth_probe_gc_commit(&mut fds), Ok(()));
+    assert!(fds.auth_probe_gc_reservation.is_none());
+    assert_eq!(
+        ram.storage.lookup(ROOT, b"auth-probe-gc"),
+        Ok(fds.auth_probe_gc.unwrap())
+    );
+    assert_eq!(ram.storage.preparations_used(), 0);
+    assert_eq!(
+        ram.auth_probe_gc_commit(&mut fds),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        ram.auth_probe_gc_reserve(&mut fds),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    ram.storage.unlink(ROOT, b"auth-probe-gc", FIRST).unwrap();
+    assert_eq!(drain(&mut ram), 1);
+    assert_eq!(ram.storage.usage(FIRST), Usage::default());
+}
+
+#[cfg(feature = "auth-probe")]
+#[test]
+fn diagnostic_gc_commit_refusal_cancels_exact_reservation_once() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: FIRST,
+        ..Fds::default()
+    };
+    ram.auth_probe_gc_reserve(&mut fds).unwrap();
+    let other = create(&mut ram, SECOND, b"other");
+    assert_eq!(
+        ram.auth_probe_gc_commit(&mut fds),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert!(fds.auth_probe_gc_reservation.is_none());
+    assert!(fds.auth_probe_gc.is_none());
+    assert_eq!(ram.storage.preparations_used(), 0);
+    assert!(!ram.release_step(&mut fds));
+    assert_eq!(
+        ram.auth_probe_gc_commit(&mut fds),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(drain(&mut ram), 1);
+    assert_eq!(ram.storage.usage(FIRST), Usage::default());
+    assert_eq!(ram.storage.lookup(ROOT, b"other"), Ok(other));
+    ram.storage.unlink(ROOT, b"other", SECOND).unwrap();
+    assert_eq!(drain(&mut ram), 1);
+    assert_eq!(ram.storage.usage(SECOND), Usage::default());
+}
+
+#[cfg(feature = "auth-probe")]
+#[test]
+fn diagnostic_gc_reservation_follows_portioned_and_gone_release() {
+    for gone in [false, true] {
+        let mut ram = Ram::new(0);
+        let mut fds = Fds {
+            root: FIRST,
+            ..Fds::default()
+        };
+        ram.auth_probe_gc_reserve(&mut fds).unwrap();
+        if gone {
+            ram.release(&mut fds);
+        } else {
+            assert!(ram.release_step(&mut fds));
+        }
+        assert!(fds.auth_probe_gc_reservation.is_none());
+        assert_eq!(ram.storage.preparations_used(), 0);
+        assert!(!ram.release_step(&mut fds));
+        assert_eq!(
+            ram.auth_probe_gc_commit(&mut fds),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert_eq!(drain(&mut ram), 1);
+        assert_eq!(ram.storage.usage(FIRST), Usage::default());
+    }
+}
+
 #[test]
 fn inode_and_name_shares_leave_a_second_roots_reserve() {
     let mut ram = Ram::new(0);
