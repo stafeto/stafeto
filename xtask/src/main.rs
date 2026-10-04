@@ -2744,7 +2744,10 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
     };
     const NORMAL: [ImageProgram; 6] = {
         let mut programs = MEASURED;
+        programs[1].3 = &["auth-probe", "steps"];
+        programs[2].3 = &["steps"];
         programs[4].3 = &["image-gates-normal"];
+        programs[5].3 = &["auth-probe"];
         programs
     };
     let (name, programs) = if normal {
