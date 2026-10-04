@@ -658,3 +658,39 @@ On integrated wiring `11275b9`, all complete intervals remain below B=20,538:
 Omitting Controlling deliberately produces a zero snapshot and fails the
 probe. The restored probe passes. Its log is
 `target/measure/posix-tty-control-steps.log`; the command is a CI gate.
+
+### PTY inheritance at the session limit
+
+`cargo xtask posix-pty-steps` holds 32 real slave descriptions and fills a
+root's 255 clone places with the initial child and 254 further sessions.
+It checks the limit, releases one place, then performs a real fork and
+checks all 32 descriptors in the grandchild. After retirement completes,
+it snapshots Clone (7) and the service's own step (65) before printing.
+The measured interval includes receive return, dispatch, identity checks
+and reply, with B fixed at 20,538 and no overhead subtracted.
+
+On the implementation accepted at `76fa4b2`, Clone takes at most 17,670
+and the own step 7,138 ticks. Exact ID selection checks the complete
+generation and side, deduplicates selected slots, and preserves request
+order. Clone reservation counts the root and finds its first free place
+in one pass. Retired descriptions close one per step; each cleanup phase
+finishes its step before UART work starts.
+
+### Terminal latency scenarios
+
+`cargo xtask rtbench --short` checks the complete terminal scenarios on
+TCG; `cargo xtask rtbench --minutes 10` measures them on HVF and VZ.
+Existing entropy rows S23–S25 remain. The added rows are:
+
+| Scenario | Measured interval |
+|---|---|
+| S26 PTY echo | writing a byte to the master through reading its echo; the slave consumes and checks the same byte outside the sample |
+| S27 Ctrl-C idle/busy25 | master write through the first counter read in the foreground child's signal handler, with an optional busy thread at 25 |
+| S28 STOP/CONT 128 | kill through the verified wait report; 127 native workers plus the child main fill the kernel limit, and every worker executes an acknowledgement after CONT outside the sample |
+| S29 pipe poll | the lower-priority writer's timestamp before write through the higher-priority reader's return from poll; the byte and POLLIN are checked |
+
+The parser requires all six terminal histograms and the exact 128-thread
+readiness record. Replacing each WatchTake notification session makes
+S29 fail; omitting the native worker notices makes S28 fail. Hardware
+rows retain n, minimum, p50, p99, maximum and the full histogram in
+`target/measure/rtbench-hvf.txt` and `rtbench-vz.txt`.

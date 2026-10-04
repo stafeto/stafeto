@@ -108,7 +108,7 @@ Bounded paths with interrupts masked are listed in
 Since step 5a′ the C library is relibc (`tools/build-relibc.py`, the fork
 pinned there): its headers and `libc.a` under `target/relibc/sysroot`, its
 platform the layer's `stafeto_*` functions (`lib/posix-platform`, interface
-4). The layer exports no C names (`cargo xtask ci` checks it) and keeps the
+14). The layer exports no C names (`cargo xtask ci` checks it) and keeps the
 system part; the C probe `posix-abi` and the Rust guest probes on a C main
 (`tests/libc-ffi`) are programs on relibc, and the native probe
 `posix-tls` checks the layer's TCB for threads relibc did not start. Since step 5a the layer has no helper threads;
@@ -132,14 +132,16 @@ provides the C side of each.
 | Spawn and `exec` | `posix_spawn` and `exec` of a file of the RAM service through a loader in the new process: `argv`, `envp`, the current directory, file actions (`adddup2`, `addclose`, `addopen`, `addchdir`), `SETPGROUP`, `SETSID`, `SETSIGMASK`, `SETSIGDEF`, `RESETIDS`, set-ID files, descriptions shared with the child, `FD_CLOEXEC`, a failed `exec` that leaves the old image whole | [m5c](../notes/m5c-spawn-exec.md) |
 | `fork` | a full copy of the parent's memory by the child's loader, at the forking thread's level; the other threads stop first; the child has one thread, its descriptions shared with the parent's and its layer bound to its own handles; `vfork` is `fork`; `pthread_atfork` in POSIX's order | [m5d](../notes/m5d-fork.md) |
 | Pipes | `pipe`, `pipe2` (`O_NONBLOCK`, `O_CLOEXEC`, `O_CLOFORK`) through the pipe service: a ring of 4 KiB per pipe, `PIPE_BUF` 512, blocking reads and writes as long operations in two steps that a signal cancels (`SA_RESTART`), `SIGPIPE` before `EPIPE`, `fstat` as a FIFO, `ESPIPE`; ends cross `fork`, `posix_spawn` (`adddup2`) and `exec`; `/dev/null` as a null device of the RAM service (`O_CHANGES`) | [m5e](../notes/m5e-pipes.md) |
+| Terminals and jobs | `termios`, `/dev/console`, `/dev/tty`, eight PTYs with grant/unlock/name and window size; personal controlling terminals, foreground groups, Ctrl-C/Ctrl-Z, `SIGTTIN`/`SIGTTOU`, `SIGSTOP`/`SIGCONT`, `WUNTRACED`/`WCONTINUED`; `ash` built-ins and jobs through a PTY | [m5f](../notes/m5f-tty.md) |
+| Readiness | `poll`, `ppoll`, `select`, `pselect`, up to 32 descriptors; masks and absolute deadlines, cancellable watches, one notification session across repeated Take calls; ready writers below the polling reader can run | [m5f](../notes/m5f-tty.md) |
 | Random numbers | `getentropy` (up to 256 bytes, `EINVAL` past it), `getrandom` (`GRND_NONBLOCK`, `GRND_RANDOM`, `GRND_INSECURE`), `/dev/random` and `/dev/urandom` as character devices of the RAM service (reads served by the layer, writes dropped, `O_CHANGES`), `arc4random`, `arc4random_buf`, `arc4random_uniform`, the names of `mkstemp` and `mkdtemp`: a ChaCha20 generator with fast key erasure in each process, keyed by the entropy service (the Virtio entropy device through `virtio-rng`); a forked child takes its own key; `ENOSYS` without the service | [m5e2](../notes/m5e2-entropy.md) |
 | Memory map | the layer keeps the handle of every memory object of the process: the loader hands over narrowed copies for the segments, the stack and the start area, and each chunk of the heap adds one; at most 128 regions, no device window or DMA object; `mmap` refuses `MAP_SHARED` with `ENOTSUP` (no shared memory yet). A mapping made past the layer by a direct kernel call is not in the map | `lib/posix-map`, `posix_abi::allocation::regions` |
 | Process lifetime | `waitpid`, `waitid`, `WNOHANG`, `WIFSIGNALED` apart from `exit(143)`, `kill`, `killpg`, `kill(0)`, `kill(-1)`, `SIGKILL` through the kernel, `SIGCHLD` to `sigwaitinfo`, `setpgid`, `setsid`, `getpgid`, `getsid`, orphans to PID 1 | [m5b](../notes/m5b-processes.md) |
 
 relibc gives conditions, semaphores and stdio over the layer
 (`relibc-threads` checks the first two). Not there yet: `fexecve`,
-`poll` and `select` (5f), named pipes, queued signals (`sigqueue`), stop and continue signals,
-`SA_RESTART` beyond console reads and `waitpid`, POSIX timers, `termios`, asynchronous cancellation,
+named pipes, queued signals (`sigqueue`),
+POSIX timers, asynchronous cancellation,
 general ELF TLS. BusyBox
 runs on relibc since 5a′; see [m2-ram-posix](../notes/m2-ram-posix.md) for
 its first steps.
@@ -157,8 +159,11 @@ cancellation, shared-state, input and interruption probes as well, and
 | `kernel-test`, `init-test` [machine] | the kernel test image or the EL0 test `init` alone, on `512M` or the machine named (`EL2`, `2G`, `GICv3`, `EL2 GICv3`, `HVF GICv3`, `HVF GICv2`); `kernel-test <machine> icount` runs the icount build under `-icount` |
 | `ext4ro` | reads an e2fsprogs ext4 image inside the guest |
 | `ramfs` | RAM file service: descriptors, reads, writes, seeks, sizes; the files of the boot image's table: modes, owners, links, reads at an offset, the longest path |
-| `posix-abi` | a C program on relibc against relibc's headers: files, directories, threads, cancellation, keys, mutexes, clocks, signals, credentials; the layer's `.data` + `.bss` within 20 KiB |
+| `posix-abi` | a C program on relibc against relibc's headers: files, directories, threads, cancellation, keys, mutexes, clocks, signals, credentials; the layer's `.data` + `.bss` measured; size limits apply to the kernel |
 | `relibc-hello`, `relibc-threads` | relibc's start, files, `mmap`, `fcntl`, `writev`; its pthreads over the layer, `siglongjmp`, the clock's page (`relibc-threads-hvf` on HVF) |
+| `posix-poll` | mixed file/pipe/terminal readiness, masks and deadlines, Cancel/Take/Gone, 32 aliases and a ready writer below the waiting reader |
+| `posix-pty`, `posix-pty-steps` | PTY lifecycle, real UID grant, spawn aliases and rollback, window size and signals, interactive ash jobs and HUP; the quiet steps variant measures a late Clone with 32 descriptions and a full root pool |
+| `posix-tty-control-steps` | full terminal control intervals with sixteen live clients, including the first Acquire and inherited personal controlling-terminal pairs |
 | `posix-procs` | the C probe of processes on relibc: `fork` (a copy of the parent's memory, descriptors, signals, threads, `vfork`, `pthread_atfork`), `posix_spawn` and `exec` from files (`/bin/ls /etc`, `argv`, `envp`, set-ID, 32 live children, 1,100 in a row, descriptors, a failed `exec`), exit status, `WIFSIGNALED`, `SIGKILL` of a child that blocks everything, a handler that exits with 42, a fault as `SIGSEGV`, `SIGCHLD` with `si_pid`, groups, sessions, `killpg`, `kill(0)`, `kill(-1)`, `clock_settime` by effective UID; the children end as `init` reports |
 | `os-test` | os-test (Sortix, ISC, pinned) io, malloc, process and signal suites, `basic/spawn`, `basic/unistd` `exec*` and the `basic` tests that call `fork` or `pipe` (among them `stdio`, `wchar` and `fmtmsg`) on relibc, a boot a suite with the tests started from files; PASS, FAIL and UNSUPPORTED (needs `poll` or `select`) in `target/measure/os-test.txt`; a test that runs 10 s is killed, the run stops after 420 s, and it fails when a test of `tests/os-test/pass.txt` does not pass |
 | `process-steps` [branches] | the longest step of the process service under `-icount` with a crowd of children (128 with 4 branches, in `ci`; 248 with 7), a child that forks among them, and the longest step of each kind of the loader's copy; it fails when the longest Vouch passes 6,000 ticks, a ForkStart passes the longest SpawnStart or a Clone of the RAM file service passes term B; the table is in `target/measure/process-steps.txt` and in [non-preemptible-paths](non-preemptible-paths.md) |
