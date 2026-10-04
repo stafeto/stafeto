@@ -64,6 +64,8 @@ mod cleanup;
 #[cfg(feature = "files")]
 mod open_stages;
 #[cfg(feature = "ipc-loss")]
+mod reply_death;
+#[cfg(feature = "ipc-loss")]
 mod reply_loss;
 /// Sixteen real sessions retain all thirty-two descriptions during both
 /// credential changes. Every reply and retained byte is checked by the guest.

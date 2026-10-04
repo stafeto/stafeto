@@ -1000,3 +1000,9 @@ mod test_access {
         (p.stage, p.handles.len(), tables)
     }
 }
+
+/// Physical object slots retained by the dedicated native guest.
+#[cfg(feature = "ipc-loss-probe")]
+pub fn probe_in_use() -> usize {
+    LIVE.count()
+}

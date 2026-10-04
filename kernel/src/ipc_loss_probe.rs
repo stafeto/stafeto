@@ -17,6 +17,7 @@ use kcore::args::Desc;
 const ARM: u16 = 0xFFE0;
 const SNAPSHOT: u16 = 0xFFE1;
 const DISARM: u16 = 0xFFE2;
+const LIVE: u16 = 0xFFE3;
 
 struct Arm {
     worker: NonNull<Thread>,
@@ -151,6 +152,19 @@ fn result(t: NonNull<Thread>, code: u64) {
 /// SNAPSHOT: x1 Ended, x2 Alive, x3 actual Reply result, x4 slot, x5 generation.
 /// DISARM: release the current worker's arm once.
 pub fn test_call(t: NonNull<Thread>, number: u16) -> bool {
+    if number == LIVE {
+        // SAFETY: only the running caller's output registers are written; values hold no references.
+        unsafe {
+            let r = &mut (*t.as_ptr()).regs.x;
+            r[0] = 0;
+            r[1] = thread::probe_in_use() as u64;
+            r[2] = channel::probe_in_use() as u64;
+            r[3] = session::probe_in_use() as u64;
+            r[4] = crate::process::probe_in_use() as u64;
+            r[5] = u64::from((*PROBE.0.get()).arm.is_some());
+        }
+        return true;
+    }
     if number == ARM {
         result(t, arm(t).map_or_else(|e| e.code(), |()| 0));
         return true;

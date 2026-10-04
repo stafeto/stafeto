@@ -20,8 +20,8 @@ static RETURNED: AtomicU64 = AtomicU64::new(0);
 const SLOT: u32 = 28;
 
 extern "C" fn worker(_: u64) -> ! {
-    // SAFETY: main retains the session until this worker has ended.
-    let channel = unsafe { Handle::from_raw(rt::abi::Handle(ENDPOINT.load(Ordering::Acquire))) };
+    // Main retains the session until this worker has ended.
+    let channel = Handle::from_raw(rt::abi::Handle(ENDPOINT.load(Ordering::Acquire)));
     let files = ManuallyDrop::new(Files::from_sessions(channel, None));
     let key = OpenKey {
         slot: SLOT,
@@ -128,8 +128,8 @@ fn probe<const CALL: u16>(args: sys::Regs) -> sys::Regs {
     unsafe { sys::raw::<CALL>(args) }
 }
 extern "C" fn negative_worker(mode: u64) -> ! {
-    // SAFETY: main retains this session until the sequential worker has ended.
-    let channel = unsafe { Handle::from_raw(rt::abi::Handle(ENDPOINT.load(Ordering::Acquire))) };
+    // Main retains this session until the sequential worker has ended.
+    let channel = Handle::from_raw(rt::abi::Handle(ENDPOINT.load(Ordering::Acquire)));
     let files = ManuallyDrop::new(Files::from_sessions(channel, None));
     let key = OpenKey {
         slot: 26,
@@ -374,6 +374,7 @@ fn payload(files: &Files, held: PreparedOpen, bytes: &[u8]) -> Result<(), i32> {
 }
 pub fn run(files: &Files) -> Result<(), i32> {
     negatives(files)?;
+    super::reply_death::run()?;
     let baseline = counts(files)?;
     let key = OpenKey {
         slot: SLOT,

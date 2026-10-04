@@ -856,3 +856,9 @@ pub fn run(next: NonNull<Thread>) -> ! {
 pub fn in_use() -> usize {
     LIVE.count()
 }
+
+/// Physical object slots retained by the dedicated native guest.
+#[cfg(feature = "ipc-loss-probe")]
+pub fn probe_in_use() -> usize {
+    LIVE.count()
+}
