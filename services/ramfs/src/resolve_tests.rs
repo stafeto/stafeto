@@ -136,6 +136,106 @@ fn refreshed_capture_preserves_authority_class_and_retained_descriptions() {
     ram.release(&mut fds);
 }
 #[test]
+fn refresh_checks_every_capture_class_without_changing_the_old_snapshot() {
+    let active = who();
+    let pending = WhoReply {
+        loader: Some(LoaderOf {
+            ticket: 7,
+            image: active.image,
+        }),
+        ..active
+    };
+    for original in [
+        Binding::Active(active),
+        Binding::Inherited(active),
+        Binding::Pending(pending),
+    ] {
+        let old = original.snapshot().unwrap();
+        let mut fresh = WhoReply {
+            generation: old.generation + 1,
+            ..old
+        };
+        fresh.credentials.euid = 123;
+        let refreshed = original.refreshed(&fresh).unwrap();
+        assert_eq!(refreshed.snapshot(), Some(fresh));
+        assert_eq!(
+            core::mem::discriminant(&refreshed),
+            core::mem::discriminant(&original)
+        );
+        for invalid in [
+            WhoReply {
+                pid: old.pid + 1,
+                ..fresh
+            },
+            WhoReply {
+                index: old.index + 1,
+                ..fresh
+            },
+            WhoReply {
+                image: old.image + 1,
+                ..fresh
+            },
+            WhoReply {
+                root: ExpenditureRoot {
+                    pid: old.root.pid + 1,
+                    ..old.root
+                },
+                ..fresh
+            },
+            WhoReply {
+                root: ExpenditureRoot {
+                    generation: old.root.generation + 1,
+                    ..old.root
+                },
+                ..fresh
+            },
+            WhoReply {
+                generation: 0,
+                ..fresh
+            },
+            WhoReply {
+                generation: proto_process::GENERATION_DEAD | fresh.generation,
+                ..fresh
+            },
+            WhoReply {
+                loader: if old.loader.is_some() {
+                    None
+                } else {
+                    pending.loader
+                },
+                ..fresh
+            },
+        ] {
+            assert_eq!(original.refreshed(&invalid), Err(proto_fs::PERMISSION));
+            assert_eq!(original.snapshot(), Some(old));
+        }
+        if let Some(loader) = old.loader {
+            for changed in [
+                LoaderOf {
+                    ticket: loader.ticket + 1,
+                    ..loader
+                },
+                LoaderOf {
+                    image: loader.image + 1,
+                    ..loader
+                },
+            ] {
+                assert_eq!(
+                    original.refreshed(&WhoReply {
+                        loader: Some(changed),
+                        ..fresh
+                    }),
+                    Err(proto_fs::PERMISSION)
+                );
+            }
+        }
+    }
+    for original in [Binding::Unbound, Binding::Boot, Binding::Cleanup] {
+        assert_eq!(original.refreshed(&active), Err(proto_fs::PERMISSION));
+    }
+}
+
+#[test]
 fn binding_retains_vouched_identity_image_and_root() {
     let mut binding = Binding::Unbound;
     assert_eq!(binding.bind(None, false), Err(proto_fs::PERMISSION));
