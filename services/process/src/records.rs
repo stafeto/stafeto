@@ -105,6 +105,8 @@ pub struct Record<P> {
     /// The last image number an exec of the record took, committed or
     /// not: the next exec takes one more, so no number names two attempts.
     pub tried: u32,
+    /// Exact successful loader ticket of the current image, retained after Take.
+    pub committed_loader_ticket: u64,
     /// Its process group and session: those of its parent, or its own PID
     /// for a record of init's table.
     pub pgid: u32,
@@ -357,6 +359,7 @@ impl<P> Records<P> {
             handle_limit: 0,
             image: proto_process::IMAGE,
             tried: proto_process::IMAGE,
+            committed_loader_ticket: 0,
             pgid,
             sid,
             ctty: None,
@@ -706,6 +709,7 @@ impl<P> Records<P> {
         // for: its Spawn failed.
         let loaded = record.state != State::Loading;
         record.state = State::Zombie(end);
+        record.committed_loader_ticket = 0;
         record.stop_report = None;
         record.cont_report = false;
         self.unlink(pgid, linked);

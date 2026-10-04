@@ -10,6 +10,12 @@
 //! With require_fds=0 the offered endpoint may be omitted: only LoaderOf is sent.
 //! The returned fresh session holds a paid preparation; FinishBinding commits
 //! its captured references under the same authentic Pending image and generation.
+//! A paid RetainedLoader refresh distinguishes Loading from Handoff. Handoff
+//! preserves the exact successful target's fd/CWD/umask capture and permits only
+//! Close, cancellation, FinishBinding and genuine Bind of that target identity.
+//! File effects resume after the exact PID/index/image/root binds with loader=None.
+//! Such Bind supersedes a queued retained-loader refresh; its candidate keeps
+//! the old capability and capture for rollback on an invalid identity.
 //!
 //! ResolveStart retains raw bytes and the authenticated session's base inode.
 //! Its body is base slot u32, generation u64, real_ids u32, follow_final u32,

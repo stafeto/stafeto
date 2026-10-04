@@ -793,6 +793,9 @@ impl Processes {
             }
             return self.terminal_request(method, r);
         }
+        if method == Method::RetainedLoader as u16 {
+            return self.retained_loader(r);
+        }
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
@@ -877,6 +880,71 @@ impl Processes {
                     .then_some((index, None))
             }
         }
+    }
+
+    fn retained_loader(&mut self, r: &mut Request<'_>) -> Answer {
+        let Ok(expected) = proto_process::RetainedLoader::read(r.body()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(identity) = r.handles.take::<Channel>(0) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let Ok(label) = sys::copy_label(&self.identities, &identity) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let Some((named, Place::Loader, image)) = Label::parse_image(label) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let Some(index) = self.records.find_loader(label) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let record = self.records.get(index).expect("an exact retained record");
+        if expected.pid != named.pid()
+            || expected.index as usize != index
+            || expected.image != image
+            || expected.root != record.root
+            || matches!(record.state, State::Zombie(_))
+            || self.generations.get(index) & proto_process::GENERATION_DEAD != 0
+        {
+            return refuse(proto_process::PERMISSION);
+        }
+        let Some(state) = self.loaders.retained(
+            index,
+            image,
+            expected.ticket,
+            record.image,
+            record.committed_loader_ticket,
+            record.state == State::Alive,
+        ) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let who = proto_process::Vouch {
+            pid: record.label.pid(),
+            credentials: record.credentials,
+            generation: self.generations.get(index),
+            loader: Some(LoaderOf {
+                image,
+                ticket: expected.ticket,
+            }),
+            index: index as u32,
+            ctty: record.ctty,
+            image,
+            groups: &record.groups,
+            limits: &record.limits,
+            root: record.root,
+        };
+        if r.reply()
+            .u32(0)
+            .and_then(|()| r.reply().u32(state as u32))
+            .and_then(|()| who.write(r.reply()))
+            .is_err()
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
     }
 
     /// Router of the record in `index`: one thread handle with MANAGE, the
@@ -1943,6 +2011,7 @@ impl Processes {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
         let slot = self.loaders.of(index).expect("an exec's place");
+        let committed_ticket = self.loaders.ticket(slot);
         let place = self.loaders.get_mut(slot).expect("a place");
         let image = place.image;
         let incoming = place.held.incoming.take().expect("the new process");
@@ -1956,6 +2025,7 @@ impl Processes {
         let old = core::mem::replace(&mut record.process, incoming);
         let ceiling = record.ceiling;
         record.image = image;
+        record.committed_loader_ticket = committed_ticket;
         record.execed = true;
         let mut credentials = loaders::child_credentials(record.credentials, 0);
         if let Some(ids) = set_id {
@@ -2326,8 +2396,11 @@ impl Processes {
         let Ok(set_id) = self.loaders.commit(child) else {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
+        let committed_slot = self.loaders.of(child).expect("a committed place");
+        let committed_ticket = self.loaders.ticket(committed_slot);
         let record = self.records.get_mut(child).expect("a loading record");
         record.state = State::Alive;
+        record.committed_loader_ticket = committed_ticket;
         // A child of posix_spawn runs its own program from the start; one
         // of fork runs its parent's copy until it execs.
         record.execed = !fork;

@@ -761,9 +761,9 @@ impl Service<0> for Fs {
                 .and_then(Option::as_ref)
                 .map_or(0, |identity| match identity.admission {
                     Admission::Unvouched => 1,
-                    Admission::Wire(_) => 2,
-                    Admission::Vouched(_) => 3,
-                    Admission::Validated(_) => 4,
+                    Admission::Wire(_) | Admission::RetainedWire(_) => 2,
+                    Admission::Vouched(_) | Admission::RetainedVouched(_) => 3,
+                    Admission::Validated(_) | Admission::RetainedValidated(_) => 4,
                 });
             let output = r.reply();
             let result = output
@@ -782,6 +782,7 @@ impl Service<0> for Fs {
             return self.finish_binding(&mut s.data, r);
         }
         if s.data.binding_preparation.is_some()
+            && !(r.method() == Method::Bind as u16 && self.can_replace_refresh(&s.data))
             && !matches!(
                 Method::from_number(r.method()),
                 Some(Method::Close | Method::ResolveCancel | Method::VerifySession)
@@ -1216,6 +1217,49 @@ impl Fs {
         // SAFETY: all bytes were initialized by the checked copy above.
         Some(unsafe { wire.assume_init() })
     }
+    fn retained_wire(
+        &mut self,
+        identity: &Handle<Channel>,
+        original: Binding,
+    ) -> Result<Option<[u8; 260]>, u32> {
+        let who = original.snapshot_ref().ok_or(proto_fs::PERMISSION)?;
+        let loader = who.loader.ok_or(proto_fs::PERMISSION)?;
+        let expected = proto_process::RetainedLoader {
+            pid: who.pid,
+            index: who.index,
+            image: who.image,
+            ticket: loader.ticket,
+            root: who.root,
+        };
+        let copy = sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER)
+            .map_err(|_| proto_fs::PERMISSION)?;
+        let mut request = proto_wire::Writer::new();
+        proto_process::Method::RetainedLoader
+            .header()
+            .write(&mut request)
+            .and_then(|()| expected.write(&mut request))
+            .map_err(|_| proto_fs::PERMISSION)?;
+        let Some(notary) = self.notary.as_ref() else {
+            return Err(proto_fs::PERMISSION);
+        };
+        let Ok(reply) = sys::send_handles(notary, request.as_bytes(), [copy.erase()]) else {
+            // A lost transport response proves no loader abort. The next paid
+            // phase retries this read with a fresh copy of the retained identity.
+            return Ok(None);
+        };
+        if !reply.handles.is_empty() {
+            return Err(proto_fs::PERMISSION);
+        }
+        if reply.len == 8 && reply.words[0] as u32 != 0 && reply.words[0] >> 32 == 0 {
+            return Err(proto_fs::PERMISSION);
+        }
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        if bytes.len() != 260 {
+            return Err(proto_fs::PERMISSION);
+        }
+        Ok(Some(bytes.try_into().map_err(|_| proto_fs::PERMISSION)?))
+    }
     fn install_identity(
         &mut self,
         fds: &mut Fds,
@@ -1359,7 +1403,7 @@ impl Fs {
         if r.body().finish().is_err()
             || r.handles.len() != 1
             || proto_fs::is_loaders(r.label())
-            || fds.binding_preparation.is_some()
+            || (fds.binding_preparation.is_some() && !self.can_replace_refresh(fds))
             || matches!(fds.binding, Binding::Cleanup)
         {
             return self.bind_refusal(fds, proto_fs::PERMISSION);
@@ -1376,6 +1420,11 @@ impl Fs {
         let Ok(identity) = r.handles.take::<Channel>(0) else {
             return self.bind_refusal(fds, proto_fs::PERMISSION);
         };
+        if fds.binding_preparation.is_some() {
+            // A real target identity supersedes only the retained loader refresh.
+            // The original identity and captured descriptions remain for rollback.
+            self.ram.complete_binding(fds, proto_fs::PERMISSION);
+        }
         if let Err(code) = self.ram.begin_binding(fds) {
             return self.bind_refusal(fds, code);
         }
@@ -1386,6 +1435,15 @@ impl Fs {
                 self.bind_refusal(fds, code)
             }
         }
+    }
+
+    fn can_replace_refresh(&self, fds: &Fds) -> bool {
+        matches!(fds.binding, Binding::Pending(_) | Binding::Handoff(_))
+            && self
+                .identities
+                .get(fds.authority_index as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|identity| identity.purpose == BindingPurpose::Refresh)
     }
 
     fn authenticate(&mut self, fds: &mut Fds, label: u64) -> Result<(), u32> {
@@ -1405,7 +1463,7 @@ impl Fs {
         let who = fds.binding.snapshot_ref().ok_or(proto_fs::PERMISSION)?;
         let current = generation(who.index as usize);
         if current == who.generation {
-            return if matches!(fds.binding, Binding::Inherited(_)) {
+            return if matches!(fds.binding, Binding::Inherited(_) | Binding::Handoff(_)) {
                 Err(proto_fs::PERMISSION)
             } else {
                 Ok(())
@@ -1601,6 +1659,20 @@ impl Fs {
                 };
             }
             let identity = Handle::borrowed(binding.channel.raw());
+            if binding.purpose == BindingPurpose::Refresh
+                && matches!(binding.original, Binding::Pending(_) | Binding::Handoff(_))
+            {
+                let original = binding.original;
+                return match self.retained_wire(&identity, original) {
+                    Ok(Some(wire)) => {
+                        self.identities[i].as_mut().unwrap().admission =
+                            Admission::RetainedWire(wire);
+                        proto_fs::RESOLVING
+                    }
+                    Ok(None) => proto_fs::RESOLVING,
+                    Err(code) => self.fail_binding(fds, code),
+                };
+            }
             let wire = self.vouch_wire(&identity);
             let valid = wire.is_some();
             if let Some(wire) = wire {
@@ -1612,9 +1684,38 @@ impl Fs {
                 self.reject_binding(fds)
             };
         }
-        if matches!(binding.admission, Admission::Wire(_)) {
+        if matches!(
+            binding.admission,
+            Admission::Wire(_) | Admission::RetainedWire(_)
+        ) {
             return match self.identities[i].as_mut().unwrap().admission.decode() {
                 Ok(()) => proto_fs::RESOLVING,
+                Err(code) => self.fail_binding(fds, code),
+            };
+        }
+        if let Admission::RetainedVouched(retained) = binding.admission {
+            let original = binding.original;
+            return match self.identities[i]
+                .as_mut()
+                .unwrap()
+                .admission
+                .validate_retained(original, generation(retained.who.index as usize))
+            {
+                Ok(()) => proto_fs::RESOLVING,
+                Err(code) => self.fail_binding(fds, code),
+            };
+        }
+        if let Admission::RetainedValidated(retained) = binding.admission {
+            if generation(retained.who.index as usize) != retained.who.generation {
+                self.identities[i].as_mut().unwrap().admission = Admission::Unvouched;
+                return proto_fs::RESOLVING;
+            }
+            return match binding.original.retained_refresh(&retained) {
+                Ok(refreshed) => {
+                    fds.binding = refreshed;
+                    self.ram.complete_binding(fds, 0);
+                    0
+                }
                 Err(code) => self.fail_binding(fds, code),
             };
         }

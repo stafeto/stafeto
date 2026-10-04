@@ -10,8 +10,11 @@ use proto_process::{Credentials, Groups, WhoReply};
 pub enum Admission {
     Unvouched,
     Wire([u8; 252]),
+    RetainedWire([u8; 260]),
     Vouched(WhoReply),
+    RetainedVouched(proto_process::RetainedLoaderReply),
     Validated(WhoReply),
+    RetainedValidated(proto_process::RetainedLoaderReply),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BindingPurpose {
@@ -20,11 +23,32 @@ pub enum BindingPurpose {
 }
 impl Admission {
     pub fn decode(&mut self) -> Result<(), u32> {
+        if let Self::RetainedWire(wire) = self {
+            let retained =
+                proto_process::RetainedLoaderReply::read(wire).map_err(|_| proto_fs::PERMISSION)?;
+            *self = Self::RetainedVouched(retained);
+            return Ok(());
+        }
         let Self::Wire(wire) = self else {
             return Err(proto_fs::PERMISSION);
         };
         let who = WhoReply::read(wire).map_err(|_| proto_fs::PERMISSION)?;
         *self = Self::Vouched(who);
+        Ok(())
+    }
+    pub fn validate_retained(&mut self, original: Binding, generation: u64) -> Result<(), u32> {
+        let Self::RetainedVouched(retained) = self else {
+            return Err(proto_fs::PERMISSION);
+        };
+        if generation & proto_process::GENERATION_DEAD != 0 {
+            return Err(proto_fs::PERMISSION);
+        }
+        if generation != retained.who.generation {
+            *self = Self::Unvouched;
+            return Ok(());
+        }
+        original.retained_refresh(retained)?;
+        *self = Self::RetainedValidated(*retained);
         Ok(())
     }
     /// A stale reply restarts transport; validation never publishes a binding.
@@ -71,11 +95,40 @@ pub enum Binding {
     Boot,
     Active(WhoReply),
     Pending(WhoReply),
+    /// The exact successful target awaits its genuine startup identity.
+    Handoff(WhoReply),
     /// Captured descriptions await a child identity, while the creator still owns cleanup.
     Inherited(WhoReply),
     Cleanup,
 }
 impl Binding {
+    pub fn retained_refresh(
+        self,
+        retained: &proto_process::RetainedLoaderReply,
+    ) -> Result<Self, u32> {
+        let old = match self {
+            Self::Pending(who) | Self::Handoff(who) => who,
+            _ => return Err(proto_fs::PERMISSION),
+        };
+        let loader = old.loader.ok_or(proto_fs::PERMISSION)?;
+        let expected = proto_process::RetainedLoader {
+            pid: old.pid,
+            index: old.index,
+            image: old.image,
+            ticket: loader.ticket,
+            root: old.root,
+        };
+        if !expected.matches(&retained.who) {
+            return Err(proto_fs::PERMISSION);
+        }
+        match retained.state {
+            proto_process::RetainedLoaderState::Loading if matches!(self, Self::Pending(_)) => {
+                self.refreshed(&retained.who)
+            }
+            proto_process::RetainedLoaderState::Handoff => Ok(Self::Handoff(retained.who)),
+            _ => Err(proto_fs::PERMISSION),
+        }
+    }
     /// Refresh preserves the exact authority class and its captured owner.
     pub fn refreshed(self, who: &WhoReply) -> Result<Self, u32> {
         let old = self.snapshot_ref().ok_or(proto_fs::PERMISSION)?;
@@ -119,7 +172,7 @@ impl Binding {
         if pending != who.loader.is_some() {
             return Err(proto_fs::PERMISSION);
         }
-        if let Self::Active(old) | Self::Pending(old) = self {
+        if let Self::Active(old) | Self::Pending(old) | Self::Handoff(old) = self {
             if old.pid != who.pid
                 || old.index != who.index
                 || old.image != who.image
@@ -128,6 +181,9 @@ impl Binding {
                 return Err(proto_fs::PERMISSION);
             }
             if pending && old.loader != who.loader {
+                return Err(proto_fs::PERMISSION);
+            }
+            if pending && matches!(self, Self::Handoff(_)) {
                 return Err(proto_fs::PERMISSION);
             }
         }
@@ -151,7 +207,7 @@ impl Binding {
     }
     pub fn snapshot_ref(&self) -> Option<&WhoReply> {
         match self {
-            Self::Active(w) | Self::Pending(w) | Self::Inherited(w) => Some(w),
+            Self::Active(w) | Self::Pending(w) | Self::Inherited(w) | Self::Handoff(w) => Some(w),
             _ => None,
         }
     }
@@ -163,7 +219,7 @@ impl Binding {
     }
     pub fn valid(&self, generation: u64) -> bool {
         matches!(*self, Self::Boot)
-            || (!matches!(*self, Self::Inherited(_))
+            || (!matches!(*self, Self::Inherited(_) | Self::Handoff(_))
                 && self
                     .snapshot_ref()
                     .is_some_and(|who| who.generation == generation && generation != 0))
@@ -182,7 +238,7 @@ impl Binding {
                 groups: Groups::EMPTY,
             });
         }
-        if matches!(self, Self::Inherited(_)) {
+        if matches!(self, Self::Inherited(_) | Self::Handoff(_)) {
             return Err(proto_fs::PERMISSION);
         }
         let who = self.snapshot_ref().ok_or(proto_fs::PERMISSION)?;

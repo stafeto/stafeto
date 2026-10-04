@@ -206,6 +206,32 @@ impl<T> Loaders<T> {
         (place.stage == Stage::Loading).then(|| self.ticket(index))
     }
 
+    /// A paid retention query distinguishes live loading authority from handoff.
+    pub fn retained(
+        &self,
+        record: usize,
+        image: u32,
+        ticket: u64,
+        accepted_image: u32,
+        accepted_ticket: u64,
+        alive: bool,
+    ) -> Option<proto_process::RetainedLoaderState> {
+        use proto_process::RetainedLoaderState::{Handoff, Loading};
+        if alive && image == accepted_image && ticket != 0 && ticket == accepted_ticket {
+            return Some(Handoff);
+        }
+        let slot = self.of(record)?;
+        let place = self.get(slot)?;
+        if place.image != image || self.ticket(slot) != ticket {
+            return None;
+        }
+        match place.stage {
+            Stage::Loading => Some(Loading),
+            Stage::Loaded => Some(Handoff),
+            Stage::Booting | Stage::Ready => None,
+        }
+    }
+
     /// SetId of a file service for the place of `ticket`: kept when the
     /// place loads the record in `record`, image `image`, and has none.
     pub fn set_id(
@@ -285,6 +311,32 @@ impl<T> Loaders<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_loader_distinguishes_loading_handoff_and_retired_attempts() {
+        use proto_process::RetainedLoaderState::{Handoff, Loading};
+        let mut t = Loaders::<()>::new();
+        let ticket = loading(&mut t, 5);
+        assert_eq!(t.retained(5, 1, ticket, 1, 0, false), Some(Loading));
+        t.loaded(5).unwrap();
+        assert_eq!(t.retained(5, 1, ticket, 1, 0, false), Some(Handoff));
+        t.commit(5).unwrap();
+        assert_eq!(t.retained(5, 1, ticket, 1, 0, true), None);
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, true), Some(Handoff));
+        t.free(5).unwrap();
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, true), Some(Handoff));
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, false), None);
+        let slot = t.take(5, 5, 2, ()).unwrap();
+        let next = t.ticket(slot);
+        t.get_mut(slot).unwrap().stage = Stage::Loading;
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, true), Some(Handoff));
+        t.loaded(5).unwrap();
+        assert_eq!(t.retained(5, 2, next, 1, ticket, true), Some(Handoff));
+        t.free(5).unwrap();
+        assert_eq!(t.retained(5, 2, next, 1, ticket, true), None);
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, true), Some(Handoff));
+        assert_eq!(t.retained(5, 1, ticket, 2, next, true), None);
+    }
 
     #[test]
     fn an_exhausted_ticket_place_is_retired_permanently() {
