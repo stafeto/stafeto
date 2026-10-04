@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 /* Included after pty.c's ordinary pair helpers. The parent speaks only
  * through the real PTY master; the child shell owns the slave as ctty. */
