@@ -441,5 +441,8 @@ pub extern "C" fn files_open_stages() -> i32 {
         return 90;
     };
     let files = core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
-    run(&files).err().unwrap_or(0)
+    let result = run(&files);
+    #[cfg(feature = "ipc-loss")]
+    let result = result.and_then(|()| super::reply_loss::run(&files));
+    result.err().unwrap_or(0)
 }

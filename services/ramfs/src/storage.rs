@@ -845,6 +845,15 @@ impl<'a> Storage<'a> {
         Ok(())
     }
 
+    #[cfg(feature = "auth-probe")]
+    pub fn preparations_for_root(&self, root: Root) -> u16 {
+        self.state
+            .accounts
+            .iter()
+            .flatten()
+            .find(|a| a.key == root)
+            .map_or(0, |a| a.pending)
+    }
     pub fn preparations_used(&self) -> u16 {
         self.state.preparation_used
     }

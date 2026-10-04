@@ -25,7 +25,7 @@ struct Arm {
     slot: u32,
     generation: u64,
     body: u64,
-    start: bool,
+    keyed: bool,
     sent: bool,
 }
 
@@ -131,7 +131,7 @@ fn arm(t: NonNull<Thread>) -> Result<(), Error> {
         slot: args[2] as u32,
         generation: args[3],
         body: args[4],
-        start: args[5] == 0,
+        keyed: args[5] == 0,
         sent: false,
     };
     // SAFETY: this entry owns the state, with retained references above.
@@ -147,7 +147,7 @@ fn result(t: NonNull<Thread>, code: u64) {
     unsafe { (*t.as_ptr()).regs.x[0] = code };
 }
 
-/// ARM: endpoint, Header64, slot, generation, expected jobID, start/job flag.
+/// ARM: endpoint, Header64, slot, generation, expected jobID, key/job flag.
 /// SNAPSHOT: x1 Ended, x2 Alive, x3 actual Reply result, x4 slot, x5 generation.
 /// DISARM: release the current worker's arm once.
 pub fn test_call(t: NonNull<Thread>, number: u16) -> bool {
@@ -195,7 +195,7 @@ pub fn test_call(t: NonNull<Thread>, number: u16) -> bool {
             let matches = unsafe {
                 let a = (*PROBE.0.get()).arm.as_ref().unwrap();
                 let r = &t.as_ref().regs.x;
-                let body_matches = if a.start {
+                let body_matches = if a.keyed {
                     r[3] as u32 == a.slot
                         && (r[3] >> 32 | ((r[4] as u32 as u64) << 32)) == a.generation
                 } else {
@@ -204,7 +204,7 @@ pub fn test_call(t: NonNull<Thread>, number: u16) -> bool {
                 r[2] == a.header
                     && via(t, r[0]) == Ok(a.via)
                     && body_matches
-                    && Desc::from_send(r[1]).is_ok_and(|d| d.len >= if a.start { 20 } else { 16 })
+                    && Desc::from_send(r[1]).is_ok_and(|d| d.len >= if a.keyed { 20 } else { 16 })
             };
             if matches {
                 // SAFETY: no borrow remains from the predicate above.

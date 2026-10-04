@@ -975,6 +975,7 @@ enum Variant {
     TestIcount,
     FaultProbe,
     OverflowProbe,
+    IpcLossProbe,
 }
 
 impl Variant {
@@ -997,6 +998,7 @@ impl Variant {
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
+            Variant::IpcLossProbe => Some("ipc-loss-probe"),
         }
     }
 
@@ -1007,9 +1009,11 @@ impl Variant {
             | Variant::TraceNormal
             | Variant::FaultProbe
             | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
-            Variant::Test | Variant::Baseline | Variant::Trace | Variant::TestIcount => {
-                (TEST_KERNEL_LIMIT, "test builds")
-            }
+            Variant::Test
+            | Variant::Baseline
+            | Variant::Trace
+            | Variant::TestIcount
+            | Variant::IpcLossProbe => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
 
@@ -1023,6 +1027,7 @@ impl Variant {
             Variant::TestIcount => "stafeto-ktest-icount",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
+            Variant::IpcLossProbe => "stafeto-ipc-loss",
         }
     }
 }
@@ -1060,6 +1065,7 @@ commands:
   ramfs-cleanup verify unfinished binding cleanup with a foreign holder
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
+  posix-files-loss verify native refused Open replies with a live sibling
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
   posix-input-vz verify file progress during Virtio console reads on Apple VZ
@@ -1174,6 +1180,7 @@ fn main() {
         Some("loader-abort") => loader_abort_probe(false),
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
+        Some("posix-files-loss") => posix_files_loss(),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -2822,6 +2829,25 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
         }
         println!("RAM credential dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     }
+    Ok(())
+}
+
+fn posix_files_loss() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::IpcLossProbe)?;
+    const PROGRAMS: [ImageProgram; 5] = {
+        let mut programs = POSIX_FILES_PROGRAMS;
+        programs[1].3 = &["auth-probe"];
+        programs[4].3 = &["ipc-loss"];
+        programs
+    };
+    let image = build_boot_image("boot-posix-files-loss.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(&output, "posix-files: genuine native reply loss ok")?;
     Ok(())
 }
 
