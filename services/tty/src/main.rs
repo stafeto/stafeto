@@ -165,6 +165,7 @@ struct Device {
     jobs: Jobs,
     job_generation: u64,
     disconnect_pending: bool,
+    disconnect_wake: bool,
     departed: Departures,
 }
 impl Device {
@@ -181,6 +182,7 @@ impl Device {
             jobs: Jobs::new(),
             job_generation: 0,
             disconnect_pending: false,
+            disconnect_wake: false,
             departed: Departures::new(),
         }
     }
@@ -547,15 +549,10 @@ impl Tty {
         self.select(terminal);
         self.devices[terminal].console.flush_input();
         self.devices[terminal].console.flush_output();
-        self.tell_readers();
-        self.tell_output();
-        self.tell_master_readers();
-        self.tell_master_writers();
         self.devices[terminal].disconnect_pending = self.devices[terminal].job_generation != 0;
-        if self.devices[terminal].disconnect_pending {
-            self.disconnect_work_due = true;
-            self.kick();
-        }
+        self.devices[terminal].disconnect_wake = !self.devices[terminal].disconnect_pending;
+        self.disconnect_work_due = true;
+        self.kick();
     }
 
     fn disconnect_link(&mut self) {
@@ -566,6 +563,7 @@ impl Tty {
         let device = &self.devices[self.active];
         let Some(sid) = device.jobs.session() else {
             self.devices[self.active].disconnect_pending = false;
+            self.devices[self.active].disconnect_wake = true;
             return;
         };
         let generation = device.job_generation;
@@ -580,8 +578,10 @@ impl Tty {
         if let Ok(reply) = sys::send(notary, w.as_bytes())
             && proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() == Ok(0)
         {
+            // Process publishes HUP before this accepted reply. EOF and
+            // readiness notifications are published in the next step.
             self.devices[self.active].disconnect_pending = false;
-            self.departure();
+            self.devices[self.active].disconnect_wake = true;
         } else {
             self.kick();
         }
@@ -1005,6 +1005,25 @@ impl Tty {
     /// waits armed, or else a piece of output; a step that took input
     /// leaves the output to the next.
     fn work(&mut self) {
+        if self.disconnect_work_due {
+            if let Some(terminal) = self.devices.iter().position(|d| d.disconnect_pending) {
+                self.select(terminal);
+                self.disconnect_link();
+                self.kick();
+                return;
+            }
+            if let Some(terminal) = self.devices.iter().position(|d| d.disconnect_wake) {
+                self.select(terminal);
+                self.devices[terminal].disconnect_wake = false;
+                self.tell_readers();
+                self.tell_output();
+                self.tell_master_readers();
+                self.tell_master_writers();
+                self.kick();
+                return;
+            }
+            self.disconnect_work_due = false;
+        }
         if let Some(slot) = self.retired.first() {
             if let Some(id) = self.holdsets[slot].holds.first() {
                 if let Ok(Some(effect)) = self.endpoints.close(&mut self.holdsets[slot].holds, id) {
@@ -1028,15 +1047,6 @@ impl Tty {
                 return;
             }
             self.pin_cleanup_due = false;
-        }
-        if self.disconnect_work_due {
-            if let Some(terminal) = self.devices.iter().position(|d| d.disconnect_pending) {
-                self.select(terminal);
-                self.disconnect_link();
-                self.kick();
-                return;
-            }
-            self.disconnect_work_due = false;
         }
         if self.watch_cleanup_due {
             if let Some((label, key, id)) = self.watches.cleanup() {
@@ -1248,7 +1258,11 @@ impl Tty {
             .instance(endpoint.terminal)
             .is_some_and(|i| i.disconnected)
         {
-            return watch::READ | watch::ERR | watch::HUP;
+            return if self.devices[endpoint.terminal].disconnect_pending {
+                0
+            } else {
+                watch::READ | watch::ERR | watch::HUP
+            };
         }
         let terminal = &self.devices[endpoint.terminal].console;
         if endpoint.side == Side::Slave {
@@ -1443,6 +1457,17 @@ impl Tty {
         if master {
             return self.master_read(s, r, read, endpoint);
         }
+        if self.devices[self.active].disconnect_pending {
+            if endpoint.flags & tty::endpoints::NONBLOCK != 0 {
+                return status(Status::Kernel(Error::LimitReached).code());
+            }
+            let notify = match self.notify_of(r, take) {
+                Ok(notify) => notify,
+                Err(answer) => return answer,
+            };
+            self.kick();
+            return self.wait(s, r, read.key, Wait::Read(None), read.terminal, notify);
+        }
         if self.disconnected() {
             self.finish(s, read.key);
             return long_answer(r, long::Reply::Ready(&[]));
@@ -1573,6 +1598,13 @@ impl Tty {
             Ok(notify) => notify,
             Err(answer) => return answer,
         };
+        if self.devices[self.active].disconnect_pending {
+            if endpoint.flags & tty::endpoints::NONBLOCK != 0 {
+                return status(Status::Kernel(Error::LimitReached).code());
+            }
+            self.kick();
+            return self.wait(s, r, read.key, Wait::MasterRead, read.terminal, notify);
+        }
         if self.disconnected() {
             self.finish(s, read.key);
             return long_answer(r, long::Reply::Ready(&[]));
