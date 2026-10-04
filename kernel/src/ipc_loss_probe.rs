@@ -54,6 +54,11 @@ static PROBE: Probe = Probe(UnsafeCell::new(State {
     snapshot: None,
 }));
 
+fn cause(t: NonNull<Thread>) -> u8 {
+    // SAFETY: the caller holds t throughout this single-core entry.
+    unsafe { t.as_ref().priority() }
+}
+
 fn owner(t: NonNull<Thread>) -> NonNull<Process> {
     // SAFETY: every hook's caller holds t, which holds its process.
     unsafe { t.as_ref().process() }
@@ -106,7 +111,7 @@ pub fn ending(t: NonNull<Thread>, cause: u8) {
 fn arm(t: NonNull<Thread>) -> Result<(), Error> {
     if let Some(old) = take() {
         // SAFETY: the running caller is alive throughout the probe call.
-        release(old, unsafe { t.as_ref().priority() });
+        release(old, cause(t));
     }
     // SAFETY: only the running caller's registers are read.
     let args = unsafe { &t.as_ref().regs.x };
@@ -155,7 +160,7 @@ pub fn test_call(t: NonNull<Thread>, number: u16) -> bool {
         let same = unsafe { (*PROBE.0.get()).arm.as_ref().is_none_or(|a| a.worker == t) };
         if same {
             if let Some(arm) = take() {
-                release(arm, unsafe { t.as_ref().priority() });
+                release(arm, cause(t));
             }
             result(t, 0);
         } else {
@@ -205,7 +210,7 @@ pub fn test_call(t: NonNull<Thread>, number: u16) -> bool {
                 // SAFETY: no borrow remains from the predicate above.
                 unsafe { (*PROBE.0.get()).arm.as_mut().unwrap().sent = true };
             } else if let Some(arm) = take() {
-                release(arm, unsafe { t.as_ref().priority() });
+                release(arm, cause(t));
             }
         }
         return false;
@@ -235,7 +240,7 @@ pub fn test_call(t: NonNull<Thread>, number: u16) -> bool {
         return false;
     };
     if thread::end_waiting_for_probe(worker, owner(t)).is_err() {
-        release(a, unsafe { t.as_ref().priority() });
+        release(a, cause(t));
         return false;
     }
     let ended = thread::info(worker).state == ThreadState::Ended;
@@ -256,6 +261,6 @@ pub fn test_call(t: NonNull<Thread>, number: u16) -> bool {
             generation: a.generation,
         });
     }
-    release(a, unsafe { t.as_ref().priority() });
+    release(a, cause(t));
     true
 }
