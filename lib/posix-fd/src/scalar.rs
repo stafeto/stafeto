@@ -780,6 +780,70 @@ mod tests {
     }
 
     #[test]
+    fn pinned_startup_initialization_matches_constructor_and_scalar_lifecycle() {
+        extern crate std;
+        use std::boxed::Box;
+        type Large = Table<u32, 32, [u64; 3], [u8; 1012]>;
+        let mut storage = Box::<Large>::new_uninit();
+        let address = storage.as_mut_ptr();
+        // SAFETY: Box owns aligned writable uninitialized Large storage;
+        // startup is exclusive and the allocation remains fixed for this test.
+        unsafe {
+            Large::initialize_at(address, |_| false);
+        }
+        // SAFETY: initialize_at initialized every field of this allocation.
+        let mut pinned = unsafe { storage.assume_init() };
+        let mut ordinary = Large::default();
+        assert_eq!((&*pinned as *const Large).cast_mut(), address);
+        for table in [&mut *pinned, &mut ordinary] {
+            assert_eq!(table.open().count(), 0);
+            for slot in &table.holds {
+                assert_eq!(slot.generation, 0);
+                assert_eq!(slot.changed.load(Ordering::Relaxed), 0);
+                assert!(matches!(slot.held, Held::Empty));
+            }
+            for fd in 0..32 {
+                assert_eq!(table.entries[fd].generation, 0);
+                assert_eq!(table.get(fd as u32), Err(Error::BadFileDescriptor));
+                table
+                    .place(fd as u32, fd as u32 + 10, Flags::default())
+                    .unwrap();
+            }
+            let (token, claim) = table.begin_scalar(owner(1), 0, [17; 1012]).unwrap();
+            table
+                .complete_scalar(claim, ScalarResult::Bytes(31))
+                .unwrap();
+            table.close(0).unwrap();
+            assert_eq!(
+                table.scalar_begin_cleanup(token).unwrap().last_target,
+                Some(10)
+            );
+            table.scalar_finish_cleanup(token).unwrap();
+            assert_eq!(
+                table.ack_scalar(token, owner(1)),
+                Ok(ScalarResult::Bytes(31))
+            );
+        }
+        assert!(pinned.open().eq(ordinary.open()));
+        assert_eq!((&*pinned as *const Large).cast_mut(), address);
+    }
+
+    #[test]
+    fn in_place_startup_preserves_early_release_configuration() {
+        let mut storage = core::mem::MaybeUninit::<Table<u32, 2>>::uninit();
+        // SAFETY: this exclusive aligned allocation is completely uninitialized.
+        unsafe {
+            Table::initialize_at(storage.as_mut_ptr(), |target| target >= 100);
+        }
+        // SAFETY: initialize_at established all fields before this read.
+        let mut table = unsafe { storage.assume_init() };
+        table.place(0, 100, Flags::default()).unwrap();
+        table.hold(0).unwrap();
+        assert_eq!(table.close(0), Ok(Some(100)));
+        assert_eq!(table.unhold(100), None);
+    }
+
+    #[test]
     fn scalar_layout_uses_existing_fixed_hold_headers() {
         use core::mem::size_of;
         type Base = Table<u32, 32, [u64; 3]>;

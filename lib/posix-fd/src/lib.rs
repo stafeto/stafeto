@@ -370,6 +370,46 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
         }
     }
 
+    /// Initialize a table directly in its permanent startup allocation.
+    /// Every slot receives a valid enum and atomic value independently.
+    ///
+    /// # Safety
+    /// `destination` is aligned, writable, and valid for a complete uninitialized
+    /// `Self`. The caller has exclusive access until startup publishes Ready.
+    /// No initialized resources may occupy this allocation. Its address remains
+    /// pinned while live records or waiters refer to the hold headers.
+    pub unsafe fn initialize_at(destination: *mut Self, release_early: fn(T) -> bool) {
+        // SAFETY: the caller provides exclusive writable storage for all fields.
+        let entries =
+            unsafe { core::ptr::addr_of_mut!((*destination).entries) }.cast::<EntrySlot<T>>();
+        // SAFETY: this field lies within the caller's complete Self allocation.
+        let holds =
+            unsafe { core::ptr::addr_of_mut!((*destination).holds) }.cast::<HoldSlot<T, R, S>>();
+        for index in 0..N {
+            // SAFETY: index is bounded by the entries array; write initializes
+            // this element without reading or dropping uninitialized bytes.
+            unsafe {
+                entries.add(index).write(EntrySlot {
+                    generation: 0,
+                    state: EntryState::Empty,
+                });
+            }
+            // SAFETY: index is bounded by the holds array. The enum and atomic
+            // receive their valid initial values before any reader exists.
+            unsafe {
+                holds.add(index).write(HoldSlot {
+                    generation: 0,
+                    changed: AtomicU32::new(0),
+                    held: Held::Empty,
+                });
+            }
+        }
+        // SAFETY: exclusive startup ownership permits initializing this field.
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).release_early).write(release_early);
+        }
+    }
+
     fn entry(&self, fd: u32) -> Result<Entry<T>, Error> {
         match self.entries.get(fd as usize).map(|slot| slot.state) {
             Some(EntryState::Open(entry)) => Ok(entry),
