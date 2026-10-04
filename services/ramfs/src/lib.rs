@@ -512,7 +512,7 @@ impl<'a> Ram<'a> {
         token: Token,
         flags: u32,
         identity: authority::Identity,
-        created: bool,
+        creation: Option<storage::Reservation>,
     ) -> Result<TentativeOpen, u32> {
         let allowed = 3
             | proto_fs::DIRECTORY_ONLY
@@ -524,6 +524,14 @@ impl<'a> Ram<'a> {
         if flags & !allowed != 0 || flags & 3 == 3 {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
+        let created = if let Some(reservation) = creation {
+            if self.storage.reserved_token(reservation, fds.root)? != token {
+                return Err(proto_fs::PERMISSION);
+            }
+            true
+        } else {
+            false
+        };
         let node = self.storage.node(token)?;
         let access = flags & 3;
         if created && node.links != 0 {

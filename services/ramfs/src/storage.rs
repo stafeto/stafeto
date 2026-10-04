@@ -752,6 +752,23 @@ impl<'a> Storage<'a> {
         }
         Ok(reservation)
     }
+    /// Only a live, exact unpublished reservation grants a creation's initial access.
+    pub fn reserved_token(&self, r: Reservation, root: Root) -> Result<Token, u32> {
+        if self.state.pending.get(r.place as usize).copied().flatten() != Some(r)
+            || !self
+                .state
+                .accounts
+                .get(r.root as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|account| account.key == root)
+        {
+            return Err(proto_fs::PERMISSION);
+        }
+        if r.epoch != self.state.epoch {
+            return Err(proto_fs::STALE_PROOF);
+        }
+        Ok(r.token)
+    }
     pub fn commit(&mut self, reservation: Reservation) -> Result<Token, u32> {
         let token = self.commit_keep_charge(reservation)?;
         self.release_preparation(reservation.root);
