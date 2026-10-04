@@ -131,8 +131,7 @@ pub fn run() -> Result<(), i32> {
         };
         let begin = core::ptr::addr_of!(native_arm_child_begin);
         let end = core::ptr::addr_of!(native_arm_child_end);
-        // SAFETY: these ordered assembly labels delimit a single static executable section.
-        let len = unsafe { end.offset_from(begin) } as usize;
+        let len = end.addr().checked_sub(begin.addr()).ok_or(178)?;
         if len == 0 || len > PAGE as usize {
             return Err(178);
         }
