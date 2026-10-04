@@ -82,6 +82,12 @@ pub const DIRECTORY_ONLY: u32 = 4;
 /// them (it has no contents to create, cut or follow), any other file
 /// answers INVALID_ARGUMENT.
 pub const CHANGES: u32 = 8;
+/// Distinct mutable-open flags; the legacy CHANGES profile remains separate.
+pub const CREATE: u32 = 16;
+pub const EXCLUSIVE: u32 = 32;
+pub const TRUNCATE: u32 = 64;
+pub const APPEND: u32 = 128;
+pub const NO_FOLLOW: u32 = 256;
 /// The third word of the reply to an OPEN of a random device.
 pub const RANDOM_DEVICE: u32 = 1;
 

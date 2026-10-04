@@ -44,6 +44,150 @@ fn walk(r: &mut Ram<'_>, path: &[u8], identity: Identity) -> Result<Token, u32> 
     job.release(&mut r.storage);
     result
 }
+
+fn intent_ready(
+    r: &mut Ram<'_>,
+    resolver: &mut Resolve,
+    identity: Identity,
+) -> Result<(Progress, usize), u32> {
+    for step in 1..2000 {
+        let progress = resolver.step(&mut r.storage, identity)?;
+        if progress != Progress::More {
+            return Ok((progress, step));
+        }
+    }
+    panic!("bounded intent fixture failed to terminate");
+}
+
+#[test]
+fn create_intent_retains_missing_edge_and_restarts_before_publication() {
+    use crate::resolve::Intent;
+    let mut r = Ram::new(0);
+    let parent = create(&mut r, ROOT, b"parent", DIR, 0o755);
+    let intent = Intent::Open {
+        flags: proto_fs::CREATE | proto_fs::READ_WRITE,
+    };
+    let before = r.storage.node(parent).unwrap().pins;
+    let mut resolver =
+        Resolve::with_intent(&mut r.storage, b"/parent/\xff", ROOT, OWNER, intent).unwrap();
+    let (progress, steps) = intent_ready(&mut r, &mut resolver, OWNER).unwrap();
+    assert_eq!(progress, Progress::Missing(parent));
+    assert!(steps >= crate::storage::DENTRIES / 8);
+    let proof = resolver.result_proof(&r.storage, OWNER, intent).unwrap();
+    assert_eq!(proof.parent, parent);
+    assert_eq!(proof.leaf, b"\xff");
+    assert_eq!(proof.target, None);
+    assert_eq!(resolver.proof(&r.storage, OWNER), Err(proto_fs::PERMISSION));
+    assert!(!proof.trailing_slash);
+    assert!(
+        resolver
+            .result_proof(&r.storage, OWNER, Intent::DirectoryCreate)
+            .is_err()
+    );
+    assert_eq!(
+        r.storage.node(parent).unwrap().pins[Pin::Pending as usize],
+        before[Pin::Pending as usize] + 1
+    );
+    let new = create(&mut r, parent, b"\xff", REG, 0o600);
+    assert!(resolver.result_proof(&r.storage, OWNER, intent).is_err());
+    assert_eq!(resolver.step(&mut r.storage, OWNER), Ok(Progress::More));
+    assert_eq!(
+        intent_ready(&mut r, &mut resolver, OWNER).unwrap().0,
+        Progress::Found(new)
+    );
+    let proof = resolver.result_proof(&r.storage, OWNER, intent).unwrap();
+    assert_eq!(
+        (proof.parent, proof.leaf, proof.target),
+        (parent, b"\xff".as_slice(), Some(new))
+    );
+    resolver.release(&mut r.storage);
+    assert_eq!(r.storage.node(parent).unwrap().pins, before);
+    assert_eq!(r.storage.node(new).unwrap().pins, [0; 5]);
+}
+
+#[test]
+fn create_intent_requires_search_and_absence_only_at_final_component() {
+    use crate::resolve::Intent;
+    let mut r = Ram::new(0);
+    create(&mut r, ROOT, b"denied", DIR, 0);
+    let intent = Intent::Open {
+        flags: proto_fs::CREATE,
+    };
+    for (path, error) in [
+        (b"/absent/child".as_slice(), proto_fs::NO_ENTRY),
+        (b"/absent/", proto_fs::NO_ENTRY),
+        (b"/denied/.", proto_fs::ACCESS_DENIED),
+        (b"/denied/../new", proto_fs::ACCESS_DENIED),
+    ] {
+        let mut resolver = Resolve::with_intent(&mut r.storage, path, ROOT, OWNER, intent).unwrap();
+        assert_eq!(intent_ready(&mut r, &mut resolver, OWNER), Err(error));
+        resolver.release(&mut r.storage);
+    }
+    let mut directory = Resolve::with_intent(
+        &mut r.storage,
+        b"/new/",
+        ROOT,
+        OWNER,
+        Intent::DirectoryCreate,
+    )
+    .unwrap();
+    assert_eq!(
+        intent_ready(&mut r, &mut directory, OWNER).unwrap().0,
+        Progress::Missing(ROOT)
+    );
+    assert!(
+        directory
+            .result_proof(&r.storage, OWNER, Intent::DirectoryCreate)
+            .unwrap()
+            .trailing_slash
+    );
+    directory.release(&mut r.storage);
+    assert_eq!(r.storage.node(ROOT).unwrap().pins, [0; 5]);
+}
+
+#[test]
+fn exclusive_intent_captures_dangling_symlink_and_existing_naming_edge() {
+    use crate::resolve::Intent;
+    let mut r = Ram::new(0);
+    let link = create(&mut r, ROOT, b"dangling", SYMLINK, 0o777);
+    r.storage.write(link, ROOT_ACCOUNT, 0, b"/missing").unwrap();
+    let exclusive = Intent::Open {
+        flags: proto_fs::CREATE | proto_fs::EXCLUSIVE,
+    };
+    for path in [b"/dangling".as_slice(), b"/dangling/"] {
+        let mut resolver =
+            Resolve::with_intent(&mut r.storage, path, ROOT, OWNER, exclusive).unwrap();
+        assert_eq!(
+            intent_ready(&mut r, &mut resolver, OWNER).unwrap().0,
+            Progress::Found(link)
+        );
+        let proof = resolver.result_proof(&r.storage, OWNER, exclusive).unwrap();
+        assert_eq!(
+            (proof.parent, proof.leaf, proof.target),
+            (ROOT, b"dangling".as_slice(), Some(link))
+        );
+        resolver.release(&mut r.storage);
+    }
+    let normal = Intent::Open {
+        flags: proto_fs::CREATE,
+    };
+    let mut resolver =
+        Resolve::with_intent(&mut r.storage, b"/dangling", ROOT, OWNER, normal).unwrap();
+    assert_eq!(
+        intent_ready(&mut r, &mut resolver, OWNER).unwrap().0,
+        Progress::Missing(ROOT)
+    );
+    assert_eq!(
+        resolver
+            .result_proof(&r.storage, OWNER, normal)
+            .unwrap()
+            .leaf,
+        b"missing"
+    );
+    resolver.release(&mut r.storage);
+    assert_eq!(r.storage.node(link).unwrap().pins, [0; 5]);
+    assert_eq!(r.storage.node(ROOT).unwrap().pins, [0; 5]);
+}
 fn who() -> WhoReply {
     WhoReply {
         pid: 300,

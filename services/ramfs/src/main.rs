@@ -2189,14 +2189,14 @@ impl Fs {
             }
         }
         let mut result = j.resolver.step(&mut self.ram.storage, identity);
-        if matches!(result, Ok(Progress::Found(_)))
+        if matches!(result, Ok(Progress::Found(_) | Progress::Missing(_)))
             && let Some(second) = j.second.as_mut()
         {
             result = second.step(&mut self.ram.storage, identity);
         }
         match result {
             Ok(Progress::More) => status(proto_fs::RESOLVING),
-            Ok(Progress::Found(_)) => Answer::Status(Status::Ok),
+            Ok(Progress::Found(_) | Progress::Missing(_)) => Answer::Status(Status::Ok),
             Err(code) => {
                 self.cancel_job(id, r.label(), Some(fds));
                 status(code)
