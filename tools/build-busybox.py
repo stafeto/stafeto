@@ -32,7 +32,7 @@ STAMP = WORK / "config"
 A53_ERRATA = "-mfix-cortex-a53-835769"
 # BusyBox's main becomes busybox_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
-PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769"
+PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-input math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769"
 
 
 def relibc_commit() -> str:
@@ -124,6 +124,33 @@ def main() -> None:
             "# undef HAVE_UNLOCKED_LINE_OPS\nstruct timeval;\nstruct timezone;\n"
             "int settimeofday(const struct timeval *, const struct timezone *);\n#endif\n\n"
             "#if defined(ANDROID) || defined(__ANDROID__)\n# if __ANDROID_API__ < 8")
+    # Interactive input returns to ash's trap evaluation after a signal.
+    # The terminal service supplies canonical input with Editing disabled.
+    replace(SOURCE / "shell/ash.c",
+            "#else\n\tnr = nonblock_immune_read(g_parsefile->pf_fd, buf, IBUFSIZ - 1);\n#endif",
+            "#else\n"
+            "# if defined(__RELIBC__)\n"
+            "\tif (iflag && g_parsefile->pf_fd == STDIN_FILENO) {\n"
+            "\t\tstruct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };\n"
+            "\t\tfor (;;) {\n"
+            "\t\t\tif (pending_sig) {\n"
+            "\t\t\t\tbuf[0] = '\\n';\n"
+            "\t\t\t\tbuf[1] = '\\0';\n"
+            "\t\t\t\treturn 1;\n"
+            "\t\t\t}\n"
+            "\t\t\tnr = read(STDIN_FILENO, buf, IBUFSIZ - 1);\n"
+            "\t\t\tif (nr < 0 && errno == EAGAIN) {\n"
+            "\t\t\t\tif (poll(&pfd, 1, -1) < 0 && errno != EINTR)\n"
+            "\t\t\t\t\treturn -1;\n"
+            "\t\t\t\tcontinue;\n"
+            "\t\t\t}\n"
+            "\t\t\tif (nr >= 0 || errno != EINTR)\n"
+            "\t\t\t\tbreak;\n"
+            "\t\t}\n"
+            "\t} else\n"
+            "# endif\n"
+            "\t\tnr = nonblock_immune_read(g_parsefile->pf_fd, buf, IBUFSIZ - 1);\n"
+            "#endif")
     kbuild = SOURCE / "libbb/Kbuild.src"
     lines = [line for line in kbuild.read_text().splitlines()
              if not line.startswith("lib-y +=")]
