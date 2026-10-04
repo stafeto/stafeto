@@ -996,6 +996,7 @@ commands:
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
   posix-files verify authentic file identity and byte path proofs
+  posix-files-steps measure full RAM dispatches across credential refresh
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
   posix-input-vz verify file progress during Virtio console reads on Apple VZ
@@ -1105,6 +1106,7 @@ fn main() {
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-files") => posix_files_probe(),
+        Some("posix-files-steps") => posix_files_run(true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -2597,15 +2599,54 @@ fn loader_channels_probe() -> Result<(), String> {
 
 /// C operations observe the real Process identities and Files proofs.
 fn posix_files_probe() -> Result<(), String> {
+    posix_files_run(false)
+}
+
+fn posix_files_run(measured: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-posix-files.img", &POSIX_FILES_PROGRAMS, BOOT_PROFILE)?;
+    const MEASURED: [ImageProgram; 5] = {
+        let mut programs = POSIX_FILES_PROGRAMS;
+        programs[1].3 = &["steps"];
+        programs
+    };
+    let programs = if measured {
+        &MEASURED
+    } else {
+        &POSIX_FILES_PROGRAMS
+    };
+    let name = if measured {
+        "boot-posix-files-steps.img"
+    } else {
+        "boot-posix-files.img"
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
+    if measured {
+        cmd.args(qemu::ICOUNT);
+    }
     let ended = "init: posix-files ended: exit code 0, not restarted";
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ended)?;
-    qemu::expect_marker(&output, "posix-files: identity and proofs ok")
+    qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
+    if measured {
+        let steps = longest_steps(&output.lines, "2");
+        for kind in [15, 19, 21, 25, 65] {
+            if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
+                return Err(format!(
+                    "RAM credential probe has no method {kind} measurement: {steps:?}"
+                ));
+            }
+        }
+        if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "RAM method {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+            ));
+        }
+        println!("RAM credential dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    }
+    Ok(())
 }
 
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
@@ -3742,6 +3783,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("posix-files", posix_files_probe),
+        job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
