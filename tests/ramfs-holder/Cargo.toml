@@ -1,0 +1,18 @@
+[package]
+name = "ramfs-holder"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "ramfs-holder"
+test = false
+bench = false
+
+[dependencies]
+rt = { path = "../../lib/rt" }
+proto-fs = { path = "../../proto/fs" }
+proto-wire = { path = "../../proto/wire" }
+proto-init = { path = "../../proto/init" }

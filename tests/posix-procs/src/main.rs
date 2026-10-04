@@ -57,6 +57,8 @@ extern "C" fn files_fake_identity() -> i32 {
     }
 }
 
+#[cfg(feature = "auth-probe")]
+mod cleanup;
 /// Sixteen real sessions retain all thirty-two descriptions during both
 /// credential changes. Every reply and retained byte is checked by the guest.
 #[cfg(feature = "files")]

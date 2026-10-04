@@ -15,6 +15,7 @@ bench = false
 
 [features]
 jobs = []
+auth-probe = ["files"]
 files = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt"]
 loader-abort = ["files", "dep:proto-process", "dep:proto-loader", "dep:posix-fs"]
 terminal = ["posix-crt/uart-input"]

@@ -147,6 +147,53 @@ const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-files", "posix-procs", POSIX_STACK_SIZE, &["files"]),
 ];
+const LOADER_ABORT_PROGRAMS: [ImageProgram; 6] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-posix-files", "loader-abort"],
+    ),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["auth-probe"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    (
+        "posix-files",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["loader-abort"],
+    ),
+    ("loader", "loader", 0, &["auth-probe"]),
+];
+const RAMFS_CLEANUP_PROGRAMS: [ImageProgram; 7] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-posix-files", "ramfs-cleanup"],
+    ),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["auth-probe"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    (
+        "posix-files",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["auth-probe"],
+    ),
+    ("ramfs-holder", "ramfs-holder", CHILD_STACK_SIZE, &[]),
+    ("loader", "loader", 0, &[]),
+];
 const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -995,6 +1042,8 @@ commands:
   posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
+  loader-abort verify retained file cleanup after genuine exec cancellation
+  ramfs-cleanup verify unfinished binding cleanup with a foreign holder
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
   posix-abi run a C main against Rust POSIX and verify thread-local errno
@@ -1106,6 +1155,8 @@ fn main() {
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-files") => posix_files_probe(),
+        Some("ramfs-cleanup") => ramfs_cleanup_probe(),
+        Some("loader-abort") => loader_abort_probe(),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
@@ -2597,7 +2648,49 @@ fn loader_channels_probe() -> Result<(), String> {
     qemu::expect_marker(&outcome, "loader-channels: ok")
 }
 
+fn loader_abort_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-loader-abort.img",
+        &LOADER_ABORT_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "posix-files: genuine loader abort releases retained capture ok",
+    )
+}
+
 /// C operations observe the real Process identities and Files proofs.
+fn ramfs_cleanup_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-ramfs-cleanup.img",
+        &RAMFS_CLEANUP_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(&output, "ramfs-cleanup: ok")?;
+    for owner in ["ramfs-owner-0", "ramfs-owner-1", "ramfs-owner-2"] {
+        qemu::expect_marker(
+            &output,
+            &format!("init: {owner} ended: exit code 0, not restarted"),
+        )?;
+    }
+    Ok(())
+}
+
 fn posix_files_probe() -> Result<(), String> {
     posix_files_run(false)
 }
