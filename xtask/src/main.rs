@@ -5649,7 +5649,6 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-random-probe",
         "--package",
         "posix-pty",
-        "posix-pty-steps",
         "--target",
         PROGRAM_TARGET,
         "--",
