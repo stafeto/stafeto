@@ -37,7 +37,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 0xfff8, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -1008,6 +1008,46 @@ impl Service<0> for Fs {
                     .and_then(|()| output.u32(pins))
                     .is_err()
                 {
+                    return Answer::Status(Status::BadSize);
+                }
+                return Answer::Reply(Outgoing::new());
+            }
+            #[cfg(feature = "image-gates")]
+            if r.method() == 0xfff9 {
+                if !r.handles.is_empty() || r.body().finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                if let Err(code) = self.image_authorize(&mut s.data, r.label()) {
+                    return status(code);
+                }
+                let Some(who) = s.data.binding.snapshot_ref() else {
+                    return status(proto_fs::PERMISSION);
+                };
+                let Some(held) = s.data.image_hold else {
+                    return status(proto_fs::BAD_FD);
+                };
+                let Some(loader) = who.loader else {
+                    return status(proto_fs::PERMISSION);
+                };
+                let label = r.label();
+                let w = r.reply();
+                let result = (|| {
+                    w.u32(0)?;
+                    w.u32(0)?;
+                    w.u32(who.pid)?;
+                    w.u32(who.index)?;
+                    w.u32(who.image)?;
+                    w.u32(u32::from(matches!(s.data.binding, Binding::Handoff(_))))?;
+                    w.u64(who.generation)?;
+                    w.u64(loader.ticket)?;
+                    w.u64(label)?;
+                    w.u64(held.root.id)?;
+                    w.u64(held.root.generation)?;
+                    w.u32(u32::from(held.token.slot))?;
+                    w.u32(0)?;
+                    w.u64(held.token.generation)
+                })();
+                if result.is_err() {
                     return Answer::Status(Status::BadSize);
                 }
                 return Answer::Reply(Outgoing::new());

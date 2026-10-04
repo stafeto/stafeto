@@ -49,7 +49,7 @@ fn abort() -> Result<(), Status> {
 }
 
 /// Standard Start/Go/HandlesDone loads a real ELF before an uncommitted abort.
-fn load_image(loader: &Handle<Channel>) -> Result<(), Status> {
+pub(super) fn load_image(loader: &Handle<Channel>) -> Result<(), Status> {
     const WINDOW: usize = 0x58_0000_0000;
     const PAGE: u64 = 4096;
     let object = sys::mem_create(PAGE).map_err(Status::Kernel)?;

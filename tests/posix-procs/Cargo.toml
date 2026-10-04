@@ -19,6 +19,8 @@ auth-probe = ["files"]
 ipc-loss = ["files"]
 files = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt"]
 loader-abort = ["files", "dep:proto-process", "dep:proto-loader", "dep:posix-fs"]
+image-gates = ["loader-abort"]
+image-gates-normal = ["image-gates"]
 terminal = ["posix-crt/uart-input"]
 
 [dependencies]

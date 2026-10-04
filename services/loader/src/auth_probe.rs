@@ -107,3 +107,64 @@ pub fn capture(own: &Own, body: Reader<'_>, mut handles: Incoming, token: Token)
         }
     }
 }
+
+#[cfg(feature = "image-gates")]
+pub const OBSERVE: u16 = 0xfffb;
+#[cfg(feature = "image-gates")]
+const RELEASE: u16 = 0xfffa;
+
+/// Install one owned notification capability before the genuine Take.
+#[cfg(feature = "image-gates")]
+pub fn observe(own: &Own, body: Reader<'_>, mut handles: Incoming, token: Token) {
+    let result = (|| {
+        if body.finish().is_err()
+            || handles.len() != 1
+            || handles.info(0) != Some((ObjectKind::Channel, Rights::NOTIFY | Rights::TRANSFER))
+        {
+            return Err(Status::BadSize);
+        }
+        let observer = handles.take::<Channel>(0).map_err(Status::Kernel)?;
+        if let Some(previous) = own.observer.take() {
+            own.observer.set(Some(previous));
+            return Err(Status::Kernel(rt::abi::Error::BadState));
+        }
+        own.observer.set(Some(observer));
+        Ok(())
+    })();
+    let installed = result.is_ok();
+    let status = result.err().unwrap_or(Status::Ok);
+    if token.reply(&proto_wire::reply(status)).is_err() && installed {
+        drop(own.observer.take());
+    }
+}
+
+/// Hold the real Handoff before CRT while the parent observes retained image reads.
+#[cfg(feature = "image-gates")]
+pub fn after_take(own: &Own, start: &Handle<Channel>) -> Result<(), rt::abi::Error> {
+    let Some(observer) = own.observer.take() else {
+        return Ok(());
+    };
+    sys::notify(&observer, 1)?;
+    let sys::Received::Message {
+        label,
+        len,
+        handles,
+        token,
+        words,
+    } = sys::receive(start)?
+    else {
+        return Err(rt::abi::Error::PeerClosed);
+    };
+    if label != proto_loader::PARENT || len != proto_wire::HEADER_LEN || !handles.is_empty() {
+        return Err(rt::abi::Error::BadState);
+    }
+    let bytes = rt::abi::inline_bytes(&words);
+    let mut reader = Reader::new(&bytes[..len]);
+    if !proto_wire::Header::read(&mut reader)
+        .is_ok_and(|header| header.version == proto_loader::VERSION && header.method == RELEASE)
+        || reader.finish().is_err()
+    {
+        return Err(rt::abi::Error::BadState);
+    }
+    token.reply(&proto_wire::reply(Status::Ok))
+}

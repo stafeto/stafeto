@@ -18,6 +18,7 @@ bench = false
 [features]
 # Read-only retained-session observation for the owner-death regression.
 auth-probe = []
+image-gates = ["auth-probe"]
 # The longest step of the loop for each method, printed when it grows (rt
 # feature step-stats; xtask process-steps, under -icount).
 steps = ["rt/step-stats"]

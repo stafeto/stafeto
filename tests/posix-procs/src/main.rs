@@ -12,6 +12,8 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
 #[cfg(feature = "loader-abort")]
 mod audit;
+#[cfg(feature = "image-gates")]
+mod image_gates;
 #[cfg(feature = "loader-abort")]
 mod image_hold;
 #[cfg(feature = "loader-abort")]
