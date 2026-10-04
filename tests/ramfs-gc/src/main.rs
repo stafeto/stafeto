@@ -68,6 +68,8 @@ fn run() -> Result<(), Status> {
     let baseline = pages(channel)?;
     rt::println!("ramfs-gc: before inode preparation");
     control(channel, 0)?;
+    rt::println!("ramfs-gc: inode reserved, before commit");
+    control(channel, 4)?;
     rt::println!("ramfs-gc: inode created, before page allocation");
     for page in 0..32 {
         let mut request = Writer::new();
