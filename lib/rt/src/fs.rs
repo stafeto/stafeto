@@ -160,6 +160,14 @@ impl Drop for Proof<'_> {
 }
 
 impl Files {
+    /// Even a long reply retains its first 64 bytes in the returned registers.
+    /// Reading status needs no message-buffer copy or kilobyte stack frame.
+    fn reply_code(reply: &crate::sys::Reply) -> Result<u32, Status> {
+        if reply.len < 4 {
+            return Err(Status::BadSize);
+        }
+        Ok(reply.words[0] as u32)
+    }
     /// Bind this ordinary session to the actual Process identity capability.
     pub fn bind(&self, identity: &Handle<Channel>) -> Result<(), Status> {
         let copy = sys::handle_duplicate(
@@ -173,8 +181,7 @@ impl Files {
             [copy.erase()],
         )
         .map_err(|e| Status::Kernel(e.error))?;
-        let mut buffer = [0; MESSAGE_MAX];
-        let status = Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?);
+        let status = Status::from_code(Self::reply_code(&reply)?);
         if status != Status::Unknown(proto_fs::RESOLVING) {
             return Err(status);
         }
@@ -190,11 +197,10 @@ impl Files {
                 Err(Error::Interrupted) => continue,
                 result => result.map_err(Status::Kernel)?,
             };
-            let mut buffer = [0; MESSAGE_MAX];
             if !reply.handles.is_empty() {
                 return Err(Status::BadSize);
             }
-            match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+            match Status::from_code(Self::reply_code(&reply)?) {
                 Status::Ok => return Ok(()),
                 Status::Unknown(proto_fs::RESOLVING) => {}
                 status => return Err(status),
@@ -206,8 +212,7 @@ impl Files {
     pub fn send_on(channel: &Handle<Channel>, request: &[u8]) -> Result<crate::sys::Reply, Status> {
         loop {
             let reply = sys::send(channel, request).map_err(Status::Kernel)?;
-            let mut buffer = [0; MESSAGE_MAX];
-            if Reader::new(reply.bytes(&mut buffer)).u32()? != proto_fs::AUTHENTICATING {
+            if Self::reply_code(&reply)? != proto_fs::AUTHENTICATING {
                 return Ok(reply);
             }
             if !reply.handles.is_empty() {
@@ -218,8 +223,7 @@ impl Files {
     }
     pub fn clone_on(channel: &Handle<Channel>, request: &[u8]) -> Result<Handle<Channel>, Status> {
         let mut reply = Self::send_on(channel, request)?;
-        let mut buffer = [0; MESSAGE_MAX];
-        match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+        match Status::from_code(Self::reply_code(&reply)?) {
             Status::Ok if reply.handles.len() == 1 => reply.handles.take(0).map_err(Status::Kernel),
             Status::Ok => Err(Status::BadSize),
             status => Err(status),
@@ -234,8 +238,7 @@ impl Files {
         loop {
             let mut reply = sys::send_handles(channel, request, [offered.erase()])
                 .map_err(|refused| Status::Kernel(refused.error))?;
-            let mut buffer = [0; MESSAGE_MAX];
-            let status = Reader::new(reply.bytes(&mut buffer)).u32()?;
+            let status = Self::reply_code(&reply)?;
             if status != 0 && status != proto_fs::AUTHENTICATING {
                 return Err(Status::from_code(status));
             }
