@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod authority;
+pub mod places;
 pub mod resolve;
 #[cfg(test)]
 mod resolve_tests;
@@ -200,6 +201,8 @@ pub struct Fds {
     pub claimed: bool,
     pub binding: authority::Binding,
     pub authority_index: u16,
+    pub binding_preparation: Option<u16>,
+    pub binding_source: Option<(u16, u64)>,
     pub resolvers: [u64; 16],
     pub root: storage::Root,
     pub cwd: Option<Token>,
@@ -213,6 +216,8 @@ impl Default for Fds {
             claimed: false,
             binding: authority::Binding::Unbound,
             authority_index: storage::NONE,
+            binding_preparation: None,
+            binding_source: None,
             resolvers: [0; 16],
             root: BOOT_ROOT,
             cwd: None,
@@ -503,6 +508,11 @@ impl<'a> Ram<'a> {
 
     /// One reference or preparation per cleanup step.
     pub fn release_step(&mut self, fds: &mut Fds) -> bool {
+        if let Some(root) = fds.binding_preparation.take() {
+            self.storage.release_preparation(root);
+            fds.binding_source = None;
+            return true;
+        }
         if let Some(r) = fds
             .preparations
             .iter_mut()
@@ -556,6 +566,10 @@ impl<'a> Ram<'a> {
     }
 
     pub fn release(&mut self, fds: &mut Fds) {
+        if let Some(root) = fds.binding_preparation.take() {
+            self.storage.release_preparation(root);
+        }
+        fds.binding_source = None;
         if let Some(cwd) = fds.cwd.take() {
             let _ = self.storage.unpin(cwd, Pin::Cwd);
         }
@@ -847,7 +861,10 @@ impl<'a> Ram<'a> {
     /// ReadAt of an image session: the bytes of the program file `entry`
     /// from `offset`; the time of the image does not change.
     pub fn image_read(&self, entry: u16, offset: u64, out: &mut [u8]) -> Result<usize, u32> {
-        self.image_information(entry)?;
+        let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
+        if entry >= tree.len() || tree.entry(entry).is_directory() {
+            return Err(NO_ENTRY);
+        }
         if i64::try_from(offset).is_err() {
             return Err(proto_fs::INVALID_ARGUMENT);
         }

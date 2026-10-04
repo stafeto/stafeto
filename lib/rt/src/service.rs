@@ -79,9 +79,15 @@ pub trait Service<const K: usize> {
     }
 
     /// One bounded maintenance step, including retained clients whose owner ended.
-    /// Called after each receive; heartbeat notices also advance the cursor.
-    fn maintenance(&mut self, sessions: &mut [Option<Session<Self::Data, K>>]) {
-        let _ = sessions;
+    /// Called after notifications; heartbeat notices also advance the cursor.
+    fn maintenance(&mut self, sessions: &mut [Option<Session<Self::Data, K>>], notice: Notice) {
+        let _ = (sessions, notice);
+    }
+
+    /// A scheduling handoff after a measured notification dispatch has ended.
+    /// A service with a queue of own cursor notices may yield to FIFO peers here.
+    fn between_notifications(&mut self, notice: Notice) {
+        let _ = notice;
     }
 
     /// A notification other than CLIENT_GONE and the heartbeat's timer:
@@ -419,7 +425,6 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 #[cfg(not(feature = "step-stats"))]
                 let began = steps::begin();
                 request(service, table, config.issued, label, bytes, handles, token);
-                service.maintenance(table);
                 steps::end(began, kind);
                 continue;
             }
@@ -467,8 +472,9 @@ pub fn run_in<S: Service<K>, const K: usize>(
             }
             _ => service.notification(notice),
         }
-        service.maintenance(table);
+        service.maintenance(table, notice);
         steps::end(began, steps::NOTICE);
+        service.between_notifications(notice);
     }
 }
 

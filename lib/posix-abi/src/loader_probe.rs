@@ -166,6 +166,14 @@ pub fn full(slot: u32) -> i32 {
             .take::<Channel>(0)
             .map_err(|_| crate::constants::EIO)?;
         if slot == Slot::Files as u32 {
+            // This probe becomes the true holder before using the verified capture.
+            let files = core::mem::ManuallyDrop::new(rt::fs::Files::from_sessions(
+                Handle::from_raw(returned.raw()),
+                None,
+            ));
+            files
+                .bind(crate::process::identity().ok_or(crate::constants::EIO)?)
+                .map_err(|_| crate::constants::EIO)?;
             let mut read = Writer::new();
             proto_fs::Method::Read
                 .header()

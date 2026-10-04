@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Process protocol v4 (spec 2, section 3.1). The service creates every
+//! Process protocol v10 (spec 2, section 3.1). The service creates every
 //! POSIX process itself, so that a record comes with its process and goes
 //! only with the notification of its end. The label of a session names
 //! the caller's record (`Label`), never the body.
@@ -645,59 +645,126 @@ pub struct LoaderOf {
     pub ticket: u64,
 }
 
-impl WhoReply {
+/// A service-owned snapshot encoded directly from its immutable record fields.
+pub struct Vouch<'a> {
+    pub pid: u32,
+    pub credentials: Credentials,
+    pub generation: u64,
+    pub loader: Option<LoaderOf>,
+    pub index: u32,
+    pub ctty: Option<(u32, u64)>,
+    pub image: u32,
+    pub groups: &'a Groups,
+    pub limits: &'a ResourceLimits,
+    pub root: ExpenditureRoot,
+}
+impl Vouch<'_> {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
-        w.u32(0)?;
-        w.u32(self.pid)?;
-        for id in self.credentials.words() {
-            w.u32(id)?;
-        }
-        w.u64(self.generation)?;
+        let mut words = [0u32; 19];
+        words[1] = self.pid;
+        words[2..8].copy_from_slice(&self.credentials.words());
+        let pair = |v: u64| [v as u32, (v >> 32) as u32];
+        words[8..10].copy_from_slice(&pair(self.generation));
         let (mark, image, ticket) = self.loader.map_or((0, 0, 0), |l| (1, l.image, l.ticket));
-        w.u32(mark)?;
-        w.u32(image)?;
-        w.u64(ticket)?;
-        w.u32(self.index)?;
-        w.u32(0)?;
+        words[10] = mark;
+        words[11] = image;
+        words[12..14].copy_from_slice(&pair(ticket));
+        words[14] = self.index;
         let (terminal, generation) = self.ctty.unwrap_or((u32::MAX, 0));
-        w.u32(terminal)?;
-        w.u64(generation)?;
+        words[16] = terminal;
+        words[17..19].copy_from_slice(&pair(generation));
+        for word in &mut words {
+            *word = word.to_le();
+        }
+        // SAFETY: the initialized u32 array has no padding; every word is little endian.
+        w.bytes(unsafe {
+            core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 4)
+        })?;
         w.u32(self.image)?;
         self.groups.write(w)?;
         self.limits.write(w)?;
         w.u32(self.root.pid)?;
         w.u32(self.root.generation)
     }
+}
+impl WhoReply {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        Vouch {
+            pid: self.pid,
+            credentials: self.credentials,
+            generation: self.generation,
+            loader: self.loader,
+            index: self.index,
+            ctty: self.ctty,
+            image: self.image,
+            groups: &self.groups,
+            limits: &self.limits,
+            root: self.root,
+        }
+        .write(w)
+    }
 
     /// BAD_SIZE out of the layout, for a PID of 0 or past the signed range,
     /// or a credential of -1.
     pub fn read(bytes: &[u8]) -> Result<Self, Status> {
-        let mut r = Reader::new(bytes);
-        if r.u32()? != 0 {
+        if bytes.len() != 252 {
             return Err(Status::BadSize);
         }
-        let pid = r.u32()?;
-        let mut words = [0; 6];
-        for w in &mut words {
-            *w = r.u32()?;
+        let mut wire = core::mem::MaybeUninit::<[u32; 63]>::uninit();
+        // SAFETY: exactly 252 source bytes initialize the aligned array's 63 words.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                wire.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            )
+        };
+        // SAFETY: the exact whole array was initialized by the copy above.
+        let mut wire = unsafe { wire.assume_init() };
+        for word in &mut wire {
+            *word = u32::from_le(*word);
         }
-        let generation = r.u64()?;
-        let (mark, loader_image, ticket) = (r.u32()?, r.u32()?, r.u64()?);
-        let (index, zero) = (r.u32()?, r.u32()?);
-        let (terminal, ctty_generation) = (r.u32()?, r.u64()?);
+        if wire[0] != 0 {
+            return Err(Status::BadSize);
+        }
+        let wide = |at: usize| u64::from(wire[at]) | (u64::from(wire[at + 1]) << 32);
+        let pid = wire[1];
+        let mut words = [0; 6];
+        words.copy_from_slice(&wire[2..8]);
+        let generation = wide(8);
+        let (mark, loader_image, ticket) = (wire[10], wire[11], wide(12));
+        let (index, zero) = (wire[14], wire[15]);
+        let (terminal, ctty_generation) = (wire[16], wide(17));
         let ctty = match (terminal, ctty_generation) {
             (u32::MAX, 0) => None,
             (t, g) if (t as usize) < TERMINALS && g != 0 => Some((t, g)),
             _ => return Err(Status::BadSize),
         };
-        let image = r.u32()?;
-        let groups = Groups::read(&mut r)?;
-        let limits = ResourceLimits::read(&mut r)?;
-        let root = ExpenditureRoot {
-            pid: r.u32()?,
-            generation: r.u32()?,
+        let image = wire[19];
+        let groups = Groups {
+            count: wire[20],
+            ids: wire[21..37].try_into().map_err(|_| Status::BadSize)?,
         };
-        r.finish()?;
+        if !groups.valid() {
+            return Err(Status::BadSize);
+        }
+        let limits = ResourceLimits {
+            values: core::array::from_fn(|i| Limit {
+                soft: wide(37 + 4 * i),
+                hard: wide(39 + 4 * i),
+            }),
+        };
+        if limits
+            .values
+            .iter()
+            .any(|limit| limit.soft > limit.hard || limit.hard == u64::MAX)
+        {
+            return Err(Status::BadSize);
+        }
+        let root = ExpenditureRoot {
+            pid: wire[61],
+            generation: wire[62],
+        };
         if generation == 0
             || generation & GENERATION_DEAD != 0
             || image == 0

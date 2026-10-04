@@ -2731,13 +2731,21 @@ const RAM_STEP_MAX: u64 = 20_538;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 6] = [
+const RAM_STEP_KINDS: [(usize, &str); 14] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
     (15, "Clone"),
     (17, "ReadInto"),
+    (19, "Bind"),
+    (20, "BindPending"),
+    (21, "ResolveStart"),
+    (22, "ResolveStep"),
+    (23, "ResolveCancel"),
+    (24, "ResolveSecond"),
+    (25, "FinishBinding"),
     (64, "notification"),
+    (65, "maintenance"),
 ];
 
 /// The longest heartbeat of the pipe service's loop, in ticks under
@@ -2899,6 +2907,13 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if read_into == 0 || read_into > RAM_STEP_MAX {
         return Err(format!(
             "the RAM file service: READ_INTO took {read_into} ticks, past {RAM_STEP_MAX}: {ram:?}"
+        ));
+    }
+    // Authentication admission, each proof step, effects and notified cleanup
+    // are all full service dispatches under the same unchanged term B.
+    if let Some((kind, ticks, _)) = ram.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "the RAM file service: method {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {ram:?}"
         ));
     }
     // ForkStart makes a process as SpawnStart does and stays within it

@@ -32,9 +32,17 @@ extern "C" fn files_fake_identity() -> i32 {
         return -4;
     };
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() == Ok(proto_fs::PERMISSION) {
+    let mut status = proto_wire::Reader::new(reply.bytes(&mut buffer)).u32();
+    let request = proto_fs::Method::FinishBinding.header().bytes();
+    while status == Ok(proto_fs::RESOLVING) {
+        let Ok(reply) = rt::sys::send(&channel, &request) else {
+            return -5;
+        };
+        status = proto_wire::Reader::new(reply.bytes(&mut buffer)).u32();
+    }
+    if status == Ok(proto_fs::PERMISSION) {
         0
     } else {
-        -5
+        -6
     }
 }

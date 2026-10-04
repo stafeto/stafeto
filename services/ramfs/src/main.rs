@@ -34,7 +34,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 /// then the clients', with room for the 255 records of the process
 /// service and the services beside them. The table lies in `.bss`
 /// (`SESSION_TABLE`).
-const SESSIONS: usize = 320;
+const SESSIONS: usize = ramfs::places::COUNT;
 /// Where the service maps the boot image, read-only, for as long as it
 /// lives: the files of its table are read from there.
 const IMAGE: usize = 0x50_0000_0000;
@@ -136,6 +136,7 @@ fn main(_: u64) -> u64 {
         level,
         births: &mut tables.births,
         clones: &mut tables.clones,
+        places: &tables.places,
         identities: &mut tables.identities,
         jobs: &mut tables.jobs,
         job_generations: &mut tables.job_generations,
@@ -144,7 +145,11 @@ fn main(_: u64) -> u64 {
         job_cursor: 0,
         audit_remaining: 0,
         next_audit_ns: 0,
+        maintenance_jobs: false,
     };
+    // Prepare the authentic notary page after publishing the RAM endpoint.
+    // Standalone boot profiles may have no Process service.
+    let _ = fs.notary_register();
     #[cfg(feature = "steps")]
     rt::service::report_steps(2);
     let _ = rt::service::run_in(&channel, &mut fs, config, &mut tables.sessions);
@@ -171,6 +176,7 @@ struct Fs {
     births: &'static mut [Option<(u64, Fds)>; BIRTHS],
     /// The clones alive, bounded for each client and in all.
     clones: &'static mut Clones<CLONES>,
+    places: &'static ramfs::places::Places,
     identities: &'static mut [Option<IdentityChannel>; SESSIONS],
     jobs: &'static mut [Option<ResolveJob>; ramfs::storage::PREPARATIONS],
     job_generations: &'static mut [u64; ramfs::storage::PREPARATIONS],
@@ -179,6 +185,7 @@ struct Fs {
     job_cursor: usize,
     audit_remaining: usize,
     next_audit_ns: u64,
+    maintenance_jobs: bool,
 }
 
 /// The clones the service keeps alive at most: one for each record of the
@@ -187,25 +194,37 @@ const CLONES: usize = 320;
 
 /// Clones whose sessions sent nothing yet, at most: past them, Clone is
 /// LIMIT_REACHED. A child that never touches a file keeps its birth, so
-/// there is one for each record of the process service.
-const BIRTHS: usize = 256;
+/// there is room for every record and its transient binding preparation.
+const BIRTHS: usize = CLONES;
 
 /// The tables of the sessions and of the births, in `.bss`: too big for
 /// the service's stack.
+enum Admission {
+    Unvouched,
+    Wire([u8; 252]),
+    Vouched(proto_process::WhoReply),
+}
 struct IdentityChannel {
     label: u64,
     channel: Handle<Channel>,
+    offered: Option<Handle<Channel>>,
+    previous: Option<Handle<Channel>>,
+    admission: Admission,
+    pending: bool,
+    require: bool,
 }
 struct ResolveJob {
     id: u64,
     owner: u64,
     root: u16,
     real: bool,
+    authority: Option<ramfs::authority::Stamp>,
     resolver: Resolve,
     second: Option<Resolve>,
     loader: Option<(proto_process::WhoReply, Handle<Channel>)>,
 }
 struct Tables {
+    places: ramfs::places::Places,
     clones: Clones<CLONES>,
     sessions: [Option<Session<Fds, 0>>; SESSIONS],
     births: [Option<(u64, Fds)>; BIRTHS],
@@ -217,6 +236,7 @@ struct Bss(UnsafeCell<Tables>);
 // SAFETY: only the main thread reaches it, once (`main`).
 unsafe impl Sync for Bss {}
 static TABLES: Bss = Bss(UnsafeCell::new(Tables {
+    places: ramfs::places::Places::new(),
     clones: Clones::new(),
     sessions: [const { None }; SESSIONS],
     births: [None; BIRTHS],
@@ -230,19 +250,30 @@ impl Fs {
     fn cleanup_job_step(&mut self) -> bool {
         let i = self.job_cursor;
         self.job_cursor = (i + 1) % self.jobs.len();
-        let Some(job) = self.jobs[i].take() else {
+        let Some(job) = self.jobs[i].as_ref() else {
             return false;
         };
-        let valid = if let Some((who, identity)) = &job.loader {
+        let Some((who, _)) = job.loader.as_ref() else {
+            return false;
+        };
+        if generation(who.index as usize) == who.generation {
+            return false;
+        }
+        let mut job = self.jobs[i].take().expect("loader job");
+        let valid = if let Some((who, identity)) = &mut job.loader {
             self.vouch(identity).is_some_and(|fresh| {
-                fresh.pid == who.pid
+                let valid = fresh.pid == who.pid
                     && fresh.index == who.index
                     && fresh.image == who.image
                     && fresh.root == who.root
-                    && fresh.loader == who.loader
+                    && fresh.loader == who.loader;
+                if valid {
+                    *who = fresh;
+                }
+                valid
             })
         } else {
-            true
+            false
         };
         let (id, owner) = (job.id, job.owner);
         self.jobs[i] = Some(job);
@@ -254,7 +285,10 @@ impl Fs {
     }
     /// A dead or superseded authority releases one retained reference per pass.
     fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
-        if fds.binding.snapshot().is_some() {
+        if fds.binding_preparation.is_some() {
+            return false;
+        }
+        if fds.binding.snapshot_ref().is_some() {
             let _ = self.authenticate(fds, label);
         }
         if !matches!(fds.binding, Binding::Cleanup) {
@@ -279,36 +313,43 @@ impl Fs {
 
     /// A session of the service's own with `label` for a client.
     fn session(&mut self, label: u64) -> Result<Handle<Channel>, rt::abi::Error> {
-        self.given += 1;
-        sys::handle_label(
+        let Some(next) = self.given.checked_add(1).filter(|n| *n < 1 << 46) else {
+            self.places.release(label);
+            return Err(abi::Error::LimitReached);
+        };
+        self.given = next;
+        let made = sys::handle_label(
             &self.channel,
             Rights::SEND | Rights::TRANSFER,
             label,
             self.level,
-        )
+        );
+        if made.is_err() {
+            self.places.release(label);
+        }
+        made
     }
 
-    /// OPEN_EXEC of `path` for the loader whose identity `r` brings, from
-    /// the session of the loaders (condition O1, condition O3): the process service vouches
-    /// for it, the path resolves for the effective IDs of the record it
-    /// loads in this one step, the set-ID bits go to the process service
-    /// before the reply, and the reply brings the image session.
+    /// A genuine Pending session proves its retained LoaderOf authority.
+    /// The final effect rechecks generation and path proof before SetId and
+    /// returning the image capability; no caller-supplied identity is trusted.
     fn open_exec(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
-        if !proto_fs::is_loaders(r.label()) || r.handles.len() != 1 {
+        if !r.handles.is_empty()
+            || !matches!(fds.binding, Binding::Pending(_))
+            || !self.authenticate(fds, r.label())
+        {
             return status(proto_fs::PERMISSION);
         }
         let mut body = r.body();
         let (Ok(job), Ok(())) = (body.u64(), body.finish()) else {
             return Answer::Status(Status::BadSize);
         };
-        if !self.loader_claim(job, r) {
-            return status(proto_fs::PERMISSION);
-        }
-        let (token, who) = match self.proof(job, r.label(), None) {
-            Ok((t, Some(w))) => (t, w),
+        let token = match self.proof(job, r.label(), Some(fds)) {
+            Ok((token, None)) => token,
             Ok(_) => return status(proto_fs::PERMISSION),
             Err(code) => return status(code),
         };
+        let who = fds.binding.snapshot().expect("authenticated pending image");
         let Some(loader) = who.loader else {
             return status(proto_fs::PERMISSION);
         };
@@ -523,7 +564,10 @@ impl Fs {
         if matches!(fds.binding, Binding::Boot) {
             child.binding = Binding::Boot;
         }
-        let label = proto_fs::OWN | self.given;
+        let Some(label) = self.places.issue(self.given) else {
+            self.ram.release(&mut child);
+            return status(proto_fs::TOO_MANY_OPEN_FILES);
+        };
         if let Some(who) = fds.binding.snapshot() {
             child.binding = Binding::Inherited(who);
             let identity = self.identities[fds.authority_index as usize]
@@ -537,8 +581,9 @@ impl Fs {
                 });
             let result = identity
                 .ok_or(proto_fs::PERMISSION)
-                .and_then(|identity| self.install_identity(&mut child, label, identity));
+                .and_then(|identity| self.install_identity(&mut child, label, identity, false));
             if let Err(code) = result {
+                self.places.release(label);
                 self.ram.release(&mut child);
                 return status(code);
             }
@@ -583,6 +628,7 @@ impl Service<0> for Fs {
     /// The last copy of a session Clone made went before it sent anything:
     /// the descriptors it was born with close.
     fn closed(&mut self, label: u64) {
+        self.places.release(label);
         self.clones.gone(label);
         if let Some(birth) = self
             .births
@@ -600,13 +646,30 @@ impl Service<0> for Fs {
         }
     }
 
-    fn maintenance(&mut self, sessions: &mut [Option<Session<Fds, 0>>]) {
+    fn maintenance(
+        &mut self,
+        sessions: &mut [Option<Session<Fds, 0>>],
+        notice: rt::service::Notice,
+    ) {
+        if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
+            let _ = sys::notify(&self.channel, 1);
+            return;
+        }
+        rt::service::step_own();
         let now = rt::time::ticks_to_ns(rt::time::now());
         if now >= self.next_audit_ns && self.audit_remaining == 0 {
             self.next_audit_ns = now.saturating_add(250_000_000);
             self.audit_remaining = SESSIONS + BIRTHS - 1;
         }
-        let mut work = self.ram.storage.reclaim_step() | self.cleanup_job_step();
+        let mut work = self.ram.storage.reclaim_step();
+        self.maintenance_jobs = !self.maintenance_jobs;
+        if self.maintenance_jobs {
+            work |= self.cleanup_job_step();
+            if work || self.audit_remaining != 0 {
+                let _ = sys::notify(&self.channel, 1);
+            }
+            return;
+        }
         let mut client_work = false;
         let i = self.maintenance_cursor;
         if i < SESSIONS {
@@ -629,9 +692,17 @@ impl Service<0> for Fs {
         }
     }
 
-    /// The image sessions share place 0: they hold nothing.
+    fn between_notifications(&mut self, notice: rt::service::Notice) {
+        if notice.source == rt::abi::Source::Unlabeled && notice.label == 0 {
+            // The one cursor dispatch and its statistics have ended. An own
+            // queued notice must not monopolize equal-priority FIFO services.
+            let _ = sys::yield_now();
+        }
+    }
+
+    /// Image sessions share place 0; genuine ordinary labels name exact slots.
     fn place(&self, label: u64) -> Option<usize> {
-        proto_fs::image_entry(label).map(|_| 0)
+        Some(self.places.place(label))
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
@@ -654,6 +725,17 @@ impl Service<0> for Fs {
                 s.data.binding = Binding::Cleanup;
             }
             s.data.claimed = true;
+            // Admission into the session table is one bounded phase of its own.
+            // It cannot share a receive with the Process Vouch round trip.
+            if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {
+                return status(proto_fs::RESOLVING);
+            }
+        }
+        if r.method() == Method::FinishBinding as u16 {
+            return self.finish_binding(&mut s.data, r);
+        }
+        if s.data.binding_preparation.is_some() {
+            return status(proto_fs::PERMISSION);
         }
         if r.method() == Method::Bind as u16 {
             return self.bind(&mut s.data, r);
@@ -701,7 +783,8 @@ impl Service<0> for Fs {
                 | Method::ResolveStart
                 | Method::ResolveStep
                 | Method::ResolveCancel
-                | Method::ResolveSecond,
+                | Method::ResolveSecond
+                | Method::FinishBinding,
             ) => status(proto_fs::PERMISSION),
             Some(Method::Open) => {
                 let Ok(flags) = body.u32() else {
@@ -1073,11 +1156,31 @@ impl Fs {
         let reply = sys::send_handles(notary, &request, [copy.erase()]).ok()?;
         proto_process::WhoReply::read(reply.bytes(&mut buffer)).ok()
     }
+    /// Only transport happens in this phase. Decoding the genuine Process reply
+    /// is another receive, before any identity or inode effect is committed.
+    fn vouch_wire(&mut self, identity: &Handle<Channel>) -> Option<[u8; 252]> {
+        let copy = sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER).ok()?;
+        let request = proto_process::Method::Vouch.header().bytes();
+        let reply = sys::send_handles(self.notary.as_ref()?, &request, [copy.erase()]).ok()?;
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        if bytes.len() != 252 {
+            return None;
+        }
+        let mut wire = core::mem::MaybeUninit::<[u8; 252]>::uninit();
+        // SAFETY: the exact reply initializes every byte of the separate array.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), wire.as_mut_ptr().cast::<u8>(), 252);
+        }
+        // SAFETY: all bytes were initialized by the checked copy above.
+        Some(unsafe { wire.assume_init() })
+    }
     fn install_identity(
         &mut self,
         fds: &mut Fds,
         label: u64,
         identity: Handle<Channel>,
+        retain_previous: bool,
     ) -> Result<(), u32> {
         let i = if fds.authority_index == NONE {
             self.identities
@@ -1087,9 +1190,21 @@ impl Fs {
         } else {
             fds.authority_index as usize
         };
+        let previous = self.identities[i].take().and_then(|old| {
+            if retain_previous {
+                Some(old.channel)
+            } else {
+                None
+            }
+        });
         self.identities[i] = Some(IdentityChannel {
             label,
             channel: identity,
+            offered: None,
+            previous,
+            admission: Admission::Unvouched,
+            pending: false,
+            require: false,
         });
         fds.authority_index = i as u16;
         if let Some(root) = fds.binding.root() {
@@ -1098,13 +1213,47 @@ impl Fs {
         Ok(())
     }
     fn drop_identity(&mut self, fds: &mut Fds) {
+        if let Some(root) = fds.binding_preparation.take() {
+            self.ram.storage.release_preparation(root);
+        }
+        fds.binding_source = None;
         if fds.authority_index != NONE {
             self.identities[fds.authority_index as usize] = None;
             fds.authority_index = NONE;
         }
     }
+    /// A rejected candidate restores the actual old capability and its binding.
+    fn reject_binding(&mut self, fds: &mut Fds) -> Answer {
+        let i = fds.authority_index as usize;
+        let previous = self
+            .identities
+            .get_mut(i)
+            .and_then(Option::as_mut)
+            .and_then(|identity| identity.previous.take());
+        if let Some(previous) = previous {
+            let identity = self.identities[i].as_mut().unwrap();
+            identity.channel = previous;
+            identity.admission = Admission::Unvouched;
+            identity.offered = None;
+            identity.pending = false;
+            identity.require = false;
+            if let Some(root) = fds.binding_preparation.take() {
+                self.ram.storage.release_preparation(root);
+            }
+            fds.binding_source = None;
+        } else {
+            self.drop_identity(fds);
+            fds.binding = Binding::Cleanup;
+        }
+        status(proto_fs::PERMISSION)
+    }
     fn bind(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
-        if r.body().finish().is_err() || r.handles.len() != 1 || proto_fs::is_loaders(r.label()) {
+        if r.body().finish().is_err()
+            || r.handles.len() != 1
+            || proto_fs::is_loaders(r.label())
+            || fds.binding_preparation.is_some()
+            || matches!(fds.binding, Binding::Cleanup)
+        {
             return status(proto_fs::PERMISSION);
         }
         let rights = r.handles.info(0).map(|(_, rights)| rights);
@@ -1116,15 +1265,20 @@ impl Fs {
         let Ok(identity) = r.handles.take::<Channel>(0) else {
             return status(proto_fs::PERMISSION);
         };
-        let who = self.vouch(&identity);
-        if fds.binding.bind(who, false).is_err() {
-            return status(proto_fs::PERMISSION);
-        }
-        match self.install_identity(fds, r.label(), identity) {
-            Ok(()) => Answer::Status(Status::Ok),
-            Err(code) => status(code),
+        let root = match self.ram.storage.charge_preparation(fds.root) {
+            Ok(root) => root,
+            Err(code) => return status(code),
+        };
+        fds.binding_preparation = Some(root);
+        match self.install_identity(fds, r.label(), identity, true) {
+            Ok(()) => status(proto_fs::RESOLVING),
+            Err(code) => {
+                self.drop_identity(fds);
+                status(code)
+            }
         }
     }
+
     fn authenticate(&mut self, fds: &mut Fds, label: u64) -> bool {
         if matches!(fds.binding, Binding::Unbound) && proto_fs::is_boot_profile(label) {
             fds.binding = Binding::Boot;
@@ -1169,7 +1323,7 @@ impl Fs {
             }
             return false;
         }
-        if fds.binding.bind(refreshed, pending).is_ok() {
+        if fds.binding.bind_ref(refreshed.as_ref(), pending).is_ok() {
             return true;
         }
         // A committed Pending image awaits its own authentic startup Bind.
@@ -1204,7 +1358,8 @@ impl Fs {
             return status(proto_fs::PERMISSION);
         };
         let (_, mut child) = self.births[i].take().expect("own clone");
-        child.binding = fds.binding;
+        // Verification retains creator capture; only a genuine Bind grants
+        // effects to the eventual holder of this unclaimed child capability.
         let installed = if fds.authority_index == NONE {
             Ok(())
         } else {
@@ -1219,7 +1374,7 @@ impl Fs {
                 });
             identity
                 .ok_or(proto_fs::PERMISSION)
-                .and_then(|identity| self.install_identity(&mut child, label, identity))
+                .and_then(|identity| self.install_identity(&mut child, label, identity, false))
         };
         self.births[i] = Some((label, child));
         if let Err(code) = installed {
@@ -1236,113 +1391,220 @@ impl Fs {
         if !proto_fs::is_loaders(r.label())
             || !matches!(require, Ok(0 | 1))
             || body.finish().is_err()
-            || r.handles.len() != 2
+            || !(r.handles.len() == 2 || (require == Ok(0) && r.handles.len() == 1))
         {
             return status(proto_fs::PERMISSION);
         }
-        if !r
-            .handles
-            .info(0)
-            .is_some_and(|(_, rights)| rights.contains(Rights::SEND | Rights::TRANSFER))
-            || !r.handles.info(1).is_some_and(|(_, rights)| {
-                rights.contains(Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER)
-            })
-        {
+        let offered_index = (r.handles.len() == 2).then_some(0);
+        let identity_index = usize::from(offered_index.is_some());
+        if offered_index.is_some_and(|i| {
+            !r.handles
+                .info(i)
+                .is_some_and(|(_, rights)| rights.contains(Rights::SEND | Rights::TRANSFER))
+        }) || !r.handles.info(identity_index).is_some_and(|(_, rights)| {
+            rights.contains(Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER)
+        }) {
             return status(proto_fs::PERMISSION);
         }
-        let Ok(offered) = r.handles.take::<Channel>(0) else {
+        let offered = match offered_index {
+            Some(i) => match r.handles.take::<Channel>(i) {
+                Ok(offered) => Some(offered),
+                Err(_) => return status(proto_fs::PERMISSION),
+            },
+            None => None,
+        };
+        let Ok(identity) = r.handles.take::<Channel>(identity_index) else {
             return status(proto_fs::PERMISSION);
         };
-        let Ok(identity) = r.handles.take::<Channel>(1) else {
-            return status(proto_fs::PERMISSION);
-        };
-        let Some(who) = self.vouch(&identity).filter(|w| w.loader.is_some()) else {
-            return status(proto_fs::PERMISSION);
-        };
-        let offered_label = sys::copy_label(&self.channel, &offered).ok();
-        let original = offered_label.and_then(|label| {
-            self.births
-                .iter()
-                .position(|b| b.is_some_and(|(l, _)| l == label))
-        });
-        if require == Ok(1) && original.is_none() {
-            return status(proto_fs::PERMISSION);
-        }
-        let slot = match original.or_else(|| self.births.iter().position(Option::is_none)) {
-            Some(slot) => slot,
-            None => return status(proto_fs::TOO_MANY_OPEN_FILES),
+        let Some(slot) = self.births.iter().position(Option::is_none) else {
+            return status(proto_fs::TOO_MANY_OPEN_FILES);
         };
         if self.clones.room_within(r.label(), CLONES).is_err() {
             return status(proto_fs::TOO_MANY_OPEN_FILES);
         }
-        let source = original.and_then(|i| self.births[i].take());
-        if let Some((label, mut source)) = source {
-            let mut binding = source.binding;
-            if binding.bind(Some(who), true).is_err()
-                || (source.root.id != 0 && source.root != binding.root().unwrap())
-            {
-                self.births[slot] = Some((label, source));
-                return status(proto_fs::PERMISSION);
-            }
-            let mut kept = [0; 32];
-            let mut count = 0;
-            for fd in source.numbers() {
-                kept[count] = fd;
-                count += 1;
-            }
-            let mut child = match self.ram.clone_fds(&source, &kept[..count]) {
-                Ok(child) => child,
-                Err(code) => {
-                    self.births[slot] = Some((label, source));
-                    return status(code);
-                }
-            };
-            let new_label = proto_fs::OWN | self.given;
-            let new_session = match self.session(new_label) {
-                Ok(session) => session,
-                Err(error) => {
-                    self.ram.release(&mut child);
-                    self.births[slot] = Some((label, source));
-                    return Answer::Status(Status::Kernel(error));
-                }
-            };
-            child.binding = binding;
-            // Commit the new authority on a new label. Old aliases retain no child resources.
-            child.authority_index = source.authority_index;
-            source.authority_index = NONE;
-            if let Err(code) = self.install_identity(&mut child, new_label, identity) {
-                source.authority_index = child.authority_index;
-                child.authority_index = NONE;
-                self.ram.release(&mut child);
-                self.births[slot] = Some((label, source));
-                return status(code);
-            }
-            self.ram.release(&mut source);
-            self.births[slot] = Some((new_label, child));
-            let _ = self.clones.add_within(new_label, r.label(), CLONES);
-            drop(offered);
-            if r.reply().u32(0).is_err() {
-                return Answer::Status(Status::BadSize);
-            }
-            return Answer::Reply([new_session.erase()].into());
-        }
-        drop(offered);
-        let label = proto_fs::OWN | self.given;
-        let session = match self.session(label) {
-            Ok(s) => s,
-            Err(e) => return Answer::Status(Status::Kernel(e)),
-        };
+        // Identity admission itself holds a finite preparation. Its exact root
+        // replaces the boot admission account after the separate genuine Vouch.
         let mut child = Fds::default();
-        child.binding.bind(Some(who), true).expect("vouched loader");
-        if let Err(code) = self.install_identity(&mut child, label, identity) {
+        let root = match self.ram.storage.charge_preparation(child.root) {
+            Ok(root) => root,
+            Err(code) => return status(code),
+        };
+        child.binding_preparation = Some(root);
+        let Some(label) = self.places.issue(self.given) else {
+            self.drop_identity(&mut child);
+            return status(proto_fs::TOO_MANY_OPEN_FILES);
+        };
+        let session = match self.session(label) {
+            Ok(session) => session,
+            Err(error) => {
+                self.drop_identity(&mut child);
+                return Answer::Status(Status::Kernel(error));
+            }
+        };
+        if let Err(code) = self.install_identity(&mut child, label, identity, false) {
+            self.drop_identity(&mut child);
             return status(code);
         }
+        let binding = self.identities[child.authority_index as usize]
+            .as_mut()
+            .unwrap();
+        binding.offered = offered;
+        binding.pending = true;
+        binding.require = require == Ok(1);
         self.births[slot] = Some((label, child));
         let _ = self.clones.add_within(label, r.label(), CLONES);
         if r.reply().u32(0).is_err() {
             return Answer::Status(Status::BadSize);
         }
         Answer::Reply([session.erase()].into())
+    }
+    /// Each genuine prepared capability advances at most one authentication phase.
+    fn finish_binding(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty()
+            || r.body().finish().is_err()
+            || fds.binding_preparation.is_none()
+            || fds.authority_index == NONE
+        {
+            return status(proto_fs::PERMISSION);
+        }
+        let i = fds.authority_index as usize;
+        let Some(binding) = self.identities[i].as_ref() else {
+            return status(proto_fs::PERMISSION);
+        };
+        if binding.label != r.label() {
+            return status(proto_fs::PERMISSION);
+        }
+        if matches!(binding.admission, Admission::Unvouched) {
+            if self.generations.is_none() {
+                return status(if self.notary_register() {
+                    proto_fs::RESOLVING
+                } else {
+                    proto_fs::PERMISSION
+                });
+            }
+            let identity = Handle::borrowed(binding.channel.raw());
+            let wire = self.vouch_wire(&identity);
+            let valid = wire.is_some();
+            if let Some(wire) = wire {
+                self.identities[i].as_mut().unwrap().admission = Admission::Wire(wire);
+            }
+            return if valid {
+                status(proto_fs::RESOLVING)
+            } else {
+                self.reject_binding(fds)
+            };
+        }
+        if let Admission::Wire(wire) = &binding.admission {
+            return match proto_process::WhoReply::read(wire) {
+                Ok(who) => {
+                    self.identities[i].as_mut().unwrap().admission = Admission::Vouched(who);
+                    status(proto_fs::RESOLVING)
+                }
+                Err(_) => self.reject_binding(fds),
+            };
+        }
+        let Admission::Vouched(who) = binding.admission else {
+            unreachable!()
+        };
+        if generation(who.index as usize) != who.generation {
+            self.identities[i].as_mut().unwrap().admission = Admission::Unvouched;
+            return status(proto_fs::RESOLVING);
+        }
+        let pending = binding.pending;
+        if !pending || !matches!(fds.binding, Binding::Pending(_)) {
+            let mut bound = fds.binding;
+            if bound.bind_ref(Some(&who), pending).is_err() {
+                return self.reject_binding(fds);
+            }
+            let root = bound.root().unwrap();
+            if pending {
+                let binding = self.identities[i].as_ref().unwrap();
+                let offered_label = binding
+                    .offered
+                    .as_ref()
+                    .and_then(|offered| sys::copy_label(&self.channel, offered).ok());
+                let original = offered_label.and_then(|label| {
+                    self.births
+                        .iter()
+                        .position(|b| b.is_some_and(|(l, _)| l == label))
+                });
+                if binding.require && original.is_none() {
+                    return status(proto_fs::PERMISSION);
+                }
+                if let Some(slot) = original {
+                    let source = &self.births[slot].as_ref().unwrap().1;
+                    let mut inherited = source.binding;
+                    if source.binding_preparation.is_some()
+                        || inherited.bind_ref(Some(&who), true).is_err()
+                        || (source.root.id != 0 && source.root != root)
+                    {
+                        return status(proto_fs::PERMISSION);
+                    }
+                    fds.binding_source = Some((slot as u16, offered_label.unwrap()));
+                }
+            }
+            let charge = match self
+                .ram
+                .storage
+                .reassign_preparation(fds.binding_preparation.unwrap(), root)
+            {
+                Ok(charge) => charge,
+                Err(code) => return status(code),
+            };
+            fds.binding_preparation = Some(charge);
+            fds.root = root;
+            fds.binding = bound;
+            if pending {
+                return status(proto_fs::RESOLVING);
+            }
+        }
+        if let Some((slot, label)) = fds.binding_source {
+            let Some((old_label, source)) = self.births[slot as usize].as_ref() else {
+                return status(proto_fs::PERMISSION);
+            };
+            if *old_label != label {
+                return status(proto_fs::PERMISSION);
+            }
+            let Some(creator) = source.binding.snapshot_ref() else {
+                return status(proto_fs::PERMISSION);
+            };
+            if generation(creator.index as usize) != creator.generation {
+                let (_, mut source) = self.births[slot as usize].take().unwrap();
+                let _ = self.authenticate(&mut source, label);
+                let valid = !matches!(source.binding, Binding::Cleanup);
+                self.births[slot as usize] = Some((label, source));
+                return status(if valid {
+                    proto_fs::RESOLVING
+                } else {
+                    proto_fs::PERMISSION
+                });
+            }
+            let (_, mut source) = self.births[slot as usize].take().unwrap();
+            let mut bound = source.binding;
+            if bound.bind_ref(Some(&who), true).is_err() || source.root != fds.root {
+                self.births[slot as usize] = Some((label, source));
+                return status(proto_fs::PERMISSION);
+            }
+            self.drop_identity(&mut source);
+            source.binding = bound;
+            source.authority_index = fds.authority_index;
+            source.claimed = true;
+            self.ram
+                .storage
+                .release_preparation(fds.binding_preparation.take().unwrap());
+            *fds = source;
+        } else {
+            self.ram
+                .storage
+                .release_preparation(fds.binding_preparation.take().unwrap());
+        }
+        let binding = self.identities[fds.authority_index as usize]
+            .as_mut()
+            .unwrap();
+        binding.admission = Admission::Unvouched;
+        binding.offered = None;
+        binding.previous = None;
+        Answer::Status(Status::Ok)
     }
     /// The claimant must bring the same genuine pending Loader identity.
     fn loader_claim(&mut self, id: u64, r: &mut Request<'_>) -> bool {
@@ -1352,7 +1614,13 @@ impl Fs {
         let Some((expected, _)) = self.jobs[i].as_ref().and_then(|j| j.loader.as_ref()) else {
             return false;
         };
-        let expected = *expected;
+        let expected = (
+            expected.pid,
+            expected.index,
+            expected.image,
+            expected.root,
+            expected.loader,
+        );
         if r.handles.len() != 1 {
             return false;
         }
@@ -1360,18 +1628,16 @@ impl Fs {
             return false;
         };
         let Some(who) = self.vouch(&identity).filter(|who| {
-            who.pid == expected.pid
-                && who.index == expected.index
-                && who.image == expected.image
-                && who.root == expected.root
-                && who.loader == expected.loader
+            who.pid == expected.0
+                && who.index == expected.1
+                && who.image == expected.2
+                && who.root == expected.3
+                && who.loader == expected.4
         }) else {
             return false;
         };
         let job = self.jobs[i].as_mut().expect("claimed job");
-        if Identity::of(who.credentials, who.groups, false) == job.resolver.identity {
-            job.loader.as_mut().expect("loader").0 = who;
-        }
+        job.loader.as_mut().expect("loader").0 = who;
         true
     }
     fn job_slot(&self, id: u64, owner: u64) -> Result<usize, u32> {
@@ -1506,6 +1772,7 @@ impl Fs {
                 owner: r.label(),
                 root: charge,
                 real: real != 0,
+                authority: fds.binding.stamp(),
                 resolver,
                 second: None,
                 loader,
@@ -1570,30 +1837,29 @@ impl Fs {
             Ok(i) => i,
             Err(code) => return status(code),
         };
-        let mut j = self.jobs[i].take().expect("resolve job");
-        let identity = if let Some((who, channel)) = &mut j.loader {
+        let j = self.jobs[i].as_ref().expect("resolve job");
+        let identity = if let Some((who, _)) = &j.loader {
             if generation(who.index as usize) != who.generation {
-                let Some(fresh) = self
-                    .vouch(channel)
-                    .filter(|w| w.pid == who.pid && w.image == who.image && w.loader == who.loader)
-                else {
-                    self.jobs[i] = Some(j);
-                    self.cancel_job(id, r.label(), Some(fds));
-                    return status(proto_fs::PERMISSION);
-                };
-                *who = fresh;
+                return status(proto_fs::RESOLVING);
             }
             Identity::of(who.credentials, who.groups, false)
         } else {
             fds.binding.identity(j.real).expect("authenticated")
         };
+        let j = self.jobs[i].as_mut().expect("resolve job");
+        if j.loader.is_none() && j.authority != fds.binding.stamp() {
+            j.authority = fds.binding.stamp();
+            j.resolver.invalidate();
+            if let Some(second) = j.second.as_mut() {
+                second.invalidate();
+            }
+        }
         let mut result = j.resolver.step(&mut self.ram.storage, identity);
         if matches!(result, Ok(Progress::Found(_)))
             && let Some(second) = j.second.as_mut()
         {
             result = second.step(&mut self.ram.storage, identity);
         }
-        self.jobs[i] = Some(j);
         match result {
             Ok(Progress::More) => status(proto_fs::RESOLVING),
             Ok(Progress::Found(_)) => Answer::Status(Status::Ok),
@@ -1620,10 +1886,11 @@ impl Fs {
             }
             (Identity::of(who.credentials, who.groups, false), Some(*who))
         } else {
-            (
-                fds.ok_or(proto_fs::PERMISSION)?.binding.identity(j.real)?,
-                None,
-            )
+            let fds = fds.ok_or(proto_fs::PERMISSION)?;
+            if j.authority != fds.binding.stamp() {
+                return Err(proto_fs::STALE_PROOF);
+            }
+            (fds.binding.identity(j.real)?, None)
         };
         Ok((j.resolver.proof(&self.ram.storage, identity)?, who))
     }

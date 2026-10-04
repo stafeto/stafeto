@@ -2,10 +2,14 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Version 4 of the bounded RAM file service. Numbers are little endian.
-//! Ordinary sessions first Bind with a genuine Process identity capability.
+//! Ordinary sessions first Bind with a genuine Process identity capability,
+//! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
 //! BindPending admits a real Loader identity and a genuine unclaimed clone;
 //! an unsuitable empty endpoint may be replaced when descriptors are optional.
+//! With require_fds=0 the offered endpoint may be omitted: only LoaderOf is sent.
+//! The returned fresh session holds a paid preparation; FinishBinding commits
+//! its captured references under the same authentic Pending image and generation.
 //!
 //! ResolveStart retains raw bytes and the authenticated session's base inode.
 //! Its body is base slot u32, generation u64, real_ids u32, follow_final u32,
@@ -15,14 +19,15 @@
 //! RESOLVING asks for another step. OK leaves a proof for the final operation.
 //! ResolveSecond adds base slot/generation, follow_final and another path under
 //! one job charge. Both paths retain their bases until ResolveCancel(job u64).
-//! Loader ResolveStart/Step and OpenExec carry its actual identity capability.
+//! Loader executable proofs use a fresh genuine Pending session from BindPending.
+//! Subsequent operations use that unforgeable session and recheck its generation.
 //! Traversal, metadata or credential changes invalidate proofs; STALE_PROOF
 //! requires another ResolveStep before retrying the final operation.
 //!
 //! OPEN: flags u32, proof u64. Reply: status, fd u32, optional RANDOM_DEVICE u32.
 //! LOOKUP/INFO_PATH: proof u64. Reply: status then metadata/NodeInfo.
 //! READ_DIR: index u32, proof u64. Reply: status, kind u32, name bytes.
-//! OPEN_EXEC through LOADERS: proof u64 and Loader identity; image session reply.
+//! OPEN_EXEC through a bound Pending session: proof u64; image session reply.
 //! A final path operation consumes its proof. Cancellation is always idempotent.
 //! READ/WRITE: fd u32, count u32 or bytes. Reply: status, count u32, read bytes.
 //! READ_AT/WRITE_AT add an offset u64; they preserve the description's position.
@@ -75,8 +80,7 @@ pub const NO_DATA: u32 = 306;
 pub const TOO_MANY_OPEN_FILES: u32 = 307;
 pub const ACCESS_DENIED: u32 = 308;
 pub const NOT_DIRECTORY: u32 = 309;
-/// EPERM: OPEN_EXEC through a session other than the loaders', or for an
-/// identity that is no loader's.
+/// EPERM: missing genuine Pending Loader authority or a cleanup-only session.
 pub const PERMISSION: u32 = 310;
 pub const NAME_TOO_LONG: u32 = 311;
 pub const LOOP: u32 = 312;
@@ -183,6 +187,8 @@ pub enum Method {
     ResolveCancel = 23,
     /// Add a second captured base/path to the same paid preparation.
     ResolveSecond = 24,
+    /// On a prepared genuine session: no body, no handles. RESOLVING requests another step.
+    FinishBinding = 25,
 }
 
 impl Method {
@@ -216,13 +222,14 @@ impl Method {
             22 => Some(Self::ResolveStep),
             23 => Some(Self::ResolveCancel),
             24 => Some(Self::ResolveSecond),
+            25 => Some(Self::FinishBinding),
             _ => None,
         }
     }
 }
 
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

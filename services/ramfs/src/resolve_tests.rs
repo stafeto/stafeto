@@ -357,3 +357,115 @@ fn two_path_preparation_uses_one_charge_and_two_independent_pinned_bases() {
     assert_eq!(r.storage.preparations_used(), 0);
     assert_eq!(r.storage.usage(ROOT_ACCOUNT), before);
 }
+
+#[test]
+fn lost_binding_preparation_returns_its_charge_without_dropping_creator_files() {
+    let mut r = Ram::new(0);
+    let file = create(&mut r, ROOT, b"captured", REG, 0o600);
+    let mut creator = crate::Fds {
+        root: ROOT_ACCOUNT,
+        ..crate::Fds::default()
+    };
+    let fd = r
+        .open_token(&mut creator, file, proto_fs::READ_ONLY, OWNER)
+        .unwrap();
+    let mut prepared = crate::Fds {
+        root: ROOT_ACCOUNT,
+        ..crate::Fds::default()
+    };
+    prepared.binding_preparation = Some(r.storage.charge_preparation(ROOT_ACCOUNT).unwrap());
+    prepared.binding_source = Some((7, 19));
+    assert_eq!(r.storage.preparations_used(), 1);
+    assert!(r.release_step(&mut prepared));
+    assert_eq!(r.storage.preparations_used(), 0);
+    assert_eq!(prepared.binding_source, None);
+    assert!(r.description_token(&creator, fd).is_ok());
+    assert_eq!(r.open_descriptions(), 1);
+    prepared.binding_preparation = Some(r.storage.charge_preparation(ROOT_ACCOUNT).unwrap());
+    r.release(&mut prepared);
+    assert_eq!(r.storage.preparations_used(), 0);
+    assert_eq!(r.open_descriptions(), 1);
+    r.release(&mut creator);
+    assert_eq!(r.open_descriptions(), 0);
+}
+
+#[test]
+fn preparation_root_transfer_preserves_global_charge_at_the_full_limit() {
+    let mut r = Ram::new(0);
+    let boot = crate::storage::BOOT_ROOT;
+    let other = Root {
+        id: 17,
+        generation: 3,
+    };
+    let mut first = [0; 96];
+    let mut second = [0; 32];
+    for ticket in &mut first {
+        *ticket = r.storage.charge_preparation(boot).unwrap();
+    }
+    for ticket in &mut second {
+        *ticket = r.storage.charge_preparation(other).unwrap();
+    }
+    assert_eq!(r.storage.preparations_used(), 128);
+    first[0] = r.storage.reassign_preparation(first[0], other).unwrap();
+    assert_eq!(r.storage.preparations_used(), 128);
+    assert_eq!(
+        r.storage.charge_preparation(ROOT_ACCOUNT),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    );
+    for ticket in first.into_iter().chain(second) {
+        r.storage.release_preparation(ticket);
+    }
+    assert_eq!(r.storage.preparations_used(), 0);
+    // Both zero-usage accounts become reusable, including retained generation.
+    let renewed = Root {
+        id: other.id,
+        generation: other.generation + 1,
+    };
+    let ticket = r.storage.charge_preparation(renewed).unwrap();
+    r.storage.release_preparation(ticket);
+    assert_eq!(r.storage.preparations_used(), 0);
+}
+
+#[test]
+fn preparation_root_transfer_refuses_a_full_share_without_losing_the_old_charge() {
+    let mut r = Ram::new(0);
+    let mut full = [0; 96];
+    for ticket in &mut full {
+        *ticket = r.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
+    }
+    let old = r
+        .storage
+        .charge_preparation(crate::storage::BOOT_ROOT)
+        .unwrap();
+    assert_eq!(
+        r.storage.reassign_preparation(old, ROOT_ACCOUNT),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    );
+    assert_eq!(r.storage.preparations_used(), 97);
+    r.storage.release_preparation(old);
+    for ticket in full {
+        r.storage.release_preparation(ticket);
+    }
+    assert_eq!(r.storage.preparations_used(), 0);
+}
+
+#[test]
+fn new_authentic_generation_invalidates_a_proof_with_unchanged_ids() {
+    let mut binding = Binding::Unbound;
+    let mut w = who();
+    binding.bind(Some(w), false).unwrap();
+    let stamp = binding.stamp();
+    let identity = binding.identity(false).unwrap();
+    let mut r = Ram::new(0);
+    let file = create(&mut r, ROOT, b"same-ids", REG, 0o600);
+    let mut proof = Resolve::new(&mut r.storage, b"/same-ids", ROOT, OWNER, true).unwrap();
+    assert_eq!(finish(&mut r, &mut proof, OWNER), Ok(file));
+    w.generation += 1;
+    binding.bind(Some(w), false).unwrap();
+    assert_eq!(binding.identity(false).unwrap(), identity);
+    assert_ne!(binding.stamp(), stamp);
+    proof.invalidate();
+    assert_eq!(proof.proof(&r.storage, OWNER), Err(proto_fs::STALE_PROOF));
+    assert_eq!(finish(&mut r, &mut proof, OWNER), Ok(file));
+    proof.release(&mut r.storage);
+}

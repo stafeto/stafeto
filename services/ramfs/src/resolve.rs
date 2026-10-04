@@ -87,6 +87,10 @@ impl Resolve {
         self.identity = identity;
         Ok(())
     }
+    /// A new authentic authority generation invalidates a proof even if IDs match.
+    pub fn invalidate(&mut self) {
+        self.epoch = 0;
+    }
     pub fn step(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<Progress, u32> {
         if self.epoch != storage.state.epoch || self.identity != identity {
             self.restart(storage, identity)?;

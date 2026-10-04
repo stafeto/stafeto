@@ -186,12 +186,24 @@ impl Files {
         .map_err(|e| Status::Kernel(e.error))?;
         let mut buffer = [0; MESSAGE_MAX];
         let status = Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?);
-        if status == Status::Ok {
-            Ok(())
-        } else {
-            Err(status)
+        if status != Status::Unknown(proto_fs::RESOLVING) {
+            return Err(status);
+        }
+        self.finish_binding()
+    }
+    fn finish_binding(&self) -> Result<(), Status> {
+        let request = Method::FinishBinding.header().bytes();
+        loop {
+            let reply = sys::send(&self.channel, &request).map_err(Status::Kernel)?;
+            let mut buffer = [0; MESSAGE_MAX];
+            match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+                Status::Ok => return Ok(()),
+                Status::Unknown(proto_fs::RESOLVING) => {}
+                status => return Err(status),
+            }
         }
     }
+
     fn prepare<'a>(
         &'a self,
         path: &[u8],
@@ -269,7 +281,28 @@ impl Files {
         path: &[u8],
         identity: &Handle<Channel>,
     ) -> Result<Handle<Channel>, Status> {
-        let proof = self.prepare(path, Some(identity))?;
+        let identity = sys::handle_duplicate(
+            identity,
+            abi::Rights::NOTIFY | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
+        )
+        .map_err(Status::Kernel)?;
+        let mut request = Writer::new();
+        Method::BindPending.header().write(&mut request)?;
+        request.u32(0)?;
+        let mut reply = sys::send_handles(&self.channel, request.as_bytes(), [identity.erase()])
+            .map_err(|e| Status::Kernel(e.error))?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let status = Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?);
+        if status != Status::Ok {
+            return Err(status);
+        }
+        let session = reply.handles.take::<Channel>(0).map_err(Status::Kernel)?;
+        let prepared = Self::from_sessions(session, None);
+        prepared.finish_binding()?;
+        prepared.open_exec_bound(path)
+    }
+    fn open_exec_bound(&self, path: &[u8]) -> Result<Handle<Channel>, Status> {
+        let proof = self.prepare(path, None)?;
         let mut w = Writer::new();
         Method::OpenExec.header().write(&mut w)?;
         w.u64(proof.id)?;

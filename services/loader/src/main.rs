@@ -326,6 +326,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     // The sessions the block's descriptors need (Block::needs).
     let mut needed = [false; SLOTS];
     let mut given: [Option<Handle<Channel>>; SLOTS] = Default::default();
+    let mut normalized = [false; SLOTS];
     let mut ready = false;
     let mut early_given = false;
     let mut completed = false;
@@ -593,6 +594,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         match take_given(r, &mut handles, &mut given) {
                             Ok(()) => {
                                 for slot in [Slot::Files, Slot::Clock] {
+                                    if normalized[slot as usize] {
+                                        continue;
+                                    }
                                     if let Some(offered) = given[slot as usize].take() {
                                         // Fork descriptors live in the copied layer memory.
                                         let require_fds = fork.is_some()
@@ -600,7 +604,10 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                                 .and_then(|len| Block::read(staged(len)).ok())
                                                 .is_some_and(|block| block.needs(Slot::Files));
                                         match verify_session(own, slot, offered, require_fds) {
-                                            Ok(channel) => given[slot as usize] = Some(channel),
+                                            Ok(channel) => {
+                                                given[slot as usize] = Some(channel);
+                                                normalized[slot as usize] = true;
+                                            }
                                             Err(code) => {
                                                 reply(token, code);
                                                 return None;
@@ -608,7 +615,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                         }
                                     }
                                 }
-                                if let Some(offered) = given[Slot::Terminal as usize].take() {
+                                if !normalized[Slot::Terminal as usize]
+                                    && let Some(offered) = given[Slot::Terminal as usize].take()
+                                {
                                     if trusted_terminal.is_none() {
                                         trusted_terminal = match loader_terminal(session) {
                                             Ok(terminal) => terminal,
@@ -620,7 +629,8 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                     }
                                     match verify_terminal(trusted_terminal.as_ref(), offered) {
                                         Ok(terminal) => {
-                                            given[Slot::Terminal as usize] = Some(terminal)
+                                            given[Slot::Terminal as usize] = Some(terminal);
+                                            normalized[Slot::Terminal as usize] = true;
                                         }
                                         Err(code) => {
                                             reply(token, code);
@@ -830,7 +840,19 @@ fn verify_session(
     if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
         return Err(pl::IO);
     }
-    reply.handles.take::<Channel>(0).map_err(code)
+    let session = reply.handles.take::<Channel>(0).map_err(code)?;
+    if slot == Slot::Files {
+        let request = proto_fs::Method::FinishBinding.header().bytes();
+        loop {
+            let reply = sys::send(&session, &request).map_err(code)?;
+            match Reader::new(reply.bytes(&mut buffer)).u32() {
+                Ok(0) => break,
+                Ok(proto_fs::RESOLVING) => continue,
+                _ => return Err(pl::IO),
+            }
+        }
+    }
+    Ok(session)
 }
 
 fn loader_terminal(session: &Handle<Channel>) -> Result<Option<Handle<Channel>>, u32> {

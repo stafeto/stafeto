@@ -14,6 +14,7 @@ pub const NOFILE: usize = 3;
 pub const STACK: usize = 4;
 pub const AS: usize = 5;
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Groups {
     pub count: u32,
@@ -28,6 +29,9 @@ impl Groups {
         self.ids[..self.count as usize].contains(&gid)
     }
     pub fn valid(&self) -> bool {
+        if self.count == 0 {
+            return self.ids == [0; SUPPLEMENTARY_MAX];
+        }
         self.count as usize <= SUPPLEMENTARY_MAX
             && !self.ids[..self.count as usize].contains(&u32::MAX)
             && self.ids[self.count as usize..].iter().all(|&id| id == 0)
@@ -36,11 +40,24 @@ impl Groups {
         if !self.valid() {
             return Err(Status::BadSize);
         }
-        w.u32(self.count)?;
-        for id in self.ids {
-            w.u32(id)?;
+        #[cfg(target_endian = "little")]
+        {
+            const {
+                assert!(core::mem::size_of::<Groups>() == 68);
+            }
+            // SAFETY: repr(C) has 17 initialized u32 words and no padding, in wire byte order.
+            w.bytes(unsafe {
+                core::slice::from_raw_parts(core::ptr::from_ref(self).cast::<u8>(), 68)
+            })
         }
-        Ok(())
+        #[cfg(target_endian = "big")]
+        {
+            w.u32(self.count)?;
+            for id in self.ids {
+                w.u32(id)?;
+            }
+            Ok(())
+        }
     }
     pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
         let count = r.u32()?;
@@ -55,11 +72,13 @@ impl Groups {
         Ok(groups)
     }
 }
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limit {
     pub soft: u64,
     pub hard: u64,
 }
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub values: [Limit; LIMITS],
@@ -83,14 +102,31 @@ impl ResourceLimits {
         Self { values }
     }
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
-        for l in self.values {
-            if l.soft > l.hard || l.hard == u64::MAX {
-                return Err(Status::BadSize);
-            }
-            w.u64(l.soft)?;
-            w.u64(l.hard)?;
+        if self
+            .values
+            .iter()
+            .any(|l| l.soft > l.hard || l.hard == u64::MAX)
+        {
+            return Err(Status::BadSize);
         }
-        Ok(())
+        #[cfg(target_endian = "little")]
+        {
+            const {
+                assert!(core::mem::size_of::<ResourceLimits>() == 96);
+            }
+            // SAFETY: repr(C) consists of 12 initialized u64 fields and no padding, in wire byte order.
+            w.bytes(unsafe {
+                core::slice::from_raw_parts(core::ptr::from_ref(self).cast::<u8>(), 96)
+            })
+        }
+        #[cfg(target_endian = "big")]
+        {
+            for l in self.values {
+                w.u64(l.soft)?;
+                w.u64(l.hard)?;
+            }
+            Ok(())
+        }
     }
     pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
         let mut values = [Limit { soft: 0, hard: 0 }; LIMITS];

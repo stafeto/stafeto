@@ -6,6 +6,11 @@
 use crate::storage::{Node, Root};
 use proto_process::{Credentials, Groups, WhoReply};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub generation: u64,
+    pub image: u32,
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Binding {
     #[default]
@@ -18,7 +23,10 @@ pub enum Binding {
     Cleanup,
 }
 impl Binding {
-    pub fn bind(&mut self, vouched: Option<WhoReply>, pending: bool) -> Result<WhoReply, u32> {
+    pub fn bind(&mut self, vouched: Option<WhoReply>, pending: bool) -> Result<(), u32> {
+        self.bind_ref(vouched.as_ref(), pending)
+    }
+    pub fn bind_ref(&mut self, vouched: Option<&WhoReply>, pending: bool) -> Result<(), u32> {
         let who = vouched.ok_or(proto_fs::PERMISSION)?;
         if who.generation == 0
             || who.generation & proto_process::GENERATION_DEAD != 0
@@ -38,7 +46,7 @@ impl Binding {
         if pending != who.loader.is_some() {
             return Err(proto_fs::PERMISSION);
         }
-        if let Self::Active(old) | Self::Pending(old) = *self {
+        if let Self::Active(old) | Self::Pending(old) = self {
             if old.pid != who.pid
                 || old.index != who.index
                 || old.image != who.image
@@ -50,7 +58,7 @@ impl Binding {
                 return Err(proto_fs::PERMISSION);
             }
         }
-        if let Self::Inherited(old) = *self
+        if let Self::Inherited(old) = self
             && old.root != who.root
         {
             return Err(proto_fs::PERMISSION);
@@ -59,27 +67,36 @@ impl Binding {
             return Err(proto_fs::PERMISSION);
         }
         *self = if pending {
-            Self::Pending(who)
+            Self::Pending(*who)
         } else {
-            Self::Active(who)
+            Self::Active(*who)
         };
-        Ok(who)
+        Ok(())
     }
     pub fn snapshot(&self) -> Option<WhoReply> {
-        match *self {
+        self.snapshot_ref().copied()
+    }
+    pub fn snapshot_ref(&self) -> Option<&WhoReply> {
+        match self {
             Self::Active(w) | Self::Pending(w) | Self::Inherited(w) => Some(w),
             _ => None,
         }
+    }
+    pub fn stamp(&self) -> Option<Stamp> {
+        self.snapshot_ref().map(|who| Stamp {
+            generation: who.generation,
+            image: who.image,
+        })
     }
     pub fn valid(&self, generation: u64) -> bool {
         matches!(*self, Self::Boot)
             || (!matches!(*self, Self::Inherited(_))
                 && self
-                    .snapshot()
+                    .snapshot_ref()
                     .is_some_and(|who| who.generation == generation && generation != 0))
     }
     pub fn root(&self) -> Option<Root> {
-        self.snapshot().map(|who| Root {
+        self.snapshot_ref().map(|who| Root {
             id: u64::from(who.root.pid),
             generation: u64::from(who.root.generation),
         })
@@ -95,7 +112,7 @@ impl Binding {
         if matches!(self, Self::Inherited(_)) {
             return Err(proto_fs::PERMISSION);
         }
-        let who = self.snapshot().ok_or(proto_fs::PERMISSION)?;
+        let who = self.snapshot_ref().ok_or(proto_fs::PERMISSION)?;
         Ok(Identity::of(who.credentials, who.groups, real))
     }
 }

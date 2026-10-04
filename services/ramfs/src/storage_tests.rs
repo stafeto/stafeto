@@ -332,3 +332,42 @@ fn live_descriptions_cwd_and_generation_use_the_services_actual_backend() {
     ram.release(&mut child);
     assert_eq!(ram.storage.node(ROOT).unwrap().pins[Pin::Cwd as usize], 0);
 }
+
+#[test]
+fn boot_copy_preserves_unaligned_offsets_destinations_and_short_tails() {
+    use bootimg::rootfs::{Entry, REGULAR};
+    let expected: std::vec::Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+    let table = bootimg::rootfs::write::rootfs(
+        &[Entry {
+            path: "/copy",
+            mode: REGULAR | 0o644,
+            uid: 1,
+            gid: 2,
+            file: 1,
+        }],
+        3,
+    )
+    .unwrap();
+    let image =
+        bootimg::write::image(&[("init", b"init"), ("copy", &expected), ("rootfs", &table)])
+            .unwrap();
+    let mut index = crate::tree::Index::new();
+    let tree = crate::tree::load(&image, &mut index).unwrap();
+    let ram = Ram::with_tree(0, tree);
+    let token = ram.storage.resolve(b"/copy").unwrap();
+    for offset in 0..8 {
+        for destination in 0..8 {
+            let mut out = [0x55; 256];
+            let count = ram
+                .storage
+                .read(token, offset as u64, &mut out[destination..])
+                .unwrap();
+            assert_eq!(
+                &out[destination..destination + count],
+                &expected[offset..offset + count]
+            );
+            assert!(out[..destination].iter().all(|b| *b == 0x55));
+            assert!(out[destination + count..].iter().all(|b| *b == 0x55));
+        }
+    }
+}

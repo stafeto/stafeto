@@ -19,9 +19,10 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 40,
         ceiling: 40,
-        // 4096 data pages + 603 table pages + 25 code/rodata pages
-        // + 12 stack pages + 128 reserve pages, measured with the RAM image.
-        quota: (4096 + 603 + 25 + 12 + 128) * PAGE,
+        // 4096 data pages + 650 metadata/PT_LOAD data pages + 27 code/rodata
+        // pages (26 ordinary, 27 instrumented) + 12 stack + 128 reserve,
+        // measured from RAM ELF segments and the printed table byte count.
+        quota: (4096 + 650 + 27 + 12 + 128) * PAGE,
         handle_limit: 512,
         restart: Restart::Never,
         console: true,

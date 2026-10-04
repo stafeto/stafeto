@@ -64,6 +64,20 @@ impl Generations {
         }
     }
 
+    /// Invalidate cached authority while retaining a retired record's death mark.
+    pub fn invalidate(&self, index: usize) {
+        if let Some(w) = self.word(index) {
+            let old = w.load(Ordering::Relaxed);
+            let next = (old & !proto_process::GENERATION_DEAD)
+                .checked_add(1)
+                .unwrap_or(proto_process::GENERATION_DEAD);
+            w.store(
+                next | (old & proto_process::GENERATION_DEAD),
+                Ordering::Release,
+            );
+        }
+    }
+
     pub fn retire(&self, index: usize) {
         if let Some(w) = self.word(index) {
             w.fetch_or(proto_process::GENERATION_DEAD, Ordering::Release);

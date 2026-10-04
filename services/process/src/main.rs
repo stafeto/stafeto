@@ -826,7 +826,7 @@ impl Processes {
             return refuse(proto_process::PERMISSION);
         };
         let record = self.records.get(index).expect("a vouched record");
-        let who = proto_process::WhoReply {
+        let who = proto_process::Vouch {
             pid: record.label.pid(),
             credentials: record.credentials,
             generation: self.generations.get(index),
@@ -834,8 +834,8 @@ impl Processes {
             index: index as u32,
             ctty: record.ctty,
             image: loader.map_or(record.image, |l| l.image),
-            groups: record.groups,
-            limits: record.limits,
+            groups: &record.groups,
+            limits: &record.limits,
             root: record.root,
         };
         if who.write(r.reply()).is_err() {
@@ -2095,6 +2095,7 @@ impl Processes {
     /// `status`. The record goes with the end of its process.
     fn abort_load(&mut self, child: usize, status: Status) {
         if let Some(place) = self.loaders.free(child) {
+            self.generations.invalidate(child);
             if let Some(start) = place.held.start {
                 let _ = start.answer(&proto_wire::reply(status), Outgoing::new());
             }
@@ -2240,7 +2241,10 @@ impl Processes {
             return Answer::Status(Status::BadSize);
         }
         match self.loaders.loaded(child) {
-            Ok(()) => Answer::Status(Status::Ok),
+            Ok(()) => {
+                self.generations.invalidate(child);
+                Answer::Status(Status::Ok)
+            }
             Err(loaders::Refused) => Answer::Status(Status::Kernel(abi::Error::BadState)),
         }
     }
@@ -2286,6 +2290,7 @@ impl Processes {
             return Answer::Status(Status::BadSize);
         }
         self.loaders.free(child);
+        self.generations.invalidate(child);
         Answer::Reply(handles)
     }
 

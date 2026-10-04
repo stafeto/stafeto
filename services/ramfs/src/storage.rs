@@ -25,17 +25,7 @@ pub const NONE: u16 = u16::MAX;
 pub const SYMLINK: u32 = 5;
 
 pub fn canonical(tree: &Tree<'_>, n: u16) -> u16 {
-    let file = crate::image_file(tree, n);
-    if file.is_device() || file.is_directory() {
-        return n;
-    }
-    let entry = tree.entry(n);
-    (0..tree.len())
-        .find(|&i| {
-            let e = tree.entry(i);
-            e.file == entry.file && !e.is_directory() && !crate::image_file(tree, i).is_device()
-        })
-        .unwrap_or(n)
+    tree.canonical(n)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -728,6 +718,20 @@ impl<'a> Storage<'a> {
         self.state.preparation_used += 1;
         Ok(a as u16)
     }
+    /// Move the one existing charge after authenticating its actual expenditure root.
+    pub fn reassign_preparation(&mut self, old: u16, root: Root) -> Result<u16, u32> {
+        if self.state.accounts[old as usize].unwrap().key == root {
+            return Ok(old);
+        }
+        let new = self.account(root)?;
+        if self.state.accounts[new].unwrap().pending == PREPARATION_SHARE {
+            return Err(proto_fs::TOO_MANY_OPEN_FILES);
+        }
+        self.state.accounts[new].as_mut().unwrap().pending += 1;
+        self.release_preparation(old);
+        self.state.preparation_used += 1;
+        Ok(new as u16)
+    }
     pub fn release_preparation(&mut self, root: u16) {
         let a = self.state.accounts[root as usize]
             .as_mut()
@@ -857,18 +861,56 @@ impl<'a> Storage<'a> {
         let n = self.node(token)?;
         let count = out.len().min(n.length.saturating_sub(offset) as usize);
         let boot = self.boot_bytes(token);
-        for (i, b) in out[..count].iter_mut().enumerate() {
-            let at = offset as usize + i;
+        if n.overlay == NONE && offset <= boot.len() as u64 && count <= boot.len() - offset as usize
+        {
+            let bytes = &boot[offset as usize..offset as usize + count];
+            #[cfg(not(target_arch = "aarch64"))]
+            let copied = 0;
+            #[cfg(target_arch = "aarch64")]
+            let mut copied = 0;
+            #[cfg(target_arch = "aarch64")]
+            while copied + 32 <= count {
+                // SAFETY: every scalar word pair stays inside both checked slices.
+                // AArch64 normal-memory loads/stores support unaligned addresses;
+                // output cannot alias the immutable boot mapping. This avoids the
+                // freestanding byte-copy builtin at opt-level="s", without SIMD.
+                unsafe {
+                    core::arch::asm!(
+                        "ldp {a}, {b}, [{source}]",
+                        "ldp {c}, {d}, [{source}, #16]",
+                        "stp {a}, {b}, [{destination}]",
+                        "stp {c}, {d}, [{destination}, #16]",
+                        source = in(reg) bytes.as_ptr().add(copied),
+                        destination = in(reg) out.as_mut_ptr().add(copied),
+                        a = out(reg) _, b = out(reg) _, c = out(reg) _, d = out(reg) _,
+                        options(nostack, preserves_flags),
+                    );
+                }
+                copied += 32;
+            }
+            out[copied..count].copy_from_slice(&bytes[copied..]);
+            return Ok(count);
+        }
+        let mut copied = 0;
+        while copied < count {
+            let at = offset as usize + copied;
+            let amount = (PAGE - at % PAGE).min(count - copied);
             let p = if n.overlay == NONE {
                 NONE
             } else {
                 self.state.overlays[n.overlay as usize].pages[at / PAGE]
             };
-            *b = if p == NONE {
-                boot.get(at).copied().unwrap_or(0)
+            let chunk = &mut out[copied..copied + amount];
+            if p == NONE {
+                let available = boot.len().saturating_sub(at).min(amount);
+                chunk[..available]
+                    .copy_from_slice(&boot[at.min(boot.len())..at.min(boot.len()) + available]);
+                chunk[available..].fill(0);
             } else {
-                self.data[p as usize * PAGE + at % PAGE]
-            };
+                let start = p as usize * PAGE + at % PAGE;
+                chunk.copy_from_slice(&self.data[start..start + amount]);
+            }
+            copied += amount;
         }
         Ok(count)
     }
