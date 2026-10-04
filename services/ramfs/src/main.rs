@@ -37,7 +37,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 30, 31, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// The sessions: one place the image sessions share (they hold nothing),
 /// then the clients', with room for the 255 records of the process
@@ -882,6 +882,7 @@ impl Service<0> for Fs {
                     | Method::OpenStart
                     | Method::OpenPrepare
                     | Method::OpenCommit
+                    | Method::OpenFinish
                     | Method::OpenCancel
                     | Method::OpenQuery
             )
@@ -922,6 +923,7 @@ impl Service<0> for Fs {
                 | Method::OpenStart
                 | Method::OpenPrepare
                 | Method::OpenCommit
+                | Method::OpenFinish
                 | Method::OpenCancel
                 | Method::OpenQuery,
             ) => status(proto_fs::PERMISSION),
@@ -2073,7 +2075,7 @@ impl Fs {
         }
         if matches!(
             Method::from_number(r.method()),
-            Some(Method::OpenCancel | Method::OpenQuery)
+            Some(Method::OpenCancel | Method::OpenQuery | Method::OpenFinish)
         ) {
             let mut body = r.body();
             let (Ok(slot), Ok(generation), Ok(())) = (body.u32(), body.u64(), body.finish()) else {
@@ -2091,9 +2093,20 @@ impl Fs {
                 if r.method() == Method::OpenCancel as u16 {
                     let watermark = &mut fds.open_watermarks[key.slot as usize];
                     *watermark = (*watermark).max(key.generation);
-                    return Answer::Status(Status::Ok);
+                    return match self.ram.cancel_finished_open(fds, key) {
+                        Ok(()) => Answer::Status(Status::Ok),
+                        Err(code) => status(code),
+                    };
                 }
-                return status(proto_fs::OPEN_RETIRED);
+                if let Err(code) = self.authenticate(fds, r.label()) {
+                    return status(code);
+                }
+                return match self.ram.finished_open(fds, key) {
+                    Ok(held) => {
+                        Self::finished_reply(r, held, r.method() == Method::OpenQuery as u16)
+                    }
+                    Err(code) => status(code),
+                };
             };
             let j = self.jobs[i].as_ref().expect("exact client key");
             let id = j.id;
@@ -2105,6 +2118,40 @@ impl Fs {
                 return status(code);
             }
             let j = self.jobs[i].as_ref().expect("retained query job");
+            if !fds.resolvers.contains(&id)
+                || j.real
+                || j.second.is_some()
+                || j.authority.map(|stamp| stamp.image)
+                    != fds.binding.stamp().map(|stamp| stamp.image)
+            {
+                return status(proto_fs::OPEN_RETIRED);
+            }
+            if r.method() == Method::OpenFinish as u16 {
+                let OpenPhase::Committed { held, .. } = j.open.as_ref().expect("keyed Open").phase
+                else {
+                    return status(proto_fs::RESOLVING);
+                };
+                if let Err(code) = self.ram.validate_tentative(fds, held) {
+                    return status(code);
+                }
+                // Preflight the fixed response before transferring the descriptor reference.
+                if matches!(Self::finished_reply(r, held, false), Answer::Status(_)) {
+                    return Answer::Status(Status::BadSize);
+                }
+                if let Err(code) = self.ram.finish_open(fds, key, held) {
+                    return status(code);
+                }
+                let completed = self.jobs[i].take().expect("finished paid Open");
+                completed.resolver.release(&mut self.ram.storage);
+                if completed.root != NONE {
+                    self.ram.storage.release_preparation(completed.root);
+                }
+                *fds.resolvers
+                    .iter_mut()
+                    .find(|slot| **slot == id)
+                    .expect("owned finished slot") = 0;
+                return Answer::Reply(Outgoing::new());
+            }
             let phase = match j.open.as_ref().expect("keyed Open").phase {
                 OpenPhase::Resolving => 0,
                 OpenPhase::Reserved(_) => 1,
@@ -2382,6 +2429,26 @@ impl Fs {
         }
     }
     /// Every effect and cached result is gated by the exact job and current binding stamp.
+    fn finished_reply(r: &mut Request<'_>, held: ramfs::TentativeOpen, query: bool) -> Answer {
+        let w = r.reply();
+        let result = if query {
+            w.u32(0)
+                .and_then(|()| w.u32(5))
+                .and_then(|()| w.u64(0))
+                .and_then(|()| w.u32(held.fd))
+                .and_then(|()| w.u32(0))
+                .and_then(|()| w.u64(held.description.generation))
+        } else {
+            w.u32(0)
+                .and_then(|()| w.u32(held.fd))
+                .and_then(|()| w.u64(held.description.generation))
+        };
+        if result.is_err() {
+            Answer::Status(Status::BadSize)
+        } else {
+            Answer::Reply(Outgoing::new())
+        }
+    }
     fn open_stage(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         let (Ok(id), Ok(())) = (body.u64(), body.finish()) else {

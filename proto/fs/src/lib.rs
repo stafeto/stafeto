@@ -40,6 +40,10 @@
 //! descriptor resources in separate steps; RESOLVING continues preparation.
 //! OpenCommit(job u64) commits the file effect once and returns the hidden fd
 //! u32 plus its description generation u64. Replays return the exact held result.
+//! OpenFinish(client key) publishes its exact descriptor and releases the paid job.
+//! Query active phases0..4 reply status0/phase/jobID (16 bytes). Finished phase5
+//! replies status0/5/jobID0/fd/reserved0/description generation (32 bytes).
+//! Close retains a tombstone; a replaced receipt returns terminal OPEN_RETIRED.
 //! ResolveCancel releases the job and hidden descriptor; committed file effects
 //! remain observable. Ordinary descriptor APIs and Clone exclude the hidden fd.
 //!
@@ -78,7 +82,7 @@ pub use info::NodeInfo;
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
-pub const VERSION: u16 = 7;
+pub const VERSION: u16 = 8;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -128,6 +132,8 @@ pub const READ_ONLY_FILESYSTEM: u32 = 317;
 pub const TEXT_BUSY: u32 = 318;
 /// The former operation may have completed; a fresh pathname retry is forbidden.
 pub const OPEN_RETIRED: u32 = 319;
+/// The implementation regular-file capacity was reached (EFBIG).
+pub const FILE_TOO_LARGE: u32 = 320;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -251,6 +257,8 @@ pub enum Method {
     OpenPrepare = 27,
     /// Paid job u64. Commit once; reply fd u32 and description generation u64.
     OpenCommit = 28,
+    /// Client key slot u32/generation u64. Publish the exact committed descriptor once.
+    OpenFinish = 29,
     /// Client key slot u32/generation u64. Release exact ownership; effects persist.
     OpenCancel = 30,
     /// Client key slot u32/generation u64. Find the original paid operation.
@@ -292,6 +300,7 @@ impl Method {
             26 => Some(Self::OpenStart),
             27 => Some(Self::OpenPrepare),
             28 => Some(Self::OpenCommit),
+            29 => Some(Self::OpenFinish),
             30 => Some(Self::OpenCancel),
             31 => Some(Self::OpenQuery),
             _ => None,
@@ -301,7 +310,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 30, 31,
+    27, 28, 29, 30, 31,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
@@ -337,7 +346,7 @@ mod tests {
 
     #[test]
     fn every_method_number_round_trips_and_is_listed() {
-        for number in 0..=23u16 {
+        for number in 0..=31u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(method) = method {

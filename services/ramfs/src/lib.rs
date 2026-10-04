@@ -217,6 +217,8 @@ pub struct Fds {
     pub auth_probe_gc_reservation: Option<storage::Reservation>,
     pub resolvers: [u64; 16],
     pub open_watermarks: [u64; OPEN_MAX],
+    /// Exact completed operations survive Close as tombstones until this fd is reused.
+    open_receipts: [OpenReceipt; OPEN_MAX],
     pub root: storage::Root,
     pub cwd: Option<Token>,
     preparations: [Option<storage::Reservation>; 16],
@@ -241,6 +243,7 @@ impl Default for Fds {
             auth_probe_gc_reservation: None,
             resolvers: [0; 16],
             open_watermarks: [0; OPEN_MAX],
+            open_receipts: [OpenReceipt::EMPTY; OPEN_MAX],
             root: BOOT_ROOT,
             cwd: None,
             preparations: [None; 16],
@@ -298,6 +301,26 @@ impl Fds {
 pub struct TentativeOpen {
     pub fd: u32,
     pub description: Token,
+}
+
+/// A completed operation owns the precise description in one session slot.
+#[derive(Clone, Copy)]
+struct OpenReceipt {
+    key: proto_fs::OpenKey,
+    description: Token,
+}
+const _: () = assert!(core::mem::size_of::<OpenReceipt>() == 32);
+impl OpenReceipt {
+    const EMPTY: Self = Self {
+        key: proto_fs::OpenKey {
+            slot: 0,
+            generation: 0,
+        },
+        description: Token {
+            slot: 0,
+            generation: 0,
+        },
+    };
 }
 
 /// An open description and the descriptors of all sessions that name it.
@@ -617,6 +640,65 @@ impl<'a> Ram<'a> {
         fds.tentative &= !(1 << slot);
         Ok(held.fd)
     }
+    /// The caller validates the exact committed paid job before this handoff.
+    /// Receipt storage and the descriptor reference are already paid.
+    pub fn finish_open(
+        &mut self,
+        fds: &mut Fds,
+        key: proto_fs::OpenKey,
+        held: TentativeOpen,
+    ) -> Result<TentativeOpen, u32> {
+        key.validate()?;
+        if fds.open_receipts.iter().any(|receipt| receipt.key == key) {
+            let previous = self.finished_open(fds, key)?;
+            if previous != held {
+                return Err(proto_fs::PERMISSION);
+            }
+            return Ok(previous);
+        }
+        let slot = self.tentative_slot(fds, held)?;
+        // Exact validation completes before the nonfallible publication.
+        fds.open_receipts[slot] = OpenReceipt {
+            key,
+            description: held.description,
+        };
+        fds.tentative &= !(1 << slot);
+        Ok(held)
+    }
+    /// Recover a completed outcome only while this session still owns its reference.
+    pub fn finished_open(&self, fds: &Fds, key: proto_fs::OpenKey) -> Result<TentativeOpen, u32> {
+        key.validate()?;
+        let slot = fds
+            .open_receipts
+            .iter()
+            .position(|receipt| receipt.key == key)
+            .ok_or(proto_fs::OPEN_RETIRED)?;
+        let receipt = fds.open_receipts[slot];
+        if fds.tentative & (1 << slot) != 0
+            || fds.slots[slot] != u8::try_from(receipt.description.slot).ok()
+            || !self.descriptions[receipt.description.slot as usize]
+                .is_some_and(|shared| shared.generation == receipt.description.generation)
+        {
+            return Err(proto_fs::OPEN_RETIRED);
+        }
+        Ok(TentativeOpen {
+            fd: slot as u32 + 3,
+            description: receipt.description,
+        })
+    }
+    /// Cancel owns a description generation; an old key leaves reused fds intact.
+    pub fn cancel_finished_open(
+        &mut self,
+        fds: &mut Fds,
+        key: proto_fs::OpenKey,
+    ) -> Result<(), u32> {
+        match self.finished_open(fds, key) {
+            Ok(held) => self.close(fds, held.fd),
+            Err(proto_fs::OPEN_RETIRED) => Ok(()),
+            Err(code) => Err(code),
+        }
+    }
+
     pub fn cancel_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<(), u32> {
         let slot = self.tentative_slot(fds, held)?;
         fds.tentative &= !(1 << slot);

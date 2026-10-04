@@ -104,6 +104,13 @@ pub struct PreparedOpen {
     pub generation: u64,
 }
 
+/// Recovery separates a live paid preparation from its completed descriptor handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenOutcome {
+    Active { job: u64, phase: u32 },
+    Finished(PreparedOpen),
+}
+
 pub struct Files {
     channel: Handle<Channel>,
     uart: Option<Handle<Channel>>,
@@ -203,19 +210,42 @@ impl Files {
         Ok(())
     }
     /// Recover the paid job after the original Start reply was unavailable.
-    pub fn open_query(&self, key: proto_fs::OpenKey) -> Result<(u64, u32), Status> {
+    pub fn open_query(&self, key: proto_fs::OpenKey) -> Result<OpenOutcome, Status> {
         let mut w = Writer::new();
         Method::OpenQuery.header().write(&mut w)?;
         w.u32(key.slot)?;
         w.u64(key.generation)?;
         let reply = Self::send_on(&self.channel, w.as_bytes())?;
-        Self::open_reply(&reply, 16)?;
+        Self::open_query_reply(&reply)
+    }
+    pub fn open_query_reply(reply: &crate::sys::Reply) -> Result<OpenOutcome, Status> {
         let phase = (reply.words[0] >> 32) as u32;
+        if phase == 5 {
+            Self::open_reply(reply, 32)?;
+            if reply.words[1] != 0 || reply.words[2] >> 32 != 0 {
+                return Err(Status::BadSize);
+            }
+            let result = Self::open_description(reply.words[2] as u32, reply.words[3])?;
+            return Ok(OpenOutcome::Finished(result));
+        }
+        Self::open_reply(reply, 16)?;
         if phase > 4 {
             return Err(Status::BadSize);
         }
         Self::open_job_id(reply.words[1])?;
-        Ok((reply.words[1], phase))
+        Ok(OpenOutcome::Active {
+            job: reply.words[1],
+            phase,
+        })
+    }
+    /// The resident caller captures expected fd/generation before sending this handoff.
+    pub fn open_finish(&self, key: proto_fs::OpenKey) -> Result<PreparedOpen, Status> {
+        let mut w = Writer::new();
+        Method::OpenFinish.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_commit_reply(&reply)
     }
     /// Cleanup uses the client key even before its server job ID was decoded.
     pub fn open_cancel_key(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
@@ -274,8 +304,9 @@ impl Files {
     /// Successful wire shape must describe a real server descriptor lifetime.
     pub fn open_commit_reply(reply: &crate::sys::Reply) -> Result<PreparedOpen, Status> {
         Self::open_reply(reply, 16)?;
-        let fd = (reply.words[0] >> 32) as u32;
-        let generation = reply.words[1];
+        Self::open_description((reply.words[0] >> 32) as u32, reply.words[1])
+    }
+    fn open_description(fd: u32, generation: u64) -> Result<PreparedOpen, Status> {
         if !(3..35).contains(&fd) || generation == 0 {
             return Err(Status::BadSize);
         }
