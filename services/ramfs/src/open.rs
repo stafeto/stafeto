@@ -169,6 +169,10 @@ impl Journal {
             }
             if self.flags & proto_fs::TRUNCATE != 0 && node.kind == REG {
                 ram.storage.truncate_zero(target, now)?;
+                ram.storage
+                    .node_mut(target)
+                    .expect("retained truncate target")
+                    .mode &= !(crate::SET_UID | crate::SET_GID);
                 Effect::Truncated
             } else {
                 Effect::None
@@ -401,6 +405,7 @@ mod tests {
         let mut fds = fds();
         let token = create(&mut ram, b"truncate");
         ram.storage.write(token, ROOT_ACCOUNT, 0, b"old").unwrap();
+        ram.storage.node_mut(token).unwrap().mode = 0o6600;
         let flags = proto_fs::READ_WRITE | proto_fs::TRUNCATE;
         let resolver = ready(&mut ram, b"/truncate", flags);
         let mut charge = ram.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
@@ -448,6 +453,7 @@ mod tests {
             21,
         )
         .unwrap();
+        assert_eq!(ram.storage.node(token).unwrap().mode, 0o600);
         ram.storage.write(token, ROOT_ACCOUNT, 0, b"new").unwrap();
         assert_eq!(
             journal.commit(&mut ram, &mut fds, None, OWNER, &mut charge, 22),
