@@ -228,8 +228,8 @@ pub const SPAWN_FLAGS: u32 =
 
 /// Records of the service at most: PID = index + RECORDS * generation.
 pub const RECORDS: usize = 256;
-/// Generations of a record run from 1 to this and wrap to 1, so that a
-/// PID stays a positive i32.
+/// Generations of a record run from 1 to this. Exhausted indices retire,
+/// so a PID stays a positive i32 and an old endpoint never names a new record.
 pub const GENERATION_MAX: u32 = (1 << 23) - 1;
 /// The parent PID of a record that init created, and of an orphan: the
 /// service itself, the system process that adopts them.
@@ -361,12 +361,12 @@ impl Label {
         self.index as u32 + RECORDS as u32 * self.generation
     }
 
-    /// The generation after `generation`, from 1 to GENERATION_MAX.
-    pub const fn next_generation(generation: u32) -> u32 {
+    /// The next generation, or exhaustion before another endpoint is issued.
+    pub const fn next_generation(generation: u32) -> Option<u32> {
         if generation >= GENERATION_MAX {
-            1
+            None
         } else {
-            generation + 1
+            Some(generation + 1)
         }
     }
 }
@@ -1395,8 +1395,12 @@ mod tests {
         };
         assert_eq!(Label::from_raw(last.raw()), Some(last));
         assert!(i32::try_from(last.pid()).is_ok());
-        assert_eq!(Label::next_generation(GENERATION_MAX), 1);
-        assert_eq!(Label::next_generation(1), 2);
+        assert_eq!(Label::next_generation(GENERATION_MAX), None);
+        assert_eq!(
+            Label::next_generation(GENERATION_MAX - 1),
+            Some(GENERATION_MAX)
+        );
+        assert_eq!(Label::next_generation(1), Some(2));
     }
 
     #[test]

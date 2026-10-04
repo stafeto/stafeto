@@ -247,8 +247,8 @@ impl<P> Records<P> {
         self.records.get_mut(index)?.as_mut()
     }
 
-    /// The places taken: the live records, and the places held for a
-    /// group or a session whose number is still used.
+    /// The unavailable places: records, live group/session numbers and
+    /// permanently retired indices whose label generation is exhausted.
     pub fn count(&self) -> usize {
         RECORDS - self.free_len
     }
@@ -259,7 +259,7 @@ impl<P> Records<P> {
         let index = *self.free[..self.free_len].last()?;
         Some(Label {
             index,
-            generation: Label::next_generation(self.generations[usize::from(index)]),
+            generation: Label::next_generation(self.generations[usize::from(index)])?,
         })
     }
 
@@ -420,6 +420,9 @@ impl<P> Records<P> {
     fn settle(&mut self, index: usize) {
         if self.records[index].is_none() && self.numbers[index].unused() && !self.listed[index] {
             self.orphaned.remove(index);
+            if Label::next_generation(self.generations[index]).is_none() {
+                return;
+            }
             self.listed[index] = true;
             self.free[self.free_len] = index as u16;
             self.free_len += 1;
@@ -983,6 +986,28 @@ pub struct ExitPlace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exhausted_record_index_never_reissues_its_identity() {
+        let mut t = Records::<u32>::new();
+        t.generations[0] = proto_process::GENERATION_MAX - 1;
+        let last = t.next_label().unwrap();
+        assert_eq!(last.index, 0);
+        assert_eq!(last.generation, proto_process::GENERATION_MAX);
+        let index = t.insert(last, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        assert_eq!(t.find_identity(last.identity()), Some(index));
+        assert_eq!(t.exited(index, End::exited(0)).0, Exit::Reaped);
+        assert_eq!(t.find_identity(last.identity()), None);
+        assert!(!t.listed[index]);
+        assert_eq!(t.count(), 1, "the exhausted index remains unavailable");
+        let next = t.next_label().unwrap();
+        assert_eq!(next.index, 1);
+        assert_eq!(next.generation, 1);
+        t.insert(next, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        assert_eq!(t.find_identity(last.identity()), None);
+        assert_eq!(t.find_loader(last.loader()), None);
+        assert_eq!(t.find_identity(next.identity()), Some(1));
+    }
     use proto_process::{SIGKILL, SIGSEGV};
 
     fn add(t: &mut Records<u32>) -> Option<Label> {
