@@ -56,7 +56,17 @@ impl Generations {
     /// Raises the generation of the record in `index`, with Release.
     pub fn raise(&self, index: usize) {
         if let Some(w) = self.word(index) {
-            w.fetch_add(1, Ordering::Release);
+            let old = w.load(Ordering::Relaxed) & !proto_process::GENERATION_DEAD;
+            w.store(
+                old.checked_add(1).unwrap_or(proto_process::GENERATION_DEAD),
+                Ordering::Release,
+            );
+        }
+    }
+
+    pub fn retire(&self, index: usize) {
+        if let Some(w) = self.word(index) {
+            w.fetch_or(proto_process::GENERATION_DEAD, Ordering::Release);
         }
     }
 

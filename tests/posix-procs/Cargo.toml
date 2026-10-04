@@ -15,7 +15,13 @@ bench = false
 
 [features]
 jobs = []
+files = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt"]
 terminal = ["posix-crt/uart-input"]
 
 [dependencies]
 posix-crt = { path = "../../lib/posix-crt" }
+
+posix-abi = { path = "../../lib/posix-abi", optional = true }
+proto-fs = { path = "../../proto/fs", optional = true }
+proto-wire = { path = "../../proto/wire", optional = true }
+rt = { path = "../../lib/rt", optional = true }

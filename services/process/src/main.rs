@@ -432,6 +432,7 @@ impl Processes {
         );
         if let Some(record) = self.records.get_mut(index) {
             record.quota = create.quota;
+            record.limits = proto_process::ResourceLimits::initial(create.quota);
             record.handle_limit = create.handle_limit;
         }
         self.witnesses[index] = Some(witness);
@@ -832,6 +833,10 @@ impl Processes {
             loader,
             index: index as u32,
             ctty: record.ctty,
+            image: loader.map_or(record.image, |l| l.image),
+            groups: record.groups,
+            limits: record.limits,
+            root: record.root,
         };
         if who.write(r.reply()).is_err() {
             return Answer::Status(Status::BadSize);
@@ -866,7 +871,11 @@ impl Processes {
                 let (_, _, named) = Label::parse_image(label)?;
                 (named == image).then_some((index, Some(LoaderOf { image, ticket })))
             }
-            _ => Some((self.records.find_identity(label)?, None)),
+            _ => {
+                let index = self.records.find_identity(label)?;
+                (!matches!(self.records.get(index)?.state, State::Zombie(_)))
+                    .then_some((index, None))
+            }
         }
     }
 
@@ -2561,6 +2570,7 @@ impl Service<0> for Processes {
             }
             return;
         }
+        self.generations.retire(index);
         let end = End::of(sys::process_state(&record.process).unwrap_or(abi::ProcessState::Killed))
             .unwrap_or(End::Signaled(SIGKILL));
         // A walk of the ended sender stops, and those it queued: their

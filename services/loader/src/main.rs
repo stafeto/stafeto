@@ -805,7 +805,7 @@ fn verify_session(
     require_fds: bool,
 ) -> Result<Handle<Channel>, u32> {
     let (root, header) = match slot {
-        Slot::Files => (&own.files, proto_fs::Method::VerifySession.header()),
+        Slot::Files => (&own.files, proto_fs::Method::BindPending.header()),
         Slot::Clock => (&own.clock, proto_clock::Method::VerifySession.header()),
         _ => return Err(pl::IO),
     };
@@ -814,8 +814,18 @@ fn verify_session(
     if slot == Slot::Files {
         w.u32(u32::from(require_fds)).map_err(|s| s.code())?;
     }
-    let mut reply = sys::send_handles(root, w.as_bytes(), [offered.erase()])
-        .map_err(|refused| code(refused.error))?;
+    let mut outgoing = rt::handle::Outgoing::new();
+    outgoing.push(offered.erase()).map_err(|_| pl::IO)?;
+    if slot == Slot::Files {
+        let identity = sys::handle_duplicate(
+            &own.identity,
+            Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
+        )
+        .map_err(code)?;
+        outgoing.push(identity.erase()).map_err(|_| pl::IO)?;
+    }
+    let mut reply =
+        sys::send_handles(root, w.as_bytes(), outgoing).map_err(|refused| code(refused.error))?;
     let mut buffer = [0; MESSAGE_MAX];
     if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
         return Err(pl::IO);
@@ -1165,28 +1175,18 @@ fn load(own: &Own, block: &Block<'_>) -> Result<(u64, Handle<Channel>, Maps), u3
 
 /// OpenExec of `path`: the image session, or the code of the refusal.
 fn open(own: &Own, path: &[u8]) -> Result<Handle<Channel>, u32> {
-    let copy =
-        sys::handle_duplicate(&own.identity, Rights::NOTIFY | Rights::TRANSFER).map_err(code)?;
-    let mut w = Writer::new();
-    proto_fs::Method::OpenExec
-        .header()
-        .write(&mut w)
-        .and_then(|()| w.bytes(path))
-        .map_err(|_| pl::NAME_TOO_LONG)?;
-    let mut reply = sys::send_handles(&own.files, w.as_bytes(), [copy.erase()])
-        .map_err(|refused| code(refused.error))?;
-    let mut buffer = [0; MESSAGE_MAX];
-    let status = Reader::new(reply.bytes(&mut buffer))
-        .u32()
-        .map_err(|_| pl::IO)?;
-    match status {
-        0 => reply.handles.take(0).map_err(|_| pl::IO),
-        proto_fs::NO_ENTRY => Err(pl::NO_ENTRY),
-        proto_fs::ACCESS_DENIED => Err(pl::ACCESS),
-        proto_fs::NOT_DIRECTORY => Err(pl::NOT_DIRECTORY),
-        proto_fs::PERMISSION => Err(pl::PERMISSION),
-        _ => Err(pl::IO),
-    }
+    let files = core::mem::ManuallyDrop::new(rt::fs::Files::from_sessions(
+        Handle::from_raw(own.files.raw()),
+        None,
+    ));
+    files.open_exec(path, &own.identity).map_err(|s| match s {
+        Status::Unknown(proto_fs::NO_ENTRY) => pl::NO_ENTRY,
+        Status::Unknown(proto_fs::ACCESS_DENIED) => pl::ACCESS,
+        Status::Unknown(proto_fs::NOT_DIRECTORY) => pl::NOT_DIRECTORY,
+        Status::Unknown(proto_fs::PERMISSION) => pl::PERMISSION,
+        Status::Unknown(proto_fs::NAME_TOO_LONG) => pl::NAME_TOO_LONG,
+        _ => pl::IO,
+    })
 }
 
 /// The size of the file of the image session.

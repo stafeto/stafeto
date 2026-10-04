@@ -79,6 +79,9 @@ pub struct Record<P> {
     /// for an orphan.
     pub parent: u32,
     pub credentials: Credentials,
+    pub groups: proto_process::Groups,
+    pub limits: proto_process::ResourceLimits,
+    pub root: proto_process::ExpenditureRoot,
     pub state: State,
     /// Suspension is independent of image loading and process lifetime.
     pub stopped: Option<u8>,
@@ -318,11 +321,27 @@ impl<P> Records<P> {
         self.listed[i] = false;
         self.generations[i] = label.generation;
         let linked = parent.is_some_and(|p| self.separates(p, pgid, sid));
+        let groups = parent.map_or(proto_process::Groups::EMPTY, |p| {
+            self.records[p].as_ref().unwrap().groups
+        });
+        let limits = parent.map_or(proto_process::ResourceLimits::initial(0), |p| {
+            self.records[p].as_ref().unwrap().limits
+        });
+        let root = parent.map_or(
+            proto_process::ExpenditureRoot {
+                pid: label.pid(),
+                generation: label.generation,
+            },
+            |p| self.records[p].as_ref().unwrap().root,
+        );
         self.records[i] = Some(Record {
             process,
             label,
             parent: pid,
             credentials,
+            groups,
+            limits,
+            root,
             state: State::Loading,
             stopped: None,
             stop_epoch: 0,
@@ -1621,5 +1640,31 @@ mod tests {
         assert_eq!(t.find_identity(live.identity_at(2)), Some(i));
         assert_eq!(t.find_loader(live.loader_at(3)), Some(i));
         assert_eq!(t.find_pid(live.pid()), Some(i));
+    }
+    #[test]
+    fn child_inherits_groups_finite_limits_and_the_original_expenditure_root() {
+        let mut records = Records::<u32>::new();
+        let parent = add(&mut records).unwrap();
+        let i = parent.index as usize;
+        let mut groups = proto_process::Groups::EMPTY;
+        groups.count = 16;
+        groups.ids = [42; 16];
+        let limits = proto_process::ResourceLimits::initial(3 * 1024 * 1024);
+        let root = records.get(i).unwrap().root;
+        records.get_mut(i).unwrap().groups = groups;
+        records.get_mut(i).unwrap().limits = limits;
+        let child = child(&mut records, parent);
+        let child = records.get(child.index as usize).unwrap();
+        assert_eq!(child.groups, groups);
+        assert_eq!(child.limits, limits);
+        assert_eq!(child.root, root);
+        assert_ne!(child.label.pid(), root.pid);
+        assert_eq!(limits.values[proto_process::NOFILE].soft, 32);
+        assert!(
+            limits
+                .values
+                .iter()
+                .all(|l| l.soft <= l.hard && l.hard != u64::MAX)
+        );
     }
 }

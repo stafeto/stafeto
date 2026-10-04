@@ -1,0 +1,359 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Fixtures use the live RAM backend before public mutation methods exist.
+extern crate std;
+use crate::authority::{Binding, Identity};
+use crate::resolve::{Progress, Resolve};
+use crate::storage::{Pin, ROOT, Root, SYMLINK, Token};
+use crate::{DIR, Fds, REG, Ram};
+use proto_process::{Credentials, ExpenditureRoot, Groups, LoaderOf, ResourceLimits, WhoReply};
+use std::format;
+const ROOT_ACCOUNT: Root = Root {
+    id: 300,
+    generation: 1,
+};
+const OWNER: Identity = Identity {
+    uid: 11,
+    gid: 22,
+    groups: Groups::EMPTY,
+};
+const ADMIN: Identity = Identity {
+    uid: 0,
+    gid: 0,
+    groups: Groups::EMPTY,
+};
+fn create(r: &mut Ram<'_>, parent: Token, name: &[u8], kind: u32, mode: u32) -> Token {
+    let pending = r
+        .storage
+        .reserve(ROOT_ACCOUNT, parent, name, (kind, mode, 11, 22))
+        .unwrap();
+    r.storage.commit(pending).unwrap()
+}
+fn finish(r: &mut Ram<'_>, job: &mut Resolve, identity: Identity) -> Result<Token, u32> {
+    for _ in 0..20000 {
+        if let Progress::Found(token) = job.step(&mut r.storage, identity)? {
+            return Ok(token);
+        }
+    }
+    panic!("bounded fixture failed to terminate");
+}
+fn walk(r: &mut Ram<'_>, path: &[u8], identity: Identity) -> Result<Token, u32> {
+    let mut job = Resolve::new(&mut r.storage, path, ROOT, identity, true)?;
+    let result = finish(r, &mut job, identity);
+    job.release(&mut r.storage);
+    result
+}
+fn who() -> WhoReply {
+    WhoReply {
+        pid: 300,
+        credentials: Credentials::NOBODY,
+        generation: 1,
+        loader: None,
+        index: 44,
+        ctty: None,
+        image: 1,
+        groups: Groups::EMPTY,
+        limits: ResourceLimits::initial(2 * 1024 * 1024),
+        root: ExpenditureRoot {
+            pid: 300,
+            generation: 1,
+        },
+    }
+}
+#[test]
+fn binding_retains_vouched_identity_image_and_root() {
+    let mut binding = Binding::Unbound;
+    assert_eq!(binding.bind(None, false), Err(proto_fs::PERMISSION));
+    let mut w = who();
+    binding.bind(Some(w), false).unwrap();
+    assert!(binding.valid(1));
+    assert!(!binding.valid(2));
+    w.credentials.euid = 11;
+    w.generation = 2;
+    binding.bind(Some(w), false).unwrap();
+    assert_eq!(binding.identity(false).unwrap().uid, 11);
+    for changed in [
+        WhoReply { pid: 301, ..w },
+        WhoReply { image: 2, ..w },
+        WhoReply { index: 45, ..w },
+        WhoReply {
+            root: ExpenditureRoot {
+                pid: 301,
+                generation: 1,
+            },
+            ..w
+        },
+    ] {
+        assert_eq!(
+            binding.bind(Some(changed), false),
+            Err(proto_fs::PERMISSION)
+        );
+    }
+    assert_eq!(binding.snapshot(), Some(w));
+    binding = Binding::Cleanup;
+    assert_eq!(binding.bind(Some(w), false), Err(proto_fs::PERMISSION));
+    assert!(binding.identity(false).is_err());
+    let pending = WhoReply {
+        loader: Some(LoaderOf {
+            ticket: 9,
+            image: 2,
+        }),
+        image: 2,
+        ..w
+    };
+    binding = Binding::Unbound;
+    assert!(binding.bind(Some(pending), false).is_err());
+    binding.bind(Some(pending), true).unwrap();
+    assert!(
+        binding
+            .bind(
+                Some(WhoReply {
+                    loader: Some(LoaderOf {
+                        ticket: 10,
+                        image: 2
+                    }),
+                    ..pending
+                }),
+                true
+            )
+            .is_err()
+    );
+    binding
+        .bind(
+            Some(WhoReply {
+                loader: None,
+                ..pending
+            }),
+            false,
+        )
+        .unwrap();
+    assert!(matches!(binding, Binding::Active(_)));
+}
+#[test]
+fn inherited_clone_denies_effects_and_rebinds_only_with_same_expenditure_root() {
+    let parent = who();
+    let mut inherited = Binding::Inherited(parent);
+    assert!(!inherited.valid(parent.generation));
+    assert!(inherited.identity(false).is_err());
+    let child = WhoReply {
+        pid: 301,
+        index: 45,
+        image: 2,
+        ..parent
+    };
+    assert!(
+        inherited
+            .bind(
+                Some(WhoReply {
+                    root: ExpenditureRoot {
+                        pid: 301,
+                        generation: 1
+                    },
+                    ..child
+                }),
+                false
+            )
+            .is_err()
+    );
+    inherited.bind(Some(child), false).unwrap();
+    assert!(inherited.valid(child.generation));
+    assert_eq!(inherited.snapshot(), Some(child));
+}
+
+#[test]
+fn owner_group_other_use_one_class_and_real_effective_supplementary_ids() {
+    let mut r = Ram::new(0);
+    let token = create(&mut r, ROOT, b"file", REG, 0o640);
+    let n = r.storage.node(token).unwrap();
+    assert!(OWNER.permits(n, 6));
+    assert!(
+        Identity {
+            uid: 33,
+            gid: 22,
+            ..OWNER
+        }
+        .permits(n, 4)
+    );
+    assert!(
+        !Identity {
+            uid: 33,
+            gid: 44,
+            ..OWNER
+        }
+        .permits(n, 4)
+    );
+    let mut groups = Groups::EMPTY;
+    groups.count = 16;
+    groups.ids = [22; 16];
+    assert!(
+        Identity {
+            uid: 33,
+            gid: 44,
+            groups
+        }
+        .permits(n, 4)
+    );
+    let ids = Credentials {
+        uid: 33,
+        gid: 44,
+        euid: 11,
+        egid: 22,
+        suid: 55,
+        sgid: 66,
+    };
+    assert!(!Identity::of(ids, Groups::EMPTY, true).permits(n, 4));
+    assert!(Identity::of(ids, Groups::EMPTY, false).permits(n, 6));
+    r.storage.node_mut(token).unwrap().mode = 0o047;
+    assert!(
+        !OWNER.permits(r.storage.node(token).unwrap(), 4),
+        "owner cannot borrow other bits"
+    );
+    assert!(ADMIN.permits(r.storage.node(token).unwrap(), 6));
+    r.storage.node_mut(token).unwrap().mode = 0o600;
+    assert!(!ADMIN.permits(r.storage.node(token).unwrap(), 1));
+    r.storage.node_mut(token).unwrap().mode |= 1;
+    assert!(ADMIN.permits(r.storage.node(token).unwrap(), 1));
+    let directory = create(&mut r, ROOT, b"dir", DIR, 0);
+    assert!(ADMIN.permits(r.storage.node(directory).unwrap(), 1));
+}
+#[test]
+fn traversal_checks_denied_directory_before_parent_component() {
+    let mut r = Ram::new(0);
+    let denied = create(&mut r, ROOT, b"denied", DIR, 0o700);
+    let allowed = create(&mut r, ROOT, b"allowed", REG, 0o644);
+    let other = Identity {
+        uid: 33,
+        gid: 44,
+        ..OWNER
+    };
+    assert_eq!(
+        walk(&mut r, b"/denied/../allowed", other),
+        Err(proto_fs::ACCESS_DENIED)
+    );
+    assert_eq!(walk(&mut r, b"/denied/../allowed", OWNER), Ok(allowed));
+    assert_eq!(
+        walk(&mut r, b"/allowed/..", OWNER),
+        Err(proto_fs::NOT_DIRECTORY)
+    );
+    assert_eq!(walk(&mut r, b"/../../allowed", OWNER), Ok(allowed));
+    assert_eq!(walk(&mut r, b"/denied/.", OWNER), Ok(denied));
+}
+#[test]
+fn link_parent_walks_target_directory_and_preserves_invalid_utf8() {
+    let mut r = Ram::new(0);
+    let a = create(&mut r, ROOT, b"a", DIR, 0o755);
+    let child = create(&mut r, a, b"child", DIR, 0o755);
+    let target = create(&mut r, a, b"\xff", REG, 0o644);
+    let link = create(&mut r, ROOT, b"link", SYMLINK, 0o777);
+    r.storage.write(link, ROOT_ACCOUNT, 0, b"a/child").unwrap();
+    assert_eq!(walk(&mut r, b"/link/../\xff", OWNER), Ok(target));
+    let mut nofollow = Resolve::new(&mut r.storage, b"/link", ROOT, OWNER, false).unwrap();
+    assert_eq!(finish(&mut r, &mut nofollow, OWNER), Ok(link));
+    nofollow.release(&mut r.storage);
+    assert_eq!(walk(&mut r, b"/link/", OWNER), Ok(child));
+    let absolute = create(&mut r, a, b"absolute", SYMLINK, 0o777);
+    r.storage
+        .write(absolute, ROOT_ACCOUNT, 0, b"/a/\xff")
+        .unwrap();
+    assert_eq!(walk(&mut r, b"/a/absolute", OWNER), Ok(target));
+}
+#[test]
+fn link_limit_is_32_and_path_and_component_bounds_are_bytes() {
+    let mut r = Ram::new(0);
+    let target = create(&mut r, ROOT, &[b'x'; 255], REG, 0o644);
+    let mut path = std::vec![b'/'];
+    path.extend_from_slice(&[b'x'; 255]);
+    assert_eq!(walk(&mut r, &path, OWNER), Ok(target));
+    path.push(b'x');
+    assert_eq!(walk(&mut r, &path, OWNER), Err(proto_fs::NAME_TOO_LONG));
+    let long = [b'/'; 511];
+    assert_eq!(walk(&mut r, &long, OWNER), Ok(ROOT));
+    assert_eq!(
+        Resolve::new(&mut r.storage, &[b'/'; 512], ROOT, OWNER, true).err(),
+        Some(proto_fs::NAME_TOO_LONG)
+    );
+    for i in (0..33).rev() {
+        let link = create(&mut r, ROOT, format!("s{i}").as_bytes(), SYMLINK, 0o777);
+        let next = if i == 32 {
+            b"/".to_vec()
+        } else {
+            format!("s{}", i + 1).into_bytes()
+        };
+        r.storage.write(link, ROOT_ACCOUNT, 0, &next).unwrap();
+    }
+    assert_eq!(walk(&mut r, b"/s1", OWNER), Ok(ROOT));
+    assert_eq!(walk(&mut r, b"/s0", OWNER), Err(proto_fs::LOOP));
+}
+#[test]
+fn proof_restarts_after_namespace_and_authority_changes_and_retains_base() {
+    let mut r = Ram::new(0);
+    let directory = create(&mut r, ROOT, b"base", DIR, 0o700);
+    let file = create(&mut r, directory, b"file", REG, 0o644);
+    let mut job = Resolve::new(&mut r.storage, b"file", directory, OWNER, true).unwrap();
+    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    assert_eq!(job.proof(&r.storage, OWNER), Ok(file));
+    let other = Identity {
+        uid: 33,
+        gid: 44,
+        ..OWNER
+    };
+    assert_eq!(job.proof(&r.storage, other), Err(proto_fs::STALE_PROOF));
+    assert_eq!(job.step(&mut r.storage, other), Ok(Progress::More));
+    assert_eq!(
+        finish(&mut r, &mut job, other),
+        Err(proto_fs::ACCESS_DENIED)
+    );
+    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    r.storage.set_attributes(directory, 0o600, 11, 22).unwrap();
+    assert_eq!(job.proof(&r.storage, OWNER), Err(proto_fs::STALE_PROOF));
+    assert_eq!(
+        finish(&mut r, &mut job, OWNER),
+        Err(proto_fs::ACCESS_DENIED)
+    );
+    r.storage.set_attributes(directory, 0o700, 11, 22).unwrap();
+    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    create(&mut r, ROOT, b"change", REG, 0o644);
+    assert_eq!(job.proof(&r.storage, OWNER), Err(proto_fs::STALE_PROOF));
+    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    let mut fds = Fds::default();
+    r.set_cwd_token(&mut fds, ROOT).unwrap();
+    assert_eq!(
+        job.base, directory,
+        "another cwd cannot change captured base"
+    );
+    job.release(&mut r.storage);
+    r.release(&mut fds);
+    let bad = Token {
+        slot: directory.slot,
+        generation: directory.generation + 1,
+    };
+    assert!(Resolve::new(&mut r.storage, b"file", bad, OWNER, true).is_err());
+    let mut absolute = Resolve::new(&mut r.storage, b"/base/file", bad, OWNER, true).unwrap();
+    assert_eq!(finish(&mut r, &mut absolute, OWNER), Ok(file));
+    absolute.release(&mut r.storage);
+    r.storage.pin(directory, Pin::Cwd).unwrap();
+    r.storage.unpin(directory, Pin::Cwd).unwrap();
+}
+#[test]
+fn two_path_preparation_uses_one_charge_and_two_independent_pinned_bases() {
+    let mut r = Ram::new(0);
+    let a = create(&mut r, ROOT, b"a", DIR, 0o755);
+    let b = create(&mut r, ROOT, b"b", DIR, 0o755);
+    let x = create(&mut r, a, b"x", REG, 0o644);
+    let y = create(&mut r, b, b"y", REG, 0o644);
+    let before = r.storage.usage(ROOT_ACCOUNT);
+    let charge = r.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
+    let mut first = Resolve::new(&mut r.storage, b"x", a, OWNER, true).unwrap();
+    let mut second = Resolve::new(&mut r.storage, b"y", b, OWNER, true).unwrap();
+    assert_eq!(r.storage.preparations_used(), 1);
+    assert_eq!(finish(&mut r, &mut first, OWNER), Ok(x));
+    assert_eq!(finish(&mut r, &mut second, OWNER), Ok(y));
+    assert_eq!(first.proof(&r.storage, OWNER), Ok(x));
+    assert_eq!(second.proof(&r.storage, OWNER), Ok(y));
+    first.release(&mut r.storage);
+    second.release(&mut r.storage);
+    r.storage.release_preparation(charge);
+    assert_eq!(r.storage.preparations_used(), 0);
+    assert_eq!(r.storage.usage(ROOT_ACCOUNT), before);
+}

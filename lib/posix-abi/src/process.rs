@@ -926,13 +926,32 @@ pub(crate) fn load_errno(code: u32) -> i32 {
     }
 }
 
-/// A request through C, sent again while it comes back INTERRUPTED (the
-/// loader never saw it): its status.
+/// A Loader request and its status. Non-repeatable capability transfers mask
+/// thread entries until the reply has been copied: an interrupted send consumes
+/// the outgoing handles even when the Loader never received them.
 pub(crate) fn ask_loader(
     c: &Handle<Channel>,
     w: &Writer,
     handles: Option<rt::handle::Outgoing>,
 ) -> u32 {
+    struct TransferMask(bool);
+    impl Drop for TransferMask {
+        fn drop(&mut self) {
+            if self.0 {
+                // SAFETY: restore the entry state that this thread already enabled.
+                // The reply and all outgoing resources have ended before this guard.
+                unsafe { rt::upcall::enable() }.expect("restore Loader transfer entry state");
+            }
+        }
+    }
+    let _mask = if handles.is_some() {
+        match rt::upcall::mask() {
+            Ok(was_masked) => TransferMask(!was_masked),
+            Err(_) => return proto_loader::IO,
+        }
+    } else {
+        TransferMask(false)
+    };
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
     let mut handles = handles;
     loop {
@@ -1393,11 +1412,10 @@ fn image_ready(
 }
 
 /// Step 4 of exec: the descriptors with FD_CLOEXEC close (their
-/// descriptions with the last of them), then the process's own sessions
-/// with the RAM files, the clock and the console's input move to the
-/// loader (Handles): the new image keeps the descriptions, offsets and
-/// labels. Nothing of this image uses them afterwards. Whether the loader
-/// took them.
+/// descriptions with the last of them), then a fresh RAM session sharing
+/// retained descriptions and the clock and console sessions go to the Loader.
+/// The new image keeps descriptions and offsets under its authenticated binding.
+/// Whether the Loader took them.
 fn move_files(c: &Handle<Channel>) -> bool {
     use proto_loader::Slot;
     for fd in 0..posix_fs::OPEN_MAX as u32 {
@@ -1415,12 +1433,35 @@ fn move_files(c: &Handle<Channel>) -> bool {
     // here, or the new image would keep it in the service with no
     // descriptor.
     crate::shared::abandon_holds();
+    let mut kept = [0; posix_fs::OPEN_MAX];
     let sessions = crate::shared::with_files(|files| {
-        let (files, uart) = files.sessions();
-        Ok((files.raw(), uart.map(Handle::raw)))
+        let count = files.kept_by_exec(&mut kept);
+        let (channel, uart) = files.sessions();
+        Ok((channel.raw(), uart.map(Handle::raw), count))
     });
     let clock = crate::clock::session().map(Handle::raw);
-    let Ok((files, uart)) = sessions else {
+    let Ok((files, uart, count)) = sessions else {
+        return false;
+    };
+    // The old image's session remains tied to its authority. The new image
+    // receives a true unclaimed clone whose Pending binding the Loader authenticates.
+    let mut request = Writer::new();
+    if proto_fs::Method::Clone
+        .header()
+        .write(&mut request)
+        .and_then(|()| request.u32(count as u32))
+        .is_err()
+    {
+        return false;
+    }
+    for fd in &kept[..count] {
+        if request.u32(*fd).is_err() {
+            return false;
+        }
+    }
+    let Ok(files) =
+        rt::service::clone_session(&Handle::<Channel>::borrowed(files), request.as_bytes())
+    else {
         return false;
     };
     // The session with the pipe service moves as it is, with the ends of
@@ -1449,7 +1490,7 @@ fn move_files(c: &Handle<Channel>) -> bool {
     give_sessions(
         c,
         [
-            (Slot::Files, moved(Some(files))),
+            (Slot::Files, Some(files)),
             (Slot::Clock, moved(clock)),
             (Slot::Driver, moved(uart)),
             (Slot::Pipes, moved(pipes)),

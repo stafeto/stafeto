@@ -135,6 +135,18 @@ const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
 ];
+const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-files"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-files", "posix-procs", POSIX_STACK_SIZE, &["files"]),
+];
 const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -983,6 +995,7 @@ commands:
   posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
+  posix-files verify authentic file identity and byte path proofs
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
   posix-input-vz verify file progress during Virtio console reads on Apple VZ
@@ -1091,6 +1104,7 @@ fn main() {
         },
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
+        Some("posix-files") => posix_files_probe(),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -2581,6 +2595,19 @@ fn loader_channels_probe() -> Result<(), String> {
     qemu::expect_marker(&outcome, "loader-channels: ok")
 }
 
+/// C operations observe the real Process identities and Files proofs.
+fn posix_files_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-posix-files.img", &POSIX_FILES_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(&output, "posix-files: identity and proofs ok")
+}
+
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
@@ -2593,10 +2620,11 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     // The probe is the table's only record: its end is init's line, and
     // its children are processes of the service that init never hears of.
     // It ends in an exec (stage 10) of the role that exits with 42: init
-    // reports the new image's end.
+    // reports the new image's end. The authenticated component proofs add
+    // bounded IPC rounds across this large spawn/fork/exec scenario.
     let ended = run.expect_seen(
         "init: posix-procs ended: exit code 42, not restarted",
-        BOOT_TIMEOUT,
+        Duration::from_secs(60),
     );
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
@@ -3698,6 +3726,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-tty-control-steps", posix_tty_control_steps),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
+        job("posix-files", posix_files_probe),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),

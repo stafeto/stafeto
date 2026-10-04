@@ -199,6 +199,7 @@ pub struct State {
     generations: [u64; INODES],
     pub epoch: u64,
     pending: [Option<Reservation>; PREPARATIONS],
+    preparation_used: u16,
     reclaim_queue: [u16; INODES],
     reclaim_head: usize,
     reclaim_len: usize,
@@ -223,6 +224,7 @@ impl State {
             generations: [0; INODES],
             epoch: 1,
             pending: [None; PREPARATIONS],
+            preparation_used: 0,
             reclaim_queue: [0; INODES],
             reclaim_head: 0,
             reclaim_len: 0,
@@ -243,6 +245,7 @@ impl State {
         self.dentry_len = DENTRIES;
         self.page_len = PAGES;
         self.epoch = 1;
+        self.preparation_used = 0;
     }
 }
 impl Default for State {
@@ -391,6 +394,23 @@ impl<'a> Storage<'a> {
     pub fn node_mut(&mut self, token: Token) -> Result<&mut Node, u32> {
         self.node(token)?;
         Ok(&mut self.state.nodes[token.slot as usize])
+    }
+    /// Metadata changes invalidate every retained path proof before publishing fields.
+    pub fn set_attributes(
+        &mut self,
+        token: Token,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), u32> {
+        self.node(token)?;
+        let next = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
+        let node = &mut self.state.nodes[token.slot as usize];
+        node.mode = mode;
+        node.uid = uid;
+        node.gid = gid;
+        self.state.epoch = next;
+        Ok(())
     }
     fn account(&mut self, key: Root) -> Result<usize, u32> {
         if let Some(i) = self
@@ -590,7 +610,9 @@ impl<'a> Storage<'a> {
             .iter()
             .position(Option::is_none)
             .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
-        if self.state.accounts[a].unwrap().pending == PREPARATION_SHARE {
+        if self.state.preparation_used as usize == PREPARATIONS
+            || self.state.accounts[a].unwrap().pending == PREPARATION_SHARE
+        {
             return Err(proto_fs::TOO_MANY_OPEN_FILES);
         }
         if self.node(parent)?.pins[Pin::Pending.index()] == u16::MAX {
@@ -652,6 +674,7 @@ impl<'a> Storage<'a> {
         };
         self.state.pending[place] = Some(reservation);
         self.state.accounts[a].as_mut().unwrap().pending += 1;
+        self.state.preparation_used += 1;
         Ok(reservation)
     }
     pub fn commit(&mut self, reservation: Reservation) -> Result<Token, u32> {
@@ -688,11 +711,34 @@ impl<'a> Storage<'a> {
 
     fn end_preparation(&mut self, r: Reservation) {
         self.state.pending[r.place as usize] = None;
-        self.state.accounts[r.root as usize]
-            .as_mut()
-            .unwrap()
-            .pending -= 1;
+        self.release_preparation(r.root);
     }
+    pub fn preparations_used(&self) -> u16 {
+        self.state.preparation_used
+    }
+    pub fn charge_preparation(&mut self, root: Root) -> Result<u16, u32> {
+        if self.state.preparation_used as usize == PREPARATIONS {
+            return Err(proto_fs::TOO_MANY_OPEN_FILES);
+        }
+        let a = self.account(root)?;
+        if self.state.accounts[a].unwrap().pending == PREPARATION_SHARE {
+            return Err(proto_fs::TOO_MANY_OPEN_FILES);
+        }
+        self.state.accounts[a].as_mut().unwrap().pending += 1;
+        self.state.preparation_used += 1;
+        Ok(a as u16)
+    }
+    pub fn release_preparation(&mut self, root: u16) {
+        let a = self.state.accounts[root as usize]
+            .as_mut()
+            .expect("paid preparation");
+        a.pending -= 1;
+        self.state.preparation_used -= 1;
+        if a.pending == 0 && a.usage == Usage::EMPTY {
+            self.state.accounts[root as usize] = None;
+        }
+    }
+
     fn drop_dentry(&mut self, i: usize) {
         let root = self.state.dentries[i].root as usize;
         self.state.dentries[i] = Dentry::EMPTY;

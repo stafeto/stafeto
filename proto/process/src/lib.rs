@@ -194,7 +194,11 @@
 use abi::ProcessState;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
-pub const VERSION: u16 = 9;
+pub const VERSION: u16 = 10;
+
+mod limits;
+pub use limits::{AS, CORE, DATA, FSIZE, NOFILE, STACK};
+pub use limits::{ExpenditureRoot, Groups, Limit, ResourceLimits, SUPPLEMENTARY_MAX};
 pub const INVALID: u32 = 500;
 pub const PERMISSION: u32 = 501;
 pub const FULL: u32 = 502;
@@ -609,13 +613,15 @@ impl Create {
 /// The bytes of the page of the credentials generations: a u64 for each
 /// record index (see Register).
 pub const GENERATIONS_SIZE: usize = RECORDS * 8;
+/// A retired record has this mark until its index starts a later generation.
+pub const GENERATION_DEAD: u64 = 1 << 63;
 
 /// The reply to Vouch: status u32 (0), the record's PID u32, the six
 /// credentials u32, the generation of the credentials u64, then 1 u32
 /// for the identity of a loader (0 for a process's), the image u32 and the
 /// ticket of the loader's place u64 (zeros for a process), the record's
 /// index u32 and a zero u32, then the terminal u32 and its generation u64
-/// (u32::MAX and 0 for no attachment): 76 bytes.
+/// (u32::MAX and 0 for no attachment), current image, groups, finite limits and expenditure root: 252 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WhoReply {
     pub pid: u32,
@@ -625,6 +631,10 @@ pub struct WhoReply {
     pub index: u32,
     /// Controlling terminal attachment; invalidated by its exact departure.
     pub ctty: Option<(u32, u64)>,
+    pub image: u32,
+    pub groups: Groups,
+    pub limits: ResourceLimits,
+    pub root: ExpenditureRoot,
 }
 
 /// What Vouch says of a loader's identity: the image of the record it
@@ -651,7 +661,12 @@ impl WhoReply {
         w.u32(0)?;
         let (terminal, generation) = self.ctty.unwrap_or((u32::MAX, 0));
         w.u32(terminal)?;
-        w.u64(generation)
+        w.u64(generation)?;
+        w.u32(self.image)?;
+        self.groups.write(w)?;
+        self.limits.write(w)?;
+        w.u32(self.root.pid)?;
+        w.u32(self.root.generation)
     }
 
     /// BAD_SIZE out of the layout, for a PID of 0 or past the signed range,
@@ -667,7 +682,7 @@ impl WhoReply {
             *w = r.u32()?;
         }
         let generation = r.u64()?;
-        let (mark, image, ticket) = (r.u32()?, r.u32()?, r.u64()?);
+        let (mark, loader_image, ticket) = (r.u32()?, r.u32()?, r.u64()?);
         let (index, zero) = (r.u32()?, r.u32()?);
         let (terminal, ctty_generation) = (r.u32()?, r.u64()?);
         let ctty = match (terminal, ctty_generation) {
@@ -675,7 +690,22 @@ impl WhoReply {
             (t, g) if (t as usize) < TERMINALS && g != 0 => Some((t, g)),
             _ => return Err(Status::BadSize),
         };
+        let image = r.u32()?;
+        let groups = Groups::read(&mut r)?;
+        let limits = ResourceLimits::read(&mut r)?;
+        let root = ExpenditureRoot {
+            pid: r.u32()?,
+            generation: r.u32()?,
+        };
         r.finish()?;
+        if generation == 0
+            || generation & GENERATION_DEAD != 0
+            || image == 0
+            || root.pid == 0
+            || root.generation == 0
+        {
+            return Err(Status::BadSize);
+        }
         if pid == 0
             || pid > i32::MAX as u32
             || words.contains(&u32::MAX)
@@ -684,9 +714,12 @@ impl WhoReply {
         {
             return Err(Status::BadSize);
         }
-        let loader = match (mark, image, ticket) {
+        let loader = match (mark, loader_image, ticket) {
             (0, 0, 0) => None,
-            (1, image, ticket) => Some(LoaderOf { image, ticket }),
+            (1, loader_image, ticket) if loader_image == image && ticket != 0 => Some(LoaderOf {
+                image: loader_image,
+                ticket,
+            }),
             _ => return Err(Status::BadSize),
         };
         Ok(Self {
@@ -696,6 +729,10 @@ impl WhoReply {
             loader,
             index,
             ctty,
+            image,
+            groups,
+            limits,
+            root,
         })
     }
 }
@@ -1301,10 +1338,17 @@ mod tests {
             loader: None,
             index: 44,
             ctty: Some((0, 5)),
+            image: 1,
+            groups: Groups::EMPTY,
+            limits: ResourceLimits::initial(2 * 1024 * 1024),
+            root: ExpenditureRoot {
+                pid: 2,
+                generation: 1,
+            },
         };
         let mut w = Writer::new();
         reply.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 76);
+        assert_eq!(w.as_bytes().len(), 252);
         assert_eq!(WhoReply::read(w.as_bytes()), Ok(reply));
         let mut bytes = w.as_bytes().to_vec();
         bytes[4..8].fill(0);

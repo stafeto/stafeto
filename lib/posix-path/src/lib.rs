@@ -2,8 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Byte-oriented path state for the current single-process POSIX port.
-//! The RAM namespace still lacks symbolic links and treats dot segments
-//! lexically; a full namespace service must resolve each component.
+//! Dot components and links are resolved by the RAM inode service.
 
 #![no_std]
 
@@ -45,38 +44,17 @@ impl PathState {
         if path.contains(&0) {
             return Err(PathError::Invalid);
         }
-        let mut used = if path[0] == b'/' {
-            out[0] = b'/';
-            1
-        } else {
-            out[..self.length].copy_from_slice(self.cwd());
-            self.length
-        };
-        for part in path.split(|byte| *byte == b'/') {
-            if part.is_empty() || part == b"." {
-                continue;
-            }
-            if part == b".." {
-                if used > 1 {
-                    used = out[..used]
-                        .iter()
-                        .rposition(|byte| *byte == b'/')
-                        .unwrap_or(0)
-                        .max(1);
-                }
-                continue;
-            }
-            let separator = usize::from(used > 1);
-            if used + separator + part.len() > MAX_PATH {
-                return Err(PathError::TooLong);
-            }
-            if separator != 0 {
-                out[used] = b'/';
-                used += 1;
-            }
-            out[used..used + part.len()].copy_from_slice(part);
-            used += part.len();
+        let prefix = if path[0] == b'/' { 0 } else { self.length };
+        let separator = usize::from(prefix > 0 && self.cwd[prefix - 1] != b'/');
+        let used = prefix + separator + path.len();
+        if used > MAX_PATH {
+            return Err(PathError::TooLong);
         }
+        out[..prefix].copy_from_slice(&self.cwd[..prefix]);
+        if separator != 0 {
+            out[prefix] = b'/';
+        }
+        out[prefix + separator..used].copy_from_slice(path);
         out[used] = 0;
         Ok(used)
     }
@@ -106,10 +84,10 @@ mod tests {
         let mut state = PathState::new();
         state.set_cwd(b"/etc").unwrap();
         let (out, n) = resolved(&state, b"./motd").unwrap();
-        assert_eq!(&out[..n], b"/etc/motd");
+        assert_eq!(&out[..n], b"/etc/./motd");
         assert_eq!(out[n], 0);
         let (out, n) = resolved(&state, b"../tmp//probe").unwrap();
-        assert_eq!(&out[..n], b"/tmp/probe");
+        assert_eq!(&out[..n], b"/etc/../tmp//probe");
         assert_eq!(state.cwd(), b"/etc");
     }
 
@@ -123,7 +101,14 @@ mod tests {
             b"/etc/../".as_slice(),
         ] {
             let (out, n) = resolved(&state, path).unwrap();
-            assert_eq!(&out[..n], b"/");
+            assert_eq!(
+                &out[..n],
+                if path[0] == b'/' {
+                    path
+                } else {
+                    b"/tmp/../../"
+                }
+            );
         }
     }
 

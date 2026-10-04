@@ -853,6 +853,8 @@ int main(int argc, char **argv) {
     too_long[512] = 0;
     if (PATH_MAX != 512 || open(too_long, O_RDONLY) != -1 || errno != ENAMETOOLONG) return 10;
     too_long[511] = 0;
+    /* Keep this PATH_MAX fixture within NAME_MAX for each component. */
+    too_long[255] = '/';
     if (open(too_long, O_RDONLY) != -1 || errno != ENOENT) return 34;
     if (chdir("/etc") != 0 || getcwd(text, sizeof(text)) != text || !same(text, "/etc", 5)) return 11;
     if (getcwd(text, 4) != NULL || errno != ERANGE) return 12;

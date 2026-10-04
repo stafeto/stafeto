@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! File and directory operations for the evolving Rust POSIX layer.
-//! The current RAM service uses UTF-8 paths and bounded regular files.
+//! The RAM service owns byte paths, inode traversal and bounded regular files.
 
 #![no_std]
 
@@ -72,6 +72,7 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::IS_DIRECTORY) => Self::IsDirectory,
             Status::Unknown(proto_fs::NOT_DIRECTORY) => Self::NotDirectory,
             Status::Unknown(proto_fs::NO_SPACE) => Self::NoSpace,
+            Status::Unknown(proto_fs::NAME_TOO_LONG) => Self::NameTooLong,
             Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES) => Self::TooManyOpenFiles,
             Status::Unknown(proto_fs::INVALID_ARGUMENT) | Status::BadSize => Self::InvalidArgument,
             Status::Unknown(proto_fs::OFFSET_OVERFLOW) => Self::OffsetOverflow,
@@ -204,6 +205,9 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
     pub fn as_str(&self) -> Result<&str, FsError> {
         core::str::from_utf8(&self.bytes[..self.len]).map_err(|_| FsError::UnsupportedEncoding)
     }
@@ -370,10 +374,10 @@ impl Transport {
     /// service says so and the description reads: one opened for writing
     /// alone stays a file of the service, which refuses its reads with
     /// BAD_FD.
-    pub fn open(&self, path: &str, flags: u32) -> Result<Target, FsError> {
+    pub fn open(&self, path: &[u8], flags: u32) -> Result<Target, FsError> {
         let (fd, random) = self
             .files()
-            .open_marked(path, flags)
+            .open_marked_bytes(path, flags)
             .map_err(FsError::from)?;
         Ok(if random && flags & 3 != proto_fs::WRITE_ONLY {
             Target::Random(fd)
@@ -532,7 +536,9 @@ impl Transport {
         if self.terminal().is_none() {
             return Ok(None);
         }
-        let named = terminal_named(path.as_str()?);
+        let named = core::str::from_utf8(path.as_bytes())
+            .ok()
+            .and_then(terminal_named);
         if named.is_some() && path.trailing_slash {
             return Err(FsError::NotDirectory);
         }
@@ -546,7 +552,10 @@ impl Transport {
                 size: 0,
             });
         }
-        let meta = self.files().lookup(path.as_str()?).map_err(FsError::from)?;
+        let meta = self
+            .files()
+            .lookup_bytes(path.as_bytes())
+            .map_err(FsError::from)?;
         let kind = FileKind::from_wire(meta.kind)?;
         if path.trailing_slash && kind == FileKind::Regular {
             return Err(FsError::NotDirectory);
@@ -558,7 +567,7 @@ impl Transport {
     }
 
     pub fn stat_information(&self, path: &Resolved) -> Result<NodeInfo, FsError> {
-        let name = path.as_str()?;
+        let name = core::str::from_utf8(path.as_bytes()).unwrap_or("");
         if self.terminal().is_some() {
             let physical = if name == "/dev/ptmx" {
                 Some(proto_tty::STAT_PATH)
@@ -579,7 +588,7 @@ impl Transport {
         }
         let info = self
             .files()
-            .node_information(path.as_str()?)
+            .node_information_bytes(path.as_bytes())
             .map_err(FsError::from)?;
         if path.trailing_slash && FileKind::from_wire(info.kind)? != FileKind::Directory {
             return Err(FsError::NotDirectory);
@@ -757,6 +766,20 @@ impl PosixFs {
         count
     }
 
+    /// Every RAM description retained by exec, including FD_CLOFORK.
+    pub fn kept_by_exec(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+        let mut count = 0;
+        for (_, target, _) in self.descriptors.open() {
+            if let Target::Ram(n) | Target::Random(n) = target
+                && !out[..count].contains(&n)
+            {
+                out[count] = n;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// The terminal descriptions retained by a forked child, each once.
     pub fn terminals_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
         let mut count = 0;
@@ -789,6 +812,11 @@ impl PosixFs {
 
     /// The session with the RAM file service and the console's driver's,
     /// which a child gets clones of.
+    /// Authenticate the file session before any operation can commit.
+    pub fn bind(&self, identity: &Handle<Channel>) -> Result<(), FsError> {
+        self.files.bind(identity).map_err(FsError::from)
+    }
+
     pub fn sessions(&self) -> (&Handle<Channel>, Option<&Handle<Channel>>) {
         self.files.sessions()
     }
@@ -951,7 +979,7 @@ impl PosixFs {
         let resolved = self.resolve(path)?;
         self.descriptors.vacant(0)?;
         let transport = self.transport();
-        let opened = transport.open(resolved.as_str()?, flags)?;
+        let opened = transport.open(resolved.as_bytes(), flags)?;
         match self.insert(opened, DescriptorFlags::default()) {
             Ok(fd) => Ok(fd),
             Err(error) => {

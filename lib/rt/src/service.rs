@@ -78,6 +78,12 @@ pub trait Service<const K: usize> {
         let _ = label;
     }
 
+    /// One bounded maintenance step, including retained clients whose owner ended.
+    /// Called after each receive; heartbeat notices also advance the cursor.
+    fn maintenance(&mut self, sessions: &mut [Option<Session<Self::Data, K>>]) {
+        let _ = sessions;
+    }
+
     /// A notification other than CLIENT_GONE and the heartbeat's timer:
     /// an interrupt, the end of a child, a timer of the service, the bits
     /// of a client's notify.
@@ -413,6 +419,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 #[cfg(not(feature = "step-stats"))]
                 let began = steps::begin();
                 request(service, table, config.issued, label, bytes, handles, token);
+                service.maintenance(table);
                 steps::end(began, kind);
                 continue;
             }
@@ -460,6 +467,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
             }
             _ => service.notification(notice),
         }
+        service.maintenance(table);
         steps::end(began, steps::NOTICE);
     }
 }

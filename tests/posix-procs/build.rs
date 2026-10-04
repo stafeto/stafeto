@@ -15,6 +15,7 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
+    println!("cargo:rerun-if-changed=files.c");
     println!("cargo:rerun-if-changed=jobs.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
@@ -69,7 +70,15 @@ fn main() {
             "-isystem",
         ])
         .arg(sysroot.join("include"))
-        .args(["-c", "procs.c", "-o"])
+        .args([
+            "-c",
+            if env::var_os("CARGO_FEATURE_FILES").is_some() {
+                "files.c"
+            } else {
+                "procs.c"
+            },
+            "-o",
+        ])
         .arg(out.join("procs.o")));
     run(Command::new(tools.join("llvm-ar"))
         .arg("crs")

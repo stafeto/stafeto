@@ -121,7 +121,178 @@ impl View {
     }
 }
 
+/// A retained service preparation; cancellation also releases the captured base.
+struct Proof<'a> {
+    files: &'a Files,
+    id: u64,
+    loader: Option<&'a Handle<Channel>>,
+}
+impl Proof<'_> {
+    fn send(&self, request: &[u8]) -> Result<crate::sys::Reply, Status> {
+        if let Some(identity) = self.loader {
+            let copy = sys::handle_duplicate(
+                identity,
+                abi::Rights::NOTIFY | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
+            )
+            .map_err(Status::Kernel)?;
+            sys::send_handles(&self.files.channel, request, [copy.erase()])
+                .map_err(|e| Status::Kernel(e.error))
+        } else {
+            sys::send(&self.files.channel, request).map_err(Status::Kernel)
+        }
+    }
+    fn ready(&self) -> Result<(), Status> {
+        let mut w = Writer::new();
+        Method::ResolveStep.header().write(&mut w)?;
+        w.u64(self.id)?;
+        loop {
+            let reply = self.send(w.as_bytes())?;
+            let mut buffer = [0; MESSAGE_MAX];
+            match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+                Status::Ok => return Ok(()),
+                Status::Unknown(proto_fs::RESOLVING) => {}
+                status => return Err(status),
+            }
+        }
+    }
+}
+impl Drop for Proof<'_> {
+    fn drop(&mut self) {
+        let mut w = Writer::new();
+        if Method::ResolveCancel
+            .header()
+            .write(&mut w)
+            .and_then(|()| w.u64(self.id))
+            .is_ok()
+        {
+            loop {
+                match self.send(w.as_bytes()) {
+                    Err(Status::Kernel(Error::Interrupted)) => continue,
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
 impl Files {
+    /// Bind this ordinary session to the actual Process identity capability.
+    pub fn bind(&self, identity: &Handle<Channel>) -> Result<(), Status> {
+        let copy = sys::handle_duplicate(
+            identity,
+            abi::Rights::NOTIFY | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
+        )
+        .map_err(Status::Kernel)?;
+        let reply = sys::send_handles(
+            &self.channel,
+            &Method::Bind.header().bytes(),
+            [copy.erase()],
+        )
+        .map_err(|e| Status::Kernel(e.error))?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let status = Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?);
+        if status == Status::Ok {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+    fn prepare<'a>(
+        &'a self,
+        path: &[u8],
+        loader: Option<&'a Handle<Channel>>,
+    ) -> Result<Proof<'a>, Status> {
+        if path.is_empty() {
+            return Err(Status::Unknown(proto_fs::NO_ENTRY));
+        }
+        if path.len() > proto_fs::MAX_PATH {
+            return Err(Status::Unknown(proto_fs::NAME_TOO_LONG));
+        }
+        if path.contains(&0) {
+            return Err(Status::BadSize);
+        }
+        let mut w = Writer::new();
+        Method::ResolveStart.header().write(&mut w)?;
+        w.u32(0)?;
+        w.u64(1)?;
+        w.u32(0)?;
+        w.u32(1)?;
+        w.bytes(path)?;
+        let sender = Proof {
+            files: self,
+            id: 0,
+            loader,
+        };
+        let reply = sender.send(w.as_bytes())?;
+        core::mem::forget(sender);
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut r = Reader::new(reply.bytes(&mut buffer));
+        let status = Status::from_code(r.u32()?);
+        if status != Status::Ok {
+            return Err(status);
+        }
+        let proof = Proof {
+            files: self,
+            id: r.u64()?,
+            loader,
+        };
+        r.finish()?;
+        proof.ready()?;
+        Ok(proof)
+    }
+    fn path_call<'a>(
+        &self,
+        method: Method,
+        path: &[u8],
+        prefix: Option<u32>,
+        buffer: &'a mut [u8; MESSAGE_MAX],
+    ) -> Result<&'a [u8], Status> {
+        let proof = self.prepare(path, None)?;
+        let mut w = Writer::new();
+        method.header().write(&mut w)?;
+        if let Some(prefix) = prefix {
+            w.u32(prefix)?;
+        }
+        w.u64(proof.id)?;
+        loop {
+            let reply = sys::send(&self.channel, w.as_bytes()).map_err(Status::Kernel)?;
+            let status = Status::from_code(Reader::new(reply.bytes(buffer)).u32()?);
+            if status == Status::Unknown(proto_fs::STALE_PROOF) {
+                proof.ready()?;
+                continue;
+            }
+            return if status == Status::Ok {
+                Ok(reply.bytes(buffer))
+            } else {
+                Err(status)
+            };
+        }
+    }
+    /// A loader's image, after its authentic pending identity resolves each component.
+    pub fn open_exec(
+        &self,
+        path: &[u8],
+        identity: &Handle<Channel>,
+    ) -> Result<Handle<Channel>, Status> {
+        let proof = self.prepare(path, Some(identity))?;
+        let mut w = Writer::new();
+        Method::OpenExec.header().write(&mut w)?;
+        w.u64(proof.id)?;
+        loop {
+            let mut reply = proof.send(w.as_bytes())?;
+            let mut buffer = [0; MESSAGE_MAX];
+            let status = Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?);
+            if status == Status::Unknown(proto_fs::STALE_PROOF) {
+                proof.ready()?;
+                continue;
+            }
+            if status != Status::Ok {
+                return Err(status);
+            }
+            return reply.handles.take::<Channel>(0).map_err(Status::Kernel);
+        }
+    }
+
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, Status> {
         Ok(Self {
             channel: service::connect(parent, "ramfs")?,
@@ -214,12 +385,11 @@ impl Files {
     /// file is a random device, whose reads the caller serves itself.
     pub fn open_marked(&self, path: &str, flags: u32) -> Result<(u32, bool), Status> {
         valid_path(path.as_bytes())?;
-        let mut w = Writer::new();
-        Method::Open.header().write(&mut w)?;
-        w.u32(flags)?;
-        w.bytes(path.as_bytes())?;
+        self.open_marked_bytes(path.as_bytes(), flags)
+    }
+    pub fn open_marked_bytes(&self, path: &[u8], flags: u32) -> Result<(u32, bool), Status> {
         let mut reply = [0; MESSAGE_MAX];
-        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let bytes = self.path_call(Method::Open, path, Some(flags), &mut reply)?;
         let mut r = Reader::new(bytes);
         if r.u32()? != 0 {
             return Err(Status::BadSize);
@@ -368,13 +538,8 @@ impl Files {
         index: u32,
         out: &mut [u8],
     ) -> Result<Option<(usize, u32)>, Status> {
-        valid_path(path.as_bytes())?;
-        let mut w = Writer::new();
-        Method::ReadDir.header().write(&mut w)?;
-        w.u32(index)?;
-        w.bytes(path.as_bytes())?;
         let mut reply = [0; MESSAGE_MAX];
-        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let bytes = self.path_call(Method::ReadDir, path.as_bytes(), Some(index), &mut reply)?;
         let mut r = Reader::new(bytes);
         if r.u32()? != 0 {
             return Err(Status::BadSize);
@@ -422,11 +587,11 @@ impl Files {
 
     pub fn lookup(&self, path: &str) -> Result<Metadata, Status> {
         valid_path(path.as_bytes())?;
-        let mut w = Writer::new();
-        Method::Lookup.header().write(&mut w)?;
-        w.bytes(path.as_bytes())?;
+        self.lookup_bytes(path.as_bytes())
+    }
+    pub fn lookup_bytes(&self, path: &[u8]) -> Result<Metadata, Status> {
         let mut reply = [0; MESSAGE_MAX];
-        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let bytes = self.path_call(Method::Lookup, path, None, &mut reply)?;
         let mut r = Reader::new(bytes);
         if r.u32()? != 0 {
             return Err(Status::BadSize);
@@ -443,11 +608,18 @@ impl Files {
     }
 
     pub fn node_information(&self, path: &str) -> Result<proto_fs::NodeInfo, Status> {
-        valid_path(path.as_bytes())?;
-        let mut w = Writer::new();
-        Method::InfoPath.header().write(&mut w)?;
-        w.bytes(path.as_bytes())?;
-        self.information(w.as_bytes())
+        self.node_information_bytes(path.as_bytes())
+    }
+    pub fn node_information_bytes(&self, path: &[u8]) -> Result<proto_fs::NodeInfo, Status> {
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = self.path_call(Method::InfoPath, path, None, &mut reply)?;
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let info = proto_fs::NodeInfo::read(&mut r)?;
+        r.finish()?;
+        Ok(info)
     }
 
     pub fn descriptor_information(&self, fd: u32) -> Result<proto_fs::NodeInfo, Status> {

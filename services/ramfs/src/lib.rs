@@ -8,6 +8,10 @@
 //! are exercised through the same backend on the host.
 #![cfg_attr(not(test), no_std)]
 
+pub mod authority;
+pub mod resolve;
+#[cfg(test)]
+mod resolve_tests;
 pub mod storage;
 #[cfg(test)]
 mod storage_tests;
@@ -194,6 +198,9 @@ struct Open {
 pub struct Fds {
     slots: [Option<u8>; OPEN_MAX],
     pub claimed: bool,
+    pub binding: authority::Binding,
+    pub authority_index: u16,
+    pub resolvers: [u64; 16],
     pub root: storage::Root,
     pub cwd: Option<Token>,
     preparations: [Option<storage::Reservation>; 16],
@@ -204,6 +211,9 @@ impl Default for Fds {
         Self {
             slots: [None; OPEN_MAX],
             claimed: false,
+            binding: authority::Binding::Unbound,
+            authority_index: storage::NONE,
+            resolvers: [0; 16],
             root: BOOT_ROOT,
             cwd: None,
             preparations: [None; 16],
@@ -491,6 +501,29 @@ impl<'a> Ram<'a> {
         Ok(token)
     }
 
+    /// One reference or preparation per cleanup step.
+    pub fn release_step(&mut self, fds: &mut Fds) -> bool {
+        if let Some(r) = fds
+            .preparations
+            .iter_mut()
+            .find(|r| r.is_some())
+            .and_then(Option::take)
+        {
+            let _ = self.storage.cancel(r);
+            return true;
+        }
+        if let Some(cwd) = fds.cwd.take() {
+            let _ = self.storage.unpin(cwd, Pin::Cwd);
+            return true;
+        }
+        let first = fds.numbers().next();
+        if let Some(fd) = first {
+            let _ = self.close(fds, fd);
+            return true;
+        }
+        false
+    }
+
     pub fn description_token(&self, fds: &Fds, fd: u32) -> Result<Token, u32> {
         let slot = fds.description(fd)?;
         Ok(Token {
@@ -501,6 +534,16 @@ impl<'a> Ram<'a> {
         })
     }
 
+    /// A raw token can serve as a relative base only when this session retains it.
+    pub fn owns_directory_base(&self, fds: &Fds, token: Token) -> bool {
+        if !self.storage.node(token).is_ok_and(|n| n.kind == DIR) {
+            return false;
+        }
+        fds.cwd.unwrap_or(storage::ROOT) == token
+            || fds
+                .numbers()
+                .any(|fd| self.description_token(fds, fd) == Ok(token))
+    }
     pub fn set_cwd_token(&mut self, fds: &mut Fds, token: Token) -> Result<(), u32> {
         if self.storage.node(token)?.kind != DIR {
             return Err(proto_fs::NOT_DIRECTORY);
@@ -594,6 +637,49 @@ impl<'a> Ram<'a> {
             Err(NO_ENTRY) if changes => return Err(proto_fs::INVALID_ARGUMENT),
             found => found?,
         };
+        self.open_file(
+            fds,
+            file,
+            flags
+                | if directory_only {
+                    proto_fs::DIRECTORY_ONLY
+                } else {
+                    0
+                }
+                | if changes { proto_fs::CHANGES } else { 0 },
+        )
+    }
+
+    pub fn open_token(
+        &mut self,
+        fds: &mut Fds,
+        token: Token,
+        flags: u32,
+        identity: authority::Identity,
+    ) -> Result<u32, u32> {
+        if flags & !15 != 0 || flags & 3 == 3 {
+            return Err(proto_wire::BAD_SIZE);
+        }
+        let file = self.file(token);
+        if flags & proto_fs::CHANGES != 0 && !file.is_device() {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let node = self.storage.node(token)?;
+        let bits = match flags & 3 {
+            proto_fs::READ_ONLY => 4,
+            proto_fs::WRITE_ONLY => 2,
+            _ => 6,
+        };
+        if !identity.permits(node, bits) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        self.open_file(fds, self.file(token), flags)
+    }
+
+    fn open_file(&mut self, fds: &mut Fds, file: File, flags: u32) -> Result<u32, u32> {
+        let changes = flags & proto_fs::CHANGES != 0;
+        let directory_only = flags & proto_fs::DIRECTORY_ONLY != 0;
+        let flags = flags & 3;
         if changes && !file.is_device() {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
@@ -715,6 +801,41 @@ impl<'a> Ram<'a> {
     }
 
     /// The information of the program file of an image session.
+    pub fn exec_token(&self, token: Token, identity: authority::Identity) -> Result<Exec, u32> {
+        let n = self.storage.node(token)?;
+        if n.kind != REG || n.boot == storage::NONE || !identity.permits(n, 1) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        Ok(Exec {
+            entry: n.boot,
+            mode: n.mode,
+            uid: n.uid,
+            gid: n.gid,
+        })
+    }
+
+    pub fn token_information(&self, token: Token) -> Result<NodeInfo, u32> {
+        self.storage.node(token)?;
+        Ok(self.node_information(self.file(token)))
+    }
+
+    pub fn directory_read_token(
+        &mut self,
+        token: Token,
+        index: u32,
+        identity: authority::Identity,
+        now: u64,
+    ) -> Result<Option<DirectoryRecord<'a>>, u32> {
+        let node = self.storage.node(token)?;
+        if node.kind != DIR {
+            return Err(proto_fs::NOT_DIRECTORY);
+        }
+        if !identity.permits(node, 4) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        Ok(self.entry_of(self.file(token), index, now))
+    }
+
     pub fn image_information(&self, entry: u16) -> Result<NodeInfo, u32> {
         let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
         if entry >= tree.len() || tree.entry(entry).is_directory() {
@@ -1759,6 +1880,13 @@ mod tests {
             loader: Some(loader),
             index: 0,
             ctty: None,
+            image: 1,
+            groups: proto_process::Groups::EMPTY,
+            limits: proto_process::ResourceLimits::initial(2 * 1024 * 1024),
+            root: proto_process::ExpenditureRoot {
+                pid: 2,
+                generation: 1,
+            },
         };
         let loaders = proto_fs::LOADERS | 9;
         assert_eq!(
@@ -1780,6 +1908,13 @@ mod tests {
             loader: None,
             index: 0,
             ctty: None,
+            image: 1,
+            groups: proto_process::Groups::EMPTY,
+            limits: proto_process::ResourceLimits::initial(2 * 1024 * 1024),
+            root: proto_process::ExpenditureRoot {
+                pid: 2,
+                generation: 1,
+            },
             ..who
         };
         assert_eq!(exec_for(loaders, Some(process)), refused, "no loader");

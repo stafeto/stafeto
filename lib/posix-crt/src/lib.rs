@@ -342,6 +342,15 @@ fn loaded_main() -> u64 {
     if let Some(identity) = one(Slot::PosixId) {
         // SAFETY: still single-threaded, after the process service's init.
         unsafe { posix_abi::process::set_identity(Handle::from_raw(identity)) };
+        if posix_abi::shared::with_files(|files| {
+            files
+                .bind(posix_abi::process::identity().unwrap())
+                .map_err(posix_abi::error)
+        })
+        .is_err()
+        {
+            return 125;
+        }
     }
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
@@ -419,6 +428,15 @@ pub extern "C" fn crt_main(arg: u64) -> u64 {
     if let Some(identity) = identity {
         // SAFETY: still single-threaded, after the process service's init.
         unsafe { posix_abi::process::set_identity(identity) };
+        if posix_abi::shared::with_files(|files| {
+            files
+                .bind(posix_abi::process::identity().unwrap())
+                .map_err(posix_abi::error)
+        })
+        .is_err()
+        {
+            return 125;
+        }
     }
     posix_abi::fork::at_child(forked);
     start_relibc(&arguments[..count])

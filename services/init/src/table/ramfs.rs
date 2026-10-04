@@ -19,10 +19,10 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 40,
         ceiling: 40,
-        // 4096 data pages + 457 table pages + 21 code/rodata pages
+        // 4096 data pages + 603 table pages + 25 code/rodata pages
         // + 12 stack pages + 128 reserve pages, measured with the RAM image.
-        quota: (4096 + 457 + 21 + 12 + 128) * PAGE,
-        handle_limit: 32,
+        quota: (4096 + 603 + 25 + 12 + 128) * PAGE,
+        handle_limit: 512,
         restart: Restart::Never,
         console: true,
         log: false,
@@ -160,6 +160,24 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
         program: "posix-probe",
         connects: &["ramfs", "uart", "clock", "posix"],
         quota: 512 * PAGE,
+        // Diagnostic writers exercise the fixed root-owned /tmp/probe node.
+        root: true,
+        ..POSIX
+    },
+];
+
+/// The authentic identity and bounded file proof fixture, before public mutation APIs.
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "clock", "posix"],
+        quota: 2048 * PAGE,
+        root: true,
         ..POSIX
     },
 ];
@@ -241,6 +259,7 @@ pub const RELIBC_TABLE: &[Record] = &[
     Record {
         name: "relibc-hello",
         program: "relibc-hello",
+        root: true,
         args: b"relibc-hello\0",
         connects: &["ramfs", "clock", "posix"],
         quota: 512 * PAGE,
