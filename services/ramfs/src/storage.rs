@@ -523,11 +523,22 @@ impl<'a> Storage<'a> {
         self.state.original_len + DENTRIES
     }
     pub fn lookup(&self, parent: Token, name: &[u8]) -> Result<Token, u32> {
-        for i in 0..self.entries() {
-            if let Some((n, t)) = self.entry(parent, i)
-                && n == name
+        for (i, original) in self.state.originals[..self.state.original_len]
+            .iter()
+            .enumerate()
+        {
+            if !original.hidden && original.parent == parent && self.original_name(i) == name {
+                return Ok(original.node);
+            }
+        }
+        for dentry in &self.state.dentries {
+            if dentry.len != 0
+                && !dentry.reserved
+                && dentry.parent == parent
+                && dentry.len as usize == name.len()
+                && &dentry.name[..dentry.len as usize] == name
             {
-                return Ok(t);
+                return Ok(dentry.node);
             }
         }
         Err(NO_ENTRY)
@@ -1027,6 +1038,7 @@ impl<'a> Storage<'a> {
 
 #[cfg(test)]
 mod page_tests {
+    extern crate std;
     use super::*;
 
     const FIRST: Root = Root {
@@ -1048,6 +1060,109 @@ mod page_tests {
             assert!(steps <= PAGES + INODES);
         }
         steps
+    }
+
+    #[test]
+    fn lookup_matches_entry_oracle_at_full_dentry_capacity() {
+        use bootimg::rootfs::{Entry, REGULAR};
+        let image = crate::tree::test_image(&[Entry {
+            path: "/boot",
+            mode: REGULAR | 0o644,
+            uid: 1,
+            gid: 2,
+            file: 1,
+        }]);
+        let mut index = crate::tree::Index::new();
+        let tree = crate::tree::load(&image, &mut index).unwrap();
+        let mut ram = crate::Ram::with_tree(0, tree);
+        let storage = &mut ram.storage;
+        let directory = storage
+            .reserve(FIRST, ROOT, b"directory", (crate::DIR, 0o755, 0, 0))
+            .unwrap();
+        let directory = storage.commit(directory).unwrap();
+        let shared = create(storage, b"same");
+        let nested = storage
+            .reserve(FIRST, directory, b"same", (crate::REG, 0o644, 0, 0))
+            .unwrap();
+        let nested = storage.commit(nested).unwrap();
+        let raw = create(storage, b"\xffraw");
+        let _pending = storage
+            .reserve(FIRST, ROOT, b"pending", (crate::REG, 0o644, 0, 0))
+            .unwrap();
+        let oracle = |storage: &Storage<'_>, parent, name: &[u8]| {
+            (0..storage.entries())
+                .find_map(|i| {
+                    storage
+                        .entry(parent, i)
+                        .filter(|(bytes, _)| *bytes == name)
+                        .map(|(_, token)| token)
+                })
+                .ok_or(NO_ENTRY)
+        };
+        for parent in [ROOT, directory] {
+            for name in [
+                b"same".as_slice(),
+                b"\xffraw",
+                b"pending",
+                b"boot",
+                b"",
+                b"absent",
+            ] {
+                assert_eq!(storage.lookup(parent, name), oracle(storage, parent, name));
+            }
+        }
+        assert_eq!(storage.lookup(ROOT, b"same"), Ok(shared));
+        assert_eq!(storage.lookup(directory, b"same"), Ok(nested));
+        assert_eq!(storage.lookup(ROOT, b"\xffraw"), Ok(raw));
+        assert_eq!(storage.lookup(ROOT, b"pending"), Err(NO_ENTRY));
+        storage.unlink(ROOT, b"boot", FIRST).unwrap();
+        assert_eq!(
+            storage.lookup(ROOT, b"boot"),
+            oracle(storage, ROOT, b"boot")
+        );
+        assert_eq!(storage.lookup(ROOT, b"boot"), Err(NO_ENTRY));
+        for i in 0..DENTRIES {
+            if storage.available().dentries == 0 {
+                break;
+            }
+            let root = if storage.usage(FIRST).dentries < DENTRY_SHARE {
+                FIRST
+            } else {
+                Root {
+                    id: 22,
+                    generation: 9,
+                }
+            };
+            storage
+                .link(root, ROOT, std::format!("filler{i}").as_bytes(), shared)
+                .unwrap();
+        }
+        assert_eq!(storage.available().dentries, 0);
+        let last = &storage.state.dentries[DENTRIES - 1];
+        let name = &last.name[..last.len as usize];
+        assert!(!name.is_empty());
+        assert_eq!(storage.lookup(ROOT, name), Ok(shared));
+        for parent in [ROOT, directory] {
+            assert_eq!(storage.lookup(parent, name), oracle(storage, parent, name));
+            for i in 0..storage.entries() {
+                if let Some((name, _)) = storage.entry(parent, i) {
+                    assert_eq!(storage.lookup(parent, name), oracle(storage, parent, name));
+                }
+            }
+        }
+        assert_eq!(
+            storage.lookup(ROOT, b"still-absent"),
+            oracle(storage, ROOT, b"still-absent")
+        );
+        let last_name = std::vec::Vec::from(name);
+        let usage = storage.usage(FIRST);
+        assert_eq!(
+            storage
+                .reserve(FIRST, ROOT, &last_name, (crate::REG, 0o644, 0, 0))
+                .err(),
+            Some(proto_fs::INVALID_ARGUMENT)
+        );
+        assert_eq!(storage.usage(FIRST), usage);
     }
 
     #[test]
