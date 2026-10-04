@@ -32,6 +32,8 @@ pub struct Recovery {
     pub description_generation: u64,
     pub backend_fd: u32,
     pub phase: Phase,
+    /// Captured before Start; writable-only Random uses the RAM route.
+    pub access: u8,
 }
 
 const _: () = assert!(core::mem::size_of::<Recovery>() == 24);
@@ -56,9 +58,19 @@ impl PosixFs {
     pub fn begin_open_record(
         &mut self,
         owner: OwnerToken,
+        access: u32,
     ) -> Result<(OpenToken, ClaimToken), FsError> {
+        if access > proto_fs::READ_WRITE {
+            return Err(FsError::InvalidArgument);
+        }
         self.descriptors
-            .begin_open(owner, Recovery::default())
+            .begin_open(
+                owner,
+                Recovery {
+                    access: access as u8,
+                    ..Recovery::default()
+                },
+            )
             .map_err(FsError::from)
     }
 

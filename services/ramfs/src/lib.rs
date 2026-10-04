@@ -960,6 +960,30 @@ impl<'a> Ram<'a> {
         }
     }
 
+    /// Capture a published description before importing it into a local table.
+    pub fn capture_description(&self, fds: &Fds, fd: u32) -> Result<(TentativeOpen, u32), u32> {
+        let description = self.description_token(fds, fd)?;
+        let flags = self.descriptions[description.slot as usize]
+            .as_ref()
+            .ok_or(BAD_FD)?
+            .open
+            .flags;
+        Ok((TentativeOpen { fd, description }, flags))
+    }
+
+    /// A stale exact cleanup leaves the replacement and its shared references intact.
+    pub fn close_exact_description(
+        &mut self,
+        fds: &mut Fds,
+        held: TentativeOpen,
+    ) -> Result<bool, u32> {
+        if self.description_token(fds, held.fd) != Ok(held.description) {
+            return Ok(false);
+        }
+        self.close(fds, held.fd)?;
+        Ok(true)
+    }
+
     /// Clone's descriptors: a session's of the same numbers as `list` of
     /// `fds`, which share their descriptions, offsets and access modes;
     /// BAD_FD for a number no descriptor has. O(OPEN_MAX).
@@ -2262,6 +2286,8 @@ mod tests {
         assert_ne!(regular.description.slot, old.description.slot);
         assert_eq!(regular.description.generation, old.description.generation);
         assert_eq!(ram.marked_open(&fds, old), Err(BAD_FD));
+        assert_eq!(ram.close_exact_description(&mut fds, old), Ok(false));
+        assert_eq!(ram.description_token(&fds, regular.fd), Err(BAD_FD));
         assert_eq!(
             ram.marked_open(&fds, regular),
             Ok(regular.fd
@@ -2272,6 +2298,11 @@ mod tests {
             generation: 2,
         };
         ram.finish_open(&mut fds, new_key, regular).unwrap();
+        assert_eq!(
+            ram.capture_description(&fds, regular.fd),
+            Ok((regular, READ_WRITE))
+        );
+        assert_eq!(ram.close_exact_description(&mut fds, old), Ok(false));
         assert_eq!(
             ram.finished_open(&fds, old_key),
             Err(proto_fs::OPEN_RETIRED)

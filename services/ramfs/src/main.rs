@@ -801,7 +801,28 @@ impl Fs {
             let Ok(n) = body.u32() else {
                 return Answer::Status(Status::BadSize);
             };
-            *fd = n;
+            if r.method() == Method::CloneExact as u16 {
+                let Ok(generation) = body.u64() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if n & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+                    || !(3..35).contains(&(n & proto_fs::OPEN_FD_MASK))
+                    || generation == 0
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                *fd = n & proto_fs::OPEN_FD_MASK;
+                let expected = ramfs::storage::Token {
+                    slot: ((n & proto_fs::OPEN_DESCRIPTION_MASK)
+                        >> proto_fs::OPEN_DESCRIPTION_SHIFT) as u16,
+                    generation,
+                };
+                if self.ram.description_token(fds, *fd) != Ok(expected) {
+                    return status(proto_fs::STALE_PROOF);
+                }
+            } else {
+                *fd = n;
+            }
         }
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
@@ -1140,6 +1161,7 @@ impl Service<0> for Fs {
                 Method::from_number(r.method()),
                 Some(
                     Method::Close
+                        | Method::CloseExact
                         | Method::ResolveCancel
                         | Method::OpenCancel
                         | Method::VerifySession
@@ -1183,14 +1205,14 @@ impl Service<0> for Fs {
         }
         let cleanup = matches!(
             Method::from_number(r.method()),
-            Some(Method::Close | Method::ResolveCancel)
+            Some(Method::Close | Method::CloseExact | Method::ResolveCancel)
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
         }
         let mut body = r.body();
         match Method::from_number(r.method()) {
-            Some(Method::Clone) => self.clone_session(&s.data, r),
+            Some(Method::Clone | Method::CloneExact) => self.clone_session(&s.data, r),
             Some(
                 Method::OpenExec
                 | Method::ReadInto
@@ -1380,6 +1402,58 @@ impl Service<0> for Fs {
                 }
                 match self.ram.size(&s.data, fd) {
                     Ok(size) => value(r, size),
+                    Err(code) => status(code),
+                }
+            }
+            Some(Method::CaptureDescription) => {
+                let Ok(fd) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() || !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let (held, flags) = match self.ram.capture_description(&s.data, fd) {
+                    Ok(captured) => captured,
+                    Err(code) => return status(code),
+                };
+                let packed = match self.ram.marked_open(&s.data, held) {
+                    Ok(word) => word,
+                    Err(code) => return status(code),
+                };
+                if r.reply()
+                    .u32(0)
+                    .and_then(|()| r.reply().u32(packed))
+                    .and_then(|()| r.reply().u64(held.description.generation))
+                    .and_then(|()| r.reply().u32(flags))
+                    .is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            Some(Method::CloseExact) => {
+                let (Ok(packed), Ok(generation)) = (body.u32(), body.u64()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err()
+                    || !r.handles.is_empty()
+                    || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+                    || !(3..35).contains(&(packed & proto_fs::OPEN_FD_MASK))
+                    || generation == 0
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                let held = ramfs::TentativeOpen {
+                    fd: packed & proto_fs::OPEN_FD_MASK,
+                    description: ramfs::storage::Token {
+                        slot: ((packed & proto_fs::OPEN_DESCRIPTION_MASK)
+                            >> proto_fs::OPEN_DESCRIPTION_SHIFT)
+                            as u16,
+                        generation,
+                    },
+                };
+                match self.ram.close_exact_description(&mut s.data, held) {
+                    Ok(closed) => value(r, u32::from(!closed)),
                     Err(code) => status(code),
                 }
             }

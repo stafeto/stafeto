@@ -118,6 +118,19 @@ impl PreparedOpen {
     }
 }
 
+/// Startup imports capture the exact existing descriptor and its access policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapturedDescription {
+    pub held: PreparedOpen,
+    pub flags: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseOutcome {
+    Closed,
+    AlreadyGone,
+}
+
 /// Recovery separates a live paid preparation from its completed descriptor handoff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenOutcome {
@@ -261,6 +274,91 @@ impl Files {
         let reply = Self::send_on(&self.channel, w.as_bytes())?;
         Self::open_commit_reply(&reply)
     }
+    /// Bind precedes this read-only normalization; imports publish after exact capture.
+    pub fn capture_description(&self, fd: u32) -> Result<CapturedDescription, Status> {
+        let mut w = Writer::new();
+        Method::CaptureDescription.header().write(&mut w)?;
+        w.u32(fd)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::capture_description_reply(&reply)
+    }
+
+    pub fn capture_description_reply(reply: &sys::Reply) -> Result<CapturedDescription, Status> {
+        Self::open_reply(reply, 20)?;
+        let held = Self::open_description((reply.words[0] >> 32) as u32, reply.words[1])?;
+        let flags = reply.words[2] as u32;
+        if flags & !(3 | proto_fs::APPEND) != 0 || flags & 3 == 3 {
+            return Err(Status::BadSize);
+        }
+        Ok(CapturedDescription { held, flags })
+    }
+
+    /// Canonical exact cleanup preserves a replacement at the same numeric fd.
+    pub fn close_exact(&self, held: PreparedOpen) -> Result<CloseOutcome, Status> {
+        let mut w = Writer::new();
+        Method::CloseExact.header().write(&mut w)?;
+        w.u32(Self::exact_description_word(held)?)?;
+        w.u64(held.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::close_exact_reply(&reply)
+    }
+
+    pub fn close_exact_reply(reply: &sys::Reply) -> Result<CloseOutcome, Status> {
+        if Self::reply_code(reply)? != 0 {
+            Self::open_reply(reply, 8)?;
+        }
+        if reply.len != 8 || !reply.handles.is_empty() {
+            return Err(Status::BadSize);
+        }
+        match reply.words[0] >> 32 {
+            0 => Ok(CloseOutcome::Closed),
+            1 => Ok(CloseOutcome::AlreadyGone),
+            _ => Err(Status::BadSize),
+        }
+    }
+
+    fn exact_description_word(held: PreparedOpen) -> Result<u32, Status> {
+        if !(3..35).contains(&held.fd) || held.slot >= 128 || held.generation == 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(held.fd | (held.slot << proto_fs::OPEN_DESCRIPTION_SHIFT))
+    }
+
+    /// Whole-list token validation precedes every shared reference and CWD effect.
+    pub fn clone_exact_on(
+        channel: &Handle<Channel>,
+        descriptions: &[PreparedOpen],
+    ) -> Result<Handle<Channel>, Status> {
+        if descriptions.len() > 32 {
+            return Err(Status::BadSize);
+        }
+        let mut w = Writer::new();
+        Method::CloneExact.header().write(&mut w)?;
+        w.u32(descriptions.len() as u32)?;
+        for held in descriptions {
+            w.u32(Self::exact_description_word(*held)?)?;
+            w.u64(held.generation)?;
+        }
+        let mut reply = Self::send_on(channel, w.as_bytes())?;
+        let code = Self::reply_code(&reply)?;
+        if code != 0 {
+            return match Self::open_reply(&reply, 4) {
+                Err(error) => Err(error),
+                Ok(()) => Err(Status::BadSize),
+            };
+        }
+        if reply.len != 4
+            || reply.handles.len() != 1
+            || !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                kind == abi::ObjectKind::Channel
+                    && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+            })
+        {
+            return Err(Status::BadSize);
+        }
+        reply.handles.take(0).map_err(Status::Kernel)
+    }
+
     /// The numeric-reservation phase performs one request before releasing its defer.
     /// AUTHENTICATING leaves staged refresh to the caller's recovery decision.
     pub fn open_finish_once(&self, key: proto_fs::OpenKey) -> Result<PreparedOpen, Status> {
