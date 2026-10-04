@@ -302,6 +302,433 @@ pub struct Storage<'a> {
     data: &'a mut [u8],
     pub tree: Option<Tree<'a>>,
 }
+
+#[derive(Clone, Copy)]
+struct TempPage {
+    physical: u16,
+    logical: u16,
+    ready: bool,
+}
+impl TempPage {
+    const EMPTY: Self = Self {
+        physical: NONE,
+        logical: NONE,
+        ready: false,
+    };
+}
+
+pub(crate) struct DataWrite {
+    token: Token,
+    generation: u64,
+    overlay: u16,
+    private_overlay: bool,
+    root: u16,
+    pages: [TempPage; 2],
+    pub offset: u64,
+    pub count: usize,
+    committed: bool,
+    canceled: bool,
+}
+
+pub(crate) struct DataTruncate {
+    token: Token,
+    generation: u64,
+    old_length: u64,
+    pub length: u64,
+    overlay: u16,
+    root: u16,
+    tail: TempPage,
+    scan: usize,
+    detached: usize,
+    committed: bool,
+    canceled: bool,
+}
+
+impl Storage<'_> {
+    fn io_generation(&self, token: Token, generation: u64) -> Result<(), u32> {
+        if self.node(token)?.data_generation != generation {
+            return Err(proto_fs::STALE_PROOF);
+        }
+        Ok(())
+    }
+
+    fn io_preflight(&self, token: Token) -> Result<(), u32> {
+        self.node(token)?
+            .data_generation
+            .checked_add(1)
+            .ok_or(NO_SPACE)?;
+        self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
+        Ok(())
+    }
+
+    fn io_take_page(&mut self, root: u16, logical: usize) -> TempPage {
+        self.state.page_len -= 1;
+        let physical = self.state.page_free[self.state.page_len];
+        self.state.accounts[root as usize]
+            .as_mut()
+            .expect("paid root")
+            .usage
+            .pages += 1;
+        TempPage {
+            physical,
+            logical: logical as u16,
+            ready: false,
+        }
+    }
+
+    fn io_free_page(&mut self, root: u16, page: &mut TempPage) {
+        self.state.page_free[self.state.page_len] = page.physical;
+        self.state.page_len += 1;
+        self.uncharge(root as usize, |usage| &mut usage.pages);
+        *page = TempPage::EMPTY;
+    }
+
+    fn io_initialize_page(&mut self, token: Token, page: &mut TempPage, source: u16) {
+        let destination = page.physical as usize * PAGE;
+        if source != NONE {
+            let source = source as usize * PAGE;
+            self.data.copy_within(source..source + PAGE, destination);
+        } else {
+            let boot = self.boot_bytes(token);
+            let at = page.logical as usize * PAGE;
+            let amount = boot.len().saturating_sub(at).min(PAGE);
+            let data = &mut self.data[destination..destination + PAGE];
+            data[..amount].copy_from_slice(&boot[at.min(boot.len())..at.min(boot.len()) + amount]);
+            data[amount..].fill(0);
+        }
+        page.ready = true;
+    }
+
+    pub(crate) fn prepare_data_write(
+        &mut self,
+        token: Token,
+        root: Root,
+        offset: u64,
+        requested: usize,
+    ) -> Result<DataWrite, u32> {
+        self.io_preflight(token)?;
+        let capacity = (FILE_PAGES * PAGE) as u64;
+        if offset >= capacity {
+            return Err(proto_fs::FILE_TOO_LARGE);
+        }
+        offset
+            .checked_add(requested as u64)
+            .filter(|end| *end <= i64::MAX as u64)
+            .ok_or(proto_fs::OFFSET_OVERFLOW)?;
+        let existing = self.node(token)?.overlay;
+        let account = if existing == NONE {
+            self.account(root)?
+        } else {
+            self.state.overlays[existing as usize].root as usize
+        };
+        let usage = self.state.accounts[account]
+            .expect("retained account")
+            .usage;
+        if existing == NONE && (self.state.inode_len == 0 || usage.inodes == INODE_SHARE) {
+            return Err(NO_SPACE);
+        }
+        let mut credit = self.state.page_len.min((PAGE_SHARE - usage.pages) as usize);
+        let wanted = requested.min((capacity - offset) as usize);
+        let mut count = 0;
+        while count < wanted {
+            let at = offset as usize + count;
+            let amount = (PAGE - at % PAGE).min(wanted - count);
+            let missing =
+                existing == NONE || self.state.overlays[existing as usize].pages[at / PAGE] == NONE;
+            if missing {
+                if credit == 0 {
+                    break;
+                }
+                credit -= 1;
+            }
+            count += amount;
+        }
+        if count == 0 {
+            return Err(NO_SPACE);
+        }
+        let overlay = if existing == NONE {
+            self.state.inode_len -= 1;
+            let slot = self.state.inode_free[self.state.inode_len];
+            // Free overlays have no mapped pages; reclamation cleared each entry.
+            let held = &mut self.state.overlays[slot as usize];
+            debug_assert_eq!(held.head, NONE);
+            held.node = token.slot;
+            held.root = account as u16;
+            self.state.accounts[account].as_mut().unwrap().usage.inodes += 1;
+            slot
+        } else {
+            existing
+        };
+        let mut pages = [TempPage::EMPTY; 2];
+        let mut next = 0;
+        let first = offset as usize / PAGE;
+        let last = (offset as usize + count - 1) / PAGE;
+        for logical in first..=last {
+            if self.state.overlays[overlay as usize].pages[logical] == NONE {
+                pages[next] = self.io_take_page(account as u16, logical);
+                next += 1;
+            }
+        }
+        Ok(DataWrite {
+            token,
+            generation: self.node(token)?.data_generation,
+            overlay,
+            private_overlay: existing == NONE,
+            root: account as u16,
+            pages,
+            offset,
+            count,
+            committed: false,
+            canceled: false,
+        })
+    }
+
+    pub(crate) fn step_data_write(&mut self, data: &mut DataWrite) -> Result<bool, u32> {
+        if data.canceled {
+            return Err(proto_fs::BAD_FD);
+        }
+        self.io_generation(data.token, data.generation)?;
+        if let Some(page) = data
+            .pages
+            .iter_mut()
+            .find(|page| page.physical != NONE && !page.ready)
+        {
+            self.io_initialize_page(data.token, page, NONE);
+        }
+        Ok(data
+            .pages
+            .iter()
+            .all(|page| page.physical == NONE || page.ready))
+    }
+
+    pub(crate) fn commit_data_write(
+        &mut self,
+        data: &mut DataWrite,
+        bytes: &[u8],
+        now: u64,
+    ) -> Result<(), u32> {
+        if data.committed {
+            return Ok(());
+        }
+        if data.canceled
+            || bytes.len() != data.count
+            || data
+                .pages
+                .iter()
+                .any(|page| page.physical != NONE && !page.ready)
+        {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        self.io_generation(data.token, data.generation)?;
+        self.io_preflight(data.token)?;
+        let overlay = &mut self.state.overlays[data.overlay as usize];
+        for page in &mut data.pages {
+            if page.physical == NONE {
+                continue;
+            }
+            overlay.pages[page.logical as usize] = page.physical;
+            self.state.page_logical[page.physical as usize] = page.logical;
+            self.state.page_next[page.physical as usize] = overlay.head;
+            overlay.head = page.physical;
+            *page = TempPage::EMPTY;
+        }
+        let mut done = 0;
+        while done < bytes.len() {
+            let at = data.offset as usize + done;
+            let amount = (PAGE - at % PAGE).min(bytes.len() - done);
+            let physical = overlay.pages[at / PAGE] as usize;
+            let start = physical * PAGE + at % PAGE;
+            self.data[start..start + amount].copy_from_slice(&bytes[done..done + amount]);
+            done += amount;
+        }
+        let node = &mut self.state.nodes[data.token.slot as usize];
+        node.overlay = data.overlay;
+        node.length = node.length.max(data.offset + data.count as u64);
+        node.data_generation += 1;
+        node.times[1] = now;
+        node.times[2] = now;
+        node.mode &= !0o6000;
+        self.state.epoch += 1;
+        data.private_overlay = false;
+        data.committed = true;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_data_write(&mut self, data: &mut DataWrite) -> Result<bool, u32> {
+        data.canceled = true;
+        if let Some(page) = data.pages.iter_mut().find(|page| page.physical != NONE) {
+            self.io_free_page(data.root, page);
+            return Ok(false);
+        }
+        if data.private_overlay {
+            let overlay = &mut self.state.overlays[data.overlay as usize];
+            overlay.node = NONE;
+            overlay.root = NONE;
+            self.state.inode_free[self.state.inode_len] = data.overlay;
+            self.state.inode_len += 1;
+            self.uncharge(data.root as usize, |usage| &mut usage.inodes);
+            data.private_overlay = false;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn prepare_data_truncate(
+        &mut self,
+        token: Token,
+        length: u64,
+    ) -> Result<DataTruncate, u32> {
+        self.io_preflight(token)?;
+        let node = *self.node(token)?;
+        let root = if node.overlay == NONE {
+            NONE
+        } else {
+            self.state.overlays[node.overlay as usize].root
+        };
+        let mut tail = TempPage::EMPTY;
+        if length < node.length && !length.is_multiple_of(PAGE as u64) && node.overlay != NONE {
+            let logical = length as usize / PAGE;
+            if self.state.overlays[node.overlay as usize].pages[logical] != NONE {
+                let usage = self.state.accounts[root as usize]
+                    .expect("retained root")
+                    .usage;
+                if self.state.page_len == 0 || usage.pages == PAGE_SHARE {
+                    return Err(NO_SPACE);
+                }
+                tail = self.io_take_page(root, logical);
+            }
+        }
+        let scan = if length == 0 || length >= node.length || node.overlay == NONE {
+            FILE_PAGES
+        } else {
+            0
+        };
+        Ok(DataTruncate {
+            token,
+            generation: node.data_generation,
+            old_length: node.length,
+            length,
+            overlay: node.overlay,
+            root,
+            tail,
+            scan,
+            detached: 0,
+            committed: false,
+            canceled: false,
+        })
+    }
+
+    pub(crate) fn step_data_truncate(&mut self, data: &mut DataTruncate) -> Result<bool, u32> {
+        if data.canceled {
+            return Err(proto_fs::BAD_FD);
+        }
+        self.io_generation(data.token, data.generation)?;
+        if data.tail.physical != NONE && !data.tail.ready {
+            let source =
+                self.state.overlays[data.overlay as usize].pages[data.tail.logical as usize];
+            self.io_initialize_page(data.token, &mut data.tail, source);
+            let start = data.tail.physical as usize * PAGE + data.length as usize % PAGE;
+            let end = (data.tail.physical as usize + 1) * PAGE;
+            self.data[start..end].fill(0);
+            return Ok(data.scan == FILE_PAGES);
+        }
+        let end = (data.scan + 64).min(FILE_PAGES);
+        if data.scan < end {
+            let first_removed = (data.length as usize).div_ceil(PAGE);
+            for logical in data.scan..end {
+                if self.state.overlays[data.overlay as usize].pages[logical] != NONE
+                    && (logical >= first_removed || logical == data.tail.logical as usize)
+                {
+                    data.detached += 1;
+                }
+            }
+            data.scan = end;
+        }
+        Ok(data.scan == FILE_PAGES)
+    }
+
+    pub(crate) fn commit_data_truncate(
+        &mut self,
+        data: &mut DataTruncate,
+        now: u64,
+    ) -> Result<(), u32> {
+        if data.committed {
+            return Ok(());
+        }
+        if data.canceled
+            || data.scan != FILE_PAGES
+            || (data.tail.physical != NONE && !data.tail.ready)
+        {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        self.io_generation(data.token, data.generation)?;
+        self.io_preflight(data.token)?;
+        if data.length == 0 {
+            self.truncate_zero(data.token, now)?;
+            self.state.nodes[data.token.slot as usize].mode &= !0o6000;
+            data.committed = true;
+            return Ok(());
+        }
+        if data.length < data.old_length && data.overlay != NONE {
+            if data.detached != 0 && self.state.retired_len == PAGES {
+                return Err(NO_SPACE);
+            }
+            let first_removed = (data.length as usize).div_ceil(PAGE);
+            let overlay = &mut self.state.overlays[data.overlay as usize];
+            let mut live = NONE;
+            let mut retired = NONE;
+            for logical in 0..FILE_PAGES {
+                let old = overlay.pages[logical];
+                if old == NONE {
+                    continue;
+                }
+                if logical >= first_removed || logical == data.tail.logical as usize {
+                    self.state.page_next[old as usize] = retired;
+                    retired = old;
+                    overlay.pages[logical] = NONE;
+                } else {
+                    self.state.page_next[old as usize] = live;
+                    live = old;
+                }
+            }
+            if data.tail.physical != NONE {
+                overlay.pages[data.tail.logical as usize] = data.tail.physical;
+                self.state.page_logical[data.tail.physical as usize] = data.tail.logical;
+                self.state.page_next[data.tail.physical as usize] = live;
+                live = data.tail.physical;
+                data.tail = TempPage::EMPTY;
+            }
+            overlay.head = live;
+            if retired != NONE {
+                let tail = (self.state.retired_head + self.state.retired_len) % PAGES;
+                self.state.retired[tail] = RetiredPages {
+                    head: retired,
+                    root: data.root,
+                };
+                self.state.retired_len += 1;
+            }
+        }
+        let node = &mut self.state.nodes[data.token.slot as usize];
+        node.length = data.length;
+        node.boot_visible_length = node.boot_visible_length.min(data.length);
+        node.data_generation += 1;
+        node.times[1] = now;
+        node.times[2] = now;
+        node.mode &= !0o6000;
+        self.state.epoch += 1;
+        data.committed = true;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_data_truncate(&mut self, data: &mut DataTruncate) -> Result<bool, u32> {
+        data.canceled = true;
+        if data.tail.physical != NONE {
+            self.io_free_page(data.root, &mut data.tail);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
 impl<'a> Storage<'a> {
     pub fn new(state: &'a mut State, data: &'a mut [u8], tree: Option<Tree<'a>>, now: u64) -> Self {
         assert_eq!(data.len(), PAGES * PAGE);
