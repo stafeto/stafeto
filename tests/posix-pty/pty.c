@@ -25,6 +25,11 @@ extern uint32_t stafeto_pty_description(uint32_t fd);
 extern uint32_t stafeto_pty_query(uint32_t fd, uint32_t description);
 extern void stafeto_pty_action_packet(uint32_t mode);
 extern uint64_t stafeto_pty_action_result(void);
+extern int stafeto_pty_clone_full(uint32_t fd);
+extern void stafeto_pty_clone_clear(void);
+#ifdef PTY_CLONE_STEPS
+extern int stafeto_pty_clone_stats(uint32_t fd);
+#endif
 
 struct pair { int master, slave; char name[32]; };
 static int make_pair(struct pair *p) {
@@ -407,7 +412,57 @@ static int spawn_actions(void) {
     return 0;
 }
 
+static int clone_chain_count;
+static int clone_full_table(void) {
+    struct pair p;
+    CHECK(make_pair(&p) == 0);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        if (close(p.master) != 0 || close(p.slave) != 0) _exit(70);
+        for (int i = 0; i < 3; i++) if (close(i) != 0) _exit(71);
+        int fds[32];
+        for (unsigned i = 0; i < 32; i++) {
+            fds[i] = open(p.name, O_RDWR | O_NOCTTY);
+            if (fds[i] < 0) _exit(72);
+        }
+        int used = stafeto_pty_clone_full(fds[0]);
+        if (used < 250) { stafeto_pty_clone_clear(); _exit(73); }
+        pid_t grandchild = fork();
+        if (grandchild < 0) { stafeto_pty_clone_clear(); _exit(74); }
+        if (grandchild == 0) {
+            for (unsigned i = 0; i < 32; i++) {
+                struct stat info;
+                struct termios attributes;
+                if (!isatty(fds[i]) || fstat(fds[i], &info) != 0 || !S_ISCHR(info.st_mode) || tcgetattr(fds[i], &attributes) != 0) _exit(75);
+            }
+            _exit(0);
+        }
+        int status;
+        pid_t waited;
+        do { waited = waitpid(grandchild, &status, 0); } while (waited < 0 && errno == EINTR);
+        stafeto_pty_clone_clear();
+        if (waited != grandchild || !WIFEXITED(status) || WEXITSTATUS(status) != 0) _exit(76);
+        for (unsigned i = 0; i < 32; i++) if (close(fds[i]) != 0) _exit(77);
+        _exit(used);
+    }
+    int status;
+    pid_t waited;
+    do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    CHECK(waited == child && WIFEXITED(status) && WEXITSTATUS(status) >= 250);
+    clone_chain_count = WEXITSTATUS(status);
+    CHECK(close_pair(&p) == 0);
+#ifndef PTY_CLONE_STEPS
+    printf("posix-pty: 32 real descriptions survive a late fork after %d retained chain clones and limit refusal\n", clone_chain_count);
+#endif
+    return 0;
+}
+
+#include "ash-dialog.c"
+
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "ash-worker") == 0) return pty_ash_worker();
+    if (argc == 2 && strcmp(argv[1], "ash-link") == 0) return pty_ash_link();
     if (argc == 2 && strcmp(argv[1], "spawn-slave") == 0) return spawned_slave();
     if (argc == 2 && strcmp(argv[1], "spawn-empty") == 0) {
         errno = 0; CHECK(fcntl(9, F_GETFD) == -1 && errno == EBADF);
@@ -415,14 +470,29 @@ int main(int argc, char **argv) {
     }
     /* The file-loaded image supplies the region map used by fork. */
     if (argc == 1) {
+#ifdef PTY_CLONE_STEPS
+        char *next[] = {"posix-pty", "clone-loaded", NULL}, *env[] = {NULL};
+#else
         char *next[] = {"posix-pty", "loaded", NULL}, *env[] = {NULL};
+#endif
         execve("/bin/posix-pty", next, env); CHECK(0);
     }
+#ifdef PTY_CLONE_STEPS
+    CHECK(argc == 2 && strcmp(argv[1], "clone-loaded") == 0);
+    CHECK(clone_full_table() == 0 && pause_ms(20) == 0);
+    CHECK(stafeto_pty_clone_stats(0) == 0);
+    printf("posix-pty: 32 real descriptions, %d retained chain clones and a late fork checked\n", clone_chain_count);
+    printf("posix-pty: ok\n");
+    return 0;
+#endif
     CHECK(names_grants() == 0 && flags_refs() == 0 && discard_disconnect() == 0 && armed_disconnect() == 0);
     CHECK(ring_and_input() == 0 && controller_disconnect(0) == 0 && controller_disconnect(1) == 0);
     CHECK(limits_and_generation() == 0);
     CHECK(spawn_actions() == 0);
     CHECK(window_sizes() == 0);
+    CHECK(clone_full_table() == 0);
+    CHECK(pty_ash_dialog(1) == 0);
+    CHECK(pty_ash_dialog(0) == 0);
     printf("posix-pty: ok\n");
     return 0;
 }
