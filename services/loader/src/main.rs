@@ -827,44 +827,29 @@ fn verify_session(
     offered: Handle<Channel>,
     require_fds: bool,
 ) -> Result<Handle<Channel>, u32> {
-    let (root, header) = match slot {
-        Slot::Files => (&own.files, proto_fs::Method::BindPending.header()),
-        Slot::Clock => (&own.clock, proto_clock::Method::VerifySession.header()),
-        _ => return Err(pl::IO),
-    };
-    let mut w = Writer::new();
-    header.write(&mut w).map_err(|s| s.code())?;
-    if slot == Slot::Files {
-        w.u32(u32::from(require_fds)).map_err(|s| s.code())?;
-    }
-    let mut outgoing = rt::handle::Outgoing::new();
-    outgoing.push(offered.erase()).map_err(|_| pl::IO)?;
     if slot == Slot::Files {
         let identity = sys::handle_duplicate(
             &own.identity,
             Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
         )
         .map_err(code)?;
-        outgoing.push(identity.erase()).map_err(|_| pl::IO)?;
+        let session =
+            rt::fs::Files::bind_pending_on(&own.files, require_fds, Some(offered), identity)
+                .map_err(|_| pl::IO)?;
+        rt::fs::Files::finish_on(&session).map_err(|_| pl::IO)?;
+        return Ok(session);
     }
-    let mut reply =
-        sys::send_handles(root, w.as_bytes(), outgoing).map_err(|refused| code(refused.error))?;
+    if slot != Slot::Clock {
+        return Err(pl::IO);
+    }
+    let request = proto_clock::Method::VerifySession.header().bytes();
+    let mut reply = sys::send_handles(&own.clock, &request, [offered.erase()])
+        .map_err(|refused| code(refused.error))?;
     let mut buffer = [0; MESSAGE_MAX];
     if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
         return Err(pl::IO);
     }
     let session = reply.handles.take::<Channel>(0).map_err(code)?;
-    if slot == Slot::Files {
-        let request = proto_fs::Method::FinishBinding.header().bytes();
-        loop {
-            let reply = sys::send(&session, &request).map_err(code)?;
-            match Reader::new(reply.bytes(&mut buffer)).u32() {
-                Ok(0) => break,
-                Ok(proto_fs::RESOLVING) => continue,
-                _ => return Err(pl::IO),
-            }
-        }
-    }
     Ok(session)
 }
 

@@ -960,6 +960,7 @@ impl Service<0> for Fs {
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        let first = !s.data.claimed;
         if !s.data.claimed {
             // The first request of a session Clone made takes its
             // descriptors.
@@ -981,6 +982,9 @@ impl Service<0> for Fs {
             if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {
                 return status(proto_fs::RESOLVING);
             }
+        }
+        if first && proto_fs::is_loaders(r.label()) && r.method() == Method::BindPending as u16 {
+            return self.pending_admission(r);
         }
         if proto_fs::is_image(r.label()) {
             #[cfg(feature = "auth-probe")]
@@ -1897,7 +1901,7 @@ impl Fs {
         }
         Answer::Reply([offered.erase()].into())
     }
-    fn bind_pending(&mut self, r: &mut Request<'_>) -> Answer {
+    fn pending_input(r: &Request<'_>) -> Result<(bool, Option<usize>, usize), u32> {
         let mut body = r.body();
         let require = body.u32();
         if !proto_fs::is_loaders(r.label())
@@ -1905,19 +1909,55 @@ impl Fs {
             || body.finish().is_err()
             || !(r.handles.len() == 2 || (require == Ok(0) && r.handles.len() == 1))
         {
-            return status(proto_fs::PERMISSION);
+            return Err(proto_fs::PERMISSION);
         }
         let offered_index = (r.handles.len() == 2).then_some(0);
         let identity_index = usize::from(offered_index.is_some());
         if offered_index.is_some_and(|i| {
-            !r.handles
-                .info(i)
-                .is_some_and(|(_, rights)| rights.contains(Rights::SEND | Rights::TRANSFER))
-        }) || !r.handles.info(identity_index).is_some_and(|(_, rights)| {
-            rights.contains(Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER)
-        }) {
-            return status(proto_fs::PERMISSION);
+            !r.handles.info(i).is_some_and(|(kind, rights)| {
+                kind == rt::abi::ObjectKind::Channel
+                    && rights.contains(Rights::SEND | Rights::TRANSFER)
+            })
+        }) || !r
+            .handles
+            .info(identity_index)
+            .is_some_and(|(kind, rights)| {
+                kind == rt::abi::ObjectKind::Channel
+                    && rights.contains(Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER)
+            })
+        {
+            return Err(proto_fs::PERMISSION);
         }
+        Ok((require == Ok(1), offered_index, identity_index))
+    }
+    /// Cold root admission returns every accepted object before paid child preparation.
+    fn pending_admission(&mut self, r: &mut Request<'_>) -> Answer {
+        if let Err(code) = Self::pending_input(r) {
+            return status(code);
+        }
+        if r.reply()
+            .u32(proto_fs::AUTHENTICATING)
+            .and_then(|()| r.reply().u32(0))
+            .is_err()
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut returned = Outgoing::new();
+        for i in 0..r.handles.len() {
+            let Ok(channel) = r.handles.take::<Channel>(i) else {
+                return status(proto_fs::PERMISSION);
+            };
+            returned
+                .push(channel.erase())
+                .expect("at most two pending admission channels");
+        }
+        Answer::Reply(returned)
+    }
+    fn bind_pending(&mut self, r: &mut Request<'_>) -> Answer {
+        let (require, offered_index, identity_index) = match Self::pending_input(r) {
+            Ok(input) => input,
+            Err(code) => return status(code),
+        };
         let offered = match offered_index {
             Some(i) => match r.handles.take::<Channel>(i) {
                 Ok(offered) => Some(offered),
@@ -1960,7 +2000,7 @@ impl Fs {
             .unwrap();
         binding.offered = offered;
         binding.pending = true;
-        binding.require = require == Ok(1);
+        binding.require = require;
         self.births[slot] = Some((label, child));
         let _ = self.clones.add_within(label, r.label(), CLONES);
         if r.reply().u32(0).is_err() {

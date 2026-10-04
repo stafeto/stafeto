@@ -53,7 +53,11 @@ fn elf(image: &Handle<Channel>) -> Result<(), Status> {
     }
     Ok(())
 }
-pub(super) fn capture(pending: &Handle<Channel>) -> Result<[Handle<Channel>; 2], Status> {
+pub(super) struct CapturedImages {
+    handles: [Handle<Channel>; 2],
+    descriptions_after_release: u32,
+}
+pub(super) fn capture(pending: &Handle<Channel>) -> Result<CapturedImages, Status> {
     let mut request = Writer::new();
     proto_fs::Method::ResolveStart
         .header()
@@ -138,13 +142,17 @@ pub(super) fn capture(pending: &Handle<Channel>) -> Result<[Handle<Channel>; 2],
         "posix-files: exact image pin and cached capability ok {:?}",
         a
     );
-    Ok([image, duplicate])
+    Ok(CapturedImages {
+        handles: [image, duplicate],
+        descriptions_after_release: a[2].checked_sub(1).ok_or(Status::BadSize)?,
+    })
 }
-pub(super) fn released(images: &[Handle<Channel>; 2]) -> Result<(), Status> {
+pub(super) fn released(captured: &CapturedImages) -> Result<(), Status> {
+    let images = &captured.handles;
     let mut after = [0; 4];
     for _ in 0..200 {
         after = image_counts(&images[0])?;
-        if after[0] == 0 && after[1] == 0 {
+        if after == [0, 0, captured.descriptions_after_release, 0] {
             break;
         }
         // SAFETY: the existing C helper takes no pointers and performs a timed wait.
@@ -152,7 +160,8 @@ pub(super) fn released(images: &[Handle<Channel>; 2]) -> Result<(), Status> {
             return Err(Status::BadSize);
         }
     }
-    if after[0] != 0 || after[1] != 0 || after[3] != 0 || image_counts(&images[1])? != after {
+    if after != [0, 0, captured.descriptions_after_release, 0] || image_counts(&images[1])? != after
+    {
         return Err(Status::BadSize);
     }
     if elf(&images[0]).is_ok() {

@@ -496,6 +496,86 @@ impl Files {
             };
         }
     }
+    /// A cold loader root returns exact incoming channels before paid preparation.
+    /// Every retry transfers the newly returned objects in their original order.
+    pub fn bind_pending_on(
+        root: &Handle<Channel>,
+        require_fds: bool,
+        mut offered: Option<Handle<Channel>>,
+        mut identity: Handle<Channel>,
+    ) -> Result<Handle<Channel>, Status> {
+        if require_fds && offered.is_none() {
+            return Err(Status::BadSize);
+        }
+        let count = 1 + usize::from(offered.is_some());
+        let mut request = Writer::new();
+        Method::BindPending.header().write(&mut request)?;
+        request.u32(u32::from(require_fds))?;
+        loop {
+            let mut outgoing = crate::handle::Outgoing::new();
+            if let Some(channel) = offered.take() {
+                outgoing
+                    .push(channel.erase())
+                    .map_err(|_| Status::BadSize)?;
+            }
+            outgoing
+                .push(identity.erase())
+                .map_err(|_| Status::BadSize)?;
+            let mut reply = sys::send_handles(root, request.as_bytes(), outgoing)
+                .map_err(|refused| Status::Kernel(refused.error))?;
+            let code = Self::reply_code(&reply)?;
+            if code == proto_fs::AUTHENTICATING {
+                if reply.len != proto_wire::HEADER_LEN
+                    || reply.words[0] >> 32 != 0
+                    || reply.handles.len() != count
+                    || !reply.handles.info(count - 1).is_some_and(|(kind, rights)| {
+                        kind == abi::ObjectKind::Channel
+                            && rights.contains(
+                                abi::Rights::NOTIFY
+                                    | abi::Rights::DUPLICATE
+                                    | abi::Rights::TRANSFER,
+                            )
+                    })
+                    || (count == 2
+                        && !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                            kind == abi::ObjectKind::Channel
+                                && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+                        }))
+                {
+                    return Err(Status::BadSize);
+                }
+                offered = if count == 2 {
+                    Some(reply.handles.take::<Channel>(0).map_err(Status::Kernel)?)
+                } else {
+                    None
+                };
+                identity = reply
+                    .handles
+                    .take::<Channel>(count - 1)
+                    .map_err(Status::Kernel)?;
+                continue;
+            }
+            if code != 0 {
+                if reply.len != proto_wire::HEADER_LEN
+                    || reply.words[0] >> 32 != 0
+                    || !reply.handles.is_empty()
+                {
+                    return Err(Status::BadSize);
+                }
+                return Err(Status::from_code(code));
+            }
+            if reply.len != 4
+                || reply.handles.len() != 1
+                || !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                    kind == abi::ObjectKind::Channel
+                        && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+                })
+            {
+                return Err(Status::BadSize);
+            }
+            return reply.handles.take::<Channel>(0).map_err(Status::Kernel);
+        }
+    }
     /// A loader's image, after its authentic pending identity resolves each component.
     pub fn open_exec(
         &self,
@@ -507,17 +587,7 @@ impl Files {
             abi::Rights::NOTIFY | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
         )
         .map_err(Status::Kernel)?;
-        let mut request = Writer::new();
-        Method::BindPending.header().write(&mut request)?;
-        request.u32(0)?;
-        let mut reply = sys::send_handles(&self.channel, request.as_bytes(), [identity.erase()])
-            .map_err(|e| Status::Kernel(e.error))?;
-        let mut buffer = [0; MESSAGE_MAX];
-        let status = Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?);
-        if status != Status::Ok {
-            return Err(status);
-        }
-        let session = reply.handles.take::<Channel>(0).map_err(Status::Kernel)?;
+        let session = Self::bind_pending_on(&self.channel, false, None, identity)?;
         let prepared = Self::from_sessions(session, None);
         prepared.finish_binding()?;
         prepared.open_exec_bound(path)

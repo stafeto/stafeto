@@ -26,6 +26,10 @@
 //! ResolveSecond adds base slot/generation, follow_final and another path under
 //! one job charge. Both paths retain their bases until ResolveCancel(job u64).
 //! Loader executable proofs use a fresh genuine Pending session from BindPending.
+//! A cold named loader root answers BindPending with canonical AUTHENTICATING
+//! and all actual incoming Channels in their original order (one identity, or
+//! offered session then identity). The caller retries with those returned handles
+//! on the same root; FinishBinding begins after the new Pending capability exists.
 //! Subsequent operations use that unforgeable session and recheck its generation.
 //! Traversal, metadata or credential changes invalidate proofs; STALE_PROOF
 //! requires another ResolveStep before retrying the final operation.
