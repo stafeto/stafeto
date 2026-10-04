@@ -659,7 +659,10 @@ pub fn end_waiting_for_probe(t: NonNull<Thread>, server: NonNull<Process>) -> Re
     let (p, cause) = unsafe { (t.as_ref().process, t.as_ref().priority()) };
     let exact = sched::locked(|_| {
         // SAFETY: the scheduler lock guards the held thread's wait.
-        unsafe { t.as_ref().waits == Some(Wait::Reply(server)) }
+        unsafe {
+            t.as_ref().sched.state() == State::Waiting
+                && t.as_ref().waits == Some(Wait::Reply(server))
+        }
     });
     if !exact || !process::probe_started_peer(p, t) {
         return Err(Error::BadState);
