@@ -285,19 +285,6 @@ enum Opened {
     Terminal(u32, bool),
 }
 
-/// Synthetic terminal names shared by open and spawn file actions.
-pub(crate) fn terminal_name(name: &str) -> Option<(u32, u32)> {
-    match name {
-        "/dev/console" => Some((proto_tty::OPEN_CONSOLE, 0)),
-        "/dev/tty" => Some((proto_tty::OPEN_CONTROLLING, 0)),
-        "/dev/ptmx" => Some((proto_tty::OPEN_MASTER, 0)),
-        _ => name
-            .strip_prefix("/dev/pts/")
-            .and_then(|n| n.parse::<u32>().ok())
-            .map(|n| (proto_tty::OPEN_SLAVE, n)),
-    }
-}
-
 /// Open: the path resolved under the lock, the service's open outside it,
 /// then the descriptor under it again.
 fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
@@ -322,14 +309,7 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
         {
             return Err(ENOTDIR);
         }
-        let name = core::str::from_utf8(path.as_bytes()).unwrap_or("");
-        // The names of terminals are the layer's to resolve (5f): the
-        // process's session with the terminal service serves them, and no
-        // request goes to the RAM files.
-        let named = terminal_name(name);
-        if transport.terminal().is_some()
-            && let Some((kind, number)) = named
-        {
+        if let Some((kind, number)) = transport.terminal_open(path).map_err(crate::error)? {
             if flags & O_DIRECTORY != 0 || path.trailing_slash {
                 return Err(ENOTDIR);
             }

@@ -718,11 +718,7 @@ impl Shadow {
                     if transport.terminal().is_none() {
                         return Ok(None);
                     }
-                    let named = crate::shared::terminal_name(path.as_str().map_err(crate::error)?);
-                    if named.is_some() && path.trailing_slash {
-                        return Err(ENOTDIR);
-                    }
-                    Ok(named)
+                    transport.terminal_open(path).map_err(crate::error)
                 })?;
                 if let Some((kind, number)) = terminal {
                     if flags & O_DIRECTORY != 0 {

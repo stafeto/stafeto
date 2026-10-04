@@ -226,7 +226,6 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
 }));
 
 impl Fs {
-    /// The notary session, asked of init once.
     /// A Loader that abandoned a job cannot keep its base or expenditure alive.
     fn cleanup_job_step(&mut self) -> bool {
         let i = self.job_cursor;

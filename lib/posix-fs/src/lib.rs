@@ -160,18 +160,6 @@ pub fn terminal_path(terminal: u32) -> Option<&'static str> {
     (terminal == proto_tty::CONSOLE).then_some("/dev/console")
 }
 
-/// The terminal a path names, as the layer resolves it itself (5f,
-/// decision 5): `path` is absolute and normalised. The names of the
-/// terminal service go to its session and never to the RAM file
-/// service. `/dev/tty` is the controlling terminal of the caller's
-/// session, which the console is until sessions come (5f, T3).
-pub fn terminal_named(path: &str) -> Option<u32> {
-    match path {
-        "/dev/console" | "/dev/tty" => Some(proto_tty::CONSOLE),
-        _ => None,
-    }
-}
-
 /// One process's file state, mutated by one owner: the table of
 /// descriptors and the current directory. The requests to the services go
 /// through the `Transport`, which needs no owner: the owner snapshots a
@@ -530,23 +518,69 @@ impl Transport {
         }
     }
 
-    /// The terminal `path` names, when the process has a session with the
-    /// terminal service to open it through (`terminal_named`).
-    pub fn terminal_of(&self, path: &Resolved) -> Result<Option<u32>, FsError> {
+    /// A virtual terminal leaf whose parent the RAM service resolved by inode.
+    /// Parent search includes dot components and links under the actual identity.
+    pub fn terminal_open(&self, path: &Resolved) -> Result<Option<(u32, u32)>, FsError> {
         if self.terminal().is_none() {
             return Ok(None);
         }
-        let named = core::str::from_utf8(path.as_bytes())
-            .ok()
-            .and_then(terminal_named);
-        if named.is_some() && path.trailing_slash {
+        let bytes = path.as_bytes();
+        let mut end = bytes.len();
+        while end > 0 && bytes[end - 1] == b'/' {
+            end -= 1;
+        }
+        let Some(slash) = bytes[..end].iter().rposition(|&b| b == b'/') else {
+            return Ok(None);
+        };
+        let leaf = &bytes[slash + 1..end];
+        let (named, parent): ((u32, u32), &[u8]) = match leaf {
+            b"console" => ((proto_tty::OPEN_CONSOLE, 0), b"/dev/."),
+            b"tty" => ((proto_tty::OPEN_CONTROLLING, 0), b"/dev/."),
+            b"ptmx" => ((proto_tty::OPEN_MASTER, 0), b"/dev/."),
+            _ => match core::str::from_utf8(leaf)
+                .ok()
+                .and_then(|n| n.parse::<u32>().ok())
+            {
+                Some(n) => ((proto_tty::OPEN_SLAVE, n), b"/dev/pts/."),
+                None => return Ok(None),
+            },
+        };
+        let mut directory = [0; MAX_PATH + 1];
+        directory[..slash].copy_from_slice(&bytes[..slash]);
+        directory[slash..slash + 2].copy_from_slice(b"/.");
+        let (actual, parent) = match self.files().node_information_bytes(&directory[..slash + 2]) {
+            Ok(actual) => (actual, parent),
+            Err(Status::Unknown(proto_fs::NO_ENTRY))
+                if named.0 == proto_tty::OPEN_SLAVE && bytes[..slash].ends_with(b"/pts") =>
+            {
+                // The terminal service also mounts pts for boot profiles whose
+                // immutable RAM image contains only /dev. Resolve its real parent.
+                let mount = slash - 4;
+                directory[mount..mount + 2].copy_from_slice(b"/.");
+                (
+                    self.files()
+                        .node_information_bytes(&directory[..mount + 2])?,
+                    b"/dev/.".as_slice(),
+                )
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let expected = match self.files().node_information_bytes(parent) {
+            Ok(info) => info,
+            Err(Status::Unknown(proto_fs::NO_ENTRY)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if actual.kind != 1 || actual.device != expected.device || actual.inode != expected.inode {
+            return Ok(None);
+        }
+        if path.trailing_slash {
             return Err(FsError::NotDirectory);
         }
-        Ok(named)
+        Ok(Some(named))
     }
 
     pub fn stat(&self, path: &Resolved) -> Result<Metadata, FsError> {
-        if self.terminal_of(path)?.is_some() {
+        if self.terminal_open(path)?.is_some() {
             return Ok(Metadata {
                 kind: FileKind::Character,
                 size: 0,
@@ -567,24 +601,17 @@ impl Transport {
     }
 
     pub fn stat_information(&self, path: &Resolved) -> Result<NodeInfo, FsError> {
-        let name = core::str::from_utf8(path.as_bytes()).unwrap_or("");
-        if self.terminal().is_some() {
-            let physical = if name == "/dev/ptmx" {
-                Some(proto_tty::STAT_PATH)
-            } else {
-                name.strip_prefix("/dev/pts/")
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .and_then(|n| n.checked_add(1))
-            };
-            if let Some(physical) = physical {
-                if path.trailing_slash {
-                    return Err(FsError::NotDirectory);
+        if let Some((kind, number)) = self.terminal_open(path)? {
+            return match kind {
+                proto_tty::OPEN_MASTER => {
+                    self.terminal_information(proto_tty::STAT_PATH, Some(proto_tty::STAT_PATH))
                 }
-                return self.terminal_information(proto_tty::STAT_PATH, Some(physical));
-            }
-        }
-        if self.terminal_of(path)?.is_some() {
-            return Ok(CONSOLE_INFO);
+                proto_tty::OPEN_SLAVE => self.terminal_information(
+                    proto_tty::STAT_PATH,
+                    Some(number.checked_add(1).ok_or(FsError::NoEntry)?),
+                ),
+                _ => Ok(CONSOLE_INFO),
+            };
         }
         let info = self
             .files()
