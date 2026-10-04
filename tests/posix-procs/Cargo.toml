@@ -16,6 +16,7 @@ bench = false
 [features]
 jobs = []
 files = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt"]
+loader-abort = ["files", "dep:proto-process", "dep:proto-loader", "dep:posix-fs"]
 terminal = ["posix-crt/uart-input"]
 
 [dependencies]
@@ -25,3 +26,6 @@ posix-abi = { path = "../../lib/posix-abi", optional = true }
 proto-fs = { path = "../../proto/fs", optional = true }
 proto-wire = { path = "../../proto/wire", optional = true }
 rt = { path = "../../lib/rt", optional = true }
+proto-process = { path = "../../proto/process", optional = true }
+proto-loader = { path = "../../proto/loader", optional = true }
+posix-fs = { path = "../../lib/posix-fs", optional = true }

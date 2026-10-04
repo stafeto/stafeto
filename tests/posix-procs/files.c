@@ -7,6 +7,9 @@
 #include <unistd.h>
 extern int files_fake_identity(void);
 extern int files_full_sessions(void);
+#if LOADER_ABORT_PROBE
+#include "loader-abort.c"
+#endif
 int main(void) {
     int fd = open("/tmp/probe", O_WRONLY);
     if (fd < 0 || close(fd) || geteuid() != 0) return 1;
@@ -31,5 +34,8 @@ int main(void) {
     if (open(over,O_RDONLY) != -1 || errno != ENAMETOOLONG) return 11;
     if (files_full_sessions()) return 12;
     puts("posix-files: 16 sessions with 32 retained descriptors ok");
+#if LOADER_ABORT_PROBE
+    if (files_loader_abort()) return 13;
+#endif
     puts("posix-files: identity and proofs ok"); return 0;
 }
