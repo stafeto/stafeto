@@ -2635,7 +2635,14 @@ fn ramfs_cleanup_probe() -> Result<(), String> {
     let ended = "init: posix-files ended: exit code 0, not restarted";
     let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ended)?;
-    qemu::expect_marker(&output, "ramfs-cleanup: ok")
+    qemu::expect_marker(&output, "ramfs-cleanup: ok")?;
+    for owner in ["ramfs-owner-0", "ramfs-owner-1", "ramfs-owner-2"] {
+        qemu::expect_marker(
+            &output,
+            &format!("init: {owner} ended: exit code 0, not restarted"),
+        )?;
+    }
+    Ok(())
 }
 
 fn posix_files_probe() -> Result<(), String> {

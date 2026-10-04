@@ -217,6 +217,39 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         quota: 64 * PAGE,
         ..TABLE[0]
     },
+    Record {
+        name: "ramfs-owner-0",
+        args: b"posix-files\00\0",
+        program: "posix-files",
+        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        priority: 30,
+        ceiling: 31,
+        quota: 2048 * PAGE,
+        root: false,
+        ..POSIX
+    },
+    Record {
+        name: "ramfs-owner-1",
+        args: b"posix-files\01\0",
+        program: "posix-files",
+        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        priority: 30,
+        ceiling: 31,
+        quota: 2048 * PAGE,
+        root: false,
+        ..POSIX
+    },
+    Record {
+        name: "ramfs-owner-2",
+        args: b"posix-files\02\0",
+        program: "posix-files",
+        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        priority: 30,
+        ceiling: 31,
+        quota: 2048 * PAGE,
+        root: false,
+        ..POSIX
+    },
 ];
 
 pub const POSIX_ABI_TABLE: &[Record] = &[

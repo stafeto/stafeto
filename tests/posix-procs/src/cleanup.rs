@@ -20,7 +20,7 @@ extern "C" fn files_cleanup_owner(phase: u32) -> i32 {
     if files.bind(identity).is_err() {
         return 3;
     }
-    if files.open("/tmp/probe", proto_fs::READ_WRITE).is_err() {
+    if files.open("/etc/motd", proto_fs::READ_ONLY).is_err() {
         return 4;
     }
     let Ok(offered) = rt::sys::handle_duplicate(
@@ -88,13 +88,28 @@ extern "C" fn files_cleanup_check(phase: u32) -> i32 {
     let Ok(holder) = rt::service::connect(&parent, "ramfs-holder") else {
         return -1;
     };
-    let Ok(reply) = rt::sys::send(&holder, &proto_wire::Header::new(2, 1).bytes()) else {
+    let mut request = Writer::new();
+    if proto_wire::Header::new(2, 1)
+        .write(&mut request)
+        .and_then(|()| request.u32(phase + 1))
+        .is_err()
+    {
+        return -6;
+    }
+    let Ok(reply) = rt::sys::send(&holder, request.as_bytes()) else {
         return -2;
     };
     if !reply.handles.is_empty() {
         return -3;
     }
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    if reply.len == 8
+        && reply.words[0] >> 32 == 0
+        && Reader::new(reply.bytes(&mut buffer)).u32()
+            == Ok(proto_wire::Status::Kernel(rt::abi::Error::BadState).code())
+    {
+        return 1;
+    }
     let mut reader = Reader::new(reply.bytes(&mut buffer));
     let mut values = [0; 12];
     for value in &mut values {
@@ -109,7 +124,7 @@ extern "C" fn files_cleanup_check(phase: u32) -> i32 {
     if values[1..6] != [0; 5] || values[8] != 0 {
         return 1;
     }
-    if values[6].checked_add(1) != Some(values[9]) || values[7].checked_add(1) != Some(values[10]) {
+    if values[6] != 0 || values[7] != 0 {
         return 1;
     }
     0

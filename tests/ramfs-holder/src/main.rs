@@ -29,8 +29,8 @@ fn snapshot(channel: &Handle<Channel>) -> Result<[u32; 9], Status> {
     Ok(result)
 }
 struct Holder {
-    kept: Option<Handle<Channel>>,
-    before: [u32; 9],
+    kept: [Option<Handle<Channel>>; 3],
+    before: [[u32; 9]; 3],
 }
 impl Service<0> for Holder {
     const VERSION: u16 = 1;
@@ -59,24 +59,33 @@ impl Service<0> for Holder {
                 );
                 return Answer::Status(Status::Kernel(rt::abi::Error::BadState));
             }
-            self.before = before;
-            self.kept = Some(kept);
+            if !(1..=3).contains(&phase) || self.kept[(phase - 1) as usize].is_some() {
+                return Answer::Status(Status::BadSize);
+            }
+            self.before[(phase - 1) as usize] = before;
+            self.kept[(phase - 1) as usize] = Some(kept);
             return Answer::Status(Status::Ok);
         }
-        if request.body().finish().is_err() || !request.handles.is_empty() {
+        let mut body = request.body();
+        let Ok(phase) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        if body.finish().is_err() || !request.handles.is_empty() || !(1..=3).contains(&phase) {
             return Answer::Status(Status::BadSize);
         }
-        let Some(kept) = self.kept.as_ref() else {
+        let index = (phase - 1) as usize;
+        let Some(kept) = self.kept[index].as_ref() else {
             return Answer::Status(Status::Kernel(rt::abi::Error::BadState));
         };
         let current = match snapshot(kept) {
             Ok(value) => value,
             Err(status) => return Answer::Status(status),
         };
-        for value in current
-            .into_iter()
-            .chain([self.before[6], self.before[7], self.before[8]])
-        {
+        for value in current.into_iter().chain([
+            self.before[index][6],
+            self.before[index][7],
+            self.before[index][8],
+        ]) {
             if request.reply().u32(value).is_err() {
                 return Answer::Status(Status::BadSize);
             }
@@ -100,8 +109,8 @@ fn main(_: u64) -> u64 {
     let _ = rt::service::run::<Holder, 4, 0>(
         &channel,
         &mut Holder {
-            kept: None,
-            before: [0; 9],
+            kept: [const { None }; 3],
+            before: [[0; 9]; 3],
         },
         Config {
             issued: 0,

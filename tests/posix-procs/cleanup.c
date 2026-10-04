@@ -11,16 +11,11 @@ int main(int argc, char **argv) {
     if (argc == 2 && argv[1][0] >= '0' && argv[1][0] <= '2' && !argv[1][1])
         return files_cleanup_owner((unsigned)(argv[1][0] - '0'));
     for (unsigned phase = 0; phase < 3; ++phase) {
-        char value[] = {(char)('0' + phase), 0};
-        char *args[] = {"posix-files", value, 0};
-        pid_t child; int status;
-        if (posix_spawn(&child, "/bin/posix-files", 0, 0, args, environ)) return 20;
-        if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 21;
         unsigned attempt;
         for (attempt = 0; attempt < 100; ++attempt) {
             int result = files_cleanup_check(phase);
             if (!result) break;
-            if (result != 1) return 22;
+            if (result != 1) { printf("ramfs-cleanup: phase %u check error %d\n", phase, result); return 22; }
             struct timespec pause = {0, 10000000};
             if (nanosleep(&pause, 0)) return 23;
         }
