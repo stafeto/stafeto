@@ -80,8 +80,8 @@ static int pty_ash_command(struct pty_ash_dialog *d, const char *command, const 
     return 0;
 }
 
-/* The shell starts this external role by exec. Its ready line proves
- * that Stop/Ctrl-C reaches the final executable rather than its loader. */
+/* The shell starts this external role by exec. Its ready line confirms
+ * that the final executable has entered main before Stop/Ctrl-C. */
 static int pty_ash_worker(void) {
     const char ready[] = "PTY-CHILD\n";
     size_t sent = 0;
