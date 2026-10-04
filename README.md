@@ -66,7 +66,13 @@ links statically with relibc over the Rust POSIX layer. The dialog's
 files of `/bin` (`/bin/ls -la`, `/bin/ash -c 'exit 3'`). Pipelines work in
 the dialog (`ls /etc | cat`, a pipeline of three, `ls /bin | wc -l`, a job
 in the background with `wait`), and `/dev/null` takes redirections. The
-terminal and job control come in 5f.
+terminal service provides canonical input, termios and window sizes,
+process groups, Ctrl-C/Ctrl-Z and `jobs`, `bg` and `fg`. Interactive ash
+also runs through a PTY master. The service has eight PTY pairs beside
+the console; `posix_openpt`, `grantpt`, `unlockpt` and `ptsname` expose
+`/dev/ptmx` and `/dev/pts/N`. `poll`, `ppoll`, `select` and `pselect`
+wait on pipes and terminal descriptions. [notes/m5f-tty.md](notes/m5f-tty.md)
+has their limits and checks.
 
 **POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
 interface. The C library is relibc (a fork pinned by
@@ -162,10 +168,12 @@ the services and the limits.
 BusyBox included; its platform is the layer's `stafeto_*` functions.
 os-test's io, malloc, process and signal suites, `basic/spawn`, `basic/unistd`
 `exec*` and the `basic` tests that call `fork` run on it in `ci` from files,
-one boot a suite: 121 pass, 73 fail (`mkstemp`, `access`, `sigaltstack`,
-`posix_openpt`: the RAM service creates no file yet and the terminal and
-job control wait for 5f) and 11 need `poll` or `select` (5f) of 205; `ci`
-fails when a test that passed stops passing. relibc
+one boot a suite. The baseline before the terminal extension had 121
+passes, 73 failures and 11 unsupported cases out of 205; `ci` fails when
+a test that passed stops passing. The PTY and termios suites now exercise
+the terminal APIs, and readiness tests cover all four waiting interfaces.
+The remaining file and signal work includes `mkstemp`, `access` and
+`sigaltstack`. relibc
 builds at its own level 3: user-space programs have no size limit, only
 the kernel has one. Details are in
 [docs/status.md](docs/status.md).
