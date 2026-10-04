@@ -37,7 +37,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 0xfff8, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// The sessions: one place the image sessions share (they hold nothing),
 /// then the clients', with room for the 255 records of the process
@@ -821,7 +821,7 @@ impl Service<0> for Fs {
             return self.auth_probe_gc(&mut s.data, r);
         }
         #[cfg(feature = "auth-probe")]
-        if r.method() == 0xfffa {
+        if r.method() == 0xfff8 {
             if !r.handles.is_empty() || r.body().finish().is_err() {
                 return Answer::Status(Status::BadSize);
             }

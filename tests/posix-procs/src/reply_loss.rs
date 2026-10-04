@@ -325,7 +325,7 @@ fn negatives(files: &Files) -> Result<(), i32> {
 }
 
 fn counts(files: &Files) -> Result<[u32; 4], i32> {
-    let request = proto_wire::Header::new(0xfffa, proto_fs::VERSION).bytes();
+    let request = proto_wire::Header::new(0xfff8, proto_fs::VERSION).bytes();
     let reply = sys::send(files.sessions().0, &request).map_err(|_| 114)?;
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
     let mut reader = Reader::new(reply.bytes(&mut buffer));
