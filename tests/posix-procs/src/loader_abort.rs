@@ -44,9 +44,58 @@ fn abort() -> Result<(), Status> {
     Ok(())
 }
 
+/// Standard Start/Go/HandlesDone loads a real ELF before an uncommitted abort.
+fn load_image(loader: &Handle<Channel>) -> Result<(), Status> {
+    const WINDOW: usize = 0x58_0000_0000;
+    const PAGE: u64 = 4096;
+    let object = sys::mem_create(PAGE).map_err(Status::Kernel)?;
+    let process = posix_abi::allocation::process();
+    sys::mem_map(
+        process,
+        &object,
+        0,
+        PAGE,
+        WINDOW,
+        rt::abi::Access::ReadWrite,
+    )
+    .map_err(Status::Kernel)?;
+    // SAFETY: this single-threaded probe exclusively owns the fresh mapped page.
+    let buffer = unsafe { core::slice::from_raw_parts_mut(WINDOW as *mut u8, PAGE as usize) };
+    let length = proto_loader::Block::write(
+        buffer,
+        b"/bin/posix-files",
+        b"/",
+        0o022,
+        [b"posix-files".as_slice()].into_iter(),
+        [].into_iter(),
+    );
+    // SAFETY: the probe's sole temporary mapping is unused after Block::write.
+    let unmapped = unsafe { sys::mem_unmap(process, WINDOW, PAGE) };
+    unmapped.map_err(Status::Kernel)?;
+    let length = length.map_err(|_| Status::BadSize)?;
+    let copy = sys::handle_duplicate(&object, Rights::MAP_READ | Rights::TRANSFER)
+        .map_err(Status::Kernel)?;
+    let mut request = [0; proto_wire::HEADER_LEN + 4];
+    request[..proto_wire::HEADER_LEN]
+        .copy_from_slice(&proto_loader::Method::Start.header().bytes());
+    request[proto_wire::HEADER_LEN..].copy_from_slice(&(length as u32).to_le_bytes());
+    let reply = sys::send_handles(loader, &request, [copy.erase()])
+        .map_err(|refused| Status::Kernel(refused.error))?;
+    if reply.len != 8 || reply.words[0] != 0 || !reply.handles.is_empty() {
+        return Err(Status::BadSize);
+    }
+    for method in [proto_loader::Method::Go, proto_loader::Method::HandlesDone] {
+        let reply = sys::send(loader, &method.header().bytes()).map_err(Status::Kernel)?;
+        if reply.len != 8 || reply.words[0] != 0 || !reply.handles.is_empty() {
+            return Err(Status::BadSize);
+        }
+    }
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
-extern "C" fn files_loader_abort_capture(fd: i32) -> i32 {
-    fn run(fd: i32) -> Result<(), Status> {
+extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
+    fn run(fd: i32, loaded: i32) -> Result<(), Status> {
         let fd = u32::try_from(fd).map_err(|_| Status::BadSize)?;
         let descriptor = posix_abi::shared::with_files(|files| match files.target(fd) {
             Ok(posix_fs::Target::Ram(fd)) => Ok(fd),
@@ -101,6 +150,14 @@ extern "C" fn files_loader_abort_capture(fd: i32) -> i32 {
                 return Err(Status::BadSize);
             }
             rt::println!("posix-files: loader abort retained before {:?}", initial);
+            if loaded != 0 {
+                load_image(&loader)?;
+                let ready = counts(&pending)?;
+                if ready[0] != 1 || ready[3] != 1 || ready[4] != 0 {
+                    return Err(Status::BadSize);
+                }
+                rt::println!("posix-files: loader abort loaded capture {:?}", ready);
+            }
             abort()?;
             let after = posix_abi::process::client().query()?;
             if after.pid != before.pid || after.credentials != before.credentials {
@@ -140,7 +197,7 @@ extern "C" fn files_loader_abort_capture(fd: i32) -> i32 {
         }
         result
     }
-    match run(fd) {
+    match run(fd, loaded) {
         Ok(()) => 0,
         Err(error) => {
             rt::println!("posix-files: loader abort failed {:?}", error);
