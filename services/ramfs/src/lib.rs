@@ -216,6 +216,7 @@ pub struct Fds {
     #[cfg(feature = "auth-probe")]
     pub auth_probe_gc_reservation: Option<storage::Reservation>,
     pub resolvers: [u64; 16],
+    pub open_watermarks: [u64; OPEN_MAX],
     pub root: storage::Root,
     pub cwd: Option<Token>,
     preparations: [Option<storage::Reservation>; 16],
@@ -239,6 +240,7 @@ impl Default for Fds {
             #[cfg(feature = "auth-probe")]
             auth_probe_gc_reservation: None,
             resolvers: [0; 16],
+            open_watermarks: [0; OPEN_MAX],
             root: BOOT_ROOT,
             cwd: None,
             preparations: [None; 16],

@@ -170,6 +170,7 @@ impl Files {
     /// Capture a mutable-open path and its policy before prepaying descriptor resources.
     pub fn open_start(
         &self,
+        key: proto_fs::OpenKey,
         path: &[u8],
         flags: u32,
         mode: u32,
@@ -177,6 +178,8 @@ impl Files {
     ) -> Result<u64, Status> {
         let mut w = Writer::new();
         Method::OpenStart.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
         w.u32(0)?;
         w.u64(1)?;
         w.u32(flags)?;
@@ -184,8 +187,35 @@ impl Files {
         w.u32(umask)?;
         w.bytes(path)?;
         let reply = Self::send_on(&self.channel, w.as_bytes())?;
-        Self::open_reply(&reply, 12)?;
+        Self::open_start_reply(&reply)
+    }
+    /// Decode a Start transport reply before acknowledging the resident operation.
+    pub fn open_start_reply(reply: &crate::sys::Reply) -> Result<u64, Status> {
+        Self::open_reply(reply, 12)?;
         Ok((reply.words[0] >> 32) | ((reply.words[1] as u32 as u64) << 32))
+    }
+    /// Recover the paid job after the original Start reply was unavailable.
+    pub fn open_query(&self, key: proto_fs::OpenKey) -> Result<(u64, u32), Status> {
+        let mut w = Writer::new();
+        Method::OpenQuery.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_reply(&reply, 16)?;
+        let phase = (reply.words[0] >> 32) as u32;
+        if phase > 4 {
+            return Err(Status::BadSize);
+        }
+        Ok((reply.words[1], phase))
+    }
+    /// Cleanup uses the client key even before its server job ID was decoded.
+    pub fn open_cancel_key(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        let mut w = Writer::new();
+        Method::OpenCancel.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_reply(&reply, 8)
     }
     fn open_reply(reply: &crate::sys::Reply, len: usize) -> Result<(), Status> {
         let code = Self::reply_code(reply)?;
@@ -193,9 +223,12 @@ impl Files {
             return Err(Status::BadSize);
         }
         if code != 0 {
+            if reply.len != 8 || reply.words[0] >> 32 != 0 {
+                return Err(Status::BadSize);
+            }
             return Err(Status::from_code(code));
         }
-        if reply.len != len {
+        if reply.len != len || (len == 8 && reply.words[0] >> 32 != 0) {
             return Err(Status::BadSize);
         }
         Ok(())

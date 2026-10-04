@@ -141,6 +141,10 @@ impl Resolve {
         self.identity = identity;
         Ok(())
     }
+    /// The admitted raw pathname survives link expansion and traversal restarts.
+    pub fn original_path(&self) -> &[u8] {
+        &self.original[..self.original_len]
+    }
     /// A new authentic authority generation invalidates a proof even if IDs match.
     pub fn invalidate(&mut self) {
         self.epoch = 0;

@@ -1811,3 +1811,34 @@ fn created_regular_io_updates_times_only_after_successful_nonempty_transfer() {
     ram.release(&mut fds);
     assert_eq!(ram.open_descriptions(), 0);
 }
+
+#[test]
+fn original_open_args_survive_real_link_expansion_and_namespace_restart() {
+    use crate::resolve::Intent;
+    let mut ram = Ram::new(0);
+    let target = create(&mut ram, ROOT, b"destination", REG, 0o600);
+    let link = create(&mut ram, ROOT, b"source", SYMLINK, 0o777);
+    ram.storage
+        .write(link, ROOT_ACCOUNT, 0, b"/destination")
+        .unwrap();
+    let intent = Intent::Open {
+        flags: proto_fs::READ_WRITE,
+    };
+    let mut resolver =
+        Resolve::with_intent(&mut ram.storage, b"/source", ROOT, OWNER, intent).unwrap();
+    assert_eq!(
+        intent_ready(&mut ram, &mut resolver, OWNER).unwrap().0,
+        Progress::Found(target)
+    );
+    assert_eq!(resolver.original_path(), b"/source");
+    create(&mut ram, ROOT, b"changed", REG, 0o600);
+    assert_eq!(resolver.step(&mut ram.storage, OWNER), Ok(Progress::More));
+    assert_eq!(
+        intent_ready(&mut ram, &mut resolver, OWNER).unwrap().0,
+        Progress::Found(target)
+    );
+    assert_eq!(resolver.original_path(), b"/source");
+    resolver.release(&mut ram.storage);
+    assert_eq!(ram.storage.node(ROOT).unwrap().pins, [0; 5]);
+    assert_eq!(ram.storage.node(target).unwrap().pins, [0; 5]);
+}

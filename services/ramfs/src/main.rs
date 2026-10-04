@@ -37,7 +37,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 30, 31, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// The sessions: one place the image sessions share (they hold nothing),
 /// then the clients', with room for the 255 records of the process
@@ -226,6 +226,8 @@ struct ResolveJob {
     resolver: Resolve,
     second: Option<Resolve>,
     open: Option<OpenJournal>,
+    open_key: Option<proto_fs::OpenKey>,
+    raw_base: (u32, u64),
 }
 struct Tables {
     places: ramfs::places::Places,
@@ -854,7 +856,12 @@ impl Service<0> for Fs {
             && !(r.method() == Method::Bind as u16 && self.can_replace_refresh(&s.data))
             && !matches!(
                 Method::from_number(r.method()),
-                Some(Method::Close | Method::ResolveCancel | Method::VerifySession)
+                Some(
+                    Method::Close
+                        | Method::ResolveCancel
+                        | Method::OpenCancel
+                        | Method::VerifySession
+                )
             )
         {
             return status(proto_fs::AUTHENTICATING);
@@ -875,6 +882,8 @@ impl Service<0> for Fs {
                     | Method::OpenStart
                     | Method::OpenPrepare
                     | Method::OpenCommit
+                    | Method::OpenCancel
+                    | Method::OpenQuery
             )
         ) {
             return self.resolve_request(&mut s.data, r);
@@ -912,7 +921,9 @@ impl Service<0> for Fs {
                 | Method::FinishBinding
                 | Method::OpenStart
                 | Method::OpenPrepare
-                | Method::OpenCommit,
+                | Method::OpenCommit
+                | Method::OpenCancel
+                | Method::OpenQuery,
             ) => status(proto_fs::PERMISSION),
             Some(Method::Open) => {
                 let Ok(flags) = body.u32() else {
@@ -2060,6 +2071,57 @@ impl Fs {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
+        if matches!(
+            Method::from_number(r.method()),
+            Some(Method::OpenCancel | Method::OpenQuery)
+        ) {
+            let mut body = r.body();
+            let (Ok(slot), Ok(generation), Ok(())) = (body.u32(), body.u64(), body.finish()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            let key = proto_fs::OpenKey { slot, generation };
+            if let Err(code) = key.validate() {
+                return status(code);
+            }
+            let found = self.jobs.iter().position(|j| {
+                j.as_ref()
+                    .is_some_and(|j| j.owner == r.label() && j.open_key == Some(key))
+            });
+            let Some(i) = found else {
+                if r.method() == Method::OpenCancel as u16 {
+                    let watermark = &mut fds.open_watermarks[key.slot as usize];
+                    *watermark = (*watermark).max(key.generation);
+                    return Answer::Status(Status::Ok);
+                }
+                return status(proto_fs::OPEN_RETIRED);
+            };
+            let j = self.jobs[i].as_ref().expect("exact client key");
+            let id = j.id;
+            if r.method() == Method::OpenCancel as u16 {
+                self.cancel_job(id, r.label(), Some(fds));
+                return Answer::Status(Status::Ok);
+            }
+            if let Err(code) = self.authenticate(fds, r.label()) {
+                return status(code);
+            }
+            let j = self.jobs[i].as_ref().expect("retained query job");
+            let phase = match j.open.as_ref().expect("keyed Open").phase {
+                OpenPhase::Resolving => 0,
+                OpenPhase::Reserved(_) => 1,
+                OpenPhase::Prepared { .. } => 2,
+                OpenPhase::Committed { .. } => 3,
+                OpenPhase::Canceled { .. } => 4,
+            };
+            let w = r.reply();
+            if w.u32(0)
+                .and_then(|()| w.u32(phase))
+                .and_then(|()| w.u64(id))
+                .is_err()
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply(Outgoing::new());
+        }
         if r.method() == Method::ResolveCancel as u16 {
             let mut body = r.body();
             let (Ok(id), Ok(())) = (body.u64(), body.finish()) else {
@@ -2082,6 +2144,18 @@ impl Fs {
             Method::from_number(r.method()),
             Some(Method::ResolveStart | Method::OpenStart)
         ) {
+            let open_key = if r.method() == Method::OpenStart as u16 {
+                let (Ok(slot), Ok(generation)) = (body.u32(), body.u64()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let key = proto_fs::OpenKey { slot, generation };
+                if let Err(code) = key.validate() {
+                    return status(code);
+                }
+                Some(key)
+            } else {
+                None
+            };
             let (Ok(slot), Ok(generation)) = (body.u32(), body.u64()) else {
                 return Answer::Status(Status::BadSize);
             };
@@ -2112,6 +2186,39 @@ impl Fs {
             let Ok(path) = body.bytes(body.left()) else {
                 return Answer::Status(Status::BadSize);
             };
+            let raw_base = (slot, generation);
+            if let Some(key) = open_key {
+                if let Some(j) = self
+                    .jobs
+                    .iter()
+                    .flatten()
+                    .find(|j| j.owner == r.label() && j.open_key == Some(key))
+                {
+                    let old = j.open.as_ref().expect("keyed Open");
+                    let current = open.as_ref().expect("parsed Open");
+                    if j.raw_base != raw_base
+                        || old.flags != current.flags
+                        || old.mode != current.mode
+                        || old.umask != current.umask
+                        || j.resolver.original_path() != path
+                    {
+                        return status(proto_fs::PERMISSION);
+                    }
+                    let id = j.id;
+                    if r.reply().u32(0).and_then(|()| r.reply().u64(id)).is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    return Answer::Reply(Outgoing::new());
+                }
+                if self.jobs.iter().flatten().any(|j| {
+                    j.owner == r.label() && j.open_key.is_some_and(|old| old.slot == key.slot)
+                }) {
+                    return status(proto_fs::TOO_MANY_OPEN_FILES);
+                }
+                if key.generation <= fds.open_watermarks[key.slot as usize] {
+                    return status(proto_fs::OPEN_RETIRED);
+                }
+            }
             let identity = fds.binding.identity(real != 0).expect("authenticated");
             let root = fds.root;
             for id in &mut fds.resolvers {
@@ -2172,8 +2279,13 @@ impl Fs {
                 resolver,
                 second: None,
                 open,
+                open_key,
+                raw_base,
             });
             fds.resolvers[place] = id;
+            if let Some(key) = open_key {
+                fds.open_watermarks[key.slot as usize] = key.generation;
+            }
             if r.reply().u32(0).and_then(|()| r.reply().u64(id)).is_err() {
                 self.cancel_job(id, r.label(), Some(fds));
                 return Answer::Status(Status::BadSize);
@@ -2238,7 +2350,7 @@ impl Fs {
                 return if j.authority == fds.binding.stamp() {
                     Answer::Status(Status::Ok)
                 } else {
-                    status(proto_fs::STALE_PROOF)
+                    status(proto_fs::OPEN_RETIRED)
                 };
             }
             if !matches!(open.phase, OpenPhase::Resolving)
@@ -2284,7 +2396,18 @@ impl Fs {
             return status(proto_fs::PERMISSION);
         }
         if j.authority != fds.binding.stamp() {
-            return status(proto_fs::STALE_PROOF);
+            return status(
+                if j.open.as_ref().is_some_and(|open| {
+                    matches!(
+                        open.phase,
+                        OpenPhase::Committed { .. } | OpenPhase::Canceled { .. }
+                    )
+                }) {
+                    proto_fs::OPEN_RETIRED
+                } else {
+                    proto_fs::STALE_PROOF
+                },
+            );
         }
         let identity = match fds.binding.identity(false) {
             Ok(identity) => identity,

@@ -2,8 +2,16 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Real paid Open stages; the C supervisor observes the returned failure code.
+use core::sync::atomic::{AtomicU64, Ordering};
 use proto_wire::Status;
 use rt::fs::{Files, PreparedOpen};
+static NEXT: AtomicU64 = AtomicU64::new(1);
+fn key() -> proto_fs::OpenKey {
+    proto_fs::OpenKey {
+        slot: 0,
+        generation: NEXT.fetch_add(1, Ordering::Relaxed),
+    }
+}
 
 fn prepared(files: &Files, id: u64) -> Result<(), Status> {
     for prepare in [false, true] {
@@ -27,7 +35,7 @@ fn committed(
     mode: u32,
     umask: u32,
 ) -> Result<(u64, PreparedOpen), Status> {
-    let id = files.open_start(path, flags, mode, umask)?;
+    let id = files.open_start(key(), path, flags, mode, umask)?;
     let result = prepared(files, id).and_then(|()| files.open_commit(id));
     match result {
         Ok(held) => Ok((id, held)),
@@ -37,7 +45,137 @@ fn committed(
         }
     }
 }
+fn raw_start(files: &Files, key: proto_fs::OpenKey) -> Result<rt::sys::Reply, Status> {
+    let mut request = proto_wire::Writer::new();
+    proto_fs::Method::OpenStart.header().write(&mut request)?;
+    request.u32(key.slot)?;
+    request.u64(key.generation)?;
+    request.u32(0)?;
+    request.u64(1)?;
+    request.u32(proto_fs::READ_ONLY)?;
+    request.u32(0)?;
+    request.u32(0)?;
+    request.bytes(b"/etc/motd")?;
+    rt::sys::send(files.sessions().0, request.as_bytes()).map_err(Status::Kernel)
+}
+fn start_recovery(files: &Files) -> Result<(), i32> {
+    let first = proto_fs::OpenKey {
+        slot: 1,
+        generation: 4,
+    };
+    // The genuine accepted reply goes unread; Query recovers its single paid job.
+    drop(raw_start(files, first).map_err(|_| 40)?);
+    let (id, phase) = files.open_query(first).map_err(|_| 41)?;
+    if phase != 0 || files.open_start(first, b"/etc/motd", proto_fs::READ_ONLY, 0, 0) != Ok(id) {
+        return Err(42);
+    }
+    if files.open_start(first, b"/etc/motd", proto_fs::READ_ONLY, 1, 0)
+        != Err(Status::Unknown(proto_fs::PERMISSION))
+    {
+        return Err(43);
+    }
+    let mut reply = raw_start(files, first).map_err(|_| 44)?;
+    reply.len = 4;
+    if Files::open_start_reply(&reply) != Err(Status::BadSize) {
+        return Err(45);
+    }
+    for (len, upper) in [(4, 0), (16, 0), (8, 1)] {
+        reply.len = len;
+        reply.words[0] = proto_fs::STALE_PROOF as u64 | (upper << 32);
+        if Files::open_start_reply(&reply) != Err(Status::BadSize) {
+            return Err(46);
+        }
+    }
+    if files.open_query(first) != Ok((id, 0)) {
+        return Err(47);
+    }
+    let second = proto_fs::OpenKey {
+        slot: 2,
+        generation: 2,
+    };
+    let third = proto_fs::OpenKey {
+        slot: 3,
+        generation: 1,
+    };
+    let second_id = files
+        .open_start(second, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        .map_err(|_| 48)?;
+    let third_id = files
+        .open_start(third, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        .map_err(|_| 49)?;
+    if second_id == third_id {
+        return Err(50);
+    }
+    // All sixteen preparations are actual jobs. Duplicate Start needs no extra charge.
+    let mut keys = [first; 16];
+    keys[1] = second;
+    keys[2] = third;
+    for (i, key) in keys.iter_mut().enumerate().skip(3) {
+        *key = proto_fs::OpenKey {
+            slot: i as u32 + 1,
+            generation: 1,
+        };
+        files
+            .open_start(*key, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+            .map_err(|_| 51)?;
+    }
+    if files.open_start(first, b"/etc/motd", proto_fs::READ_ONLY, 0, 0) != Ok(id) {
+        return Err(52);
+    }
+    let extra = proto_fs::OpenKey {
+        slot: 17,
+        generation: 1,
+    };
+    if files.open_start(extra, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        != Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES))
+    {
+        return Err(53);
+    }
+    // A refused admission retains the key for a later attempt after exact cleanup.
+    files.open_cancel_key(first).map_err(|_| 54)?;
+    let extra_id = files
+        .open_start(extra, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        .map_err(|_| 55)?;
+    if files.open_query(extra) != Ok((extra_id, 0)) {
+        return Err(56);
+    }
+    for key in keys {
+        files.open_cancel_key(key).map_err(|_| 57)?;
+    }
+    files.open_cancel_key(extra).map_err(|_| 58)?;
+    if files.open_start(first, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        != Err(Status::Unknown(proto_fs::OPEN_RETIRED))
+    {
+        return Err(59);
+    }
+    // Cancel installs a fence before its ACK, so a delayed Start cannot appear later.
+    let canceled = proto_fs::OpenKey {
+        slot: 30,
+        generation: 12,
+    };
+    files.open_cancel_key(canceled).map_err(|_| 60)?;
+    if files.open_start(canceled, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        != Err(Status::Unknown(proto_fs::OPEN_RETIRED))
+    {
+        return Err(61);
+    }
+    let last = proto_fs::OpenKey {
+        slot: 31,
+        generation: u64::MAX,
+    };
+    files
+        .open_start(last, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        .map_err(|_| 62)?;
+    files.open_cancel_key(last).map_err(|_| 63)?;
+    if files.open_start(last, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        != Err(Status::Unknown(proto_fs::OPEN_RETIRED))
+    {
+        return Err(64);
+    }
+    Ok(())
+}
 fn run(files: &Files) -> Result<(), i32> {
+    start_recovery(files)?;
     let flags = proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_WRITE;
     let (id, held) = committed(files, b"/tmp/t3-created", flags, 0o666, 0o077).map_err(|_| 1)?;
     let result = (|| {
@@ -62,6 +200,20 @@ fn run(files: &Files) -> Result<(), i32> {
         }
         Ok(())
     })();
+    let current_key = proto_fs::OpenKey {
+        slot: 0,
+        generation: 1,
+    };
+    posix_abi::process::seteuid(65533).map_err(|_| 65)?;
+    let query = files.open_query(current_key);
+    let changed = files.open_commit(id);
+    let restored = posix_abi::process::seteuid(0);
+    if query != Ok((id, 3))
+        || changed != Err(Status::Unknown(proto_fs::OPEN_RETIRED))
+        || restored.is_err()
+    {
+        return Err(66);
+    }
     files.open_cancel(id).map_err(|_| 9)?;
     result?;
     // Repeated cancellation and a late Commit cannot create another operation.
@@ -70,7 +222,7 @@ fn run(files: &Files) -> Result<(), i32> {
         return Err(11);
     }
     let exclusive = files
-        .open_start(b"/tmp/t3-created", flags, 0o777, 0)
+        .open_start(key(), b"/tmp/t3-created", flags, 0o777, 0)
         .map_err(|_| 12)?;
     let exists = prepared(files, exclusive);
     files.open_cancel(exclusive).map_err(|_| 14)?;
