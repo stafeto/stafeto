@@ -10,6 +10,7 @@ use std::process::Command;
 use crate::{PROGRAM_TARGET, cargo, llvm_tool, relibc, run_cmd, stdout_of, target_dir};
 
 const INVENTORY: &str = include_str!("../../tests/posix/2024-xsh.tsv");
+const XBD_HEADERS: &str = include_str!("../../tests/posix/2024-xbd-headers.tsv");
 
 #[derive(Debug)]
 struct Interface<'a> {
@@ -17,6 +18,13 @@ struct Interface<'a> {
     page: &'a str,
     requirement: &'a str,
     headers: &'a str,
+    option_codes: &'a str,
+}
+
+struct Header<'a> {
+    name: &'a str,
+    page: &'a str,
+    requirement: &'a str,
     option_codes: &'a str,
 }
 
@@ -54,6 +62,42 @@ fn interfaces(input: &str) -> Result<Vec<Interface<'_>>, String> {
     }
     if rows.is_empty() {
         return Err("XSH inventory is empty".to_owned());
+    }
+    Ok(rows)
+}
+
+fn headers(input: &str) -> Result<Vec<Header<'_>>, String> {
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let parts: Vec<_> = line.split('\t').collect();
+        if parts.len() != 4 || !matches!(parts[2], "required" | "option") {
+            return Err(format!("XBD inventory line {}: invalid fields", index + 1));
+        }
+        if parts[0].is_empty() || parts[1].is_empty() || !seen.insert(parts[0]) {
+            return Err(format!(
+                "XBD inventory line {}: empty or duplicate header",
+                index + 1
+            ));
+        }
+        rows.push(Header {
+            name: parts[0],
+            page: parts[1],
+            requirement: parts[2],
+            option_codes: parts[3],
+        });
+    }
+    if rows.len() != 86
+        || rows
+            .iter()
+            .filter(|row| row.requirement == "required")
+            .count()
+            != 70
+    {
+        return Err("XBD inventory needs 86 headers, including 70 required".to_owned());
     }
     Ok(rows)
 }
@@ -100,6 +144,7 @@ fn macro_names(listing: &str) -> BTreeSet<&str> {
 
 struct HeaderScan {
     definitions: BTreeMap<String, BTreeSet<String>>,
+    resource_include: PathBuf,
     missing: Vec<String>,
     failed: Vec<String>,
 }
@@ -129,6 +174,7 @@ fn header_macros(rows: &[Interface<'_>], include: &Path) -> Result<HeaderScan, S
     let headers: BTreeSet<_> = rows.iter().flat_map(|row| row.headers.split(',')).collect();
     let mut scan = HeaderScan {
         definitions: BTreeMap::new(),
+        resource_include: resource_include.clone(),
         missing: Vec::new(),
         failed: Vec::new(),
     };
@@ -199,6 +245,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let mut names = names_in(&libc)?;
     names.extend(names_in(&crt)?);
     let rows = interfaces(INVENTORY)?;
+    let xbd = headers(XBD_HEADERS)?;
     let scan = header_macros(&rows, &include)?;
     let mut counts = BTreeMap::<(&str, &str), usize>::new();
     let mut output = String::from(
@@ -226,6 +273,32 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(path.parent().expect("measure path has parent"))
         .map_err(|error| format!("{}: {error}", path.display()))?;
     std::fs::write(&path, output).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut header_counts = BTreeMap::<(&str, bool), usize>::new();
+    let mut header_output = String::from(
+        "# POSIX.1-2024 XBD header inventory\nheader\tpage\trequirement\toption_codes\tavailable\n",
+    );
+    let mut required_missing = Vec::new();
+    for row in &xbd {
+        let available =
+            include.join(row.name).exists() || scan.resource_include.join(row.name).exists();
+        *header_counts
+            .entry((row.requirement, available))
+            .or_default() += 1;
+        if row.requirement == "required" && !available {
+            required_missing.push(row.name);
+        }
+        header_output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            row.name,
+            row.page,
+            row.requirement,
+            row.option_codes,
+            if available { "present" } else { "missing" }
+        ));
+    }
+    let header_path = target_dir().join("measure/posix-headers.tsv");
+    std::fs::write(&header_path, header_output)
+        .map_err(|error| format!("{}: {error}", header_path.display()))?;
     for requirement in ["required", "option"] {
         println!(
             "XSH {requirement}: {} exported symbols, {} header macros, {} unresolved",
@@ -244,6 +317,21 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         );
     }
     println!("XSH interface inventory: {}", path.display());
+    println!(
+        "XBD required headers: {} present, {} missing; option headers: {} present, {} missing",
+        header_counts.get(&("required", true)).copied().unwrap_or(0),
+        header_counts
+            .get(&("required", false))
+            .copied()
+            .unwrap_or(0),
+        header_counts.get(&("option", true)).copied().unwrap_or(0),
+        header_counts.get(&("option", false)).copied().unwrap_or(0),
+    );
+    println!(
+        "Missing required XBD headers: {}",
+        required_missing.join(", ")
+    );
+    println!("XBD header inventory: {}", header_path.display());
     println!(
         "XSH headers: {} checked, {} missing, {} failed preprocessing",
         scan.definitions.len(),
@@ -275,6 +363,19 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|r| r.name == "mq_open" && r.requirement == "option")
+        );
+    }
+
+    #[test]
+    fn xbd_inventory_covers_required_and_option_headers() {
+        let rows = headers(XBD_HEADERS).unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.name == "aio.h" && row.requirement == "required")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.name == "mqueue.h" && row.requirement == "option")
         );
     }
 

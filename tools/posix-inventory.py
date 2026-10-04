@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-"""Extract interface names from the official POSIX.1-2024 XSH pages.
+"""Extract interfaces and headers from official POSIX.1-2024 pages.
 
 The checked-in TSV records names and references only. Pass --cache to keep
 downloaded pages outside the repository when auditing an extraction change.
@@ -18,6 +18,7 @@ from urllib.request import urlopen
 
 
 BASE = "https://pubs.opengroup.org/onlinepubs/9799919799/functions/"
+XBD_BASE = "https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/"
 SECTION = re.compile(
     r'<h4 class="mansect"[^>]*>.*?\b%s</h4>\s*<blockquote[^>]*>(.*?)</blockquote>',
     re.S | re.I,
@@ -60,11 +61,11 @@ class Synopsis(HTMLParser):
         return "".join(self.characters)
 
 
-def page(cache, name):
+def page(cache, name, base=BASE):
     path = cache / name
     if path.exists():
         return path.read_text(encoding="utf-8")
-    with urlopen(BASE + name, timeout=30) as response:
+    with urlopen(base + name, timeout=30) as response:
         content = response.read().decode("utf-8")
     path.write_text(content, encoding="utf-8")
     return content
@@ -101,10 +102,25 @@ def entries(cache, filename):
     return result
 
 
+def header_entry(cache, filename):
+    html = page(cache, filename, XBD_BASE)
+    synopsis = Synopsis()
+    synopsis.feed(section(html, "SYNOPSIS"))
+    match = re.search(r"#include\s*<([^>]+)>", synopsis.text)
+    if not match:
+        raise ValueError(f"{filename}: no include in synopsis")
+    scope = synopsis.options[match.start()]
+    required = all(code in ("CX", "OB") for code in scope)
+    codes = sorted(code for code in scope if code not in ("CX", "OB"))
+    return (match.group(1), filename.removesuffix(".html"),
+            "required" if required else "option", ",".join(codes) or "-")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--xbd-output", type=Path)
     args = parser.parse_args()
     args.cache.mkdir(parents=True, exist_ok=True)
     index = page(args.cache, "contents.html")
@@ -125,6 +141,24 @@ def main():
         for row in rows:
             file.write("\t".join(row) + "\n")
     print(f"{len(pages)} pages, {len(rows)} names, {sum(row[2] == 'required' for row in rows)} required")
+    if args.xbd_output:
+        xbd_cache = args.cache / "basedefs"
+        xbd_cache.mkdir(exist_ok=True)
+        xbd_index = page(xbd_cache, "contents.html", XBD_BASE)
+        xbd_pages = sorted(set(re.findall(r'href="(?:\.\./basedefs/)?([A-Za-z0-9_]+\.h\.html)', xbd_index)))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            headers = sorted(pool.map(lambda name: header_entry(xbd_cache, name), xbd_pages))
+        if len(headers) != 86 or sum(row[2] == "required" for row in headers) != 70:
+            raise ValueError("XBD header count changed; audit the source and extraction")
+        args.xbd_output.parent.mkdir(parents=True, exist_ok=True)
+        with args.xbd_output.open("w", encoding="utf-8") as file:
+            file.write("# SPDX-License-Identifier: GPL-3.0-or-later\n")
+            file.write("# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>\n")
+            file.write("# POSIX.1-2024 XBD, " + XBD_BASE + "contents.html\n")
+            file.write("# header\tpage\trequirement\toption_codes\n")
+            for row in headers:
+                file.write("\t".join(row) + "\n")
+        print(f"{len(headers)} XBD headers, {sum(row[2] == 'required' for row in headers)} required")
 
 
 if __name__ == "__main__":
