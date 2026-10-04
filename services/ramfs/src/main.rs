@@ -34,7 +34,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    0xfffe,
+    0xfffc, 0xfffd, 0xfffe,
 ];
 /// The sessions: one place the image sessions share (they hold nothing),
 /// then the clients', with room for the 255 records of the process
@@ -262,6 +262,16 @@ impl Fs {
             }
             return true;
         }
+        #[cfg(feature = "auth-probe")]
+        if fds.auth_probe_hold
+            && fds.binding_preparation.is_some()
+            && fds
+                .binding
+                .snapshot_ref()
+                .is_some_and(|who| generation(who.index as usize) == who.generation)
+        {
+            return false;
+        }
         if fds.binding_preparation.is_some() {
             let _ = self.binding_step(fds, label);
             return true;
@@ -277,6 +287,14 @@ impl Fs {
         }
         if let Some(id) = fds.resolvers.iter().copied().find(|&id| id != 0) {
             self.cancel_job(id, label, Some(fds));
+            return true;
+        }
+        #[cfg(feature = "auth-probe")]
+        if fds.auth_probe_gc.take().is_some() {
+            let _ = self
+                .ram
+                .storage
+                .unlink(ramfs::storage::ROOT, b"auth-probe-gc", fds.root);
             return true;
         }
         if self.ram.release_step(fds) {
@@ -711,6 +729,25 @@ impl Service<0> for Fs {
             if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {
                 return status(proto_fs::RESOLVING);
             }
+        }
+        #[cfg(feature = "auth-probe")]
+        if r.method() == 0xfffd {
+            if !r.handles.is_empty()
+                || r.body().finish().is_err()
+                || !s
+                    .data
+                    .binding
+                    .snapshot_ref()
+                    .is_some_and(|who| generation(who.index as usize) == who.generation)
+            {
+                return status(proto_fs::PERMISSION);
+            }
+            s.data.auth_probe_hold = true;
+            return Answer::Status(Status::Ok);
+        }
+        #[cfg(feature = "auth-probe")]
+        if r.method() == 0xfffc {
+            return self.auth_probe_gc(&mut s.data, r);
         }
         #[cfg(feature = "auth-probe")]
         if r.method() == 0xfffe {
@@ -1260,6 +1297,57 @@ impl Fs {
         }
         fds.binding_outcome = Some(code);
         code
+    }
+    /// Test setup queues real storage reclamation before releasing a live
+    /// prepared binding to the unchanged alternating maintenance cursor.
+    #[cfg(feature = "auth-probe")]
+    fn auth_probe_gc(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut body = r.body();
+        let Ok(phase) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        let result = match phase {
+            0 if body.left() == 0 && fds.auth_probe_gc.is_none() => {
+                let reservation = self.ram.storage.reserve(
+                    fds.root,
+                    ramfs::storage::ROOT,
+                    b"auth-probe-gc",
+                    (ramfs::REG, 0o600, 0, 0),
+                );
+                reservation
+                    .and_then(|reservation| self.ram.storage.commit(reservation))
+                    .map(|token| fds.auth_probe_gc = Some(token))
+            }
+            1 => {
+                let offset = body.u32();
+                let bytes = body.bytes(body.left());
+                match (offset, bytes, fds.auth_probe_gc) {
+                    (Ok(offset), Ok(bytes), Some(token)) if bytes.len() <= proto_fs::MAX_WRITE => {
+                        self.ram
+                            .storage
+                            .write(token, fds.root, offset as usize, bytes)
+                            .map(|_| ())
+                    }
+                    _ => Err(proto_fs::INVALID_ARGUMENT),
+                }
+            }
+            2 if body.left() == 0 && fds.auth_probe_gc.is_some() => self
+                .ram
+                .storage
+                .unlink(ramfs::storage::ROOT, b"auth-probe-gc", fds.root)
+                .map(|_| {
+                    fds.auth_probe_gc = None;
+                    fds.auth_probe_hold = false;
+                }),
+            _ => Err(proto_fs::INVALID_ARGUMENT),
+        };
+        match result {
+            Ok(()) => Answer::Status(Status::Ok),
+            Err(code) => status(code),
+        }
     }
     fn bind(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err()

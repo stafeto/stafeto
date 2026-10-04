@@ -205,6 +205,10 @@ pub struct Fds {
     pub binding_source: Option<(u16, u64)>,
     /// The completed binding result remains available until a new preparation.
     pub binding_outcome: Option<u32>,
+    #[cfg(feature = "auth-probe")]
+    pub auth_probe_hold: bool,
+    #[cfg(feature = "auth-probe")]
+    pub auth_probe_gc: Option<Token>,
     pub resolvers: [u64; 16],
     pub root: storage::Root,
     pub cwd: Option<Token>,
@@ -221,6 +225,10 @@ impl Default for Fds {
             binding_preparation: None,
             binding_source: None,
             binding_outcome: None,
+            #[cfg(feature = "auth-probe")]
+            auth_probe_hold: false,
+            #[cfg(feature = "auth-probe")]
+            auth_probe_gc: None,
             resolvers: [0; 16],
             root: BOOT_ROOT,
             cwd: None,
