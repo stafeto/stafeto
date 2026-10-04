@@ -3,11 +3,14 @@
 
 //! Process-local descriptors sharing backend open descriptions. The owner
 //! serializes table access and releases backends after unlocking. Ordinary
-//! operation holds and resident Open records share the fixed hold budget.
+//! operation holds and resident Open/Scalar records share the fixed hold budget.
 //! A live Open record preserves its completion through fd replacement.
 //! The caller pins this table's address while records or waiters exist.
 
 #![no_std]
+
+mod scalar;
+pub use scalar::*;
 
 use core::{
     num::NonZeroU64,
@@ -312,19 +315,20 @@ impl<T: Copy, R: Copy> OpenRecord<T, R> {
 }
 
 #[derive(Clone, Copy)]
-enum Held<T, R> {
+enum Held<T, R, S> {
     Empty,
     Io(Hold<T>),
     Open(OpenRecord<T, R>),
+    Scalar(ScalarRecord<T, S>),
 }
 
-struct HoldSlot<T, R> {
+struct HoldSlot<T, R, S> {
     generation: u64,
     changed: AtomicU32,
-    held: Held<T, R>,
+    held: Held<T, R, S>,
 }
 
-impl<T, R> HoldSlot<T, R> {
+impl<T, R, S> HoldSlot<T, R, S> {
     fn change(&self) {
         let value = self.changed.load(Ordering::Relaxed);
         self.changed
@@ -332,13 +336,13 @@ impl<T, R> HoldSlot<T, R> {
     }
 }
 
-pub struct Table<T: Copy + Eq, const N: usize, R: Copy = ()> {
+pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = ()> {
     entries: [EntrySlot<T>; N],
-    holds: [HoldSlot<T, R>; N],
+    holds: [HoldSlot<T, R, S>; N],
     release_early: fn(T) -> bool,
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy> Default for Table<T, N, R> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Default for Table<T, N, R, S> {
     fn default() -> Self {
         Self {
             entries: [EntrySlot {
@@ -357,7 +361,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Default for Table<T, N, R> {
     }
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
     /// Armed early-release operations retain their generations in the service.
     pub fn with_early_release(release_early: fn(T) -> bool) -> Self {
         Self {
@@ -446,7 +450,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
     }
 
     fn left(&mut self, backend: T) -> Option<T> {
-        if self.referenced(backend) {
+        if self.referenced(backend) || self.scalar_pinned(backend) {
             return None;
         }
         let hold = self.holds.iter_mut().find_map(|slot| match &mut slot.held {
@@ -504,7 +508,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
         }
         let closed = hold.closed && !hold.released;
         slot.held = Held::Empty;
-        (closed && !self.referenced(backend)).then_some(backend)
+        (closed && !self.referenced(backend) && !self.scalar_pinned(backend)).then_some(backend)
     }
 
     /// Discard abandoned ordinary I/O holds one release at a time.
@@ -518,7 +522,11 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
                 unreachable!()
             };
             slot.held = Held::Empty;
-            if hold.closed && !hold.released && !self.referenced(hold.backend) {
+            if hold.closed
+                && !hold.released
+                && !self.referenced(hold.backend)
+                && !self.scalar_pinned(hold.backend)
+            {
                 return Some(hold.backend);
             }
         }
@@ -1000,7 +1008,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
         Some(Abandoned::ClaimReleased(token))
     }
 
-    /// The fork child drops inherited recovery authority in its private table.
+    /// The fork child drops inherited Open/Scalar recovery in its private table.
     /// Published fd references survive. The parent owns every unresolved job.
     /// The caller establishes child-exclusive access before this operation.
     pub fn discard_open_after_fork(&mut self) {
@@ -1010,7 +1018,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
             }
         }
         for slot in &mut self.holds {
-            if matches!(slot.held, Held::Open(_)) {
+            if matches!(slot.held, Held::Open(_) | Held::Scalar(_)) {
                 slot.held = Held::Empty;
                 slot.change();
             }
