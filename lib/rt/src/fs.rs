@@ -97,6 +97,13 @@ impl Input {
     }
 }
 
+/// An exact hidden descriptor returned by a committed paid Open operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedOpen {
+    pub fd: u32,
+    pub generation: u64,
+}
+
 pub struct Files {
     channel: Handle<Channel>,
     uart: Option<Handle<Channel>>,
@@ -160,6 +167,128 @@ impl Drop for Proof<'_> {
 }
 
 impl Files {
+    /// Capture a mutable-open path and its policy before prepaying descriptor resources.
+    pub fn open_start(
+        &self,
+        key: proto_fs::OpenKey,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+        umask: u32,
+    ) -> Result<u64, Status> {
+        let mut w = Writer::new();
+        Method::OpenStart.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        w.u32(0)?;
+        w.u64(1)?;
+        w.u32(flags)?;
+        w.u32(mode)?;
+        w.u32(umask)?;
+        w.bytes(path)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_start_reply(&reply)
+    }
+    /// Decode a Start transport reply before acknowledging the resident operation.
+    pub fn open_start_reply(reply: &crate::sys::Reply) -> Result<u64, Status> {
+        Self::open_reply(reply, 12)?;
+        let id = (reply.words[0] >> 32) | ((reply.words[1] as u32 as u64) << 32);
+        Self::open_job_id(id)?;
+        Ok(id)
+    }
+    fn open_job_id(id: u64) -> Result<(), Status> {
+        if id >> 8 == 0 || id & 255 >= 128 {
+            return Err(Status::BadSize);
+        }
+        Ok(())
+    }
+    /// Recover the paid job after the original Start reply was unavailable.
+    pub fn open_query(&self, key: proto_fs::OpenKey) -> Result<(u64, u32), Status> {
+        let mut w = Writer::new();
+        Method::OpenQuery.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_reply(&reply, 16)?;
+        let phase = (reply.words[0] >> 32) as u32;
+        if phase > 4 {
+            return Err(Status::BadSize);
+        }
+        Self::open_job_id(reply.words[1])?;
+        Ok((reply.words[1], phase))
+    }
+    /// Cleanup uses the client key even before its server job ID was decoded.
+    pub fn open_cancel_key(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        let mut w = Writer::new();
+        Method::OpenCancel.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_reply(&reply, 8)
+    }
+    fn open_reply(reply: &crate::sys::Reply, len: usize) -> Result<(), Status> {
+        let code = Self::reply_code(reply)?;
+        if !reply.handles.is_empty() {
+            return Err(Status::BadSize);
+        }
+        if code != 0 {
+            if reply.len != 8 || reply.words[0] >> 32 != 0 {
+                return Err(Status::BadSize);
+            }
+            return Err(Status::from_code(code));
+        }
+        if reply.len != len || (len == 8 && reply.words[0] >> 32 != 0) {
+            return Err(Status::BadSize);
+        }
+        Ok(())
+    }
+    /// Advance one bounded traversal or descriptor-prepayment phase.
+    pub fn open_advance(&self, id: u64, prepare: bool) -> Result<bool, Status> {
+        let mut w = Writer::new();
+        (if prepare {
+            Method::OpenPrepare
+        } else {
+            Method::ResolveStep
+        })
+        .header()
+        .write(&mut w)?;
+        w.u64(id)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        if Self::reply_code(&reply)? == proto_fs::RESOLVING {
+            if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
+                return Err(Status::BadSize);
+            }
+            return Ok(false);
+        }
+        Self::open_reply(&reply, 8)?;
+        Ok(true)
+    }
+    /// Retry this same operation ID to recover its exact committed result.
+    pub fn open_commit(&self, id: u64) -> Result<PreparedOpen, Status> {
+        let mut w = Writer::new();
+        Method::OpenCommit.header().write(&mut w)?;
+        w.u64(id)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_commit_reply(&reply)
+    }
+    /// Successful wire shape must describe a real server descriptor lifetime.
+    pub fn open_commit_reply(reply: &crate::sys::Reply) -> Result<PreparedOpen, Status> {
+        Self::open_reply(reply, 16)?;
+        let fd = (reply.words[0] >> 32) as u32;
+        let generation = reply.words[1];
+        if !(3..35).contains(&fd) || generation == 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(PreparedOpen { fd, generation })
+    }
+    /// Release the exact job and hidden descriptor after a completed or abandoned Open.
+    pub fn open_cancel(&self, id: u64) -> Result<(), Status> {
+        let mut w = Writer::new();
+        Method::ResolveCancel.header().write(&mut w)?;
+        w.u64(id)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_reply(&reply, 8)
+    }
     /// Even a long reply retains its first 64 bytes in the returned registers.
     /// Reading status needs no message-buffer copy or kilobyte stack frame.
     fn reply_code(reply: &crate::sys::Reply) -> Result<u32, Status> {

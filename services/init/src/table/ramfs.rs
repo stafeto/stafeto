@@ -19,10 +19,10 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 40,
         ceiling: 40,
-        // 4096 data pages + 650 metadata/PT_LOAD data pages + 27 code/rodata
-        // pages (26 ordinary, 27 instrumented) + 12 stack + 128 reserve,
-        // measured from RAM ELF segments and the printed table byte count.
-        quota: (4096 + 650 + 27 + 12 + 128) * PAGE,
+        // 4096 data pages + 725 metadata/PT_LOAD data pages + 7 rodata
+        // and 25 code pages + 12 stack + 128 reserve. The instrumented
+        // VERSION7 ELF has RW 2967641, RO 24808 and RX 99004 bytes.
+        quota: (4096 + 725 + 7 + 25 + 12 + 128) * PAGE,
         handle_limit: 512,
         restart: Restart::Never,
         console: true,

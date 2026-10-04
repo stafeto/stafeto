@@ -10,6 +10,7 @@
 
 pub mod authority;
 pub mod maintenance;
+pub mod open;
 pub mod places;
 pub mod resolve;
 #[cfg(test)]
@@ -215,6 +216,7 @@ pub struct Fds {
     #[cfg(feature = "auth-probe")]
     pub auth_probe_gc_reservation: Option<storage::Reservation>,
     pub resolvers: [u64; 16],
+    pub open_watermarks: [u64; OPEN_MAX],
     pub root: storage::Root,
     pub cwd: Option<Token>,
     preparations: [Option<storage::Reservation>; 16],
@@ -238,6 +240,7 @@ impl Default for Fds {
             #[cfg(feature = "auth-probe")]
             auth_probe_gc_reservation: None,
             resolvers: [0; 16],
+            open_watermarks: [0; OPEN_MAX],
             root: BOOT_ROOT,
             cwd: None,
             preparations: [None; 16],
@@ -597,6 +600,17 @@ impl<'a> Ram<'a> {
         }
         Ok(slot)
     }
+    pub fn validate_tentative(&self, fds: &Fds, held: TentativeOpen) -> Result<Token, u32> {
+        let slot = self.tentative_slot(fds, held)?;
+        let description = fds.slots[slot].expect("retained tentative description");
+        Ok(self.token(
+            self.descriptions[description as usize]
+                .expect("retained description")
+                .open
+                .file,
+        ))
+    }
+
     /// This publication cannot allocate or fail after a successful effect preflight.
     pub fn publish_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<u32, u32> {
         let slot = self.tentative_slot(fds, held)?;

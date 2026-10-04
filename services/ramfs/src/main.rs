@@ -19,7 +19,8 @@ use proto_wire::clones::Clones;
 use ramfs::authority::{
     Admission, AuditStep, Binding, BindingPurpose, CleanupAudit, Identity, NotaryReply,
 };
-use ramfs::resolve::{Progress, Resolve};
+use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
+use ramfs::resolve::{Intent, Progress, Resolve};
 use ramfs::storage::{NONE, Root, Token};
 use ramfs::tree::{self, Index};
 use ramfs::{Exec, SET_GID, SET_UID};
@@ -35,8 +36,8 @@ rt::entry!(main);
 const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 30, 31, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// The sessions: one place the image sessions share (they hold nothing),
 /// then the clients', with room for the 255 records of the process
@@ -224,6 +225,9 @@ struct ResolveJob {
     authority: Option<ramfs::authority::Stamp>,
     resolver: Resolve,
     second: Option<Resolve>,
+    open: Option<OpenJournal>,
+    open_key: Option<proto_fs::OpenKey>,
+    raw_base: (u32, u64),
 }
 struct Tables {
     places: ramfs::places::Places,
@@ -656,7 +660,7 @@ impl Service<0> for Fs {
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
         for id in s.data.resolvers {
             if id != 0 {
-                self.cancel_job(id, s.label(), None);
+                self.cancel_job(id, s.label(), Some(&mut s.data));
             }
         }
         self.drop_identity(&mut s.data);
@@ -676,7 +680,7 @@ impl Service<0> for Fs {
         {
             for id in fds.resolvers {
                 if id != 0 {
-                    self.cancel_job(id, label, None);
+                    self.cancel_job(id, label, Some(&mut fds));
                 }
             }
             self.drop_identity(&mut fds);
@@ -852,7 +856,12 @@ impl Service<0> for Fs {
             && !(r.method() == Method::Bind as u16 && self.can_replace_refresh(&s.data))
             && !matches!(
                 Method::from_number(r.method()),
-                Some(Method::Close | Method::ResolveCancel | Method::VerifySession)
+                Some(
+                    Method::Close
+                        | Method::ResolveCancel
+                        | Method::OpenCancel
+                        | Method::VerifySession
+                )
             )
         {
             return status(proto_fs::AUTHENTICATING);
@@ -870,6 +879,11 @@ impl Service<0> for Fs {
                     | Method::ResolveStep
                     | Method::ResolveCancel
                     | Method::ResolveSecond
+                    | Method::OpenStart
+                    | Method::OpenPrepare
+                    | Method::OpenCommit
+                    | Method::OpenCancel
+                    | Method::OpenQuery
             )
         ) {
             return self.resolve_request(&mut s.data, r);
@@ -904,7 +918,12 @@ impl Service<0> for Fs {
                 | Method::ResolveStep
                 | Method::ResolveCancel
                 | Method::ResolveSecond
-                | Method::FinishBinding,
+                | Method::FinishBinding
+                | Method::OpenStart
+                | Method::OpenPrepare
+                | Method::OpenCommit
+                | Method::OpenCancel
+                | Method::OpenQuery,
             ) => status(proto_fs::PERMISSION),
             Some(Method::Open) => {
                 let Ok(flags) = body.u32() else {
@@ -2020,15 +2039,24 @@ impl Fs {
         }
         Ok(i)
     }
-    fn cancel_job(&mut self, id: u64, owner: u64, fds: Option<&mut Fds>) {
+    fn cancel_job(&mut self, id: u64, owner: u64, mut fds: Option<&mut Fds>) {
         if let Ok(i) = self.job_slot(id, owner)
-            && let Some(j) = self.jobs[i].take()
+            && let Some(mut j) = self.jobs[i].take()
         {
+            if let Some(open) = j.open.as_mut() {
+                let fds = fds
+                    .as_deref_mut()
+                    .expect("open job retains its owning session");
+                open.cancel(&mut self.ram, fds, &mut j.root)
+                    .expect("exact open job cleanup");
+            }
             j.resolver.release(&mut self.ram.storage);
             if let Some(second) = j.second {
                 second.release(&mut self.ram.storage);
             }
-            self.ram.storage.release_preparation(j.root);
+            if j.root != NONE {
+                self.ram.storage.release_preparation(j.root);
+            }
         }
         if let Some(fds) = fds
             && let Some(place) = fds.resolvers.iter_mut().find(|r| **r == id)
@@ -2043,6 +2071,57 @@ impl Fs {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
+        if matches!(
+            Method::from_number(r.method()),
+            Some(Method::OpenCancel | Method::OpenQuery)
+        ) {
+            let mut body = r.body();
+            let (Ok(slot), Ok(generation), Ok(())) = (body.u32(), body.u64(), body.finish()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            let key = proto_fs::OpenKey { slot, generation };
+            if let Err(code) = key.validate() {
+                return status(code);
+            }
+            let found = self.jobs.iter().position(|j| {
+                j.as_ref()
+                    .is_some_and(|j| j.owner == r.label() && j.open_key == Some(key))
+            });
+            let Some(i) = found else {
+                if r.method() == Method::OpenCancel as u16 {
+                    let watermark = &mut fds.open_watermarks[key.slot as usize];
+                    *watermark = (*watermark).max(key.generation);
+                    return Answer::Status(Status::Ok);
+                }
+                return status(proto_fs::OPEN_RETIRED);
+            };
+            let j = self.jobs[i].as_ref().expect("exact client key");
+            let id = j.id;
+            if r.method() == Method::OpenCancel as u16 {
+                self.cancel_job(id, r.label(), Some(fds));
+                return Answer::Status(Status::Ok);
+            }
+            if let Err(code) = self.authenticate(fds, r.label()) {
+                return status(code);
+            }
+            let j = self.jobs[i].as_ref().expect("retained query job");
+            let phase = match j.open.as_ref().expect("keyed Open").phase {
+                OpenPhase::Resolving => 0,
+                OpenPhase::Reserved(_) => 1,
+                OpenPhase::Prepared { .. } => 2,
+                OpenPhase::Committed { .. } => 3,
+                OpenPhase::Canceled { .. } => 4,
+            };
+            let w = r.reply();
+            if w.u32(0)
+                .and_then(|()| w.u32(phase))
+                .and_then(|()| w.u64(id))
+                .is_err()
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply(Outgoing::new());
+        }
         if r.method() == Method::ResolveCancel as u16 {
             let mut body = r.body();
             let (Ok(id), Ok(())) = (body.u64(), body.finish()) else {
@@ -2054,19 +2133,92 @@ impl Fs {
         if let Err(code) = self.authenticate(fds, r.label()) {
             return status(code);
         }
+        if matches!(
+            Method::from_number(r.method()),
+            Some(Method::OpenPrepare | Method::OpenCommit)
+        ) {
+            return self.open_stage(fds, r);
+        }
         let mut body = r.body();
-        if r.method() == Method::ResolveStart as u16 {
-            let (Ok(slot), Ok(generation), Ok(real), Ok(follow)) =
-                (body.u32(), body.u64(), body.u32(), body.u32())
-            else {
+        if matches!(
+            Method::from_number(r.method()),
+            Some(Method::ResolveStart | Method::OpenStart)
+        ) {
+            let open_key = if r.method() == Method::OpenStart as u16 {
+                let (Ok(slot), Ok(generation)) = (body.u32(), body.u64()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let key = proto_fs::OpenKey { slot, generation };
+                if let Err(code) = key.validate() {
+                    return status(code);
+                }
+                Some(key)
+            } else {
+                None
+            };
+            let (Ok(slot), Ok(generation)) = (body.u32(), body.u64()) else {
                 return Answer::Status(Status::BadSize);
             };
-            if !matches!(real, 0 | 1) || !matches!(follow, 0 | 1) {
-                return Answer::Status(Status::BadSize);
-            }
+            let (real, intent, open) = if r.method() == Method::OpenStart as u16 {
+                let (Ok(flags), Ok(mode), Ok(umask)) = (body.u32(), body.u32(), body.u32()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let open = match OpenJournal::new(flags, mode, umask) {
+                    Ok(open) => open,
+                    Err(code) => return status(code),
+                };
+                (0, Intent::Open { flags }, Some(open))
+            } else {
+                let (Ok(real), Ok(follow)) = (body.u32(), body.u32()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if !matches!(real, 0 | 1) || !matches!(follow, 0 | 1) {
+                    return Answer::Status(Status::BadSize);
+                }
+                (
+                    real,
+                    Intent::Lookup {
+                        follow: follow != 0,
+                    },
+                    None,
+                )
+            };
             let Ok(path) = body.bytes(body.left()) else {
                 return Answer::Status(Status::BadSize);
             };
+            let raw_base = (slot, generation);
+            if let Some(key) = open_key {
+                if let Some(j) = self
+                    .jobs
+                    .iter()
+                    .flatten()
+                    .find(|j| j.owner == r.label() && j.open_key == Some(key))
+                {
+                    let old = j.open.as_ref().expect("keyed Open");
+                    let current = open.as_ref().expect("parsed Open");
+                    if j.raw_base != raw_base
+                        || old.flags != current.flags
+                        || old.mode != current.mode
+                        || old.umask != current.umask
+                        || j.resolver.original_path() != path
+                    {
+                        return status(proto_fs::PERMISSION);
+                    }
+                    let id = j.id;
+                    if r.reply().u32(0).and_then(|()| r.reply().u64(id)).is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    return Answer::Reply(Outgoing::new());
+                }
+                if self.jobs.iter().flatten().any(|j| {
+                    j.owner == r.label() && j.open_key.is_some_and(|old| old.slot == key.slot)
+                }) {
+                    return status(proto_fs::TOO_MANY_OPEN_FILES);
+                }
+                if key.generation <= fds.open_watermarks[key.slot as usize] {
+                    return status(proto_fs::OPEN_RETIRED);
+                }
+            }
             let identity = fds.binding.identity(real != 0).expect("authenticated");
             let root = fds.root;
             for id in &mut fds.resolvers {
@@ -2109,7 +2261,7 @@ impl Fs {
                 return status(proto_fs::BAD_FD);
             }
             let resolver =
-                match Resolve::new(&mut self.ram.storage, path, base, identity, follow != 0) {
+                match Resolve::with_intent(&mut self.ram.storage, path, base, identity, intent) {
                     Ok(r) => r,
                     Err(code) => {
                         self.ram.storage.release_preparation(charge);
@@ -2126,8 +2278,14 @@ impl Fs {
                 authority: fds.binding.stamp(),
                 resolver,
                 second: None,
+                open,
+                open_key,
+                raw_base,
             });
             fds.resolvers[place] = id;
+            if let Some(key) = open_key {
+                fds.open_watermarks[key.slot as usize] = key.generation;
+            }
             if r.reply().u32(0).and_then(|()| r.reply().u64(id)).is_err() {
                 self.cancel_job(id, r.label(), Some(fds));
                 return Answer::Status(Status::BadSize);
@@ -2155,7 +2313,7 @@ impl Fs {
                 Err(code) => return status(code),
             };
             let j = self.jobs[i].as_mut().expect("owned job");
-            if j.second.is_some() || j.real {
+            if j.second.is_some() || j.real || j.open.is_some() {
                 return status(proto_fs::PERMISSION);
             }
             let base = Token {
@@ -2184,6 +2342,23 @@ impl Fs {
         let j = self.jobs[i].as_ref().expect("resolve job");
         let identity = fds.binding.identity(j.real).expect("authenticated");
         let j = self.jobs[i].as_mut().expect("resolve job");
+        if let Some(open) = j.open.as_mut() {
+            if matches!(
+                open.phase,
+                OpenPhase::Committed { .. } | OpenPhase::Canceled { .. }
+            ) {
+                return if j.authority == fds.binding.stamp() {
+                    Answer::Status(Status::Ok)
+                } else {
+                    status(proto_fs::OPEN_RETIRED)
+                };
+            }
+            if !matches!(open.phase, OpenPhase::Resolving)
+                && let Err(code) = open.reset_unpublished(&mut self.ram, fds, &mut j.root)
+            {
+                return status(code);
+            }
+        }
         if j.authority != fds.binding.stamp() {
             j.authority = fds.binding.stamp();
             j.resolver.invalidate();
@@ -2206,6 +2381,89 @@ impl Fs {
             }
         }
     }
+    /// Every effect and cached result is gated by the exact job and current binding stamp.
+    fn open_stage(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let (Ok(id), Ok(())) = (body.u64(), body.finish()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let i = match self.job_slot(id, r.label()) {
+            Ok(i) => i,
+            Err(code) => return status(code),
+        };
+        let j = self.jobs[i].as_mut().expect("owned open job");
+        if !fds.resolvers.contains(&id) || j.real || j.second.is_some() {
+            return status(proto_fs::PERMISSION);
+        }
+        if j.authority != fds.binding.stamp() {
+            return status(
+                if j.open.as_ref().is_some_and(|open| {
+                    matches!(
+                        open.phase,
+                        OpenPhase::Committed { .. } | OpenPhase::Canceled { .. }
+                    )
+                }) {
+                    proto_fs::OPEN_RETIRED
+                } else {
+                    proto_fs::STALE_PROOF
+                },
+            );
+        }
+        let identity = match fds.binding.identity(false) {
+            Ok(identity) => identity,
+            Err(code) => return status(code),
+        };
+        let Some(open) = j.open.as_mut() else {
+            return status(proto_fs::PERMISSION);
+        };
+        let cached = matches!(open.phase, OpenPhase::Committed { .. });
+        let proof = if cached {
+            None
+        } else {
+            match j.resolver.result_proof(
+                &self.ram.storage,
+                identity,
+                Intent::Open { flags: open.flags },
+            ) {
+                Ok(proof) => Some(proof),
+                Err(code) => return status(code),
+            }
+        };
+        if r.method() == Method::OpenPrepare as u16 {
+            if let OpenPhase::Committed { held, .. } = open.phase {
+                return match self.ram.validate_tentative(fds, held) {
+                    Ok(_) => Answer::Status(Status::Ok),
+                    Err(code) => status(code),
+                };
+            }
+            return match open.prepare(
+                &mut self.ram,
+                fds,
+                proof.expect("uncommitted path proof"),
+                identity,
+                &mut j.root,
+            ) {
+                Ok(true) => Answer::Status(Status::Ok),
+                Ok(false) => status(proto_fs::RESOLVING),
+                Err(code) => status(code),
+            };
+        }
+        let now = rt::time::ticks_to_ns(rt::time::now());
+        match open.commit(&mut self.ram, fds, proof, identity, &mut j.root, now) {
+            Ok(held) => {
+                let w = r.reply();
+                if w.u32(0)
+                    .and_then(|()| w.u32(held.fd))
+                    .and_then(|()| w.u64(held.description.generation))
+                    .is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            Err(code) => status(code),
+        }
+    }
     fn proof(
         &mut self,
         id: u64,
@@ -2214,7 +2472,7 @@ impl Fs {
     ) -> Result<(Token, Option<proto_process::WhoReply>), u32> {
         let i = self.job_slot(id, owner)?;
         let j = self.jobs[i].as_ref().expect("job");
-        if j.real || j.second.is_some() {
+        if j.real || j.second.is_some() || j.open.is_some() {
             return Err(proto_fs::PERMISSION);
         }
         let fds = fds.ok_or(proto_fs::PERMISSION)?;

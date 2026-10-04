@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 5 of the bounded RAM file service. Numbers are little endian.
+//! Version 7 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -29,6 +29,19 @@
 //! Subsequent operations use that unforgeable session and recheck its generation.
 //! Traversal, metadata or credential changes invalidate proofs; STALE_PROOF
 //! requires another ResolveStep before retrying the final operation.
+//!
+//! OpenStart first carries client hold slot u32 and nonwrapping generation u64.
+//! Live duplicate keys require exact original arguments and return the same job.
+//! OpenQuery/OpenCancel address this key before a Start reply supplies its job ID.
+//! Retired keys are terminal and can never repeat a file effect.
+//! OpenStart captures base slot u32/generation u64, flags/mode/umask u32 and
+//! raw pathname bytes under one paid job. ResolveStep produces an exact existing
+//! edge or missing final edge. OpenPrepare(job u64) prepays creation and hidden
+//! descriptor resources in separate steps; RESOLVING continues preparation.
+//! OpenCommit(job u64) commits the file effect once and returns the hidden fd
+//! u32 plus its description generation u64. Replays return the exact held result.
+//! ResolveCancel releases the job and hidden descriptor; committed file effects
+//! remain observable. Ordinary descriptor APIs and Clone exclude the hidden fd.
 //!
 //! OPEN: flags u32, proof u64. Reply: status, fd u32, optional RANDOM_DEVICE u32.
 //! LOOKUP/INFO_PATH: proof u64. Reply: status then metadata/NodeInfo.
@@ -65,7 +78,7 @@ pub use info::NodeInfo;
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 7;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -113,6 +126,22 @@ pub const AUTHENTICATING: u32 = 315;
 pub const ALREADY_EXISTS: u32 = 316;
 pub const READ_ONLY_FILESYSTEM: u32 = 317;
 pub const TEXT_BUSY: u32 = 318;
+/// The former operation may have completed; a fresh pathname retry is forbidden.
+pub const OPEN_RETIRED: u32 = 319;
+/// Existing local hold slots give independent idempotency domains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenKey {
+    pub slot: u32,
+    pub generation: u64,
+}
+impl OpenKey {
+    pub fn validate(self) -> Result<usize, u32> {
+        if self.slot >= 32 || self.generation == 0 {
+            return Err(INVALID_ARGUMENT);
+        }
+        Ok(self.slot as usize)
+    }
+}
 pub const BOOT_PROFILE: u64 = 1 << 61;
 
 /// Init issues this profile exclusively to the named diagnostic client.
@@ -216,6 +245,16 @@ pub enum Method {
     ResolveSecond = 24,
     /// On a prepared genuine session: no body, no handles. RESOLVING requests another step.
     FinishBinding = 25,
+    /// Captured base, mutable-open flags, mode, umask and raw path; reply job u64.
+    OpenStart = 26,
+    /// Paid job u64. Prepay creation and a hidden description before file effects.
+    OpenPrepare = 27,
+    /// Paid job u64. Commit once; reply fd u32 and description generation u64.
+    OpenCommit = 28,
+    /// Client key slot u32/generation u64. Release exact ownership; effects persist.
+    OpenCancel = 30,
+    /// Client key slot u32/generation u64. Find the original paid operation.
+    OpenQuery = 31,
 }
 
 impl Method {
@@ -250,13 +289,19 @@ impl Method {
             23 => Some(Self::ResolveCancel),
             24 => Some(Self::ResolveSecond),
             25 => Some(Self::FinishBinding),
+            26 => Some(Self::OpenStart),
+            27 => Some(Self::OpenPrepare),
+            28 => Some(Self::OpenCommit),
+            30 => Some(Self::OpenCancel),
+            31 => Some(Self::OpenQuery),
             _ => None,
         }
     }
 }
 
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 30, 31,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
