@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod authority;
+pub mod maintenance;
 pub mod places;
 pub mod resolve;
 #[cfg(test)]
