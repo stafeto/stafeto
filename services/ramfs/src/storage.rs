@@ -138,6 +138,12 @@ impl Overlay {
         pages: [NONE; FILE_PAGES],
         head: NONE,
     };
+    fn initialize(&mut self, node: u16, root: u16) {
+        self.pages.fill(NONE);
+        self.head = NONE;
+        self.node = node;
+        self.root = root;
+    }
 }
 #[derive(Clone, Copy)]
 struct Dentry {
@@ -553,11 +559,7 @@ impl<'a> Storage<'a> {
         let next = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
         self.state.inode_len -= 1;
         let i = self.state.inode_free[self.state.inode_len] as usize;
-        self.state.overlays[i] = Overlay {
-            node: token.slot,
-            root: a as u16,
-            ..Overlay::EMPTY
-        };
+        self.state.overlays[i].initialize(token.slot, a as u16);
         self.state.nodes[token.slot as usize].overlay = i as u16;
         self.state.accounts[a].as_mut().unwrap().usage.inodes += 1;
         self.state.epoch = next;
@@ -625,6 +627,7 @@ impl<'a> Storage<'a> {
         self.state.dentry_len -= 1;
         let d = self.state.dentry_free[self.state.dentry_len] as usize;
         self.state.generations[i] = generation;
+        self.state.overlays[i].initialize(token.slot, a as u16);
         self.state.nodes[token.slot as usize] = Node {
             generation,
             kind,
@@ -635,11 +638,6 @@ impl<'a> Storage<'a> {
             overlay: i as u16,
             pins: [0, 0, 0, 1, 0],
             ..Node::EMPTY
-        };
-        self.state.overlays[i] = Overlay {
-            node: token.slot,
-            root: a as u16,
-            ..Overlay::EMPTY
         };
         let entry = &mut self.state.dentries[d];
         *entry = Dentry {
@@ -1050,6 +1048,54 @@ mod page_tests {
             assert!(steps <= PAGES + INODES);
         }
         steps
+    }
+
+    #[test]
+    fn reused_overlay_is_initialized_before_reserved_inode_publication() {
+        let mut ram = crate::Ram::new(0);
+        let storage = &mut ram.storage;
+        let old = create(storage, b"old");
+        storage.write(old, FIRST, PAGE + 5, b"old bytes").unwrap();
+        let slot = storage.node(old).unwrap().overlay as usize;
+        storage.unlink(ROOT, b"old", FIRST).unwrap();
+        assert_eq!(drain(storage), 2);
+        // Free metadata may contain stale links; admission must initialize every field.
+        storage.state.overlays[slot] = Overlay {
+            node: old.slot,
+            root: 7,
+            pages: [123; FILE_PAGES],
+            head: 123,
+        };
+        let reservation = storage
+            .reserve(FIRST, ROOT, b"new", (crate::REG, 0o644, 0, 0))
+            .unwrap();
+        assert_eq!(
+            storage.node(reservation.token).unwrap().overlay as usize,
+            slot
+        );
+        assert_eq!(reservation.token.slot, old.slot);
+        assert!(reservation.token.generation > old.generation);
+        let overlay = &storage.state.overlays[slot];
+        assert_eq!(overlay.node, reservation.token.slot);
+        assert_eq!(overlay.root, reservation.root);
+        assert_eq!(overlay.head, NONE);
+        assert!(overlay.pages.iter().all(|&page| page == NONE));
+        assert_eq!(storage.usage(FIRST).pages, 0);
+        assert_eq!(storage.lookup(ROOT, b"new"), Err(NO_ENTRY));
+        let new = storage.commit(reservation).unwrap();
+        storage
+            .write(new, FIRST, FILE_PAGES * PAGE - 1, b"z")
+            .unwrap();
+        let mut tail = [0xa5; 8];
+        assert_eq!(
+            storage.read(new, (FILE_PAGES * PAGE - 8) as u64, &mut tail),
+            Ok(8)
+        );
+        assert_eq!(tail, *b"\0\0\0\0\0\0\0z");
+        assert_eq!(storage.usage(FIRST).pages, 1);
+        storage.unlink(ROOT, b"new", FIRST).unwrap();
+        assert_eq!(drain(storage), 2);
+        assert_eq!(storage.usage(FIRST), Usage::default());
     }
 
     #[test]
