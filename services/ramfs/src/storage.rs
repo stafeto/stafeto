@@ -769,6 +769,25 @@ impl<'a> Storage<'a> {
         }
         Ok(r.token)
     }
+    /// Match the reserved namespace edge before the admitted creation is published.
+    pub fn reserved_edge(
+        &self,
+        r: Reservation,
+        root: Root,
+        parent: Token,
+        leaf: &[u8],
+    ) -> Result<(), u32> {
+        self.reserved_token(r, root)?;
+        let d = &self.state.dentries[r.dentry as usize];
+        if !d.reserved
+            || d.node != r.token
+            || d.parent != parent
+            || &d.name[..d.len as usize] != leaf
+        {
+            return Err(proto_fs::STALE_PROOF);
+        }
+        Ok(())
+    }
     pub fn commit(&mut self, reservation: Reservation) -> Result<Token, u32> {
         let token = self.commit_keep_charge(reservation)?;
         self.release_preparation(reservation.root);
@@ -806,6 +825,12 @@ impl<'a> Storage<'a> {
         Ok(reservation.token)
     }
     pub fn cancel(&mut self, r: Reservation) -> Result<(), u32> {
+        self.cancel_keep_charge(r)?;
+        self.release_preparation(r.root);
+        Ok(())
+    }
+    /// Roll back an unpublished reserve while keeping the exact job's paid admission.
+    pub fn cancel_keep_charge(&mut self, r: Reservation) -> Result<(), u32> {
         if self.state.pending.get(r.place as usize).copied().flatten() != Some(r) {
             return Err(NO_ENTRY);
         }
@@ -816,14 +841,10 @@ impl<'a> Storage<'a> {
         self.drop_dentry(r.dentry as usize);
         self.unpin(d.parent, Pin::Pending)?;
         self.unpin(r.token, Pin::Pending)?;
-        self.end_preparation(r);
+        self.state.pending[r.place as usize] = None;
         Ok(())
     }
 
-    fn end_preparation(&mut self, r: Reservation) {
-        self.state.pending[r.place as usize] = None;
-        self.release_preparation(r.root);
-    }
     pub fn preparations_used(&self) -> u16 {
         self.state.preparation_used
     }

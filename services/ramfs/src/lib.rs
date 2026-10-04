@@ -10,6 +10,7 @@
 
 pub mod authority;
 pub mod maintenance;
+pub mod open;
 pub mod places;
 pub mod resolve;
 #[cfg(test)]
@@ -597,6 +598,17 @@ impl<'a> Ram<'a> {
         }
         Ok(slot)
     }
+    pub fn validate_tentative(&self, fds: &Fds, held: TentativeOpen) -> Result<Token, u32> {
+        let slot = self.tentative_slot(fds, held)?;
+        let description = fds.slots[slot].expect("retained tentative description");
+        Ok(self.token(
+            self.descriptions[description as usize]
+                .expect("retained description")
+                .open
+                .file,
+        ))
+    }
+
     /// This publication cannot allocate or fail after a successful effect preflight.
     pub fn publish_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<u32, u32> {
         let slot = self.tentative_slot(fds, held)?;
