@@ -625,6 +625,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ramfs-gc"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+ "proto-fs",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "ramfs-holder"
 version = "0.1.0"
 dependencies = [

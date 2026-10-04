@@ -170,6 +170,18 @@ const LOADER_ABORT_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("loader", "loader", 0, &["auth-probe"]),
 ];
+const RAMFS_GC_PROGRAMS: [ImageProgram; 5] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-files"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["auth-probe", "steps"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-files", "ramfs-gc", POSIX_STACK_SIZE, &[]),
+];
 const RAMFS_CLEANUP_PROGRAMS: [ImageProgram; 7] = [
     (
         "init",
@@ -1043,6 +1055,7 @@ commands:
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
   loader-abort verify retained file cleanup after genuine exec cancellation
+  ramfs-gc verify binding progress during queued page reclamation
   ramfs-cleanup verify unfinished binding cleanup with a foreign holder
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
@@ -1156,6 +1169,7 @@ fn main() {
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-files") => posix_files_probe(),
         Some("ramfs-cleanup") => ramfs_cleanup_probe(),
+        Some("ramfs-gc") => ramfs_gc_probe(),
         Some("loader-abort") => loader_abort_probe(),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
@@ -2646,6 +2660,39 @@ fn loader_channels_probe() -> Result<(), String> {
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;
     qemu::expect_marker(&outcome, "loader-channels: ok")
+}
+
+fn ramfs_gc_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-ramfs-gc.img", &RAMFS_GC_PROGRAMS, BOOT_PROFILE)?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "ramfs-gc: binding and page reclamation both progress ok",
+    )?;
+    let steps = longest_steps(&output.lines, "2");
+    for kind in [22, 63, 65] {
+        if !steps
+            .iter()
+            .any(|(seen, ticks, _)| *seen == kind && *ticks != 0)
+        {
+            return Err(format!(
+                "RAM GC probe has no kind {kind} measurement: {steps:?}"
+            ));
+        }
+    }
+    if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "RAM GC kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    println!("RAM GC dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    Ok(())
 }
 
 fn loader_abort_probe() -> Result<(), String> {
