@@ -118,14 +118,25 @@ impl Holds {
         if ids.len() > HOLDS {
             return Err(Failure::Limit);
         }
+        // A description's low byte is its unique table index. Compare
+        // the complete owned ID to preserve side and generation checks.
+        let mut owned = [0u32; DESCRIPTIONS];
+        for id in self.ids() {
+            owned[(id & 255) as usize] = id;
+        }
         let mut result = Self::new();
+        let mut selected = [0u64; DESCRIPTIONS / 64];
+        let mut next = 0;
         for &id in ids {
-            if !self.contains(id) {
+            let index = (id & 255) as usize;
+            if id == 0 || owned[index] != id {
                 return Err(Failure::BadDescription);
             }
-            if !result.contains(id) {
-                let slot = result.room()?;
-                result.ids[slot] = Some(id);
+            let bit = 1 << (index % 64);
+            if selected[index / 64] & bit == 0 {
+                *result.ids.get_mut(next).ok_or(Failure::Limit)? = Some(id);
+                next += 1;
+                selected[index / 64] |= bit;
             }
         }
         Ok(result)
@@ -562,6 +573,32 @@ mod tests {
             Err(Failure::BadDescription)
         );
         assert!(table.resolve(&holders, foreign).is_ok());
+    }
+
+    #[test]
+    fn selection_preserves_full_ids_and_order_at_the_hold_limit() {
+        let mut table = Endpoints::new();
+        let mut parent = Holds::new();
+        let mut ids = [0; HOLDS];
+        for id in &mut ids {
+            *id = table.open_console(&mut parent, 2).unwrap();
+        }
+        let selected = parent.selected(&ids).unwrap();
+        assert_eq!(selected.ids().count(), HOLDS);
+        assert!(selected.ids().eq(ids));
+        assert!(
+            parent
+                .selected(&[ids[31], ids[0], ids[31]])
+                .unwrap()
+                .ids()
+                .eq([ids[31], ids[0]])
+        );
+        for stale in [0, ids[0] ^ 256, ids[0] ^ (1 << 31)] {
+            assert!(matches!(
+                parent.selected(&[ids[31], stale]),
+                Err(Failure::BadDescription)
+            ));
+        }
     }
 
     #[test]

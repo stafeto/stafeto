@@ -58,9 +58,19 @@ impl<const N: usize> Clones<N> {
 
     /// `add` with `most` clones of `client` at most (`room_within`).
     pub fn add_within(&mut self, label: u64, client: u64, most: usize) -> Result<(), Full> {
-        self.room_within(client, most)?;
-        let free = self.live.iter_mut().find(|l| l.is_none()).ok_or(Full)?;
-        *free = Some((label, client));
+        let mut own = 0;
+        let mut free = None;
+        for (index, live) in self.live.iter().enumerate() {
+            match live {
+                Some((_, owner)) => own += usize::from(*owner == client),
+                None if free.is_none() => free = Some(index),
+                None => {}
+            }
+        }
+        if own >= most {
+            return Err(Full);
+        }
+        self.live[free.ok_or(Full)?] = Some((label, client));
         Ok(())
     }
 
