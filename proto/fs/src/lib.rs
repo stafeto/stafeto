@@ -128,6 +128,8 @@ pub const READ_ONLY_FILESYSTEM: u32 = 317;
 pub const TEXT_BUSY: u32 = 318;
 /// The former operation may have completed; a fresh pathname retry is forbidden.
 pub const OPEN_RETIRED: u32 = 319;
+/// The implementation regular-file capacity was reached (EFBIG).
+pub const FILE_TOO_LARGE: u32 = 320;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
