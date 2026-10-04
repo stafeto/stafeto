@@ -1453,3 +1453,160 @@ fn no_follow_open_still_resolves_a_link_with_a_trailing_slash() {
     );
     assert_eq!(ram.storage.node(link).unwrap().pins.iter().sum::<u16>(), 0);
 }
+
+#[test]
+fn tentative_open_prepays_resources_without_exposing_a_descriptor() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let token = create(&mut ram, ROOT, b"prepaid", REG, 0o600);
+    let before = ram.storage.usage(ROOT_ACCOUNT);
+    let held = ram
+        .prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, false)
+        .unwrap();
+    assert_eq!(ram.open_descriptions(), 1);
+    assert_eq!(
+        ram.storage.usage(ROOT_ACCOUNT).descriptions,
+        before.descriptions + 1
+    );
+    assert_eq!(fds.numbers().count(), 0);
+    assert_eq!(ram.description_token(&fds, held.fd), Err(proto_fs::BAD_FD));
+    assert!(matches!(
+        ram.clone_fds(&fds, &[held.fd]),
+        Err(proto_fs::BAD_FD)
+    ));
+    assert_eq!(
+        ram.read(&mut fds, held.fd, &mut [0; 1]),
+        Err(proto_fs::BAD_FD)
+    );
+    assert_eq!(ram.write(&mut fds, held.fd, b"x"), Err(proto_fs::BAD_FD));
+    assert_eq!(ram.close(&mut fds, held.fd), Err(proto_fs::BAD_FD));
+    ram.cancel_open(&mut fds, held).unwrap();
+    assert_eq!(ram.cancel_open(&mut fds, held), Err(proto_fs::BAD_FD));
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT), before);
+    let replacement = ram
+        .prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, false)
+        .unwrap();
+    assert_eq!(replacement.fd, held.fd);
+    assert_ne!(
+        replacement.description.generation,
+        held.description.generation
+    );
+    assert_eq!(ram.cancel_open(&mut fds, held), Err(proto_fs::BAD_FD));
+    assert_eq!(ram.publish_open(&mut fds, replacement), Ok(replacement.fd));
+    assert_eq!(
+        ram.publish_open(&mut fds, replacement),
+        Err(proto_fs::BAD_FD)
+    );
+    assert_eq!(
+        ram.description_token(&fds, replacement.fd),
+        Ok(replacement.description)
+    );
+    assert_eq!(ram.write(&mut fds, replacement.fd, b"live"), Ok(4));
+    ram.close(&mut fds, replacement.fd).unwrap();
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.node(token).unwrap().pins.iter().sum::<u16>(), 0);
+}
+
+#[test]
+fn created_mode_zero_can_be_prepaid_and_session_cleanup_closes_it_once() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let reservation = ram
+        .storage
+        .reserve(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"mode-zero",
+            (REG, 0, OWNER.uid, OWNER.gid),
+        )
+        .unwrap();
+    assert!(matches!(
+        ram.prepare_open_token(
+            &mut fds,
+            reservation.token,
+            proto_fs::READ_WRITE,
+            OWNER,
+            false
+        ),
+        Err(proto_fs::ACCESS_DENIED)
+    ));
+    let held = ram
+        .prepare_open_token(
+            &mut fds,
+            reservation.token,
+            proto_fs::READ_WRITE | proto_fs::CREATE,
+            OWNER,
+            true,
+        )
+        .unwrap();
+    ram.storage.commit(reservation).unwrap();
+    assert_eq!(ram.publish_open(&mut fds, held), Ok(held.fd));
+    assert_eq!(ram.write(&mut fds, held.fd, b"created"), Ok(7));
+    ram.close(&mut fds, held.fd).unwrap();
+    let token = ram.storage.lookup(ROOT, b"mode-zero").unwrap();
+    ram.storage
+        .set_attributes(token, 0o600, OWNER.uid, OWNER.gid)
+        .unwrap();
+    ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, false)
+        .unwrap();
+    assert!(ram.release_step(&mut fds));
+    assert!(!ram.release_step(&mut fds));
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.node(token).unwrap().pins.iter().sum::<u16>(), 0);
+    assert_eq!(ram.storage.preparations_used(), 0);
+}
+
+#[test]
+fn tentative_open_failure_and_full_cleanup_preserve_descriptor_accounting() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let token = create(&mut ram, ROOT, b"full-open", REG, 0o600);
+    for _ in 0..32 {
+        ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, false)
+            .unwrap();
+    }
+    let before = ram.storage.usage(ROOT_ACCOUNT);
+    assert_eq!(fds.numbers().count(), 0);
+    assert_eq!(ram.open_descriptions(), 32);
+    assert!(matches!(
+        ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, false),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    ));
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT), before);
+    assert_eq!(ram.open_descriptions(), 32);
+    for _ in 0..32 {
+        assert!(ram.release_step(&mut fds));
+    }
+    assert!(!ram.release_step(&mut fds));
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT).descriptions, 0);
+    assert_eq!(ram.storage.node(token).unwrap().pins.iter().sum::<u16>(), 0);
+    assert!(matches!(
+        ram.prepare_open_token(
+            &mut fds,
+            token,
+            proto_fs::CREATE | proto_fs::EXCLUSIVE,
+            OWNER,
+            false
+        ),
+        Err(proto_fs::ALREADY_EXISTS)
+    ));
+    let motd = Token {
+        slot: 3,
+        generation: 1,
+    };
+    assert!(matches!(
+        ram.prepare_open_token(&mut fds, motd, proto_fs::WRITE_ONLY, ADMIN, false),
+        Err(proto_fs::READ_ONLY_FILESYSTEM)
+    ));
+    assert_eq!(ram.open_descriptions(), 0);
+}

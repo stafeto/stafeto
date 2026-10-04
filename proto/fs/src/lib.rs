@@ -110,6 +110,9 @@ pub const RESOLVING: u32 = 314;
 /// The original request made no file effect. FinishBinding completes the
 /// retained authority refresh before the caller retries the original request.
 pub const AUTHENTICATING: u32 = 315;
+pub const ALREADY_EXISTS: u32 = 316;
+pub const READ_ONLY_FILESYSTEM: u32 = 317;
+pub const TEXT_BUSY: u32 = 318;
 pub const BOOT_PROFILE: u64 = 1 << 61;
 
 /// Init issues this profile exclusively to the named diagnostic client.

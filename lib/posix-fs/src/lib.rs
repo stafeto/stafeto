@@ -10,7 +10,10 @@ use core::mem::ManuallyDrop;
 pub use posix_fd::Flags as DescriptorFlags;
 use posix_fd::{Error as DescriptorError, Table};
 use posix_path::{MAX_PATH, PathError, PathState};
-pub use proto_fs::{CHANGES, DIRECTORY_ONLY, MAX_READ, NodeInfo, SeekFrom};
+pub use proto_fs::{
+    APPEND, CHANGES, CREATE, DIRECTORY_ONLY, EXCLUSIVE, MAX_READ, NO_FOLLOW, NodeInfo, SeekFrom,
+    TRUNCATE,
+};
 use proto_wire::Status;
 use rt::Handle;
 use rt::fs::{Files, View};
@@ -19,6 +22,11 @@ use rt::handle::Channel;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsError {
     NoEntry,
+    AlreadyExists,
+    Loop,
+    ReadOnlyFilesystem,
+    TextBusy,
+    OperationNotPermitted,
     PermissionDenied,
     BadFileDescriptor,
     IsDirectory,
@@ -67,6 +75,11 @@ impl From<Status> for FsError {
         match status {
             Status::Kernel(rt::abi::Error::Interrupted) => Self::Interrupted,
             Status::Unknown(proto_fs::NO_ENTRY) => Self::NoEntry,
+            Status::Unknown(proto_fs::ALREADY_EXISTS) => Self::AlreadyExists,
+            Status::Unknown(proto_fs::LOOP) => Self::Loop,
+            Status::Unknown(proto_fs::READ_ONLY_FILESYSTEM) => Self::ReadOnlyFilesystem,
+            Status::Unknown(proto_fs::TEXT_BUSY) => Self::TextBusy,
+            Status::Unknown(proto_fs::PERMISSION) => Self::OperationNotPermitted,
             Status::Unknown(proto_fs::ACCESS_DENIED) => Self::PermissionDenied,
             Status::Unknown(proto_fs::BAD_FD) => Self::BadFileDescriptor,
             Status::Unknown(proto_fs::IS_DIRECTORY) => Self::IsDirectory,
