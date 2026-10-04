@@ -8,6 +8,9 @@ license = "GPL-3.0-or-later"
 description = "The C probe of pseudoterminal descriptions, disconnect and ownership"
 build = "build.rs"
 
+[features]
+clone-steps = []
+
 [[bin]]
 name = "posix-pty"
 test = false

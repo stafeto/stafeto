@@ -94,7 +94,14 @@ static int pty_ash_worker(void) {
     for (;;) pause();
 }
 
-static int pty_ash_dialog(void) {
+static int pty_ash_link(void) {
+    sigset_t mask;
+    CHECK(sigprocmask(SIG_SETMASK, NULL, &mask) == 0);
+    printf("PTY-LINK pid %d parent %d sid %d tty-sid %d foreground %d group %d parent-group %d HUP-blocked %d\n", getpid(), getppid(), getsid(0), tcgetsid(0), tcgetpgrp(0), getpgrp(), getpgid(getppid()), sigismember(&mask, SIGHUP));
+    return 0;
+}
+
+static int pty_ash_dialog(int direct_hup) {
     struct pair p;
     CHECK(make_pair(&p) == 0);
     pid_t child = fork();
@@ -141,10 +148,22 @@ static int pty_ash_dialog(void) {
     CHECK(pty_ash_receive(&d, pty_ash_prompt, 0) == 0);
     CHECK(pty_ash_command(&d, "echo $?\n", "130") == 0);
     CHECK(pty_ash_command(&d, "trap 'exit 79' HUP; echo PTY-HUP-ARMED\n", "PTY-HUP-ARMED") == 0);
-    CHECK(close(p.master) == 0);
+    CHECK(pty_ash_command(&d, "echo PTY-SHELL-PID=$$; /bin/posix-pty ash-link\n", NULL) == 0);
+    printf("posix-pty: shell link [%s]\n", d.output);
+    CHECK(pty_ash_command(&d, "trap\n", NULL) == 0);
+    printf("posix-pty: installed shell traps [%s]\n", d.output);
+    CHECK(strstr(d.output, "exit 79") != NULL && strstr(d.output, "HUP") != NULL);
+    struct termios attributes;
+    CHECK(tcgetattr(p.master, &attributes) == 0);
+    printf("posix-pty: ash CLOCAL %d, cflag 0x%x\n", !!(attributes.c_cflag & CLOCAL), (unsigned)attributes.c_cflag);
+    CHECK(!(attributes.c_cflag & CLOCAL));
+    if (direct_hup) CHECK(kill(child, SIGHUP) == 0);
+    else CHECK(close(p.master) == 0);
     int status;
     CHECK(waitpid(child, &status, 0) == child);
+    printf("posix-pty: ash disconnect status %d, exited %d code %d signal %d\n", status, WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 79);
-    printf("posix-pty: ash master Ctrl-C/Ctrl-Z/jobs/bg/fg/HUP ok\n");
+    if (direct_hup) CHECK(close(p.master) == 0);
+    printf("posix-pty: ash master Ctrl-C/Ctrl-Z/jobs/bg/fg/HUP via %s ok\n", direct_hup ? "kill" : "master close");
     return 0;
 }

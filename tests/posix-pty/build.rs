@@ -15,6 +15,7 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=pty.c");
+    println!("cargo:rerun-if-changed=ash-dialog.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     let manifest =
@@ -40,7 +41,11 @@ fn main() {
     );
     println!("cargo:rerun-if-changed={}", lib.join("libc.a").display());
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    run(Command::new(tools.join("clang"))
+    let mut compiler = Command::new(tools.join("clang"));
+    if env::var_os("CARGO_FEATURE_CLONE_STEPS").is_some() {
+        compiler.arg("-DPTY_CLONE_STEPS");
+    }
+    run(compiler
         .args([
             // The Linux C ABI relibc's headers describe.
             "--target=aarch64-linux-gnu",
