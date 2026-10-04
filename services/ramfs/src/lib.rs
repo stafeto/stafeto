@@ -203,6 +203,8 @@ pub struct Fds {
     pub authority_index: u16,
     pub binding_preparation: Option<u16>,
     pub binding_source: Option<(u16, u64)>,
+    /// The completed binding result remains available until a new preparation.
+    pub binding_outcome: Option<u32>,
     pub resolvers: [u64; 16],
     pub root: storage::Root,
     pub cwd: Option<Token>,
@@ -218,6 +220,7 @@ impl Default for Fds {
             authority_index: storage::NONE,
             binding_preparation: None,
             binding_source: None,
+            binding_outcome: None,
             resolvers: [0; 16],
             root: BOOT_ROOT,
             cwd: None,

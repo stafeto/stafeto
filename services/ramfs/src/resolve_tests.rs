@@ -62,6 +62,36 @@ fn who() -> WhoReply {
     }
 }
 #[test]
+fn refreshed_capture_preserves_authority_class_and_retained_descriptions() {
+    let parent = who();
+    let pending = WhoReply { loader: Some(LoaderOf { ticket: 7, image: parent.image }), ..parent };
+    let mut ram = Ram::new(0);
+    let mut fds = Fds::default();
+    let fd = ram.open(&mut fds, "/tmp/probe", proto_fs::READ_WRITE).unwrap();
+    ram.set_cwd_token(&mut fds, ROOT).unwrap();
+    let description = ram.description_token(&fds, fd).unwrap();
+    let usage = ram.storage.usage(ROOT_ACCOUNT);
+    for original in [Binding::Inherited(parent), Binding::Active(parent), Binding::Pending(pending)] {
+        fds.binding = original;
+        let old = original.snapshot().unwrap();
+        let fresh = WhoReply { generation: 2, ..old };
+        fds.binding = original.refreshed(&fresh).unwrap();
+        assert_eq!(fds.binding.snapshot(), Some(fresh));
+        assert_eq!(core::mem::discriminant(&fds.binding), core::mem::discriminant(&original));
+        if matches!(original, Binding::Inherited(_)) {
+            assert_eq!(fds.binding.identity(false), Err(proto_fs::PERMISSION));
+        }
+        assert_eq!(ram.description_token(&fds, fd), Ok(description));
+        assert_eq!(fds.cwd, Some(ROOT));
+        assert_eq!(ram.storage.usage(ROOT_ACCOUNT), usage);
+        for changed in [WhoReply { pid: fresh.pid + 1, ..fresh }, WhoReply { image: fresh.image + 1, ..fresh }, WhoReply { index: fresh.index + 1, ..fresh }, WhoReply { loader: None, ..pending }, WhoReply { generation: proto_process::GENERATION_DEAD, ..fresh }] {
+            if changed == fresh { continue; }
+            assert_eq!(Binding::Pending(pending).refreshed(&changed), Err(proto_fs::PERMISSION));
+        }
+    }
+    ram.release(&mut fds);
+}
+#[test]
 fn binding_retains_vouched_identity_image_and_root() {
     let mut binding = Binding::Unbound;
     assert_eq!(binding.bind(None, false), Err(proto_fs::PERMISSION));

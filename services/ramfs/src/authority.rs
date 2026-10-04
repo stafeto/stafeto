@@ -23,6 +23,26 @@ pub enum Binding {
     Cleanup,
 }
 impl Binding {
+    /// Refresh preserves the exact authority class and its captured owner.
+    pub fn refreshed(self, who: &WhoReply) -> Result<Self, u32> {
+        let old = self.snapshot_ref().ok_or(proto_fs::PERMISSION)?;
+        if old.pid != who.pid
+            || old.index != who.index
+            || old.image != who.image
+            || old.root != who.root
+            || old.loader != who.loader
+        {
+            return Err(proto_fs::PERMISSION);
+        }
+        let mut checked = self;
+        checked.bind_ref(Some(who), matches!(self, Self::Pending(_)))?;
+        Ok(match self {
+            Self::Active(_) => Self::Active(*who),
+            Self::Pending(_) => Self::Pending(*who),
+            Self::Inherited(_) => Self::Inherited(*who),
+            _ => return Err(proto_fs::PERMISSION),
+        })
+    }
     pub fn bind(&mut self, vouched: Option<WhoReply>, pending: bool) -> Result<(), u32> {
         self.bind_ref(vouched.as_ref(), pending)
     }
