@@ -16,7 +16,7 @@ use proto_fs::{MAX_READ, MAX_WRITE, Method, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
 use proto_wire::clones::Clones;
-use ramfs::authority::{Binding, Identity};
+use ramfs::authority::{Admission, Binding, BindingPurpose, Identity};
 use ramfs::resolve::{Progress, Resolve};
 use ramfs::storage::{NONE, Root, Token};
 use ramfs::tree::{self, Index};
@@ -203,17 +203,6 @@ const BIRTHS: usize = CLONES;
 
 /// The tables of the sessions and of the births, in `.bss`: too big for
 /// the service's stack.
-enum Admission {
-    Unvouched,
-    Wire([u8; 252]),
-    Vouched(proto_process::WhoReply),
-    Validated(proto_process::WhoReply),
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BindingPurpose {
-    Candidate,
-    Refresh,
-}
 struct IdentityChannel {
     label: u64,
     channel: Handle<Channel>,
@@ -265,9 +254,12 @@ impl Fs {
             .snapshot_ref()
             .is_some_and(|who| generation(who.index as usize) & proto_process::GENERATION_DEAD != 0)
         {
+            let unfinished = fds.binding_preparation.is_some();
             self.drop_identity(fds);
             fds.binding = Binding::Cleanup;
-            fds.binding_outcome = Some(proto_fs::PERMISSION);
+            if unfinished || fds.binding_outcome.is_none() {
+                fds.binding_outcome = Some(proto_fs::PERMISSION);
+            }
             return true;
         }
         if fds.binding_preparation.is_some() {
@@ -1261,10 +1253,7 @@ impl Fs {
             identity.offered = None;
             identity.pending = false;
             identity.require = false;
-            if let Some(root) = fds.binding_preparation.take() {
-                self.ram.storage.release_preparation(root);
-            }
-            fds.binding_source = None;
+            self.ram.complete_binding(fds, code);
         } else {
             self.drop_identity(fds);
             fds.binding = Binding::Cleanup;
@@ -1293,12 +1282,9 @@ impl Fs {
         let Ok(identity) = r.handles.take::<Channel>(0) else {
             return status(proto_fs::PERMISSION);
         };
-        let root = match self.ram.storage.charge_preparation(fds.root) {
-            Ok(root) => root,
-            Err(code) => return status(code),
-        };
-        fds.binding_preparation = Some(root);
-        fds.binding_outcome = None;
+        if let Err(code) = self.ram.begin_binding(fds) {
+            return status(code);
+        }
         match self.install_identity(fds, r.label(), identity, true) {
             Ok(()) => status(proto_fs::RESOLVING),
             Err(code) => {
@@ -1347,14 +1333,12 @@ impl Fs {
         if identity.label != label {
             return Err(proto_fs::PERMISSION);
         }
-        let charge = self.ram.storage.charge_preparation(fds.root)?;
+        self.ram.begin_binding(fds)?;
         identity.admission = Admission::Unvouched;
         identity.purpose = BindingPurpose::Refresh;
         identity.original = fds.binding;
         identity.original_root = fds.root;
         identity.pending = matches!(fds.binding, Binding::Pending(_));
-        fds.binding_preparation = Some(charge);
-        fds.binding_outcome = None;
         Err(proto_fs::AUTHENTICATING)
     }
     /// Compatibility verification only admits this authenticated caller's true clone.
@@ -1465,11 +1449,9 @@ impl Fs {
         // Identity admission itself holds a finite preparation. Its exact root
         // replaces the boot admission account after the separate genuine Vouch.
         let mut child = Fds::default();
-        let root = match self.ram.storage.charge_preparation(child.root) {
-            Ok(root) => root,
-            Err(code) => return status(code),
-        };
-        child.binding_preparation = Some(root);
+        if let Err(code) = self.ram.begin_binding(&mut child) {
+            return status(code);
+        }
         let Some(label) = self.places.issue(self.given) else {
             self.drop_identity(&mut child);
             return status(proto_fs::TOO_MANY_OPEN_FILES);
@@ -1536,31 +1518,23 @@ impl Fs {
                 self.reject_binding(fds)
             };
         }
-        if let Admission::Wire(wire) = &binding.admission {
-            return match proto_process::WhoReply::read(wire) {
-                Ok(who) => {
-                    self.identities[i].as_mut().unwrap().admission = Admission::Vouched(who);
-                    proto_fs::RESOLVING
-                }
-                Err(_) => self.reject_binding(fds),
+        if matches!(binding.admission, Admission::Wire(_)) {
+            return match self.identities[i].as_mut().unwrap().admission.decode() {
+                Ok(()) => proto_fs::RESOLVING,
+                Err(code) => self.fail_binding(fds, code),
             };
         }
         if let Admission::Vouched(who) = binding.admission {
-            if generation(who.index as usize) != who.generation {
-                self.identities[i].as_mut().unwrap().admission = Admission::Unvouched;
-                return proto_fs::RESOLVING;
-            }
-            let valid = if binding.purpose == BindingPurpose::Refresh {
-                binding.original.refreshed(&who).is_ok()
-            } else {
-                let mut original = binding.original;
-                original.bind_ref(Some(&who), binding.pending).is_ok()
+            let (original, purpose, pending) = (binding.original, binding.purpose, binding.pending);
+            return match self.identities[i].as_mut().unwrap().admission.validate(
+                original,
+                purpose,
+                pending,
+                generation(who.index as usize),
+            ) {
+                Ok(()) => proto_fs::RESOLVING,
+                Err(code) => self.fail_binding(fds, code),
             };
-            if !valid {
-                return self.reject_binding(fds);
-            }
-            self.identities[i].as_mut().unwrap().admission = Admission::Validated(who);
-            return proto_fs::RESOLVING;
         }
         let Admission::Validated(who) = binding.admission else {
             unreachable!()
@@ -1576,10 +1550,7 @@ impl Fs {
                 Ok(refreshed) => fds.binding = refreshed,
                 Err(_) => return self.reject_binding(fds),
             }
-            self.ram
-                .storage
-                .release_preparation(fds.binding_preparation.take().unwrap());
-            fds.binding_outcome = Some(0);
+            self.ram.complete_binding(fds, 0);
             return 0;
         }
         if !pending || !matches!(fds.binding, Binding::Pending(_)) {
@@ -1671,14 +1642,10 @@ impl Fs {
             source.binding = bound;
             source.authority_index = fds.authority_index;
             source.claimed = true;
-            self.ram
-                .storage
-                .release_preparation(fds.binding_preparation.take().unwrap());
+            self.ram.complete_binding(fds, 0);
             *fds = source;
         } else {
-            self.ram
-                .storage
-                .release_preparation(fds.binding_preparation.take().unwrap());
+            self.ram.complete_binding(fds, 0);
         }
         let binding = self.identities[fds.authority_index as usize]
             .as_mut()

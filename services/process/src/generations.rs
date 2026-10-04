@@ -56,9 +56,9 @@ impl Generations {
     /// Raises the generation of the record in `index`, with Release.
     pub fn raise(&self, index: usize) {
         if let Some(w) = self.word(index) {
-            let old = w.load(Ordering::Relaxed) & !proto_process::GENERATION_DEAD;
+            let old = w.load(Ordering::Relaxed);
             w.store(
-                old.checked_add(1).unwrap_or(proto_process::GENERATION_DEAD),
+                proto_process::next_generation(old, false),
                 Ordering::Release,
             );
         }
@@ -68,13 +68,7 @@ impl Generations {
     pub fn invalidate(&self, index: usize) {
         if let Some(w) = self.word(index) {
             let old = w.load(Ordering::Relaxed);
-            let next = (old & !proto_process::GENERATION_DEAD)
-                .checked_add(1)
-                .unwrap_or(proto_process::GENERATION_DEAD);
-            w.store(
-                next | (old & proto_process::GENERATION_DEAD),
-                Ordering::Release,
-            );
+            w.store(proto_process::next_generation(old, true), Ordering::Release);
         }
     }
 

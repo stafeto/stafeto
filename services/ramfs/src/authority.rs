@@ -6,6 +6,59 @@
 use crate::storage::{Node, Root};
 use proto_process::{Credentials, Groups, WhoReply};
 
+/// A single paid receive advances one authentication phase.
+pub enum Admission {
+    Unvouched,
+    Wire([u8; 252]),
+    Vouched(WhoReply),
+    Validated(WhoReply),
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BindingPurpose {
+    Candidate,
+    Refresh,
+}
+impl Admission {
+    pub fn decode(&mut self) -> Result<(), u32> {
+        let Self::Wire(wire) = self else {
+            return Err(proto_fs::PERMISSION);
+        };
+        let who = WhoReply::read(wire).map_err(|_| proto_fs::PERMISSION)?;
+        *self = Self::Vouched(who);
+        Ok(())
+    }
+    /// A stale reply restarts transport; validation never publishes a binding.
+    pub fn validate(
+        &mut self,
+        original: Binding,
+        purpose: BindingPurpose,
+        pending: bool,
+        generation: u64,
+    ) -> Result<(), u32> {
+        let Self::Vouched(who) = self else {
+            return Err(proto_fs::PERMISSION);
+        };
+        if generation & proto_process::GENERATION_DEAD != 0 {
+            return Err(proto_fs::PERMISSION);
+        }
+        if generation != who.generation {
+            *self = Self::Unvouched;
+            return Ok(());
+        }
+        match purpose {
+            BindingPurpose::Refresh => {
+                original.refreshed(who)?;
+            }
+            BindingPurpose::Candidate => {
+                let mut bound = original;
+                bound.bind_ref(Some(who), pending)?;
+            }
+        }
+        *self = Self::Validated(*who);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     pub generation: u64,

@@ -615,6 +615,20 @@ impl Create {
 pub const GENERATIONS_SIZE: usize = RECORDS * 8;
 /// A retired record has this mark until its index starts a later generation.
 pub const GENERATION_DEAD: u64 = 1 << 63;
+/// The final generation remains terminal, including after retirement or reuse.
+/// Ordinary reuse clears death; invalidation can retain a retired death mark.
+pub const fn next_generation(old: u64, retain_dead: bool) -> u64 {
+    let generation = old & !GENERATION_DEAD;
+    if generation == GENERATION_DEAD - 1 {
+        return u64::MAX;
+    }
+    (generation + 1)
+        | if retain_dead {
+            old & GENERATION_DEAD
+        } else {
+            0
+        }
+}
 
 /// The reply to Vouch: status u32 (0), the record's PID u32, the six
 /// credentials u32, the generation of the credentials u64, then 1 u32
@@ -1264,6 +1278,23 @@ pub const fn signal_name(n: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exhausted_generation_never_reopens_an_old_authority() {
+        assert_eq!(next_generation(0, false), 1);
+        assert_eq!(next_generation(GENERATION_DEAD | 7, false), 8);
+        assert_eq!(
+            next_generation(GENERATION_DEAD | 7, true),
+            GENERATION_DEAD | 8
+        );
+        let last = GENERATION_DEAD - 1;
+        let exhausted = next_generation(last, false);
+        assert_eq!(exhausted, u64::MAX);
+        for retain in [false, true] {
+            assert_eq!(next_generation(last, retain), exhausted);
+            assert_eq!(next_generation(exhausted, retain), exhausted);
+        }
+    }
+
     #[test]
     fn protocol_fields_and_numbers_are_stable() {
         let value = Credentials::from_words([1, 2, 3, 4, 5, 6]);

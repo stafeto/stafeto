@@ -520,6 +520,27 @@ impl<'a> Ram<'a> {
         Ok(token)
     }
 
+    /// Binding and resolver jobs share the session's sixteen preparation slots.
+    pub fn begin_binding(&mut self, fds: &mut Fds) -> Result<(), u32> {
+        if fds.binding_preparation.is_some()
+            || fds.resolvers.iter().filter(|&&id| id != 0).count() >= fds.resolvers.len()
+        {
+            return Err(proto_fs::TOO_MANY_OPEN_FILES);
+        }
+        let root = self.storage.charge_preparation(fds.root)?;
+        fds.binding_preparation = Some(root);
+        fds.binding_outcome = None;
+        Ok(())
+    }
+    /// Completing a preparation is idempotent and records its terminal result.
+    pub fn complete_binding(&mut self, fds: &mut Fds, outcome: u32) {
+        if let Some(root) = fds.binding_preparation.take() {
+            self.storage.release_preparation(root);
+        }
+        fds.binding_source = None;
+        fds.binding_outcome = Some(outcome);
+    }
+
     /// One reference or preparation per cleanup step.
     pub fn release_step(&mut self, fds: &mut Fds) -> bool {
         if let Some(root) = fds.binding_preparation.take() {
