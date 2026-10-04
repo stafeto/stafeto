@@ -1047,6 +1047,8 @@ impl Tty {
                 return;
             }
             self.pin_cleanup_due = false;
+            self.kick();
+            return;
         }
         if self.watch_cleanup_due {
             if let Some((label, key, id)) = self.watches.cleanup() {
@@ -1065,6 +1067,8 @@ impl Tty {
                 return;
             }
             self.watch_cleanup_due = false;
+            self.kick();
+            return;
         }
         self.select(0);
         if !matches!(self.input, Input::Waiting { armed: true, .. }) && self.pull() {
