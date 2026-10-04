@@ -16,7 +16,9 @@ use proto_fs::{MAX_READ, MAX_WRITE, Method, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
 use proto_wire::clones::Clones;
-use ramfs::authority::{Admission, Binding, BindingPurpose, Identity};
+use ramfs::authority::{
+    Admission, AuditStep, Binding, BindingPurpose, CleanupAudit, Identity, NotaryReply,
+};
 use ramfs::resolve::{Progress, Resolve};
 use ramfs::storage::{NONE, Root, Token};
 use ramfs::tree::{self, Index};
@@ -214,6 +216,7 @@ struct IdentityChannel {
     purpose: BindingPurpose,
     original: Binding,
     original_root: Root,
+    audit: CleanupAudit,
 }
 struct ResolveJob {
     id: u64,
@@ -276,9 +279,46 @@ impl Fs {
             let _ = self.binding_step(fds, label);
             return true;
         }
+        if self
+            .identities
+            .get(fds.authority_index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|identity| {
+                identity.purpose == BindingPurpose::Audit
+                    && !identity.audit.cached(
+                        fds.binding
+                            .snapshot_ref()
+                            .map_or(0, |who| generation(who.index as usize)),
+                    )
+            })
+        {
+            return self.audit_step(fds, label);
+        }
         if fds.binding.snapshot_ref().is_some() {
-            let _ = self.authenticate(fds, label);
+            let result = self.authenticate(fds, label);
             if fds.binding_preparation.is_some() {
+                return true;
+            }
+            if result == Err(proto_fs::TOO_MANY_OPEN_FILES) {
+                let Some(who) = fds.binding.snapshot_ref() else {
+                    return false;
+                };
+                let current = generation(who.index as usize);
+                let Some(identity) = self
+                    .identities
+                    .get_mut(fds.authority_index as usize)
+                    .and_then(Option::as_mut)
+                else {
+                    fds.binding = Binding::Cleanup;
+                    return true;
+                };
+                if identity.audit.cached(current) && identity.original == fds.binding {
+                    return false;
+                }
+                identity.audit.start(&mut identity.admission, current);
+                identity.original = fds.binding;
+                identity.original_root = fds.root;
+                identity.purpose = BindingPurpose::Audit;
                 return true;
             }
         }
@@ -1200,30 +1240,27 @@ impl Fs {
     }
     /// Only transport happens in this phase. Decoding the genuine Process reply
     /// is another receive, before any identity or inode effect is committed.
-    fn vouch_wire(&mut self, identity: &Handle<Channel>) -> Option<[u8; 252]> {
-        let copy = sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER).ok()?;
+    fn vouch_wire(&mut self, identity: &Handle<Channel>) -> NotaryReply<252> {
+        let Ok(copy) = sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER) else {
+            return NotaryReply::Retry;
+        };
         let request = proto_process::Method::Vouch.header().bytes();
-        let reply = sys::send_handles(self.notary.as_ref()?, &request, [copy.erase()]).ok()?;
+        let Some(notary) = self.notary.as_ref() else {
+            return NotaryReply::Retry;
+        };
+        let Ok(reply) = sys::send_handles(notary, &request, [copy.erase()]) else {
+            return NotaryReply::Retry;
+        };
         let mut buffer = [0; rt::abi::MESSAGE_MAX];
-        let bytes = reply.bytes(&mut buffer);
-        if bytes.len() != 252 {
-            return None;
-        }
-        let mut wire = core::mem::MaybeUninit::<[u8; 252]>::uninit();
-        // SAFETY: the exact reply initializes every byte of the separate array.
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), wire.as_mut_ptr().cast::<u8>(), 252);
-        }
-        // SAFETY: all bytes were initialized by the checked copy above.
-        Some(unsafe { wire.assume_init() })
+        NotaryReply::read(reply.bytes(&mut buffer), reply.handles.is_empty())
     }
-    fn retained_wire(
-        &mut self,
-        identity: &Handle<Channel>,
-        original: Binding,
-    ) -> Result<Option<[u8; 260]>, u32> {
-        let who = original.snapshot_ref().ok_or(proto_fs::PERMISSION)?;
-        let loader = who.loader.ok_or(proto_fs::PERMISSION)?;
+    fn retained_wire(&mut self, identity: &Handle<Channel>, original: Binding) -> NotaryReply<260> {
+        let Some(who) = original.snapshot_ref() else {
+            return NotaryReply::Denied;
+        };
+        let Some(loader) = who.loader else {
+            return NotaryReply::Denied;
+        };
         let expected = proto_process::RetainedLoader {
             pid: who.pid,
             index: who.index,
@@ -1231,34 +1268,28 @@ impl Fs {
             ticket: loader.ticket,
             root: who.root,
         };
-        let copy = sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER)
-            .map_err(|_| proto_fs::PERMISSION)?;
+        let Ok(copy) = sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER) else {
+            return NotaryReply::Retry;
+        };
         let mut request = proto_wire::Writer::new();
-        proto_process::Method::RetainedLoader
+        if proto_process::Method::RetainedLoader
             .header()
             .write(&mut request)
             .and_then(|()| expected.write(&mut request))
-            .map_err(|_| proto_fs::PERMISSION)?;
+            .is_err()
+        {
+            return NotaryReply::Retry;
+        }
         let Some(notary) = self.notary.as_ref() else {
-            return Err(proto_fs::PERMISSION);
+            return NotaryReply::Retry;
         };
         let Ok(reply) = sys::send_handles(notary, request.as_bytes(), [copy.erase()]) else {
             // A lost transport response proves no loader abort. The next paid
             // phase retries this read with a fresh copy of the retained identity.
-            return Ok(None);
+            return NotaryReply::Retry;
         };
-        if !reply.handles.is_empty() {
-            return Err(proto_fs::PERMISSION);
-        }
-        if reply.len == 8 && reply.words[0] as u32 != 0 && reply.words[0] >> 32 == 0 {
-            return Err(proto_fs::PERMISSION);
-        }
         let mut buffer = [0; rt::abi::MESSAGE_MAX];
-        let bytes = reply.bytes(&mut buffer);
-        if bytes.len() != 260 {
-            return Err(proto_fs::PERMISSION);
-        }
-        Ok(Some(bytes.try_into().map_err(|_| proto_fs::PERMISSION)?))
+        NotaryReply::read(reply.bytes(&mut buffer), reply.handles.is_empty())
     }
     fn install_identity(
         &mut self,
@@ -1293,6 +1324,7 @@ impl Fs {
             purpose: BindingPurpose::Candidate,
             original: fds.binding,
             original_root: fds.root,
+            audit: CleanupAudit::default(),
         });
         fds.authority_index = i as u16;
         if let Some(root) = fds.binding.root() {
@@ -1487,6 +1519,7 @@ impl Fs {
         }
         self.ram.begin_binding(fds)?;
         identity.admission = Admission::Unvouched;
+        identity.audit.reset();
         identity.purpose = BindingPurpose::Refresh;
         identity.original = fds.binding;
         identity.original_root = fds.root;
@@ -1642,6 +1675,74 @@ impl Fs {
         }
         status(self.binding_step(fds, r.label()))
     }
+    /// Existing identity storage bounds cleanup even when every preparation is used.
+    fn audit_step(&mut self, fds: &mut Fds, label: u64) -> bool {
+        let Some(who) = fds.binding.snapshot_ref() else {
+            return false;
+        };
+        let current = generation(who.index as usize);
+        let i = fds.authority_index as usize;
+        let Some(identity) = self.identities.get_mut(i).and_then(Option::as_mut) else {
+            fds.binding = Binding::Cleanup;
+            return true;
+        };
+        if identity.label != label || identity.original != fds.binding {
+            self.reject_binding(fds);
+            return true;
+        }
+        match identity.audit.synchronize(&mut identity.admission, current) {
+            AuditStep::Denied => {
+                self.reject_binding(fds);
+                return true;
+            }
+            AuditStep::Retry => return false,
+            _ => {}
+        }
+        let step = if matches!(identity.admission, Admission::Unvouched) {
+            let channel = Handle::borrowed(identity.channel.raw());
+            let original = identity.original;
+            if self.generations.is_none() {
+                let _ = self.notary_register();
+                return false;
+            }
+            let wire = if matches!(original, Binding::Pending(_) | Binding::Handoff(_)) {
+                match self.retained_wire(&channel, original) {
+                    NotaryReply::Wire(wire) => Some(Admission::RetainedWire(wire)),
+                    NotaryReply::Denied => {
+                        self.reject_binding(fds);
+                        return true;
+                    }
+                    NotaryReply::Retry => None,
+                }
+            } else {
+                match self.vouch_wire(&channel) {
+                    NotaryReply::Wire(wire) => Some(Admission::Wire(wire)),
+                    NotaryReply::Denied => {
+                        self.reject_binding(fds);
+                        return true;
+                    }
+                    NotaryReply::Retry => None,
+                }
+            };
+            let Some(wire) = wire else {
+                return false;
+            };
+            self.identities[i].as_mut().unwrap().admission = wire;
+            AuditStep::Advance
+        } else {
+            identity
+                .audit
+                .step(identity.original, &mut identity.admission, current)
+        };
+        match step {
+            AuditStep::Denied => {
+                self.reject_binding(fds);
+                true
+            }
+            AuditStep::Retry => false,
+            AuditStep::Advance | AuditStep::Alive => true,
+        }
+    }
     fn binding_step(&mut self, fds: &mut Fds, label: u64) -> u32 {
         let i = fds.authority_index as usize;
         let Some(binding) = self.identities.get(i).and_then(Option::as_ref) else {
@@ -1664,24 +1765,22 @@ impl Fs {
             {
                 let original = binding.original;
                 return match self.retained_wire(&identity, original) {
-                    Ok(Some(wire)) => {
+                    NotaryReply::Wire(wire) => {
                         self.identities[i].as_mut().unwrap().admission =
                             Admission::RetainedWire(wire);
                         proto_fs::RESOLVING
                     }
-                    Ok(None) => proto_fs::RESOLVING,
-                    Err(code) => self.fail_binding(fds, code),
+                    NotaryReply::Retry => proto_fs::RESOLVING,
+                    NotaryReply::Denied => self.reject_binding(fds),
                 };
             }
-            let wire = self.vouch_wire(&identity);
-            let valid = wire.is_some();
-            if let Some(wire) = wire {
-                self.identities[i].as_mut().unwrap().admission = Admission::Wire(wire);
-            }
-            return if valid {
-                proto_fs::RESOLVING
-            } else {
-                self.reject_binding(fds)
+            return match self.vouch_wire(&identity) {
+                NotaryReply::Wire(wire) => {
+                    self.identities[i].as_mut().unwrap().admission = Admission::Wire(wire);
+                    proto_fs::RESOLVING
+                }
+                NotaryReply::Retry => proto_fs::RESOLVING,
+                NotaryReply::Denied => self.reject_binding(fds),
             };
         }
         if matches!(

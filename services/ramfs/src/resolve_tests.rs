@@ -821,3 +821,240 @@ fn binding_and_resolver_preparations_share_the_sixteen_session_slots() {
     }
     assert_eq!(ram.storage.preparations_used(), 0);
 }
+
+#[test]
+fn cleanup_audit_preserves_real_capture_and_proofs_at_every_preparation_limit() {
+    use crate::authority::{Admission, AuditStep, BindingPurpose, CleanupAudit};
+    for limit in [16, 96, 128] {
+        let mut ram = Ram::new(0);
+        let old = who();
+        let fresh = WhoReply {
+            generation: old.generation + 1,
+            credentials: Credentials {
+                euid: 65533,
+                ..old.credentials
+            },
+            ..old
+        };
+        let mut fds = Fds {
+            binding: Binding::Active(old),
+            root: ROOT_ACCOUNT,
+            ..Fds::default()
+        };
+        let file = create(&mut ram, ROOT, b"audit-live", REG, 0o600);
+        let fd = ram
+            .open_token(&mut fds, file, proto_fs::READ_ONLY, OWNER)
+            .unwrap();
+        ram.set_cwd_token(&mut fds, ROOT).unwrap();
+        let retained = ram.description_token(&fds, fd).unwrap();
+        let stamp = fds.binding.stamp();
+        let mut jobs = std::vec::Vec::new();
+        let mut charges = std::vec::Vec::new();
+        for i in 0..limit {
+            let root = if i < 96 {
+                ROOT_ACCOUNT
+            } else {
+                Root {
+                    id: 301,
+                    generation: 1,
+                }
+            };
+            charges.push(ram.storage.charge_preparation(root).unwrap());
+            if limit == 16 {
+                let mut job =
+                    Resolve::new(&mut ram.storage, b"/audit-live", ROOT, OWNER, true).unwrap();
+                assert_eq!(finish(&mut ram, &mut job, OWNER), Ok(file));
+                jobs.push(job);
+                fds.resolvers[i] = 256 + i as u64;
+            }
+        }
+        assert_eq!(
+            ram.begin_binding(&mut fds),
+            Err(proto_fs::TOO_MANY_OPEN_FILES)
+        );
+        let mut audit = CleanupAudit::default();
+        let mut admission = Admission::Unvouched;
+        audit.start(&mut admission, fresh.generation);
+        let mut wire = proto_wire::Writer::new();
+        fresh.write(&mut wire).unwrap();
+        admission = Admission::Wire(wire.as_bytes().try_into().unwrap());
+        assert_eq!(
+            audit.step(fds.binding, &mut admission, fresh.generation),
+            AuditStep::Advance
+        );
+        assert_eq!(
+            audit.step(fds.binding, &mut admission, fresh.generation),
+            AuditStep::Advance
+        );
+        assert_eq!(
+            audit.step(fds.binding, &mut admission, fresh.generation),
+            AuditStep::Alive
+        );
+        assert!(audit.cached(fresh.generation));
+        assert!(!audit.cached(fresh.generation + 1));
+        assert_eq!(fds.binding, Binding::Active(old));
+        assert_eq!(fds.binding.stamp(), stamp);
+        assert_eq!(ram.description_token(&fds, fd), Ok(retained));
+        assert_eq!(fds.cwd, Some(ROOT));
+        assert_eq!(ram.storage.preparations_used() as usize, limit);
+        assert_eq!(
+            ram.begin_binding(&mut fds),
+            Err(proto_fs::TOO_MANY_OPEN_FILES)
+        );
+        for job in &jobs {
+            assert_eq!(job.proof(&ram.storage, OWNER), Ok(file));
+        }
+        // ResolveCancel frees one real job and its sole charge before normal Refresh.
+        if let Some(job) = jobs.pop() {
+            job.release(&mut ram.storage);
+            fds.resolvers[15] = 0;
+        }
+        let removed = if limit == 16 {
+            charges.pop().unwrap()
+        } else {
+            charges.remove(0)
+        };
+        ram.storage.release_preparation(removed);
+        audit.reset();
+        ram.begin_binding(&mut fds).unwrap();
+        assert_eq!(ram.storage.preparations_used() as usize, limit);
+        admission = Admission::Vouched(fresh);
+        admission
+            .validate(
+                fds.binding,
+                BindingPurpose::Refresh,
+                false,
+                fresh.generation,
+            )
+            .unwrap();
+        fds.binding = fds.binding.refreshed(&fresh).unwrap();
+        ram.complete_binding(&mut fds, 0);
+        assert_ne!(fds.binding.stamp(), stamp);
+        assert!(!audit.cached(fresh.generation));
+        for mut job in jobs {
+            job.invalidate();
+            assert_eq!(job.proof(&ram.storage, OWNER), Err(proto_fs::STALE_PROOF));
+            job.release(&mut ram.storage);
+        }
+        for charge in charges {
+            ram.storage.release_preparation(charge);
+        }
+        fds.resolvers.fill(0);
+        assert_eq!(ram.storage.preparations_used(), 0);
+        fds.binding = Binding::Cleanup;
+        assert!(ram.release_step(&mut fds));
+        assert_eq!(fds.cwd, None);
+        assert!(ram.release_step(&mut fds));
+        assert_eq!(ram.open_descriptions(), 0);
+        assert!(!ram.release_step(&mut fds));
+    }
+}
+
+#[test]
+fn cleanup_audit_retries_unconfirmed_responses_and_rechecks_every_epoch() {
+    use crate::authority::{Admission, AuditStep, CleanupAudit, NotaryReply};
+    let old = who();
+    let fresh = WhoReply {
+        generation: 2,
+        ..old
+    };
+    let denied = proto_wire::reply(proto_wire::Status::Unknown(proto_process::PERMISSION));
+    assert!(matches!(
+        NotaryReply::<252>::read(&denied, true),
+        NotaryReply::Denied
+    ));
+    assert!(matches!(
+        NotaryReply::<252>::read(&denied, false),
+        NotaryReply::Retry
+    ));
+    let mut malformed = denied;
+    malformed[4] = 1;
+    assert!(matches!(
+        NotaryReply::<252>::read(&malformed, true),
+        NotaryReply::Retry
+    ));
+    assert!(matches!(
+        NotaryReply::<252>::read(&denied[..4], true),
+        NotaryReply::Retry
+    ));
+    assert!(matches!(
+        NotaryReply::<252>::read(&proto_wire::reply(proto_wire::Status::BadSize), true),
+        NotaryReply::Retry
+    ));
+    assert!(matches!(
+        NotaryReply::<252>::read(
+            &proto_wire::reply(proto_wire::Status::Unknown(proto_fs::PERMISSION)),
+            true
+        ),
+        NotaryReply::Retry
+    ));
+    let mut audit = CleanupAudit::default();
+    let mut admission = Admission::Unvouched;
+    audit.start(&mut admission, 2);
+    admission = Admission::Wire([0; 252]);
+    assert_eq!(
+        audit.step(Binding::Active(old), &mut admission, 2),
+        AuditStep::Retry
+    );
+    assert!(matches!(admission, Admission::Unvouched));
+    assert!(!audit.cached(2));
+    let mut wire = proto_wire::Writer::new();
+    fresh.write(&mut wire).unwrap();
+    let wire: [u8; 252] = wire.as_bytes().try_into().unwrap();
+    for phase in 0..4 {
+        audit.start(&mut admission, 2);
+        admission = match phase {
+            0 => Admission::Unvouched,
+            1 => Admission::Wire(wire),
+            2 => Admission::Vouched(fresh),
+            _ => Admission::Validated(fresh),
+        };
+        assert_eq!(
+            audit.step(
+                Binding::Active(old),
+                &mut admission,
+                proto_process::GENERATION_DEAD | 2
+            ),
+            AuditStep::Denied
+        );
+        assert!(!audit.cached(2));
+    }
+    audit.start(&mut admission, 2);
+    admission = Admission::Vouched(WhoReply {
+        image: old.image + 1,
+        ..fresh
+    });
+    assert_eq!(
+        audit.step(Binding::Active(old), &mut admission, 2),
+        AuditStep::Denied
+    );
+    audit.start(&mut admission, 2);
+    admission = Admission::Vouched(fresh);
+    assert_eq!(
+        audit.step(Binding::Active(old), &mut admission, 2),
+        AuditStep::Advance
+    );
+    assert_eq!(
+        audit.step(Binding::Active(old), &mut admission, 3),
+        AuditStep::Retry
+    );
+    assert!(matches!(admission, Admission::Unvouched));
+    assert!(!audit.cached(2));
+    admission = Admission::Vouched(WhoReply {
+        generation: 3,
+        ..fresh
+    });
+    assert_eq!(
+        audit.step(Binding::Active(old), &mut admission, 3),
+        AuditStep::Advance
+    );
+    assert_eq!(
+        audit.step(Binding::Active(old), &mut admission, 3),
+        AuditStep::Alive
+    );
+    assert!(audit.cached(3));
+    assert_eq!(audit.synchronize(&mut admission, 4), AuditStep::Retry);
+    assert!(!audit.cached(3));
+    audit.reset();
+    assert!(!audit.cached(4));
+}
