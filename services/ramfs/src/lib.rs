@@ -210,6 +210,8 @@ pub struct Fds {
     pub auth_probe_hold: bool,
     #[cfg(feature = "auth-probe")]
     pub auth_probe_gc: Option<Token>,
+    #[cfg(feature = "auth-probe")]
+    pub auth_probe_gc_reservation: Option<storage::Reservation>,
     pub resolvers: [u64; 16],
     pub root: storage::Root,
     pub cwd: Option<Token>,
@@ -230,6 +232,8 @@ impl Default for Fds {
             auth_probe_hold: false,
             #[cfg(feature = "auth-probe")]
             auth_probe_gc: None,
+            #[cfg(feature = "auth-probe")]
+            auth_probe_gc_reservation: None,
             resolvers: [0; 16],
             root: BOOT_ROOT,
             cwd: None,
@@ -529,6 +533,43 @@ impl<'a> Ram<'a> {
         Ok(token)
     }
 
+    /// Diagnostic setup uses the same paid reserve and commit as normal creation.
+    #[cfg(feature = "auth-probe")]
+    pub fn auth_probe_gc_reserve(&mut self, fds: &mut Fds) -> Result<(), u32> {
+        if fds.auth_probe_gc.is_some() || fds.auth_probe_gc_reservation.is_some() {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let reservation = self.reserve_create(fds, storage::ROOT, b"auth-probe-gc", REG)?;
+        fds.auth_probe_gc_reservation = Some(reservation);
+        Ok(())
+    }
+
+    #[cfg(feature = "auth-probe")]
+    pub fn auth_probe_gc_commit(&mut self, fds: &mut Fds) -> Result<(), u32> {
+        let reservation = fds
+            .auth_probe_gc_reservation
+            .take()
+            .ok_or(proto_fs::INVALID_ARGUMENT)?;
+        match self.commit_create(fds, reservation) {
+            Ok(token) => {
+                fds.auth_probe_gc = Some(token);
+                Ok(())
+            }
+            Err(code) => {
+                if let Some(place) = fds
+                    .preparations
+                    .iter_mut()
+                    .find(|r| r.is_some_and(|r| r.token == reservation.token))
+                {
+                    let _ = self
+                        .storage
+                        .cancel(place.take().expect("exact retained reservation"));
+                }
+                Err(code)
+            }
+        }
+    }
+
     /// Binding and resolver jobs share the session's sixteen preparation slots.
     pub fn begin_binding(&mut self, fds: &mut Fds) -> Result<(), u32> {
         if fds.binding_preparation.is_some()
@@ -563,6 +604,13 @@ impl<'a> Ram<'a> {
             .find(|r| r.is_some())
             .and_then(Option::take)
         {
+            #[cfg(feature = "auth-probe")]
+            if fds
+                .auth_probe_gc_reservation
+                .is_some_and(|held| held.token == r.token)
+            {
+                fds.auth_probe_gc_reservation = None;
+            }
             let _ = self.storage.cancel(r);
             return true;
         }
@@ -613,6 +661,10 @@ impl<'a> Ram<'a> {
     }
 
     pub fn release(&mut self, fds: &mut Fds) {
+        #[cfg(feature = "auth-probe")]
+        {
+            fds.auth_probe_gc_reservation = None;
+        }
         if let Some(root) = fds.binding_preparation.take() {
             self.storage.release_preparation(root);
         }

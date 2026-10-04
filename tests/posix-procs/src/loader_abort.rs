@@ -13,7 +13,7 @@ unsafe extern "C" {
     fn files_loader_abort_sleep() -> i32;
 }
 
-fn counts(channel: &Handle<Channel>) -> Result<[u32; 8], Status> {
+pub(super) fn counts(channel: &Handle<Channel>) -> Result<[u32; 8], Status> {
     let request = Header::new(0xfffe, proto_fs::VERSION).bytes();
     let reply = sys::send(channel, &request).map_err(Status::Kernel)?;
     if reply.len != 36 || !reply.handles.is_empty() {

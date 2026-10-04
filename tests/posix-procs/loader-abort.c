@@ -3,6 +3,7 @@
 #include <time.h>
 
 extern int files_loader_abort_capture(int fd, int loaded);
+extern int files_cleanup_audit(int fd);
 
 int files_loader_abort_sleep(void) {
     const struct timespec delay = {0, 10000000};
@@ -13,7 +14,8 @@ static int files_loader_abort(void) {
     int pid = getpid();
     int fd = open("/etc/motd", O_RDONLY);
     if (fd < 0) return 1;
-    int result = files_loader_abort_capture(fd, 0);
+    int result = files_cleanup_audit(fd);
+    if (!result) result = files_loader_abort_capture(fd, 0);
     if (!result) result = files_loader_abort_capture(fd, 1);
     char byte = 0;
     if (result || getpid() != pid || pread(fd, &byte, 1, 0) != 1 || byte != 's') {
