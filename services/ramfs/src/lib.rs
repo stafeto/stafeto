@@ -696,6 +696,26 @@ impl<'a> Ram<'a> {
             description: receipt.description,
         })
     }
+    /// Preserve the exact description's device type through Commit and final handoff.
+    pub fn marked_open(&self, fds: &Fds, held: TentativeOpen) -> Result<u32, u32> {
+        let slot = held.fd.checked_sub(3).ok_or(BAD_FD)? as usize;
+        if slot >= OPEN_MAX || fds.slots[slot] != u8::try_from(held.description.slot).ok() {
+            return Err(BAD_FD);
+        }
+        let shared = self
+            .descriptions
+            .get(held.description.slot as usize)
+            .and_then(Option::as_ref)
+            .filter(|shared| shared.generation == held.description.generation)
+            .ok_or(BAD_FD)?;
+        Ok(held.fd
+            | ((held.description.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT)
+            | if matches!(shared.open.file, File::Random(_)) {
+                proto_fs::OPEN_RANDOM
+            } else {
+                0
+            })
+    }
     /// Cancel owns a description generation; an old key leaves reused fds intact.
     pub fn cancel_finished_open(
         &mut self,
@@ -2175,6 +2195,121 @@ mod tests {
         assert!(kinds.contains(&("random", CHAR)), "{kinds:?}");
         assert!(kinds.contains(&("urandom", CHAR)), "{kinds:?}");
         assert!(kinds.contains(&("other", REG)), "{kinds:?}");
+    }
+
+    #[test]
+    fn random_open_marker_tracks_exact_receipts_clone_and_reused_descriptions() {
+        let bytes = test_image(&[
+            entry("/dev", DIRECTORY | 0o755, 0),
+            entry("/dev/random", REGULAR | 0o666, 2),
+        ]);
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(0, load(&bytes, &mut index).unwrap());
+        let dev = ram.storage.lookup(storage::ROOT, b"dev").unwrap();
+        let random = ram.storage.lookup(dev, b"random").unwrap();
+        let identity = authority::Identity {
+            uid: 0,
+            gid: 0,
+            groups: proto_process::Groups::EMPTY,
+        };
+        let mut fds = Fds::default();
+        let mut receipts = [None; OPEN_MAX];
+        for (slot, saved) in receipts.iter_mut().enumerate() {
+            let held = ram
+                .prepare_open_token(&mut fds, random, READ_WRITE, identity, None)
+                .unwrap();
+            let key = proto_fs::OpenKey {
+                slot: slot as u32,
+                generation: 1,
+            };
+            assert_eq!(held.fd, slot as u32 + 3);
+            assert_eq!(
+                ram.marked_open(&fds, held),
+                Ok(proto_fs::OPEN_RANDOM
+                    | held.fd
+                    | ((held.description.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT))
+            );
+            assert_eq!(ram.finish_open(&mut fds, key, held), Ok(held));
+            assert_eq!(
+                ram.marked_open(&fds, ram.finished_open(&fds, key).unwrap()),
+                Ok(proto_fs::OPEN_RANDOM
+                    | held.fd
+                    | ((held.description.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT))
+            );
+            *saved = Some((key, held));
+        }
+        assert_eq!(ram.open_descriptions(), OPEN_MAX);
+        let numbers: Vec<u32> = fds.numbers().collect();
+        let mut child = ram.clone_fds(&fds, &numbers).unwrap();
+        for fd in numbers {
+            assert!(ram.is_random(&child, fd));
+        }
+        let (old_key, old) = receipts[0].unwrap();
+        ram.close(&mut fds, old.fd).unwrap();
+        let regular = ram
+            .prepare_open_token(
+                &mut fds,
+                Token {
+                    slot: 4,
+                    generation: 1,
+                },
+                READ_WRITE,
+                identity,
+                None,
+            )
+            .unwrap();
+        assert_eq!(regular.fd, old.fd);
+        assert_ne!(regular.description.slot, old.description.slot);
+        assert_eq!(regular.description.generation, old.description.generation);
+        assert_eq!(ram.marked_open(&fds, old), Err(BAD_FD));
+        assert_eq!(
+            ram.marked_open(&fds, regular),
+            Ok(regular.fd
+                | ((regular.description.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT))
+        );
+        let new_key = proto_fs::OpenKey {
+            slot: 0,
+            generation: 2,
+        };
+        ram.finish_open(&mut fds, new_key, regular).unwrap();
+        assert_eq!(
+            ram.finished_open(&fds, old_key),
+            Err(proto_fs::OPEN_RETIRED)
+        );
+        ram.cancel_finished_open(&mut fds, old_key).unwrap();
+        assert_eq!(ram.finished_open(&fds, new_key), Ok(regular));
+        assert!(ram.is_random(&child, old.fd));
+        ram.release(&mut child);
+        ram.release(&mut fds);
+        assert_eq!(ram.open_descriptions(), 0);
+        let mut full: [Fds; 4] = core::array::from_fn(|group| Fds {
+            root: storage::Root {
+                id: 500 + group as u64,
+                generation: 1,
+            },
+            ..Fds::default()
+        });
+        for session in &mut full {
+            for _ in 0..OPEN_MAX {
+                let held = ram
+                    .prepare_open_token(session, random, READ_WRITE, identity, None)
+                    .unwrap();
+                ram.publish_open(session, held).unwrap();
+            }
+        }
+        let last = TentativeOpen {
+            fd: 34,
+            description: ram.description_token(&full[3], 34).unwrap(),
+        };
+        assert_eq!(last.description.slot, 127);
+        assert_eq!(
+            ram.marked_open(&full[3], last),
+            Ok(proto_fs::OPEN_RANDOM | (127 << proto_fs::OPEN_DESCRIPTION_SHIFT) | 34)
+        );
+        for session in &mut full {
+            ram.release(session);
+        }
+        assert_eq!(ram.open_descriptions(), 0);
     }
 
     #[test]

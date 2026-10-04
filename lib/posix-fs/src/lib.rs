@@ -6,6 +6,8 @@
 
 #![no_std]
 
+pub mod open;
+
 use core::mem::ManuallyDrop;
 pub use posix_fd::Flags as DescriptorFlags;
 use posix_fd::{Error as DescriptorError, Table};
@@ -189,7 +191,7 @@ pub struct PosixFs {
     /// the console's input, output and error go there (5f).
     terminal: Option<Handle<Channel>>,
     paths: PathState,
-    descriptors: Table<Target, OPEN_MAX>,
+    descriptors: Table<Target, OPEN_MAX, open::Recovery>,
 }
 
 /// The transports of a process's files, borrowed from its PosixFs, which
@@ -779,6 +781,7 @@ impl PosixFs {
         core::mem::forget(parent);
         core::mem::forget(core::mem::replace(&mut self.pipes, pipes));
         core::mem::forget(core::mem::replace(&mut self.terminal, terminal));
+        self.descriptors.discard_open_after_fork();
         while self.descriptors.abandon_hold().is_some() {}
         let mut closing = [false; OPEN_MAX];
         for (fd, _, flags) in self.descriptors.open() {

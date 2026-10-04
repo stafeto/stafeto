@@ -101,7 +101,21 @@ impl Input {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreparedOpen {
     pub fd: u32,
+    pub slot: u32,
     pub generation: u64,
+    pub random: bool,
+}
+
+impl PreparedOpen {
+    pub fn marked_fd(self) -> u32 {
+        self.fd
+            | (self.slot << proto_fs::OPEN_DESCRIPTION_SHIFT)
+            | if self.random {
+                proto_fs::OPEN_RANDOM
+            } else {
+                0
+            }
+    }
 }
 
 /// Recovery separates a live paid preparation from its completed descriptor handoff.
@@ -247,6 +261,31 @@ impl Files {
         let reply = Self::send_on(&self.channel, w.as_bytes())?;
         Self::open_commit_reply(&reply)
     }
+    /// The numeric-reservation phase performs one request before releasing its defer.
+    /// AUTHENTICATING leaves staged refresh to the caller's recovery decision.
+    pub fn open_finish_once(&self, key: proto_fs::OpenKey) -> Result<PreparedOpen, Status> {
+        let reply = self.open_key_once(Method::OpenFinish, key)?;
+        Self::open_commit_reply(&reply)
+    }
+
+    pub fn open_query_once(&self, key: proto_fs::OpenKey) -> Result<OpenOutcome, Status> {
+        let reply = self.open_key_once(Method::OpenQuery, key)?;
+        Self::open_query_reply(&reply)
+    }
+
+    pub fn open_cancel_key_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        let reply = self.open_key_once(Method::OpenCancel, key)?;
+        Self::open_reply(&reply, 8)
+    }
+
+    fn open_key_once(&self, method: Method, key: proto_fs::OpenKey) -> Result<sys::Reply, Status> {
+        key.validate().map_err(Status::from_code)?;
+        let mut w = Writer::new();
+        method.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        sys::send(&self.channel, w.as_bytes()).map_err(Status::Kernel)
+    }
     /// Cleanup uses the client key even before its server job ID was decoded.
     pub fn open_cancel_key(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
         let mut w = Writer::new();
@@ -301,16 +340,31 @@ impl Files {
         let reply = Self::send_on(&self.channel, w.as_bytes())?;
         Self::open_commit_reply(&reply)
     }
+    pub fn open_commit_once(&self, id: u64) -> Result<PreparedOpen, Status> {
+        Self::open_job_id(id)?;
+        let mut w = Writer::new();
+        Method::OpenCommit.header().write(&mut w)?;
+        w.u64(id)?;
+        let reply = sys::send(&self.channel, w.as_bytes()).map_err(Status::Kernel)?;
+        Self::open_commit_reply(&reply)
+    }
     /// Successful wire shape must describe a real server descriptor lifetime.
     pub fn open_commit_reply(reply: &crate::sys::Reply) -> Result<PreparedOpen, Status> {
         Self::open_reply(reply, 16)?;
         Self::open_description((reply.words[0] >> 32) as u32, reply.words[1])
     }
-    fn open_description(fd: u32, generation: u64) -> Result<PreparedOpen, Status> {
-        if !(3..35).contains(&fd) || generation == 0 {
+    fn open_description(marked_fd: u32, generation: u64) -> Result<PreparedOpen, Status> {
+        let fd = marked_fd & proto_fs::OPEN_FD_MASK;
+        if marked_fd & !proto_fs::OPEN_RESULT_MASK != 0 || !(3..35).contains(&fd) || generation == 0
+        {
             return Err(Status::BadSize);
         }
-        Ok(PreparedOpen { fd, generation })
+        Ok(PreparedOpen {
+            fd,
+            slot: (marked_fd & proto_fs::OPEN_DESCRIPTION_MASK) >> proto_fs::OPEN_DESCRIPTION_SHIFT,
+            generation,
+            random: marked_fd & proto_fs::OPEN_RANDOM != 0,
+        })
     }
     /// Release the exact job and hidden descriptor after a completed or abandoned Open.
     pub fn open_cancel(&self, id: u64) -> Result<(), Status> {

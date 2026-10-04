@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 7 of the bounded RAM file service. Numbers are little endian.
+//! Version 10 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -11,7 +11,7 @@
 //! The returned fresh session holds a paid preparation; FinishBinding commits
 //! its captured references under the same authentic Pending image and generation.
 //! A paid RetainedLoader refresh distinguishes Loading from Handoff. Handoff
-//! preserves the exact successful target's fd/CWD/umask capture and permits only
+//! preserves the exact successful target's fd/CWD capture and permits only
 //! Close, cancellation, FinishBinding and genuine Bind of that target identity.
 //! File effects resume after the exact PID/index/image/root binds with loader=None.
 //! Such Bind supersedes a queued retained-loader refresh; its candidate keeps
@@ -43,11 +43,14 @@
 //! edge or missing final edge. OpenPrepare(job u64) prepays creation and hidden
 //! descriptor resources in separate steps; RESOLVING continues preparation.
 //! OpenCommit(job u64) commits the file effect once and returns the hidden fd
-//! u32 plus its description generation u64. Replays return the exact held result.
+//! packed u32 plus its description generation u64. Replays return the exact held result.
 //! OpenFinish(client key) publishes its exact descriptor and releases the paid job.
 //! Query active phases0..4 reply status0/phase/jobID (16 bytes). Finished phase5
 //! replies status0/5/jobID0/fd/reserved0/description generation (32 bytes).
 //! Close retains a tombstone; a replaced receipt returns terminal OPEN_RETIRED.
+//! Commit/Finish/FinishedQuery pack fd bits0..5, description slot bits8..14 and
+//! OPEN_RANDOM bit31. All other bits are zero. Numeric operations use the bare fd;
+//! recovery retains the full description token and captured device type.
 //! ResolveCancel releases the job and hidden descriptor; committed file effects
 //! remain observable. Ordinary descriptor APIs and Clone exclude the hidden fd.
 //!
@@ -94,7 +97,7 @@ pub use info::NodeInfo;
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
-pub const VERSION: u16 = 9;
+pub const VERSION: u16 = 10;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -119,6 +122,14 @@ pub const APPEND: u32 = 128;
 pub const NO_FOLLOW: u32 = 256;
 /// The third word of the reply to an OPEN of a random device.
 pub const RANDOM_DEVICE: u32 = 1;
+/// Commit, Finish and FinishedQuery encode a captured Random description in fd bit31.
+/// Bits0..5 hold fd3..34; bits8..14 hold its shared description slot0..127.
+pub const OPEN_RANDOM: u32 = 1 << 31;
+/// A success word retains the exact shared description slot.
+pub const OPEN_DESCRIPTION_SHIFT: u32 = 8;
+pub const OPEN_DESCRIPTION_MASK: u32 = 127 << OPEN_DESCRIPTION_SHIFT;
+pub const OPEN_FD_MASK: u32 = 63;
+pub const OPEN_RESULT_MASK: u32 = OPEN_RANDOM | OPEN_DESCRIPTION_MASK | OPEN_FD_MASK;
 
 pub const NO_ENTRY: u32 = 300;
 pub const BAD_FD: u32 = 301;
@@ -257,7 +268,7 @@ pub enum Method {
     OpenStart = 26,
     /// Paid job u64. Prepay creation and a hidden description before file effects.
     OpenPrepare = 27,
-    /// Paid job u64. Commit once; reply fd u32 and description generation u64.
+    /// Paid job u64. Commit once; reply packed fd/slot/type u32 and description generation u64.
     OpenCommit = 28,
     /// Client key slot u32/generation u64. Publish the exact committed descriptor once.
     OpenFinish = 29,

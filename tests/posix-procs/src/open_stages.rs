@@ -111,8 +111,64 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
     for fd in [3u32, 32, 34] {
         reply.words[0] = (fd as u64) << 32;
         reply.words[1] = 1;
-        if Files::open_commit_reply(&reply) != Ok(PreparedOpen { fd, generation: 1 }) {
+        if Files::open_commit_reply(&reply)
+            != Ok(PreparedOpen {
+                fd,
+                slot: 0,
+                generation: 1,
+                random: false,
+            })
+        {
             return Err(69);
+        }
+    }
+    // Corrupt accepted success replies retain ambiguous recovery semantics.
+    for marked in [
+        proto_fs::OPEN_RANDOM | 3,
+        proto_fs::OPEN_RANDOM | 34 | (127 << proto_fs::OPEN_DESCRIPTION_SHIFT),
+    ] {
+        reply.len = 16;
+        reply.words[0] = (marked as u64) << 32;
+        reply.words[1] = 1;
+        let expected = PreparedOpen {
+            fd: marked & proto_fs::OPEN_FD_MASK,
+            slot: (marked & proto_fs::OPEN_DESCRIPTION_MASK) >> proto_fs::OPEN_DESCRIPTION_SHIFT,
+            generation: 1,
+            random: true,
+        };
+        if Files::open_commit_reply(&reply) != Ok(expected) {
+            return Err(105);
+        }
+        reply.len = 32;
+        reply.words[0] = 5u64 << 32;
+        reply.words[1] = 0;
+        reply.words[2] = marked as u64;
+        reply.words[3] = 1;
+        if Files::open_query_reply(&reply) != Ok(OpenOutcome::Finished(expected)) {
+            return Err(106);
+        }
+    }
+    for marked in [
+        proto_fs::OPEN_RANDOM | 2,
+        proto_fs::OPEN_RANDOM | 35,
+        (1u32 << 30) | 3,
+        (1u32 << 6) | 3,
+        (1u32 << 7) | 3,
+        (1u32 << 15) | 3,
+    ] {
+        reply.len = 16;
+        reply.words[0] = (marked as u64) << 32;
+        reply.words[1] = 1;
+        if Files::open_commit_reply(&reply) != Err(Status::BadSize) {
+            return Err(107);
+        }
+        reply.len = 32;
+        reply.words[0] = 5u64 << 32;
+        reply.words[1] = 0;
+        reply.words[2] = marked as u64;
+        reply.words[3] = 1;
+        if Files::open_query_reply(&reply) != Err(Status::BadSize) {
+            return Err(108);
         }
     }
     if active_query(files, first) != Ok((id, 0)) {
@@ -203,8 +259,91 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
     }
     Ok(())
 }
+fn clone_bound(files: &Files, numbers: &[u32]) -> Result<Files, Status> {
+    let mut request = proto_wire::Writer::new();
+    proto_fs::Method::Clone.header().write(&mut request)?;
+    request.u32(numbers.len() as u32)?;
+    for fd in numbers {
+        request.u32(*fd)?;
+    }
+    let channel = Files::clone_on(files.sessions().0, request.as_bytes())?;
+    let cloned = Files::from_sessions(channel, None);
+    cloned.bind(posix_abi::process::identity().ok_or(Status::BadSize)?)?;
+    Ok(cloned)
+}
+fn random_marker(files: &Files) -> Result<(), i32> {
+    let files = clone_bound(files, &[]).map_err(|_| 110)?;
+    let mut held = [PreparedOpen {
+        fd: 0,
+        slot: 0,
+        generation: 0,
+        random: false,
+    }; 32];
+    for (slot, result) in held.iter_mut().enumerate() {
+        let key = proto_fs::OpenKey {
+            slot: slot as u32,
+            generation: 1,
+        };
+        let id = files
+            .open_start(key, b"/dev/urandom", proto_fs::READ_WRITE, 0, 0)
+            .map_err(|_| 111)?;
+        prepared(&files, id).map_err(|_| 112)?;
+        *result = files.open_commit(id).map_err(|_| 113)?;
+        if result.fd != slot as u32 + 3 || !result.random {
+            return Err(114);
+        }
+        if files.open_commit(id) != Ok(*result)
+            || files.open_finish(key) != Ok(*result)
+            || files.open_query(key) != Ok(OpenOutcome::Finished(*result))
+        {
+            return Err(115);
+        }
+    }
+    let numbers = core::array::from_fn::<_, 32, _>(|slot| slot as u32 + 3);
+    let child = clone_bound(&files, &numbers).map_err(|_| 116)?;
+    files.close(held[0].fd).map_err(|_| 117)?;
+    let old = proto_fs::OpenKey {
+        slot: 0,
+        generation: 1,
+    };
+    let new = proto_fs::OpenKey {
+        slot: 0,
+        generation: 2,
+    };
+    let id = files
+        .open_start(new, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        .map_err(|_| 118)?;
+    prepared(&files, id).map_err(|_| 119)?;
+    let regular = files.open_commit(id).map_err(|_| 120)?;
+    if regular.fd != held[0].fd || regular.random || regular.slot == held[0].slot {
+        return Err(121);
+    }
+    if files.open_finish(new) != Ok(regular)
+        || files.open_query(old) != Err(Status::Unknown(proto_fs::OPEN_RETIRED))
+    {
+        return Err(122);
+    }
+    files.open_cancel_key(old).map_err(|_| 123)?;
+    if files.open_query(new) != Ok(OpenOutcome::Finished(regular)) {
+        return Err(124);
+    }
+    let mut byte = [0];
+    if files.read(regular.fd, &mut byte) != Ok(1) {
+        return Err(125);
+    }
+    for fd in numbers {
+        if child.read(fd, &mut byte) != Err(Status::Unknown(proto_fs::INVALID_ARGUMENT)) {
+            return Err(126);
+        }
+        child.close(fd).map_err(|_| 127)?;
+        files.close(fd).map_err(|_| 128)?;
+    }
+    rt::println!("posix-files: Random marker full32 Clone and reuse ok");
+    Ok(())
+}
 fn run(files: &Files) -> Result<(), i32> {
     start_recovery(files)?;
+    random_marker(files)?;
     let flags = proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_WRITE;
     let (id, held) = committed(files, b"/tmp/t3-created", flags, 0o666, 0o077).map_err(|_| 1)?;
     let result = (|| {

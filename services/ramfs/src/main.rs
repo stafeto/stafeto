@@ -2438,7 +2438,7 @@ impl Fs {
                 }
                 return match self.ram.finished_open(fds, key) {
                     Ok(held) => {
-                        Self::finished_reply(r, held, r.method() == Method::OpenQuery as u16)
+                        self.finished_reply(fds, r, held, r.method() == Method::OpenQuery as u16)
                     }
                     Err(code) => status(code),
                 };
@@ -2470,7 +2470,7 @@ impl Fs {
                     return status(code);
                 }
                 // Preflight the fixed response before transferring the descriptor reference.
-                if matches!(Self::finished_reply(r, held, false), Answer::Status(_)) {
+                if matches!(self.finished_reply(fds, r, held, false), Answer::Status(_)) {
                     return Answer::Status(Status::BadSize);
                 }
                 if let Err(code) = self.ram.finish_open(fds, key, held) {
@@ -2764,18 +2764,28 @@ impl Fs {
         }
     }
     /// Every effect and cached result is gated by the exact job and current binding stamp.
-    fn finished_reply(r: &mut Request<'_>, held: ramfs::TentativeOpen, query: bool) -> Answer {
+    fn finished_reply(
+        &self,
+        fds: &Fds,
+        r: &mut Request<'_>,
+        held: ramfs::TentativeOpen,
+        query: bool,
+    ) -> Answer {
+        let marked_fd = match self.ram.marked_open(fds, held) {
+            Ok(fd) => fd,
+            Err(code) => return status(code),
+        };
         let w = r.reply();
         let result = if query {
             w.u32(0)
                 .and_then(|()| w.u32(5))
                 .and_then(|()| w.u64(0))
-                .and_then(|()| w.u32(held.fd))
+                .and_then(|()| w.u32(marked_fd))
                 .and_then(|()| w.u32(0))
                 .and_then(|()| w.u64(held.description.generation))
         } else {
             w.u32(0)
-                .and_then(|()| w.u32(held.fd))
+                .and_then(|()| w.u32(marked_fd))
                 .and_then(|()| w.u64(held.description.generation))
         };
         if result.is_err() {
@@ -2850,17 +2860,27 @@ impl Fs {
                 Err(code) => status(code),
             };
         }
+        let held = match open.phase {
+            OpenPhase::Prepared { held, .. } | OpenPhase::Committed { held, .. } => held,
+            _ => return status(proto_fs::RESOLVING),
+        };
+        let marked_fd = match self.ram.marked_open(fds, held) {
+            Ok(fd) => fd,
+            Err(code) => return status(code),
+        };
+        // The exact type and fixed response are captured before namespace effects.
+        let w = r.reply();
+        if w.u32(0)
+            .and_then(|()| w.u32(marked_fd))
+            .and_then(|()| w.u64(held.description.generation))
+            .is_err()
+        {
+            return Answer::Status(Status::BadSize);
+        }
         let now = rt::time::ticks_to_ns(rt::time::now());
         match open.commit(&mut self.ram, fds, proof, identity, &mut j.root, now) {
-            Ok(held) => {
-                let w = r.reply();
-                if w.u32(0)
-                    .and_then(|()| w.u32(held.fd))
-                    .and_then(|()| w.u64(held.description.generation))
-                    .is_err()
-                {
-                    return Answer::Status(Status::BadSize);
-                }
+            Ok(committed) => {
+                debug_assert_eq!(committed, held);
                 Answer::Reply(Outgoing::new())
             }
             Err(code) => status(code),
