@@ -19,10 +19,10 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 40,
         ceiling: 40,
-        // 4096 data pages + 885 metadata/PT_LOAD data pages + 7 rodata
-        // and 25 code pages + 12 stack + 128 reserve. The instrumented
-        // VERSION8 ELF has RW 3623001, RO 25176 and RX 100704 bytes.
-        quota: (4096 + 885 + 7 + 25 + 12 + 128) * PAGE,
+        // 4096 data pages + 913 metadata/PT_LOAD data pages + 7 rodata
+        // and 28 code pages + 12 stack + 128 allowance before runtime allocations.
+        // The measured VERSION9 ImageHold ELF requires these mapped page counts.
+        quota: (4096 + 913 + 7 + 28 + 12 + 128) * PAGE,
         handle_limit: 512,
         restart: Restart::Never,
         console: true,
