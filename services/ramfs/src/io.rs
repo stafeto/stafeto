@@ -13,6 +13,15 @@ pub use proto_fs::FILE_TOO_LARGE;
 struct Held {
     description: Token,
     open: Open,
+    capacity: u64,
+}
+
+fn io_capacity(file: File) -> u64 {
+    if matches!(file, File::Scratch) {
+        crate::FILE_CAPACITY as u64
+    } else {
+        (storage::FILE_PAGES * storage::PAGE) as u64
+    }
 }
 
 pub struct WritePreparation {
@@ -40,6 +49,7 @@ impl Ram<'_> {
         Ok(Held {
             description,
             open: shared.open,
+            capacity: io_capacity(shared.open.file),
         })
     }
 
@@ -106,7 +116,7 @@ impl Ram<'_> {
             prep.result = Some(0);
             return Ok(prep);
         }
-        let held = self.io_retain(fds, fd)?;
+        let mut data_request = None;
         if !open.file.is_device() {
             let token = self.token(open.file);
             let offset = position.unwrap_or_else(|| {
@@ -116,9 +126,17 @@ impl Ram<'_> {
                     open.offset as u64
                 }
             });
+            let capacity = io_capacity(open.file);
+            if offset >= capacity {
+                return Err(FILE_TOO_LARGE);
+            }
+            data_request = Some((token, offset, bytes.len().min((capacity - offset) as usize)));
+        }
+        let held = self.io_retain(fds, fd)?;
+        if let Some((token, offset, requested)) = data_request {
             let data = match self
                 .storage
-                .prepare_data_write(token, fds.root, offset, bytes.len())
+                .prepare_data_write(token, fds.root, offset, requested)
             {
                 Ok(data) => data,
                 Err(error) => {
@@ -154,7 +172,7 @@ impl Ram<'_> {
         if length > i64::MAX as u64 {
             return Err(OFFSET_OVERFLOW);
         }
-        if length > (storage::FILE_PAGES * storage::PAGE) as u64 {
+        if length > io_capacity(open.file) {
             return Err(FILE_TOO_LARGE);
         }
         let held = self.io_retain(fds, fd)?;
@@ -194,6 +212,9 @@ impl WritePreparation {
         let held = self.held.as_ref().ok_or(BAD_FD)?;
         ram.io_validate(held)?;
         if let Some(data) = self.data.as_mut() {
+            if data.offset + self.count as u64 > held.capacity {
+                return Err(FILE_TOO_LARGE);
+            }
             ram.storage
                 .commit_data_write(data, &self.bytes[..self.count], now)?;
             if !self.positioned {
@@ -236,7 +257,11 @@ impl TruncatePreparation {
         if let Some(result) = self.result {
             return Ok(result);
         }
-        ram.io_validate(self.held.as_ref().ok_or(BAD_FD)?)?;
+        let held = self.held.as_ref().ok_or(BAD_FD)?;
+        ram.io_validate(held)?;
+        if self.data.length > held.capacity {
+            return Err(FILE_TOO_LARGE);
+        }
         ram.storage.commit_data_truncate(&mut self.data, now)?;
         self.result = Some(self.data.length);
         Ok(self.data.length)

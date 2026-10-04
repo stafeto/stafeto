@@ -331,8 +331,8 @@ fn new_overlay_retains_originating_root_and_cancel_releases_private_overlay() {
     assert_eq!(ram.storage.usage(SECOND), before);
     assert_eq!(write(&mut ram, &fds, fd, None, b"y", 1), 1);
     fds.root = FIRST;
-    assert_eq!(write(&mut ram, &fds, fd, Some(PAGE as u64), b"z", 2), 1);
-    assert_eq!(ram.storage.usage(SECOND).pages, 2);
+    assert_eq!(write(&mut ram, &fds, fd, Some(500), b"z", 2), 1);
+    assert_eq!(ram.storage.usage(SECOND).pages, 1);
     assert_eq!(ram.storage.usage(FIRST).pages, 0);
 }
 
@@ -468,4 +468,84 @@ fn truncate_cached_replay_keeps_later_payload_and_shared_offset() {
     assert_eq!(out, [0, 0, 0, b'n', b'e', b'w']);
     while !prep.cancel(&mut ram).unwrap() {}
     assert_eq!(prep.commit(&mut ram, 9), Ok(0));
+}
+
+#[test]
+fn scratch_capacity_refusals_leave_refs_resources_bytes_and_metadata_unchanged() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: FIRST,
+        ..Fds::default()
+    };
+    let fd = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
+    let token = ram.token(File::Scratch);
+    let description = ram.description_token(&fds, fd).unwrap();
+    let original = *ram.storage.node(token).unwrap();
+    let epoch = ram.storage.state.epoch;
+    let usage = ram.storage.usage(FIRST);
+    let refs = ram.descriptions[description.slot as usize].unwrap().refs;
+    assert!(matches!(
+        ram.prepare_write(&fds, fd, b"x", Some(crate::FILE_CAPACITY as u64)),
+        Err(FILE_TOO_LARGE)
+    ));
+    assert!(matches!(
+        ram.prepare_truncate(&fds, fd, crate::FILE_CAPACITY as u64 + 1),
+        Err(FILE_TOO_LARGE)
+    ));
+    assert_eq!(ram.storage.usage(FIRST), usage);
+    assert_eq!(
+        ram.descriptions[description.slot as usize].unwrap().refs,
+        refs
+    );
+    assert_eq!(ram.storage.state.epoch, epoch);
+    let node = ram.storage.node(token).unwrap();
+    assert_eq!(node.length, original.length);
+    assert_eq!(node.data_generation, original.data_generation);
+    assert_eq!(node.times, original.times);
+    assert_eq!(node.mode, original.mode);
+    write(&mut ram, &fds, fd, None, b"kept", 7);
+    let saved = *ram.storage.node(token).unwrap();
+    let usage = ram.storage.usage(FIRST);
+    assert!(matches!(
+        ram.prepare_write(&fds, fd, b"x", Some(crate::FILE_CAPACITY as u64)),
+        Err(FILE_TOO_LARGE)
+    ));
+    assert!(matches!(
+        ram.prepare_truncate(&fds, fd, crate::FILE_CAPACITY as u64 + 1),
+        Err(FILE_TOO_LARGE)
+    ));
+    assert_eq!(ram.storage.usage(FIRST), usage);
+    let node = ram.storage.node(token).unwrap();
+    assert_eq!(node.length, saved.length);
+    assert_eq!(node.data_generation, saved.data_generation);
+    assert_eq!(node.times, saved.times);
+    let mut out = [0; 4];
+    assert_eq!(bytes(&ram, token, 0, &mut out), 4);
+    assert_eq!(out, *b"kept");
+}
+
+#[test]
+fn scratch_last_byte_and_exact_limit_truncate_preserve_the_fixed_capacity() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: FIRST,
+        ..Fds::default()
+    };
+    let fd = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
+    let token = ram.token(File::Scratch);
+    let limit = crate::FILE_CAPACITY as u64;
+    truncate(&mut ram, &fds, fd, limit, 1);
+    assert_eq!(ram.storage.node(token).unwrap().length, limit);
+    assert_eq!(write(&mut ram, &fds, fd, Some(limit - 1), b"abc", 2), 1);
+    assert_eq!(ram.storage.node(token).unwrap().length, limit);
+    let mut out = [0; 1];
+    assert_eq!(bytes(&ram, token, limit - 1, &mut out), 1);
+    assert_eq!(out, [b'a']);
+    assert_eq!(ram.get(&fds, fd).unwrap().offset, 0);
+    append(&mut ram, &fds, fd);
+    assert!(matches!(
+        ram.prepare_write(&fds, fd, b"x", None),
+        Err(FILE_TOO_LARGE)
+    ));
+    assert_eq!(ram.storage.usage(FIRST).pages, 1);
 }
