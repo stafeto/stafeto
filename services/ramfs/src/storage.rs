@@ -94,6 +94,10 @@ pub struct Node {
     pub links: u32,
     pub parent: Token,
     pub length: u64,
+    /// Payload changes are independent of namespace proof invalidation.
+    pub data_generation: u64,
+    /// Shrinking never makes truncated boot bytes visible after a later extension.
+    pub boot_visible_length: u64,
     pub times: [u64; 3],
     pub pins: [u16; 5],
     /// The boot entry (canonical for regular hard links), or NONE for fixed nodes.
@@ -111,6 +115,8 @@ impl Node {
         links: 0,
         parent: ROOT,
         length: 0,
+        data_generation: 0,
+        boot_visible_length: 0,
         times: [0; 3],
         pins: [0; 5],
         boot: NONE,
@@ -145,6 +151,19 @@ impl Overlay {
         self.root = root;
     }
 }
+/// A detached chain retains its page charge without referencing a reusable overlay.
+#[derive(Clone, Copy)]
+struct RetiredPages {
+    head: u16,
+    root: u16,
+}
+impl RetiredPages {
+    const EMPTY: Self = Self {
+        head: NONE,
+        root: NONE,
+    };
+}
+
 #[derive(Clone, Copy)]
 struct Dentry {
     parent: Token,
@@ -199,6 +218,10 @@ pub struct State {
     reclaim_queue: [u16; INODES],
     reclaim_head: usize,
     reclaim_len: usize,
+    retired: [RetiredPages; PAGES],
+    retired_head: usize,
+    retired_len: usize,
+    retired_turn: bool,
     page_next: [u16; PAGES],
     page_logical: [u16; PAGES],
 }
@@ -224,6 +247,10 @@ impl State {
             reclaim_queue: [0; INODES],
             reclaim_head: 0,
             reclaim_len: 0,
+            retired: [RetiredPages::EMPTY; PAGES],
+            retired_head: 0,
+            retired_len: 0,
+            retired_turn: false,
             page_next: [NONE; PAGES],
             page_logical: [0; PAGES],
         }
@@ -242,6 +269,10 @@ impl State {
         self.page_len = PAGES;
         self.epoch = 1;
         self.preparation_used = 0;
+        self.retired.fill(RetiredPages::EMPTY);
+        self.retired_head = 0;
+        self.retired_len = 0;
+        self.retired_turn = false;
     }
 }
 impl Default for State {
@@ -318,6 +349,7 @@ impl<'a> Storage<'a> {
                 mode,
                 links,
                 length,
+                boot_visible_length: length,
                 parent,
                 times: [now; 3],
                 ..Node::EMPTY
@@ -358,6 +390,7 @@ impl<'a> Storage<'a> {
                         } else {
                             tree.data(n).len() as u64
                         },
+                        boot_visible_length: tree.data(n).len() as u64,
                         times: [now; 3],
                         boot: canonical(&tree, n),
                         ..Node::EMPTY
@@ -927,13 +960,14 @@ impl<'a> Storage<'a> {
 
     pub fn boot_bytes(&self, token: Token) -> &'a [u8] {
         let n = &self.state.nodes[token.slot as usize];
-        if token.slot == 3 {
+        let bytes = if token.slot == 3 {
             crate::MOTD
         } else if n.boot != NONE && n.kind == crate::REG {
             self.tree.as_ref().unwrap().data(n.boot)
         } else {
             &[]
-        }
+        };
+        &bytes[..bytes.len().min(n.boot_visible_length as usize)]
     }
     pub fn read(&self, token: Token, offset: u64, out: &mut [u8]) -> Result<usize, u32> {
         let n = self.node(token)?;
@@ -1006,6 +1040,11 @@ impl<'a> Storage<'a> {
         if bytes.is_empty() {
             return Ok(0);
         }
+        let data_generation = self
+            .node(token)?
+            .data_generation
+            .checked_add(1)
+            .ok_or(NO_SPACE)?;
         let first = offset / PAGE;
         let last = (end - 1) / PAGE;
         let existing = self.node(token)?.overlay;
@@ -1052,10 +1091,80 @@ impl<'a> Storage<'a> {
         }
         self.state.nodes[token.slot as usize].length =
             self.state.nodes[token.slot as usize].length.max(end as u64);
+        self.state.nodes[token.slot as usize].data_generation = data_generation;
         Ok(bytes.len())
     }
-    /// One overlay slot or one page per call. A detached inode keeps its charge until the final pin.
+    /// All fallible preflight precedes the single detachment of a live file's data.
+    /// The admitted caller owns the Open/Truncate journal and exact authority proof.
+    pub fn truncate_zero(&mut self, token: Token, now: u64) -> Result<(), u32> {
+        let node = self.node(token)?;
+        if node.kind != crate::REG {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let data_generation = node.data_generation.checked_add(1).ok_or(NO_SPACE)?;
+        let epoch = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
+        let overlay = node.overlay;
+        let chain = if overlay == NONE {
+            RetiredPages::EMPTY
+        } else {
+            let held = &self.state.overlays[overlay as usize];
+            RetiredPages {
+                head: held.head,
+                root: held.root,
+            }
+        };
+        // Every existing nonempty chain owns a page. A nonempty live chain therefore
+        // has a guaranteed credit before any of its pages can enter the retired FIFO.
+        if chain.head != NONE && self.state.retired_len == PAGES {
+            return Err(NO_SPACE);
+        }
+        if chain.head != NONE {
+            let tail = (self.state.retired_head + self.state.retired_len) % PAGES;
+            self.state.retired[tail] = chain;
+            self.state.retired_len += 1;
+        }
+        if overlay != NONE {
+            self.state.overlays[overlay as usize].pages.fill(NONE);
+            self.state.overlays[overlay as usize].head = NONE;
+        }
+        let node = &mut self.state.nodes[token.slot as usize];
+        node.length = 0;
+        node.boot_visible_length = 0;
+        node.data_generation = data_generation;
+        node.times[1] = now;
+        node.times[2] = now;
+        self.state.epoch = epoch;
+        Ok(())
+    }
+    /// One page or inode slot per call, alternating two independently paid queues.
     pub fn reclaim_step(&mut self) -> bool {
+        if self.state.retired_len != 0 && (self.state.reclaim_len == 0 || self.state.retired_turn) {
+            self.state.retired_turn = false;
+            self.reclaim_retired_page();
+            return true;
+        }
+        if self.reclaim_inode_step() {
+            self.state.retired_turn = true;
+            return true;
+        }
+        false
+    }
+    fn reclaim_retired_page(&mut self) {
+        let entry = &mut self.state.retired[self.state.retired_head];
+        let page = entry.head;
+        let root = entry.root;
+        entry.head = self.state.page_next[page as usize];
+        if entry.head == NONE {
+            *entry = RetiredPages::EMPTY;
+            self.state.retired_head = (self.state.retired_head + 1) % PAGES;
+            self.state.retired_len -= 1;
+        }
+        self.state.page_free[self.state.page_len] = page;
+        self.state.page_len += 1;
+        self.uncharge(root as usize, |u| &mut u.pages);
+    }
+    /// The inode queue keeps its original guaranteed credit for every live overlay.
+    fn reclaim_inode_step(&mut self) -> bool {
         if self.state.reclaim_len == 0 {
             return false;
         }
@@ -1102,6 +1211,18 @@ impl<'a> Storage<'a> {
 mod page_tests {
     extern crate std;
     use super::*;
+
+    #[test]
+    fn retirement_records_and_node_growth_have_fixed_accounted_layout() {
+        assert_eq!(core::mem::size_of::<RetiredPages>(), 4);
+        std::println!(
+            "T3 layout: Node {} bytes, State {} bytes, retirement table {} bytes, nodes {}",
+            core::mem::size_of::<Node>(),
+            core::mem::size_of::<State>(),
+            core::mem::size_of::<[RetiredPages; PAGES]>(),
+            NODES
+        );
+    }
 
     const FIRST: Root = Root {
         id: 11,

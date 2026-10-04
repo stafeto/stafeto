@@ -505,7 +505,7 @@ impl<'a> Ram<'a> {
     }
 
     /// Prepay every descriptor resource before a namespace or truncation effect.
-    /// A creation's access is authorized by the parent and captured intent, not its new mode.
+    /// A creation's access is authorized by its parent and captured intent.
     pub fn prepare_open_token(
         &mut self,
         fds: &mut Fds,
