@@ -251,13 +251,19 @@ impl Default for State {
 }
 
 /// An allocated inode/name pair remains unpublished until commit.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reservation {
     pub token: Token,
     dentry: u16,
     epoch: u64,
     place: u16,
     root: u16,
+}
+
+impl Reservation {
+    pub fn charge(&self) -> u16 {
+        self.root
+    }
 }
 
 pub struct Storage<'a> {
@@ -583,6 +589,40 @@ impl<'a> Storage<'a> {
         name: &[u8],
         attributes: (u32, u32, u32, u32),
     ) -> Result<Reservation, u32> {
+        self.reserve_with_charge(root, parent, name, attributes, None)
+    }
+    /// Move an admitted job's charge into its reservation, without allocating another.
+    /// The caller must validate the exact job, owner, and authority before this transfer.
+    pub fn reserve_paid(
+        &mut self,
+        root: Root,
+        parent: Token,
+        name: &[u8],
+        attributes: (u32, u32, u32, u32),
+        charge: &mut u16,
+    ) -> Result<Reservation, u32> {
+        let paid = *charge;
+        if !self
+            .state
+            .accounts
+            .get(paid as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|a| a.key == root && a.pending != 0)
+        {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let reservation = self.reserve_with_charge(root, parent, name, attributes, Some(paid))?;
+        *charge = NONE;
+        Ok(reservation)
+    }
+    fn reserve_with_charge(
+        &mut self,
+        root: Root,
+        parent: Token,
+        name: &[u8],
+        attributes: (u32, u32, u32, u32),
+        paid: Option<u16>,
+    ) -> Result<Reservation, u32> {
         let (kind, mode, uid, gid) = attributes;
         if name.is_empty()
             || name.len() > 255
@@ -613,8 +653,9 @@ impl<'a> Storage<'a> {
             .iter()
             .position(Option::is_none)
             .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
-        if self.state.preparation_used as usize == PREPARATIONS
-            || self.state.accounts[a].unwrap().pending == PREPARATION_SHARE
+        if paid.is_none()
+            && (self.state.preparation_used as usize == PREPARATIONS
+                || self.state.accounts[a].unwrap().pending == PREPARATION_SHARE)
         {
             return Err(proto_fs::TOO_MANY_OPEN_FILES);
         }
@@ -672,11 +713,29 @@ impl<'a> Storage<'a> {
             root: a as u16,
         };
         self.state.pending[place] = Some(reservation);
-        self.state.accounts[a].as_mut().unwrap().pending += 1;
-        self.state.preparation_used += 1;
+        if paid.is_none() {
+            self.state.accounts[a].as_mut().unwrap().pending += 1;
+            self.state.preparation_used += 1;
+        }
         Ok(reservation)
     }
     pub fn commit(&mut self, reservation: Reservation) -> Result<Token, u32> {
+        let token = self.commit_keep_charge(reservation)?;
+        self.release_preparation(reservation.root);
+        Ok(token)
+    }
+    /// Publish once, retaining the paid charge for the completed operation journal.
+    pub fn commit_keep_charge(&mut self, reservation: Reservation) -> Result<Token, u32> {
+        if self
+            .state
+            .pending
+            .get(reservation.place as usize)
+            .copied()
+            .flatten()
+            != Some(reservation)
+        {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
         let d = self.state.dentries[reservation.dentry as usize];
         if !d.reserved || d.node != reservation.token || reservation.epoch != self.state.epoch {
             return Err(proto_fs::INVALID_ARGUMENT);
@@ -693,10 +752,13 @@ impl<'a> Storage<'a> {
         }
         self.unpin(d.parent, Pin::Pending)?;
         self.state.epoch = next;
-        self.end_preparation(reservation);
+        self.state.pending[reservation.place as usize] = None;
         Ok(reservation.token)
     }
     pub fn cancel(&mut self, r: Reservation) -> Result<(), u32> {
+        if self.state.pending.get(r.place as usize).copied().flatten() != Some(r) {
+            return Err(NO_ENTRY);
+        }
         let d = self.state.dentries[r.dentry as usize];
         if !d.reserved || d.node != r.token {
             return Err(NO_ENTRY);

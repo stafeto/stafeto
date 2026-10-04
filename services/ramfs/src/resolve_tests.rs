@@ -1277,3 +1277,179 @@ fn retrying_binding_cursor_releases_dead_and_superseded_real_captures() {
     assert_eq!(ram.open_descriptions(), 0);
     assert_eq!(ram.storage.preparations_used(), 0);
 }
+
+#[test]
+fn creation_binding_and_path_jobs_share_the_session_budget() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let mut charges = [0; 8];
+    for (i, charge) in charges.iter_mut().enumerate() {
+        *charge = ram.storage.charge_preparation(fds.root).unwrap();
+        fds.resolvers[i] = i as u64 + 1;
+    }
+    let mut reservations = std::vec::Vec::new();
+    for i in 0..7 {
+        reservations.push(
+            ram.reserve_create(&mut fds, ROOT, format!("held{i}").as_bytes(), REG)
+                .unwrap(),
+        );
+    }
+    ram.begin_binding(&mut fds).unwrap();
+    assert_eq!(fds.preparation_count(), 16);
+    assert!(!fds.preparation_available());
+    assert!(matches!(
+        ram.reserve_create(&mut fds, ROOT, b"overflow", REG),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    ));
+    assert_eq!(ram.storage.preparations_used(), 16);
+    ram.complete_binding(&mut fds, 0);
+    ram.reserve_create(&mut fds, ROOT, b"replacement", REG)
+        .unwrap();
+    assert_eq!(
+        ram.begin_binding(&mut fds),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    );
+    for (i, charge) in charges.into_iter().enumerate() {
+        ram.storage.release_preparation(charge);
+        fds.resolvers[i] = 0;
+    }
+    while ram.release_step(&mut fds) {}
+    assert_eq!(ram.storage.preparations_used(), 0);
+    assert_eq!(fds.preparation_count(), 0);
+    assert_eq!(ram.storage.node(ROOT).unwrap().pins.iter().sum::<u16>(), 0);
+}
+
+#[test]
+fn paid_creation_transfers_at_full_global_and_root_budgets_once() {
+    let mut ram = Ram::new(0);
+    let other = Root {
+        id: 301,
+        generation: 1,
+    };
+    let mut charges = std::vec::Vec::new();
+    for _ in 0..96 {
+        charges.push(ram.storage.charge_preparation(ROOT_ACCOUNT).unwrap());
+    }
+    for _ in 0..32 {
+        charges.push(ram.storage.charge_preparation(other).unwrap());
+    }
+    let mut paid = charges[0];
+    let renewed = Root {
+        generation: 2,
+        ..ROOT_ACCOUNT
+    };
+    let usage = ram.storage.usage(ROOT_ACCOUNT);
+    assert!(
+        ram.storage
+            .reserve_paid(
+                ROOT_ACCOUNT,
+                ROOT,
+                b"bad/name",
+                (REG, 0o600, 11, 22),
+                &mut paid
+            )
+            .is_err()
+    );
+    assert_eq!(paid, charges[0]);
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT), usage);
+    assert_eq!(ram.storage.preparations_used(), 128);
+    assert!(matches!(
+        ram.storage
+            .reserve_paid(renewed, ROOT, b"wrong", (REG, 0o600, 11, 22), &mut paid),
+        Err(proto_fs::INVALID_ARGUMENT)
+    ));
+    assert_eq!(paid, charges[0]);
+    let r = ram
+        .storage
+        .reserve_paid(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"transferred",
+            (REG, 0o600, 11, 22),
+            &mut paid,
+        )
+        .unwrap();
+    assert_eq!(paid, crate::storage::NONE);
+    assert_eq!(ram.storage.preparations_used(), 128);
+    assert!(matches!(
+        ram.storage.reserve_paid(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"duplicate",
+            (REG, 0o600, 11, 22),
+            &mut paid
+        ),
+        Err(proto_fs::INVALID_ARGUMENT)
+    ));
+    let token = ram.storage.commit_keep_charge(r).unwrap();
+    assert_eq!(ram.storage.lookup(ROOT, b"transferred"), Ok(token));
+    assert_eq!(ram.storage.preparations_used(), 128);
+    assert!(ram.storage.commit_keep_charge(r).is_err());
+    assert!(ram.storage.cancel(r).is_err());
+    assert_eq!(ram.storage.preparations_used(), 128);
+    ram.storage.release_preparation(r.charge());
+    for charge in charges.into_iter().skip(1) {
+        ram.storage.release_preparation(charge);
+    }
+    assert_eq!(ram.storage.preparations_used(), 0);
+    // A retired reservation cannot cancel another generation at the reused place.
+    let mut next = ram.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
+    let replacement = ram
+        .storage
+        .reserve_paid(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"replacement",
+            (REG, 0o600, 11, 22),
+            &mut next,
+        )
+        .unwrap();
+    assert!(ram.storage.cancel(r).is_err());
+    assert_eq!(ram.storage.preparations_used(), 1);
+    ram.storage.cancel(replacement).unwrap();
+    assert!(ram.storage.cancel(replacement).is_err());
+    assert_eq!(ram.storage.preparations_used(), 0);
+    assert_eq!(ram.storage.node(ROOT).unwrap().pins.iter().sum::<u16>(), 0);
+}
+
+#[test]
+fn no_follow_open_still_resolves_a_link_with_a_trailing_slash() {
+    use crate::resolve::Intent;
+    let mut ram = Ram::new(0);
+    let target = create(&mut ram, ROOT, b"target-dir", DIR, 0o755);
+    let link = create(&mut ram, ROOT, b"dir-link", SYMLINK, 0o777);
+    ram.storage
+        .write(link, ROOT_ACCOUNT, 0, b"/target-dir")
+        .unwrap();
+    for (path, expected) in [
+        (b"/dir-link/".as_slice(), target),
+        (b"/dir-link".as_slice(), link),
+    ] {
+        let intent = Intent::Open {
+            flags: proto_fs::NO_FOLLOW,
+        };
+        let mut resolver =
+            Resolve::with_intent(&mut ram.storage, path, ROOT, OWNER, intent).unwrap();
+        assert_eq!(
+            intent_ready(&mut ram, &mut resolver, OWNER).unwrap().0,
+            Progress::Found(expected)
+        );
+        assert_eq!(
+            resolver
+                .result_proof(&ram.storage, OWNER, intent)
+                .unwrap()
+                .target,
+            Some(expected)
+        );
+        resolver.release(&mut ram.storage);
+    }
+    assert_eq!(ram.storage.node(ROOT).unwrap().pins.iter().sum::<u16>(), 0);
+    assert_eq!(
+        ram.storage.node(target).unwrap().pins.iter().sum::<u16>(),
+        0
+    );
+    assert_eq!(ram.storage.node(link).unwrap().pins.iter().sum::<u16>(), 0);
+}

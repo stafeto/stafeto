@@ -243,6 +243,15 @@ impl Default for Fds {
 }
 
 impl Fds {
+    /// Binding, path jobs, and unpublished creations share one session budget.
+    pub fn preparation_count(&self) -> usize {
+        self.resolvers.iter().filter(|&&id| id != 0).count()
+            + self.preparations.iter().filter(|p| p.is_some()).count()
+            + usize::from(self.binding_preparation.is_some())
+    }
+    pub fn preparation_available(&self) -> bool {
+        self.preparation_count() < self.resolvers.len()
+    }
     /// Retained references in this session, without authenticating or mutating it.
     #[cfg(feature = "auth-probe")]
     pub fn retained_counts(&self) -> [u32; 5] {
@@ -510,6 +519,9 @@ impl<'a> Ram<'a> {
         name: &[u8],
         kind: u32,
     ) -> Result<storage::Reservation, u32> {
+        if !fds.preparation_available() {
+            return Err(proto_fs::TOO_MANY_OPEN_FILES);
+        }
         let place = fds
             .preparations
             .iter()
@@ -572,9 +584,7 @@ impl<'a> Ram<'a> {
 
     /// Binding and resolver jobs share the session's sixteen preparation slots.
     pub fn begin_binding(&mut self, fds: &mut Fds) -> Result<(), u32> {
-        if fds.binding_preparation.is_some()
-            || fds.resolvers.iter().filter(|&&id| id != 0).count() >= fds.resolvers.len()
-        {
+        if fds.binding_preparation.is_some() || !fds.preparation_available() {
             return Err(proto_fs::TOO_MANY_OPEN_FILES);
         }
         let root = self.storage.charge_preparation(fds.root)?;

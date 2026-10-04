@@ -253,7 +253,11 @@ impl Resolve {
                 if node.kind == SYMLINK
                     && (self.follow
                         || !self.final_component()
-                        || (self.end < self.length && matches!(self.intent, Intent::Lookup { .. })))
+                        || (self.end < self.length
+                            && !matches!(self.intent, Intent::DirectoryCreate)
+                            && !matches!(self.intent, Intent::Open { flags }
+                                if flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE)
+                                    == proto_fs::CREATE | proto_fs::EXCLUSIVE)))
                 {
                     self.link = Some(token);
                 } else {

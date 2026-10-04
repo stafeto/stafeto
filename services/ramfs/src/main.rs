@@ -1465,7 +1465,7 @@ impl Fs {
         {
             return self.bind_refusal(fds, proto_fs::PERMISSION);
         }
-        if fds.resolvers.iter().filter(|&&id| id != 0).count() >= fds.resolvers.len() {
+        if !fds.preparation_available() && fds.binding_preparation.is_none() {
             return self.bind_refusal(fds, proto_fs::TOO_MANY_OPEN_FILES);
         }
         let rights = r.handles.info(0).map(|(_, rights)| rights);
@@ -1530,7 +1530,7 @@ impl Fs {
             fds.binding = Binding::Cleanup;
             return Err(proto_fs::PERMISSION);
         }
-        if fds.resolvers.iter().filter(|&&id| id != 0).count() >= fds.resolvers.len() {
+        if !fds.preparation_available() {
             return Err(proto_fs::TOO_MANY_OPEN_FILES);
         }
         let i = fds.authority_index as usize;
@@ -2077,6 +2077,9 @@ impl Fs {
                 {
                     *id = 0;
                 }
+            }
+            if !fds.preparation_available() {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
             }
             let Some(place) = fds.resolvers.iter().position(|&id| id == 0) else {
                 return status(proto_fs::TOO_MANY_OPEN_FILES);
