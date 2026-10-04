@@ -86,6 +86,29 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
             return Err(46);
         }
     }
+    reply.len = 12;
+    for bad in [0u64, 127, 384] {
+        reply.words[0] = (bad as u32 as u64) << 32;
+        reply.words[1] = bad >> 32;
+        if Files::open_start_reply(&reply) != Err(Status::BadSize) {
+            return Err(67);
+        }
+    }
+    reply.len = 16;
+    for (fd, generation) in [(2u32, 1), (35, 1), (3, 0)] {
+        reply.words[0] = (fd as u64) << 32;
+        reply.words[1] = generation;
+        if Files::open_commit_reply(&reply) != Err(Status::BadSize) {
+            return Err(68);
+        }
+    }
+    for fd in [3u32, 32, 34] {
+        reply.words[0] = (fd as u64) << 32;
+        reply.words[1] = 1;
+        if Files::open_commit_reply(&reply) != Ok(PreparedOpen { fd, generation: 1 }) {
+            return Err(69);
+        }
+    }
     if files.open_query(first) != Ok((id, 0)) {
         return Err(47);
     }

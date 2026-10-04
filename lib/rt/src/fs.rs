@@ -192,7 +192,15 @@ impl Files {
     /// Decode a Start transport reply before acknowledging the resident operation.
     pub fn open_start_reply(reply: &crate::sys::Reply) -> Result<u64, Status> {
         Self::open_reply(reply, 12)?;
-        Ok((reply.words[0] >> 32) | ((reply.words[1] as u32 as u64) << 32))
+        let id = (reply.words[0] >> 32) | ((reply.words[1] as u32 as u64) << 32);
+        Self::open_job_id(id)?;
+        Ok(id)
+    }
+    fn open_job_id(id: u64) -> Result<(), Status> {
+        if id >> 8 == 0 || id & 255 >= 128 {
+            return Err(Status::BadSize);
+        }
+        Ok(())
     }
     /// Recover the paid job after the original Start reply was unavailable.
     pub fn open_query(&self, key: proto_fs::OpenKey) -> Result<(u64, u32), Status> {
@@ -206,6 +214,7 @@ impl Files {
         if phase > 4 {
             return Err(Status::BadSize);
         }
+        Self::open_job_id(reply.words[1])?;
         Ok((reply.words[1], phase))
     }
     /// Cleanup uses the client key even before its server job ID was decoded.
@@ -260,11 +269,17 @@ impl Files {
         Method::OpenCommit.header().write(&mut w)?;
         w.u64(id)?;
         let reply = Self::send_on(&self.channel, w.as_bytes())?;
-        Self::open_reply(&reply, 16)?;
-        Ok(PreparedOpen {
-            fd: (reply.words[0] >> 32) as u32,
-            generation: reply.words[1],
-        })
+        Self::open_commit_reply(&reply)
+    }
+    /// Successful wire shape must describe a real server descriptor lifetime.
+    pub fn open_commit_reply(reply: &crate::sys::Reply) -> Result<PreparedOpen, Status> {
+        Self::open_reply(reply, 16)?;
+        let fd = (reply.words[0] >> 32) as u32;
+        let generation = reply.words[1];
+        if !(3..35).contains(&fd) || generation == 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(PreparedOpen { fd, generation })
     }
     /// Release the exact job and hidden descriptor after a completed or abandoned Open.
     pub fn open_cancel(&self, id: u64) -> Result<(), Status> {
