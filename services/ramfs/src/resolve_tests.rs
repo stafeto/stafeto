@@ -643,3 +643,111 @@ fn new_authentic_generation_invalidates_a_proof_with_unchanged_ids() {
     assert_eq!(finish(&mut r, &mut proof, OWNER), Ok(file));
     proof.release(&mut r.storage);
 }
+
+#[test]
+fn paid_admission_phases_preserve_capture_and_cleanup_the_real_session() {
+    use crate::authority::{Admission, BindingPurpose};
+    let old = who();
+    let fresh = WhoReply {
+        generation: old.generation + 1,
+        ..old
+    };
+    let mut wire = proto_wire::Writer::new();
+    fresh.write(&mut wire).unwrap();
+    let mut admission = Admission::Wire(wire.as_bytes().try_into().unwrap());
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        binding: Binding::Inherited(old),
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let file = create(&mut ram, ROOT, b"phase", REG, 0o600);
+    let fd = ram
+        .open_token(&mut fds, file, proto_fs::READ_ONLY, OWNER)
+        .unwrap();
+    ram.set_cwd_token(&mut fds, ROOT).unwrap();
+    let retained = ram.description_token(&fds, fd).unwrap();
+    ram.begin_binding(&mut fds).unwrap();
+    assert_eq!(ram.storage.preparations_used(), 1);
+    admission.decode().unwrap();
+    assert!(matches!(admission, Admission::Vouched(_)));
+    assert_eq!(fds.binding, Binding::Inherited(old));
+    admission
+        .validate(
+            fds.binding,
+            BindingPurpose::Refresh,
+            false,
+            fresh.generation,
+        )
+        .unwrap();
+    let Admission::Validated(checked) = admission else {
+        panic!("separate validation phase")
+    };
+    assert_eq!(fds.binding, Binding::Inherited(old));
+    fds.binding = fds.binding.refreshed(&checked).unwrap();
+    ram.complete_binding(&mut fds, 0);
+    assert_eq!(fds.binding, Binding::Inherited(fresh));
+    assert_eq!(fds.binding_outcome, Some(0));
+    assert_eq!(ram.storage.preparations_used(), 0);
+    assert_eq!(ram.description_token(&fds, fd), Ok(retained));
+    assert_eq!(fds.cwd, Some(ROOT));
+    // A lost Finish reply sees the same finite journal, without another effect.
+    assert_eq!(fds.binding_outcome, Some(0));
+    ram.begin_binding(&mut fds).unwrap();
+    assert_eq!(fds.binding_outcome, None);
+    admission = Admission::Vouched(fresh);
+    assert_eq!(
+        admission.validate(
+            fds.binding,
+            BindingPurpose::Refresh,
+            false,
+            proto_process::GENERATION_DEAD | fresh.generation
+        ),
+        Err(proto_fs::PERMISSION)
+    );
+    ram.complete_binding(&mut fds, proto_fs::PERMISSION);
+    assert_eq!(fds.binding_outcome, Some(proto_fs::PERMISSION));
+    assert_eq!(ram.storage.preparations_used(), 0);
+    fds.binding = Binding::Cleanup;
+    assert!(ram.release_step(&mut fds));
+    assert_eq!(fds.cwd, None);
+    assert_eq!(ram.description_token(&fds, fd), Ok(retained));
+    assert!(ram.release_step(&mut fds));
+    assert_eq!(ram.description_token(&fds, fd), Err(proto_fs::BAD_FD));
+    assert!(!ram.release_step(&mut fds));
+    assert_eq!(ram.open_descriptions(), 0);
+}
+
+#[test]
+fn binding_and_resolver_preparations_share_the_sixteen_session_slots() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let mut charges = [0; 16];
+    for (i, charge) in charges.iter_mut().enumerate() {
+        *charge = ram.storage.charge_preparation(fds.root).unwrap();
+        fds.resolvers[i] = (i + 1) as u64;
+    }
+    assert_eq!(
+        ram.begin_binding(&mut fds),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    );
+    assert_eq!(ram.storage.preparations_used(), 16);
+    ram.storage.release_preparation(charges[15]);
+    fds.resolvers[15] = 0;
+    ram.begin_binding(&mut fds).unwrap();
+    assert_eq!(ram.storage.preparations_used(), 16);
+    assert_eq!(
+        ram.begin_binding(&mut fds),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    );
+    ram.complete_binding(&mut fds, proto_fs::PERMISSION);
+    assert_eq!(ram.storage.preparations_used(), 15);
+    assert_eq!(fds.binding_outcome, Some(proto_fs::PERMISSION));
+    for charge in &charges[..15] {
+        ram.storage.release_preparation(*charge);
+    }
+    assert_eq!(ram.storage.preparations_used(), 0);
+}
