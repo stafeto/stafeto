@@ -1,0 +1,25 @@
+[package]
+name = "posix-tty"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The probe of the terminal in C on relibc: termios, isatty, ttyname, the names of terminals"
+build = "build.rs"
+
+[[bin]]
+name = "posix-tty"
+test = false
+bench = false
+
+[features]
+quiet-control = []
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt", features = ["uart-input"] }
+posix-abi = { path = "../../lib/posix-abi" }
+proto-tty = { path = "../../proto/tty" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }
+posix-fs = { path = "../../lib/posix-fs" }

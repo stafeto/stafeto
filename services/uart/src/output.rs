@@ -9,7 +9,10 @@
 //! bytes and the other has some, a CR LF ends it and the other goes on;
 //! the part of a line of the clients cut short this way, up to REPEAT_MAX
 //! bytes, goes out again once the log has ended its line and has no more.
-//! A CR goes before each LF.
+//! A CR goes before each LF of a client's WRITE. The bytes of WRITE_SOME,
+//! those of the terminal service, go out as they are: the terminal's
+//! output processing (OPOST, ONLCR; XBD 11.2.3) made them; an LF among them
+//! still ends the line for the turns with the log.
 
 /// The bytes of the ring of the clients.
 pub const TX_RING: usize = 4096;
@@ -53,6 +56,9 @@ pub struct Output {
     cut: bool,
     /// The bytes of `line` that went out again so far, while they go.
     repeat: Option<usize>,
+    /// One bit for each byte of the ring: it came with WRITE_SOME and goes
+    /// out as it is.
+    raw: [u8; TX_RING / 8],
 }
 
 impl Output {
@@ -72,6 +78,7 @@ impl Output {
             long: false,
             cut: false,
             repeat: None,
+            raw: [0; TX_RING / 8],
         }
     }
 
@@ -83,14 +90,57 @@ impl Output {
     /// Puts `bytes` of a client into the ring, all or none: false, with
     /// nothing taken, when they do not fit.
     pub fn put(&mut self, bytes: &[u8]) -> bool {
+        self.put_as(bytes, false)
+    }
+
+    /// `put` of the bytes of WRITE_SOME, which go out as they are.
+    pub fn put_raw(&mut self, bytes: &[u8]) -> bool {
+        self.put_as(bytes, true)
+    }
+
+    fn put_as(&mut self, bytes: &[u8], raw: bool) -> bool {
         if bytes.len() > self.room() {
             return false;
         }
-        for &b in bytes {
-            self.ring[(self.ring_start + self.ring_len) % TX_RING] = b;
-            self.ring_len += 1;
+        // In one or two runs of the ring, a copy and the bits of each.
+        let mut done = 0;
+        while done < bytes.len() {
+            let at = (self.ring_start + self.ring_len) % TX_RING;
+            let n = (bytes.len() - done).min(TX_RING - at);
+            self.ring[at..at + n].copy_from_slice(&bytes[done..done + n]);
+            self.mark(at, n, raw);
+            self.ring_len += n;
+            done += n;
         }
         true
+    }
+
+    /// The bits of the `n` bytes of the ring from `at`, which does not
+    /// wrap: set for `raw`, clear otherwise; whole bytes of bits at once.
+    fn mark(&mut self, at: usize, n: usize, raw: bool) {
+        let (mut i, end) = (at, at + n);
+        while i < end {
+            if i % 8 == 0 && end - i >= 8 {
+                self.raw[i / 8] = if raw { 0xff } else { 0 };
+                i += 8;
+                continue;
+            }
+            let bit = 1 << (i % 8);
+            if raw {
+                self.raw[i / 8] |= bit;
+            } else {
+                self.raw[i / 8] &= !bit;
+            }
+            i += 1;
+        }
+    }
+
+    /// The bytes of the clients in the ring go unsent, as if the port took
+    /// them: for a stand-in of the driver whose port sends at once (the
+    /// measure of the terminal service's steps, tests/tty).
+    pub fn discard_clients(&mut self) {
+        self.ring_start = (self.ring_start + self.ring_len) % TX_RING;
+        self.ring_len = 0;
     }
 
     /// Whether the text of the last batch of the log went out whole: the
@@ -174,10 +224,11 @@ impl Output {
                         self.repeat = None;
                     }
                     if self.ring_len > 0 {
-                        let b = self.ring[self.ring_start];
-                        self.ring_start = (self.ring_start + 1) % TX_RING;
+                        let at = self.ring_start;
+                        let raw = self.raw[at / 8] & (1 << (at % 8)) != 0;
+                        self.ring_start = (at + 1) % TX_RING;
                         self.ring_len -= 1;
-                        return Some(self.client_byte(b));
+                        return Some(self.client_byte(self.ring[at], raw));
                     }
                     if !self.log_has() {
                         return None;
@@ -205,13 +256,17 @@ impl Output {
         }
     }
 
-    /// Byte `b` of the clients as it goes out: a CR before an LF, which
-    /// ends the line; any other byte joins the line.
-    fn client_byte(&mut self, b: u8) -> u8 {
+    /// Byte `b` of the clients as it goes out: an LF ends the line, with
+    /// a CR before it unless the byte is `raw`; any other byte joins the
+    /// line.
+    fn client_byte(&mut self, b: u8, raw: bool) -> u8 {
         if b == b'\n' {
             self.at = At::Start;
             self.line_len = 0;
             self.long = false;
+            if raw {
+                return b'\n';
+            }
             self.pending = b"\n";
             return b'\r';
         }
@@ -264,6 +319,37 @@ mod tests {
         assert!(o.put_log(b"k1\nk2\n"));
         assert_eq!(drain(&mut o), b"k1\r\nk2\r\n");
         assert!(o.log_done());
+    }
+
+    /// WRITE_SOME's bytes go out as the terminal made them: an LF alone
+    /// stays alone; WRITE's LF gets its CR.
+    #[test]
+    fn the_bytes_of_write_some_go_out_as_they_are() {
+        let mut o = Output::new();
+        assert!(o.put_raw(b"one\r\ntwo\nx\ry"));
+        assert!(o.put(b"\nz\n"));
+        assert_eq!(drain(&mut o), b"one\r\ntwo\nx\ry\r\nz\r\n");
+        // An LF of WRITE_SOME ends the line: the log goes after it.
+        assert!(o.put_raw(b"raw\nmore\n"));
+        assert_eq!(take(&mut o, 2), b"ra");
+        assert!(o.put_log(b"log\n"));
+        assert_eq!(drain(&mut o), b"w\nlog\r\nmore\n");
+    }
+
+    /// The marks of WRITE_SOME's bytes hold across the wrap of the ring
+    /// and are cleared by WRITE's bytes in the same places.
+    #[test]
+    fn marks_hold_across_the_wrap() {
+        let mut o = Output::new();
+        assert!(o.put(&[b'.'; TX_RING - 5]));
+        drain(&mut o);
+        let raw = b"ab\ncdefghij\nkl\n";
+        assert!(o.put_raw(raw));
+        assert_eq!(drain(&mut o), raw);
+        assert!(o.put(&[b'x'; TX_RING - 8]));
+        drain(&mut o);
+        assert!(o.put(b"ab\ncdefghij\nkl\n"));
+        assert_eq!(drain(&mut o), b"ab\r\ncdefghij\r\nkl\r\n");
     }
 
     #[test]

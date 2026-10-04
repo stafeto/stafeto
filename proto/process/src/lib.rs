@@ -160,6 +160,30 @@
 //! loader's identity, of the image its place loads, answers with the
 //! image and the ticket of its place (`LoaderOf`) only while it loads.
 //!
+//! TtySignal, SetCtty and DropCtty, through a notary session whose label
+//! has TERMINAL (init gives it to the terminal service of its table; 5f):
+//! the service keeps which session each terminal is the controlling
+//! terminal of. SetCtty: body the terminal u32 and the session u32: the
+//! terminal becomes the controlling terminal of the session, whose leader
+//! lives, when the terminal has no session with a live leader and the
+//! session has no terminal; PERMISSION for a session with no live leader,
+//! ACCESS for a terminal or a session taken. DropCtty: body the terminal
+//! u32: it is no session's. The end of a session's leader takes its
+//! terminal from the session. TtySignal: body the terminal u32, the group
+//! u32 and the signal u32: the signal goes to every member of the group,
+//! with no check of permission (XBD 11.1.9), when the group lies in the
+//! session of the terminal; PERMISSION when it does not, NO_PROCESS for a
+//! group nobody is in, INVALID for a signal the members refuse (the stop
+//! signals until stops come); the reply comes once the walk of the group
+//! is over, as for Kill.
+//!
+//! The second half of the page of the generations (from GROUPS_AT) holds a
+//! word for each record index: its group in the high half and its session
+//! in the low half (`groups_word`), which the service stores with Release
+//! when it makes the record, moves it between groups or sessions, and
+//! clears when the record is reaped. Vouch's reply names the record index,
+//! so a voucher reads the group and session of a client with no call.
+//!
 //! Through a session: Query has no body or handles. Snapshot reply:
 //! status u32, pid u32, parent u32, uid/euid/suid/gid/egid/sgid u32.
 //! Change: operation u32, id u32; reply status alone. The kernel answers
@@ -170,7 +194,7 @@
 use abi::ProcessState;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 9;
 pub const INVALID: u32 = 500;
 pub const PERMISSION: u32 = 501;
 pub const FULL: u32 = 502;
@@ -185,6 +209,8 @@ pub const AGAIN: u32 = 506;
 pub const ACCESS: u32 = 507;
 /// ENOENT: no program of that name.
 pub const NOT_FOUND: u32 = 508;
+/// A terminal stop was refused for an orphaned group.
+pub const ORPHAN: u32 = 509;
 
 /// The flags of Spawn: those of posix_spawnattr_setflags (Linux values).
 pub const SPAWN_SETPGROUP: u32 = 0x02;
@@ -417,6 +443,25 @@ pub enum Method {
     ForkStart = 34,
     ForkCommit = 35,
     ForkAbort = 36,
+    TtySignal = 37,
+    SetCtty = 38,
+    DropCtty = 39,
+    TtyEvents = 40,
+    AckCtty = 41,
+    LoaderTerminal = 43,
+    /// Empty body and no handles, through an active loader session before Ready.
+    /// Reply: status and the trusted Clock endpoint with SEND|TRANSFER.
+    LoaderClock = 45,
+    /// Generate a directed job signal and return its epoch ticket.
+    SignalGeneration = 48,
+    /// Apply a delivered default stop with its epoch ticket.
+    StopSelf = 49,
+    /// Trusted terminal request: detach one PID, including a leader.
+    DetachCtty = 50,
+    /// Return a claimed process-origin signal; ordinary numbers require ticket 0.
+    ReturnSignal = 51,
+    /// Exact terminal/SID/link generation, followed by whether CLOCAL is clear.
+    DisconnectCtty = 52,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -428,7 +473,7 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33, 34, 35, 36,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -445,6 +490,41 @@ pub const fn is_notary(label: u64) -> bool {
 /// set-ID (SetId): bit 61 with NOTARY, which init gives only to the file
 /// services its table names.
 pub const SET_ID: u64 = 1 << 61;
+
+/// The mark of the notary session of the terminal service: bit 60 with
+/// NOTARY, which init gives only to the terminal services its table names
+/// (TtySignal, SetCtty, DropCtty).
+pub const TERMINAL: u64 = 1 << 60;
+
+/// Whether `label` is that of the terminal service's notary session.
+pub const fn is_terminal(label: u64) -> bool {
+    is_notary(label) && label & TERMINAL != 0
+}
+
+/// The terminals of the terminal service: the console and 8
+/// pseudo-terminals.
+pub const TERMINALS: usize = 9;
+/// Pending departures per terminal, including the active link's reserve.
+pub const CTTY_EVENTS: usize = 8;
+
+/// The offset of the group and session words in the page of the
+/// generations.
+pub const GROUPS_AT: usize = RECORDS * 8;
+
+/// The word of a record's group `pgid` and session `sid`.
+pub const fn groups_word(pgid: u32, sid: u32) -> u64 {
+    (pgid as u64) << 32 | sid as u64
+}
+
+/// The group and session of a word of the second half of the page; None
+/// for a cleared word.
+pub const fn groups_of(word: u64) -> Option<(u32, u32)> {
+    if word == 0 {
+        None
+    } else {
+        Some(((word >> 32) as u32, word as u32))
+    }
+}
 
 /// Whether `label` is that of a notary session that may send SetId.
 pub const fn may_set_id(label: u64) -> bool {
@@ -533,13 +613,18 @@ pub const GENERATIONS_SIZE: usize = RECORDS * 8;
 /// The reply to Vouch: status u32 (0), the record's PID u32, the six
 /// credentials u32, the generation of the credentials u64, then 1 u32
 /// for the identity of a loader (0 for a process's), the image u32 and the
-/// ticket of the loader's place u64 (zeros for a process): 56 bytes.
+/// ticket of the loader's place u64 (zeros for a process), the record's
+/// index u32 and a zero u32, then the terminal u32 and its generation u64
+/// (u32::MAX and 0 for no attachment): 76 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WhoReply {
     pub pid: u32,
     pub credentials: Credentials,
     pub generation: u64,
     pub loader: Option<LoaderOf>,
+    pub index: u32,
+    /// Controlling terminal attachment; invalidated by its exact departure.
+    pub ctty: Option<(u32, u64)>,
 }
 
 /// What Vouch says of a loader's identity: the image of the record it
@@ -561,7 +646,12 @@ impl WhoReply {
         let (mark, image, ticket) = self.loader.map_or((0, 0, 0), |l| (1, l.image, l.ticket));
         w.u32(mark)?;
         w.u32(image)?;
-        w.u64(ticket)
+        w.u64(ticket)?;
+        w.u32(self.index)?;
+        w.u32(0)?;
+        let (terminal, generation) = self.ctty.unwrap_or((u32::MAX, 0));
+        w.u32(terminal)?;
+        w.u64(generation)
     }
 
     /// BAD_SIZE out of the layout, for a PID of 0 or past the signed range,
@@ -578,8 +668,20 @@ impl WhoReply {
         }
         let generation = r.u64()?;
         let (mark, image, ticket) = (r.u32()?, r.u32()?, r.u64()?);
+        let (index, zero) = (r.u32()?, r.u32()?);
+        let (terminal, ctty_generation) = (r.u32()?, r.u64()?);
+        let ctty = match (terminal, ctty_generation) {
+            (u32::MAX, 0) => None,
+            (t, g) if (t as usize) < TERMINALS && g != 0 => Some((t, g)),
+            _ => return Err(Status::BadSize),
+        };
         r.finish()?;
-        if pid == 0 || pid > i32::MAX as u32 || words.contains(&u32::MAX) {
+        if pid == 0
+            || pid > i32::MAX as u32
+            || words.contains(&u32::MAX)
+            || index as usize >= RECORDS
+            || zero != 0
+        {
             return Err(Status::BadSize);
         }
         let loader = match (mark, image, ticket) {
@@ -592,6 +694,8 @@ impl WhoReply {
             credentials: Credentials::from_words(words),
             generation,
             loader,
+            index,
+            ctty,
         })
     }
 }
@@ -665,11 +769,13 @@ impl WaitStart {
     }
 }
 
-/// What a wait found: a child that exited or died by a signal, none yet
-/// (WNOHANG), or no child of the selector at all (ECHILD).
+/// What a wait found: the latest child exit, stop or continuation, none
+/// yet (WNOHANG), or no child of the selector at all (ECHILD).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitResult {
     Ended { pid: u32, end: End, uid: u32 },
+    Stopped { pid: u32, signal: u8, uid: u32 },
+    Continued { pid: u32, uid: u32 },
     Nothing,
     NoChild,
 }
@@ -689,6 +795,8 @@ impl WaitResult {
                 end: End::Signaled(n),
                 uid,
             } => (pid, 2, n, uid),
+            WaitResult::Stopped { pid, signal, uid } => (pid, 4, signal, uid),
+            WaitResult::Continued { pid, uid } => (pid, 5, SIGCONT, uid),
             WaitResult::Nothing => (0, 0, 0, 0),
             WaitResult::NoChild => (0, 3, 0, 0),
         };
@@ -714,6 +822,14 @@ impl WaitResult {
                 end: End::Signaled(value),
                 uid,
             }),
+            (4, p) if p != 0 && matches!(value, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU) => {
+                Ok(WaitResult::Stopped {
+                    pid,
+                    signal: value,
+                    uid,
+                })
+            }
+            (5, p) if p != 0 && value == SIGCONT => Ok(WaitResult::Continued { pid, uid }),
             (0, 0) => Ok(WaitResult::Nothing),
             (3, 0) => Ok(WaitResult::NoChild),
             _ => Err(Status::BadSize),
@@ -722,9 +838,11 @@ impl WaitResult {
 }
 
 /// Where the page of its record lies in a POSIX process.
+pub mod job;
+
 pub const PAGE_ADDRESS: usize = 0x0D00_0000;
 /// The version of the page's layout.
-pub const PAGE_VERSION: u32 = 1;
+pub const PAGE_VERSION: u32 = 2;
 
 /// The page of a record (spec 2, 3.1, 3.3), one page in the process at
 /// PAGE_ADDRESS and in the service. The service writes the identity and
@@ -751,7 +869,9 @@ pub struct Page {
     /// the thread whose posix_spawn made it ([P24-SPAWN]); the service
     /// writes it, and `ignored` too, before the process runs.
     pub start_mask: AtomicU64,
-    _reserved: [u64; 2],
+    /// Epoch and pending bits for maskable job stops and SIGCONT.
+    pub stop_word: AtomicU64,
+    pub cont_word: AtomicU64,
     /// The information of the first sending of each pending signal.
     pub info: [PageInfo; 64],
 }
@@ -777,8 +897,12 @@ const _: () = assert!(core::mem::size_of::<Page>() <= 4096);
 
 /// si_code of a signal kill sent, and of SIGCHLD.
 pub const SI_USER: i32 = 0;
+/// The code of a signal of the terminal (INTR, QUIT, SUSP): Linux's SI_KERNEL.
+pub const SI_KERNEL: i32 = 0x80;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
+pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
 
 /// The body of SpawnStart: the spawn-flags u32 (SPAWN_FLAGS), the
 /// process group u32, the caller's level u32, at which the loader runs,
@@ -1073,11 +1197,23 @@ mod tests {
             Method::ForkStart,
             Method::ForkCommit,
             Method::ForkAbort,
+            Method::TtySignal,
+            Method::SetCtty,
+            Method::DropCtty,
+            Method::TtyEvents,
+            Method::AckCtty,
+            Method::LoaderTerminal,
+            Method::LoaderClock,
+            Method::SignalGeneration,
+            Method::StopSelf,
+            Method::DetachCtty,
+            Method::ReturnSignal,
+            Method::DisconnectCtty,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
             assert_eq!(*m as u16, METHODS[i]);
-            assert_eq!(m.header().version, 6);
+            assert_eq!(m.header().version, VERSION);
         }
         for i in 1..=4 {
             assert_eq!(Change::from_number(i).unwrap() as u32, i);
@@ -1163,15 +1299,20 @@ mod tests {
             credentials: Credentials::NOBODY,
             generation: 1 << 40 | 7,
             loader: None,
+            index: 44,
+            ctty: Some((0, 5)),
         };
         let mut w = Writer::new();
         reply.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 56);
+        assert_eq!(w.as_bytes().len(), 76);
         assert_eq!(WhoReply::read(w.as_bytes()), Ok(reply));
         let mut bytes = w.as_bytes().to_vec();
         bytes[4..8].fill(0);
         assert_eq!(WhoReply::read(&bytes), Err(Status::BadSize), "pid 0");
-        assert_eq!(WhoReply::read(&w.as_bytes()[..55]), Err(Status::BadSize));
+        assert_eq!(WhoReply::read(&w.as_bytes()[..63]), Err(Status::BadSize));
+        bytes = w.as_bytes().to_vec();
+        bytes[56..60].copy_from_slice(&(RECORDS as u32).to_le_bytes());
+        assert_eq!(WhoReply::read(&bytes), Err(Status::BadSize), "index");
         let loader = WhoReply {
             loader: Some(LoaderOf {
                 image: 1,
@@ -1186,6 +1327,12 @@ mod tests {
         bytes[40] = 2;
         assert_eq!(WhoReply::read(&bytes), Err(Status::BadSize), "mark 2");
         assert_eq!(GENERATIONS_SIZE, 2048);
+        assert_eq!(GROUPS_AT + RECORDS * 8, 4096, "both halves in a page");
+        assert_eq!(groups_of(groups_word(300, 257)), Some((300, 257)));
+        assert_eq!(groups_of(0), None);
+        assert!(is_terminal(NOTARY | TERMINAL));
+        assert!(!is_terminal(NOTARY));
+        assert!(!is_terminal(1 << 63 | NOTARY | TERMINAL));
     }
 
     #[test]

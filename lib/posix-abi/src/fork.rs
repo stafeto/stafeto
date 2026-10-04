@@ -31,6 +31,13 @@ use proto_wire::{Status, Writer};
 use rt::abi::{Access, Rights};
 use rt::handle::{Channel, Handle, Memory, Outgoing};
 
+static PROBE_LOADING_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The child whose loader is at an explicitly installed fork window.
+pub fn probe_loading_pid() -> u32 {
+    PROBE_LOADING_PID.load(Ordering::Acquire)
+}
+
 /// The registers of the callee the calling thread had at `point`: x19 to
 /// x30, the stack pointer, d8 to d15, FPCR, FPSR and TPIDR_EL0.
 #[repr(C)]
@@ -162,7 +169,7 @@ struct Work {
 }
 
 /// The values of the sessions a fork gives the child's loader (Handles),
-/// by proto_loader::Slot: Files, Clock, Uart, Pipes and Entropy; 0 for
+/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal and Entropy; 0 for
 /// none.
 #[derive(Clone, Copy, Default)]
 pub struct Sessions {
@@ -170,14 +177,45 @@ pub struct Sessions {
     pub clock: u64,
     pub uart: u64,
     pub pipes: u64,
+    pub terminal: u64,
     pub entropy: u64,
 }
 
 impl Sessions {
+    /// Declare the original session snapshot before any transfer probe can
+    /// remove an offered handle. A bound layer also needs Files and Clock.
+    fn required_mask(self) -> u32 {
+        use proto_loader::Slot;
+        let mut mask = 0;
+        for (slot, raw) in [
+            (Slot::Files, self.files),
+            (Slot::Clock, self.clock),
+            (Slot::Driver, self.uart),
+            (Slot::Pipes, self.pipes),
+            (Slot::Terminal, self.terminal),
+            (Slot::Entropy, self.entropy),
+        ] {
+            if raw != 0 {
+                mask |= slot.bit();
+            }
+        }
+        if self.files != 0 || self.clock != 0 {
+            mask |= Slot::Files.bit() | Slot::Clock.bit();
+        }
+        mask
+    }
+
     /// The parent's own sessions go: those of a fork that never came to
     /// its loader.
     fn close(self) {
-        for raw in [self.files, self.clock, self.uart, self.pipes, self.entropy] {
+        for raw in [
+            self.files,
+            self.clock,
+            self.uart,
+            self.pipes,
+            self.terminal,
+            self.entropy,
+        ] {
             if raw != 0 {
                 drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
             }
@@ -228,37 +266,16 @@ pub fn copy(window: Option<fn()>, sessions: Sessions) -> Result<Forked, i32> {
 /// entropy service's in a second.
 fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
     use proto_loader::Slot;
-    give_slots(
-        c,
-        &[
-            (Slot::Files, sessions.files),
-            (Slot::Clock, sessions.clock),
-            (Slot::Uart, sessions.uart),
-            (Slot::Pipes, sessions.pipes),
-        ],
-    )
-    .and(give_slots(c, &[(Slot::Entropy, sessions.entropy)]))
-}
-
-/// One Handles of the sessions `slots` (four at most) that are there.
-pub(crate) fn give_slots(
-    c: &Handle<Channel>,
-    slots: &[(proto_loader::Slot, u64)],
-) -> Result<(), i32> {
-    let mut w = Writer::new();
-    Method::Handles.header().write(&mut w).map_err(|_| EIO)?;
-    let mut handles = Outgoing::new();
-    for &(slot, raw) in slots {
-        if raw != 0 {
-            let session = Handle::<Channel>::from_raw(rt::abi::Handle(raw));
-            w.u32(slot as u32).map_err(|_| EIO)?;
-            handles.push(session.erase()).map_err(|_| EIO)?;
-        }
-    }
-    if handles.is_empty() {
-        return Ok(());
-    }
-    match ask_loader(c, &w, Some(handles)) {
+    let session = |raw: u64| (raw != 0).then(|| Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
+    let given = [
+        (Slot::Files, session(sessions.files)),
+        (Slot::Clock, session(sessions.clock)),
+        (Slot::Driver, session(sessions.uart)),
+        (Slot::Pipes, session(sessions.pipes)),
+        (Slot::Terminal, session(sessions.terminal)),
+        (Slot::Entropy, session(sessions.entropy)),
+    ];
+    match crate::process::give_sessions(c, given) {
         0 => Ok(()),
         _ => Err(EIO),
     }
@@ -370,6 +387,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
             });
         }
     };
+    PROBE_LOADING_PID.store(pid, Ordering::Release);
     let made = make(&c, regions, sessions, window);
     let method = match made {
         Ok(()) => proto_process::Method::ForkCommit,
@@ -395,6 +413,7 @@ fn make(
         sp,
         transfer: TRANSFER.0.get() as u64,
         regions: regions.count as u32,
+        required_mask: sessions.required_mask(),
     };
     let mut w = Writer::new();
     Method::Fork.header().write(&mut w).map_err(|_| EIO)?;
@@ -612,6 +631,13 @@ fn sessions() -> Result<Sessions, i32> {
             let clone = pipes_clone(pipes, &ends[..count])?;
             out.pipes = clone.into_raw().0;
         }
+        if let Some(terminal) = crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))?
+        {
+            let count = crate::shared::terminals_kept_by_fork(&mut ends)?;
+            out.terminal = crate::terminal::clone_kept(terminal, Some(&ends[..count]))?
+                .into_raw()
+                .0;
+        }
         if let Some(clone) = entropy_clone() {
             out.entropy = clone.into_raw().0;
         }
@@ -721,7 +747,12 @@ fn child() -> Result<(), &'static str> {
         posix_sync::after_fork();
         crate::process::after_fork(posix, handle(raw(Slot::PosixId))).map_err(|_| "its record")?;
         if let Some(files) = handle(raw(Slot::Files)) {
-            crate::shared::after_fork(files, handle(raw(Slot::Uart)), handle(raw(Slot::Pipes)));
+            crate::shared::after_fork(
+                files,
+                handle(raw(Slot::Driver)),
+                handle(raw(Slot::Pipes)),
+                handle(raw(Slot::Terminal)),
+            );
         }
         crate::clock::after_fork(handle(raw(Slot::Clock)), crate::allocation::process())
             .map_err(|_| "its clock")?;

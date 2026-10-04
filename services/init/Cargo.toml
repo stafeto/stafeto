@@ -37,6 +37,9 @@ table-relibc = []
 table-relibc-threads = []
 # The probe of POSIX processes (posix-procs) and the records it spawns.
 table-posix-procs = []
+table-loader-channels = []
+table-posix-poll = []
+table-posix-pty = []
 # The probe of the longest step of the process service (posix-procs in the
 # steps mode, xtask process-steps).
 table-posix-steps = []
@@ -45,6 +48,13 @@ table-busybox = []
 table-busybox-dialog = []
 table-posix-dialog = []
 table-posix-dialog-vz = []
+# The probe of the terminal service (xtask tty, tty-vz).
+table-tty = []
+table-tty-vz = []
+table-tty-steps = []
+# The probe of the terminal in C (xtask posix-tty, posix-tty-vz).
+table-posix-tty = []
+table-posix-tty-vz = []
 # The probes of the entropy device's driver (xtask entropy, entropy-vz).
 table-entropy = []
 table-entropy-vz = []

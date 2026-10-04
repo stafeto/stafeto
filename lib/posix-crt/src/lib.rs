@@ -124,8 +124,16 @@ pub unsafe fn posix_init_process(
     unsafe { posix_abi::process::init(session) }.map_err(|_| "process registration failed")?;
     // SAFETY: as above.
     unsafe { posix_abi::clock::init(parent) }.map_err(|_| "clock connection failed")?;
+    // The console's input through the terminal service when init's table
+    // gives the program one (5f), through the console's driver otherwise.
     #[cfg(feature = "uart-input")]
-    let files = PosixFs::connect_with_uart(parent);
+    let files = match rt::service::connect(parent, "tty") {
+        Ok(terminal) => PosixFs::connect(parent).map(|mut fs| {
+            fs.set_terminal(Some(terminal));
+            fs
+        }),
+        Err(_) => PosixFs::connect_with_uart(parent),
+    };
     #[cfg(not(feature = "uart-input"))]
     let files = PosixFs::connect(parent);
     let files = files.map_err(|_| "file connection failed")?;
@@ -210,7 +218,9 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             Names::Error => Target::Error,
             Names::File(n) => Target::Ram(n),
             Names::Pipe(n) => Target::Pipe(n),
+            Names::Terminal(n) => Target::Tty(n),
             Names::Random(n) => Target::Random(n),
+            Names::PendingTerminal(_) => continue,
         };
         *place = Inherited { fd: d.fd, target };
     }
@@ -297,7 +307,7 @@ fn loaded_main() -> u64 {
                     .map_err(|_| "clock session failed")
             })
             .and_then(|()| {
-                let uart = one(Slot::Uart).map(Handle::from_raw);
+                let uart = one(Slot::Driver).map(Handle::from_raw);
                 let inherited = inherited(&area);
                 let count = area.descriptor_count as usize;
                 let secure = area.flags & SECURE != 0;
@@ -310,6 +320,7 @@ fn loaded_main() -> u64 {
                 )
                 .map(|mut fs| {
                     fs.set_pipes(one(Slot::Pipes).map(Handle::from_raw));
+                    fs.set_terminal(one(Slot::Terminal).map(Handle::from_raw));
                     fs
                 })
                 .map_err(|_| "files failed")

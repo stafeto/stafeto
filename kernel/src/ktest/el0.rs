@@ -97,6 +97,8 @@ unsafe extern "C" {
     static el0_long_calls: u8;
     static el0_receive_then_count: u8;
     static el0_pend: u8;
+    static el0_suspend_send: u8;
+    static el0_continue_crowd: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -117,6 +119,8 @@ const SVC_SLOW: u16 = 0xFF03;
 const SVC_RELEASE: u16 = 0xFF04;
 const SVC_PENDING: u16 = 0xFF05;
 const SVC_PEND: u16 = 0xFF06;
+const SVC_SUSPEND_SEND: u16 = 0xFF07;
+const SVC_CONTINUE_CROWD: u16 = 0xFF08;
 
 const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_PEND <= *abi::TEST_CALLS.end());
 
@@ -197,6 +201,16 @@ struct El0Test {
 }
 
 const EL0_TESTS: &[El0Test] = &[
+    El0Test {
+        name: "suspended_fast_receiver_stays_before_el0",
+        start: start_suspended_fast_receiver,
+        done: done_suspended_fast_receiver,
+    },
+    El0Test {
+        name: "suspended_128_threads_enter_only_after_continue",
+        start: start_suspended_el0_crowd,
+        done: done_suspended_el0_crowd,
+    },
     El0Test {
         name: "el0_reads_the_virtual_counter",
         start: start_counter,
@@ -851,6 +865,32 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
         SVC_SLOW => FAST_PATH_OFF.store(true, Relaxed),
         SVC_RELEASE => release_crowd(thread),
         SVC_PEND => pend(thread),
+        SVC_SUSPEND_SEND => {
+            let p = FIXTURE.lock().processes[0].expect("the receiving process");
+            process::control(p, true, PRIORITY).expect("the receiver suspends");
+            syscall::dispatch(thread, Call::Send.number());
+            return true;
+        }
+        SVC_CONTINUE_CROWD => {
+            let result = {
+                let f = FIXTURE.lock();
+                check(
+                    f.crowd
+                        .iter()
+                        .flatten()
+                        // SAFETY: The locked fixture retains every crowd thread reference.
+                        .all(|t| unsafe { t.as_ref().sched.state() == State::Parked }),
+                    "a crowd thread entered EL0 before continuation",
+                )
+                .and_then(|()| {
+                    process::control(f.processes[1].unwrap(), false, CAUSE)
+                        .map_err(|_| "crowd continue failed")
+                })
+            };
+            if result.is_err() {
+                end(result);
+            }
+        }
         SVC_PENDING => {
             // The timer fires at once, and its interrupt is pending when
             // send looks.
@@ -4381,4 +4421,82 @@ fn done_interrupt_path(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "the driver did not take the interrupt's notification",
     )?;
     check(portion > 0, "the binding's portion was not measured")
+}
+
+/// A waiting receiver is stopped immediately before the sender takes its
+/// fast path. The lower judge must see it parked before it enters EL0.
+fn start_suspended_fast_receiver(f: &mut Fixture) -> Result<(), &'static str> {
+    let receiver = spawn(f, 0, &raw const el0_serve, 0)?;
+    let p = f.processes[0].unwrap();
+    let ch = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let rh = process::insert_handle(p, Object::Channel(ch), Rights::RECEIVE)
+        .map_err(|_| "no receiving handle")?;
+    let sender = spawn(f, 1, &raw const el0_suspend_send, 0)?;
+    let sh = process::insert_handle(f.processes[1].unwrap(), Object::Channel(ch), Rights::SEND)
+        .map_err(|_| "no sending handle")?;
+    // SAFETY: Both installed handles retain the channel after its creation reference goes.
+    unsafe {
+        channel::release(ch, Rights::NONE, CAUSE);
+    }
+    let judge = spawn(f, 2, &raw const el0_done_at_once, 0)?;
+    sched::set_priority(receiver, 20, Policy::Fifo).map_err(|_| "receiver priority failed")?;
+    sched::set_priority(judge, 1, Policy::Fifo).map_err(|_| "judge priority failed")?;
+    // SAFETY: The fixture retains both threads, which have not entered EL0 yet.
+    unsafe {
+        (*receiver.as_ptr()).regs.x[0] = rh.0;
+        (*receiver.as_ptr()).regs.x[1] = 0;
+        (*sender.as_ptr()).regs.x[0] = sh.0;
+        (*sender.as_ptr()).regs.x[1] = 0;
+    }
+    Ok(())
+}
+
+fn done_suspended_fast_receiver(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        2 => {
+            check(
+                slot_thread(f, 0).sched.state() == State::Parked
+                    && FAST_PATH_HITS.load(Relaxed) == 1,
+                "the fast send bypassed process suspension",
+            )?;
+            process::control(f.processes[0].unwrap(), false, CAUSE)
+                .map_err(|_| "receiver continue failed")
+        }
+        _ => check(
+            f.passed[2] && t.regs.x[0] == 0,
+            "a sender or receiver ran before the suspension judge",
+        ),
+    }
+}
+
+fn start_suspended_el0_crowd(f: &mut Fixture) -> Result<(), &'static str> {
+    let controller = spawn(f, 0, &raw const el0_continue_crowd, 0)?;
+    sched::set_priority(controller, 1, Policy::Fifo).map_err(|_| "controller priority failed")?;
+    let p = new_process(f, 1)?;
+    process::control(p, true, CAUSE).map_err(|_| "crowd stop failed")?;
+    for i in 0..MAX_THREADS as usize {
+        let t = thread::create(
+            p,
+            user_address(&raw const el0_thread_exit),
+            DATA_VA,
+            0,
+            (i % 62 + 2) as u8,
+            Policy::Fifo,
+        )
+        .map_err(|_| "no crowd thread")?;
+        f.crowd[i] = Some(t);
+        thread::start(t).map_err(|_| "crowd start failed")?;
+    }
+    Ok(())
+}
+
+fn done_suspended_el0_crowd(f: &Fixture, _: &Thread) -> Result<(), &'static str> {
+    check(
+        f.crowd
+            .iter()
+            .flatten()
+            // SAFETY: The fixture retains every crowd thread until teardown.
+            .all(|t| unsafe { t.as_ref().sched.state() == State::Dead }),
+        "a crowd thread failed to resume at EL0",
+    )
 }

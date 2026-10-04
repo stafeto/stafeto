@@ -150,6 +150,36 @@ pub enum ConversionError {
     Overflow,
 }
 
+/// Linux AArch64 poll descriptor, copied before a wait begins.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// Linux AArch64 fd_set: 1024 bits in sixteen native words.
+pub type FdSet = [u64; 16];
+pub const FD_SETSIZE: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct Timeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<PollFd>() == 8);
+    assert!(core::mem::offset_of!(PollFd, events) == 4);
+    assert!(core::mem::offset_of!(PollFd, revents) == 6);
+    assert!(core::mem::size_of::<FdSet>() == 128);
+    assert!(core::mem::align_of::<FdSet>() == 8);
+    assert!(core::mem::size_of::<Timeval>() == 16);
+    assert!(core::mem::offset_of!(Timeval, tv_usec) == 8);
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct Timespec {

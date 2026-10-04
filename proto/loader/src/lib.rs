@@ -18,13 +18,20 @@
 //!   stack and start area, all paid by the new process; reply 0 for "the
 //!   image is ready", or one of the codes below.
 //! - Handles: body the slot of each handle u32 (`Slot::Files`, `Clock`,
-//!   `Uart`, `Pipes`, `Entropy`, each once) and as many handles, sessions
-//!   with SEND, after "the image is ready" (after Fork for a copy); reply
-//!   its status. Four sessions take all abi::MESSAGE_HANDLES of one
-//!   message: the fifth, Entropy, comes in a second Handles.
+//!   `Driver`, `Pipes`, `Terminal`, `Entropy`, each once over all Handles) and as many
+//!   handles, sessions with SEND, before Go for spawn and after Go for
+//!   exec or fork; reply its status. One message takes abi::MESSAGE_HANDLES
+//!   handles at most: additional sessions go in a second Handles.
+//! - HandlesDone: empty body and no handles, once after all Handles,
+//!   including an empty bundle. It checks every required slot before
+//!   Commit. Later Handles or HandlesDone are refused. Early Handles
+//!   require HandlesDone before Go. The process service hears Ready once
+//!   both Go and HandlesDone succeeded, before the parent's final reply.
 //! - Fork, in place of Start (spec 2, 3.2; 5d): body `Fork`, the copy of
 //!   the parent's memory the loader makes for a `fork`; reply its status,
-//!   BAD_SIZE past REGIONS_MAX regions or a second Fork or Start.
+//!   required_mask declares the original layer's session slots before Go
+//!   or HandlesDone. BAD_SIZE for a bit outside Slot::GIVEN, past
+//!   REGIONS_MAX regions or a second Fork or Start.
 //! - Regions, after Fork: body an entry (`Region`, REGION bytes) for each
 //!   of its handles, one to four memory objects of the parent's memory map
 //!   with MAP_READ, each at least the entry's pages long; the loader takes
@@ -60,7 +67,7 @@
 use core::ops::Range;
 use proto_wire::{Header, Reader, Status};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 5;
 
 /// The region of the loader: 16 MiB under the top of a process's lower
 /// half (spec 2, 3.2), which no program's segment may take.
@@ -105,10 +112,17 @@ pub enum Names {
     /// service the child gets, which holds it (5e). The loader takes the
     /// kind only with a session in the slot Pipes.
     Pipe(u32),
+    /// The terminal of this number of the terminal service, which the
+    /// child's session in the slot Terminal serves (5f); the loader takes
+    /// the kind only with that session.
+    Terminal(u32),
     /// The open description of this number of a random device (5e'), in
     /// the same session of the RAM file service as `File`; the child's
     /// layer serves its reads from its own generator.
     Random(u32),
+    /// A terminal action's temporary token; the loader replaces every
+    /// alias before writing the start area. Never a service description.
+    PendingTerminal(u32),
 }
 
 /// A descriptor the child starts with.
@@ -126,7 +140,9 @@ impl Descriptor {
             Names::Error => (2, 0),
             Names::File(n) => (3, n),
             Names::Pipe(n) => (4, n),
-            Names::Random(n) => (5, n),
+            Names::Terminal(n) => (5, n),
+            Names::Random(n) => (6, n),
+            Names::PendingTerminal(n) => (7, n),
         };
         let mut out = [0; DESCRIPTOR];
         out[..4].copy_from_slice(&self.fd.to_le_bytes());
@@ -146,7 +162,9 @@ impl Descriptor {
             (2, 0) => Names::Error,
             (3, n) => Names::File(n),
             (4, n) => Names::Pipe(n),
-            (5, n) => Names::Random(n),
+            (5, n) => Names::Terminal(n),
+            (6, n) => Names::Random(n),
+            (7, n) if (n as usize) < TERMINAL_OPENS => Names::PendingTerminal(n),
             _ => return None,
         };
         ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
@@ -176,6 +194,8 @@ pub enum Method {
     Handles = 3,
     Fork = 4,
     Regions = 5,
+    TerminalActions = 6,
+    HandlesDone = 7,
 }
 
 impl Method {
@@ -193,6 +213,8 @@ impl Method {
             3 => Some(Method::Handles),
             4 => Some(Method::Fork),
             5 => Some(Method::Regions),
+            6 => Some(Method::TerminalActions),
+            7 => Some(Method::HandlesDone),
             _ => None,
         }
     }
@@ -213,11 +235,97 @@ pub const NAME_TOO_LONG: u32 = 605;
 pub const PERMISSION: u32 = 606;
 pub const IO: u32 = 607;
 pub const NOT_DIRECTORY: u32 = 608;
+pub const NO_CONTROLLING: u32 = 609;
+
+/// Terminal effects run in order through the child's verified session.
+pub const TERMINAL_OPENS: usize = 32;
+pub const TERMINAL_ACTIONS: usize = 64;
+pub const TERMINAL_PACKET: usize = 32;
+pub const TERMINAL_CLOSE: u32 = 4;
+/// Access mode, O_NONBLOCK and O_NOCTTY (the layer's Linux ABI values).
+pub const TERMINAL_FLAGS: u32 = 3 | 0o4000 | 0o400;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalAction {
+    pub token: u32,
+    /// 0 console, 1 controlling, 2 master, 3 slave, 4 close.
+    pub kind: u32,
+    pub number: u32,
+    pub flags: u32,
+}
+
+impl TerminalAction {
+    pub fn write(self, w: &mut proto_wire::Writer) -> Result<(), Status> {
+        w.u32(self.token)?;
+        w.u32(self.kind)?;
+        w.u32(self.number)?;
+        w.u32(self.flags)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
+        let action = Self {
+            token: r.u32()?,
+            kind: r.u32()?,
+            number: r.u32()?,
+            flags: r.u32()?,
+        };
+        if action.token as usize >= TERMINAL_OPENS
+            || action.kind > TERMINAL_CLOSE
+            || action.flags & !TERMINAL_FLAGS != 0
+            || action.flags & 3 == 3
+            || (action.kind != 3 && action.number != 0)
+            || (action.kind == TERMINAL_CLOSE && action.flags != 0)
+        {
+            return Err(Status::BadSize);
+        }
+        Ok(action)
+    }
+}
+
+/// Validation of the complete packet precedes its first effect. Tokens
+/// cannot be reused, including after Close or in a later packet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalPlan {
+    opened: u32,
+    live: u32,
+    count: usize,
+}
+
+impl TerminalPlan {
+    pub fn validate(&self, actions: &[TerminalAction], exported: u32) -> Result<Self, Status> {
+        if actions.is_empty()
+            || actions.len() > TERMINAL_PACKET
+            || self.count + actions.len() > TERMINAL_ACTIONS
+        {
+            return Err(Status::BadSize);
+        }
+        let mut next = *self;
+        for &action in actions {
+            // The same checks protect callers building actions directly.
+            let mut w = proto_wire::Writer::new();
+            action.write(&mut w)?;
+            TerminalAction::read(&mut Reader::new(w.as_bytes()))?;
+            let bit = 1 << action.token;
+            if action.kind == TERMINAL_CLOSE {
+                if next.live & bit == 0 || exported & bit != 0 {
+                    return Err(Status::BadSize);
+                }
+                next.live &= !bit;
+            } else {
+                if next.opened & bit != 0 {
+                    return Err(Status::BadSize);
+                }
+                next.opened |= bit;
+                next.live |= bit;
+            }
+            next.count += 1;
+        }
+        Ok(next)
+    }
+}
 
 /// The handles of the start area, by their place in `Start::handles`; the
-/// sessions the parent gives with Handles are Files, Clock, Uart, Pipes
-/// (5e) and Entropy (5e'). Place 9 is kept for the terminal's session of
-/// step 5e and stays 0 here.
+/// sessions the parent gives with Handles are Files, Clock, Driver (the
+/// console's driver), Pipes (5e) Terminal (the terminal service, 5f), and Entropy (5e').
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Slot {
@@ -227,9 +335,10 @@ pub enum Slot {
     PosixId = 3,
     Files = 4,
     Clock = 5,
-    Uart = 6,
+    Driver = 6,
     Console = 7,
     Pipes = 8,
+    Terminal = 9,
     Entropy = 10,
 }
 
@@ -237,14 +346,41 @@ pub enum Slot {
 pub const SLOTS: usize = 11;
 
 impl Slot {
-    /// The slot of a handle Handles brings: Files, Clock, Uart, Pipes or
-    /// Entropy.
+    /// The sessions Handles brings, in their order.
+    pub const GIVEN: [Slot; 6] = [
+        Slot::Files,
+        Slot::Clock,
+        Slot::Driver,
+        Slot::Pipes,
+        Slot::Terminal,
+        Slot::Entropy,
+    ];
+
+    /// The bit of this slot in Fork's required session mask.
+    pub const fn bit(self) -> u32 {
+        1 << self as u32
+    }
+
+    /// Every session slot a parent may declare required for a fork.
+    pub const GIVEN_MASK: u32 = {
+        let mut mask = 0;
+        let mut i = 0;
+        while i < Self::GIVEN.len() {
+            mask |= Self::GIVEN[i].bit();
+            i += 1;
+        }
+        mask
+    };
+
+    /// The slot of a handle Handles brings: Files, Clock, Driver, Pipes or
+    /// Terminal or Entropy.
     pub const fn given(n: u32) -> Option<Slot> {
         match n {
             4 => Some(Slot::Files),
             5 => Some(Slot::Clock),
-            6 => Some(Slot::Uart),
+            6 => Some(Slot::Driver),
             8 => Some(Slot::Pipes),
+            9 => Some(Slot::Terminal),
             10 => Some(Slot::Entropy),
             _ => None,
         }
@@ -284,7 +420,7 @@ pub enum BlockError {
 }
 
 const MAGIC: [u8; 8] = *b"STAFSPWN";
-const BLOCK_VERSION: u32 = 1;
+const BLOCK_VERSION: u32 = 2;
 
 /// The bytes of `argv` and `envp` as {ARG_MAX} counts them: their
 /// strings with the NULs and a pointer for each and for the two NULLs.
@@ -320,11 +456,24 @@ impl<'a> Block<'a> {
     }
 
     /// The descriptors the child starts with.
-    /// Whether a descriptor names the end of a pipe, which only a session
-    /// of the pipe service holds (the loader needs one in the slot Pipes).
-    pub fn names_pipes(&self) -> bool {
-        self.descriptors()
-            .any(|d| matches!(d.names, Names::Pipe(_)))
+    /// Whether the block's descriptors need a session in `slot` to mean
+    /// anything: a RAM file needs Files, a pipe needs Pipes (5e), and a
+    /// terminal needs Terminal (5f). A random device needs Files for its
+    /// description and Entropy for reads. HandlesDone answers BAD_SIZE for a
+    /// required slot left empty.
+    pub fn needs(&self, slot: Slot) -> bool {
+        self.descriptors().any(|d| {
+            matches!(
+                (slot, d.names),
+                (Slot::Files, Names::File(_) | Names::Random(_))
+                    | (Slot::Entropy, Names::Random(_))
+                    | (Slot::Pipes, Names::Pipe(_))
+                    | (
+                        Slot::Terminal,
+                        Names::Terminal(_) | Names::PendingTerminal(_)
+                    )
+            )
+        })
     }
 
     pub fn descriptors(&self) -> impl Iterator<Item = Descriptor> + 'a {
@@ -333,6 +482,40 @@ impl<'a> Block<'a> {
             .0
             .iter()
             .filter_map(|chunk| Descriptor::read(chunk))
+    }
+
+    pub fn pending_terminals(&self) -> u32 {
+        self.descriptors().fold(0, |mask, d| match d.names {
+            Names::PendingTerminal(token) => mask | 1 << token,
+            _ => mask,
+        })
+    }
+
+    /// Replace all aliases in a validated private staging copy.
+    pub fn replace_terminal(
+        bytes: &mut [u8],
+        token: u32,
+        description: u32,
+    ) -> Result<(), BlockError> {
+        let (at, count) = {
+            let block = Block::read(bytes)?;
+            (
+                HEADER + block.path.len() + block.cwd.len(),
+                block.descriptors.len() / DESCRIPTOR,
+            )
+        };
+        for chunk in bytes[at..at + count * DESCRIPTOR]
+            .as_chunks_mut::<DESCRIPTOR>()
+            .0
+            .iter_mut()
+        {
+            let mut descriptor = Descriptor::read(chunk).ok_or(BlockError::Malformed)?;
+            if descriptor.names == Names::PendingTerminal(token) {
+                descriptor.names = Names::Terminal(description);
+                chunk.copy_from_slice(&descriptor.bytes());
+            }
+        }
+        Ok(())
     }
 
     /// `write` with the descriptors `descriptors` (DESCRIPTORS at most).
@@ -676,6 +859,9 @@ pub fn write_area(
     handles: [u64; SLOTS],
     maps: &[MapEntry],
 ) -> Result<(), BlockError> {
+    if block.pending_terminals() != 0 {
+        return Err(BlockError::Malformed);
+    }
     let len = area_len(block);
     let area = area.get_mut(..len).ok_or(BlockError::Malformed)?;
     if maps.len() > MAP_ENTRIES {
@@ -872,13 +1058,15 @@ pub fn region_object(kind: abi::ObjectKind, rights: abi::Rights) -> bool {
 /// layer's code it jumps to with the stack pointer `sp` and x0 = 0, the
 /// address `transfer` of TRANSFER_SIZE bytes of the layer's data the
 /// loader writes the child's handles into (`write_transfer`), and how many
-/// regions Regions brings.
+/// regions Regions brings. `required_mask` names the sessions the copied
+/// layer needs, using Slot bits; HandlesDone checks all of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fork {
     pub pc: u64,
     pub sp: u64,
     pub transfer: u64,
     pub regions: u32,
+    pub required_mask: u32,
 }
 
 impl Fork {
@@ -886,14 +1074,18 @@ impl Fork {
         w.u64(self.pc)?;
         w.u64(self.sp)?;
         w.u64(self.transfer)?;
-        w.u32(self.regions)
+        w.u32(self.regions)?;
+        w.u32(self.required_mask)
     }
 
-    /// BAD_SIZE out of the layout, for no regions or past REGIONS_MAX.
+    /// BAD_SIZE out of the layout, for no regions, past REGIONS_MAX or
+    /// a required slot outside Slot::GIVEN.
     pub fn read(mut r: Reader<'_>) -> Result<Fork, Status> {
-        let (pc, sp, transfer, regions) = (r.u64()?, r.u64()?, r.u64()?, r.u32()?);
+        let (pc, sp, transfer, regions, required_mask) =
+            (r.u64()?, r.u64()?, r.u64()?, r.u32()?, r.u32()?);
         r.finish()?;
-        if regions == 0 || regions as usize > REGIONS_MAX {
+        if regions == 0 || regions as usize > REGIONS_MAX || required_mask & !Slot::GIVEN_MASK != 0
+        {
             return Err(Status::BadSize);
         }
         Ok(Fork {
@@ -901,6 +1093,7 @@ impl Fork {
             sp,
             transfer,
             regions,
+            required_mask,
         })
     }
 }
@@ -1068,7 +1261,7 @@ mod tests {
         assert_eq!(Block::read(&good[..len - 1]), Err(BlockError::Malformed));
         for (at, value) in [
             (0, b'x'),
-            (8, 2),
+            (8, (BLOCK_VERSION + 1) as u8),
             (12, 0xFF),
             (20, 2),
             (24, 1),
@@ -1158,8 +1351,9 @@ mod tests {
         assert_eq!(read.full_path(&mut path), Err(BlockError::NameTooLong));
     }
 
-    /// Handles takes Files, Clock, Uart and Pipes, each once, four handles
-    /// at most: a fifth, a slot twice, another slot are refused.
+    /// Handles takes Files, Clock, Driver, Pipes and Terminal, each once,
+    /// four handles at most: a fifth, a slot twice, another slot are
+    /// refused.
     #[test]
     fn handles_name_given_slots_once() {
         let body = |slots: &[u32]| {
@@ -1172,7 +1366,12 @@ mod tests {
         let w = body(&[4, 5, 6]);
         assert_eq!(
             handle_slots(Reader::new(w.as_bytes()), 3),
-            Ok([Some(Slot::Files), Some(Slot::Clock), Some(Slot::Uart), None])
+            Ok([
+                Some(Slot::Files),
+                Some(Slot::Clock),
+                Some(Slot::Driver),
+                None
+            ])
         );
         let w = body(&[8, 4, 5, 6]);
         assert_eq!(
@@ -1181,8 +1380,13 @@ mod tests {
                 Some(Slot::Pipes),
                 Some(Slot::Files),
                 Some(Slot::Clock),
-                Some(Slot::Uart)
+                Some(Slot::Driver)
             ])
+        );
+        let w = body(&[9]);
+        assert_eq!(
+            handle_slots(Reader::new(w.as_bytes()), 1),
+            Ok([Some(Slot::Terminal), None, None, None])
         );
         let w = body(&[10]);
         assert_eq!(
@@ -1190,7 +1394,7 @@ mod tests {
             Ok([Some(Slot::Entropy), None, None, None])
         );
         for (slots, count) in [
-            (&[9][..], 1),
+            (&[11][..], 1),
             (&[10, 10][..], 2),
             (&[4, 5, 6, 8, 5][..], 5),
             (&[8, 8][..], 2),
@@ -1273,7 +1477,7 @@ mod tests {
             let read = Block::read(&out[..len]).unwrap();
             let at = START_AREA;
             let mut area = vec![0xAA; area_len(&read)];
-            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 0, 11];
+            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11];
             write_area(&mut area, at, &read, SECURE, handles, &[]).unwrap();
             assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles, &[]).is_err());
             let start = Start::read(&area).unwrap();
@@ -1331,6 +1535,10 @@ mod tests {
             },
             Descriptor {
                 fd: 6,
+                names: Names::Terminal(0),
+            },
+            Descriptor {
+                fd: 7,
                 names: Names::Random(11),
             },
         ];
@@ -1349,7 +1557,7 @@ mod tests {
         let read = Block::read(&out[..len]).unwrap();
         assert_eq!(read.descriptors().collect::<Vec<_>>(), list);
         assert_eq!(read.strings(), b"ls\0");
-        assert!(read.names_pipes());
+        assert!(read.needs(Slot::Pipes) && read.needs(Slot::Terminal) && read.needs(Slot::Files));
         let mut plain = vec![0; BLOCK_MAX];
         let plain_len = Block::write_with(
             &mut plain,
@@ -1361,7 +1569,23 @@ mod tests {
             &list[..2],
         )
         .unwrap();
-        assert!(!Block::read(&plain[..plain_len]).unwrap().names_pipes());
+        let plain = Block::read(&plain[..plain_len]).unwrap();
+        assert!(!plain.needs(Slot::Pipes) && !plain.needs(Slot::Terminal));
+        let mut random = vec![0; BLOCK_MAX];
+        let random_len = Block::write_with(
+            &mut random,
+            b"/bin/ls",
+            b"/",
+            0,
+            [&b"ls"[..]].into_iter(),
+            [].into_iter(),
+            &list[list.len() - 1..],
+        )
+        .unwrap();
+        let random = Block::read(&random[..random_len]).unwrap();
+        assert!(random.needs(Slot::Files) && random.needs(Slot::Entropy));
+        assert!(!random.needs(Slot::Pipes) && !random.needs(Slot::Terminal));
+        assert!(!plain.needs(Slot::Entropy));
         let mut twice = out[..len].to_vec();
         let at = HEADER + 7 + 1;
         twice[at + DESCRIPTOR..at + DESCRIPTOR + 4].copy_from_slice(&0u32.to_le_bytes());
@@ -1376,9 +1600,9 @@ mod tests {
         let mut area = vec![0; area_len(&read)];
         write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
-        assert_eq!(start.descriptor_count, 4);
+        assert_eq!(start.descriptor_count as usize, list.len());
         let at = (start.descriptors - START_AREA) as usize;
-        let back: Vec<_> = area[at..at + 4 * DESCRIPTOR]
+        let back: Vec<_> = area[at..at + list.len() * DESCRIPTOR]
             .as_chunks::<DESCRIPTOR>()
             .0
             .iter()
@@ -1496,6 +1720,7 @@ mod tests {
             sp: abi::INIT_STACK_TOP - 0x400,
             transfer: 0x22_0100,
             regions: regions as u32,
+            required_mask: 0,
         }
     }
 
@@ -1539,6 +1764,41 @@ mod tests {
             Err(Status::BadSize),
             "W and X together"
         );
+    }
+
+    /// Required sessions are declared independently of offered Handles.
+    #[test]
+    fn fork_accepts_only_given_session_bits() {
+        for mask in core::iter::once(0)
+            .chain(core::iter::once(Slot::GIVEN_MASK))
+            .chain(Slot::GIVEN.map(Slot::bit))
+        {
+            let f = Fork {
+                required_mask: mask,
+                ..fork(8)
+            };
+            let mut w = Writer::new();
+            f.write(&mut w).unwrap();
+            assert_eq!(Fork::read(Reader::new(w.as_bytes())), Ok(f));
+        }
+        for mask in [
+            Slot::Process.bit(),
+            Slot::Thread.bit(),
+            Slot::Posix.bit(),
+            Slot::PosixId.bit(),
+            Slot::Console.bit(),
+            1 << SLOTS,
+            u32::MAX,
+        ] {
+            let mut w = Writer::new();
+            Fork {
+                required_mask: mask,
+                ..fork(8)
+            }
+            .write(&mut w)
+            .unwrap();
+            assert_eq!(Fork::read(Reader::new(w.as_bytes())), Err(Status::BadSize));
+        }
     }
 
     /// A copy takes regions inside the rooms of a program alone, each apart
@@ -1697,7 +1957,7 @@ mod tests {
                 handle: 100 + i,
             })
             .collect();
-        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 0, 11];
+        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11];
         let mut out = vec![0xAA; TRANSFER_SIZE];
         write_transfer(&mut out, handles, &map).unwrap();
         let t = Transfer::read(&out).unwrap();
@@ -1711,5 +1971,117 @@ mod tests {
         assert_eq!(Transfer::read(&out).unwrap().map().count(), 2);
         out[0] = b'x';
         assert_eq!(Transfer::read(&out), None);
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    fn open(token: u32) -> TerminalAction {
+        TerminalAction {
+            token,
+            kind: 2,
+            number: 0,
+            flags: 2 | 0o400,
+        }
+    }
+    fn close(token: u32) -> TerminalAction {
+        TerminalAction {
+            token,
+            kind: TERMINAL_CLOSE,
+            number: 0,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn packets_validate_before_effects_and_preserve_order() {
+        let plan = TerminalPlan::default();
+        assert_eq!(
+            plan.validate(&[open(0), close(0), open(1)], 0)
+                .unwrap()
+                .live,
+            2
+        );
+        assert_eq!(plan.validate(&[open(0), open(0)], 0), Err(Status::BadSize));
+        let first = plan.validate(&[open(0)], 0).unwrap();
+        assert_eq!(
+            first.validate(&[close(0), open(0)], 0),
+            Err(Status::BadSize)
+        );
+        assert_eq!(first.live, 1);
+        assert_eq!(first.validate(&[close(0)], 1), Err(Status::BadSize));
+        let bad = TerminalAction {
+            flags: u32::MAX,
+            ..open(1)
+        };
+        assert_eq!(first.validate(&[close(0), bad], 0), Err(Status::BadSize));
+        assert_eq!(first.live, 1);
+        let opens: Vec<_> = (0..32).map(open).collect();
+        let closes: Vec<_> = (0..32).map(close).collect();
+        let full = plan
+            .validate(&opens, 0)
+            .unwrap()
+            .validate(&closes, 0)
+            .unwrap();
+        assert_eq!((full.count, full.live), (64, 0));
+        assert_eq!(full.validate(&[open(0)], 0), Err(Status::BadSize));
+        assert_eq!(plan.validate(&[open(0); 33], 0), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn every_pending_alias_is_rewritten_and_cannot_reach_start() {
+        let mut bytes = [0; 512];
+        let descriptors = [
+            Descriptor {
+                fd: 0,
+                names: Names::PendingTerminal(7),
+            },
+            Descriptor {
+                fd: 2,
+                names: Names::PendingTerminal(7),
+            },
+            Descriptor {
+                fd: 3,
+                names: Names::PendingTerminal(8),
+            },
+        ];
+        let len = Block::write_with(
+            &mut bytes,
+            b"/bin/ash",
+            b"/",
+            0,
+            [b"ash".as_slice()].into_iter(),
+            [].into_iter(),
+            &descriptors,
+        )
+        .unwrap();
+        let block = Block::read(&bytes[..len]).unwrap();
+        assert!(block.needs(Slot::Terminal));
+        assert_eq!(block.pending_terminals(), (1 << 7) | (1 << 8));
+        let mut area = vec![0; area_len(&block)];
+        assert_eq!(
+            write_area(&mut area, START_AREA, &block, 0, [0; SLOTS], &[]),
+            Err(BlockError::Malformed)
+        );
+        Block::replace_terminal(&mut bytes[..len], 7, 0x80000112).unwrap();
+        let names: Vec<_> = Block::read(&bytes[..len])
+            .unwrap()
+            .descriptors()
+            .map(|d| d.names)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Names::Terminal(0x80000112),
+                Names::Terminal(0x80000112),
+                Names::PendingTerminal(8)
+            ]
+        );
+        Block::replace_terminal(&mut bytes[..len], 8, 0x123).unwrap();
+        let block = Block::read(&bytes[..len]).unwrap();
+        assert_eq!(block.pending_terminals(), 0);
+        write_area(&mut area, START_AREA, &block, 0, [0; SLOTS], &[]).unwrap();
     }
 }

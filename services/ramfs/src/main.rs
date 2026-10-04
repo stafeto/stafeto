@@ -377,6 +377,28 @@ fn value(r: &mut Request<'_>, number: u32) -> Answer {
 }
 
 impl Fs {
+    /// A fresh ordinary session with no descriptors, counted for this root.
+    fn empty_clone(&mut self, r: &mut Request<'_>) -> Answer {
+        let Some(free) = self.births.iter().position(Option::is_none) else {
+            return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
+        };
+        if self.clones.room(r.label()).is_err() {
+            return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
+        }
+        let label = proto_fs::OWN | self.given;
+        match self.session(label) {
+            Ok(session) => {
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                self.births[free] = Some((label, Fds::default()));
+                let _ = self.clones.add(label, r.label());
+                Answer::Reply([session.erase()].into())
+            }
+            Err(e) => Answer::Status(Status::Kernel(e)),
+        }
+    }
+
     /// CLONE with a list of descriptors of the session `fds` (count u32,
     /// then each u32): a session of the service's own label whose
     /// descriptors of the same numbers share their open descriptions;
@@ -477,14 +499,41 @@ impl Service<0> for Fs {
         if r.method() == Method::OpenExec as u16 {
             return self.open_exec(r);
         }
-        // The session of the loaders opens programs and nothing else.
+        if r.method() == Method::VerifySession as u16 {
+            let mut body = r.body();
+            let required = body.u32();
+            if !matches!(required, Ok(0 | 1)) || body.finish().is_err() || r.handles.len() != 1 {
+                return Answer::Status(Status::BadSize);
+            }
+            let rights = r.handles.info(0).map(|(_, rights)| rights);
+            let Ok(offered) = r.handles.take::<Channel>(0) else {
+                return Answer::Status(Status::BadSize);
+            };
+            let normal = sys::copy_label(&self.channel, &offered)
+                .is_ok_and(|label| label != 0 && label & proto_fs::LOADERS == 0)
+                && rights.is_some_and(|rights| rights.contains(Rights::SEND | Rights::TRANSFER));
+            if normal {
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                return Answer::Reply([offered.erase()].into());
+            }
+            drop(offered);
+            if required == Ok(1) {
+                return status(proto_fs::PERMISSION);
+            }
+            return self.empty_clone(r);
+        }
+        // The loader root also verifies the origin of inherited sessions.
         if proto_fs::is_loaders(r.label()) {
             return status(proto_fs::PERMISSION);
         }
         let mut body = r.body();
         match Method::from_number(r.method()) {
             Some(Method::Clone) => self.clone_session(&s.data, r),
-            Some(Method::OpenExec | Method::ReadInto) => status(proto_fs::PERMISSION),
+            Some(Method::OpenExec | Method::ReadInto | Method::VerifySession) => {
+                status(proto_fs::PERMISSION)
+            }
             Some(Method::Open) => {
                 let Ok(flags) = body.u32() else {
                     return Answer::Status(Status::BadSize);

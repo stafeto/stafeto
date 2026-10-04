@@ -300,6 +300,25 @@ impl Page {
     }
 }
 impl Clocks {
+    fn clone_session(&mut self, r: &mut Request<'_>) -> Answer {
+        if self.clones.room(r.label()).is_err() {
+            return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
+        }
+        self.given += 1;
+        let rights = rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER;
+        let label = OWN | self.given;
+        match sys::handle_label(&self.channel, rights, label, self.level) {
+            Ok(session) => {
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let _ = self.clones.add(label, r.label());
+                Answer::Reply([session.erase()].into())
+            }
+            Err(e) => Answer::Status(Status::Kernel(e)),
+        }
+    }
+
     fn record(&mut self, value: i128) {
         for watch in self.watches.iter_mut().flatten() {
             watch.history.see(value);
@@ -379,26 +398,33 @@ impl Service<0> for Clocks {
             });
             return Answer::Status(Status::Ok);
         }
+        if r.method() == Method::VerifySession as u16 {
+            if r.body().finish().is_err() || r.handles.len() != 1 {
+                return Answer::Status(Status::BadSize);
+            }
+            let rights = r.handles.info(0).map(|(_, rights)| rights);
+            let Ok(offered) = r.handles.take::<Channel>(0) else {
+                return Answer::Status(Status::BadSize);
+            };
+            let normal = sys::copy_label(&self.channel, &offered)
+                .is_ok_and(|label| label != 0 && label & (1 << 62) == 0)
+                && rights.is_some_and(|rights| {
+                    rights.contains(rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER)
+                });
+            if normal {
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                return Answer::Reply([offered.erase()].into());
+            }
+            drop(offered);
+            return self.clone_session(r);
+        }
         if r.method() == Method::Clone as u16 {
             if r.body().finish().is_err() || !r.handles.is_empty() {
                 return Answer::Status(Status::BadSize);
             }
-            if self.clones.room(r.label()).is_err() {
-                return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
-            }
-            self.given += 1;
-            let rights = rt::abi::Rights::SEND.union(rt::abi::Rights::TRANSFER);
-            let label = OWN | self.given;
-            return match sys::handle_label(&self.channel, rights, label, self.level) {
-                Ok(session) => {
-                    if r.reply().u32(0).is_err() {
-                        return Answer::Status(Status::BadSize);
-                    }
-                    let _ = self.clones.add(label, r.label());
-                    Answer::Reply([session.erase()].into())
-                }
-                Err(e) => Answer::Status(Status::Kernel(e)),
-            };
+            return self.clone_session(r);
         }
         if r.handles.len() > usize::from(r.method() == Method::Set as u16) {
             return Answer::Status(Status::BadSize);
@@ -508,7 +534,9 @@ impl Service<0> for Clocks {
                 }
                 Answer::Reply(handles)
             }
-            Some(Method::Watch | Method::Clone) | None => Answer::Status(Status::UnknownMethod),
+            Some(Method::Watch | Method::Clone | Method::VerifySession) | None => {
+                Answer::Status(Status::UnknownMethod)
+            }
         }
     }
     /// The last copy of a session Clone gave went.

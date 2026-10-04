@@ -126,6 +126,7 @@ struct Own {
     process: Handle<Process>,
     thread: Handle<Thread>,
     files: Handle<Channel>,
+    clock: Handle<Channel>,
     identity: Handle<Channel>,
     /// The loader's data and stack, which it unmaps at its end.
     data: (u64, u64),
@@ -183,6 +184,7 @@ fn boot(session: &Handle<Channel>, start: &Handle<Channel>, level: u8) -> Result
         thread: reply.handles.take(1)?,
         files: reply.handles.take(2)?,
         identity: reply.handles.take(3)?,
+        clock: loader_clock(session).map_err(|_| Error::BadState)?,
         data,
     })
 }
@@ -245,7 +247,8 @@ fn keep_region(
 /// The bytes of the copy of the block.
 fn staged(len: usize) -> &'static [u8] {
     // SAFETY: the copy lies at STAGING, mapped read and write for the
-    // loader's life (`stage`), and nothing writes it after Start.
+    // loader's life (`stage`). TerminalActions rewrites it only between
+    // requests, with no outstanding borrow used across that rewrite.
     unsafe { core::slice::from_raw_parts(STAGING as *const u8, len) }
 }
 
@@ -320,12 +323,19 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     let mut loaded: Option<(u64, Handle<Channel>, Maps)> = None;
     let mut fork: Option<(Fork, &'static mut Scratch)> = None;
     let mut copied = false;
-    // Whether the block names the end of a pipe.
-    let mut pipes_named = false;
+    // The sessions the block's descriptors need (Block::needs).
+    let mut needed = [false; SLOTS];
     let mut given: [Option<Handle<Channel>>; SLOTS] = Default::default();
     let mut ready = false;
+    let mut early_given = false;
+    let mut completed = false;
+    let mut terminal_actions: Option<TerminalLoads> = None;
+    let mut trusted_terminal = None;
     let mut buffer = [0; MESSAGE_MAX];
     loop {
+        if ready && (!completed || (0..SLOTS).any(|i| needed[i] && given[i].is_none())) {
+            return None;
+        }
         if ready && let Some((entry, image, maps)) = loaded.take() {
             return Some(Done::Loaded(Loaded {
                 block_len: block_len?,
@@ -381,7 +391,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                 };
                 let first = block_len.is_none() && fork.is_none();
                 let status = match method {
-                    Some(Method::Start) if first => {
+                    Some(Method::Start) if first && terminal_actions.is_none() => {
                         let memory = handles.take::<Memory>(0).ok();
                         match (r.u32(), memory, r.finish()) {
                             (Ok(len), Some(memory), Ok(())) => {
@@ -399,6 +409,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     Some(Method::Fork) if first => match Fork::read(r) {
                         Ok(body) if handles.is_empty() => match scratch(own) {
                             Ok(scratch) => {
+                                for slot in Slot::GIVEN {
+                                    needed[slot as usize] = body.required_mask & slot.bit() != 0;
+                                }
                                 fork = Some((body, scratch));
                                 0
                             }
@@ -418,11 +431,26 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         None => Status::Kernel(Error::BadState).code(),
                     },
                     Some(Method::Go) if !copied && fork.is_some() => {
+                        if trusted_terminal.is_none() {
+                            trusted_terminal = match loader_terminal(session) {
+                                Ok(terminal) => terminal,
+                                Err(code) => {
+                                    reply(token, code);
+                                    return None;
+                                }
+                            };
+                        }
                         let (body, scratch) = fork.as_mut()?;
                         let regions = scratch.count as u64;
-                        match steps::timed(kind::GO, regions, || copy(own, body, scratch))
-                            .and_then(|()| tell_ready(session))
-                        {
+                        match steps::timed(kind::GO, regions, || copy(own, body, scratch)).and_then(
+                            |()| {
+                                if completed {
+                                    tell_ready(session)
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        ) {
                             Ok(()) => {
                                 copied = true;
                                 0
@@ -434,16 +462,56 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                     }
                     Some(Method::Go) if block_len.is_some() && loaded.is_none() => {
+                        if trusted_terminal.is_none() {
+                            trusted_terminal = match loader_terminal(session) {
+                                Ok(terminal) => terminal,
+                                Err(code) => {
+                                    reply(token, code);
+                                    return None;
+                                }
+                            };
+                        }
+                        if let Some(terminals) = terminal_actions.as_mut()
+                            && let Err(code) = terminals.finish()
+                        {
+                            reply(token, code);
+                            return None;
+                        }
                         let Ok(block) = Block::read(staged(block_len?)) else {
                             reply(token, Status::BadSize.code());
                             return None;
                         };
-                        let named = block.names_pipes();
-                        match load(own, &block).and_then(|done| tell_ready(session).map(|()| done))
+                        if block.pending_terminals() != 0 {
+                            reply(token, Status::BadSize.code());
+                            return None;
+                        }
+                        let needs = Slot::GIVEN.map(|slot| (slot, block.needs(slot)));
+                        if early_given && !completed {
+                            reply(token, Status::Kernel(Error::BadState).code());
+                            return None;
+                        }
+                        if completed
+                            && needs
+                                .iter()
+                                .any(|(slot, needs)| *needs && given[*slot as usize].is_none())
                         {
+                            reply(token, Status::BadSize.code());
+                            return None;
+                        }
+                        match load(own, &block).and_then(|done| {
+                            if completed {
+                                tell_ready(session)?;
+                            }
+                            Ok(done)
+                        }) {
                             Ok(done) => {
+                                if let Some(terminals) = terminal_actions.as_mut() {
+                                    terminals.committed = true;
+                                }
                                 loaded = Some(done);
-                                pipes_named = named;
+                                for (slot, needs) in needs {
+                                    needed[slot as usize] = needs;
+                                }
                                 0
                             }
                             Err(code) => {
@@ -454,14 +522,114 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             }
                         }
                     }
-                    Some(Method::Handles) if loaded.is_some() || fork.is_some() => {
-                        match take_given(r, &mut handles, &mut given) {
-                            // The end of a pipe the block names needs the
-                            // session of the pipe service that holds it.
-                            Ok(()) if pipes_named && given[Slot::Pipes as usize].is_none() => {
-                                Status::BadSize.code()
-                            }
+                    Some(Method::TerminalActions)
+                        if block_len.is_some()
+                            && loaded.is_none()
+                            && completed
+                            && handles.is_empty() =>
+                    {
+                        if terminal_actions.is_none() {
+                            let Ok(block) = Block::read(staged(block_len?)) else {
+                                reply(token, Status::BadSize.code());
+                                return None;
+                            };
+                            let Some(tty) = given[Slot::Terminal as usize].as_ref() else {
+                                reply(token, Status::BadSize.code());
+                                return None;
+                            };
+                            // The verified client endpoint has SEND|TRANSFER,
+                            // not DUPLICATE. given outlives TerminalLoads on
+                            // every failure; a committed guard does no I/O.
+                            terminal_actions = Some(TerminalLoads::new(
+                                Handle::borrowed(tty.raw()),
+                                block.pending_terminals(),
+                            ));
+                        }
+                        match terminal_actions.as_mut()?.run(own, block_len?, r) {
                             Ok(()) => 0,
+                            Err(code) => {
+                                reply(token, code);
+                                return None;
+                            }
+                        }
+                    }
+                    Some(Method::HandlesDone)
+                        if !completed
+                            && terminal_actions.is_none()
+                            && (block_len.is_some() || fork.is_some()) =>
+                    {
+                        if r.finish().is_err() || !handles.is_empty() {
+                            Status::BadSize.code()
+                        } else {
+                            if let Some(len) = block_len {
+                                let Ok(block) = Block::read(staged(len)) else {
+                                    reply(token, Status::BadSize.code());
+                                    return None;
+                                };
+                                for slot in Slot::GIVEN {
+                                    needed[slot as usize] = block.needs(slot);
+                                }
+                            }
+                            if (0..SLOTS).any(|i| needed[i] && given[i].is_none()) {
+                                reply(token, Status::BadSize.code());
+                                return None;
+                            }
+                            if (loaded.is_some() || copied)
+                                && let Err(code) = tell_ready(session)
+                            {
+                                reply(token, code);
+                                return None;
+                            }
+                            completed = true;
+                            0
+                        }
+                    }
+                    Some(Method::Handles)
+                        if !completed
+                            && terminal_actions.is_none()
+                            && (block_len.is_some() || fork.is_some()) =>
+                    {
+                        early_given |= loaded.is_none() && block_len.is_some();
+                        match take_given(r, &mut handles, &mut given) {
+                            Ok(()) => {
+                                for slot in [Slot::Files, Slot::Clock] {
+                                    if let Some(offered) = given[slot as usize].take() {
+                                        // Fork descriptors live in the copied layer memory.
+                                        let require_fds = fork.is_some()
+                                            || block_len
+                                                .and_then(|len| Block::read(staged(len)).ok())
+                                                .is_some_and(|block| block.needs(Slot::Files));
+                                        match verify_session(own, slot, offered, require_fds) {
+                                            Ok(channel) => given[slot as usize] = Some(channel),
+                                            Err(code) => {
+                                                reply(token, code);
+                                                return None;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(offered) = given[Slot::Terminal as usize].take() {
+                                    if trusted_terminal.is_none() {
+                                        trusted_terminal = match loader_terminal(session) {
+                                            Ok(terminal) => terminal,
+                                            Err(code) => {
+                                                reply(token, code);
+                                                return None;
+                                            }
+                                        };
+                                    }
+                                    match verify_terminal(trusted_terminal.as_ref(), offered) {
+                                        Ok(terminal) => {
+                                            given[Slot::Terminal as usize] = Some(terminal)
+                                        }
+                                        Err(code) => {
+                                            reply(token, code);
+                                            return None;
+                                        }
+                                    }
+                                }
+                                0
+                            }
                             Err(status) => status.code(),
                         }
                     }
@@ -472,6 +640,216 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
             }
         }
     }
+}
+
+/// Only the verified child session sees LoaderOf. It owns the new
+/// descriptions; every failed attempt releases its successful opens.
+struct TerminalLoads {
+    tty: core::mem::ManuallyDrop<Handle<Channel>>,
+    plan: pl::TerminalPlan,
+    descriptions: [Option<u32>; pl::TERMINAL_OPENS],
+    exported: u32,
+    committed: bool,
+}
+
+impl TerminalLoads {
+    fn new(tty: core::mem::ManuallyDrop<Handle<Channel>>, exported: u32) -> Self {
+        Self {
+            tty,
+            plan: pl::TerminalPlan::default(),
+            descriptions: [None; pl::TERMINAL_OPENS],
+            exported,
+            committed: false,
+        }
+    }
+
+    fn run(&mut self, own: &Own, len: usize, mut r: Reader<'_>) -> Result<(), u32> {
+        let count = r.u32().map_err(|s| s.code())? as usize;
+        if count == 0 || count > pl::TERMINAL_PACKET {
+            return Err(Status::BadSize.code());
+        }
+        let mut actions = [pl::TerminalAction::default(); pl::TERMINAL_PACKET];
+        for action in &mut actions[..count] {
+            *action = pl::TerminalAction::read(&mut r).map_err(|s| s.code())?;
+        }
+        r.finish().map_err(|s| s.code())?;
+        let next = self
+            .plan
+            .validate(&actions[..count], self.exported)
+            .map_err(|s| s.code())?;
+        for action in &actions[..count] {
+            let place = action.token as usize;
+            if action.kind == pl::TERMINAL_CLOSE {
+                let id = self.descriptions[place].ok_or(pl::IO)?;
+                close_terminal(&self.tty, id)?;
+                self.descriptions[place] = None;
+                continue;
+            }
+            let mut w = Writer::new();
+            proto_tty::Open {
+                kind: action.kind,
+                flags: action.flags & !0o400,
+                number: action.number,
+            }
+            .write(&mut w)
+            .map_err(|s| s.code())?;
+            let id = terminal_request(own, &self.tty, &w)?;
+            self.descriptions[place] = Some(id);
+            // SAFETY: STAGING is the loader's private mapped copy; no
+            // Block borrow survives this point, and only serve writes it.
+            let bytes = unsafe { core::slice::from_raw_parts_mut(STAGING as *mut u8, len) };
+            Block::replace_terminal(bytes, action.token, id).map_err(|_| Status::BadSize.code())?;
+            if action.kind != proto_tty::OPEN_MASTER
+                && action.kind != proto_tty::OPEN_CONTROLLING
+                && action.flags & 0o400 == 0
+            {
+                let mut w = Writer::new();
+                proto_tty::Method::Acquire
+                    .header()
+                    .write(&mut w)
+                    .map_err(|s| s.code())?;
+                w.u32(id).map_err(|s| s.code())?;
+                // A busy controlling terminal does not fail ordinary open.
+                let _ = terminal_request(own, &self.tty, &w);
+            }
+        }
+        self.plan = next;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), u32> {
+        for (token, description) in self.descriptions.iter_mut().enumerate() {
+            if self.exported & 1 << token == 0
+                && let Some(id) = *description
+            {
+                close_terminal(&self.tty, id)?;
+                *description = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TerminalLoads {
+    fn drop(&mut self) {
+        if !self.committed {
+            for id in self.descriptions.iter_mut().filter_map(Option::take) {
+                let _ = close_terminal(&self.tty, id);
+            }
+        }
+    }
+}
+
+fn terminal_request(own: &Own, tty: &Handle<Channel>, request: &Writer) -> Result<u32, u32> {
+    loop {
+        let identity = sys::handle_duplicate(&own.identity, Rights::NOTIFY | Rights::TRANSFER)
+            .map_err(code)?;
+        match sys::send_handles(tty, request.as_bytes(), [identity.erase()]) {
+            Err(refused) if refused.error == Error::Interrupted => continue,
+            Err(refused) => return Err(code(refused.error)),
+            Ok(reply) => {
+                let mut buffer = [0; MESSAGE_MAX];
+                let mut r = Reader::new(reply.bytes(&mut buffer));
+                let status = r.u32().map_err(|_| pl::IO)?;
+                return if status == 0 {
+                    Ok(r.u32().unwrap_or(0))
+                } else {
+                    Err(match status {
+                        proto_tty::NOT_CONTROLLING => pl::NO_CONTROLLING,
+                        proto_tty::PERMISSION => pl::ACCESS,
+                        proto_tty::NO_ENTRY => pl::NO_ENTRY,
+                        _ => status,
+                    })
+                };
+            }
+        }
+    }
+}
+
+fn close_terminal(tty: &Handle<Channel>, id: u32) -> Result<(), u32> {
+    let mut w = Writer::new();
+    proto_tty::Method::Close
+        .header()
+        .write(&mut w)
+        .map_err(|s| s.code())?;
+    w.u32(id).map_err(|s| s.code())?;
+    loop {
+        match sys::send(tty, w.as_bytes()) {
+            Err(Error::Interrupted) => continue,
+            Err(error) => return Err(code(error)),
+            Ok(reply) => {
+                let mut buffer = [0; MESSAGE_MAX];
+                return match Reader::new(reply.bytes(&mut buffer)).u32() {
+                    Ok(0) => Ok(()),
+                    _ => Err(pl::IO),
+                };
+            }
+        }
+    }
+}
+
+fn loader_clock(session: &Handle<Channel>) -> Result<Handle<Channel>, u32> {
+    let request = proto_process::Method::LoaderClock.header().bytes();
+    let mut reply = sys::send(session, &request).map_err(code)?;
+    let mut buffer = [0; MESSAGE_MAX];
+    if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+        return Err(pl::IO);
+    }
+    reply.handles.take::<Channel>(0).map_err(code)
+}
+
+fn verify_session(
+    own: &Own,
+    slot: Slot,
+    offered: Handle<Channel>,
+    require_fds: bool,
+) -> Result<Handle<Channel>, u32> {
+    let (root, header) = match slot {
+        Slot::Files => (&own.files, proto_fs::Method::VerifySession.header()),
+        Slot::Clock => (&own.clock, proto_clock::Method::VerifySession.header()),
+        _ => return Err(pl::IO),
+    };
+    let mut w = Writer::new();
+    header.write(&mut w).map_err(|s| s.code())?;
+    if slot == Slot::Files {
+        w.u32(u32::from(require_fds)).map_err(|s| s.code())?;
+    }
+    let mut reply = sys::send_handles(root, w.as_bytes(), [offered.erase()])
+        .map_err(|refused| code(refused.error))?;
+    let mut buffer = [0; MESSAGE_MAX];
+    if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+        return Err(pl::IO);
+    }
+    reply.handles.take::<Channel>(0).map_err(code)
+}
+
+fn loader_terminal(session: &Handle<Channel>) -> Result<Option<Handle<Channel>>, u32> {
+    let request = proto_process::Method::LoaderTerminal.header().bytes();
+    let mut reply = sys::send(session, &request).map_err(code)?;
+    let mut buffer = [0; MESSAGE_MAX];
+    match Reader::new(reply.bytes(&mut buffer)).u32() {
+        Ok(0) => reply.handles.take::<Channel>(0).map(Some).map_err(code),
+        Ok(proto_process::UNREGISTERED) => Ok(None),
+        _ => Err(pl::IO),
+    }
+}
+
+/// Verify before a parent can commit SetId. True tty descriptions and
+/// their clone root move unchanged; a counterfeit is replaced without a
+/// single request or identity sent through it.
+fn verify_terminal(
+    tty: Option<&Handle<Channel>>,
+    offered: Handle<Channel>,
+) -> Result<Handle<Channel>, u32> {
+    let tty = tty.ok_or(pl::IO)?;
+    let request = proto_tty::Method::VerifySession.header().bytes();
+    let mut reply = sys::send_handles(tty, &request, [offered.erase()])
+        .map_err(|refused| code(refused.error))?;
+    let mut buffer = [0; MESSAGE_MAX];
+    if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+        return Err(pl::IO);
+    }
+    reply.handles.take::<Channel>(0).map_err(code)
 }
 
 /// Regions: an entry for each handle, a memory object of the parent's
@@ -995,13 +1373,7 @@ fn finish(
     handles[Slot::Posix as usize] = keep(taken.posix);
     handles[Slot::PosixId as usize] = keep(taken.identity);
     handles[Slot::Console as usize] = taken.console.map_or(0, keep);
-    for slot in [
-        Slot::Files,
-        Slot::Clock,
-        Slot::Uart,
-        Slot::Pipes,
-        Slot::Entropy,
-    ] {
+    for slot in Slot::GIVEN {
         handles[slot as usize] = given[slot as usize].take().map_or(0, keep);
     }
     let mut entries = [MapEntry {
@@ -1028,7 +1400,7 @@ fn finish(
         return GAVE_UP;
     }
     let staging = (block_len as u64).next_multiple_of(PAGE);
-    drop((image, own.files, own.identity, start, session));
+    drop((image, own.files, own.clock, own.identity, start, session));
     // SAFETY: the copy of the block is read no more.
     let _ = unsafe {
         sys::mem_unmap(
@@ -1067,13 +1439,7 @@ fn finish_fork(
     handles[Slot::Posix as usize] = keep(taken.posix);
     handles[Slot::PosixId as usize] = keep(taken.identity);
     handles[Slot::Console as usize] = taken.console.map_or(0, keep);
-    for slot in [
-        Slot::Files,
-        Slot::Clock,
-        Slot::Uart,
-        Slot::Pipes,
-        Slot::Entropy,
-    ] {
+    for slot in Slot::GIVEN {
         handles[slot as usize] = given[slot as usize].take().map_or(0, keep);
     }
     // SAFETY: `check_fork` put the transfer whole in a writable region,
@@ -1083,7 +1449,7 @@ fn finish_fork(
     if pl::write_transfer(out, handles, scratch.map()).is_err() {
         return GAVE_UP;
     }
-    drop((own.files, own.identity, start, session));
+    drop((own.files, own.clock, own.identity, start, session));
     // SAFETY: the scratch is read no more.
     let _ = unsafe {
         sys::mem_unmap(

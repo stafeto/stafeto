@@ -96,7 +96,7 @@ pub const BUSYBOX_TABLE: &[Record] = &[
 /// process service holds the quota of five more processes of the
 /// launcher's size (the shell, the three of a pipeline of three, and a
 /// nested shell's command), and the reserve of its loaders. The pipe service (5e)
-/// serves the shell's pipelines.
+/// serves the shell's pipelines, the terminal service (5f) its console.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     TABLE[0],
@@ -108,16 +108,43 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     PIPE,
     Record {
         args: b"ash-launch\0",
-        connects: &["ramfs", "uart", "pipe", "clock", "posix", "entropy"],
+        connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         quota: DIALOG_QUOTA,
         ..BUSYBOX_TABLE[3]
     },
+    TTY,
     super::entropy::RNG,
     super::entropy::ENTROPY,
 ];
 
 /// The quota of the launcher, which the shell and its children get too.
 const DIALOG_QUOTA: u64 = 512 * PAGE;
+
+/// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
+/// console's driver, the terminal service, the RAM files, the process,
+/// clock and pipe services, and the probe, which forks a child of its own
+/// size. Eighteen child quotas hold run, the session leader and sixteen
+/// live members for the terminal-signal walk. Spawn and exec run separately.
+pub const POSIX_TTY_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TABLE[0],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 18 * DIALOG_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "posix-tty",
+        program: "posix-tty",
+        args: b"posix-tty\0",
+        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
+        quota: DIALOG_QUOTA,
+        root: true,
+        ..POSIX
+    },
+    TTY,
+];
 
 /// The probes of console input and interruption (posix-threads with
 /// cancel-input, posix-shared): the console's driver, the RAM files, the
@@ -148,8 +175,8 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         // A process handle for each of its 256 records.
         handle_limit: 1024,
         restart: Restart::Never,
-        // The session of the loaders (5c), which init marks.
-        connects: &["ramfs"],
+        // Loader roots, obtained at startup and narrowed for each loader.
+        connects: &["ramfs", "clock"],
         ..TABLE[0]
     },
     Record {
@@ -318,15 +345,17 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
 /// each, and 24 of its own (tests/posix-procs STEPS_BRANCHES).
 const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 
-/// The quota of the steps probe, which each child it spawns gets too.
-const STEPS_QUOTA: u64 = 256 * PAGE;
+/// The steps probe and each spawned child: the enlarged image plus its
+/// checked 64 KiB malloc, including the allocator mapping and alignment.
+const STEPS_QUOTA: u64 = (256 + 16) * PAGE;
 
 /// The quota of the probe of POSIX processes, which each child it spawns
-/// from a file gets too (5c).
-const PROCS_QUOTA: u64 = 512 * PAGE;
+/// from a file gets too (5c), with 16 pages for the enlarged signal layer
+/// while the fork probe still allocates its additional 1 MiB.
+const PROCS_QUOTA: u64 = (512 + 16) * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
-/// files with the tests of the image, the process and clock services, and
+/// files with the tests of the image, the terminal, process and clock services, and
 /// the runner, whose children are the tests, started from their files
 /// (5c), one at a time, with room for one more for the exec of a test
 /// that execs, for the processes of a test of groups (a test, its unreaped
@@ -334,6 +363,8 @@ const PROCS_QUOTA: u64 = 512 * PAGE;
 /// of an emptied group leave alive for good: their child holds both ends of
 /// its pipe and reads one (5e).
 pub const OS_TEST_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TTY,
     TABLE[0],
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 10 * OS_TEST_QUOTA + 384 * PAGE,
@@ -345,7 +376,7 @@ pub const OS_TEST_TABLE: &[Record] = &[
         name: "os-test-run",
         program: "os-test-run",
         args: b"os-test-run\0",
-        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: OS_TEST_QUOTA,
         ..POSIX
@@ -422,7 +453,8 @@ pub const RTBENCH: Record = Record {
         "clock",
         "posix",
         "pipe",
-        "uart",
+        "bench-uart",
+        "tty",
         "rtbench-load",
         "entropy",
     ],
@@ -438,15 +470,16 @@ pub const RTBENCH: Record = Record {
 /// the service of long operations, the load and the benchmark, whose
 /// children (S10 to S13) are files of the image started from the loader.
 pub const RTBENCH_POSIX_TABLE: &[Record] = &[
-    Record {
-        name: "console",
-        ..super::normal::TABLE[0]
-    },
+    super::normal::TABLE[0],
     TABLE[0],
     RTBENCH_POOL,
     POSIX_ABI_TABLE[2],
     PIPE,
-    LONG,
+    Record {
+        name: "bench-uart",
+        ..LONG
+    },
+    TTY,
     LOAD,
     RTBENCH,
     super::entropy::RNG,
@@ -461,6 +494,62 @@ pub const RTBENCH_POOL: Record = Record {
     quota: POSIX_ABI_TABLE[1].quota + 33 * RTBENCH.quota + 384 * PAGE,
     ..POSIX_ABI_TABLE[1]
 };
+
+/// The terminal service (5f): the console as a terminal over the
+/// console's driver, at 50, below the driver and above the POSIX
+/// processes; its segments, a stack of 32 KiB, its 320 sessions, 128 long
+/// operations and the console's discipline in `.bss`; a handle for each
+/// long operation that waits.
+pub const TTY: Record = Record {
+    name: "tty",
+    program: "tty",
+    priority: 50,
+    ceiling: 50,
+    // PT_LOAD 84 pages + stack 8 + generations 1; reserve 35 pages.
+    quota: 128 * PAGE,
+    handle_limit: 192,
+    restart: Restart::Never,
+    connects: &["uart"],
+    ..TABLE[0]
+};
+
+/// The probe of the terminal service (tests/tty, xtask tty): the console's
+/// driver, the service and the probe, a client of it.
+pub const TTY_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TTY,
+    Record {
+        name: "tty-probe",
+        program: "tty-probe",
+        connects: &["tty"],
+        ..TABLE[1]
+    },
+];
+
+/// The measure of the terminal service's steps (xtask tty, under
+/// -icount): the probe's program as a quiet driver under the driver's
+/// name (its role `S`, no device, no interrupt), the service, and the
+/// probe in its role `s`, which feeds the driver its input.
+pub const TTY_STEPS_TABLE: &[Record] = &[
+    Record {
+        program: "tty-probe",
+        windows: &[],
+        bindings: &[],
+        log: false,
+        args: b"S",
+        restart: Restart::Never,
+        ..super::normal::TABLE[0]
+    },
+    TTY,
+    Record {
+        args: b"s",
+        connects: &["tty", "uart"],
+        // A handle for each clone of its chain (tests/tty steps.rs).
+        handle_limit: 320,
+        quota: 64 * PAGE,
+        ..TTY_TABLE[2]
+    },
+];
 
 /// The probe of getentropy and getrandom (tests/posix-random, step 5e'):
 /// the RAM files, the process and clock services, the pipe service, the
@@ -485,4 +574,57 @@ pub const POSIX_RANDOM_TABLE: &[Record] = &[
         quota: PROCS_QUOTA,
         ..POSIX
     },
+];
+
+/// Functional loader channel probe with the process probe's ordinary image.
+pub const LOADER_CHANNELS_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TTY,
+    POSIX_PROCS_TABLE[0],
+    POSIX_PROCS_TABLE[1],
+    POSIX_PROCS_TABLE[2],
+    POSIX_PROCS_TABLE[3],
+    Record {
+        args: b"posix-procs\0loaderchannels\0",
+        connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
+        ..POSIX_PROCS_TABLE[4]
+    },
+    POSIX_PROCS_TABLE[5],
+    POSIX_PROCS_TABLE[6],
+];
+
+/// The readiness probe uses the loader probe's ordinary services and pool.
+pub const POSIX_POLL_TABLE: &[Record] = &[
+    LOADER_CHANNELS_TABLE[0],
+    LOADER_CHANNELS_TABLE[1],
+    LOADER_CHANNELS_TABLE[2],
+    LOADER_CHANNELS_TABLE[3],
+    LOADER_CHANNELS_TABLE[4],
+    LOADER_CHANNELS_TABLE[5],
+    Record {
+        name: "posix-poll",
+        program: "posix-poll",
+        args: b"posix-poll\0",
+        ..LOADER_CHANNELS_TABLE[6]
+    },
+    LOADER_CHANNELS_TABLE[7],
+    LOADER_CHANNELS_TABLE[8],
+];
+
+/// Functional PTY probe with the process probe's ordinary services.
+pub const POSIX_PTY_TABLE: &[Record] = &[
+    LOADER_CHANNELS_TABLE[0],
+    LOADER_CHANNELS_TABLE[1],
+    LOADER_CHANNELS_TABLE[2],
+    LOADER_CHANNELS_TABLE[3],
+    LOADER_CHANNELS_TABLE[4],
+    LOADER_CHANNELS_TABLE[5],
+    Record {
+        name: "posix-pty",
+        program: "posix-pty",
+        args: b"posix-pty\0",
+        ..LOADER_CHANNELS_TABLE[6]
+    },
+    LOADER_CHANNELS_TABLE[7],
+    LOADER_CHANNELS_TABLE[8],
 ];

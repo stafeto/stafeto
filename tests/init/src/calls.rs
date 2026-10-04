@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 37] = [
+pub(crate) const TESTS: [Test; 38] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -30,6 +30,10 @@ pub(crate) const TESTS: [Test; 37] = [
         debug_write_checks_its_arguments,
     ),
     ("unknown_system_calls_fail", unknown_system_calls_fail),
+    (
+        "process_control_checks_its_arguments",
+        process_control_checks_its_arguments,
+    ),
     ("priority_ceilings_hold", priority_ceilings_hold),
     (
         "thread_set_priority_checks_its_arguments",
@@ -2077,4 +2081,44 @@ extern "C" fn echo_until_empty(h: u64) -> ! {
         }
     }
     sys::thread_exit()
+}
+
+/// Process control at EL0, with raw register checks and the typed rt call.
+fn process_control_checks_its_arguments() -> Outcome {
+    const N: u16 = Call::ProcessControl.number();
+    let p = child(20)?;
+    let weak = copy(&p, Rights::NONE)?;
+    let resource = abi::INIT_RESOURCE.0;
+    let gone = closed_handle()?;
+    let result = (|| {
+        for (args, error) in [
+            ([gone, 2, 64], Error::InvalidArgs),
+            ([gone, 0, 64], Error::InvalidArgs),
+            ([gone, 0, 0], Error::BadHandle),
+            ([resource, 0, 0], Error::WrongType),
+            ([weak.raw().0, 0, 0], Error::AccessDenied),
+        ] {
+            check(
+                x0_alone::<N>(&args, error.code()),
+                "process control changed an error register or check order",
+            )?;
+        }
+        for suspend in [true, true, false, false] {
+            check(
+                sys::process_control(&p, suspend, 0).is_ok(),
+                "typed process control failed",
+            )?;
+        }
+        check(sys::process_kill(&p).is_ok(), "control target did not end")?;
+        for action in 0..=1 {
+            check(
+                x0_alone::<N>(&[p.raw().0, action, 0], Error::BadState.code()),
+                "a dead process accepted process control",
+            )?;
+        }
+        Ok(())
+    })();
+    close(weak)?;
+    close(p)?;
+    result
 }

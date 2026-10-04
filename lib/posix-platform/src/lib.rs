@@ -17,6 +17,7 @@
 
 mod files;
 mod signals;
+mod wait;
 
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
@@ -27,7 +28,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 13;
+pub const PLATFORM_INTERFACE: u64 = 14;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -154,8 +155,9 @@ const O_NONBLOCK: c_int = 0o4000;
 
 /// Opens `path`, relative to the current directory or absolute (any
 /// `dirfd` then). The layer opens files of the RAM file service: the
-/// access mode, O_DIRECTORY and O_CLOEXEC; O_NOCTTY, O_NOFOLLOW (no
-/// symbolic links yet) and O_LARGEFILE change nothing; other flags, and a
+/// access mode, O_DIRECTORY and O_CLOEXEC; O_NOCTTY keeps a terminal from
+/// becoming the controlling terminal (5f); O_NOFOLLOW (no symbolic links
+/// yet) and O_LARGEFILE change nothing; other flags, and a
 /// relative path from a directory other than `AT_FDCWD`, answer EINVAL.
 /// O_CREAT, O_TRUNC and O_APPEND name a directory as POSIX has it: EISDIR
 /// for O_CREAT without O_DIRECTORY and for O_TRUNC or O_APPEND with write
@@ -208,6 +210,9 @@ pub unsafe extern "C" fn stafeto_openat(
     }
     if flags & O_CLOFORK != 0 {
         ours |= posix_abi::constants::O_CLOFORK;
+    }
+    if flags & O_NOCTTY != 0 {
+        ours |= posix_abi::constants::O_NOCTTY;
     }
     value(call(|| posix_abi::open(name, ours)).map(i64::from)) as c_int
 }
@@ -330,7 +335,13 @@ pub extern "C" fn stafeto_getppid() -> c_int {
 pub unsafe extern "C" fn stafeto_waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
     match call(|| posix_abi::process::waitpid(pid, options)) {
         Ok(waited) => {
-            let word = waited.end.map_or(0, proto_process::End::wait_status);
+            let word = if let Some(signal) = waited.stopped {
+                (i32::from(signal) << 8) | 0x7f
+            } else if waited.continued {
+                0xffff
+            } else {
+                waited.end.map_or(0, proto_process::End::wait_status)
+            };
             // SAFETY: the caller's promise.
             unsafe { status.write(word) };
             waited.pid
@@ -384,10 +395,16 @@ pub unsafe extern "C" fn stafeto_waitid(
     match call(|| posix_abi::process::wait(selector, options)) {
         Ok(waited) => {
             let mut words = [0i32; SIGINFO_LEN / 4];
-            if let Some(end) = waited.end {
-                let (code, status) = match end {
-                    End::Exited(code) => (CLD_EXITED, i32::from(code)),
-                    End::Signaled(n) => (CLD_KILLED, i32::from(n)),
+            if waited.pid != 0 {
+                let (code, status) = if let Some(signal) = waited.stopped {
+                    (proto_process::CLD_STOPPED, i32::from(signal))
+                } else if waited.continued {
+                    (proto_process::CLD_CONTINUED, proto_process::SIGCONT as i32)
+                } else {
+                    match waited.end.expect("a wait report") {
+                        End::Exited(code) => (CLD_EXITED, i32::from(code)),
+                        End::Signaled(n) => (CLD_KILLED, i32::from(n)),
+                    }
                 };
                 words[0] = SIGCHLD;
                 words[2] = code;
@@ -648,6 +665,13 @@ pub extern "C" fn stafeto_probe_loads() -> c_int {
     posix_abi::process::probe_loads()
 }
 
+/// TtySignal through the process's own session
+/// (posix_abi::process::probe_tty_signal): the errno of the refusal.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_tty_signal(pgid: c_int, signal: c_int) -> c_int {
+    posix_abi::process::probe_tty_signal(pgid as u32, signal as u32)
+}
+
 /// The bytes of the process service's quota left for children (Pool),
 /// for the probe that the ends of loads give theirs back.
 #[unsafe(no_mangle)]
@@ -750,6 +774,12 @@ pub extern "C" fn stafeto_probe_fork_window(window: Option<extern "C" fn()>) {
         window.map_or(0, |f| f as usize),
         core::sync::atomic::Ordering::Release,
     );
+}
+
+/// PID at an explicitly installed fork loader window, for regression probes.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loading_pid() -> c_int {
+    posix_abi::fork::probe_loading_pid() as c_int
 }
 
 /// The C function an early window of the next fork runs
@@ -1206,4 +1236,35 @@ pub unsafe extern "C" fn stafeto_setcanceltype(kind: c_int, old: *mut c_int) -> 
     // SAFETY: the caller's promise.
     unsafe { old.write(value) };
     0
+}
+
+/// Controls the loader channel functional probe.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_start(mode: u32) -> c_int {
+    posix_abi::loader_probe::start(mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_listen() -> u32 {
+    posix_abi::loader_probe::listen()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_stop() -> u32 {
+    posix_abi::loader_probe::stop()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_disable() {
+    posix_abi::loader_probe::disable();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_full(slot: u32) -> c_int {
+    posix_abi::loader_probe::full(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loader_bundle(mode: u32) {
+    posix_abi::loader_probe::bundle_mode(mode);
 }

@@ -20,3 +20,4 @@ posix-sync = { path = "../posix-sync" }
 rt = { path = "../rt" }
 posix-fs = { path = "../posix-fs" }
 proto-process = { path = "../../proto/process" }
+proto-tty = { path = "../../proto/tty" }

@@ -49,6 +49,14 @@ pub const START_DATA_NAMES: [&str; 6] = [
 pub const BOOT_IMAGE: &str = "bootimage";
 /// The name of the RAM file service's record: it gets the boot image.
 pub const RAM_SERVICE: &str = "ramfs";
+pub const CLOCK_SERVICE: &str = "clock";
+
+/// These connections obtain roots for loaders at service startup.
+/// Processes keeps these endpoints solely to give narrowed loader copies.
+pub fn loader_grant(client: &str, service: &[u8]) -> bool {
+    client == PROCESS_SERVICE
+        && (service == RAM_SERVICE.as_bytes() || service == CLOCK_SERVICE.as_bytes())
+}
 /// The name of the POSIX process service (spec 2, section 3.1). A record
 /// that connects to it is a POSIX process: init takes no CONNECT to it and
 /// loads no program for it; the service takes the record with ADOPT,
@@ -60,10 +68,13 @@ pub const PROCESS_SERVICE: &str = "posix";
 /// The services init gives a notary session of the process service on
 /// CONNECT (proto_process::NOTARY): through it they ask who a client is
 /// (Vouch) and map the page of the credentials generations (Register).
-pub const VOUCHERS: &[&str] = &["clock", RAM_SERVICE];
+pub const VOUCHERS: &[&str] = &["clock", RAM_SERVICE, TERMINAL_SERVICE];
 /// The vouchers whose notary session may tell the process service that a
 /// file is set-ID (proto_process SetId, spec 2, 3.2): the file services.
 pub const SET_ID_VOUCHERS: &[&str] = &[RAM_SERVICE];
+/// The name of the terminal service (5f): its notary session may send
+/// TtySignal, SetCtty and DropCtty (proto_process::TERMINAL).
+pub const TERMINAL_SERVICE: &str = "tty";
 /// The name of the identity session of a POSIX process in its start data
 /// (spec 2, 3.1): the process gives copies of it to the services it asks
 /// something of, which ask the process service who it is.
@@ -481,7 +492,9 @@ pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     for client in table {
         for s in connections(table, client) {
             let service = &table[s];
-            if service.priority < client.ceiling {
+            if !loader_grant(client.name, service.name.as_bytes())
+                && service.priority < client.ceiling
+            {
                 return Err(TableError::BelowClient {
                     service: service.name,
                     priority: service.priority,
@@ -725,6 +738,9 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-relibc") as usize
     + cfg!(feature = "table-relibc-threads") as usize
     + cfg!(feature = "table-posix-procs") as usize
+    + cfg!(feature = "table-loader-channels") as usize
+    + cfg!(feature = "table-posix-poll") as usize
+    + cfg!(feature = "table-posix-pty") as usize
     + cfg!(feature = "table-posix-steps") as usize
     + cfg!(feature = "table-os-test") as usize
     + cfg!(feature = "table-posix-abi-vz") as usize
@@ -732,6 +748,11 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-rtbench-vz") as usize
     + cfg!(feature = "table-rtbench-posix") as usize
     + cfg!(feature = "table-rtbench-posix-vz") as usize
+    + cfg!(feature = "table-tty") as usize
+    + cfg!(feature = "table-tty-vz") as usize
+    + cfg!(feature = "table-tty-steps") as usize
+    + cfg!(feature = "table-posix-tty") as usize
+    + cfg!(feature = "table-posix-tty-vz") as usize
     + cfg!(feature = "table-entropy") as usize
     + cfg!(feature = "table-entropy-vz") as usize
     + cfg!(feature = "table-posix-random") as usize;
@@ -757,6 +778,9 @@ const _: () = assert!(
     feature = "table-relibc",
     feature = "table-relibc-threads",
     feature = "table-posix-procs",
+    feature = "table-loader-channels",
+    feature = "table-posix-poll",
+    feature = "table-posix-pty",
     feature = "table-posix-steps",
     feature = "table-os-test",
     feature = "table-posix-abi-vz",
@@ -764,6 +788,11 @@ const _: () = assert!(
     feature = "table-rtbench-vz",
     feature = "table-rtbench-posix",
     feature = "table-rtbench-posix-vz",
+    feature = "table-tty",
+    feature = "table-tty-vz",
+    feature = "table-tty-steps",
+    feature = "table-posix-tty",
+    feature = "table-posix-tty-vz",
     feature = "table-entropy",
     feature = "table-entropy-vz",
     feature = "table-posix-random"
@@ -775,6 +804,12 @@ pub const TABLE: &[Record] = ramfs::TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_ABI_TABLE;
 #[cfg(feature = "table-relibc")]
 pub const TABLE: &[Record] = ramfs::RELIBC_TABLE;
+#[cfg(feature = "table-loader-channels")]
+pub const TABLE: &[Record] = ramfs::LOADER_CHANNELS_TABLE;
+#[cfg(feature = "table-posix-poll")]
+pub const TABLE: &[Record] = ramfs::POSIX_POLL_TABLE;
+#[cfg(feature = "table-posix-pty")]
+pub const TABLE: &[Record] = ramfs::POSIX_PTY_TABLE;
 #[cfg(feature = "table-posix-procs")]
 pub const TABLE: &[Record] = ramfs::POSIX_PROCS_TABLE;
 #[cfg(feature = "table-posix-steps")]
@@ -809,6 +844,16 @@ pub const TABLE: &[Record] = test::TABLE;
 pub const TABLE: &[Record] = cycle::TABLE;
 #[cfg(feature = "table-ceiling")]
 pub const TABLE: &[Record] = ceiling::TABLE;
+#[cfg(feature = "table-tty")]
+pub const TABLE: &[Record] = ramfs::TTY_TABLE;
+#[cfg(feature = "table-tty-vz")]
+pub const TABLE: &[Record] = vz::TTY_TABLE;
+#[cfg(feature = "table-tty-steps")]
+pub const TABLE: &[Record] = ramfs::TTY_STEPS_TABLE;
+#[cfg(feature = "table-posix-tty")]
+pub const TABLE: &[Record] = ramfs::POSIX_TTY_TABLE;
+#[cfg(feature = "table-posix-tty-vz")]
+pub const TABLE: &[Record] = vz::POSIX_TTY_TABLE;
 #[cfg(feature = "table-entropy")]
 pub const TABLE: &[Record] = entropy::TABLE;
 #[cfg(feature = "table-entropy-vz")]
@@ -931,6 +976,42 @@ mod tests {
     /// Why `check` refuses `table`, as init prints it.
     fn refused(table: &[Record]) -> String {
         check(table).expect_err("the table is refused").to_string()
+    }
+
+    #[test]
+    fn loader_roots_keep_start_dependencies_and_allow_lower_service_levels() {
+        let records = [
+            Record {
+                connects: &["ramfs", "clock"],
+                ..service("posix", 48, 48)
+            },
+            service("ramfs", 40, 40),
+            service("clock", 32, 32),
+        ];
+        assert_eq!(order_of(&records), ["ramfs", "clock", "posix"]);
+        let ordinary = [
+            Record {
+                name: "ordinary",
+                ..records[0]
+            },
+            records[1],
+            records[2],
+        ];
+        assert!(matches!(
+            check(&ordinary),
+            Err(TableError::BelowClient { .. })
+        ));
+        let missing = [records[0], records[1]];
+        assert!(matches!(check(&missing), Err(TableError::Unknown { .. })));
+        let cycle = [
+            records[0],
+            records[1],
+            Record {
+                connects: &["posix"],
+                ..records[2]
+            },
+        ];
+        assert!(matches!(check(&cycle), Err(TableError::Cycle(_))));
     }
 
     #[test]
@@ -1448,6 +1529,20 @@ mod tests {
     /// tables are refused with the reasons xtask looks for in their runs.
     #[test]
     fn the_tables_of_the_images_pass_or_are_refused() {
+        assert_eq!(
+            order_of(ramfs::LOADER_CHANNELS_TABLE),
+            [
+                "uart",
+                "tty",
+                "ramfs",
+                "clock",
+                "posix",
+                "pipe",
+                "rng",
+                "entropy",
+                "posix-procs"
+            ]
+        );
         assert_eq!(order_of(normal::TABLE), ["uart", "shell"]);
         assert_eq!(order_of(vz::TABLE), ["uart", "shell"]);
         assert_eq!(
@@ -1456,24 +1551,50 @@ mod tests {
                 "uart",
                 "long",
                 "ramfs",
-                "posix",
                 "clock",
+                "posix",
                 "clock-peer",
                 "posix-abi-probe",
                 "posix-sender"
             ]
         );
+        for table in [vz::POSIX_TTY_TABLE, ramfs::POSIX_TTY_TABLE] {
+            assert_eq!(
+                order_of(table),
+                [
+                    "uart",
+                    "tty",
+                    "ramfs",
+                    "clock",
+                    "posix",
+                    "pipe",
+                    "posix-tty"
+                ]
+            );
+        }
+        for table in [ramfs::TTY_TABLE, vz::TTY_TABLE, ramfs::TTY_STEPS_TABLE] {
+            assert_eq!(order_of(table), ["uart", "tty", "tty-probe"]);
+        }
         assert_eq!(
             order_of(vz::BUSYBOX_DIALOG_TABLE),
-            ["uart", "ramfs", "posix", "clock", "pipe", "busybox-probe"]
+            [
+                "uart",
+                "tty",
+                "ramfs",
+                "clock",
+                "posix",
+                "pipe",
+                "busybox-probe"
+            ]
         );
         assert_eq!(
             order_of(ramfs::BUSYBOX_DIALOG_TABLE),
             [
                 "uart",
+                "tty",
                 "ramfs",
-                "posix",
                 "clock",
+                "posix",
                 "pipe",
                 "rng",
                 "entropy",
@@ -1483,9 +1604,11 @@ mod tests {
         assert_eq!(
             order_of(ramfs::OS_TEST_TABLE),
             [
+                "uart",
+                "tty",
                 "ramfs",
-                "posix",
                 "clock",
+                "posix",
                 "pipe",
                 "rng",
                 "entropy",
@@ -1497,8 +1620,8 @@ mod tests {
             order_of(ramfs::RELIBC_TABLE),
             [
                 "ramfs",
-                "posix",
                 "clock",
+                "posix",
                 "relibc-hello",
                 "relibc-abort",
                 "relibc-assert",
@@ -1507,14 +1630,14 @@ mod tests {
         );
         assert_eq!(
             order_of(ramfs::RELIBC_THREADS_TABLE),
-            ["ramfs", "posix", "clock", "relibc-threads"]
+            ["ramfs", "clock", "posix", "relibc-threads"]
         );
         assert_eq!(
             order_of(ramfs::POSIX_PROCS_TABLE),
             [
                 "ramfs",
-                "posix",
                 "clock",
+                "posix",
                 "pipe",
                 "rng",
                 "entropy",
@@ -1525,12 +1648,13 @@ mod tests {
             assert_eq!(
                 order_of(table),
                 [
-                    "console",
-                    "ramfs",
-                    "posix",
-                    "clock",
-                    "pipe",
                     "uart",
+                    "tty",
+                    "ramfs",
+                    "clock",
+                    "posix",
+                    "pipe",
+                    "bench-uart",
                     "rtbench-load",
                     "rng",
                     "entropy",
@@ -1576,6 +1700,7 @@ mod tests {
             ramfs::RELIBC_TABLE,
             ramfs::RELIBC_THREADS_TABLE,
             ramfs::OS_TEST_TABLE,
+            ramfs::POSIX_PTY_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
@@ -1594,6 +1719,7 @@ mod tests {
                     "os-test-run",
                     "rtbench-posix",
                     "posix-random",
+                    "posix-pty",
                 ]
                 .contains(&r.program)
             });

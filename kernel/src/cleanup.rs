@@ -116,6 +116,20 @@ pub unsafe fn requeue(item: NonNull<Item>, work: impl Into<Work>, level: u8) {
     unsafe { push(item, work.into(), level, true) }
 }
 
+/// Takes an item's work out of the queue in O(1).
+///
+/// # Safety
+/// `item` is alive and queued; its owner takes responsibility for its work.
+pub unsafe fn remove(item: NonNull<Item>) {
+    let mut q = QUEUE.lock();
+    // SAFETY: the caller's promise.
+    unsafe {
+        q.items.remove(item);
+        (*item.as_ptr()).work = None;
+    }
+    q.len -= 1;
+}
+
 /// Moves a queued object to the head of `level`, unless it stands higher:
 /// the object whose portion calls it waits for this one, right behind it
 /// (the stage Children of a process, spec 7.7).

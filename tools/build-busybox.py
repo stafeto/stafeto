@@ -32,7 +32,7 @@ STAMP = WORK / "config"
 A53_ERRATA = "-mfix-cortex-a53-835769"
 # BusyBox's main becomes busybox_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
-PATCH = "echo cat wc head-c mktemp ash-random ash ls-nofork relibc main-renamed a53-835769"
+PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-traps math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769"
 
 
 def relibc_commit() -> str:
@@ -53,7 +53,7 @@ OBJECTS = (
     "const_hack.o", "endofname.o", "bb_strtonum.o", "sysconf.o",
     "parse_mode.o", "time.o", "signals.o", "read_printf.o",
     "u_signal_names.o",
-    "safe_poll.o",
+    "safe_poll.o", "single_argv.o", "skip_whitespace.o", "bb_getgroups.o",
     "common_bufsiz.o", "concat_path_file.o", "printable_string.o",
     "xreadlink.o", "mode_string.o",
     "last_char_is.o", "auto_string.o",
@@ -96,7 +96,8 @@ def main() -> None:
     if (STAMP.exists() and STAMP.read_text() == config_stamp
             and (SOURCE / "libbb/lib.a").exists()
             and (SOURCE / "coreutils/lib.a").exists()
-            and (SOURCE / "shell/lib.a").exists()):
+            and (SOURCE / "shell/lib.a").exists()
+            and (SOURCE / "procps/lib.a").exists()):
         print(f"BusyBox objects ready: {SOURCE}")
         return
     WORK.mkdir(parents=True, exist_ok=True)
@@ -118,11 +119,43 @@ def main() -> None:
     # of settimeofday, which libbb's xsettimeofday names and no probe calls.
     replace(SOURCE / "include/platform.h",
             "#if defined(ANDROID) || defined(__ANDROID__)\n# if __ANDROID_API__ < 8",
-            "#if defined(__RELIBC__)\n# include <alloca.h>\n# undef HAVE_CLEARENV\n"
+            "#if defined(__RELIBC__)\n# define _PATH_TTY \"/dev/tty\"\n# include <alloca.h>\n# undef HAVE_CLEARENV\n"
             "# undef HAVE_MEMPCPY\n# undef HAVE_STRVERSCMP\n# undef HAVE_UNLOCKED_STDIO\n"
             "# undef HAVE_UNLOCKED_LINE_OPS\nstruct timeval;\nstruct timezone;\n"
             "int settimeofday(const struct timeval *, const struct timezone *);\n#endif\n\n"
             "#if defined(ANDROID) || defined(__ANDROID__)\n# if __ANDROID_API__ < 8")
+    # Interactive input returns to ash's trap evaluation after a signal.
+    # The terminal service supplies canonical input with Editing disabled.
+    replace(SOURCE / "shell/ash.c",
+            "#else\n\tnr = nonblock_immune_read(g_parsefile->pf_fd, buf, IBUFSIZ - 1);\n#endif",
+            "#else\n"
+            "# if defined(__RELIBC__)\n"
+            "\tif (iflag && g_parsefile->pf_fd == STDIN_FILENO) {\n"
+            "\t\tstruct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };\n"
+            "\t\tfor (;;) {\n"
+            "\t\t\tif (pending_sig && trap[pending_sig]) {\n"
+            "\t\t\t\tbuf[0] = '\\n';\n"
+            "\t\t\t\tbuf[1] = '\\0';\n"
+            "\t\t\t\treturn 1;\n"
+            "\t\t\t}\n"
+            "\t\t\tnr = read(STDIN_FILENO, buf, IBUFSIZ - 1);\n"
+            "\t\t\tif (nr <= 0 && pending_sig && trap[pending_sig]) {\n"
+            "\t\t\t\tbuf[0] = '\\n';\n"
+            "\t\t\t\tbuf[1] = '\\0';\n"
+            "\t\t\t\treturn 1;\n"
+            "\t\t\t}\n"
+            "\t\t\tif (nr < 0 && errno == EAGAIN) {\n"
+            "\t\t\t\tif (poll(&pfd, 1, -1) < 0 && errno != EINTR)\n"
+            "\t\t\t\t\treturn -1;\n"
+            "\t\t\t\tcontinue;\n"
+            "\t\t\t}\n"
+            "\t\t\tif (nr >= 0 || errno != EINTR)\n"
+            "\t\t\t\tbreak;\n"
+            "\t\t}\n"
+            "\t} else\n"
+            "# endif\n"
+            "\t\tnr = nonblock_immune_read(g_parsefile->pf_fd, buf, IBUFSIZ - 1);\n"
+            "#endif")
     kbuild = SOURCE / "libbb/Kbuild.src"
     lines = [line for line in kbuild.read_text().splitlines()
              if not line.startswith("lib-y +=")]
@@ -138,6 +171,7 @@ def main() -> None:
     replace(config, "# CONFIG_CAT is not set", "CONFIG_CAT=y")
     replace(config, "# CONFIG_LS is not set", "CONFIG_LS=y")
     replace(config, "# CONFIG_WC is not set", "CONFIG_WC=y")
+    replace(config, "# CONFIG_SLEEP is not set", "CONFIG_SLEEP=y")
     # The applets that take bytes or names from the random devices (5e').
     replace(config, "# CONFIG_HEAD is not set", "CONFIG_HEAD=y")
     replace(config, "# CONFIG_FEATURE_FANCY_HEAD is not set", "CONFIG_FEATURE_FANCY_HEAD=y")
@@ -149,6 +183,11 @@ def main() -> None:
     replace(config, "# CONFIG_FEATURE_CLEAN_UP is not set", "CONFIG_FEATURE_CLEAN_UP=y")
     replace(config, "# CONFIG_ASH is not set", "CONFIG_ASH=y")
     replace(config, "# CONFIG_ASH_ECHO is not set", "CONFIG_ASH_ECHO=y")
+    replace(config, "# CONFIG_ASH_JOB_CONTROL is not set", "CONFIG_ASH_JOB_CONTROL=y")
+    for name in ("FEATURE_SH_MATH", "ASH_TEST", "ASH_PRINTF", "ASH_GETOPTS",
+                 "ASH_ALIAS", "ASH_CMDCMD"):
+        replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
+    replace(config, "# CONFIG_KILL is not set", "CONFIG_KILL=y")
     replace(config, "# CONFIG_FEATURE_SH_STANDALONE is not set",
             "CONFIG_FEATURE_SH_STANDALONE=y")
     replace(config, "# CONFIG_FEATURE_SH_NOFORK is not set",
@@ -162,14 +201,14 @@ def main() -> None:
     include = RELIBC / "include"
     if not (include / "stdio.h").exists():
         raise SystemExit("build relibc with cargo xtask relibc first")
-    run("make", "-j4", "libbb", "coreutils", "shell", f"CC={clang}", f"LD={lld}",
+    run("make", "-j4", "libbb", "coreutils", "shell", "procps", f"CC={clang}", f"LD={lld}",
         f"AR={ar}", "HOSTCC=cc",
         "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-linux-gnu", "-nostdinc",
             f"-isystem {include}", f"-idirafter {COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
             "-ffunction-sections", "-fdata-sections", "-Dmain=busybox_main",
             A53_ERRATA)), cwd=SOURCE)
     for archive in [SOURCE / "libbb/lib.a", SOURCE / "coreutils/lib.a",
-                    SOURCE / "shell/lib.a"]:
+                    SOURCE / "shell/lib.a", SOURCE / "procps/lib.a"]:
         if not archive.exists():
             raise SystemExit(f"BusyBox did not produce {archive}")
     STAMP.write_text(config_stamp)

@@ -20,7 +20,7 @@ use pipe::{Held, Pipes, Roots, Wakes};
 use proto_init::ServiceArgs;
 use proto_pipe::{Cancel, HELD_MAX, MAX_READ, Method, OWN, Read, VERSION, Write};
 use proto_wire::clones::Clones;
-use proto_wire::{Status, long};
+use proto_wire::{Status, long, watch};
 use rt::abi::{Error, Rights, Source};
 use rt::handle::{Channel, Handle, Outgoing, Resource};
 use rt::service::{
@@ -75,6 +75,7 @@ struct Tables {
     births: [Option<Birth>; BIRTHS],
     pipes: Pipes,
     ops: LongOps<OPERATIONS>,
+    watches: watch::Pool<OPERATIONS>,
     roots: Roots<OPERATIONS>,
     clones: Clones<CLONES>,
 }
@@ -86,6 +87,7 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     births: [None; BIRTHS],
     pipes: Pipes::new(),
     ops: LongOps::new(),
+    watches: watch::Pool::new(),
     roots: Roots::new(),
     clones: Clones::new(),
 }));
@@ -121,6 +123,7 @@ fn main(_: u64) -> u64 {
     let mut service = PipeService {
         pipes: &mut tables.pipes,
         ops: &mut tables.ops,
+        watches: &mut tables.watches,
         roots: &mut tables.roots,
         channel: Handle::borrowed(channel.raw()),
         level,
@@ -134,6 +137,8 @@ fn main(_: u64) -> u64 {
     rt::println!("pipe: ready");
     #[cfg(feature = "steps")]
     rt::service::report_steps(4);
+    #[cfg(feature = "quiet-steps")]
+    rt::service::quiet_steps();
     let _ = rt::service::run_in(&channel, &mut service, config, &mut tables.sessions);
     4
 }
@@ -141,6 +146,7 @@ fn main(_: u64) -> u64 {
 struct PipeService {
     pipes: &'static mut Pipes,
     ops: &'static mut LongOps<OPERATIONS>,
+    watches: &'static mut watch::Pool<OPERATIONS>,
     /// The operations that wait, for each root.
     roots: &'static mut Roots<OPERATIONS>,
     /// The service's channel, which its own sessions are copies of.
@@ -204,12 +210,20 @@ impl PipeService {
             self.step_due = false;
             rt::service::step_own();
             let mut wakes = Wakes::default();
-            let more = self.pipes.step(&mut wakes);
+            let more = self.cleanup_step(&mut wakes);
             self.tell(&wakes);
             if more {
                 self.kick();
             }
         }
+    }
+
+    /// One reverse subscription and one deferred description per step.
+    fn cleanup_step(&mut self, wakes: &mut Wakes) -> bool {
+        if let Some((label, key, end)) = self.watches.cleanup() {
+            self.pipes.unwait(end, (label, key));
+        }
+        self.pipes.step(wakes) || self.watches.cleanup_due()
     }
 
     /// One operation of the session `s` is over (`finished`): it waits no
@@ -223,6 +237,10 @@ impl PipeService {
 
     /// Every operation of the session `s` goes (it went, or Abandon).
     fn abandon(&mut self, s: &mut Session<Client, 0>) {
+        self.watches.retire(s.label());
+        if self.watches.cleanup_due() {
+            self.kick();
+        }
         self.ops.gone(&mut s.data.long);
         self.roots
             .give(s.data.root, core::mem::take(&mut s.data.waiting));
@@ -307,7 +325,7 @@ impl PipeService {
             Err(answer) => return answer,
         };
         if let Some(key) = read.key
-            && !self.ops.waits(s.label(), key)
+            && (!self.ops.waits(s.label(), key) || self.watches.get(s.label(), key).is_some())
         {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
@@ -344,7 +362,7 @@ impl PipeService {
             Err(answer) => return answer,
         };
         if let Some(key) = write.key
-            && !self.ops.waits(s.label(), key)
+            && (!self.ops.waits(s.label(), key) || self.watches.get(s.label(), key).is_some())
         {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
@@ -373,6 +391,9 @@ impl PipeService {
             Err(status) => return Answer::Status(status),
         };
         let label = s.label();
+        if self.watches.get(label, cancel.key).is_some() {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
         if !self.ops.finish(&mut s.data.long, label, cancel.key) {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
@@ -382,6 +403,136 @@ impl PipeService {
         self.pipes.unwait(cancel.end, (label, cancel.key));
         self.pipes.unwait(cancel.end ^ 1, (label, cancel.key));
         long_answer(r, long::Reply::Cancelled)
+    }
+
+    fn watch_ready(r: &mut Request<'_>, ready: watch::Ready) -> Answer {
+        let mut body = proto_wire::Writer::new();
+        if let Err(status) = ready.write(&mut body) {
+            return Answer::Status(status);
+        }
+        long_answer(r, long::Reply::Ready(body.as_bytes()))
+    }
+
+    fn watch_start(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        let set = match watch::Set::parse(r.body()) {
+            Ok(set) if r.handles.is_empty() => set,
+            _ => return Answer::Status(Status::BadSize),
+        };
+        let descriptions = match s
+            .data
+            .held
+            .select(set.items[..set.len].iter().map(|item| item.description))
+        {
+            Ok(descriptions) => descriptions,
+            Err(code) => return status(code),
+        };
+        rt::service::step_detail(set.len as u64);
+        let ready = set.ready(|end| self.pipes.readiness(&s.data.held, end));
+        if ready.any() {
+            return Self::watch_ready(r, ready);
+        }
+        if let Err(code) = self.roots.take(s.data.root) {
+            return status(code);
+        }
+        let label = s.label();
+        let key = match self.ops.start(&mut s.data.long, label) {
+            Ok(key) => key,
+            Err(error) => {
+                self.roots.give(s.data.root, 1);
+                return Answer::Status(Status::Kernel(error));
+            }
+        };
+        s.data.waiting += 1;
+        let registered = self.watches.insert(label, key, set);
+        let mut refusal = if registered {
+            None
+        } else {
+            Some(proto_pipe::AGAIN)
+        };
+        if registered {
+            for description in descriptions.descriptions() {
+                let ops = &self.ops;
+                if let Err(code) = self
+                    .pipes
+                    .wait_new(description, (label, key), |(l, k)| ops.waits(l, k))
+                {
+                    refusal = Some(code);
+                    break;
+                }
+            }
+        }
+        if let Some(code) = refusal {
+            for description in descriptions.descriptions() {
+                self.pipes.unwait(description, (label, key));
+            }
+            self.watches.remove(label, key);
+            let finished = self.ops.finish(&mut s.data.long, label, key);
+            self.over(s, finished);
+            return status(code);
+        }
+        long_answer(r, long::Reply::Wait(key))
+    }
+
+    fn watch_keyed(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        cancel: bool,
+    ) -> Answer {
+        let key = match watch::key(r.body()) {
+            Ok(key) => key,
+            Err(status) => return Answer::Status(status),
+        };
+        let label = s.label();
+        let Some(set) = self
+            .watches
+            .get(label, key)
+            .copied()
+            .filter(|_| self.ops.waits(label, key))
+        else {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        };
+        if cancel {
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+        } else {
+            if r.handles.len() > 1 {
+                return Answer::Status(Status::BadSize);
+            }
+            if !r.handles.is_empty()
+                && !matches!(r.handles.info(0), Some((rt::abi::ObjectKind::Channel, rights)) if rights.contains(Rights::NOTIFY))
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            let notify = match Self::notify_of(r, true) {
+                Ok(notify) => notify,
+                Err(answer) => return answer,
+            };
+            match notify {
+                Some(handle) => {
+                    if let Err(error) = self.ops.arm(label, key, handle) {
+                        return Answer::Status(Status::Kernel(error));
+                    }
+                }
+                None => self.ops.untell(label, key),
+            }
+        }
+        rt::service::step_detail(set.len as u64);
+        let ready = set.ready(|end| self.pipes.readiness(&s.data.held, end));
+        if cancel {
+            for description in set.descriptions() {
+                self.pipes.unwait(description, (label, key));
+            }
+            self.watches.remove(label, key);
+            let finished = self.ops.finish(&mut s.data.long, label, key);
+            self.over(s, finished);
+            Self::watch_ready(r, ready)
+        } else if ready.any() {
+            Self::watch_ready(r, ready)
+        } else {
+            long_answer(r, long::Reply::Armed)
+        }
     }
 
     /// CLONE with a list of the session's descriptions (count u32, then
@@ -465,11 +616,24 @@ fn end_body(r: &Request<'_>, word: bool) -> Result<(u32, u32), Answer> {
 
 impl Service<0> for PipeService {
     const VERSION: u16 = VERSION;
-    const METHODS: &'static [u16] = proto_pipe::METHODS;
+    const METHODS: &'static [u16] = {
+        #[cfg(feature = "steps")]
+        {
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        }
+        #[cfg(not(feature = "steps"))]
+        {
+            proto_pipe::METHODS
+        }
+    };
     type Data = Client;
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         self.due();
+        #[cfg(feature = "steps")]
+        if r.method() == 17 {
+            return rt::service::step_snapshot(r);
+        }
         if !s.data.claimed {
             // The first request of a session Clone made takes its
             // descriptions and its root; init's client is its own root.
@@ -500,6 +664,9 @@ impl Service<0> for PipeService {
                     Err(code) => status(code),
                 }
             }
+            Some(Method::WatchStart) => self.watch_start(s, r),
+            Some(Method::WatchTake) => self.watch_keyed(s, r, false),
+            Some(Method::WatchCancel) => self.watch_keyed(s, r, true),
             Some(Method::ReadStart) => self.read(s, r, false),
             Some(Method::ReadTake) => self.read(s, r, true),
             Some(Method::WriteStart) => self.write(s, r, false),
@@ -589,7 +756,7 @@ impl Service<0> for PipeService {
         }
         self.step_told = false;
         let mut wakes = Wakes::default();
-        let more = self.pipes.step(&mut wakes);
+        let more = self.cleanup_step(&mut wakes);
         self.tell(&wakes);
         rt::service::step_own();
         rt::service::step_detail(u64::from(more));

@@ -1,0 +1,40 @@
+[package]
+name = "tty"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The terminal service of stafeto"
+
+# The line discipline, the pump of the output and the waiters, apart from
+# the loop: tested on the host, a fuzzing test with a corpus among them.
+[lib]
+bench = false
+
+[[bin]]
+name = "tty"
+test = false
+bench = false
+
+[features]
+# The longest step of the loop for each method, printed when it grows (rt
+# feature step-stats; xtask tty, under -icount).
+steps = ["rt/step-stats"]
+# Buffer maxima until the measurement client reads its snapshot.
+quiet-steps = ["steps"]
+# Trusted terminal and newborn probes, in the posix-tty image alone.
+trust-probe = []
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-init = { path = "../../proto/init" }
+proto-process = { path = "../../proto/process" }
+proto-tty = { path = "../../proto/tty" }
+proto-uart = { path = "../../proto/uart" }
+proto-wire = { path = "../../proto/wire" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt.
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }

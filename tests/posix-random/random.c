@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 extern char **environ;
+extern uint64_t random_probe_calls(void);
 
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -263,6 +264,7 @@ static void pause_ms(long ms) {
 static volatile sig_atomic_t usr2_ran, arc4_done, cancel_returned;
 static pthread_t arc4_thread, cancel_thread;
 static uint32_t arc4_value;
+static uint64_t cancel_wait_calls;
 
 static void on_usr2(int sig) {
     (void)sig;
@@ -279,7 +281,9 @@ static void *in_arc4random(void *arg) {
 static void *in_getentropy(void *arg) {
     (void)arg;
     unsigned char bytes[32];
+    uint64_t before = random_probe_calls();
     if (getentropy(bytes, sizeof bytes) == 0 && !all_zero(bytes, sizeof bytes)) cancel_returned = 1;
+    cancel_wait_calls = random_probe_calls() - before;
     pthread_testcancel();
     return NULL;
 }
@@ -362,6 +366,14 @@ static int nested(void) {
     CHECK(ended == PTHREAD_CANCELED && cancel_returned == 1);
     printf("posix-random: getentropy is no point of cancellation: it returned, the next point "
            "cancelled\n");
+    /* The counter includes the other three threads, the signal handlers
+     * and their joins while this thread waits for the first key. A finite
+     * set of requests fits well below this allowance. Retrying SEED on
+     * every cancellation EINTR turns the wait into thousands of calls. */
+    printf("posix-random: first seed wait used %llu kernel calls\n",
+           (unsigned long long)cancel_wait_calls);
+    CHECK(cancel_wait_calls <= 1024);
+    printf("posix-random: cancellation left the first seed wait bounded\n");
     CHECK(pipe(outer_pipe) == 0 && pipe(inner_pipe) == 0);
     nested_mode = 1;
     nested_done = 0;

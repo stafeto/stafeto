@@ -31,6 +31,10 @@ unsafe impl Sync for Cell {}
 static STATE: Cell = Cell(UnsafeCell::new(State { files: None }));
 static READY: AtomicBool = AtomicBool::new(false);
 static FILES_LOCK: LayerLock = LayerLock::raising();
+pub fn terminals_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+    process_state(|files| Ok(files.terminals_kept_by_fork(out)))
+}
+
 /// Runs `run` holding the lock of the process's files, for the guest probes.
 #[cfg(feature = "thread-probe")]
 pub fn probe_hold(run: impl FnOnce()) {
@@ -51,7 +55,7 @@ pub unsafe fn init(files: PosixFs) -> Result<(), rt::abi::Error> {
 }
 
 /// The files of a forked child (posix_fs::PosixFs::after_fork): its own
-/// sessions `files`, `uart` and `pipes`.
+/// sessions `files`, `uart`, `pipes` and `terminal`.
 ///
 /// # Safety
 /// The child's only thread, before anything else of the layer runs.
@@ -59,13 +63,14 @@ pub unsafe fn after_fork(
     files: Handle<rt::handle::Channel>,
     uart: Option<Handle<rt::handle::Channel>>,
     pipes: Option<Handle<rt::handle::Channel>>,
+    terminal: Option<Handle<rt::handle::Channel>>,
 ) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
     // SAFETY: the caller's promise gives this borrow alone.
     if let Some(own) = unsafe { (*STATE.0.get()).files.as_mut() } {
-        own.after_fork(files, uart, pipes);
+        own.after_fork(files, uart, pipes, terminal);
     }
 }
 
@@ -124,9 +129,9 @@ fn window() {
     }
 }
 
-/// Runs `run` with the transports and what `fd` names, held: outside the
-/// lock, and a close meanwhile releases the service's description once
-/// `run` is over.
+/// Runs `run` with the transports and what `fd` names, outside the lock.
+/// RAM and pipe close waits until `run` is over. Terminal last-fd close
+/// releases the real hold immediately; armed I/O retains a service pin.
 pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -> Result<R, i32> {
     let (transport, target) =
         process_state(|files| Ok((files.transport(), files.hold(fd).map_err(crate::error)?)))?;
@@ -237,21 +242,65 @@ fn pipe_reply(transport: Transport, end: u32, count: u32, out: &mut Writer) -> R
     Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
 }
 
+/// The reply of a read of the console through the terminal service (5f),
+/// its bytes once they came.
+#[inline(never)]
+fn terminal_reply(
+    transport: Transport,
+    number: u32,
+    count: u32,
+    out: &mut Writer,
+) -> Result<(), i32> {
+    let mut bytes = [0; posix_fs::MAX_READ];
+    let extent = (count as usize).min(bytes.len());
+    let n = crate::terminal::read(transport, number, &mut bytes[..extent])?;
+    Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
+}
+
 /// A read of `fd`: what it names held, outside the lock; the read of a
-/// pipe waits here. Each kind has its own frame: the reads of files stay
-/// as deep as they were (threads with small stacks read files).
+/// pipe or of the terminal waits here. Each kind has its own frame: the
+/// reads of files stay as deep as they were (threads with small stacks
+/// read files).
 fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
     held(fd, |transport, target| match target {
         Target::Pipe(end) => pipe_reply(transport, end, count, &mut *out),
+        Target::Input if transport.terminal().is_some() => {
+            terminal_reply(transport, proto_tty::CONSOLE, count, &mut *out)
+        }
+        Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
         Target::Random(_) => random_reply(count, &mut *out),
         target => file_reply(transport, target, count, &mut *out),
     })
 }
 
+/// What an open of a name gave: a description of the RAM file service, or
+/// a terminal of the terminal service.
+#[derive(Clone, Copy)]
+enum Opened {
+    File(Target),
+    /// A terminal, and whether it was opened as /dev/tty.
+    Terminal(u32, bool),
+}
+
+/// Synthetic terminal names shared by open and spawn file actions.
+pub(crate) fn terminal_name(name: &str) -> Option<(u32, u32)> {
+    match name {
+        "/dev/console" => Some((proto_tty::OPEN_CONSOLE, 0)),
+        "/dev/tty" => Some((proto_tty::OPEN_CONTROLLING, 0)),
+        "/dev/ptmx" => Some((proto_tty::OPEN_MASTER, 0)),
+        _ => name
+            .strip_prefix("/dev/pts/")
+            .and_then(|n| n.parse::<u32>().ok())
+            .map(|n| (proto_tty::OPEN_SLAVE, n)),
+    }
+}
+
 /// Open: the path resolved under the lock, the service's open outside it,
 /// then the descriptor under it again.
 fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
-    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES) != 0
+    if flags
+        & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY | O_NONBLOCK)
+        != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
         return Err(EINVAL);
@@ -271,18 +320,59 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
             return Err(ENOTDIR);
         }
         let name = path.as_str().map_err(crate::error)?;
+        // The names of terminals are the layer's to resolve (5f): the
+        // process's session with the terminal service serves them, and no
+        // request goes to the RAM files.
+        let named = terminal_name(name);
+        if transport.terminal().is_some()
+            && let Some((kind, number)) = named
+        {
+            if flags & O_DIRECTORY != 0 || path.trailing_slash {
+                return Err(ENOTDIR);
+            }
+            let id = crate::terminal::open(
+                transport,
+                kind,
+                (flags & (O_ACCMODE | O_NONBLOCK)) as u32,
+                number,
+            )?;
+            return Ok((
+                transport,
+                Opened::Terminal(
+                    id,
+                    kind == proto_tty::OPEN_CONTROLLING || kind == proto_tty::OPEN_MASTER,
+                ),
+            ));
+        }
         let opened = transport
             .open(name, (flags & O_ACCMODE) as u32 | directory)
             .map_err(crate::error)?;
-        Ok((transport, opened))
+        Ok((transport, Opened::File(opened)))
     })?;
     let inserted = process_state(|files| {
-        files
-            .insert(opened, crate::descriptor_flags(flags))
-            .map_err(crate::error)
+        let flags = crate::descriptor_flags(flags);
+        match opened {
+            Opened::File(fd) => files.insert(fd, flags),
+            Opened::Terminal(number, _) => files.insert_terminal(number, flags),
+        }
+        .map_err(crate::error)
     });
+    // A session leader that opens a terminal without O_NOCTTY takes it as
+    // its controlling terminal when its session has none and the terminal
+    // is no other session's (XBD 11.1.3); the open stands either way.
+    if inserted.is_ok()
+        && let Opened::Terminal(number, false) = opened
+        && flags & O_NOCTTY == 0
+        && crate::process::getsid(0) == Ok(crate::process::getpid())
+    {
+        let _ = crate::terminal::job(transport, number, proto_tty::Method::Acquire, None);
+    }
     if inserted.is_err() {
-        let _ = transport.release(Some(opened));
+        let target = match opened {
+            Opened::File(target) => target,
+            Opened::Terminal(id, _) => Target::Tty(id),
+        };
+        let _ = transport.release(Some(target));
     }
     inserted.map(u64::from)
 }
@@ -295,6 +385,13 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
             // A file or the console takes at most one message of it.
             let extent = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];
             match target {
+                // The write of the terminal waits here, outside the lock.
+                Target::Output | Target::Error if transport.terminal().is_some() => {
+                    crate::terminal::write(transport, proto_tty::CONSOLE, bytes).map(|n| n as u64)
+                }
+                Target::Tty(number) => {
+                    crate::terminal::write(transport, number, bytes).map(|n| n as u64)
+                }
                 Target::Output | Target::Error => transport
                     .input()
                     .write(extent)

@@ -58,10 +58,29 @@ impl<const N: usize> Clones<N> {
 
     /// `add` with `most` clones of `client` at most (`room_within`).
     pub fn add_within(&mut self, label: u64, client: u64, most: usize) -> Result<(), Full> {
-        self.room_within(client, most)?;
-        let free = self.live.iter_mut().find(|l| l.is_none()).ok_or(Full)?;
-        *free = Some((label, client));
+        let mut own = 0;
+        let mut free = None;
+        for (index, live) in self.live.iter().enumerate() {
+            match live {
+                Some((_, owner)) => own += usize::from(*owner == client),
+                None if free.is_none() => free = Some(index),
+                None => {}
+            }
+        }
+        if own >= most {
+            return Err(Full);
+        }
+        self.live[free.ok_or(Full)?] = Some((label, client));
         Ok(())
+    }
+
+    /// The client the live clone `label` was made for, if it is one.
+    pub fn client_of(&self, label: u64) -> Option<u64> {
+        self.live
+            .iter()
+            .flatten()
+            .find(|(l, _)| *l == label)
+            .map(|(_, c)| *c)
     }
 
     /// The last copy of the clone `label` went.
@@ -96,5 +115,7 @@ mod tests {
             assert_eq!(c.add(2000 + i, 9), Ok(()));
         }
         assert_eq!(c.add(3000, 10), Err(Full), "the service's 64");
+        assert_eq!(c.client_of(1000), Some(7));
+        assert_eq!(c.client_of(100), None, "gone");
     }
 }

@@ -136,8 +136,10 @@ pub const MAX_CWD: usize = MAX_PATH;
 
 /// What a descriptor names: the console's input, output or error, an
 /// open description of the RAM file service by its number in the
-/// process's session, or an end of a pipe of the pipe service by its
-/// number there (5e).
+/// process's session, an end of a pipe of the pipe service by its
+/// number there (5e), or an opaque open description of the terminal
+/// service (5f). The implicit standard console uses CONSOLE (0); an
+/// explicit terminal open has its own generation and description ID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Target {
     Input,
@@ -145,10 +147,28 @@ pub enum Target {
     Error,
     Ram(u32),
     Pipe(u32),
+    Tty(u32),
     /// A random device (`/dev/random`, `/dev/urandom`, 5e'): the service's
     /// open description of this number takes the writes, the closes and
     /// the `fstat`, and the layer serves the reads from its generator.
     Random(u32),
+}
+
+/// The name `ttyname` gives the terminal `terminal`.
+pub fn terminal_path(terminal: u32) -> Option<&'static str> {
+    (terminal == proto_tty::CONSOLE).then_some("/dev/console")
+}
+
+/// The terminal a path names, as the layer resolves it itself (5f,
+/// decision 5): `path` is absolute and normalised. The names of the
+/// terminal service go to its session and never to the RAM file
+/// service. `/dev/tty` is the controlling terminal of the caller's
+/// session, which the console is until sessions come (5f, T3).
+pub fn terminal_named(path: &str) -> Option<u32> {
+    match path {
+        "/dev/console" | "/dev/tty" => Some(proto_tty::CONSOLE),
+        _ => None,
+    }
 }
 
 /// One process's file state, mutated by one owner: the table of
@@ -161,6 +181,9 @@ pub struct PosixFs {
     files: Files,
     /// The session with the pipe service, when the process has one.
     pipes: Option<Handle<Channel>>,
+    /// The session with the terminal service, when the process has one:
+    /// the console's input, output and error go there (5f).
+    terminal: Option<Handle<Channel>>,
     paths: PathState,
     descriptors: Table<Target, OPEN_MAX>,
 }
@@ -169,7 +192,7 @@ pub struct PosixFs {
 /// stays alive while a transport is used: what a request needs outside
 /// the owner's lock.
 #[derive(Clone, Copy)]
-pub struct Transport(View, Option<rt::abi::Handle>);
+pub struct Transport(View, Option<rt::abi::Handle>, Option<rt::abi::Handle>);
 
 /// A path the owner resolved against its current directory, for a
 /// request outside its lock.
@@ -248,6 +271,11 @@ impl Transport {
             .ok_or(FsError::BadFileDescriptor)
     }
 
+    /// The session with the terminal service, when the process has one.
+    pub fn terminal(&self) -> Option<ManuallyDrop<Handle<Channel>>> {
+        self.2.map(Handle::borrowed)
+    }
+
     /// Close of the service's description `fd` that the table handed back.
     /// The console's targets take no frame of the requests: the probes of
     /// requests before the heap run it on a small stack.
@@ -255,7 +283,30 @@ impl Transport {
         match target {
             Some(Target::Ram(fd) | Target::Random(fd)) => self.close_file(fd),
             Some(Target::Pipe(end)) => self.close_pipe(end),
+            Some(Target::Tty(id)) => self.close_terminal(id),
             _ => Ok(()),
+        }
+    }
+
+    fn close_terminal(&self, id: u32) -> Result<(), FsError> {
+        let mut request = proto_wire::Writer::new();
+        proto_tty::description(proto_tty::Method::Close, id, None, &mut request)
+            .map_err(FsError::from)?;
+        let terminal = self.terminal().ok_or(FsError::BadFileDescriptor)?;
+        let reply = loop {
+            match rt::sys::send(&terminal, request.as_bytes()) {
+                Err(rt::abi::Error::Interrupted) => continue,
+                result => break result.map_err(|_| FsError::Io)?,
+            }
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let code = proto_wire::Reader::new(reply.bytes(&mut buffer))
+            .u32()
+            .map_err(FsError::from)?;
+        match code {
+            0 => Ok(()),
+            proto_tty::BAD_DESCRIPTION => Err(FsError::BadFileDescriptor),
+            _ => Err(FsError::Io),
         }
     }
 
@@ -387,12 +438,53 @@ impl Transport {
         }
     }
 
+    fn terminal_information(&self, id: u32, physical: Option<u32>) -> Result<NodeInfo, FsError> {
+        let mut w = proto_wire::Writer::new();
+        proto_tty::Method::Stat
+            .header()
+            .write(&mut w)
+            .map_err(FsError::from)?;
+        w.u32(id).map_err(FsError::from)?;
+        if let Some(terminal) = physical {
+            w.u32(terminal).map_err(FsError::from)?;
+        }
+        let channel = self.terminal().ok_or(FsError::BadFileDescriptor)?;
+        let reply = loop {
+            match rt::sys::send(&channel, w.as_bytes()) {
+                Err(rt::abi::Error::Interrupted) => continue,
+                result => break result.map_err(|_| FsError::Io)?,
+            }
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        let mut r = proto_wire::Reader::new(bytes);
+        match r.u32().map_err(FsError::from)? {
+            0 => {}
+            proto_tty::BAD_DESCRIPTION => return Err(FsError::BadFileDescriptor),
+            proto_tty::NO_ENTRY => return Err(FsError::NoEntry),
+            _ => return Err(FsError::Io),
+        }
+        let info =
+            proto_tty::Stat::read(proto_wire::Reader::new(&bytes[4..])).map_err(FsError::from)?;
+        Ok(NodeInfo {
+            kind: 3,
+            uid: info.uid,
+            gid: info.gid,
+            permissions: info.mode & 0o7777,
+            device: 4,
+            special_device: u64::from(info.terminal) + (u64::from(info.side) << 32),
+            inode: u64::from(info.terminal) + 1,
+            ..CONSOLE_INFO
+        })
+    }
+
     pub fn descriptor_information(&self, target: Target) -> Result<NodeInfo, FsError> {
         match target {
             Target::Ram(fd) | Target::Random(fd) => self
                 .files()
                 .descriptor_information(fd)
                 .map_err(FsError::from),
+            Target::Tty(id) => self.terminal_information(id, None),
             Target::Pipe(end) => {
                 let [pipe, _] = self.pipe_call(proto_pipe::Method::Stat, end, None)?;
                 Ok(NodeInfo {
@@ -421,7 +513,39 @@ impl Transport {
         })
     }
 
+    /// The terminal a descriptor's `target` is: the console's standard
+    /// descriptors when the process has a session with the terminal
+    /// service, and the terminals opened by name; None for the rest.
+    pub fn terminal_number(&self, target: Target) -> Option<u32> {
+        match target {
+            Target::Tty(number) => Some(number),
+            Target::Input | Target::Output | Target::Error if self.terminal().is_some() => {
+                Some(proto_tty::CONSOLE)
+            }
+            _ => None,
+        }
+    }
+
+    /// The terminal `path` names, when the process has a session with the
+    /// terminal service to open it through (`terminal_named`).
+    pub fn terminal_of(&self, path: &Resolved) -> Result<Option<u32>, FsError> {
+        if self.terminal().is_none() {
+            return Ok(None);
+        }
+        let named = terminal_named(path.as_str()?);
+        if named.is_some() && path.trailing_slash {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(named)
+    }
+
     pub fn stat(&self, path: &Resolved) -> Result<Metadata, FsError> {
+        if self.terminal_of(path)?.is_some() {
+            return Ok(Metadata {
+                kind: FileKind::Character,
+                size: 0,
+            });
+        }
         let meta = self.files().lookup(path.as_str()?).map_err(FsError::from)?;
         let kind = FileKind::from_wire(meta.kind)?;
         if path.trailing_slash && kind == FileKind::Regular {
@@ -434,6 +558,25 @@ impl Transport {
     }
 
     pub fn stat_information(&self, path: &Resolved) -> Result<NodeInfo, FsError> {
+        let name = path.as_str()?;
+        if self.terminal().is_some() {
+            let physical = if name == "/dev/ptmx" {
+                Some(proto_tty::STAT_PATH)
+            } else {
+                name.strip_prefix("/dev/pts/")
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .and_then(|n| n.checked_add(1))
+            };
+            if let Some(physical) = physical {
+                if path.trailing_slash {
+                    return Err(FsError::NotDirectory);
+                }
+                return self.terminal_information(proto_tty::STAT_PATH, Some(physical));
+            }
+        }
+        if self.terminal_of(path)?.is_some() {
+            return Ok(CONSOLE_INFO);
+        }
         let info = self
             .files()
             .node_information(path.as_str()?)
@@ -511,6 +654,13 @@ impl PosixFs {
         self.pipes = pipes;
     }
 
+    /// The session with the terminal service the program was given (from
+    /// init, or its loader's start, the slot Terminal): the console's
+    /// targets go to it.
+    pub fn set_terminal(&mut self, terminal: Option<Handle<Channel>>) {
+        self.terminal = terminal;
+    }
+
     /// The files through sessions the program was given (its loader's
     /// start, spec 2, 3.2), with `cwd` its current directory and the
     /// descriptors of `inherited` (the console's 0, 1 and 2 when None).
@@ -530,8 +680,11 @@ impl PosixFs {
                 let mut fs = Self {
                     files: Files::from_sessions(files, uart),
                     pipes: None,
+                    terminal: None,
                     paths: PathState::new(),
-                    descriptors: Table::default(),
+                    descriptors: Table::with_early_release(|target| {
+                        matches!(target, Target::Tty(_))
+                    }),
                 };
                 for d in list {
                     fs.descriptors
@@ -557,7 +710,8 @@ impl PosixFs {
     }
 
     /// The files of a forked child (spec 2, 3.2), whose table is a copy of
-    /// its parent's: its own sessions `files` and `uart`, clones of its
+    /// its parent's: its own sessions `files`, `uart`, `pipes` and
+    /// `terminal`, clones of its
     /// parent's that share the descriptions of the descriptors without
     /// FD_CLOFORK, in place of the parent's, which name nothing of the
     /// child's and go without a close; the descriptors with FD_CLOFORK go
@@ -568,10 +722,12 @@ impl PosixFs {
         files: Handle<Channel>,
         uart: Option<Handle<Channel>>,
         pipes: Option<Handle<Channel>>,
+        terminal: Option<Handle<Channel>>,
     ) {
         let parent = core::mem::replace(&mut self.files, Files::from_sessions(files, uart));
         core::mem::forget(parent);
         core::mem::forget(core::mem::replace(&mut self.pipes, pipes));
+        core::mem::forget(core::mem::replace(&mut self.terminal, terminal));
         while self.descriptors.abandon_hold().is_some() {}
         let mut closing = [false; OPEN_MAX];
         for (fd, _, flags) in self.descriptors.open() {
@@ -601,9 +757,22 @@ impl PosixFs {
         count
     }
 
-    /// The ends of pipes a forked child's session shares with its
-    /// parent's: those of the descriptors without FD_CLOFORK, each once,
-    /// into `out`; how many.
+    /// The terminal descriptions retained by a forked child, each once.
+    pub fn terminals_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+        let mut count = 0;
+        for (_, target, flags) in self.descriptors.open() {
+            if !flags.close_on_fork
+                && let Target::Tty(id) = target
+                && !out[..count].contains(&id)
+            {
+                out[count] = id;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Pipe ends retained by a forked child, each once.
     pub fn pipes_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
@@ -629,14 +798,20 @@ impl PosixFs {
         self.pipes.as_ref()
     }
 
+    /// The session with the terminal service, when the process has one.
+    pub fn terminal(&self) -> Option<&Handle<Channel>> {
+        self.terminal.as_ref()
+    }
+
     fn from_files(files: Files) -> Result<Self, FsError> {
-        let mut descriptors = Table::default();
+        let mut descriptors = Table::with_early_release(|target| matches!(target, Target::Tty(_)));
         for target in [Target::Input, Target::Output, Target::Error] {
             descriptors.insert(target, DescriptorFlags::default())?;
         }
         Ok(Self {
             files,
             pipes: None,
+            terminal: None,
             paths: PathState::new(),
             descriptors,
         })
@@ -644,7 +819,11 @@ impl PosixFs {
 
     /// The transports, for a request outside the owner's lock.
     pub fn transport(&self) -> Transport {
-        Transport(self.files.view(), self.pipes.as_ref().map(Handle::raw))
+        Transport(
+            self.files.view(),
+            self.pipes.as_ref().map(Handle::raw),
+            self.terminal.as_ref().map(Handle::raw),
+        )
     }
 
     pub fn cwd(&self) -> &[u8] {
@@ -673,8 +852,9 @@ impl PosixFs {
         self.descriptors.get(fd).map_err(FsError::from)
     }
 
-    /// What `fd` names, held for a request outside the owner's lock: a
-    /// close meanwhile leaves the service's description until `unhold`.
+    /// What `fd` names, held for a request outside the owner's lock.
+    /// RAM and pipe close waits for `unhold`; terminal last-fd close
+    /// releases its real hold immediately, while armed I/O keeps a pin.
     pub fn hold(&mut self, fd: u32) -> Result<Target, FsError> {
         self.descriptors.hold(fd).map_err(FsError::from)
     }
@@ -697,6 +877,18 @@ impl PosixFs {
     pub fn insert(&mut self, target: Target, flags: DescriptorFlags) -> Result<u32, FsError> {
         self.descriptors
             .insert(target, flags)
+            .map_err(FsError::from)
+    }
+
+    /// The lowest free descriptor for terminal `terminal` of the terminal
+    /// service (an open of its name, `terminal_named`).
+    pub fn insert_terminal(
+        &mut self,
+        terminal: u32,
+        flags: DescriptorFlags,
+    ) -> Result<u32, FsError> {
+        self.descriptors
+            .insert(Target::Tty(terminal), flags)
             .map_err(FsError::from)
     }
 

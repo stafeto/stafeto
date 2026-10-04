@@ -3,8 +3,8 @@
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 """Compile os-test's suites for stafeto (`cargo xtask os-test`): Sortix's
-os-test (ISC) at a pinned commit, its io, malloc, process and signal
-suites and the parts of its basic suite that start programs: basic/spawn,
+os-test (ISC) at a pinned commit, its io, malloc, process, signal
+and pty suites and the parts of its basic suite that start programs: basic/spawn,
 the tests of basic/unistd named exec*, basic/unistd/getentropy (5e'), and
 the tests of every part of basic/ that call fork; each test with relibc's headers
 (target/relibc/sysroot, cargo xtask relibc) into an object of its own
@@ -17,23 +17,24 @@ suite has none of: its tests pass with the outcome `exit: 0`. A stamp of
 both commits makes a second run do nothing."""
 
 import importlib.util
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 
 REPOSITORY = "https://gitlab.com/sortix/os-test.git"
 COMMIT = "f8144f0215ea265fd46281e29271d8e857a6856e"
-SUITES = ("io", "malloc", "process", "signal")
+SUITES = ("io", "malloc", "process", "signal", "pty")
 # The parts of the basic suite and which of their tests run: a glob, or
-# None for the tests that call fork (5d) or pipe (5e). Tests that need
-# poll or select stay in: `cargo xtask os-test` marks them unsupported
-# until those come (5f).
+# None for the tests that call fork (5d) or pipe (5e). Readiness groups
+# poll, sys_select and termios include every test explicitly (5f).
 BASIC = (("spawn", "*.c"), ("unistd", "*exec*.c"), ("unistd", "getentropy.c"),
          ("unistd", None),
-         ("nl_types", None), ("poll", None), ("pthread", None), ("signal", None),
-         ("stdlib", None), ("sys_select", None), ("sys_wait", None), ("termios", None),
+         ("nl_types", None), ("poll", "*.c"), ("pthread", None), ("signal", None),
+         ("stdlib", None), ("sys_select", "*.c"), ("sys_wait", None), ("termios", "*.c"),
          ("fmtmsg", None), ("stdio", None), ("wchar", None))
 FORK = re.compile(r"(^|[^_\w])(v?fork|pipe2?)\(")
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +43,7 @@ SOURCE = WORK / "source"
 OBJECTS = WORK / "objects"
 LIST = WORK / "tests.txt"
 STAMP = WORK / "stamp"
-INCLUDE = ROOT / "target" / "relibc" / "sysroot" / "include"
+INCLUDE = Path(os.environ.get("STAFETO_RELIBC_SYSROOT", ROOT / "target" / "relibc" / "sysroot")) / "include"
 # os-test's compile.sh, with the C ABI relibc's headers describe.
 FLAGS = ("--target=aarch64-linux-gnu", "-nostdinc", "-isystem", str(INCLUDE),
          "-mno-outline-atomics", "-mfix-cortex-a53-835769", "-fno-stack-protector",
@@ -119,7 +120,17 @@ def fetch() -> None:
 def main() -> None:
     if not (INCLUDE / "stdio.h").exists():
         raise SystemExit("build relibc with cargo xtask relibc first")
-    config = f"{COMMIT} {SUITES} {BASIC} relibc {relibc_commit()} {' '.join(FLAGS)}\n"
+    args = sys.argv[1:]
+    if args and (len(args) != 2 or args[0] != "--suite"):
+        raise SystemExit("usage: build-os-test.py [--suite NAME]")
+    selected = args[1] if args else None
+    parts = [(suite, suite, "*.c") for suite in SUITES]
+    parts += [(f"basic/{part}", f"basic/{part}", pattern) for part, pattern in BASIC]
+    if selected is not None:
+        parts = [part for part in parts if part[0] == selected]
+        if not parts:
+            raise SystemExit(f"unknown os-test suite: {selected}")
+    config = f"{COMMIT} {SUITES} {BASIC} suite {selected} relibc {relibc_commit()} {' '.join(FLAGS)}\n"
     if STAMP.exists() and STAMP.read_text() == config and LIST.exists():
         print(f"os-test objects ready: {LIST}")
         return
@@ -128,8 +139,6 @@ def main() -> None:
         shutil.rmtree(OBJECTS)
     compiler = clang()
     lines = []
-    parts = [(suite, suite, "*.c") for suite in SUITES]
-    parts += [(f"basic/{part}", f"basic/{part}", pattern) for part, pattern in BASIC]
     seen = set()
     for suite, directory, pattern in parts:
         (OBJECTS / directory).mkdir(parents=True, exist_ok=True)
@@ -147,6 +156,8 @@ def main() -> None:
                 lines.append(f"{name} {target}")
             else:
                 lines.append(f"{name} !{outcome(result.stderr, test.read_text())}")
+    if not lines:
+        raise SystemExit(f"empty os-test suite: {selected}")
     LIST.write_text("\n".join(lines) + "\n")
     STAMP.write_text(config)
     print(f"os-test objects ready: {LIST}")

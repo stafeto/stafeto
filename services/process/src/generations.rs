@@ -6,12 +6,13 @@
 //! the service maps for writing at its own address and gives the services
 //! that ask (Register) a read-only copy of. The service raises a record's
 //! word with Release when it makes the record and before it answers a
-//! change of its credentials; a service that remembers the answer of Vouch reads
+//! change of its credentials; the second half holds the group and session
+//! of each record (5f); a service that remembers the answer of Vouch reads
 //! the word with Acquire, with no call, before each check. The words never
 //! start over: a record made in a used index raises its word.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use proto_process::{GENERATIONS_SIZE, RECORDS};
+use proto_process::{GENERATIONS_SIZE, GROUPS_AT, RECORDS, groups_word};
 use rt::abi::{Access, Error, Rights};
 use rt::handle::{Handle, Memory, Process};
 use rt::sys;
@@ -31,7 +32,8 @@ impl Generations {
 
     /// Makes the object and maps it in `own`, the service's process.
     pub fn make(&mut self, own: &Handle<Process>) -> Result<(), Error> {
-        const { assert!(GENERATIONS_SIZE as u64 <= PAGE) };
+        const { assert!((GROUPS_AT + RECORDS * 8) as u64 <= PAGE) };
+        const { assert!(GENERATIONS_SIZE <= GROUPS_AT) };
         let object = sys::mem_create(PAGE)?;
         sys::mem_map(own, &object, 0, PAGE, BASE, Access::ReadWrite)?;
         self.object = Some(object);
@@ -56,6 +58,20 @@ impl Generations {
         if let Some(w) = self.word(index) {
             w.fetch_add(1, Ordering::Release);
         }
+    }
+
+    /// The word of the group and session of the record in `index`, in the
+    /// second half of the page (proto_process GROUPS_AT), with Release:
+    /// `None` clears it.
+    pub fn set_groups(&self, index: usize, groups: Option<(u32, u32)>) {
+        if self.object.is_none() || index >= RECORDS {
+            return;
+        }
+        // SAFETY: as in `word`: the second half of the page holds a word
+        // for each index below RECORDS.
+        let word = unsafe { &*((BASE + GROUPS_AT + index * 8) as *const AtomicU64) };
+        let value = groups.map_or(0, |(pgid, sid)| groups_word(pgid, sid));
+        word.store(value, Ordering::Release);
     }
 
     /// A copy of the object with MAP_READ and TRANSFER, for Register.

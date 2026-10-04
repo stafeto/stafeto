@@ -66,7 +66,13 @@ links statically with relibc over the Rust POSIX layer. The dialog's
 files of `/bin` (`/bin/ls -la`, `/bin/ash -c 'exit 3'`). Pipelines work in
 the dialog (`ls /etc | cat`, a pipeline of three, `ls /bin | wc -l`, a job
 in the background with `wait`), and `/dev/null` takes redirections. The
-terminal and job control come in 5f.
+terminal service provides canonical input, termios and window sizes,
+process groups, Ctrl-C/Ctrl-Z and `jobs`, `bg` and `fg`. Interactive ash
+also runs through a PTY master. The service has eight PTY pairs beside
+the console; `posix_openpt`, `grantpt`, `unlockpt` and `ptsname` expose
+`/dev/ptmx` and `/dev/pts/N`. `poll`, `ppoll`, `select` and `pselect`
+wait on pipes and terminal descriptions. [notes/m5f-tty.md](notes/m5f-tty.md)
+has their limits and checks.
 
 **POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
 interface. The C library is relibc (a fork pinned by
@@ -162,10 +168,12 @@ the services and the limits.
 BusyBox included; its platform is the layer's `stafeto_*` functions.
 os-test's io, malloc, process and signal suites, `basic/spawn`, `basic/unistd`
 `exec*` and the `basic` tests that call `fork` run on it in `ci` from files,
-one boot a suite: 121 pass, 73 fail (`mkstemp`, `access`, `sigaltstack`,
-`posix_openpt`: the RAM service creates no file yet and the terminal and
-job control wait for 5f) and 11 need `poll` or `select` (5f) of 205; `ci`
-fails when a test that passed stops passing. relibc
+one boot a suite. The baseline before the terminal extension had 121
+passes, 73 failures and 11 unsupported cases out of 205; `ci` fails when
+a test that passed stops passing. The PTY and termios suites now exercise
+the terminal APIs, and readiness tests cover all four waiting interfaces.
+The remaining file and signal work includes `mkstemp`, `access` and
+`sigaltstack`. relibc
 builds at its own level 3: user-space programs have no size limit, only
 the kernel has one. Details are in
 [docs/status.md](docs/status.md).
@@ -285,8 +293,8 @@ Bounded kernel paths and their costs:
 | POSIX: spawn and exec | boot image files in the RAM service, a loader, `posix_spawn` and `exec` from files, set-ID through the file service, os-test from files, measured steps of the process service | ✅ [#78](https://github.com/stafeto/stafeto/pull/78) |
 | POSIX: fork | `fork` with the loader copying the parent; the other threads stop for it; `ash` runs external programs; rtbench rows by memory size | ✅ [#79](https://github.com/stafeto/stafeto/pull/79) |
 | POSIX: pipes | a pipe service, `pipe`, ends across `fork`, `posix_spawn` and `exec`, `SA_RESTART` and `SIGCHLD` in the shell, `setpgid` of a child, `/dev/null`; `ash` runs `ls \| cat`; rtbench rows of pipes | ✅ [#80](https://github.com/stafeto/stafeto/pull/80) |
-| POSIX: terminal | a terminal service with `termios`, pseudo-terminals, job control, `poll` and `select`, Ctrl-C to the foreground group, the missing `ash` built-ins | 🚧 |
-| POSIX: random numbers | a Virtio entropy driver and an entropy service, a ChaCha20 generator in the layer, `getentropy`, `getrandom`, `arc4random`, `/dev/random` and `/dev/urandom`, names of `mkstemp` from the generator; rtbench rows of the generator | 🚧 |
+| POSIX: terminal | a terminal service with `termios`, pseudo-terminals, job control, `poll` and `select`, Ctrl-C to the foreground group, the missing `ash` built-ins | ✅ [#83](https://github.com/stafeto/stafeto/pull/83) |
+| POSIX: random numbers | a Virtio entropy driver and an entropy service, a ChaCha20 generator in the layer, `getentropy`, `getrandom`, `arc4random`, `/dev/random` and `/dev/urandom`, names of `mkstemp` from the generator; rtbench rows of the generator | ✅ [#82](https://github.com/stafeto/stafeto/pull/82) |
 | POSIX: files with writing | the RAM file service creates files and directories, `/tmp`, `fcntl` locks, FIFOs | ⬜ |
 | POSIX: conformance | the full os-test suite and Open POSIX in `ci`, honest headers and `sysconf`, `cargo xtask coverage` checking the standard's interface list against the C library at every step | ⬜ |
 | POSIX: timers and scheduling | POSIX timers, CPU time, `SCHED_FIFO` and `SCHED_RR`, queued signals | ⬜ |

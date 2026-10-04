@@ -13,6 +13,7 @@ pub mod allocation;
 pub mod clock;
 pub mod constants;
 pub mod fork;
+pub mod loader_probe;
 pub mod long;
 pub mod metadata;
 pub mod pipes;
@@ -21,8 +22,10 @@ pub mod random;
 pub mod relibc;
 pub mod shared;
 pub mod signals;
+pub mod terminal;
 pub mod threads;
 pub mod tls;
+pub mod wait;
 
 use constants::*;
 use core::ffi::{c_char, c_int};
@@ -127,7 +130,9 @@ pub unsafe fn path<'a>(pointer: *const c_char) -> Result<&'a [u8], c_int> {
 /// Opens `name` with the access mode, O_DIRECTORY, O_CHANGES and the
 /// close-on-exec and close-on-fork flags of `flags`: the descriptor or an errno.
 pub fn open(name: &[u8], flags: c_int) -> Result<c_int, c_int> {
-    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES) != 0
+    if flags
+        & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY | O_NONBLOCK)
+        != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
         return Err(EINVAL);
@@ -300,6 +305,17 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
         posix_fs::Target::Pipe(end) => match set {
             None => pipes::status_flags(transport, end).map(Some),
             Some(flags) => pipes::set_status_flags(transport, end, flags).map(|()| Some(0)),
+        },
+        posix_fs::Target::Tty(id) => match set {
+            None => terminal::description(transport, id, proto_tty::Method::GetFlags, None)
+                .map(|flags| Some(flags as c_int)),
+            Some(flags) => terminal::description(
+                transport,
+                id,
+                proto_tty::Method::SetFlags,
+                Some(flags as u32),
+            )
+            .map(|_| Some(0)),
         },
         _ => Ok(None),
     })

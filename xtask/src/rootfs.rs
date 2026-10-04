@@ -154,13 +154,15 @@ fn null_device() -> RootFile {
     of("/dev/null", 0o666, ROOT, Source::Bytes("null", b""))
 }
 
+/// `/dev/pts` is the directory for synthetic PTY slave paths (5f).
 /// `/dev/random` and `/dev/urandom` (5e'): the RAM service serves the
 /// entries of these paths as random devices (writes dropped; the client's
 /// layer reads them from its generator), so the bytes are none. With
 /// `/dev/null` they are the device nodes of an image where POSIX programs
 /// run, and the image has the entropy service for them.
-fn devices() -> [RootFile; 3] {
+fn devices() -> [RootFile; 4] {
     [
+        dir("/dev/pts"),
         null_device(),
         of("/dev/random", 0o666, ROOT, Source::Bytes("random", b"")),
         of("/dev/urandom", 0o666, ROOT, Source::Bytes("urandom", b"")),
@@ -178,6 +180,7 @@ fn dialog() -> Vec<RootFile> {
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
         file("/bin/wc", 0o755, ROOT, "busybox-probe"),
+        file("/bin/sleep", 0o755, ROOT, "busybox-probe"),
         file("/bin/head", 0o755, ROOT, "busybox-probe"),
         file("/bin/mktemp", 0o755, ROOT, "busybox-probe"),
         file("/bin/ramfs", 0o4750, USER, "ramfs"),
@@ -241,6 +244,19 @@ fn procs() -> Vec<RootFile> {
     ];
     files.extend(devices());
     files
+}
+
+/// The probe of the terminal (5f): itself as the file its "run" and
+/// "spawned" roles start from, and the null device, a character device
+/// that is no terminal.
+fn posix_tty() -> Vec<RootFile> {
+    vec![
+        dir("/bin"),
+        file("/bin/posix-tty", 0o755, ROOT, "posix-tty"),
+        file("/bin/posix-tty-suid", 0o4755, ROOT, "posix-tty-suid"),
+        dir("/dev"),
+        null_device(),
+    ]
 }
 
 /// The probe of the longest step of the process service (5c): the probe
@@ -344,7 +360,12 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
+    "boot-posix-jobs.img",
     "boot-posix-steps.img",
+    "boot-posix-tty.img",
+    "boot-posix-tty-steps.img",
+    "boot-posix-tty-control-steps.img",
+    "boot-posix-tty-vz.img",
     "rtbench-posix.img",
     "rtbench-posix-vz.img",
     "rtbench-posix-short.img",
@@ -355,7 +376,27 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
     match name {
         "boot-ramfs.img" => ramfs(),
         "boot-ash-dialog.img" => dialog(),
-        "boot-posix-procs.img" => procs(),
+        "boot-posix-procs.img" | "boot-posix-jobs.img" => procs(),
+        "boot-posix-poll.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-poll", 0o755, ROOT, "posix-poll"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
+        "boot-posix-pty.img" | "boot-posix-pty-steps.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-pty", 0o755, ROOT, "posix-pty"),
+                file("/bin/ash", 0o755, ROOT, "busybox-probe"),
+                file("/bin/sleep", 0o755, ROOT, "busybox-probe"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-posix-random.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -365,7 +406,20 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        "boot-loader-channels.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/procs-child", 0o755, ROOT, "posix-procs"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-posix-steps.img" => steps(),
+        "boot-posix-tty.img"
+        | "boot-posix-tty-steps.img"
+        | "boot-posix-tty-control-steps.img"
+        | "boot-posix-tty-vz.img" => posix_tty(),
         "rtbench-posix.img" | "rtbench-posix-vz.img" | "rtbench-posix-short.img" => rtbench(),
         _ => Vec::new(),
     }
@@ -465,8 +519,12 @@ mod tests {
             let list: &[crate::ImageProgram] = match image {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
-                "boot-posix-procs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
+                "boot-posix-tty.img" => &crate::POSIX_TTY_PROGRAMS,
+                "boot-posix-tty-steps.img" => &crate::POSIX_TTY_STEPS_PROGRAMS,
+                "boot-posix-tty-control-steps.img" => &crate::POSIX_TTY_CONTROL_PROGRAMS,
+                "boot-posix-tty-vz.img" => &crate::POSIX_TTY_VZ_PROGRAMS,
                 "rtbench-posix.img" | "rtbench-posix-short.img" => &crate::RTBENCH_POSIX_PROGRAMS,
                 "rtbench-posix-vz.img" => &crate::RTBENCH_POSIX_VZ_PROGRAMS,
                 other => panic!("no programs known for {other}"),
@@ -479,6 +537,10 @@ mod tests {
             for program in programs(&files) {
                 assert!(have.contains(&program), "{image}: {program}");
             }
+            // Build and parse each image's real file table, including devices.
+            let total = have.len() as u32;
+            let bytes = table(&files, 0, total).unwrap_or_else(|error| panic!("{image}: {error}"));
+            Rootfs::parse(&bytes, total).unwrap_or_else(|error| panic!("{image}: {error}"));
             // Every entry has its parent directory in the list.
             for f in &files {
                 let parent = &f.path[..f.path.rfind('/').unwrap()];
@@ -553,13 +615,20 @@ mod tests {
             "boot-ash-dialog.img",
             "boot-posix-procs.img",
             "boot-posix-random.img",
+            "boot-posix-pty.img",
             "boot-posix-steps.img",
             "rtbench-posix.img",
             "rtbench-posix-vz.img",
             "rtbench-posix-short.img",
         ] {
             let files = files_of(name);
-            for path in ["/dev", "/dev/null", "/dev/random", "/dev/urandom"] {
+            for path in [
+                "/dev",
+                "/dev/pts",
+                "/dev/null",
+                "/dev/random",
+                "/dev/urandom",
+            ] {
                 assert_eq!(
                     files.iter().filter(|f| f.path == path).count(),
                     1,
@@ -568,7 +637,13 @@ mod tests {
             }
         }
         let os_test = os_test(&[]);
-        for path in ["/dev", "/dev/null", "/dev/random", "/dev/urandom"] {
+        for path in [
+            "/dev",
+            "/dev/pts",
+            "/dev/null",
+            "/dev/random",
+            "/dev/urandom",
+        ] {
             assert!(os_test.iter().any(|f| f.path == path), "os-test {path}");
         }
     }

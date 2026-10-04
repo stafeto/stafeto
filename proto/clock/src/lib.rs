@@ -19,6 +19,9 @@
 //! CLONE: empty body; reply status and one handle, a new session (SEND,
 //! TRANSFER) with a label of the service's own, for a child of the
 //! client (spec 2, 3.7; 5c).
+//! VERIFY_SESSION: empty body and one offered session. A normal session
+//! of this service with SEND and TRANSFER returns unchanged; any other
+//! channel is replaced with an ordinary empty clone.
 //! The kernel answers an accepted request once (spec 6.1): a client sends
 //! a request again only when the send came back INTERRUPTED, which the
 //! service never saw, so SET and OBSERVE take effect once with no journal.
@@ -43,6 +46,7 @@ pub enum Method {
     Observe = 7,
     Page = 10,
     Clone = 11,
+    VerifySession = 12,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -60,11 +64,12 @@ impl Method {
             7 => Some(Self::Observe),
             10 => Some(Self::Page),
             11 => Some(Self::Clone),
+            12 => Some(Self::VerifySession),
             _ => None,
         }
     }
 }
-pub const METHODS: &[u16] = &[1, 2, 5, 6, 7, 10, 11];
+pub const METHODS: &[u16] = &[1, 2, 5, 6, 7, 10, 11, 12];
 
 /// The page of the CLOCK_REALTIME anchor (spec 2, 3.6): a counter s and
 /// two places. The service writes place (s + 1) mod 2 word by word, then

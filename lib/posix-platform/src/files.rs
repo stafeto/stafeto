@@ -418,61 +418,295 @@ struct Termios {
     ispeed: u32,
     ospeed: u32,
 }
-const _: () = assert!(size_of::<Termios>() == 60);
+const _: () = {
+    assert!(size_of::<Termios>() == 60);
+    assert!(offset_of!(Termios, line) == 16);
+    assert!(offset_of!(Termios, cc) == 17);
+    assert!(offset_of!(Termios, ispeed) == 52);
+    assert!(offset_of!(Termios, ospeed) == 56);
+    // The service's settings are this less the line, which no POSIX
+    // interface names (proto_tty asserts the numbers of the flags and the
+    // control characters, and relibc asserts them on its side).
+    assert!(proto_tty::NCCS == 32 && proto_tty::TERMIOS_LEN == 56);
+};
 
+impl Termios {
+    fn of(t: &proto_tty::Termios) -> Termios {
+        Termios {
+            iflag: t.iflag,
+            oflag: t.oflag,
+            cflag: t.cflag,
+            lflag: t.lflag,
+            line: 0,
+            cc: t.cc,
+            ispeed: t.ispeed,
+            ospeed: t.ospeed,
+        }
+    }
+
+    fn settings(&self) -> proto_tty::Termios {
+        proto_tty::Termios {
+            iflag: self.iflag,
+            oflag: self.oflag,
+            cflag: self.cflag,
+            lflag: self.lflag,
+            cc: self.cc,
+            ispeed: self.ispeed,
+            ospeed: self.ospeed,
+        }
+    }
+}
+
+/// The ioctl requests of Linux that relibc's termios functions send
+/// (sys/ioctl.h): TCSETS + 1 and + 2 are the waiting and the flushing
+/// forms.
 const TCGETS: c_ulong = 0x5401;
 const TCSETS: c_ulong = 0x5402;
 const TCSETSW: c_ulong = 0x5403;
 const TCSETSF: c_ulong = 0x5404;
+const TCSBRK: c_ulong = 0x5409;
+const TCXONC: c_ulong = 0x540A;
+const TCFLSH: c_ulong = 0x540B;
+const TIOCSCTTY: c_ulong = 0x540E;
+const TIOCNOTTY: c_ulong = 0x5422;
+const TIOCGWINSZ: c_ulong = 0x5413;
+const TIOCSWINSZ: c_ulong = 0x5414;
+const TIOCGPTN: c_ulong = 0x80045430;
+const TIOCSPTLCK: c_ulong = 0x40045431;
+const TIOCGPGRP: c_ulong = 0x540F;
+const TIOCSPGRP: c_ulong = 0x5410;
+const TIOCGSID: c_ulong = 0x5429;
+const _: () = assert!(TCSETSW - TCSETS == proto_tty::DRAIN as c_ulong);
+const _: () = assert!(TCSETSF - TCSETS == proto_tty::FLUSH as c_ulong);
 const ENOTTY: c_int = 25;
 
-/// ioctl: TCGETS gives a terminal's settings for the console (so isatty
-/// says yes), the settings of the console's driver as they are; setting
-/// them is ENOSYS until the terminal service (5e); ENOTTY elsewhere.
+/// An ioctl on terminal `terminal` of the terminal service: tcgetattr and
+/// tcsetattr (TCGETS, TCSETS, TCSETSW, TCSETSF), tcflush (TCFLSH, the
+/// queue in `argument`), tcflow (TCXONC, the action there), tcdrain
+/// (TCSBRK with an argument) and tcsendbreak (TCSBRK with 0: the
+/// console has no line to hold at zero, so it takes none and succeeds).
+/// The service checks the queue and the action (EINVAL).
+fn terminal_ioctl(
+    transport: Transport,
+    terminal: u32,
+    request: c_ulong,
+    argument: *mut c_void,
+) -> Result<c_int, c_int> {
+    use posix_abi::terminal;
+    let word = argument as usize;
+    match request {
+        TCGETS => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            let settings = terminal::get_attr(transport, terminal)?;
+            // SAFETY: the caller's promise: writable for a struct termios.
+            unsafe { argument.cast::<Termios>().write(Termios::of(&settings)) };
+            Ok(0)
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            // SAFETY: the caller's promise: readable for a struct termios.
+            let settings = unsafe { argument.cast::<Termios>().read() }.settings();
+            terminal::set_attr(transport, terminal, (request - TCSETS) as u32, settings)?;
+            Ok(0)
+        }
+        TIOCGWINSZ => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            let size = terminal::get_winsize(transport, terminal)?;
+            // SAFETY: the caller supplies a writable Linux winsize (8 bytes).
+            unsafe { argument.cast::<proto_tty::Winsize>().write(size) };
+            Ok(0)
+        }
+        TIOCSWINSZ => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            // SAFETY: the caller supplies a readable Linux winsize (8 bytes).
+            let size = unsafe { argument.cast::<proto_tty::Winsize>().read() };
+            terminal::set_winsize(transport, terminal, size)?;
+            Ok(0)
+        }
+        TCFLSH => {
+            let queue = u32::try_from(word).map_err(|_| EINVAL)?;
+            terminal::control(transport, terminal, proto_tty::Method::FlushQueues, queue)?;
+            Ok(0)
+        }
+        TCXONC => {
+            let action = u32::try_from(word).map_err(|_| EINVAL)?;
+            terminal::control(transport, terminal, proto_tty::Method::Flow, action)?;
+            Ok(0)
+        }
+        TCSBRK if word != 0 => terminal::drain(transport, terminal).map(|()| 0),
+        TCSBRK => Ok(0),
+        // The controlling terminal (5f, T3): tcsetpgrp, tcgetpgrp,
+        // tcgetsid, TIOCSCTTY.
+        TIOCSPGRP => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            // SAFETY: the caller's promise: readable for a pid_t.
+            let group = unsafe { argument.cast::<i32>().read() };
+            let group = u32::try_from(group).map_err(|_| EINVAL)?;
+            let method = proto_tty::Method::SetPgrp;
+            terminal::job(transport, terminal, method, Some(group)).map(|_| 0)
+        }
+        TIOCGPGRP | TIOCGSID => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            let method = if request == TIOCGPGRP {
+                proto_tty::Method::GetPgrp
+            } else {
+                proto_tty::Method::GetSid
+            };
+            let number = terminal::job(transport, terminal, method, None)?;
+            // SAFETY: the caller's promise: writable for a pid_t.
+            unsafe { argument.cast::<i32>().write(number as i32) };
+            Ok(0)
+        }
+        TIOCGPTN => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            let value =
+                terminal::description(transport, terminal, proto_tty::Method::Number, None)?;
+            // SAFETY: the caller supplies writable storage for the number.
+            unsafe { argument.cast::<u32>().write(value) };
+            Ok(0)
+        }
+        TIOCSPTLCK => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            // SAFETY: the caller supplies readable storage for the lock flag.
+            let value = unsafe { argument.cast::<i32>().read() };
+            if !matches!(value, 0 | 1) {
+                return Err(EINVAL);
+            }
+            terminal::description(
+                transport,
+                terminal,
+                proto_tty::Method::Lock,
+                Some(value as u32),
+            )
+            .map(|_| 0)
+        }
+        TIOCNOTTY => terminal::job(transport, terminal, proto_tty::Method::Detach, None).map(|_| 0),
+        TIOCSCTTY => {
+            terminal::job(transport, terminal, proto_tty::Method::Acquire, None).map(|_| 0)
+        }
+        _ => Err(ENOTTY),
+    }
+}
+
+/// ioctl: the terminal requests of a descriptor that is a terminal
+/// (`terminal_ioctl`); ENOTTY for a descriptor of any other kind. A
+/// process with no session with the terminal service (its console is the
+/// driver's) answers TCGETS for its console with the settings of the
+/// opened terminal and ENOSYS for setting them.
 ///
 /// # Safety
-/// For TCGETS `argument` is writable for a struct termios.
+/// `argument` is what `request` says: writable for a struct termios for
+/// TCGETS, readable for one for TCSETS, TCSETSW and TCSETSF, the integer
+/// itself for the rest.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_ioctl(
     fd: c_int,
     request: c_ulong,
     argument: *mut c_void,
 ) -> c_int {
-    let console = number(fd).and_then(|fd| {
+    let result = number(fd).and_then(|fd| {
         posix_abi::shared::held(fd, |transport, target| {
-            let info = transport
-                .descriptor_information(target)
-                .map_err(posix_abi::error)?;
-            Ok(info.kind == 3)
+            if let Some(terminal) = transport.terminal_number(target) {
+                return terminal_ioctl(transport, terminal, request, argument);
+            }
+            let console = matches!(
+                target,
+                posix_fs::Target::Input | posix_fs::Target::Output | posix_fs::Target::Error
+            );
+            match (request, console) {
+                (TCGETS, true) => {
+                    if argument.is_null() {
+                        return Err(EFAULT);
+                    }
+                    // SAFETY: the caller's promise.
+                    unsafe {
+                        argument
+                            .cast::<Termios>()
+                            .write(Termios::of(&proto_tty::Termios::opened()))
+                    };
+                    Ok(0)
+                }
+                (TCSETS | TCSETSW | TCSETSF, true) => Err(ENOSYS),
+                _ => Err(ENOTTY),
+            }
         })
     });
-    match (request, console) {
-        (_, Err(errno)) => -errno,
-        (TCGETS, Ok(true)) => {
-            if argument.is_null() {
-                return -EFAULT;
-            }
-            // Canonical input with echo and signals, CR to NL in, NL to
-            // CR NL out, 8 bits at 38400 baud.
-            let mut cc = [0u8; 32];
-            cc[..7].copy_from_slice(&[3, 28, 127, 21, 4, 0, 1]);
-            // SAFETY: the caller's promise.
-            unsafe {
-                argument.cast::<Termios>().write(Termios {
-                    iflag: 0o400,
-                    oflag: 0o5,
-                    cflag: 0o277,
-                    lflag: 0o105_073,
-                    line: 0,
-                    cc,
-                    ispeed: 0o17,
-                    ospeed: 0o17,
-                })
+    result.unwrap_or_else(|errno| -errno)
+}
+
+/// Validate a PTY master and set the slave owner and mode through Grant.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_grantpt(fd: c_int) -> c_int {
+    call(|| {
+        posix_abi::shared::held(number(fd)?, |transport, target| {
+            let Target::Tty(id) = target else {
+                return Err(EINVAL);
             };
-            0
+            posix_abi::terminal::description(transport, id, proto_tty::Method::Grant, None)
+                .map(|_| 0)
+        })
+    })
+    .unwrap_or_else(|errno| -errno)
+}
+
+/// ttyname_r: the name of the terminal `fd` is, NUL-terminated, into the
+/// `len` bytes at `buf`: its length without the NUL; ENOTTY for another
+/// kind of descriptor, ERANGE when the name and its NUL do not fit.
+///
+/// # Safety
+/// `buf` is writable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_ttyname(fd: c_int, buf: *mut u8, len: usize) -> isize {
+    let mut name = [0u8; 20];
+    let result = number(fd).and_then(|fd| {
+        posix_abi::shared::held(fd, |transport, target| {
+            let id = transport.terminal_number(target).ok_or(ENOTTY)?;
+            let info = posix_abi::terminal::stat(transport, id)?;
+            let text = if info.side != 0 {
+                b"/dev/ptmx".as_slice()
+            } else if info.terminal == 0 {
+                b"/dev/console".as_slice()
+            } else {
+                b"/dev/pts/".as_slice()
+            };
+            name[..text.len()].copy_from_slice(text);
+            if info.side == 0 && info.terminal != 0 {
+                if info.terminal > 8 {
+                    return Err(ENOTTY);
+                }
+                name[text.len()] = b'0' + (info.terminal - 1) as u8;
+                Ok(text.len() + 1)
+            } else {
+                Ok(text.len())
+            }
+        })
+    });
+    match result {
+        Err(errno) => -(errno as isize),
+        Ok(n) if buf.is_null() || len <= n => -(posix_abi::constants::ERANGE as isize),
+        Ok(n) => {
+            // SAFETY: the caller provides writable storage and the name fits.
+            let out = unsafe { core::slice::from_raw_parts_mut(buf, n + 1) };
+            out[..n].copy_from_slice(&name[..n]);
+            out[n] = 0;
+            n as isize
         }
-        (TCSETS | TCSETSW | TCSETSF, Ok(true)) => -ENOSYS,
-        _ => -ENOTTY,
     }
 }
 

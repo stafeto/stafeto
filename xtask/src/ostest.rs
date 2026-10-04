@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! `cargo xtask os-test`: the io, malloc, process and signal suites of
+//! `cargo xtask os-test`: the io, malloc, process, signal and pty suites of
 //! os-test and the tests of its basic suite that start programs (spawn,
 //! exec, fork; tools/build-os-test.py) on relibc. The tests of a suite are files of one boot's RAM service, and
 //! the runner (tests/os-test-run) starts each as misc/run.sh does and marks
@@ -10,8 +10,8 @@
 //! output, then `exit: N` when the output is empty or the status is 2 or
 //! more. A test passes when one of its expectations
 //! (<suite>.expect/<test>.*) is that text; a test of the basic suite, which
-//! has none, when the outcome is `exit: 0`. A test that needs `poll` or
-//! `select` (5f) is UNSUPPORTED and does not run. A test that faults, is killed or gives
+//! has none, when the outcome is `exit: 0`. The bounded readiness groups
+//! basic/poll, basic/sys_select, signal/ppoll and pty run explicitly (5f). A test that faults, is killed or gives
 //! no end within the runner's 10 s FAILs, and the run goes on. The
 //! table goes to target/measure/os-test.txt; `ci` fails when a test of
 //! tests/os-test/pass.txt does not pass. `cargo xtask os-test --one NAME`
@@ -29,10 +29,12 @@ use crate::{
     llvm_tool, qemu, rootfs, target_dir, write_boot_image_files,
 };
 
-/// The image of a suite: the RAM files with the tests, the pipes, the process and
-/// clock services, the loader and the runner.
-const PROGRAMS: [ImageProgram; 9] = [
+/// The image of a suite: the RAM files with the tests, pipes, the console
+/// and terminal, process and clock services, the loader and the runner.
+const PROGRAMS: [ImageProgram; 11] = [
     ("init", "init", crate::INIT_STACK_SIZE, &["table-os-test"]),
+    ("uart", "uart", crate::UART_STACK_SIZE, &[]),
+    ("tty", "tty", crate::TTY_STACK_SIZE, &[]),
     ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
     ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
     (
@@ -115,8 +117,13 @@ pub fn outcome(log: &str, name: &str) -> Ended {
     };
     let how = rest[end + mark.len()..].lines().next().unwrap_or("");
     let service = |line: &str| {
+        let line = line.strip_suffix('\n').unwrap_or(line);
         line.starts_with("init: ")
             || line.starts_with("ramfs: ")
+            || line == "pipe: ready"
+            || line == "tty: ready"
+            || line == "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0"
+            || line == "entropy: seeded from the device"
             || line.starts_with("posix-process: ")
             || line.starts_with("clock: ")
             || line.starts_with("process fault: ")
@@ -163,18 +170,27 @@ pub fn expected(expect: &Path, test: &str, outcome: &str) -> Result<bool, String
     Ok(false)
 }
 
-/// Whether the test's source needs what stafeto has not yet: `poll` or
-/// `select` (5f), which `ppoll` and `pselect` contain.
+/// Finds readiness calls, including ppoll and pselect.
 fn needs_poll(source: &str) -> bool {
     ["poll(", "select("]
         .iter()
         .any(|call| source.contains(call))
 }
 
-/// The time `ci` gives the boots of the suites, counted from the first
-/// one's start: about 230 s on TCG since the suites of `fork` (5d), up to
-/// 241 s seen, with room for the variance of a loaded host.
-const BUDGET: Duration = Duration::from_secs(420);
+/// Readiness coverage is enabled explicitly for the accepted groups.
+fn readiness_group(name: &str) -> bool {
+    name.starts_with("basic/poll/")
+        || name.starts_with("basic/sys_select/")
+        || name.starts_with("signal/ppoll-")
+        || name.starts_with("pty/")
+}
+
+/// The time `ci` gives suite builds and boots, counted from the first
+/// one's start. The terminal and readiness suites exhausted the former
+/// 420-second budget while compiling io/basic images. Nine hundred seconds
+/// allow the expanded set to compile and run on a loaded host; each guest
+/// test retains its separate ten-second limit.
+const BUDGET: Duration = Duration::from_secs(900);
 
 /// The tests that pass on stafeto: `ci` fails when one of them does not.
 const PASSING: &str = "tests/os-test/pass.txt";
@@ -210,26 +226,65 @@ pub struct Plan {
     rows: Rows,
     /// The start of the first test's job: the budget counts from it.
     started: Arc<OnceLock<Instant>>,
+    /// Selected directory; a full CI run has no filter.
+    suite: Option<String>,
 }
 
 /// The suites as jobs (a boot a suite, the tests started from files), after
 /// the build of os-test's tests. `ci` puts them among its own jobs.
 pub fn plan() -> Result<(Vec<Job>, Plan), String> {
-    crate::relibc()?;
-    crate::run_cmd(
-        std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
-    )?;
+    plan_suite(None)
+}
+
+/// Select a whole directory with the regular runner and retained PASS gate.
+pub fn run_suite(suite: &str, jobs: usize) -> Result<(), String> {
+    let (list, plan) = plan_suite(Some(suite))?;
+    crate::jobs::run_all(list, jobs)?;
+    finish(plan)
+}
+
+fn in_suite(name: &str, suite: &str) -> bool {
+    name.strip_prefix(suite)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn select_suite(tests: Vec<Test>, suite: &str) -> Result<Vec<Test>, String> {
+    let selected: Vec<_> = tests
+        .into_iter()
+        .filter(|t| in_suite(&t.name, suite))
+        .collect();
+    if selected.is_empty() {
+        Err(format!("unknown or empty os-test suite: {suite}"))
+    } else {
+        Ok(selected)
+    }
+}
+
+fn plan_suite(suite: Option<&str>) -> Result<(Vec<Job>, Plan), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        crate::relibc()?;
+    }
+    let mut compile = Command::new("python3");
+    compile.arg(crate::root().join("tools/build-os-test.py"));
+    if let Some(suite) = suite {
+        compile.args(["--suite", suite]);
+    }
+    crate::run_cmd(&mut compile)?;
     let work = target_dir().join("os-test");
     let tests = tests_of(&work)?;
+    let tests = match suite {
+        Some(suite) => select_suite(tests, suite)?,
+        None => tests,
+    };
     let kernel = build(Variant::Normal)?;
     let mut places: Vec<Option<Row>> = Vec::new();
     for test in &tests {
         let source = source_of(&work, test)?;
-        places.push(if needs_poll(&source) {
+        places.push(if needs_poll(&source) && !readiness_group(&test.name) {
             Some((
                 test.name.clone(),
                 Verdict::Unsupported,
-                "needs poll or select (5f)".to_owned(),
+                "readiness test awaits explicit coverage".to_owned(),
             ))
         } else if let Some(failed) = test.built.strip_prefix('!') {
             // A test that did not compile: os-test's outcome for it.
@@ -247,7 +302,14 @@ pub fn plan() -> Result<(Vec<Job>, Plan), String> {
     let rows: Rows = Arc::new(Mutex::new(places));
     let started = Arc::new(OnceLock::new());
     let jobs = suite_jobs(&work, tests, &kernel, &rows, &started)?;
-    Ok((jobs, Plan { rows, started }))
+    Ok((
+        jobs,
+        Plan {
+            rows,
+            started,
+            suite: suite.map(str::to_owned),
+        },
+    ))
 }
 
 /// The end of a run of the suites: the table, the score and the list of
@@ -261,7 +323,7 @@ pub fn finish(plan: Plan) -> Result<(), String> {
         .flatten()
         .cloned()
         .collect();
-    let path = write(&rows)?;
+    let path = write(&rows, plan.suite.as_deref())?;
     println!("os-test: {}", score(&rows));
     println!("os-test table: {}", path.display());
     let took = plan.started.get().map_or(Duration::ZERO, Instant::elapsed);
@@ -272,6 +334,14 @@ pub fn finish(plan: Plan) -> Result<(), String> {
     );
     let path = crate::root().join(PASSING);
     let list = std::fs::read_to_string(&path).map_err(|e| format!("{PASSING}: {e}"))?;
+    let list = match plan.suite.as_deref() {
+        Some(suite) => list
+            .lines()
+            .filter(|name| in_suite(name.trim(), suite))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => list,
+    };
     let (lost, new) = compare(&list, &rows);
     for name in &new {
         println!("os-test {name} passes and is not in {PASSING}");
@@ -510,7 +580,9 @@ fn suite_jobs(
 /// time (a hung test is killed after a second).
 pub fn runner_check_job() -> Job {
     crate::jobs::job("os-test runner check", || {
-        crate::relibc()?;
+        if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+            crate::relibc()?;
+        }
         runner_check(&build(Variant::Normal)?)
     })
 }
@@ -518,7 +590,9 @@ pub fn runner_check_job() -> Job {
 /// `cargo xtask os-test --one NAME`: the test `NAME` alone in a boot of
 /// its own, with the whole log of the boot.
 pub fn run_one(name: &str) -> Result<(), String> {
-    crate::relibc()?;
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        crate::relibc()?;
+    }
     crate::run_cmd(
         std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
     )?;
@@ -583,11 +657,11 @@ fn score(rows: &[Row]) -> String {
 }
 
 /// target/measure/os-test.txt: the score and a row a test.
-fn write(rows: &[Row]) -> Result<PathBuf, String> {
+fn write(rows: &[Row], suite: Option<&str>) -> Result<PathBuf, String> {
     let dir = target_dir().join("measure");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut text = format!(
-        "os-test io, malloc, process, signal and basic spawn, exec and fork on relibc (commit {}): {}\n\n| test | result | outcome |\n|---|---|---|\n",
+        "os-test io, malloc, process, signal, pty and basic tests on relibc (commit {}): {}\n\n| test | result | outcome |\n|---|---|---|\n",
         crate::rtbench2::commit(),
         score(rows)
     );
@@ -598,7 +672,11 @@ fn write(rows: &[Row]) -> Result<PathBuf, String> {
             outcome.trim_end().replace('\n', "; ")
         ));
     }
-    let path = dir.join("os-test.txt");
+    let filename = suite.map_or_else(
+        || "os-test.txt".to_owned(),
+        |suite| format!("os-test-{}.txt", suite.replace('/', "-")),
+    );
+    let path = dir.join(filename);
     std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }
@@ -621,6 +699,10 @@ mod tests {
             "init: services started",
             "ramfs: ready",
             "@@os-test begin io/open",
+            "pipe: ready",
+            "tty: ready",
+            "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0",
+            "entropy: seeded from the device",
             "open: EISDIR",
             "@@os-test end io/open exit 1",
             "@@os-test begin io/silent",
@@ -628,6 +710,9 @@ mod tests {
             "@@os-test begin io/aborted",
             "NULL",
             "@@os-test end io/aborted exit 134",
+            "@@os-test begin io/unexpected",
+            "tty: unexpected failure",
+            "@@os-test end io/unexpected exit 1",
         ]);
         assert_eq!(
             outcome(&log, "io/open"),
@@ -640,6 +725,10 @@ mod tests {
         assert_eq!(
             outcome(&log, "io/aborted"),
             Ended::Exited("NULL\nexit: 134\n".to_owned())
+        );
+        assert_eq!(
+            outcome(&log, "io/unexpected"),
+            Ended::Exited("tty: unexpected failure\n".to_owned())
         );
     }
 
@@ -716,7 +805,50 @@ mod tests {
     }
 
     #[test]
-    fn poll_and_select_are_unsupported() {
+    fn suite_selection_preserves_directory_boundaries_and_rejects_empty() {
+        let tests = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| Test {
+                    name: (*name).to_owned(),
+                    suite: "unused".to_owned(),
+                    test: "unused".to_owned(),
+                    built: "object".to_owned(),
+                })
+                .collect()
+        };
+        let selected = select_suite(
+            tests(&[
+                "pty/a",
+                "pty-other/b",
+                "basic/termios/a",
+                "basic/termios-extra/b",
+            ]),
+            "pty",
+        )
+        .unwrap();
+        assert_eq!(
+            selected.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["pty/a"]
+        );
+        let selected = select_suite(
+            tests(&["basic/termios/a", "basic/termios-extra/b"]),
+            "basic/termios",
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(select_suite(tests(&["pty-other/a"]), "pty").is_err());
+        assert!(select_suite(tests(&[]), "basic/termios").is_err());
+    }
+
+    #[test]
+    fn readiness_calls_and_explicit_groups() {
+        assert!(readiness_group("basic/poll/poll"));
+        assert!(readiness_group("basic/sys_select/select"));
+        assert!(readiness_group("signal/ppoll-block-raise"));
+        assert!(readiness_group("pty/pty-poll"));
+        assert!(readiness_group("pty/pty-hup-poll"));
+        assert!(!readiness_group("signal/other-poll"));
         assert!(needs_poll("int n = poll(fds, 1, 0);"));
         assert!(needs_poll("int n = ppoll(fds, 1, NULL, NULL);"));
         assert!(needs_poll("int n = select(1, &set, NULL, NULL, &tv);"));

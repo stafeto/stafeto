@@ -117,6 +117,60 @@ pub(crate) fn request(method: proto_process::Method, words: &[u32]) -> Result<Wr
     Ok(w)
 }
 
+/// Obtain the service's authoritative epoch for a directed job signal.
+pub(crate) fn signal_generation(signal: i32) -> Result<u64, i32> {
+    let w = request(proto_process::Method::SignalGeneration, &[signal as u32])?;
+    let mut bytes = [0; rt::abi::MESSAGE_MAX];
+    loop {
+        match rt::sys::send(client().session(), w.as_bytes()) {
+            Err(rt::abi::Error::Interrupted) => continue,
+            Err(_) => return Err(crate::constants::EIO),
+            Ok(reply) => {
+                let mut r = proto_wire::Reader::new(reply.bytes(&mut bytes));
+                let status = r.u32().map_err(|_| crate::constants::EIO)?;
+                if status == proto_process::AGAIN {
+                    return Err(crate::constants::EAGAIN);
+                }
+                if status != 0 {
+                    return Err(crate::constants::EIO);
+                }
+                return r.u64().map_err(|_| crate::constants::EIO);
+            }
+        }
+    }
+}
+
+pub(crate) fn stop_self(signal: i32, ticket: u64) -> Result<(), i32> {
+    let mut w = request(proto_process::Method::StopSelf, &[signal as u32])?;
+    w.u64(ticket).map_err(|_| crate::constants::EIO)?;
+    ask(&w).map(|_| ())
+}
+
+static PROBE_RETURN_FAILURE: AtomicU32 = AtomicU32::new(0);
+pub(crate) fn probe_return_failure() {
+    PROBE_RETURN_FAILURE.store(1, Ordering::Release);
+}
+
+/// Return process information through its single publisher. Interrupted sends
+/// were not accepted and repeat; a stale ticket is acknowledged harmlessly.
+pub(crate) fn return_signal(
+    signal: i32,
+    ticket: u64,
+    info: &posix_types::SigInfo,
+) -> Result<(), i32> {
+    if PROBE_RETURN_FAILURE.swap(0, Ordering::AcqRel) != 0 {
+        return Err(crate::constants::EIO);
+    }
+    let mut w = request(proto_process::Method::ReturnSignal, &[signal as u32])?;
+    w.u64(ticket)
+        .and_then(|()| w.u32(info.si_code as u32))
+        .and_then(|()| w.u32(info.si_pid as u32))
+        .and_then(|()| w.u32(info.si_uid))
+        .and_then(|()| w.u32(info.si_status as u32))
+        .map_err(|_| crate::constants::EIO)?;
+    ask(&w).map(|_| ())
+}
+
 /// Takes `session`, the process's identity session.
 ///
 /// # Safety
@@ -292,6 +346,8 @@ pub fn getppid() -> i32 {
 pub struct Waited {
     pub pid: i32,
     pub end: Option<proto_process::End>,
+    pub stopped: Option<u8>,
+    pub continued: bool,
     pub uid: u32,
 }
 
@@ -325,11 +381,29 @@ pub fn wait(selector: proto_process::Selector, options: u32) -> Result<Waited, i
         Ok(WaitResult::Ended { pid, end, uid }) => Ok(Waited {
             pid: i32::try_from(pid).map_err(|_| EIO)?,
             end: Some(end),
+            stopped: None,
+            continued: false,
+            uid,
+        }),
+        Ok(WaitResult::Stopped { pid, signal, uid }) => Ok(Waited {
+            pid: i32::try_from(pid).map_err(|_| EIO)?,
+            end: None,
+            stopped: Some(signal),
+            continued: false,
+            uid,
+        }),
+        Ok(WaitResult::Continued { pid, uid }) => Ok(Waited {
+            pid: i32::try_from(pid).map_err(|_| EIO)?,
+            end: None,
+            stopped: None,
+            continued: true,
             uid,
         }),
         Ok(WaitResult::Nothing) => Ok(Waited {
             pid: 0,
             end: None,
+            stopped: None,
+            continued: false,
             uid: 0,
         }),
         Ok(WaitResult::NoChild) => Err(ECHILD),
@@ -358,6 +432,102 @@ static DECOY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::n
 /// Sets the probe of condition O2.
 pub fn probe_decoy(on: bool) {
     DECOY.store(on, Ordering::Relaxed);
+}
+
+/// Malformed own-loader packets for the terminal C probe. No foreign
+/// endpoint or credential participates in these refusal paths.
+static TERMINAL_PACKET_PROBE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TERMINAL_PACKET_RESULT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub fn probe_terminal_packet_result() -> u64 {
+    TERMINAL_PACKET_RESULT.load(Ordering::Acquire)
+}
+pub fn probe_terminal_packet(mode: u32) {
+    TERMINAL_PACKET_PROBE.store(mode, Ordering::Release);
+}
+
+/// A live counterfeit terminal endpoint used by the C terminal probe.
+static FAKE_TERMINAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn probe_terminal_fake_start() -> i32 {
+    match rt::sys::channel_create(1) {
+        Ok(channel) => {
+            FAKE_TERMINAL.store(channel.into_raw().0, Ordering::Release);
+            0
+        }
+        Err(_) => crate::constants::EIO,
+    }
+}
+
+pub fn probe_terminal_fake_control() -> i32 {
+    let fake = Handle::<Channel>::borrowed(rt::abi::Handle(FAKE_TERMINAL.load(Ordering::Acquire)));
+    let Some(identity) = identity().and_then(|identity| {
+        rt::sys::handle_duplicate(
+            identity,
+            rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER,
+        )
+        .ok()
+    }) else {
+        return crate::constants::EIO;
+    };
+    if rt::sys::send_handles(
+        &fake,
+        &proto_tty::Method::Controlling.header().bytes(),
+        [identity.erase()],
+    )
+    .is_ok()
+    {
+        0
+    } else {
+        crate::constants::EIO
+    }
+}
+
+pub fn probe_terminal_fake_listen() -> u32 {
+    let fake = Handle::<Channel>::borrowed(rt::abi::Handle(FAKE_TERMINAL.load(Ordering::Acquire)));
+    let mut identities = 0;
+    loop {
+        let Ok(received) = rt::sys::receive(&fake) else {
+            return u32::MAX;
+        };
+        if let rt::sys::Received::Message {
+            token,
+            words,
+            handles,
+            ..
+        } = received
+        {
+            let stop = u16::from_le_bytes(rt::abi::inline_bytes(&words)[..2].try_into().unwrap())
+                == u16::MAX;
+            for i in 0..handles.len() {
+                if matches!(handles.info(i), Some((rt::abi::ObjectKind::Channel, rights)) if rights.contains(rt::abi::Rights::NOTIFY))
+                {
+                    identities += 1;
+                }
+            }
+            let _ = token.reply(&proto_wire::reply(proto_wire::Status::Ok));
+            if stop {
+                return identities;
+            }
+        }
+    }
+}
+
+pub fn probe_terminal_fake_stop() -> i32 {
+    let fake = Handle::<Channel>::borrowed(rt::abi::Handle(FAKE_TERMINAL.load(Ordering::Acquire)));
+    let request = proto_wire::Header::new(u16::MAX, proto_tty::VERSION).bytes();
+    if rt::sys::send(&fake, &request).is_ok() {
+        0
+    } else {
+        crate::constants::EIO
+    }
+}
+
+pub fn probe_terminal_fake_close() {
+    let raw = FAKE_TERMINAL.swap(0, Ordering::AcqRel);
+    if raw != 0 {
+        drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
+    }
 }
 
 /// The probe of the loader's refusal of the end of a pipe with no session
@@ -398,6 +568,10 @@ struct Shadow {
     opened: [Option<u32>; posix_fs::OPEN_MAX],
     cwd: [u8; proto_loader::PATH_MAX],
     cwd_len: usize,
+    terminal_opens: [proto_loader::TerminalAction; proto_loader::TERMINAL_ACTIONS],
+    terminal_count: usize,
+    terminal_open_count: usize,
+    pending: [Option<u32>; posix_fs::OPEN_MAX],
 }
 
 impl Shadow {
@@ -409,6 +583,11 @@ impl Shadow {
             opened: [None; posix_fs::OPEN_MAX],
             cwd: [0; proto_loader::PATH_MAX],
             cwd_len: 0,
+            terminal_opens: [proto_loader::TerminalAction::default();
+                proto_loader::TERMINAL_ACTIONS],
+            terminal_count: 0,
+            terminal_open_count: 0,
+            pending: [None; posix_fs::OPEN_MAX],
         };
         crate::shared::with_files(|files| {
             let mut open = [None; posix_fs::OPEN_MAX];
@@ -464,6 +643,38 @@ impl Shadow {
         Ok(&out[..len])
     }
 
+    /// The final alias of a temporary open closes at this point in the
+    /// action sequence, before any following Open takes effect.
+    fn replace_entry(
+        &mut self,
+        fd: usize,
+        entry: Option<(posix_fs::Target, bool)>,
+        pending: Option<u32>,
+    ) -> Result<(), i32> {
+        if let Some(token) = self.pending[fd]
+            && pending != Some(token)
+            && !self
+                .pending
+                .iter()
+                .enumerate()
+                .any(|(i, &p)| i != fd && p == Some(token))
+        {
+            if self.terminal_count == proto_loader::TERMINAL_ACTIONS {
+                return Err(crate::constants::EMFILE);
+            }
+            self.terminal_opens[self.terminal_count] = proto_loader::TerminalAction {
+                token,
+                kind: proto_loader::TERMINAL_CLOSE,
+                number: 0,
+                flags: 0,
+            };
+            self.terminal_count += 1;
+        }
+        self.entries[fd] = entry;
+        self.pending[fd] = pending;
+        Ok(())
+    }
+
     /// One file action, in order ([P24-SPAWN]).
     fn apply(&mut self, action: FileAction<'_>) -> Result<(), i32> {
         use crate::constants::{EBADF, ENOSYS, ENOTDIR};
@@ -474,18 +685,69 @@ impl Shadow {
         };
         match action {
             FileAction::Close(fd) => {
-                self.entries[slot(fd)?] = None;
+                self.replace_entry(slot(fd)?, None, None)?;
             }
             FileAction::Dup2(fd, new) => {
                 let (target, _) = self.entries[slot(fd)?].ok_or(EBADF)?;
                 // The copy has no FD_CLOEXEC, and so has the descriptor
                 // dup2 names twice ([P24-SPAWN]).
-                self.entries[slot(new)?] = Some((target, false));
+                self.replace_entry(slot(new)?, Some((target, false)), self.pending[slot(fd)?])?;
             }
             FileAction::Open { fd, path, flags } => {
                 let place = slot(fd)?;
                 let mut full = [0; proto_loader::PATH_MAX];
                 let full = self.absolute(path, &mut full)?;
+                use crate::constants::{
+                    EINVAL, EMFILE, O_ACCMODE, O_CHANGES, O_CLOEXEC, O_CLOFORK, O_DIRECTORY,
+                    O_NOCTTY, O_NONBLOCK,
+                };
+                if flags
+                    & !(O_ACCMODE
+                        | O_DIRECTORY
+                        | O_CLOEXEC
+                        | O_CLOFORK
+                        | O_CHANGES
+                        | O_NOCTTY
+                        | O_NONBLOCK)
+                    != 0
+                    || flags & O_ACCMODE == O_ACCMODE
+                {
+                    return Err(EINVAL);
+                }
+                let terminal = crate::shared::resolved(full, |transport, path| {
+                    if transport.terminal().is_none() {
+                        return Ok(None);
+                    }
+                    let named = crate::shared::terminal_name(path.as_str().map_err(crate::error)?);
+                    if named.is_some() && path.trailing_slash {
+                        return Err(ENOTDIR);
+                    }
+                    Ok(named)
+                })?;
+                if let Some((kind, number)) = terminal {
+                    if flags & O_DIRECTORY != 0 {
+                        return Err(ENOTDIR);
+                    }
+                    if self.terminal_open_count == proto_loader::TERMINAL_OPENS
+                        || self.terminal_count == proto_loader::TERMINAL_ACTIONS
+                    {
+                        return Err(EMFILE);
+                    }
+                    self.replace_entry(place, None, None)?;
+                    let token = self.terminal_open_count as u32;
+                    self.terminal_opens[self.terminal_count] = proto_loader::TerminalAction {
+                        token,
+                        kind,
+                        number,
+                        flags: (flags & (O_ACCMODE | O_NONBLOCK | O_NOCTTY)) as u32,
+                    };
+                    self.terminal_count += 1;
+                    self.terminal_open_count += 1;
+                    self.entries[place] = Some((posix_fs::Target::Tty(0), flags & O_CLOEXEC != 0));
+                    self.pending[place] = Some(token);
+                    return Ok(());
+                }
+                self.replace_entry(place, None, None)?;
                 // The caller's own descriptor lives only for the spawn: with
                 // FD_CLOEXEC, so that an exec or spawn of another thread in
                 // the meantime does not inherit it. The child's flag is the
@@ -535,13 +797,18 @@ impl Shadow {
             let Some((target, false)) = entry else {
                 continue;
             };
-            let names = match *target {
-                posix_fs::Target::Input => Names::Input,
-                posix_fs::Target::Output => Names::Output,
-                posix_fs::Target::Error => Names::Error,
-                posix_fs::Target::Ram(n) => Names::File(n),
-                posix_fs::Target::Pipe(n) => Names::Pipe(n),
-                posix_fs::Target::Random(n) => Names::Random(n),
+            let names = if let Some(token) = self.pending[fd] {
+                Names::PendingTerminal(token)
+            } else {
+                match *target {
+                    posix_fs::Target::Input => Names::Input,
+                    posix_fs::Target::Output => Names::Output,
+                    posix_fs::Target::Error => Names::Error,
+                    posix_fs::Target::Ram(n) => Names::File(n),
+                    posix_fs::Target::Pipe(n) => Names::Pipe(n),
+                    posix_fs::Target::Tty(n) => Names::Terminal(n),
+                    posix_fs::Target::Random(n) => Names::Random(n),
+                }
             };
             out[count] = Descriptor {
                 fd: fd as u32,
@@ -550,6 +817,22 @@ impl Shadow {
             count += 1;
         }
         (out, count)
+    }
+
+    fn shared_terminals(&self) -> ([u32; posix_fs::OPEN_MAX], usize) {
+        let (list, count) = self.descriptors();
+        let mut ids = [0; posix_fs::OPEN_MAX];
+        let mut n = 0;
+        for descriptor in &list[..count] {
+            if let proto_loader::Names::Terminal(id) = descriptor.names
+                && id != 0
+                && !ids[..n].contains(&id)
+            {
+                ids[n] = id;
+                n += 1;
+            }
+        }
+        (ids, n)
     }
 
     /// The service's descriptions the child's session shares, each once.
@@ -638,6 +921,7 @@ pub(crate) fn load_errno(code: u32) -> i32 {
         proto_loader::NAME_TOO_LONG => ENAMETOOLONG,
         proto_loader::PERMISSION => EPERM,
         proto_loader::NOT_DIRECTORY => ENOTDIR,
+        proto_loader::NO_CONTROLLING => ENXIO,
         _ => EIO,
     }
 }
@@ -663,10 +947,79 @@ pub(crate) fn ask_loader(
             Err(rt::abi::Error::Interrupted) => continue,
             Err(_) => return proto_loader::IO,
             Ok(reply) => {
-                return proto_wire::Reader::new(reply.bytes(&mut buffer))
+                let status = proto_wire::Reader::new(reply.bytes(&mut buffer))
                     .u32()
                     .unwrap_or(proto_loader::IO);
+                if TERMINAL_PACKET_PROBE.load(Ordering::Relaxed) != 0 {
+                    let method =
+                        proto_wire::Header::read(&mut proto_wire::Reader::new(w.as_bytes()))
+                            .map_or(0, |h| h.method);
+                    TERMINAL_PACKET_RESULT
+                        .store((method as u64) << 32 | status as u64, Ordering::Release);
+                }
+                return status;
             }
+        }
+    }
+}
+
+/// Handles of the sessions `sessions` that are there, by their slots, to
+/// the loader `c`: abi::MESSAGE_HANDLES of them a message, so further ones go
+/// in a second Handles. The sessions move whatever comes of it; the
+/// loader's code of the first message that failed, 0 once all went.
+pub(crate) fn give_sessions<const N: usize>(
+    c: &Handle<Channel>,
+    sessions: [(proto_loader::Slot, Option<Handle<Channel>>); N],
+) -> u32 {
+    use proto_loader::Method;
+    let sessions = match crate::loader_probe::bundle(sessions) {
+        Ok(sessions) => sessions,
+        Err(_) => return proto_loader::IO,
+    };
+    let mut left = sessions
+        .into_iter()
+        .filter_map(|(slot, s)| s.map(|s| (slot, s)));
+    loop {
+        let mut w = Writer::new();
+        if Method::Handles.header().write(&mut w).is_err() {
+            return proto_loader::IO;
+        }
+        let mut handles = rt::handle::Outgoing::new();
+        for (slot, session) in left.by_ref().take(rt::abi::MESSAGE_HANDLES) {
+            let session = match crate::loader_probe::replace(slot, session) {
+                Ok(session) => session,
+                Err(_) => return proto_loader::IO,
+            };
+            if w.u32(slot as u32).is_err() || handles.push(session.erase()).is_err() {
+                return proto_loader::IO;
+            }
+        }
+        if handles.is_empty() {
+            if crate::loader_probe::omit_completion() {
+                return 0;
+            }
+            let mut done = Writer::new();
+            if Method::HandlesDone.header().write(&mut done).is_err() {
+                return proto_loader::IO;
+            }
+            let code = ask_loader(c, &done, None);
+            if code == 0 && crate::loader_probe::repeat_bundle() {
+                let expected = Status::Kernel(rt::abi::Error::BadState).code();
+                if ask_loader(c, &done, None) != expected {
+                    return proto_loader::IO;
+                }
+                let mut late = Writer::new();
+                if Method::Handles.header().write(&mut late).is_err()
+                    || ask_loader(c, &late, None) != expected
+                {
+                    return proto_loader::IO;
+                }
+            }
+            return code;
+        }
+        let code = ask_loader(c, &w, Some(handles));
+        if code != 0 {
+            return code;
         }
     }
 }
@@ -831,7 +1184,12 @@ pub fn exec<'s>(
     let block = crate::threads::own_block();
     // Step 1: every signal of the caller held, the others stopped.
     let mask = block.mask.swap(!0, Ordering::SeqCst);
-    let pending = block.pending.load(Ordering::SeqCst);
+    if let Err(error) = crate::signals::prepare_exec_jobs() {
+        block.mask.store(mask, Ordering::SeqCst);
+        crate::signals::deliver_now();
+        return Err(error);
+    }
+    let pending = block.pending.load(Ordering::SeqCst) & !proto_process::job::MASK;
     let stopped = crate::signals::stop_others();
     let result =
         stopped.and_then(|()| exec_stopped(path, argv, envp, umask, mask, pending, Probe::None));
@@ -922,6 +1280,10 @@ fn exec_stopped<'s>(
         rt::sys::process_exit(127);
     }
     if ask(&request(Method::ExecCommit, &[])?).is_err() {
+        // A distinct probe status witnesses refusal while this image still runs.
+        if crate::loader_probe::omit_completion() {
+            rt::sys::process_exit(126);
+        }
         rt::sys::process_exit(127);
     }
     if let Some(clock) = kept {
@@ -1037,7 +1399,7 @@ fn image_ready(
 /// labels. Nothing of this image uses them afterwards. Whether the loader
 /// took them.
 fn move_files(c: &Handle<Channel>) -> bool {
-    use proto_loader::{Method, Slot};
+    use proto_loader::Slot;
     for fd in 0..posix_fs::OPEN_MAX as u32 {
         let close_on_exec = crate::shared::with_files(|files| {
             Ok(files
@@ -1068,41 +1430,33 @@ fn move_files(c: &Handle<Channel>) -> bool {
     // never end them. The sessions of the RAM files and the clock keep no
     // waiting operation, so a general Abandon of long operations has
     // nothing else to do here.
-    let pipes = crate::shared::with_files(|files| Ok(files.pipes().map(Handle::raw)))
-        .ok()
-        .flatten();
+    let (pipes, terminal) = crate::shared::with_files(|files| {
+        Ok((
+            files.pipes().map(Handle::raw),
+            files.terminal().map(Handle::raw),
+        ))
+    })
+    .unwrap_or((None, None));
     if let Some(pipes) = pipes {
         crate::pipes::abandon(pipes);
     }
-    let mut w = Writer::new();
-    if Method::Handles.header().write(&mut w).is_err() {
-        return false;
+    // The terminal's session moves too, its waiting operations gone.
+    if let Some(terminal) = terminal {
+        crate::terminal::abandon(terminal);
     }
-    let mut handles = rt::handle::Outgoing::new();
-    for (slot, session) in [
-        (Slot::Files, Some(files)),
-        (Slot::Clock, clock),
-        (Slot::Uart, uart),
-    ] {
-        if let Some(raw) = session
-            && w.u32(slot as u32).is_ok()
-        {
-            // The handle moves: this image's owner never uses it again.
-            let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
-        }
-    }
-    if let Some(raw) = pipes
-        && w.u32(Slot::Pipes as u32).is_ok()
-    {
-        let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
-    }
-    if ask_loader(c, &w, Some(handles)) != 0 {
-        return false;
-    }
-    // The session with the entropy service moves too, in a second Handles;
-    // the new image's generator starts with no key.
-    let entropy = crate::random::session().map_or(0, |raw| raw.0);
-    crate::fork::give_slots(c, &[(Slot::Entropy, entropy)]).is_ok()
+    // The handles move: this image's owner never uses them again.
+    let moved = |raw: Option<rt::abi::Handle>| raw.map(Handle::<Channel>::from_raw);
+    give_sessions(
+        c,
+        [
+            (Slot::Files, moved(Some(files))),
+            (Slot::Clock, moved(clock)),
+            (Slot::Driver, moved(uart)),
+            (Slot::Pipes, moved(pipes)),
+            (Slot::Terminal, moved(terminal)),
+            (Slot::Entropy, moved(crate::random::session())),
+        ],
+    ) == 0
 }
 
 /// The errno of a refused Clone: EAGAIN for a service at its limit of
@@ -1148,12 +1502,6 @@ fn commit(
         return Err(EIO);
     }
     drop(object);
-    let mut w = Writer::new();
-    Method::Go.header().write(&mut w).map_err(|_| EIO)?;
-    let code = ask_loader(c, &w, None);
-    if code != 0 {
-        return Err(load_errno(code));
-    }
     // The child's own sessions: clones of the caller's, the one of the
     // RAM files sharing the descriptions the child starts with.
     let clock = crate::clock::session().ok_or(EIO)?;
@@ -1197,26 +1545,92 @@ fn commit(
         }
         None => None,
     };
-    let mut w = Writer::new();
-    Method::Handles.header().write(&mut w).map_err(|_| EIO)?;
-    let mut handles = rt::handle::Outgoing::new();
-    for (slot, session) in [
+    // The child's session with the terminal service: a clone of the
+    // caller's.
+    let terminal = match crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))? {
+        Some(terminal) => {
+            let (ids, count) = shadow.shared_terminals();
+            Some(crate::terminal::clone_kept(terminal, Some(&ids[..count]))?)
+        }
+        None => None,
+    };
+    let fake = FAKE_TERMINAL.load(Ordering::Acquire);
+    let terminal = if fake != 0 {
+        Some(
+            rt::sys::handle_duplicate(
+                &Handle::<Channel>::borrowed(rt::abi::Handle(fake)),
+                rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER,
+            )
+            .map_err(|_| EIO)?,
+        )
+    } else {
+        terminal
+    };
+    let entropy = crate::fork::entropy_clone();
+    let sessions = [
         (Slot::Files, Some(files)),
         (Slot::Clock, Some(clock)),
-        (Slot::Uart, uart),
+        (Slot::Driver, uart),
         (Slot::Pipes, pipes),
-    ] {
-        if let Some(session) = session {
-            w.u32(slot as u32).map_err(|_| EIO)?;
-            handles.push(session.erase()).map_err(|_| EIO)?;
-        }
-    }
-    if ask_loader(c, &w, Some(handles)) != 0 {
+        (Slot::Terminal, terminal),
+        (Slot::Entropy, entropy),
+    ];
+    if give_sessions(c, sessions) != 0 {
         return Err(EIO);
     }
-    // The child's session with the entropy service, in a second Handles.
-    let entropy = crate::fork::entropy_clone();
-    crate::fork::give_slots(c, &[(Slot::Entropy, entropy.map_or(0, |e| e.into_raw().0))])?;
+    let packet_probe = TERMINAL_PACKET_PROBE.load(Ordering::Acquire);
+    for (packet_index, packet) in shadow.terminal_opens[..shadow.terminal_count]
+        .chunks(proto_loader::TERMINAL_PACKET)
+        .enumerate()
+    {
+        if packet_probe == 4 {
+            break;
+        }
+        let mut w = Writer::new();
+        Method::TerminalActions
+            .header()
+            .write(&mut w)
+            .map_err(|_| EIO)?;
+        w.u32(packet.len() as u32).map_err(|_| EIO)?;
+        for (i, &action) in packet.iter().enumerate() {
+            let action = if packet_probe == 1 && packet_index == 0 && i == 1 {
+                packet[0]
+            } else if packet_probe == 2 && packet_index == 1 && i == 0 {
+                proto_loader::TerminalAction {
+                    flags: u32::MAX,
+                    ..action
+                }
+            } else {
+                action
+            };
+            action.write(&mut w).map_err(|_| EIO)?;
+        }
+        let code = ask_loader(c, &w, None);
+        if code != 0 {
+            return Err(load_errno(code));
+        }
+    }
+    if packet_probe == 3 {
+        let mut w = Writer::new();
+        Method::TerminalActions
+            .header()
+            .write(&mut w)
+            .map_err(|_| EIO)?;
+        w.u32(1).map_err(|_| EIO)?;
+        proto_loader::TerminalAction::default()
+            .write(&mut w)
+            .map_err(|_| EIO)?;
+        let code = ask_loader(c, &w, None);
+        if code != 0 {
+            return Err(load_errno(code));
+        }
+    }
+    let mut w = Writer::new();
+    Method::Go.header().write(&mut w).map_err(|_| EIO)?;
+    let code = ask_loader(c, &w, None);
+    if code != 0 {
+        return Err(load_errno(code));
+    }
     ask(&request(proto_process::Method::SpawnCommit, &[pid as u32])?).map(drop)
 }
 
@@ -1289,6 +1703,17 @@ pub fn probe_loads() -> i32 {
 
 /// The bytes of the service's quota left for children (Pool), for the
 /// probe that the ends of loads give theirs back; 0 on an error.
+/// TtySignal of `signal` to the group `pgid` through the process's own
+/// session, for the probe that the process service takes it from the
+/// notary session of the terminal service alone: the errno of the
+/// refusal, 0 when it was taken.
+pub fn probe_tty_signal(pgid: u32, signal: u32) -> i32 {
+    match request(proto_process::Method::TtySignal, &[0, pgid, signal]).and_then(|w| ask(&w)) {
+        Ok(_) => 0,
+        Err(errno) => errno,
+    }
+}
+
 pub fn probe_pool() -> u64 {
     let Ok(w) = request(proto_process::Method::Pool, &[]) else {
         return 0;

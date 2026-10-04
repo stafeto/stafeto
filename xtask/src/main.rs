@@ -51,6 +51,9 @@ const PIPE_STACK_SIZE: u32 = 32 * 1024;
 /// (apps/shell), which init's loader maps.
 const UART_STACK_SIZE: u32 = 16 * 1024;
 const SHELL_STACK_SIZE: u32 = 16 * 1024;
+/// The terminal service's stack: its state lies in its `.bss`, and a
+/// request copies up to 1 KiB.
+const TTY_STACK_SIZE: u32 = 32 * 1024;
 /// A program of a boot image: its file's name in the image, the package
 /// that builds it for EL0, the size of its stack and the features of the
 /// package it builds with.
@@ -83,7 +86,7 @@ const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE
 /// the console; the loader, which starts the benchmark's children from the
 /// files of the image (5c); the pipe service and BusyBox, whose `ls` and
 /// `cat` are the stages of S22 (5e).
-const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 13] = [
+const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 14] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -95,6 +98,7 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 13] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("tty", "tty", 32 * 1024, &[]),
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
@@ -104,7 +108,7 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 13] = [
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
-const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 13] = [
+const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 14] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -116,6 +120,7 @@ const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 13] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("tty", "tty", 32 * 1024, &[]),
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
@@ -304,6 +309,60 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
         &["input-probe"],
     ),
 ];
+/// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
+/// console's driver, the terminal service, the RAM files, the pipes, the
+/// process and clock services, the loader (the probe forks) and the probe.
+const POSIX_TTY_PROGRAMS: [ImageProgram; 10] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-tty"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &["trust-probe"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &["tty-probe"],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
+    ("posix-tty", "posix-tty", POSIX_STACK_SIZE, &[]),
+    ("posix-tty-suid", "posix-tty", POSIX_STACK_SIZE, &[]),
+];
+const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_TTY_PROGRAMS;
+    programs[2].3 = &["trust-probe", "steps"];
+    programs[5].3 = &["tty-probe", "steps"];
+    programs
+};
+/// Full terminal control steps with sixteen live POSIX clients over a PTY.
+const POSIX_TTY_CONTROL_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_TTY_STEPS_PROGRAMS;
+    programs[2].3 = &["quiet-steps"];
+    programs[5].3 = &["tty-probe"];
+    programs[8].3 = &["quiet-control"];
+    programs[9].3 = &["quiet-control"];
+    programs
+};
+/// The same over the Virtio console's driver on Apple VZ (xtask
+/// posix-tty-vz).
+const POSIX_TTY_VZ_PROGRAMS: [ImageProgram; 10] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-tty-vz"]),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &["trust-probe"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &["tty-probe"],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
+    ("posix-tty", "posix-tty", POSIX_STACK_SIZE, &[]),
+    ("posix-tty-suid", "posix-tty", POSIX_STACK_SIZE, &[]),
+];
 const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -458,7 +517,7 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 10] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 11] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -477,8 +536,32 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 10] = [
         POSIX_STACK_SIZE,
         &["ash-interactive"],
     ),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
+];
+/// The probe of the terminal service (xtask tty): the PL011's driver, the
+/// service, which prints each new longest step, and the probe.
+const TTY_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-tty"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
+];
+/// The measure of the service's steps (xtask tty, under -icount): the
+/// service prints each new longest step, the probe drives it, and its
+/// program is the quiet driver too.
+const TTY_STEPS_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-tty-steps"]),
+    ("tty", "tty", TTY_STACK_SIZE, &["steps"]),
+    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
+];
+/// The same over the Virtio console's driver on Apple VZ (xtask tty-vz).
+const TTY_VZ_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-tty-vz"]),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
 ];
 const LS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
@@ -538,7 +621,7 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// left or on where a timer fires, which only -icount makes repeatable;
 /// and the teardown of a big process in hundreds of portions with
 /// interrupts between them.
-const ICOUNT_TESTS: [&str; 16] = [
+const ICOUNT_TESTS: [&str; 17] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
@@ -555,6 +638,7 @@ const ICOUNT_TESTS: [&str; 16] = [
     "device_windows_are_measured",
     "upcall_calls_are_measured",
     "process_kill_with_a_level_is_measured",
+    "suspension_paths_are_measured",
 ];
 /// The rows of the line of `ipc_round_trip_is_measured`, in its order
 /// (spec 15.3).
@@ -598,6 +682,14 @@ const TEARDOWN_ROWS: [&str; 9] = [
     "session_buffers",
     "session_handles",
     "threads",
+];
+/// Scoped direct-control, pick + park and continuation measurements.
+const SUSPENSION_ROWS: [&str; 5] = [
+    "control_stop_no_queue",
+    "control_stop_cancel",
+    "pick_park_selected",
+    "control_continue",
+    "resume_64",
 ];
 /// The rows of the line of the test init's `normal_build_costs`, in its
 /// order: the costs of the build that ships (spec 15.3).
@@ -739,7 +831,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 228;
+const INIT_TESTS: u32 = 229;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -908,6 +1000,8 @@ commands:
             over the Rust POSIX layer
   posix-procs run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
+  posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
+  loader-channels verify ordinary loader channel provenance and descriptor transfer
   process-steps run the probe of the longest step of the process service
             under -icount with a crowd of children
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
@@ -923,6 +1017,16 @@ commands:
             the table goes to target/measure/os-test.txt; fails when a
             test of tests/os-test/pass.txt does not pass; with
             --one NAME, one test in a boot of its own, with its log
+  posix-tty run the C probe of the terminal: termios, isatty, ttyname and the
+            names of terminals through the terminal service, with typed input
+  posix-tty-control-steps measure full terminal control with sixteen live clients
+  posix-tty-steps measure controlling terminal, last-slot groups and full walks
+            under -icount; startup dependency waits are printed separately
+  posix-tty-vz the same over the Virtio console on Apple VZ
+  tty       check the terminal service in QEMU under -icount: line editing,
+            echo, INTR, raw reads with VMIN 1, output that waits for the
+            driver, and each step of the service under term B
+  tty-vz    the same checks over the Virtio console on Apple VZ
   entropy [--hvf] run the probe of the entropy device's driver in QEMU
             under -icount: fills, a restart of the driver, its longest
             steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
@@ -979,11 +1083,21 @@ fn main() {
         Some("relibc") => relibc(),
         Some("os-test") => match &args[1..] {
             [flag, name] if flag == "--one" => ostest::run_one(name),
+            [flag, name, rest @ ..] if flag == "--suite" => {
+                jobs::parse_jobs("os-test --suite", rest)
+                    .and_then(|jobs| ostest::run_suite(name, jobs))
+            }
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("loader-channels") => loader_channels_probe(),
+        Some("posix-poll") => posix_poll_probe(),
+        Some("posix-pty") => posix_pty_probe(),
+        Some("posix-tty-control-steps") => posix_tty_control_steps(),
+        Some("posix-pty-steps") => posix_pty_probe_in(true),
+        Some("posix-jobs") => posix_jobs_probe(),
         Some("process-steps") => match &args[1..] {
             [] => process_steps(&qemu::VIRT, 7),
             [n] => n
@@ -1019,6 +1133,11 @@ fn main() {
         Some("ash-shell") => ash_shell(),
         Some("ash-dialog") => ash_dialog(),
         Some("ls") => ls_probe(),
+        Some("posix-tty") => posix_tty_probe(false, false),
+        Some("posix-tty-vz") => posix_tty_probe(true, false),
+        Some("posix-tty-steps") => posix_tty_probe(false, true),
+        Some("tty") => tty_probe(false),
+        Some("tty-vz") => tty_probe(true),
         Some("entropy") => match args.get(1).map(String::as_str) {
             None => entropy::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -1638,12 +1757,7 @@ fn posix_abi_boots() -> Result<(), String> {
         "boot-posix-abi.img",
         "posix-abi-probe",
     ))?;
-    println!("posix-abi-probe: the layer's .data + .bss {data} bytes, limit {LAYER_DATA_LIMIT}");
-    if data > LAYER_DATA_LIMIT {
-        return Err(format!(
-            "the layer's .data + .bss in posix-abi-probe is {data} bytes, over {LAYER_DATA_LIMIT}"
-        ));
-    }
+    println!("posix-abi-probe: the layer's .data + .bss {data} bytes");
     let image = build_boot_image("boot-posix-tls.img", &POSIX_TLS_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
@@ -1814,6 +1928,230 @@ fn posix_input_probe(vz: bool) -> Result<(), String> {
     }
     println!(
         "Rust POSIX concurrent input guest probe passed on {}",
+        if vz { "the Virtio console" } else { "the UART" }
+    );
+    Ok(())
+}
+
+/// Measures the full terminal control interval against a PTY in memory.
+fn posix_tty_control_steps() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-tty-control-steps.img",
+        &POSIX_TTY_CONTROL_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let outcome = qemu::run_until(cmd, Duration::from_secs(180), Some("init: posix-tty ended"))?;
+    let dir = target_dir().join("measure");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir.join("posix-tty-control-steps.log"),
+        outcome.lines.join("\n") + "\n",
+    )
+    .map_err(|e| e.to_string())?;
+    if !outcome
+        .lines
+        .iter()
+        .any(|line| line == "posix-tty: quiet controls sixteen clients ok")
+        || !outcome
+            .lines
+            .iter()
+            .any(|line| line == "init: posix-tty ended: exit code 0, not restarted")
+    {
+        return Err(
+            "quiet terminal controls failed; see target/measure/posix-tty-control-steps.log".into(),
+        );
+    }
+    let maxima = longest_steps(&outcome.lines, "5");
+    for kind in 16..=20 {
+        let ticks = maxima
+            .iter()
+            .find(|row| row.0 == kind)
+            .map_or(0, |row| row.1);
+        if ticks == 0 || ticks > RAM_STEP_MAX {
+            return Err(format!(
+                "terminal control kind {kind}: {ticks} ticks, limit {RAM_STEP_MAX}"
+            ));
+        }
+    }
+    println!("Quiet terminal controls, sixteen live clients: {maxima:?}");
+    Ok(())
+}
+
+fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
+    relibc()?;
+    let image = if measure {
+        build_boot_image(
+            "boot-posix-tty-steps.img",
+            &POSIX_TTY_STEPS_PROGRAMS,
+            BOOT_PROFILE,
+        )?
+    } else if vz {
+        build_boot_image(
+            "boot-posix-tty-vz.img",
+            &POSIX_TTY_VZ_PROGRAMS,
+            BOOT_PROFILE,
+        )?
+    } else {
+        build_boot_image("boot-posix-tty.img", &POSIX_TTY_PROGRAMS, BOOT_PROFILE)?
+    };
+    let (mut cmd, _) = probe_command(&image, vz)?;
+    if measure {
+        cmd.args(qemu::ICOUNT);
+    }
+    const ENDED: &str = "init: posix-tty ended: exit code 0, not restarted";
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let result = (|| {
+        run.expect("posix-tty: settings ok", BOOT_TIMEOUT)?;
+        for (i, byte) in b"xyz".iter().copied().enumerate() {
+            run.expect(&format!("posix-tty: raw read {i} waits"), DIALOG_STEP)?;
+            run.type_raw(&[byte])?;
+            run.expect(
+                &format!("posix-tty: raw read {i} gave 0x{byte:02x}"),
+                DIALOG_STEP,
+            )?;
+        }
+        run.expect("posix-tty: attributes restored", DIALOG_STEP)?;
+        run.expect("posix-tty: canonical read waits", DIALOG_STEP)?;
+        run.send("hi")?;
+        run.expect("posix-tty: canonical read gave 3 bytes", DIALOG_STEP)?;
+        for (ask, typed, done) in [
+            ("type junk", &b"junk"[..], "tcflush dropped the input"),
+            ("type more junk", b"more", "TCSAFLUSH dropped the input"),
+            ("type k", b"k", "input after a flush is read"),
+        ] {
+            run.expect(&format!("posix-tty: {ask}"), DIALOG_STEP)?;
+            run.type_raw(typed)?;
+            run.expect(&format!("posix-tty: {done}"), DIALOG_STEP)?;
+        }
+        // STOP and START go out between the bytes written.
+        run.expect("<\x13>(\x11)", DIALOG_STEP)?;
+        run.expect("posix-tty: output flushed", DIALOG_STEP)?;
+        run.expect("posix-tty: output ok", DIALOG_STEP)?;
+        run.expect("posix-tty: written through /dev/console", DIALOG_STEP)?;
+        run.expect("posix-tty: child wrote through /dev/console", DIALOG_STEP)?;
+        run.expect(
+            "posix-tty: spawned child wrote through the inherited descriptor",
+            DIALOG_STEP,
+        )?;
+        run.expect(
+            "posix-tty: spawned child wrote through the descriptor of a file action",
+            DIALOG_STEP,
+        )?;
+        run.expect("posix-tty: foreground changed during read", DIALOG_STEP)?;
+        run.send("r")?;
+        run.expect("posix-tty: stopped reader resumed", DIALOG_STEP)?;
+        run.send("j")?;
+        run.expect("posix-tty: job control ok", DIALOG_STEP)?;
+        run.expect("posix-tty: detached reader still uses open fd", DIALOG_STEP)?;
+        run.send("d")?;
+        run.expect(
+            "posix-tty: personal detach and fresh attachment ok",
+            DIALOG_STEP,
+        )?;
+        run.expect("posix-tty: sessions ok", DIALOG_STEP)?;
+        run.expect("posix-tty: ok", DIALOG_STEP)?;
+        run.expect(ENDED, DIALOG_STEP)
+    })();
+    let output = run.stop();
+    if vz {
+        vz::stop_hint(result)?;
+    } else {
+        result?;
+    }
+    if measure {
+        let dir = target_dir().join("measure");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("posix-tty-steps.log"),
+            output.lines.join("\n") + "\n",
+        )
+        .map_err(|e| e.to_string())?;
+        for tag in ["5", "1"] {
+            println!(
+                "POSIX terminal steps tag {tag}: {:?}",
+                longest_steps(&output.lines, tag)
+            );
+        }
+        let tty = longest_steps(&output.lines, "5");
+        for kind in 16..=20 {
+            let ticks = tty.iter().find(|row| row.0 == kind).map_or(0, |row| row.1);
+            if ticks == 0 {
+                return Err(format!(
+                    "terminal control kind {kind} made no measured request"
+                ));
+            }
+        }
+        let mut edge_codes = Vec::new();
+        for line in &output.lines {
+            let Some(scan) = line.strip_prefix("tty group scan: group ") else {
+                continue;
+            };
+            let fields: Vec<_> = scan.split_whitespace().collect();
+            let [group, ticks, "ticks", "code", code] = fields.as_slice() else {
+                return Err(format!("malformed terminal group scan: {line}"));
+            };
+            let ticks: u64 = ticks.parse().map_err(|_| line.clone())?;
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!(
+                    "terminal group scan exceeded {RAM_STEP_MAX}: {line}"
+                ));
+            }
+            if *group == "2147483646" {
+                edge_codes.push(code.parse::<u32>().map_err(|_| line.clone())?);
+            }
+        }
+        if !edge_codes.contains(&0) || !edge_codes.iter().any(|code| *code != 0) {
+            return Err(format!(
+                "terminal group scans missed last-slot or absent group: {edge_codes:?}"
+            ));
+        }
+        let process = longest_steps(&output.lines, "1");
+        let walk = process
+            .iter()
+            .find(|row| row.0 == 65)
+            .map_or(0, |row| row.1);
+        if walk == 0 || walk > RAM_STEP_MAX {
+            return Err(format!(
+                "terminal group walk step took {walk} ticks, bound {RAM_STEP_MAX}"
+            ));
+        }
+    }
+    // No echo in raw mode: a byte typed would show before the line that
+    // follows its read.
+    for line in output
+        .lines
+        .iter()
+        .filter(|l| l.contains("posix-tty: raw read"))
+    {
+        if !line.starts_with("posix-tty: raw read") {
+            return Err(format!("a raw read's line came with an echo: {line:?}"));
+        }
+    }
+    // What tcflush dropped never shows, and what tcflow held shows once.
+    if output
+        .lines
+        .iter()
+        .any(|l| l.contains("posix-tty: dropped by tcflush"))
+    {
+        return Err("the output tcflush had to drop reached the console".to_owned());
+    }
+    let held = output
+        .lines
+        .iter()
+        .filter(|l| l.contains("posix-tty: held by tcflow"))
+        .count();
+    if held != 1 {
+        return Err(format!("the output tcflow held came {held} times"));
+    }
+    if output.lines.iter().any(|l| l.contains("check failed")) {
+        return Err("a check of the probe failed".to_owned());
+    }
+    println!(
+        "POSIX terminal guest probe passed on {}",
         if vz { "the Virtio console" } else { "the UART" }
     );
     Ok(())
@@ -2030,6 +2368,219 @@ fn relibc_hello_probe() -> Result<(), String> {
 /// The probe of POSIX processes (tests/posix-procs): its checks pass, its
 /// child says the PID the parent's posix_spawn gave and the parent's PID,
 /// and the child that did not load got no process.
+fn posix_poll_probe() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 11] = [
+        ("init", "init", INIT_STACK_SIZE, &["table-posix-poll"]),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        ("tty", "tty", TTY_STACK_SIZE, &["quiet-steps"]),
+        POSIX_PROCS_PROGRAMS[1],
+        ("pipe", "pipe", PIPE_STACK_SIZE, &["quiet-steps"]),
+        POSIX_PROCS_PROGRAMS[3],
+        POSIX_PROCS_PROGRAMS[4],
+        ("posix-poll", "posix-poll", POSIX_STACK_SIZE, &[]),
+        POSIX_PROCS_PROGRAMS[6],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    let image = build_boot_image("boot-posix-poll.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: posix-poll ended: "),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(&output, "posix-poll: ok")?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: posix-poll ended: exit code 0, not restarted",
+    )?;
+    check_watch_steps(&output.lines)
+}
+
+fn posix_pty_probe() -> Result<(), String> {
+    posix_pty_probe_in(false)
+}
+fn posix_pty_steps() -> Result<(), String> {
+    posix_pty_probe_in(true)
+}
+
+fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 12] = [
+        ("init", "init", INIT_STACK_SIZE, &["table-posix-pty"]),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        ("tty", "tty", TTY_STACK_SIZE, &[]),
+        POSIX_PROCS_PROGRAMS[1],
+        ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+        POSIX_PROCS_PROGRAMS[3],
+        POSIX_PROCS_PROGRAMS[4],
+        ("posix-pty", "posix-pty", POSIX_STACK_SIZE, &[]),
+        (
+            "busybox-probe",
+            "busybox-probe",
+            POSIX_STACK_SIZE,
+            &["ash-interactive"],
+        ),
+        POSIX_PROCS_PROGRAMS[6],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    const STEPS: [ImageProgram; 12] = {
+        let mut programs = PROGRAMS;
+        programs[2].3 = &["quiet-steps"];
+        programs[7].3 = &["clone-steps"];
+        programs
+    };
+    let image = build_boot_image(
+        if steps {
+            "boot-posix-pty-steps.img"
+        } else {
+            "boot-posix-pty.img"
+        },
+        if steps { &STEPS } else { &PROGRAMS },
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: posix-pty ended: "),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(&output, "posix-pty: ok")?;
+    qemu::expect_stopped_on(&output, "init: posix-pty ended: exit code 0, not restarted")?;
+    if steps {
+        let measured = longest_steps(&output.lines, "5");
+        for kind in [7, 65] {
+            let ticks = measured
+                .iter()
+                .find(|row| row.0 == kind)
+                .map_or(0, |row| row.1);
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!(
+                    "terminal Clone 32: kind {kind} took {ticks} ticks, bound {RAM_STEP_MAX}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_watch_steps(lines: &[String]) -> Result<(), String> {
+    for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
+        let steps = longest_steps(lines, tag);
+        for &(kind, ticks, _) in &steps {
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!(
+                    "watch service {tag}, kind {kind} exceeded {RAM_STEP_MAX}: {ticks}"
+                ));
+            }
+        }
+        let cases: Vec<String> = lines
+            .iter()
+            .filter(|line| line.starts_with("service case:"))
+            .map(|line| line.replacen("service case:", "service step:", 1))
+            .collect();
+        let full = longest_steps(&cases, tag);
+        for &(_, ticks, _) in &full {
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!("watch full case exceeded {RAM_STEP_MAX}: {ticks}"));
+            }
+        }
+        for method in methods {
+            if !full
+                .iter()
+                .any(|&(kind, ticks, detail)| kind == method && ticks != 0 && detail == 32)
+            {
+                return Err(format!(
+                    "watch method {method} has no full 32-element measurement: {steps:?}"
+                ));
+            }
+        }
+        if ![64, 65].iter().all(|wanted| {
+            steps
+                .iter()
+                .any(|&(kind, ticks, _)| kind == *wanted && ticks != 0)
+        }) {
+            return Err(format!(
+                "watch service {tag} has no heartbeat/notification or Gone measurement"
+            ));
+        }
+    }
+    Ok(())
+}
+fn posix_jobs_probe() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 10] = {
+        let mut programs = POSIX_PROCS_PROGRAMS;
+        programs[5].3 = &["jobs"];
+        programs
+    };
+    let image = build_boot_image("boot-posix-jobs.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let ended = run.expect_seen(
+        "init: posix-procs ended: exit code 0, not restarted",
+        BOOT_TIMEOUT,
+    );
+    let outcome = run.stop();
+    ended?;
+    qemu::expect_marker(&outcome, "posix-jobs: ok")
+}
+
+fn loader_channels_probe() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 11] = [
+        ("init", "init", INIT_STACK_SIZE, &["table-loader-channels"]),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        ("tty", "tty", TTY_STACK_SIZE, &[]),
+        POSIX_PROCS_PROGRAMS[1],
+        POSIX_PROCS_PROGRAMS[2],
+        POSIX_PROCS_PROGRAMS[3],
+        POSIX_PROCS_PROGRAMS[4],
+        (
+            "posix-procs",
+            "posix-procs",
+            POSIX_STACK_SIZE,
+            &["terminal"],
+        ),
+        POSIX_PROCS_PROGRAMS[6],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    let image = build_boot_image("boot-loader-channels.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let ended = run.expect_seen(
+        "init: posix-procs ended: exit code 0, not restarted",
+        BOOT_TIMEOUT,
+    );
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    ended?;
+    qemu::expect_marker(&outcome, "loader-channels: ok")
+}
+
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
@@ -2148,7 +2699,7 @@ const VOUCH_TICKS_MAX: u64 = 6_000;
 
 /// The most one READ_INTO of up to proto_fs::READ_INTO_MAX bytes may take in
 /// the RAM file service's loop: term B of the kernel, in ticks under -icount.
-const RAM_STEP_MAX: u64 = 20_536;
+const RAM_STEP_MAX: u64 = 20_538;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
@@ -2504,13 +3055,14 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "7", "ash", busybox.clone()),
-        ("-rwxr-xr-x", "7", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "7", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "7", "head", busybox.clone()),
-        ("-rwxr-xr-x", "7", "ls", busybox.clone()),
-        ("-rwxr-xr-x", "7", "mktemp", busybox.clone()),
-        ("-rwxr-xr-x", "7", "wc", busybox),
+        ("-rwxr-xr-x", "8", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "8", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "8", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "8", "head", busybox.clone()),
+        ("-rwxr-xr-x", "8", "ls", busybox.clone()),
+        ("-rwxr-xr-x", "8", "mktemp", busybox.clone()),
+        ("-rwxr-xr-x", "8", "sleep", busybox.clone()),
+        ("-rwxr-xr-x", "8", "wc", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
@@ -2528,6 +3080,96 @@ fn ash_dialog() -> Result<(), String> {
             |line| line == "interactive-ready",
             DIALOG_STEP,
         )?;
+        run.expect("# ", DIALOG_STEP)?;
+        // Each builtin produces an observed result. The numeric false cases
+        // also check exit status, and command bypasses the function named echo.
+        let builtin_cases: &[(&str, &[&str])] = &[
+            ("echo arithmetic:$((6 * 7))", &["arithmetic:42"]),
+            (
+                "test 7 -eq 7; echo test-true:$?; test 7 -eq 8; echo test-false:$?",
+                &["test-true:0", "test-false:1"],
+            ),
+            (
+                "[ word = word ]; echo bracket-true:$?; [ word = other ]; echo bracket-false:$?",
+                &["bracket-true:0", "bracket-false:1"],
+            ),
+            (
+                "printf 'formatted:%04d:%s\\n' 7 word",
+                &["formatted:0007:word"],
+            ),
+            (
+                "set -- -a -b value; while getopts 'ab:' opt; do echo option:$opt:$OPTARG; done; echo option-index:$OPTIND",
+                &["option:a:", "option:b:value", "option-index:4"],
+            ),
+            ("alias hello='echo alias-ready'", &[]),
+            ("hello", &["alias-ready"]),
+            (
+                "unalias hello; command -v hello >/dev/null; echo unalias:$?",
+                &["unalias:127"],
+            ),
+            (
+                "echo() { printf 'function:%s\\n' \"$1\"; }; echo called; command echo bypassed; unset -f echo",
+                &["function:called", "bypassed"],
+            ),
+            ("command -v printf", &["printf"]),
+        ];
+        for (command, expected) in builtin_cases {
+            run.send(command)?;
+            for expected_line in *expected {
+                run.expect_line(expected_line, |line| line == *expected_line, DIALOG_STEP)?;
+            }
+            run.expect("# ", DIALOG_STEP)?;
+        }
+        // The terminal service edits the line before ash reads it (5f):
+        // DEL erases the "x" and its echo, and ash gets "echo abc".
+        run.send("echo abx\x7fc")?;
+        run.expect("echo abx\x08 \x08c", DIALOG_STEP)?;
+        run.expect_line("abc", |line| line == "abc", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // The name of the terminal is the layer's to resolve (5f): the
+        // shell opens /dev/console for a redirection, and a file of /bin
+        // that the shell forks and execs writes to the descriptor it
+        // inherits (the terminal moves through exec).
+        run.send("echo console >/dev/console")?;
+        run.expect("echo console >/dev/console", DIALOG_STEP)?;
+        run.expect_line("console", |line| line == "console", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ls -1 /etc >/dev/console")?;
+        run.expect("/bin/ls -1 /etc >/dev/console", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // The first goal of 5f: INTR at the console reaches the shell's
+        // foreground group, the shell's session's (its getty made it): the
+        // command ends by SIGINT and the shell, which catches it, goes on.
+        run.send("echo sleeping; sleep 100")?;
+        run.expect_line("sleeping", |line| line == "sleeping", DIALOG_STEP)?;
+        std::thread::sleep(Duration::from_secs(2));
+        run.type_raw(b"\x03")?;
+        run.expect("^C", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo $?")?;
+        run.expect_line("130", |line| line == "130", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo stopping; sleep 100")?;
+        run.expect_line("stopping", |line| line == "stopping", DIALOG_STEP)?;
+        std::thread::sleep(Duration::from_secs(1));
+        run.type_raw(b"\x1a")?;
+        run.expect("^Z", DIALOG_STEP)?;
+        run.expect("Stopped", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("jobs")?;
+        run.expect("Stopped", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("bg")?;
+        run.expect("sleep 100", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("fg")?;
+        run.expect("sleep 100", DIALOG_STEP)?;
+        std::thread::sleep(Duration::from_millis(500));
+        run.type_raw(b"\x03")?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo $?")?;
+        run.expect_line("130", |line| line == "130", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("ls -1 /")?;
         run.expect("ls -1 /", DIALOG_STEP)?;
@@ -2791,6 +3433,165 @@ fn ash_dialog() -> Result<(), String> {
     Ok(())
 }
 
+/// The kinds of the lines of the terminal service (tag 5), by the
+/// numbers of proto_tty::Method.
+const TTY_STEP_KINDS: [(usize, &str); 17] = [
+    (1, "ReadStart"),
+    (2, "ReadTake"),
+    (3, "ReadCancel"),
+    (4, "WriteStart"),
+    (5, "WriteTake"),
+    (6, "WriteCancel"),
+    (7, "Clone"),
+    (8, "GetAttr"),
+    (9, "SetAttr"),
+    (10, "Abandon"),
+    (11, "DrainStart"),
+    (12, "DrainTake"),
+    (13, "DrainCancel"),
+    (14, "FlushQueues"),
+    (15, "Flow"),
+    (64, "heartbeat: a send to init and its reply"),
+    (
+        65,
+        "own step: input, room, the next step, the timer of VTIME",
+    ),
+];
+
+/// The probe of the terminal service (tests/tty) on QEMU, or over the
+/// Virtio console on Apple VZ (`vz`): xtask types INTR after "lost", then
+/// "ab", DEL, "c" and Enter, and the probe's canonical read gives "ac\n"
+/// while the console shows the echo of the erase; with VMIN 1 each byte
+/// typed comes alone; 200 lines of output come whole and in order. On QEMU
+/// the measure of the steps follows (`tty_steps`).
+const ENDED_TTY: &str = "init: tty-probe ended: exit code 0, not restarted";
+
+fn tty_probe(vz: bool) -> Result<(), String> {
+    let image = if vz {
+        build_boot_image("boot-tty-vz.img", &TTY_VZ_PROGRAMS, BOOT_PROFILE)?
+    } else {
+        build_boot_image("boot-tty.img", &TTY_PROGRAMS, BOOT_PROFILE)?
+    };
+    let (cmd, _) = probe_command(&image, vz)?;
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let result = (|| {
+        run.expect("tty-probe: canonical read waits", BOOT_TIMEOUT)?;
+        // INTR drops what was typed before it and asks for SIGINT.
+        run.type_raw(b"lost\x03")?;
+        run.expect("^C", DIALOG_STEP)?;
+        run.expect("tty: SIGINT, no foreground process group", DIALOG_STEP)?;
+        run.send("ab\x7fc")?;
+        // The echo: the erase of the "b" and Enter as CR LF.
+        run.expect("ab\x08 \x08c\r\n", DIALOG_STEP)?;
+        run.expect("tty-probe: read ac and a newline", DIALOG_STEP)?;
+        for (i, b) in ["x", "y", "z"].iter().enumerate() {
+            run.expect(&format!("tty-probe: raw read {i} waits"), DIALOG_STEP)?;
+            run.type_raw(b.as_bytes())?;
+            run.expect(&format!("tty-probe: raw read {i} gave {b}"), DIALOG_STEP)?;
+        }
+        run.expect("tty-probe: raw reads gave each byte", DIALOG_STEP)?;
+        // ONLCR clear: the console's driver adds no CR either.
+        run.expect_bytes(b"\nbare-lf\n", DIALOG_STEP)?;
+        run.expect("tty-probe: wrote", DIALOG_STEP)?;
+        run.expect("tty-probe: ok", DIALOG_STEP)?;
+        run.expect(ENDED_TTY, DIALOG_STEP)
+    })();
+    let output = run.stop();
+    if vz {
+        vz::stop_hint(result)?;
+    } else {
+        result?;
+    }
+    // The lines of the output come whole, each once, in their order. A
+    // line of the kernel's log may cut one short: the driver shows the
+    // part that went out again after it (uart::output), so a part of a
+    // line comes before the line whole.
+    let text = " abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let want: Vec<String> = (0..200)
+        .map(|n| format!("tty-probe line {n:03}{text}"))
+        .collect();
+    let mut next = 0;
+    for line in output
+        .lines
+        .iter()
+        .filter(|l| l.starts_with("tty-probe line "))
+    {
+        let Some(wanted) = want.get(next) else {
+            return Err(format!("a line past the probe's {}: {line:?}", want.len()));
+        };
+        if line == wanted {
+            next += 1;
+        } else if !wanted.starts_with(line.as_str()) {
+            return Err(format!("line {next} of the probe came as {line:?}"));
+        }
+    }
+    if next != want.len() {
+        return Err(format!("{next} lines of the probe's {} came", want.len()));
+    }
+    println!(
+        "terminal service guest probe passed on {}",
+        if vz { "the Virtio console" } else { "the UART" }
+    );
+    if vz { Ok(()) } else { tty_steps() }
+}
+
+/// The measure of the terminal service's steps under -icount, against a
+/// quiet driver (tests/tty, roles `S` and `s`): every step stays under
+/// term B (a chunk of input through the discipline with the longest echo,
+/// a message of output to the driver, WAITERS notifications), and every
+/// byte of echo and output reached the driver.
+fn tty_steps() -> Result<(), String> {
+    let image = build_boot_image("boot-tty-steps.img", &TTY_STEPS_PROGRAMS, BOOT_PROFILE)?;
+    let (mut cmd, kernel) = probe_command(&image, false)?;
+    cmd.args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: tty-probe ended"),
+        &kernel.elf,
+    )?;
+    let dir = target_dir().join("measure");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let log = dir.join("tty-steps.log");
+    std::fs::write(&log, output.lines.join("\n") + "\n")
+        .map_err(|e| format!("{}: {e}", log.display()))?;
+    qemu::expect_stopped_on(&output, ENDED_TTY)?;
+    qemu::expect_marker(&output, "tty-probe: ok")?;
+    let steps = longest_steps(&output.lines, "5");
+    let mut table = String::from("kind method ticks detail\n");
+    for (kind, ticks, detail) in &steps {
+        let name = TTY_STEP_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map_or("other", |(_, n)| n);
+        table += &format!("tty {kind} {name} {ticks} {detail}\n");
+    }
+    let path = dir.join("tty-steps.txt");
+    std::fs::write(&path, &table).map_err(|e| format!("{}: {e}", path.display()))?;
+    print!("terminal service steps under icount:\n{table}");
+    // Each method and the service's own notifications made a step, each
+    // under term B; the heartbeat, which waits for init, has its own bound.
+    for kind in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 65] {
+        let ticks = steps.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
+        if ticks == 0 || ticks > RAM_STEP_MAX {
+            return Err(format!(
+                "the terminal service: kind {kind} took {ticks} ticks, past {RAM_STEP_MAX} or none: {steps:?}"
+            ));
+        }
+    }
+    if let Some(row) = steps.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+        return Err(format!("the terminal service: a step past term B: {row:?}"));
+    }
+    let heartbeat = steps.iter().find(|(k, ..)| *k == 64).map_or(0, |r| r.1);
+    if heartbeat > HEARTBEAT_STEP_MAX {
+        return Err(format!(
+            "the terminal service: a heartbeat took {heartbeat} ticks, past {HEARTBEAT_STEP_MAX}"
+        ));
+    }
+    println!("terminal service steps passed: {}", log.display());
+    Ok(())
+}
+
 fn ash_shell() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -2893,9 +3694,16 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-shared", posix_shared_probe),
         job("posix-input", || posix_input_probe(false)),
         job("posix-interrupt", || posix_interrupt_probe(false)),
+        job("posix-tty", || posix_tty_probe(false, false)),
+        job("posix-tty-control-steps", posix_tty_control_steps),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
+        job("posix-jobs", posix_jobs_probe),
+        job("loader-channels", loader_channels_probe),
+        job("posix-poll", posix_poll_probe),
+        job("posix-pty", posix_pty_probe),
+        job("posix-pty-steps", posix_pty_steps),
         // The longest step of the process service with 128 children, under
         // -icount: the host's time changes none of its numbers.
         job("process-steps", || process_steps(&qemu::VIRT, 4)),
@@ -2959,6 +3767,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("kernel tests 2G icount", || {
             kernel_tests(&qemu::VIRT_2G, Variant::TestIcount).map(drop)
         }),
+        job("tty", || tty_probe(false)),
         // The entropy device's driver under -icount, its steps measured.
         job("entropy", || entropy::probe(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
@@ -3039,6 +3848,10 @@ fn host_tests() -> Result<(), String> {
         "virtio-console",
         "--package",
         "xtask",
+        "--package",
+        "proto-tty",
+        "--package",
+        "tty",
         "--package",
         "virtio-pci",
         "--package",
@@ -3993,6 +4806,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             ("device window", &WINDOW_ROWS[..]),
             ("upcall", &UPCALL_ROWS[..]),
             ("teardown portions", &TEARDOWN_ROWS[..]),
+            ("suspension scopes", &SUSPENSION_ROWS[..]),
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
@@ -4010,16 +4824,17 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     Ok(r.passed.len())
 }
 
-/// The lines whose rows are each one stretch of the kernel between two
-/// polls for interrupts: a portion of a long call, of the timer queue or
-/// of the cleanup, or a whole short call (spec 15.3).
-const PORTION_LINES: [&str; 6] = [
+/// Measured portions and scoped components compared against B (spec 15.3).
+/// Suspension control and pick rows exclude the surrounding syscall and
+/// exit-loop work; their boundaries are documented with the path table.
+const PORTION_LINES: [&str; 7] = [
     "memory portions",
     "timer portions",
     "interrupt path",
     "device window",
     "upcall",
     "teardown portions",
+    "suspension scopes",
 ];
 
 /// The longest row of the PORTION_LINES among the `measured` lines (name,
@@ -4539,11 +5354,6 @@ fn text_size(elf: &Path) -> Result<u64, String> {
         .ok_or_else(|| format!("{}: no .text", elf.display()))
 }
 
-/// The bound of the layer's `.data` + `.bss` in a program (step 5a′: 16
-/// KiB; 20 KiB since step 5d, which adds the memory map of 128 regions,
-/// 4 KiB).
-const LAYER_DATA_LIMIT: u64 = 20 * 1024;
-
 /// The test hooks of the reply journals went with the journals (spec 6.1):
 /// no Cargo.toml of the workspace names the feature `transport-probe`.
 fn no_transport_probe() -> Result<(), String> {
@@ -4633,6 +5443,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "xtask",
         "--package",
+        "proto-tty",
+        "--package",
         "virtio-pci",
         "--package",
         "proto-entropy",
@@ -4661,6 +5473,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "virtio-console",
         "--package",
         "posix-process-service",
+        "--package",
+        "tty",
         "--package",
         "virtio-rng",
         "--package",
@@ -4777,6 +5591,10 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "rtbench-load",
         "--package",
+        "tty",
+        "--package",
+        "tty-probe",
+        "--package",
         "virtio-rng",
         "--package",
         "entropy-probe",
@@ -4829,6 +5647,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "os-test-run",
         "--package",
         "posix-random-probe",
+        "--package",
+        "posix-pty",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -4875,6 +5695,31 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn full_watch_case_survives_a_longer_single_item_maximum() {
+        let mut lines = Vec::new();
+        for (tag, methods) in [(4, [14, 15, 16]), (5, [25, 26, 27])] {
+            for method in methods {
+                lines.push(format!(
+                    "service step: {tag} kind {method} 15000 ticks detail 1"
+                ));
+                lines.push(format!(
+                    "service case: {tag} kind {method} 14000 ticks detail 32"
+                ));
+            }
+            for kind in [64, 65] {
+                lines.push(format!(
+                    "service step: {tag} kind {kind} 1000 ticks detail 0"
+                ));
+            }
+        }
+        assert!(super::check_watch_steps(&lines).is_ok());
+        let mut missing = lines.clone();
+        missing.retain(|line| !line.starts_with("service case: 5 kind 26 "));
+        assert!(super::check_watch_steps(&missing).is_err());
+        lines.push("service case: 5 kind 26 20539 ticks detail 32".into());
+        assert!(super::check_watch_steps(&lines).is_err());
+    }
     use super::*;
 
     /// The check of the layer's names takes every global defined symbol

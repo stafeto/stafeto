@@ -15,6 +15,7 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
+    println!("cargo:rerun-if-changed=jobs.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     // The branches of the steps mode (xtask process-steps N).
@@ -45,6 +46,10 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     run(Command::new(tools.join("clang"))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
+        .arg(format!(
+            "-DJOB_CONTROL_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_JOBS").is_some())
+        ))
         .args([
             // The Linux C ABI relibc's headers describe.
             "--target=aarch64-linux-gnu",

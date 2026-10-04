@@ -182,6 +182,11 @@ pub enum Method {
     Clone = 15,
     WriteAt = 16,
     ReadInto = 17,
+    /// VerifySession: body require_fds u32 (0 or 1), one offered channel.
+    /// A normal SEND|TRANSFER session returns unchanged. An unsuitable
+    /// endpoint with required descriptors is refused; otherwise a fresh
+    /// ordinary empty clone is returned.
+    VerifySession = 18,
 }
 
 impl Method {
@@ -208,12 +213,15 @@ impl Method {
             15 => Some(Self::Clone),
             16 => Some(Self::WriteAt),
             17 => Some(Self::ReadInto),
+            18 => Some(Self::VerifySession),
             _ => None,
         }
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+pub const METHODS: &[u16] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
     if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {
@@ -248,7 +256,7 @@ mod tests {
 
     #[test]
     fn every_method_number_round_trips_and_is_listed() {
-        for number in 0..=17u16 {
+        for number in 0..=18u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(method) = method {

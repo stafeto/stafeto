@@ -1826,7 +1826,21 @@ static int pipe_ghosts(void);
 static int pipe_ghosts_after(void);
 
 /* The roles of the children. */
+static int loader_channels(void);
+static int channel_child(const char *name);
+
+#if JOB_CONTROL_PROBE
+#include "jobs.c"
+#endif
+
 static int role(const char *name) {
+#if JOB_CONTROL_PROBE
+    if (strcmp(name, "jobcontrol") == 0) return job_control();
+    if (strcmp(name, "jobexec-local") == 0) return job_after_exec(0);
+    if (strcmp(name, "jobexec-process") == 0) return job_after_exec(1);
+#endif
+    if (strcmp(name, "loaderchannels") == 0) return loader_channels();
+    if (strncmp(name, "channels_", 9) == 0) return channel_child(name);
     if (strcmp(name, "steps") == 0) return steps_run();
     if (strcmp(name, "branch") == 0) return steps_branch();
     if (strcmp(name, "armed") == 0) return steps_armed();
@@ -3496,10 +3510,266 @@ static void null_device(void) {
     if (failures == 0) printf("posix-procs: /dev/null drops 1 MiB\n");
 }
 
+
+/* Ordinary channel provenance and descriptor continuity, with no credentials
+ * sent by the probe receiver. */
+int stafeto_probe_loader_start(unsigned mode);
+unsigned stafeto_probe_loader_listen(void);
+unsigned stafeto_probe_loader_stop(void);
+void stafeto_probe_loader_disable(void);
+int stafeto_probe_loader_full(unsigned slot);
+void stafeto_probe_loader_bundle(unsigned mode);
+
+static void *channel_listener(void *unused) {
+    (void)unused;
+    return (void *)(unsigned long)stafeto_probe_loader_listen();
+}
+
+static int channel_io(int inherited, char expected) {
+    struct timespec now;
+    char byte = 0;
+    int fd = inherited ? 3 : open("/etc/motd", O_RDONLY);
+    if (fd < 0 || read(fd, &byte, 1) != 1 || byte != expected) return 1;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || clock_gettime(CLOCK_REALTIME, &now) != 0) return 2;
+    if (!inherited && close(fd) != 0) return 3;
+    return 0;
+}
+
+static int channel_child(const char *name) {
+    if (strcmp(name, "channels_random") == 0) {
+        unsigned char bytes[32];
+        return read(3, bytes, sizeof bytes) == sizeof bytes ? 0 : 27;
+    }
+    if (strcmp(name, "channels_terminal") == 0) return isatty(3) == 1 ? 0 : 15;
+    if (strcmp(name, "channels_missing_exec") == 0 || strcmp(name, "channels_no_done_exec") == 0) {
+        stafeto_probe_loader_bundle(strcmp(name, "channels_missing_exec") == 0 ? 2 : 4);
+        char *next[] = {"posix-procs", "channels_terminal", NULL};
+        execv("/bin/procs-child", next);
+        return 19;
+    }
+    if (strcmp(name, "channels_terminal_exec") == 0) {
+        stafeto_probe_loader_bundle(3);
+        char *next[] = {"posix-procs", "channels_terminal", NULL};
+        execv("/bin/procs-child", next);
+        return 16;
+    }
+    if (strcmp(name, "channels_missing_fork") == 0) {
+        int file = open("/etc/motd", O_RDONLY);
+        int random = open("/dev/urandom", O_RDONLY);
+        int ends[2];
+        if (file < 0 || random < 0 || pipe(ends) != 0 || write(ends[1], "p", 1) != 1) return 20;
+        const unsigned modes[] = {2, 5, 6, 7, 8};
+        const char *slots[] = {"Terminal", "Files", "Clock", "Pipes", "Entropy"};
+        for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+            stafeto_probe_loader_bundle(modes[i]);
+            errno = 0;
+            pid_t child = fork();
+            int error = errno;
+            if (child == 0) _exit(21);
+            if (child > 0) {
+                int status = 0;
+                waitpid(child, &status, 0);
+                printf("loader-channels: missing fork %s accepted PID %d errno %d child %d\n",
+                       slots[i], (int)child, error, status);
+                return 22;
+            }
+            if (error != EAGAIN) {
+                printf("loader-channels: missing fork %s failed PID %d errno %d, expected EAGAIN\n",
+                       slots[i], (int)child, error);
+                return 23;
+            }
+            printf("loader-channels: missing fork %s refused before Commit\n", slots[i]);
+        }
+        stafeto_probe_loader_bundle(0);
+        pid_t child = fork();
+        if (child == 0) {
+            char byte = 0;
+            struct timespec now;
+            unsigned char bytes[32];
+            if (read(random, bytes, sizeof bytes) != sizeof bytes || isatty(3) != 1 || read(file, &byte, 1) != 1 || byte != 's' ||
+                read(ends[0], &byte, 1) != 1 || byte != 'p' ||
+                clock_gettime(CLOCK_MONOTONIC, &now) != 0) _exit(24);
+            _exit(0);
+        }
+        int status = 0;
+        char byte = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child || status != 0 ||
+            read(file, &byte, 1) != 1 || byte != 't') return 25;
+        if (close(file) != 0 || close(random) != 0 || close(ends[0]) != 0 || close(ends[1]) != 0) return 26;
+        return 0;
+    }
+    if (strcmp(name, "channels_terminal_fork") == 0) {
+        stafeto_probe_loader_bundle(3);
+        pid_t child = fork();
+        if (child == 0) _exit(isatty(3) == 1 ? 0 : 17);
+        int status = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child || status != 0) return 18;
+        return 0;
+    }
+    if (strcmp(name, "channels_clean") == 0) {
+        unsigned long handles[2];
+        stafeto_start_handles(handles);
+        if (handles[0] != handles[1]) return 4;
+        return channel_io(0, 's');
+    }
+    if (strcmp(name, "channels_io") == 0) return channel_io(1, 's');
+    if (strcmp(name, "channels_after") == 0) return channel_io(1, 't');
+    if (strcmp(name, "channels_exec") == 0) {
+        if (channel_io(1, 's') != 0) return 5;
+        char *next[] = {"posix-procs", "channels_after", NULL};
+        execv("/bin/procs-child", next);
+        return 6;
+    }
+    if (strcmp(name, "channels_fork") == 0) {
+        pid_t child = fork();
+        if (child == 0) _exit(channel_io(1, 's'));
+        int status = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child || status != 0) return 7;
+        return channel_io(1, 't');
+    }
+    if (strcmp(name, "channels_fakefork") == 0 || strcmp(name, "channels_fakeexec") == 0) {
+        if (stafeto_probe_loader_start(4) != 0) return 8;
+        if (strcmp(name, "channels_fakeexec") == 0) {
+            char *next[] = {"posix-procs", "channels_clean", NULL};
+            execv("/bin/procs-child", next);
+            return 10;
+        }
+        pid_t child = fork();
+        if (child == 0) {
+            stafeto_probe_loader_disable();
+            _exit(channel_io(0, 's'));
+        }
+        int status = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child || status != 0) return 11;
+        if (stafeto_probe_loader_stop() != 0) return 12;
+        return 0;
+    }
+    return 14;
+}
+
+static int loader_channels(void) {
+    printf("loader-channels: begin\n");
+    int fd = open("/etc/motd", O_RDONLY);
+    expect("loader channel fd", fd, 3);
+    printf("loader-channels: RAM quota\n");
+    expect("RAM true session at 48 clones", stafeto_probe_loader_full(4), 0);
+    char byte = 0;
+    expect("Verify keeps the shared offset", read(fd, &byte, 1) == 1 && byte == 't', 1);
+    printf("loader-channels: Clock quota\n");
+    expect("Clock true session at 48 clones", stafeto_probe_loader_full(5), 0);
+    printf("loader-channels: inherited transfers\n");
+    for (unsigned i = 0; i < 3; i++) {
+        printf("loader-channels: transfer %u\n", i);
+        const char *role = i == 0 ? "channels_io" : i == 1 ? "channels_exec" : "channels_fork";
+        expect("rewind inherited file", lseek(fd, 0, SEEK_SET), 0);
+        pid_t child = -1;
+        expect("spawn with an inherited description", spawn(&child, role, NULL, NULL), 0);
+        if (child > 0) reap("channel descriptor child", child, 0, 0);
+    }
+    unsigned long long pool_before = stafeto_probe_pool();
+    printf("loader-channels: invalid descriptor endpoints\n");
+    for (unsigned mode = 1; mode <= 4; mode += 2) {
+        expect("create wrong Files endpoint", stafeto_probe_loader_start(mode), 0);
+        pthread_t receiver;
+        if (mode == 1) expect("start wrong Files receiver", pthread_create(&receiver, NULL, channel_listener, NULL), 0);
+        pid_t child = -1;
+        expect("wrong Files with descriptors is refused", spawn(&child, "channels_io", NULL, NULL), EIO);
+        expect("stop wrong Files endpoint", stafeto_probe_loader_stop(), 0);
+        if (mode == 1) {
+            void *requests = NULL;
+            expect("join wrong Files receiver", pthread_join(receiver, &requests), 0);
+            expect("wrong Files gets no request", requests == NULL, 1);
+        }
+    }
+    unsigned long long pool_after = stafeto_probe_pool();
+    for (unsigned i = 0; i < 20 && pool_after != pool_before; i++) {
+        pause_ms(1);
+        pool_after = stafeto_probe_pool();
+    }
+    expect("failed normalization releases the process pool", pool_after == pool_before, 1);
+    expect("close inherited descriptor", close(fd), 0);
+    printf("loader-channels: empty replacements\n");
+    for (unsigned mode = 1; mode <= 4; mode++) {
+        printf("loader-channels: replacement %u\n", mode);
+        expect("create replacement endpoint", stafeto_probe_loader_start(mode), 0);
+        pthread_t receiver;
+        if (mode <= 2) expect("start replacement receiver", pthread_create(&receiver, NULL, channel_listener, NULL), 0);
+        pid_t child = -1;
+        expect("spawn normalizes endpoint", spawn(&child, "channels_clean", NULL, NULL), 0);
+        if (child > 0) reap("normalized channel child", child, 0, 0);
+        expect("stop replacement endpoint", stafeto_probe_loader_stop(), 0);
+        if (mode <= 2) {
+            void *requests = NULL;
+            expect("join replacement receiver", pthread_join(receiver, &requests), 0);
+            expect("offered endpoint gets no request", requests == NULL, 1);
+        }
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        pid_t child = -1;
+        expect("spawn transfer normalization probe", spawn(&child, i ? "channels_fakeexec" : "channels_fakefork", NULL, NULL), 0);
+        if (child > 0) reap("transfer normalization child", child, 0, 0);
+    }
+    pid_t child = -1;
+    expect("spawn handle cleanup probe", spawn(&child, "handles", NULL, NULL), 0);
+    if (child > 0) reap("loader roots close", child, 0, 0);
+    int terminal = open("/dev/console", O_RDWR | O_NOCTTY);
+    expect("terminal for the final Handles packet", terminal, 3);
+    stafeto_probe_loader_bundle(3);
+    for (unsigned i = 0; i < 3; i++) {
+        stafeto_probe_loader_bundle(i == 2 ? 0 : 3);
+        pid_t part = -1;
+        expect("six channels in two Handles packets", spawn(&part,
+               i == 0 ? "channels_terminal" : i == 1 ? "channels_terminal_exec" : "channels_terminal_fork", NULL, NULL), 0);
+        if (part > 0) reap("Terminal in the last packet", part, 0, 0);
+    }
+    stafeto_probe_loader_bundle(2);
+    pid_t missing = -1;
+    expect("HandlesDone refuses the missing final Terminal", spawn(&missing, "channels_terminal", NULL, NULL), EIO);
+    stafeto_probe_loader_bundle(4);
+    expect("Go refuses early Handles without Done", spawn(&missing, "channels_terminal", NULL, NULL), EIO);
+    stafeto_probe_loader_bundle(0);
+    pid_t exec_missing = -1;
+    expect("spawn missing exec bundle probe", spawn(&exec_missing, "channels_missing_exec", NULL, NULL), 0);
+    if (exec_missing > 0) reap("missing exec slot stops before Commit", exec_missing, 127, 0);
+    exec_missing = -1;
+    expect("spawn incomplete exec bundle probe", spawn(&exec_missing, "channels_no_done_exec", NULL, NULL), 0);
+    if (exec_missing > 0) reap("Commit before Done is refused", exec_missing, 126, 0);
+    pid_t fork_missing = -1;
+    expect("spawn missing fork bundle probe", spawn(&fork_missing, "channels_missing_fork", NULL, NULL), 0);
+    if (fork_missing > 0) reap("fork slots checked before Commit, then descriptors preserved", fork_missing, 0, 0);
+    expect("close the packet terminal", close(terminal), 0);
+    int random = open("/dev/urandom", O_RDONLY);
+    expect("random description for loader requirements", random, 3);
+    for (unsigned mode = 5; mode <= 8; mode += 3) {
+        stafeto_probe_loader_bundle(mode);
+        pid_t random_child = -1;
+        expect("random description requires Files and Entropy", spawn(&random_child, "channels_random", NULL, NULL), EIO);
+    }
+    stafeto_probe_loader_bundle(0);
+    expect("replace Files with a closed endpoint for random", stafeto_probe_loader_start(3), 0);
+    pid_t random_child = -1;
+    expect("random description refuses the wrong Files endpoint", spawn(&random_child, "channels_random", NULL, NULL), EIO);
+    expect("close random replacement endpoint", stafeto_probe_loader_stop(), 0);
+    expect("spawn keeps a random description", spawn(&random_child, "channels_random", NULL, NULL), 0);
+    if (random_child > 0) reap("inherited random description reads", random_child, 0, 0);
+    expect("close loader random description", close(random), 0);
+    if (failures) return 1;
+    printf("loader-channels: packets 4+2, final slots and repeated completion checked\n");
+    printf("loader-channels: ok (spawn exec fork, RAM/Clock 48, inherited offsets, closed endpoints)\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     argc_seen = argc;
     argv_seen = argv;
     if (argc > 1) return role(argv[1]);
+    if (JOB_CONTROL_PROBE) {
+        pid_t child = -1;
+        expect("spawn job-control probe", spawn(&child, "jobcontrol", NULL, NULL), 0);
+        if (child > 0) reap("job-control probe", child, 0, 0);
+        if (!failures) printf("posix-jobs: ok\n");
+        return failures != 0;
+    }
     pid_t child = 0;
     int e = spawn(&child, "child", NULL, NULL);
     expect("spawn of procs-child", e, 0);

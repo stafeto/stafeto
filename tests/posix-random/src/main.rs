@@ -9,3 +9,9 @@
 
 #[used]
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
+
+/// The existing process counter, for bounded waits in the C probe.
+#[unsafe(no_mangle)]
+pub extern "C" fn random_probe_calls() -> u64 {
+    rt::sys::calls()
+}

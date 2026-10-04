@@ -145,9 +145,22 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::ramfs::BUSYBOX_DIALOG_TABLE[4],
     // The image of this table has no entropy service.
     Record {
-        connects: &["ramfs", "uart", "pipe", "clock", "posix"],
+        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
         ..super::ramfs::BUSYBOX_DIALOG_TABLE[5]
     },
+    super::ramfs::TTY,
+];
+
+/// The probe of the terminal in C over the Virtio console's driver, as
+/// `ramfs::POSIX_TTY_TABLE` on QEMU.
+pub const POSIX_TTY_TABLE: &[Record] = &[
+    CONSOLE,
+    super::ramfs::POSIX_TTY_TABLE[1],
+    super::ramfs::POSIX_TTY_TABLE[2],
+    super::ramfs::POSIX_TTY_TABLE[3],
+    super::ramfs::POSIX_TTY_TABLE[4],
+    super::ramfs::POSIX_TTY_TABLE[5],
+    super::ramfs::TTY,
 ];
 
 /// The probes of console input and interruption, as
@@ -181,17 +194,22 @@ pub const RTBENCH_TABLE: &[Record] = &[
 /// rtbench 2 on VZ: the image of `ramfs::RTBENCH_POSIX_TABLE` with the
 /// Virtio console's driver for the console.
 pub const RTBENCH_POSIX_TABLE: &[Record] = &[
-    Record {
-        name: "console",
-        ..CONSOLE
-    },
+    CONSOLE,
     super::ramfs::TABLE[0],
     super::ramfs::RTBENCH_POOL,
     super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::PIPE,
-    super::ramfs::LONG,
+    Record {
+        name: "bench-uart",
+        ..super::ramfs::LONG
+    },
+    super::ramfs::TTY,
     super::ramfs::LOAD,
     super::ramfs::RTBENCH,
     super::entropy::RNG_VZ,
     super::entropy::ENTROPY,
 ];
+
+/// The probe of the terminal service over the Virtio console's driver, as
+/// `ramfs::TTY_TABLE` on QEMU.
+pub const TTY_TABLE: &[Record] = &[CONSOLE, super::ramfs::TTY, super::ramfs::TTY_TABLE[2]];

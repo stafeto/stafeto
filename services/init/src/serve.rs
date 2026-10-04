@@ -1191,15 +1191,25 @@ impl Init {
         // for each (proto_fs::LOADERS).
         let grant = if notary {
             let set_id = table::SET_ID_VOUCHERS.contains(&client.name);
+            let terminal = client.name == table::TERMINAL_SERVICE;
+            let mut mark = proto_process::NOTARY;
+            if set_id {
+                mark |= proto_process::SET_ID;
+            }
+            if terminal {
+                mark |= proto_process::TERMINAL;
+            }
             Grant {
-                mark: proto_process::NOTARY | if set_id { proto_process::SET_ID } else { 0 },
+                mark,
                 duplicate: false,
             }
-        } else if client.name == table::PROCESS_SERVICE
-            && name.as_bytes() == table::RAM_SERVICE.as_bytes()
-        {
+        } else if table::loader_grant(client.name, name.as_bytes()) {
             Grant {
-                mark: proto_fs::LOADERS,
+                mark: if name.as_bytes() == table::RAM_SERVICE.as_bytes() {
+                    proto_fs::LOADERS
+                } else {
+                    0
+                },
                 duplicate: true,
             }
         } else {
