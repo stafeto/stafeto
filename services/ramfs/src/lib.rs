@@ -9,6 +9,9 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod authority;
+pub mod image;
+#[cfg(test)]
+mod image_tests;
 pub mod maintenance;
 pub mod open;
 pub mod places;
@@ -217,6 +220,7 @@ pub struct Fds {
     pub auth_probe_gc_reservation: Option<storage::Reservation>,
     pub resolvers: [u64; 16],
     pub open_watermarks: [u64; OPEN_MAX],
+    pub image_hold: Option<image::ImageHold>,
     /// Exact completed operations survive Close as tombstones until this fd is reused.
     open_receipts: [OpenReceipt; OPEN_MAX],
     pub root: storage::Root,
@@ -243,6 +247,7 @@ impl Default for Fds {
             auth_probe_gc_reservation: None,
             resolvers: [0; 16],
             open_watermarks: [0; OPEN_MAX],
+            image_hold: None,
             open_receipts: [OpenReceipt::EMPTY; OPEN_MAX],
             root: BOOT_ROOT,
             cwd: None,
@@ -847,6 +852,9 @@ impl<'a> Ram<'a> {
             let _ = self.storage.cancel(r);
             return true;
         }
+        if self.release_image(fds) {
+            return true;
+        }
         if let Some(cwd) = fds.cwd.take() {
             let _ = self.storage.unpin(cwd, Pin::Cwd);
             return true;
@@ -897,6 +905,7 @@ impl<'a> Ram<'a> {
     }
 
     pub fn release(&mut self, fds: &mut Fds) {
+        self.release_image(fds);
         #[cfg(feature = "auth-probe")]
         {
             fds.auth_probe_gc_reservation = None;
