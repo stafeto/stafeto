@@ -16,6 +16,22 @@ pub struct ImageHold {
     pub root: Root,
 }
 
+/// The source retains recovery authority for one exact executable proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImagePhase {
+    Prepared,
+    Ready,
+    Retired,
+    AbortRequired,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageOutcome {
+    pub job: u64,
+    pub label: u64,
+    pub token: Token,
+    pub phase: ImagePhase,
+}
+
 impl Ram<'_> {
     /// The service validates owner, path proof and execute permission before admission.
     pub fn hold_image(&mut self, fds: &mut Fds, token: Token, entry: u16) -> Result<(), u32> {

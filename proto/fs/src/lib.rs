@@ -50,8 +50,16 @@
 //! OPEN: flags u32, proof u64. Reply: status, fd u32, optional RANDOM_DEVICE u32.
 //! LOOKUP/INFO_PATH: proof u64. Reply: status then metadata/NodeInfo.
 //! READ_DIR: index u32, proof u64. Reply: status, kind u32, name bytes.
-//! OPEN_EXEC through a bound Pending session: proof u64; image session reply.
-//! A final path operation consumes its proof. Cancellation is always idempotent.
+//! OPEN_EXEC through a bound Pending session takes the original proof u64.
+//! Its prepaid image resources return RESOLVING before a separate SetId effect.
+//! Success replies with one SEND|TRANSFER image channel and status0 (4 bytes).
+//! Replays of that exact proof return the same retained image without another SetId.
+//! ResolveCancel retires the source's private recovery copy; external caps retain
+//! the inode pin, fd0/root description charge and exact loader identity.
+//! Completed ProofCancel retains terminal OPEN_RETIRED metadata for the old attempt.
+//! Image labels carry opaque places/generations; ReadAt/ReadInto/InfoFd use fd0.
+//! IMAGE_ABORT_REQUIRED is terminal after an uncertain SetId outcome.
+//! Other final path operations consume their proofs. Cancellation is idempotent.
 //! READ/WRITE: fd u32, count u32 or bytes. Reply: status, count u32, read bytes.
 //! READ_AT/WRITE_AT add an offset u64; they preserve the description's position.
 //! SEEK: fd u32, offset u32. SEEK_FROM adds signed offset i64 and origin u32.
@@ -82,7 +90,7 @@ pub use info::NodeInfo;
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
-pub const VERSION: u16 = 8;
+pub const VERSION: u16 = 9;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -134,6 +142,8 @@ pub const TEXT_BUSY: u32 = 318;
 pub const OPEN_RETIRED: u32 = 319;
 /// The implementation regular-file capacity was reached (EFBIG).
 pub const FILE_TOO_LARGE: u32 = 320;
+/// A SetId outcome requires a genuine loader abort before another execution attempt.
+pub const IMAGE_ABORT_REQUIRED: u32 = 321;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -165,24 +175,12 @@ pub const fn is_loaders(label: u64) -> bool {
     label & (1 << 63) == 0 && label & LOADERS != 0
 }
 
-/// The labels the service gives itself: bit 63, which no label of init
-/// has; with bit 62 an image session, whose low 16 bits name the entry
-/// of the image's table it reads.
+/// Genuine issued sessions carry OWN; image sessions also carry IMAGE_SESSION.
+/// The remaining bits identify an opaque place and its nonwrapping generation.
 pub const OWN: u64 = 1 << 63;
 pub const IMAGE_SESSION: u64 = 1 << 62;
-
-/// The label of the `count`th image session, for entry `entry`.
-pub const fn image_label(count: u64, entry: u16) -> u64 {
-    OWN | IMAGE_SESSION | (count & ((1 << 46) - 1)) << 16 | entry as u64
-}
-
-/// The entry an image session's label names.
-pub const fn image_entry(label: u64) -> Option<u16> {
-    if label & (OWN | IMAGE_SESSION) == OWN | IMAGE_SESSION {
-        Some(label as u16)
-    } else {
-        None
-    }
+pub const fn is_image(label: u64) -> bool {
+    label & (OWN | IMAGE_SESSION) == OWN | IMAGE_SESSION
 }
 
 /// Origins for the signed 64-bit SEEK_FROM request.
@@ -362,10 +360,8 @@ mod tests {
         assert!(is_loaders(LOADERS | 7));
         assert!(!is_loaders(7));
         assert!(!is_loaders(OWN | LOADERS | 7), "an image session");
-        let label = image_label(5, 12);
-        assert_eq!(image_entry(label), Some(12));
-        assert_ne!(image_label(6, 12), label);
-        assert_eq!(image_entry(OWN | 12), None, "a clone");
-        assert_eq!(image_entry(LOADERS | 12), None);
+        assert!(is_image(OWN | IMAGE_SESSION | 12));
+        assert!(!is_image(OWN | 12));
+        assert!(!is_image(LOADERS | 12));
     }
 }

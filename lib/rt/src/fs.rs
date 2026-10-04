@@ -529,16 +529,33 @@ impl Files {
         w.u64(proof.id)?;
         loop {
             let mut reply = proof.send(w.as_bytes())?;
-            let mut buffer = [0; MESSAGE_MAX];
-            let status = Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?);
-            if status == Status::Unknown(proto_fs::STALE_PROOF) {
+            let code = Self::reply_code(&reply)?;
+            if code == 0 {
+                if reply.len != 4
+                    || reply.handles.len() != 1
+                    || !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                        kind == abi::ObjectKind::Channel
+                            && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+                    })
+                {
+                    return Err(Status::BadSize);
+                }
+                return reply.handles.take::<Channel>(0).map_err(Status::Kernel);
+            }
+            if reply.len != proto_wire::HEADER_LEN
+                || reply.words[0] >> 32 != 0
+                || !reply.handles.is_empty()
+            {
+                return Err(Status::BadSize);
+            }
+            if code == proto_fs::RESOLVING {
+                continue;
+            }
+            if code == proto_fs::STALE_PROOF {
                 proof.ready()?;
                 continue;
             }
-            if status != Status::Ok {
-                return Err(status);
-            }
-            return reply.handles.take::<Channel>(0).map_err(Status::Kernel);
+            return Err(Status::from_code(code));
         }
     }
 

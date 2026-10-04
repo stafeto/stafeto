@@ -1232,7 +1232,7 @@ fn file_size(image: &Handle<Channel>) -> Result<u64, u32> {
         .write(&mut w)
         .and_then(|()| w.u32(0))
         .map_err(|_| pl::IO)?;
-    let reply = sys::send(image, w.as_bytes()).map_err(code)?;
+    let reply = rt::fs::Files::send_on(image, w.as_bytes()).map_err(|_| pl::IO)?;
     let mut buffer = [0; MESSAGE_MAX];
     let mut r = Reader::new(reply.bytes(&mut buffer));
     if r.u32() != Ok(0) {
@@ -1257,7 +1257,7 @@ fn read_at(image: &Handle<Channel>, offset: u64, out: &mut [u8]) -> Result<usize
             .and_then(|()| w.u64(offset + done as u64))
             .and_then(|()| w.u32(count as u32))
             .map_err(|_| pl::IO)?;
-        let reply = sys::send(image, w.as_bytes()).map_err(code)?;
+        let reply = rt::fs::Files::send_on(image, w.as_bytes()).map_err(|_| pl::IO)?;
         let mut r = Reader::new(reply.bytes(&mut buffer));
         if r.u32() != Ok(0) {
             return Err(pl::IO);
@@ -1320,7 +1320,6 @@ fn read_into(
     at: u64,
 ) -> Result<u64, u32> {
     let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
-    let copy = sys::handle_duplicate(m, rights).map_err(code)?;
     let mut w = Writer::new();
     proto_fs::Method::ReadInto
         .header()
@@ -1330,13 +1329,23 @@ fn read_into(
         .and_then(|()| w.u32(count as u32))
         .and_then(|()| w.u64(at))
         .map_err(|_| pl::IO)?;
-    let reply = sys::send_handles(image, w.as_bytes(), [copy.erase()])
-        .map_err(|refused| code(refused.error))?;
-    let mut buffer = [0; MESSAGE_MAX];
-    let mut r = Reader::new(reply.bytes(&mut buffer));
-    match (r.u32(), r.u32()) {
-        (Ok(0), Ok(n)) => Ok(n.into()),
-        _ => Err(pl::IO),
+    loop {
+        let copy = sys::handle_duplicate(m, rights).map_err(code)?;
+        let reply = sys::send_handles(image, w.as_bytes(), [copy.erase()])
+            .map_err(|refused| code(refused.error))?;
+        if !reply.handles.is_empty() {
+            return Err(pl::IO);
+        }
+        let status = reply.words[0] as u32;
+        if reply.len == 8 && reply.words[0] >> 32 == 0 && status == proto_fs::AUTHENTICATING {
+            rt::fs::Files::finish_on(image).map_err(|_| pl::IO)?;
+            continue;
+        }
+        if reply.len != 8 || status != 0 {
+            return Err(pl::IO);
+        }
+        let n = reply.words[0] >> 32;
+        return if n <= count { Ok(n) } else { Err(pl::IO) };
     }
 }
 

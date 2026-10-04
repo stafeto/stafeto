@@ -224,6 +224,7 @@ pub struct Fds {
     pub resolvers: [u64; 16],
     pub open_watermarks: [u64; OPEN_MAX],
     pub image_hold: Option<image::ImageHold>,
+    pub image_outcome: Option<image::ImageOutcome>,
     /// Exact completed operations survive Close as tombstones until this fd is reused.
     open_receipts: [OpenReceipt; OPEN_MAX],
     pub root: storage::Root,
@@ -251,6 +252,7 @@ impl Default for Fds {
             resolvers: [0; 16],
             open_watermarks: [0; OPEN_MAX],
             image_hold: None,
+            image_outcome: None,
             open_receipts: [OpenReceipt::EMPTY; OPEN_MAX],
             root: BOOT_ROOT,
             cwd: None,
