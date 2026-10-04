@@ -1094,6 +1094,7 @@ fn main() {
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
         Some("posix-tty-control-steps") => posix_tty_control_steps(),
+        Some("posix-pty-steps") => posix_pty_probe_in(true),
         Some("posix-jobs") => posix_jobs_probe(),
         Some("process-steps") => match &args[1..] {
             [] => process_steps(&qemu::VIRT, 7),
@@ -2401,11 +2402,19 @@ fn posix_poll_probe() -> Result<(), String> {
 }
 
 fn posix_pty_probe() -> Result<(), String> {
+    posix_pty_probe_in(false)
+}
+fn posix_pty_steps() -> Result<(), String> {
+    posix_pty_probe_in(true)
+}
+
+fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
     }
+    busybox_build()?;
     let kernel = build(Variant::Normal)?;
-    const PROGRAMS: [ImageProgram; 11] = [
+    const PROGRAMS: [ImageProgram; 12] = [
         ("init", "init", INIT_STACK_SIZE, &["table-posix-pty"]),
         ("uart", "uart", UART_STACK_SIZE, &[]),
         ("tty", "tty", TTY_STACK_SIZE, &[]),
@@ -2414,11 +2423,31 @@ fn posix_pty_probe() -> Result<(), String> {
         POSIX_PROCS_PROGRAMS[3],
         POSIX_PROCS_PROGRAMS[4],
         ("posix-pty", "posix-pty", POSIX_STACK_SIZE, &[]),
+        (
+            "busybox-probe",
+            "busybox-probe",
+            POSIX_STACK_SIZE,
+            &["ash-interactive"],
+        ),
         POSIX_PROCS_PROGRAMS[6],
         POSIX_PROCS_PROGRAMS[8],
         POSIX_PROCS_PROGRAMS[9],
     ];
-    let image = build_boot_image("boot-posix-pty.img", &PROGRAMS, BOOT_PROFILE)?;
+    const STEPS: [ImageProgram; 12] = {
+        let mut programs = PROGRAMS;
+        programs[2].3 = &["quiet-steps"];
+        programs[7].3 = &["clone-steps"];
+        programs
+    };
+    let image = build_boot_image(
+        if steps {
+            "boot-posix-pty-steps.img"
+        } else {
+            "boot-posix-pty.img"
+        },
+        if steps { &STEPS } else { &PROGRAMS },
+        BOOT_PROFILE,
+    )?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
     let output = run_until(
@@ -2429,6 +2458,20 @@ fn posix_pty_probe() -> Result<(), String> {
     )?;
     qemu::expect_marker(&output, "posix-pty: ok")?;
     qemu::expect_stopped_on(&output, "init: posix-pty ended: exit code 0, not restarted")?;
+    if steps {
+        let measured = longest_steps(&output.lines, "5");
+        for kind in [7, 65] {
+            let ticks = measured
+                .iter()
+                .find(|row| row.0 == kind)
+                .map_or(0, |row| row.1);
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!(
+                    "terminal Clone 32: kind {kind} took {ticks} ticks, bound {RAM_STEP_MAX}"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3658,6 +3701,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
         job("posix-pty", posix_pty_probe),
+        job("posix-pty-steps", posix_pty_steps),
         // The longest step of the process service with 128 children, under
         // -icount: the host's time changes none of its numbers.
         job("process-steps", || process_steps(&qemu::VIRT, 4)),
@@ -5603,6 +5647,7 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-random-probe",
         "--package",
         "posix-pty",
+        "posix-pty-steps",
         "--target",
         PROGRAM_TARGET,
         "--",
