@@ -149,8 +149,7 @@ fn main(_: u64) -> u64 {
         jobs: &mut tables.jobs,
         job_generations: &mut tables.job_generations,
         generations: None,
-        maintenance_cursor: 1,
-        audit_remaining: 0,
+        maintenance: ramfs::maintenance::Cursor::default(),
         next_audit_ns: 0,
         maintenance_jobs: false,
     };
@@ -188,8 +187,7 @@ struct Fs {
     jobs: &'static mut [Option<ResolveJob>; ramfs::storage::PREPARATIONS],
     job_generations: &'static mut [u64; ramfs::storage::PREPARATIONS],
     generations: Option<Handle<Memory>>,
-    maintenance_cursor: usize,
-    audit_remaining: usize,
+    maintenance: ramfs::maintenance::Cursor,
     next_audit_ns: u64,
     maintenance_jobs: bool,
 }
@@ -276,8 +274,9 @@ impl Fs {
             return false;
         }
         if fds.binding_preparation.is_some() {
-            let _ = self.binding_step(fds, label);
-            return true;
+            let mut progress = true;
+            let _ = self.binding_phase(fds, label, &mut progress);
+            return progress;
         }
         if self
             .identities
@@ -696,21 +695,21 @@ impl Service<0> for Fs {
         }
         rt::service::step_own();
         let now = rt::time::ticks_to_ns(rt::time::now());
-        if now >= self.next_audit_ns && self.audit_remaining == 0 {
+        if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
             self.next_audit_ns = now.saturating_add(250_000_000);
-            self.audit_remaining = SESSIONS + BIRTHS - 1;
+            self.maintenance.remaining = SESSIONS + BIRTHS - 1;
         }
         let mut work = false;
         self.maintenance_jobs = !self.maintenance_jobs;
         if self.maintenance_jobs {
             work = self.ram.storage.reclaim_step();
-            if work || self.audit_remaining != 0 {
+            if work || self.maintenance.remaining != 0 {
                 let _ = sys::notify(&self.channel, 1);
             }
             return;
         }
         let mut client_work = false;
-        let i = self.maintenance_cursor;
+        let i = self.maintenance.position;
         if i < SESSIONS {
             if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
                 let label = s.label();
@@ -721,12 +720,9 @@ impl Service<0> for Fs {
             self.births[i - SESSIONS] = Some((label, fds));
         }
         work |= client_work;
-        if !client_work {
-            self.maintenance_cursor = 1 + i % (SESSIONS + BIRTHS - 1);
-            self.audit_remaining = self.audit_remaining.saturating_sub(1);
-        }
+        self.maintenance.complete(client_work, SESSIONS + BIRTHS);
         // A maintenance notification makes reclamation progress with no client request.
-        if work || self.audit_remaining != 0 {
+        if work || self.maintenance.remaining != 0 {
             let _ = sys::notify(&self.channel, 1);
         }
     }
@@ -1782,6 +1778,10 @@ impl Fs {
         }
     }
     fn binding_step(&mut self, fds: &mut Fds, label: u64) -> u32 {
+        self.binding_phase(fds, label, &mut true)
+    }
+    fn binding_phase(&mut self, fds: &mut Fds, label: u64, progress: &mut bool) -> u32 {
+        *progress = true;
         let i = fds.authority_index as usize;
         let Some(binding) = self.identities.get(i).and_then(Option::as_ref) else {
             return self.reject_binding(fds);
@@ -1802,23 +1802,28 @@ impl Fs {
                 && matches!(binding.original, Binding::Pending(_) | Binding::Handoff(_))
             {
                 let original = binding.original;
-                return match self.retained_wire(&identity, original) {
-                    NotaryReply::Wire(wire) => {
-                        self.identities[i].as_mut().unwrap().admission =
-                            Admission::RetainedWire(wire);
+                let wire = self.retained_wire(&identity, original);
+                return match wire.admit(
+                    &mut self.identities[i].as_mut().unwrap().admission,
+                    Admission::RetainedWire,
+                ) {
+                    Ok(advanced) => {
+                        *progress = advanced;
                         proto_fs::RESOLVING
                     }
-                    NotaryReply::Retry => proto_fs::RESOLVING,
-                    NotaryReply::Denied => self.reject_binding(fds),
+                    Err(code) => self.fail_binding(fds, code),
                 };
             }
-            return match self.vouch_wire(&identity) {
-                NotaryReply::Wire(wire) => {
-                    self.identities[i].as_mut().unwrap().admission = Admission::Wire(wire);
+            let wire = self.vouch_wire(&identity);
+            return match wire.admit(
+                &mut self.identities[i].as_mut().unwrap().admission,
+                Admission::Wire,
+            ) {
+                Ok(advanced) => {
+                    *progress = advanced;
                     proto_fs::RESOLVING
                 }
-                NotaryReply::Retry => proto_fs::RESOLVING,
-                NotaryReply::Denied => self.reject_binding(fds),
+                Err(code) => self.fail_binding(fds, code),
             };
         }
         if matches!(
@@ -1826,7 +1831,13 @@ impl Fs {
             Admission::Wire(_) | Admission::RetainedWire(_)
         ) {
             return match self.identities[i].as_mut().unwrap().admission.decode() {
-                Ok(()) => proto_fs::RESOLVING,
+                Ok(()) => {
+                    *progress = !matches!(
+                        self.identities[i].as_ref().unwrap().admission,
+                        Admission::Unvouched
+                    );
+                    proto_fs::RESOLVING
+                }
                 Err(code) => self.fail_binding(fds, code),
             };
         }
@@ -1838,13 +1849,20 @@ impl Fs {
                 .admission
                 .validate_retained(original, generation(retained.who.index as usize))
             {
-                Ok(()) => proto_fs::RESOLVING,
+                Ok(()) => {
+                    *progress = !matches!(
+                        self.identities[i].as_ref().unwrap().admission,
+                        Admission::Unvouched
+                    );
+                    proto_fs::RESOLVING
+                }
                 Err(code) => self.fail_binding(fds, code),
             };
         }
         if let Admission::RetainedValidated(retained) = binding.admission {
             if generation(retained.who.index as usize) != retained.who.generation {
                 self.identities[i].as_mut().unwrap().admission = Admission::Unvouched;
+                *progress = false;
                 return proto_fs::RESOLVING;
             }
             return match binding.original.retained_refresh(&retained) {
@@ -1864,7 +1882,13 @@ impl Fs {
                 pending,
                 generation(who.index as usize),
             ) {
-                Ok(()) => proto_fs::RESOLVING,
+                Ok(()) => {
+                    *progress = !matches!(
+                        self.identities[i].as_ref().unwrap().admission,
+                        Admission::Unvouched
+                    );
+                    proto_fs::RESOLVING
+                }
                 Err(code) => self.fail_binding(fds, code),
             };
         }
@@ -1873,6 +1897,7 @@ impl Fs {
         };
         if generation(who.index as usize) != who.generation {
             self.identities[i].as_mut().unwrap().admission = Admission::Unvouched;
+            *progress = false;
             return proto_fs::RESOLVING;
         }
         let pending = binding.pending;
@@ -1952,7 +1977,7 @@ impl Fs {
             {
                 let (_, mut source) = self.births[slot as usize].take().unwrap();
                 let code = if source.binding_preparation.is_some() {
-                    self.binding_step(&mut source, label)
+                    self.binding_phase(&mut source, label, progress)
                 } else {
                     match self.authenticate(&mut source, label) {
                         Ok(()) | Err(proto_fs::AUTHENTICATING) => proto_fs::RESOLVING,

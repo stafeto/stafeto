@@ -30,6 +30,20 @@ pub enum NotaryReply<const N: usize> {
     Retry,
 }
 impl<const N: usize> NotaryReply<N> {
+    pub fn admit(
+        self,
+        admission: &mut Admission,
+        wire: fn([u8; N]) -> Admission,
+    ) -> Result<bool, u32> {
+        match self {
+            Self::Wire(bytes) => {
+                *admission = wire(bytes);
+                Ok(true)
+            }
+            Self::Denied => Err(proto_fs::PERMISSION),
+            Self::Retry => Ok(false),
+        }
+    }
     pub fn read(bytes: &[u8], handles_empty: bool) -> Self {
         if !handles_empty {
             return Self::Retry;

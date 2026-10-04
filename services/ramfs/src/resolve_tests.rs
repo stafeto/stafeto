@@ -1058,3 +1058,78 @@ fn cleanup_audit_retries_unconfirmed_responses_and_rechecks_every_epoch() {
     audit.reset();
     assert!(!audit.cached(4));
 }
+
+#[test]
+fn retrying_binding_cursor_releases_dead_and_superseded_real_captures() {
+    use crate::authority::{Admission, AuditStep, CleanupAudit, NotaryReply};
+    let mut ram = Ram::new(0);
+    let old = who();
+    let file = create(&mut ram, ROOT, b"cursor", REG, 0o600);
+    let mut sessions: [Fds; 4] = core::array::from_fn(|_| Fds {
+        binding: Binding::Active(old),
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    });
+    for session in &mut sessions[1..] {
+        ram.open_token(session, file, proto_fs::READ_ONLY, OWNER)
+            .unwrap();
+        ram.set_cwd_token(session, ROOT).unwrap();
+        ram.begin_binding(session).unwrap();
+    }
+    let mut cursor = crate::maintenance::Cursor {
+        position: 1,
+        remaining: 3,
+    };
+    let mut first = Admission::Unvouched;
+    for _ in 0..32 {
+        let index = cursor.position;
+        let session = &mut sessions[index];
+        let work = if index == 1 {
+            // The exact production transport adapter preserves this real preparation.
+            NotaryReply::<252>::Retry
+                .admit(&mut first, Admission::Wire)
+                .unwrap()
+        } else if session.binding != Binding::Cleanup {
+            let mut audit = CleanupAudit::default();
+            let mut admission = Admission::Vouched(WhoReply {
+                generation: 2,
+                image: old.image + 1,
+                ..old
+            });
+            audit.start(&mut admission, 2);
+            admission = Admission::Vouched(WhoReply {
+                generation: 2,
+                image: old.image + 1,
+                ..old
+            });
+            let generation = if index == 2 {
+                proto_process::GENERATION_DEAD | 2
+            } else {
+                2
+            };
+            assert_eq!(
+                audit.step(session.binding, &mut admission, generation),
+                AuditStep::Denied
+            );
+            session.binding = Binding::Cleanup;
+            true
+        } else {
+            ram.release_step(session)
+        };
+        cursor.complete(work, sessions.len());
+    }
+    assert!(sessions[1].binding_preparation.is_some());
+    assert!(sessions[1].cwd.is_some());
+    assert!(matches!(first, Admission::Unvouched));
+    assert_eq!(ram.open_descriptions(), 1);
+    assert_eq!(ram.storage.preparations_used(), 1);
+    for session in &sessions[2..] {
+        assert_eq!(session.binding, Binding::Cleanup);
+        assert_eq!(session.binding_preparation, None);
+        assert_eq!(session.cwd, None);
+        assert_eq!(ram.description_token(session, 0), Err(proto_fs::BAD_FD));
+    }
+    ram.release(&mut sessions[1]);
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.preparations_used(), 0);
+}
