@@ -2817,10 +2817,11 @@ const PIPE_STEP_KINDS: [(usize, &str); 15] = [
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
-const STEP_KINDS: [(usize, &str); 15] = [
+const STEP_KINDS: [(usize, &str); 16] = [
     (1, "Create"),
     (13, "Kill"),
     (21, "Vouch"),
+    (53, "RetainedLoader"),
     (22, "SpawnStart"),
     (23, "Boot"),
     (24, "Take"),
@@ -2940,6 +2941,13 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if vouch == 0 || vouch > VOUCH_TICKS_MAX {
         return Err(format!(
             "the longest Vouch took {vouch} ticks with {live} children, past {VOUCH_TICKS_MAX}"
+        ));
+    }
+    if let Some((_, ticks, _)) = rows.iter().find(|(kind, _, _)| *kind == 53)
+        && *ticks > VOUCH_TICKS_MAX
+    {
+        return Err(format!(
+            "RetainedLoader took {ticks} ticks with {live} children, past {VOUCH_TICKS_MAX}"
         ));
     }
     // One READ_INTO is a step of the RAM file service at level 40 whose
