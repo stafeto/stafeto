@@ -53,6 +53,10 @@ impl Generations {
         self.word(index).map_or(0, |w| w.load(Ordering::Acquire))
     }
 
+    pub fn room(&self, index: usize, steps: u64) -> bool {
+        proto_process::generation_room(self.get(index), steps)
+    }
+
     /// Raises the generation of the record in `index`, with Release.
     pub fn raise(&self, index: usize) {
         if let Some(w) = self.word(index) {

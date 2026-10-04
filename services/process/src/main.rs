@@ -339,13 +339,6 @@ fn main(_: u64) -> u64 {
     let _ = rt::service::run::<Processes, SESSIONS, 0>(&channel, owner, config);
     5
 }
-fn status(result: Result<(), posix_credentials::Error>) -> Status {
-    Status::from_code(match result {
-        Ok(()) => 0,
-        Err(posix_credentials::Error::Invalid) => proto_process::INVALID,
-        Err(posix_credentials::Error::Permission) => proto_process::PERMISSION,
-    })
-}
 fn snapshot(r: &mut Request<'_>, record: &Record<Handle<Process>>) {
     let w = r.reply();
     w.u32(0)
@@ -397,6 +390,10 @@ impl Processes {
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::FULL);
         };
+        if !self.generations.room(usize::from(label.index), 1) {
+            self.records.retire_next(label);
+            return refuse(proto_process::FULL);
+        }
         let place = records::exit_place(label, &create, self.level);
         let made = sys::handle_label(&self.channel, Rights::NOTIFY, place.label, place.slot)
             .and_then(|exit| {
@@ -1359,6 +1356,9 @@ impl Processes {
                 return refuse(proto_process::PERMISSION);
             }
             let leader = pid == record.sid;
+            if !self.generations.room(index, 1) {
+                return refuse(proto_process::AGAIN);
+            }
             self.records.get_mut(index).expect("caller").ctty = None;
             self.generations.raise(index);
             if leader {
@@ -1384,6 +1384,11 @@ impl Processes {
                 return Answer::Status(Status::BadSize);
             };
             let records = &self.records;
+            if let Some(index) = records.find_pid(sid)
+                && !self.generations.room(index, 1)
+            {
+                return refuse(proto_process::AGAIN);
+            }
             let lives = |sid: u32| {
                 records.find_pid(sid).is_some_and(|i| {
                     records.get(i).is_some_and(|r| {
@@ -1615,6 +1620,9 @@ impl Processes {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
+        if !self.generations.room(index, 1) {
+            return refuse(proto_process::AGAIN);
+        }
         match self.records.set_sid(index) {
             Ok(sid) => {
                 self.generations.raise(index);
@@ -1774,6 +1782,10 @@ impl Processes {
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::AGAIN);
         };
+        if !self.generations.room(usize::from(label.index), 4) {
+            self.records.retire_next(label);
+            return refuse(proto_process::AGAIN);
+        }
         let Some(join) = self
             .records
             .joining(index, birth.flags, birth.pgroup, label.pid())
@@ -1911,6 +1923,7 @@ impl Processes {
         if self.loaders.of(index).is_some()
             || !self.loaders.room_for(index)
             || record.tried >= proto_process::IMAGE_MAX
+            || !self.generations.room(index, 3)
         {
             return refuse(proto_process::AGAIN);
         }
@@ -1998,6 +2011,9 @@ impl Processes {
     fn exec_commit(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
+        }
+        if !self.generations.room(index, 2) {
+            return refuse(proto_process::AGAIN);
         }
         let exec = self
             .loaders
@@ -2310,6 +2326,9 @@ impl Processes {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
+        if !self.generations.room(child, 3) {
+            return refuse(proto_process::AGAIN);
+        }
         match self.loaders.loaded(child) {
             Ok(()) => {
                 self.generations.invalidate(child);
@@ -2325,6 +2344,9 @@ impl Processes {
     fn take(&mut self, child: usize, slot: usize, r: &mut Request<'_>) -> Answer {
         if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Ready) {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
+        if !self.generations.room(child, 1) {
+            return refuse(proto_process::AGAIN);
         }
         let record = self.records.get(child).expect("a ready record");
         let (label, credentials, image) = (record.label, record.credentials, record.image);
@@ -2393,6 +2415,9 @@ impl Processes {
         let Some(child) = self.loading_child(index, r, fork) else {
             return refuse(proto_process::NO_PROCESS);
         };
+        if !self.generations.room(child, 2) {
+            return refuse(proto_process::AGAIN);
+        }
         let Ok(set_id) = self.loaders.commit(child) else {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
@@ -2565,9 +2590,12 @@ impl Service<0> for Processes {
                 let Some(operation) = Change::from_number(operation) else {
                     return refuse(proto_process::INVALID);
                 };
-                let record = self.records.get_mut(index).expect("change process");
-                let result = posix_credentials::change(record.credentials, operation, id)
-                    .map(|next| record.credentials = next);
+                let result = self.records.change_credentials(
+                    index,
+                    operation,
+                    id,
+                    self.generations.get(index),
+                );
                 // The services that remember the credentials see the
                 // generation move before the caller's reply, so that
                 // whatever the caller sends after it returns is checked by
@@ -2575,7 +2603,7 @@ impl Service<0> for Processes {
                 if result.is_ok() {
                     self.generations.raise(index);
                 }
-                Answer::Status(status(result))
+                Answer::Status(Status::from_code(result.err().unwrap_or(0)))
             }
             n if n == Method::SpawnStart as u16 => self.spawn_start(index, r),
             n if n == Method::SpawnCommit as u16 => self.spawn_commit(index, r, false),

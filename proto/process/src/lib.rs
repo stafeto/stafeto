@@ -634,6 +634,12 @@ pub const fn next_generation(old: u64, retain_dead: bool) -> u64 {
         }
 }
 
+/// Reserve live generations before a mutation or a multi-stage handoff.
+pub const fn generation_room(old: u64, steps: u64) -> bool {
+    let used = old & !GENERATION_DEAD;
+    steps != 0 && steps <= !GENERATION_DEAD && used <= !GENERATION_DEAD - steps
+}
+
 /// The reply to Vouch: status u32 (0), the record's PID u32, the six
 /// credentials u32, the generation of the credentials u64, then 1 u32
 /// for the identity of a loader (0 for a process's), the image u32 and the
@@ -1297,6 +1303,15 @@ mod tests {
             assert_eq!(next_generation(last, retain), exhausted);
             assert_eq!(next_generation(exhausted, retain), exhausted);
         }
+        assert!(!generation_room(last, 1));
+        assert!(generation_room(last - 1, 1));
+        assert!(!generation_room(last - 1, 2));
+        assert!(generation_room(last - 2, 2));
+        assert!(!generation_room(last - 2, 3));
+        assert!(generation_room(last - 3, 3));
+        assert!(generation_room(GENERATION_DEAD | 7, 4));
+        assert!(!generation_room(exhausted, 1));
+        assert!(!generation_room(0, 0));
     }
 
     #[test]

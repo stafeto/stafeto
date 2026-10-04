@@ -189,6 +189,26 @@ impl<P> Default for Records<P> {
 }
 
 impl<P> Records<P> {
+    /// The credentials effect is admitted before a generation can become terminal.
+    pub fn change_credentials(
+        &mut self,
+        index: usize,
+        operation: proto_process::Change,
+        id: u32,
+        generation: u64,
+    ) -> Result<(), u32> {
+        if !proto_process::generation_room(generation, 1) {
+            return Err(proto_process::AGAIN);
+        }
+        let record = self.get_mut(index).ok_or(proto_process::NO_PROCESS)?;
+        let next =
+            posix_credentials::change(record.credentials, operation, id).map_err(|e| match e {
+                posix_credentials::Error::Invalid => proto_process::INVALID,
+                posix_credentials::Error::Permission => proto_process::PERMISSION,
+            })?;
+        record.credentials = next;
+        Ok(())
+    }
     /// No record, every index free, index 0 on top.
     pub const fn new() -> Self {
         let mut free = [0; RECORDS];
@@ -263,6 +283,16 @@ impl<P> Records<P> {
             index,
             generation: Label::next_generation(self.generations[usize::from(index)])?,
         })
+    }
+
+    /// Retire one free index whose credentials generation cannot admit a load.
+    /// A later request considers the next index; this refusal remains O(1).
+    pub fn retire_next(&mut self, label: Label) {
+        assert_eq!(self.next_label(), Some(label));
+        let index = usize::from(label.index);
+        self.free_len -= 1;
+        self.listed[index] = false;
+        self.generations[index] = proto_process::GENERATION_MAX;
     }
 
     /// Whether the record in `index` may have another child.
@@ -990,6 +1020,46 @@ pub struct ExitPlace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_credentials_leave_the_real_record_unchanged() {
+        let mut t = Records::<u32>::new();
+        let label = t.next_label().unwrap();
+        let index = t.insert(label, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        let last = proto_process::GENERATION_DEAD - 1;
+        assert_eq!(
+            t.change_credentials(index, proto_process::Change::EffectiveUid, 33, last),
+            Err(proto_process::AGAIN)
+        );
+        assert_eq!(t.get(index).unwrap().credentials, Credentials::ROOT);
+        t.change_credentials(index, proto_process::Change::EffectiveUid, 33, last - 1)
+            .unwrap();
+        assert_eq!(t.get(index).unwrap().credentials.euid, 33);
+        let retained = t.get(index).unwrap().credentials;
+        assert_eq!(
+            t.change_credentials(index, proto_process::Change::EffectiveUid, 0, u64::MAX),
+            Err(proto_process::AGAIN)
+        );
+        assert_eq!(t.get(index).unwrap().credentials, retained);
+        assert_eq!(t.exited(index, End::exited(0)).0, Exit::Reaped);
+    }
+
+    #[test]
+    fn retiring_a_free_credentials_index_keeps_other_indices_available() {
+        let mut t = Records::<u32>::new();
+        let retired = t.next_label().unwrap();
+        t.retire_next(retired);
+        assert_eq!(t.count(), 1);
+        assert!(!t.listed[usize::from(retired.index)]);
+        let live = t.next_label().unwrap();
+        assert_eq!(live.index, 1);
+        let index = t.insert(live, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        t.exited(index, End::exited(0));
+        assert_eq!(t.next_label().unwrap().index, live.index);
+        assert_eq!(t.count(), 1);
+        t.settle(usize::from(retired.index));
+        assert!(!t.listed[usize::from(retired.index)]);
+    }
 
     #[test]
     fn an_exhausted_record_index_never_reissues_its_identity() {
