@@ -10,3 +10,6 @@ publish = false
 [dependencies]
 abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
+
+[dev-dependencies]
+posix-fd = { path = "../lib/posix-fd" }

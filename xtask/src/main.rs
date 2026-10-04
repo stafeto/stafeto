@@ -6,6 +6,10 @@
 #[macro_use]
 mod out;
 
+#[cfg(test)]
+#[path = "../../lib/posix-abi/src/relibc/lifetime.rs"]
+mod owner_lifetime;
+
 mod disasm;
 mod entropy;
 mod image;

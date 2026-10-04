@@ -933,6 +933,43 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
         }
     }
 
+    /// Preserve last-reference cleanup of a Published, unreturned Open in
+    /// its prepaid record. The caller preflights exact remote authority in R.
+    /// Other phases retain their existing recovery payload. Ordinary alias
+    /// and I/O hold release semantics remain those of abandon_open.
+    pub fn abandon_open_with_recovery(
+        &mut self,
+        token: OpenToken,
+        recovery: R,
+    ) -> Result<Abandoned<T, R>, Error> {
+        let mut record = self.record(token)?;
+        let Phase::Published(entry) = record.phase else {
+            return self.abandon_open(token);
+        };
+        let io_held = self.get(entry.fd).ok().is_some_and(|backend| {
+            self.holds
+                .iter()
+                .any(|slot| matches!(slot.held, Held::Io(h) if h.backend == backend))
+        });
+        let release = self.close_exact(entry);
+        if let Some(backend) = release.filter(|_| !io_held) {
+            record.owner = None;
+            record.claimant = None;
+            record.phase = Phase::Canceling {
+                recovery,
+                entry: None,
+                backend: Some(backend),
+            };
+            self.save(token, record);
+            return Ok(Abandoned::Recover {
+                token,
+                snapshot: record.snapshot(),
+            });
+        }
+        self.free_open(token);
+        Ok(Abandoned::Discarded { token, release })
+    }
+
     /// Detach one original owner or helper claim per call, before slot reuse.
     pub fn abandon_owner(&mut self, owner: OwnerToken) -> Option<Abandoned<T, R>> {
         let (slot, record) = self
@@ -1596,5 +1633,218 @@ mod tests {
         assert_eq!(table.open_tokens().count(), 0);
         assert_eq!(table.vacant(0), Ok(entry.fd));
         assert!(table.begin_open(owner(4), 80).is_ok());
+    }
+
+    fn publish<const N: usize>(
+        table: &mut Table<u32, N, u64>,
+        backend: u32,
+    ) -> (OpenToken, ClaimToken, EntryToken) {
+        let (open, claim) = table.begin_open(owner(1), 70).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        table.stage_committed(claim, backend).unwrap();
+        table.publish_open(claim).unwrap();
+        (open, claim, entry)
+    }
+
+    #[test]
+    fn published_cleanup_stays_paid_in_full_mixed_32_budget() {
+        let mut table = Table::<u32, 32, u64>::default();
+        for backend in 0..31 {
+            let fd = table.insert(backend, Flags::default()).unwrap();
+            table.hold(fd).unwrap();
+        }
+        let (open, late, entry) = publish(&mut table, 50);
+        assert_eq!(table.begin_open(owner(2), 80), Err(Error::TooManyOpenFiles));
+        let Abandoned::Recover { snapshot, .. } =
+            table.abandon_open_with_recovery(open, 500).unwrap()
+        else {
+            panic!("last target remains resident")
+        };
+        assert_eq!(snapshot.phase, OpenPhase::Canceling);
+        assert_eq!(snapshot.recovery, Some(500));
+        assert_eq!(snapshot.entry, None);
+        assert_eq!(snapshot.owner, None);
+        assert_eq!(snapshot.claimant, None);
+        assert!(table.get(entry.fd).is_err());
+        assert_eq!(table.begin_open(owner(2), 80), Err(Error::TooManyOpenFiles));
+        assert_eq!(
+            table.ack_open(open, owner(1)),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.publish_open(late), Err(Error::BadFileDescriptor));
+        assert!(matches!(
+            table.claim_open(open, owner(2)),
+            Ok(Claim::Canceling(_))
+        ));
+        assert_eq!(table.finish_cancel(open, 5), Ok(Some(50)));
+        assert!(table.begin_open(owner(2), 80).is_ok());
+    }
+
+    #[test]
+    fn published_cleanup_survives_helper_death_before_and_after_remote_cancel() {
+        let mut table = Table::<u32, 2, u64>::default();
+        let (open, _, entry) = publish(&mut table, 0x10003);
+        table.abandon_open_with_recovery(open, 0x10003).unwrap();
+        // The first helper dies before it sends exact Cancel.
+        assert_eq!(table.abandon_owner(owner(2)), None);
+        assert_eq!(table.open_snapshot(open).unwrap().recovery, Some(0x10003));
+        // The backend confirms cancellation, then a second helper dies.
+        assert_eq!(table.abandon_owner(owner(3)), None);
+        table.abandon_open_with_recovery(open, 0x20003).unwrap();
+        assert_eq!(table.open_snapshot(open).unwrap().recovery, Some(0x10003));
+        // A new backend lifetime reuses the native numeric fd 3 and local fd.
+        let replacement = table.insert(0x20003, Flags::default()).unwrap();
+        assert_eq!(replacement, entry.fd);
+        let snapshot = table.finish_cancel(open, 5).unwrap();
+        assert_eq!(snapshot, Some(0x10003));
+        // Exact remote cancellation consumed this snapshot; replacement lives.
+        assert_eq!(table.get(replacement), Ok(0x20003));
+        assert_eq!(table.finish_cancel(open, 5), Err(Error::BadFileDescriptor));
+    }
+
+    #[test]
+    fn published_cleanup_discard_preserves_alias_and_io_release_semantics() {
+        let mut alias = Table::<u32, 2, u64>::default();
+        let (open, _, entry) = publish(&mut alias, 10);
+        let copied = alias.duplicate(entry.fd, 0, Flags::default()).unwrap();
+        assert_eq!(
+            alias.abandon_open_with_recovery(open, 500),
+            Ok(Abandoned::Discarded {
+                token: open,
+                release: None
+            })
+        );
+        assert_eq!(alias.get(copied), Ok(10));
+        assert_eq!(alias.close(copied), Ok(Some(10)));
+        for early in [false, true] {
+            let mut table =
+                Table::<u32, 2, u64>::with_early_release(if early { |_| true } else { |_| false });
+            let (open, _, entry) = publish(&mut table, 20);
+            table.hold(entry.fd).unwrap();
+            assert_eq!(
+                table.abandon_open_with_recovery(open, 500),
+                Ok(Abandoned::Discarded {
+                    token: open,
+                    release: early.then_some(20)
+                })
+            );
+            assert!(table.open_snapshot(open).is_err());
+            assert_eq!(table.unhold(20), (!early).then_some(20));
+        }
+    }
+
+    #[test]
+    fn published_cleanup_does_not_close_replaced_same_backend_entry() {
+        let mut table = Table::<u32, 3, u64>::default();
+        let source = table.insert(10, Flags::default()).unwrap();
+        let (open, _, old) = publish(&mut table, 10);
+        table.dup2(source, old.fd).unwrap();
+        let replacement = table.entry_token(old.fd).unwrap();
+        assert!(replacement.generation() > old.generation());
+        assert_eq!(
+            table.abandon_open_with_recovery(open, 500),
+            Ok(Abandoned::Discarded {
+                token: open,
+                release: None
+            })
+        );
+        assert_eq!(table.entry_token(old.fd), Ok(replacement));
+        assert_eq!(table.get(old.fd), Ok(10));
+        assert!(table.open_snapshot(open).is_err());
+    }
+
+    #[test]
+    fn abandonment_payload_is_unchanged_before_publication_and_on_repeat() {
+        let mut table = Table::<u32, 2, u64>::default();
+        let (open, claim) = table.begin_open(owner(1), 70).unwrap();
+        table.reserve_open(claim, 0, Flags::default()).unwrap();
+        let first = table.abandon_open_with_recovery(open, 500).unwrap();
+        assert_eq!(table.open_snapshot(open).unwrap().recovery, Some(70));
+        assert_eq!(table.abandon_open_with_recovery(open, 900), Ok(first));
+        let claim = acquired(table.claim_open(open, owner(2)).unwrap());
+        let canceled = table.begin_cancel(claim).unwrap();
+        assert_eq!(
+            table.abandon_open_with_recovery(open, 900).unwrap(),
+            Abandoned::Recover {
+                token: open,
+                snapshot: canceled
+            }
+        );
+    }
+
+    #[test]
+    fn preparing_and_committed_abandonment_keep_existing_recovery() {
+        for committed in [false, true] {
+            let mut table = Table::<u32, 1, u64>::default();
+            let (open, claim) = table.begin_open(owner(1), 70).unwrap();
+            if committed {
+                table.reserve_open(claim, 0, Flags::default()).unwrap();
+                table.stage_committed(claim, 10).unwrap();
+            }
+            let phase = table.open_snapshot(open).unwrap().phase;
+            table.abandon_open_with_recovery(open, 500).unwrap();
+            let snapshot = table.open_snapshot(open).unwrap();
+            assert_eq!(snapshot.recovery, Some(70));
+            assert_eq!(snapshot.phase, phase);
+            assert_eq!(snapshot.owner, None);
+            assert_eq!(snapshot.claimant, None);
+        }
+    }
+
+    #[test]
+    fn published_cleanup_terminal_counters_need_no_new_authority() {
+        let mut table = Table::<u32, 1, u64>::default();
+        table.holds[0].generation = u64::MAX - 1;
+        let (open, _, _) = publish(&mut table, 10);
+        let Held::Open(record) = &mut table.holds[0].held else {
+            panic!("open")
+        };
+        record.serial = u64::MAX;
+        table.holds[0].changed.store(u32::MAX, Ordering::Relaxed);
+        table.abandon_open_with_recovery(open, 500).unwrap();
+        assert_eq!(table.wait_snapshot(open), Ok(WaitValue::NeverSleep));
+        assert!(matches!(
+            table.claim_open(open, owner(2)),
+            Ok(Claim::Canceling(_))
+        ));
+        assert_eq!(table.finish_cancel(open, 5), Ok(Some(10)));
+        assert_eq!(table.open_tokens().count(), 0);
+        assert_eq!(table.begin_open(owner(2), 80), Err(Error::TooManyOpenFiles));
+        assert_eq!(table.insert(20, Flags::default()), Ok(0));
+    }
+
+    #[test]
+    fn cancelled_published_cleanup_stale_tokens_cannot_touch_new_record() {
+        let mut table = Table::<u32, 1, u64>::default();
+        let (old, late, _) = publish(&mut table, 10);
+        table.abandon_open_with_recovery(old, 500).unwrap();
+        table.finish_cancel(old, 5).unwrap();
+        let (new, _, entry) = publish(&mut table, 20);
+        let before = table.open_snapshot(new).unwrap();
+        assert_eq!(table.finish_cancel(old, 5), Err(Error::BadFileDescriptor));
+        assert_eq!(
+            table.abandon_open_with_recovery(old, 900),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.ack_open(old, owner(1)), Err(Error::BadFileDescriptor));
+        assert_eq!(table.publish_open(late), Err(Error::BadFileDescriptor));
+        assert_eq!(
+            table.claim_open(old, owner(2)),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.open_snapshot(new), Ok(before));
+        assert_eq!(table.get(entry.fd), Ok(20));
+    }
+
+    #[test]
+    fn fork_child_discards_cleanup_without_releasing_parent_target() {
+        let mut table = Table::<u32, 1, u64>::default();
+        let (open, _, _) = publish(&mut table, 10);
+        table.abandon_open_with_recovery(open, 500).unwrap();
+        table.discard_open_after_fork();
+        assert_eq!(table.open_tokens().count(), 0);
+        assert!(table.open_snapshot(open).is_err());
+        assert_eq!(table.finish_cancel(open, 5), Err(Error::BadFileDescriptor));
+        assert!(table.begin_open(owner(2), 80).is_ok());
     }
 }
