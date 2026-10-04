@@ -718,7 +718,12 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
         if let Some(owner) = record.claimant {
             return Ok(Claim::Busy(owner));
         }
-        let Some(serial) = record.serial.checked_add(1) else {
+        let Some(serial) = record
+            .serial
+            .checked_add(1)
+            .filter(|serial| *serial < u64::MAX)
+        else {
+            record.serial = u64::MAX;
             record.cancel();
             self.save(token, record);
             return Ok(Claim::Canceling(record.snapshot()));
@@ -1549,5 +1554,47 @@ mod tests {
         );
         assert_eq!(table.entry_token(entry.fd), Ok(fresh));
         assert_eq!(table.get(entry.fd), Ok(40));
+    }
+
+    #[test]
+    fn claim_reaching_max_enters_canceling_without_publication_authority() {
+        let mut table = Table::<u32, 1, u64>::default();
+        let (open, original) = table.begin_open(owner(1), 70).unwrap();
+        let entry = table.reserve_open(original, 0, Flags::default()).unwrap();
+        table.stage_committed(original, 10).unwrap();
+        table.release_claim(original).unwrap();
+        let Held::Open(record) = &mut table.holds[0].held else {
+            panic!("open")
+        };
+        record.serial = u64::MAX - 2;
+        let last = acquired(table.claim_open(open, owner(2)).unwrap());
+        assert_eq!(last.serial, u64::MAX - 1);
+        table.release_claim(last).unwrap();
+        assert!(
+            matches!(table.claim_open(open, owner(3)), Ok(Claim::Canceling(snapshot))
+            if snapshot.phase == OpenPhase::Canceling && snapshot.claimant.is_none())
+        );
+        let Held::Open(record) = table.holds[0].held else {
+            panic!("open")
+        };
+        assert_eq!(record.serial, u64::MAX);
+        assert_eq!(table.publish_open(last), Err(Error::BadFileDescriptor));
+        assert_eq!(
+            table.stage_committed(last, 20),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(
+            table.publish_open(ClaimToken {
+                open,
+                serial: u64::MAX
+            }),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.pending(entry.fd), Some(open));
+        table.abandon_owner(owner(1)).unwrap();
+        assert_eq!(table.finish_cancel(open, 5), Ok(Some(10)));
+        assert_eq!(table.open_tokens().count(), 0);
+        assert_eq!(table.vacant(0), Ok(entry.fd));
+        assert!(table.begin_open(owner(4), 80).is_ok());
     }
 }
