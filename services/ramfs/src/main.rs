@@ -1349,6 +1349,12 @@ impl Fs {
             Err(code) => status(code),
         }
     }
+    fn bind_refusal(&mut self, fds: &mut Fds, code: u32) -> Answer {
+        if fds.binding_preparation.is_none() {
+            fds.binding_outcome = Some(code);
+        }
+        status(code)
+    }
     fn bind(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err()
             || r.handles.len() != 1
@@ -1356,28 +1362,28 @@ impl Fs {
             || fds.binding_preparation.is_some()
             || matches!(fds.binding, Binding::Cleanup)
         {
-            return status(proto_fs::PERMISSION);
+            return self.bind_refusal(fds, proto_fs::PERMISSION);
         }
         if fds.resolvers.iter().filter(|&&id| id != 0).count() >= fds.resolvers.len() {
-            return status(proto_fs::TOO_MANY_OPEN_FILES);
+            return self.bind_refusal(fds, proto_fs::TOO_MANY_OPEN_FILES);
         }
         let rights = r.handles.info(0).map(|(_, rights)| rights);
         if !rights
             .is_some_and(|r| r.contains(Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER))
         {
-            return status(proto_fs::PERMISSION);
+            return self.bind_refusal(fds, proto_fs::PERMISSION);
         }
         let Ok(identity) = r.handles.take::<Channel>(0) else {
-            return status(proto_fs::PERMISSION);
+            return self.bind_refusal(fds, proto_fs::PERMISSION);
         };
         if let Err(code) = self.ram.begin_binding(fds) {
-            return status(code);
+            return self.bind_refusal(fds, code);
         }
         match self.install_identity(fds, r.label(), identity, true) {
             Ok(()) => status(proto_fs::RESOLVING),
             Err(code) => {
                 self.drop_identity(fds);
-                status(code)
+                self.bind_refusal(fds, code)
             }
         }
     }
@@ -1707,17 +1713,22 @@ impl Fs {
                 || generation(creator.index as usize) != creator.generation
             {
                 let (_, mut source) = self.births[slot as usize].take().unwrap();
-                if source.binding_preparation.is_some() {
-                    let _ = self.binding_step(&mut source, label);
+                let code = if source.binding_preparation.is_some() {
+                    self.binding_step(&mut source, label)
                 } else {
-                    let _ = self.authenticate(&mut source, label);
-                }
+                    match self.authenticate(&mut source, label) {
+                        Ok(()) | Err(proto_fs::AUTHENTICATING) => proto_fs::RESOLVING,
+                        Err(code) => code,
+                    }
+                };
                 let valid = !matches!(source.binding, Binding::Cleanup);
                 self.births[slot as usize] = Some((label, source));
-                return if valid {
+                return if !valid {
+                    self.reject_binding(fds)
+                } else if code == 0 || code == proto_fs::RESOLVING {
                     proto_fs::RESOLVING
                 } else {
-                    self.reject_binding(fds)
+                    self.fail_binding(fds, code)
                 };
             }
             let (_, mut source) = self.births[slot as usize].take().unwrap();
