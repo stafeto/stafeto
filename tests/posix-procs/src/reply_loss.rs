@@ -146,7 +146,7 @@ extern "C" fn negative_worker(mode: u64) -> ! {
         3 => args[3] += 1,
         4 => {
             args[1] = u64::from_le_bytes(Method::OpenCommit.header().bytes());
-            args[4] = 42;
+            args[4] = JOB.load(Ordering::Acquire) ^ 128;
             args[5] = 1;
         }
         5 => {
@@ -181,7 +181,8 @@ extern "C" fn negative_worker(mode: u64) -> ! {
                 });
             }
         } else if mode == 4 {
-            good = files.open_commit(0).is_err();
+            good = files.open_commit(JOB.load(Ordering::Acquire)).is_ok();
+            good &= files.open_cancel_key(key).is_ok();
         } else {
             good = files
                 .open_start(key, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
@@ -249,6 +250,33 @@ fn negatives(files: &Files) -> Result<(), i32> {
             )
         }
         .map_err(|_| 156)?;
+        if mode == 4 {
+            let job = files
+                .open_start(
+                    OpenKey {
+                        slot: 26,
+                        generation: 4004,
+                    },
+                    b"/etc/motd",
+                    proto_fs::READ_ONLY,
+                    0,
+                    0,
+                )
+                .map_err(|_| 167)?;
+            for preparing in [false, true] {
+                let mut ready = false;
+                for _ in 0..2000 {
+                    if files.open_advance(job, preparing).map_err(|_| 168)? {
+                        ready = true;
+                        break;
+                    }
+                }
+                if !ready {
+                    return Err(169);
+                }
+            }
+            JOB.store(job, Ordering::Release);
+        }
         sys::thread_start(&thread).map_err(|_| 157)?;
         if mode == 6 {
             if probe::<0xffe2>([0; 10])[0] != Error::AccessDenied.code() {
