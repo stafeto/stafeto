@@ -20,6 +20,124 @@ pub enum Admission {
 pub enum BindingPurpose {
     Candidate,
     Refresh,
+    Audit,
+}
+
+/// Only a canonical refusal from the genuine notary proves an invalid owner.
+pub enum NotaryReply<const N: usize> {
+    Wire([u8; N]),
+    Denied,
+    Retry,
+}
+impl<const N: usize> NotaryReply<N> {
+    pub fn read(bytes: &[u8], handles_empty: bool) -> Self {
+        if !handles_empty {
+            return Self::Retry;
+        }
+        if bytes == proto_wire::reply(proto_wire::Status::Unknown(proto_process::PERMISSION)) {
+            return Self::Denied;
+        }
+        match bytes.try_into() {
+            Ok(wire) => Self::Wire(wire),
+            Err(_) => Self::Retry,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct CleanupAudit {
+    target: u64,
+    audited: u64,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuditStep {
+    Advance,
+    Retry,
+    Alive,
+    Denied,
+}
+impl CleanupAudit {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+    pub fn cached(&self, generation: u64) -> bool {
+        generation != 0 && generation == self.audited
+    }
+    pub fn start(&mut self, admission: &mut Admission, generation: u64) {
+        self.target = generation;
+        self.audited = 0;
+        *admission = Admission::Unvouched;
+    }
+    /// A changed epoch discards the reply before another transport step.
+    pub fn synchronize(&mut self, admission: &mut Admission, generation: u64) -> AuditStep {
+        if generation == 0 || generation & proto_process::GENERATION_DEAD != 0 {
+            return AuditStep::Denied;
+        }
+        if self.target != generation {
+            self.start(admission, generation);
+            return AuditStep::Retry;
+        }
+        AuditStep::Advance
+    }
+    /// Each call decodes, validates, or commits one read-only cleanup phase.
+    pub fn step(
+        &mut self,
+        original: Binding,
+        admission: &mut Admission,
+        generation: u64,
+    ) -> AuditStep {
+        let synchronized = self.synchronize(admission, generation);
+        if synchronized != AuditStep::Advance {
+            return synchronized;
+        }
+        match admission {
+            Admission::Wire(_) | Admission::RetainedWire(_) => {
+                if admission.decode().is_err() {
+                    self.start(admission, generation);
+                    return AuditStep::Retry;
+                }
+                AuditStep::Advance
+            }
+            Admission::Vouched(who) => {
+                if who.generation != generation {
+                    self.start(admission, generation);
+                    return AuditStep::Retry;
+                }
+                if admission
+                    .validate(original, BindingPurpose::Audit, false, generation)
+                    .is_err()
+                {
+                    return AuditStep::Denied;
+                }
+                AuditStep::Advance
+            }
+            Admission::RetainedVouched(reply) => {
+                if reply.who.generation != generation {
+                    self.start(admission, generation);
+                    return AuditStep::Retry;
+                }
+                if admission.validate_retained(original, generation).is_err() {
+                    return AuditStep::Denied;
+                }
+                AuditStep::Advance
+            }
+            Admission::Validated(who) => {
+                if who.generation != generation || original.refreshed(who).is_err() {
+                    return AuditStep::Denied;
+                }
+                self.audited = generation;
+                AuditStep::Alive
+            }
+            Admission::RetainedValidated(reply) => {
+                if reply.who.generation != generation || original.retained_refresh(reply).is_err() {
+                    return AuditStep::Denied;
+                }
+                self.audited = generation;
+                AuditStep::Alive
+            }
+            Admission::Unvouched => AuditStep::Retry,
+        }
+    }
 }
 impl Admission {
     pub fn decode(&mut self) -> Result<(), u32> {
@@ -70,7 +188,7 @@ impl Admission {
             return Ok(());
         }
         match purpose {
-            BindingPurpose::Refresh => {
+            BindingPurpose::Refresh | BindingPurpose::Audit => {
                 original.refreshed(who)?;
             }
             BindingPurpose::Candidate => {
