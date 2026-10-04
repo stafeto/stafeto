@@ -91,6 +91,7 @@ struct Subscription {
     service: Service,
     owner: u64,
     key: u64,
+    armed: bool,
     label: u64,
     set: watch::Set,
     original: [usize; watch::MAX],
@@ -101,6 +102,7 @@ impl Subscription {
             service,
             owner: 0,
             key: 0,
+            armed: false,
             label,
             set: watch::Set::new(),
             original: [0; watch::MAX],
@@ -179,16 +181,31 @@ impl Subscription {
         if self.key == 0 {
             return Ok(());
         }
-        let notify = sys::handle_label(
-            channel,
-            Rights::NOTIFY | Rights::TRANSFER,
-            self.label,
-            level,
-        )
-        .map_err(kernel_error)?;
-        match self.call(self.keyed(1)?.as_bytes(), Some(notify))? {
-            Reply::Ready(value) => self.merge(value, ready),
-            Reply::Armed => Ok(()),
+        // Keep one notification session for the registration. Replacing it
+        // on every Take closes the previous session and emits CLIENT_GONE
+        // to this channel, which would wake an empty poll repeatedly.
+        let notify = if self.armed {
+            None
+        } else {
+            Some(
+                sys::handle_label(
+                    channel,
+                    Rights::NOTIFY | Rights::TRANSFER,
+                    self.label,
+                    level,
+                )
+                .map_err(kernel_error)?,
+            )
+        };
+        match self.call(self.keyed(1)?.as_bytes(), notify)? {
+            Reply::Ready(value) => {
+                self.armed = true;
+                self.merge(value, ready)
+            }
+            Reply::Armed => {
+                self.armed = true;
+                Ok(())
+            }
             _ => Err(EIO),
         }
     }
