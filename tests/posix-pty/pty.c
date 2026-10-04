@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 #define _GNU_SOURCE 1
 #include <errno.h>
 #include <fcntl.h>
