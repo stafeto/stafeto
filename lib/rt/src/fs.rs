@@ -170,22 +170,32 @@ impl Files {
     }
     /// Bind this ordinary session to the actual Process identity capability.
     pub fn bind(&self, identity: &Handle<Channel>) -> Result<(), Status> {
-        let copy = sys::handle_duplicate(
-            identity,
-            abi::Rights::NOTIFY | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
-        )
-        .map_err(Status::Kernel)?;
-        let reply = sys::send_handles(
-            &self.channel,
-            &Method::Bind.header().bytes(),
-            [copy.erase()],
-        )
-        .map_err(|e| Status::Kernel(e.error))?;
-        let status = Status::from_code(Self::reply_code(&reply)?);
-        if status != Status::Unknown(proto_fs::RESOLVING) {
-            return Err(status);
+        loop {
+            // A refusal consumes outgoing handles. Each no-effect retry owns
+            // a fresh duplicate of the actual retained identity capability.
+            let copy = sys::handle_duplicate(
+                identity,
+                abi::Rights::NOTIFY | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
+            )
+            .map_err(Status::Kernel)?;
+            let reply = sys::send_handles(
+                &self.channel,
+                &Method::Bind.header().bytes(),
+                [copy.erase()],
+            )
+            .map_err(|e| Status::Kernel(e.error))?;
+            if reply.len != proto_wire::HEADER_LEN
+                || reply.words[0] >> 32 != 0
+                || !reply.handles.is_empty()
+            {
+                return Err(Status::BadSize);
+            }
+            match Status::from_code(Self::reply_code(&reply)?) {
+                Status::Unknown(proto_fs::AUTHENTICATING) => Self::finish_on(&self.channel)?,
+                Status::Unknown(proto_fs::RESOLVING) => return self.finish_binding(),
+                status => return Err(status),
+            }
         }
-        self.finish_binding()
     }
     pub fn finish_binding(&self) -> Result<(), Status> {
         Self::finish_on(&self.channel)
@@ -197,7 +207,10 @@ impl Files {
                 Err(Error::Interrupted) => continue,
                 result => result.map_err(Status::Kernel)?,
             };
-            if !reply.handles.is_empty() {
+            if reply.len != proto_wire::HEADER_LEN
+                || reply.words[0] >> 32 != 0
+                || !reply.handles.is_empty()
+            {
                 return Err(Status::BadSize);
             }
             match Status::from_code(Self::reply_code(&reply)?) {
@@ -215,7 +228,10 @@ impl Files {
             if Self::reply_code(&reply)? != proto_fs::AUTHENTICATING {
                 return Ok(reply);
             }
-            if !reply.handles.is_empty() {
+            if reply.len != proto_wire::HEADER_LEN
+                || reply.words[0] >> 32 != 0
+                || !reply.handles.is_empty()
+            {
                 return Err(Status::BadSize);
             }
             Self::finish_on(channel)?;
@@ -242,7 +258,8 @@ impl Files {
             if status != 0 && status != proto_fs::AUTHENTICATING {
                 return Err(Status::from_code(status));
             }
-            if reply.handles.len() != 1
+            if reply.len != 4
+                || reply.handles.len() != 1
                 || !reply.handles.info(0).is_some_and(|(kind, rights)| {
                     kind == abi::ObjectKind::Channel
                         && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)

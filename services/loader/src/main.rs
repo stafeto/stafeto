@@ -314,6 +314,9 @@ fn scratch(own: &Own) -> Result<&'static mut Scratch, Status> {
     Ok(unsafe { &mut *(STAGING as *mut Scratch) })
 }
 
+#[cfg(feature = "auth-probe")]
+mod auth_probe;
+
 /// The requests of the parent through C and the service's word that the
 /// record is ready: the load once Start and Go came, or the copy once
 /// Fork, the regions and Go came, and the end once the image or the copy
@@ -382,6 +385,16 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     bytes.copy_from_slice(&abi::inline_bytes(&words)[..len]);
                 } else {
                     msgbuf::read(0, bytes);
+                }
+                #[cfg(feature = "auth-probe")]
+                if label == pl::PARENT {
+                    let mut probe = Reader::new(bytes);
+                    if Header::read(&mut probe).is_ok_and(|header| {
+                        header.version == pl::VERSION && header.method == auth_probe::METHOD
+                    }) {
+                        auth_probe::capture(own, probe, handles, token);
+                        continue;
+                    }
                 }
                 let mut r = Reader::new(bytes);
                 let method = match Header::read(&mut r) {

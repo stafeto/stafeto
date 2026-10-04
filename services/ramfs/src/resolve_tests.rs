@@ -62,6 +62,76 @@ fn who() -> WhoReply {
     }
 }
 #[test]
+fn retained_handoff_preserves_real_capture_until_genuine_startup_bind() {
+    use crate::authority::{Admission, BindingPurpose};
+    use proto_process::{RetainedLoaderReply, RetainedLoaderState};
+    let old = WhoReply {
+        loader: Some(LoaderOf {
+            image: 1,
+            ticket: 7,
+        }),
+        ..who()
+    };
+    let handoff = RetainedLoaderReply {
+        state: RetainedLoaderState::Handoff,
+        who: WhoReply {
+            generation: 2,
+            ..old
+        },
+    };
+    let mut wire = proto_wire::Writer::new();
+    handoff.write(&mut wire).unwrap();
+    assert_eq!(wire.as_bytes().len(), 260);
+    assert!(WhoReply::read(wire.as_bytes()).is_err());
+    let mut admission = Admission::RetainedWire(wire.as_bytes().try_into().unwrap());
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        binding: Binding::Pending(old),
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let file = create(&mut ram, ROOT, b"handoff", REG, 0o600);
+    let fd = ram
+        .open_token(&mut fds, file, proto_fs::READ_ONLY, OWNER)
+        .unwrap();
+    ram.set_cwd_token(&mut fds, ROOT).unwrap();
+    let capture = ram.description_token(&fds, fd).unwrap();
+    ram.begin_binding(&mut fds).unwrap();
+    admission.decode().unwrap();
+    admission.validate_retained(fds.binding, 2).unwrap();
+    assert!(matches!(admission, Admission::RetainedValidated(_)));
+    assert_eq!(fds.binding, Binding::Pending(old));
+    fds.binding = fds.binding.retained_refresh(&handoff).unwrap();
+    ram.complete_binding(&mut fds, 0);
+    assert!(!fds.binding.valid(2));
+    assert_eq!(fds.binding.identity(false), Err(proto_fs::PERMISSION));
+    assert_eq!(fds.binding.identity(true), Err(proto_fs::PERMISSION));
+    assert_eq!(ram.description_token(&fds, fd), Ok(capture));
+    assert_eq!(fds.cwd, Some(ROOT));
+    assert_eq!(
+        fds.binding.bind(Some(handoff.who), true),
+        Err(proto_fs::PERMISSION)
+    );
+    let real = WhoReply {
+        loader: None,
+        generation: 3,
+        ..old
+    };
+    let mut candidate = Admission::Vouched(real);
+    ram.begin_binding(&mut fds).unwrap();
+    candidate
+        .validate(fds.binding, BindingPurpose::Candidate, false, 3)
+        .unwrap();
+    assert!(matches!(fds.binding, Binding::Handoff(_)));
+    fds.binding.bind(Some(real), false).unwrap();
+    ram.complete_binding(&mut fds, 0);
+    assert!(fds.binding.valid(3));
+    assert_eq!(fds.binding.snapshot(), Some(real));
+    assert_eq!(ram.description_token(&fds, fd), Ok(capture));
+    assert_eq!(fds.cwd, Some(ROOT));
+    assert_eq!(ram.storage.preparations_used(), 0);
+}
+#[test]
 fn refreshed_capture_preserves_authority_class_and_retained_descriptions() {
     let parent = who();
     let pending = WhoReply {

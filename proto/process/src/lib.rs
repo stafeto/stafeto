@@ -197,8 +197,10 @@ use proto_wire::{Header, Reader, Status, Writer};
 pub const VERSION: u16 = 10;
 
 mod limits;
+mod retained;
 pub use limits::{AS, CORE, DATA, FSIZE, NOFILE, STACK};
 pub use limits::{ExpenditureRoot, Groups, Limit, ResourceLimits, SUPPLEMENTARY_MAX};
+pub use retained::{RetainedLoader, RetainedLoaderReply, RetainedLoaderState};
 pub const INVALID: u32 = 500;
 pub const PERMISSION: u32 = 501;
 pub const FULL: u32 = 502;
@@ -228,8 +230,8 @@ pub const SPAWN_FLAGS: u32 =
 
 /// Records of the service at most: PID = index + RECORDS * generation.
 pub const RECORDS: usize = 256;
-/// Generations of a record run from 1 to this and wrap to 1, so that a
-/// PID stays a positive i32.
+/// Generations of a record run from 1 to this. Exhausted indices retire,
+/// so a PID stays a positive i32 and an old endpoint never names a new record.
 pub const GENERATION_MAX: u32 = (1 << 23) - 1;
 /// The parent PID of a record that init created, and of an orphan: the
 /// service itself, the system process that adopts them.
@@ -361,12 +363,12 @@ impl Label {
         self.index as u32 + RECORDS as u32 * self.generation
     }
 
-    /// The generation after `generation`, from 1 to GENERATION_MAX.
-    pub const fn next_generation(generation: u32) -> u32 {
+    /// The next generation, or exhaustion before another endpoint is issued.
+    pub const fn next_generation(generation: u32) -> Option<u32> {
         if generation >= GENERATION_MAX {
-            1
+            None
         } else {
-            generation + 1
+            Some(generation + 1)
         }
     }
 }
@@ -466,6 +468,8 @@ pub enum Method {
     ReturnSignal = 51,
     /// Exact terminal/SID/link generation, followed by whether CLOCAL is clear.
     DisconnectCtty = 52,
+    /// Read the exact retained authority of a previously vouched loader.
+    RetainedLoader = 53,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -477,7 +481,7 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -628,6 +632,12 @@ pub const fn next_generation(old: u64, retain_dead: bool) -> u64 {
         } else {
             0
         }
+}
+
+/// Reserve live generations before a mutation or a multi-stage handoff.
+pub const fn generation_room(old: u64, steps: u64) -> bool {
+    let used = old & !GENERATION_DEAD;
+    steps != 0 && steps <= !GENERATION_DEAD && used <= !GENERATION_DEAD - steps
 }
 
 /// The reply to Vouch: status u32 (0), the record's PID u32, the six
@@ -1293,6 +1303,15 @@ mod tests {
             assert_eq!(next_generation(last, retain), exhausted);
             assert_eq!(next_generation(exhausted, retain), exhausted);
         }
+        assert!(!generation_room(last, 1));
+        assert!(generation_room(last - 1, 1));
+        assert!(!generation_room(last - 1, 2));
+        assert!(generation_room(last - 2, 2));
+        assert!(!generation_room(last - 2, 3));
+        assert!(generation_room(last - 3, 3));
+        assert!(generation_room(GENERATION_DEAD | 7, 4));
+        assert!(!generation_room(exhausted, 1));
+        assert!(!generation_room(0, 0));
     }
 
     #[test]
@@ -1344,6 +1363,7 @@ mod tests {
             Method::DetachCtty,
             Method::ReturnSignal,
             Method::DisconnectCtty,
+            Method::RetainedLoader,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
@@ -1395,8 +1415,12 @@ mod tests {
         };
         assert_eq!(Label::from_raw(last.raw()), Some(last));
         assert!(i32::try_from(last.pid()).is_ok());
-        assert_eq!(Label::next_generation(GENERATION_MAX), 1);
-        assert_eq!(Label::next_generation(1), 2);
+        assert_eq!(Label::next_generation(GENERATION_MAX), None);
+        assert_eq!(
+            Label::next_generation(GENERATION_MAX - 1),
+            Some(GENERATION_MAX)
+        );
+        assert_eq!(Label::next_generation(1), Some(2));
     }
 
     #[test]

@@ -368,7 +368,10 @@ version = "0.1.0"
 dependencies = [
  "posix-abi",
  "posix-crt",
+ "posix-fs",
  "proto-fs",
+ "proto-loader",
+ "proto-process",
  "proto-wire",
  "rt",
 ]

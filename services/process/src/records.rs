@@ -105,6 +105,8 @@ pub struct Record<P> {
     /// The last image number an exec of the record took, committed or
     /// not: the next exec takes one more, so no number names two attempts.
     pub tried: u32,
+    /// Exact successful loader ticket of the current image, retained after Take.
+    pub committed_loader_ticket: u64,
     /// Its process group and session: those of its parent, or its own PID
     /// for a record of init's table.
     pub pgid: u32,
@@ -187,6 +189,29 @@ impl<P> Default for Records<P> {
 }
 
 impl<P> Records<P> {
+    /// The credentials effect is admitted before a generation can become terminal.
+    pub fn change_credentials(
+        &mut self,
+        index: usize,
+        operation: proto_process::Change,
+        id: u32,
+        generation: u64,
+    ) -> Result<(), u32> {
+        if generation & proto_process::GENERATION_DEAD != 0 {
+            return Err(proto_process::NO_PROCESS);
+        }
+        if !proto_process::generation_room(generation, 1) {
+            return Err(proto_process::AGAIN);
+        }
+        let record = self.get_mut(index).ok_or(proto_process::NO_PROCESS)?;
+        let next =
+            posix_credentials::change(record.credentials, operation, id).map_err(|e| match e {
+                posix_credentials::Error::Invalid => proto_process::INVALID,
+                posix_credentials::Error::Permission => proto_process::PERMISSION,
+            })?;
+        record.credentials = next;
+        Ok(())
+    }
     /// No record, every index free, index 0 on top.
     pub const fn new() -> Self {
         let mut free = [0; RECORDS];
@@ -247,8 +272,8 @@ impl<P> Records<P> {
         self.records.get_mut(index)?.as_mut()
     }
 
-    /// The places taken: the live records, and the places held for a
-    /// group or a session whose number is still used.
+    /// The unavailable places: records, live group/session numbers and
+    /// permanently retired indices whose label generation is exhausted.
     pub fn count(&self) -> usize {
         RECORDS - self.free_len
     }
@@ -259,8 +284,18 @@ impl<P> Records<P> {
         let index = *self.free[..self.free_len].last()?;
         Some(Label {
             index,
-            generation: Label::next_generation(self.generations[usize::from(index)]),
+            generation: Label::next_generation(self.generations[usize::from(index)])?,
         })
+    }
+
+    /// Retire one free index whose credentials generation cannot admit a load.
+    /// A later request considers the next index; this refusal remains O(1).
+    pub fn retire_next(&mut self, label: Label) {
+        assert_eq!(self.next_label(), Some(label));
+        let index = usize::from(label.index);
+        self.free_len -= 1;
+        self.listed[index] = false;
+        self.generations[index] = proto_process::GENERATION_MAX;
     }
 
     /// Whether the record in `index` may have another child.
@@ -357,6 +392,7 @@ impl<P> Records<P> {
             handle_limit: 0,
             image: proto_process::IMAGE,
             tried: proto_process::IMAGE,
+            committed_loader_ticket: 0,
             pgid,
             sid,
             ctty: None,
@@ -420,6 +456,9 @@ impl<P> Records<P> {
     fn settle(&mut self, index: usize) {
         if self.records[index].is_none() && self.numbers[index].unused() && !self.listed[index] {
             self.orphaned.remove(index);
+            if Label::next_generation(self.generations[index]).is_none() {
+                return;
+            }
             self.listed[index] = true;
             self.free[self.free_len] = index as u16;
             self.free_len += 1;
@@ -703,6 +742,7 @@ impl<P> Records<P> {
         // for: its Spawn failed.
         let loaded = record.state != State::Loading;
         record.state = State::Zombie(end);
+        record.committed_loader_ticket = 0;
         record.stop_report = None;
         record.cont_report = false;
         self.unlink(pgid, linked);
@@ -983,6 +1023,68 @@ pub struct ExitPlace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_credentials_leave_the_real_record_unchanged() {
+        let mut t = Records::<u32>::new();
+        let label = t.next_label().unwrap();
+        let index = t.insert(label, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        let last = proto_process::GENERATION_DEAD - 1;
+        assert_eq!(
+            t.change_credentials(index, proto_process::Change::EffectiveUid, 33, last),
+            Err(proto_process::AGAIN)
+        );
+        assert_eq!(t.get(index).unwrap().credentials, Credentials::ROOT);
+        t.change_credentials(index, proto_process::Change::EffectiveUid, 33, last - 1)
+            .unwrap();
+        assert_eq!(t.get(index).unwrap().credentials.euid, 33);
+        let retained = t.get(index).unwrap().credentials;
+        assert_eq!(
+            t.change_credentials(index, proto_process::Change::EffectiveUid, 0, u64::MAX),
+            Err(proto_process::NO_PROCESS)
+        );
+        assert_eq!(t.get(index).unwrap().credentials, retained);
+        assert_eq!(t.exited(index, End::exited(0)).0, Exit::Reaped);
+    }
+
+    #[test]
+    fn retiring_a_free_credentials_index_keeps_other_indices_available() {
+        let mut t = Records::<u32>::new();
+        let retired = t.next_label().unwrap();
+        t.retire_next(retired);
+        assert_eq!(t.count(), 1);
+        assert!(!t.listed[usize::from(retired.index)]);
+        let live = t.next_label().unwrap();
+        assert_eq!(live.index, 1);
+        let index = t.insert(live, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        t.exited(index, End::exited(0));
+        assert_eq!(t.next_label().unwrap().index, live.index);
+        assert_eq!(t.count(), 1);
+        t.settle(usize::from(retired.index));
+        assert!(!t.listed[usize::from(retired.index)]);
+    }
+
+    #[test]
+    fn an_exhausted_record_index_never_reissues_its_identity() {
+        let mut t = Records::<u32>::new();
+        t.generations[0] = proto_process::GENERATION_MAX - 1;
+        let last = t.next_label().unwrap();
+        assert_eq!(last.index, 0);
+        assert_eq!(last.generation, proto_process::GENERATION_MAX);
+        let index = t.insert(last, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        assert_eq!(t.find_identity(last.identity()), Some(index));
+        assert_eq!(t.exited(index, End::exited(0)).0, Exit::Reaped);
+        assert_eq!(t.find_identity(last.identity()), None);
+        assert!(!t.listed[index]);
+        assert_eq!(t.count(), 1, "the exhausted index remains unavailable");
+        let next = t.next_label().unwrap();
+        assert_eq!(next.index, 1);
+        assert_eq!(next.generation, 1);
+        t.insert(next, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        assert_eq!(t.find_identity(last.identity()), None);
+        assert_eq!(t.find_loader(last.loader()), None);
+        assert_eq!(t.find_identity(next.identity()), Some(1));
+    }
     use proto_process::{SIGKILL, SIGSEGV};
 
     fn add(t: &mut Records<u32>) -> Option<Label> {
