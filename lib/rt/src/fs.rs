@@ -184,7 +184,10 @@ impl Files {
                 [copy.erase()],
             )
             .map_err(|e| Status::Kernel(e.error))?;
-            if reply.len != 4 || !reply.handles.is_empty() {
+            if reply.len != proto_wire::HEADER_LEN
+                || reply.words[0] >> 32 != 0
+                || !reply.handles.is_empty()
+            {
                 return Err(Status::BadSize);
             }
             match Status::from_code(Self::reply_code(&reply)?) {
@@ -204,7 +207,10 @@ impl Files {
                 Err(Error::Interrupted) => continue,
                 result => result.map_err(Status::Kernel)?,
             };
-            if reply.len != 4 || !reply.handles.is_empty() {
+            if reply.len != proto_wire::HEADER_LEN
+                || reply.words[0] >> 32 != 0
+                || !reply.handles.is_empty()
+            {
                 return Err(Status::BadSize);
             }
             match Status::from_code(Self::reply_code(&reply)?) {
@@ -222,7 +228,10 @@ impl Files {
             if Self::reply_code(&reply)? != proto_fs::AUTHENTICATING {
                 return Ok(reply);
             }
-            if reply.len != 4 || !reply.handles.is_empty() {
+            if reply.len != proto_wire::HEADER_LEN
+                || reply.words[0] >> 32 != 0
+                || !reply.handles.is_empty()
+            {
                 return Err(Status::BadSize);
             }
             Self::finish_on(channel)?;
