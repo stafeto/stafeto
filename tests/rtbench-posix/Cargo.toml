@@ -17,6 +17,7 @@ bench = false
 abi = { path = "../../lib/abi" }
 posix-abi = { path = "../../lib/posix-abi", features = ["rtbench"] }
 posix-sync = { path = "../../lib/posix-sync" }
+posix-fs = { path = "../../lib/posix-fs" }
 posix-crt = { path = "../../lib/posix-crt", features = ["uart-input"] }
 proto-uart = { path = "../../proto/uart" }
 proto-wire = { path = "../../proto/wire" }

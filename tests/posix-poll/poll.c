@@ -24,6 +24,7 @@ int stafeto_watch_full_pipe(uint32_t, uint32_t);
 int stafeto_watch_full_tty(uint32_t, uint32_t);
 void stafeto_watch_close_channel(void);
 int stafeto_watch_stats(uint32_t, uint32_t);
+int stafeto_poll_level(uint32_t);
 #define CHECK(c) do { if (!(c)) { printf("posix-poll: line %d: %s errno %d\n", __LINE__, #c, errno); fflush(stdout); return 20; } } while (0)
 #define IN 1u
 #define OUT 4u
@@ -129,6 +130,47 @@ static uint64_t monotonic_ns(void) {
     struct timespec t;
     if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
     return (uint64_t)t.tv_sec * 1000000000u + t.tv_nsec;
+}
+
+struct lower_writer { int fd; int ready; };
+static void *lower_write(void *arg) {
+    struct lower_writer *w = arg;
+    if (stafeto_poll_level(28) != 0) {
+        __atomic_store_n(&w->ready, -1, __ATOMIC_RELEASE);
+        return (void *)1;
+    }
+    __atomic_store_n(&w->ready, 1, __ATOMIC_RELEASE);
+    struct timespec delay = {0, 20000000};
+    if (nanosleep(&delay, NULL) != 0) return (void *)1;
+    return write(w->fd, "L", 1) == 1 ? NULL : (void *)1;
+}
+
+/* A spinning reader at 30 would starve this already registered writer
+ * at 28. The ordinary poll must block until the actual byte arrives. */
+static int lower_writer_ready(void) {
+    CHECK(stafeto_poll_level(30) == 0);
+    int ends[2];
+    CHECK(pipe(ends) == 0);
+    struct lower_writer w = {.fd = ends[1], .ready = 0};
+    pthread_t worker;
+    CHECK(pthread_create(&worker, NULL, lower_write, &w) == 0);
+    uint64_t began = monotonic_ns();
+    while (__atomic_load_n(&w.ready, __ATOMIC_ACQUIRE) == 0) {
+        struct timespec delay = {0, 1000000};
+        CHECK(monotonic_ns() - began < 1000000000 && nanosleep(&delay, NULL) == 0);
+    }
+    CHECK(__atomic_load_n(&w.ready, __ATOMIC_ACQUIRE) == 1);
+    struct pollfd p = {ends[0], POLLIN, 0};
+    began = monotonic_ns();
+    CHECK(poll(&p, 1, 1000) == 1 && p.revents == POLLIN);
+    CHECK(monotonic_ns() - began < 1000000000);
+    char byte;
+    void *result;
+    CHECK(read(ends[0], &byte, 1) == 1 && byte == 'L');
+    CHECK(pthread_join(worker, &result) == 0 && result == NULL);
+    CHECK(close(ends[0]) == 0 && close(ends[1]) == 0);
+    printf("posix-poll: reader 30 receives the real byte from writer 28 before timeout\n");
+    return 0;
 }
 static volatile int cleanup_mask_restored;
 struct masked_wait { struct pollfd *fds; int select_call; };
@@ -401,6 +443,7 @@ int main(int argc, char **argv) {
     }
     if (argc == 2) return lifecycle_start();
     CHECK(argc == 6 && lifecycle_resume(argv) == 0);
+    CHECK(lower_writer_ready() == 0);
     int result = frontends();
     if (result != 0) return result;
     result = service_watches();

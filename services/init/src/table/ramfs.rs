@@ -453,7 +453,8 @@ pub const RTBENCH: Record = Record {
         "clock",
         "posix",
         "pipe",
-        "uart",
+        "bench-uart",
+        "tty",
         "rtbench-load",
         "entropy",
     ],
@@ -469,15 +470,16 @@ pub const RTBENCH: Record = Record {
 /// the service of long operations, the load and the benchmark, whose
 /// children (S10 to S13) are files of the image started from the loader.
 pub const RTBENCH_POSIX_TABLE: &[Record] = &[
-    Record {
-        name: "console",
-        ..super::normal::TABLE[0]
-    },
+    super::normal::TABLE[0],
     TABLE[0],
     RTBENCH_POOL,
     POSIX_ABI_TABLE[2],
     PIPE,
-    LONG,
+    Record {
+        name: "bench-uart",
+        ..LONG
+    },
+    TTY,
     LOAD,
     RTBENCH,
     super::entropy::RNG,

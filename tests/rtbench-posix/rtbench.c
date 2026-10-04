@@ -67,11 +67,17 @@
  * The scenarios of 5e' (the generator of the layer, which serves these with
  * no request to a service; the rows count the kernel calls): S23 and S24
  * one getentropy of 32 and of 256 bytes, S25 one read of 4 KiB of
- * /dev/urandom.
+ * /dev/urandom. S26 master write to echo read; S27 master VINTR write to
+ * the foreground reader handler at idle and with busy 25; S28 STOP/CONT
+ * of 128 kernel threads to verified wait reports; S29 pipe write to poll.
+ * S28 setup and all-worker acknowledgements are outside its intervals.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <sched.h>
 #include <signal.h>
 #include <spawn.h>
@@ -86,6 +92,11 @@
 
 uint64_t rtbench_seconds(void);
 uint64_t rtbench_calls(void);
+int rtbench_io_init(void);
+int rtbench_terminals(int enabled);
+int rtbench_threads128(void);
+int rtbench_resumed128(void);
+int rtbench_native_count(void);
 uint64_t rtbench_counter_check(void);
 int rtbench_level(int level);
 int rtbench_ping(void);
@@ -1283,6 +1294,181 @@ static int generator(void) {
     return 0;
 }
 
+
+/* --- S26-S29: PTY and job-control paths ------------------------------- */
+
+static struct histogram s26, s27[2], s28[2], s29;
+#define STAMP_REQUEST 40
+#define STAMP_ACK 48
+#define STAMP_NATIVE 56
+#define TTY_SAMPLES 100
+
+static int master_open(char name[32]) {
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0 || grantpt(master) || unlockpt(master) || ptsname_r(master, name, 32)) {
+        fail("PTY open/grant/unlock/name", errno);
+        if (master >= 0) close(master);
+        return -1;
+    }
+    return master;
+}
+
+static int pty_echo(void) {
+    char name[32], got, consumed;
+    int master = master_open(name);
+    if (master < 0) return 1;
+    int slave = open(name, O_RDWR | O_NOCTTY);
+    struct termios settings;
+    if (slave < 0 || tcgetattr(slave, &settings)) { fail("S26 slave", errno); return 1; }
+    settings.c_lflag &= ~(ICANON | ISIG | ECHOCTL | ECHONL);
+    settings.c_lflag |= ECHO;
+    settings.c_oflag = 0;
+    settings.c_cc[VMIN] = 1; settings.c_cc[VTIME] = 0;
+    if (tcsetattr(slave, TCSANOW, &settings)) { fail("S26 raw echo", errno); return 1; }
+    for (int i = 0; i < TTY_SAMPLES; i++) {
+        char byte = (char)('a' + i % 26);
+        uint64_t began = ticks();
+        ssize_t written = write(master, &byte, 1);
+        ssize_t readback = written == 1 ? read(master, &got, 1) : -1;
+        uint64_t ended = ticks();
+        if (written != 1 || readback != 1 || got != byte || read(slave, &consumed, 1) != 1 || consumed != byte) {
+            fail("S26 echo byte", errno); return 1;
+        }
+        record(&s26, ticks_ns(ended - began));
+    }
+    return close(slave) || close(master);
+}
+
+static int pty_interrupt(int spin, struct histogram *histogram) {
+    char name[32];
+    int master = master_open(name);
+    if (master < 0) return 1;
+    pid_t pid;
+    char *argv[] = {"rtbench-posix", "pty-reader", name, NULL};
+    if (clear_stamps() || spawn_argv(&pid, argv, 0, 0) || await_stamp(STAMP_READY, "S27 foreground reader")) return 1;
+    struct worker spinner;
+    bursts = 0;
+    if (spin && start(&spinner, busy, BUSY_LEVEL, NULL)) return 1;
+    for (int i = 0; i < 50; i++) {
+        if (await_stamp(STAMP_READY, "S27 reader wait")) return 1;
+        sleep_ns(1 * MS);
+        if (put_stamp(probe_fd, STAMP_READY, 0) || put_stamp(probe_fd, STAMP_HANDLER, 0)) return 1;
+        char interrupt = 3;
+        uint64_t began = ticks();
+        if (write(master, &interrupt, 1) != 1 || await_stamp(STAMP_HANDLER, "S27 handler")) return 1;
+        uint64_t ended = get_stamp(STAMP_HANDLER);
+        if (ended < began) { fail("S27 handler timestamp", 0); return 1; }
+        record(histogram, ticks_ns(ended - began));
+    }
+    if (spin && finish(&spinner)) return 1;
+    if (kill(pid, SIGTERM) || reaped(pid, 0, SIGTERM, "S27 reader exit") != 1) return 1;
+    return close(master);
+}
+
+static void *thread_slot_probe(void *argument) { return argument; }
+
+static int stop_continue128(void) {
+    pid_t pid;
+    if (clear_stamps() || spawn_child(&pid, "stop128", 0, 0)
+        || await_stamp(STAMP_READY, "S28 native threads readiness")) return 1;
+    if (get_stamp(STAMP_READY) != 128) { fail("S28 actual kernel count", 0); return 1; }
+    uint64_t natives = get_stamp(STAMP_NATIVE);
+    if (natives == 0 || natives >= 128) { fail("S28 native count", 0); return 1; }
+    /* A fresh kernel thread elsewhere excludes global thread-pool exhaustion. */
+    pthread_t spare;
+    int error = pthread_create(&spare, NULL, thread_slot_probe, NULL);
+    if (error || (error = pthread_join(spare, NULL))) { fail("S28 global thread slot", error); return 1; }
+    struct line ready_line = {.length = 0};
+    put(&ready_line, "RTB2 S28 ready kernel_threads=128 native_threads="); put_number(&ready_line, natives);
+    put(&ready_line, " existing_threads="); put_number(&ready_line, 128 - natives); say(&ready_line);
+    for (int i = 0; i < 20; i++) {
+        int status;
+        uint64_t began = ticks();
+        if (kill(pid, SIGSTOP) || waitpid(pid, &status, WUNTRACED) != pid) {
+            fail("S28 STOP wait", errno); return 1;
+        }
+        if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP) { fail("S28 STOP report", status); return 1; }
+        uint64_t ended = ticks();
+        record(&s28[0], ticks_ns(ended - began));
+        began = ticks();
+        if (kill(pid, SIGCONT) || waitpid(pid, &status, WCONTINUED) != pid) {
+            fail("S28 CONT wait", errno); return 1;
+        }
+        if (!WIFCONTINUED(status)) { fail("S28 CONT report", status); return 1; }
+        ended = ticks();
+        record(&s28[1], ticks_ns(ended - began));
+        /* Every native worker executes after CONT, outside the sample. */
+        if (put_stamp(probe_fd, STAMP_ACK, 0) || put_stamp(probe_fd, STAMP_REQUEST, (uint64_t)i + 1)
+            || await_stamp(STAMP_ACK, "S28 all workers after CONT") || get_stamp(STAMP_ACK) != 128) return 1;
+    }
+    return kill(pid, SIGTERM) || reaped(pid, 0, SIGTERM, "S28 native child exit") != 1;
+}
+
+struct poll_sample {
+    int fd, request, ready, error;
+    uint64_t began;
+};
+static void *poll_writer(void *argument) {
+    struct poll_sample *sample = argument;
+    if (rtbench_level(SENDER_LEVEL)) { store(&sample->error, 1); return NULL; }
+    store(&sample->ready, 1);
+    for (int i = 0; i < TTY_SAMPLES; i++) {
+        while (load(&sample->request) < i + 1) {
+            int error = rtbench_futex_wait((const uint32_t *)&sample->request, (uint32_t)i);
+            if (error && error != EAGAIN && error != EINTR) { store(&sample->error, error); return NULL; }
+        }
+        uint64_t began = ticks();
+        __atomic_store_n(&sample->began, began, __ATOMIC_RELEASE);
+        if (write(sample->fd, "p", 1) != 1) {
+            store(&sample->error, 1); return NULL;
+        }
+    }
+    return NULL;
+}
+static int pipe_poll(void) {
+    int ends[2];
+    if (pipe(ends)) { fail("S29 pipe", errno); return 1; }
+    if (fcntl(ends[0], F_SETFL, O_NONBLOCK) || rtbench_level(MAIN_LEVEL)) {
+        fail("S29 setup", errno); return 1;
+    }
+    struct poll_sample sample = {.fd = ends[1]};
+    pthread_t writer;
+    int error = pthread_create(&writer, NULL, poll_writer, &sample);
+    if (error) { fail("S29 thread", error); return 1; }
+    uint64_t deadline = now_ns() + 2 * 1000 * MS;
+    while (!load(&sample.ready) && !load(&sample.error) && now_ns() < deadline) sleep_ns(100 * US);
+    if (!load(&sample.ready)) { fail("S29 writer readiness", load(&sample.error)); return 1; }
+    for (int i = 0; i < TTY_SAMPLES; i++) {
+        struct pollfd fd = {ends[0], POLLIN, 0};
+        /* Main 30 reaches the empty pipe's poll wait before writer 28 runs. */
+        store(&sample.request, i + 1);
+        rtbench_futex_wake((const uint32_t *)&sample.request, 1);
+        int result = poll(&fd, 1, 1000);
+        uint64_t returned = ticks();
+        uint64_t began = __atomic_load_n(&sample.began, __ATOMIC_ACQUIRE);
+        char byte;
+        if (result != 1) { fail("S29 poll result", result < 0 ? errno : result); return 1; }
+        if (fd.revents != POLLIN) { fail("S29 poll events", fd.revents); return 1; }
+        if (read(ends[0], &byte, 1) != 1 || byte != 'p') { fail("S29 consumed byte", errno); return 1; }
+        if (load(&sample.error) || !began || returned < began) { fail("S29 poll timestamp", 0); return 1; }
+        record(&s29, ticks_ns(returned - began));
+    }
+    error = pthread_join(writer, NULL);
+    return error || close(ends[0]) || close(ends[1]) || rtbench_level(SENDER_LEVEL);
+}
+
+static int terminals(void) {
+    if (rtbench_terminals(1)) { fail("TTY attach", 0); return 1; }
+    /* A real console description is held throughout this attachment. */
+    int console = open("/dev/console", O_RDWR | O_NOCTTY);
+    if (console < 0) { fail("TTY console description", errno); return 1; }
+    int error = pty_echo() || pty_interrupt(0, &s27[0]) || pty_interrupt(1, &s27[1])
+        || stop_continue128() || pipe_poll();
+    error |= close(console);
+    error |= rtbench_terminals(0) != 0;
+    return error;
+}
+
 static int processes(void) {
     probe_fd = open("/tmp/probe", O_RDWR);
     if (probe_fd < 0) {
@@ -1298,6 +1484,7 @@ static int processes(void) {
     if (!error) error = kill_group();
     if (!error) error = forks();
     if (!error) error = pipes();
+    if (!error) error = terminals();
     error |= rtbench_level(MAIN_LEVEL);
     close(probe_fd);
     return error;
@@ -1305,6 +1492,12 @@ static int processes(void) {
 
 /* The children: the program with a role as its first argument. */
 static volatile uint64_t handler_at;
+
+/* Keep the counter read at entry, before any compiler-generated address load. */
+__attribute__((naked)) static void on_pty_target(int signal __attribute__((unused))) {
+    __asm__ volatile("isb\n\tmrs x8, cntvct_el0\n\tadrp x9, handler_at\n\t"
+        "add x9, x9, :lo12:handler_at\n\tstr x8, [x9]\n\tret");
+}
 
 static void on_target(int signal) {
     handler_at = ticks();
@@ -1328,7 +1521,7 @@ static int child(uint64_t entered, char **argv) {
             if (write(1, &byte, 1) != 1) return 2;
         return 0;
     }
-    int fd = open("/tmp/probe", O_WRONLY);
+    int fd = open("/tmp/probe", O_RDWR);
     if (fd < 0) return 2;
     if (strcmp(role, "sink") == 0) {
         static char buffer[4096];
@@ -1355,6 +1548,41 @@ static int child(uint64_t entered, char **argv) {
     if (strcmp(role, "exiter") == 0) {
         put_stamp(fd, STAMP_EXIT, ticks());
         _exit(0);
+    }
+
+    if (strcmp(role, "pty-reader") == 0) {
+        struct sigaction action = { .sa_handler = on_pty_target, .sa_mask = 0, .sa_flags = 0 };
+        if (setsid() != getpid() || sigaction(SIGINT, &action, NULL)) return 6;
+        int slave = open(argv[2], O_RDWR);
+        struct termios settings;
+        if (slave < 0 || tcgetattr(slave, &settings)) return 7;
+        settings.c_lflag &= ~(ICANON | ECHO | ECHONL);
+        settings.c_lflag |= ISIG; settings.c_cc[VINTR] = 3;
+        settings.c_cc[VMIN] = 1; settings.c_cc[VTIME] = 0;
+        if (tcsetattr(slave, TCSANOW, &settings) || tcsetpgrp(slave, getpgrp()) || tcgetsid(slave) != getpid()) return 8;
+        for (;;) {
+            if (put_stamp(fd, STAMP_READY, 1)) return 9;
+            char byte;
+            if (read(slave, &byte, 1) != -1 || errno != EINTR || !handler_at) return 10;
+            uint64_t at = handler_at; handler_at = 0;
+            if (put_stamp(fd, STAMP_HANDLER, at)) return 11;
+        }
+    }
+    if (strcmp(role, "stop128") == 0) {
+        int count = rtbench_threads128();
+        if (count != 128) { fail("S28 child population", count); put_stamp(fd, STAMP_READY, UINT64_MAX); return 12; }
+        if (put_stamp(fd, STAMP_NATIVE, (uint64_t)rtbench_native_count())
+            || put_stamp(fd, STAMP_READY, (uint64_t)count)) return 12;
+        uint64_t last = 0;
+        for (;;) {
+            uint64_t request = 0;
+            if (pread(fd, &request, sizeof request, STAMP_REQUEST) != (ssize_t)sizeof request) return 13;
+            if (request != last) {
+                if (rtbench_resumed128() != 128 || put_stamp(fd, STAMP_ACK, 128)) return 14;
+                last = request;
+            }
+            sleep_ns(1 * MS);
+        }
     }
     if (strcmp(role, "target") == 0) {
         struct sigaction action = { .sa_handler = on_target, .sa_mask = 0, .sa_flags = 0 };
@@ -1428,6 +1656,12 @@ static void report(void) {
     row("s23_getentropy_32", &s23, 1);
     row("s24_getentropy_256", &s24, 1);
     row("s25_urandom_4k", &s25, 1);
+    row("s26_pty_echo_byte", &s26, 0);
+    row("s27_pty_ctrl_c_idle", &s27[0], 0);
+    row("s27_pty_ctrl_c_busy_25", &s27[1], 0);
+    row("s28_stop_threads_128", &s28[0], 0);
+    row("s28_cont_threads_128", &s28[1], 0);
+    row("s29_pipe_write_to_poll", &s29, 0);
     none("timer_1ms", "POSIX timers come with 5h");
     none("inheritance_chain", "priority inheritance comes with 5h");
     struct line l = { .length = 0 };
@@ -1453,6 +1687,7 @@ int main(int argc, char **argv) {
     put(&l, "RTB2 calls yield=");
     put_number(&l, rtbench_counter_check());
     say(&l);
+    if (rtbench_io_init()) { fail("legacy UART initialization", 0); return 1; }
     s4_fd = open("/etc/motd", O_RDONLY);
     if (s4_fd < 0) {
         fail("open", errno);

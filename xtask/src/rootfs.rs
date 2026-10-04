@@ -537,6 +537,10 @@ mod tests {
             for program in programs(&files) {
                 assert!(have.contains(&program), "{image}: {program}");
             }
+            // Build and parse each image's real file table, including devices.
+            let total = have.len() as u32;
+            let bytes = table(&files, 0, total).unwrap_or_else(|error| panic!("{image}: {error}"));
+            Rootfs::parse(&bytes, total).unwrap_or_else(|error| panic!("{image}: {error}"));
             // Every entry has its parent directory in the list.
             for f in &files {
                 let parent = &f.path[..f.path.rfind('/').unwrap()];

@@ -15,7 +15,7 @@ bench = false
 
 [dependencies]
 posix-crt = { path = "../../lib/posix-crt", features = ["uart-input"] }
-posix-abi = { path = "../../lib/posix-abi" }
+posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
 posix-fs = { path = "../../lib/posix-fs" }
 proto-pipe = { path = "../../proto/pipe" }
 proto-tty = { path = "../../proto/tty" }
