@@ -165,12 +165,7 @@ impl Drop for Proof<'_> {
             .and_then(|()| w.u64(self.id))
             .is_ok()
         {
-            loop {
-                match self.send(w.as_bytes()) {
-                    Err(Status::Kernel(Error::Interrupted)) => continue,
-                    _ => break,
-                }
-            }
+            while let Err(Status::Kernel(Error::Interrupted)) = self.send(w.as_bytes()) {}
         }
     }
 }
