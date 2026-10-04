@@ -66,8 +66,10 @@ fn defined_names(listing: &str) -> BTreeSet<&str> {
             let [.., kind, name] = words.as_slice() else {
                 return None;
             };
-            (kind.len() == 1 && kind.as_bytes()[0].is_ascii_uppercase() && *kind != "U")
-                .then_some(*name)
+            (kind.len() == 1
+                && kind.as_bytes()[0].is_ascii_uppercase()
+                && !matches!(*kind, "U" | "N"))
+            .then_some(*name)
         })
         .collect()
 }
@@ -137,7 +139,7 @@ fn header_macros(rows: &[Interface<'_>], include: &Path) -> Result<HeaderScan, S
         }
         let output = checked_stdout(
             Command::new(&clang)
-                .args(["--target=aarch64-none-elf", "-nostdinc", "-isystem"])
+                .args(["--target=aarch64-linux-gnu", "-nostdinc", "-isystem"])
                 .arg(include)
                 .arg("-isystem")
                 .arg(&resource_include)
@@ -278,7 +280,7 @@ mod tests {
 
     #[test]
     fn archive_listing_uses_defined_global_names() {
-        let listing = "archive.o:\n00000000 T getentropy\n         U absent\n00000000 t local\n";
+        let listing = "archive.o:\n00000000 T getentropy\n         U absent\n00000000 N debug\n00000000 t local\n";
         assert_eq!(defined_names(listing), BTreeSet::from(["getentropy"]));
     }
 
