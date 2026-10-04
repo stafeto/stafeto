@@ -194,15 +194,16 @@ pub const RTBENCH_TABLE: &[Record] = &[
 /// rtbench 2 on VZ: the image of `ramfs::RTBENCH_POSIX_TABLE` with the
 /// Virtio console's driver for the console.
 pub const RTBENCH_POSIX_TABLE: &[Record] = &[
-    Record {
-        name: "console",
-        ..CONSOLE
-    },
+    CONSOLE,
     super::ramfs::TABLE[0],
     super::ramfs::RTBENCH_POOL,
     super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::PIPE,
-    super::ramfs::LONG,
+    Record {
+        name: "bench-uart",
+        ..super::ramfs::LONG
+    },
+    super::ramfs::TTY,
     super::ramfs::LOAD,
     super::ramfs::RTBENCH,
     super::entropy::RNG_VZ,

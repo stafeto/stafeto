@@ -22,7 +22,7 @@ use crate::{
 
 /// The rows of a run, in its order: each comes once, as numbers or as
 /// `none` with the reason the layer has no such operation yet.
-pub const ROWS: [&str; 50] = [
+pub const ROWS: [&str; 56] = [
     "s1_mutex_alone",
     "s2_futex_wake_idle",
     "s3_mutex_rival_10",
@@ -69,6 +69,12 @@ pub const ROWS: [&str; 50] = [
     "s23_getentropy_32",
     "s24_getentropy_256",
     "s25_urandom_4k",
+    "s26_pty_echo_byte",
+    "s27_pty_ctrl_c_idle",
+    "s27_pty_ctrl_c_busy_25",
+    "s28_stop_threads_128",
+    "s28_cont_threads_128",
+    "s29_pipe_write_to_poll",
     "timer_1ms",
     "inheritance_chain",
     "s7_missed",
@@ -201,7 +207,35 @@ pub fn parse(lines: &[String]) -> Result<Run, String> {
             ),
             _ => Row::Numbers(numbers(&words, line)?),
         };
+        if (name.starts_with("s26_")
+            || name.starts_with("s27_")
+            || name.starts_with("s28_")
+            || name.starts_with("s29_"))
+            && !matches!(row, Row::Numbers(_))
+        {
+            return Err(format!("required scenario has no measurements: {name}"));
+        }
         rows.push((name, row));
+    }
+    let readiness: Vec<_> = lines
+        .iter()
+        .filter(|line| line.starts_with("RTB2 S28 ready "))
+        .collect();
+    if readiness.len() as u64 != rounds {
+        return Err("S28 readiness must confirm each round".into());
+    }
+    for line in readiness {
+        let words: Vec<_> = line.split_whitespace().collect();
+        let total = field(&words, "kernel_threads=", line)?;
+        let native = field(&words, "native_threads=", line)?;
+        let existing = field(&words, "existing_threads=", line)?;
+        if total != 128
+            || native == 0
+            || existing == 0
+            || native.checked_add(existing) != Some(total)
+        {
+            return Err(format!("S28 thread count is wrong: {line}"));
+        }
     }
     match rows.last() {
         Some(("load_rounds", Row::Count(n))) if *n > 0 && *n < u64::MAX - 1 => {}
@@ -379,6 +413,7 @@ mod tests {
             "RTB2 START hz=24000000 seconds=0".to_owned(),
             "RTB2 calls yield=1".to_owned(),
             "RTB2 round 1".to_owned(),
+            "RTB2 S28 ready kernel_threads=128 native_threads=127 existing_threads=1".to_owned(),
         ];
         for name in ROWS {
             lines.push(match name {
@@ -466,6 +501,34 @@ mod tests {
                 .unwrap_err()
                 .starts_with("the histogram does not sum to n")
         );
+    }
+
+    #[test]
+    fn required_terminal_rows_and_exact_thread_count_are_enforced() {
+        for name in ROWS.iter().filter(|name| {
+            name.starts_with("s26_")
+                || name.starts_with("s27_")
+                || name.starts_with("s28_")
+                || name.starts_with("s29_")
+        }) {
+            let mut lines = self::lines();
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with(&format!("RTB2 {name} ")))
+                .unwrap();
+            lines[at] = format!("RTB2 {name} none unsupported");
+            assert!(parse(&lines).unwrap_err().contains("required scenario"));
+        }
+        let mut lines = self::lines();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("RTB2 S28 ready "))
+            .unwrap();
+        lines[at] =
+            "RTB2 S28 ready kernel_threads=127 native_threads=126 existing_threads=1".into();
+        assert!(parse(&lines).unwrap_err().contains("thread count"));
+        lines.remove(at);
+        assert!(parse(&lines).unwrap_err().contains("each round"));
     }
 
     #[test]
