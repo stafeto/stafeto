@@ -32,7 +32,7 @@ STAMP = WORK / "config"
 A53_ERRATA = "-mfix-cortex-a53-835769"
 # BusyBox's main becomes busybox_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
-PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-input math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769"
+PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-input-eof math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769"
 
 
 def relibc_commit() -> str:
@@ -139,6 +139,11 @@ def main() -> None:
             "\t\t\t\treturn 1;\n"
             "\t\t\t}\n"
             "\t\t\tnr = read(STDIN_FILENO, buf, IBUFSIZ - 1);\n"
+            "\t\t\tif (nr <= 0 && pending_sig) {\n"
+            "\t\t\t\tbuf[0] = '\\n';\n"
+            "\t\t\t\tbuf[1] = '\\0';\n"
+            "\t\t\t\treturn 1;\n"
+            "\t\t\t}\n"
             "\t\t\tif (nr < 0 && errno == EAGAIN) {\n"
             "\t\t\t\tif (poll(&pfd, 1, -1) < 0 && errno != EINTR)\n"
             "\t\t\t\t\treturn -1;\n"
