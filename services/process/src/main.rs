@@ -1235,11 +1235,22 @@ impl Processes {
             if hup > 1 {
                 return refuse(proto_process::INVALID);
             }
-            if self.terminals.disconnect(terminal, sid, generation) {
+            #[cfg(feature = "tty-probe")]
+            let link = self.terminals.link(terminal);
+            let disconnected = self.terminals.disconnect(terminal, sid, generation);
+            #[cfg(feature = "tty-probe")]
+            rt::println!(
+                "process: PTY disconnect terminal={terminal} sid={sid} generation={generation} hup={hup} link={link:?} accepted={disconnected}"
+            );
+            if disconnected {
                 if hup != 0
                     && let Some(index) = self.records.find_pid(sid)
                 {
-                    let _ = self.deliver_terminal(index, proto_process::SIGHUP);
+                    let delivered = self.deliver_terminal(index, proto_process::SIGHUP);
+                    #[cfg(feature = "tty-probe")]
+                    rt::println!("process: PTY HUP pid={sid} result={delivered:?}");
+                    #[cfg(not(feature = "tty-probe"))]
+                    let _ = delivered;
                 }
                 if let Some(notice) = self.terminal_notice.as_ref() {
                     let _ = sys::notify(notice, 1);
