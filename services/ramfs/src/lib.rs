@@ -12,6 +12,9 @@ pub mod authority;
 pub mod image;
 #[cfg(test)]
 mod image_tests;
+pub mod io;
+#[cfg(test)]
+mod io_tests;
 pub mod maintenance;
 pub mod open;
 pub mod places;
