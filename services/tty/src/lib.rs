@@ -16,6 +16,7 @@ mod fuzz;
 pub mod jobs;
 #[cfg(test)]
 mod reference;
+pub mod retired;
 
 use discipline::Terminal;
 use proto_uart::WRITE_MAX;

@@ -350,30 +350,27 @@ impl Endpoints {
         Ok(())
     }
     pub fn clone_holds(&mut self, parent: &Holds) -> Result<Holds, Failure> {
-        // Validate every increment before publishing any child reference.
+        // Holds contains each description once. Count the increments for
+        // each side in one pass, then validate the batch before publishing.
+        let mut additional = [[0u32; 2]; TERMINALS];
         for id in parent.ids() {
             let d = self.descriptions[self.locate(id)?];
-            if d.references == u32::MAX {
-                return Err(Failure::Overflow);
-            }
-            let i = &self.instances[d.endpoint.terminal];
-            let additional = parent
-                .ids()
-                .filter(|&other| {
-                    self.descriptions[(other & 255) as usize].endpoint.terminal
-                        == d.endpoint.terminal
-                        && self.descriptions[(other & 255) as usize].endpoint.side
-                            == d.endpoint.side
-                })
-                .count() as u32;
-            let count = match d.endpoint.side {
-                Side::Master => i.masters,
-                Side::Slave => i.slaves,
-            };
-            count.checked_add(additional).ok_or(Failure::Overflow)?;
+            d.references.checked_add(1).ok_or(Failure::Overflow)?;
+            let side = usize::from(d.endpoint.side == Side::Master);
+            additional[d.endpoint.terminal][side] += 1;
+        }
+        for (terminal, count) in additional.iter().enumerate() {
+            let i = &self.instances[terminal];
+            i.slaves.checked_add(count[0]).ok_or(Failure::Overflow)?;
+            i.masters.checked_add(count[1]).ok_or(Failure::Overflow)?;
         }
         for id in parent.ids() {
-            self.retain(id, true)?;
+            // Validated above, and each descriptor has one increment.
+            self.descriptions[(id & 255) as usize].references += 1;
+        }
+        for (terminal, count) in additional.iter().enumerate() {
+            self.instances[terminal].slaves += count[0];
+            self.instances[terminal].masters += count[1];
         }
         Ok(parent.clone())
     }
@@ -565,6 +562,33 @@ mod tests {
             Err(Failure::BadDescription)
         );
         assert!(table.resolve(&holders, foreign).is_ok());
+    }
+
+    #[test]
+    fn full_clone_validates_side_totals_before_publishing_any_reference() {
+        let mut table = Endpoints::new();
+        let mut parent = Holds::new();
+        for _ in 0..HOLDS {
+            table.open_console(&mut parent, 2).unwrap();
+        }
+        table.instances[0].slaves = u32::MAX - HOLDS as u32 + 1;
+        assert_eq!(table.clone_holds(&parent).err(), Some(Failure::Overflow));
+        for id in parent.ids() {
+            assert_eq!(table.descriptions[(id & 255) as usize].references, 1);
+        }
+        table.instances[0].slaves = HOLDS as u32;
+        let mut child = table.clone_holds(&parent).unwrap();
+        assert_eq!(table.instances[0].slaves, 2 * HOLDS as u32);
+        for id in parent.ids() {
+            assert_eq!(table.descriptions[(id & 255) as usize].references, 2);
+        }
+        while let Some(id) = child.first() {
+            assert_eq!(table.close(&mut child, id), Ok(None));
+        }
+        assert_eq!(table.instances[0].slaves, HOLDS as u32);
+        for id in parent.ids() {
+            assert!(table.resolve(&parent, id).is_ok());
+        }
     }
 
     #[test]

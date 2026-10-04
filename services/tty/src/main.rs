@@ -120,6 +120,7 @@ const GENERATIONS_AT: usize = 0x41_0000_0000;
 /// discipline, in `.bss`: too big for the stack.
 struct HoldSet {
     label: u64,
+    root: u64,
     holds: Holds,
     retired: bool,
 }
@@ -127,6 +128,7 @@ impl HoldSet {
     const fn new() -> Self {
         Self {
             label: 0,
+            root: 0,
             holds: Holds::new(),
             retired: false,
         }
@@ -252,6 +254,10 @@ fn main(_: u64) -> u64 {
         endpoints: &mut tables.endpoints,
         holdsets: &mut tables.holdsets,
         pins: &mut tables.pins,
+        retired: tty::retired::Retired::new(),
+        pin_cleanup_due: false,
+        watch_cleanup_due: false,
+        disconnect_work_due: false,
         pump: Pump::new(),
         input: Input::Idle,
         timer,
@@ -349,6 +355,10 @@ struct Tty {
     endpoints: &'static mut Endpoints,
     holdsets: &'static mut [HoldSet; SESSIONS],
     pins: &'static mut [Option<Pin>; OPERATIONS],
+    retired: tty::retired::Retired<SESSIONS>,
+    pin_cleanup_due: bool,
+    watch_cleanup_due: bool,
+    disconnect_work_due: bool,
     pump: Pump,
     input: Input,
     /// The timer of VTIME and the deadline it is armed for.
@@ -543,6 +553,7 @@ impl Tty {
         self.tell_master_writers();
         self.devices[terminal].disconnect_pending = self.devices[terminal].job_generation != 0;
         if self.devices[terminal].disconnect_pending {
+            self.disconnect_work_due = true;
             self.kick();
         }
     }
@@ -994,46 +1005,58 @@ impl Tty {
     /// waits armed, or else a piece of output; a step that took input
     /// leaves the output to the next.
     fn work(&mut self) {
-        if let Some(slot) = self.holdsets.iter().position(|h| h.retired) {
+        if let Some(slot) = self.retired.first() {
             if let Some(id) = self.holdsets[slot].holds.first() {
                 if let Ok(Some(effect)) = self.endpoints.close(&mut self.holdsets[slot].holds, id) {
                     self.disconnect(effect.terminal);
                 }
-                self.kick();
             } else {
                 self.holdsets[slot] = HoldSet::new();
-                self.kick();
+                self.retired.pop();
             }
-        }
-        if let Some(index) = self
-            .pins
-            .iter()
-            .position(|p| p.is_some_and(|p| !self.ops.waits(p.label, p.key)))
-        {
-            self.clear_pin(index);
             self.kick();
+            return;
         }
-        if let Some(terminal) = self.devices.iter().position(|d| d.disconnect_pending) {
-            self.select(terminal);
-            self.disconnect_link();
+        if self.pin_cleanup_due {
+            if let Some(index) = self
+                .pins
+                .iter()
+                .position(|p| p.is_some_and(|p| !self.ops.waits(p.label, p.key)))
+            {
+                self.clear_pin(index);
+                self.kick();
+                return;
+            }
+            self.pin_cleanup_due = false;
+        }
+        if self.disconnect_work_due {
+            if let Some(terminal) = self.devices.iter().position(|d| d.disconnect_pending) {
+                self.select(terminal);
+                self.disconnect_link();
+                self.kick();
+                return;
+            }
+            self.disconnect_work_due = false;
+        }
+        if self.watch_cleanup_due {
+            if let Some((label, key, id)) = self.watches.cleanup() {
+                let terminal = if id == CONSOLE {
+                    Some(0)
+                } else {
+                    self.endpoints.pinned(id).ok().map(|e| e.terminal)
+                };
+                if let Some(terminal) = terminal {
+                    self.devices[terminal].watchers.remove(label, key);
+                }
+                if id != CONSOLE {
+                    let _ = self.endpoints.unpin(id);
+                }
+                self.kick();
+                return;
+            }
+            self.watch_cleanup_due = false;
         }
         self.select(0);
-        if let Some((label, key, id)) = self.watches.cleanup() {
-            let terminal = if id == CONSOLE {
-                Some(0)
-            } else {
-                self.endpoints.pinned(id).ok().map(|e| e.terminal)
-            };
-            if let Some(terminal) = terminal {
-                self.devices[terminal].watchers.remove(label, key);
-            }
-            if id != CONSOLE {
-                let _ = self.endpoints.unpin(id);
-            }
-        }
-        if self.watches.cleanup_due() {
-            self.kick();
-        }
         if !matches!(self.input, Input::Waiting { armed: true, .. }) && self.pull() {
             return;
         }
@@ -1893,9 +1916,6 @@ impl Tty {
     }
 
     fn new_clone(&mut self, root: u64, parent: &Holds, r: &mut Request<'_>) -> Answer {
-        if self.clones.room_within(root, ROOT_CLONES).is_err() {
-            return Answer::Status(Status::Kernel(Error::LimitReached));
-        }
         let Some(slot) = self.holdsets.iter().position(|h| h.label == 0) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
@@ -1903,6 +1923,9 @@ impl Tty {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
         let label = OWN | given;
+        if self.clones.add_within(label, root, ROOT_CLONES).is_err() {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        }
         let priority = self.level.saturating_sub(1).max(1);
         let session = match sys::handle_label(
             &self.channel,
@@ -1911,19 +1934,27 @@ impl Tty {
             priority,
         ) {
             Ok(session) => session,
-            Err(error) => return Answer::Status(Status::Kernel(error)),
+            Err(error) => {
+                self.clones.gone(label);
+                return Answer::Status(Status::Kernel(error));
+            }
         };
+        // The kernel may report this label's Gone after a later request.
+        // Every issued channel consumes its label even if inheritance fails.
+        self.given = given;
         let child = match self.endpoints.clone_holds(parent) {
             Ok(child) => child,
-            Err(error) => return status(Self::endpoint_error(error)),
+            Err(error) => {
+                self.clones.gone(label);
+                return status(Self::endpoint_error(error));
+            }
         };
         self.holdsets[slot] = HoldSet {
             label,
+            root,
             holds: child,
             retired: false,
         };
-        self.given = given;
-        let _ = self.clones.add_within(label, root, ROOT_CLONES);
         let _ = r.reply().u32(0);
         Answer::Reply([session.erase()].into())
     }
@@ -2506,10 +2537,21 @@ impl Tty {
 }
 
 impl Tty {
+    fn retire_holds(&mut self, slot: usize) {
+        if !self.holdsets[slot].retired {
+            // A slot remains occupied until the queue releases it.
+            // There are SESSIONS slots, and each enters only once.
+            assert!(self.retired.push(slot));
+            self.holdsets[slot].retired = true;
+        }
+    }
+
     fn abandon(&mut self, s: &mut Session<Client, 0>) {
         let label = s.label();
         self.watches.retire(label);
         self.ops.gone(&mut s.data.long);
+        self.pin_cleanup_due = true;
+        self.watch_cleanup_due = true;
         for device in self.devices.iter_mut() {
             device.readers.remove_all(label);
             device.writers.remove_all(label);
@@ -2575,9 +2617,12 @@ impl Service<0> for Tty {
             if self.holdsets[holding].retired {
                 return Answer::Status(Status::Kernel(Error::BadState));
             }
-            self.holdsets[holding].label = label;
+            if self.holdsets[holding].label == 0 {
+                self.holdsets[holding].label = label;
+                self.holdsets[holding].root = label;
+            }
             s.data.holding = holding;
-            s.data.root = self.clones.client_of(label).unwrap_or(label);
+            s.data.root = self.holdsets[holding].root;
         }
         match Method::from_number(r.method()) {
             Some(Method::Open) => self.open(s, r),
@@ -2662,16 +2707,16 @@ impl Service<0> for Tty {
 
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         self.abandon(s);
-        if let Some(holding) = self.holdsets.iter_mut().find(|h| h.label == s.label()) {
-            holding.retired = true;
+        if let Some(slot) = self.holdsets.iter().position(|h| h.label == s.label()) {
+            self.retire_holds(slot);
         }
         self.kick();
     }
 
     fn closed(&mut self, label: u64) {
         self.clones.gone(label);
-        if let Some(holding) = self.holdsets.iter_mut().find(|h| h.label == label) {
-            holding.retired = true;
+        if let Some(slot) = self.holdsets.iter().position(|h| h.label == label) {
+            self.retire_holds(slot);
         }
         self.kick();
     }
