@@ -66,7 +66,9 @@ fn run() -> Result<(), Status> {
     let fd = files.open("/etc/motd", proto_fs::READ_ONLY)?;
     let channel = files.sessions().0;
     let baseline = pages(channel)?;
+    rt::println!("ramfs-gc: before inode preparation");
     control(channel, 0)?;
+    rt::println!("ramfs-gc: inode created, before page allocation");
     for page in 0..32 {
         let mut request = Writer::new();
         Header::new(0xfffc, proto_fs::VERSION).write(&mut request)?;
@@ -78,6 +80,7 @@ fn run() -> Result<(), Status> {
             return Err(Status::BadSize);
         }
     }
+    rt::println!("ramfs-gc: pages allocated, before binding barrier");
     let armed = sys::send(channel, &Header::new(0xfffd, proto_fs::VERSION).bytes())
         .map_err(Status::Kernel)?;
     if armed.len != 8 || armed.words[0] != 0 || !armed.handles.is_empty() {
