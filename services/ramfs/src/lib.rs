@@ -1195,7 +1195,7 @@ impl<'a> Ram<'a> {
         now: u64,
     ) -> Result<usize, u32> {
         let file = self.get(fds, fd)?.file;
-        let n = self.write(fds, fd, bytes)?;
+        let n = self.write_position(fds, fd, bytes, None)?;
         // The null device keeps no times.
         if n > 0 && file.index().is_some() {
             let node = self.storage.node_mut(self.token(file)).expect("live inode");
@@ -1215,15 +1215,15 @@ impl<'a> Ram<'a> {
         bytes: &[u8],
         now: u64,
     ) -> Result<usize, u32> {
-        let at = i64::try_from(offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
-        let mut open = self.get(fds, fd)?;
-        let position = open.offset;
-        open.offset = at;
-        self.put(fds, fd, open)?;
-        let written = self.write_at(fds, fd, bytes, now);
-        open.offset = position;
-        self.put(fds, fd, open)?;
-        written
+        i64::try_from(offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
+        let file = self.get(fds, fd)?.file;
+        let n = self.write_position(fds, fd, bytes, Some(offset))?;
+        if n > 0 && file.index().is_some() {
+            let node = self.storage.node_mut(self.token(file)).expect("live inode");
+            node.times[1] = now;
+            node.times[2] = now;
+        }
+        Ok(n)
     }
 
     pub fn directory_read(
@@ -1410,6 +1410,16 @@ impl<'a> Ram<'a> {
     }
 
     pub fn write(&mut self, fds: &mut Fds, fd: u32, bytes: &[u8]) -> Result<usize, u32> {
+        self.write_position(fds, fd, bytes, None)
+    }
+    /// An explicit position bypasses APPEND and never changes the shared description.
+    fn write_position(
+        &mut self,
+        fds: &mut Fds,
+        fd: u32,
+        bytes: &[u8],
+        position: Option<u64>,
+    ) -> Result<usize, u32> {
         let mut open = self.get(fds, fd)?;
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
@@ -1420,15 +1430,28 @@ impl<'a> Ram<'a> {
         if bytes.is_empty() || open.file.is_device() {
             return Ok(bytes.len());
         }
-        let offset = usize::try_from(open.offset).map_err(|_| NO_SPACE)?;
+        let offset = if let Some(at) = position {
+            usize::try_from(at).map_err(|_| NO_SPACE)?
+        } else if open.flags & proto_fs::APPEND != 0 {
+            self.length(open.file)
+        } else {
+            usize::try_from(open.offset).map_err(|_| NO_SPACE)?
+        };
         let end = offset.checked_add(bytes.len()).ok_or(NO_SPACE)?;
-        if end > FILE_CAPACITY {
+        let capacity = if matches!(open.file, File::Scratch) {
+            FILE_CAPACITY
+        } else {
+            storage::FILE_PAGES * storage::PAGE
+        };
+        if end > capacity {
             return Err(NO_SPACE);
         }
         self.storage
             .write(self.token(open.file), fds.root, offset, bytes)?;
-        open.offset = end as i64;
-        self.put(fds, fd, open)?;
+        if position.is_none() {
+            open.offset = end as i64;
+            self.put(fds, fd, open)?;
+        }
         Ok(bytes.len())
     }
 }

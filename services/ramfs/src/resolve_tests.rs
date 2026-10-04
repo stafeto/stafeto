@@ -1691,3 +1691,70 @@ fn creation_access_requires_a_fresh_exact_reservation_in_its_owner_root() {
     assert_eq!(ram.open_descriptions(), 0);
     assert_eq!(ram.storage.preparations_used(), 0);
 }
+
+#[test]
+fn append_uses_current_eof_and_positioned_write_preserves_flags_and_offset() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let token = create(&mut ram, ROOT, b"append", REG, 0o600);
+    let a = ram
+        .prepare_open_token(
+            &mut fds,
+            token,
+            proto_fs::READ_WRITE | proto_fs::APPEND,
+            OWNER,
+            None,
+        )
+        .unwrap();
+    let a = ram.publish_open(&mut fds, a).unwrap();
+    let b = ram
+        .prepare_open_token(
+            &mut fds,
+            token,
+            proto_fs::READ_WRITE | proto_fs::APPEND,
+            OWNER,
+            None,
+        )
+        .unwrap();
+    let b = ram.publish_open(&mut fds, b).unwrap();
+    let mut child = ram.clone_fds(&fds, &[a]).unwrap();
+    ram.write(&mut fds, a, b"first").unwrap();
+    ram.write(&mut fds, b, b"second").unwrap();
+    assert_eq!(ram.pwrite(&mut fds, a, 0, b"F", 10), Ok(1));
+    assert_eq!(
+        ram.seek_from(&mut fds, a, 0, proto_fs::SeekFrom::Current),
+        Ok(5)
+    );
+    assert_eq!(ram.write(&mut child, a, b"third"), Ok(5));
+    assert_eq!(
+        ram.seek_from(&mut fds, a, 0, proto_fs::SeekFrom::Current),
+        Ok(16)
+    );
+    assert_eq!(
+        ram.seek_from(&mut fds, b, 0, proto_fs::SeekFrom::Current),
+        Ok(11)
+    );
+    let mut bytes = [0; 16];
+    assert_eq!(ram.storage.read(token, 0, &mut bytes), Ok(16));
+    assert_eq!(&bytes, b"Firstsecondthird");
+    assert_eq!(ram.write(&mut fds, b, b""), Ok(0));
+    assert_eq!(
+        ram.seek_from(&mut fds, b, 0, proto_fs::SeekFrom::Current),
+        Ok(11)
+    );
+    // Created regular storage uses the full bound; the old fixed scratch profile is separate.
+    assert_eq!(ram.pwrite(&mut fds, b, 4096, b"sparse", 20), Ok(6));
+    assert_eq!(
+        ram.seek_from(&mut fds, b, 0, proto_fs::SeekFrom::Current),
+        Ok(11)
+    );
+    assert_eq!(ram.write(&mut fds, b, b"tail"), Ok(4));
+    assert_eq!(ram.storage.node(token).unwrap().length, 4106);
+    ram.release(&mut child);
+    ram.release(&mut fds);
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.node(token).unwrap().pins.iter().sum::<u16>(), 0);
+}
