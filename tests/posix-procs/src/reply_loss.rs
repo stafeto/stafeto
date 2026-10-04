@@ -6,11 +6,12 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use proto_fs::{Method, OpenKey};
 use proto_wire::{Reader, Status};
-use rt::abi::{Error, Policy, ProcessState, ThreadState};
+use rt::abi::{Error, Policy, ProcessState, Rights, ThreadState};
 use rt::fs::{Files, OpenOutcome, PreparedOpen};
 use rt::{Handle, Stack, sys};
 
-static STACKS: [Stack<16384>; 4] = [const { Stack::new() }; 4];
+static STACKS: [Stack<16384>; 11] = [const { Stack::new() }; 11];
+static ALTERNATE: AtomicU64 = AtomicU64::new(0);
 static ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static JOB: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +115,187 @@ fn lose(files: &Files, index: usize, key: OpenKey, job: u64, method: u64) -> Res
     Ok(())
 }
 
+fn arm_args(endpoint: u64, key: OpenKey) -> sys::Regs {
+    let mut args = [0; 10];
+    args[0] = endpoint;
+    args[1] = u64::from_le_bytes(Method::OpenStart.header().bytes());
+    args[2] = key.slot as u64;
+    args[3] = key.generation;
+    args
+}
+fn probe<const CALL: u16>(args: sys::Regs) -> sys::Regs {
+    // SAFETY: these dedicated guest calls accept registers and retain their own references.
+    unsafe { sys::raw::<CALL>(args) }
+}
+extern "C" fn negative_worker(mode: u64) -> ! {
+    // SAFETY: main retains this session until the sequential worker has ended.
+    let channel = unsafe { Handle::from_raw(rt::abi::Handle(ENDPOINT.load(Ordering::Acquire))) };
+    let files = ManuallyDrop::new(Files::from_sessions(channel, None));
+    let key = OpenKey {
+        slot: 26,
+        generation: 4000 + mode,
+    };
+    let mut args = arm_args(files.sessions().0.raw().0, key);
+    let extra = if mode == 5 {
+        sys::channel_create(1).ok()
+    } else {
+        None
+    };
+    match mode {
+        2 => args[1] = u64::from_le_bytes(Method::OpenQuery.header().bytes()),
+        3 => args[3] += 1,
+        4 => {
+            args[1] = u64::from_le_bytes(Method::OpenCommit.header().bytes());
+            args[4] = 42;
+            args[5] = 1;
+        }
+        5 => {
+            if let Some(extra) = &extra {
+                args[0] = extra.raw().0;
+            } else {
+                RETURNED.store(3, Ordering::Release);
+                sys::thread_exit();
+            }
+        }
+        _ => {}
+    }
+    if mode == 6 {
+        args[0] = ALTERNATE.load(Ordering::Acquire);
+    }
+    let mut good = probe::<0xffe0>(args)[0] == 0;
+    if mode == 1 {
+        good &= probe::<0xffe2>([0; 10])[0] == 0 && probe::<0xffe2>([0; 10])[0] == 0;
+    }
+    if good && mode != 0 {
+        if mode == 6 {
+            let endpoint = Handle::borrowed(rt::abi::Handle(args[0]));
+            let mut request = proto_wire::Writer::new();
+            good = Method::OpenStart.header().write(&mut request).is_ok()
+                && request.u32(key.slot).is_ok()
+                && request.u64(key.generation).is_ok();
+            if good {
+                good = sys::send(&endpoint, request.as_bytes()).is_ok_and(|reply| {
+                    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+                    reply.len == 8
+                        && Reader::new(reply.bytes(&mut buffer)).u32() == Ok(proto_fs::OPEN_RETIRED)
+                });
+            }
+        } else if mode == 4 {
+            good = files.open_commit(0).is_err();
+        } else {
+            good = files
+                .open_start(key, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+                .is_ok();
+            good &= files.open_cancel_key(key).is_ok();
+        }
+    }
+    drop(extra);
+    RETURNED.store(if good { 2 } else { 3 }, Ordering::Release);
+    sys::thread_exit()
+}
+fn negatives(files: &Files) -> Result<(), i32> {
+    let endpoint = files.sessions().0;
+    let process = posix_abi::allocation::process();
+    let key = OpenKey {
+        slot: 26,
+        generation: 3000,
+    };
+    let args = arm_args(endpoint.raw().0, key);
+    let owned = sys::channel_create(1).map_err(|_| 150)?;
+    let restricted = sys::handle_duplicate(&owned, Rights::NONE).map_err(|_| 150)?;
+    for (index, value, expected) in [
+        (2, 32, Error::InvalidArgs),
+        (3, 0, Error::InvalidArgs),
+        (5, 2, Error::InvalidArgs),
+        (0, 0, Error::BadHandle),
+        (0, process.raw().0, Error::WrongType),
+        (0, restricted.raw().0, Error::AccessDenied),
+    ] {
+        let mut bad = args;
+        bad[index] = value;
+        if probe::<0xffe0>(bad)[0] != expected.code() || probe::<0xffe2>([0; 10])[0] != 0 {
+            return Err(151);
+        }
+    }
+    // A failed replacement removes the previous arm before validation.
+    if probe::<0xffe0>(args)[0] != 0 {
+        return Err(152);
+    }
+    let mut invalid = args;
+    invalid[3] = 0;
+    if probe::<0xffe0>(invalid)[0] != Error::InvalidArgs.code() {
+        return Err(153);
+    }
+    files
+        .open_start(key, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
+        .map_err(|_| 154)?;
+    files.open_cancel_key(key).map_err(|_| 155)?;
+    let baseline = counts(files)?;
+    ENDPOINT.store(endpoint.raw().0, Ordering::Release);
+    for mode in 0..7 {
+        RETURNED.store(0, Ordering::Release);
+        let alternate = sys::channel_create(1).map_err(|_| 160)?;
+        ALTERNATE.store(alternate.raw().0, Ordering::Release);
+        // SAFETY: each worker owns a distinct static stack and message page, used once.
+        let thread = unsafe {
+            sys::thread_create(
+                process,
+                negative_worker,
+                STACKS[4 + mode].top(),
+                mode as u64,
+                31,
+                Policy::Fifo,
+                0xe00000 + (4 + mode) * 4096,
+            )
+        }
+        .map_err(|_| 156)?;
+        sys::thread_start(&thread).map_err(|_| 157)?;
+        if mode == 6 {
+            if probe::<0xffe2>([0; 10])[0] != Error::AccessDenied.code() {
+                return Err(161);
+            }
+            let sys::Received::Message { token, .. } =
+                sys::try_receive(&alternate).map_err(|_| 162)?
+            else {
+                return Err(163);
+            };
+            let mut wrong = [0; 10];
+            wrong[0] = u64::MAX;
+            wrong[1] = 8;
+            // SAFETY: the invalid reply token carries no handles or borrowed memory.
+            if unsafe { sys::raw::<{ rt::abi::Call::Reply.number() }>(wrong) }[0]
+                != Error::BadState.code()
+                || !sys::thread_info(&thread)
+                    .is_ok_and(|info| info.state == ThreadState::AwaitingReply)
+            {
+                return Err(164);
+            }
+            let mut response = proto_wire::Writer::new();
+            response.u32(proto_fs::OPEN_RETIRED).map_err(|_| 165)?;
+            response.u32(0).map_err(|_| 165)?;
+            token.reply(response.as_bytes()).map_err(|_| 166)?;
+        }
+        let mut ended = false;
+        for _ in 0..1000 {
+            if sys::thread_info(&thread).is_ok_and(|info| info.state == ThreadState::Ended) {
+                ended = true;
+                break;
+            }
+            sys::yield_now().map_err(|_| 158)?;
+        }
+        if !ended
+            || RETURNED.load(Ordering::Acquire) != 2
+            || probe::<0xffe1>([0; 10])[0] != Error::BadState.code()
+            || sys::process_state(process) != Ok(ProcessState::Alive)
+            || counts(files)? != baseline
+        {
+            return Err(159);
+        }
+    }
+    rt::println!("posix-files: native ARM rejection and teardown ok");
+    Ok(())
+}
+
 fn counts(files: &Files) -> Result<[u32; 4], i32> {
     let request = proto_wire::Header::new(0xfffa, proto_fs::VERSION).bytes();
     let reply = sys::send(files.sessions().0, &request).map_err(|_| 114)?;
@@ -163,6 +345,7 @@ fn payload(files: &Files, held: PreparedOpen, bytes: &[u8]) -> Result<(), i32> {
     Ok(())
 }
 pub fn run(files: &Files) -> Result<(), i32> {
+    negatives(files)?;
     let baseline = counts(files)?;
     let key = OpenKey {
         slot: SLOT,
