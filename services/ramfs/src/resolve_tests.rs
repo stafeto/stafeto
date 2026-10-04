@@ -1842,3 +1842,146 @@ fn original_open_args_survive_real_link_expansion_and_namespace_restart() {
     assert_eq!(ram.storage.node(ROOT).unwrap().pins, [0; 5]);
     assert_eq!(ram.storage.node(target).unwrap().pins, [0; 5]);
 }
+
+#[test]
+fn finished_open_receipt_preserves_exact_reference_across_close_reuse_and_clone() {
+    let mut ram = Ram::new(0);
+    let mut owner = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let inode = create(&mut ram, ROOT, b"receipt-old", REG, 0o600);
+    let replacement = create(&mut ram, ROOT, b"receipt-new", REG, 0o600);
+    let key = proto_fs::OpenKey {
+        slot: 7,
+        generation: 1,
+    };
+    let held = ram
+        .prepare_open_token(&mut owner, inode, proto_fs::READ_WRITE, OWNER, None)
+        .unwrap();
+    assert_eq!(ram.finished_open(&owner, key), Err(proto_fs::OPEN_RETIRED));
+    assert!(owner.numbers().next().is_none());
+    assert_eq!(ram.finish_open(&mut owner, key, held), Ok(held));
+    assert_eq!(ram.finish_open(&mut owner, key, held), Ok(held));
+    assert_eq!(ram.finished_open(&owner, key), Ok(held));
+    assert_eq!(ram.write_at(&mut owner, held.fd, b"old", 10), Ok(3));
+    let mut child = ram.clone_fds(&owner, &[held.fd]).unwrap();
+    assert_eq!(ram.finished_open(&child, key), Err(proto_fs::OPEN_RETIRED));
+    ram.cancel_finished_open(&mut child, key).unwrap();
+    ram.close(&mut owner, held.fd).unwrap();
+    assert_eq!(ram.finished_open(&owner, key), Err(proto_fs::OPEN_RETIRED));
+    assert_eq!(
+        ram.finish_open(&mut owner, key, held),
+        Err(proto_fs::OPEN_RETIRED)
+    );
+    let next = ram
+        .prepare_open_token(&mut owner, replacement, proto_fs::READ_WRITE, OWNER, None)
+        .unwrap();
+    assert_eq!(next.fd, held.fd);
+    assert_ne!(next.description, held.description);
+    ram.cancel_finished_open(&mut owner, key).unwrap();
+    assert_eq!(ram.validate_tentative(&owner, next), Ok(replacement));
+    let next_key = proto_fs::OpenKey {
+        slot: key.slot,
+        generation: 2,
+    };
+    assert_eq!(ram.finish_open(&mut owner, next_key, next), Ok(next));
+    ram.cancel_finished_open(&mut owner, key).unwrap();
+    assert_eq!(ram.write_at(&mut owner, next.fd, b"new", 20), Ok(3));
+    assert_eq!(ram.finished_open(&owner, key), Err(proto_fs::OPEN_RETIRED));
+    assert_eq!(ram.finished_open(&owner, next_key), Ok(next));
+    ram.seek_from(&mut child, held.fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    let mut bytes = [0; 3];
+    assert_eq!(ram.read_at(&mut child, held.fd, &mut bytes, 30), Ok(3));
+    assert_eq!(&bytes, b"old");
+    ram.cancel_finished_open(&mut owner, next_key).unwrap();
+    ram.cancel_finished_open(&mut owner, next_key).unwrap();
+    assert_eq!(
+        ram.finished_open(&owner, next_key),
+        Err(proto_fs::OPEN_RETIRED)
+    );
+    ram.release(&mut child);
+    ram.release(&mut owner);
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.node(inode).unwrap().pins, [0; 5]);
+    assert_eq!(ram.storage.node(replacement).unwrap().pins, [0; 5]);
+}
+
+#[test]
+fn finished_open_handoff_succeeds_with_full_description_and_session_tables() {
+    let mut ram = Ram::new(0);
+    let mut sessions = [Fds::default(); 4];
+    for (n, fds) in sessions.iter_mut().enumerate() {
+        fds.root = Root {
+            id: 301 + n as u64,
+            generation: 1,
+        };
+        for slot in 0..32 {
+            let held = ram
+                .prepare_open_token(
+                    fds,
+                    crate::storage::Token {
+                        slot: 3,
+                        generation: 1,
+                    },
+                    proto_fs::READ_ONLY,
+                    ADMIN,
+                    None,
+                )
+                .unwrap();
+            let key = proto_fs::OpenKey {
+                slot,
+                generation: 1,
+            };
+            assert_eq!(ram.finish_open(fds, key, held), Ok(held));
+            assert_eq!(ram.finished_open(fds, key), Ok(held));
+        }
+    }
+    assert_eq!(ram.open_descriptions(), 128);
+    for fds in &mut sessions {
+        assert_eq!(fds.numbers().count(), 32);
+        for slot in 0..32 {
+            let key = proto_fs::OpenKey {
+                slot,
+                generation: 1,
+            };
+            let held = ram.finished_open(fds, key).unwrap();
+            assert_eq!(ram.finish_open(fds, key, held), Ok(held));
+        }
+        ram.release(fds);
+    }
+    assert_eq!(ram.open_descriptions(), 0);
+}
+
+#[test]
+fn finished_receipt_cannot_cancel_a_reallocated_description_in_the_same_slot() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let inode = create(&mut ram, ROOT, b"receipt-generation", REG, 0o600);
+    let key = proto_fs::OpenKey {
+        slot: 31,
+        generation: u64::MAX,
+    };
+    let held = ram
+        .prepare_open_token(&mut fds, inode, proto_fs::READ_WRITE, OWNER, None)
+        .unwrap();
+    ram.finish_open(&mut fds, key, held).unwrap();
+    ram.close(&mut fds, held.fd).unwrap();
+    let fresh = ram
+        .open_token(&mut fds, inode, proto_fs::READ_WRITE, OWNER)
+        .unwrap();
+    let actual = ram.description_token(&fds, fresh).unwrap();
+    assert_eq!(fresh, held.fd);
+    assert_eq!(actual.slot, held.description.slot);
+    assert_ne!(actual.generation, held.description.generation);
+    assert_eq!(ram.finished_open(&fds, key), Err(proto_fs::OPEN_RETIRED));
+    ram.cancel_finished_open(&mut fds, key).unwrap();
+    assert_eq!(ram.write_at(&mut fds, fresh, b"live", 12), Ok(4));
+    assert_eq!(ram.finished_open(&fds, key), Err(proto_fs::OPEN_RETIRED));
+    ram.release(&mut fds);
+    assert_eq!(ram.open_descriptions(), 0);
+}
