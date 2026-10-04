@@ -131,7 +131,10 @@ impl<T> Loaders<T> {
 
     /// Whether a place is free.
     pub fn room(&self) -> bool {
-        self.places.iter().any(Option::is_none)
+        self.places
+            .iter()
+            .zip(&self.generations)
+            .any(|(place, &generation)| place.is_none() && generation != u32::MAX)
     }
 
     /// Whether the record in `parent` may start another load: a place is
@@ -154,8 +157,12 @@ impl<T> Loaders<T> {
         if self.of_record[record].is_some() || !self.room_for(parent) {
             return None;
         }
-        let index = self.places.iter().position(Option::is_none)?;
-        self.generations[index] = self.generations[index].wrapping_add(1);
+        let index = self
+            .places
+            .iter()
+            .zip(&self.generations)
+            .position(|(place, &generation)| place.is_none() && generation != u32::MAX)?;
+        self.generations[index] += 1;
         self.places[index] = Some(Place {
             record,
             parent,
@@ -255,7 +262,7 @@ impl<T> Loaders<T> {
     pub fn free(&mut self, record: usize) -> Option<Place<T>> {
         let index = self.of(record)?;
         self.of_record[record] = None;
-        self.generations[index] = self.generations[index].wrapping_add(1);
+        self.generations[index] = self.generations[index].saturating_add(1);
         self.places[index].take()
     }
 
@@ -278,6 +285,26 @@ impl<T> Loaders<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exhausted_ticket_place_is_retired_permanently() {
+        let mut t = Loaders::<()>::new();
+        t.generations.fill(u32::MAX);
+        assert!(!t.room());
+        assert_eq!(t.take(5, 0, 1, ()), None);
+        t.generations[3] = u32::MAX - 1;
+        assert!(t.room());
+        assert_eq!(t.take(5, 0, 1, ()), Some(3));
+        let last = t.ticket(3);
+        assert_eq!(last, (u64::from(u32::MAX) << 8) | 3);
+        assert!(t.free(5).is_some());
+        assert_eq!(t.generations[3], u32::MAX);
+        assert!(!t.room());
+        assert_eq!(t.take(5, 0, 2, ()), None);
+        t.generations[4] = 0;
+        assert_eq!(t.take(5, 0, 2, ()), Some(4));
+        assert_ne!(t.ticket(4), last);
+    }
 
     /// RESETIDS takes the real IDs for the effective ones; the saved ones
     /// follow the effective ones, as at an exec; a set-ID file's IDs win
