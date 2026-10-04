@@ -230,6 +230,17 @@ impl Default for Fds {
 }
 
 impl Fds {
+    /// Retained references in this session, without authenticating or mutating it.
+    #[cfg(feature = "auth-probe")]
+    pub fn retained_counts(&self) -> [u32; 5] {
+        [
+            self.slots.iter().filter(|slot| slot.is_some()).count() as u32,
+            u32::from(self.cwd.is_some()),
+            u32::from(self.binding_preparation.is_some()),
+            u32::from(self.authority_index != storage::NONE),
+            self.resolvers.iter().filter(|&&id| id != 0).count() as u32,
+        ]
+    }
     /// The description of `fd`.
     fn description(&self, fd: u32) -> Result<usize, u32> {
         let slot = fd.checked_sub(3).ok_or(BAD_FD)? as usize;
