@@ -614,7 +614,7 @@ fn sessions() -> Result<Sessions, i32> {
             w.u32(*n).map_err(|_| EIO)?;
         }
         // The sessions live as long as the process's files.
-        let clone = rt::service::clone_session(&Handle::<Channel>::borrowed(files), w.as_bytes())
+        let clone = rt::fs::Files::clone_on(&Handle::<Channel>::borrowed(files), w.as_bytes())
             .map_err(clone_errno)?;
         out.files = clone.into_raw().0;
         if let Some(uart) = uart {

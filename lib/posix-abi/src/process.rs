@@ -1456,7 +1456,7 @@ fn move_files(c: &Handle<Channel>) -> bool {
         }
     }
     let Ok(files) =
-        rt::service::clone_session(&Handle::<Channel>::borrowed(files), request.as_bytes())
+        rt::fs::Files::clone_on(&Handle::<Channel>::borrowed(files), request.as_bytes())
     else {
         return false;
     };
@@ -1559,7 +1559,7 @@ fn commit(
         w.u32(fd).map_err(|_| EIO)?;
     }
     // The sessions live as long as the process's files.
-    let files = rt::service::clone_session(&Handle::<Channel>::borrowed(files), w.as_bytes())
+    let files = rt::fs::Files::clone_on(&Handle::<Channel>::borrowed(files), w.as_bytes())
         .map_err(clone_errno)?;
     let uart = match uart {
         Some(u) => Some(

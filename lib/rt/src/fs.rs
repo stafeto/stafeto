@@ -125,21 +125,10 @@ impl View {
 struct Proof<'a> {
     files: &'a Files,
     id: u64,
-    loader: Option<&'a Handle<Channel>>,
 }
 impl Proof<'_> {
     fn send(&self, request: &[u8]) -> Result<crate::sys::Reply, Status> {
-        if let Some(identity) = self.loader {
-            let copy = sys::handle_duplicate(
-                identity,
-                abi::Rights::NOTIFY | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
-            )
-            .map_err(Status::Kernel)?;
-            sys::send_handles(&self.files.channel, request, [copy.erase()])
-                .map_err(|e| Status::Kernel(e.error))
-        } else {
-            sys::send(&self.files.channel, request).map_err(Status::Kernel)
-        }
+        Files::send_on(&self.files.channel, request)
     }
     fn ready(&self) -> Result<(), Status> {
         let mut w = Writer::new();
@@ -191,11 +180,20 @@ impl Files {
         }
         self.finish_binding()
     }
-    fn finish_binding(&self) -> Result<(), Status> {
+    pub fn finish_binding(&self) -> Result<(), Status> {
+        Self::finish_on(&self.channel)
+    }
+    pub fn finish_on(channel: &Handle<Channel>) -> Result<(), Status> {
         let request = Method::FinishBinding.header().bytes();
         loop {
-            let reply = sys::send(&self.channel, &request).map_err(Status::Kernel)?;
+            let reply = match sys::send(channel, &request) {
+                Err(Error::Interrupted) => continue,
+                result => result.map_err(Status::Kernel)?,
+            };
             let mut buffer = [0; MESSAGE_MAX];
+            if !reply.handles.is_empty() {
+                return Err(Status::BadSize);
+            }
             match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
                 Status::Ok => return Ok(()),
                 Status::Unknown(proto_fs::RESOLVING) => {}
@@ -203,12 +201,62 @@ impl Files {
             }
         }
     }
+    /// AUTHENTICATING guarantees no file effect. Complete the retained
+    /// refresh before retrying the exact original handle-free request.
+    pub fn send_on(channel: &Handle<Channel>, request: &[u8]) -> Result<crate::sys::Reply, Status> {
+        loop {
+            let reply = sys::send(channel, request).map_err(Status::Kernel)?;
+            let mut buffer = [0; MESSAGE_MAX];
+            if Reader::new(reply.bytes(&mut buffer)).u32()? != proto_fs::AUTHENTICATING {
+                return Ok(reply);
+            }
+            if !reply.handles.is_empty() {
+                return Err(Status::BadSize);
+            }
+            Self::finish_on(channel)?;
+        }
+    }
+    pub fn clone_on(channel: &Handle<Channel>, request: &[u8]) -> Result<Handle<Channel>, Status> {
+        let mut reply = Self::send_on(channel, request)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+            Status::Ok if reply.handles.len() == 1 => reply.handles.take(0).map_err(Status::Kernel),
+            Status::Ok => Err(Status::BadSize),
+            status => Err(status),
+        }
+    }
+    /// Returned handles retain the exact offered object and its original rights.
+    pub fn verify_on(
+        channel: &Handle<Channel>,
+        request: &[u8],
+        mut offered: Handle<Channel>,
+    ) -> Result<Handle<Channel>, Status> {
+        loop {
+            let mut reply = sys::send_handles(channel, request, [offered.erase()])
+                .map_err(|refused| Status::Kernel(refused.error))?;
+            let mut buffer = [0; MESSAGE_MAX];
+            let status = Reader::new(reply.bytes(&mut buffer)).u32()?;
+            if status != 0 && status != proto_fs::AUTHENTICATING {
+                return Err(Status::from_code(status));
+            }
+            if reply.handles.len() != 1
+                || !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                    kind == abi::ObjectKind::Channel
+                        && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+                })
+            {
+                return Err(Status::BadSize);
+            }
+            let returned = reply.handles.take::<Channel>(0).map_err(Status::Kernel)?;
+            if status == 0 {
+                return Ok(returned);
+            }
+            offered = returned;
+            Self::finish_on(channel)?;
+        }
+    }
 
-    fn prepare<'a>(
-        &'a self,
-        path: &[u8],
-        loader: Option<&'a Handle<Channel>>,
-    ) -> Result<Proof<'a>, Status> {
+    fn prepare<'a>(&'a self, path: &[u8]) -> Result<Proof<'a>, Status> {
         if path.is_empty() {
             return Err(Status::Unknown(proto_fs::NO_ENTRY));
         }
@@ -225,13 +273,7 @@ impl Files {
         w.u32(0)?;
         w.u32(1)?;
         w.bytes(path)?;
-        let sender = Proof {
-            files: self,
-            id: 0,
-            loader,
-        };
-        let reply = sender.send(w.as_bytes())?;
-        core::mem::forget(sender);
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
         let mut buffer = [0; MESSAGE_MAX];
         let mut r = Reader::new(reply.bytes(&mut buffer));
         let status = Status::from_code(r.u32()?);
@@ -241,7 +283,6 @@ impl Files {
         let proof = Proof {
             files: self,
             id: r.u64()?,
-            loader,
         };
         r.finish()?;
         proof.ready()?;
@@ -254,7 +295,7 @@ impl Files {
         prefix: Option<u32>,
         buffer: &'a mut [u8; MESSAGE_MAX],
     ) -> Result<&'a [u8], Status> {
-        let proof = self.prepare(path, None)?;
+        let proof = self.prepare(path)?;
         let mut w = Writer::new();
         method.header().write(&mut w)?;
         if let Some(prefix) = prefix {
@@ -262,7 +303,7 @@ impl Files {
         }
         w.u64(proof.id)?;
         loop {
-            let reply = sys::send(&self.channel, w.as_bytes()).map_err(Status::Kernel)?;
+            let reply = Self::send_on(&self.channel, w.as_bytes())?;
             let status = Status::from_code(Reader::new(reply.bytes(buffer)).u32()?);
             if status == Status::Unknown(proto_fs::STALE_PROOF) {
                 proof.ready()?;
@@ -302,7 +343,7 @@ impl Files {
         prepared.open_exec_bound(path)
     }
     fn open_exec_bound(&self, path: &[u8]) -> Result<Handle<Channel>, Status> {
-        let proof = self.prepare(path, None)?;
+        let proof = self.prepare(path)?;
         let mut w = Writer::new();
         Method::OpenExec.header().write(&mut w)?;
         w.u64(proof.id)?;
@@ -371,7 +412,12 @@ impl Files {
         request: &[u8],
         buffer: &'a mut [u8; MESSAGE_MAX],
     ) -> Result<&'a [u8], Status> {
-        Self::call_on(&self.channel, request, buffer)
+        let reply = Self::send_on(&self.channel, request)?;
+        let bytes = reply.bytes(buffer);
+        match Status::from_code(Reader::new(bytes).u32()?) {
+            Status::Ok => Ok(bytes),
+            status => Err(status),
+        }
     }
 
     fn call_on<'a>(

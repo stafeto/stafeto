@@ -132,12 +132,20 @@ pub fn full(slot: u32) -> i32 {
             core::array::from_fn(|_| None);
         for clone in &mut clones {
             *clone = Some(
-                rt::service::clone_session(&root, request.as_bytes())
-                    .map_err(|_| crate::constants::EIO)?,
+                if slot == Slot::Files as u32 {
+                    rt::fs::Files::clone_on(&root, request.as_bytes())
+                } else {
+                    rt::service::clone_session(&root, request.as_bytes())
+                }
+                .map_err(|_| crate::constants::EIO)?,
             );
         }
         if !matches!(
-            rt::service::clone_session(&root, request.as_bytes()),
+            if slot == Slot::Files as u32 {
+                rt::fs::Files::clone_on(&root, request.as_bytes())
+            } else {
+                rt::service::clone_session(&root, request.as_bytes())
+            },
             Err(Status::Kernel(Error::LimitReached))
         ) {
             return Err(crate::constants::EIO);
@@ -155,16 +163,23 @@ pub fn full(slot: u32) -> i32 {
             verify.u32(1).map_err(|_| crate::constants::EIO)?;
         }
         let offered = clones[0].take().ok_or(crate::constants::EIO)?;
-        let mut reply = sys::send_handles(&root, verify.as_bytes(), [offered.erase()])
-            .map_err(|_| crate::constants::EIO)?;
+        let offered = if slot == Slot::Files as u32 {
+            rt::fs::Files::verify_on(&root, verify.as_bytes(), offered)
+                .map_err(|_| crate::constants::EIO)?
+        } else {
+            let mut reply = sys::send_handles(&root, verify.as_bytes(), [offered.erase()])
+                .map_err(|_| crate::constants::EIO)?;
+            let mut buffer = [0; rt::abi::MESSAGE_MAX];
+            if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+                return Err(crate::constants::EIO);
+            }
+            reply
+                .handles
+                .take::<Channel>(0)
+                .map_err(|_| crate::constants::EIO)?
+        };
+        let returned = offered;
         let mut buffer = [0; rt::abi::MESSAGE_MAX];
-        if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
-            return Err(crate::constants::EIO);
-        }
-        let returned = reply
-            .handles
-            .take::<Channel>(0)
-            .map_err(|_| crate::constants::EIO)?;
         if slot == Slot::Files as u32 {
             // This probe becomes the true holder before using the verified capture.
             let files = core::mem::ManuallyDrop::new(rt::fs::Files::from_sessions(
@@ -201,15 +216,23 @@ pub fn full(slot: u32) -> i32 {
             clones[0] = Some(returned);
         }
         if !matches!(
-            rt::service::clone_session(&root, request.as_bytes()),
+            if slot == Slot::Files as u32 {
+                rt::fs::Files::clone_on(&root, request.as_bytes())
+            } else {
+                rt::service::clone_session(&root, request.as_bytes())
+            },
             Err(Status::Kernel(Error::LimitReached))
         ) {
             return Err(crate::constants::EIO);
         }
         drop(clones);
         drop(
-            rt::service::clone_session(&root, request.as_bytes())
-                .map_err(|_| crate::constants::EIO)?,
+            if slot == Slot::Files as u32 {
+                rt::fs::Files::clone_on(&root, request.as_bytes())
+            } else {
+                rt::service::clone_session(&root, request.as_bytes())
+            }
+            .map_err(|_| crate::constants::EIO)?,
         );
         Ok(())
     })();

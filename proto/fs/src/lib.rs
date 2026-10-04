@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 4 of the bounded RAM file service. Numbers are little endian.
+//! Version 5 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -38,6 +38,15 @@
 //! CLONE: count u32, descriptor numbers u32; a genuine child session shares
 //! descriptions and retains the creator's authority until its own authentic Bind.
 //! VerifySession only verifies the authenticated caller's own genuine clone.
+//! AUTHENTICATING guarantees no file effect; FinishBinding completes a staged
+//! retained-identity refresh, then the caller retries its exact original request.
+//! Handle-free calls return no handles at this barrier. VerifySession returns
+//! exactly its received Channel with SEND|TRANSFER rights, preserving its
+//! captured fd/CWD snapshot; retry transfers that returned handle, never the
+//! consumed old outgoing handle. FinishBinding's terminal result is journaled
+//! until the next Bind or refresh, including completion by maintenance.
+//! Raw LoaderRoot Resolve requests are refused; executable proofs require the
+//! genuine fresh BindPending session described above.
 //! READ_INTO on an image session: fd0, offset/count, destination memory capability.
 
 #![cfg_attr(not(test), no_std)]
@@ -50,7 +59,7 @@ pub use info::NodeInfo;
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -86,6 +95,9 @@ pub const NAME_TOO_LONG: u32 = 311;
 pub const LOOP: u32 = 312;
 pub const STALE_PROOF: u32 = 313;
 pub const RESOLVING: u32 = 314;
+/// The original request made no file effect. FinishBinding completes the
+/// retained authority refresh before the caller retries the original request.
+pub const AUTHENTICATING: u32 = 315;
 pub const BOOT_PROFILE: u64 = 1 << 61;
 
 /// Init issues this profile exclusively to the named diagnostic client.
