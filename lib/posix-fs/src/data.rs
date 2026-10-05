@@ -549,6 +549,28 @@ mod tests {
         assert_eq!(fs.target(0).unwrap(), Target::Input);
         assert_eq!(fs.data_tokens().count(), 0);
     }
+    #[test]
+    fn canceling_retains_known_read_cache_and_rejects_missing_result() {
+        let mut fs = files();
+        let (token, claim) = begin(&mut fs, DataKind::Read, 3, &[]);
+        committing(&mut fs, token, claim);
+        let mut outcome = done(256, 3);
+        outcome.phase = DataPhase::Canceling;
+        outcome.result = DataResult::None;
+        assert!(fs.save_data_result(claim, outcome, &[], |_| 5).is_err());
+        assert_eq!(fs.data_snapshot(token).unwrap().result, None);
+        outcome.result = DataResult::Bytes(3);
+        fs.save_data_result(claim, outcome, b"abc", |_| 5).unwrap();
+        let proof = cleanup_proof(fs.begin_data_cleanup(token).unwrap());
+        fs.finish_data_cleanup(proof).unwrap();
+        let mut bytes = [0; 3];
+        assert_eq!(
+            fs.acknowledge_data(token, owner(1), &mut bytes).unwrap(),
+            ScalarResult::Bytes(3)
+        );
+        assert_eq!(&bytes, b"abc");
+    }
+
     fn retired(fs: &PosixFs, claim: ScalarClaimToken) -> TerminalCleanupAuthority {
         let TerminalQueryResult::Retired(authority) = fs
             .data_terminal_query_context(claim)
@@ -1182,7 +1204,7 @@ impl PosixFs {
         let snapshot = self.data_claim_snapshot(claim)?;
         if snapshot.owner.is_none()
             || snapshot.recovery.session_handle != self.sessions().0.raw().0
-            || outcome.phase != DataPhase::Completed
+            || !matches!(outcome.phase, DataPhase::Completed | DataPhase::Canceling)
             || outcome.job != snapshot.recovery.job
         {
             return Err(FsError::Io);
