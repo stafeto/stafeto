@@ -128,8 +128,14 @@ fn ended(owner: u64) -> Result<bool, i32> {
 /// This is read-only: the production helper must perform the first detach.
 #[unsafe(no_mangle)]
 extern "C" fn files_data_loss_status(helper: i32) -> i32 {
+    if !READY.load(Ordering::Acquire) || (helper != 0 && HELPER.load(Ordering::Acquire) == 0) {
+        return 0;
+    }
     let result = (|| {
         let event = event()?;
+        if helper != 0 && ended(event.owner.value())? {
+            return Err(5);
+        }
         let owner = if helper != 0 {
             HELPER.load(Ordering::Acquire)
         } else {
@@ -235,6 +241,9 @@ extern "C" fn files_data_loss_finish() -> i32 {
         if CASE.load(Ordering::Acquire) < 3 && live() != baseline {
             return Err(5);
         }
+        // The next worker need not have reached its registration when the
+        // supervisor first polls; never expose the preceding case's event.
+        READY.store(false, Ordering::Release);
         Ok(())
     })();
     result.err().unwrap_or(0)
