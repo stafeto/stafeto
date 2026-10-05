@@ -13,6 +13,8 @@ pub mod allocation;
 pub mod clock;
 pub mod constants;
 mod data_driver;
+#[cfg(feature = "data-driver-probe")]
+pub mod data_probe;
 pub mod fork;
 mod io_driver;
 pub mod loader_probe;
@@ -190,7 +192,6 @@ pub fn read(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
 
 // Keep cancellation outside frames holding transport resources and buffers.
 fn read_inner(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
-    let mut message = [0; MESSAGE_MAX];
     let fd = fd(number)?;
     let count = buffer.len().min(posix_request::MAX_READ);
     loop {
@@ -199,25 +200,34 @@ fn read_inner(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
         {
             return operation.run(&mut buffer[..count]).map(|n| n as usize);
         }
-        let Some(reply) = shared::read_nonram(fd, count as u32, &mut message)? else {
-            continue;
-        };
-        return match reply {
-            Reply::Bytes(bytes) => {
-                if bytes.len() > count {
-                    return Err(EIO);
-                }
-                buffer[..bytes.len()].copy_from_slice(bytes);
-                Ok(bytes.len())
+        if let Some(count) = read_nonram_inner(fd, &mut buffer[..count])? {
+            return Ok(count);
+        }
+    }
+}
+
+#[inline(never)]
+fn read_nonram_inner(fd: u32, buffer: &mut [u8]) -> Result<Option<usize>, c_int> {
+    let mut message = [0; MESSAGE_MAX];
+    let count = buffer.len();
+    let Some(reply) = shared::read_nonram(fd, count as u32, &mut message)? else {
+        return Ok(None);
+    };
+    match reply {
+        Reply::Bytes(bytes) => {
+            if bytes.len() > count {
+                return Err(EIO);
             }
-            Reply::Input { uart, extent } => {
-                if extent as usize > count {
-                    return Err(EIO);
-                }
-                console_read(uart, &mut buffer[..extent as usize])
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            Ok(Some(bytes.len()))
+        }
+        Reply::Input { uart, extent } => {
+            if extent as usize > count {
+                return Err(EIO);
             }
-            _ => Err(EIO),
-        };
+            console_read(uart, &mut buffer[..extent as usize]).map(Some)
+        }
+        _ => Err(EIO),
     }
 }
 

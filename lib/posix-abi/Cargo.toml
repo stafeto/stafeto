@@ -20,6 +20,7 @@ rtbench = []
 # file state (tests/posix-threads, tests/posix-shared).
 thread-probe = []
 open-finalize-clock-probe = []
+data-driver-probe = []
 
 [dependencies]
 posix-types = { path = "../posix-types" }

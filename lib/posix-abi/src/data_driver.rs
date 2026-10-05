@@ -5,8 +5,8 @@
 
 use crate::constants::*;
 use posix_fs::data::{
-    DataKind, DataOutcome, DataPhase, DataResult, OwnerToken, Phase, ScalarClaim, ScalarClaimToken,
-    ScalarPhase, ScalarResult, ScalarToken, StartResult, WaitValue,
+    DataKind, DataOutcome, DataPhase, DataResult, OwnerToken, Phase, ScalarClaimState,
+    ScalarClaimToken, ScalarPhase, ScalarResult, ScalarToken, StartResult, WaitValue,
 };
 use posix_fs::{Target, Transport};
 use proto_wire::Status;
@@ -50,7 +50,7 @@ pub(crate) fn begin(
         return Ok(None);
     }
     let owner = owner()?;
-    crate::shared::with_files(|files| {
+    let operation = crate::shared::with_files(|files| {
         let target = files.target(fd).map_err(crate::error)?;
         if !eligible(target) {
             return Ok(None);
@@ -65,7 +65,12 @@ pub(crate) fn begin(
             transport,
             active: true,
         }))
-    })
+    })?;
+    #[cfg(feature = "data-driver-probe")]
+    if let Some(operation) = &operation {
+        operation.observe(crate::data_probe::Stage::CapturedBeforeStart)?;
+    }
+    Ok(operation)
 }
 
 pub(crate) struct Operation {
@@ -77,6 +82,21 @@ pub(crate) struct Operation {
 }
 
 impl Operation {
+    #[cfg(feature = "data-driver-probe")]
+    fn observe(&self, stage: crate::data_probe::Stage) -> Result<(), i32> {
+        let state =
+            crate::shared::with_files(|files| files.data_state(self.token).map_err(crate::error))?;
+        crate::data_probe::observe(
+            stage,
+            crate::data_probe::Event {
+                owner: self.owner,
+                token: self.token,
+                claim: self.claim,
+                state,
+            },
+        )
+    }
+
     /// Read bytes leave resident custody only in this original caller's local defer.
     pub(crate) fn run(mut self, out: &mut [u8]) -> Result<u64, i32> {
         loop {
@@ -84,7 +104,7 @@ impl Operation {
                 return Err(EINTR);
             }
             let snapshot = crate::shared::with_files(|files| {
-                files.data_snapshot(self.token).map_err(crate::error)
+                files.data_state(self.token).map_err(crate::error)
             })?;
             if snapshot.result.is_some() {
                 self.claim = None;
@@ -118,20 +138,20 @@ impl Operation {
                 Some(claim) => claim,
                 None => match crate::shared::with_files(|files| {
                     files
-                        .claim_data(self.token, self.owner)
+                        .claim_data_token(self.token, self.owner)
                         .map_err(crate::error)
                 })? {
-                    ScalarClaim::Acquired { token, .. } => {
+                    ScalarClaimState::Acquired(token) => {
                         self.claim = Some(token);
                         token
                     }
-                    ScalarClaim::Busy(helper) => {
+                    ScalarClaimState::Busy(helper) => {
                         let _ = crate::relibc::detach_ended_open_owner(helper.value());
                         wait(self.token)?;
                         continue;
                     }
-                    ScalarClaim::Complete(_) => continue,
-                    ScalarClaim::Cleanup(_) => {
+                    ScalarClaimState::Complete(_) => continue,
+                    ScalarClaimState::Cleanup => {
                         terminal_exhausted(self.token, self.owner)?;
                         cleanup(self.token);
                         continue;
@@ -141,9 +161,19 @@ impl Operation {
             match advance(claim, self.transport)? {
                 Progress::ClaimReleased => self.claim = None,
                 Progress::More => {}
+                Progress::Feed(job) => feed(claim, job)?,
                 Progress::Commit => {
-                    commit(claim)?;
+                    #[cfg(feature = "data-driver-probe")]
+                    self.observe(crate::data_probe::Stage::ReadyBeforeCommit)?;
+                    let committed = commit(claim);
+                    #[cfg(feature = "data-driver-probe")]
+                    if committed.is_err() {
+                        crate::data_probe::disarm_failed_commit(self.owner);
+                    }
+                    committed?;
                     self.claim = None;
+                    #[cfg(feature = "data-driver-probe")]
+                    self.observe(crate::data_probe::Stage::ClaimReleasedAfterCommit)?;
                 }
                 Progress::Cache(outcome) => {
                     if cache(claim, self.transport, outcome)? {
@@ -161,6 +191,7 @@ impl Operation {
 
 // Drop releases the exact effect claim before Point.finish can run user handlers.
 impl Drop for Operation {
+    #[inline(never)]
     fn drop(&mut self) {
         if let Some(claim) = self.claim.take() {
             release(claim);
@@ -180,6 +211,7 @@ enum Progress {
     More,
     ClaimReleased,
     Commit,
+    Feed(u64),
     Cache(DataOutcome),
     Retired,
 }
@@ -188,59 +220,27 @@ fn release(claim: ScalarClaimToken) {
         crate::shared::with_files(|files| files.release_data_claim(claim).map_err(crate::error));
     wake(claim.scalar());
 }
-fn save(claim: ScalarClaimToken, recovery: posix_fs::data::Recovery) -> Result<(), i32> {
-    crate::shared::with_files(|files| files.update_data(claim, recovery).map_err(crate::error))
+fn progress(claim: ScalarClaimToken, phase: Phase, job: u64, feed_end: u16) -> Result<(), i32> {
+    crate::shared::with_files(|files| {
+        files
+            .set_data_progress(claim, phase, job, feed_end)
+            .map_err(crate::error)
+    })
 }
 
 /// Each preparation request runs with neither layer lock nor signal defer held.
 #[inline(never)]
 fn advance(claim: ScalarClaimToken, transport: Transport) -> Result<Progress, i32> {
     let snapshot =
-        crate::shared::with_files(|files| files.data_claim_snapshot(claim).map_err(crate::error))?;
+        crate::shared::with_files(|files| files.data_claim_state(claim).map_err(crate::error))?;
     if snapshot.owner.is_none() {
         release(claim);
-        cleanup(claim.scalar());
         return Ok(Progress::ClaimReleased);
     }
-    let mut recovery = snapshot.recovery;
+    let state = snapshot;
     let files = transport.files();
-    if recovery.phase == Phase::Starting {
-        let context = crate::shared::with_files(|files| {
-            files.data_start_context(claim).map_err(crate::error)
-        })?;
-        match context.send_once() {
-            StartResult::Started { phase, job } => {
-                recovery.job = job;
-                recovery.phase = if recovery.kind().writes() {
-                    Phase::Feeding
-                } else {
-                    Phase::Preparing
-                };
-                if matches!(phase, DataPhase::Ready | DataPhase::TimeDeferred) {
-                    recovery.phase = Phase::Ready;
-                }
-                save(claim, recovery)?;
-            }
-            StartResult::Rejected(proof) => {
-                crate::shared::with_files(|files| {
-                    files
-                        .reject_data_start(proof, crate::error)
-                        .map_err(crate::error)
-                })?;
-                wake(claim.scalar());
-                return Ok(Progress::ClaimReleased);
-            }
-            StartResult::Ambiguous(Status::Unknown(proto_fs::AUTHENTICATING)) => {
-                release(claim);
-                files.finish_binding().map_err(|e| crate::error(e.into()))?;
-                return Ok(Progress::ClaimReleased);
-            }
-            StartResult::Ambiguous(_) => {
-                // Unknown Start retains the same key; Query or exact replay follows.
-                release(claim);
-                return Ok(Progress::ClaimReleased);
-            }
-        }
+    if state.progress == Phase::Starting {
+        return start(claim, transport, state.kind);
     }
     let context =
         crate::shared::with_files(|files| files.data_query_context(claim).map_err(crate::error))?;
@@ -260,7 +260,7 @@ fn advance(claim: ScalarClaimToken, transport: Transport) -> Result<Progress, i3
     if query.outcome.result != DataResult::None {
         return Ok(Progress::Cache(query.outcome));
     }
-    if recovery.phase == Phase::Committing {
+    if state.progress == Phase::Committing {
         if let Some(proof) = query.prepared {
             crate::shared::with_files(|files| {
                 files.restore_data_preparation(proof).map_err(crate::error)
@@ -276,31 +276,70 @@ fn advance(claim: ScalarClaimToken, transport: Transport) -> Result<Progress, i3
         return Ok(Progress::ClaimReleased);
     }
     match query.outcome.phase {
-        DataPhase::Captured | DataPhase::Feeding if recovery.kind().writes() => {
-            let start = recovery.feed_end as usize;
-            let end = (start + proto_fs::FEED_MAX).min(recovery.count() as usize);
-            if start < end
-                && files
-                    .data_feed_once(recovery.job, start as u32, &recovery.input()[start..end])
-                    .is_ok()
-            {
-                recovery.feed_end = end as u16;
-                recovery.phase = Phase::Feeding;
-                save(claim, recovery)?;
-            }
-            Ok(Progress::More)
+        DataPhase::Captured | DataPhase::Feeding if state.kind.writes() => {
+            Ok(Progress::Feed(state.job))
         }
         DataPhase::Captured | DataPhase::Preparing => {
-            let _ = files.data_step_once(recovery.job);
+            let _ = files.data_step_once(state.job);
             Ok(Progress::More)
         }
         DataPhase::Ready | DataPhase::TimeDeferred => {
-            recovery.phase = Phase::Ready;
-            save(claim, recovery)?;
+            progress(claim, Phase::Ready, state.job, state.feed_end)?;
             Ok(Progress::Commit)
         }
         DataPhase::Completed | DataPhase::Canceling | DataPhase::Feeding => Err(EIO),
     }
+}
+
+/// Start and its exact rejection have their own bounded frame.
+#[inline(never)]
+fn start(claim: ScalarClaimToken, transport: Transport, kind: DataKind) -> Result<Progress, i32> {
+    let context =
+        crate::shared::with_files(|files| files.data_start_context(claim).map_err(crate::error))?;
+    match context.send_once() {
+        StartResult::Started { phase, job } => {
+            let phase = if matches!(phase, DataPhase::Ready | DataPhase::TimeDeferred) {
+                Phase::Ready
+            } else if kind.writes() {
+                Phase::Feeding
+            } else {
+                Phase::Preparing
+            };
+            progress(claim, phase, job, 0)?;
+            Ok(Progress::More)
+        }
+        StartResult::Rejected(proof) => {
+            crate::shared::with_files(|files| {
+                files
+                    .reject_data_start(proof, crate::error)
+                    .map_err(crate::error)
+            })?;
+            wake(claim.scalar());
+            Ok(Progress::ClaimReleased)
+        }
+        StartResult::Ambiguous(error) => {
+            // Unknown Start retains the same key; exact replay follows.
+            release(claim);
+            if error == Status::Unknown(proto_fs::AUTHENTICATING) {
+                transport
+                    .files()
+                    .finish_binding()
+                    .map_err(|e| crate::error(e.into()))?;
+            }
+            Ok(Progress::ClaimReleased)
+        }
+    }
+}
+
+/// The owned feed copy has a separate frame from the preparation driver.
+#[inline(never)]
+fn feed(claim: ScalarClaimToken, job: u64) -> Result<(), i32> {
+    let context =
+        crate::shared::with_files(|files| files.data_feed_context(claim).map_err(crate::error))?;
+    if context.send_once().is_ok() {
+        progress(claim, Phase::Feeding, job, context.end())?;
+    }
+    Ok(())
 }
 
 /// The final defer contains one native Commit and local revocation before handlers.
@@ -309,12 +348,10 @@ fn commit(claim: ScalarClaimToken) -> Result<(), i32> {
     let defer = Defer::enter();
     let result = (|| {
         let context = crate::shared::with_files(|files| {
-            let mut recovery = files
-                .data_claim_snapshot(claim)
-                .map_err(crate::error)?
-                .recovery;
-            recovery.phase = Phase::Committing;
-            files.update_data(claim, recovery).map_err(crate::error)?;
+            let state = files.data_claim_state(claim).map_err(crate::error)?;
+            files
+                .set_data_progress(claim, Phase::Committing, state.job, state.feed_end)
+                .map_err(crate::error)?;
             files.data_commit_context(claim).map_err(crate::error)
         })?;
         // Query and ReadResult run after this defer; completed bytes remain server-resident.
@@ -329,13 +366,13 @@ fn commit(claim: ScalarClaimToken) -> Result<(), i32> {
 #[inline(never)]
 fn cache(claim: ScalarClaimToken, transport: Transport, outcome: DataOutcome) -> Result<bool, i32> {
     let snapshot =
-        crate::shared::with_files(|files| files.data_claim_snapshot(claim).map_err(crate::error))?;
+        crate::shared::with_files(|files| files.data_claim_state(claim).map_err(crate::error))?;
     let mut bytes = [0; proto_fs::MAX_READ];
     let count = match outcome.result {
-        DataResult::Bytes(n) if snapshot.recovery.kind().reads() => n as usize,
+        DataResult::Bytes(n) if snapshot.kind.reads() => n as usize,
         _ => 0,
     };
-    if snapshot.recovery.kind().reads()
+    if snapshot.kind.reads()
         && matches!(outcome.result, DataResult::Bytes(_))
         && transport
             .files()
@@ -357,11 +394,8 @@ fn cache(claim: ScalarClaimToken, transport: Transport, outcome: DataOutcome) ->
 #[inline(never)]
 fn terminal_exhausted(token: ScalarToken, owner: OwnerToken) -> Result<(), i32> {
     crate::shared::with_files(|files| {
-        let proof = files
-            .exhausted_data_cleanup_authority(token, owner)
-            .map_err(crate::error)?;
         files
-            .begin_data_terminal_cleanup(token, owner, proof)
+            .begin_data_exhausted_cleanup(token, owner)
             .map_err(crate::error)
     })?;
     wake(token);
@@ -375,13 +409,14 @@ fn terminal_retired(claim: ScalarClaimToken, owner: OwnerToken) -> Result<(), i3
             .data_terminal_query_context(claim)
             .map_err(crate::error)
     })?;
-    use posix_fs::data::TerminalQueryResult;
-    if let TerminalQueryResult::Retired(proof) =
-        context.query_once().map_err(|e| crate::error(e.into()))?
+    use posix_fs::data::TerminalSmallQueryResult;
+    if let TerminalSmallQueryResult::Retired(marker) = context
+        .query_small_once()
+        .map_err(|e| crate::error(e.into()))?
     {
         crate::shared::with_files(|files| {
             files
-                .begin_data_terminal_cleanup(claim.scalar(), owner, proof)
+                .begin_data_terminal_cleanup_from_query(claim.scalar(), owner, &context, marker)
                 .map_err(crate::error)
         })?;
         wake(claim.scalar());
@@ -391,14 +426,17 @@ fn terminal_retired(claim: ScalarClaimToken, owner: OwnerToken) -> Result<(), i3
     Ok(())
 }
 
+#[inline(never)]
 fn cleanup(token: ScalarToken) {
     let context =
         crate::shared::with_files(|files| files.begin_data_cleanup(token).map_err(crate::error));
     if let Ok(context) = context
-        && let Ok(proof) = context.send_once()
+        && let Ok(proof) = context.send_small_once()
     {
         let _ = crate::shared::with_files(|files| {
-            files.finish_data_cleanup(proof).map_err(crate::error)
+            files
+                .finish_data_cleanup_from_context(&context, proof)
+                .map_err(crate::error)
         });
         wake(token);
     }
@@ -475,14 +513,12 @@ pub(crate) fn help() {
         Ok(token)
     });
     let Ok(Some(token)) = candidate else { return };
-    let snapshot =
-        crate::shared::with_files(|files| files.data_snapshot(token).map_err(crate::error));
+    let snapshot = crate::shared::with_files(|files| files.data_state(token).map_err(crate::error));
     let Ok(snapshot) = snapshot else { return };
     for lifetime in [snapshot.owner, snapshot.claimant].into_iter().flatten() {
         let _ = crate::relibc::detach_ended_open_owner(lifetime.value());
     }
-    let snapshot =
-        crate::shared::with_files(|files| files.data_snapshot(token).map_err(crate::error));
+    let snapshot = crate::shared::with_files(|files| files.data_state(token).map_err(crate::error));
     let Ok(snapshot) = snapshot else { return };
     if snapshot.owner.is_none()
         || snapshot.result.is_some()
@@ -491,17 +527,19 @@ pub(crate) fn help() {
         cleanup(token);
         return;
     }
-    if snapshot.recovery.phase != Phase::Committing || snapshot.claimant.is_some() {
+    if snapshot.progress != Phase::Committing || snapshot.claimant.is_some() {
         return;
     }
     let Ok(helper) = owner() else { return };
     let claimed = crate::shared::with_files(|files| {
         Ok((
-            files.claim_data(token, helper).map_err(crate::error)?,
+            files
+                .claim_data_token(token, helper)
+                .map_err(crate::error)?,
             files.transport(),
         ))
     });
-    if let Ok((ScalarClaim::Acquired { token: claim, .. }, transport)) = claimed {
+    if let Ok((ScalarClaimState::Acquired(claim), transport)) = claimed {
         let query = crate::shared::with_files(|files| {
             files.data_query_context(claim).map_err(crate::error)
         });
