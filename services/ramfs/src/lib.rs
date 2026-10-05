@@ -596,6 +596,7 @@ impl<'a> Ram<'a> {
     ) -> Result<TentativeOpen, u32> {
         let allowed = 3
             | proto_fs::DIRECTORY_ONLY
+            | proto_fs::CHANGES
             | proto_fs::CREATE
             | proto_fs::EXCLUSIVE
             | proto_fs::TRUNCATE
@@ -612,6 +613,9 @@ impl<'a> Ram<'a> {
         } else {
             false
         };
+        if flags & proto_fs::CHANGES != 0 && (creation.is_some() || !self.file(token).is_device()) {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
         let node = self.storage.node(token)?;
         let access = flags & 3;
         if created && node.links != 0 {
@@ -2647,5 +2651,117 @@ mod tests {
         );
         ram.release(&mut sessions[0]);
         assert!(ram.open(&mut one_more, "/etc/motd", READ_ONLY).is_ok());
+    }
+    #[test]
+    fn paid_open_preserves_device_only_changes_profile() {
+        use crate::open::Journal;
+        use crate::resolve::{Intent, Progress, Resolve};
+        use crate::storage::{ROOT, Root};
+        let bytes = test_image(&[
+            entry("/dev", DIRECTORY | 0o755, 0),
+            entry("/dev/null", REGULAR | 0o666, 2),
+            entry("/dev/urandom", REGULAR | 0o666, 2),
+            entry("/dev/other", REGULAR | 0o666, 2),
+        ]);
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let identity = authority::Identity {
+            uid: 0,
+            gid: 0,
+            groups: proto_process::Groups::EMPTY,
+        };
+        let mut fds = Fds {
+            root: Root {
+                id: 800,
+                generation: 1,
+            },
+            ..Fds::default()
+        };
+        for (path, extra, expected) in [
+            (b"/dev/null".as_slice(), WRITE_ONLY, Ok(())),
+            (b"/dev/urandom".as_slice(), READ_WRITE, Ok(())),
+            (
+                b"/dev/other".as_slice(),
+                READ_ONLY,
+                Err(proto_fs::INVALID_ARGUMENT),
+            ),
+            (
+                b"/dev".as_slice(),
+                READ_ONLY,
+                Err(proto_fs::INVALID_ARGUMENT),
+            ),
+            (
+                b"/dev/null".as_slice(),
+                proto_fs::DIRECTORY_ONLY,
+                Err(proto_fs::NOT_DIRECTORY),
+            ),
+        ] {
+            let flags = extra | proto_fs::CHANGES;
+            let mut journal = Journal::new(flags, 0, 0).unwrap();
+            let intent = Intent::Open { flags };
+            let mut resolver =
+                Resolve::with_intent(&mut ram.storage, path, ROOT, identity, intent).unwrap();
+            for _ in 0..2000 {
+                if matches!(
+                    resolver.step(&mut ram.storage, identity).unwrap(),
+                    Progress::Found(_)
+                ) {
+                    break;
+                }
+            }
+            let proof = resolver
+                .result_proof(&ram.storage, identity, intent)
+                .unwrap();
+            let target = proof.target.unwrap();
+            let before_node = *ram.storage.node(target).unwrap();
+            let mut charge = ram.storage.charge_preparation(fds.root).unwrap();
+            let before_usage = ram.storage.usage(fds.root);
+            let before_epoch = ram.storage.state.epoch;
+            let before_generations = ram.description_generations;
+            let result = journal.prepare(&mut ram, &mut fds, proof, identity, &mut charge);
+            assert_eq!(result.map(|_| ()), expected);
+            if result.is_ok() {
+                let proof = resolver
+                    .result_proof(&ram.storage, identity, intent)
+                    .unwrap();
+                let held = journal
+                    .commit(&mut ram, &mut fds, Some(proof), identity, &mut charge, 20)
+                    .unwrap();
+                assert_eq!(
+                    journal.commit(&mut ram, &mut fds, None, identity, &mut charge, 99),
+                    Ok(held)
+                );
+                let fd = ram.publish_open(&mut fds, held).unwrap();
+                assert_eq!(ram.write(&mut fds, fd, b"device"), Ok(6));
+                assert_eq!(ram.size(&fds, fd), Ok(0));
+                ram.close(&mut fds, fd).unwrap();
+            }
+            assert_eq!(ram.storage.usage(fds.root), before_usage);
+            assert_eq!(ram.open_descriptions(), 0);
+            assert_eq!(ram.storage.state.epoch, before_epoch);
+            let after_node = ram.storage.node(target).unwrap();
+            assert_eq!(after_node.times, before_node.times);
+            assert_eq!(after_node.length, before_node.length);
+            assert_eq!(after_node.mode, before_node.mode);
+            assert_eq!(after_node.pins, before_node.pins);
+            if expected.is_err() {
+                assert_eq!(ram.description_generations, before_generations);
+            }
+            ram.storage.release_preparation(charge);
+            resolver.release(&mut ram.storage);
+        }
+        for change in [
+            proto_fs::CREATE,
+            proto_fs::EXCLUSIVE,
+            proto_fs::TRUNCATE,
+            proto_fs::APPEND,
+            proto_fs::NO_FOLLOW,
+        ] {
+            assert!(matches!(
+                Journal::new(proto_fs::CHANGES | change, 0, 0),
+                Err(proto_fs::INVALID_ARGUMENT)
+            ));
+        }
+        assert_eq!(ram.storage.preparations_used(), 0);
     }
 }
