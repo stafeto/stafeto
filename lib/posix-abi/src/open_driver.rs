@@ -5,7 +5,8 @@
 
 use crate::constants::*;
 use posix_fs::open::{
-    Abandoned, Claim, ClaimToken, OpenPhase, OpenToken, OwnerToken, Phase, Recovery, WaitValue,
+    Abandoned, Claim, ClaimToken, FinalizeRecovery, FinalizeResult, OpenPhase, OpenToken,
+    OwnerToken, Phase, Recovery, WaitValue,
 };
 use posix_fs::{DescriptorFlags, Transport};
 use proto_wire::Status;
@@ -46,16 +47,17 @@ pub(crate) fn open(
     descriptor_flags: DescriptorFlags,
 ) -> Result<u32, i32> {
     let owner = OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)?;
-    let (token, claim) = crate::shared::with_files(|files| {
+    let (token, mut claim) = crate::shared::with_files(|files| {
         files
-            .begin_open_record(owner, flags & 3)
+            .begin_open_record(owner, flags & 3, descriptor_flags)
             .map_err(crate::error)
     })?;
-    let mut recovery = Recovery {
-        access: (flags & 3) as u8,
-        ..Recovery::default()
-    };
+    let mut recovery = Recovery::starting(flags & 3, descriptor_flags).map_err(crate::error)?;
     let files = transport.files();
+    enum FinalPhase {
+        Published(u32),
+        Prepared(Status),
+    }
     let result = (|| {
         recovery.job = files
             .open_start(key(token), path, flags, mode, umask)
@@ -65,44 +67,91 @@ pub(crate) fn open(
         while !files.open_advance(recovery.job, false).map_err(protocol)? {}
         recovery.phase = Phase::Preparing;
         save(claim, recovery)?;
-        while !files.open_advance(recovery.job, true).map_err(protocol)? {}
-        let _defer = Defer::enter();
-        let final_result = (|| {
-            crate::shared::with_files(|files| {
-                files
-                    .reserve_open_record(claim, descriptor_flags)
-                    .map_err(crate::error)
-            })?;
-            recovery.phase = Phase::Committing;
-            save(claim, recovery)?;
-            let held = files.open_commit_once(recovery.job).map_err(protocol)?;
-            recovery = recovery.remember(held);
-            save(claim, recovery)?;
-            let target =
-                Transport::opened_target(held, recovery.access as u32).map_err(crate::error)?;
-            crate::shared::with_files(|files| {
-                files.stage_open_record(claim, target).map_err(crate::error)
-            })?;
-            let finished = files.open_finish_once(key(token)).map_err(protocol)?;
-            if finished != held {
-                return Err(EIO);
+        loop {
+            // Binding and preparation retries run without a numeric reservation or defer.
+            while !files.open_advance(recovery.job, true).map_err(protocol)? {}
+            let defer = Defer::enter();
+            let final_result = (|| {
+                let (entry, context) = crate::shared::with_files(|files| {
+                    let entry = files.reserve_open_record(claim).map_err(crate::error)?;
+                    let context = files
+                        .begin_open_finalize(claim, entry)
+                        .map_err(crate::error)?;
+                    Ok((entry, context))
+                })?;
+                recovery.phase = Phase::Committing;
+                let finished = match context.send_once() {
+                    FinalizeResult::Finished(held) => Ok(held),
+                    FinalizeResult::Deferred { proof, reason } => {
+                        crate::shared::with_files(|files| {
+                            files
+                                .unreserve_open_record(claim, entry, proof)
+                                .map_err(crate::error)?;
+                            Ok(())
+                        })?;
+                        recovery.phase = Phase::Preparing;
+                        return Ok(FinalPhase::Prepared(reason));
+                    }
+                    FinalizeResult::Rejected(error) => return Err(protocol(error)),
+                    FinalizeResult::Unresolved(context) => match context.query_once() {
+                        FinalizeRecovery::Finished(held) => Ok(held),
+                        FinalizeRecovery::Prepared(proof) => {
+                            crate::shared::with_files(|files| {
+                                files
+                                    .unreserve_open_record(claim, entry, proof)
+                                    .map_err(crate::error)?;
+                                Ok(())
+                            })?;
+                            recovery.phase = Phase::Preparing;
+                            return Ok(FinalPhase::Prepared(Status::Ok));
+                        }
+                        FinalizeRecovery::Failed(_) => Err(EIO),
+                    },
+                }?;
+                recovery = recovery.remember(finished);
+                save(claim, recovery)?;
+                let target = Transport::opened_target(finished, recovery.access as u32)
+                    .map_err(crate::error)?;
+                crate::shared::with_files(|files| {
+                    files
+                        .stage_open_record(claim, target)
+                        .map_err(crate::error)?;
+                    files.publish_open_record(claim).map_err(crate::error)?;
+                    files
+                        .ack_open_record(token, owner)
+                        .map_err(crate::error)?
+                        .into_result()
+                })
+                .map(FinalPhase::Published)
+            })();
+            if final_result.is_err() {
+                // Deferred handlers encounter cleanup with its final claim already revoked.
+                let _ = crate::shared::with_files(|files| {
+                    files.begin_open_cancel(claim).map_err(crate::error)
+                });
             }
-            crate::shared::with_files(|files| {
-                files.publish_open_record(claim).map_err(crate::error)?;
-                files
-                    .ack_open_record(token, owner)
-                    .map_err(crate::error)?
-                    .into_result()
-            })
-        })();
-        if final_result.is_err() {
-            // Revoke the claim before deferred handlers can encounter Pending.
-            let _ = crate::shared::with_files(|files| {
-                files.begin_open_cancel(claim).map_err(crate::error)
-            });
+            wake(token);
+            drop(defer);
+            match final_result? {
+                FinalPhase::Published(fd) => return Ok(fd),
+                FinalPhase::Prepared(reason) => {
+                    claim = crate::shared::with_files(|files| {
+                        match files
+                            .claim_open_record(token, owner)
+                            .map_err(crate::error)?
+                        {
+                            Claim::Acquired { token, .. } => Ok(token),
+                            _ => Err(EIO),
+                        }
+                    })?;
+                    if reason == Status::Unknown(proto_fs::AUTHENTICATING) {
+                        files.finish_binding().map_err(protocol)?;
+                    } else {
+                        rt::sys::yield_now().map_err(|error| protocol(Status::Kernel(error)))?;
+                    }
+                }
+            }
         }
-        wake(token);
-        final_result
     })();
     if let Err(errno) = result {
         let _ =
@@ -127,6 +176,7 @@ pub(crate) fn open(
     }
     result
 }
+
 fn save(claim: ClaimToken, recovery: Recovery) -> Result<(), i32> {
     crate::shared::with_files(|files| {
         files

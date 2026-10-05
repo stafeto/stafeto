@@ -138,6 +138,31 @@ pub enum OpenOutcome {
     Finished(PreparedOpen),
 }
 
+/// A canonical first final request retained its preparation without a file effect.
+pub struct OpenNoEffect {
+    key: proto_fs::OpenKey,
+    session: abi::Handle,
+    code: u32,
+}
+
+impl OpenNoEffect {
+    pub fn matches_request(&self, key: proto_fs::OpenKey, session: abi::Handle) -> bool {
+        self.key == key && self.session == session
+    }
+
+    pub fn status(&self) -> Status {
+        Status::from_code(self.code)
+    }
+}
+
+/// One native Finish request has no automatic binding or preparation retry.
+pub enum OpenFinalizeAttempt {
+    Finished(PreparedOpen),
+    Deferred(OpenNoEffect),
+    Rejected(Status),
+    Ambiguous(Status),
+}
+
 pub struct Files {
     channel: Handle<Channel>,
     uart: Option<Handle<Channel>>,
@@ -364,6 +389,39 @@ impl Files {
     pub fn open_finish_once(&self, key: proto_fs::OpenKey) -> Result<PreparedOpen, Status> {
         let reply = self.open_key_once(Method::OpenFinish, key)?;
         Self::open_commit_reply(&reply)
+    }
+
+    /// Finalize a preparation atomically; an uncertain reply requires exact Query recovery.
+    pub fn open_finalize_once(&self, key: proto_fs::OpenKey) -> OpenFinalizeAttempt {
+        match self.open_key_once(Method::OpenFinish, key) {
+            Ok(reply) => Self::open_finalize_reply(&reply, key, self.channel.raw()),
+            Err(error) => OpenFinalizeAttempt::Ambiguous(error),
+        }
+    }
+
+    fn open_finalize_reply(
+        reply: &sys::Reply,
+        key: proto_fs::OpenKey,
+        session: abi::Handle,
+    ) -> OpenFinalizeAttempt {
+        let code = match Self::reply_code(reply) {
+            Ok(code) => code,
+            Err(error) => return OpenFinalizeAttempt::Ambiguous(error),
+        };
+        if code == 0 {
+            return match Self::open_commit_reply(reply) {
+                Ok(held) => OpenFinalizeAttempt::Finished(held),
+                Err(error) => OpenFinalizeAttempt::Ambiguous(error),
+            };
+        }
+        if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
+            return OpenFinalizeAttempt::Ambiguous(Status::BadSize);
+        }
+        if matches!(code, proto_fs::AUTHENTICATING | proto_fs::TIME_DEFERRED) {
+            OpenFinalizeAttempt::Deferred(OpenNoEffect { key, session, code })
+        } else {
+            OpenFinalizeAttempt::Rejected(Status::from_code(code))
+        }
     }
 
     pub fn open_query_once(&self, key: proto_fs::OpenKey) -> Result<OpenOutcome, Status> {
@@ -1262,5 +1320,101 @@ impl Files {
         let reply = self.open_key_once(method, key)?;
         let mut buffer = [0; MESSAGE_MAX];
         proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+}
+
+#[cfg(test)]
+mod finalize_reply_tests {
+    use super::*;
+    fn key() -> proto_fs::OpenKey {
+        proto_fs::OpenKey {
+            slot: 2,
+            generation: 9,
+        }
+    }
+    fn session() -> abi::Handle {
+        abi::Handle::new(7, 9)
+    }
+    fn reply(len: usize, first: u64, second: u64) -> sys::Reply {
+        let mut words = [0; 8];
+        words[0] = first;
+        words[1] = second;
+        sys::Reply {
+            len,
+            words,
+            handles: crate::handle::Incoming::none(),
+        }
+    }
+    #[test]
+    fn canonical_no_effect_receipt_binds_request_and_transport_generations() {
+        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+            let r = reply(8, code as u64, 0);
+            let OpenFinalizeAttempt::Deferred(receipt) =
+                Files::open_finalize_reply(&r, key(), session())
+            else {
+                panic!("canonical receipt");
+            };
+            assert_eq!(receipt.status(), Status::Unknown(code));
+            assert!(receipt.matches_request(key(), session()));
+            assert!(!receipt.matches_request(
+                proto_fs::OpenKey {
+                    slot: 2,
+                    generation: 10
+                },
+                session()
+            ));
+            assert!(!receipt.matches_request(key(), abi::Handle::new(7, 10)));
+        }
+    }
+    #[test]
+    fn malformed_no_effect_envelopes_remain_ambiguous() {
+        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+            for len in [0, 4, 7, 9, 12, 16, 32] {
+                assert!(matches!(
+                    Files::open_finalize_reply(&reply(len, code as u64, 0), key(), session()),
+                    OpenFinalizeAttempt::Ambiguous(_)
+                ));
+            }
+            assert!(matches!(
+                Files::open_finalize_reply(&reply(8, code as u64 | 1 << 32, 0), key(), session()),
+                OpenFinalizeAttempt::Ambiguous(_)
+            ));
+        }
+    }
+    #[test]
+    fn completed_finalization_requires_the_exact_descriptor_envelope() {
+        let held = PreparedOpen {
+            fd: 3,
+            slot: 127,
+            generation: 11,
+            random: true,
+        };
+        let first = (held.marked_fd() as u64) << 32;
+        assert!(
+            matches!(Files::open_finalize_reply(&reply(16, first, held.generation), key(), session()), OpenFinalizeAttempt::Finished(found) if found == held)
+        );
+        for len in [8, 15, 17, 32] {
+            assert!(matches!(
+                Files::open_finalize_reply(&reply(len, first, held.generation), key(), session()),
+                OpenFinalizeAttempt::Ambiguous(_)
+            ));
+        }
+        for (packed, generation) in [(first, 0), (35u64 << 32, 1), (first | 1 << 60, 1)] {
+            assert!(matches!(
+                Files::open_finalize_reply(&reply(16, packed, generation), key(), session()),
+                OpenFinalizeAttempt::Ambiguous(_)
+            ));
+        }
+    }
+    #[test]
+    fn canonical_terminal_refusal_creates_no_prepared_receipt() {
+        assert!(matches!(
+            Files::open_finalize_reply(
+                &reply(8, proto_fs::ACCESS_DENIED as u64, 0),
+                key(),
+                session()
+            ),
+            OpenFinalizeAttempt::Rejected(Status::Unknown(proto_fs::ACCESS_DENIED))
+        ));
     }
 }

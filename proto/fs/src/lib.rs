@@ -170,7 +170,7 @@ pub const OPEN_RETIRED: u32 = 319;
 pub const FILE_TOO_LARGE: u32 = 320;
 /// A SetId outcome requires a genuine loader abort before another execution attempt.
 pub const IMAGE_ABORT_REQUIRED: u32 = 321;
-/// This exact Commit made no effect while its paid record awaits Clock.
+/// This exact final request made no effect while its paid record awaits Clock.
 pub const TIME_DEFERRED: u32 = 325;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

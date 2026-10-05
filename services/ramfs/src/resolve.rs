@@ -346,6 +346,19 @@ impl Resolve {
             epoch: self.epoch,
         })
     }
+    /// Current-directory paths use the authentic retained search result.
+    pub fn cwd_proof(
+        &self,
+        storage: &Storage<'_>,
+        identity: Identity,
+    ) -> Result<crate::cwd::CwdProof, u32> {
+        let proof = self.result_proof(storage, identity, Intent::Lookup { follow: true })?;
+        Ok(crate::cwd::CwdProof {
+            target: proof.target.ok_or(NO_ENTRY)?,
+            identity,
+            epoch: self.epoch,
+        })
+    }
     /// Metadata proofs preserve the requested follow and real/effective search role.
     pub fn metadata_proof(
         &self,
