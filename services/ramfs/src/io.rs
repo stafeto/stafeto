@@ -16,6 +16,12 @@ pub(crate) struct Held {
     capacity: u64,
 }
 
+impl Held {
+    pub(crate) fn description(&self) -> Token {
+        self.description
+    }
+}
+
 fn io_capacity(file: File) -> u64 {
     if matches!(file, File::Scratch) {
         crate::FILE_CAPACITY as u64
@@ -53,7 +59,7 @@ impl Ram<'_> {
         })
     }
 
-    fn io_validate(&self, held: &Held) -> Result<(), u32> {
+    pub(crate) fn io_validate(&self, held: &Held) -> Result<(), u32> {
         let shared = self.descriptions[held.description.slot as usize]
             .as_ref()
             .filter(|shared| shared.generation == held.description.generation)
