@@ -544,7 +544,12 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
         &[],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
+    (
+        "posix-procs",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["pending-open"],
+    ),
     // Pieces of 64 KiB: the probe's forks copy regions past one piece.
     ("loader", "loader", 0, &["small-pieces"]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),

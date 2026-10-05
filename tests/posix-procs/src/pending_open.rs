@@ -6,7 +6,7 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
-use posix_fs::open::{ClaimToken, Completion, OpenToken, OwnerToken, Recovery};
+use posix_fs::open::{Claim, ClaimToken, Completion, OpenPhase, OpenToken, OwnerToken, Recovery};
 use posix_fs::{DescriptorFlags, Target};
 
 #[derive(Clone, Copy)]
@@ -271,4 +271,119 @@ pub extern "C" fn files_pending_dup(source: i32, target: i32, flags: i32) -> i32
         posix_abi::dup3(source, target, posix_abi::constants::O_CLOEXEC)
     };
     result.unwrap_or_else(|errno| -errno)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn files_pending_child_empty() -> i32 {
+    let result = (|| {
+        let pending = state()?;
+        posix_abi::shared::with_files(|files| {
+            if files.open_snapshot(pending.token).is_ok() || files.target(pending.fd).is_ok() {
+                return Err(5);
+            }
+            Ok(())
+        })
+    })();
+    result.err().unwrap_or(0)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn files_pending_parent_live() -> i32 {
+    let result = (|| {
+        let pending = state()?;
+        let transport = posix_abi::shared::with_files(|files| {
+            let snapshot = files
+                .open_snapshot(pending.token)
+                .map_err(posix_abi::error)?;
+            if snapshot.owner != Some(pending.owner) || snapshot.claimant != Some(pending.owner) {
+                return Err(5);
+            }
+            Ok(files.transport())
+        })?;
+        if !matches!(
+            transport.files().open_query(proto_fs::OpenKey {
+                slot: pending.token.slot() as u32,
+                generation: pending.token.generation(),
+            }),
+            Ok(rt::fs::OpenOutcome::Active { phase: 3, .. })
+        ) {
+            return Err(5);
+        }
+        Ok(())
+    })();
+    result.err().unwrap_or(0)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn files_pending_release_original() -> i32 {
+    state()
+        .and_then(|pending| {
+            posix_abi::shared::with_files(|files| {
+                files
+                    .release_open_claim(pending.claim)
+                    .map_err(posix_abi::error)
+            })
+        })
+        .err()
+        .unwrap_or(0)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn files_pending_claim() -> i32 {
+    let result = (|| {
+        let pending = state()?;
+        let helper = OwnerToken::new(posix_abi::relibc::open_owner()?).map_err(|_| 5)?;
+        posix_abi::shared::with_files(|files| {
+            if !matches!(
+                files.claim_open_record(pending.token, helper),
+                Ok(Claim::Acquired { .. })
+            ) {
+                return Err(5);
+            }
+            Ok(())
+        })
+    })();
+    result.err().unwrap_or(0)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn files_pending_claimant_status() -> i32 {
+    let result = (|| {
+        let pending = state()?;
+        let snapshot = posix_abi::shared::with_files(|files| {
+            files.open_snapshot(pending.token).map_err(posix_abi::error)
+        })?;
+        if snapshot.owner != Some(pending.owner) || snapshot.phase != OpenPhase::Reserved {
+            return Err(5);
+        }
+        let Some(helper) = snapshot.claimant else {
+            return Ok(1);
+        };
+        if helper == pending.owner {
+            return Err(5);
+        }
+        let (_, native) = posix_abi::relibc::target((helper.value() & 63) + 1)?;
+        Ok(
+            if rt::sys::thread_info(&native).map_err(|_| 5)?.state == rt::abi::ThreadState::Ended {
+                2
+            } else {
+                0
+            },
+        )
+    })();
+    result.unwrap_or(-1)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn files_pending_reclaim_original() -> i32 {
+    let result = (|| {
+        let mut pending = state()?;
+        pending.claim = posix_abi::shared::with_files(|files| {
+            match files
+                .claim_open_record(pending.token, pending.owner)
+                .map_err(posix_abi::error)?
+            {
+                Claim::Acquired { token, .. } => Ok(token),
+                _ => Err(5),
+            }
+        })?;
+        // SAFETY: the native helper ended; only the supervisor updates fixture metadata.
+        unsafe { *PENDING.0.get() = Some(pending) };
+        files_pending_parent_live().eq(&0).then_some(()).ok_or(5)
+    })();
+    result.err().unwrap_or(0)
 }

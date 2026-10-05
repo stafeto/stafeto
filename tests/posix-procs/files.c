@@ -53,6 +53,8 @@ int main(void) {
 #endif
     int pending = check_pending_dup();
     if (pending) { printf("posix-files: Pending dup failed %d\n", pending); return 19; }
+    pending = check_pending_claimant();
+    if (pending) { printf("posix-files: Pending claimant failed %d\n", pending); return 22; }
     pending = check_pending_ended();
     if (pending) { printf("posix-files: Pending Ended failed %d\n", pending); return 20; }
     puts("posix-files: identity and proofs ok"); return 0;

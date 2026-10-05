@@ -10,7 +10,7 @@
 #[used]
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
-#[cfg(feature = "files")]
+#[cfg(feature = "pending-open")]
 mod pending_open;
 
 #[cfg(feature = "loader-abort")]

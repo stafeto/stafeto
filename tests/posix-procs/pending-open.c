@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/wait.h>
 extern int files_pending_begin(int, int);
 extern int files_pending_waiting(void);
 extern int files_pending_finish(int, int);
@@ -11,6 +12,12 @@ extern int files_pending_dup(int, int, int);
 extern void files_pending_end(void);
 extern int files_pending_owner_status(void);
 extern int files_pending_ended_clean(void);
+extern int files_pending_child_empty(void);
+extern int files_pending_parent_live(void);
+extern int files_pending_release_original(void);
+extern int files_pending_claim(void);
+extern int files_pending_claimant_status(void);
+extern int files_pending_reclaim_original(void);
 struct pending_worker { int source, target, flags, result; int entered, done; };
 static struct pending_worker *pending_signal_worker;
 static int pending_signal_entered, pending_signal_result, pending_signal_duplicate;
@@ -101,6 +108,58 @@ static int check_pending_dup(void) {
     return 0;
 }
 struct pending_owner { int source, target, ready; };
+struct pending_gated_worker { struct pending_worker work; int go; };
+static void *pending_gated_duplicate(void *argument) {
+    struct pending_gated_worker *work = argument;
+    while (!__atomic_load_n(&work->go, __ATOMIC_SEQ_CST)) pending_pause();
+    return pending_duplicate(&work->work);
+}
+static void *pending_end_claimant(void *argument) {
+    struct pending_owner *helper = argument;
+    helper->target = files_pending_claim();
+    __atomic_store_n(&helper->ready, 1, __ATOMIC_SEQ_CST);
+    files_pending_end();
+    return NULL;
+}
+static int check_pending_claimant(void) {
+    int source = open("/etc/motd", O_RDONLY);
+    if (source < 0) return 1;
+    int target = files_pending_begin(source, 0);
+    if (target < 0 || files_pending_release_original()) return 2;
+    struct pending_gated_worker work = {.work = {.source = source, .target = target}};
+    pthread_t duplicate;
+    if (pthread_create(&duplicate, NULL, pending_gated_duplicate, &work)) return 3;
+    struct pending_owner helper = {0};
+    pthread_t native_helper;
+    if (pthread_create(&native_helper, NULL, pending_end_claimant, &helper)) return 4;
+    int ended = 0;
+    for (int retry = 0; retry < 500; ++retry) {
+        if (__atomic_load_n(&helper.ready, __ATOMIC_SEQ_CST) && files_pending_claimant_status() == 2) {
+            ended = 1; break;
+        }
+        pending_pause();
+    }
+    if (!ended || helper.target) return 5;
+    __atomic_store_n(&work.go, 1, __ATOMIC_SEQ_CST);
+    int released = 0;
+    for (int retry = 0; retry < 500; ++retry) {
+        if (__atomic_load_n(&work.work.done, __ATOMIC_SEQ_CST)) return 6;
+        if (files_pending_claimant_status() == 1 && files_pending_waiting() > 0) {
+            released = 1; break;
+        }
+        pending_pause();
+    }
+    if (!released || files_pending_reclaim_original()) return 7;
+    if (files_pending_finish(0, -1)) return 8;
+    if (pthread_join(duplicate, NULL) || work.work.result != target) return 9;
+    if (files_pending_ack(0, target)) return 10;
+    char bytes[3];
+    if (read(target, bytes, 3) != 3 || memcmp(bytes, "sta", 3)) return 11;
+    if (close(target) || close(source)) return 12;
+    /* The native Ended claimant retains its relibc allocation until process exit. */
+    puts("posix-files: native Ended claimant releases claim and preserves live Open ok");
+    return 0;
+}
 static void *pending_end_owner(void *argument) {
     struct pending_owner *owner = argument;
     owner->target = files_pending_begin(owner->source, 0);

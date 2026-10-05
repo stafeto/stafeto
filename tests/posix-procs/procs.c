@@ -202,6 +202,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if PENDING_OPEN_PROBE
+#include "pending-fork.c"
+#endif
+
 /* The spawn-flags the process service takes are those of Linux, which
  * relibc's header gives (proto_process::SPAWN_SETPGROUP, SPAWN_SETSID). */
 _Static_assert(POSIX_SPAWN_SETPGROUP == 0x02 && POSIX_SPAWN_SETSID == 0x80,
@@ -1834,6 +1838,9 @@ static int channel_child(const char *name);
 #endif
 
 static int role(const char *name) {
+#if PENDING_OPEN_PROBE
+    if (strcmp(name, "pendingfork") == 0) return check_pending_fork();
+#endif
 #if JOB_CONTROL_PROBE
     if (strcmp(name, "jobcontrol") == 0) return job_control();
     if (strcmp(name, "jobexec-local") == 0) return job_after_exec(0);
@@ -2427,6 +2434,9 @@ static void forks(void) {
     expect("a fork of a program init started", stafeto_probe_fork_bare(bare_park, NULL, NULL), -ENOSYS);
     run_role("/bin/procs-child", "forkbare", NULL);
     run_role("/bin/procs-child", "forkfull", NULL);
+#if PENDING_OPEN_PROBE
+    run_role("/bin/procs-child", "pendingfork", NULL);
+#endif
     run_role("/bin/procs-child", "forkthreads", NULL);
     run_role("/bin/procs-child", "forkthread", NULL);
     run_role("/bin/procs-child", "forkwaits", NULL);
