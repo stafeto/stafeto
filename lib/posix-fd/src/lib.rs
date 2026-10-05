@@ -859,6 +859,32 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
         Ok(entry)
     }
 
+    /// Return an exact reservation to preparation after a proven remote no-effect result.
+    /// The caller validates that result and supplies its next recovery state under the same lock.
+    /// This revokes the final-phase claim and preserves the numeric entry generation.
+    pub fn unreserve_open(
+        &mut self,
+        claim: ClaimToken,
+        expected: EntryToken,
+        recovery: R,
+    ) -> Result<EntryToken, Error> {
+        let mut record = self.claimed(claim)?;
+        if record.owner.is_none() {
+            return Err(Error::InvalidArgument);
+        }
+        let Phase::Reserved { entry, .. } = record.phase else {
+            return Err(Error::InvalidArgument);
+        };
+        if entry != expected || !self.reserved(claim.open, entry) {
+            return Err(Error::Io);
+        }
+        self.entries[entry.fd as usize].state = EntryState::Empty;
+        record.phase = Phase::Preparing(recovery);
+        record.claimant = None;
+        self.save(claim.open, record);
+        Ok(entry)
+    }
+
     pub fn stage_committed(&mut self, claim: ClaimToken, backend: T) -> Result<(), Error> {
         let mut record = self.claimed(claim)?;
         let Phase::Reserved {
@@ -1364,6 +1390,227 @@ mod tests {
         assert_eq!(table.get(entry.fd), Ok(10));
         assert_eq!(table.close(source), Ok(None));
         assert_eq!(table.close(entry.fd), Ok(Some(10)));
+    }
+
+    #[test]
+    fn deferred_open_allows_handler_replacement_and_keeps_exact_attempt() {
+        let mut table = Table::<u32, 3, u64>::default();
+        let source = table.insert(90, Flags::default()).unwrap();
+        let (open, claim) = table.begin_open(owner(1), 700).unwrap();
+        let flags = Flags {
+            close_on_exec: true,
+            close_on_fork: true,
+        };
+        let first = table.reserve_open(claim, 0, flags).unwrap();
+        assert_eq!(
+            table.try_dup2(source, first.fd),
+            Ok(Replacement::Pending(open))
+        );
+        let before = table.wait_snapshot(open).unwrap();
+        assert_eq!(table.unreserve_open(claim, first, 701), Ok(first));
+        assert_ne!(table.wait_snapshot(open).unwrap(), before);
+        assert_eq!(table.pending(first.fd), None);
+        let snapshot = table.open_snapshot(open).unwrap();
+        assert_eq!(snapshot.owner, Some(owner(1)));
+        assert_eq!(snapshot.claimant, None);
+        assert_eq!(snapshot.phase, OpenPhase::Preparing);
+        assert_eq!(snapshot.recovery, Some(701));
+        assert_eq!(table.open_tokens().count(), 1);
+        assert_eq!(table.open_tokens().next(), Some(open));
+        assert_eq!(
+            table.stage_committed(claim, 20),
+            Err(Error::BadFileDescriptor)
+        );
+        // A handler can replace the released number before the same attempt continues.
+        assert_eq!(table.dup2(source, first.fd), Ok((first.fd, None)));
+        assert_eq!(table.get(first.fd), Ok(90));
+        let next = acquired(table.claim_open(open, owner(1)).unwrap());
+        assert!(next.serial > claim.serial);
+        let second = table.reserve_open(next, 0, flags).unwrap();
+        assert_ne!(second.fd, first.fd);
+        table.stage_committed(next, 20).unwrap();
+        table.publish_open(next).unwrap();
+        assert_eq!(
+            table.ack_open(open, owner(1)),
+            Ok(Completion::Opened(second.fd))
+        );
+        assert_eq!(table.get(first.fd), Ok(90));
+        assert_eq!(table.get(second.fd), Ok(20));
+        assert_eq!(table.flags(second.fd), Ok(flags));
+    }
+
+    #[test]
+    fn unreserve_checks_exact_entry_claim_and_phase_before_any_change() {
+        let mut table = Table::<u32, 2, u64>::default();
+        let (open, first_claim) = table.begin_open(owner(1), 70).unwrap();
+        let first = table
+            .reserve_open(first_claim, 0, Flags::default())
+            .unwrap();
+        let before = table.open_snapshot(open).unwrap();
+        let sequence = table.wait_snapshot(open).unwrap();
+        for wrong in [
+            EntryToken::new(1, first.generation()),
+            EntryToken::new(first.fd, first.generation() + 1),
+        ] {
+            assert_eq!(table.unreserve_open(first_claim, wrong, 99), Err(Error::Io));
+            assert_eq!(table.open_snapshot(open).unwrap(), before);
+            assert_eq!(table.wait_snapshot(open).unwrap(), sequence);
+            assert_eq!(table.pending(first.fd), Some(open));
+        }
+        table.release_claim(first_claim).unwrap();
+        let next = acquired(table.claim_open(open, owner(2)).unwrap());
+        let before = table.open_snapshot(open).unwrap();
+        assert_eq!(
+            table.unreserve_open(first_claim, first, 99),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.open_snapshot(open).unwrap(), before);
+        table.unreserve_open(next, first, 71).unwrap();
+        let next = acquired(table.claim_open(open, owner(2)).unwrap());
+        let before = table.open_snapshot(open).unwrap();
+        assert_eq!(
+            table.unreserve_open(next, first, 99),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(table.open_snapshot(open).unwrap(), before);
+        let second = table.reserve_open(next, 0, Flags::default()).unwrap();
+        assert_eq!(second.fd, first.fd);
+        assert!(second.generation() > first.generation());
+        let before = table.open_snapshot(open).unwrap();
+        assert_eq!(table.unreserve_open(next, first, 99), Err(Error::Io));
+        assert_eq!(table.open_snapshot(open).unwrap(), before);
+        assert_eq!(table.pending(second.fd), Some(open));
+        table.stage_committed(next, 10).unwrap();
+        let before = table.open_snapshot(open).unwrap();
+        assert_eq!(
+            table.unreserve_open(next, second, 99),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(table.open_snapshot(open).unwrap(), before);
+        table.publish_open(next).unwrap();
+        assert_eq!(
+            table.unreserve_open(next, second, 99),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.get(second.fd), Ok(10));
+    }
+
+    #[test]
+    fn deferred_open_keeps_paid_hold_and_ended_owner_cleanup() {
+        let mut table = Table::<u32, 32, u64>::default();
+        let mut last = None;
+        for i in 0..32 {
+            let (open, claim) = table.begin_open(owner(1), i).unwrap();
+            let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+            table.unreserve_open(claim, entry, i).unwrap();
+            last = Some((open, claim, entry));
+        }
+        assert_eq!(table.begin_open(owner(2), 99), Err(Error::TooManyOpenFiles));
+        assert_eq!(table.vacant(0), Ok(0));
+        let (open, old_claim, entry) = last.unwrap();
+        let new_claim = acquired(table.claim_open(open, owner(2)).unwrap());
+        table.abandon_open(open).unwrap();
+        assert_eq!(
+            table.unreserve_open(old_claim, entry, 99),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(
+            table.unreserve_open(new_claim, entry, 99),
+            Err(Error::BadFileDescriptor)
+        );
+        // Drain all ended-owner attempts through the canonical cancellation path.
+        while let Some(abandoned) = table.abandon_owner(owner(1)) {
+            assert!(matches!(abandoned, Abandoned::Recover { .. }));
+        }
+        let mut tokens = [None; 32];
+        for (slot, token) in table.open_tokens().enumerate() {
+            tokens[slot] = Some(token);
+        }
+        for token in tokens.into_iter().flatten() {
+            let claim = acquired(table.claim_open(token, owner(3)).unwrap());
+            table.begin_cancel(claim).unwrap();
+            assert_eq!(table.finish_cancel(token, 5), Ok(None));
+        }
+        assert_eq!(table.open_tokens().count(), 0);
+        assert!(table.begin_open(owner(2), 99).is_ok());
+    }
+
+    #[test]
+    fn unreserve_preserves_reused_mapping_and_ended_owner_reservation() {
+        let mut table = Table::<u32, 2, u64>::default();
+        let (open, claim) = table.begin_open(owner(1), 70).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        // An inconsistent late entry must preserve the replacement's ownership.
+        table.entries[entry.fd as usize].state = EntryState::Open(Entry {
+            backend: 90,
+            flags: Flags::default(),
+        });
+        let before = table.open_snapshot(open).unwrap();
+        let sequence = table.wait_snapshot(open).unwrap();
+        assert_eq!(table.unreserve_open(claim, entry, 99), Err(Error::Io));
+        assert_eq!(table.get(entry.fd), Ok(90));
+        assert_eq!(table.open_snapshot(open).unwrap(), before);
+        assert_eq!(table.wait_snapshot(open).unwrap(), sequence);
+        let mut table = Table::<u32, 2, u64>::default();
+        let (open, claim) = table.begin_open(owner(1), 70).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        table.abandon_open(open).unwrap();
+        let helper = acquired(table.claim_open(open, owner(2)).unwrap());
+        let before = table.open_snapshot(open).unwrap();
+        let sequence = table.wait_snapshot(open).unwrap();
+        assert_eq!(
+            table.unreserve_open(helper, entry, 99),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(table.pending(entry.fd), Some(open));
+        assert_eq!(table.open_snapshot(open).unwrap(), before);
+        assert_eq!(table.wait_snapshot(open).unwrap(), sequence);
+        table.begin_cancel(helper).unwrap();
+        assert_eq!(table.finish_cancel(open, 5), Ok(None));
+        assert_eq!(table.vacant(0), Ok(entry.fd));
+    }
+
+    #[test]
+    fn unreserve_preserves_terminal_generation_and_claim_limits() {
+        let mut table = Table::<u32, 1, u64>::default();
+        table.entries[0].generation = u64::MAX - 1;
+        let (open, claim) = table.begin_open(owner(1), 70).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        assert_eq!(entry.generation(), u64::MAX);
+        table.unreserve_open(claim, entry, 71).unwrap();
+        let next = acquired(table.claim_open(open, owner(1)).unwrap());
+        assert_eq!(
+            table.reserve_open(next, 0, Flags::default()),
+            Err(Error::Io)
+        );
+        assert_eq!(table.open_snapshot(open).unwrap().recovery, Some(71));
+        table.begin_cancel(next).unwrap();
+        table.finish_cancel(open, 5).unwrap();
+        table.ack_open(open, owner(1)).unwrap();
+        let mut table = Table::<u32, 1, u64>::default();
+        let (open, claim) = table.begin_open(owner(1), 80).unwrap();
+        let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
+        let Held::Open(record) = &mut table.holds[0].held else {
+            panic!("open")
+        };
+        record.serial = u64::MAX - 1;
+        let final_claim = ClaimToken {
+            open,
+            serial: u64::MAX - 1,
+        };
+        table.unreserve_open(final_claim, entry, 81).unwrap();
+        assert!(matches!(
+            table.claim_open(open, owner(2)),
+            Ok(Claim::Canceling(_))
+        ));
+        assert_eq!(table.pending(entry.fd), None);
+        assert_eq!(
+            table.unreserve_open(claim, entry, 82),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.open_snapshot(open).unwrap().recovery, Some(81));
+        table.finish_cancel(open, 5).unwrap();
+        assert_eq!(table.ack_open(open, owner(1)), Ok(Completion::Failed(5)));
     }
 
     #[test]
