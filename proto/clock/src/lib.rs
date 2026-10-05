@@ -27,7 +27,7 @@
 //! service never saw, so SET and OBSERVE take effect once with no journal.
 
 #![no_std]
-use proto_wire::Header;
+use proto_wire::{Header, Reader, Status};
 pub const VERSION: u16 = 5;
 pub const REALTIME: u32 = 0;
 pub const MONOTONIC: u32 = 1;
@@ -70,6 +70,51 @@ impl Method {
     }
 }
 pub const METHODS: &[u16] = &[1, 2, 5, 6, 7, 10, 11, 12];
+
+/// Decode the complete PAGE reply before accepting custody of its memory.
+pub fn decode_page_reply(bytes: &[u8], handle_count: usize) -> Result<(), Status> {
+    let mut reader = Reader::new(bytes);
+    let status = Status::from_code(reader.u32()?);
+    reader.finish()?;
+    let expected_handles = usize::from(status == Status::Ok);
+    if handle_count != expected_handles {
+        return Err(Status::BadSize);
+    }
+    match status {
+        Status::Ok => Ok(()),
+        error => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    #[test]
+    fn page_success_requires_one_handle_and_the_complete_status_word() {
+        let bytes = 0_u32.to_le_bytes();
+        assert_eq!(decode_page_reply(&bytes, 1), Ok(()));
+        for count in [0, 2, usize::MAX] {
+            assert_eq!(decode_page_reply(&bytes, count), Err(Status::BadSize));
+        }
+        for length in 0..4 {
+            assert_eq!(decode_page_reply(&bytes[..length], 1), Err(Status::BadSize));
+        }
+        assert_eq!(decode_page_reply(&[0, 0, 0, 0, 1], 1), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn page_failure_preserves_status_and_rejects_attached_handles_or_bytes() {
+        let bytes = PERMISSION.to_le_bytes();
+        let denied = Status::from_code(PERMISSION);
+        assert_eq!(decode_page_reply(&bytes, 0), Err(denied));
+        for count in [1, 2, usize::MAX] {
+            assert_eq!(decode_page_reply(&bytes, count), Err(Status::BadSize));
+        }
+        let trailing = [bytes[0], bytes[1], bytes[2], bytes[3], 0];
+        assert_eq!(decode_page_reply(&trailing, 0), Err(Status::BadSize));
+    }
+}
 
 /// The page of the CLOCK_REALTIME anchor (spec 2, 3.6): a counter s and
 /// two places. The service writes place (s + 1) mod 2 word by word, then
