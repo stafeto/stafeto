@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,23 @@
     return 1; } } while (0)
 extern int t6_runtime_counts(uint32_t out[4]);
 extern int t6_runtime_stage(int fd);
+
+struct executable_header {
+    unsigned char e_ident[16];
+    uint16_t e_type, e_machine;
+    uint32_t e_version;
+    uint64_t e_entry, e_phoff, e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+};
+struct executable_part {
+    uint32_t p_type, p_flags;
+    uint64_t p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align;
+};
+_Static_assert(sizeof(struct executable_header) == 64, "ELF64 header size");
+_Static_assert(offsetof(struct executable_header, e_phentsize) == 54, "ELF64 program entry size offset");
+_Static_assert(sizeof(struct executable_part) == 56, "ELF64 program entry size");
+_Static_assert(offsetof(struct executable_part, p_filesz) == 32, "ELF64 segment file size offset");
 
 
 int files_loader_abort_sleep(void) {
@@ -118,14 +136,17 @@ static int runtime(int parent_read, int child_read, int grand_read, int events) 
 static int copy_image(void) {
     int source = open("/bin/posix-files", O_RDONLY);
     CHECK(source >= 0);
-    Elf64_Ehdr header;
+    struct executable_header header;
     CHECK(pread(source, &header, sizeof(header), 0) == (ssize_t)sizeof(header));
+    printf("t6-runtime: ELF header %02x%02x%02x%02x size %u phsize %u phnum %u\n",
+           header.e_ident[0], header.e_ident[1], header.e_ident[2], header.e_ident[3],
+           (unsigned)sizeof(header), header.e_phentsize, header.e_phnum);
     CHECK(memcmp(header.e_ident, "\177ELF", 4) == 0 &&
-          header.e_phentsize == sizeof(Elf64_Phdr) && header.e_phnum > 0 && header.e_phnum <= 16);
-    uint64_t extent = header.e_phoff + header.e_phnum * sizeof(Elf64_Phdr);
+          header.e_phentsize == sizeof(struct executable_part) && header.e_phnum > 0 && header.e_phnum <= 16);
+    uint64_t extent = header.e_phoff + header.e_phnum * sizeof(struct executable_part);
     unsigned loads = 0;
     for (unsigned i = 0; i < header.e_phnum; ++i) {
-        Elf64_Phdr part;
+        struct executable_part part;
         CHECK(pread(source, &part, sizeof(part),
                     (off_t)(header.e_phoff + i * sizeof(part))) == (ssize_t)sizeof(part));
         if (part.p_type == PT_LOAD) {
