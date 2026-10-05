@@ -18,10 +18,10 @@ const RAM_BASE: Record = Record {
     }),
     priority: 40,
     ceiling: 40,
-    // 4096 data pages + 913 metadata/PT_LOAD data pages + 7 rodata
-    // and 28 code pages + 12 stack + 128 allowance before runtime allocations.
-    // The measured VERSION9 ImageHold ELF requires these mapped page counts.
-    quota: (4096 + 913 + 7 + 28 + 12 + 128) * PAGE,
+    // 4096 data pages + 915 metadata/PT_LOAD data pages + 9 rodata
+    // and 33 code pages + 12 stack + 128 allowance before runtime allocations.
+    // The measured VERSION12 Data steps ELF requires these mapped page counts.
+    quota: (4096 + 915 + 9 + 33 + 12 + 128) * PAGE,
     handle_limit: 512,
     restart: Restart::Never,
     console: true,
@@ -182,10 +182,20 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
     },
 ];
 
+#[cfg(not(feature = "data-carrier-probe"))]
+const RAM_POSIX_FILES: Record = RAM_CLOCKED;
+#[cfg(feature = "data-carrier-probe")]
+const RAM_POSIX_FILES: Record = Record {
+    // The steps,auth-probe ELF maps 10 RO + 36 RX + 925 RW pages.
+    // Data pages, stack and allowance are paid separately in this fixture.
+    quota: (4096 + 971 + 12 + 128) * PAGE,
+    ..RAM_CLOCKED
+};
+
 /// The authentic identity and bounded file proof fixture, before public mutation APIs.
 #[cfg(not(any(feature = "ramfs-cleanup", feature = "loader-abort")))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
-    RAM_CLOCKED,
+    RAM_POSIX_FILES,
     POSIX_ABI_TABLE[1],
     POSIX_ABI_TABLE[2],
     Record {

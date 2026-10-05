@@ -16,6 +16,7 @@ bench = false
 [features]
 jobs = []
 auth-probe = ["files"]
+data-carrier-probe = ["files"]
 ipc-loss = ["files"]
 files = ["pending-open"]
 pending-open = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt", "dep:posix-fs", "dep:posix-sync"]

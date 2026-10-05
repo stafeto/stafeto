@@ -8,6 +8,7 @@
 extern int files_fake_identity(void);
 extern int files_full_sessions(void);
 extern int files_open_stages(void);
+extern int files_data_stages(void);
 #include "pending-open.c"
 #include "open-policy.c"
 #if LOADER_ABORT_PROBE
@@ -50,6 +51,9 @@ int main(void) {
     int staged = files_open_stages();
     if (staged) { printf("posix-files: staged Open failed %d\n", staged); return 14; }
     puts("posix-files: staged CREATE/TRUNC cached outcome and hidden fd ok");
+    int data = files_data_stages();
+    if (data) { printf("posix-files: Data stages failed %d\n", data); return 24; }
+    puts("posix-files: paid Data bytes, replay, exact lease and cleanup ok");
     if (files_full_sessions()) return 12;
     puts("posix-files: 16 sessions with 32 retained descriptors ok");
 #if LOADER_ABORT_PROBE

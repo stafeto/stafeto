@@ -12,6 +12,7 @@ pub mod authority;
 pub mod cwd;
 #[cfg(test)]
 mod cwd_tests;
+pub mod data;
 pub mod directory;
 #[cfg(test)]
 mod directory_tests;

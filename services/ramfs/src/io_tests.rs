@@ -635,3 +635,151 @@ fn scratch_last_byte_and_exact_limit_truncate_preserve_the_fixed_capacity() {
     ));
     assert_eq!(ram.storage.usage(FIRST).pages, 1);
 }
+
+#[test]
+fn lease_admission_checks_full_token_and_survives_bare_fd_reuse_before_feed() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (mut fds, fd, original) = create(&mut ram, FIRST, b"lease-original");
+    let expected = ram.description_token(&fds, fd).unwrap();
+    let refs = ram.descriptions[expected.slot as usize].unwrap().refs;
+    assert!(matches!(
+        ram.capture_data_lease(
+            &fds,
+            fd,
+            Token {
+                slot: expected.slot + 1,
+                ..expected
+            }
+        ),
+        Err(BAD_FD)
+    ));
+    assert_eq!(ram.descriptions[expected.slot as usize].unwrap().refs, refs);
+    let lease = ram.capture_data_lease(&fds, fd, expected).unwrap();
+    ram.close(&mut fds, fd).unwrap();
+    let (_, _, replacement) = create(&mut ram, SECOND, b"lease-replacement");
+    assert_eq!(
+        ram.insert(
+            &mut fds,
+            Open {
+                file: File::Node(replacement),
+                offset: 0,
+                flags: READ_WRITE
+            }
+        )
+        .unwrap(),
+        fd
+    );
+    let mut prep = match ram.prepare_write_held(lease, b"old", None) {
+        Ok(prep) => prep,
+        Err(_) => panic!("held preparation"),
+    };
+    while !prep.step(&mut ram).unwrap() {}
+    assert_eq!(
+        prep.commit(&mut ram, proto_fs::Timestamp::new(4, 0).unwrap()),
+        Ok(3)
+    );
+    assert_eq!(ram.storage.node(replacement).unwrap().length, 0);
+    assert_eq!(ram.get(&fds, fd).unwrap().offset, 0);
+    assert_eq!(ram.storage.usage(FIRST).pages, 1);
+    assert_eq!(ram.storage.usage(SECOND).pages, 0);
+    let mut out = [0; 3];
+    bytes(&ram, original, 0, &mut out);
+    assert_eq!(out, *b"old");
+    while !prep.cancel(&mut ram).unwrap() {}
+    assert!(ram.descriptions[expected.slot as usize].is_none());
+}
+
+#[test]
+fn held_refusal_returns_cleanup_and_refresh_keeps_original_description() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (mut fds, fd, _) = create(&mut ram, FIRST, b"lease-refresh");
+    write(&mut ram, &fds, fd, None, b"abc", 1);
+    let expected = ram.description_token(&fds, fd).unwrap();
+    let lease = ram.capture_data_lease(&fds, fd, expected).unwrap();
+    let (code, mut lease) = match ram.prepare_write_held(lease, b"x", Some(u64::MAX)) {
+        Err(error) => error,
+        Ok(_) => panic!("signed offset"),
+    };
+    assert_eq!(code, proto_fs::OFFSET_OVERFLOW);
+    assert_eq!(ram.descriptions[expected.slot as usize].unwrap().refs, 2);
+    ram.seek(&mut fds, fd, 0).unwrap();
+    let mut out = [0; 2];
+    assert_eq!(
+        ram.read_held(&lease, None, &mut out, proto_fs::Timestamp::ZERO),
+        Err(STALE_PROOF)
+    );
+    lease.refresh(&ram).unwrap();
+    assert_eq!(
+        ram.read_held(
+            &lease,
+            None,
+            &mut out,
+            proto_fs::Timestamp::new(-1, 0).unwrap()
+        ),
+        Ok(2)
+    );
+    assert_eq!(out, *b"ab");
+    assert_eq!(ram.get(&fds, fd).unwrap().offset, 2);
+    assert_eq!(
+        ram.read_held(&lease, None, &mut out, proto_fs::Timestamp::ZERO),
+        Err(STALE_PROOF)
+    );
+    lease.cancel(&mut ram);
+    assert_eq!(ram.descriptions[expected.slot as usize].unwrap().refs, 1);
+}
+
+#[test]
+fn regression_held_eof_and_zero_read_preserve_exact_time_and_offset() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (mut fds, fd, token) = create(&mut ram, FIRST, b"review-read");
+    write(&mut ram, &fds, fd, None, b"abc", 1);
+    let id = ram.description_token(&fds, fd).unwrap();
+    let mut lease = ram.capture_data_lease(&fds, fd, id).unwrap();
+    let now = proto_fs::Timestamp::new(-7, 123).unwrap();
+    let mut out = [0; 1];
+    assert_eq!(ram.read_held(&lease, None, &mut out, now), Ok(0));
+    assert_eq!(ram.storage.node(token).unwrap().times[0], now);
+    assert_eq!(ram.get(&fds, fd).unwrap().offset, 3);
+    let later = proto_fs::Timestamp::new(99, 3).unwrap();
+    assert_eq!(ram.read_held(&lease, None, &mut [], later), Ok(0));
+    assert_eq!(ram.storage.node(token).unwrap().times[0], now);
+    ram.seek(&mut fds, fd, 1).unwrap();
+    lease.refresh(&ram).unwrap();
+    assert_eq!(ram.read_held(&lease, Some(0), &mut out, later), Ok(1));
+    assert_eq!(out, [b'a']);
+    assert_eq!(ram.get(&fds, fd).unwrap().offset, 1);
+    assert_eq!(ram.storage.node(token).unwrap().times[0], later);
+    lease.cancel(&mut ram);
+    assert_eq!(ram.descriptions[id.slot as usize].unwrap().refs, 1);
+}
+
+#[test]
+fn regression_held_truncate_after_fd_reuse_retains_inode_and_cleanup() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (mut fds, fd, original) = create(&mut ram, FIRST, b"review-truncate");
+    write(&mut ram, &fds, fd, None, b"abcdef", 1);
+    let id = ram.description_token(&fds, fd).unwrap();
+    let lease = ram.capture_data_lease(&fds, fd, id).unwrap();
+    let (code, lease) = match ram.prepare_truncate_held(lease, 1024 * 1024 * 8 + 1) {
+        Err(pair) => pair,
+        Ok(_) => panic!("over capacity"),
+    };
+    assert_eq!(code, FILE_TOO_LARGE);
+    assert_eq!(ram.descriptions[id.slot as usize].unwrap().refs, 2);
+    ram.close(&mut fds, fd).unwrap();
+    let replacement = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
+    assert_eq!(replacement, fd);
+    let mut prep = match ram.prepare_truncate_held(lease, 2) {
+        Ok(value) => value,
+        Err(_) => panic!("exact retained truncate"),
+    };
+    while !prep.step(&mut ram).unwrap() {}
+    let stamp = proto_fs::Timestamp::new(-4, 5).unwrap();
+    assert_eq!(prep.commit(&mut ram, stamp), Ok(2));
+    assert_eq!(prep.commit(&mut ram, proto_fs::Timestamp::ZERO), Ok(2));
+    assert_eq!(ram.storage.node(original).unwrap().length, 2);
+    assert_eq!(ram.storage.node(original).unwrap().times[1], stamp);
+    assert_eq!(ram.get(&fds, fd).unwrap().offset, 0);
+    while !prep.cancel(&mut ram).unwrap() {}
+    assert!(ram.descriptions[id.slot as usize].is_none());
+}

@@ -13,7 +13,7 @@ fn key() -> proto_fs::OpenKey {
     }
 }
 
-fn prepared(files: &Files, id: u64) -> Result<(), Status> {
+pub(super) fn prepared(files: &Files, id: u64) -> Result<(), Status> {
     for prepare in [false, true] {
         let mut completed = false;
         for _ in 0..2000 {
@@ -289,7 +289,7 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
     }
     Ok(())
 }
-fn clone_bound(files: &Files, numbers: &[u32]) -> Result<Files, Status> {
+pub(super) fn clone_bound(files: &Files, numbers: &[u32]) -> Result<Files, Status> {
     let mut request = proto_wire::Writer::new();
     proto_fs::Method::Clone.header().write(&mut request)?;
     request.u32(numbers.len() as u32)?;
