@@ -516,9 +516,10 @@ impl Fs {
                 .iter()
                 .position(|b| b.as_ref().is_some_and(|(label, _)| *label == outcome.label))
             {
-                let (_, mut image) = self.births[i].take().unwrap();
-                self.drop_identity(&mut image);
-                self.ram.release(&mut image);
+                let (_, image) = self.births[i].as_mut().expect("retained image birth");
+                Self::drop_identity_fields(&mut self.ram, self.identities, image);
+                self.ram.release(image);
+                self.births[i] = None;
             }
             self.places.release(outcome.label);
         } else if let Some(identity) = self
@@ -2026,12 +2027,20 @@ impl Fs {
         Ok(())
     }
     fn drop_identity(&mut self, fds: &mut Fds) {
+        Self::drop_identity_fields(&mut self.ram, self.identities, fds);
+    }
+    /// Disjoint fields allow a retained birth to release its authority in place.
+    fn drop_identity_fields(
+        ram: &mut Ram<'_>,
+        identities: &mut [Option<IdentityChannel>; SESSIONS],
+        fds: &mut Fds,
+    ) {
         if let Some(root) = fds.binding_preparation.take() {
-            self.ram.storage.release_preparation(root);
+            ram.storage.release_preparation(root);
         }
         fds.binding_source = None;
         if fds.authority_index != NONE {
-            self.identities[fds.authority_index as usize] = None;
+            identities[fds.authority_index as usize] = None;
             fds.authority_index = NONE;
         }
     }
