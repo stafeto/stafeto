@@ -8,6 +8,7 @@
 extern int files_fake_identity(void);
 extern int files_full_sessions(void);
 extern int files_open_stages(void);
+#include "pending-open.c"
 #if LOADER_ABORT_PROBE
 #include "loader-abort.c"
 #endif
@@ -50,5 +51,9 @@ int main(void) {
 #if LOADER_ABORT_PROBE
     if (files_loader_abort()) return 13;
 #endif
+    int pending = check_pending_dup();
+    if (pending) { printf("posix-files: Pending dup failed %d\n", pending); return 19; }
+    pending = check_pending_ended();
+    if (pending) { printf("posix-files: Pending Ended failed %d\n", pending); return 20; }
     puts("posix-files: identity and proofs ok"); return 0;
 }

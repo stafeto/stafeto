@@ -4,7 +4,9 @@
 //! Resident Open ownership precedes every request; final handoff has a bounded defer.
 
 use crate::constants::*;
-use posix_fs::open::{Abandoned, ClaimToken, OpenPhase, OpenToken, OwnerToken, Phase, Recovery};
+use posix_fs::open::{
+    Abandoned, Claim, ClaimToken, OpenPhase, OpenToken, OwnerToken, Phase, Recovery, WaitValue,
+};
 use posix_fs::{DescriptorFlags, Transport};
 use proto_wire::Status;
 
@@ -99,6 +101,7 @@ pub(crate) fn open(
                 files.begin_open_cancel(claim).map_err(crate::error)
             });
         }
+        wake(token);
         final_result
     })();
     if let Err(errno) = result {
@@ -117,6 +120,7 @@ pub(crate) fn open(
                 .map_err(crate::error)?;
             Ok(None)
         });
+        wake(token);
         if let Ok(Some(completion)) = completion {
             return completion.into_result();
         }
@@ -136,7 +140,7 @@ pub(crate) fn detach(owner: u64) {
     let Ok(owner) = OwnerToken::new(owner) else {
         return;
     };
-    let _ = crate::shared::with_files(|files| {
+    let notified = crate::shared::with_files(|files| {
         let mut tokens = [None; posix_fs::OPEN_MAX];
         for (slot, token) in files.open_tokens().enumerate() {
             tokens[slot] = Some(token);
@@ -170,8 +174,22 @@ pub(crate) fn detach(owner: u64) {
                 }
             }
         }
-        Ok(())
+        Ok(tokens)
     });
+    if let Ok(tokens) = notified {
+        for token in tokens.into_iter().flatten() {
+            wake(token);
+        }
+    }
+}
+
+/// Wake uses the pinned header after releasing FILES_LOCK, including exact slot reuse.
+fn wake(token: OpenToken) {
+    let address =
+        crate::shared::with_files(|files| files.open_wait_address(token).map_err(crate::error));
+    if let Ok(address) = address {
+        posix_sync::futex_wake(address as *const core::sync::atomic::AtomicU32, u32::MAX);
+    }
 }
 
 /// One exact cleanup request, without authority to begin Start or Commit.
@@ -200,10 +218,97 @@ pub(crate) fn help() {
     let Some((transport, token)) = pending else {
         return;
     };
+    cancel_pending(transport, token);
+}
+
+fn cancel_pending(transport: Transport, token: OpenToken) {
+    let Ok(helper) =
+        crate::relibc::open_owner().and_then(|owner| OwnerToken::new(owner).map_err(|_| EIO))
+    else {
+        return;
+    };
+    let ready = crate::shared::with_files(|files| {
+        let snapshot = files.open_snapshot(token).map_err(crate::error)?;
+        if snapshot.phase == OpenPhase::Canceling {
+            return Ok(true);
+        }
+        if snapshot.owner.is_some() {
+            return Ok(false);
+        }
+        match files
+            .claim_open_record(token, helper)
+            .map_err(crate::error)?
+        {
+            Claim::Acquired { token: claim, .. } => {
+                files.begin_open_cancel(claim).map_err(crate::error)?;
+                Ok(true)
+            }
+            Claim::Canceling(_) => Ok(true),
+            Claim::Busy(_) | Claim::Complete(_) => Ok(false),
+        }
+    });
+    if ready != Ok(true) {
+        return;
+    }
     if transport.files().open_cancel_key_once(key(token)).is_ok() {
         let _ = crate::shared::with_files(|files| {
             let _snapshot = files.finish_open_cancel(token, EIO).map_err(crate::error)?;
             Ok(())
         });
+        wake(token);
+    }
+}
+
+/// A live operation retains its final-phase ownership while a conflicting dup waits.
+pub(crate) fn wait_pending(token: OpenToken) -> Result<(), i32> {
+    let snapshot = crate::shared::with_files(|files| Ok(files.open_snapshot(token).ok()))?;
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    if let Some(owner) = snapshot.owner {
+        let _ = crate::relibc::detach_ended_open_owner(owner.value());
+    }
+    if let Some(helper) = snapshot
+        .claimant
+        .filter(|helper| Some(*helper) != snapshot.owner)
+    {
+        let _ = crate::relibc::detach_ended_open_owner(helper.value());
+    }
+    let pending = crate::shared::with_files(|files| {
+        let Ok(snapshot) = files.open_snapshot(token) else {
+            return Ok(None);
+        };
+        if snapshot.completion.is_some() {
+            return Ok(None);
+        }
+        Ok(Some((
+            snapshot,
+            files.transport(),
+            files.open_wait_address(token).map_err(crate::error)?,
+            files.open_wait_snapshot(token).map_err(crate::error)?,
+        )))
+    })?;
+    let Some((snapshot, transport, address, wait)) = pending else {
+        return Ok(());
+    };
+    if snapshot.phase == OpenPhase::Canceling || snapshot.owner.is_none() {
+        cancel_pending(transport, token);
+    }
+    match wait {
+        WaitValue::Sequence(sequence) => {
+            let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(1_000_000);
+            // SAFETY: FILES remains pinned; its atomic header survives free and reuse.
+            let word = unsafe { &*(address as *const core::sync::atomic::AtomicU32) };
+            match posix_sync::futex_wait(
+                word,
+                sequence,
+                crate::clock::CLOCK_MONOTONIC as u32,
+                Some(deadline),
+            ) {
+                Ok(_) | Err(EAGAIN | ETIMEDOUT) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        WaitValue::NeverSleep => crate::threads::sleep::pause(1_000_000),
     }
 }

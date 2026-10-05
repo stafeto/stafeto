@@ -433,12 +433,7 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                 .map(|value| value as u64)
                 .map_err(crate::error)
         }),
-        Dup2 { source, target } => releasing(|files| {
-            files
-                .take_dup3(source, target, None)
-                .map(|(fd, release)| (fd as u64, release))
-                .map_err(crate::error)
-        }),
+        Dup2 { source, target } => duplicate_replacing(source, target, None),
         Dup3 {
             source,
             target,
@@ -447,16 +442,37 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
             if flags & !((O_CLOEXEC | O_CLOFORK) as u32) != 0 {
                 return Err(EINVAL);
             }
-            let flags = crate::descriptor_flags(flags as i32);
-            releasing(|files| {
-                files
-                    .take_dup3(source, target, Some(flags))
-                    .map(|(fd, release)| (fd as u64, release))
-                    .map_err(crate::error)
-            })
+            duplicate_replacing(source, target, Some(crate::descriptor_flags(flags as i32)))
         }
         // Directory streams are relibc's (getdents on a descriptor).
         _ => Err(ENOSYS),
+    }
+}
+
+/// A tentative numeric target keeps its operation alive while the caller waits unlocked.
+fn duplicate_replacing(
+    source: u32,
+    target: u32,
+    flags: Option<posix_fs::DescriptorFlags>,
+) -> Result<u64, i32> {
+    loop {
+        let (replacement, transport) = process_state(|files| {
+            Ok((
+                files
+                    .try_take_dup3(source, target, flags)
+                    .map_err(crate::error)?,
+                files.transport(),
+            ))
+        })?;
+        match replacement {
+            posix_fs::open::Replacement::Complete { fd, release } => {
+                transport.release(release).map_err(crate::error)?;
+                return Ok(fd as u64);
+            }
+            posix_fs::open::Replacement::Pending(token) => {
+                crate::open_driver::wait_pending(token)?;
+            }
+        }
     }
 }
 
