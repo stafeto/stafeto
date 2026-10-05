@@ -37,7 +37,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 32, 33, 34, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -136,6 +136,10 @@ fn main(_: u64) -> u64 {
     let tables = unsafe { &mut *TABLES.0.get() };
     let mut fs = Fs {
         ram,
+        #[cfg(feature = "image-info-probe")]
+        image_info_backing: Handle::borrowed(backing.raw()),
+        #[cfg(feature = "image-info-probe")]
+        image_info_fault: 0,
         process: Handle::borrowed(start.process.raw()),
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
@@ -164,6 +168,11 @@ fn main(_: u64) -> u64 {
 
 struct Fs {
     ram: Ram<'static>,
+    // The startup-owned backing outlives this service loop and every outgoing copy.
+    #[cfg(feature = "image-info-probe")]
+    image_info_backing: ManuallyDrop<Handle<Memory>>,
+    #[cfg(feature = "image-info-probe")]
+    image_info_fault: u32,
     /// The service's own process, to map the object of a READ_INTO in.
     process: ManuallyDrop<Handle<rt::handle::Process>>,
     /// The service's channel, which its own sessions are copies of, and
@@ -731,6 +740,30 @@ impl Fs {
                 }
                 match self.ram.held_image_information(fds) {
                     Ok(info) => {
+                        #[cfg(feature = "image-info-probe")]
+                        if self.image_info_fault != 0 {
+                            let fault = core::mem::take(&mut self.image_info_fault);
+                            let mut body = proto_wire::Writer::new();
+                            if body.u32(0).and_then(|()| info.write(&mut body)).is_err() {
+                                return Answer::Status(Status::BadSize);
+                            }
+                            let length = body.as_bytes().len() - usize::from(fault == 2);
+                            if r.reply().bytes(&body.as_bytes()[..length]).is_err()
+                                || (fault == 1 && r.reply().u32(0).is_err())
+                            {
+                                return Answer::Status(Status::BadSize);
+                            }
+                            if fault == 3 {
+                                return match sys::handle_duplicate(
+                                    &self.image_info_backing,
+                                    Rights::MAP_READ | Rights::TRANSFER,
+                                ) {
+                                    Ok(copy) => Answer::Reply([copy.erase()].into()),
+                                    Err(error) => Answer::Status(Status::Kernel(error)),
+                                };
+                            }
+                            return Answer::Reply(Outgoing::new());
+                        }
                         let w = r.reply();
                         if w.u32(0).and_then(|()| info.write(w)).is_err() {
                             return Answer::Status(Status::BadSize);
@@ -1003,6 +1036,27 @@ impl Service<0> for Fs {
             if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {
                 return status(proto_fs::RESOLVING);
             }
+        }
+        #[cfg(feature = "image-info-probe")]
+        if r.method() == 0xfff7 {
+            let mut body = r.body();
+            let Ok(fault) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if body.finish().is_err() || !r.handles.is_empty() || !(1..=3).contains(&fault) {
+                return Answer::Status(Status::BadSize);
+            }
+            if self.image_info_fault != 0
+                || !s
+                    .data
+                    .binding
+                    .snapshot_ref()
+                    .is_some_and(|who| who.loader.is_some())
+            {
+                return status(proto_fs::PERMISSION);
+            }
+            self.image_info_fault = fault;
+            return Answer::Status(Status::Ok);
         }
         if first && proto_fs::is_loaders(r.label()) && r.method() == Method::BindPending as u16 {
             return self.pending_admission(r);

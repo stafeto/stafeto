@@ -1169,7 +1169,7 @@ fn load(own: &Own, block: &Block<'_>) -> Result<(u64, Handle<Channel>, Maps), u3
         _ => pl::NO_ENTRY,
     })?;
     let image = open(own, path)?;
-    let size = file_size(&image)?;
+    let size = file_size(own, &image)?;
     let mut head = [0; PAGE as usize];
     let read = read_at(&image, 0, &mut head[..size.min(PAGE) as usize])?;
     let layout =
@@ -1228,17 +1228,48 @@ fn open(own: &Own, path: &[u8]) -> Result<Handle<Channel>, u32> {
 }
 
 /// The size of the file of the image session.
-fn file_size(image: &Handle<Channel>) -> Result<u64, u32> {
+fn file_size(_own: &Own, image: &Handle<Channel>) -> Result<u64, u32> {
     let mut w = Writer::new();
     proto_fs::Method::InfoFd
         .header()
         .write(&mut w)
         .and_then(|()| w.u32(0))
         .map_err(|_| pl::IO)?;
+    #[cfg(feature = "image-info-probe")]
+    let before = sys::process_handles(&_own.process)
+        .map_err(|_| pl::IO)?
+        .live;
     let reply = rt::fs::Files::send_on(image, w.as_bytes()).map_err(|_| pl::IO)?;
     let mut buffer = [0; MESSAGE_MAX];
-    loader_image::image_reply_size(reply.bytes(&mut buffer), reply.handles.len())
-        .map_err(|_| pl::IO)
+    let handles = reply.handles.len();
+    #[cfg(feature = "image-info-probe")]
+    let received = sys::process_handles(&_own.process)
+        .map_err(|_| pl::IO)?
+        .live;
+    #[cfg(feature = "image-info-probe")]
+    let valid_caps = handles == 0
+        || (handles == 1
+            && reply.handles.info(0)
+                == Some((abi::ObjectKind::Memory, Rights::MAP_READ | Rights::TRANSFER)));
+    let size = loader_image::image_reply_size(reply.bytes(&mut buffer), handles);
+    drop(reply);
+    #[cfg(feature = "image-info-probe")]
+    {
+        let after = sys::process_handles(&_own.process)
+            .map_err(|_| pl::IO)?
+            .live;
+        rt::println!(
+            "loader: image info handles={handles} live={before}->{received}->{after} refused={}",
+            size.is_err()
+        );
+        if before != after || received != before + handles as u64 || !valid_caps {
+            return Err(pl::IO);
+        }
+        if handles == 1 {
+            rt::println!("loader: image info extra Memory handle released before refusal");
+        }
+    }
+    size.map_err(|_| pl::IO)
 }
 
 /// ReadAt of the image session into `out` from `offset`, as many requests

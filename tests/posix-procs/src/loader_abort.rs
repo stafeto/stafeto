@@ -90,8 +90,11 @@ pub(super) fn load_image(loader: &Handle<Channel>) -> Result<(), Status> {
     }
     for method in [proto_loader::Method::Go, proto_loader::Method::HandlesDone] {
         let reply = sys::send(loader, &method.header().bytes()).map_err(Status::Kernel)?;
-        if reply.len != 8 || reply.words[0] != 0 || !reply.handles.is_empty() {
+        if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
             return Err(Status::BadSize);
+        }
+        if reply.words[0] != 0 {
+            return Err(Status::from_code(reply.words[0] as u32));
         }
     }
     Ok(())
@@ -156,12 +159,32 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
             }
             rt::println!("posix-files: loader abort retained before {:?}", initial);
             if loaded != 0 {
-                load_image(&loader)?;
-                let ready = counts(&pending)?;
-                if ready[0] != 1 || ready[3] != 1 || ready[4] != 0 {
-                    return Err(Status::BadSize);
+                #[cfg(feature = "image-info-probe")]
+                {
+                    let mut arm = Writer::new();
+                    Header::new(0xfff7, proto_fs::VERSION).write(&mut arm)?;
+                    arm.u32(loaded as u32)?;
+                    let reply = sys::send(&pending, arm.as_bytes()).map_err(Status::Kernel)?;
+                    if reply.len != 8 || reply.words[0] != 0 || !reply.handles.is_empty() {
+                        return Err(Status::BadSize);
+                    }
+                    if load_image(&loader) != Err(Status::from_code(proto_loader::IO)) {
+                        return Err(Status::BadSize);
+                    }
+                    rt::println!(
+                        "posix-files: malformed image metadata {loaded} refused before Ready"
+                    );
                 }
-                rt::println!("posix-files: loader abort loaded capture {:?}", ready);
+                #[cfg(not(feature = "image-info-probe"))]
+                load_image(&loader)?;
+                #[cfg(not(feature = "image-info-probe"))]
+                {
+                    let ready = counts(&pending)?;
+                    if ready[0] != 1 || ready[3] != 1 || ready[4] != 0 {
+                        return Err(Status::BadSize);
+                    }
+                    rt::println!("posix-files: loader abort loaded capture {:?}", ready);
+                }
             }
             abort()?;
             let after = posix_abi::process::client().query()?;
