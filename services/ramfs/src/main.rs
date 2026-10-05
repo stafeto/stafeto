@@ -3036,21 +3036,67 @@ impl Fs {
                 return status(proto_fs::OPEN_RETIRED);
             }
             if r.method() == Method::OpenFinish as u16 {
-                let OpenPhase::Committed { held, .. } =
-                    j.path().open.as_ref().expect("keyed Open").phase
-                else {
-                    return status(proto_fs::RESOLVING);
+                let j = self.jobs[i].as_mut().expect("retained finalization job");
+                let JobOperation::Path(path) = &mut j.operation else {
+                    unreachable!()
                 };
-                if let Err(code) = self.ram.validate_tentative(fds, held) {
-                    return status(code);
+                let open = path.open.as_mut().expect("keyed Open");
+                let first = matches!(open.phase, OpenPhase::Prepared { .. });
+                let held = match open.phase {
+                    OpenPhase::Prepared { held, .. } | OpenPhase::Committed { held, .. } => held,
+                    _ => return status(proto_fs::RESOLVING),
+                };
+                if first && j.authority != fds.binding.stamp() {
+                    return status(proto_fs::STALE_PROOF);
                 }
-                // Preflight the fixed response before transferring the descriptor reference.
-                if matches!(self.finished_reply(fds, r, held, false), Answer::Status(_)) {
+                let publication = match self.ram.preflight_finish_open(fds, key, held) {
+                    Ok(proof) => proof,
+                    Err(code) => return status(code),
+                };
+                let marked_fd = match self.ram.marked_open(fds, held) {
+                    Ok(fd) => fd,
+                    Err(code) => return status(code),
+                };
+                // Reply and receipt are paid before Clock or file effects.
+                if r.reply()
+                    .u32(0)
+                    .and_then(|()| r.reply().u32(marked_fd))
+                    .and_then(|()| r.reply().u64(held.description.generation))
+                    .is_err()
+                {
                     return Answer::Status(Status::BadSize);
                 }
-                if let Err(code) = self.ram.finish_open(fds, key, held) {
-                    return status(code);
+                if first {
+                    let identity = match fds.binding.identity(false) {
+                        Ok(identity) => identity,
+                        Err(code) => return status(code),
+                    };
+                    let proof = match path.resolver.result_proof(
+                        &self.ram.storage,
+                        identity,
+                        Intent::Open { flags: open.flags },
+                    ) {
+                        Ok(proof) => proof,
+                        Err(code) => return status(code),
+                    };
+                    let now = match open.needs_time(&self.ram, fds) {
+                        Ok(false) => proto_fs::Timestamp::ZERO,
+                        Ok(true) => match self.time_source.read_once() {
+                            Ok(Some(now)) => now,
+                            Ok(None) => return status(proto_fs::TIME_DEFERRED),
+                            Err(error) => return Answer::Status(error),
+                        },
+                        Err(code) => return status(code),
+                    };
+                    if let Err(code) =
+                        open.commit(&mut self.ram, fds, Some(proof), identity, &mut j.root, now)
+                    {
+                        return status(code);
+                    }
                 }
+                // Commit does not alter the prepaid descriptor/receipt mappings.
+                let published = self.ram.finish_preflighted(fds, publication);
+                debug_assert_eq!(published, held);
                 let completed = self.jobs[i].take().expect("finished paid Open");
                 let JobOperation::Path(path) = completed.operation else {
                     unreachable!()

@@ -367,6 +367,21 @@ pub struct TentativeOpen {
     pub description: Token,
 }
 
+/// Move-only publication authority, produced before the file effect.
+/// Apply within the same service step and Fds, without changing its descriptors.
+#[derive(Debug)]
+pub struct FinishOpenPreflight {
+    key: proto_fs::OpenKey,
+    held: TentativeOpen,
+    slot: usize,
+    mode: FinishMode,
+}
+#[derive(Debug)]
+enum FinishMode {
+    Publish,
+    Replay,
+}
+
 /// A completed operation owns the precise description in one session slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct OpenReceipt {
@@ -714,6 +729,46 @@ impl<'a> Ram<'a> {
         fds.tentative &= !(1 << slot);
         Ok(held.fd)
     }
+    /// Check receipt and exact descriptor ownership before any file effect.
+    /// The same service step keeps these mappings unchanged until finish_open.
+    pub fn preflight_finish_open(
+        &self,
+        fds: &Fds,
+        key: proto_fs::OpenKey,
+        held: TentativeOpen,
+    ) -> Result<FinishOpenPreflight, u32> {
+        key.validate()?;
+        let (slot, mode) = if fds.open_receipts.iter().any(|receipt| receipt.key == key) {
+            if self.finished_open(fds, key)? != held {
+                return Err(proto_fs::PERMISSION);
+            }
+            ((held.fd - 3) as usize, FinishMode::Replay)
+        } else {
+            (self.tentative_slot(fds, held)?, FinishMode::Publish)
+        };
+        Ok(FinishOpenPreflight {
+            key,
+            held,
+            slot,
+            mode,
+        })
+    }
+    /// Consume a preflight while the exact session mappings remain unchanged.
+    /// Journal.commit only changes file metadata and namespace, preserving them.
+    pub fn finish_preflighted(
+        &mut self,
+        fds: &mut Fds,
+        proof: FinishOpenPreflight,
+    ) -> TentativeOpen {
+        if matches!(proof.mode, FinishMode::Publish) {
+            fds.open_receipts[proof.slot] = OpenReceipt {
+                key: proof.key,
+                description: proof.held.description,
+            };
+            fds.tentative &= !(1 << proof.slot);
+        }
+        proof.held
+    }
     /// The caller validates the exact committed paid job before this handoff.
     /// Receipt storage and the descriptor reference are already paid.
     pub fn finish_open(
@@ -722,22 +777,8 @@ impl<'a> Ram<'a> {
         key: proto_fs::OpenKey,
         held: TentativeOpen,
     ) -> Result<TentativeOpen, u32> {
-        key.validate()?;
-        if fds.open_receipts.iter().any(|receipt| receipt.key == key) {
-            let previous = self.finished_open(fds, key)?;
-            if previous != held {
-                return Err(proto_fs::PERMISSION);
-            }
-            return Ok(previous);
-        }
-        let slot = self.tentative_slot(fds, held)?;
-        // Exact validation completes before the nonfallible publication.
-        fds.open_receipts[slot] = OpenReceipt {
-            key,
-            description: held.description,
-        };
-        fds.tentative &= !(1 << slot);
-        Ok(held)
+        let proof = self.preflight_finish_open(fds, key, held)?;
+        Ok(self.finish_preflighted(fds, proof))
     }
     /// Recover a completed outcome only while this session still owns its reference.
     pub fn finished_open(&self, fds: &Fds, key: proto_fs::OpenKey) -> Result<TentativeOpen, u32> {
