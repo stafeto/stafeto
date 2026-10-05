@@ -100,7 +100,7 @@ fn capture(attempt: &Attempt, fd: i32) -> Result<Handle<Channel>, Status> {
     let mut w = Writer::new();
     proto_fs::Method::Clone.header().write(&mut w)?;
     w.u32(1)?;
-    w.u32(fd)?;
+    w.u32(fd.fd())?;
     let offered = Files::clone_on(&Handle::<Channel>::borrowed(raw), w.as_bytes())?;
     let mut reply = sys::send_handles(
         &attempt.loader,

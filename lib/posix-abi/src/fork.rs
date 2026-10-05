@@ -598,24 +598,21 @@ fn sessions() -> Result<Sessions, i32> {
                     .map_err(clone_errno)?;
             out.clock = clone.into_raw().0;
         }
-        let mut kept = [0; posix_fs::OPEN_MAX];
+        let mut kept = [rt::fs::PreparedOpen {
+            fd: 0,
+            slot: 0,
+            generation: 0,
+            random: false,
+        }; posix_fs::OPEN_MAX];
         let count = crate::shared::kept_by_fork(&mut kept)?;
         let (files, uart) = crate::shared::with_files(|fs| {
             let (files, uart) = fs.sessions();
             Ok((files.raw(), uart.map(Handle::raw)))
         })?;
-        let mut w = Writer::new();
-        proto_fs::Method::Clone
-            .header()
-            .write(&mut w)
-            .map_err(|_| EIO)?;
-        w.u32(count as u32).map_err(|_| EIO)?;
-        for n in &kept[..count] {
-            w.u32(*n).map_err(|_| EIO)?;
-        }
-        // The sessions live as long as the process's files.
-        let clone = rt::fs::Files::clone_on(&Handle::<Channel>::borrowed(files), w.as_bytes())
-            .map_err(clone_errno)?;
+        // The complete captured list is validated before child references exist.
+        let clone =
+            rt::fs::Files::clone_exact_on(&Handle::<Channel>::borrowed(files), &kept[..count])
+                .map_err(clone_errno)?;
         out.files = clone.into_raw().0;
         if let Some(uart) = uart {
             let clone = rt::service::clone_session(

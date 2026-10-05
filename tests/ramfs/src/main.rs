@@ -70,8 +70,9 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let result =
-        check_initialization(&start.parent, &start.process).and_then(|()| check(&start.parent));
+    let result = check_initialization(&start.parent, &start.process)
+        .and_then(|()| check_exact_imports(&start.parent, &start.process))
+        .and_then(|()| check(&start.parent));
     match result {
         Ok(()) => {
             rt::println!("ramfs-probe: ok");
@@ -130,16 +131,16 @@ fn check_initialization(
     let duplicate = [
         posix_fs::Inherited {
             fd: 4,
-            target: posix_fs::Target::Output,
+            target: posix_fs::InheritedTarget::Ready(posix_fs::Target::Output),
         },
         posix_fs::Inherited {
             fd: 4,
-            target: posix_fs::Target::Error,
+            target: posix_fs::InheritedTarget::Ready(posix_fs::Target::Error),
         },
     ];
     let outside = [posix_fs::Inherited {
         fd: OPEN_MAX as u32,
-        target: posix_fs::Target::Input,
+        target: posix_fs::InheritedTarget::Ready(posix_fs::Target::Input),
     }];
     for (cwd, list, expected) in [
         (b"/bad\0cwd".as_slice(), None, FsError::InvalidArgument),
@@ -190,6 +191,171 @@ fn check_initialization(
     if files.cwd() != b"/" || files.descriptors().count() != 3 {
         return Err("initial table state");
     }
+    Ok(())
+}
+
+fn check_exact_imports(
+    parent: &rt::Handle<rt::handle::Channel>,
+    process: &rt::Handle<rt::handle::Process>,
+) -> Result<(), &'static str> {
+    use posix_fs::{Inherited, InheritedTarget, Target};
+    let source = Files::connect(parent).map_err(|_| "import source")?;
+    let fd = source
+        .open("/etc/motd", READ_ONLY)
+        .map_err(|_| "import open")?;
+    let held = source
+        .capture_description(fd)
+        .map_err(|_| "import capture")?
+        .held;
+    let raw = InheritedTarget::RawRam {
+        fd,
+        random_hint: false,
+    };
+    let wrong = posix_fs::RamTarget::from_prepared(rt::fs::PreparedOpen {
+        slot: (held.slot + 1) % 128,
+        ..held
+    })
+    .map_err(|_| "mismatched import token")?;
+    for (last, expected) in [
+        (
+            InheritedTarget::RawRam {
+                fd: 35,
+                random_hint: false,
+            },
+            FsError::BadFileDescriptor,
+        ),
+        (InheritedTarget::Ready(Target::Ram(wrong)), FsError::Io),
+    ] {
+        let before = rt::sys::process_handles(process)
+            .map_err(|_| "import handle baseline")?
+            .live;
+        let channel = Files::clone_exact_on(source.sessions().0, &[held])
+            .map_err(|_| "import failure clone")?;
+        let startup = StartupFiles::from_sessions(channel, None, None, None);
+        let list = [
+            Inherited { fd: 4, target: raw },
+            Inherited {
+                fd: 7,
+                target: last,
+            },
+        ];
+        // SAFETY: no native guard owns this startup allocation.
+        let destination = unsafe { (*FILES.0.get()).as_mut_ptr() };
+        // SAFETY: the full allocation is uninitialized and exclusive.
+        unsafe {
+            destination
+                .cast::<u8>()
+                .write_bytes(0xa5, core::mem::size_of::<PosixFs>())
+        };
+        // SAFETY: the allocation is aligned, exclusive and retains no initialized fields.
+        if unsafe { PosixFs::initialize_at(destination, startup, b"/", Some(&list), false) }
+            != Err(expected)
+        {
+            return Err("last import failure");
+        }
+        // SAFETY: the sentinel initialized every byte and preflight must preserve them.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(destination.cast::<u8>(), core::mem::size_of::<PosixFs>())
+        };
+        if bytes.iter().any(|&byte| byte != 0xa5) {
+            return Err("last import changed destination");
+        }
+        if rt::sys::process_handles(process)
+            .map_err(|_| "import released handle")?
+            .live
+            != before
+        {
+            return Err("last import retained channel");
+        }
+    }
+    let channel =
+        Files::clone_exact_on(source.sessions().0, &[held]).map_err(|_| "alias import clone")?;
+    let startup = StartupFiles::from_sessions(channel, None, None, None);
+    let list = [
+        Inherited { fd: 4, target: raw },
+        Inherited { fd: 7, target: raw },
+    ];
+    // SAFETY: the failed preflights left the allocation uninitialized and exclusive.
+    unsafe {
+        PosixFs::initialize_at(
+            (*FILES.0.get()).as_mut_ptr(),
+            startup,
+            b"/",
+            Some(&list),
+            false,
+        )
+    }
+    .map_err(|_| "alias import initialization")?;
+    FILES_BUSY.store(true, core::sync::atomic::Ordering::Release);
+    let mut native = NativeFiles;
+    let exact = posix_fs::RamTarget::from_prepared(held).map_err(|_| "alias exact target")?;
+    if native.target(4) != Ok(Target::Ram(exact)) || native.target(7) != Ok(Target::Ram(exact)) {
+        return Err("alias import token");
+    }
+    let mut kept = [held; OPEN_MAX];
+    if native.kept_by_fork(&mut kept) != 1 || kept[0] != exact.prepared() {
+        return Err("exact alias clone list");
+    }
+    let child = Files::clone_exact_on(native.sessions().0, &kept[..1])
+        .map_err(|_| "normalized exact clone")?;
+    let child = Files::from_sessions(child, None);
+    if child
+        .capture_description(fd)
+        .map_err(|_| "child exact token")?
+        .held
+        != held
+    {
+        return Err("clone changed full token");
+    }
+    let mut bytes = [0; 3];
+    if native.read(4, &mut bytes) != Ok(3) || &bytes != b"sta" {
+        return Err("first imported alias read");
+    }
+    if native.read(7, &mut bytes) != Ok(3) || &bytes != b"fet" {
+        return Err("import aliases shared offset");
+    }
+    native.close(4).map_err(|_| "close first import alias")?;
+    if native.read(7, &mut bytes) != Ok(3) || &bytes != b"o r" {
+        return Err("import surviving alias");
+    }
+    check_cancel_ack(&mut native)?;
+    native.close(7).map_err(|_| "close last import alias")?;
+    // The child's own reference remains live after the parent's exact Close.
+    if child.read(fd, &mut bytes) != Ok(3) || &bytes != b"amf" {
+        return Err("child retained exact clone");
+    }
+    child.close_exact(held).map_err(|_| "child exact close")?;
+    source.close_exact(held).map_err(|_| "source exact close")?;
+    Ok(())
+}
+
+fn check_cancel_ack(files: &mut PosixFs) -> Result<(), &'static str> {
+    use posix_fs::open::{Completion, OwnerToken};
+    let owner = OwnerToken::new(17).map_err(|_| "cancel original owner")?;
+    let foreign = OwnerToken::new(18).map_err(|_| "cancel foreign owner")?;
+    for canonical in [true, false] {
+        for _ in 0..64 {
+            let (token, claim) = files
+                .begin_open_record(owner, READ_ONLY)
+                .map_err(|_| "cancel race admission")?;
+            files
+                .begin_open_cancel(claim)
+                .map_err(|_| "cancel race transition")?;
+            // The helper's first canonical result is saved before the original reply.
+            files
+                .finish_open_cancel(token, 13)
+                .map_err(|_| "helper saved cancellation")?;
+            if files.acknowledge_open_cancel(token, foreign, canonical, 5)
+                != Err(FsError::BadFileDescriptor)
+                || files.acknowledge_open_cancel(token, owner, canonical, 5)
+                    != Ok(Some(Completion::Failed(13)))
+                || files.open_tokens().next().is_some()
+            {
+                return Err("helper original cancel acknowledgement");
+            }
+        }
+    }
+    rt::println!("ramfs-probe: exact imports and 128 Cancel/ACK races ok");
     Ok(())
 }
 
