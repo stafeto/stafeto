@@ -20,6 +20,24 @@ fn key(token: ScalarToken) -> proto_fs::OpenKey {
 fn owner() -> Result<OwnerToken, i32> {
     OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)
 }
+
+/// Recover the original call object from its retained, exact paid Table entry.
+#[cfg(feature = "full-capacity-probe")]
+pub(crate) fn retained_operation(token: ScalarToken) -> Result<Operation, i32> {
+    let owner = owner()?;
+    crate::shared::with_files(|files| {
+        files
+            .retained_data_byte(token, owner)
+            .map_err(crate::error)?;
+        Ok(Operation {
+            token,
+            owner,
+            claim: None,
+            transport: files.transport(),
+            active: true,
+        })
+    })
+}
 struct Defer;
 impl Defer {
     fn enter() -> Self {
@@ -98,7 +116,35 @@ impl Operation {
     }
 
     /// Read bytes leave resident custody only in this original caller's local defer.
-    pub(crate) fn run(mut self, out: &mut [u8]) -> Result<u64, i32> {
+    pub(crate) fn run(self, out: &mut [u8]) -> Result<u64, i32> {
+        self.run_inner(
+            out,
+            #[cfg(feature = "full-capacity-probe")]
+            false,
+        )
+    }
+
+    /// The private capacity actor retains the actual paid result in its Table.
+    #[cfg(feature = "full-capacity-probe")]
+    pub(crate) fn run_until_retained(self) -> Result<ScalarToken, i32> {
+        crate::shared::with_files(|files| {
+            let state = files.data_state(self.token).map_err(crate::error)?;
+            if state.owner != Some(self.owner) || state.kind != DataKind::PRead || state.count != 1
+            {
+                return Err(EIO);
+            }
+            Ok(())
+        })?;
+        let token = self.token;
+        self.run_inner(&mut [0; 1], true)?;
+        Ok(token)
+    }
+
+    fn run_inner(
+        mut self,
+        out: &mut [u8],
+        #[cfg(feature = "full-capacity-probe")] retain: bool,
+    ) -> Result<u64, i32> {
         loop {
             if crate::threads::cancel::requested() {
                 return Err(EINTR);
@@ -107,6 +153,26 @@ impl Operation {
                 files.data_state(self.token).map_err(crate::error)
             })?;
             if snapshot.result.is_some() {
+                #[cfg(feature = "full-capacity-probe")]
+                if retain {
+                    if let Some(ScalarResult::Failed(errno)) = snapshot.result {
+                        return Err(errno);
+                    }
+                    let session = self.transport.files().sessions().0.raw();
+                    crate::shared::with_files(|files| {
+                        if files.sessions().0.raw() != session {
+                            return Err(EIO);
+                        }
+                        // This exact view validates the complete saved byte and
+                        // the owner, claimant, job, phase, pin and session.
+                        files
+                            .retained_data_byte(self.token, self.owner)
+                            .map_err(crate::error)
+                    })?;
+                    self.claim = None;
+                    self.active = false;
+                    return Ok(1);
+                }
                 self.claim = None;
                 // Canonical remote cleanup preserves the result in this ownerSome hold.
                 cleanup(self.token);

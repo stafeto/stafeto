@@ -11,6 +11,9 @@ description = "Rust POSIX file and directory client for stafeto"
 test = false
 bench = false
 
+[features]
+full-capacity-probe = []
+
 [dependencies]
 posix-fd = { path = "../posix-fd" }
 posix-path = { path = "../posix-path" }

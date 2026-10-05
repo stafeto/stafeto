@@ -91,6 +91,103 @@ mod tests {
             _ => 5,
         }
     }
+
+    #[cfg(feature = "full-capacity-probe")]
+    fn retained(fs: &mut PosixFs) -> ScalarToken {
+        let (token, claim) = begin(fs, DataKind::PRead, 1, &[]);
+        committing(fs, token, claim);
+        fs.save_data_result(claim, done(256, 1), b"R", errno)
+            .unwrap();
+        token
+    }
+
+    #[cfg(feature = "full-capacity-probe")]
+    #[test]
+    fn retained_byte_observes_actual_cache_without_ack_or_owner_transfer() {
+        let mut fs = files();
+        let token = retained(&mut fs);
+        let before = fs.data_snapshot(token).unwrap();
+        assert_eq!(fs.retained_data_byte(token, owner(1)), Ok(b'R'));
+        assert!(fs.retained_data_byte(token, owner(2)).is_err());
+        assert_eq!(fs.data_snapshot(token).unwrap(), before);
+        assert_eq!(fs.data_tokens().count(), 1);
+    }
+
+    #[cfg(feature = "full-capacity-probe")]
+    #[test]
+    fn retained_byte_refuses_session_argument_and_cache_inconsistencies() {
+        for defect in 0..7 {
+            let mut fs = files();
+            let (token, claim) = begin(&mut fs, DataKind::PRead, 1, &[]);
+            committing(&mut fs, token, claim);
+            fs.descriptors
+                .update_scalar_with(claim, |r| {
+                    r.phase = Phase::Completed;
+                    r.saved_len = 1;
+                    r.bytes[0] = b'R';
+                    match defect {
+                        0 => r.session_handle = rt::abi::Handle::new(7, 10).0,
+                        1 => r.kind = DataKind::Read as u8,
+                        2 => r.count = 2,
+                        3 => r.saved_len = 0,
+                        4 => r.saved_len = 2,
+                        5 => r.job = 0,
+                        6 => r.phase = Phase::Committing,
+                        _ => unreachable!(),
+                    }
+                })
+                .unwrap();
+            fs.descriptors
+                .complete_scalar(claim, ScalarResult::Bytes(1))
+                .unwrap();
+            let before = fs.data_snapshot(token).unwrap();
+            assert!(fs.retained_data_byte(token, owner(1)).is_err());
+            assert_eq!(fs.data_snapshot(token).unwrap(), before);
+        }
+    }
+
+    #[cfg(feature = "full-capacity-probe")]
+    #[test]
+    fn retained_byte_refuses_detached_pin_and_reused_scalar_generation() {
+        let mut fs = files();
+        let old = retained(&mut fs);
+        let context = fs.begin_data_cleanup(old).unwrap();
+        assert!(fs.data_snapshot(old).unwrap().pin.is_none());
+        assert!(fs.retained_data_byte(old, owner(1)).is_err());
+        fs.finish_data_cleanup(cleanup_proof(context)).unwrap();
+        fs.acknowledge_data(old, owner(1), &mut [0; 1]).unwrap();
+        let current = retained(&mut fs);
+        assert_eq!(old.slot(), current.slot());
+        assert_ne!(old.generation(), current.generation());
+        assert!(fs.retained_data_byte(old, owner(1)).is_err());
+        assert_eq!(fs.retained_data_byte(current, owner(1)), Ok(b'R'));
+    }
+
+    #[cfg(feature = "full-capacity-probe")]
+    #[test]
+    fn retained_byte_refuses_foreign_route_and_ownerless_completion() {
+        let mut fs = files();
+        let token = retained(&mut fs);
+        let recovery = fs.data_snapshot(token).unwrap().recovery;
+        let Target::Ram(exact) = target(43) else {
+            unreachable!()
+        };
+        let fd = fs
+            .insert(
+                Target::Random(exact),
+                super::super::DescriptorFlags::default(),
+            )
+            .unwrap();
+        let (foreign, claim) = fs.descriptors.begin_scalar(owner(1), fd, recovery).unwrap();
+        fs.descriptors
+            .complete_scalar(claim, ScalarResult::Bytes(1))
+            .unwrap();
+        let before = fs.data_snapshot(foreign).unwrap();
+        assert!(fs.retained_data_byte(foreign, owner(1)).is_err());
+        assert_eq!(fs.data_snapshot(foreign).unwrap(), before);
+        fs.abandon_data(token, owner(1)).unwrap();
+        assert!(fs.retained_data_byte(token, owner(1)).is_err());
+    }
     fn cleanup_proof(context: CleanupContext) -> CleanupProof {
         // Local transition fixture supplies the exact successful native custody.
         // Real Cancel/ACK/CloseExact replies belong to the native driver gate.
@@ -1412,6 +1509,27 @@ impl CleanupContext {
 }
 
 impl PosixFs {
+    /// Inspect one actual paid capacity result without acknowledging its custody.
+    #[cfg(feature = "full-capacity-probe")]
+    pub fn retained_data_byte(&self, token: ScalarToken, owner: OwnerToken) -> Result<u8, FsError> {
+        let view = self.descriptors.scalar_view(token)?;
+        if view.owner != Some(owner)
+            || view.claimant.is_some()
+            || view.phase != ScalarPhase::Complete
+            || view.result != Some(ScalarResult::Bytes(1))
+            || view.recovery.phase != Phase::Completed
+            || view.recovery.kind() != DataKind::PRead
+            || view.recovery.count != 1
+            || view.recovery.job == 0
+            || view.recovery.session_handle != self.sessions().0.raw().0
+            || !matches!(view.pin, Some(Target::Ram(_)))
+            || view.recovery.saved_len != 1
+        {
+            return Err(FsError::Io);
+        }
+        Ok(view.recovery.bytes[0])
+    }
+
     pub fn data_state(&self, token: ScalarToken) -> Result<DataState, FsError> {
         Ok(state(self.descriptors.scalar_view(token)?))
     }

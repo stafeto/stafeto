@@ -21,6 +21,7 @@ rtbench = []
 thread-probe = []
 open-finalize-clock-probe = []
 data-driver-probe = []
+full-capacity-probe = ["posix-fs/full-capacity-probe"]
 
 [dependencies]
 posix-types = { path = "../posix-types" }

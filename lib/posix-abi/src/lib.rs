@@ -10,6 +10,8 @@
 #![no_std]
 
 pub mod allocation;
+#[cfg(feature = "full-capacity-probe")]
+pub mod capacity_probe;
 pub mod clock;
 pub mod constants;
 mod data_driver;
