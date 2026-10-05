@@ -11,7 +11,9 @@
 
 mod io;
 pub use io::*;
+mod control;
 mod scalar;
+pub use control::*;
 pub use scalar::*;
 
 use core::{
@@ -317,22 +319,23 @@ impl<T: Copy, R: Copy> OpenRecord<T, R> {
 }
 
 #[derive(Clone, Copy)]
-enum Held<T, R, S> {
+enum Held<T, R, S, C> {
     Empty,
     Io(Hold<T>),
     Open(OpenRecord<T, R>),
     Scalar(ScalarRecord<T, S>),
+    Control(ControlRecord<C>),
     RecoverableIo(IoRecord<T, R>),
     Disposal(DisposalSnapshot<T, R>),
 }
 
-struct HoldSlot<T, R, S> {
+struct HoldSlot<T, R, S, C> {
     generation: u64,
     changed: AtomicU32,
-    held: Held<T, R, S>,
+    held: Held<T, R, S, C>,
 }
 
-impl<T, R, S> HoldSlot<T, R, S> {
+impl<T, R, S, C> HoldSlot<T, R, S, C> {
     fn change(&self) {
         let value = self.changed.load(Ordering::Relaxed);
         self.changed
@@ -340,13 +343,13 @@ impl<T, R, S> HoldSlot<T, R, S> {
     }
 }
 
-pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = ()> {
+pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Copy = ()> {
     entries: [EntrySlot<T>; N],
-    holds: [HoldSlot<T, R, S>; N],
+    holds: [HoldSlot<T, R, S, C>; N],
     release_early: fn(T) -> bool,
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Default for Table<T, N, R, S> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<T, N, R, S, C> {
     fn default() -> Self {
         Self {
             entries: [EntrySlot {
@@ -365,7 +368,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Default for Table<T, N, R, 
     }
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
     /// Armed early-release operations retain their generations in the service.
     pub fn with_early_release(release_early: fn(T) -> bool) -> Self {
         Self {
@@ -388,7 +391,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
             unsafe { core::ptr::addr_of_mut!((*destination).entries) }.cast::<EntrySlot<T>>();
         // SAFETY: this field lies within the caller's complete Self allocation.
         let holds =
-            unsafe { core::ptr::addr_of_mut!((*destination).holds) }.cast::<HoldSlot<T, R, S>>();
+            unsafe { core::ptr::addr_of_mut!((*destination).holds) }.cast::<HoldSlot<T, R, S, C>>();
         for index in 0..N {
             // SAFETY: index is bounded by the entries array; write initializes
             // this element without reading or dropping uninitialized bytes.
@@ -1083,7 +1086,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
         Some(Abandoned::ClaimReleased(token))
     }
 
-    /// The fork child drops inherited Open/Scalar/Io/Disposal recovery locally.
+    /// The fork child drops inherited Open/Scalar/Control/Io/Disposal recovery locally.
     /// Published fd references survive. The parent owns every unresolved job.
     /// The caller establishes child-exclusive access before this operation.
     pub fn discard_open_after_fork(&mut self) {
@@ -1095,7 +1098,11 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
         for slot in &mut self.holds {
             if matches!(
                 slot.held,
-                Held::Open(_) | Held::Scalar(_) | Held::RecoverableIo(_) | Held::Disposal(_)
+                Held::Open(_)
+                    | Held::Scalar(_)
+                    | Held::Control(_)
+                    | Held::RecoverableIo(_)
+                    | Held::Disposal(_)
             ) {
                 slot.held = Held::Empty;
                 slot.change();
