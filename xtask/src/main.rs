@@ -2942,7 +2942,7 @@ fn posix_files_run_profile(measured: bool, data: bool, clock_gate: bool) -> Resu
         let mut programs = POSIX_FILES_PROGRAMS;
         programs[0].3 = &["table-posix-files", "data-carrier-probe"];
         programs[1].3 = &["steps", "auth-probe"];
-        programs[4].3 = &["data-carrier-probe"];
+        programs[4].3 = &["data-carrier-probe", "public-data-probe"];
         programs
     };
     const CLOCK_GATE: [ImageProgram; 5] = {

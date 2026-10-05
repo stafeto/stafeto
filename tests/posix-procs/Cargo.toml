@@ -17,6 +17,7 @@ bench = false
 jobs = []
 auth-probe = ["files"]
 data-carrier-probe = ["files"]
+public-data-probe = ["files"]
 open-finalize-clock-probe = ["data-carrier-probe", "posix-abi/open-finalize-clock-probe", "dep:posix-clock", "dep:posix-time", "dep:proto-clock"]
 ipc-loss = ["files"]
 files = ["pending-open"]

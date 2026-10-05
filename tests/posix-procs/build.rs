@@ -17,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=files.c");
     println!("cargo:rerun-if-changed=open-policy.c");
+    println!("cargo:rerun-if-changed=public-data.c");
     println!("cargo:rerun-if-changed=pending-open.c");
     println!("cargo:rerun-if-changed=pending-fork.c");
     println!("cargo:rerun-if-changed=cleanup.c");
@@ -52,6 +53,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", lib.join("libc.a").display());
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     run(Command::new(tools.join("clang"))
+        .arg(format!(
+            "-DPUBLIC_DATA_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_PUBLIC_DATA_PROBE").is_some())
+        ))
         .arg(format!(
             "-DLOADER_ABORT_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_LOADER_ABORT").is_some())
