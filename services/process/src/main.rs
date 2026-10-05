@@ -2753,9 +2753,33 @@ impl Processes {
             Ok(cap) => cap,
             Err(error) => return kernel(error),
         };
-        match self.loaders.stage_exec(record, args, cap) {
-            Ok(Staged::Installed) => Answer::Status(Status::Ok),
-            Ok(Staged::Replay(extra)) => {
+        #[cfg(feature = "image-probe")]
+        let staged = image_probe::stage_exec(
+            &mut self.loaders,
+            &mut self
+                .records
+                .get_mut(record)
+                .expect("a stage target")
+                .image_probe,
+            record,
+            args,
+            cap,
+        );
+        #[cfg(not(feature = "image-probe"))]
+        let staged = self
+            .loaders
+            .stage_exec(record, args, cap)
+            .map(|result| (result, false));
+        match staged {
+            Ok((Staged::Installed, true)) => {
+                let w = r.reply();
+                if w.u32(0).and_then(|()| w.u32(1)).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            Ok((Staged::Installed, false)) => Answer::Status(Status::Ok),
+            Ok((Staged::Replay(extra), _)) => {
                 drop(extra);
                 Answer::Status(Status::Ok)
             }
