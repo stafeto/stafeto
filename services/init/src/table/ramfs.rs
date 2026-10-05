@@ -189,9 +189,9 @@ const RAM_POSIX_FILES: Record = RAM_CLOCKED;
     not(feature = "open-finalize-clock-probe")
 ))]
 const RAM_POSIX_FILES: Record = Record {
-    // The steps,auth-probe ELF maps 10 RO + 36 RX + 925 RW pages.
+    // The joint steps,auth-probe ELF maps 10 RO + 37 RX + 925 RW pages.
     // Data pages, stack and allowance are paid separately in this fixture.
-    quota: (4096 + 971 + 12 + 128) * PAGE,
+    quota: (4096 + 972 + 12 + 128) * PAGE,
     ..RAM_CLOCKED
 };
 
