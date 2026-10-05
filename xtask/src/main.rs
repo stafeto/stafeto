@@ -1227,6 +1227,7 @@ fn main() {
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-files-loss") => posix_files_loss(),
         Some("posix-data-steps") => posix_files_run_profile(true, true, false),
+        Some("posix-data-loss") => posix_data_loss(),
         Some("posix-open-finalize-clock") => posix_files_run_profile(true, true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
@@ -3037,6 +3038,44 @@ fn posix_files_loss() -> Result<(), String> {
     qemu::expect_stopped_on(&output, ended)?;
     qemu::expect_marker(&output, "posix-files: genuine native reply loss ok")?;
     Ok(())
+}
+
+fn posix_data_loss() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::IpcLossProbe)?;
+    const PROGRAMS: [ImageProgram; 8] = [
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-posix-files", "public-data-probe"],
+        ),
+        ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps", "auth-probe"]),
+        POSIX_FILES_PROGRAMS[2],
+        POSIX_FILES_PROGRAMS[3],
+        (
+            "posix-files",
+            "posix-procs",
+            POSIX_STACK_SIZE,
+            &["public-data-loss-probe"],
+        ),
+        POSIX_PROCS_PROGRAMS[2],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    // Reuse the existing files-loss rootfs and service graph. The local
+    // public keys live only in the ordinary shared session; raw test keys
+    // remain on their separate genuine cloned sessions.
+    let image = build_boot_image("boot-posix-files-loss.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "posix-files: public Data Start Commit and Query Waiting End recovery ok",
+    )
 }
 
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {

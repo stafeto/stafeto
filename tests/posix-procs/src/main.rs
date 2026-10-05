@@ -92,6 +92,8 @@ mod data_stages;
 mod open_finalize_clock;
 #[cfg(feature = "files")]
 mod open_stages;
+#[cfg(feature = "public-data-loss-probe")]
+mod public_data_loss;
 #[cfg(feature = "ipc-loss")]
 mod reply_death;
 #[cfg(feature = "ipc-loss")]
