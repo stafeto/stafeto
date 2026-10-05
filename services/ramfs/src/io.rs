@@ -85,12 +85,14 @@ pub struct WritePreparation {
     count: usize,
     positioned: bool,
     result: Option<usize>,
+    originating_root: storage::Root,
 }
 
 pub struct TruncatePreparation {
     held: Option<Held>,
     data: storage::DataTruncate,
     result: Option<u64>,
+    originating_root: storage::Root,
 }
 
 impl Ram<'_> {
@@ -253,6 +255,7 @@ impl Ram<'_> {
             bytes: [0; proto_fs::MAX_WRITE],
             count,
             positioned: position.is_some(),
+            originating_root: lease.originating_root,
             result: if bytes.is_empty() { Some(0) } else { None },
         };
         prep.bytes[..count].copy_from_slice(&bytes[..count]);
@@ -287,6 +290,7 @@ impl Ram<'_> {
                 held: Some(lease.held),
                 data,
                 result: None,
+                originating_root: lease.originating_root,
             }),
             Err(code) => Err((code, lease)),
         }
@@ -321,6 +325,7 @@ impl Ram<'_> {
             count: bytes.len(),
             positioned: position.is_some(),
             result: None,
+            originating_root: fds.root,
         };
         if bytes.is_empty() {
             prep.result = Some(0);
@@ -394,6 +399,7 @@ impl Ram<'_> {
                 held: Some(held),
                 data,
                 result: None,
+                originating_root: fds.root,
             }),
             Err(error) => {
                 self.io_release(held);
@@ -439,6 +445,24 @@ impl WritePreparation {
         Ok(self.count)
     }
 
+    /// A pre-effect conflict releases private pages while preserving the exact lease.
+    pub fn restart_step(&mut self, ram: &mut Ram<'_>) -> Result<Option<DataLease>, u32> {
+        if self.result.is_some() {
+            return Err(proto_fs::OPEN_RETIRED);
+        }
+        if let Some(data) = self.data.as_mut()
+            && !ram.storage.cancel_data_write(data)?
+        {
+            return Ok(None);
+        }
+        self.data = None;
+        let held = self.held.take().ok_or(BAD_FD)?;
+        Ok(Some(DataLease {
+            held,
+            originating_root: self.originating_root,
+        }))
+    }
+
     /// Release at most one private page, overlay or retained description.
     pub fn cancel(&mut self, ram: &mut Ram<'_>) -> Result<bool, u32> {
         if let Some(data) = self.data.as_mut()
@@ -475,6 +499,20 @@ impl TruncatePreparation {
         ram.storage.commit_data_truncate(&mut self.data, now)?;
         self.result = Some(self.data.length);
         Ok(self.data.length)
+    }
+
+    pub fn restart_step(&mut self, ram: &mut Ram<'_>) -> Result<Option<DataLease>, u32> {
+        if self.result.is_some() {
+            return Err(proto_fs::OPEN_RETIRED);
+        }
+        if !ram.storage.cancel_data_truncate(&mut self.data)? {
+            return Ok(None);
+        }
+        let held = self.held.take().ok_or(BAD_FD)?;
+        Ok(Some(DataLease {
+            held,
+            originating_root: self.originating_root,
+        }))
     }
 
     pub fn cancel(&mut self, ram: &mut Ram<'_>) -> Result<bool, u32> {

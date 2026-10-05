@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod authority;
+pub mod data;
 pub mod image;
 #[cfg(test)]
 mod image_tests;

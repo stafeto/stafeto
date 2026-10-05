@@ -92,7 +92,7 @@
 mod data;
 pub use data::{
     DataDescription, DataKind, DataOutcome, DataPhase, DataResult, DataStart, FEED_MAX,
-    data_progress_reply, data_read_reply, data_start_reply,
+    data_progress_reply, data_read_reply, data_start_reply, terminal_failure,
 };
 mod directory;
 pub use directory::DirectoryEntry;
