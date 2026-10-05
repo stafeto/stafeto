@@ -138,40 +138,71 @@ impl<'a> Guard<'a> {
 
     /// Establish exactly one separate baseline after the specified warm-up.
     pub fn warm(&mut self) -> Result<(), Error> {
-        let memory = crate::sys::process_memory(self.process);
-        let handles = crate::sys::process_handles(self.process);
-        METER.record(memory, handles);
-        METER.status()?;
-        let used = memory?.used;
-        if used == 0
-            || METER
-                .warm
-                .compare_exchange(0, used, Ordering::Relaxed, Ordering::Relaxed)
-                .is_err()
-        {
-            return Err(Error::BadState);
-        }
-        Ok(())
+        warm_for(self.process)
     }
 
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
-        METER.sample();
-        self.observed()
+        snapshot_for(self.process)
     }
 
     /// Inspect the recorded event without introducing another sampling syscall.
-    /// Native probes can check an installed resource before its next operation.
     pub fn observed(&self) -> Result<Snapshot, Error> {
-        METER.status()?;
-        Ok(Snapshot {
-            startup: METER.startup.load(Ordering::Relaxed),
-            warm: METER.warm.load(Ordering::Relaxed),
-            peak: METER.peak.load(Ordering::Relaxed),
-            attempts: METER.attempts.load(Ordering::Relaxed),
-            failures: METER.failures.load(Ordering::Relaxed),
-            handle_peak: METER.handle_peak.load(Ordering::Relaxed),
-        })
+        observed_for(self.process)
     }
+}
+
+fn registered(process: &Handle<Process>) -> Result<(), Error> {
+    let raw = process.raw().0;
+    if raw == 0 || METER.process.load(Ordering::Relaxed) != raw {
+        return Err(Error::BadState);
+    }
+    METER.status()
+}
+
+/// Access the live registration through its exact process capability value.
+/// The installing guard retains its original borrow until this registration ends.
+pub fn warm_for(process: &Handle<Process>) -> Result<(), Error> {
+    registered(process)?;
+    let memory = crate::sys::process_memory(process);
+    let handles = crate::sys::process_handles(process);
+    METER.record(memory, handles);
+    METER.status()?;
+    let used = memory?.used;
+    if used == 0
+        || METER
+            .warm
+            .compare_exchange(0, used, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return Err(Error::BadState);
+    }
+    Ok(())
+}
+
+pub fn snapshot_for(process: &Handle<Process>) -> Result<Snapshot, Error> {
+    registered(process)?;
+    METER.sample();
+    observed_for(process)
+}
+
+/// Retain a real failed ObjectInfo result from an associated resource observation.
+pub fn invalidate_for(process: &Handle<Process>, error: Error) -> Result<(), Error> {
+    registered(process)?;
+    METER.record(Err(error), Err(error));
+    METER.status()
+}
+
+/// Read the existing event record without introducing a sampling syscall.
+pub fn observed_for(process: &Handle<Process>) -> Result<Snapshot, Error> {
+    registered(process)?;
+    Ok(Snapshot {
+        startup: METER.startup.load(Ordering::Relaxed),
+        warm: METER.warm.load(Ordering::Relaxed),
+        peak: METER.peak.load(Ordering::Relaxed),
+        attempts: METER.attempts.load(Ordering::Relaxed),
+        failures: METER.failures.load(Ordering::Relaxed),
+        handle_peak: METER.handle_peak.load(Ordering::Relaxed),
+    })
 }
 
 impl Drop for Guard<'_> {

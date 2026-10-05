@@ -38,9 +38,61 @@ rt::entry!(main);
 const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0xfff6, 0xfff7, 0xfff8, 0xfff9,
-    0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    0xfff6,
+    0xfff7,
+    0xfff8,
+    0xfff9,
+    0xfffa,
+    0xfffb,
+    0xfffc,
+    0xfffd,
+    0xfffe,
+    #[cfg(feature = "full-capacity-probe")]
+    0xfff0,
+    #[cfg(feature = "full-capacity-probe")]
+    0xfff1,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -85,6 +137,14 @@ fn image_tree(start: &mut rt::startup::Startup) -> Option<tree::Tree<'static>> {
 fn main(_: u64) -> u64 {
     let Ok(mut start) = rt::startup() else {
         return 1;
+    };
+    // Startup retains this exact owner handle throughout the loop. take changes
+    // only Named. Reverse local drop order removes the observer before Startup.
+    #[cfg(feature = "full-capacity-probe")]
+    let registered_process = Handle::borrowed(start.process.raw());
+    #[cfg(feature = "full-capacity-probe")]
+    let Ok(_resource_guard) = rt::resource_meter::Guard::install(&registered_process) else {
+        return 10;
     };
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
@@ -158,6 +218,10 @@ fn main(_: u64) -> u64 {
         image_info_backing: Handle::borrowed(backing.raw()),
         #[cfg(feature = "image-info-probe")]
         image_info_fault: None,
+        #[cfg(feature = "full-capacity-probe")]
+        capacity_backing: Handle::borrowed(backing.raw()),
+        #[cfg(feature = "full-capacity-probe")]
+        capacity_checkpoints: ramfs::capacity::Checkpoints::default(),
         process: Handle::borrowed(start.process.raw()),
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
@@ -197,6 +261,10 @@ struct Fs {
     image_info_backing: ManuallyDrop<Handle<Memory>>,
     #[cfg(feature = "image-info-probe")]
     image_info_fault: Option<(u32, u32, u64, u32)>,
+    #[cfg(feature = "full-capacity-probe")]
+    capacity_backing: ManuallyDrop<Handle<Memory>>,
+    #[cfg(feature = "full-capacity-probe")]
+    capacity_checkpoints: ramfs::capacity::Checkpoints,
     /// The service's own process, to map the object of a READ_INTO in.
     process: ManuallyDrop<Handle<rt::handle::Process>>,
     /// The service's channel, which its own sessions are copies of, and
@@ -1126,6 +1194,10 @@ impl Service<0> for Fs {
             if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {
                 return status(proto_fs::RESOLVING);
             }
+        }
+        #[cfg(feature = "full-capacity-probe")]
+        if matches!(r.method(), 0xfff0 | 0xfff1) {
+            return self.capacity_request(&mut s.data, r);
         }
         #[cfg(feature = "open-finalize-clock-probe")]
         if r.method() == 0xfff6 {
@@ -2176,6 +2248,177 @@ impl Fs {
                 .get(fds.authority_index as usize)
                 .and_then(Option::as_ref)
                 .is_some_and(|identity| identity.purpose == BindingPurpose::Refresh)
+    }
+
+    #[cfg(feature = "full-capacity-probe")]
+    fn capacity_info<T>(&self, result: Result<T, abi::Error>) -> Result<T, abi::Error> {
+        result.inspect_err(|&error| {
+            let _ = rt::resource_meter::invalidate_for(&self.process, error);
+        })
+    }
+
+    #[cfg(feature = "full-capacity-probe")]
+    fn capacity_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut body = r.body();
+        let control = if r.method() == 0xfff1 {
+            let (Ok(action), Ok(phase)) = (body.u32(), body.u32()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            Some((action, phase))
+        } else {
+            None
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        if let Err(code) = self.authenticate(fds, r.label()) {
+            return status(code);
+        }
+        let Binding::Active(who) = &fds.binding else {
+            return status(proto_fs::PERMISSION);
+        };
+        let root = Root {
+            id: u64::from(who.root.pid),
+            generation: u64::from(who.root.generation),
+        };
+        if root != fds.root {
+            return status(proto_fs::PERMISSION);
+        }
+        let (pid, image) = (who.pid, who.image);
+        if let Some((action, phase)) = control {
+            if action == 1 && phase == 0 {
+                let own =
+                    self.capacity_checkpoints.0.iter().any(|c| {
+                        c.root == root && c.pid == pid && c.image == image && c.phase == 1
+                    });
+                if !own
+                    || !self.capacity_checkpoints.both(1)
+                    || self.jobs.iter().any(Option::is_some)
+                    || self.ram.storage.preparations_used() != 0
+                    || self.ram.storage.available().pages as usize != ramfs::storage::PAGES
+                    || self.ram.storage.reclamation_pending()
+                {
+                    return status(proto_fs::INVALID_ARGUMENT);
+                }
+                return match rt::resource_meter::warm_for(&self.process) {
+                    Ok(()) => Answer::Status(Status::Ok),
+                    Err(error) => Answer::Status(Status::Kernel(error)),
+                };
+            }
+            if action != 0 {
+                return status(proto_fs::INVALID_ARGUMENT);
+            }
+            // An invalid observation refuses the phase before either card changes.
+            let snapshot = match rt::resource_meter::snapshot_for(&self.process) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Answer::Status(Status::Kernel(error)),
+            };
+            let handles = match self.capacity_info(sys::process_handles(&self.process)) {
+                Ok(handles) => handles,
+                Err(error) => return Answer::Status(Status::Kernel(error)),
+            };
+            let changed = match self.capacity_checkpoints.advance(root, pid, image, phase) {
+                Ok(changed) => changed,
+                Err(code) => return status(code),
+            };
+            if changed && self.capacity_checkpoints.both(5) {
+                let [a, b] = self.capacity_checkpoints.0;
+                rt::println!(
+                    "ramfs-capacity: final roots={}:{} pid={} image={} phase={} / {}:{} pid={} image={} phase={} startup={} warm={} memory_peak={} handles_peak={} handles_limit={} attempts={} failures={}",
+                    a.root.id,
+                    a.root.generation,
+                    a.pid,
+                    a.image,
+                    a.phase,
+                    b.root.id,
+                    b.root.generation,
+                    b.pid,
+                    b.image,
+                    b.phase,
+                    snapshot.startup,
+                    snapshot.warm,
+                    snapshot.peak,
+                    snapshot.handle_peak,
+                    handles.limit,
+                    snapshot.attempts,
+                    snapshot.failures
+                );
+            }
+            return Answer::Status(Status::Ok);
+        }
+        let meter = match rt::resource_meter::snapshot_for(&self.process) {
+            Ok(meter) => meter,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        let memory = match self.capacity_info(sys::process_memory(&self.process)) {
+            Ok(memory) => memory,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        let handles = match self.capacity_info(sys::process_handles(&self.process)) {
+            Ok(handles) => handles,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        let backing = match self.capacity_info(sys::memory_info(&self.capacity_backing)) {
+            Ok(backing) => backing,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        let available = self.ram.storage.available();
+        let usage = self.ram.storage.usage(root);
+        let jobs = self.jobs.iter().filter(|job| job.is_some()).count() as u32;
+        let output = r.reply();
+        let result = (|| -> Result<(), Status> {
+            for word in [0, 1, pid, image] {
+                output.u32(word)?;
+            }
+            for word in [root.id, root.generation] {
+                output.u64(word)?;
+            }
+            for word in memory.to_words() {
+                output.u64(word)?;
+            }
+            for word in [
+                meter.startup,
+                meter.warm,
+                meter.peak,
+                meter.attempts,
+                meter.failures,
+            ] {
+                output.u64(word)?;
+            }
+            for word in handles.to_words() {
+                output.u64(word)?;
+            }
+            for word in backing.to_words() {
+                output.u64(word)?;
+            }
+            for word in [
+                available.inodes as u32,
+                available.dentries as u32,
+                available.pages as u32,
+                0,
+                usage.inodes as u32,
+                usage.dentries as u32,
+                usage.pages as u32,
+                usage.descriptions as u32,
+                jobs,
+                self.ram.storage.preparations_used() as u32,
+                self.ram.storage.preparations_for_root(root) as u32,
+                self.capacity_checkpoints.phase(root),
+            ] {
+                output.u32(word)?;
+            }
+            if output.as_bytes().len() != 192 {
+                return Err(Status::BadSize);
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(error) => Answer::Status(error),
+        }
     }
 
     fn authenticate(&mut self, fds: &mut Fds, label: u64) -> Result<(), u32> {

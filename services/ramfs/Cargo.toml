@@ -18,6 +18,8 @@ bench = false
 [features]
 # Read-only retained-session observation for the owner-death regression.
 auth-probe = []
+# Private full physical-page and retained-job measurements.
+full-capacity-probe = ["auth-probe", "rt/resource-meter"]
 image-gates = ["auth-probe"]
 image-info-probe = ["auth-probe"]
 open-finalize-clock-probe = ["auth-probe"]

@@ -1759,6 +1759,11 @@ impl<'a> Storage<'a> {
         Ok(())
     }
     /// One page or inode slot per call, alternating two independently paid queues.
+    #[cfg(feature = "full-capacity-probe")]
+    pub fn reclamation_pending(&self) -> bool {
+        self.state.retired_len != 0 || self.state.reclaim_len != 0
+    }
+
     pub fn reclaim_step(&mut self) -> bool {
         if self.state.retired_len != 0 && (self.state.reclaim_len == 0 || self.state.retired_turn) {
             self.state.retired_turn = false;

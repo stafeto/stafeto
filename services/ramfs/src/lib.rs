@@ -3119,3 +3119,6 @@ mod tests {
         assert_eq!(ram.storage.preparations_used(), 0);
     }
 }
+
+#[cfg(feature = "full-capacity-probe")]
+pub mod capacity;
