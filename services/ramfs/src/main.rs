@@ -2370,7 +2370,7 @@ impl Fs {
         let jobs = self.jobs.iter().filter(|job| job.is_some()).count() as u32;
         let output = r.reply();
         let result = (|| -> Result<(), Status> {
-            for word in [0, 1, pid, image] {
+            for word in [0, 2, pid, image] {
                 output.u32(word)?;
             }
             for word in [root.id, root.generation] {
@@ -2406,7 +2406,7 @@ impl Fs {
                 jobs,
                 self.ram.storage.preparations_used() as u32,
                 self.ram.storage.preparations_for_root(root) as u32,
-                self.capacity_checkpoints.phase(root),
+                self.capacity_checkpoints.phase_pack(root),
             ] {
                 output.u32(word)?;
             }

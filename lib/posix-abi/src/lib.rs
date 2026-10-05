@@ -12,6 +12,8 @@
 pub mod allocation;
 #[cfg(feature = "full-capacity-probe")]
 pub mod capacity_probe;
+#[cfg(feature = "full-capacity-probe")]
+pub mod capacity_snapshot;
 pub mod clock;
 pub mod constants;
 mod data_driver;

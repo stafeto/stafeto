@@ -78,6 +78,10 @@ impl Checkpoints {
             .find(|c| c.root == root)
             .map_or(0, |c| c.phase)
     }
+    /// Value-only progress in registration order, including this authenticated root.
+    pub fn phase_pack(&self, root: Root) -> u32 {
+        self.phase(root) | (self.0[0].phase << 8) | (self.0[1].phase << 16)
+    }
     pub fn both(&self, phase: u32) -> bool {
         self.0.iter().all(|c| c.phase == phase && c.pid != 0)
     }
@@ -131,5 +135,18 @@ mod tests {
         let before = records;
         assert!(records.advance(root(3), 3, 1, 4).is_err());
         assert_eq!(records, before);
+    }
+    #[test]
+    fn packed_phase_keeps_registration_order_and_the_exact_root_generation() {
+        let mut records = Checkpoints::default();
+        records.advance(root(4), 4, 1, 1).unwrap();
+        records.advance(root(3), 3, 1, 1).unwrap();
+        records.advance(root(3), 3, 1, 2).unwrap();
+        records.advance(root(3), 3, 1, 3).unwrap();
+        assert_eq!(records.phase_pack(root(4)), 1 | (1 << 8) | (3 << 16));
+        assert_eq!(records.phase_pack(root(3)), 3 | (1 << 8) | (3 << 16));
+        let mut stale = root(4);
+        stale.generation += 1;
+        assert_eq!(records.phase_pack(stale), (1 << 8) | (3 << 16));
     }
 }
