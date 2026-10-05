@@ -180,7 +180,7 @@ fn counters(files: &Files) -> Result<([u32; 4], u32), Status> {
         *count = input.u32()?;
     }
     input.finish()?;
-    let reply = query(files, 0xfff7, Some(3))?;
+    let reply = query(files, 0xfffc, Some(3))?;
     if !reply.handles.is_empty() {
         return Err(Status::BadSize);
     }
