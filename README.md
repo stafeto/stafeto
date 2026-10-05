@@ -228,11 +228,13 @@ cargo xtask hvf          # the test set under HVF on Apple silicon; skips elsewh
 cargo xtask rtbench      # throughput and 1 ms timer wakeups on TCG, HVF and VZ; --minutes N runs HVF and VZ together
 cargo xtask ash-shell    # interactive BusyBox ash over the QEMU UART
 cargo xtask os-test      # os-test's io and malloc suites on relibc, a table in target/measure/
+cargo xtask coverage     # POSIX.1-2024 symbol, macro and header inventory
 cargo xtask gdb          # QEMU halted at the first instruction, debugger on :1234
 cargo xtask help         # every command, including single probes
 ```
 
 How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
+Coverage tooling and its remaining conformance work: [docs/posix-coverage.md](docs/posix-coverage.md).
 Bounded kernel paths and their costs:
 [docs/non-preemptible-paths.md](docs/non-preemptible-paths.md).
 

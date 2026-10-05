@@ -5,7 +5,12 @@
 CMPLX	CMPLX	required	complex.h	-
 CMPLXF	CMPLX	required	complex.h	-
 CMPLXL	CMPLX	required	complex.h	-
+FD_CLR	pselect	required	sys/select.h	-
+FD_ISSET	pselect	required	sys/select.h	-
+FD_SET	pselect	required	sys/select.h	-
+FD_ZERO	pselect	required	sys/select.h	-
 _Exit	_Exit	required	stdlib.h,unistd.h	-
+_Fork	fork	required	unistd.h	-
 _exit	_Exit	required	stdlib.h,unistd.h	-
 a64l	a64l	option	stdlib.h	XSI
 abort	abort	required	stdlib.h	-
@@ -377,6 +382,7 @@ getchar	getchar	required	stdio.h	-
 getchar_unlocked	getc_unlocked	required	stdio.h	-
 getcwd	getcwd	required	unistd.h	-
 getdate	getdate	option	time.h	XSI
+getdate_err	getdate	option	time.h	XSI
 getdelim	getdelim	required	stdio.h	-
 getegid	getegid	required	unistd.h	-
 getentropy	getentropy	required	unistd.h	-
@@ -1151,6 +1157,10 @@ unsetenv	unsetenv	required	stdlib.h	-
 uselocale	uselocale	required	locale.h	-
 utimensat	futimens	required	fcntl.h,sys/stat.h,sys/time.h	-
 utimes	futimens	option	fcntl.h,sys/stat.h,sys/time.h	XSI
+va_arg	va_arg	required	stdarg.h	-
+va_copy	va_arg	required	stdarg.h	-
+va_end	va_arg	required	stdarg.h	-
+va_start	va_arg	required	stdarg.h	-
 vasprintf	vfprintf	required	stdarg.h,stdio.h	-
 vdprintf	vfprintf	required	stdarg.h,stdio.h	-
 vfprintf	vfprintf	required	stdarg.h,stdio.h	-

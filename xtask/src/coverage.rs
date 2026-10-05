@@ -355,12 +355,12 @@ mod tests {
     #[test]
     fn inventory_keeps_required_and_optional_interfaces() {
         let rows = interfaces(INVENTORY).unwrap();
-        assert_eq!(rows.len(), 1_231);
+        assert_eq!(rows.len(), 1_241);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.requirement == "required")
                 .count(),
-            1_026
+            1_035
         );
         assert!(
             rows.iter()
@@ -376,6 +376,23 @@ mod tests {
                     .any(|r| r.name == name && r.requirement == "required")
             );
         }
+        for name in [
+            "FD_CLR", "FD_ISSET", "FD_SET", "FD_ZERO", "_Fork", "va_arg", "va_copy", "va_end",
+            "va_start",
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|r| r.name == name && r.requirement == "required")
+            );
+        }
+        assert!(rows.iter().any(|r| r.name == "getdate_err"
+            && r.requirement == "option"
+            && r.option_codes == "XSI"));
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r.name, "asctime_r" | "ctime_r"))
+        );
         for (name, requirement) in [
             ("errno", "required"),
             ("tzname", "required"),

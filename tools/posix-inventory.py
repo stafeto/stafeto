@@ -19,6 +19,10 @@ from urllib.request import urlopen
 
 BASE = "https://pubs.opengroup.org/onlinepubs/9799919799/functions/"
 XBD_BASE = "https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/"
+INDEX_BASE = "https://pubs.opengroup.org/onlinepubs/9799919799/idx/"
+# Issue 8, Austin Group Defect 1410 removes these functions. The alphabetical
+# index retains their historical URLs, so they are not normative interfaces.
+REMOVED = {"asctime_r", "ctime_r"}
 SECTION = re.compile(
     r'<h4 class="mansect"[^>]*>.*?\b%s</h4>\s*<blockquote[^>]*>(.*?)</blockquote>',
     re.S | re.I,
@@ -61,11 +65,11 @@ class Synopsis(HTMLParser):
         return "".join(self.characters)
 
 
-def page(cache, name, base=BASE):
+def page(cache, name, base=BASE, remote_name=None):
     path = cache / name
     if path.exists():
         return path.read_text(encoding="utf-8")
-    with urlopen(base + name, timeout=30) as response:
+    with urlopen(base + (remote_name or name), timeout=30) as response:
         content = response.read().decode("utf-8")
     path.write_text(content, encoding="utf-8")
     return content
@@ -78,7 +82,32 @@ def section(html, name):
     return match.group(1)
 
 
-def entries(cache, filename):
+def alphabetical_interfaces(html):
+    result = {}
+    for filename, body in re.findall(
+        r'<a\b[^>]*href="(?:\.\./functions/)?([_A-Za-z0-9]+\.html)"[^>]*>(.*?)</a>',
+        html, re.S | re.I,
+    ):
+        text = Synopsis()
+        text.feed(body)
+        name = re.sub(r"\(\)$", "", text.text.strip())
+        if not re.fullmatch(r"[_A-Za-z][_A-Za-z0-9]*", name):
+            raise ValueError(f"invalid alphabetical interface {name!r}")
+        if name in result and result[name] != filename:
+            raise ValueError(f"conflicting alphabetical URLs for {name}")
+        result[name] = filename
+    if not result:
+        raise ValueError("empty alphabetical interface index")
+    return result
+
+
+def classification(scopes):
+    required = any(all(code in ("CX", "OB") for code in scope) for scope in scopes)
+    codes = sorted({code for scope in scopes for code in scope if code not in ("CX", "OB")})
+    return "required" if required else "option", ",".join(codes) or "-"
+
+
+def entries(cache, filename, indexed_names=()):
     html = page(cache, filename)
     names = Synopsis()
     names.feed(section(html, "NAME"))
@@ -88,18 +117,74 @@ def entries(cache, filename):
     headers = sorted(set(re.findall(r"#include\s*<\s*([^>]+?)\s*>", synopsis.text)))
     if not headers:
         raise ValueError(f"{filename}: no headers")
+    declared = {part.strip() for part in head.split(",")}
+    # NAME can omit aliases and function-like macros that SYNOPSIS requires.
+    # Limit candidates to names independently listed by the official index.
+    declared.update(set(re.findall(r"\b([_A-Za-z][_A-Za-z0-9]*)\s*\(", synopsis.text))
+                    & set(indexed_names))
     result = []
-    for name in (part.strip() for part in head.split(",")):
+    for name in sorted(declared):
         if not re.fullmatch(r"[_A-Za-z][_A-Za-z0-9]*", name):
             raise ValueError(f"{filename}: invalid name {name!r}")
         positions = [match.start() for match in re.finditer(r"\b" + name + r"\b", synopsis.text)]
         if not positions:
             raise ValueError(f"{filename}: {name} absent from synopsis")
         scopes = [synopsis.options[pos] for pos in positions]
-        required = any(all(code in ("CX", "OB") for code in scope) for scope in scopes)
-        codes = sorted({code for scope in scopes for code in scope if code not in ("CX", "OB")})
-        result.append((name, filename.removesuffix(".html"), "required" if required else "option", ",".join(headers), ",".join(codes) or "-"))
+        requirement, codes = classification(scopes)
+        result.append((name, filename.removesuffix(".html"), requirement, ",".join(headers), codes))
     return result
+
+
+def getdate_error_entry(cache):
+    # XSH DESCRIPTION defines this object without an option marker. XBD time.h
+    # explicitly encloses its declaration in XSI, which supplies its status.
+    description = Synopsis()
+    description.feed(section(page(cache, "getdate.html"), "DESCRIPTION"))
+    if not re.search(r"\bgetdate_err\b", description.text):
+        raise ValueError("getdate DESCRIPTION no longer defines getdate_err")
+    xbd = cache / "basedefs"
+    xbd.mkdir(exist_ok=True)
+    declaration = Synopsis()
+    declaration.feed(section(page(xbd, "time.h.html", XBD_BASE), "DESCRIPTION"))
+    scopes = [declaration.options[m.start()]
+              for m in re.finditer(r"\bgetdate_err\b", declaration.text)]
+    if not scopes or any(scope != ("XSI",) for scope in scopes):
+        raise ValueError("time.h getdate_err needs explicit XSI declaration")
+    return ("getdate_err", "getdate", "option", "time.h", "XSI")
+
+
+def inventory(cache):
+    index = page(cache, "contents.html")
+    pages = sorted(set(re.findall(r'href="(?:\.\./functions/)?([A-Za-z0-9_]+\.html)', index)))
+    pages = [name for name in pages if name not in ("V2_chap01.html", "V2_chap02.html", "V2_chap03.html", "contents.html")]
+    alphabetical = alphabetical_interfaces(
+        page(cache, "functions-index.html", INDEX_BASE, "functions.html"))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        grouped = list(pool.map(lambda name: entries(cache, name, alphabetical), pages))
+    by_name = {}
+    for group in grouped:
+        for row in group:
+            if row[0] in by_name:
+                raise ValueError(f"duplicate interface name {row[0]}")
+            by_name[row[0]] = row
+    by_name["getdate_err"] = getdate_error_entry(cache)
+    # Pages absent from contents (currently va_arg) are discovered by the
+    # alphabetical index. Once their NAME aliases are loaded, skip those URLs.
+    for name, filename in sorted(alphabetical.items()):
+        if name in by_name or name in REMOVED:
+            continue
+        for row in entries(cache, filename, alphabetical):
+            if row[0] in by_name:
+                if by_name[row[0]][2:] != row[2:]:
+                    raise ValueError(f"conflicting interface alias {row[0]}")
+            else:
+                by_name[row[0]] = row
+    expected = set(alphabetical) - REMOVED
+    if set(by_name) != expected:
+        raise ValueError(f"index mismatch: missing {sorted(expected - set(by_name))}, "
+                         f"unexpected {sorted(set(by_name) - expected)}")
+    rows = sorted(by_name.values())
+    return rows, len({row[1] for row in rows})
 
 
 def header_entry(cache, filename):
@@ -123,15 +208,7 @@ def main():
     parser.add_argument("--xbd-output", type=Path)
     args = parser.parse_args()
     args.cache.mkdir(parents=True, exist_ok=True)
-    index = page(args.cache, "contents.html")
-    pages = sorted(set(re.findall(r'href="(?:\.\./functions/)?([A-Za-z0-9_]+\.html)', index)))
-    pages = [name for name in pages if name not in ("V2_chap01.html", "V2_chap02.html", "V2_chap03.html", "contents.html")]
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        grouped = list(pool.map(lambda name: entries(args.cache, name), pages))
-    rows = sorted((row for group in grouped for row in group), key=lambda row: row[0])
-    names = [row[0] for row in rows]
-    if len(names) != len(set(names)):
-        raise ValueError("duplicate interface name")
+    rows, page_count = inventory(args.cache)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as file:
         file.write("# SPDX-License-Identifier: GPL-3.0-or-later\n")
@@ -140,7 +217,7 @@ def main():
         file.write("# name\tpage\trequirement\theaders\toption_codes\n")
         for row in rows:
             file.write("\t".join(row) + "\n")
-    print(f"{len(pages)} pages, {len(rows)} names, {sum(row[2] == 'required' for row in rows)} required")
+    print(f"{page_count} pages, {len(rows)} names, {sum(row[2] == 'required' for row in rows)} required")
     if args.xbd_output:
         xbd_cache = args.cache / "basedefs"
         xbd_cache.mkdir(exist_ok=True)
