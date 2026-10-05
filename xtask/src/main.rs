@@ -2940,7 +2940,7 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
         let mut programs = POSIX_FILES_PROGRAMS;
         programs[0].3 = &["table-posix-files", "data-carrier-probe"];
         programs[1].3 = &["steps", "auth-probe"];
-        programs[4].3 = &["auth-probe"];
+        programs[4].3 = &["data-carrier-probe"];
         programs
     };
     let programs = if data {

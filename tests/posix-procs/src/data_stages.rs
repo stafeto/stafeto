@@ -156,7 +156,7 @@ fn full_mapping(files: &Files) -> Result<(), i32> {
     Ok(())
 }
 
-#[cfg(feature = "auth-probe")]
+#[cfg(feature = "data-carrier-probe")]
 fn counters(files: &Files) -> Result<([u32; 4], u32), Status> {
     fn query(files: &Files, method: u16, phase: Option<u32>) -> Result<rt::sys::Reply, Status> {
         let mut request = proto_wire::Writer::new();
@@ -193,7 +193,7 @@ fn counters(files: &Files) -> Result<([u32; 4], u32), Status> {
     Ok((counts, pages))
 }
 
-#[cfg(feature = "auth-probe")]
+#[cfg(feature = "data-carrier-probe")]
 fn full_gone(files: &Files, held: PreparedOpen) -> Result<(), i32> {
     let before = counters(files).map_err(|_| 82)?;
     let child = super::open_stages::clone_bound(files, &[held.fd]).map_err(|_| 83)?;
@@ -445,7 +445,7 @@ fn run(files: &Files) -> Result<(), i32> {
     complete(files, job, overflow).map_err(|_| 55)?;
     cleanup(files, overflow.key, true).map_err(|_| 56)?;
     retained_completions(files, reused)?;
-    #[cfg(feature = "auth-probe")]
+    #[cfg(feature = "data-carrier-probe")]
     full_gone(files, reused)?;
     files.close_exact(reused).map_err(|_| 57)?;
     full_mapping(files)?;
