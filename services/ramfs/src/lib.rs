@@ -16,6 +16,9 @@ pub mod io;
 #[cfg(test)]
 mod io_tests;
 pub mod maintenance;
+pub use storage::namespace;
+#[cfg(test)]
+mod namespace_tests;
 pub mod open;
 pub mod places;
 pub mod resolve;

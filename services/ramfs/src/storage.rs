@@ -4,6 +4,9 @@
 //! One bounded inode namespace with boot-backed bytes and paid overlays.
 //! Reservations retain their expenditure root until cancellation or reclamation.
 
+#[path = "namespace.rs"]
+pub mod namespace;
+
 use crate::tree::Tree;
 use proto_fs::{NO_ENTRY, NO_SPACE};
 
@@ -104,6 +107,7 @@ pub struct Node {
     pub boot: u16,
     overlay: u16,
     reclaim: bool,
+    orphan_parent: bool,
 }
 impl Node {
     const EMPTY: Self = Self {
@@ -122,6 +126,7 @@ impl Node {
         boot: NONE,
         overlay: NONE,
         reclaim: false,
+        orphan_parent: false,
     };
     pub fn live(&self) -> bool {
         self.kind != 0 && !self.reclaim
@@ -1237,14 +1242,25 @@ impl<'a> Storage<'a> {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         let next = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
-        self.node(reservation.token)?;
-        self.node(d.parent)?;
+        let directory = self.node(reservation.token)?.kind == crate::DIR;
+        let parent = self.node(d.parent)?;
+        if parent.links == 0 {
+            return Err(NO_ENTRY);
+        }
+        let parent_links = if directory {
+            parent
+                .links
+                .checked_add(1)
+                .ok_or(namespace::TOO_MANY_LINKS)?
+        } else {
+            parent.links
+        };
         self.state.dentries[reservation.dentry as usize].reserved = false;
         let n = &mut self.state.nodes[reservation.token.slot as usize];
         n.pins[Pin::Pending.index()] -= 1;
         n.links = if n.kind == crate::DIR { 2 } else { 1 };
         if n.kind == crate::DIR {
-            self.state.nodes[d.parent.slot as usize].links += 1;
+            self.state.nodes[d.parent.slot as usize].links = parent_links;
         }
         self.unpin(d.parent, Pin::Pending)?;
         self.state.epoch = next;
@@ -1328,61 +1344,11 @@ impl<'a> Storage<'a> {
         self.state.dentry_len += 1;
         self.uncharge(root, |u| &mut u.dentries);
     }
-    /// Model namespace deletion. Public mutation methods are added separately.
+    /// Trusted model adapter using the common paid namespace journal.
     pub fn unlink(&mut self, parent: Token, name: &[u8], root: Root) -> Result<Token, u32> {
-        let token = self.lookup(parent, name)?;
-        if self.node(token)?.kind == crate::DIR {
-            return Err(proto_fs::IS_DIRECTORY);
-        }
-        let next = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
-        let original = (0..self.state.original_len)
-            .find(|&i| self.entry(parent, i).is_some_and(|(n, _)| n == name));
-        // Reserve the tombstone's name charge before publishing a boot overlay.
-        let original_account = if original.is_some() {
-            let a = self.account(root)?;
-            if self.state.dentry_len == 0
-                || self.state.accounts[a].unwrap().usage.dentries == DENTRY_SHARE
-            {
-                return Err(NO_SPACE);
-            }
-            Some(a)
-        } else {
-            None
-        };
-        self.overlay(token, root)?;
-        if let Some(i) = original {
-            let a = original_account.expect("reserved original name");
-            self.state.dentry_len -= 1;
-            let d = self.state.dentry_free[self.state.dentry_len] as usize;
-            self.state.dentries[d] = Dentry {
-                parent,
-                node: token,
-                root: a as u16,
-                reserved: true,
-                ..Dentry::EMPTY
-            };
-            self.state.accounts[a].as_mut().unwrap().usage.dentries += 1;
-            self.state.originals[i].hidden = true;
-        } else {
-            let i = self
-                .state
-                .dentries
-                .iter()
-                .position(|d| {
-                    d.len != 0
-                        && !d.reserved
-                        && d.parent == parent
-                        && &d.name[..d.len as usize] == name
-                })
-                .ok_or(NO_ENTRY)?;
-            self.drop_dentry(i);
-        }
-        self.state.nodes[token.slot as usize].links -= 1;
-        self.state.epoch = next;
-        self.collect(token);
-        Ok(token)
+        namespace::model_unlink(self, parent, name, root)
     }
-    /// Model hard link with one paid name; the shared inode retains its original root.
+    /// Trusted token-source model adapter using the common paid namespace journal.
     pub fn link(
         &mut self,
         root: Root,
@@ -1390,46 +1356,7 @@ impl<'a> Storage<'a> {
         name: &[u8],
         token: Token,
     ) -> Result<(), u32> {
-        if name.is_empty()
-            || name.len() > 255
-            || name.contains(&0)
-            || name.contains(&b'/')
-            || name == b"."
-            || name == b".."
-        {
-            return Err(proto_fs::INVALID_ARGUMENT);
-        }
-        if self.node(parent)?.kind != crate::DIR {
-            return Err(proto_fs::NOT_DIRECTORY);
-        }
-        if self.node(token)?.kind == crate::DIR {
-            return Err(proto_fs::PERMISSION);
-        }
-        if self.lookup(parent, name).is_ok() {
-            return Err(proto_fs::INVALID_ARGUMENT);
-        }
-        let next = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
-        let links = self.node(token)?.links.checked_add(1).ok_or(NO_SPACE)?;
-        let a = self.account(root)?;
-        if self.state.dentry_len == 0
-            || self.state.accounts[a].unwrap().usage.dentries == DENTRY_SHARE
-        {
-            return Err(NO_SPACE);
-        }
-        self.state.dentry_len -= 1;
-        let i = self.state.dentry_free[self.state.dentry_len] as usize;
-        self.state.dentries[i] = Dentry {
-            parent,
-            node: token,
-            root: a as u16,
-            len: name.len() as u8,
-            ..Dentry::EMPTY
-        };
-        self.state.dentries[i].name[..name.len()].copy_from_slice(name);
-        self.state.accounts[a].as_mut().unwrap().usage.dentries += 1;
-        self.state.nodes[token.slot as usize].links = links;
-        self.state.epoch = next;
-        Ok(())
+        namespace::model_link(self, root, parent, name, token)
     }
 
     pub fn boot_bytes(&self, token: Token) -> &'a [u8] {
@@ -1653,8 +1580,9 @@ impl<'a> Storage<'a> {
             self.state.page_len += 1;
             self.uncharge(overlay.root as usize, |u| &mut u.pages);
         } else {
+            let node = self.state.nodes[overlay.node as usize];
             self.state.nodes[overlay.node as usize] = Node {
-                generation: self.state.nodes[overlay.node as usize].generation,
+                generation: node.generation,
                 ..Node::EMPTY
             };
             self.state.overlays[i] = Overlay::EMPTY;
@@ -1663,6 +1591,10 @@ impl<'a> Storage<'a> {
             self.uncharge(overlay.root as usize, |u| &mut u.inodes);
             self.state.reclaim_head = (self.state.reclaim_head + 1) % INODES;
             self.state.reclaim_len -= 1;
+            if node.orphan_parent {
+                self.unpin(node.parent, Pin::Parent)
+                    .expect("exact orphan parent pin");
+            }
         }
         true
     }
