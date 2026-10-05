@@ -2907,7 +2907,10 @@ mod tests {
             entry("/dev/other", REGULAR | 0o666, 2),
         ]);
         let mut index = Index::new();
-        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
         let identity = authority::Identity {
             uid: 0,
             gid: 0,
@@ -2968,10 +2971,24 @@ mod tests {
                     .result_proof(&ram.storage, identity, intent)
                     .unwrap();
                 let held = journal
-                    .commit(&mut ram, &mut fds, Some(proof), identity, &mut charge, 20)
+                    .commit(
+                        &mut ram,
+                        &mut fds,
+                        Some(proof),
+                        identity,
+                        &mut charge,
+                        proto_fs::Timestamp::legacy_ns(20),
+                    )
                     .unwrap();
                 assert_eq!(
-                    journal.commit(&mut ram, &mut fds, None, identity, &mut charge, 99),
+                    journal.commit(
+                        &mut ram,
+                        &mut fds,
+                        None,
+                        identity,
+                        &mut charge,
+                        proto_fs::Timestamp::legacy_ns(99)
+                    ),
                     Ok(held)
                 );
                 let fd = ram.publish_open(&mut fds, held).unwrap();
