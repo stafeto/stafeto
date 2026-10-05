@@ -2812,11 +2812,14 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
 fn loader_info_probe() -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    let mut programs = LOADER_ABORT_PROGRAMS;
-    programs[1].3 = &["image-info-probe", "steps"];
-    programs[4].3 = &["image-info-probe"];
-    programs[5].3 = &["image-info-probe"];
-    let image = build_boot_image("boot-loader-info.img", &programs, BOOT_PROFILE)?;
+    const PROGRAMS: [ImageProgram; 6] = {
+        let mut programs = LOADER_ABORT_PROGRAMS;
+        programs[1].3 = &["image-info-probe", "steps"];
+        programs[4].3 = &["image-info-probe"];
+        programs[5].3 = &["image-info-probe"];
+        programs
+    };
+    let image = build_boot_image("boot-loader-info.img", &PROGRAMS, BOOT_PROFILE)?;
     let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     command.args(qemu::HEADLESS);
     command.args(qemu::ICOUNT);
