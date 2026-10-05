@@ -888,6 +888,32 @@ impl PosixFs {
         self.terminal = terminal;
     }
 
+    /// Replace startup transports while the existing pinned table is still idle.
+    /// Bind incoming sessions before locking. Drop either returned transport set
+    /// after unlocking, including the incoming set returned on refusal.
+    pub fn replace_initial_transports(
+        &mut self,
+        startup: StartupFiles,
+    ) -> Result<StartupFiles, (FsError, StartupFiles)> {
+        let standard = [Target::Input, Target::Output, Target::Error];
+        if self.cwd() != b"/"
+            || self.descriptors.has_holds()
+            || self.descriptors.has_pending_entries()
+            || self.descriptors.open().count() != standard.len()
+            || standard.into_iter().enumerate().any(|(fd, target)| {
+                self.descriptors.get(fd as u32) != Ok(target)
+                    || self.descriptors.flags(fd as u32) != Ok(DescriptorFlags::default())
+            })
+        {
+            return Err((FsError::InvalidArgument, startup));
+        }
+        Ok(StartupFiles {
+            files: core::mem::replace(&mut self.files, startup.files),
+            pipes: core::mem::replace(&mut self.pipes, startup.pipes),
+            terminal: core::mem::replace(&mut self.terminal, startup.terminal),
+        })
+    }
+
     /// The files through sessions the program was given (its loader's
     /// start, spec 2, 3.2), with `cwd` its current directory and the
     /// descriptors of `inherited` (the console's 0, 1 and 2 when None).

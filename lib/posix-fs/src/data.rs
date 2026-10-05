@@ -504,6 +504,51 @@ mod tests {
             ScalarResult::Failed(28)
         );
     }
+
+    #[test]
+    fn transport_replacement_preserves_incoming_custody_and_refuses_ownerless_debt() {
+        fn incoming() -> super::super::StartupFiles {
+            super::super::StartupFiles::from_sessions(
+                Handle::<Channel>::from_raw(rt::abi::Handle::new(8, 10)),
+                None,
+                None,
+                None,
+            )
+        }
+        let mut fs = files();
+        let fd = fs
+            .insert(target(43), super::super::DescriptorFlags::default())
+            .unwrap();
+        let (token, _, _) = fs
+            .begin_data(owner(1), fd, DataKind::Read, 3, 0, &[])
+            .unwrap();
+        fs.take_close(fd).unwrap();
+        fs.abandon_data_owner(owner(1)).unwrap();
+        assert_eq!(fs.descriptors().count(), 3);
+        let before = fs.data_snapshot(token).unwrap();
+        let session = fs.sessions().0.raw();
+        let refused = ManuallyDrop::new(fs.replace_initial_transports(incoming()));
+        let Err((_, retained)) = refused.as_ref() else {
+            panic!("resident debt must block replacement");
+        };
+        assert_eq!(
+            retained.files.sessions().0.raw(),
+            rt::abi::Handle::new(8, 10)
+        );
+        assert_eq!(fs.sessions().0.raw(), session);
+        assert_eq!(fs.data_snapshot(token).unwrap(), before);
+        let cleanup = cleanup_proof(fs.begin_data_cleanup(token).unwrap());
+        fs.finish_data_cleanup(cleanup).unwrap();
+        let accepted = ManuallyDrop::new(fs.replace_initial_transports(incoming()));
+        assert!(accepted.is_ok());
+        assert_eq!(fs.sessions().0.raw(), rt::abi::Handle::new(8, 10));
+        let Ok(old) = accepted.as_ref() else {
+            panic!("idle initial transports");
+        };
+        assert_eq!(old.files.sessions().0.raw(), session);
+        assert_eq!(fs.target(0).unwrap(), Target::Input);
+        assert_eq!(fs.data_tokens().count(), 0);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
