@@ -435,12 +435,17 @@ impl Files {
     }
 
     fn open_key_once(&self, method: Method, key: proto_fs::OpenKey) -> Result<sys::Reply, Status> {
+        let request = Self::open_key_bytes(method, key)?;
+        sys::send(&self.channel, &request).map_err(Status::Kernel)
+    }
+
+    fn open_key_bytes(method: Method, key: proto_fs::OpenKey) -> Result<[u8; 20], Status> {
         key.validate().map_err(Status::from_code)?;
-        let mut w = Writer::new();
-        method.header().write(&mut w)?;
-        w.u32(key.slot)?;
-        w.u64(key.generation)?;
-        sys::send(&self.channel, w.as_bytes()).map_err(Status::Kernel)
+        let mut request = [0; 20];
+        request[..8].copy_from_slice(&method.header().bytes());
+        request[8..12].copy_from_slice(&key.slot.to_le_bytes());
+        request[12..].copy_from_slice(&key.generation.to_le_bytes());
+        Ok(request)
     }
     /// Cleanup uses the client key even before its server job ID was decoded.
     pub fn open_cancel_key(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
@@ -1279,8 +1284,20 @@ impl Files {
         args: proto_fs::DataStart,
     ) -> Result<proto_fs::DataOutcome, Status> {
         let reply = self.open_key_once(Method::DataQuery, args.key)?;
-        let mut buffer = [0; MESSAGE_MAX];
-        proto_fs::DataOutcome::read(reply.bytes(&mut buffer), reply.handles.len(), args)
+        Self::data_query_reply(reply.len, &reply.words, reply.handles.len(), args)
+    }
+
+    fn data_query_reply(
+        len: usize,
+        words: &[u64; 8],
+        handles: usize,
+        args: proto_fs::DataStart,
+    ) -> Result<proto_fs::DataOutcome, Status> {
+        if len > 32 {
+            return Err(Status::BadSize);
+        }
+        let bytes = abi::inline_bytes(words);
+        proto_fs::DataOutcome::read(&bytes[..len], handles, args)
     }
 
     pub fn data_cancel_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
@@ -1416,5 +1433,107 @@ mod finalize_reply_tests {
             ),
             OpenFinalizeAttempt::Rejected(Status::Unknown(proto_fs::ACCESS_DENIED))
         ));
+    }
+}
+
+#[cfg(test)]
+mod small_data_wire_tests {
+    use super::*;
+
+    fn args() -> proto_fs::DataStart {
+        proto_fs::DataStart {
+            key: proto_fs::OpenKey {
+                slot: 31,
+                generation: u64::MAX,
+            },
+            kind: proto_fs::DataKind::PRead,
+            description: proto_fs::DataDescription {
+                packed: 34 | (127 << 8),
+                generation: 1,
+            },
+            count: 1016,
+            position: 7,
+        }
+    }
+
+    fn completed() -> [u64; 8] {
+        [5 << 32, 256, 1, 1016, 0, 0, 0, 0]
+    }
+
+    #[test]
+    fn key_request_preserves_complete_wire_identity() {
+        for method in [
+            Method::OpenFinish,
+            Method::OpenQuery,
+            Method::OpenCancel,
+            Method::DataQuery,
+            Method::DataReadResult,
+            Method::DataCancel,
+            Method::DataAck,
+        ] {
+            let key = args().key;
+            let mut old = Writer::new();
+            method.header().write(&mut old).unwrap();
+            old.u32(key.slot).unwrap();
+            old.u64(key.generation).unwrap();
+            assert_eq!(Files::open_key_bytes(method, key).unwrap(), old.as_bytes());
+            let mut invalid = key;
+            invalid.generation = 0;
+            assert!(Files::open_key_bytes(method, invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn inline_query_preserves_canonical_status_and_result_checks() {
+        let words = completed();
+        assert_eq!(
+            Files::data_query_reply(32, &words, 0, args()),
+            Ok(proto_fs::DataOutcome {
+                phase: proto_fs::DataPhase::Completed,
+                job: 256,
+                result: proto_fs::DataResult::Bytes(1016),
+            })
+        );
+        for len in [0, 4, 8, 31] {
+            assert_eq!(
+                Files::data_query_reply(len, &words, 0, args()),
+                Err(Status::BadSize)
+            );
+        }
+        assert_eq!(
+            Files::data_query_reply(32, &words, 1, args()),
+            Err(Status::BadSize)
+        );
+        let mut reserved = words;
+        reserved[2] |= 1 << 32;
+        assert_eq!(
+            Files::data_query_reply(32, &reserved, 0, args()),
+            Err(Status::BadSize)
+        );
+        let mut error = [0; 8];
+        error[0] = 319;
+        assert_eq!(
+            Files::data_query_reply(8, &error, 0, args()),
+            Err(Status::from_code(319))
+        );
+        assert_eq!(
+            Files::data_query_reply(32, &error, 0, args()),
+            Err(Status::BadSize)
+        );
+        error[0] |= 1 << 32;
+        assert_eq!(
+            Files::data_query_reply(8, &error, 0, args()),
+            Err(Status::BadSize)
+        );
+    }
+
+    #[test]
+    fn oversized_query_refuses_a_valid_prefix_without_truncation() {
+        for len in [33, 64, 65, 1024, usize::MAX] {
+            assert_eq!(
+                Files::data_query_reply(len, &completed(), 0, args()),
+                Err(Status::BadSize)
+            );
+        }
     }
 }
