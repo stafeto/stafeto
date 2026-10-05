@@ -3,11 +3,16 @@
 
 //! Process-local descriptors sharing backend open descriptions. The owner
 //! serializes table access and releases backends after unlocking. Ordinary
-//! operation holds and resident Open records share the fixed hold budget.
+//! operation holds and resident Open/Scalar records share the fixed hold budget.
 //! A live Open record preserves its completion through fd replacement.
 //! The caller pins this table's address while records or waiters exist.
 
 #![no_std]
+
+mod io;
+pub use io::*;
+mod scalar;
+pub use scalar::*;
 
 use core::{
     num::NonZeroU64,
@@ -312,19 +317,22 @@ impl<T: Copy, R: Copy> OpenRecord<T, R> {
 }
 
 #[derive(Clone, Copy)]
-enum Held<T, R> {
+enum Held<T, R, S> {
     Empty,
     Io(Hold<T>),
     Open(OpenRecord<T, R>),
+    Scalar(ScalarRecord<T, S>),
+    RecoverableIo(IoRecord<T, R>),
+    Disposal(DisposalSnapshot<T, R>),
 }
 
-struct HoldSlot<T, R> {
+struct HoldSlot<T, R, S> {
     generation: u64,
     changed: AtomicU32,
-    held: Held<T, R>,
+    held: Held<T, R, S>,
 }
 
-impl<T, R> HoldSlot<T, R> {
+impl<T, R, S> HoldSlot<T, R, S> {
     fn change(&self) {
         let value = self.changed.load(Ordering::Relaxed);
         self.changed
@@ -332,13 +340,13 @@ impl<T, R> HoldSlot<T, R> {
     }
 }
 
-pub struct Table<T: Copy + Eq, const N: usize, R: Copy = ()> {
+pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = ()> {
     entries: [EntrySlot<T>; N],
-    holds: [HoldSlot<T, R>; N],
+    holds: [HoldSlot<T, R, S>; N],
     release_early: fn(T) -> bool,
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy> Default for Table<T, N, R> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Default for Table<T, N, R, S> {
     fn default() -> Self {
         Self {
             entries: [EntrySlot {
@@ -357,12 +365,52 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Default for Table<T, N, R> {
     }
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
     /// Armed early-release operations retain their generations in the service.
     pub fn with_early_release(release_early: fn(T) -> bool) -> Self {
         Self {
             release_early,
             ..Self::default()
+        }
+    }
+
+    /// Initialize a table directly in its permanent startup allocation.
+    /// Every slot receives a valid enum and atomic value independently.
+    ///
+    /// # Safety
+    /// `destination` is aligned, writable, and valid for a complete uninitialized
+    /// `Self`. The caller has exclusive access until startup publishes Ready.
+    /// No initialized resources may occupy this allocation. Its address remains
+    /// pinned while live records or waiters refer to the hold headers.
+    pub unsafe fn initialize_at(destination: *mut Self, release_early: fn(T) -> bool) {
+        // SAFETY: the caller provides exclusive writable storage for all fields.
+        let entries =
+            unsafe { core::ptr::addr_of_mut!((*destination).entries) }.cast::<EntrySlot<T>>();
+        // SAFETY: this field lies within the caller's complete Self allocation.
+        let holds =
+            unsafe { core::ptr::addr_of_mut!((*destination).holds) }.cast::<HoldSlot<T, R, S>>();
+        for index in 0..N {
+            // SAFETY: index is bounded by the entries array; write initializes
+            // this element without reading or dropping uninitialized bytes.
+            unsafe {
+                entries.add(index).write(EntrySlot {
+                    generation: 0,
+                    state: EntryState::Empty,
+                });
+            }
+            // SAFETY: index is bounded by the holds array. The enum and atomic
+            // receive their valid initial values before any reader exists.
+            unsafe {
+                holds.add(index).write(HoldSlot {
+                    generation: 0,
+                    changed: AtomicU32::new(0),
+                    held: Held::Empty,
+                });
+            }
+        }
+        // SAFETY: exclusive startup ownership permits initializing this field.
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).release_early).write(release_early);
         }
     }
 
@@ -446,7 +494,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
     }
 
     fn left(&mut self, backend: T) -> Option<T> {
-        if self.referenced(backend) {
+        if self.referenced(backend) || self.scalar_pinned(backend) || self.io_pinned(backend) {
             return None;
         }
         let hold = self.holds.iter_mut().find_map(|slot| match &mut slot.held {
@@ -504,7 +552,11 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
         }
         let closed = hold.closed && !hold.released;
         slot.held = Held::Empty;
-        (closed && !self.referenced(backend)).then_some(backend)
+        (closed
+            && !self.referenced(backend)
+            && !self.scalar_pinned(backend)
+            && !self.io_pinned(backend))
+        .then_some(backend)
     }
 
     /// Discard abandoned ordinary I/O holds one release at a time.
@@ -518,7 +570,12 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
                 unreachable!()
             };
             slot.held = Held::Empty;
-            if hold.closed && !hold.released && !self.referenced(hold.backend) {
+            if hold.closed
+                && !hold.released
+                && !self.referenced(hold.backend)
+                && !self.scalar_pinned(hold.backend)
+                && !self.io_pinned(hold.backend)
+            {
                 return Some(hold.backend);
             }
         }
@@ -1000,7 +1057,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
         Some(Abandoned::ClaimReleased(token))
     }
 
-    /// The fork child drops inherited recovery authority in its private table.
+    /// The fork child drops inherited Open/Scalar/Io/Disposal recovery locally.
     /// Published fd references survive. The parent owns every unresolved job.
     /// The caller establishes child-exclusive access before this operation.
     pub fn discard_open_after_fork(&mut self) {
@@ -1010,7 +1067,10 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
             }
         }
         for slot in &mut self.holds {
-            if matches!(slot.held, Held::Open(_)) {
+            if matches!(
+                slot.held,
+                Held::Open(_) | Held::Scalar(_) | Held::RecoverableIo(_) | Held::Disposal(_)
+            ) {
                 slot.held = Held::Empty;
                 slot.change();
             }
