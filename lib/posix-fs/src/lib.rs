@@ -7,6 +7,7 @@
 #![no_std]
 
 pub mod data;
+pub mod io;
 pub mod open;
 mod target;
 pub use target::RamTarget;

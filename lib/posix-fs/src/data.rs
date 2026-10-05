@@ -1059,6 +1059,20 @@ impl PosixFs {
             .scalar_finish_cleanup(proof.token)
             .map_err(FsError::from)
     }
+    /// Detach exactly the original operation before its lifetime can be reused.
+    pub fn abandon_data(
+        &mut self,
+        token: ScalarToken,
+        owner: OwnerToken,
+    ) -> Result<ScalarAbandoned<Target, Recovery>, FsError> {
+        if self.data_snapshot(token)?.owner != Some(owner) {
+            return Err(FsError::BadFileDescriptor);
+        }
+        self.descriptors
+            .abandon_scalar(token)
+            .map_err(FsError::from)
+    }
+
     pub fn abandon_data_owner(
         &mut self,
         owner: OwnerToken,
