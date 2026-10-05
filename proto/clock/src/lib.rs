@@ -139,6 +139,7 @@ mod reply_tests {
 /// CLOCK_REALTIME is then the anchor's ns plus the monotonic ns since its
 /// instant.
 pub mod page {
+    use core::sync::atomic::{Ordering, fence};
     /// The counter s, a u64 word.
     pub const SEQUENCE: usize = 0;
     /// The first place; the second follows it.
@@ -150,6 +151,46 @@ pub mod page {
     pub const MONO: usize = 16;
     pub const GENERATION: usize = 24;
     pub const PLACE_SIZE: usize = 32;
+    /// One complete realtime anchor from the shared page.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Anchor {
+        pub value_ns: i128,
+        pub monotonic_ns: u64,
+        pub generation: u64,
+    }
+
+    impl Anchor {
+        /// Add elapsed monotonic nanoseconds with checked signed arithmetic.
+        pub fn realtime_ns(self, monotonic_now: u64) -> Option<i128> {
+            self.value_ns
+                .checked_add(i128::from(monotonic_now.saturating_sub(self.monotonic_ns)))
+        }
+    }
+
+    /// Read one snapshot in six atomic loads. A changed sequence defers it.
+    /// Each call to `load` must read the aligned AtomicU64 at the byte offset
+    /// in the mapped page with the supplied ordering.
+    pub fn read_anchor_once(mut load: impl FnMut(usize, Ordering) -> u64) -> Option<Anchor> {
+        let sequence = load(SEQUENCE, Ordering::Acquire);
+        let place = PLACES + (sequence % 2) as usize * PLACE_SIZE;
+        let low = load(place + LOW, Ordering::Relaxed);
+        let high = load(place + HIGH, Ordering::Relaxed);
+        let monotonic_ns = load(place + MONO, Ordering::Relaxed);
+        let generation = load(place + GENERATION, Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        if load(SEQUENCE, Ordering::Relaxed) != sequence {
+            return None;
+        }
+        Some(Anchor {
+            value_ns: ((u128::from(high) << 64) | u128::from(low)) as i128,
+            monotonic_ns,
+            generation,
+        })
+    }
+
     /// The size of the object.
     pub const SIZE: usize = 4096;
 }
+
+#[cfg(test)]
+mod page_tests;
