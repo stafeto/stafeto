@@ -87,7 +87,7 @@ static int counts(int fd, const struct pin_snapshot *baseline, uint32_t images) 
             actual.own_descriptions == baseline->own_descriptions + images &&
             actual.global_descriptions == baseline->global_descriptions + images &&
             memcmp(actual.root, baseline->root, sizeof(actual.root)) == 0) {
-            printf("t6-runtime: images %u Shared %u own/root/global descriptions %u/%u root %llu/%llu\n",
+            printf("t6-runtime: images %u Shared %u own/global descriptions %u/%u root %llu/%llu\n",
                    actual.pins, actual.counts[3], actual.own_descriptions,
                    actual.global_descriptions, (unsigned long long)actual.root[0],
                    (unsigned long long)actual.root[1]);
