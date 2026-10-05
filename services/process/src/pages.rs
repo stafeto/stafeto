@@ -17,7 +17,7 @@ use rt::{loader, sys};
 
 const PAGE: usize = 4096;
 /// The pages of one object.
-const GROUP: usize = 32;
+const GROUP: usize = 4;
 const OBJECTS: usize = RECORDS / GROUP;
 /// Where the service maps its objects, GROUP pages each, one after the
 /// other.

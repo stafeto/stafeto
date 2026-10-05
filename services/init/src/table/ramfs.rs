@@ -342,8 +342,9 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     Record {
         name: "posix",
         program: "posix-process-service",
-        // Its own, and the eight objects of the pages of its records
-        // (32 pages each); what its POSIX records take init adds.
+        // Its own, and the 64 objects of the pages of its records
+        // (four data pages and one page-list node each); init adds what
+        // its POSIX records take.
         quota: 640 * PAGE,
         // A process handle for each of its 256 records.
         handle_limit: 1024,
