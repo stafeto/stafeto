@@ -1705,14 +1705,14 @@ mod tests {
             (initial, written, written)
         );
         let mut byte = [0];
-        assert_eq!(ram.pread(&mut fds, fd, 0, &mut byte, read), Ok(1));
+        assert_eq!(ram.pread(&fds, fd, 0, &mut byte, read), Ok(1));
         assert_eq!(byte, *b"x");
         let info = ram.descriptor_information(&fds, fd).unwrap();
         assert_eq!(
             (info.access_time, info.modify_time, info.change_time),
             (read, written, written)
         );
-        assert_eq!(ram.pread(&mut fds, fd, 0, &mut [], initial), Ok(0));
+        assert_eq!(ram.pread(&fds, fd, 0, &mut [], initial), Ok(0));
         assert_eq!(
             ram.descriptor_information(&fds, fd).unwrap().access_time,
             read
