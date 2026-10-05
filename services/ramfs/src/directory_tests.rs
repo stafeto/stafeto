@@ -451,3 +451,35 @@ fn committed_directory_prefix_survives_rmdir_until_exact_cleanup() {
     assert!(ram.storage.node(dir).is_err());
     assert_eq!(ram.storage.usage(EXPENSE), crate::storage::Usage::default());
 }
+
+#[test]
+fn directory_result_survives_cleanup_until_original_ack() {
+    let mut ram = Ram::new(Timestamp::ZERO);
+    let dir = create(&mut ram, ROOT, b"review-dir", DIR);
+    create(&mut ram, dir, b"entry", REG);
+    let mut fds = Fds {
+        root: EXPENSE,
+        ..Fds::default()
+    };
+    let fd = ram.open(&mut fds, "/review-dir", READ_ONLY).unwrap();
+    let charge = ram.storage.charge_preparation(EXPENSE).unwrap();
+    let mut job = ram
+        .prepare_directory(&fds, fd, charge, ADMIN, 1016, DirectoryFormat::Linux64)
+        .unwrap();
+    assert_eq!(job.bytes(), Err(proto_fs::RESOLVING));
+    while !job.step(&ram, ADMIN).unwrap() {}
+    assert_eq!(job.bytes(), Err(proto_fs::RESOLVING));
+    let stamp = Timestamp::new(-5, 2).unwrap();
+    let result = job.commit(&mut ram, ADMIN, stamp).unwrap();
+    let cached = job.bytes().unwrap().to_vec();
+    assert!(!cached.is_empty());
+    assert!(job.cancel_step(&mut ram));
+    assert!(job.cancel_step(&mut ram));
+    assert_eq!(job.commit(&mut ram, ADMIN, Timestamp::ZERO), Ok(result));
+    assert_eq!(job.bytes(), Ok(cached.as_slice()));
+    assert_eq!(ram.storage.preparations_used(), 1);
+    assert_eq!(ram.storage.node(dir).unwrap().times[0], stamp);
+    ram.storage.release_preparation(charge);
+    assert_eq!(ram.storage.preparations_used(), 0);
+    ram.release(&mut fds);
+}

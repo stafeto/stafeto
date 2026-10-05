@@ -132,9 +132,7 @@ impl DirectoryJournal {
         self.outcome
     }
     pub fn bytes(&self) -> Result<&[u8], u32> {
-        if self.phase != Phase::Committed
-            || !matches!(self.outcome, Some(DirectoryOutcome::Bytes { .. }))
-        {
+        if !matches!(self.outcome, Some(DirectoryOutcome::Bytes { .. })) {
             return Err(RESOLVING);
         }
         Ok(&self.output[..self.used as usize])
