@@ -68,6 +68,50 @@ fn open(files: &Files, generation: u64, path: &[u8]) -> Result<PreparedOpen, Sta
     Ok(held)
 }
 
+fn full_mapping(files: &Files) -> Result<(), i32> {
+    let held = open(files, 3, b"/tmp/data-full-map").map_err(|_| 60)?;
+    for page in 0..2048 {
+        let mut request = args(held, 25, DataKind::PWrite, 1, page * 4096);
+        request.key.generation = page + 1;
+        let (_, job) = files.data_start_once(request).map_err(|_| 61)?;
+        files.data_feed_once(job, 0, b"M").map_err(|_| 62)?;
+        if complete(files, job, request).map_err(|_| 63)?.result != DataResult::Bytes(1) {
+            return Err(64);
+        }
+        cleanup(files, request.key, true).map_err(|_| 65)?;
+    }
+    let request = args(held, 26, DataKind::Truncate, 0, 4097);
+    let (_, job) = files.data_start_once(request).map_err(|_| 66)?;
+    let outcome = complete(files, job, request).map_err(|_| 67)?;
+    if outcome.result != DataResult::Bytes(0) || files.data_commit_once(job, request) != Ok(outcome)
+    {
+        return Err(68);
+    }
+    cleanup(files, request.key, true).map_err(|_| 69)?;
+    if files.descriptor_information(held.fd).map_err(|_| 70)?.size != 4097 {
+        return Err(71);
+    }
+    let extend = args(held, 27, DataKind::Truncate, 0, 8 * 1024 * 1024);
+    let (_, job) = files.data_start_once(extend).map_err(|_| 72)?;
+    complete(files, job, extend).map_err(|_| 73)?;
+    cleanup(files, extend.key, true).map_err(|_| 74)?;
+    let read = args(held, 28, DataKind::PRead, 1, 2047 * 4096);
+    let (_, job) = files.data_start_once(read).map_err(|_| 75)?;
+    if complete(files, job, read).map_err(|_| 76)?.result != DataResult::Bytes(1) {
+        return Err(77);
+    }
+    let mut byte = [9];
+    files
+        .data_read_result_once(read.key, 1, &mut byte)
+        .map_err(|_| 78)?;
+    if byte != [0] {
+        return Err(79);
+    }
+    cleanup(files, read.key, true).map_err(|_| 80)?;
+    files.close_exact(held).map_err(|_| 81)?;
+    Ok(())
+}
+
 fn run(files: &Files) -> Result<(), i32> {
     let held = open(files, 1, b"/tmp/data-stages").map_err(|_| 1)?;
     let input = [0x57; proto_fs::MAX_WRITE];
@@ -215,6 +259,7 @@ fn run(files: &Files) -> Result<(), i32> {
     complete(files, job, overflow).map_err(|_| 55)?;
     cleanup(files, overflow.key, true).map_err(|_| 56)?;
     files.close_exact(reused).map_err(|_| 57)?;
+    full_mapping(files)?;
     Ok(())
 }
 
