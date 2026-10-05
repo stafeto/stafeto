@@ -42,12 +42,24 @@ impl Journal {
     pub fn new(flags: u32, mode: u32, umask: u32) -> Result<Self, u32> {
         let allowed = 3
             | proto_fs::DIRECTORY_ONLY
+            | proto_fs::CHANGES
             | proto_fs::CREATE
             | proto_fs::EXCLUSIVE
             | proto_fs::TRUNCATE
             | proto_fs::APPEND
             | proto_fs::NO_FOLLOW;
         if flags & !allowed != 0 || flags & 3 == 3 {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        if flags & proto_fs::CHANGES != 0
+            && flags
+                & (proto_fs::CREATE
+                    | proto_fs::EXCLUSIVE
+                    | proto_fs::TRUNCATE
+                    | proto_fs::APPEND
+                    | proto_fs::NO_FOLLOW)
+                != 0
+        {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         Ok(Self {
@@ -89,6 +101,9 @@ impl Journal {
                         held,
                     };
                     return Ok(true);
+                }
+                if self.flags & proto_fs::CHANGES != 0 {
+                    return Err(proto_fs::INVALID_ARGUMENT);
                 }
                 if self.flags & proto_fs::CREATE == 0 {
                     return Err(proto_fs::NO_ENTRY);

@@ -102,7 +102,7 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
     fn run(fd: i32, loaded: i32) -> Result<(), Status> {
         let fd = u32::try_from(fd).map_err(|_| Status::BadSize)?;
         let descriptor = posix_abi::shared::with_files(|files| match files.target(fd) {
-            Ok(posix_fs::Target::Ram(fd)) => Ok(fd),
+            Ok(posix_fs::Target::Ram(fd)) => Ok(fd.fd()),
             _ => Err(posix_abi::constants::EIO),
         })
         .map_err(|_| Status::BadSize)?;

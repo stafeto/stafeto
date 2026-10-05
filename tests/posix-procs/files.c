@@ -8,6 +8,7 @@
 extern int files_fake_identity(void);
 extern int files_full_sessions(void);
 extern int files_open_stages(void);
+#include "pending-open.c"
 #if LOADER_ABORT_PROBE
 #include "loader-abort.c"
 #endif
@@ -33,6 +34,15 @@ int main(void) {
     if (open(name,O_RDONLY) != -1 || errno != ENOENT) return 10;
     name[255]='x'; char over[258]; memcpy(over,name,256);over[256]='x';over[257]=0;errno=0;
     if (open(over,O_RDONLY) != -1 || errno != ENAMETOOLONG) return 11;
+    fd = open("/dev/null", O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0600);
+    if (fd < 0 || write(fd, "null", 4) != 4 || close(fd)) return 15;
+    fd = open("/dev/urandom", O_WRONLY | O_APPEND);
+    if (fd < 0 || write(fd, "random", 6) != 6 || close(fd)) return 16;
+    errno = 0;
+    if (open("/etc/motd", O_RDONLY | O_CREAT, 0600) != -1 || errno != EINVAL) return 17;
+    errno = 0;
+    if (open("/tmp/changes-missing", O_WRONLY | O_CREAT, 0600) != -1 || errno != ENOENT) return 18;
+    puts("posix-files: compatibility device-only flags ok");
     int staged = files_open_stages();
     if (staged) { printf("posix-files: staged Open failed %d\n", staged); return 14; }
     puts("posix-files: staged CREATE/TRUNC cached outcome and hidden fd ok");
@@ -41,5 +51,11 @@ int main(void) {
 #if LOADER_ABORT_PROBE
     if (files_loader_abort()) return 13;
 #endif
+    int pending = check_pending_dup();
+    if (pending) { printf("posix-files: Pending dup failed %d\n", pending); return 19; }
+    pending = check_pending_claimant();
+    if (pending) { printf("posix-files: Pending claimant failed %d\n", pending); return 22; }
+    pending = check_pending_ended();
+    if (pending) { printf("posix-files: Pending Ended failed %d\n", pending); return 20; }
     puts("posix-files: identity and proofs ok"); return 0;
 }

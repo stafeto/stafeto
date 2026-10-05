@@ -16,6 +16,7 @@ pub mod fork;
 pub mod loader_probe;
 pub mod long;
 pub mod metadata;
+mod open_driver;
 pub mod pipes;
 pub mod process;
 pub mod random;
@@ -335,6 +336,16 @@ pub fn dup2(source: c_int, target: c_int) -> Result<c_int, c_int> {
     shared::number(Request::Dup2 {
         source: fd(source)?,
         target: fd(target)?,
+    })
+    .map(|fd| fd as c_int)
+}
+
+/// Replace a descriptor and capture its close flags in the same table transition.
+pub fn dup3(source: c_int, target: c_int, flags: c_int) -> Result<c_int, c_int> {
+    shared::number(Request::Dup3 {
+        source: fd(source)?,
+        target: fd(target)?,
+        flags: flags as u32,
     })
     .map(|fd| fd as c_int)
 }

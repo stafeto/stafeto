@@ -165,13 +165,13 @@ pub enum Target {
     Input,
     Output,
     Error,
-    Ram(u32),
+    Ram(RamTarget),
     Pipe(u32),
     Tty(u32),
     /// A random device (`/dev/random`, `/dev/urandom`, 5e'): the service's
     /// open description of this number takes the writes, the closes and
     /// the `fstat`, and the layer serves the reads from its generator.
-    Random(u32),
+    Random(RamTarget),
 }
 
 /// The name `ttyname` gives the terminal `terminal`.
@@ -315,7 +315,8 @@ const CONSOLE_INFO: NodeInfo = NodeInfo {
 };
 
 impl Transport {
-    fn files(&self) -> ManuallyDrop<Files> {
+    /// Borrow the existing file session for paid client phases.
+    pub fn files(&self) -> ManuallyDrop<Files> {
         self.0.files()
     }
 
@@ -366,8 +367,11 @@ impl Transport {
     }
 
     #[inline(never)]
-    fn close_file(&self, fd: u32) -> Result<(), FsError> {
-        self.files().close(fd).map_err(FsError::from)
+    fn close_file(&self, fd: RamTarget) -> Result<(), FsError> {
+        self.files()
+            .close_exact(fd.prepared())
+            .map(|_| ())
+            .map_err(FsError::from)
     }
 
     #[inline(never)]
@@ -421,19 +425,16 @@ impl Transport {
         Ok((read, write))
     }
 
-    /// OPEN: the service's description, as a random device when the
-    /// service says so and the description reads: one opened for writing
-    /// alone stays a file of the service, which refuses its reads with
-    /// BAD_FD.
-    pub fn open(&self, path: &[u8], flags: u32) -> Result<Target, FsError> {
-        let (fd, random) = self
-            .files()
-            .open_marked_bytes(path, flags)
-            .map_err(FsError::from)?;
-        Ok(if random && flags & 3 != proto_fs::WRITE_ONLY {
-            Target::Random(fd)
+    /// Capture the complete held outcome before the descriptor becomes public.
+    pub fn opened_target(held: rt::fs::PreparedOpen, access: u32) -> Result<Target, FsError> {
+        if access > proto_fs::READ_WRITE {
+            return Err(FsError::InvalidArgument);
+        }
+        let exact = RamTarget::from_prepared(held)?;
+        Ok(if held.random && access != proto_fs::WRITE_ONLY {
+            Target::Random(exact)
         } else {
-            Target::Ram(fd)
+            Target::Ram(exact)
         })
     }
 
@@ -455,7 +456,7 @@ impl Transport {
     pub fn read(&self, target: Target, out: &mut [u8]) -> Result<usize, FsError> {
         let fd = match target {
             Target::Input => 0,
-            Target::Ram(fd) => fd,
+            Target::Ram(fd) => fd.fd(),
             _ => return Err(FsError::BadFileDescriptor),
         };
         self.files().read(fd, out).map_err(FsError::from)
@@ -477,7 +478,7 @@ impl Transport {
         let fd = match target {
             Target::Output => 1,
             Target::Error => 2,
-            Target::Ram(fd) | Target::Random(fd) => fd,
+            Target::Ram(fd) | Target::Random(fd) => fd.fd(),
             _ => return Err(FsError::BadFileDescriptor),
         };
         self.files().write(fd, bytes).map_err(FsError::from)
@@ -487,7 +488,7 @@ impl Transport {
         match target {
             Target::Ram(fd) | Target::Random(fd) => self
                 .files()
-                .seek_from(fd, offset, origin)
+                .seek_from(fd.fd(), offset, origin)
                 .map_err(FsError::from),
             _ => Err(FsError::NotSeekable),
         }
@@ -537,7 +538,7 @@ impl Transport {
         match target {
             Target::Ram(fd) | Target::Random(fd) => self
                 .files()
-                .descriptor_information(fd)
+                .descriptor_information(fd.fd())
                 .map_err(FsError::from),
             Target::Tty(id) => self.terminal_information(id, None),
             Target::Pipe(end) => {
@@ -690,7 +691,7 @@ impl Transport {
         match target {
             Target::Ram(fd) => self
                 .files()
-                .read_dir_fd(fd, out)
+                .read_dir_fd(fd.fd(), out)
                 .map_err(FsError::from)?
                 .map(|(name_len, kind, inode)| {
                     Ok(DirEntry {
@@ -711,7 +712,14 @@ impl Transport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Inherited {
     pub fd: u32,
-    pub target: Target,
+    pub target: InheritedTarget,
+}
+
+/// Loader names carry raw RAM numbers until bound startup normalization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InheritedTarget {
+    Ready(Target),
+    RawRam { fd: u32, random_hint: bool },
 }
 
 /// The errno-like error of a refusal of the pipe service.
@@ -763,6 +771,52 @@ impl PosixFs {
                 *slot = true;
             }
         }
+        let mut normalized = [None; OPEN_MAX];
+        let mut captured = [None; OPEN_MAX];
+        if let Some(list) = inherited {
+            for (index, item) in list.iter().enumerate() {
+                let ram_fd = |target| match target {
+                    InheritedTarget::RawRam { fd, .. } => Some(fd),
+                    InheritedTarget::Ready(Target::Ram(exact) | Target::Random(exact)) => {
+                        Some(exact.fd())
+                    }
+                    _ => None,
+                };
+                let target = if let Some(fd) = ram_fd(item.target) {
+                    let previous = list[..index]
+                        .iter()
+                        .position(|old| ram_fd(old.target) == Some(fd));
+                    let info = if let Some(previous) = previous {
+                        captured[previous].expect("previous RAM import normalized")
+                    } else {
+                        startup
+                            .files
+                            .capture_description(fd)
+                            .map_err(FsError::from)?
+                    };
+                    let target = Transport::opened_target(info.held, info.flags & 3)?;
+                    match item.target {
+                        InheritedTarget::RawRam { random_hint, .. } => {
+                            if matches!(target, Target::Random(_)) != random_hint {
+                                return Err(FsError::Io);
+                            }
+                        }
+                        InheritedTarget::Ready(expected) if expected != target => {
+                            return Err(FsError::Io);
+                        }
+                        _ => {}
+                    }
+                    captured[index] = Some(info);
+                    target
+                } else {
+                    let InheritedTarget::Ready(target) = item.target else {
+                        unreachable!("raw RAM import has a numeric description");
+                    };
+                    target
+                };
+                normalized[item.fd as usize] = Some(target);
+            }
+        }
         let StartupFiles {
             files,
             pipes,
@@ -785,7 +839,11 @@ impl PosixFs {
         if let Some(list) = inherited {
             for item in list {
                 own.descriptors
-                    .place(item.fd, item.target, DescriptorFlags::default())
+                    .place(
+                        item.fd,
+                        normalized[item.fd as usize].expect("normalized import"),
+                        DescriptorFlags::default(),
+                    )
                     .expect("validated startup descriptor");
             }
         }
@@ -842,39 +900,14 @@ impl PosixFs {
         inherited: Option<&[Inherited]>,
         secure: bool,
     ) -> Result<Self, FsError> {
-        let mut fs = match inherited {
-            None => Self::from_files(Files::from_sessions(files, uart))?,
-            Some(list) => {
-                let mut fs = Self {
-                    files: Files::from_sessions(files, uart),
-                    pipes: None,
-                    terminal: None,
-                    paths: PathState::new(),
-                    descriptors: Table::with_early_release(|target| {
-                        matches!(target, Target::Tty(_))
-                    }),
-                };
-                for d in list {
-                    fs.descriptors
-                        .place(d.fd, d.target, DescriptorFlags::default())?;
-                }
-                if secure {
-                    for (fd, target) in
-                        [(0, Target::Input), (1, Target::Output), (2, Target::Error)]
-                    {
-                        if fs.descriptors.get(fd).is_err() {
-                            fs.descriptors
-                                .place(fd, target, DescriptorFlags::default())?;
-                        }
-                    }
-                }
-                fs
-            }
-        };
-        if !cwd.is_empty() {
-            fs.paths.set_cwd(cwd)?;
+        let mut destination = core::mem::MaybeUninit::uninit();
+        let startup = StartupFiles::from_sessions(files, uart, None, None);
+        // SAFETY: this compatibility constructor owns fresh local storage until return.
+        unsafe {
+            Self::initialize_at(destination.as_mut_ptr(), startup, cwd, inherited, secure)?;
         }
-        Ok(fs)
+        // SAFETY: initialize_at completed all fields.
+        Ok(unsafe { destination.assume_init() })
     }
 
     /// The files of a forked child (spec 2, 3.2), whose table is a copy of
@@ -912,14 +945,14 @@ impl PosixFs {
     /// The service's descriptions a forked child's session shares with
     /// its parent's: those of the descriptors without FD_CLOFORK, each
     /// once, into `out`; how many.
-    pub fn kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+    pub fn kept_by_fork(&self, out: &mut [rt::fs::PreparedOpen; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
             if let Target::Ram(n) | Target::Random(n) = target
                 && !flags.close_on_fork
-                && !out[..count].contains(&n)
+                && !out[..count].contains(&n.prepared())
             {
-                out[count] = n;
+                out[count] = n.prepared();
                 count += 1;
             }
         }
@@ -927,13 +960,13 @@ impl PosixFs {
     }
 
     /// Every RAM description retained by exec, including FD_CLOFORK.
-    pub fn kept_by_exec(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+    pub fn kept_by_exec(&self, out: &mut [rt::fs::PreparedOpen; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, _) in self.descriptors.open() {
             if let Target::Ram(n) | Target::Random(n) = target
-                && !out[..count].contains(&n)
+                && !out[..count].contains(&n.prepared())
             {
-                out[count] = n;
+                out[count] = n.prepared();
                 count += 1;
             }
         }
@@ -1133,20 +1166,7 @@ impl PosixFs {
 
     /// Open by a single owner: the request, then the descriptor.
     pub fn open(&mut self, path: &[u8], flags: u32) -> Result<u32, FsError> {
-        if path.last() == Some(&b'/') && self.stat(path)?.kind == FileKind::Regular {
-            return Err(FsError::NotDirectory);
-        }
-        let resolved = self.resolve(path)?;
-        self.descriptors.vacant(0)?;
-        let transport = self.transport();
-        let opened = transport.open(resolved.as_bytes(), flags)?;
-        match self.insert(opened, DescriptorFlags::default()) {
-            Ok(fd) => Ok(fd),
-            Err(error) => {
-                let _ = transport.release(Some(opened));
-                Err(error)
-            }
-        }
+        self.open_policy(path, flags, 0, 0, DescriptorFlags::default())
     }
 
     pub fn close(&mut self, fd: u32) -> Result<(), FsError> {

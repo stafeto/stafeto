@@ -115,7 +115,7 @@ fn run(fd: i32, root_full: bool) -> Result<(), Status> {
         else {
             return Err(posix_abi::constants::EIO);
         };
-        Ok((files.sessions().0.raw(), descriptor))
+        Ok((files.sessions().0.raw(), descriptor.fd()))
     })
     .map_err(|_| Status::BadSize)?;
     let identity = posix_abi::process::identity().ok_or(Status::BadSize)?;

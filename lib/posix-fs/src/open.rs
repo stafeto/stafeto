@@ -6,8 +6,8 @@
 
 use super::{DescriptorFlags, FsError, PosixFs, Target};
 pub use posix_fd::{
-    Abandoned, Claim, ClaimToken, Completion, EntryToken, OpenSnapshot, OpenToken, OwnerToken,
-    Replacement, WaitValue,
+    Abandoned, Claim, ClaimToken, Completion, EntryToken, OpenPhase, OpenSnapshot, OpenToken,
+    OwnerToken, Replacement, WaitValue,
 };
 use rt::fs::PreparedOpen;
 
@@ -150,6 +150,29 @@ impl PosixFs {
             .map_err(FsError::from)
     }
 
+    /// A surviving original acknowledges the first completion saved by either participant.
+    /// A failed remote attempt can still observe the helper's canonical completion.
+    pub fn acknowledge_open_cancel(
+        &mut self,
+        token: OpenToken,
+        owner: OwnerToken,
+        canonical: bool,
+        errno: i32,
+    ) -> Result<Option<Completion>, FsError> {
+        let snapshot = self.open_snapshot(token)?;
+        if snapshot.owner != Some(owner) {
+            return Err(FsError::BadFileDescriptor);
+        }
+        if snapshot.completion.is_some() {
+            return self.ack_open_record(token, owner).map(Some);
+        }
+        if canonical {
+            let _snapshot = self.finish_open_cancel(token, errno)?;
+            return self.ack_open_record(token, owner).map(Some);
+        }
+        Ok(None)
+    }
+
     /// The same paid record owns canonical cleanup after an unreturned publication.
     pub fn abandon_open_record(
         &mut self,
@@ -194,5 +217,102 @@ impl PosixFs {
             Some(flags) => self.descriptors.try_dup3(source, target, flags),
         }
         .map_err(FsError::from)
+    }
+}
+
+impl Recovery {
+    /// Capture the immutable full outcome before the final handoff request.
+    pub fn remember(mut self, held: PreparedOpen) -> Self {
+        self.backend_fd = held.fd
+            | (held.slot << proto_fs::OPEN_DESCRIPTION_SHIFT)
+            | if held.random {
+                proto_fs::OPEN_RANDOM
+            } else {
+                0
+            };
+        self.description_generation = held.generation;
+        self.phase = Phase::Finishing;
+        self
+    }
+}
+
+impl PosixFs {
+    /// A native owner keeps exclusive access to this pinned table through the call.
+    /// Public threaded callers use the shared adapter between each paid phase.
+    pub fn open_policy(
+        &mut self,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+        umask: u32,
+        descriptor_flags: DescriptorFlags,
+    ) -> Result<u32, FsError> {
+        let resolved = self.resolve(path)?;
+        let owner = OwnerToken::new(1)?;
+        let (token, claim) = self.begin_open_record(owner, flags & 3)?;
+        let key = proto_fs::OpenKey {
+            slot: token.slot() as u32,
+            generation: token.generation(),
+        };
+        let transport = self.transport();
+        let files = transport.files();
+        let mut recovery = Recovery {
+            access: (flags & 3) as u8,
+            ..Recovery::default()
+        };
+        let result = (|| {
+            recovery.job = files.open_start(key, resolved.as_bytes(), flags, mode, umask)?;
+            recovery.phase = Phase::Traversing;
+            self.update_open_record(claim, recovery)?;
+            while !files.open_advance(recovery.job, false)? {}
+            recovery.phase = Phase::Preparing;
+            self.update_open_record(claim, recovery)?;
+            while !files.open_advance(recovery.job, true)? {}
+            self.reserve_open_record(claim, descriptor_flags)?;
+            recovery.phase = Phase::Committing;
+            self.update_open_record(claim, recovery)?;
+            let held = files.open_commit(recovery.job)?;
+            recovery = recovery.remember(held);
+            self.update_open_record(claim, recovery)?;
+            let target = super::Transport::opened_target(held, recovery.access as u32)?;
+            self.stage_open_record(claim, target)?;
+            let finished = files.open_finish(key)?;
+            if finished != held {
+                return Err(FsError::Io);
+            }
+            self.publish_open_record(claim)?;
+            self.ack_open_record(token, owner)?
+                .into_result()
+                .map_err(|_| FsError::Io)
+        })();
+        if result.is_err() && self.begin_open_cancel(claim).is_ok() {
+            if files.open_cancel_key(key).is_ok() {
+                // Native Cancel consumes the exact backend reference. Its snapshot
+                // carries no further ordinary Close obligation.
+                let _ = self.finish_open_cancel(token, 5);
+                let _ = self.ack_open_record(token, owner);
+            } else {
+                // The same record retains cleanup until a later native owner phase.
+                let _ = self.abandon_open_record(token, recovery);
+            }
+        }
+        result
+    }
+}
+
+impl PosixFs {
+    /// Recover cleanup identity only from the still-current unreturned entry.
+    pub fn published_open_recovery(&self, entry: Option<EntryToken>) -> Result<Recovery, i32> {
+        let Some(entry) = entry else {
+            return Ok(Recovery::default());
+        };
+        if self.descriptors.entry_token(entry.fd).ok() != Some(entry) {
+            return Ok(Recovery::default());
+        }
+        let exact = match self.descriptors.get(entry.fd).map_err(|_| 5)? {
+            Target::Ram(exact) | Target::Random(exact) => exact,
+            _ => return Err(5),
+        };
+        Ok(Recovery::default().remember(exact.prepared()))
     }
 }

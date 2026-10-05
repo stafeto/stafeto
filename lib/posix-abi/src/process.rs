@@ -800,10 +800,10 @@ impl Shadow {
                     posix_fs::Target::Input => Names::Input,
                     posix_fs::Target::Output => Names::Output,
                     posix_fs::Target::Error => Names::Error,
-                    posix_fs::Target::Ram(n) => Names::File(n),
+                    posix_fs::Target::Ram(n) => Names::File(n.fd()),
                     posix_fs::Target::Pipe(n) => Names::Pipe(n),
                     posix_fs::Target::Tty(n) => Names::Terminal(n),
-                    posix_fs::Target::Random(n) => Names::Random(n),
+                    posix_fs::Target::Random(n) => Names::Random(n.fd()),
                 }
             };
             out[count] = Descriptor {
@@ -832,18 +832,14 @@ impl Shadow {
     }
 
     /// The service's descriptions the child's session shares, each once.
-    fn shared(&self) -> impl Iterator<Item = u32> + Clone + '_ {
-        let (list, count) = self.descriptors();
-        (0..count).filter_map(move |i| match list[i].names {
-            proto_loader::Names::File(n) | proto_loader::Names::Random(n)
-                if !list[..i].iter().any(|d| {
-                    matches!(d.names, proto_loader::Names::File(m)
-                        | proto_loader::Names::Random(m) if m == n)
-                }) =>
-            {
-                Some(n)
-            }
-            _ => None,
+    fn shared(&self) -> impl Iterator<Item = rt::fs::PreparedOpen> + Clone + '_ {
+        (0..self.entries.len()).filter_map(move |index| {
+            let Some((posix_fs::Target::Ram(target) | posix_fs::Target::Random(target), false)) = self.entries[index] else { return None; };
+            let captured = target.prepared();
+            let duplicate = self.entries[..index].iter().any(|entry| {
+                matches!(entry, Some((posix_fs::Target::Ram(old) | posix_fs::Target::Random(old), false)) if old.prepared() == captured)
+            });
+            (!duplicate).then_some(captured)
         })
     }
 
@@ -1430,7 +1426,12 @@ fn move_files(c: &Handle<Channel>) -> bool {
     // descriptor.
     crate::relibc::detach_for_exec();
     crate::shared::abandon_holds();
-    let mut kept = [0; posix_fs::OPEN_MAX];
+    let mut kept = [rt::fs::PreparedOpen {
+        fd: 0,
+        slot: 0,
+        generation: 0,
+        random: false,
+    }; posix_fs::OPEN_MAX];
     let sessions = crate::shared::with_files(|files| {
         let count = files.kept_by_exec(&mut kept);
         let (channel, uart) = files.sessions();
@@ -1442,22 +1443,8 @@ fn move_files(c: &Handle<Channel>) -> bool {
     };
     // The old image's session remains tied to its authority. The new image
     // receives a true unclaimed clone whose Pending binding the Loader authenticates.
-    let mut request = Writer::new();
-    if proto_fs::Method::Clone
-        .header()
-        .write(&mut request)
-        .and_then(|()| request.u32(count as u32))
-        .is_err()
-    {
-        return false;
-    }
-    for fd in &kept[..count] {
-        if request.u32(*fd).is_err() {
-            return false;
-        }
-    }
     let Ok(files) =
-        rt::fs::Files::clone_on(&Handle::<Channel>::borrowed(files), request.as_bytes())
+        rt::fs::Files::clone_exact_on(&Handle::<Channel>::borrowed(files), &kept[..count])
     else {
         return false;
     };
@@ -1549,18 +1536,18 @@ fn commit(
         let (files, uart) = fs.sessions();
         Ok((files.raw(), uart.map(Handle::raw)))
     })?;
-    let mut w = Writer::new();
-    proto_fs::Method::Clone
-        .header()
-        .write(&mut w)
-        .map_err(|_| EIO)?;
-    let shared = shadow.shared();
-    w.u32(shared.clone().count() as u32).map_err(|_| EIO)?;
-    for fd in shared {
-        w.u32(fd).map_err(|_| EIO)?;
+    let mut kept = [rt::fs::PreparedOpen {
+        fd: 0,
+        slot: 0,
+        generation: 0,
+        random: false,
+    }; posix_fs::OPEN_MAX];
+    let mut count = 0;
+    for held in shadow.shared() {
+        kept[count] = held;
+        count += 1;
     }
-    // The sessions live as long as the process's files.
-    let files = rt::fs::Files::clone_on(&Handle::<Channel>::borrowed(files), w.as_bytes())
+    let files = rt::fs::Files::clone_exact_on(&Handle::<Channel>::borrowed(files), &kept[..count])
         .map_err(clone_errno)?;
     let uart = match uart {
         Some(u) => Some(

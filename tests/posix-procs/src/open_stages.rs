@@ -700,6 +700,11 @@ pub extern "C" fn files_open_stages() -> i32 {
         return 90;
     };
     let files = core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+    // The native suite owns independent keys on its fresh genuinely bound session.
+    // Local Table records retain their own client-key namespace in the shared session.
+    let Ok(files) = clone_bound(&files, &[]) else {
+        return 91;
+    };
     let result = run(&files);
     #[cfg(feature = "ipc-loss")]
     let result = result.and_then(|()| super::reply_loss::run(&files));

@@ -241,7 +241,7 @@ fn at_offset(
                 return Err(ESPIPE);
             };
             let offset = u64::try_from(offset).map_err(|_| EINVAL)?;
-            run(transport, fd, offset).map_err(posix_abi::error)
+            run(transport, fd.fd(), offset).map_err(posix_abi::error)
         })
     });
     match result {
