@@ -1010,7 +1010,7 @@ impl<'a> Ram<'a> {
             let _ = self.storage.cancel(r);
             return true;
         }
-        if self.release_image(fds) {
+        if self.release_loading_image(fds) {
             return true;
         }
         if let Some(cwd) = fds.cwd.take() {

@@ -239,6 +239,8 @@ struct ImageContext {
     token: Token,
     private: Option<Handle<Channel>>,
     transfer: Option<Handle<Channel>>,
+    stage_transfer: Option<Handle<Channel>>,
+    receipt: proto_process::StageReceipt,
 }
 struct IdentityChannel {
     label: u64,
@@ -438,13 +440,13 @@ impl Fs {
         made
     }
 
-    /// Prepayment retains one exact loading image before the SetId effect.
+    /// Prepayment retains one exact loading image and both outgoing capabilities.
     fn prepare_image(
         &mut self,
         fds: &mut Fds,
         job: u64,
         token: Token,
-        entry: u16,
+        exec: &Exec,
     ) -> Result<(), u32> {
         let free = self
             .births
@@ -469,13 +471,25 @@ impl Fs {
         child.binding = fds.binding;
         child.root = fds.root;
         let admitted = (|| {
-            self.ram.hold_image(&mut child, token, entry)?;
+            self.ram.hold_image(&mut child, token, exec.entry)?;
             self.install_identity(&mut child, label, copy, false)?;
             let private = self
                 .session_rights(label, Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER)
                 .map_err(|_| proto_fs::TOO_MANY_OPEN_FILES)?;
             let transfer = sys::handle_duplicate(&private, Rights::SEND | Rights::TRANSFER)
                 .map_err(|_| proto_fs::TOO_MANY_OPEN_FILES)?;
+            let stage_transfer = sys::handle_duplicate(
+                &private,
+                Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .map_err(|_| proto_fs::TOO_MANY_OPEN_FILES)?;
+            let pick = |bit, id| {
+                if exec.mode & bit != 0 {
+                    id
+                } else {
+                    proto_process::NO_ID
+                }
+            };
             self.identities[child.authority_index as usize]
                 .as_mut()
                 .unwrap()
@@ -483,6 +497,13 @@ impl Fs {
                 token,
                 private: Some(private),
                 transfer: Some(transfer),
+                stage_transfer: Some(stage_transfer),
+                receipt: proto_process::StageReceipt {
+                    uid: pick(SET_UID, exec.uid),
+                    gid: pick(SET_GID, exec.gid),
+                    kind: proto_process::ExecKind::Execute,
+                    label,
+                },
             });
             Ok(())
         })();
@@ -611,7 +632,7 @@ impl Fs {
         };
         let exec = match self
             .ram
-            .exec_token(token, Identity::of(who.credentials, who.groups, false))
+            .exec_inode(token, Identity::of(who.credentials, who.groups, false))
         {
             Ok(exec) => exec,
             Err(code) => {
@@ -620,7 +641,7 @@ impl Fs {
             }
         };
         if fds.image_outcome.is_none() {
-            return match self.prepare_image(fds, job, token, exec.entry) {
+            return match self.prepare_image(fds, job, token, &exec) {
                 Ok(()) => status(proto_fs::RESOLVING),
                 Err(code) => status(code),
             };
@@ -642,15 +663,88 @@ impl Fs {
             self.clear_image_outcome(fds);
             return status(proto_fs::STALE_PROOF);
         }
-        if !self.tell_set_id(&exec, who.pid, loader) {
+        let now = match self.time_source.read_once() {
+            Ok(Some(now)) => now,
+            Ok(None) => return status(proto_fs::RESOLVING),
+            Err(code) => return Answer::Status(code),
+        };
+        // Connect and serialize while the loading image still permits exact rollback.
+        if self.notary().is_none() {
+            return status(proto_fs::RESOLVING);
+        }
+        let context = self
+            .identities
+            .iter()
+            .filter_map(Option::as_ref)
+            .find(|identity| identity.label == outcome.label)
+            .and_then(|identity| identity.image.as_ref())
+            .unwrap();
+        let args = proto_process::StageExec {
+            pid: who.pid,
+            image: loader.image,
+            ticket: loader.ticket,
+            uid: context.receipt.uid,
+            gid: context.receipt.gid,
+            kind: context.receipt.kind,
+            label: context.receipt.label,
+        };
+        let mut stage = proto_wire::Writer::new();
+        if proto_process::Method::StageExec
+            .header()
+            .write(&mut stage)
+            .is_err()
+            || args.write(&mut stage).is_err()
+            || context.stage_transfer.is_none()
+        {
             self.clear_image_outcome(fds);
-            fds.image_outcome = Some(ramfs::image::ImageOutcome {
-                phase: ramfs::image::ImagePhase::AbortRequired,
-                ..outcome
-            });
+            return status(proto_fs::STALE_PROOF);
+        }
+        let Some((_, held)) = self
+            .births
+            .iter_mut()
+            .filter_map(Option::as_mut)
+            .find(|(label, _)| *label == outcome.label)
+        else {
+            self.clear_image_outcome(fds);
+            return status(proto_fs::STALE_PROOF);
+        };
+        if let Err(code) = self.ram.arm_image_execution(held, token, now) {
+            self.clear_image_outcome(fds);
+            return status(code);
+        }
+        fds.image_outcome
+            .as_mut()
+            .unwrap()
+            .begin_stage()
+            .expect("prepared executable source");
+        let transfer = self
+            .identities
+            .iter_mut()
+            .filter_map(Option::as_mut)
+            .find(|identity| identity.label == outcome.label)
+            .unwrap()
+            .image
+            .as_mut()
+            .unwrap()
+            .stage_transfer
+            .take()
+            .unwrap();
+        let staged = sys::send_handles(
+            self.notary.as_ref().unwrap(),
+            stage.as_bytes(),
+            [transfer.erase()],
+        )
+        .is_ok_and(|reply| {
+            reply.len == proto_wire::HEADER_LEN
+                && ramfs::image::stage_accepted_reply(
+                    &reply.words[0].to_le_bytes(),
+                    reply.handles.len(),
+                )
+        });
+        if !staged {
             return status(proto_fs::IMAGE_ABORT_REQUIRED);
         }
-        // Every resource and reply field was prepaid before the first SetId attempt.
+        // Every resource and reply field was prepaid before the first StageExec attempt.
         self.finish_image_job(fds, job, r.label());
         fds.image_outcome.as_mut().unwrap().phase = ramfs::image::ImagePhase::Ready;
         let image = self
@@ -690,40 +784,6 @@ impl Fs {
             Err(code) => Err(code),
             _ => Err(proto_fs::PERMISSION),
         }
-    }
-
-    /// SetId for a file with a set-ID bit, through the notary session:
-    /// whether the process service kept it, or the file has none.
-    fn tell_set_id(&mut self, exec: &Exec, pid: u32, loader: proto_process::LoaderOf) -> bool {
-        if exec.mode & (SET_UID | SET_GID) == 0 {
-            return true;
-        }
-        let pick = |bit, id| {
-            if exec.mode & bit != 0 {
-                id
-            } else {
-                proto_process::NO_ID
-            }
-        };
-        let set = proto_process::SetId {
-            ticket: loader.ticket,
-            pid,
-            image: loader.image,
-            uid: pick(SET_UID, exec.uid),
-            gid: pick(SET_GID, exec.gid),
-        };
-        let mut w = proto_wire::Writer::new();
-        if proto_process::Method::SetId.header().write(&mut w).is_err()
-            || set.write(&mut w).is_err()
-        {
-            return false;
-        }
-        let Some(notary) = self.notary() else {
-            return false;
-        };
-        sys::send(notary, w.as_bytes()).is_ok_and(|reply| {
-            reply.len == proto_wire::HEADER_LEN && reply.words[0] == 0 && reply.handles.is_empty()
-        })
     }
 
     /// READ_AT, READ_INTO and INFO_FD use the image session's retained inode at fd0.
@@ -1205,7 +1265,7 @@ impl Service<0> for Fs {
                     return Answer::Status(Status::BadSize);
                 }
                 self.drop_identity(&mut s.data);
-                self.ram.release_image(&mut s.data);
+                self.ram.release_loading_image(&mut s.data);
                 s.data.binding = Binding::Cleanup;
                 return Answer::Status(Status::Ok);
             }
