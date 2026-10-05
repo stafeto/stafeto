@@ -9,6 +9,7 @@ pub use posix_fd::{
     Abandoned, Claim, ClaimToken, Completion, EntryToken, OpenPhase, OpenSnapshot, OpenToken,
     OwnerToken, Replacement, WaitValue,
 };
+use proto_wire::Status;
 use rt::fs::PreparedOpen;
 
 /// The next backend phase; the local OpenToken always retains the client key.
@@ -48,6 +49,89 @@ pub struct PreparedNoEffect {
     session: rt::abi::Handle,
 }
 
+/// Captured from one exact reservation before its first final native request.
+pub struct FinalizeContext {
+    claim: ClaimToken,
+    entry: EntryToken,
+    job: u64,
+    session: rt::abi::Handle,
+    transport: super::Transport,
+}
+
+/// Only an actual uncertain final request creates this recovery continuation.
+pub struct UnresolvedFinalize(FinalizeContext);
+
+pub enum FinalizeResult {
+    Finished(PreparedOpen),
+    Deferred {
+        proof: PreparedNoEffect,
+        reason: Status,
+    },
+    Rejected(Status),
+    Unresolved(UnresolvedFinalize),
+}
+
+pub enum FinalizeRecovery {
+    Finished(PreparedOpen),
+    Prepared(PreparedNoEffect),
+    Failed(Status),
+}
+
+impl FinalizeContext {
+    fn key(&self) -> proto_fs::OpenKey {
+        proto_fs::OpenKey {
+            slot: self.claim.open().slot() as u32,
+            generation: self.claim.open().generation(),
+        }
+    }
+
+    fn prepared(self) -> PreparedNoEffect {
+        PreparedNoEffect {
+            claim: self.claim,
+            entry: self.entry,
+            job: self.job,
+            session: self.session,
+        }
+    }
+
+    /// Exactly one native call; the proof comes from that call's canonical receipt.
+    pub fn send_once(self) -> FinalizeResult {
+        let attempt = self.transport.files().open_finalize_once(self.key());
+        match attempt {
+            rt::fs::OpenFinalizeAttempt::Finished(held) => FinalizeResult::Finished(held),
+            rt::fs::OpenFinalizeAttempt::Deferred(receipt)
+                if receipt.matches_request(self.key(), self.session) =>
+            {
+                let reason = receipt.status();
+                FinalizeResult::Deferred {
+                    proof: self.prepared(),
+                    reason,
+                }
+            }
+            rt::fs::OpenFinalizeAttempt::Rejected(error) => FinalizeResult::Rejected(error),
+            rt::fs::OpenFinalizeAttempt::Deferred(_)
+            | rt::fs::OpenFinalizeAttempt::Ambiguous(_) => {
+                FinalizeResult::Unresolved(UnresolvedFinalize(self))
+            }
+        }
+    }
+}
+
+impl UnresolvedFinalize {
+    /// Recovery spends one Query call and never repeats the uncertain final request.
+    pub fn query_once(self) -> FinalizeRecovery {
+        let context = self.0;
+        match context.transport.files().open_query_once(context.key()) {
+            Ok(rt::fs::OpenOutcome::Active { job, phase: 2 }) if job == context.job => {
+                FinalizeRecovery::Prepared(context.prepared())
+            }
+            Ok(rt::fs::OpenOutcome::Finished(held)) => FinalizeRecovery::Finished(held),
+            Ok(rt::fs::OpenOutcome::Active { .. }) => FinalizeRecovery::Failed(Status::BadSize),
+            Err(error) => FinalizeRecovery::Failed(error),
+        }
+    }
+}
+
 impl Recovery {
     pub fn starting(access: u32, descriptor_flags: DescriptorFlags) -> Result<Self, FsError> {
         if access > proto_fs::READ_WRITE {
@@ -76,6 +160,44 @@ impl Recovery {
             generation: self.description_generation,
             random: self.backend_fd & proto_fs::OPEN_RANDOM != 0,
         })
+    }
+
+    fn progresses_from(self, previous: Self) -> bool {
+        if self.access != previous.access
+            || self.descriptor_flags != previous.descriptor_flags
+            || (previous.job != 0 && self.job != previous.job)
+            || (previous.backend_fd != 0 || previous.description_generation != 0)
+                && (self.backend_fd != previous.backend_fd
+                    || self.description_generation != previous.description_generation)
+        {
+            return false;
+        }
+        let forward = self.phase == previous.phase
+            || matches!(
+                (previous.phase, self.phase),
+                (Phase::Starting, Phase::Traversing)
+                    | (Phase::Traversing, Phase::Preparing)
+                    | (Phase::Preparing, Phase::Committing)
+                    | (Phase::Committing, Phase::Finishing)
+            );
+        if !forward {
+            return false;
+        }
+        match self.phase {
+            Phase::Starting => {
+                self.job == 0 && self.backend_fd == 0 && self.description_generation == 0
+            }
+            Phase::Traversing | Phase::Preparing | Phase::Committing => {
+                self.job >> 8 != 0
+                    && self.job & 255 < 128
+                    && self.backend_fd == 0
+                    && self.description_generation == 0
+            }
+            Phase::Finishing => {
+                self.job >> 8 != 0 && self.job & 255 < 128 && self.expected().is_some()
+            }
+            Phase::Canceling => false,
+        }
     }
 }
 
@@ -116,12 +238,11 @@ impl PosixFs {
         recovery: Recovery,
     ) -> Result<(), FsError> {
         let resident = self
-            .open_snapshot(claim.open())?
+            .descriptors
+            .claim_snapshot(claim)?
             .recovery
             .ok_or(FsError::BadFileDescriptor)?;
-        if resident.access != recovery.access
-            || resident.descriptor_flags != recovery.descriptor_flags
-        {
+        if !recovery.progresses_from(resident) {
             return Err(FsError::InvalidArgument);
         }
         self.descriptors
@@ -137,6 +258,36 @@ impl PosixFs {
         self.descriptors
             .reserve_open(claim, 0, resident.descriptor_flags)
             .map_err(FsError::from)
+    }
+
+    /// Capture final request history and advance the resident phase under the file lock.
+    pub fn begin_open_finalize(
+        &mut self,
+        claim: ClaimToken,
+        entry: EntryToken,
+    ) -> Result<FinalizeContext, FsError> {
+        let snapshot = self.descriptors.claim_snapshot(claim)?;
+        let mut recovery = snapshot.recovery.ok_or(FsError::BadFileDescriptor)?;
+        if snapshot.owner.is_none()
+            || snapshot.phase != OpenPhase::Reserved
+            || snapshot.entry != Some(entry)
+            || recovery.phase != Phase::Preparing
+            || recovery.job >> 8 == 0
+            || recovery.job & 255 >= 128
+            || recovery.backend_fd != 0
+            || recovery.description_generation != 0
+        {
+            return Err(FsError::BadFileDescriptor);
+        }
+        recovery.phase = Phase::Committing;
+        self.update_open_record(claim, recovery)?;
+        Ok(FinalizeContext {
+            claim,
+            entry,
+            job: recovery.job,
+            session: self.files.sessions().0.raw(),
+            transport: self.transport(),
+        })
     }
 
     /// Retain the paid operation while revoking a proven no-effect final-phase claim.
@@ -402,18 +553,138 @@ mod tests {
             close_on_fork: true,
         }
     }
-    fn reserved(files: &mut PosixFs) -> (OpenToken, ClaimToken, EntryToken) {
+    fn preparing(files: &mut PosixFs) -> (OpenToken, ClaimToken, EntryToken) {
         let (token, claim) = files
             .begin_open_record(OwnerToken::new(1).unwrap(), 0, flags())
             .unwrap();
         let mut recovery = files.open_snapshot(token).unwrap().recovery.unwrap();
         recovery.job = 256;
+        recovery.phase = Phase::Traversing;
+        files.update_open_record(claim, recovery).unwrap();
         recovery.phase = Phase::Preparing;
         files.update_open_record(claim, recovery).unwrap();
         let entry = files.reserve_open_record(claim).unwrap();
+        (token, claim, entry)
+    }
+    fn reserved(files: &mut PosixFs) -> (OpenToken, ClaimToken, EntryToken) {
+        let (token, claim, entry) = preparing(files);
+        let mut recovery = files.open_snapshot(token).unwrap().recovery.unwrap();
         recovery.phase = Phase::Committing;
         files.update_open_record(claim, recovery).unwrap();
         (token, claim, entry)
+    }
+
+    #[test]
+    fn ordinary_updates_cannot_restore_preparation_or_change_request_history() {
+        let mut files = files();
+        let (token, claim, _) = reserved(&mut files);
+        let before = files.open_snapshot(token).unwrap();
+        let wait = files.open_wait_snapshot(token).unwrap();
+        for phase in [
+            Phase::Starting,
+            Phase::Traversing,
+            Phase::Preparing,
+            Phase::Canceling,
+        ] {
+            let mut wrong = before.recovery.unwrap();
+            wrong.phase = phase;
+            assert_eq!(
+                files.update_open_record(claim, wrong),
+                Err(FsError::InvalidArgument)
+            );
+            assert_eq!(files.open_snapshot(token).unwrap(), before);
+            assert_eq!(files.open_wait_snapshot(token).unwrap(), wait);
+        }
+        for job in [0, 512, 384] {
+            let mut wrong = before.recovery.unwrap();
+            wrong.job = job;
+            assert_eq!(
+                files.update_open_record(claim, wrong),
+                Err(FsError::InvalidArgument)
+            );
+        }
+        let remembered = before.recovery.unwrap().remember(PreparedOpen {
+            fd: 3,
+            slot: 0,
+            generation: 1,
+            random: false,
+        });
+        files.update_open_record(claim, remembered).unwrap();
+        let finished = files.open_snapshot(token).unwrap();
+        let wrong = remembered.remember(PreparedOpen {
+            fd: 4,
+            slot: 1,
+            generation: 2,
+            random: true,
+        });
+        assert_eq!(
+            files.update_open_record(claim, wrong),
+            Err(FsError::InvalidArgument)
+        );
+        assert_eq!(files.open_snapshot(token).unwrap(), finished);
+    }
+
+    #[test]
+    fn final_context_is_minted_once_from_the_exact_current_preparation() {
+        let mut files = files();
+        let (token, claim, entry) = preparing(&mut files);
+        let (_, _, foreign_entry) = preparing(&mut files);
+        let before = files.open_snapshot(token).unwrap();
+        assert!(files.begin_open_finalize(claim, foreign_entry).is_err());
+        assert_eq!(files.open_snapshot(token).unwrap(), before);
+        files.release_open_claim(claim).unwrap();
+        let Claim::Acquired { token: next, .. } = files
+            .claim_open_record(token, OwnerToken::new(1).unwrap())
+            .unwrap()
+        else {
+            panic!("claim");
+        };
+        let before = files.open_snapshot(token).unwrap();
+        assert!(files.begin_open_finalize(claim, entry).is_err());
+        assert_eq!(files.open_snapshot(token).unwrap(), before);
+        let context = files.begin_open_finalize(next, entry).unwrap();
+        assert_eq!(context.claim, next);
+        assert_eq!(context.entry, entry);
+        assert_eq!(context.job, 256);
+        assert_eq!(context.session, files.sessions().0.raw());
+        assert_eq!(context.key().slot, token.slot() as u32);
+        assert_eq!(context.key().generation, token.generation());
+        let committed = files.open_snapshot(token).unwrap();
+        assert_eq!(committed.recovery.unwrap().phase, Phase::Committing);
+        assert!(files.begin_open_finalize(next, entry).is_err());
+        assert_eq!(files.open_snapshot(token).unwrap(), committed);
+        // The unit fixture consumes the private proof boundary without issuing native RPC.
+        files
+            .unreserve_open_record(next, entry, context.prepared())
+            .unwrap();
+        let snapshot = files.open_snapshot(token).unwrap();
+        assert_eq!(snapshot.claimant, None);
+        assert_eq!(snapshot.recovery.unwrap().phase, Phase::Preparing);
+        assert_eq!(snapshot.recovery.unwrap().descriptor_flags(), flags());
+    }
+
+    #[test]
+    fn starting_history_requires_a_real_nonzero_job_and_forward_phase() {
+        let mut files = files();
+        let (token, claim) = files
+            .begin_open_record(OwnerToken::new(1).unwrap(), 0, flags())
+            .unwrap();
+        let original = files.open_snapshot(token).unwrap().recovery.unwrap();
+        for (phase, job) in [
+            (Phase::Preparing, 256),
+            (Phase::Traversing, 0),
+            (Phase::Traversing, 384),
+            (Phase::Finishing, 256),
+        ] {
+            let mut wrong = original;
+            wrong.phase = phase;
+            wrong.job = job;
+            assert_eq!(
+                files.update_open_record(claim, wrong),
+                Err(FsError::InvalidArgument)
+            );
+        }
+        assert_eq!(files.open_snapshot(token).unwrap().recovery, Some(original));
     }
     fn proof(files: &PosixFs, claim: ClaimToken, entry: EntryToken) -> PreparedNoEffect {
         PreparedNoEffect {

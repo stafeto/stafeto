@@ -810,6 +810,11 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         Ok(())
     }
 
+    /// Inspect one current claim without advancing the resident wait sequence.
+    pub fn claim_snapshot(&self, claim: ClaimToken) -> Result<OpenSnapshot<R>, Error> {
+        Ok(self.claimed(claim)?.snapshot())
+    }
+
     pub fn update_open(&mut self, claim: ClaimToken, recovery: R) -> Result<(), Error> {
         let mut record = self.claimed(claim)?;
         record.phase = match record.phase {
@@ -1958,6 +1963,23 @@ mod tests {
         table.stage_committed(claim, backend).unwrap();
         table.publish_open(claim).unwrap();
         (open, claim, entry)
+    }
+
+    #[test]
+    fn claim_snapshot_preserves_wait_state_and_rejects_released_serials() {
+        let mut table = Table::<u32, 32, u64>::default();
+        let (open, first) = table.begin_open(owner(1), 70).unwrap();
+        let before = table.wait_snapshot(open).unwrap();
+        assert_eq!(table.claim_snapshot(first), table.open_snapshot(open));
+        assert_eq!(table.wait_snapshot(open), Ok(before));
+        table.release_claim(first).unwrap();
+        let second = acquired(table.claim_open(open, owner(2)).unwrap());
+        let before = table.wait_snapshot(open).unwrap();
+        assert_eq!(table.claim_snapshot(first), Err(Error::BadFileDescriptor));
+        assert_eq!(table.claim_snapshot(second), table.open_snapshot(open));
+        assert_eq!(table.wait_snapshot(open), Ok(before));
+        table.abandon_open_with_recovery(open, 80).unwrap();
+        assert_eq!(table.claim_snapshot(second), Err(Error::BadFileDescriptor));
     }
 
     #[test]

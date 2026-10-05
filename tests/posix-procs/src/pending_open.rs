@@ -6,7 +6,9 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
-use posix_fs::open::{Claim, ClaimToken, Completion, OpenPhase, OpenToken, OwnerToken, Recovery};
+use posix_fs::open::{
+    Claim, ClaimToken, Completion, OpenPhase, OpenToken, OwnerToken, Phase, Recovery,
+};
 use posix_fs::{DescriptorFlags, Target};
 
 #[derive(Clone, Copy)]
@@ -50,17 +52,39 @@ pub extern "C" fn files_pending_begin(source: i32, saturate: i32) -> i32 {
             let job = backend
                 .open_start(key, b"/etc/motd", proto_fs::READ_ONLY, 0, 0)
                 .map_err(|_| 5)?;
-            for prepare in [false, true] {
-                while !backend.open_advance(job, prepare).map_err(|_| 5)? {}
-            }
+            let mut recovery = Recovery::starting(proto_fs::READ_ONLY, DescriptorFlags::default())
+                .map_err(posix_abi::error)?;
+            recovery.job = job;
+            recovery.phase = Phase::Traversing;
+            posix_abi::shared::with_files(|files| {
+                files
+                    .update_open_record(claim, recovery)
+                    .map_err(posix_abi::error)
+            })?;
+            while !backend.open_advance(job, false).map_err(|_| 5)? {}
+            recovery.phase = Phase::Preparing;
+            posix_abi::shared::with_files(|files| {
+                files
+                    .update_open_record(claim, recovery)
+                    .map_err(posix_abi::error)
+            })?;
+            while !backend.open_advance(job, true).map_err(|_| 5)? {}
+            let entry = posix_abi::shared::with_files(|files| {
+                let entry = files.reserve_open_record(claim).map_err(posix_abi::error)?;
+                recovery.phase = Phase::Committing;
+                files
+                    .update_open_record(claim, recovery)
+                    .map_err(posix_abi::error)?;
+                Ok(entry)
+            })?;
             let held = backend.open_commit(job).map_err(|_| 5)?;
+            recovery = recovery.remember(held);
             let target = posix_fs::Transport::opened_target(held, proto_fs::READ_ONLY)
                 .map_err(posix_abi::error)?;
             posix_abi::shared::with_files(|files| {
                 files
-                    .update_open_record(claim, Recovery::default().remember(held))
+                    .update_open_record(claim, recovery)
                     .map_err(posix_abi::error)?;
-                let entry = files.reserve_open_record(claim).map_err(posix_abi::error)?;
                 let address = files.open_wait_address(token).map_err(posix_abi::error)?;
                 Ok((
                     entry.fd as i32,
