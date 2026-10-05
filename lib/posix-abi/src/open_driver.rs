@@ -48,13 +48,10 @@ pub(crate) fn open(
     let owner = OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)?;
     let (token, claim) = crate::shared::with_files(|files| {
         files
-            .begin_open_record(owner, flags & 3)
+            .begin_open_record(owner, flags & 3, descriptor_flags)
             .map_err(crate::error)
     })?;
-    let mut recovery = Recovery {
-        access: (flags & 3) as u8,
-        ..Recovery::default()
-    };
+    let mut recovery = Recovery::starting(flags & 3, descriptor_flags).map_err(crate::error)?;
     let files = transport.files();
     let result = (|| {
         recovery.job = files
@@ -69,9 +66,7 @@ pub(crate) fn open(
         let _defer = Defer::enter();
         let final_result = (|| {
             crate::shared::with_files(|files| {
-                files
-                    .reserve_open_record(claim, descriptor_flags)
-                    .map_err(crate::error)
+                files.reserve_open_record(claim).map_err(crate::error)
             })?;
             recovery.phase = Phase::Committing;
             save(claim, recovery)?;
