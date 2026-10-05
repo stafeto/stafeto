@@ -336,7 +336,7 @@ fn check_cancel_ack(files: &mut PosixFs) -> Result<(), &'static str> {
     for canonical in [true, false] {
         for _ in 0..64 {
             let (token, claim) = files
-                .begin_open_record(owner, READ_ONLY)
+                .begin_open_record(owner, READ_ONLY, posix_fs::DescriptorFlags::default())
                 .map_err(|_| "cancel race admission")?;
             files
                 .begin_open_cancel(claim)

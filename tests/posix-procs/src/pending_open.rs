@@ -37,7 +37,7 @@ pub extern "C" fn files_pending_begin(source: i32, saturate: i32) -> i32 {
         let (transport, token, claim) = posix_abi::shared::with_files(|files| {
             files.target(source as u32).map_err(posix_abi::error)?;
             let (token, claim) = files
-                .begin_open_record(owner, proto_fs::READ_ONLY)
+                .begin_open_record(owner, proto_fs::READ_ONLY, DescriptorFlags::default())
                 .map_err(posix_abi::error)?;
             Ok((files.transport(), token, claim))
         })?;
@@ -60,9 +60,7 @@ pub extern "C" fn files_pending_begin(source: i32, saturate: i32) -> i32 {
                 files
                     .update_open_record(claim, Recovery::default().remember(held))
                     .map_err(posix_abi::error)?;
-                let entry = files
-                    .reserve_open_record(claim, DescriptorFlags::default())
-                    .map_err(posix_abi::error)?;
+                let entry = files.reserve_open_record(claim).map_err(posix_abi::error)?;
                 let address = files.open_wait_address(token).map_err(posix_abi::error)?;
                 Ok((
                     entry.fd as i32,
