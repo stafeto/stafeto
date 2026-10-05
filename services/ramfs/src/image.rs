@@ -6,7 +6,7 @@
 
 use crate::{
     Fds, REG, Ram,
-    storage::{NONE, Pin, Root, Token},
+    storage::{Pin, Root, Token},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,9 +39,10 @@ impl Ram<'_> {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         let node = self.storage.node(token)?;
-        if node.kind != REG || node.boot == NONE || node.boot != entry {
+        if node.kind != REG || node.boot != entry {
             return Err(proto_fs::ACCESS_DENIED);
         }
+        self.storage.exec_guard(token)?;
         self.storage.charge_description(fds.root)?;
         if let Err(code) = self.storage.pin(token, Pin::Image) {
             self.storage.release_description(fds.root);

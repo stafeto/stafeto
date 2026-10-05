@@ -95,6 +95,8 @@ pub struct Node {
     pub uid: u32,
     pub gid: u32,
     pub links: u32,
+    /// Writable open descriptions, counted through their final retained reference.
+    pub writers: u16,
     pub parent: Token,
     pub length: u64,
     /// Payload changes are independent of namespace proof invalidation.
@@ -117,6 +119,7 @@ impl Node {
         uid: 0,
         gid: 0,
         links: 0,
+        writers: 0,
         parent: ROOT,
         length: 0,
         data_generation: 0,
@@ -447,6 +450,7 @@ impl Storage<'_> {
     }
 
     fn io_preflight(&self, token: Token) -> Result<(), u32> {
+        self.content_guard(token)?;
         self.node(token)?
             .data_generation
             .checked_add(1)
@@ -1094,7 +1098,33 @@ impl<'a> Storage<'a> {
             self.uncharge(i, |u| &mut u.descriptions);
         }
     }
+    /// Content changes require an inode with no pending or active executable pin.
+    pub(crate) fn content_guard(&self, token: Token) -> Result<(), u32> {
+        if self.node(token)?.pins[Pin::Image.index()] != 0 {
+            return Err(proto_fs::TEXT_BUSY);
+        }
+        Ok(())
+    }
+    pub(crate) fn exec_guard(&self, token: Token) -> Result<(), u32> {
+        if self.node(token)?.writers != 0 {
+            return Err(proto_fs::TEXT_BUSY);
+        }
+        Ok(())
+    }
+    pub(crate) fn acquire_writer(&mut self, token: Token) -> Result<(), u32> {
+        self.content_guard(token)?;
+        let node = self.node_mut(token)?;
+        node.writers = node.writers.checked_add(1).ok_or(NO_SPACE)?;
+        Ok(())
+    }
+    pub(crate) fn release_writer(&mut self, token: Token) {
+        let node = self.node_mut(token).expect("retained writable inode");
+        node.writers = node.writers.checked_sub(1).expect("owned writer");
+    }
     pub fn pin(&mut self, token: Token, kind: Pin) -> Result<(), u32> {
+        if kind == Pin::Image {
+            self.exec_guard(token)?;
+        }
         let n = self.node_mut(token)?;
         n.pins[kind.index()] = n.pins[kind.index()].checked_add(1).ok_or(NO_SPACE)?;
         Ok(())
@@ -1616,6 +1646,7 @@ impl<'a> Storage<'a> {
         if bytes.is_empty() {
             return Ok(0);
         }
+        self.content_guard(token)?;
         let data_generation = self
             .node(token)?
             .data_generation
@@ -1688,6 +1719,7 @@ impl<'a> Storage<'a> {
         if node.kind != crate::REG {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
+        self.content_guard(token)?;
         let data_generation = node.data_generation.checked_add(1).ok_or(NO_SPACE)?;
         let epoch = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
         let overlay = node.overlay;
