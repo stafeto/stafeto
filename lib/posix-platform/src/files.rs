@@ -10,7 +10,7 @@ use super::{call, value};
 use core::ffi::{c_char, c_int, c_ulong, c_void};
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
-use posix_abi::constants::{EBADF, EFAULT, EINVAL, ENOSYS, ESPIPE};
+use posix_abi::constants::{EBADF, EFAULT, EINVAL, ENOSYS};
 use posix_fs::{DescriptorFlags, FileKind, NodeInfo, SeekFrom, Target, Transport};
 
 /// relibc's struct stat on AArch64 Linux (asm-generic/stat.h).
@@ -229,36 +229,13 @@ pub unsafe extern "C" fn stafeto_getdents(
     }
 }
 
-/// pread and pwrite: at `offset`, the description's own offset as it
-/// was (READ_AT and WRITE_AT of the service), outside the lock.
-fn at_offset(
-    fd: c_int,
-    offset: i64,
-    run: impl FnOnce(Transport, u32, u64) -> Result<usize, posix_fs::FsError>,
-) -> isize {
-    let result = number(fd).and_then(|fd| {
-        posix_abi::shared::held(fd, |transport, target| {
-            // The console has no offset: ESPIPE.
-            let Target::Ram(fd) = target else {
-                return Err(ESPIPE);
-            };
-            let offset = u64::try_from(offset).map_err(|_| EINVAL)?;
-            run(transport, fd.fd(), offset).map_err(posix_abi::error)
-        })
-    });
-    match result {
-        Ok(count) => count as isize,
-        Err(errno) => -(errno as isize),
-    }
-}
-
 /// # Safety
 /// `buf` is writable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offset: i64) -> isize {
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    at_offset(fd, offset, |files, fd, at| files.read_at(fd, at, out))
+    value(posix_abi::pread(fd, out, offset).map(|n| n as i64)) as isize
 }
 
 /// # Safety
@@ -272,7 +249,16 @@ pub unsafe extern "C" fn stafeto_pwrite(
 ) -> isize {
     // SAFETY: the caller's promise.
     let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
-    at_offset(fd, offset, |files, fd, at| files.write_at(fd, at, bytes))
+    value(posix_abi::pwrite(fd, bytes, offset).map(|n| n as i64)) as isize
+}
+
+/// The platform returns zero or a negative errno, as its other C bridges do.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_ftruncate(fd: c_int, length: i64) -> c_int {
+    match posix_abi::ftruncate(fd, length) {
+        Ok(()) => 0,
+        Err(errno) => -errno,
+    }
 }
 
 /// # Safety
