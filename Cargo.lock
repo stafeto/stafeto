@@ -367,9 +367,12 @@ name = "posix-procs"
 version = "0.1.0"
 dependencies = [
  "posix-abi",
+ "posix-clock",
  "posix-crt",
  "posix-fs",
  "posix-sync",
+ "posix-time",
+ "proto-clock",
  "proto-fs",
  "proto-loader",
  "proto-process",
