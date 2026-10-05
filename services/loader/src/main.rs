@@ -1237,12 +1237,8 @@ fn file_size(image: &Handle<Channel>) -> Result<u64, u32> {
         .map_err(|_| pl::IO)?;
     let reply = rt::fs::Files::send_on(image, w.as_bytes()).map_err(|_| pl::IO)?;
     let mut buffer = [0; MESSAGE_MAX];
-    let mut r = Reader::new(reply.bytes(&mut buffer));
-    if r.u32() != Ok(0) {
-        return Err(pl::IO);
-    }
-    let info = proto_fs::NodeInfo::read(&mut r).map_err(|_| pl::IO)?;
-    Ok(info.size)
+    loader_image::image_reply_size(reply.bytes(&mut buffer), reply.handles.len())
+        .map_err(|_| pl::IO)
 }
 
 /// ReadAt of the image session into `out` from `offset`, as many requests
