@@ -37,7 +37,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 0xfff8, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 32, 33, 34, 0xfff8, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -793,10 +793,9 @@ impl Fs {
     fn clone_session(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         let mut list = [0u32; 32];
-        let count = body.u32().unwrap_or(0) as usize;
-        if count > list.len() || !r.handles.is_empty() {
+        let Ok(count) = ramfs::clone_count(&mut body, r.handles.len()) else {
             return Answer::Status(Status::BadSize);
-        }
+        };
         for fd in &mut list[..count] {
             let Ok(n) = body.u32() else {
                 return Answer::Status(Status::BadSize);
@@ -833,10 +832,10 @@ impl Fs {
         if self.clones.room(r.label()).is_err() {
             return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
         }
-        let mut child = match self.ram.clone_fds(fds, &list[..count]) {
-            Ok(child) => child,
-            Err(code) => return status(code),
-        };
+        let mut child = Fds::default();
+        if let Err(code) = self.ram.clone_fds_into(fds, &list[..count], &mut child) {
+            return status(code);
+        }
         if matches!(fds.binding, Binding::Boot) {
             child.binding = Binding::Boot;
         }

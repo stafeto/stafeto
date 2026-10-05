@@ -359,6 +359,18 @@ fn random_marker(files: &Files) -> Result<(), i32> {
     {
         return Err(139);
     }
+    for method in [proto_fs::Method::Clone, proto_fs::Method::CloneExact] {
+        let mut missing_count = proto_wire::Writer::new();
+        method.header().write(&mut missing_count).map_err(|_| 150)?;
+        let refused =
+            rt::sys::send(files.sessions().0, missing_count.as_bytes()).map_err(|_| 150)?;
+        if refused.len != 8
+            || refused.words[0] != proto_wire::BAD_SIZE as u64
+            || !refused.handles.is_empty()
+        {
+            return Err(151);
+        }
+    }
     let capture = files.capture_description(34).map_err(|_| 133)?;
     if capture.held != held[31] || capture.flags != proto_fs::READ_WRITE {
         return Err(134);
