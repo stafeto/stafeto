@@ -309,7 +309,10 @@ mod tests {
                     claim,
                     target,
                     job,
-                    session
+                    session,
+                    request: snapshot.recovery.request(claim.scalar(), target).unwrap(),
+                    feed_end: snapshot.recovery.feed_end,
+                    phase: Phase::Ready,
                 })
                 .is_err()
             );
@@ -320,6 +323,12 @@ mod tests {
             target: target(43),
             job: 256,
             session,
+            request: snapshot
+                .recovery
+                .request(claim.scalar(), target(43))
+                .unwrap(),
+            feed_end: snapshot.recovery.feed_end,
+            phase: Phase::Ready,
         })
         .unwrap();
         let restored = fs.data_snapshot(token).unwrap();
@@ -327,6 +336,111 @@ mod tests {
         assert_eq!(restored.claimant, None);
         assert_eq!(restored.recovery.input(), b"x");
         assert!(fs.data_commit_context(claim).is_err());
+    }
+
+    #[test]
+    fn query_preparation_restores_exact_phase_and_immutable_input() {
+        for (remote, local) in [
+            (DataPhase::Preparing, Phase::Preparing),
+            (DataPhase::Ready, Phase::Ready),
+            (DataPhase::TimeDeferred, Phase::Ready),
+        ] {
+            let mut fs = files();
+            let input = [0xa5; proto_fs::MAX_WRITE];
+            let (token, claim) =
+                begin(&mut fs, DataKind::Write, proto_fs::MAX_WRITE as u32, &input);
+            committing(&mut fs, token, claim);
+            let before = fs.data_snapshot(token).unwrap();
+            let context = fs.data_query_context(claim).unwrap();
+            let outcome = DataOutcome {
+                job: 256,
+                phase: remote,
+                result: DataResult::None,
+            };
+            let mut bad_request = context.classify(Ok(outcome)).unwrap().prepared.unwrap();
+            bad_request.request.count -= 1;
+            assert!(fs.restore_data_preparation(bad_request).is_err());
+            let mut bad_feed = context.classify(Ok(outcome)).unwrap().prepared.unwrap();
+            bad_feed.feed_end -= 1;
+            assert!(fs.restore_data_preparation(bad_feed).is_err());
+            assert_eq!(fs.data_snapshot(token).unwrap(), before);
+            let proof = context.classify(Ok(outcome)).unwrap().prepared.unwrap();
+            fs.restore_data_preparation(proof).unwrap();
+            let after = fs.data_snapshot(token).unwrap();
+            let mut expected = before.recovery;
+            expected.phase = local;
+            assert_eq!(after.recovery, expected);
+            assert_eq!(after.claimant, None);
+            let stale = context.classify(Ok(outcome)).unwrap().prepared.unwrap();
+            assert!(fs.restore_data_preparation(stale).is_err());
+            assert_eq!(fs.data_snapshot(token).unwrap(), after);
+        }
+    }
+
+    #[test]
+    fn query_preparation_requires_committing_job_and_canonical_no_effect() {
+        let mut fs = files();
+        let (token, claim) = begin(&mut fs, DataKind::Write, 1, b"x");
+        let outcome = DataOutcome {
+            job: 256,
+            phase: DataPhase::Preparing,
+            result: DataResult::None,
+        };
+        assert!(
+            fs.data_query_context(claim)
+                .unwrap()
+                .classify(Ok(outcome))
+                .unwrap()
+                .prepared
+                .is_none()
+        );
+        committing(&mut fs, token, claim);
+        let context = fs.data_query_context(claim).unwrap();
+        for phase in [
+            Phase::Starting,
+            Phase::Feeding,
+            Phase::Preparing,
+            Phase::Ready,
+            Phase::Completed,
+        ] {
+            let mut other = context;
+            other.phase = phase;
+            assert!(other.classify(Ok(outcome)).unwrap().prepared.is_none());
+        }
+        for phase in [
+            DataPhase::Captured,
+            DataPhase::Feeding,
+            DataPhase::Canceling,
+        ] {
+            assert!(
+                context
+                    .classify(Ok(DataOutcome { phase, ..outcome }))
+                    .unwrap()
+                    .prepared
+                    .is_none()
+            );
+        }
+        assert!(
+            context
+                .classify(Ok(done(256, 1)))
+                .unwrap()
+                .prepared
+                .is_none()
+        );
+        assert!(matches!(
+            context.classify(Ok(DataOutcome {
+                job: 512,
+                ..outcome
+            })),
+            Err(Status::BadSize)
+        ));
+        assert!(matches!(
+            context.classify(Ok(DataOutcome {
+                result: DataResult::Bytes(1),
+                ..outcome
+            })),
+            Err(Status::BadSize)
+        ));
     }
 
     #[test]
@@ -1024,6 +1138,8 @@ pub struct QueryContext {
     target: Target,
     session: u64,
     request: DataStart,
+    phase: Phase,
+    feed_end: u16,
     transport: Transport,
 }
 
@@ -1083,6 +1199,9 @@ pub struct PreparedNoEffect {
     job: u64,
     target: Target,
     session: u64,
+    request: DataStart,
+    feed_end: u16,
+    phase: Phase,
 }
 
 pub struct QueryResult {
@@ -1195,13 +1314,28 @@ impl QueryContext {
         if self.job != 0 && outcome.job != self.job {
             return Err(Status::BadSize);
         }
-        let prepared = matches!(outcome.phase, DataPhase::Ready | DataPhase::TimeDeferred)
-            .then_some(PreparedNoEffect {
+        outcome.validate(self.request)?;
+        let phase = match outcome.phase {
+            DataPhase::Preparing => Some(Phase::Preparing),
+            DataPhase::Ready | DataPhase::TimeDeferred => Some(Phase::Ready),
+            _ => None,
+        };
+        let prepared = if self.phase == Phase::Committing
+            && self.job != 0
+            && outcome.result == DataResult::None
+        {
+            phase.map(|phase| PreparedNoEffect {
                 claim: self.claim,
-                job: outcome.job,
+                job: self.job,
                 target: self.target,
                 session: self.session,
-            });
+                request: self.request,
+                feed_end: self.feed_end,
+                phase,
+            })
+        } else {
+            None
+        };
         Ok(QueryResult { outcome, prepared })
     }
 }
@@ -1445,6 +1579,8 @@ impl PosixFs {
             target,
             session,
             request: snapshot.recovery.request(claim.scalar(), target)?,
+            phase: snapshot.recovery.phase,
+            feed_end: snapshot.recovery.feed_end,
             transport: self.transport(),
         })
     }
@@ -1650,11 +1786,16 @@ impl PosixFs {
             || snapshot.recovery.job != proof.job
             || snapshot.recovery.session_handle != proof.session
             || self.sessions().0.raw().0 != proof.session
+            || snapshot
+                .recovery
+                .request(proof.claim.scalar(), proof.target)?
+                != proof.request
+            || snapshot.recovery.feed_end != proof.feed_end
         {
             return Err(FsError::Io);
         }
         self.descriptors
-            .update_scalar_with(proof.claim, |recovery| recovery.phase = Phase::Ready)?;
+            .update_scalar_with(proof.claim, |recovery| recovery.phase = proof.phase)?;
         self.descriptors.release_scalar_claim(proof.claim)?;
         Ok(())
     }
