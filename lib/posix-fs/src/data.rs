@@ -1754,9 +1754,14 @@ impl PosixFs {
         {
             return Err(FsError::Io);
         }
-        let cleanup = self.descriptors.scalar_begin_cleanup(token)?;
+        self.descriptors.scalar_mark_cleanup(token)?;
+        let view = self.descriptors.scalar_view(token)?;
         Ok(CleanupContext {
-            cleanup,
+            cleanup: ScalarCleanup {
+                token,
+                recovery: *view.recovery,
+                last_target: view.last_target,
+            },
             session,
             transport: self.transport(),
         })
