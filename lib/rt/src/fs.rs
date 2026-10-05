@@ -744,7 +744,9 @@ impl Files {
         prepared.finish_binding()?;
         prepared.open_exec_bound(path)
     }
-    fn open_exec_bound(&self, path: &[u8]) -> Result<Handle<Channel>, Status> {
+    /// Resolve an executable using this authenticated bound session.
+    /// The service requires a genuine Pending loader binding for the image handoff.
+    pub fn open_exec_bound(&self, path: &[u8]) -> Result<Handle<Channel>, Status> {
         let proof = self.prepare(path)?;
         let mut w = Writer::new();
         Method::OpenExec.header().write(&mut w)?;

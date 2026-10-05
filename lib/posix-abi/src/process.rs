@@ -1811,39 +1811,26 @@ pub fn probe_notify_identity() -> i32 {
     }
 }
 
-/// OPEN_EXEC of `path` through the process's own session with the RAM
-/// file service, with a copy of its identity: what a process that is no
-/// loader gets (5c, the probe of condition O1). 0 when an image session came back,
-/// EPERM for the refusal, EIO for anything else.
+/// OPEN_EXEC through the process's bound RAM session, using a live paid
+/// pathname proof and the current wire. A normal process receives EPERM.
+/// A returned image gives 0; malformed replies and transport errors give EIO.
 pub fn probe_open_exec(path: &[u8]) -> i32 {
     use crate::constants::{EIO, EPERM};
-    let Some(own) = identity() else {
-        return EIO;
-    };
-    let rights = rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER;
-    let Ok(copy) = rt::sys::handle_duplicate(own, rights) else {
-        return EIO;
-    };
-    let mut w = Writer::new();
-    if proto_fs::Method::OpenExec.header().write(&mut w).is_err() || w.bytes(path).is_err() {
-        return EIO;
-    }
     let Ok(session) = crate::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
         return EIO;
     };
-    // The session lives as long as the process's files.
-    let session = Handle::<Channel>::borrowed(session);
-    let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    let sent = rt::sys::send_handles(&session, w.as_bytes(), [copy.erase()])
-        .map_err(|_| EIO)
-        .and_then(|reply| {
-            proto_wire::Reader::new(reply.bytes(&mut buffer))
-                .u32()
-                .map_err(|_| EIO)
-        });
-    match sent {
-        Ok(0) => 0,
-        Ok(proto_fs::PERMISSION) => EPERM,
-        _ => EIO,
+    // The process keeps its session alive; this borrowed view closes no handle.
+    // The paid request and its Proof cleanup execute outside the files lock.
+    let files = core::mem::ManuallyDrop::new(rt::fs::Files::from_sessions(
+        Handle::from_raw(session),
+        None,
+    ));
+    match files.open_exec_bound(path) {
+        Ok(image) => {
+            drop(image);
+            0
+        }
+        Err(proto_wire::Status::Unknown(proto_fs::PERMISSION)) => EPERM,
+        Err(_) => EIO,
     }
 }
