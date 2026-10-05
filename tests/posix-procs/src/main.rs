@@ -70,6 +70,8 @@ extern "C" fn files_fake_identity() -> i32 {
 mod cleanup;
 #[cfg(feature = "files")]
 mod data_stages;
+#[cfg(feature = "open-finalize-clock-probe")]
+mod open_finalize_clock;
 #[cfg(feature = "files")]
 mod open_stages;
 #[cfg(feature = "ipc-loss")]

@@ -390,7 +390,8 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-posix-files.img"
         | "boot-posix-files-steps.img"
         | "boot-posix-files-loss.img"
-        | "boot-posix-data-steps.img" => {
+        | "boot-posix-data-steps.img"
+        | "boot-posix-open-finalize-clock.img" => {
             let mut files = vec![dir("/dev")];
             files.extend(devices());
             files
