@@ -772,7 +772,7 @@ pub(crate) fn umask() -> u32 {
     UMASK.load(Ordering::Relaxed)
 }
 
-/// umask: the process's mask (no file the layer creates reads it yet).
+/// Captures the creation mask for subsequent Open and spawn operations.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_umask(mask: u32) -> u32 {
     UMASK.swap(mask & 0o777, Ordering::Relaxed)

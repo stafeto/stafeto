@@ -641,6 +641,12 @@ impl<'a> Ram<'a> {
         if flags & proto_fs::DIRECTORY_ONLY != 0 && node.kind != DIR {
             return Err(proto_fs::NOT_DIRECTORY);
         }
+        if node.kind == DIR
+            && flags & proto_fs::CREATE != 0
+            && flags & proto_fs::DIRECTORY_ONLY == 0
+        {
+            return Err(IS_DIRECTORY);
+        }
         if node.kind == DIR && (access != READ_ONLY || flags & proto_fs::TRUNCATE != 0) {
             return Err(IS_DIRECTORY);
         }
