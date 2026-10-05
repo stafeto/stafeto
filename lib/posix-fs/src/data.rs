@@ -987,6 +987,7 @@ pub struct TerminalCleanupAuthority {
 }
 
 impl TerminalQueryContext {
+    #[inline(never)]
     pub fn query_once(self) -> Result<TerminalQueryResult, Status> {
         let result = self
             .context
@@ -1061,6 +1062,7 @@ pub struct CleanupProof {
 impl CleanupContext {
     /// Cancel fences an uncertain Start; ACK retires any completed cache.
     /// CloseExact consumes only the captured description lifetime.
+    #[inline(never)]
     pub fn send_once(self) -> Result<CleanupProof, FsError> {
         let files = self.transport.files();
         files
@@ -1310,6 +1312,7 @@ impl PosixFs {
     }
 
     /// Revoke effect authority before the exact-key native fence, retaining cache.
+    #[inline(never)]
     pub fn begin_data_terminal_cleanup(
         &mut self,
         token: ScalarToken,
@@ -1370,7 +1373,7 @@ impl PosixFs {
         errno_of: fn(FsError) -> i32,
     ) -> Result<(), FsError> {
         let context = proof.context;
-        let snapshot = self.data_claim_snapshot(context.claim)?;
+        let snapshot = self.descriptors.scalar_claim_view(context.claim)?;
         if snapshot.owner.is_none()
             || snapshot.recovery.phase != Phase::Starting
             || snapshot.recovery.job != 0
@@ -1388,9 +1391,8 @@ impl PosixFs {
         if errno <= 0 {
             return Err(FsError::Io);
         }
-        let mut recovery = snapshot.recovery;
-        recovery.phase = Phase::Completed;
-        self.descriptors.update_scalar(context.claim, recovery)?;
+        self.descriptors
+            .update_scalar_with(context.claim, |recovery| recovery.phase = Phase::Completed)?;
         self.descriptors
             .complete_scalar(context.claim, ScalarResult::Failed(errno))?;
         Ok(())
@@ -1496,6 +1498,7 @@ impl PosixFs {
             .map_err(FsError::from)
     }
 
+    #[inline(never)]
     pub fn begin_data_cleanup(&mut self, token: ScalarToken) -> Result<CleanupContext, FsError> {
         let snapshot = self.descriptors.scalar_view(token)?;
         let session = self.sessions().0.raw().0;
