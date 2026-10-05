@@ -423,3 +423,69 @@ mod tests {
         assert_eq!(data_read_reply(out.as_bytes(), 0, 3), Err(Status::BadSize));
     }
 }
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn regression_result_envelopes_and_noeffect_status_domain() {
+        let args = DataStart {
+            key: OpenKey {
+                slot: 0,
+                generation: 1,
+            },
+            kind: DataKind::Read,
+            description: DataDescription {
+                packed: 3,
+                generation: 1,
+            },
+            count: 1016,
+            position: 0,
+        };
+        for phase_number in 0..=6 {
+            let phase = DataPhase::from_number(phase_number).unwrap();
+            for result in [
+                DataResult::None,
+                DataResult::Bytes(1016),
+                DataResult::FailedNoEffect(300),
+            ] {
+                let outcome = DataOutcome {
+                    phase,
+                    job: 383,
+                    result,
+                };
+                let mut w = Writer::new();
+                outcome.write(&mut w).unwrap();
+                let allowed = match phase {
+                    DataPhase::Completed => result != DataResult::None,
+                    DataPhase::Canceling => true,
+                    _ => result == DataResult::None,
+                };
+                assert_eq!(DataOutcome::read(w.as_bytes(), 0, args).is_ok(), allowed);
+                assert_eq!(
+                    DataOutcome::read(w.as_bytes(), 1, args),
+                    Err(Status::BadSize)
+                );
+                w.bytes(&[0]).unwrap();
+                assert_eq!(
+                    DataOutcome::read(w.as_bytes(), 0, args),
+                    Err(Status::BadSize)
+                );
+            }
+        }
+        for code in [314, 315, 319, 321, 325] {
+            assert!(!terminal_failure(code));
+        }
+        for job in [0, 127, 128, 255, 384, u64::MAX] {
+            assert!(!valid_job(job));
+        }
+        for job in [256, 383, 512, u64::MAX - 128] {
+            assert!(valid_job(job));
+        }
+        for number in 1..=325 {
+            let bytes = proto_wire::reply(Status::from_code(number));
+            assert!(data_progress_reply(&bytes, 0).is_err());
+            assert_eq!(data_progress_reply(&bytes, 1), Err(Status::BadSize));
+        }
+    }
+}
