@@ -731,6 +731,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compact_exhaustion_rejects_live_claim_without_changing_history() {
+        let mut fs = files();
+        let (token, claim) = begin(&mut fs, DataKind::Read, 3, &[]);
+        let original = fs.data_snapshot(token).unwrap();
+        assert!(fs.begin_data_exhausted_cleanup(token, owner(1)).is_err());
+        assert!(fs.begin_data_exhausted_cleanup(token, owner(2)).is_err());
+        assert_eq!(fs.data_snapshot(token).unwrap(), original);
+        assert!(fs.data_claim_state(claim).is_ok());
+    }
+
     fn retired(fs: &PosixFs, claim: ScalarClaimToken) -> TerminalCleanupAuthority {
         let TerminalQueryResult::Retired(authority) = fs
             .data_terminal_query_context(claim)
@@ -1474,6 +1485,24 @@ impl PosixFs {
             length: length as u16,
             bytes,
         })
+    }
+
+    /// Fold exhausted claim authority and revocation into one exclusive borrow.
+    pub fn begin_data_exhausted_cleanup(
+        &mut self,
+        token: ScalarToken,
+        owner: OwnerToken,
+    ) -> Result<(), FsError> {
+        let view = self.descriptors.scalar_view(token)?;
+        if view.phase != ScalarPhase::CleanupRequired
+            || view.owner != Some(owner)
+            || view.recovery.session_handle != self.sessions().0.raw().0
+        {
+            return Err(FsError::BadFileDescriptor);
+        }
+        self.descriptors
+            .scalar_mark_cleanup(token)
+            .map_err(FsError::from)
     }
 
     /// Irreversible claim exhaustion permits cleanup without minting a new claim.
