@@ -180,14 +180,16 @@ impl Drop for Guard<'_> {
     }
 }
 
+#[inline(always)]
 pub(crate) fn before<const N: u16>() {
     // ObjectInfo reads only registers and never allocates or consumes incoming caps.
     // Excluding it also terminates the sampler's own ObjectInfo calls.
-    if N != Call::ObjectInfo.number() {
+    if N != Call::ObjectInfo.number() && METER.process.load(Ordering::Relaxed) != 0 {
         METER.sample();
     }
 }
 
+#[inline(always)]
 pub(crate) fn after<const N: u16>(status: u64) {
     if N == Call::ObjectInfo.number() || METER.process.load(Ordering::Relaxed) == 0 {
         return;
