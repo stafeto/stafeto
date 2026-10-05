@@ -208,14 +208,14 @@ int main(int argc, char **argv) {
     char magic[4];
     CHECK(pread(retained, magic, sizeof(magic), 0) == (ssize_t)sizeof(magic) &&
           memcmp(magic, "\177ELF", sizeof(magic)) == 0);
-    int64_t initial_atime[2];
-    CHECK(access_time(retained, initial_atime) == 0);
     struct pin_snapshot baseline;
     CHECK(t6_runtime_pins(retained, &baseline) == 0);
     CHECK(baseline.counts[0] == 0 && baseline.counts[1] == 0 && baseline.counts[2] == 0);
     CHECK(baseline.pins == 0 && baseline.writers == 0);
     CHECK(t6_runtime_stage(retained) == 0);
     CHECK(counts(retained, &baseline, 0) == 0);
+    int64_t initial_atime[2];
+    CHECK(access_time(retained, initial_atime) == 0);
     int parent[2], child[2], grand[2], events[2];
     CHECK(pipe(parent) == 0 && pipe(child) == 0 && pipe(grand) == 0 && pipe(events) == 0);
     char a[16], b[16], c[16], d[16];
