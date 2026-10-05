@@ -341,7 +341,7 @@ fn times_exact_now_omit_and_zero_effect_permissions_preserve_signed_values() {
             b"/times",
             OTHER,
             MetadataIntent::Times([TimeSetting::Now, TimeSetting::Omit]),
-            None
+            Some(NOW)
         ),
         MetadataOutcome::Failed(PERMISSION)
     );
