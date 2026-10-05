@@ -284,7 +284,7 @@ fn console_read(uart: Option<u64>, buffer: &mut [u8]) -> Result<usize, i32> {
 pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
     let point = threads::cancel::Point::begin();
     let result = fd(number)
-        .and_then(|fd| shared::number(Request::Write { fd, bytes }))
+        .and_then(|fd| shared::write(fd, bytes))
         .map(|n| n as usize);
     if result == Err(EPIPE) {
         let _ = signals::raise(SIGPIPE);

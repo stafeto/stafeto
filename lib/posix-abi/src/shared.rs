@@ -492,6 +492,59 @@ fn open(path: &[u8], flags: i32, mode: u32, umask: u32) -> Result<u64, i32> {
     inserted.map(u64::from)
 }
 
+/// Selects exact RAM scalar custody before entering device transport frames.
+pub(crate) fn write(fd: u32, bytes: &[u8]) -> Result<u64, i32> {
+    if !READY.load(Ordering::Acquire) {
+        return Err(ENOSYS);
+    }
+    loop {
+        let extent = &bytes[..bytes.len().min(proto_fs::MAX_WRITE)];
+        if let Some(operation) = crate::data_driver::begin(
+            fd,
+            posix_fs::data::DataKind::Write,
+            extent.len() as u32,
+            0,
+            extent,
+        )? {
+            break operation.run(&mut []);
+        }
+        let result = write_nonram(fd, bytes)?;
+        if let Some(result) = result {
+            break Ok(result);
+        }
+    }
+}
+
+#[inline(never)]
+fn write_nonram(fd: u32, bytes: &[u8]) -> Result<Option<u64>, i32> {
+    held(fd, |transport, target| {
+        // A file or the console takes at most one message of it.
+        let extent = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];
+        match target {
+            // The write of the terminal waits here, outside the lock.
+            Target::Output | Target::Error if transport.terminal().is_some() => {
+                crate::terminal::write(transport, proto_tty::CONSOLE, bytes).map(|n| n as u64)
+            }
+            Target::Tty(number) => {
+                crate::terminal::write(transport, number, bytes).map(|n| n as u64)
+            }
+            Target::Output | Target::Error => transport
+                .input()
+                .write(extent)
+                .map(|n| n as u64)
+                .map_err(|status| crate::error(posix_fs::FsError::from(status))),
+            // The write of a pipe waits here, outside the lock.
+            Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
+            Target::Ram(_) | Target::Random(_) => return Ok(None),
+            target => transport
+                .write(target, extent)
+                .map(|n| n as u64)
+                .map_err(crate::error),
+        }
+        .map(Some)
+    })
+}
+
 fn number_operation(request: Request<'_>) -> Result<u64, i32> {
     use Request::*;
     match request {
@@ -501,50 +554,7 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
             mode,
             umask,
         } => open(path, flags as i32, mode, umask),
-        Write { fd, bytes } => loop {
-            let extent = &bytes[..bytes.len().min(proto_fs::MAX_WRITE)];
-            if let Some(operation) = crate::data_driver::begin(
-                fd,
-                posix_fs::data::DataKind::Write,
-                extent.len() as u32,
-                0,
-                extent,
-            )? {
-                break operation.run(&mut []);
-            }
-            let result = held(fd, |transport, target| {
-                // A file or the console takes at most one message of it.
-                let extent = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];
-                match target {
-                    // The write of the terminal waits here, outside the lock.
-                    Target::Output | Target::Error if transport.terminal().is_some() => {
-                        crate::terminal::write(transport, proto_tty::CONSOLE, bytes)
-                            .map(|n| n as u64)
-                    }
-                    Target::Tty(number) => {
-                        crate::terminal::write(transport, number, bytes).map(|n| n as u64)
-                    }
-                    Target::Output | Target::Error => transport
-                        .input()
-                        .write(extent)
-                        .map(|n| n as u64)
-                        .map_err(|status| crate::error(posix_fs::FsError::from(status))),
-                    // The write of a pipe waits here, outside the lock.
-                    Target::Pipe(end) => {
-                        crate::pipes::write(transport, end, bytes).map(|n| n as u64)
-                    }
-                    Target::Ram(_) | Target::Random(_) => return Ok(None),
-                    target => transport
-                        .write(target, extent)
-                        .map(|n| n as u64)
-                        .map_err(crate::error),
-                }
-                .map(Some)
-            })?;
-            if let Some(result) = result {
-                break Ok(result);
-            }
-        },
+        Write { fd, bytes } => write(fd, bytes),
         Seek { fd, offset, origin } => held(fd, |transport, target| {
             transport
                 .lseek(target, offset, origin)
