@@ -549,6 +549,111 @@ mod tests {
         assert_eq!(fs.target(0).unwrap(), Target::Input);
         assert_eq!(fs.data_tokens().count(), 0);
     }
+    fn retired(fs: &PosixFs, claim: ScalarClaimToken) -> TerminalCleanupAuthority {
+        let TerminalQueryResult::Retired(authority) = fs
+            .data_terminal_query_context(claim)
+            .unwrap()
+            .classify(Err(Status::Unknown(proto_fs::OPEN_RETIRED)))
+            .unwrap()
+        else {
+            panic!("canonical retired reply");
+        };
+        authority
+    }
+
+    #[test]
+    fn terminal_fence_retains_original_until_confirmation_and_allows_retry() {
+        let mut fs = files();
+        let (token, claim) = begin(&mut fs, DataKind::Read, 3, &[]);
+        assert!(
+            fs.exhausted_data_cleanup_authority(token, owner(1))
+                .is_err()
+        );
+        assert!(fs.begin_data_cleanup(token).is_err());
+        let authority = retired(&fs, claim);
+        let _uncertain = fs
+            .begin_data_terminal_cleanup(token, owner(1), authority)
+            .unwrap();
+        assert!(fs.data_claim_snapshot(claim).is_err());
+        assert!(fs.claim_data(token, owner(2)).is_ok());
+        assert_eq!(
+            fs.data_snapshot(token).unwrap().phase,
+            ScalarPhase::Cleaning
+        );
+        assert_eq!(fs.data_snapshot(token).unwrap().result, None);
+        assert!(fs.acknowledge_data(token, owner(1), &mut []).is_err());
+        let proof = cleanup_proof(fs.begin_data_cleanup(token).unwrap());
+        fs.finish_data_cleanup(proof).unwrap();
+        assert_eq!(
+            fs.acknowledge_data(token, owner(1), &mut []).unwrap(),
+            ScalarResult::Failed(5)
+        );
+        assert!(fs.data_snapshot(token).is_err());
+    }
+
+    #[test]
+    fn terminal_authority_cannot_replace_new_claim_or_completed_read_cache() {
+        let mut fs = files();
+        let (token, claim) = begin(&mut fs, DataKind::Read, 3, &[]);
+        let authority = retired(&fs, claim);
+        fs.release_data_claim(claim).unwrap();
+        let ScalarClaim::Acquired { token: current, .. } = fs.claim_data(token, owner(1)).unwrap()
+        else {
+            panic!("new exact claim");
+        };
+        assert!(
+            fs.begin_data_terminal_cleanup(token, owner(1), authority)
+                .is_err()
+        );
+        assert_eq!(fs.data_snapshot(token).unwrap().phase, ScalarPhase::Working);
+        committing(&mut fs, token, current);
+        let authority = retired(&fs, current);
+        fs.save_data_result(current, done(256, 3), b"abc", |_| 5)
+            .unwrap();
+        assert!(
+            fs.begin_data_terminal_cleanup(token, owner(1), authority)
+                .is_err()
+        );
+        let proof = cleanup_proof(fs.begin_data_cleanup(token).unwrap());
+        fs.finish_data_cleanup(proof).unwrap();
+        let mut bytes = [0; 3];
+        assert_eq!(
+            fs.acknowledge_data(token, owner(1), &mut bytes).unwrap(),
+            ScalarResult::Bytes(3)
+        );
+        assert_eq!(&bytes, b"abc");
+    }
+
+    #[test]
+    fn ambiguous_query_and_working_snapshot_cannot_mint_terminal_cleanup() {
+        let mut fs = files();
+        let (token, claim) = begin(&mut fs, DataKind::Read, 3, &[]);
+        for status in [
+            Status::Unknown(300),
+            Status::BadSize,
+            Status::Kernel(rt::abi::Error::Interrupted),
+        ] {
+            assert!(
+                fs.data_terminal_query_context(claim)
+                    .unwrap()
+                    .classify(Err(status))
+                    .is_err()
+            );
+        }
+        let forged = TerminalCleanupAuthority {
+            token,
+            snapshot: fs.data_snapshot(token).unwrap(),
+            claim: None,
+        };
+        assert!(
+            fs.begin_data_terminal_cleanup(token, owner(1), forged)
+                .is_err()
+        );
+        assert_eq!(
+            fs.data_claim_snapshot(claim).unwrap().phase,
+            ScalarPhase::Working
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -710,9 +815,62 @@ pub struct QueryResult {
     pub prepared: Option<PreparedNoEffect>,
 }
 
+/// This context preserves complete history while querying terminal custody.
+pub struct TerminalQueryContext {
+    context: QueryContext,
+    snapshot: Snapshot,
+}
+
+// The exact immutable snapshot remains value-owned without heap allocation.
+#[allow(clippy::large_enum_variant)]
+pub enum TerminalQueryResult {
+    Outcome(QueryResult),
+    Retired(TerminalCleanupAuthority),
+}
+
+/// An exact retired reply or irreversible claim exhaustion permits fencing.
+/// Cleanup can report EIO after an earlier effect; this carries no no-effect proof.
+pub struct TerminalCleanupAuthority {
+    token: ScalarToken,
+    snapshot: Snapshot,
+    claim: Option<ScalarClaimToken>,
+}
+
+impl TerminalQueryContext {
+    pub fn query_once(self) -> Result<TerminalQueryResult, Status> {
+        let result = self
+            .context
+            .transport
+            .files()
+            .data_query_once(self.context.request);
+        self.classify(result)
+    }
+
+    fn classify(self, result: Result<DataOutcome, Status>) -> Result<TerminalQueryResult, Status> {
+        match result {
+            Err(Status::Unknown(proto_fs::OPEN_RETIRED)) => {
+                Ok(TerminalQueryResult::Retired(TerminalCleanupAuthority {
+                    token: self.context.claim.scalar(),
+                    snapshot: self.snapshot,
+                    claim: Some(self.context.claim),
+                }))
+            }
+            other => self
+                .context
+                .classify(other)
+                .map(TerminalQueryResult::Outcome),
+        }
+    }
+}
+
 impl QueryContext {
     pub fn query_once(self) -> Result<QueryResult, Status> {
-        let outcome = self.transport.files().data_query_once(self.request)?;
+        let result = self.transport.files().data_query_once(self.request);
+        self.classify(result)
+    }
+
+    fn classify(self, result: Result<DataOutcome, Status>) -> Result<QueryResult, Status> {
+        let outcome = result?;
         if self.job != 0 && outcome.job != self.job {
             return Err(Status::BadSize);
         }
@@ -876,6 +1034,71 @@ impl PosixFs {
             transport: self.transport(),
         })
     }
+    pub fn data_terminal_query_context(
+        &self,
+        claim: ScalarClaimToken,
+    ) -> Result<TerminalQueryContext, FsError> {
+        let snapshot = self.data_claim_snapshot(claim)?;
+        if snapshot.owner.is_none() {
+            return Err(FsError::BadFileDescriptor);
+        }
+        Ok(TerminalQueryContext {
+            context: self.data_query_context(claim)?,
+            snapshot,
+        })
+    }
+
+    /// Irreversible claim exhaustion permits cleanup without minting a new claim.
+    pub fn exhausted_data_cleanup_authority(
+        &self,
+        token: ScalarToken,
+        owner: OwnerToken,
+    ) -> Result<TerminalCleanupAuthority, FsError> {
+        let snapshot = self.data_snapshot(token)?;
+        if snapshot.phase != ScalarPhase::CleanupRequired
+            || snapshot.owner != Some(owner)
+            || snapshot.recovery.session_handle != self.sessions().0.raw().0
+        {
+            return Err(FsError::BadFileDescriptor);
+        }
+        Ok(TerminalCleanupAuthority {
+            token,
+            snapshot,
+            claim: None,
+        })
+    }
+
+    /// Revoke effect authority before the exact-key native fence, retaining cache.
+    pub fn begin_data_terminal_cleanup(
+        &mut self,
+        token: ScalarToken,
+        owner: OwnerToken,
+        authority: TerminalCleanupAuthority,
+    ) -> Result<CleanupContext, FsError> {
+        if token != authority.token || authority.snapshot.owner != Some(owner) {
+            return Err(FsError::BadFileDescriptor);
+        }
+        let snapshot = if let Some(claim) = authority.claim {
+            self.data_claim_snapshot(claim)?
+        } else {
+            let snapshot = self.data_snapshot(token)?;
+            if snapshot.phase != ScalarPhase::CleanupRequired {
+                return Err(FsError::BadFileDescriptor);
+            }
+            snapshot
+        };
+        let session = self.sessions().0.raw().0;
+        if snapshot != authority.snapshot || snapshot.recovery.session_handle != session {
+            return Err(FsError::Io);
+        }
+        let cleanup = self.descriptors.scalar_begin_cleanup(token)?;
+        Ok(CleanupContext {
+            cleanup,
+            session,
+            transport: self.transport(),
+        })
+    }
+
     pub fn data_commit_context(&self, claim: ScalarClaimToken) -> Result<CommitContext, FsError> {
         let snapshot = self.data_claim_snapshot(claim)?;
         if snapshot.owner.is_none()
@@ -1035,7 +1258,9 @@ impl PosixFs {
         let snapshot = self.data_snapshot(token)?;
         let session = self.sessions().0.raw().0;
         if snapshot.recovery.session_handle != session
-            || (snapshot.owner.is_some() && snapshot.result.is_none())
+            || (snapshot.owner.is_some()
+                && snapshot.result.is_none()
+                && snapshot.phase != ScalarPhase::Cleaning)
         {
             return Err(FsError::Io);
         }
