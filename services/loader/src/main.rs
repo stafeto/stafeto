@@ -472,6 +472,10 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 }
                             };
                         }
+                        if let Err(code) = capture_fork_image(own, session) {
+                            reply(token, code);
+                            return None;
+                        }
                         let (body, scratch) = fork.as_mut()?;
                         let regions = scratch.count as u64;
                         match steps::timed(kind::GO, regions, || copy(own, body, scratch)).and_then(
@@ -1058,6 +1062,68 @@ fn fill(own: &Own, parent: &Handle<Memory>, bytes: u64, at: u64) -> Result<(), u
         offset += piece;
     }
     Ok(())
+}
+
+/// Process owns the parent snapshot; this loader captures child custody before copying code.
+fn capture_fork_image(own: &Own, session: &Handle<Channel>) -> Result<(), u32> {
+    let request = proto_process::Method::LoaderForkImage.header().bytes();
+    let mut reply = sys::send(session, &request).map_err(code)?;
+    if reply.len > 8 {
+        return Err(pl::IO);
+    }
+    let bytes = reply.words[0].to_le_bytes();
+    let retained = loader_image::fork_source_reply(
+        &bytes[..reply.len],
+        reply.handles.len(),
+        reply.handles.info(0),
+    )
+    .map_err(|_| pl::IO)?;
+    if !retained {
+        return Ok(());
+    }
+    let source = reply.handles.take::<Channel>(0).map_err(code)?;
+    drop(reply);
+    let identity = sys::handle_duplicate(
+        &own.identity,
+        Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
+    )
+    .map_err(code)?;
+    let files =
+        rt::fs::Files::bind_pending_on(&own.files, false, None, identity).map_err(|_| pl::IO)?;
+    rt::fs::Files::finish_on(&files).map_err(|_| pl::IO)?;
+    let request = proto_fs::Method::CloneExec.header().bytes();
+    loop {
+        let copy =
+            sys::handle_duplicate(&source, Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER)
+                .map_err(code)?;
+        let mut reply = sys::send_handles(&files, &request, [copy.erase()])
+            .map_err(|refused| code(refused.error))?;
+        if reply.len > 8 {
+            return Err(pl::IO);
+        }
+        let bytes = reply.words[0].to_le_bytes();
+        match loader_image::clone_image_reply(
+            &bytes[..reply.len],
+            reply.handles.len(),
+            reply.handles.info(0),
+        )
+        .map_err(|_| pl::IO)?
+        {
+            loader_image::CloneImageProgress::Ready => {
+                // Process pending custody owns the same session before this loader copy goes.
+                drop(reply.handles.take::<Channel>(0).map_err(code)?);
+                return Ok(());
+            }
+            loader_image::CloneImageProgress::Authenticate => {
+                drop(reply);
+                rt::fs::Files::finish_on(&files).map_err(|_| pl::IO)?;
+            }
+            loader_image::CloneImageProgress::Continue => {
+                drop(reply);
+                let _ = sys::yield_now();
+            }
+        }
+    }
 }
 
 /// Ready: the service hears the image is loaded before the parent does,

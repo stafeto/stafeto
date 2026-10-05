@@ -28,6 +28,70 @@ pub fn image_reply_size(bytes: &[u8], handle_count: usize) -> Result<u64, Status
     Ok(info.size)
 }
 
+/// Only the canonical own Process NOT_FOUND permits the initial-image fork path.
+pub fn fork_source_reply(
+    bytes: &[u8],
+    handles: usize,
+    cap: Option<(abi::ObjectKind, abi::Rights)>,
+) -> Result<bool, Status> {
+    let mut r = Reader::new(bytes);
+    let status = r.u32()?;
+    if status == 0 {
+        r.finish()?;
+        let rights = abi::Rights::SEND | abi::Rights::DUPLICATE | abi::Rights::TRANSFER;
+        if handles != 1
+            || !matches!(cap, Some((abi::ObjectKind::Channel, got)) if got.contains(rights))
+        {
+            return Err(Status::BadSize);
+        }
+        return Ok(true);
+    }
+    if r.u32()? != 0 || handles != 0 {
+        return Err(Status::BadSize);
+    }
+    r.finish()?;
+    if status == proto_process::NOT_FOUND {
+        Ok(false)
+    } else {
+        Err(Status::from_code(status))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloneImageProgress {
+    Continue,
+    Authenticate,
+    Ready,
+}
+/// A retained image success has exactly one channel; progress/error has none.
+pub fn clone_image_reply(
+    bytes: &[u8],
+    handles: usize,
+    cap: Option<(abi::ObjectKind, abi::Rights)>,
+) -> Result<CloneImageProgress, Status> {
+    let mut r = Reader::new(bytes);
+    let status = r.u32()?;
+    if status == 0 {
+        r.finish()?;
+        let rights = abi::Rights::SEND | abi::Rights::TRANSFER;
+        if handles != 1
+            || !matches!(cap, Some((abi::ObjectKind::Channel, got)) if got.contains(rights))
+        {
+            return Err(Status::BadSize);
+        }
+        return Ok(CloneImageProgress::Ready);
+    }
+    if r.u32()? != 0 || handles != 0 {
+        return Err(Status::BadSize);
+    }
+    r.finish()?;
+    match status {
+        proto_fs::RESOLVING => Ok(CloneImageProgress::Continue),
+        proto_fs::AUTHENTICATING => Ok(CloneImageProgress::Authenticate),
+        _ => Err(Status::from_code(status)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +150,77 @@ mod tests {
             bytes[..4].copy_from_slice(&code.to_le_bytes());
             assert_eq!(image_reply_size(&bytes, 0), Err(Status::BadSize));
         }
+    }
+}
+
+#[cfg(test)]
+mod fork_reply_tests {
+    use super::*;
+    use abi::{ObjectKind, Rights};
+    fn error(code: u32) -> [u8; 8] {
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&code.to_le_bytes());
+        bytes
+    }
+    #[test]
+    fn initial_fork_requires_exact_not_found_and_retained_source_requires_duplicate_right() {
+        let none = error(proto_process::NOT_FOUND);
+        assert_eq!(fork_source_reply(&none, 0, None), Ok(false));
+        for (bytes, count) in [(&none[..4], 0), (&none[..], 1), (&[0; 8][..], 1)] {
+            assert_eq!(fork_source_reply(bytes, count, None), Err(Status::BadSize));
+        }
+        let mut bad = none;
+        bad[4] = 1;
+        assert_eq!(fork_source_reply(&bad, 0, None), Err(Status::BadSize));
+        assert_eq!(
+            fork_source_reply(&error(proto_process::PERMISSION), 0, None),
+            Err(Status::from_code(proto_process::PERMISSION))
+        );
+        let full = Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER;
+        assert_eq!(
+            fork_source_reply(&[0; 4], 1, Some((ObjectKind::Channel, full))),
+            Ok(true)
+        );
+        for cap in [
+            (ObjectKind::Memory, full),
+            (ObjectKind::Channel, Rights::SEND | Rights::TRANSFER),
+        ] {
+            assert_eq!(
+                fork_source_reply(&[0; 4], 1, Some(cap)),
+                Err(Status::BadSize)
+            );
+        }
+    }
+    #[test]
+    fn clone_progress_preserves_ambiguity_and_rejects_extra_caps_reserved_words_and_trailing_bytes()
+    {
+        assert_eq!(
+            clone_image_reply(&error(proto_fs::RESOLVING), 0, None),
+            Ok(CloneImageProgress::Continue)
+        );
+        assert_eq!(
+            clone_image_reply(&error(proto_fs::AUTHENTICATING), 0, None),
+            Ok(CloneImageProgress::Authenticate)
+        );
+        assert_eq!(
+            clone_image_reply(&error(proto_fs::IMAGE_ABORT_REQUIRED), 0, None),
+            Err(Status::from_code(proto_fs::IMAGE_ABORT_REQUIRED))
+        );
+        let cap = Some((ObjectKind::Channel, Rights::SEND | Rights::TRANSFER));
+        assert_eq!(
+            clone_image_reply(&[0; 4], 1, cap),
+            Ok(CloneImageProgress::Ready)
+        );
+        for (bytes, n) in [
+            (&[0; 4][..], 0),
+            (&[0; 8][..], 1),
+            (&[0; 4][..], 2),
+            (&error(proto_fs::RESOLVING)[..], 1),
+        ] {
+            assert_eq!(clone_image_reply(bytes, n, cap), Err(Status::BadSize));
+        }
+        let mut bad = error(proto_fs::RESOLVING);
+        bad[4] = 1;
+        assert_eq!(clone_image_reply(&bad, 0, None), Err(Status::BadSize));
     }
 }

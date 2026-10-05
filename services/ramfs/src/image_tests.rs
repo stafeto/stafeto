@@ -748,3 +748,96 @@ fn fork_preflight_preserves_full_origin_budget_and_loading_source() {
     }
     assert_eq!(ram.storage.usage(EXPENSE).descriptions, 0);
 }
+
+#[test]
+fn fork_snapshot_admission_and_final_child_cleanup_preserve_exact_origin_and_atime() {
+    let bytes = image();
+    let mut index = crate::tree::Index::new();
+    let tree = crate::tree::load(&bytes, &mut index).unwrap();
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::legacy_ns(0), tree);
+    let token = ram.storage.resolve(b"/program").unwrap();
+    let entry = ram.storage.node(token).unwrap().boot;
+    let target_root = Root {
+        id: 301,
+        generation: 2,
+    };
+    let mut parent = Fds {
+        root: EXPENSE,
+        ..Fds::default()
+    };
+    ram.hold_image(&mut parent, token, entry).unwrap();
+    let mut child = Fds {
+        root: target_root,
+        ..Fds::default()
+    };
+    let unarmed = parent.image_hold.unwrap();
+    assert_eq!(
+        ram.hold_fork_snapshot(&mut child, unarmed),
+        Err(proto_fs::PERMISSION)
+    );
+    assert!(child.image_hold.is_none());
+    let time = proto_fs::Timestamp::new(-5, 42).unwrap();
+    ram.arm_image_execution(&mut parent, token, time).unwrap();
+    let held = parent.image_hold.unwrap();
+    parent.binding = crate::authority::Binding::Cleanup;
+    parent.root = target_root;
+    let charge = ram.storage.charge_preparation(target_root).unwrap();
+    ram.hold_fork_snapshot(&mut child, held).unwrap();
+    assert_eq!(ram.storage.node(token).unwrap().times[0], time);
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 2);
+    assert_eq!(ram.storage.usage(target_root).descriptions, 0);
+    ram.storage.release_preparation(charge);
+    ram.release(&mut parent);
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 1);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins[Pin::Image as usize],
+        1
+    );
+    assert!(!ram.release_loading_image(&mut child));
+    assert_eq!(
+        ram.storage.write(token, target_root, 0, b"x"),
+        Err(proto_fs::TEXT_BUSY)
+    );
+    ram.release(&mut child);
+    ram.release(&mut child);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins[Pin::Image as usize],
+        0
+    );
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 0);
+    assert_eq!(ram.storage.preparations_used(), 0);
+}
+
+#[test]
+fn clone_preparation_shares_existing_global_and_root_budget_before_any_image_reference() {
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let other = Root {
+        id: 301,
+        generation: 1,
+    };
+    let mut paid = [0; crate::storage::PREPARATIONS];
+    for (i, p) in paid.iter_mut().enumerate() {
+        *p = ram
+            .storage
+            .charge_preparation(if i < 96 { EXPENSE } else { other })
+            .unwrap();
+    }
+    let mut child = Fds {
+        root: other,
+        ..Fds::default()
+    };
+    assert_eq!(
+        ram.storage.charge_preparation(other),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    );
+    assert!(child.image_hold.is_none());
+    assert_eq!(ram.storage.usage(other).descriptions, 0);
+    for p in paid {
+        ram.storage.release_preparation(p);
+    }
+    child.resolvers.fill(1);
+    assert!(!child.preparation_available());
+    child.resolvers[15] = 0;
+    assert!(child.preparation_available());
+    assert_eq!(ram.storage.preparations_used(), 0);
+}

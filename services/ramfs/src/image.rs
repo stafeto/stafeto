@@ -60,7 +60,10 @@ impl Ram<'_> {
     /// A verified private source capability supplies this exact retained image.
     /// Fork pays an independent child reference on the originating root.
     pub fn hold_fork_image(&mut self, child: &mut Fds, source: &Fds) -> Result<(), u32> {
-        let held = source.image_hold.ok_or(proto_fs::BAD_FD)?;
+        self.hold_fork_snapshot(child, source.image_hold.ok_or(proto_fs::BAD_FD)?)
+    }
+    /// The service captures this value while a proven private source capability is retained.
+    pub fn hold_fork_snapshot(&mut self, child: &mut Fds, held: ImageHold) -> Result<(), u32> {
         if !held.executable || child.image_hold.is_some() {
             return Err(proto_fs::PERMISSION);
         }

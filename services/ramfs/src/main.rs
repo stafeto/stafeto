@@ -27,7 +27,7 @@ use ramfs::{Exec, SET_GID, SET_UID};
 use ramfs::{Fds, Ram};
 use rt::abi::{Access, Rights};
 use rt::handle::{Channel, Handle, Memory, Outgoing, Resource};
-use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
+use rt::service::{Answer, Config, Heartbeat, Peers, Request, Service, Session};
 use rt::sys;
 
 mod clock_page;
@@ -39,8 +39,8 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0xfff7, 0xfff8, 0xfff9, 0xfffa,
-    0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 0xfff7, 0xfff8, 0xfff9,
+    0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -241,6 +241,7 @@ struct ImageContext {
     transfer: Option<Handle<Channel>>,
     stage_transfer: Option<Handle<Channel>>,
     receipt: proto_process::StageReceipt,
+    source_label: u64,
 }
 struct IdentityChannel {
     label: u64,
@@ -276,18 +277,19 @@ struct PathJob {
 enum JobOperation {
     Path(PathJob),
     Data(ramfs::data::Journal),
+    ImageClone(u64),
 }
 impl ResolveJob {
     fn path(&self) -> &PathJob {
         match &self.operation {
             JobOperation::Path(path) => path,
-            JobOperation::Data(_) => panic!("validated path job"),
+            JobOperation::Data(_) | JobOperation::ImageClone(_) => panic!("validated path job"),
         }
     }
     fn path_mut(&mut self) -> &mut PathJob {
         match &mut self.operation {
             JobOperation::Path(path) => path,
-            JobOperation::Data(_) => panic!("validated path job"),
+            JobOperation::Data(_) | JobOperation::ImageClone(_) => panic!("validated path job"),
         }
     }
 }
@@ -314,6 +316,24 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
 }));
 
 impl Fs {
+    fn claim_birth(&mut self, s: &mut Session<Fds, 0>, label: u64) {
+        if !s.data.claimed {
+            // The first request of a session Clone made takes its
+            // descriptors.
+            if let Some(birth) = self
+                .births
+                .iter_mut()
+                .find(|b| b.is_some_and(|(l, _)| l == label))
+            {
+                s.data = birth.take().expect("a birth").1;
+            } else if label & proto_fs::OWN != 0 && self.clones.client_of(label).is_some() {
+                // A Loader consumed this birth into a distinct label; surviving old copies
+                // have cleanup authority only, regardless of a creator's retained handle.
+                s.data.binding = Binding::Cleanup;
+            }
+            s.data.claimed = true;
+        }
+    }
     /// A dead or superseded authority releases one retained reference per pass.
     fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
         if fds
@@ -447,6 +467,7 @@ impl Fs {
         job: u64,
         token: Token,
         exec: &Exec,
+        source: Option<(u64, ramfs::image::ImageHold)>,
     ) -> Result<(), u32> {
         let free = self
             .births
@@ -471,7 +492,11 @@ impl Fs {
         child.binding = fds.binding;
         child.root = fds.root;
         let admitted = (|| {
-            self.ram.hold_image(&mut child, token, exec.entry)?;
+            if let Some((_, held)) = source {
+                self.ram.hold_fork_snapshot(&mut child, held)?;
+            } else {
+                self.ram.hold_image(&mut child, token, exec.entry)?;
+            }
             self.install_identity(&mut child, label, copy, false)?;
             let private = self
                 .session_rights(label, Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER)
@@ -501,9 +526,14 @@ impl Fs {
                 receipt: proto_process::StageReceipt {
                     uid: pick(SET_UID, exec.uid),
                     gid: pick(SET_GID, exec.gid),
-                    kind: proto_process::ExecKind::Execute,
+                    kind: if source.is_some() {
+                        proto_process::ExecKind::Fork
+                    } else {
+                        proto_process::ExecKind::Execute
+                    },
                     label,
                 },
+                source_label: source.map_or(0, |(label, _)| label),
             });
             Ok(())
         })();
@@ -549,14 +579,17 @@ impl Fs {
         }
     }
     fn finish_image_job(&mut self, fds: &mut Fds, id: u64, owner: u64) {
-        let i = self.path_slot(id, owner).expect("exact executable job");
+        let i = self.job_slot(id, owner).expect("exact executable job");
         let j = self.jobs[i].take().unwrap();
-        let JobOperation::Path(path) = j.operation else {
-            unreachable!()
-        };
-        path.resolver.release(&mut self.ram.storage);
-        if let Some(second) = path.second {
-            second.release(&mut self.ram.storage);
+        match j.operation {
+            JobOperation::Path(path) => {
+                path.resolver.release(&mut self.ram.storage);
+                if let Some(second) = path.second {
+                    second.release(&mut self.ram.storage);
+                }
+            }
+            JobOperation::ImageClone(_) => (),
+            JobOperation::Data(_) => unreachable!(),
         }
         if j.root != NONE {
             self.ram.storage.release_preparation(j.root);
@@ -572,6 +605,16 @@ impl Fs {
             return Answer::Status(Status::BadSize);
         };
         if let Some(outcome) = fds.image_outcome {
+            if self
+                .identities
+                .iter()
+                .flatten()
+                .find(|identity| identity.label == outcome.label)
+                .and_then(|identity| identity.image.as_ref())
+                .is_some_and(|image| image.source_label != 0)
+            {
+                return status(proto_fs::PERMISSION);
+            }
             if outcome.phase == ramfs::image::ImagePhase::Retired {
                 return status(proto_fs::OPEN_RETIRED);
             }
@@ -627,9 +670,6 @@ impl Fs {
             }
         };
         let who = fds.binding.snapshot().expect("authenticated pending image");
-        let Some(loader) = who.loader else {
-            return status(proto_fs::PERMISSION);
-        };
         let exec = match self
             .ram
             .exec_inode(token, Identity::of(who.credentials, who.groups, false))
@@ -641,7 +681,7 @@ impl Fs {
             }
         };
         if fds.image_outcome.is_none() {
-            return match self.prepare_image(fds, job, token, &exec) {
+            return match self.prepare_image(fds, job, token, &exec, None) {
                 Ok(()) => status(proto_fs::RESOLVING),
                 Err(code) => status(code),
             };
@@ -668,6 +708,21 @@ impl Fs {
             Ok(None) => return status(proto_fs::RESOLVING),
             Err(code) => return Answer::Status(code),
         };
+        self.stage_image(fds, job, r, Some(now))
+    }
+    fn stage_image(
+        &mut self,
+        fds: &mut Fds,
+        job: u64,
+        r: &mut Request<'_>,
+        now: Option<proto_fs::Timestamp>,
+    ) -> Answer {
+        let outcome = fds.image_outcome.expect("a prepaid image outcome");
+        let who = fds.binding.snapshot().expect("authenticated pending image");
+        let Some(loader) = who.loader else {
+            return status(proto_fs::PERMISSION);
+        };
+        let token = outcome.token;
         // Connect and serialize while the loading image still permits exact rollback.
         if self.notary().is_none() {
             return status(proto_fs::RESOLVING);
@@ -708,7 +763,9 @@ impl Fs {
             self.clear_image_outcome(fds);
             return status(proto_fs::STALE_PROOF);
         };
-        if let Err(code) = self.ram.arm_image_execution(held, token, now) {
+        if let Some(now) = now
+            && let Err(code) = self.ram.arm_image_execution(held, token, now)
+        {
             self.clear_image_outcome(fds);
             return status(code);
         }
@@ -757,6 +814,169 @@ impl Fs {
             .as_mut()
             .unwrap();
         Answer::Reply([image.transfer.take().unwrap().erase()].into())
+    }
+    /// The private source proves custody; the child loading identity supplies actor authority.
+    fn clone_exec(
+        &mut self,
+        fds: &mut Fds,
+        r: &mut Request<'_>,
+        peers: Peers<'_, Fds, 0>,
+    ) -> Answer {
+        let rights = Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER;
+        if r.body().finish().is_err()
+            || r.handles.len() != 1
+            || !matches!(r.handles.info(0), Some((abi::ObjectKind::Channel, got)) if got.contains(rights))
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        let source_cap = match r.handles.take::<Channel>(0) {
+            Ok(cap) => cap,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        let source_label = match sys::copy_label(&self.channel, &source_cap) {
+            Ok(label)
+                if label & (proto_fs::OWN | proto_fs::IMAGE_SESSION)
+                    == (proto_fs::OWN | proto_fs::IMAGE_SESSION) =>
+            {
+                label
+            }
+            _ => return status(proto_fs::PERMISSION),
+        };
+        let Some(source_slot) = self.places.image_place(source_label) else {
+            return status(proto_fs::PERMISSION);
+        };
+        if r.label() & proto_fs::IMAGE_SESSION != 0 || proto_fs::is_loaders(r.label()) {
+            return status(proto_fs::PERMISSION);
+        }
+        if let Err(code) = self.authenticate(fds, r.label()) {
+            return status(code);
+        }
+        if !matches!(fds.binding, Binding::Pending(_)) {
+            return status(proto_fs::PERMISSION);
+        }
+        if let Some(outcome) = fds.image_outcome {
+            if outcome.phase == ramfs::image::ImagePhase::AbortRequired {
+                return status(proto_fs::IMAGE_ABORT_REQUIRED);
+            }
+            if outcome.phase == ramfs::image::ImagePhase::Retired {
+                return status(proto_fs::OPEN_RETIRED);
+            }
+            let context = self
+                .identities
+                .iter()
+                .flatten()
+                .find(|i| i.label == outcome.label);
+            let exact = context.is_some_and(|i| {
+                i.original == fds.binding
+                    && i.image.as_ref().is_some_and(|image| {
+                        image.source_label == source_label
+                            && image.receipt.kind == proto_process::ExecKind::Fork
+                            && image.token == outcome.token
+                    })
+            });
+            if !exact {
+                return status(proto_fs::PERMISSION);
+            }
+            if outcome.phase == ramfs::image::ImagePhase::Ready {
+                let copy = context
+                    .unwrap()
+                    .image
+                    .as_ref()
+                    .unwrap()
+                    .private
+                    .as_ref()
+                    .and_then(|cap| {
+                        sys::handle_duplicate(cap, Rights::SEND | Rights::TRANSFER).ok()
+                    });
+                return match copy {
+                    Some(cap) if r.reply().u32(0).is_ok() => Answer::Reply([cap.erase()].into()),
+                    _ => {
+                        self.clear_image_outcome(fds);
+                        fds.image_outcome = Some(ramfs::image::ImageOutcome {
+                            phase: ramfs::image::ImagePhase::AbortRequired,
+                            ..outcome
+                        });
+                        status(proto_fs::IMAGE_ABORT_REQUIRED)
+                    }
+                };
+            }
+            let slot = match self.job_slot(outcome.job, r.label()) {
+                Ok(slot) => slot,
+                Err(code) => return status(code),
+            };
+            let job = self.jobs[slot].as_ref().unwrap();
+            if job.authority != fds.binding.stamp()
+                || !matches!(job.operation, JobOperation::ImageClone(label) if label == source_label)
+            {
+                self.cancel_job(outcome.job, r.label(), Some(fds));
+                return status(proto_fs::STALE_PROOF);
+            }
+            if r.reply().u32(0).is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            return self.stage_image(fds, outcome.job, r, None);
+        }
+        // The retained incoming copy keeps this source's pin and account live across admission.
+        let held = self
+            .births
+            .iter()
+            .flatten()
+            .find(|(label, _)| *label == source_label)
+            .and_then(|(_, source)| source.image_hold)
+            .or_else(|| {
+                peers
+                    .get(source_slot, source_label)
+                    .and_then(|source| source.image_hold)
+            });
+        let Some(held) = held else {
+            return status(proto_fs::PERMISSION);
+        };
+        if !fds.preparation_available() {
+            return status(proto_fs::TOO_MANY_OPEN_FILES);
+        }
+        let Some(local) = fds.resolvers.iter().position(|id| *id == 0) else {
+            return status(proto_fs::TOO_MANY_OPEN_FILES);
+        };
+        let Some(slot) = self.jobs.iter().position(Option::is_none) else {
+            return status(proto_fs::TOO_MANY_OPEN_FILES);
+        };
+        let Some(next) = self.job_generations[slot]
+            .checked_add(1)
+            .filter(|n| *n < 1 << 56)
+        else {
+            return status(proto_fs::TOO_MANY_OPEN_FILES);
+        };
+        let charge = match self.ram.storage.charge_preparation(fds.root) {
+            Ok(charge) => charge,
+            Err(code) => return status(code),
+        };
+        let job = next << 8 | slot as u64;
+        self.job_generations[slot] = next;
+        self.jobs[slot] = Some(ResolveJob {
+            id: job,
+            owner: r.label(),
+            root: charge,
+            real: false,
+            authority: fds.binding.stamp(),
+            operation: JobOperation::ImageClone(source_label),
+            open_key: None,
+            raw_base: (u32::MAX, 0),
+            abandoned: false,
+        });
+        fds.resolvers[local] = job;
+        let exec = Exec {
+            entry: held.entry,
+            mode: 0,
+            uid: proto_process::NO_ID,
+            gid: proto_process::NO_ID,
+        };
+        match self.prepare_image(fds, job, held.token, &exec, Some((source_label, held))) {
+            Ok(()) => status(proto_fs::RESOLVING),
+            Err(code) => {
+                self.cancel_job(job, r.label(), Some(fds));
+                status(code)
+            }
+        }
     }
     fn image_authorize(&mut self, fds: &mut Fds, label: u64) -> Result<(), u32> {
         if fds.image_hold.is_none() {
@@ -1041,6 +1261,19 @@ impl Service<0> for Fs {
     const PLACED: usize = SESSIONS;
     type Data = Fds;
 
+    fn request_with_peers(
+        &mut self,
+        s: &mut Session<Fds, 0>,
+        r: &mut Request<'_>,
+        peers: Peers<'_, Fds, 0>,
+    ) -> Answer {
+        if r.method() == Method::CloneExec as u16 {
+            self.claim_birth(s, r.label());
+            return self.clone_exec(&mut s.data, r, peers);
+        }
+        self.request(s, r)
+    }
+
     /// The client of `s` went: its descriptors close.
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
         self.clear_image_outcome(&mut s.data);
@@ -1144,27 +1377,13 @@ impl Service<0> for Fs {
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
         let first = !s.data.claimed;
-        if !s.data.claimed {
-            // The first request of a session Clone made takes its
-            // descriptors.
-            let label = r.label();
-            if let Some(birth) = self
-                .births
-                .iter_mut()
-                .find(|b| b.is_some_and(|(l, _)| l == label))
-            {
-                s.data = birth.take().expect("a birth").1;
-            } else if r.label() & proto_fs::OWN != 0 && self.clones.client_of(r.label()).is_some() {
-                // A Loader consumed this birth into a distinct label; surviving old copies
-                // have cleanup authority only, regardless of a creator's retained handle.
-                s.data.binding = Binding::Cleanup;
-            }
-            s.data.claimed = true;
-            // Admission into the session table is one bounded phase of its own.
-            // It cannot share a receive with the Process Vouch round trip.
-            if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {
-                return status(proto_fs::RESOLVING);
-            }
+        self.claim_birth(s, r.label());
+        // Admission is separate from a Process Vouch transport phase.
+        if first
+            && s.data.binding_preparation.is_some()
+            && r.method() == Method::FinishBinding as u16
+        {
+            return status(proto_fs::RESOLVING);
         }
         #[cfg(feature = "image-info-probe")]
         if r.method() == 0xfff7 {
@@ -1455,6 +1674,7 @@ impl Service<0> for Fs {
             Some(Method::Clone | Method::CloneExact) => self.clone_session(&s.data, r),
             Some(
                 Method::OpenExec
+                | Method::CloneExec
                 | Method::ReadInto
                 | Method::VerifySession
                 | Method::Bind
