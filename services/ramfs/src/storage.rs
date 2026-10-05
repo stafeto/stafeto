@@ -1064,6 +1064,16 @@ impl<'a> Storage<'a> {
             .find(|a| a.key == root)
             .map_or(Usage::EMPTY, |a| a.usage)
     }
+    /// Sum the existing paid root accounts for the read-only native fixture.
+    #[cfg(feature = "auth-probe")]
+    pub fn probe_description_charges(&self) -> u32 {
+        self.state
+            .accounts
+            .iter()
+            .flatten()
+            .map(|a| u32::from(a.usage.descriptions))
+            .sum()
+    }
     pub fn available(&self) -> Usage {
         Usage {
             inodes: self.state.inode_len as u16,

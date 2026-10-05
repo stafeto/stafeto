@@ -20,6 +20,12 @@
     printf("t6-runtime: line %d %s failed errno %d\n", __LINE__, #x, errno); \
     return 1; } } while (0)
 extern int t6_runtime_counts(uint32_t out[4]);
+struct pin_snapshot {
+    uint32_t counts[4], pins, writers, own_descriptions, global_descriptions;
+    uint64_t root[2];
+};
+_Static_assert(sizeof(struct pin_snapshot) == 48, "pin snapshot size");
+extern int t6_runtime_pins(int fd, struct pin_snapshot *out);
 extern int t6_runtime_stage(int fd);
 
 struct executable_header {
@@ -72,21 +78,27 @@ static int stopped(pid_t pid) {
     }
     CHECK(0);
 }
-static int counts(const uint32_t baseline[4], uint32_t images) {
-    uint32_t actual[4];
+static int counts(int fd, const struct pin_snapshot *baseline, uint32_t images) {
+    struct pin_snapshot actual;
     for (int i = 0; i < 200; ++i) {
-        CHECK(t6_runtime_counts(actual) == 0);
-        if (actual[0] == baseline[0] && actual[1] == baseline[1] &&
-            actual[2] == baseline[2] && actual[3] == baseline[3] + images) {
-            printf("t6-runtime: live images %u descriptions %u preparations %u\n",
-                   images, actual[3], actual[1]);
+        CHECK(t6_runtime_pins(fd, &actual) == 0);
+        if (memcmp(actual.counts, baseline->counts, sizeof(actual.counts)) == 0 &&
+            actual.pins == baseline->pins + images && actual.writers == 0 &&
+            actual.own_descriptions == baseline->own_descriptions + images &&
+            actual.global_descriptions == baseline->global_descriptions + images &&
+            memcmp(actual.root, baseline->root, sizeof(actual.root)) == 0) {
+            printf("t6-runtime: images %u Shared %u own/root/global descriptions %u/%u root %llu/%llu\n",
+                   actual.pins, actual.counts[3], actual.own_descriptions,
+                   actual.global_descriptions, (unsigned long long)actual.root[0],
+                   (unsigned long long)actual.root[1]);
             return 0;
         }
         CHECK(files_loader_abort_sleep() == 0);
     }
-    printf("t6-runtime: counters %u/%u/%u/%u expected %u/%u/%u/%u\n",
-           actual[0], actual[1], actual[2], actual[3],
-           baseline[0], baseline[1], baseline[2], baseline[3] + images);
+    printf("t6-runtime: snapshot Shared %u pins %u writers %u own/global %u/%u expected %u/%u/%u/%u/%u\n",
+           actual.counts[3], actual.pins, actual.writers, actual.own_descriptions,
+           actual.global_descriptions, baseline->counts[3], baseline->pins + images,
+           0u, baseline->own_descriptions + images, baseline->global_descriptions + images);
     CHECK(0);
 }
 static int access_time(int fd, int64_t out[2]) {
@@ -193,15 +205,17 @@ int main(int argc, char **argv) {
     CHECK(copy_image() == 0);
     int retained = open(PATH, O_RDONLY);
     CHECK(retained >= 0);
-    CHECK(t6_runtime_stage(retained) == 0);
     char magic[4];
     CHECK(pread(retained, magic, sizeof(magic), 0) == (ssize_t)sizeof(magic) &&
           memcmp(magic, "\177ELF", sizeof(magic)) == 0);
     int64_t initial_atime[2];
     CHECK(access_time(retained, initial_atime) == 0);
-    uint32_t baseline[4];
-    CHECK(t6_runtime_counts(baseline) == 0);
-    CHECK(baseline[0] == 0 && baseline[1] == 0 && baseline[2] == 0);
+    struct pin_snapshot baseline;
+    CHECK(t6_runtime_pins(retained, &baseline) == 0);
+    CHECK(baseline.counts[0] == 0 && baseline.counts[1] == 0 && baseline.counts[2] == 0);
+    CHECK(baseline.pins == 0 && baseline.writers == 0);
+    CHECK(t6_runtime_stage(retained) == 0);
+    CHECK(counts(retained, &baseline, 0) == 0);
     int parent[2], child[2], grand[2], events[2];
     CHECK(pipe(parent) == 0 && pipe(child) == 0 && pipe(grand) == 0 && pipe(events) == 0);
     char a[16], b[16], c[16], d[16];
@@ -219,34 +233,36 @@ int main(int argc, char **argv) {
     CHECK(close(events[1]) == 0);
     pid_t p, q, r;
     CHECK(event(events[0], 'P', &p) == 0 && p == worker);
-    CHECK(counts(baseline, 1) == 0 && busy() == 0);
+    CHECK(counts(retained, &baseline, 1) == 0 && busy() == 0);
     int64_t atime[2], after[2];
     CHECK(access_time(retained, atime) == 0);
     CHECK(atime[0] > initial_atime[0] ||
           (atime[0] == initial_atime[0] && atime[1] > initial_atime[1]));
     CHECK(byte(parent[1], 'F'));
     CHECK(event(events[0], 'C', &q) == 0 && q != p);
-    CHECK(counts(baseline, 2) == 0 && busy() == 0);
+    CHECK(counts(retained, &baseline, 2) == 0 && busy() == 0);
     CHECK(access_time(retained, after) == 0 && memcmp(after, atime, sizeof(after)) == 0);
     CHECK(byte(child[1], 'F'));
     CHECK(event(events[0], 'G', &r) == 0 && r != p && r != q);
-    CHECK(counts(baseline, 3) == 0 && busy() == 0);
+    CHECK(counts(retained, &baseline, 3) == 0 && busy() == 0);
     CHECK(access_time(retained, after) == 0 && memcmp(after, atime, sizeof(after)) == 0);
     CHECK(kill(p, SIGKILL) == 0);
     int status = 0;
     CHECK(waitpid(worker, &status, 0) == worker && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
-    CHECK(counts(baseline, 2) == 0 && busy() == 0);
+    CHECK(counts(retained, &baseline, 2) == 0 && busy() == 0);
     CHECK(stopped(q) == 0);
-    CHECK(counts(baseline, 1) == 0 && busy() == 0);
+    CHECK(counts(retained, &baseline, 1) == 0 && busy() == 0);
     CHECK(stopped(r) == 0);
-    CHECK(counts(baseline, 0) == 0);
+    CHECK(counts(retained, &baseline, 0) == 0);
     int writable = open(PATH, O_WRONLY);
     CHECK(writable >= 0 && pwrite(writable, "\177", 1, 0) == 1 && close(writable) == 0);
-    CHECK(counts(baseline, 0) == 0);
+    CHECK(counts(retained, &baseline, 0) == 0);
     CHECK(close(retained) == 0);
-    CHECK(baseline[3] > 0);
-    --baseline[3];
-    CHECK(counts(baseline, 0) == 0);
+    CHECK(baseline.counts[3] > 0);
+    --baseline.counts[3];
+    uint32_t closed[4];
+    CHECK(t6_runtime_counts(closed) == 0);
+    CHECK(memcmp(closed, baseline.counts, sizeof(closed)) == 0);
     CHECK(close(parent[1]) == 0 && close(child[1]) == 0 && close(grand[1]) == 0);
     CHECK(close(events[0]) == 0);
     puts("t6-runtime: dynamic exec, two forks, End and ETXTBSY custody ok");

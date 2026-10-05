@@ -1545,9 +1545,30 @@ impl Service<0> for Fs {
         }
         #[cfg(feature = "auth-probe")]
         if r.method() == 0xfff8 {
-            if !r.handles.is_empty() || r.body().finish().is_err() {
+            if !r.handles.is_empty() {
                 return Answer::Status(Status::BadSize);
             }
+            let mut body = r.body();
+            let probe = if r.body().finish().is_ok() {
+                None
+            } else {
+                let (Ok(fd), Ok(slot), Ok(generation), Ok(())) =
+                    (body.u32(), body.u32(), body.u64(), body.finish())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Ok(slot) = u16::try_from(slot) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if let Err(code) = self.authenticate(&mut s.data, r.label()) {
+                    return status(code);
+                }
+                let exact = ramfs::storage::Token { slot, generation };
+                match self.ram.probe_exec_pin(&s.data, fd, exact) {
+                    Ok(pins) => Some(pins),
+                    Err(code) => return status(code),
+                }
+            };
             let counts = [
                 s.data.preparation_count() as u32,
                 self.ram.storage.preparations_used() as u32,
@@ -1555,11 +1576,19 @@ impl Service<0> for Fs {
                 self.ram.open_descriptions() as u32,
             ];
             let w = r.reply();
-            return if w
+            let result = w
                 .u32(0)
                 .and_then(|()| counts.into_iter().try_for_each(|n| w.u32(n)))
-                .is_ok()
-            {
+                .and_then(|()| match probe {
+                    None => Ok(()),
+                    Some(pins) => pins
+                        .into_iter()
+                        .try_for_each(|n| w.u32(n))
+                        .and_then(|()| w.u32(0))
+                        .and_then(|()| w.u64(s.data.root.id))
+                        .and_then(|()| w.u64(s.data.root.generation)),
+                });
+            return if result.is_ok() {
                 Answer::Reply(Outgoing::new())
             } else {
                 Answer::Status(Status::BadSize)
