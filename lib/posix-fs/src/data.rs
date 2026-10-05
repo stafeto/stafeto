@@ -618,6 +618,60 @@ mod tests {
         assert_eq!(core::mem::size_of::<PosixFs>(), 38984);
     }
 
+    #[test]
+    fn compact_terminal_marker_checks_binding_and_complete_owned_history() {
+        let mut fs = files();
+        let (token, claim) = begin(&mut fs, DataKind::Write, 3, b"abc");
+        let context = fs.data_terminal_query_context(claim).unwrap();
+        for status in [
+            Status::Unknown(300),
+            Status::BadSize,
+            Status::Kernel(rt::abi::Error::Interrupted),
+        ] {
+            assert!(context.classify_small(Err(status)).is_err());
+        }
+        let mint = || {
+            let TerminalSmallQueryResult::Retired(marker) = context
+                .classify_small(Err(Status::Unknown(proto_fs::OPEN_RETIRED)))
+                .unwrap()
+            else {
+                panic!("strict retired marker")
+            };
+            marker
+        };
+        let mut wrong = mint();
+        wrong.job = 256;
+        assert!(
+            fs.begin_data_terminal_cleanup_from_query(token, owner(1), &context, wrong)
+                .is_err()
+        );
+        let mut changed = fs.data_claim_snapshot(claim).unwrap().recovery;
+        changed.bytes[1] = b'x';
+        fs.descriptors.update_scalar(claim, changed).unwrap();
+        assert!(
+            fs.begin_data_terminal_cleanup_from_query(token, owner(1), &context, mint())
+                .is_err()
+        );
+        fs.descriptors
+            .update_scalar(claim, context.snapshot.recovery)
+            .unwrap();
+        assert!(
+            fs.begin_data_terminal_cleanup_from_query(token, owner(2), &context, mint())
+                .is_err()
+        );
+        fs.begin_data_terminal_cleanup_from_query(token, owner(1), &context, mint())
+            .unwrap();
+        assert!(fs.data_claim_state(claim).is_err());
+        assert_eq!(fs.data_state(token).unwrap().phase, ScalarPhase::Cleaning);
+        assert!(fs.acknowledge_data(token, owner(1), &mut []).is_err());
+        let proof = cleanup_proof(fs.begin_data_cleanup(token).unwrap());
+        fs.finish_data_cleanup(proof).unwrap();
+        assert_eq!(
+            fs.acknowledge_data(token, owner(1), &mut []).unwrap(),
+            ScalarResult::Failed(5)
+        );
+    }
+
     fn retired(fs: &PosixFs, claim: ScalarClaimToken) -> TerminalCleanupAuthority {
         let TerminalQueryResult::Retired(authority) = fs
             .data_terminal_query_context(claim)
@@ -893,6 +947,7 @@ impl Recovery {
 }
 
 /// One exact native Query context. A caller-constructed outcome cannot mint its proof.
+#[derive(Clone, Copy)]
 pub struct QueryContext {
     claim: ScalarClaimToken,
     job: u64,
@@ -986,7 +1041,52 @@ pub struct TerminalCleanupAuthority {
     claim: Option<ScalarClaimToken>,
 }
 
+/// Compact authority binds a strict retired reply to the caller-owned context.
+pub struct TerminalRetiredMarker {
+    claim: ScalarClaimToken,
+    job: u64,
+    target: Target,
+    session: u64,
+    request: DataStart,
+}
+
+pub enum TerminalSmallQueryResult {
+    Outcome(QueryResult),
+    Retired(TerminalRetiredMarker),
+}
+
 impl TerminalQueryContext {
+    #[inline(never)]
+    pub fn query_small_once(&self) -> Result<TerminalSmallQueryResult, Status> {
+        let result = self
+            .context
+            .transport
+            .files()
+            .data_query_once(self.context.request);
+        self.classify_small(result)
+    }
+
+    fn classify_small(
+        &self,
+        result: Result<DataOutcome, Status>,
+    ) -> Result<TerminalSmallQueryResult, Status> {
+        match result {
+            Err(Status::Unknown(proto_fs::OPEN_RETIRED)) => {
+                Ok(TerminalSmallQueryResult::Retired(TerminalRetiredMarker {
+                    claim: self.context.claim,
+                    job: self.context.job,
+                    target: self.context.target,
+                    session: self.context.session,
+                    request: self.context.request,
+                }))
+            }
+            other => self
+                .context
+                .classify(other)
+                .map(TerminalSmallQueryResult::Outcome),
+        }
+    }
+
     #[inline(never)]
     pub fn query_once(self) -> Result<TerminalQueryResult, Status> {
         let result = self
@@ -1267,6 +1367,7 @@ impl PosixFs {
         })
     }
 
+    #[inline(never)]
     pub fn data_feed_context(&self, claim: ScalarClaimToken) -> Result<FeedContext, FsError> {
         let view = self.descriptors.scalar_claim_view(claim)?;
         let recovery = view.recovery;
@@ -1309,6 +1410,37 @@ impl PosixFs {
             snapshot: own_snapshot(snapshot),
             claim: None,
         })
+    }
+
+    /// The context owns complete history while the marker remains compact.
+    #[inline(never)]
+    pub fn begin_data_terminal_cleanup_from_query(
+        &mut self,
+        token: ScalarToken,
+        owner: OwnerToken,
+        context: &TerminalQueryContext,
+        marker: TerminalRetiredMarker,
+    ) -> Result<(), FsError> {
+        let query = &context.context;
+        if token != query.claim.scalar()
+            || marker.claim != query.claim
+            || marker.job != query.job
+            || marker.target != query.target
+            || marker.session != query.session
+            || marker.request != query.request
+            || context.snapshot.owner != Some(owner)
+        {
+            return Err(FsError::BadFileDescriptor);
+        }
+        let view = self.descriptors.scalar_claim_view(query.claim)?;
+        if !same_snapshot(&view, &context.snapshot)
+            || view.recovery.session_handle != self.sessions().0.raw().0
+        {
+            return Err(FsError::Io);
+        }
+        self.descriptors
+            .scalar_mark_cleanup(token)
+            .map_err(FsError::from)
     }
 
     /// Revoke effect authority before the exact-key native fence, retaining cache.

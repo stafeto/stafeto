@@ -422,8 +422,22 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         &mut self,
         token: ScalarToken,
     ) -> Result<ScalarCleanup<T, S>, Error> {
-        let last_target = match self.scalar_record_ref(token)?.cleanup {
-            Cleanup::Running { last_target } => last_target,
+        self.scalar_mark_cleanup(token)?;
+        let record = self.scalar_record_ref(token)?;
+        let Cleanup::Running { last_target } = record.cleanup else {
+            unreachable!()
+        };
+        Ok(ScalarCleanup {
+            token,
+            recovery: record.recovery,
+            last_target,
+        })
+    }
+
+    /// Revoke authority in place without copying the resident recovery payload.
+    pub fn scalar_mark_cleanup(&mut self, token: ScalarToken) -> Result<(), Error> {
+        match self.scalar_record_ref(token)?.cleanup {
+            Cleanup::Running { .. } => {}
             Cleanup::Done => return Err(Error::BadFileDescriptor),
             Cleanup::Pending => {
                 let slot = &mut self.holds[token.slot];
@@ -440,14 +454,9 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 };
                 record.cleanup = Cleanup::Running { last_target };
                 slot.change();
-                last_target
             }
         };
-        Ok(ScalarCleanup {
-            token,
-            recovery: self.scalar_record_ref(token)?.recovery,
-            last_target,
-        })
+        Ok(())
     }
 
     /// The caller proves canonical exact remote cleanup. An unresolved outcome
