@@ -228,7 +228,7 @@ impl TryFrom<proto_fs::NodeInfo> for Stat {
             1 => constants::S_IFDIR,
             2 => constants::S_IFREG,
             3 => constants::S_IFCHR,
-            5 => 0o120_000,
+            5 => constants::S_IFLNK,
             _ => return Err(ConversionError::Malformed),
         };
         Ok(Self {
@@ -367,7 +367,7 @@ mod tests {
         info.modify_time = proto_fs::Timestamp::from_ns(-1).unwrap();
         info.change_time = proto_fs::Timestamp::new(i64::MAX, 0).unwrap();
         let stat = Stat::try_from(info).unwrap();
-        assert_eq!(stat.st_mode, 0o120_000 | info.permissions);
+        assert_eq!(stat.st_mode, constants::S_IFLNK | info.permissions);
         assert_eq!(stat.st_atim.tv_sec, i64::MIN);
         assert_eq!(
             (stat.st_mtim.tv_sec, stat.st_mtim.tv_nsec),

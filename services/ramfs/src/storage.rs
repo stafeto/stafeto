@@ -1520,6 +1520,11 @@ impl<'a> Storage<'a> {
             .data_generation
             .checked_add(1)
             .ok_or(NO_SPACE)?;
+        let permission_epoch = if self.node(token)?.mode & 0o6000 != 0 {
+            Some(self.state.epoch.checked_add(1).ok_or(NO_SPACE)?)
+        } else {
+            None
+        };
         let first = offset / PAGE;
         let last = (end - 1) / PAGE;
         let existing = self.node(token)?.overlay;
@@ -1571,6 +1576,10 @@ impl<'a> Storage<'a> {
         self.state.nodes[token.slot as usize].length =
             self.state.nodes[token.slot as usize].length.max(end as u64);
         self.state.nodes[token.slot as usize].data_generation = data_generation;
+        if let Some(epoch) = permission_epoch {
+            self.state.nodes[token.slot as usize].mode &= !0o6000;
+            self.state.epoch = epoch;
+        }
         Ok(bytes.len())
     }
     /// All fallible preflight precedes the single detachment of a live file's data.
