@@ -82,6 +82,8 @@ pub enum Stage {
     Loading,
     /// The loader said the image is ready (Ready): the parent may commit.
     Loaded,
+    /// Abort holds the paid place until native stop is confirmed.
+    Aborting,
     /// SpawnCommit or ExecCommit came: the record lives, and the loader
     /// takes its program's sessions next.
     Ready,
@@ -232,7 +234,7 @@ impl<T> Loaders<T> {
         match place.stage {
             Stage::Loading => Some(Loading),
             Stage::Loaded => Some(Handoff),
-            Stage::Booting | Stage::Ready => None,
+            Stage::Booting | Stage::Aborting | Stage::Ready => None,
         }
     }
 
@@ -259,6 +261,19 @@ impl<T> Loaders<T> {
         }
         place.set_id = Some(ids);
         Ok(())
+    }
+
+    /// Marks cleanup before a Kill. Ready custody belongs to the committed record.
+    /// Returns true once, so a caller can account one resident cleanup obligation.
+    pub fn begin_abort(&mut self, record: usize) -> Result<bool, Refused> {
+        let index = self.of(record).ok_or(Refused)?;
+        let place = self.places[index].as_mut().ok_or(Refused)?;
+        if place.stage == Stage::Ready {
+            return Err(Refused);
+        }
+        let first = place.stage != Stage::Aborting;
+        place.stage = Stage::Aborting;
+        Ok(first)
     }
 
     /// Ready of the loader of the record in `record`: its image is loaded,

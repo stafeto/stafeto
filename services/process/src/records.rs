@@ -71,9 +71,11 @@ impl Orphans {
     }
 }
 
-pub struct Record<P> {
+pub struct Record<P, C = ()> {
     /// Its process, which the service created and calls with later.
     pub process: P,
+    /// Exact private executable custody through native process death.
+    pub active_exec: Option<C>,
     pub label: Label,
     /// The PID of its parent: INIT_PID for a record of init's table and
     /// for an orphan.
@@ -131,8 +133,8 @@ pub struct Record<P> {
     next: Option<u16>,
 }
 
-pub struct Records<P> {
-    records: [Option<Record<P>>; RECORDS],
+pub struct Records<P, C = ()> {
+    records: [Option<Record<P, C>>; RECORDS],
     /// The last generation each index gave, 0 for none.
     generations: [u32; RECORDS],
     /// The free indices, the last freed on top.
@@ -184,13 +186,20 @@ pub enum GroupError {
     Access,
 }
 
-impl<P> Default for Records<P> {
+impl<P, C> Default for Records<P, C> {
     fn default() -> Self {
-        Self::new()
+        Self::with_exec_custody()
     }
 }
 
 impl<P> Records<P> {
+    /// Construct records with the legacy value-only executable custody.
+    pub const fn new() -> Self {
+        Self::with_exec_custody()
+    }
+}
+
+impl<P, C> Records<P, C> {
     /// The credentials effect is admitted before a generation can become terminal.
     pub fn change_credentials(
         &mut self,
@@ -215,7 +224,7 @@ impl<P> Records<P> {
         Ok(())
     }
     /// No record, every index free, index 0 on top.
-    pub const fn new() -> Self {
+    pub const fn with_exec_custody() -> Self {
         let mut free = [0; RECORDS];
         let mut i = 0;
         while i < RECORDS {
@@ -266,12 +275,24 @@ impl<P> Records<P> {
         self.named(label, Place::Work)
     }
 
-    pub fn get(&self, index: usize) -> Option<&Record<P>> {
+    pub fn get(&self, index: usize) -> Option<&Record<P, C>> {
         self.records.get(index)?.as_ref()
     }
 
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut Record<P>> {
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Record<P, C>> {
         self.records.get_mut(index)?.as_mut()
+    }
+
+    /// Replace custody only with a successful, already prepaid image commit.
+    pub fn replace_active_exec(&mut self, index: usize, cap: Option<C>) -> Option<C> {
+        core::mem::replace(
+            &mut self.get_mut(index).expect("a committed record").active_exec,
+            cap,
+        )
+    }
+
+    pub fn take_active_exec(&mut self, index: usize) -> Option<C> {
+        self.get_mut(index)?.active_exec.take()
     }
 
     /// The unavailable places: records, live group/session numbers and
@@ -373,6 +394,7 @@ impl<P> Records<P> {
         );
         self.records[i] = Some(Record {
             process,
+            active_exec: None,
             label,
             parent: pid,
             credentials,
@@ -711,6 +733,9 @@ impl<P> Records<P> {
     /// at once without one or when it was still LOADING. CHILDREN_MAX
     /// steps.
     pub fn exited(&mut self, index: usize, end: End) -> (Exit, Orphans) {
+        // Custody ends before the record can become a waitable zombie.
+        let active = self.take_active_exec(index);
+        drop(active);
         self.ready_remove(index);
         self.set_stopped(index, None);
         let mut orphans = Orphans::default();
@@ -766,7 +791,7 @@ impl<P> Records<P> {
 
     /// The zombie in `index` goes: out of its parent's list, its index on
     /// top of the free ones, its next label one generation on. O(1).
-    pub fn reap(&mut self, index: usize) -> Option<Record<P>> {
+    pub fn reap(&mut self, index: usize) -> Option<Record<P, C>> {
         let record = self.records[index].as_ref()?;
         if !matches!(record.state, State::Zombie(_)) {
             return None;
@@ -809,7 +834,7 @@ impl<P> Records<P> {
 
     /// The record in `index` leaves the table and its group and session;
     /// its place is free unless a group or a session carries its number.
-    fn free_index(&mut self, index: usize) -> Option<Record<P>> {
+    fn free_index(&mut self, index: usize) -> Option<Record<P, C>> {
         self.ready_remove(index);
         if self.get(index).is_some_and(|r| r.stopped.is_some()) {
             self.set_stopped(index, None);

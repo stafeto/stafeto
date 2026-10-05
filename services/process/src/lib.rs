@@ -11,6 +11,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod executable;
 #[cfg(feature = "image-probe")]
 pub mod image_probe;
 pub mod loaders;

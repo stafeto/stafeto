@@ -23,6 +23,7 @@
 use core::cell::UnsafeCell;
 #[cfg(feature = "image-probe")]
 mod image_probe_main;
+use posix_process_service::executable::{ExecCustody, ExecHolder, RetiredExec, Staged};
 #[cfg(feature = "image-probe")]
 use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
@@ -83,7 +84,10 @@ struct Replacing {
     ready: Option<Handle<Channel>>,
     process: Option<Handle<Process>>,
     /// The old process, which the service kills once init took the new.
-    old: Option<Handle<Process>>,
+    old: RetiredExec<Handle<Process>, Handle<Channel>>,
+    old_image: u32,
+    /// Init has accepted the replacement, or direct cleanup may proceed.
+    cleanup: bool,
     ticket: u64,
 }
 /// A walk of kill(0), kill(-pgid) or kill(-1) that waits (walk.rs): the
@@ -142,6 +146,19 @@ struct Held {
     /// The load is a copy of ForkStart: only ForkCommit and ForkAbort
     /// take it.
     fork: bool,
+    exec: ExecCustody<Handle<Channel>>,
+    /// First abort reason remains resident across failed Kill attempts.
+    abort_status: Option<Status>,
+    abort_ceiling: u8,
+}
+impl ExecHolder for Held {
+    type Cap = Handle<Channel>;
+    fn exec_custody(&mut self) -> &mut ExecCustody<Self::Cap> {
+        &mut self.exec
+    }
+    fn fork(&self) -> bool {
+        self.fork
+    }
 }
 /// What a child of SpawnStart or ForkStart starts with: its spawn-flags
 /// and group, the level of its loader, its credentials and its page.
@@ -166,7 +183,7 @@ struct Processes {
     identities: ManuallyDrop<Handle<Channel>>,
     /// The priority of the slot of a session: the loop's level.
     level: u8,
-    records: Records<Handle<Process>>,
+    records: Records<Handle<Process>, Handle<Channel>>,
     /// The ticket init gave each record of its table, 0 for the others.
     tickets: [u64; RECORDS],
     /// The ExecCommit of each record that waits for init, by the record's
@@ -175,6 +192,10 @@ struct Processes {
     replacing: [Option<Replacing>; RECORDS],
     replace_queue: Queue,
     replacer: Option<Pending>,
+    replace_cleanup: usize,
+    abort_cleanup: usize,
+    replace_cursor: usize,
+    replace_turn: bool,
     /// The pages of the records.
     pages: pages::Pages,
     /// The page of the credentials generations.
@@ -225,11 +246,15 @@ impl Processes {
             channel: Handle::borrowed(abi::Handle::INVALID),
             identities: Handle::borrowed(abi::Handle::INVALID),
             level: 1,
-            records: Records::new(),
+            records: Records::with_exec_custody(),
             tickets: [0; RECORDS],
             replacing: [const { None }; RECORDS],
             replace_queue: Queue::new(),
             replacer: None,
+            replace_cleanup: 0,
+            abort_cleanup: 0,
+            replace_cursor: 0,
+            replace_turn: false,
             pages: pages::Pages::new(),
             generations: generations::Generations::new(),
             witnesses: [const { None }; RECORDS],
@@ -357,7 +382,7 @@ fn main(_: u64) -> u64 {
     let _ = rt::service::run::<Processes, SESSIONS, 0>(&channel, owner, config);
     5
 }
-fn snapshot(r: &mut Request<'_>, record: &Record<Handle<Process>>) {
+fn snapshot(r: &mut Request<'_>, record: &Record<Handle<Process>, Handle<Channel>>) {
     let w = r.reply();
     w.u32(0)
         .and_then(|()| w.u32(record.label.pid()))
@@ -408,6 +433,11 @@ impl Processes {
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::FULL);
         };
+        if self.replacing[usize::from(label.index)].is_some()
+            || self.loaders.of(usize::from(label.index)).is_some()
+        {
+            return refuse(proto_process::FULL);
+        }
         if !self.generations.room(usize::from(label.index), 1) {
             self.records.retire_next(label);
             return refuse(proto_process::FULL);
@@ -793,6 +823,9 @@ impl Processes {
         if method == Method::SetId as u16 {
             return self.set_id(r);
         }
+        if method == Method::StageExec as u16 {
+            return self.stage_exec(r);
+        }
         let terminal = [
             Method::TtySignal,
             Method::SetCtty,
@@ -1146,7 +1179,11 @@ impl Processes {
     /// never comes.
     fn kick(&mut self) {
         if !self.step_told
-            && (self.tty_walk.is_some() || self.orphan_walk.is_some() || self.records.has_orphans())
+            && (self.tty_walk.is_some()
+                || self.orphan_walk.is_some()
+                || self.records.has_orphans()
+                || self.replace_cleanup != 0
+                || self.abort_cleanup != 0)
         {
             if self
                 .step
@@ -1190,6 +1227,15 @@ impl Processes {
     /// and none could be signalled, NO_PROCESS for none.
     fn walk_step(&mut self) {
         self.step_told = false;
+        if self.replace_cleanup != 0 || self.abort_cleanup != 0 {
+            self.replace_turn = !self.replace_turn;
+            if self.replace_turn {
+                rt::service::step_own();
+                self.replace_cleanup_step();
+                self.kick();
+                return;
+            }
+        }
         // A walk of the terminal goes first: the terminal service waits
         // for it, and its input with it.
         if self.tty_walk.is_some() {
@@ -1205,6 +1251,7 @@ impl Processes {
             return;
         }
         let Some(index) = self.walking.pop() else {
+            self.kick();
             return;
         };
         let Some(mut w) = self.walks[index].take() else {
@@ -1800,6 +1847,11 @@ impl Processes {
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::AGAIN);
         };
+        if self.replacing[usize::from(label.index)].is_some()
+            || self.loaders.of(usize::from(label.index)).is_some()
+        {
+            return refuse(proto_process::AGAIN);
+        }
         if !self.generations.room(usize::from(label.index), 4) {
             self.records.retire_next(label);
             return refuse(proto_process::AGAIN);
@@ -1819,6 +1871,21 @@ impl Processes {
                     .link(terminal as usize)
                     .is_some_and(|link| link.sid == parent.sid && link.generation == generation)
             })
+        };
+        // Capture the private source before the child loader can run.
+        let fork_source = if matches!(birth.page, PageStart::Fork { .. }) {
+            match parent.active_exec.as_ref() {
+                Some(source) => match sys::handle_duplicate(
+                    source,
+                    Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
+                ) {
+                    Ok(copy) => Some(copy),
+                    Err(error) => return kernel(error),
+                },
+                None => None,
+            }
+        } else {
+            None
         };
         let create = Create {
             quota: parent.quota,
@@ -1905,6 +1972,12 @@ impl Processes {
             start: Some(pending),
             incoming: None,
             fork: matches!(birth.page, PageStart::Fork { .. }),
+            exec: ExecCustody {
+                fork_source,
+                ..ExecCustody::new()
+            },
+            abort_status: None,
+            abort_ceiling: create.ceiling,
         };
         let Some(slot) = self.loaders.take(child, index, proto_process::IMAGE, held) else {
             let _ = sys::process_kill(&record.process);
@@ -1939,6 +2012,7 @@ impl Processes {
         }
         let record = self.records.get(index).expect("the caller");
         if self.loaders.of(index).is_some()
+            || self.replacing[index].is_some()
             || !self.loaders.room_for(index)
             || record.tried >= proto_process::IMAGE_MAX
             || !self.generations.live_room(index, 3)
@@ -2002,6 +2076,9 @@ impl Processes {
             start: Some(pending),
             incoming: Some(process),
             fork: false,
+            exec: ExecCustody::new(),
+            abort_status: None,
+            abort_ceiling: ceiling,
         };
         if self.loaders.take(index, index, image, held).is_none() {
             return Answer::Deferred;
@@ -2041,22 +2118,54 @@ impl Processes {
         if !exec {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         }
-        let Ok(set_id) = self.loaders.commit(index) else {
-            return Answer::Status(Status::Kernel(abi::Error::BadState));
-        };
+        // The existing per-record replacement slot and reply are paid before Commit.
+        if self.replacing[index].is_some() {
+            return refuse(proto_process::AGAIN);
+        }
         let slot = self.loaders.of(index).expect("an exec's place");
+        let place = self.loaders.get(slot).expect("a place");
+        if place.stage != Stage::Loaded
+            || self
+                .records
+                .get(index)
+                .is_some_and(|r| r.active_exec.is_some())
+                && place.held.exec.pending_exec.is_none()
+        {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
+        let ticket = self.tickets[index];
+        let copy = if ticket != 0 {
+            match sys::handle_duplicate(
+                place.held.incoming.as_ref().expect("the new process"),
+                Rights::DUPLICATE | Rights::TRANSFER,
+            ) {
+                Ok(copy) => Some(copy),
+                Err(error) => return kernel(error),
+            }
+        } else {
+            None
+        };
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::BadSize);
+        };
+        let Ok(set_id) = self.loaders.commit(index) else {
+            let _ = pending.answer(
+                &proto_wire::reply(Status::Kernel(abi::Error::BadState)),
+                Outgoing::new(),
+            );
+            return Answer::Deferred;
+        };
         let committed_ticket = self.loaders.ticket(slot);
+        let new_exec = self.loaders.take_pending_exec(index);
         let place = self.loaders.get_mut(slot).expect("a place");
         let image = place.image;
         let incoming = place.held.incoming.take().expect("the new process");
         self.routers[index] = place.held.thread.take();
         let ready = place.held.ready.take();
-        let ticket = self.tickets[index];
-        let copy = (ticket != 0)
-            .then(|| sys::handle_duplicate(&incoming, Rights::DUPLICATE | Rights::TRANSFER).ok())
-            .flatten();
         let record = self.records.get_mut(index).expect("the caller");
         let old = core::mem::replace(&mut record.process, incoming);
+        let old_exec = core::mem::replace(&mut record.active_exec, new_exec);
+        let old_image = record.image;
         let ceiling = record.ceiling;
         record.image = image;
         record.committed_loader_ticket = committed_ticket;
@@ -2085,25 +2194,22 @@ impl Processes {
         for &child in &children[..count] {
             self.abort_load(usize::from(child), Status::Kernel(abi::Error::PeerClosed));
         }
-        if let Some(process) = copy
-            && let Some(pending) = r.defer()
-        {
-            self.replacing[index] = Some(Replacing {
-                pending,
-                ready,
-                process: Some(process),
-                old: Some(old),
-                ticket,
-            });
+        self.replacing[index] = Some(Replacing {
+            pending,
+            ready,
+            process: copy,
+            old: RetiredExec::new(old, old_exec, ceiling),
+            old_image,
+            cleanup: false,
+            ticket,
+        });
+        if ticket != 0 {
             self.replace_queue.push(index);
             self.dispatch_replace();
-            return Answer::Deferred;
+        } else {
+            self.finish_replace(index);
         }
-        let _ = sys::process_kill_at(&old, ceiling);
-        if let Some(ready) = ready.as_ref() {
-            let _ = sys::notify(ready, 1);
-        }
-        Answer::Status(Status::Ok)
+        Answer::Deferred
     }
 
     /// Replace (label 0): the thread that tells init of an exec names the
@@ -2162,19 +2268,64 @@ impl Processes {
     /// service kills the old process and the loader tells the new image
     /// the record is ready.
     fn finish_replace(&mut self, index: usize) {
-        let Some(replacing) = self.replacing[index].take() else {
+        let Some(replacing) = self.replacing[index].as_mut() else {
             return;
         };
-        if let Some(old) = replacing.old.as_ref() {
-            let ceiling = self.records.get(index).map_or(0, |r| r.ceiling);
-            let _ = sys::process_kill_at(old, ceiling);
+        if !replacing.cleanup {
+            replacing.cleanup = true;
+            self.replace_cleanup += 1;
         }
+        self.try_finish_replace(index);
+        self.kick();
+    }
+
+    fn try_finish_replace(&mut self, index: usize) {
+        let Some(replacing) = self.replacing[index].as_mut() else {
+            return;
+        };
+        if !replacing.cleanup
+            || replacing
+                .old
+                .try_stop(self.level, |old, level| {
+                    sys::process_kill_at(old, level).or_else(|error| {
+                        if sys::process_state(old).is_ok_and(|state| End::of(state).is_some()) {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    })
+                })
+                .is_err()
+        {
+            return;
+        }
+        let replacing = self.replacing[index].take().expect("a stopped replacement");
+        self.replace_cleanup -= 1;
+        // Successful Kill guarantees that the old image cannot run.
+        drop(replacing.old);
         if let Some(ready) = replacing.ready.as_ref() {
             let _ = sys::notify(ready, 1);
         }
         let _ = replacing
             .pending
             .answer(&proto_wire::reply(Status::Ok), Outgoing::new());
+    }
+
+    /// At most one existing replacement row and one Kill in this STEP.
+    fn replace_cleanup_step(&mut self) {
+        let index = self.replace_cursor;
+        self.replace_cursor = (index + 1) % (RECORDS + LOADERS);
+        if index >= RECORDS {
+            if let Some(place) = self.loaders.get(index - RECORDS)
+                && place.stage == Stage::Aborting
+            {
+                self.try_abort_load(place.record);
+            }
+            return;
+        }
+        if self.replacing[index].as_ref().is_some_and(|r| r.cleanup) {
+            self.try_finish_replace(index);
+        }
     }
 
     /// ExecAbort of the record in `index`: the new process of its exec is
@@ -2200,34 +2351,82 @@ impl Processes {
         child: usize,
         terminal: Terminal,
     ) -> Option<loaders::Place<Held>> {
-        let observation = &mut self.records.get_mut(child)?.image_probe;
-        image_probe::free(&mut self.loaders, observation, child, terminal)
+        let Some(record) = self.records.get_mut(child) else {
+            return self.loaders.free(child);
+        };
+        image_probe::free(&mut self.loaders, &mut record.image_probe, child, terminal)
     }
 
     /// The load of the record in `child` stops: its process is killed, its
     /// loader's place and SetId go, and a SpawnStart that waits gets
     /// `status`. The record goes with the end of its process.
     fn abort_load(&mut self, child: usize, status: Status) {
+        let Some(slot) = self.loaders.of(child) else {
+            if let Some(record) = self.records.get(child)
+                && record.state == State::Loading
+            {
+                let _ = sys::process_kill(&record.process);
+            }
+            return;
+        };
+        if self
+            .loaders
+            .get(slot)
+            .is_some_and(|p| p.stage == Stage::Ready)
+        {
+            // Pending custody has already moved to the committed record.
+            self.free_aborted_load(child, status);
+            return;
+        }
+        if self.loaders.begin_abort(child) == Ok(true) {
+            self.abort_cleanup += 1;
+        }
+        self.loaders
+            .get_mut(slot)
+            .expect("an aborting place")
+            .held
+            .abort_status
+            .get_or_insert(status);
+        self.try_abort_load(child);
+        self.kick();
+    }
+
+    fn try_abort_load(&mut self, child: usize) {
+        let Some(slot) = self.loaders.of(child) else {
+            return;
+        };
+        let place = self.loaders.get(slot).expect("an aborting place");
+        if place.stage != Stage::Aborting {
+            return;
+        }
+        let target = match place.held.incoming.as_ref() {
+            Some(target) => target,
+            None => match self.records.get(child) {
+                Some(record) => &record.process,
+                None => return,
+            },
+        };
+        let stopped = sys::process_state(target).is_ok_and(|state| End::of(state).is_some())
+            || sys::process_kill_at(target, place.held.abort_ceiling.min(self.level)).is_ok();
+        if !stopped {
+            return;
+        }
+        let status = place.held.abort_status.expect("a saved abort reason");
+        self.abort_cleanup -= 1;
+        self.free_aborted_load(child, status);
+    }
+
+    fn free_aborted_load(&mut self, child: usize, status: Status) {
         #[cfg(feature = "image-probe")]
         let place = self.free_observed_loader(child, Terminal::Aborted);
         #[cfg(not(feature = "image-probe"))]
         let place = self.loaders.free(child);
-        if let Some(place) = place {
+        if let Some(mut place) = place {
             self.generations.invalidate(child);
-            if let Some(start) = place.held.start {
+            // Stop is confirmed before any pending guard or fork source is closed.
+            if let Some(start) = place.held.start.take() {
                 let _ = start.answer(&proto_wire::reply(status), Outgoing::new());
             }
-            // An exec's new process goes; the record keeps its old one.
-            if let Some(incoming) = place.held.incoming {
-                let ceiling = self.records.get(child).map_or(0, |r| r.ceiling);
-                let _ = sys::process_kill_at(&incoming, ceiling);
-                return;
-            }
-        }
-        if let Some(record) = self.records.get(child)
-            && record.state == State::Loading
-        {
-            let _ = sys::process_kill(&record.process);
         }
     }
 
@@ -2266,6 +2465,29 @@ impl Processes {
             }
             m if m == Method::Boot as u16 => self.boot(child, slot, r),
             m if m == Method::Ready as u16 => self.ready(child, r),
+            m if m == Method::LoaderForkImage as u16 => {
+                if !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let place = self.loaders.get(slot).expect("an exact loader");
+                if place.stage != Stage::Loading || !place.held.fork {
+                    return refuse(proto_process::PERMISSION);
+                }
+                let Some(source) = place.held.exec.fork_source.as_ref() else {
+                    return refuse(proto_process::NOT_FOUND);
+                };
+                let copy = match sys::handle_duplicate(
+                    source,
+                    Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
+                ) {
+                    Ok(copy) => copy,
+                    Err(error) => return kernel(error),
+                };
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply([copy.erase()].into())
+            }
             m if m == Method::Take as u16 => self.take(child, slot, r),
             _ => refuse(proto_process::PERMISSION),
         }
@@ -2453,12 +2675,20 @@ impl Processes {
         if !self.generations.live_room(child, 2) {
             return refuse(proto_process::AGAIN);
         }
+        let slot = self.loaders.of(child).expect("a loading place");
+        if self.loaders.get(slot).is_some_and(|p| {
+            p.held.exec.fork_source.is_some() && p.held.exec.pending_exec.is_none()
+        }) {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
         let Ok(set_id) = self.loaders.commit(child) else {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
         let committed_slot = self.loaders.of(child).expect("a committed place");
         let committed_ticket = self.loaders.ticket(committed_slot);
+        let new_exec = self.loaders.take_pending_exec(child);
         let record = self.records.get_mut(child).expect("a loading record");
+        record.active_exec = new_exec;
         record.state = State::Alive;
         record.committed_loader_ticket = committed_ticket;
         // A child of posix_spawn runs its own program from the start; one
@@ -2500,6 +2730,47 @@ impl Processes {
     /// SetId through a notary session with SET_ID: kept for the loader's
     /// place the ticket names, while it loads the record and image the
     /// body names (loaders.rs); PERMISSION otherwise.
+    /// Trusted RAM installs one exact prepaid executable cap and its captured IDs.
+    fn stage_exec(&mut self, r: &mut Request<'_>) -> Answer {
+        if !proto_process::may_set_id(r.label()) {
+            return refuse(proto_process::PERMISSION);
+        }
+        let Ok(args) = proto_process::StageExec::read(r.body()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let rights = Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER;
+        if r.handles.len() != 1 || r.handles.info(0) != Some((ObjectKind::Channel, rights)) {
+            return Answer::Status(Status::BadSize);
+        }
+        let Some(record) = self.records.find_pid(args.pid) else {
+            return refuse(proto_process::STAGE_RETIRED);
+        };
+        if self.loaders.of(record).is_none() {
+            let current = self.records.get(record).expect("a stage target");
+            return if current.image == args.image && current.committed_loader_ticket == args.ticket
+            {
+                refuse(proto_process::STAGE_RETIRED)
+            } else {
+                refuse(proto_process::PERMISSION)
+            };
+        }
+        let cap = match r.handles.take::<Channel>(0) {
+            Ok(cap) => cap,
+            Err(error) => return kernel(error),
+        };
+        match self.loaders.stage_exec(record, args, cap) {
+            Ok(Staged::Installed) => Answer::Status(Status::Ok),
+            Ok(Staged::Replay(extra)) => {
+                drop(extra);
+                Answer::Status(Status::Ok)
+            }
+            Err(posix_process_service::executable::Refused(cap)) => {
+                drop(cap);
+                refuse(proto_process::PERMISSION)
+            }
+        }
+    }
+
     fn set_id(&mut self, r: &mut Request<'_>) -> Answer {
         if !proto_process::may_set_id(r.label()) || !r.handles.is_empty() {
             return refuse(proto_process::PERMISSION);
@@ -2735,6 +3006,18 @@ impl Service<0> for Processes {
         };
         let record = self.records.get(index).expect("an ended record");
         if image != record.image {
+            if self.replacing[index]
+                .as_ref()
+                .is_some_and(|r| r.old_image == image)
+            {
+                self.replacing[index]
+                    .as_mut()
+                    .expect("an exact old image")
+                    .old
+                    .ended();
+                self.finish_replace(index);
+                return;
+            }
             // The new process of an exec ended before ExecCommit: the place
             // goes, and the old image goes on. The end of an old image
             // after ExecCommit names nothing.
