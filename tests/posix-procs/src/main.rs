@@ -13,6 +13,24 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 #[cfg(feature = "pending-open")]
 mod pending_open;
 
+/// The C probe supplies two writable words for the actual process accounting.
+#[cfg(feature = "public-data-probe")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn files_data_memory(out: *mut u64) -> i32 {
+    let Ok(memory) = rt::sys::process_memory(posix_abi::allocation::process()) else {
+        return -1;
+    };
+    if out.is_null() || memory.used > memory.quota {
+        return -1;
+    }
+    // SAFETY: the C caller provides two writable u64 words for this call.
+    unsafe {
+        out.write(memory.used);
+        out.add(1).write(memory.quota);
+    }
+    0
+}
+
 #[cfg(feature = "loader-abort")]
 mod audit;
 #[cfg(feature = "image-gates")]

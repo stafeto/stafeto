@@ -3,6 +3,8 @@
 #include <sys/stat.h>
 #include <pthread.h>
 
+extern int files_data_memory(unsigned long long out[2]);
+
 static struct { int fd, result; unsigned char bytes[1016]; } public_data_thread;
 static __attribute__((noinline)) int public_data_thread_stack(void) {
     pthread_attr_t actual;
@@ -22,6 +24,9 @@ static void *public_data_read_thread(void *argument) {
 
 /* build.rs compiles every libc call with -fno-builtin. */
 static int check_public_data(void) {
+    unsigned long long memory[2];
+    if (files_data_memory(memory)) return 29;
+    printf("posix-files: public Data process memory used %llu limit %llu bytes\n", memory[0], memory[1]);
     int fd = open("/tmp/public-data", O_CREAT | O_TRUNC | O_RDWR, 0600);
     if (fd < 0) return 1;
     unsigned char input[1012], bytes[1016];
@@ -38,6 +43,8 @@ static int check_public_data(void) {
         || pthread_join(thread, NULL) || public_data_thread.result != 1016
         || memcmp(public_data_thread.bytes, input, 1012)
         || memcmp(public_data_thread.bytes + 1012, "tail", 4)) return 28;
+    if (files_data_memory(memory)) return 29;
+    printf("posix-files: public Data pthread stack 65536, memory used %llu limit %llu bytes\n", memory[0], memory[1]);
     int alias = dup(fd);
     if (alias < 0 || lseek(alias, 8, SEEK_SET) != 8 || read(fd, bytes, 3) != 3) return 8;
     if (memcmp(bytes, input + 8, 3) || lseek(alias, 0, SEEK_CUR) != 11) return 9;
