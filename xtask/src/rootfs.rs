@@ -360,6 +360,7 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
+    "boot-posix-initial-fork.img",
     "boot-posix-jobs.img",
     "boot-posix-steps.img",
     "boot-posix-tty.img",
@@ -413,7 +414,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ),
         ],
         "boot-ash-dialog.img" => dialog(),
-        "boot-posix-procs.img" | "boot-posix-jobs.img" => procs(),
+        "boot-posix-procs.img" | "boot-posix-initial-fork.img" | "boot-posix-jobs.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -557,6 +558,7 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-posix-initial-fork.img" => &crate::POSIX_INITIAL_FORK_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
                 "boot-posix-tty.img" => &crate::POSIX_TTY_PROGRAMS,
                 "boot-posix-tty-steps.img" => &crate::POSIX_TTY_STEPS_PROGRAMS,

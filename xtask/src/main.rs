@@ -557,6 +557,12 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
+/// The initial POSIX record runs the direct fork fixture on the existing profile.
+const POSIX_INITIAL_FORK_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = ("posix-procs", "posix-initial-fork", POSIX_STACK_SIZE, &[]);
+    programs
+};
 /// The probe of the longest step of the process service (xtask
 /// process-steps): the probe in its steps mode, and the process service
 /// that prints each new longest step.
@@ -1122,6 +1128,7 @@ commands:
             over the Rust POSIX layer
   posix-procs run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
+  posix-initial-fork [--build] verify direct fork of the Init-adopted image
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
   loader-channels verify ordinary loader channel provenance and descriptor transfer
   process-steps run the probe of the longest step of the process service
@@ -1230,6 +1237,11 @@ fn main() {
         Some("posix-data-loss") => posix_data_loss(),
         Some("posix-open-finalize-clock") => posix_files_run_profile(true, true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("posix-initial-fork") => match &args[1..] {
+            [] => posix_initial_fork_probe(false),
+            [build] if build == "--build" => posix_initial_fork_probe(true),
+            _ => Err("usage: cargo xtask posix-initial-fork [--build]".into()),
+        },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
@@ -3075,6 +3087,39 @@ fn posix_data_loss() -> Result<(), String> {
     qemu::expect_marker(
         &output,
         "posix-files: public Data Start Commit and Query Waiting End recovery ok",
+    )
+}
+
+/// Require fork directly from the image Init adopted, before any replacement.
+fn posix_initial_fork_probe(build_only: bool) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-initial-fork.img",
+        &POSIX_INITIAL_FORK_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    if build_only {
+        return Ok(());
+    }
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: posix-procs ended"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &output,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(&output, "initial-fork: Init-adopted parent ")?;
+    qemu::expect_marker(&output, "initial-fork: child copied initial image")?;
+    qemu::expect_marker(
+        &output,
+        "initial-fork: parent retained initial image and reaped child",
     )
 }
 
