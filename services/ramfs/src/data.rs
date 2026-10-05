@@ -473,4 +473,42 @@ mod tests {
         assert_eq!(ram.storage.node(inode).unwrap().times[0], now);
         cleanup(&mut eof, &mut ram);
     }
+
+    #[test]
+    fn abandonment_marks_only_and_releases_at_most_one_private_page_per_step() {
+        let mut ram = Ram::new(Timestamp::ZERO);
+        let (fds, fd, inode) = file(&mut ram, b"abandoned");
+        let before = ram.storage.usage(ROOT_ACCOUNT);
+        let request = args(&ram, &fds, fd, DataKind::PWrite, 1012, 4095);
+        let mut journal = Journal::capture(&mut ram, &fds, request).unwrap();
+        journal.feed(0, &[3; 1004]).unwrap();
+        journal.feed(1004, &[3; 8]).unwrap();
+        ready(&mut journal, &mut ram);
+        let prepared = ram.storage.usage(ROOT_ACCOUNT);
+        assert_eq!(prepared.pages, before.pages + 2);
+        journal.abandon();
+        journal.abandon();
+        assert_eq!(journal.originating_root(), ROOT_ACCOUNT);
+        assert_eq!(ram.storage.usage(ROOT_ACCOUNT), prepared);
+        assert_eq!(
+            journal.commit(&mut ram, Some(Timestamp::ZERO)),
+            Err(proto_fs::RESOLVING)
+        );
+        assert_eq!(ram.storage.node(inode).unwrap().length, 0);
+        let mut done = false;
+        for _ in 0..8 {
+            let old = ram.storage.usage(ROOT_ACCOUNT).pages;
+            done = journal.cancel_step(&mut ram).unwrap();
+            let new = ram.storage.usage(ROOT_ACCOUNT).pages;
+            assert!(new <= old && old - new <= 1);
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(ram.storage.usage(ROOT_ACCOUNT), before);
+        assert!(journal.cancel_step(&mut ram).unwrap());
+        assert_eq!(ram.storage.usage(ROOT_ACCOUNT), before);
+        assert!(ram.get(&fds, fd).is_ok());
+    }
 }
