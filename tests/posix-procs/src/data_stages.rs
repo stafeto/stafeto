@@ -195,6 +195,10 @@ fn counters(files: &Files) -> Result<([u32; 4], u32), Status> {
 
 #[cfg(feature = "data-carrier-probe")]
 fn full_gone(files: &Files, held: PreparedOpen) -> Result<(), i32> {
+    // Finish reclamation queued by the preceding byte/reuse scenarios.
+    for _ in 0..4000 {
+        rt::sys::yield_now().map_err(|_| 126)?;
+    }
     let before = counters(files).map_err(|_| 82)?;
     let child = super::open_stages::clone_bound(files, &[held.fd]).map_err(|_| 83)?;
     let bytes = [5; proto_fs::MAX_WRITE];
