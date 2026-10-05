@@ -3073,8 +3073,16 @@ impl Fs {
             let (Ok(id), Ok(())) = (body.u64(), body.finish()) else {
                 return Answer::Status(Status::BadSize);
             };
-            if let Err(code) = self.path_slot(id, r.label()) {
-                return status(code);
+            if let Ok(slot) = self.job_slot(id, r.label())
+                && matches!(
+                    self.jobs[slot]
+                        .as_ref()
+                        .expect("exact canceled job")
+                        .operation,
+                    JobOperation::Data(_)
+                )
+            {
+                return status(proto_fs::PERMISSION);
             }
             self.cancel_job(id, r.label(), Some(fds));
             return Answer::Status(Status::Ok);
