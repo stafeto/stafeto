@@ -946,3 +946,67 @@ fn followed_link_source_directory_and_root_return_permission_without_new_names()
     assert_eq!(ram.storage.state.epoch, epoch);
     assert_eq!(ram.storage.lookup(ROOT, b"new"), Err(NO_ENTRY));
 }
+
+#[test]
+fn typed_unlink_directory_returns_permission_and_preserves_all_paid_state() {
+    let mut ram = Ram::new(17);
+    let dir = create(&mut ram, FIRST, ROOT, b"directory", DIR, 0o777);
+    let link = create(&mut ram, FIRST, ROOT, b"directory-link", SYMLINK, 0o777);
+    ram.storage.write(link, FIRST, 0, b"directory").unwrap();
+    let charge = ram.storage.charge_preparation(FIRST).unwrap();
+    let usage = ram.storage.usage(FIRST);
+    let before_pins = pins(&ram);
+    let epoch = ram.storage.state.epoch;
+    let before_dir = *ram.storage.node(dir).unwrap();
+    let before_link = *ram.storage.node(link).unwrap();
+    let before_root = *ram.storage.node(ROOT).unwrap();
+    for path in [b"/directory".as_slice(), b"/directory-link/"] {
+        assert!(matches!(
+            begin(
+                &mut ram,
+                charge,
+                FIRST,
+                NamespaceIntent::Unlink,
+                path,
+                None,
+                ROOT_USER
+            ),
+            Err(proto_fs::PERMISSION)
+        ));
+        assert_eq!(ram.storage.usage(FIRST), usage);
+        assert_eq!(pins(&ram), before_pins);
+        assert_eq!(ram.storage.state.epoch, epoch);
+        assert_eq!(ram.storage.preparations_used(), 1);
+        for (token, before) in [(dir, before_dir), (link, before_link), (ROOT, before_root)] {
+            let after = ram.storage.node(token).unwrap();
+            assert_eq!(
+                (after.times, after.links, after.parent, after.length),
+                (before.times, before.links, before.parent, before.length)
+            );
+        }
+        assert_eq!(ram.storage.lookup(ROOT, b"directory"), Ok(dir));
+        assert_eq!(ram.storage.lookup(ROOT, b"directory-link"), Ok(link));
+    }
+    ram.storage.release_preparation(charge);
+    assert_eq!(ram.storage.preparations_used(), 0);
+    assert_eq!(
+        ram.storage.unlink(ROOT, b"directory", FIRST),
+        Err(proto_fs::IS_DIRECTORY)
+    );
+    assert_eq!(ram.storage.preparations_used(), 0);
+    assert_eq!(ram.storage.usage(FIRST), usage);
+    assert_eq!(pins(&ram), before_pins);
+    assert_eq!(ram.storage.state.epoch, epoch);
+    assert_eq!(
+        run(
+            &mut ram,
+            NamespaceIntent::Unlink,
+            b"/directory-link",
+            None,
+            99
+        ),
+        Ok(NamespaceOutcome::Applied)
+    );
+    assert_eq!(ram.storage.lookup(ROOT, b"directory"), Ok(dir));
+    assert_eq!(ram.storage.lookup(ROOT, b"directory-link"), Err(NO_ENTRY));
+}

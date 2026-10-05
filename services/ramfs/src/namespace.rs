@@ -668,7 +668,7 @@ impl Storage<'_> {
         let token = edges[0].target.ok_or(NO_ENTRY)?;
         let kind = self.node(token)?.kind;
         match intent {
-            NamespaceIntent::Unlink if kind == crate::DIR => return Err(IS_DIRECTORY),
+            NamespaceIntent::Unlink if kind == crate::DIR => return Err(PERMISSION),
             NamespaceIntent::Rmdir if kind != crate::DIR => return Err(NOT_DIRECTORY),
             NamespaceIntent::Link { .. } if kind == crate::DIR => return Err(PERMISSION),
             NamespaceIntent::Link { .. } if edges[1].target.is_some() => {
@@ -791,6 +791,10 @@ pub(super) fn model_unlink(
     let prepared = (|| {
         let proof = model_edge(storage, parent, name, NamespacePath::Victim)?;
         let token = proof.edge.target.ok_or(NO_ENTRY)?;
+        // The trusted storage model preserves its directory refusal status.
+        if storage.node(token)?.kind == crate::DIR {
+            return Err(IS_DIRECTORY);
+        }
         Ok((
             token,
             storage.prepare_namespace_paid(
