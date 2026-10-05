@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -203,19 +204,17 @@ int main(int argc, char **argv) {
     CHECK(baseline[0] == 0 && baseline[1] == 0 && baseline[2] == 0);
     int parent[2], child[2], grand[2], events[2];
     CHECK(pipe(parent) == 0 && pipe(child) == 0 && pipe(grand) == 0 && pipe(events) == 0);
-    pid_t worker = fork();
-    CHECK(worker >= 0);
-    if (worker == 0) {
-        char a[16], b[16], c[16], d[16];
-        CHECK(snprintf(a, sizeof(a), "%d", parent[0]) > 0);
-        CHECK(snprintf(b, sizeof(b), "%d", child[0]) > 0);
-        CHECK(snprintf(c, sizeof(c), "%d", grand[0]) > 0);
-        CHECK(snprintf(d, sizeof(d), "%d", events[1]) > 0);
-        char *args[] = {PATH, "runtime", a, b, c, d, NULL};
-        char *env[] = {NULL};
-        execve(PATH, args, env);
-        CHECK(0);
-    }
+    char a[16], b[16], c[16], d[16];
+    CHECK(snprintf(a, sizeof(a), "%d", parent[0]) > 0);
+    CHECK(snprintf(b, sizeof(b), "%d", child[0]) > 0);
+    CHECK(snprintf(c, sizeof(c), "%d", grand[0]) > 0);
+    CHECK(snprintf(d, sizeof(d), "%d", events[1]) > 0);
+    char *args[] = {PATH, "runtime", a, b, c, d, NULL};
+    char *env[] = {NULL};
+    pid_t worker = -1;
+    int launched = posix_spawn(&worker, PATH, NULL, NULL, args, env);
+    printf("t6-runtime: dynamic parent spawn status %d pid %d\n", launched, worker);
+    CHECK(launched == 0 && worker > 0);
     CHECK(close(parent[0]) == 0 && close(child[0]) == 0 && close(grand[0]) == 0);
     CHECK(close(events[1]) == 0);
     pid_t p, q, r;
