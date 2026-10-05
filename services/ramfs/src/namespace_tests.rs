@@ -1010,3 +1010,132 @@ fn typed_unlink_directory_returns_permission_and_preserves_all_paid_state() {
     assert_eq!(ram.storage.lookup(ROOT, b"directory"), Ok(dir));
     assert_eq!(ram.storage.lookup(ROOT, b"directory-link"), Err(NO_ENTRY));
 }
+
+fn rename_into_exact_parent(ram: &mut Ram<'_>, charge: u16, parent: Token) -> Preparation {
+    let source = resolved(ram, b"/source", NamespacePath::Victim, ROOT_USER).unwrap();
+    let mut destination = Resolve::with_intent(
+        &mut ram.storage,
+        b"moved",
+        parent,
+        ROOT_USER,
+        Intent::Namespace {
+            path: NamespacePath::Destination,
+        },
+    )
+    .unwrap();
+    while destination.step(&mut ram.storage, ROOT_USER).unwrap() == Progress::More {}
+    let prep = ram
+        .storage
+        .prepare_namespace_paid(
+            FIRST,
+            charge,
+            NamespaceIntent::Rename,
+            source
+                .namespace_proof(&ram.storage, ROOT_USER, NamespacePath::Victim)
+                .unwrap(),
+            Some(
+                destination
+                    .namespace_proof(&ram.storage, ROOT_USER, NamespacePath::Destination)
+                    .unwrap(),
+            ),
+            ROOT_USER,
+        )
+        .unwrap();
+    source.release(&mut ram.storage);
+    destination.release(&mut ram.storage);
+    prep
+}
+
+#[test]
+fn rename_ancestors_include_deep_boot_and_relative_dynamic_directories() {
+    let paths = (1..=255)
+        .map(|depth| "/a".repeat(depth))
+        .collect::<Vec<_>>();
+    let entries = paths
+        .iter()
+        .map(|path| bootimg::rootfs::Entry {
+            path,
+            mode: bootimg::rootfs::DIRECTORY | 0o755,
+            uid: 0,
+            gid: 0,
+            file: 0,
+        })
+        .collect::<Vec<_>>();
+    let image = crate::tree::test_image(&entries);
+    let mut index = crate::tree::Index::new();
+    let tree = crate::tree::load(&image, &mut index).unwrap();
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::ZERO, tree);
+    let mut parent = ram
+        .storage
+        .resolve(paths.last().unwrap().as_bytes())
+        .unwrap();
+    for _ in 0..4 {
+        parent = create(&mut ram, FIRST, parent, b"child", DIR, 0o755);
+    }
+    let source = create(&mut ram, FIRST, ROOT, b"source", DIR, 0o755);
+    let charge = ram.storage.charge_preparation(FIRST).unwrap();
+    let before_pins = pins(&ram);
+    let usage = ram.storage.usage(FIRST);
+    let epoch = ram.storage.state.epoch;
+    let mut prep = rename_into_exact_parent(&mut ram, charge, parent);
+    assert!(ready(&mut ram, &mut prep, ROOT_USER).unwrap() > INODES);
+    assert_eq!(ram.storage.usage(FIRST), usage);
+    assert_eq!(ram.storage.state.epoch, epoch);
+    let now = proto_fs::Timestamp::legacy_ns(73);
+    assert_eq!(
+        prep.commit(&mut ram.storage, ROOT_USER, now),
+        Ok(NamespaceOutcome::Applied)
+    );
+    assert_eq!(ram.storage.lookup(parent, b"moved"), Ok(source));
+    assert_eq!(ram.storage.lookup(ROOT, b"source"), Err(NO_ENTRY));
+    assert_eq!(ram.storage.node(source).unwrap().parent, parent);
+    assert_eq!(ram.storage.node(parent).unwrap().times[1], now);
+    cleanup(&mut ram, &mut prep);
+    cleanup(&mut ram, &mut prep);
+    assert_eq!(pins(&ram), before_pins);
+    assert_eq!(ram.storage.preparations_used(), 1);
+    ram.storage.release_preparation(charge);
+}
+
+#[test]
+fn rename_ancestors_cycle_refuses_with_exact_paid_cleanup() {
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(19));
+    let parent = create(&mut ram, FIRST, ROOT, b"parent", DIR, 0o755);
+    let source = create(&mut ram, FIRST, ROOT, b"source", DIR, 0o755);
+    let charge = ram.storage.charge_preparation(FIRST).unwrap();
+    let before_pins = pins(&ram);
+    let mut prep = rename_into_exact_parent(&mut ram, charge, parent);
+    // This model keeps the captured namespace epoch and supplies a cyclic parent graph.
+    ram.storage.state.nodes[parent.slot as usize].parent = parent;
+    let usage = ram.storage.usage(FIRST);
+    let epoch = ram.storage.state.epoch;
+    let times = ram
+        .storage
+        .state
+        .nodes
+        .iter()
+        .map(|node| node.times)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ready(&mut ram, &mut prep, ROOT_USER),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(ram.storage.usage(FIRST), usage);
+    assert_eq!(ram.storage.state.epoch, epoch);
+    assert_eq!(
+        ram.storage
+            .state
+            .nodes
+            .iter()
+            .map(|node| node.times)
+            .collect::<Vec<_>>(),
+        times
+    );
+    assert_eq!(ram.storage.lookup(ROOT, b"source"), Ok(source));
+    assert_eq!(ram.storage.lookup(parent, b"moved"), Err(NO_ENTRY));
+    cleanup(&mut ram, &mut prep);
+    cleanup(&mut ram, &mut prep);
+    assert_eq!(pins(&ram), before_pins);
+    assert_eq!(ram.storage.preparations_used(), 1);
+    ram.storage.release_preparation(charge);
+}

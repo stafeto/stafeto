@@ -314,7 +314,7 @@ impl Preparation {
                     if at == ROOT {
                         self.phase = Phase::Prepay;
                     } else {
-                        if self.ancestor_steps == INODES as u16 {
+                        if self.ancestor_steps == NODES as u16 {
                             return Err(INVALID_ARGUMENT);
                         }
                         self.ancestor = Some(storage.node(at)?.parent);
