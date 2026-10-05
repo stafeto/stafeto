@@ -99,6 +99,10 @@ pub use time::Timestamp;
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
+/// Explicit startup mode for standalone deterministic RAM probes.
+pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
+/// Explicit startup mode requiring the shared Clock realtime page.
+pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
 pub const VERSION: u16 = 11;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;

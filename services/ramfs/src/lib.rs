@@ -29,6 +29,7 @@ mod resolve_tests;
 pub mod storage;
 #[cfg(test)]
 mod storage_tests;
+pub mod time_source;
 pub mod tree;
 
 use storage::{BOOT_ROOT, Pin, Storage, Token};

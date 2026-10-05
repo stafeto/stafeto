@@ -30,6 +30,8 @@ use rt::handle::{Channel, Handle, Memory, Outgoing, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 
+mod clock_page;
+
 rt::entry!(main);
 
 #[cfg(not(feature = "auth-probe"))]
@@ -87,7 +89,20 @@ fn main(_: u64) -> u64 {
         rt::console::set(console);
     }
     // Legacy diagnostic timestamp source; clocked profiles replace this at startup.
-    let now = rt::time::ticks_to_ns(rt::time::now());
+    let Ok(args) = ServiceArgs::read(start.args()) else {
+        return 7;
+    };
+    let period_ns = args.period_ns;
+    let Ok(mode) = ramfs::time_source::Mode::parse(args.own) else {
+        return 7;
+    };
+    let Ok(time_source) = clock_page::TimeSource::attach(mode, &start.parent, &start.process)
+    else {
+        return 8;
+    };
+    let Ok(now) = time_source.initial() else {
+        return 9;
+    };
     let tree = image_tree(&mut start);
     let Ok(backing) = sys::mem_create((ramfs::storage::PAGES * ramfs::storage::PAGE) as u64) else {
         return 5;
@@ -106,8 +121,7 @@ fn main(_: u64) -> u64 {
         &mut *pointer
     };
     state.initialize();
-    let ram = Ram::with_storage(proto_fs::Timestamp::legacy_ns(now), state, data, tree);
-    let args = ServiceArgs::read(start.args()).ok();
+    let ram = Ram::with_storage(now, state, data, tree);
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
         return 2;
@@ -117,7 +131,7 @@ fn main(_: u64) -> u64 {
     }
     let heartbeat = Heartbeat {
         to: &start.parent,
-        period_ns: args.map_or(0, |args| args.period_ns),
+        period_ns,
         priority: level,
     };
     let config = Config {
