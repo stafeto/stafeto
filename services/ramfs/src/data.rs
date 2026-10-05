@@ -28,6 +28,7 @@ pub struct Journal {
     bytes: [u8; proto_fs::MAX_READ],
     fed: usize,
     rebuilding: bool,
+    cleanup_done: bool,
     originating_root: crate::storage::Root,
 }
 
@@ -54,6 +55,7 @@ impl Journal {
             bytes: [0; proto_fs::MAX_READ],
             fed: 0,
             rebuilding: false,
+            cleanup_done: false,
             originating_root: fds.root,
         })
     }
@@ -260,8 +262,11 @@ impl Journal {
 
     /// One private page or retained lease per cleanup step. File effects remain committed.
     pub fn cancel_step(&mut self, ram: &mut Ram<'_>) -> Result<bool, u32> {
+        if self.cleanup_done {
+            return Ok(true);
+        }
         self.phase = DataPhase::Canceling;
-        match &mut self.prepared {
+        let done = match &mut self.prepared {
             Preparation::Write(prepared) => prepared.cancel(ram),
             Preparation::Truncate(prepared) => prepared.cancel(ram),
             Preparation::Captured(_) => {
@@ -274,7 +279,9 @@ impl Journal {
                 Ok(true)
             }
             Preparation::Empty => Ok(true),
-        }
+        }?;
+        self.cleanup_done = done;
+        Ok(done)
     }
 }
 

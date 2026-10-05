@@ -54,6 +54,26 @@ fn cleanup(files: &Files, key: OpenKey, ack: bool) -> Result<(), Status> {
     Err(Status::BadSize)
 }
 
+fn unread_commit(files: &Files, job: u64, args: DataStart) -> Result<DataOutcome, Status> {
+    for _ in 0..3000 {
+        match files.data_step_once(job) {
+            Ok(()) => {}
+            Err(Status::Unknown(proto_fs::RESOLVING)) => continue,
+            Err(error) => return Err(error),
+        }
+        let mut request = proto_wire::Writer::new();
+        proto_fs::Method::DataCommit.header().write(&mut request)?;
+        request.u64(job)?;
+        // A real accepted native response is deliberately left unread.
+        drop(rt::sys::send(files.sessions().0, request.as_bytes()).map_err(Status::Kernel)?);
+        let outcome = files.data_query_once(args)?;
+        if outcome.phase == DataPhase::Completed {
+            return Ok(outcome);
+        }
+    }
+    Err(Status::BadSize)
+}
+
 fn open(files: &Files, generation: u64, path: &[u8]) -> Result<PreparedOpen, Status> {
     let key = OpenKey {
         slot: 31,
@@ -205,6 +225,39 @@ fn full_gone(files: &Files, held: PreparedOpen) -> Result<(), i32> {
     Ok(())
 }
 
+fn retained_completions(files: &Files, held: PreparedOpen) -> Result<(), i32> {
+    let child = super::open_stages::clone_bound(files, &[held.fd]).map_err(|_| 101)?;
+    for slot in 0..16 {
+        let request = args(held, slot, DataKind::Read, 0, 0);
+        let (_, job) = child.data_start_once(request).map_err(|_| 102)?;
+        if complete(&child, job, request).map_err(|_| 103)?.result != DataResult::Bytes(0) {
+            return Err(104);
+        }
+        cleanup(&child, request.key, false).map_err(|_| 105)?;
+    }
+    let extra = args(held, 16, DataKind::Read, 0, 0);
+    if child.data_start_once(extra) != Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) {
+        return Err(106);
+    }
+    for slot in 0..16 {
+        let request = args(held, slot, DataKind::Read, 0, 0);
+        let outcome = child.data_query_once(request).map_err(|_| 107)?;
+        if outcome.phase != DataPhase::Canceling || outcome.result != DataResult::Bytes(0) {
+            return Err(108);
+        }
+        child
+            .data_read_result_once(request.key, 0, &mut [])
+            .map_err(|_| 109)?;
+        cleanup(&child, request.key, true).map_err(|_| 110)?;
+        if child.data_query_once(request) != Err(Status::Unknown(proto_fs::OPEN_RETIRED)) {
+            return Err(111);
+        }
+    }
+    child.data_start_once(extra).map_err(|_| 112)?;
+    cleanup(&child, extra.key, false).map_err(|_| 113)?;
+    Ok(())
+}
+
 fn run(files: &Files) -> Result<(), i32> {
     let held = open(files, 1, b"/tmp/data-stages").map_err(|_| 1)?;
     let input = [0x57; proto_fs::MAX_WRITE];
@@ -249,9 +302,18 @@ fn run(files: &Files) -> Result<(), i32> {
 
     let read = args(held, 1, DataKind::Read, input.len() as u32, 0);
     let (_, read_job) = files.data_start_once(read).map_err(|_| 13)?;
-    let read_outcome = complete(files, read_job, read).map_err(|_| 14)?;
+    let read_outcome = unread_commit(files, read_job, read).map_err(|_| 14)?;
     if read_outcome.result != DataResult::Bytes(input.len() as u64) {
         return Err(15);
+    }
+    cleanup(files, read.key, false).map_err(|_| 98)?;
+    cleanup(files, read.key, false).map_err(|_| 99)?;
+    let canceled_read = DataOutcome {
+        phase: DataPhase::Canceling,
+        ..read_outcome
+    };
+    if files.data_query_once(read) != Ok(canceled_read) {
+        return Err(100);
     }
     let replacement = args(held, 2, DataKind::PWrite, 3, 0);
     let (_, replacement_job) = files.data_start_once(replacement).map_err(|_| 16)?;
@@ -266,7 +328,7 @@ fn run(files: &Files) -> Result<(), i32> {
         .map_err(|_| 20)?
         != input.len()
         || out[..input.len()] != input
-        || files.data_commit_once(read_job, read) != Ok(read_outcome)
+        || files.data_commit_once(read_job, read) != Ok(canceled_read)
         || files
             .seek_from(held.fd, 0, proto_fs::SeekFrom::Current)
             .map_err(|_| 21)?
@@ -358,6 +420,7 @@ fn run(files: &Files) -> Result<(), i32> {
     files.data_feed_once(job, 0, b"X").map_err(|_| 54)?;
     complete(files, job, overflow).map_err(|_| 55)?;
     cleanup(files, overflow.key, true).map_err(|_| 56)?;
+    retained_completions(files, reused)?;
     #[cfg(feature = "auth-probe")]
     full_gone(files, reused)?;
     files.close_exact(reused).map_err(|_| 57)?;

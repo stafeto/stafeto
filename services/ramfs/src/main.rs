@@ -2780,11 +2780,11 @@ impl Fs {
             if method == Method::DataAck && !data.ack_allowed() {
                 return status(proto_fs::INVALID_ARGUMENT);
             }
-            self.cancel_job(id, r.label(), Some(fds));
-            return if self.jobs[slot].is_some() {
-                status(proto_fs::RESOLVING)
-            } else {
+            let retire = method == Method::DataAck || !data.ack_allowed();
+            return if self.cancel_job_mode(id, r.label(), Some(fds), retire) {
                 Answer::Status(Status::Ok)
+            } else {
+                status(proto_fs::RESOLVING)
             };
         }
         if job.abandoned {
@@ -2900,7 +2900,17 @@ impl Fs {
             self.cancel_job(id, owner, Some(fds));
         }
     }
-    fn cancel_job(&mut self, id: u64, owner: u64, mut fds: Option<&mut Fds>) {
+    fn cancel_job(&mut self, id: u64, owner: u64, fds: Option<&mut Fds>) {
+        self.cancel_job_mode(id, owner, fds, true);
+    }
+    /// Completed Data Cancel retains the paid result until exact ACK or abandonment.
+    fn cancel_job_mode(
+        &mut self,
+        id: u64,
+        owner: u64,
+        mut fds: Option<&mut Fds>,
+        retire: bool,
+    ) -> bool {
         if let Some(fds) = fds.as_deref_mut()
             && fds.image_outcome.is_some_and(|outcome| outcome.job == id)
         {
@@ -2926,7 +2936,10 @@ impl Fs {
                     .cancel_step(&mut self.ram)
                     .expect("exact data job cleanup")
             {
-                return;
+                return false;
+            }
+            if !retire {
+                return true;
             }
             let mut j = self.jobs[i].take().expect("owned canceled job");
             if let JobOperation::Path(mut path) = j.operation {
@@ -2957,6 +2970,7 @@ impl Fs {
         {
             *place = 0;
         }
+        true
     }
     fn resolve_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if proto_fs::is_loaders(r.label()) {
