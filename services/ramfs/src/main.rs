@@ -139,7 +139,7 @@ fn main(_: u64) -> u64 {
         #[cfg(feature = "image-info-probe")]
         image_info_backing: Handle::borrowed(backing.raw()),
         #[cfg(feature = "image-info-probe")]
-        image_info_fault: 0,
+        image_info_fault: None,
         process: Handle::borrowed(start.process.raw()),
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
@@ -172,7 +172,7 @@ struct Fs {
     #[cfg(feature = "image-info-probe")]
     image_info_backing: ManuallyDrop<Handle<Memory>>,
     #[cfg(feature = "image-info-probe")]
-    image_info_fault: u32,
+    image_info_fault: Option<(u32, u32, u64, u32)>,
     /// The service's own process, to map the object of a READ_INTO in.
     process: ManuallyDrop<Handle<rt::handle::Process>>,
     /// The service's channel, which its own sessions are copies of, and
@@ -741,8 +741,17 @@ impl Fs {
                 match self.ram.held_image_information(fds) {
                     Ok(info) => {
                         #[cfg(feature = "image-info-probe")]
-                        if self.image_info_fault != 0 {
-                            let fault = core::mem::take(&mut self.image_info_fault);
+                        if self
+                            .image_info_fault
+                            .is_some_and(|(pid, image, ticket, _)| {
+                                fds.binding.snapshot_ref().is_some_and(|who| {
+                                    who.pid == pid
+                                        && who.image == image
+                                        && who.loader.is_some_and(|loader| loader.ticket == ticket)
+                                })
+                            })
+                        {
+                            let fault = self.image_info_fault.take().expect("armed exact loader").3;
                             let mut body = proto_wire::Writer::new();
                             if body.u32(0).and_then(|()| info.write(&mut body)).is_err() {
                                 return Answer::Status(Status::BadSize);
@@ -1046,16 +1055,16 @@ impl Service<0> for Fs {
             if body.finish().is_err() || !r.handles.is_empty() || !(1..=3).contains(&fault) {
                 return Answer::Status(Status::BadSize);
             }
-            if self.image_info_fault != 0
-                || !s
-                    .data
-                    .binding
-                    .snapshot_ref()
-                    .is_some_and(|who| who.loader.is_some())
-            {
+            let Some(who) = s.data.binding.snapshot_ref() else {
+                return status(proto_fs::PERMISSION);
+            };
+            let Some(loader) = who.loader else {
+                return status(proto_fs::PERMISSION);
+            };
+            if self.image_info_fault.is_some() {
                 return status(proto_fs::PERMISSION);
             }
-            self.image_info_fault = fault;
+            self.image_info_fault = Some((who.pid, who.image, loader.ticket, fault));
             return Answer::Status(Status::Ok);
         }
         if first && proto_fs::is_loaders(r.label()) && r.method() == Method::BindPending as u16 {
