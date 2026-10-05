@@ -1718,7 +1718,17 @@ impl Service<0> for Fs {
                     Err(code) => status(code),
                 }
             }
-            None => Answer::Status(Status::UnknownMethod),
+            Some(
+                Method::DataStart
+                | Method::DataFeed
+                | Method::DataStep
+                | Method::DataCommit
+                | Method::DataQuery
+                | Method::DataCancel
+                | Method::DataAck
+                | Method::DataReadResult,
+            )
+            | None => Answer::Status(Status::UnknownMethod),
         }
     }
 }

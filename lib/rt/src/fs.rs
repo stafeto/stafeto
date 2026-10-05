@@ -1165,3 +1165,102 @@ fn console_write(uart: Option<&Handle<Channel>>, bytes: &[u8]) -> Result<usize, 
     console::write(bytes).map_err(Status::Kernel)?;
     Ok(bytes.len())
 }
+
+impl Files {
+    /// One native request. Refresh and recovery remain outside the final signal defer.
+    pub fn data_start_once(
+        &self,
+        args: proto_fs::DataStart,
+    ) -> Result<(proto_fs::DataPhase, u64), Status> {
+        let mut request = Writer::new();
+        Method::DataStart.header().write(&mut request)?;
+        args.write(&mut request)?;
+        let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_start_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+
+    pub fn data_feed_once(&self, job: u64, offset: u32, bytes: &[u8]) -> Result<(), Status> {
+        Self::open_job_id(job)?;
+        if bytes.len() > proto_fs::FEED_MAX {
+            return Err(Status::BadSize);
+        }
+        let mut request = Writer::new();
+        Method::DataFeed.header().write(&mut request)?;
+        request.u64(job)?;
+        request.u32(offset)?;
+        request.bytes(bytes)?;
+        let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+
+    pub fn data_step_once(&self, job: u64) -> Result<(), Status> {
+        let reply = self.data_job_once(Method::DataStep, job)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+
+    pub fn data_commit_once(
+        &self,
+        job: u64,
+        args: proto_fs::DataStart,
+    ) -> Result<proto_fs::DataOutcome, Status> {
+        let reply = self.data_job_once(Method::DataCommit, job)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let outcome =
+            proto_fs::DataOutcome::read(reply.bytes(&mut buffer), reply.handles.len(), args)?;
+        if outcome.job != job {
+            return Err(Status::BadSize);
+        }
+        Ok(outcome)
+    }
+
+    pub fn data_query_once(
+        &self,
+        args: proto_fs::DataStart,
+    ) -> Result<proto_fs::DataOutcome, Status> {
+        let reply = self.open_key_once(Method::DataQuery, args.key)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::DataOutcome::read(reply.bytes(&mut buffer), reply.handles.len(), args)
+    }
+
+    pub fn data_cancel_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        self.data_cleanup_once(Method::DataCancel, key)
+    }
+
+    pub fn data_ack_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        self.data_cleanup_once(Method::DataAck, key)
+    }
+
+    pub fn data_read_result_once(
+        &self,
+        key: proto_fs::OpenKey,
+        count: usize,
+        out: &mut [u8],
+    ) -> Result<usize, Status> {
+        if count > out.len() || count > MAX_READ {
+            return Err(Status::BadSize);
+        }
+        let reply = self.open_key_once(Method::DataReadResult, key)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let bytes =
+            proto_fs::data_read_reply(reply.bytes(&mut buffer), reply.handles.len(), count)?;
+        out[..count].copy_from_slice(bytes);
+        Ok(count)
+    }
+
+    fn data_job_once(&self, method: Method, job: u64) -> Result<sys::Reply, Status> {
+        Self::open_job_id(job)?;
+        let mut request = Writer::new();
+        method.header().write(&mut request)?;
+        request.u64(job)?;
+        sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)
+    }
+
+    fn data_cleanup_once(&self, method: Method, key: proto_fs::OpenKey) -> Result<(), Status> {
+        let reply = self.open_key_once(method, key)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+}
