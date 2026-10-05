@@ -1102,6 +1102,7 @@ commands:
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
   posix-data-steps measure paid data cleanup and full mapping dispatches
+  posix-open-finalize-clock probe genuine Clock publication during Finish
   posix-files-loss verify native refused Open replies with a live sibling
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
@@ -1222,7 +1223,8 @@ fn main() {
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-files-loss") => posix_files_loss(),
-        Some("posix-data-steps") => posix_files_run_profile(true, true),
+        Some("posix-data-steps") => posix_files_run_profile(true, true, false),
+        Some("posix-open-finalize-clock") => posix_files_run_profile(true, true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -2925,10 +2927,10 @@ fn posix_files_probe() -> Result<(), String> {
 }
 
 fn posix_files_run(measured: bool) -> Result<(), String> {
-    posix_files_run_profile(measured, false)
+    posix_files_run_profile(measured, false, false)
 }
 
-fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
+fn posix_files_run_profile(measured: bool, data: bool, clock_gate: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     const MEASURED: [ImageProgram; 5] = {
@@ -2943,14 +2945,25 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
         programs[4].3 = &["data-carrier-probe"];
         programs
     };
-    let programs = if data {
+    const CLOCK_GATE: [ImageProgram; 5] = {
+        let mut programs = DATA;
+        programs[0].3 = &["table-posix-files", "open-finalize-clock-probe"];
+        programs[1].3 = &["steps", "open-finalize-clock-probe"];
+        programs[4].3 = &["open-finalize-clock-probe"];
+        programs
+    };
+    let programs = if clock_gate {
+        &CLOCK_GATE
+    } else if data {
         &DATA
     } else if measured {
         &MEASURED
     } else {
         &POSIX_FILES_PROGRAMS
     };
-    let name = if data {
+    let name = if clock_gate {
+        "boot-posix-open-finalize-clock.img"
+    } else if data {
         "boot-posix-data-steps.img"
     } else if measured {
         "boot-posix-files-steps.img"

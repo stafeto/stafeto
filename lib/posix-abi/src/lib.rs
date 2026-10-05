@@ -17,6 +17,8 @@ pub mod loader_probe;
 pub mod long;
 pub mod metadata;
 mod open_driver;
+#[cfg(feature = "open-finalize-clock-probe")]
+pub mod open_finalize_probe;
 pub mod pipes;
 pub mod process;
 pub mod random;

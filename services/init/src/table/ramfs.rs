@@ -184,11 +184,21 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
 
 #[cfg(not(feature = "data-carrier-probe"))]
 const RAM_POSIX_FILES: Record = RAM_CLOCKED;
-#[cfg(feature = "data-carrier-probe")]
+#[cfg(all(
+    feature = "data-carrier-probe",
+    not(feature = "open-finalize-clock-probe")
+))]
 const RAM_POSIX_FILES: Record = Record {
     // The steps,auth-probe ELF maps 10 RO + 36 RX + 925 RW pages.
     // Data pages, stack and allowance are paid separately in this fixture.
     quota: (4096 + 971 + 12 + 128) * PAGE,
+    ..RAM_CLOCKED
+};
+
+#[cfg(feature = "open-finalize-clock-probe")]
+const RAM_POSIX_FILES: Record = Record {
+    // The joint steps,open-finalize-clock-probe ELF maps 10 RO + 37 RX + 925 RW pages.
+    quota: (4096 + 972 + 12 + 128) * PAGE,
     ..RAM_CLOCKED
 };
 

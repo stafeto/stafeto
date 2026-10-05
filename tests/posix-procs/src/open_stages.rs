@@ -561,6 +561,8 @@ fn finalization(files: &Files) -> Result<(), i32> {
 }
 
 fn run(files: &Files) -> Result<(), i32> {
+    #[cfg(feature = "open-finalize-clock-probe")]
+    crate::open_finalize_clock::run(files)?;
     finalization(files)?;
     start_recovery(files)?;
     random_marker(files)?;

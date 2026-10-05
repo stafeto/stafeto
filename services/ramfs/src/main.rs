@@ -39,8 +39,8 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0xfff7, 0xfff8, 0xfff9, 0xfffa,
-    0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0xfff6, 0xfff7, 0xfff8, 0xfff9,
+    0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -152,6 +152,8 @@ fn main(_: u64) -> u64 {
     let mut fs = Fs {
         ram,
         time_source,
+        #[cfg(feature = "open-finalize-clock-probe")]
+        clock_gate: None,
         #[cfg(feature = "image-info-probe")]
         image_info_backing: Handle::borrowed(backing.raw()),
         #[cfg(feature = "image-info-probe")]
@@ -188,6 +190,8 @@ fn main(_: u64) -> u64 {
 struct Fs {
     ram: Ram<'static>,
     time_source: clock_page::TimeSource,
+    #[cfg(feature = "open-finalize-clock-probe")]
+    clock_gate: Option<clock_page::ClockGate>,
     // The startup-owned backing outlives this service loop and every outgoing copy.
     #[cfg(feature = "image-info-probe")]
     image_info_backing: ManuallyDrop<Handle<Memory>>,
@@ -983,6 +987,14 @@ impl Service<0> for Fs {
 
     /// The client of `s` went: its descriptors close.
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
+        #[cfg(feature = "open-finalize-clock-probe")]
+        if self
+            .clock_gate
+            .as_ref()
+            .is_some_and(|gate| gate.owner == s.label())
+        {
+            self.clock_gate = None;
+        }
         self.clear_image_outcome(&mut s.data);
         for id in s.data.resolvers {
             if id != 0 {
@@ -996,6 +1008,14 @@ impl Service<0> for Fs {
     /// The last copy of a session Clone made went before it sent anything:
     /// the descriptors it was born with close.
     fn closed(&mut self, label: u64) {
+        #[cfg(feature = "open-finalize-clock-probe")]
+        if self
+            .clock_gate
+            .as_ref()
+            .is_some_and(|gate| gate.owner == label)
+        {
+            self.clock_gate = None;
+        }
         self.places.release(label);
         self.clones.gone(label);
         if let Some(birth) = self
@@ -1105,6 +1125,84 @@ impl Service<0> for Fs {
             if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {
                 return status(proto_fs::RESOLVING);
             }
+        }
+        #[cfg(feature = "open-finalize-clock-probe")]
+        if r.method() == 0xfff6 {
+            let mut body = r.body();
+            let (Ok(action), Ok(slot), Ok(generation), Ok(job), Ok(())) = (
+                body.u32(),
+                body.u32(),
+                body.u64(),
+                body.u64(),
+                body.finish(),
+            ) else {
+                return Answer::Status(Status::BadSize);
+            };
+            let key = proto_fs::OpenKey { slot, generation };
+            if action > 1 || key.validate().is_err() || job == 0 {
+                return Answer::Status(Status::BadSize);
+            }
+            if let Err(code) = self.authenticate(&mut s.data, r.label()) {
+                return status(code);
+            }
+            let Some(stamp) = s.data.binding.stamp() else {
+                return status(proto_fs::PERMISSION);
+            };
+            let matches = self.clock_gate.as_ref().is_some_and(|gate| {
+                gate.owner == r.label() && gate.key == key && gate.job == job && gate.stamp == stamp
+            });
+            if action == 0 {
+                if !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                if matches {
+                    self.clock_gate = None;
+                } else if self.clock_gate.is_some() {
+                    return status(proto_fs::PERMISSION);
+                }
+                return Answer::Status(Status::Ok);
+            }
+            if matches && r.handles.is_empty() {
+                return Answer::Status(Status::Ok);
+            }
+            if self.clock_gate.is_some() {
+                return status(proto_fs::PERMISSION);
+            }
+            if r.handles.len() != 1
+                || r.handles.info(0)
+                    != Some((
+                        rt::abi::ObjectKind::Channel,
+                        Rights::SEND | Rights::TRANSFER,
+                    ))
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            let Ok(index) = self.path_slot(job, r.label()) else {
+                return status(proto_fs::PERMISSION);
+            };
+            let paid = self.jobs[index].as_ref().expect("exact gated job");
+            if paid.open_key != Some(key)
+                || paid.authority != Some(stamp)
+                || !s.data.resolvers.contains(&job)
+                || paid.real
+                || !paid.path().open.as_ref().is_some_and(|open| {
+                    matches!(open.phase, OpenPhase::Prepared { .. })
+                        && open.needs_time(&self.ram, &s.data) == Ok(true)
+                })
+            {
+                return status(proto_fs::PERMISSION);
+            }
+            let Ok(channel) = r.handles.take::<Channel>(0) else {
+                return Answer::Status(Status::BadSize);
+            };
+            self.clock_gate = Some(clock_page::ClockGate {
+                owner: r.label(),
+                key,
+                job,
+                stamp,
+                channel,
+            });
+            return Answer::Status(Status::Ok);
         }
         #[cfg(feature = "image-info-probe")]
         if r.method() == 0xfff7 {
@@ -3081,11 +3179,29 @@ impl Fs {
                     };
                     let now = match open.needs_time(&self.ram, fds) {
                         Ok(false) => proto_fs::Timestamp::ZERO,
-                        Ok(true) => match self.time_source.read_once() {
-                            Ok(Some(now)) => now,
-                            Ok(None) => return status(proto_fs::TIME_DEFERRED),
-                            Err(error) => return Answer::Status(error),
-                        },
+                        Ok(true) => {
+                            #[cfg(feature = "open-finalize-clock-probe")]
+                            let sample = {
+                                let gate = if self.clock_gate.as_ref().is_some_and(|gate| {
+                                    gate.owner == r.label()
+                                        && gate.key == key
+                                        && gate.job == id
+                                        && Some(gate.stamp) == fds.binding.stamp()
+                                }) {
+                                    self.clock_gate.take()
+                                } else {
+                                    None
+                                };
+                                self.time_source.read_gated(gate)
+                            };
+                            #[cfg(not(feature = "open-finalize-clock-probe"))]
+                            let sample = self.time_source.read_once();
+                            match sample {
+                                Ok(Some(now)) => now,
+                                Ok(None) => return status(proto_fs::TIME_DEFERRED),
+                                Err(error) => return Answer::Status(error),
+                            }
+                        }
                         Err(code) => return status(code),
                     };
                     if let Err(code) =
