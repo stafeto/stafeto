@@ -496,7 +496,7 @@ impl Preparation {
     }
 }
 impl Storage<'_> {
-    fn namespace_charge(&self, root: Root, charge: u16) -> Result<(), u32> {
+    pub(crate) fn namespace_charge(&self, root: Root, charge: u16) -> Result<(), u32> {
         if self
             .state
             .accounts

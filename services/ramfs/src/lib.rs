@@ -16,6 +16,9 @@ pub mod io;
 #[cfg(test)]
 mod io_tests;
 pub mod maintenance;
+pub mod metadata;
+#[cfg(test)]
+mod metadata_tests;
 pub use storage::namespace;
 #[cfg(test)]
 mod create_tests;
@@ -1352,8 +1355,8 @@ impl<'a> Ram<'a> {
             uid,
             gid,
             size,
-            block_size: FILE_CAPACITY as u32,
-            blocks: size.div_ceil(512),
+            block_size: storage::PAGE as u32,
+            blocks: self.storage.blocks(self.token(file)),
             access_time: times.access,
             modify_time: times.modify,
             change_time: times.change,
@@ -1886,7 +1889,7 @@ mod tests {
             (
                 5,
                 3,
-                1,
+                8,
                 proto_fs::Timestamp::legacy_ns(10),
                 proto_fs::Timestamp::legacy_ns(20),
                 proto_fs::Timestamp::legacy_ns(20)

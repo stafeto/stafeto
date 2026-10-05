@@ -10,9 +10,9 @@ use proto_fs::{BAD_FD, INVALID_ARGUMENT, IS_DIRECTORY, OFFSET_OVERFLOW, READ_ONL
 /// EFBIG. The protocol owner publishes this status with the data-operation wire.
 pub use proto_fs::FILE_TOO_LARGE;
 
-struct Held {
+pub(crate) struct Held {
     description: Token,
-    open: Open,
+    pub(crate) open: Open,
     capacity: u64,
 }
 
@@ -40,7 +40,7 @@ pub struct TruncatePreparation {
 }
 
 impl Ram<'_> {
-    fn io_retain(&mut self, fds: &Fds, fd: u32) -> Result<Held, u32> {
+    pub(crate) fn io_retain(&mut self, fds: &Fds, fd: u32) -> Result<Held, u32> {
         let description = self.description_token(fds, fd)?;
         let shared = self.descriptions[description.slot as usize]
             .as_mut()
@@ -64,7 +64,7 @@ impl Ram<'_> {
         Ok(())
     }
 
-    fn io_release(&mut self, held: Held) {
+    pub(crate) fn io_release(&mut self, held: Held) {
         let slot = held.description.slot as usize;
         let Some(shared) = self.descriptions[slot].as_mut() else {
             return;
