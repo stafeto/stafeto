@@ -75,6 +75,9 @@ pub const METHODS: &[u16] = &[1, 2, 5, 6, 7, 10, 11, 12];
 pub fn decode_page_reply(bytes: &[u8], handle_count: usize) -> Result<(), Status> {
     let mut reader = Reader::new(bytes);
     let status = Status::from_code(reader.u32()?);
+    if status != Status::Ok && reader.u32()? != 0 {
+        return Err(Status::BadSize);
+    }
     reader.finish()?;
     let expected_handles = usize::from(status == Status::Ok);
     if handle_count != expected_handles {
@@ -105,14 +108,27 @@ mod reply_tests {
 
     #[test]
     fn page_failure_preserves_status_and_rejects_attached_handles_or_bytes() {
-        let bytes = PERMISSION.to_le_bytes();
-        let denied = Status::from_code(PERMISSION);
-        assert_eq!(decode_page_reply(&bytes, 0), Err(denied));
-        for count in [1, 2, usize::MAX] {
-            assert_eq!(decode_page_reply(&bytes, count), Err(Status::BadSize));
+        // Kernel NoMemory and the clock's permission error use the service runtime's reply.
+        for status in [Status::from_code(5), Status::from_code(PERMISSION)] {
+            let bytes = proto_wire::reply(status);
+            assert_eq!(bytes.len(), 8);
+            assert_eq!(decode_page_reply(&bytes, 0), Err(status));
+            for count in [1, 2, usize::MAX] {
+                assert_eq!(decode_page_reply(&bytes, count), Err(Status::BadSize));
+            }
+            for length in 0..8 {
+                assert_eq!(decode_page_reply(&bytes[..length], 0), Err(Status::BadSize));
+            }
+            let mut nonzero_reserved = bytes;
+            nonzero_reserved[4] = 1;
+            assert_eq!(
+                decode_page_reply(&nonzero_reserved, 0),
+                Err(Status::BadSize)
+            );
+            let mut trailing = [0; 9];
+            trailing[..8].copy_from_slice(&bytes);
+            assert_eq!(decode_page_reply(&trailing, 0), Err(Status::BadSize));
         }
-        let trailing = [bytes[0], bytes[1], bytes[2], bytes[3], 0];
-        assert_eq!(decode_page_reply(&trailing, 0), Err(Status::BadSize));
     }
 }
 
