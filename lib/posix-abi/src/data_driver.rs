@@ -277,7 +277,17 @@ fn advance(claim: ScalarClaimToken, transport: Transport) -> Result<Progress, i3
     }
     match query.outcome.phase {
         DataPhase::Captured | DataPhase::Feeding if state.kind.writes() => {
-            Ok(Progress::Feed(state.job))
+            if u32::from(state.feed_end) < state.count {
+                Ok(Progress::Feed(state.job))
+            } else if u32::from(state.feed_end) == state.count {
+                // The immutable input is fully acknowledged, including count
+                // zero. Preparation keeps this same key, job and held target.
+                progress(claim, Phase::Preparing, state.job, state.feed_end)?;
+                let _ = files.data_step_once(state.job);
+                Ok(Progress::More)
+            } else {
+                Err(EIO)
+            }
         }
         DataPhase::Captured | DataPhase::Preparing => {
             let _ = files.data_step_once(state.job);
