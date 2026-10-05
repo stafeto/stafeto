@@ -849,7 +849,7 @@ mod tests {
             pipes: Option<Handle<Channel>>,
             terminal: Option<Handle<Channel>>,
             paths: crate::PathState,
-            descriptors: posix_fd::Table<Target, 32, Legacy>,
+            descriptors: posix_fd::Table<Target, 32, Legacy, crate::data::Recovery>,
         }
         assert_eq!(size_of::<Recovery>(), 24);
         assert_eq!(size_of::<PosixFs>(), size_of::<LegacyFs>());

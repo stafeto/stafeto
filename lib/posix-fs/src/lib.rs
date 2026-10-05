@@ -6,6 +6,7 @@
 
 #![no_std]
 
+pub mod data;
 pub mod open;
 mod target;
 pub use target::RamTarget;
@@ -193,7 +194,7 @@ pub struct PosixFs {
     /// the console's input, output and error go there (5f).
     terminal: Option<Handle<Channel>>,
     paths: PathState,
-    descriptors: Table<Target, OPEN_MAX, open::Recovery>,
+    descriptors: Table<Target, OPEN_MAX, open::Recovery, data::Recovery>,
 }
 
 /// Owned startup transports, prepared before the pinned descriptor table exists.
