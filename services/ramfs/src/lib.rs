@@ -18,6 +18,8 @@ mod io_tests;
 pub mod maintenance;
 pub use storage::namespace;
 #[cfg(test)]
+mod create_tests;
+#[cfg(test)]
 mod namespace_tests;
 pub mod open;
 pub mod places;

@@ -6,6 +6,9 @@
 
 use super::*;
 use crate::authority::Identity;
+#[path = "create.rs"]
+mod create;
+pub use create::{CreateJournal, ReadLinkJournal};
 use proto_fs::{
     ACCESS_DENIED, ALREADY_EXISTS, INVALID_ARGUMENT, IS_DIRECTORY, NOT_DIRECTORY, PERMISSION,
     STALE_PROOF,
@@ -29,6 +32,9 @@ pub enum NamespacePath {
     Victim,
     Destination,
     LinkSource { follow: bool },
+    CreateDirectory,
+    CreateSymbolicLink,
+    ReadLink,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinalComponent {
