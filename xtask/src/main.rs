@@ -2814,6 +2814,7 @@ fn loader_info_probe() -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
     const PROGRAMS: [ImageProgram; 6] = {
         let mut programs = LOADER_ABORT_PROGRAMS;
+        programs[0].3 = &["table-posix-files", "loader-info"];
         programs[1].3 = &["image-info-probe", "steps"];
         programs[4].3 = &["image-info-probe"];
         programs[5].3 = &["image-info-probe"];
