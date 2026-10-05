@@ -9,6 +9,8 @@
 
 #![no_std]
 
+mod io;
+pub use io::*;
 mod scalar;
 pub use scalar::*;
 
@@ -320,6 +322,8 @@ enum Held<T, R, S> {
     Io(Hold<T>),
     Open(OpenRecord<T, R>),
     Scalar(ScalarRecord<T, S>),
+    RecoverableIo(IoRecord<T, R>),
+    Disposal(DisposalSnapshot<T, R>),
 }
 
 struct HoldSlot<T, R, S> {
@@ -490,7 +494,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
     }
 
     fn left(&mut self, backend: T) -> Option<T> {
-        if self.referenced(backend) || self.scalar_pinned(backend) {
+        if self.referenced(backend) || self.scalar_pinned(backend) || self.io_pinned(backend) {
             return None;
         }
         let hold = self.holds.iter_mut().find_map(|slot| match &mut slot.held {
@@ -548,7 +552,11 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
         }
         let closed = hold.closed && !hold.released;
         slot.held = Held::Empty;
-        (closed && !self.referenced(backend) && !self.scalar_pinned(backend)).then_some(backend)
+        (closed
+            && !self.referenced(backend)
+            && !self.scalar_pinned(backend)
+            && !self.io_pinned(backend))
+        .then_some(backend)
     }
 
     /// Discard abandoned ordinary I/O holds one release at a time.
@@ -566,6 +574,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
                 && !hold.released
                 && !self.referenced(hold.backend)
                 && !self.scalar_pinned(hold.backend)
+                && !self.io_pinned(hold.backend)
             {
                 return Some(hold.backend);
             }
@@ -1048,7 +1057,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
         Some(Abandoned::ClaimReleased(token))
     }
 
-    /// The fork child drops inherited Open/Scalar recovery in its private table.
+    /// The fork child drops inherited Open/Scalar/Io/Disposal recovery locally.
     /// Published fd references survive. The parent owns every unresolved job.
     /// The caller establishes child-exclusive access before this operation.
     pub fn discard_open_after_fork(&mut self) {
@@ -1058,7 +1067,10 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
             }
         }
         for slot in &mut self.holds {
-            if matches!(slot.held, Held::Open(_) | Held::Scalar(_)) {
+            if matches!(
+                slot.held,
+                Held::Open(_) | Held::Scalar(_) | Held::RecoverableIo(_) | Held::Disposal(_)
+            ) {
                 slot.held = Held::Empty;
                 slot.change();
             }
