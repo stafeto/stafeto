@@ -1724,6 +1724,74 @@ impl<'a> Storage<'a> {
     }
 }
 
+impl Storage<'_> {
+    pub(crate) fn cwd_result_preflight(&self, root: u16, count: usize) -> Result<(), u32> {
+        let a = self.state.accounts[root as usize]
+            .as_ref()
+            .expect("paid result root");
+        if count > crate::cwd::getcwd::MAX_PAGES
+            || count > self.state.page_len
+            || count > usize::from(PAGE_SHARE - a.usage.pages)
+        {
+            return Err(crate::cwd::getcwd::NO_MEMORY);
+        }
+        Ok(())
+    }
+    pub(crate) fn cwd_result_allocate(
+        &mut self,
+        pages: &mut crate::cwd::getcwd::ResultPages,
+    ) -> Result<(), u32> {
+        self.cwd_result_preflight(pages.root, 1)?;
+        if pages.count as usize == crate::cwd::getcwd::MAX_PAGES {
+            return Err(crate::cwd::getcwd::NO_MEMORY);
+        }
+        let page = self.io_take_page(pages.root, 0);
+        self.data[page.physical as usize * PAGE..(page.physical as usize + 1) * PAGE].fill(0);
+        self.state.page_next[page.physical as usize] = pages.head;
+        pages.head = page.physical;
+        pages.first = PAGE as u16;
+        pages.count += 1;
+        Ok(())
+    }
+    pub(crate) fn cwd_result_prepend(
+        &mut self,
+        pages: &mut crate::cwd::getcwd::ResultPages,
+        bytes: &[u8],
+    ) {
+        assert!(bytes.len() <= pages.first as usize);
+        pages.first -= bytes.len() as u16;
+        let at = pages.head as usize * PAGE + pages.first as usize;
+        self.data[at..at + bytes.len()].copy_from_slice(bytes);
+        pages.length += bytes.len() as u32;
+    }
+    pub(crate) fn cwd_result_next(&self, page: u16) -> u16 {
+        self.state.page_next[page as usize]
+    }
+    pub(crate) fn cwd_result_read(&self, page: u16, offset: usize, out: &mut [u8]) {
+        let first = (PAGE - offset).min(out.len());
+        let at = page as usize * PAGE + offset;
+        out[..first].copy_from_slice(&self.data[at..at + first]);
+        if first < out.len() {
+            let remaining = out.len() - first;
+            let next = self.state.page_next[page as usize] as usize * PAGE;
+            out[first..].copy_from_slice(&self.data[next..next + remaining]);
+        }
+    }
+    pub(crate) fn cwd_result_free(&mut self, pages: &mut crate::cwd::getcwd::ResultPages) {
+        let page = pages.head;
+        pages.head = self.state.page_next[page as usize];
+        self.state.page_next[page as usize] = NONE;
+        self.state.page_free[self.state.page_len] = page;
+        self.state.page_len += 1;
+        self.uncharge(pages.root as usize, |u| &mut u.pages);
+        pages.count -= 1;
+        if pages.head == NONE {
+            pages.first = 0;
+            pages.length = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod page_tests {
     extern crate std;
