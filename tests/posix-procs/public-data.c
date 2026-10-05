@@ -1,6 +1,24 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 #include <sys/stat.h>
+#include <pthread.h>
+
+static struct { int fd, result; unsigned char bytes[1016]; } public_data_thread;
+static __attribute__((noinline)) int public_data_thread_stack(void) {
+    pthread_attr_t actual;
+    size_t size = 0;
+    void *address = NULL;
+    if (pthread_getattr_np(pthread_self(), &actual)) return 1;
+    int result = pthread_attr_getstack(&actual, &address, &size);
+    if (pthread_attr_destroy(&actual)) return 1;
+    return result || !address || size != 64 * 1024;
+}
+static void *public_data_read_thread(void *argument) {
+    (void)argument;
+    public_data_thread.result = public_data_thread_stack() ? -1
+        : (int)pread(public_data_thread.fd, public_data_thread.bytes, sizeof(public_data_thread.bytes), 0);
+    return NULL;
+}
 
 /* build.rs compiles every libc call with -fno-builtin. */
 static int check_public_data(void) {
@@ -14,6 +32,12 @@ static int check_public_data(void) {
     if (lseek(fd, 0, SEEK_CUR) != 1012) return 5;
     if (pwrite(fd, "tail", 4, 1012) != 4 || lseek(fd, 0, SEEK_CUR) != 1012) return 6;
     if (pread(fd, bytes, sizeof(bytes), 0) != 1016 || memcmp(bytes + 1012, "tail", 4)) return 7;
+    public_data_thread.fd = fd;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, public_data_read_thread, NULL)
+        || pthread_join(thread, NULL) || public_data_thread.result != 1016
+        || memcmp(public_data_thread.bytes, input, 1012)
+        || memcmp(public_data_thread.bytes + 1012, "tail", 4)) return 28;
     int alias = dup(fd);
     if (alias < 0 || lseek(alias, 8, SEEK_SET) != 8 || read(fd, bytes, 3) != 3) return 8;
     if (memcmp(bytes, input + 8, 3) || lseek(alias, 0, SEEK_CUR) != 11) return 9;
