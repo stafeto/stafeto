@@ -197,8 +197,8 @@ const RAM_POSIX_FILES: Record = Record {
 
 #[cfg(feature = "open-finalize-clock-probe")]
 const RAM_POSIX_FILES: Record = Record {
-    // The steps,open-finalize-clock-probe ELF maps 10 RO + 37 RX + 924 RW pages.
-    quota: (4096 + 971 + 12 + 128) * PAGE,
+    // The joint steps,open-finalize-clock-probe ELF maps 10 RO + 37 RX + 925 RW pages.
+    quota: (4096 + 972 + 12 + 128) * PAGE,
     ..RAM_CLOCKED
 };
 

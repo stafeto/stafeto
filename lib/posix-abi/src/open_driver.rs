@@ -70,6 +70,14 @@ pub(crate) fn open(
         loop {
             // Binding and preparation retries run without a numeric reservation or defer.
             while !files.open_advance(recovery.job, true).map_err(protocol)? {}
+            #[cfg(feature = "open-finalize-clock-probe")]
+            crate::open_finalize_probe::prepared(crate::open_finalize_probe::Prepared {
+                owner,
+                token,
+                claim,
+                job: recovery.job,
+                session: files.sessions().0.raw(),
+            })?;
             let defer = Defer::enter();
             let final_result = (|| {
                 let (entry, context) = crate::shared::with_files(|files| {
@@ -83,6 +91,8 @@ pub(crate) fn open(
                 let finished = match context.send_once() {
                     FinalizeResult::Finished(held) => Ok(held),
                     FinalizeResult::Deferred { proof, reason } => {
+                        #[cfg(feature = "open-finalize-clock-probe")]
+                        crate::open_finalize_probe::deferred(owner, token, reason);
                         crate::shared::with_files(|files| {
                             files
                                 .unreserve_open_record(claim, entry, proof)
