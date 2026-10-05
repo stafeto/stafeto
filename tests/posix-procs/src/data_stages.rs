@@ -204,7 +204,7 @@ fn full_gone(files: &Files, held: PreparedOpen) -> Result<(), i32> {
             slot,
             DataKind::PWrite,
             bytes.len() as u32,
-            4095 + slot as u64 * 8192,
+            12287 + slot as u64 * 8192,
         );
         let (_, job) = child.data_start_once(request).map_err(|_| 84)?;
         child
