@@ -2830,10 +2830,6 @@ fn loader_info_probe() -> Result<(), String> {
         &output,
         "posix-files: strict image metadata and incoming handle cleanup ok",
     )?;
-    qemu::expect_marker(
-        &output,
-        "loader: image info extra Memory handle released before refusal",
-    )?;
     let steps = longest_steps(&output.lines, "2");
     if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
         return Err(format!(

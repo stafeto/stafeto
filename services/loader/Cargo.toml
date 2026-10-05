@@ -20,7 +20,7 @@ bench = false
 [features]
 auth-probe = []
 image-gates = ["auth-probe"]
-image-info-probe = ["auth-probe"]
+image-info-probe = ["image-gates"]
 # The probes of the copy of a fork (posix-procs): pieces of 64 KiB, so
 # that the copy of a region past one piece, with an offset into the
 # parent's object, runs within a record's quota of 2 MiB.

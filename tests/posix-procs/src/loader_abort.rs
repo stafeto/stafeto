@@ -161,6 +161,18 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
             if loaded != 0 {
                 #[cfg(feature = "image-info-probe")]
                 {
+                    let observer = sys::channel_create(1).map_err(Status::Kernel)?;
+                    let copy = sys::handle_duplicate(&observer, Rights::NOTIFY | Rights::TRANSFER)
+                        .map_err(Status::Kernel)?;
+                    let reply = sys::send_handles(
+                        &loader,
+                        &Header::new(0xfffb, proto_loader::VERSION).bytes(),
+                        [copy.erase()],
+                    )
+                    .map_err(|refused| Status::Kernel(refused.error))?;
+                    if reply.len != 8 || reply.words[0] != 0 || !reply.handles.is_empty() {
+                        return Err(Status::BadSize);
+                    }
                     let mut arm = Writer::new();
                     Header::new(0xfff7, proto_fs::VERSION).write(&mut arm)?;
                     arm.u32(loaded as u32)?;
@@ -171,8 +183,28 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
                     if load_image(&loader) != Err(Status::from_code(proto_loader::IO)) {
                         return Err(Status::BadSize);
                     }
+                    let sys::Received::Notification {
+                        source: rt::abi::Source::Unlabeled,
+                        label: 0,
+                        bits,
+                        ..
+                    } = sys::receive(&observer).map_err(Status::Kernel)?
+                    else {
+                        return Err(Status::BadSize);
+                    };
+                    let before = (bits >> 8) & 0xffff;
+                    let received = (bits >> 24) & 0xffff;
+                    let after = (bits >> 40) & 0xffff;
+                    let caps = bits >> 56;
+                    if bits & 0xff != 0x87
+                        || before != after
+                        || received != before + caps
+                        || caps != u64::from(loaded == 3)
+                    {
+                        return Err(Status::BadSize);
+                    }
                     rt::println!(
-                        "posix-files: malformed image metadata {loaded} refused before Ready"
+                        "posix-files: image metadata {loaded} handles={caps} live={before}->{received}->{after} refused before Ready"
                     );
                 }
                 #[cfg(not(feature = "image-info-probe"))]
