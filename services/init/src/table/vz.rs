@@ -139,7 +139,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
 /// `ramfs::BUSYBOX_DIALOG_TABLE` on QEMU.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     CONSOLE,
-    super::ramfs::TABLE[0],
+    super::ramfs::RAM_CLOCKED,
     super::ramfs::BUSYBOX_DIALOG_TABLE[2],
     super::ramfs::BUSYBOX_DIALOG_TABLE[3],
     super::ramfs::BUSYBOX_DIALOG_TABLE[4],
@@ -167,7 +167,7 @@ pub const POSIX_TTY_TABLE: &[Record] = &[
 /// `ramfs::POSIX_DIALOG_TABLE` on QEMU.
 pub const POSIX_DIALOG_TABLE: &[Record] = &[
     CONSOLE,
-    super::ramfs::TABLE[0],
+    super::ramfs::RAM_CLOCKED,
     super::ramfs::POSIX_ABI_TABLE[1],
     super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::POSIX_DIALOG_TABLE[4],
@@ -195,7 +195,7 @@ pub const RTBENCH_TABLE: &[Record] = &[
 /// Virtio console's driver for the console.
 pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     CONSOLE,
-    super::ramfs::TABLE[0],
+    super::ramfs::RAM_CLOCKED,
     super::ramfs::RTBENCH_POOL,
     super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::PIPE,
