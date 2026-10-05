@@ -10,6 +10,7 @@ mod out;
 #[path = "../../lib/posix-abi/src/relibc/lifetime.rs"]
 mod owner_lifetime;
 
+mod coverage;
 mod disasm;
 mod entropy;
 mod image;
@@ -1132,6 +1133,7 @@ commands:
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
+  coverage  compare POSIX.1-2024 XSH names with relibc and the POSIX startup archive
   os-test [--jobs N] run os-test's io, malloc, process, signal and basic spawn,
             exec and fork tests on relibc, a boot a suite with the tests started from
             files, N boots at a time;
@@ -1211,6 +1213,7 @@ fn main() {
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
         Some("layer-names") => layer_c_names(),
+        Some("coverage") => coverage::run(&args[1..]),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-files") => posix_files_probe(),
         Some("ramfs-cleanup") => ramfs_cleanup_probe(),
