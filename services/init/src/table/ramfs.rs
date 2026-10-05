@@ -18,10 +18,10 @@ const RAM_BASE: Record = Record {
     }),
     priority: 40,
     ceiling: 40,
-    // 4096 data pages + 910 metadata/PT_LOAD data pages + 9 rodata
+    // 4096 data pages + 914 metadata/PT_LOAD data pages + 9 rodata
     // and 33 code pages + 12 stack + 128 allowance before runtime allocations.
     // The measured VERSION12 Data steps ELF requires these mapped page counts.
-    quota: (4096 + 910 + 9 + 33 + 12 + 128) * PAGE,
+    quota: (4096 + 914 + 9 + 33 + 12 + 128) * PAGE,
     handle_limit: 512,
     restart: Restart::Never,
     console: true,
