@@ -25,7 +25,7 @@ const OWNER: Identity = Identity {
     groups: Groups::EMPTY,
 };
 fn writable_root(now: u64) -> Ram<'static> {
-    let mut ram = Ram::new(now);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(now));
     ram.storage.node_mut(ROOT).unwrap().mode = 0o777;
     ram
 }
@@ -91,7 +91,7 @@ fn commit(
         charge,
         Some(proof),
         identity,
-        now,
+        proto_fs::Timestamp::legacy_ns(now),
     )
 }
 fn finish(ram: &mut Ram<'_>, journal: &mut CreateJournal, r: Resolve, charge: &mut u16) {
@@ -113,7 +113,13 @@ fn read(ram: &mut Ram<'_>, path: &[u8], requested: usize, now: u64) -> (ReadLink
     let p = r
         .namespace_proof(&ram.storage, OWNER, NamespacePath::ReadLink)
         .unwrap();
-    j.capture(&mut ram.storage, Some(p), OWNER, now).unwrap();
+    j.capture(
+        &mut ram.storage,
+        Some(p),
+        OWNER,
+        proto_fs::Timestamp::legacy_ns(now),
+    )
+    .unwrap();
     (j, r)
 }
 
@@ -138,10 +144,13 @@ fn mkdir_reuses_paid_reservation_umask_gid_and_checked_parent_nlink() {
     let node = ram.storage.node(token).unwrap();
     assert_eq!(
         (node.mode, node.uid, node.gid, node.links, node.times),
-        (0o2750, 37, 99, 2, [22; 3])
+        (0o2750, 37, 99, 2, [proto_fs::Timestamp::legacy_ns(22); 3])
     );
     assert_eq!(ram.storage.node(parent).unwrap().links, 3);
-    assert_eq!(ram.storage.node(parent).unwrap().times[1..], [22; 2]);
+    assert_eq!(
+        ram.storage.node(parent).unwrap().times[1..],
+        [proto_fs::Timestamp::legacy_ns(22); 2]
+    );
     let epoch = ram.storage.state.epoch;
     assert_eq!(
         j.commit(
@@ -150,12 +159,15 @@ fn mkdir_reuses_paid_reservation_umask_gid_and_checked_parent_nlink() {
             &mut charge,
             None,
             Identity { uid: 55, ..OWNER },
-            99
+            proto_fs::Timestamp::legacy_ns(99)
         ),
         Ok(NamespaceOutcome::Applied)
     );
     assert_eq!(ram.storage.state.epoch, epoch);
-    assert_eq!(ram.storage.node(token).unwrap().times, [22; 3]);
+    assert_eq!(
+        ram.storage.node(token).unwrap().times,
+        [proto_fs::Timestamp::legacy_ns(22); 3]
+    );
     finish(&mut ram, &mut j, r, &mut charge);
     assert_eq!(ram.storage.preparations_used(), 0);
 }
@@ -250,21 +262,43 @@ fn readlink_short_zero_and_cached_bytes_preserve_one_atime_and_no_offset() {
     ram.storage.write(link, ROOT_ACCOUNT, 0, b"abcdef").unwrap();
     let (mut short, r) = read(&mut ram, b"/symbol", 3, 10);
     assert_eq!(short.result(), Some(b"abc".as_slice()));
-    assert_eq!(ram.storage.node(link).unwrap().times[0], 10);
+    assert_eq!(
+        ram.storage.node(link).unwrap().times[0],
+        proto_fs::Timestamp::legacy_ns(10)
+    );
     ram.storage.write(link, ROOT_ACCOUNT, 0, b"XXXXXX").unwrap();
     assert_eq!(
-        short.capture(&mut ram.storage, None, Identity { uid: 8, ..OWNER }, 99),
+        short.capture(
+            &mut ram.storage,
+            None,
+            Identity { uid: 8, ..OWNER },
+            proto_fs::Timestamp::legacy_ns(99)
+        ),
         Ok(3)
     );
     assert_eq!(short.result(), Some(b"abc".as_slice()));
-    assert_eq!(ram.storage.node(link).unwrap().times[0], 10);
+    assert_eq!(
+        ram.storage.node(link).unwrap().times[0],
+        proto_fs::Timestamp::legacy_ns(10)
+    );
     short.cancel_step(&mut ram.storage).unwrap();
     r.release(&mut ram.storage);
-    assert_eq!(short.capture(&mut ram.storage, None, OWNER, 77), Ok(3));
+    assert_eq!(
+        short.capture(
+            &mut ram.storage,
+            None,
+            OWNER,
+            proto_fs::Timestamp::legacy_ns(77)
+        ),
+        Ok(3)
+    );
     assert_eq!(short.result(), Some(b"abc".as_slice()));
     let (mut zero, r) = read(&mut ram, b"/symbol", 0, 55);
     assert_eq!(zero.result(), Some(b"".as_slice()));
-    assert_eq!(ram.storage.node(link).unwrap().times[0], 55);
+    assert_eq!(
+        ram.storage.node(link).unwrap().times[0],
+        proto_fs::Timestamp::legacy_ns(55)
+    );
     zero.cancel_step(&mut ram.storage).unwrap();
     r.release(&mut ram.storage);
     let (mut full, r) = read(&mut ram, b"/symbol", usize::MAX, 66);
@@ -287,7 +321,12 @@ fn readlink_pin_and_role_refusals_preserve_atime_bytes_and_pins() {
         .namespace_proof(&ram.storage, OWNER, NamespacePath::ReadLink)
         .unwrap();
     assert_eq!(
-        j.capture(&mut ram.storage, Some(p), OWNER, 88),
+        j.capture(
+            &mut ram.storage,
+            Some(p),
+            OWNER,
+            proto_fs::Timestamp::legacy_ns(88)
+        ),
         Err(NO_SPACE)
     );
     assert_eq!(ram.storage.node(link).unwrap().times, before);
@@ -297,7 +336,12 @@ fn readlink_pin_and_role_refusals_preserve_atime_bytes_and_pins() {
         .namespace_proof(&ram.storage, OWNER, NamespacePath::ReadLink)
         .unwrap();
     assert_eq!(
-        j.capture(&mut ram.storage, Some(p), Identity { uid: 88, ..OWNER }, 88),
+        j.capture(
+            &mut ram.storage,
+            Some(p),
+            Identity { uid: 88, ..OWNER },
+            proto_fs::Timestamp::legacy_ns(88)
+        ),
         Err(STALE_PROOF)
     );
     assert_eq!(ram.storage.node(link).unwrap().times, before);
@@ -308,7 +352,12 @@ fn readlink_pin_and_role_refusals_preserve_atime_bytes_and_pins() {
         .namespace_proof(&ram.storage, OWNER, NamespacePath::ReadLink)
         .unwrap();
     assert_eq!(
-        j.capture(&mut ram.storage, Some(p), OWNER, 88),
+        j.capture(
+            &mut ram.storage,
+            Some(p),
+            OWNER,
+            proto_fs::Timestamp::legacy_ns(88)
+        ),
         Err(proto_fs::INVALID_ARGUMENT)
     );
     r.release(&mut ram.storage);

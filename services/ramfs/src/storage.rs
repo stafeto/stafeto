@@ -101,7 +101,7 @@ pub struct Node {
     pub data_generation: u64,
     /// Shrinking never makes truncated boot bytes visible after a later extension.
     pub boot_visible_length: u64,
-    pub times: [u64; 3],
+    pub times: [proto_fs::Timestamp; 3],
     pub pins: [u16; 5],
     /// The boot entry (canonical for regular hard links), or NONE for fixed nodes.
     pub boot: u16,
@@ -121,7 +121,7 @@ impl Node {
         length: 0,
         data_generation: 0,
         boot_visible_length: 0,
-        times: [0; 3],
+        times: [proto_fs::Timestamp::ZERO; 3],
         pins: [0; 5],
         boot: NONE,
         overlay: NONE,
@@ -510,7 +510,7 @@ impl Storage<'_> {
         &mut self,
         data: &mut DataWrite,
         bytes: &[u8],
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<(), u32> {
         if data.committed {
             return Ok(());
@@ -655,7 +655,7 @@ impl Storage<'_> {
     pub(crate) fn commit_data_truncate(
         &mut self,
         data: &mut DataTruncate,
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<(), u32> {
         if data.committed {
             return Ok(());
@@ -735,7 +735,12 @@ impl Storage<'_> {
     }
 }
 impl<'a> Storage<'a> {
-    pub fn new(state: &'a mut State, data: &'a mut [u8], tree: Option<Tree<'a>>, now: u64) -> Self {
+    pub fn new(
+        state: &'a mut State,
+        data: &'a mut [u8],
+        tree: Option<Tree<'a>>,
+        now: proto_fs::Timestamp,
+    ) -> Self {
         assert_eq!(data.len(), PAGES * PAGE);
         for (i, free) in state.inode_free.iter_mut().enumerate() {
             *free = (INODES - i - 1) as u16;
@@ -1497,7 +1502,7 @@ impl<'a> Storage<'a> {
     }
     /// All fallible preflight precedes the single detachment of a live file's data.
     /// The admitted caller owns the Open/Truncate journal and exact authority proof.
-    pub fn truncate_zero(&mut self, token: Token, now: u64) -> Result<(), u32> {
+    pub fn truncate_zero(&mut self, token: Token, now: proto_fs::Timestamp) -> Result<(), u32> {
         let node = self.node(token)?;
         if node.kind != crate::REG {
             return Err(proto_fs::INVALID_ARGUMENT);
@@ -1663,7 +1668,7 @@ mod page_tests {
         }]);
         let mut index = crate::tree::Index::new();
         let tree = crate::tree::load(&image, &mut index).unwrap();
-        let mut ram = crate::Ram::with_tree(0, tree);
+        let mut ram = crate::Ram::with_tree(proto_fs::Timestamp::legacy_ns(0), tree);
         let storage = &mut ram.storage;
         let directory = storage
             .reserve(FIRST, ROOT, b"directory", (crate::DIR, 0o755, 0, 0))
@@ -1756,7 +1761,7 @@ mod page_tests {
 
     #[test]
     fn reused_overlay_is_initialized_before_reserved_inode_publication() {
-        let mut ram = crate::Ram::new(0);
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::legacy_ns(0));
         let storage = &mut ram.storage;
         let old = create(storage, b"old");
         storage.write(old, FIRST, PAGE + 5, b"old bytes").unwrap();
@@ -1814,7 +1819,7 @@ mod page_tests {
         }]);
         let mut index = crate::tree::Index::new();
         let tree = crate::tree::load(&image, &mut index).unwrap();
-        let mut ram = crate::Ram::with_tree(0, tree);
+        let mut ram = crate::Ram::with_tree(proto_fs::Timestamp::legacy_ns(0), tree);
         let storage = &mut ram.storage;
         storage.data.fill(0xa5);
         let dirty = create(storage, b"dirty");

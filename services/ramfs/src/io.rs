@@ -205,7 +205,7 @@ impl WritePreparation {
             .map_or(Ok(true), |data| ram.storage.step_data_write(data))
     }
 
-    pub fn commit(&mut self, ram: &mut Ram<'_>, now: u64) -> Result<usize, u32> {
+    pub fn commit(&mut self, ram: &mut Ram<'_>, now: proto_fs::Timestamp) -> Result<usize, u32> {
         if let Some(result) = self.result {
             return Ok(result);
         }
@@ -253,7 +253,7 @@ impl TruncatePreparation {
         ram.storage.step_data_truncate(&mut self.data)
     }
 
-    pub fn commit(&mut self, ram: &mut Ram<'_>, now: u64) -> Result<u64, u32> {
+    pub fn commit(&mut self, ram: &mut Ram<'_>, now: proto_fs::Timestamp) -> Result<u64, u32> {
         if let Some(result) = self.result {
             return Ok(result);
         }
