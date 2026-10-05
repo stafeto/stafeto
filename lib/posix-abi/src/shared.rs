@@ -315,21 +315,38 @@ enum Opened {
 
 /// Open: the path resolved under the lock, the service's open outside it,
 /// then the descriptor under it again.
-fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
+fn open(path: &[u8], flags: i32, mode: u32, umask: u32) -> Result<u64, i32> {
     if flags
-        & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY | O_NONBLOCK)
+        & !(O_ACCMODE
+            | O_DIRECTORY
+            | O_CLOEXEC
+            | O_CLOFORK
+            | O_CHANGES
+            | O_NOCTTY
+            | O_NONBLOCK
+            | O_CREAT
+            | O_EXCL
+            | O_TRUNC
+            | O_APPEND
+            | O_NOFOLLOW)
         != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
         return Err(EINVAL);
     }
-    let mut directory = if flags & O_DIRECTORY != 0 {
-        posix_fs::DIRECTORY_ONLY
-    } else {
-        0
-    };
-    if flags & O_CHANGES != 0 {
-        directory |= posix_fs::CHANGES;
+    let mut policy = (flags & O_ACCMODE) as u32;
+    for (local, backend) in [
+        (O_DIRECTORY, posix_fs::DIRECTORY_ONLY),
+        (O_CHANGES, posix_fs::CHANGES),
+        (O_CREAT, posix_fs::CREATE),
+        (O_EXCL, posix_fs::EXCLUSIVE),
+        (O_TRUNC, posix_fs::TRUNCATE),
+        (O_APPEND, posix_fs::APPEND),
+        (O_NOFOLLOW, posix_fs::NO_FOLLOW),
+    ] {
+        if flags & local != 0 {
+            policy |= backend;
+        }
     }
     let (transport, opened) = resolved(path, |transport, path| {
         if path.trailing_slash
@@ -358,9 +375,9 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
         let fd = crate::open_driver::open(
             transport,
             path.as_bytes(),
-            (flags & O_ACCMODE) as u32 | directory,
-            0,
-            0,
+            policy,
+            mode,
+            umask,
             crate::descriptor_flags(flags),
         )?;
         Ok((transport, Opened::Resident(fd)))
@@ -396,7 +413,12 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
 fn number_operation(request: Request<'_>) -> Result<u64, i32> {
     use Request::*;
     match request {
-        Open { path, flags } => open(path, flags as i32),
+        Open {
+            path,
+            flags,
+            mode,
+            umask,
+        } => open(path, flags as i32, mode, umask),
         Write { fd, bytes } => held(fd, |transport, target| {
             // A file or the console takes at most one message of it.
             let extent = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];

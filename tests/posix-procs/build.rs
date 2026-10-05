@@ -16,6 +16,7 @@ fn run(cmd: &mut Command) {
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=files.c");
+    println!("cargo:rerun-if-changed=open-policy.c");
     println!("cargo:rerun-if-changed=pending-open.c");
     println!("cargo:rerun-if-changed=pending-fork.c");
     println!("cargo:rerun-if-changed=cleanup.c");

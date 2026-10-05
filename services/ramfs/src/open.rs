@@ -563,3 +563,51 @@ mod tests {
         assert_eq!(ram.storage.preparations_used(), 0);
     }
 }
+
+#[cfg(test)]
+mod create_directory_policy_tests {
+    use super::*;
+    use crate::storage::{ROOT, Root};
+    #[test]
+    fn read_only_create_directory_refuses_before_descriptor_charge() {
+        let mut ram = Ram::new(0);
+        let mut fds = Fds {
+            root: Root {
+                id: 700,
+                generation: 1,
+            },
+            ..Fds::default()
+        };
+        let identity = Identity {
+            uid: 0,
+            gid: 0,
+            groups: proto_process::Groups::EMPTY,
+        };
+        assert!(matches!(
+            ram.prepare_open_token(&mut fds, ROOT, proto_fs::CREATE, identity, None),
+            Err(proto_fs::IS_DIRECTORY)
+        ));
+        assert!(fds.slots.iter().all(Option::is_none));
+        let held = ram
+            .prepare_open_token(
+                &mut fds,
+                ROOT,
+                proto_fs::CREATE | proto_fs::DIRECTORY_ONLY,
+                identity,
+                None,
+            )
+            .unwrap();
+        ram.cancel_open(&mut fds, held).unwrap();
+        assert!(fds.slots.iter().all(Option::is_none));
+        assert!(matches!(
+            ram.prepare_open_token(
+                &mut fds,
+                ROOT,
+                proto_fs::CREATE | proto_fs::EXCLUSIVE,
+                identity,
+                None
+            ),
+            Err(proto_fs::ALREADY_EXISTS)
+        ));
+    }
+}
