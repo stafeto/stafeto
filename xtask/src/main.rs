@@ -1101,6 +1101,7 @@ commands:
   ramfs-cleanup verify unfinished binding cleanup with a foreign holder
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
+  posix-data-steps measure paid data cleanup and full mapping dispatches
   posix-files-loss verify native refused Open replies with a live sibling
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
@@ -1221,6 +1222,7 @@ fn main() {
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-files-loss") => posix_files_loss(),
+        Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -2923,6 +2925,10 @@ fn posix_files_probe() -> Result<(), String> {
 }
 
 fn posix_files_run(measured: bool) -> Result<(), String> {
+    posix_files_run_profile(measured, false)
+}
+
+fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     const MEASURED: [ImageProgram; 5] = {
@@ -2930,12 +2936,23 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
         programs[1].3 = &["steps"];
         programs
     };
-    let programs = if measured {
+    const DATA: [ImageProgram; 5] = {
+        let mut programs = POSIX_FILES_PROGRAMS;
+        programs[0].3 = &["table-posix-files", "data-carrier-probe"];
+        programs[1].3 = &["steps", "auth-probe"];
+        programs[4].3 = &["auth-probe"];
+        programs
+    };
+    let programs = if data {
+        &DATA
+    } else if measured {
         &MEASURED
     } else {
         &POSIX_FILES_PROGRAMS
     };
-    let name = if measured {
+    let name = if data {
+        "boot-posix-data-steps.img"
+    } else if measured {
         "boot-posix-files-steps.img"
     } else {
         "boot-posix-files.img"
@@ -2952,7 +2969,12 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
     if measured {
         let steps = longest_steps(&output.lines, "2");
-        for kind in [15, 19, 21, 25, 65] {
+        let required: &[usize] = if data {
+            &[15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 65]
+        } else {
+            &[15, 19, 21, 25, 65]
+        };
+        for &kind in required {
             if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
                 return Err(format!(
                     "RAM credential probe has no method {kind} measurement: {steps:?}"

@@ -182,10 +182,20 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
     },
 ];
 
+#[cfg(not(feature = "data-carrier-probe"))]
+const RAM_POSIX_FILES: Record = RAM_CLOCKED;
+#[cfg(feature = "data-carrier-probe")]
+const RAM_POSIX_FILES: Record = Record {
+    // The steps,auth-probe ELF maps 10 RO + 36 RX + 924 RW pages.
+    // Data pages, stack and allowance are paid separately in this fixture.
+    quota: (4096 + 970 + 12 + 128) * PAGE,
+    ..RAM_CLOCKED
+};
+
 /// The authentic identity and bounded file proof fixture, before public mutation APIs.
 #[cfg(not(any(feature = "ramfs-cleanup", feature = "loader-abort")))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
-    RAM_CLOCKED,
+    RAM_POSIX_FILES,
     POSIX_ABI_TABLE[1],
     POSIX_ABI_TABLE[2],
     Record {

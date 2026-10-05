@@ -128,6 +128,30 @@ fn full_mapping(files: &Files) -> Result<(), i32> {
         return Err(79);
     }
     cleanup(files, read.key, true).map_err(|_| 80)?;
+    // Only group zero is populated: logical2047 requires all 94 neighbor reads.
+    files
+        .seek_from(held.fd, 2047 * 4096, proto_fs::SeekFrom::Start)
+        .map_err(|_| 114)?;
+    if files.write(held.fd, b"L") != Ok(1) {
+        return Err(115);
+    }
+    let sparse = args(held, 29, DataKind::PWrite, 1, 2046 * 4096);
+    let (_, job) = files.data_start_once(sparse).map_err(|_| 116)?;
+    files.data_feed_once(job, 0, b"S").map_err(|_| 117)?;
+    if complete(files, job, sparse).map_err(|_| 118)?.result != DataResult::Bytes(1) {
+        return Err(119);
+    }
+    cleanup(files, sparse.key, true).map_err(|_| 120)?;
+    let verify = args(held, 30, DataKind::PRead, 1, 2046 * 4096);
+    let (_, job) = files.data_start_once(verify).map_err(|_| 121)?;
+    complete(files, job, verify).map_err(|_| 122)?;
+    files
+        .data_read_result_once(verify.key, 1, &mut byte)
+        .map_err(|_| 123)?;
+    if byte != *b"S" {
+        return Err(124);
+    }
+    cleanup(files, verify.key, true).map_err(|_| 125)?;
     files.close_exact(held).map_err(|_| 81)?;
     Ok(())
 }
