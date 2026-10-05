@@ -34,7 +34,7 @@ fn drain(ram: &mut Ram<'_>) -> usize {
 #[cfg(feature = "auth-probe")]
 #[test]
 fn diagnostic_gc_creation_is_paid_unpublished_and_commits_once() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
     let mut fds = Fds {
         root: FIRST,
         ..Fds::default()
@@ -71,7 +71,7 @@ fn diagnostic_gc_creation_is_paid_unpublished_and_commits_once() {
 #[cfg(feature = "auth-probe")]
 #[test]
 fn diagnostic_gc_commit_refusal_cancels_exact_reservation_once() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
     let mut fds = Fds {
         root: FIRST,
         ..Fds::default()
@@ -102,7 +102,7 @@ fn diagnostic_gc_commit_refusal_cancels_exact_reservation_once() {
 #[test]
 fn diagnostic_gc_reservation_follows_portioned_and_gone_release() {
     for gone in [false, true] {
-        let mut ram = Ram::new(0);
+        let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
         let mut fds = Fds {
             root: FIRST,
             ..Fds::default()
@@ -127,7 +127,7 @@ fn diagnostic_gc_reservation_follows_portioned_and_gone_release() {
 
 #[test]
 fn inode_and_name_shares_leave_a_second_roots_reserve() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut tokens = std::vec::Vec::new();
     for i in 0..INODE_SHARE {
         tokens.push(create(&mut ram, FIRST, format!("a{i}").as_bytes()));
@@ -188,7 +188,7 @@ fn inode_and_name_shares_leave_a_second_roots_reserve() {
 
 #[test]
 fn all_pages_are_prepaid_and_reclaimed_one_per_step_after_the_last_pin() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let a = create(&mut ram, FIRST, b"a");
     let b = create(&mut ram, FIRST, b"b");
     let c = create(&mut ram, SECOND, b"c");
@@ -233,7 +233,7 @@ fn all_pages_are_prepaid_and_reclaimed_one_per_step_after_the_last_pin() {
 
 #[test]
 fn reservation_cancellation_lost_reply_and_each_pin_keep_accounting() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let r = ram
         .storage
         .reserve(FIRST, ROOT, b"unaccepted", (REG, 0o644, 1, 2))
@@ -263,7 +263,7 @@ fn reservation_cancellation_lost_reply_and_each_pin_keep_accounting() {
 
 #[test]
 fn description_share_is_charged_to_the_retained_root_across_clone() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = [Fds::default(); 4];
     for session in &mut fds {
         session.root = FIRST;
@@ -308,7 +308,7 @@ fn sparse_original_overlay_and_boot_hardlinks_share_actual_bytes() {
     let image = crate::tree::test_image(&[entry("/a"), entry("/b")]);
     let mut index = crate::tree::Index::new();
     let tree = crate::tree::load(&image, &mut index).unwrap();
-    let mut ram = Ram::with_tree(0, tree);
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::legacy_ns(0), tree);
     let a = ram.storage.resolve(b"/a").unwrap();
     let b = ram.storage.resolve(b"/b").unwrap();
     assert_eq!(a, b);
@@ -330,7 +330,7 @@ fn sparse_original_overlay_and_boot_hardlinks_share_actual_bytes() {
 
 #[test]
 fn gone_sessions_cancel_paid_preparations_and_leave_the_other_roots_reserve() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut sessions = [Fds::default(); 8];
     for (i, s) in sessions.iter_mut().enumerate() {
         s.root = if i < 6 { FIRST } else { SECOND };
@@ -395,7 +395,7 @@ fn gone_sessions_cancel_paid_preparations_and_leave_the_other_roots_reserve() {
 
 #[test]
 fn live_descriptions_cwd_and_generation_use_the_services_actual_backend() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let old = create(&mut ram, FIRST, b"live");
     let mut fds = Fds {
         root: FIRST,
@@ -447,7 +447,7 @@ fn boot_copy_preserves_unaligned_offsets_destinations_and_short_tails() {
             .unwrap();
     let mut index = crate::tree::Index::new();
     let tree = crate::tree::load(&image, &mut index).unwrap();
-    let ram = Ram::with_tree(0, tree);
+    let ram = Ram::with_tree(proto_fs::Timestamp::legacy_ns(0), tree);
     let token = ram.storage.resolve(b"/copy").unwrap();
     for offset in 0..8 {
         for destination in 0..8 {
@@ -468,7 +468,7 @@ fn boot_copy_preserves_unaligned_offsets_destinations_and_short_tails() {
 
 #[test]
 fn independent_review_first_write_refusal_keeps_unmodified_boot_account() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let a = create(&mut ram, FIRST, b"fill-a");
     let b = create(&mut ram, FIRST, b"fill-b");
     for i in 0..PAGE_SHARE as usize {
@@ -500,7 +500,7 @@ fn independent_review_first_write_refusal_keeps_unmodified_boot_account() {
 
 #[test]
 fn independent_review_original_unlink_refusal_preserves_account() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let token = create(&mut ram, FIRST, b"existing");
     for i in 1..DENTRY_SHARE {
         ram.storage
@@ -526,7 +526,7 @@ fn independent_review_original_unlink_refusal_preserves_account() {
 
 #[test]
 fn independent_review_open_directory_is_an_authorized_relative_base() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let pending = ram
         .storage
         .reserve(FIRST, ROOT, b"base", (crate::DIR, 0o755, 0, 0))
@@ -550,7 +550,7 @@ fn independent_review_open_directory_is_an_authorized_relative_base() {
 
 #[test]
 fn directory_base_rejects_a_colliding_regular_description() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds::default();
     let first = ram
         .open(&mut fds, "/etc/motd", proto_fs::READ_ONLY)
@@ -568,7 +568,7 @@ fn directory_base_rejects_a_colliding_regular_description() {
 
 #[test]
 fn full_retired_page_fifo_preserves_every_inode_cleanup_credit() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut files = std::vec::Vec::new();
     for i in 0..INODES {
         let root = if i < INODE_SHARE as usize {
@@ -588,7 +588,9 @@ fn full_retired_page_fifo_preserves_every_inode_cleanup_credit() {
             (SECOND, second)
         };
         assert_eq!(ram.storage.write(token, root, 0, &[i as u8]), Ok(1));
-        ram.storage.truncate_zero(token, i as u64).unwrap();
+        ram.storage
+            .truncate_zero(token, proto_fs::Timestamp::legacy_ns(i as u64))
+            .unwrap();
     }
     assert_eq!(ram.storage.usage(FIRST).pages, PAGE_SHARE);
     assert_eq!(
@@ -596,7 +598,9 @@ fn full_retired_page_fifo_preserves_every_inode_cleanup_credit() {
         PAGES - PAGE_SHARE as usize
     );
     // Empty truncation is valid with all 4096 detached credits already occupied.
-    ram.storage.truncate_zero(first, 5000).unwrap();
+    ram.storage
+        .truncate_zero(first, proto_fs::Timestamp::legacy_ns(5000))
+        .unwrap();
     assert_eq!(
         ram.storage.write(first, FIRST, 0, b"refused"),
         Err(NO_SPACE)
@@ -627,10 +631,12 @@ fn full_retired_page_fifo_preserves_every_inode_cleanup_credit() {
 
 #[test]
 fn retired_pages_never_clear_new_mappings_or_reused_overlay_slots() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let old = create(&mut ram, FIRST, b"old");
     ram.storage.write(old, FIRST, 0, b"old bytes").unwrap();
-    ram.storage.truncate_zero(old, 10).unwrap();
+    ram.storage
+        .truncate_zero(old, proto_fs::Timestamp::legacy_ns(10))
+        .unwrap();
     ram.storage.write(old, FIRST, 0, b"new bytes").unwrap();
     assert!(ram.storage.reclaim_step());
     // Reuse the freed physical page while the first logical page stays live.
@@ -639,7 +645,9 @@ fn retired_pages_never_clear_new_mappings_or_reused_overlay_slots() {
     assert_eq!(ram.storage.read(old, 0, &mut bytes), Ok(12));
     assert_eq!(&bytes[..9], b"new bytes");
     assert_eq!(&bytes[9..], &[0; 3]);
-    ram.storage.truncate_zero(old, 20).unwrap();
+    ram.storage
+        .truncate_zero(old, proto_fs::Timestamp::legacy_ns(20))
+        .unwrap();
     ram.storage.unlink(ROOT, b"old", FIRST).unwrap();
     // Inode cleanup wins this turn, while its detached pages retain their root.
     assert!(ram.storage.reclaim_step());
@@ -659,13 +667,15 @@ fn retired_pages_never_clear_new_mappings_or_reused_overlay_slots() {
 
 #[test]
 fn truncation_masks_boot_bytes_and_exhaustion_preserves_live_payload() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let motd = Token {
         slot: 3,
         generation: 1,
     };
     let original_length = ram.storage.node(motd).unwrap().length;
-    ram.storage.truncate_zero(motd, 10).unwrap();
+    ram.storage
+        .truncate_zero(motd, proto_fs::Timestamp::legacy_ns(10))
+        .unwrap();
     // The future extension publishes only its length; the retained backend mask
     // independently prevents boot bytes returning to sparse holes and new pages.
     ram.storage.node_mut(motd).unwrap().length = original_length;
@@ -686,13 +696,21 @@ fn truncation_masks_boot_bytes_and_exhaustion_preserves_live_payload() {
     ram.storage.write(token, FIRST, 0, b"kept").unwrap();
     let before = ram.storage.usage(FIRST);
     ram.storage.node_mut(token).unwrap().data_generation = u64::MAX;
-    assert_eq!(ram.storage.truncate_zero(token, 100), Err(NO_SPACE));
+    assert_eq!(
+        ram.storage
+            .truncate_zero(token, proto_fs::Timestamp::legacy_ns(100)),
+        Err(NO_SPACE)
+    );
     assert_eq!(ram.storage.node(token).unwrap().length, 4);
     assert_eq!(ram.storage.usage(FIRST), before);
     assert!(!ram.storage.reclaim_step());
     ram.storage.node_mut(token).unwrap().data_generation = 1;
     ram.storage.state.epoch = u64::MAX;
-    assert_eq!(ram.storage.truncate_zero(token, 100), Err(NO_SPACE));
+    assert_eq!(
+        ram.storage
+            .truncate_zero(token, proto_fs::Timestamp::legacy_ns(100)),
+        Err(NO_SPACE)
+    );
     assert_eq!(ram.storage.read(token, 0, &mut bytes), Ok(4));
     assert_eq!(&bytes[..4], b"kept");
     assert_eq!(ram.storage.node(token).unwrap().data_generation, 1);
