@@ -48,6 +48,7 @@ const _: () = {
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
 const S_IFCHR: u32 = 0o020_000;
+const S_IFLNK: u32 = 0o120_000;
 const S_IFIFO: u32 = 0o010_000;
 /// Linux's dirent64 d_type.
 const DT_FIFO: u8 = 1;
@@ -58,14 +59,15 @@ const DT_REG: u8 = 8;
 const AT_FDCWD: c_int = -100;
 const AT_EMPTY_PATH: c_int = 0x1000;
 
-fn time(ns: u64) -> [i64; 2] {
-    [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64]
+fn time(time: posix_fs::Timestamp) -> [i64; 2] {
+    [time.seconds, i64::from(time.nanos)]
 }
 
 fn linux_stat(info: &NodeInfo) -> LinuxStat {
     let kind = match info.kind {
         1 => S_IFDIR,
         2 => S_IFREG,
+        5 => S_IFLNK,
         posix_fs::FIFO => S_IFIFO,
         _ => S_IFCHR,
     };
@@ -82,9 +84,9 @@ fn linux_stat(info: &NodeInfo) -> LinuxStat {
         blksize: info.block_size as i32,
         pad2: 0,
         blocks: info.blocks as i64,
-        atime: time(info.access_ns),
-        mtime: time(info.modify_ns),
-        ctime: time(info.change_ns),
+        atime: time(info.access_time),
+        mtime: time(info.modify_time),
+        ctime: time(info.change_time),
         unused: [0; 2],
     }
 }

@@ -187,15 +187,6 @@ pub struct Timespec {
     pub tv_nsec: i64,
 }
 
-impl Timespec {
-    fn from_ns(ns: u64) -> Self {
-        Self {
-            tv_sec: (ns / 1_000_000_000) as i64,
-            tv_nsec: (ns % 1_000_000_000) as i64,
-        }
-    }
-}
-
 #[repr(C)]
 pub struct Stat {
     pub st_dev: u64,
@@ -225,13 +216,19 @@ impl TryFrom<proto_fs::NodeInfo> for Stat {
     type Error = ConversionError;
 
     fn try_from(info: proto_fs::NodeInfo) -> Result<Self, Self::Error> {
-        if info.permissions & !0o7777 != 0 || info.block_size == 0 {
+        if info.permissions & !0o7777 != 0
+            || info.block_size == 0
+            || !info.access_time.valid()
+            || !info.modify_time.valid()
+            || !info.change_time.valid()
+        {
             return Err(ConversionError::Malformed);
         }
         let kind = match info.kind {
             1 => constants::S_IFDIR,
             2 => constants::S_IFREG,
             3 => constants::S_IFCHR,
+            5 => 0o120_000,
             _ => return Err(ConversionError::Malformed),
         };
         Ok(Self {
@@ -245,9 +242,18 @@ impl TryFrom<proto_fs::NodeInfo> for Stat {
             st_size: i64::try_from(info.size).map_err(|_| ConversionError::Overflow)?,
             st_blksize: i64::from(info.block_size),
             st_blocks: i64::try_from(info.blocks).map_err(|_| ConversionError::Overflow)?,
-            st_atim: Timespec::from_ns(info.access_ns),
-            st_mtim: Timespec::from_ns(info.modify_ns),
-            st_ctim: Timespec::from_ns(info.change_ns),
+            st_atim: Timespec {
+                tv_sec: info.access_time.seconds,
+                tv_nsec: i64::from(info.access_time.nanos),
+            },
+            st_mtim: Timespec {
+                tv_sec: info.modify_time.seconds,
+                tv_nsec: i64::from(info.modify_time.nanos),
+            },
+            st_ctim: Timespec {
+                tv_sec: info.change_time.seconds,
+                tv_nsec: i64::from(info.change_time.nanos),
+            },
         })
     }
 }
@@ -313,9 +319,9 @@ mod tests {
             size: i64::MAX as u64,
             block_size: u32::MAX,
             blocks: i64::MAX as u64,
-            access_ns: 1_000_000_001,
-            modify_ns: u64::MAX,
-            change_ns: 999_999_999,
+            access_time: proto_fs::Timestamp::legacy_ns(1_000_000_001),
+            modify_time: proto_fs::Timestamp::legacy_ns(u64::MAX),
+            change_time: proto_fs::Timestamp::legacy_ns(999_999_999),
         }
     }
 
@@ -351,6 +357,28 @@ mod tests {
                 tv_nsec: 999_999_999
             }
         );
+    }
+
+    #[test]
+    fn negative_file_times_and_symbolic_link_mode_survive_stat() {
+        let mut info = node();
+        info.kind = 5;
+        info.access_time = proto_fs::Timestamp::new(i64::MIN, 999_999_999).unwrap();
+        info.modify_time = proto_fs::Timestamp::from_ns(-1).unwrap();
+        info.change_time = proto_fs::Timestamp::new(i64::MAX, 0).unwrap();
+        let stat = Stat::try_from(info).unwrap();
+        assert_eq!(stat.st_mode, 0o120_000 | info.permissions);
+        assert_eq!(stat.st_atim.tv_sec, i64::MIN);
+        assert_eq!(
+            (stat.st_mtim.tv_sec, stat.st_mtim.tv_nsec),
+            (-1, 999_999_999)
+        );
+        assert_eq!(stat.st_ctim.tv_sec, i64::MAX);
+        info.access_time.nanos = 1_000_000_000;
+        assert!(matches!(
+            Stat::try_from(info),
+            Err(ConversionError::Malformed)
+        ));
     }
 
     #[test]

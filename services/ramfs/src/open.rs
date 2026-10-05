@@ -122,7 +122,7 @@ impl Journal {
         proof: Option<ResultProof<'_>>,
         identity: Identity,
         charge: &mut u16,
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<TentativeOpen, u32> {
         if let Phase::Committed { held, .. } = self.phase {
             ram.validate_tentative(fds, held)?;
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn created_commit_is_cached_after_epoch_change_and_cancel_is_terminal() {
-        let mut ram = Ram::new(0);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
         let mut fds = fds();
         let flags = proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_WRITE;
         let resolver = ready(&mut ram, b"/created", flags);
@@ -351,7 +351,7 @@ mod tests {
             some,
             OWNER,
             &mut charge,
-            11,
+            proto_fs::Timestamp::legacy_ns(11),
         )
         .unwrap();
         assert!(
@@ -361,11 +361,24 @@ mod tests {
         );
         let token = ram.storage.lookup(ROOT, b"created").unwrap();
         assert_eq!(ram.storage.node(token).unwrap().mode, 0);
-        assert_eq!(ram.storage.node(token).unwrap().times, [11; 3]);
-        assert_eq!(ram.storage.node(ROOT).unwrap().times[1..], [11; 2]);
+        assert_eq!(
+            ram.storage.node(token).unwrap().times,
+            [proto_fs::Timestamp::legacy_ns(11); 3]
+        );
+        assert_eq!(
+            ram.storage.node(ROOT).unwrap().times[1..],
+            [proto_fs::Timestamp::legacy_ns(11); 2]
+        );
         assert_eq!(
             journal
-                .commit(&mut ram, &mut fds, None, OWNER, &mut charge, 12)
+                .commit(
+                    &mut ram,
+                    &mut fds,
+                    None,
+                    OWNER,
+                    &mut charge,
+                    proto_fs::Timestamp::legacy_ns(12)
+                )
                 .unwrap(),
             held
         );
@@ -378,7 +391,14 @@ mod tests {
             Ok(Effect::Created)
         );
         assert_eq!(
-            journal.commit(&mut ram, &mut fds, None, OWNER, &mut charge, 13),
+            journal.commit(
+                &mut ram,
+                &mut fds,
+                None,
+                OWNER,
+                &mut charge,
+                proto_fs::Timestamp::legacy_ns(13)
+            ),
             Err(proto_fs::STALE_PROOF)
         );
         assert_eq!(
@@ -401,7 +421,7 @@ mod tests {
 
     #[test]
     fn truncation_commit_revalidates_access_and_replay_preserves_new_bytes() {
-        let mut ram = Ram::new(0);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
         let mut fds = fds();
         let token = create(&mut ram, b"truncate");
         ram.storage.write(token, ROOT_ACCOUNT, 0, b"old").unwrap();
@@ -436,7 +456,7 @@ mod tests {
                 some,
                 denied,
                 &mut charge,
-                20
+                proto_fs::Timestamp::legacy_ns(20)
             ),
             Err(proto_fs::ACCESS_DENIED)
         );
@@ -450,13 +470,20 @@ mod tests {
             some,
             OWNER,
             &mut charge,
-            21,
+            proto_fs::Timestamp::legacy_ns(21),
         )
         .unwrap();
         assert_eq!(ram.storage.node(token).unwrap().mode, 0o600);
         ram.storage.write(token, ROOT_ACCOUNT, 0, b"new").unwrap();
         assert_eq!(
-            journal.commit(&mut ram, &mut fds, None, OWNER, &mut charge, 22),
+            journal.commit(
+                &mut ram,
+                &mut fds,
+                None,
+                OWNER,
+                &mut charge,
+                proto_fs::Timestamp::legacy_ns(22)
+            ),
             Ok(held)
         );
         let mut bytes = [0; 3];
@@ -473,7 +500,7 @@ mod tests {
 
     #[test]
     fn reserved_edge_and_every_unpublished_phase_keep_one_charge_at_full_pool() {
-        let mut ram = Ram::new(0);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
         let mut fds = fds();
         let mut charges = [NONE; crate::storage::PREPARATIONS];
         for (i, charge) in charges.iter_mut().enumerate() {
@@ -526,7 +553,14 @@ mod tests {
                     trailing_slash: false,
                 };
                 assert_eq!(
-                    journal.commit(&mut ram, &mut fds, Some(wrong), OWNER, &mut charges[0], 30),
+                    journal.commit(
+                        &mut ram,
+                        &mut fds,
+                        Some(wrong),
+                        OWNER,
+                        &mut charges[0],
+                        proto_fs::Timestamp::legacy_ns(30)
+                    ),
                     Err(proto_fs::STALE_PROOF)
                 );
             }

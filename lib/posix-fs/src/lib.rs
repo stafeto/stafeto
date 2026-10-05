@@ -16,7 +16,7 @@ use posix_fd::{Error as DescriptorError, Table};
 use posix_path::{MAX_PATH, PathError, PathState};
 pub use proto_fs::{
     APPEND, CHANGES, CREATE, DIRECTORY_ONLY, EXCLUSIVE, MAX_READ, NO_FOLLOW, NodeInfo, SeekFrom,
-    TRUNCATE,
+    TRUNCATE, Timestamp,
 };
 use proto_wire::Status;
 use rt::Handle;
@@ -309,9 +309,9 @@ const CONSOLE_INFO: NodeInfo = NodeInfo {
     size: 0,
     block_size: 1024,
     blocks: 0,
-    access_ns: 0,
-    modify_ns: 0,
-    change_ns: 0,
+    access_time: proto_fs::Timestamp::ZERO,
+    modify_time: proto_fs::Timestamp::ZERO,
+    change_time: proto_fs::Timestamp::ZERO,
 };
 
 impl Transport {

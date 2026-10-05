@@ -361,7 +361,7 @@ impl Preparation {
         &mut self,
         storage: &mut Storage<'_>,
         identity: Identity,
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<NamespaceOutcome, u32> {
         if let Some(outcome) = self.outcome {
             return Ok(outcome);
@@ -778,7 +778,7 @@ fn model_edge<'a>(
 fn model_finish(storage: &mut Storage<'_>, mut prep: Preparation, charge: u16) -> Result<(), u32> {
     let result = (|| {
         while !prep.step(storage, model_identity())? {}
-        match prep.commit(storage, model_identity(), 0)? {
+        match prep.commit(storage, model_identity(), proto_fs::Timestamp::legacy_ns(0))? {
             NamespaceOutcome::Failed(code) => Err(code),
             _ => Ok(()),
         }
