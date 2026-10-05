@@ -180,7 +180,11 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
                     if reply.len != 8 || reply.words[0] != 0 || !reply.handles.is_empty() {
                         return Err(Status::BadSize);
                     }
-                    if load_image(&loader) != Err(Status::from_code(proto_loader::IO)) {
+                    let outcome = load_image(&loader);
+                    if outcome != Err(Status::from_code(proto_loader::IO)) {
+                        rt::println!(
+                            "posix-files: malformed image metadata {loaded} unexpected Go {outcome:?}"
+                        );
                         return Err(Status::BadSize);
                     }
                     let sys::Received::Notification {
@@ -196,6 +200,10 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
                     let received = (bits >> 24) & 0xffff;
                     let after = (bits >> 40) & 0xffff;
                     let caps = bits >> 56;
+                    rt::println!(
+                        "posix-files: image metadata {loaded} handles={caps} live={before}->{received}->{after} flags={} refused before Ready",
+                        bits & 0xff
+                    );
                     if bits & 0xff != 0x87
                         || before != after
                         || received != before + caps
@@ -203,9 +211,6 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
                     {
                         return Err(Status::BadSize);
                     }
-                    rt::println!(
-                        "posix-files: image metadata {loaded} handles={caps} live={before}->{received}->{after} refused before Ready"
-                    );
                 }
                 #[cfg(not(feature = "image-info-probe"))]
                 load_image(&loader)?;
