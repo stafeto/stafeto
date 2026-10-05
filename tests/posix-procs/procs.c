@@ -3506,7 +3506,8 @@ static void null_device(void) {
     close(fd);
     /* A file of the image beside it is no device. */
     expect("open of /bin/data with O_TRUNC", open("/bin/data", O_WRONLY | O_TRUNC) == -1 ? errno : 0, EINVAL);
-    expect("open of /bin/data for writing", open("/bin/data", O_WRONLY) == -1 ? errno : 0, EACCES);
+    /* Boot regular files retain the staged read-only guard until writable image integration. */
+    expect("open of /bin/data for writing", open("/bin/data", O_WRONLY) == -1 ? errno : 0, EROFS);
     if (failures == 0) printf("posix-procs: /dev/null drops 1 MiB\n");
 }
 
