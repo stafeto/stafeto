@@ -16,6 +16,12 @@ pub(crate) struct Held {
     capacity: u64,
 }
 
+impl Held {
+    pub(crate) fn description(&self) -> Token {
+        self.description
+    }
+}
+
 /// One originating job retains this exact description until explicit cleanup.
 /// The value is moved into preparation and has no implicit release.
 pub struct DataLease {
@@ -109,7 +115,7 @@ impl Ram<'_> {
         })
     }
 
-    fn io_validate(&self, held: &Held) -> Result<(), u32> {
+    pub(crate) fn io_validate(&self, held: &Held) -> Result<(), u32> {
         let shared = self.descriptions[held.description.slot as usize]
             .as_ref()
             .filter(|shared| shared.generation == held.description.generation)

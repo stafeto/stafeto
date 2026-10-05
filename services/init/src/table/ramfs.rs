@@ -18,10 +18,10 @@ const RAM_BASE: Record = Record {
     }),
     priority: 40,
     ceiling: 40,
-    // 4096 data pages + 914 metadata/PT_LOAD data pages + 9 rodata
+    // 4096 data pages + 915 metadata/PT_LOAD data pages + 9 rodata
     // and 33 code pages + 12 stack + 128 allowance before runtime allocations.
     // The measured VERSION12 Data steps ELF requires these mapped page counts.
-    quota: (4096 + 914 + 9 + 33 + 12 + 128) * PAGE,
+    quota: (4096 + 915 + 9 + 33 + 12 + 128) * PAGE,
     handle_limit: 512,
     restart: Restart::Never,
     console: true,
@@ -189,9 +189,9 @@ const RAM_POSIX_FILES: Record = RAM_CLOCKED;
     not(feature = "open-finalize-clock-probe")
 ))]
 const RAM_POSIX_FILES: Record = Record {
-    // The steps,auth-probe ELF maps 10 RO + 36 RX + 924 RW pages.
+    // The steps,auth-probe ELF maps 10 RO + 36 RX + 925 RW pages.
     // Data pages, stack and allowance are paid separately in this fixture.
-    quota: (4096 + 970 + 12 + 128) * PAGE,
+    quota: (4096 + 971 + 12 + 128) * PAGE,
     ..RAM_CLOCKED
 };
 
@@ -505,9 +505,9 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 const STEPS_QUOTA: u64 = (256 + 16) * PAGE;
 
 /// The probe and each child it spawns inherit this budget. Its 1 MiB
-/// allocator growth needs 537 transient pages: 260 live, 274 for the
+/// allocator growth needs 538 transient pages: 261 live, 274 for the
 /// memory object and 3 prepaid page tables. Retain the 16-page reserve.
-const PROCS_QUOTA: u64 = (537 + 16) * PAGE;
+const PROCS_QUOTA: u64 = (538 + 16) * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and
