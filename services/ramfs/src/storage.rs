@@ -2429,3 +2429,98 @@ mod sorted_chain_tests {
         check(storage, replacement);
     }
 }
+
+#[cfg(test)]
+mod root_sorted_review {
+    use super::*;
+    const ACCOUNT: Root = Root {
+        id: 89,
+        generation: 9,
+    };
+    fn file(storage: &mut Storage<'_>) -> Token {
+        let reservation = storage
+            .reserve(ACCOUNT, ROOT, b"root-sorted", (crate::REG, 0o600, 0, 0))
+            .unwrap();
+        storage.commit(reservation).unwrap()
+    }
+    fn chain(storage: &Storage<'_>, token: Token) {
+        let overlay = &storage.state.overlays[storage.node(token).unwrap().overlay as usize];
+        let mut physical = overlay.head;
+        for (logical, &mapped) in overlay.pages.iter().enumerate() {
+            if mapped == NONE {
+                continue;
+            }
+            assert_eq!(physical, mapped);
+            assert_eq!(
+                storage.state.page_logical[physical as usize] as usize,
+                logical
+            );
+            physical = storage.state.page_next[physical as usize];
+        }
+        assert_eq!(physical, NONE);
+        for group in 0..32 {
+            assert_eq!(
+                overlay.group_tail[group],
+                overlay.pages[group * 64..(group + 1) * 64]
+                    .iter()
+                    .rev()
+                    .find(|&&p| p != NONE)
+                    .copied()
+                    .unwrap_or(NONE)
+            );
+        }
+    }
+    #[test]
+    fn captured_predecessor_is_rejected_after_an_intervening_legacy_insert() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let storage = &mut ram.storage;
+        let token = file(storage);
+        storage.write(token, ACCOUNT, 0, b"a").unwrap();
+        let mut old = storage
+            .prepare_data_write(token, ACCOUNT, (2047 * PAGE) as u64, 1)
+            .unwrap();
+        while !storage.step_data_write(&mut old).unwrap() {}
+        storage.write(token, ACCOUNT, 2046 * PAGE, b"b").unwrap();
+        let slot = storage.node(token).unwrap().overlay as usize;
+        let maps = storage.state.overlays[slot].pages;
+        let tails = storage.state.overlays[slot].group_tail;
+        assert_eq!(
+            storage.commit_data_write(&mut old, b"x", proto_fs::Timestamp::ZERO),
+            Err(proto_fs::STALE_PROOF)
+        );
+        assert_eq!(storage.state.overlays[slot].pages, maps);
+        assert_eq!(storage.state.overlays[slot].group_tail, tails);
+        while !storage.cancel_data_write(&mut old).unwrap() {}
+        assert_eq!(storage.usage(ACCOUNT).pages, 2);
+        chain(storage, token);
+    }
+    #[test]
+    fn boundary_insertions_with_one_existing_page_keep_exact_bytes_and_chain() {
+        for existing in [62, 63, 64, 65] {
+            let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+            let storage = &mut ram.storage;
+            let token = file(storage);
+            for logical in [2047, existing, 0] {
+                storage.write(token, ACCOUNT, logical * PAGE, b"s").unwrap();
+            }
+            let offset = 64 * PAGE - 1;
+            let mut write = storage
+                .prepare_data_write(token, ACCOUNT, offset as u64, 2)
+                .unwrap();
+            while !storage.step_data_write(&mut write).unwrap() {}
+            storage
+                .commit_data_write(&mut write, b"XY", proto_fs::Timestamp::ZERO)
+                .unwrap();
+            let count = storage.usage(ACCOUNT).pages;
+            storage
+                .commit_data_write(&mut write, b"XY", proto_fs::Timestamp::ZERO)
+                .unwrap();
+            assert_eq!(storage.usage(ACCOUNT).pages, count);
+            assert!(storage.cancel_data_write(&mut write).unwrap());
+            let mut bytes = [0; 2];
+            assert_eq!(storage.read(token, offset as u64, &mut bytes), Ok(2));
+            assert_eq!(&bytes, b"XY");
+            chain(storage, token);
+        }
+    }
+}
