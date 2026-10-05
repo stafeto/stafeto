@@ -30,6 +30,7 @@ pub struct RetiredExec<P, C> {
     pub executable: Option<C>,
     ceiling: u8,
     stopped: bool,
+    cleanup_requested: bool,
 }
 impl<P, C> RetiredExec<P, C> {
     pub fn new(process: P, executable: Option<C>, ceiling: u8) -> Self {
@@ -38,19 +39,33 @@ impl<P, C> RetiredExec<P, C> {
             executable,
             ceiling,
             stopped: false,
+            cleanup_requested: false,
         }
     }
+    /// Init handoff acknowledgement or direct replacement authorizes cleanup once.
+    pub fn request_cleanup(&mut self) -> bool {
+        let first = !self.cleanup_requested;
+        self.cleanup_requested = true;
+        first
+    }
+    pub fn cleanup_requested(&self) -> bool {
+        self.cleanup_requested
+    }
+    /// An offered replacement keeps its resident offer until handoff acknowledgement.
     /// A failed Kill preserves both capabilities for the next bounded retry.
     pub fn try_stop<E>(
         &mut self,
         base: u8,
         kill: impl FnOnce(&P, u8) -> Result<(), E>,
-    ) -> Result<(), E> {
+    ) -> Result<bool, E> {
+        if !self.cleanup_requested {
+            return Ok(false);
+        }
         if !self.stopped {
             kill(&self.process, self.ceiling.min(base))?;
             self.stopped = true;
         }
-        Ok(())
+        Ok(true)
     }
     /// An exact native Exit independently confirms the old image's end.
     pub fn ended(&mut self) {
@@ -349,6 +364,7 @@ mod tests {
     fn old_image_kill_error_keeps_cap_until_retry_and_exit_confirmation() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut old = RetiredExec::new(cap(1, &log), Some(cap(2, &log)), 31);
+        assert!(old.request_cleanup());
         assert_eq!(
             old.try_stop(5, |process, level| {
                 assert_eq!((process.id, level), (1, 5));
@@ -363,7 +379,7 @@ mod tests {
                 assert_eq!((process.id, level), (1, 3));
                 Ok::<(), u32>(())
             }),
-            Ok(())
+            Ok(true)
         );
         old.try_stop(31, |_, _| -> Result<(), u32> { panic!("stopped image") })
             .unwrap();
@@ -372,6 +388,7 @@ mod tests {
         assert_eq!(&*log.borrow(), &[1, 2]);
         let mut ended = RetiredExec::new(cap(3, &log), Some(cap(4, &log)), 2);
         ended.ended();
+        assert!(ended.request_cleanup());
         ended
             .try_stop(31, |_, _| -> Result<(), u32> {
                 panic!("exact ended image")
@@ -468,5 +485,53 @@ mod tests {
         drop(t.free(5));
         assert!(!log.borrow().contains(&2));
         drop(active);
+    }
+    #[test]
+    fn old_end_before_init_handoff_preserves_offer_and_completion() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut old = RetiredExec::new(cap(1, &log), Some(cap(2, &log)), 31);
+        let offer = cap(3, &log);
+        let ready = cap(4, &log);
+        let pending = cap(5, &log);
+        let mut cleanup_count = 0_u32;
+        old.ended();
+        assert!(!old.cleanup_requested());
+        assert_eq!(cleanup_count, 0);
+        assert_eq!(
+            old.try_stop(1, |_, _| -> Result<(), u32> { panic!("no handoff") }),
+            Ok(false)
+        );
+        assert!(log.borrow().is_empty());
+        // Genuine Init handoff transfers the offered new process before cleanup.
+        drop(offer);
+        if old.request_cleanup() {
+            cleanup_count += 1;
+        }
+        assert!(!old.request_cleanup());
+        assert_eq!(cleanup_count, 1);
+        assert_eq!(
+            old.try_stop(1, |_, _| -> Result<(), u32> { panic!("old ended") }),
+            Ok(true)
+        );
+        cleanup_count -= 1;
+        drop((old, ready, pending));
+        assert_eq!(cleanup_count, 0);
+        assert_eq!(&*log.borrow(), &[3, 1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn old_end_after_init_handoff_allows_existing_cleanup_debt_to_finish() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut old = RetiredExec::new(cap(1, &log), Some(cap(2, &log)), 31);
+        assert!(old.request_cleanup());
+        assert_eq!(old.try_stop(1, |_, _| Err(7)), Err(7));
+        assert!(log.borrow().is_empty());
+        old.ended();
+        assert_eq!(
+            old.try_stop(1, |_, _| -> Result<(), u32> { panic!("exact native End") }),
+            Ok(true)
+        );
+        drop(old);
+        assert_eq!(&*log.borrow(), &[1, 2]);
     }
 }

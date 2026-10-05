@@ -86,8 +86,6 @@ struct Replacing {
     /// The old process, which the service kills once init took the new.
     old: RetiredExec<Handle<Process>, Handle<Channel>>,
     old_image: u32,
-    /// Init has accepted the replacement, or direct cleanup may proceed.
-    cleanup: bool,
     ticket: u64,
 }
 /// A walk of kill(0), kill(-pgid) or kill(-1) that waits (walk.rs): the
@@ -2200,7 +2198,6 @@ impl Processes {
             process: copy,
             old: RetiredExec::new(old, old_exec, ceiling),
             old_image,
-            cleanup: false,
             ticket,
         });
         if ticket != 0 {
@@ -2271,8 +2268,7 @@ impl Processes {
         let Some(replacing) = self.replacing[index].as_mut() else {
             return;
         };
-        if !replacing.cleanup {
-            replacing.cleanup = true;
+        if replacing.old.request_cleanup() {
             self.replace_cleanup += 1;
         }
         self.try_finish_replace(index);
@@ -2283,19 +2279,15 @@ impl Processes {
         let Some(replacing) = self.replacing[index].as_mut() else {
             return;
         };
-        if !replacing.cleanup
-            || replacing
-                .old
-                .try_stop(self.level, |old, level| {
-                    sys::process_kill_at(old, level).or_else(|error| {
-                        if sys::process_state(old).is_ok_and(|state| End::of(state).is_some()) {
-                            Ok(())
-                        } else {
-                            Err(error)
-                        }
-                    })
-                })
-                .is_err()
+        if replacing.old.try_stop(self.level, |old, level| {
+            sys::process_kill_at(old, level).or_else(|error| {
+                if sys::process_state(old).is_ok_and(|state| End::of(state).is_some()) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+        }) != Ok(true)
         {
             return;
         }
@@ -2323,7 +2315,10 @@ impl Processes {
             }
             return;
         }
-        if self.replacing[index].as_ref().is_some_and(|r| r.cleanup) {
+        if self.replacing[index]
+            .as_ref()
+            .is_some_and(|r| r.old.cleanup_requested())
+        {
             self.try_finish_replace(index);
         }
     }
@@ -3015,7 +3010,8 @@ impl Service<0> for Processes {
                     .expect("an exact old image")
                     .old
                     .ended();
-                self.finish_replace(index);
+                self.try_finish_replace(index);
+                self.kick();
                 return;
             }
             // The new process of an exec ended before ExecCommit: the place
