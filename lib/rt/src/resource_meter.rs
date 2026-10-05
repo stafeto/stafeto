@@ -156,6 +156,12 @@ impl<'a> Guard<'a> {
 
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
         METER.sample();
+        self.observed()
+    }
+
+    /// Inspect the recorded event without introducing another sampling syscall.
+    /// Native probes can check an installed resource before its next operation.
+    pub fn observed(&self) -> Result<Snapshot, Error> {
         METER.status()?;
         Ok(Snapshot {
             startup: METER.startup.load(Ordering::Relaxed),
