@@ -672,6 +672,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compact_cleanup_checks_owned_context_and_last_history_byte() {
+        let mut fs = files();
+        let (token, claim) = begin(&mut fs, DataKind::Read, 3, &[]);
+        let authority = retired(&fs, claim);
+        fs.begin_data_terminal_cleanup(token, owner(1), authority)
+            .unwrap();
+        let mut context = fs.begin_data_cleanup(token).unwrap();
+        let mint = |context: &CleanupContext| SmallCleanupProof {
+            token: context.cleanup.token,
+            last_target: context.cleanup.last_target,
+            session: context.session,
+        };
+        let mut wrong = mint(&context);
+        wrong.session ^= 1;
+        assert!(
+            fs.finish_data_cleanup_from_context(&context, wrong)
+                .is_err()
+        );
+        let mut wrong = mint(&context);
+        wrong.last_target = Some(target(44));
+        assert!(
+            fs.finish_data_cleanup_from_context(&context, wrong)
+                .is_err()
+        );
+        let last = context.cleanup.recovery.bytes.len() - 1;
+        context.cleanup.recovery.bytes[last] ^= 1;
+        assert!(
+            fs.finish_data_cleanup_from_context(&context, mint(&context))
+                .is_err()
+        );
+        context.cleanup.recovery.bytes[last] ^= 1;
+        assert_eq!(fs.data_state(token).unwrap().phase, ScalarPhase::Cleaning);
+        fs.finish_data_cleanup_from_context(&context, mint(&context))
+            .unwrap();
+        assert_eq!(
+            fs.acknowledge_data(token, owner(1), &mut []).unwrap(),
+            ScalarResult::Failed(5)
+        );
+    }
+
     fn retired(fs: &PosixFs, claim: ScalarClaimToken) -> TerminalCleanupAuthority {
         let TerminalQueryResult::Retired(authority) = fs
             .data_terminal_query_context(claim)
@@ -1159,11 +1200,28 @@ pub struct CleanupProof {
     last_target: Option<Target>,
     session: u64,
 }
+/// Compact proof is minted after the exact remote cleanup sequence completes.
+pub struct SmallCleanupProof {
+    token: ScalarToken,
+    last_target: Option<Target>,
+    session: u64,
+}
 impl CleanupContext {
     /// Cancel fences an uncertain Start; ACK retires any completed cache.
     /// CloseExact consumes only the captured description lifetime.
     #[inline(never)]
     pub fn send_once(self) -> Result<CleanupProof, FsError> {
+        self.send_small_once()?;
+        Ok(CleanupProof {
+            token: self.cleanup.token,
+            recovery: self.cleanup.recovery,
+            last_target: self.cleanup.last_target,
+            session: self.session,
+        })
+    }
+
+    #[inline(never)]
+    pub fn send_small_once(&self) -> Result<SmallCleanupProof, FsError> {
         let files = self.transport.files();
         files
             .data_cancel_once(key(self.cleanup.token))
@@ -1173,9 +1231,8 @@ impl CleanupContext {
             Err(error) => return Err(FsError::from(error)),
         }
         self.transport.release(self.cleanup.last_target)?;
-        Ok(CleanupProof {
+        Ok(SmallCleanupProof {
             token: self.cleanup.token,
-            recovery: self.cleanup.recovery,
             last_target: self.cleanup.last_target,
             session: self.session,
         })
@@ -1648,6 +1705,30 @@ impl PosixFs {
             transport: self.transport(),
         })
     }
+    pub fn finish_data_cleanup_from_context(
+        &mut self,
+        context: &CleanupContext,
+        proof: SmallCleanupProof,
+    ) -> Result<(), FsError> {
+        if proof.token != context.cleanup.token
+            || proof.last_target != context.cleanup.last_target
+            || proof.session != context.session
+        {
+            return Err(FsError::Io);
+        }
+        let view = self.descriptors.scalar_view(proof.token)?;
+        if view.phase != ScalarPhase::Cleaning
+            || view.last_target != proof.last_target
+            || view.recovery != &context.cleanup.recovery
+            || proof.session != self.sessions().0.raw().0
+        {
+            return Err(FsError::Io);
+        }
+        self.descriptors
+            .scalar_finish_cleanup(proof.token)
+            .map_err(FsError::from)
+    }
+
     pub fn finish_data_cleanup(&mut self, proof: CleanupProof) -> Result<(), FsError> {
         let snapshot = self.descriptors.scalar_view(proof.token)?;
         if snapshot.phase != ScalarPhase::Cleaning
