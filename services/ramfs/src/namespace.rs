@@ -328,7 +328,7 @@ impl Preparation {
                 for i in 0..3 {
                     if self.dentry_needed(i) && self.reserves.dentries[i].is_none() {
                         self.reserves.dentries[i] =
-                            Some(storage.namespace_reserve_dentry(self.charge)?);
+                            Some(storage.namespace_reserve_dentry(self.charge, i == 2)?);
                         return Ok(false);
                     }
                 }
@@ -541,18 +541,24 @@ impl Storage<'_> {
             Err(STALE_PROOF)
         }
     }
-    fn namespace_reserve_dentry(&mut self, charge: u16) -> Result<u16, u32> {
+    fn namespace_reserve_dentry(&mut self, charge: u16, visible: bool) -> Result<u16, u32> {
         let a = self.state.accounts[charge as usize]
             .as_ref()
             .ok_or(INVALID_ARGUMENT)?;
         if self.state.dentry_len == 0 || a.usage.dentries == DENTRY_SHARE {
             return Err(NO_SPACE);
         }
+        let cookie = if visible {
+            self.next_directory_cookie()?
+        } else {
+            0
+        };
         self.state.dentry_len -= 1;
         let i = self.state.dentry_free[self.state.dentry_len];
         self.state.dentries[i as usize] = Dentry {
             root: charge,
             reserved: true,
+            cookie,
             ..Dentry::EMPTY
         };
         self.state.accounts[charge as usize]

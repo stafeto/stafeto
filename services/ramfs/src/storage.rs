@@ -190,6 +190,7 @@ struct Dentry {
     len: u8,
     root: u16,
     reserved: bool,
+    cookie: u64,
 }
 impl Dentry {
     const EMPTY: Self = Self {
@@ -199,6 +200,7 @@ impl Dentry {
         len: 0,
         root: NONE,
         reserved: false,
+        cookie: 0,
     };
 }
 #[derive(Clone, Copy)]
@@ -236,6 +238,7 @@ pub struct State {
     pub nodes: [Node; NODES],
     originals: [Original; ORIGINALS],
     original_len: usize,
+    next_cookie: u64,
     boot_files: u64,
     boot_blocks: u64,
     overlays: [Overlay; INODES],
@@ -267,6 +270,7 @@ impl State {
             nodes: [Node::EMPTY; NODES],
             originals: [Original::EMPTY; ORIGINALS],
             original_len: 0,
+            next_cookie: (3 + ORIGINALS) as u64,
             boot_files: 0,
             boot_blocks: 0,
             overlays: [Overlay::EMPTY; INODES],
@@ -308,6 +312,7 @@ impl State {
         self.dentry_len = DENTRIES;
         self.page_len = PAGES;
         self.epoch = 1;
+        self.next_cookie = (3 + ORIGINALS) as u64;
         self.preparation_used = 0;
         self.retired.fill(RetiredPages::EMPTY);
         self.retired_head = 0;
@@ -1064,6 +1069,28 @@ impl<'a> Storage<'a> {
         (d.len != 0 && !d.reserved && d.parent == parent)
             .then_some((&d.name[..d.len as usize], d.node))
     }
+    fn next_directory_cookie(&mut self) -> Result<u64, u32> {
+        let cookie = self.state.next_cookie;
+        if cookie >= i64::MAX as u64 {
+            return Err(NO_SPACE);
+        }
+        self.state.next_cookie = cookie + 1;
+        Ok(cookie)
+    }
+    /// Stable positions belong to naming lifetimes and survive physical-row reuse.
+    pub(crate) fn directory_entry(
+        &self,
+        parent: Token,
+        index: usize,
+    ) -> Option<(u64, &[u8], Token)> {
+        let (name, token) = self.entry(parent, index)?;
+        let cookie = if index < self.state.original_len {
+            3 + index as u64
+        } else {
+            self.state.dentries[index - self.state.original_len].cookie
+        };
+        Some((cookie, name, token))
+    }
     pub fn entries(&self) -> usize {
         self.state.original_len + DENTRIES
     }
@@ -1214,6 +1241,7 @@ impl<'a> Storage<'a> {
             slot: (ORIGINALS + i) as u16,
             generation,
         };
+        let cookie = self.next_directory_cookie()?;
         self.state.inode_len -= 1;
         self.state.dentry_len -= 1;
         let d = self.state.dentry_free[self.state.dentry_len] as usize;
@@ -1237,6 +1265,7 @@ impl<'a> Storage<'a> {
             len: name.len() as u8,
             root: a as u16,
             reserved: true,
+            cookie,
             ..Dentry::EMPTY
         };
         entry.name[..name.len()].copy_from_slice(name);
@@ -1789,6 +1818,88 @@ impl Storage<'_> {
             pages.first = 0;
             pages.length = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod directory_cookie_tests {
+    use super::*;
+    const EXPENSE: Root = Root {
+        id: 11,
+        generation: 7,
+    };
+    #[test]
+    fn terminal_cookie_preserves_existing_dynamic_and_same_inode_rename() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let r = ram
+            .storage
+            .reserve(EXPENSE, ROOT, b"a", (crate::REG, 0o644, 0, 0))
+            .unwrap();
+        let token = ram.storage.commit(r).unwrap();
+        ram.storage.link(EXPENSE, ROOT, b"b", token).unwrap();
+        let cookie = ram
+            .storage
+            .state
+            .dentries
+            .iter()
+            .find(|d| d.len != 0 && &d.name[..d.len as usize] == b"a")
+            .unwrap()
+            .cookie;
+        ram.storage.state.next_cookie = i64::MAX as u64;
+        let epoch = ram.storage.state.epoch;
+        let times = ram.storage.node(token).unwrap().times;
+        crate::directory_tests::rename(&mut ram, b"/a", b"/b");
+        assert_eq!(ram.storage.state.epoch, epoch);
+        assert_eq!(ram.storage.node(token).unwrap().times, times);
+        crate::directory_tests::rename(&mut ram, b"/a", b"/c");
+        assert_eq!(ram.storage.lookup(ROOT, b"c"), Ok(token));
+        let current = ram
+            .storage
+            .state
+            .dentries
+            .iter()
+            .find(|d| d.len != 0 && &d.name[..d.len as usize] == b"c")
+            .unwrap()
+            .cookie;
+        assert_eq!(current, cookie);
+        assert_eq!(ram.storage.state.next_cookie, i64::MAX as u64);
+        assert_eq!(ram.storage.link(EXPENSE, ROOT, b"d", token), Err(NO_SPACE));
+        assert_eq!(ram.storage.node(token).unwrap().links, 2);
+        ram.storage.unlink(ROOT, b"c", EXPENSE).unwrap();
+        ram.storage.unlink(ROOT, b"b", EXPENSE).unwrap();
+        while ram.storage.reclaim_step() {}
+        assert_eq!(ram.storage.usage(EXPENSE), Usage::EMPTY);
+    }
+    #[test]
+    fn cookie_max_last_issued_reservation_cleanup_needs_no_new_cookie() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        ram.storage.state.next_cookie = i64::MAX as u64 - 1;
+        let reserved = ram
+            .storage
+            .reserve(EXPENSE, ROOT, b"last", (crate::REG, 0o644, 0, 0))
+            .unwrap();
+        assert_eq!(
+            ram.storage.state.dentries[reserved.dentry as usize].cookie,
+            i64::MAX as u64 - 1
+        );
+        assert_eq!(ram.storage.state.next_cookie, i64::MAX as u64);
+        let before = ram.storage.available();
+        let usage = ram.storage.usage(EXPENSE);
+        let pins = ram.storage.node(ROOT).unwrap().pins;
+        let epoch = ram.storage.state.epoch;
+        assert_eq!(
+            ram.storage
+                .reserve(EXPENSE, ROOT, b"over", (crate::REG, 0o644, 0, 0)),
+            Err(NO_SPACE)
+        );
+        assert_eq!(ram.storage.available(), before);
+        assert_eq!(ram.storage.usage(EXPENSE), usage);
+        assert_eq!(ram.storage.node(ROOT).unwrap().pins, pins);
+        assert_eq!(ram.storage.state.epoch, epoch);
+        ram.storage.cancel(reserved).unwrap();
+        while ram.storage.reclaim_step() {}
+        assert_eq!(ram.storage.usage(EXPENSE), Usage::EMPTY);
+        assert_eq!(ram.storage.state.next_cookie, i64::MAX as u64);
     }
 }
 
