@@ -28,6 +28,15 @@ pub mod tree;
 
 use storage::{BOOT_ROOT, Pin, Storage, Token};
 
+/// Read the common Clone count before allocating a session or retaining references.
+pub fn clone_count(body: &mut proto_wire::Reader<'_>, handle_count: usize) -> Result<usize, u32> {
+    let count = body.u32().map_err(|_| proto_wire::BAD_SIZE)? as usize;
+    if count > OPEN_MAX || handle_count != 0 {
+        return Err(proto_wire::BAD_SIZE);
+    }
+    Ok(count)
+}
+
 use proto_fs::{
     BAD_FD, IS_DIRECTORY, Metadata, NO_ENTRY, NO_SPACE, NodeInfo, READ_ONLY, WRITE_ONLY,
 };
@@ -262,6 +271,41 @@ impl Default for Fds {
 }
 
 impl Fds {
+    fn fresh_clone_destination(&self) -> bool {
+        if self.slots.iter().any(Option::is_some)
+            || self.tentative != 0
+            || self.claimed
+            || self.binding != authority::Binding::Unbound
+            || self.authority_index != storage::NONE
+            || self.binding_preparation.is_some()
+            || self.binding_source.is_some()
+            || self.binding_outcome.is_some()
+            || self.resolvers.iter().any(|&id| id != 0)
+            || self
+                .open_watermarks
+                .iter()
+                .any(|&generation| generation != 0)
+            || self.image_hold.is_some()
+            || self.image_outcome.is_some()
+            || self
+                .open_receipts
+                .iter()
+                .any(|&receipt| receipt != OpenReceipt::EMPTY)
+            || self.root != BOOT_ROOT
+            || self.cwd.is_some()
+            || self.preparations.iter().any(Option::is_some)
+        {
+            return false;
+        }
+        #[cfg(feature = "auth-probe")]
+        if self.auth_probe_hold
+            || self.auth_probe_gc.is_some()
+            || self.auth_probe_gc_reservation.is_some()
+        {
+            return false;
+        }
+        true
+    }
     /// Binding, path jobs, and unpublished creations share one session budget.
     pub fn preparation_count(&self) -> usize {
         self.resolvers.iter().filter(|&&id| id != 0).count()
@@ -314,7 +358,7 @@ pub struct TentativeOpen {
 }
 
 /// A completed operation owns the precise description in one session slot.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct OpenReceipt {
     key: proto_fs::OpenKey,
     description: Token,
@@ -960,29 +1004,65 @@ impl<'a> Ram<'a> {
         }
     }
 
+    /// Capture a published description before importing it into a local table.
+    pub fn capture_description(&self, fds: &Fds, fd: u32) -> Result<(TentativeOpen, u32), u32> {
+        let description = self.description_token(fds, fd)?;
+        let flags = self.descriptions[description.slot as usize]
+            .as_ref()
+            .ok_or(BAD_FD)?
+            .open
+            .flags;
+        Ok((TentativeOpen { fd, description }, flags))
+    }
+
+    /// A stale exact cleanup leaves the replacement and its shared references intact.
+    pub fn close_exact_description(
+        &mut self,
+        fds: &mut Fds,
+        held: TentativeOpen,
+    ) -> Result<bool, u32> {
+        if self.description_token(fds, held.fd) != Ok(held.description) {
+            return Ok(false);
+        }
+        self.close(fds, held.fd)?;
+        Ok(true)
+    }
+
     /// Clone's descriptors: a session's of the same numbers as `list` of
     /// `fds`, which share their descriptions, offsets and access modes;
     /// BAD_FD for a number no descriptor has. O(OPEN_MAX).
     pub fn clone_fds(&mut self, fds: &Fds, list: &[u32]) -> Result<Fds, u32> {
-        let mut out = Fds {
-            root: fds.root,
-            ..Fds::default()
-        };
+        let mut out = Fds::default();
+        self.clone_fds_into(fds, list, &mut out)?;
+        Ok(out)
+    }
+
+    /// Fill a fresh destination after validating the complete descriptor list.
+    /// Errors preserve the destination and all source references.
+    #[inline(never)]
+    pub fn clone_fds_into(&mut self, fds: &Fds, list: &[u32], out: &mut Fds) -> Result<(), u32> {
+        if !out.fresh_clone_destination() {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let mut slots = [None; OPEN_MAX];
         for &fd in list {
             let index = fds.description(fd)?;
-            out.slots[(fd - 3) as usize] = Some(index as u8);
+            slots[(fd - 3) as usize] = Some(index as u8);
         }
         if let Some(cwd) = fds.cwd {
             self.storage.pin(cwd, Pin::Cwd)?;
-            out.cwd = Some(cwd);
         }
+        out.root = fds.root;
+        out.slots = slots;
+        out.cwd = fds.cwd;
+        // At most 641 session/birth records, including this child, own 32 references each.
         for index in out.slots.iter().flatten() {
             self.descriptions[usize::from(*index)]
                 .as_mut()
                 .expect("a named description")
                 .refs += 1;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// The descriptions that are open.
@@ -2262,6 +2342,8 @@ mod tests {
         assert_ne!(regular.description.slot, old.description.slot);
         assert_eq!(regular.description.generation, old.description.generation);
         assert_eq!(ram.marked_open(&fds, old), Err(BAD_FD));
+        assert_eq!(ram.close_exact_description(&mut fds, old), Ok(false));
+        assert_eq!(ram.description_token(&fds, regular.fd), Err(BAD_FD));
         assert_eq!(
             ram.marked_open(&fds, regular),
             Ok(regular.fd
@@ -2272,6 +2354,11 @@ mod tests {
             generation: 2,
         };
         ram.finish_open(&mut fds, new_key, regular).unwrap();
+        assert_eq!(
+            ram.capture_description(&fds, regular.fd),
+            Ok((regular, READ_WRITE))
+        );
+        assert_eq!(ram.close_exact_description(&mut fds, old), Ok(false));
         assert_eq!(
             ram.finished_open(&fds, old_key),
             Err(proto_fs::OPEN_RETIRED)

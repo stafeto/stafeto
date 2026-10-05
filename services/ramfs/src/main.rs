@@ -37,7 +37,7 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 32, 33, 34, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -793,15 +793,35 @@ impl Fs {
     fn clone_session(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         let mut list = [0u32; 32];
-        let count = body.u32().unwrap_or(0) as usize;
-        if count > list.len() || !r.handles.is_empty() {
+        let Ok(count) = ramfs::clone_count(&mut body, r.handles.len()) else {
             return Answer::Status(Status::BadSize);
-        }
+        };
         for fd in &mut list[..count] {
             let Ok(n) = body.u32() else {
                 return Answer::Status(Status::BadSize);
             };
-            *fd = n;
+            if r.method() == Method::CloneExact as u16 {
+                let Ok(generation) = body.u64() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if n & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+                    || !(3..35).contains(&(n & proto_fs::OPEN_FD_MASK))
+                    || generation == 0
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                *fd = n & proto_fs::OPEN_FD_MASK;
+                let expected = ramfs::storage::Token {
+                    slot: ((n & proto_fs::OPEN_DESCRIPTION_MASK)
+                        >> proto_fs::OPEN_DESCRIPTION_SHIFT) as u16,
+                    generation,
+                };
+                if self.ram.description_token(fds, *fd) != Ok(expected) {
+                    return status(proto_fs::STALE_PROOF);
+                }
+            } else {
+                *fd = n;
+            }
         }
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
@@ -812,10 +832,10 @@ impl Fs {
         if self.clones.room(r.label()).is_err() {
             return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
         }
-        let mut child = match self.ram.clone_fds(fds, &list[..count]) {
-            Ok(child) => child,
-            Err(code) => return status(code),
-        };
+        let mut child = Fds::default();
+        if let Err(code) = self.ram.clone_fds_into(fds, &list[..count], &mut child) {
+            return status(code);
+        }
         if matches!(fds.binding, Binding::Boot) {
             child.binding = Binding::Boot;
         }
@@ -1180,6 +1200,7 @@ impl Service<0> for Fs {
                 Method::from_number(r.method()),
                 Some(
                     Method::Close
+                        | Method::CloseExact
                         | Method::ResolveCancel
                         | Method::OpenCancel
                         | Method::VerifySession
@@ -1223,14 +1244,14 @@ impl Service<0> for Fs {
         }
         let cleanup = matches!(
             Method::from_number(r.method()),
-            Some(Method::Close | Method::ResolveCancel)
+            Some(Method::Close | Method::CloseExact | Method::ResolveCancel)
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
         }
         let mut body = r.body();
         match Method::from_number(r.method()) {
-            Some(Method::Clone) => self.clone_session(&s.data, r),
+            Some(Method::Clone | Method::CloneExact) => self.clone_session(&s.data, r),
             Some(
                 Method::OpenExec
                 | Method::ReadInto
@@ -1420,6 +1441,58 @@ impl Service<0> for Fs {
                 }
                 match self.ram.size(&s.data, fd) {
                     Ok(size) => value(r, size),
+                    Err(code) => status(code),
+                }
+            }
+            Some(Method::CaptureDescription) => {
+                let Ok(fd) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() || !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let (held, flags) = match self.ram.capture_description(&s.data, fd) {
+                    Ok(captured) => captured,
+                    Err(code) => return status(code),
+                };
+                let packed = match self.ram.marked_open(&s.data, held) {
+                    Ok(word) => word,
+                    Err(code) => return status(code),
+                };
+                if r.reply()
+                    .u32(0)
+                    .and_then(|()| r.reply().u32(packed))
+                    .and_then(|()| r.reply().u64(held.description.generation))
+                    .and_then(|()| r.reply().u32(flags))
+                    .is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            Some(Method::CloseExact) => {
+                let (Ok(packed), Ok(generation)) = (body.u32(), body.u64()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err()
+                    || !r.handles.is_empty()
+                    || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+                    || !(3..35).contains(&(packed & proto_fs::OPEN_FD_MASK))
+                    || generation == 0
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                let held = ramfs::TentativeOpen {
+                    fd: packed & proto_fs::OPEN_FD_MASK,
+                    description: ramfs::storage::Token {
+                        slot: ((packed & proto_fs::OPEN_DESCRIPTION_MASK)
+                            >> proto_fs::OPEN_DESCRIPTION_SHIFT)
+                            as u16,
+                        generation,
+                    },
+                };
+                match self.ram.close_exact_description(&mut s.data, held) {
+                    Ok(closed) => value(r, u32::from(!closed)),
                     Err(code) => status(code),
                 }
             }

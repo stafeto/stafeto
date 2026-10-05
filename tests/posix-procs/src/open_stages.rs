@@ -171,6 +171,36 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
             return Err(108);
         }
     }
+    reply.len = 20;
+    reply.words[0] =
+        ((proto_fs::OPEN_RANDOM | (127 << proto_fs::OPEN_DESCRIPTION_SHIFT) | 34) as u64) << 32;
+    reply.words[1] = 1;
+    reply.words[2] = proto_fs::WRITE_ONLY as u64;
+    let capture = Files::capture_description_reply(&reply).map_err(|_| 129)?;
+    if capture.held.slot != 127
+        || capture.held.fd != 34
+        || !capture.held.random
+        || capture.flags != proto_fs::WRITE_ONLY
+    {
+        return Err(130);
+    }
+    for flags in [3u32, 1 << 20] {
+        reply.words[2] = flags as u64;
+        if Files::capture_description_reply(&reply) != Err(Status::BadSize) {
+            return Err(131);
+        }
+    }
+    reply.len = 8;
+    for (outcome, expected) in [
+        (0, Ok(rt::fs::CloseOutcome::Closed)),
+        (1, Ok(rt::fs::CloseOutcome::AlreadyGone)),
+        (2, Err(Status::BadSize)),
+    ] {
+        reply.words[0] = outcome << 32;
+        if Files::close_exact_reply(&reply) != expected {
+            return Err(132);
+        }
+    }
     if active_query(files, first) != Ok((id, 0)) {
         return Err(47);
     }
@@ -300,7 +330,51 @@ fn random_marker(files: &Files) -> Result<(), i32> {
         }
     }
     let numbers = core::array::from_fn::<_, 32, _>(|slot| slot as u32 + 3);
-    let child = clone_bound(&files, &numbers).map_err(|_| 116)?;
+    let child_channel = Files::clone_exact_on(files.sessions().0, &held).map_err(|_| 116)?;
+    let child = Files::from_sessions(child_channel, None);
+    child
+        .bind(posix_abi::process::identity().ok_or(116)?)
+        .map_err(|_| 116)?;
+    let mut invalid = held;
+    invalid[31].generation += 1;
+    if Files::clone_exact_on(files.sessions().0, &invalid).err()
+        != Some(Status::Unknown(proto_fs::STALE_PROOF))
+    {
+        return Err(137);
+    }
+    let mut corrupted = proto_wire::Writer::new();
+    proto_fs::Method::CloneExact
+        .header()
+        .write(&mut corrupted)
+        .map_err(|_| 138)?;
+    corrupted
+        .u32(1)
+        .and_then(|()| corrupted.u32(held[0].marked_fd()))
+        .and_then(|()| corrupted.u64(held[0].generation))
+        .map_err(|_| 138)?;
+    let refused = rt::sys::send(files.sessions().0, corrupted.as_bytes()).map_err(|_| 138)?;
+    if refused.len != 8
+        || refused.words[0] != proto_wire::BAD_SIZE as u64
+        || !refused.handles.is_empty()
+    {
+        return Err(139);
+    }
+    for method in [proto_fs::Method::Clone, proto_fs::Method::CloneExact] {
+        let mut missing_count = proto_wire::Writer::new();
+        method.header().write(&mut missing_count).map_err(|_| 150)?;
+        let refused =
+            rt::sys::send(files.sessions().0, missing_count.as_bytes()).map_err(|_| 150)?;
+        if refused.len != 8
+            || refused.words[0] != proto_wire::BAD_SIZE as u64
+            || !refused.handles.is_empty()
+        {
+            return Err(151);
+        }
+    }
+    let capture = files.capture_description(34).map_err(|_| 133)?;
+    if capture.held != held[31] || capture.flags != proto_fs::READ_WRITE {
+        return Err(134);
+    }
     files.close(held[0].fd).map_err(|_| 117)?;
     let old = proto_fs::OpenKey {
         slot: 0,
@@ -323,10 +397,56 @@ fn random_marker(files: &Files) -> Result<(), i32> {
     {
         return Err(122);
     }
+    if files.close_exact(held[0]) != Ok(rt::fs::CloseOutcome::AlreadyGone) {
+        return Err(135);
+    }
+    if Files::clone_exact_on(files.sessions().0, &held[..1]).err()
+        != Some(Status::Unknown(proto_fs::STALE_PROOF))
+    {
+        return Err(136);
+    }
     files.open_cancel_key(old).map_err(|_| 123)?;
     if files.open_query(new) != Ok(OpenOutcome::Finished(regular)) {
         return Err(124);
     }
+    let writable_channel = Files::clone_exact_on(files.sessions().0, &[]).map_err(|_| 140)?;
+    let writable = Files::from_sessions(writable_channel, None);
+    writable
+        .bind(posix_abi::process::identity().ok_or(140)?)
+        .map_err(|_| 140)?;
+    let key = proto_fs::OpenKey {
+        slot: 0,
+        generation: 1,
+    };
+    let job = writable
+        .open_start(key, b"/dev/urandom", proto_fs::WRITE_ONLY, 0, 0)
+        .map_err(|_| 141)?;
+    prepared(&writable, job).map_err(|_| 142)?;
+    let write_only = writable.open_commit(job).map_err(|_| 143)?;
+    writable.open_finish(key).map_err(|_| 143)?;
+    let capture = writable
+        .capture_description(write_only.fd)
+        .map_err(|_| 144)?;
+    if capture.held != write_only || !capture.held.random || capture.flags != proto_fs::WRITE_ONLY {
+        return Err(145);
+    }
+    let alias_channel =
+        Files::clone_exact_on(writable.sessions().0, &[write_only]).map_err(|_| 146)?;
+    let alias = Files::from_sessions(alias_channel, None);
+    alias
+        .bind(posix_abi::process::identity().ok_or(146)?)
+        .map_err(|_| 146)?;
+    if alias.capture_description(write_only.fd) != Ok(capture)
+        || alias.read(write_only.fd, &mut [0]) != Err(Status::Unknown(proto_fs::BAD_FD))
+    {
+        return Err(147);
+    }
+    if alias.close_exact(write_only) != Ok(rt::fs::CloseOutcome::Closed)
+        || alias.close_exact(write_only) != Ok(rt::fs::CloseOutcome::AlreadyGone)
+    {
+        return Err(148);
+    }
+    writable.close_exact(write_only).map_err(|_| 149)?;
     let mut byte = [0];
     if files.read(regular.fd, &mut byte) != Ok(1) {
         return Err(125);

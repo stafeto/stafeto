@@ -1985,3 +1985,164 @@ fn finished_receipt_cannot_cancel_a_reallocated_description_in_the_same_slot() {
     ram.release(&mut fds);
     assert_eq!(ram.open_descriptions(), 0);
 }
+
+#[test]
+fn clone_count_rejects_missing_or_invalid_count_before_admission() {
+    for bytes in [b"".as_slice(), &[0], &[0, 0], &[0, 0, 0]] {
+        assert_eq!(
+            crate::clone_count(&mut proto_wire::Reader::new(bytes), 0),
+            Err(proto_wire::BAD_SIZE)
+        );
+    }
+    for count in [0u32, 32, 33] {
+        let bytes = count.to_le_bytes();
+        let expected = if count <= 32 {
+            Ok(count as usize)
+        } else {
+            Err(proto_wire::BAD_SIZE)
+        };
+        assert_eq!(
+            crate::clone_count(&mut proto_wire::Reader::new(&bytes), 0),
+            expected
+        );
+        assert_eq!(
+            crate::clone_count(&mut proto_wire::Reader::new(&bytes), 1),
+            Err(proto_wire::BAD_SIZE)
+        );
+    }
+}
+
+#[test]
+fn clone_into_rejects_last_fd_and_cwd_failure_without_reference_changes() {
+    let mut ram = Ram::new(0);
+    let inode = create(&mut ram, ROOT, b"clone-into", REG, 0o600);
+    let directory = create(&mut ram, ROOT, b"clone-cwd", DIR, 0o700);
+    let mut source = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let fd = ram
+        .open_token(&mut source, inode, proto_fs::READ_WRITE, OWNER)
+        .unwrap();
+    ram.set_cwd_token(&mut source, directory).unwrap();
+    let held = ram.capture_description(&source, fd).unwrap().0;
+    let refs = ram.descriptions[held.description.slot as usize]
+        .as_ref()
+        .unwrap()
+        .refs;
+    let usage = ram.storage.usage(ROOT_ACCOUNT);
+    let pins = ram.storage.node(directory).unwrap().pins;
+    let mut out = Fds::default();
+    assert_eq!(
+        ram.clone_fds_into(&source, &[fd, 35], &mut out),
+        Err(proto_fs::BAD_FD)
+    );
+    assert!(out.fresh_clone_destination());
+    ram.release(&mut out);
+    assert_eq!(
+        ram.descriptions[held.description.slot as usize]
+            .as_ref()
+            .unwrap()
+            .refs,
+        refs
+    );
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT), usage);
+    assert_eq!(ram.storage.node(directory).unwrap().pins, pins);
+    ram.storage.node_mut(directory).unwrap().pins[Pin::Cwd as usize] = u16::MAX;
+    assert_eq!(
+        ram.clone_fds_into(&source, &[fd], &mut out),
+        Err(proto_fs::NO_SPACE)
+    );
+    assert!(out.fresh_clone_destination());
+    ram.release(&mut out);
+    assert_eq!(
+        ram.descriptions[held.description.slot as usize]
+            .as_ref()
+            .unwrap()
+            .refs,
+        refs
+    );
+    assert_eq!(
+        ram.storage.node(directory).unwrap().pins[Pin::Cwd as usize],
+        u16::MAX
+    );
+    ram.storage.node_mut(directory).unwrap().pins = pins;
+    ram.release(&mut source);
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.node(directory).unwrap().pins, [0; 5]);
+}
+
+#[test]
+fn clone_into_deduplicates_numeric_fds_and_retains_distinct_alias_slots() {
+    let mut ram = Ram::new(0);
+    let inode = create(&mut ram, ROOT, b"clone-alias", REG, 0o600);
+    let mut source = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let fd = ram
+        .open_token(&mut source, inode, proto_fs::READ_WRITE, OWNER)
+        .unwrap();
+    let held = ram.capture_description(&source, fd).unwrap().0;
+    // The live session model gives a second numeric slot the same description.
+    source.slots[1] = source.slots[0];
+    ram.descriptions[held.description.slot as usize]
+        .as_mut()
+        .unwrap()
+        .refs += 1;
+    let mut out = Fds::default();
+    ram.clone_fds_into(&source, &[fd, fd, 4, 4], &mut out)
+        .unwrap();
+    assert_eq!(out.numbers().count(), 2);
+    assert_eq!(out.root, source.root);
+    assert_eq!(
+        ram.descriptions[held.description.slot as usize]
+            .as_ref()
+            .unwrap()
+            .refs,
+        4
+    );
+    assert_eq!(ram.write(&mut out, 4, b"alias"), Ok(5));
+    assert_eq!(
+        ram.seek_from(&mut source, fd, 0, proto_fs::SeekFrom::Current),
+        Ok(5)
+    );
+    ram.release(&mut out);
+    assert_eq!(
+        ram.descriptions[held.description.slot as usize]
+            .as_ref()
+            .unwrap()
+            .refs,
+        2
+    );
+    ram.release(&mut source);
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.node(inode).unwrap().pins, [0; 5]);
+}
+
+#[test]
+fn clone_into_requires_fresh_destination_including_operation_tombstones() {
+    let mut ram = Ram::new(0);
+    let source = Fds::default();
+    let mut destinations = [Fds::default(); 9];
+    destinations[0].open_watermarks[31] = 1;
+    destinations[1].open_receipts[31].key.generation = 1;
+    destinations[2].open_receipts[31].description.slot = 1;
+    destinations[3].binding = Binding::Boot;
+    destinations[4].root = ROOT_ACCOUNT;
+    destinations[5].binding_outcome = Some(0);
+    destinations[6].claimed = true;
+    destinations[7].resolvers[15] = 1;
+    destinations[8].authority_index = 0;
+    for out in &mut destinations {
+        assert_eq!(
+            ram.clone_fds_into(&source, &[], out),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert!(!out.fresh_clone_destination());
+    }
+    assert_eq!(destinations[0].open_watermarks[31], 1);
+    assert_eq!(destinations[1].open_receipts[31].key.generation, 1);
+    assert_eq!(destinations[2].open_receipts[31].description.slot, 1);
+    assert_eq!(ram.open_descriptions(), 0);
+}

@@ -276,6 +276,12 @@ pub enum Method {
     OpenCancel = 30,
     /// Client key slot u32/generation u64. Find the original paid operation.
     OpenQuery = 31,
+    /// Published fd u32. Read-only status/packed token/generation/access flags (20 bytes).
+    CaptureDescription = 32,
+    /// Packed fd/slot u32 and generation u64. Reply status and Closed0/AlreadyGone1.
+    CloseExact = 33,
+    /// Count u32 and exact packed fd/slot u32 + generation u64 entries. Maximum 32.
+    CloneExact = 34,
 }
 
 impl Method {
@@ -316,6 +322,9 @@ impl Method {
             29 => Some(Self::OpenFinish),
             30 => Some(Self::OpenCancel),
             31 => Some(Self::OpenQuery),
+            32 => Some(Self::CaptureDescription),
+            33 => Some(Self::CloseExact),
+            34 => Some(Self::CloneExact),
             _ => None,
         }
     }
@@ -323,7 +332,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31,
+    27, 28, 29, 30, 31, 32, 33, 34,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
