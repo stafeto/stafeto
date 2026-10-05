@@ -195,9 +195,14 @@ fn counters(files: &Files) -> Result<([u32; 4], u32), Status> {
 
 #[cfg(feature = "data-carrier-probe")]
 fn full_gone(files: &Files, held: PreparedOpen) -> Result<(), i32> {
-    // Finish reclamation queued by the preceding byte/reuse scenarios.
-    for _ in 0..4000 {
-        rt::sys::yield_now().map_err(|_| 126)?;
+    // Let preceding closed sessions finish their next periodic binding audit.
+    // The temporary timer and channel leave before the resource snapshot.
+    {
+        let channel = rt::sys::channel_create(1).map_err(|_| 126)?;
+        let timer = rt::sys::timer_create(&channel, 30).map_err(|_| 127)?;
+        let deadline = rt::time::ticks_to_ns(rt::time::now()) + 1_000_000_000;
+        rt::sys::timer_set(&timer, deadline).map_err(|_| 128)?;
+        rt::sys::receive(&channel).map_err(|_| 129)?;
     }
     let before = counters(files).map_err(|_| 82)?;
     let child = super::open_stages::clone_bound(files, &[held.fd]).map_err(|_| 83)?;
