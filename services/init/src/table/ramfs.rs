@@ -203,7 +203,11 @@ const RAM_POSIX_FILES: Record = Record {
 };
 
 /// The authentic identity and bounded file proof fixture, before public mutation APIs.
-#[cfg(not(any(feature = "ramfs-cleanup", feature = "loader-abort")))]
+#[cfg(not(any(
+    feature = "ramfs-cleanup",
+    feature = "loader-abort",
+    feature = "public-data-probe"
+)))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
     RAM_POSIX_FILES,
     POSIX_ABI_TABLE[1],
@@ -217,6 +221,29 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         root: true,
         ..POSIX
     },
+];
+
+/// The public data fixture retains genuine pipe and random device routes.
+#[cfg(all(
+    feature = "public-data-probe",
+    not(any(feature = "ramfs-cleanup", feature = "loader-abort"))
+))]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    RAM_POSIX_FILES,
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "clock", "posix", "pipe", "entropy"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
 ];
 
 /// Genuine uncommitted exec attempts with one pending image at a time.

@@ -2938,21 +2938,34 @@ fn posix_files_run_profile(measured: bool, data: bool, clock_gate: bool) -> Resu
         programs[1].3 = &["steps"];
         programs
     };
-    const DATA: [ImageProgram; 5] = {
-        let mut programs = POSIX_FILES_PROGRAMS;
-        programs[0].3 = &["table-posix-files", "data-carrier-probe"];
-        programs[1].3 = &["steps", "auth-probe"];
-        programs[4].3 = &["data-carrier-probe", "public-data-probe"];
-        programs
-    };
+    const DATA: [ImageProgram; 8] = [
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-posix-files", "public-data-probe"],
+        ),
+        ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps", "auth-probe"]),
+        POSIX_FILES_PROGRAMS[2],
+        POSIX_FILES_PROGRAMS[3],
+        (
+            "posix-files",
+            "posix-procs",
+            POSIX_STACK_SIZE,
+            &["data-carrier-probe", "public-data-probe"],
+        ),
+        POSIX_PROCS_PROGRAMS[2],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
     const CLOCK_GATE: [ImageProgram; 5] = {
-        let mut programs = DATA;
+        let mut programs = POSIX_FILES_PROGRAMS;
         programs[0].3 = &["table-posix-files", "open-finalize-clock-probe"];
         programs[1].3 = &["steps", "open-finalize-clock-probe"];
         programs[4].3 = &["open-finalize-clock-probe"];
         programs
     };
-    let programs = if clock_gate {
+    let programs: &[ImageProgram] = if clock_gate {
         &CLOCK_GATE
     } else if data {
         &DATA
