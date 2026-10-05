@@ -144,8 +144,13 @@ fn run(
             return Err(code);
         }
     };
-    let result = ready(ram, &mut prep, ROOT_USER)
-        .and_then(|_| prep.commit(&mut ram.storage, ROOT_USER, now));
+    let result = ready(ram, &mut prep, ROOT_USER).and_then(|_| {
+        prep.commit(
+            &mut ram.storage,
+            ROOT_USER,
+            proto_fs::Timestamp::legacy_ns(now),
+        )
+    });
     cleanup(ram, &mut prep);
     ram.storage.release_preparation(charge);
     result
@@ -164,7 +169,7 @@ fn drain(ram: &mut Ram<'_>) -> usize {
 
 #[test]
 fn rename_replacement_preserves_the_open_victim_and_source_expense_root() {
-    let mut ram = Ram::new(10);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(10));
     let left = create(&mut ram, FIRST, ROOT, b"left", DIR, 0o777);
     let right = create(&mut ram, SECOND, ROOT, b"right", DIR, 0o777);
     let source = create(&mut ram, FIRST, left, b"source", REG, 0o644);
@@ -194,11 +199,35 @@ fn rename_replacement_preserves_the_open_victim_and_source_expense_root() {
     assert_eq!(ram.storage.usage(SECOND).dentries, second.dentries - 1);
     assert_eq!(ram.storage.node(victim).unwrap().links, 0);
     let mut bytes = [0; 3];
-    assert_eq!(ram.read_at(&mut fds, fd, &mut bytes, 100).unwrap(), 3);
+    assert_eq!(
+        ram.read_at(
+            &mut fds,
+            fd,
+            &mut bytes,
+            proto_fs::Timestamp::legacy_ns(100)
+        )
+        .unwrap(),
+        3
+    );
     assert_eq!(&bytes, b"old");
-    assert_eq!(ram.storage.node(left).unwrap().times[1..], [99, 99]);
-    assert_eq!(ram.storage.node(right).unwrap().times[1..], [99, 99]);
-    assert_eq!(ram.storage.node(victim).unwrap().times[2], 99);
+    assert_eq!(
+        ram.storage.node(left).unwrap().times[1..],
+        [
+            proto_fs::Timestamp::legacy_ns(99),
+            proto_fs::Timestamp::legacy_ns(99)
+        ]
+    );
+    assert_eq!(
+        ram.storage.node(right).unwrap().times[1..],
+        [
+            proto_fs::Timestamp::legacy_ns(99),
+            proto_fs::Timestamp::legacy_ns(99)
+        ]
+    );
+    assert_eq!(
+        ram.storage.node(victim).unwrap().times[2],
+        proto_fs::Timestamp::legacy_ns(99)
+    );
     ram.close(&mut fds, fd).unwrap();
     drain(&mut ram);
     assert!(ram.storage.node(victim).is_err());
@@ -206,7 +235,7 @@ fn rename_replacement_preserves_the_open_victim_and_source_expense_root() {
 
 #[test]
 fn cached_commit_survives_epoch_credentials_and_cleanup_without_repeating_time() {
-    let mut ram = Ram::new(10);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(10));
     let source = create(&mut ram, FIRST, ROOT, b"source", REG, 0o644);
     let charge = ram.storage.charge_preparation(FIRST).unwrap();
     let mut prep = begin(
@@ -223,19 +252,30 @@ fn cached_commit_survives_epoch_credentials_and_cleanup_without_repeating_time()
     .unwrap();
     ready(&mut ram, &mut prep, ROOT_USER).unwrap();
     assert_eq!(
-        prep.commit(&mut ram.storage, ROOT_USER, 71),
+        prep.commit(
+            &mut ram.storage,
+            ROOT_USER,
+            proto_fs::Timestamp::legacy_ns(71)
+        ),
         Ok(NamespaceOutcome::Applied)
     );
     ram.storage.set_attributes(source, 0, 37, 43).unwrap();
     assert_eq!(
-        prep.commit(&mut ram.storage, OWNER, 999),
+        prep.commit(&mut ram.storage, OWNER, proto_fs::Timestamp::legacy_ns(999)),
         Ok(NamespaceOutcome::Applied)
     );
     assert_eq!(ram.storage.node(source).unwrap().links, 2);
-    assert_eq!(ram.storage.node(source).unwrap().times[2], 71);
+    assert_eq!(
+        ram.storage.node(source).unwrap().times[2],
+        proto_fs::Timestamp::legacy_ns(71)
+    );
     cleanup(&mut ram, &mut prep);
     assert_eq!(
-        prep.commit(&mut ram.storage, OWNER, 1000),
+        prep.commit(
+            &mut ram.storage,
+            OWNER,
+            proto_fs::Timestamp::legacy_ns(1000)
+        ),
         Ok(NamespaceOutcome::Applied)
     );
     ram.storage.release_preparation(charge);
@@ -243,7 +283,7 @@ fn cached_commit_survives_epoch_credentials_and_cleanup_without_repeating_time()
 
 #[test]
 fn same_inode_rename_succeeds_at_full_name_share_without_changing_epoch_or_times() {
-    let mut ram = Ram::new(10);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(10));
     let source = create(&mut ram, FIRST, ROOT, b"source", REG, 0o644);
     ram.storage.link(FIRST, ROOT, b"alias", source).unwrap();
     for n in 0..DENTRY_SHARE - 2 {
@@ -275,7 +315,7 @@ fn same_inode_rename_succeeds_at_full_name_share_without_changing_epoch_or_times
 
 #[test]
 fn captured_search_identity_prevents_reusing_a_prefix_proof_after_euid_change() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     create(&mut ram, FIRST, ROOT, b"secret", DIR, 0o100);
     let public = create(&mut ram, FIRST, ROOT, b"public", DIR, 0o777);
     let file = create(&mut ram, FIRST, public, b"file", REG, 0o644);
@@ -292,7 +332,14 @@ fn captured_search_identity_prevents_reusing_a_prefix_proof_after_euid_change() 
     .unwrap();
     ready(&mut ram, &mut prep, OWNER).unwrap();
     let changed = Identity { uid: 38, ..OWNER };
-    assert_eq!(prep.commit(&mut ram.storage, changed, 22), Err(STALE_PROOF));
+    assert_eq!(
+        prep.commit(
+            &mut ram.storage,
+            changed,
+            proto_fs::Timestamp::legacy_ns(22)
+        ),
+        Err(STALE_PROOF)
+    );
     assert_eq!(ram.storage.lookup(public, b"file"), Ok(file));
     cleanup(&mut ram, &mut prep);
     ram.storage.release_preparation(charge);
@@ -300,7 +347,7 @@ fn captured_search_identity_prevents_reusing_a_prefix_proof_after_euid_change() 
 
 #[test]
 fn constructor_refusals_preserve_charge_usage_pins_epoch_and_exact_root() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     create(&mut ram, FIRST, ROOT, b"file", REG, 0o644);
     let charge = ram.storage.charge_preparation(FIRST).unwrap();
     let usage = ram.storage.usage(FIRST);
@@ -351,7 +398,7 @@ fn constructor_refusals_preserve_charge_usage_pins_epoch_and_exact_root() {
 
 #[test]
 fn raw_dot_dotdot_and_slash_survive_link_expansion_and_missing_destination() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let dir = create(&mut ram, FIRST, ROOT, b"dir", DIR, 0o777);
     let link = create(&mut ram, FIRST, ROOT, b"link", SYMLINK, 0o777);
     ram.storage.write(link, FIRST, 0, b"dir").unwrap();
@@ -375,7 +422,7 @@ fn raw_dot_dotdot_and_slash_survive_link_expansion_and_missing_destination() {
 
 #[test]
 fn rename_rejects_ancestor_and_nonempty_destination_with_bounded_cancel() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let top = create(&mut ram, FIRST, ROOT, b"top", DIR, 0o777);
     create(&mut ram, FIRST, top, b"child", DIR, 0o777);
     let other = create(&mut ram, FIRST, ROOT, b"other", DIR, 0o777);
@@ -409,7 +456,7 @@ fn rename_rejects_ancestor_and_nonempty_destination_with_bounded_cancel() {
 
 #[test]
 fn nlink_exhaustion_and_directory_create_refuse_before_publication() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let file = create(&mut ram, FIRST, ROOT, b"file", REG, 0o644);
     ram.storage.node_mut(file).unwrap().links = u32::MAX;
     let usage = ram.storage.usage(FIRST);
@@ -442,7 +489,7 @@ fn nlink_exhaustion_and_directory_create_refuse_before_publication() {
 
 #[test]
 fn rename_directory_replacement_combines_parent_delta_at_nlink_max() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let left = create(&mut ram, FIRST, ROOT, b"left", DIR, 0o777);
     let right = create(&mut ram, FIRST, ROOT, b"right", DIR, 0o777);
     let source = create(&mut ram, FIRST, left, b"source", DIR, 0o777);
@@ -468,7 +515,7 @@ fn rename_directory_replacement_combines_parent_delta_at_nlink_max() {
 
 #[test]
 fn rmdir_orphan_parent_survives_fd_walk_and_cascades_before_slot_reuse() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let parent = create(&mut ram, FIRST, ROOT, b"parent", DIR, 0o777);
     let child = create(&mut ram, FIRST, parent, b"child", DIR, 0o777);
     let mut fds = Fds {
@@ -520,7 +567,7 @@ fn rmdir_orphan_parent_survives_fd_walk_and_cascades_before_slot_reuse() {
 
 #[test]
 fn unpublished_child_reservation_cannot_commit_into_a_removed_parent() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let parent = create(&mut ram, FIRST, ROOT, b"parent", DIR, 0o777);
     let child = ram
         .storage
@@ -543,7 +590,7 @@ fn unpublished_child_reservation_cannot_commit_into_a_removed_parent() {
 
 #[test]
 fn full_preparation_pool_uses_the_existing_admission_and_cancel_is_exact() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     create(&mut ram, FIRST, ROOT, b"file", REG, 0o644);
     let charge = ram.storage.charge_preparation(FIRST).unwrap();
     let mut charges = Vec::new();
@@ -572,7 +619,11 @@ fn full_preparation_pool_uses_the_existing_admission_and_cancel_is_exact() {
     assert!(ram.storage.lookup(ROOT, b"file").is_ok());
     assert_eq!(ram.storage.lookup(ROOT, b"new"), Err(NO_ENTRY));
     assert_eq!(
-        prep.commit(&mut ram.storage, ROOT_USER, 21),
+        prep.commit(
+            &mut ram.storage,
+            ROOT_USER,
+            proto_fs::Timestamp::legacy_ns(21)
+        ),
         Err(STALE_PROOF)
     );
     for charge in charges {
@@ -584,7 +635,7 @@ fn full_preparation_pool_uses_the_existing_admission_and_cancel_is_exact() {
 
 #[test]
 fn step_failure_keeps_reserved_names_until_explicit_cancel_and_blocks_stale_effect() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let source = create(&mut ram, FIRST, ROOT, b"source", REG, 0o644);
     let charge = ram.storage.charge_preparation(FIRST).unwrap();
     let mut prep = begin(
@@ -607,7 +658,11 @@ fn step_failure_keeps_reserved_names_until_explicit_cancel_and_blocks_stale_effe
     assert_eq!(prep.step(&mut ram.storage, ROOT_USER), Err(STALE_PROOF));
     assert_eq!(ram.storage.usage(FIRST).dentries, usage.dentries + 1);
     assert_eq!(
-        prep.commit(&mut ram.storage, ROOT_USER, 77),
+        prep.commit(
+            &mut ram.storage,
+            ROOT_USER,
+            proto_fs::Timestamp::legacy_ns(77)
+        ),
         Err(STALE_PROOF)
     );
     cleanup(&mut ram, &mut prep);
@@ -636,7 +691,7 @@ fn boot_rename_prepays_both_tombstones_and_preserves_open_destination() {
     ]);
     let mut index = crate::tree::Index::new();
     let tree = crate::tree::load(&image, &mut index).unwrap();
-    let mut ram = Ram::with_tree(10, tree);
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::legacy_ns(10), tree);
     let source = ram.storage.lookup(ROOT, b"source").unwrap();
     let victim = ram.storage.lookup(ROOT, b"victim").unwrap();
     let mut fds = Fds {
@@ -645,7 +700,9 @@ fn boot_rename_prepays_both_tombstones_and_preserves_open_destination() {
     };
     let fd = ram.open(&mut fds, "/victim", READ_ONLY).unwrap();
     let mut before = [0; 64];
-    let n = ram.pread(&fds, fd, 0, &mut before, 12).unwrap();
+    let n = ram
+        .pread(&fds, fd, 0, &mut before, proto_fs::Timestamp::legacy_ns(12))
+        .unwrap();
     assert_eq!(
         run(
             &mut ram,
@@ -661,7 +718,11 @@ fn boot_rename_prepays_both_tombstones_and_preserves_open_destination() {
     assert_eq!(ram.storage.lookup(ROOT, b"source"), Err(NO_ENTRY));
     assert_eq!(ram.storage.lookup(ROOT, b"victim"), Ok(source));
     let mut after = [0; 64];
-    assert_eq!(ram.pread(&fds, fd, 0, &mut after, 44).unwrap(), n);
+    assert_eq!(
+        ram.pread(&fds, fd, 0, &mut after, proto_fs::Timestamp::legacy_ns(44))
+            .unwrap(),
+        n
+    );
     assert_eq!(&before[..n], &after[..n]);
     assert_eq!(ram.storage.node(victim).unwrap().links, 0);
     ram.close(&mut fds, fd).unwrap();
@@ -672,7 +733,7 @@ fn boot_rename_prepays_both_tombstones_and_preserves_open_destination() {
 
 #[test]
 fn boot_preparation_cancel_reverses_partial_reserves_and_preserves_original_metadata() {
-    let mut ram = Ram::new(10);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(10));
     let source = ram
         .storage
         .lookup(
@@ -697,7 +758,10 @@ fn boot_preparation_cancel_reverses_partial_reserves_and_preserves_original_meta
     ready(&mut ram, &mut prep, ROOT_USER).unwrap();
     assert_eq!(ram.storage.usage(FIRST).dentries, 2);
     assert_eq!(ram.storage.usage(FIRST).inodes, 1);
-    assert_eq!(ram.storage.node(source).unwrap().times, [10; 3]);
+    assert_eq!(
+        ram.storage.node(source).unwrap().times,
+        [proto_fs::Timestamp::legacy_ns(10); 3]
+    );
     assert_eq!(
         ram.storage.lookup(
             Token {
@@ -710,13 +774,16 @@ fn boot_preparation_cancel_reverses_partial_reserves_and_preserves_original_meta
     );
     cleanup(&mut ram, &mut prep);
     assert_eq!(ram.storage.usage(FIRST), Usage::default());
-    assert_eq!(ram.storage.node(source).unwrap().times, [10; 3]);
+    assert_eq!(
+        ram.storage.node(source).unwrap().times,
+        [proto_fs::Timestamp::legacy_ns(10); 3]
+    );
     ram.storage.release_preparation(charge);
 }
 
 #[test]
 fn remove_dispatches_the_actual_type_and_link_follow_intent_is_exact() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let file = create(&mut ram, FIRST, ROOT, b"file", REG, 0o644);
     let link = create(&mut ram, FIRST, ROOT, b"symbol", SYMLINK, 0o777);
     ram.storage.write(link, FIRST, 0, b"file").unwrap();
@@ -763,7 +830,7 @@ fn remove_dispatches_the_actual_type_and_link_follow_intent_is_exact() {
 
 #[test]
 fn native_role_mismatch_and_group_change_preserve_the_prepared_namespace() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     create(&mut ram, FIRST, ROOT, b"file", REG, 0o644);
     let r = resolved(&mut ram, b"/file", NamespacePath::Victim, ROOT_USER).unwrap();
     assert!(matches!(
@@ -797,7 +864,7 @@ fn native_role_mismatch_and_group_change_preserve_the_prepared_namespace() {
 #[test]
 fn namespace_actual_layout_uses_the_existing_paid_job_and_node_padding() {
     assert_eq!(core::mem::size_of::<Preparation>(), 648);
-    assert_eq!(core::mem::size_of::<Node>(), 112);
+    assert_eq!(core::mem::size_of::<Node>(), 136);
     std::println!(
         "T4 actual layout: Preparation={} Node={} State={}",
         core::mem::size_of::<Preparation>(),
@@ -827,7 +894,7 @@ fn boot_full_share_failure_restores_partial_tombstone_reserve_without_publishing
     ]);
     let mut index = crate::tree::Index::new();
     let tree = crate::tree::load(&image, &mut index).unwrap();
-    let mut ram = Ram::with_tree(10, tree);
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::legacy_ns(10), tree);
     let filler = create(&mut ram, FIRST, ROOT, b"filler", REG, 0o644);
     for i in 0..DENTRY_SHARE - 2 {
         ram.storage
@@ -854,12 +921,15 @@ fn boot_full_share_failure_restores_partial_tombstone_reserve_without_publishing
     assert_eq!(ram.storage.lookup(ROOT, b"source"), Ok(original_source));
     assert_eq!(ram.storage.lookup(ROOT, b"victim"), Ok(original_victim));
     assert_eq!(pins(&ram), before_pins);
-    assert_eq!(ram.storage.node(original_source).unwrap().times, [10; 3]);
+    assert_eq!(
+        ram.storage.node(original_source).unwrap().times,
+        [proto_fs::Timestamp::legacy_ns(10); 3]
+    );
 }
 
 #[test]
 fn constructor_pin_exhaustion_is_atomic_after_genuine_resolver_capture() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let source = create(&mut ram, FIRST, ROOT, b"source", REG, 0o644);
     let charge = ram.storage.charge_preparation(FIRST).unwrap();
     let resolver = resolved(&mut ram, b"/source", NamespacePath::Victim, ROOT_USER).unwrap();
@@ -893,7 +963,7 @@ fn constructor_pin_exhaustion_is_atomic_after_genuine_resolver_capture() {
 
 #[test]
 fn source_and_destination_role_capture_cannot_be_exchanged() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     create(&mut ram, FIRST, ROOT, b"source", REG, 0o644);
     let source = resolved(&mut ram, b"/source", NamespacePath::Victim, ROOT_USER).unwrap();
     let destination =
@@ -925,7 +995,7 @@ fn source_and_destination_role_capture_cannot_be_exchanged() {
 
 #[test]
 fn followed_link_source_directory_and_root_return_permission_without_new_names() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let link = create(&mut ram, FIRST, ROOT, b"rootlink", SYMLINK, 0o777);
     ram.storage.write(link, FIRST, 0, b"/").unwrap();
     let usage = ram.storage.usage(FIRST);
@@ -949,7 +1019,7 @@ fn followed_link_source_directory_and_root_return_permission_without_new_names()
 
 #[test]
 fn typed_unlink_directory_returns_permission_and_preserves_all_paid_state() {
-    let mut ram = Ram::new(17);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(17));
     let dir = create(&mut ram, FIRST, ROOT, b"directory", DIR, 0o777);
     let link = create(&mut ram, FIRST, ROOT, b"directory-link", SYMLINK, 0o777);
     ram.storage.write(link, FIRST, 0, b"directory").unwrap();

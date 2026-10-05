@@ -10,9 +10,9 @@ use proto_fs::{BAD_FD, INVALID_ARGUMENT, IS_DIRECTORY, OFFSET_OVERFLOW, READ_ONL
 /// EFBIG. The protocol owner publishes this status with the data-operation wire.
 pub use proto_fs::FILE_TOO_LARGE;
 
-struct Held {
+pub(crate) struct Held {
     description: Token,
-    open: Open,
+    pub(crate) open: Open,
     capacity: u64,
 }
 
@@ -40,7 +40,7 @@ pub struct TruncatePreparation {
 }
 
 impl Ram<'_> {
-    fn io_retain(&mut self, fds: &Fds, fd: u32) -> Result<Held, u32> {
+    pub(crate) fn io_retain(&mut self, fds: &Fds, fd: u32) -> Result<Held, u32> {
         let description = self.description_token(fds, fd)?;
         let shared = self.descriptions[description.slot as usize]
             .as_mut()
@@ -64,7 +64,7 @@ impl Ram<'_> {
         Ok(())
     }
 
-    fn io_release(&mut self, held: Held) {
+    pub(crate) fn io_release(&mut self, held: Held) {
         let slot = held.description.slot as usize;
         let Some(shared) = self.descriptions[slot].as_mut() else {
             return;
@@ -205,7 +205,7 @@ impl WritePreparation {
             .map_or(Ok(true), |data| ram.storage.step_data_write(data))
     }
 
-    pub fn commit(&mut self, ram: &mut Ram<'_>, now: u64) -> Result<usize, u32> {
+    pub fn commit(&mut self, ram: &mut Ram<'_>, now: proto_fs::Timestamp) -> Result<usize, u32> {
         if let Some(result) = self.result {
             return Ok(result);
         }
@@ -253,7 +253,7 @@ impl TruncatePreparation {
         ram.storage.step_data_truncate(&mut self.data)
     }
 
-    pub fn commit(&mut self, ram: &mut Ram<'_>, now: u64) -> Result<u64, u32> {
+    pub fn commit(&mut self, ram: &mut Ram<'_>, now: proto_fs::Timestamp) -> Result<u64, u32> {
         if let Some(result) = self.result {
             return Ok(result);
         }

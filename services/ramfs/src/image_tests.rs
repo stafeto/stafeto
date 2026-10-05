@@ -41,7 +41,7 @@ fn image_pin_keeps_unlinked_bytes_and_cleanup_uses_its_original_root() {
     let bytes = image();
     let mut index = crate::tree::Index::new();
     let tree = crate::tree::load(&bytes, &mut index).unwrap();
-    let mut ram = Ram::with_tree(0, tree);
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::legacy_ns(0), tree);
     let token = ram.storage.resolve(b"/program").unwrap();
     let entry = ram.storage.node(token).unwrap().boot;
     let mut fds = Fds {
@@ -100,7 +100,7 @@ fn full_root_description_account_refuses_image_before_pin_and_recovers_one_credi
     let bytes = image();
     let mut index = crate::tree::Index::new();
     let tree = crate::tree::load(&bytes, &mut index).unwrap();
-    let mut ram = Ram::with_tree(0, tree);
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::legacy_ns(0), tree);
     let token = ram.storage.resolve(b"/program").unwrap();
     let entry = ram.storage.node(token).unwrap().boot;
     let mut filled = [Fds {

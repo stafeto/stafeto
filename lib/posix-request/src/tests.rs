@@ -177,9 +177,9 @@ fn reply_tags_status_input_extent_and_metadata_are_validated() {
         size: 91,
         block_size: 1024,
         blocks: 1,
-        access_ns: 1,
-        modify_ns: 2,
-        change_ns: 3,
+        access_time: proto_fs::Timestamp::legacy_ns(1),
+        modify_time: proto_fs::Timestamp::legacy_ns(2),
+        change_time: proto_fs::Timestamp::legacy_ns(3),
     };
     let replies = [
         Reply::Unit,
