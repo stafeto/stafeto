@@ -21,6 +21,8 @@ mod image_gates;
 mod image_hold;
 #[cfg(feature = "loader-abort")]
 mod loader_abort;
+#[cfg(feature = "t6-runtime")]
+mod t6_runtime;
 
 /// A counterfeit identity capability must leave the already bound session intact.
 #[cfg(feature = "files")]

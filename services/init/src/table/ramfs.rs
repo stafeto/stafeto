@@ -182,9 +182,9 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
     },
 ];
 
-#[cfg(not(feature = "data-carrier-probe"))]
+#[cfg(all(not(feature = "data-carrier-probe"), not(feature = "t6-runtime")))]
 const RAM_POSIX_FILES: Record = RAM_CLOCKED;
-#[cfg(feature = "data-carrier-probe")]
+#[cfg(all(feature = "data-carrier-probe", not(feature = "t6-runtime")))]
 const RAM_POSIX_FILES: Record = Record {
     // The steps,auth-probe ELF maps 10 RO + 36 RX + 925 RW pages.
     // Data pages, stack and allowance are paid separately in this fixture.
@@ -210,9 +210,13 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
 ];
 
 /// Genuine uncommitted exec attempts with one pending image at a time.
-#[cfg(all(feature = "loader-abort", not(feature = "loader-info")))]
+#[cfg(all(
+    feature = "loader-abort",
+    not(feature = "loader-info"),
+    not(feature = "t6-runtime")
+))]
 const RAM_LOADER_INFO: Record = RAM_CLOCKED;
-#[cfg(feature = "loader-info")]
+#[cfg(all(feature = "loader-info", not(feature = "t6-runtime")))]
 const RAM_LOADER_INFO: Record = Record {
     // This diagnostic ELF maps 9 RO + 31 RX + 920 RW pages.
     // The fixed data pool, stack and runtime allowance are paid separately.
@@ -220,7 +224,7 @@ const RAM_LOADER_INFO: Record = Record {
     ..RAM_CLOCKED
 };
 
-#[cfg(feature = "loader-abort")]
+#[cfg(all(feature = "loader-abort", not(feature = "t6-runtime")))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
     RAM_LOADER_INFO,
     Record {
@@ -233,6 +237,32 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         program: "posix-files",
         args: b"posix-files\0",
         connects: &["ramfs", "clock", "posix"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+];
+
+/// Three independently held runtime images use real pipe handshakes.
+/// The measured image-gates,steps ELF maps 10 RO + 38 RX + 928 RW pages.
+/// Data pool, stack and runtime allowance are paid separately.
+#[cfg(feature = "t6-runtime")]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    Record {
+        quota: (4096 + 976 + 12 + 128) * PAGE,
+        ..RAM_CLOCKED
+    },
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 3 * 2048 * PAGE + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "pipe", "clock", "posix"],
         quota: 2048 * PAGE,
         root: true,
         ..POSIX
