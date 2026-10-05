@@ -19,7 +19,7 @@ use core::ffi::{c_char, c_int};
 use core::mem::ManuallyDrop;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
-use posix_fs::PosixFs;
+use posix_fs::StartupFiles;
 use rt::handle::{Channel, Handle, Process, Resource, Thread};
 
 // relibc's platform calls the layer through posix-platform's functions.
@@ -116,29 +116,35 @@ unsafe fn enter_relibc(stack: *const usize) -> ! {
 /// `process` and `thread` are the program's own (rt::startup).
 pub unsafe fn posix_init_process(
     session: Handle<Channel>,
+    identity: Option<Handle<Channel>>,
     parent: &Handle<Channel>,
     process: Handle<Process>,
     thread: Handle<Thread>,
 ) -> Result<(), &'static str> {
     // SAFETY: startup runs once, before application threads and clock calls.
     unsafe { posix_abi::process::init(session) }.map_err(|_| "process registration failed")?;
+    if let Some(identity) = identity {
+        // SAFETY: startup owns process identity installation.
+        unsafe { posix_abi::process::set_identity(identity) };
+    }
     // SAFETY: as above.
     unsafe { posix_abi::clock::init(parent) }.map_err(|_| "clock connection failed")?;
     // The console's input through the terminal service when init's table
     // gives the program one (5f), through the console's driver otherwise.
     #[cfg(feature = "uart-input")]
     let files = match rt::service::connect(parent, "tty") {
-        Ok(terminal) => PosixFs::connect(parent).map(|mut fs| {
+        Ok(terminal) => StartupFiles::connect(parent, false).map(|mut fs| {
             fs.set_terminal(Some(terminal));
             fs
         }),
-        Err(_) => PosixFs::connect_with_uart(parent),
+        Err(_) => StartupFiles::connect(parent, true),
     };
     #[cfg(not(feature = "uart-input"))]
-    let files = PosixFs::connect(parent);
+    let files = StartupFiles::connect(parent, false);
     let files = files.map_err(|_| "file connection failed")?;
     // SAFETY: only startup owns file initialization.
-    unsafe { posix_abi::shared::init(files) }.map_err(|_| "files failed")?;
+    unsafe { posix_abi::shared::init(files, b"/", None, false, posix_abi::process::identity()) }
+        .map_err(|_| "files failed")?;
     // The entropy service, when the record names it; none otherwise, and
     // getentropy gives ENOSYS. SAFETY: startup, on the only thread.
     unsafe { posix_abi::random::init(rt::service::connect(parent, "entropy").ok()) };
@@ -311,21 +317,24 @@ fn loaded_main() -> u64 {
                 let inherited = inherited(&area);
                 let count = area.descriptor_count as usize;
                 let secure = area.flags & SECURE != 0;
-                PosixFs::from_sessions(
+                if let Some(identity) = one(Slot::PosixId) {
+                    posix_abi::process::set_identity(Handle::from_raw(identity));
+                }
+                let startup = StartupFiles::from_sessions(
                     Handle::from_raw(files),
                     uart,
+                    one(Slot::Pipes).map(Handle::from_raw),
+                    one(Slot::Terminal).map(Handle::from_raw),
+                );
+                posix_abi::shared::init(
+                    startup,
                     cwd,
                     Some(&inherited[..count.min(inherited.len())]),
                     secure,
+                    posix_abi::process::identity(),
                 )
-                .map(|mut fs| {
-                    fs.set_pipes(one(Slot::Pipes).map(Handle::from_raw));
-                    fs.set_terminal(one(Slot::Terminal).map(Handle::from_raw));
-                    fs
-                })
                 .map_err(|_| "files failed")
             })
-            .and_then(|files| posix_abi::shared::init(files).map_err(|_| "files failed"))
             .and_then(|()| posix_abi::allocation::init(process).map_err(|_| "heap failed"))
             .and_then(|()| adopt_map(&area))
             .and_then(|()| {
@@ -339,19 +348,6 @@ fn loaded_main() -> u64 {
     }
     // SAFETY: still single-threaded.
     unsafe { posix_abi::random::init(one(Slot::Entropy).map(Handle::from_raw)) };
-    if let Some(identity) = one(Slot::PosixId) {
-        // SAFETY: still single-threaded, after the process service's init.
-        unsafe { posix_abi::process::set_identity(Handle::from_raw(identity)) };
-        if posix_abi::shared::with_files(|files| {
-            files
-                .bind(posix_abi::process::identity().unwrap())
-                .map_err(posix_abi::error)
-        })
-        .is_err()
-        {
-            return 125;
-        }
-    }
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };
@@ -419,24 +415,17 @@ pub extern "C" fn crt_main(arg: u64) -> u64 {
         .ok();
     // SAFETY: the main thread, once, before any other; the start channel
     // stays in `start` until main returned.
-    if let Err(why) =
-        unsafe { posix_init_process(session, &start.parent, start.process, start.thread) }
-    {
+    if let Err(why) = unsafe {
+        posix_init_process(
+            session,
+            identity,
+            &start.parent,
+            start.process,
+            start.thread,
+        )
+    } {
         rt::println!("POSIX startup: {}", why);
         return 125;
-    }
-    if let Some(identity) = identity {
-        // SAFETY: still single-threaded, after the process service's init.
-        unsafe { posix_abi::process::set_identity(identity) };
-        if posix_abi::shared::with_files(|files| {
-            files
-                .bind(posix_abi::process::identity().unwrap())
-                .map_err(posix_abi::error)
-        })
-        .is_err()
-        {
-            return 125;
-        }
     }
     posix_abi::fork::at_child(forked);
     start_relibc(&arguments[..count])
