@@ -147,6 +147,7 @@ struct Overlay {
     node: u16,
     root: u16,
     pages: [u16; FILE_PAGES],
+    group_tail: [u16; FILE_PAGES / 64],
     head: u16,
     mapped_count: u16,
     shadow_boot_sectors: u16,
@@ -156,12 +157,30 @@ impl Overlay {
         node: NONE,
         root: NONE,
         pages: [NONE; FILE_PAGES],
+        group_tail: [NONE; FILE_PAGES / 64],
         head: NONE,
         mapped_count: 0,
         shadow_boot_sectors: 0,
     };
+    /// At most 63 mapping cells and 31 previous group tails are inspected.
+    fn predecessor(&self, logical: usize) -> u16 {
+        let group = logical / 64;
+        for index in (group * 64..logical).rev() {
+            if self.pages[index] != NONE {
+                return self.pages[index];
+            }
+        }
+        for index in (0..group).rev() {
+            if self.group_tail[index] != NONE {
+                return self.group_tail[index];
+            }
+        }
+        NONE
+    }
+
     fn initialize(&mut self, node: u16, root: u16) {
         self.pages.fill(NONE);
+        self.group_tail.fill(NONE);
         self.head = NONE;
         self.mapped_count = 0;
         self.shadow_boot_sectors = 0;
@@ -364,6 +383,8 @@ pub(crate) struct DataWrite {
     private_overlay: bool,
     root: u16,
     pages: [TempPage; 2],
+    predecessor: u16,
+    predecessor_ready: bool,
     pub offset: u64,
     pub count: usize,
     committed: bool,
@@ -380,6 +401,8 @@ pub(crate) struct DataTruncate {
     tail: TempPage,
     scan: usize,
     detached: usize,
+    last_keep: u16,
+    first_retired: u16,
     mapped_count: u16,
     shadow_boot_sectors: u16,
     boot_visible_length: u64,
@@ -388,6 +411,29 @@ pub(crate) struct DataTruncate {
 }
 
 impl Storage<'_> {
+    /// Publish one initialized page into the increasing logical chain.
+    fn link_page(&mut self, index: usize, logical: usize, page: u16, predecessor: u16) {
+        let overlay = &mut self.state.overlays[index];
+        let successor = if predecessor == NONE {
+            overlay.head
+        } else {
+            self.state.page_next[predecessor as usize]
+        };
+        self.state.page_next[page as usize] = successor;
+        self.state.page_logical[page as usize] = logical as u16;
+        overlay.pages[logical] = page;
+        if predecessor == NONE {
+            overlay.head = page;
+        } else {
+            self.state.page_next[predecessor as usize] = page;
+        }
+        let group = logical / 64;
+        let old_tail = overlay.group_tail[group];
+        if old_tail == NONE || (self.state.page_logical[old_tail as usize] as usize) < logical {
+            overlay.group_tail[group] = page;
+        }
+    }
+
     fn io_generation(&self, token: Token, generation: u64) -> Result<(), u32> {
         if self.node(token)?.data_generation != generation {
             return Err(proto_fs::STALE_PROOF);
@@ -519,6 +565,8 @@ impl Storage<'_> {
             private_overlay: existing == NONE,
             root: account as u16,
             pages,
+            predecessor: NONE,
+            predecessor_ready: false,
             offset,
             count,
             committed: false,
@@ -538,10 +586,18 @@ impl Storage<'_> {
         {
             self.io_initialize_page(data.token, page, NONE);
         }
-        Ok(data
+        let ready = data
             .pages
             .iter()
-            .all(|page| page.physical == NONE || page.ready))
+            .all(|page| page.physical == NONE || page.ready);
+        if ready && !data.predecessor_ready {
+            if let Some(page) = data.pages.iter().find(|page| page.physical != NONE) {
+                data.predecessor =
+                    self.state.overlays[data.overlay as usize].predecessor(page.logical as usize);
+            }
+            data.predecessor_ready = true;
+        }
+        Ok(ready)
     }
 
     pub(crate) fn commit_data_write(
@@ -554,6 +610,7 @@ impl Storage<'_> {
             return Ok(());
         }
         if data.canceled
+            || !data.predecessor_ready
             || bytes.len() != data.count
             || data
                 .pages
@@ -565,25 +622,29 @@ impl Storage<'_> {
         self.io_generation(data.token, data.generation)?;
         self.io_preflight(data.token)?;
         let boot_length = self.node(data.token)?.boot_visible_length;
-        let overlay = &mut self.state.overlays[data.overlay as usize];
+        let mut predecessor = data.predecessor;
         for page in &mut data.pages {
             if page.physical == NONE {
                 continue;
             }
+            let overlay = &mut self.state.overlays[data.overlay as usize];
             debug_assert_eq!(overlay.pages[page.logical as usize], NONE);
             overlay.mapped_count += 1;
             overlay.shadow_boot_sectors += boot_sectors(page.logical as usize, boot_length);
-            overlay.pages[page.logical as usize] = page.physical;
-            self.state.page_logical[page.physical as usize] = page.logical;
-            self.state.page_next[page.physical as usize] = overlay.head;
-            overlay.head = page.physical;
+            self.link_page(
+                data.overlay as usize,
+                page.logical as usize,
+                page.physical,
+                predecessor,
+            );
+            predecessor = page.physical;
             *page = TempPage::EMPTY;
         }
         let mut done = 0;
         while done < bytes.len() {
             let at = data.offset as usize + done;
             let amount = (PAGE - at % PAGE).min(bytes.len() - done);
-            let physical = overlay.pages[at / PAGE] as usize;
+            let physical = self.state.overlays[data.overlay as usize].pages[at / PAGE] as usize;
             let start = physical * PAGE + at % PAGE;
             self.data[start..start + amount].copy_from_slice(&bytes[done..done + amount]);
             done += amount;
@@ -660,6 +721,8 @@ impl Storage<'_> {
             tail,
             scan,
             detached: 0,
+            last_keep: NONE,
+            first_retired: NONE,
             mapped_count: if length >= node.length && node.overlay != NONE {
                 self.state.overlays[node.overlay as usize].mapped_count
             } else {
@@ -697,6 +760,12 @@ impl Storage<'_> {
                 if self.state.overlays[data.overlay as usize].pages[logical] != NONE {
                     if logical >= first_removed || logical == data.tail.logical as usize {
                         data.detached += 1;
+                        if data.first_retired == NONE {
+                            data.first_retired =
+                                self.state.overlays[data.overlay as usize].pages[logical];
+                        }
+                    } else {
+                        data.last_keep = self.state.overlays[data.overlay as usize].pages[logical];
                     }
                     // A COW tail replaces the same logical mapping. Prospective counts
                     // are paid by this scan and validated by the captured data generation.
@@ -739,30 +808,33 @@ impl Storage<'_> {
             }
             let first_removed = (data.length as usize).div_ceil(PAGE);
             let overlay = &mut self.state.overlays[data.overlay as usize];
-            let mut live = NONE;
-            let mut retired = NONE;
-            for logical in 0..FILE_PAGES {
-                let old = overlay.pages[logical];
-                if old == NONE {
-                    continue;
-                }
-                if logical >= first_removed || logical == data.tail.logical as usize {
-                    self.state.page_next[old as usize] = retired;
-                    retired = old;
-                    overlay.pages[logical] = NONE;
-                } else {
-                    self.state.page_next[old as usize] = live;
-                    live = old;
-                }
-            }
+            let retired = data.first_retired;
+            let mut final_last = data.last_keep;
+            overlay.pages[first_removed..].fill(NONE);
             if data.tail.physical != NONE {
-                overlay.pages[data.tail.logical as usize] = data.tail.physical;
-                self.state.page_logical[data.tail.physical as usize] = data.tail.logical;
-                self.state.page_next[data.tail.physical as usize] = live;
-                live = data.tail.physical;
+                let tail = data.tail.physical;
+                overlay.pages[data.tail.logical as usize] = tail;
+                self.state.page_logical[tail as usize] = data.tail.logical;
+                self.state.page_next[tail as usize] = NONE;
+                if data.last_keep == NONE {
+                    overlay.head = tail;
+                } else {
+                    self.state.page_next[data.last_keep as usize] = tail;
+                }
+                final_last = tail;
                 data.tail = TempPage::EMPTY;
+            } else if data.last_keep == NONE {
+                overlay.head = NONE;
+            } else {
+                self.state.page_next[data.last_keep as usize] = NONE;
             }
-            overlay.head = live;
+            if final_last == NONE {
+                overlay.group_tail.fill(NONE);
+            } else {
+                let group = self.state.page_logical[final_last as usize] as usize / 64;
+                overlay.group_tail[group] = final_last;
+                overlay.group_tail[group + 1..].fill(NONE);
+            }
             overlay.mapped_count = data.mapped_count;
             overlay.shadow_boot_sectors = data.shadow_boot_sectors;
             if retired != NONE {
@@ -1562,10 +1634,8 @@ impl<'a> Storage<'a> {
             overlay.mapped_count += 1;
             overlay.shadow_boot_sectors +=
                 boot_sectors(p, self.state.nodes[token.slot as usize].boot_visible_length);
-            overlay.pages[p] = page;
-            self.state.page_next[page as usize] = self.state.overlays[i].head;
-            self.state.page_logical[page as usize] = p as u16;
-            self.state.overlays[i].head = page;
+            let predecessor = overlay.predecessor(p);
+            self.link_page(i, p, page, predecessor);
             self.state.accounts[a].as_mut().unwrap().usage.pages += 1;
         }
         for (n, b) in bytes.iter().enumerate() {
@@ -1613,6 +1683,7 @@ impl<'a> Storage<'a> {
         }
         if overlay != NONE {
             self.state.overlays[overlay as usize].pages.fill(NONE);
+            self.state.overlays[overlay as usize].group_tail.fill(NONE);
             self.state.overlays[overlay as usize].head = NONE;
             self.state.overlays[overlay as usize].mapped_count = 0;
             self.state.overlays[overlay as usize].shadow_boot_sectors = 0;
@@ -1665,6 +1736,9 @@ impl<'a> Storage<'a> {
             let p = self.state.page_logical[page as usize] as usize;
             self.state.overlays[i].head = self.state.page_next[page as usize];
             self.state.overlays[i].pages[p] = NONE;
+            if self.state.overlays[i].group_tail[p / 64] == page {
+                self.state.overlays[i].group_tail[p / 64] = NONE;
+            }
             self.state.overlays[i].mapped_count -= 1;
             self.state.overlays[i].shadow_boot_sectors -= boot_sectors(
                 p,
@@ -2083,6 +2157,7 @@ mod page_tests {
             node: old.slot,
             root: 7,
             pages: [123; FILE_PAGES],
+            group_tail: [123; FILE_PAGES / 64],
             head: 123,
             mapped_count: 55,
             shadow_boot_sectors: 77,
@@ -2097,6 +2172,7 @@ mod page_tests {
         assert_eq!(reservation.token.slot, old.slot);
         assert!(reservation.token.generation > old.generation);
         let overlay = &storage.state.overlays[slot];
+        assert_eq!(overlay.group_tail, [NONE; FILE_PAGES / 64]);
         assert_eq!(overlay.node, reservation.token.slot);
         assert_eq!(overlay.root, reservation.root);
         assert_eq!(overlay.head, NONE);
@@ -2164,5 +2240,192 @@ mod page_tests {
         assert!(gap[..gap.len() - 1].iter().all(|&b| b == 0));
         assert_eq!(gap[gap.len() - 1], b'x');
         assert_eq!(storage.usage(FIRST).pages, 1);
+    }
+}
+
+#[cfg(test)]
+mod sorted_chain_tests {
+    use super::*;
+    const ACCOUNT: Root = Root {
+        id: 88,
+        generation: 7,
+    };
+    fn file(storage: &mut Storage<'_>, name: &[u8]) -> Token {
+        let reservation = storage
+            .reserve(ACCOUNT, ROOT, name, (crate::REG, 0o600, 0, 0))
+            .unwrap();
+        storage.commit(reservation).unwrap()
+    }
+    fn check(storage: &Storage<'_>, token: Token) {
+        let overlay = &storage.state.overlays[storage.node(token).unwrap().overlay as usize];
+        let mut physical = overlay.head;
+        for (logical, &mapped) in overlay.pages.iter().enumerate() {
+            if mapped == NONE {
+                continue;
+            }
+            assert_eq!(physical, mapped, "logical {logical}");
+            assert_eq!(
+                storage.state.page_logical[physical as usize] as usize,
+                logical
+            );
+            physical = storage.state.page_next[physical as usize];
+        }
+        assert_eq!(physical, NONE);
+        for group in 0..FILE_PAGES / 64 {
+            let expected = overlay.pages[group * 64..(group + 1) * 64]
+                .iter()
+                .rfind(|&&page| page != NONE)
+                .copied()
+                .unwrap_or(NONE);
+            assert_eq!(overlay.group_tail[group], expected, "group {group}");
+        }
+    }
+    fn paid_write(storage: &mut Storage<'_>, token: Token, logical: usize) {
+        let mut write = storage
+            .prepare_data_write(token, ACCOUNT, (logical * PAGE) as u64, 1)
+            .unwrap();
+        while !storage.step_data_write(&mut write).unwrap() {}
+        storage
+            .commit_data_write(&mut write, b"x", proto_fs::Timestamp::ZERO)
+            .unwrap();
+        assert!(storage.cancel_data_write(&mut write).unwrap());
+    }
+    fn truncate(storage: &mut Storage<'_>, token: Token, length: u64) {
+        let mut truncate = storage.prepare_data_truncate(token, length).unwrap();
+        while !storage.step_data_truncate(&mut truncate).unwrap() {}
+        storage
+            .commit_data_truncate(&mut truncate, proto_fs::Timestamp::ZERO)
+            .unwrap();
+        storage
+            .commit_data_truncate(&mut truncate, proto_fs::Timestamp::ZERO)
+            .unwrap();
+        assert!(storage.cancel_data_truncate(&mut truncate).unwrap());
+        check(storage, token);
+    }
+    #[test]
+    fn sparse_reverse_and_permuted_insertions_keep_both_write_paths_sorted() {
+        for paid in [false, true] {
+            let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+            let storage = &mut ram.storage;
+            let token = file(storage, b"insertion");
+            for logical in [2047, 64, 63, 0, 1024, 128, 1, 1023] {
+                if paid {
+                    paid_write(storage, token, logical);
+                } else {
+                    storage.write(token, ACCOUNT, logical * PAGE, b"l").unwrap();
+                }
+                check(storage, token);
+            }
+            for i in 0..128 {
+                let logical = (i * 73 + 119) % FILE_PAGES;
+                if paid {
+                    paid_write(storage, token, logical);
+                } else {
+                    storage.write(token, ACCOUNT, logical * PAGE, b"l").unwrap();
+                }
+                check(storage, token);
+            }
+            // A two-page paid insertion links the second new page after the first.
+            let mut write = storage
+                .prepare_data_write(token, ACCOUNT, (33 * PAGE - 1) as u64, 2)
+                .unwrap();
+            while !storage.step_data_write(&mut write).unwrap() {}
+            storage
+                .commit_data_write(&mut write, b"ab", proto_fs::Timestamp::ZERO)
+                .unwrap();
+            check(storage, token);
+        }
+    }
+    #[test]
+    fn full_mapping_tail_split_extend_gc_and_reuse_preserve_live_cache() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let storage = &mut ram.storage;
+        let token = file(storage, b"full-chain");
+        for logical in (0..FILE_PAGES).rev() {
+            paid_write(storage, token, logical);
+        }
+        check(storage, token);
+        truncate(storage, token, PAGE as u64 + 1);
+        let retained = storage.usage(ACCOUNT).pages;
+        assert_eq!(retained, FILE_PAGES as u16 + 1);
+        for _ in 0..PAGES * 2 {
+            storage.reclaim_step();
+        }
+        assert_eq!(storage.usage(ACCOUNT).pages, 2);
+        check(storage, token);
+        paid_write(storage, token, 63);
+        paid_write(storage, token, 64);
+        paid_write(storage, token, 2047);
+        check(storage, token);
+        truncate(storage, token, (65 * PAGE) as u64);
+        truncate(storage, token, (64 * PAGE) as u64);
+        truncate(storage, token, (63 * PAGE + 17) as u64);
+        truncate(storage, token, 0);
+        paid_write(storage, token, 2047);
+        paid_write(storage, token, 0);
+        check(storage, token);
+    }
+    #[test]
+    fn absent_tail_cancel_and_generation_failure_leave_links_and_cache_unchanged() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let storage = &mut ram.storage;
+        let token = file(storage, b"sparse-tail");
+        for logical in [2047, 128, 64, 0] {
+            paid_write(storage, token, logical);
+        }
+        let mut old = storage
+            .prepare_data_truncate(token, (63 * PAGE + 17) as u64)
+            .unwrap();
+        while !storage.step_data_truncate(&mut old).unwrap() {}
+        paid_write(storage, token, 63);
+        assert_eq!(
+            storage.commit_data_truncate(&mut old, proto_fs::Timestamp::ZERO),
+            Err(proto_fs::STALE_PROOF)
+        );
+        while !storage.cancel_data_truncate(&mut old).unwrap() {}
+        check(storage, token);
+        let mut canceled = storage
+            .prepare_data_truncate(token, (63 * PAGE + 17) as u64)
+            .unwrap();
+        while !storage.step_data_truncate(&mut canceled).unwrap() {}
+        while !storage.cancel_data_truncate(&mut canceled).unwrap() {}
+        check(storage, token);
+        truncate(storage, token, (62 * PAGE + 17) as u64);
+        assert_eq!(
+            storage.state.overlays[storage.node(token).unwrap().overlay as usize].mapped_count,
+            1
+        );
+    }
+    #[test]
+    fn inode_gc_clears_only_the_popped_group_tail_and_reinitializes_reused_overlay() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let storage = &mut ram.storage;
+        let token = file(storage, b"inode-cache");
+        for logical in [128, 64, 1, 0] {
+            paid_write(storage, token, logical);
+        }
+        let slot = storage.node(token).unwrap().overlay as usize;
+        storage.unlink(ROOT, b"inode-cache", ACCOUNT).unwrap();
+        for _ in 0..4 {
+            assert!(storage.reclaim_inode_step());
+            let overlay = &storage.state.overlays[slot];
+            for group in 0..FILE_PAGES / 64 {
+                let expected = overlay.pages[group * 64..(group + 1) * 64]
+                    .iter()
+                    .rfind(|&&page| page != NONE)
+                    .copied()
+                    .unwrap_or(NONE);
+                assert_eq!(overlay.group_tail[group], expected);
+            }
+        }
+        assert!(storage.reclaim_inode_step());
+        assert_eq!(
+            storage.state.overlays[slot].group_tail,
+            [NONE; FILE_PAGES / 64]
+        );
+        let replacement = file(storage, b"replacement-cache");
+        paid_write(storage, replacement, 2047);
+        paid_write(storage, replacement, 0);
+        check(storage, replacement);
     }
 }
