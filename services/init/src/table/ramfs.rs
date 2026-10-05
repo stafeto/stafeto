@@ -532,10 +532,10 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 const STEPS_QUOTA: u64 = (256 + 16) * PAGE;
 
 /// The probe and each child it spawns inherit this budget. Its 1 MiB
-/// allocator growth needs 555 transient pages: 278 live, 274 for the
-/// memory object and 3 prepaid page tables. The image maps 29/108/40 pages.
+/// allocator growth needs 556 transient pages: 279 live, 274 for the
+/// memory object and 3 prepaid page tables. The image maps 29/109/40 pages.
 /// Retain the 16-page reserve.
-const PROCS_QUOTA: u64 = (555 + 16) * PAGE;
+const PROCS_QUOTA: u64 = (556 + 16) * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and
