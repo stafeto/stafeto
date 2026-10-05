@@ -207,26 +207,25 @@ pub extern "C" fn rtbench_io_init() -> c_int {
     ) else {
         return -1;
     };
-    let Ok(mut fresh) = posix_fs::PosixFs::from_sessions(ram, Some(uart), b"/", None, false) else {
-        return -1;
-    };
+    let startup = posix_fs::StartupFiles::from_sessions(ram, Some(uart), Some(pipe), None);
     let Some(identity) = posix_abi::process::identity() else {
         return -1;
     };
-    if fresh.bind(identity).is_err() {
+    if startup.bind(identity).is_err() {
         return -1;
     }
-    fresh.set_pipes(Some(pipe));
-    posix_abi::shared::with_files(|files| {
-        if files.descriptors().any(|(fd, _, _)| fd > 2) {
-            return Err(posix_abi::constants::EBUSY);
+    match posix_abi::shared::with_files(|files| Ok(files.replace_initial_transports(startup))) {
+        Ok(Ok(old)) => {
+            drop(old);
+            0
         }
-        Ok(core::mem::replace(files, fresh))
-    })
-    .map_or(-1, |old| {
-        drop(old);
-        0
-    })
+        // Both transport sets are returned out of FILES_LOCK before any Drop.
+        Ok(Err((_, incoming))) => {
+            drop(incoming);
+            -1
+        }
+        Err(_) => -1,
+    }
 }
 
 /// TTY is attached only while the new scenarios run; existing fds survive.
