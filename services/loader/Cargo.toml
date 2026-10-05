@@ -8,6 +8,10 @@ license = "GPL-3.0-or-later WITH GCC-exception-3.1"
 description = "The loader of POSIX programs from files: it runs in the new process, which pays for the program's image"
 build = "build.rs"
 
+[lib]
+name = "loader_image"
+path = "src/image_info.rs"
+
 [[bin]]
 name = "loader"
 test = false
@@ -16,6 +20,7 @@ bench = false
 [features]
 auth-probe = []
 image-gates = ["auth-probe"]
+image-info-probe = ["image-gates"]
 # The probes of the copy of a fork (posix-procs): pieces of 64 KiB, so
 # that the copy of a region past one piece, with an offset into the
 # parent's object, runs within a record's quota of 2 MiB.

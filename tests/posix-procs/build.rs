@@ -58,6 +58,10 @@ fn main() {
         ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
         .arg(format!(
+            "-DIMAGE_INFO_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_IMAGE_INFO_PROBE").is_some())
+        ))
+        .arg(format!(
             "-DPENDING_OPEN_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_PENDING_OPEN").is_some())
         ))

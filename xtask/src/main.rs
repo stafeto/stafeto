@@ -1095,6 +1095,7 @@ commands:
   image-gates-steps measure retained image dispatches under icount
   image-gates-normal-steps measure normal SetId without reply corruption
   loader-abort verify retained file cleanup after genuine exec cancellation
+  loader-info verify strict retained image metadata and incoming handle cleanup
   ramfs-gc verify binding progress during queued page reclamation
   loader-abort-steps measure retained cleanup audits at resolver limits
   ramfs-cleanup verify unfinished binding cleanup with a foreign holder
@@ -1216,6 +1217,7 @@ fn main() {
         Some("image-gates-steps") => image_gates_probe(true, false),
         Some("image-gates-normal-steps") => image_gates_probe(true, true),
         Some("loader-abort") => loader_abort_probe(false),
+        Some("loader-info") => loader_info_probe(),
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-files-loss") => posix_files_loss(),
@@ -2804,6 +2806,38 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
         }
         println!("RAM image dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     }
+    Ok(())
+}
+
+fn loader_info_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 6] = {
+        let mut programs = LOADER_ABORT_PROGRAMS;
+        programs[0].3 = &["table-posix-files", "loader-info"];
+        programs[1].3 = &["image-info-probe", "steps"];
+        programs[4].3 = &["image-info-probe"];
+        programs[5].3 = &["image-info-probe"];
+        programs
+    };
+    let image = build_boot_image("boot-loader-info.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    command.args(qemu::ICOUNT);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "posix-files: strict image metadata and incoming handle cleanup ok",
+    )?;
+    let steps = longest_steps(&output.lines, "2");
+    if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "RAM image metadata kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    println!("RAM image metadata dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     Ok(())
 }
 

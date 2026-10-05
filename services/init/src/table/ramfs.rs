@@ -200,9 +200,19 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
 ];
 
 /// Genuine uncommitted exec attempts with one pending image at a time.
+#[cfg(all(feature = "loader-abort", not(feature = "loader-info")))]
+const RAM_LOADER_INFO: Record = RAM_CLOCKED;
+#[cfg(feature = "loader-info")]
+const RAM_LOADER_INFO: Record = Record {
+    // This diagnostic ELF maps 9 RO + 31 RX + 920 RW pages.
+    // The fixed data pool, stack and runtime allowance are paid separately.
+    quota: (4096 + 960 + 12 + 128) * PAGE,
+    ..RAM_CLOCKED
+};
+
 #[cfg(feature = "loader-abort")]
 pub const POSIX_FILES_TABLE: &[Record] = &[
-    RAM_CLOCKED,
+    RAM_LOADER_INFO,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 2048 * PAGE + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]

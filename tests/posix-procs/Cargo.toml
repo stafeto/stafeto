@@ -21,6 +21,7 @@ files = ["pending-open"]
 pending-open = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt", "dep:posix-fs", "dep:posix-sync"]
 loader-abort = ["files", "dep:proto-process", "dep:proto-loader", "dep:posix-fs"]
 image-gates = ["loader-abort"]
+image-info-probe = ["loader-abort"]
 image-gates-normal = ["image-gates"]
 terminal = ["posix-crt/uart-input"]
 
