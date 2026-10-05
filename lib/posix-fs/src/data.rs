@@ -713,6 +713,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn data_cleanup_release_rejects_unrelated_domains_before_rpc() {
+        let fs = files();
+        assert_eq!(release_data_target(&fs.transport(), None), Ok(()));
+        for target in [
+            Target::Input,
+            Target::Output,
+            Target::Error,
+            Target::Pipe(7),
+            Target::Tty(9),
+        ] {
+            assert_eq!(
+                release_data_target(&fs.transport(), Some(target)),
+                Err(FsError::Io)
+            );
+        }
+    }
+
     fn retired(fs: &PosixFs, claim: ScalarClaimToken) -> TerminalCleanupAuthority {
         let TerminalQueryResult::Retired(authority) = fs
             .data_terminal_query_context(claim)
@@ -1188,6 +1206,15 @@ impl CommitContext {
     }
 }
 
+#[inline(never)]
+fn release_data_target(transport: &Transport, target: Option<Target>) -> Result<(), FsError> {
+    match target {
+        None => Ok(()),
+        Some(Target::Ram(fd) | Target::Random(fd)) => transport.close_file(fd),
+        Some(_) => Err(FsError::Io),
+    }
+}
+
 /// Exact cleanup custody persists in the scalar hold until these calls succeed.
 pub struct CleanupContext {
     cleanup: ScalarCleanup<Target, Recovery>,
@@ -1230,7 +1257,7 @@ impl CleanupContext {
             Ok(()) | Err(Status::Unknown(proto_fs::OPEN_RETIRED)) => {}
             Err(error) => return Err(FsError::from(error)),
         }
-        self.transport.release(self.cleanup.last_target)?;
+        release_data_target(&self.transport, self.cleanup.last_target)?;
         Ok(SmallCleanupProof {
             token: self.cleanup.token,
             last_target: self.cleanup.last_target,
