@@ -28,6 +28,8 @@ pub mod handle;
 pub mod loader;
 pub mod mmio;
 pub mod msgbuf;
+#[cfg(feature = "resource-meter")]
+pub mod resource_meter;
 pub mod service;
 pub mod startup;
 pub mod sys;

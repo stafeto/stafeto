@@ -53,6 +53,8 @@ pub fn calls() -> u64 {
 /// As for `raw`.
 #[inline(always)]
 unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
+    #[cfg(feature = "resource-meter")]
+    crate::resource_meter::before::<N>();
     #[cfg(feature = "count-calls")]
     CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if OUT11 {
@@ -98,6 +100,8 @@ unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
             )
         };
     }
+    #[cfg(feature = "resource-meter")]
+    crate::resource_meter::after::<N>(x[0]);
 }
 
 /// System call `N` with `x` in x0-x9; returns x0-x9 as the kernel left
@@ -1026,6 +1030,8 @@ fn received(x: [u64; 12]) -> Result<Received, Error> {
 /// Kernel receive and idle before its return are outside this interval.
 #[cfg(feature = "step-stats")]
 pub fn receive_measured(channel: &Handle<Channel>) -> (u64, Result<Received, Error>) {
+    #[cfg(feature = "resource-meter")]
+    crate::resource_meter::before::<{ Call::Receive.number() }>();
     let mut x = [0; 12];
     x[0] = channel.raw().0;
     #[cfg(feature = "count-calls")]
@@ -1055,6 +1061,8 @@ pub fn receive_measured(channel: &Handle<Channel>) -> (u64, Result<Received, Err
             options(nostack),
         );
     }
+    #[cfg(feature = "resource-meter")]
+    crate::resource_meter::after::<{ Call::Receive.number() }>(x[0]);
     (began, received(x))
 }
 
