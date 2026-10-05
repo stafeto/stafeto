@@ -571,6 +571,53 @@ mod tests {
         assert_eq!(&bytes, b"abc");
     }
 
+    #[test]
+    fn compact_progress_and_owned_feed_keep_input_and_exact_claim() {
+        let mut fs = files();
+        let mut input = [0; 1012];
+        for (i, byte) in input.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let (token, claim) = begin(&mut fs, DataKind::Write, 1012, &input);
+        fs.set_data_progress(claim, Phase::Feeding, 256, 0).unwrap();
+        let feed = fs.data_feed_context(claim).unwrap();
+        assert_eq!(feed.end(), 1004);
+        assert_eq!(&feed.bytes[..1004], &input[..1004]);
+        fs.set_data_progress(claim, Phase::Feeding, 256, feed.end())
+            .unwrap();
+        assert!(
+            fs.set_data_progress(claim, Phase::Feeding, 512, 1012)
+                .is_err()
+        );
+        assert!(
+            fs.set_data_progress(claim, Phase::Feeding, 256, 1013)
+                .is_err()
+        );
+        let last = fs.data_feed_context(claim).unwrap();
+        assert_eq!(last.length, 8);
+        assert_eq!(last.end(), 1012);
+        assert_eq!(&last.bytes[..8], &input[1004..]);
+        fs.release_data_claim(claim).unwrap();
+        let ScalarClaimState::Acquired(current) = fs.claim_data_token(token, owner(1)).unwrap()
+        else {
+            panic!("small exact claim");
+        };
+        assert!(
+            fs.set_data_progress(claim, Phase::Ready, 256, 1012)
+                .is_err()
+        );
+        fs.set_data_progress(current, Phase::Ready, 256, 1012)
+            .unwrap();
+        let view = fs.descriptors.scalar_claim_view(current).unwrap();
+        assert_eq!(view.recovery.input(), &input);
+        let small = fs.data_claim_state(current).unwrap();
+        assert_eq!(small.progress, Phase::Ready);
+        assert_eq!(small.feed_end, 1012);
+        assert_eq!(small.session_handle, fs.sessions().0.raw().0);
+        assert!(core::mem::size_of::<DataState>() < 192);
+        assert_eq!(core::mem::size_of::<PosixFs>(), 38984);
+    }
+
     fn retired(fs: &PosixFs, claim: ScalarClaimToken) -> TerminalCleanupAuthority {
         let TerminalQueryResult::Retired(authority) = fs
             .data_terminal_query_context(claim)
@@ -698,6 +745,65 @@ const _: () = assert!(
 );
 
 pub type Snapshot = ScalarSnapshot<Target, Recovery>;
+pub use posix_fd::ScalarClaimState;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataState {
+    pub owner: Option<OwnerToken>,
+    pub claimant: Option<OwnerToken>,
+    pub phase: ScalarPhase,
+    pub pin: Option<Target>,
+    pub result: Option<ScalarResult>,
+    pub last_target: Option<Target>,
+    pub job: u64,
+    pub position: u64,
+    pub session_handle: u64,
+    pub count: u32,
+    pub feed_end: u16,
+    pub kind: DataKind,
+    pub progress: Phase,
+}
+
+fn state(view: posix_fd::ScalarView<'_, Target, Recovery>) -> DataState {
+    DataState {
+        owner: view.owner,
+        claimant: view.claimant,
+        phase: view.phase,
+        pin: view.pin,
+        result: view.result,
+        last_target: view.last_target,
+        job: view.recovery.job,
+        position: view.recovery.position,
+        session_handle: view.recovery.session_handle,
+        count: view.recovery.count,
+        feed_end: view.recovery.feed_end,
+        kind: view.recovery.kind(),
+        progress: view.recovery.phase,
+    }
+}
+
+fn same_snapshot(view: &posix_fd::ScalarView<'_, Target, Recovery>, snapshot: &Snapshot) -> bool {
+    view.owner == snapshot.owner
+        && view.claimant == snapshot.claimant
+        && view.phase == snapshot.phase
+        && view.pin == snapshot.pin
+        && view.result == snapshot.result
+        && view.last_target == snapshot.last_target
+        && view.recovery == &snapshot.recovery
+}
+
+#[inline(always)]
+fn own_snapshot(view: posix_fd::ScalarView<'_, Target, Recovery>) -> Snapshot {
+    Snapshot {
+        owner: view.owner,
+        claimant: view.claimant,
+        phase: view.phase,
+        recovery: *view.recovery,
+        pin: view.pin,
+        result: view.result,
+        last_target: view.last_target,
+    }
+}
 
 fn valid_job(job: u64) -> bool {
     job >> 8 != 0 && job & 255 < 128
@@ -723,16 +829,16 @@ fn description(target: Target, kind: DataKind) -> Result<DataDescription, FsErro
 }
 
 impl Recovery {
-    pub fn kind(self) -> DataKind {
+    pub fn kind(&self) -> DataKind {
         DataKind::from_number(self.kind as u32).expect("validated resident kind")
     }
-    pub fn count(self) -> u32 {
+    pub fn count(&self) -> u32 {
         self.count
     }
-    pub fn position(self) -> u64 {
+    pub fn position(&self) -> u64 {
         self.position
     }
-    pub fn session_handle(self) -> u64 {
+    pub fn session_handle(&self) -> u64 {
         self.session_handle
     }
     pub fn input(&self) -> &[u8] {
@@ -742,7 +848,7 @@ impl Recovery {
             &[]
         }
     }
-    pub fn request(self, token: ScalarToken, target: Target) -> Result<DataStart, FsError> {
+    pub fn request(&self, token: ScalarToken, target: Target) -> Result<DataStart, FsError> {
         let request = DataStart {
             key: key(token),
             kind: self.kind(),
@@ -797,6 +903,28 @@ pub struct QueryContext {
 }
 
 pub struct StartContext(QueryContext);
+
+/// A bounded owned copy survives unlocking; no resident borrow crosses IPC.
+pub struct FeedContext {
+    context: QueryContext,
+    offset: u16,
+    length: u16,
+    bytes: [u8; proto_fs::FEED_MAX],
+}
+
+impl FeedContext {
+    pub fn end(&self) -> u16 {
+        self.offset + self.length
+    }
+
+    pub fn send_once(&self) -> Result<(), Status> {
+        self.context.transport.files().data_feed_once(
+            self.context.job,
+            u32::from(self.offset),
+            &self.bytes[..usize::from(self.length)],
+        )
+    }
+}
 pub struct StartRejected {
     context: QueryContext,
     status: Status,
@@ -953,6 +1081,73 @@ impl CleanupContext {
 }
 
 impl PosixFs {
+    pub fn data_state(&self, token: ScalarToken) -> Result<DataState, FsError> {
+        Ok(state(self.descriptors.scalar_view(token)?))
+    }
+
+    pub fn data_claim_state(&self, claim: ScalarClaimToken) -> Result<DataState, FsError> {
+        Ok(state(self.descriptors.scalar_claim_view(claim)?))
+    }
+
+    pub fn claim_data_token(
+        &mut self,
+        token: ScalarToken,
+        helper: OwnerToken,
+    ) -> Result<ScalarClaimState, FsError> {
+        if self.descriptors.scalar_view(token)?.recovery.session_handle != self.sessions().0.raw().0
+        {
+            return Err(FsError::Io);
+        }
+        self.descriptors
+            .claim_scalar_token(token, helper)
+            .map_err(FsError::from)
+    }
+
+    pub fn set_data_progress(
+        &mut self,
+        claim: ScalarClaimToken,
+        phase: Phase,
+        job: u64,
+        feed_end: u16,
+    ) -> Result<(), FsError> {
+        let view = self.descriptors.scalar_claim_view(claim)?;
+        let old = view.recovery;
+        if view.owner.is_none()
+            || old.session_handle != self.sessions().0.raw().0
+            || feed_end < old.feed_end
+            || u32::from(feed_end) > old.count
+            || (!old.kind().writes() && feed_end != 0)
+            || (old.job != 0 && job != old.job)
+        {
+            return Err(FsError::Io);
+        }
+        if phase == Phase::Starting {
+            if old.phase != phase || job != 0 || feed_end != old.feed_end {
+                return Err(FsError::Io);
+            }
+        } else if !valid_job(job)
+            || !(phase == old.phase
+                || matches!(
+                    (old.phase, phase),
+                    (
+                        Phase::Starting,
+                        Phase::Feeding | Phase::Preparing | Phase::Ready
+                    ) | (Phase::Feeding, Phase::Preparing | Phase::Ready)
+                        | (Phase::Preparing, Phase::Ready)
+                        | (Phase::Ready, Phase::Committing)
+                ))
+        {
+            return Err(FsError::Io);
+        }
+        self.descriptors
+            .update_scalar_with(claim, |recovery| {
+                recovery.phase = phase;
+                recovery.job = job;
+                recovery.feed_end = feed_end;
+            })
+            .map_err(FsError::from)
+    }
+
     pub fn begin_data(
         &mut self,
         owner: OwnerToken,
@@ -1041,7 +1236,7 @@ impl PosixFs {
             .map_err(FsError::from)
     }
     pub fn data_query_context(&self, claim: ScalarClaimToken) -> Result<QueryContext, FsError> {
-        let snapshot = self.data_claim_snapshot(claim)?;
+        let snapshot = self.descriptors.scalar_claim_view(claim)?;
         let target = snapshot.pin.ok_or(FsError::Io)?;
         let session = self.sessions().0.raw().0;
         if snapshot.recovery.session_handle != session {
@@ -1060,13 +1255,37 @@ impl PosixFs {
         &self,
         claim: ScalarClaimToken,
     ) -> Result<TerminalQueryContext, FsError> {
-        let snapshot = self.data_claim_snapshot(claim)?;
+        let snapshot = self.descriptors.scalar_claim_view(claim)?;
         if snapshot.owner.is_none() {
             return Err(FsError::BadFileDescriptor);
         }
         Ok(TerminalQueryContext {
             context: self.data_query_context(claim)?,
-            snapshot,
+            snapshot: own_snapshot(snapshot),
+        })
+    }
+
+    pub fn data_feed_context(&self, claim: ScalarClaimToken) -> Result<FeedContext, FsError> {
+        let view = self.descriptors.scalar_claim_view(claim)?;
+        let recovery = view.recovery;
+        if view.owner.is_none()
+            || !recovery.kind().writes()
+            || !matches!(recovery.phase, Phase::Feeding)
+            || !valid_job(recovery.job)
+            || recovery.feed_end as u32 >= recovery.count
+        {
+            return Err(FsError::Io);
+        }
+        let offset = recovery.feed_end;
+        let length = (recovery.count as usize - usize::from(offset)).min(proto_fs::FEED_MAX);
+        let mut bytes = [0; proto_fs::FEED_MAX];
+        bytes[..length]
+            .copy_from_slice(&recovery.input()[usize::from(offset)..usize::from(offset) + length]);
+        Ok(FeedContext {
+            context: self.data_query_context(claim)?,
+            offset,
+            length: length as u16,
+            bytes,
         })
     }
 
@@ -1076,7 +1295,7 @@ impl PosixFs {
         token: ScalarToken,
         owner: OwnerToken,
     ) -> Result<TerminalCleanupAuthority, FsError> {
-        let snapshot = self.data_snapshot(token)?;
+        let snapshot = self.descriptors.scalar_view(token)?;
         if snapshot.phase != ScalarPhase::CleanupRequired
             || snapshot.owner != Some(owner)
             || snapshot.recovery.session_handle != self.sessions().0.raw().0
@@ -1085,7 +1304,7 @@ impl PosixFs {
         }
         Ok(TerminalCleanupAuthority {
             token,
-            snapshot,
+            snapshot: own_snapshot(snapshot),
             claim: None,
         })
     }
@@ -1101,16 +1320,18 @@ impl PosixFs {
             return Err(FsError::BadFileDescriptor);
         }
         let snapshot = if let Some(claim) = authority.claim {
-            self.data_claim_snapshot(claim)?
+            self.descriptors.scalar_claim_view(claim)?
         } else {
-            let snapshot = self.data_snapshot(token)?;
+            let snapshot = self.descriptors.scalar_view(token)?;
             if snapshot.phase != ScalarPhase::CleanupRequired {
                 return Err(FsError::BadFileDescriptor);
             }
             snapshot
         };
         let session = self.sessions().0.raw().0;
-        if snapshot != authority.snapshot || snapshot.recovery.session_handle != session {
+        if !same_snapshot(&snapshot, &authority.snapshot)
+            || snapshot.recovery.session_handle != session
+        {
             return Err(FsError::Io);
         }
         let cleanup = self.descriptors.scalar_begin_cleanup(token)?;
@@ -1122,7 +1343,7 @@ impl PosixFs {
     }
 
     pub fn data_commit_context(&self, claim: ScalarClaimToken) -> Result<CommitContext, FsError> {
-        let snapshot = self.data_claim_snapshot(claim)?;
+        let snapshot = self.descriptors.scalar_claim_view(claim)?;
         if snapshot.owner.is_none()
             || snapshot.recovery.phase != Phase::Committing
             || !valid_job(snapshot.recovery.job)
@@ -1132,7 +1353,7 @@ impl PosixFs {
         Ok(CommitContext(self.data_query_context(claim)?))
     }
     pub fn data_start_context(&self, claim: ScalarClaimToken) -> Result<StartContext, FsError> {
-        let snapshot = self.data_claim_snapshot(claim)?;
+        let snapshot = self.descriptors.scalar_claim_view(claim)?;
         if snapshot.owner.is_none()
             || snapshot.recovery.phase != Phase::Starting
             || snapshot.recovery.job != 0
@@ -1175,7 +1396,7 @@ impl PosixFs {
         Ok(())
     }
     pub fn restore_data_preparation(&mut self, proof: PreparedNoEffect) -> Result<(), FsError> {
-        let snapshot = self.data_claim_snapshot(proof.claim)?;
+        let snapshot = self.descriptors.scalar_claim_view(proof.claim)?;
         if snapshot.owner.is_none()
             || snapshot.recovery.phase != Phase::Committing
             || snapshot.pin != Some(proof.target)
@@ -1185,9 +1406,8 @@ impl PosixFs {
         {
             return Err(FsError::Io);
         }
-        let mut recovery = snapshot.recovery;
-        recovery.phase = Phase::Ready;
-        self.descriptors.update_scalar(proof.claim, recovery)?;
+        self.descriptors
+            .update_scalar_with(proof.claim, |recovery| recovery.phase = Phase::Ready)?;
         self.descriptors.release_scalar_claim(proof.claim)?;
         Ok(())
     }
@@ -1201,7 +1421,7 @@ impl PosixFs {
         read_bytes: &[u8],
         errno_of: fn(FsError) -> i32,
     ) -> Result<(), FsError> {
-        let snapshot = self.data_claim_snapshot(claim)?;
+        let snapshot = self.descriptors.scalar_claim_view(claim)?;
         if snapshot.owner.is_none()
             || snapshot.recovery.session_handle != self.sessions().0.raw().0
             || !matches!(outcome.phase, DataPhase::Completed | DataPhase::Canceling)
@@ -1234,13 +1454,13 @@ impl PosixFs {
         if read_bytes.len() != expected {
             return Err(FsError::Io);
         }
-        let mut recovery = snapshot.recovery;
-        recovery.phase = Phase::Completed;
-        recovery.saved_len = expected as u16;
-        if expected != 0 {
-            recovery.bytes[..expected].copy_from_slice(read_bytes);
-        }
-        self.descriptors.update_scalar(claim, recovery)?;
+        self.descriptors.update_scalar_with(claim, |recovery| {
+            recovery.phase = Phase::Completed;
+            recovery.saved_len = expected as u16;
+            if expected != 0 {
+                recovery.bytes[..expected].copy_from_slice(read_bytes);
+            }
+        })?;
         // The exact claim was validated under the same exclusive table borrow.
         self.descriptors.complete_scalar(claim, result)?;
         Ok(())
@@ -1253,7 +1473,7 @@ impl PosixFs {
         owner: OwnerToken,
         out: &mut [u8],
     ) -> Result<ScalarResult, FsError> {
-        let snapshot = self.data_snapshot(token)?;
+        let snapshot = self.descriptors.scalar_view(token)?;
         if snapshot.owner != Some(owner) {
             return Err(FsError::BadFileDescriptor);
         }
@@ -1277,7 +1497,7 @@ impl PosixFs {
     }
 
     pub fn begin_data_cleanup(&mut self, token: ScalarToken) -> Result<CleanupContext, FsError> {
-        let snapshot = self.data_snapshot(token)?;
+        let snapshot = self.descriptors.scalar_view(token)?;
         let session = self.sessions().0.raw().0;
         if snapshot.recovery.session_handle != session
             || (snapshot.owner.is_some()
@@ -1294,10 +1514,10 @@ impl PosixFs {
         })
     }
     pub fn finish_data_cleanup(&mut self, proof: CleanupProof) -> Result<(), FsError> {
-        let snapshot = self.data_snapshot(proof.token)?;
+        let snapshot = self.descriptors.scalar_view(proof.token)?;
         if snapshot.phase != ScalarPhase::Cleaning
             || snapshot.last_target != proof.last_target
-            || snapshot.recovery != proof.recovery
+            || snapshot.recovery != &proof.recovery
             || proof.session != self.sessions().0.raw().0
         {
             return Err(FsError::Io);
@@ -1312,7 +1532,7 @@ impl PosixFs {
         token: ScalarToken,
         owner: OwnerToken,
     ) -> Result<ScalarAbandoned<Target, Recovery>, FsError> {
-        if self.data_snapshot(token)?.owner != Some(owner) {
+        if self.descriptors.scalar_view(token)?.owner != Some(owner) {
             return Err(FsError::BadFileDescriptor);
         }
         self.descriptors
