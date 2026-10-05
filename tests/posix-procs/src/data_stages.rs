@@ -112,6 +112,99 @@ fn full_mapping(files: &Files) -> Result<(), i32> {
     Ok(())
 }
 
+#[cfg(feature = "auth-probe")]
+fn counters(files: &Files) -> Result<([u32; 4], u32), Status> {
+    fn query(files: &Files, method: u16, phase: Option<u32>) -> Result<rt::sys::Reply, Status> {
+        let mut request = proto_wire::Writer::new();
+        proto_wire::Header::new(method, proto_fs::VERSION).write(&mut request)?;
+        if let Some(phase) = phase {
+            request.u32(phase)?;
+        }
+        rt::sys::send(files.sessions().0, request.as_bytes()).map_err(Status::Kernel)
+    }
+    let reply = query(files, 0xfff8, None)?;
+    if !reply.handles.is_empty() {
+        return Err(Status::BadSize);
+    }
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let mut input = proto_wire::Reader::new(reply.bytes(&mut buffer));
+    if input.u32()? != 0 {
+        return Err(Status::BadSize);
+    }
+    let mut counts = [0; 4];
+    for count in &mut counts {
+        *count = input.u32()?;
+    }
+    input.finish()?;
+    let reply = query(files, 0xfff7, Some(3))?;
+    if !reply.handles.is_empty() {
+        return Err(Status::BadSize);
+    }
+    let mut input = proto_wire::Reader::new(reply.bytes(&mut buffer));
+    if input.u32()? != 0 {
+        return Err(Status::BadSize);
+    }
+    let pages = input.u32()?;
+    input.finish()?;
+    Ok((counts, pages))
+}
+
+#[cfg(feature = "auth-probe")]
+fn full_gone(files: &Files, held: PreparedOpen) -> Result<(), i32> {
+    let before = counters(files).map_err(|_| 82)?;
+    let child = super::open_stages::clone_bound(files, &[held.fd]).map_err(|_| 83)?;
+    let bytes = [5; proto_fs::MAX_WRITE];
+    for slot in 0..16 {
+        let request = args(
+            held,
+            slot,
+            DataKind::PWrite,
+            bytes.len() as u32,
+            4095 + slot as u64 * 8192,
+        );
+        let (_, job) = child.data_start_once(request).map_err(|_| 84)?;
+        child
+            .data_feed_once(job, 0, &bytes[..proto_fs::FEED_MAX])
+            .map_err(|_| 85)?;
+        child
+            .data_feed_once(job, proto_fs::FEED_MAX as u32, &bytes[proto_fs::FEED_MAX..])
+            .map_err(|_| 86)?;
+        let mut ready = false;
+        for _ in 0..16 {
+            match child.data_step_once(job) {
+                Ok(()) => {
+                    ready = true;
+                    break;
+                }
+                Err(Status::Unknown(proto_fs::RESOLVING)) => {}
+                Err(_) => return Err(87),
+            }
+        }
+        if !ready {
+            return Err(88);
+        }
+    }
+    let admitted = counters(files).map_err(|_| 89)?;
+    if admitted.0 != [before.0[0], before.0[1] + 16, before.0[2] + 16, before.0[3]]
+        || admitted.1 != before.1 + 32
+    {
+        return Err(92);
+    }
+    drop(child);
+    let mut restored = false;
+    for _ in 0..4000 {
+        if counters(files).map_err(|_| 93)? == before {
+            restored = true;
+            break;
+        }
+        rt::sys::yield_now().map_err(|_| 94)?;
+    }
+    if !restored || files.descriptor_information(held.fd).map_err(|_| 95)?.size != 1 {
+        return Err(96);
+    }
+    Ok(())
+}
+
 fn run(files: &Files) -> Result<(), i32> {
     let held = open(files, 1, b"/tmp/data-stages").map_err(|_| 1)?;
     let input = [0x57; proto_fs::MAX_WRITE];
@@ -119,6 +212,13 @@ fn run(files: &Files) -> Result<(), i32> {
     let (_, job) = files.data_start_once(write).map_err(|_| 2)?;
     if files.data_start_once(write) != Ok((DataPhase::Captured, job)) {
         return Err(3);
+    }
+    if files.open_cancel(job) != Err(Status::Unknown(proto_fs::PERMISSION))
+        || files.open_advance(job, false) != Err(Status::Unknown(proto_fs::PERMISSION))
+        || files.open_start(write.key, b"/tmp/data-stages", proto_fs::READ_WRITE, 0, 0)
+            != Err(Status::Unknown(proto_fs::PERMISSION))
+    {
+        return Err(97);
     }
     if files.data_ack_once(write.key) != Err(Status::Unknown(proto_fs::INVALID_ARGUMENT)) {
         return Err(4);
@@ -258,6 +358,8 @@ fn run(files: &Files) -> Result<(), i32> {
     files.data_feed_once(job, 0, b"X").map_err(|_| 54)?;
     complete(files, job, overflow).map_err(|_| 55)?;
     cleanup(files, overflow.key, true).map_err(|_| 56)?;
+    #[cfg(feature = "auth-probe")]
+    full_gone(files, reused)?;
     files.close_exact(reused).map_err(|_| 57)?;
     full_mapping(files)?;
     Ok(())
