@@ -604,7 +604,7 @@ mod create_directory_policy_tests {
     use crate::storage::{ROOT, Root};
     #[test]
     fn read_only_create_directory_refuses_before_descriptor_charge() {
-        let mut ram = Ram::new(0);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
         let mut fds = Fds {
             root: Root {
                 id: 700,
