@@ -1236,7 +1236,11 @@ fn main() {
         Some("posix-data-steps") => posix_files_run_profile(true, true, false),
         Some("posix-data-loss") => posix_data_loss(),
         Some("posix-open-finalize-clock") => posix_files_run_profile(true, true, true),
-        Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("posix-procs") => match &args[1..] {
+            [] => posix_procs_probe(&qemu::VIRT),
+            [build] if build == "--build" => posix_procs_probe_profile(&qemu::VIRT, true),
+            _ => Err("usage: cargo xtask posix-procs [--build]".into()),
+        },
         Some("posix-initial-fork") => match &args[1..] {
             [] => posix_initial_fork_probe(false),
             [build] if build == "--build" => posix_initial_fork_probe(true),
@@ -3174,11 +3178,18 @@ fn posix_initial_fork_probe(build_only: bool) -> Result<(), String> {
 }
 
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
+    posix_procs_probe_profile(machine, false)
+}
+
+fn posix_procs_probe_profile(machine: &qemu::Machine, build_only: bool) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-posix-procs.img", &POSIX_PROCS_PROGRAMS, BOOT_PROFILE)?;
+    if build_only {
+        return Ok(());
+    }
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
