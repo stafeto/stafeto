@@ -187,6 +187,14 @@ impl View {
     }
 }
 
+/// Header and existing descriptor requirement for the pending binding.
+fn pending_binding_request(require_fds: bool) -> [u8; 12] {
+    let mut request = [0; 12];
+    request[..8].copy_from_slice(&Method::BindPending.header().bytes());
+    request[8..].copy_from_slice(&u32::from(require_fds).to_le_bytes());
+    request
+}
+
 /// Header and exact paid job for the resolver and image handoff requests.
 fn job_request(method: Method, job: u64) -> [u8; 16] {
     let mut request = [0; 16];
@@ -729,9 +737,7 @@ impl Files {
             return Err(Status::BadSize);
         }
         let count = 1 + usize::from(offered.is_some());
-        let mut request = Writer::new();
-        Method::BindPending.header().write(&mut request)?;
-        request.u32(u32::from(require_fds))?;
+        let request = pending_binding_request(require_fds);
         loop {
             let mut outgoing = crate::handle::Outgoing::new();
             if let Some(channel) = offered.take() {
@@ -742,7 +748,7 @@ impl Files {
             outgoing
                 .push(identity.erase())
                 .map_err(|_| Status::BadSize)?;
-            let mut reply = sys::send_handles(root, request.as_bytes(), outgoing)
+            let mut reply = sys::send_handles(root, &request, outgoing)
                 .map_err(|refused| Status::Kernel(refused.error))?;
             let code = Self::reply_code(&reply)?;
             if code == proto_fs::AUTHENTICATING {
@@ -1555,6 +1561,19 @@ mod resolver_small_wire_tests {
                 writer.u64(job).unwrap();
                 assert_eq!(job_request(method, job).as_slice(), writer.as_bytes());
             }
+        }
+    }
+
+    #[test]
+    fn pending_binding_request_matches_the_existing_full_writer() {
+        for require_fds in [false, true] {
+            let mut writer = Writer::new();
+            Method::BindPending.header().write(&mut writer).unwrap();
+            writer.u32(u32::from(require_fds)).unwrap();
+            assert_eq!(
+                pending_binding_request(require_fds).as_slice(),
+                writer.as_bytes()
+            );
         }
     }
 
