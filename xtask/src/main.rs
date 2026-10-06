@@ -3047,7 +3047,7 @@ fn posix_files_loss() -> Result<(), String> {
 fn posix_data_capacity(run: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    const PROGRAMS: [ImageProgram; 8] = [
+    const PROGRAMS: [ImageProgram; 9] = [
         (
             "init",
             "init",
@@ -3068,6 +3068,8 @@ fn posix_data_capacity(run: bool) -> Result<(), String> {
             POSIX_STACK_SIZE,
             &["full-capacity-probe"],
         ),
+        // The Process service loads both genuine factories through this image.
+        POSIX_PROCS_PROGRAMS[6],
         POSIX_PROCS_PROGRAMS[2],
         POSIX_PROCS_PROGRAMS[8],
         POSIX_PROCS_PROGRAMS[9],
