@@ -105,6 +105,24 @@ impl<'a> Bindings<'a> {
         }
     }
 
+    /// Resolve an exact source and artifact name in the checked image.
+    /// Call validate_layout before using the returned program for admission.
+    pub fn resolve<'b>(
+        &self,
+        image: BootImage<'b>,
+        source: InitialSource,
+        name: &[u8],
+    ) -> Result<Program<'b>, Error> {
+        if !(0..self.len()).any(|n| self.entry(n) == source) {
+            return Err(Error::Coverage);
+        }
+        let file = image.file_at(source.artifact).ok_or(Error::Index)?;
+        if file.name.as_bytes() != name {
+            return Err(Error::Program);
+        }
+        Program::parse(file.data).map_err(|_| Error::Program)
+    }
+
     /// Check coverage and metadata against immutable bytes. Seed admission
     /// separately compares content in bounded chunks before trusting this source.
     pub fn validate_layout(&self, image: BootImage<'_>) -> Result<(), Error> {
@@ -273,6 +291,41 @@ mod tests {
             Err(Error::Canonical)
         );
         assert_eq!(validate(&fixture(None, true, false)), Err(Error::Canonical));
+    }
+
+    #[test]
+    fn resolution_requires_exact_source_and_artifact_name() {
+        let bytes = fixture(Some(0), true, false);
+        let image = BootImage::parse(&bytes).unwrap();
+        let metadata = image.files().find(|f| f.name == FILE).unwrap();
+        let bindings = Bindings::parse(metadata.data, image.count()).unwrap();
+        bindings.validate_layout(image).unwrap();
+        let source = bindings.entry(0);
+        assert!(bindings.resolve(image, source, b"init").is_ok());
+        assert_eq!(
+            bindings.resolve(image, source, b"init.elf"),
+            Err(Error::Program)
+        );
+        for incorrect in [
+            InitialSource { raw: 1, ..source },
+            InitialSource {
+                canonical: None,
+                ..source
+            },
+            InitialSource {
+                canonical: Some(1),
+                ..source
+            },
+            InitialSource {
+                artifact: 2,
+                ..source
+            },
+        ] {
+            assert_eq!(
+                bindings.resolve(image, incorrect, b"init"),
+                Err(Error::Coverage)
+            );
+        }
     }
 
     #[test]

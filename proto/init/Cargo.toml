@@ -11,5 +11,6 @@ description = "The protocol of init: its method numbers and the start data of a 
 bench = false
 
 [dependencies]
+bootimg = { path = "../../lib/bootimg" }
 abi = { path = "../../lib/abi" }
 proto-wire = { path = "../wire" }

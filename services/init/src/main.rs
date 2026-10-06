@@ -20,9 +20,9 @@ mod serve;
 mod worker;
 
 use abi::{Access, Rights};
-use bootimg::{BootImage, Program};
+use init::initial::{InitialProgram, Programs};
 use init::labels::Labels;
-use init::table::{self, MAX_RECORDS, Record, TABLE};
+use init::table::{self, MAX_RECORDS, TABLE};
 use proto_init::{OWN_ARGS_MAX, SERVICE_ARGS_FIXED};
 use rt::handle::{Memory, Process};
 use rt::service::Config;
@@ -34,7 +34,7 @@ rt::entry!(main);
 const _: () = assert!(SERVICE_ARGS_FIXED + OWN_ARGS_MAX <= rt::startup::ARGS_MAX);
 // Init lives on the stack of the main thread (64 KiB, INIT_STACK_SIZE of
 // xtask), twice while `Init::new` builds it.
-const _: () = assert!(core::mem::size_of::<serve::Init>() <= 20 * 1024);
+const _: () = assert!(core::mem::size_of::<serve::Init>() <= 21 * 1024);
 
 /// Where init maps the boot image, read-only, for as long as it lives: the
 /// programs it loads are read from there.
@@ -65,10 +65,7 @@ fn main(_: u64) -> u64 {
     let programs = match programs(&init.process, &init.boot_image) {
         Ok(programs) => programs,
         Err(r) => {
-            println!(
-                "init: table refused: {} has no program {} in the boot image",
-                r.name, r.program
-            );
+            println!("init: table refused: {r}");
             return REFUSED;
         }
     };
@@ -100,13 +97,30 @@ fn main(_: u64) -> u64 {
     panic!("init stopped serving its channel: {error:?}")
 }
 
+#[derive(Debug)]
+enum ProgramError {
+    Map,
+    Bindings,
+    Missing(&'static str),
+}
+
+impl core::fmt::Display for ProgramError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Map => f.write_str("boot image mapping failed"),
+            Self::Bindings => f.write_str("invalid initial executable bindings"),
+            Self::Missing(name) => write!(f, "missing initial program {name}"),
+        }
+    }
+}
+
 /// The program of each record of the table, by its place, from the boot
 /// image `image`, which init maps at IMAGE through its process `own`; the
 /// first record whose program is not in the image.
 fn programs(
     own: &Handle<Process>,
     image: &Handle<Memory>,
-) -> Result<[Option<Program<'static>>; MAX_RECORDS], &'static Record> {
+) -> Result<[Option<InitialProgram<'static>>; MAX_RECORDS], ProgramError> {
     let size = sys::memory_info(image).map_or(0, |info| info.size);
     let mapped = sys::mem_map(own, image, 0, size, IMAGE, Access::Read).is_ok();
     let bytes: &'static [u8] = if mapped {
@@ -116,12 +130,16 @@ fn programs(
     } else {
         &[]
     };
-    let boot = BootImage::parse(bytes).ok();
+    if !mapped {
+        return Err(ProgramError::Map);
+    }
+    let boot = Programs::parse(bytes).map_err(|_| ProgramError::Bindings)?;
     let mut programs = [None; MAX_RECORDS];
     for (place, r) in TABLE.iter().enumerate() {
-        let file = boot.and_then(|b| b.files().find(|f| f.name == r.program));
-        let program = file.and_then(|f| Program::parse(f.data).ok());
-        programs[place] = Some(program.ok_or(r)?);
+        programs[place] = Some(
+            boot.get(r.program)
+                .ok_or(ProgramError::Missing(r.program))?,
+        );
     }
     Ok(programs)
 }

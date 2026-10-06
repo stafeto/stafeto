@@ -128,7 +128,7 @@ use abi::{KernelStats, MESSAGE_HANDLES, MESSAGE_MAX};
 use proto_wire::{HEADER_LEN, Header, NAME_LEN, Name, Reader, Status, Writer};
 
 /// The version of the protocol, in the header of each request.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// The methods of init with their numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,8 +186,13 @@ impl Method {
 /// | 30 | root: 0 or 1 |
 /// | 31 | zero |
 /// | 32..48 | the program's name in the boot image |
+/// | 48..52 | packed artifact file index |
+/// | 52..56 | raw ELF file index |
+/// | 56..60 | first canonical rootfs entry, or u32::MAX |
+/// | 60..64 | zero |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Adoption {
+    pub source: bootimg::exec_bindings::InitialSource,
     pub ticket: u64,
     pub quota: u64,
     pub handle_limit: u32,
@@ -197,14 +202,36 @@ pub struct Adoption {
     pub program: Name,
 }
 
+pub use bootimg::exec_bindings::InitialSource;
+
+fn source_valid(source: InitialSource) -> bool {
+    source.artifact < bootimg::rootfs::FILES_MAX as u32
+        && source.raw < bootimg::rootfs::FILES_MAX as u32
+        && source.artifact != source.raw
+        && source
+            .canonical
+            .is_none_or(|n| n < bootimg::rootfs::ENTRIES_MAX as u32)
+}
+
 impl Adoption {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        if !source_valid(self.source) {
+            return Err(Status::BadSize);
+        }
         w.bytes(&proto_wire::reply(Status::Ok))?;
         w.u64(self.ticket)?;
         w.u64(self.quota)?;
         w.u32(self.handle_limit)?;
         w.bytes(&[self.ceiling, self.priority, u8::from(self.root), 0])?;
-        w.name(Some(self.program))
+        w.name(Some(self.program))?;
+        w.u32(self.source.artifact)?;
+        w.u32(self.source.raw)?;
+        w.u32(
+            self.source
+                .canonical
+                .unwrap_or(bootimg::exec_bindings::NONE),
+        )?;
+        w.u32(0)
     }
 
     /// BAD_SIZE unless `bytes` hold status 0 and the fields in their
@@ -220,8 +247,18 @@ impl Adoption {
             return Err(Status::BadSize);
         }
         let program = r.name()?.ok_or(Status::BadSize)?;
+        let (artifact, raw, canonical, reserved) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+        let source = InitialSource {
+            artifact,
+            raw,
+            canonical: (canonical != bootimg::exec_bindings::NONE).then_some(canonical),
+        };
+        if reserved != 0 || !source_valid(source) {
+            return Err(Status::BadSize);
+        }
         r.finish()?;
         Ok(Adoption {
+            source,
             ticket,
             quota,
             handle_limit,
@@ -732,6 +769,11 @@ mod tests {
     #[test]
     fn adoption_round_trips_and_refuses_its_layout() {
         let adoption = Adoption {
+            source: InitialSource {
+                artifact: 5,
+                raw: 12,
+                canonical: Some(3),
+            },
             ticket: 0x1234_5678_9abc,
             quota: 512 * 4096,
             handle_limit: 32,
@@ -742,7 +784,7 @@ mod tests {
         };
         let mut w = Writer::new();
         adoption.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 48);
+        assert_eq!(w.as_bytes().len(), 64);
         assert_eq!(Adoption::read(w.as_bytes()), Ok(adoption));
         let mut bad = w.as_bytes().to_vec();
         bad[30] = 2;
@@ -751,6 +793,49 @@ mod tests {
         refusal[0] = 1;
         assert_eq!(Adoption::read(&refusal), Err(Status::BadSize));
         assert_eq!(Adoption::read(&w.as_bytes()[..47]), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn adoption_source_is_exact_and_legacy_layout_is_rejected() {
+        let mut adoption = Adoption {
+            source: InitialSource {
+                artifact: 5,
+                raw: 12,
+                canonical: None,
+            },
+            ticket: 17,
+            quota: 4096,
+            handle_limit: 32,
+            ceiling: 31,
+            priority: 30,
+            root: false,
+            program: name("guest").unwrap(),
+        };
+        for canonical in [None, Some(0), Some(1023)] {
+            adoption.source.canonical = canonical;
+            let mut w = Writer::new();
+            adoption.write(&mut w).unwrap();
+            let bytes = w.as_bytes();
+            assert_eq!(&bytes[48..52], &5u32.to_le_bytes());
+            assert_eq!(&bytes[52..56], &12u32.to_le_bytes());
+            assert_eq!(&bytes[56..60], &canonical.unwrap_or(u32::MAX).to_le_bytes());
+            assert_eq!(Adoption::read(bytes), Ok(adoption));
+            for cut in 0..bytes.len() {
+                assert_eq!(Adoption::read(&bytes[..cut]), Err(Status::BadSize));
+            }
+            let mut trailing = bytes.to_vec();
+            trailing.push(0);
+            assert_eq!(Adoption::read(&trailing), Err(Status::BadSize));
+            for (at, word) in [(48, 1024u32), (52, 1024), (52, 5), (56, 1024), (60, 1)] {
+                let mut malformed = bytes.to_vec();
+                malformed[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                assert_eq!(Adoption::read(&malformed), Err(Status::BadSize));
+            }
+        }
+        adoption.source.raw = adoption.source.artifact;
+        let mut w = Writer::new();
+        assert_eq!(adoption.write(&mut w), Err(Status::BadSize));
+        assert!(w.as_bytes().is_empty());
     }
 
     #[test]
@@ -1095,8 +1180,8 @@ mod tests {
         assert_eq!(Method::from_number(0), None);
         assert_eq!(Method::from_number(10), None);
         assert_eq!(Method::from_number(12), None);
-        assert_eq!(VERSION, 1);
-        assert_eq!(Method::Start.header().bytes(), [1, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(VERSION, 2);
+        assert_eq!(Method::Start.header().bytes(), [1, 0, 2, 0, 0, 0, 0, 0]);
         assert_eq!(START_PIECE_MAX, 952);
     }
 }

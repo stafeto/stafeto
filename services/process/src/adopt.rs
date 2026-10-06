@@ -90,6 +90,7 @@ extern "C" fn receiver(_: u64) -> ! {
                     &create,
                     [start, witness],
                     &adoption.program,
+                    adoption.source,
                     WINDOW,
                     &own,
                     adoption.priority,
@@ -100,7 +101,7 @@ extern "C" fn receiver(_: u64) -> ! {
                 label: None,
             }),
         };
-        make::adopted(adoption.ticket, made);
+        make::adopted(&adoption, made);
     }
 }
 
