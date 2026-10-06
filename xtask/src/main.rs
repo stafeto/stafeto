@@ -1658,12 +1658,21 @@ fn write_elf_image(
         elf_bytes.push(source.bytes(read_elf)?);
         elf_names.push(source.file_name());
     }
-    for (file, _, stack) in sources {
-        let raw = rootfs::elf_name(file);
-        if *stack == 0 && !elf_names.contains(&raw) {
-            elf_bytes.push(read_elf(file)?);
-            elf_names.push(raw);
-        }
+    let mut initial_raw = Vec::with_capacity(sources.len());
+    for (file, _, _) in sources {
+        let raw = match wanted
+            .iter()
+            .position(|s| matches!(s, rootfs::Source::Elf(program) if program == file))
+        {
+            Some(index) => index,
+            None => {
+                let index = elf_bytes.len();
+                elf_bytes.push(read_elf(file)?);
+                elf_names.push(rootfs::elf_name(file));
+                index
+            }
+        };
+        initial_raw.push((*file, raw));
     }
     let first = list.len() as u32;
     for (file, bytes) in elf_names.iter().zip(&elf_bytes) {
@@ -1672,12 +1681,53 @@ fn write_elf_image(
     let table = if listed.is_empty() {
         None
     } else {
-        Some(rootfs::table(&listed, first, list.len() as u32 + 1)?)
+        Some(rootfs::table(&listed, first, list.len() as u32 + 2)?)
     };
     if let Some(table) = &table {
         list.push(("rootfs", table.as_slice()));
     }
+    // Initial packed programs and their exact raw ELF copies share an immutable association.
+    let root_table = table
+        .as_ref()
+        .map(|bytes| bootimg::rootfs::Rootfs::parse(bytes, list.len() as u32 + 1))
+        .transpose()
+        .map_err(|e| format!("{name}: rootfs bindings: {e}"))?;
+    let mut associations = Vec::with_capacity(files.len());
+    for (artifact, (file, packed, _)) in files.iter().enumerate() {
+        let raw = initial_raw
+            .iter()
+            .find(|(program, _)| program == file)
+            .map(|(_, index)| *index)
+            .ok_or_else(|| format!("{name}: missing initial ELF for {file}"))?;
+        let packed = bootimg::Program::parse(packed).map_err(|e| format!("{name}: {e}"))?;
+        let original = bootimg::elf::program(&elf_bytes[raw], packed.stack_size)
+            .map_err(|e| format!("{name}: {e}"))?;
+        if packed != original {
+            return Err(format!(
+                "{name}: initial artifact {file} differs from its ELF"
+            ));
+        }
+        let raw = first + raw as u32;
+        let canonical = root_table.as_ref().and_then(|t| {
+            (0..t.len() as u32).find(|&n| {
+                let entry = t.entry(n);
+                !entry.is_directory() && entry.file == raw
+            })
+        });
+        associations.push(bootimg::exec_bindings::InitialSource {
+            artifact: artifact as u32,
+            raw,
+            canonical,
+        });
+    }
+    let bindings = bootimg::exec_bindings::write(&associations, list.len() as u32 + 1)
+        .map_err(|e| format!("{name}: initial bindings: {e:?}"))?;
+    list.push((bootimg::exec_bindings::FILE, &bindings));
     let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
+    let parsed = bootimg::BootImage::parse(&image).map_err(|e| format!("{name}: {e}"))?;
+    bootimg::exec_bindings::Bindings::parse(&bindings, parsed.count())
+        .and_then(|b| b.validate_layout(parsed))
+        .map_err(|e| format!("{name}: initial binding validation: {e:?}"))?;
     let path = target.join(name);
     std::fs::write(&path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
     let from: Vec<_> = files
