@@ -255,7 +255,11 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
 /// existing loader reserve are paid by the Process service's pool.
 #[cfg(feature = "full-capacity-probe")]
 pub const POSIX_FILES_TABLE: &[Record] = &[
-    RAM_POSIX_FILES,
+    Record {
+        // This capacity ELF maps 10 RO + 39 RX + 925 RW pages.
+        quota: (4096 + 974 + 12 + 128) * PAGE,
+        ..RAM_POSIX_FILES
+    },
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 10 * 2048 * PAGE + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
