@@ -194,7 +194,7 @@
 use abi::ProcessState;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
-pub const VERSION: u16 = 10;
+pub const VERSION: u16 = 12;
 
 mod limits;
 mod retained;
@@ -470,6 +470,8 @@ pub enum Method {
     DisconnectCtty = 52,
     /// Read the exact retained authority of a previously vouched loader.
     RetainedLoader = 53,
+    InitialMapQuery = 56,
+    InitialMapAck = 57,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -481,7 +483,7 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 56, 57,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -966,6 +968,7 @@ impl WaitResult {
 }
 
 /// Where the page of its record lies in a POSIX process.
+pub mod initial_map;
 pub mod job;
 
 pub const PAGE_ADDRESS: usize = 0x0D00_0000;
@@ -1364,6 +1367,8 @@ mod tests {
             Method::ReturnSignal,
             Method::DisconnectCtty,
             Method::RetainedLoader,
+            Method::InitialMapQuery,
+            Method::InitialMapAck,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
