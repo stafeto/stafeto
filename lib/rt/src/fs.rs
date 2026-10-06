@@ -187,6 +187,22 @@ impl View {
     }
 }
 
+/// Header and exact paid job for the resolver and image handoff requests.
+fn job_request(method: Method, job: u64) -> [u8; 16] {
+    let mut request = [0; 16];
+    request[..8].copy_from_slice(&method.header().bytes());
+    request[8..].copy_from_slice(&job.to_le_bytes());
+    request
+}
+
+/// ResolveStep returns only the canonical status envelope, with no capabilities.
+fn proof_ready_status(len: usize, first: u64, handles: usize) -> Result<Status, Status> {
+    if len != proto_wire::HEADER_LEN || first >> 32 != 0 || handles != 0 {
+        return Err(Status::BadSize);
+    }
+    Ok(Status::from_code(first as u32))
+}
+
 /// A retained service preparation; cancellation also releases the captured base.
 struct Proof<'a> {
     files: &'a Files,
@@ -197,13 +213,10 @@ impl Proof<'_> {
         Files::send_on(&self.files.channel, request)
     }
     fn ready(&self) -> Result<(), Status> {
-        let mut w = Writer::new();
-        Method::ResolveStep.header().write(&mut w)?;
-        w.u64(self.id)?;
+        let request = job_request(Method::ResolveStep, self.id);
         loop {
-            let reply = self.send(w.as_bytes())?;
-            let mut buffer = [0; MESSAGE_MAX];
-            match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+            let reply = self.send(&request)?;
+            match proof_ready_status(reply.len, reply.words[0], reply.handles.len())? {
                 Status::Ok => return Ok(()),
                 Status::Unknown(proto_fs::RESOLVING) => {}
                 status => return Err(status),
@@ -213,15 +226,8 @@ impl Proof<'_> {
 }
 impl Drop for Proof<'_> {
     fn drop(&mut self) {
-        let mut w = Writer::new();
-        if Method::ResolveCancel
-            .header()
-            .write(&mut w)
-            .and_then(|()| w.u64(self.id))
-            .is_ok()
-        {
-            while let Err(Status::Kernel(Error::Interrupted)) = self.send(w.as_bytes()) {}
-        }
+        let request = job_request(Method::ResolveCancel, self.id);
+        while let Err(Status::Kernel(Error::Interrupted)) = self.send(&request) {}
     }
 }
 
@@ -811,11 +817,9 @@ impl Files {
     /// The service requires a genuine Pending loader binding for the image handoff.
     pub fn open_exec_bound(&self, path: &[u8]) -> Result<Handle<Channel>, Status> {
         let proof = self.prepare(path)?;
-        let mut w = Writer::new();
-        Method::OpenExec.header().write(&mut w)?;
-        w.u64(proof.id)?;
+        let request = job_request(Method::OpenExec, proof.id);
         loop {
-            let mut reply = proof.send(w.as_bytes())?;
+            let mut reply = proof.send(&request)?;
             let code = Self::reply_code(&reply)?;
             if code == 0 {
                 if reply.len != 4
@@ -1534,6 +1538,64 @@ mod small_data_wire_tests {
                 Files::data_query_reply(len, &completed(), 0, args()),
                 Err(Status::BadSize)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolver_small_wire_tests {
+    use super::*;
+
+    #[test]
+    fn paid_job_requests_match_the_existing_full_writer() {
+        for method in [Method::ResolveStep, Method::OpenExec, Method::ResolveCancel] {
+            for job in [1, 256, u64::MAX] {
+                let mut writer = Writer::new();
+                method.header().write(&mut writer).unwrap();
+                writer.u64(job).unwrap();
+                assert_eq!(job_request(method, job).as_slice(), writer.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn ready_status_preserves_canonical_outcomes() {
+        for status in [
+            Status::Ok,
+            Status::Unknown(proto_fs::RESOLVING),
+            Status::Unknown(proto_fs::STALE_PROOF),
+            Status::Unknown(proto_fs::ACCESS_DENIED),
+            Status::Kernel(Error::Interrupted),
+            Status::BadSize,
+        ] {
+            let bytes = proto_wire::reply(status);
+            assert_eq!(bytes.len(), 8);
+            let first = u64::from_le_bytes(bytes);
+            assert_eq!(proof_ready_status(8, first, 0), Ok(status));
+        }
+    }
+
+    #[test]
+    fn ready_status_rejects_prefixes_reserved_bits_and_capabilities() {
+        for code in [0, proto_fs::RESOLVING, proto_fs::ACCESS_DENIED] {
+            for len in [0, 1, 4, 7, 9, 16, 32, MESSAGE_MAX, MESSAGE_MAX + 1] {
+                assert_eq!(
+                    proof_ready_status(len, code as u64, 0),
+                    Err(Status::BadSize)
+                );
+            }
+            for bit in 32..64 {
+                assert_eq!(
+                    proof_ready_status(8, code as u64 | 1 << bit, 0),
+                    Err(Status::BadSize)
+                );
+            }
+            for caps in [1, 2, 8] {
+                assert_eq!(
+                    proof_ready_status(8, code as u64, caps),
+                    Err(Status::BadSize)
+                );
+            }
         }
     }
 }
