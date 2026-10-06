@@ -27,6 +27,17 @@ use posix_process_service::executable::{ExecCustody, ExecHolder, RetiredExec, St
 #[cfg(feature = "image-probe")]
 use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
+use posix_process_service::preparing::{
+    self, GroupClaim, Kind as PrepareKind, Phase as PreparePhase, RecordWork,
+};
+type NativePreparation = preparing::StartPreparation<
+    Handle<Process>,
+    Handle<Channel>,
+    Handle<Memory>,
+    Handle<Thread>,
+    Pending,
+>;
+type Work = RecordWork<Replacing, NativePreparation>;
 use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
@@ -56,6 +67,7 @@ mod loader;
 mod make;
 mod pages;
 mod replace;
+mod start;
 use core::mem::ManuallyDrop;
 rt::entry!(main);
 /// The sessions of the loop: those of the service's own threads through
@@ -187,13 +199,16 @@ struct Processes {
     /// The ExecCommit of each record that waits for init, by the record's
     /// index, the records whose new process waits for the thread that
     /// tells init, and that thread's Replace that waits for one.
-    replacing: [Option<Replacing>; RECORDS],
+    replacing: [Option<Work>; RECORDS],
     replace_queue: Queue,
     replacer: Option<Pending>,
     replace_cleanup: usize,
     abort_cleanup: usize,
     replace_cursor: usize,
     replace_turn: bool,
+    preparing_count: u16,
+    preparing_cursor: u16,
+    preparing_turn: bool,
     /// The pages of the records.
     pages: pages::Pages,
     /// The page of the credentials generations.
@@ -253,6 +268,9 @@ impl Processes {
             abort_cleanup: 0,
             replace_cursor: 0,
             replace_turn: false,
+            preparing_count: 0,
+            preparing_cursor: 0,
+            preparing_turn: false,
             pages: pages::Pages::new(),
             generations: generations::Generations::new(),
             witnesses: [const { None }; RECORDS],
@@ -415,8 +433,8 @@ impl Processes {
     /// request brought, the process's end told through the record's exit
     /// place (O(1)). The reply: the PID and the label, a copy of the
     /// process for the load and the record's session. FULL with every
-    /// record taken; the errors of the calls as the status, and nothing
-    /// stays.
+    /// record taken; a resident preparation retains native resources
+    /// through bounded effects and exact cleanup before its final reply.
     fn create(&mut self, r: &mut Request<'_>) -> Answer {
         let Ok(create) = Create::read(r.body()) else {
             return Answer::Status(Status::BadSize);
@@ -440,90 +458,32 @@ impl Processes {
             self.records.retire_next(label);
             return refuse(proto_process::FULL);
         }
-        let place = records::exit_place(label, &create, self.level);
-        let made = sys::handle_label(&self.channel, Rights::NOTIFY, place.label, place.slot)
-            .and_then(|exit| {
-                sys::process_create_with(
-                    create.quota,
-                    create.handle_limit,
-                    create.ceiling,
-                    Some((&exit, place.notice)),
-                    Some(start),
-                )
-                .map_err(|(e, _)| e)
-            });
-        let process = match made {
-            Ok(process) => process,
-            Err(e) => return Answer::Status(Status::Kernel(e)),
+        let Some(pending) = r.defer() else {
+            return refuse(proto_process::FULL);
         };
-        // From here on the record is in the table, and only the end of its
-        // process takes it out, so that the exit label is never given twice.
-        let rights = Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER;
-        let copy = sys::handle_duplicate(&process, rights);
-        let credentials = if create.root {
-            Credentials::ROOT
-        } else {
-            Credentials::NOBODY
-        };
-        let index = self.records.insert(
-            label,
-            process,
-            None,
-            credentials,
-            create.ceiling,
-            Join::Inherit,
+        let reservation = self
+            .records
+            .reserve_next()
+            .expect("the preflighted record slot");
+        let key = preparing::Key { label, image: 1 };
+        let mut work = NativePreparation::new(
+            key,
+            PrepareKind::Initial { create },
+            preparing::Origin {
+                parent: None,
+                credentials_generation: 0,
+            },
+            create.priority,
+            pending,
         );
-        if let Some(record) = self.records.get_mut(index) {
-            record.quota = create.quota;
-            record.limits = proto_process::ResourceLimits::initial(create.quota);
-            record.handle_limit = create.handle_limit;
-        }
-        self.witnesses[index] = Some(witness);
-        self.tickets[index] = create.ticket;
-        // A record made in a used index never starts its generation over.
-        self.generations.raise(index);
-        self.publish_groups(index);
-        let record = self.records.get(index).expect("a new record");
-        let identity = [label.pid(), record.parent, record.pgid, record.sid];
-        let paged = self
-            .pages
-            .give(&make::own(), index, &record.process, identity);
-        let session = paged.and_then(|()| {
-            sys::handle_label(
-                &self.channel,
-                Rights::SEND | Rights::TRANSFER,
-                label.raw(),
-                self.level,
-            )
-        });
-        // The identity session: the process gives copies of it (DUPLICATE)
-        // to the services it asks something of, which have it vouched for.
-        let who = sys::handle_label(
-            &self.identities,
-            Rights::NOTIFY | Rights::TRANSFER | Rights::DUPLICATE,
-            label.identity(),
-            self.level,
-        );
-        let (copy, session, who) = match (copy, session, who) {
-            (Ok(copy), Ok(session), Ok(who)) => (copy, session, who),
-            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                let record = self.records.get(index).expect("a new record");
-                let _ = sys::process_kill(&record.process);
-                return Answer::Status(Status::Kernel(e));
-            }
-        };
-        let w = r.reply();
-        let written = w
-            .u32(0)
-            .and_then(|()| w.u32(label.pid()))
-            .and_then(|()| w.u64(label.raw()));
-        match written {
-            Ok(()) => Answer::Reply([copy.erase(), session.erase(), who.erase()].into()),
-            Err(status) => {
-                let _ = sys::process_kill(&copy);
-                Answer::Status(status)
-            }
-        }
+        work.reservation = Some(reservation);
+        work.identity = [label.pid(), INIT_PID, label.pid(), label.pid()];
+        work.resources.start = Some(start);
+        work.resources.witness = Some(witness);
+        self.replacing[usize::from(label.index)] = Some(Work::Preparing(work));
+        self.preparing_count += 1;
+        self.kick();
+        Answer::Deferred
     }
 
     /// Loaded (label 0) of the LOADING record the body names, with its
@@ -1181,7 +1141,8 @@ impl Processes {
                 || self.orphan_walk.is_some()
                 || self.records.has_orphans()
                 || self.replace_cleanup != 0
-                || self.abort_cleanup != 0)
+                || self.abort_cleanup != 0
+                || self.preparing_count != 0)
         {
             if self
                 .step
@@ -1225,6 +1186,21 @@ impl Processes {
     /// and none could be signalled, NO_PROCESS for none.
     fn walk_step(&mut self) {
         self.step_told = false;
+        if self.preparing_count != 0 {
+            self.preparing_turn = !self.preparing_turn;
+            let other = self.replace_cleanup != 0
+                || self.abort_cleanup != 0
+                || self.tty_walk.is_some()
+                || self.orphan_walk.is_some()
+                || self.records.has_orphans()
+                || !self.walking.is_empty();
+            if self.preparing_turn || !other {
+                rt::service::step_own();
+                self.prepare_step();
+                self.kick();
+                return;
+            }
+        }
         if self.replace_cleanup != 0 || self.abort_cleanup != 0 {
             self.replace_turn = !self.replace_turn;
             if self.replace_turn {
@@ -2192,14 +2168,14 @@ impl Processes {
         for &child in &children[..count] {
             self.abort_load(usize::from(child), Status::Kernel(abi::Error::PeerClosed));
         }
-        self.replacing[index] = Some(Replacing {
+        self.replacing[index] = Some(Work::Replacing(Replacing {
             pending,
             ready,
             process: copy,
             old: RetiredExec::new(old, old_exec, ceiling),
             old_image,
             ticket,
-        });
+        }));
         if ticket != 0 {
             self.replace_queue.push(index);
             self.dispatch_replace();
@@ -2240,9 +2216,10 @@ impl Processes {
             let Some(index) = self.replace_queue.pop() else {
                 return;
             };
-            let (Some(replacing), Some(record)) =
-                (self.replacing[index].as_mut(), self.records.get(index))
-            else {
+            let (Some(replacing), Some(record)) = (
+                self.replacing[index].as_mut().and_then(Work::replacing_mut),
+                self.records.get(index),
+            ) else {
                 continue;
             };
             let Some(process) = replacing.process.take() else {
@@ -2265,7 +2242,7 @@ impl Processes {
     /// service kills the old process and the loader tells the new image
     /// the record is ready.
     fn finish_replace(&mut self, index: usize) {
-        let Some(replacing) = self.replacing[index].as_mut() else {
+        let Some(replacing) = self.replacing[index].as_mut().and_then(Work::replacing_mut) else {
             return;
         };
         if replacing.old.request_cleanup() {
@@ -2276,7 +2253,7 @@ impl Processes {
     }
 
     fn try_finish_replace(&mut self, index: usize) {
-        let Some(replacing) = self.replacing[index].as_mut() else {
+        let Some(replacing) = self.replacing[index].as_mut().and_then(Work::replacing_mut) else {
             return;
         };
         if replacing.old.try_stop(self.level, |old, level| {
@@ -2291,7 +2268,8 @@ impl Processes {
         {
             return;
         }
-        let replacing = self.replacing[index].take().expect("a stopped replacement");
+        let replacing =
+            Work::take_replacing(&mut self.replacing[index]).expect("a stopped replacement");
         self.replace_cleanup -= 1;
         // Successful Kill guarantees that the old image cannot run.
         drop(replacing.old);
@@ -2317,6 +2295,7 @@ impl Processes {
         }
         if self.replacing[index]
             .as_ref()
+            .and_then(Work::replacing)
             .is_some_and(|r| r.old.cleanup_requested())
         {
             self.try_finish_replace(index);
@@ -3020,6 +2999,13 @@ impl Service<0> for Processes {
         if n.source != Source::Exit {
             return;
         }
+        if let Some((label, Place::Exit, image)) = Label::parse_image(n.label)
+            && let Some(work) = self.replacing[usize::from(label.index)]
+                .as_mut()
+                .and_then(Work::preparing_mut)
+        {
+            work.ended(label, image);
+        }
         let Some((index, image)) = self.records.find_exit_any(n.label) else {
             return;
         };
@@ -3027,10 +3013,12 @@ impl Service<0> for Processes {
         if image != record.image {
             if self.replacing[index]
                 .as_ref()
+                .and_then(Work::replacing)
                 .is_some_and(|r| r.old_image == image)
             {
                 self.replacing[index]
                     .as_mut()
+                    .and_then(Work::replacing_mut)
                     .expect("an exact old image")
                     .old
                     .ended();

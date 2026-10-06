@@ -12,6 +12,94 @@ pub enum RecordWork<R, S> {
     Preparing(S),
 }
 
+impl<R, S> RecordWork<R, S> {
+    pub fn replacing(&self) -> Option<&R> {
+        match self {
+            Self::Replacing(value) => Some(value),
+            Self::Preparing(_) => None,
+        }
+    }
+    pub fn replacing_mut(&mut self) -> Option<&mut R> {
+        match self {
+            Self::Replacing(value) => Some(value),
+            Self::Preparing(_) => None,
+        }
+    }
+    pub fn preparing(&self) -> Option<&S> {
+        match self {
+            Self::Preparing(value) => Some(value),
+            Self::Replacing(_) => None,
+        }
+    }
+    pub fn preparing_mut(&mut self) -> Option<&mut S> {
+        match self {
+            Self::Preparing(value) => Some(value),
+            Self::Replacing(_) => None,
+        }
+    }
+    pub fn take_replacing(slot: &mut Option<Self>) -> Option<R> {
+        if !matches!(slot, Some(Self::Replacing(_))) {
+            return None;
+        }
+        match slot.take() {
+            Some(Self::Replacing(value)) => Some(value),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// One existing page-group cell retains its exclusive cold-map owner.
+pub enum PageGroup<M> {
+    Empty,
+    Reserved(Key),
+    Mapped(M),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupClaim {
+    Owned,
+    Waiting,
+    Mapped,
+}
+impl<M> PageGroup<M> {
+    pub fn claim(&mut self, key: Key) -> GroupClaim {
+        match self {
+            Self::Empty => {
+                *self = Self::Reserved(key);
+                GroupClaim::Owned
+            }
+            Self::Reserved(owner) if *owner == key => GroupClaim::Owned,
+            Self::Reserved(_) => GroupClaim::Waiting,
+            Self::Mapped(_) => GroupClaim::Mapped,
+        }
+    }
+    pub fn reserved_by(&self, key: Key) -> bool {
+        matches!(self, Self::Reserved(owner) if *owner == key)
+    }
+    pub fn mapped(&self) -> Option<&M> {
+        match self {
+            Self::Mapped(value) => Some(value),
+            _ => None,
+        }
+    }
+    /// The native loop preflights this exact owner before its single own-map call.
+    /// No other thread mutates the group between that call and this ownership publication.
+    pub fn publish(&mut self, key: Key, value: M) -> Result<(), M> {
+        if !self.reserved_by(key) {
+            return Err(value);
+        }
+        *self = Self::Mapped(value);
+        Ok(())
+    }
+    /// The caller has already closed any unmapped temporary memory in bounded cleanup.
+    pub fn cancel(&mut self, key: Key) -> bool {
+        if !self.reserved_by(key) {
+            return false;
+        }
+        *self = Self::Empty;
+        true
+    }
+}
+
 pub struct Birth {
     pub flags: u32,
     pub pgroup: u32,
@@ -203,6 +291,14 @@ impl<P, C, M, T, D> StartPreparation<P, C, M, T, D> {
         true
     }
 
+    /// The native notification dispatcher has authenticated Source::Exit.
+    pub fn ended(&mut self, label: Label, image: u32) -> bool {
+        if self.key.label != label || self.key.image != image {
+            return false;
+        }
+        self.stopped(self.key)
+    }
+
     /// Reply and reservation ownership must have crossed their final cleanup boundary.
     pub fn finish_cleanup(&mut self, key: Key) -> bool {
         if self.key != key
@@ -272,6 +368,94 @@ mod tests {
             self.0.set(self.0.get() + 1);
         }
     }
+    #[test]
+    fn initial_phase_stops_at_reply_and_only_exact_native_end_releases_kill_debt() {
+        let mut work: StartPreparation<u32, u32, u32, u32, u32> = StartPreparation::new(
+            key(),
+            Kind::Initial {
+                create: Create {
+                    quota: 4096,
+                    handle_limit: 32,
+                    ceiling: 31,
+                    priority: 20,
+                    root: false,
+                    ticket: 17,
+                },
+            },
+            Origin {
+                parent: None,
+                credentials_generation: 0,
+            },
+            20,
+            42,
+        );
+        for phase in [
+            Phase::Admission,
+            Phase::Process,
+            Phase::PageMemory,
+            Phase::PageOwnMap,
+            Phase::PageInit,
+            Phase::PageTargetMap,
+        ] {
+            assert_eq!(work.phase(), phase);
+            assert!(work.advance(key(), phase));
+        }
+        assert_eq!(work.phase(), Phase::Reply);
+        assert!(!work.advance(key(), Phase::Reply));
+        work.resources.process = Some(7);
+        assert!(work.cancel(key(), 5, true));
+        let wrong = Label {
+            generation: key().label.generation + 1,
+            ..key().label
+        };
+        assert!(!work.ended(wrong, key().image));
+        assert!(!work.ended(key().label, key().image + 1));
+        assert!(work.cleanup_one(key()).is_none());
+        assert_eq!(work.resources.process, Some(7));
+        assert!(work.ended(key().label, key().image));
+        assert!(!work.ended(key().label, key().image));
+        assert!(matches!(
+            work.cleanup_one(key()),
+            Some(Released::Process(7))
+        ));
+    }
+
+    #[test]
+    fn shared_page_group_retains_one_owner_and_refuses_stale_publication() {
+        let first = key();
+        let second = Key {
+            image: first.image + 1,
+            ..first
+        };
+        let mut group = PageGroup::Empty;
+        assert_eq!(group.claim(first), GroupClaim::Owned);
+        assert_eq!(group.claim(first), GroupClaim::Owned);
+        assert_eq!(group.claim(second), GroupClaim::Waiting);
+        assert!(!group.cancel(second));
+        assert_eq!(group.publish(second, 17), Err(17));
+        assert!(group.cancel(first));
+        assert_eq!(group.claim(second), GroupClaim::Owned);
+        assert_eq!(group.publish(first, 19), Err(19));
+        assert_eq!(group.publish(second, 23), Ok(()));
+        assert_eq!(group.claim(first), GroupClaim::Mapped);
+        assert_eq!(group.mapped(), Some(&23));
+        assert!(!group.cancel(second));
+    }
+
+    #[test]
+    fn replacement_extraction_preserves_a_preparation_and_its_owned_value() {
+        let count = Rc::new(Cell::new(0));
+        let mut row: Option<RecordWork<u32, Cap>> = Some(RecordWork::Preparing(Cap(count.clone())));
+        assert!(RecordWork::take_replacing(&mut row).is_none());
+        assert!(row.as_ref().unwrap().preparing().is_some());
+        assert_eq!(count.get(), 0);
+        drop(row);
+        assert_eq!(count.get(), 1);
+        let mut row: Option<RecordWork<u32, Cap>> = Some(RecordWork::Replacing(7));
+        assert_eq!(RecordWork::take_replacing(&mut row), Some(7));
+        assert!(row.is_none());
+    }
+
     fn key() -> Key {
         Key {
             label: Label {
