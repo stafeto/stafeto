@@ -93,6 +93,8 @@ const METHODS: &[u16] = &[
     0xfff0,
     #[cfg(feature = "full-capacity-probe")]
     0xfff1,
+    #[cfg(feature = "full-capacity-probe")]
+    0xfff2,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -222,6 +224,8 @@ fn main(_: u64) -> u64 {
         capacity_backing: Handle::borrowed(backing.raw()),
         #[cfg(feature = "full-capacity-probe")]
         capacity_checkpoints: ramfs::capacity::Checkpoints::default(),
+        #[cfg(feature = "full-capacity-probe")]
+        capacity_retired_gate: None,
         process: Handle::borrowed(start.process.raw()),
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
@@ -265,6 +269,8 @@ struct Fs {
     capacity_backing: ManuallyDrop<Handle<Memory>>,
     #[cfg(feature = "full-capacity-probe")]
     capacity_checkpoints: ramfs::capacity::Checkpoints,
+    #[cfg(feature = "full-capacity-probe")]
+    capacity_retired_gate: Option<ramfs::capacity::RetiredGate>,
     /// The service's own process, to map the object of a READ_INTO in.
     process: ManuallyDrop<Handle<rt::handle::Process>>,
     /// The service's channel, which its own sessions are copies of, and
@@ -386,6 +392,14 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
 impl Fs {
     /// A dead or superseded authority releases one retained reference per pass.
     fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
+        #[cfg(feature = "full-capacity-probe")]
+        if fds
+            .binding
+            .snapshot_ref()
+            .is_none_or(|who| generation(who.index as usize) != who.generation)
+        {
+            self.capacity_clear_owner(label);
+        }
         if fds
             .binding
             .snapshot_ref()
@@ -1056,6 +1070,8 @@ impl Service<0> for Fs {
 
     /// The client of `s` went: its descriptors close.
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
+        #[cfg(feature = "full-capacity-probe")]
+        self.capacity_clear_owner(s.label());
         #[cfg(feature = "open-finalize-clock-probe")]
         if self
             .clock_gate
@@ -1077,6 +1093,8 @@ impl Service<0> for Fs {
     /// The last copy of a session Clone made went before it sent anything:
     /// the descriptors it was born with close.
     fn closed(&mut self, label: u64) {
+        #[cfg(feature = "full-capacity-probe")]
+        self.capacity_clear_owner(label);
         #[cfg(feature = "open-finalize-clock-probe")]
         if self
             .clock_gate
@@ -1132,7 +1150,13 @@ impl Service<0> for Fs {
                     work = true;
                 }
             } else {
-                work = self.ram.storage.reclaim_step();
+                #[cfg(feature = "full-capacity-probe")]
+                let paused = self.capacity_retired_gate.is_some_and(|gate| gate.paused());
+                #[cfg(not(feature = "full-capacity-probe"))]
+                let paused = false;
+                if !paused {
+                    work = self.ram.storage.reclaim_step();
+                }
             }
             if work || self.maintenance.remaining != 0 || self.orphan_count != 0 {
                 let _ = sys::notify(&self.channel, 1);
@@ -1196,7 +1220,7 @@ impl Service<0> for Fs {
             }
         }
         #[cfg(feature = "full-capacity-probe")]
-        if matches!(r.method(), 0xfff0 | 0xfff1) {
+        if matches!(r.method(), 0xfff0..=0xfff2) {
             return self.capacity_request(&mut s.data, r);
         }
         #[cfg(feature = "open-finalize-clock-probe")]
@@ -2258,11 +2282,35 @@ impl Fs {
     }
 
     #[cfg(feature = "full-capacity-probe")]
+    fn capacity_clear_owner(&mut self, label: u64) {
+        if self
+            .capacity_retired_gate
+            .is_some_and(|gate| gate.owner(label))
+        {
+            self.capacity_retired_gate = None;
+            let _ = sys::notify(&self.channel, 1);
+        }
+    }
+
+    #[cfg(feature = "full-capacity-probe")]
     fn capacity_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if !r.handles.is_empty() {
+            if r.method() == 0xfff0 {
+                self.capacity_clear_owner(r.label());
+            }
             return Answer::Status(Status::BadSize);
         }
         let mut body = r.body();
+        let retired = if r.method() == 0xfff2 {
+            let (Ok(action), Ok(slot), Ok(generation), Ok(job)) =
+                (body.u32(), body.u32(), body.u64(), body.u64())
+            else {
+                return Answer::Status(Status::BadSize);
+            };
+            Some((action, proto_fs::OpenKey { slot, generation }, job))
+        } else {
+            None
+        };
         let control = if r.method() == 0xfff1 {
             let (Ok(action), Ok(phase)) = (body.u32(), body.u32()) else {
                 return Answer::Status(Status::BadSize);
@@ -2272,9 +2320,13 @@ impl Fs {
             None
         };
         if body.finish().is_err() {
+            if r.method() == 0xfff0 {
+                self.capacity_clear_owner(r.label());
+            }
             return Answer::Status(Status::BadSize);
         }
         if let Err(code) = self.authenticate(fds, r.label()) {
+            self.capacity_clear_owner(r.label());
             return status(code);
         }
         let Binding::Active(who) = &fds.binding else {
@@ -2288,6 +2340,45 @@ impl Fs {
             return status(proto_fs::PERMISSION);
         }
         let (pid, image) = (who.pid, who.image);
+        if let Some((action, key, job)) = retired {
+            if action == 1 {
+                if !self
+                    .capacity_retired_gate
+                    .is_some_and(|gate| gate.exact(r.label(), pid, image, root, key, job))
+                {
+                    return status(proto_fs::PERMISSION);
+                }
+                self.capacity_clear_owner(r.label());
+                return Answer::Status(Status::Ok);
+            }
+            if action != 0 || self.capacity_retired_gate.is_some() {
+                return status(proto_fs::INVALID_ARGUMENT);
+            }
+            if !self
+                .capacity_checkpoints
+                .0
+                .iter()
+                .any(|c| c.root == root && c.pid == pid && c.image == image && c.phase == 4)
+            {
+                return status(proto_fs::PERMISSION);
+            }
+            let valid=self.jobs.iter().flatten().any(|record| {
+                record.id==job && record.owner==r.label() && record.open_key==Some(key) && !record.abandoned
+                    && fds.resolvers.contains(&job) && record.authority==fds.binding.stamp()
+                    && matches!(&record.operation, JobOperation::Data(data) if data.args.kind==proto_fs::DataKind::Truncate
+                        && data.outcome(job).phase==proto_fs::DataPhase::Ready && data.outcome(job).result==proto_fs::DataResult::None)
+            });
+            if !valid {
+                return status(proto_fs::PERMISSION);
+            }
+            let gate =
+                match ramfs::capacity::RetiredGate::new(r.label(), pid, image, root, key, job) {
+                    Ok(gate) => gate,
+                    Err(code) => return status(code),
+                };
+            self.capacity_retired_gate = Some(gate);
+            return Answer::Status(Status::Ok);
+        }
         if let Some((action, phase)) = control {
             if action == 1 && phase == 0 {
                 let own =
@@ -2415,6 +2506,15 @@ impl Fs {
             }
             Ok(())
         })();
+        if self
+            .capacity_retired_gate
+            .is_some_and(|gate| gate.observed(r.label(), pid, image, root))
+        {
+            // Capture actual charge/free counters before resuming the real GC.
+            self.capacity_clear_owner(r.label());
+        } else if result.is_err() {
+            self.capacity_clear_owner(r.label());
+        }
         match result {
             Ok(()) => Answer::Reply(Outgoing::new()),
             Err(error) => Answer::Status(error),
@@ -3182,8 +3282,14 @@ impl Fs {
                 } else {
                     None
                 };
+                #[cfg(feature = "full-capacity-probe")]
+                let before = data.outcome(id);
                 if let Err(code) = data.commit(&mut self.ram, now) {
                     return status(code);
+                }
+                #[cfg(feature = "full-capacity-probe")]
+                if let (Some(gate), Some(key)) = (&mut self.capacity_retired_gate, job.open_key) {
+                    gate.committed(r.label(), key, before, data.outcome(id));
                 }
                 data.outcome(id)
                     .write(r.reply())
@@ -3261,6 +3367,13 @@ impl Fs {
         mut fds: Option<&mut Fds>,
         retire: bool,
     ) -> bool {
+        #[cfg(feature = "full-capacity-probe")]
+        if self
+            .capacity_retired_gate
+            .is_some_and(|gate| gate.canceled_armed(owner, id))
+        {
+            self.capacity_clear_owner(owner);
+        }
         if let Some(fds) = fds.as_deref_mut()
             && fds.image_outcome.is_some_and(|outcome| outcome.job == id)
         {

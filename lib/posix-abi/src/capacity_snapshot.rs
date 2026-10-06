@@ -157,6 +157,54 @@ pub fn control(action: u32, phase: u32) -> Result<(), i32> {
     }
 }
 
+/// Bind the observation to the actual Ready claim before the final native call.
+pub fn retired_arm(event: crate::data_probe::Event) -> Result<(), i32> {
+    let claim = event.claim.ok_or(crate::constants::EIO)?;
+    crate::shared::with_files(|files| {
+        let actual = files.data_claim_state(claim).map_err(crate::error)?;
+        if actual != event.state
+            || actual.owner != Some(event.owner)
+            || actual.claimant != Some(event.owner)
+            || actual.kind != proto_fs::DataKind::Truncate
+            || actual.progress != posix_fs::data::Phase::Ready
+            || actual.job == 0
+            || actual.result.is_some()
+            || files.sessions().0.raw().0 != actual.session_handle
+        {
+            return Err(crate::constants::EIO);
+        }
+        Ok(())
+    })?;
+    retired_control(0, event)
+}
+/// Release only the same retained session/key/job observation after a refused call.
+pub fn retired_disarm(event: crate::data_probe::Event) -> Result<(), i32> {
+    retired_control(1, event)
+}
+fn retired_control(action: u32, event: crate::data_probe::Event) -> Result<(), i32> {
+    let transport = crate::shared::with_files(|files| {
+        if files.sessions().0.raw().0 != event.state.session_handle {
+            return Err(crate::constants::EIO);
+        }
+        Ok(files.transport())
+    })?;
+    let mut request = [0; 32];
+    request[..8].copy_from_slice(&proto_wire::Header::new(0xfff2, proto_fs::VERSION).bytes());
+    request[8..12].copy_from_slice(&action.to_le_bytes());
+    request[12..16].copy_from_slice(&(event.token.slot() as u32).to_le_bytes());
+    request[16..24].copy_from_slice(&event.token.generation().to_le_bytes());
+    request[24..32].copy_from_slice(&event.state.job.to_le_bytes());
+    let reply = rt::sys::send(transport.files().sessions().0, &request)
+        .map_err(|_| crate::constants::EIO)?;
+    if reply.len != 8 || !reply.handles.is_empty() || reply.words[0] >> 32 != 0 {
+        return Err(crate::constants::EIO);
+    }
+    match Status::from_code(reply.words[0] as u32) {
+        Status::Ok => Ok(()),
+        error => Err(crate::error(posix_fs::FsError::from(error))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

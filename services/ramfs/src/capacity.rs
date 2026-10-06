@@ -87,6 +87,97 @@ impl Checkpoints {
     }
 }
 
+/// One observation owns no capability, charge, page or client key allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetiredGate {
+    label: u64,
+    pid: u32,
+    image: u32,
+    root: Root,
+    key: proto_fs::OpenKey,
+    job: u64,
+    fired: bool,
+}
+impl RetiredGate {
+    pub fn new(
+        label: u64,
+        pid: u32,
+        image: u32,
+        root: Root,
+        key: proto_fs::OpenKey,
+        job: u64,
+    ) -> Result<Self, u32> {
+        key.validate()?;
+        if label == 0
+            || pid == 0
+            || image == 0
+            || root.id != u64::from(pid)
+            || root.generation == 0
+            || job == 0
+        {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        Ok(Self {
+            label,
+            pid,
+            image,
+            root,
+            key,
+            job,
+            fired: false,
+        })
+    }
+    pub fn owner(self, label: u64) -> bool {
+        self.label == label
+    }
+    pub fn exact(
+        self,
+        label: u64,
+        pid: u32,
+        image: u32,
+        root: Root,
+        key: proto_fs::OpenKey,
+        job: u64,
+    ) -> bool {
+        (
+            self.label, self.pid, self.image, self.root, self.key, self.job,
+        ) == (label, pid, image, root, key, job)
+    }
+    /// Only the first actual successful server effect changes Armed to Fired.
+    pub fn committed(
+        &mut self,
+        label: u64,
+        key: proto_fs::OpenKey,
+        before: proto_fs::DataOutcome,
+        after: proto_fs::DataOutcome,
+    ) -> bool {
+        if self.fired
+            || self.label != label
+            || self.key != key
+            || self.job != before.job
+            || before.job != after.job
+            || before.phase != proto_fs::DataPhase::Ready
+            || before.result != proto_fs::DataResult::None
+            || after.phase != proto_fs::DataPhase::Completed
+            || after.result != proto_fs::DataResult::Bytes(0)
+        {
+            return false;
+        }
+        self.fired = true;
+        true
+    }
+    pub fn paused(self) -> bool {
+        self.fired
+    }
+    pub fn canceled_armed(self, label: u64, job: u64) -> bool {
+        !self.fired && self.label == label && self.job == job
+    }
+    pub fn observed(self, label: u64, pid: u32, image: u32, root: Root) -> bool {
+        self.fired && (self.label, self.pid, self.image, self.root) == (label, pid, image, root)
+    }
+}
+const _: () = assert!(core::mem::size_of::<RetiredGate>() == 64);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +239,90 @@ mod tests {
         let mut stale = root(4);
         stale.generation += 1;
         assert_eq!(records.phase_pack(stale), (1 << 8) | (3 << 16));
+    }
+    fn gate() -> RetiredGate {
+        RetiredGate::new(
+            17,
+            3,
+            2,
+            root(3),
+            proto_fs::OpenKey {
+                slot: 0,
+                generation: 4,
+            },
+            257,
+        )
+        .unwrap()
+    }
+    fn ready() -> proto_fs::DataOutcome {
+        proto_fs::DataOutcome {
+            phase: proto_fs::DataPhase::Ready,
+            job: 257,
+            result: proto_fs::DataResult::None,
+        }
+    }
+    fn completed() -> proto_fs::DataOutcome {
+        proto_fs::DataOutcome {
+            phase: proto_fs::DataPhase::Completed,
+            job: 257,
+            result: proto_fs::DataResult::Bytes(0),
+        }
+    }
+    #[test]
+    fn gate_requires_actual_success_and_exact_owner_key_job() {
+        let baseline = gate();
+        let key = proto_fs::OpenKey {
+            slot: 0,
+            generation: 4,
+        };
+        let mut wrong = key;
+        wrong.generation += 1;
+        let mut wrong_job = ready();
+        wrong_job.job += 1;
+        for (label, key, before, after) in [
+            (18, key, ready(), completed()),
+            (17, wrong, ready(), completed()),
+            (17, key, wrong_job, completed()),
+            (17, key, completed(), completed()),
+            (
+                17,
+                key,
+                ready(),
+                proto_fs::DataOutcome {
+                    result: proto_fs::DataResult::FailedNoEffect(proto_fs::NO_SPACE),
+                    ..completed()
+                },
+            ),
+        ] {
+            let mut g = baseline;
+            assert!(!g.committed(label, key, before, after));
+            assert_eq!(g, baseline);
+        }
+        let mut g = baseline;
+        assert!(g.committed(17, key, ready(), completed()));
+        assert!(g.paused());
+        assert!(!g.committed(17, key, ready(), completed()));
+    }
+    #[test]
+    fn armed_cancel_and_fired_ack_keep_distinct_observation_custody() {
+        let key = proto_fs::OpenKey {
+            slot: 0,
+            generation: 4,
+        };
+        let mut g = gate();
+        assert!(g.canceled_armed(17, 257));
+        assert!(!g.canceled_armed(18, 257));
+        assert!(!g.observed(17, 3, 2, root(3)));
+        assert!(g.committed(17, key, ready(), completed()));
+        // A lost Reply and original ACK leave the value-only Fired observation intact.
+        assert!(!g.canceled_armed(17, 257));
+        assert!(g.observed(17, 3, 2, root(3)));
+        assert!(!g.observed(18, 3, 2, root(3)));
+        assert!(!g.observed(17, 3, 3, root(3)));
+        assert!(!g.observed(17, 4, 2, root(3)));
+        let mut reused = root(3);
+        reused.generation += 1;
+        assert!(!g.observed(17, 3, 2, reused));
+        assert!(!g.exact(17, 3, 2, root(3), key, 258));
     }
 }
