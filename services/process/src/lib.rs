@@ -15,6 +15,7 @@ pub mod executable;
 #[cfg(feature = "image-probe")]
 pub mod image_probe;
 pub mod loaders;
+pub mod preparing;
 pub mod queue;
 pub mod records;
 pub mod signals;

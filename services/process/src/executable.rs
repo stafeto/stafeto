@@ -104,7 +104,10 @@ impl<T: ExecHolder> Loaders<T> {
         };
         if place.record != record
             || place.image != args.image
-            || matches!(place.stage, Stage::Booting | Stage::Aborting)
+            || matches!(
+                place.stage,
+                Stage::Preparing | Stage::Booting | Stage::Aborting
+            )
             || place.held.fork() != (args.kind == ExecKind::Fork)
         {
             return Err(Refused(cap));

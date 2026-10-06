@@ -140,11 +140,64 @@ pub struct Records<P, C = ()> {
     /// The free indices, the last freed on top.
     free: [u16; RECORDS],
     free_len: usize,
-    /// Whether an index is among the free ones.
-    listed: [bool; RECORDS],
+    /// A reservation keeps its index unavailable before a process is inserted.
+    slots: [SlotState; RECORDS],
     /// The group and the session each place's PID names.
     numbers: [Numbers; RECORDS],
     orphaned: crate::queue::Queue,
+}
+
+/// The fixed record indices carry one authoritative lifecycle byte each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum SlotState {
+    Free,
+    Reserved,
+    Used,
+    Retired,
+}
+
+/// Exclusive ownership of one prepaid record index and its issued generation.
+/// The caller consumes or cancels it before discarding its resident preparation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reservation {
+    label: Label,
+}
+impl Reservation {
+    pub const fn label(&self) -> Label {
+        self.label
+    }
+}
+
+/// A parent snapshot names one image and its captured group/session namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartParent {
+    label: Label,
+    image: u32,
+    pgid: u32,
+    sid: u32,
+}
+impl StartParent {
+    pub const fn label(&self) -> Label {
+        self.label
+    }
+    pub const fn image(&self) -> u32 {
+        self.image
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsumeError {
+    Stale,
+    Parent,
+    Group,
+}
+
+/// Failed publication retains both the paid reservation and the process.
+pub struct ConsumeRefused<P> {
+    pub reservation: Reservation,
+    pub process: P,
+    pub error: ConsumeError,
 }
 
 /// What a place keeps of the group and the session its PID names.
@@ -236,7 +289,7 @@ impl<P, C> Records<P, C> {
             generations: [0; RECORDS],
             free,
             free_len: RECORDS,
-            listed: [true; RECORDS],
+            slots: [SlotState::Free; RECORDS],
             numbers: [Numbers {
                 members: 0,
                 stopped: 0,
@@ -317,8 +370,96 @@ impl<P, C> Records<P, C> {
         assert_eq!(self.next_label(), Some(label));
         let index = usize::from(label.index);
         self.free_len -= 1;
-        self.listed[index] = false;
+        self.slots[index] = SlotState::Retired;
         self.generations[index] = proto_process::GENERATION_MAX;
+    }
+
+    /// Burn one label generation and remove its slot from the free list.
+    pub fn reserve_next(&mut self) -> Option<Reservation> {
+        let label = self.next_label()?;
+        let index = usize::from(label.index);
+        assert_eq!(self.slots[index], SlotState::Free);
+        self.free_len -= 1;
+        self.slots[index] = SlotState::Reserved;
+        self.generations[index] = label.generation;
+        Some(Reservation { label })
+    }
+
+    fn exact_reservation(&self, reservation: &Reservation) -> bool {
+        let label = reservation.label;
+        let index = usize::from(label.index);
+        index < RECORDS
+            && self.slots[index] == SlotState::Reserved
+            && self.generations[index] == label.generation
+            && self.records[index].is_none()
+    }
+
+    /// Cleanup uses the issued generation and needs no new admission.
+    pub fn cancel_reserved(&mut self, reservation: Reservation) -> Result<(), Reservation> {
+        if !self.exact_reservation(&reservation) {
+            return Err(reservation);
+        }
+        let index = usize::from(reservation.label.index);
+        self.slots[index] = SlotState::Used;
+        self.settle(index);
+        Ok(())
+    }
+
+    pub fn start_parent(&self, index: usize) -> Option<StartParent> {
+        let record = self.get(index)?;
+        (record.state == State::Alive).then_some(StartParent {
+            label: record.label,
+            image: record.image,
+            pgid: record.pgid,
+            sid: record.sid,
+        })
+    }
+
+    /// The native caller checks its captured credentials generation before this call.
+    /// Every refusal returns the caller's existing ownership for bounded cleanup.
+    pub fn consume_reserved(
+        &mut self,
+        reservation: Reservation,
+        process: P,
+        parent: Option<StartParent>,
+        credentials: Credentials,
+        ceiling: u8,
+        join: Join,
+    ) -> Result<usize, ConsumeRefused<P>> {
+        let fail = if !self.exact_reservation(&reservation) {
+            Some(ConsumeError::Stale)
+        } else if let Some(parent) = parent {
+            let index = usize::from(parent.label.index);
+            if self.start_parent(index) != Some(parent) || !self.may_spawn(index) {
+                Some(ConsumeError::Parent)
+            } else {
+                let (flags, group) = match join {
+                    Join::Inherit => (0, 0),
+                    Join::NewGroup => (SPAWN_SETPGROUP, reservation.label.pid()),
+                    Join::Group(group) => (SPAWN_SETPGROUP, group),
+                    Join::NewSession => (SPAWN_SETSID, 0),
+                };
+                (self.joining(index, flags, group, reservation.label.pid()) != Some(join))
+                    .then_some(ConsumeError::Group)
+            }
+        } else {
+            None
+        };
+        if let Some(error) = fail {
+            return Err(ConsumeRefused {
+                reservation,
+                process,
+                error,
+            });
+        }
+        Ok(self.insert_consumed(
+            reservation.label,
+            process,
+            parent.map(|p| usize::from(p.label.index)),
+            credentials,
+            ceiling,
+            join,
+        ))
     }
 
     /// Whether the record in `index` may have another child.
@@ -350,7 +491,29 @@ impl<P, C> Records<P, C> {
             Some(label),
             "the label of the next record"
         );
+        let reservation = self.reserve_next().expect("the next record slot");
+        self.insert_consumed(
+            reservation.label,
+            process,
+            parent,
+            credentials,
+            ceiling,
+            join,
+        )
+    }
+
+    fn insert_consumed(
+        &mut self,
+        label: Label,
+        process: P,
+        parent: Option<usize>,
+        credentials: Credentials,
+        ceiling: u8,
+        join: Join,
+    ) -> usize {
         let i = usize::from(label.index);
+        assert_eq!(self.slots[i], SlotState::Reserved);
+        assert_eq!(self.generations[i], label.generation);
         let own = label.pid();
         let (pid, first, (pgid, sid)) = match parent {
             Some(p) => {
@@ -375,9 +538,7 @@ impl<P, C> Records<P, C> {
                 .expect("a child")
                 .previous = Some(i as u16);
         }
-        self.free_len -= 1;
-        self.listed[i] = false;
-        self.generations[i] = label.generation;
+        self.slots[i] = SlotState::Used;
         let linked = parent.is_some_and(|p| self.separates(p, pgid, sid));
         let groups = parent.map_or(proto_process::Groups::EMPTY, |p| {
             self.records[p].as_ref().unwrap().groups
@@ -480,12 +641,16 @@ impl<P, C> Records<P, C> {
     /// The place in `index` goes to the free ones when no record is in it
     /// and no group or session carries its number.
     fn settle(&mut self, index: usize) {
-        if self.records[index].is_none() && self.numbers[index].unused() && !self.listed[index] {
+        if self.records[index].is_none()
+            && self.numbers[index].unused()
+            && self.slots[index] == SlotState::Used
+        {
             self.orphaned.remove(index);
             if Label::next_generation(self.generations[index]).is_none() {
+                self.slots[index] = SlotState::Retired;
                 return;
             }
-            self.listed[index] = true;
+            self.slots[index] = SlotState::Free;
             self.free[self.free_len] = index as u16;
             self.free_len += 1;
         }
@@ -1054,6 +1219,196 @@ mod tests {
     use super::*;
 
     #[test]
+    fn eight_records_and_248_reservations_pay_the_same_fixed_table() {
+        let mut table = Records::<u32>::new();
+        for _ in 0..8 {
+            let label = table.next_label().unwrap();
+            table.insert(
+                label,
+                label.pid(),
+                None,
+                Credentials::ROOT,
+                31,
+                Join::NewSession,
+            );
+        }
+        let mut reserved = Vec::new();
+        for _ in 0..248 {
+            let reservation = table.reserve_next().unwrap();
+            assert!(table.find_pid(reservation.label().pid()).is_none());
+            assert!(
+                table
+                    .find_identity(reservation.label().identity())
+                    .is_none()
+            );
+            table.settle(usize::from(reservation.label().index));
+            assert!(table.exact_reservation(&reservation));
+            reserved.push(reservation);
+        }
+        assert_eq!(table.count(), RECORDS);
+        assert!(table.reserve_next().is_none());
+        assert!(table.next_label().is_none());
+        for reservation in reserved.into_iter().rev() {
+            table.cancel_reserved(reservation).unwrap();
+        }
+        assert_eq!(table.count(), 8);
+        assert_eq!(core::mem::size_of::<SlotState>(), 1);
+    }
+
+    #[test]
+    fn reserved_records_publish_out_of_order_and_burn_canceled_generations() {
+        let mut table = Records::<u32>::new();
+        let first = table.reserve_next().unwrap();
+        let first_label = first.label();
+        let second = table.reserve_next().unwrap();
+        let second_label = second.label();
+        let index = table
+            .consume_reserved(second, 7, None, Credentials::ROOT, 31, Join::NewSession)
+            .unwrap_or_else(|_| panic!("an exact reservation"));
+        assert_eq!(index, usize::from(second_label.index));
+        assert_eq!(table.find_pid(second_label.pid()), Some(index));
+        assert_eq!(table.find_pid(first_label.pid()), None);
+        table.cancel_reserved(first).unwrap();
+        let reused = table.reserve_next().unwrap();
+        assert_eq!(reused.label().index, first_label.index);
+        assert!(reused.label().generation > first_label.generation);
+        let stale = Reservation { label: first_label };
+        assert!(table.cancel_reserved(stale).is_err());
+        let stale = Reservation { label: first_label };
+        let failed = table
+            .consume_reserved(stale, 9, None, Credentials::ROOT, 31, Join::NewSession)
+            .err()
+            .unwrap();
+        assert_eq!(failed.error, ConsumeError::Stale);
+        assert_eq!(failed.process, 9);
+        assert!(table.exact_reservation(&reused));
+        table.cancel_reserved(reused).unwrap();
+        assert_eq!(table.count(), 1);
+    }
+
+    #[test]
+    fn terminal_reserved_generation_cancels_without_a_fresh_mint() {
+        let mut table = Records::<u32>::new();
+        table.generations[0] = proto_process::GENERATION_MAX - 1;
+        let last = table.reserve_next().unwrap();
+        assert_eq!(last.label().generation, proto_process::GENERATION_MAX);
+        table.cancel_reserved(last).unwrap();
+        assert_eq!(table.slots[0], SlotState::Retired);
+        table.settle(0);
+        assert_eq!(table.next_label().unwrap().index, 1);
+        assert_eq!(table.count(), 1);
+    }
+
+    #[test]
+    fn consume_after_parent_reuse_returns_every_existing_owned_value() {
+        use std::{cell::Cell, rc::Rc};
+        struct Process(Rc<Cell<u32>>);
+        impl Drop for Process {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Rc::new(Cell::new(0));
+        let mut table = Records::<Process>::new();
+        let label = table.next_label().unwrap();
+        let parent = table.insert(
+            label,
+            Process(drops.clone()),
+            None,
+            Credentials::ROOT,
+            31,
+            Join::NewSession,
+        );
+        table.get_mut(parent).unwrap().state = State::Alive;
+        let origin = table.start_parent(parent).unwrap();
+        let reservation = table.reserve_next().unwrap();
+        table.exited(parent, End::exited(0));
+        let next = table.next_label().unwrap();
+        assert_eq!(next.index, label.index);
+        table.insert(
+            next,
+            Process(drops.clone()),
+            None,
+            Credentials::ROOT,
+            31,
+            Join::NewSession,
+        );
+        table.get_mut(parent).unwrap().state = State::Alive;
+        let failed = table
+            .consume_reserved(
+                reservation,
+                Process(drops.clone()),
+                Some(origin),
+                Credentials::ROOT,
+                31,
+                Join::Inherit,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(failed.error, ConsumeError::Parent);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(table.get(parent).unwrap().children, 0);
+        assert!(table.exact_reservation(&failed.reservation));
+        table.cancel_reserved(failed.reservation).unwrap();
+        drop(failed.process);
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    fn consume_rechecks_child_limit_image_and_group_before_publication() {
+        let mut table = Records::<u32>::new();
+        let label = table.next_label().unwrap();
+        let parent = table.insert(label, 0, None, Credentials::ROOT, 31, Join::NewSession);
+        table.get_mut(parent).unwrap().state = State::Alive;
+        let origin = table.start_parent(parent).unwrap();
+        let reservation = table.reserve_next().unwrap();
+        table.get_mut(parent).unwrap().image += 1;
+        let failed = table
+            .consume_reserved(
+                reservation,
+                1,
+                Some(origin),
+                Credentials::ROOT,
+                31,
+                Join::Inherit,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(failed.error, ConsumeError::Parent);
+        table.get_mut(parent).unwrap().image -= 1;
+        table.get_mut(parent).unwrap().children = CHILDREN_MAX;
+        let failed = table
+            .consume_reserved(
+                failed.reservation,
+                failed.process,
+                Some(origin),
+                Credentials::ROOT,
+                31,
+                Join::Inherit,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(failed.error, ConsumeError::Parent);
+        table.get_mut(parent).unwrap().children = 0;
+        let failed = table
+            .consume_reserved(
+                failed.reservation,
+                failed.process,
+                Some(origin),
+                Credentials::ROOT,
+                31,
+                Join::Group(u32::MAX),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(failed.error, ConsumeError::Group);
+        assert_eq!(table.get(parent).unwrap().children, 0);
+        assert_eq!(table.count(), 2);
+        table.cancel_reserved(failed.reservation).unwrap();
+        assert_eq!(table.count(), 1);
+    }
+
+    #[test]
     fn exhausted_credentials_leave_the_real_record_unchanged() {
         let mut t = Records::<u32>::new();
         let label = t.next_label().unwrap();
@@ -1082,7 +1437,7 @@ mod tests {
         let retired = t.next_label().unwrap();
         t.retire_next(retired);
         assert_eq!(t.count(), 1);
-        assert!(!t.listed[usize::from(retired.index)]);
+        assert_eq!(t.slots[usize::from(retired.index)], SlotState::Retired);
         let live = t.next_label().unwrap();
         assert_eq!(live.index, 1);
         let index = t.insert(live, 0, None, Credentials::ROOT, 31, Join::NewSession);
@@ -1090,7 +1445,7 @@ mod tests {
         assert_eq!(t.next_label().unwrap().index, live.index);
         assert_eq!(t.count(), 1);
         t.settle(usize::from(retired.index));
-        assert!(!t.listed[usize::from(retired.index)]);
+        assert_eq!(t.slots[usize::from(retired.index)], SlotState::Retired);
     }
 
     #[test]
@@ -1104,7 +1459,7 @@ mod tests {
         assert_eq!(t.find_identity(last.identity()), Some(index));
         assert_eq!(t.exited(index, End::exited(0)).0, Exit::Reaped);
         assert_eq!(t.find_identity(last.identity()), None);
-        assert!(!t.listed[index]);
+        assert_eq!(t.slots[index], SlotState::Retired);
         assert_eq!(t.count(), 1, "the exhausted index remains unavailable");
         let next = t.next_label().unwrap();
         assert_eq!(next.index, 1);

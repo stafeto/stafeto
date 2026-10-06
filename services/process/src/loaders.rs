@@ -75,6 +75,8 @@ pub const LOADERS_OF_PARENT: usize = 2;
 /// Where a load is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    /// The paid place owns a stopped target and its bounded preparation.
+    Preparing,
     /// The process was made and the loader runs; it has not said Boot.
     Booting,
     /// Boot came: the parent has the loader's start channel, and the
@@ -181,6 +183,35 @@ impl<T> Loaders<T> {
         Some(index)
     }
 
+    /// Reserve the existing loader and per-parent credits before native effects.
+    pub fn take_preparing(
+        &mut self,
+        record: usize,
+        parent: usize,
+        image: u32,
+        held: T,
+    ) -> Result<usize, T> {
+        if self.of_record[record].is_some() || !self.room_for(parent) {
+            return Err(held);
+        }
+        let slot = self
+            .take(record, parent, image, held)
+            .expect("the paid loader preflight");
+        self.places[slot].as_mut().expect("a paid place").stage = Stage::Preparing;
+        Ok(slot)
+    }
+
+    /// Publish Booting immediately before the one native ThreadStart attempt.
+    pub fn begin_boot(&mut self, record: usize) -> Result<(), Refused> {
+        let slot = self.of(record).ok_or(Refused)?;
+        let place = self.places[slot].as_mut().ok_or(Refused)?;
+        if place.stage != Stage::Preparing {
+            return Err(Refused);
+        }
+        place.stage = Stage::Booting;
+        Ok(())
+    }
+
     /// The place of the loader of the record in `record`.
     pub fn of(&self, record: usize) -> Option<usize> {
         self.of_record
@@ -234,7 +265,7 @@ impl<T> Loaders<T> {
         match place.stage {
             Stage::Loading => Some(Loading),
             Stage::Loaded => Some(Handoff),
-            Stage::Booting | Stage::Aborting | Stage::Ready => None,
+            Stage::Preparing | Stage::Booting | Stage::Aborting | Stage::Ready => None,
         }
     }
 
@@ -330,6 +361,40 @@ impl<T> Loaders<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparing_prepays_parent_and_global_credits_and_denies_loading_authority() {
+        let mut loads = Loaders::<u32>::new();
+        let slot = loads.take_preparing(1, 0, 1, 7).unwrap();
+        let ticket = loads.ticket(slot);
+        assert_eq!(loads.get(slot).unwrap().stage, Stage::Preparing);
+        assert_eq!(loads.vouches(1), None);
+        assert_eq!(loads.retained(1, 1, ticket, 1, 0, false), None);
+        assert!(loads.set_id(ticket, 1, 1, (37, 43)).is_err());
+        assert!(loads.loaded(1).is_err());
+        assert!(loads.commit(1).is_err());
+        loads.take_preparing(2, 0, 1, 8).unwrap();
+        assert!(!loads.room_for(0));
+        assert!(loads.take_preparing(3, 0, 1, 9).is_err());
+        for parent in 1..8 {
+            loads.take_preparing(parent * 2 + 1, parent, 1, 9).unwrap();
+            loads.take_preparing(parent * 2 + 2, parent, 1, 10).unwrap();
+        }
+        assert!(!loads.room());
+        assert!(loads.take_preparing(17, 8, 1, 11).is_err());
+        loads.begin_boot(1).unwrap();
+        assert_eq!(loads.get(slot).unwrap().stage, Stage::Booting);
+        assert!(loads.begin_boot(1).is_err());
+        assert_eq!(loads.begin_abort(1), Ok(true));
+        assert!(loads.begin_boot(1).is_err());
+        for record in 1..=16 {
+            loads.free(record).unwrap();
+        }
+        assert!(loads.room_for(0));
+        let next = loads.take_preparing(1, 0, 1, 12).unwrap();
+        assert_eq!(next, slot);
+        assert_ne!(loads.ticket(next), ticket);
+    }
 
     #[test]
     fn retained_loader_distinguishes_loading_handoff_and_retired_attempts() {
