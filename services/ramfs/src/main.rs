@@ -2291,7 +2291,7 @@ impl Fs {
             let _ = sys::notify(&self.channel, 1);
         }
     }
-
+    #[inline(never)]
     #[cfg(feature = "full-capacity-probe")]
     fn capacity_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if !r.handles.is_empty() {
