@@ -325,4 +325,29 @@ mod tests {
         assert!(!g.observed(17, 3, 2, reused));
         assert!(!g.exact(17, 3, 2, root(3), key, 258));
     }
+    #[test]
+    fn exact_arm_replay_preserves_armed_and_fired_observation() {
+        let key = proto_fs::OpenKey {
+            slot: 0,
+            generation: 4,
+        };
+        let mut g = gate();
+        for fired in [false, true] {
+            if fired {
+                assert!(g.committed(17, key, ready(), completed()));
+            }
+            let before = g;
+            assert!(g.exact(17, 3, 2, root(3), key, 257));
+            assert_eq!(g, before);
+            for (label, pid, image, job) in [
+                (18, 3, 2, 257),
+                (17, 4, 2, 257),
+                (17, 3, 3, 257),
+                (17, 3, 2, 258),
+            ] {
+                assert!(!g.exact(label, pid, image, root(3), key, job));
+                assert_eq!(g, before);
+            }
+        }
+    }
 }

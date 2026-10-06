@@ -2330,6 +2330,7 @@ impl Fs {
             return status(code);
         }
         let Binding::Active(who) = &fds.binding else {
+            self.capacity_clear_owner(r.label());
             return status(proto_fs::PERMISSION);
         };
         let root = Root {
@@ -2337,6 +2338,7 @@ impl Fs {
             generation: u64::from(who.root.generation),
         };
         if root != fds.root {
+            self.capacity_clear_owner(r.label());
             return status(proto_fs::PERMISSION);
         }
         let (pid, image) = (who.pid, who.image);
@@ -2351,8 +2353,15 @@ impl Fs {
                 self.capacity_clear_owner(r.label());
                 return Answer::Status(Status::Ok);
             }
-            if action != 0 || self.capacity_retired_gate.is_some() {
+            if action != 0 {
                 return status(proto_fs::INVALID_ARGUMENT);
+            }
+            if let Some(gate) = self.capacity_retired_gate {
+                return if gate.exact(r.label(), pid, image, root, key, job) {
+                    Answer::Status(Status::Ok)
+                } else {
+                    status(proto_fs::INVALID_ARGUMENT)
+                };
             }
             if !self
                 .capacity_checkpoints
@@ -2442,19 +2451,31 @@ impl Fs {
         }
         let meter = match rt::resource_meter::snapshot_for(&self.process) {
             Ok(meter) => meter,
-            Err(error) => return Answer::Status(Status::Kernel(error)),
+            Err(error) => {
+                self.capacity_clear_owner(r.label());
+                return Answer::Status(Status::Kernel(error));
+            }
         };
         let memory = match self.capacity_info(sys::process_memory(&self.process)) {
             Ok(memory) => memory,
-            Err(error) => return Answer::Status(Status::Kernel(error)),
+            Err(error) => {
+                self.capacity_clear_owner(r.label());
+                return Answer::Status(Status::Kernel(error));
+            }
         };
         let handles = match self.capacity_info(sys::process_handles(&self.process)) {
             Ok(handles) => handles,
-            Err(error) => return Answer::Status(Status::Kernel(error)),
+            Err(error) => {
+                self.capacity_clear_owner(r.label());
+                return Answer::Status(Status::Kernel(error));
+            }
         };
         let backing = match self.capacity_info(sys::memory_info(&self.capacity_backing)) {
             Ok(backing) => backing,
-            Err(error) => return Answer::Status(Status::Kernel(error)),
+            Err(error) => {
+                self.capacity_clear_owner(r.label());
+                return Answer::Status(Status::Kernel(error));
+            }
         };
         let available = self.ram.storage.available();
         let usage = self.ram.storage.usage(root);
