@@ -14,6 +14,7 @@
 pub mod adoption_reply;
 #[cfg(feature = "image-probe")]
 pub mod image_probe;
+pub mod initial_maps;
 pub mod loaders;
 pub mod queue;
 pub mod records;

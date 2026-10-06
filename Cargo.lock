@@ -360,6 +360,7 @@ dependencies = [
 name = "posix-process-service"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "bootimg",
  "posix-credentials",
  "proto-init",
@@ -588,6 +589,7 @@ name = "proto-process"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "bootimg",
  "proto-wire",
 ]
 

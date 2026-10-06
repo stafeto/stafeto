@@ -132,7 +132,7 @@ pub struct Reply {
 }
 
 impl Reply {
-    fn validate(&self) -> Result<(), Status> {
+    pub(crate) fn validate(&self) -> Result<(), Status> {
         let count = usize::from(self.count);
         if !(1..=ENTRIES).contains(&count) || !self.receipt.valid() {
             return Err(Status::BadSize);
