@@ -226,7 +226,11 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
 /// The public data fixture retains genuine pipe and random device routes.
 #[cfg(all(
     feature = "public-data-probe",
-    not(any(feature = "ramfs-cleanup", feature = "loader-abort"))
+    not(any(
+        feature = "ramfs-cleanup",
+        feature = "loader-abort",
+        feature = "full-capacity-probe"
+    ))
 ))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
     RAM_POSIX_FILES,
@@ -240,6 +244,40 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         connects: &["ramfs", "clock", "posix", "pipe", "entropy"],
         quota: 2048 * PAGE,
         root: true,
+        ..POSIX
+    },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
+];
+
+/// Two initial leaders retain distinct genuine roots; ten loaded descendants
+/// are two factories and their eight actors. Their 2048-page quotas and the
+/// existing loader reserve are paid by the Process service's pool.
+#[cfg(feature = "full-capacity-probe")]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    RAM_POSIX_FILES,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 10 * 2048 * PAGE + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"capacity-a\0",
+        connects: &["ramfs", "clock", "posix", "pipe", "entropy"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+    Record {
+        name: "capacity-b",
+        program: "posix-files",
+        args: b"capacity-b\0",
+        connects: &["ramfs", "clock", "posix", "pipe", "entropy"],
+        quota: 2048 * PAGE,
+        root: false,
         ..POSIX
     },
     super::entropy::RNG,

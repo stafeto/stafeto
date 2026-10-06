@@ -14,6 +14,7 @@ test = false
 bench = false
 
 [features]
+full-capacity-probe = ["data-carrier-probe", "public-data-probe", "posix-abi/full-capacity-probe", "dep:proto-pipe"]
 jobs = []
 auth-probe = ["files"]
 data-carrier-probe = ["files"]
@@ -45,3 +46,5 @@ posix-sync = { path = "../../lib/posix-sync", optional = true }
 posix-clock = { path = "../../lib/posix-clock", optional = true }
 posix-time = { path = "../../lib/posix-time", optional = true }
 proto-clock = { path = "../../proto/clock", optional = true }
+
+proto-pipe = { path = "../../proto/pipe", optional = true }

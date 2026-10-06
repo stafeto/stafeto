@@ -13,6 +13,9 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 #[cfg(feature = "pending-open")]
 mod pending_open;
 
+#[cfg(feature = "full-capacity-probe")]
+mod native_capacity;
+
 /// The C probe supplies two writable words for the actual process accounting.
 #[cfg(feature = "public-data-probe")]
 #[unsafe(no_mangle)]

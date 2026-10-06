@@ -387,6 +387,15 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        "boot-posix-data-capacity.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/capacity-probe", 0o755, ROOT, "posix-files"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-posix-files.img"
         | "boot-posix-files-steps.img"
         | "boot-posix-files-loss.img"

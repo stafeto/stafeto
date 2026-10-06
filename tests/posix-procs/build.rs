@@ -16,6 +16,7 @@ fn run(cmd: &mut Command) {
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=files.c");
+    println!("cargo:rerun-if-changed=native-capacity.c");
     println!("cargo:rerun-if-changed=open-policy.c");
     println!("cargo:rerun-if-changed=public-data.c");
     println!("cargo:rerun-if-changed=public-data-loss.c");
@@ -53,7 +54,12 @@ fn main() {
     );
     println!("cargo:rerun-if-changed={}", lib.join("libc.a").display());
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    run(Command::new(tools.join("clang"))
+    let capacity = env::var_os("CARGO_FEATURE_FULL_CAPACITY_PROBE").is_some();
+    let mut compiler = Command::new(tools.join("clang"));
+    if capacity {
+        compiler.arg("-Dmain=capacity_previous_main");
+    }
+    run(compiler
         .arg(format!(
             "-DPUBLIC_DATA_LOSS_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_PUBLIC_DATA_LOSS_PROBE").is_some())
@@ -120,10 +126,35 @@ fn main() {
             "-o",
         ])
         .arg(out.join("procs.o")));
-    run(Command::new(tools.join("llvm-ar"))
+    if capacity {
+        run(Command::new(tools.join("clang"))
+            .args([
+                "--target=aarch64-linux-gnu",
+                "-mfix-cortex-a53-835769",
+                "-nostdinc",
+                "-fno-stack-protector",
+                "-fno-pic",
+                "-std=c11",
+                "-O2",
+                "-fno-builtin",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-isystem",
+            ])
+            .arg(sysroot.join("include"))
+            .args(["-c", "native-capacity.c", "-o"])
+            .arg(out.join("capacity.o")));
+    }
+    let mut archiver = Command::new(tools.join("llvm-ar"));
+    archiver
         .arg("crs")
         .arg(out.join("libposixprocs.a"))
-        .arg(out.join("procs.o")));
+        .arg(out.join("procs.o"));
+    if capacity {
+        archiver.arg(out.join("capacity.o"));
+    }
+    run(&mut archiver);
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-search=native={}", lib.display());
     println!("cargo:rustc-link-lib=static=posixprocs");

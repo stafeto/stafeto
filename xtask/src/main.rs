@@ -1103,6 +1103,8 @@ commands:
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
   posix-data-steps measure paid data cleanup and full mapping dispatches
+  posix-data-capacity-build build the complete two-root capacity profile
+  posix-data-capacity verify full4096 pages and genuine96/32 paid jobs
   posix-open-finalize-clock probe genuine Clock publication during Finish
   posix-files-loss verify native refused Open replies with a live sibling
   posix-abi run a C main against Rust POSIX and verify thread-local errno
@@ -1228,6 +1230,8 @@ fn main() {
         Some("posix-files-loss") => posix_files_loss(),
         Some("posix-data-steps") => posix_files_run_profile(true, true, false),
         Some("posix-data-loss") => posix_data_loss(),
+        Some("posix-data-capacity-build") => posix_data_capacity(false),
+        Some("posix-data-capacity") => posix_data_capacity(true),
         Some("posix-open-finalize-clock") => posix_files_run_profile(true, true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
@@ -3037,6 +3041,66 @@ fn posix_files_loss() -> Result<(), String> {
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ended)?;
     qemu::expect_marker(&output, "posix-files: genuine native reply loss ok")?;
+    Ok(())
+}
+
+fn posix_data_capacity(run: bool) -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 8] = [
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-posix-files", "full-capacity-probe"],
+        ),
+        (
+            "ramfs",
+            "ramfs",
+            RAMFS_STACK_SIZE,
+            &["steps", "full-capacity-probe"],
+        ),
+        POSIX_FILES_PROGRAMS[2],
+        POSIX_FILES_PROGRAMS[3],
+        (
+            "posix-files",
+            "posix-procs",
+            POSIX_STACK_SIZE,
+            &["full-capacity-probe"],
+        ),
+        POSIX_PROCS_PROGRAMS[2],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    let image = build_boot_image("boot-posix-data-capacity.img", &PROGRAMS, BOOT_PROFILE)?;
+    if !run {
+        return Ok(());
+    }
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(cmd, Duration::from_secs(120), Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "init: capacity-b ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(&output, "ramfs-capacity: final roots=")?;
+    qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
+    let steps = longest_steps(&output.lines, "2");
+    for kind in [15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 65] {
+        if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
+            return Err(format!(
+                "capacity profile has no method {kind} measurement: {steps:?}"
+            ));
+        }
+    }
+    if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "capacity RAM method {kind} took {ticks}, past {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    println!("RAM full-capacity dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     Ok(())
 }
 

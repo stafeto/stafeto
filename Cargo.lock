@@ -375,6 +375,7 @@ dependencies = [
  "proto-clock",
  "proto-fs",
  "proto-loader",
+ "proto-pipe",
  "proto-process",
  "proto-wire",
  "rt",
