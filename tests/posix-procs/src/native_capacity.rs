@@ -389,11 +389,46 @@ fn collect_failed() {
         posix_abi::shared::help_open_recovery();
     }
 }
+#[inline(never)]
+fn refusal_snapshot(stage: u32, snapshot: &Snapshot) {
+    rt::println!(
+        "capacity-diag: refusal stage={} jobs={} preparations={} root_preparations={}",
+        stage,
+        snapshot.jobs,
+        snapshot.preparations,
+        snapshot.root_preparations
+    );
+    for (index, value) in snapshot.usage.iter().enumerate() {
+        rt::println!(
+            "capacity-diag: refusal stage={} usage_index={} value={}",
+            stage,
+            index,
+            value
+        );
+    }
+    for (index, value) in snapshot.available.iter().enumerate() {
+        rt::println!(
+            "capacity-diag: refusal stage={} available_index={} value={}",
+            stage,
+            index,
+            value
+        );
+    }
+}
 fn refusing(fd: i32, expected: i32) -> Result<(), i32> {
     let before = meter::snapshot()?;
-    require(paid::retain_read(fd as u32, 0) == Err(expected))?;
+    refusal_snapshot(0, &before);
+    let result = paid::retain_read(fd as u32, 0);
+    rt::println!(
+        "capacity-diag: refusal expected={} actual_errno={} retained={}",
+        expected,
+        result.err().unwrap_or(0),
+        u32::from(result.is_ok())
+    );
+    require(result == Err(expected))?;
     collect_failed();
     let after = meter::snapshot()?;
+    refusal_snapshot(1, &after);
     require(
         after.jobs == before.jobs
             && after.preparations == before.preparations
