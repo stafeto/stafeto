@@ -1010,7 +1010,7 @@ impl<'a> Ram<'a> {
             let _ = self.storage.cancel(r);
             return true;
         }
-        if self.release_image(fds) {
+        if self.release_loading_image(fds) {
             return true;
         }
         if let Some(cwd) = fds.cwd.take() {
@@ -1036,6 +1036,27 @@ impl<'a> Ram<'a> {
                 .expect("named description")
                 .generation,
         })
+    }
+
+    /// Observe executable accounting for this running probe caller's exact descriptor.
+    #[cfg(feature = "auth-probe")]
+    pub fn probe_exec_pin(&self, fds: &Fds, fd: u32, expected: Token) -> Result<[u32; 4], u32> {
+        if !matches!(fds.binding, authority::Binding::Active(who) if who.loader.is_none()) {
+            return Err(proto_fs::PERMISSION);
+        }
+        if self.description_token(fds, fd)? != expected {
+            return Err(BAD_FD);
+        }
+        let node = self.storage.node(self.token(self.get(fds, fd)?.file))?;
+        if node.kind != REG {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        Ok([
+            u32::from(node.pins[Pin::Image as usize]),
+            u32::from(node.writers),
+            u32::from(self.storage.usage(fds.root).descriptions),
+            self.storage.probe_description_charges(),
+        ])
     }
 
     /// A raw token can serve as a relative base only when this session retains it.

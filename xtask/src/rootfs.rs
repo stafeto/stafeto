@@ -399,7 +399,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         }
         "boot-image-gates.img"
         | "boot-image-gates-steps.img"
-        | "boot-image-gates-normal-steps.img" => vec![
+        | "boot-image-gates-normal-steps.img"
+        | "boot-t6-runtime.img"
+        | "boot-t6-runtime-steps.img" => vec![
             dir("/bin"),
             file("/bin/posix-files", 0o755, ROOT, "posix-files"),
             of(
@@ -522,6 +524,31 @@ pub fn table(files: &[RootFile], first: u32, total: u32) -> Result<Vec<u8>, Stri
 mod tests {
     use super::*;
     use bootimg::rootfs::Rootfs;
+
+    #[test]
+    fn runtime_custody_images_keep_the_canonical_setid_artifact() {
+        for name in ["boot-t6-runtime.img", "boot-t6-runtime-steps.img"] {
+            let files = files_of(name);
+            let bytes = table(&files, 0, 7).unwrap();
+            let parsed = Rootfs::parse(&bytes, 7).unwrap();
+            let entry = parsed.entry(parsed.find("/bin/setid-image").unwrap() as u32);
+            assert_eq!(
+                (entry.mode, entry.uid, entry.gid),
+                (rootfs::REGULAR | 0o6755, 37, 43)
+            );
+            assert!(files.iter().any(|file| file.path == "/bin/setid-image"
+                && matches!(
+                    file.source,
+                    Some(Source::Variant {
+                        program: "posix-files",
+                        tag: "setid",
+                        extra: 0
+                    })
+                )));
+            assert!(files.iter().any(|file| file.path == "/bin/posix-files"
+                && matches!(file.source, Some(Source::Elf("posix-files")))));
+        }
+    }
 
     #[test]
     fn hard_links_of_a_program_share_one_file_and_the_table_reads_back() {

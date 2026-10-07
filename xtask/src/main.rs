@@ -1098,6 +1098,8 @@ commands:
   posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
+  t6-runtime-gates verify dynamic exec, two forks, End custody and atomic Stage Abort
+  t6-runtime-gates-steps measure the runtime custody gates under icount
   image-gates verify genuine Take and accepted SetId ambiguity
   image-gates-steps measure retained image dispatches under icount
   image-gates-normal-steps measure normal SetId without reply corruption
@@ -1226,6 +1228,8 @@ fn main() {
         Some("ramfs-cleanup") => ramfs_cleanup_probe(),
         Some("ramfs-gc") => ramfs_gc_probe(),
         Some("image-gates") => image_gates_probe(false, false),
+        Some("t6-runtime-gates") => t6_runtime_probe(false),
+        Some("t6-runtime-gates-steps") => t6_runtime_probe(true),
         Some("image-gates-steps") => image_gates_probe(true, false),
         Some("image-gates-normal-steps") => image_gates_probe(true, true),
         Some("loader-abort") => loader_abort_probe(false),
@@ -2815,6 +2819,113 @@ fn ramfs_gc_probe() -> Result<(), String> {
         ));
     }
     println!("RAM GC dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    Ok(())
+}
+
+/// Runtime custody uses a writable dynamic ELF and three independently paid images.
+fn t6_runtime_probe(measured: bool) -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 7] = [
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-posix-files", "t6-runtime"],
+        ),
+        ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["image-gates"]),
+        (
+            "posix-process-service",
+            "posix-process-service",
+            64 * 1024,
+            &["image-probe"],
+        ),
+        ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+        (
+            "posix-files",
+            "posix-procs",
+            POSIX_STACK_SIZE,
+            &["t6-runtime"],
+        ),
+        ("loader", "loader", 0, &["image-gates"]),
+        ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    ];
+    const MEASURED: [ImageProgram; 7] = {
+        let mut programs = PROGRAMS;
+        programs[1].3 = &["image-gates", "steps"];
+        programs[2].3 = &["image-probe", "steps"];
+        programs
+    };
+    let name = if measured {
+        "boot-t6-runtime-steps.img"
+    } else {
+        "boot-t6-runtime.img"
+    };
+    let image = build_boot_image(
+        name,
+        if measured { &MEASURED } else { &PROGRAMS },
+        BOOT_PROFILE,
+    )?;
+    let ram_elf = image_elf(&target_dir(), name, "ramfs");
+    let bytes = std::fs::read(&ram_elf).map_err(|error| error.to_string())?;
+    let ram = bootimg::elf::program(&bytes, RAMFS_STACK_SIZE).map_err(|error| error.to_string())?;
+    let pages: u64 = ram
+        .segments
+        .iter()
+        .map(|segment| segment.mem_size.div_ceil(4096))
+        .sum();
+    if pages > 976 {
+        return Err(format!(
+            "runtime fixture RAM maps {pages} pages; remeasure its quota to preserve 128 allowance"
+        ));
+    }
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    if measured {
+        command.args(qemu::ICOUNT);
+    }
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, STEPS_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    for marker in [
+        "t6-runtime: actual Stage Installed, malformed reply, AbortRequired and Abort ok",
+        "t6-runtime: dynamic exec, two forks, End and ETXTBSY custody ok",
+    ] {
+        qemu::expect_marker(&output, marker)?;
+    }
+    if measured {
+        let steps = longest_steps(&output.lines, "2");
+        for kind in [14, 43, 65] {
+            if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
+                return Err(format!(
+                    "RAM runtime custody has no method {kind}: {steps:?}"
+                ));
+            }
+        }
+        if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "RAM runtime custody kind {kind} took {ticks}, past {RAM_STEP_MAX}: {steps:?}"
+            ));
+        }
+        println!("RAM runtime custody dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+        let process = longest_steps(&output.lines, "1");
+        for kind in [54, 55] {
+            if !process
+                .iter()
+                .any(|(k, ticks, _)| *k == kind && *ticks != 0)
+            {
+                return Err(format!(
+                    "Process runtime custody has no method {kind}: {process:?}"
+                ));
+            }
+        }
+        if let Some((kind, ticks, _)) = process.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "Process runtime custody kind {kind} took {ticks}, past {RAM_STEP_MAX}: {process:?}"
+            ));
+        }
+        println!("Process runtime custody dispatches under icount (B {RAM_STEP_MAX}): {process:?}");
+    }
     Ok(())
 }
 

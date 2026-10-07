@@ -75,6 +75,14 @@ impl Places {
             slot as usize
         }
     }
+    /// Private image custody requires the exact issued image label and generation.
+    pub fn image_place(&self, label: u64) -> Option<usize> {
+        if label & (OWN | IMAGE_SESSION) != (OWN | IMAGE_SESSION) {
+            return None;
+        }
+        let slot = self.place(label);
+        (slot < COUNT).then_some(slot)
+    }
     pub fn release(&self, label: u64) {
         let slot = if label & OWN != 0 {
             (label & 511) as usize
@@ -142,5 +150,27 @@ mod tests {
         places.release(image);
         assert!(places.place(new_image) < COUNT);
         assert_eq!(places.issue_image(1 << 53), None);
+    }
+}
+
+#[cfg(test)]
+mod image_place_tests {
+    use super::*;
+    #[test]
+    fn custody_lookup_rejects_ordinary_named_and_reused_image_generations_without_admission() {
+        let places = Places::new();
+        let ordinary = places.issue(1).unwrap();
+        let old = places.issue_image(2).unwrap();
+        assert_eq!(places.image_place(17), None);
+        assert_eq!(places.image_place(ordinary), None);
+        assert_eq!(places.image_place(old), Some((old & 511) as usize));
+        places.release(old);
+        let new = places.issue_image(3).unwrap();
+        assert_eq!(old & 511, new & 511);
+        assert_eq!(places.image_place(old), None);
+        assert_eq!(places.image_place(new), Some((new & 511) as usize));
+        assert_eq!(places.image_place(new ^ IMAGE_SESSION), None);
+        places.release(old);
+        assert!(places.image_place(new).is_some());
     }
 }

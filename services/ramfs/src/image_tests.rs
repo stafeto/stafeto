@@ -549,3 +549,454 @@ fn closed_numeric_slot_reuse_preserves_original_retained_writer_and_exact_cleanu
     ram.close(&mut fds, fd).unwrap();
     assert_eq!(ram.storage.node(new).unwrap().writers, 0);
 }
+
+#[test]
+fn attempted_stage_revokes_reads_and_preserves_inode_until_last_session_gone() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let token = writable_inode(&mut ram, b"runtime");
+    ram.storage.write(token, EXPENSE, 0, b"ELF bytes").unwrap();
+    let mut held = session();
+    ram.hold_image(&mut held, token, crate::storage::NONE)
+        .unwrap();
+    let now = proto_fs::Timestamp::new(-7, 23).unwrap();
+    assert_eq!(ram.arm_image_execution(&mut held, token, now), Ok(true));
+    assert_eq!(ram.storage.node(token).unwrap().times[0], now);
+    let mut source = crate::image::ImageOutcome {
+        job: 9,
+        label: 11,
+        token,
+        phase: crate::image::ImagePhase::Prepared,
+    };
+    source.begin_stage().unwrap();
+    assert_eq!(source.phase, crate::image::ImagePhase::AbortRequired);
+    assert_eq!(source.begin_stage(), Err(proto_fs::IMAGE_ABORT_REQUIRED));
+    // A retained-audit failure or explicit Close revokes the old read tuple.
+    held.binding = crate::authority::Binding::Cleanup;
+    held.root = Root {
+        id: 301,
+        generation: 2,
+    };
+    let before = ram.storage.usage(EXPENSE);
+    let mut out = [0; 9];
+    assert_eq!(
+        ram.held_image_read(&held, 0, &mut out),
+        Err(proto_fs::PERMISSION)
+    );
+    assert_eq!(ram.held_image_information(&held), Err(proto_fs::PERMISSION));
+    assert!(!ram.release_loading_image(&mut held));
+    assert!(!ram.release_step(&mut held));
+    assert_eq!(ram.storage.usage(EXPENSE), before);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins[Pin::Image as usize],
+        1
+    );
+    assert_eq!(
+        ram.storage.write(token, EXPENSE, 0, b"new"),
+        Err(proto_fs::TEXT_BUSY)
+    );
+    assert_eq!(
+        ram.open_token(&mut session(), token, proto_fs::WRITE_ONLY, ADMIN),
+        Err(proto_fs::TEXT_BUSY)
+    );
+    assert_eq!(
+        ram.arm_image_execution(&mut held, token, proto_fs::Timestamp::ZERO),
+        Ok(false)
+    );
+    assert_eq!(ram.storage.node(token).unwrap().times[0], now);
+    // Canonical GONE occurs after the Process custodian releases its last copy.
+    ram.release(&mut held);
+    ram.release(&mut held);
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 0);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins[Pin::Image as usize],
+        0
+    );
+    assert_eq!(ram.storage.write(token, EXPENSE, 0, b"new"), Ok(3));
+}
+
+#[test]
+fn fork_image_keeps_exact_origin_after_parent_authority_and_account_reuse() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let token = writable_inode(&mut ram, b"fork-runtime");
+    ram.storage
+        .write(token, EXPENSE, 0, b"old executable")
+        .unwrap();
+    let mut parent = session();
+    ram.hold_image(&mut parent, token, crate::storage::NONE)
+        .unwrap();
+    let now = proto_fs::Timestamp::new(33, 99).unwrap();
+    ram.arm_image_execution(&mut parent, token, now).unwrap();
+    parent.binding = crate::authority::Binding::Cleanup;
+    parent.root = Root {
+        id: 999,
+        generation: 2,
+    };
+    let mut child = Fds {
+        root: Root {
+            id: 777,
+            generation: 1,
+        },
+        ..Fds::default()
+    };
+    ram.hold_fork_image(&mut child, &parent).unwrap();
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 2);
+    assert_eq!(ram.storage.usage(parent.root).descriptions, 0);
+    assert_eq!(ram.storage.usage(child.root).descriptions, 0);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins[Pin::Image as usize],
+        2
+    );
+    ram.storage.unlink(ROOT, b"fork-runtime", EXPENSE).unwrap();
+    let fresh = writable_inode(&mut ram, b"fork-runtime");
+    assert_ne!(token, fresh);
+    ram.release(&mut parent);
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 1);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins[Pin::Image as usize],
+        1
+    );
+    assert_eq!(ram.storage.node(token).unwrap().times[0], now);
+    let mut out = [0; 14];
+    assert_eq!(ram.held_image_read(&child, 0, &mut out), Ok(14));
+    assert_eq!(&out, b"old executable");
+    assert_eq!(
+        ram.storage.write(token, EXPENSE, 0, b"new"),
+        Err(proto_fs::TEXT_BUSY)
+    );
+    assert_eq!(ram.storage.write(fresh, EXPENSE, 0, b"new"), Ok(3));
+    child.binding = crate::authority::Binding::Cleanup;
+    assert!(!ram.release_step(&mut child));
+    ram.release(&mut child);
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 0);
+    assert!(ram.storage.node(token).is_err());
+}
+
+#[test]
+fn stage_preflight_and_strict_accepted_reply_preserve_exact_once_effect() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let token = writable_inode(&mut ram, b"first");
+    let other = writable_inode(&mut ram, b"other");
+    let mut held = session();
+    ram.hold_image(&mut held, token, crate::storage::NONE)
+        .unwrap();
+    let times = ram.storage.node(token).unwrap().times;
+    let usage = ram.storage.usage(EXPENSE);
+    assert_eq!(
+        ram.arm_image_execution(&mut held, other, proto_fs::Timestamp::ZERO),
+        Err(proto_fs::STALE_PROOF)
+    );
+    assert_eq!(ram.storage.node(token).unwrap().times, times);
+    assert_eq!(ram.storage.usage(EXPENSE), usage);
+    assert!(ram.release_loading_image(&mut held));
+    use crate::image::stage_accepted_reply;
+    assert!(stage_accepted_reply(&[0; 8], 0));
+    for size in 0..8 {
+        assert!(!stage_accepted_reply(&[0; 8][..size], 0));
+    }
+    assert!(!stage_accepted_reply(&[0; 9], 0));
+    assert!(!stage_accepted_reply(&[0; 8], 1));
+    for i in 0..8 {
+        let mut bad = [0; 8];
+        bad[i] = 1;
+        assert!(!stage_accepted_reply(&bad, 0));
+    }
+}
+
+#[test]
+fn fork_preflight_preserves_full_origin_budget_and_loading_source() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let token = writable_inode(&mut ram, b"fork-budget");
+    let mut parent = session();
+    ram.hold_image(&mut parent, token, crate::storage::NONE)
+        .unwrap();
+    let mut child = Fds {
+        root: Root {
+            id: 777,
+            generation: 1,
+        },
+        ..Fds::default()
+    };
+    let usage = ram.storage.usage(EXPENSE);
+    assert_eq!(
+        ram.hold_fork_image(&mut child, &parent),
+        Err(proto_fs::PERMISSION)
+    );
+    assert_eq!(ram.storage.usage(EXPENSE), usage);
+    assert!(child.image_hold.is_none());
+    ram.arm_image_execution(&mut parent, token, proto_fs::Timestamp::ZERO)
+        .unwrap();
+    for _ in 1..crate::storage::DESCRIPTION_SHARE {
+        ram.storage.charge_description(EXPENSE).unwrap();
+    }
+    let usage = ram.storage.usage(EXPENSE);
+    assert_eq!(
+        ram.hold_fork_image(&mut child, &parent),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    );
+    assert_eq!(ram.storage.usage(EXPENSE), usage);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins[Pin::Image as usize],
+        1
+    );
+    assert!(child.image_hold.is_none());
+    ram.storage.release_description(EXPENSE);
+    ram.hold_fork_image(&mut child, &parent).unwrap();
+    ram.release(&mut parent);
+    ram.release(&mut child);
+    for _ in 2..crate::storage::DESCRIPTION_SHARE {
+        ram.storage.release_description(EXPENSE);
+    }
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 0);
+}
+
+#[test]
+fn fork_snapshot_admission_and_final_child_cleanup_preserve_exact_origin_and_atime() {
+    let bytes = image();
+    let mut index = crate::tree::Index::new();
+    let tree = crate::tree::load(&bytes, &mut index).unwrap();
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::legacy_ns(0), tree);
+    let token = ram.storage.resolve(b"/program").unwrap();
+    let entry = ram.storage.node(token).unwrap().boot;
+    let target_root = Root {
+        id: 301,
+        generation: 2,
+    };
+    let mut parent = Fds {
+        root: EXPENSE,
+        ..Fds::default()
+    };
+    ram.hold_image(&mut parent, token, entry).unwrap();
+    let mut child = Fds {
+        root: target_root,
+        ..Fds::default()
+    };
+    let unarmed = parent.image_hold.unwrap();
+    assert_eq!(
+        ram.hold_fork_snapshot(&mut child, unarmed),
+        Err(proto_fs::PERMISSION)
+    );
+    assert!(child.image_hold.is_none());
+    let time = proto_fs::Timestamp::new(-5, 42).unwrap();
+    ram.arm_image_execution(&mut parent, token, time).unwrap();
+    let held = parent.image_hold.unwrap();
+    parent.binding = crate::authority::Binding::Cleanup;
+    parent.root = target_root;
+    let charge = ram.storage.charge_preparation(target_root).unwrap();
+    ram.hold_fork_snapshot(&mut child, held).unwrap();
+    assert_eq!(ram.storage.node(token).unwrap().times[0], time);
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 2);
+    assert_eq!(ram.storage.usage(target_root).descriptions, 0);
+    ram.storage.release_preparation(charge);
+    ram.release(&mut parent);
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 1);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins[Pin::Image as usize],
+        1
+    );
+    assert!(!ram.release_loading_image(&mut child));
+    assert_eq!(
+        ram.storage.write(token, target_root, 0, b"x"),
+        Err(proto_fs::TEXT_BUSY)
+    );
+    ram.release(&mut child);
+    ram.release(&mut child);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins[Pin::Image as usize],
+        0
+    );
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 0);
+    assert_eq!(ram.storage.preparations_used(), 0);
+}
+
+#[test]
+fn clone_preparation_shares_existing_global_and_root_budget_before_any_image_reference() {
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let other = Root {
+        id: 301,
+        generation: 1,
+    };
+    let mut paid = [0; crate::storage::PREPARATIONS];
+    for (i, p) in paid.iter_mut().enumerate() {
+        *p = ram
+            .storage
+            .charge_preparation(if i < 96 { EXPENSE } else { other })
+            .unwrap();
+    }
+    let mut child = Fds {
+        root: other,
+        ..Fds::default()
+    };
+    assert_eq!(
+        ram.storage.charge_preparation(other),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    );
+    assert!(child.image_hold.is_none());
+    assert_eq!(ram.storage.usage(other).descriptions, 0);
+    for p in paid {
+        ram.storage.release_preparation(p);
+    }
+    child.resolvers.fill(1);
+    assert!(!child.preparation_available());
+    child.resolvers[15] = 0;
+    assert!(child.preparation_available());
+    assert_eq!(ram.storage.preparations_used(), 0);
+}
+
+#[cfg(feature = "auth-probe")]
+fn probe_binding() -> crate::authority::Binding {
+    crate::authority::Binding::Active(proto_process::WhoReply {
+        pid: 300,
+        credentials: proto_process::Credentials::ROOT,
+        generation: 1,
+        loader: None,
+        index: 1,
+        ctty: None,
+        image: 1,
+        groups: proto_process::Groups::EMPTY,
+        limits: proto_process::ResourceLimits::initial(2 * 1024 * 1024),
+        root: proto_process::ExpenditureRoot {
+            pid: 300,
+            generation: 1,
+        },
+    })
+}
+
+#[cfg(feature = "auth-probe")]
+#[test]
+fn pin_probe_observes_exact_descriptor_origin_and_lifecycle_without_effects() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let token = writable_inode(&mut ram, b"observed");
+    let mut observer = session();
+    observer.binding = probe_binding();
+    let fd = ram
+        .open_token(&mut observer, token, proto_fs::READ_ONLY, ADMIN)
+        .unwrap();
+    let exact = ram.description_token(&observer, fd).unwrap();
+    assert_eq!(ram.probe_exec_pin(&observer, fd, exact), Ok([0, 0, 1, 1]));
+    let mut parent = session();
+    ram.hold_image(&mut parent, token, crate::storage::NONE)
+        .unwrap();
+    ram.arm_image_execution(&mut parent, token, proto_fs::Timestamp::new(3, 4).unwrap())
+        .unwrap();
+    let mut child = session();
+    ram.hold_fork_image(&mut child, &parent).unwrap();
+    let mut grand = session();
+    ram.hold_fork_image(&mut grand, &child).unwrap();
+    let epoch = ram.storage.state.epoch;
+    let times = ram.storage.node(token).unwrap().times;
+    let usage = ram.storage.usage(EXPENSE);
+    assert_eq!(ram.probe_exec_pin(&observer, fd, exact), Ok([3, 0, 4, 4]));
+    assert_eq!(ram.storage.state.epoch, epoch);
+    assert_eq!(ram.storage.node(token).unwrap().times, times);
+    assert_eq!(ram.storage.usage(EXPENSE), usage);
+    parent.binding = crate::authority::Binding::Cleanup;
+    ram.release(&mut parent);
+    assert_eq!(ram.probe_exec_pin(&observer, fd, exact), Ok([2, 0, 3, 3]));
+    ram.release(&mut child);
+    assert_eq!(ram.probe_exec_pin(&observer, fd, exact), Ok([1, 0, 2, 2]));
+    ram.release(&mut grand);
+    assert_eq!(ram.probe_exec_pin(&observer, fd, exact), Ok([0, 0, 1, 1]));
+    let other_root = Root {
+        id: 900,
+        generation: 2,
+    };
+    let mut writer = Fds {
+        root: other_root,
+        ..Fds::default()
+    };
+    let write_fd = ram
+        .open_token(&mut writer, token, proto_fs::WRITE_ONLY, ADMIN)
+        .unwrap();
+    assert_eq!(ram.probe_exec_pin(&observer, fd, exact), Ok([0, 1, 1, 2]));
+    ram.close(&mut writer, write_fd).unwrap();
+    assert_eq!(ram.probe_exec_pin(&observer, fd, exact), Ok([0, 0, 1, 1]));
+    ram.close(&mut observer, fd).unwrap();
+    let replacement = ram
+        .open_token(&mut observer, token, proto_fs::READ_ONLY, ADMIN)
+        .unwrap();
+    assert_eq!(replacement, fd);
+    assert_eq!(
+        ram.probe_exec_pin(&observer, replacement, exact),
+        Err(proto_fs::BAD_FD)
+    );
+    let fresh = ram.description_token(&observer, replacement).unwrap();
+    assert_ne!(exact, fresh);
+    assert_eq!(
+        ram.probe_exec_pin(&observer, replacement, fresh),
+        Ok([0, 0, 1, 1])
+    );
+    ram.release(&mut observer);
+    assert_eq!(ram.storage.probe_description_charges(), 0);
+}
+
+#[cfg(feature = "auth-probe")]
+#[test]
+fn pin_probe_rejects_authority_classes_and_nonregular_descriptors() {
+    use crate::authority::Binding;
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let mut fds = session();
+    let fd = ram
+        .open(&mut fds, "/etc/motd", proto_fs::READ_ONLY)
+        .unwrap();
+    let exact = ram.description_token(&fds, fd).unwrap();
+    let Binding::Active(who) = probe_binding() else {
+        unreachable!()
+    };
+    for binding in [
+        Binding::Unbound,
+        Binding::Boot,
+        Binding::Pending(who),
+        Binding::Handoff(who),
+        Binding::Inherited(who),
+        Binding::Cleanup,
+        Binding::Active(proto_process::WhoReply {
+            loader: Some(proto_process::LoaderOf {
+                image: 1,
+                ticket: 1,
+            }),
+            ..who
+        }),
+    ] {
+        fds.binding = binding;
+        assert_eq!(
+            ram.probe_exec_pin(&fds, fd, exact),
+            Err(proto_fs::PERMISSION)
+        );
+    }
+    fds.binding = Binding::Active(who);
+    assert_eq!(ram.probe_exec_pin(&fds, fd, exact), Ok([0, 0, 1, 1]));
+    let directory = ram.open(&mut fds, "/tmp", proto_fs::READ_ONLY).unwrap();
+    let dir_exact = ram.description_token(&fds, directory).unwrap();
+    assert_eq!(
+        ram.probe_exec_pin(&fds, directory, dir_exact),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        ram.probe_exec_pin(&fds, fd, dir_exact),
+        Err(proto_fs::BAD_FD)
+    );
+    ram.release(&mut fds);
+}
+
+#[cfg(feature = "auth-probe")]
+#[test]
+fn pin_probe_sums_all_root_accounts_without_new_resources() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    for id in 1..=crate::storage::ROOTS as u64 {
+        for _ in 0..96 {
+            ram.storage
+                .charge_description(Root { id, generation: 1 })
+                .unwrap();
+        }
+    }
+    assert_eq!(ram.storage.probe_description_charges(), 320 * 96);
+    let epoch = ram.storage.state.epoch;
+    assert_eq!(ram.storage.probe_description_charges(), 320 * 96);
+    assert_eq!(ram.storage.state.epoch, epoch);
+    for id in 1..=crate::storage::ROOTS as u64 {
+        for _ in 0..96 {
+            ram.storage.release_description(Root { id, generation: 1 });
+        }
+    }
+    assert_eq!(ram.storage.probe_description_charges(), 0);
+}

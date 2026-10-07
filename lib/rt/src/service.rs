@@ -64,6 +64,18 @@ pub trait Service<const K: usize> {
     /// returns `Answer::Deferred`.
     fn request(&mut self, s: &mut Session<Self::Data, K>, r: &mut Request<'_>) -> Answer;
 
+    /// Handles one request with read-only data from disjoint peer sessions.
+    /// Each peer lookup checks its global slot and exact current label.
+    fn request_with_peers(
+        &mut self,
+        s: &mut Session<Self::Data, K>,
+        r: &mut Request<'_>,
+        peers: Peers<'_, Self::Data, K>,
+    ) -> Answer {
+        let _ = peers;
+        self.request(s, r)
+    }
+
     /// The client of `s` went (CLIENT_GONE); the session ends right after,
     /// and what it holds closes. A client `place` names comes here with a
     /// new session when it had none.
@@ -259,6 +271,38 @@ pub struct Session<T, const K: usize> {
     held: [Held; K],
     issued: u32,
     issued_max: u32,
+}
+
+/// Borrowed peer data excludes the current mutable session and owns no resources.
+pub struct Peers<'a, T, const K: usize> {
+    before: &'a [Option<Session<T, K>>],
+    after: &'a [Option<Session<T, K>>],
+}
+impl<T, const K: usize> Peers<'_, T, K> {
+    /// Returns data only for the exact label currently occupying this global slot.
+    pub fn get(&self, slot: usize, label: u64) -> Option<&T> {
+        let session = if slot < self.before.len() {
+            self.before.get(slot)?
+        } else {
+            self.after.get(slot.checked_sub(self.before.len() + 1)?)?
+        };
+        session
+            .as_ref()
+            .filter(|s| s.label == label)
+            .map(|s| &s.data)
+    }
+}
+
+fn split_peers<T, const K: usize>(
+    table: &mut [Option<Session<T, K>>],
+    current: usize,
+) -> (&mut Session<T, K>, Peers<'_, T, K>) {
+    let (before, tail) = table.split_at_mut(current);
+    let (slot, after) = tail.split_first_mut().expect("an admitted session slot");
+    (
+        slot.as_mut().expect("an admitted session"),
+        Peers { before, after },
+    )
 }
 
 impl<T, const K: usize> Session<T, K> {
@@ -662,12 +706,16 @@ fn request<S: Service<K>, const K: usize>(
         other => other,
     };
     let place = service.place(label);
-    let (header, s) =
-        match header.map(|h| (h, session::<S, K>(service, table, label, place, issued))) {
-            Ok((header, Some(s))) => (header, s),
-            Ok((_, None)) => return refuse(token, Status::Kernel(Error::LimitReached)),
-            Err(status) => return refuse(token, status),
-        };
+    let (header, slot) = match header.map(|h| {
+        (
+            h,
+            session_slot::<S, K>(service, table, label, place, issued),
+        )
+    }) {
+        Ok((header, Some(s))) => (header, s),
+        Ok((_, None)) => return refuse(token, Status::Kernel(Error::LimitReached)),
+        Err(status) => return refuse(token, status),
+    };
     let mut r = Request {
         label,
         header,
@@ -676,7 +724,8 @@ fn request<S: Service<K>, const K: usize>(
         token: Some(token),
         reply: None,
     };
-    let answer = service.request(s, &mut r);
+    let (s, peers) = split_peers(table, slot);
+    let answer = service.request_with_peers(s, &mut r, peers);
     let Some(token) = r.token.take() else {
         return;
     };
@@ -707,13 +756,13 @@ fn refuse(token: Token, status: Status) {
 /// in the first free one from PLACED on, when there is none; a session of
 /// another label at the service's place ends first. None when the table
 /// is full or the place lies past it.
-fn session<'a, S: Service<K>, const K: usize>(
+fn session_slot<S: Service<K>, const K: usize>(
     service: &mut S,
-    table: &'a mut [Option<Session<S::Data, K>>],
+    table: &mut [Option<Session<S::Data, K>>],
     label: u64,
     place: Option<usize>,
     issued: u32,
-) -> Option<&'a mut Session<S::Data, K>> {
+) -> Option<usize> {
     let found = match place {
         Some(i) => {
             debug_assert!(i < S::PLACED, "a place past those Service::place gives");
@@ -747,7 +796,7 @@ fn session<'a, S: Service<K>, const K: usize>(
     if slot.is_none() {
         *slot = Some(Session::new(label, S::Data::default(), issued));
     }
-    slot.as_mut()
+    Some(found)
 }
 
 /// Token::reply_handles; when the kernel refused the reply before it
@@ -1104,5 +1153,84 @@ impl<const N: usize> LongOps<N> {
                 )
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Probe {
+        ended: Option<u64>,
+    }
+    impl Service<0> for Probe {
+        const VERSION: u16 = 1;
+        const METHODS: &'static [u16] = &[1];
+        const PLACED: usize = 4;
+        type Data = u64;
+        fn request(&mut self, s: &mut Session<u64, 0>, _: &mut Request<'_>) -> Answer {
+            s.data += 1;
+            Answer::Deferred
+        }
+        fn gone(&mut self, s: &mut Session<u64, 0>) {
+            self.ended = Some(s.label());
+        }
+    }
+    #[test]
+    fn peer_slots_exclude_current_and_require_exact_label_across_reuse() {
+        let mut table: [Option<Session<u64, 0>>; 4] = core::array::from_fn(|i| {
+            Some(Session::new(
+                (i as u64 + 1) << 9 | i as u64,
+                i as u64 + 10,
+                0,
+            ))
+        });
+        for current in 0..4 {
+            let (s, peers) = split_peers(&mut table, current);
+            s.data += 1;
+            assert_eq!(peers.get(current, s.label()), None);
+            assert_eq!(peers.get(4, 0), None);
+            for slot in 0..4 {
+                if slot != current {
+                    let label = (slot as u64 + 1) << 9 | slot as u64;
+                    assert!(peers.get(slot, label).is_some());
+                    assert_eq!(peers.get(slot, label + (1 << 9)), None);
+                }
+            }
+        }
+        let old = table[2].as_ref().unwrap().label();
+        table[2] = Some(Session::new(old + (1 << 9), 99, 0));
+        let (_, peers) = split_peers(&mut table, 0);
+        assert_eq!(peers.get(2, old), None);
+        assert_eq!(peers.get(2, old + (1 << 9)), Some(&99));
+    }
+    #[test]
+    fn admission_replaces_old_label_before_peer_borrows_and_default_dispatch_is_preserved() {
+        let mut probe = Probe::default();
+        let mut table: [Option<Session<u64, 0>>; 4] = core::array::from_fn(|_| None);
+        assert_eq!(
+            session_slot(&mut probe, &mut table, 100, Some(2), 0),
+            Some(2)
+        );
+        assert_eq!(
+            session_slot(&mut probe, &mut table, 200, Some(2), 0),
+            Some(2)
+        );
+        assert_eq!(probe.ended, Some(100));
+        let (s, peers) = split_peers(&mut table, 2);
+        assert_eq!(s.label(), 200);
+        let mut r = Request {
+            label: 200,
+            header: Header::new(1, 1),
+            bytes: &[],
+            handles: Incoming::none(),
+            token: None,
+            reply: None,
+        };
+        assert!(matches!(
+            probe.request_with_peers(s, &mut r, peers),
+            Answer::Deferred
+        ));
+        assert_eq!(s.data, 1);
     }
 }
