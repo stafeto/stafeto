@@ -12,6 +12,11 @@ fn owner() -> Result<OwnerToken, i32> {
     OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)
 }
 
+/// Inspect the fixed Table before the first empty shutdown command.
+pub fn idle() -> Result<bool, i32> {
+    crate::shared::with_files(|files| Ok(files.capacity_idle()))
+}
+
 /// Execute the ordinary carrier, preserving its completed byte until original ACK.
 pub fn retain_read(fd: u32, position: u64) -> Result<ScalarToken, i32> {
     crate::data_driver::begin(fd, DataKind::PRead, 1, position, &[])?

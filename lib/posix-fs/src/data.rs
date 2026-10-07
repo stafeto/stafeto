@@ -93,6 +93,59 @@ mod tests {
     }
 
     #[cfg(feature = "full-capacity-probe")]
+    #[test]
+    fn capacity_idle_rejects_every_actual_custody_kind() {
+        for kind in 0..7 {
+            let mut fs = files();
+            assert!(fs.capacity_idle());
+            let fd = fs
+                .insert(target(43), super::super::DescriptorFlags::default())
+                .unwrap();
+            assert!(fs.capacity_idle());
+            match kind {
+                0 => {
+                    fs.descriptors.hold(fd).unwrap();
+                }
+                1 => {
+                    fs.begin_open_record(owner(1), 0, super::super::DescriptorFlags::default())
+                        .unwrap();
+                }
+                2 => {
+                    begin(&mut fs, DataKind::PRead, 1, &[]);
+                }
+                3 => {
+                    fs.descriptors.begin_control(owner(1), ()).unwrap();
+                }
+                4 => {
+                    fs.descriptors
+                        .begin_io(owner(1), fd, super::super::open::Recovery::default())
+                        .unwrap();
+                }
+                5 => {
+                    let (token, _) = fs
+                        .descriptors
+                        .begin_io(owner(1), fd, super::super::open::Recovery::default())
+                        .unwrap();
+                    fs.descriptors.close(fd).unwrap();
+                    assert!(matches!(
+                        fs.descriptors.finish_io(token, owner(1)).unwrap(),
+                        posix_fd::IoEnd::Cleanup { .. }
+                    ));
+                }
+                6 => {
+                    let (_, claim) = fs
+                        .begin_open_record(owner(1), 0, super::super::DescriptorFlags::default())
+                        .unwrap();
+                    fs.reserve_open_record(claim).unwrap();
+                    assert!(fs.descriptors.has_pending_entries());
+                }
+                _ => unreachable!(),
+            }
+            assert!(!fs.capacity_idle(), "custody kind {kind}");
+        }
+    }
+
+    #[cfg(feature = "full-capacity-probe")]
     fn retained(fs: &mut PosixFs) -> ScalarToken {
         let (token, claim) = begin(fs, DataKind::PRead, 1, &[]);
         committing(fs, token, claim);
@@ -1509,6 +1562,12 @@ impl CleanupContext {
 }
 
 impl PosixFs {
+    /// Observe all resident custody and unpublished descriptors without collecting.
+    #[cfg(feature = "full-capacity-probe")]
+    pub fn capacity_idle(&self) -> bool {
+        !self.descriptors.has_holds() && !self.descriptors.has_pending_entries()
+    }
+
     /// Inspect one actual paid capacity result without acknowledging its custody.
     #[cfg(feature = "full-capacity-probe")]
     pub fn retained_data_byte(&self, token: ScalarToken, owner: OwnerToken) -> Result<u8, FsError> {

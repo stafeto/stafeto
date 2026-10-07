@@ -2401,6 +2401,21 @@ impl Fs {
                     || self.ram.storage.preparations_used() != 0
                     || self.ram.storage.available().pages as usize != ramfs::storage::PAGES
                     || self.ram.storage.reclamation_pending()
+                    || !ramfs::capacity::warm_metadata_idle(
+                        self.births.iter().all(Option::is_none),
+                        self.places.has_issued(),
+                        self.clones.is_empty(),
+                        self.identities.iter().flatten().all(|identity| {
+                            ramfs::capacity::warm_identity_idle(
+                                identity.label,
+                                identity.pending,
+                                identity.offered.is_some(),
+                                identity.previous.is_some(),
+                                identity.image.is_some(),
+                            )
+                        }),
+                        self.orphan_count,
+                    )
                 {
                     return status(proto_fs::INVALID_ARGUMENT);
                 }

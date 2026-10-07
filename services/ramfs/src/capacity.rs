@@ -5,6 +5,27 @@
 
 use crate::storage::Root;
 
+/// Retained metadata must be settled before the sole resource baseline.
+pub fn warm_metadata_idle(
+    births_empty: bool,
+    issued: bool,
+    clones_empty: bool,
+    identities_idle: bool,
+    orphans: u16,
+) -> bool {
+    births_empty && !issued && clones_empty && identities_idle && orphans == 0
+}
+
+pub fn warm_identity_idle(
+    label: u64,
+    pending: bool,
+    offered: bool,
+    previous: bool,
+    image: bool,
+) -> bool {
+    label & proto_fs::OWN == 0 && !pending && !offered && !previous && !image
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct Checkpoint {
@@ -348,6 +369,44 @@ mod tests {
                 assert!(!g.exact(label, pid, image, root(3), key, job));
                 assert_eq!(g, before);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+
+    #[test]
+    fn every_retained_metadata_kind_blocks_the_sole_warm() {
+        assert!(warm_metadata_idle(true, false, true, true, 0));
+        for (births, issued, clones, identities, orphans) in [
+            (false, false, true, true, 0),
+            (true, true, true, true, 0),
+            (true, false, false, true, 0),
+            (true, false, true, false, 0),
+            (true, false, true, true, 1),
+        ] {
+            assert!(!warm_metadata_idle(
+                births, issued, clones, identities, orphans
+            ));
+        }
+    }
+
+    #[test]
+    fn named_and_loader_identity_can_remain_without_transient_custody() {
+        assert!(warm_identity_idle(17, false, false, false, false));
+        assert!(warm_identity_idle(1 << 62, false, false, false, false));
+        for (label, pending, offered, previous, image) in [
+            (proto_fs::OWN | 3, false, false, false, false),
+            (17, true, false, false, false),
+            (17, false, true, false, false),
+            (17, false, false, true, false),
+            (17, false, false, false, true),
+        ] {
+            assert!(!warm_identity_idle(
+                label, pending, offered, previous, image
+            ));
         }
     }
 }

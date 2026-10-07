@@ -9,6 +9,8 @@ use posix_abi::{
 };
 use posix_fs::{Target, Transport};
 use rt::sys;
+#[path = "capacity_warm.rs"]
+mod warmup;
 unsafe extern "C" {
     fn capacity_spawn_factory(role: i32, command: i32, response: i32, a: i32, b: i32) -> i32;
     fn capacity_wait_child(pid: i32, killed: i32) -> i32;
@@ -138,6 +140,11 @@ fn actor(
     loop {
         let (seq, action) = receive_command(input)?;
         require(seq == sequence + 1)?;
+        let initial_empty = if sequence == 0 && seq == 1 && action == 3 {
+            warmup::initial_empty(sequence, seq, action, paid::idle()?)
+        } else {
+            false
+        };
         sequence = seq;
         let count = match action {
             1 => {
@@ -169,6 +176,7 @@ fn actor(
                 require(paid::repeat_first()? && paid::retained_count(expected)? == 16)?;
                 16
             }
+            3 if initial_empty => 0,
             3 => {
                 for _ in 0..16 {
                     require(paid::release_first(expected)?)?;
@@ -475,6 +483,34 @@ fn tail_baseline(stage: u32, snapshot: &Snapshot) {
         snapshot.backing.mappings
     );
 }
+#[inline(never)]
+fn warm_factory(role: i32, f0: i32, f1: i32) -> Result<(), i32> {
+    let before = meter::snapshot()?;
+    require(before.jobs == 0 && before.preparations == 0 && before.root_preparations == 0)?;
+    require(before.available[2] == 4096 && before.usage[2] == 0 && paid::idle()?)?;
+    let commands = posix_abi::pipe2(0)?;
+    let replies = posix_abi::pipe2(0)?;
+    // SAFETY: the ordinary loaded factory inherits these actual descriptors.
+    let pid = unsafe { capacity_spawn_factory(role, commands[0], replies[1], f0, f1) };
+    require(pid > 0)?;
+    posix_abi::close(commands[0])?;
+    posix_abi::close(replies[1])?;
+    let input = Pipe::capture(replies[0])?;
+    let output = Pipe::capture(commands[1])?;
+    ask(input, output, 1, 3, 0)?;
+    wait_child(pid, false)?;
+    posix_abi::close(replies[0])?;
+    posix_abi::close(commands[1])?;
+    await_snapshot(|s| {
+        s.jobs == 0
+            && s.preparations == 0
+            && s.root_preparations == 0
+            && s.available[2] == 4096
+            && s.usage == before.usage
+    })?;
+    require(paid::idle()?)
+}
+
 fn leader(role: i32) -> Result<(), i32> {
     let a = role == 1;
     let cold = meter::snapshot()?;
@@ -502,15 +538,15 @@ fn leader(role: i32) -> Result<(), i32> {
     } else {
         -1
     };
+    warm_factory(role, f0, f1)?;
     meter::control(0, 1)?;
     if a {
-        loop {
-            match meter::control(1, 0) {
-                Ok(()) => break,
-                Err(EINVAL) => sys::yield_now().map_err(|_| EIO)?,
-                Err(e) => return Err(e),
-            }
-        }
+        warmup::await_ready(
+            || meter::control(1, 0),
+            || sys::yield_now().map_err(|_| EIO),
+            EINVAL,
+            EIO,
+        )?;
     }
     let warm = await_snapshot(|s| s.meter[1] != 0)?;
     rt::println!(

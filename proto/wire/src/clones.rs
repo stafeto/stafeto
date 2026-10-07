@@ -74,6 +74,11 @@ impl<const N: usize> Clones<N> {
         Ok(())
     }
 
+    /// Observe whether every issued clone has completed its final close.
+    pub fn is_empty(&self) -> bool {
+        self.live.iter().all(Option::is_none)
+    }
+
     /// The client the live clone `label` was made for, if it is one.
     pub fn client_of(&self, label: u64) -> Option<u64> {
         self.live
@@ -98,6 +103,20 @@ impl<const N: usize> Clones<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_retains_each_clone_until_its_exact_gone() {
+        let mut clones = Clones::<4>::new();
+        assert!(clones.is_empty());
+        clones.add(100, 7).unwrap();
+        clones.add(101, 100).unwrap();
+        clones.gone(999);
+        assert!(!clones.is_empty());
+        clones.gone(100);
+        assert!(!clones.is_empty());
+        clones.gone(101);
+        assert!(clones.is_empty());
+    }
 
     /// A client has PER_CLIENT live clones: the next is refused until one
     /// goes; the service's N bound all clients.

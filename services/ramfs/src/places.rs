@@ -75,6 +75,10 @@ impl Places {
             slot as usize
         }
     }
+    /// Observe retained issued sessions while named startup principals remain live.
+    pub fn has_issued(&self) -> bool {
+        self.labels.iter().any(|label| label.get() & OWN != 0)
+    }
     pub fn release(&self, label: u64) {
         let slot = if label & OWN != 0 {
             (label & 511) as usize
@@ -101,6 +105,25 @@ impl Default for Places {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn issued_readiness_keeps_named_principals_and_requires_exact_final_release() {
+        let places = Places::new();
+        places.place(17);
+        places.place(1 << 62);
+        assert!(!places.has_issued());
+        let old = places.issue(0).unwrap();
+        assert!(places.has_issued());
+        places.release(old);
+        let live = places.issue(1).unwrap();
+        places.release(old);
+        assert!(places.has_issued());
+        places.release(live);
+        assert!(!places.has_issued());
+        let image = places.issue_image(2).unwrap();
+        assert!(places.has_issued());
+        places.release(image);
+        assert!(!places.has_issued());
+    }
     #[test]
     fn every_admitted_session_has_a_distinct_place_and_exhaustion_does_not_evict() {
         let places = Places::new();
