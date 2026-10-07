@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Process protocol v11 (spec 2, section 3.1). The service creates every
+//! Process protocol v12 (spec 2, section 3.1). The service creates every
 //! POSIX process itself, so that a record comes with its process and goes
 //! only with the notification of its end. The label of a session names
 //! the caller's record (`Label`), never the body.
