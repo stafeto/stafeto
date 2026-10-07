@@ -120,7 +120,10 @@ impl Processes {
                 let record = self.records.get(child).expect("the owned child");
                 let native_alive = sys::process_state(&record.process)
                     .is_ok_and(|state| state == abi::ProcessState::Alive);
-                let (image, ticket) = (record.image, record.committed_loader_ticket);
+                let (image, ticket) = (
+                    record.image,
+                    record.loader_ticket(self.tickets[child]).unwrap_or(0),
+                );
                 let fields = [
                     u32::from(native_alive),
                     u32::from(record.state == State::Alive),

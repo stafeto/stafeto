@@ -128,7 +128,9 @@ pub struct Record<P, C = ()> {
     /// not: the next exec takes one more, so no number names two attempts.
     pub tried: u32,
     /// Exact successful loader ticket of the current image, retained after Take.
-    pub committed_loader_ticket: u64,
+    image_origin: u64,
+    pub source_origin: crate::initial_origin::SourceOrigin,
+    pub active_guard_label: u64,
     #[cfg(feature = "image-probe")]
     pub image_probe: crate::image_probe::Observation,
     /// Its process group and session: those of its parent, or its own PID
@@ -151,6 +153,26 @@ pub struct Record<P, C = ()> {
     /// Its neighbours in the list of its parent's children.
     previous: Option<u16>,
     next: Option<u16>,
+}
+
+impl<P, C> Record<P, C> {
+    pub fn loader_ticket(&self, initial_ticket: u64) -> Option<u64> {
+        (!(self.image == proto_process::IMAGE && initial_ticket != 0)).then_some(self.image_origin)
+    }
+    pub fn initial_origin(
+        &self,
+        initial_ticket: u64,
+    ) -> Option<crate::initial_origin::InitialOrigin> {
+        (self.image == proto_process::IMAGE && initial_ticket != 0)
+            .then(|| crate::initial_origin::InitialOrigin::from_raw(self.image_origin))
+            .flatten()
+    }
+    pub fn set_initial_origin(&mut self, origin: crate::initial_origin::InitialOrigin) {
+        self.image_origin = origin.raw();
+    }
+    pub fn set_loader_ticket(&mut self, ticket: u64) {
+        self.image_origin = ticket;
+    }
 }
 
 pub struct Records<P, C = ()> {
@@ -618,7 +640,11 @@ impl<P, C> Records<P, C> {
             handle_limit: 0,
             image: proto_process::IMAGE,
             tried: proto_process::IMAGE,
-            committed_loader_ticket: 0,
+            image_origin: 0,
+            source_origin: parent.map_or(crate::initial_origin::SourceOrigin::UNKNOWN, |p| {
+                self.records[p].as_ref().unwrap().source_origin.inherited()
+            }),
+            active_guard_label: 0,
             #[cfg(feature = "image-probe")]
             image_probe: crate::image_probe::Observation::default(),
             pgid,
@@ -1113,7 +1139,10 @@ impl<P, C> Records<P, C> {
         let record = self.get_mut(index).expect("the checked ending record");
         let (pgid, linked) = (record.pgid, core::mem::take(&mut record.linked));
         record.state = State::Zombie(reason);
-        record.committed_loader_ticket = 0;
+        // Initial origin survives Zombie until reap for exact Init ACK.
+        if record.image != proto_process::IMAGE {
+            record.image_origin = 0;
+        }
         record.stop_report = None;
         record.cont_report = false;
         let parent = record.parent_index.filter(|_| loaded);
@@ -1178,7 +1207,10 @@ impl<P, C> Records<P, C> {
         // for: its Spawn failed.
         let loaded = record.state != State::Loading;
         record.state = State::Zombie(end);
-        record.committed_loader_ticket = 0;
+        // Initial origin survives Zombie until reap for exact Init ACK.
+        if record.image != proto_process::IMAGE {
+            record.image_origin = 0;
+        }
         record.stop_report = None;
         record.cont_report = false;
         self.unlink(pgid, linked);

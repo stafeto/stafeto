@@ -17,6 +17,8 @@ pub mod executable;
 #[cfg(feature = "image-probe")]
 pub mod image_probe;
 pub mod initial_maps;
+pub mod initial_origin;
+pub mod initial_resident;
 pub mod loaders;
 pub mod preparing;
 pub mod queue;

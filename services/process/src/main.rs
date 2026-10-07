@@ -37,7 +37,17 @@ type NativePreparation = preparing::StartPreparation<
     Handle<Thread>,
     Pending,
 >;
-type Work = RecordWork<Replacing, NativePreparation, ending::Ending>;
+type NativeInitial = posix_process_service::initial_resident::InitialResident<
+    Handle<Memory>,
+    Handle<Channel>,
+    Handle<Thread>,
+    Pending,
+>;
+type Work = RecordWork<Replacing, NativePreparation, ending::Ending, NativeInitial>;
+const _: [(); 472] = [(); core::mem::size_of::<Option<Work>>()];
+const _: [(); 472] = [(); core::mem::size_of::<NativeInitial>()];
+#[cfg(not(feature = "image-probe"))]
+const _: [(); 368] = [(); core::mem::size_of::<Record<Handle<Process>, Handle<Channel>>>()];
 use posix_process_service::birthwalk::BirthWalk;
 use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
@@ -987,7 +997,7 @@ impl Processes {
             image,
             expected.ticket,
             record.image,
-            record.committed_loader_ticket,
+            record.loader_ticket(self.tickets[index]).unwrap_or(0),
             record.state == State::Alive,
         ) else {
             return refuse(proto_process::PERMISSION);
@@ -2130,7 +2140,9 @@ impl Processes {
         let old_image = record.image;
         let ceiling = record.ceiling;
         record.image = image;
-        record.committed_loader_ticket = committed_ticket;
+        record.source_origin = posix_process_service::initial_origin::SourceOrigin::UNKNOWN;
+        record.active_guard_label = 0;
+        record.set_loader_ticket(committed_ticket);
         record.execed = true;
         let mut credentials = loaders::child_credentials(record.credentials, 0);
         if let Some(ids) = set_id {
@@ -2714,10 +2726,14 @@ impl Processes {
         let record = self.records.get_mut(child).expect("a loading record");
         record.active_exec = new_exec;
         record.state = State::Alive;
-        record.committed_loader_ticket = committed_ticket;
+        record.set_loader_ticket(committed_ticket);
         // A child of posix_spawn runs its own program from the start; one
         // of fork runs its parent's copy until it execs.
         record.execed = !fork;
+        if !fork {
+            record.source_origin = posix_process_service::initial_origin::SourceOrigin::UNKNOWN;
+        }
+        record.active_guard_label = 0;
         if let Some(ids) = set_id {
             record.credentials = loaders::set_ids(record.credentials, ids);
         }
@@ -2775,7 +2791,8 @@ impl Processes {
         };
         if self.loaders.of(record).is_none() {
             let current = self.records.get(record).expect("a stage target");
-            return if current.image == args.image && current.committed_loader_ticket == args.ticket
+            return if current.image == args.image
+                && current.loader_ticket(self.tickets[record]) == Some(args.ticket)
             {
                 refuse(proto_process::STAGE_RETIRED)
             } else {
