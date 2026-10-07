@@ -69,6 +69,13 @@ impl Completion {
     }
 }
 
+/// Burn a fresh native admission serial. MAX is a terminal tombstone:
+/// existing debt may observe it, but no fresh Send is admitted there.
+pub fn prepay(counter: &mut u64) -> Option<u64> {
+    *counter = counter.checked_add(1)?;
+    (*counter != u64::MAX).then_some(*counter)
+}
+
 pub fn init_status(mut reader: Reader<'_>) -> Result<u32, Status> {
     let status = reader.u32()?;
     if reader.u32()? != 0 || reader.finish().is_err() {
@@ -335,6 +342,18 @@ mod tests {
         assert_eq!(shared.claim(u64::MAX), Claim::Stale);
         assert!(!shared.cancel(u64::MAX));
         assert_eq!(shared.raw(), 199);
+    }
+
+    #[test]
+    fn native_serial_admission_burns_max_without_admitting_or_wrapping() {
+        let mut counter = u64::MAX - 2;
+        assert_eq!(prepay(&mut counter), Some(u64::MAX - 1));
+        assert_eq!(prepay(&mut counter), None);
+        assert_eq!(counter, u64::MAX);
+        assert_eq!(prepay(&mut counter), None);
+        assert_eq!(counter, u64::MAX);
+        let mut fresh = 0;
+        assert_eq!(prepay(&mut fresh), Some(1));
     }
 
     #[test]

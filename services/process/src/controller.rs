@@ -67,8 +67,7 @@ impl Controller {
 
     /// Admission burns its serial before any new Process/Thread effect.
     pub fn prepay(&mut self) -> Option<u64> {
-        self.next_serial = self.next_serial.checked_add(1)?;
-        Some(self.next_serial)
+        posix_process_service::worker_control::prepay(&mut self.next_serial)
     }
 
     pub fn busy(&self) -> bool {
