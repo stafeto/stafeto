@@ -53,10 +53,37 @@ impl Generations {
         self.word(index).map_or(0, |w| w.load(Ordering::Acquire))
     }
 
+    pub fn room(&self, index: usize, steps: u64) -> bool {
+        proto_process::generation_room(self.get(index), steps)
+    }
+
+    pub fn live_room(&self, index: usize, steps: u64) -> bool {
+        let old = self.get(index);
+        old & proto_process::GENERATION_DEAD == 0 && proto_process::generation_room(old, steps)
+    }
+
     /// Raises the generation of the record in `index`, with Release.
     pub fn raise(&self, index: usize) {
         if let Some(w) = self.word(index) {
-            w.fetch_add(1, Ordering::Release);
+            let old = w.load(Ordering::Relaxed);
+            w.store(
+                proto_process::next_generation(old, false),
+                Ordering::Release,
+            );
+        }
+    }
+
+    /// Invalidate cached authority while retaining a retired record's death mark.
+    pub fn invalidate(&self, index: usize) {
+        if let Some(w) = self.word(index) {
+            let old = w.load(Ordering::Relaxed);
+            w.store(proto_process::next_generation(old, true), Ordering::Release);
+        }
+    }
+
+    pub fn retire(&self, index: usize) {
+        if let Some(w) = self.word(index) {
+            w.fetch_or(proto_process::GENERATION_DEAD, Ordering::Release);
         }
     }
 

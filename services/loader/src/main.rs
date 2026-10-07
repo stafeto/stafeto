@@ -314,6 +314,9 @@ fn scratch(own: &Own) -> Result<&'static mut Scratch, Status> {
     Ok(unsafe { &mut *(STAGING as *mut Scratch) })
 }
 
+#[cfg(feature = "auth-probe")]
+mod auth_probe;
+
 /// The requests of the parent through C and the service's word that the
 /// record is ready: the load once Start and Go came, or the copy once
 /// Fork, the regions and Go came, and the end once the image or the copy
@@ -326,6 +329,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     // The sessions the block's descriptors need (Block::needs).
     let mut needed = [false; SLOTS];
     let mut given: [Option<Handle<Channel>>; SLOTS] = Default::default();
+    let mut normalized = [false; SLOTS];
     let mut ready = false;
     let mut early_given = false;
     let mut completed = false;
@@ -381,6 +385,16 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     bytes.copy_from_slice(&abi::inline_bytes(&words)[..len]);
                 } else {
                     msgbuf::read(0, bytes);
+                }
+                #[cfg(feature = "auth-probe")]
+                if label == pl::PARENT {
+                    let mut probe = Reader::new(bytes);
+                    if Header::read(&mut probe).is_ok_and(|header| {
+                        header.version == pl::VERSION && header.method == auth_probe::METHOD
+                    }) {
+                        auth_probe::capture(own, probe, handles, token);
+                        continue;
+                    }
                 }
                 let mut r = Reader::new(bytes);
                 let method = match Header::read(&mut r) {
@@ -593,6 +607,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         match take_given(r, &mut handles, &mut given) {
                             Ok(()) => {
                                 for slot in [Slot::Files, Slot::Clock] {
+                                    if normalized[slot as usize] {
+                                        continue;
+                                    }
                                     if let Some(offered) = given[slot as usize].take() {
                                         // Fork descriptors live in the copied layer memory.
                                         let require_fds = fork.is_some()
@@ -600,7 +617,10 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                                 .and_then(|len| Block::read(staged(len)).ok())
                                                 .is_some_and(|block| block.needs(Slot::Files));
                                         match verify_session(own, slot, offered, require_fds) {
-                                            Ok(channel) => given[slot as usize] = Some(channel),
+                                            Ok(channel) => {
+                                                given[slot as usize] = Some(channel);
+                                                normalized[slot as usize] = true;
+                                            }
                                             Err(code) => {
                                                 reply(token, code);
                                                 return None;
@@ -608,7 +628,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                         }
                                     }
                                 }
-                                if let Some(offered) = given[Slot::Terminal as usize].take() {
+                                if !normalized[Slot::Terminal as usize]
+                                    && let Some(offered) = given[Slot::Terminal as usize].take()
+                                {
                                     if trusted_terminal.is_none() {
                                         trusted_terminal = match loader_terminal(session) {
                                             Ok(terminal) => terminal,
@@ -620,7 +642,8 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                     }
                                     match verify_terminal(trusted_terminal.as_ref(), offered) {
                                         Ok(terminal) => {
-                                            given[Slot::Terminal as usize] = Some(terminal)
+                                            given[Slot::Terminal as usize] = Some(terminal);
+                                            normalized[Slot::Terminal as usize] = true;
                                         }
                                         Err(code) => {
                                             reply(token, code);
@@ -805,7 +828,7 @@ fn verify_session(
     require_fds: bool,
 ) -> Result<Handle<Channel>, u32> {
     let (root, header) = match slot {
-        Slot::Files => (&own.files, proto_fs::Method::VerifySession.header()),
+        Slot::Files => (&own.files, proto_fs::Method::BindPending.header()),
         Slot::Clock => (&own.clock, proto_clock::Method::VerifySession.header()),
         _ => return Err(pl::IO),
     };
@@ -814,13 +837,35 @@ fn verify_session(
     if slot == Slot::Files {
         w.u32(u32::from(require_fds)).map_err(|s| s.code())?;
     }
-    let mut reply = sys::send_handles(root, w.as_bytes(), [offered.erase()])
-        .map_err(|refused| code(refused.error))?;
+    let mut outgoing = rt::handle::Outgoing::new();
+    outgoing.push(offered.erase()).map_err(|_| pl::IO)?;
+    if slot == Slot::Files {
+        let identity = sys::handle_duplicate(
+            &own.identity,
+            Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
+        )
+        .map_err(code)?;
+        outgoing.push(identity.erase()).map_err(|_| pl::IO)?;
+    }
+    let mut reply =
+        sys::send_handles(root, w.as_bytes(), outgoing).map_err(|refused| code(refused.error))?;
     let mut buffer = [0; MESSAGE_MAX];
     if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
         return Err(pl::IO);
     }
-    reply.handles.take::<Channel>(0).map_err(code)
+    let session = reply.handles.take::<Channel>(0).map_err(code)?;
+    if slot == Slot::Files {
+        let request = proto_fs::Method::FinishBinding.header().bytes();
+        loop {
+            let reply = sys::send(&session, &request).map_err(code)?;
+            match Reader::new(reply.bytes(&mut buffer)).u32() {
+                Ok(0) => break,
+                Ok(proto_fs::RESOLVING) => continue,
+                _ => return Err(pl::IO),
+            }
+        }
+    }
+    Ok(session)
 }
 
 fn loader_terminal(session: &Handle<Channel>) -> Result<Option<Handle<Channel>>, u32> {
@@ -1165,28 +1210,18 @@ fn load(own: &Own, block: &Block<'_>) -> Result<(u64, Handle<Channel>, Maps), u3
 
 /// OpenExec of `path`: the image session, or the code of the refusal.
 fn open(own: &Own, path: &[u8]) -> Result<Handle<Channel>, u32> {
-    let copy =
-        sys::handle_duplicate(&own.identity, Rights::NOTIFY | Rights::TRANSFER).map_err(code)?;
-    let mut w = Writer::new();
-    proto_fs::Method::OpenExec
-        .header()
-        .write(&mut w)
-        .and_then(|()| w.bytes(path))
-        .map_err(|_| pl::NAME_TOO_LONG)?;
-    let mut reply = sys::send_handles(&own.files, w.as_bytes(), [copy.erase()])
-        .map_err(|refused| code(refused.error))?;
-    let mut buffer = [0; MESSAGE_MAX];
-    let status = Reader::new(reply.bytes(&mut buffer))
-        .u32()
-        .map_err(|_| pl::IO)?;
-    match status {
-        0 => reply.handles.take(0).map_err(|_| pl::IO),
-        proto_fs::NO_ENTRY => Err(pl::NO_ENTRY),
-        proto_fs::ACCESS_DENIED => Err(pl::ACCESS),
-        proto_fs::NOT_DIRECTORY => Err(pl::NOT_DIRECTORY),
-        proto_fs::PERMISSION => Err(pl::PERMISSION),
-        _ => Err(pl::IO),
-    }
+    let files = core::mem::ManuallyDrop::new(rt::fs::Files::from_sessions(
+        Handle::from_raw(own.files.raw()),
+        None,
+    ));
+    files.open_exec(path, &own.identity).map_err(|s| match s {
+        Status::Unknown(proto_fs::NO_ENTRY) => pl::NO_ENTRY,
+        Status::Unknown(proto_fs::ACCESS_DENIED) => pl::ACCESS,
+        Status::Unknown(proto_fs::NOT_DIRECTORY) => pl::NOT_DIRECTORY,
+        Status::Unknown(proto_fs::PERMISSION) => pl::PERMISSION,
+        Status::Unknown(proto_fs::NAME_TOO_LONG) => pl::NAME_TOO_LONG,
+        _ => pl::IO,
+    })
 }
 
 /// The size of the file of the image session.

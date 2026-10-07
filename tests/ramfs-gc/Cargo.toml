@@ -1,0 +1,20 @@
+[package]
+name = "ramfs-gc"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+build = "build.rs"
+
+[[bin]]
+name = "ramfs-gc"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }
+posix-abi = { path = "../../lib/posix-abi" }
+rt = { path = "../../lib/rt" }
+proto-fs = { path = "../../proto/fs" }
+proto-wire = { path = "../../proto/wire" }

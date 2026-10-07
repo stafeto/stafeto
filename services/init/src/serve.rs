@@ -1212,6 +1212,14 @@ impl Init {
                 },
                 duplicate: true,
             }
+        } else if name.as_bytes() == table::RAM_SERVICE.as_bytes()
+            && client.name == "ramfs-probe"
+            && !client.is_posix()
+        {
+            Grant {
+                mark: proto_fs::BOOT_PROFILE,
+                duplicate: false,
+            }
         } else {
             Grant::PLAIN
         };

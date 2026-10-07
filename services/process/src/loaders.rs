@@ -131,7 +131,10 @@ impl<T> Loaders<T> {
 
     /// Whether a place is free.
     pub fn room(&self) -> bool {
-        self.places.iter().any(Option::is_none)
+        self.places
+            .iter()
+            .zip(&self.generations)
+            .any(|(place, &generation)| place.is_none() && generation != u32::MAX)
     }
 
     /// Whether the record in `parent` may start another load: a place is
@@ -154,8 +157,12 @@ impl<T> Loaders<T> {
         if self.of_record[record].is_some() || !self.room_for(parent) {
             return None;
         }
-        let index = self.places.iter().position(Option::is_none)?;
-        self.generations[index] = self.generations[index].wrapping_add(1);
+        let index = self
+            .places
+            .iter()
+            .zip(&self.generations)
+            .position(|(place, &generation)| place.is_none() && generation != u32::MAX)?;
+        self.generations[index] += 1;
         self.places[index] = Some(Place {
             record,
             parent,
@@ -197,6 +204,32 @@ impl<T> Loaders<T> {
         let index = self.of(record)?;
         let place = self.get(index)?;
         (place.stage == Stage::Loading).then(|| self.ticket(index))
+    }
+
+    /// A paid retention query distinguishes live loading authority from handoff.
+    pub fn retained(
+        &self,
+        record: usize,
+        image: u32,
+        ticket: u64,
+        accepted_image: u32,
+        accepted_ticket: u64,
+        alive: bool,
+    ) -> Option<proto_process::RetainedLoaderState> {
+        use proto_process::RetainedLoaderState::{Handoff, Loading};
+        if alive && image == accepted_image && ticket != 0 && ticket == accepted_ticket {
+            return Some(Handoff);
+        }
+        let slot = self.of(record)?;
+        let place = self.get(slot)?;
+        if place.image != image || self.ticket(slot) != ticket {
+            return None;
+        }
+        match place.stage {
+            Stage::Loading => Some(Loading),
+            Stage::Loaded => Some(Handoff),
+            Stage::Booting | Stage::Ready => None,
+        }
     }
 
     /// SetId of a file service for the place of `ticket`: kept when the
@@ -255,7 +288,7 @@ impl<T> Loaders<T> {
     pub fn free(&mut self, record: usize) -> Option<Place<T>> {
         let index = self.of(record)?;
         self.of_record[record] = None;
-        self.generations[index] = self.generations[index].wrapping_add(1);
+        self.generations[index] = self.generations[index].saturating_add(1);
         self.places[index].take()
     }
 
@@ -278,6 +311,52 @@ impl<T> Loaders<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_loader_distinguishes_loading_handoff_and_retired_attempts() {
+        use proto_process::RetainedLoaderState::{Handoff, Loading};
+        let mut t = Loaders::<()>::new();
+        let ticket = loading(&mut t, 5);
+        assert_eq!(t.retained(5, 1, ticket, 1, 0, false), Some(Loading));
+        t.loaded(5).unwrap();
+        assert_eq!(t.retained(5, 1, ticket, 1, 0, false), Some(Handoff));
+        t.commit(5).unwrap();
+        assert_eq!(t.retained(5, 1, ticket, 1, 0, true), None);
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, true), Some(Handoff));
+        t.free(5).unwrap();
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, true), Some(Handoff));
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, false), None);
+        let slot = t.take(5, 5, 2, ()).unwrap();
+        let next = t.ticket(slot);
+        t.get_mut(slot).unwrap().stage = Stage::Loading;
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, true), Some(Handoff));
+        t.loaded(5).unwrap();
+        assert_eq!(t.retained(5, 2, next, 1, ticket, true), Some(Handoff));
+        t.free(5).unwrap();
+        assert_eq!(t.retained(5, 2, next, 1, ticket, true), None);
+        assert_eq!(t.retained(5, 1, ticket, 1, ticket, true), Some(Handoff));
+        assert_eq!(t.retained(5, 1, ticket, 2, next, true), None);
+    }
+
+    #[test]
+    fn an_exhausted_ticket_place_is_retired_permanently() {
+        let mut t = Loaders::<()>::new();
+        t.generations.fill(u32::MAX);
+        assert!(!t.room());
+        assert_eq!(t.take(5, 0, 1, ()), None);
+        t.generations[3] = u32::MAX - 1;
+        assert!(t.room());
+        assert_eq!(t.take(5, 0, 1, ()), Some(3));
+        let last = t.ticket(3);
+        assert_eq!(last, (u64::from(u32::MAX) << 8) | 3);
+        assert!(t.free(5).is_some());
+        assert_eq!(t.generations[3], u32::MAX);
+        assert!(!t.room());
+        assert_eq!(t.take(5, 0, 2, ()), None);
+        t.generations[4] = 0;
+        assert_eq!(t.take(5, 0, 2, ()), Some(4));
+        assert_ne!(t.ticket(4), last);
+    }
 
     /// RESETIDS takes the real IDs for the effective ones; the saved ones
     /// follow the effective ones, as at an exec; a set-ID file's IDs win

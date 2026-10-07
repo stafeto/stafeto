@@ -136,6 +136,77 @@ const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
 ];
+const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-files"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-files", "posix-procs", POSIX_STACK_SIZE, &["files"]),
+];
+const LOADER_ABORT_PROGRAMS: [ImageProgram; 6] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-posix-files", "loader-abort"],
+    ),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["auth-probe"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    (
+        "posix-files",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["loader-abort"],
+    ),
+    ("loader", "loader", 0, &["auth-probe"]),
+];
+const RAMFS_GC_PROGRAMS: [ImageProgram; 5] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-files"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["auth-probe", "steps"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-files", "ramfs-gc", POSIX_STACK_SIZE, &[]),
+];
+const RAMFS_CLEANUP_PROGRAMS: [ImageProgram; 7] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-posix-files", "ramfs-cleanup"],
+    ),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["auth-probe"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    (
+        "posix-files",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["auth-probe"],
+    ),
+    ("ramfs-holder", "ramfs-holder", CHILD_STACK_SIZE, &[]),
+    ("loader", "loader", 0, &[]),
+];
 const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -984,6 +1055,12 @@ commands:
   posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
+  loader-abort verify retained file cleanup after genuine exec cancellation
+  ramfs-gc verify binding progress during queued page reclamation
+  loader-abort-steps measure retained cleanup audits at resolver limits
+  ramfs-cleanup verify unfinished binding cleanup with a foreign holder
+  posix-files verify authentic file identity and byte path proofs
+  posix-files-steps measure full RAM dispatches across credential refresh
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
   posix-input-vz verify file progress during Virtio console reads on Apple VZ
@@ -1094,6 +1171,12 @@ fn main() {
         Some("layer-names") => layer_c_names(),
         Some("coverage") => coverage::run(&args[1..]),
         Some("relibc-hello") => relibc_hello_probe(),
+        Some("posix-files") => posix_files_probe(),
+        Some("ramfs-cleanup") => ramfs_cleanup_probe(),
+        Some("ramfs-gc") => ramfs_gc_probe(),
+        Some("loader-abort") => loader_abort_probe(false),
+        Some("loader-abort-steps") => loader_abort_probe(true),
+        Some("posix-files-steps") => posix_files_run(true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -2584,6 +2667,167 @@ fn loader_channels_probe() -> Result<(), String> {
     qemu::expect_marker(&outcome, "loader-channels: ok")
 }
 
+fn ramfs_gc_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-ramfs-gc.img", &RAMFS_GC_PROGRAMS, BOOT_PROFILE)?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "ramfs-gc: binding and page reclamation both progress ok",
+    )?;
+    let steps = longest_steps(&output.lines, "2");
+    for kind in [22, 63, 65] {
+        if !steps
+            .iter()
+            .any(|(seen, ticks, _)| *seen == kind && *ticks != 0)
+        {
+            return Err(format!(
+                "RAM GC probe has no kind {kind} measurement: {steps:?}"
+            ));
+        }
+    }
+    if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "RAM GC kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    println!("RAM GC dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    Ok(())
+}
+
+fn loader_abort_probe(measured: bool) -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const MEASURED: [ImageProgram; 6] = {
+        let mut programs = LOADER_ABORT_PROGRAMS;
+        programs[1].3 = &["auth-probe", "steps"];
+        programs
+    };
+    let (name, programs) = if measured {
+        ("boot-loader-abort-steps.img", &MEASURED)
+    } else {
+        ("boot-loader-abort.img", &LOADER_ABORT_PROGRAMS)
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    if measured {
+        command.args(qemu::ICOUNT);
+    }
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "posix-files: genuine loader abort releases retained capture ok",
+    )?;
+    if measured {
+        for count in [16, 96] {
+            qemu::expect_marker(
+                &output,
+                &format!(
+                    "posix-files: cleanup audit {count} jobs preserves retained byte and frontend quota ok"
+                ),
+            )?;
+        }
+        let steps = longest_steps(&output.lines, "2");
+        for kind in [19, 21, 22, 23, 63, 65] {
+            if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
+                return Err(format!(
+                    "RAM cleanup audit has no kind {kind} measurement: {steps:?}"
+                ));
+            }
+        }
+        if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "RAM cleanup audit kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+            ));
+        }
+        println!("RAM cleanup audit dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    }
+    Ok(())
+}
+
+/// C operations observe the real Process identities and Files proofs.
+fn ramfs_cleanup_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-ramfs-cleanup.img",
+        &RAMFS_CLEANUP_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(&output, "ramfs-cleanup: ok")?;
+    for owner in ["ramfs-owner-0", "ramfs-owner-1", "ramfs-owner-2"] {
+        qemu::expect_marker(
+            &output,
+            &format!("init: {owner} ended: exit code 0, not restarted"),
+        )?;
+    }
+    Ok(())
+}
+
+fn posix_files_probe() -> Result<(), String> {
+    posix_files_run(false)
+}
+
+fn posix_files_run(measured: bool) -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const MEASURED: [ImageProgram; 5] = {
+        let mut programs = POSIX_FILES_PROGRAMS;
+        programs[1].3 = &["steps"];
+        programs
+    };
+    let programs = if measured {
+        &MEASURED
+    } else {
+        &POSIX_FILES_PROGRAMS
+    };
+    let name = if measured {
+        "boot-posix-files-steps.img"
+    } else {
+        "boot-posix-files.img"
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    if measured {
+        cmd.args(qemu::ICOUNT);
+    }
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
+    if measured {
+        let steps = longest_steps(&output.lines, "2");
+        for kind in [15, 19, 21, 25, 65] {
+            if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
+                return Err(format!(
+                    "RAM credential probe has no method {kind} measurement: {steps:?}"
+                ));
+            }
+        }
+        if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "RAM method {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+            ));
+        }
+        println!("RAM credential dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    }
+    Ok(())
+}
+
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
@@ -2596,10 +2840,11 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     // The probe is the table's only record: its end is init's line, and
     // its children are processes of the service that init never hears of.
     // It ends in an exec (stage 10) of the role that exits with 42: init
-    // reports the new image's end.
+    // reports the new image's end. The authenticated component proofs add
+    // bounded IPC rounds across this large spawn/fork/exec scenario.
     let ended = run.expect_seen(
         "init: posix-procs ended: exit code 42, not restarted",
-        BOOT_TIMEOUT,
+        Duration::from_secs(60),
     );
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
@@ -2706,13 +2951,21 @@ const RAM_STEP_MAX: u64 = 20_538;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 6] = [
+const RAM_STEP_KINDS: [(usize, &str); 14] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
     (15, "Clone"),
     (17, "ReadInto"),
+    (19, "Bind"),
+    (20, "BindPending"),
+    (21, "ResolveStart"),
+    (22, "ResolveStep"),
+    (23, "ResolveCancel"),
+    (24, "ResolveSecond"),
+    (25, "FinishBinding"),
     (64, "notification"),
+    (65, "maintenance"),
 ];
 
 /// The longest heartbeat of the pipe service's loop, in ticks under
@@ -2743,10 +2996,11 @@ const PIPE_STEP_KINDS: [(usize, &str); 15] = [
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
-const STEP_KINDS: [(usize, &str); 15] = [
+const STEP_KINDS: [(usize, &str); 16] = [
     (1, "Create"),
     (13, "Kill"),
     (21, "Vouch"),
+    (53, "RetainedLoader"),
     (22, "SpawnStart"),
     (23, "Boot"),
     (24, "Take"),
@@ -2868,12 +3122,26 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the longest Vouch took {vouch} ticks with {live} children, past {VOUCH_TICKS_MAX}"
         ));
     }
+    if let Some((_, ticks, _)) = rows.iter().find(|(kind, _, _)| *kind == 53)
+        && *ticks > VOUCH_TICKS_MAX
+    {
+        return Err(format!(
+            "RetainedLoader took {ticks} ticks with {live} children, past {VOUCH_TICKS_MAX}"
+        ));
+    }
     // One READ_INTO is a step of the RAM file service at level 40 whose
     // copy is bounded by READ_INTO_MAX; it stays under term B.
     let read_into = ram.iter().find(|(k, ..)| *k == 17).map_or(0, |r| r.1);
     if read_into == 0 || read_into > RAM_STEP_MAX {
         return Err(format!(
             "the RAM file service: READ_INTO took {read_into} ticks, past {RAM_STEP_MAX}: {ram:?}"
+        ));
+    }
+    // Authentication admission, each proof step, effects and notified cleanup
+    // are all full service dispatches under the same unchanged term B.
+    if let Some((kind, ticks, _)) = ram.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "the RAM file service: method {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {ram:?}"
         ));
     }
     // ForkStart makes a process as SpawnStart does and stays within it
@@ -3701,6 +3969,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-tty-control-steps", posix_tty_control_steps),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
+        job("posix-files", posix_files_probe),
+        job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),

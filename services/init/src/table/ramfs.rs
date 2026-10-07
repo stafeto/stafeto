@@ -19,11 +19,12 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 40,
         ceiling: 40,
-        // Its segments, a stack of 48 KiB, its tables of 320 sessions and
-        // 256 births in `.bss`, and the tables of the image's files.
-        quota: 96 * PAGE,
-        handle_limit: 32,
-        restart: Restart::Always,
+        // 4096 data pages + 650 metadata/PT_LOAD data pages + 27 code/rodata
+        // pages (26 ordinary, 27 instrumented) + 12 stack + 128 reserve,
+        // measured from RAM ELF segments and the printed table byte count.
+        quota: (4096 + 650 + 27 + 12 + 128) * PAGE,
+        handle_limit: 512,
+        restart: Restart::Never,
         console: true,
         log: false,
         trace: false,
@@ -160,6 +161,113 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
         program: "posix-probe",
         connects: &["ramfs", "uart", "clock", "posix"],
         quota: 512 * PAGE,
+        // Diagnostic writers exercise the fixed root-owned /tmp/probe node.
+        root: true,
+        ..POSIX
+    },
+];
+
+/// The authentic identity and bounded file proof fixture, before public mutation APIs.
+#[cfg(not(any(feature = "ramfs-cleanup", feature = "loader-abort")))]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "clock", "posix"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+];
+
+/// Genuine uncommitted exec attempts with one pending image at a time.
+#[cfg(feature = "loader-abort")]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    TABLE[0],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 2048 * PAGE + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "clock", "posix"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+];
+
+/// Owner and retained foreign session holder for the unfinished-binding fixture.
+#[cfg(feature = "ramfs-cleanup")]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    Record {
+        priority: 40,
+        ceiling: 40,
+        ..TABLE[0]
+    },
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 4096 * PAGE + 384 * PAGE,
+        ceiling: 40,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        priority: 30,
+        ceiling: 31,
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+    Record {
+        name: "ramfs-holder",
+        program: "ramfs-holder",
+        priority: 35,
+        ceiling: 40,
+        quota: 64 * PAGE,
+        ..TABLE[0]
+    },
+    Record {
+        name: "ramfs-owner-0",
+        args: b"posix-files\00\0",
+        program: "posix-files",
+        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        priority: 30,
+        ceiling: 31,
+        quota: 2048 * PAGE,
+        root: false,
+        ..POSIX
+    },
+    Record {
+        name: "ramfs-owner-1",
+        args: b"posix-files\01\0",
+        program: "posix-files",
+        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        priority: 30,
+        ceiling: 31,
+        quota: 2048 * PAGE,
+        root: false,
+        ..POSIX
+    },
+    Record {
+        name: "ramfs-owner-2",
+        args: b"posix-files\02\0",
+        program: "posix-files",
+        connects: &["ramfs", "clock", "posix", "ramfs-holder"],
+        priority: 30,
+        ceiling: 31,
+        quota: 2048 * PAGE,
+        root: false,
         ..POSIX
     },
 ];
@@ -241,6 +349,7 @@ pub const RELIBC_TABLE: &[Record] = &[
     Record {
         name: "relibc-hello",
         program: "relibc-hello",
+        root: true,
         args: b"relibc-hello\0",
         connects: &["ramfs", "clock", "posix"],
         quota: 512 * PAGE,
@@ -316,7 +425,7 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
 pub const POSIX_STEPS_TABLE: &[Record] = &[
     // Room for the crowd's descriptions in the RAM file service.
     Record {
-        quota: 512 * PAGE,
+        quota: TABLE[0].quota,
         ..TABLE[0]
     },
     Record {

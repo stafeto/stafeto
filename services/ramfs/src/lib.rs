@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Bounded RAM files and per-client open descriptions for the first POSIX
-//! userspace experiment. A single service thread owns `Ram`; each IPC
-//! session owns its own `Fds`, so closing a session closes its files. Next
-//! to its fixed tree (`/etc/motd`, the scratch file `/tmp/probe`) the
-//! service shows the files of the boot image's table `rootfs` (`tree`),
-//! read-only, with the modes and owners of the table, and reads them from
-//! the mapped image as they lie.
-
+//! RAM inode storage with fixed boot nodes, paid mutable overlays and
+//! shared open descriptions. One service thread owns the namespace and
+//! every client retains its descriptors, current directory and preparations.
+//! The original guest operations use this storage; mutation entry points
+//! are exercised through the same backend on the host.
 #![cfg_attr(not(test), no_std)]
 
+pub mod authority;
+pub mod maintenance;
+pub mod places;
+pub mod resolve;
+#[cfg(test)]
+mod resolve_tests;
+pub mod storage;
+#[cfg(test)]
+mod storage_tests;
 pub mod tree;
+
+use storage::{BOOT_ROOT, Pin, Storage, Token};
 
 use proto_fs::{
     BAD_FD, IS_DIRECTORY, Metadata, NO_ENTRY, NO_SPACE, NodeInfo, READ_ONLY, WRITE_ONLY,
@@ -163,6 +171,8 @@ enum File {
     Tmp,
     Motd,
     Scratch,
+    Node(Token),
+    NodeDir(Token),
     /// Entry `n` of the table, a directory or a regular file.
     ImageDir(u16),
     ImageRegular(u16),
@@ -190,6 +200,22 @@ struct Open {
 pub struct Fds {
     slots: [Option<u8>; OPEN_MAX],
     pub claimed: bool,
+    pub binding: authority::Binding,
+    pub authority_index: u16,
+    pub binding_preparation: Option<u16>,
+    pub binding_source: Option<(u16, u64)>,
+    /// The completed binding result remains available until a new preparation.
+    pub binding_outcome: Option<u32>,
+    #[cfg(feature = "auth-probe")]
+    pub auth_probe_hold: bool,
+    #[cfg(feature = "auth-probe")]
+    pub auth_probe_gc: Option<Token>,
+    #[cfg(feature = "auth-probe")]
+    pub auth_probe_gc_reservation: Option<storage::Reservation>,
+    pub resolvers: [u64; 16],
+    pub root: storage::Root,
+    pub cwd: Option<Token>,
+    preparations: [Option<storage::Reservation>; 16],
 }
 
 impl Default for Fds {
@@ -197,11 +223,37 @@ impl Default for Fds {
         Self {
             slots: [None; OPEN_MAX],
             claimed: false,
+            binding: authority::Binding::Unbound,
+            authority_index: storage::NONE,
+            binding_preparation: None,
+            binding_source: None,
+            binding_outcome: None,
+            #[cfg(feature = "auth-probe")]
+            auth_probe_hold: false,
+            #[cfg(feature = "auth-probe")]
+            auth_probe_gc: None,
+            #[cfg(feature = "auth-probe")]
+            auth_probe_gc_reservation: None,
+            resolvers: [0; 16],
+            root: BOOT_ROOT,
+            cwd: None,
+            preparations: [None; 16],
         }
     }
 }
 
 impl Fds {
+    /// Retained references in this session, without authenticating or mutating it.
+    #[cfg(feature = "auth-probe")]
+    pub fn retained_counts(&self) -> [u32; 5] {
+        [
+            self.slots.iter().filter(|slot| slot.is_some()).count() as u32,
+            u32::from(self.cwd.is_some()),
+            u32::from(self.binding_preparation.is_some()),
+            u32::from(self.authority_index != storage::NONE),
+            self.resolvers.iter().filter(|&&id| id != 0).count() as u32,
+        ]
+    }
     /// The description of `fd`.
     fn description(&self, fd: u32) -> Result<usize, u32> {
         let slot = fd.checked_sub(3).ok_or(BAD_FD)? as usize;
@@ -228,6 +280,8 @@ impl Fds {
 struct Shared {
     open: Open,
     refs: u16,
+    root: storage::Root,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,7 +293,10 @@ struct FileTimes {
 
 impl File {
     fn is_directory(self) -> bool {
-        matches!(self, Self::Root | Self::Etc | Self::Tmp | Self::ImageDir(_))
+        matches!(
+            self,
+            Self::Root | Self::Etc | Self::Tmp | Self::ImageDir(_) | Self::NodeDir(_)
+        )
     }
 
     /// A character device: writes are dropped, and it has no contents.
@@ -267,22 +324,25 @@ impl File {
             Self::Tmp => Some(2),
             Self::Motd => Some(3),
             Self::Scratch => Some(4),
-            Self::ImageDir(_) | Self::ImageRegular(_) | Self::Null(_) | Self::Random(_) => None,
+            Self::ImageDir(_)
+            | Self::ImageRegular(_)
+            | Self::Null(_)
+            | Self::Random(_)
+            | Self::Node(_)
+            | Self::NodeDir(_) => None,
         }
     }
 }
 
 pub struct Ram<'a> {
-    scratch: [u8; FILE_CAPACITY],
-    len: usize,
+    pub storage: Storage<'a>,
     /// The open descriptions, shared by the sessions that name them.
     descriptions: [Option<Shared>; DESCRIPTIONS],
-    times: [FileTimes; 5],
-    /// When the service started: the times of the files of the image.
-    born: u64,
+    description_generations: [u64; DESCRIPTIONS],
     tree: Option<Tree<'a>>,
 }
 
+#[cfg(test)]
 impl Default for Ram<'_> {
     fn default() -> Self {
         Self::new(0)
@@ -290,28 +350,87 @@ impl Default for Ram<'_> {
 }
 
 impl<'a> Ram<'a> {
-    /// Seeded namespace with one creation time on the caller's file clock.
+    #[cfg(test)]
     pub fn new(now: u64) -> Self {
+        Self::test_ram(now, None)
+    }
+
+    #[cfg(test)]
+    pub fn with_tree(now: u64, tree: Tree<'a>) -> Self {
+        Self::test_ram(now, Some(tree))
+    }
+
+    #[cfg(test)]
+    fn test_ram(now: u64, tree: Option<Tree<'a>>) -> Self {
+        extern crate std;
+        // SAFETY: State consists of integer arrays, booleans and optional integer accounts.
+        let state = std::boxed::Box::leak(unsafe {
+            std::boxed::Box::<storage::State>::new_zeroed().assume_init()
+        });
+        state.initialize();
+        let data =
+            std::boxed::Box::leak(std::vec![0; storage::PAGES * storage::PAGE].into_boxed_slice());
+        Self::with_storage(now, state, data, tree)
+    }
+
+    pub fn with_storage(
+        now: u64,
+        state: &'a mut storage::State,
+        data: &'a mut [u8],
+        tree: Option<Tree<'a>>,
+    ) -> Self {
         Self {
-            scratch: [0; FILE_CAPACITY],
-            len: 0,
+            storage: Storage::new(state, data, tree, now),
             descriptions: [None; DESCRIPTIONS],
-            times: [FileTimes {
-                access: now,
-                modify: now,
-                change: now,
-            }; 5],
-            born: now,
-            tree: None,
+            description_generations: [0; DESCRIPTIONS],
+            tree,
         }
     }
 
-    /// `new` with the files of the boot image's table as well.
-    pub fn with_tree(now: u64, tree: Tree<'a>) -> Self {
-        Self {
-            tree: Some(tree),
-            ..Self::new(now)
+    fn token(&self, file: File) -> Token {
+        match file {
+            File::Root => storage::ROOT,
+            File::Etc => Token {
+                slot: 1,
+                generation: 1,
+            },
+            File::Tmp => Token {
+                slot: 2,
+                generation: 1,
+            },
+            File::Motd => Token {
+                slot: 3,
+                generation: 1,
+            },
+            File::Scratch => Token {
+                slot: 4,
+                generation: 1,
+            },
+            File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) | File::Random(n) => Token {
+                slot: 5 + storage::canonical(self.tree(), n),
+                generation: 1,
+            },
+            File::Node(token) | File::NodeDir(token) => token,
         }
+    }
+
+    fn file(&self, token: Token) -> File {
+        match token.slot {
+            0 => File::Root,
+            1 => File::Etc,
+            2 => File::Tmp,
+            3 => File::Motd,
+            4 => File::Scratch,
+            n if (n as usize) < storage::ORIGINALS => image_file(self.tree(), n - 5),
+            _ if self.storage.node(token).is_ok_and(|n| n.kind == DIR) => File::NodeDir(token),
+            _ => File::Node(token),
+        }
+    }
+
+    fn length(&self, file: File) -> usize {
+        self.storage
+            .node(self.token(file))
+            .map_or(0, |n| n.length as usize)
     }
 
     /// The open description `fd` of `fds` names.
@@ -344,7 +463,21 @@ impl<'a> Ram<'a> {
             .iter()
             .position(Option::is_none)
             .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
-        self.descriptions[index] = Some(Shared { open, refs: 1 });
+        let generation = self.description_generations[index]
+            .checked_add(1)
+            .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
+        self.storage.charge_description(fds.root)?;
+        if let Err(code) = self.storage.pin(self.token(open.file), Pin::Fd) {
+            self.storage.release_description(fds.root);
+            return Err(code);
+        }
+        self.descriptions[index] = Some(Shared {
+            open,
+            refs: 1,
+            root: fds.root,
+            generation,
+        });
+        self.description_generations[index] = generation;
         fds.slots[slot] = Some(index as u8);
         Ok(slot as u32 + 3)
     }
@@ -359,13 +492,191 @@ impl<'a> Ram<'a> {
             .expect("a named description");
         shared.refs -= 1;
         if shared.refs == 0 {
+            let file = shared.open.file;
+            let root = shared.root;
+            let token = self.token(file);
             self.descriptions[index] = None;
+            self.storage.unpin(token, Pin::Fd)?;
+            self.storage.release_description(root);
         }
         Ok(())
     }
 
     /// The descriptors of a session that goes, all of them closed.
+    pub fn reserve_create(
+        &mut self,
+        fds: &mut Fds,
+        parent: Token,
+        name: &[u8],
+        kind: u32,
+    ) -> Result<storage::Reservation, u32> {
+        let place = fds
+            .preparations
+            .iter()
+            .position(Option::is_none)
+            .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
+        let r = self
+            .storage
+            .reserve(fds.root, parent, name, (kind, 0o644, 0, 0))?;
+        fds.preparations[place] = Some(r);
+        Ok(r)
+    }
+
+    pub fn commit_create(&mut self, fds: &mut Fds, r: storage::Reservation) -> Result<Token, u32> {
+        let place = fds
+            .preparations
+            .iter()
+            .position(|p| p.is_some_and(|p| p.token == r.token))
+            .ok_or(NO_ENTRY)?;
+        let token = self.storage.commit(r)?;
+        fds.preparations[place] = None;
+        Ok(token)
+    }
+
+    /// Diagnostic setup uses the same paid reserve and commit as normal creation.
+    #[cfg(feature = "auth-probe")]
+    pub fn auth_probe_gc_reserve(&mut self, fds: &mut Fds) -> Result<(), u32> {
+        if fds.auth_probe_gc.is_some() || fds.auth_probe_gc_reservation.is_some() {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let reservation = self.reserve_create(fds, storage::ROOT, b"auth-probe-gc", REG)?;
+        fds.auth_probe_gc_reservation = Some(reservation);
+        Ok(())
+    }
+
+    #[cfg(feature = "auth-probe")]
+    pub fn auth_probe_gc_commit(&mut self, fds: &mut Fds) -> Result<(), u32> {
+        let reservation = fds
+            .auth_probe_gc_reservation
+            .take()
+            .ok_or(proto_fs::INVALID_ARGUMENT)?;
+        match self.commit_create(fds, reservation) {
+            Ok(token) => {
+                fds.auth_probe_gc = Some(token);
+                Ok(())
+            }
+            Err(code) => {
+                if let Some(place) = fds
+                    .preparations
+                    .iter_mut()
+                    .find(|r| r.is_some_and(|r| r.token == reservation.token))
+                {
+                    let _ = self
+                        .storage
+                        .cancel(place.take().expect("exact retained reservation"));
+                }
+                Err(code)
+            }
+        }
+    }
+
+    /// Binding and resolver jobs share the session's sixteen preparation slots.
+    pub fn begin_binding(&mut self, fds: &mut Fds) -> Result<(), u32> {
+        if fds.binding_preparation.is_some()
+            || fds.resolvers.iter().filter(|&&id| id != 0).count() >= fds.resolvers.len()
+        {
+            return Err(proto_fs::TOO_MANY_OPEN_FILES);
+        }
+        let root = self.storage.charge_preparation(fds.root)?;
+        fds.binding_preparation = Some(root);
+        fds.binding_outcome = None;
+        Ok(())
+    }
+    /// Completing a preparation is idempotent and records its terminal result.
+    pub fn complete_binding(&mut self, fds: &mut Fds, outcome: u32) {
+        if let Some(root) = fds.binding_preparation.take() {
+            self.storage.release_preparation(root);
+        }
+        fds.binding_source = None;
+        fds.binding_outcome = Some(outcome);
+    }
+
+    /// One reference or preparation per cleanup step.
+    pub fn release_step(&mut self, fds: &mut Fds) -> bool {
+        if let Some(root) = fds.binding_preparation.take() {
+            self.storage.release_preparation(root);
+            fds.binding_source = None;
+            return true;
+        }
+        if let Some(r) = fds
+            .preparations
+            .iter_mut()
+            .find(|r| r.is_some())
+            .and_then(Option::take)
+        {
+            #[cfg(feature = "auth-probe")]
+            if fds
+                .auth_probe_gc_reservation
+                .is_some_and(|held| held.token == r.token)
+            {
+                fds.auth_probe_gc_reservation = None;
+            }
+            let _ = self.storage.cancel(r);
+            return true;
+        }
+        if let Some(cwd) = fds.cwd.take() {
+            let _ = self.storage.unpin(cwd, Pin::Cwd);
+            return true;
+        }
+        let first = fds.numbers().next();
+        if let Some(fd) = first {
+            let _ = self.close(fds, fd);
+            return true;
+        }
+        false
+    }
+
+    pub fn description_token(&self, fds: &Fds, fd: u32) -> Result<Token, u32> {
+        let slot = fds.description(fd)?;
+        Ok(Token {
+            slot: slot as u16,
+            generation: self.descriptions[slot]
+                .expect("named description")
+                .generation,
+        })
+    }
+
+    /// A raw token can serve as a relative base only when this session retains it.
+    pub fn owns_directory_base(&self, fds: &Fds, token: Token) -> bool {
+        if !self.storage.node(token).is_ok_and(|n| n.kind == DIR) {
+            return false;
+        }
+        fds.cwd.unwrap_or(storage::ROOT) == token
+            || fds.numbers().any(|fd| {
+                fds.description(fd)
+                    .ok()
+                    .and_then(|slot| self.descriptions[slot].as_ref())
+                    .is_some_and(|description| self.token(description.open.file) == token)
+            })
+    }
+    pub fn set_cwd_token(&mut self, fds: &mut Fds, token: Token) -> Result<(), u32> {
+        if self.storage.node(token)?.kind != DIR {
+            return Err(proto_fs::NOT_DIRECTORY);
+        }
+        self.storage.pin(token, Pin::Cwd)?;
+        if let Some(old) = fds.cwd.replace(token) {
+            self.storage.unpin(old, Pin::Cwd)?;
+        }
+        Ok(())
+    }
+
     pub fn release(&mut self, fds: &mut Fds) {
+        #[cfg(feature = "auth-probe")]
+        {
+            fds.auth_probe_gc_reservation = None;
+        }
+        if let Some(root) = fds.binding_preparation.take() {
+            self.storage.release_preparation(root);
+        }
+        fds.binding_source = None;
+        if let Some(cwd) = fds.cwd.take() {
+            let _ = self.storage.unpin(cwd, Pin::Cwd);
+        }
+        for r in &mut fds.preparations {
+            if let Some(r) = r.take() {
+                let _ = self.storage.cancel(r);
+            }
+        }
         let numbers: [Option<u32>; OPEN_MAX] = {
             let mut list = [None; OPEN_MAX];
             for (place, fd) in list.iter_mut().zip(fds.numbers()) {
@@ -382,10 +693,17 @@ impl<'a> Ram<'a> {
     /// `fds`, which share their descriptions, offsets and access modes;
     /// BAD_FD for a number no descriptor has. O(OPEN_MAX).
     pub fn clone_fds(&mut self, fds: &Fds, list: &[u32]) -> Result<Fds, u32> {
-        let mut out = Fds::default();
+        let mut out = Fds {
+            root: fds.root,
+            ..Fds::default()
+        };
         for &fd in list {
             let index = fds.description(fd)?;
             out.slots[(fd - 3) as usize] = Some(index as u8);
+        }
+        if let Some(cwd) = fds.cwd {
+            self.storage.pin(cwd, Pin::Cwd)?;
+            out.cwd = Some(cwd);
         }
         for index in out.slots.iter().flatten() {
             self.descriptions[usize::from(*index)]
@@ -409,18 +727,7 @@ impl<'a> Ram<'a> {
     }
 
     fn resolve(&self, path: &str) -> Result<File, u32> {
-        Ok(match path {
-            "/" => File::Root,
-            "/etc" => File::Etc,
-            "/tmp" => File::Tmp,
-            "/etc/motd" => File::Motd,
-            "/tmp/probe" => File::Scratch,
-            _ => {
-                let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
-                let n = tree.find(path).ok_or(NO_ENTRY)?;
-                image_file(tree, n)
-            }
-        })
+        Ok(self.file(self.storage.resolve(path.as_bytes())?))
     }
 
     /// Whether the description `fd` is a random device, whose reads the
@@ -443,6 +750,49 @@ impl<'a> Ram<'a> {
             Err(NO_ENTRY) if changes => return Err(proto_fs::INVALID_ARGUMENT),
             found => found?,
         };
+        self.open_file(
+            fds,
+            file,
+            flags
+                | if directory_only {
+                    proto_fs::DIRECTORY_ONLY
+                } else {
+                    0
+                }
+                | if changes { proto_fs::CHANGES } else { 0 },
+        )
+    }
+
+    pub fn open_token(
+        &mut self,
+        fds: &mut Fds,
+        token: Token,
+        flags: u32,
+        identity: authority::Identity,
+    ) -> Result<u32, u32> {
+        if flags & !15 != 0 || flags & 3 == 3 {
+            return Err(proto_wire::BAD_SIZE);
+        }
+        let file = self.file(token);
+        if flags & proto_fs::CHANGES != 0 && !file.is_device() {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let node = self.storage.node(token)?;
+        let bits = match flags & 3 {
+            proto_fs::READ_ONLY => 4,
+            proto_fs::WRITE_ONLY => 2,
+            _ => 6,
+        };
+        if !identity.permits(node, bits) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        self.open_file(fds, self.file(token), flags)
+    }
+
+    fn open_file(&mut self, fds: &mut Fds, file: File, flags: u32) -> Result<u32, u32> {
+        let changes = flags & proto_fs::CHANGES != 0;
+        let directory_only = flags & proto_fs::DIRECTORY_ONLY != 0;
+        let flags = flags & 3;
         if changes && !file.is_device() {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
@@ -466,8 +816,11 @@ impl<'a> Ram<'a> {
     }
 
     fn touch_access(&mut self, file: File, now: u64) {
-        if let Some(index) = file.index() {
-            self.times[index].access = now;
+        if file.index().is_some() {
+            self.storage
+                .node_mut(self.token(file))
+                .expect("live inode")
+                .times[0] = now;
         }
     }
 
@@ -478,6 +831,9 @@ impl<'a> Ram<'a> {
             File::Tmp => 3,
             File::Motd => 4,
             File::Scratch => 5,
+            File::Node(token) | File::NodeDir(token) => {
+                (u64::from(token.slot) + 1) | token.generation << 32
+            }
             File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) | File::Random(n) => {
                 IMAGE_INODE + u64::from(self.tree().canonical(n))
             }
@@ -558,6 +914,41 @@ impl<'a> Ram<'a> {
     }
 
     /// The information of the program file of an image session.
+    pub fn exec_token(&self, token: Token, identity: authority::Identity) -> Result<Exec, u32> {
+        let n = self.storage.node(token)?;
+        if n.kind != REG || n.boot == storage::NONE || !identity.permits(n, 1) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        Ok(Exec {
+            entry: n.boot,
+            mode: n.mode,
+            uid: n.uid,
+            gid: n.gid,
+        })
+    }
+
+    pub fn token_information(&self, token: Token) -> Result<NodeInfo, u32> {
+        self.storage.node(token)?;
+        Ok(self.node_information(self.file(token)))
+    }
+
+    pub fn directory_read_token(
+        &mut self,
+        token: Token,
+        index: u32,
+        identity: authority::Identity,
+        now: u64,
+    ) -> Result<Option<DirectoryRecord<'a>>, u32> {
+        let node = self.storage.node(token)?;
+        if node.kind != DIR {
+            return Err(proto_fs::NOT_DIRECTORY);
+        }
+        if !identity.permits(node, 4) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        Ok(self.entry_of(self.file(token), index, now))
+    }
+
     pub fn image_information(&self, entry: u16) -> Result<NodeInfo, u32> {
         let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
         if entry >= tree.len() || tree.entry(entry).is_directory() {
@@ -569,50 +960,27 @@ impl<'a> Ram<'a> {
     /// ReadAt of an image session: the bytes of the program file `entry`
     /// from `offset`; the time of the image does not change.
     pub fn image_read(&self, entry: u16, offset: u64, out: &mut [u8]) -> Result<usize, u32> {
-        self.image_information(entry)?;
+        let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
+        if entry >= tree.len() || tree.entry(entry).is_directory() {
+            return Err(NO_ENTRY);
+        }
         if i64::try_from(offset).is_err() {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
-        let bytes = self.bytes(File::ImageRegular(entry));
-        let start = usize::try_from(offset).map_or(bytes.len(), |o| o.min(bytes.len()));
-        let n = out.len().min(bytes.len() - start);
-        out[..n].copy_from_slice(&bytes[start..start + n]);
-        Ok(n)
+        self.storage
+            .read(self.token(File::ImageRegular(entry)), offset, out)
     }
 
     fn node_information(&self, file: File) -> NodeInfo {
-        let size = self.bytes(file).len() as u64;
-        let (kind, links, permissions, uid, gid, times) = match file {
-            File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) | File::Random(n) => {
-                let entry = self.tree().entry(n);
-                let kind = file.kind();
-                let times = FileTimes {
-                    access: self.born,
-                    modify: self.born,
-                    change: self.born,
-                };
-                let links = u64::from(self.tree().links(n));
-                (
-                    kind,
-                    links,
-                    entry.mode & 0o7777,
-                    entry.uid,
-                    entry.gid,
-                    times,
-                )
-            }
-            _ => {
-                let (kind, links, permissions) = match file {
-                    File::Root => (DIR, 4 + self.root_links(), 0o555),
-                    File::Etc => (DIR, 2, 0o555),
-                    File::Tmp => (DIR, 2, 0o555),
-                    File::Motd => (REG, 1, 0o444),
-                    _ => (REG, 1, 0o644),
-                };
-                let times = self.times[file.index().expect("fixed tree")];
-                (kind, links, permissions, 0, 0, times)
-            }
+        let size = self.length(file) as u64;
+        let n = self.storage.node(self.token(file)).expect("live inode");
+        let times = FileTimes {
+            access: n.times[0],
+            modify: n.times[1],
+            change: n.times[2],
         };
+        let (kind, links, permissions, uid, gid) =
+            (n.kind, u64::from(n.links), n.mode, n.uid, n.gid);
         NodeInfo {
             kind,
             permissions,
@@ -629,13 +997,6 @@ impl<'a> Ram<'a> {
             modify_ns: times.modify,
             change_ns: times.change,
         }
-    }
-
-    /// The directories of the image at `/`: each has a `..` in `/`.
-    fn root_links(&self) -> u64 {
-        self.tree
-            .as_ref()
-            .map_or(0, |tree| u64::from(tree.root_links()))
     }
 
     pub fn descriptor_information(&self, fds: &Fds, fd: u32) -> Result<NodeInfo, u32> {
@@ -678,10 +1039,7 @@ impl<'a> Ram<'a> {
         if i64::try_from(offset).is_err() || matches!(open.file, File::Random(_)) {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
-        let bytes = self.bytes(open.file);
-        let start = usize::try_from(offset).map_or(bytes.len(), |o| o.min(bytes.len()));
-        let n = out.len().min(bytes.len() - start);
-        out[..n].copy_from_slice(&bytes[start..start + n]);
+        let n = self.storage.read(self.token(open.file), offset, out)?;
         if !out.is_empty() {
             self.touch_access(open.file, now);
         }
@@ -698,10 +1056,10 @@ impl<'a> Ram<'a> {
         let file = self.get(fds, fd)?.file;
         let n = self.write(fds, fd, bytes)?;
         // The null device keeps no times.
-        if let (true, Some(index)) = (n > 0, file.index()) {
-            let times = &mut self.times[index];
-            times.modify = now;
-            times.change = now;
+        if n > 0 && file.index().is_some() {
+            let node = self.storage.node_mut(self.token(file)).expect("live inode");
+            node.times[1] = now;
+            node.times[2] = now;
         }
         Ok(n)
     }
@@ -838,26 +1196,12 @@ impl<'a> Ram<'a> {
         let file = self.resolve(path)?;
         Ok(Metadata {
             kind: file.kind(),
-            size: self.bytes(file).len() as u32,
+            size: self.length(file) as u32,
         })
     }
 
-    fn bytes(&self, file: File) -> &[u8] {
-        match file {
-            File::Root
-            | File::Etc
-            | File::Tmp
-            | File::ImageDir(_)
-            | File::Null(_)
-            | File::Random(_) => &[],
-            File::Motd => MOTD,
-            File::Scratch => &self.scratch[..self.len],
-            File::ImageRegular(n) => self.tree().data(n),
-        }
-    }
-
     pub fn size(&self, fds: &Fds, fd: u32) -> Result<u32, u32> {
-        Ok(self.bytes(self.get(fds, fd)?.file).len() as u32)
+        Ok(self.length(self.get(fds, fd)?.file) as u32)
     }
 
     /// Reposition one open description without extending its file. RAM files
@@ -877,7 +1221,7 @@ impl<'a> Ram<'a> {
         let size = if open.file.is_directory() {
             self.directory_count(open.file)
         } else {
-            self.bytes(open.file).len() as i64
+            self.length(open.file) as i64
         };
         let next = match origin {
             SeekFrom::Start => offset,
@@ -916,10 +1260,9 @@ impl<'a> Ram<'a> {
         if matches!(open.file, File::Random(_)) {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
-        let bytes = self.bytes(open.file);
-        let start = open.offset.min(bytes.len() as i64) as usize;
-        let n = out.len().min(bytes.len() - start);
-        out[..n].copy_from_slice(&bytes[start..start + n]);
+        let n = self
+            .storage
+            .read(self.token(open.file), open.offset as u64, out)?;
         open.offset += n as i64;
         self.put(fds, fd, open)?;
         Ok(n)
@@ -941,11 +1284,8 @@ impl<'a> Ram<'a> {
         if end > FILE_CAPACITY {
             return Err(NO_SPACE);
         }
-        if offset > self.len {
-            self.scratch[self.len..offset].fill(0);
-        }
-        self.scratch[offset..end].copy_from_slice(bytes);
-        self.len = self.len.max(end);
+        self.storage
+            .write(self.token(open.file), fds.root, offset, bytes)?;
         open.offset = end as i64;
         self.put(fds, fd, open)?;
         Ok(bytes.len())
@@ -1356,7 +1696,7 @@ mod tests {
         );
         assert_eq!(ram.lookup("/bin"), Ok(Metadata { kind: DIR, size: 0 }));
         assert_eq!(ram.information("/bin/none"), Err(NO_ENTRY));
-        assert_eq!(ram.information("/bin/ash/x"), Err(NO_ENTRY));
+        assert_eq!(ram.information("/bin/ash/x"), Err(proto_fs::NOT_DIRECTORY));
         // The fixed tree is as before.
         assert_eq!(ram.information("/etc/motd").unwrap().size, 14);
     }
@@ -1656,6 +1996,13 @@ mod tests {
             loader: Some(loader),
             index: 0,
             ctty: None,
+            image: 1,
+            groups: proto_process::Groups::EMPTY,
+            limits: proto_process::ResourceLimits::initial(2 * 1024 * 1024),
+            root: proto_process::ExpenditureRoot {
+                pid: 2,
+                generation: 1,
+            },
         };
         let loaders = proto_fs::LOADERS | 9;
         assert_eq!(
@@ -1677,6 +2024,13 @@ mod tests {
             loader: None,
             index: 0,
             ctty: None,
+            image: 1,
+            groups: proto_process::Groups::EMPTY,
+            limits: proto_process::ResourceLimits::initial(2 * 1024 * 1024),
+            root: proto_process::ExpenditureRoot {
+                pid: 2,
+                generation: 1,
+            },
             ..who
         };
         assert_eq!(exec_for(loaders, Some(process)), refused, "no loader");
@@ -1781,7 +2135,11 @@ mod tests {
     fn descriptions_are_bounded_across_sessions() {
         let mut ram = Ram::default();
         let mut sessions = [Fds::default(); DESCRIPTIONS / OPEN_MAX];
-        for fds in &mut sessions {
+        for (i, fds) in sessions.iter_mut().enumerate() {
+            fds.root = storage::Root {
+                id: i as u64 + 1,
+                generation: 1,
+            };
             for _ in 0..OPEN_MAX {
                 ram.open(fds, "/etc/motd", READ_ONLY).unwrap();
             }

@@ -111,6 +111,15 @@ impl Index {
             if entry.is_directory() {
                 self.canon[n] = n as u16;
                 self.links[n] = 2 + self.directories(table, n);
+            } else if [
+                crate::NULL_DEVICE,
+                crate::RANDOM_DEVICES[0],
+                crate::RANDOM_DEVICES[1],
+            ]
+            .contains(&entry.path)
+            {
+                self.canon[n] = n as u16;
+                self.links[n] = 1;
             } else {
                 let slot = &mut self.file_first[entry.file as usize];
                 if *slot == NONE {
@@ -122,7 +131,14 @@ impl Index {
         }
         for n in 0..len {
             let entry = table.entry(n as u32);
-            if !entry.is_directory() {
+            if !entry.is_directory()
+                && ![
+                    crate::NULL_DEVICE,
+                    crate::RANDOM_DEVICES[0],
+                    crate::RANDOM_DEVICES[1],
+                ]
+                .contains(&entry.path)
+            {
                 self.links[n] = self.file_links[entry.file as usize];
             }
         }

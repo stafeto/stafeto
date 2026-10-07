@@ -210,6 +210,12 @@ pub extern "C" fn rtbench_io_init() -> c_int {
     let Ok(mut fresh) = posix_fs::PosixFs::from_sessions(ram, Some(uart), b"/", None, false) else {
         return -1;
     };
+    let Some(identity) = posix_abi::process::identity() else {
+        return -1;
+    };
+    if fresh.bind(identity).is_err() {
+        return -1;
+    }
     fresh.set_pipes(Some(pipe));
     posix_abi::shared::with_files(|files| {
         if files.descriptors().any(|(fd, _, _)| fd > 2) {
