@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use posix_fs::{DescriptorFlags, FileKind, FsError, OPEN_MAX, PosixFs, SeekFrom};
+use posix_fs::{DescriptorFlags, FileKind, FsError, OPEN_MAX, PosixFs, SeekFrom, StartupFiles};
 use posix_path::{MAX_PATH, PathState};
 use proto_fs::{
     ACCESS_DENIED, BAD_FD, INVALID_ARGUMENT, NO_ENTRY, READ_ONLY, READ_WRITE, WRITE_ONLY,
@@ -17,14 +17,68 @@ use rt::handle::Resource;
 
 rt::entry!(main);
 
-fn main(_: u64) -> u64 {
-    let Ok(mut start) = rt::startup() else {
-        return 1;
-    };
+struct FileCell(core::cell::UnsafeCell<core::mem::MaybeUninit<PosixFs>>);
+// SAFETY: FILES_BUSY admits one native owner; its guard drops the initialized table.
+unsafe impl Sync for FileCell {}
+static FILES: FileCell = FileCell(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+static FILES_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+struct NativeFiles;
+impl NativeFiles {
+    fn connect(parent: &rt::Handle<rt::handle::Channel>) -> Result<Self, FsError> {
+        use core::sync::atomic::Ordering;
+        if FILES_BUSY.swap(true, Ordering::Acquire) {
+            return Err(FsError::Io);
+        }
+        let result = StartupFiles::connect(parent, false).and_then(|startup| {
+            // SAFETY: this guard owns the allocation exclusively and keeps it pinned.
+            unsafe {
+                PosixFs::initialize_at((*FILES.0.get()).as_mut_ptr(), startup, b"/", None, false)
+            }
+        });
+        if let Err(error) = result {
+            FILES_BUSY.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(Self)
+    }
+}
+impl core::ops::Deref for NativeFiles {
+    type Target = PosixFs;
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: a successful guard witnesses initialization and exclusive ownership.
+        unsafe { (*FILES.0.get()).assume_init_ref() }
+    }
+}
+impl core::ops::DerefMut for NativeFiles {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: a mutable guard gives the only borrow of the initialized allocation.
+        unsafe { (*FILES.0.get()).assume_init_mut() }
+    }
+}
+impl Drop for NativeFiles {
+    fn drop(&mut self) {
+        // SAFETY: the guard owns initialized fields and no borrowed transport survives it.
+        unsafe { (*FILES.0.get()).assume_init_drop() };
+        FILES_BUSY.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+// Startup capabilities stay live through initialization checks alone.
+#[inline(never)]
+fn probe_parent() -> Option<(rt::Handle<rt::handle::Channel>, Result<(), &'static str>)> {
+    let mut start = rt::startup().ok()?;
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let result = check(&start.parent);
+    let result = check_initialization(&start.parent, &start.process);
+    Some((start.parent, result))
+}
+
+fn main(_: u64) -> u64 {
+    let Some((parent, initial)) = probe_parent() else {
+        return 1;
+    };
+    let result = initial.and_then(|()| check(&parent));
     match result {
         Ok(()) => {
             rt::println!("ramfs-probe: ok");
@@ -35,6 +89,115 @@ fn main(_: u64) -> u64 {
             2
         }
     }
+}
+
+fn check_initialization(
+    parent: &rt::Handle<rt::handle::Channel>,
+    process: &rt::Handle<rt::handle::Process>,
+) -> Result<(), &'static str> {
+    let held = |slot, generation| rt::fs::PreparedOpen {
+        fd: 34,
+        slot,
+        generation,
+        random: true,
+    };
+    let old = posix_fs::RamTarget::from_prepared(held(0, 1)).map_err(|_| "old exact target")?;
+    let replacement =
+        posix_fs::RamTarget::from_prepared(held(127, 1)).map_err(|_| "replacement exact target")?;
+    let next = posix_fs::RamTarget::from_prepared(held(0, 2)).map_err(|_| "next exact target")?;
+    if old == replacement
+        || old == next
+        || replacement.fd() != 34
+        || replacement.description_slot() != 127
+        || replacement.generation() != 1
+        || replacement.prepared()
+            != (rt::fs::PreparedOpen {
+                fd: 34,
+                slot: 127,
+                generation: 1,
+                random: false,
+            })
+    {
+        return Err("full target identity");
+    }
+    for (fd, slot, generation) in [(2, 0, 1), (35, 0, 1), (3, 128, 1), (3, 0, 0)] {
+        if posix_fs::RamTarget::from_prepared(rt::fs::PreparedOpen {
+            fd,
+            slot,
+            generation,
+            random: false,
+        }) != Err(FsError::Io)
+        {
+            return Err("invalid target publication");
+        }
+    }
+    let before = rt::sys::process_handles(process)
+        .map_err(|_| "initial handles")?
+        .live;
+    let duplicate = [
+        posix_fs::Inherited {
+            fd: 4,
+            target: posix_fs::Target::Output,
+        },
+        posix_fs::Inherited {
+            fd: 4,
+            target: posix_fs::Target::Error,
+        },
+    ];
+    let outside = [posix_fs::Inherited {
+        fd: OPEN_MAX as u32,
+        target: posix_fs::Target::Input,
+    }];
+    for (cwd, list, expected) in [
+        (b"/bad\0cwd".as_slice(), None, FsError::InvalidArgument),
+        (
+            b"/".as_slice(),
+            Some(duplicate.as_slice()),
+            FsError::InvalidArgument,
+        ),
+        (
+            b"/".as_slice(),
+            Some(outside.as_slice()),
+            FsError::BadFileDescriptor,
+        ),
+    ] {
+        // SAFETY: this startup-only check has no initialized owner or competing user.
+        let destination = unsafe { (*FILES.0.get()).as_mut_ptr() };
+        // SAFETY: the entire uninitialized allocation is writable; the byte sentinel
+        // is inspected exclusively as bytes until successful initialization.
+        unsafe {
+            destination
+                .cast::<u8>()
+                .write_bytes(0xa5, core::mem::size_of::<PosixFs>())
+        };
+        let startup =
+            StartupFiles::connect(parent, false).map_err(|_| "error fixture transports")?;
+        // SAFETY: the startup-only allocation is aligned, exclusive and uninitialized.
+        if unsafe { PosixFs::initialize_at(destination, startup, cwd, list, false) }
+            != Err(expected)
+        {
+            return Err("initialization error result");
+        }
+        // SAFETY: the sentinel initialized every byte; failed preflight writes no fields.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(destination.cast::<u8>(), core::mem::size_of::<PosixFs>())
+        };
+        if bytes.iter().any(|&byte| byte != 0xa5) {
+            return Err("failed initialization changed allocation");
+        }
+        if rt::sys::process_handles(process)
+            .map_err(|_| "released startup handles")?
+            .live
+            != before
+        {
+            return Err("failed initialization retained transports");
+        }
+    }
+    let files = NativeFiles::connect(parent).map_err(|_| "initialize after rejected preflight")?;
+    if files.cwd() != b"/" || files.descriptors().count() != 3 {
+        return Err("initial table state");
+    }
+    Ok(())
 }
 
 fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
@@ -228,7 +391,7 @@ fn check_image(fs: &Files) -> Result<(), &'static str> {
 }
 
 fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
-    let mut posix = PosixFs::connect(parent).map_err(|_| "connect POSIX files")?;
+    let mut posix = NativeFiles::connect(parent).map_err(|_| "connect POSIX files")?;
     if posix.stat(b"/").map_err(|_| "stat root")?.kind != FileKind::Directory {
         return Err("root type");
     }
@@ -318,7 +481,7 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
 }
 
 fn check_seek(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
-    let mut posix = PosixFs::connect(parent).map_err(|_| "connect seek")?;
+    let mut posix = NativeFiles::connect(parent).map_err(|_| "connect seek")?;
     let fd = posix
         .open(b"/tmp/probe", READ_WRITE)
         .map_err(|_| "open seek")?;
@@ -379,7 +542,7 @@ fn check_seek(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static s
 }
 
 fn check_duplicates(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
-    let mut fs = PosixFs::connect(parent).map_err(|_| "dup connect")?;
+    let mut fs = NativeFiles::connect(parent).map_err(|_| "dup connect")?;
     if fs.fstat(1).map_err(|_| "console stat")?.kind != FileKind::Character
         || fs.lseek(1, 0, SeekFrom::Start) != Err(FsError::NotSeekable)
         || fs.read(1, &mut []) != Err(FsError::BadFileDescriptor)
@@ -489,7 +652,7 @@ fn check_duplicates(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'st
 }
 
 fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
-    let mut fs = PosixFs::connect(parent).map_err(|_| "limit connect")?;
+    let mut fs = NativeFiles::connect(parent).map_err(|_| "limit connect")?;
     let source = fs.open(b"/etc/motd", READ_ONLY).map_err(|_| "limit open")?;
     for expected in 4..OPEN_MAX as u32 {
         if fs.dup(source) != Ok(expected) {

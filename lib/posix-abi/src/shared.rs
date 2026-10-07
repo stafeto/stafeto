@@ -13,22 +13,26 @@
 use crate::constants::*;
 use core::{
     cell::UnsafeCell,
+    mem::MaybeUninit,
     sync::atomic::{AtomicBool, Ordering},
 };
-use posix_fs::{PosixFs, Resolved, Target, Transport};
+use posix_fs::{Inherited, PosixFs, Resolved, StartupFiles, Target, Transport};
 use posix_request::{MESSAGE_MAX, Reply, Request};
 use posix_sync::LayerLock;
 use proto_wire::Writer;
 use rt::handle::Handle;
 
 struct State {
-    files: Option<PosixFs>,
+    files: MaybeUninit<PosixFs>,
 }
 struct Cell(UnsafeCell<State>);
 // SAFETY: startup installs the files once; afterwards only `process_state`
 // borrows the state, under FILES_LOCK.
 unsafe impl Sync for Cell {}
-static STATE: Cell = Cell(UnsafeCell::new(State { files: None }));
+static STATE: Cell = Cell(UnsafeCell::new(State {
+    files: MaybeUninit::uninit(),
+}));
+static STARTED: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 static FILES_LOCK: LayerLock = LayerLock::raising();
 pub fn terminals_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
@@ -44,12 +48,32 @@ pub fn probe_hold(run: impl FnOnce()) {
 
 /// # Safety
 /// Startup has exclusive access, before any client thread uses the files.
-pub unsafe fn init(files: PosixFs) -> Result<(), rt::abi::Error> {
-    if READY.load(Ordering::Acquire) {
+pub unsafe fn init(
+    startup: StartupFiles,
+    cwd: &[u8],
+    inherited: Option<&[Inherited]>,
+    secure: bool,
+    identity: Option<&Handle<rt::handle::Channel>>,
+) -> Result<(), rt::abi::Error> {
+    if STARTED.swap(true, Ordering::AcqRel) {
         return Err(rt::abi::Error::BadState);
     }
+    if let Some(identity) = identity {
+        startup
+            .bind(identity)
+            .map_err(|_| rt::abi::Error::BadState)?;
+    }
     // SAFETY: startup has exclusive access; no client exists yet.
-    unsafe { (*STATE.0.get()).files = Some(files) };
+    unsafe {
+        PosixFs::initialize_at(
+            (*STATE.0.get()).files.as_mut_ptr(),
+            startup,
+            cwd,
+            inherited,
+            secure,
+        )
+    }
+    .map_err(|_| rt::abi::Error::BadState)?;
     READY.store(true, Ordering::Release);
     Ok(())
 }
@@ -69,7 +93,9 @@ pub unsafe fn after_fork(
         return;
     }
     // SAFETY: the caller's promise gives this borrow alone.
-    if let Some(own) = unsafe { (*STATE.0.get()).files.as_mut() } {
+    {
+        // SAFETY: READY witnesses complete in-place initialization.
+        let own = unsafe { (*STATE.0.get()).files.assume_init_mut() };
         own.after_fork(files, uart, pipes, terminal);
         if let Some(identity) = crate::process::identity() {
             let _ = own.bind(identity);
@@ -104,7 +130,8 @@ fn process_state<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R,
     let _guard = FILES_LOCK.lock();
     // SAFETY: the lock gives this borrow alone; READY published the state.
     let state = unsafe { &mut *STATE.0.get() };
-    let files = state.files.as_mut().ok_or(ENOSYS)?;
+    // SAFETY: READY witnesses complete initialization and the lock is exclusive.
+    let files = unsafe { state.files.assume_init_mut() };
     f(files)
 }
 

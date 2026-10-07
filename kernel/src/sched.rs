@@ -209,6 +209,8 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 /// `t` is alive. When the kernel's reference is its last, `t` is queued
 /// for cleanup here, and the caller does not use it afterwards.
 pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
+    #[cfg(feature = "ipc-loss-probe")]
+    crate::ipc_loss_probe::ending(t, cause);
     let (held, waited) = locked(|k| {
         // SAFETY: `t` is alive; its node is read before the scheduler takes it.
         let state = unsafe { t.as_ref() }.sched.state();

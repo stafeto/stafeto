@@ -4,6 +4,7 @@
 //! Retained byte paths. Every step handles one component, eight names or one link.
 
 use crate::authority::Identity;
+use crate::namespace::{Edge, Location, NamespacePath, NamespaceProof, RawSyntax};
 use crate::storage::{Pin, ROOT, SYMLINK, Storage, Token};
 use proto_fs::{LOOP, MAX_PATH, NAME_TOO_LONG, NO_ENTRY, NOT_DIRECTORY, STALE_PROOF};
 
@@ -35,6 +36,8 @@ pub enum Intent {
     Lookup { follow: bool },
     Open { flags: u32 },
     DirectoryCreate,
+    SymbolicLinkCreate,
+    Namespace { path: NamespacePath },
 }
 impl Intent {
     fn follows(self) -> bool {
@@ -45,12 +48,19 @@ impl Intent {
                     && flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE)
                         != proto_fs::CREATE | proto_fs::EXCLUSIVE
             }
-            Self::DirectoryCreate => false,
+            Self::DirectoryCreate | Self::SymbolicLinkCreate => false,
+            Self::Namespace { path } => matches!(path, NamespacePath::LinkSource { follow: true }),
         }
     }
     fn permits_missing(self) -> bool {
-        matches!(self, Self::DirectoryCreate)
-            || matches!(self, Self::Open { flags } if flags & proto_fs::CREATE != 0)
+        matches!(
+            self,
+            Self::DirectoryCreate
+                | Self::SymbolicLinkCreate
+                | Self::Namespace {
+                    path: NamespacePath::Destination
+                }
+        ) || matches!(self, Self::Open { flags } if flags & proto_fs::CREATE != 0)
     }
 }
 /// The exact naming edge remains borrowed from the retained resolver path.
@@ -141,6 +151,10 @@ impl Resolve {
         self.identity = identity;
         Ok(())
     }
+    /// The admitted raw pathname survives link expansion and traversal restarts.
+    pub fn original_path(&self) -> &[u8] {
+        &self.original[..self.original_len]
+    }
     /// A new authentic authority generation invalidates a proof even if IDs match.
     pub fn invalidate(&mut self) {
         self.epoch = 0;
@@ -190,7 +204,10 @@ impl Resolve {
             if self.at == self.length {
                 if self.path[self.length - 1] == b'/'
                     && storage.node(self.current)?.kind != crate::DIR
-                    && !matches!(self.intent, Intent::DirectoryCreate)
+                    && !matches!(
+                        self.intent,
+                        Intent::DirectoryCreate | Intent::SymbolicLinkCreate
+                    )
                     && !matches!(self.intent, Intent::Open { flags }
                         if flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE) == proto_fs::CREATE | proto_fs::EXCLUSIVE)
                 {
@@ -254,7 +271,10 @@ impl Resolve {
                     && (self.follow
                         || !self.final_component()
                         || (self.end < self.length
-                            && !matches!(self.intent, Intent::DirectoryCreate)
+                            && !matches!(
+                                self.intent,
+                                Intent::DirectoryCreate | Intent::SymbolicLinkCreate
+                            )
                             && !matches!(self.intent, Intent::Open { flags }
                                 if flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE)
                                     == proto_fs::CREATE | proto_fs::EXCLUSIVE)))
@@ -286,6 +306,42 @@ impl Resolve {
         self.edge_start = self.at;
         self.edge_end = self.end;
         Ok(())
+    }
+    /// A namespace proof retains the original syntax and the authentic search identity.
+    pub fn namespace_proof(
+        &self,
+        storage: &Storage<'_>,
+        identity: Identity,
+        path: NamespacePath,
+    ) -> Result<NamespaceProof<'_>, u32> {
+        let intent = match path {
+            NamespacePath::CreateDirectory => Intent::DirectoryCreate,
+            NamespacePath::CreateSymbolicLink => Intent::SymbolicLinkCreate,
+            NamespacePath::ReadLink => Intent::Lookup { follow: false },
+            _ => Intent::Namespace { path },
+        };
+        let proof = self.result_proof(storage, identity, intent)?;
+        let location = if proof.target.is_none() {
+            Location::Missing
+        } else {
+            self.search
+                .checked_sub(1)
+                .map(|i| storage.namespace_location(i))
+                .transpose()?
+                .unwrap_or(Location::Missing)
+        };
+        Ok(NamespaceProof {
+            edge: Edge {
+                parent: proof.parent,
+                target: proof.target,
+                location,
+                syntax: RawSyntax::of(self.original_path()),
+            },
+            leaf: proof.leaf,
+            role: path,
+            identity,
+            epoch: self.epoch,
+        })
     }
     /// Commit must supply the same operation intent captured at admission.
     pub fn result_proof(

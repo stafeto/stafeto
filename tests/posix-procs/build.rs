@@ -19,6 +19,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cleanup.c");
     println!("cargo:rerun-if-changed=jobs.c");
     println!("cargo:rerun-if-changed=loader-abort.c");
+    println!("cargo:rerun-if-changed=image-gates.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     // The branches of the steps mode (xtask process-steps N).
@@ -54,6 +55,14 @@ fn main() {
         ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
         .arg(format!(
+            "-DIMAGE_GATES_NORMAL={}",
+            u8::from(env::var_os("CARGO_FEATURE_IMAGE_GATES_NORMAL").is_some())
+        ))
+        .arg(format!(
+            "-DIMAGE_GATES_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_IMAGE_GATES").is_some())
+        ))
+        .arg(format!(
             "-DJOB_CONTROL_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_JOBS").is_some())
         ))
@@ -78,7 +87,9 @@ fn main() {
         .arg(sysroot.join("include"))
         .args([
             "-c",
-            if env::var_os("CARGO_FEATURE_AUTH_PROBE").is_some() {
+            if env::var_os("CARGO_FEATURE_IMAGE_GATES").is_some() {
+                "image-gates.c"
+            } else if env::var_os("CARGO_FEATURE_AUTH_PROBE").is_some() {
                 "cleanup.c"
             } else if env::var_os("CARGO_FEATURE_FILES").is_some() {
                 "files.c"

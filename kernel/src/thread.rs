@@ -651,6 +651,45 @@ pub unsafe fn exit(t: NonNull<Thread>) {
     }
 }
 
+/// End one held AwaitingReply thread of the isolated IPC-loss guest.
+/// The caller has removed the Arm and keeps the thread through the snapshot.
+#[cfg(feature = "ipc-loss-probe")]
+pub fn end_waiting_for_probe(t: NonNull<Thread>, server: NonNull<Process>) -> Result<(), Error> {
+    // SAFETY: the caller holds t, which holds its process.
+    let (p, cause) = unsafe { (t.as_ref().process, t.as_ref().priority()) };
+    let exact = sched::locked(|_| {
+        // SAFETY: the scheduler lock guards the held thread's wait.
+        unsafe {
+            t.as_ref().sched.state() == State::Waiting
+                && t.as_ref().waits == Some(Wait::Reply(server))
+        }
+    });
+    if !exact || !process::probe_started_peer(p, t) {
+        return Err(Error::BadState);
+    }
+    // SAFETY: no interrupt is polled between validation and mutation.
+    // The Arm keeps t alive; its scheduler reference leaves first, which
+    // removes the accepted queue slot and marks its last token dead.
+    unsafe {
+        let heard = (*t.as_ptr()).exit.is_some();
+        if heard {
+            retain(t);
+        }
+        sched::exit(t, cause);
+        drop_buffer(t, cause);
+        process::remove_thread(p, t);
+        let ended = process::thread_exited(p, cause);
+        assert!(!ended, "the reply-loss probe retains a started sibling");
+        if let Some(source) = (*t.as_ptr()).exit.as_mut() {
+            let _ = Source::post(NonNull::from(source), EXIT_BITS, cause);
+        }
+        if heard {
+            release(t, cause);
+        }
+    }
+    Ok(())
+}
+
 /// Whether `t` waits in send, in receive or for a reply (spec 6.1), read
 /// with the scheduler locked: the stage Threads counts its work by it.
 pub fn waits(t: NonNull<Thread>) -> bool {
@@ -815,5 +854,11 @@ pub fn run(next: NonNull<Thread>) -> ! {
 /// Threads whose slots have not gone back.
 #[cfg(feature = "ktest")]
 pub fn in_use() -> usize {
+    LIVE.count()
+}
+
+/// Physical object slots retained by the dedicated native guest.
+#[cfg(feature = "ipc-loss-probe")]
+pub fn probe_in_use() -> usize {
     LIVE.count()
 }

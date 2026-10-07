@@ -375,9 +375,35 @@ pub const IMAGES: &[&str] = &[
 pub fn files_of(name: &str) -> Vec<RootFile> {
     match name {
         "boot-ramfs.img" => ramfs(),
-        "boot-ramfs-cleanup.img" | "boot-loader-abort.img" | "boot-loader-abort-steps.img" => vec![
+        "boot-ramfs-cleanup.img" | "boot-loader-abort.img" | "boot-loader-abort-steps.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-files", 0o755, ROOT, "posix-files"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
+        "boot-posix-files.img" | "boot-posix-files-steps.img" | "boot-posix-files-loss.img" => {
+            let mut files = vec![dir("/dev")];
+            files.extend(devices());
+            files
+        }
+        "boot-image-gates.img"
+        | "boot-image-gates-steps.img"
+        | "boot-image-gates-normal-steps.img" => vec![
             dir("/bin"),
             file("/bin/posix-files", 0o755, ROOT, "posix-files"),
+            of(
+                "/bin/setid-image",
+                0o6755,
+                (37, 43),
+                Source::Variant {
+                    program: "posix-files",
+                    tag: "setid",
+                    extra: 0,
+                },
+            ),
         ],
         "boot-ash-dialog.img" => dialog(),
         "boot-posix-procs.img" | "boot-posix-jobs.img" => procs(),

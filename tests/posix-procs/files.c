@@ -7,6 +7,7 @@
 #include <unistd.h>
 extern int files_fake_identity(void);
 extern int files_full_sessions(void);
+extern int files_open_stages(void);
 #if LOADER_ABORT_PROBE
 #include "loader-abort.c"
 #endif
@@ -32,6 +33,9 @@ int main(void) {
     if (open(name,O_RDONLY) != -1 || errno != ENOENT) return 10;
     name[255]='x'; char over[258]; memcpy(over,name,256);over[256]='x';over[257]=0;errno=0;
     if (open(over,O_RDONLY) != -1 || errno != ENAMETOOLONG) return 11;
+    int staged = files_open_stages();
+    if (staged) { printf("posix-files: staged Open failed %d\n", staged); return 14; }
+    puts("posix-files: staged CREATE/TRUNC cached outcome and hidden fd ok");
     if (files_full_sessions()) return 12;
     puts("posix-files: 16 sessions with 32 retained descriptors ok");
 #if LOADER_ABORT_PROBE
