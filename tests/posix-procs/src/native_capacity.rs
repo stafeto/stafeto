@@ -574,7 +574,7 @@ fn leader(role: i32) -> Result<(), i32> {
         refusal.jobs,
         refusal.root_preparations
     );
-    let result = refusing(f0, if a { ENOSPC } else { EMFILE });
+    let result = refusing(f0, EMFILE);
     rt::println!(
         "capacity-diag: leader={} stage=5 errno={}",
         role,
