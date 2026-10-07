@@ -44,6 +44,150 @@ fn walk(r: &mut Ram<'_>, path: &[u8], identity: Identity) -> Result<Token, u32> 
     job.release(&mut r.storage);
     result
 }
+
+fn intent_ready(
+    r: &mut Ram<'_>,
+    resolver: &mut Resolve,
+    identity: Identity,
+) -> Result<(Progress, usize), u32> {
+    for step in 1..2000 {
+        let progress = resolver.step(&mut r.storage, identity)?;
+        if progress != Progress::More {
+            return Ok((progress, step));
+        }
+    }
+    panic!("bounded intent fixture failed to terminate");
+}
+
+#[test]
+fn create_intent_retains_missing_edge_and_restarts_before_publication() {
+    use crate::resolve::Intent;
+    let mut r = Ram::new(0);
+    let parent = create(&mut r, ROOT, b"parent", DIR, 0o755);
+    let intent = Intent::Open {
+        flags: proto_fs::CREATE | proto_fs::READ_WRITE,
+    };
+    let before = r.storage.node(parent).unwrap().pins;
+    let mut resolver =
+        Resolve::with_intent(&mut r.storage, b"/parent/\xff", ROOT, OWNER, intent).unwrap();
+    let (progress, steps) = intent_ready(&mut r, &mut resolver, OWNER).unwrap();
+    assert_eq!(progress, Progress::Missing(parent));
+    assert!(steps >= crate::storage::DENTRIES / 8);
+    let proof = resolver.result_proof(&r.storage, OWNER, intent).unwrap();
+    assert_eq!(proof.parent, parent);
+    assert_eq!(proof.leaf, b"\xff");
+    assert_eq!(proof.target, None);
+    assert_eq!(resolver.proof(&r.storage, OWNER), Err(proto_fs::PERMISSION));
+    assert!(!proof.trailing_slash);
+    assert!(
+        resolver
+            .result_proof(&r.storage, OWNER, Intent::DirectoryCreate)
+            .is_err()
+    );
+    assert_eq!(
+        r.storage.node(parent).unwrap().pins[Pin::Pending as usize],
+        before[Pin::Pending as usize] + 1
+    );
+    let new = create(&mut r, parent, b"\xff", REG, 0o600);
+    assert!(resolver.result_proof(&r.storage, OWNER, intent).is_err());
+    assert_eq!(resolver.step(&mut r.storage, OWNER), Ok(Progress::More));
+    assert_eq!(
+        intent_ready(&mut r, &mut resolver, OWNER).unwrap().0,
+        Progress::Found(new)
+    );
+    let proof = resolver.result_proof(&r.storage, OWNER, intent).unwrap();
+    assert_eq!(
+        (proof.parent, proof.leaf, proof.target),
+        (parent, b"\xff".as_slice(), Some(new))
+    );
+    resolver.release(&mut r.storage);
+    assert_eq!(r.storage.node(parent).unwrap().pins, before);
+    assert_eq!(r.storage.node(new).unwrap().pins, [0; 5]);
+}
+
+#[test]
+fn create_intent_requires_search_and_absence_only_at_final_component() {
+    use crate::resolve::Intent;
+    let mut r = Ram::new(0);
+    create(&mut r, ROOT, b"denied", DIR, 0);
+    let intent = Intent::Open {
+        flags: proto_fs::CREATE,
+    };
+    for (path, error) in [
+        (b"/absent/child".as_slice(), proto_fs::NO_ENTRY),
+        (b"/absent/", proto_fs::NO_ENTRY),
+        (b"/denied/.", proto_fs::ACCESS_DENIED),
+        (b"/denied/../new", proto_fs::ACCESS_DENIED),
+    ] {
+        let mut resolver = Resolve::with_intent(&mut r.storage, path, ROOT, OWNER, intent).unwrap();
+        assert_eq!(intent_ready(&mut r, &mut resolver, OWNER), Err(error));
+        resolver.release(&mut r.storage);
+    }
+    let mut directory = Resolve::with_intent(
+        &mut r.storage,
+        b"/new/",
+        ROOT,
+        OWNER,
+        Intent::DirectoryCreate,
+    )
+    .unwrap();
+    assert_eq!(
+        intent_ready(&mut r, &mut directory, OWNER).unwrap().0,
+        Progress::Missing(ROOT)
+    );
+    assert!(
+        directory
+            .result_proof(&r.storage, OWNER, Intent::DirectoryCreate)
+            .unwrap()
+            .trailing_slash
+    );
+    directory.release(&mut r.storage);
+    assert_eq!(r.storage.node(ROOT).unwrap().pins, [0; 5]);
+}
+
+#[test]
+fn exclusive_intent_captures_dangling_symlink_and_existing_naming_edge() {
+    use crate::resolve::Intent;
+    let mut r = Ram::new(0);
+    let link = create(&mut r, ROOT, b"dangling", SYMLINK, 0o777);
+    r.storage.write(link, ROOT_ACCOUNT, 0, b"/missing").unwrap();
+    let exclusive = Intent::Open {
+        flags: proto_fs::CREATE | proto_fs::EXCLUSIVE,
+    };
+    for path in [b"/dangling".as_slice(), b"/dangling/"] {
+        let mut resolver =
+            Resolve::with_intent(&mut r.storage, path, ROOT, OWNER, exclusive).unwrap();
+        assert_eq!(
+            intent_ready(&mut r, &mut resolver, OWNER).unwrap().0,
+            Progress::Found(link)
+        );
+        let proof = resolver.result_proof(&r.storage, OWNER, exclusive).unwrap();
+        assert_eq!(
+            (proof.parent, proof.leaf, proof.target),
+            (ROOT, b"dangling".as_slice(), Some(link))
+        );
+        resolver.release(&mut r.storage);
+    }
+    let normal = Intent::Open {
+        flags: proto_fs::CREATE,
+    };
+    let mut resolver =
+        Resolve::with_intent(&mut r.storage, b"/dangling", ROOT, OWNER, normal).unwrap();
+    assert_eq!(
+        intent_ready(&mut r, &mut resolver, OWNER).unwrap().0,
+        Progress::Missing(ROOT)
+    );
+    assert_eq!(
+        resolver
+            .result_proof(&r.storage, OWNER, normal)
+            .unwrap()
+            .leaf,
+        b"missing"
+    );
+    resolver.release(&mut r.storage);
+    assert_eq!(r.storage.node(link).unwrap().pins, [0; 5]);
+    assert_eq!(r.storage.node(ROOT).unwrap().pins, [0; 5]);
+}
 fn who() -> WhoReply {
     WhoReply {
         pid: 300,
@@ -1132,4 +1276,538 @@ fn retrying_binding_cursor_releases_dead_and_superseded_real_captures() {
     ram.release(&mut sessions[1]);
     assert_eq!(ram.open_descriptions(), 0);
     assert_eq!(ram.storage.preparations_used(), 0);
+}
+
+#[test]
+fn creation_binding_and_path_jobs_share_the_session_budget() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let mut charges = [0; 8];
+    for (i, charge) in charges.iter_mut().enumerate() {
+        *charge = ram.storage.charge_preparation(fds.root).unwrap();
+        fds.resolvers[i] = i as u64 + 1;
+    }
+    let mut reservations = std::vec::Vec::new();
+    for i in 0..7 {
+        reservations.push(
+            ram.reserve_create(&mut fds, ROOT, format!("held{i}").as_bytes(), REG)
+                .unwrap(),
+        );
+    }
+    ram.begin_binding(&mut fds).unwrap();
+    assert_eq!(fds.preparation_count(), 16);
+    assert!(!fds.preparation_available());
+    assert!(matches!(
+        ram.reserve_create(&mut fds, ROOT, b"overflow", REG),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    ));
+    assert_eq!(ram.storage.preparations_used(), 16);
+    ram.complete_binding(&mut fds, 0);
+    ram.reserve_create(&mut fds, ROOT, b"replacement", REG)
+        .unwrap();
+    assert_eq!(
+        ram.begin_binding(&mut fds),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    );
+    for (i, charge) in charges.into_iter().enumerate() {
+        ram.storage.release_preparation(charge);
+        fds.resolvers[i] = 0;
+    }
+    while ram.release_step(&mut fds) {}
+    assert_eq!(ram.storage.preparations_used(), 0);
+    assert_eq!(fds.preparation_count(), 0);
+    assert_eq!(ram.storage.node(ROOT).unwrap().pins.iter().sum::<u16>(), 0);
+}
+
+#[test]
+fn paid_creation_transfers_at_full_global_and_root_budgets_once() {
+    let mut ram = Ram::new(0);
+    let other = Root {
+        id: 301,
+        generation: 1,
+    };
+    let mut charges = std::vec::Vec::new();
+    for _ in 0..96 {
+        charges.push(ram.storage.charge_preparation(ROOT_ACCOUNT).unwrap());
+    }
+    for _ in 0..32 {
+        charges.push(ram.storage.charge_preparation(other).unwrap());
+    }
+    let mut paid = charges[0];
+    let renewed = Root {
+        generation: 2,
+        ..ROOT_ACCOUNT
+    };
+    let usage = ram.storage.usage(ROOT_ACCOUNT);
+    assert!(
+        ram.storage
+            .reserve_paid(
+                ROOT_ACCOUNT,
+                ROOT,
+                b"bad/name",
+                (REG, 0o600, 11, 22),
+                &mut paid
+            )
+            .is_err()
+    );
+    assert_eq!(paid, charges[0]);
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT), usage);
+    assert_eq!(ram.storage.preparations_used(), 128);
+    assert!(matches!(
+        ram.storage
+            .reserve_paid(renewed, ROOT, b"wrong", (REG, 0o600, 11, 22), &mut paid),
+        Err(proto_fs::INVALID_ARGUMENT)
+    ));
+    assert_eq!(paid, charges[0]);
+    let r = ram
+        .storage
+        .reserve_paid(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"transferred",
+            (REG, 0o600, 11, 22),
+            &mut paid,
+        )
+        .unwrap();
+    assert_eq!(paid, crate::storage::NONE);
+    assert_eq!(ram.storage.preparations_used(), 128);
+    assert!(matches!(
+        ram.storage.reserve_paid(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"duplicate",
+            (REG, 0o600, 11, 22),
+            &mut paid
+        ),
+        Err(proto_fs::INVALID_ARGUMENT)
+    ));
+    let token = ram.storage.commit_keep_charge(r).unwrap();
+    assert_eq!(ram.storage.lookup(ROOT, b"transferred"), Ok(token));
+    assert_eq!(ram.storage.preparations_used(), 128);
+    assert!(ram.storage.commit_keep_charge(r).is_err());
+    assert!(ram.storage.cancel(r).is_err());
+    assert_eq!(ram.storage.preparations_used(), 128);
+    ram.storage.release_preparation(r.charge());
+    for charge in charges.into_iter().skip(1) {
+        ram.storage.release_preparation(charge);
+    }
+    assert_eq!(ram.storage.preparations_used(), 0);
+    // A retired reservation cannot cancel another generation at the reused place.
+    let mut next = ram.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
+    let replacement = ram
+        .storage
+        .reserve_paid(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"replacement",
+            (REG, 0o600, 11, 22),
+            &mut next,
+        )
+        .unwrap();
+    assert!(ram.storage.cancel(r).is_err());
+    assert_eq!(ram.storage.preparations_used(), 1);
+    ram.storage.cancel(replacement).unwrap();
+    assert!(ram.storage.cancel(replacement).is_err());
+    assert_eq!(ram.storage.preparations_used(), 0);
+    assert_eq!(ram.storage.node(ROOT).unwrap().pins.iter().sum::<u16>(), 0);
+}
+
+#[test]
+fn no_follow_open_still_resolves_a_link_with_a_trailing_slash() {
+    use crate::resolve::Intent;
+    let mut ram = Ram::new(0);
+    let target = create(&mut ram, ROOT, b"target-dir", DIR, 0o755);
+    let link = create(&mut ram, ROOT, b"dir-link", SYMLINK, 0o777);
+    ram.storage
+        .write(link, ROOT_ACCOUNT, 0, b"/target-dir")
+        .unwrap();
+    for (path, expected) in [
+        (b"/dir-link/".as_slice(), target),
+        (b"/dir-link".as_slice(), link),
+    ] {
+        let intent = Intent::Open {
+            flags: proto_fs::NO_FOLLOW,
+        };
+        let mut resolver =
+            Resolve::with_intent(&mut ram.storage, path, ROOT, OWNER, intent).unwrap();
+        assert_eq!(
+            intent_ready(&mut ram, &mut resolver, OWNER).unwrap().0,
+            Progress::Found(expected)
+        );
+        assert_eq!(
+            resolver
+                .result_proof(&ram.storage, OWNER, intent)
+                .unwrap()
+                .target,
+            Some(expected)
+        );
+        resolver.release(&mut ram.storage);
+    }
+    assert_eq!(ram.storage.node(ROOT).unwrap().pins.iter().sum::<u16>(), 0);
+    assert_eq!(
+        ram.storage.node(target).unwrap().pins.iter().sum::<u16>(),
+        0
+    );
+    assert_eq!(ram.storage.node(link).unwrap().pins.iter().sum::<u16>(), 0);
+}
+
+#[test]
+fn tentative_open_prepays_resources_without_exposing_a_descriptor() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let token = create(&mut ram, ROOT, b"prepaid", REG, 0o600);
+    let before = ram.storage.usage(ROOT_ACCOUNT);
+    let held = ram
+        .prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None)
+        .unwrap();
+    assert_eq!(ram.open_descriptions(), 1);
+    assert_eq!(
+        ram.storage.usage(ROOT_ACCOUNT).descriptions,
+        before.descriptions + 1
+    );
+    assert_eq!(fds.numbers().count(), 0);
+    assert_eq!(ram.description_token(&fds, held.fd), Err(proto_fs::BAD_FD));
+    assert!(matches!(
+        ram.clone_fds(&fds, &[held.fd]),
+        Err(proto_fs::BAD_FD)
+    ));
+    assert_eq!(
+        ram.read(&mut fds, held.fd, &mut [0; 1]),
+        Err(proto_fs::BAD_FD)
+    );
+    assert_eq!(ram.write(&mut fds, held.fd, b"x"), Err(proto_fs::BAD_FD));
+    assert_eq!(ram.close(&mut fds, held.fd), Err(proto_fs::BAD_FD));
+    ram.cancel_open(&mut fds, held).unwrap();
+    assert_eq!(ram.cancel_open(&mut fds, held), Err(proto_fs::BAD_FD));
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT), before);
+    let replacement = ram
+        .prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None)
+        .unwrap();
+    assert_eq!(replacement.fd, held.fd);
+    assert_ne!(
+        replacement.description.generation,
+        held.description.generation
+    );
+    assert_eq!(ram.cancel_open(&mut fds, held), Err(proto_fs::BAD_FD));
+    assert_eq!(ram.publish_open(&mut fds, replacement), Ok(replacement.fd));
+    assert_eq!(
+        ram.publish_open(&mut fds, replacement),
+        Err(proto_fs::BAD_FD)
+    );
+    assert_eq!(
+        ram.description_token(&fds, replacement.fd),
+        Ok(replacement.description)
+    );
+    assert_eq!(ram.write(&mut fds, replacement.fd, b"live"), Ok(4));
+    ram.close(&mut fds, replacement.fd).unwrap();
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.node(token).unwrap().pins.iter().sum::<u16>(), 0);
+}
+
+#[test]
+fn created_mode_zero_can_be_prepaid_and_session_cleanup_closes_it_once() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let reservation = ram
+        .storage
+        .reserve(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"mode-zero",
+            (REG, 0, OWNER.uid, OWNER.gid),
+        )
+        .unwrap();
+    assert!(matches!(
+        ram.prepare_open_token(
+            &mut fds,
+            reservation.token,
+            proto_fs::READ_WRITE,
+            OWNER,
+            None
+        ),
+        Err(proto_fs::ACCESS_DENIED)
+    ));
+    let held = ram
+        .prepare_open_token(
+            &mut fds,
+            reservation.token,
+            proto_fs::READ_WRITE | proto_fs::CREATE,
+            OWNER,
+            Some(reservation),
+        )
+        .unwrap();
+    ram.storage.commit(reservation).unwrap();
+    assert_eq!(ram.publish_open(&mut fds, held), Ok(held.fd));
+    assert_eq!(ram.write(&mut fds, held.fd, b"created"), Ok(7));
+    ram.close(&mut fds, held.fd).unwrap();
+    let token = ram.storage.lookup(ROOT, b"mode-zero").unwrap();
+    ram.storage
+        .set_attributes(token, 0o600, OWNER.uid, OWNER.gid)
+        .unwrap();
+    ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None)
+        .unwrap();
+    assert!(ram.release_step(&mut fds));
+    assert!(!ram.release_step(&mut fds));
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.node(token).unwrap().pins.iter().sum::<u16>(), 0);
+    assert_eq!(ram.storage.preparations_used(), 0);
+}
+
+#[test]
+fn tentative_open_failure_and_full_cleanup_preserve_descriptor_accounting() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let token = create(&mut ram, ROOT, b"full-open", REG, 0o600);
+    for _ in 0..32 {
+        ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None)
+            .unwrap();
+    }
+    let before = ram.storage.usage(ROOT_ACCOUNT);
+    assert_eq!(fds.numbers().count(), 0);
+    assert_eq!(ram.open_descriptions(), 32);
+    assert!(matches!(
+        ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None),
+        Err(proto_fs::TOO_MANY_OPEN_FILES)
+    ));
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT), before);
+    assert_eq!(ram.open_descriptions(), 32);
+    for _ in 0..32 {
+        assert!(ram.release_step(&mut fds));
+    }
+    assert!(!ram.release_step(&mut fds));
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT).descriptions, 0);
+    assert_eq!(ram.storage.node(token).unwrap().pins.iter().sum::<u16>(), 0);
+    assert!(matches!(
+        ram.prepare_open_token(
+            &mut fds,
+            token,
+            proto_fs::CREATE | proto_fs::EXCLUSIVE,
+            OWNER,
+            None
+        ),
+        Err(proto_fs::ALREADY_EXISTS)
+    ));
+    let motd = Token {
+        slot: 3,
+        generation: 1,
+    };
+    assert!(matches!(
+        ram.prepare_open_token(&mut fds, motd, proto_fs::WRITE_ONLY, ADMIN, None),
+        Err(proto_fs::READ_ONLY_FILESYSTEM)
+    ));
+    assert_eq!(ram.open_descriptions(), 0);
+}
+
+#[test]
+fn creation_access_requires_a_fresh_exact_reservation_in_its_owner_root() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let r = ram
+        .storage
+        .reserve(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"provenance",
+            (REG, 0o600, OWNER.uid, OWNER.gid),
+        )
+        .unwrap();
+    let other = create(&mut ram, ROOT, b"other", REG, 0o600);
+    let before = ram.storage.usage(ROOT_ACCOUNT);
+    // An unrelated namespace publication makes the old proof stale.
+    assert!(matches!(
+        ram.prepare_open_token(&mut fds, r.token, proto_fs::READ_WRITE, OWNER, Some(r)),
+        Err(proto_fs::STALE_PROOF)
+    ));
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT), before);
+    ram.storage.cancel(r).unwrap();
+    while ram.storage.reclaim_step() {}
+    let r = ram
+        .storage
+        .reserve(
+            ROOT_ACCOUNT,
+            ROOT,
+            b"provenance",
+            (REG, 0o600, OWNER.uid, OWNER.gid),
+        )
+        .unwrap();
+    assert!(matches!(
+        ram.prepare_open_token(&mut fds, other, proto_fs::READ_WRITE, OWNER, Some(r)),
+        Err(proto_fs::PERMISSION)
+    ));
+    let mut foreign_root = Fds {
+        root: Root {
+            id: 301,
+            generation: 1,
+        },
+        ..Fds::default()
+    };
+    assert!(matches!(
+        ram.prepare_open_token(
+            &mut foreign_root,
+            r.token,
+            proto_fs::READ_WRITE,
+            OWNER,
+            Some(r)
+        ),
+        Err(proto_fs::PERMISSION)
+    ));
+    let token = ram.storage.commit(r).unwrap();
+    let fd = ram
+        .open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER)
+        .unwrap();
+    ram.storage
+        .set_attributes(token, 0, OWNER.uid, OWNER.gid)
+        .unwrap();
+    ram.storage
+        .unlink(ROOT, b"provenance", ROOT_ACCOUNT)
+        .unwrap();
+    assert_eq!(ram.storage.node(token).unwrap().links, 0);
+    let before = ram.storage.usage(ROOT_ACCOUNT);
+    assert!(matches!(
+        ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, Some(r)),
+        Err(proto_fs::PERMISSION)
+    ));
+    assert_eq!(ram.storage.usage(ROOT_ACCOUNT), before);
+    // The already authorized description remains usable after unlink and chmod.
+    assert_eq!(ram.write(&mut fds, fd, b"kept"), Ok(4));
+    ram.close(&mut fds, fd).unwrap();
+    while ram.storage.reclaim_step() {}
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.preparations_used(), 0);
+}
+
+#[test]
+fn append_uses_current_eof_and_positioned_write_preserves_flags_and_offset() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let token = create(&mut ram, ROOT, b"append", REG, 0o600);
+    let a = ram
+        .prepare_open_token(
+            &mut fds,
+            token,
+            proto_fs::READ_WRITE | proto_fs::APPEND,
+            OWNER,
+            None,
+        )
+        .unwrap();
+    let a = ram.publish_open(&mut fds, a).unwrap();
+    let b = ram
+        .prepare_open_token(
+            &mut fds,
+            token,
+            proto_fs::READ_WRITE | proto_fs::APPEND,
+            OWNER,
+            None,
+        )
+        .unwrap();
+    let b = ram.publish_open(&mut fds, b).unwrap();
+    let mut child = ram.clone_fds(&fds, &[a]).unwrap();
+    ram.write(&mut fds, a, b"first").unwrap();
+    ram.write(&mut fds, b, b"second").unwrap();
+    assert_eq!(ram.pwrite(&mut fds, a, 0, b"F", 10), Ok(1));
+    assert_eq!(
+        ram.seek_from(&mut fds, a, 0, proto_fs::SeekFrom::Current),
+        Ok(5)
+    );
+    assert_eq!(ram.write(&mut child, a, b"third"), Ok(5));
+    assert_eq!(
+        ram.seek_from(&mut fds, a, 0, proto_fs::SeekFrom::Current),
+        Ok(16)
+    );
+    assert_eq!(
+        ram.seek_from(&mut fds, b, 0, proto_fs::SeekFrom::Current),
+        Ok(11)
+    );
+    let mut bytes = [0; 16];
+    assert_eq!(ram.storage.read(token, 0, &mut bytes), Ok(16));
+    assert_eq!(&bytes, b"Firstsecondthird");
+    assert_eq!(ram.write(&mut fds, b, b""), Ok(0));
+    assert_eq!(
+        ram.seek_from(&mut fds, b, 0, proto_fs::SeekFrom::Current),
+        Ok(11)
+    );
+    // Created regular storage uses the full bound; the old fixed scratch profile is separate.
+    assert_eq!(ram.pwrite(&mut fds, b, 4096, b"sparse", 20), Ok(6));
+    assert_eq!(
+        ram.seek_from(&mut fds, b, 0, proto_fs::SeekFrom::Current),
+        Ok(11)
+    );
+    assert_eq!(ram.write(&mut fds, b, b"tail"), Ok(4));
+    assert_eq!(ram.storage.node(token).unwrap().length, 4106);
+    ram.release(&mut child);
+    ram.release(&mut fds);
+    assert_eq!(ram.open_descriptions(), 0);
+    assert_eq!(ram.storage.node(token).unwrap().pins.iter().sum::<u16>(), 0);
+}
+
+#[test]
+fn created_regular_io_updates_times_only_after_successful_nonempty_transfer() {
+    let mut ram = Ram::new(0);
+    let mut fds = Fds {
+        root: ROOT_ACCOUNT,
+        ..Fds::default()
+    };
+    let token = create(&mut ram, ROOT, b"io-times", REG, 0o600);
+    let held = ram
+        .prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None)
+        .unwrap();
+    let fd = ram.publish_open(&mut fds, held).unwrap();
+    let initial = ram.storage.node(token).unwrap().times;
+    assert_eq!(ram.write_at(&mut fds, fd, b"abc", 10), Ok(3));
+    assert_eq!(ram.storage.node(token).unwrap().times, [initial[0], 10, 10]);
+    assert_eq!(ram.pwrite(&mut fds, fd, 1, b"B", 20), Ok(1));
+    assert_eq!(ram.storage.node(token).unwrap().times, [initial[0], 20, 20]);
+    assert_eq!(ram.write_at(&mut fds, fd, b"", 30), Ok(0));
+    assert_eq!(ram.pwrite(&mut fds, fd, 0, b"", 31), Ok(0));
+    assert_eq!(
+        ram.pwrite(&mut fds, fd, u64::MAX, b"x", 32),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        ram.pwrite(
+            &mut fds,
+            fd,
+            (crate::storage::FILE_PAGES * crate::storage::PAGE) as u64,
+            b"x",
+            33
+        ),
+        Err(proto_fs::NO_SPACE)
+    );
+    assert_eq!(ram.storage.node(token).unwrap().times, [initial[0], 20, 20]);
+    ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    let mut out = [0; 3];
+    assert_eq!(ram.read_at(&mut fds, fd, &mut out, 40), Ok(3));
+    assert_eq!(&out, b"aBc");
+    assert_eq!(ram.storage.node(token).unwrap().times, [40, 20, 20]);
+    assert_eq!(ram.pread(&fds, fd, 0, &mut out, 50), Ok(3));
+    assert_eq!(
+        ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current),
+        Ok(3)
+    );
+    assert_eq!(ram.storage.node(token).unwrap().times, [50, 20, 20]);
+    assert_eq!(ram.read_at(&mut fds, fd, &mut [], 60), Ok(0));
+    assert_eq!(ram.pread(&fds, fd, 0, &mut [], 61), Ok(0));
+    assert_eq!(ram.storage.node(token).unwrap().times, [50, 20, 20]);
+    ram.release(&mut fds);
+    assert_eq!(ram.open_descriptions(), 0);
 }

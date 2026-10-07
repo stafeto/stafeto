@@ -565,3 +565,137 @@ fn directory_base_rejects_a_colliding_regular_description() {
     ram.close(&mut fds, second).unwrap();
     ram.release(&mut fds);
 }
+
+#[test]
+fn full_retired_page_fifo_preserves_every_inode_cleanup_credit() {
+    let mut ram = Ram::new(0);
+    let mut files = std::vec::Vec::new();
+    for i in 0..INODES {
+        let root = if i < INODE_SHARE as usize {
+            FIRST
+        } else {
+            SECOND
+        };
+        let name = format!("retirement-{i}");
+        files.push((root, create(&mut ram, root, name.as_bytes()), name));
+    }
+    let first = files[0].1;
+    let second = files[INODE_SHARE as usize].1;
+    for i in 0..PAGES {
+        let (root, token) = if i < PAGE_SHARE as usize {
+            (FIRST, first)
+        } else {
+            (SECOND, second)
+        };
+        assert_eq!(ram.storage.write(token, root, 0, &[i as u8]), Ok(1));
+        ram.storage.truncate_zero(token, i as u64).unwrap();
+    }
+    assert_eq!(ram.storage.usage(FIRST).pages, PAGE_SHARE);
+    assert_eq!(
+        ram.storage.usage(SECOND).pages as usize,
+        PAGES - PAGE_SHARE as usize
+    );
+    // Empty truncation is valid with all 4096 detached credits already occupied.
+    ram.storage.truncate_zero(first, 5000).unwrap();
+    assert_eq!(
+        ram.storage.write(first, FIRST, 0, b"refused"),
+        Err(NO_SPACE)
+    );
+    assert_eq!(ram.storage.node(first).unwrap().length, 0);
+    for (root, _, name) in &files {
+        ram.storage.unlink(ROOT, name.as_bytes(), *root).unwrap();
+    }
+    let before = ram.storage.usage(FIRST);
+    assert!(ram.storage.reclaim_step());
+    assert_eq!(ram.storage.usage(FIRST).inodes, before.inodes - 1);
+    assert_eq!(ram.storage.usage(FIRST).pages, before.pages);
+    assert!(ram.storage.reclaim_step());
+    assert_eq!(ram.storage.usage(FIRST).inodes, before.inodes - 1);
+    assert_eq!(ram.storage.usage(FIRST).pages, before.pages - 1);
+    let mut steps = 2;
+    while ram.storage.reclaim_step() {
+        steps += 1;
+        assert!(steps <= PAGES + INODES);
+    }
+    assert_eq!(steps, PAGES + INODES);
+    assert_eq!(ram.storage.usage(FIRST), Usage::default());
+    assert_eq!(ram.storage.usage(SECOND), Usage::default());
+    for (_, token, _) in files {
+        assert_eq!(ram.storage.node(token).err(), Some(NO_ENTRY));
+    }
+}
+
+#[test]
+fn retired_pages_never_clear_new_mappings_or_reused_overlay_slots() {
+    let mut ram = Ram::new(0);
+    let old = create(&mut ram, FIRST, b"old");
+    ram.storage.write(old, FIRST, 0, b"old bytes").unwrap();
+    ram.storage.truncate_zero(old, 10).unwrap();
+    ram.storage.write(old, FIRST, 0, b"new bytes").unwrap();
+    assert!(ram.storage.reclaim_step());
+    // Reuse the freed physical page while the first logical page stays live.
+    ram.storage.write(old, FIRST, PAGE, b"second page").unwrap();
+    let mut bytes = [0; 12];
+    assert_eq!(ram.storage.read(old, 0, &mut bytes), Ok(12));
+    assert_eq!(&bytes[..9], b"new bytes");
+    assert_eq!(&bytes[9..], &[0; 3]);
+    ram.storage.truncate_zero(old, 20).unwrap();
+    ram.storage.unlink(ROOT, b"old", FIRST).unwrap();
+    // Inode cleanup wins this turn, while its detached pages retain their root.
+    assert!(ram.storage.reclaim_step());
+    let new = create(&mut ram, SECOND, b"new");
+    assert_eq!(new.slot, old.slot);
+    assert_ne!(new.generation, old.generation);
+    ram.storage.write(new, SECOND, 0, b"replacement").unwrap();
+    while ram.storage.reclaim_step() {}
+    assert_eq!(ram.storage.usage(FIRST), Usage::default());
+    assert_eq!(ram.storage.usage(SECOND).pages, 1);
+    assert_eq!(ram.storage.read(new, 0, &mut bytes), Ok(11));
+    assert_eq!(&bytes[..11], b"replacement");
+    ram.storage.unlink(ROOT, b"new", SECOND).unwrap();
+    assert_eq!(drain(&mut ram), 2);
+    assert_eq!(ram.storage.usage(SECOND), Usage::default());
+}
+
+#[test]
+fn truncation_masks_boot_bytes_and_exhaustion_preserves_live_payload() {
+    let mut ram = Ram::new(0);
+    let motd = Token {
+        slot: 3,
+        generation: 1,
+    };
+    let original_length = ram.storage.node(motd).unwrap().length;
+    ram.storage.truncate_zero(motd, 10).unwrap();
+    // The future extension publishes only its length; the retained backend mask
+    // independently prevents boot bytes returning to sparse holes and new pages.
+    ram.storage.node_mut(motd).unwrap().length = original_length;
+    let mut bytes = [0xff; 16];
+    assert_eq!(
+        ram.storage.read(motd, 0, &mut bytes),
+        Ok(original_length as usize)
+    );
+    assert!(
+        bytes[..original_length as usize]
+            .iter()
+            .all(|&byte| byte == 0)
+    );
+    ram.storage.write(motd, FIRST, 4, b"x").unwrap();
+    ram.storage.read(motd, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes[..5], &[0, 0, 0, 0, b'x']);
+    let token = create(&mut ram, FIRST, b"exhausted");
+    ram.storage.write(token, FIRST, 0, b"kept").unwrap();
+    let before = ram.storage.usage(FIRST);
+    ram.storage.node_mut(token).unwrap().data_generation = u64::MAX;
+    assert_eq!(ram.storage.truncate_zero(token, 100), Err(NO_SPACE));
+    assert_eq!(ram.storage.node(token).unwrap().length, 4);
+    assert_eq!(ram.storage.usage(FIRST), before);
+    assert!(!ram.storage.reclaim_step());
+    ram.storage.node_mut(token).unwrap().data_generation = 1;
+    ram.storage.state.epoch = u64::MAX;
+    assert_eq!(ram.storage.truncate_zero(token, 100), Err(NO_SPACE));
+    assert_eq!(ram.storage.read(token, 0, &mut bytes), Ok(4));
+    assert_eq!(&bytes[..4], b"kept");
+    assert_eq!(ram.storage.node(token).unwrap().data_generation, 1);
+    assert_eq!(ram.storage.usage(FIRST), before);
+    assert!(!ram.storage.reclaim_step());
+}

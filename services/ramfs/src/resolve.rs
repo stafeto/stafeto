@@ -23,12 +23,48 @@ pub struct Resolve {
     epoch: u64,
     pub identity: Identity,
     follow: bool,
+    intent: Intent,
+    edge_parent: Option<Token>,
+    edge_start: usize,
+    edge_end: usize,
+    missing: bool,
     result: Option<Token>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intent {
+    Lookup { follow: bool },
+    Open { flags: u32 },
+    DirectoryCreate,
+}
+impl Intent {
+    fn follows(self) -> bool {
+        match self {
+            Self::Lookup { follow } => follow,
+            Self::Open { flags } => {
+                flags & proto_fs::NO_FOLLOW == 0
+                    && flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE)
+                        != proto_fs::CREATE | proto_fs::EXCLUSIVE
+            }
+            Self::DirectoryCreate => false,
+        }
+    }
+    fn permits_missing(self) -> bool {
+        matches!(self, Self::DirectoryCreate)
+            || matches!(self, Self::Open { flags } if flags & proto_fs::CREATE != 0)
+    }
+}
+/// The exact naming edge remains borrowed from the retained resolver path.
+pub struct ResultProof<'a> {
+    pub parent: Token,
+    pub leaf: &'a [u8],
+    pub target: Option<Token>,
+    pub trailing_slash: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
     More,
     Found(Token),
+    Missing(Token),
 }
 impl Resolve {
     pub fn new(
@@ -37,6 +73,15 @@ impl Resolve {
         base: Token,
         identity: Identity,
         follow: bool,
+    ) -> Result<Self, u32> {
+        Self::with_intent(storage, path, base, identity, Intent::Lookup { follow })
+    }
+    pub fn with_intent(
+        storage: &mut Storage<'_>,
+        path: &[u8],
+        base: Token,
+        identity: Identity,
+        intent: Intent,
     ) -> Result<Self, u32> {
         if path.is_empty() {
             return Err(NO_ENTRY);
@@ -66,7 +111,12 @@ impl Resolve {
             links: 0,
             epoch: storage.state.epoch,
             identity,
-            follow,
+            follow: intent.follows(),
+            intent,
+            edge_parent: None,
+            edge_start: 0,
+            edge_end: 0,
+            missing: false,
             result: None,
         })
     }
@@ -74,6 +124,10 @@ impl Resolve {
         if let Some(result) = self.result.take() {
             storage.unpin(result, Pin::Pending)?;
         }
+        if let Some(parent) = self.edge_parent.take() {
+            storage.unpin(parent, Pin::Pending)?;
+        }
+        self.missing = false;
         self.path = self.original;
         self.length = self.original_len;
         self.current = self.base;
@@ -98,6 +152,11 @@ impl Resolve {
         }
         if let Some(result) = self.result {
             return Ok(Progress::Found(result));
+        }
+        if self.missing {
+            return Ok(Progress::Missing(
+                self.edge_parent.expect("retained missing parent"),
+            ));
         }
         if let Some(link) = self.link.take() {
             if self.links == 32 {
@@ -131,6 +190,9 @@ impl Resolve {
             if self.at == self.length {
                 if self.path[self.length - 1] == b'/'
                     && storage.node(self.current)?.kind != crate::DIR
+                    && !matches!(self.intent, Intent::DirectoryCreate)
+                    && !matches!(self.intent, Intent::Open { flags }
+                        if flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE) == proto_fs::CREATE | proto_fs::EXCLUSIVE)
                 {
                     return Err(NOT_DIRECTORY);
                 }
@@ -145,6 +207,7 @@ impl Resolve {
             if !identity.permits(directory, 1) {
                 return Err(proto_fs::ACCESS_DENIED);
             }
+            let directory_parent = directory.parent;
             self.end = self.at;
             while self.end < self.length && self.path[self.end] != b'/' {
                 self.end += 1;
@@ -154,8 +217,12 @@ impl Resolve {
                 return Err(NAME_TOO_LONG);
             }
             if name == b"." || name == b".." {
-                if name == b".." {
-                    self.current = directory.parent;
+                let parent_component = name == b"..";
+                if self.final_component() {
+                    self.capture_edge(storage)?;
+                }
+                if parent_component {
+                    self.current = directory_parent;
                 }
                 self.at = self.end;
                 return Ok(Progress::More);
@@ -165,6 +232,16 @@ impl Resolve {
         }
         for _ in 0..8 {
             if self.search == storage.entries() {
+                if self.final_component() && self.intent.permits_missing() {
+                    if self.path[self.length - 1] == b'/'
+                        && !matches!(self.intent, Intent::DirectoryCreate)
+                    {
+                        return Err(NO_ENTRY);
+                    }
+                    self.capture_edge(storage)?;
+                    self.missing = true;
+                    return Ok(Progress::Missing(self.current));
+                }
                 return Err(NO_ENTRY);
             }
             let i = self.search;
@@ -173,9 +250,20 @@ impl Resolve {
                 && name == &self.path[self.at..self.end]
             {
                 let node = storage.node(token)?;
-                if node.kind == SYMLINK && (self.follow || self.end < self.length) {
+                if node.kind == SYMLINK
+                    && (self.follow
+                        || !self.final_component()
+                        || (self.end < self.length
+                            && !matches!(self.intent, Intent::DirectoryCreate)
+                            && !matches!(self.intent, Intent::Open { flags }
+                                if flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE)
+                                    == proto_fs::CREATE | proto_fs::EXCLUSIVE)))
+                {
                     self.link = Some(token);
                 } else {
+                    if self.final_component() {
+                        self.capture_edge(storage)?;
+                    }
                     self.current = token;
                     self.at = self.end;
                 }
@@ -185,7 +273,49 @@ impl Resolve {
         }
         Ok(Progress::More)
     }
+    fn final_component(&self) -> bool {
+        self.path[self.end..self.length]
+            .iter()
+            .all(|&byte| byte == b'/')
+    }
+    fn capture_edge(&mut self, storage: &mut Storage<'_>) -> Result<(), u32> {
+        storage.pin(self.current, Pin::Pending)?;
+        if let Some(parent) = self.edge_parent.replace(self.current) {
+            storage.unpin(parent, Pin::Pending)?;
+        }
+        self.edge_start = self.at;
+        self.edge_end = self.end;
+        Ok(())
+    }
+    /// Commit must supply the same operation intent captured at admission.
+    pub fn result_proof(
+        &self,
+        storage: &Storage<'_>,
+        identity: Identity,
+        intent: Intent,
+    ) -> Result<ResultProof<'_>, u32> {
+        if self.epoch != storage.state.epoch || self.identity != identity || self.intent != intent {
+            return Err(STALE_PROOF);
+        }
+        storage.node(self.base)?;
+        let parent = self.edge_parent.or(self.result).ok_or(STALE_PROOF)?;
+        storage.node(parent)?;
+        if let Some(result) = self.result {
+            storage.node(result)?;
+        } else if !self.missing {
+            return Err(STALE_PROOF);
+        }
+        Ok(ResultProof {
+            parent,
+            leaf: &self.path[self.edge_start..self.edge_end],
+            target: self.result,
+            trailing_slash: self.path[self.length - 1] == b'/',
+        })
+    }
     pub fn proof(&self, storage: &Storage<'_>, identity: Identity) -> Result<Token, u32> {
+        if !matches!(self.intent, Intent::Lookup { .. }) {
+            return Err(proto_fs::PERMISSION);
+        }
         if self.epoch != storage.state.epoch || self.identity != identity {
             return Err(STALE_PROOF);
         }
@@ -197,6 +327,9 @@ impl Resolve {
     pub fn release(mut self, storage: &mut Storage<'_>) {
         if let Some(result) = self.result.take() {
             let _ = storage.unpin(result, Pin::Pending);
+        }
+        if let Some(parent) = self.edge_parent.take() {
+            let _ = storage.unpin(parent, Pin::Pending);
         }
         let _ = storage.unpin(self.base, Pin::Pending);
     }

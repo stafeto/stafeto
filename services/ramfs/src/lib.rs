@@ -199,6 +199,8 @@ struct Open {
 #[derive(Clone, Copy)]
 pub struct Fds {
     slots: [Option<u8>; OPEN_MAX],
+    /// Reserved descriptions are paid and held, but are not yet public descriptors.
+    tentative: u32,
     pub claimed: bool,
     pub binding: authority::Binding,
     pub authority_index: u16,
@@ -222,6 +224,7 @@ impl Default for Fds {
     fn default() -> Self {
         Self {
             slots: [None; OPEN_MAX],
+            tentative: 0,
             claimed: false,
             binding: authority::Binding::Unbound,
             authority_index: storage::NONE,
@@ -243,6 +246,15 @@ impl Default for Fds {
 }
 
 impl Fds {
+    /// Binding, path jobs, and unpublished creations share one session budget.
+    pub fn preparation_count(&self) -> usize {
+        self.resolvers.iter().filter(|&&id| id != 0).count()
+            + self.preparations.iter().filter(|p| p.is_some()).count()
+            + usize::from(self.binding_preparation.is_some())
+    }
+    pub fn preparation_available(&self) -> bool {
+        self.preparation_count() < self.resolvers.len()
+    }
     /// Retained references in this session, without authenticating or mutating it.
     #[cfg(feature = "auth-probe")]
     pub fn retained_counts(&self) -> [u32; 5] {
@@ -257,6 +269,9 @@ impl Fds {
     /// The description of `fd`.
     fn description(&self, fd: u32) -> Result<usize, u32> {
         let slot = fd.checked_sub(3).ok_or(BAD_FD)? as usize;
+        if slot >= OPEN_MAX || self.tentative & (1 << slot) != 0 {
+            return Err(BAD_FD);
+        }
         self.slots
             .get(slot)
             .copied()
@@ -270,9 +285,16 @@ impl Fds {
         self.slots
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.is_some())
+            .filter(|(slot, d)| d.is_some() && self.tentative & (1 << slot) == 0)
             .map(|(slot, _)| slot as u32 + 3)
     }
+}
+
+/// Exact ownership of a paid descriptor before its Open result is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TentativeOpen {
+    pub fd: u32,
+    pub description: Token,
 }
 
 /// An open description and the descriptors of all sessions that name it.
@@ -482,6 +504,120 @@ impl<'a> Ram<'a> {
         Ok(slot as u32 + 3)
     }
 
+    /// Prepay every descriptor resource before a namespace or truncation effect.
+    /// A creation's access is authorized by its parent and captured intent.
+    pub fn prepare_open_token(
+        &mut self,
+        fds: &mut Fds,
+        token: Token,
+        flags: u32,
+        identity: authority::Identity,
+        creation: Option<storage::Reservation>,
+    ) -> Result<TentativeOpen, u32> {
+        let allowed = 3
+            | proto_fs::DIRECTORY_ONLY
+            | proto_fs::CREATE
+            | proto_fs::EXCLUSIVE
+            | proto_fs::TRUNCATE
+            | proto_fs::APPEND
+            | proto_fs::NO_FOLLOW;
+        if flags & !allowed != 0 || flags & 3 == 3 {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let created = if let Some(reservation) = creation {
+            if self.storage.reserved_token(reservation, fds.root)? != token {
+                return Err(proto_fs::PERMISSION);
+            }
+            true
+        } else {
+            false
+        };
+        let node = self.storage.node(token)?;
+        let access = flags & 3;
+        if created && node.links != 0 {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        if !created
+            && flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE)
+                == proto_fs::CREATE | proto_fs::EXCLUSIVE
+        {
+            return Err(proto_fs::ALREADY_EXISTS);
+        }
+        if node.kind == storage::SYMLINK {
+            return Err(proto_fs::LOOP);
+        }
+        if flags & proto_fs::DIRECTORY_ONLY != 0 && node.kind != DIR {
+            return Err(proto_fs::NOT_DIRECTORY);
+        }
+        if node.kind == DIR && (access != READ_ONLY || flags & proto_fs::TRUNCATE != 0) {
+            return Err(IS_DIRECTORY);
+        }
+        if node.kind == REG
+            && (access != READ_ONLY || flags & proto_fs::TRUNCATE != 0)
+            && self.read_only_regular(token)?
+        {
+            return Err(proto_fs::READ_ONLY_FILESYSTEM);
+        }
+        let bits = match access {
+            READ_ONLY => 4,
+            WRITE_ONLY => 2,
+            _ => 6,
+        };
+        if !created && !identity.permits(node, bits) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        let fd = self.insert(
+            fds,
+            Open {
+                file: self.file(token),
+                offset: 0,
+                flags: access | (flags & proto_fs::APPEND),
+            },
+        )?;
+        let description = self.description_token(fds, fd)?;
+        fds.tentative |= 1 << (fd - 3);
+        Ok(TentativeOpen { fd, description })
+    }
+    /// Boot regular files and the fixed motd remain immutable until full executable pins.
+    pub fn read_only_regular(&self, token: Token) -> Result<bool, u32> {
+        let node = self.storage.node(token)?;
+        Ok(node.kind == REG && (node.boot != storage::NONE || token.slot == 3))
+    }
+    fn tentative_slot(&self, fds: &Fds, held: TentativeOpen) -> Result<usize, u32> {
+        let slot = held.fd.checked_sub(3).ok_or(BAD_FD)? as usize;
+        if slot >= OPEN_MAX || fds.tentative & (1 << slot) == 0 {
+            return Err(BAD_FD);
+        }
+        let description = fds.slots[slot].ok_or(BAD_FD)? as usize;
+        if held.description.slot as usize != description
+            || !self.descriptions[description]
+                .is_some_and(|d| d.generation == held.description.generation)
+        {
+            return Err(BAD_FD);
+        }
+        Ok(slot)
+    }
+    /// This publication cannot allocate or fail after a successful effect preflight.
+    pub fn publish_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<u32, u32> {
+        let slot = self.tentative_slot(fds, held)?;
+        fds.tentative &= !(1 << slot);
+        Ok(held.fd)
+    }
+    pub fn cancel_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<(), u32> {
+        let slot = self.tentative_slot(fds, held)?;
+        fds.tentative &= !(1 << slot);
+        self.close(fds, held.fd)
+    }
+    fn release_tentative_step(&mut self, fds: &mut Fds) -> bool {
+        if fds.tentative == 0 {
+            return false;
+        }
+        let slot = fds.tentative.trailing_zeros() as usize;
+        fds.tentative &= !(1 << slot);
+        let _ = self.close(fds, slot as u32 + 3);
+        true
+    }
+
     /// Close: the descriptor goes, and its description with the last one
     /// that names it, in any session.
     pub fn close(&mut self, fds: &mut Fds, fd: u32) -> Result<(), u32> {
@@ -510,6 +646,9 @@ impl<'a> Ram<'a> {
         name: &[u8],
         kind: u32,
     ) -> Result<storage::Reservation, u32> {
+        if !fds.preparation_available() {
+            return Err(proto_fs::TOO_MANY_OPEN_FILES);
+        }
         let place = fds
             .preparations
             .iter()
@@ -572,9 +711,7 @@ impl<'a> Ram<'a> {
 
     /// Binding and resolver jobs share the session's sixteen preparation slots.
     pub fn begin_binding(&mut self, fds: &mut Fds) -> Result<(), u32> {
-        if fds.binding_preparation.is_some()
-            || fds.resolvers.iter().filter(|&&id| id != 0).count() >= fds.resolvers.len()
-        {
+        if fds.binding_preparation.is_some() || !fds.preparation_available() {
             return Err(proto_fs::TOO_MANY_OPEN_FILES);
         }
         let root = self.storage.charge_preparation(fds.root)?;
@@ -616,6 +753,9 @@ impl<'a> Ram<'a> {
         }
         if let Some(cwd) = fds.cwd.take() {
             let _ = self.storage.unpin(cwd, Pin::Cwd);
+            return true;
+        }
+        if self.release_tentative_step(fds) {
             return true;
         }
         let first = fds.numbers().next();
@@ -677,6 +817,7 @@ impl<'a> Ram<'a> {
                 let _ = self.storage.cancel(r);
             }
         }
+        while self.release_tentative_step(fds) {}
         let numbers: [Option<u32>; OPEN_MAX] = {
             let mut list = [None; OPEN_MAX];
             for (place, fd) in list.iter_mut().zip(fds.numbers()) {
@@ -816,7 +957,7 @@ impl<'a> Ram<'a> {
     }
 
     fn touch_access(&mut self, file: File, now: u64) {
-        if file.index().is_some() {
+        if file.index().is_some() || matches!(file, File::Node(_) | File::NodeDir(_)) {
             self.storage
                 .node_mut(self.token(file))
                 .expect("live inode")
@@ -1033,7 +1174,7 @@ impl<'a> Ram<'a> {
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
         }
-        if open.flags == WRITE_ONLY {
+        if open.flags & 3 == WRITE_ONLY {
             return Err(BAD_FD);
         }
         if i64::try_from(offset).is_err() || matches!(open.file, File::Random(_)) {
@@ -1054,9 +1195,9 @@ impl<'a> Ram<'a> {
         now: u64,
     ) -> Result<usize, u32> {
         let file = self.get(fds, fd)?.file;
-        let n = self.write(fds, fd, bytes)?;
-        // The null device keeps no times.
-        if n > 0 && file.index().is_some() {
+        let n = self.write_position(fds, fd, bytes, None)?;
+        // Character devices keep no times.
+        if n > 0 && !file.is_device() {
             let node = self.storage.node_mut(self.token(file)).expect("live inode");
             node.times[1] = now;
             node.times[2] = now;
@@ -1074,15 +1215,15 @@ impl<'a> Ram<'a> {
         bytes: &[u8],
         now: u64,
     ) -> Result<usize, u32> {
-        let at = i64::try_from(offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
-        let mut open = self.get(fds, fd)?;
-        let position = open.offset;
-        open.offset = at;
-        self.put(fds, fd, open)?;
-        let written = self.write_at(fds, fd, bytes, now);
-        open.offset = position;
-        self.put(fds, fd, open)?;
-        written
+        i64::try_from(offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
+        let file = self.get(fds, fd)?.file;
+        let n = self.write_position(fds, fd, bytes, Some(offset))?;
+        if n > 0 && !file.is_device() {
+            let node = self.storage.node_mut(self.token(file)).expect("live inode");
+            node.times[1] = now;
+            node.times[2] = now;
+        }
+        Ok(n)
     }
 
     pub fn directory_read(
@@ -1254,7 +1395,7 @@ impl<'a> Ram<'a> {
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
         }
-        if open.flags == WRITE_ONLY {
+        if open.flags & 3 == WRITE_ONLY {
             return Err(BAD_FD);
         }
         if matches!(open.file, File::Random(_)) {
@@ -1269,25 +1410,48 @@ impl<'a> Ram<'a> {
     }
 
     pub fn write(&mut self, fds: &mut Fds, fd: u32, bytes: &[u8]) -> Result<usize, u32> {
+        self.write_position(fds, fd, bytes, None)
+    }
+    /// An explicit position bypasses APPEND and never changes the shared description.
+    fn write_position(
+        &mut self,
+        fds: &mut Fds,
+        fd: u32,
+        bytes: &[u8],
+        position: Option<u64>,
+    ) -> Result<usize, u32> {
         let mut open = self.get(fds, fd)?;
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
         }
-        if open.flags == READ_ONLY || matches!(open.file, File::Motd | File::ImageRegular(_)) {
+        if open.flags & 3 == READ_ONLY || matches!(open.file, File::Motd | File::ImageRegular(_)) {
             return Err(BAD_FD);
         }
         if bytes.is_empty() || open.file.is_device() {
             return Ok(bytes.len());
         }
-        let offset = usize::try_from(open.offset).map_err(|_| NO_SPACE)?;
+        let offset = if let Some(at) = position {
+            usize::try_from(at).map_err(|_| NO_SPACE)?
+        } else if open.flags & proto_fs::APPEND != 0 {
+            self.length(open.file)
+        } else {
+            usize::try_from(open.offset).map_err(|_| NO_SPACE)?
+        };
         let end = offset.checked_add(bytes.len()).ok_or(NO_SPACE)?;
-        if end > FILE_CAPACITY {
+        let capacity = if matches!(open.file, File::Scratch) {
+            FILE_CAPACITY
+        } else {
+            storage::FILE_PAGES * storage::PAGE
+        };
+        if end > capacity {
             return Err(NO_SPACE);
         }
         self.storage
             .write(self.token(open.file), fds.root, offset, bytes)?;
-        open.offset = end as i64;
-        self.put(fds, fd, open)?;
+        if position.is_none() {
+            open.offset = end as i64;
+            self.put(fds, fd, open)?;
+        }
         Ok(bytes.len())
     }
 }
