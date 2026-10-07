@@ -783,6 +783,15 @@ mod concurrent_create_retry_tests {
 
     #[test]
     fn two_root_creation_refreshes_stale_proof_with_same_paid_admission() {
+        interleaved_creates(true);
+    }
+
+    #[test]
+    fn stale_between_resolve_and_prepare_retains_the_same_paid_admission() {
+        interleaved_creates(false);
+    }
+
+    fn interleaved_creates(fully_prepared: bool) {
         let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
         let identities = [
             Identity {
@@ -841,6 +850,7 @@ mod concurrent_create_retry_tests {
                         &mut charges[i],
                     )
                     .unwrap()
+                    || (i == 1 && !fully_prepared)
                 {
                     break;
                 }
