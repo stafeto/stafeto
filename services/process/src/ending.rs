@@ -178,6 +178,10 @@ impl Processes {
                 if self.records.end_reason(journal.key).is_none() {
                     let record = self.records.get(index).expect("the exact ended record");
                     if let Ok(state) = sys::process_state(&record.process)
+                        && !matches!(
+                            state,
+                            abi::ProcessState::Alive | abi::ProcessState::Unknown(_)
+                        )
                         && let Some(reason) = End::of(state)
                     {
                         self.records.mark_end_pending(journal.key, Some(reason));
