@@ -23,6 +23,46 @@ pub enum BindingPurpose {
     Audit,
 }
 
+/// A retained source advances its own refresh through maintenance.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RetainedSourcePhase {
+    WaitRefresh,
+    Authenticate,
+    Ready,
+}
+impl RetainedSourcePhase {
+    /// Waiting destinations let maintenance reach the retained source.
+    pub fn progresses(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
+/// A reused label or an unrelated preparation cannot enter the refresh wait.
+pub fn retained_source_phase(
+    expected_label: u64,
+    actual_label: u64,
+    has_preparation: bool,
+    purpose: Option<BindingPurpose>,
+    current_generation: u64,
+    creator_generation: u64,
+) -> Result<RetainedSourcePhase, u32> {
+    if expected_label != actual_label {
+        return Err(proto_fs::PERMISSION);
+    }
+    if has_preparation {
+        return if purpose == Some(BindingPurpose::Refresh) {
+            Ok(RetainedSourcePhase::WaitRefresh)
+        } else {
+            Err(proto_fs::PERMISSION)
+        };
+    }
+    if current_generation != creator_generation {
+        Ok(RetainedSourcePhase::Authenticate)
+    } else {
+        Ok(RetainedSourcePhase::Ready)
+    }
+}
+
 /// Only a canonical refusal from the genuine notary proves an invalid owner.
 pub enum NotaryReply<const N: usize> {
     Wire([u8; N]),
@@ -427,5 +467,48 @@ impl Identity {
                 0
             };
         (kind, mode, self.uid, gid)
+    }
+}
+
+#[cfg(test)]
+mod retained_source_tests {
+    use super::*;
+
+    #[test]
+    fn retained_wait_requires_the_exact_birth_and_refresh_authority() {
+        for purpose in [
+            None,
+            Some(BindingPurpose::Candidate),
+            Some(BindingPurpose::Audit),
+        ] {
+            assert_eq!(
+                retained_source_phase(19, 19, true, purpose, 7, 7),
+                Err(proto_fs::PERMISSION)
+            );
+        }
+        assert_eq!(
+            retained_source_phase(19, 20, true, Some(BindingPurpose::Refresh), 7, 7),
+            Err(proto_fs::PERMISSION)
+        );
+        assert_eq!(
+            retained_source_phase(19, 19, true, Some(BindingPurpose::Refresh), 7, 7),
+            Ok(RetainedSourcePhase::WaitRefresh)
+        );
+    }
+
+    #[test]
+    fn a_changed_generation_reauthenticates_before_transfer() {
+        assert_eq!(
+            retained_source_phase(19, 19, false, None, 8, 7),
+            Ok(RetainedSourcePhase::Authenticate)
+        );
+        assert_eq!(
+            retained_source_phase(19, 19, false, None, proto_process::GENERATION_DEAD, 7),
+            Ok(RetainedSourcePhase::Authenticate)
+        );
+        assert_eq!(
+            retained_source_phase(19, 19, false, None, 7, 7),
+            Ok(RetainedSourcePhase::Ready)
+        );
     }
 }
