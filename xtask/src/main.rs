@@ -1228,8 +1228,16 @@ fn main() {
         Some("ramfs-cleanup") => ramfs_cleanup_probe(),
         Some("ramfs-gc") => ramfs_gc_probe(),
         Some("image-gates") => image_gates_probe(false, false),
-        Some("t6-runtime-gates") => t6_runtime_probe(false),
-        Some("t6-runtime-gates-steps") => t6_runtime_probe(true),
+        Some("t6-runtime-gates") => match &args[1..] {
+            [] => t6_runtime_probe(false, false),
+            [flag] if flag == "--build" => t6_runtime_probe(false, true),
+            _ => Err("usage: cargo xtask t6-runtime-gates [--build]".into()),
+        },
+        Some("t6-runtime-gates-steps") => match &args[1..] {
+            [] => t6_runtime_probe(true, false),
+            [flag] if flag == "--build" => t6_runtime_probe(true, true),
+            _ => Err("usage: cargo xtask t6-runtime-gates-steps [--build]".into()),
+        },
         Some("image-gates-steps") => image_gates_probe(true, false),
         Some("image-gates-normal-steps") => image_gates_probe(true, true),
         Some("loader-abort") => loader_abort_probe(false),
@@ -2823,7 +2831,7 @@ fn ramfs_gc_probe() -> Result<(), String> {
 }
 
 /// Runtime custody uses a writable dynamic ELF and three independently paid images.
-fn t6_runtime_probe(measured: bool) -> Result<(), String> {
+fn t6_runtime_probe(measured: bool, build_only: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     const PROGRAMS: [ImageProgram; 7] = [
@@ -2878,6 +2886,9 @@ fn t6_runtime_probe(measured: bool) -> Result<(), String> {
         return Err(format!(
             "runtime fixture RAM maps {pages} pages; remeasure its quota to preserve 128 allowance"
         ));
+    }
+    if build_only {
+        return Ok(());
     }
     let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     command.args(qemu::HEADLESS);
