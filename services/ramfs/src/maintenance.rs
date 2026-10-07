@@ -180,3 +180,13 @@ mod debt_tests {
         assert_eq!(cursor, 0);
     }
 }
+
+/// A mapped or owned INTO debt keeps the exact image pin and root expenditure.
+pub fn retained_release_step(
+    ram: &mut crate::Ram<'_>,
+    fds: &mut crate::Fds,
+    label: u64,
+    window_owner: Option<u64>,
+) -> bool {
+    window_owner == Some(label) || ram.release_step(fds)
+}

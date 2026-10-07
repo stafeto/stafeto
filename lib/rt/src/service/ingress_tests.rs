@@ -18,6 +18,7 @@ struct Fixture {
     deferred: Option<Token>,
     mode: u8,
     tail_visits: u8,
+    maintenance_visits: usize,
 }
 impl Service<0> for Fixture {
     const VERSION: u16 = 1;
@@ -47,6 +48,11 @@ impl Service<0> for Fixture {
         } else {
             TailProgress::Continue
         }
+    }
+    fn request_maintenance(&mut self, _: &mut [Option<Session<Data, 0>>], protected: u64) {
+        assert_eq!(protected, 0);
+        self.maintenance_visits += 1;
+        let _ = sys::notify(&Handle::borrowed(abi::Handle::new(99, 1)), 1);
     }
     fn request(&mut self, _: &mut Session<Data, 0>, r: &mut Request<'_>) -> Answer {
         self.requests += 1;
@@ -459,4 +465,36 @@ fn explicit_four_byte_writer_reply_preserves_its_existing_length() {
     );
     settle(&mut s, &mut current);
     assert_eq!(test_calls::log()[0].1[1], 4);
+}
+
+#[test]
+fn ongoing_loan_runs_distinct_fair_maintenance_before_each_fifo_yield_and_final_reply() {
+    let mut service = Fixture {
+        mode: 2,
+        tail_visits: 3,
+        ..Default::default()
+    };
+    let mut table = [None];
+    let mut buffer = [0; INLINE_MAX];
+    let mut loan = [0; 11];
+    let mut calls = Vec::new();
+    for _ in 0..3 {
+        calls.push((Call::Yield.number(), None)); // Actual loan operation.
+        calls.push((Call::Notify.number(), None)); // Actual maintenance operation.
+        calls.push((Call::Yield.number(), None)); // FIFO handoff.
+    }
+    calls.push((Call::Reply.number(), None));
+    test_calls::expect(calls);
+    let mut current = dispatch(
+        &mut service,
+        &mut table,
+        received(0, &Header::new(15, 1).bytes(), &[]),
+        &mut buffer,
+    );
+    current.request.loan = Some(&mut loan);
+    current.finish(&mut service, &mut table, 15);
+    assert_eq!(service.maintenance_visits, 3);
+    assert!(current.request.token.is_none());
+    assert_eq!(test_calls::log().last().unwrap().0, Call::Reply.number());
+    test_calls::complete();
 }

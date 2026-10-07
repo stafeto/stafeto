@@ -117,6 +117,16 @@ pub trait Service<const K: usize> {
         TailProgress::Idle
     }
 
+    /// One separately measured maintenance operation between current loan visits.
+    /// The exact protected owner retains its immutable request context.
+    fn request_maintenance(
+        &mut self,
+        sessions: &mut [Option<Session<Self::Data, K>>],
+        protected: u64,
+    ) {
+        let _ = (sessions, protected);
+    }
+
     /// A scheduling handoff after a measured notification dispatch has ended.
     /// A service with a queue of own cursor notices may yield to FIFO peers here.
     fn between_notifications(&mut self, notice: Notice) {
@@ -201,9 +211,26 @@ pub struct Request<'a> {
     pub handles: Incoming,
     token: Option<Token>,
     reply: Option<Writer>,
+    loan: Option<&'a mut [u64; 11]>,
 }
 
 impl<'a> Request<'a> {
+    /// CPU state borrowed from the sole bounded current ingress frame.
+    pub fn loan(&mut self) -> Option<&mut [u64; 11]> {
+        self.loan.as_deref_mut()
+    }
+
+    /// Operate on CPU loan state and request owners without extending either borrow.
+    pub fn with_loan<R>(
+        &mut self,
+        operation: impl FnOnce(&mut Self, &mut [u64; 11]) -> R,
+    ) -> Option<R> {
+        let words = self.loan.take()?;
+        let result = operation(self, words);
+        self.loan = Some(words);
+        Some(result)
+    }
+
     /// The label of the handle the request came through.
     pub fn label(&self) -> u64 {
         self.label
@@ -468,10 +495,12 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 #[cfg(not(feature = "step-stats"))]
                 let began = steps::begin();
                 if S::BOUNDED_INGRESS {
+                    let mut loan = [0; 11];
                     let mut current = CurrentRequest::new(label, bytes, handles, token);
+                    current.request.loan = Some(&mut loan);
                     request(service, table, config.issued, &mut current);
                     steps::end(began, kind);
-                    current.finish(service, kind);
+                    current.finish(service, table, kind);
                     let began = time::now();
                     steps::own();
                     steps::detail(4); // Terminal CPU disposal of the empty current loan.
@@ -747,6 +776,7 @@ impl<'a> CurrentRequest<'a> {
                 handles,
                 token: Some(token),
                 reply: None,
+                loan: None,
             },
             held: None,
             cursor: 0,
@@ -808,23 +838,31 @@ impl<'a> CurrentRequest<'a> {
         }) || (*drain_back && !outgoing.is_empty())
     }
 
-    fn finish<S: Service<K>, const K: usize>(&mut self, service: &mut S, kind: usize) {
-        crate::retention::continuations(
-            || {
-                let began = time::now();
-                steps::own();
-                let retry = self.step(service);
-                steps::end(began, kind);
-                retry
-            },
-            || {
-                let began = time::now();
-                steps::own();
-                steps::detail(3); // Separate FIFO yield.
-                let _ = sys::yield_now();
-                steps::end(began, kind);
-            },
-        );
+    fn finish<S: Service<K>, const K: usize>(
+        &mut self,
+        service: &mut S,
+        sessions: &mut [Option<Session<S::Data, K>>],
+        kind: usize,
+    ) {
+        loop {
+            let began = time::now();
+            steps::own();
+            let retry = self.step(service);
+            steps::end(began, kind);
+            if !retry {
+                break;
+            }
+            let began = time::now();
+            steps::own();
+            steps::detail(5); // Separate fair maintenance during the current loan.
+            service.request_maintenance(sessions, self.request.label);
+            steps::end(began, kind);
+            let began = time::now();
+            steps::own();
+            steps::detail(3); // Separate FIFO yield.
+            let _ = sys::yield_now();
+            steps::end(began, kind);
+        }
     }
 }
 
@@ -900,6 +938,7 @@ fn legacy_request<S: Service<K>, const K: usize>(
         handles,
         token: Some(token),
         reply: None,
+        loan: None,
     };
     let answer = service.request(s, &mut r);
     let Some(token) = r.token.take() else {

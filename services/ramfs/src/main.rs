@@ -260,6 +260,7 @@ fn main(_: u64) -> u64 {
 }
 
 type IntoWindow = rt::retention::Window<Handle<Memory>>;
+const _: () = assert!(core::mem::size_of::<IntoWindow>() == 40);
 
 struct Fs {
     /// The unique INTO resource keeps its paid mapping owner through failed unmap.
@@ -533,15 +534,12 @@ impl Fs {
                 .unlink(ramfs::storage::ROOT, b"auth-probe-gc", fds.root);
             return true;
         }
-        if self.ram.release_step(fds) {
-            return true;
-        }
-        // Window custody keeps the corresponding identity until unmap and close settle.
-        if self
-            .into_window
-            .as_ref()
-            .is_some_and(|window| window.owner == label)
-        {
+        if ramfs::maintenance::retained_release_step(
+            &mut self.ram,
+            fds,
+            label,
+            self.into_window.as_ref().map(|window| window.owner),
+        ) {
             return true;
         }
         if !Ram::references_released(fds) {
@@ -1042,22 +1040,21 @@ impl Fs {
                     return Answer::Status(Status::BadSize);
                 };
                 let rights = Rights::MAP_READ | Rights::MAP_WRITE;
-                let writable = matches!(r.handles.info(0), Some((rt::abi::ObjectKind::Memory, got)) if got.contains(rights));
-                let handles = r.handles.len();
-                if body.finish().is_err() {
+                if body.finish().is_err()
+                    || count as usize > proto_fs::READ_INTO_MAX
+                    || r.handles.len() != 1
+                    || !matches!(r.handles.info(0), Some((abi::ObjectKind::Memory, got)) if got.contains(rights))
+                {
                     return Answer::Status(Status::BadSize);
                 }
-                let Ok(memory) = r.handles.take::<Memory>(0) else {
-                    return Answer::Status(Status::BadSize);
+                let Some(image) = fds.image_hold else {
+                    return status(proto_fs::BAD_FD);
                 };
-                let size = sys::memory_info(&memory).map_or(0, |i| i.size);
-                if !ramfs::read_into_valid(fd, count as usize, at, handles, writable, size) {
-                    return Answer::Status(Status::BadSize);
-                }
-                match self.read_into(fds, r.label(), offset, count as usize, memory, at) {
-                    Ok(n) => value(r, n as u32),
-                    Err(answer) => answer,
-                }
+                let Some(words) = r.loan() else {
+                    return Answer::Status(Status::Kernel(abi::Error::BadState));
+                };
+                ramfs::read_into::Loan::new(words).begin(fd, count, offset, at, image);
+                Answer::Reply(Outgoing::new())
             }
             Some(Method::ReadAt) => {
                 let (Ok(fd), Ok(offset), Ok(count)) = (body.u32(), body.u64(), body.u32()) else {
@@ -1135,51 +1132,6 @@ impl Fs {
             }
             _ => status(proto_fs::PERMISSION),
         }
-    }
-}
-
-impl Fs {
-    /// READ_INTO: `count` bytes of the retained inode from `offset` into
-    /// `memory` from `at`, through the window INTO of the service's own
-    /// space, mapped for the copy alone: the count copied.
-    fn read_into(
-        &mut self,
-        fds: &Fds,
-        owner: u64,
-        offset: u64,
-        count: usize,
-        memory: Handle<Memory>,
-        at: u64,
-    ) -> Result<usize, Answer> {
-        if self.into_window.is_some() {
-            return Err(status(proto_fs::RESOLVING));
-        }
-        if count == 0 {
-            return Ok(0);
-        }
-        let len = (count as u64).next_multiple_of(4096);
-        sys::mem_map(&self.process, &memory, at, len, INTO, Access::ReadWrite)
-            .map_err(|e| Answer::Status(Status::Kernel(e)))?;
-        self.into_window = Some(IntoWindow {
-            owner,
-            memory: Some(memory),
-            length: len,
-            mapped: true,
-        });
-        // SAFETY: the window maps `len` bytes of the object, which only this
-        // step touches until the unmap below.
-        let out = unsafe { core::slice::from_raw_parts_mut(INTO as *mut u8, count) };
-        let read = self.ram.held_image_read(fds, offset, out);
-        // SAFETY: the mapping made above, which nothing uses now.
-        match unsafe { sys::mem_unmap(&self.process, INTO, len) } {
-            Ok(()) => self.into_window.as_mut().expect("mapped owner").mapped = false,
-            Err(error) => {
-                let _ = sys::notify(&self.channel, 1);
-                return Err(Answer::Status(Status::Kernel(error)));
-            }
-        }
-        let _ = sys::notify(&self.channel, 1);
-        read.map_err(status)
     }
 }
 
@@ -1530,95 +1482,24 @@ impl Service<0> for Fs {
         sessions: &mut [Option<Session<Fds, 0>>],
         notice: rt::service::Notice,
     ) {
-        if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
-            let _ = sys::notify(&self.channel, 1);
-            return;
-        }
-        rt::service::step_own();
-        let now = rt::time::ticks_to_ns(rt::time::now());
-        if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
-            self.next_audit_ns = now.saturating_add(250_000_000);
-            self.maintenance.remaining = SESSIONS + BIRTHS - 1;
-        }
-        let mut work = false;
-        self.maintenance_jobs = !self.maintenance_jobs;
-        if self.maintenance_jobs {
-            self.data_gc_turn = !self.data_gc_turn;
-            if self.data_gc_turn && (self.orphan_count != 0 || self.into_window.is_some()) {
-                let slot = ramfs::maintenance::debt_turn(
-                    &mut self.orphan_cursor,
-                    ramfs::storage::PREPARATIONS,
-                );
-                if slot == ramfs::storage::PREPARATIONS {
-                    self.window_cleanup_step();
-                    work = true;
-                } else if let Some(job) = self.jobs[slot].as_ref().filter(|job| job.abandoned) {
-                    let (id, owner) = (job.id, job.owner);
-                    self.cancel_job(id, owner, None);
-                    work = true;
-                }
-            } else {
-                #[cfg(feature = "full-capacity-probe")]
-                let paused = self.capacity_retired_gate.is_some_and(|gate| gate.paused());
-                #[cfg(not(feature = "full-capacity-probe"))]
-                let paused = false;
-                if !paused {
-                    work = self.ram.storage.reclaim_step();
-                }
-            }
-            if work
-                || self.maintenance.remaining != 0
-                || self.orphan_count != 0
-                || self.into_window.is_some()
-            {
-                let _ = sys::notify(&self.channel, 1);
-            }
-            return;
-        }
-        let mut client_work = false;
-        let mut closing_visit = false;
-        let i = self.maintenance.position;
-        if i < SESSIONS {
-            if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
-                let label = s.label();
-                client_work = self.cleanup_step(&mut s.data, label);
-                closing_visit = s.data.closing;
-                if s.data.closing && self.closed_terminal(&s.data, label) {
-                    self.places.release(label);
-                    self.clones.gone(label);
-                    sessions[i] = None;
-                }
-            }
-        } else if self.births[i - SESSIONS]
-            .as_ref()
-            .is_some_and(|(_, data)| matches!(data, BirthData::Cloning(_)))
-        {
-            self.clone_birth_step(i - SESSIONS);
-            self.maintenance.complete_clone(SESSIONS + BIRTHS);
-            self.clone_wake = true;
-            return;
-        } else if let Some((label, data)) = self.births[i - SESSIONS].take() {
-            let mut fds = data.into_ready();
-            client_work = self.cleanup_step(&mut fds, label);
-            closing_visit = fds.closing;
-            if fds.closing && self.closed_terminal(&fds, label) {
-                self.places.release(label);
-                self.clones.gone(label);
-            } else {
-                self.births[i - SESSIONS] = Some((label, BirthData::Ready(fds)));
-            }
-        }
-        work |= client_work;
-        self.maintenance
-            .complete_client(client_work, closing_visit, SESSIONS + BIRTHS);
-        // A maintenance notification makes reclamation progress with no client request.
-        if work
-            || self.maintenance.remaining != 0
-            || self.orphan_count != 0
-            || self.into_window.is_some()
-        {
-            let _ = sys::notify(&self.channel, 1);
-        }
+        self.cursor_maintenance(sessions, notice, None);
+    }
+
+    fn request_maintenance(&mut self, sessions: &mut [Option<Session<Fds, 0>>], protected: u64) {
+        self.cursor_maintenance(
+            sessions,
+            rt::service::Notice {
+                source: abi::Source::Unlabeled,
+                label: 0,
+                bits: 1,
+                count: 1,
+            },
+            Some(protected),
+        );
+    }
+
+    fn request_tail(&mut self, request: &mut Request<'_>) -> rt::service::TailProgress {
+        self.read_into_step(request)
     }
 
     fn continuation_step(&mut self) -> bool {
@@ -4612,5 +4493,243 @@ impl Fs {
         }
         let identity = fds.binding.identity(j.real)?;
         Ok((j.path().resolver.proof(&self.ram.storage, identity)?, None))
+    }
+}
+
+impl Fs {
+    fn cursor_maintenance(
+        &mut self,
+        sessions: &mut [Option<Session<Fds, 0>>],
+        notice: rt::service::Notice,
+        protected: Option<u64>,
+    ) {
+        if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
+            self.clone_wake = true;
+            return;
+        }
+        rt::service::step_own();
+        let now = rt::time::ticks_to_ns(rt::time::now());
+        if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
+            self.next_audit_ns = now.saturating_add(250_000_000);
+            self.maintenance.remaining = SESSIONS + BIRTHS - 1;
+        }
+        let mut work = false;
+        self.maintenance_jobs = !self.maintenance_jobs;
+        if self.maintenance_jobs {
+            self.data_gc_turn = !self.data_gc_turn;
+            if self.data_gc_turn && (self.orphan_count != 0 || self.into_window.is_some()) {
+                let slot = ramfs::maintenance::debt_turn(
+                    &mut self.orphan_cursor,
+                    ramfs::storage::PREPARATIONS,
+                );
+                if slot == ramfs::storage::PREPARATIONS {
+                    if self
+                        .into_window
+                        .as_ref()
+                        .is_some_and(|window| Some(window.owner) != protected)
+                    {
+                        self.window_cleanup_step();
+                    }
+                    work = true;
+                } else if let Some(job) = self.jobs[slot].as_ref().filter(|job| job.abandoned) {
+                    let (id, owner) = (job.id, job.owner);
+                    self.cancel_job(id, owner, None);
+                    work = true;
+                }
+            } else {
+                #[cfg(feature = "full-capacity-probe")]
+                let paused = self.capacity_retired_gate.is_some_and(|gate| gate.paused());
+                #[cfg(not(feature = "full-capacity-probe"))]
+                let paused = false;
+                if !paused {
+                    work = self.ram.storage.reclaim_step();
+                }
+            }
+            if work
+                || self.maintenance.remaining != 0
+                || self.orphan_count != 0
+                || self.into_window.is_some()
+            {
+                self.clone_wake = true;
+            }
+            return;
+        }
+        let mut client_work = false;
+        let mut closing_visit = false;
+        let i = self.maintenance.position;
+        if i < SESSIONS {
+            if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut)
+                && Some(s.label()) != protected
+            {
+                let label = s.label();
+                client_work = self.cleanup_step(&mut s.data, label);
+                closing_visit = s.data.closing;
+                if s.data.closing && self.closed_terminal(&s.data, label) {
+                    self.places.release(label);
+                    self.clones.gone(label);
+                    sessions[i] = None;
+                }
+            }
+        } else if self.births[i - SESSIONS]
+            .as_ref()
+            .is_some_and(|(_, data)| matches!(data, BirthData::Cloning(_)))
+        {
+            self.clone_birth_step(i - SESSIONS);
+            self.maintenance.complete_clone(SESSIONS + BIRTHS);
+            self.clone_wake = true;
+            return;
+        } else if self.births[i - SESSIONS]
+            .as_ref()
+            .is_some_and(|(label, _)| Some(*label) == protected)
+        {
+            // Preserve only this exact current image context.
+        } else if let Some((label, data)) = self.births[i - SESSIONS].take() {
+            let mut fds = data.into_ready();
+            client_work = self.cleanup_step(&mut fds, label);
+            closing_visit = fds.closing;
+            if fds.closing && self.closed_terminal(&fds, label) {
+                self.places.release(label);
+                self.clones.gone(label);
+            } else {
+                self.births[i - SESSIONS] = Some((label, BirthData::Ready(fds)));
+            }
+        }
+        work |= client_work;
+        self.maintenance
+            .complete_client(client_work, closing_visit, SESSIONS + BIRTHS);
+        // A maintenance notification makes reclamation progress with no client request.
+        if work
+            || self.maintenance.remaining != 0
+            || self.orphan_count != 0
+            || self.into_window.is_some()
+        {
+            self.clone_wake = true;
+        }
+    }
+}
+
+impl Fs {
+    fn read_into_step(&mut self, request: &mut Request<'_>) -> rt::service::TailProgress {
+        request
+            .with_loan(|request, words| self.read_into_loan(request, words))
+            .unwrap_or(rt::service::TailProgress::Idle)
+    }
+
+    fn read_into_loan(
+        &mut self,
+        request: &mut Request<'_>,
+        words: &mut [u64; 11],
+    ) -> rt::service::TailProgress {
+        use ramfs::read_into::{Loan, Progress};
+        let mut loan = Loan::new(words);
+        rt::service::step_detail(16 + loan.phase() as u64);
+        let mut effects = IntoEffects { fs: self, request };
+        match loan.step(&mut effects) {
+            Progress::Idle => rt::service::TailProgress::Idle,
+            Progress::Continue => rt::service::TailProgress::Continue,
+            Progress::Finish { code, count } => {
+                let writer = effects.request.reply();
+                writer
+                    .u32(code)
+                    .and_then(|()| writer.u32(count))
+                    .expect("bounded reply bytes");
+                rt::service::TailProgress::Idle
+            }
+        }
+    }
+}
+
+struct IntoEffects<'a, 'b> {
+    fs: &'a mut Fs,
+    request: &'a mut Request<'b>,
+}
+impl ramfs::read_into::Effects for IntoEffects<'_, '_> {
+    fn info(&mut self) -> u64 {
+        self.request
+            .handles
+            .with_view::<Memory, _>(0, sys::memory_info)
+            .ok()
+            .and_then(Result::ok)
+            .map_or(0, |info| info.size)
+    }
+    fn incoming(&self) -> usize {
+        self.request.handles.len()
+    }
+    fn busy(&self) -> bool {
+        self.fs.into_window.is_some()
+    }
+    fn admit(&mut self, count: usize) {
+        let memory = self
+            .request
+            .handles
+            .take::<Memory>(0)
+            .expect("checked incoming memory");
+        self.fs.into_window = Some(IntoWindow {
+            owner: self.request.label(),
+            memory: Some(memory),
+            length: (count as u64).next_multiple_of(4096),
+            mapped: false,
+        });
+    }
+    fn map(&mut self, at: u64) -> Result<(), (u32, bool)> {
+        let window = self.fs.into_window.as_mut().expect("current window owner");
+        assert_eq!(window.owner, self.request.label());
+        match sys::mem_map(
+            &self.fs.process,
+            window.memory.as_ref().expect("owned memory"),
+            at,
+            window.length,
+            INTO,
+            Access::ReadWrite,
+        ) {
+            Ok(()) => {
+                window.mapped = true;
+                Ok(())
+            }
+            Err(error) => {
+                window.mapped = matches!(error, abi::Error::Unknown(_));
+                Err((Status::Kernel(error).code(), window.mapped))
+            }
+        }
+    }
+    fn copy(
+        &mut self,
+        image: ramfs::image::ImageHold,
+        offset: u64,
+        copied: usize,
+        remaining: usize,
+    ) -> Result<(usize, usize), u32> {
+        let count = self
+            .fs
+            .ram
+            .storage
+            .read_chunk(image.token, offset, remaining)?;
+        // SAFETY: only the current loan accesses its exact mapped INTO window.
+        // count is bounded by remaining and source physical and logical pages.
+        let out = unsafe { core::slice::from_raw_parts_mut((INTO as *mut u8).add(copied), count) };
+        self.fs
+            .ram
+            .storage
+            .read(image.token, offset, out)
+            .map(|n| (n, count))
+    }
+    fn unmap(&mut self) -> Result<(), u32> {
+        let window = self.fs.into_window.as_mut().expect("current mapped owner");
+        // SAFETY: the exact singleton mapping stays owned until this call succeeds.
+        unsafe { sys::mem_unmap(&self.fs.process, INTO, window.length) }
+            .map(|()| window.mapped = false)
+            .map_err(|error| Status::Kernel(error).code())
+    }
+    fn close(&mut self) -> bool {
+        let window = self.fs.into_window.as_mut().expect("current memory owner");
+        if Handle::close_retained(&mut window.memory).is_err() {
+            return false;
+        }
+        assert!(!window.mapped);
+        self.fs.into_window = None;
+        true
+    }
+    fn wake_due(&mut self) {
+        self.fs.clone_wake = true;
     }
 }

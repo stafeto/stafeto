@@ -1582,6 +1582,23 @@ impl<'a> Storage<'a> {
         };
         &bytes[..bytes.len().min(n.boot_visible_length as usize)]
     }
+    /// Bound a CPU copy by its actual immutable boot source page and logical page.
+    pub fn read_chunk(&self, token: Token, offset: u64, requested: usize) -> Result<usize, u32> {
+        self.node(token)?;
+        let remaining = requested;
+        if remaining == 0 {
+            return Ok(0);
+        }
+        let logical = (offset % PAGE as u64) as usize;
+        let mut count = remaining.min(1024).min(PAGE - logical);
+        let boot = self.boot_bytes(token);
+        if offset < boot.len() as u64 {
+            let physical = (boot.as_ptr() as usize + offset as usize) % PAGE;
+            count = count.min(PAGE - physical);
+        }
+        Ok(count)
+    }
+
     pub fn read(&self, token: Token, offset: u64, out: &mut [u8]) -> Result<usize, u32> {
         let n = self.node(token)?;
         let count = out.len().min(n.length.saturating_sub(offset) as usize);

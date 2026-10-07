@@ -195,6 +195,23 @@ impl Incoming {
         (i < self.count).then(|| self.info[i])
     }
 
+    /// Inspect a typed borrowed view while Incoming retains the sole owner.
+    pub fn with_view<K: Kind, R>(
+        &self,
+        i: usize,
+        operation: impl FnOnce(&Handle<K>) -> R,
+    ) -> Result<R, Error> {
+        let (kind, _) = self.info(i).ok_or(Error::BadHandle)?;
+        if self.values[i] == abi::Handle::INVALID {
+            return Err(Error::BadHandle);
+        }
+        if !K::accepts(kind) {
+            return Err(Error::WrongType);
+        }
+        let view = Handle::borrowed(self.values[i]);
+        Ok(operation(&view))
+    }
+
     /// Handle `i`, when its object is of kind `K`: WRONG_TYPE, with no call
     /// to the kernel, when it is not, and the handle stays here;
     /// BAD_HANDLE past the count or when it was taken.

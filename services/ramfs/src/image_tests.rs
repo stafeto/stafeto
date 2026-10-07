@@ -549,3 +549,135 @@ fn closed_numeric_slot_reuse_preserves_original_retained_writer_and_exact_cleanu
     ram.close(&mut fds, fd).unwrap();
     assert_eq!(ram.storage.node(new).unwrap().writers, 0);
 }
+
+#[test]
+fn exact_window_debt_retains_image_and_origin_while_other_cleanup_and_gc_progress() {
+    let bytes = image();
+    let mut index = crate::tree::Index::new();
+    let tree = crate::tree::load(&bytes, &mut index).unwrap();
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::ZERO, tree);
+    let token = ram.storage.resolve(b"/program").unwrap();
+    let entry = ram.storage.node(token).unwrap().boot;
+    let mut owner = Fds {
+        root: EXPENSE,
+        ..Fds::default()
+    };
+    ram.hold_image(&mut owner, token, entry).unwrap();
+    let held = owner.image_hold;
+    let mut other = Fds {
+        root: EXPENSE,
+        ..Fds::default()
+    };
+    ram.hold_image(&mut other, token, entry).unwrap();
+    ram.storage.unlink(ROOT, b"program", EXPENSE).unwrap();
+    for _ in 0..8 {
+        assert!(crate::maintenance::retained_release_step(
+            &mut ram,
+            &mut owner,
+            19,
+            Some(19)
+        ));
+        assert_eq!(owner.image_hold, held);
+        assert_eq!(ram.storage.usage(EXPENSE).descriptions, 2);
+        ram.storage.reclaim_step();
+        assert!(ram.storage.node(token).is_ok());
+    }
+    for _ in 0..1024 {
+        crate::maintenance::retained_release_step(&mut ram, &mut other, 20, Some(19));
+        if Ram::released(&other) {
+            break;
+        }
+    }
+    assert!(Ram::released(&other));
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 1);
+    assert_eq!(owner.image_hold, held);
+    for _ in 0..1024 {
+        crate::maintenance::retained_release_step(&mut ram, &mut owner, 19, None);
+        if Ram::released(&owner) {
+            break;
+        }
+    }
+    assert!(Ram::released(&owner));
+    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 0);
+    while ram.storage.reclaim_step() {}
+    assert!(ram.storage.node(token).is_err());
+}
+
+#[test]
+fn bounded_source_chunks_match_boot_and_overlay_reads_with_exact_eof_and_padding() {
+    let payload: std::vec::Vec<u8> = (0..15037).map(|i| (i % 251) as u8).collect();
+    let table = bootimg::rootfs::write::rootfs(
+        &[bootimg::rootfs::Entry {
+            path: "/program",
+            mode: bootimg::rootfs::REGULAR | 0o755,
+            uid: 0,
+            gid: 0,
+            file: 1,
+        }],
+        2,
+    )
+    .unwrap();
+    let bytes =
+        bootimg::write::image(&[("init", b"init"), ("program", &payload), ("rootfs", &table)])
+            .unwrap();
+    let mut unaligned = std::vec![0; bytes.len() + 8192];
+    let start = 4096 - unaligned.as_ptr() as usize % 4096 + 37;
+    unaligned[start..start + bytes.len()].copy_from_slice(&bytes);
+    let bytes = &unaligned[start..start + bytes.len()];
+    let mut index = crate::tree::Index::new();
+    let tree = crate::tree::load(bytes, &mut index).unwrap();
+    let mut ram = Ram::with_tree(proto_fs::Timestamp::ZERO, tree);
+    let token = ram.storage.resolve(b"/program").unwrap();
+    let source_base = ram.storage.boot_bytes(token).as_ptr() as usize;
+    assert_ne!(source_base % 4096, 0);
+    for overlay in [false, true] {
+        if overlay {
+            ram.storage
+                .write(token, EXPENSE, 4090, &[71; 2048])
+                .unwrap();
+        }
+        for offset in [0, 37, 4095, 14500, 15037, u64::MAX] {
+            let mut expected = [0xcc; 12288];
+            let count = ram.storage.read(token, offset, &mut expected).unwrap();
+            let mut actual = [0xcc; 12288];
+            let mut copied = 0;
+            let mut visits = 0;
+            loop {
+                let current = offset.checked_add(copied as u64).unwrap();
+                let chunk = ram
+                    .storage
+                    .read_chunk(token, current, actual.len() - copied)
+                    .unwrap();
+                assert!(chunk <= 1024);
+                assert!(chunk <= 4096 - (current % 4096) as usize);
+                if current < payload.len() as u64 {
+                    assert!(chunk <= 4096 - (source_base + current as usize) % 4096);
+                }
+                if chunk == 0 {
+                    break;
+                }
+                visits += 1;
+                assert!(visits <= 18);
+                let n = ram
+                    .storage
+                    .read(token, current, &mut actual[copied..copied + chunk])
+                    .unwrap();
+                assert!(n <= chunk);
+                copied += n;
+                if n < chunk {
+                    break;
+                }
+            }
+            assert_eq!(copied, count);
+            assert_eq!(actual, expected);
+        }
+    }
+    let stale = crate::storage::Token {
+        generation: token.generation + 1,
+        ..token
+    };
+    assert_eq!(
+        ram.storage.read_chunk(stale, 0, 1024),
+        Err(proto_fs::NO_ENTRY)
+    );
+}

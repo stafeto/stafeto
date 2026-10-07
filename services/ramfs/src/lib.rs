@@ -3259,3 +3259,5 @@ mod tests {
 
 #[cfg(feature = "full-capacity-probe")]
 pub mod capacity;
+
+pub mod read_into;
