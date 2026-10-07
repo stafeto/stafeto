@@ -70,7 +70,7 @@ impl Walk {
     /// places. A LOADING record is a target: a child a member spawns
     /// while the walk is on gets the signal, which waits on its page until
     /// it starts (or, for SIGKILL, ends its load).
-    pub fn step<P>(&mut self, records: &Records<P>) -> Step {
+    pub fn step<P, C>(&mut self, records: &Records<P, C>) -> Step {
         for _ in 0..LOOKS {
             let Some(index) = (self.cursor < RECORDS).then_some(self.cursor) else {
                 return Step::Done;

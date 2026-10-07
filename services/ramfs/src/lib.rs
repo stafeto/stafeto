@@ -9,7 +9,29 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod authority;
+pub mod cwd;
+#[cfg(test)]
+mod cwd_tests;
+pub mod data;
+pub mod directory;
+#[cfg(test)]
+mod directory_tests;
+pub mod image;
+#[cfg(test)]
+mod image_tests;
+pub mod io;
+#[cfg(test)]
+mod io_tests;
 pub mod maintenance;
+pub mod metadata;
+#[cfg(test)]
+mod metadata_tests;
+pub use storage::namespace;
+#[cfg(test)]
+mod create_tests;
+#[cfg(test)]
+mod namespace_tests;
+pub mod open;
 pub mod places;
 pub mod resolve;
 #[cfg(test)]
@@ -17,9 +39,19 @@ mod resolve_tests;
 pub mod storage;
 #[cfg(test)]
 mod storage_tests;
+pub mod time_source;
 pub mod tree;
 
 use storage::{BOOT_ROOT, Pin, Storage, Token};
+
+/// Read the common Clone count before allocating a session or retaining references.
+pub fn clone_count(body: &mut proto_wire::Reader<'_>, handle_count: usize) -> Result<usize, u32> {
+    let count = body.u32().map_err(|_| proto_wire::BAD_SIZE)? as usize;
+    if count > OPEN_MAX || handle_count != 0 {
+        return Err(proto_wire::BAD_SIZE);
+    }
+    Ok(count)
+}
 
 use proto_fs::{
     BAD_FD, IS_DIRECTORY, Metadata, NO_ENTRY, NO_SPACE, NodeInfo, READ_ONLY, WRITE_ONLY,
@@ -215,6 +247,11 @@ pub struct Fds {
     #[cfg(feature = "auth-probe")]
     pub auth_probe_gc_reservation: Option<storage::Reservation>,
     pub resolvers: [u64; 16],
+    pub open_watermarks: [u64; OPEN_MAX],
+    pub image_hold: Option<image::ImageHold>,
+    pub image_outcome: Option<image::ImageOutcome>,
+    /// Exact completed operations survive Close as tombstones until this fd is reused.
+    open_receipts: [OpenReceipt; OPEN_MAX],
     pub root: storage::Root,
     pub cwd: Option<Token>,
     preparations: [Option<storage::Reservation>; 16],
@@ -238,6 +275,10 @@ impl Default for Fds {
             #[cfg(feature = "auth-probe")]
             auth_probe_gc_reservation: None,
             resolvers: [0; 16],
+            open_watermarks: [0; OPEN_MAX],
+            image_hold: None,
+            image_outcome: None,
+            open_receipts: [OpenReceipt::EMPTY; OPEN_MAX],
             root: BOOT_ROOT,
             cwd: None,
             preparations: [None; 16],
@@ -246,6 +287,41 @@ impl Default for Fds {
 }
 
 impl Fds {
+    fn fresh_clone_destination(&self) -> bool {
+        if self.slots.iter().any(Option::is_some)
+            || self.tentative != 0
+            || self.claimed
+            || self.binding != authority::Binding::Unbound
+            || self.authority_index != storage::NONE
+            || self.binding_preparation.is_some()
+            || self.binding_source.is_some()
+            || self.binding_outcome.is_some()
+            || self.resolvers.iter().any(|&id| id != 0)
+            || self
+                .open_watermarks
+                .iter()
+                .any(|&generation| generation != 0)
+            || self.image_hold.is_some()
+            || self.image_outcome.is_some()
+            || self
+                .open_receipts
+                .iter()
+                .any(|&receipt| receipt != OpenReceipt::EMPTY)
+            || self.root != BOOT_ROOT
+            || self.cwd.is_some()
+            || self.preparations.iter().any(Option::is_some)
+        {
+            return false;
+        }
+        #[cfg(feature = "auth-probe")]
+        if self.auth_probe_hold
+            || self.auth_probe_gc.is_some()
+            || self.auth_probe_gc_reservation.is_some()
+        {
+            return false;
+        }
+        true
+    }
     /// Binding, path jobs, and unpublished creations share one session budget.
     pub fn preparation_count(&self) -> usize {
         self.resolvers.iter().filter(|&&id| id != 0).count()
@@ -297,6 +373,41 @@ pub struct TentativeOpen {
     pub description: Token,
 }
 
+/// Move-only publication authority, produced before the file effect.
+/// Apply within the same service step and Fds, without changing its descriptors.
+#[derive(Debug)]
+pub struct FinishOpenPreflight {
+    key: proto_fs::OpenKey,
+    held: TentativeOpen,
+    slot: usize,
+    mode: FinishMode,
+}
+#[derive(Debug)]
+enum FinishMode {
+    Publish,
+    Replay,
+}
+
+/// A completed operation owns the precise description in one session slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OpenReceipt {
+    key: proto_fs::OpenKey,
+    description: Token,
+}
+const _: () = assert!(core::mem::size_of::<OpenReceipt>() == 32);
+impl OpenReceipt {
+    const EMPTY: Self = Self {
+        key: proto_fs::OpenKey {
+            slot: 0,
+            generation: 0,
+        },
+        description: Token {
+            slot: 0,
+            generation: 0,
+        },
+    };
+}
+
 /// An open description and the descriptors of all sessions that name it.
 #[derive(Clone, Copy)]
 struct Shared {
@@ -308,9 +419,9 @@ struct Shared {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileTimes {
-    access: u64,
-    modify: u64,
-    change: u64,
+    access: proto_fs::Timestamp,
+    modify: proto_fs::Timestamp,
+    change: proto_fs::Timestamp,
 }
 
 impl File {
@@ -367,23 +478,23 @@ pub struct Ram<'a> {
 #[cfg(test)]
 impl Default for Ram<'_> {
     fn default() -> Self {
-        Self::new(0)
+        Self::new(proto_fs::Timestamp::legacy_ns(0))
     }
 }
 
 impl<'a> Ram<'a> {
     #[cfg(test)]
-    pub fn new(now: u64) -> Self {
+    pub fn new(now: proto_fs::Timestamp) -> Self {
         Self::test_ram(now, None)
     }
 
     #[cfg(test)]
-    pub fn with_tree(now: u64, tree: Tree<'a>) -> Self {
+    pub fn with_tree(now: proto_fs::Timestamp, tree: Tree<'a>) -> Self {
         Self::test_ram(now, Some(tree))
     }
 
     #[cfg(test)]
-    fn test_ram(now: u64, tree: Option<Tree<'a>>) -> Self {
+    fn test_ram(now: proto_fs::Timestamp, tree: Option<Tree<'a>>) -> Self {
         extern crate std;
         // SAFETY: State consists of integer arrays, booleans and optional integer accounts.
         let state = std::boxed::Box::leak(unsafe {
@@ -396,7 +507,7 @@ impl<'a> Ram<'a> {
     }
 
     pub fn with_storage(
-        now: u64,
+        now: proto_fs::Timestamp,
         state: &'a mut storage::State,
         data: &'a mut [u8],
         tree: Option<Tree<'a>>,
@@ -464,10 +575,13 @@ impl<'a> Ram<'a> {
     /// The open description `fd` of `fds` names takes `open`.
     fn put(&mut self, fds: &Fds, fd: u32, open: Open) -> Result<(), u32> {
         let index = fds.description(fd)?;
-        self.descriptions[index]
+        let shared = self.descriptions[index]
             .as_mut()
-            .expect("a named description")
-            .open = open;
+            .expect("a named description");
+        if shared.open.file != open.file || shared.open.flags & 3 != open.flags & 3 {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        shared.open = open;
         Ok(())
     }
 
@@ -490,6 +604,16 @@ impl<'a> Ram<'a> {
             .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
         self.storage.charge_description(fds.root)?;
         if let Err(code) = self.storage.pin(self.token(open.file), Pin::Fd) {
+            self.storage.release_description(fds.root);
+            return Err(code);
+        }
+        if self.storage.node(self.token(open.file))?.kind == REG
+            && open.flags & 3 != READ_ONLY
+            && let Err(code) = self.storage.acquire_writer(self.token(open.file))
+        {
+            self.storage
+                .unpin(self.token(open.file), Pin::Fd)
+                .expect("new inode pin");
             self.storage.release_description(fds.root);
             return Err(code);
         }
@@ -516,6 +640,7 @@ impl<'a> Ram<'a> {
     ) -> Result<TentativeOpen, u32> {
         let allowed = 3
             | proto_fs::DIRECTORY_ONLY
+            | proto_fs::CHANGES
             | proto_fs::CREATE
             | proto_fs::EXCLUSIVE
             | proto_fs::TRUNCATE
@@ -532,6 +657,9 @@ impl<'a> Ram<'a> {
         } else {
             false
         };
+        if flags & proto_fs::CHANGES != 0 && (creation.is_some() || !self.file(token).is_device()) {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
         let node = self.storage.node(token)?;
         let access = flags & 3;
         if created && node.links != 0 {
@@ -549,8 +677,17 @@ impl<'a> Ram<'a> {
         if flags & proto_fs::DIRECTORY_ONLY != 0 && node.kind != DIR {
             return Err(proto_fs::NOT_DIRECTORY);
         }
+        if node.kind == DIR
+            && flags & proto_fs::CREATE != 0
+            && flags & proto_fs::DIRECTORY_ONLY == 0
+        {
+            return Err(IS_DIRECTORY);
+        }
         if node.kind == DIR && (access != READ_ONLY || flags & proto_fs::TRUNCATE != 0) {
             return Err(IS_DIRECTORY);
+        }
+        if node.kind == REG && (access != READ_ONLY || flags & proto_fs::TRUNCATE != 0) {
+            self.storage.content_guard(token)?;
         }
         if node.kind == REG
             && (access != READ_ONLY || flags & proto_fs::TRUNCATE != 0)
@@ -597,12 +734,128 @@ impl<'a> Ram<'a> {
         }
         Ok(slot)
     }
+    pub fn validate_tentative(&self, fds: &Fds, held: TentativeOpen) -> Result<Token, u32> {
+        let slot = self.tentative_slot(fds, held)?;
+        let description = fds.slots[slot].expect("retained tentative description");
+        Ok(self.token(
+            self.descriptions[description as usize]
+                .expect("retained description")
+                .open
+                .file,
+        ))
+    }
+
     /// This publication cannot allocate or fail after a successful effect preflight.
     pub fn publish_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<u32, u32> {
         let slot = self.tentative_slot(fds, held)?;
         fds.tentative &= !(1 << slot);
         Ok(held.fd)
     }
+    /// Check receipt and exact descriptor ownership before any file effect.
+    /// The same service step keeps these mappings unchanged until finish_open.
+    pub fn preflight_finish_open(
+        &self,
+        fds: &Fds,
+        key: proto_fs::OpenKey,
+        held: TentativeOpen,
+    ) -> Result<FinishOpenPreflight, u32> {
+        key.validate()?;
+        let (slot, mode) = if fds.open_receipts.iter().any(|receipt| receipt.key == key) {
+            if self.finished_open(fds, key)? != held {
+                return Err(proto_fs::PERMISSION);
+            }
+            ((held.fd - 3) as usize, FinishMode::Replay)
+        } else {
+            (self.tentative_slot(fds, held)?, FinishMode::Publish)
+        };
+        Ok(FinishOpenPreflight {
+            key,
+            held,
+            slot,
+            mode,
+        })
+    }
+    /// Consume a preflight while the exact session mappings remain unchanged.
+    /// Journal.commit only changes file metadata and namespace, preserving them.
+    pub fn finish_preflighted(
+        &mut self,
+        fds: &mut Fds,
+        proof: FinishOpenPreflight,
+    ) -> TentativeOpen {
+        if matches!(proof.mode, FinishMode::Publish) {
+            fds.open_receipts[proof.slot] = OpenReceipt {
+                key: proof.key,
+                description: proof.held.description,
+            };
+            fds.tentative &= !(1 << proof.slot);
+        }
+        proof.held
+    }
+    /// The caller validates the exact committed paid job before this handoff.
+    /// Receipt storage and the descriptor reference are already paid.
+    pub fn finish_open(
+        &mut self,
+        fds: &mut Fds,
+        key: proto_fs::OpenKey,
+        held: TentativeOpen,
+    ) -> Result<TentativeOpen, u32> {
+        let proof = self.preflight_finish_open(fds, key, held)?;
+        Ok(self.finish_preflighted(fds, proof))
+    }
+    /// Recover a completed outcome only while this session still owns its reference.
+    pub fn finished_open(&self, fds: &Fds, key: proto_fs::OpenKey) -> Result<TentativeOpen, u32> {
+        key.validate()?;
+        let slot = fds
+            .open_receipts
+            .iter()
+            .position(|receipt| receipt.key == key)
+            .ok_or(proto_fs::OPEN_RETIRED)?;
+        let receipt = fds.open_receipts[slot];
+        if fds.tentative & (1 << slot) != 0
+            || fds.slots[slot] != u8::try_from(receipt.description.slot).ok()
+            || !self.descriptions[receipt.description.slot as usize]
+                .is_some_and(|shared| shared.generation == receipt.description.generation)
+        {
+            return Err(proto_fs::OPEN_RETIRED);
+        }
+        Ok(TentativeOpen {
+            fd: slot as u32 + 3,
+            description: receipt.description,
+        })
+    }
+    /// Preserve the exact description's device type through Commit and final handoff.
+    pub fn marked_open(&self, fds: &Fds, held: TentativeOpen) -> Result<u32, u32> {
+        let slot = held.fd.checked_sub(3).ok_or(BAD_FD)? as usize;
+        if slot >= OPEN_MAX || fds.slots[slot] != u8::try_from(held.description.slot).ok() {
+            return Err(BAD_FD);
+        }
+        let shared = self
+            .descriptions
+            .get(held.description.slot as usize)
+            .and_then(Option::as_ref)
+            .filter(|shared| shared.generation == held.description.generation)
+            .ok_or(BAD_FD)?;
+        Ok(held.fd
+            | ((held.description.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT)
+            | if matches!(shared.open.file, File::Random(_)) {
+                proto_fs::OPEN_RANDOM
+            } else {
+                0
+            })
+    }
+    /// Cancel owns a description generation; an old key leaves reused fds intact.
+    pub fn cancel_finished_open(
+        &mut self,
+        fds: &mut Fds,
+        key: proto_fs::OpenKey,
+    ) -> Result<(), u32> {
+        match self.finished_open(fds, key) {
+            Ok(held) => self.close(fds, held.fd),
+            Err(proto_fs::OPEN_RETIRED) => Ok(()),
+            Err(code) => Err(code),
+        }
+    }
+
     pub fn cancel_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<(), u32> {
         let slot = self.tentative_slot(fds, held)?;
         fds.tentative &= !(1 << slot);
@@ -623,17 +876,23 @@ impl<'a> Ram<'a> {
     pub fn close(&mut self, fds: &mut Fds, fd: u32) -> Result<(), u32> {
         let index = fds.description(fd)?;
         fds.slots[(fd - 3) as usize] = None;
+        self.release_shared(index)
+    }
+
+    /// Release one exact shared reference, including its final writer and root charge.
+    fn release_shared(&mut self, index: usize) -> Result<(), u32> {
         let shared = self.descriptions[index]
             .as_mut()
-            .expect("a named description");
+            .expect("retained description");
         shared.refs -= 1;
         if shared.refs == 0 {
-            let file = shared.open.file;
-            let root = shared.root;
-            let token = self.token(file);
-            self.descriptions[index] = None;
+            let shared = self.descriptions[index].take().expect("last description");
+            let token = self.token(shared.open.file);
+            if self.storage.node(token)?.kind == REG && shared.open.flags & 3 != READ_ONLY {
+                self.storage.release_writer(token);
+            }
             self.storage.unpin(token, Pin::Fd)?;
-            self.storage.release_description(root);
+            self.storage.release_description(shared.root);
         }
         Ok(())
     }
@@ -751,6 +1010,9 @@ impl<'a> Ram<'a> {
             let _ = self.storage.cancel(r);
             return true;
         }
+        if self.release_loading_image(fds) {
+            return true;
+        }
         if let Some(cwd) = fds.cwd.take() {
             let _ = self.storage.unpin(cwd, Pin::Cwd);
             return true;
@@ -774,6 +1036,27 @@ impl<'a> Ram<'a> {
                 .expect("named description")
                 .generation,
         })
+    }
+
+    /// Observe executable accounting for this running probe caller's exact descriptor.
+    #[cfg(feature = "auth-probe")]
+    pub fn probe_exec_pin(&self, fds: &Fds, fd: u32, expected: Token) -> Result<[u32; 4], u32> {
+        if !matches!(fds.binding, authority::Binding::Active(who) if who.loader.is_none()) {
+            return Err(proto_fs::PERMISSION);
+        }
+        if self.description_token(fds, fd)? != expected {
+            return Err(BAD_FD);
+        }
+        let node = self.storage.node(self.token(self.get(fds, fd)?.file))?;
+        if node.kind != REG {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        Ok([
+            u32::from(node.pins[Pin::Image as usize]),
+            u32::from(node.writers),
+            u32::from(self.storage.usage(fds.root).descriptions),
+            self.storage.probe_description_charges(),
+        ])
     }
 
     /// A raw token can serve as a relative base only when this session retains it.
@@ -801,6 +1084,7 @@ impl<'a> Ram<'a> {
     }
 
     pub fn release(&mut self, fds: &mut Fds) {
+        self.release_image(fds);
         #[cfg(feature = "auth-probe")]
         {
             fds.auth_probe_gc_reservation = None;
@@ -830,29 +1114,65 @@ impl<'a> Ram<'a> {
         }
     }
 
+    /// Capture a published description before importing it into a local table.
+    pub fn capture_description(&self, fds: &Fds, fd: u32) -> Result<(TentativeOpen, u32), u32> {
+        let description = self.description_token(fds, fd)?;
+        let flags = self.descriptions[description.slot as usize]
+            .as_ref()
+            .ok_or(BAD_FD)?
+            .open
+            .flags;
+        Ok((TentativeOpen { fd, description }, flags))
+    }
+
+    /// A stale exact cleanup leaves the replacement and its shared references intact.
+    pub fn close_exact_description(
+        &mut self,
+        fds: &mut Fds,
+        held: TentativeOpen,
+    ) -> Result<bool, u32> {
+        if self.description_token(fds, held.fd) != Ok(held.description) {
+            return Ok(false);
+        }
+        self.close(fds, held.fd)?;
+        Ok(true)
+    }
+
     /// Clone's descriptors: a session's of the same numbers as `list` of
     /// `fds`, which share their descriptions, offsets and access modes;
     /// BAD_FD for a number no descriptor has. O(OPEN_MAX).
     pub fn clone_fds(&mut self, fds: &Fds, list: &[u32]) -> Result<Fds, u32> {
-        let mut out = Fds {
-            root: fds.root,
-            ..Fds::default()
-        };
+        let mut out = Fds::default();
+        self.clone_fds_into(fds, list, &mut out)?;
+        Ok(out)
+    }
+
+    /// Fill a fresh destination after validating the complete descriptor list.
+    /// Errors preserve the destination and all source references.
+    #[inline(never)]
+    pub fn clone_fds_into(&mut self, fds: &Fds, list: &[u32], out: &mut Fds) -> Result<(), u32> {
+        if !out.fresh_clone_destination() {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let mut slots = [None; OPEN_MAX];
         for &fd in list {
             let index = fds.description(fd)?;
-            out.slots[(fd - 3) as usize] = Some(index as u8);
+            slots[(fd - 3) as usize] = Some(index as u8);
         }
         if let Some(cwd) = fds.cwd {
             self.storage.pin(cwd, Pin::Cwd)?;
-            out.cwd = Some(cwd);
         }
+        out.root = fds.root;
+        out.slots = slots;
+        out.cwd = fds.cwd;
+        // At most 641 session/birth records, including this child, own 32 references each.
         for index in out.slots.iter().flatten() {
             self.descriptions[usize::from(*index)]
                 .as_mut()
                 .expect("a named description")
                 .refs += 1;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// The descriptions that are open.
@@ -940,6 +1260,9 @@ impl<'a> Ram<'a> {
         if file.is_directory() && flags != READ_ONLY {
             return Err(IS_DIRECTORY);
         }
+        if file.kind() == REG && flags != READ_ONLY {
+            self.storage.content_guard(self.token(file))?;
+        }
         if matches!(file, File::Motd | File::ImageRegular(_)) && flags != READ_ONLY {
             return Err(proto_fs::ACCESS_DENIED);
         }
@@ -956,7 +1279,7 @@ impl<'a> Ram<'a> {
         )
     }
 
-    fn touch_access(&mut self, file: File, now: u64) {
+    fn touch_access(&mut self, file: File, now: proto_fs::Timestamp) {
         if file.index().is_some() || matches!(file, File::Node(_) | File::NodeDir(_)) {
             self.storage
                 .node_mut(self.token(file))
@@ -1046,6 +1369,7 @@ impl<'a> Ram<'a> {
         let File::ImageRegular(entry) = file else {
             return Err(proto_fs::ACCESS_DENIED);
         };
+        self.storage.exec_guard(self.token(file))?;
         Ok(Exec {
             entry,
             mode: info.permissions,
@@ -1056,10 +1380,20 @@ impl<'a> Ram<'a> {
 
     /// The information of the program file of an image session.
     pub fn exec_token(&self, token: Token, identity: authority::Identity) -> Result<Exec, u32> {
-        let n = self.storage.node(token)?;
-        if n.kind != REG || n.boot == storage::NONE || !identity.permits(n, 1) {
+        let exec = self.exec_inode(token, identity)?;
+        if exec.entry == storage::NONE {
             return Err(proto_fs::ACCESS_DENIED);
         }
+        Ok(exec)
+    }
+
+    /// Canonical executable metadata; custody is supplied by the image hold caller.
+    pub fn exec_inode(&self, token: Token, identity: authority::Identity) -> Result<Exec, u32> {
+        let n = self.storage.node(token)?;
+        if n.kind != REG || !identity.permits(n, 1) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        self.storage.exec_guard(token)?;
         Ok(Exec {
             entry: n.boot,
             mode: n.mode,
@@ -1078,7 +1412,7 @@ impl<'a> Ram<'a> {
         token: Token,
         index: u32,
         identity: authority::Identity,
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<Option<DirectoryRecord<'a>>, u32> {
         let node = self.storage.node(token)?;
         if node.kind != DIR {
@@ -1132,11 +1466,11 @@ impl<'a> Ram<'a> {
             uid,
             gid,
             size,
-            block_size: FILE_CAPACITY as u32,
-            blocks: size.div_ceil(512),
-            access_ns: times.access,
-            modify_ns: times.modify,
-            change_ns: times.change,
+            block_size: storage::PAGE as u32,
+            blocks: self.storage.blocks(self.token(file)),
+            access_time: times.access,
+            modify_time: times.modify,
+            change_time: times.change,
         }
     }
 
@@ -1150,7 +1484,7 @@ impl<'a> Ram<'a> {
         fds: &mut Fds,
         fd: u32,
         out: &mut [u8],
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<usize, u32> {
         let file = self.get(fds, fd)?.file;
         let n = self.read(fds, fd, out)?;
@@ -1168,7 +1502,7 @@ impl<'a> Ram<'a> {
         fd: u32,
         offset: u64,
         out: &mut [u8],
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<usize, u32> {
         let open = self.get(fds, fd)?;
         if open.file.is_directory() {
@@ -1192,7 +1526,7 @@ impl<'a> Ram<'a> {
         fds: &mut Fds,
         fd: u32,
         bytes: &[u8],
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<usize, u32> {
         let file = self.get(fds, fd)?.file;
         let n = self.write_position(fds, fd, bytes, None)?;
@@ -1213,7 +1547,7 @@ impl<'a> Ram<'a> {
         fd: u32,
         offset: u64,
         bytes: &[u8],
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<usize, u32> {
         i64::try_from(offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
         let file = self.get(fds, fd)?.file;
@@ -1230,7 +1564,7 @@ impl<'a> Ram<'a> {
         &mut self,
         fds: &mut Fds,
         fd: u32,
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<Option<DirectoryRecord<'a>>, u32> {
         let mut open = self.get(fds, fd)?;
         if !open.file.is_directory() {
@@ -1249,7 +1583,7 @@ impl<'a> Ram<'a> {
         &mut self,
         path: &str,
         index: u32,
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<Option<DirectoryRecord<'a>>, u32> {
         let file = self.resolve(path)?;
         if !file.is_directory() {
@@ -1261,7 +1595,12 @@ impl<'a> Ram<'a> {
     /// Entry `index` of directory `dir`: `.`, `..`, then the fixed
     /// entries, then the children from the table; the access time of the
     /// directory is `now`.
-    fn entry_of(&mut self, dir: File, index: u32, now: u64) -> Option<DirectoryRecord<'a>> {
+    fn entry_of(
+        &mut self,
+        dir: File,
+        index: u32,
+        now: proto_fs::Timestamp,
+    ) -> Option<DirectoryRecord<'a>> {
         self.touch_access(dir, now);
         let tree = self.tree;
         let index = index as usize;
@@ -1464,6 +1803,35 @@ mod tests {
     /// The checks of READ_INTO, one at a time: each refusal is its own
     /// (dropping any check lets its case through).
     #[test]
+    fn signed_times_survive_storage_write_read_and_information() {
+        let initial = proto_fs::Timestamp::new(i64::MIN, 0).unwrap();
+        let written = proto_fs::Timestamp::from_ns(-1).unwrap();
+        let read = proto_fs::Timestamp::new(i64::MAX, 999_999_999).unwrap();
+        let mut ram = Ram::new(initial);
+        let mut fds = Fds::default();
+        let fd = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
+        assert_eq!(ram.write_at(&mut fds, fd, b"x", written), Ok(1));
+        let info = ram.descriptor_information(&fds, fd).unwrap();
+        assert_eq!(
+            (info.access_time, info.modify_time, info.change_time),
+            (initial, written, written)
+        );
+        let mut byte = [0];
+        assert_eq!(ram.pread(&fds, fd, 0, &mut byte, read), Ok(1));
+        assert_eq!(byte, *b"x");
+        let info = ram.descriptor_information(&fds, fd).unwrap();
+        assert_eq!(
+            (info.access_time, info.modify_time, info.change_time),
+            (read, written, written)
+        );
+        assert_eq!(ram.pread(&fds, fd, 0, &mut [], initial), Ok(0));
+        assert_eq!(
+            ram.descriptor_information(&fds, fd).unwrap().access_time,
+            read
+        );
+    }
+
+    #[test]
     fn read_into_checks_each_argument() {
         let ok = |fd, count, at, handles, writable, size| {
             read_into_valid(fd, count, at, handles, writable, size)
@@ -1490,7 +1858,7 @@ mod tests {
 
     #[test]
     fn directory_descriptions_keep_positions_identity_and_access_times() {
-        let mut ram = Ram::new(10);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(10));
         let mut fds = Fds::default();
         let fd = ram
             .open(&mut fds, "/etc", READ_ONLY | proto_fs::DIRECTORY_ONLY)
@@ -1503,31 +1871,49 @@ mod tests {
             Err(proto_fs::NOT_DIRECTORY)
         );
         assert_eq!(
-            ram.read_at(&mut fds, fd, &mut [0; 1], 15),
+            ram.read_at(
+                &mut fds,
+                fd,
+                &mut [0; 1],
+                proto_fs::Timestamp::legacy_ns(15)
+            ),
             Err(IS_DIRECTORY)
         );
-        assert_eq!(ram.write_at(&mut fds, fd, b"x", 16), Err(IS_DIRECTORY));
-        assert_eq!(ram.information("/etc").unwrap().access_ns, 10);
+        assert_eq!(
+            ram.write_at(&mut fds, fd, b"x", proto_fs::Timestamp::legacy_ns(16)),
+            Err(IS_DIRECTORY)
+        );
+        assert_eq!(
+            ram.information("/etc").unwrap().access_time,
+            proto_fs::Timestamp::legacy_ns(10)
+        );
         for (now, name, inode, kind) in
             [(20, ".", 2, DIR), (30, "..", 1, DIR), (40, "motd", 4, REG)]
         {
             assert_eq!(
-                ram.directory_read(&mut fds, fd, now),
+                ram.directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(now)),
                 Ok(Some(DirectoryRecord { name, kind, inode }))
             );
         }
-        assert_eq!(ram.directory_read(&mut fds, fd, 50), Ok(None));
+        assert_eq!(
+            ram.directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(50)),
+            Ok(None)
+        );
         assert_eq!(
             ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current),
             Ok(3)
         );
         let info = ram.information("/etc").unwrap();
         assert_eq!(
-            (info.access_ns, info.modify_ns, info.change_ns),
-            (50, 10, 10)
+            (info.access_time, info.modify_time, info.change_time),
+            (
+                proto_fs::Timestamp::legacy_ns(50),
+                proto_fs::Timestamp::legacy_ns(10),
+                proto_fs::Timestamp::legacy_ns(10)
+            )
         );
         assert_eq!(
-            ram.directory_read(&mut fds, second, 60)
+            ram.directory_read(&mut fds, second, proto_fs::Timestamp::legacy_ns(60))
                 .unwrap()
                 .unwrap()
                 .name,
@@ -1538,7 +1924,10 @@ mod tests {
             Ok(1)
         );
         assert_eq!(
-            ram.directory_read(&mut fds, fd, 70).unwrap().unwrap().name,
+            ram.directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(70))
+                .unwrap()
+                .unwrap()
+                .name,
             ".."
         );
         let before = ram.information("/etc").unwrap();
@@ -1555,10 +1944,13 @@ mod tests {
             Ok(2)
         );
         ram.close(&mut fds, fd).unwrap();
-        assert_eq!(ram.directory_read(&mut fds, fd, 80), Err(BAD_FD));
+        assert_eq!(
+            ram.directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(80)),
+            Err(BAD_FD)
+        );
         let regular = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
         assert_eq!(
-            ram.directory_read(&mut fds, regular, 90),
+            ram.directory_read(&mut fds, regular, proto_fs::Timestamp::legacy_ns(90)),
             Err(proto_fs::NOT_DIRECTORY)
         );
         assert_eq!(ram.information("/etc").unwrap(), before);
@@ -1566,7 +1958,7 @@ mod tests {
 
     #[test]
     fn metadata_identity_and_clock_updates_are_shared_across_sessions() {
-        let mut ram = Ram::new(10);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(10));
         let root = ram.information("/").unwrap();
         assert_eq!(
             (root.kind, root.inode, root.links, root.permissions),
@@ -1592,7 +1984,8 @@ mod tests {
         );
         let fa = ram.open(&mut a, "/tmp/probe", READ_WRITE).unwrap();
         let fb = ram.open(&mut b, "/tmp/probe", READ_ONLY).unwrap();
-        ram.write_at(&mut a, fa, b"abc", 20).unwrap();
+        ram.write_at(&mut a, fa, b"abc", proto_fs::Timestamp::legacy_ns(20))
+            .unwrap();
         let info = ram.descriptor_information(&b, fb).unwrap();
         assert_eq!(info, ram.information("/tmp/probe").unwrap());
         assert_eq!(
@@ -1600,24 +1993,53 @@ mod tests {
                 info.inode,
                 info.size,
                 info.blocks,
-                info.access_ns,
-                info.modify_ns,
-                info.change_ns
+                info.access_time,
+                info.modify_time,
+                info.change_time
             ),
-            (5, 3, 1, 10, 20, 20)
+            (
+                5,
+                3,
+                8,
+                proto_fs::Timestamp::legacy_ns(10),
+                proto_fs::Timestamp::legacy_ns(20),
+                proto_fs::Timestamp::legacy_ns(20)
+            )
         );
-        assert_eq!(ram.read_at(&mut b, fb, &mut [0; 3], 30), Ok(3));
-        assert_eq!(ram.read_at(&mut b, fb, &mut [0; 1], 40), Ok(0));
+        assert_eq!(
+            ram.read_at(&mut b, fb, &mut [0; 3], proto_fs::Timestamp::legacy_ns(30)),
+            Ok(3)
+        );
+        assert_eq!(
+            ram.read_at(&mut b, fb, &mut [0; 1], proto_fs::Timestamp::legacy_ns(40)),
+            Ok(0)
+        );
         let info = ram.information("/tmp/probe").unwrap();
         assert_eq!(
-            (info.access_ns, info.modify_ns, info.change_ns),
-            (40, 20, 20)
+            (info.access_time, info.modify_time, info.change_time),
+            (
+                proto_fs::Timestamp::legacy_ns(40),
+                proto_fs::Timestamp::legacy_ns(20),
+                proto_fs::Timestamp::legacy_ns(20)
+            )
         );
-        assert_eq!(ram.read_at(&mut b, fb, &mut [], 50), Ok(0));
-        assert_eq!(ram.write_at(&mut a, fa, b"", 60), Ok(0));
-        assert_eq!(ram.write_at(&mut b, fb, b"x", 70), Err(BAD_FD));
+        assert_eq!(
+            ram.read_at(&mut b, fb, &mut [], proto_fs::Timestamp::legacy_ns(50)),
+            Ok(0)
+        );
+        assert_eq!(
+            ram.write_at(&mut a, fa, b"", proto_fs::Timestamp::legacy_ns(60)),
+            Ok(0)
+        );
+        assert_eq!(
+            ram.write_at(&mut b, fb, b"x", proto_fs::Timestamp::legacy_ns(70)),
+            Err(BAD_FD)
+        );
         ram.seek(&mut a, fa, FILE_CAPACITY as u32).unwrap();
-        assert_eq!(ram.write_at(&mut a, fa, b"x", 80), Err(NO_SPACE));
+        assert_eq!(
+            ram.write_at(&mut a, fa, b"x", proto_fs::Timestamp::legacy_ns(80)),
+            Err(NO_SPACE)
+        );
         assert_eq!(ram.information("/tmp/probe").unwrap(), info);
         ram.close(&mut b, fb).unwrap();
         assert_eq!(ram.descriptor_information(&b, fb), Err(BAD_FD));
@@ -1822,7 +2244,10 @@ mod tests {
     fn image_files_have_the_mode_owner_size_inode_and_links_of_the_table() {
         let bytes = image();
         let mut index = Index::new();
-        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
         let ash = ram.information("/bin/ash").unwrap();
         let ls = ram.information("/bin/ls").unwrap();
         assert_eq!(
@@ -1842,11 +2267,29 @@ mod tests {
         assert_eq!((b.permissions, b.size, b.links), (0o640, 4, 1));
         assert_ne!(b.inode, ash.inode);
         // The times are the service's start: nothing of the image changes.
-        assert_eq!((ash.access_ns, ash.modify_ns, ash.change_ns), (10, 10, 10));
+        assert_eq!(
+            (ash.access_time, ash.modify_time, ash.change_time),
+            (
+                proto_fs::Timestamp::legacy_ns(10),
+                proto_fs::Timestamp::legacy_ns(10),
+                proto_fs::Timestamp::legacy_ns(10)
+            )
+        );
         let mut fds = Fds::default();
         let fd = ram.open(&mut fds, "/bin/ash", READ_ONLY).unwrap();
-        assert_eq!(ram.read_at(&mut fds, fd, &mut [0; 4], 99), Ok(4));
-        assert_eq!(ram.information("/bin/ash").unwrap().access_ns, 10);
+        assert_eq!(
+            ram.read_at(
+                &mut fds,
+                fd,
+                &mut [0; 4],
+                proto_fs::Timestamp::legacy_ns(99)
+            ),
+            Ok(4)
+        );
+        assert_eq!(
+            ram.information("/bin/ash").unwrap().access_time,
+            proto_fs::Timestamp::legacy_ns(10)
+        );
         assert_eq!(ram.descriptor_information(&fds, fd).unwrap(), ash);
         // `/bin` has `.`, its entry in `/`, and `..` of `sub`.
         let bin = ram.information("/bin").unwrap();
@@ -1868,7 +2311,10 @@ mod tests {
     /// The entries of the directory `path`, one call each.
     fn names<'a>(ram: &mut Ram<'a>, path: &str) -> Vec<(&'a str, u32, u64)> {
         let mut out = Vec::new();
-        while let Some(entry) = ram.directory_read_path(path, out.len() as u32, 20).unwrap() {
+        while let Some(entry) = ram
+            .directory_read_path(path, out.len() as u32, proto_fs::Timestamp::legacy_ns(20))
+            .unwrap()
+        {
             out.push((entry.name, entry.kind, entry.inode));
         }
         out
@@ -1878,7 +2324,10 @@ mod tests {
     fn image_directories_list_dot_dotdot_the_fixed_entries_then_the_children() {
         let bytes = image();
         let mut index = Index::new();
-        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
         let mut fds = Fds::default();
         let bin = ram.information("/bin").unwrap().inode;
         let sub = ram.information("/bin/sub").unwrap().inode;
@@ -1910,7 +2359,7 @@ mod tests {
         assert_eq!(names(&mut ram, "/lib").len(), 2);
         assert_eq!(names(&mut ram, "/etc").len(), 3);
         assert_eq!(
-            ram.directory_read_path("/bin/ash", 0, 20),
+            ram.directory_read_path("/bin/ash", 0, proto_fs::Timestamp::legacy_ns(20)),
             Err(proto_fs::NOT_DIRECTORY)
         );
         // An open directory advances through the same entries, and its
@@ -1923,9 +2372,15 @@ mod tests {
         );
         ram.seek_from(&mut fds, fd, 4, proto_fs::SeekFrom::Start)
             .unwrap();
-        let last = ram.directory_read(&mut fds, fd, 30).unwrap().unwrap();
+        let last = ram
+            .directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(30))
+            .unwrap()
+            .unwrap();
         assert_eq!(last.name, "sub");
-        assert_eq!(ram.directory_read(&mut fds, fd, 30), Ok(None));
+        assert_eq!(
+            ram.directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(30)),
+            Ok(None)
+        );
         let root_fd = ram.open(&mut fds, "/", READ_ONLY).unwrap();
         assert_eq!(
             ram.seek_from(&mut fds, root_fd, 0, proto_fs::SeekFrom::End),
@@ -1938,7 +2393,10 @@ mod tests {
     fn image_files_are_read_only_and_read_from_the_start_of_their_own_bytes() {
         let bytes = image();
         let mut index = Index::new();
-        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
         let mut fds = Fds::default();
         assert_eq!(
             ram.open(&mut fds, "/bin/ash", WRITE_ONLY),
@@ -1977,18 +2435,30 @@ mod tests {
             entry("/dev/other", REGULAR | 0o666, 2),
         ]);
         let mut index = Index::new();
-        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
         let mut fds = Fds::default();
         let fd = ram.open(&mut fds, "/dev/null", READ_WRITE).unwrap();
         let block = [7u8; 4096];
         for _ in 0..512 {
-            assert_eq!(ram.write_at(&mut fds, fd, &block, 20), Ok(4096));
+            assert_eq!(
+                ram.write_at(&mut fds, fd, &block, proto_fs::Timestamp::legacy_ns(20)),
+                Ok(4096)
+            );
         }
-        assert_eq!(ram.pwrite(&mut fds, fd, 9, b"abc", 21), Ok(3));
+        assert_eq!(
+            ram.pwrite(&mut fds, fd, 9, b"abc", proto_fs::Timestamp::legacy_ns(21)),
+            Ok(3)
+        );
         assert_eq!(ram.size(&fds, fd), Ok(0));
         let mut out = [1u8; 8];
         assert_eq!(ram.read(&mut fds, fd, &mut out), Ok(0));
-        assert_eq!(ram.pread(&fds, fd, 0, &mut out, 22), Ok(0));
+        assert_eq!(
+            ram.pread(&fds, fd, 0, &mut out, proto_fs::Timestamp::legacy_ns(22)),
+            Ok(0)
+        );
         assert_eq!(ram.information("/dev/null").unwrap().size, 0);
         let writer = ram.open(&mut fds, "/dev/null", WRITE_ONLY).unwrap();
         assert_eq!(ram.write(&mut fds, writer, b"x"), Ok(1));
@@ -2026,13 +2496,19 @@ mod tests {
             entry("/dev/other", REGULAR | 0o666, 2),
         ]);
         let mut index = Index::new();
-        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
         let mut fds = Fds::default();
         for path in ["/dev/random", "/dev/urandom"] {
             let fd = ram.open(&mut fds, path, READ_WRITE).unwrap();
             assert!(ram.is_random(&fds, fd), "{path}");
             assert_eq!(ram.write(&mut fds, fd, b"abc"), Ok(3));
-            assert_eq!(ram.write_at(&mut fds, fd, &[1; 4096], 20), Ok(4096));
+            assert_eq!(
+                ram.write_at(&mut fds, fd, &[1; 4096], proto_fs::Timestamp::legacy_ns(20)),
+                Ok(4096)
+            );
             assert_eq!(ram.size(&fds, fd), Ok(0));
             let mut out = [9u8; 8];
             assert_eq!(
@@ -2040,7 +2516,7 @@ mod tests {
                 Err(proto_fs::INVALID_ARGUMENT)
             );
             assert_eq!(
-                ram.pread(&fds, fd, 0, &mut out, 22),
+                ram.pread(&fds, fd, 0, &mut out, proto_fs::Timestamp::legacy_ns(22)),
                 Err(proto_fs::INVALID_ARGUMENT)
             );
             assert_eq!(out, [9u8; 8], "no byte of the service");
@@ -2058,7 +2534,10 @@ mod tests {
         assert!(!ram.is_random(&fds, other));
         assert_eq!(ram.lookup("/dev/other").map(|m| m.kind), Ok(REG));
         let kinds: Vec<(&str, u32)> = (0..8)
-            .filter_map(|i| ram.directory_read_path("/dev", i, 30).unwrap())
+            .filter_map(|i| {
+                ram.directory_read_path("/dev", i, proto_fs::Timestamp::legacy_ns(30))
+                    .unwrap()
+            })
             .map(|r| (r.name, r.kind))
             .collect();
         assert!(kinds.contains(&("null", CHAR)), "{kinds:?}");
@@ -2068,50 +2547,256 @@ mod tests {
     }
 
     #[test]
+    fn random_open_marker_tracks_exact_receipts_clone_and_reused_descriptions() {
+        let bytes = test_image(&[
+            entry("/dev", DIRECTORY | 0o755, 0),
+            entry("/dev/random", REGULAR | 0o666, 2),
+        ]);
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(0),
+            load(&bytes, &mut index).unwrap(),
+        );
+        let dev = ram.storage.lookup(storage::ROOT, b"dev").unwrap();
+        let random = ram.storage.lookup(dev, b"random").unwrap();
+        let identity = authority::Identity {
+            uid: 0,
+            gid: 0,
+            groups: proto_process::Groups::EMPTY,
+        };
+        let mut fds = Fds::default();
+        let mut receipts = [None; OPEN_MAX];
+        for (slot, saved) in receipts.iter_mut().enumerate() {
+            let held = ram
+                .prepare_open_token(&mut fds, random, READ_WRITE, identity, None)
+                .unwrap();
+            let key = proto_fs::OpenKey {
+                slot: slot as u32,
+                generation: 1,
+            };
+            assert_eq!(held.fd, slot as u32 + 3);
+            assert_eq!(
+                ram.marked_open(&fds, held),
+                Ok(proto_fs::OPEN_RANDOM
+                    | held.fd
+                    | ((held.description.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT))
+            );
+            assert_eq!(ram.finish_open(&mut fds, key, held), Ok(held));
+            assert_eq!(
+                ram.marked_open(&fds, ram.finished_open(&fds, key).unwrap()),
+                Ok(proto_fs::OPEN_RANDOM
+                    | held.fd
+                    | ((held.description.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT))
+            );
+            *saved = Some((key, held));
+        }
+        assert_eq!(ram.open_descriptions(), OPEN_MAX);
+        let numbers: Vec<u32> = fds.numbers().collect();
+        let mut child = ram.clone_fds(&fds, &numbers).unwrap();
+        for fd in numbers {
+            assert!(ram.is_random(&child, fd));
+        }
+        let (old_key, old) = receipts[0].unwrap();
+        ram.close(&mut fds, old.fd).unwrap();
+        let regular = ram
+            .prepare_open_token(
+                &mut fds,
+                Token {
+                    slot: 4,
+                    generation: 1,
+                },
+                READ_WRITE,
+                identity,
+                None,
+            )
+            .unwrap();
+        assert_eq!(regular.fd, old.fd);
+        assert_ne!(regular.description.slot, old.description.slot);
+        assert_eq!(regular.description.generation, old.description.generation);
+        assert_eq!(ram.marked_open(&fds, old), Err(BAD_FD));
+        assert_eq!(ram.close_exact_description(&mut fds, old), Ok(false));
+        assert_eq!(ram.description_token(&fds, regular.fd), Err(BAD_FD));
+        assert_eq!(
+            ram.marked_open(&fds, regular),
+            Ok(regular.fd
+                | ((regular.description.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT))
+        );
+        let new_key = proto_fs::OpenKey {
+            slot: 0,
+            generation: 2,
+        };
+        ram.finish_open(&mut fds, new_key, regular).unwrap();
+        assert_eq!(
+            ram.capture_description(&fds, regular.fd),
+            Ok((regular, READ_WRITE))
+        );
+        assert_eq!(ram.close_exact_description(&mut fds, old), Ok(false));
+        assert_eq!(
+            ram.finished_open(&fds, old_key),
+            Err(proto_fs::OPEN_RETIRED)
+        );
+        ram.cancel_finished_open(&mut fds, old_key).unwrap();
+        assert_eq!(ram.finished_open(&fds, new_key), Ok(regular));
+        assert!(ram.is_random(&child, old.fd));
+        ram.release(&mut child);
+        ram.release(&mut fds);
+        assert_eq!(ram.open_descriptions(), 0);
+        let mut full: [Fds; 4] = core::array::from_fn(|group| Fds {
+            root: storage::Root {
+                id: 500 + group as u64,
+                generation: 1,
+            },
+            ..Fds::default()
+        });
+        for session in &mut full {
+            for _ in 0..OPEN_MAX {
+                let held = ram
+                    .prepare_open_token(session, random, READ_WRITE, identity, None)
+                    .unwrap();
+                ram.publish_open(session, held).unwrap();
+            }
+        }
+        let last = TentativeOpen {
+            fd: 34,
+            description: ram.description_token(&full[3], 34).unwrap(),
+        };
+        assert_eq!(last.description.slot, 127);
+        assert_eq!(
+            ram.marked_open(&full[3], last),
+            Ok(proto_fs::OPEN_RANDOM | (127 << proto_fs::OPEN_DESCRIPTION_SHIFT) | 34)
+        );
+        for session in &mut full {
+            ram.release(session);
+        }
+        assert_eq!(ram.open_descriptions(), 0);
+    }
+
+    #[test]
     fn pread_takes_the_offset_of_the_file_and_keeps_the_position() {
         let bytes = image();
         let mut index = Index::new();
-        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
         let mut fds = Fds::default();
         let fd = ram.open(&mut fds, "/bin/ash", READ_ONLY).unwrap();
         let mut out = [0; 32];
         // From the start, from the middle, up to the end, and a count over it.
-        assert_eq!(ram.pread(&fds, fd, 0, &mut out[..5], 40), Ok(5));
+        assert_eq!(
+            ram.pread(
+                &fds,
+                fd,
+                0,
+                &mut out[..5],
+                proto_fs::Timestamp::legacy_ns(40)
+            ),
+            Ok(5)
+        );
         assert_eq!(&out[..5], b"alpha");
-        assert_eq!(ram.pread(&fds, fd, 6, &mut out, 40), Ok(5));
+        assert_eq!(
+            ram.pread(&fds, fd, 6, &mut out, proto_fs::Timestamp::legacy_ns(40)),
+            Ok(5)
+        );
         assert_eq!(&out[..5], b"bytes");
-        assert_eq!(ram.pread(&fds, fd, 10, &mut out, 40), Ok(1));
+        assert_eq!(
+            ram.pread(&fds, fd, 10, &mut out, proto_fs::Timestamp::legacy_ns(40)),
+            Ok(1)
+        );
         assert_eq!(out[0], b's');
         // At the end, past it, and at the largest offset.
-        assert_eq!(ram.pread(&fds, fd, 11, &mut out, 40), Ok(0));
-        assert_eq!(ram.pread(&fds, fd, 1 << 40, &mut out, 40), Ok(0));
-        assert_eq!(ram.pread(&fds, fd, i64::MAX as u64, &mut out, 40), Ok(0));
         assert_eq!(
-            ram.pread(&fds, fd, i64::MAX as u64 + 1, &mut out, 40),
+            ram.pread(&fds, fd, 11, &mut out, proto_fs::Timestamp::legacy_ns(40)),
+            Ok(0)
+        );
+        assert_eq!(
+            ram.pread(
+                &fds,
+                fd,
+                1 << 40,
+                &mut out,
+                proto_fs::Timestamp::legacy_ns(40)
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            ram.pread(
+                &fds,
+                fd,
+                i64::MAX as u64,
+                &mut out,
+                proto_fs::Timestamp::legacy_ns(40)
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            ram.pread(
+                &fds,
+                fd,
+                i64::MAX as u64 + 1,
+                &mut out,
+                proto_fs::Timestamp::legacy_ns(40)
+            ),
             Err(proto_fs::INVALID_ARGUMENT)
         );
         // The position of the description did not move, so a read starts at 0.
         assert_eq!(ram.read(&mut fds, fd, &mut out[..5]), Ok(5));
         assert_eq!(&out[..5], b"alpha");
-        assert_eq!(ram.pread(&fds, fd, 0, &mut [], 40), Ok(0));
+        assert_eq!(
+            ram.pread(&fds, fd, 0, &mut [], proto_fs::Timestamp::legacy_ns(40)),
+            Ok(0)
+        );
         // A read updates the access time of a file of the fixed tree only.
         let motd = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
-        assert_eq!(ram.pread(&fds, motd, 7, &mut out, 50), Ok(7));
+        assert_eq!(
+            ram.pread(&fds, motd, 7, &mut out, proto_fs::Timestamp::legacy_ns(50)),
+            Ok(7)
+        );
         assert_eq!(&out[..7], b" ramfs\n");
-        assert_eq!(ram.information("/etc/motd").unwrap().access_ns, 50);
-        assert_eq!(ram.information("/bin/ash").unwrap().access_ns, 10);
+        assert_eq!(
+            ram.information("/etc/motd").unwrap().access_time,
+            proto_fs::Timestamp::legacy_ns(50)
+        );
+        assert_eq!(
+            ram.information("/bin/ash").unwrap().access_time,
+            proto_fs::Timestamp::legacy_ns(10)
+        );
         // The scratch file reads at an offset as well, and errors are the
         // read's: a closed descriptor, a directory, a write-only open.
         let scratch = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
         ram.write(&mut fds, scratch, b"abcdef").unwrap();
-        assert_eq!(ram.pread(&fds, scratch, 4, &mut out, 60), Ok(2));
+        assert_eq!(
+            ram.pread(
+                &fds,
+                scratch,
+                4,
+                &mut out,
+                proto_fs::Timestamp::legacy_ns(60)
+            ),
+            Ok(2)
+        );
         assert_eq!(&out[..2], b"ef");
         let write_only = ram.open(&mut fds, "/tmp/probe", WRITE_ONLY).unwrap();
-        assert_eq!(ram.pread(&fds, write_only, 0, &mut out, 60), Err(BAD_FD));
+        assert_eq!(
+            ram.pread(
+                &fds,
+                write_only,
+                0,
+                &mut out,
+                proto_fs::Timestamp::legacy_ns(60)
+            ),
+            Err(BAD_FD)
+        );
         let dir = ram.open(&mut fds, "/bin", READ_ONLY).unwrap();
-        assert_eq!(ram.pread(&fds, dir, 0, &mut out, 60), Err(IS_DIRECTORY));
+        assert_eq!(
+            ram.pread(&fds, dir, 0, &mut out, proto_fs::Timestamp::legacy_ns(60)),
+            Err(IS_DIRECTORY)
+        );
         ram.close(&mut fds, fd).unwrap();
-        assert_eq!(ram.pread(&fds, fd, 0, &mut out, 60), Err(BAD_FD));
+        assert_eq!(
+            ram.pread(&fds, fd, 0, &mut out, proto_fs::Timestamp::legacy_ns(60)),
+            Err(BAD_FD)
+        );
     }
 
     #[test]
@@ -2125,7 +2810,10 @@ mod tests {
             entry(&deep, REGULAR | 0o644, 1),
         ]);
         let mut index = Index::new();
-        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
         let mut fds = Fds::default();
         assert!(ram.open(&mut fds, &deep, READ_ONLY).is_ok());
         assert_eq!(ram.information(&deep).unwrap().size, 11);
@@ -2208,7 +2896,10 @@ mod tests {
     fn exec_checks_search_and_execute_for_the_loaders_ids() {
         let bytes = image();
         let mut index = Index::new();
-        let ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
         let root = Who { euid: 0, egid: 0 };
         let nobody = Who {
             euid: 65534,
@@ -2250,7 +2941,10 @@ mod tests {
             entry("/sbin/x", REGULAR | 0o755, 1),
         ]);
         let mut locked_index = Index::new();
-        let locked = Ram::with_tree(10, load(&locked, &mut locked_index).unwrap());
+        let locked = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&locked, &mut locked_index).unwrap(),
+        );
         assert_eq!(locked.exec("/sbin/x", nobody), Err(proto_fs::ACCESS_DENIED));
         assert!(locked.exec("/sbin/x", root).is_ok());
         // The image session reads the file and nothing else.
@@ -2315,5 +3009,134 @@ mod tests {
         );
         ram.release(&mut sessions[0]);
         assert!(ram.open(&mut one_more, "/etc/motd", READ_ONLY).is_ok());
+    }
+    #[test]
+    fn paid_open_preserves_device_only_changes_profile() {
+        use crate::open::Journal;
+        use crate::resolve::{Intent, Progress, Resolve};
+        use crate::storage::{ROOT, Root};
+        let bytes = test_image(&[
+            entry("/dev", DIRECTORY | 0o755, 0),
+            entry("/dev/null", REGULAR | 0o666, 2),
+            entry("/dev/urandom", REGULAR | 0o666, 2),
+            entry("/dev/other", REGULAR | 0o666, 2),
+        ]);
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(
+            proto_fs::Timestamp::legacy_ns(10),
+            load(&bytes, &mut index).unwrap(),
+        );
+        let identity = authority::Identity {
+            uid: 0,
+            gid: 0,
+            groups: proto_process::Groups::EMPTY,
+        };
+        let mut fds = Fds {
+            root: Root {
+                id: 800,
+                generation: 1,
+            },
+            ..Fds::default()
+        };
+        for (path, extra, expected) in [
+            (b"/dev/null".as_slice(), WRITE_ONLY, Ok(())),
+            (b"/dev/urandom".as_slice(), READ_WRITE, Ok(())),
+            (
+                b"/dev/other".as_slice(),
+                READ_ONLY,
+                Err(proto_fs::INVALID_ARGUMENT),
+            ),
+            (
+                b"/dev".as_slice(),
+                READ_ONLY,
+                Err(proto_fs::INVALID_ARGUMENT),
+            ),
+            (
+                b"/dev/null".as_slice(),
+                proto_fs::DIRECTORY_ONLY,
+                Err(proto_fs::NOT_DIRECTORY),
+            ),
+        ] {
+            let flags = extra | proto_fs::CHANGES;
+            let mut journal = Journal::new(flags, 0, 0).unwrap();
+            let intent = Intent::Open { flags };
+            let mut resolver =
+                Resolve::with_intent(&mut ram.storage, path, ROOT, identity, intent).unwrap();
+            for _ in 0..2000 {
+                if matches!(
+                    resolver.step(&mut ram.storage, identity).unwrap(),
+                    Progress::Found(_)
+                ) {
+                    break;
+                }
+            }
+            let proof = resolver
+                .result_proof(&ram.storage, identity, intent)
+                .unwrap();
+            let target = proof.target.unwrap();
+            let before_node = *ram.storage.node(target).unwrap();
+            let mut charge = ram.storage.charge_preparation(fds.root).unwrap();
+            let before_usage = ram.storage.usage(fds.root);
+            let before_epoch = ram.storage.state.epoch;
+            let before_generations = ram.description_generations;
+            let result = journal.prepare(&mut ram, &mut fds, proof, identity, &mut charge);
+            assert_eq!(result.map(|_| ()), expected);
+            if result.is_ok() {
+                let proof = resolver
+                    .result_proof(&ram.storage, identity, intent)
+                    .unwrap();
+                let held = journal
+                    .commit(
+                        &mut ram,
+                        &mut fds,
+                        Some(proof),
+                        identity,
+                        &mut charge,
+                        proto_fs::Timestamp::legacy_ns(20),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    journal.commit(
+                        &mut ram,
+                        &mut fds,
+                        None,
+                        identity,
+                        &mut charge,
+                        proto_fs::Timestamp::legacy_ns(99)
+                    ),
+                    Ok(held)
+                );
+                let fd = ram.publish_open(&mut fds, held).unwrap();
+                assert_eq!(ram.write(&mut fds, fd, b"device"), Ok(6));
+                assert_eq!(ram.size(&fds, fd), Ok(0));
+                ram.close(&mut fds, fd).unwrap();
+            }
+            assert_eq!(ram.storage.usage(fds.root), before_usage);
+            assert_eq!(ram.open_descriptions(), 0);
+            assert_eq!(ram.storage.state.epoch, before_epoch);
+            let after_node = ram.storage.node(target).unwrap();
+            assert_eq!(after_node.times, before_node.times);
+            assert_eq!(after_node.length, before_node.length);
+            assert_eq!(after_node.mode, before_node.mode);
+            assert_eq!(after_node.pins, before_node.pins);
+            if expected.is_err() {
+                assert_eq!(ram.description_generations, before_generations);
+            }
+            ram.storage.release_preparation(charge);
+            resolver.release(&mut ram.storage);
+        }
+        for change in [
+            proto_fs::CREATE,
+            proto_fs::EXCLUSIVE,
+            proto_fs::TRUNCATE,
+            proto_fs::APPEND,
+            proto_fs::NO_FOLLOW,
+        ] {
+            assert!(matches!(
+                Journal::new(proto_fs::CHANGES | change, 0, 0),
+                Err(proto_fs::INVALID_ARGUMENT)
+            ));
+        }
+        assert_eq!(ram.storage.preparations_used(), 0);
     }
 }

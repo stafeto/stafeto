@@ -10,7 +10,7 @@ use super::{call, value};
 use core::ffi::{c_char, c_int, c_ulong, c_void};
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
-use posix_abi::constants::{EBADF, EFAULT, EINVAL, ENOSYS, ESPIPE};
+use posix_abi::constants::{EBADF, EFAULT, EINVAL, ENOSYS};
 use posix_fs::{DescriptorFlags, FileKind, NodeInfo, SeekFrom, Target, Transport};
 
 /// relibc's struct stat on AArch64 Linux (asm-generic/stat.h).
@@ -48,6 +48,7 @@ const _: () = {
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
 const S_IFCHR: u32 = 0o020_000;
+const S_IFLNK: u32 = 0o120_000;
 const S_IFIFO: u32 = 0o010_000;
 /// Linux's dirent64 d_type.
 const DT_FIFO: u8 = 1;
@@ -58,14 +59,15 @@ const DT_REG: u8 = 8;
 const AT_FDCWD: c_int = -100;
 const AT_EMPTY_PATH: c_int = 0x1000;
 
-fn time(ns: u64) -> [i64; 2] {
-    [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64]
+fn time(time: posix_fs::Timestamp) -> [i64; 2] {
+    [time.seconds, i64::from(time.nanos)]
 }
 
 fn linux_stat(info: &NodeInfo) -> LinuxStat {
     let kind = match info.kind {
         1 => S_IFDIR,
         2 => S_IFREG,
+        5 => S_IFLNK,
         posix_fs::FIFO => S_IFIFO,
         _ => S_IFCHR,
     };
@@ -82,9 +84,9 @@ fn linux_stat(info: &NodeInfo) -> LinuxStat {
         blksize: info.block_size as i32,
         pad2: 0,
         blocks: info.blocks as i64,
-        atime: time(info.access_ns),
-        mtime: time(info.modify_ns),
-        ctime: time(info.change_ns),
+        atime: time(info.access_time),
+        mtime: time(info.modify_time),
+        ctime: time(info.change_time),
         unused: [0; 2],
     }
 }
@@ -227,36 +229,13 @@ pub unsafe extern "C" fn stafeto_getdents(
     }
 }
 
-/// pread and pwrite: at `offset`, the description's own offset as it
-/// was (READ_AT and WRITE_AT of the service), outside the lock.
-fn at_offset(
-    fd: c_int,
-    offset: i64,
-    run: impl FnOnce(Transport, u32, u64) -> Result<usize, posix_fs::FsError>,
-) -> isize {
-    let result = number(fd).and_then(|fd| {
-        posix_abi::shared::held(fd, |transport, target| {
-            // The console has no offset: ESPIPE.
-            let Target::Ram(fd) = target else {
-                return Err(ESPIPE);
-            };
-            let offset = u64::try_from(offset).map_err(|_| EINVAL)?;
-            run(transport, fd, offset).map_err(posix_abi::error)
-        })
-    });
-    match result {
-        Ok(count) => count as isize,
-        Err(errno) => -(errno as isize),
-    }
-}
-
 /// # Safety
 /// `buf` is writable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offset: i64) -> isize {
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    at_offset(fd, offset, |files, fd, at| files.read_at(fd, at, out))
+    value(posix_abi::pread(fd, out, offset).map(|n| n as i64)) as isize
 }
 
 /// # Safety
@@ -270,7 +249,16 @@ pub unsafe extern "C" fn stafeto_pwrite(
 ) -> isize {
     // SAFETY: the caller's promise.
     let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
-    at_offset(fd, offset, |files, fd, at| files.write_at(fd, at, bytes))
+    value(posix_abi::pwrite(fd, bytes, offset).map(|n| n as i64)) as isize
+}
+
+/// The platform returns zero or a negative errno, as its other C bridges do.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_ftruncate(fd: c_int, length: i64) -> c_int {
+    match posix_abi::ftruncate(fd, length) {
+        Ok(()) => 0,
+        Err(errno) => -errno,
+    }
 }
 
 /// # Safety
@@ -770,7 +758,7 @@ pub(crate) fn umask() -> u32 {
     UMASK.load(Ordering::Relaxed)
 }
 
-/// umask: the process's mask (no file the layer creates reads it yet).
+/// Captures the creation mask for subsequent Open and spawn operations.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_umask(mask: u32) -> u32 {
     UMASK.swap(mask & 0o777, Ordering::Relaxed)

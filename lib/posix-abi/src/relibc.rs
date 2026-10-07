@@ -17,7 +17,7 @@
 //! touches freed memory. The next `create`, or an exit, collects them.
 
 use crate::{allocation, constants::*};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use posix_thread::{Block, flag};
 use rt::abi::{Error, Policy, Rights, ThreadState};
 use rt::handle::{Channel, Handle, Thread};
@@ -30,19 +30,14 @@ const PAGE: usize = 4096;
 /// main thread's own, given by the loader).
 const BUFFERS: usize = 0x200_0000;
 
-/// States of a place.
-const FREE: u32 = 0;
-const MAKING: u32 = 1;
-const LIVE: u32 = 2;
-/// Bits added to LIVE: the thread called exit_thread (its stack is known),
-/// relibc released it.
-const EXITED: u32 = 4;
-const RELEASED: u32 = 8;
+mod lifetime;
+pub use lifetime::OwnerStatus;
+use lifetime::{DETACHED, DETACHING, EXITED, FREE, LIVE, Lifetime, RELEASED};
 
 /// A place of the table: 64 bytes.
 #[repr(C, align(64))]
 struct Place {
-    state: AtomicU32,
+    state: Lifetime,
     /// The thread's handle (all rights): for its state, interrupts and
     /// entries. The main thread's is borrowed.
     native: AtomicU64,
@@ -59,10 +54,13 @@ struct Place {
     floating: AtomicU64,
 }
 const _: () = assert!(core::mem::size_of::<Place>() == 64);
+const _: () = assert!(core::mem::offset_of!(Place, native) == 8);
+const _: () = assert!(core::mem::offset_of!(Place, block) == 16);
+const _: () = assert!(core::mem::offset_of!(Place, floating) == 56);
 
 static TABLE: [Place; PLACES] = [const {
     Place {
-        state: AtomicU32::new(FREE),
+        state: Lifetime::new(),
         native: AtomicU64::new(0),
         block: AtomicUsize::new(0),
         tcb: AtomicUsize::new(0),
@@ -111,6 +109,111 @@ pub fn current() -> u64 {
     unsafe { posix_thread::block().as_ref() }.map_or(0, |block| block.thread_id)
 }
 
+/// Fixed callbacks installed by shared initialization before its Ready state.
+static OPEN_DETACH: AtomicUsize = AtomicUsize::new(0);
+static OPEN_HELP: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the file layer callbacks once, before any resident Open exists.
+/// Fork preserves these code pointers; child initialization discards records.
+pub fn configure_open_lifetime(detach: fn(u64), help: fn()) {
+    let known = OPEN_DETACH.load(Ordering::Acquire);
+    assert!(known == 0 || known == detach as usize);
+    let known_help = OPEN_HELP.load(Ordering::Acquire);
+    assert!(known_help == 0 || known_help == help as usize);
+    OPEN_HELP.store(help as usize, Ordering::Release);
+    OPEN_DETACH.store(detach as usize, Ordering::Release);
+}
+
+fn owner_token(id: u64) -> Option<u64> {
+    let index = usize::try_from(id).ok()?.checked_sub(1)?;
+    TABLE.get(index)?.state.token(index)
+}
+
+/// The exact current lifetime, after the file layer registered its callbacks.
+pub fn open_owner() -> Result<u64, i32> {
+    if OPEN_DETACH.load(Ordering::Acquire) == 0 {
+        return Err(EIO);
+    }
+    let index = usize::try_from(current())
+        .ok()
+        .and_then(|id| id.checked_sub(1))
+        .ok_or(EIO)?;
+    TABLE
+        .get(index)
+        .and_then(|place| place.state.owner(index))
+        .ok_or(EIO)
+}
+
+fn detach_open_owner(owner: u64) {
+    let place = &TABLE[(owner & 63) as usize];
+    match place.state.begin_detach(owner) {
+        OwnerStatus::Gone | OwnerStatus::Detached => return,
+        OwnerStatus::Alive => unreachable!(),
+        OwnerStatus::Detaching => {}
+    }
+    let function = OPEN_DETACH.load(Ordering::Acquire);
+    if function != 0 {
+        // SAFETY: initialization stores this immutable fn(u64) code pointer.
+        let detach: fn(u64) = unsafe { core::mem::transmute(function) };
+        // The callback locally removes owner/helper references and preserves
+        // pending cleanup in the prepaid resident records. It is idempotent.
+        detach(owner);
+    }
+    place.state.finish_detach(owner);
+}
+
+/// Recover an ended owner before relibc join/release permits memory collection.
+/// The syscall under TABLE_LOCK reads native state; callbacks run after unlock.
+pub fn detach_ended_open_owner(owner: u64) -> OwnerStatus {
+    if owner >> 6 == 0 {
+        return OwnerStatus::Gone;
+    }
+    let place = &TABLE[(owner & 63) as usize];
+    {
+        let _guard = TABLE_LOCK.lock();
+        match place.state.status(owner) {
+            OwnerStatus::Gone => return OwnerStatus::Gone,
+            OwnerStatus::Detached => return OwnerStatus::Detached,
+            OwnerStatus::Detaching => {}
+            OwnerStatus::Alive => {
+                // A MAKING place has no published native handle yet.
+                if place.state.flags() & LIVE == 0 {
+                    return OwnerStatus::Alive;
+                }
+                let native = place.native.load(Ordering::Relaxed);
+                if native == 0
+                    || !sys::thread_info(&borrowed::<Thread>(native))
+                        .is_ok_and(|info| info.state == ThreadState::Ended)
+                {
+                    return OwnerStatus::Alive;
+                }
+                place.state.begin_detach(owner);
+            }
+        }
+    }
+    detach_open_owner(owner);
+    place.state.status(owner)
+}
+
+fn help_open_recovery() {
+    let function = OPEN_HELP.load(Ordering::Acquire);
+    if function != 0 {
+        // SAFETY: initialization stores this immutable fn() code pointer.
+        let help: fn() = unsafe { core::mem::transmute(function) };
+        help();
+    }
+}
+
+/// Old-image owners detach after exec quiesced their threads, before fd export.
+pub(crate) fn detach_for_exec() {
+    for (index, place) in TABLE.iter().enumerate() {
+        if let Some(owner) = place.state.token(index) {
+            detach_open_owner(owner);
+        }
+    }
+    help_open_recovery();
+}
+
 /// The number of the live thread whose relibc `pthread_t` is `pthread`,
 /// 0 for none: relibc's thread record lies in its TCB, whose page begins
 /// `BLOCK_OFFSET` before the block. For the guest probes.
@@ -118,7 +221,7 @@ pub fn current() -> u64 {
 pub fn number_of(pthread: u64) -> u64 {
     let pthread = pthread as usize;
     for (index, place) in TABLE.iter().enumerate() {
-        if place.state.load(Ordering::Acquire) & LIVE == 0 {
+        if place.state.flags() & LIVE == 0 {
             continue;
         }
         let tcb = place.block.load(Ordering::Relaxed) - posix_thread::BLOCK_OFFSET;
@@ -142,7 +245,7 @@ pub unsafe fn attach_main(block: *mut Block) {
     unsafe { (*block).thread_id = 1 };
     crate::signals::reset_taken_before_live(1);
     place.block.store(block as usize, Ordering::Relaxed);
-    place.state.store(LIVE, Ordering::Release);
+    place.state.main();
 }
 
 /// The table of a forked child (spec 2, 3.2): its only thread, number
@@ -160,7 +263,7 @@ pub unsafe fn after_fork(id: u64, native: u64) {
             place.native.store(native, Ordering::Relaxed);
             place.stack.store(0, Ordering::Relaxed);
             place.stack_len.store(0, Ordering::Relaxed);
-            place.state.store(LIVE, Ordering::Release);
+            place.state.after_fork(true);
             continue;
         }
         place.native.store(0, Ordering::Relaxed);
@@ -169,7 +272,7 @@ pub unsafe fn after_fork(id: u64, native: u64) {
         place.tcb_len.store(0, Ordering::Relaxed);
         place.stack.store(0, Ordering::Relaxed);
         place.stack_len.store(0, Ordering::Relaxed);
-        place.state.store(FREE, Ordering::Release);
+        place.state.after_fork(false);
     }
     EXITS.store(0, Ordering::Release);
     ROUTER.store(id, Ordering::Release);
@@ -188,7 +291,7 @@ pub fn target(id: u64) -> Result<(&'static Block, core::mem::ManuallyDrop<Handle
         .and_then(|id| id.checked_sub(1))
         .and_then(|index| TABLE.get(index))
         .ok_or(ESRCH)?;
-    if place.state.load(Ordering::Acquire) & LIVE == 0 {
+    if place.state.flags() & LIVE == 0 {
         return Err(ESRCH);
     }
     let block = place.block.load(Ordering::Relaxed) as *const Block;
@@ -207,7 +310,7 @@ static TABLE_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::raising();
 pub fn each_block(mut f: impl FnMut(&Block)) {
     let _guard = TABLE_LOCK.lock();
     for place in &TABLE {
-        if place.state.load(Ordering::Acquire) & LIVE != 0 {
+        if place.state.flags() & LIVE != 0 {
             // SAFETY: as in `target`.
             f(unsafe { &*(place.block.load(Ordering::Relaxed) as *const Block) });
         }
@@ -219,7 +322,7 @@ pub fn each_block(mut f: impl FnMut(&Block)) {
 pub fn each_live(mut f: impl FnMut(usize, u64, &Block)) {
     let _guard = TABLE_LOCK.lock();
     for (index, place) in TABLE.iter().enumerate() {
-        if place.state.load(Ordering::Acquire) & LIVE != 0 {
+        if place.state.flags() & LIVE != 0 {
             let native = place.native.load(Ordering::Relaxed);
             // SAFETY: as in `target`.
             f(index, native, unsafe {
@@ -233,7 +336,7 @@ pub fn each_live(mut f: impl FnMut(usize, u64, &Block)) {
 pub fn occupied() -> usize {
     TABLE
         .iter()
-        .filter(|place| place.state.load(Ordering::Acquire) != FREE)
+        .filter(|place| place.state.flags() != FREE)
         .count()
 }
 
@@ -245,23 +348,25 @@ pub fn collect() {
         let channel = borrowed::<Channel>(exits);
         while sys::try_receive(&channel).is_ok() {}
     }
+    // Owner recovery precedes relibc release and stack/TCB reclamation.
+    for (index, place) in TABLE.iter().enumerate() {
+        if let Some(owner) = place.state.token(index) {
+            let _ = detach_ended_open_owner(owner);
+        }
+    }
+    help_open_recovery();
     for place in &TABLE[1..] {
-        let state = place.state.load(Ordering::Acquire);
-        if state != LIVE | EXITED | RELEASED {
+        if place.state.flags() != LIVE | EXITED | RELEASED | DETACHED {
+            continue;
+        }
+        let _guard = TABLE_LOCK.lock();
+        if place.state.flags() != LIVE | EXITED | RELEASED | DETACHED {
             continue;
         }
         let native = place.native.load(Ordering::Relaxed);
         let ended = sys::thread_info(&borrowed::<Thread>(native))
             .is_ok_and(|info| info.state == ThreadState::Ended);
-        // One collector takes the place, under the lock of the table: no
-        // `each_block` reads the block from here until the place is free.
-        let _guard = TABLE_LOCK.lock();
-        if !ended
-            || place
-                .state
-                .compare_exchange(state, MAKING, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-        {
+        if !ended || !place.state.claim_collect() {
             continue;
         }
         // SAFETY: the TCB is mapped until the unmap below.
@@ -278,13 +383,10 @@ pub fn collect() {
             place.tcb.swap(0, Ordering::Relaxed),
             place.tcb_len.swap(0, Ordering::Relaxed),
         );
-        // A use of the TCB after its end reads this pattern and finds none of the
-        // stale values: a joiner's return value, a pthread_t's thread number.
-        // SAFETY: the TCB is relibc's mapping of tcb_len bytes, which nobody
-        // uses any more.
+        // SAFETY: relibc released the ended thread; no reader uses its TCB.
         unsafe { core::ptr::write_bytes(tcb as *mut u8, 0xA5, tcb_len) };
         unmap(tcb, tcb_len);
-        place.state.store(FREE, Ordering::Release);
+        place.state.free();
     }
 }
 
@@ -293,7 +395,7 @@ pub fn collect() {
 fn exiting() -> bool {
     TABLE[1..]
         .iter()
-        .any(|place| place.state.load(Ordering::Acquire) & RELEASED != 0)
+        .any(|place| place.state.flags() & RELEASED != 0)
 }
 
 fn exits() -> Result<u64, i32> {
@@ -319,11 +421,7 @@ fn reserve() -> Result<usize, i32> {
     loop {
         collect();
         for (index, place) in TABLE.iter().enumerate().skip(1) {
-            if place
-                .state
-                .compare_exchange(FREE, MAKING, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
+            if place.state.reserve() {
                 return Ok(index);
             }
         }
@@ -378,14 +476,23 @@ pub unsafe fn create(
     let place = &TABLE[index];
     let id = index as u64 + 1;
     let undo = |native: u64, channel: u64, timer: u64, own: u64| {
+        if let Some(owner) = place.state.token(index) {
+            detach_open_owner(owner);
+        }
         close_raw(timer);
         close_raw(channel);
         close_raw(own);
         close_raw(native);
         unmap(tcb, tcb_len);
-        place.state.store(FREE, Ordering::Release);
+        place.state.free();
     };
-    let ceiling = crate::ceiling().map_err(|_| EIO)?;
+    let ceiling = match crate::ceiling() {
+        Ok(ceiling) => ceiling,
+        Err(_) => {
+            undo(0, 0, 0, 0);
+            return Err(EIO);
+        }
+    };
     // The creator's policy: round robin unless it asked for FIFO.
     let policy_raw = me.policy.load(Ordering::Relaxed);
     let policy = Policy::from_raw(policy_raw).unwrap_or(Policy::RoundRobin);
@@ -447,7 +554,7 @@ pub unsafe fn create(
     place.stack_len.store(0, Ordering::Relaxed);
     place.floating.store(floating(), Ordering::Relaxed);
     crate::signals::reset_taken_before_live(id);
-    place.state.store(LIVE, Ordering::Release);
+    place.state.set_flags(LIVE);
     let hook = START_WINDOW.swap(0, Ordering::AcqRel);
     if hook != 0 {
         // SAFETY: only probe_start_window stores a C function with this signature.
@@ -457,7 +564,7 @@ pub unsafe fn create(
     if sys::thread_start(&native).is_err() {
         // SAFETY: the block is the new thread's, which never ran.
         let block = unsafe { &*block };
-        place.state.store(MAKING, Ordering::Release);
+        place.state.rollback();
         undo(
             native.into_raw().0,
             block.channel.swap(0, Ordering::Relaxed),
@@ -532,11 +639,14 @@ pub fn leaving() {
     // one; with none left the process ends as exit(0) ends it (POSIX: the
     // last thread's pthread_exit), atexit handlers and stdio included.
     let own = current();
+    if let Some(owner) = owner_token(own) {
+        detach_open_owner(owner);
+    }
     // A thread that left is LIVE until its place goes (the main thread's
     // never does); its block says EXITING from `leaving` on.
     let next = TABLE.iter().enumerate().find(|(index, place)| {
         index + 1 != own as usize
-            && place.state.load(Ordering::Acquire) & (LIVE | EXITED) == LIVE
+            && place.state.flags() & (LIVE | EXITED | DETACHING | DETACHED) == LIVE
             // SAFETY: a LIVE place's block lives until the place goes, and
             // only `collect` frees a place, under the lock, after EXITED.
             && unsafe { (place.block.load(Ordering::Acquire) as *const Block).as_ref() }
@@ -571,7 +681,7 @@ pub fn release(id: u64) {
         .filter(|&index| index != 0)
         .and_then(|index| TABLE.get(index))
     {
-        place.state.fetch_or(RELEASED, Ordering::AcqRel);
+        place.state.add_flags(RELEASED);
     }
 }
 
@@ -587,7 +697,7 @@ pub fn exit_thread(stack: usize, length: usize) -> ! {
     {
         place.stack.store(stack, Ordering::Relaxed);
         place.stack_len.store(length, Ordering::Relaxed);
-        place.state.fetch_or(EXITED, Ordering::AcqRel);
+        place.state.add_flags(EXITED);
     }
     collect();
     sys::thread_exit()

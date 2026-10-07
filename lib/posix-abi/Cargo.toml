@@ -19,6 +19,8 @@ rtbench = []
 # the file and heap workers, a cancellation window and a borrow of the
 # file state (tests/posix-threads, tests/posix-shared).
 thread-probe = []
+open-finalize-clock-probe = []
+data-driver-probe = []
 
 [dependencies]
 posix-types = { path = "../posix-types" }

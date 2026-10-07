@@ -28,6 +28,8 @@ exit-early = []
 # feature step-stats; xtask process-steps, under -icount).
 steps = ["rt/step-stats"]
 tty-probe = []
+# Exact SetId reply corruption and readonly Image handoff diagnostics.
+image-probe = []
 
 [dependencies]
 proto-process = { path = "../../proto/process" }
@@ -41,3 +43,6 @@ posix-credentials = { path = "../../lib/posix-credentials" }
 bootimg = { path = "../../lib/bootimg" }
 proto-loader = { path = "../../proto/loader" }
 rt = { path = "../../lib/rt" }
+
+[dev-dependencies]
+abi = { path = "../../lib/abi" }

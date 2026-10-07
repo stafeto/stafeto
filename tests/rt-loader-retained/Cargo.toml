@@ -1,0 +1,11 @@
+[package]
+name = "rt-loader-retained-tests"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+bootimg = { path = "../../lib/bootimg" }

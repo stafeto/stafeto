@@ -68,7 +68,15 @@ unsafe extern "C" fn seen_holding(_: i32) {
 }
 
 /// dup while main holds the lock of the files.
-unsafe extern "C" fn dupper(_: *mut c_void) -> *mut c_void {
+unsafe extern "C" fn dupper(argument: *mut c_void) -> *mut c_void {
+    let gate = Handle::<Channel>::borrowed(rt::abi::Handle(argument as u64));
+    loop {
+        match sys::receive(&gate) {
+            Ok(sys::Received::Notification { bits, .. }) if bits & 1 != 0 => break,
+            Ok(_) | Err(rt::abi::Error::Interrupted) => {}
+            Err(_) => return ptr::null_mut(),
+        }
+    }
     let fd = FD.load(Ordering::SeqCst) as i32;
     let copy = unsafe { ffi::dup(fd) };
     if copy >= 0 && unsafe { ffi::close(copy) } == 0 {
@@ -128,20 +136,35 @@ fn files_lock_and_stack(fd: i32) -> bool {
         tv_nsec: 5_000_000,
     };
     let mut id = 0;
-    let mut created = false;
+    let gate = sys::channel_create(30).expect("file waiter gate");
+    // Thread creation collects ended owners through the file table.
+    // The gate keeps the new thread outside that table until main holds it.
+    if unsafe {
+        ffi::pthread_create(
+            &mut id,
+            ptr::null(),
+            Some(dupper),
+            gate.raw().0 as usize as *mut c_void,
+        )
+    } != 0
+    {
+        return failed(696);
+    }
+    let mut blocked = false;
+    let mut signalled = false;
     abi::shared::probe_hold(|| {
         HOLDING.store(1, Ordering::SeqCst);
-        created =
-            unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(dupper), ptr::null_mut()) }
-                == 0;
-        // The dupper runs while main sleeps and waits for the lock; the
-        // signal comes then.
+        sys::notify(&gate, 1).expect("start file waiter");
         let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
-        let _ = ffi::pthread_kill(id, SIGUSR1);
+        blocked = futex_blocked(id) && DUPED.load(Ordering::SeqCst) == 0;
+        if blocked {
+            signalled = ffi::pthread_kill(id, SIGUSR1) == 0;
+        }
         let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
         HOLDING.store(0, Ordering::SeqCst);
     });
-    if !created
+    if !blocked
+        || !signalled
         || unsafe { ffi::pthread_join(id, ptr::null_mut()) } != 0
         || DUPED.load(Ordering::SeqCst) != 1
         || CAUGHT_HOLDING.load(Ordering::SeqCst) != 0

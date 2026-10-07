@@ -716,6 +716,33 @@ pub fn check_alive(process: NonNull<Process>) -> Result<(), Error> {
     }
 }
 
+/// A live started sibling keeps the native reply-loss probe's process alive.
+#[cfg(feature = "ipc-loss-probe")]
+pub fn probe_started_peer(process: NonNull<Process>, target: NonNull<Thread>) -> bool {
+    sched::locked(|_| {
+        // SAFETY: target holds process, its list holds each linked thread,
+        // and the scheduler lock guards their states on the single core.
+        unsafe {
+            if !(*life(process)).is_alive() {
+                return false;
+            }
+            let mut at = (*process.as_ptr()).threads;
+            while let Some(t) = at {
+                if t != target
+                    && !matches!(
+                        t.as_ref().sched.state(),
+                        kcore::sched::State::Stopped | kcore::sched::State::Dead
+                    )
+                {
+                    return true;
+                }
+                at = t.as_ref().siblings.and_then(|s| s.next);
+            }
+            false
+        }
+    })
+}
+
 /// The process's life, as a raw pointer to its field (see `refs`). Test
 /// builds stop a process that went, as `Refs::check` does.
 ///
@@ -972,4 +999,10 @@ mod test_access {
         let tables = p.retired.as_ref().map_or(0, |r| r.freed());
         (p.stage, p.handles.len(), tables)
     }
+}
+
+/// Physical object slots retained by the dedicated native guest.
+#[cfg(feature = "ipc-loss-probe")]
+pub fn probe_in_use() -> usize {
+    LIVE.count()
 }

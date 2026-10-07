@@ -253,3 +253,9 @@ mod test_access {
         unsafe { (*s.as_ptr()).payer }
     }
 }
+
+/// Physical object slots retained by the dedicated native guest.
+#[cfg(feature = "ipc-loss-probe")]
+pub fn probe_in_use() -> usize {
+    LIVE.count()
+}

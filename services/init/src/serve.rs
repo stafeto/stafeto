@@ -34,11 +34,11 @@
 
 use crate::worker::{Kept, Loaded, Worker};
 use abi::{Error, ObjectKind, ProcessState, Rights, Source};
-use bootimg::Program;
 use core::fmt;
 use core::mem;
 use core::mem::ManuallyDrop;
 use init::PAGE;
+use init::initial::InitialProgram;
 use init::labels::Labels;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
@@ -304,7 +304,7 @@ pub struct Init {
     resource: Handle<Resource>,
     worker: Worker,
     labels: Labels,
-    programs: [Option<Program<'static>>; MAX_RECORDS],
+    programs: [Option<InitialProgram<'static>>; MAX_RECORDS],
     entries: [Entry; MAX_RECORDS],
     /// The job the worker does and those that wait.
     jobs: Jobs,
@@ -324,7 +324,7 @@ impl Init {
         resource: Handle<Resource>,
         worker: Worker,
         labels: Labels,
-        programs: [Option<Program<'static>>; MAX_RECORDS],
+        programs: [Option<InitialProgram<'static>>; MAX_RECORDS],
     ) -> Init {
         Init {
             own,
@@ -398,7 +398,7 @@ impl Init {
         let posix = (0..TABLE.len()).filter(|&p| TABLE[p].is_posix());
         let children: u64 = posix
             .filter_map(|p| {
-                self.programs[p].map(|program| quota::need_pages(TABLE[p].quota, &program))
+                self.programs[p].map(|program| quota::need_pages(TABLE[p].quota, &program.program))
             })
             .sum();
         record.quota + children * PAGE
@@ -445,7 +445,7 @@ impl Init {
                     let program =
                         self.programs[place].expect("init found each program at its start");
                     let quota = self.quota_of(place);
-                    self.worker.load(place, label, program, quota)
+                    self.worker.load(place, label, program.program, quota)
                 }
                 Work::Teardown => self
                     .worker
@@ -467,7 +467,7 @@ impl Init {
     fn quota_fits(&mut self, place: usize) -> bool {
         let record = &TABLE[place];
         let quota = self.quota_of(place);
-        let need = self.programs[place].map_or(u64::MAX, |p| quota::need_pages(quota, &p));
+        let need = self.programs[place].map_or(u64::MAX, |p| quota::need_pages(quota, &p.program));
         let memory = sys::process_memory(&self.own);
         let free = memory.map_or(0, |m| m.quota.saturating_sub(m.used) / PAGE);
         let entry = &mut self.entries[place];
@@ -653,6 +653,9 @@ impl Init {
         let witness = self.labels.next().expect("init gave every label");
         let seen = sys::handle_label(&self.channel, Rights::TRANSFER, witness, record.priority)?;
         let adoption = Adoption {
+            source: self.programs[place]
+                .expect("init checked each source")
+                .source,
             ticket,
             quota: record.quota,
             handle_limit: record.handle_limit,
@@ -661,7 +664,7 @@ impl Init {
             root: record.root,
             program: Name::new(record.program.as_bytes()).expect("a checked table has names"),
         };
-        // The reply has room for the 48 bytes of an adoption.
+        // The reply has room for the 64 bytes of an adoption.
         let _ = adoption.write(w);
         self.entries[place].ticket = ticket;
         self.entries[place].witness = witness;

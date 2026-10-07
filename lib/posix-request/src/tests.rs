@@ -9,6 +9,8 @@ fn all_request_kinds_roundtrip() {
     let requests = [
         Request::Open {
             flags: 2,
+            mode: 0o764,
+            umask: 0o027,
             path: b"/tmp/probe",
         },
         Request::Close { fd: 3 },
@@ -70,7 +72,7 @@ fn fixed_fields_have_checked_lengths_and_little_endian_values() {
     let bytes = out.as_bytes();
     assert_eq!(
         &bytes[..12],
-        &[5, 0, 1, 0, 0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12]
+        &[5, 0, 2, 0, 0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12]
     );
     assert_eq!(&bytes[12..20], &(-2i64).to_le_bytes());
     assert_eq!(&bytes[20..], &[2, 0, 0, 0]);
@@ -88,7 +90,7 @@ fn fixed_fields_have_checked_lengths_and_little_endian_values() {
 #[test]
 fn unknown_versions_methods_reserved_fields_and_invalid_paths_are_rejected() {
     let mut header = Header::new(10, VERSION).bytes();
-    header[2] = 2;
+    header[2] = (VERSION + 1) as u8;
     assert_eq!(Request::read(&header), Err(Status::BadVersion));
     header = Header::new(65535, VERSION).bytes();
     assert_eq!(Request::read(&header), Err(Status::UnknownMethod));
@@ -132,7 +134,7 @@ fn full_payloads_fit_the_kernel_message_and_do_not_alias_the_source() {
     .write(&mut wire)
     .unwrap();
     assert_eq!(wire.as_bytes().len(), MESSAGE_MAX);
-    assert_eq!(&out.as_bytes()[..12], &[4, 0, 1, 0, 0, 0, 0, 0, 4, 3, 2, 1]);
+    assert_eq!(&out.as_bytes()[..12], &[4, 0, 2, 0, 0, 0, 0, 0, 4, 3, 2, 1]);
     payload.fill(0);
     let exchange::Exchange::Execute { request, .. } =
         exchange::Exchange::read(wire.as_bytes()).unwrap()
@@ -175,9 +177,9 @@ fn reply_tags_status_input_extent_and_metadata_are_validated() {
         size: 91,
         block_size: 1024,
         blocks: 1,
-        access_ns: 1,
-        modify_ns: 2,
-        change_ns: 3,
+        access_time: proto_fs::Timestamp::legacy_ns(1),
+        modify_time: proto_fs::Timestamp::legacy_ns(2),
+        change_time: proto_fs::Timestamp::legacy_ns(3),
     };
     let replies = [
         Reply::Unit,
@@ -234,4 +236,25 @@ fn reply_tags_status_input_extent_and_metadata_are_validated() {
         }
         assert_eq!(Reply::read(out.as_bytes()), Err(Status::BadSize));
     }
+}
+
+#[test]
+fn open_policy_is_complete_before_its_path_and_keeps_mode_zero() {
+    let request = Request::Open {
+        flags: 0x101,
+        mode: 0,
+        umask: 0o077,
+        path: b"/created",
+    };
+    let mut out = Writer::new();
+    request.write(&mut out).unwrap();
+    assert_eq!(Request::read(out.as_bytes()), Ok(request));
+    for size in 8..20 {
+        assert_eq!(Request::read(&out.as_bytes()[..size]), Err(Status::BadSize));
+    }
+    let mut old = Writer::new();
+    Header::new(1, 1).write(&mut old).unwrap();
+    old.u32(1).unwrap();
+    old.bytes(b"/created").unwrap();
+    assert_eq!(Request::read(old.as_bytes()), Err(Status::BadVersion));
 }

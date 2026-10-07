@@ -13,22 +13,26 @@
 use crate::constants::*;
 use core::{
     cell::UnsafeCell,
+    mem::MaybeUninit,
     sync::atomic::{AtomicBool, Ordering},
 };
-use posix_fs::{PosixFs, Resolved, Target, Transport};
+use posix_fs::{Inherited, PosixFs, Resolved, StartupFiles, Target, Transport};
 use posix_request::{MESSAGE_MAX, Reply, Request};
 use posix_sync::LayerLock;
 use proto_wire::Writer;
 use rt::handle::Handle;
 
 struct State {
-    files: Option<PosixFs>,
+    files: MaybeUninit<PosixFs>,
 }
 struct Cell(UnsafeCell<State>);
 // SAFETY: startup installs the files once; afterwards only `process_state`
 // borrows the state, under FILES_LOCK.
 unsafe impl Sync for Cell {}
-static STATE: Cell = Cell(UnsafeCell::new(State { files: None }));
+static STATE: Cell = Cell(UnsafeCell::new(State {
+    files: MaybeUninit::uninit(),
+}));
+static STARTED: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 static FILES_LOCK: LayerLock = LayerLock::raising();
 pub fn terminals_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
@@ -44,12 +48,33 @@ pub fn probe_hold(run: impl FnOnce()) {
 
 /// # Safety
 /// Startup has exclusive access, before any client thread uses the files.
-pub unsafe fn init(files: PosixFs) -> Result<(), rt::abi::Error> {
-    if READY.load(Ordering::Acquire) {
+pub unsafe fn init(
+    startup: StartupFiles,
+    cwd: &[u8],
+    inherited: Option<&[Inherited]>,
+    secure: bool,
+    identity: Option<&Handle<rt::handle::Channel>>,
+) -> Result<(), rt::abi::Error> {
+    if STARTED.swap(true, Ordering::AcqRel) {
         return Err(rt::abi::Error::BadState);
     }
+    if let Some(identity) = identity {
+        startup
+            .bind(identity)
+            .map_err(|_| rt::abi::Error::BadState)?;
+    }
     // SAFETY: startup has exclusive access; no client exists yet.
-    unsafe { (*STATE.0.get()).files = Some(files) };
+    unsafe {
+        PosixFs::initialize_at(
+            (*STATE.0.get()).files.as_mut_ptr(),
+            startup,
+            cwd,
+            inherited,
+            secure,
+        )
+    }
+    .map_err(|_| rt::abi::Error::BadState)?;
+    crate::relibc::configure_open_lifetime(detach_open_owner, help_open_recovery);
     READY.store(true, Ordering::Release);
     Ok(())
 }
@@ -69,7 +94,9 @@ pub unsafe fn after_fork(
         return;
     }
     // SAFETY: the caller's promise gives this borrow alone.
-    if let Some(own) = unsafe { (*STATE.0.get()).files.as_mut() } {
+    {
+        // SAFETY: READY witnesses complete in-place initialization.
+        let own = unsafe { (*STATE.0.get()).files.assume_init_mut() };
         own.after_fork(files, uart, pipes, terminal);
         if let Some(identity) = crate::process::identity() {
             let _ = own.bind(identity);
@@ -79,7 +106,7 @@ pub unsafe fn after_fork(
 
 /// The descriptions of the RAM file service a forked child's session
 /// shares (posix_fs::PosixFs::kept_by_fork), into `out`; how many.
-pub fn kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+pub fn kept_by_fork(out: &mut [rt::fs::PreparedOpen; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
     process_state(|files| Ok(files.kept_by_fork(out)))
 }
 
@@ -104,7 +131,8 @@ fn process_state<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R,
     let _guard = FILES_LOCK.lock();
     // SAFETY: the lock gives this borrow alone; READY published the state.
     let state = unsafe { &mut *STATE.0.get() };
-    let files = state.files.as_mut().ok_or(ENOSYS)?;
+    // SAFETY: READY witnesses complete initialization and the lock is exclusive.
+    let files = unsafe { state.files.assume_init_mut() };
     f(files)
 }
 
@@ -136,13 +164,54 @@ fn window() {
 /// RAM and pipe close waits until `run` is over. Terminal last-fd close
 /// releases the real hold immediately; armed I/O retains a service pin.
 pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -> Result<R, i32> {
-    let (transport, target) =
-        process_state(|files| Ok((files.transport(), files.hold(fd).map_err(crate::error)?)))?;
+    enum Capture {
+        OwnerRequired,
+        Legacy(Transport, Target),
+        Ram(Transport, Target, crate::io_driver::Pin),
+    }
+    let mut owner = None;
+    let capture = loop {
+        let capture = process_state(|files| {
+            let target = files.target(fd).map_err(crate::error)?;
+            if matches!(target, Target::Ram(_) | Target::Random(_)) {
+                let Some(owner) = owner else {
+                    return Ok(Capture::OwnerRequired);
+                };
+                let (token, target, transport) = files.begin_io(owner, fd).map_err(crate::error)?;
+                Ok(Capture::Ram(
+                    transport,
+                    target,
+                    crate::io_driver::Pin { token, owner },
+                ))
+            } else {
+                Ok(Capture::Legacy(
+                    files.transport(),
+                    files.hold(fd).map_err(crate::error)?,
+                ))
+            }
+        })?;
+        if matches!(capture, Capture::OwnerRequired) {
+            owner =
+                Some(posix_fs::io::OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)?);
+        } else {
+            break capture;
+        }
+    };
     window();
-    let result = run(transport, target);
-    let release = process_state(|files| Ok(files.unhold(target)))?;
-    let _ = transport.release(release);
-    result
+    match capture {
+        Capture::Ram(transport, target, pin) => {
+            let result = run(transport, target);
+            drop(pin);
+            result
+        }
+        Capture::Legacy(transport, target) => {
+            let result = run(transport, target);
+            let release = process_state(|files| Ok(files.unhold(target)))?;
+            let _ = transport.release(release);
+            result
+        }
+        Capture::OwnerRequired => unreachable!(),
+    }
 }
 
 /// Runs `run` with the transports and `path` resolved against the
@@ -186,7 +255,7 @@ pub fn abandon_holds() {
 
 /// Close of the service's open description `fd`, which the table handed
 /// back to release, outside the lock.
-pub fn release(fd: u32) -> Result<(), i32> {
+pub fn release(fd: posix_fs::RamTarget) -> Result<(), i32> {
     release_target(Target::Ram(fd))
 }
 
@@ -264,44 +333,102 @@ fn terminal_reply(
 /// pipe or of the terminal waits here. Each kind has its own frame: the
 /// reads of files stay as deep as they were (threads with small stacks
 /// read files).
-fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
-    held(fd, |transport, target| match target {
-        Target::Pipe(end) => pipe_reply(transport, end, count, &mut *out),
-        Target::Input if transport.terminal().is_some() => {
-            terminal_reply(transport, proto_tty::CONSOLE, count, &mut *out)
-        }
-        Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
-        Target::Random(_) => random_reply(count, &mut *out),
-        target => file_reply(transport, target, count, &mut *out),
+fn nonram_read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<bool, i32> {
+    held(fd, |transport, target| {
+        match target {
+            Target::Ram(_) => return Ok(false),
+            Target::Pipe(end) => pipe_reply(transport, end, count, &mut *out),
+            Target::Input if transport.terminal().is_some() => {
+                terminal_reply(transport, proto_tty::CONSOLE, count, &mut *out)
+            }
+            Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
+            Target::Random(_) => random_reply(count, &mut *out),
+            target => file_reply(transport, target, count, &mut *out),
+        }?;
+        Ok(true)
     })
+}
+
+/// The public read caller copies RAM cache directly to its current buffer.
+/// A route changed by concurrent close/reuse repeats atomic data admission.
+pub(crate) fn read_nonram<'a>(
+    fd: u32,
+    count: u32,
+    buffer: &'a mut [u8; MESSAGE_MAX],
+) -> Result<Option<Reply<'a>>, i32> {
+    let mut encoded = Writer::new();
+    if !nonram_read_reply(fd, count, &mut encoded)? {
+        return Ok(None);
+    }
+    let bytes = encoded.as_bytes();
+    buffer[..bytes.len()].copy_from_slice(bytes);
+    Reply::read(&buffer[..bytes.len()])
+        .map(Some)
+        .map_err(|_| EIO)
+}
+
+#[inline(never)]
+fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
+    loop {
+        let count = count.min(proto_fs::MAX_READ as u32);
+        if let Some(operation) =
+            crate::data_driver::begin(fd, posix_fs::data::DataKind::Read, count, 0, &[])?
+        {
+            let mut bytes = [0; proto_fs::MAX_READ];
+            let used = operation.run(&mut bytes[..count as usize])?;
+            return Reply::Bytes(&bytes[..used as usize])
+                .write(out)
+                .map_err(|_| EIO);
+        }
+        if nonram_read_reply(fd, count, out)? {
+            return Ok(());
+        }
+    }
 }
 
 /// What an open of a name gave: a description of the RAM file service, or
 /// a terminal of the terminal service.
 #[derive(Clone, Copy)]
 enum Opened {
-    File(Target),
+    Resident(u32),
     /// A terminal, and whether it was opened as /dev/tty.
     Terminal(u32, bool),
 }
 
 /// Open: the path resolved under the lock, the service's open outside it,
 /// then the descriptor under it again.
-fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
+fn open(path: &[u8], flags: i32, mode: u32, umask: u32) -> Result<u64, i32> {
     if flags
-        & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY | O_NONBLOCK)
+        & !(O_ACCMODE
+            | O_DIRECTORY
+            | O_CLOEXEC
+            | O_CLOFORK
+            | O_CHANGES
+            | O_NOCTTY
+            | O_NONBLOCK
+            | O_CREAT
+            | O_EXCL
+            | O_TRUNC
+            | O_APPEND
+            | O_NOFOLLOW)
         != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
         return Err(EINVAL);
     }
-    let mut directory = if flags & O_DIRECTORY != 0 {
-        posix_fs::DIRECTORY_ONLY
-    } else {
-        0
-    };
-    if flags & O_CHANGES != 0 {
-        directory |= posix_fs::CHANGES;
+    let mut policy = (flags & O_ACCMODE) as u32;
+    for (local, backend) in [
+        (O_DIRECTORY, posix_fs::DIRECTORY_ONLY),
+        (O_CHANGES, posix_fs::CHANGES),
+        (O_CREAT, posix_fs::CREATE),
+        (O_EXCL, posix_fs::EXCLUSIVE),
+        (O_TRUNC, posix_fs::TRUNCATE),
+        (O_APPEND, posix_fs::APPEND),
+        (O_NOFOLLOW, posix_fs::NO_FOLLOW),
+    ] {
+        if flags & local != 0 {
+            policy |= backend;
+        }
     }
     let (transport, opened) = resolved(path, |transport, path| {
         if path.trailing_slash
@@ -327,15 +454,20 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
                 ),
             ));
         }
-        let opened = transport
-            .open(path.as_bytes(), (flags & O_ACCMODE) as u32 | directory)
-            .map_err(crate::error)?;
-        Ok((transport, Opened::File(opened)))
+        let fd = crate::open_driver::open(
+            transport,
+            path.as_bytes(),
+            policy,
+            mode,
+            umask,
+            crate::descriptor_flags(flags),
+        )?;
+        Ok((transport, Opened::Resident(fd)))
     })?;
     let inserted = process_state(|files| {
         let flags = crate::descriptor_flags(flags);
         match opened {
-            Opened::File(fd) => files.insert(fd, flags),
+            Opened::Resident(fd) => return Ok(fd),
             Opened::Terminal(number, _) => files.insert_terminal(number, flags),
         }
         .map_err(crate::error)
@@ -352,7 +484,7 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
     }
     if inserted.is_err() {
         let target = match opened {
-            Opened::File(target) => target,
+            Opened::Resident(_) => return inserted.map(u64::from),
             Opened::Terminal(id, _) => Target::Tty(id),
         };
         let _ = transport.release(Some(target));
@@ -360,34 +492,69 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
     inserted.map(u64::from)
 }
 
+/// Selects exact RAM scalar custody before entering device transport frames.
+pub(crate) fn write(fd: u32, bytes: &[u8]) -> Result<u64, i32> {
+    if !READY.load(Ordering::Acquire) {
+        return Err(ENOSYS);
+    }
+    loop {
+        let extent = &bytes[..bytes.len().min(proto_fs::MAX_WRITE)];
+        if let Some(operation) = crate::data_driver::begin(
+            fd,
+            posix_fs::data::DataKind::Write,
+            extent.len() as u32,
+            0,
+            extent,
+        )? {
+            break operation.run(&mut []);
+        }
+        let result = write_nonram(fd, bytes)?;
+        if let Some(result) = result {
+            break Ok(result);
+        }
+    }
+}
+
+#[inline(never)]
+fn write_nonram(fd: u32, bytes: &[u8]) -> Result<Option<u64>, i32> {
+    held(fd, |transport, target| {
+        // A file or the console takes at most one message of it.
+        let extent = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];
+        match target {
+            // The write of the terminal waits here, outside the lock.
+            Target::Output | Target::Error if transport.terminal().is_some() => {
+                crate::terminal::write(transport, proto_tty::CONSOLE, bytes).map(|n| n as u64)
+            }
+            Target::Tty(number) => {
+                crate::terminal::write(transport, number, bytes).map(|n| n as u64)
+            }
+            Target::Output | Target::Error => transport
+                .input()
+                .write(extent)
+                .map(|n| n as u64)
+                .map_err(|status| crate::error(posix_fs::FsError::from(status))),
+            // The write of a pipe waits here, outside the lock.
+            Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
+            Target::Ram(_) | Target::Random(_) => return Ok(None),
+            target => transport
+                .write(target, extent)
+                .map(|n| n as u64)
+                .map_err(crate::error),
+        }
+        .map(Some)
+    })
+}
+
 fn number_operation(request: Request<'_>) -> Result<u64, i32> {
     use Request::*;
     match request {
-        Open { path, flags } => open(path, flags as i32),
-        Write { fd, bytes } => held(fd, |transport, target| {
-            // A file or the console takes at most one message of it.
-            let extent = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];
-            match target {
-                // The write of the terminal waits here, outside the lock.
-                Target::Output | Target::Error if transport.terminal().is_some() => {
-                    crate::terminal::write(transport, proto_tty::CONSOLE, bytes).map(|n| n as u64)
-                }
-                Target::Tty(number) => {
-                    crate::terminal::write(transport, number, bytes).map(|n| n as u64)
-                }
-                Target::Output | Target::Error => transport
-                    .input()
-                    .write(extent)
-                    .map(|n| n as u64)
-                    .map_err(|status| crate::error(posix_fs::FsError::from(status))),
-                // The write of a pipe waits here, outside the lock.
-                Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
-                target => transport
-                    .write(target, extent)
-                    .map(|n| n as u64)
-                    .map_err(crate::error),
-            }
-        }),
+        Open {
+            path,
+            flags,
+            mode,
+            umask,
+        } => open(path, flags as i32, mode, umask),
+        Write { fd, bytes } => write(fd, bytes),
         Seek { fd, offset, origin } => held(fd, |transport, target| {
             transport
                 .lseek(target, offset, origin)
@@ -400,12 +567,7 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                 .map(|value| value as u64)
                 .map_err(crate::error)
         }),
-        Dup2 { source, target } => releasing(|files| {
-            files
-                .take_dup3(source, target, None)
-                .map(|(fd, release)| (fd as u64, release))
-                .map_err(crate::error)
-        }),
+        Dup2 { source, target } => duplicate_replacing(source, target, None),
         Dup3 {
             source,
             target,
@@ -414,16 +576,37 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
             if flags & !((O_CLOEXEC | O_CLOFORK) as u32) != 0 {
                 return Err(EINVAL);
             }
-            let flags = crate::descriptor_flags(flags as i32);
-            releasing(|files| {
-                files
-                    .take_dup3(source, target, Some(flags))
-                    .map(|(fd, release)| (fd as u64, release))
-                    .map_err(crate::error)
-            })
+            duplicate_replacing(source, target, Some(crate::descriptor_flags(flags as i32)))
         }
         // Directory streams are relibc's (getdents on a descriptor).
         _ => Err(ENOSYS),
+    }
+}
+
+/// A tentative numeric target keeps its operation alive while the caller waits unlocked.
+fn duplicate_replacing(
+    source: u32,
+    target: u32,
+    flags: Option<posix_fs::DescriptorFlags>,
+) -> Result<u64, i32> {
+    loop {
+        let (replacement, transport) = process_state(|files| {
+            Ok((
+                files
+                    .try_take_dup3(source, target, flags)
+                    .map_err(crate::error)?,
+                files.transport(),
+            ))
+        })?;
+        match replacement {
+            posix_fs::open::Replacement::Complete { fd, release } => {
+                transport.release(release).map_err(crate::error)?;
+                return Ok(fd as u64);
+            }
+            posix_fs::open::Replacement::Pending(token) => {
+                crate::open_driver::wait_pending(token)?;
+            }
+        }
     }
 }
 
@@ -565,4 +748,21 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
     let bytes = encoded.as_bytes();
     buffer[..bytes.len()].copy_from_slice(bytes);
     Ok(bytes.len())
+}
+
+/// Final lifetime callbacks perform local transitions and retain remote ownership.
+pub fn detach_open_owner(owner: u64) {
+    crate::open_driver::detach(owner);
+    crate::data_driver::detach(owner);
+    crate::io_driver::detach(owner);
+}
+/// A surviving caller or collector pays one cleanup phase outside the layer locks.
+pub fn help_open_recovery() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static KIND: AtomicUsize = AtomicUsize::new(0);
+    match KIND.fetch_add(1, Ordering::Relaxed) % 3 {
+        0 => crate::open_driver::help(),
+        1 => crate::data_driver::help(),
+        _ => crate::io_driver::help(),
+    }
 }

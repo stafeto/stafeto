@@ -1528,6 +1528,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ram_time_profiles_require_clock_before_ram_and_process() {
+        assert_eq!(ramfs::TABLE[0].args, proto_fs::RAM_TIME_LEGACY);
+        assert!(ramfs::TABLE[0].connects.is_empty());
+        for table in [
+            ramfs::BUSYBOX_TABLE,
+            ramfs::BUSYBOX_DIALOG_TABLE,
+            ramfs::POSIX_TTY_TABLE,
+            ramfs::POSIX_DIALOG_TABLE,
+            ramfs::POSIX_FILES_TABLE,
+            ramfs::POSIX_ABI_TABLE,
+            ramfs::RELIBC_TABLE,
+            ramfs::POSIX_PROCS_TABLE,
+            ramfs::POSIX_STEPS_TABLE,
+            ramfs::OS_TEST_TABLE,
+            ramfs::RELIBC_THREADS_TABLE,
+            ramfs::RTBENCH_POSIX_TABLE,
+            ramfs::POSIX_RANDOM_TABLE,
+            ramfs::LOADER_CHANNELS_TABLE,
+            ramfs::POSIX_POLL_TABLE,
+            ramfs::POSIX_PTY_TABLE,
+            vz::POSIX_ABI_TABLE,
+            vz::BUSYBOX_DIALOG_TABLE,
+            vz::POSIX_TTY_TABLE,
+            vz::POSIX_DIALOG_TABLE,
+            vz::RTBENCH_POSIX_TABLE,
+        ] {
+            check(table).unwrap();
+            let ram = table.iter().find(|r| r.name == "ramfs").unwrap();
+            let clock = table.iter().find(|r| r.name == "clock").unwrap();
+            assert_eq!(ram.args, proto_fs::RAM_TIME_CLOCKED);
+            assert_eq!(ram.connects, &["clock"]);
+            assert!(clock.connects.is_empty());
+            let order = order_of(table);
+            let position = |name| order.iter().position(|n| *n == name).unwrap();
+            assert!(position("clock") < position("ramfs"));
+            assert!(position("ramfs") < position("posix"));
+        }
+        let bad: Vec<_> = ramfs::POSIX_FILES_TABLE
+            .iter()
+            .map(|r| {
+                if r.name == "clock" {
+                    Record {
+                        connects: &["clock"],
+                        ..*r
+                    }
+                } else {
+                    *r
+                }
+            })
+            .collect();
+        assert!(check(&bad).is_err());
+    }
+
     /// The tables of the images (spec 15.2): the one that ships and the
     /// test table pass, in the order of their dependencies; the two bad
     /// tables are refused with the reasons xtask looks for in their runs.
@@ -1538,8 +1592,8 @@ mod tests {
             [
                 "uart",
                 "tty",
-                "ramfs",
                 "clock",
+                "ramfs",
                 "posix",
                 "pipe",
                 "rng",
@@ -1554,8 +1608,8 @@ mod tests {
             [
                 "uart",
                 "long",
-                "ramfs",
                 "clock",
+                "ramfs",
                 "posix",
                 "clock-peer",
                 "posix-abi-probe",
@@ -1568,8 +1622,8 @@ mod tests {
                 [
                     "uart",
                     "tty",
-                    "ramfs",
                     "clock",
+                    "ramfs",
                     "posix",
                     "pipe",
                     "posix-tty"
@@ -1584,8 +1638,8 @@ mod tests {
             [
                 "uart",
                 "tty",
-                "ramfs",
                 "clock",
+                "ramfs",
                 "posix",
                 "pipe",
                 "busybox-probe"
@@ -1596,8 +1650,8 @@ mod tests {
             [
                 "uart",
                 "tty",
-                "ramfs",
                 "clock",
+                "ramfs",
                 "posix",
                 "pipe",
                 "rng",
@@ -1610,8 +1664,8 @@ mod tests {
             [
                 "uart",
                 "tty",
-                "ramfs",
                 "clock",
+                "ramfs",
                 "posix",
                 "pipe",
                 "rng",
@@ -1623,8 +1677,8 @@ mod tests {
         assert_eq!(
             order_of(ramfs::RELIBC_TABLE),
             [
-                "ramfs",
                 "clock",
+                "ramfs",
                 "posix",
                 "relibc-hello",
                 "relibc-abort",
@@ -1634,13 +1688,13 @@ mod tests {
         );
         assert_eq!(
             order_of(ramfs::RELIBC_THREADS_TABLE),
-            ["ramfs", "clock", "posix", "relibc-threads"]
+            ["clock", "ramfs", "posix", "relibc-threads"]
         );
         assert_eq!(
             order_of(ramfs::POSIX_PROCS_TABLE),
             [
-                "ramfs",
                 "clock",
+                "ramfs",
                 "posix",
                 "pipe",
                 "rng",
@@ -1654,8 +1708,8 @@ mod tests {
                 [
                     "uart",
                     "tty",
-                    "ramfs",
                     "clock",
+                    "ramfs",
                     "posix",
                     "pipe",
                     "bench-uart",

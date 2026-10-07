@@ -27,7 +27,7 @@
 //! service never saw, so SET and OBSERVE take effect once with no journal.
 
 #![no_std]
-use proto_wire::Header;
+use proto_wire::{Header, Reader, Status};
 pub const VERSION: u16 = 5;
 pub const REALTIME: u32 = 0;
 pub const MONOTONIC: u32 = 1;
@@ -71,6 +71,67 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[1, 2, 5, 6, 7, 10, 11, 12];
 
+/// Decode the complete PAGE reply before accepting custody of its memory.
+pub fn decode_page_reply(bytes: &[u8], handle_count: usize) -> Result<(), Status> {
+    let mut reader = Reader::new(bytes);
+    let status = Status::from_code(reader.u32()?);
+    if status != Status::Ok && reader.u32()? != 0 {
+        return Err(Status::BadSize);
+    }
+    reader.finish()?;
+    let expected_handles = usize::from(status == Status::Ok);
+    if handle_count != expected_handles {
+        return Err(Status::BadSize);
+    }
+    match status {
+        Status::Ok => Ok(()),
+        error => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    #[test]
+    fn page_success_requires_one_handle_and_the_complete_status_word() {
+        let bytes = 0_u32.to_le_bytes();
+        assert_eq!(decode_page_reply(&bytes, 1), Ok(()));
+        for count in [0, 2, usize::MAX] {
+            assert_eq!(decode_page_reply(&bytes, count), Err(Status::BadSize));
+        }
+        for length in 0..4 {
+            assert_eq!(decode_page_reply(&bytes[..length], 1), Err(Status::BadSize));
+        }
+        assert_eq!(decode_page_reply(&[0, 0, 0, 0, 1], 1), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn page_failure_preserves_status_and_rejects_attached_handles_or_bytes() {
+        // Kernel NoMemory and the clock's permission error use the service runtime's reply.
+        for status in [Status::from_code(5), Status::from_code(PERMISSION)] {
+            let bytes = proto_wire::reply(status);
+            assert_eq!(bytes.len(), 8);
+            assert_eq!(decode_page_reply(&bytes, 0), Err(status));
+            for count in [1, 2, usize::MAX] {
+                assert_eq!(decode_page_reply(&bytes, count), Err(Status::BadSize));
+            }
+            for length in 0..8 {
+                assert_eq!(decode_page_reply(&bytes[..length], 0), Err(Status::BadSize));
+            }
+            let mut nonzero_reserved = bytes;
+            nonzero_reserved[4] = 1;
+            assert_eq!(
+                decode_page_reply(&nonzero_reserved, 0),
+                Err(Status::BadSize)
+            );
+            let mut trailing = [0; 9];
+            trailing[..8].copy_from_slice(&bytes);
+            assert_eq!(decode_page_reply(&trailing, 0), Err(Status::BadSize));
+        }
+    }
+}
+
 /// The page of the CLOCK_REALTIME anchor (spec 2, 3.6): a counter s and
 /// two places. The service writes place (s + 1) mod 2 word by word, then
 /// raises s with Release; a reader takes s with Acquire, place s mod 2
@@ -78,6 +139,7 @@ pub const METHODS: &[u16] = &[1, 2, 5, 6, 7, 10, 11, 12];
 /// CLOCK_REALTIME is then the anchor's ns plus the monotonic ns since its
 /// instant.
 pub mod page {
+    use core::sync::atomic::{Ordering, fence};
     /// The counter s, a u64 word.
     pub const SEQUENCE: usize = 0;
     /// The first place; the second follows it.
@@ -89,6 +151,46 @@ pub mod page {
     pub const MONO: usize = 16;
     pub const GENERATION: usize = 24;
     pub const PLACE_SIZE: usize = 32;
+    /// One complete realtime anchor from the shared page.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Anchor {
+        pub value_ns: i128,
+        pub monotonic_ns: u64,
+        pub generation: u64,
+    }
+
+    impl Anchor {
+        /// Add elapsed monotonic nanoseconds with checked signed arithmetic.
+        pub fn realtime_ns(self, monotonic_now: u64) -> Option<i128> {
+            self.value_ns
+                .checked_add(i128::from(monotonic_now.saturating_sub(self.monotonic_ns)))
+        }
+    }
+
+    /// Read one snapshot in six atomic loads. A changed sequence defers it.
+    /// Each call to `load` must read the aligned AtomicU64 at the byte offset
+    /// in the mapped page with the supplied ordering.
+    pub fn read_anchor_once(mut load: impl FnMut(usize, Ordering) -> u64) -> Option<Anchor> {
+        let sequence = load(SEQUENCE, Ordering::Acquire);
+        let place = PLACES + (sequence % 2) as usize * PLACE_SIZE;
+        let low = load(place + LOW, Ordering::Relaxed);
+        let high = load(place + HIGH, Ordering::Relaxed);
+        let monotonic_ns = load(place + MONO, Ordering::Relaxed);
+        let generation = load(place + GENERATION, Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        if load(SEQUENCE, Ordering::Relaxed) != sequence {
+            return None;
+        }
+        Some(Anchor {
+            value_ns: ((u128::from(high) << 64) | u128::from(low)) as i128,
+            monotonic_ns,
+            generation,
+        })
+    }
+
     /// The size of the object.
     pub const SIZE: usize = 4096;
 }
+
+#[cfg(test)]
+mod page_tests;

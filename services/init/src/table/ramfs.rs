@@ -9,34 +9,48 @@ use crate::watch::Watch;
 
 const MS: u64 = 1_000_000;
 
+const RAM_BASE: Record = Record {
+    name: "ramfs",
+    program: "ramfs",
+    kind: Kind::Service(Watch {
+        period_ns: 250 * MS,
+        deadline_ns: 1000 * MS,
+    }),
+    priority: 40,
+    ceiling: 40,
+    // The joint shipping ELF maps 10 RO + 34 RX + 918 RW pages.
+    // Data pool, stack and allowance are paid separately.
+    quota: (4096 + 962 + 12 + 128) * PAGE,
+    handle_limit: 512,
+    restart: Restart::Never,
+    console: true,
+    log: false,
+    trace: false,
+    windows: &[],
+    bindings: &[],
+    connects: &[],
+    args: &[],
+    dma: &[],
+    quiesce: &[],
+    trusted: false,
+    root: false,
+};
+
+/// Standalone RAM probes use an explicit deterministic source.
+pub const RAM_LEGACY: Record = Record {
+    args: proto_fs::RAM_TIME_LEGACY,
+    ..RAM_BASE
+};
+
+/// POSIX RAM starts after Clock and requires its realtime page.
+pub const RAM_CLOCKED: Record = Record {
+    args: proto_fs::RAM_TIME_CLOCKED,
+    connects: &["clock"],
+    ..RAM_BASE
+};
+
 pub const TABLE: &[Record] = &[
-    Record {
-        name: "ramfs",
-        program: "ramfs",
-        kind: Kind::Service(Watch {
-            period_ns: 250 * MS,
-            deadline_ns: 1000 * MS,
-        }),
-        priority: 40,
-        ceiling: 40,
-        // 4096 data pages + 650 metadata/PT_LOAD data pages + 27 code/rodata
-        // pages (26 ordinary, 27 instrumented) + 12 stack + 128 reserve,
-        // measured from RAM ELF segments and the printed table byte count.
-        quota: (4096 + 650 + 27 + 12 + 128) * PAGE,
-        handle_limit: 512,
-        restart: Restart::Never,
-        console: true,
-        log: false,
-        trace: false,
-        windows: &[],
-        bindings: &[],
-        connects: &[],
-        args: &[],
-        dma: &[],
-        quiesce: &[],
-        trusted: false,
-        root: false,
-    },
+    RAM_LEGACY,
     Record {
         name: "ramfs-probe",
         program: "ramfs-probe",
@@ -76,7 +90,7 @@ const POSIX: Record = Record {
 /// BusyBox, or a probe in its place, with the RAM files and the process
 /// and clock services a program on relibc starts with.
 pub const BUSYBOX_TABLE: &[Record] = &[
-    TABLE[0],
+    RAM_CLOCKED,
     POSIX_ABI_TABLE[1],
     POSIX_ABI_TABLE[2],
     Record {
@@ -100,7 +114,7 @@ pub const BUSYBOX_TABLE: &[Record] = &[
 /// serves the shell's pipelines, the terminal service (5f) its console.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
-    TABLE[0],
+    RAM_CLOCKED,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 5 * DIALOG_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
@@ -128,7 +142,7 @@ const DIALOG_QUOTA: u64 = 512 * PAGE;
 /// live members for the terminal-signal walk. Spawn and exec run separately.
 pub const POSIX_TTY_TABLE: &[Record] = &[
     super::normal::TABLE[0],
-    TABLE[0],
+    RAM_CLOCKED,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 18 * DIALOG_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
@@ -153,7 +167,7 @@ pub const POSIX_TTY_TABLE: &[Record] = &[
 /// `posix-probe`.
 pub const POSIX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
-    TABLE[0],
+    RAM_CLOCKED,
     POSIX_ABI_TABLE[1],
     POSIX_ABI_TABLE[2],
     Record {
@@ -167,10 +181,36 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
     },
 ];
 
+#[cfg(all(not(feature = "data-carrier-probe"), not(feature = "t6-runtime")))]
+const RAM_POSIX_FILES: Record = RAM_CLOCKED;
+#[cfg(all(
+    feature = "data-carrier-probe",
+    not(feature = "open-finalize-clock-probe"),
+    not(feature = "t6-runtime")
+))]
+const RAM_POSIX_FILES: Record = Record {
+    // The joint steps,auth-probe ELF maps 10 RO + 37 RX + 925 RW pages.
+    // Data pages, stack and allowance are paid separately in this fixture.
+    quota: (4096 + 972 + 12 + 128) * PAGE,
+    ..RAM_CLOCKED
+};
+
+#[cfg(feature = "open-finalize-clock-probe")]
+const RAM_POSIX_FILES: Record = Record {
+    // The joint steps,open-finalize-clock-probe ELF maps 10 RO + 37 RX + 925 RW pages.
+    quota: (4096 + 972 + 12 + 128) * PAGE,
+    ..RAM_CLOCKED
+};
+
 /// The authentic identity and bounded file proof fixture, before public mutation APIs.
-#[cfg(not(any(feature = "ramfs-cleanup", feature = "loader-abort")))]
+#[cfg(not(any(
+    feature = "ramfs-cleanup",
+    feature = "loader-abort",
+    feature = "public-data-probe",
+    feature = "t6-runtime"
+)))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
-    TABLE[0],
+    RAM_POSIX_FILES,
     POSIX_ABI_TABLE[1],
     POSIX_ABI_TABLE[2],
     Record {
@@ -184,10 +224,51 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
     },
 ];
 
-/// Genuine uncommitted exec attempts with one pending image at a time.
-#[cfg(feature = "loader-abort")]
+/// The public data fixture retains genuine pipe and random device routes.
+#[cfg(all(
+    feature = "public-data-probe",
+    not(any(
+        feature = "ramfs-cleanup",
+        feature = "loader-abort",
+        feature = "t6-runtime"
+    ))
+))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
-    TABLE[0],
+    RAM_POSIX_FILES,
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "clock", "posix", "pipe", "entropy"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
+];
+
+/// Genuine uncommitted exec attempts with one pending image at a time.
+#[cfg(all(
+    feature = "loader-abort",
+    not(feature = "loader-info"),
+    not(feature = "t6-runtime")
+))]
+const RAM_LOADER_INFO: Record = RAM_CLOCKED;
+#[cfg(all(feature = "loader-info", not(feature = "t6-runtime")))]
+const RAM_LOADER_INFO: Record = Record {
+    // This diagnostic ELF maps 9 RO + 31 RX + 920 RW pages.
+    // The fixed data pool, stack and runtime allowance are paid separately.
+    quota: (4096 + 960 + 12 + 128) * PAGE,
+    ..RAM_CLOCKED
+};
+
+#[cfg(all(feature = "loader-abort", not(feature = "t6-runtime")))]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    RAM_LOADER_INFO,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 2048 * PAGE + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
@@ -204,13 +285,39 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
     },
 ];
 
+/// Three independently held runtime images use real pipe handshakes.
+/// The measured image-gates,steps ELF maps 10 RO + 38 RX + 928 RW pages.
+/// Data pool, stack and runtime allowance are paid separately.
+#[cfg(feature = "t6-runtime")]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    Record {
+        quota: (4096 + 976 + 12 + 128) * PAGE,
+        ..RAM_CLOCKED
+    },
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 3 * 2048 * PAGE + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "pipe", "clock", "posix"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+];
+
 /// Owner and retained foreign session holder for the unfinished-binding fixture.
 #[cfg(feature = "ramfs-cleanup")]
 pub const POSIX_FILES_TABLE: &[Record] = &[
     Record {
         priority: 40,
         ceiling: 40,
-        ..TABLE[0]
+        ..RAM_CLOCKED
     },
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 4096 * PAGE + 384 * PAGE,
@@ -235,7 +342,7 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         priority: 35,
         ceiling: 40,
         quota: 64 * PAGE,
-        ..TABLE[0]
+        ..RAM_BASE
     },
     Record {
         name: "ramfs-owner-0",
@@ -273,26 +380,28 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
 ];
 
 pub const POSIX_ABI_TABLE: &[Record] = &[
-    TABLE[0],
+    RAM_CLOCKED,
     Record {
         name: "posix",
         program: "posix-process-service",
-        // Its own, and the eight objects of the pages of its records
-        // (32 pages each); what its POSIX records take init adds.
+        // Its own, and the 64 objects of the pages of its records
+        // (four data pages and one page-list node each); init adds what
+        // its POSIX records take.
         quota: 640 * PAGE,
         // A process handle for each of its 256 records.
         handle_limit: 1024,
         restart: Restart::Never,
         // Loader roots, obtained at startup and narrowed for each loader.
         connects: &["ramfs", "clock"],
-        ..TABLE[0]
+        ..RAM_BASE
     },
     Record {
         name: "clock",
         program: "posix-clock-service",
+        connects: &[],
         quota: 64 * PAGE,
         restart: Restart::Never,
-        ..TABLE[0]
+        ..RAM_BASE
     },
     Record {
         name: "clock-peer",
@@ -300,7 +409,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         quota: 64 * PAGE,
         connects: &["clock", "posix"],
         restart: Restart::Never,
-        ..TABLE[0]
+        ..RAM_BASE
     },
     Record {
         name: "posix-abi-probe",
@@ -343,7 +452,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
 /// The first C program on relibc (5a′): the RAM files, the process and
 /// clock services, and the program.
 pub const RELIBC_TABLE: &[Record] = &[
-    TABLE[0],
+    RAM_CLOCKED,
     POSIX_ABI_TABLE[1],
     POSIX_ABI_TABLE[2],
     Record {
@@ -384,7 +493,7 @@ pub const PIPE: Record = Record {
     quota: 160 * PAGE,
     handle_limit: 192,
     restart: Restart::Never,
-    ..TABLE[0]
+    ..RAM_BASE
 };
 
 /// The probe of POSIX processes (tests/posix-procs): the RAM files, the
@@ -392,7 +501,7 @@ pub const PIPE: Record = Record {
 /// start from files (5c): the table has the pool for 33 of them and holds
 /// no record of theirs.
 pub const POSIX_PROCS_TABLE: &[Record] = &[
-    TABLE[0],
+    RAM_CLOCKED,
     Record {
         // The pool of the children from files (5c): 32 of the probe's
         // quota at once and one that fails its load, with the service's
@@ -425,8 +534,8 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
 pub const POSIX_STEPS_TABLE: &[Record] = &[
     // Room for the crowd's descriptions in the RAM file service.
     Record {
-        quota: TABLE[0].quota,
-        ..TABLE[0]
+        quota: RAM_CLOCKED.quota,
+        ..RAM_CLOCKED
     },
     Record {
         quota: POSIX_ABI_TABLE[1].quota + (STEPS_CHILDREN + 2) * STEPS_QUOTA + 384 * PAGE,
@@ -458,10 +567,11 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// checked 64 KiB malloc, including the allocator mapping and alignment.
 const STEPS_QUOTA: u64 = (256 + 16) * PAGE;
 
-/// The quota of the probe of POSIX processes, which each child it spawns
-/// from a file gets too (5c), with 16 pages for the enlarged signal layer
-/// while the fork probe still allocates its additional 1 MiB.
-const PROCS_QUOTA: u64 = (512 + 16) * PAGE;
+/// The probe and each child it spawns inherit this budget. Its 1 MiB
+/// allocator growth needs 556 transient pages: 279 live, 274 for the
+/// memory object and 3 prepaid page tables. The image maps 29/109/40 pages.
+/// Retain the 16-page reserve.
+const PROCS_QUOTA: u64 = (556 + 16) * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and
@@ -474,7 +584,7 @@ const PROCS_QUOTA: u64 = (512 + 16) * PAGE;
 pub const OS_TEST_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     TTY,
-    TABLE[0],
+    RAM_CLOCKED,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 10 * OS_TEST_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
@@ -510,7 +620,7 @@ const RELIBC_HELLO: Record = Record {
 /// The threads of relibc (5a′): as RELIBC_TABLE, with room for 64
 /// threads (four handles each, their stacks and TCBs).
 pub const RELIBC_THREADS_TABLE: &[Record] = &[
-    TABLE[0],
+    RAM_CLOCKED,
     POSIX_ABI_TABLE[1],
     POSIX_ABI_TABLE[2],
     Record {
@@ -535,7 +645,7 @@ pub const LONG: Record = Record {
     handle_limit: 16,
     restart: Restart::Never,
     args: b"l",
-    ..TABLE[0]
+    ..RAM_BASE
 };
 
 /// The hostile load of rtbench 2 (tests/rtbench-load): a service whose
@@ -548,7 +658,7 @@ pub const LOAD: Record = Record {
     handle_limit: 32,
     restart: Restart::Never,
     connects: &[],
-    ..TABLE[0]
+    ..RAM_BASE
 };
 
 /// rtbench 2 (tests/rtbench-posix): a POSIX process with main at 30, its
@@ -580,7 +690,7 @@ pub const RTBENCH: Record = Record {
 /// children (S10 to S13) are files of the image started from the loader.
 pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     super::normal::TABLE[0],
-    TABLE[0],
+    RAM_CLOCKED,
     RTBENCH_POOL,
     POSIX_ABI_TABLE[2],
     PIPE,
@@ -619,7 +729,7 @@ pub const TTY: Record = Record {
     handle_limit: 192,
     restart: Restart::Never,
     connects: &["uart"],
-    ..TABLE[0]
+    ..RAM_BASE
 };
 
 /// The probe of the terminal service (tests/tty, xtask tty): the console's
@@ -665,7 +775,7 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
 /// entropy device's driver and the entropy service; the probe starts its
 /// own file once, whose copy forks.
 pub const POSIX_RANDOM_TABLE: &[Record] = &[
-    TABLE[0],
+    RAM_CLOCKED,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 3 * PROCS_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]

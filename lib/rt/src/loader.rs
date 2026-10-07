@@ -21,6 +21,11 @@ use crate::sys;
 use abi::{Access, Call, Error, INIT_MSGBUF, INIT_STACK_TOP, Policy, Rights, START_CHANNEL};
 use bootimg::{PAGE_SIZE, Part, Program, Segment};
 
+mod retained;
+pub use retained::{
+    FillFailure, Mapping, RetainedImage, RetainedSegment, WindowMapping, fill_retained,
+};
+
 /// The new process and its first thread (spec 7.5, 8, 13.3).
 pub struct Params<'a> {
     /// The process's quota in bytes, whole pages, its room for handles and

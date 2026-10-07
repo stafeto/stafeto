@@ -16,9 +16,16 @@ fn run(cmd: &mut Command) {
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=files.c");
+    println!("cargo:rerun-if-changed=open-policy.c");
+    println!("cargo:rerun-if-changed=public-data.c");
+    println!("cargo:rerun-if-changed=public-data-loss.c");
+    println!("cargo:rerun-if-changed=pending-open.c");
+    println!("cargo:rerun-if-changed=pending-fork.c");
     println!("cargo:rerun-if-changed=cleanup.c");
     println!("cargo:rerun-if-changed=jobs.c");
     println!("cargo:rerun-if-changed=loader-abort.c");
+    println!("cargo:rerun-if-changed=image-gates.c");
+    println!("cargo:rerun-if-changed=t6-runtime.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     // The branches of the steps mode (xtask process-steps N).
@@ -49,10 +56,34 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     run(Command::new(tools.join("clang"))
         .arg(format!(
+            "-DPUBLIC_DATA_LOSS_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_PUBLIC_DATA_LOSS_PROBE").is_some())
+        ))
+        .arg(format!(
+            "-DPUBLIC_DATA_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_PUBLIC_DATA_PROBE").is_some())
+        ))
+        .arg(format!(
             "-DLOADER_ABORT_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_LOADER_ABORT").is_some())
         ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
+        .arg(format!(
+            "-DIMAGE_INFO_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_IMAGE_INFO_PROBE").is_some())
+        ))
+        .arg(format!(
+            "-DPENDING_OPEN_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_PENDING_OPEN").is_some())
+        ))
+        .arg(format!(
+            "-DIMAGE_GATES_NORMAL={}",
+            u8::from(env::var_os("CARGO_FEATURE_IMAGE_GATES_NORMAL").is_some())
+        ))
+        .arg(format!(
+            "-DIMAGE_GATES_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_IMAGE_GATES").is_some())
+        ))
         .arg(format!(
             "-DJOB_CONTROL_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_JOBS").is_some())
@@ -78,7 +109,11 @@ fn main() {
         .arg(sysroot.join("include"))
         .args([
             "-c",
-            if env::var_os("CARGO_FEATURE_AUTH_PROBE").is_some() {
+            if env::var_os("CARGO_FEATURE_T6_RUNTIME").is_some() {
+                "t6-runtime.c"
+            } else if env::var_os("CARGO_FEATURE_IMAGE_GATES").is_some() {
+                "image-gates.c"
+            } else if env::var_os("CARGO_FEATURE_AUTH_PROBE").is_some() {
                 "cleanup.c"
             } else if env::var_os("CARGO_FEATURE_FILES").is_some() {
                 "files.c"

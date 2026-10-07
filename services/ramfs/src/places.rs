@@ -44,10 +44,13 @@ impl Places {
         }
         self.allocate(|slot| OWN | generation << 9 | u64::from(slot))
     }
-    pub fn place(&self, label: u64) -> usize {
-        if label & (OWN | IMAGE_SESSION) == OWN | IMAGE_SESSION {
-            return 0;
+    pub fn issue_image(&self, generation: u64) -> Option<u64> {
+        if generation >= 1 << 53 {
+            return None;
         }
+        self.allocate(|slot| OWN | IMAGE_SESSION | generation << 9 | u64::from(slot))
+    }
+    pub fn place(&self, label: u64) -> usize {
         if label & OWN != 0 {
             let slot = (label & 511) as usize;
             return if slot != 0 && slot < COUNT && self.labels[slot].get() == label {
@@ -72,10 +75,15 @@ impl Places {
             slot as usize
         }
     }
-    pub fn release(&self, label: u64) {
-        if label & (OWN | IMAGE_SESSION) == OWN | IMAGE_SESSION {
-            return;
+    /// Private image custody requires the exact issued image label and generation.
+    pub fn image_place(&self, label: u64) -> Option<usize> {
+        if label & (OWN | IMAGE_SESSION) != (OWN | IMAGE_SESSION) {
+            return None;
         }
+        let slot = self.place(label);
+        (slot < COUNT).then_some(slot)
+    }
+    pub fn release(&self, label: u64) {
         let slot = if label & OWN != 0 {
             (label & 511) as usize
         } else {
@@ -132,6 +140,37 @@ mod tests {
         assert_eq!(places.issue(1 << 53), None);
         places.release(new);
         assert_eq!(places.place(new), COUNT);
-        assert_eq!(places.place(proto_fs::image_label(10, 12)), 0);
+        let image = places.issue_image(2).unwrap();
+        assert_ne!(places.place(image), 0);
+        assert!(places.place(image) < COUNT);
+        places.release(image);
+        let new_image = places.issue_image(3).unwrap();
+        assert_eq!(image & 511, new_image & 511);
+        assert_eq!(places.place(image), COUNT);
+        places.release(image);
+        assert!(places.place(new_image) < COUNT);
+        assert_eq!(places.issue_image(1 << 53), None);
+    }
+}
+
+#[cfg(test)]
+mod image_place_tests {
+    use super::*;
+    #[test]
+    fn custody_lookup_rejects_ordinary_named_and_reused_image_generations_without_admission() {
+        let places = Places::new();
+        let ordinary = places.issue(1).unwrap();
+        let old = places.issue_image(2).unwrap();
+        assert_eq!(places.image_place(17), None);
+        assert_eq!(places.image_place(ordinary), None);
+        assert_eq!(places.image_place(old), Some((old & 511) as usize));
+        places.release(old);
+        let new = places.issue_image(3).unwrap();
+        assert_eq!(old & 511, new & 511);
+        assert_eq!(places.image_place(old), None);
+        assert_eq!(places.image_place(new), Some((new & 511) as usize));
+        assert_eq!(places.image_place(new ^ IMAGE_SESSION), None);
+        places.release(old);
+        assert!(places.image_place(new).is_some());
     }
 }

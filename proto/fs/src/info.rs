@@ -3,10 +3,11 @@
 
 //! Complete node information transported independently of a C structure layout.
 
+use crate::Timestamp;
 use proto_wire::{Reader, Status, Writer};
 
-/// Kind is 1 directory, 2 regular, 3 character. Permissions contain only the
-/// low twelve mode bits. Times are nanoseconds on the file service's clock.
+/// Kind is 1 directory, 2 regular, 3 character, 5 symbolic link. Permissions contain only the
+/// low twelve mode bits. Times use signed seconds and normalized nanoseconds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NodeInfo {
     pub kind: u32,
@@ -20,9 +21,9 @@ pub struct NodeInfo {
     pub size: u64,
     pub block_size: u32,
     pub blocks: u64,
-    pub access_ns: u64,
-    pub modify_ns: u64,
-    pub change_ns: u64,
+    pub access_time: Timestamp,
+    pub modify_time: Timestamp,
+    pub change_time: Timestamp,
 }
 
 impl NodeInfo {
@@ -38,9 +39,9 @@ impl NodeInfo {
         out.u64(self.size)?;
         out.u32(self.block_size)?;
         out.u64(self.blocks)?;
-        out.u64(self.access_ns)?;
-        out.u64(self.modify_ns)?;
-        out.u64(self.change_ns)
+        self.access_time.write(out)?;
+        self.modify_time.write(out)?;
+        self.change_time.write(out)
     }
 
     pub fn read(input: &mut Reader<'_>) -> Result<Self, Status> {
@@ -56,11 +57,13 @@ impl NodeInfo {
             size: input.u64()?,
             block_size: input.u32()?,
             blocks: input.u64()?,
-            access_ns: input.u64()?,
-            modify_ns: input.u64()?,
-            change_ns: input.u64()?,
+            access_time: Timestamp::read(input)?,
+            modify_time: Timestamp::read(input)?,
+            change_time: Timestamp::read(input)?,
         };
-        if !(1..=3).contains(&info.kind) || info.permissions & !0o7777 != 0 || info.block_size == 0
+        if !matches!(info.kind, 1 | 2 | 3 | 5)
+            || info.permissions & !0o7777 != 0
+            || info.block_size == 0
         {
             return Err(Status::BadSize);
         }
@@ -86,16 +89,16 @@ mod tests {
             size: 7 << 40,
             block_size: 512,
             blocks: 8 << 40,
-            access_ns: 9 << 40,
-            modify_ns: 10 << 40,
-            change_ns: u64::MAX,
+            access_time: Timestamp::new(i64::MIN, 1).unwrap(),
+            modify_time: Timestamp::new(-1, 2).unwrap(),
+            change_time: Timestamp::new(i64::MAX, 999_999_999).unwrap(),
         };
         let mut writer = Writer::new();
         info.write(&mut writer).unwrap();
         let bytes = writer.as_bytes();
-        assert_eq!(bytes.len(), 92);
+        assert_eq!(bytes.len(), 116);
         assert_eq!(&bytes[8..16], &info.device.to_le_bytes());
-        assert_eq!(&bytes[84..92], &info.change_ns.to_le_bytes());
+        assert_eq!(&bytes[100..108], &info.change_time.seconds.to_le_bytes());
         let mut reader = Reader::new(bytes);
         assert_eq!(NodeInfo::read(&mut reader), Ok(info));
         assert_eq!(reader.finish(), Ok(()));
@@ -106,7 +109,7 @@ mod tests {
             );
         }
         for (offset, value) in [(0, 4u32), (4, 0o10000), (56, 0)] {
-            let mut invalid = [0; 92];
+            let mut invalid = [0; 116];
             invalid.copy_from_slice(bytes);
             invalid[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             assert_eq!(

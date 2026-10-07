@@ -281,6 +281,35 @@ fn run_in(
             drop(guard);
             continue;
         }
+        // A nested park can receive this key's only notification. Check the
+        // retained result while entries stay deferred through the next receive.
+        match call(
+            service,
+            request(false).map_err(|_| EIO)?.as_bytes(),
+            None,
+            out,
+            refusal,
+            authenticated,
+        ) {
+            Ok((long::READY, n, _)) => return Ok(n),
+            Ok((long::ARMED, _, _)) => {}
+            Ok(_) => {
+                drop(guard);
+                break 'wait Some(EIO);
+            }
+            Err(EINTR) => {
+                drop(guard);
+                if ending(&block.flags, point) {
+                    break 'wait None;
+                }
+                armed = false;
+                continue;
+            }
+            Err(error) => {
+                drop(guard);
+                break 'wait Some(error);
+            }
+        }
         let got = sys::receive(&channel);
         drop(guard);
         match got {
