@@ -142,9 +142,27 @@ fn actor(
         let count = match action {
             1 => {
                 for n in 0..16 {
-                    paid::retain_read(fd as u32, ((id * 16 + n) * 4096) as u64)?;
+                    let result = paid::retain_read(fd as u32, ((id * 16 + n) * 4096) as u64);
+                    if let Err(error) = result {
+                        rt::println!(
+                            "capacity-diag: actor={} seq={} n={} retain_errno={}",
+                            id,
+                            seq,
+                            n,
+                            error
+                        );
+                    }
+                    result?;
                 }
-                require(paid::retained_count(expected)? == 16)?;
+                let count = paid::retained_count(expected);
+                rt::println!(
+                    "capacity-diag: actor={} seq={} retained={} errno={}",
+                    id,
+                    seq,
+                    count.unwrap_or(0),
+                    count.err().unwrap_or(0)
+                );
+                require(count? == 16)?;
                 16
             }
             2 => {
@@ -244,10 +262,18 @@ fn factory(role: i32, command_fd: i32, response_fd: i32, data: i32, data1: i32) 
             let mut b = [0; 16];
             responses.read_exact(&mut b)?;
             let id = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+            rt::println!("capacity-diag: factory={} mask={} id={}", role, mask, id);
             require(id < n && children.pids[id] != 0 && mask & (1 << id) == 0)?;
             let seq = u32::from_le_bytes(b[4..8].try_into().unwrap());
             let len = u32::from_le_bytes(b[8..12].try_into().unwrap());
             let count = u32::from_le_bytes(b[12..].try_into().unwrap());
+            rt::println!(
+                "capacity-diag: factory={} seq={} len={} count={}",
+                role,
+                seq,
+                len,
+                count
+            );
             require(
                 seq == actor_sequence[id] && len == 16 && count == if action == 3 { 0 } else { 16 },
             )?;
@@ -487,17 +513,48 @@ fn leader(role: i32) -> Result<(), i32> {
     if !a {
         await_snapshot(|s| s.phases.other_at_least(3) && s.jobs == 96)?;
     }
-    ask(input, output, 1, 1, if a { 96 } else { 32 })?;
-    await_snapshot(|s| s.jobs == if a { 96 } else { 128 })?;
+    rt::println!("capacity-diag: leader={} stage=1", role);
+    let result = ask(input, output, 1, 1, if a { 96 } else { 32 });
+    rt::println!(
+        "capacity-diag: leader={} stage=2 errno={}",
+        role,
+        result.err().unwrap_or(0)
+    );
+    result?;
+    let result = await_snapshot(|s| s.jobs == if a { 96 } else { 128 });
+    rt::println!(
+        "capacity-diag: leader={} stage=3 errno={}",
+        role,
+        result.err().unwrap_or(0)
+    );
+    result?;
     let refusal = meter::snapshot()?;
     require(
         refusal.jobs == if a { 96 } else { 128 }
             && refusal.root_preparations == if a { 96 } else { 32 },
     )?;
-    refusing(f0, if a { ENOSPC } else { EMFILE })?;
+    rt::println!(
+        "capacity-diag: leader={} stage=4 jobs={} root_preparations={}",
+        role,
+        refusal.jobs,
+        refusal.root_preparations
+    );
+    let result = refusing(f0, if a { ENOSPC } else { EMFILE });
+    rt::println!(
+        "capacity-diag: leader={} stage=5 errno={}",
+        role,
+        result.err().unwrap_or(0)
+    );
+    result?;
     meter::control(0, 3)?;
     if a {
-        await_snapshot(|s| s.phases.other_at_least(3) && s.jobs == 128)?;
+        let result = await_snapshot(|s| s.phases.other_at_least(3) && s.jobs == 128);
+        rt::println!(
+            "capacity-diag: leader={} stage=6 errno={}",
+            role,
+            result.err().unwrap_or(0)
+        );
+        result?;
         duplicate(input, output, 2, 96)?;
         ask(input, output, 3, 4, 5)?;
         let gone = await_snapshot(|s| s.jobs == 112 && s.root_preparations == 80)?;
