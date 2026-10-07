@@ -13,6 +13,18 @@ pub fn revoke<T>(slot: &mut Option<T>, retained: bool, mut gone: impl FnMut(&mut
     }
 }
 
+/// Retained callbacks must return with their irreversible data marker set.
+pub fn revoke_marked<T>(
+    slot: &mut Option<T>,
+    retained: bool,
+    mut gone: impl FnMut(&mut T) -> bool,
+) {
+    revoke(slot, retained, |owner| {
+        let closing = gone(owner);
+        assert!(!retained || closing, "retained revocation marker");
+    });
+}
+
 /// A colliding label is refused while the old exact slot remains occupied.
 pub fn collision<T>(slot: &mut Option<T>, retained: bool, gone: impl FnMut(&mut T)) -> bool {
     revoke(slot, retained, gone);
@@ -31,6 +43,16 @@ pub fn close<T, E>(
     call(handle)?;
     disarm(owner.take().expect("successfully closed owner"));
     Ok(())
+}
+
+/// Select the mandatory handle while a close error retains the complete owner row.
+pub fn close_field<T, H, E>(
+    owner: &mut Option<T>,
+    select: impl FnOnce(&T) -> &H,
+    call: impl FnOnce(&H) -> Result<(), E>,
+    disarm: impl FnOnce(T),
+) -> Result<(), E> {
+    close(owner, |row| call(select(row)), disarm)
 }
 
 /// One existing mapped resource retains its exact memory owner across errors.
@@ -102,6 +124,76 @@ mod tests {
         }
         drop(slots);
         assert_eq!(drops.get(), 320);
+    }
+
+    #[test]
+    fn retained_callback_marker_survives_repeated_revocation() {
+        let drops = Cell::new(0);
+        let mut slot = Some((false, Owner(71, &drops)));
+        for _ in 0..3 {
+            revoke_marked(&mut slot, true, |data| {
+                data.0 = true;
+                data.0
+            });
+            assert!(slot.as_ref().unwrap().0);
+            assert_eq!(drops.get(), 0);
+        }
+        revoke_marked(&mut slot, false, |_| false);
+        assert!(slot.is_none());
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "retained revocation marker")]
+    fn retained_callback_without_marker_is_rejected() {
+        revoke_marked(&mut Some(false), true, |data| *data);
+    }
+
+    #[test]
+    fn failed_mandatory_close_preserves_full_owner_row_then_success_disarms_channel() {
+        struct Row<'a> {
+            label: u64,
+            index: u16,
+            channel: Owner<'a>,
+            optional: [Option<Owner<'a>>; 4],
+        }
+        let drops = Cell::new(0);
+        let mut row = Some(Row {
+            label: 0x8000_0000_0000_0042,
+            index: 319,
+            channel: Owner(91, &drops),
+            optional: core::array::from_fn(|_| None),
+        });
+        assert_eq!(
+            close_field(
+                &mut row,
+                |row| &row.channel,
+                |channel| {
+                    assert_eq!(channel.0, 91);
+                    Err(7)
+                },
+                |row| core::mem::forget(row.channel)
+            ),
+            Err(7)
+        );
+        let kept = row.as_ref().unwrap();
+        assert_eq!(
+            (kept.label, kept.index, kept.channel.0),
+            (0x8000_0000_0000_0042, 319, 91)
+        );
+        assert!(kept.optional.iter().all(Option::is_none));
+        assert_eq!(drops.get(), 0);
+        assert_eq!(
+            close_field(
+                &mut row,
+                |row| &row.channel,
+                |_| Ok::<_, u32>(()),
+                |row| core::mem::forget(row.channel)
+            ),
+            Ok(())
+        );
+        assert!(row.is_none());
+        assert_eq!(drops.get(), 0);
     }
 
     #[test]

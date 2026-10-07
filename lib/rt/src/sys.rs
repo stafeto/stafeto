@@ -177,6 +177,16 @@ impl<K> Handle<K> {
         close_raw(self.into_raw())
     }
 
+    /// Close the selected mandatory handle of one retained row.
+    /// The caller proves its other owners empty and disarms the selected handle on success.
+    pub fn close_retained_owner<T>(
+        owner: &mut Option<T>,
+        select: impl FnOnce(&T) -> &Self,
+        disarm: impl FnOnce(T),
+    ) -> Result<(), Error> {
+        crate::retention::close_field(owner, select, |handle| close_raw(handle.raw()), disarm)
+    }
+
     /// Close one retained owner. A failed call preserves the exact field.
     pub fn close_retained(owner: &mut Option<Self>) -> Result<(), Error> {
         crate::retention::close(

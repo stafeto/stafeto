@@ -46,6 +46,13 @@ pub trait Service<const K: usize> {
     /// Keep exact closed sessions until service maintenance settles their debt.
     const RETAIN_CLOSED: bool = false;
 
+    /// RETAIN_CLOSED services expose their irreversible marker kept in Data.
+    /// Their gone callback sets it before returning; this method reads it without effects.
+    fn closing(&self, s: &Session<Self::Data, K>) -> bool {
+        let _ = s;
+        false
+    }
+
     /// Methods that can settle an existing closed session.
     fn closed_method(&self, method: u16) -> bool {
         let _ = method;
@@ -268,7 +275,6 @@ pub struct Session<T, const K: usize> {
     held: [Held; K],
     issued: u32,
     issued_max: u32,
-    closing: bool,
 }
 
 impl<T, const K: usize> Session<T, K> {
@@ -279,23 +285,12 @@ impl<T, const K: usize> Session<T, K> {
             held: [const { Held::Free }; K],
             issued: 0,
             issued_max,
-            closing: false,
         }
     }
 
     /// The label of the client.
     pub fn label(&self) -> u64 {
         self.label
-    }
-
-    /// Whether irreversible client revocation began.
-    pub fn closing(&self) -> bool {
-        self.closing
-    }
-
-    /// Service-owned births carry irreversible revocation into their claimed session.
-    pub fn revoke(&mut self) {
-        self.closing = true;
     }
 
     /// A free place; LIMIT_REACHED when K are held.
@@ -484,9 +479,9 @@ pub fn run_in<S: Service<K>, const K: usize>(
                     if !S::RETAIN_CLOSED && placed.is_some() && slot.is_none() {
                         *slot = Some(Session::new(label, S::Data::default(), config.issued));
                     }
-                    crate::retention::revoke(slot, S::RETAIN_CLOSED, |s| {
-                        s.closing = true;
+                    crate::retention::revoke_marked(slot, S::RETAIN_CLOSED, |s| {
                         service.gone(s);
+                        service.closing(s)
                     });
                 }
                 service.closed(label);
@@ -689,7 +684,7 @@ fn request<S: Service<K>, const K: usize>(
             Ok((_, None)) => return refuse(token, Status::Kernel(Error::LimitReached)),
             Err(status) => return refuse(token, status),
         };
-    if s.closing && !service.closed_method(header.method) {
+    if S::RETAIN_CLOSED && service.closing(s) && !service.closed_method(header.method) {
         return refuse(token, Status::Kernel(Error::AccessDenied));
     }
     let mut r = Request {
@@ -744,9 +739,9 @@ fn session<'a, S: Service<K>, const K: usize>(
             let s = table.get_mut(i)?;
             if s.as_ref().is_some_and(|s| s.label != label) {
                 if S::RETAIN_CLOSED {
-                    crate::retention::collision(s, true, |old| {
-                        old.closing = true;
+                    crate::retention::revoke_marked(s, true, |old| {
                         service.gone(old);
+                        service.closing(old)
                     });
                     return None;
                 }

@@ -1004,6 +1004,11 @@ impl<'a> Ram<'a> {
 
     /// Exact local custody is empty after phased cleanup.
     pub fn released(fds: &Fds) -> bool {
+        Self::references_released(fds) && fds.authority_index == storage::NONE
+    }
+
+    /// Local references and preparations are empty before the final authority close.
+    pub fn references_released(fds: &Fds) -> bool {
         fds.slots.iter().all(Option::is_none)
             && fds.tentative == 0
             && fds.preparations.iter().all(Option::is_none)
@@ -1013,7 +1018,6 @@ impl<'a> Ram<'a> {
             && fds.binding_preparation.is_none()
             && fds.binding_source.is_none()
             && fds.resolvers.iter().all(|id| *id == 0)
-            && fds.authority_index == storage::NONE
     }
 
     /// One reference or preparation per cleanup step.
