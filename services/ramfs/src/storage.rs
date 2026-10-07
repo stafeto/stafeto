@@ -1121,6 +1121,13 @@ impl<'a> Storage<'a> {
         let node = self.node_mut(token).expect("retained writable inode");
         node.writers = node.writers.checked_sub(1).expect("owned writer");
     }
+    /// Read-only preflight for an atomic retained capture.
+    pub fn can_pin(&self, token: Token, kind: Pin) -> Result<(), u32> {
+        self.node(token)?.pins[kind.index()]
+            .checked_add(1)
+            .ok_or(NO_SPACE)?;
+        Ok(())
+    }
     pub fn pin(&mut self, token: Token, kind: Pin) -> Result<(), u32> {
         if kind == Pin::Image {
             self.exec_guard(token)?;

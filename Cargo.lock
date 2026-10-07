@@ -623,6 +623,7 @@ dependencies = [
  "abi",
  "bootimg",
  "posix-clock",
+ "posix-process-service",
  "proto-clock",
  "proto-fs",
  "proto-init",

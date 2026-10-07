@@ -18,7 +18,7 @@ use proto_wire::Status;
 use proto_wire::clones::Clones;
 use ramfs::authority::{
     Admission, AuditStep, Binding, BindingPurpose, CleanupAudit, Identity, NotaryReply,
-    RetainedSourcePhase, retained_source_phase,
+    RetainedSourcePhase,
 };
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
@@ -247,6 +247,7 @@ fn main(_: u64) -> u64 {
         data_gc_turn: false,
         orphan_cursor: 0,
         orphan_count: 0,
+        clone_wake: false,
     };
     // Prepare the authentic notary page after publishing the RAM endpoint.
     // Standalone boot profiles may have no Process service.
@@ -292,7 +293,7 @@ struct Fs {
     /// The descriptors of the sessions Clone made that sent nothing yet,
     /// by their labels: the session's first request takes them, and the
     /// end of its last copy closes them.
-    births: &'static mut [Option<(u64, Fds)>; BIRTHS],
+    births: &'static mut [Option<(u64, BirthData)>; BIRTHS],
     /// The clones alive, bounded for each client and in all.
     clones: &'static mut Clones<CLONES>,
     places: &'static ramfs::places::Places,
@@ -306,6 +307,7 @@ struct Fs {
     data_gc_turn: bool,
     orphan_cursor: u8,
     orphan_count: u16,
+    clone_wake: bool,
 }
 
 /// The clones the service keeps alive at most: one for each record of the
@@ -319,6 +321,43 @@ const BIRTHS: usize = CLONES;
 
 /// The tables of the sessions and of the births, in `.bss`: too big for
 /// the service's stack.
+// The paid resident Fds variant supplies the exact existing storage for both owners.
+#[allow(clippy::large_enum_variant)]
+enum BirthData {
+    Ready(Fds),
+    Cloning(CloneBirth),
+}
+impl BirthData {
+    fn into_ready(self) -> Fds {
+        match self {
+            Self::Ready(fds) => fds,
+            Self::Cloning(_) => panic!("published ready birth"),
+        }
+    }
+}
+impl core::ops::Deref for BirthData {
+    type Target = Fds;
+    fn deref(&self) -> &Fds {
+        match self {
+            Self::Ready(fds) => fds,
+            Self::Cloning(_) => panic!("ready birth access"),
+        }
+    }
+}
+impl core::ops::DerefMut for BirthData {
+    fn deref_mut(&mut self) -> &mut Fds {
+        match self {
+            Self::Ready(fds) => fds,
+            Self::Cloning(_) => panic!("ready birth access"),
+        }
+    }
+}
+type CloneBirth = ramfs::clone::Journal<Handle<Channel>, sys::Token>;
+use ramfs::clone::Phase as ClonePhase;
+const _: () = assert!(
+    core::mem::size_of::<Option<(u64, BirthData)>>() == core::mem::size_of::<Option<(u64, Fds)>>()
+);
+
 struct ImageContext {
     token: Token,
     private: Option<Handle<Channel>>,
@@ -380,7 +419,7 @@ struct Tables {
     places: ramfs::places::Places,
     clones: Clones<CLONES>,
     sessions: [Option<Session<Fds, 0>>; SESSIONS],
-    births: [Option<(u64, Fds)>; BIRTHS],
+    births: [Option<(u64, BirthData)>; BIRTHS],
     identities: [Option<IdentityChannel>; SESSIONS],
     jobs: [Option<ResolveJob>; ramfs::storage::PREPARATIONS],
     job_generations: [u64; ramfs::storage::PREPARATIONS],
@@ -392,7 +431,7 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     places: ramfs::places::Places::new(),
     clones: Clones::new(),
     sessions: [const { None }; SESSIONS],
-    births: [None; BIRTHS],
+    births: [const { None }; BIRTHS],
     identities: [const { None }; SESSIONS],
     jobs: [const { None }; ramfs::storage::PREPARATIONS],
     job_generations: [0; ramfs::storage::PREPARATIONS],
@@ -416,7 +455,12 @@ impl Fs {
     }
 
     fn closed_terminal(&self, fds: &Fds, label: u64) -> bool {
-        Ram::released(fds)
+        !self
+            .births
+            .iter()
+            .flatten()
+            .any(|(held, data)| *held == label && matches!(data, BirthData::Cloning(_)))
+            && Ram::released(fds)
             && self.jobs.iter().flatten().all(|job| job.owner != label)
             && self
                 .into_window
@@ -570,11 +614,20 @@ impl Fs {
         {
             self.capacity_clear_owner(label);
         }
+        match fds.binding.custody_phase(fds.binding_preparation.is_some()) {
+            ramfs::authority::CustodyPhase::Hold => return false,
+            ramfs::authority::CustodyPhase::Candidate => {
+                let _ = self.binding_phase(fds, label, &mut true);
+                return true;
+            }
+            ramfs::authority::CustodyPhase::Ordinary => {}
+        }
         if fds
             .binding
             .snapshot_ref()
             .is_some_and(|who| generation(who.index as usize) & proto_process::GENERATION_DEAD != 0)
         {
+            self.revoke_clone_owner(label);
             let unfinished = fds.binding_preparation.is_some();
             fds.closing = true;
             fds.binding = Binding::Cleanup;
@@ -730,7 +783,7 @@ impl Fs {
             self.places.release(label);
             return Err(code);
         }
-        self.births[free] = Some((label, child));
+        self.births[free] = Some((label, BirthData::Ready(child)));
         fds.image_outcome = Some(ramfs::image::ImageOutcome {
             job,
             label,
@@ -1174,60 +1227,198 @@ impl Fs {
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        let Some(free) = self.births.iter().position(Option::is_none) else {
-            return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
+        let snapshot = match ramfs::clone::Snapshot::preflight(&self.ram, fds, &list[..count]) {
+            Ok(snapshot) => snapshot,
+            Err(code) => return status(code),
         };
-        if self.clones.room(r.label()).is_err() {
-            return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
-        }
-        let mut child = Fds::default();
-        if let Err(code) = self.ram.clone_fds_into(fds, &list[..count], &mut child) {
-            return status(code);
-        }
-        if matches!(fds.binding, Binding::Boot) {
-            child.binding = Binding::Boot;
-        }
-        let Some(label) = self.places.issue(self.given) else {
-            self.ram.release(&mut child);
-            return status(proto_fs::TOO_MANY_OPEN_FILES);
+        let source = if fds.binding.snapshot_ref().is_some() {
+            let Some(identity) = self
+                .identities
+                .get(fds.authority_index as usize)
+                .and_then(Option::as_ref)
+                .filter(|identity| {
+                    identity.label == r.label() && !identity.closing && identity.channel.is_some()
+                })
+            else {
+                return status(proto_fs::PERMISSION);
+            };
+            Some(
+                identity
+                    .channel
+                    .as_ref()
+                    .expect("exact source identity")
+                    .raw(),
+            )
+        } else {
+            None
         };
-        if let Some(who) = fds.binding.snapshot() {
-            child.binding = Binding::Inherited(who);
-            let identity = self.identities[fds.authority_index as usize]
-                .as_ref()
-                .and_then(|i| {
-                    sys::handle_duplicate(
-                        i.channel.as_ref().expect("live identity channel"),
-                        Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
-                    )
-                    .ok()
-                });
-            let result = identity
-                .ok_or(proto_fs::PERMISSION)
-                .and_then(|identity| self.install_identity(&mut child, label, identity, false));
-            if let Err(code) = result {
-                self.places.release(label);
-                self.ram.release(&mut child);
-                return status(code);
-            }
-        }
-        match self.session(label) {
-            Ok(session) => {
-                if r.reply().u32(0).is_err() {
-                    self.drop_identity(&mut child);
-                    self.ram.release(&mut child);
-                    return Answer::Status(Status::BadSize);
+        let authority_index = if source.is_some() {
+            let Some(index) = self.identities.iter().position(Option::is_none) else {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            };
+            index as u16
+        } else {
+            NONE
+        };
+        let (free, label) = match ramfs::clone::reserve(
+            self.births,
+            &mut self.given,
+            self.places,
+            self.clones,
+            r.label(),
+        ) {
+            Ok(reserved) => reserved,
+            Err(code) => return status(code),
+        };
+        snapshot.retain(&mut self.ram);
+        let binding = fds
+            .binding
+            .snapshot()
+            .map_or(fds.binding, Binding::Inherited);
+        self.births[free] = Some((
+            label,
+            BirthData::Cloning(CloneBirth {
+                owner: r.label(),
+                snapshot: Some(snapshot),
+                binding,
+                authority_index,
+                session: None,
+                token: r.token(),
+                phase: ClonePhase::Session,
+                code: 0,
+            }),
+        ));
+        if let Some(raw) = source {
+            let identity = Handle::<Channel>::borrowed(raw);
+            match sys::handle_duplicate(
+                &identity,
+                Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
+            ) {
+                Ok(copy) => {
+                    self.identities[authority_index as usize] = Some(IdentityChannel {
+                        label,
+                        closing: false,
+                        channel: Some(copy),
+                        offered: None,
+                        previous: None,
+                        admission: Admission::Unvouched,
+                        pending: false,
+                        require: false,
+                        purpose: BindingPurpose::Candidate,
+                        original: binding,
+                        original_root: fds.root,
+                        audit: CleanupAudit::default(),
+                        image: None,
+                    });
                 }
-                self.births[free] = Some((label, child));
-                let _ = self.clones.add(label, r.label());
-                Answer::Reply([session.erase()].into())
-            }
-            Err(e) => {
-                self.drop_identity(&mut child);
-                self.ram.release(&mut child);
-                Answer::Status(Status::Kernel(e))
+                Err(_) => {
+                    let BirthData::Cloning(child) = &mut self.births[free].as_mut().unwrap().1
+                    else {
+                        unreachable!()
+                    };
+                    child.authority_index = NONE;
+                    child.code = proto_fs::PERMISSION;
+                    child.phase = ClonePhase::ErrorReply;
+                }
             }
         }
+        self.clone_wake = true;
+        Answer::Deferred
+    }
+}
+
+impl Fs {
+    fn revoke_clone_owner(&mut self, owner: u64) {
+        for (_, data) in self.births.iter_mut().flatten() {
+            if let BirthData::Cloning(child) = data
+                && child.owner == owner
+            {
+                child.code = Status::Kernel(abi::Error::PeerClosed).code();
+                child.phase = if child.token.is_some() {
+                    ClonePhase::ErrorReply
+                } else {
+                    ClonePhase::Rollback
+                };
+                self.clone_wake = true;
+            }
+        }
+    }
+
+    /// Dispatch the same resident ownership engine exercised by host fixtures.
+    fn clone_birth_step(&mut self, slot: usize) {
+        let (label, data) = self.births[slot].as_mut().expect("paid clone birth");
+        let BirthData::Cloning(child) = data else {
+            return;
+        };
+        let mut effects = CloneEffects {
+            channel: &self.channel,
+            identities: self.identities,
+            level: self.level,
+        };
+        match child.step(&mut self.ram, *label, &mut effects) {
+            ramfs::clone::Outcome::Pending => {}
+            ramfs::clone::Outcome::Ready => *data = BirthData::Ready(child.materialize()),
+            ramfs::clone::Outcome::Terminal => {
+                let label = *label;
+                self.places.release(label);
+                self.clones.gone(label);
+                self.births[slot] = None;
+            }
+        }
+    }
+}
+
+struct CloneEffects<'a> {
+    channel: &'a Handle<Channel>,
+    identities: &'a mut [Option<IdentityChannel>; SESSIONS],
+    level: u8,
+}
+impl ramfs::clone::Effects<Handle<Channel>, sys::Token> for CloneEffects<'_> {
+    fn label(&mut self, label: u64) -> Result<Handle<Channel>, abi::Error> {
+        sys::handle_label(
+            self.channel,
+            Rights::SEND | Rights::TRANSFER,
+            label,
+            self.level,
+        )
+    }
+    fn reply(
+        &mut self,
+        token: sys::Token,
+        session: Option<Handle<Channel>>,
+        code: u32,
+    ) -> Result<(), ramfs::clone::Refusal<Handle<Channel>, sys::Token>> {
+        let mut outgoing = Outgoing::new();
+        if let Some(session) = session {
+            outgoing.push(session.erase()).expect("one clone transfer");
+        }
+        token
+            .reply_handles(&proto_wire::reply(Status::from_code(code)), outgoing)
+            .map_err(|mut refusal| {
+                let back = refusal
+                    .back
+                    .as_mut()
+                    .and_then(Outgoing::pop)
+                    .map(|handle| Handle::from_raw(handle.into_raw()));
+                assert!(refusal.back.as_ref().is_none_or(Outgoing::is_empty));
+                ramfs::clone::Refusal {
+                    error: refusal.error,
+                    back,
+                    token: refusal.token,
+                }
+            })
+    }
+    fn close(&mut self, session: &mut Option<Handle<Channel>>) -> Result<(), abi::Error> {
+        Handle::close_retained(session)
+    }
+    fn close_identity(&mut self, index: u16, label: u64) -> Result<(), abi::Error> {
+        let identity = self.identities[index as usize]
+            .as_mut()
+            .expect("retained child identity");
+        assert_eq!(identity.label, label, "exact clone identity");
+        Handle::close_retained(&mut identity.channel)?;
+        self.identities[index as usize] = None;
+        Ok(())
     }
 }
 
@@ -1260,15 +1451,19 @@ impl Service<0> for Fs {
         }
         if !s.data.claimed {
             let label = s.label();
-            if let Some(birth) = self
-                .births
-                .iter_mut()
-                .find(|b| b.is_some_and(|(l, _)| l == label))
-            {
-                s.data = birth.take().expect("exact disappearing birth").1;
+            if let Some(birth) = self.births.iter_mut().find(|b| {
+                b.as_ref()
+                    .is_some_and(|(l, data)| *l == label && matches!(data, BirthData::Ready(_)))
+            }) {
+                s.data = birth
+                    .take()
+                    .expect("exact disappearing birth")
+                    .1
+                    .into_ready();
             }
             s.data.claimed = true;
         }
+        self.revoke_clone_owner(s.label());
         s.data.closing = true;
         s.data.binding = Binding::Cleanup;
         #[cfg(feature = "auth-probe")]
@@ -1292,6 +1487,18 @@ impl Service<0> for Fs {
                 .as_mut()
                 .expect("exact revoked gate")
                 .closing = true;
+        }
+        if let Some((_, BirthData::Cloning(child))) =
+            self.births.iter_mut().flatten().find(|(l, _)| *l == label)
+        {
+            child.phase = if child.token.is_some() {
+                ClonePhase::ErrorReply
+            } else {
+                ClonePhase::Rollback
+            };
+            child.code = Status::Kernel(abi::Error::PeerClosed).code();
+            self.clone_wake = true;
+            return;
         }
         if let Some((_, fds)) = self.births.iter_mut().flatten().find(|(l, _)| *l == label) {
             fds.closing = true;
@@ -1370,14 +1577,23 @@ impl Service<0> for Fs {
                     sessions[i] = None;
                 }
             }
-        } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
+        } else if self.births[i - SESSIONS]
+            .as_ref()
+            .is_some_and(|(_, data)| matches!(data, BirthData::Cloning(_)))
+        {
+            self.clone_birth_step(i - SESSIONS);
+            self.maintenance.complete_clone(SESSIONS + BIRTHS);
+            self.clone_wake = true;
+            return;
+        } else if let Some((label, data)) = self.births[i - SESSIONS].take() {
+            let mut fds = data.into_ready();
             client_work = self.cleanup_step(&mut fds, label);
             closing_visit = fds.closing;
             if fds.closing && self.closed_terminal(&fds, label) {
                 self.places.release(label);
                 self.clones.gone(label);
             } else {
-                self.births[i - SESSIONS] = Some((label, fds));
+                self.births[i - SESSIONS] = Some((label, BirthData::Ready(fds)));
             }
         }
         work |= client_work;
@@ -1391,6 +1607,16 @@ impl Service<0> for Fs {
         {
             let _ = sys::notify(&self.channel, 1);
         }
+    }
+
+    fn continuation_step(&mut self) -> bool {
+        if !self.clone_wake {
+            return false;
+        }
+        if sys::notify(&self.channel, 1).is_ok() {
+            self.clone_wake = false;
+        }
+        self.clone_wake
     }
 
     fn between_notifications(&mut self, notice: rt::service::Notice) {
@@ -1409,12 +1635,11 @@ impl Service<0> for Fs {
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
         if s.closing() && !s.data.claimed {
             let label = s.label();
-            if let Some(birth) = self
-                .births
-                .iter_mut()
-                .find(|b| b.is_some_and(|(l, _)| l == label))
-            {
-                s.data = birth.take().expect("exact retained birth").1;
+            if let Some(birth) = self.births.iter_mut().find(|b| {
+                b.as_ref()
+                    .is_some_and(|(l, data)| *l == label && matches!(data, BirthData::Ready(_)))
+            }) {
+                s.data = birth.take().expect("exact retained birth").1.into_ready();
             }
             s.data.claimed = true;
             s.data.closing = true;
@@ -1428,12 +1653,12 @@ impl Service<0> for Fs {
             // The first request of a session Clone made takes its
             // descriptors.
             let label = r.label();
-            if let Some(birth) = self
-                .births
-                .iter_mut()
-                .find(|b| b.is_some_and(|(l, _)| l == label))
-            {
-                s.data.claim_birth(birth.take().expect("a birth").1);
+            if let Some(birth) = self.births.iter_mut().find(|b| {
+                b.as_ref()
+                    .is_some_and(|(l, data)| *l == label && matches!(data, BirthData::Ready(_)))
+            }) {
+                s.data
+                    .claim_birth(birth.take().expect("a birth").1.into_ready());
             } else if r.label() & proto_fs::OWN != 0 && self.clones.client_of(r.label()).is_some() {
                 // A Loader consumed this birth into a distinct label; surviving old copies
                 // have cleanup authority only, regardless of a creator's retained handle.
@@ -2819,18 +3044,13 @@ impl Fs {
         if fds.binding_preparation.is_some() {
             return Err(proto_fs::AUTHENTICATING);
         }
+        if fds.binding.awaits_child_identity() {
+            return Err(proto_fs::PERMISSION);
+        }
         let who = fds.binding.snapshot_ref().ok_or(proto_fs::PERMISSION)?;
         let current = generation(who.index as usize);
-        if current == who.generation {
-            return if matches!(fds.binding, Binding::Inherited(_) | Binding::Handoff(_)) {
-                Err(proto_fs::PERMISSION)
-            } else {
-                Ok(())
-            };
-        }
-        if current & proto_process::GENERATION_DEAD != 0 {
-            fds.binding = Binding::Cleanup;
-            return Err(proto_fs::PERMISSION);
+        if fds.binding.authenticate_epoch(current)? {
+            return Ok(());
         }
         if !fds.preparation_available() {
             return Err(proto_fs::TOO_MANY_OPEN_FILES);
@@ -2888,11 +3108,12 @@ impl Fs {
         let Some(i) = self
             .births
             .iter()
-            .position(|b| b.is_some_and(|(l, _)| l == label))
+            .position(|b| b.as_ref().is_some_and(|(l, _)| *l == label))
         else {
             return status(proto_fs::PERMISSION);
         };
-        let (_, mut child) = self.births[i].take().expect("own clone");
+        let (_, child) = self.births[i].take().expect("own clone");
+        let mut child = child.into_ready();
         // Verification retains creator capture; only a genuine Bind grants
         // effects to the eventual holder of this unclaimed child capability.
         let installed = if fds.authority_index == NONE {
@@ -2911,7 +3132,7 @@ impl Fs {
                 .ok_or(proto_fs::PERMISSION)
                 .and_then(|identity| self.install_identity(&mut child, label, identity, false))
         };
-        self.births[i] = Some((label, child));
+        self.births[i] = Some((label, BirthData::Ready(child)));
         if let Err(code) = installed {
             return status(code);
         }
@@ -3020,7 +3241,7 @@ impl Fs {
         binding.offered = offered;
         binding.pending = true;
         binding.require = require;
-        self.births[slot] = Some((label, child));
+        self.births[slot] = Some((label, BirthData::Ready(child)));
         let _ = self.clones.add_within(label, r.label(), CLONES);
         if r.reply().u32(0).is_err() {
             return Answer::Status(Status::BadSize);
@@ -3039,6 +3260,9 @@ impl Fs {
     }
     /// Existing identity storage bounds cleanup even when every preparation is used.
     fn audit_step(&mut self, fds: &mut Fds, label: u64) -> bool {
+        if fds.binding.awaits_child_identity() {
+            return false;
+        }
         let Some(who) = fds.binding.snapshot_ref() else {
             return false;
         };
@@ -3265,7 +3489,7 @@ impl Fs {
                 let original = offered_label.and_then(|label| {
                     self.births
                         .iter()
-                        .position(|b| b.is_some_and(|(l, _)| l == label))
+                        .position(|b| b.as_ref().is_some_and(|(l, _)| *l == label))
                 });
                 if binding.require && original.is_none() {
                     return self.reject_binding(fds);
@@ -3318,7 +3542,8 @@ impl Fs {
                 .and_then(Option::as_ref)
                 .filter(|identity| identity.label == label)
                 .map(|identity| identity.purpose);
-            let source_phase = match retained_source_phase(
+            let source_phase = match ramfs::authority::inherited_source_phase(
+                source.binding,
                 label,
                 *old_label,
                 source.binding_preparation.is_some(),
@@ -3361,7 +3586,7 @@ impl Fs {
             source.authority_index = fds.authority_index;
             source.claimed = true;
             self.ram.complete_binding(fds, 0);
-            core::mem::swap(fds, source);
+            core::mem::swap(fds, &mut **source);
             self.births[slot as usize] = None;
         } else {
             self.ram.complete_binding(fds, 0);

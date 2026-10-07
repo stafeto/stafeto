@@ -57,6 +57,13 @@ impl<T> Window<T> {
     }
 }
 
+/// Retry one continuation step only after a distinct FIFO handoff step.
+pub fn continuations(mut step: impl FnMut() -> bool, mut handoff: impl FnMut()) {
+    while step() {
+        handoff();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +184,29 @@ mod tests {
             Ok(true)
         );
         assert_eq!(drops.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::continuations;
+    use std::cell::RefCell;
+    #[test]
+    fn retry_notify_and_fifo_yield_are_distinct_steps_until_wake_succeeds() {
+        let effects = RefCell::new(std::vec::Vec::new());
+        let mut attempts = 0;
+        continuations(
+            || {
+                effects.borrow_mut().push("notify");
+                attempts += 1;
+                attempts < 3
+            },
+            || effects.borrow_mut().push("yield"),
+        );
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            &*effects.borrow(),
+            &["notify", "yield", "notify", "yield", "notify"]
+        );
     }
 }

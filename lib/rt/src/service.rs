@@ -93,6 +93,12 @@ pub trait Service<const K: usize> {
         let _ = (sessions, notice);
     }
 
+    /// One continuation operation, fully measured separately from request dispatch.
+    /// True requests another boundary before the loop blocks in Receive.
+    fn continuation_step(&mut self) -> bool {
+        false
+    }
+
     /// A scheduling handoff after a measured notification dispatch has ended.
     /// A service with a queue of own cursor notices may yield to FIFO peers here.
     fn between_notifications(&mut self, notice: Notice) {
@@ -447,6 +453,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 let began = steps::begin();
                 request(service, table, config.issued, label, bytes, handles, token);
                 steps::end(began, kind);
+                continuation(service);
                 continue;
             }
             Ok(Received::Notification {
@@ -495,8 +502,31 @@ pub fn run_in<S: Service<K>, const K: usize>(
         }
         service.maintenance(table, notice);
         steps::end(began, steps::NOTICE);
+        let began = time::now();
+        steps::own();
         service.between_notifications(notice);
+        steps::end(began, steps::NOTICE);
+        continuation(service);
     }
+}
+
+/// Every retry and its FIFO handoff is a separate measured kernel-operation interval.
+fn continuation<S: Service<K>, const K: usize>(service: &mut S) {
+    crate::retention::continuations(
+        || {
+            let began = time::now();
+            steps::own();
+            let retry = service.continuation_step();
+            steps::end(began, steps::NOTICE);
+            retry
+        },
+        || {
+            let began = time::now();
+            steps::own();
+            let _ = sys::yield_now();
+            steps::end(began, steps::NOTICE);
+        },
+    );
 }
 
 /// The longest step of the loop (feature `step-stats`, which only the

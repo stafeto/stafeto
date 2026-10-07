@@ -9,6 +9,9 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod authority;
+pub mod clone;
+#[cfg(test)]
+mod clone_tests;
 pub mod cwd;
 #[cfg(test)]
 mod cwd_tests;

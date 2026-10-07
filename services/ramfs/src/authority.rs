@@ -63,6 +63,36 @@ pub fn retained_source_phase(
     }
 }
 
+/// Captured child custody does not authenticate or refresh its ancestor.
+pub fn inherited_source_phase(
+    binding: Binding,
+    expected_label: u64,
+    actual_label: u64,
+    has_preparation: bool,
+    purpose: Option<BindingPurpose>,
+    current_generation: u64,
+    creator_generation: u64,
+) -> Result<RetainedSourcePhase, u32> {
+    if binding.awaits_child_identity() {
+        if expected_label != actual_label {
+            return Err(proto_fs::PERMISSION);
+        }
+        return Ok(if has_preparation {
+            RetainedSourcePhase::WaitRefresh
+        } else {
+            RetainedSourcePhase::Ready
+        });
+    }
+    retained_source_phase(
+        expected_label,
+        actual_label,
+        has_preparation,
+        purpose,
+        current_generation,
+        creator_generation,
+    )
+}
+
 /// Only a canonical refusal from the genuine notary proves an invalid owner.
 pub enum NotaryReply<const N: usize> {
     Wire([u8; N]),
@@ -263,6 +293,12 @@ pub struct Stamp {
     pub generation: u64,
     pub image: u32,
 }
+#[derive(Debug, PartialEq, Eq)]
+pub enum CustodyPhase {
+    Ordinary,
+    Hold,
+    Candidate,
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Binding {
     #[default]
@@ -272,11 +308,47 @@ pub enum Binding {
     Pending(WhoReply),
     /// The exact successful target awaits its genuine startup identity.
     Handoff(WhoReply),
-    /// Captured descriptions await a child identity, while the creator still owns cleanup.
+    /// Captured descriptions retain independent child custody until its genuine identity binds.
     Inherited(WhoReply),
     Cleanup,
 }
 impl Binding {
+    /// The exact child custody advances only its own candidate or genuine revocation.
+    pub fn custody_phase(&self, candidate: bool) -> CustodyPhase {
+        if self.awaits_child_identity() {
+            if candidate {
+                CustodyPhase::Candidate
+            } else {
+                CustodyPhase::Hold
+            }
+        } else {
+            CustodyPhase::Ordinary
+        }
+    }
+    /// Captured ancestry never grants operations, including after parent epoch reuse.
+    pub fn authenticate_epoch(&mut self, current: u64) -> Result<bool, u32> {
+        if self.awaits_child_identity() {
+            return Err(proto_fs::PERMISSION);
+        }
+        let who = self.snapshot_ref().ok_or(proto_fs::PERMISSION)?;
+        if current == who.generation {
+            return if matches!(self, Self::Handoff(_)) {
+                Err(proto_fs::PERMISSION)
+            } else {
+                Ok(true)
+            };
+        }
+        if current & proto_process::GENERATION_DEAD != 0 {
+            *self = Self::Cleanup;
+            return Err(proto_fs::PERMISSION);
+        }
+        Ok(false)
+    }
+    /// A captured ancestor supplies custody until a genuine child identity binds.
+    pub fn awaits_child_identity(&self) -> bool {
+        matches!(self, Self::Inherited(_))
+    }
+
     pub fn retained_refresh(
         self,
         retained: &proto_process::RetainedLoaderReply,

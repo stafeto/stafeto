@@ -16,6 +16,11 @@ impl Default for Cursor {
     }
 }
 impl Cursor {
+    /// Every Cloning visit, including a failed retained close, releases the cursor.
+    pub fn complete_clone(&mut self, slots: usize) {
+        self.complete_client(true, true, slots);
+    }
+
     /// Retained cleanup rotates after every visit and keeps retrying the finite table.
     pub fn complete_client(&mut self, worked: bool, closing: bool, slots: usize) {
         if worked && closing {

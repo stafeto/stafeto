@@ -42,3 +42,4 @@ posix-clock = { path = "../../lib/posix-clock" }
 
 [dev-dependencies]
 bootimg = { path = "../../lib/bootimg", features = ["write"] }
+posix-process-service = { path = "../process" }
