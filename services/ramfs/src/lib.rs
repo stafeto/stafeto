@@ -287,6 +287,17 @@ impl Default for Fds {
 }
 
 impl Fds {
+    /// Transfer one exact retained birth into an unclaimed RT default session.
+    pub fn claim_birth(&mut self, birth: &mut Option<(u64, Self)>, label: u64) -> bool {
+        let Some((owner, source)) = birth.as_mut().filter(|(owner, _)| *owner == label) else {
+            return false;
+        };
+        debug_assert_eq!(*owner, label);
+        debug_assert!(self.fresh_clone_destination());
+        core::mem::swap(self, source);
+        *birth = None;
+        true
+    }
     fn fresh_clone_destination(&self) -> bool {
         if self.slots.iter().any(Option::is_some)
             || self.tentative != 0
@@ -3081,5 +3092,72 @@ mod tests {
             ));
         }
         assert_eq!(ram.storage.preparations_used(), 0);
+    }
+}
+
+#[cfg(test)]
+mod birth_claim_tests {
+    use super::*;
+    use crate::storage::Root;
+
+    #[test]
+    fn wrong_label_keeps_the_birth_and_default_destination() {
+        let mut destination = Fds::default();
+        let mut source = Fds::default();
+        source.root = Root {
+            id: 17,
+            generation: 9,
+        };
+        source.binding_outcome = Some(proto_fs::PERMISSION);
+        let mut birth = Some((41, source));
+        assert!(!destination.claim_birth(&mut birth, 42));
+        assert!(destination.fresh_clone_destination());
+        let (owner, source) = birth.as_ref().unwrap();
+        assert_eq!(*owner, 41);
+        assert_eq!(
+            source.root,
+            Root {
+                id: 17,
+                generation: 9
+            }
+        );
+        assert_eq!(source.binding_outcome, Some(proto_fs::PERMISSION));
+        assert!(destination.claim_birth(&mut birth, 41));
+        assert!(birth.is_none());
+        assert_eq!(
+            destination.root,
+            Root {
+                id: 17,
+                generation: 9
+            }
+        );
+        assert_eq!(destination.binding_outcome, Some(proto_fs::PERMISSION));
+    }
+
+    #[test]
+    fn exact_claim_preserves_the_description_and_its_offset_until_release() {
+        let mut ram = Ram::default();
+        let mut source = Fds::default();
+        let fd = ram.open(&mut source, "/etc/motd", READ_ONLY).unwrap();
+        let mut prefix = [0; 3];
+        assert_eq!(ram.read(&mut source, fd, &mut prefix), Ok(3));
+        let mut birth = Some((41, source));
+        let mut destination = Fds::default();
+        assert!(!destination.claim_birth(&mut birth, 42));
+        assert_eq!(ram.open_descriptions(), 1);
+        assert!(destination.claim_birth(&mut birth, 41));
+        assert!(birth.is_none());
+        assert_eq!(ram.open_descriptions(), 1);
+        assert_eq!(ram.read(&mut destination, fd, &mut prefix), Ok(3));
+        assert_eq!(&prefix, b"fet");
+        ram.release(&mut destination);
+        assert_eq!(ram.open_descriptions(), 0);
+    }
+
+    #[test]
+    fn missing_birth_keeps_the_unclaimed_destination() {
+        let mut destination = Fds::default();
+        assert!(!destination.claim_birth(&mut None, 41));
+        assert!(destination.fresh_clone_destination());
     }
 }

@@ -1095,7 +1095,9 @@ impl Service<0> for Fs {
                 .iter_mut()
                 .find(|b| b.is_some_and(|(l, _)| l == label))
             {
-                s.data = birth.take().expect("a birth").1;
+                // RT creates unclaimed sessions from Fds::default, with no held references.
+                let claimed = s.data.claim_birth(birth, label);
+                debug_assert!(claimed);
             } else if r.label() & proto_fs::OWN != 0 && self.clones.client_of(r.label()).is_some() {
                 // A Loader consumed this birth into a distinct label; surviving old copies
                 // have cleanup authority only, regardless of a creator's retained handle.
@@ -2233,6 +2235,7 @@ impl Fs {
         Ok((require == Ok(1), offered_index, identity_index))
     }
     /// Cold root admission returns every accepted object before paid child preparation.
+    #[inline(never)]
     fn pending_admission(&mut self, r: &mut Request<'_>) -> Answer {
         if let Err(code) = Self::pending_input(r) {
             return status(code);
@@ -2255,6 +2258,7 @@ impl Fs {
         }
         Answer::Reply(returned)
     }
+    #[inline(never)]
     fn bind_pending(&mut self, r: &mut Request<'_>) -> Answer {
         let (require, offered_index, identity_index) = match Self::pending_input(r) {
             Ok(input) => input,
