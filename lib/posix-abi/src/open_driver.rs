@@ -85,9 +85,25 @@ pub(crate) fn open(
             recovery.job
         );
         save(claim, recovery)?;
-        loop {
+        'prepare: loop {
+            if recovery.phase == Phase::Traversing {
+                while !files.open_advance(recovery.job, false).map_err(protocol)? {}
+                recovery.phase = Phase::Preparing;
+                save(claim, recovery)?;
+            }
             // Binding and preparation retries run without a numeric reservation or defer.
-            while !files.open_advance(recovery.job, true).map_err(protocol)? {}
+            loop {
+                match files.open_advance(recovery.job, true) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(Status::Unknown(proto_fs::STALE_PROOF)) => {
+                        recovery.phase = Phase::Traversing;
+                        save(claim, recovery)?;
+                        continue 'prepare;
+                    }
+                    Err(error) => return Err(protocol(error)),
+                }
+            }
             #[cfg(feature = "full-capacity-probe")]
             rt::println!(
                 "capacity-open: pid={} stage=3 job={}",
@@ -194,6 +210,9 @@ pub(crate) fn open(
                     })?;
                     if reason == Status::Unknown(proto_fs::AUTHENTICATING) {
                         files.finish_binding().map_err(protocol)?;
+                    } else if reason == Status::Unknown(proto_fs::STALE_PROOF) {
+                        recovery.phase = Phase::Traversing;
+                        save(claim, recovery)?;
                     } else {
                         rt::sys::yield_now().map_err(|error| protocol(Status::Kernel(error)))?;
                     }
