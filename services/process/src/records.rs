@@ -306,6 +306,9 @@ impl<P, C> Records<P, C> {
             return Err(proto_process::AGAIN);
         }
         let record = self.get_mut(index).ok_or(proto_process::NO_PROCESS)?;
+        if !record.state.live() {
+            return Err(proto_process::NO_PROCESS);
+        }
         let next =
             posix_credentials::change(record.credentials, operation, id).map_err(|e| match e {
                 posix_credentials::Error::Invalid => proto_process::INVALID,
@@ -1485,6 +1488,10 @@ mod tests {
         assert_eq!(table.target(at(parent), label.pid()), None);
         assert_eq!(table.set_pgid(at(label), 0, 0), Err(GroupError::NoProcess));
         assert_eq!(
+            table.change_credentials(at(label), proto_process::Change::EffectiveUid, 33, 1),
+            Err(proto_process::NO_PROCESS)
+        );
+        assert_eq!(
             table.find_pid(label.pid()),
             Some(at(label)),
             "namespace remains owned before ACK"
@@ -1507,6 +1514,10 @@ mod tests {
         };
         assert!(!table.mark_end_pending(old, Some(End::Exited(8))));
         assert_eq!(table.begin_end_retained(key), Some(None));
+        assert_eq!(
+            table.change_credentials(at(label), proto_process::Change::EffectiveUid, 33, 1),
+            Err(proto_process::NO_PROCESS)
+        );
         assert_eq!(table.reported(at(parent), Selector::Any, WEXITED), None);
         assert_eq!(
             table.finish_end_metadata(key).unwrap().exit,
@@ -1589,6 +1600,49 @@ mod tests {
         assert_eq!(record.label, parent);
         assert_eq!(table.slots[at(parent)], SlotState::Retaining);
         table.release_retained(token).unwrap();
+    }
+
+    #[test]
+    fn retained_end_transfers_noncopy_owners_without_running_drop() {
+        use core::cell::Cell;
+        use std::rc::Rc;
+        struct Owner(Rc<Cell<u32>>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Rc::new(Cell::new(0));
+        let mut table = Records::<Owner, Owner>::with_exec_custody();
+        let label = table.next_label().unwrap();
+        let index = table.insert(
+            label,
+            Owner(drops.clone()),
+            None,
+            Credentials::ROOT,
+            31,
+            Join::NewSession,
+        );
+        table.get_mut(index).unwrap().active_exec = Some(Owner(drops.clone()));
+        table.get_mut(index).unwrap().state = State::Alive;
+        let key = crate::preparing::Key {
+            label,
+            image: proto_process::IMAGE,
+        };
+        assert!(table.mark_end_pending(key, Some(End::Exited(0))));
+        let executable = table.begin_end_retained(key).unwrap().unwrap();
+        assert_eq!(drops.get(), 0);
+        drop(executable);
+        assert_eq!(drops.get(), 1);
+        let (record, token) = table.finish_end_metadata(key).unwrap().retired.unwrap();
+        assert_eq!(drops.get(), 1);
+        assert!(table.get(index).is_none());
+        assert_eq!(table.slots[index], SlotState::Retaining);
+        assert_ne!(table.next_label().unwrap().index, label.index);
+        drop(record);
+        assert_eq!(drops.get(), 2);
+        table.release_retained(token).unwrap();
+        assert_eq!(table.next_label().unwrap().index, label.index);
     }
 
     #[test]
