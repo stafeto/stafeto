@@ -78,6 +78,11 @@ pub fn probe_ceiling() -> u8 {
 pub fn error(error: FsError) -> c_int {
     match error {
         FsError::NoEntry => ENOENT,
+        FsError::AlreadyExists => EEXIST,
+        FsError::Loop => ELOOP,
+        FsError::ReadOnlyFilesystem => EROFS,
+        FsError::TextBusy => ETXTBSY,
+        FsError::OperationNotPermitted => EPERM,
         FsError::PermissionDenied => EACCES,
         FsError::BadFileDescriptor => EBADF,
         FsError::IsDirectory => EISDIR,
