@@ -37,7 +37,7 @@ type NativePreparation = preparing::StartPreparation<
     Handle<Thread>,
     Pending,
 >;
-type Work = RecordWork<Replacing, NativePreparation>;
+type Work = RecordWork<Replacing, NativePreparation, ending::Ending>;
 use posix_process_service::birthwalk::BirthWalk;
 use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
@@ -62,6 +62,7 @@ use rt::{
 };
 mod adopt;
 mod controller;
+mod ending;
 mod ends;
 mod generations;
 mod jobs;
@@ -689,11 +690,11 @@ impl Processes {
             return (!any).then_some(WaitResult::NoChild);
         };
         if options & WNOWAIT == 0 {
-            self.tell(parent, child);
             if matches!(result, WaitResult::Ended { .. }) {
-                self.records.reap(child);
-                self.generations.set_groups(child, None);
+                self.reap_wait_retained(parent, child);
+                self.kick();
             } else {
+                self.tell(parent, child);
                 self.records.consume_report(child, result);
             }
         }
@@ -943,7 +944,10 @@ impl Processes {
             }
             _ => {
                 let index = self.records.find_identity(label)?;
-                (!matches!(self.records.get(index)?.state, State::Zombie(_)))
+                self.records
+                    .get(index)?
+                    .state
+                    .live()
                     .then_some((index, None))
             }
         }
@@ -973,7 +977,7 @@ impl Processes {
             || expected.index as usize != index
             || expected.image != image
             || expected.root != record.root
-            || matches!(record.state, State::Zombie(_))
+            || !record.state.live()
             || self.generations.get(index) & proto_process::GENERATION_DEAD != 0
         {
             return refuse(proto_process::PERMISSION);
@@ -1043,6 +1047,9 @@ impl Processes {
     /// Posts `signal` with `info` to the process of the record in `target`
     /// and asks for its router's entry when it waits now (O(1)).
     fn signal(&mut self, target: usize, signal: u8, info: Info) {
+        if !self.records.get(target).is_some_and(|r| r.state.live()) {
+            return;
+        }
         if proto_process::job::class(signal).is_some() || signal == SIGSTOP {
             if self.generate_job(target, signal).is_none() {
                 return;
@@ -1072,6 +1079,9 @@ impl Processes {
     /// (`signal`). O(1).
     fn deliver(&mut self, sender: usize, target: usize, signal: u8) -> Delivery {
         let from = self.records.get(sender).expect("the sender");
+        if !from.state.live() {
+            return Delivery::Denied;
+        }
         let (from_pid, creds, from_session) = (from.label.pid(), from.credentials, from.sid);
         let record = self.records.get(target).expect("a target");
         if !signals::may_signal(
@@ -1082,7 +1092,7 @@ impl Processes {
         ) {
             return Delivery::Denied;
         }
-        let zombie = matches!(record.state, State::Zombie(_));
+        let zombie = !record.state.live();
         if signal == 0 || zombie {
             return Delivery::Done;
         }
@@ -1131,10 +1141,11 @@ impl Processes {
         }
         let Some(target) = self.records.find_pid(pid as u32).filter(|&t| {
             self.records.get(t).is_some_and(|r| {
-                r.state != State::Loading
-                    || signal == SIGKILL
-                    || signal == SIGSTOP
-                    || proto_process::job::class(signal).is_some()
+                !r.state.end_pending()
+                    && (r.state != State::Loading
+                        || signal == SIGKILL
+                        || signal == SIGSTOP
+                        || proto_process::job::class(signal).is_some())
             })
         }) else {
             return refuse(proto_process::NO_PROCESS);
@@ -1444,6 +1455,10 @@ impl Processes {
             self.births.removed(key);
             return Err(abi::Error::PeerClosed);
         };
+        if record.state.end_pending() {
+            self.births.removed(key);
+            return Err(abi::Error::PeerClosed);
+        }
         if !matches!(record.state, State::Loading | State::Zombie(_)) {
             return Err(abi::Error::BadState);
         }
@@ -1564,7 +1579,10 @@ impl Processes {
             );
             if disconnected {
                 if hup != 0
-                    && let Some(index) = self.records.find_pid(sid)
+                    && let Some(index) = self
+                        .records
+                        .find_pid(sid)
+                        .filter(|&i| self.records.get(i).is_some_and(|r| r.state.live()))
                 {
                     let delivered = self.deliver_terminal(index, proto_process::SIGHUP);
                     #[cfg(feature = "tty-probe")]
@@ -1589,7 +1607,11 @@ impl Processes {
             let (Ok(pid), Ok(generation), Ok(())) = (body.u32(), body.u64(), body.finish()) else {
                 return Answer::Status(Status::BadSize);
             };
-            let Some(index) = self.records.find_pid(pid) else {
+            let Some(index) = self
+                .records
+                .find_pid(pid)
+                .filter(|&i| self.records.get(i).is_some_and(|r| r.state.live()))
+            else {
                 return refuse(proto_process::NO_PROCESS);
             };
             let record = self.records.get(index).expect("detaching caller");
@@ -1728,7 +1750,7 @@ impl Processes {
             *count += 1;
         }
         let record = self.records.get(target).expect("a target");
-        if matches!(record.state, State::Zombie(_)) {
+        if !record.state.live() {
             return Delivery::Done;
         }
         if signal == SIGKILL {
@@ -1803,7 +1825,11 @@ impl Processes {
         let (Ok(pid), Ok(())) = (body.u32(), body.finish()) else {
             return Answer::Status(Status::BadSize);
         };
-        let Some(index) = self.records.find_pid(pid) else {
+        let Some(index) = self
+            .records
+            .find_pid(pid)
+            .filter(|&i| self.records.get(i).is_some_and(|r| r.state.live()))
+        else {
             return refuse(proto_process::NO_PROCESS);
         };
         let record = self.records.get(index).expect("the probe's target");
@@ -1919,36 +1945,6 @@ impl Processes {
             Some(n) => number(r, n),
             None => refuse(proto_process::NO_PROCESS),
         }
-    }
-
-    /// The child in `child` of the record in `parent` ended with `end`: a
-    /// parent whose page says SA_NOCLDWAIT or SIGCHLD ignored takes no
-    /// zombie, which goes at once; SIGCHLD goes to the parent (CLD_EXITED
-    /// or CLD_KILLED with the child's PID, real UID and status); the
-    /// parent's waits that take the child are told.
-    fn child_ended(&mut self, parent: usize, child: usize, end: End) {
-        let record = self.records.get(child).expect("a zombie");
-        let (pid, uid) = (record.label.pid(), record.credentials.uid);
-        let (code, status) = match end {
-            End::Exited(code) => (CLD_EXITED, i32::from(code)),
-            End::Signaled(n) => (CLD_KILLED, i32::from(n)),
-        };
-        let flags = self
-            .pages
-            .page(parent)
-            .map_or(0, |p| p.flags.load(core::sync::atomic::Ordering::Acquire));
-        self.tell(parent, child);
-        if flags & (PAGE_NOCLDWAIT | PAGE_CHLD_IGNORED) != 0 {
-            self.records.reap(child);
-            self.generations.set_groups(child, None);
-        }
-        let info = Info {
-            code,
-            pid,
-            uid,
-            status,
-        };
-        self.signal(parent, SIGCHLD, info);
     }
 }
 /// The status of a failed call of the kernel.
@@ -2240,7 +2236,12 @@ impl Processes {
                 }
             }
             4 => {
-                if let Some(ready) = work.ready.as_ref() {
+                if !self
+                    .records
+                    .get(index)
+                    .is_some_and(|r| r.state.end_pending())
+                    && let Some(ready) = work.ready.as_ref()
+                {
                     let _ = sys::notify(ready, 1);
                 }
             }
@@ -2250,6 +2251,24 @@ impl Processes {
                 }
             }
             6 => {
+                if self
+                    .records
+                    .get(index)
+                    .is_some_and(|r| r.state.end_pending())
+                {
+                    let pending = work.pending.take();
+                    let empty = Work::take_replacing(&mut self.replacing[index])
+                        .expect("an empty ended replacement");
+                    assert!(
+                        empty.ready.is_none()
+                            && empty.process.is_none()
+                            && empty.old.process.is_none()
+                            && empty.old.executable.is_none()
+                    );
+                    self.replace_cleanup -= 1;
+                    self.start_ending(index, pending);
+                    return;
+                }
                 if let Some(pending) = work.pending.take() {
                     let _ = pending.answer(&proto_wire::reply(Status::Ok), Outgoing::new());
                 }
@@ -2282,6 +2301,10 @@ impl Processes {
             {
                 self.try_abort_load(place.record);
             }
+            return;
+        }
+        if matches!(self.replacing[index], Some(Work::Ending(_))) {
+            self.try_end_step(index);
             return;
         }
         if self.replacing[index]
@@ -2743,7 +2766,11 @@ impl Processes {
         if r.handles.len() != 1 || r.handles.info(0) != Some((ObjectKind::Channel, rights)) {
             return Answer::Status(Status::BadSize);
         }
-        let Some(record) = self.records.find_pid(args.pid) else {
+        let Some(record) = self
+            .records
+            .find_pid(args.pid)
+            .filter(|&i| self.records.get(i).is_some_and(|r| r.state.live()))
+        else {
             return refuse(proto_process::STAGE_RETIRED);
         };
         if self.loaders.of(record).is_none() {
@@ -2803,7 +2830,11 @@ impl Processes {
         let Ok(set) = SetId::read(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
-        let Some(child) = self.records.find_pid(set.pid) else {
+        let Some(child) = self
+            .records
+            .find_pid(set.pid)
+            .filter(|&i| self.records.get(i).is_some_and(|r| r.state.live()))
+        else {
             return refuse(proto_process::PERMISSION);
         };
         #[cfg(feature = "image-probe")]
@@ -3074,64 +3105,27 @@ impl Service<0> for Processes {
             }
             return;
         }
+        let key = preparing::Key {
+            label: record.label,
+            image: record.image,
+        };
+        let first = self.records.mark_end_pending(key, None);
         self.generations.retire(index);
-        let end = End::of(sys::process_state(&record.process).unwrap_or(abi::ProcessState::Killed))
-            .unwrap_or(End::Signaled(SIGKILL));
-        // A walk of the ended sender stops, and those it queued: their
-        // replies have no taker.
-        self.cancel_walks(record.label.raw_at(record.image));
-        // A loader that ended: its place and SetId go, and a SpawnStart
-        // that waited for its Boot gets AGAIN. An old image that ended
-        // before its ExecCommit, by itself or by SIGKILL, takes the new
-        // process with it, whose quota comes back to the pool.
-        #[cfg(feature = "image-probe")]
-        self.abort_ended_load(index, Status::from_code(proto_process::AGAIN));
-        #[cfg(not(feature = "image-probe"))]
-        self.abort_load(index, Status::from_code(proto_process::AGAIN));
-        // The end of a session's leader takes its terminal from the
-        // session (XBD 11.1.3).
-        if let Some(r) = self.records.get(index)
-            && r.label.pid() == r.sid
-        {
-            self.terminals.leader_ended(r.sid);
-            if let Some(notice) = self.terminal_notice.as_ref() {
-                let _ = sys::notify(notice, 1);
-            }
+        if first {
+            self.cancel_walks(key.label.raw_at(key.image));
         }
-        let (exit, orphans) = self.records.exited(index, end);
-        // An exec that waited for init goes on: its new image is dead.
-        // The new image ending does not acknowledge init's handoff.
-        // Its immutable offer and old owner survive until canonical ACK.
-        let awaiting_init = self.replacing[index]
-            .as_ref()
-            .and_then(Work::replacing)
-            .is_some_and(|work| work.ticket != 0 && !work.old.cleanup_requested());
-        if !awaiting_init {
-            self.replace_queue.remove(index);
-            self.finish_replace(index);
-        }
-        self.tickets[index] = 0;
-        // Init reads the end once the witness closed.
-        self.witnesses[index] = None;
-        for &orphan in orphans.as_slice() {
-            let orphan = usize::from(orphan);
-            if let Some(page) = self.pages.page(orphan) {
-                page.ppid
-                    .store(INIT_PID, core::sync::atomic::Ordering::Release);
-            }
-            // A child whose parent ended before its SpawnCommit goes.
-            if self
-                .records
-                .get(orphan)
-                .is_some_and(|r| r.state == State::Loading)
-                && self.loaders.of(orphan).is_some()
-            {
-                self.abort_load(orphan, Status::Kernel(abi::Error::PeerClosed));
-            }
-        }
-        self.routers[index] = None;
-        if let Exit::Zombie { parent } = exit {
-            self.child_ended(parent, index, end);
+        if let Some(work) = self.replacing[index].as_mut().and_then(Work::preparing_mut) {
+            let attempted = work.key();
+            let requires_stop = work.resources.process.is_some();
+            work.cancel(
+                attempted,
+                Status::from_code(proto_process::AGAIN).code(),
+                requires_stop,
+            );
+            // Only the exact ended target can skip its paid Kill.
+            work.ended(key.label, key.image);
+        } else if self.replacing[index].is_none() {
+            self.start_ending(index, None);
         }
         self.kick();
     }

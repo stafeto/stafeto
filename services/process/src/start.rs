@@ -911,6 +911,13 @@ impl Processes {
         if work.finish_cleanup(key) {
             self.replacing[index] = None;
             self.preparing_count -= 1;
+            if self
+                .records
+                .get(index)
+                .is_some_and(|record| record.state.end_pending())
+            {
+                self.start_ending(index, None);
+            }
         }
     }
 }

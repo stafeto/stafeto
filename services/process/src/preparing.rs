@@ -7,34 +7,35 @@ use crate::records::{Join, Reservation, StartParent};
 use crate::signals::PageStart;
 use proto_process::{Create, Credentials, Label};
 
-pub enum RecordWork<R, S> {
+pub enum RecordWork<R, S, E = ()> {
     Replacing(R),
     Preparing(S),
+    Ending(E),
 }
 
-impl<R, S> RecordWork<R, S> {
+impl<R, S, E> RecordWork<R, S, E> {
     pub fn replacing(&self) -> Option<&R> {
         match self {
             Self::Replacing(value) => Some(value),
-            Self::Preparing(_) => None,
+            Self::Preparing(_) | Self::Ending(_) => None,
         }
     }
     pub fn replacing_mut(&mut self) -> Option<&mut R> {
         match self {
             Self::Replacing(value) => Some(value),
-            Self::Preparing(_) => None,
+            Self::Preparing(_) | Self::Ending(_) => None,
         }
     }
     pub fn preparing(&self) -> Option<&S> {
         match self {
             Self::Preparing(value) => Some(value),
-            Self::Replacing(_) => None,
+            Self::Replacing(_) | Self::Ending(_) => None,
         }
     }
     pub fn preparing_mut(&mut self) -> Option<&mut S> {
         match self {
             Self::Preparing(value) => Some(value),
-            Self::Replacing(_) => None,
+            Self::Replacing(_) | Self::Ending(_) => None,
         }
     }
     pub fn take_replacing(slot: &mut Option<Self>) -> Option<R> {
