@@ -72,6 +72,30 @@ impl Pages {
         self.objects[index / GROUP].cancel(key)
     }
 
+    /// The narrowed owner remains resident until a later map and close step.
+    pub fn narrow(&self, index: usize) -> Result<Handle<Memory>, Error> {
+        let object = self.objects[index / GROUP]
+            .mapped()
+            .ok_or(Error::BadState)?;
+        sys::handle_duplicate(object, Access::ReadWrite.rights())
+    }
+
+    /// One target mapping uses the already narrowed resident owner.
+    pub fn map_prepared(
+        index: usize,
+        process: &Handle<Process>,
+        narrow: &Handle<Memory>,
+    ) -> Result<(), Error> {
+        sys::mem_map(
+            process,
+            narrow,
+            ((index % GROUP) * PAGE) as u64,
+            PAGE as u64,
+            PAGE_ADDRESS,
+            Access::ReadWrite,
+        )
+    }
+
     /// One zeroed page and four atomic fields, before its process can run.
     pub fn initialize(&self, index: usize, identity: [u32; 4]) -> Result<(), Error> {
         self.objects[index / GROUP]

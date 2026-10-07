@@ -138,13 +138,27 @@ impl Processes {
                 assert!(work.advance(key, phase));
             }
             PreparePhase::PageTargetMap => {
-                let process = work
-                    .resources
-                    .process
-                    .as_ref()
-                    .ok_or(abi::Error::BadState)?;
-                self.pages.map_again(index, process)?;
-                assert!(work.advance(key, phase));
+                match work.copy_cursor {
+                    0 => work.resources.narrow = Some(self.pages.narrow(index)?),
+                    1 => {
+                        let process = work
+                            .resources
+                            .process
+                            .as_ref()
+                            .ok_or(abi::Error::BadState)?;
+                        let narrow = work.resources.narrow.as_ref().ok_or(abi::Error::BadState)?;
+                        pages::Pages::map_prepared(index, process, narrow)?;
+                    }
+                    2 => {
+                        let narrow = work.resources.narrow.take().ok_or(abi::Error::BadState)?;
+                        narrow.close()?;
+                        work.copy_cursor = 0;
+                        assert!(work.advance(key, phase));
+                        return Ok(());
+                    }
+                    _ => return Err(abi::Error::BadState),
+                }
+                work.copy_cursor += 1;
             }
             PreparePhase::Reply => return self.publish_initial(index, key),
             _ => return Err(abi::Error::BadState),
