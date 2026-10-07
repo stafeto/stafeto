@@ -63,16 +63,23 @@ impl Drop for NativeFiles {
     }
 }
 
-fn main(_: u64) -> u64 {
-    let Ok(mut start) = rt::startup() else {
-        return 1;
-    };
+// Startup capabilities stay live through initialization checks alone.
+#[inline(never)]
+fn probe_parent() -> Option<(rt::Handle<rt::handle::Channel>, Result<(), &'static str>)> {
+    let mut start = rt::startup().ok()?;
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
     let result = check_initialization(&start.parent, &start.process)
-        .and_then(|()| check_exact_imports(&start.parent, &start.process))
-        .and_then(|()| check(&start.parent));
+        .and_then(|()| check_exact_imports(&start.parent, &start.process));
+    Some((start.parent, result))
+}
+
+fn main(_: u64) -> u64 {
+    let Some((parent, initial)) = probe_parent() else {
+        return 1;
+    };
+    let result = initial.and_then(|()| check(&parent));
     match result {
         Ok(()) => {
             rt::println!("ramfs-probe: ok");
