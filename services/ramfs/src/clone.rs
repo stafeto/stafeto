@@ -4,12 +4,12 @@
 //! Atomic bounded descriptor capture with retained, one-reference rollback.
 
 use crate::{
-    Fds, OPEN_MAX, Ram,
+    DescriptionSlot, Fds, OPEN_MAX, Ram,
     storage::{Pin, Root, Token},
 };
 
 pub struct Snapshot {
-    slots: [Option<u8>; OPEN_MAX],
+    slots: [Option<DescriptionSlot>; OPEN_MAX],
     cwd: Option<Token>,
     root: Root,
 }
@@ -22,11 +22,11 @@ impl Snapshot {
         let mut slots = [None; OPEN_MAX];
         for &fd in list {
             let index = source.description(fd)?;
-            slots[(fd - 3) as usize] = Some(index as u8);
+            slots[(fd - 3) as usize] = Some(DescriptionSlot::new(index).ok_or(proto_fs::BAD_FD)?);
         }
         let mut additions = [0u8; crate::DESCRIPTIONS];
         for &slot in slots.iter().flatten() {
-            additions[usize::from(slot)] += 1;
+            additions[slot.index()] += 1;
         }
         for (index, &count) in additions.iter().enumerate() {
             if count != 0 {
@@ -53,7 +53,7 @@ impl Snapshot {
             ram.storage.pin(cwd, Pin::Cwd).expect("preflight CWD pin");
         }
         for &slot in self.slots.iter().flatten() {
-            ram.descriptions[usize::from(slot)]
+            ram.descriptions[slot.index()]
                 .as_mut()
                 .expect("preflight description")
                 .refs += 1;
@@ -72,7 +72,7 @@ impl Snapshot {
             return Ok(true);
         }
         if let Some(index) = self.slots.iter().position(Option::is_some) {
-            ram.release_shared(usize::from(self.slots[index].expect("retained reference")))?;
+            ram.release_shared(self.slots[index].expect("retained reference").index())?;
             self.slots[index] = None;
             return Ok(true);
         }

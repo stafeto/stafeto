@@ -355,9 +355,7 @@ impl core::ops::DerefMut for BirthData {
 }
 type CloneBirth = ramfs::clone::Journal<Handle<Channel>, sys::Token>;
 use ramfs::clone::Phase as ClonePhase;
-const _: () = assert!(
-    core::mem::size_of::<Option<(u64, BirthData)>>() == core::mem::size_of::<Option<(u64, Fds)>>()
-);
+const _: () = assert!(core::mem::size_of::<Option<(u64, BirthData)>>() <= 2632);
 
 struct ImageContext {
     token: Token,

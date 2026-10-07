@@ -445,7 +445,7 @@ fn aggregated_shared_preflight_and_bad_last_fd_have_zero_effect() {
     let index = source.description(first).unwrap();
     let released = source.description(second).unwrap();
     ram.release_shared(released).unwrap();
-    source.slots[(second - 3) as usize] = Some(index as u8);
+    source.slots[(second - 3) as usize] = Some(crate::DescriptionSlot::new(index).unwrap());
     ram.descriptions[index].as_mut().unwrap().refs += 1;
     source.cwd = Some(ROOT);
     ram.storage.pin(ROOT, Pin::Cwd).unwrap();

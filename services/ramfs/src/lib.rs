@@ -16,6 +16,8 @@ pub mod cwd;
 #[cfg(test)]
 mod cwd_tests;
 pub mod data;
+#[cfg(test)]
+mod description_slot_tests;
 pub mod directory;
 #[cfg(test)]
 mod directory_tests;
@@ -227,13 +229,32 @@ struct Open {
     flags: u32,
 }
 
+/// An internal description index with one byte of optional resident storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+struct DescriptionSlot(core::num::NonZeroU8);
+
+impl DescriptionSlot {
+    fn new(index: usize) -> Option<Self> {
+        if index >= DESCRIPTIONS {
+            return None;
+        }
+        core::num::NonZeroU8::new(u8::try_from(index.checked_add(1)?).ok()?).map(Self)
+    }
+    fn index(self) -> usize {
+        usize::from(self.0.get()) - 1
+    }
+}
+const _: () = assert!(DESCRIPTIONS <= u8::MAX as usize);
+const _: () = assert!(core::mem::size_of::<Option<DescriptionSlot>>() == 1);
+
 /// The descriptors of one session: each names an open description of the
 /// service (`Ram`), which sessions a client cloned for its children share
 /// with their offsets and access modes (Clone). `claimed`: the session's
 /// first request took what Clone made for its label.
 #[derive(Clone, Copy)]
 pub struct Fds {
-    slots: [Option<u8>; OPEN_MAX],
+    slots: [Option<DescriptionSlot>; OPEN_MAX],
     /// Reserved descriptions are paid and held, but are not yet public descriptors.
     tentative: u32,
     pub claimed: bool,
@@ -370,7 +391,7 @@ impl Fds {
             .get(slot)
             .copied()
             .flatten()
-            .map(usize::from)
+            .map(DescriptionSlot::index)
             .ok_or(BAD_FD)
     }
 
@@ -617,6 +638,7 @@ impl<'a> Ram<'a> {
             .iter()
             .position(Option::is_none)
             .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
+        let description = DescriptionSlot::new(index).ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
         let generation = self.description_generations[index]
             .checked_add(1)
             .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
@@ -642,7 +664,7 @@ impl<'a> Ram<'a> {
             generation,
         });
         self.description_generations[index] = generation;
-        fds.slots[slot] = Some(index as u8);
+        fds.slots[slot] = Some(description);
         Ok(slot as u32 + 3)
     }
 
@@ -743,7 +765,7 @@ impl<'a> Ram<'a> {
         if slot >= OPEN_MAX || fds.tentative & (1 << slot) == 0 {
             return Err(BAD_FD);
         }
-        let description = fds.slots[slot].ok_or(BAD_FD)? as usize;
+        let description = fds.slots[slot].ok_or(BAD_FD)?.index();
         if held.description.slot as usize != description
             || !self.descriptions[description]
                 .is_some_and(|d| d.generation == held.description.generation)
@@ -756,7 +778,7 @@ impl<'a> Ram<'a> {
         let slot = self.tentative_slot(fds, held)?;
         let description = fds.slots[slot].expect("retained tentative description");
         Ok(self.token(
-            self.descriptions[description as usize]
+            self.descriptions[description.index()]
                 .expect("retained description")
                 .open
                 .file,
@@ -829,9 +851,11 @@ impl<'a> Ram<'a> {
             .position(|receipt| receipt.key == key)
             .ok_or(proto_fs::OPEN_RETIRED)?;
         let receipt = fds.open_receipts[slot];
+        let description = DescriptionSlot::new(usize::from(receipt.description.slot))
+            .ok_or(proto_fs::OPEN_RETIRED)?;
         if fds.tentative & (1 << slot) != 0
-            || fds.slots[slot] != u8::try_from(receipt.description.slot).ok()
-            || !self.descriptions[receipt.description.slot as usize]
+            || fds.slots[slot] != Some(description)
+            || !self.descriptions[description.index()]
                 .is_some_and(|shared| shared.generation == receipt.description.generation)
         {
             return Err(proto_fs::OPEN_RETIRED);
@@ -844,17 +868,18 @@ impl<'a> Ram<'a> {
     /// Preserve the exact description's device type through Commit and final handoff.
     pub fn marked_open(&self, fds: &Fds, held: TentativeOpen) -> Result<u32, u32> {
         let slot = held.fd.checked_sub(3).ok_or(BAD_FD)? as usize;
-        if slot >= OPEN_MAX || fds.slots[slot] != u8::try_from(held.description.slot).ok() {
+        let description = DescriptionSlot::new(usize::from(held.description.slot)).ok_or(BAD_FD)?;
+        if slot >= OPEN_MAX || fds.slots[slot] != Some(description) {
             return Err(BAD_FD);
         }
         let shared = self
             .descriptions
-            .get(held.description.slot as usize)
+            .get(description.index())
             .and_then(Option::as_ref)
             .filter(|shared| shared.generation == held.description.generation)
             .ok_or(BAD_FD)?;
         Ok(held.fd
-            | ((held.description.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT)
+            | (u32::from(held.description.slot) << proto_fs::OPEN_DESCRIPTION_SHIFT)
             | if matches!(shared.open.file, File::Random(_)) {
                 proto_fs::OPEN_RANDOM
             } else {
@@ -1172,7 +1197,7 @@ impl<'a> Ram<'a> {
         let mut slots = [None; OPEN_MAX];
         for &fd in list {
             let index = fds.description(fd)?;
-            slots[(fd - 3) as usize] = Some(index as u8);
+            slots[(fd - 3) as usize] = Some(DescriptionSlot::new(index).ok_or(BAD_FD)?);
         }
         if let Some(cwd) = fds.cwd {
             self.storage.pin(cwd, Pin::Cwd)?;
@@ -1182,7 +1207,7 @@ impl<'a> Ram<'a> {
         out.cwd = fds.cwd;
         // At most 641 session/birth records, including this child, own 32 references each.
         for index in out.slots.iter().flatten() {
-            self.descriptions[usize::from(*index)]
+            self.descriptions[index.index()]
                 .as_mut()
                 .expect("a named description")
                 .refs += 1;
