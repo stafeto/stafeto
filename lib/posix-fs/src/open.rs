@@ -177,6 +177,7 @@ impl Recovery {
                 (previous.phase, self.phase),
                 (Phase::Starting, Phase::Traversing)
                     | (Phase::Traversing, Phase::Preparing)
+                    | (Phase::Preparing, Phase::Traversing)
                     | (Phase::Preparing, Phase::Committing)
                     | (Phase::Committing, Phase::Finishing)
             );
@@ -237,11 +238,16 @@ impl PosixFs {
         claim: ClaimToken,
         recovery: Recovery,
     ) -> Result<(), FsError> {
-        let resident = self
-            .descriptors
-            .claim_snapshot(claim)?
-            .recovery
-            .ok_or(FsError::BadFileDescriptor)?;
+        let snapshot = self.descriptors.claim_snapshot(claim)?;
+        let resident = snapshot.recovery.ok_or(FsError::BadFileDescriptor)?;
+        if resident.phase == Phase::Preparing
+            && recovery.phase == Phase::Traversing
+            && (snapshot.phase != OpenPhase::Preparing
+                || snapshot.entry.is_some()
+                || snapshot.owner.is_none())
+        {
+            return Err(FsError::InvalidArgument);
+        }
         if !recovery.progresses_from(resident) {
             return Err(FsError::InvalidArgument);
         }
@@ -611,6 +617,15 @@ mod tests {
         });
         files.update_open_record(claim, remembered).unwrap();
         let finished = files.open_snapshot(token).unwrap();
+        for phase in [Phase::Traversing, Phase::Preparing] {
+            let mut stale = remembered;
+            stale.phase = phase;
+            assert_eq!(
+                files.update_open_record(claim, stale),
+                Err(FsError::InvalidArgument)
+            );
+            assert_eq!(files.open_snapshot(token).unwrap(), finished);
+        }
         let wrong = remembered.remember(PreparedOpen {
             fd: 4,
             slot: 1,
@@ -622,6 +637,74 @@ mod tests {
             Err(FsError::InvalidArgument)
         );
         assert_eq!(files.open_snapshot(token).unwrap(), finished);
+    }
+
+    #[test]
+    fn stale_traversal_requires_an_unreserved_preparing_claim() {
+        let mut files = files();
+        let (token, claim, _) = preparing(&mut files);
+        let before = files.open_snapshot(token).unwrap();
+        let wait = files.open_wait_snapshot(token).unwrap();
+        let mut retry = before.recovery.unwrap();
+        retry.phase = Phase::Traversing;
+        assert_eq!(
+            files.update_open_record(claim, retry),
+            Err(FsError::InvalidArgument)
+        );
+        assert_eq!(files.open_snapshot(token).unwrap(), before);
+        assert_eq!(files.open_wait_snapshot(token).unwrap(), wait);
+    }
+
+    #[test]
+    fn confirmed_no_effect_retry_retains_capture_and_paid_owner() {
+        let mut files = files();
+        let (token, old_claim, entry) = reserved(&mut files);
+        let receipt = proof(&files, old_claim, entry);
+        files
+            .unreserve_open_record(old_claim, entry, receipt)
+            .unwrap();
+        let owner = OwnerToken::new(1).unwrap();
+        let Claim::Acquired { token: claim, .. } = files.claim_open_record(token, owner).unwrap()
+        else {
+            panic!("new exact claim");
+        };
+        let before = files.open_snapshot(token).unwrap();
+        assert_eq!(before.phase, OpenPhase::Preparing);
+        assert_eq!(before.entry, None);
+        let mut retry = before.recovery.unwrap();
+        retry.phase = Phase::Traversing;
+        for wrong in [
+            Recovery { job: 512, ..retry },
+            Recovery { access: 1, ..retry },
+            Recovery {
+                descriptor_flags: DescriptorFlags::default(),
+                ..retry
+            },
+            Recovery {
+                backend_fd: 3,
+                ..retry
+            },
+            Recovery {
+                description_generation: 1,
+                ..retry
+            },
+        ] {
+            assert_eq!(
+                files.update_open_record(claim, wrong),
+                Err(FsError::InvalidArgument)
+            );
+            assert_eq!(files.open_snapshot(token).unwrap(), before);
+        }
+        assert!(files.update_open_record(old_claim, retry).is_err());
+        files.update_open_record(claim, retry).unwrap();
+        let traversing = files.open_snapshot(token).unwrap();
+        assert_eq!(traversing.owner, Some(owner));
+        assert_eq!(traversing.entry, None);
+        assert_eq!(traversing.recovery, Some(retry));
+        assert_eq!(files.open_tokens().count(), 1);
+        retry.phase = Phase::Preparing;
+        files.update_open_record(claim, retry).unwrap();
+        files.reserve_open_record(claim).unwrap();
     }
 
     #[test]
