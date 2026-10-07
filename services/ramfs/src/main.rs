@@ -27,6 +27,7 @@ use ramfs::tree::{self, Index};
 use ramfs::{Exec, SET_GID, SET_UID};
 use ramfs::{Fds, Ram};
 use rt::abi::{Access, Rights};
+use rt::compact::Compact;
 use rt::handle::{Channel, Handle, Memory, Outgoing, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
@@ -366,9 +367,9 @@ struct ImageContext {
 struct IdentityChannel {
     label: u64,
     closing: bool,
-    channel: Option<Handle<Channel>>,
-    offered: Option<Handle<Channel>>,
-    previous: Option<Handle<Channel>>,
+    channel: Handle<Channel>,
+    offered: Compact<Channel>,
+    previous: Compact<Channel>,
     admission: Admission,
     pending: bool,
     require: bool,
@@ -545,6 +546,9 @@ impl Fs {
         {
             return true;
         }
+        if !Ram::references_released(fds) {
+            return true;
+        }
         self.identity_close_step(fds)
     }
 
@@ -558,11 +562,11 @@ impl Fs {
             return false;
         };
         if identity.offered.is_some() {
-            let _ = Handle::close_retained(&mut identity.offered);
+            let _ = identity.offered.close_retained();
             return true;
         }
         if identity.previous.is_some() {
-            let _ = Handle::close_retained(&mut identity.previous);
+            let _ = identity.previous.close_retained();
             return true;
         }
         if let Some(image) = identity.image.as_mut() {
@@ -575,8 +579,16 @@ impl Fs {
                 return true;
             }
         }
-        if Handle::close_retained(&mut identity.channel).is_ok() {
-            self.identities[fds.authority_index as usize] = None;
+        // All four optional owners are absent before the mandatory channel call.
+        if Handle::close_retained_owner(
+            &mut self.identities[fds.authority_index as usize],
+            |identity| &identity.channel,
+            |identity| {
+                let _ = identity.channel.into_raw();
+            },
+        )
+        .is_ok()
+        {
             fds.authority_index = NONE;
         }
         true
@@ -748,7 +760,7 @@ impl Fs {
             .and_then(Option::as_ref)
             .ok_or(proto_fs::PERMISSION)?;
         let copy = sys::handle_duplicate(
-            identity.channel.as_ref().expect("live identity channel"),
+            &identity.channel,
             Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
         )
         .map_err(|_| proto_fs::TOO_MANY_OPEN_FILES)?;
@@ -1236,19 +1248,11 @@ impl Fs {
                 .identities
                 .get(fds.authority_index as usize)
                 .and_then(Option::as_ref)
-                .filter(|identity| {
-                    identity.label == r.label() && !identity.closing && identity.channel.is_some()
-                })
+                .filter(|identity| identity.label == r.label() && !identity.closing)
             else {
                 return status(proto_fs::PERMISSION);
             };
-            Some(
-                identity
-                    .channel
-                    .as_ref()
-                    .expect("exact source identity")
-                    .raw(),
-            )
+            Some(identity.channel.raw())
         } else {
             None
         };
@@ -1298,9 +1302,9 @@ impl Fs {
                     self.identities[authority_index as usize] = Some(IdentityChannel {
                         label,
                         closing: false,
-                        channel: Some(copy),
-                        offered: None,
-                        previous: None,
+                        channel: copy,
+                        offered: Compact::empty(),
+                        previous: Compact::empty(),
                         admission: Admission::Unvouched,
                         pending: false,
                         require: false,
@@ -1413,12 +1417,20 @@ impl ramfs::clone::Effects<Handle<Channel>, sys::Token> for CloneEffects<'_> {
     }
     fn close_identity(&mut self, index: u16, label: u64) -> Result<(), abi::Error> {
         let identity = self.identities[index as usize]
-            .as_mut()
+            .as_ref()
             .expect("retained child identity");
         assert_eq!(identity.label, label, "exact clone identity");
-        Handle::close_retained(&mut identity.channel)?;
-        self.identities[index as usize] = None;
-        Ok(())
+        assert!(
+            identity.offered.is_none() && identity.previous.is_none() && identity.image.is_none(),
+            "unpublished clone identity optionals"
+        );
+        Handle::close_retained_owner(
+            &mut self.identities[index as usize],
+            |identity| &identity.channel,
+            |identity| {
+                let _ = identity.channel.into_raw();
+            },
+        )
     }
 }
 
@@ -1427,6 +1439,10 @@ impl Service<0> for Fs {
     const METHODS: &'static [u16] = METHODS;
     const PLACED: usize = SESSIONS;
     const RETAIN_CLOSED: bool = true;
+
+    fn closing(&self, s: &Session<Fds, 0>) -> bool {
+        s.data.closing
+    }
 
     fn closed_method(&self, method: u16) -> bool {
         ramfs::maintenance::closed_method(method)
@@ -1568,9 +1584,6 @@ impl Service<0> for Fs {
                 let label = s.label();
                 client_work = self.cleanup_step(&mut s.data, label);
                 closing_visit = s.data.closing;
-                if s.data.closing {
-                    s.revoke();
-                }
                 if s.data.closing && self.closed_terminal(&s.data, label) {
                     self.places.release(label);
                     self.clones.gone(label);
@@ -1633,7 +1646,7 @@ impl Service<0> for Fs {
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
-        if s.closing() && !s.data.claimed {
+        if self.closing(s) && !s.data.claimed {
             let label = s.label();
             if let Some(birth) = self.births.iter_mut().find(|b| {
                 b.as_ref()
@@ -1665,11 +1678,8 @@ impl Service<0> for Fs {
                 s.data.binding = Binding::Cleanup;
             }
             s.data.claimed = true;
-            if s.data.closing {
-                s.revoke();
-                if !s.data.permits_method(r.method()) {
-                    return status(proto_fs::PERMISSION);
-                }
+            if s.data.closing && !s.data.permits_method(r.method()) {
+                return status(proto_fs::PERMISSION);
             }
             // Admission into the session table is one bounded phase of its own.
             // It cannot share a receive with the Process Vouch round trip.
@@ -2553,15 +2563,19 @@ impl Fs {
         } else {
             fds.authority_index as usize
         };
-        let previous = self.identities[i]
-            .take()
-            .and_then(|old| if retain_previous { old.channel } else { None });
+        let previous = self.identities[i].take().and_then(|old| {
+            if retain_previous {
+                Some(old.channel)
+            } else {
+                None
+            }
+        });
         self.identities[i] = Some(IdentityChannel {
             label,
             closing: false,
-            channel: Some(identity),
-            offered: None,
-            previous,
+            channel: identity,
+            offered: Compact::empty(),
+            previous: Compact::from_owner(previous),
             admission: Admission::Unvouched,
             pending: false,
             require: false,
@@ -2614,9 +2628,9 @@ impl Fs {
         if let Some(previous) = previous {
             let identity = self.identities[i].as_mut().unwrap();
             (fds.binding, fds.root) = original.unwrap();
-            identity.channel = Some(previous);
+            identity.channel = previous;
             identity.admission = Admission::Unvouched;
-            identity.offered = None;
+            identity.offered = Compact::empty();
             identity.pending = false;
             identity.require = false;
             self.ram.complete_binding(fds, code);
@@ -2630,6 +2644,7 @@ impl Fs {
     /// Test setup queues real storage reclamation before releasing a live
     /// prepared binding to the unchanged alternating maintenance cursor.
     #[cfg(feature = "auth-probe")]
+    #[inline(always)]
     fn auth_probe_gc(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
@@ -3123,7 +3138,7 @@ impl Fs {
                 .as_ref()
                 .and_then(|identity| {
                     sys::handle_duplicate(
-                        identity.channel.as_ref().expect("live identity channel"),
+                        &identity.channel,
                         Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
                     )
                     .ok()
@@ -3238,7 +3253,7 @@ impl Fs {
         let binding = self.identities[child.authority_index as usize]
             .as_mut()
             .unwrap();
-        binding.offered = offered;
+        binding.offered = Compact::from_owner(offered);
         binding.pending = true;
         binding.require = require;
         self.births[slot] = Some((label, BirthData::Ready(child)));
@@ -3259,6 +3274,7 @@ impl Fs {
         status(self.binding_step(fds, r.label()))
     }
     /// Existing identity storage bounds cleanup even when every preparation is used.
+    #[inline(always)]
     fn audit_step(&mut self, fds: &mut Fds, label: u64) -> bool {
         if fds.binding.awaits_child_identity() {
             return false;
@@ -3285,13 +3301,7 @@ impl Fs {
             _ => {}
         }
         let step = if matches!(identity.admission, Admission::Unvouched) {
-            let channel = Handle::borrowed(
-                identity
-                    .channel
-                    .as_ref()
-                    .expect("live identity channel")
-                    .raw(),
-            );
+            let channel = Handle::borrowed(identity.channel.raw());
             let original = identity.original;
             if self.generations.is_none() {
                 let _ = self.notary_register();
@@ -3355,13 +3365,7 @@ impl Fs {
                     self.reject_binding(fds)
                 };
             }
-            let identity = Handle::borrowed(
-                binding
-                    .channel
-                    .as_ref()
-                    .expect("live identity channel")
-                    .raw(),
-            );
+            let identity = Handle::borrowed(binding.channel.raw());
             if binding.purpose == BindingPurpose::Refresh
                 && matches!(binding.original, Binding::Pending(_) | Binding::Handoff(_))
             {
@@ -3484,8 +3488,8 @@ impl Fs {
                 let binding = self.identities[i].as_ref().unwrap();
                 let offered_label = binding
                     .offered
-                    .as_ref()
-                    .and_then(|offered| sys::copy_label(&self.channel, offered).ok());
+                    .with_view(|offered| sys::copy_label(&self.channel, offered).ok())
+                    .flatten();
                 let original = offered_label.and_then(|label| {
                     self.births
                         .iter()
@@ -3595,8 +3599,8 @@ impl Fs {
             .as_mut()
             .unwrap();
         binding.admission = Admission::Unvouched;
-        binding.offered = None;
-        binding.previous = None;
+        binding.offered = Compact::empty();
+        binding.previous = Compact::empty();
         fds.binding_outcome = Some(0);
         0
     }

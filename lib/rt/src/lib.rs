@@ -21,6 +21,7 @@
 
 #![no_std]
 
+pub mod compact;
 pub mod console;
 pub mod dma;
 pub mod fs;
