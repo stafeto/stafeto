@@ -299,13 +299,29 @@ fn factory(role: i32, command_fd: i32, response_fd: i32, data: i32, data1: i32) 
     }
 }
 fn await_snapshot(predicate: impl Fn(&Snapshot) -> bool) -> Result<Snapshot, i32> {
+    let mut last = [0u32; 5];
     for _ in 0..200_000 {
         let s = meter::snapshot()?;
         if predicate(&s) {
             return Ok(s);
         }
+        last = [
+            s.available[2],
+            s.usage[2],
+            s.jobs,
+            s.preparations,
+            s.root_preparations,
+        ];
         sys::yield_now().map_err(|_| EIO)?;
     }
+    rt::println!(
+        "capacity-diag: await exhausted free={} pages={} jobs={} preparations={} root_preparations={}",
+        last[0],
+        last[1],
+        last[2],
+        last[3],
+        last[4]
+    );
     Err(EIO)
 }
 fn empty_file(path: &[u8]) -> Result<i32, i32> {
@@ -441,6 +457,23 @@ fn ask(input: Pipe, output: Pipe, seq: u32, action: u32, expected: u32) -> Resul
     command(output, seq, action)?;
     let (id, count) = receive_response(input, seq)?;
     require(id == 0 && count == expected)
+}
+#[inline(never)]
+fn tail_baseline(stage: u32, snapshot: &Snapshot) {
+    rt::println!(
+        "capacity-diag: baseline stage={} memory={} live={} meter1={}",
+        stage,
+        snapshot.memory.used,
+        snapshot.handles.live,
+        snapshot.meter[1]
+    );
+    rt::println!(
+        "capacity-diag: baseline stage={} size={} pages={} mappings={}",
+        stage,
+        snapshot.backing.size,
+        snapshot.backing.pages,
+        snapshot.backing.mappings
+    );
 }
 fn leader(role: i32) -> Result<(), i32> {
     let a = role == 1;
@@ -639,16 +672,48 @@ fn leader(role: i32) -> Result<(), i32> {
         require(refilled.available[2] == 0 && refilled.usage[2] == 3072)?;
         rt::println!("capacity: actual refill1536 returned physical free0");
         observe_truncate(f1, 0, 3072)?;
-        await_snapshot(|s| s.available[2] == 1024 && s.usage[2] == 2048)?;
-        posix_abi::ftruncate(f0, 0)?;
+        let result = await_snapshot(|s| s.available[2] == 1024 && s.usage[2] == 2048);
+        rt::println!(
+            "capacity-diag: leader={} stage=10 errno={}",
+            role,
+            result.err().unwrap_or(0)
+        );
+        result?;
+        let result = posix_abi::ftruncate(f0, 0);
+        rt::println!(
+            "capacity-diag: leader={} stage=11 errno={}",
+            role,
+            result.err().unwrap_or(0)
+        );
+        result?;
     } else {
         // Both full-pool cases belong to A; B keeps its 1024 actual pages until A's GC.
-        await_snapshot(|s| s.available[2] == 3072 && s.usage[2] == 1024)?;
-        posix_abi::ftruncate(f0, 0)?;
+        let result = await_snapshot(|s| s.available[2] == 3072 && s.usage[2] == 1024);
+        rt::println!(
+            "capacity-diag: leader={} stage=12 errno={}",
+            role,
+            result.err().unwrap_or(0)
+        );
+        result?;
+        let result = posix_abi::ftruncate(f0, 0);
+        rt::println!(
+            "capacity-diag: leader={} stage=13 errno={}",
+            role,
+            result.err().unwrap_or(0)
+        );
+        result?;
     }
-    let final_state = await_snapshot(|s| {
+    let result = await_snapshot(|s| {
         s.available[2] == 4096 && s.usage == warm.usage && s.jobs == 0 && s.preparations == 0
-    })?;
+    });
+    rt::println!(
+        "capacity-diag: leader={} stage=14 errno={}",
+        role,
+        result.err().unwrap_or(0)
+    );
+    let final_state = result?;
+    tail_baseline(0, &warm);
+    tail_baseline(1, &final_state);
     require(
         final_state.memory.used == warm.memory.used
             && final_state.handles.live == warm.handles.live
