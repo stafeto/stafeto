@@ -57,3 +57,86 @@ mod tests {
         assert_eq!(cursor.remaining, 1);
     }
 }
+
+/// Closed sessions may only inspect or settle exact existing operations.
+pub fn closed_method(method: u16) -> bool {
+    use proto_fs::Method;
+    matches!(
+        Method::from_number(method),
+        Some(
+            Method::Close
+                | Method::CloseExact
+                | Method::ResolveCancel
+                | Method::OpenCancel
+                | Method::OpenQuery
+                | Method::DataQuery
+                | Method::DataCancel
+                | Method::DataAck
+        )
+    )
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    use proto_fs::Method;
+    #[test]
+    fn retained_dispatch_accepts_settlement_and_rejects_every_new_effect() {
+        for method in [
+            Method::Close,
+            Method::CloseExact,
+            Method::ResolveCancel,
+            Method::OpenCancel,
+            Method::OpenQuery,
+            Method::DataQuery,
+            Method::DataCancel,
+            Method::DataAck,
+        ] {
+            assert!(closed_method(method as u16));
+        }
+        for method in [
+            Method::Open,
+            Method::Clone,
+            Method::CloneExact,
+            Method::Bind,
+            Method::FinishBinding,
+            Method::ReadInto,
+            Method::OpenStart,
+            Method::OpenPrepare,
+            Method::OpenCommit,
+            Method::OpenFinish,
+            Method::ResolveStart,
+            Method::ResolveStep,
+            Method::DataStart,
+            Method::DataFeed,
+            Method::DataStep,
+            Method::DataCommit,
+        ] {
+            assert!(!closed_method(method as u16));
+        }
+        assert!(!closed_method(u16::MAX));
+    }
+}
+
+/// The existing cursor visits every paid job and the unique INTO resource.
+pub fn debt_turn(cursor: &mut u8, jobs: usize) -> usize {
+    let slot = *cursor as usize;
+    *cursor = ((slot + 1) % (jobs + 1)) as u8;
+    slot
+}
+
+#[cfg(test)]
+mod debt_tests {
+    use super::*;
+    #[test]
+    fn failed_window_retry_preserves_fair_visits_to_all_128_jobs() {
+        let mut cursor = 0;
+        let mut visits = [0; 129];
+        for _ in 0..129 * 4 {
+            let slot = debt_turn(&mut cursor, 128);
+            visits[slot] += 1;
+        }
+        assert_eq!(visits, [4; 129]);
+        assert_eq!(cursor, 0);
+    }
+}

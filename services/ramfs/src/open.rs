@@ -242,6 +242,27 @@ impl Journal {
         Ok(())
     }
     /// Cancel the exact fd ownership and retain a terminal operation outcome.
+    /// Cancel one descriptor or reservation per retained cleanup visit.
+    pub fn cancel_step(
+        &mut self,
+        ram: &mut Ram<'_>,
+        fds: &mut Fds,
+        charge: &mut u16,
+    ) -> Result<bool, u32> {
+        if let Phase::Prepared {
+            creation: Some(creation),
+            held,
+        } = self.phase
+        {
+            ram.cancel_open(fds, held)?;
+            self.phase = Phase::Reserved(creation);
+            return Ok(false);
+        }
+        let done = matches!(self.phase, Phase::Canceled { .. } | Phase::Resolving);
+        self.cancel(ram, fds, charge)?;
+        Ok(done)
+    }
+
     /// A committed CREATE/TRUNC remains observable after its tentative fd is canceled.
     pub fn cancel(
         &mut self,
@@ -408,6 +429,85 @@ mod tests {
         assert!(ram.preflight_finish_open(&fds, key, held).is_err());
         ram.storage.release_preparation(charge);
         resolver.release(&mut ram.storage);
+    }
+
+    #[test]
+    fn retained_prepared_create_cancels_descriptor_then_reservation_then_pins() {
+        let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+        let mut fds = fds();
+        let flags = proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_WRITE;
+        let mut resolver = ready(&mut ram, b"/retained", flags);
+        let mut charge = ram.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
+        let mut journal = Journal::new(flags, 0o600, 0).unwrap();
+        assert!(
+            !with_proof!(
+                prepare,
+                journal,
+                ram,
+                fds,
+                resolver,
+                plain,
+                OWNER,
+                &mut charge
+            )
+            .unwrap()
+        );
+        assert!(
+            with_proof!(
+                prepare,
+                journal,
+                ram,
+                fds,
+                resolver,
+                plain,
+                OWNER,
+                &mut charge
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            journal.phase,
+            Phase::Prepared {
+                creation: Some(_),
+                ..
+            }
+        ));
+        let before = ram.storage.preparations_used();
+        assert!(
+            !journal
+                .cancel_step(&mut ram, &mut fds, &mut charge)
+                .unwrap()
+        );
+        assert_eq!(ram.open_descriptions(), 0);
+        assert_eq!(ram.storage.preparations_used(), before);
+        assert!(matches!(journal.phase, Phase::Reserved(_)));
+        assert!(
+            !journal
+                .cancel_step(&mut ram, &mut fds, &mut charge)
+                .unwrap()
+        );
+        assert!(matches!(journal.phase, Phase::Canceled { .. }));
+        assert!(
+            journal
+                .cancel_step(&mut ram, &mut fds, &mut charge)
+                .unwrap()
+        );
+        assert_ne!(charge, NONE);
+        let before_pins =
+            ram.storage.node(ROOT).unwrap().pins[crate::storage::Pin::Pending as usize];
+        assert!(before_pins >= 2);
+        assert!(!resolver.release_step(&mut ram.storage));
+        assert_eq!(
+            ram.storage.node(ROOT).unwrap().pins[crate::storage::Pin::Pending as usize],
+            before_pins - 1
+        );
+        assert!(!resolver.release_step(&mut ram.storage));
+        assert_eq!(
+            ram.storage.node(ROOT).unwrap().pins[crate::storage::Pin::Pending as usize],
+            before_pins - 2
+        );
+        assert!(resolver.release_step(&mut ram.storage));
+        ram.storage.release_preparation(charge);
     }
 
     #[test]

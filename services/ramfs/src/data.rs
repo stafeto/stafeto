@@ -260,6 +260,10 @@ impl Journal {
         self.result != DataResult::None
     }
 
+    pub fn cleanup_done(&self) -> bool {
+        self.cleanup_done
+    }
+
     /// One private page or retained lease per cleanup step. File effects remain committed.
     pub fn cancel_step(&mut self, ram: &mut Ram<'_>) -> Result<bool, u32> {
         if self.cleanup_done {

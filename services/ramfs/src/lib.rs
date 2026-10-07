@@ -234,6 +234,8 @@ pub struct Fds {
     /// Reserved descriptions are paid and held, but are not yet public descriptors.
     tentative: u32,
     pub claimed: bool,
+    /// Irreversible revocation keeps every paid owner until settlement.
+    pub closing: bool,
     pub binding: authority::Binding,
     pub authority_index: u16,
     pub binding_preparation: Option<u16>,
@@ -263,6 +265,7 @@ impl Default for Fds {
             slots: [None; OPEN_MAX],
             tentative: 0,
             claimed: false,
+            closing: false,
             binding: authority::Binding::Unbound,
             authority_index: storage::NONE,
             binding_preparation: None,
@@ -985,6 +988,20 @@ impl<'a> Ram<'a> {
         }
         fds.binding_source = None;
         fds.binding_outcome = Some(outcome);
+    }
+
+    /// Exact local custody is empty after phased cleanup.
+    pub fn released(fds: &Fds) -> bool {
+        fds.slots.iter().all(Option::is_none)
+            && fds.tentative == 0
+            && fds.preparations.iter().all(Option::is_none)
+            && fds.cwd.is_none()
+            && fds.image_hold.is_none()
+            && fds.image_outcome.is_none()
+            && fds.binding_preparation.is_none()
+            && fds.binding_source.is_none()
+            && fds.resolvers.iter().all(|id| *id == 0)
+            && fds.authority_index == storage::NONE
     }
 
     /// One reference or preparation per cleanup step.
@@ -2024,6 +2041,56 @@ mod tests {
         assert_eq!(ram.descriptor_information(&b, fb), Err(BAD_FD));
         assert_eq!(ram.information("/missing"), Err(NO_ENTRY));
         assert_eq!(ram.information("/").unwrap(), root);
+    }
+
+    #[test]
+    fn retained_cleanup_releases_one_of_32_descriptors_and_preserves_sibling() {
+        let mut ram = Ram::default();
+        let mut parent = Fds::default();
+        let numbers: [u32; OPEN_MAX] =
+            core::array::from_fn(|_| ram.open(&mut parent, "/etc/motd", READ_ONLY).unwrap());
+        let mut child = ram.clone_fds(&parent, &numbers).unwrap();
+        parent.closing = true;
+        parent.binding = authority::Binding::Cleanup;
+        for remaining in (0..OPEN_MAX).rev() {
+            assert!(!Ram::released(&parent));
+            assert!(ram.release_step(&mut parent));
+            assert_eq!(parent.numbers().count(), remaining);
+            assert_eq!(ram.open_descriptions(), OPEN_MAX);
+            assert_eq!(child.numbers().count(), OPEN_MAX);
+        }
+        assert!(Ram::released(&parent));
+        assert!(!ram.release_step(&mut parent));
+        for remaining in (0..OPEN_MAX).rev() {
+            assert!(ram.release_step(&mut child));
+            assert_eq!(ram.open_descriptions(), remaining);
+        }
+        assert!(Ram::released(&child));
+    }
+
+    #[test]
+    fn retained_terminal_waits_for_each_local_debt() {
+        let mut fds = Fds {
+            closing: true,
+            ..Fds::default()
+        };
+        assert!(Ram::released(&fds));
+        fds.resolvers[15] = 19;
+        assert!(!Ram::released(&fds));
+        fds.resolvers[15] = 0;
+        fds.binding_source = Some((7, 11));
+        assert!(!Ram::released(&fds));
+        fds.binding_source = None;
+        fds.binding_preparation = Some(7);
+        assert!(!Ram::released(&fds));
+        fds.binding_preparation = None;
+        fds.authority_index = 319;
+        assert!(!Ram::released(&fds));
+        fds.authority_index = storage::NONE;
+        fds.tentative = 1 << 31;
+        assert!(!Ram::released(&fds));
+        fds.tentative = 0;
+        assert!(Ram::released(&fds));
     }
 
     #[test]

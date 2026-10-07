@@ -31,6 +31,7 @@ pub struct Resolve {
     edge_end: usize,
     missing: bool,
     result: Option<Token>,
+    base_released: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -131,6 +132,7 @@ impl Resolve {
             edge_end: 0,
             missing: false,
             result: None,
+            base_released: false,
         })
     }
     fn restart(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<(), u32> {
@@ -411,6 +413,24 @@ impl Resolve {
         storage.node(self.base)?;
         Ok(token)
     }
+    /// One retained pin per cancel visit.
+    pub fn release_step(&mut self, storage: &mut Storage<'_>) -> bool {
+        if let Some(result) = self.result.take() {
+            let _ = storage.unpin(result, Pin::Pending);
+            return false;
+        }
+        if let Some(parent) = self.edge_parent.take() {
+            let _ = storage.unpin(parent, Pin::Pending);
+            return false;
+        }
+        if !self.base_released {
+            let _ = storage.unpin(self.base, Pin::Pending);
+            self.base_released = true;
+            return false;
+        }
+        true
+    }
+
     pub fn release(mut self, storage: &mut Storage<'_>) {
         if let Some(result) = self.result.take() {
             let _ = storage.unpin(result, Pin::Pending);

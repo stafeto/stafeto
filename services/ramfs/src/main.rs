@@ -227,6 +227,7 @@ fn main(_: u64) -> u64 {
         capacity_checkpoints: ramfs::capacity::Checkpoints::default(),
         #[cfg(feature = "full-capacity-probe")]
         capacity_retired_gate: None,
+        into_window: None,
         process: Handle::borrowed(start.process.raw()),
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
@@ -256,7 +257,11 @@ fn main(_: u64) -> u64 {
     4
 }
 
+type IntoWindow = rt::retention::Window<Handle<Memory>>;
+
 struct Fs {
+    /// The unique INTO resource keeps its paid mapping owner through failed unmap.
+    into_window: Option<IntoWindow>,
     ram: Ram<'static>,
     time_source: clock_page::TimeSource,
     #[cfg(feature = "open-finalize-clock-probe")]
@@ -321,7 +326,8 @@ struct ImageContext {
 }
 struct IdentityChannel {
     label: u64,
-    channel: Handle<Channel>,
+    closing: bool,
+    channel: Option<Handle<Channel>>,
     offered: Option<Handle<Channel>>,
     previous: Option<Handle<Channel>>,
     admission: Admission,
@@ -343,6 +349,8 @@ struct ResolveJob {
     open_key: Option<proto_fs::OpenKey>,
     raw_base: (u32, u64),
     abandoned: bool,
+    /// A paid cancellation continues through the ordinary owner cursor.
+    retiring: bool,
 }
 struct PathJob {
     resolver: Resolve,
@@ -391,8 +399,169 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
 }));
 
 impl Fs {
+    fn window_cleanup_step(&mut self) {
+        let Some(window) = self.into_window.as_mut() else {
+            return;
+        };
+        let done = window.step(
+            |length| {
+                // SAFETY: this journal owns the unique exact INTO mapping.
+                unsafe { sys::mem_unmap(&self.process, INTO, length) }
+            },
+            Handle::close_retained,
+        );
+        if done == Ok(true) {
+            self.into_window = None;
+        }
+    }
+
+    fn closed_terminal(&self, fds: &Fds, label: u64) -> bool {
+        Ram::released(fds)
+            && self.jobs.iter().flatten().all(|job| job.owner != label)
+            && self
+                .into_window
+                .as_ref()
+                .is_none_or(|window| window.owner != label)
+    }
+
+    /// Closing dispatch reaches only retained settlement phases.
+    fn closed_cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
+        #[cfg(feature = "open-finalize-clock-probe")]
+        if let Some(gate) = self.clock_gate.as_mut().filter(|gate| gate.owner == label) {
+            gate.closing = true;
+            if Handle::close_retained(&mut gate.channel).is_ok() {
+                self.clock_gate = None;
+            }
+            return true;
+        }
+        if let Some(outcome) = fds.image_outcome {
+            if outcome.phase == ramfs::image::ImagePhase::Prepared {
+                if let Some((_, child)) = self
+                    .births
+                    .iter_mut()
+                    .flatten()
+                    .find(|(l, _)| *l == outcome.label)
+                {
+                    child.closing = true;
+                    child.binding = Binding::Cleanup;
+                }
+                if let Some(identity) = self
+                    .identities
+                    .iter_mut()
+                    .flatten()
+                    .find(|identity| identity.label == outcome.label)
+                {
+                    identity.closing = true;
+                }
+                fds.image_outcome = None;
+                return true;
+            }
+            if let Some(image) = self
+                .identities
+                .iter_mut()
+                .flatten()
+                .find(|identity| identity.label == outcome.label)
+                .and_then(|identity| identity.image.as_mut())
+                && image.private.is_some()
+            {
+                if Handle::close_retained(&mut image.private).is_ok() {
+                    fds.image_outcome = None;
+                }
+                return true;
+            }
+            fds.image_outcome = None;
+            return true;
+        }
+        if let Some(id) = self
+            .jobs
+            .iter()
+            .flatten()
+            .find(|job| job.owner == label)
+            .map(|job| job.id)
+        {
+            self.cancel_job_mode(id, label, Some(fds), true);
+            return true;
+        }
+        #[cfg(feature = "auth-probe")]
+        if fds.auth_probe_gc.take().is_some() {
+            let _ = self
+                .ram
+                .storage
+                .unlink(ramfs::storage::ROOT, b"auth-probe-gc", fds.root);
+            return true;
+        }
+        if self.ram.release_step(fds) {
+            return true;
+        }
+        // Window custody keeps the corresponding identity until unmap and close settle.
+        if self
+            .into_window
+            .as_ref()
+            .is_some_and(|window| window.owner == label)
+        {
+            return true;
+        }
+        self.identity_close_step(fds)
+    }
+
+    fn identity_close_step(&mut self, fds: &mut Fds) -> bool {
+        let Some(identity) = self
+            .identities
+            .get_mut(fds.authority_index as usize)
+            .and_then(Option::as_mut)
+        else {
+            fds.authority_index = NONE;
+            return false;
+        };
+        if identity.offered.is_some() {
+            let _ = Handle::close_retained(&mut identity.offered);
+            return true;
+        }
+        if identity.previous.is_some() {
+            let _ = Handle::close_retained(&mut identity.previous);
+            return true;
+        }
+        if let Some(image) = identity.image.as_mut() {
+            if image.private.is_some() {
+                let _ = Handle::close_retained(&mut image.private);
+                return true;
+            }
+            if image.transfer.is_some() {
+                let _ = Handle::close_retained(&mut image.transfer);
+                return true;
+            }
+        }
+        if Handle::close_retained(&mut identity.channel).is_ok() {
+            self.identities[fds.authority_index as usize] = None;
+            fds.authority_index = NONE;
+        }
+        true
+    }
+}
+
+impl Fs {
     /// A dead or superseded authority releases one retained reference per pass.
     fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
+        if fds.closing
+            || self
+                .identities
+                .get(fds.authority_index as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|identity| identity.closing)
+        {
+            fds.closing = true;
+            fds.binding = Binding::Cleanup;
+            return self.closed_cleanup_step(fds, label);
+        }
+        if let Some(id) = fds.resolvers.iter().copied().find(|id| {
+            *id != 0
+                && self
+                    .job_slot(*id, label)
+                    .is_ok_and(|slot| self.jobs[slot].as_ref().is_some_and(|job| job.retiring))
+        }) {
+            self.cancel_job_mode(id, label, Some(fds), true);
+            return true;
+        }
         #[cfg(feature = "full-capacity-probe")]
         if fds
             .binding
@@ -407,7 +576,7 @@ impl Fs {
             .is_some_and(|who| generation(who.index as usize) & proto_process::GENERATION_DEAD != 0)
         {
             let unfinished = fds.binding_preparation.is_some();
-            self.drop_identity(fds);
+            fds.closing = true;
             fds.binding = Binding::Cleanup;
             if unfinished || fds.binding_outcome.is_none() {
                 fds.binding_outcome = Some(proto_fs::PERMISSION);
@@ -475,28 +644,10 @@ impl Fs {
         if !matches!(fds.binding, Binding::Cleanup) {
             return false;
         }
-        if fds.image_outcome.is_some() {
-            self.clear_image_outcome(fds);
-            return true;
-        }
-        if let Some(id) = fds.resolvers.iter().copied().find(|&id| id != 0) {
-            self.cancel_job(id, label, Some(fds));
-            return true;
-        }
-        #[cfg(feature = "auth-probe")]
-        if fds.auth_probe_gc.take().is_some() {
-            let _ = self
-                .ram
-                .storage
-                .unlink(ramfs::storage::ROOT, b"auth-probe-gc", fds.root);
-            return true;
-        }
-        if self.ram.release_step(fds) {
-            return true;
-        }
-        self.drop_identity(fds);
-        false
+        fds.closing = true;
+        self.closed_cleanup_step(fds, label)
     }
+
     fn notary(&mut self) -> Option<&Handle<Channel>> {
         if self.notary.is_none() {
             self.notary = rt::service::connect(&self.parent, "posix").ok();
@@ -544,7 +695,7 @@ impl Fs {
             .and_then(Option::as_ref)
             .ok_or(proto_fs::PERMISSION)?;
         let copy = sys::handle_duplicate(
-            &identity.channel,
+            identity.channel.as_ref().expect("live identity channel"),
             Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
         )
         .map_err(|_| proto_fs::TOO_MANY_OPEN_FILES)?;
@@ -840,7 +991,7 @@ impl Fs {
                 if !ramfs::read_into_valid(fd, count as usize, at, handles, writable, size) {
                     return Answer::Status(Status::BadSize);
                 }
-                match self.read_into(fds, offset, count as usize, &memory, at) {
+                match self.read_into(fds, r.label(), offset, count as usize, memory, at) {
                     Ok(n) => value(r, n as u32),
                     Err(answer) => answer,
                 }
@@ -931,23 +1082,40 @@ impl Fs {
     fn read_into(
         &mut self,
         fds: &Fds,
+        owner: u64,
         offset: u64,
         count: usize,
-        memory: &Handle<Memory>,
+        memory: Handle<Memory>,
         at: u64,
     ) -> Result<usize, Answer> {
+        if self.into_window.is_some() {
+            return Err(status(proto_fs::RESOLVING));
+        }
         if count == 0 {
             return Ok(0);
         }
         let len = (count as u64).next_multiple_of(4096);
-        sys::mem_map(&self.process, memory, at, len, INTO, Access::ReadWrite)
+        sys::mem_map(&self.process, &memory, at, len, INTO, Access::ReadWrite)
             .map_err(|e| Answer::Status(Status::Kernel(e)))?;
+        self.into_window = Some(IntoWindow {
+            owner,
+            memory: Some(memory),
+            length: len,
+            mapped: true,
+        });
         // SAFETY: the window maps `len` bytes of the object, which only this
         // step touches until the unmap below.
         let out = unsafe { core::slice::from_raw_parts_mut(INTO as *mut u8, count) };
         let read = self.ram.held_image_read(fds, offset, out);
         // SAFETY: the mapping made above, which nothing uses now.
-        let _ = unsafe { sys::mem_unmap(&self.process, INTO, len) };
+        match unsafe { sys::mem_unmap(&self.process, INTO, len) } {
+            Ok(()) => self.into_window.as_mut().expect("mapped owner").mapped = false,
+            Err(error) => {
+                let _ = sys::notify(&self.channel, 1);
+                return Err(Answer::Status(Status::Kernel(error)));
+            }
+        }
+        let _ = sys::notify(&self.channel, 1);
         read.map_err(status)
     }
 }
@@ -1029,7 +1197,7 @@ impl Fs {
                 .as_ref()
                 .and_then(|i| {
                     sys::handle_duplicate(
-                        &i.channel,
+                        i.channel.as_ref().expect("live identity channel"),
                         Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
                     )
                     .ok()
@@ -1067,59 +1235,71 @@ impl Service<0> for Fs {
     const VERSION: u16 = VERSION;
     const METHODS: &'static [u16] = METHODS;
     const PLACED: usize = SESSIONS;
+    const RETAIN_CLOSED: bool = true;
+
+    fn closed_method(&self, method: u16) -> bool {
+        ramfs::maintenance::closed_method(method)
+    }
+
     type Data = Fds;
 
     /// The client of `s` went: its descriptors close.
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
         #[cfg(feature = "full-capacity-probe")]
-        self.capacity_clear_owner(s.label());
+        self.capacity_revoke_owner(s.label());
         #[cfg(feature = "open-finalize-clock-probe")]
         if self
             .clock_gate
             .as_ref()
             .is_some_and(|gate| gate.owner == s.label())
         {
-            self.clock_gate = None;
+            self.clock_gate
+                .as_mut()
+                .expect("exact revoked gate")
+                .closing = true;
         }
-        self.clear_image_outcome(&mut s.data);
-        for id in s.data.resolvers {
-            if id != 0 {
-                self.abandon_job(id, s.label(), &mut s.data);
+        if !s.data.claimed {
+            let label = s.label();
+            if let Some(birth) = self
+                .births
+                .iter_mut()
+                .find(|b| b.is_some_and(|(l, _)| l == label))
+            {
+                s.data = birth.take().expect("exact disappearing birth").1;
             }
+            s.data.claimed = true;
         }
-        self.drop_identity(&mut s.data);
-        self.ram.release(&mut s.data);
+        s.data.closing = true;
+        s.data.binding = Binding::Cleanup;
+        #[cfg(feature = "auth-probe")]
+        {
+            s.data.auth_probe_hold = false;
+        }
     }
 
     /// The last copy of a session Clone made went before it sent anything:
     /// the descriptors it was born with close.
     fn closed(&mut self, label: u64) {
         #[cfg(feature = "full-capacity-probe")]
-        self.capacity_clear_owner(label);
+        self.capacity_revoke_owner(label);
         #[cfg(feature = "open-finalize-clock-probe")]
         if self
             .clock_gate
             .as_ref()
             .is_some_and(|gate| gate.owner == label)
         {
-            self.clock_gate = None;
+            self.clock_gate
+                .as_mut()
+                .expect("exact revoked gate")
+                .closing = true;
         }
-        self.places.release(label);
-        self.clones.gone(label);
-        if let Some(birth) = self
-            .births
-            .iter_mut()
-            .find(|b| b.is_some_and(|(l, _)| l == label))
-            && let Some((_, mut fds)) = birth.take()
-        {
-            self.clear_image_outcome(&mut fds);
-            for id in fds.resolvers {
-                if id != 0 {
-                    self.abandon_job(id, label, &mut fds);
-                }
+        if let Some((_, fds)) = self.births.iter_mut().flatten().find(|(l, _)| *l == label) {
+            fds.closing = true;
+            fds.binding = Binding::Cleanup;
+            #[cfg(feature = "auth-probe")]
+            {
+                fds.auth_probe_hold = false;
             }
-            self.drop_identity(&mut fds);
-            self.ram.release(&mut fds);
         }
     }
 
@@ -1142,10 +1322,15 @@ impl Service<0> for Fs {
         self.maintenance_jobs = !self.maintenance_jobs;
         if self.maintenance_jobs {
             self.data_gc_turn = !self.data_gc_turn;
-            if self.data_gc_turn && self.orphan_count != 0 {
-                let slot = self.orphan_cursor as usize;
-                self.orphan_cursor = ((slot + 1) % ramfs::storage::PREPARATIONS) as u8;
-                if let Some(job) = self.jobs[slot].as_ref().filter(|job| job.abandoned) {
+            if self.data_gc_turn && (self.orphan_count != 0 || self.into_window.is_some()) {
+                let slot = ramfs::maintenance::debt_turn(
+                    &mut self.orphan_cursor,
+                    ramfs::storage::PREPARATIONS,
+                );
+                if slot == ramfs::storage::PREPARATIONS {
+                    self.window_cleanup_step();
+                    work = true;
+                } else if let Some(job) = self.jobs[slot].as_ref().filter(|job| job.abandoned) {
                     let (id, owner) = (job.id, job.owner);
                     self.cancel_job(id, owner, None);
                     work = true;
@@ -1159,7 +1344,11 @@ impl Service<0> for Fs {
                     work = self.ram.storage.reclaim_step();
                 }
             }
-            if work || self.maintenance.remaining != 0 || self.orphan_count != 0 {
+            if work
+                || self.maintenance.remaining != 0
+                || self.orphan_count != 0
+                || self.into_window.is_some()
+            {
                 let _ = sys::notify(&self.channel, 1);
             }
             return;
@@ -1170,15 +1359,29 @@ impl Service<0> for Fs {
             if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
                 let label = s.label();
                 client_work = self.cleanup_step(&mut s.data, label);
+                if s.data.closing && self.closed_terminal(&s.data, label) {
+                    self.places.release(label);
+                    self.clones.gone(label);
+                    sessions[i] = None;
+                }
             }
         } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
             client_work = self.cleanup_step(&mut fds, label);
-            self.births[i - SESSIONS] = Some((label, fds));
+            if fds.closing && self.closed_terminal(&fds, label) {
+                self.places.release(label);
+                self.clones.gone(label);
+            } else {
+                self.births[i - SESSIONS] = Some((label, fds));
+            }
         }
         work |= client_work;
         self.maintenance.complete(client_work, SESSIONS + BIRTHS);
         // A maintenance notification makes reclamation progress with no client request.
-        if work || self.maintenance.remaining != 0 || self.orphan_count != 0 {
+        if work
+            || self.maintenance.remaining != 0
+            || self.orphan_count != 0
+            || self.into_window.is_some()
+        {
             let _ = sys::notify(&self.channel, 1);
         }
     }
@@ -1197,6 +1400,22 @@ impl Service<0> for Fs {
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        if s.closing() && !s.data.claimed {
+            let label = s.label();
+            if let Some(birth) = self
+                .births
+                .iter_mut()
+                .find(|b| b.is_some_and(|(l, _)| l == label))
+            {
+                s.data = birth.take().expect("exact retained birth").1;
+            }
+            s.data.claimed = true;
+            s.data.closing = true;
+            s.data.binding = Binding::Cleanup;
+        }
+        if s.data.closing && !self.closed_method(r.method()) {
+            return status(proto_fs::PERMISSION);
+        }
         let first = !s.data.claimed;
         if !s.data.claimed {
             // The first request of a session Clone made takes its
@@ -1294,11 +1513,12 @@ impl Service<0> for Fs {
                 return Answer::Status(Status::BadSize);
             };
             self.clock_gate = Some(clock_page::ClockGate {
+                closing: false,
                 owner: r.label(),
                 key,
                 job,
                 stamp,
-                channel,
+                channel: Some(channel),
             });
             return Answer::Status(Status::Ok);
         }
@@ -1400,8 +1620,7 @@ impl Service<0> for Fs {
                 if !r.handles.is_empty() || body.u32() != Ok(0) || body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                self.drop_identity(&mut s.data);
-                self.ram.release_image(&mut s.data);
+                s.data.closing = true;
                 s.data.binding = Binding::Cleanup;
                 return Answer::Status(Status::Ok);
             }
@@ -2096,16 +2315,13 @@ impl Fs {
         } else {
             fds.authority_index as usize
         };
-        let previous = self.identities[i].take().and_then(|old| {
-            if retain_previous {
-                Some(old.channel)
-            } else {
-                None
-            }
-        });
+        let previous = self.identities[i]
+            .take()
+            .and_then(|old| if retain_previous { old.channel } else { None });
         self.identities[i] = Some(IdentityChannel {
             label,
-            channel: identity,
+            closing: false,
+            channel: Some(identity),
             offered: None,
             previous,
             admission: Admission::Unvouched,
@@ -2160,7 +2376,7 @@ impl Fs {
         if let Some(previous) = previous {
             let identity = self.identities[i].as_mut().unwrap();
             (fds.binding, fds.root) = original.unwrap();
-            identity.channel = previous;
+            identity.channel = Some(previous);
             identity.admission = Admission::Unvouched;
             identity.offered = None;
             identity.pending = false;
@@ -2280,6 +2496,16 @@ impl Fs {
         result.inspect_err(|&error| {
             let _ = rt::resource_meter::invalidate_for(&self.process, error);
         })
+    }
+
+    #[cfg(feature = "full-capacity-probe")]
+    fn capacity_revoke_owner(&mut self, label: u64) {
+        if self
+            .capacity_retired_gate
+            .is_some_and(|gate| gate.owner(label))
+        {
+            self.capacity_retired_gate = None;
+        }
     }
 
     #[cfg(feature = "full-capacity-probe")]
@@ -2663,7 +2889,7 @@ impl Fs {
                 .as_ref()
                 .and_then(|identity| {
                     sys::handle_duplicate(
-                        &identity.channel,
+                        identity.channel.as_ref().expect("live identity channel"),
                         Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
                     )
                     .ok()
@@ -2822,7 +3048,13 @@ impl Fs {
             _ => {}
         }
         let step = if matches!(identity.admission, Admission::Unvouched) {
-            let channel = Handle::borrowed(identity.channel.raw());
+            let channel = Handle::borrowed(
+                identity
+                    .channel
+                    .as_ref()
+                    .expect("live identity channel")
+                    .raw(),
+            );
             let original = identity.original;
             if self.generations.is_none() {
                 let _ = self.notary_register();
@@ -2886,7 +3118,13 @@ impl Fs {
                     self.reject_binding(fds)
                 };
             }
-            let identity = Handle::borrowed(binding.channel.raw());
+            let identity = Handle::borrowed(
+                binding
+                    .channel
+                    .as_ref()
+                    .expect("live identity channel")
+                    .raw(),
+            );
             if binding.purpose == BindingPurpose::Refresh
                 && matches!(binding.original, Binding::Pending(_) | Binding::Handoff(_))
             {
@@ -3217,6 +3455,7 @@ impl Fs {
                 open_key: Some(args.key),
                 raw_base: (0, 0),
                 abandoned: false,
+                retiring: false,
             });
             self.job_generations[slot] = generation;
             fds.resolvers[local] = id;
@@ -3287,6 +3526,14 @@ impl Fs {
         if !fds.resolvers.contains(&id) {
             return status(proto_fs::PERMISSION);
         }
+        if job.retiring
+            && !matches!(
+                method,
+                Method::DataQuery | Method::DataAck | Method::DataCancel
+            )
+        {
+            return status(proto_fs::OPEN_RETIRED);
+        }
         if matches!(method, Method::DataAck | Method::DataCancel) {
             if method == Method::DataAck && !data.ack_allowed() {
                 return status(proto_fs::INVALID_ARGUMENT);
@@ -3301,11 +3548,16 @@ impl Fs {
         if job.abandoned {
             return status(proto_fs::OPEN_RETIRED);
         }
-        if let Err(code) = self.authenticate(fds, r.label()) {
+        if !fds.closing
+            && let Err(code) = self.authenticate(fds, r.label())
+        {
             return status(code);
         }
         let job = self.jobs[slot].as_mut().expect("owned data job");
-        if job.authority.map(|stamp| stamp.image) != fds.binding.stamp().map(|stamp| stamp.image) {
+        if !fds.closing
+            && job.authority.map(|stamp| stamp.image)
+                != fds.binding.stamp().map(|stamp| stamp.image)
+        {
             return status(proto_fs::OPEN_RETIRED);
         }
         let JobOperation::Data(data) = &mut job.operation else {
@@ -3392,6 +3644,9 @@ impl Fs {
     }
     fn path_slot(&self, id: u64, owner: u64) -> Result<usize, u32> {
         let slot = self.job_slot(id, owner)?;
+        if self.jobs[slot].as_ref().is_some_and(|job| job.retiring) {
+            return Err(proto_fs::OPEN_RETIRED);
+        }
         if !matches!(
             self.jobs[slot].as_ref().expect("exact job").operation,
             JobOperation::Path(_)
@@ -3399,23 +3654,6 @@ impl Fs {
             return Err(proto_fs::PERMISSION);
         }
         Ok(slot)
-    }
-    fn abandon_job(&mut self, id: u64, owner: u64, fds: &mut Fds) {
-        let Ok(slot) = self.job_slot(id, owner) else {
-            return;
-        };
-        let job = self.jobs[slot].as_mut().expect("exact disappearing job");
-        if let JobOperation::Data(data) = &mut job.operation {
-            if !job.abandoned {
-                data.abandon();
-                job.abandoned = true;
-                self.orphan_count = self.orphan_count.checked_add(1).expect("bounded paid jobs");
-                assert!(self.orphan_count as usize <= ramfs::storage::PREPARATIONS);
-            }
-            let _ = sys::notify(&self.channel, 1);
-        } else {
-            self.cancel_job(id, owner, Some(fds));
-        }
     }
     fn cancel_job(&mut self, id: u64, owner: u64, fds: Option<&mut Fds>) {
         self.cancel_job_mode(id, owner, fds, true);
@@ -3436,6 +3674,7 @@ impl Fs {
             self.capacity_clear_owner(owner);
         }
         if let Some(fds) = fds.as_deref_mut()
+            && !fds.closing
             && fds.image_outcome.is_some_and(|outcome| outcome.job == id)
         {
             let outcome = fds.image_outcome.unwrap();
@@ -3452,36 +3691,60 @@ impl Fs {
             }
         }
         if let Ok(i) = self.job_slot(id, owner) {
+            if retire {
+                let job = self.jobs[i].as_mut().expect("exact retiring job");
+                if !job.retiring {
+                    job.retiring = true;
+                    self.maintenance.remaining = SESSIONS + BIRTHS;
+                    let _ = sys::notify(&self.channel, 1);
+                }
+            }
             if let Some(ResolveJob {
                 operation: JobOperation::Data(data),
                 ..
             }) = self.jobs[i].as_mut()
-                && !data
-                    .cancel_step(&mut self.ram)
-                    .expect("exact data job cleanup")
+                && !data.cleanup_done()
             {
+                data.cancel_step(&mut self.ram)
+                    .expect("exact data job cleanup");
                 return false;
             }
             if !retire {
                 return true;
             }
-            let mut j = self.jobs[i].take().expect("owned canceled job");
-            if let JobOperation::Path(mut path) = j.operation {
-                if let Some(open) = path.open.as_mut() {
+            let j = self.jobs[i].as_mut().expect("owned canceled job");
+            if let JobOperation::Path(path) = &mut j.operation {
+                if let Some(open) = path.open.as_mut()
+                    && !matches!(open.phase, OpenPhase::Canceled { .. })
+                {
                     let fds = fds
                         .as_deref_mut()
                         .expect("open job retains its owning session");
-                    open.cancel(&mut self.ram, fds, &mut j.root)
-                        .expect("exact open job cleanup");
+                    if !open
+                        .cancel_step(&mut self.ram, fds, &mut j.root)
+                        .expect("exact open cleanup")
+                    {
+                        return false;
+                    }
+                    return false;
                 }
-                path.resolver.release(&mut self.ram.storage);
-                if let Some(second) = path.second {
-                    second.release(&mut self.ram.storage);
+                if !path.resolver.release_step(&mut self.ram.storage) {
+                    return false;
+                }
+                if let Some(second) = path.second.as_mut() {
+                    if !second.release_step(&mut self.ram.storage) {
+                        return false;
+                    }
+                    path.second = None;
+                    return false;
                 }
             }
             if j.root != NONE {
                 self.ram.storage.release_preparation(j.root);
+                j.root = NONE;
+                return false;
             }
+            let j = self.jobs[i].take().expect("settled canceled job");
             if j.abandoned {
                 self.orphan_count = self
                     .orphan_count
@@ -3528,7 +3791,9 @@ impl Fs {
                         Err(code) => status(code),
                     };
                 }
-                if let Err(code) = self.authenticate(fds, r.label()) {
+                if !fds.closing
+                    && let Err(code) = self.authenticate(fds, r.label())
+                {
                     return status(code);
                 }
                 return match self.ram.finished_open(fds, key) {
@@ -3547,15 +3812,18 @@ impl Fs {
                 self.cancel_job(id, r.label(), Some(fds));
                 return Answer::Status(Status::Ok);
             }
-            if let Err(code) = self.authenticate(fds, r.label()) {
+            if !fds.closing
+                && let Err(code) = self.authenticate(fds, r.label())
+            {
                 return status(code);
             }
             let j = self.jobs[i].as_ref().expect("retained query job");
             if !fds.resolvers.contains(&id)
                 || j.real
                 || j.path().second.is_some()
-                || j.authority.map(|stamp| stamp.image)
-                    != fds.binding.stamp().map(|stamp| stamp.image)
+                || (!fds.closing
+                    && j.authority.map(|stamp| stamp.image)
+                        != fds.binding.stamp().map(|stamp| stamp.image))
             {
                 return status(proto_fs::OPEN_RETIRED);
             }
@@ -3846,6 +4114,7 @@ impl Fs {
                 open_key,
                 raw_base,
                 abandoned: false,
+                retiring: false,
             });
             fds.resolvers[place] = id;
             if let Some(key) = open_key {

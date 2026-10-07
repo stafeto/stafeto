@@ -81,8 +81,11 @@ impl TimeSource {
                         .and_then(|()| request.u64(gate.key.generation))
                         .and_then(|()| request.u64(gate.job))
                         .and_then(|()| {
-                            let reply = sys::send(&gate.channel, request.as_bytes())
-                                .map_err(Status::Kernel)?;
+                            let reply = sys::send(
+                                gate.channel.as_ref().expect("live clock gate"),
+                                request.as_bytes(),
+                            )
+                            .map_err(Status::Kernel)?;
                             let mut bytes = [0; rt::abi::MESSAGE_MAX];
                             if !reply.handles.is_empty()
                                 || reply.bytes(&mut bytes) != proto_wire::reply(Status::Ok)
@@ -122,8 +125,9 @@ impl TimeSource {
 #[cfg(feature = "open-finalize-clock-probe")]
 pub struct ClockGate {
     pub owner: u64,
+    pub closing: bool,
     pub key: proto_fs::OpenKey,
     pub job: u64,
     pub stamp: ramfs::authority::Stamp,
-    pub channel: Handle<Channel>,
+    pub channel: Option<Handle<Channel>>,
 }
