@@ -46,6 +46,26 @@ pub enum State {
     Alive,
     /// Its process ended so; the record waits for its parent's wait.
     Zombie(End),
+    /// Native death revoked authority; ownership waits for ACK/cleanup.
+    EndPendingLoading(Option<End>),
+    EndPendingAlive(Option<End>),
+    /// One resident journal drains the exact image before Zombie/reuse.
+    EndingLoading(End),
+    EndingAlive(End),
+}
+impl State {
+    pub const fn end_pending(self) -> bool {
+        matches!(
+            self,
+            Self::EndPendingLoading(_)
+                | Self::EndPendingAlive(_)
+                | Self::EndingLoading(_)
+                | Self::EndingAlive(_)
+        )
+    }
+    pub const fn live(self) -> bool {
+        matches!(self, Self::Loading | Self::Alive)
+    }
 }
 
 /// What became of a record whose process ended (`exited`).
@@ -155,6 +175,24 @@ enum SlotState {
     Reserved,
     Used,
     Retired,
+    Retaining,
+}
+
+/// Exact removed row remains unavailable until its resident caps settle.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Retirement {
+    key: crate::preparing::Key,
+}
+impl Retirement {
+    pub const fn key(&self) -> crate::preparing::Key {
+        self.key
+    }
+}
+
+pub type RetainedRecord<P, C> = (Record<P, C>, Retirement);
+pub struct EndMetadata<P, C> {
+    pub exit: Exit,
+    pub retired: Option<RetainedRecord<P, C>>,
 }
 
 /// Exclusive ownership of one prepaid record index and its issued generation.
@@ -310,9 +348,9 @@ impl<P, C> Records<P, C> {
         let index = usize::from(label.index);
         let any_image = place == Place::Loader;
         (got == place
-            && self.records[index]
-                .as_ref()
-                .is_some_and(|r| r.label == label && (any_image || r.image == image)))
+            && self.records[index].as_ref().is_some_and(|r| {
+                r.label == label && (any_image || r.image == image) && !r.state.end_pending()
+            }))
         .then_some(index)
     }
 
@@ -710,12 +748,15 @@ impl<P, C> Records<P, C> {
     /// does not know yet.
     fn target(&self, caller: usize, pid: u32) -> Option<usize> {
         if pid == 0 {
-            return Some(caller);
+            return self
+                .get(caller)
+                .filter(|record| !record.state.end_pending())
+                .map(|_| caller);
         }
         self.find_pid(pid).filter(|&t| {
             self.records[t]
                 .as_ref()
-                .is_some_and(|r| r.state != State::Loading)
+                .is_some_and(|r| r.state != State::Loading && !r.state.end_pending())
         })
     }
 
@@ -742,6 +783,12 @@ impl<P, C> Records<P, C> {
     /// A child that execed in another session gets EACCES: POSIX gives the
     /// errors no order, and Linux checks the session first (EPERM).
     pub fn set_pgid(&mut self, caller: usize, pid: u32, pgid: u32) -> Result<(), GroupError> {
+        if self
+            .get(caller)
+            .is_none_or(|record| record.state.end_pending())
+        {
+            return Err(GroupError::NoProcess);
+        }
         let me = self.records[caller].as_ref().expect("the caller");
         let (own, sid) = (me.label.pid(), me.sid);
         let target = if pid != 0 && pid != own {
@@ -783,6 +830,12 @@ impl<P, C> Records<P, C> {
     /// group of its own PID, which it returns; EPERM when a group already
     /// has that number, that is when the caller leads one.
     pub fn set_sid(&mut self, caller: usize) -> Result<u32, GroupError> {
+        if self
+            .get(caller)
+            .is_none_or(|record| record.state.end_pending())
+        {
+            return Err(GroupError::NoProcess);
+        }
         let own = self.records[caller]
             .as_ref()
             .expect("the caller")
@@ -889,6 +942,192 @@ impl<P, C> Records<P, C> {
             .as_ref()
             .is_some_and(|r| r.label == label)
             .then_some(usize::from(index))
+    }
+
+    /// Mark native death without releasing its namespace or any owner.
+    /// None preserves an unknown reason; the first known reason wins.
+    pub fn mark_end_pending(&mut self, key: crate::preparing::Key, reason: Option<End>) -> bool {
+        let Some(record) = self.get_mut(usize::from(key.label.index)) else {
+            return false;
+        };
+        if record.label != key.label || record.image != key.image {
+            return false;
+        }
+        let first = match record.state {
+            State::Loading | State::Alive => {
+                record.state = if record.state == State::Alive {
+                    State::EndPendingAlive(reason)
+                } else {
+                    State::EndPendingLoading(reason)
+                };
+                true
+            }
+            State::EndPendingLoading(None) | State::EndPendingAlive(None) if reason.is_some() => {
+                record.state = if matches!(record.state, State::EndPendingAlive(_)) {
+                    State::EndPendingAlive(reason)
+                } else {
+                    State::EndPendingLoading(reason)
+                };
+                false
+            }
+            _ => false,
+        };
+        if first {
+            self.ready_remove(usize::from(key.label.index));
+        }
+        first
+    }
+
+    pub fn end_reason(&self, key: crate::preparing::Key) -> Option<End> {
+        let record = self.get(usize::from(key.label.index))?;
+        if record.label != key.label || record.image != key.image {
+            return None;
+        }
+        match record.state {
+            State::EndPendingLoading(reason) | State::EndPendingAlive(reason) => reason,
+            State::EndingLoading(reason) | State::EndingAlive(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// CPU-only ownership transfer. The caller pays one close outside.
+    pub fn begin_end_retained(&mut self, key: crate::preparing::Key) -> Option<Option<C>> {
+        let index = usize::from(key.label.index);
+        let record = self.get_mut(index)?;
+        if record.label != key.label || record.image != key.image {
+            return None;
+        }
+        record.state = match record.state {
+            State::EndPendingLoading(Some(reason)) => State::EndingLoading(reason),
+            State::EndPendingAlive(Some(reason)) => State::EndingAlive(reason),
+            _ => return None,
+        };
+        Some(record.active_exec.take())
+    }
+
+    pub fn ending_child(&self, key: crate::preparing::Key) -> Option<crate::preparing::Key> {
+        let record = self.get(usize::from(key.label.index))?;
+        if record.label != key.label
+            || record.image != key.image
+            || !matches!(
+                record.state,
+                State::EndingLoading(_) | State::EndingAlive(_)
+            )
+        {
+            return None;
+        }
+        let child = self.get(usize::from(record.first_child?))?;
+        Some(crate::preparing::Key {
+            label: child.label,
+            image: child.image,
+        })
+    }
+
+    /// Remove one live sibling head without touching capability owners.
+    pub fn orphan_ending_child(
+        &mut self,
+        parent: crate::preparing::Key,
+        child: crate::preparing::Key,
+    ) -> bool {
+        if self.ending_child(parent) != Some(child) {
+            return false;
+        }
+        let index = usize::from(child.label.index);
+        let record = self.get_mut(index).expect("the checked child");
+        if !record.state.live() {
+            return false;
+        }
+        let next = record.next;
+        let (pgid, linked) = (record.pgid, core::mem::take(&mut record.linked));
+        record.parent = INIT_PID;
+        record.parent_index = None;
+        record.previous = None;
+        record.next = None;
+        self.ready_remove(index);
+        self.unlink(pgid, linked);
+        let parent = self
+            .get_mut(usize::from(parent.label.index))
+            .expect("the ending parent");
+        parent.first_child = next;
+        parent.children -= 1;
+        if let Some(next) = next {
+            self.get_mut(usize::from(next))
+                .expect("the next sibling")
+                .previous = None;
+        }
+        true
+    }
+
+    /// Detach one complete Zombie, withholding its slot across close.
+    pub fn reap_retained(&mut self, key: crate::preparing::Key) -> Option<RetainedRecord<P, C>> {
+        let index = usize::from(key.label.index);
+        let record = self.get(index)?;
+        if record.label != key.label
+            || record.image != key.image
+            || !matches!(record.state, State::Zombie(_))
+        {
+            return None;
+        }
+        self.slots[index] = SlotState::Retaining;
+        let record = self.reap(index).expect("the checked complete zombie");
+        Some((record, Retirement { key }))
+    }
+
+    /// No capability effects. Only the holder of the exact token releases.
+    pub fn release_retained(&mut self, token: Retirement) -> Result<(), Retirement> {
+        let index = usize::from(token.key.label.index);
+        if self.slots[index] != SlotState::Retaining
+            || self.generations[index] != token.key.label.generation
+            || self.records[index].is_some()
+        {
+            return Err(token);
+        }
+        self.slots[index] = SlotState::Used;
+        self.settle(index);
+        Ok(())
+    }
+
+    /// Final CPU metadata after every child and executable owner settled.
+    /// A no-parent record is returned, never implicitly dropped here.
+    pub fn finish_end_metadata(&mut self, key: crate::preparing::Key) -> Option<EndMetadata<P, C>> {
+        let index = usize::from(key.label.index);
+        let record = self.get(index)?;
+        if record.label != key.label
+            || record.image != key.image
+            || record.children != 0
+            || record.first_child.is_some()
+            || record.active_exec.is_some()
+        {
+            return None;
+        }
+        let (reason, loaded) = match record.state {
+            State::EndingLoading(reason) => (reason, false),
+            State::EndingAlive(reason) => (reason, true),
+            _ => return None,
+        };
+        self.ready_remove(index);
+        self.set_stopped(index, None);
+        let record = self.get_mut(index).expect("the checked ending record");
+        let (pgid, linked) = (record.pgid, core::mem::take(&mut record.linked));
+        record.state = State::Zombie(reason);
+        record.committed_loader_ticket = 0;
+        record.stop_report = None;
+        record.cont_report = false;
+        let parent = record.parent_index.filter(|_| loaded);
+        self.unlink(pgid, linked);
+        self.ready_add(index);
+        match parent {
+            Some(parent) => Some(EndMetadata {
+                exit: Exit::Zombie {
+                    parent: usize::from(parent),
+                },
+                retired: None,
+            }),
+            None => Some(EndMetadata {
+                exit: Exit::Reaped,
+                retired: self.reap_retained(key),
+            }),
+        }
     }
 
     /// The process of the record in `index` ended with `end` (the
@@ -1014,7 +1253,12 @@ impl<P, C> Records<P, C> {
     /// child, whose PID its parent does not know yet.
     pub fn takes(&self, child: usize, selector: Selector) -> bool {
         self.get(child)
-            .filter(|r| r.state != State::Loading)
+            .filter(|r| match r.state {
+                State::Loading => false,
+                State::EndPendingLoading(_) | State::EndingLoading(_) => false,
+                State::EndPendingAlive(_) | State::EndingAlive(_) => true,
+                _ => true,
+            })
             .is_some_and(|r| match selector {
                 Selector::Pid(pid) => r.label.pid() == pid,
                 Selector::Any => true,
@@ -1064,7 +1308,7 @@ impl<P, C> Records<P, C> {
 
     fn ready_add(&mut self, index: usize) {
         let r = self.records[index].as_ref().expect("a child");
-        if r.ready || r.state == State::Loading {
+        if r.ready || r.state == State::Loading || r.state.end_pending() {
             return;
         }
         let Some(parent) = r.parent_index else { return };
@@ -1217,6 +1461,135 @@ pub struct ExitPlace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_end_pending_revokes_lookup_without_releasing_namespace_or_first_reason() {
+        let mut table = Records::<u32>::new();
+        let parent = add(&mut table).unwrap();
+        let label = child(&mut table, parent);
+        let key = crate::preparing::Key {
+            label,
+            image: proto_process::IMAGE,
+        };
+        table.report(at(label), Some(proto_process::SIGSTOP));
+        assert!(
+            table
+                .reported(at(parent), Selector::Any, WSTOPPED)
+                .is_some()
+        );
+        assert!(table.mark_end_pending(key, None));
+        assert_eq!(table.find(label.raw()), None);
+        assert_eq!(table.find_identity(label.identity()), None);
+        assert_eq!(table.find_loader(label.loader()), None);
+        assert_eq!(table.start_parent(at(label)), None);
+        assert_eq!(table.target(at(parent), label.pid()), None);
+        assert_eq!(table.set_pgid(at(label), 0, 0), Err(GroupError::NoProcess));
+        assert_eq!(
+            table.find_pid(label.pid()),
+            Some(at(label)),
+            "namespace remains owned before ACK"
+        );
+        assert_eq!(
+            table.reported(at(parent), Selector::Any, WEXITED | WSTOPPED),
+            None
+        );
+        assert_eq!(
+            table.begin_end_retained(key),
+            None,
+            "unknown reason is not fabricated"
+        );
+        assert!(!table.mark_end_pending(key, Some(End::Exited(7))));
+        assert!(!table.mark_end_pending(key, Some(End::Signaled(SIGKILL))));
+        assert_eq!(table.end_reason(key), Some(End::Exited(7)));
+        let old = crate::preparing::Key {
+            image: key.image + 1,
+            ..key
+        };
+        assert!(!table.mark_end_pending(old, Some(End::Exited(8))));
+        assert_eq!(table.begin_end_retained(key), Some(None));
+        assert_eq!(table.reported(at(parent), Selector::Any, WEXITED), None);
+        assert_eq!(
+            table.finish_end_metadata(key).unwrap().exit,
+            Exit::Zombie { parent: at(parent) }
+        );
+        assert!(table.reported(at(parent), Selector::Any, WEXITED).is_some());
+    }
+
+    #[test]
+    fn retained_zombie_slot_is_unavailable_across_close_refusal_and_exact_release() {
+        let mut table = Records::<u32>::new();
+        let parent = add(&mut table).unwrap();
+        let label = child(&mut table, parent);
+        let key = crate::preparing::Key {
+            label,
+            image: proto_process::IMAGE,
+        };
+        table.exited(at(label), End::Exited(7));
+        let (record, token) = table.reap_retained(key).unwrap();
+        assert_eq!(record.label, label);
+        assert_eq!(token.key(), key);
+        assert!(
+            table.reap_retained(key).is_none(),
+            "duplicate Wait cannot take its owners"
+        );
+        assert_eq!(table.slots[at(label)], SlotState::Retaining);
+        let next = table.reserve_next().unwrap();
+        assert_ne!(
+            next.label().index,
+            label.index,
+            "a failed close keeps the detached slot withheld"
+        );
+        table.cancel_reserved(next).unwrap();
+        // The native caller retains record owners and token on refusal;
+        // only its successful one-cap close reaches release_retained.
+        table.release_retained(token).unwrap();
+        let reused = table.next_label().unwrap();
+        assert_eq!(reused.index, label.index);
+        assert_ne!(reused, label);
+        assert!(!table.mark_end_pending(key, Some(End::Exited(8))));
+    }
+
+    #[test]
+    fn one_child_end_metadata_drains_32_children_with_retained_slot_release() {
+        let mut table = Records::<u32>::new();
+        let parent = add(&mut table).unwrap();
+        let mut children = Vec::new();
+        for n in 0..CHILDREN_MAX {
+            let label = child(&mut table, parent);
+            if n % 2 == 0 {
+                table.exited(at(label), End::Exited(0));
+            }
+            children.push(label);
+        }
+        table.get_mut(at(parent)).unwrap().state = State::Alive;
+        let key = crate::preparing::Key {
+            label: parent,
+            image: proto_process::IMAGE,
+        };
+        table.mark_end_pending(key, Some(End::Exited(7)));
+        table.begin_end_retained(key).unwrap();
+        assert!(table.finish_end_metadata(key).is_none());
+        let mut visits = 0;
+        while let Some(child) = table.ending_child(key) {
+            if matches!(table.get(at(child.label)).unwrap().state, State::Zombie(_)) {
+                let (record, token) = table.reap_retained(child).unwrap();
+                assert_eq!(record.label, child.label);
+                assert!(table.ending_child(key).map(|next| next.label) != Some(child.label));
+                table.release_retained(token).unwrap();
+            } else {
+                assert!(table.orphan_ending_child(key, child));
+                assert_eq!(table.get(at(child.label)).unwrap().parent, INIT_PID);
+            }
+            visits += 1;
+        }
+        assert_eq!(visits, CHILDREN_MAX);
+        let metadata = table.finish_end_metadata(key).unwrap();
+        assert_eq!(metadata.exit, Exit::Reaped);
+        let (record, token) = metadata.retired.unwrap();
+        assert_eq!(record.label, parent);
+        assert_eq!(table.slots[at(parent)], SlotState::Retaining);
+        table.release_retained(token).unwrap();
+    }
 
     #[test]
     fn eight_records_and_248_reservations_pay_the_same_fixed_table() {
