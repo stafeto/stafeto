@@ -43,6 +43,15 @@ pub trait Service<const K: usize> {
     /// label it gives none takes the first free place from PLACED on.
     const PLACED: usize = 0;
 
+    /// Keep exact closed sessions until service maintenance settles their debt.
+    const RETAIN_CLOSED: bool = false;
+
+    /// Methods that can settle an existing closed session.
+    fn closed_method(&self, method: u16) -> bool {
+        let _ = method;
+        false
+    }
+
     /// The place in the table of the session of `label`, for a service
     /// that gives its clients' labels itself: a lookup in O(1), and the
     /// client goes to `gone` even when it never sent a request. None
@@ -259,6 +268,7 @@ pub struct Session<T, const K: usize> {
     held: [Held; K],
     issued: u32,
     issued_max: u32,
+    closing: bool,
 }
 
 impl<T, const K: usize> Session<T, K> {
@@ -269,12 +279,18 @@ impl<T, const K: usize> Session<T, K> {
             held: [const { Held::Free }; K],
             issued: 0,
             issued_max,
+            closing: false,
         }
     }
 
     /// The label of the client.
     pub fn label(&self) -> u64 {
         self.label
+    }
+
+    /// Whether irreversible client revocation began.
+    pub fn closing(&self) -> bool {
+        self.closing
     }
 
     /// A free place; LIMIT_REACHED when K are held.
@@ -460,13 +476,13 @@ pub fn run_in<S: Service<K>, const K: usize>(
                         .find(|s| s.as_ref().is_some_and(|s| s.label == label)),
                 };
                 if let Some(slot) = found {
-                    if placed.is_some() && slot.is_none() {
+                    if !S::RETAIN_CLOSED && placed.is_some() && slot.is_none() {
                         *slot = Some(Session::new(label, S::Data::default(), config.issued));
                     }
-                    if let Some(s) = slot.as_mut() {
+                    crate::retention::revoke(slot, S::RETAIN_CLOSED, |s| {
+                        s.closing = true;
                         service.gone(s);
-                    }
-                    *slot = None;
+                    });
                 }
                 service.closed(label);
             }
@@ -668,6 +684,9 @@ fn request<S: Service<K>, const K: usize>(
             Ok((_, None)) => return refuse(token, Status::Kernel(Error::LimitReached)),
             Err(status) => return refuse(token, status),
         };
+    if s.closing && !service.closed_method(header.method) {
+        return refuse(token, Status::Kernel(Error::AccessDenied));
+    }
     let mut r = Request {
         label,
         header,
@@ -719,6 +738,13 @@ fn session<'a, S: Service<K>, const K: usize>(
             debug_assert!(i < S::PLACED, "a place past those Service::place gives");
             let s = table.get_mut(i)?;
             if s.as_ref().is_some_and(|s| s.label != label) {
+                if S::RETAIN_CLOSED {
+                    crate::retention::collision(s, true, |old| {
+                        old.closing = true;
+                        service.gone(old);
+                    });
+                    return None;
+                }
                 // A session of a label the service gave the place up for.
                 if let Some(mut old) = s.take() {
                     service.gone(&mut old);

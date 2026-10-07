@@ -176,6 +176,17 @@ impl<K> Handle<K> {
     pub fn close(self) -> Result<(), Error> {
         close_raw(self.into_raw())
     }
+
+    /// Close one retained owner. A failed call preserves the exact field.
+    pub fn close_retained(owner: &mut Option<Self>) -> Result<(), Error> {
+        crate::retention::close(
+            owner,
+            |handle| close_raw(handle.raw()),
+            |handle| {
+                let _ = handle.into_raw();
+            },
+        )
+    }
 }
 
 /// handle_close of the value `h`, for `Handle::close` and its drop.
