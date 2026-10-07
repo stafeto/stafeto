@@ -5,6 +5,22 @@ pub fn initial_empty(previous: u32, sequence: u32, action: u32, idle: bool) -> b
     previous == 0 && sequence == 1 && action == 3 && idle
 }
 
+pub fn initial_ready(
+    jobs: u32,
+    preparations: u32,
+    root_preparations: u32,
+    free: u32,
+    pages: u32,
+    reclamation_pending: bool,
+) -> bool {
+    jobs == 0
+        && preparations == 0
+        && root_preparations == 0
+        && free == 4096
+        && pages == 0
+        && !reclamation_pending
+}
+
 pub fn await_ready(
     mut attempt: impl FnMut() -> Result<(), i32>,
     mut pause: impl FnMut() -> Result<(), i32>,

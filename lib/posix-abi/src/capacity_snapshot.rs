@@ -42,6 +42,8 @@ pub struct Snapshot {
     pub backing: MemoryInfo,
     /// Free inodes, dentries and physical data-page slots.
     pub available: [u32; 3],
+    /// Existing retired-page or inode reclamation remains paid until its final step.
+    pub reclamation_pending: bool,
     /// Root inodes, dentries, pages and descriptions.
     pub usage: [u32; 4],
     pub jobs: u32,
@@ -63,7 +65,7 @@ impl Snapshot {
             r.finish()?;
             return Err(status);
         }
-        if bytes.len() != 192 || r.u32()? != 2 {
+        if bytes.len() != 192 || r.u32()? != 3 {
             return Err(Status::BadSize);
         }
         let pid = r.u32()?;
@@ -74,9 +76,11 @@ impl Snapshot {
         let handles = ProcessHandles::from_words([r.u64()?, r.u64()?, r.u64()?]);
         let backing = MemoryInfo::from_words([r.u64()?, r.u64()?, r.u64()?]);
         let available = [r.u32()?, r.u32()?, r.u32()?];
-        if r.u32()? != 0 {
-            return Err(Status::BadSize);
-        }
+        let reclamation_pending = match r.u32()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Status::BadSize),
+        };
         let usage = [r.u32()?, r.u32()?, r.u32()?, r.u32()?];
         let jobs = r.u32()?;
         let preparations = r.u32()?;
@@ -110,6 +114,7 @@ impl Snapshot {
             handles,
             backing,
             available,
+            reclamation_pending,
             usage,
             jobs,
             preparations,
@@ -210,7 +215,7 @@ mod tests {
     use super::*;
     fn fixture() -> [u8; 192] {
         let mut b = [0; 192];
-        for (at, value) in [(4, 2), (8, 19), (12, 1), (188, 2 | (3 << 8) | (2 << 16))] {
+        for (at, value) in [(4, 3), (8, 19), (12, 1), (188, 2 | (3 << 8) | (2 << 16))] {
             b[at..at + 4].copy_from_slice(&u32::to_le_bytes(value));
         }
         for (at, value) in [
@@ -227,10 +232,14 @@ mod tests {
         b
     }
     #[test]
-    fn schema_two_preserves_exact_root_and_registration_order() {
+    fn schema_three_preserves_exact_root_and_registration_order() {
         let b = fixture();
         let s = Snapshot::read(&b, 0).unwrap();
         assert_eq!(s.root, [19, 1]);
+        assert!(!s.reclamation_pending);
+        let mut pending = b;
+        pending[156..160].copy_from_slice(&1u32.to_le_bytes());
+        assert!(Snapshot::read(&pending, 0).unwrap().reclamation_pending);
         assert_eq!(s.phases.own, 2);
         assert_eq!(s.phases.registered, [3, 2]);
         assert!(s.phases.other_at_least(3));
@@ -251,8 +260,10 @@ mod tests {
         let b = fixture();
         for (at, value) in [
             (4, 1),
-            (4, 3),
-            (156, 1),
+            (4, 2),
+            (4, 4),
+            (156, 2),
+            (156, u32::MAX),
             (188, 0x01030202),
             (188, 6),
             (188, 2 | (6 << 8)),

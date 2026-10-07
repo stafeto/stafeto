@@ -522,11 +522,14 @@ fn warm_usage(role: i32, stage: u32, snapshot: &Snapshot) {
 #[inline(never)]
 fn warm_factory(role: i32, f0: i32, f1: i32) -> Result<(), i32> {
     let before = await_snapshot_at(role, 0, |s| {
-        s.jobs == 0
-            && s.preparations == 0
-            && s.root_preparations == 0
-            && s.available[2] == 4096
-            && s.usage[2] == 0
+        warmup::initial_ready(
+            s.jobs,
+            s.preparations,
+            s.root_preparations,
+            s.available[2],
+            s.usage[2],
+            s.reclamation_pending,
+        )
     })?;
     warm_usage(role, 0, &before);
     require(paid::idle()?)?;

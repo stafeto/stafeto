@@ -2498,7 +2498,7 @@ impl Fs {
         let jobs = self.jobs.iter().filter(|job| job.is_some()).count() as u32;
         let output = r.reply();
         let result = (|| -> Result<(), Status> {
-            for word in [0, 2, pid, image] {
+            for word in [0, 3, pid, image] {
                 output.u32(word)?;
             }
             for word in [root.id, root.generation] {
@@ -2526,7 +2526,7 @@ impl Fs {
                 available.inodes as u32,
                 available.dentries as u32,
                 available.pages as u32,
-                0,
+                u32::from(self.ram.storage.reclamation_pending()),
                 usage.inodes as u32,
                 usage.dentries as u32,
                 usage.pages as u32,

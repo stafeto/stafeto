@@ -769,6 +769,13 @@ mod create_directory_policy_tests {
 #[cfg(test)]
 mod concurrent_create_retry_tests {
     use super::*;
+    #[cfg(feature = "full-capacity-probe")]
+    mod warmup {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/posix-procs/src/capacity_warm.rs"
+        ));
+    }
     use crate::resolve::{Intent, Progress, Resolve};
     use crate::storage::{ROOT, Root};
 
@@ -980,6 +987,14 @@ mod concurrent_create_retry_tests {
                 assert_eq!(ram.storage.preparations_used(), 0);
                 assert_eq!(ram.storage.available().pages, crate::storage::PAGES as u16);
                 assert!(ram.storage.reclamation_pending());
+                assert!(!warmup::initial_ready(
+                    0,
+                    u32::from(ram.storage.preparations_used()),
+                    u32::from(ram.storage.preparations_for_root(roots[1])),
+                    u32::from(ram.storage.available().pages),
+                    u32::from(before.pages),
+                    ram.storage.reclamation_pending(),
+                ));
                 for _ in 0..20_000 {
                     if !ram.storage.reclaim_step() {
                         break;
@@ -998,6 +1013,14 @@ mod concurrent_create_retry_tests {
                 assert_eq!(ram.storage.preparations_used(), 0);
                 assert_eq!(ram.storage.available().pages, crate::storage::PAGES as u16);
                 assert!(!ram.storage.reclamation_pending());
+                assert!(warmup::initial_ready(
+                    0,
+                    u32::from(ram.storage.preparations_used()),
+                    u32::from(ram.storage.preparations_for_root(roots[1])),
+                    u32::from(ram.storage.available().pages),
+                    u32::from(after.pages),
+                    ram.storage.reclamation_pending(),
+                ));
                 assert_eq!(ram.storage.lookup(tmp, b"concurrent-b"), Ok(token));
                 ram.release(&mut sessions[1]);
                 return;
