@@ -99,7 +99,9 @@ fn dispatch<'a>(
         panic!()
     };
     bytes[..len].copy_from_slice(&abi::inline_bytes(&words)[..len]);
-    request(s, table, 0, label, &bytes[..len], handles, token).unwrap()
+    let mut current = CurrentRequest::new(label, &bytes[..len], handles, token);
+    request(s, table, 0, &mut current);
+    current
 }
 fn step(s: &mut Fixture, current: &mut CurrentRequest<'_>) -> bool {
     let before = test_calls::log().len();

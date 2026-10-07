@@ -467,14 +467,18 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 let kind = steps::kind_of(bytes);
                 #[cfg(not(feature = "step-stats"))]
                 let began = steps::begin();
-                let current = request(service, table, config.issued, label, bytes, handles, token);
-                steps::end(began, kind);
-                if let Some(mut current) = current {
+                if S::BOUNDED_INGRESS {
+                    let mut current = CurrentRequest::new(label, bytes, handles, token);
+                    request(service, table, config.issued, &mut current);
+                    steps::end(began, kind);
                     current.finish(service, kind);
                     let began = time::now();
                     steps::own();
                     steps::detail(4); // Terminal CPU disposal of the empty current loan.
                     drop(current);
+                    steps::end(began, kind);
+                } else {
+                    legacy_request(service, table, config.issued, label, bytes, handles, token);
                     steps::end(began, kind);
                 }
                 continuation(service);
@@ -732,7 +736,26 @@ struct CurrentRequest<'a> {
     drain_back: bool,
 }
 
-impl CurrentRequest<'_> {
+impl<'a> CurrentRequest<'a> {
+    fn new(label: u64, bytes: &'a [u8], handles: Incoming, token: Token) -> Self {
+        // Custody precedes header, session and closing guards.
+        Self {
+            request: Request {
+                label,
+                header: Header::new(0, 0),
+                bytes,
+                handles,
+                token: Some(token),
+                reply: None,
+            },
+            held: None,
+            cursor: 0,
+            status: None,
+            outgoing: Outgoing::new(),
+            drain_back: false,
+        }
+    }
+
     fn step<S: Service<K>, const K: usize>(&mut self, service: &mut S) -> bool {
         if !matches!(service.request_tail(&mut self.request), TailProgress::Idle) {
             return true;
@@ -805,35 +828,14 @@ impl CurrentRequest<'_> {
     }
 }
 
-fn request<'a, S: Service<K>, const K: usize>(
+fn request<S: Service<K>, const K: usize>(
     service: &mut S,
     table: &mut [Option<Session<S::Data, K>>],
     issued: u32,
-    label: u64,
-    bytes: &'a [u8],
-    handles: Incoming,
-    token: Token,
-) -> Option<CurrentRequest<'a>> {
-    if !S::BOUNDED_INGRESS {
-        legacy_request(service, table, issued, label, bytes, handles, token);
-        return None;
-    }
-    // Custody precedes header, session and closing guards.
-    let mut current = CurrentRequest {
-        request: Request {
-            label,
-            header: Header::new(0, 0),
-            bytes,
-            handles,
-            token: Some(token),
-            reply: None,
-        },
-        held: None,
-        cursor: 0,
-        status: None,
-        outgoing: Outgoing::new(),
-        drain_back: false,
-    };
+    current: &mut CurrentRequest<'_>,
+) {
+    let bytes = current.request.bytes;
+    let label = current.request.label;
     let header = match Header::read(&mut Reader::new(bytes)) {
         Ok(header) if header.version != S::VERSION => Err(Status::BadVersion),
         Ok(header) if !S::METHODS.contains(&header.method) => Err(Status::UnknownMethod),
@@ -865,7 +867,6 @@ fn request<'a, S: Service<K>, const K: usize>(
         }
         Answer::Deferred => {}
     }
-    Some(current)
 }
 
 fn legacy_request<S: Service<K>, const K: usize>(
