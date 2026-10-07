@@ -485,9 +485,14 @@ fn tail_baseline(stage: u32, snapshot: &Snapshot) {
 }
 #[inline(never)]
 fn warm_factory(role: i32, f0: i32, f1: i32) -> Result<(), i32> {
-    let before = meter::snapshot()?;
-    require(before.jobs == 0 && before.preparations == 0 && before.root_preparations == 0)?;
-    require(before.available[2] == 4096 && before.usage[2] == 0 && paid::idle()?)?;
+    let before = await_snapshot(|s| {
+        s.jobs == 0
+            && s.preparations == 0
+            && s.root_preparations == 0
+            && s.available[2] == 4096
+            && s.usage[2] == 0
+    })?;
+    require(paid::idle()?)?;
     let commands = posix_abi::pipe2(0)?;
     let replies = posix_abi::pipe2(0)?;
     // SAFETY: the ordinary loaded factory inherits these actual descriptors.
