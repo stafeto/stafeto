@@ -545,7 +545,12 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
         &[],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
+    (
+        "posix-procs",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["pending-open"],
+    ),
     // Pieces of 64 KiB: the probe's forks copy regions past one piece.
     ("loader", "loader", 0, &["small-pieces"]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
@@ -1091,11 +1096,13 @@ commands:
   image-gates-steps measure retained image dispatches under icount
   image-gates-normal-steps measure normal SetId without reply corruption
   loader-abort verify retained file cleanup after genuine exec cancellation
+  loader-info verify strict retained image metadata and incoming handle cleanup
   ramfs-gc verify binding progress during queued page reclamation
   loader-abort-steps measure retained cleanup audits at resolver limits
   ramfs-cleanup verify unfinished binding cleanup with a foreign holder
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
+  posix-data-steps measure paid data cleanup and full mapping dispatches
   posix-files-loss verify native refused Open replies with a live sibling
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
@@ -1214,9 +1221,11 @@ fn main() {
         Some("image-gates-steps") => image_gates_probe(true, false),
         Some("image-gates-normal-steps") => image_gates_probe(true, true),
         Some("loader-abort") => loader_abort_probe(false),
+        Some("loader-info") => loader_info_probe(),
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-files-loss") => posix_files_loss(),
+        Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -2805,6 +2814,38 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn loader_info_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 6] = {
+        let mut programs = LOADER_ABORT_PROGRAMS;
+        programs[0].3 = &["table-posix-files", "loader-info"];
+        programs[1].3 = &["image-info-probe", "steps"];
+        programs[4].3 = &["image-info-probe"];
+        programs[5].3 = &["image-info-probe"];
+        programs
+    };
+    let image = build_boot_image("boot-loader-info.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    command.args(qemu::ICOUNT);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "posix-files: strict image metadata and incoming handle cleanup ok",
+    )?;
+    let steps = longest_steps(&output.lines, "2");
+    if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "RAM image metadata kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    println!("RAM image metadata dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    Ok(())
+}
+
 fn loader_abort_probe(measured: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
@@ -2887,6 +2928,10 @@ fn posix_files_probe() -> Result<(), String> {
 }
 
 fn posix_files_run(measured: bool) -> Result<(), String> {
+    posix_files_run_profile(measured, false)
+}
+
+fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     const MEASURED: [ImageProgram; 5] = {
@@ -2894,12 +2939,23 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
         programs[1].3 = &["steps"];
         programs
     };
-    let programs = if measured {
+    const DATA: [ImageProgram; 5] = {
+        let mut programs = POSIX_FILES_PROGRAMS;
+        programs[0].3 = &["table-posix-files", "data-carrier-probe"];
+        programs[1].3 = &["steps", "auth-probe"];
+        programs[4].3 = &["data-carrier-probe"];
+        programs
+    };
+    let programs = if data {
+        &DATA
+    } else if measured {
         &MEASURED
     } else {
         &POSIX_FILES_PROGRAMS
     };
-    let name = if measured {
+    let name = if data {
+        "boot-posix-data-steps.img"
+    } else if measured {
         "boot-posix-files-steps.img"
     } else {
         "boot-posix-files.img"
@@ -2916,7 +2972,12 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
     if measured {
         let steps = longest_steps(&output.lines, "2");
-        for kind in [15, 19, 21, 25, 65] {
+        let required: &[usize] = if data {
+            &[15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 65]
+        } else {
+            &[15, 19, 21, 25, 65]
+        };
+        for &kind in required {
             if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
                 return Err(format!(
                     "RAM credential probe has no method {kind} measurement: {steps:?}"

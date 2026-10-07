@@ -138,6 +138,31 @@ pub enum OpenOutcome {
     Finished(PreparedOpen),
 }
 
+/// A canonical first final request retained its preparation without a file effect.
+pub struct OpenNoEffect {
+    key: proto_fs::OpenKey,
+    session: abi::Handle,
+    code: u32,
+}
+
+impl OpenNoEffect {
+    pub fn matches_request(&self, key: proto_fs::OpenKey, session: abi::Handle) -> bool {
+        self.key == key && self.session == session
+    }
+
+    pub fn status(&self) -> Status {
+        Status::from_code(self.code)
+    }
+}
+
+/// One native Finish request has no automatic binding or preparation retry.
+pub enum OpenFinalizeAttempt {
+    Finished(PreparedOpen),
+    Deferred(OpenNoEffect),
+    Rejected(Status),
+    Ambiguous(Status),
+}
+
 pub struct Files {
     channel: Handle<Channel>,
     uart: Option<Handle<Channel>>,
@@ -364,6 +389,39 @@ impl Files {
     pub fn open_finish_once(&self, key: proto_fs::OpenKey) -> Result<PreparedOpen, Status> {
         let reply = self.open_key_once(Method::OpenFinish, key)?;
         Self::open_commit_reply(&reply)
+    }
+
+    /// Finalize a preparation atomically; an uncertain reply requires exact Query recovery.
+    pub fn open_finalize_once(&self, key: proto_fs::OpenKey) -> OpenFinalizeAttempt {
+        match self.open_key_once(Method::OpenFinish, key) {
+            Ok(reply) => Self::open_finalize_reply(&reply, key, self.channel.raw()),
+            Err(error) => OpenFinalizeAttempt::Ambiguous(error),
+        }
+    }
+
+    fn open_finalize_reply(
+        reply: &sys::Reply,
+        key: proto_fs::OpenKey,
+        session: abi::Handle,
+    ) -> OpenFinalizeAttempt {
+        let code = match Self::reply_code(reply) {
+            Ok(code) => code,
+            Err(error) => return OpenFinalizeAttempt::Ambiguous(error),
+        };
+        if code == 0 {
+            return match Self::open_commit_reply(reply) {
+                Ok(held) => OpenFinalizeAttempt::Finished(held),
+                Err(error) => OpenFinalizeAttempt::Ambiguous(error),
+            };
+        }
+        if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
+            return OpenFinalizeAttempt::Ambiguous(Status::BadSize);
+        }
+        if matches!(code, proto_fs::AUTHENTICATING | proto_fs::TIME_DEFERRED) {
+            OpenFinalizeAttempt::Deferred(OpenNoEffect { key, session, code })
+        } else {
+            OpenFinalizeAttempt::Rejected(Status::from_code(code))
+        }
     }
 
     pub fn open_query_once(&self, key: proto_fs::OpenKey) -> Result<OpenOutcome, Status> {
@@ -1164,4 +1222,199 @@ fn console_write(uart: Option<&Handle<Channel>>, bytes: &[u8]) -> Result<usize, 
     }
     console::write(bytes).map_err(Status::Kernel)?;
     Ok(bytes.len())
+}
+
+impl Files {
+    /// One native request. Refresh and recovery remain outside the final signal defer.
+    pub fn data_start_once(
+        &self,
+        args: proto_fs::DataStart,
+    ) -> Result<(proto_fs::DataPhase, u64), Status> {
+        let mut request = Writer::new();
+        Method::DataStart.header().write(&mut request)?;
+        args.write(&mut request)?;
+        let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_start_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+
+    pub fn data_feed_once(&self, job: u64, offset: u32, bytes: &[u8]) -> Result<(), Status> {
+        Self::open_job_id(job)?;
+        if bytes.len() > proto_fs::FEED_MAX {
+            return Err(Status::BadSize);
+        }
+        let mut request = Writer::new();
+        Method::DataFeed.header().write(&mut request)?;
+        request.u64(job)?;
+        request.u32(offset)?;
+        request.bytes(bytes)?;
+        let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+
+    pub fn data_step_once(&self, job: u64) -> Result<(), Status> {
+        let reply = self.data_job_once(Method::DataStep, job)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+
+    pub fn data_commit_once(
+        &self,
+        job: u64,
+        args: proto_fs::DataStart,
+    ) -> Result<proto_fs::DataOutcome, Status> {
+        let reply = self.data_job_once(Method::DataCommit, job)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let outcome =
+            proto_fs::DataOutcome::read(reply.bytes(&mut buffer), reply.handles.len(), args)?;
+        if outcome.job != job {
+            return Err(Status::BadSize);
+        }
+        Ok(outcome)
+    }
+
+    pub fn data_query_once(
+        &self,
+        args: proto_fs::DataStart,
+    ) -> Result<proto_fs::DataOutcome, Status> {
+        let reply = self.open_key_once(Method::DataQuery, args.key)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::DataOutcome::read(reply.bytes(&mut buffer), reply.handles.len(), args)
+    }
+
+    pub fn data_cancel_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        self.data_cleanup_once(Method::DataCancel, key)
+    }
+
+    pub fn data_ack_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        self.data_cleanup_once(Method::DataAck, key)
+    }
+
+    pub fn data_read_result_once(
+        &self,
+        key: proto_fs::OpenKey,
+        count: usize,
+        out: &mut [u8],
+    ) -> Result<usize, Status> {
+        if count > out.len() || count > MAX_READ {
+            return Err(Status::BadSize);
+        }
+        let reply = self.open_key_once(Method::DataReadResult, key)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let bytes =
+            proto_fs::data_read_reply(reply.bytes(&mut buffer), reply.handles.len(), count)?;
+        out[..count].copy_from_slice(bytes);
+        Ok(count)
+    }
+
+    fn data_job_once(&self, method: Method, job: u64) -> Result<sys::Reply, Status> {
+        Self::open_job_id(job)?;
+        let mut request = Writer::new();
+        method.header().write(&mut request)?;
+        request.u64(job)?;
+        sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)
+    }
+
+    fn data_cleanup_once(&self, method: Method, key: proto_fs::OpenKey) -> Result<(), Status> {
+        let reply = self.open_key_once(method, key)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+}
+
+#[cfg(test)]
+mod finalize_reply_tests {
+    use super::*;
+    fn key() -> proto_fs::OpenKey {
+        proto_fs::OpenKey {
+            slot: 2,
+            generation: 9,
+        }
+    }
+    fn session() -> abi::Handle {
+        abi::Handle::new(7, 9)
+    }
+    fn reply(len: usize, first: u64, second: u64) -> sys::Reply {
+        let mut words = [0; 8];
+        words[0] = first;
+        words[1] = second;
+        sys::Reply {
+            len,
+            words,
+            handles: crate::handle::Incoming::none(),
+        }
+    }
+    #[test]
+    fn canonical_no_effect_receipt_binds_request_and_transport_generations() {
+        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+            let r = reply(8, code as u64, 0);
+            let OpenFinalizeAttempt::Deferred(receipt) =
+                Files::open_finalize_reply(&r, key(), session())
+            else {
+                panic!("canonical receipt");
+            };
+            assert_eq!(receipt.status(), Status::Unknown(code));
+            assert!(receipt.matches_request(key(), session()));
+            assert!(!receipt.matches_request(
+                proto_fs::OpenKey {
+                    slot: 2,
+                    generation: 10
+                },
+                session()
+            ));
+            assert!(!receipt.matches_request(key(), abi::Handle::new(7, 10)));
+        }
+    }
+    #[test]
+    fn malformed_no_effect_envelopes_remain_ambiguous() {
+        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+            for len in [0, 4, 7, 9, 12, 16, 32] {
+                assert!(matches!(
+                    Files::open_finalize_reply(&reply(len, code as u64, 0), key(), session()),
+                    OpenFinalizeAttempt::Ambiguous(_)
+                ));
+            }
+            assert!(matches!(
+                Files::open_finalize_reply(&reply(8, code as u64 | 1 << 32, 0), key(), session()),
+                OpenFinalizeAttempt::Ambiguous(_)
+            ));
+        }
+    }
+    #[test]
+    fn completed_finalization_requires_the_exact_descriptor_envelope() {
+        let held = PreparedOpen {
+            fd: 3,
+            slot: 127,
+            generation: 11,
+            random: true,
+        };
+        let first = (held.marked_fd() as u64) << 32;
+        assert!(
+            matches!(Files::open_finalize_reply(&reply(16, first, held.generation), key(), session()), OpenFinalizeAttempt::Finished(found) if found == held)
+        );
+        for len in [8, 15, 17, 32] {
+            assert!(matches!(
+                Files::open_finalize_reply(&reply(len, first, held.generation), key(), session()),
+                OpenFinalizeAttempt::Ambiguous(_)
+            ));
+        }
+        for (packed, generation) in [(first, 0), (35u64 << 32, 1), (first | 1 << 60, 1)] {
+            assert!(matches!(
+                Files::open_finalize_reply(&reply(16, packed, generation), key(), session()),
+                OpenFinalizeAttempt::Ambiguous(_)
+            ));
+        }
+    }
+    #[test]
+    fn canonical_terminal_refusal_creates_no_prepared_receipt() {
+        assert!(matches!(
+            Files::open_finalize_reply(
+                &reply(8, proto_fs::ACCESS_DENIED as u64, 0),
+                key(),
+                session()
+            ),
+            OpenFinalizeAttempt::Rejected(Status::Unknown(proto_fs::ACCESS_DENIED))
+        ));
+    }
 }

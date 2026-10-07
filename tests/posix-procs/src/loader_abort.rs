@@ -90,8 +90,11 @@ pub(super) fn load_image(loader: &Handle<Channel>) -> Result<(), Status> {
     }
     for method in [proto_loader::Method::Go, proto_loader::Method::HandlesDone] {
         let reply = sys::send(loader, &method.header().bytes()).map_err(Status::Kernel)?;
-        if reply.len != 8 || reply.words[0] != 0 || !reply.handles.is_empty() {
+        if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
             return Err(Status::BadSize);
+        }
+        if reply.words[0] != 0 {
+            return Err(Status::from_code(reply.words[0] as u32));
         }
     }
     Ok(())
@@ -102,7 +105,7 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
     fn run(fd: i32, loaded: i32) -> Result<(), Status> {
         let fd = u32::try_from(fd).map_err(|_| Status::BadSize)?;
         let descriptor = posix_abi::shared::with_files(|files| match files.target(fd) {
-            Ok(posix_fs::Target::Ram(fd)) => Ok(fd),
+            Ok(posix_fs::Target::Ram(fd)) => Ok(fd.fd()),
             _ => Err(posix_abi::constants::EIO),
         })
         .map_err(|_| Status::BadSize)?;
@@ -156,12 +159,69 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
             }
             rt::println!("posix-files: loader abort retained before {:?}", initial);
             if loaded != 0 {
-                load_image(&loader)?;
-                let ready = counts(&pending)?;
-                if ready[0] != 1 || ready[3] != 1 || ready[4] != 0 {
-                    return Err(Status::BadSize);
+                #[cfg(feature = "image-info-probe")]
+                {
+                    let observer = sys::channel_create(1).map_err(Status::Kernel)?;
+                    let copy = sys::handle_duplicate(&observer, Rights::NOTIFY | Rights::TRANSFER)
+                        .map_err(Status::Kernel)?;
+                    let reply = sys::send_handles(
+                        &loader,
+                        &Header::new(0xfffb, proto_loader::VERSION).bytes(),
+                        [copy.erase()],
+                    )
+                    .map_err(|refused| Status::Kernel(refused.error))?;
+                    if reply.len != 8 || reply.words[0] != 0 || !reply.handles.is_empty() {
+                        return Err(Status::BadSize);
+                    }
+                    let mut arm = Writer::new();
+                    Header::new(0xfff7, proto_fs::VERSION).write(&mut arm)?;
+                    arm.u32(loaded as u32)?;
+                    let reply = sys::send(&pending, arm.as_bytes()).map_err(Status::Kernel)?;
+                    if reply.len != 8 || reply.words[0] != 0 || !reply.handles.is_empty() {
+                        return Err(Status::BadSize);
+                    }
+                    let outcome = load_image(&loader);
+                    if outcome != Err(Status::from_code(proto_loader::IO)) {
+                        rt::println!(
+                            "posix-files: malformed image metadata {loaded} unexpected Go {outcome:?}"
+                        );
+                        return Err(Status::BadSize);
+                    }
+                    let sys::Received::Notification {
+                        source: rt::abi::Source::Unlabeled,
+                        label: 0,
+                        bits,
+                        ..
+                    } = sys::receive(&observer).map_err(Status::Kernel)?
+                    else {
+                        return Err(Status::BadSize);
+                    };
+                    let before = (bits >> 8) & 0xffff;
+                    let received = (bits >> 24) & 0xffff;
+                    let after = (bits >> 40) & 0xffff;
+                    let caps = bits >> 56;
+                    rt::println!(
+                        "posix-files: image metadata {loaded} handles={caps} live={before}->{received}->{after} flags={} refused before Ready",
+                        bits & 0xff
+                    );
+                    if bits & 0xff != 0x87
+                        || before != after
+                        || received != before + caps
+                        || caps != u64::from(loaded == 3)
+                    {
+                        return Err(Status::BadSize);
+                    }
                 }
-                rt::println!("posix-files: loader abort loaded capture {:?}", ready);
+                #[cfg(not(feature = "image-info-probe"))]
+                load_image(&loader)?;
+                #[cfg(not(feature = "image-info-probe"))]
+                {
+                    let ready = counts(&pending)?;
+                    if ready[0] != 1 || ready[3] != 1 || ready[4] != 0 {
+                        return Err(Status::BadSize);
+                    }
+                    rt::println!("posix-files: loader abort loaded capture {:?}", ready);
+                }
             }
             abort()?;
             let after = posix_abi::process::client().query()?;

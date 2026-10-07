@@ -375,7 +375,10 @@ pub const IMAGES: &[&str] = &[
 pub fn files_of(name: &str) -> Vec<RootFile> {
     match name {
         "boot-ramfs.img" => ramfs(),
-        "boot-ramfs-cleanup.img" | "boot-loader-abort.img" | "boot-loader-abort-steps.img" => {
+        "boot-ramfs-cleanup.img"
+        | "boot-loader-abort.img"
+        | "boot-loader-abort-steps.img"
+        | "boot-loader-info.img" => {
             let mut files = vec![
                 dir("/bin"),
                 file("/bin/posix-files", 0o755, ROOT, "posix-files"),
@@ -384,7 +387,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
-        "boot-posix-files.img" | "boot-posix-files-steps.img" | "boot-posix-files-loss.img" => {
+        "boot-posix-files.img"
+        | "boot-posix-files-steps.img"
+        | "boot-posix-files-loss.img"
+        | "boot-posix-data-steps.img" => {
             let mut files = vec![dir("/dev")];
             files.extend(devices());
             files

@@ -16,6 +16,7 @@ pub mod fork;
 pub mod loader_probe;
 pub mod long;
 pub mod metadata;
+mod open_driver;
 pub mod pipes;
 pub mod process;
 pub mod random;
@@ -133,11 +134,26 @@ pub unsafe fn path<'a>(pointer: *const c_char) -> Result<&'a [u8], c_int> {
     Err(ENAMETOOLONG)
 }
 
-/// Opens `name` with the access mode, O_DIRECTORY, O_CHANGES and the
-/// close-on-exec and close-on-fork flags of `flags`: the descriptor or an errno.
+/// Opens `name` with mode zero and a zero creation mask.
 pub fn open(name: &[u8], flags: c_int) -> Result<c_int, c_int> {
+    open_policy(name, flags, 0, 0)
+}
+
+/// Opens a path under its captured creation mode and process mask.
+pub fn open_policy(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c_int, c_int> {
     if flags
-        & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY | O_NONBLOCK)
+        & !(O_ACCMODE
+            | O_DIRECTORY
+            | O_CLOEXEC
+            | O_CLOFORK
+            | O_CHANGES
+            | O_NOCTTY
+            | O_NONBLOCK
+            | O_CREAT
+            | O_EXCL
+            | O_TRUNC
+            | O_APPEND
+            | O_NOFOLLOW)
         != 0
         || flags & O_ACCMODE == O_ACCMODE
     {
@@ -146,6 +162,8 @@ pub fn open(name: &[u8], flags: c_int) -> Result<c_int, c_int> {
     shared::number(Request::Open {
         path: name,
         flags: flags as u32,
+        mode,
+        umask,
     })
     .map(|fd| fd as c_int)
 }
@@ -335,6 +353,16 @@ pub fn dup2(source: c_int, target: c_int) -> Result<c_int, c_int> {
     shared::number(Request::Dup2 {
         source: fd(source)?,
         target: fd(target)?,
+    })
+    .map(|fd| fd as c_int)
+}
+
+/// Replace a descriptor and capture its close flags in the same table transition.
+pub fn dup3(source: c_int, target: c_int, flags: c_int) -> Result<c_int, c_int> {
+    shared::number(Request::Dup3 {
+        source: fd(source)?,
+        target: fd(target)?,
+        flags: flags as u32,
     })
     .map(|fd| fd as c_int)
 }

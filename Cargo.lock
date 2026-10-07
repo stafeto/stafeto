@@ -369,6 +369,7 @@ dependencies = [
  "posix-abi",
  "posix-crt",
  "posix-fs",
+ "posix-sync",
  "proto-fs",
  "proto-loader",
  "proto-process",
@@ -617,6 +618,8 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "posix-clock",
+ "proto-clock",
  "proto-fs",
  "proto-init",
  "proto-process",

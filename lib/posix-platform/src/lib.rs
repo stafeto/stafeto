@@ -23,7 +23,7 @@ use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use core::sync::atomic::AtomicU32;
-use posix_abi::constants::{EFAULT, EINVAL, EISDIR, ENOMEM};
+use posix_abi::constants::{EFAULT, EINVAL, ENOMEM};
 use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
@@ -140,8 +140,8 @@ pub unsafe extern "C" fn stafeto_read(fd: c_int, buf: *mut u8, len: usize) -> is
 /// relibc's open flags (its headers for AArch64 Linux, asm/fcntl.h).
 const AT_FDCWD: c_int = -100;
 const O_ACCMODE: c_int = 0o3;
-const O_RDONLY: c_int = 0;
 const O_CREAT: c_int = 0o100;
+const O_EXCL: c_int = 0o200;
 const O_TRUNC: c_int = 0o1000;
 const O_APPEND: c_int = 0o2000;
 const O_NOCTTY: c_int = 0o400;
@@ -153,18 +153,44 @@ const O_CLOEXEC: c_int = 0o2000000;
 const O_CLOFORK: c_int = 0o1_0000_0000;
 const O_NONBLOCK: c_int = 0o4000;
 
-/// Opens `path`, relative to the current directory or absolute (any
-/// `dirfd` then). The layer opens files of the RAM file service: the
-/// access mode, O_DIRECTORY and O_CLOEXEC; O_NOCTTY keeps a terminal from
-/// becoming the controlling terminal (5f); O_NOFOLLOW (no symbolic links
-/// yet) and O_LARGEFILE change nothing; other flags, and a
-/// relative path from a directory other than `AT_FDCWD`, answer EINVAL.
-/// O_CREAT, O_TRUNC and O_APPEND name a directory as POSIX has it: EISDIR
-/// for O_CREAT without O_DIRECTORY and for O_TRUNC or O_APPEND with write
-/// access; O_APPEND for reading opens the directory; on anything else they
-/// go to the service, which takes them for the null device only and
-/// answers EINVAL for any other file (it creates, truncates and appends
-/// nothing yet).
+/// Translates relibc Open flags into the process-local request interface.
+fn open_flags(flags: c_int) -> Result<c_int, c_int> {
+    let known = O_ACCMODE
+        | O_CREAT
+        | O_EXCL
+        | O_TRUNC
+        | O_APPEND
+        | O_NOCTTY
+        | O_DIRECTORY
+        | O_NOFOLLOW
+        | O_LARGEFILE
+        | O_CLOEXEC
+        | O_CLOFORK
+        | O_NONBLOCK;
+    if flags & !known != 0 || flags & O_ACCMODE == O_ACCMODE {
+        return Err(EINVAL);
+    }
+    let mut mapped = flags & O_ACCMODE;
+    for (native, local) in [
+        (O_CREAT, posix_abi::constants::O_CREAT),
+        (O_EXCL, posix_abi::constants::O_EXCL),
+        (O_TRUNC, posix_abi::constants::O_TRUNC),
+        (O_APPEND, posix_abi::constants::O_APPEND),
+        (O_NOFOLLOW, posix_abi::constants::O_NOFOLLOW),
+        (O_DIRECTORY, posix_abi::constants::O_DIRECTORY),
+        (O_CLOEXEC, posix_abi::constants::O_CLOEXEC),
+        (O_CLOFORK, posix_abi::constants::O_CLOFORK),
+        (O_NOCTTY, posix_abi::constants::O_NOCTTY),
+        (O_NONBLOCK, posix_abi::constants::O_NONBLOCK),
+    ] {
+        if flags & native != 0 {
+            mapped |= local;
+        }
+    }
+    Ok(mapped)
+}
+
+/// Opens an absolute path or a path under the current directory with captured mode and umask.
 ///
 /// # Safety
 /// `path` is a live C string.
@@ -173,54 +199,25 @@ pub unsafe extern "C" fn stafeto_openat(
     dirfd: c_int,
     path: *const c_char,
     flags: c_int,
-    _mode: u32,
+    mode: u32,
 ) -> c_int {
-    let known =
-        O_ACCMODE | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | O_CLOEXEC | O_CLOFORK;
-    let changes = O_CREAT | O_TRUNC | O_APPEND;
     // SAFETY: the caller's promise.
     let absolute = !path.is_null() && unsafe { *path } == b'/' as c_char;
-    if (dirfd != AT_FDCWD && !absolute) || flags & !(known | changes) != 0 {
+    if dirfd != AT_FDCWD && !absolute {
         return -EINVAL;
     }
+    let mapped = match open_flags(flags) {
+        Ok(mapped) => mapped,
+        Err(errno) => return -errno,
+    };
     // SAFETY: the caller's promise.
     let name = match unsafe { posix_abi::path(path) } {
         Ok(name) => name,
         Err(errno) => return -errno,
     };
-    let mut ours_changes = 0;
-    if flags & changes != 0 {
-        let reads = flags & O_ACCMODE == O_RDONLY;
-        let creates = flags & O_CREAT != 0 && flags & O_DIRECTORY == 0;
-        let directory = (creates || !reads || flags & changes == O_APPEND) && is_directory(name);
-        if directory && (creates || !reads) {
-            return -EISDIR;
-        }
-        // The null device takes them; the service refuses any other file.
-        if !(directory && flags & changes == O_APPEND) {
-            ours_changes = posix_abi::constants::O_CHANGES;
-        }
-    }
-    let mut ours = flags & O_ACCMODE | ours_changes;
-    if flags & O_DIRECTORY != 0 {
-        ours |= posix_abi::constants::O_DIRECTORY;
-    }
-    if flags & O_CLOEXEC != 0 {
-        ours |= posix_abi::constants::O_CLOEXEC;
-    }
-    if flags & O_CLOFORK != 0 {
-        ours |= posix_abi::constants::O_CLOFORK;
-    }
-    if flags & O_NOCTTY != 0 {
-        ours |= posix_abi::constants::O_NOCTTY;
-    }
-    value(call(|| posix_abi::open(name, ours)).map(i64::from)) as c_int
-}
-
-/// Whether `name` opens as a directory.
-fn is_directory(name: &[u8]) -> bool {
-    call(|| posix_abi::open(name, posix_abi::constants::O_DIRECTORY).and_then(posix_abi::close))
-        .is_ok()
+    let captured_umask = files::umask();
+    value(call(|| posix_abi::open_policy(name, mapped, mode, captured_umask)).map(i64::from))
+        as c_int
 }
 
 /// pipe2: the read end into `fds[0]` and the write end into `fds[1]`
