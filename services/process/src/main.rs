@@ -3100,8 +3100,16 @@ impl Service<0> for Processes {
         }
         let (exit, orphans) = self.records.exited(index, end);
         // An exec that waited for init goes on: its new image is dead.
-        self.replace_queue.remove(index);
-        self.finish_replace(index);
+        // The new image ending does not acknowledge init's handoff.
+        // Its immutable offer and old owner survive until canonical ACK.
+        let awaiting_init = self.replacing[index]
+            .as_ref()
+            .and_then(Work::replacing)
+            .is_some_and(|work| work.ticket != 0 && !work.old.cleanup_requested());
+        if !awaiting_init {
+            self.replace_queue.remove(index);
+            self.finish_replace(index);
+        }
         self.tickets[index] = 0;
         // Init reads the end once the witness closed.
         self.witnesses[index] = None;
