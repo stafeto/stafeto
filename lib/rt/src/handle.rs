@@ -346,3 +346,53 @@ impl fmt::Debug for Outgoing {
         f.debug_list().entries(self.values()).finish()
     }
 }
+
+#[cfg(test)]
+mod incoming_view_tests {
+    use super::*;
+    use crate::sys::test_calls;
+    #[test]
+    fn memory_info_view_keeps_the_original_max_generation_owner_until_exact_take_and_close() {
+        let raw = abi::Handle::new(71, abi::Handle::MAX_GENERATION);
+        let mut incoming = Incoming::fixture(&[raw]);
+        incoming.info[0] = (ObjectKind::Memory, Rights::MAP_READ | Rights::MAP_WRITE);
+        test_calls::expect([
+            (abi::Call::ObjectInfo.number(), Some(Error::Unknown(991))),
+            (abi::Call::HandleClose.number(), None),
+        ]);
+        assert_eq!(
+            incoming.with_view::<Memory, _>(0, |view| {
+                assert_eq!(view.raw(), raw);
+                crate::sys::memory_info(view).map(|info| info.size)
+            }),
+            Ok(Err(Error::Unknown(991)))
+        );
+        assert_eq!(incoming.values[0], raw);
+        let memory = incoming.take::<Memory>(0).unwrap();
+        assert_eq!(incoming.values[0], abi::Handle::INVALID);
+        assert_eq!(
+            incoming.with_view::<Memory, _>(0, |_| ()),
+            Err(Error::BadHandle)
+        );
+        drop(memory);
+        test_calls::complete();
+    }
+    #[test]
+    fn wrong_kind_and_absent_view_preserve_incoming_without_a_syscall() {
+        let raw = abi::Handle::new(3, 4);
+        let mut incoming = Incoming::fixture(&[raw]);
+        incoming.info[0] = (ObjectKind::Channel, Rights::SEND);
+        test_calls::expect([(abi::Call::HandleClose.number(), None)]);
+        assert_eq!(
+            incoming.with_view::<Memory, _>(0, |_| ()),
+            Err(Error::WrongType)
+        );
+        assert_eq!(
+            incoming.with_view::<Memory, _>(1, |_| ()),
+            Err(Error::BadHandle)
+        );
+        assert_eq!(incoming.values[0], raw);
+        drop(incoming);
+        test_calls::complete();
+    }
+}
