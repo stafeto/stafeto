@@ -293,6 +293,11 @@ impl<T, const K: usize> Session<T, K> {
         self.closing
     }
 
+    /// Service-owned births carry irreversible revocation into their claimed session.
+    pub fn revoke(&mut self) {
+        self.closing = true;
+    }
+
     /// A free place; LIMIT_REACHED when K are held.
     fn free(&self) -> Result<usize, Error> {
         self.held

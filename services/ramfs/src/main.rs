@@ -1354,11 +1354,16 @@ impl Service<0> for Fs {
             return;
         }
         let mut client_work = false;
+        let mut closing_visit = false;
         let i = self.maintenance.position;
         if i < SESSIONS {
             if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
                 let label = s.label();
                 client_work = self.cleanup_step(&mut s.data, label);
+                closing_visit = s.data.closing;
+                if s.data.closing {
+                    s.revoke();
+                }
                 if s.data.closing && self.closed_terminal(&s.data, label) {
                     self.places.release(label);
                     self.clones.gone(label);
@@ -1367,6 +1372,7 @@ impl Service<0> for Fs {
             }
         } else if let Some((label, mut fds)) = self.births[i - SESSIONS].take() {
             client_work = self.cleanup_step(&mut fds, label);
+            closing_visit = fds.closing;
             if fds.closing && self.closed_terminal(&fds, label) {
                 self.places.release(label);
                 self.clones.gone(label);
@@ -1375,7 +1381,8 @@ impl Service<0> for Fs {
             }
         }
         work |= client_work;
-        self.maintenance.complete(client_work, SESSIONS + BIRTHS);
+        self.maintenance
+            .complete_client(client_work, closing_visit, SESSIONS + BIRTHS);
         // A maintenance notification makes reclamation progress with no client request.
         if work
             || self.maintenance.remaining != 0
@@ -1426,13 +1433,19 @@ impl Service<0> for Fs {
                 .iter_mut()
                 .find(|b| b.is_some_and(|(l, _)| l == label))
             {
-                s.data = birth.take().expect("a birth").1;
+                s.data.claim_birth(birth.take().expect("a birth").1);
             } else if r.label() & proto_fs::OWN != 0 && self.clones.client_of(r.label()).is_some() {
                 // A Loader consumed this birth into a distinct label; surviving old copies
                 // have cleanup authority only, regardless of a creator's retained handle.
                 s.data.binding = Binding::Cleanup;
             }
             s.data.claimed = true;
+            if s.data.closing {
+                s.revoke();
+                if !s.data.permits_method(r.method()) {
+                    return status(proto_fs::PERMISSION);
+                }
+            }
             // Admission into the session table is one bounded phase of its own.
             // It cannot share a receive with the Process Vouch round trip.
             if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {

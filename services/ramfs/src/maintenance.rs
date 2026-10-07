@@ -16,6 +16,14 @@ impl Default for Cursor {
     }
 }
 impl Cursor {
+    /// Retained cleanup rotates after every visit and keeps retrying the finite table.
+    pub fn complete_client(&mut self, worked: bool, closing: bool, slots: usize) {
+        if worked && closing {
+            self.remaining = self.remaining.max(slots - 1);
+        }
+        self.complete(worked && !closing, slots);
+    }
+
     pub fn complete(&mut self, worked: bool, slots: usize) {
         if !worked {
             self.position = 1 + self.position % (slots - 1);
@@ -27,6 +35,33 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_retained_close_rotates_and_retries_while_another_owner_progresses() {
+        let mut cursor = Cursor {
+            position: 1,
+            remaining: 0,
+        };
+        let mut stalled_visits = 0;
+        let mut other_steps = 0;
+        for _ in 0..18 {
+            match cursor.position {
+                1 => {
+                    stalled_visits += 1;
+                    cursor.complete_client(true, true, 4);
+                }
+                2 => {
+                    other_steps += 1;
+                    cursor.complete_client(true, true, 4);
+                }
+                _ => cursor.complete_client(false, false, 4),
+            }
+            assert!(cursor.remaining > 0);
+        }
+        assert_eq!(stalled_visits, 6);
+        assert_eq!(other_steps, 6);
+        assert_eq!(cursor.position, 1);
+    }
 
     #[test]
     fn waiting_destination_gives_the_retained_source_a_turn() {

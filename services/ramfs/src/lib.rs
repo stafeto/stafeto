@@ -259,6 +259,18 @@ pub struct Fds {
     preparations: [Option<storage::Reservation>; 16],
 }
 
+impl Fds {
+    /// Transfer the exact birth before deciding which request may proceed.
+    pub fn claim_birth(&mut self, birth: Self) {
+        *self = birth;
+        self.claimed = true;
+    }
+
+    pub fn permits_method(&self, method: u16) -> bool {
+        !self.closing || maintenance::closed_method(method)
+    }
+}
+
 impl Default for Fds {
     fn default() -> Self {
         Self {
@@ -2066,6 +2078,32 @@ mod tests {
             assert_eq!(ram.open_descriptions(), remaining);
         }
         assert!(Ram::released(&child));
+    }
+
+    #[test]
+    fn late_first_request_claims_closed_birth_and_refuses_new_effects() {
+        let mut ram = Ram::default();
+        let mut birth = Fds::default();
+        let fd = ram.open(&mut birth, "/etc/motd", READ_ONLY).unwrap();
+        birth.closing = true;
+        birth.binding = authority::Binding::Cleanup;
+        let mut slot = Some(birth);
+        let mut session = Fds::default();
+        session.claim_birth(slot.take().unwrap());
+        assert!(slot.is_none());
+        assert!(session.claimed && session.closing);
+        assert_eq!(session.numbers().collect::<std::vec::Vec<_>>(), [fd]);
+        for method in [
+            proto_fs::Method::Bind,
+            proto_fs::Method::DataStart,
+            proto_fs::Method::OpenStart,
+        ] {
+            assert!(!session.permits_method(method as u16));
+        }
+        assert!(session.permits_method(proto_fs::Method::OpenQuery as u16));
+        assert_eq!(ram.open_descriptions(), 1);
+        assert!(ram.release_step(&mut session));
+        assert!(Ram::released(&session));
     }
 
     #[test]
