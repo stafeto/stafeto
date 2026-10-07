@@ -1421,7 +1421,7 @@ impl ramfs::clone::Effects<Handle<Channel>, sys::Token> for CloneEffects<'_> {
             .expect("retained child identity");
         assert_eq!(identity.label, label, "exact clone identity");
         assert!(
-            identity.offered.is_none() && identity.previous.is_none() && identity.image.is_none(),
+            !identity.offered.is_some() && !identity.previous.is_some() && identity.image.is_none(),
             "unpublished clone identity optionals"
         );
         Handle::close_retained_owner(
