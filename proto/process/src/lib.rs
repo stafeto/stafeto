@@ -197,6 +197,7 @@ use proto_wire::{Header, Reader, Status, Writer};
 pub const VERSION: u16 = 12;
 
 mod executable;
+pub mod initial_identity;
 mod limits;
 mod retained;
 pub use executable::{ExecKind, StageExec, StageReceipt};
@@ -482,6 +483,8 @@ pub enum Method {
     InitialMapAck = 57,
     CreateInitial = 58,
     InitialMaps = 59,
+    /// Reserved envelope; native admission adds this method after its handler exists.
+    InitialOf = 61,
 }
 impl Method {
     pub const fn header(self) -> Header {
