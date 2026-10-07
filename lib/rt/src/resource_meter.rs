@@ -52,17 +52,21 @@ impl Meter {
         }
     }
 
-    fn sample(&self) {
+    fn sample(&self) -> u64 {
         let raw = self.process.load(Ordering::Relaxed);
         if raw == 0 {
-            return;
+            return u64::MAX;
         }
         // The guard borrows this exact process handle for the registration's lifetime.
         let process = Handle::<Process>::borrowed(crate::abi::Handle(raw));
-        self.record(
-            crate::sys::process_memory(&process),
-            crate::sys::process_handles(&process),
-        );
+        let memory = crate::sys::process_memory(&process);
+        let handles = crate::sys::process_handles(&process);
+        let used = match (memory, handles) {
+            (Ok(memory), Ok(_)) => memory.used,
+            _ => u64::MAX,
+        };
+        self.record(memory, handles);
+        used
     }
 
     fn status(&self) -> Result<(), Error> {
@@ -212,16 +216,25 @@ impl Drop for Guard<'_> {
 }
 
 #[inline(always)]
-pub(crate) fn before<const N: u16>() {
+pub(crate) fn before<const N: u16>() -> u64 {
     // ObjectInfo reads only registers and never allocates or consumes incoming caps.
     // Excluding it also terminates the sampler's own ObjectInfo calls.
-    if N != Call::ObjectInfo.number() && METER.process.load(Ordering::Relaxed) != 0 {
-        METER.sample();
+    #[cfg(feature = "capacity-memory-trace")]
+    if N == Call::DebugWrite.number() {
+        return u64::MAX;
     }
+    if N != Call::ObjectInfo.number() && METER.process.load(Ordering::Relaxed) != 0 {
+        return METER.sample();
+    }
+    u64::MAX
 }
 
 #[inline(always)]
-pub(crate) fn after<const N: u16>(status: u64) {
+pub(crate) fn after<const N: u16>(status: u64, _before: u64) {
+    #[cfg(feature = "capacity-memory-trace")]
+    if N == Call::DebugWrite.number() {
+        return;
+    }
     if N == Call::ObjectInfo.number() || METER.process.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -233,7 +246,23 @@ pub(crate) fn after<const N: u16>(status: u64) {
     {
         METER.attempt(status);
     }
-    METER.sample();
+    let _after = METER.sample();
+    #[cfg(feature = "capacity-memory-trace")]
+    if _before != u64::MAX && _after != u64::MAX && _before != _after {
+        trace_memory(N, status, _before, _after);
+    }
+}
+
+#[cfg(feature = "capacity-memory-trace")]
+#[inline(never)]
+fn trace_memory(call: u16, status: u64, before: u64, after: u64) {
+    crate::println!(
+        "capacity-memory: call={} status={} before={} after={}",
+        call,
+        status,
+        before,
+        after
+    );
 }
 
 #[cfg(test)]

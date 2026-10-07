@@ -19,6 +19,8 @@ bench = false
 count-calls = []
 # Private actual resource observations for native capacity fixtures.
 resource-meter = []
+# Private capacity diagnostics reuse the resource observer samples.
+capacity-memory-trace = ["resource-meter"]
 # The longest step of a service's loop for each method, which a service
 # that asks (`service::report_steps`) prints when it grows; off in every
 # image but the process service's measurement (xtask process-steps).
