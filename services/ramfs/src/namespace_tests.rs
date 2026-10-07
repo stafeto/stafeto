@@ -1064,7 +1064,7 @@ fn rename_ancestors_include_deep_boot_and_relative_dynamic_directories() {
     let image = crate::tree::test_image(&entries);
     let mut index = crate::tree::Index::new();
     let tree = crate::tree::load(&image, &mut index).unwrap();
-    let mut ram = Ram::with_tree(proto_fs::Timestamp::ZERO, tree);
+    let mut ram = Ram::with_tree(0, tree);
     let mut parent = ram
         .storage
         .resolve(paths.last().unwrap().as_bytes())
@@ -1081,7 +1081,7 @@ fn rename_ancestors_include_deep_boot_and_relative_dynamic_directories() {
     assert!(ready(&mut ram, &mut prep, ROOT_USER).unwrap() > INODES);
     assert_eq!(ram.storage.usage(FIRST), usage);
     assert_eq!(ram.storage.state.epoch, epoch);
-    let now = proto_fs::Timestamp::legacy_ns(73);
+    let now = 73;
     assert_eq!(
         prep.commit(&mut ram.storage, ROOT_USER, now),
         Ok(NamespaceOutcome::Applied)
@@ -1099,7 +1099,7 @@ fn rename_ancestors_include_deep_boot_and_relative_dynamic_directories() {
 
 #[test]
 fn rename_ancestors_cycle_refuses_with_exact_paid_cleanup() {
-    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(19));
+    let mut ram = Ram::new(19);
     let parent = create(&mut ram, FIRST, ROOT, b"parent", DIR, 0o755);
     let source = create(&mut ram, FIRST, ROOT, b"source", DIR, 0o755);
     let charge = ram.storage.charge_preparation(FIRST).unwrap();
