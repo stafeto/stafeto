@@ -17,14 +17,21 @@ use rt::handle::Resource;
 
 rt::entry!(main);
 
-fn main(_: u64) -> u64 {
-    let Ok(mut start) = rt::startup() else {
-        return 1;
-    };
+// Startup's named-handle buffer is no longer needed during the file probes.
+#[inline(never)]
+fn probe_parent() -> Option<rt::Handle<rt::handle::Channel>> {
+    let mut start = rt::startup().ok()?;
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let result = check(&start.parent);
+    Some(start.parent)
+}
+
+fn main(_: u64) -> u64 {
+    let Some(parent) = probe_parent() else {
+        return 1;
+    };
+    let result = check(&parent);
     match result {
         Ok(()) => {
             rt::println!("ramfs-probe: ok");
@@ -38,6 +45,16 @@ fn main(_: u64) -> u64 {
 }
 
 fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
+    check_files(parent)?;
+    check_posix(parent)?;
+    check_seek(parent)?;
+    check_duplicates(parent)?;
+    check_descriptor_limit(parent)
+}
+
+// Release the path buffers before constructing the larger descriptor table.
+#[inline(never)]
+fn check_files(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     let fs = Files::connect(parent).map_err(|_| "connect")?;
     let mut name = [0; 32];
     if fs.read_dir("/", 2, &mut name) != Ok(Some((3, 1))) || &name[..3] != b"etc" {
@@ -105,10 +122,6 @@ fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     }
     fs.close(fd).map_err(|_| "close scratch")?;
     check_image(&fs)?;
-    check_posix(parent)?;
-    check_seek(parent)?;
-    check_duplicates(parent)?;
-    check_descriptor_limit(parent)?;
     Ok(())
 }
 
@@ -227,8 +240,10 @@ fn check_image(fs: &Files) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[inline(never)]
 fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
-    let mut posix = PosixFs::connect(parent).map_err(|_| "connect POSIX files")?;
+    let mut files = PosixFs::connect(parent);
+    let posix = files.as_mut().map_err(|_| "connect POSIX files")?;
     if posix.stat(b"/").map_err(|_| "stat root")?.kind != FileKind::Directory {
         return Err("root type");
     }
@@ -317,8 +332,10 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
     Ok(())
 }
 
+#[inline(never)]
 fn check_seek(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
-    let mut posix = PosixFs::connect(parent).map_err(|_| "connect seek")?;
+    let mut files = PosixFs::connect(parent);
+    let posix = files.as_mut().map_err(|_| "connect seek")?;
     let fd = posix
         .open(b"/tmp/probe", READ_WRITE)
         .map_err(|_| "open seek")?;
@@ -378,8 +395,10 @@ fn check_seek(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static s
     Ok(())
 }
 
+#[inline(never)]
 fn check_duplicates(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
-    let mut fs = PosixFs::connect(parent).map_err(|_| "dup connect")?;
+    let mut files = PosixFs::connect(parent);
+    let fs = files.as_mut().map_err(|_| "dup connect")?;
     if fs.fstat(1).map_err(|_| "console stat")?.kind != FileKind::Character
         || fs.lseek(1, 0, SeekFrom::Start) != Err(FsError::NotSeekable)
         || fs.read(1, &mut []) != Err(FsError::BadFileDescriptor)
@@ -488,8 +507,10 @@ fn check_duplicates(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'st
     Ok(())
 }
 
+#[inline(never)]
 fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
-    let mut fs = PosixFs::connect(parent).map_err(|_| "limit connect")?;
+    let mut files = PosixFs::connect(parent);
+    let fs = files.as_mut().map_err(|_| "limit connect")?;
     let source = fs.open(b"/etc/motd", READ_ONLY).map_err(|_| "limit open")?;
     for expected in 4..OPEN_MAX as u32 {
         if fs.dup(source) != Ok(expected) {

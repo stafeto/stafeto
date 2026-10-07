@@ -340,6 +340,13 @@ pub struct Table<T: Copy + Eq, const N: usize, R: Copy = ()> {
 
 impl<T: Copy + Eq, const N: usize, R: Copy> Default for Table<T, N, R> {
     fn default() -> Self {
+        Self::with_early_release(|_| false)
+    }
+}
+
+impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
+    /// Armed early-release operations retain their generations in the service.
+    pub const fn with_early_release(release_early: fn(T) -> bool) -> Self {
         Self {
             entries: [EntrySlot {
                 generation: 0,
@@ -352,17 +359,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy> Default for Table<T, N, R> {
                     held: Held::Empty,
                 }
             }; N],
-            release_early: |_| false,
-        }
-    }
-}
-
-impl<T: Copy + Eq, const N: usize, R: Copy> Table<T, N, R> {
-    /// Armed early-release operations retain their generations in the service.
-    pub fn with_early_release(release_early: fn(T) -> bool) -> Self {
-        Self {
             release_early,
-            ..Self::default()
         }
     }
 

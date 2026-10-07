@@ -686,15 +686,15 @@ impl PosixFs {
     /// files and, when init's table gives it one, a session with the pipe
     /// service.
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, FsError> {
-        let mut fs = Self::from_files(Files::connect(parent).map_err(FsError::from)?)?;
-        fs.pipes = rt::service::connect(parent, "pipe").ok();
-        Ok(fs)
+        let files = Files::connect(parent).map_err(FsError::from)?;
+        let pipes = rt::service::connect(parent, "pipe").ok();
+        Self::from_files_parts(files, pipes)
     }
 
     pub fn connect_with_uart(parent: &Handle<Channel>) -> Result<Self, FsError> {
-        let mut fs = Self::from_files(Files::connect_with_uart(parent).map_err(FsError::from)?)?;
-        fs.pipes = rt::service::connect(parent, "pipe").ok();
-        Ok(fs)
+        let files = Files::connect_with_uart(parent).map_err(FsError::from)?;
+        let pipes = rt::service::connect(parent, "pipe").ok();
+        Self::from_files_parts(files, pipes)
     }
 
     /// The session with the pipe service the program was given (its
@@ -731,9 +731,9 @@ impl PosixFs {
                     pipes: None,
                     terminal: None,
                     paths: PathState::new(),
-                    descriptors: Table::with_early_release(|target| {
-                        matches!(target, Target::Tty(_))
-                    }),
+                    descriptors: const {
+                        Table::with_early_release(|target| matches!(target, Target::Tty(_)))
+                    },
                 };
                 for d in list {
                     fs.descriptors
@@ -872,17 +872,21 @@ impl PosixFs {
     }
 
     fn from_files(files: Files) -> Result<Self, FsError> {
-        let mut descriptors = Table::with_early_release(|target| matches!(target, Target::Tty(_)));
-        for target in [Target::Input, Target::Output, Target::Error] {
-            descriptors.insert(target, DescriptorFlags::default())?;
-        }
-        Ok(Self {
+        Self::from_files_parts(files, None)
+    }
+
+    fn from_files_parts(files: Files, pipes: Option<Handle<Channel>>) -> Result<Self, FsError> {
+        let mut fs = Self {
             files,
-            pipes: None,
+            pipes,
             terminal: None,
             paths: PathState::new(),
-            descriptors,
-        })
+            descriptors: const { Table::with_early_release(|target| matches!(target, Target::Tty(_))) },
+        };
+        for target in [Target::Input, Target::Output, Target::Error] {
+            fs.descriptors.insert(target, DescriptorFlags::default())?;
+        }
+        Ok(fs)
     }
 
     /// The transports, for a request outside the owner's lock.
@@ -1016,6 +1020,12 @@ impl PosixFs {
         if path.last() == Some(&b'/') && self.stat(path)?.kind == FileKind::Regular {
             return Err(FsError::NotDirectory);
         }
+        self.open_after_directory_check(path, flags)
+    }
+
+    // The preliminary stat finishes before reserving this path buffer.
+    #[inline(never)]
+    fn open_after_directory_check(&mut self, path: &[u8], flags: u32) -> Result<u32, FsError> {
         let resolved = self.resolve(path)?;
         self.descriptors.vacant(0)?;
         let transport = self.transport();
@@ -1116,11 +1126,15 @@ impl PosixFs {
     }
 
     pub fn stat(&self, path: &[u8]) -> Result<Metadata, FsError> {
-        self.transport().stat(&self.resolve(path)?)
+        let resolved = self.resolve(path);
+        self.transport()
+            .stat(resolved.as_ref().map_err(|error| *error)?)
     }
 
     pub fn stat_information(&self, path: &[u8]) -> Result<NodeInfo, FsError> {
-        self.transport().stat_information(&self.resolve(path)?)
+        let resolved = self.resolve(path);
+        self.transport()
+            .stat_information(resolved.as_ref().map_err(|error| *error)?)
     }
 
     pub fn descriptor_information(&self, fd: u32) -> Result<NodeInfo, FsError> {
