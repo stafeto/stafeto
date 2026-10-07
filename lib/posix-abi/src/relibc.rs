@@ -17,9 +17,9 @@
 //! touches freed memory. The next `create`, or an exit, collects them.
 
 use crate::{allocation, constants::*};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use posix_thread::{Block, flag};
-use rt::abi::{Error, Policy, Rights, ThreadState};
+use rt::abi::{Policy, Rights, ThreadState};
 use rt::handle::{Channel, Handle, Thread};
 use rt::sys;
 
@@ -29,6 +29,16 @@ const PAGE: usize = 4096;
 /// The IPC buffers of the threads: a page each from here (place 0 is the
 /// main thread's own, given by the loader).
 const BUFFERS: usize = 0x200_0000;
+
+// Admission hint only: full lifetime state remains the authority for row reuse.
+static FREE_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+/// The caller holds TABLE_LOCK after completing exact detach and resource cleanup.
+fn publish_free(place: &Place) {
+    place.state.free();
+    FREE_EPOCH.fetch_add(1, Ordering::SeqCst);
+    posix_sync::futex_wake(&FREE_EPOCH, u32::MAX);
+}
 
 mod lifetime;
 pub use lifetime::OwnerStatus;
@@ -392,7 +402,7 @@ pub fn collect() -> bool {
         // SAFETY: relibc released the ended thread; no reader uses its TCB.
         unsafe { core::ptr::write_bytes(tcb as *mut u8, 0xA5, tcb_len) };
         unmap(tcb, tcb_len);
-        place.state.free();
+        publish_free(place);
     }
     deferred
 }
@@ -400,6 +410,7 @@ pub fn collect() -> bool {
 /// Whether some place holds a thread relibc released (joined, or detached):
 /// its end, which the exit channel tells, frees the place.
 fn future_exit() -> bool {
+    let _guard = TABLE_LOCK.lock();
     TABLE.iter().enumerate().skip(1).any(|(index, place)| {
         let state = place.state.load();
         if index as u64 + 1 == current()
@@ -437,6 +448,7 @@ fn exits() -> Result<u64, i32> {
 /// exiting thread's end when all are taken; EAGAIN when none will come.
 fn reserve() -> Result<usize, i32> {
     loop {
+        let snapshot = FREE_EPOCH.load(Ordering::SeqCst);
         let deferred = collect();
         for (index, place) in TABLE.iter().enumerate().skip(1) {
             if place.state.reserve() {
@@ -460,9 +472,16 @@ fn reserve() -> Result<usize, i32> {
         {
             return Err(EAGAIN);
         }
-        let channel = borrowed::<Channel>(exits()?);
-        match sys::receive(&channel) {
-            Ok(_) | Err(Error::Interrupted) => {}
+        let deadline = rt::time::ticks_to_ns(rt::time::now())
+            .checked_add(1_000_000)
+            .ok_or(EAGAIN)?;
+        match posix_sync::futex_wait(
+            &FREE_EPOCH,
+            snapshot,
+            posix_sync::CLOCK_MONOTONIC,
+            Some(deadline),
+        ) {
+            Ok(_) | Err(EAGAIN | ETIMEDOUT) => {}
             Err(_) => return Err(EAGAIN),
         }
     }
@@ -522,7 +541,8 @@ pub unsafe fn create(
         close_raw(own);
         close_raw(native);
         unmap(tcb, tcb_len);
-        place.state.free();
+        let _guard = TABLE_LOCK.lock();
+        publish_free(place);
     };
     let ceiling = match crate::ceiling() {
         Ok(ceiling) => ceiling,
