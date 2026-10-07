@@ -3127,6 +3127,11 @@ impl Service<0> for Processes {
             image: record.image,
         };
         let first = self.records.mark_end_pending(key, None);
+        if let Some(resident) = self.replacing[index].as_mut().and_then(Work::initial_mut) {
+            // This exact record/image Exit revokes the pending guard before
+            // any later worker proof can commit authority.
+            assert!(resident.ended(resident.key, Status::from_code(proto_process::AGAIN).code()));
+        }
         self.generations.retire(index);
         if first {
             self.cancel_walks(key.label.raw_at(key.image));

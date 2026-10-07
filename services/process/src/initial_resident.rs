@@ -65,8 +65,7 @@ const ENDED: u16 = 128;
 
 impl<M, C, T, D> InitialResident<M, C, T, D> {
     pub fn reserved(key: SeedKey, receipt: Receipt, source: InitialSource) -> Option<Self> {
-        if key.epoch == 0
-            || key.ticket == 0
+        if key.ticket == 0
             || key.label == 0
             || key.ticket != receipt.init_ticket
             || key.ticket != receipt.key.key
@@ -118,15 +117,66 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         self.phase = Phase::GuardWait;
         true
     }
+    /// Proposed epoch is CPU metadata in an unused map entry before maps exist.
+    pub fn queue_stage(&mut self, epoch: u64, uid: u32, gid: u32, mode: u32) -> bool {
+        if epoch == 0
+            || mode > 1
+            || self.key.epoch != 0
+            || self.phase != Phase::GuardWait
+            || self.flags != 0
+            || self.publication.map.count != 0
+            || self
+                .publication
+                .map
+                .entries
+                .iter()
+                .any(|entry| *entry != Entry::EMPTY)
+            || self.originals.iter().any(Option::is_some)
+            || self.reply_copies.iter().any(Option::is_some)
+        {
+            return false;
+        }
+        self.publication.map.entries[0].address = epoch;
+        self.end_reason = uid;
+        self.guard_label = u64::from(gid) | (u64::from(mode) << 32);
+        self.phase = Phase::StageWait;
+        true
+    }
+    pub fn pending_stage(&self) -> Option<(u64, u32, u32, u32)> {
+        (self.phase == Phase::StageWait && self.key.epoch == 0 && self.flags == 0).then_some((
+            self.publication.map.entries[0].address,
+            self.end_reason,
+            self.guard_label as u32,
+            (self.guard_label >> 32) as u32,
+        ))
+    }
+    fn clear_pending_epoch(&mut self) {
+        if self.flags & MAPS == 0 {
+            self.publication.map.entries[0] = Entry::EMPTY;
+        }
+    }
+
     /// The native caller has verified the actual registered RAM private source.
     pub fn authenticated_stage(&mut self, key: SeedKey, source_label: u64) -> bool {
-        if key != self.key || self.flags & ENDED != 0 || source_label == 0 {
+        if self.flags & ENDED != 0
+            || source_label == 0
+            || key.epoch == 0
+            || key.ticket != self.key.ticket
+            || key.label != self.key.label
+        {
             return false;
         }
         if self.flags & STAGE != 0 {
-            return self.guard_label == source_label;
+            return key == self.key && self.guard_label == source_label;
         }
-        if self.phase != Phase::GuardWait {
+        if self.key.epoch == 0 {
+            if self.pending_stage().map(|value| value.0) != Some(key.epoch) {
+                return false;
+            }
+            self.clear_pending_epoch();
+            self.end_reason = 0;
+            self.key.epoch = key.epoch;
+        } else if key != self.key || self.phase != Phase::GuardWait {
             return false;
         }
         self.guard_label = source_label;
@@ -143,6 +193,7 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         let count = usize::from(publication.map.count);
         if self.flags & ENDED != 0
             || self.flags & STAGE == 0
+            || self.phase != Phase::Loading
             || self.flags & MAPS != 0
             || publication.validate().is_err()
             || publication.map.receipt != self.publication.map.receipt
@@ -222,6 +273,7 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         if self.flags & ENDED != 0 {
             return self.end_reason == reason;
         }
+        self.clear_pending_epoch();
         self.flags |= ENDED;
         self.end_reason = reason;
         self.phase = Phase::Canceling;
@@ -337,6 +389,52 @@ mod tests {
             None,
         ]
     }
+    #[test]
+    fn reserved_epoch_is_private_until_exact_proof_and_cleared_before_maps() {
+        let (mut resident, publication, log) = fixture();
+        resident.key.epoch = 0;
+        assert!(resident.awaiting_guard());
+        assert!(resident.queue_stage(37, 12, 13, 1));
+        assert_eq!(resident.key.epoch, 0);
+        assert_eq!(resident.pending_stage(), Some((37, 12, 13, 1)));
+        assert!(!resident.queue_stage(38, 12, 13, 1));
+        assert!(resident.map_reply(Key::FIRST).is_none());
+        let owners = resident.publish(publication, objects(&log)).err().unwrap();
+        assert_eq!(resident.pending_stage(), Some((37, 12, 13, 1)));
+        let key = SeedKey {
+            epoch: 38,
+            ..resident.key
+        };
+        assert!(!resident.authenticated_stage(key, 71));
+        assert_eq!(resident.key.epoch, 0);
+        assert!(resident.authenticated_stage(SeedKey { epoch: 37, ..key }, 71));
+        assert_eq!(resident.key.epoch, 37);
+        assert_eq!(resident.publication.map.entries[0], Entry::EMPTY);
+        assert!(resident.pending_stage().is_none());
+        assert!(resident.publish(publication, owners).is_ok());
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn end_before_maps_clears_only_cpu_alias_and_blocks_late_proof() {
+        let (mut resident, _, log) = fixture();
+        resident.key.epoch = 0;
+        assert!(resident.awaiting_guard());
+        assert!(resident.queue_stage(37, 12, 13, 1));
+        assert!(resident.ended(resident.key, 19));
+        assert_eq!(resident.publication.map.entries[0], Entry::EMPTY);
+        assert!(resident.cleanup_original().is_none());
+        assert!(!resident.authenticated_stage(
+            SeedKey {
+                epoch: 37,
+                ..resident.key
+            },
+            71
+        ));
+        assert_eq!(resident.end_reason(), Some(19));
+        assert!(log.borrow().is_empty());
+    }
+
     #[test]
     fn guard_precedes_maps_and_rejected_tuple_never_drops_in_admission() {
         let (mut resident, publication, log) = fixture();

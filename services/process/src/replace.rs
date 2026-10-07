@@ -5,9 +5,12 @@
 //! the shared process table; a retained Replace request proves parking.
 
 use crate::{controller::Controller, make};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    mem::ManuallyDrop,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use posix_process_service::worker_control::{
-    Claim, Command, Completion, Outcome, init_status, reply_serial,
+    Claim, Command, Completion, Outcome, RawKind, init_status, reply_serial,
 };
 use proto_process::Method;
 use proto_wire::{Name, Reader, Status, Writer};
@@ -164,6 +167,122 @@ fn refresh(
     outcome
 }
 
+pub fn owns_proof(pointer: u64) -> bool {
+    let Ok(pointer) = usize::try_from(pointer) else {
+        return false;
+    };
+    pointer >= STACK.top() - STACK_SIZE
+        && pointer
+            .checked_add(proto_process::initial_stage::PROOF)
+            .is_some_and(|end| end <= STACK.top())
+}
+
+fn initial_proof(
+    command: Command,
+    serial: u64,
+    raw: u64,
+    slots: &[AtomicU64; 4],
+    buffer: &mut [u8; abi::MESSAGE_MAX],
+    len: usize,
+) -> (Outcome, RawKind) {
+    let shared = crate::worker_shared();
+    let failed = |raw, status| {
+        (
+            Outcome {
+                raw,
+                status,
+                acknowledged: false,
+                reply_slots: slots.as_ptr() as u64,
+            },
+            if raw == 0 {
+                RawKind::Empty
+            } else {
+                RawKind::Capability
+            },
+        )
+    };
+    let Command::InitialProof {
+        index,
+        generation,
+        ticket,
+        epoch,
+    } = command
+    else {
+        unreachable!()
+    };
+    if len != 120 || slots.iter().any(|slot| slot.load(Ordering::Acquire) != 0) {
+        return failed(raw, Status::BadSize.code());
+    }
+    let Ok(stage) = proto_process::initial_stage::Stage::read(&buffer[8..104], 1) else {
+        return failed(raw, Status::BadSize.code());
+    };
+    let mut suffix = Reader::new(&buffer[104..120]);
+    let Ok(reply_serial) = suffix.u64() else {
+        return failed(raw, Status::BadSize.code());
+    };
+    let Ok(files_raw) = suffix.u64() else {
+        return failed(raw, Status::BadSize.code());
+    };
+    let label = proto_process::Label { index, generation };
+    if buffer[..8] != [0; 8]
+        || stage.label != label.raw_at(1)
+        || stage.epoch != epoch
+        || stage.ticket != ticket
+        || reply_serial != serial
+        || files_raw == 0
+        || raw == 0
+    {
+        return failed(raw, Status::BadSize.code());
+    }
+    let mut wire = Writer::new();
+    // FS58 is admitted with the complete Seed integration and version14.
+    proto_wire::Header::new(58, 14)
+        .write(&mut wire)
+        .expect("fixed source-proof header");
+    stage.write(&mut wire).expect("the validated Stage body");
+    let files = ManuallyDrop::new(Handle::<Channel>::from_raw(abi::Handle(files_raw)));
+    if !shared.initial_slots(serial, slots.as_ptr() as u64) {
+        return failed(raw, Status::BadSize.code());
+    }
+    let candidate = Handle::<Channel>::from_raw(abi::Handle(raw));
+    match sys::send_handles(&files, wire.as_bytes(), [candidate.erase()]) {
+        Ok(mut reply) => {
+            let proof =
+                proto_process::initial_stage::Proof::read(reply.bytes(buffer), reply.handles.len());
+            retain(&mut reply.handles, slots);
+            match proof {
+                Ok(proof) if proof.stage == stage => {
+                    assert!(shared.begin_proof(serial));
+                    (
+                        Outcome {
+                            raw: buffer.as_ptr() as u64,
+                            status: 0,
+                            acknowledged: true,
+                            reply_slots: slots.as_ptr() as u64,
+                        },
+                        RawKind::ProofBuffer,
+                    )
+                }
+                Ok(_) => failed(0, Status::BadSize.code()),
+                Err(status) => failed(0, status.code()),
+            }
+        }
+        Err(mut refused) => {
+            let returned = if let Some(back) = refused.back.take() {
+                let mut back = ManuallyDrop::new(back);
+                assert_eq!(back.len(), 1, "the exact refused source duplicate");
+                let cap = ManuallyDrop::new(back.pop().expect("the source duplicate"));
+                assert_eq!(cap.raw().0, raw, "the exact full source generation");
+                ManuallyDrop::into_inner(cap).into_raw().0
+            } else {
+                0
+            };
+            assert!(refused.token.is_none(), "Send has no reply token owner");
+            failed(returned, Status::Kernel(refused.error).code())
+        }
+    }
+}
+
 extern "C" fn replacer(_: u64) -> ! {
     let init = make::init();
     let channel = make::channel();
@@ -189,47 +308,68 @@ extern "C" fn replacer(_: u64) -> ! {
             // The entire service ends; this is not an isolated ThreadExit.
             Err(_) => sys::process_exit(12),
         };
-        let packet = reply_serial(Reader::new(reply.bytes(&mut buffer)), reply.handles.len());
+        let packet_len = reply.bytes(&mut buffer).len();
+        let packet = reply_serial(Reader::new(&buffer[..packet_len]), reply.handles.len());
         // A real command reply follows main's slots0/outgoing-settled
         // proof. Take unexpected caps before any subsequent SVC.
         assert!(slots.iter().all(|slot| slot.load(Ordering::Acquire) == 0));
         retain(&mut reply.handles, &slots);
         let serial = shared.serial();
+        let mut initial_kind = None;
         let outcome = match shared.claim(serial) {
             Claim::Owned(command, raw) => {
-                let expected = match command {
-                    Command::Replace { label, .. } => (0, label, serial),
-                    Command::Refresh => (1, 0, serial),
-                    Command::Idle => (u32::MAX, 0, serial),
-                };
-                if packet != Ok(expected) {
-                    Outcome {
-                        raw,
-                        status: Status::BadSize.code(),
-                        acknowledged: false,
-                        reply_slots: slots.as_ptr() as u64,
-                    }
+                if matches!(command, Command::InitialProof { .. }) {
+                    let (outcome, kind) =
+                        initial_proof(command, serial, raw, &slots, &mut buffer, packet_len);
+                    initial_kind = Some(kind);
+                    outcome
                 } else {
-                    match command {
-                        Command::Replace { ticket, .. } => {
-                            replace(&init, ticket, raw, &slots, &mut buffer)
+                    let expected = match command {
+                        Command::Replace { label, .. } => (0, label, serial),
+                        Command::Refresh => (1, 0, serial),
+                        Command::Idle => (u32::MAX, 0, serial),
+                        Command::InitialProof { .. } => unreachable!(),
+                    };
+                    if packet != Ok(expected) {
+                        Outcome {
+                            raw,
+                            status: Status::BadSize.code(),
+                            acknowledged: false,
+                            reply_slots: slots.as_ptr() as u64,
                         }
-                        Command::Refresh => refresh(&init, &slots, &mut buffer),
-                        Command::Idle => unreachable!("an idle command cannot be published"),
+                    } else {
+                        match command {
+                            Command::Replace { ticket, .. } => {
+                                replace(&init, ticket, raw, &slots, &mut buffer)
+                            }
+                            Command::Refresh => refresh(&init, &slots, &mut buffer),
+                            Command::Idle => unreachable!("an idle command cannot be published"),
+                            Command::InitialProof { .. } => unreachable!(),
+                        }
                     }
                 }
             }
-            Claim::Cancelled => Outcome {
-                raw: shared.raw(),
-                status: Status::Kernel(abi::Error::Interrupted).code(),
-                acknowledged: false,
-                reply_slots: slots.as_ptr() as u64,
-            },
+            Claim::Cancelled => {
+                // SAFETY: the canceled command remains immutable while parked.
+                if matches!(unsafe { shared.command() }, Command::InitialProof { .. }) {
+                    initial_kind = shared.raw_kind(serial);
+                }
+                Outcome {
+                    raw: shared.raw(),
+                    status: Status::Kernel(abi::Error::Interrupted).code(),
+                    acknowledged: false,
+                    reply_slots: slots.as_ptr() as u64,
+                }
+            }
             // Main never answers without a published command. Ending the
             // whole service releases its table; no isolated lost owner.
             Claim::Stale => sys::process_exit(13),
         };
-        assert!(shared.complete(serial, outcome));
+        assert!(if let Some(kind) = initial_kind {
+            shared.complete_initial(serial, outcome, kind)
+        } else {
+            shared.complete(serial, outcome)
+        });
         completion.serial = serial;
         completion.status = outcome.status;
     }

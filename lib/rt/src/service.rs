@@ -230,6 +230,22 @@ impl Pending {
         self.label
     }
 
+    /// Move the exact token into a bounded caller-owned reply step.
+    /// The caller retains every Refused token/back and restores a returned
+    /// token before retrying; an empty Pending has no Drop reply effect.
+    pub fn take_token(&mut self) -> Option<Token> {
+        self.token.take()
+    }
+
+    /// Restore a refused token without replacing an existing owner.
+    pub fn restore_token(&mut self, token: Token) -> Result<(), Token> {
+        if self.token.is_some() {
+            return Err(token);
+        }
+        self.token = Some(token);
+        Ok(())
+    }
+
     /// Replies `bytes`, the status first, and `handles`, as
     /// Token::reply_handles; when the kernel refused the reply before it
     /// reached the request, the client gets the error as its status.

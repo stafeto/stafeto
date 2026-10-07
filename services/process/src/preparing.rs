@@ -39,6 +39,18 @@ impl<R, S, E, I> RecordWork<R, S, E, I> {
             Self::Replacing(_) | Self::Ending(_) | Self::Initial(_) => None,
         }
     }
+    pub fn initial(&self) -> Option<&I> {
+        match self {
+            Self::Initial(value) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn initial_mut(&mut self) -> Option<&mut I> {
+        match self {
+            Self::Initial(value) => Some(value),
+            _ => None,
+        }
+    }
     pub fn take_replacing(slot: &mut Option<Self>) -> Option<R> {
         if !matches!(slot, Some(Self::Replacing(_))) {
             return None;

@@ -18,6 +18,7 @@ pub(super) enum Phase {
     Publish,
     Waiting,
     Drain,
+    ReadInitialProof,
     CheckRaw,
     CloseRaw,
     CheckFiles,
@@ -182,12 +183,59 @@ impl Processes {
             }
             return;
         }
+        if matches!(self.replacer.phase, Phase::Duplicate | Phase::Publish)
+            && let Command::InitialProof { index, .. } = unsafe { SHARED.command() }
+            && self.replacing[usize::from(index)]
+                .as_ref()
+                .and_then(Work::initial)
+                .and_then(|resident| resident.pending_stage())
+                .is_none()
+        {
+            let serial = SHARED.serial();
+            if SHARED.idle() {
+                // SAFETY: the old genuine Pending still proves parking.
+                unsafe {
+                    SHARED.publish(SHARED.command(), serial, SHARED.raw());
+                }
+                assert!(SHARED.cancel(serial));
+                self.replacer.cursor = 0;
+                self.replacer.phase = Phase::Drain;
+            } else {
+                self.replacer.reap = true;
+            }
+            return;
+        }
         match self.replacer.phase {
             Phase::Idle => {
                 if self.replacer.pending.is_none() {
                     return;
                 }
                 if let Some(index) = self.replace_queue.pop() {
+                    if let Some(resident) = self.replacing[index].as_ref().and_then(Work::initial) {
+                        let Some((epoch, ..)) = resident.pending_stage() else {
+                            return;
+                        };
+                        let Some((label, proto_process::Place::Work, 1)) =
+                            proto_process::Label::parse_image(resident.key.label)
+                        else {
+                            return;
+                        };
+                        let command = Command::InitialProof {
+                            index: label.index,
+                            generation: label.generation,
+                            ticket: resident.key.ticket,
+                            epoch,
+                        };
+                        let Some(serial) = self.replacer.prepay() else {
+                            return;
+                        };
+                        // SAFETY: the exact retained parked worker and settled prior owners.
+                        unsafe {
+                            SHARED.stage(command, serial);
+                        }
+                        self.replacer.phase = Phase::Duplicate;
+                        return;
+                    }
                     let Some(work) = self.replacing[index].as_ref().and_then(Work::replacing)
                     else {
                         return;
@@ -236,6 +284,41 @@ impl Processes {
                 }
             }
             Phase::Duplicate => {
+                if let Command::InitialProof {
+                    index,
+                    generation,
+                    ticket,
+                    epoch,
+                } = unsafe { SHARED.command() }
+                {
+                    let label = proto_process::Label { index, generation };
+                    let Some(resident) = self.replacing[usize::from(index)]
+                        .as_ref()
+                        .and_then(Work::initial)
+                    else {
+                        return;
+                    };
+                    if resident.key.label != label.raw_at(1)
+                        || resident.key.ticket != ticket
+                        || resident.pending_stage().map(|value| value.0) != Some(epoch)
+                    {
+                        return;
+                    }
+                    use posix_process_service::initial_resident::CleanupOwner;
+                    let Some(CleanupOwner::Channel(candidate)) = resident.cleanup[0].as_ref()
+                    else {
+                        return;
+                    };
+                    if let Ok(copy) =
+                        sys::handle_duplicate(candidate, abi::Rights::SEND | abi::Rights::TRANSFER)
+                    {
+                        unsafe {
+                            SHARED.main_raw(copy.into_raw().0);
+                        }
+                        self.replacer.phase = Phase::Publish;
+                    }
+                    return;
+                }
                 let Command::Replace {
                     index,
                     label,
@@ -273,6 +356,73 @@ impl Processes {
                 }
             }
             Phase::Publish => {
+                if let Command::InitialProof { index, .. } = unsafe { SHARED.command() } {
+                    let Some(resident) = self.replacing[usize::from(index)]
+                        .as_ref()
+                        .and_then(Work::initial)
+                    else {
+                        return;
+                    };
+                    let Some((epoch, uid, gid, mode)) = resident.pending_stage() else {
+                        return;
+                    };
+                    let Some(files) = self.files.as_ref() else {
+                        return;
+                    };
+                    let stage = proto_process::initial_stage::Stage {
+                        epoch,
+                        ticket: resident.key.ticket,
+                        label: resident.key.label,
+                        source: resident.publication.source,
+                        query: proto_process::initial_identity::Query {
+                            receipt: resident.publication.map.receipt,
+                        },
+                        uid,
+                        gid,
+                        mode,
+                    };
+                    let mut wire = proto_wire::Writer::new();
+                    wire.bytes(&[0; 8])
+                        .and_then(|()| stage.write(&mut wire))
+                        .and_then(|()| wire.u64(SHARED.serial()))
+                        .and_then(|()| wire.u64(files.raw().0))
+                        .expect("fixed initial command reply");
+                    let Some(pending) = self.replacer.pending.as_mut() else {
+                        return;
+                    };
+                    let Some(token) = pending.take_token() else {
+                        return;
+                    };
+                    // Publication happens once while the worker remains parked.
+                    if SHARED.idle() {
+                        unsafe {
+                            SHARED.publish(SHARED.command(), SHARED.serial(), SHARED.raw());
+                        }
+                    }
+                    match token.reply_handles(wire.as_bytes(), rt::handle::Outgoing::new()) {
+                        Ok(()) => {
+                            self.replacer.pending.take();
+                            self.replacer.phase = Phase::Waiting;
+                        }
+                        Err(mut refused) => {
+                            assert!(
+                                refused
+                                    .back
+                                    .as_ref()
+                                    .is_none_or(rt::handle::Outgoing::is_empty)
+                            );
+                            if let Some(token) = refused.token.take() {
+                                assert!(pending.restore_token(token).is_ok());
+                                self.replacer.reap = true;
+                            } else {
+                                self.replacer.pending.take();
+                                self.replacer.phase = Phase::Waiting;
+                                self.replacer.reap = true;
+                            }
+                        }
+                    }
+                    return;
+                }
                 let Some(pending) = self.replacer.pending.take() else {
                     return;
                 };
@@ -295,13 +445,24 @@ impl Processes {
             }
             Phase::Waiting => {}
             Phase::DiscardPending => {
+                if matches!(unsafe { SHARED.command() }, Command::InitialProof { .. }) {
+                    assert!(
+                        self.replacer.ended,
+                        "genuine worker Ended permits stale token discard"
+                    );
+                    if let Some(pending) = self.replacer.pending.as_mut() {
+                        // The exact request's thread ended. Token has no Drop
+                        // syscall; removing it disarms Pending's fallback reply.
+                        pending.take_token();
+                    }
+                }
                 drop(self.replacer.pending.take());
                 self.replacer.phase = Phase::Drain;
             }
             Phase::Drain => {
                 let serial = SHARED.serial();
                 let outcome = SHARED.outcome(serial);
-                let pointer = outcome.map_or(0, |outcome| outcome.reply_slots);
+                let pointer = SHARED.slots(serial).unwrap_or(0);
                 if pointer != 0 && self.replacer.cursor < abi::MESSAGE_HANDLES as u8 {
                     if !replace::owns_slots(pointer) {
                         return;
@@ -319,6 +480,30 @@ impl Processes {
                     }
                     return;
                 }
+                if matches!(unsafe { SHARED.command() }, Command::InitialProof { .. }) {
+                    use posix_process_service::worker_control::RawKind;
+                    match SHARED.raw_kind(serial).expect("the current initial serial") {
+                        RawKind::ProofBuffer if !self.replacer.ended => {
+                            self.replacer.phase = Phase::ReadInitialProof
+                        }
+                        RawKind::ProofBuffer | RawKind::ProofPublishing => {
+                            // Genuine Ended forbids reading/closing a proof pointer.
+                            unsafe {
+                                SHARED.main_raw(0);
+                            }
+                            self.replacer.phase = Phase::Finish;
+                        }
+                        RawKind::Empty => self.replacer.phase = Phase::Finish,
+                        RawKind::Capability => {
+                            self.replacer.phase = if self.replacer.ended {
+                                Phase::CheckRaw
+                            } else {
+                                Phase::CloseRaw
+                            }
+                        }
+                    }
+                    return;
+                }
                 self.replacer.phase = if SHARED.raw() != 0 {
                     match unsafe { SHARED.command() } {
                         Command::Refresh if outcome.is_some_and(|outcome| outcome.acknowledged) => {
@@ -331,9 +516,95 @@ impl Processes {
                     Phase::Finish
                 };
             }
+            Phase::ReadInitialProof => {
+                let pointer = SHARED.raw();
+                if self.replacer.pending.is_none()
+                    || self.replacer.ended
+                    || !replace::owns_proof(pointer)
+                {
+                    return;
+                }
+                // SAFETY: genuine retained Completion and checked STACK120
+                // protect the worker buffer until this CPU-only read ends.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        pointer as *const u8,
+                        proto_process::initial_stage::PROOF,
+                    )
+                };
+                let proof = proto_process::initial_stage::Proof::read(bytes, 0)
+                    .expect("the published canonical source proof");
+                let Command::InitialProof {
+                    index,
+                    generation,
+                    ticket,
+                    epoch,
+                } = (unsafe { SHARED.command() })
+                else {
+                    unreachable!()
+                };
+                let label = proto_process::Label { index, generation };
+                let index = usize::from(index);
+                if let Some(resident) = self
+                    .replacing
+                    .get_mut(index)
+                    .and_then(Option::as_mut)
+                    .and_then(Work::initial_mut)
+                {
+                    let matches = resident.key.label == label.raw_at(1)
+                        && resident.key.ticket == ticket
+                        && resident.pending_stage()
+                            == Some((epoch, proof.stage.uid, proof.stage.gid, proof.stage.mode))
+                        && resident.publication.source == proof.stage.source
+                        && resident.publication.map.receipt == proof.stage.query.receipt
+                        && proof.stage.label == label.raw_at(1)
+                        && proof.stage.ticket == ticket
+                        && proof.stage.epoch == epoch;
+                    if matches
+                        && self.records.get(index).is_some_and(|record| {
+                            record.label == label
+                                && record.image == 1
+                                && record.state == crate::State::Loading
+                                && record.active_exec.is_none()
+                        })
+                    {
+                        use posix_process_service::initial_resident::{CleanupOwner, SeedKey};
+                        if matches!(resident.cleanup[0], Some(CleanupOwner::Channel(_))) {
+                            assert!(resident.authenticated_stage(
+                                SeedKey {
+                                    epoch,
+                                    ticket,
+                                    label: label.raw_at(1)
+                                },
+                                proof.source_label
+                            ));
+                            let Some(CleanupOwner::Channel(candidate)) = resident.cleanup[0].take()
+                            else {
+                                unreachable!()
+                            };
+                            let record = self
+                                .records
+                                .get_mut(index)
+                                .expect("the exact initial record");
+                            record.active_exec = Some(candidate);
+                            record.active_guard_label = proof.source_label;
+                        }
+                    }
+                }
+                // The proof is a byte view; no owned cap is created here.
+                unsafe {
+                    SHARED.main_raw(0);
+                }
+                self.replacer.phase = Phase::Finish;
+            }
             Phase::CheckRaw => {
                 let raw = SHARED.raw();
-                match raw_info(raw, abi::INFO_PROCESS_STATE) {
+                let kind = if matches!(unsafe { SHARED.command() }, Command::InitialProof { .. }) {
+                    abi::INFO_CHANNEL
+                } else {
+                    abi::INFO_PROCESS_STATE
+                };
+                match raw_info(raw, kind) {
                     Ok(_) => self.replacer.phase = Phase::CloseRaw,
                     Err(abi::Error::BadHandle) => {
                         // Genuine full-generation NotFound means consumed,
@@ -416,6 +687,7 @@ impl Processes {
                     }
                     Command::Refresh => {}
                     Command::Idle => {}
+                    Command::InitialProof { .. } => {}
                 }
                 // SAFETY: actual parked completion or genuine Ended is
                 // retained, and all slots/raw owners are settled above.
@@ -473,3 +745,6 @@ impl Processes {
         }
     }
 }
+
+const _: [(); 24] = [(); core::mem::size_of::<Command>()];
+const _: [(); 56] = [(); core::mem::size_of::<Shared>()];

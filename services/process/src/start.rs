@@ -846,19 +846,15 @@ impl Processes {
                 Some(refused.error)
             }
         };
-        if failure.is_none() {
+        if let Some(error) = failure {
+            work.cancel(key, Status::Kernel(error).code(), true);
+        } else {
             assert!(work.cancel(key, 0, false));
             assert!(work.finish_cleanup(key));
             // Every owner has crossed its transfer or close boundary. The
             // empty slot becomes available before the next request dispatch.
             self.replacing[index] = None;
             self.preparing_count -= 1;
-        } else {
-            work.cancel(
-                key,
-                Status::Kernel(failure.expect("the refused reply")).code(),
-                true,
-            );
         }
         self.publish_groups(index);
         Ok(())

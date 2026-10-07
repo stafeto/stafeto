@@ -13,6 +13,12 @@ use proto_wire::{Reader, Status, Writer};
 pub enum Command {
     Idle,
     Refresh,
+    InitialProof {
+        index: u16,
+        generation: u32,
+        ticket: u64,
+        epoch: u64,
+    },
     Replace {
         index: u16,
         label: u64,
@@ -27,6 +33,31 @@ const CLAIMED: u64 = 2;
 const CANCELLED: u64 = 3;
 const OUTCOME: u64 = 4;
 const ACK: u64 = 1 << 8;
+const KIND_SHIFT: u32 = 9;
+const KIND_MASK: u64 = 3 << KIND_SHIFT;
+
+/// InitialProof raw custody is distinct from the worker publication phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum RawKind {
+    Empty = 0,
+    Capability = 1,
+    ProofPublishing = 2,
+    ProofBuffer = 3,
+}
+impl RawKind {
+    fn state(self) -> u64 {
+        (self as u64) << KIND_SHIFT
+    }
+    fn read(state: u64) -> Self {
+        match (state & KIND_MASK) >> KIND_SHIFT {
+            0 => Self::Empty,
+            1 => Self::Capability,
+            2 => Self::ProofPublishing,
+            _ => Self::ProofBuffer,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Outcome {
@@ -90,6 +121,9 @@ pub fn command_reply(command: Command, serial: u64) -> Writer {
         Command::Replace { label, .. } => (0, label),
         Command::Refresh => (1, 0),
         Command::Idle => unreachable!("idle has no command reply"),
+        Command::InitialProof { .. } => {
+            unreachable!("initial proof has its retained 120-byte reply")
+        }
     };
     writer
         .u32(0)
@@ -186,39 +220,159 @@ impl Shared {
         self.raw.store(raw, Ordering::Relaxed);
         self.reply_slots.store(0, Ordering::Relaxed);
         self.serial.store(serial, Ordering::Relaxed);
-        self.state.store(MAIN, Ordering::Release);
+        let kind = if matches!(command, Command::InitialProof { .. }) && raw != 0 {
+            RawKind::Capability.state()
+        } else {
+            0
+        };
+        self.state.store(MAIN | kind, Ordering::Release);
     }
 
     pub fn claim(&self, serial: u64) -> Claim {
         if self.serial() != serial {
             return Claim::Stale;
         }
-        match self
-            .state
-            .compare_exchange(MAIN, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
-        {
+        let state = self.state.load(Ordering::Acquire);
+        let phase = state & 0xff;
+        if phase == CANCELLED {
+            return Claim::Cancelled;
+        }
+        if phase != MAIN {
+            return Claim::Stale;
+        }
+        match self.state.compare_exchange(
+            state,
+            CLAIMED | (state & KIND_MASK),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => {
-                // SAFETY: claim wins against cancel. Main cannot rewrite
-                // command until the worker's next real parked request.
+                // SAFETY: claim wins against cancel; command cannot be rearmed.
                 let command = unsafe { *self.command.get() };
                 Claim::Owned(command, self.raw.load(Ordering::Acquire))
             }
-            Err(CANCELLED) => Claim::Cancelled,
+            Err(value) if value & 0xff == CANCELLED => Claim::Cancelled,
             Err(_) => Claim::Stale,
         }
     }
 
     pub fn cancel(&self, serial: u64) -> bool {
-        self.serial() == serial
+        if self.serial() != serial {
+            return false;
+        }
+        let state = self.state.load(Ordering::Acquire);
+        state & 0xff == MAIN
             && self
                 .state
-                .compare_exchange(MAIN, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    state,
+                    CANCELLED | (state & KIND_MASK),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
+    }
+
+    /// Read custody even after genuine Ended interrupted Outcome publication.
+    pub fn raw_kind(&self, serial: u64) -> Option<RawKind> {
+        (self.serial() == serial).then(|| RawKind::read(self.state.load(Ordering::Acquire)))
+    }
+
+    /// Publish stable cap slots before the first InitialProof Send.
+    pub fn initial_slots(&self, serial: u64, pointer: u64) -> bool {
+        if self.serial() != serial
+            || self.state.load(Ordering::Acquire) & 0xff != CLAIMED
+            || pointer == 0
+        {
+            return false;
+        }
+        // SAFETY: a claimed command is immutable until parked/Ended reset.
+        if !matches!(unsafe { *self.command.get() }, Command::InitialProof { .. }) {
+            return false;
+        }
+        self.reply_slots.store(pointer, Ordering::Release);
+        true
+    }
+
+    pub fn slots(&self, serial: u64) -> Option<u64> {
+        (self.serial() == serial).then(|| self.reply_slots.load(Ordering::Acquire))
+    }
+
+    /// Disarm capability interpretation before any proof pointer store.
+    /// The caller has validated the consumed Send and canonical proof.
+    pub fn begin_proof(&self, serial: u64) -> bool {
+        if self.serial() != serial {
+            return false;
+        }
+        // SAFETY: the worker's claimed command remains immutable.
+        if !matches!(unsafe { *self.command.get() }, Command::InitialProof { .. }) {
+            return false;
+        }
+        let state = self.state.load(Ordering::Acquire);
+        state & 0xff == CLAIMED
+            && self
+                .state
+                .compare_exchange(
+                    state,
+                    CLAIMED | RawKind::ProofPublishing.state(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+    }
+
+    pub fn complete_initial(&self, serial: u64, outcome: Outcome, kind: RawKind) -> bool {
+        if self.serial() != serial {
+            return false;
+        }
+        let state = self.state.load(Ordering::Acquire);
+        let phase = state & 0xff;
+        // SAFETY: command remains immutable throughout a claim.
+        if !matches!(unsafe { *self.command.get() }, Command::InitialProof { .. }) {
+            return false;
+        }
+        if phase != CLAIMED && phase != CANCELLED {
+            return false;
+        }
+        if kind == RawKind::ProofPublishing {
+            return false;
+        }
+        let success = kind == RawKind::ProofBuffer;
+        if success {
+            if phase != CLAIMED
+                || RawKind::read(state) != RawKind::ProofPublishing
+                || !outcome.acknowledged
+                || outcome.status != 0
+                || outcome.raw == 0
+            {
+                return false;
+            }
+        } else if outcome.acknowledged || (kind == RawKind::Empty) != (outcome.raw == 0) {
+            return false;
+        }
+        if phase == CANCELLED && (kind != RawKind::read(state) || outcome.raw != self.raw()) {
+            return false;
+        }
+        self.raw.store(outcome.raw, Ordering::Relaxed);
+        self.reply_slots
+            .store(outcome.reply_slots, Ordering::Relaxed);
+        self.state.store(
+            OUTCOME
+                | kind.state()
+                | (u64::from(outcome.status) << 32)
+                | if success { ACK } else { 0 },
+            Ordering::Release,
+        );
+        true
     }
 
     /// Called by the worker after Send, or after observing cancellation.
     /// Every unexpected reply cap is already in stable STACK slots.
     pub fn complete(&self, serial: u64, outcome: Outcome) -> bool {
+        // SAFETY: only claimed immutable commands reach completion.
+        if matches!(unsafe { *self.command.get() }, Command::InitialProof { .. }) {
+            return false;
+        }
         if self.serial() != serial || outcome.acknowledged && outcome.status != 0 {
             return false;
         }
@@ -277,6 +431,73 @@ impl Default for Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn initial_command() -> Command {
+        Command::InitialProof {
+            index: 3,
+            generation: u32::MAX,
+            ticket: 29,
+            epoch: 37,
+        }
+    }
+    #[test]
+    fn initial_raw_end_boundaries_preserve_discriminator_and_slots() {
+        let shared = Shared::new();
+        unsafe {
+            shared.publish(initial_command(), 17, 0x1234);
+        }
+        assert_eq!(shared.raw_kind(17), Some(RawKind::Capability));
+        assert_eq!(shared.claim(17), Claim::Owned(initial_command(), 0x1234));
+        assert!(shared.initial_slots(17, 0x4000));
+        assert_eq!(shared.slots(17), Some(0x4000));
+        assert!(shared.begin_proof(17));
+        assert_eq!(shared.raw_kind(17), Some(RawKind::ProofPublishing));
+        assert!(shared.outcome(17).is_none());
+        let outcome = Outcome {
+            raw: 0x5000,
+            status: 0,
+            acknowledged: true,
+            reply_slots: 0x4000,
+        };
+        assert!(!shared.complete(17, outcome));
+        assert!(shared.complete_initial(17, outcome, RawKind::ProofBuffer));
+        assert_eq!(shared.raw_kind(17), Some(RawKind::ProofBuffer));
+        assert_eq!(shared.outcome(17), Some(outcome));
+        assert!(shared.raw_kind(18).is_none());
+    }
+    #[test]
+    fn initial_cancel_and_consumed_error_never_publish_proof() {
+        let shared = Shared::new();
+        unsafe {
+            shared.publish(initial_command(), 17, 0x1234);
+        }
+        assert!(shared.cancel(17));
+        assert_eq!(shared.claim(17), Claim::Cancelled);
+        assert_eq!(shared.raw_kind(17), Some(RawKind::Capability));
+        assert!(!shared.begin_proof(17));
+        let canceled = Outcome {
+            raw: 0x1234,
+            status: 19,
+            acknowledged: false,
+            reply_slots: 0,
+        };
+        assert!(shared.complete_initial(17, canceled, RawKind::Capability));
+        unsafe {
+            assert!(shared.reset(17));
+            shared.publish(initial_command(), 18, 0x5678);
+        }
+        assert!(matches!(shared.claim(18), Claim::Owned(..)));
+        let consumed = Outcome {
+            raw: 0,
+            status: 19,
+            acknowledged: false,
+            reply_slots: 0x4000,
+        };
+        assert!(!shared.complete_initial(18, consumed, RawKind::ProofBuffer));
+        assert!(shared.complete_initial(18, consumed, RawKind::Empty));
+        assert_eq!(shared.raw_kind(18), Some(RawKind::Empty));
+        assert!(!shared.outcome(18).unwrap().acknowledged);
+    }
+
     fn command() -> Command {
         Command::Replace {
             index: 2,

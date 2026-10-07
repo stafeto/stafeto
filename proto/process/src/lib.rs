@@ -198,6 +198,7 @@ pub const VERSION: u16 = 12;
 
 mod executable;
 pub mod initial_identity;
+pub mod initial_stage;
 mod limits;
 mod retained;
 pub use executable::{ExecKind, StageExec, StageReceipt};
