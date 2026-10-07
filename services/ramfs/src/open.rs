@@ -791,7 +791,17 @@ mod concurrent_create_retry_tests {
         interleaved_creates(false);
     }
 
+    #[cfg(feature = "full-capacity-probe")]
+    #[test]
+    fn stale_create_can_leave_paid_inode_gc_after_all_preparations_end() {
+        interleaved_with_reclamation(true, false);
+    }
+
     fn interleaved_creates(fully_prepared: bool) {
+        interleaved_with_reclamation(fully_prepared, true);
+    }
+
+    fn interleaved_with_reclamation(fully_prepared: bool, drain_before_retry: bool) {
         let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
         let identities = [
             Identity {
@@ -879,12 +889,17 @@ mod concurrent_create_retry_tests {
         assert_eq!(charges, paid);
         assert_eq!(ram.storage.preparations_used(), 2);
         assert_eq!(ram.open_descriptions(), 1);
-        for _ in 0..20_000 {
-            if !ram.storage.reclaim_step() {
-                break;
+        if drain_before_retry {
+            for _ in 0..20_000 {
+                if !ram.storage.reclaim_step() {
+                    break;
+                }
             }
         }
-        assert_eq!(ram.storage.usage(roots[1]).inodes, 0);
+        assert_eq!(
+            ram.storage.usage(roots[1]).inodes,
+            u16::from(!drain_before_retry)
+        );
         assert_eq!(ram.storage.usage(roots[1]).descriptions, 0);
         resolve(&mut ram, &mut resolvers[1], identities[1]);
         loop {
@@ -907,7 +922,7 @@ mod concurrent_create_retry_tests {
         let refreshed = resolvers[1]
             .result_proof(&ram.storage, identities[1], Intent::Open { flags })
             .unwrap();
-        journals[1]
+        let held_b = journals[1]
             .commit(
                 &mut ram,
                 &mut sessions[1],
@@ -941,7 +956,53 @@ mod concurrent_create_retry_tests {
                 (node.uid, node.gid, node.mode, node.links),
                 (identities[i].uid, identities[i].gid, 0o600, 1)
             );
-            assert_eq!(ram.storage.usage(roots[i]).inodes, 1);
+            assert_eq!(
+                ram.storage.usage(roots[i]).inodes,
+                1 + u16::from(i == 1 && !drain_before_retry)
+            );
+            #[cfg(feature = "full-capacity-probe")]
+            if i == 1 && !drain_before_retry {
+                ram.publish_open(&mut sessions[1], held_b).unwrap();
+                ram.storage.release_preparation(charges[1]);
+                for resolver in resolvers {
+                    resolver.release(&mut ram.storage);
+                }
+                let before = ram.storage.usage(roots[1]);
+                assert_eq!(
+                    (
+                        before.inodes,
+                        before.dentries,
+                        before.pages,
+                        before.descriptions
+                    ),
+                    (2, 1, 0, 1)
+                );
+                assert_eq!(ram.storage.preparations_used(), 0);
+                assert_eq!(ram.storage.available().pages, crate::storage::PAGES as u16);
+                assert!(ram.storage.reclamation_pending());
+                for _ in 0..20_000 {
+                    if !ram.storage.reclaim_step() {
+                        break;
+                    }
+                }
+                let after = ram.storage.usage(roots[1]);
+                assert_eq!(
+                    (
+                        after.inodes,
+                        after.dentries,
+                        after.pages,
+                        after.descriptions
+                    ),
+                    (1, 1, 0, 1)
+                );
+                assert_eq!(ram.storage.preparations_used(), 0);
+                assert_eq!(ram.storage.available().pages, crate::storage::PAGES as u16);
+                assert!(!ram.storage.reclamation_pending());
+                assert_eq!(ram.storage.lookup(tmp, b"concurrent-b"), Ok(token));
+                ram.release(&mut sessions[1]);
+                return;
+            }
+            let _ = held_b;
             journals[i]
                 .cancel(&mut ram, &mut sessions[i], &mut charges[i])
                 .unwrap();
