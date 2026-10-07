@@ -9,12 +9,23 @@
 //! is checked by the new credentials, as the generation was raised
 //! before `setuid` was answered.
 
-use proto_process::{Credentials, RECORDS, WhoReply};
+#[cfg(test)]
+use proto_process::RECORDS;
+use proto_process::{Credentials, WhoReply};
 
 /// What Vouch said of a client: its PID, credentials and their generation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Known {
-    answer: Option<WhoReply>,
+    answer: Option<Answer>,
+}
+
+// This cache needs no Loader, limits, groups or terminal payload.
+#[derive(Clone, Copy, Debug)]
+struct Answer {
+    pid: u32,
+    index: u32,
+    credentials: Credentials,
+    generation: u64,
 }
 
 impl Known {
@@ -32,11 +43,16 @@ impl Known {
         ask: impl FnOnce() -> Option<WhoReply>,
     ) -> Option<Credentials> {
         if let Some(known) = self.answer
-            && generation(known.pid as usize % RECORDS) == known.generation
+            && generation(known.index as usize) == known.generation
         {
             return Some(known.credentials);
         }
-        self.answer = ask();
+        self.answer = ask().map(|who| Answer {
+            pid: who.pid,
+            index: who.index,
+            credentials: who.credentials,
+            generation: who.generation,
+        });
         self.answer.map(|known| known.credentials)
     }
 
@@ -59,8 +75,15 @@ mod tests {
             credentials,
             generation,
             loader: None,
-            index: 0,
+            index: 300 % RECORDS as u32,
             ctty: None,
+            image: 1,
+            groups: proto_process::Groups::EMPTY,
+            limits: proto_process::ResourceLimits::initial(2 * 1024 * 1024),
+            root: proto_process::ExpenditureRoot {
+                pid: 2,
+                generation: 1,
+            },
         }
     }
 

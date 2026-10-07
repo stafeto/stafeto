@@ -375,6 +375,10 @@ pub const IMAGES: &[&str] = &[
 pub fn files_of(name: &str) -> Vec<RootFile> {
     match name {
         "boot-ramfs.img" => ramfs(),
+        "boot-ramfs-cleanup.img" | "boot-loader-abort.img" | "boot-loader-abort-steps.img" => vec![
+            dir("/bin"),
+            file("/bin/posix-files", 0o755, ROOT, "posix-files"),
+        ],
         "boot-ash-dialog.img" => dialog(),
         "boot-posix-procs.img" | "boot-posix-jobs.img" => procs(),
         "boot-posix-poll.img" => {

@@ -339,13 +339,6 @@ fn main(_: u64) -> u64 {
     let _ = rt::service::run::<Processes, SESSIONS, 0>(&channel, owner, config);
     5
 }
-fn status(result: Result<(), posix_credentials::Error>) -> Status {
-    Status::from_code(match result {
-        Ok(()) => 0,
-        Err(posix_credentials::Error::Invalid) => proto_process::INVALID,
-        Err(posix_credentials::Error::Permission) => proto_process::PERMISSION,
-    })
-}
 fn snapshot(r: &mut Request<'_>, record: &Record<Handle<Process>>) {
     let w = r.reply();
     w.u32(0)
@@ -397,6 +390,10 @@ impl Processes {
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::FULL);
         };
+        if !self.generations.room(usize::from(label.index), 1) {
+            self.records.retire_next(label);
+            return refuse(proto_process::FULL);
+        }
         let place = records::exit_place(label, &create, self.level);
         let made = sys::handle_label(&self.channel, Rights::NOTIFY, place.label, place.slot)
             .and_then(|exit| {
@@ -432,6 +429,7 @@ impl Processes {
         );
         if let Some(record) = self.records.get_mut(index) {
             record.quota = create.quota;
+            record.limits = proto_process::ResourceLimits::initial(create.quota);
             record.handle_limit = create.handle_limit;
         }
         self.witnesses[index] = Some(witness);
@@ -792,6 +790,9 @@ impl Processes {
             }
             return self.terminal_request(method, r);
         }
+        if method == Method::RetainedLoader as u16 {
+            return self.retained_loader(r);
+        }
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
@@ -825,13 +826,17 @@ impl Processes {
             return refuse(proto_process::PERMISSION);
         };
         let record = self.records.get(index).expect("a vouched record");
-        let who = proto_process::WhoReply {
+        let who = proto_process::Vouch {
             pid: record.label.pid(),
             credentials: record.credentials,
             generation: self.generations.get(index),
             loader,
             index: index as u32,
             ctty: record.ctty,
+            image: loader.map_or(record.image, |l| l.image),
+            groups: &record.groups,
+            limits: &record.limits,
+            root: record.root,
         };
         if who.write(r.reply()).is_err() {
             return Answer::Status(Status::BadSize);
@@ -866,8 +871,77 @@ impl Processes {
                 let (_, _, named) = Label::parse_image(label)?;
                 (named == image).then_some((index, Some(LoaderOf { image, ticket })))
             }
-            _ => Some((self.records.find_identity(label)?, None)),
+            _ => {
+                let index = self.records.find_identity(label)?;
+                (!matches!(self.records.get(index)?.state, State::Zombie(_)))
+                    .then_some((index, None))
+            }
         }
+    }
+
+    fn retained_loader(&mut self, r: &mut Request<'_>) -> Answer {
+        let Ok(expected) = proto_process::RetainedLoader::read(r.body()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(identity) = r.handles.take::<Channel>(0) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let Ok(label) = sys::copy_label(&self.identities, &identity) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let Some((named, Place::Loader, image)) = Label::parse_image(label) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let Some(index) = self.records.find_loader(label) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let record = self.records.get(index).expect("an exact retained record");
+        if expected.pid != named.pid()
+            || expected.index as usize != index
+            || expected.image != image
+            || expected.root != record.root
+            || matches!(record.state, State::Zombie(_))
+            || self.generations.get(index) & proto_process::GENERATION_DEAD != 0
+        {
+            return refuse(proto_process::PERMISSION);
+        }
+        let Some(state) = self.loaders.retained(
+            index,
+            image,
+            expected.ticket,
+            record.image,
+            record.committed_loader_ticket,
+            record.state == State::Alive,
+        ) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let who = proto_process::Vouch {
+            pid: record.label.pid(),
+            credentials: record.credentials,
+            generation: self.generations.get(index),
+            loader: Some(LoaderOf {
+                image,
+                ticket: expected.ticket,
+            }),
+            index: index as u32,
+            ctty: record.ctty,
+            image,
+            groups: &record.groups,
+            limits: &record.limits,
+            root: record.root,
+        };
+        if r.reply()
+            .u32(0)
+            .and_then(|()| r.reply().u32(state as u32))
+            .and_then(|()| who.write(r.reply()))
+            .is_err()
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
     }
 
     /// Router of the record in `index`: one thread handle with MANAGE, the
@@ -1282,6 +1356,9 @@ impl Processes {
                 return refuse(proto_process::PERMISSION);
             }
             let leader = pid == record.sid;
+            if !self.generations.live_room(index, 1) {
+                return refuse(proto_process::AGAIN);
+            }
             self.records.get_mut(index).expect("caller").ctty = None;
             self.generations.raise(index);
             if leader {
@@ -1307,6 +1384,11 @@ impl Processes {
                 return Answer::Status(Status::BadSize);
             };
             let records = &self.records;
+            if let Some(index) = records.find_pid(sid)
+                && !self.generations.live_room(index, 1)
+            {
+                return refuse(proto_process::AGAIN);
+            }
             let lives = |sid: u32| {
                 records.find_pid(sid).is_some_and(|i| {
                     records.get(i).is_some_and(|r| {
@@ -1538,6 +1620,9 @@ impl Processes {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
+        if !self.generations.live_room(index, 1) {
+            return refuse(proto_process::AGAIN);
+        }
         match self.records.set_sid(index) {
             Ok(sid) => {
                 self.generations.raise(index);
@@ -1697,6 +1782,10 @@ impl Processes {
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::AGAIN);
         };
+        if !self.generations.room(usize::from(label.index), 4) {
+            self.records.retire_next(label);
+            return refuse(proto_process::AGAIN);
+        }
         let Some(join) = self
             .records
             .joining(index, birth.flags, birth.pgroup, label.pid())
@@ -1834,6 +1923,7 @@ impl Processes {
         if self.loaders.of(index).is_some()
             || !self.loaders.room_for(index)
             || record.tried >= proto_process::IMAGE_MAX
+            || !self.generations.live_room(index, 3)
         {
             return refuse(proto_process::AGAIN);
         }
@@ -1922,6 +2012,9 @@ impl Processes {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
+        if !self.generations.live_room(index, 2) {
+            return refuse(proto_process::AGAIN);
+        }
         let exec = self
             .loaders
             .of(index)
@@ -1934,6 +2027,7 @@ impl Processes {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
         let slot = self.loaders.of(index).expect("an exec's place");
+        let committed_ticket = self.loaders.ticket(slot);
         let place = self.loaders.get_mut(slot).expect("a place");
         let image = place.image;
         let incoming = place.held.incoming.take().expect("the new process");
@@ -1947,6 +2041,7 @@ impl Processes {
         let old = core::mem::replace(&mut record.process, incoming);
         let ceiling = record.ceiling;
         record.image = image;
+        record.committed_loader_ticket = committed_ticket;
         record.execed = true;
         let mut credentials = loaders::child_credentials(record.credentials, 0);
         if let Some(ids) = set_id {
@@ -2086,6 +2181,7 @@ impl Processes {
     /// `status`. The record goes with the end of its process.
     fn abort_load(&mut self, child: usize, status: Status) {
         if let Some(place) = self.loaders.free(child) {
+            self.generations.invalidate(child);
             if let Some(start) = place.held.start {
                 let _ = start.answer(&proto_wire::reply(status), Outgoing::new());
             }
@@ -2230,8 +2326,14 @@ impl Processes {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
+        if !self.generations.live_room(child, 3) {
+            return refuse(proto_process::AGAIN);
+        }
         match self.loaders.loaded(child) {
-            Ok(()) => Answer::Status(Status::Ok),
+            Ok(()) => {
+                self.generations.invalidate(child);
+                Answer::Status(Status::Ok)
+            }
             Err(loaders::Refused) => Answer::Status(Status::Kernel(abi::Error::BadState)),
         }
     }
@@ -2242,6 +2344,9 @@ impl Processes {
     fn take(&mut self, child: usize, slot: usize, r: &mut Request<'_>) -> Answer {
         if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Ready) {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
+        if !self.generations.live_room(child, 1) {
+            return refuse(proto_process::AGAIN);
         }
         let record = self.records.get(child).expect("a ready record");
         let (label, credentials, image) = (record.label, record.credentials, record.image);
@@ -2277,6 +2382,7 @@ impl Processes {
             return Answer::Status(Status::BadSize);
         }
         self.loaders.free(child);
+        self.generations.invalidate(child);
         Answer::Reply(handles)
     }
 
@@ -2309,11 +2415,17 @@ impl Processes {
         let Some(child) = self.loading_child(index, r, fork) else {
             return refuse(proto_process::NO_PROCESS);
         };
+        if !self.generations.live_room(child, 2) {
+            return refuse(proto_process::AGAIN);
+        }
         let Ok(set_id) = self.loaders.commit(child) else {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
+        let committed_slot = self.loaders.of(child).expect("a committed place");
+        let committed_ticket = self.loaders.ticket(committed_slot);
         let record = self.records.get_mut(child).expect("a loading record");
         record.state = State::Alive;
+        record.committed_loader_ticket = committed_ticket;
         // A child of posix_spawn runs its own program from the start; one
         // of fork runs its parent's copy until it execs.
         record.execed = !fork;
@@ -2478,9 +2590,12 @@ impl Service<0> for Processes {
                 let Some(operation) = Change::from_number(operation) else {
                     return refuse(proto_process::INVALID);
                 };
-                let record = self.records.get_mut(index).expect("change process");
-                let result = posix_credentials::change(record.credentials, operation, id)
-                    .map(|next| record.credentials = next);
+                let result = self.records.change_credentials(
+                    index,
+                    operation,
+                    id,
+                    self.generations.get(index),
+                );
                 // The services that remember the credentials see the
                 // generation move before the caller's reply, so that
                 // whatever the caller sends after it returns is checked by
@@ -2488,7 +2603,7 @@ impl Service<0> for Processes {
                 if result.is_ok() {
                     self.generations.raise(index);
                 }
-                Answer::Status(status(result))
+                Answer::Status(Status::from_code(result.err().unwrap_or(0)))
             }
             n if n == Method::SpawnStart as u16 => self.spawn_start(index, r),
             n if n == Method::SpawnCommit as u16 => self.spawn_commit(index, r, false),
@@ -2561,6 +2676,7 @@ impl Service<0> for Processes {
             }
             return;
         }
+        self.generations.retire(index);
         let end = End::of(sys::process_state(&record.process).unwrap_or(abi::ProcessState::Killed))
             .unwrap_or(End::Signaled(SIGKILL));
         // A walk of the ended sender stops, and those it queued: their

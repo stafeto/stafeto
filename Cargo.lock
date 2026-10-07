@@ -366,7 +366,14 @@ dependencies = [
 name = "posix-procs"
 version = "0.1.0"
 dependencies = [
+ "posix-abi",
  "posix-crt",
+ "posix-fs",
+ "proto-fs",
+ "proto-loader",
+ "proto-process",
+ "proto-wire",
+ "rt",
 ]
 
 [[package]]
@@ -613,6 +620,27 @@ dependencies = [
  "proto-fs",
  "proto-init",
  "proto-process",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "ramfs-gc"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+ "proto-fs",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "ramfs-holder"
+version = "0.1.0"
+dependencies = [
+ "proto-fs",
+ "proto-init",
  "proto-wire",
  "rt",
 ]

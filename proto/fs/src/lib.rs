@@ -1,63 +1,59 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 2 of the RAM file service protocol. All numbers are little endian.
-//! OPEN: header, flags u32, UTF-8 absolute path bytes. Reply: status, fd u32,
-//! and for a random device (`/dev/random`, `/dev/urandom`, step 5e') a third
-//! word, RANDOM_DEVICE: the client's layer serves the reads of such a
-//! description from its own generator, and the service refuses them.
-//! READ: header, fd u32, count u32. Reply: status, count u32, bytes.
-//! WRITE: header, fd u32, bytes. Reply: status, count u32.
-//! SEEK: header, fd u32, absolute offset u32. Reply: status, offset u32.
-//! STAT: header, fd u32. Reply: status, size u32.
-//! CLOSE: header, fd u32. Reply: status alone.
-//! READ_DIR: header, index u32, UTF-8 absolute path bytes. Reply: status,
-//! kind u32 (0 at end, 1 directory, 2 file), entry name bytes.
-//! LOOKUP: header, UTF-8 absolute path bytes. Reply: status, kind u32,
-//! size u32 (directories report zero until their metadata is available).
-//! SEEK_FROM: header, fd u32, signed offset i64, origin u32. Reply:
-//! status, resulting offset u64 (at most i64::MAX). Legacy SEEK is unchanged.
-//! INFO_FD: header, fd u32. INFO_PATH: header, absolute path bytes. Replies:
-//! status and NodeInfo fields (92 bytes), without C ABI padding.
-//! READ_DIR_FD: header, fd u32. Reply: status u32, kind u32, inode u64,
-//! name bytes. At end, kind/inode are zero and name is empty. The service
-//! advances the open-description position and updates directory access time.
-//! READ_AT: header, fd u32, offset u64, count u32. Reply: status, count u32,
-//! bytes. The bytes start at the offset of the file; the position of the
-//! open description stays where it is (the model of pread).
-//! Paths are at most MAX_PATH bytes, which leaves room for the terminator
-//! within the 512 bytes of PATH_MAX.
+//! Version 5 of the bounded RAM file service. Numbers are little endian.
+//! Ordinary sessions first Bind with a genuine Process identity capability,
+//! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
+//! Init grants the named RAM diagnostic client an explicit boot profile.
+//! BindPending admits a real Loader identity and a genuine unclaimed clone;
+//! an unsuitable empty endpoint may be replaced when descriptors are optional.
+//! With require_fds=0 the offered endpoint may be omitted: only LoaderOf is sent.
+//! The returned fresh session holds a paid preparation; FinishBinding commits
+//! its captured references under the same authentic Pending image and generation.
+//! A paid RetainedLoader refresh distinguishes Loading from Handoff. Handoff
+//! preserves the exact successful target's fd/CWD/umask capture and permits only
+//! Close, cancellation, FinishBinding and genuine Bind of that target identity.
+//! File effects resume after the exact PID/index/image/root binds with loader=None.
+//! Such Bind supersedes a queued retained-loader refresh; its candidate keeps
+//! the old capability and capture for rollback on an invalid identity.
 //!
-//! OPEN_EXEC (spec 2, 3.2; 5c), only through the session of the loaders,
-//! whose label init marks with LOADERS and gives the process service
-//! alone: header, the absolute path bytes, and one handle, a copy of the
-//! loader's identity (proto_process). The service has the process service
-//! vouch for it through its notary session, and only an identity of a
-//! loader that loads passes; then in one step it resolves the path, checks
-//! search on each directory and execute on the file by the effective IDs
-//! of the record the loader loads, tells the process service the set-ID
-//! bits of the file (SetId) and replies status and one handle, the image
-//! session (SEND): a session of its own (IMAGE_SESSION) that takes
-//! READ_AT, READ_INTO and INFO_FD of fd 0 alone and reads that file.
-//! READ_INTO, through an image session alone: header, fd u32 (0), offset
-//! u64, count u32 (at most READ_INTO_MAX), the place u64 in the object
-//! (a whole page), and one handle, a memory object with MAP_READ and
-//! MAP_WRITE that holds `count` bytes from the place: the service maps it,
-//! copies the file's bytes from the offset into it and unmaps it. Reply:
-//! status, count u32, short at the end of the file. A loader fills a
-//! segment of a program this way in a few requests, where READ_AT takes
-//! one for each MAX_READ bytes. PERMISSION
-//! through any other session or for any other identity; NO_ENTRY,
-//! ACCESS_DENIED, NOT_DIRECTORY.
-//! CLONE: header, a count u32 (at most 32) and as many descriptors u32 of
-//! the session, through a session of a client: reply status and one
-//! handle, a new session (SEND, TRANSFER) of the service's own label
-//! whose descriptors of the same numbers share the open descriptions,
-//! their offsets and access modes, for a child of the client (5c); BAD_FD
-//! for a number of no descriptor.
-//! WRITE_AT: header, fd u32, offset u64, bytes. Reply: status, count u32.
-//! The bytes go at the offset of the file; the position of the open
-//! description stays where it is (the model of pwrite).
+//! ResolveStart retains raw bytes and the authenticated session's base inode.
+//! Its body is base slot u32, generation u64, real_ids u32, follow_final u32,
+//! then 1..=511 pathname bytes. Absolute paths use root. Names have 255 bytes.
+//! The reply carries a generation-tagged job u64. ResolveStep, body job u64,
+//! handles one component, up to eight dentry comparisons or one link expansion.
+//! RESOLVING asks for another step. OK leaves a proof for the final operation.
+//! ResolveSecond adds base slot/generation, follow_final and another path under
+//! one job charge. Both paths retain their bases until ResolveCancel(job u64).
+//! Loader executable proofs use a fresh genuine Pending session from BindPending.
+//! Subsequent operations use that unforgeable session and recheck its generation.
+//! Traversal, metadata or credential changes invalidate proofs; STALE_PROOF
+//! requires another ResolveStep before retrying the final operation.
+//!
+//! OPEN: flags u32, proof u64. Reply: status, fd u32, optional RANDOM_DEVICE u32.
+//! LOOKUP/INFO_PATH: proof u64. Reply: status then metadata/NodeInfo.
+//! READ_DIR: index u32, proof u64. Reply: status, kind u32, name bytes.
+//! OPEN_EXEC through a bound Pending session: proof u64; image session reply.
+//! A final path operation consumes its proof. Cancellation is always idempotent.
+//! READ/WRITE: fd u32, count u32 or bytes. Reply: status, count u32, read bytes.
+//! READ_AT/WRITE_AT add an offset u64; they preserve the description's position.
+//! SEEK: fd u32, offset u32. SEEK_FROM adds signed offset i64 and origin u32.
+//! STAT: fd u32, reply size u32. INFO_FD returns NodeInfo without ABI padding.
+//! READ_DIR_FD advances the shared description and returns kind/inode/name.
+//! CLOSE: fd u32, reply status and zero u32.
+//! CLONE: count u32, descriptor numbers u32; a genuine child session shares
+//! descriptions and retains the creator's authority until its own authentic Bind.
+//! VerifySession only verifies the authenticated caller's own genuine clone.
+//! AUTHENTICATING guarantees no file effect; FinishBinding completes a staged
+//! retained-identity refresh, then the caller retries its exact original request.
+//! Handle-free calls return no handles at this barrier. VerifySession returns
+//! exactly its received Channel with SEND|TRANSFER rights, preserving its
+//! captured fd/CWD snapshot; retry transfers that returned handle, never the
+//! consumed old outgoing handle. FinishBinding's terminal result is journaled
+//! until the next Bind or refresh, including completion by maintenance.
+//! Raw LoaderRoot Resolve requests are refused; executable proofs require the
+//! genuine fresh BindPending session described above.
+//! READ_INTO on an image session: fd0, offset/count, destination memory capability.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -69,7 +65,7 @@ pub use info::NodeInfo;
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 5;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -99,9 +95,21 @@ pub const NO_DATA: u32 = 306;
 pub const TOO_MANY_OPEN_FILES: u32 = 307;
 pub const ACCESS_DENIED: u32 = 308;
 pub const NOT_DIRECTORY: u32 = 309;
-/// EPERM: OPEN_EXEC through a session other than the loaders', or for an
-/// identity that is no loader's.
+/// EPERM: missing genuine Pending Loader authority or a cleanup-only session.
 pub const PERMISSION: u32 = 310;
+pub const NAME_TOO_LONG: u32 = 311;
+pub const LOOP: u32 = 312;
+pub const STALE_PROOF: u32 = 313;
+pub const RESOLVING: u32 = 314;
+/// The original request made no file effect. FinishBinding completes the
+/// retained authority refresh before the caller retries the original request.
+pub const AUTHENTICATING: u32 = 315;
+pub const BOOT_PROFILE: u64 = 1 << 61;
+
+/// Init issues this profile exclusively to the named diagnostic client.
+pub const fn is_boot_profile(label: u64) -> bool {
+    label & (OWN | LOADERS) == 0 && label & BOOT_PROFILE != 0
+}
 
 /// The mark of the label of the session of the loaders: bit 62 with bit
 /// 63 clear, which init gives only to the process service's session with
@@ -183,10 +191,22 @@ pub enum Method {
     WriteAt = 16,
     ReadInto = 17,
     /// VerifySession: body require_fds u32 (0 or 1), one offered channel.
-    /// A normal SEND|TRANSFER session returns unchanged. An unsuitable
-    /// endpoint with required descriptors is refused; otherwise a fresh
-    /// ordinary empty clone is returned.
+    /// Only this authenticated caller's true unclaimed clone is accepted.
     VerifySession = 18,
+    /// Process identity capability, no body. A session retains the vouched principal.
+    Bind = 19,
+    /// Trusted loader root: require_fds u32, target Files and LoaderOf identity capabilities.
+    BindPending = 20,
+    /// base slot u32/generation u64, real_ids u32/follow_final u32, raw pathname bytes.
+    ResolveStart = 21,
+    /// Resolve job u64. One component and at most eight dentry comparisons.
+    ResolveStep = 22,
+    /// Resolve job u64. Releases its charge and retained bases.
+    ResolveCancel = 23,
+    /// Add a second captured base/path to the same paid preparation.
+    ResolveSecond = 24,
+    /// On a prepared genuine session: no body, no handles. RESOLVING requests another step.
+    FinishBinding = 25,
 }
 
 impl Method {
@@ -214,13 +234,20 @@ impl Method {
             16 => Some(Self::WriteAt),
             17 => Some(Self::ReadInto),
             18 => Some(Self::VerifySession),
+            19 => Some(Self::Bind),
+            20 => Some(Self::BindPending),
+            21 => Some(Self::ResolveStart),
+            22 => Some(Self::ResolveStep),
+            23 => Some(Self::ResolveCancel),
+            24 => Some(Self::ResolveSecond),
+            25 => Some(Self::FinishBinding),
             _ => None,
         }
     }
 }
 
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
@@ -256,7 +283,7 @@ mod tests {
 
     #[test]
     fn every_method_number_round_trips_and_is_listed() {
-        for number in 0..=18u16 {
+        for number in 0..=23u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(method) = method {

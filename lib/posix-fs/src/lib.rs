@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! File and directory operations for the evolving Rust POSIX layer.
-//! The current RAM service uses UTF-8 paths and bounded regular files.
+//! The RAM service owns byte paths, inode traversal and bounded regular files.
 
 #![no_std]
 
@@ -72,6 +72,7 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::IS_DIRECTORY) => Self::IsDirectory,
             Status::Unknown(proto_fs::NOT_DIRECTORY) => Self::NotDirectory,
             Status::Unknown(proto_fs::NO_SPACE) => Self::NoSpace,
+            Status::Unknown(proto_fs::NAME_TOO_LONG) => Self::NameTooLong,
             Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES) => Self::TooManyOpenFiles,
             Status::Unknown(proto_fs::INVALID_ARGUMENT) | Status::BadSize => Self::InvalidArgument,
             Status::Unknown(proto_fs::OFFSET_OVERFLOW) => Self::OffsetOverflow,
@@ -159,18 +160,6 @@ pub fn terminal_path(terminal: u32) -> Option<&'static str> {
     (terminal == proto_tty::CONSOLE).then_some("/dev/console")
 }
 
-/// The terminal a path names, as the layer resolves it itself (5f,
-/// decision 5): `path` is absolute and normalised. The names of the
-/// terminal service go to its session and never to the RAM file
-/// service. `/dev/tty` is the controlling terminal of the caller's
-/// session, which the console is until sessions come (5f, T3).
-pub fn terminal_named(path: &str) -> Option<u32> {
-    match path {
-        "/dev/console" | "/dev/tty" => Some(proto_tty::CONSOLE),
-        _ => None,
-    }
-}
-
 /// One process's file state, mutated by one owner: the table of
 /// descriptors and the current directory. The requests to the services go
 /// through the `Transport`, which needs no owner: the owner snapshots a
@@ -204,6 +193,9 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
     pub fn as_str(&self) -> Result<&str, FsError> {
         core::str::from_utf8(&self.bytes[..self.len]).map_err(|_| FsError::UnsupportedEncoding)
     }
@@ -370,10 +362,10 @@ impl Transport {
     /// service says so and the description reads: one opened for writing
     /// alone stays a file of the service, which refuses its reads with
     /// BAD_FD.
-    pub fn open(&self, path: &str, flags: u32) -> Result<Target, FsError> {
+    pub fn open(&self, path: &[u8], flags: u32) -> Result<Target, FsError> {
         let (fd, random) = self
             .files()
-            .open_marked(path, flags)
+            .open_marked_bytes(path, flags)
             .map_err(FsError::from)?;
         Ok(if random && flags & 3 != proto_fs::WRITE_ONLY {
             Target::Random(fd)
@@ -526,27 +518,78 @@ impl Transport {
         }
     }
 
-    /// The terminal `path` names, when the process has a session with the
-    /// terminal service to open it through (`terminal_named`).
-    pub fn terminal_of(&self, path: &Resolved) -> Result<Option<u32>, FsError> {
+    /// A virtual terminal leaf whose parent the RAM service resolved by inode.
+    /// Parent search includes dot components and links under the actual identity.
+    pub fn terminal_open(&self, path: &Resolved) -> Result<Option<(u32, u32)>, FsError> {
         if self.terminal().is_none() {
             return Ok(None);
         }
-        let named = terminal_named(path.as_str()?);
-        if named.is_some() && path.trailing_slash {
+        let bytes = path.as_bytes();
+        let mut end = bytes.len();
+        while end > 0 && bytes[end - 1] == b'/' {
+            end -= 1;
+        }
+        let Some(slash) = bytes[..end].iter().rposition(|&b| b == b'/') else {
+            return Ok(None);
+        };
+        let leaf = &bytes[slash + 1..end];
+        let (named, parent): ((u32, u32), &[u8]) = match leaf {
+            b"console" => ((proto_tty::OPEN_CONSOLE, 0), b"/dev/."),
+            b"tty" => ((proto_tty::OPEN_CONTROLLING, 0), b"/dev/."),
+            b"ptmx" => ((proto_tty::OPEN_MASTER, 0), b"/dev/."),
+            _ => match core::str::from_utf8(leaf)
+                .ok()
+                .and_then(|n| n.parse::<u32>().ok())
+            {
+                Some(n) => ((proto_tty::OPEN_SLAVE, n), b"/dev/pts/."),
+                None => return Ok(None),
+            },
+        };
+        let mut directory = [0; MAX_PATH + 1];
+        directory[..slash].copy_from_slice(&bytes[..slash]);
+        directory[slash..slash + 2].copy_from_slice(b"/.");
+        let (actual, parent) = match self.files().node_information_bytes(&directory[..slash + 2]) {
+            Ok(actual) => (actual, parent),
+            Err(Status::Unknown(proto_fs::NO_ENTRY))
+                if named.0 == proto_tty::OPEN_SLAVE && bytes[..slash].ends_with(b"/pts") =>
+            {
+                // The terminal service also mounts pts for boot profiles whose
+                // immutable RAM image contains only /dev. Resolve its real parent.
+                let mount = slash - 4;
+                directory[mount..mount + 2].copy_from_slice(b"/.");
+                (
+                    self.files()
+                        .node_information_bytes(&directory[..mount + 2])?,
+                    b"/dev/.".as_slice(),
+                )
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let expected = match self.files().node_information_bytes(parent) {
+            Ok(info) => info,
+            Err(Status::Unknown(proto_fs::NO_ENTRY)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if actual.kind != 1 || actual.device != expected.device || actual.inode != expected.inode {
+            return Ok(None);
+        }
+        if path.trailing_slash {
             return Err(FsError::NotDirectory);
         }
-        Ok(named)
+        Ok(Some(named))
     }
 
     pub fn stat(&self, path: &Resolved) -> Result<Metadata, FsError> {
-        if self.terminal_of(path)?.is_some() {
+        if self.terminal_open(path)?.is_some() {
             return Ok(Metadata {
                 kind: FileKind::Character,
                 size: 0,
             });
         }
-        let meta = self.files().lookup(path.as_str()?).map_err(FsError::from)?;
+        let meta = self
+            .files()
+            .lookup_bytes(path.as_bytes())
+            .map_err(FsError::from)?;
         let kind = FileKind::from_wire(meta.kind)?;
         if path.trailing_slash && kind == FileKind::Regular {
             return Err(FsError::NotDirectory);
@@ -558,28 +601,21 @@ impl Transport {
     }
 
     pub fn stat_information(&self, path: &Resolved) -> Result<NodeInfo, FsError> {
-        let name = path.as_str()?;
-        if self.terminal().is_some() {
-            let physical = if name == "/dev/ptmx" {
-                Some(proto_tty::STAT_PATH)
-            } else {
-                name.strip_prefix("/dev/pts/")
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .and_then(|n| n.checked_add(1))
-            };
-            if let Some(physical) = physical {
-                if path.trailing_slash {
-                    return Err(FsError::NotDirectory);
+        if let Some((kind, number)) = self.terminal_open(path)? {
+            return match kind {
+                proto_tty::OPEN_MASTER => {
+                    self.terminal_information(proto_tty::STAT_PATH, Some(proto_tty::STAT_PATH))
                 }
-                return self.terminal_information(proto_tty::STAT_PATH, Some(physical));
-            }
-        }
-        if self.terminal_of(path)?.is_some() {
-            return Ok(CONSOLE_INFO);
+                proto_tty::OPEN_SLAVE => self.terminal_information(
+                    proto_tty::STAT_PATH,
+                    Some(number.checked_add(1).ok_or(FsError::NoEntry)?),
+                ),
+                _ => Ok(CONSOLE_INFO),
+            };
         }
         let info = self
             .files()
-            .node_information(path.as_str()?)
+            .node_information_bytes(path.as_bytes())
             .map_err(FsError::from)?;
         if path.trailing_slash && FileKind::from_wire(info.kind)? != FileKind::Directory {
             return Err(FsError::NotDirectory);
@@ -757,6 +793,20 @@ impl PosixFs {
         count
     }
 
+    /// Every RAM description retained by exec, including FD_CLOFORK.
+    pub fn kept_by_exec(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+        let mut count = 0;
+        for (_, target, _) in self.descriptors.open() {
+            if let Target::Ram(n) | Target::Random(n) = target
+                && !out[..count].contains(&n)
+            {
+                out[count] = n;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// The terminal descriptions retained by a forked child, each once.
     pub fn terminals_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
         let mut count = 0;
@@ -789,6 +839,11 @@ impl PosixFs {
 
     /// The session with the RAM file service and the console's driver's,
     /// which a child gets clones of.
+    /// Authenticate the file session before any operation can commit.
+    pub fn bind(&self, identity: &Handle<Channel>) -> Result<(), FsError> {
+        self.files.bind(identity).map_err(FsError::from)
+    }
+
     pub fn sessions(&self) -> (&Handle<Channel>, Option<&Handle<Channel>>) {
         self.files.sessions()
     }
@@ -951,7 +1006,7 @@ impl PosixFs {
         let resolved = self.resolve(path)?;
         self.descriptors.vacant(0)?;
         let transport = self.transport();
-        let opened = transport.open(resolved.as_str()?, flags)?;
+        let opened = transport.open(resolved.as_bytes(), flags)?;
         match self.insert(opened, DescriptorFlags::default()) {
             Ok(fd) => Ok(fd),
             Err(error) => {

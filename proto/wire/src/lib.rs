@@ -274,9 +274,16 @@ impl Writer {
     pub fn bytes(&mut self, bytes: &[u8]) -> Result<(), Status> {
         let end = self.len + bytes.len();
         let room = self.buffer.get_mut(self.len..end).ok_or(Status::BadSize)?;
-        for (slot, byte) in room.iter_mut().zip(bytes) {
-            slot.write(*byte);
-        }
+        // SAFETY: the destination has the checked length and belongs to this Writer.
+        // The borrowed source cannot overlap its private buffer; all bytes become initialized.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                room.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            )
+        };
+
         self.len = end;
         Ok(())
     }

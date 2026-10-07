@@ -15,7 +15,10 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
+    println!("cargo:rerun-if-changed=files.c");
+    println!("cargo:rerun-if-changed=cleanup.c");
     println!("cargo:rerun-if-changed=jobs.c");
+    println!("cargo:rerun-if-changed=loader-abort.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     // The branches of the steps mode (xtask process-steps N).
@@ -45,6 +48,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", lib.join("libc.a").display());
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     run(Command::new(tools.join("clang"))
+        .arg(format!(
+            "-DLOADER_ABORT_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_LOADER_ABORT").is_some())
+        ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
         .arg(format!(
             "-DJOB_CONTROL_PROBE={}",
@@ -69,7 +76,17 @@ fn main() {
             "-isystem",
         ])
         .arg(sysroot.join("include"))
-        .args(["-c", "procs.c", "-o"])
+        .args([
+            "-c",
+            if env::var_os("CARGO_FEATURE_AUTH_PROBE").is_some() {
+                "cleanup.c"
+            } else if env::var_os("CARGO_FEATURE_FILES").is_some() {
+                "files.c"
+            } else {
+                "procs.c"
+            },
+            "-o",
+        ])
         .arg(out.join("procs.o")));
     run(Command::new(tools.join("llvm-ar"))
         .arg("crs")
