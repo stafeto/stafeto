@@ -3074,7 +3074,37 @@ fn posix_data_capacity(run: bool) -> Result<(), String> {
         POSIX_PROCS_PROGRAMS[8],
         POSIX_PROCS_PROGRAMS[9],
     ];
-    let image = build_boot_image("boot-posix-data-capacity.img", &PROGRAMS, BOOT_PROFILE)?;
+    build_boot_image("boot-posix-data-capacity.img", &PROGRAMS, BOOT_PROFILE)?;
+    // Isolate the private RAM diagnostic from Cargo feature unification.
+    let target = target_dir();
+    {
+        let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cmd = cargo();
+        cmd.arg("build").args(BOOT_PROFILE.args());
+        cmd.args([
+            "--target",
+            PROGRAM_TARGET,
+            "--package",
+            "ramfs",
+            "--features",
+            "steps,full-capacity-probe,rt/capacity-memory-trace",
+        ]);
+        run_cmd(&mut cmd)?;
+        let built = cargo_output(&target, PROGRAM_TARGET, BOOT_PROFILE, "ramfs");
+        let copied = image_elf(&target, "boot-posix-data-capacity.img", "ramfs");
+        std::fs::copy(&built, &copied).map_err(|e| format!("{}: {e}", built.display()))?;
+    }
+    let sources: Vec<_> = PROGRAMS
+        .iter()
+        .map(|(file, package, stack, _)| {
+            (
+                *file,
+                image_elf(&target, "boot-posix-data-capacity.img", package),
+                *stack,
+            )
+        })
+        .collect();
+    let image = write_elf_image("boot-posix-data-capacity.img", &sources, Vec::new())?;
     if !run {
         return Ok(());
     }
