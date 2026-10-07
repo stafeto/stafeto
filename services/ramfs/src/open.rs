@@ -765,3 +765,183 @@ mod create_directory_policy_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod concurrent_create_retry_tests {
+    use super::*;
+    use crate::resolve::{Intent, Progress, Resolve};
+    use crate::storage::{ROOT, Root};
+
+    fn resolve(ram: &mut Ram<'_>, resolver: &mut Resolve, identity: Identity) {
+        for _ in 0..2000 {
+            if resolver.step(&mut ram.storage, identity).unwrap() != Progress::More {
+                return;
+            }
+        }
+        panic!("bounded resolver did not complete");
+    }
+
+    #[test]
+    fn two_root_creation_refreshes_stale_proof_with_same_paid_admission() {
+        let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+        let identities = [
+            Identity {
+                uid: 0,
+                gid: 0,
+                groups: proto_process::Groups::EMPTY,
+            },
+            Identity {
+                uid: 65534,
+                gid: 65534,
+                groups: proto_process::Groups::EMPTY,
+            },
+        ];
+        let roots = [
+            Root {
+                id: 700,
+                generation: 1,
+            },
+            Root {
+                id: 701,
+                generation: 1,
+            },
+        ];
+        let mut sessions = roots.map(|root| Fds {
+            root,
+            ..Fds::default()
+        });
+        let flags = proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_WRITE;
+        let names: [&[u8]; 2] = [b"/tmp/concurrent-a", b"/tmp/concurrent-b"];
+        let mut resolvers = core::array::from_fn::<_, 2, _>(|i| {
+            Resolve::with_intent(
+                &mut ram.storage,
+                names[i],
+                ROOT,
+                identities[i],
+                Intent::Open { flags },
+            )
+            .unwrap()
+        });
+        let mut journals =
+            core::array::from_fn::<_, 2, _>(|_| Journal::new(flags, 0o600, 0).unwrap());
+        let mut charges = roots.map(|root| ram.storage.charge_preparation(root).unwrap());
+        let paid = charges;
+        for i in 0..2 {
+            resolve(&mut ram, &mut resolvers[i], identities[i]);
+            loop {
+                let proof = resolvers[i]
+                    .result_proof(&ram.storage, identities[i], Intent::Open { flags })
+                    .unwrap();
+                if journals[i]
+                    .prepare(
+                        &mut ram,
+                        &mut sessions[i],
+                        proof,
+                        identities[i],
+                        &mut charges[i],
+                    )
+                    .unwrap()
+                {
+                    break;
+                }
+            }
+        }
+        let first = resolvers[0]
+            .result_proof(&ram.storage, identities[0], Intent::Open { flags })
+            .unwrap();
+        let held_a = journals[0]
+            .commit(
+                &mut ram,
+                &mut sessions[0],
+                Some(first),
+                identities[0],
+                &mut charges[0],
+                proto_fs::Timestamp::ZERO,
+            )
+            .unwrap();
+        assert!(matches!(
+            resolvers[1].result_proof(&ram.storage, identities[1], Intent::Open { flags }),
+            Err(proto_fs::STALE_PROOF)
+        ));
+        journals[1]
+            .reset_unpublished(&mut ram, &mut sessions[1], &mut charges[1])
+            .unwrap();
+        assert_eq!(charges, paid);
+        assert_eq!(ram.storage.preparations_used(), 2);
+        assert_eq!(ram.open_descriptions(), 1);
+        for _ in 0..20_000 {
+            if !ram.storage.reclaim_step() {
+                break;
+            }
+        }
+        assert_eq!(ram.storage.usage(roots[1]).inodes, 0);
+        assert_eq!(ram.storage.usage(roots[1]).descriptions, 0);
+        resolve(&mut ram, &mut resolvers[1], identities[1]);
+        loop {
+            let proof = resolvers[1]
+                .result_proof(&ram.storage, identities[1], Intent::Open { flags })
+                .unwrap();
+            if journals[1]
+                .prepare(
+                    &mut ram,
+                    &mut sessions[1],
+                    proof,
+                    identities[1],
+                    &mut charges[1],
+                )
+                .unwrap()
+            {
+                break;
+            }
+        }
+        let refreshed = resolvers[1]
+            .result_proof(&ram.storage, identities[1], Intent::Open { flags })
+            .unwrap();
+        journals[1]
+            .commit(
+                &mut ram,
+                &mut sessions[1],
+                Some(refreshed),
+                identities[1],
+                &mut charges[1],
+                proto_fs::Timestamp::ZERO,
+            )
+            .unwrap();
+        assert_eq!(
+            journals[0]
+                .commit(
+                    &mut ram,
+                    &mut sessions[0],
+                    None,
+                    identities[0],
+                    &mut charges[0],
+                    proto_fs::Timestamp::ZERO
+                )
+                .unwrap(),
+            held_a
+        );
+        let tmp = ram.storage.lookup(ROOT, b"tmp").unwrap();
+        for (i, leaf) in [b"concurrent-a".as_slice(), b"concurrent-b".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let token = ram.storage.lookup(tmp, leaf).unwrap();
+            let node = ram.storage.node(token).unwrap();
+            assert_eq!(
+                (node.uid, node.gid, node.mode, node.links),
+                (identities[i].uid, identities[i].gid, 0o600, 1)
+            );
+            assert_eq!(ram.storage.usage(roots[i]).inodes, 1);
+            journals[i]
+                .cancel(&mut ram, &mut sessions[i], &mut charges[i])
+                .unwrap();
+            ram.storage.release_preparation(charges[i]);
+        }
+        for resolver in resolvers {
+            resolver.release(&mut ram.storage);
+        }
+        assert_eq!(ram.open_descriptions(), 0);
+        assert_eq!(ram.storage.preparations_used(), 0);
+        assert!(sessions.iter().all(|s| s.slots.iter().all(Option::is_none)));
+    }
+}

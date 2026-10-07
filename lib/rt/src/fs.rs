@@ -482,7 +482,10 @@ impl Files {
         if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
             return OpenFinalizeAttempt::Ambiguous(Status::BadSize);
         }
-        if matches!(code, proto_fs::AUTHENTICATING | proto_fs::TIME_DEFERRED) {
+        if matches!(
+            code,
+            proto_fs::AUTHENTICATING | proto_fs::TIME_DEFERRED | proto_fs::STALE_PROOF
+        ) {
             OpenFinalizeAttempt::Deferred(OpenNoEffect { key, session, code })
         } else {
             OpenFinalizeAttempt::Rejected(Status::from_code(code))
@@ -1404,7 +1407,11 @@ mod finalize_reply_tests {
     }
     #[test]
     fn canonical_no_effect_receipt_binds_request_and_transport_generations() {
-        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+        for code in [
+            proto_fs::AUTHENTICATING,
+            proto_fs::TIME_DEFERRED,
+            proto_fs::STALE_PROOF,
+        ] {
             let r = reply(8, code as u64, 0);
             let OpenFinalizeAttempt::Deferred(receipt) =
                 Files::open_finalize_reply(&r, key(), session())
@@ -1425,7 +1432,11 @@ mod finalize_reply_tests {
     }
     #[test]
     fn malformed_no_effect_envelopes_remain_ambiguous() {
-        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+        for code in [
+            proto_fs::AUTHENTICATING,
+            proto_fs::TIME_DEFERRED,
+            proto_fs::STALE_PROOF,
+        ] {
             for len in [0, 4, 7, 9, 12, 16, 32] {
                 assert!(matches!(
                     Files::open_finalize_reply(&reply(len, code as u64, 0), key(), session()),
@@ -1473,6 +1484,23 @@ mod finalize_reply_tests {
             ),
             OpenFinalizeAttempt::Rejected(Status::Unknown(proto_fs::ACCESS_DENIED))
         ));
+    }
+    #[test]
+    fn prepare_stale_requires_the_canonical_no_effect_envelope() {
+        assert_eq!(
+            Files::open_reply(&reply(8, proto_fs::STALE_PROOF as u64, 0), 8),
+            Err(Status::Unknown(proto_fs::STALE_PROOF))
+        );
+        for len in [0, 4, 7, 9, 12, 16, 32] {
+            assert_eq!(
+                Files::open_reply(&reply(len, proto_fs::STALE_PROOF as u64, 0), 8),
+                Err(Status::BadSize)
+            );
+        }
+        assert_eq!(
+            Files::open_reply(&reply(8, proto_fs::STALE_PROOF as u64 | 1 << 32, 0), 8),
+            Err(Status::BadSize)
+        );
     }
 }
 
