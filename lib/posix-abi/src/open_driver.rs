@@ -12,6 +12,12 @@ use posix_fs::{DescriptorFlags, Transport};
 use proto_wire::Status;
 
 fn protocol(error: Status) -> i32 {
+    #[cfg(feature = "full-capacity-probe")]
+    rt::println!(
+        "capacity-open: pid={} status={}",
+        crate::process::getpid(),
+        error.code()
+    );
     if error == Status::BadSize {
         EIO
     } else {
@@ -63,13 +69,31 @@ pub(crate) fn open(
             .open_start(key(token), path, flags, mode, umask)
             .map_err(protocol)?;
         recovery.phase = Phase::Traversing;
+        #[cfg(feature = "full-capacity-probe")]
+        rt::println!(
+            "capacity-open: pid={} stage=1 job={}",
+            crate::process::getpid(),
+            recovery.job
+        );
         save(claim, recovery)?;
         while !files.open_advance(recovery.job, false).map_err(protocol)? {}
         recovery.phase = Phase::Preparing;
+        #[cfg(feature = "full-capacity-probe")]
+        rt::println!(
+            "capacity-open: pid={} stage=2 job={}",
+            crate::process::getpid(),
+            recovery.job
+        );
         save(claim, recovery)?;
         loop {
             // Binding and preparation retries run without a numeric reservation or defer.
             while !files.open_advance(recovery.job, true).map_err(protocol)? {}
+            #[cfg(feature = "full-capacity-probe")]
+            rt::println!(
+                "capacity-open: pid={} stage=3 job={}",
+                crate::process::getpid(),
+                recovery.job
+            );
             #[cfg(feature = "open-finalize-clock-probe")]
             crate::open_finalize_probe::prepared(crate::open_finalize_probe::Prepared {
                 owner,
@@ -88,6 +112,12 @@ pub(crate) fn open(
                     Ok((entry, context))
                 })?;
                 recovery.phase = Phase::Committing;
+                #[cfg(feature = "full-capacity-probe")]
+                rt::println!(
+                    "capacity-open: pid={} stage=4 job={}",
+                    crate::process::getpid(),
+                    recovery.job
+                );
                 let finished = match context.send_once() {
                     FinalizeResult::Finished(held) => Ok(held),
                     FinalizeResult::Deferred { proof, reason } => {
@@ -115,7 +145,15 @@ pub(crate) fn open(
                             recovery.phase = Phase::Preparing;
                             return Ok(FinalPhase::Prepared(Status::Ok));
                         }
-                        FinalizeRecovery::Failed(_) => Err(EIO),
+                        FinalizeRecovery::Failed(_error) => {
+                            #[cfg(feature = "full-capacity-probe")]
+                            rt::println!(
+                                "capacity-open: pid={} stage=5 status={}",
+                                crate::process::getpid(),
+                                _error.code()
+                            );
+                            Err(EIO)
+                        }
                     },
                 }?;
                 recovery = recovery.remember(finished);
@@ -164,6 +202,16 @@ pub(crate) fn open(
         }
     })();
     if let Err(errno) = result {
+        #[cfg(feature = "full-capacity-probe")]
+        rt::println!(
+            "capacity-open: pid={} token={} generation={} job={} phase={} errno={}",
+            crate::process::getpid(),
+            token.slot(),
+            token.generation(),
+            recovery.job,
+            recovery.phase as u32,
+            errno
+        );
         let _ =
             crate::shared::with_files(|files| files.begin_open_cancel(claim).map_err(crate::error));
         let canonical = files.open_cancel_key_once(key(token)).is_ok();
