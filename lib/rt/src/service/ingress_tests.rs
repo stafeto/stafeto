@@ -55,6 +55,10 @@ impl Service<0> for Fixture {
                 self.deferred = r.token.take();
                 Answer::Deferred
             }
+            3 => {
+                let _ = r.reply().u32(0);
+                Answer::Reply(Outgoing::new())
+            }
             2 => {
                 let _ = r.reply().u32(0);
                 let _ = r.reply().u32(7);
@@ -338,11 +342,11 @@ fn deferred_clone_token_and_successful_codec_stay_with_their_original_owner() {
         .deferred
         .take()
         .unwrap()
-        .reply_handles(&[0; 4], Outgoing::new())
+        .reply_handles(&proto_wire::reply(Status::Ok), Outgoing::new())
         .unwrap_err();
     assert!(refused.token.is_none());
     assert!(refused.back.is_none());
-    assert_eq!(test_calls::log()[0].1[1], 4); // Retained Clone error family.
+    assert_eq!(test_calls::log()[0].1[1], 8); // Existing CloneEffects status envelope.
     test_calls::complete();
     s.mode = 2;
     test_calls::expect([(Call::Reply.number(), None)]);
@@ -434,4 +438,23 @@ fn consumed_reply_back_drains_without_resurrecting_the_token_or_offer() {
         assert!(current.outgoing.is_empty());
         test_calls::complete();
     }
+}
+
+#[test]
+fn explicit_four_byte_writer_reply_preserves_its_existing_length() {
+    test_calls::expect([(Call::Reply.number(), None)]);
+    let mut s = Fixture {
+        mode: 3,
+        ..Default::default()
+    };
+    let mut table = [None];
+    let mut buffer = [0; INLINE_MAX];
+    let mut current = dispatch(
+        &mut s,
+        &mut table,
+        received(0, &Header::new(15, 1).bytes(), &[]),
+        &mut buffer,
+    );
+    settle(&mut s, &mut current);
+    assert_eq!(test_calls::log()[0].1[1], 4);
 }
