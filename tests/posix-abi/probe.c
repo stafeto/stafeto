@@ -181,7 +181,7 @@ static int metadata(void) {
             || value.st_nlink != 4 || value.st_dev != 1 || value.st_uid || value.st_gid) return 40;
     if (stat("motd", &value) || !S_ISREG(value.st_mode) || value.st_ino != 4
             || value.st_size != 14 || value.st_nlink != 1 || value.st_blocks != 1
-            || value.st_blksize != 1024 || (value.st_mode & 07777) != 0444) return 41;
+            || value.st_blksize != 4096 || (value.st_mode & 07777) != 0444) return 41;
     int fd = open("motd", O_RDONLY), alias = dup(fd);
     if (fd < 0 || alias < 0 || fstat(alias, &copy) || copy.st_ino != value.st_ino
             || copy.st_dev != value.st_dev || copy.st_size != value.st_size) return 42;
