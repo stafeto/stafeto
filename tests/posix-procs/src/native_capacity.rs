@@ -377,6 +377,15 @@ fn ask(input: Pipe, output: Pipe, seq: u32, action: u32, expected: u32) -> Resul
 fn leader(role: i32) -> Result<(), i32> {
     let a = role == 1;
     let cold = meter::snapshot()?;
+    rt::println!(
+        "capacity-diag: role={} uid={} euid={} pid={} coldroot={}:{}",
+        role,
+        posix_abi::process::getuid(),
+        posix_abi::process::geteuid(),
+        posix_abi::process::getpid(),
+        cold.root[0],
+        cold.root[1]
+    );
     require(
         posix_abi::process::getuid() == if a { 0 } else { 65534 }
             && posix_abi::process::geteuid() == if a { 0 } else { 65534 },
@@ -403,6 +412,20 @@ fn leader(role: i32) -> Result<(), i32> {
         }
     }
     let warm = await_snapshot(|s| s.meter[1] != 0)?;
+    rt::println!(
+        "capacity-diag: role={} pid={} root={}:{} jobs={} free={} used={} quota={} phase={} registered={}/{}",
+        role,
+        posix_abi::process::getpid(),
+        warm.root[0],
+        warm.root[1],
+        warm.jobs,
+        warm.available[2],
+        warm.memory.used,
+        warm.memory.quota,
+        warm.phases.own,
+        warm.phases.registered[0],
+        warm.phases.registered[1]
+    );
     require(
         warm.root[0] == posix_abi::process::getpid() as u64
             && warm.jobs == 0
