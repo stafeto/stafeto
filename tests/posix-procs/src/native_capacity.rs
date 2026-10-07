@@ -284,7 +284,14 @@ fn await_snapshot(predicate: impl Fn(&Snapshot) -> bool) -> Result<Snapshot, i32
 }
 fn empty_file(path: &[u8]) -> Result<i32, i32> {
     let fd = posix_abi::open_policy(path, O_RDWR | O_CREAT | O_EXCL, 0o600, 0)?;
-    posix_abi::ftruncate(fd, 0)?;
+    let result = posix_abi::ftruncate(fd, 0);
+    rt::println!(
+        "capacity-diag: empty pid={} fd={} truncate_errno={}",
+        posix_abi::process::getpid(),
+        fd,
+        result.err().unwrap_or(0)
+    );
+    result?;
     Ok(fd)
 }
 struct GateEvent(core::cell::UnsafeCell<Option<posix_abi::data_probe::Event>>);
