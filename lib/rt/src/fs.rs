@@ -97,6 +97,47 @@ impl Input {
     }
 }
 
+/// An exact hidden descriptor returned by a committed paid Open operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedOpen {
+    pub fd: u32,
+    pub slot: u32,
+    pub generation: u64,
+    pub random: bool,
+}
+
+impl PreparedOpen {
+    pub fn marked_fd(self) -> u32 {
+        self.fd
+            | (self.slot << proto_fs::OPEN_DESCRIPTION_SHIFT)
+            | if self.random {
+                proto_fs::OPEN_RANDOM
+            } else {
+                0
+            }
+    }
+}
+
+/// Startup imports capture the exact existing descriptor and its access policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapturedDescription {
+    pub held: PreparedOpen,
+    pub flags: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseOutcome {
+    Closed,
+    AlreadyGone,
+}
+
+/// Recovery separates a live paid preparation from its completed descriptor handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenOutcome {
+    Active { job: u64, phase: u32 },
+    Finished(PreparedOpen),
+}
+
 pub struct Files {
     channel: Handle<Channel>,
     uart: Option<Handle<Channel>>,
@@ -160,6 +201,277 @@ impl Drop for Proof<'_> {
 }
 
 impl Files {
+    /// Capture a mutable-open path and its policy before prepaying descriptor resources.
+    pub fn open_start(
+        &self,
+        key: proto_fs::OpenKey,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+        umask: u32,
+    ) -> Result<u64, Status> {
+        let mut w = Writer::new();
+        Method::OpenStart.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        w.u32(0)?;
+        w.u64(1)?;
+        w.u32(flags)?;
+        w.u32(mode)?;
+        w.u32(umask)?;
+        w.bytes(path)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_start_reply(&reply)
+    }
+    /// Decode a Start transport reply before acknowledging the resident operation.
+    pub fn open_start_reply(reply: &crate::sys::Reply) -> Result<u64, Status> {
+        Self::open_reply(reply, 12)?;
+        let id = (reply.words[0] >> 32) | ((reply.words[1] as u32 as u64) << 32);
+        Self::open_job_id(id)?;
+        Ok(id)
+    }
+    fn open_job_id(id: u64) -> Result<(), Status> {
+        if id >> 8 == 0 || id & 255 >= 128 {
+            return Err(Status::BadSize);
+        }
+        Ok(())
+    }
+    /// Recover the paid job after the original Start reply was unavailable.
+    pub fn open_query(&self, key: proto_fs::OpenKey) -> Result<OpenOutcome, Status> {
+        let mut w = Writer::new();
+        Method::OpenQuery.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_query_reply(&reply)
+    }
+    pub fn open_query_reply(reply: &crate::sys::Reply) -> Result<OpenOutcome, Status> {
+        let phase = (reply.words[0] >> 32) as u32;
+        if phase == 5 {
+            Self::open_reply(reply, 32)?;
+            if reply.words[1] != 0 || reply.words[2] >> 32 != 0 {
+                return Err(Status::BadSize);
+            }
+            let result = Self::open_description(reply.words[2] as u32, reply.words[3])?;
+            return Ok(OpenOutcome::Finished(result));
+        }
+        Self::open_reply(reply, 16)?;
+        if phase > 4 {
+            return Err(Status::BadSize);
+        }
+        Self::open_job_id(reply.words[1])?;
+        Ok(OpenOutcome::Active {
+            job: reply.words[1],
+            phase,
+        })
+    }
+    /// The resident caller captures expected fd/generation before sending this handoff.
+    pub fn open_finish(&self, key: proto_fs::OpenKey) -> Result<PreparedOpen, Status> {
+        let mut w = Writer::new();
+        Method::OpenFinish.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_commit_reply(&reply)
+    }
+    /// Bind precedes this read-only normalization; imports publish after exact capture.
+    pub fn capture_description(&self, fd: u32) -> Result<CapturedDescription, Status> {
+        let mut w = Writer::new();
+        Method::CaptureDescription.header().write(&mut w)?;
+        w.u32(fd)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::capture_description_reply(&reply)
+    }
+
+    pub fn capture_description_reply(reply: &sys::Reply) -> Result<CapturedDescription, Status> {
+        Self::open_reply(reply, 20)?;
+        let held = Self::open_description((reply.words[0] >> 32) as u32, reply.words[1])?;
+        let flags = reply.words[2] as u32;
+        if flags & !(3 | proto_fs::APPEND) != 0 || flags & 3 == 3 {
+            return Err(Status::BadSize);
+        }
+        Ok(CapturedDescription { held, flags })
+    }
+
+    /// Canonical exact cleanup preserves a replacement at the same numeric fd.
+    pub fn close_exact(&self, held: PreparedOpen) -> Result<CloseOutcome, Status> {
+        let mut w = Writer::new();
+        Method::CloseExact.header().write(&mut w)?;
+        w.u32(Self::exact_description_word(held)?)?;
+        w.u64(held.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::close_exact_reply(&reply)
+    }
+
+    pub fn close_exact_reply(reply: &sys::Reply) -> Result<CloseOutcome, Status> {
+        if Self::reply_code(reply)? != 0 {
+            Self::open_reply(reply, 8)?;
+        }
+        if reply.len != 8 || !reply.handles.is_empty() {
+            return Err(Status::BadSize);
+        }
+        match reply.words[0] >> 32 {
+            0 => Ok(CloseOutcome::Closed),
+            1 => Ok(CloseOutcome::AlreadyGone),
+            _ => Err(Status::BadSize),
+        }
+    }
+
+    fn exact_description_word(held: PreparedOpen) -> Result<u32, Status> {
+        if !(3..35).contains(&held.fd) || held.slot >= 128 || held.generation == 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(held.fd | (held.slot << proto_fs::OPEN_DESCRIPTION_SHIFT))
+    }
+
+    /// Whole-list token validation precedes every shared reference and CWD effect.
+    pub fn clone_exact_on(
+        channel: &Handle<Channel>,
+        descriptions: &[PreparedOpen],
+    ) -> Result<Handle<Channel>, Status> {
+        if descriptions.len() > 32 {
+            return Err(Status::BadSize);
+        }
+        let mut w = Writer::new();
+        Method::CloneExact.header().write(&mut w)?;
+        w.u32(descriptions.len() as u32)?;
+        for held in descriptions {
+            w.u32(Self::exact_description_word(*held)?)?;
+            w.u64(held.generation)?;
+        }
+        let mut reply = Self::send_on(channel, w.as_bytes())?;
+        let code = Self::reply_code(&reply)?;
+        if code != 0 {
+            return match Self::open_reply(&reply, 4) {
+                Err(error) => Err(error),
+                Ok(()) => Err(Status::BadSize),
+            };
+        }
+        if reply.len != 4
+            || reply.handles.len() != 1
+            || !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                kind == abi::ObjectKind::Channel
+                    && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+            })
+        {
+            return Err(Status::BadSize);
+        }
+        reply.handles.take(0).map_err(Status::Kernel)
+    }
+
+    /// The numeric-reservation phase performs one request before releasing its defer.
+    /// AUTHENTICATING leaves staged refresh to the caller's recovery decision.
+    pub fn open_finish_once(&self, key: proto_fs::OpenKey) -> Result<PreparedOpen, Status> {
+        let reply = self.open_key_once(Method::OpenFinish, key)?;
+        Self::open_commit_reply(&reply)
+    }
+
+    pub fn open_query_once(&self, key: proto_fs::OpenKey) -> Result<OpenOutcome, Status> {
+        let reply = self.open_key_once(Method::OpenQuery, key)?;
+        Self::open_query_reply(&reply)
+    }
+
+    pub fn open_cancel_key_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        let reply = self.open_key_once(Method::OpenCancel, key)?;
+        Self::open_reply(&reply, 8)
+    }
+
+    fn open_key_once(&self, method: Method, key: proto_fs::OpenKey) -> Result<sys::Reply, Status> {
+        key.validate().map_err(Status::from_code)?;
+        let mut w = Writer::new();
+        method.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        sys::send(&self.channel, w.as_bytes()).map_err(Status::Kernel)
+    }
+    /// Cleanup uses the client key even before its server job ID was decoded.
+    pub fn open_cancel_key(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        let mut w = Writer::new();
+        Method::OpenCancel.header().write(&mut w)?;
+        w.u32(key.slot)?;
+        w.u64(key.generation)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_reply(&reply, 8)
+    }
+    fn open_reply(reply: &crate::sys::Reply, len: usize) -> Result<(), Status> {
+        let code = Self::reply_code(reply)?;
+        if !reply.handles.is_empty() {
+            return Err(Status::BadSize);
+        }
+        if code != 0 {
+            if reply.len != 8 || reply.words[0] >> 32 != 0 {
+                return Err(Status::BadSize);
+            }
+            return Err(Status::from_code(code));
+        }
+        if reply.len != len || (len == 8 && reply.words[0] >> 32 != 0) {
+            return Err(Status::BadSize);
+        }
+        Ok(())
+    }
+    /// Advance one bounded traversal or descriptor-prepayment phase.
+    pub fn open_advance(&self, id: u64, prepare: bool) -> Result<bool, Status> {
+        let mut w = Writer::new();
+        (if prepare {
+            Method::OpenPrepare
+        } else {
+            Method::ResolveStep
+        })
+        .header()
+        .write(&mut w)?;
+        w.u64(id)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        if Self::reply_code(&reply)? == proto_fs::RESOLVING {
+            if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
+                return Err(Status::BadSize);
+            }
+            return Ok(false);
+        }
+        Self::open_reply(&reply, 8)?;
+        Ok(true)
+    }
+    /// Retry this same operation ID to recover its exact committed result.
+    pub fn open_commit(&self, id: u64) -> Result<PreparedOpen, Status> {
+        let mut w = Writer::new();
+        Method::OpenCommit.header().write(&mut w)?;
+        w.u64(id)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_commit_reply(&reply)
+    }
+    pub fn open_commit_once(&self, id: u64) -> Result<PreparedOpen, Status> {
+        Self::open_job_id(id)?;
+        let mut w = Writer::new();
+        Method::OpenCommit.header().write(&mut w)?;
+        w.u64(id)?;
+        let reply = sys::send(&self.channel, w.as_bytes()).map_err(Status::Kernel)?;
+        Self::open_commit_reply(&reply)
+    }
+    /// Successful wire shape must describe a real server descriptor lifetime.
+    pub fn open_commit_reply(reply: &crate::sys::Reply) -> Result<PreparedOpen, Status> {
+        Self::open_reply(reply, 16)?;
+        Self::open_description((reply.words[0] >> 32) as u32, reply.words[1])
+    }
+    fn open_description(marked_fd: u32, generation: u64) -> Result<PreparedOpen, Status> {
+        let fd = marked_fd & proto_fs::OPEN_FD_MASK;
+        if marked_fd & !proto_fs::OPEN_RESULT_MASK != 0 || !(3..35).contains(&fd) || generation == 0
+        {
+            return Err(Status::BadSize);
+        }
+        Ok(PreparedOpen {
+            fd,
+            slot: (marked_fd & proto_fs::OPEN_DESCRIPTION_MASK) >> proto_fs::OPEN_DESCRIPTION_SHIFT,
+            generation,
+            random: marked_fd & proto_fs::OPEN_RANDOM != 0,
+        })
+    }
+    /// Release the exact job and hidden descriptor after a completed or abandoned Open.
+    pub fn open_cancel(&self, id: u64) -> Result<(), Status> {
+        let mut w = Writer::new();
+        Method::ResolveCancel.header().write(&mut w)?;
+        w.u64(id)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        Self::open_reply(&reply, 8)
+    }
     /// Even a long reply retains its first 64 bytes in the returned registers.
     /// Reading status needs no message-buffer copy or kilobyte stack frame.
     fn reply_code(reply: &crate::sys::Reply) -> Result<u32, Status> {
@@ -336,6 +648,86 @@ impl Files {
             };
         }
     }
+    /// A cold loader root returns exact incoming channels before paid preparation.
+    /// Every retry transfers the newly returned objects in their original order.
+    pub fn bind_pending_on(
+        root: &Handle<Channel>,
+        require_fds: bool,
+        mut offered: Option<Handle<Channel>>,
+        mut identity: Handle<Channel>,
+    ) -> Result<Handle<Channel>, Status> {
+        if require_fds && offered.is_none() {
+            return Err(Status::BadSize);
+        }
+        let count = 1 + usize::from(offered.is_some());
+        let mut request = Writer::new();
+        Method::BindPending.header().write(&mut request)?;
+        request.u32(u32::from(require_fds))?;
+        loop {
+            let mut outgoing = crate::handle::Outgoing::new();
+            if let Some(channel) = offered.take() {
+                outgoing
+                    .push(channel.erase())
+                    .map_err(|_| Status::BadSize)?;
+            }
+            outgoing
+                .push(identity.erase())
+                .map_err(|_| Status::BadSize)?;
+            let mut reply = sys::send_handles(root, request.as_bytes(), outgoing)
+                .map_err(|refused| Status::Kernel(refused.error))?;
+            let code = Self::reply_code(&reply)?;
+            if code == proto_fs::AUTHENTICATING {
+                if reply.len != proto_wire::HEADER_LEN
+                    || reply.words[0] >> 32 != 0
+                    || reply.handles.len() != count
+                    || !reply.handles.info(count - 1).is_some_and(|(kind, rights)| {
+                        kind == abi::ObjectKind::Channel
+                            && rights.contains(
+                                abi::Rights::NOTIFY
+                                    | abi::Rights::DUPLICATE
+                                    | abi::Rights::TRANSFER,
+                            )
+                    })
+                    || (count == 2
+                        && !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                            kind == abi::ObjectKind::Channel
+                                && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+                        }))
+                {
+                    return Err(Status::BadSize);
+                }
+                offered = if count == 2 {
+                    Some(reply.handles.take::<Channel>(0).map_err(Status::Kernel)?)
+                } else {
+                    None
+                };
+                identity = reply
+                    .handles
+                    .take::<Channel>(count - 1)
+                    .map_err(Status::Kernel)?;
+                continue;
+            }
+            if code != 0 {
+                if reply.len != proto_wire::HEADER_LEN
+                    || reply.words[0] >> 32 != 0
+                    || !reply.handles.is_empty()
+                {
+                    return Err(Status::BadSize);
+                }
+                return Err(Status::from_code(code));
+            }
+            if reply.len != 4
+                || reply.handles.len() != 1
+                || !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                    kind == abi::ObjectKind::Channel
+                        && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+                })
+            {
+                return Err(Status::BadSize);
+            }
+            return reply.handles.take::<Channel>(0).map_err(Status::Kernel);
+        }
+    }
     /// A loader's image, after its authentic pending identity resolves each component.
     pub fn open_exec(
         &self,
@@ -347,38 +739,47 @@ impl Files {
             abi::Rights::NOTIFY | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
         )
         .map_err(Status::Kernel)?;
-        let mut request = Writer::new();
-        Method::BindPending.header().write(&mut request)?;
-        request.u32(0)?;
-        let mut reply = sys::send_handles(&self.channel, request.as_bytes(), [identity.erase()])
-            .map_err(|e| Status::Kernel(e.error))?;
-        let mut buffer = [0; MESSAGE_MAX];
-        let status = Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?);
-        if status != Status::Ok {
-            return Err(status);
-        }
-        let session = reply.handles.take::<Channel>(0).map_err(Status::Kernel)?;
+        let session = Self::bind_pending_on(&self.channel, false, None, identity)?;
         let prepared = Self::from_sessions(session, None);
         prepared.finish_binding()?;
         prepared.open_exec_bound(path)
     }
-    fn open_exec_bound(&self, path: &[u8]) -> Result<Handle<Channel>, Status> {
+    /// Resolve an executable using this authenticated bound session.
+    /// The service requires a genuine Pending loader binding for the image handoff.
+    pub fn open_exec_bound(&self, path: &[u8]) -> Result<Handle<Channel>, Status> {
         let proof = self.prepare(path)?;
         let mut w = Writer::new();
         Method::OpenExec.header().write(&mut w)?;
         w.u64(proof.id)?;
         loop {
             let mut reply = proof.send(w.as_bytes())?;
-            let mut buffer = [0; MESSAGE_MAX];
-            let status = Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?);
-            if status == Status::Unknown(proto_fs::STALE_PROOF) {
+            let code = Self::reply_code(&reply)?;
+            if code == 0 {
+                if reply.len != 4
+                    || reply.handles.len() != 1
+                    || !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                        kind == abi::ObjectKind::Channel
+                            && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+                    })
+                {
+                    return Err(Status::BadSize);
+                }
+                return reply.handles.take::<Channel>(0).map_err(Status::Kernel);
+            }
+            if reply.len != proto_wire::HEADER_LEN
+                || reply.words[0] >> 32 != 0
+                || !reply.handles.is_empty()
+            {
+                return Err(Status::BadSize);
+            }
+            if code == proto_fs::RESOLVING {
+                continue;
+            }
+            if code == proto_fs::STALE_PROOF {
                 proof.ready()?;
                 continue;
             }
-            if status != Status::Ok {
-                return Err(status);
-            }
-            return reply.handles.take::<Channel>(0).map_err(Status::Kernel);
+            return Err(Status::from_code(code));
         }
     }
 

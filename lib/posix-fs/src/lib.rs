@@ -6,6 +6,10 @@
 
 #![no_std]
 
+pub mod open;
+mod target;
+pub use target::RamTarget;
+
 use core::mem::ManuallyDrop;
 pub use posix_fd::Flags as DescriptorFlags;
 use posix_fd::{Error as DescriptorError, Table};
@@ -32,6 +36,7 @@ pub enum FsError {
     IsDirectory,
     NotDirectory,
     NoSpace,
+    FileTooLarge,
     TooManyOpenFiles,
     NotSeekable,
     OffsetOverflow,
@@ -85,6 +90,7 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::IS_DIRECTORY) => Self::IsDirectory,
             Status::Unknown(proto_fs::NOT_DIRECTORY) => Self::NotDirectory,
             Status::Unknown(proto_fs::NO_SPACE) => Self::NoSpace,
+            Status::Unknown(proto_fs::FILE_TOO_LARGE) => Self::FileTooLarge,
             Status::Unknown(proto_fs::NAME_TOO_LONG) => Self::NameTooLong,
             Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES) => Self::TooManyOpenFiles,
             Status::Unknown(proto_fs::INVALID_ARGUMENT) | Status::BadSize => Self::InvalidArgument,
@@ -187,7 +193,51 @@ pub struct PosixFs {
     /// the console's input, output and error go there (5f).
     terminal: Option<Handle<Channel>>,
     paths: PathState,
-    descriptors: Table<Target, OPEN_MAX>,
+    descriptors: Table<Target, OPEN_MAX, open::Recovery>,
+}
+
+/// Owned startup transports, prepared before the pinned descriptor table exists.
+pub struct StartupFiles {
+    files: Files,
+    pipes: Option<Handle<Channel>>,
+    terminal: Option<Handle<Channel>>,
+}
+
+impl StartupFiles {
+    pub fn connect(parent: &Handle<Channel>, uart: bool) -> Result<Self, FsError> {
+        let files = if uart {
+            Files::connect_with_uart(parent)
+        } else {
+            Files::connect(parent)
+        }
+        .map_err(FsError::from)?;
+        Ok(Self {
+            files,
+            pipes: rt::service::connect(parent, "pipe").ok(),
+            terminal: None,
+        })
+    }
+
+    pub fn from_sessions(
+        files: Handle<Channel>,
+        uart: Option<Handle<Channel>>,
+        pipes: Option<Handle<Channel>>,
+        terminal: Option<Handle<Channel>>,
+    ) -> Self {
+        Self {
+            files: Files::from_sessions(files, uart),
+            pipes,
+            terminal,
+        }
+    }
+
+    pub fn set_terminal(&mut self, terminal: Option<Handle<Channel>>) {
+        self.terminal = terminal;
+    }
+
+    pub fn bind(&self, identity: &Handle<Channel>) -> Result<(), FsError> {
+        self.files.bind(identity).map_err(FsError::from)
+    }
 }
 
 /// The transports of a process's files, borrowed from its PosixFs, which
@@ -682,19 +732,88 @@ pub fn pipe_error(status: Status) -> FsError {
 }
 
 impl PosixFs {
+    /// Initialize the process table directly in its permanent allocation.
+    /// Errors consume startup transports before any destination field is written.
+    ///
+    /// # Safety
+    /// `destination` names aligned, writable, uninitialized storage for Self.
+    /// The caller owns it exclusively and pins its address through all records
+    /// and waiters. Existing initialized resources require their own cleanup.
+    #[inline(never)]
+    pub unsafe fn initialize_at(
+        destination: *mut Self,
+        startup: StartupFiles,
+        cwd: &[u8],
+        inherited: Option<&[Inherited]>,
+        secure: bool,
+    ) -> Result<(), FsError> {
+        let mut paths = PathState::new();
+        if !cwd.is_empty() {
+            paths.set_cwd(cwd)?;
+        }
+        let mut occupied = [false; OPEN_MAX];
+        if let Some(list) = inherited {
+            for item in list {
+                let slot = occupied
+                    .get_mut(item.fd as usize)
+                    .ok_or(FsError::BadFileDescriptor)?;
+                if *slot {
+                    return Err(FsError::InvalidArgument);
+                }
+                *slot = true;
+            }
+        }
+        let StartupFiles {
+            files,
+            pipes,
+            terminal,
+        } = startup;
+        // SAFETY: the caller supplies exclusive uninitialized storage; preflight
+        // completed and every field receives its initial valid value here.
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).files).write(files);
+            core::ptr::addr_of_mut!((*destination).pipes).write(pipes);
+            core::ptr::addr_of_mut!((*destination).terminal).write(terminal);
+            core::ptr::addr_of_mut!((*destination).paths).write(paths);
+            Table::initialize_at(
+                core::ptr::addr_of_mut!((*destination).descriptors),
+                |target| matches!(target, Target::Tty(_)),
+            );
+        }
+        // SAFETY: all fields are initialized; startup owns the only reference.
+        let own = unsafe { &mut *destination };
+        if let Some(list) = inherited {
+            for item in list {
+                own.descriptors
+                    .place(item.fd, item.target, DescriptorFlags::default())
+                    .expect("validated startup descriptor");
+            }
+        }
+        if inherited.is_none() || secure {
+            for (fd, target) in [(0, Target::Input), (1, Target::Output), (2, Target::Error)] {
+                if !occupied[fd as usize] {
+                    own.descriptors
+                        .place(fd, target, DescriptorFlags::default())
+                        .expect("fresh standard descriptor");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The files of a program init started, through `parent`: the RAM
     /// files and, when init's table gives it one, a session with the pipe
     /// service.
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, FsError> {
-        let files = Files::connect(parent).map_err(FsError::from)?;
-        let pipes = rt::service::connect(parent, "pipe").ok();
-        Self::from_files_parts(files, pipes)
+        let mut fs = Self::from_files(Files::connect(parent).map_err(FsError::from)?)?;
+        fs.pipes = rt::service::connect(parent, "pipe").ok();
+        Ok(fs)
     }
 
     pub fn connect_with_uart(parent: &Handle<Channel>) -> Result<Self, FsError> {
-        let files = Files::connect_with_uart(parent).map_err(FsError::from)?;
-        let pipes = rt::service::connect(parent, "pipe").ok();
-        Self::from_files_parts(files, pipes)
+        let mut fs = Self::from_files(Files::connect_with_uart(parent).map_err(FsError::from)?)?;
+        fs.pipes = rt::service::connect(parent, "pipe").ok();
+        Ok(fs)
     }
 
     /// The session with the pipe service the program was given (its
@@ -731,9 +850,9 @@ impl PosixFs {
                     pipes: None,
                     terminal: None,
                     paths: PathState::new(),
-                    descriptors: const {
-                        Table::with_early_release(|target| matches!(target, Target::Tty(_)))
-                    },
+                    descriptors: Table::with_early_release(|target| {
+                        matches!(target, Target::Tty(_))
+                    }),
                 };
                 for d in list {
                     fs.descriptors
@@ -777,6 +896,7 @@ impl PosixFs {
         core::mem::forget(parent);
         core::mem::forget(core::mem::replace(&mut self.pipes, pipes));
         core::mem::forget(core::mem::replace(&mut self.terminal, terminal));
+        self.descriptors.discard_open_after_fork();
         while self.descriptors.abandon_hold().is_some() {}
         let mut closing = [false; OPEN_MAX];
         for (fd, _, flags) in self.descriptors.open() {
@@ -872,21 +992,17 @@ impl PosixFs {
     }
 
     fn from_files(files: Files) -> Result<Self, FsError> {
-        Self::from_files_parts(files, None)
-    }
-
-    fn from_files_parts(files: Files, pipes: Option<Handle<Channel>>) -> Result<Self, FsError> {
-        let mut fs = Self {
+        let mut descriptors = Table::with_early_release(|target| matches!(target, Target::Tty(_)));
+        for target in [Target::Input, Target::Output, Target::Error] {
+            descriptors.insert(target, DescriptorFlags::default())?;
+        }
+        Ok(Self {
             files,
-            pipes,
+            pipes: None,
             terminal: None,
             paths: PathState::new(),
-            descriptors: const { Table::with_early_release(|target| matches!(target, Target::Tty(_))) },
-        };
-        for target in [Target::Input, Target::Output, Target::Error] {
-            fs.descriptors.insert(target, DescriptorFlags::default())?;
-        }
-        Ok(fs)
+            descriptors,
+        })
     }
 
     /// The transports, for a request outside the owner's lock.
@@ -1020,12 +1136,6 @@ impl PosixFs {
         if path.last() == Some(&b'/') && self.stat(path)?.kind == FileKind::Regular {
             return Err(FsError::NotDirectory);
         }
-        self.open_after_directory_check(path, flags)
-    }
-
-    // The preliminary stat finishes before reserving this path buffer.
-    #[inline(never)]
-    fn open_after_directory_check(&mut self, path: &[u8], flags: u32) -> Result<u32, FsError> {
         let resolved = self.resolve(path)?;
         self.descriptors.vacant(0)?;
         let transport = self.transport();
@@ -1126,15 +1236,11 @@ impl PosixFs {
     }
 
     pub fn stat(&self, path: &[u8]) -> Result<Metadata, FsError> {
-        let resolved = self.resolve(path);
-        self.transport()
-            .stat(resolved.as_ref().map_err(|error| *error)?)
+        self.transport().stat(&self.resolve(path)?)
     }
 
     pub fn stat_information(&self, path: &[u8]) -> Result<NodeInfo, FsError> {
-        let resolved = self.resolve(path);
-        self.transport()
-            .stat_information(resolved.as_ref().map_err(|error| *error)?)
+        self.transport().stat_information(&self.resolve(path)?)
     }
 
     pub fn descriptor_information(&self, fd: u32) -> Result<NodeInfo, FsError> {

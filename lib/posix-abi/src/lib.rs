@@ -88,6 +88,7 @@ pub fn error(error: FsError) -> c_int {
         FsError::IsDirectory => EISDIR,
         FsError::NotDirectory => ENOTDIR,
         FsError::NoSpace => ENOSPC,
+        FsError::FileTooLarge => EFBIG,
         FsError::TooManyOpenFiles => EMFILE,
         FsError::NotSeekable => ESPIPE,
         FsError::OffsetOverflow => EOVERFLOW,

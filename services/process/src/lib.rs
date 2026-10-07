@@ -11,6 +11,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+#[cfg(feature = "image-probe")]
+pub mod image_probe;
 pub mod loaders;
 pub mod queue;
 pub mod records;

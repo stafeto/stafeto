@@ -12,6 +12,10 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
 #[cfg(feature = "loader-abort")]
 mod audit;
+#[cfg(feature = "image-gates")]
+mod image_gates;
+#[cfg(feature = "loader-abort")]
+mod image_hold;
 #[cfg(feature = "loader-abort")]
 mod loader_abort;
 
@@ -61,6 +65,12 @@ extern "C" fn files_fake_identity() -> i32 {
 
 #[cfg(feature = "auth-probe")]
 mod cleanup;
+#[cfg(feature = "files")]
+mod open_stages;
+#[cfg(feature = "ipc-loss")]
+mod reply_death;
+#[cfg(feature = "ipc-loss")]
+mod reply_loss;
 /// Sixteen real sessions retain all thirty-two descriptions during both
 /// credential changes. Every reply and retained byte is checked by the guest.
 #[cfg(feature = "files")]

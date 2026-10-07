@@ -130,6 +130,8 @@ struct Own {
     identity: Handle<Channel>,
     /// The loader's data and stack, which it unmaps at its end.
     data: (u64, u64),
+    #[cfg(feature = "image-gates")]
+    observer: core::cell::Cell<Option<Handle<Channel>>>,
 }
 
 fn main(level: u64) -> u64 {
@@ -149,6 +151,10 @@ fn main(level: u64) -> u64 {
     let Ok(taken) = take(&session) else {
         return GAVE_UP;
     };
+    #[cfg(feature = "image-gates")]
+    if auth_probe::after_take(&own, &start).is_err() {
+        return GAVE_UP;
+    }
     #[cfg(feature = "steps")]
     if matches!(done, Done::Copied(_))
         && let Some(console) = taken.console.as_ref()
@@ -186,6 +192,8 @@ fn boot(session: &Handle<Channel>, start: &Handle<Channel>, level: u8) -> Result
         identity: reply.handles.take(3)?,
         clock: loader_clock(session).map_err(|_| Error::BadState)?,
         data,
+        #[cfg(feature = "image-gates")]
+        observer: core::cell::Cell::new(None),
     })
 }
 
@@ -388,6 +396,16 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                 }
                 #[cfg(feature = "auth-probe")]
                 if label == pl::PARENT {
+                    #[cfg(feature = "image-gates")]
+                    {
+                        let mut probe = Reader::new(bytes);
+                        if Header::read(&mut probe).is_ok_and(|header| {
+                            header.version == pl::VERSION && header.method == auth_probe::OBSERVE
+                        }) {
+                            auth_probe::observe(own, probe, handles, token);
+                            continue;
+                        }
+                    }
                     let mut probe = Reader::new(bytes);
                     if Header::read(&mut probe).is_ok_and(|header| {
                         header.version == pl::VERSION && header.method == auth_probe::METHOD
@@ -827,44 +845,29 @@ fn verify_session(
     offered: Handle<Channel>,
     require_fds: bool,
 ) -> Result<Handle<Channel>, u32> {
-    let (root, header) = match slot {
-        Slot::Files => (&own.files, proto_fs::Method::BindPending.header()),
-        Slot::Clock => (&own.clock, proto_clock::Method::VerifySession.header()),
-        _ => return Err(pl::IO),
-    };
-    let mut w = Writer::new();
-    header.write(&mut w).map_err(|s| s.code())?;
-    if slot == Slot::Files {
-        w.u32(u32::from(require_fds)).map_err(|s| s.code())?;
-    }
-    let mut outgoing = rt::handle::Outgoing::new();
-    outgoing.push(offered.erase()).map_err(|_| pl::IO)?;
     if slot == Slot::Files {
         let identity = sys::handle_duplicate(
             &own.identity,
             Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
         )
         .map_err(code)?;
-        outgoing.push(identity.erase()).map_err(|_| pl::IO)?;
+        let session =
+            rt::fs::Files::bind_pending_on(&own.files, require_fds, Some(offered), identity)
+                .map_err(|_| pl::IO)?;
+        rt::fs::Files::finish_on(&session).map_err(|_| pl::IO)?;
+        return Ok(session);
     }
-    let mut reply =
-        sys::send_handles(root, w.as_bytes(), outgoing).map_err(|refused| code(refused.error))?;
+    if slot != Slot::Clock {
+        return Err(pl::IO);
+    }
+    let request = proto_clock::Method::VerifySession.header().bytes();
+    let mut reply = sys::send_handles(&own.clock, &request, [offered.erase()])
+        .map_err(|refused| code(refused.error))?;
     let mut buffer = [0; MESSAGE_MAX];
     if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
         return Err(pl::IO);
     }
     let session = reply.handles.take::<Channel>(0).map_err(code)?;
-    if slot == Slot::Files {
-        let request = proto_fs::Method::FinishBinding.header().bytes();
-        loop {
-            let reply = sys::send(&session, &request).map_err(code)?;
-            match Reader::new(reply.bytes(&mut buffer)).u32() {
-                Ok(0) => break,
-                Ok(proto_fs::RESOLVING) => continue,
-                _ => return Err(pl::IO),
-            }
-        }
-    }
     Ok(session)
 }
 
@@ -1232,7 +1235,7 @@ fn file_size(image: &Handle<Channel>) -> Result<u64, u32> {
         .write(&mut w)
         .and_then(|()| w.u32(0))
         .map_err(|_| pl::IO)?;
-    let reply = sys::send(image, w.as_bytes()).map_err(code)?;
+    let reply = rt::fs::Files::send_on(image, w.as_bytes()).map_err(|_| pl::IO)?;
     let mut buffer = [0; MESSAGE_MAX];
     let mut r = Reader::new(reply.bytes(&mut buffer));
     if r.u32() != Ok(0) {
@@ -1257,7 +1260,7 @@ fn read_at(image: &Handle<Channel>, offset: u64, out: &mut [u8]) -> Result<usize
             .and_then(|()| w.u64(offset + done as u64))
             .and_then(|()| w.u32(count as u32))
             .map_err(|_| pl::IO)?;
-        let reply = sys::send(image, w.as_bytes()).map_err(code)?;
+        let reply = rt::fs::Files::send_on(image, w.as_bytes()).map_err(|_| pl::IO)?;
         let mut r = Reader::new(reply.bytes(&mut buffer));
         if r.u32() != Ok(0) {
             return Err(pl::IO);
@@ -1320,7 +1323,6 @@ fn read_into(
     at: u64,
 ) -> Result<u64, u32> {
     let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
-    let copy = sys::handle_duplicate(m, rights).map_err(code)?;
     let mut w = Writer::new();
     proto_fs::Method::ReadInto
         .header()
@@ -1330,13 +1332,23 @@ fn read_into(
         .and_then(|()| w.u32(count as u32))
         .and_then(|()| w.u64(at))
         .map_err(|_| pl::IO)?;
-    let reply = sys::send_handles(image, w.as_bytes(), [copy.erase()])
-        .map_err(|refused| code(refused.error))?;
-    let mut buffer = [0; MESSAGE_MAX];
-    let mut r = Reader::new(reply.bytes(&mut buffer));
-    match (r.u32(), r.u32()) {
-        (Ok(0), Ok(n)) => Ok(n.into()),
-        _ => Err(pl::IO),
+    loop {
+        let copy = sys::handle_duplicate(m, rights).map_err(code)?;
+        let reply = sys::send_handles(image, w.as_bytes(), [copy.erase()])
+            .map_err(|refused| code(refused.error))?;
+        if !reply.handles.is_empty() {
+            return Err(pl::IO);
+        }
+        let status = reply.words[0] as u32;
+        if reply.len == 8 && reply.words[0] >> 32 == 0 && status == proto_fs::AUTHENTICATING {
+            rt::fs::Files::finish_on(image).map_err(|_| pl::IO)?;
+            continue;
+        }
+        if reply.len != 8 || status != 0 {
+            return Err(pl::IO);
+        }
+        let n = reply.words[0] >> 32;
+        return if n <= count { Ok(n) } else { Err(pl::IO) };
     }
 }
 

@@ -32,6 +32,10 @@ pub(super) fn counts(channel: &Handle<Channel>) -> Result<[u32; 8], Status> {
     Ok(counters)
 }
 
+pub(super) unsafe fn sleep_for_cleanup() -> i32 {
+    // SAFETY: this fixture helper takes no pointers and returns its observed result.
+    unsafe { files_loader_abort_sleep() }
+}
 fn abort() -> Result<(), Status> {
     let reply = sys::send(
         posix_abi::process::client().session(),
@@ -45,7 +49,7 @@ fn abort() -> Result<(), Status> {
 }
 
 /// Standard Start/Go/HandlesDone loads a real ELF before an uncommitted abort.
-fn load_image(loader: &Handle<Channel>) -> Result<(), Status> {
+pub(super) fn load_image(loader: &Handle<Channel>) -> Result<(), Status> {
     const WINDOW: usize = 0x58_0000_0000;
     const PAGE: u64 = 4096;
     let object = sys::mem_create(PAGE).map_err(Status::Kernel)?;
@@ -145,6 +149,7 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
                 .handles
                 .take::<Channel>(0)
                 .map_err(Status::Kernel)?;
+            let images = super::image_hold::capture(&pending)?;
             let initial = counts(&pending)?;
             if initial[0] != 1 || initial[2] != 0 || initial[3] != 1 || initial[4] != 0 {
                 return Err(Status::BadSize);
@@ -182,6 +187,7 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
                             return Err(Status::BadSize);
                         }
                     }
+                    super::image_hold::released(&images)?;
                     return Ok(());
                 }
                 // SAFETY: the C helper takes no pointers and returns its observed result.

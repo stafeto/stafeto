@@ -19,10 +19,10 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 40,
         ceiling: 40,
-        // 4096 data pages + 650 metadata/PT_LOAD data pages + 27 code/rodata
-        // pages (26 ordinary, 27 instrumented) + 12 stack + 128 reserve,
-        // measured from RAM ELF segments and the printed table byte count.
-        quota: (4096 + 650 + 27 + 12 + 128) * PAGE,
+        // 4096 data pages + 913 metadata/PT_LOAD data pages + 7 rodata
+        // and 28 code pages + 12 stack + 128 allowance before runtime allocations.
+        // The measured VERSION9 ImageHold ELF requires these mapped page counts.
+        quota: (4096 + 913 + 7 + 28 + 12 + 128) * PAGE,
         handle_limit: 512,
         restart: Restart::Never,
         console: true,
@@ -458,10 +458,10 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// checked 64 KiB malloc, including the allocator mapping and alignment.
 const STEPS_QUOTA: u64 = (256 + 16) * PAGE;
 
-/// The quota of the probe of POSIX processes, which each child it spawns
-/// from a file gets too (5c), with 16 pages for the enlarged signal layer
-/// while the fork probe still allocates its additional 1 MiB.
-const PROCS_QUOTA: u64 = (512 + 16) * PAGE;
+/// The probe and each child it spawns inherit this budget. Its 1 MiB
+/// allocator growth needs 530 transient pages: 253 live, 274 for the
+/// memory object and 3 prepaid page tables. Retain the 16-page reserve.
+const PROCS_QUOTA: u64 = (530 + 16) * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and
