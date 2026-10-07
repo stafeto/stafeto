@@ -307,7 +307,14 @@ fn factory(role: i32, command_fd: i32, response_fd: i32, data: i32, data1: i32) 
     }
 }
 fn await_snapshot(predicate: impl Fn(&Snapshot) -> bool) -> Result<Snapshot, i32> {
-    let mut last = [0u32; 5];
+    await_snapshot_at(0, 0, predicate)
+}
+fn await_snapshot_at(
+    role: i32,
+    stage: u32,
+    predicate: impl Fn(&Snapshot) -> bool,
+) -> Result<Snapshot, i32> {
+    let mut last = [0u32; 8];
     for _ in 0..200_000 {
         let s = meter::snapshot()?;
         if predicate(&s) {
@@ -319,16 +326,24 @@ fn await_snapshot(predicate: impl Fn(&Snapshot) -> bool) -> Result<Snapshot, i32
             s.jobs,
             s.preparations,
             s.root_preparations,
+            s.usage[0],
+            s.usage[1],
+            s.usage[3],
         ];
         sys::yield_now().map_err(|_| EIO)?;
     }
     rt::println!(
-        "capacity-diag: await exhausted free={} pages={} jobs={} preparations={} root_preparations={}",
+        "capacity-diag: await exhausted role={} stage={} free={} pages={} jobs={} preparations={} root_preparations={} nodes={} dentries={} descriptions={}",
+        role,
+        stage,
         last[0],
         last[1],
         last[2],
         last[3],
-        last[4]
+        last[4],
+        last[5],
+        last[6],
+        last[7]
     );
     Err(EIO)
 }
@@ -484,14 +499,36 @@ fn tail_baseline(stage: u32, snapshot: &Snapshot) {
     );
 }
 #[inline(never)]
+fn warm_stage(role: i32, stage: u32, errno: i32) {
+    rt::println!(
+        "capacity-warm: role={} stage={} errno={}",
+        role,
+        stage,
+        errno
+    );
+}
+#[inline(never)]
+fn warm_usage(role: i32, stage: u32, snapshot: &Snapshot) {
+    rt::println!(
+        "capacity-warm: role={} stage={} nodes={} dentries={} pages={} descriptions={}",
+        role,
+        stage,
+        snapshot.usage[0],
+        snapshot.usage[1],
+        snapshot.usage[2],
+        snapshot.usage[3]
+    );
+}
+#[inline(never)]
 fn warm_factory(role: i32, f0: i32, f1: i32) -> Result<(), i32> {
-    let before = await_snapshot(|s| {
+    let before = await_snapshot_at(role, 0, |s| {
         s.jobs == 0
             && s.preparations == 0
             && s.root_preparations == 0
             && s.available[2] == 4096
             && s.usage[2] == 0
     })?;
+    warm_usage(role, 0, &before);
     require(paid::idle()?)?;
     let commands = posix_abi::pipe2(0)?;
     let replies = posix_abi::pipe2(0)?;
@@ -506,13 +543,15 @@ fn warm_factory(role: i32, f0: i32, f1: i32) -> Result<(), i32> {
     wait_child(pid, false)?;
     posix_abi::close(replies[0])?;
     posix_abi::close(commands[1])?;
-    await_snapshot(|s| {
+    warm_stage(role, 1, 0);
+    let drained = await_snapshot_at(role, 1, |s| {
         s.jobs == 0
             && s.preparations == 0
             && s.root_preparations == 0
             && s.available[2] == 4096
             && s.usage == before.usage
     })?;
+    warm_usage(role, 2, &drained);
     require(paid::idle()?)
 }
 
@@ -545,15 +584,32 @@ fn leader(role: i32) -> Result<(), i32> {
     };
     warm_factory(role, f0, f1)?;
     meter::control(0, 1)?;
+    warm_stage(role, 3, 0);
     if a {
-        warmup::await_ready(
-            || meter::control(1, 0),
+        let mut last_control_error = 0;
+        warm_stage(role, 4, 0);
+        let result = warmup::await_ready(
+            || {
+                let reply = meter::control(1, 0);
+                last_control_error = reply.err().unwrap_or(0);
+                reply
+            },
             || sys::yield_now().map_err(|_| EIO),
             EINVAL,
             EIO,
-        )?;
+        );
+        if result.is_err() {
+            rt::println!(
+                "capacity-warm: role={} ready_errno={} last_control_errno={}",
+                role,
+                result.err().unwrap_or(0),
+                last_control_error
+            );
+        }
+        warm_stage(role, 5, result.err().unwrap_or(0));
+        result?;
     }
-    let warm = await_snapshot(|s| s.meter[1] != 0)?;
+    let warm = await_snapshot_at(role, 6, |s| s.meter[1] != 0)?;
     rt::println!(
         "capacity-diag: role={} pid={} root={}:{} jobs={} free={} used={} quota={} phase={} registered={}/{}",
         role,
