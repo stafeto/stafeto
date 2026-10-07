@@ -19,6 +19,7 @@ struct Fixture {
     mode: u8,
     tail_visits: u8,
     maintenance_visits: usize,
+    overwrite_msgbuf: bool,
 }
 impl Service<0> for Fixture {
     const VERSION: u16 = 1;
@@ -37,7 +38,23 @@ impl Service<0> for Fixture {
         self.gone += 1;
         s.data.closing = true;
     }
-    fn request_tail(&mut self, _: &mut Request<'_>) -> TailProgress {
+    fn request_tail(&mut self, request: &mut Request<'_>) -> TailProgress {
+        if self.overwrite_msgbuf {
+            assert!(
+                request.bytes()[HEADER_LEN..]
+                    .iter()
+                    .all(|byte| *byte == 0x39)
+            );
+            assert_eq!(
+                request.handles.info(0),
+                Some((
+                    abi::ObjectKind::Memory,
+                    abi::Rights::MAP_READ | abi::Rights::MAP_WRITE
+                ))
+            );
+            assert_eq!(request.token.as_ref().unwrap().raw(), 123);
+            assert_eq!(request.loan().unwrap()[8], u64::MAX);
+        }
         if self.tail_visits == 0 {
             return TailProgress::Idle;
         }
@@ -52,7 +69,17 @@ impl Service<0> for Fixture {
     fn request_maintenance(&mut self, _: &mut [Option<Session<Data, 0>>], protected: u64) {
         assert_eq!(protected, 0);
         self.maintenance_visits += 1;
-        let _ = sys::notify(&Handle::borrowed(abi::Handle::new(99, 1)), 1);
+        if self.overwrite_msgbuf {
+            // An unrelated Process send reuses the kernel message buffer.
+            crate::msgbuf::put_handles(&[abi::Handle::new(999, 1)]);
+            crate::msgbuf::write(
+                abi::msgbuf::INFO,
+                &abi::msgbuf::info(abi::ObjectKind::Channel, abi::Rights::SEND).to_ne_bytes(),
+            );
+            assert!(sys::send(&Handle::borrowed(abi::Handle::new(99, 1)), &[0xa7; 96]).is_err());
+        } else {
+            let _ = sys::notify(&Handle::borrowed(abi::Handle::new(99, 1)), 1);
+        }
     }
     fn request(&mut self, _: &mut Session<Data, 0>, r: &mut Request<'_>) -> Answer {
         self.requests += 1;
@@ -496,5 +523,66 @@ fn ongoing_loan_runs_distinct_fair_maintenance_before_each_fifo_yield_and_final_
     assert_eq!(service.maintenance_visits, 3);
     assert!(current.request.token.is_none());
     assert_eq!(test_calls::log().last().unwrap().0, Call::Reply.number());
+    test_calls::complete();
+}
+
+#[test]
+fn process_maintenance_send_overwrites_kernel_buffer_while_current_bytes_caps_token_and_loan_stay_owned()
+ {
+    let mut service = Fixture {
+        mode: 2,
+        tail_visits: 2,
+        overwrite_msgbuf: true,
+        ..Default::default()
+    };
+    let mut table = [None];
+    let mut bytes = [0x39; 96];
+    bytes[..HEADER_LEN].copy_from_slice(&Header::new(15, 1).bytes());
+    let original = abi::Handle::new(71, abi::Handle::MAX_GENERATION);
+    crate::msgbuf::write(0, &bytes);
+    crate::msgbuf::put_handles(&[original]);
+    crate::msgbuf::write(
+        abi::msgbuf::INFO,
+        &abi::msgbuf::info(
+            abi::ObjectKind::Memory,
+            abi::Rights::MAP_READ | abi::Rights::MAP_WRITE,
+        )
+        .to_ne_bytes(),
+    );
+    // This is the production buffered receive capture: local bytes and owned Incoming arrays.
+    let handles = Incoming::from_buffer(1);
+    let mut buffer = [0; MESSAGE_MAX];
+    crate::msgbuf::read(0, &mut buffer[..bytes.len()]);
+    let mut loan = [0; 11];
+    loan[8] = u64::MAX;
+    let mut current = CurrentRequest::new(0, &buffer[..bytes.len()], handles, Token::fixture(123));
+    current.request.loan = Some(&mut loan);
+    request(&mut service, &mut table, 0, &mut current);
+    let mut calls = Vec::new();
+    for _ in 0..2 {
+        calls.push((Call::Yield.number(), None));
+        calls.push((Call::Send.number(), Some(Error::PeerClosed)));
+        calls.push((Call::Yield.number(), None));
+    }
+    calls.extend([
+        (Call::HandleClose.number(), None),
+        (Call::Send.number(), Some(Error::PeerClosed)),
+        (Call::Yield.number(), None),
+        (Call::Reply.number(), None),
+    ]);
+    test_calls::expect(calls);
+    current.finish(&mut service, &mut table, 15);
+    assert_eq!(current.request.bytes(), bytes);
+    assert!(current.request.token.is_none());
+    assert_eq!(
+        test_calls::log()
+            .iter()
+            .find(|(call, _)| *call == Call::HandleClose.number())
+            .unwrap()
+            .1[0],
+        original.0
+    );
+    assert_eq!(crate::msgbuf::handle(0).0, abi::Handle::new(999, 1));
+    assert_eq!(current.request.loan().unwrap()[8], u64::MAX);
     test_calls::complete();
 }
