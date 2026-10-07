@@ -4,6 +4,10 @@
 //! Main-thread ownership beside the existing worker's atomic mailbox.
 
 use posix_process_service::worker_control::Shared;
+
+// Separate from OWNER: main's exclusive Processes/Controller references
+// never cover the worker's shared atomic mailbox or command UnsafeCell.
+pub(super) static SHARED: Shared = Shared::new();
 use rt::handle::{Channel, Handle, Thread};
 use rt::service::Pending;
 
@@ -27,7 +31,6 @@ pub(super) enum Phase {
 }
 
 pub(super) struct Controller {
-    pub shared: Shared,
     pub pending: Option<Pending>,
     pub worker: Option<Handle<Thread>>,
     pub retired: Option<Handle<Thread>>,
@@ -46,7 +49,6 @@ pub(super) struct Controller {
 impl Controller {
     pub const fn new() -> Self {
         Self {
-            shared: Shared::new(),
             pending: None,
             worker: None,
             retired: None,
@@ -129,17 +131,15 @@ impl Processes {
         if completion.worker != worker.raw().0 || self.replacer.pending.is_some() {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         }
-        let serial = self.replacer.shared.serial();
+        let serial = SHARED.serial();
         if completion.serial != serial {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         }
         if self.replacer.bootstrap {
-            if !self.replacer.shared.idle() || completion.status != 0 {
+            if !SHARED.idle() || completion.status != 0 {
                 return Answer::Status(Status::BadSize);
             }
-        } else if !self
-            .replacer
-            .shared
+        } else if !SHARED
             .outcome(serial)
             .is_some_and(|outcome| outcome.status == completion.status)
         {
@@ -205,24 +205,23 @@ impl Processes {
                     // SAFETY: the actual worker Pending is retained; the
                     // previous raw and reply slots were settled before Idle.
                     unsafe {
-                        self.replacer.shared.stage(command, work.serial);
+                        SHARED.stage(command, work.serial);
                     }
                     self.replacer.phase = Phase::Duplicate;
                 } else if self.replacer.refresh {
                     // An interrupted/failed refresh replays its existing
                     // serial, just as a replacement reuses its prepaid one.
-                    let previous = unsafe { self.replacer.shared.command() };
-                    let serial =
-                        if previous == Command::Refresh && self.replacer.shared.serial() != 0 {
-                            self.replacer.shared.serial()
-                        } else {
-                            let Some(serial) = self.replacer.prepay() else {
-                                return;
-                            };
-                            serial
+                    let previous = unsafe { SHARED.command() };
+                    let serial = if previous == Command::Refresh && SHARED.serial() != 0 {
+                        SHARED.serial()
+                    } else {
+                        let Some(serial) = self.replacer.prepay() else {
+                            return;
                         };
+                        serial
+                    };
                     unsafe {
-                        self.replacer.shared.stage(Command::Refresh, serial);
+                        SHARED.stage(Command::Refresh, serial);
                     }
                     self.replacer.phase = Phase::Publish;
                 } else if self.replacer.check_files {
@@ -243,7 +242,7 @@ impl Processes {
                     label,
                     image,
                     ticket,
-                } = (unsafe { self.replacer.shared.command() })
+                } = (unsafe { SHARED.command() })
                 else {
                     unreachable!("a replacement duplicate");
                 };
@@ -256,7 +255,7 @@ impl Processes {
                 if work.key.label.raw_at(work.key.image) != label
                     || work.key.image != image
                     || work.ticket != ticket
-                    || work.serial != self.replacer.shared.serial()
+                    || work.serial != SHARED.serial()
                 {
                     return;
                 }
@@ -269,7 +268,7 @@ impl Processes {
                     // SAFETY: worker remains parked and this new duplicate
                     // is main-owned. There is no main-to-worker IPC cap hop.
                     unsafe {
-                        self.replacer.shared.main_raw(transfer.into_raw().0);
+                        SHARED.main_raw(transfer.into_raw().0);
                     }
                     self.replacer.phase = Phase::Publish;
                 }
@@ -278,13 +277,13 @@ impl Processes {
                 let Some(pending) = self.replacer.pending.take() else {
                     return;
                 };
-                let command = unsafe { self.replacer.shared.command() };
-                let serial = self.replacer.shared.serial();
-                let raw = self.replacer.shared.raw();
+                let command = unsafe { SHARED.command() };
+                let serial = SHARED.serial();
+                let raw = SHARED.raw();
                 // SAFETY: this is the actual retained parked request. Its
                 // command/serial and duplicate were paid before publication.
                 unsafe {
-                    self.replacer.shared.publish(command, serial, raw);
+                    SHARED.publish(command, serial, raw);
                 }
                 self.replacer.phase = Phase::Waiting;
                 let wire = command_reply(command, serial);
@@ -301,8 +300,8 @@ impl Processes {
                 self.replacer.phase = Phase::Drain;
             }
             Phase::Drain => {
-                let serial = self.replacer.shared.serial();
-                let outcome = self.replacer.shared.outcome(serial);
+                let serial = SHARED.serial();
+                let outcome = SHARED.outcome(serial);
                 let pointer = outcome.map_or(0, |outcome| outcome.reply_slots);
                 if pointer != 0 && self.replacer.cursor < abi::MESSAGE_HANDLES as u8 {
                     if !replace::owns_slots(pointer) {
@@ -321,8 +320,8 @@ impl Processes {
                     }
                     return;
                 }
-                self.replacer.phase = if self.replacer.shared.raw() != 0 {
-                    match unsafe { self.replacer.shared.command() } {
+                self.replacer.phase = if SHARED.raw() != 0 {
+                    match unsafe { SHARED.command() } {
                         Command::Refresh if outcome.is_some_and(|outcome| outcome.acknowledged) => {
                             Phase::CheckFiles
                         }
@@ -334,14 +333,14 @@ impl Processes {
                 };
             }
             Phase::CheckRaw => {
-                let raw = self.replacer.shared.raw();
+                let raw = SHARED.raw();
                 match raw_info(raw, abi::INFO_PROCESS_STATE) {
                     Ok(_) => self.replacer.phase = Phase::CloseRaw,
                     Err(abi::Error::BadHandle) => {
                         // Genuine full-generation NotFound means consumed,
                         // never Init ACK. Other errors keep resident custody.
                         unsafe {
-                            self.replacer.shared.main_raw(0);
+                            SHARED.main_raw(0);
                         }
                         self.replacer.phase = Phase::Finish;
                     }
@@ -349,20 +348,20 @@ impl Processes {
                 }
             }
             Phase::CloseRaw => {
-                if raw_close(self.replacer.shared.raw()).is_ok() {
+                if raw_close(SHARED.raw()).is_ok() {
                     unsafe {
-                        self.replacer.shared.main_raw(0);
+                        SHARED.main_raw(0);
                     }
                     self.replacer.phase = Phase::Finish;
                 }
             }
             Phase::CheckFiles => {
-                let raw = self.replacer.shared.raw();
+                let raw = SHARED.raw();
                 match raw_info(raw, abi::INFO_CHANNEL) {
                     Ok(values) if values[4] == 0 => {
                         self.replacer.result = Some(Handle::<Channel>::from_raw(abi::Handle(raw)));
                         unsafe {
-                            self.replacer.shared.main_raw(0);
+                            SHARED.main_raw(0);
                         }
                         self.replacer.phase = Phase::InstallFiles;
                     }
@@ -386,9 +385,9 @@ impl Processes {
                 self.replacer.phase = Phase::Finish;
             }
             Phase::Finish => {
-                let serial = self.replacer.shared.serial();
-                let outcome = self.replacer.shared.outcome(serial);
-                match unsafe { self.replacer.shared.command() } {
+                let serial = SHARED.serial();
+                let outcome = SHARED.outcome(serial);
+                match unsafe { SHARED.command() } {
                     Command::Replace {
                         index,
                         label,
@@ -422,11 +421,11 @@ impl Processes {
                 // SAFETY: actual parked completion or genuine Ended is
                 // retained, and all slots/raw owners are settled above.
                 unsafe {
-                    self.replacer.shared.reset(serial);
+                    SHARED.reset(serial);
                     // A successful refresh has finished its replay. A
                     // later reconnect must burn a fresh nonwrapping serial.
                     if serial != 0 && !self.replacer.refresh {
-                        self.replacer.shared.stage(Command::Idle, serial);
+                        SHARED.stage(Command::Idle, serial);
                     }
                 }
                 self.replacer.cursor = 0;

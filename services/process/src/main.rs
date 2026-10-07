@@ -351,10 +351,9 @@ struct Owner(UnsafeCell<Processes>);
 unsafe impl Sync for Owner {}
 static OWNER: Owner = Owner(UnsafeCell::new(Processes::new()));
 fn worker_shared() -> &'static posix_process_service::worker_control::Shared {
-    // SAFETY: OWNER is static and never moved. The worker reaches only
-    // Shared, whose accesses obey the parked command publication protocol.
-    unsafe { &*core::ptr::addr_of!((*OWNER.0.get()).replacer.shared) }
+    &controller::SHARED
 }
+
 fn main(_: u64) -> u64 {
     let Ok(mut start) = rt::startup() else {
         return 1;
