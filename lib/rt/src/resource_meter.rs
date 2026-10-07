@@ -258,9 +258,12 @@ pub(crate) fn after<const N: u16>(status: u64, _before: u64) {
 fn trace_memory(call: u16, status: u64, before: u64, after: u64) {
     let mut line = [b' '; 88];
     line[..20].copy_from_slice(b"capacity-memory hex ");
-    for (field, value) in line[20..]
-        .chunks_exact_mut(17)
-        .zip([call as u64, status, before, after])
+    for (field, value) in
+        line[20..]
+            .as_chunks_mut::<17>()
+            .0
+            .iter_mut()
+            .zip([call as u64, status, before, after])
     {
         for (index, byte) in field.iter_mut().take(16).enumerate() {
             *byte = b"0123456789abcdef"[((value >> ((15 - index) * 4)) & 15) as usize];
