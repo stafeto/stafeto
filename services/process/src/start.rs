@@ -160,7 +160,15 @@ impl Processes {
                 }
                 work.copy_cursor += 1;
             }
-            PreparePhase::Reply => return self.publish_initial(index, key),
+            PreparePhase::Reply => {
+                if let Some(exit) = work.resources.exit.take() {
+                    // The process retains its exit source. Close the temporary
+                    // owner before the reply makes Loaded and Exec admissible.
+                    exit.close()?;
+                    return Ok(());
+                }
+                return self.publish_initial(index, key);
+            }
             _ => return Err(abi::Error::BadState),
         }
         Ok(())
@@ -233,8 +241,12 @@ impl Processes {
             )
             .is_ok();
         if accepted {
-            // Exit capability release is a separate bounded cleanup step.
-            work.cancel(key, 0, false);
+            assert!(work.cancel(key, 0, false));
+            assert!(work.finish_cleanup(key));
+            // Every owner has crossed its transfer or close boundary. The
+            // empty slot becomes available before the next request dispatch.
+            self.replacing[index] = None;
+            self.preparing_count -= 1;
         } else {
             work.cancel(key, Status::Kernel(abi::Error::PeerClosed).code(), true);
         }
