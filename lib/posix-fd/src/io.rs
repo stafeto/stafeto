@@ -66,7 +66,7 @@ pub(super) struct IoRecord<T, R> {
     cleanup: R,
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
     pub(super) fn io_pinned(&self, backend: T) -> bool {
         self.holds
             .iter()

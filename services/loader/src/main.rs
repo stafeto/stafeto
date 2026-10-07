@@ -472,6 +472,10 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 }
                             };
                         }
+                        if let Err(code) = capture_fork_image(own, session) {
+                            reply(token, code);
+                            return None;
+                        }
                         let (body, scratch) = fork.as_mut()?;
                         let regions = scratch.count as u64;
                         match steps::timed(kind::GO, regions, || copy(own, body, scratch)).and_then(
@@ -1060,6 +1064,68 @@ fn fill(own: &Own, parent: &Handle<Memory>, bytes: u64, at: u64) -> Result<(), u
     Ok(())
 }
 
+/// Process owns the parent snapshot; this loader captures child custody before copying code.
+fn capture_fork_image(own: &Own, session: &Handle<Channel>) -> Result<(), u32> {
+    let request = proto_process::Method::LoaderForkImage.header().bytes();
+    let mut reply = sys::send(session, &request).map_err(code)?;
+    if reply.len > 8 {
+        return Err(pl::IO);
+    }
+    let bytes = reply.words[0].to_le_bytes();
+    let retained = loader_image::fork_source_reply(
+        &bytes[..reply.len],
+        reply.handles.len(),
+        reply.handles.info(0),
+    )
+    .map_err(|_| pl::IO)?;
+    if !retained {
+        return Ok(());
+    }
+    let source = reply.handles.take::<Channel>(0).map_err(code)?;
+    drop(reply);
+    let identity = sys::handle_duplicate(
+        &own.identity,
+        Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
+    )
+    .map_err(code)?;
+    let files =
+        rt::fs::Files::bind_pending_on(&own.files, false, None, identity).map_err(|_| pl::IO)?;
+    rt::fs::Files::finish_on(&files).map_err(|_| pl::IO)?;
+    let request = proto_fs::Method::CloneExec.header().bytes();
+    loop {
+        let copy =
+            sys::handle_duplicate(&source, Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER)
+                .map_err(code)?;
+        let mut reply = sys::send_handles(&files, &request, [copy.erase()])
+            .map_err(|refused| code(refused.error))?;
+        if reply.len > 8 {
+            return Err(pl::IO);
+        }
+        let bytes = reply.words[0].to_le_bytes();
+        match loader_image::clone_image_reply(
+            &bytes[..reply.len],
+            reply.handles.len(),
+            reply.handles.info(0),
+        )
+        .map_err(|_| pl::IO)?
+        {
+            loader_image::CloneImageProgress::Ready => {
+                // Process pending custody owns the same session before this loader copy goes.
+                drop(reply.handles.take::<Channel>(0).map_err(code)?);
+                return Ok(());
+            }
+            loader_image::CloneImageProgress::Authenticate => {
+                drop(reply);
+                rt::fs::Files::finish_on(&files).map_err(|_| pl::IO)?;
+            }
+            loader_image::CloneImageProgress::Continue => {
+                drop(reply);
+                let _ = sys::yield_now();
+            }
+        }
+    }
+}
+
 /// Ready: the service hears the image is loaded before the parent does,
 /// and takes a commit of the place only from then on.
 fn tell_ready(session: &Handle<Channel>) -> Result<(), u32> {
@@ -1169,7 +1235,7 @@ fn load(own: &Own, block: &Block<'_>) -> Result<(u64, Handle<Channel>, Maps), u3
         _ => pl::NO_ENTRY,
     })?;
     let image = open(own, path)?;
-    let size = file_size(&image)?;
+    let size = file_size(own, &image)?;
     let mut head = [0; PAGE as usize];
     let read = read_at(&image, 0, &mut head[..size.min(PAGE) as usize])?;
     let layout =
@@ -1228,21 +1294,59 @@ fn open(own: &Own, path: &[u8]) -> Result<Handle<Channel>, u32> {
 }
 
 /// The size of the file of the image session.
-fn file_size(image: &Handle<Channel>) -> Result<u64, u32> {
+fn file_size(_own: &Own, image: &Handle<Channel>) -> Result<u64, u32> {
     let mut w = Writer::new();
     proto_fs::Method::InfoFd
         .header()
         .write(&mut w)
         .and_then(|()| w.u32(0))
         .map_err(|_| pl::IO)?;
+    #[cfg(feature = "image-info-probe")]
+    let before = sys::process_handles(&_own.process)
+        .map_err(|_| pl::IO)?
+        .live;
     let reply = rt::fs::Files::send_on(image, w.as_bytes()).map_err(|_| pl::IO)?;
     let mut buffer = [0; MESSAGE_MAX];
-    let mut r = Reader::new(reply.bytes(&mut buffer));
-    if r.u32() != Ok(0) {
-        return Err(pl::IO);
+    let handles = reply.handles.len();
+    #[cfg(feature = "image-info-probe")]
+    let received = sys::process_handles(&_own.process)
+        .map_err(|_| pl::IO)?
+        .live;
+    #[cfg(feature = "image-info-probe")]
+    let valid_caps = handles == 0
+        || (handles == 1
+            && reply.handles.info(0)
+                == Some((abi::ObjectKind::Memory, Rights::MAP_READ | Rights::TRANSFER)));
+    let size = loader_image::image_reply_size(reply.bytes(&mut buffer), handles);
+    drop(reply);
+    #[cfg(feature = "image-info-probe")]
+    {
+        let after = sys::process_handles(&_own.process)
+            .map_err(|_| pl::IO)?
+            .live;
+        if before > u16::MAX as u64
+            || received > u16::MAX as u64
+            || after > u16::MAX as u64
+            || handles > 0x7f
+        {
+            return Err(pl::IO);
+        }
+        let balanced = before == after && received == before + handles as u64;
+        let flags = 0x80
+            | u64::from(size.is_err())
+            | (u64::from(valid_caps) << 1)
+            | (u64::from(balanced) << 2);
+        let bits =
+            flags | (before << 8) | (received << 24) | (after << 40) | ((handles as u64) << 56);
+        let observer = _own.observer.take().ok_or(pl::IO)?;
+        let result = sys::notify(&observer, bits);
+        _own.observer.set(Some(observer));
+        result.map_err(|_| pl::IO)?;
+        if !balanced || !valid_caps {
+            return Err(pl::IO);
+        }
     }
-    let info = proto_fs::NodeInfo::read(&mut r).map_err(|_| pl::IO)?;
-    Ok(info.size)
+    size.map_err(|_| pl::IO)
 }
 
 /// ReadAt of the image session into `out` from `offset`, as many requests

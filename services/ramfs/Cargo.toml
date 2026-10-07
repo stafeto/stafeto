@@ -19,6 +19,8 @@ bench = false
 # Read-only retained-session observation for the owner-death regression.
 auth-probe = []
 image-gates = ["auth-probe"]
+image-info-probe = ["auth-probe"]
+open-finalize-clock-probe = ["auth-probe"]
 # The longest step of the loop for each method, printed when it grows (rt
 # feature step-stats; xtask process-steps, under -icount).
 steps = ["rt/step-stats"]
@@ -26,6 +28,7 @@ steps = ["rt/step-stats"]
 [dependencies]
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
+proto-clock = { path = "../../proto/clock" }
 proto-fs = { path = "../../proto/fs" }
 proto-init = { path = "../../proto/init" }
 proto-process = { path = "../../proto/process" }
@@ -33,6 +36,7 @@ proto-wire = { path = "../../proto/wire" }
 
 [target.'cfg(target_os = "none")'.dependencies]
 rt = { path = "../../lib/rt" }
+posix-clock = { path = "../../lib/posix-clock" }
 
 [dev-dependencies]
 bootimg = { path = "../../lib/bootimg", features = ["write"] }

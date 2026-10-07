@@ -13,7 +13,7 @@
 
 use crate::make::{self, Failed};
 use core::sync::atomic::{AtomicU64, Ordering};
-use proto_init::{Adoption, Method};
+use proto_init::Method;
 use proto_process::Create;
 use proto_wire::Status;
 #[cfg(feature = "adoption-refusals")]
@@ -55,7 +55,6 @@ pub fn start(own: &Handle<Process>, level: u8) -> Result<(), abi::Error> {
 extern "C" fn receiver(_: u64) -> ! {
     let parent = make::init();
     let own = Handle::<Thread>::borrowed(abi::Handle(THREAD.load(Ordering::Acquire)));
-    let mut buffer = [0; abi::MESSAGE_MAX];
     #[cfg(feature = "adoption-refusals")]
     refusals(&parent);
     loop {
@@ -68,7 +67,14 @@ extern "C" fn receiver(_: u64) -> ! {
         };
         // A refusal of init (a second ADOPT, a reply out of the layout)
         // would only come again: the service ends, as above.
-        let Ok(adoption) = Adoption::read(reply.bytes(&mut buffer)) else {
+        if reply.len != abi::INLINE_MAX {
+            sys::process_exit(8);
+        }
+        let Ok(adoption) = posix_process_service::adoption_reply::read(
+            reply.len,
+            &abi::inline_bytes(&reply.words),
+            reply.handles.len(),
+        ) else {
             sys::process_exit(8);
         };
         let create = Create {
@@ -90,6 +96,7 @@ extern "C" fn receiver(_: u64) -> ! {
                     &create,
                     [start, witness],
                     &adoption.program,
+                    adoption.source,
                     WINDOW,
                     &own,
                     adoption.priority,
@@ -100,7 +107,7 @@ extern "C" fn receiver(_: u64) -> ! {
                 label: None,
             }),
         };
-        make::adopted(adoption.ticket, made);
+        make::adopted(&adoption, made);
     }
 }
 

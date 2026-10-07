@@ -7,5 +7,6 @@ repository.workspace = true
 license = "MIT"
 
 [dependencies]
+bootimg = { path = "../../lib/bootimg" }
 abi = { path = "../../lib/abi" }
 proto-wire = { path = "../wire" }

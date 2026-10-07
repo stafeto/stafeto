@@ -38,8 +38,13 @@ table-relibc-threads = []
 # The probe of POSIX processes (posix-procs) and the records it spawns.
 table-posix-procs = []
 table-posix-files = []
+data-carrier-probe = []
+public-data-probe = ["data-carrier-probe"]
+open-finalize-clock-probe = ["data-carrier-probe"]
 ramfs-cleanup = []
 loader-abort = []
+loader-info = ["loader-abort"]
+t6-runtime = ["loader-abort"]
 table-loader-channels = []
 table-posix-poll = []
 table-posix-pty = []
@@ -79,3 +84,6 @@ uart = { path = "../uart" }
 # without rt.
 [target.'cfg(target_os = "none")'.dependencies]
 rt = { path = "../../lib/rt" }
+
+[dev-dependencies]
+bootimg = { path = "../../lib/bootimg", features = ["write"] }

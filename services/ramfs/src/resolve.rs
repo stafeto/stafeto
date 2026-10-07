@@ -4,6 +4,7 @@
 //! Retained byte paths. Every step handles one component, eight names or one link.
 
 use crate::authority::Identity;
+use crate::metadata::{MetadataPath, MetadataProof};
 use crate::namespace::{Edge, Location, NamespacePath, NamespaceProof, RawSyntax};
 use crate::storage::{Pin, ROOT, SYMLINK, Storage, Token};
 use proto_fs::{LOOP, MAX_PATH, NAME_TOO_LONG, NO_ENTRY, NOT_DIRECTORY, STALE_PROOF};
@@ -35,6 +36,7 @@ pub struct Resolve {
 pub enum Intent {
     Lookup { follow: bool },
     Open { flags: u32 },
+    Metadata { path: MetadataPath },
     DirectoryCreate,
     SymbolicLinkCreate,
     Namespace { path: NamespacePath },
@@ -43,6 +45,7 @@ impl Intent {
     fn follows(self) -> bool {
         match self {
             Self::Lookup { follow } => follow,
+            Self::Metadata { path } => path.follow,
             Self::Open { flags } => {
                 flags & proto_fs::NO_FOLLOW == 0
                     && flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE)
@@ -341,6 +344,34 @@ impl Resolve {
             role: path,
             identity,
             epoch: self.epoch,
+        })
+    }
+    /// Current-directory paths use the authentic retained search result.
+    pub fn cwd_proof(
+        &self,
+        storage: &Storage<'_>,
+        identity: Identity,
+    ) -> Result<crate::cwd::CwdProof, u32> {
+        let proof = self.result_proof(storage, identity, Intent::Lookup { follow: true })?;
+        Ok(crate::cwd::CwdProof {
+            target: proof.target.ok_or(NO_ENTRY)?,
+            identity,
+            epoch: self.epoch,
+        })
+    }
+    /// Metadata proofs preserve the requested follow and real/effective search role.
+    pub fn metadata_proof(
+        &self,
+        storage: &Storage<'_>,
+        identity: Identity,
+        path: MetadataPath,
+    ) -> Result<MetadataProof, u32> {
+        let proof = self.result_proof(storage, identity, Intent::Metadata { path })?;
+        Ok(MetadataProof {
+            target: proof.target.ok_or(NO_ENTRY)?,
+            identity,
+            epoch: self.epoch,
+            path,
         })
     }
     /// Commit must supply the same operation intent captured at admission.

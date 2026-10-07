@@ -100,7 +100,7 @@ fn capture(attempt: &Attempt, fd: i32) -> Result<Handle<Channel>, Status> {
     let mut w = Writer::new();
     proto_fs::Method::Clone.header().write(&mut w)?;
     w.u32(1)?;
-    w.u32(fd)?;
+    w.u32(fd.fd())?;
     let offered = Files::clone_on(&Handle::<Channel>::borrowed(raw), w.as_bytes())?;
     let mut reply = sys::send_handles(
         &attempt.loader,
@@ -117,7 +117,7 @@ fn capture(attempt: &Attempt, fd: i32) -> Result<Handle<Channel>, Status> {
     }
     reply.handles.take::<Channel>(0).map_err(Status::Kernel)
 }
-#[cfg(not(feature = "image-gates-normal"))]
+#[cfg(any(not(feature = "image-gates-normal"), feature = "t6-runtime"))]
 fn image_snapshot(image: &Handle<Channel>) -> Result<[u64; 10], Status> {
     let reply = Files::send_on(image, &Header::new(0xfff9, proto_fs::VERSION).bytes())?;
     if reply.len != 80 || !reply.handles.is_empty() {
@@ -135,11 +135,11 @@ fn image_snapshot(image: &Handle<Channel>) -> Result<[u64; 10], Status> {
     }
     Ok(words)
 }
-#[cfg(not(feature = "image-gates-normal"))]
+#[cfg(any(not(feature = "image-gates-normal"), feature = "t6-runtime"))]
 struct Mapped {
     memory: Handle<rt::handle::Memory>,
 }
-#[cfg(not(feature = "image-gates-normal"))]
+#[cfg(any(not(feature = "image-gates-normal"), feature = "t6-runtime"))]
 impl Mapped {
     const ADDRESS: usize = 0x59_0000_0000;
     fn new() -> Result<Self, Status> {
@@ -194,14 +194,14 @@ impl Mapped {
         }
     }
 }
-#[cfg(not(feature = "image-gates-normal"))]
+#[cfg(any(not(feature = "image-gates-normal"), feature = "t6-runtime"))]
 impl Drop for Mapped {
     fn drop(&mut self) {
         // SAFETY: this mapping is owned solely by the fixture and no access follows Drop.
         let _ = unsafe { sys::mem_unmap(posix_abi::allocation::process(), Self::ADDRESS, 4096) };
     }
 }
-#[cfg(not(feature = "image-gates-normal"))]
+#[cfg(any(not(feature = "image-gates-normal"), feature = "t6-runtime"))]
 fn take(fd: i32) -> Result<(), Status> {
     let mut attempt = Attempt::start(false)?;
     let pending = capture(&attempt, fd)?;
@@ -305,7 +305,7 @@ fn take(fd: i32) -> Result<(), Status> {
     );
     Ok(())
 }
-#[cfg(not(feature = "image-gates-normal"))]
+#[cfg(any(not(feature = "image-gates-normal"), feature = "t6-runtime"))]
 fn trace(ticket: u64) -> Result<[u32; 18], Status> {
     let mut w = Writer::new();
     Header::new(0xfff9, proto_process::VERSION).write(&mut w)?;
@@ -357,8 +357,8 @@ fn resolve(pending: &Handle<Channel>) -> Result<u64, Status> {
         }
     }
 }
-#[cfg(not(feature = "image-gates-normal"))]
-fn ambiguous_setid(fd: i32) -> Result<(), Status> {
+#[cfg(any(not(feature = "image-gates-normal"), feature = "t6-runtime"))]
+pub(super) fn ambiguous_setid(fd: i32) -> Result<(), Status> {
     let before = posix_abi::process::client().query()?;
     let mut attempt = Attempt::start(true)?;
     let armed = sys::send(
@@ -536,7 +536,7 @@ fn normal_setid(fd: i32) -> Result<(), Status> {
 }
 #[unsafe(no_mangle)]
 extern "C" fn files_image_gates(fd: i32) -> i32 {
-    #[cfg(not(feature = "image-gates-normal"))]
+    #[cfg(any(not(feature = "image-gates-normal"), feature = "t6-runtime"))]
     let result = take(fd).and_then(|()| ambiguous_setid(fd));
     #[cfg(feature = "image-gates-normal")]
     let result = normal_setid(fd);

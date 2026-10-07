@@ -10,6 +10,7 @@
 //! Loaded or Abandon tells the loop how it went. Until the loader of 5c
 //! the service pays for the segments from its quota.
 
+use bootimg::exec_bindings::{Bindings, InitialSource};
 use bootimg::{BootImage, Program};
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -66,7 +67,7 @@ fn level() -> u8 {
 }
 
 /// The program `name` of the boot image.
-fn program(name: &Name) -> Option<Program<'static>> {
+fn program(name: &Name, source: InitialSource) -> Option<Program<'static>> {
     let len = IMAGE[1].load(Ordering::Acquire);
     let addr = IMAGE[0].load(Ordering::Relaxed);
     if len == 0 {
@@ -77,10 +78,12 @@ fn program(name: &Name) -> Option<Program<'static>> {
     // that makes processes started.
     let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(addr as *const u8, len) };
     let boot = BootImage::parse(bytes).ok()?;
-    let file = boot
+    let metadata = boot
         .files()
-        .find(|f| f.name.as_bytes() == name.as_bytes())?;
-    Program::parse(file.data).ok()
+        .find(|f| f.name == bootimg::exec_bindings::FILE)?;
+    let bindings = Bindings::parse(metadata.data, boot.count()).ok()?;
+    bindings.validate_layout(boot).ok()?;
+    bindings.resolve(boot, source, name.as_bytes()).ok()
 }
 
 /// A process the service made and loaded, whose first thread waits for
@@ -88,6 +91,8 @@ fn program(name: &Name) -> Option<Program<'static>> {
 /// with MANAGE, DUPLICATE and TRANSFER, the record's session and its
 /// identity session, and the thread.
 pub struct Made {
+    /// Immutable metadata for the initial source; Seed admission follows separately.
+    pub source: InitialSource,
     pub label: u64,
     pub process: Handle<Process>,
     pub session: Handle<Channel>,
@@ -147,7 +152,18 @@ pub fn status(bytes: &[u8]) -> Result<Status, Status> {
 /// ADOPTED for `ticket` with what `made` gave: the session, the process,
 /// a copy of its thread and the identity session, then thread_start and Loaded once init took
 /// them; a refusal of init, or no process, ends the record with Abandon.
-pub fn adopted(ticket: u64, made: Result<Made, Failed>) {
+pub fn adopted(adoption: &proto_init::Adoption, made: Result<Made, Failed>) {
+    let ticket = adoption.ticket;
+    let made = made.and_then(|made| {
+        if made.source == adoption.source {
+            Ok(made)
+        } else {
+            Err(Failed {
+                status: Status::BadSize,
+                label: Some(made.label),
+            })
+        }
+    });
     let mut w = Writer::new();
     if proto_init::Method::Adopted.header().write(&mut w).is_err() || w.u64(ticket).is_err() {
         return;
@@ -167,6 +183,7 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>) {
         }
     };
     let Made {
+        source: _,
         label,
         process,
         session,
@@ -210,6 +227,7 @@ pub unsafe fn make(
     create: &Create,
     start: [Handle<Channel>; 2],
     name: &Name,
+    source: InitialSource,
     window: usize,
     thread: &Handle<Thread>,
     level: u8,
@@ -218,7 +236,8 @@ pub unsafe fn make(
         status,
         label: None,
     };
-    let program = program(name).ok_or(refused(Status::from_code(proto_process::INVALID)))?;
+    let program =
+        program(name, source).ok_or(refused(Status::from_code(proto_process::INVALID)))?;
     let mut w = Writer::new();
     Method::Create.header().write(&mut w).map_err(refused)?;
     create.write(&mut w).map_err(refused)?;
@@ -261,6 +280,7 @@ pub unsafe fn make(
     let _ = sys::thread_set_priority(thread, self::level(), abi::Policy::Fifo);
     let first = filled.map_err(|e| failed(Status::Kernel(e)))?;
     Ok(Made {
+        source,
         label,
         process,
         session,

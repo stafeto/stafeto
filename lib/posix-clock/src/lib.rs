@@ -122,14 +122,16 @@ impl Client {
             };
             let mut buffer = [0; MESSAGE_MAX];
             let bytes = reply.bytes(&mut buffer);
-            match Status::from_code(Reader::new(bytes).u32()?) {
-                Status::Ok => {}
-                status => return Err(status),
-            }
-            if reply.handles.len() != 1 {
+            proto_clock::decode_page_reply(bytes, reply.handles.len())?;
+            let rights = rt::abi::Rights::MAP_READ | rt::abi::Rights::TRANSFER;
+            if reply.handles.info(0) != Some((rt::abi::ObjectKind::Memory, rights)) {
                 return Err(Status::BadSize);
             }
-            return reply.handles.take(0).map_err(Status::Kernel);
+            let memory = reply.handles.take(0).map_err(Status::Kernel)?;
+            if sys::memory_info(&memory)?.size != proto_clock::page::SIZE as u64 {
+                return Err(Status::BadSize);
+            }
+            return Ok(memory);
         }
     }
     pub fn anchor(&self) -> Result<Anchor, Status> {

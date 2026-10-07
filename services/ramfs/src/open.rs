@@ -42,12 +42,24 @@ impl Journal {
     pub fn new(flags: u32, mode: u32, umask: u32) -> Result<Self, u32> {
         let allowed = 3
             | proto_fs::DIRECTORY_ONLY
+            | proto_fs::CHANGES
             | proto_fs::CREATE
             | proto_fs::EXCLUSIVE
             | proto_fs::TRUNCATE
             | proto_fs::APPEND
             | proto_fs::NO_FOLLOW;
         if flags & !allowed != 0 || flags & 3 == 3 {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        if flags & proto_fs::CHANGES != 0
+            && flags
+                & (proto_fs::CREATE
+                    | proto_fs::EXCLUSIVE
+                    | proto_fs::TRUNCATE
+                    | proto_fs::APPEND
+                    | proto_fs::NO_FOLLOW)
+                != 0
+        {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         Ok(Self {
@@ -90,6 +102,9 @@ impl Journal {
                     };
                     return Ok(true);
                 }
+                if self.flags & proto_fs::CHANGES != 0 {
+                    return Err(proto_fs::INVALID_ARGUMENT);
+                }
                 if self.flags & proto_fs::CREATE == 0 {
                     return Err(proto_fs::NO_ENTRY);
                 }
@@ -113,6 +128,19 @@ impl Journal {
             }
         }
     }
+    /// Only a first creation or regular-file truncation consumes a timestamp.
+    pub fn needs_time(&self, ram: &Ram<'_>, fds: &Fds) -> Result<bool, u32> {
+        match self.phase {
+            Phase::Prepared {
+                creation: Some(_), ..
+            } => Ok(true),
+            Phase::Prepared { held, .. } if self.flags & proto_fs::TRUNCATE != 0 => {
+                let token = ram.validate_tentative(fds, held)?;
+                Ok(ram.storage.node(token)?.kind == REG)
+            }
+            _ => Ok(false),
+        }
+    }
     /// The caller validates owner, identity stamp and intent before every entry.
     /// A committed replay uses its exact descriptor and remains independent of path epoch.
     pub fn commit(
@@ -122,7 +150,7 @@ impl Journal {
         proof: Option<ResultProof<'_>>,
         identity: Identity,
         charge: &mut u16,
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<TentativeOpen, u32> {
         if let Phase::Committed { held, .. } = self.phase {
             ram.validate_tentative(fds, held)?;
@@ -308,8 +336,115 @@ mod tests {
     }
 
     #[test]
+    fn final_publication_is_prepaid_and_creation_time_is_consumed_once() {
+        let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+        let mut fds = fds();
+        let flags = proto_fs::CREATE | proto_fs::READ_WRITE;
+        let resolver = ready(&mut ram, b"/finalized", flags);
+        let mut charge = ram.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
+        let mut journal = Journal::new(flags, 0o600, 0).unwrap();
+        while !with_proof!(
+            prepare,
+            journal,
+            ram,
+            fds,
+            resolver,
+            plain,
+            OWNER,
+            &mut charge
+        )
+        .unwrap()
+        {}
+        let Phase::Prepared { held, .. } = journal.phase else {
+            panic!("prepared")
+        };
+        let key = proto_fs::OpenKey {
+            slot: 0,
+            generation: 1,
+        };
+        assert!(journal.needs_time(&ram, &fds).unwrap());
+        let stale = TentativeOpen {
+            description: crate::storage::Token {
+                generation: held.description.generation + 1,
+                ..held.description
+            },
+            ..held
+        };
+        assert!(ram.preflight_finish_open(&fds, key, stale).is_err());
+        let publication = ram.preflight_finish_open(&fds, key, held).unwrap();
+        assert_eq!(ram.finished_open(&fds, key), Err(proto_fs::OPEN_RETIRED));
+        assert_eq!(
+            ram.storage.lookup(ROOT, b"finalized"),
+            Err(proto_fs::NO_ENTRY)
+        );
+        let slots = fds.slots;
+        let tentative = fds.tentative;
+        let receipts = fds.open_receipts;
+        let now = proto_fs::Timestamp::legacy_ns(123);
+        with_proof!(
+            commit,
+            journal,
+            ram,
+            fds,
+            resolver,
+            some,
+            OWNER,
+            &mut charge,
+            now
+        )
+        .unwrap();
+        assert_eq!(fds.slots, slots);
+        assert_eq!(fds.tentative, tentative);
+        assert!(fds.open_receipts == receipts);
+        assert!(!journal.needs_time(&ram, &fds).unwrap());
+        assert_eq!(ram.finish_preflighted(&mut fds, publication), held);
+        assert_eq!(ram.finished_open(&fds, key), Ok(held));
+        let token = ram.storage.lookup(ROOT, b"finalized").unwrap();
+        assert_eq!(ram.storage.node(token).unwrap().times, [now; 3]);
+        let replay = ram.preflight_finish_open(&fds, key, held).unwrap();
+        assert_eq!(ram.finish_preflighted(&mut fds, replay), held);
+        assert_eq!(ram.storage.node(token).unwrap().times, [now; 3]);
+        ram.cancel_finished_open(&mut fds, key).unwrap();
+        assert!(ram.preflight_finish_open(&fds, key, held).is_err());
+        ram.storage.release_preparation(charge);
+        resolver.release(&mut ram.storage);
+    }
+
+    #[test]
+    fn timestamp_hint_distinguishes_regular_truncate_from_existing_create() {
+        let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+        let mut fds = fds();
+        create(&mut ram, b"existing");
+        for (flags, timed) in [
+            (proto_fs::READ_ONLY, false),
+            (proto_fs::READ_ONLY | proto_fs::CREATE, false),
+            (proto_fs::READ_WRITE | proto_fs::TRUNCATE, true),
+        ] {
+            let resolver = ready(&mut ram, b"/existing", flags);
+            let mut charge = ram.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
+            let mut journal = Journal::new(flags, 0o600, 0).unwrap();
+            with_proof!(
+                prepare,
+                journal,
+                ram,
+                fds,
+                resolver,
+                plain,
+                OWNER,
+                &mut charge
+            )
+            .unwrap();
+            assert_eq!(journal.needs_time(&ram, &fds), Ok(timed));
+            journal.cancel(&mut ram, &mut fds, &mut charge).unwrap();
+            assert_eq!(journal.needs_time(&ram, &fds), Ok(false));
+            ram.storage.release_preparation(charge);
+            resolver.release(&mut ram.storage);
+        }
+    }
+
+    #[test]
     fn created_commit_is_cached_after_epoch_change_and_cancel_is_terminal() {
-        let mut ram = Ram::new(0);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
         let mut fds = fds();
         let flags = proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_WRITE;
         let resolver = ready(&mut ram, b"/created", flags);
@@ -351,7 +486,7 @@ mod tests {
             some,
             OWNER,
             &mut charge,
-            11,
+            proto_fs::Timestamp::legacy_ns(11),
         )
         .unwrap();
         assert!(
@@ -361,11 +496,24 @@ mod tests {
         );
         let token = ram.storage.lookup(ROOT, b"created").unwrap();
         assert_eq!(ram.storage.node(token).unwrap().mode, 0);
-        assert_eq!(ram.storage.node(token).unwrap().times, [11; 3]);
-        assert_eq!(ram.storage.node(ROOT).unwrap().times[1..], [11; 2]);
+        assert_eq!(
+            ram.storage.node(token).unwrap().times,
+            [proto_fs::Timestamp::legacy_ns(11); 3]
+        );
+        assert_eq!(
+            ram.storage.node(ROOT).unwrap().times[1..],
+            [proto_fs::Timestamp::legacy_ns(11); 2]
+        );
         assert_eq!(
             journal
-                .commit(&mut ram, &mut fds, None, OWNER, &mut charge, 12)
+                .commit(
+                    &mut ram,
+                    &mut fds,
+                    None,
+                    OWNER,
+                    &mut charge,
+                    proto_fs::Timestamp::legacy_ns(12)
+                )
                 .unwrap(),
             held
         );
@@ -378,7 +526,14 @@ mod tests {
             Ok(Effect::Created)
         );
         assert_eq!(
-            journal.commit(&mut ram, &mut fds, None, OWNER, &mut charge, 13),
+            journal.commit(
+                &mut ram,
+                &mut fds,
+                None,
+                OWNER,
+                &mut charge,
+                proto_fs::Timestamp::legacy_ns(13)
+            ),
             Err(proto_fs::STALE_PROOF)
         );
         assert_eq!(
@@ -401,7 +556,7 @@ mod tests {
 
     #[test]
     fn truncation_commit_revalidates_access_and_replay_preserves_new_bytes() {
-        let mut ram = Ram::new(0);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
         let mut fds = fds();
         let token = create(&mut ram, b"truncate");
         ram.storage.write(token, ROOT_ACCOUNT, 0, b"old").unwrap();
@@ -436,7 +591,7 @@ mod tests {
                 some,
                 denied,
                 &mut charge,
-                20
+                proto_fs::Timestamp::legacy_ns(20)
             ),
             Err(proto_fs::ACCESS_DENIED)
         );
@@ -450,13 +605,20 @@ mod tests {
             some,
             OWNER,
             &mut charge,
-            21,
+            proto_fs::Timestamp::legacy_ns(21),
         )
         .unwrap();
         assert_eq!(ram.storage.node(token).unwrap().mode, 0o600);
         ram.storage.write(token, ROOT_ACCOUNT, 0, b"new").unwrap();
         assert_eq!(
-            journal.commit(&mut ram, &mut fds, None, OWNER, &mut charge, 22),
+            journal.commit(
+                &mut ram,
+                &mut fds,
+                None,
+                OWNER,
+                &mut charge,
+                proto_fs::Timestamp::legacy_ns(22)
+            ),
             Ok(held)
         );
         let mut bytes = [0; 3];
@@ -473,7 +635,7 @@ mod tests {
 
     #[test]
     fn reserved_edge_and_every_unpublished_phase_keep_one_charge_at_full_pool() {
-        let mut ram = Ram::new(0);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
         let mut fds = fds();
         let mut charges = [NONE; crate::storage::PREPARATIONS];
         for (i, charge) in charges.iter_mut().enumerate() {
@@ -526,7 +688,14 @@ mod tests {
                     trailing_slash: false,
                 };
                 assert_eq!(
-                    journal.commit(&mut ram, &mut fds, Some(wrong), OWNER, &mut charges[0], 30),
+                    journal.commit(
+                        &mut ram,
+                        &mut fds,
+                        Some(wrong),
+                        OWNER,
+                        &mut charges[0],
+                        proto_fs::Timestamp::legacy_ns(30)
+                    ),
                     Err(proto_fs::STALE_PROOF)
                 );
             }
@@ -546,5 +715,243 @@ mod tests {
             ram.storage.release_preparation(charge);
         }
         assert_eq!(ram.storage.preparations_used(), 0);
+    }
+}
+
+#[cfg(test)]
+mod create_directory_policy_tests {
+    use super::*;
+    use crate::storage::{ROOT, Root};
+    #[test]
+    fn read_only_create_directory_refuses_before_descriptor_charge() {
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+        let mut fds = Fds {
+            root: Root {
+                id: 700,
+                generation: 1,
+            },
+            ..Fds::default()
+        };
+        let identity = Identity {
+            uid: 0,
+            gid: 0,
+            groups: proto_process::Groups::EMPTY,
+        };
+        assert!(matches!(
+            ram.prepare_open_token(&mut fds, ROOT, proto_fs::CREATE, identity, None),
+            Err(proto_fs::IS_DIRECTORY)
+        ));
+        assert!(fds.slots.iter().all(Option::is_none));
+        let held = ram
+            .prepare_open_token(
+                &mut fds,
+                ROOT,
+                proto_fs::CREATE | proto_fs::DIRECTORY_ONLY,
+                identity,
+                None,
+            )
+            .unwrap();
+        ram.cancel_open(&mut fds, held).unwrap();
+        assert!(fds.slots.iter().all(Option::is_none));
+        assert!(matches!(
+            ram.prepare_open_token(
+                &mut fds,
+                ROOT,
+                proto_fs::CREATE | proto_fs::EXCLUSIVE,
+                identity,
+                None
+            ),
+            Err(proto_fs::ALREADY_EXISTS)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod concurrent_create_retry_tests {
+    use super::*;
+    use crate::resolve::{Intent, Progress, Resolve};
+    use crate::storage::{ROOT, Root};
+
+    fn resolve(ram: &mut Ram<'_>, resolver: &mut Resolve, identity: Identity) {
+        for _ in 0..2000 {
+            if resolver.step(&mut ram.storage, identity).unwrap() != Progress::More {
+                return;
+            }
+        }
+        panic!("bounded resolver did not complete");
+    }
+
+    #[test]
+    fn two_root_creation_refreshes_stale_proof_with_same_paid_admission() {
+        interleaved_creates(true);
+    }
+
+    #[test]
+    fn stale_between_resolve_and_prepare_retains_the_same_paid_admission() {
+        interleaved_creates(false);
+    }
+
+    fn interleaved_creates(fully_prepared: bool) {
+        let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+        let identities = [
+            Identity {
+                uid: 0,
+                gid: 0,
+                groups: proto_process::Groups::EMPTY,
+            },
+            Identity {
+                uid: 65534,
+                gid: 65534,
+                groups: proto_process::Groups::EMPTY,
+            },
+        ];
+        let roots = [
+            Root {
+                id: 700,
+                generation: 1,
+            },
+            Root {
+                id: 701,
+                generation: 1,
+            },
+        ];
+        let mut sessions = roots.map(|root| Fds {
+            root,
+            ..Fds::default()
+        });
+        let flags = proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_WRITE;
+        let names: [&[u8]; 2] = [b"/tmp/concurrent-a", b"/tmp/concurrent-b"];
+        let mut resolvers = core::array::from_fn::<_, 2, _>(|i| {
+            Resolve::with_intent(
+                &mut ram.storage,
+                names[i],
+                ROOT,
+                identities[i],
+                Intent::Open { flags },
+            )
+            .unwrap()
+        });
+        let mut journals =
+            core::array::from_fn::<_, 2, _>(|_| Journal::new(flags, 0o600, 0).unwrap());
+        let mut charges = roots.map(|root| ram.storage.charge_preparation(root).unwrap());
+        let paid = charges;
+        for i in 0..2 {
+            resolve(&mut ram, &mut resolvers[i], identities[i]);
+            loop {
+                let proof = resolvers[i]
+                    .result_proof(&ram.storage, identities[i], Intent::Open { flags })
+                    .unwrap();
+                if journals[i]
+                    .prepare(
+                        &mut ram,
+                        &mut sessions[i],
+                        proof,
+                        identities[i],
+                        &mut charges[i],
+                    )
+                    .unwrap()
+                    || (i == 1 && !fully_prepared)
+                {
+                    break;
+                }
+            }
+        }
+        let first = resolvers[0]
+            .result_proof(&ram.storage, identities[0], Intent::Open { flags })
+            .unwrap();
+        let held_a = journals[0]
+            .commit(
+                &mut ram,
+                &mut sessions[0],
+                Some(first),
+                identities[0],
+                &mut charges[0],
+                proto_fs::Timestamp::ZERO,
+            )
+            .unwrap();
+        assert!(matches!(
+            resolvers[1].result_proof(&ram.storage, identities[1], Intent::Open { flags }),
+            Err(proto_fs::STALE_PROOF)
+        ));
+        journals[1]
+            .reset_unpublished(&mut ram, &mut sessions[1], &mut charges[1])
+            .unwrap();
+        assert_eq!(charges, paid);
+        assert_eq!(ram.storage.preparations_used(), 2);
+        assert_eq!(ram.open_descriptions(), 1);
+        for _ in 0..20_000 {
+            if !ram.storage.reclaim_step() {
+                break;
+            }
+        }
+        assert_eq!(ram.storage.usage(roots[1]).inodes, 0);
+        assert_eq!(ram.storage.usage(roots[1]).descriptions, 0);
+        resolve(&mut ram, &mut resolvers[1], identities[1]);
+        loop {
+            let proof = resolvers[1]
+                .result_proof(&ram.storage, identities[1], Intent::Open { flags })
+                .unwrap();
+            if journals[1]
+                .prepare(
+                    &mut ram,
+                    &mut sessions[1],
+                    proof,
+                    identities[1],
+                    &mut charges[1],
+                )
+                .unwrap()
+            {
+                break;
+            }
+        }
+        let refreshed = resolvers[1]
+            .result_proof(&ram.storage, identities[1], Intent::Open { flags })
+            .unwrap();
+        journals[1]
+            .commit(
+                &mut ram,
+                &mut sessions[1],
+                Some(refreshed),
+                identities[1],
+                &mut charges[1],
+                proto_fs::Timestamp::ZERO,
+            )
+            .unwrap();
+        assert_eq!(
+            journals[0]
+                .commit(
+                    &mut ram,
+                    &mut sessions[0],
+                    None,
+                    identities[0],
+                    &mut charges[0],
+                    proto_fs::Timestamp::ZERO
+                )
+                .unwrap(),
+            held_a
+        );
+        let tmp = ram.storage.lookup(ROOT, b"tmp").unwrap();
+        for (i, leaf) in [b"concurrent-a".as_slice(), b"concurrent-b".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let token = ram.storage.lookup(tmp, leaf).unwrap();
+            let node = ram.storage.node(token).unwrap();
+            assert_eq!(
+                (node.uid, node.gid, node.mode, node.links),
+                (identities[i].uid, identities[i].gid, 0o600, 1)
+            );
+            assert_eq!(ram.storage.usage(roots[i]).inodes, 1);
+            journals[i]
+                .cancel(&mut ram, &mut sessions[i], &mut charges[i])
+                .unwrap();
+            ram.storage.release_preparation(charges[i]);
+        }
+        for resolver in resolvers {
+            resolver.release(&mut ram.storage);
+        }
+        assert_eq!(ram.open_descriptions(), 0);
+        assert_eq!(ram.storage.preparations_used(), 0);
+        assert!(sessions.iter().all(|s| s.slots.iter().all(Option::is_none)));
     }
 }

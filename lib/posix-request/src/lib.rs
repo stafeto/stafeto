@@ -13,7 +13,7 @@ pub const MAX_WRITE: usize = proto_fs::MAX_WRITE - exchange::HEADER_BYTES;
 use proto_fs::{NodeInfo, SeekFrom};
 use proto_wire::{Header, Reader, Status, Writer};
 pub const MESSAGE_MAX: usize = MAX_READ + 8;
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 fn valid_path(path: &[u8]) -> Result<(), Status> {
     if path.len() > MAX_PATH || path.contains(&0) {
@@ -27,6 +27,8 @@ fn valid_path(path: &[u8]) -> Result<(), Status> {
 pub enum Request<'a> {
     Open {
         flags: u32,
+        mode: u32,
+        umask: u32,
         path: &'a [u8],
     },
     Close {
@@ -122,8 +124,15 @@ impl<'a> Request<'a> {
         };
         Header::new(method, VERSION).write(out)?;
         match self {
-            Self::Open { flags, path } => {
+            Self::Open {
+                flags,
+                mode,
+                umask,
+                path,
+            } => {
                 out.u32(flags)?;
+                out.u32(mode)?;
+                out.u32(umask)?;
                 valid_path(path)?;
                 out.bytes(path)?;
             }
@@ -217,9 +226,16 @@ impl<'a> Request<'a> {
         let request = match header.method {
             1 => {
                 let flags = input.u32()?;
+                let mode = input.u32()?;
+                let umask = input.u32()?;
                 let path = input.bytes(input.left())?;
                 valid_path(path)?;
-                Self::Open { flags, path }
+                Self::Open {
+                    flags,
+                    mode,
+                    umask,
+                    path,
+                }
             }
             2 => {
                 let fd = input.u32()?;

@@ -17,6 +17,11 @@ static int files_loader_abort(void) {
     int result = files_cleanup_audit(fd);
     if (!result) result = files_loader_abort_capture(fd, 0);
     if (!result) result = files_loader_abort_capture(fd, 1);
+#if IMAGE_INFO_PROBE
+    if (!result) result = files_loader_abort_capture(fd, 2);
+    if (!result) result = files_loader_abort_capture(fd, 3);
+    if (!result) puts("posix-files: strict image metadata and incoming handle cleanup ok");
+#endif
     char byte = 0;
     if (result || getpid() != pid || pread(fd, &byte, 1, 0) != 1 || byte != 's') {
         close(fd);

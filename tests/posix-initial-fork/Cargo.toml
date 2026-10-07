@@ -1,0 +1,17 @@
+[package]
+name = "posix-initial-fork"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "A direct fork regression for an Init-adopted POSIX image"
+build = "build.rs"
+
+[[bin]]
+name = "posix-initial-fork"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }

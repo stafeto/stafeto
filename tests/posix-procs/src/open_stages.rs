@@ -13,7 +13,7 @@ fn key() -> proto_fs::OpenKey {
     }
 }
 
-fn prepared(files: &Files, id: u64) -> Result<(), Status> {
+pub(super) fn prepared(files: &Files, id: u64) -> Result<(), Status> {
     for prepare in [false, true] {
         let mut completed = false;
         for _ in 0..2000 {
@@ -289,7 +289,7 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
     }
     Ok(())
 }
-fn clone_bound(files: &Files, numbers: &[u32]) -> Result<Files, Status> {
+pub(super) fn clone_bound(files: &Files, numbers: &[u32]) -> Result<Files, Status> {
     let mut request = proto_wire::Writer::new();
     proto_fs::Method::Clone.header().write(&mut request)?;
     request.u32(numbers.len() as u32)?;
@@ -461,10 +461,116 @@ fn random_marker(files: &Files) -> Result<(), i32> {
     rt::println!("posix-files: Random marker full32 Clone and reuse ok");
     Ok(())
 }
+fn finalization(files: &Files) -> Result<(), i32> {
+    let files = clone_bound(files, &[]).map_err(|_| 160)?;
+    let created = key();
+    let job = files
+        .open_start(
+            created,
+            b"/tmp/finalize-created",
+            proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_WRITE,
+            0o6600,
+            0,
+        )
+        .map_err(|_| 161)?;
+    prepared(&files, job).map_err(|_| 162)?;
+    if files.open_query(created) != Ok(OpenOutcome::Active { job, phase: 2 }) {
+        return Err(163);
+    }
+    // The real final reply is accepted but unread; Query recovers the receipt.
+    let mut request = proto_wire::Writer::new();
+    proto_fs::Method::OpenFinish
+        .header()
+        .write(&mut request)
+        .map_err(|_| 164)?;
+    request.u32(created.slot).map_err(|_| 164)?;
+    request.u64(created.generation).map_err(|_| 164)?;
+    let mut reply = rt::sys::send(files.sessions().0, request.as_bytes()).map_err(|_| 165)?;
+    // A corrupted accepted envelope remains ambiguous to the ordinary decoder.
+    reply.len = 4;
+    if Files::open_commit_reply(&reply) != Err(Status::BadSize) {
+        return Err(166);
+    }
+    drop(reply);
+    let OpenOutcome::Finished(held) = files.open_query(created).map_err(|_| 167)? else {
+        return Err(168);
+    };
+    let first = files.descriptor_information(held.fd).map_err(|_| 169)?;
+    if first.permissions != 0o6600 || first.size != 0 {
+        return Err(170);
+    }
+    if files.open_finish_once(created) != Ok(held)
+        || files.descriptor_information(held.fd).map_err(|_| 171)? != first
+    {
+        return Err(172);
+    }
+    files.close_exact(held).map_err(|_| 173)?;
+    let truncated = key();
+    let job = files
+        .open_start(
+            truncated,
+            b"/tmp/finalize-created",
+            proto_fs::READ_WRITE | proto_fs::TRUNCATE,
+            0,
+            0,
+        )
+        .map_err(|_| 174)?;
+    prepared(&files, job).map_err(|_| 175)?;
+    let held = files.open_finish_once(truncated).map_err(|_| 176)?;
+    if files.open_query(truncated) != Ok(OpenOutcome::Finished(held))
+        || files
+            .descriptor_information(held.fd)
+            .map_err(|_| 177)?
+            .permissions
+            != 0o600
+    {
+        return Err(178);
+    }
+    if files.write(held.fd, b"after finalized truncate") != Ok(24) {
+        return Err(179);
+    }
+    let written = files.descriptor_information(held.fd).map_err(|_| 180)?;
+    if files.open_finish_once(truncated) != Ok(held)
+        || files.descriptor_information(held.fd).map_err(|_| 181)? != written
+    {
+        return Err(182);
+    }
+    files.close_exact(held).map_err(|_| 183)?;
+    let zero = key();
+    let job = files
+        .open_start(
+            zero,
+            b"/tmp/finalize-zero",
+            proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_ONLY,
+            0,
+            0o777,
+        )
+        .map_err(|_| 184)?;
+    prepared(&files, job).map_err(|_| 185)?;
+    let held = files.open_finish_once(zero).map_err(|_| 186)?;
+    if files
+        .descriptor_information(held.fd)
+        .map_err(|_| 187)?
+        .permissions
+        != 0
+    {
+        return Err(188);
+    }
+    files.close_exact(held).map_err(|_| 189)?;
+    Ok(())
+}
+
 fn run(files: &Files) -> Result<(), i32> {
+    #[cfg(feature = "open-finalize-clock-probe")]
+    crate::open_finalize_clock::run(files)?;
+    finalization(files)?;
     start_recovery(files)?;
     random_marker(files)?;
     let flags = proto_fs::CREATE | proto_fs::EXCLUSIVE | proto_fs::READ_WRITE;
+    let current_key = proto_fs::OpenKey {
+        slot: 0,
+        generation: NEXT.load(Ordering::Relaxed),
+    };
     let (id, held) = committed(files, b"/tmp/t3-created", flags, 0o666, 0o077).map_err(|_| 1)?;
     let result = (|| {
         if files.read(held.fd, &mut [0]) != Err(Status::Unknown(proto_fs::BAD_FD)) {
@@ -488,10 +594,6 @@ fn run(files: &Files) -> Result<(), i32> {
         }
         Ok(())
     })();
-    let current_key = proto_fs::OpenKey {
-        slot: 0,
-        generation: 1,
-    };
     posix_abi::process::seteuid(65533).map_err(|_| 65)?;
     let query = active_query(files, current_key);
     let changed = files.open_commit(id);
@@ -598,9 +700,8 @@ fn finish_recovery(files: &Files) -> Result<(), i32> {
     let flags = proto_fs::READ_WRITE | proto_fs::TRUNCATE;
     let id = files.open_start(first, path, flags, 0, 0).map_err(|_| 70)?;
     prepared(files, id).map_err(|_| 71)?;
-    if files.open_finish(first) != Err(Status::Unknown(proto_fs::RESOLVING)) {
-        return Err(72);
-    }
+    // Preserve the legacy explicit Commit followed by receipt finalization.
+    // The separate finalization fixture covers Finish directly from Prepared.
     let held = files.open_commit(id).map_err(|_| 73)?;
     let ordinary = files
         .open("/tmp/t3-created", proto_fs::READ_WRITE)
@@ -700,6 +801,11 @@ pub extern "C" fn files_open_stages() -> i32 {
         return 90;
     };
     let files = core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+    // The native suite owns independent keys on its fresh genuinely bound session.
+    // Local Table records retain their own client-key namespace in the shared session.
+    let Ok(files) = clone_bound(&files, &[]) else {
+        return 91;
+    };
     let result = run(&files);
     #[cfg(feature = "ipc-loss")]
     let result = result.and_then(|()| super::reply_loss::run(&files));

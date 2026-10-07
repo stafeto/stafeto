@@ -62,7 +62,7 @@ fn intent_ready(
 #[test]
 fn create_intent_retains_missing_edge_and_restarts_before_publication() {
     use crate::resolve::Intent;
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let parent = create(&mut r, ROOT, b"parent", DIR, 0o755);
     let intent = Intent::Open {
         flags: proto_fs::CREATE | proto_fs::READ_WRITE,
@@ -108,7 +108,7 @@ fn create_intent_retains_missing_edge_and_restarts_before_publication() {
 #[test]
 fn create_intent_requires_search_and_absence_only_at_final_component() {
     use crate::resolve::Intent;
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     create(&mut r, ROOT, b"denied", DIR, 0);
     let intent = Intent::Open {
         flags: proto_fs::CREATE,
@@ -148,7 +148,7 @@ fn create_intent_requires_search_and_absence_only_at_final_component() {
 #[test]
 fn exclusive_intent_captures_dangling_symlink_and_existing_naming_edge() {
     use crate::resolve::Intent;
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let link = create(&mut r, ROOT, b"dangling", SYMLINK, 0o777);
     r.storage.write(link, ROOT_ACCOUNT, 0, b"/missing").unwrap();
     let exclusive = Intent::Open {
@@ -228,7 +228,7 @@ fn retained_handoff_preserves_real_capture_until_genuine_startup_bind() {
     assert_eq!(wire.as_bytes().len(), 260);
     assert!(WhoReply::read(wire.as_bytes()).is_err());
     let mut admission = Admission::RetainedWire(wire.as_bytes().try_into().unwrap());
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         binding: Binding::Pending(old),
         root: ROOT_ACCOUNT,
@@ -285,7 +285,7 @@ fn refreshed_capture_preserves_authority_class_and_retained_descriptions() {
         }),
         ..parent
     };
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds::default();
     let fd = ram
         .open(&mut fds, "/tmp/probe", proto_fs::READ_WRITE)
@@ -551,7 +551,7 @@ fn inherited_clone_denies_effects_and_rebinds_only_with_same_expenditure_root() 
 
 #[test]
 fn owner_group_other_use_one_class_and_real_effective_supplementary_ids() {
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let token = create(&mut r, ROOT, b"file", REG, 0o640);
     let n = r.storage.node(token).unwrap();
     assert!(OWNER.permits(n, 6));
@@ -607,7 +607,7 @@ fn owner_group_other_use_one_class_and_real_effective_supplementary_ids() {
 }
 #[test]
 fn traversal_checks_denied_directory_before_parent_component() {
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let denied = create(&mut r, ROOT, b"denied", DIR, 0o700);
     let allowed = create(&mut r, ROOT, b"allowed", REG, 0o644);
     let other = Identity {
@@ -629,7 +629,7 @@ fn traversal_checks_denied_directory_before_parent_component() {
 }
 #[test]
 fn link_parent_walks_target_directory_and_preserves_invalid_utf8() {
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let a = create(&mut r, ROOT, b"a", DIR, 0o755);
     let child = create(&mut r, a, b"child", DIR, 0o755);
     let target = create(&mut r, a, b"\xff", REG, 0o644);
@@ -648,7 +648,7 @@ fn link_parent_walks_target_directory_and_preserves_invalid_utf8() {
 }
 #[test]
 fn link_limit_is_32_and_path_and_component_bounds_are_bytes() {
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let target = create(&mut r, ROOT, &[b'x'; 255], REG, 0o644);
     let mut path = std::vec![b'/'];
     path.extend_from_slice(&[b'x'; 255]);
@@ -675,7 +675,7 @@ fn link_limit_is_32_and_path_and_component_bounds_are_bytes() {
 }
 #[test]
 fn proof_restarts_after_namespace_and_authority_changes_and_retains_base() {
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let directory = create(&mut r, ROOT, b"base", DIR, 0o700);
     let file = create(&mut r, directory, b"file", REG, 0o644);
     let mut job = Resolve::new(&mut r.storage, b"file", directory, OWNER, true).unwrap();
@@ -725,7 +725,7 @@ fn proof_restarts_after_namespace_and_authority_changes_and_retains_base() {
 }
 #[test]
 fn two_path_preparation_uses_one_charge_and_two_independent_pinned_bases() {
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let a = create(&mut r, ROOT, b"a", DIR, 0o755);
     let b = create(&mut r, ROOT, b"b", DIR, 0o755);
     let x = create(&mut r, a, b"x", REG, 0o644);
@@ -748,7 +748,7 @@ fn two_path_preparation_uses_one_charge_and_two_independent_pinned_bases() {
 
 #[test]
 fn lost_binding_preparation_returns_its_charge_without_dropping_creator_files() {
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let file = create(&mut r, ROOT, b"captured", REG, 0o600);
     let mut creator = crate::Fds {
         root: ROOT_ACCOUNT,
@@ -779,7 +779,7 @@ fn lost_binding_preparation_returns_its_charge_without_dropping_creator_files() 
 
 #[test]
 fn preparation_root_transfer_preserves_global_charge_at_the_full_limit() {
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let boot = crate::storage::BOOT_ROOT;
     let other = Root {
         id: 17,
@@ -816,7 +816,7 @@ fn preparation_root_transfer_preserves_global_charge_at_the_full_limit() {
 
 #[test]
 fn preparation_root_transfer_refuses_a_full_share_without_losing_the_old_charge() {
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut full = [0; 96];
     for ticket in &mut full {
         *ticket = r.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
@@ -844,7 +844,7 @@ fn new_authentic_generation_invalidates_a_proof_with_unchanged_ids() {
     binding.bind(Some(w), false).unwrap();
     let stamp = binding.stamp();
     let identity = binding.identity(false).unwrap();
-    let mut r = Ram::new(0);
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let file = create(&mut r, ROOT, b"same-ids", REG, 0o600);
     let mut proof = Resolve::new(&mut r.storage, b"/same-ids", ROOT, OWNER, true).unwrap();
     assert_eq!(finish(&mut r, &mut proof, OWNER), Ok(file));
@@ -869,7 +869,7 @@ fn paid_admission_phases_preserve_capture_and_cleanup_the_real_session() {
     let mut wire = proto_wire::Writer::new();
     fresh.write(&mut wire).unwrap();
     let mut admission = Admission::Wire(wire.as_bytes().try_into().unwrap());
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         binding: Binding::Inherited(old),
         root: ROOT_ACCOUNT,
@@ -934,7 +934,7 @@ fn paid_admission_phases_preserve_capture_and_cleanup_the_real_session() {
 
 #[test]
 fn binding_and_resolver_preparations_share_the_sixteen_session_slots() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -970,7 +970,7 @@ fn binding_and_resolver_preparations_share_the_sixteen_session_slots() {
 fn cleanup_audit_preserves_real_capture_and_proofs_at_every_preparation_limit() {
     use crate::authority::{Admission, AuditStep, BindingPurpose, CleanupAudit};
     for limit in [16, 96, 128] {
-        let mut ram = Ram::new(0);
+        let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
         let old = who();
         let fresh = WhoReply {
             generation: old.generation + 1,
@@ -1206,7 +1206,7 @@ fn cleanup_audit_retries_unconfirmed_responses_and_rechecks_every_epoch() {
 #[test]
 fn retrying_binding_cursor_releases_dead_and_superseded_real_captures() {
     use crate::authority::{Admission, AuditStep, CleanupAudit, NotaryReply};
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let old = who();
     let file = create(&mut ram, ROOT, b"cursor", REG, 0o600);
     let mut sessions: [Fds; 4] = core::array::from_fn(|_| Fds {
@@ -1280,7 +1280,7 @@ fn retrying_binding_cursor_releases_dead_and_superseded_real_captures() {
 
 #[test]
 fn creation_binding_and_path_jobs_share_the_session_budget() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -1324,7 +1324,7 @@ fn creation_binding_and_path_jobs_share_the_session_budget() {
 
 #[test]
 fn paid_creation_transfers_at_full_global_and_root_budgets_once() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let other = Root {
         id: 301,
         generation: 1,
@@ -1418,7 +1418,7 @@ fn paid_creation_transfers_at_full_global_and_root_budgets_once() {
 #[test]
 fn no_follow_open_still_resolves_a_link_with_a_trailing_slash() {
     use crate::resolve::Intent;
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let target = create(&mut ram, ROOT, b"target-dir", DIR, 0o755);
     let link = create(&mut ram, ROOT, b"dir-link", SYMLINK, 0o777);
     ram.storage
@@ -1456,7 +1456,7 @@ fn no_follow_open_still_resolves_a_link_with_a_trailing_slash() {
 
 #[test]
 fn tentative_open_prepays_resources_without_exposing_a_descriptor() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -1512,7 +1512,7 @@ fn tentative_open_prepays_resources_without_exposing_a_descriptor() {
 
 #[test]
 fn created_mode_zero_can_be_prepaid_and_session_cleanup_closes_it_once() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -1564,7 +1564,7 @@ fn created_mode_zero_can_be_prepaid_and_session_cleanup_closes_it_once() {
 
 #[test]
 fn tentative_open_failure_and_full_cleanup_preserve_descriptor_accounting() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -1613,7 +1613,7 @@ fn tentative_open_failure_and_full_cleanup_preserve_descriptor_accounting() {
 
 #[test]
 fn creation_access_requires_a_fresh_exact_reservation_in_its_owner_root() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -1694,7 +1694,7 @@ fn creation_access_requires_a_fresh_exact_reservation_in_its_owner_root() {
 
 #[test]
 fn append_uses_current_eof_and_positioned_write_preserves_flags_and_offset() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -1723,7 +1723,10 @@ fn append_uses_current_eof_and_positioned_write_preserves_flags_and_offset() {
     let mut child = ram.clone_fds(&fds, &[a]).unwrap();
     ram.write(&mut fds, a, b"first").unwrap();
     ram.write(&mut fds, b, b"second").unwrap();
-    assert_eq!(ram.pwrite(&mut fds, a, 0, b"F", 10), Ok(1));
+    assert_eq!(
+        ram.pwrite(&mut fds, a, 0, b"F", proto_fs::Timestamp::legacy_ns(10)),
+        Ok(1)
+    );
     assert_eq!(
         ram.seek_from(&mut fds, a, 0, proto_fs::SeekFrom::Current),
         Ok(5)
@@ -1746,7 +1749,16 @@ fn append_uses_current_eof_and_positioned_write_preserves_flags_and_offset() {
         Ok(11)
     );
     // Created regular storage uses the full bound; the old fixed scratch profile is separate.
-    assert_eq!(ram.pwrite(&mut fds, b, 4096, b"sparse", 20), Ok(6));
+    assert_eq!(
+        ram.pwrite(
+            &mut fds,
+            b,
+            4096,
+            b"sparse",
+            proto_fs::Timestamp::legacy_ns(20)
+        ),
+        Ok(6)
+    );
     assert_eq!(
         ram.seek_from(&mut fds, b, 0, proto_fs::SeekFrom::Current),
         Ok(11)
@@ -1761,7 +1773,7 @@ fn append_uses_current_eof_and_positioned_write_preserves_flags_and_offset() {
 
 #[test]
 fn created_regular_io_updates_times_only_after_successful_nonempty_transfer() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -1772,14 +1784,46 @@ fn created_regular_io_updates_times_only_after_successful_nonempty_transfer() {
         .unwrap();
     let fd = ram.publish_open(&mut fds, held).unwrap();
     let initial = ram.storage.node(token).unwrap().times;
-    assert_eq!(ram.write_at(&mut fds, fd, b"abc", 10), Ok(3));
-    assert_eq!(ram.storage.node(token).unwrap().times, [initial[0], 10, 10]);
-    assert_eq!(ram.pwrite(&mut fds, fd, 1, b"B", 20), Ok(1));
-    assert_eq!(ram.storage.node(token).unwrap().times, [initial[0], 20, 20]);
-    assert_eq!(ram.write_at(&mut fds, fd, b"", 30), Ok(0));
-    assert_eq!(ram.pwrite(&mut fds, fd, 0, b"", 31), Ok(0));
     assert_eq!(
-        ram.pwrite(&mut fds, fd, u64::MAX, b"x", 32),
+        ram.write_at(&mut fds, fd, b"abc", proto_fs::Timestamp::legacy_ns(10)),
+        Ok(3)
+    );
+    assert_eq!(
+        ram.storage.node(token).unwrap().times,
+        [
+            initial[0],
+            proto_fs::Timestamp::legacy_ns(10),
+            proto_fs::Timestamp::legacy_ns(10)
+        ]
+    );
+    assert_eq!(
+        ram.pwrite(&mut fds, fd, 1, b"B", proto_fs::Timestamp::legacy_ns(20)),
+        Ok(1)
+    );
+    assert_eq!(
+        ram.storage.node(token).unwrap().times,
+        [
+            initial[0],
+            proto_fs::Timestamp::legacy_ns(20),
+            proto_fs::Timestamp::legacy_ns(20)
+        ]
+    );
+    assert_eq!(
+        ram.write_at(&mut fds, fd, b"", proto_fs::Timestamp::legacy_ns(30)),
+        Ok(0)
+    );
+    assert_eq!(
+        ram.pwrite(&mut fds, fd, 0, b"", proto_fs::Timestamp::legacy_ns(31)),
+        Ok(0)
+    );
+    assert_eq!(
+        ram.pwrite(
+            &mut fds,
+            fd,
+            u64::MAX,
+            b"x",
+            proto_fs::Timestamp::legacy_ns(32)
+        ),
         Err(proto_fs::INVALID_ARGUMENT)
     );
     assert_eq!(
@@ -1788,26 +1832,66 @@ fn created_regular_io_updates_times_only_after_successful_nonempty_transfer() {
             fd,
             (crate::storage::FILE_PAGES * crate::storage::PAGE) as u64,
             b"x",
-            33
+            proto_fs::Timestamp::legacy_ns(33)
         ),
         Err(proto_fs::NO_SPACE)
     );
-    assert_eq!(ram.storage.node(token).unwrap().times, [initial[0], 20, 20]);
+    assert_eq!(
+        ram.storage.node(token).unwrap().times,
+        [
+            initial[0],
+            proto_fs::Timestamp::legacy_ns(20),
+            proto_fs::Timestamp::legacy_ns(20)
+        ]
+    );
     ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
         .unwrap();
     let mut out = [0; 3];
-    assert_eq!(ram.read_at(&mut fds, fd, &mut out, 40), Ok(3));
+    assert_eq!(
+        ram.read_at(&mut fds, fd, &mut out, proto_fs::Timestamp::legacy_ns(40)),
+        Ok(3)
+    );
     assert_eq!(&out, b"aBc");
-    assert_eq!(ram.storage.node(token).unwrap().times, [40, 20, 20]);
-    assert_eq!(ram.pread(&fds, fd, 0, &mut out, 50), Ok(3));
+    assert_eq!(
+        ram.storage.node(token).unwrap().times,
+        [
+            proto_fs::Timestamp::legacy_ns(40),
+            proto_fs::Timestamp::legacy_ns(20),
+            proto_fs::Timestamp::legacy_ns(20)
+        ]
+    );
+    assert_eq!(
+        ram.pread(&fds, fd, 0, &mut out, proto_fs::Timestamp::legacy_ns(50)),
+        Ok(3)
+    );
     assert_eq!(
         ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current),
         Ok(3)
     );
-    assert_eq!(ram.storage.node(token).unwrap().times, [50, 20, 20]);
-    assert_eq!(ram.read_at(&mut fds, fd, &mut [], 60), Ok(0));
-    assert_eq!(ram.pread(&fds, fd, 0, &mut [], 61), Ok(0));
-    assert_eq!(ram.storage.node(token).unwrap().times, [50, 20, 20]);
+    assert_eq!(
+        ram.storage.node(token).unwrap().times,
+        [
+            proto_fs::Timestamp::legacy_ns(50),
+            proto_fs::Timestamp::legacy_ns(20),
+            proto_fs::Timestamp::legacy_ns(20)
+        ]
+    );
+    assert_eq!(
+        ram.read_at(&mut fds, fd, &mut [], proto_fs::Timestamp::legacy_ns(60)),
+        Ok(0)
+    );
+    assert_eq!(
+        ram.pread(&fds, fd, 0, &mut [], proto_fs::Timestamp::legacy_ns(61)),
+        Ok(0)
+    );
+    assert_eq!(
+        ram.storage.node(token).unwrap().times,
+        [
+            proto_fs::Timestamp::legacy_ns(50),
+            proto_fs::Timestamp::legacy_ns(20),
+            proto_fs::Timestamp::legacy_ns(20)
+        ]
+    );
     ram.release(&mut fds);
     assert_eq!(ram.open_descriptions(), 0);
 }
@@ -1815,7 +1899,7 @@ fn created_regular_io_updates_times_only_after_successful_nonempty_transfer() {
 #[test]
 fn original_open_args_survive_real_link_expansion_and_namespace_restart() {
     use crate::resolve::Intent;
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let target = create(&mut ram, ROOT, b"destination", REG, 0o600);
     let link = create(&mut ram, ROOT, b"source", SYMLINK, 0o777);
     ram.storage
@@ -1845,7 +1929,7 @@ fn original_open_args_survive_real_link_expansion_and_namespace_restart() {
 
 #[test]
 fn finished_open_receipt_preserves_exact_reference_across_close_reuse_and_clone() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut owner = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -1864,7 +1948,15 @@ fn finished_open_receipt_preserves_exact_reference_across_close_reuse_and_clone(
     assert_eq!(ram.finish_open(&mut owner, key, held), Ok(held));
     assert_eq!(ram.finish_open(&mut owner, key, held), Ok(held));
     assert_eq!(ram.finished_open(&owner, key), Ok(held));
-    assert_eq!(ram.write_at(&mut owner, held.fd, b"old", 10), Ok(3));
+    assert_eq!(
+        ram.write_at(
+            &mut owner,
+            held.fd,
+            b"old",
+            proto_fs::Timestamp::legacy_ns(10)
+        ),
+        Ok(3)
+    );
     let mut child = ram.clone_fds(&owner, &[held.fd]).unwrap();
     assert_eq!(ram.finished_open(&child, key), Err(proto_fs::OPEN_RETIRED));
     ram.cancel_finished_open(&mut child, key).unwrap();
@@ -1887,13 +1979,29 @@ fn finished_open_receipt_preserves_exact_reference_across_close_reuse_and_clone(
     };
     assert_eq!(ram.finish_open(&mut owner, next_key, next), Ok(next));
     ram.cancel_finished_open(&mut owner, key).unwrap();
-    assert_eq!(ram.write_at(&mut owner, next.fd, b"new", 20), Ok(3));
+    assert_eq!(
+        ram.write_at(
+            &mut owner,
+            next.fd,
+            b"new",
+            proto_fs::Timestamp::legacy_ns(20)
+        ),
+        Ok(3)
+    );
     assert_eq!(ram.finished_open(&owner, key), Err(proto_fs::OPEN_RETIRED));
     assert_eq!(ram.finished_open(&owner, next_key), Ok(next));
     ram.seek_from(&mut child, held.fd, 0, proto_fs::SeekFrom::Start)
         .unwrap();
     let mut bytes = [0; 3];
-    assert_eq!(ram.read_at(&mut child, held.fd, &mut bytes, 30), Ok(3));
+    assert_eq!(
+        ram.read_at(
+            &mut child,
+            held.fd,
+            &mut bytes,
+            proto_fs::Timestamp::legacy_ns(30)
+        ),
+        Ok(3)
+    );
     assert_eq!(&bytes, b"old");
     ram.cancel_finished_open(&mut owner, next_key).unwrap();
     ram.cancel_finished_open(&mut owner, next_key).unwrap();
@@ -1910,7 +2018,7 @@ fn finished_open_receipt_preserves_exact_reference_across_close_reuse_and_clone(
 
 #[test]
 fn finished_open_handoff_succeeds_with_full_description_and_session_tables() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut sessions = [Fds::default(); 4];
     for (n, fds) in sessions.iter_mut().enumerate() {
         fds.root = Root {
@@ -1956,7 +2064,7 @@ fn finished_open_handoff_succeeds_with_full_description_and_session_tables() {
 
 #[test]
 fn finished_receipt_cannot_cancel_a_reallocated_description_in_the_same_slot() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let mut fds = Fds {
         root: ROOT_ACCOUNT,
         ..Fds::default()
@@ -1980,7 +2088,10 @@ fn finished_receipt_cannot_cancel_a_reallocated_description_in_the_same_slot() {
     assert_ne!(actual.generation, held.description.generation);
     assert_eq!(ram.finished_open(&fds, key), Err(proto_fs::OPEN_RETIRED));
     ram.cancel_finished_open(&mut fds, key).unwrap();
-    assert_eq!(ram.write_at(&mut fds, fresh, b"live", 12), Ok(4));
+    assert_eq!(
+        ram.write_at(&mut fds, fresh, b"live", proto_fs::Timestamp::legacy_ns(12)),
+        Ok(4)
+    );
     assert_eq!(ram.finished_open(&fds, key), Err(proto_fs::OPEN_RETIRED));
     ram.release(&mut fds);
     assert_eq!(ram.open_descriptions(), 0);
@@ -2014,7 +2125,7 @@ fn clone_count_rejects_missing_or_invalid_count_before_admission() {
 
 #[test]
 fn clone_into_rejects_last_fd_and_cwd_failure_without_reference_changes() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let inode = create(&mut ram, ROOT, b"clone-into", REG, 0o600);
     let directory = create(&mut ram, ROOT, b"clone-cwd", DIR, 0o700);
     let mut source = Fds {
@@ -2074,7 +2185,7 @@ fn clone_into_rejects_last_fd_and_cwd_failure_without_reference_changes() {
 
 #[test]
 fn clone_into_deduplicates_numeric_fds_and_retains_distinct_alias_slots() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let inode = create(&mut ram, ROOT, b"clone-alias", REG, 0o600);
     let mut source = Fds {
         root: ROOT_ACCOUNT,
@@ -2122,7 +2233,7 @@ fn clone_into_deduplicates_numeric_fds_and_retains_distinct_alias_slots() {
 
 #[test]
 fn clone_into_requires_fresh_destination_including_operation_tombstones() {
-    let mut ram = Ram::new(0);
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let source = Fds::default();
     let mut destinations = [Fds::default(); 9];
     destinations[0].open_watermarks[31] = 1;

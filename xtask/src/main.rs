@@ -11,6 +11,7 @@ mod coverage;
 #[path = "../../lib/posix-abi/src/relibc/lifetime.rs"]
 mod owner_lifetime;
 
+mod coverage;
 mod disasm;
 mod entropy;
 mod image;
@@ -545,13 +546,24 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
         &[],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
+    (
+        "posix-procs",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["pending-open"],
+    ),
     // Pieces of 64 KiB: the probe's forks copy regions past one piece.
     ("loader", "loader", 0, &["small-pieces"]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
+/// The initial POSIX record runs the direct fork fixture on the existing profile.
+const POSIX_INITIAL_FORK_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = ("posix-procs", "posix-initial-fork", POSIX_STACK_SIZE, &[]);
+    programs
+};
 /// The probe of the longest step of the process service (xtask
 /// process-steps): the probe in its steps mode, and the process service
 /// that prints each new longest step.
@@ -1087,15 +1099,20 @@ commands:
   posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
+  t6-runtime-gates verify dynamic exec, two forks, End custody and atomic Stage Abort
+  t6-runtime-gates-steps measure the runtime custody gates under icount
   image-gates verify genuine Take and accepted SetId ambiguity
   image-gates-steps measure retained image dispatches under icount
   image-gates-normal-steps measure normal SetId without reply corruption
   loader-abort verify retained file cleanup after genuine exec cancellation
+  loader-info verify strict retained image metadata and incoming handle cleanup
   ramfs-gc verify binding progress during queued page reclamation
   loader-abort-steps measure retained cleanup audits at resolver limits
   ramfs-cleanup verify unfinished binding cleanup with a foreign holder
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
+  posix-data-steps measure paid data cleanup and full mapping dispatches
+  posix-open-finalize-clock probe genuine Clock publication during Finish
   posix-files-loss verify native refused Open replies with a live sibling
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
@@ -1114,6 +1131,7 @@ commands:
             over the Rust POSIX layer
   posix-procs run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
+  posix-initial-fork [--build] verify direct fork of the Init-adopted image
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
   loader-channels verify ordinary loader channel provenance and descriptor transfer
   process-steps run the probe of the longest step of the process service
@@ -1211,13 +1229,36 @@ fn main() {
         Some("ramfs-cleanup") => ramfs_cleanup_probe(),
         Some("ramfs-gc") => ramfs_gc_probe(),
         Some("image-gates") => image_gates_probe(false, false),
+        Some("t6-runtime-gates") => match &args[1..] {
+            [] => t6_runtime_probe(false, false),
+            [flag] if flag == "--build" => t6_runtime_probe(false, true),
+            _ => Err("usage: cargo xtask t6-runtime-gates [--build]".into()),
+        },
+        Some("t6-runtime-gates-steps") => match &args[1..] {
+            [] => t6_runtime_probe(true, false),
+            [flag] if flag == "--build" => t6_runtime_probe(true, true),
+            _ => Err("usage: cargo xtask t6-runtime-gates-steps [--build]".into()),
+        },
         Some("image-gates-steps") => image_gates_probe(true, false),
         Some("image-gates-normal-steps") => image_gates_probe(true, true),
         Some("loader-abort") => loader_abort_probe(false),
+        Some("loader-info") => loader_info_probe(),
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-files-loss") => posix_files_loss(),
-        Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("posix-data-steps") => posix_files_run_profile(true, true, false),
+        Some("posix-data-loss") => posix_data_loss(),
+        Some("posix-open-finalize-clock") => posix_files_run_profile(true, true, true),
+        Some("posix-procs") => match &args[1..] {
+            [] => posix_procs_probe(&qemu::VIRT),
+            [build] if build == "--build" => posix_procs_probe_profile(&qemu::VIRT, true),
+            _ => Err("usage: cargo xtask posix-procs [--build]".into()),
+        },
+        Some("posix-initial-fork") => match &args[1..] {
+            [] => posix_initial_fork_probe(false),
+            [build] if build == "--build" => posix_initial_fork_probe(true),
+            _ => Err("usage: cargo xtask posix-initial-fork [--build]".into()),
+        },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
@@ -1634,12 +1675,21 @@ fn write_elf_image(
         elf_bytes.push(source.bytes(read_elf)?);
         elf_names.push(source.file_name());
     }
-    for (file, _, stack) in sources {
-        let raw = rootfs::elf_name(file);
-        if *stack == 0 && !elf_names.contains(&raw) {
-            elf_bytes.push(read_elf(file)?);
-            elf_names.push(raw);
-        }
+    let mut initial_raw = Vec::with_capacity(sources.len());
+    for (file, _, _) in sources {
+        let raw = match wanted
+            .iter()
+            .position(|s| matches!(s, rootfs::Source::Elf(program) if program == file))
+        {
+            Some(index) => index,
+            None => {
+                let index = elf_bytes.len();
+                elf_bytes.push(read_elf(file)?);
+                elf_names.push(rootfs::elf_name(file));
+                index
+            }
+        };
+        initial_raw.push((*file, raw));
     }
     let first = list.len() as u32;
     for (file, bytes) in elf_names.iter().zip(&elf_bytes) {
@@ -1648,12 +1698,53 @@ fn write_elf_image(
     let table = if listed.is_empty() {
         None
     } else {
-        Some(rootfs::table(&listed, first, list.len() as u32 + 1)?)
+        Some(rootfs::table(&listed, first, list.len() as u32 + 2)?)
     };
     if let Some(table) = &table {
         list.push(("rootfs", table.as_slice()));
     }
+    // Initial packed programs and their exact raw ELF copies share an immutable association.
+    let root_table = table
+        .as_ref()
+        .map(|bytes| bootimg::rootfs::Rootfs::parse(bytes, list.len() as u32 + 1))
+        .transpose()
+        .map_err(|e| format!("{name}: rootfs bindings: {e}"))?;
+    let mut associations = Vec::with_capacity(files.len());
+    for (artifact, (file, packed, _)) in files.iter().enumerate() {
+        let raw = initial_raw
+            .iter()
+            .find(|(program, _)| program == file)
+            .map(|(_, index)| *index)
+            .ok_or_else(|| format!("{name}: missing initial ELF for {file}"))?;
+        let packed = bootimg::Program::parse(packed).map_err(|e| format!("{name}: {e}"))?;
+        let original = bootimg::elf::program(&elf_bytes[raw], packed.stack_size)
+            .map_err(|e| format!("{name}: {e}"))?;
+        if packed != original {
+            return Err(format!(
+                "{name}: initial artifact {file} differs from its ELF"
+            ));
+        }
+        let raw = first + raw as u32;
+        let canonical = root_table.as_ref().and_then(|t| {
+            (0..t.len() as u32).find(|&n| {
+                let entry = t.entry(n);
+                !entry.is_directory() && entry.file == raw
+            })
+        });
+        associations.push(bootimg::exec_bindings::InitialSource {
+            artifact: artifact as u32,
+            raw,
+            canonical,
+        });
+    }
+    let bindings = bootimg::exec_bindings::write(&associations, list.len() as u32 + 1)
+        .map_err(|e| format!("{name}: initial bindings: {e:?}"))?;
+    list.push((bootimg::exec_bindings::FILE, &bindings));
     let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
+    let parsed = bootimg::BootImage::parse(&image).map_err(|e| format!("{name}: {e}"))?;
+    bootimg::exec_bindings::Bindings::parse(&bindings, parsed.count())
+        .and_then(|b| b.validate_layout(parsed))
+        .map_err(|e| format!("{name}: initial binding validation: {e:?}"))?;
     let path = target.join(name);
     std::fs::write(&path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
     let from: Vec<_> = files
@@ -2740,6 +2831,116 @@ fn ramfs_gc_probe() -> Result<(), String> {
     Ok(())
 }
 
+/// Runtime custody uses a writable dynamic ELF and three independently paid images.
+fn t6_runtime_probe(measured: bool, build_only: bool) -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 7] = [
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-posix-files", "t6-runtime"],
+        ),
+        ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["image-gates"]),
+        (
+            "posix-process-service",
+            "posix-process-service",
+            64 * 1024,
+            &["image-probe"],
+        ),
+        ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+        (
+            "posix-files",
+            "posix-procs",
+            POSIX_STACK_SIZE,
+            &["t6-runtime"],
+        ),
+        ("loader", "loader", 0, &["image-gates"]),
+        ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    ];
+    const MEASURED: [ImageProgram; 7] = {
+        let mut programs = PROGRAMS;
+        programs[1].3 = &["image-gates", "steps"];
+        programs[2].3 = &["image-probe", "steps"];
+        programs
+    };
+    let name = if measured {
+        "boot-t6-runtime-steps.img"
+    } else {
+        "boot-t6-runtime.img"
+    };
+    let image = build_boot_image(
+        name,
+        if measured { &MEASURED } else { &PROGRAMS },
+        BOOT_PROFILE,
+    )?;
+    let ram_elf = image_elf(&target_dir(), name, "ramfs");
+    let bytes = std::fs::read(&ram_elf).map_err(|error| error.to_string())?;
+    let ram = bootimg::elf::program(&bytes, RAMFS_STACK_SIZE).map_err(|error| error.to_string())?;
+    let pages: u64 = ram
+        .segments
+        .iter()
+        .map(|segment| segment.mem_size.div_ceil(4096))
+        .sum();
+    if pages > 976 {
+        return Err(format!(
+            "runtime fixture RAM maps {pages} pages; remeasure its quota to preserve 128 allowance"
+        ));
+    }
+    if build_only {
+        return Ok(());
+    }
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    if measured {
+        command.args(qemu::ICOUNT);
+    }
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, STEPS_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    for marker in [
+        "t6-runtime: actual Stage Installed, malformed reply, AbortRequired and Abort ok",
+        "t6-runtime: dynamic exec, two forks, End and ETXTBSY custody ok",
+    ] {
+        qemu::expect_marker(&output, marker)?;
+    }
+    if measured {
+        let steps = longest_steps(&output.lines, "2");
+        for kind in [14, 43, 65] {
+            if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
+                return Err(format!(
+                    "RAM runtime custody has no method {kind}: {steps:?}"
+                ));
+            }
+        }
+        if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "RAM runtime custody kind {kind} took {ticks}, past {RAM_STEP_MAX}: {steps:?}"
+            ));
+        }
+        println!("RAM runtime custody dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+        let process = longest_steps(&output.lines, "1");
+        for kind in [54, 55] {
+            if !process
+                .iter()
+                .any(|(k, ticks, _)| *k == kind && *ticks != 0)
+            {
+                return Err(format!(
+                    "Process runtime custody has no method {kind}: {process:?}"
+                ));
+            }
+        }
+        if let Some((kind, ticks, _)) = process.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "Process runtime custody kind {kind} took {ticks}, past {RAM_STEP_MAX}: {process:?}"
+            ));
+        }
+        println!("Process runtime custody dispatches under icount (B {RAM_STEP_MAX}): {process:?}");
+    }
+    Ok(())
+}
+
 fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
@@ -2802,6 +3003,38 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
         }
         println!("RAM image dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     }
+    Ok(())
+}
+
+fn loader_info_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 6] = {
+        let mut programs = LOADER_ABORT_PROGRAMS;
+        programs[0].3 = &["table-posix-files", "loader-info"];
+        programs[1].3 = &["image-info-probe", "steps"];
+        programs[4].3 = &["image-info-probe"];
+        programs[5].3 = &["image-info-probe"];
+        programs
+    };
+    let image = build_boot_image("boot-loader-info.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    command.args(qemu::ICOUNT);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "posix-files: strict image metadata and incoming handle cleanup ok",
+    )?;
+    let steps = longest_steps(&output.lines, "2");
+    if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "RAM image metadata kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    println!("RAM image metadata dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     Ok(())
 }
 
@@ -2887,6 +3120,10 @@ fn posix_files_probe() -> Result<(), String> {
 }
 
 fn posix_files_run(measured: bool) -> Result<(), String> {
+    posix_files_run_profile(measured, false, false)
+}
+
+fn posix_files_run_profile(measured: bool, data: bool, clock_gate: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     const MEASURED: [ImageProgram; 5] = {
@@ -2894,12 +3131,47 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
         programs[1].3 = &["steps"];
         programs
     };
-    let programs = if measured {
+    const DATA: [ImageProgram; 8] = [
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-posix-files", "public-data-probe"],
+        ),
+        ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps", "auth-probe"]),
+        POSIX_FILES_PROGRAMS[2],
+        POSIX_FILES_PROGRAMS[3],
+        (
+            "posix-files",
+            "posix-procs",
+            POSIX_STACK_SIZE,
+            &["data-carrier-probe", "public-data-probe"],
+        ),
+        POSIX_PROCS_PROGRAMS[2],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    const CLOCK_GATE: [ImageProgram; 5] = {
+        let mut programs = POSIX_FILES_PROGRAMS;
+        programs[0].3 = &["table-posix-files", "open-finalize-clock-probe"];
+        programs[1].3 = &["steps", "open-finalize-clock-probe"];
+        programs[4].3 = &["open-finalize-clock-probe"];
+        programs
+    };
+    let programs: &[ImageProgram] = if clock_gate {
+        &CLOCK_GATE
+    } else if data {
+        &DATA
+    } else if measured {
         &MEASURED
     } else {
         &POSIX_FILES_PROGRAMS
     };
-    let name = if measured {
+    let name = if clock_gate {
+        "boot-posix-open-finalize-clock.img"
+    } else if data {
+        "boot-posix-data-steps.img"
+    } else if measured {
         "boot-posix-files-steps.img"
     } else {
         "boot-posix-files.img"
@@ -2916,7 +3188,12 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
     if measured {
         let steps = longest_steps(&output.lines, "2");
-        for kind in [15, 19, 21, 25, 65] {
+        let required: &[usize] = if data {
+            &[15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 65]
+        } else {
+            &[15, 19, 21, 25, 65]
+        };
+        for &kind in required {
             if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
                 return Err(format!(
                     "RAM credential probe has no method {kind} measurement: {steps:?}"
@@ -2952,12 +3229,90 @@ fn posix_files_loss() -> Result<(), String> {
     Ok(())
 }
 
+fn posix_data_loss() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::IpcLossProbe)?;
+    const PROGRAMS: [ImageProgram; 8] = [
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-posix-files", "public-data-probe"],
+        ),
+        ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps", "auth-probe"]),
+        POSIX_FILES_PROGRAMS[2],
+        POSIX_FILES_PROGRAMS[3],
+        (
+            "posix-files",
+            "posix-procs",
+            POSIX_STACK_SIZE,
+            &["public-data-loss-probe"],
+        ),
+        POSIX_PROCS_PROGRAMS[2],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    // Reuse the existing files-loss rootfs and service graph. The local
+    // public keys live only in the ordinary shared session; raw test keys
+    // remain on their separate genuine cloned sessions.
+    let image = build_boot_image("boot-posix-files-loss.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "posix-files: public Data Start Commit and Query Waiting End recovery ok",
+    )
+}
+
+/// Require fork directly from the image Init adopted, before any replacement.
+fn posix_initial_fork_probe(build_only: bool) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-initial-fork.img",
+        &POSIX_INITIAL_FORK_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    if build_only {
+        return Ok(());
+    }
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: posix-procs ended"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &output,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(&output, "initial-fork: Init-adopted parent ")?;
+    qemu::expect_marker(&output, "initial-fork: child copied initial image")?;
+    qemu::expect_marker(
+        &output,
+        "initial-fork: parent retained initial image and reaped child",
+    )
+}
+
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
+    posix_procs_probe_profile(machine, false)
+}
+
+fn posix_procs_probe_profile(machine: &qemu::Machine, build_only: bool) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-posix-procs.img", &POSIX_PROCS_PROGRAMS, BOOT_PROFILE)?;
+    if build_only {
+        return Ok(());
+    }
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
