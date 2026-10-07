@@ -13,15 +13,26 @@
 
 use abi::msgbuf::{HANDLES, INFO, SIZE};
 use abi::{MESSAGE_HANDLES, ObjectKind, Rights};
+#[cfg(not(test))]
 use core::arch::asm;
 
 /// The address of the calling thread's buffer, TPIDRRO_EL0, which only
 /// the kernel writes (spec 6.2).
+#[cfg(not(test))]
 pub fn address() -> usize {
     let va: usize;
     // SAFETY: reading TPIDRRO_EL0 has no side effects.
     unsafe { asm!("mrs {}, tpidrro_el0", out(reg) va, options(nomem, nostack, preserves_flags)) };
     va
+}
+
+#[cfg(test)]
+pub fn address() -> usize {
+    std::thread_local! {
+        static BUFFER: core::cell::UnsafeCell<[u8; SIZE]>
+            = const { core::cell::UnsafeCell::new([0; SIZE]) };
+    }
+    BUFFER.with(|buffer| buffer.get().cast::<u8>() as usize)
 }
 
 /// Writes `bytes` into the calling thread's buffer at `offset` (spec

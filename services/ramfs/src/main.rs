@@ -1439,6 +1439,7 @@ impl Service<0> for Fs {
     const METHODS: &'static [u16] = METHODS;
     const PLACED: usize = SESSIONS;
     const RETAIN_CLOSED: bool = true;
+    const BOUNDED_INGRESS: bool = true;
 
     fn closing(&self, s: &Session<Fds, 0>) -> bool {
         s.data.closing

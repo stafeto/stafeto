@@ -51,6 +51,7 @@ pub fn calls() -> u64 {
 ///
 /// # Safety
 /// As for `raw`.
+#[cfg(not(test))]
 #[inline(always)]
 unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
     #[cfg(feature = "resource-meter")]
@@ -108,6 +109,47 @@ unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
     }
     #[cfg(feature = "resource-meter")]
     crate::resource_meter::after::<N>(x[0], memory_before, memory_label);
+}
+
+#[cfg(test)]
+unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
+    test_calls::call(N, x);
+}
+
+/// Host fixtures intercept the actual typed syscall boundary.
+#[cfg(test)]
+pub(crate) mod test_calls {
+    use std::{cell::RefCell, collections::VecDeque, vec::Vec};
+    std::thread_local! {
+        static STATE: RefCell<(VecDeque<(u16, Option<abi::Error>)>, Vec<(u16, [u64; 12])>)>
+            = const { RefCell::new((VecDeque::new(), Vec::new())) };
+    }
+    pub fn expect(calls: impl IntoIterator<Item = (u16, Option<abi::Error>)>) {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            assert!(state.0.is_empty(), "unexecuted syscall expectation");
+            state.0.extend(calls);
+            state.1.clear();
+        });
+    }
+    pub fn call(number: u16, registers: &mut [u64; 12]) {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let (wanted, result) = state
+                .0
+                .pop_front()
+                .expect("unexpected syscall or owner Drop");
+            assert_eq!(number, wanted);
+            state.1.push((number, *registers));
+            registers[0] = result.map_or(0, abi::Error::code);
+        });
+    }
+    pub fn log() -> Vec<(u16, [u64; 12])> {
+        STATE.with(|state| state.borrow().1.clone())
+    }
+    pub fn complete() {
+        STATE.with(|state| assert!(state.borrow().0.is_empty()));
+    }
 }
 
 /// System call `N` with `x` in x0-x9; returns x0-x9 as the kernel left
@@ -772,6 +814,11 @@ const _: fn() = || {
 };
 
 impl Token {
+    #[cfg(test)]
+    pub(crate) fn fixture(raw: u64) -> Self {
+        Self(raw)
+    }
+
     /// The value the kernel knows the token by, for tests that hand the
     /// kernel values it must refuse.
     pub const fn raw(&self) -> u64 {

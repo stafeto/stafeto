@@ -86,6 +86,31 @@ pub fn continuations(mut step: impl FnMut() -> bool, mut handoff: impl FnMut()) 
     }
 }
 
+/// Settle a loan of the current ingress, with one close or reply per visit.
+/// The original token is consumed exactly once; returned tokens stay in this slot.
+pub fn ingress_drain<H>(
+    held: &mut Option<H>,
+    next: impl FnOnce() -> Option<H>,
+    close: impl FnOnce(&mut Option<H>),
+) -> bool {
+    if held.is_none() {
+        *held = next();
+    }
+    if held.is_some() {
+        close(held);
+        return true;
+    }
+    false
+}
+
+/// A returned reply token remains the sole token of the current loan.
+pub fn ingress_reply<T>(token: &mut Option<T>, reply: impl FnOnce(T) -> Option<T>) -> bool {
+    if let Some(current) = token.take() {
+        *token = reply(current);
+    }
+    token.is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

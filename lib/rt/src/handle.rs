@@ -148,6 +148,15 @@ pub struct Incoming {
 }
 
 impl Incoming {
+    #[cfg(test)]
+    pub(crate) fn fixture(values: &[abi::Handle]) -> Self {
+        assert!(values.len() <= MESSAGE_HANDLES);
+        let mut incoming = Self::none();
+        incoming.count = values.len();
+        incoming.values[..values.len()].copy_from_slice(values);
+        incoming
+    }
+
     /// No handles.
     pub const fn none() -> Incoming {
         Incoming {

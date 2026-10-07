@@ -46,6 +46,10 @@ pub trait Service<const K: usize> {
     /// Keep exact closed sessions until service maintenance settles their debt.
     const RETAIN_CLOSED: bool = false;
 
+    /// Keep the current incoming owners through every refusal and automatic reply.
+    /// Each remaining close and reply executes in its own measured tail visit.
+    const BOUNDED_INGRESS: bool = false;
+
     /// RETAIN_CLOSED services expose their irreversible marker kept in Data.
     /// Their gone callback sets it before returning; this method reads it without effects.
     fn closing(&self, s: &Session<Self::Data, K>) -> bool {
@@ -106,6 +110,13 @@ pub trait Service<const K: usize> {
         false
     }
 
+    /// Progress a loan of the sole current request after its dispatch interval.
+    /// Idle performs CPU work only. Continue and Detach each end this measured visit.
+    fn request_tail(&mut self, request: &mut Request<'_>) -> TailProgress {
+        let _ = request;
+        TailProgress::Idle
+    }
+
     /// A scheduling handoff after a measured notification dispatch has ended.
     /// A service with a queue of own cursor notices may yield to FIFO peers here.
     fn between_notifications(&mut self, notice: Notice) {
@@ -118,6 +129,16 @@ pub trait Service<const K: usize> {
     fn notification(&mut self, n: Notice) {
         let _ = n;
     }
+}
+
+/// Progress of the current request loan before another Receive.
+pub enum TailProgress {
+    /// The loan can drain its incoming owners and automatic response.
+    Idle,
+    /// One bounded operation completed; revisit after a measured yield.
+    Continue,
+    /// The service retained its resource debt; finish the current ingress separately.
+    Detach,
 }
 
 /// A notification, as `receive` took it (spec 6.5).
@@ -446,8 +467,16 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 let kind = steps::kind_of(bytes);
                 #[cfg(not(feature = "step-stats"))]
                 let began = steps::begin();
-                request(service, table, config.issued, label, bytes, handles, token);
+                let current = request(service, table, config.issued, label, bytes, handles, token);
                 steps::end(began, kind);
+                if let Some(mut current) = current {
+                    current.finish(service, kind);
+                    let began = time::now();
+                    steps::own();
+                    steps::detail(4); // Terminal CPU disposal of the empty current loan.
+                    drop(current);
+                    steps::end(began, kind);
+                }
                 continuation(service);
                 continue;
             }
@@ -693,7 +722,153 @@ pub fn step_detail(value: u64) {
 
 /// Hands the request in `bytes` of the client `label` to `service`, and
 /// sends its answer. A request refused for its header makes no session.
-fn request<S: Service<K>, const K: usize>(
+/// The sole received request stays on the loop stack until all its owners settle.
+struct CurrentRequest<'a> {
+    request: Request<'a>,
+    held: Option<Handle<Any>>,
+    cursor: usize,
+    status: Option<Status>,
+    outgoing: Outgoing,
+    drain_back: bool,
+}
+
+impl CurrentRequest<'_> {
+    fn step<S: Service<K>, const K: usize>(&mut self, service: &mut S) -> bool {
+        if !matches!(service.request_tail(&mut self.request), TailProgress::Idle) {
+            return true;
+        }
+        let Self {
+            request,
+            held,
+            cursor,
+            status,
+            outgoing,
+            drain_back,
+        } = self;
+        if crate::retention::ingress_drain(
+            held,
+            || {
+                while *cursor < request.handles.len() {
+                    let index = *cursor;
+                    *cursor += 1;
+                    if let Ok(handle) = request.handles.take_any(index) {
+                        return Some(handle);
+                    }
+                }
+                if *drain_back { outgoing.pop() } else { None }
+            },
+            |held| {
+                // Actual valid close is allocation free; strict BadHandle fails the invariant.
+                // A future returned fault keeps this exact owner in the current loan.
+                steps::detail(1); // Incoming or returned-back Close.
+                let _ = Handle::close_retained(held);
+            },
+        ) {
+            return true;
+        }
+        crate::retention::ingress_reply(&mut request.token, |token| {
+            steps::detail(2); // Reply, including a returned-token fallback.
+            let code = status.map(proto_wire::reply);
+            let bytes = code.as_ref().map_or_else(
+                || request.reply.as_ref().map_or(&[][..], Writer::as_bytes),
+                |code| &code[..],
+            );
+            match token.reply_handles(bytes, core::mem::take(outgoing)) {
+                Ok(()) => None,
+                Err(refused) => {
+                    *outgoing = refused.back.unwrap_or_default();
+                    *drain_back = true;
+                    *status = Some(Status::Kernel(refused.error));
+                    refused.token
+                }
+            }
+        }) || (*drain_back && !outgoing.is_empty())
+    }
+
+    fn finish<S: Service<K>, const K: usize>(&mut self, service: &mut S, kind: usize) {
+        crate::retention::continuations(
+            || {
+                let began = time::now();
+                steps::own();
+                let retry = self.step(service);
+                steps::end(began, kind);
+                retry
+            },
+            || {
+                let began = time::now();
+                steps::own();
+                steps::detail(3); // Separate FIFO yield.
+                let _ = sys::yield_now();
+                steps::end(began, kind);
+            },
+        );
+    }
+}
+
+fn request<'a, S: Service<K>, const K: usize>(
+    service: &mut S,
+    table: &mut [Option<Session<S::Data, K>>],
+    issued: u32,
+    label: u64,
+    bytes: &'a [u8],
+    handles: Incoming,
+    token: Token,
+) -> Option<CurrentRequest<'a>> {
+    if !S::BOUNDED_INGRESS {
+        legacy_request(service, table, issued, label, bytes, handles, token);
+        return None;
+    }
+    // Custody precedes header, session and closing guards.
+    let mut current = CurrentRequest {
+        request: Request {
+            label,
+            header: Header::new(0, 0),
+            bytes,
+            handles,
+            token: Some(token),
+            reply: None,
+        },
+        held: None,
+        cursor: 0,
+        status: None,
+        outgoing: Outgoing::new(),
+        drain_back: false,
+    };
+    let header = match Header::read(&mut Reader::new(bytes)) {
+        Ok(header) if header.version != S::VERSION => Err(Status::BadVersion),
+        Ok(header) if !S::METHODS.contains(&header.method) => Err(Status::UnknownMethod),
+        other => other,
+    };
+    let answer = match header {
+        Err(status) => Answer::Status(status),
+        Ok(header) => {
+            current.request.header = header;
+            let place = service.place(label);
+            match session::<S, K>(service, table, label, place, issued) {
+                None => Answer::Status(Status::Kernel(Error::LimitReached)),
+                Some(s)
+                    if S::RETAIN_CLOSED
+                        && service.closing(s)
+                        && !service.closed_method(header.method) =>
+                {
+                    Answer::Status(Status::Kernel(Error::AccessDenied))
+                }
+                Some(s) => service.request(s, &mut current.request),
+            }
+        }
+    };
+    match answer {
+        Answer::Status(status) => current.status = Some(status),
+        Answer::Reply(handles) => current.outgoing = handles,
+        Answer::Deferred if current.request.token.is_some() => {
+            current.status = Some(Status::Kernel(Error::BadState));
+        }
+        Answer::Deferred => {}
+    }
+    Some(current)
+}
+
+fn legacy_request<S: Service<K>, const K: usize>(
     service: &mut S,
     table: &mut [Option<Session<S::Data, K>>],
     issued: u32,
@@ -1162,3 +1337,7 @@ impl<const N: usize> LongOps<N> {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "service/ingress_tests.rs"]
+mod ingress_tests;

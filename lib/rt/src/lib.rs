@@ -21,6 +21,9 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 pub mod compact;
 pub mod console;
 pub mod dma;
@@ -156,6 +159,7 @@ extern "C" fn start(arg: u64) -> ! {
 /// A panic prints its message to the console, if the program set one, and
 /// ends the process with abi::PANIC_EXIT_CODE. A panic while that message
 /// prints ends the process with no more output.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     static PANICKING: AtomicBool = AtomicBool::new(false);
