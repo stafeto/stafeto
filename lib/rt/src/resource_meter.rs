@@ -230,7 +230,7 @@ pub(crate) fn before<const N: u16>() -> u64 {
 }
 
 #[inline(always)]
-pub(crate) fn after<const N: u16>(status: u64, _before: u64) {
+pub(crate) fn after<const N: u16>(status: u64, _before: u64, _label: u64) {
     #[cfg(feature = "capacity-memory-trace")]
     if N == Call::DebugWrite.number() {
         return;
@@ -249,27 +249,35 @@ pub(crate) fn after<const N: u16>(status: u64, _before: u64) {
     let _after = METER.sample();
     #[cfg(feature = "capacity-memory-trace")]
     if _before != u64::MAX && _after != u64::MAX && _before != _after {
-        trace_memory(N, status, _before, _after);
+        trace_memory(
+            N,
+            status,
+            _before,
+            _after,
+            _label,
+            METER.handle_peak.load(Ordering::Relaxed),
+        );
     }
 }
 
 #[cfg(feature = "capacity-memory-trace")]
 #[inline(never)]
-fn trace_memory(call: u16, status: u64, before: u64, after: u64) {
-    let mut line = [b' '; 88];
+fn trace_memory(call: u16, status: u64, before: u64, after: u64, label: u64, peak: u64) {
+    let mut line = [b' '; 122];
     line[..20].copy_from_slice(b"capacity-memory hex ");
-    for (field, value) in
-        line[20..]
-            .as_chunks_mut::<17>()
-            .0
-            .iter_mut()
-            .zip([call as u64, status, before, after])
-    {
+    for (field, value) in line[20..].as_chunks_mut::<17>().0.iter_mut().zip([
+        call as u64,
+        status,
+        before,
+        after,
+        label,
+        peak,
+    ]) {
         for (index, byte) in field.iter_mut().take(16).enumerate() {
             *byte = b"0123456789abcdef"[((value >> ((15 - index) * 4)) & 15) as usize];
         }
     }
-    line[87] = b'\n';
+    line[121] = b'\n';
     let _ = crate::console::write(&line);
 }
 

@@ -55,6 +55,12 @@ pub fn calls() -> u64 {
 unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
     #[cfg(feature = "resource-meter")]
     let memory_before = crate::resource_meter::before::<N>();
+    #[cfg(feature = "resource-meter")]
+    let memory_label = if N == Call::HandleDuplicate.number() {
+        x[2]
+    } else {
+        0
+    };
     #[cfg(feature = "count-calls")]
     CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if OUT11 {
@@ -101,7 +107,7 @@ unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
         };
     }
     #[cfg(feature = "resource-meter")]
-    crate::resource_meter::after::<N>(x[0], memory_before);
+    crate::resource_meter::after::<N>(x[0], memory_before, memory_label);
 }
 
 /// System call `N` with `x` in x0-x9; returns x0-x9 as the kernel left
@@ -1062,7 +1068,7 @@ pub fn receive_measured(channel: &Handle<Channel>) -> (u64, Result<Received, Err
         );
     }
     #[cfg(feature = "resource-meter")]
-    crate::resource_meter::after::<{ Call::Receive.number() }>(x[0], memory_before);
+    crate::resource_meter::after::<{ Call::Receive.number() }>(x[0], memory_before, 0);
     (began, received(x))
 }
 
