@@ -186,11 +186,11 @@ fn save(claim: ClaimToken, recovery: Recovery) -> Result<(), i32> {
 }
 
 /// Local lifetime detachment leaves every remote debt in its prepaid hold.
-pub(crate) fn detach(owner: u64) {
+pub(crate) fn detach(owner: u64) -> bool {
     let Ok(owner) = OwnerToken::new(owner) else {
-        return;
+        return false;
     };
-    let notified = crate::shared::with_files(|files| {
+    let notified = crate::shared::try_with_files(|files| {
         let mut tokens = [None; posix_fs::OPEN_MAX];
         for (slot, token) in files.open_tokens().enumerate() {
             tokens[slot] = Some(token);
@@ -224,12 +224,22 @@ pub(crate) fn detach(owner: u64) {
                 }
             }
         }
-        Ok(tokens)
+        let complete = files.open_tokens().all(|token| {
+            files.open_snapshot(token).is_ok_and(|snapshot| {
+                snapshot.owner != Some(owner) && snapshot.claimant != Some(owner)
+            })
+        });
+        let addresses =
+            tokens.map(|token| token.and_then(|token| files.open_wait_address(token).ok()));
+        Ok((complete, addresses))
     });
-    if let Ok(tokens) = notified {
-        for token in tokens.into_iter().flatten() {
-            wake(token);
+    if let Ok((complete, addresses)) = notified {
+        for address in addresses.into_iter().flatten() {
+            posix_sync::futex_wake(address as *const core::sync::atomic::AtomicU32, u32::MAX);
         }
+        complete
+    } else {
+        false
     }
 }
 
@@ -244,7 +254,10 @@ fn wake(token: OpenToken) {
 
 /// One exact cleanup request, without authority to begin Start or Commit.
 pub(crate) fn help() {
-    let pending = crate::shared::with_files(|files| {
+    let helper = crate::relibc::open_owner()
+        .ok()
+        .and_then(|owner| OwnerToken::new(owner).ok());
+    let pending = crate::shared::try_with_files(|files| {
         static CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
         let cursor = CURSOR.load(core::sync::atomic::Ordering::Relaxed);
         let token = files
@@ -261,14 +274,20 @@ pub(crate) fn help() {
                 core::sync::atomic::Ordering::Relaxed,
             );
         }
-        Ok(token.map(|token| (files.transport(), token)))
+        let Some(token) = token else {
+            return Ok(None);
+        };
+        if !prepare_cancel(files, token, helper)? {
+            return Ok(None);
+        }
+        Ok(Some((files.transport(), token)))
     })
     .ok()
     .flatten();
     let Some((transport, token)) = pending else {
         return;
     };
-    cancel_pending(transport, token);
+    send_cancel(transport, token);
 }
 
 fn cancel_pending(transport: Transport, token: OpenToken) {
@@ -277,35 +296,51 @@ fn cancel_pending(transport: Transport, token: OpenToken) {
     else {
         return;
     };
-    let ready = crate::shared::with_files(|files| {
-        let snapshot = files.open_snapshot(token).map_err(crate::error)?;
-        if snapshot.phase == OpenPhase::Canceling {
-            return Ok(true);
-        }
-        if snapshot.owner.is_some() {
-            return Ok(false);
-        }
-        match files
-            .claim_open_record(token, helper)
-            .map_err(crate::error)?
-        {
-            Claim::Acquired { token: claim, .. } => {
-                files.begin_open_cancel(claim).map_err(crate::error)?;
-                Ok(true)
-            }
-            Claim::Canceling(_) => Ok(true),
-            Claim::Busy(_) | Claim::Complete(_) => Ok(false),
-        }
-    });
+    let ready = crate::shared::try_with_files(|files| prepare_cancel(files, token, Some(helper)));
     if ready != Ok(true) {
         return;
     }
+    send_cancel(transport, token);
+}
+
+fn prepare_cancel(
+    files: &mut posix_fs::PosixFs,
+    token: OpenToken,
+    helper: Option<OwnerToken>,
+) -> Result<bool, i32> {
+    let snapshot = files.open_snapshot(token).map_err(crate::error)?;
+    if snapshot.phase == OpenPhase::Canceling {
+        return Ok(true);
+    }
+    if snapshot.owner.is_some() {
+        return Ok(false);
+    }
+    let Some(helper) = helper else {
+        return Ok(false);
+    };
+    match files
+        .claim_open_record(token, helper)
+        .map_err(crate::error)?
+    {
+        Claim::Acquired { token: claim, .. } => {
+            files.begin_open_cancel(claim).map_err(crate::error)?;
+            Ok(true)
+        }
+        Claim::Canceling(_) => Ok(true),
+        Claim::Busy(_) | Claim::Complete(_) => Ok(false),
+    }
+}
+
+fn send_cancel(transport: Transport, token: OpenToken) {
     if transport.files().open_cancel_key_once(key(token)).is_ok() {
-        let _ = crate::shared::with_files(|files| {
+        let address = crate::shared::try_with_files(|files| {
+            let address = files.open_wait_address(token).map_err(crate::error)?;
             let _snapshot = files.finish_open_cancel(token, EIO).map_err(crate::error)?;
-            Ok(())
+            Ok(address)
         });
-        wake(token);
+        if let Ok(address) = address {
+            posix_sync::futex_wake(address as *const core::sync::atomic::AtomicU32, u32::MAX);
+        }
     }
 }
 

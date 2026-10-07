@@ -218,6 +218,48 @@ mod tests {
     }
 
     #[test]
+    fn all_paid_rows_reuse_only_after_deferred_detach_retry() {
+        let rows: [Lifetime; 63] = core::array::from_fn(|_| Lifetime::new());
+        for (index, row) in rows.iter().enumerate() {
+            assert!(row.reserve());
+            row.set_flags(LIVE | EXITED | RELEASED);
+            row.begin_detach(row.token(index + 1).unwrap());
+        }
+        assert!(
+            rows.iter()
+                .all(|row| !row.reserve() && !row.claim_collect())
+        );
+        for (index, row) in rows.iter().enumerate() {
+            let owner = row.token(index + 1).unwrap();
+            assert_eq!(row.status(owner), OwnerStatus::Detaching);
+            assert!(row.finish_detach(owner));
+            assert!(row.claim_collect());
+            row.free();
+            assert!(row.reserve());
+            assert_ne!(row.token(index + 1), Some(owner));
+        }
+    }
+
+    #[test]
+    fn deferred_detach_preserves_charged_row_until_retry() {
+        let state = Lifetime::new();
+        assert!(state.reserve());
+        state.set_flags(LIVE | EXITED | RELEASED);
+        let owner = state.token(5).unwrap();
+        assert_eq!(state.begin_detach(owner), OwnerStatus::Detaching);
+        // A busy callback completes no local transition.
+        assert_eq!(state.status(owner), OwnerStatus::Detaching);
+        assert!(!state.claim_collect());
+        assert!(!state.reserve());
+        assert_eq!(state.token(5), Some(owner));
+        assert!(state.finish_detach(owner));
+        assert!(state.claim_collect());
+        state.free();
+        assert!(state.reserve());
+        assert_ne!(state.token(5), Some(owner));
+    }
+
+    #[test]
     fn native_ended_detaches_before_release_without_collecting() {
         let state = Lifetime::new();
         state.reserve();

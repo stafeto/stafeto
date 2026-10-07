@@ -130,6 +130,7 @@ fn files_lock_and_stack(fd: i32) -> bool {
     let mut id = 0;
     let mut created = false;
     abi::shared::probe_hold(|| {
+        assert!(abi::shared::probe_recovery_busy_balanced());
         HOLDING.store(1, Ordering::SeqCst);
         created =
             unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(dupper), ptr::null_mut()) }

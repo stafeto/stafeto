@@ -115,7 +115,7 @@ static OPEN_HELP: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the file layer callbacks once, before any resident Open exists.
 /// Fork preserves these code pointers; child initialization discards records.
-pub fn configure_open_lifetime(detach: fn(u64), help: fn()) {
+pub fn configure_open_lifetime(detach: fn(u64) -> bool, help: fn()) {
     let known = OPEN_DETACH.load(Ordering::Acquire);
     assert!(known == 0 || known == detach as usize);
     let known_help = OPEN_HELP.load(Ordering::Acquire);
@@ -144,22 +144,25 @@ pub fn open_owner() -> Result<u64, i32> {
         .ok_or(EIO)
 }
 
-fn detach_open_owner(owner: u64) {
+fn detach_open_owner(owner: u64) -> bool {
     let place = &TABLE[(owner & 63) as usize];
     match place.state.begin_detach(owner) {
-        OwnerStatus::Gone | OwnerStatus::Detached => return,
+        OwnerStatus::Gone | OwnerStatus::Detached => return true,
         OwnerStatus::Alive => unreachable!(),
         OwnerStatus::Detaching => {}
     }
     let function = OPEN_DETACH.load(Ordering::Acquire);
     if function != 0 {
         // SAFETY: initialization stores this immutable fn(u64) code pointer.
-        let detach: fn(u64) = unsafe { core::mem::transmute(function) };
+        let detach: fn(u64) -> bool = unsafe { core::mem::transmute(function) };
         // The callback locally removes owner/helper references and preserves
         // pending cleanup in the prepaid resident records. It is idempotent.
-        detach(owner);
+        if !detach(owner) {
+            return false;
+        }
     }
     place.state.finish_detach(owner);
+    true
 }
 
 /// Recover an ended owner before relibc join/release permits memory collection.
@@ -205,13 +208,15 @@ fn help_open_recovery() {
 }
 
 /// Old-image owners detach after exec quiesced their threads, before fd export.
-pub(crate) fn detach_for_exec() {
+pub(crate) fn detach_for_exec() -> bool {
+    let mut complete = true;
     for (index, place) in TABLE.iter().enumerate() {
         if let Some(owner) = place.state.token(index) {
-            detach_open_owner(owner);
+            complete &= detach_open_owner(owner);
         }
     }
     help_open_recovery();
+    complete
 }
 
 /// The number of the live thread whose relibc `pthread_t` is `pthread`,
@@ -342,7 +347,8 @@ pub fn occupied() -> usize {
 
 /// Frees what the threads that ended and were released held: their TCB,
 /// stack and handles; drains the exit channel.
-pub fn collect() {
+pub fn collect() -> bool {
+    let mut deferred = false;
     let exits = EXITS.load(Ordering::Acquire);
     if exits != 0 {
         let channel = borrowed::<Channel>(exits);
@@ -351,7 +357,7 @@ pub fn collect() {
     // Owner recovery precedes relibc release and stack/TCB reclamation.
     for (index, place) in TABLE.iter().enumerate() {
         if let Some(owner) = place.state.token(index) {
-            let _ = detach_ended_open_owner(owner);
+            deferred |= detach_ended_open_owner(owner) == OwnerStatus::Detaching;
         }
     }
     help_open_recovery();
@@ -388,14 +394,26 @@ pub fn collect() {
         unmap(tcb, tcb_len);
         place.state.free();
     }
+    deferred
 }
 
 /// Whether some place holds a thread relibc released (joined, or detached):
 /// its end, which the exit channel tells, frees the place.
-fn exiting() -> bool {
-    TABLE[1..]
-        .iter()
-        .any(|place| place.state.flags() & RELEASED != 0)
+fn future_exit() -> bool {
+    TABLE.iter().enumerate().skip(1).any(|(index, place)| {
+        let state = place.state.load();
+        if index as u64 + 1 == current()
+            || state & (LIVE | RELEASED | EXITED | DETACHING) != LIVE | RELEASED | EXITED
+        {
+            return false;
+        }
+        let native = place.native.load(Ordering::Acquire);
+        native != 0
+            && sys::thread_info(&borrowed::<Thread>(native)).is_ok_and(|info| {
+                matches!(info.state, ThreadState::Ready | ThreadState::Running)
+                    && place.state.load() == state
+            })
+    })
 }
 
 fn exits() -> Result<u64, i32> {
@@ -419,13 +437,27 @@ fn exits() -> Result<u64, i32> {
 /// exiting thread's end when all are taken; EAGAIN when none will come.
 fn reserve() -> Result<usize, i32> {
     loop {
-        collect();
+        let deferred = collect();
         for (index, place) in TABLE.iter().enumerate().skip(1) {
             if place.state.reserve() {
                 return Ok(index);
             }
         }
-        if !exiting() {
+        if deferred || posix_sync::critical() || !future_exit() {
+            return Err(EAGAIN);
+        }
+        // Recheck admission and exact deferred debt before registering an Exit wait.
+        for (index, place) in TABLE.iter().enumerate().skip(1) {
+            if place.state.reserve() {
+                return Ok(index);
+            }
+        }
+        if TABLE
+            .iter()
+            .any(|place| place.state.flags() & DETACHING != 0)
+            || posix_sync::critical()
+            || !future_exit()
+        {
             return Err(EAGAIN);
         }
         let channel = borrowed::<Channel>(exits()?);
@@ -477,7 +509,13 @@ pub unsafe fn create(
     let id = index as u64 + 1;
     let undo = |native: u64, channel: u64, timer: u64, own: u64| {
         if let Some(owner) = place.state.token(index) {
-            detach_open_owner(owner);
+            // This exact reserved target has never executed user code. START_WINDOW
+            // executes in the creator and must not start the target independently.
+            place.state.begin_detach(owner);
+            assert!(
+                place.state.finish_detach(owner)
+                    || place.state.status(owner) == OwnerStatus::Detached
+            );
         }
         close_raw(timer);
         close_raw(channel);
@@ -559,9 +597,20 @@ pub unsafe fn create(
     if hook != 0 {
         // SAFETY: only probe_start_window stores a C function with this signature.
         let hook = unsafe { core::mem::transmute::<usize, extern "C" fn(u64)>(hook) };
+        let creator = current();
         hook(id);
+        assert_eq!(current(), creator, "start hook preserves creator identity");
+        assert!(
+            sys::thread_info(&native).is_ok_and(|info| info.state == ThreadState::Stopped),
+            "start hook leaves the target never started"
+        );
     }
     if sys::thread_start(&native).is_err() {
+        // A hook must not independently start this target. An unproved state
+        // ends the process before relibc can reclaim a potentially live TCB.
+        if !sys::thread_info(&native).is_ok_and(|info| info.state == ThreadState::Stopped) {
+            sys::process_exit(127);
+        }
         // SAFETY: the block is the new thread's, which never ran.
         let block = unsafe { &*block };
         place.state.rollback();

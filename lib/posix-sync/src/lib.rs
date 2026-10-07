@@ -512,6 +512,25 @@ impl LayerLock {
         }
     }
 
+    /// Try one acquisition without registering a waiter or waiting recursively.
+    pub fn try_lock(&self) -> Option<LayerGuard<'_>> {
+        enter();
+        let raised = self.raise && raise();
+        if self
+            .word
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(LayerGuard { lock: self, raised })
+        } else {
+            if raised {
+                lower();
+            }
+            leave();
+            None
+        }
+    }
+
     pub fn lock(&self) -> LayerGuard<'_> {
         enter();
         let raised = self.raise && raise();

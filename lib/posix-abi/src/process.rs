@@ -1424,7 +1424,9 @@ fn move_files(c: &Handle<Channel>) -> bool {
     // for: a description whose last descriptor went meanwhile closes
     // here, or the new image would keep it in the service with no
     // descriptor.
-    crate::relibc::detach_for_exec();
+    if !crate::relibc::detach_for_exec() {
+        return false;
+    }
     crate::shared::abandon_holds();
     let mut kept = [rt::fs::PreparedOpen {
         fd: 0,

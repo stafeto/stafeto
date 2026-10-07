@@ -46,6 +46,17 @@ pub fn probe_hold(run: impl FnOnce()) {
     run();
 }
 
+/// A recursive recovery probe checks the critical depth and raised priority balance.
+#[cfg(feature = "thread-probe")]
+pub fn probe_recovery_busy_balanced() -> bool {
+    let block = crate::threads::own_block();
+    let before = block.flags.load(Ordering::SeqCst);
+    let mask = block.mask.load(Ordering::SeqCst);
+    let busy = try_with_files(|_| Ok(())).is_err();
+    busy && block.flags.load(Ordering::SeqCst) == before
+        && block.mask.load(Ordering::SeqCst) == mask
+}
+
 /// # Safety
 /// Startup has exclusive access, before any client thread uses the files.
 pub unsafe fn init(
@@ -581,6 +592,17 @@ fn request_error(error: proto_wire::Status) -> i32 {
 /// Runs `f` on the process's files under their lock: the table and the
 /// current directory; a request to a service goes through `held` or
 /// `resolved` outside it.
+/// Recovery borrows the resident state only when its lock is immediately available.
+pub(crate) fn try_with_files<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
+    if !READY.load(Ordering::Acquire) {
+        return Err(ENOSYS);
+    }
+    let _guard = FILES_LOCK.try_lock().ok_or(crate::EAGAIN)?;
+    // SAFETY: READY published the state and the successful guard is exclusive.
+    let files = unsafe { (&mut *STATE.0.get()).files.assume_init_mut() };
+    f(files)
+}
+
 pub fn with_files<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
     process_state(f)
 }
@@ -639,8 +661,8 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
 }
 
 /// Final lifetime callbacks perform local transitions and retain remote ownership.
-pub fn detach_open_owner(owner: u64) {
-    crate::open_driver::detach(owner);
+pub fn detach_open_owner(owner: u64) -> bool {
+    crate::open_driver::detach(owner)
 }
 /// A surviving caller or collector pays one cleanup phase outside the layer locks.
 pub fn help_open_recovery() {
