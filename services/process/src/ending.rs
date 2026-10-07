@@ -319,7 +319,10 @@ impl Processes {
                         End::Signaled(n) => i32::from(n),
                     },
                 };
-                let parent = record.parent_index.map(usize::from);
+                let parent = record
+                    .parent_index
+                    .filter(|_| matches!(record.state, State::EndingAlive(_)))
+                    .map(usize::from);
                 if let Some(parent) = parent {
                     self.end_tells(journal, parent, index);
                 }
