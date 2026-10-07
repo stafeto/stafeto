@@ -23,7 +23,7 @@ fn source_valid(source: InitialSource) -> bool {
             .is_none_or(|n| n < bootimg::rootfs::ENTRIES_MAX as u32)
 }
 
-fn write_source(source: InitialSource, w: &mut Writer) -> Result<(), Status> {
+pub(crate) fn write_source(source: InitialSource, w: &mut Writer) -> Result<(), Status> {
     if !source_valid(source) {
         return Err(Status::BadSize);
     }
@@ -33,7 +33,7 @@ fn write_source(source: InitialSource, w: &mut Writer) -> Result<(), Status> {
     w.u32(0)
 }
 
-fn read_source(r: &mut Reader<'_>) -> Result<InitialSource, Status> {
+pub(crate) fn read_source(r: &mut Reader<'_>) -> Result<InitialSource, Status> {
     let (artifact, raw, canonical, zero) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
     let source = InitialSource {
         artifact,

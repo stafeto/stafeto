@@ -82,7 +82,7 @@ pub struct Receipt {
 }
 
 impl Receipt {
-    fn valid(self) -> bool {
+    pub(crate) fn valid(self) -> bool {
         if !self.key.valid(true)
             || self.init_ticket == 0
             || self.pid == 0
