@@ -815,14 +815,38 @@ impl Processes {
             .who
             .take()
             .expect("the prepaid identity session");
+        let returned = [copy.raw(), session.raw(), who.raw()];
         let pending = work.pending.take().expect("the original Create request");
-        let accepted = pending
-            .answer(
-                bytes.as_bytes(),
-                [copy.erase(), session.erase(), who.erase()],
-            )
-            .is_ok();
-        if accepted {
+        let failure = match pending.answer(
+            bytes.as_bytes(),
+            [copy.erase(), session.erase(), who.erase()],
+        ) {
+            Ok(()) => None,
+            Err(mut refused) => {
+                if let Some(back) = refused.back.take() {
+                    // The reply returns the complete original transfer on a
+                    // refusal that keeps handles. Keep Drop disarmed while
+                    // checking this exact tuple, including a fail-stop path.
+                    let mut back = ManuallyDrop::new(back);
+                    assert_eq!(back.len(), returned.len(), "the full initial transfer");
+                    let who = ManuallyDrop::new(back.pop().expect("the returned identity"));
+                    assert_eq!(who.raw(), returned[2], "the exact initial identity");
+                    work.resources.who =
+                        Some(Handle::from_raw(ManuallyDrop::into_inner(who).into_raw()));
+                    let session = ManuallyDrop::new(back.pop().expect("the returned session"));
+                    assert_eq!(session.raw(), returned[1], "the exact initial session");
+                    work.resources.session = Some(Handle::from_raw(
+                        ManuallyDrop::into_inner(session).into_raw(),
+                    ));
+                    let copy = ManuallyDrop::new(back.pop().expect("the returned process"));
+                    assert_eq!(copy.raw(), returned[0], "the exact initial process");
+                    work.resources.copy =
+                        Some(Handle::from_raw(ManuallyDrop::into_inner(copy).into_raw()));
+                }
+                Some(refused.error)
+            }
+        };
+        if failure.is_none() {
             assert!(work.cancel(key, 0, false));
             assert!(work.finish_cleanup(key));
             // Every owner has crossed its transfer or close boundary. The
@@ -830,7 +854,11 @@ impl Processes {
             self.replacing[index] = None;
             self.preparing_count -= 1;
         } else {
-            work.cancel(key, Status::Kernel(abi::Error::PeerClosed).code(), true);
+            work.cancel(
+                key,
+                Status::Kernel(failure.expect("the refused reply")).code(),
+                true,
+            );
         }
         self.publish_groups(index);
         Ok(())
