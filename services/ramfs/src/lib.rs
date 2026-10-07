@@ -3103,12 +3103,14 @@ mod birth_claim_tests {
     #[test]
     fn wrong_label_keeps_the_birth_and_default_destination() {
         let mut destination = Fds::default();
-        let mut source = Fds::default();
-        source.root = Root {
-            id: 17,
-            generation: 9,
+        let source = Fds {
+            root: Root {
+                id: 17,
+                generation: 9,
+            },
+            binding_outcome: Some(proto_fs::PERMISSION),
+            ..Fds::default()
         };
-        source.binding_outcome = Some(proto_fs::PERMISSION);
         let mut birth = Some((41, source));
         assert!(!destination.claim_retained_birth(&mut birth, 42));
         assert!(destination.fresh_clone_destination());
