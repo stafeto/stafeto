@@ -256,13 +256,18 @@ pub(crate) fn after<const N: u16>(status: u64, _before: u64) {
 #[cfg(feature = "capacity-memory-trace")]
 #[inline(never)]
 fn trace_memory(call: u16, status: u64, before: u64, after: u64) {
-    crate::println!(
-        "capacity-memory: call={} status={} before={} after={}",
-        call,
-        status,
-        before,
-        after
-    );
+    let mut line = [b' '; 88];
+    line[..20].copy_from_slice(b"capacity-memory hex ");
+    for (field, value) in line[20..]
+        .chunks_exact_mut(17)
+        .zip([call as u64, status, before, after])
+    {
+        for (index, byte) in field.iter_mut().take(16).enumerate() {
+            *byte = b"0123456789abcdef"[((value >> ((15 - index) * 4)) & 15) as usize];
+        }
+    }
+    line[87] = b'\n';
+    let _ = crate::console::write(&line);
 }
 
 #[cfg(test)]
