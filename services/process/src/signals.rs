@@ -149,6 +149,10 @@ pub fn return_signal(page: &Page, signal: u8, ticket: u64, info: Info) -> Option
 /// and its flags of SIGCHLD, which ForkStart named ([P24-FORK]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageStart {
+    PreparedSpawn {
+        mask: u64,
+        ignored: u64,
+    },
     Spawn {
         mask: u64,
         default: u64,
@@ -166,6 +170,10 @@ impl PageStart {
     pub fn write(self, page: &Page, from: &Page) {
         use core::sync::atomic::Ordering::{Acquire, Release};
         match self {
+            PageStart::PreparedSpawn { mask, ignored } => {
+                page.start_mask.store(mask, Release);
+                page.ignored.store(ignored, Release);
+            }
             PageStart::Spawn { mask, default } => {
                 page.start_mask.store(mask, Release);
                 let ignored = from.ignored.load(Acquire) & !default;

@@ -12,6 +12,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod adoption_reply;
+pub mod birthwalk;
 pub mod executable;
 #[cfg(feature = "image-probe")]
 pub mod image_probe;
@@ -24,3 +25,4 @@ pub mod signals;
 pub mod terminals;
 pub mod waits;
 pub mod walk;
+pub mod worker_control;

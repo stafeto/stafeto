@@ -14,9 +14,9 @@ use bootimg::BootImage;
 use bootimg::elf::{self, Layout};
 use bootimg::{PAGE_SIZE, Part};
 use proto_loader::{LOADER_BASE, LOADER_END};
-use rt::abi::{Access, Error, Policy};
-use rt::handle::{Handle, Memory, Process, Thread};
-use rt::{loader, sys};
+use rt::abi::{Access, Error};
+use rt::handle::{Handle, Memory, Process};
+use rt::sys;
 
 /// The name of the loader's file in the boot image.
 pub const FILE: &str = "loader.elf";
@@ -26,7 +26,7 @@ const STACK_PAGES: u64 = 4;
 /// five pages a loader, LOADERS of them.
 pub const DATA_PAGES: u64 = 5;
 /// Where the loop maps the objects it fills, in its own space.
-const WINDOW: usize = 0x63_0000_0000;
+pub(super) const WINDOW: usize = 0x63_0000_0000;
 
 pub struct Image {
     /// The code and the read-only data, one after the other.
@@ -68,6 +68,46 @@ fn fill(own: &Handle<Process>, m: &Handle<Memory>, at: u64, bytes: &[u8]) -> Res
 }
 
 impl Image {
+    /// A shared segment's immutable mapping parameters, captured at startup.
+    pub(super) fn shared_mapping(&self, part: Part) -> (u64, u64, usize, Access) {
+        match part {
+            Part::Code => (
+                0,
+                self.code_len,
+                self.layout.segments[part as usize].vaddr as usize,
+                Access::ReadExec,
+            ),
+            Part::Rodata => (
+                self.code_len,
+                self.rodata_len,
+                self.layout.segments[part as usize].vaddr as usize,
+                Access::Read,
+            ),
+            Part::Data => unreachable!("private data has its resident memory owner"),
+        }
+    }
+
+    /// Only duplicates the shared owner; a later STEP maps and closes it.
+    pub(super) fn narrow_shared(&self, part: Part) -> Result<Handle<Memory>, Error> {
+        sys::handle_duplicate(&self.shared, self.shared_mapping(part).3.rights())
+    }
+
+    pub(super) fn data_len(&self) -> u64 {
+        self.data_len
+    }
+
+    pub(super) fn data_bytes(&self) -> &'static [u8] {
+        self.data
+    }
+
+    pub(super) fn data_at(&self) -> usize {
+        self.data_at as usize
+    }
+
+    pub(super) fn entry(&self) -> u64 {
+        self.layout.entry
+    }
+
     /// The loader of the boot image `boot`, its code and read-only data
     /// copied into one object through `own`, the service's process; None
     /// for an image without one, or one whose segments leave the loader's
@@ -106,63 +146,6 @@ impl Image {
             data_at,
             data_len,
         })
-    }
-
-    /// Maps the loader into `process`, a new process: its code and
-    /// read-only data from the shared object, and a new object of its
-    /// data and stack, which the service pays for (through `own`, the
-    /// service's process, it fills it); then makes its thread at
-    /// `priority`, its stack pointer at the top of that object. The thread
-    /// waits for thread_start. On an error the caller kills the process.
-    pub fn place(
-        &self,
-        own: &Handle<Process>,
-        process: &Handle<Process>,
-        priority: u8,
-    ) -> Result<Handle<Thread>, Error> {
-        let code = &self.layout.segments[Part::Code as usize];
-        let rodata = &self.layout.segments[Part::Rodata as usize];
-        loader::map_narrowed(
-            process,
-            &self.shared,
-            0,
-            self.code_len,
-            code.vaddr as usize,
-            Access::ReadExec,
-        )?;
-        if self.rodata_len > 0 {
-            loader::map_narrowed(
-                process,
-                &self.shared,
-                self.code_len,
-                self.rodata_len,
-                rodata.vaddr as usize,
-                Access::Read,
-            )?;
-        }
-        let data = sys::mem_create(self.data_len)?;
-        fill(own, &data, 0, self.data)?;
-        loader::map_narrowed(
-            process,
-            &data,
-            0,
-            self.data_len,
-            self.data_at as usize,
-            Access::ReadWrite,
-        )?;
-        // The mapping holds the object; the loader unmaps it at its end.
-        drop(data);
-        // x0: the loader's level, for the slots of its start channel.
-        loader::thread_at(
-            process,
-            self.layout.entry,
-            self.data_at + self.data_len,
-            priority.into(),
-            priority,
-            // The program's first thread: SCHED_OTHER, round robin (spec
-            // 2), as a forked child's thread goes on.
-            Policy::RoundRobin,
-        )
     }
 
     /// The address and length of the loader's data and stack, which it
