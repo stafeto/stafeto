@@ -18,6 +18,7 @@ use proto_wire::Status;
 use proto_wire::clones::Clones;
 use ramfs::authority::{
     Admission, AuditStep, Binding, BindingPurpose, CleanupAudit, Identity, NotaryReply,
+    RetainedSourcePhase, retained_source_phase,
 };
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
@@ -2488,6 +2489,14 @@ impl Fs {
     }
 
     fn authenticate(&mut self, fds: &mut Fds, label: u64) -> Result<(), u32> {
+        Self::authenticate_fields(&mut self.ram, self.identities, fds, label)
+    }
+    fn authenticate_fields(
+        ram: &mut Ram<'_>,
+        identities: &mut [Option<IdentityChannel>; SESSIONS],
+        fds: &mut Fds,
+        label: u64,
+    ) -> Result<(), u32> {
         if matches!(fds.binding, Binding::Unbound) && proto_fs::is_boot_profile(label) {
             fds.binding = Binding::Boot;
             fds.root = Root {
@@ -2518,15 +2527,14 @@ impl Fs {
             return Err(proto_fs::TOO_MANY_OPEN_FILES);
         }
         let i = fds.authority_index as usize;
-        let identity = self
-            .identities
+        let identity = identities
             .get_mut(i)
             .and_then(Option::as_mut)
             .ok_or(proto_fs::PERMISSION)?;
         if identity.label != label {
             return Err(proto_fs::PERMISSION);
         }
-        self.ram.begin_binding(fds)?;
+        ram.begin_binding(fds)?;
         identity.admission = Admission::Unvouched;
         identity.audit.reset();
         identity.purpose = BindingPurpose::Refresh;
@@ -2983,40 +2991,57 @@ impl Fs {
             let Some(creator) = source.binding.snapshot_ref() else {
                 return self.reject_binding(fds);
             };
-            if source.binding_preparation.is_some()
-                || generation(creator.index as usize) != creator.generation
-            {
-                let (_, mut source) = self.births[slot as usize].take().unwrap();
-                let code = if source.binding_preparation.is_some() {
-                    self.binding_phase(&mut source, label, progress)
-                } else {
-                    match self.authenticate(&mut source, label) {
-                        Ok(()) | Err(proto_fs::AUTHENTICATING) => proto_fs::RESOLVING,
-                        Err(code) => code,
-                    }
-                };
-                let valid = !matches!(source.binding, Binding::Cleanup);
-                self.births[slot as usize] = Some((label, source));
-                return if !valid {
-                    self.reject_binding(fds)
-                } else if code == 0 || code == proto_fs::RESOLVING {
-                    proto_fs::RESOLVING
-                } else {
-                    self.fail_binding(fds, code)
-                };
+            let purpose = self
+                .identities
+                .get(source.authority_index as usize)
+                .and_then(Option::as_ref)
+                .filter(|identity| identity.label == label)
+                .map(|identity| identity.purpose);
+            let source_phase = match retained_source_phase(
+                label,
+                *old_label,
+                source.binding_preparation.is_some(),
+                purpose,
+                generation(creator.index as usize),
+                creator.generation,
+            ) {
+                Err(_) => return self.reject_binding(fds),
+                Ok(phase) => phase,
+            };
+            *progress = source_phase.progresses();
+            match source_phase {
+                RetainedSourcePhase::WaitRefresh => {
+                    // The retained birth advances from its own maintenance visit.
+                    return proto_fs::RESOLVING;
+                }
+                RetainedSourcePhase::Authenticate => {
+                    let source = &mut self.births[slot as usize].as_mut().unwrap().1;
+                    let result =
+                        Self::authenticate_fields(&mut self.ram, self.identities, source, label);
+                    let valid = !matches!(source.binding, Binding::Cleanup);
+                    return if !valid {
+                        self.reject_binding(fds)
+                    } else {
+                        match result {
+                            Ok(()) | Err(proto_fs::AUTHENTICATING) => proto_fs::RESOLVING,
+                            Err(code) => self.fail_binding(fds, code),
+                        }
+                    };
+                }
+                RetainedSourcePhase::Ready => {}
             }
-            let (_, mut source) = self.births[slot as usize].take().unwrap();
             let mut bound = source.binding;
             if bound.bind_ref(Some(&who), true).is_err() || source.root != fds.root {
-                self.births[slot as usize] = Some((label, source));
                 return self.reject_binding(fds);
             }
-            self.drop_identity(&mut source);
+            let source = &mut self.births[slot as usize].as_mut().unwrap().1;
+            Self::drop_identity_fields(&mut self.ram, self.identities, source);
             source.binding = bound;
             source.authority_index = fds.authority_index;
             source.claimed = true;
             self.ram.complete_binding(fds, 0);
-            *fds = source;
+            core::mem::swap(fds, source);
+            self.births[slot as usize] = None;
         } else {
             self.ram.complete_binding(fds, 0);
         }
