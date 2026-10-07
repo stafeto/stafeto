@@ -1096,7 +1096,7 @@ impl Service<0> for Fs {
                 .find(|b| b.is_some_and(|(l, _)| l == label))
             {
                 // RT creates unclaimed sessions from Fds::default, with no held references.
-                let claimed = s.data.claim_birth(birth, label);
+                let claimed = s.data.claim_retained_birth(birth, label);
                 debug_assert!(claimed);
             } else if r.label() & proto_fs::OWN != 0 && self.clones.client_of(r.label()).is_some() {
                 // A Loader consumed this birth into a distinct label; surviving old copies
