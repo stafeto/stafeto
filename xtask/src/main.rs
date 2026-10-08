@@ -3920,8 +3920,16 @@ fn ash_dialog() -> Result<(), String> {
         run.expect_line("mktemp 0", |line| line == "mktemp 0", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send(&format!("/bin/ls {temporary}; echo temporary-file $?"))?;
-        run.expect_line("created temporary file", |line| line == temporary, DIALOG_STEP)?;
-        run.expect_line("temporary-file 0", |line| line == "temporary-file 0", DIALOG_STEP)?;
+        run.expect_line(
+            "created temporary file",
+            |line| line == temporary,
+            DIALOG_STEP,
+        )?;
+        run.expect_line(
+            "temporary-file 0",
+            |line| line == "temporary-file 0",
+            DIALOG_STEP,
+        )?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("exit")?;
         run.expect("exit", DIALOG_STEP)?;
