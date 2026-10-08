@@ -414,8 +414,15 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         self.flags & MAPS != 0 && self.publication == *publication
     }
     pub fn bootstrap(&mut self, key: SeedKey) -> bool {
-        if key != self.key || !self.page_ready() || self.flags & (MAPS | STAGE) != MAPS | STAGE {
+        if key != self.key
+            || self.flags & ENDED != 0
+            || !self.page_ready()
+            || self.flags & (MAPS | STAGE) != MAPS | STAGE
+        {
             return false;
+        }
+        if self.flags & BOOTSTRAP != 0 {
+            return true;
         }
         self.flags |= BOOTSTRAP;
         self.phase = Phase::CRTWait;
@@ -543,6 +550,9 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         {
             return None;
         }
+        if self.flags & MAPS_ACK != 0 {
+            return Some(self.publication.map.receipt);
+        }
         self.flags |= MAPS_ACK;
         self.phase = Phase::SealWait;
         Some(self.publication.map.receipt)
@@ -567,7 +577,13 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         pending: D,
         effects: &E,
     ) -> Result<(), D> {
+        let expected_phase = if self.flags & USER != 0 {
+            Phase::UserReleased
+        } else {
+            Phase::SealWait
+        };
         if key != self.publication.map.receipt.key
+            || self.phase != expected_phase
             || self.flags & (MAPS_ACK | ENDED | CRT_REPLIED) != MAPS_ACK
             || !effects.is_live(&pending)
             || self
@@ -1331,6 +1347,21 @@ mod tests {
                 .is_err()
         );
         assert!(resident.map_ack(key).is_some());
+        for phase in [
+            Phase::CRTWait,
+            Phase::MapReplyUncertain,
+            Phase::Loading,
+            Phase::Canceling,
+        ] {
+            resident.phase = phase;
+            assert!(
+                resident
+                    .begin_crt_wait(key, MapPending { live: true }, &effects)
+                    .is_err()
+            );
+            assert!(resident.operation_pending.is_none());
+        }
+        resident.phase = Phase::SealWait;
         resident.flags |= INIT_ACK;
         assert!(
             resident
@@ -1346,6 +1377,10 @@ mod tests {
         resident.crt_pending = Some(MapPending { live: true });
         while resident.map_step(&mut effects) {}
         assert!(resident.user_release(resident.key));
+        assert!(resident.bootstrap(resident.key));
+        assert_eq!(resident.phase(), Phase::UserReleased);
+        assert!(resident.map_ack(key).is_some());
+        assert_eq!(resident.phase(), Phase::UserReleased);
         effects.outcome = MapDelivery::ReturnedLive;
         let calls = effects.calls;
         assert!(resident.crt_wait_step(&mut effects));
