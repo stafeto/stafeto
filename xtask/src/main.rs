@@ -3235,6 +3235,14 @@ const TERM_B: u64 = 20_410;
 const KERNEL_B_MAX: u64 = 18_000;
 const _: () = assert!(KERNEL_B_MAX < TERM_B);
 
+/// The guards of the paths epoch 2 made shorter, in ticks under -icount on
+/// the normal build (`init_tests`, row `null` of `normal build`) and on the
+/// test build (`kernel_tests`, row `threads_ready` of `teardown portions`).
+/// Each sits four ticks above the measure at the end of epoch 2 (262 and
+/// 12 764); a higher number needs a decision with its reason written down.
+const NULL_MAX: u64 = 266;
+const THREADS_READY_MAX: u64 = 12_768;
+
 /// The most one step of a service may take (one READ_INTO of up to
 /// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for
 /// instance): term B, in ticks under -icount.
@@ -5578,6 +5586,21 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
             m.name
         );
+        let (_, rows, ticks) = measured
+            .iter()
+            .find(|(what, ..)| *what == "teardown portions")
+            .ok_or("no teardown portions measured")?;
+        let room = guard_margin(
+            "teardown portions",
+            rows,
+            ticks,
+            "threads_ready",
+            THREADS_READY_MAX,
+        )?;
+        println!(
+            "threads_ready margin on {}: {room} of THREADS_READY_MAX {THREADS_READY_MAX}",
+            m.name
+        );
     }
     match variant {
         Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
@@ -5633,6 +5656,24 @@ fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, 
             n - KERNEL_B_MAX
         )),
     }
+}
+
+/// The row `row` of `rows` among the `ticks`, which may not pass `max`: the
+/// room left under it, or an error that names the row. The caller prints it.
+fn guard_margin(
+    what: &str,
+    rows: &[&str],
+    ticks: &[u64],
+    row: &str,
+    max: u64,
+) -> Result<u64, String> {
+    let n = rows
+        .iter()
+        .zip(ticks)
+        .find_map(|(r, &n)| (*r == row).then_some(n))
+        .ok_or_else(|| format!("the {what} line has no row {row}"))?;
+    max.checked_sub(n)
+        .ok_or_else(|| format!("{what} {row}={n} is {} past its guard {max}", n - max))
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -5737,6 +5778,8 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
             m.name,
             rows_of(&NORMAL_BUILD_ROWS, &ticks)
         );
+        let room = guard_margin("normal build", &NORMAL_BUILD_ROWS, &ticks, "null", NULL_MAX)?;
+        println!("null margin on {}: {room} of NULL_MAX {NULL_MAX}", m.name);
         let ticks = ticks_of(&o.lines, "log", &LOG_ROWS)?;
         println!("log ticks on {}: {}", m.name, rows_of(&LOG_ROWS, &ticks));
     }
@@ -7137,6 +7180,42 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// The guards of the paths of epoch 2 name the row and the excess.
+    #[test]
+    fn a_path_past_its_guard_fails_with_the_row_named() {
+        let null = |n| {
+            guard_margin(
+                "normal build",
+                &NORMAL_BUILD_ROWS,
+                &[n, 1, 1, 1, 1],
+                "null",
+                NULL_MAX,
+            )
+        };
+        assert_eq!(null(NULL_MAX), Ok(0));
+        assert_eq!(null(262), Ok(4));
+        let error = null(NULL_MAX + 1).unwrap_err();
+        assert!(
+            error.contains("null=267") && error.contains("1 past"),
+            "{error}"
+        );
+        let mut teardown = [0; 10];
+        teardown[TEARDOWN_ROWS
+            .iter()
+            .position(|r| *r == "threads_ready")
+            .unwrap()] = THREADS_READY_MAX + 8;
+        let error = guard_margin(
+            "teardown portions",
+            &TEARDOWN_ROWS,
+            &teardown,
+            "threads_ready",
+            THREADS_READY_MAX,
+        )
+        .unwrap_err();
+        assert!(error.contains("threads_ready=12776"), "{error}");
+        assert!(guard_margin("x", &NORMAL_BUILD_ROWS, &[0; 5], "none", 1).is_err());
     }
 
     /// B is the longest row of any line of portions or short calls, never
