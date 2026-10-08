@@ -36,8 +36,9 @@ const REPLIES_PORTION: usize = 32;
 const BUFFERS_PORTION: usize = 32;
 /// A thread goes into a portion only when its units fit, so the heaviest
 /// thread (its frame, the handles of its request and its long call) has to
-/// fit alone, or the stage would never end.
-const _: () = assert!(FRAME_UNITS + abi::MESSAGE_HANDLES + 1 <= BUFFERS_PORTION);
+/// fit alone, or the stage would never end (the long call is one unit more,
+/// hence the strict comparison).
+const _: () = assert!(FRAME_UNITS + abi::MESSAGE_HANDLES < BUFFERS_PORTION);
 
 /// Handle table entries a portion of the stage Handles releases, at most
 /// (spec 7.7): half a chunk, each last copy of a session telling its
