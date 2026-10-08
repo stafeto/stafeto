@@ -226,6 +226,11 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// Observe token custody without moving the reply authority.
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
     pub fn label(&self) -> u64 {
         self.label
     }

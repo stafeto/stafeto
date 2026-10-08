@@ -24,6 +24,9 @@ pub enum Phase {
     MapsReady,
     BootstrapReady,
     CRTWait,
+    MapReplyCopies,
+    MapReplySend,
+    MapReplyUncertain,
     MapsAcked,
     SealWait,
     UserReleased,
@@ -36,6 +39,28 @@ pub enum CleanupOwner<M, C, T> {
     Memory(M),
     Channel(C),
     Thread(T),
+}
+
+/// Delivery describes the token and copy ownership after the native reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapDelivery {
+    Completed,
+    ReturnedLive,
+    Consumed,
+}
+
+/// Each method performs at most one native effect. Reply restores returned
+/// copies in their exact slots and retains a consumed Pending as a marker.
+pub trait MapEffects<M, D> {
+    fn is_live(&self, pending: &D) -> bool;
+    fn duplicate(&mut self, original: &M) -> Option<M>;
+    fn send(
+        &mut self,
+        reply: &Reply,
+        copies: &mut [Option<M>; ENTRIES],
+        pending: &mut D,
+    ) -> MapDelivery;
+    fn close(&mut self, owner: M) -> Result<(), M>;
 }
 
 pub struct InitialResident<M, C, T, D> {
@@ -396,6 +421,110 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
             && (key == Key::FIRST || key == self.publication.map.receipt.key))
             .then_some(self.publication.map)
     }
+    pub fn can_begin_map_reply<E: MapEffects<M, D>>(&self, key: Key, effects: &E) -> bool {
+        self.map_reply(key).is_some()
+            && match self.phase {
+                Phase::CRTWait => self.operation_pending.is_none(),
+                Phase::MapReplyUncertain => self
+                    .operation_pending
+                    .as_ref()
+                    .is_some_and(|pending| !effects.is_live(pending)),
+                _ => false,
+            }
+    }
+    pub fn begin_map_reply<E: MapEffects<M, D>>(
+        &mut self,
+        key: Key,
+        pending: D,
+        effects: &E,
+    ) -> Result<(), D> {
+        if !self.can_begin_map_reply(key, effects) || !effects.is_live(&pending) {
+            return Err(pending);
+        }
+        // Admission only replaces a marker whose token has already been consumed.
+        self.operation_pending = Some(pending);
+        self.phase = Phase::MapReplyCopies;
+        Ok(())
+    }
+    pub fn acknowledge_maps<E: MapEffects<M, D>>(
+        &mut self,
+        key: Key,
+        effects: &E,
+    ) -> Option<Receipt> {
+        if self
+            .operation_pending
+            .as_ref()
+            .is_some_and(|p| effects.is_live(p))
+        {
+            return None;
+        }
+        let receipt = self.map_ack(key)?;
+        self.operation_pending.take();
+        Some(receipt)
+    }
+    /// Returns true when this visit belongs to the map driver, including a
+    /// waiting or refused effect. The caller performs no second native effect.
+    pub fn map_step<E: MapEffects<M, D>>(&mut self, effects: &mut E) -> bool {
+        if self.flags & ENDED != 0 {
+            return false;
+        }
+        match self.phase {
+            Phase::MapReplyCopies => {
+                let count = usize::from(self.publication.map.count);
+                if let Some(slot) = (0..count).find(|&slot| self.reply_copies[slot].is_none()) {
+                    let original = self.originals[slot].as_ref().expect("retained initial map");
+                    if let Some(copy) = effects.duplicate(original) {
+                        self.reply_copies[slot] = Some(copy);
+                    }
+                } else {
+                    self.phase = Phase::MapReplySend;
+                }
+                true
+            }
+            Phase::MapReplySend => {
+                let pending = self
+                    .operation_pending
+                    .as_mut()
+                    .expect("initial map request");
+                match effects.send(&self.publication.map, &mut self.reply_copies, pending) {
+                    MapDelivery::Completed => {
+                        assert!(!effects.is_live(pending));
+                        assert!(self.reply_copies.iter().all(Option::is_none));
+                        self.operation_pending.take();
+                        self.phase = Phase::CRTWait;
+                    }
+                    MapDelivery::ReturnedLive => {
+                        assert!(effects.is_live(pending));
+                        assert!(self.reply_copies.iter().enumerate().all(|(slot, owner)| {
+                            owner.is_some() == (slot < usize::from(self.publication.map.count))
+                        }));
+                    }
+                    MapDelivery::Consumed => {
+                        assert!(!effects.is_live(pending));
+                        self.phase = Phase::MapReplyUncertain;
+                    }
+                }
+                true
+            }
+            Phase::MapReplyUncertain => true,
+            _ if self.flags & MAPS_ACK != 0 => {
+                if let Some((slot, owner)) = self.cleanup_reply_copy() {
+                    if let Err(owner) = effects.close(owner) {
+                        assert!(self.restore_reply_copy(slot, owner).is_ok());
+                    }
+                    return true;
+                }
+                if let Some((slot, owner)) = self.cleanup_original() {
+                    if let Err(owner) = effects.close(owner) {
+                        assert!(self.restore_original(slot, owner).is_ok());
+                    }
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
     pub fn map_ack(&mut self, key: Key) -> Option<Receipt> {
         if key != self.publication.map.receipt.key
             || self.flags & (MAPS | BOOTSTRAP) != MAPS | BOOTSTRAP
@@ -470,7 +599,7 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         }
     }
     pub fn cleanup_reply_copy(&mut self) -> Option<(usize, M)> {
-        if !self.native_end_confirmed() {
+        if self.flags & MAPS_ACK == 0 && !self.native_end_confirmed() {
             return None;
         }
         self.reply_copies
@@ -612,6 +741,276 @@ mod tests {
             None,
             None,
         ]
+    }
+    struct MapPending {
+        live: bool,
+    }
+    struct Effects {
+        log: Rc<RefCell<Vec<u32>>>,
+        calls: usize,
+        dup_fail: bool,
+        close_fail: bool,
+        outcome: MapDelivery,
+        returned: bool,
+        received: Vec<Cap>,
+    }
+    impl MapEffects<Cap, MapPending> for Effects {
+        fn is_live(&self, pending: &MapPending) -> bool {
+            pending.live
+        }
+        fn duplicate(&mut self, original: &Cap) -> Option<Cap> {
+            self.calls += 1;
+            if self.dup_fail {
+                return None;
+            }
+            Some(Cap(original.0 + 100, self.log.clone()))
+        }
+        fn send(
+            &mut self,
+            reply: &Reply,
+            copies: &mut [Option<Cap>; ENTRIES],
+            pending: &mut MapPending,
+        ) -> MapDelivery {
+            self.calls += 1;
+            assert!(pending.live);
+            for (slot, copy) in copies.iter().enumerate() {
+                assert_eq!(
+                    copy.as_ref().map(|cap| cap.0),
+                    (slot < usize::from(reply.count)).then_some(slot as u32 + 101)
+                );
+            }
+            pending.live = self.outcome == MapDelivery::ReturnedLive;
+            if !self.returned {
+                for copy in copies.iter_mut().filter_map(Option::take) {
+                    self.received.push(copy);
+                }
+            }
+            self.outcome
+        }
+        fn close(&mut self, owner: Cap) -> Result<(), Cap> {
+            self.calls += 1;
+            if self.close_fail {
+                return Err(owner);
+            }
+            drop(owner);
+            Ok(())
+        }
+    }
+    fn map_fixture(count: u8) -> (InitialResident<Cap, Cap, Cap, MapPending>, Effects) {
+        let (base, mut publication, log) = fixture();
+        publication.map.count = u16::from(count);
+        for slot in 0..ENTRIES {
+            publication.map.entries[slot] = if slot < usize::from(count) {
+                Entry {
+                    address: (slot as u64 + 1) * 4096,
+                    pages: 1,
+                    access: Access::Read,
+                    slot: slot as u32,
+                }
+            } else {
+                Entry::EMPTY
+            };
+        }
+        let mut resident =
+            InitialResident::reserved(base.key, publication.map.receipt, publication.source)
+                .unwrap();
+        assert!(resident.awaiting_guard());
+        assert!(resident.authenticated_stage(resident.key, 9));
+        resident.flags |= PAGE_MAPPED | PAGE_SETTLED;
+        assert!(
+            resident
+                .publish(
+                    publication,
+                    core::array::from_fn(|slot| {
+                        (slot < usize::from(count)).then(|| Cap(slot as u32 + 1, log.clone()))
+                    })
+                )
+                .is_ok()
+        );
+        assert!(resident.bootstrap(resident.key));
+        (
+            resident,
+            Effects {
+                log,
+                calls: 0,
+                dup_fail: false,
+                close_fail: false,
+                outcome: MapDelivery::Completed,
+                returned: false,
+                received: Vec::new(),
+            },
+        )
+    }
+    #[test]
+    fn map_delivery_preserves_originals_and_retries_only_missing_copies() {
+        for count in 1..=ENTRIES as u8 {
+            for (outcome, returned) in [
+                (MapDelivery::Completed, false),
+                (MapDelivery::ReturnedLive, true),
+                (MapDelivery::Consumed, true),
+                (MapDelivery::Consumed, false),
+            ] {
+                let (mut resident, mut effects) = map_fixture(count);
+                effects.outcome = outcome;
+                effects.returned = returned;
+                let key = resident.publication.map.receipt.key;
+                assert!(
+                    resident
+                        .begin_map_reply(Key::FIRST, MapPending { live: true }, &effects)
+                        .is_ok()
+                );
+                effects.dup_fail = true;
+                assert!(resident.map_step(&mut effects));
+                assert!(resident.reply_copies.iter().all(Option::is_none));
+                effects.dup_fail = false;
+                for _ in 0..count {
+                    assert!(resident.map_step(&mut effects));
+                }
+                assert_eq!(effects.calls, usize::from(count) + 1);
+                assert!(resident.map_step(&mut effects)); // CPU phase change.
+                assert_eq!(effects.calls, usize::from(count) + 1);
+                assert!(resident.acknowledge_maps(key, &effects).is_none());
+                assert!(resident.map_step(&mut effects));
+                assert!(effects.log.borrow().is_empty());
+                assert!(
+                    resident
+                        .originals
+                        .iter()
+                        .enumerate()
+                        .all(|(slot, cap)| cap.as_ref().map(|c| c.0)
+                            == (slot < usize::from(count)).then_some(slot as u32 + 1))
+                );
+                if outcome == MapDelivery::ReturnedLive {
+                    assert!(!resident.can_begin_map_reply(key, &effects));
+                    assert!(resident.acknowledge_maps(key, &effects).is_none());
+                    effects.outcome = MapDelivery::Completed;
+                    effects.returned = false;
+                    assert!(resident.map_step(&mut effects));
+                } else if outcome == MapDelivery::Consumed {
+                    let calls = effects.calls;
+                    assert!(resident.map_step(&mut effects));
+                    assert_eq!(effects.calls, calls);
+                    let foreign = Key {
+                        key: key.key - 1,
+                        image: key.image,
+                    };
+                    assert!(!resident.can_begin_map_reply(foreign, &effects));
+                    assert!(
+                        resident
+                            .begin_map_reply(key, MapPending { live: true }, &effects)
+                            .is_ok()
+                    );
+                    let before = effects.calls;
+                    for _ in 0..=count {
+                        resident.map_step(&mut effects);
+                    }
+                    assert_eq!(
+                        effects.calls - before,
+                        if returned { 1 } else { usize::from(count) }
+                    );
+                    // Returned tuples reach Send immediately; no new duplicate.
+                    if resident.phase == Phase::MapReplySend {
+                        resident.map_step(&mut effects);
+                    }
+                }
+                assert!(resident.acknowledge_maps(key, &effects).is_some());
+                assert!(resident.operation_pending.is_none());
+                assert!(!resident.can_begin_map_reply(key, &effects));
+                let calls = effects.calls;
+                assert!(resident.acknowledge_maps(key, &effects).is_some());
+                assert_eq!(effects.calls, calls);
+                effects.close_fail = true;
+                let before = effects.calls;
+                assert!(resident.map_step(&mut effects));
+                assert_eq!(effects.calls, before + 1);
+                assert!(effects.log.borrow().is_empty());
+                effects.close_fail = false;
+                while resident.map_step(&mut effects) {}
+                assert!(resident.originals.iter().all(Option::is_none));
+                assert!(resident.reply_copies.iter().all(Option::is_none));
+                for original in 1..=u32::from(count) {
+                    assert_eq!(
+                        effects
+                            .log
+                            .borrow()
+                            .iter()
+                            .filter(|&&id| id == original)
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn exact_ack_reconciles_consumed_marker_and_closes_returned_copies() {
+        for returned in [false, true] {
+            let (mut resident, mut effects) = map_fixture(2);
+            effects.outcome = MapDelivery::Consumed;
+            effects.returned = returned;
+            let key = resident.publication.map.receipt.key;
+            assert!(
+                resident
+                    .begin_map_reply(key, MapPending { live: true }, &effects)
+                    .is_ok()
+            );
+            for _ in 0..4 {
+                assert!(resident.map_step(&mut effects));
+            }
+            assert_eq!(resident.phase, Phase::MapReplyUncertain);
+            let wrong = Key {
+                key: key.key,
+                image: key.image + 1,
+            };
+            assert!(resident.acknowledge_maps(wrong, &effects).is_none());
+            assert!(resident.operation_pending.is_some());
+            let calls = effects.calls;
+            assert!(resident.acknowledge_maps(key, &effects).is_some());
+            assert_eq!(effects.calls, calls);
+            assert!(resident.operation_pending.is_none());
+            assert!(effects.log.borrow().is_empty());
+            while resident.map_step(&mut effects) {}
+            let log = effects.log.borrow();
+            assert_eq!(log.iter().filter(|&&id| id <= 2).count(), 2);
+            assert_eq!(
+                log.iter().filter(|&&id| id >= 100).count(),
+                if returned { 2 } else { 0 }
+            );
+            assert_eq!(effects.received.len(), if returned { 0 } else { 2 });
+        }
+    }
+    #[test]
+    fn end_after_ack_waits_for_native_exit_before_closing_maps() {
+        let (mut resident, mut effects) = map_fixture(2);
+        let key = resident.publication.map.receipt.key;
+        assert!(resident.acknowledge_maps(key, &effects).is_some());
+        assert!(resident.ended(resident.key, 9));
+        assert!(!resident.native_end_confirmed());
+        assert!(!resident.map_step(&mut effects));
+        assert_eq!(effects.calls, 0);
+        assert!(resident.originals[0].is_some());
+        assert!(effects.log.borrow().is_empty());
+    }
+    #[test]
+    fn end_blocks_map_effects_in_every_reply_phase() {
+        for phase in [
+            Phase::MapReplyCopies,
+            Phase::MapReplySend,
+            Phase::MapReplyUncertain,
+        ] {
+            let (mut resident, mut effects) = map_fixture(4);
+            resident.phase = phase;
+            resident.operation_pending = Some(MapPending {
+                live: phase != Phase::MapReplyUncertain,
+            });
+            resident.reply_copies[0] = Some(Cap(101, effects.log.clone()));
+            assert!(resident.ended(resident.key, 9));
+            assert!(!resident.map_step(&mut effects));
+            assert_eq!(effects.calls, 0);
+            assert!(effects.log.borrow().is_empty());
+            assert!(resident.cleanup_reply_copy().is_none());
+            assert!(!resident.can_begin_map_reply(Key::FIRST, &effects));
+        }
     }
     #[test]
     fn terminal_release_keeps_all_owners_until_native_end_and_exact_ack() {
