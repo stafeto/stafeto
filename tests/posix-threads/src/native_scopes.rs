@@ -119,6 +119,14 @@ pub(super) fn run() -> bool {
     if original < 3 || threads::set_level(original - 2).is_err() {
         return failed(730);
     }
+    // A receive ends a retained boost; an unpublished empty
+    // channel makes this a single nonblocking operation at the lowered base.
+    let settle = sys::channel_create(original - 2).expect("native startup boost channel");
+    let settled = matches!(sys::try_receive(&settle), Err(Error::WouldBlock));
+    drop(settle);
+    if !settled {
+        return failed(731);
+    }
     let main_info = sys::thread_info(&main).expect("lowered main priority");
     let mut raised_info = main_info;
     abi::shared::probe_hold(|| {
