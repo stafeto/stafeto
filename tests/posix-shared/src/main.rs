@@ -172,7 +172,27 @@ fn in_native_thread(process: rt::abi::Handle) -> bool {
     }) else {
         return fail(27);
     };
-    if sys::thread_start(&thread).is_err() || sys::receive(&completion).is_err() {
+    let (started, start_error) = match sys::thread_start(&thread) {
+        Ok(()) => (true, 0u64),
+        Err(error) => (false, error.code()),
+    };
+    let (received, receive_error) = if started {
+        match sys::receive(&completion) {
+            Ok(_) => (1u32, 0u64),
+            Err(error) => (2, error.code()),
+        }
+    } else {
+        (0, 0)
+    };
+    if !started || received == 2 {
+        let passed = PASSED.load(Ordering::Acquire);
+        rt::println!(
+            "posix-shared-probe: completion start_error={} receive={} receive_error={} done={}",
+            start_error,
+            received,
+            receive_error,
+            passed
+        );
         return fail(28);
     }
     PASSED.load(Ordering::Acquire) == 1
