@@ -184,17 +184,65 @@ fn executable_segments(bytes: &[u8]) -> Result<Vec<(u64, &[u8])>, String> {
     Ok(segments)
 }
 
-/// A load or store, literal loads excluded (A64 encoding group
-/// `x1x0` of bits 28..25; the literal form has no base register).
-fn load_store(word: u32) -> bool {
-    word & 0x0a00_0000 == 0x0800_0000 && word & 0x3b00_0000 != 0x1800_0000
+/// Whether `word` is a load or store that may stand second in an erratum
+/// 843419 sequence (the classes of the LLD test `is843419ErratumSequence`):
+/// a single register access of any addressing form, an exclusive access, a
+/// literal load, STP or STNP, ST1.
+fn second_access(word: u32) -> bool {
+    let store = word & (1 << 22) == 0;
+    word & 0x3a00_0000 == 0x3800_0000
+        || word & 0x3f00_0000 == 0x0800_0000
+        || word & 0x3b00_0000 == 0x1800_0000
+        || (word & 0x3a00_0000 == 0x2800_0000 && store)
+        || (word & 0xbf00_0000 == 0x0c00_0000 && store)
+        || (word & 0xbf20_0000 == 0x0d00_0000 && store)
+}
+
+/// Whether the second instruction `word` of a sequence writes the
+/// register `register`: a load into it, a status register of a store
+/// exclusive, or a base register written back.
+fn writes_register(word: u32, register: u32) -> bool {
+    let (rt, base) = (word & 0x1f, (word >> 5) & 0x1f);
+    let load = word & (1 << 22) != 0;
+    let vector = word & (1 << 26) != 0;
+    if word & 0x3b00_0000 == 0x1800_0000 {
+        return !vector && rt == register;
+    }
+    if word & 0x3f00_0000 == 0x0800_0000 {
+        return if load {
+            rt == register
+        } else {
+            (word >> 16) & 0x1f == register
+        };
+    }
+    if word & 0x3a00_0000 == 0x3800_0000 {
+        let written_back = word & (1 << 24) == 0 && word & (1 << 21) == 0 && (word >> 10) & 1 == 1;
+        return (load && !vector && rt == register) || (written_back && base == register);
+    }
+    if word & 0x3a00_0000 == 0x2800_0000 {
+        let written_back = matches!((word >> 23) & 3, 1 | 3);
+        return written_back && base == register;
+    }
+    // ST1 and the like: a post-indexed form writes its base back.
+    word & 0xbf20_0000 == 0x0c80_0000 && base == register
+}
+
+/// A branch, a call or a return.
+fn branch(word: u32) -> bool {
+    word & 0x7c00_0000 == 0x1400_0000
+        || word & 0xfe00_0000 == 0x5400_0000
+        || word & 0x7e00_0000 == 0x3400_0000
+        || word & 0x7e00_0000 == 0x3600_0000
+        || word & 0xfe00_0000 == 0xd600_0000
 }
 
 /// The addresses of the erratum 843419 sequences in `code`, which starts
 /// at the address `base` of a 4 KiB page: an ADRP at offset 0xff8 or 0xffc
-/// of a page, then a load or store, then a load or store whose base is
-/// the register of the ADRP. A Cortex-A53 (the PinePhone's A64) may then
-/// read the third instruction's address wrongly. Each is the address of
+/// of a page, then a load or store (second_access) that does not write the
+/// register of the ADRP, then either directly or after one instruction
+/// that is no branch a load or store of the unsigned immediate class with
+/// that register as its base. A Cortex-A53 (the PinePhone's A64) may then
+/// read the last instruction's address wrongly. Each is the address of
 /// the ADRP.
 fn sequences_843419(base: u64, code: &[u8]) -> Vec<u64> {
     let words: Vec<u32> = code
@@ -209,15 +257,19 @@ fn sequences_843419(base: u64, code: &[u8]) -> Vec<u64> {
         if address & 0xfff < 0xff8 || adrp & 0x9f00_0000 != 0x9000_0000 {
             continue;
         }
-        let (Some(&second), Some(&third)) = (words.get(index + 1), words.get(index + 2)) else {
+        let register = adrp & 0x1f;
+        let Some(&second) = words.get(index + 1) else {
             continue;
         };
-        let register = adrp & 0x1f;
-        if register != 31
-            && load_store(second)
-            && load_store(third)
-            && (third >> 5) & 0x1f == register
-        {
+        if register == 31 || !second_access(second) || writes_register(second, register) {
+            continue;
+        }
+        let last = |word: u32| word & 0x3b00_0000 == 0x3900_0000 && (word >> 5) & 0x1f == register;
+        let three = words.get(index + 2).is_some_and(|&w| last(w));
+        let four = words
+            .get(index + 2)
+            .is_some_and(|&w| !branch(w) && words.get(index + 3).is_some_and(|&w| last(w)));
+        if three || four {
             found.push(address);
         }
     }
@@ -227,7 +279,9 @@ fn sequences_843419(base: u64, code: &[u8]) -> Vec<u64> {
 /// Fails when `elf` holds an erratum 843419 sequence in an executable
 /// segment: the linker rewrites them (`--fix-cortex-a53-843419`, which the
 /// kernel's rustflags pass and the hard-float program target passes by
-/// default), and this catches a build that loses it. The segments are
+/// default), and this finds a sequence that the linker left, which a
+/// build that loses the flag shows only when an ADRP lands at the end of
+/// a page (the flag itself is checked where the link line is read). The segments are
 /// loaded on 4 KiB pages, so the offset in the page is the offset of the
 /// address. Every kernel build and every program of a boot image goes
 /// through it, with the 835769 check.
@@ -242,7 +296,7 @@ pub fn erratum_843419(elf: &Path) -> Result<(), String> {
     if !found.is_empty() {
         let list: Vec<_> = found.iter().map(|a| format!("{a:#x}")).collect();
         return Err(format!(
-            "{}: {} erratum 843419 sequences (ADRP at the end of a page, two loads or stores): {}",
+            "{}: {} erratum 843419 sequences (ADRP at the end of a page, then loads or stores): {}",
             elf.display(),
             found.len(),
             list.join(" ")
@@ -316,15 +370,66 @@ mod tests {
         assert!(
             sequences_843419(0x4000_1000, &bytes(&[ADRP_X8, LDR_X1_X0, STR_X2_X8_8])).is_empty()
         );
-        // The third access has a base other than x8.
+        // The last access has a base other than x8.
         assert!(at(&[ADRP_X8, LDR_X1_X0, 0xf900_0422]).is_empty());
-        // A nop in place of the second or of the third instruction.
+        // A nop in place of the second or of the last instruction.
         assert!(at(&[ADRP_X8, NOP, STR_X2_X8_8]).is_empty());
         assert!(at(&[ADRP_X8, LDR_X1_X0, NOP]).is_empty());
-        // A literal load has no base register (its offset field reads as x8).
+        // A literal load as the last instruction has no base register
+        // (its offset field reads as x8).
         assert!(at(&[ADRP_X8, LDR_X1_X0, LDR_LITERAL_X3]).is_empty());
-        // Too short for a third instruction.
+        // Too short for a last instruction.
         assert!(at(&[ADRP_X8, LDR_X1_X0]).is_empty());
+    }
+
+    const ADD_X2: u32 = 0x9100_0442;
+    const LDR_X8_X8: u32 = 0xf940_0108;
+    const LDR_X0_X8: u32 = 0xf940_0100;
+    const LDP_X2_X3_X8: u32 = 0xa940_0d02 & !0x3e0 | (8 << 5);
+    const LDR_X1_X8_POST: u32 = 0xf840_8501 & !0x3e0 | (8 << 5);
+    const CBZ: u32 = 0xb400_0040;
+    const ADRP_X8_AGAIN: u32 = ADRP_X8;
+
+    #[test]
+    fn finds_the_form_of_four_instructions() {
+        let at = |code: &[u32]| sequences_843419(0x4000_0ff8, &bytes(code));
+        // One instruction that is no branch between the two accesses,
+        // an adrp of the same register among them.
+        assert_eq!(
+            at(&[ADRP_X8, LDR_X1_X0, ADD_X2, STR_X2_X8_8]),
+            [0x4000_0ff8]
+        );
+        assert_eq!(
+            at(&[ADRP_X8, LDR_X1_X0, ADRP_X8_AGAIN, STR_X2_X8_8]),
+            [0x4000_0ff8]
+        );
+        // A branch between them, or two instructions, is clean.
+        assert!(at(&[ADRP_X8, LDR_X1_X0, CBZ, STR_X2_X8_8]).is_empty());
+        assert!(at(&[ADRP_X8, LDR_X1_X0, ADD_X2, ADD_X2, STR_X2_X8_8]).is_empty());
+    }
+
+    #[test]
+    fn finds_a_literal_load_in_the_second_place() {
+        let code = bytes(&[ADRP_X8, LDR_LITERAL_X3, STR_X2_X8_8]);
+        assert_eq!(sequences_843419(0x4000_0ff8, &code), [0x4000_0ff8]);
+    }
+
+    #[test]
+    fn spares_a_second_instruction_that_writes_the_register() {
+        let at = |code: &[u32]| sequences_843419(0x4000_0ff8, &bytes(code));
+        // adrp x8; ldr x8, [x8]; ldr x0, [x8]: the pointer is loaded.
+        assert!(at(&[ADRP_X8, LDR_X8_X8, LDR_X0_X8]).is_empty());
+        // A post-indexed access that writes its base x8 back.
+        assert!(at(&[ADRP_X8, LDR_X1_X8_POST, STR_X2_X8_8]).is_empty());
+        // The same access to another base is a sequence.
+        assert_eq!(at(&[ADRP_X8, LDR_X1_X0, STR_X2_X8_8]), [0x4000_0ff8]);
+    }
+
+    #[test]
+    fn spares_a_last_instruction_outside_the_unsigned_immediate_class() {
+        let at = |code: &[u32]| sequences_843419(0x4000_0ff8, &bytes(code));
+        // ldp x2, x3, [x8] is no unsigned immediate access.
+        assert!(at(&[ADRP_X8, LDR_X1_X0, LDP_X2_X3_X8]).is_empty());
     }
 
     #[test]
