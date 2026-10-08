@@ -101,19 +101,28 @@ extern "C" fn body() {
     ERROR.store(1, Ordering::SeqCst);
 }
 static JUMP_STAGE: AtomicUsize = AtomicUsize::new(0);
+/// How often the exit hook of the worker ran.
+static HOOK_RAN: AtomicUsize = AtomicUsize::new(0);
+fn exit_hook() {
+    HOOK_RAN.fetch_add(1, Ordering::SeqCst);
+}
 
 /// The last wait, `levels` frames of 8 KiB below its caller.
 #[inline(never)]
 fn last_wait(levels: usize) -> Result<sys::Received, Error> {
-    let mut pad = [0u8; 8192];
-    core::hint::black_box(&mut pad);
     if levels > 0 {
-        let result = last_wait(levels - 1);
-        core::hint::black_box(&mut pad);
-        return result;
+        return deeper(levels);
     }
     LAST_SP.store(current_sp(), Ordering::SeqCst);
     sys::receive(&borrowed(&BLOCKING))
+}
+#[inline(never)]
+fn deeper(levels: usize) -> Result<sys::Received, Error> {
+    let mut pad = [0u8; 8192];
+    core::hint::black_box(&mut pad);
+    let result = last_wait(levels - 1);
+    core::hint::black_box(&mut pad);
+    result
 }
 
 /// The worker of variants 1 to 3.
@@ -171,6 +180,7 @@ extern "C" fn worker(_: u64) -> ! {
         ERROR.store(9, Ordering::SeqCst);
     }
     stage(JUMP_STAGE.fetch_add(1, Ordering::SeqCst) + 1);
+    upcall::set_exit_hook(Some(exit_hook));
     sys::thread_exit()
 }
 
@@ -229,6 +239,7 @@ extern "C" fn worker_inside(_: u64) -> ! {
     if PRIMARY.load(Ordering::SeqCst) != 1 {
         ERROR.store(10, Ordering::SeqCst);
     }
+    upcall::set_exit_hook(Some(exit_hook));
     stage(4);
     sys::thread_exit()
 }
@@ -289,6 +300,7 @@ fn scenario(
     base: u8,
 ) -> bool {
     STAGE.store(0, Ordering::SeqCst);
+    HOOK_RAN.store(0, Ordering::SeqCst);
     JUMP_STAGE.store(0, Ordering::SeqCst);
     PRIMARY.store(0, Ordering::SeqCst);
     ERROR.store(0, Ordering::SeqCst);
@@ -361,10 +373,19 @@ fn finish(name: &str, code: usize, ended: &Handle<Channel>) -> bool {
     loop {
         match sys::receive(ended) {
             Err(Error::Interrupted) => continue,
-            Ok(sys::Received::Notification { .. }) => return true,
+            Ok(sys::Received::Notification { .. }) => break,
             _ => return failed(code + 6),
         }
     }
+    // The hook ran once, before the call that ended the thread.
+    if HOOK_RAN.load(Ordering::SeqCst) != 1 {
+        rt::println!(
+            "native-jump: the exit hook ran {} times ({name})",
+            HOOK_RAN.load(Ordering::SeqCst)
+        );
+        return failed(code + 7);
+    }
+    true
 }
 
 /// Variant 4: a jump to a target inside the live handler of the layer.
@@ -372,6 +393,7 @@ fn finish(name: &str, code: usize, ended: &Handle<Channel>) -> bool {
 fn inside(ctx: &Ctx, level: u8, base: u8) -> bool {
     const CODE: usize = 1540;
     STAGE.store(0, Ordering::SeqCst);
+    HOOK_RAN.store(0, Ordering::SeqCst);
     PRIMARY.store(0, Ordering::SeqCst);
     ERROR.store(0, Ordering::SeqCst);
     let Some((native, ended)) = spawn(worker_inside, 4, level, base) else {
