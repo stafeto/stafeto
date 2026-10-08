@@ -78,6 +78,9 @@ pub enum Verdict {
     Pass,
     Fail,
     Unsupported,
+    /// The standard leaves the outcome open: every expectation of the test
+    /// is a `.unknown` file and the outcome is one of them.
+    Unknown,
 }
 
 impl Verdict {
@@ -86,6 +89,7 @@ impl Verdict {
             Verdict::Pass => "PASS",
             Verdict::Fail => "FAIL",
             Verdict::Unsupported => "UNSUPPORTED",
+            Verdict::Unknown => "UNKNOWN",
         }
     }
 }
@@ -151,23 +155,70 @@ pub fn outcome(log: &str, name: &str) -> Ended {
     Ended::Exited(text)
 }
 
-/// Whether `outcome` is one of the expectations of `test` in `expect`
-/// (`<test>.<anything>`, as os-test's misc/html.c reads them).
-pub fn expected(expect: &Path, test: &str, outcome: &str) -> Result<bool, String> {
+/// How an outcome stands against the expectations of a test.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Expectation {
+    /// One of the expectations the standard defines.
+    Defined,
+    /// The test has only `.unknown` expectations and this is one of them.
+    Open,
+    /// None of them.
+    Unmet,
+}
+
+/// The files `<test>.<anything>` of `expect` (as os-test's misc/html.c
+/// reads them): the part of the name after `<test>.` and the text.
+fn expectation_files(expect: &Path, test: &str) -> Result<Vec<(String, String)>, String> {
     let entries = std::fs::read_dir(expect).map_err(|e| format!("{}: {e}", expect.display()))?;
+    let mut files = Vec::new();
     for entry in entries {
         let path = entry.map_err(|e| e.to_string())?.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name
             .strip_prefix(test)
             .is_some_and(|rest| rest.starts_with('.'))
-            && !name[test.len() + 1..].starts_with("unknown.")
-            && std::fs::read_to_string(&path).is_ok_and(|text| text == outcome)
+            && let Ok(text) = std::fs::read_to_string(&path)
         {
-            return Ok(true);
+            files.push((name[test.len() + 1..].to_owned(), text));
         }
     }
-    Ok(false)
+    Ok(files)
+}
+
+/// Whether `outcome` meets the expectations in `files` (the part of a
+/// file name after `<test>.` and its text): a defined one, or an
+/// `unknown.*` one when the test has no defined expectation at all.
+fn judge_expectations(files: &[(String, String)], outcome: &str) -> Expectation {
+    let open = |name: &str| name.starts_with("unknown.");
+    if files
+        .iter()
+        .any(|(name, text)| !open(name) && text == outcome)
+    {
+        Expectation::Defined
+    } else if files.iter().all(|(name, _)| open(name))
+        && files.iter().any(|(_, text)| text == outcome)
+    {
+        Expectation::Open
+    } else {
+        Expectation::Unmet
+    }
+}
+
+/// The options of os-test's tests the system does not claim: process
+/// scheduling (PS), and the XSI extensions, which the POSIX design leaves
+/// out (specs/2026-10-01-subproject-2-posix-design.md, section 1).
+const UNCLAIMED: [&str; 2] = ["PS", "XSI"];
+
+/// The unclaimed option a test needs, by the marker os-test puts first in
+/// its source: `/*[A B]*/` needs A and B, `/*[A|B]*/` needs A or B.
+fn unclaimed_option(source: &str) -> Option<String> {
+    let marker = source.lines().next()?.strip_prefix("/*[")?;
+    let marker = marker.split_once("]*/")?.0;
+    marker.split_whitespace().find_map(|need| {
+        need.split('|')
+            .all(|option| UNCLAIMED.contains(&option))
+            .then(|| need.to_owned())
+    })
 }
 
 /// Finds readiness calls, including ppoll and pselect.
@@ -228,7 +279,12 @@ pub struct Plan {
     started: Arc<OnceLock<Instant>>,
     /// Selected directory; a full CI run has no filter.
     suite: Option<String>,
+    /// How long each suite's job ran, in the order the jobs ended.
+    times: Times,
 }
+
+/// The names and run times of the suites' jobs.
+type Times = Arc<Mutex<Vec<(String, Duration)>>>;
 
 /// The suites as jobs (a boot a suite, the tests started from files), after
 /// the build of os-test's tests. `ci` puts them among its own jobs.
@@ -288,12 +344,7 @@ fn plan_suite(suite: Option<&str>) -> Result<(Vec<Job>, Plan), String> {
             ))
         } else if let Some(failed) = test.built.strip_prefix('!') {
             // A test that did not compile: os-test's outcome for it.
-            let text = format!("{failed}\n");
-            let verdict = if passes(&work, test, &text)? {
-                Verdict::Pass
-            } else {
-                Verdict::Fail
-            };
+            let (verdict, text) = judge(&work, test, Ended::Exited(format!("{failed}\n")))?;
             Some((test.name.clone(), verdict, text))
         } else {
             None
@@ -301,13 +352,15 @@ fn plan_suite(suite: Option<&str>) -> Result<(Vec<Job>, Plan), String> {
     }
     let rows: Rows = Arc::new(Mutex::new(places));
     let started = Arc::new(OnceLock::new());
-    let jobs = suite_jobs(&work, tests, &kernel, &rows, &started)?;
+    let times: Times = Arc::new(Mutex::new(Vec::new()));
+    let jobs = suite_jobs(&work, tests, &kernel, &rows, &started, &times)?;
     Ok((
         jobs,
         Plan {
             rows,
             started,
             suite: suite.map(str::to_owned),
+            times,
         },
     ))
 }
@@ -332,6 +385,15 @@ pub fn finish(plan: Plan) -> Result<(), String> {
         took.as_secs(),
         BUDGET.as_secs()
     );
+    let mut times = plan
+        .times
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    times.sort_by_key(|(_, took)| std::cmp::Reverse(*took));
+    for (job, took) in &times {
+        println!("os-test job {job}: {} s", took.as_secs());
+    }
     let path = crate::root().join(PASSING);
     let list = std::fs::read_to_string(&path).map_err(|e| format!("{PASSING}: {e}"))?;
     let list = match plan.suite.as_deref() {
@@ -421,17 +483,48 @@ fn source_of(work: &Path, test: &Test) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Whether `text`, the outcome of `test`, is one of its expectations: of
-/// the suite's `.expect` directory, or `exit: 0` for the basic suite,
-/// which has none.
-fn passes(work: &Path, test: &Test, text: &str) -> Result<bool, String> {
+/// How `text`, the outcome of `test`, stands against the test's
+/// expectations: of the suite's `.expect` directory, or `exit: 0` for the
+/// basic suite, which has none.
+fn expectation(work: &Path, test: &Test, text: &str) -> Result<Expectation, String> {
     let expect = work.join("source").join(format!("{}.expect", test.suite));
     if test.suite == "basic" && !expect.exists() {
-        return Ok(text == "exit: 0\n");
+        return Ok(if text == "exit: 0\n" {
+            Expectation::Defined
+        } else {
+            Expectation::Unmet
+        });
     }
     // The expectations of a test of basic/<part>/<name> do not exist; the
     // others are named by the test alone.
-    expected(&expect, &test.test, text)
+    Ok(judge_expectations(
+        &expectation_files(&expect, &test.test)?,
+        text,
+    ))
+}
+
+/// The verdict and text of a test that `ended`: PASS for a defined
+/// expectation, UNKNOWN for an open one, UNSUPPORTED when it needs an
+/// option the system does not claim, else FAIL.
+fn judge(work: &Path, test: &Test, ended: Ended) -> Result<(Verdict, String), String> {
+    let (text, exited) = match ended {
+        Ended::Exited(text) => (text, true),
+        Ended::Failed(text) => (text, false),
+    };
+    let met = if exited {
+        expectation(work, test, &text)?
+    } else {
+        Expectation::Unmet
+    };
+    let verdict = match met {
+        Expectation::Defined => Verdict::Pass,
+        Expectation::Open => Verdict::Unknown,
+        Expectation::Unmet if unclaimed_option(&source_of(work, test)?).is_some() => {
+            Verdict::Unsupported
+        }
+        Expectation::Unmet => Verdict::Fail,
+    };
+    Ok((verdict, text))
 }
 
 /// The ELF file of `test`, its object linked with the layer and relibc
@@ -513,6 +606,7 @@ fn suite_jobs(
     kernel: &crate::Artifacts,
     rows: &Rows,
     started: &Arc<OnceLock<Instant>>,
+    times: &Times,
 ) -> Result<Vec<Job>, String> {
     let tests = Arc::new(tests);
     let mut suites: Vec<String> = Vec::new();
@@ -525,52 +619,59 @@ fn suite_jobs(
     for suite in suites {
         let (work, tests, kernel) = (work.to_path_buf(), Arc::clone(&tests), kernel.clone());
         let (rows, started) = (Arc::clone(rows), Arc::clone(started));
+        let times = Arc::clone(times);
         jobs.push(crate::jobs::job(&format!("os-test {suite}"), move || {
-            let deadline = *started.get_or_init(Instant::now) + BUDGET;
-            let left = |what: &str| {
-                deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|left| !left.is_zero())
-                    .ok_or_else(|| format!("os-test spent its {} s {what}", BUDGET.as_secs()))
-            };
-            let elfs = work.join("elfs");
-            std::fs::create_dir_all(&elfs).map_err(|e| format!("{}: {e}", elfs.display()))?;
-            let mut files = Vec::new();
-            let mut places = Vec::new();
-            for (place, test) in tests.iter().enumerate() {
-                let empty = rows.lock().unwrap_or_else(PoisonError::into_inner)[place].is_none();
-                if test.suite == suite && empty {
-                    left(&format!("before {}", test.name))?;
-                    files.push((test.name.clone(), test_elf(test, &test.built, &elfs)?));
-                    places.push(place);
-                }
-            }
-            if files.is_empty() {
-                return Ok(());
-            }
-            let image = format!("os-test-{suite}.img");
-            let (log, _) = boot(
-                &kernel,
-                &image,
-                rootfs::os_test(&files),
-                left(&format!("in {suite}"))?.min(TIMEOUT),
-            )?;
-            for place in places {
-                let test = &tests[place];
-                let (verdict, text) = match outcome(&log, &test.name) {
-                    Ended::Exited(text) if passes(&work, test, &text)? => (Verdict::Pass, text),
-                    Ended::Exited(text) | Ended::Failed(text) => (Verdict::Fail, text),
+            let begun = Instant::now();
+            let result = (|| {
+                let deadline = *started.get_or_init(Instant::now) + BUDGET;
+                let left = |what: &str| {
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|left| !left.is_zero())
+                        .ok_or_else(|| format!("os-test spent its {} s {what}", BUDGET.as_secs()))
                 };
-                println!(
-                    "os-test {}: {} ({})",
-                    test.name,
-                    verdict.name(),
-                    first_line(&text)
-                );
-                rows.lock().unwrap_or_else(PoisonError::into_inner)[place] =
-                    Some((test.name.clone(), verdict, text));
-            }
-            Ok(())
+                let elfs = work.join("elfs");
+                std::fs::create_dir_all(&elfs).map_err(|e| format!("{}: {e}", elfs.display()))?;
+                let mut files = Vec::new();
+                let mut places = Vec::new();
+                for (place, test) in tests.iter().enumerate() {
+                    let empty =
+                        rows.lock().unwrap_or_else(PoisonError::into_inner)[place].is_none();
+                    if test.suite == suite && empty {
+                        left(&format!("before {}", test.name))?;
+                        files.push((test.name.clone(), test_elf(test, &test.built, &elfs)?));
+                        places.push(place);
+                    }
+                }
+                if files.is_empty() {
+                    return Ok(());
+                }
+                let image = format!("os-test-{suite}.img");
+                let (log, _) = boot(
+                    &kernel,
+                    &image,
+                    rootfs::os_test(&files),
+                    left(&format!("in {suite}"))?.min(TIMEOUT),
+                )?;
+                for place in places {
+                    let test = &tests[place];
+                    let (verdict, text) = judge(&work, test, outcome(&log, &test.name))?;
+                    println!(
+                        "os-test {}: {} ({})",
+                        test.name,
+                        verdict.name(),
+                        first_line(&text)
+                    );
+                    rows.lock().unwrap_or_else(PoisonError::into_inner)[place] =
+                        Some((test.name.clone(), verdict, text));
+                }
+                Ok(())
+            })();
+            times
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((suite.clone(), begun.elapsed()));
+            result
         }));
     }
     Ok(jobs)
@@ -616,10 +717,7 @@ pub fn run_one(name: &str) -> Result<(), String> {
         TIMEOUT,
     )?;
     println!("{log}");
-    let (verdict, text) = match outcome(&log, name) {
-        Ended::Exited(text) if passes(&work, test, &text)? => (Verdict::Pass, text),
-        Ended::Exited(text) | Ended::Failed(text) => (Verdict::Fail, text),
-    };
+    let (verdict, text) = judge(&work, test, outcome(&log, name))?;
     println!("os-test {name}: {}\n{text}", verdict.name());
     Ok(())
 }
@@ -644,14 +742,15 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
 }
 
-/// `PASS n, FAIL n, UNSUPPORTED n of n`.
+/// `PASS n, FAIL n, UNSUPPORTED n, UNKNOWN n of n`.
 fn score(rows: &[Row]) -> String {
     let count = |v| rows.iter().filter(|row| row.1 == v).count();
     format!(
-        "PASS {}, FAIL {}, UNSUPPORTED {} of {}",
+        "PASS {}, FAIL {}, UNSUPPORTED {}, UNKNOWN {} of {}",
         count(Verdict::Pass),
         count(Verdict::Fail),
         count(Verdict::Unsupported),
+        count(Verdict::Unknown),
         rows.len()
     )
 }
@@ -802,6 +901,63 @@ mod tests {
         assert_eq!(lost, ["io/b", "io/d"]);
         assert_eq!(new, ["io/c"]);
         assert_eq!(compare("io/a\nio/c\n", &rows), (vec![], vec![]));
+    }
+
+    /// A test with only `.unknown` expectations is UNKNOWN on one of them
+    /// and FAILs on any other text; a defined expectation wins, and a test
+    /// with a defined and an open one does not become UNKNOWN.
+    #[test]
+    fn open_expectations_are_their_own_outcome() {
+        let file = |name: &str, text: &str| (name.to_owned(), text.to_owned());
+        let open = [file("unknown.1", "a\n"), file("unknown.2", "b\n")];
+        assert_eq!(judge_expectations(&open, "b\n"), Expectation::Open);
+        assert_eq!(judge_expectations(&open, "c\n"), Expectation::Unmet);
+        let mixed = [file("posix.1", "a\n"), file("unknown.1", "b\n")];
+        assert_eq!(judge_expectations(&mixed, "a\n"), Expectation::Defined);
+        assert_eq!(judge_expectations(&mixed, "b\n"), Expectation::Unmet);
+        assert_eq!(judge_expectations(&[], "a\n"), Expectation::Unmet);
+        let plain = [file("1", "a\n")];
+        assert_eq!(judge_expectations(&plain, "a\n"), Expectation::Defined);
+    }
+
+    /// The marker of a test names the options it needs: one the system does
+    /// not claim makes it UNSUPPORTED, an alternative with a claimed option
+    /// does not.
+    #[test]
+    fn unclaimed_options_are_read_from_the_marker() {
+        assert_eq!(
+            unclaimed_option("/*[SPN PS]*/\n/* Test */"),
+            Some("PS".to_owned())
+        );
+        assert_eq!(
+            unclaimed_option("/*[XSI]*/\nint x;"),
+            Some("XSI".to_owned())
+        );
+        assert_eq!(unclaimed_option("/*[SPN]*/\nint x;"), None);
+        assert_eq!(unclaimed_option("/*[PS|SPN]*/\nint x;"), None);
+        assert_eq!(unclaimed_option("/*[RPP|TPP]*/\nint x;"), None);
+        assert_eq!(
+            unclaimed_option("/*[PS|XSI]*/\nint x;"),
+            Some("PS|XSI".to_owned())
+        );
+        assert_eq!(unclaimed_option("/* Test sigaltstack. */"), None);
+        assert_eq!(unclaimed_option(""), None);
+    }
+
+    #[test]
+    fn the_score_counts_every_verdict() {
+        let row = |verdict| (String::new(), verdict, String::new());
+        let rows = [
+            row(Verdict::Pass),
+            row(Verdict::Fail),
+            row(Verdict::Unsupported),
+            row(Verdict::Unknown),
+            row(Verdict::Unknown),
+        ];
+        assert_eq!(
+            score(&rows),
+            "PASS 1, FAIL 1, UNSUPPORTED 1, UNKNOWN 2 of 5"
+        );
     }
 
     #[test]
