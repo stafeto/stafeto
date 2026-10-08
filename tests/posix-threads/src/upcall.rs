@@ -198,7 +198,15 @@ fn wait_flag(channel: &Handle<Channel>, waiter: &Waiter, flag: &AtomicUsize) -> 
         if flag.load(Ordering::Acquire) != 0 {
             return true;
         }
-        if !matches!(waiter.receive_until(channel, limit), Ok(Waited::Got(_))) {
+        if !matches!(
+            {
+                let deadline = limit;
+                crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                    waiter.receive_until(channel, deadline)
+                })
+            },
+            Ok(Waited::Got(_))
+        ) {
             return false;
         }
     }
@@ -234,7 +242,12 @@ pub(super) fn run() -> bool {
             0
         );
         if !matches!(
-            ready_waiter.receive_until(&ready, now() + 500_000_000),
+            {
+                let deadline = now() + 500_000_000;
+                crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                    ready_waiter.receive_until(&ready, deadline)
+                })
+            },
             Ok(Waited::Got(_))
         ) {
             return failed(230);
@@ -244,7 +257,12 @@ pub(super) fn run() -> bool {
         let native = Handle::<Thread>::borrowed(rt::abi::Handle(NATIVE.load(Ordering::Acquire)));
         // Give the lower-priority worker time to seed the actual assembly loop.
         if !matches!(
-            waiter.receive_until(&done, now() + 20_000_000),
+            {
+                let deadline = now() + 20_000_000;
+                crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                    waiter.receive_until(&done, deadline)
+                })
+            },
             Ok(Waited::Expired)
         ) || STATE.seeded.load(Ordering::Acquire) != u64::from(mode != 2 && mode != 4)
             || COUNT.load(Ordering::Acquire) != 0
@@ -267,7 +285,12 @@ pub(super) fn run() -> bool {
         if mode == 2 {
             poke();
             if !matches!(
-                waiter.receive_until(&done, now() + 20_000_000),
+                {
+                    let deadline = now() + 20_000_000;
+                    crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                        waiter.receive_until(&done, deadline)
+                    })
+                },
                 Ok(Waited::Expired)
             ) || COUNT.load(Ordering::Acquire) != 0
             {

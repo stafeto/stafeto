@@ -163,7 +163,12 @@ fn blocked(id: u64) -> bool {
 fn finished(channel: &Handle<Channel>, waiter: &Waiter, expected: usize) -> bool {
     let limit = now() + 500_000_000;
     loop {
-        match waiter.receive_until(channel, limit) {
+        match {
+            let deadline = limit;
+            crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                waiter.receive_until(channel, deadline)
+            })
+        } {
             Ok(Waited::Got(_)) if DONE.load(Ordering::Acquire) == expected => return true,
             Ok(Waited::Got(_)) if DONE.load(Ordering::Acquire) == 0 => {}
             _ => return false,
@@ -213,7 +218,12 @@ pub(super) fn run() -> bool {
     set(20_000);
     set(1);
     if !matches!(
-        waiter.receive_until(&channel, start + 100_000_000),
+        {
+            let deadline = start + 100_000_000;
+            crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                waiter.receive_until(&channel, deadline)
+            })
+        },
         Ok(Waited::Expired)
     ) || DONE.load(Ordering::Acquire) != 0
         || !blocked(id)
@@ -238,7 +248,12 @@ pub(super) fn run() -> bool {
         return failed(203);
     }
     if !matches!(
-        waiter.receive_until(&channel, now() + 20_000_000),
+        {
+            let deadline = now() + 20_000_000;
+            crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                waiter.receive_until(&channel, deadline)
+            })
+        },
         Ok(Waited::Expired)
     ) {
         return failed(204);
@@ -310,7 +325,12 @@ pub(super) fn run() -> bool {
     }
     set(9_990);
     if !matches!(
-        waiter.receive_until(&channel, original + 20_000_000),
+        {
+            let deadline = original + 20_000_000;
+            crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                waiter.receive_until(&channel, deadline)
+            })
+        },
         Ok(Waited::Expired)
     ) || DONE.load(Ordering::Acquire) != 0
         || !blocked(id)
@@ -376,7 +396,15 @@ pub(super) fn run() -> bool {
     }
     let limit = now() + 500_000_000;
     while DONE.load(Ordering::Acquire) != 1000 {
-        if !matches!(waiter.receive_until(&channel, limit), Ok(Waited::Got(_))) {
+        if !matches!(
+            {
+                let deadline = limit;
+                crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                    waiter.receive_until(&channel, deadline)
+                })
+            },
+            Ok(Waited::Got(_))
+        ) {
             return failed(223);
         }
     }

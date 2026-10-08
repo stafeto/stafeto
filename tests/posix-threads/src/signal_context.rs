@@ -221,7 +221,12 @@ pub(super) fn run() -> bool {
         }
         // Let the lower-priority worker seed the CPU loop while main sleeps.
         if !matches!(
-            waiter.receive_until(&done, now() + 20_000_000),
+            {
+                let deadline = now() + 20_000_000;
+                crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                    waiter.receive_until(&done, deadline)
+                })
+            },
             Ok(Waited::Expired)
         ) || STATE.seeded.load(Ordering::Acquire) != 1
         {
@@ -231,7 +236,12 @@ pub(super) fn run() -> bool {
             return failed(455);
         }
         if !matches!(
-            waiter.receive_until(&done, now() + 500_000_000),
+            {
+                let deadline = now() + 500_000_000;
+                crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                    waiter.receive_until(&done, deadline)
+                })
+            },
             Ok(Waited::Got(_))
         ) || RESULT.load(Ordering::Acquire) != 1
         {

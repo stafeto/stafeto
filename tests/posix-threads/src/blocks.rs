@@ -220,10 +220,12 @@ pub(super) fn run() -> bool {
     let waiter = Waiter::new(&done_channel, 1, 30).expect("blocks watchdog");
     let wait = || {
         matches!(
-            waiter.receive_until(
-                &done_channel,
-                rt::time::ticks_to_ns(rt::time::now()) + 5_000_000_000
-            ),
+            {
+                let deadline = rt::time::ticks_to_ns(rt::time::now()) + 5_000_000_000;
+                crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                    waiter.receive_until(&done_channel, deadline)
+                })
+            },
             Ok(Waited::Got(_))
         )
     };
