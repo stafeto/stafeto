@@ -6547,13 +6547,14 @@ mod tests {
     #[test]
     fn full_watch_case_survives_a_longer_single_item_maximum() {
         let mut lines = Vec::new();
-        for (tag, methods) in [(4, [14, 15, 16]), (5, [25, 26, 27])] {
+        // The pipe service's full Watch has 32 elements, the terminal's 16.
+        for (tag, methods, full) in [(4, [14, 15, 16], 32), (5, [25, 26, 27], 16)] {
             for method in methods {
                 lines.push(format!(
                     "service step: {tag} kind {method} 15000 ticks detail 1"
                 ));
                 lines.push(format!(
-                    "service case: {tag} kind {method} 14000 ticks detail 32"
+                    "service case: {tag} kind {method} 14000 ticks detail {full}"
                 ));
             }
             for kind in [64, 65] {
@@ -6566,8 +6567,17 @@ mod tests {
         let mut missing = lines.clone();
         missing.retain(|line| !line.starts_with("service case: 5 kind 26 "));
         assert!(super::check_watch_steps(&missing).is_err());
-        lines.push("service case: 5 kind 26 20539 ticks detail 32".into());
-        assert!(super::check_watch_steps(&lines).is_err());
+        // A Watch of the terminal past B, past 18 000 under B, or with
+        // more than 16 elements fails.
+        for bad in [
+            "service case: 5 kind 26 20539 ticks detail 16",
+            "service case: 5 kind 25 18500 ticks detail 16",
+            "service step: 5 kind 25 15000 ticks detail 32",
+        ] {
+            let mut worse = lines.clone();
+            worse.push(bad.into());
+            assert!(super::check_watch_steps(&worse).is_err(), "{bad}");
+        }
     }
     use super::*;
 
