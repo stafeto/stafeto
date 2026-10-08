@@ -469,6 +469,33 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
             _ => Err(owner),
         }
     }
+    pub fn cleanup_reply_copy(&mut self) -> Option<(usize, M)> {
+        if !self.native_end_confirmed() {
+            return None;
+        }
+        self.reply_copies
+            .iter_mut()
+            .enumerate()
+            .find_map(|(slot, owner)| owner.take().map(|owner| (slot, owner)))
+    }
+
+    pub fn restore_reply_copy(&mut self, slot: usize, owner: M) -> Result<(), M> {
+        match self.reply_copies.get_mut(slot) {
+            Some(place) if place.is_none() => {
+                *place = Some(owner);
+                Ok(())
+            }
+            _ => Err(owner),
+        }
+    }
+
+    pub fn cleanup_thread(&mut self) -> Option<T> {
+        if !self.native_end_confirmed() {
+            return None;
+        }
+        self.retained_thread.take()
+    }
+
     /// A terminal reply can leave an empty Pending that has no Drop effect.
     pub fn settle_operation(&mut self, token_returned: bool) {
         if !token_returned {
@@ -701,6 +728,50 @@ mod tests {
         assert!(!resident.authenticated_stage(resident.key, 71));
         assert!(resident.native_exited(resident.key, 19));
         assert!(!resident.matches_image(label, 2));
+    }
+
+    #[test]
+    fn exact_end_keeps_every_reply_copy_thread_and_failed_close_owner() {
+        let (mut resident, _, log) = fixture();
+        resident.reply_copies[0] = Some(Cap(20, log.clone()));
+        resident.reply_copies[3] = Some(Cap(23, log.clone()));
+        resident.retained_thread = Some(Cap(30, log.clone()));
+        assert!(resident.cleanup_reply_copy().is_none());
+        assert!(resident.cleanup_thread().is_none());
+        assert!(resident.ended(resident.key, 19));
+        assert!(resident.cleanup_reply_copy().is_none());
+        assert!(resident.cleanup_thread().is_none());
+        assert!(!resident.native_exited(
+            SeedKey {
+                label: resident.key.label + 1,
+                ..resident.key
+            },
+            19
+        ));
+        assert!(resident.cleanup_thread().is_none());
+        assert!(resident.native_exited(resident.key, 19));
+        let (slot, owner) = resident.cleanup_reply_copy().unwrap();
+        assert_eq!((slot, owner.0), (0, 20));
+        assert!(resident.restore_reply_copy(slot, owner).is_ok());
+        assert!(log.borrow().is_empty());
+        let (slot, owner) = resident.cleanup_reply_copy().unwrap();
+        assert_eq!(slot, 0);
+        drop(owner);
+        assert_eq!(log.borrow().as_slice(), &[20]);
+        let (slot, owner) = resident.cleanup_reply_copy().unwrap();
+        assert_eq!(slot, 3);
+        drop(owner);
+        let owner = resident.cleanup_thread().unwrap();
+        assert_eq!(owner.0, 30);
+        resident.retained_thread = Some(owner);
+        assert_eq!(log.borrow().as_slice(), &[20, 23]);
+        drop(resident.cleanup_thread().unwrap());
+        assert!(resident.cleanup_reply_copy().is_none());
+        assert!(resident.cleanup_thread().is_none());
+        assert!(!resident.releasable());
+        resident.flags |= INIT_ACK;
+        assert!(resident.releasable());
+        assert_eq!(log.borrow().as_slice(), &[20, 23, 30]);
     }
 
     #[test]

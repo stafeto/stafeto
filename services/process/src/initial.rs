@@ -277,6 +277,36 @@ impl Processes {
                 }
                 return;
             }
+            if let Some((slot, owner)) = resident.cleanup_reply_copy() {
+                if controller::raw_close(owner.raw().0).is_ok() {
+                    owner.into_raw();
+                } else {
+                    assert!(resident.restore_reply_copy(slot, owner).is_ok());
+                }
+                return;
+            }
+            if let Some(owner) = resident.cleanup_thread() {
+                if controller::raw_close(owner.raw().0).is_ok() {
+                    owner.into_raw();
+                } else {
+                    assert!(resident.retained_thread.replace(owner).is_none());
+                }
+                return;
+            }
+            if let Some(record) = self.records.get_mut(index)
+                && resident.matches_image(record.label.raw_at(record.image), record.image)
+                && let Some(owner) = record.active_exec.as_ref()
+            {
+                if controller::raw_close(owner.raw().0).is_ok() {
+                    record
+                        .active_exec
+                        .take()
+                        .expect("the exact closed source")
+                        .into_raw();
+                    record.active_guard_label = 0;
+                }
+                return;
+            }
             let notary = resident.operation_pending.is_none();
             let pending = if notary {
                 resident.crt_pending.as_mut()
