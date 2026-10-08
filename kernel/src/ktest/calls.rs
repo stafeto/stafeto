@@ -2620,8 +2620,13 @@ pub fn process_layer_roles_survive_partial_unbind_and_native_end(
             c.succeeds(control, &[C::ProcessLayerRequest.raw(), managed.0], &[])?;
             Ok(())
         })();
-        // End clears roles before cleanup and suppresses forwarding into this Process.
+        c.close(wrong)?;
+        c.close(plain)?;
+        c.close(managed)?;
+        // Non-running Threads leave at the paid Threads teardown stage.
+        // Keep the fixture references while that stage removes every role.
         unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+        cleanup::drain();
         check(
             unsafe { c.thread.as_ref() }.layer.is_none(),
             "main role survived Process End",
@@ -2633,9 +2638,6 @@ pub fn process_layer_roles_survive_partial_unbind_and_native_end(
             )?;
             unsafe { thread::release(native, CAUSE) };
         }
-        c.close(wrong)?;
-        c.close(plain)?;
-        c.close(managed)?;
         result
     });
     check(
