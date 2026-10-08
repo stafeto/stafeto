@@ -177,9 +177,12 @@ fn in_native_thread(process: rt::abi::Handle) -> bool {
         Err(error) => (false, error.code()),
     };
     let (received, receive_error) = if started {
-        match sys::receive(&completion) {
-            Ok(_) => (1u32, 0u64),
-            Err(error) => (2, error.code()),
+        loop {
+            match sys::receive(&completion) {
+                Ok(_) => break (1u32, 0u64),
+                Err(rt::abi::Error::Interrupted) => continue,
+                Err(error) => break (2, error.code()),
+            }
         }
     } else {
         (0, 0)
