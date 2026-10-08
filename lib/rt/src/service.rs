@@ -149,7 +149,15 @@ pub enum TailProgress {
     Continue,
     /// The service retained its resource debt; finish the current ingress separately.
     Detach,
+    /// CPU-only selector: the repeated service request runs in this same measured visit.
+    /// Returning Reenter must perform no SVC and retain the original ingress owners.
+    Reenter,
 }
+
+/// Scalar-only reentry state shares the bounded ingress words with other disjoint loans.
+pub const REENTER_TAG: u64 = 0x4f52_0000_0000_0000;
+pub const REENTER_TAG_MASK: u64 = 0xffff_ffff_ffff_ff00;
+pub const REENTER_SLOT: usize = 9;
 
 /// A notification, as `receive` took it (spec 6.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -786,9 +794,18 @@ impl<'a> CurrentRequest<'a> {
         }
     }
 
-    fn step<S: Service<K>, const K: usize>(&mut self, service: &mut S) -> bool {
-        if !matches!(service.request_tail(&mut self.request), TailProgress::Idle) {
-            return true;
+    fn step<S: Service<K>, const K: usize>(
+        &mut self,
+        service: &mut S,
+        sessions: &mut [Option<Session<S::Data, K>>],
+    ) -> bool {
+        match service.request_tail(&mut self.request) {
+            TailProgress::Idle => {}
+            TailProgress::Reenter => {
+                self.reenter(service, sessions);
+                return true;
+            }
+            TailProgress::Continue | TailProgress::Detach => return true,
         }
         let Self {
             request,
@@ -838,6 +855,102 @@ impl<'a> CurrentRequest<'a> {
         }) || (*drain_back && !outgoing.is_empty())
     }
 
+    /// Reentry cannot create a session or discard a capability, token or response owner.
+    fn reenter<S: Service<K>, const K: usize>(
+        &mut self,
+        service: &mut S,
+        sessions: &mut [Option<Session<S::Data, K>>],
+    ) {
+        assert!(
+            self.request.token.is_some()
+                && self.request.handles.is_empty()
+                && self.held.is_none()
+                && self.cursor == 0
+                && self.outgoing.is_empty()
+                && !self.drain_back
+                && self.request.reply.is_none(),
+            "request reentry custody"
+        );
+        let label = self.request.label;
+        let words = self
+            .request
+            .loan
+            .as_deref_mut()
+            .expect("request reentry state");
+        assert!(
+            words[0] & REENTER_TAG_MASK == REENTER_TAG && words[0] & 0xff != 0,
+            "request reentry tag"
+        );
+        assert_eq!(words[1], label, "request reentry label");
+        // Capture after initial dispatch, before the first fair maintenance visit.
+        if words[REENTER_SLOT] == u64::MAX {
+            let place = service.place(label);
+            let found = match place {
+                Some(index) => sessions
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .filter(|s| s.label == label)
+                    .map(|_| index),
+                None => sessions
+                    .iter()
+                    .enumerate()
+                    .skip(S::PLACED)
+                    .find(|(_, s)| s.as_ref().is_some_and(|s| s.label == label))
+                    .map(|(index, _)| index),
+            };
+            words[REENTER_SLOT] = found.map_or(u64::MAX, |index| index as u64);
+        }
+        let index = usize::try_from(words[REENTER_SLOT]).ok();
+        let place = service.place(label);
+        let session = index
+            .filter(|index| place.is_none_or(|place| place == *index))
+            .and_then(|index| sessions.get_mut(index))
+            .and_then(Option::as_mut)
+            .filter(|s| s.label == label);
+        // Only CPU reply storage is reset. Every owned field was checked above.
+        self.status = None;
+        self.request.reply = None;
+        let Some(session) = session else {
+            words.fill(0);
+            self.status = Some(Status::Kernel(Error::AccessDenied));
+            return;
+        };
+        if S::RETAIN_CLOSED
+            && service.closing(session)
+            && !service.closed_method(self.request.header.method)
+        {
+            words.fill(0);
+            self.status = Some(Status::Kernel(Error::AccessDenied));
+            return;
+        }
+        let answer = service.request(session, &mut self.request);
+        if self
+            .request
+            .loan
+            .as_ref()
+            .is_some_and(|words| words[0] != 0)
+        {
+            assert!(
+                matches!(&answer, Answer::Reply(handles) if handles.is_empty())
+                    && self.request.reply.is_none()
+                    && self.request.token.is_some(),
+                "request reentry provisional response"
+            );
+        }
+        self.answer(answer);
+    }
+
+    fn answer(&mut self, answer: Answer) {
+        match answer {
+            Answer::Status(status) => self.status = Some(status),
+            Answer::Reply(handles) => self.outgoing = handles,
+            Answer::Deferred if self.request.token.is_some() => {
+                self.status = Some(Status::Kernel(Error::BadState));
+            }
+            Answer::Deferred => {}
+        }
+    }
+
     fn finish<S: Service<K>, const K: usize>(
         &mut self,
         service: &mut S,
@@ -847,7 +960,7 @@ impl<'a> CurrentRequest<'a> {
         loop {
             let began = time::now();
             steps::own();
-            let retry = self.step(service);
+            let retry = self.step(service, sessions);
             steps::end(began, kind);
             if !retry {
                 break;
@@ -904,14 +1017,7 @@ fn request<S: Service<K>, const K: usize>(
             }
         }
     };
-    match answer {
-        Answer::Status(status) => current.status = Some(status),
-        Answer::Reply(handles) => current.outgoing = handles,
-        Answer::Deferred if current.request.token.is_some() => {
-            current.status = Some(Status::Kernel(Error::BadState));
-        }
-        Answer::Deferred => {}
-    }
+    current.answer(answer);
 }
 
 fn legacy_request<S: Service<K>, const K: usize>(

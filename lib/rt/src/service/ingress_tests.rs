@@ -141,7 +141,7 @@ fn dispatch<'a>(
 }
 fn step(s: &mut Fixture, current: &mut CurrentRequest<'_>) -> bool {
     let before = test_calls::log().len();
-    let retry = current.step(s);
+    let retry = current.step(s, &mut []);
     assert!(
         test_calls::log().len() - before <= 1,
         "combined kernel effects"
@@ -409,7 +409,10 @@ fn strict_bad_handle_fails_stop_with_the_exact_owner_still_held() {
     let cap = caps(1)[0];
     let mut current = dispatch(&mut s, &mut table, received(0, &[], &[cap]), &mut buffer);
     assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| current.step(&mut s))).is_err()
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || current.step(&mut s, &mut table)
+        ))
+        .is_err()
     );
     assert_eq!(current.held.as_ref().unwrap().raw(), cap);
     // The fixture resumes only to disarm before test teardown; production panic ends the process.
@@ -589,4 +592,260 @@ fn process_maintenance_send_overwrites_kernel_buffer_while_current_bytes_caps_to
     assert_eq!(crate::msgbuf::handle(0).0, abi::Handle::new(999, 1));
     assert_eq!(current.request.loan().unwrap()[8], u64::MAX);
     test_calls::complete();
+}
+
+#[derive(Default)]
+struct ReentryData {
+    closing: bool,
+    effects: usize,
+}
+#[derive(Default)]
+struct ReentryFixture {
+    requests: usize,
+    visits: usize,
+    maintenance: usize,
+    place: usize,
+}
+impl Service<0> for ReentryFixture {
+    const PLACED: usize = 2;
+    const VERSION: u16 = 1;
+    const METHODS: &'static [u16] = &[15];
+    const RETAIN_CLOSED: bool = true;
+    const BOUNDED_INGRESS: bool = true;
+    type Data = ReentryData;
+    fn place(&self, _: u64) -> Option<usize> {
+        Some(self.place)
+    }
+    fn closing(&self, s: &Session<ReentryData, 0>) -> bool {
+        s.data.closing
+    }
+    fn request_tail(&mut self, request: &mut Request<'_>) -> TailProgress {
+        if request.loan().is_some_and(|words| words[0] != 0) {
+            TailProgress::Reenter
+        } else {
+            TailProgress::Idle
+        }
+    }
+    fn request_maintenance(
+        &mut self,
+        table: &mut [Option<Session<ReentryData, 0>>],
+        protected: u64,
+    ) {
+        assert_eq!(protected, 0x8000_0001_0000_0000);
+        self.maintenance += 1;
+        // An unrelated owner progresses and its Process Send overwrites the kernel buffer.
+        table[1].as_mut().unwrap().data.effects += 1;
+        crate::msgbuf::write(0, &[0xa7; 96]);
+        let _ = sys::send(&Handle::borrowed(abi::Handle::new(99, 1)), &[0xb7; 96]);
+    }
+    fn request(&mut self, s: &mut Session<ReentryData, 0>, request: &mut Request<'_>) -> Answer {
+        assert_eq!(request.label(), 0x8000_0001_0000_0000);
+        assert_eq!(request.body().u64(), Ok(0x3939_3939_3939_3939));
+        assert_eq!(request.token.as_ref().unwrap().raw(), 123);
+        self.requests += 1;
+        if self.requests == 1 {
+            let label = request.label();
+            let words = request.loan().unwrap();
+            words[0] = REENTER_TAG | 1;
+            words[1] = label;
+            words[REENTER_SLOT] = u64::MAX;
+        } else {
+            self.visits += 1;
+            assert_eq!(request.loan().unwrap()[REENTER_SLOT], 0);
+            if self.visits == 3 {
+                s.data.effects += 1;
+                request.loan().unwrap().fill(0);
+                request.reply().u32(0).unwrap();
+                request.reply().u32(7).unwrap();
+            }
+        }
+        Answer::Reply(Outgoing::new())
+    }
+}
+
+fn reentry_bytes() -> [u8; HEADER_LEN + 8] {
+    let mut bytes = [0x39; HEADER_LEN + 8];
+    bytes[..HEADER_LEN].copy_from_slice(&Header::new(15, 1).bytes());
+    bytes
+}
+
+#[test]
+fn reentry_resets_provisional_status_then_commits_once_with_exact_token() {
+    test_calls::expect([(Call::Reply.number(), None)]);
+    let bytes = reentry_bytes();
+    let mut words = [0; 11];
+    let mut current = CurrentRequest::new(
+        0x8000_0001_0000_0000,
+        &bytes,
+        Incoming::fixture(&[]),
+        Token::fixture(123),
+    );
+    current.request.loan = Some(&mut words);
+    let mut service = ReentryFixture::default();
+    let mut table = [None];
+    request(&mut service, &mut table, 0, &mut current);
+    current.status = Some(Status::Unknown(proto_fs::AUTHENTICATING));
+    for _ in 0..3 {
+        assert!(current.step(&mut service, &mut table));
+        assert!(test_calls::log().is_empty());
+        assert!(current.status.is_none());
+    }
+    assert_eq!(service.requests, 4);
+    assert_eq!(table[0].as_ref().unwrap().data.effects, 1);
+    assert!(!current.step(&mut service, &mut table));
+    assert_eq!(service.requests, 4);
+    let (_, regs) = test_calls::log()[0];
+    assert_eq!((regs[0], regs[1], regs[2]), (123, 8, 7 << 32));
+    test_calls::complete();
+}
+
+#[test]
+fn reentry_never_creates_replaces_or_reopens_a_missing_foreign_or_closed_session() {
+    for mode in 0..4 {
+        test_calls::expect([(Call::Reply.number(), None)]);
+        let bytes = reentry_bytes();
+        let mut words = [0; 11];
+        let mut current = CurrentRequest::new(
+            0x8000_0001_0000_0000,
+            &bytes,
+            Incoming::fixture(&[]),
+            Token::fixture(123),
+        );
+        current.request.loan = Some(&mut words);
+        let mut service = ReentryFixture::default();
+        let mut table = [None, None];
+        request(&mut service, &mut table, 0, &mut current);
+        assert!(current.step(&mut service, &mut table));
+        match mode {
+            0 => table[0] = None,
+            1 => {
+                table[0] = Some(Session::new(
+                    0x8000_0002_0000_0000,
+                    ReentryData::default(),
+                    0,
+                ))
+            }
+            2 => table[0].as_mut().unwrap().data.closing = true,
+            _ => {
+                service.place = 1;
+                table[1] = Some(Session::new(
+                    0x8000_0001_0000_0000,
+                    ReentryData::default(),
+                    0,
+                ));
+            }
+        }
+        assert!(current.step(&mut service, &mut table));
+        assert_eq!(service.requests, 2);
+        assert!(
+            current
+                .request
+                .loan()
+                .unwrap()
+                .iter()
+                .all(|word| *word == 0)
+        );
+        assert!(!current.step(&mut service, &mut table));
+        assert_reply(Status::Kernel(Error::AccessDenied));
+        if mode == 0 {
+            assert!(table[0].is_none());
+        }
+        if mode == 1 {
+            assert_eq!(table[0].as_ref().unwrap().label(), 0x8000_0002_0000_0000);
+        }
+        assert!(table.iter().flatten().all(|s| s.data.effects == 0));
+        test_calls::complete();
+    }
+}
+
+#[test]
+fn reentry_fair_visits_preserve_local_request_while_other_owner_send_overwrites_msgbuf() {
+    test_calls::expect(
+        [
+            (Call::Send.number(), Some(Error::Unknown(77))),
+            (Call::Yield.number(), None),
+        ]
+        .into_iter()
+        .cycle()
+        .take(4)
+        .chain([(Call::Yield.number(), None), (Call::Reply.number(), None)]),
+    );
+    let bytes = reentry_bytes();
+    let mut words = [0; 11];
+    let mut current = CurrentRequest::new(
+        0x8000_0001_0000_0000,
+        &bytes,
+        Incoming::fixture(&[]),
+        Token::fixture(123),
+    );
+    current.request.loan = Some(&mut words);
+    let mut service = ReentryFixture::default();
+    let mut table = [None, Some(Session::new(9, ReentryData::default(), 0))];
+    request(&mut service, &mut table, 0, &mut current);
+    current.finish(&mut service, &mut table, 15);
+    assert_eq!(service.maintenance, 2);
+    assert_eq!(table[1].as_ref().unwrap().data.effects, 2);
+    assert_eq!(table[0].as_ref().unwrap().data.effects, 1);
+    test_calls::complete();
+}
+
+#[test]
+fn reentry_rejects_consumed_token_and_each_nonpristine_owner_without_discarding_them() {
+    for mode in 0..7 {
+        test_calls::expect([]);
+        let bytes = reentry_bytes();
+        let mut words = [0; 11];
+        let mut current = CurrentRequest::new(
+            0x8000_0001_0000_0000,
+            &bytes,
+            Incoming::fixture(&[]),
+            Token::fixture(123),
+        );
+        current.request.loan = Some(&mut words);
+        let mut service = ReentryFixture::default();
+        let mut table = [None];
+        request(&mut service, &mut table, 0, &mut current);
+        let cap = abi::Handle::new(91, 1);
+        match mode {
+            0 => current.request.token = None,
+            1 => current.held = Some(Handle::from_raw(cap)),
+            2 => current.outgoing.push(Handle::from_raw(cap)).unwrap(),
+            3 => current.drain_back = true,
+            4 => current.cursor = 1,
+            5 => current.request.handles = Incoming::fixture(&[cap]),
+            _ => {
+                current.request.reply().u32(991).unwrap();
+            }
+        }
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || current.step(&mut service, &mut table)
+            ))
+            .is_err()
+        );
+        assert_eq!(service.requests, 1);
+        assert!(test_calls::log().is_empty());
+        match mode {
+            0 => assert!(current.request.token.is_none()),
+            1 => {
+                assert_eq!(current.held.as_ref().unwrap().raw(), cap);
+                current.held.take().unwrap().into_raw();
+            }
+            2 => {
+                assert_eq!(current.outgoing.pop().unwrap().into_raw(), cap);
+            }
+            3 => assert!(current.drain_back),
+            4 => assert_eq!(current.cursor, 1),
+            5 => {
+                assert_eq!(current.request.handles.take_any(0).unwrap().into_raw(), cap);
+            }
+            _ => {
+                assert_eq!(
+                    current.request.reply.as_ref().unwrap().as_bytes(),
+                    &991u32.to_le_bytes()
+                );
+            }
+        }
+        test_calls::complete();
+    }
 }
