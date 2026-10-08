@@ -10,3 +10,4 @@ description = "File service wire protocol for stafeto"
 [dependencies]
 abi = { path = "../../lib/abi" }
 proto-wire = { path = "../wire" }
+proto-process = { path = "../process" }
