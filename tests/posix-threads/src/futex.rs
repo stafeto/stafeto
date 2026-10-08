@@ -8,6 +8,8 @@
 //! order they came; 10^5 handoffs of a mutex between two threads lose no
 //! wakeup; an entry of signals inside the layer's lock waits for its end.
 use super::*;
+#[path = "futex_deadline.rs"]
+mod deadline_check;
 use crate::layer::signals::{self as api, SigAction};
 use core::sync::atomic::AtomicU32;
 use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
@@ -186,22 +188,34 @@ pub(super) fn run() -> bool {
         return failed(621);
     }
     let deadline = rt::time::ticks_to_ns(rt::time::now()) + 5_000_000;
-    let result = futex_wait(&WORD, 0, CLOCK_MONOTONIC, Some(deadline));
-    let reached = rt::time::reached(deadline);
-    let waiters = posix_sync::bucket_waiters(&WORD);
-    if result != Err(ETIMEDOUT) || !reached || waiters != 0 {
-        let tag = match result {
-            Err(errno) => -errno,
-            Ok(posix_sync::Woken::Woken) => 1,
-            Ok(posix_sync::Woken::Entry) => 2,
+    loop {
+        let result = futex_wait(&WORD, 0, CLOCK_MONOTONIC, Some(deadline));
+        let reached = rt::time::reached(deadline);
+        let waiters = posix_sync::bucket_waiters(&WORD);
+        let word = WORD.load(Ordering::Acquire);
+        let outcome = match result {
+            Err(ETIMEDOUT) => deadline_check::Outcome::Timeout,
+            Ok(posix_sync::Woken::Woken) => deadline_check::Outcome::Woken,
+            _ => deadline_check::Outcome::Other,
         };
-        rt::println!(
-            "futex-probe: deadline result={} reached={} waiters={}",
-            tag,
-            u32::from(reached),
-            waiters
-        );
-        return failed(622);
+        match deadline_check::select(outcome, reached, word, waiters) {
+            deadline_check::Decision::Retry => continue,
+            deadline_check::Decision::Done => break,
+            deadline_check::Decision::Fail => {
+                let tag = match result {
+                    Err(errno) => -errno,
+                    Ok(posix_sync::Woken::Woken) => 1,
+                    Ok(posix_sync::Woken::Entry) => 2,
+                };
+                rt::println!(
+                    "futex-probe: deadline result={} reached={} waiters={}",
+                    tag,
+                    u32::from(reached),
+                    waiters
+                );
+                return failed(622);
+            }
+        }
     }
     rt::println!(
         "futex-probe: no kernel call without waiters or rivals; EAGAIN and a deadline leave the bucket empty"
