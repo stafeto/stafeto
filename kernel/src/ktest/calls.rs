@@ -2491,7 +2491,7 @@ fn with_interrupt_pending(
 pub fn process_layer_roles_survive_partial_unbind_and_native_end(
     _: &Boot,
 ) -> Result<(), &'static str> {
-    let baseline = thread::in_use();
+    let baseline = (thread::in_use(), channel::in_use());
     let result = with_caller(|c| {
         use abi::UpcallControl as C;
         let managed = c.insert(Object::Process(c.process), Rights::MANAGE)?;
@@ -2596,6 +2596,22 @@ pub fn process_layer_roles_survive_partial_unbind_and_native_end(
             extra = Some(native);
             thread::give_buffer(native, BUFFER as usize + PAGE).map_err(|_| "no native buffer")?;
             thread::start(native).map_err(|_| "no native start")?;
+            let queued = owned_channel(c.process)?;
+            // The queued send is made by the scheduler's actual running sender.
+            let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+            check(
+                matches!(picked, kcore::sched::Decision::Run(t) if t == c.thread),
+                "survivor was not picked",
+            )?;
+            check(
+                channel::send(
+                    c.thread,
+                    Via::Channel(queued),
+                    Desc::from_send(0).expect("empty send"),
+                    &[],
+                ) == Ok(None),
+                "survivor did not queue its send",
+            )?;
             let other = Caller {
                 process: c.process,
                 thread: native,
@@ -2606,6 +2622,12 @@ pub fn process_layer_roles_survive_partial_unbind_and_native_end(
                 &[],
             )?;
             other.succeeds(control, &[C::ObserverLayerReady.raw(), 1], &[])?;
+            check(
+                unsafe { c.thread.as_ref() }.sched.state() == State::Ready
+                    && unsafe { c.thread.as_ref() }.waits.is_none()
+                    && unsafe { c.thread.as_ref() }.regs.x[0] == Error::Interrupted.code(),
+                "registration did not interrupt the selected sender",
+            )?;
             // Consume the registration's primary request before native End.
             check(entry(c.thread).is_some(), "no registration forward")?;
             returned(c.thread, false)?;
@@ -2641,8 +2663,8 @@ pub fn process_layer_roles_survive_partial_unbind_and_native_end(
         result
     });
     check(
-        thread::in_use() == baseline,
-        "Layer test leaked Thread reference",
+        (thread::in_use(), channel::in_use()) == baseline,
+        "Layer test leaked Thread or interrupted Channel reference",
     )?;
     result
 }
