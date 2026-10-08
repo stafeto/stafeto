@@ -7,8 +7,11 @@ use crate::storage::{Node, Root};
 use proto_process::{Credentials, Groups, WhoReply};
 
 /// A single paid receive advances one authentication phase.
-pub enum Admission {
+pub type Admission = AdmissionState<()>;
+
+pub enum AdmissionState<C> {
     Unvouched,
+    Transport(C),
     Wire([u8; 252]),
     RetainedWire([u8; 260]),
     Vouched(WhoReply),
@@ -100,10 +103,10 @@ pub enum NotaryReply<const N: usize> {
     Retry,
 }
 impl<const N: usize> NotaryReply<N> {
-    pub fn admit(
+    pub fn admit<C>(
         self,
-        admission: &mut Admission,
-        wire: fn([u8; N]) -> Admission,
+        admission: &mut AdmissionState<C>,
+        wire: fn([u8; N]) -> AdmissionState<C>,
     ) -> Result<bool, u32> {
         match self {
             Self::Wire(bytes) => {
@@ -150,13 +153,21 @@ impl CleanupAudit {
     pub fn generations(&self) -> (u64, u64) {
         (self.target, self.audited)
     }
-    pub fn start(&mut self, admission: &mut Admission, generation: u64) {
+    pub fn start<C>(&mut self, admission: &mut AdmissionState<C>, generation: u64) {
+        assert!(
+            !matches!(admission, AdmissionState::Transport(_)),
+            "settled admission before epoch reset"
+        );
         self.target = generation;
         self.audited = 0;
-        *admission = Admission::Unvouched;
+        *admission = AdmissionState::Unvouched;
     }
     /// A changed epoch discards the reply before another transport step.
-    pub fn synchronize(&mut self, admission: &mut Admission, generation: u64) -> AuditStep {
+    pub fn synchronize<C>(
+        &mut self,
+        admission: &mut AdmissionState<C>,
+        generation: u64,
+    ) -> AuditStep {
         if generation == 0 || generation & proto_process::GENERATION_DEAD != 0 {
             return AuditStep::Denied;
         }
@@ -167,10 +178,10 @@ impl CleanupAudit {
         AuditStep::Advance
     }
     /// Each call decodes, validates, or commits one read-only cleanup phase.
-    pub fn step(
+    pub fn step<C>(
         &mut self,
         original: Binding,
-        admission: &mut Admission,
+        admission: &mut AdmissionState<C>,
         generation: u64,
     ) -> AuditStep {
         let synchronized = self.synchronize(admission, generation);
@@ -178,14 +189,14 @@ impl CleanupAudit {
             return synchronized;
         }
         match admission {
-            Admission::Wire(_) | Admission::RetainedWire(_) => {
+            AdmissionState::Wire(_) | AdmissionState::RetainedWire(_) => {
                 if admission.decode().is_err() {
                     self.start(admission, generation);
                     return AuditStep::Retry;
                 }
                 AuditStep::Advance
             }
-            Admission::Vouched(who) => {
+            AdmissionState::Vouched(who) => {
                 if who.generation != generation {
                     self.start(admission, generation);
                     return AuditStep::Retry;
@@ -198,7 +209,7 @@ impl CleanupAudit {
                 }
                 AuditStep::Advance
             }
-            Admission::RetainedVouched(reply) => {
+            AdmissionState::RetainedVouched(reply) => {
                 if reply.who.generation != generation {
                     self.start(admission, generation);
                     return AuditStep::Retry;
@@ -208,25 +219,25 @@ impl CleanupAudit {
                 }
                 AuditStep::Advance
             }
-            Admission::Validated(who) => {
+            AdmissionState::Validated(who) => {
                 if who.generation != generation || original.refreshed(who).is_err() {
                     return AuditStep::Denied;
                 }
                 self.audited = generation;
                 AuditStep::Alive
             }
-            Admission::RetainedValidated(reply) => {
+            AdmissionState::RetainedValidated(reply) => {
                 if reply.who.generation != generation || original.retained_refresh(reply).is_err() {
                     return AuditStep::Denied;
                 }
                 self.audited = generation;
                 AuditStep::Alive
             }
-            Admission::Unvouched => AuditStep::Retry,
+            AdmissionState::Unvouched | AdmissionState::Transport(_) => AuditStep::Retry,
         }
     }
 }
-impl Admission {
+impl<C> AdmissionState<C> {
     pub fn decode(&mut self) -> Result<(), u32> {
         if let Self::RetainedWire(wire) = self {
             let retained =

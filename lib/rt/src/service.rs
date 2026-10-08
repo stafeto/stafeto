@@ -852,11 +852,18 @@ impl<'a> CurrentRequest<'a> {
             if !retry {
                 break;
             }
-            let began = time::now();
-            steps::own();
-            steps::detail(5); // Separate fair maintenance during the current loan.
-            service.request_maintenance(sessions, self.request.label);
-            steps::end(began, kind);
+            if self
+                .request
+                .loan
+                .as_ref()
+                .is_some_and(|words| words[0] != 0)
+            {
+                let began = time::now();
+                steps::own();
+                steps::detail(5); // Separate fair maintenance during the active loan.
+                service.request_maintenance(sessions, self.request.label);
+                steps::end(began, kind);
+            }
             let began = time::now();
             steps::own();
             steps::detail(3); // Separate FIFO yield.

@@ -188,5 +188,10 @@ pub fn retained_release_step(
     label: u64,
     window_owner: Option<u64>,
 ) -> bool {
-    window_owner == Some(label) || ram.release_step(fds)
+    source_protected(label, None, window_owner) || ram.release_step(fds)
+}
+
+/// Indirect binding transfer cannot move the exact current image or its mapping debt.
+pub fn source_protected(label: u64, active: Option<u64>, window: Option<u64>) -> bool {
+    active == Some(label) || window == Some(label)
 }

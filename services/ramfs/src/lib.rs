@@ -36,6 +36,7 @@ pub use storage::namespace;
 mod create_tests;
 #[cfg(test)]
 mod namespace_tests;
+pub mod notary_transport;
 pub mod open;
 pub mod places;
 pub mod resolve;

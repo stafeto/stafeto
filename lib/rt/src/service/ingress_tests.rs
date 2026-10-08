@@ -56,6 +56,9 @@ impl Service<0> for Fixture {
             assert_eq!(request.loan().unwrap()[8], u64::MAX);
         }
         if self.tail_visits == 0 {
+            if let Some(words) = request.loan() {
+                words[0] = 0;
+            }
             return TailProgress::Idle;
         }
         self.tail_visits -= 1;
@@ -504,6 +507,7 @@ fn ongoing_loan_runs_distinct_fair_maintenance_before_each_fifo_yield_and_final_
     let mut table = [None];
     let mut buffer = [0; INLINE_MAX];
     let mut loan = [0; 11];
+    loan[0] = 1;
     let mut calls = Vec::new();
     for _ in 0..3 {
         calls.push((Call::Yield.number(), None)); // Actual loan operation.
@@ -554,6 +558,7 @@ fn process_maintenance_send_overwrites_kernel_buffer_while_current_bytes_caps_to
     let mut buffer = [0; MESSAGE_MAX];
     crate::msgbuf::read(0, &mut buffer[..bytes.len()]);
     let mut loan = [0; 11];
+    loan[0] = 1;
     loan[8] = u64::MAX;
     let mut current = CurrentRequest::new(0, &buffer[..bytes.len()], handles, Token::fixture(123));
     current.request.loan = Some(&mut loan);
@@ -566,7 +571,6 @@ fn process_maintenance_send_overwrites_kernel_buffer_while_current_bytes_caps_to
     }
     calls.extend([
         (Call::HandleClose.number(), None),
-        (Call::Send.number(), Some(Error::PeerClosed)),
         (Call::Yield.number(), None),
         (Call::Reply.number(), None),
     ]);

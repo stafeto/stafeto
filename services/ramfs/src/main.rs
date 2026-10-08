@@ -17,7 +17,7 @@ use proto_init::ServiceArgs;
 use proto_wire::Status;
 use proto_wire::clones::Clones;
 use ramfs::authority::{
-    Admission, AuditStep, Binding, BindingPurpose, CleanupAudit, Identity, NotaryReply,
+    AdmissionState, AuditStep, Binding, BindingPurpose, CleanupAudit, Identity, NotaryReply,
     RetainedSourcePhase,
 };
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
@@ -28,7 +28,7 @@ use ramfs::{Exec, SET_GID, SET_UID};
 use ramfs::{Fds, Ram};
 use rt::abi::{Access, Rights};
 use rt::compact::Compact;
-use rt::handle::{Channel, Handle, Memory, Outgoing, Resource};
+use rt::handle::{Any, Channel, Handle, Incoming, Memory, Outgoing, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 
@@ -259,6 +259,116 @@ fn main(_: u64) -> u64 {
     4
 }
 
+type Admission = AdmissionState<NotaryTransport>;
+
+type NotaryTransport = ramfs::notary_transport::Transport<NotaryEffects>;
+type NotaryState = ramfs::notary_transport::State<NotaryEffects>;
+
+struct NotaryEffects;
+impl ramfs::notary_transport::Owners for NotaryEffects {
+    type Copy = Compact<Channel>;
+    type Back = Outgoing;
+    type Reply = Incoming;
+    type Held = Handle<Any>;
+    fn copy_live(owner: &Self::Copy) -> bool {
+        owner.is_some()
+    }
+    fn close_copy(owner: &mut Self::Copy) {
+        let _ = owner.close_retained();
+    }
+    fn pop_back(owners: &mut Self::Back) -> Option<Self::Held> {
+        owners.pop()
+    }
+    fn reply_len(owners: &Self::Reply) -> usize {
+        owners.len()
+    }
+    fn take_reply(owners: &mut Self::Reply, index: usize) -> Option<Self::Held> {
+        owners.take_any(index).ok()
+    }
+    fn close_held(owner: &mut Option<Self::Held>) {
+        let _ = Handle::close_retained(owner);
+    }
+}
+struct NotaryCall<'a> {
+    identity: &'a Handle<Channel>,
+    notary: &'a Handle<Channel>,
+    original: &'a Binding,
+    retained: bool,
+}
+impl ramfs::notary_transport::Effects<NotaryEffects> for NotaryCall<'_> {
+    fn duplicate(&mut self) -> Option<Compact<Channel>> {
+        sys::handle_duplicate(self.identity, Rights::NOTIFY | Rights::TRANSFER)
+            .ok()
+            .map(|copy| Compact::from_owner(Some(copy)))
+    }
+    fn send(
+        &mut self,
+        owner: &mut Compact<Channel>,
+    ) -> ramfs::notary_transport::Send<Outgoing, Incoming> {
+        use ramfs::notary_transport::Send;
+        let mut request = proto_wire::Writer::new();
+        if self.retained {
+            let Some(who) = self.original.snapshot_ref() else {
+                return Send::Denied;
+            };
+            let Some(loader) = who.loader else {
+                return Send::Denied;
+            };
+            let expected = proto_process::RetainedLoader {
+                pid: who.pid,
+                index: who.index,
+                image: who.image,
+                ticket: loader.ticket,
+                root: who.root,
+            };
+            proto_process::Method::RetainedLoader
+                .header()
+                .write(&mut request)
+                .and_then(|()| expected.write(&mut request))
+                .expect("fixed retained request");
+        } else {
+            proto_process::Method::Vouch
+                .header()
+                .write(&mut request)
+                .expect("fixed vouch request");
+        }
+        let Some(copy) = owner.take() else {
+            return Send::Retry;
+        };
+        match sys::send_handles(self.notary, request.as_bytes(), [copy.erase()]) {
+            Ok(reply) => {
+                let mut bytes = [0; rt::abi::MESSAGE_MAX];
+                let body = reply.bytes(&mut bytes);
+                if !reply.handles.is_empty() {
+                    return Send::Reply(reply.handles);
+                }
+                if self.retained {
+                    match NotaryReply::<260>::read(body, true) {
+                        NotaryReply::Wire(wire) => Send::RetainedWire(wire),
+                        NotaryReply::Denied => Send::Denied,
+                        NotaryReply::Retry => Send::Retry,
+                    }
+                } else {
+                    match NotaryReply::<252>::read(body, true) {
+                        NotaryReply::Wire(wire) => Send::Wire(wire),
+                        NotaryReply::Denied => Send::Denied,
+                        NotaryReply::Retry => Send::Retry,
+                    }
+                }
+            }
+            Err(refused) => {
+                assert!(refused.token.is_none(), "Send retains no reply token");
+                match refused.back {
+                    Some(owners) => Send::Back(owners),
+                    None => Send::Retry,
+                }
+            }
+        }
+    }
+}
+const _: () = assert!(core::mem::size_of::<NotaryTransport>() == 104);
+const _: () = assert!(core::mem::size_of::<Admission>() == 280);
+
 type IntoWindow = rt::retention::Window<Handle<Memory>>;
 const _: () = assert!(core::mem::size_of::<IntoWindow>() == 40);
 
@@ -478,42 +588,8 @@ impl Fs {
             }
             return true;
         }
-        if let Some(outcome) = fds.image_outcome {
-            if outcome.phase == ramfs::image::ImagePhase::Prepared {
-                if let Some((_, child)) = self
-                    .births
-                    .iter_mut()
-                    .flatten()
-                    .find(|(l, _)| *l == outcome.label)
-                {
-                    child.closing = true;
-                    child.binding = Binding::Cleanup;
-                }
-                if let Some(identity) = self
-                    .identities
-                    .iter_mut()
-                    .flatten()
-                    .find(|identity| identity.label == outcome.label)
-                {
-                    identity.closing = true;
-                }
-                fds.image_outcome = None;
-                return true;
-            }
-            if let Some(image) = self
-                .identities
-                .iter_mut()
-                .flatten()
-                .find(|identity| identity.label == outcome.label)
-                .and_then(|identity| identity.image.as_mut())
-                && image.private.is_some()
-            {
-                if Handle::close_retained(&mut image.private).is_ok() {
-                    fds.image_outcome = None;
-                }
-                return true;
-            }
-            fds.image_outcome = None;
+        if fds.image_outcome.is_some() {
+            self.clear_image_outcome_step(fds);
             return true;
         }
         if let Some(id) = self
@@ -549,14 +625,35 @@ impl Fs {
     }
 
     fn identity_close_step(&mut self, fds: &mut Fds) -> bool {
-        let Some(identity) = self
-            .identities
+        Self::identity_close_fields(self.identities, fds)
+    }
+
+    fn identity_close_fields(
+        identities: &mut [Option<IdentityChannel>; SESSIONS],
+        fds: &mut Fds,
+    ) -> bool {
+        let Some(identity) = identities
             .get_mut(fds.authority_index as usize)
             .and_then(Option::as_mut)
         else {
             fds.authority_index = NONE;
             return false;
         };
+        if Self::transport_drain_identity(identity).is_some() {
+            return true;
+        }
+        if let Admission::Transport(transport) = &mut identity.admission {
+            match &mut transport.state {
+                NotaryState::Rollback { rejected, .. } if rejected.is_some() => {
+                    let _ = rejected.close_retained();
+                    return true;
+                }
+                NotaryState::Rollback { .. } | NotaryState::Commit => {
+                    identity.admission = Admission::Unvouched
+                }
+                _ => unreachable!("settled transport disposal"),
+            }
+        }
         if identity.offered.is_some() {
             let _ = identity.offered.close_retained();
             return true;
@@ -577,7 +674,7 @@ impl Fs {
         }
         // All four optional owners are absent before the mandatory channel call.
         if Handle::close_retained_owner(
-            &mut self.identities[fds.authority_index as usize],
+            &mut identities[fds.authority_index as usize],
             |identity| &identity.channel,
             |identity| {
                 let _ = identity.channel.into_raw();
@@ -593,7 +690,7 @@ impl Fs {
 
 impl Fs {
     /// A dead or superseded authority releases one retained reference per pass.
-    fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
+    fn cleanup_step(&mut self, fds: &mut Fds, label: u64, protected: Option<u64>) -> bool {
         if fds.closing
             || self
                 .identities
@@ -604,6 +701,40 @@ impl Fs {
             fds.closing = true;
             fds.binding = Binding::Cleanup;
             return self.closed_cleanup_step(fds, label);
+        }
+        if self.binding_finish_step(fds).is_some() {
+            return true;
+        }
+        if self
+            .identities
+            .get(fds.authority_index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|identity| {
+                matches!(
+                    identity.admission,
+                    Admission::Transport(NotaryTransport {
+                        state: NotaryState::Back { .. }
+                            | NotaryState::Reply { .. }
+                            | NotaryState::Copy { outcome: 1.., .. },
+                        ..
+                    })
+                )
+            })
+        {
+            self.transport_drain_step(fds);
+            return true;
+        }
+        if fds.image_outcome.is_some_and(|outcome| {
+            outcome.phase == ramfs::image::ImagePhase::Prepared
+                && self
+                    .births
+                    .iter()
+                    .flatten()
+                    .find(|(label, _)| *label == outcome.label)
+                    .is_none_or(|(_, child)| child.closing)
+        }) {
+            self.clear_image_outcome_step(fds);
+            return true;
         }
         if let Some(id) = fds.resolvers.iter().copied().find(|id| {
             *id != 0
@@ -625,7 +756,7 @@ impl Fs {
         match fds.binding.custody_phase(fds.binding_preparation.is_some()) {
             ramfs::authority::CustodyPhase::Hold => return false,
             ramfs::authority::CustodyPhase::Candidate => {
-                let _ = self.binding_phase(fds, label, &mut true);
+                let _ = self.binding_phase(fds, label, &mut true, protected);
                 return true;
             }
             ramfs::authority::CustodyPhase::Ordinary => {}
@@ -656,7 +787,7 @@ impl Fs {
         }
         if fds.binding_preparation.is_some() {
             let mut progress = true;
-            let _ = self.binding_phase(fds, label, &mut progress);
+            let _ = self.binding_phase(fds, label, &mut progress, protected);
             return progress;
         }
         if self
@@ -694,6 +825,10 @@ impl Fs {
                 };
                 if identity.audit.cached(current) && identity.original == fds.binding {
                     return false;
+                }
+                if matches!(identity.admission, Admission::Transport(_)) {
+                    self.transport_drain_step(fds);
+                    return true;
                 }
                 identity.audit.start(&mut identity.admission, current);
                 identity.original = fds.binding;
@@ -802,31 +937,51 @@ impl Fs {
     }
     /// Source cleanup retires its private recovery copy while external copies retain the image.
     fn clear_image_outcome(&mut self, fds: &mut Fds) {
-        let Some(outcome) = fds.image_outcome.take() else {
-            return;
+        self.clear_image_outcome_step(fds);
+        self.clone_wake = true;
+        self.maintenance.remaining = SESSIONS + BIRTHS;
+    }
+    /// Cancellation keeps the exact child until its existing cursor settles all owners.
+    fn clear_image_outcome_step(&mut self, fds: &mut Fds) -> bool {
+        let Some(outcome) = fds.image_outcome else {
+            return true;
         };
         if outcome.phase == ramfs::image::ImagePhase::Prepared {
-            if let Some(i) = self
+            if let Some((_, child)) = self
                 .births
-                .iter()
-                .position(|b| b.as_ref().is_some_and(|(label, _)| *label == outcome.label))
+                .iter_mut()
+                .flatten()
+                .find(|(label, _)| *label == outcome.label)
             {
-                let (_, image) = self.births[i].as_mut().expect("retained image birth");
-                Self::drop_identity_fields(&mut self.ram, self.identities, image);
-                self.ram.release(image);
-                self.births[i] = None;
+                child.closing = true;
+                child.binding = Binding::Cleanup;
+                self.clone_wake = true;
+                self.maintenance.remaining = SESSIONS + BIRTHS;
+                return false;
             }
-            self.places.release(outcome.label);
-        } else if let Some(identity) = self
+            if self
+                .identities
+                .iter()
+                .flatten()
+                .any(|identity| identity.label == outcome.label)
+            {
+                return false;
+            }
+        } else if let Some(image) = self
             .identities
             .iter_mut()
-            .filter_map(Option::as_mut)
+            .flatten()
             .find(|identity| identity.label == outcome.label)
-            && let Some(image) = identity.image.as_mut()
+            .and_then(|identity| identity.image.as_mut())
+            && image.private.is_some()
         {
-            image.private = None;
+            let _ = Handle::close_retained(&mut image.private);
+            return false;
         }
+        fds.image_outcome = None;
+        true
     }
+
     fn finish_image_job(&mut self, fds: &mut Fds, id: u64, owner: u64) {
         let i = self.path_slot(id, owner).expect("exact executable job");
         let j = self.jobs[i].take().unwrap();
@@ -850,6 +1005,24 @@ impl Fs {
         let (Ok(job), Ok(())) = (body.u64(), body.finish()) else {
             return Answer::Status(Status::BadSize);
         };
+        if self
+            .job_slot(job, r.label())
+            .is_ok_and(|slot| self.jobs[slot].as_ref().is_some_and(|job| job.retiring))
+        {
+            return status(proto_fs::OPEN_RETIRED);
+        }
+        if fds.image_outcome.is_some_and(|outcome| {
+            outcome.phase == ramfs::image::ImagePhase::Prepared
+                && self
+                    .births
+                    .iter()
+                    .flatten()
+                    .find(|(label, _)| *label == outcome.label)
+                    .is_none_or(|(_, child)| child.closing)
+        }) {
+            self.clear_image_outcome_step(fds);
+            return status(proto_fs::RESOLVING);
+        }
         if let Some(outcome) = fds.image_outcome {
             if outcome.phase == ramfs::image::ImagePhase::Retired {
                 return status(proto_fs::OPEN_RETIRED);
@@ -1053,6 +1226,10 @@ impl Fs {
                 let Some(words) = r.loan() else {
                     return Answer::Status(Status::Kernel(abi::Error::BadState));
                 };
+                assert!(
+                    self.notary.is_some() && self.generations.is_some(),
+                    "registered image loan"
+                );
                 ramfs::read_into::Loan::new(words).begin(fd, count, offset, at, image);
                 Answer::Reply(Outgoing::new())
             }
@@ -1840,7 +2017,7 @@ impl Service<0> for Fs {
                 .get(s.data.authority_index as usize)
                 .and_then(Option::as_ref)
                 .map_or(0, |identity| match identity.admission {
-                    Admission::Unvouched => 1,
+                    Admission::Unvouched | Admission::Transport(_) => 1,
                     Admission::Wire(_) | Admission::RetainedWire(_) => 2,
                     Admission::Vouched(_) | Admission::RetainedVouched(_) => 3,
                     Admission::Validated(_) | Admission::RetainedValidated(_) => 4,
@@ -2375,59 +2552,114 @@ impl Fs {
         self.generations = Some(page);
         true
     }
-    /// Only transport happens in this phase. Decoding the genuine Process reply
-    /// is another receive, before any identity or inode effect is committed.
-    fn vouch_wire(&mut self, identity: &Handle<Channel>) -> NotaryReply<252> {
-        let Ok(copy) = sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER) else {
-            return NotaryReply::Retry;
+    /// One retained transport owner settles before any admission reset.
+    fn transport_drain_step(&mut self, fds: &mut Fds) -> bool {
+        let Some(identity) = self
+            .identities
+            .get_mut(fds.authority_index as usize)
+            .and_then(Option::as_mut)
+        else {
+            return false;
         };
-        let request = proto_process::Method::Vouch.header().bytes();
-        let Some(notary) = self.notary.as_ref() else {
-            return NotaryReply::Retry;
+        let Some(settled) = Self::transport_drain_identity(identity) else {
+            return false;
         };
-        let Ok(reply) = sys::send_handles(notary, &request, [copy.erase()]) else {
-            return NotaryReply::Retry;
-        };
-        let mut buffer = [0; rt::abi::MESSAGE_MAX];
-        NotaryReply::read(reply.bytes(&mut buffer), reply.handles.is_empty())
-    }
-    fn retained_wire(&mut self, identity: &Handle<Channel>, original: Binding) -> NotaryReply<260> {
-        let Some(who) = original.snapshot_ref() else {
-            return NotaryReply::Denied;
-        };
-        let Some(loader) = who.loader else {
-            return NotaryReply::Denied;
-        };
-        let expected = proto_process::RetainedLoader {
-            pid: who.pid,
-            index: who.index,
-            image: who.image,
-            ticket: loader.ticket,
-            root: who.root,
-        };
-        let Ok(copy) = sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER) else {
-            return NotaryReply::Retry;
-        };
-        let mut request = proto_wire::Writer::new();
-        if proto_process::Method::RetainedLoader
-            .header()
-            .write(&mut request)
-            .and_then(|()| expected.write(&mut request))
-            .is_err()
+        if let Some(outcome) = settled
+            && outcome != 0
         {
-            return NotaryReply::Retry;
+            self.begin_binding_failure(fds, outcome);
         }
-        let Some(notary) = self.notary.as_ref() else {
-            return NotaryReply::Retry;
-        };
-        let Ok(reply) = sys::send_handles(notary, request.as_bytes(), [copy.erase()]) else {
-            // A lost transport response proves no loader abort. The next paid
-            // phase retries this read with a fresh copy of the retained identity.
-            return NotaryReply::Retry;
-        };
-        let mut buffer = [0; rt::abi::MESSAGE_MAX];
-        NotaryReply::read(reply.bytes(&mut buffer), reply.handles.is_empty())
+        true
     }
+
+    fn transport_drain_identity(identity: &mut IdentityChannel) -> Option<Option<u32>> {
+        let Admission::Transport(transport) = &mut identity.admission else {
+            return None;
+        };
+        let settled = transport.drain()?;
+        let Some(outcome) = settled else {
+            return Some(None);
+        };
+        identity.admission = Admission::Unvouched;
+        Some(Some(outcome))
+    }
+
+    /// Duplicate and Send have distinct paid visits and distinct exact owners.
+    fn notary_transport_step(&mut self, fds: &mut Fds, retained: bool) -> Result<bool, u32> {
+        let Some(notary) = self.notary.as_ref() else {
+            return Ok(false);
+        };
+        let identity = self.identities[fds.authority_index as usize]
+            .as_mut()
+            .expect("retained identity");
+        let current = identity
+            .original
+            .snapshot_ref()
+            .map_or(0, |who| generation(who.index as usize));
+        let mut effects = NotaryCall {
+            identity: &identity.channel,
+            notary,
+            original: &identity.original,
+            retained,
+        };
+        ramfs::notary_transport::advance(&mut identity.admission, current, &mut effects)
+    }
+
+    /// Failure records CPU state; subsequent visits settle every rejected owner.
+    fn begin_binding_failure(&mut self, fds: &mut Fds, code: u32) {
+        let i = fds.authority_index as usize;
+        let Some(identity) = self.identities.get_mut(i).and_then(Option::as_mut) else {
+            fds.binding = Binding::Cleanup;
+            fds.binding_outcome = Some(code);
+            return;
+        };
+        if let Some(previous) = identity.previous.take() {
+            let rejected = core::mem::replace(&mut identity.channel, previous);
+            identity.admission = Admission::Transport(NotaryTransport {
+                epoch: 0,
+                state: NotaryState::Rollback {
+                    rejected: Compact::from_owner(Some(rejected)),
+                    outcome: code,
+                },
+            });
+        } else {
+            identity.closing = true;
+            fds.closing = true;
+            fds.binding = Binding::Cleanup;
+            fds.binding_outcome = Some(code);
+        }
+    }
+
+    fn binding_finish_step(&mut self, fds: &mut Fds) -> Option<u32> {
+        let identity = self
+            .identities
+            .get_mut(fds.authority_index as usize)?
+            .as_mut()?;
+        let Admission::Transport(transport) = &mut identity.admission else {
+            return None;
+        };
+        match ramfs::notary_transport::finish(
+            transport,
+            &mut identity.offered,
+            &mut identity.previous,
+        )? {
+            ramfs::notary_transport::Finish::Pending => Some(proto_fs::RESOLVING),
+            ramfs::notary_transport::Finish::Rollback(outcome) => {
+                (fds.binding, fds.root) = (identity.original, identity.original_root);
+                identity.pending = false;
+                identity.require = false;
+                identity.admission = Admission::Unvouched;
+                self.ram.complete_binding(fds, outcome);
+                Some(outcome)
+            }
+            ramfs::notary_transport::Finish::Commit => {
+                identity.admission = Admission::Unvouched;
+                self.ram.complete_binding(fds, 0);
+                Some(0)
+            }
+        }
+    }
+
     fn install_identity(
         &mut self,
         fds: &mut Fds,
@@ -2443,6 +2675,20 @@ impl Fs {
         } else {
             fds.authority_index as usize
         };
+        assert!(
+            self.identities[i]
+                .as_ref()
+                .is_none_or(|old| !matches!(old.admission, Admission::Transport(_))),
+            "settled identity replacement"
+        );
+        assert!(
+            self.identities[i]
+                .as_ref()
+                .is_none_or(|old| !old.offered.is_some()
+                    && !old.previous.is_some()
+                    && old.image.is_none()),
+            "settled secondary identity owners"
+        );
         let previous = self.identities[i].take().and_then(|old| {
             if retain_previous {
                 Some(old.channel)
@@ -2480,6 +2726,13 @@ impl Fs {
         identities: &mut [Option<IdentityChannel>; SESSIONS],
         fds: &mut Fds,
     ) {
+        assert!(
+            identities
+                .get(fds.authority_index as usize)
+                .and_then(Option::as_ref)
+                .is_none_or(|identity| !matches!(identity.admission, Admission::Transport(_))),
+            "settled identity disposal"
+        );
         if let Some(root) = fds.binding_preparation.take() {
             ram.storage.release_preparation(root);
         }
@@ -2494,32 +2747,24 @@ impl Fs {
         self.fail_binding(fds, proto_fs::PERMISSION)
     }
     fn fail_binding(&mut self, fds: &mut Fds, code: u32) -> u32 {
-        let i = fds.authority_index as usize;
-        let original = self
+        if let Some(identity) = self
             .identities
-            .get(i)
-            .and_then(Option::as_ref)
-            .map(|identity| (identity.original, identity.original_root));
-        let previous = self
-            .identities
-            .get_mut(i)
+            .get_mut(fds.authority_index as usize)
             .and_then(Option::as_mut)
-            .and_then(|identity| identity.previous.take());
-        if let Some(previous) = previous {
-            let identity = self.identities[i].as_mut().unwrap();
-            (fds.binding, fds.root) = original.unwrap();
-            identity.channel = previous;
-            identity.admission = Admission::Unvouched;
-            identity.offered = Compact::empty();
-            identity.pending = false;
-            identity.require = false;
-            self.ram.complete_binding(fds, code);
-        } else {
-            self.drop_identity(fds);
-            fds.binding = Binding::Cleanup;
+            && let Admission::Transport(transport) = &mut identity.admission
+        {
+            match &mut transport.state {
+                NotaryState::Copy { outcome, .. }
+                | NotaryState::Back { outcome, .. }
+                | NotaryState::Reply { outcome, .. } => {
+                    *outcome = code;
+                    return proto_fs::RESOLVING;
+                }
+                NotaryState::Rollback { .. } | NotaryState::Commit => return proto_fs::RESOLVING,
+            }
         }
-        fds.binding_outcome = Some(code);
-        code
+        self.begin_binding_failure(fds, code);
+        proto_fs::RESOLVING
     }
     /// Test setup queues real storage reclamation before releasing a live
     /// prepared binding to the unchanged alternating maintenance cursor.
@@ -2589,6 +2834,19 @@ impl Fs {
         if !fds.preparation_available() && fds.binding_preparation.is_none() {
             return self.bind_refusal(fds, proto_fs::TOO_MANY_OPEN_FILES);
         }
+        if self
+            .identities
+            .get(fds.authority_index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|identity| matches!(identity.admission, Admission::Transport(_)))
+        {
+            if self.binding_finish_step(fds).is_none() {
+                self.transport_drain_step(fds);
+            }
+            self.clone_wake = true;
+            self.maintenance.remaining = SESSIONS + BIRTHS;
+            return status(proto_fs::AUTHENTICATING);
+        }
         let rights = r.handles.info(0).map(|(_, rights)| rights);
         if !rights
             .is_some_and(|r| r.contains(Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER))
@@ -2648,7 +2906,7 @@ impl Fs {
             .is_some_and(|gate| gate.owner(label))
         {
             self.capacity_retired_gate = None;
-            let _ = sys::notify(&self.channel, 1);
+            self.clone_wake = true;
         }
     }
     #[inline(never)]
@@ -2958,6 +3216,9 @@ impl Fs {
         if identity.label != label {
             return Err(proto_fs::PERMISSION);
         }
+        if matches!(identity.admission, Admission::Transport(_)) {
+            return Err(proto_fs::AUTHENTICATING);
+        }
         ram.begin_binding(fds)?;
         identity.admission = Admission::Unvouched;
         identity.audit.reset();
@@ -3164,6 +3425,26 @@ impl Fs {
         };
         let current = generation(who.index as usize);
         let i = fds.authority_index as usize;
+        if let Some(result) = self.binding_finish_step(fds) {
+            let _ = result;
+            return true;
+        }
+        if let Some(identity) = self.identities.get(i).and_then(Option::as_ref)
+            && let Admission::Transport(transport) = &identity.admission
+        {
+            if transport.epoch != current || current & proto_process::GENERATION_DEAD != 0 {
+                self.transport_drain_step(fds);
+                return true;
+            }
+            let retained = matches!(identity.original, Binding::Pending(_) | Binding::Handoff(_));
+            return match self.notary_transport_step(fds, retained) {
+                Ok(advanced) => advanced,
+                Err(code) => {
+                    self.fail_binding(fds, code);
+                    true
+                }
+            };
+        }
         let Some(identity) = self.identities.get_mut(i).and_then(Option::as_mut) else {
             fds.binding = Binding::Cleanup;
             return true;
@@ -3180,37 +3461,23 @@ impl Fs {
             AuditStep::Retry => return false,
             _ => {}
         }
-        let step = if matches!(identity.admission, Admission::Unvouched) {
-            let channel = Handle::borrowed(identity.channel.raw());
-            let original = identity.original;
+        let step = if matches!(
+            identity.admission,
+            Admission::Unvouched | Admission::Transport(_)
+        ) {
+            let retained = matches!(identity.original, Binding::Pending(_) | Binding::Handoff(_));
             if self.generations.is_none() {
                 let _ = self.notary_register();
                 return false;
             }
-            let wire = if matches!(original, Binding::Pending(_) | Binding::Handoff(_)) {
-                match self.retained_wire(&channel, original) {
-                    NotaryReply::Wire(wire) => Some(Admission::RetainedWire(wire)),
-                    NotaryReply::Denied => {
-                        self.reject_binding(fds);
-                        return true;
-                    }
-                    NotaryReply::Retry => None,
+            match self.notary_transport_step(fds, retained) {
+                Ok(true) => AuditStep::Advance,
+                Ok(false) => AuditStep::Retry,
+                Err(code) => {
+                    self.fail_binding(fds, code);
+                    return true;
                 }
-            } else {
-                match self.vouch_wire(&channel) {
-                    NotaryReply::Wire(wire) => Some(Admission::Wire(wire)),
-                    NotaryReply::Denied => {
-                        self.reject_binding(fds);
-                        return true;
-                    }
-                    NotaryReply::Retry => None,
-                }
-            };
-            let Some(wire) = wire else {
-                return false;
-            };
-            self.identities[i].as_mut().unwrap().admission = wire;
-            AuditStep::Advance
+            }
         } else {
             identity
                 .audit
@@ -3226,10 +3493,19 @@ impl Fs {
         }
     }
     fn binding_step(&mut self, fds: &mut Fds, label: u64) -> u32 {
-        self.binding_phase(fds, label, &mut true)
+        self.binding_phase(fds, label, &mut true, None)
     }
-    fn binding_phase(&mut self, fds: &mut Fds, label: u64, progress: &mut bool) -> u32 {
+    fn binding_phase(
+        &mut self,
+        fds: &mut Fds,
+        label: u64,
+        progress: &mut bool,
+        protected: Option<u64>,
+    ) -> u32 {
         *progress = true;
+        if let Some(result) = self.binding_finish_step(fds) {
+            return result;
+        }
         let i = fds.authority_index as usize;
         let Some(binding) = self.identities.get(i).and_then(Option::as_ref) else {
             return self.reject_binding(fds);
@@ -3237,7 +3513,10 @@ impl Fs {
         if binding.label != label {
             return self.reject_binding(fds);
         }
-        if matches!(binding.admission, Admission::Unvouched) {
+        if matches!(
+            binding.admission,
+            Admission::Unvouched | Admission::Transport(_)
+        ) {
             if self.generations.is_none() {
                 return if self.notary_register() {
                     proto_fs::RESOLVING
@@ -3245,28 +3524,9 @@ impl Fs {
                     self.reject_binding(fds)
                 };
             }
-            let identity = Handle::borrowed(binding.channel.raw());
-            if binding.purpose == BindingPurpose::Refresh
-                && matches!(binding.original, Binding::Pending(_) | Binding::Handoff(_))
-            {
-                let original = binding.original;
-                let wire = self.retained_wire(&identity, original);
-                return match wire.admit(
-                    &mut self.identities[i].as_mut().unwrap().admission,
-                    Admission::RetainedWire,
-                ) {
-                    Ok(advanced) => {
-                        *progress = advanced;
-                        proto_fs::RESOLVING
-                    }
-                    Err(code) => self.fail_binding(fds, code),
-                };
-            }
-            let wire = self.vouch_wire(&identity);
-            return match wire.admit(
-                &mut self.identities[i].as_mut().unwrap().admission,
-                Admission::Wire,
-            ) {
+            let retained = binding.purpose == BindingPurpose::Refresh
+                && matches!(binding.original, Binding::Pending(_) | Binding::Handoff(_));
+            return match self.notary_transport_step(fds, retained) {
                 Ok(advanced) => {
                     *progress = advanced;
                     proto_fs::RESOLVING
@@ -3411,6 +3671,14 @@ impl Fs {
             }
         }
         if let Some((slot, label)) = fds.binding_source {
+            if ramfs::maintenance::source_protected(
+                label,
+                protected,
+                self.into_window.as_ref().map(|window| window.owner),
+            ) {
+                *progress = false;
+                return proto_fs::RESOLVING;
+            }
             let Some((old_label, source)) = self.births[slot as usize].as_ref() else {
                 return self.reject_binding(fds);
             };
@@ -3465,24 +3733,30 @@ impl Fs {
                 return self.reject_binding(fds);
             }
             let source = &mut self.births[slot as usize].as_mut().unwrap().1;
-            Self::drop_identity_fields(&mut self.ram, self.identities, source);
+            if Self::identity_close_fields(self.identities, source) {
+                return proto_fs::RESOLVING;
+            }
+            if let Some(root) = source.binding_preparation.take() {
+                self.ram.storage.release_preparation(root);
+            }
+            source.binding_source = None;
             source.binding = bound;
             source.authority_index = fds.authority_index;
             source.claimed = true;
-            self.ram.complete_binding(fds, 0);
+            source.binding_preparation = fds.binding_preparation.take();
+            source.binding_source = None;
             core::mem::swap(fds, &mut **source);
             self.births[slot as usize] = None;
-        } else {
-            self.ram.complete_binding(fds, 0);
         }
         let binding = self.identities[fds.authority_index as usize]
             .as_mut()
             .unwrap();
-        binding.admission = Admission::Unvouched;
-        binding.offered = Compact::empty();
-        binding.previous = Compact::empty();
-        fds.binding_outcome = Some(0);
-        0
+        binding.admission = Admission::Transport(NotaryTransport {
+            epoch: 0,
+            state: NotaryState::Commit,
+        });
+        fds.binding_outcome = None;
+        proto_fs::RESOLVING
     }
     fn data_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if proto_fs::is_loaders(r.label()) {
@@ -3795,12 +4069,28 @@ impl Fs {
         {
             self.capacity_clear_owner(owner);
         }
+        if retire && let Ok(i) = self.job_slot(id, owner) {
+            let job = self.jobs[i].as_mut().expect("exact retiring job");
+            if !job.retiring {
+                job.retiring = true;
+                self.maintenance.remaining = SESSIONS + BIRTHS;
+                self.clone_wake = true;
+            }
+        }
         if let Some(fds) = fds.as_deref_mut()
             && !fds.closing
             && fds.image_outcome.is_some_and(|outcome| outcome.job == id)
         {
             let outcome = fds.image_outcome.unwrap();
-            self.clear_image_outcome(fds);
+            if outcome.phase == ramfs::image::ImagePhase::Ready {
+                fds.image_outcome = Some(ramfs::image::ImageOutcome {
+                    phase: ramfs::image::ImagePhase::Retired,
+                    ..outcome
+                });
+            }
+            if !self.clear_image_outcome_step(fds) {
+                return false;
+            }
             if outcome.phase != ramfs::image::ImagePhase::Prepared {
                 fds.image_outcome = Some(ramfs::image::ImageOutcome {
                     phase: if outcome.phase == ramfs::image::ImagePhase::AbortRequired {
@@ -3813,14 +4103,6 @@ impl Fs {
             }
         }
         if let Ok(i) = self.job_slot(id, owner) {
-            if retire {
-                let job = self.jobs[i].as_mut().expect("exact retiring job");
-                if !job.retiring {
-                    job.retiring = true;
-                    self.maintenance.remaining = SESSIONS + BIRTHS;
-                    let _ = sys::notify(&self.channel, 1);
-                }
-            }
             if let Some(ResolveJob {
                 operation: JobOperation::Data(data),
                 ..
@@ -4562,7 +4844,7 @@ impl Fs {
                 && Some(s.label()) != protected
             {
                 let label = s.label();
-                client_work = self.cleanup_step(&mut s.data, label);
+                client_work = self.cleanup_step(&mut s.data, label, protected);
                 closing_visit = s.data.closing;
                 if s.data.closing && self.closed_terminal(&s.data, label) {
                     self.places.release(label);
@@ -4585,7 +4867,7 @@ impl Fs {
             // Preserve only this exact current image context.
         } else if let Some((label, data)) = self.births[i - SESSIONS].take() {
             let mut fds = data.into_ready();
-            client_work = self.cleanup_step(&mut fds, label);
+            client_work = self.cleanup_step(&mut fds, label, protected);
             closing_visit = fds.closing;
             if fds.closing && self.closed_terminal(&fds, label) {
                 self.places.release(label);
