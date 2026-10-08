@@ -378,6 +378,9 @@ pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
     core::str::from_utf8(path).map_err(|_| Status::BadSize)
 }
 
+/// Initial source envelopes; native methods require separate authority admission.
+pub mod seed;
+
 #[cfg(test)]
 mod tests {
     use super::*;
