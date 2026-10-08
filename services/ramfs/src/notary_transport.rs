@@ -602,6 +602,17 @@ mod tests {
                 closing: false,
                 retained_failure: transport.failed_original_outcome(phase != 3),
             };
+            assert!(crate::authority::failed_candidate_stale(
+                &fds, 81, 8, context
+            ));
+            for epoch in [0, 7, proto_process::GENERATION_DEAD | 8] {
+                assert!(!crate::authority::failed_candidate_stale(
+                    &fds, 81, epoch, context
+                ));
+            }
+            assert!(!crate::authority::failed_candidate_stale(
+                &fds, 82, 8, context
+            ));
             let ordinary_allowed = failed_candidate_allows(&fds, 81, 7, context);
             // This is the same early decision called before production request dispatch.
             assert!(!crate::authority::preparation_rejects(

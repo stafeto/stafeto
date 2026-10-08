@@ -16,6 +16,12 @@ impl Default for Cursor {
     }
 }
 impl Cursor {
+    /// A retained failure owes both a runnable notification and one full table sweep.
+    pub fn wake_failure(&mut self, wake: &mut bool, slots: usize) {
+        *wake = true;
+        self.remaining = slots;
+    }
+
     /// Every Cloning visit, including a failed retained close, releases the cursor.
     pub fn complete_clone(&mut self, slots: usize) {
         self.complete_client(true, true, slots);
@@ -225,4 +231,29 @@ pub fn source_protected(label: u64, active: Option<u64>, window: Option<u64>) ->
 /// DEAD settles owners; only final CLIENT_GONE permits exact slot reuse.
 pub fn retirement_ready(fds: &crate::Fds, settled: bool) -> bool {
     fds.closing && fds.client_gone && settled
+}
+
+#[cfg(test)]
+mod failure_wake_tests {
+    #[test]
+    fn failure_wake_reaches_owed_owner_and_preserves_other_owner_progress() {
+        let mut cursor = super::Cursor::default();
+        let mut wake = false;
+        cursor.wake_failure(&mut wake, 320);
+        assert!(wake);
+        assert_eq!(cursor.remaining, 320);
+        let mut owed = 0;
+        let mut other = 0;
+        for _ in 0..320 {
+            match cursor.position {
+                201 => owed += 1,
+                77 => other += 1,
+                _ => {}
+            }
+            cursor.complete_client(false, false, 320);
+        }
+        assert_eq!(owed, 1);
+        assert_eq!(other, 1);
+        assert_eq!(cursor.remaining, 0);
+    }
 }

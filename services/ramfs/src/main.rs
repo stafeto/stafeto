@@ -811,6 +811,21 @@ impl Fs {
                 return true;
             }
             if result == Err(proto_fs::TOO_MANY_OPEN_FILES) {
+                if self
+                    .identities
+                    .get(fds.authority_index as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|identity| {
+                        ramfs::ordinary_loan::quota_deferred(
+                            fds,
+                            label,
+                            result,
+                            &Self::lineage(identity),
+                        )
+                    })
+                {
+                    return false;
+                }
                 let Some(who) = fds.binding.snapshot_ref() else {
                     return false;
                 };
@@ -1678,7 +1693,14 @@ impl Service<0> for Fs {
     }
 
     fn request_tail(&mut self, request: &mut Request<'_>) -> rt::service::TailProgress {
-        self.read_into_step(request)
+        if request
+            .loan()
+            .is_some_and(|words| ramfs::ordinary_loan::Loan::active(words))
+        {
+            rt::service::TailProgress::Reenter
+        } else {
+            self.read_into_step(request)
+        }
     }
 
     fn continuation_step(&mut self) -> bool {
@@ -1705,6 +1727,41 @@ impl Service<0> for Fs {
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        if r.loan()
+            .is_some_and(|words| ramfs::ordinary_loan::Loan::active(words))
+        {
+            return r
+                .with_loan(|r, words| self.ordinary_visit(s, r, words))
+                .expect("bounded ordinary journal");
+        }
+        if let Some((phase, current)) = self.ordinary_capture(&s.data, r)
+            && r.loan().is_some_and(|words| words[0] == 0)
+        {
+            let label = r.label();
+            let method = r.method();
+            let mut loan =
+                ramfs::ordinary_loan::Loan::new(r.loan().expect("bounded ordinary journal"));
+            loan.begin(&s.data, label, method, current);
+            loan.set_phase(phase);
+            if phase == ramfs::ordinary_loan::Phase::Fresh
+                && let Some(identity) = self
+                    .identities
+                    .get(s.data.authority_index as usize)
+                    .and_then(Option::as_ref)
+                && let Admission::Transport(transport) = &identity.admission
+                && transport.epoch != current
+            {
+                loan.target_next(transport.epoch);
+                loan.set_phase(ramfs::ordinary_loan::Phase::DrainFresh);
+            }
+            return Answer::Reply(Outgoing::new());
+        }
+        self.request_inner(s, r)
+    }
+}
+
+impl Fs {
+    fn request_inner(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
         if self.closing(s) && !s.data.claimed {
             let label = s.label();
             if let Some(birth) = self.births.iter_mut().find(|b| {
@@ -2563,6 +2620,17 @@ impl Fs {
     }
     /// One retained transport owner settles before any admission reset.
     fn transport_drain_step(&mut self, fds: &mut Fds) -> bool {
+        let query = Self::preserved_query(
+            self.identities,
+            fds,
+            self.identities
+                .get(fds.authority_index as usize)
+                .and_then(Option::as_ref)
+                .map_or(0, |identity| identity.label),
+        );
+        ramfs::ordinary_loan::with_query(fds, query, |fds| self.transport_drain_step_inner(fds))
+    }
+    fn transport_drain_step_inner(&mut self, fds: &mut Fds) -> bool {
         let Some(identity) = self
             .identities
             .get_mut(fds.authority_index as usize)
@@ -2616,6 +2684,20 @@ impl Fs {
 
     /// Failure records CPU state; subsequent visits settle every rejected owner.
     fn begin_binding_failure(&mut self, fds: &mut Fds, code: u32) {
+        let query = Self::preserved_query(
+            self.identities,
+            fds,
+            self.identities
+                .get(fds.authority_index as usize)
+                .and_then(Option::as_ref)
+                .map_or(0, |identity| identity.label),
+        );
+        ramfs::ordinary_loan::with_query(fds, query, |fds| {
+            self.begin_binding_failure_inner(fds, code)
+        })
+    }
+    fn begin_binding_failure_inner(&mut self, fds: &mut Fds, code: u32) {
+        self.binding_failure_wake();
         let i = fds.authority_index as usize;
         let Some(identity) = self.identities.get_mut(i).and_then(Option::as_mut) else {
             fds.binding = Binding::Cleanup;
@@ -2640,6 +2722,17 @@ impl Fs {
     }
 
     fn binding_finish_step(&mut self, fds: &mut Fds) -> Option<u32> {
+        let query = Self::preserved_query(
+            self.identities,
+            fds,
+            self.identities
+                .get(fds.authority_index as usize)
+                .and_then(Option::as_ref)
+                .map_or(0, |identity| identity.label),
+        );
+        ramfs::ordinary_loan::with_query(fds, query, |fds| self.binding_finish_step_inner(fds))
+    }
+    fn binding_finish_step_inner(&mut self, fds: &mut Fds) -> Option<u32> {
         let identity = self
             .identities
             .get_mut(fds.authority_index as usize)?
@@ -2755,7 +2848,23 @@ impl Fs {
     fn reject_binding(&mut self, fds: &mut Fds) -> u32 {
         self.fail_binding(fds, proto_fs::PERMISSION)
     }
+    fn binding_failure_wake(&mut self) {
+        self.maintenance
+            .wake_failure(&mut self.clone_wake, SESSIONS + BIRTHS);
+    }
     fn fail_binding(&mut self, fds: &mut Fds, code: u32) -> u32 {
+        let query = Self::preserved_query(
+            self.identities,
+            fds,
+            self.identities
+                .get(fds.authority_index as usize)
+                .and_then(Option::as_ref)
+                .map_or(0, |identity| identity.label),
+        );
+        ramfs::ordinary_loan::with_query(fds, query, |fds| self.fail_binding_inner(fds, code))
+    }
+    fn fail_binding_inner(&mut self, fds: &mut Fds, code: u32) -> u32 {
+        self.binding_failure_wake();
         if let Some(identity) = self
             .identities
             .get_mut(fds.authority_index as usize)
@@ -3188,8 +3297,44 @@ impl Fs {
         }
     }
 
+    fn lineage(identity: &IdentityChannel) -> ramfs::ordinary_loan::Lineage<'_, NotaryTransport> {
+        ramfs::ordinary_loan::Lineage {
+            label: identity.label,
+            original: &identity.original,
+            original_root: identity.original_root,
+            purpose: identity.purpose,
+            closing: identity.closing,
+            secondary_owners: identity.offered.is_some() || identity.previous.is_some(),
+            admission: &identity.admission,
+        }
+    }
+    fn preserved_query(
+        identities: &[Option<IdentityChannel>],
+        fds: &Fds,
+        label: u64,
+    ) -> Option<u32> {
+        let identity = identities.get(fds.authority_index as usize)?.as_ref()?;
+        ramfs::ordinary_loan::preserved_query(fds, label, &Self::lineage(identity))
+    }
     fn authenticate(&mut self, fds: &mut Fds, label: u64) -> Result<(), u32> {
-        Self::authenticate_fields(&mut self.ram, self.identities, fds, label)
+        let prepared = fds.binding_preparation.is_some();
+        let result = Self::authenticate_fields(&mut self.ram, self.identities, fds, label);
+        if self
+            .identities
+            .get(fds.authority_index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|identity| {
+                ramfs::ordinary_loan::refresh_started(
+                    prepared,
+                    fds,
+                    label,
+                    &Self::lineage(identity),
+                )
+            })
+        {
+            self.binding_failure_wake();
+        }
+        result
     }
     /// Borrow the paid old authority without advancing admission or refresh.
     fn failed_candidate_allowed(
@@ -3335,7 +3480,8 @@ impl Fs {
         if matches!(identity.admission, Admission::Transport(_)) {
             return Err(proto_fs::AUTHENTICATING);
         }
-        ram.begin_binding(fds)?;
+        let query = ramfs::ordinary_loan::preserved_query(fds, label, &Self::lineage(identity));
+        ramfs::ordinary_loan::begin_preserving(ram, fds, query)?;
         identity.admission = Admission::Unvouched;
         identity.audit.reset();
         identity.purpose = BindingPurpose::Refresh;
@@ -3621,6 +3767,18 @@ impl Fs {
         progress: &mut bool,
         protected: Option<u64>,
     ) -> u32 {
+        let query = Self::preserved_query(self.identities, fds, label);
+        ramfs::ordinary_loan::with_query(fds, query, |fds| {
+            self.binding_phase_inner(fds, label, progress, protected)
+        })
+    }
+    fn binding_phase_inner(
+        &mut self,
+        fds: &mut Fds,
+        label: u64,
+        progress: &mut bool,
+        protected: Option<u64>,
+    ) -> u32 {
         *progress = true;
         if let Some(result) = self.binding_finish_step(fds) {
             return result;
@@ -3833,16 +3991,28 @@ impl Fs {
                 }
                 RetainedSourcePhase::Authenticate => {
                     let source = &mut self.births[slot as usize].as_mut().unwrap().1;
+                    let prepared = source.binding_preparation.is_some();
                     let result =
                         Self::authenticate_fields(&mut self.ram, self.identities, source, label);
                     let valid = !matches!(source.binding, Binding::Cleanup);
-                    return if !valid {
-                        self.reject_binding(fds)
-                    } else {
-                        match result {
-                            Ok(()) | Err(proto_fs::AUTHENTICATING) => proto_fs::RESOLVING,
-                            Err(code) => self.fail_binding(fds, code),
-                        }
+                    let started = self
+                        .identities
+                        .get(source.authority_index as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|identity| {
+                            ramfs::ordinary_loan::refresh_started(
+                                prepared,
+                                source,
+                                label,
+                                &Self::lineage(identity),
+                            )
+                        });
+                    if started {
+                        self.binding_failure_wake();
+                    }
+                    return match ramfs::ordinary_loan::source_refresh_result(result, valid) {
+                        Ok(code) => code,
+                        Err(code) => self.fail_binding(fds, code),
                     };
                 }
                 RetainedSourcePhase::Ready => {}
@@ -5008,6 +5178,198 @@ impl Fs {
         {
             self.clone_wake = true;
         }
+    }
+}
+
+impl Fs {
+    /// Capture only a paid failed Candidate whose exact Active owner needs a new epoch.
+    fn ordinary_capture(
+        &self,
+        fds: &Fds,
+        request: &Request<'_>,
+    ) -> Option<(ramfs::ordinary_loan::Phase, u64)> {
+        if self.notary.is_none() || self.generations.is_none() || !request.handles.is_empty() {
+            return None;
+        }
+        let identity = self
+            .identities
+            .get(fds.authority_index as usize)?
+            .as_ref()?;
+        let who = fds.binding.snapshot_ref()?;
+        let failure = match &identity.admission {
+            Admission::Transport(transport) => {
+                transport.failed_original_outcome(identity.previous.is_some())
+            }
+            _ => None,
+        };
+        let current = generation(who.index as usize);
+        ramfs::ordinary_loan::capture_phase(
+            fds,
+            request.label(),
+            request.method(),
+            current,
+            &Self::lineage(identity),
+            failure,
+        )
+        .map(|phase| (phase, current))
+    }
+
+    /// One existing paid phase per visit; the current ingress owns every reply resource.
+    fn ordinary_visit(
+        &mut self,
+        session: &mut Session<Fds, 0>,
+        request: &mut Request<'_>,
+        words: &mut [u64; 11],
+    ) -> Answer {
+        let mut loan = ramfs::ordinary_loan::Loan::new(words);
+        rt::service::step_detail((0x6e_u64 << 56) | loan.phase() as u64);
+        let mut effects = OrdinaryEffects {
+            fs: self,
+            session,
+            request,
+        };
+        match loan.step(&mut effects) {
+            ramfs::ordinary_loan::Progress::Pending => Answer::Reply(Outgoing::new()),
+            ramfs::ordinary_loan::Progress::Status(code) => status(code),
+            ramfs::ordinary_loan::Progress::Reply(answer) => answer,
+        }
+    }
+}
+
+/// Borrowed adapter; the only ingress owners remain in CurrentRequest.
+struct OrdinaryEffects<'a, 'b> {
+    fs: &'a mut Fs,
+    session: &'a mut Session<Fds, 0>,
+    request: &'a mut Request<'b>,
+}
+const _: () = {
+    assert!(core::mem::size_of::<OrdinaryEffects<'_, '_>>() == 24);
+    assert!(core::mem::align_of::<OrdinaryEffects<'_, '_>>() == 8);
+};
+impl ramfs::ordinary_loan::Effects for OrdinaryEffects<'_, '_> {
+    type Reply = Answer;
+    fn fds(&self) -> &Fds {
+        &self.session.data
+    }
+    fn available(&self, loan: &ramfs::ordinary_loan::Loan<'_>) -> bool {
+        self.session.label() == self.request.label()
+            && loan.matches(
+                &self.session.data,
+                self.request.label(),
+                self.request.method(),
+            )
+            && self.fs.notary.is_some()
+            && self.fs.generations.is_some()
+            && self
+                .fs
+                .identities
+                .get(self.session.data.authority_index as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|identity| {
+                    identity.label == loan.label()
+                        && !identity.closing
+                        && identity.original_root == loan.root()
+                        && identity
+                            .original
+                            .snapshot_ref()
+                            .is_some_and(|who| loan.same_who(who))
+                })
+    }
+    fn current(&self) -> u64 {
+        generation(
+            self.session
+                .data
+                .binding
+                .snapshot_ref()
+                .expect("ordinary active authority")
+                .index as usize,
+        )
+    }
+    fn old_matches(&self, loan: &ramfs::ordinary_loan::Loan<'_>) -> bool {
+        self.fs.identities[self.session.data.authority_index as usize]
+            .as_ref()
+            .is_some_and(|identity| {
+                identity.purpose == BindingPurpose::Candidate
+                    && identity.original == self.session.data.binding
+                    && identity
+                        .original
+                        .snapshot_ref()
+                        .is_some_and(|who| who.generation == loan.old_epoch())
+            })
+    }
+    fn old_step(&mut self) {
+        self.fs.binding_phase(
+            &mut self.session.data,
+            self.request.label(),
+            &mut true,
+            Some(self.request.label()),
+        );
+    }
+    fn begin(&mut self, query: u32) -> Result<(), u32> {
+        ramfs::ordinary_loan::begin_preserving(
+            &mut self.fs.ram,
+            &mut self.session.data,
+            Some(query),
+        )?;
+        self.reset_fresh();
+        Ok(())
+    }
+    fn fresh_step(&mut self) -> u32 {
+        assert!(
+            self.fs.identities[self.session.data.authority_index as usize]
+                .as_ref()
+                .is_some_and(|identity| identity.purpose == BindingPurpose::Refresh),
+            "ordinary fresh purpose"
+        );
+        self.fs.binding_phase(
+            &mut self.session.data,
+            self.request.label(),
+            &mut true,
+            Some(self.request.label()),
+        )
+    }
+    fn has_transport(&self) -> bool {
+        matches!(
+            self.fs.identities[self.session.data.authority_index as usize]
+                .as_ref()
+                .unwrap()
+                .admission,
+            Admission::Transport(_)
+        )
+    }
+    fn drain_transport(&mut self) {
+        if self
+            .fs
+            .binding_finish_step(&mut self.session.data)
+            .is_none()
+        {
+            self.fs.transport_drain_step(&mut self.session.data);
+        }
+    }
+    fn reset_fresh(&mut self) {
+        assert!(!self.has_transport(), "ordinary settled transport");
+        let identity = self.fs.identities[self.session.data.authority_index as usize]
+            .as_mut()
+            .unwrap();
+        identity.admission = Admission::Unvouched;
+        identity.audit.reset();
+        identity.purpose = BindingPurpose::Refresh;
+        identity.original = self.session.data.binding;
+        identity.original_root = self.session.data.root;
+        identity.pending = false;
+    }
+    fn replay(&mut self) -> Answer {
+        assert!(self.request.handles.is_empty(), "ordinary retry ingress");
+        self.fs.request_inner(self.session, self.request)
+    }
+    fn authenticating(answer: &Answer) -> bool {
+        matches!(
+            answer,
+            Answer::Status(Status::Unknown(proto_fs::AUTHENTICATING))
+        )
+    }
+    fn restore(&mut self, query: u32) {
+        ramfs::ordinary_loan::restore_query(&mut self.session.data, Some(query));
     }
 }
 

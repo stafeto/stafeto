@@ -54,6 +54,22 @@ pub fn failed_candidate_allows(
             .is_some_and(|code| code != 0 && candidate.retained_failure == Some(code))
 }
 
+/// Stale recovery retains the same paid owner but grants no old-epoch authority.
+pub fn failed_candidate_stale(
+    fds: &crate::Fds,
+    label: u64,
+    current: u64,
+    candidate: FailedCandidate<'_>,
+) -> bool {
+    let Binding::Active(who) = candidate.original else {
+        return false;
+    };
+    current != 0
+        && current & proto_process::GENERATION_DEAD == 0
+        && current != who.generation
+        && failed_candidate_allows(fds, label, who.generation, candidate)
+}
+
 /// Ordinary work retains its own downstream authority and ownership checks.
 pub fn failed_candidate_method(method: u16) -> bool {
     use proto_fs::Method;

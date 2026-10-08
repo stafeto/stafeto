@@ -3520,3 +3520,5 @@ mod tests {
 pub mod capacity;
 
 pub mod read_into;
+
+pub mod ordinary_loan;
