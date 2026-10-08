@@ -20,8 +20,6 @@ mod channel;
 mod cleanup;
 mod init;
 mod interrupt;
-#[cfg(feature = "ipc-loss-probe")]
-mod ipc_loss_probe;
 mod irq;
 #[cfg(feature = "ktest")]
 mod ktest;
@@ -35,8 +33,6 @@ mod sched;
 mod session;
 mod syscall;
 mod testpoint;
-#[cfg(all(feature = "ipc-loss-probe", feature = "ktest"))]
-compile_error!("ipc-loss-probe uses a separate guest image");
 mod thread;
 mod timer;
 
