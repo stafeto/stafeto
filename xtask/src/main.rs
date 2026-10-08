@@ -3186,17 +3186,44 @@ const TERM_B: u64 = 20_410;
 const RAM_STEP_MAX: u64 = TERM_B;
 
 /// The steps of the process service that are longer than term B today,
-/// until step 5z splits them: (kind, name, the longest the measurement
-/// gave at 4e9abf5 with 4 branches of children (`ci`), and with any other
-/// number, which the 7 branches of the plain command bound). A step above
-/// its number fails `process-steps`; a step at or under B shows that its
-/// entry can go.
+/// until step 5z splits them: (kind, name, the limit with 4 branches of
+/// children (`process-steps 4`), the limit with 7 (`ci` and the plain
+/// command)). A step above its number fails `process-steps`; a step at or
+/// under B shows that its entry can go. Each number is the largest of
+/// four runs at e1-g2-steps (identical to the tick, since -icount is
+/// deterministic for one build; with 4 and 7 branches: Create 61,378 and
+/// 61,378, SpawnStart 92,323 and 92,556, ExecStart 51,039 and 50,833,
+/// ForkStart 53,737 and 54,153) plus NOISE_MARGIN. The margin covers what
+/// moves between builds: the layout of the code and the processes of the
+/// level above that run in the middle of a step (SpawnStart was 92,262 and
+/// 93,009 at 4e9abf5 and 92,369 at d7743c9 with the same source of the
+/// step).
 const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64, u64); 4] = [
-    (1, "Create", 61_398, 61_398),
-    (22, "SpawnStart", 92_262, 93_009),
-    (28, "ExecStart", 50_978, 51_030),
-    (34, "ForkStart", 54_369, 54_398),
+    (1, "Create", 61_378 + NOISE_MARGIN, 61_378 + NOISE_MARGIN),
+    (
+        22,
+        "SpawnStart",
+        92_323 + NOISE_MARGIN,
+        92_556 + NOISE_MARGIN,
+    ),
+    (
+        28,
+        "ExecStart",
+        51_039 + NOISE_MARGIN,
+        50_833 + NOISE_MARGIN,
+    ),
+    (
+        34,
+        "ForkStart",
+        53_737 + NOISE_MARGIN,
+        54_153 + NOISE_MARGIN,
+    ),
 ];
+
+/// The room the limits of PROCESS_STEPS_ABOVE_B leave over the largest
+/// measured step, in ticks: 1,200 is the noise the experts saw between
+/// builds, rounded up.
+const NOISE_MARGIN: u64 = 1_500;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
