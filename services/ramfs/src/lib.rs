@@ -261,6 +261,8 @@ pub struct Fds {
     pub claimed: bool,
     /// Irreversible revocation keeps every paid owner until settlement.
     pub closing: bool,
+    /// The last capability of this exact label has gone, independently of DEAD.
+    pub client_gone: bool,
     pub binding: authority::Binding,
     pub authority_index: u16,
     pub binding_preparation: Option<u16>,
@@ -287,8 +289,47 @@ pub struct Fds {
 impl Fds {
     /// Transfer the exact birth before deciding which request may proceed.
     pub fn claim_birth(&mut self, birth: Self) {
+        let client_gone = self.client_gone;
         *self = birth;
+        self.client_gone |= client_gone;
+        if self.client_gone {
+            self.closing = true;
+            self.binding = authority::Binding::Cleanup;
+        }
         self.claimed = true;
+    }
+
+    /// Transfer owners to a different label, retaining its old exact slot as a tombstone.
+    pub fn consume_birth(destination: &mut Self, source: &mut Self) {
+        let source_gone = source.client_gone;
+        let destination_gone = destination.client_gone;
+        let source_root = source.root;
+        core::mem::swap(destination, source);
+        destination.client_gone = destination_gone;
+        if destination_gone {
+            destination.closing = true;
+            destination.binding = authority::Binding::Cleanup;
+        }
+        // These are CPU aliases of the authority and source now held by destination.
+        source.authority_index = storage::NONE;
+        source.binding_source = None;
+        assert!(
+            Ram::references_released(source),
+            "consumed birth has no local owners"
+        );
+        #[cfg(feature = "auth-probe")]
+        {
+            assert!(source.auth_probe_gc.is_none() && source.auth_probe_gc_reservation.is_none());
+            source.auth_probe_hold = false;
+        }
+        source.claimed = true;
+        source.closing = true;
+        source.client_gone = source_gone;
+        source.binding = authority::Binding::Cleanup;
+        source.binding_outcome = None;
+        source.root = source_root;
+        source.open_receipts.fill(OpenReceipt::EMPTY);
+        source.open_watermarks.fill(0);
     }
 
     pub fn permits_method(&self, method: u16) -> bool {
@@ -303,6 +344,7 @@ impl Default for Fds {
             tentative: 0,
             claimed: false,
             closing: false,
+            client_gone: false,
             binding: authority::Binding::Unbound,
             authority_index: storage::NONE,
             binding_preparation: None,
@@ -2111,6 +2153,136 @@ mod tests {
             assert_eq!(ram.open_descriptions(), remaining);
         }
         assert!(Ram::released(&child));
+    }
+
+    #[test]
+    fn retained_label_live_duplicate_caps_keep_place_after_dead_and_window_debt() {
+        use crate::maintenance::{retained_release_step, retirement_ready};
+        use std::cell::Cell;
+        struct Send<'a>(&'a Cell<usize>, &'a Cell<bool>);
+        impl<'a> Send<'a> {
+            fn duplicate(&self) -> Send<'a> {
+                self.0.set(self.0.get() + 1);
+                Send(self.0, self.1)
+            }
+        }
+        impl Drop for Send<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+                if self.0.get() == 0 {
+                    self.1.set(true);
+                }
+            }
+        }
+        let places = crate::places::Places::new();
+        let label = places.issue_image(1).unwrap();
+        let live = Cell::new(1);
+        let notice = Cell::new(false);
+        let first = Send(&live, &notice);
+        let duplicate = first.duplicate();
+        let mut ram = Ram::default();
+        let root = storage::Root {
+            id: 900,
+            generation: 2,
+        };
+        let mut parent = Fds {
+            root,
+            ..Fds::default()
+        };
+        let fd = ram.open(&mut parent, "/etc/motd", READ_ONLY).unwrap();
+        let slot = parent.description(fd).unwrap();
+        let token = ram.token(ram.descriptions[slot].unwrap().open.file);
+        let mut image = Fds {
+            root,
+            closing: true,
+            binding: authority::Binding::Cleanup,
+            ..Fds::default()
+        };
+        let entry = ram.storage.node(token).unwrap().boot;
+        ram.hold_image(&mut image, token, entry).unwrap();
+        assert_eq!(ram.storage.usage(root).descriptions, 2);
+        assert!(retained_release_step(&mut ram, &mut image, label, None));
+        assert!(Ram::released(&image));
+        assert_eq!(ram.storage.usage(root).descriptions, 1);
+        assert!(!retirement_ready(&image, true));
+        assert_eq!(places.place(label), (label & 511) as usize);
+        drop(first);
+        image.client_gone = notice.get();
+        assert!(!retirement_ready(&image, true));
+        assert_eq!(live.get(), 1);
+        drop(duplicate);
+        image.client_gone = notice.get();
+        assert!(image.client_gone);
+        // A remaining exact Window debt still prohibits row reuse after CLIENT_GONE.
+        assert!(!retirement_ready(&image, false));
+        assert_eq!(places.place(label), (label & 511) as usize);
+        assert!(retirement_ready(&image, true));
+        places.release(label);
+        assert_eq!(places.place(label), crate::places::COUNT);
+        assert_eq!(ram.storage.usage(root).descriptions, 1);
+        assert!(ram.release_step(&mut parent));
+        assert_eq!(ram.storage.usage(root).descriptions, 0);
+    }
+
+    #[test]
+    fn retained_label_same_label_claim_preserves_both_gone_facts() {
+        for session_gone in [false, true] {
+            for birth_gone in [false, true] {
+                let mut session = Fds {
+                    client_gone: session_gone,
+                    ..Fds::default()
+                };
+                let birth = Fds {
+                    client_gone: birth_gone,
+                    ..Fds::default()
+                };
+                session.claim_birth(birth);
+                assert_eq!(session.client_gone, session_gone || birth_gone);
+                assert!(session.claimed);
+                if session.client_gone {
+                    assert!(session.closing);
+                    assert_eq!(session.binding, authority::Binding::Cleanup);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_label_distinct_transfer_keeps_exact_markers_and_no_second_release() {
+        for source_gone in [false, true] {
+            for destination_gone in [false, true] {
+                let mut ram = Ram::default();
+                let root = storage::Root {
+                    id: 901,
+                    generation: 3,
+                };
+                let mut source = Fds {
+                    root,
+                    client_gone: source_gone,
+                    ..Fds::default()
+                };
+                let fd = ram.open(&mut source, "/etc/motd", READ_ONLY).unwrap();
+                let mut destination = Fds {
+                    client_gone: destination_gone,
+                    authority_index: 31,
+                    binding_source: Some((13, 777)),
+                    ..Fds::default()
+                };
+                Fds::consume_birth(&mut destination, &mut source);
+                assert_eq!(destination.client_gone, destination_gone);
+                assert_eq!(source.client_gone, source_gone);
+                assert_eq!(source.root, root);
+                assert!(source.claimed && source.closing);
+                assert_eq!(source.binding, authority::Binding::Cleanup);
+                assert!(Ram::released(&source));
+                assert!(!ram.release_step(&mut source));
+                assert_eq!(ram.storage.usage(root).descriptions, 1);
+                let mut bytes = [0; 1];
+                assert_eq!(ram.read(&mut destination, fd, &mut bytes), Ok(1));
+                assert!(ram.release_step(&mut destination));
+                assert_eq!(ram.storage.usage(root).descriptions, 0);
+            }
+        }
     }
 
     #[test]

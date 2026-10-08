@@ -219,3 +219,8 @@ pub fn retained_release_step(
 pub fn source_protected(label: u64, active: Option<u64>, window: Option<u64>) -> bool {
     active == Some(label) || window == Some(label)
 }
+
+/// DEAD settles owners; only final CLIENT_GONE permits exact slot reuse.
+pub fn retirement_ready(fds: &crate::Fds, settled: bool) -> bool {
+    fds.closing && fds.client_gone && settled
+}

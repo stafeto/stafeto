@@ -1608,6 +1608,7 @@ impl Service<0> for Fs {
             s.data.claimed = true;
         }
         self.revoke_clone_owner(s.label());
+        s.data.client_gone = true;
         s.data.closing = true;
         s.data.binding = Binding::Cleanup;
         #[cfg(feature = "auth-probe")]
@@ -1645,6 +1646,7 @@ impl Service<0> for Fs {
             return;
         }
         if let Some((_, fds)) = self.births.iter_mut().flatten().find(|(l, _)| *l == label) {
+            fds.client_gone = true;
             fds.closing = true;
             fds.binding = Binding::Cleanup;
             #[cfg(feature = "auth-probe")]
@@ -1709,7 +1711,8 @@ impl Service<0> for Fs {
                 b.as_ref()
                     .is_some_and(|(l, data)| *l == label && matches!(data, BirthData::Ready(_)))
             }) {
-                s.data = birth.take().expect("exact retained birth").1.into_ready();
+                s.data
+                    .claim_birth(birth.take().expect("exact retained birth").1.into_ready());
             }
             s.data.claimed = true;
             s.data.closing = true;
@@ -3752,8 +3755,7 @@ impl Fs {
             source.claimed = true;
             source.binding_preparation = fds.binding_preparation.take();
             source.binding_source = None;
-            core::mem::swap(fds, &mut **source);
-            self.births[slot as usize] = None;
+            Fds::consume_birth(fds, source);
         }
         let binding = self.identities[fds.authority_index as usize]
             .as_mut()
@@ -4853,7 +4855,10 @@ impl Fs {
                 let label = s.label();
                 client_work = self.cleanup_step(&mut s.data, label, protected);
                 closing_visit = s.data.closing;
-                if s.data.closing && self.closed_terminal(&s.data, label) {
+                if ramfs::maintenance::retirement_ready(
+                    &s.data,
+                    self.closed_terminal(&s.data, label),
+                ) {
                     self.places.release(label);
                     self.clones.gone(label);
                     sessions[i] = None;
@@ -4876,7 +4881,7 @@ impl Fs {
             let mut fds = data.into_ready();
             client_work = self.cleanup_step(&mut fds, label, protected);
             closing_visit = fds.closing;
-            if fds.closing && self.closed_terminal(&fds, label) {
+            if ramfs::maintenance::retirement_ready(&fds, self.closed_terminal(&fds, label)) {
                 self.places.release(label);
                 self.clones.gone(label);
             } else {
