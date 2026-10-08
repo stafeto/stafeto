@@ -2758,14 +2758,17 @@ impl Fs {
                 | NotaryState::Back { outcome, .. }
                 | NotaryState::Reply { outcome, .. } => {
                     *outcome = code;
-                    return code;
+                    return ramfs::authority::capture_binding_failure(fds, code);
                 }
-                NotaryState::Rollback { outcome, .. } => return *outcome,
-                NotaryState::Commit => return code,
+                NotaryState::Rollback { outcome, .. } => {
+                    let code = *outcome;
+                    return ramfs::authority::capture_binding_failure(fds, code);
+                }
+                NotaryState::Commit => return ramfs::authority::capture_binding_failure(fds, code),
             }
         }
         self.begin_binding_failure(fds, code);
-        code
+        ramfs::authority::capture_binding_failure(fds, code)
     }
     /// Test setup queues real storage reclamation before releasing a live
     /// prepared binding to the unchanged alternating maintenance cursor.
@@ -3409,6 +3412,9 @@ impl Fs {
     fn finish_binding(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if !r.handles.is_empty() || r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
+        }
+        if let Some(code) = ramfs::authority::binding_reply(fds) {
+            return status(code);
         }
         if fds.binding_preparation.is_none() {
             return status(fds.binding_outcome.unwrap_or(proto_fs::PERMISSION));

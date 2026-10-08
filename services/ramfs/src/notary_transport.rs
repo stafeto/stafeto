@@ -518,6 +518,71 @@ mod tests {
     }
 
     #[test]
+    fn immediate_denial_repeats_during_failed_rollback_after_settlement_and_new_binding() {
+        use crate::authority::{binding_reply, capture_binding_failure};
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let mut fds = crate::Fds {
+            binding: crate::authority::Binding::Boot,
+            root: crate::storage::Root {
+                id: 900,
+                generation: 2,
+            },
+            ..crate::Fds::default()
+        };
+        ram.begin_binding(&mut fds).unwrap();
+        assert_eq!(ram.storage.preparations_used(), 1);
+        assert_eq!(
+            capture_binding_failure(&mut fds, proto_fs::PERMISSION),
+            proto_fs::PERMISSION
+        );
+        assert_eq!(binding_reply(&fds), Some(proto_fs::PERMISSION));
+        let _kernel = kernel(ResultKind::Wire);
+        let mut offered = Some(Cap::new(72));
+        let mut previous = None;
+        let mut transport = Transport::<Owned> {
+            epoch: 0,
+            state: State::Rollback {
+                rejected: Some(Cap::new(73)),
+                outcome: proto_fs::PERMISSION,
+            },
+        };
+        FAIL_CLOSE.with(|count| *count.borrow_mut() = 1);
+        let mut settled = false;
+        for _ in 0..6 {
+            assert_eq!(binding_reply(&fds), Some(proto_fs::PERMISSION));
+            assert_eq!(
+                ram.begin_binding(&mut fds),
+                Err(proto_fs::TOO_MANY_OPEN_FILES)
+            );
+            assert_eq!(binding_reply(&fds), Some(proto_fs::PERMISSION));
+            assert_eq!(ram.storage.preparations_used(), 1);
+            let before = CALLS.with(|calls| calls.borrow().len());
+            match finish(&mut transport, &mut offered, &mut previous).unwrap() {
+                Finish::Pending => {}
+                Finish::Rollback(code) => {
+                    ram.complete_binding(&mut fds, code);
+                    settled = true;
+                }
+                Finish::Commit => panic!(),
+            }
+            assert!(CALLS.with(|calls| calls.borrow().len()) - before <= 1);
+            if settled {
+                break;
+            }
+        }
+        assert!(settled);
+        assert_eq!(fds.binding, crate::authority::Binding::Boot);
+        assert_eq!(ram.storage.preparations_used(), 0);
+        assert_eq!(binding_reply(&fds), Some(proto_fs::PERMISSION));
+        ram.begin_binding(&mut fds).unwrap();
+        assert_eq!(binding_reply(&fds), None);
+        assert_eq!(ram.storage.preparations_used(), 1);
+        ram.complete_binding(&mut fds, 0);
+        assert_eq!(binding_reply(&fds), Some(0));
+        assert_eq!(ram.storage.preparations_used(), 0);
+    }
+
+    #[test]
     fn canonical_denial_returns_permission_before_retained_admission_is_reset() {
         let mut kernel = kernel(ResultKind::Denied);
         let mut admission = Admission::Unvouched;

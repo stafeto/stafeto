@@ -6,6 +6,19 @@
 use crate::storage::{Node, Root};
 use proto_process::{Credentials, Groups, WhoReply};
 
+/// A canonical failure stays queryable while its exact rollback owners settle.
+pub fn capture_binding_failure(fds: &mut crate::Fds, code: u32) -> u32 {
+    assert!(code != 0, "binding failure status");
+    fds.binding_outcome = Some(code);
+    code
+}
+
+/// A successful result is published only after the paid preparation is complete.
+pub fn binding_reply(fds: &crate::Fds) -> Option<u32> {
+    fds.binding_outcome
+        .filter(|code| *code != 0 || fds.binding_preparation.is_none())
+}
+
 /// A single paid receive advances one authentication phase.
 pub type Admission = AdmissionState<()>;
 
