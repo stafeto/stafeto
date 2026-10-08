@@ -1370,8 +1370,26 @@ unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
     if posix_sync::defer_entry() {
         return;
     }
+    // An entry that asked for nothing here (the other handler of the same
+    // entry, a request that another entry already served) returns with no
+    // call of the kernel and no lock.
+    if idle(own()) {
+        return;
+    }
     // SAFETY: the entry's frame.
     unsafe { deliver(native, true) };
+}
+
+/// Whether a delivery now would do nothing: no signal of the thread that its
+/// mask lets through, none of the process on the page (nor a stop or
+/// continue word), no stop by another thread, no deferred entry mark and no
+/// request of cancellation.
+fn idle(block: &Block) -> bool {
+    block.flags.load(Ordering::Relaxed) & flag::ENTRY_DEFERRED == 0
+        && !stopped_by_other()
+        && !threads::cancel::requested()
+        && process_pending() == 0
+        && thread_pending(block) & !block.mask.load(Ordering::SeqCst) == 0
 }
 
 /// Whether the next signal `take` would give has a handler with SA_SIGINFO.
@@ -1429,12 +1447,17 @@ fn take(block: &Block) -> Option<(i32, SigAction, Option<SigInfo>, u64)> {
 struct SignalPreparation {
     // Fields drop in order: settle local preparation before kernel Resume.
     local: posix_sync::DeliveryPreparation<'static>,
-    _kernel: upcall::DeferredEntry,
+    _kernel: Option<upcall::DeferredEntry>,
 }
 
 impl SignalPreparation {
-    fn begin() -> Self {
-        let deferred = upcall::defer_entries().expect("signal preparation deferral");
+    /// Inside an entry the kernel's mask keeps the next entry out: the
+    /// kernel masks the entry when it starts one and the layer masks it
+    /// again after each handler, so the kernel deferral (two calls) is
+    /// taken only outside an entry. `entered` says the caller is an entry.
+    fn begin(entered: bool) -> Self {
+        let deferred =
+            (!entered).then(|| upcall::defer_entries().expect("signal preparation deferral"));
         let block = own();
         Self {
             local: posix_sync::DeliveryPreparation::begin(block),
@@ -1442,7 +1465,7 @@ impl SignalPreparation {
         }
     }
 
-    fn settle_for_exit(self) -> upcall::DeferredEntry {
+    fn settle_for_exit(self) -> Option<upcall::DeferredEntry> {
         let Self { local, _kernel } = self;
         drop(local);
         _kernel
@@ -1454,7 +1477,7 @@ impl SignalPreparation {
 /// masks them on return. A null native frame requests a context-aware entry
 /// for SA_SIGINFO handlers.
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
-    let mut preparation = Some(SignalPreparation::begin());
+    let mut preparation = Some(SignalPreparation::begin(entered));
     let block = own();
     if stopped_by_other() {
         // Keep both forms of deferral through the parking effect.
@@ -1552,7 +1575,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }
-            preparation = Some(SignalPreparation::begin());
+            preparation = Some(SignalPreparation::begin(entered));
             block.handled.fetch_add(1, Ordering::SeqCst);
             // The callback may edit the return context. Preserve private native
             // metadata and let the kernel validate machine state on return.
@@ -1572,7 +1595,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }
-            preparation = Some(SignalPreparation::begin());
+            preparation = Some(SignalPreparation::begin(entered));
             block.handled.fetch_add(1, Ordering::SeqCst);
         }
         block.mask.store(restore_mask, Ordering::SeqCst);

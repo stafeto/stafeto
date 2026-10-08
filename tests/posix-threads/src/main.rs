@@ -44,6 +44,8 @@ mod clocks;
 #[cfg(not(feature = "cancel-input"))]
 mod credentials;
 #[cfg(not(feature = "cancel-input"))]
+mod entry_calls;
+#[cfg(not(feature = "cancel-input"))]
 mod futex;
 #[cfg(not(feature = "cancel-input"))]
 mod heap_lock;
@@ -508,6 +510,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !signals::run()
         || !signal_context::run()
         || !native_jump::run()
+        || !entry_calls::run()
         || !signal_wait::run()
         || !cancellation::run()
     {
