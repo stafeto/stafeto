@@ -751,9 +751,20 @@ fn set_floating(environment: u64) {
 }
 
 /// The calling thread leaves: every signal masked, cancellation disabled,
-/// so no handler runs past its destructors.
+/// so no handler runs past its destructors. Its place in the routing of the
+/// process's signals goes in this order (spec 2, 3.3):
+/// 1. every signal of the thread blocked;
+/// 2. the process signals it took go back to the page;
+/// 3. under TABLE_LOCK the thread marks itself as leaving (EXITING) and
+///    learns whether it was the router and whether any thread remains;
+/// 4. a router takes ROUTER_LOCK, chooses its successor under TABLE_LOCK
+///    and tells the process service (Router) outside TABLE_LOCK;
+/// 5. the thread ends (ThreadExit), or the process does with the last one.
 pub fn leaving() {
     let block = crate::threads::own_block();
+    // This path hands the role over itself: the exit hook of a native
+    // thread has nothing left to do.
+    rt::upcall::set_exit_hook(None);
     // Native deferral survives libc retval publication/release until ThreadExit.
     // Managed exit preserves its existing interruptible cleanup path.
     if !exit_intent::hold_native(
@@ -772,6 +783,26 @@ pub fn leaving() {
     ) {
         sys::process_exit(127);
     }
+    block_signals(block);
+    #[cfg(feature = "thread-probe")]
+    crate::signals::probe_queue_native_primary_after_intent(block);
+    let own = current();
+    if let Some(owner) = owner_token(own) {
+        detach_open_owner(owner);
+    }
+    crate::signals::leaving();
+    if !leave_table(own) {
+        // No other thread lives: the process ends as exit(0) ends it
+        // (POSIX: the last thread's pthread_exit), atexit handlers and
+        // stdio included.
+        // SAFETY: relibc's exit, with its atexit handlers and stdio.
+        unsafe { exit(0) }
+    }
+}
+
+/// Step 1 of the way out: every signal that can be blocked, and
+/// cancellation disabled; EXITING is the thread's mark as leaving.
+fn block_signals(block: &Block) {
     block.mask.store(
         posix_signals::VALID & !posix_signals::UNBLOCKABLE,
         Ordering::SeqCst,
@@ -779,47 +810,183 @@ pub fn leaving() {
     block
         .flags
         .fetch_or(flag::EXITING | flag::CANCEL_DISABLED, Ordering::SeqCst);
-    #[cfg(feature = "thread-probe")]
-    crate::signals::probe_queue_native_primary_after_intent(block);
-    // The process signals this thread took go back to the page; the router
-    // of the process's signals, if it was this thread, is the next live
-    // one; with none left the process ends as exit(0) ends it (POSIX: the
-    // last thread's pthread_exit), atexit handlers and stdio included.
-    let own = current();
-    if let Some(owner) = owner_token(own) {
-        detach_open_owner(owner);
-    }
-    // A thread that left is LIVE until its place goes (the main thread's
-    // never does); its block says EXITING from `leaving` on.
-    let guard = TABLE_LOCK.lock();
-    let next = TABLE.iter().enumerate().find(|(index, place)| {
-        index + 1 != own as usize
-            && place.state.flags() & (LIVE | EXITED) == LIVE
-            && !sys::thread_info(&borrowed::<Thread>(place.native.load(Ordering::Acquire))).is_ok_and(|i| i.state == ThreadState::Ended)
-            // SAFETY: a LIVE place's block lives until the place goes, and
-            // only `collect` frees a place, under the lock, after EXITED.
-            && unsafe { (place.block.load(Ordering::Acquire) as *const Block).as_ref() }
-                .is_some_and(|b| b.flags.load(Ordering::SeqCst) & flag::EXITING == 0)
-    });
-    let Some((index, place)) = next else {
-        drop(guard);
-        // SAFETY: relibc's exit, with its atexit handlers and stdio.
-        unsafe { exit(0) }
+}
+
+/// Steps 3 and 4 for thread `own`, past step 2; false when no other thread
+/// lives (the caller ends the process).
+fn leave_table(own: u64) -> bool {
+    let (was_router, others) = {
+        let _table = TABLE_LOCK.lock();
+        #[cfg(feature = "thread-probe")]
+        let _held = TableHeld::new(own);
+        // A leaving thread is LIVE until its place goes (the main thread's
+        // never does); its block says EXITING from here on and no choice of
+        // a router takes it.
+        if let Some(block) = usize::try_from(own)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+            .and_then(|index| TABLE.get(index))
+            .and_then(|place| {
+                // SAFETY: a LIVE place's block lives until the place goes,
+                // and only `collect` frees a place, under this lock.
+                unsafe { (place.block.load(Ordering::Acquire) as *const Block).as_ref() }
+            })
+        {
+            block.flags.fetch_or(flag::EXITING, Ordering::SeqCst);
+        }
+        (
+            ROUTER.load(Ordering::Acquire) == own,
+            successor(own).is_some(),
+        )
     };
-    if ROUTER.load(Ordering::Acquire) == own {
+    #[cfg(feature = "thread-probe")]
+    probe_marked(own);
+    if !others {
+        return false;
+    }
+    if was_router {
+        hand_over(own);
+    }
+    true
+}
+
+/// The router `own` leaves: the next thread of the process routes its
+/// signals. The handoffs of leaving routers go one at a time under
+/// ROUTER_LOCK, each choosing its successor under it, so the last message
+/// the service gets names a thread that does not leave. The service is
+/// told outside TABLE_LOCK.
+fn hand_over(own: u64) {
+    let _order = ROUTER_LOCK.lock();
+    let copy = {
+        let _table = TABLE_LOCK.lock();
+        #[cfg(feature = "thread-probe")]
+        let _held = TableHeld::new(own);
+        // Only a router passes the role on; this one still is, since the
+        // role leaves a thread only through this function.
+        if ROUTER.load(Ordering::Acquire) != own {
+            return;
+        }
+        let Some(index) = successor(own) else {
+            return;
+        };
         ROUTER.store(index as u64 + 1, Ordering::Release);
-        let native = borrowed::<Thread>(place.native.load(Ordering::Relaxed));
-        if place.stack.load(Ordering::Acquire) != 1 {
-            let _ = crate::process::register_router(&native);
+        let native = borrowed::<Thread>(TABLE[index].native.load(Ordering::Acquire));
+        crate::process::router_copy(&native)
+    };
+    if let Ok(copy) = copy {
+        let _ = crate::process::send_router(copy);
+    }
+}
+
+/// The thread that takes the routing of the process's signals once `own`
+/// leaves, as the index of its place: a thread of the layer (the main thread
+/// or a pthread) of the highest base level, the first in the table among
+/// equals; a native thread of a program only when no thread of the layer
+/// lives. A thread that marked itself as leaving is no choice. The caller
+/// holds TABLE_LOCK; the choice reads at most 64 places and calls no
+/// kernel.
+fn successor(own: u64) -> Option<usize> {
+    let mut best: Option<(usize, (bool, u32))> = None;
+    for (index, place) in TABLE.iter().enumerate() {
+        if index as u64 + 1 == own || place.state.flags() & (LIVE | EXITED) != LIVE {
+            continue;
+        }
+        // SAFETY: a LIVE place's block lives until the place goes, and only
+        // `collect` frees a place, under TABLE_LOCK, after EXITED.
+        let Some(block) =
+            (unsafe { (place.block.load(Ordering::Acquire) as *const Block).as_ref() })
+        else {
+            continue;
+        };
+        if block.flags.load(Ordering::SeqCst) & flag::EXITING != 0 {
+            continue;
+        }
+        let key = (
+            place.stack.load(Ordering::Acquire) == 1,
+            u32::MAX - block.base_level.load(Ordering::Relaxed),
+        );
+        if best.is_none_or(|(_, kept)| key < kept) {
+            best = Some((index, key));
         }
     }
-    drop(guard);
-    crate::signals::leaving();
+    best.map(|(index, _)| index)
+}
+
+/// The exit hook of a native thread (`rt::upcall::set_exit_hook`), run by
+/// `rt::sys::thread_exit` before its call: the way out of `leaving`, steps
+/// 1 to 4, for a thread that ends past the library. When no other thread
+/// lives the kernel ends the process with the thread.
+pub(crate) fn exit_hook() {
+    crate::tls::with_process(|| {
+        let block = crate::threads::own_block();
+        let own = block.thread_id;
+        if own == 0 || block.flags.load(Ordering::SeqCst) & flag::EXITING != 0 {
+            return;
+        }
+        block_signals(block);
+        crate::signals::leaving();
+        leave_table(own);
+    });
 }
 
 /// The number of the thread that routes the process's signals: the main
-/// thread first (`leaving`).
+/// thread first (`leave_table`).
 static ROUTER: AtomicU64 = AtomicU64::new(1);
+
+/// Orders the handoffs of the router role (`hand_over`). It lifts no
+/// holder: a leaving thread holds it across one exchange with the process
+/// service, and the holders of the table never wait for it.
+static ROUTER_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::new();
+
+/// The number of the thread that holds TABLE_LOCK on its way out, for the
+/// probes: the process service is never asked under the lock.
+#[cfg(feature = "thread-probe")]
+static TABLE_HELD: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "thread-probe")]
+struct TableHeld;
+
+#[cfg(feature = "thread-probe")]
+impl TableHeld {
+    fn new(own: u64) -> Self {
+        TABLE_HELD.store(own, Ordering::SeqCst);
+        TableHeld
+    }
+}
+
+#[cfg(feature = "thread-probe")]
+impl Drop for TableHeld {
+    fn drop(&mut self) {
+        TABLE_HELD.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Whether the calling thread is on its way out and holds TABLE_LOCK.
+#[cfg(feature = "thread-probe")]
+pub(crate) fn probe_table_held_by_caller() -> bool {
+    let held = TABLE_HELD.load(Ordering::SeqCst);
+    held != 0 && held == current()
+}
+
+/// A hook that runs in `leaving` once the thread marked itself as leaving,
+/// before it passes the role on: the guest probes hold a thread there.
+#[cfg(feature = "thread-probe")]
+static PROBE_MARKED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "thread-probe")]
+pub fn probe_marked_hook(hook: Option<fn(u64)>) {
+    PROBE_MARKED.store(hook.map_or(0, |f| f as usize), Ordering::Release);
+}
+
+#[cfg(feature = "thread-probe")]
+fn probe_marked(own: u64) {
+    let hook = PROBE_MARKED.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `probe_marked_hook` stores a `fn(u64)`.
+        let hook: fn(u64) = unsafe { core::mem::transmute(hook) };
+        hook(own);
+    }
+}
 
 unsafe extern "C" {
     /// relibc's exit.

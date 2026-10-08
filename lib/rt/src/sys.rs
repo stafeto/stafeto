@@ -519,27 +519,19 @@ pub fn self_thread() -> Result<Handle<Thread>, Error> {
     Ok(returned(&x))
 }
 
-/// One owned MANAGE capability of this actual calling thread.
-/// The capability permits current-thread control and has no DUPLICATE or TRANSFER.
-pub fn self_thread_managed() -> Result<Handle<Thread>, Error> {
+/// One owned MANAGE | DUPLICATE | TRANSFER capability of this actual
+/// calling thread: the rights the creator of a thread has on it, so that the
+/// thread's role can be copied to another process's service.
+pub fn self_thread_shared() -> Result<Handle<Thread>, Error> {
     let x = call::<{ Call::ObjectInfo.number() }>(&[
         0,
         abi::INFO_THREAD_SELF,
-        u64::from(Rights::MANAGE.0),
+        u64::from((Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER).0),
     ])?;
     if x[1] == 0 {
         return Err(Error::InvalidArgs);
     }
     Ok(returned(&x))
-}
-
-/// Request an explicitly published resident Layer of this MANAGE Process.
-pub fn process_layer_request(process: &Handle<Process>) -> Result<(), Error> {
-    call::<{ Call::ThreadUpcallControl.number() }>(&[
-        abi::UpcallControl::ProcessLayerRequest.raw(),
-        process.raw().0,
-    ])?;
-    Ok(())
 }
 
 /// Kernel object comparison with this caller; raw handle equality is insufficient.

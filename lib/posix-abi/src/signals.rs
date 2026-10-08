@@ -12,7 +12,8 @@
 //!
 //! Signals sent to the process (kill) wait on the page of the process's
 //! record, where the process service sets their bits and asks for the
-//! entry of the router, the main thread (spec 2, 3.3). The thread that
+//! entry of the router: the main thread first, then the thread a leaving
+//! router names (`relibc::leaving`; spec 2, 3.3). The thread that
 //! takes one is chosen late, when a thread looks at the page (`route`):
 //! one in sigwait for that signal, else the first in the table of threads
 //! whose mask lets it through; with none the signal stays on the page, and
@@ -1306,7 +1307,6 @@ pub(crate) fn attach() -> Result<(), i32> {
     // SAFETY: the dispatcher holds no interrupted Rust references or locks
     // and enters only caller-supplied C code.
     unsafe { upcall::bind(entry) }.map_err(|_| EIO)?;
-    unsafe { upcall::primary_layer_ready(true) }.map_err(|_| EIO)?;
     own().flags.fetch_or(flag::SIGNALS_READY, Ordering::SeqCst);
     unsafe { upcall::enable() }.map_err(|_| EIO)?;
     // A thread whose start ends while another stops the process parks
@@ -1325,7 +1325,7 @@ pub(crate) fn attach() -> Result<(), i32> {
 /// The page names the thread's TCB, and its ABI word is the TLS of the
 /// handler.
 /// Makes the next attachment of a native thread fail after its handler is
-/// bound and its role published, for the guest probes.
+/// bound, for the guest probes.
 #[cfg(feature = "thread-probe")]
 pub fn probe_fail_next_attach() {
     PROBE_FAIL_ATTACH.store(true, Ordering::SeqCst);
@@ -1339,23 +1339,22 @@ pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
     let owns_mask = unsafe { upcall::bind_resident(entry, page as usize) }.map_err(|_| EIO)?;
     // The layer lets entries in only when it bound the first handler of the
     // thread: a handler the program bound before keeps the program's mask.
-    // A failed step removes the role and the handler before bootstrap cleanup.
-    let published = unsafe { upcall::primary_layer_ready(true) };
-    let mut result = published;
+    // A failed step removes the handler before bootstrap cleanup.
+    let mut result: Result<(), Error> = Ok(());
     #[cfg(feature = "thread-probe")]
-    if result.is_ok() && PROBE_FAIL_ATTACH.swap(false, Ordering::SeqCst) {
+    if PROBE_FAIL_ATTACH.swap(false, Ordering::SeqCst) {
         result = Err(Error::BadState);
     }
     if result.is_ok() && owns_mask {
         result = unsafe { upcall::enable() }.map(|_| ());
     }
     if result.is_err() {
-        if published.is_ok() {
-            unsafe { upcall::primary_layer_ready(false) }.expect("bootstrap role rollback");
-        }
         upcall::unbind_resident().expect("bootstrap resident rollback");
         return Err(EIO);
     }
+    // The thread ends through `rt::sys::thread_exit` without the library:
+    // its way out of the routing of the process's signals runs there.
+    upcall::set_exit_hook(Some(crate::relibc::exit_hook));
     // SAFETY: the page's ABI word points to its complete freshly built TCB.
     let tcb = unsafe { *page.cast::<*mut posix_thread::Tcb>() };
     unsafe {

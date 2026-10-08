@@ -90,7 +90,7 @@ pub(crate) fn end_scope(block: &Block) {
 /// TABLE_LOCK and common entry deferral cover every resource insertion.
 /// Each successful SVC moves its exact owner into this prepaid MAKING row.
 fn populate(place: &Place, index: usize) -> Result<*mut u8, i32> {
-    let native = sys::self_thread_managed().map_err(|_| EAGAIN)?;
+    let native = sys::self_thread_shared().map_err(|_| EAGAIN)?;
     let raw = native.into_raw().0;
     place.native.store(raw, Ordering::Release);
     let info = sys::thread_info(&borrowed::<Thread>(raw)).map_err(|_| EIO)?;

@@ -192,29 +192,6 @@ pub fn unbind_resident() -> Result<(), Error> {
     mask_if_empty()
 }
 
-/// Publish or remove this current thread's primary Layer role.
-/// # Safety
-/// While published, its dispatcher and all layer metadata remain resident
-/// until Thread End or explicit role removal.
-pub unsafe fn primary_layer_ready(ready: bool) -> Result<(), Error> {
-    // SAFETY: current-only metadata publication uses no user pointer.
-    let result = unsafe {
-        sys::raw::<{ Call::ThreadUpcallControl.number() }>([
-            UpcallControl::PrimaryLayerReady.raw(),
-            u64::from(ready),
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ])
-    };
-    Error::from_code(result[0]).map_or(Ok(()), Err)
-}
-
 /// Stop entries until enable, for both handlers; returns whether they were
 /// already masked.
 pub fn mask() -> Result<bool, Error> {
