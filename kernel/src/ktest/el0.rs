@@ -181,6 +181,15 @@ const ROUNDS: u64 = 1000;
 /// deadline: 7 portions of firings (kcore::timer::FIRE_PORTION), and more
 /// than one process pays for them (abi::MAX_TIMERS).
 const BATCHED: usize = 100;
+/// The deadline of the timers of `expired_timers_fire_in_portions_of_their_level`
+/// and how long its spinner runs. Under TCG with no -icount the counter is
+/// the host's, and a host that holds QEMU's thread off its CPU across the
+/// deadline and the spinner's end lets the spinner finish before the
+/// interrupt comes (the race of `start_timer_latency`): the spinner runs
+/// 50 ms past the deadline, five quanta of a busy host's scheduler. The
+/// deadline leaves room to arm the last timer.
+const FIRING_DEADLINE_NS: u64 = 5_000_000;
+const FIRING_SPIN_NS: u64 = FIRING_DEADLINE_NS + 50_000_000;
 /// Pages of the memory object of `memory_object_goes_in_portions`: 64 MiB.
 const BIG_OBJECT: usize = 16384;
 /// Pages of the memory object of `long_call_yields_to_a_pending_interrupt`,
@@ -2913,8 +2922,9 @@ fn done_timer_latency(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 }
 
 /// BATCHED timers of programs of level PRIORITY on one channel, which two
-/// processes pay for, all for one deadline 1 ms from the start, while a
-/// FIFO thread in slot 0 spins at EL0 for 2 ms at that level. The one
+/// processes pay for, all for one deadline FIRING_DEADLINE_NS from the
+/// start, while a FIFO thread in slot 0 spins at EL0 for FIRING_SPIN_NS at
+/// that level. The one
 /// interrupt takes no timer off: it queues the firing of the level, which
 /// comes before the spinner of its level and takes FIRE_PORTION timers a
 /// portion, 7 portions in a row, with no other interrupt, and none pending
@@ -2933,7 +2943,7 @@ fn start_firing(f: &mut Fixture) -> Result<(), &'static str> {
     )?;
     set_args(
         spin,
-        &[DATA_VA as u64, timer::clock().ns_to_ticks(2_000_000)],
+        &[DATA_VA as u64, timer::clock().ns_to_ticks(FIRING_SPIN_NS)],
     );
     judge(f, 1)?;
     let payers = [own, f.processes[1].expect("the judge's process")];
@@ -2945,7 +2955,7 @@ fn start_firing(f: &mut Fixture) -> Result<(), &'static str> {
     });
     // The deadline comes once every timer is made, so that it is still
     // ahead when the last one is armed.
-    let at = timer::clock().deadline_after(timer::now(), 1_000_000);
+    let at = timer::clock().deadline_after(timer::now(), FIRING_DEADLINE_NS);
     let made = made.and_then(|()| {
         f.timers
             .iter()
