@@ -411,6 +411,8 @@ pub fn occupied() -> usize {
 /// Frees what the threads that ended and were released held: their TCB,
 /// stack and handles; drains the exit channel.
 pub fn collect() -> bool {
+    #[cfg(feature = "thread-probe")]
+    probe_router_ended();
     let mut deferred = false;
     let exits = EXITS.load(Ordering::Acquire);
     if exits != 0 {
@@ -845,7 +847,7 @@ fn leave_table(own: u64) -> bool {
         return false;
     }
     if was_router {
-        hand_over(own);
+        hand_over(own, true);
     }
     true
 }
@@ -854,8 +856,9 @@ fn leave_table(own: u64) -> bool {
 /// signals. The handoffs of leaving routers go one at a time under
 /// ROUTER_LOCK, each choosing its successor under it, so the last message
 /// the service gets names a thread that does not leave. The service is
-/// told outside TABLE_LOCK.
-fn hand_over(own: u64) {
+/// told outside TABLE_LOCK. `leaving` is true when the caller is the leaving
+/// thread itself and false when another thread acts for a thread that ended.
+fn hand_over(own: u64, leaving: bool) {
     let _order = ROUTER_LOCK.lock();
     let copy = {
         let _table = TABLE_LOCK.lock();
@@ -874,6 +877,14 @@ fn hand_over(own: u64) {
         crate::process::router_copy(&native)
     };
     if let Ok(copy) = copy {
+        // The calling thread is the one that leaves: no entry has anything
+        // to deliver to it. A request of its entry (the service asks for it
+        // when a signal comes) would interrupt this exchange, also under a
+        // deferral of entries, and the handoff would be lost; the mask of
+        // the kernel keeps the exchange whole.
+        if leaving {
+            let _ = rt::upcall::mask();
+        }
         let _ = crate::process::send_router(copy);
     }
 }
@@ -966,6 +977,42 @@ impl Drop for TableHeld {
 pub(crate) fn probe_table_held_by_caller() -> bool {
     let held = TABLE_HELD.load(Ordering::SeqCst);
     held != 0 && held == current()
+}
+
+/// A router whose thread ended past `rt` without the exit hook never named
+/// its successor to the process service: the signals of the process wait on
+/// the page for a thread that looks at it. The probe build says so and
+/// passes the role on in the name of the thread that ended.
+#[cfg(feature = "thread-probe")]
+fn probe_router_ended() {
+    let router = ROUTER.load(Ordering::Acquire);
+    let Some(place) = usize::try_from(router)
+        .ok()
+        .and_then(|id| id.checked_sub(1))
+        .and_then(|index| TABLE.get(index))
+    else {
+        return;
+    };
+    {
+        let _table = TABLE_LOCK.lock();
+        // SAFETY: a LIVE place's block lives until the place goes, and only
+        // `collect` frees a place, under this lock.
+        let Some(block) =
+            (unsafe { (place.block.load(Ordering::Acquire) as *const Block).as_ref() })
+        else {
+            return;
+        };
+        if place.state.flags() & LIVE == 0
+            || block.flags.load(Ordering::SeqCst) & flag::EXITING != 0
+            || !sys::thread_info(&borrowed::<Thread>(place.native.load(Ordering::Acquire)))
+                .is_ok_and(|info| info.state == ThreadState::Ended)
+        {
+            return;
+        }
+        block.flags.fetch_or(flag::EXITING, Ordering::SeqCst);
+    }
+    rt::println!("router ended without handoff");
+    hand_over(router, false);
 }
 
 /// A hook that runs in `leaving` once the thread marked itself as leaving,
