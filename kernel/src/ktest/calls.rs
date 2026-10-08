@@ -2522,208 +2522,55 @@ fn with_interrupt_pending(
     result
 }
 
-/// Current-only roles retain the surviving lane and forward a direct Thread End.
-pub fn process_layer_roles_survive_partial_unbind_and_native_end(
+/// The numbers 5 to 12 of thread_upcall_control left in epoch 2: each is
+/// INVALID_ARGS whatever its arguments, and the entry state stays as it was
+/// (enabled, a request pending, no entry taken).
+pub fn upcall_operations_5_to_12_are_invalid_and_change_nothing(
     _: &Boot,
 ) -> Result<(), &'static str> {
-    let baseline = (thread::in_use(), channel::in_use());
-    let result = with_caller(|c| {
+    with_caller(|c| {
         use abi::UpcallControl as C;
-        let managed = c.insert(Object::Process(c.process), Rights::MANAGE)?;
-        let plain = c.insert(Object::Process(c.process), Rights::NONE)?;
-        let wrong = c.insert(Object::Thread(c.thread), Rights::MANAGE)?;
-        let mut extra = None;
-        let result = (|| {
-            thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no main buffer")?;
-            thread::start(c.thread).map_err(|_| "no main start")?;
-            let control = Call::ThreadUpcallControl.number();
-            c.fails(
-                control,
-                &[C::ProcessLayerRequest.raw(), managed.0],
-                Error::BadState,
-            )?;
-            c.fails(
-                control,
-                &[C::ProcessLayerRequest.raw(), plain.0],
-                Error::AccessDenied,
-            )?;
-            c.fails(
-                control,
-                &[C::ProcessLayerRequest.raw(), wrong.0],
-                Error::WrongType,
-            )?;
-            c.fails(
-                control,
-                &[C::ProcessLayerRequest.raw(), 0],
-                Error::BadHandle,
-            )?;
-            c.fails(
-                control,
-                &[C::PrimaryLayerReady.raw(), 2],
-                Error::InvalidArgs,
-            )?;
-            c.fails(control, &[C::PrimaryLayerReady.raw(), 1], Error::BadState)?;
-            c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
-            c.succeeds(control, &[C::PrimaryLayerReady.raw(), 1], &[])?;
-            c.succeeds(
-                control,
-                &[C::ObserverBind.raw(), (USER_VA + PAGE) as u64, 0x8000],
-                &[],
-            )?;
-            c.succeeds(control, &[C::Enable.raw()], &[1, 0, 0])?;
-            c.succeeds(control, &[C::ObserverEnable.raw()], &[1, 0, 0])?;
-            c.succeeds(control, &[C::ProcessLayerRequest.raw(), managed.0], &[])?;
-            // SAFETY: every supplied Thread is held by the fixture; no EL0
-            // code runs, and each synchronous dispatch finishes before this access.
-            let entry = |t: NonNull<Thread>| unsafe {
-                (*t.as_ptr()).upcall.prepare_with_tls(0x4000, 0, 0, false)
-            };
-            let returned = |t: NonNull<Thread>, observer: bool| -> Result<(), &'static str> {
-                // SAFETY: the fixture holds `t` and does not execute its user
-                // code; this local State borrow ends before the next dispatch.
-                let state = unsafe { &mut (*t.as_ptr()).upcall };
-                state
-                    .control(if observer { 7 } else { 2 })
-                    .map_err(|_| "no take")?;
-                state.returned().map_err(|_| "no return")
-            };
-            check(
-                entry(c.thread).is_some_and(|e| e.pc == USER_VA as u64 && e.tls.is_none()),
-                "unpublished observer stole primary role",
-            )?;
-            returned(c.thread, false)?;
-            c.succeeds(control, &[C::ObserverLayerReady.raw(), 1], &[])?;
-            check(
-                entry(c.thread).is_some_and(|e| e.tls == Some(0x8000)),
-                "published observer not preferred",
-            )?;
-            returned(c.thread, true)?;
-            c.succeeds(control, &[C::ProcessLayerRequest.raw(), managed.0], &[])?;
-            c.succeeds(control, &[C::ObserverBind.raw(), 0, 0], &[])?;
-            check(
-                entry(c.thread).is_some_and(|e| e.tls.is_none()),
-                "same head lost pending on observer unbind",
-            )?;
-            returned(c.thread, false)?;
-            c.succeeds(
-                control,
-                &[C::ObserverBind.raw(), (USER_VA + PAGE) as u64, 0x8000],
-                &[],
-            )?;
-            c.succeeds(control, &[C::ObserverLayerReady.raw(), 1], &[])?;
-            c.succeeds(control, &[C::PrimaryLayerReady.raw(), 0], &[])?;
-            c.succeeds(Call::ThreadUpcallBind.number(), &[0], &[])?;
-            c.succeeds(control, &[C::ObserverEnable.raw()], &[1, 0, 0])?;
-            check(
-                entry(c.thread).is_some_and(|e| e.tls == Some(0x8000)),
-                "primary removal lost observer",
-            )?;
-            returned(c.thread, true)?;
-            c.succeeds(control, &[C::ObserverLayerReady.raw(), 0], &[])?;
-            c.fails(
-                control,
-                &[C::ProcessLayerRequest.raw(), managed.0],
-                Error::BadState,
-            )?;
-            c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
-            c.succeeds(control, &[C::PrimaryLayerReady.raw(), 1], &[])?;
-            c.succeeds(control, &[C::Enable.raw()], &[1, 0, 0])?;
-            check(entry(c.thread).is_some(), "no survivor initial entry")?;
-            returned(c.thread, false)?;
-            let native = thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo)
-                .map_err(|_| "no native")?;
-            extra = Some(native);
-            thread::give_buffer(native, BUFFER as usize + PAGE).map_err(|_| "no native buffer")?;
-            thread::start(native).map_err(|_| "no native start")?;
-            let queued = owned_channel(c.process)?;
-            // The queued send is made by the scheduler's actual running sender.
-            // SAFETY: the scheduler lock protects its queues; start retained
-            // their Threads, and the fixture also holds both creation references.
-            let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
-            check(
-                matches!(picked, kcore::sched::Decision::Run(t) if t == c.thread),
-                "survivor was not picked",
-            )?;
-            check(
-                channel::send(
-                    c.thread,
-                    Via::Channel(queued),
-                    Desc::from_send(0).expect("empty send"),
-                    &[],
-                ) == Ok(None),
-                "survivor did not queue its send",
-            )?;
-            let other = Caller {
-                process: c.process,
-                thread: native,
-            };
-            other.succeeds(
-                control,
-                &[C::ObserverBind.raw(), (USER_VA + PAGE) as u64, 0x9000],
-                &[],
-            )?;
-            other.succeeds(control, &[C::ObserverLayerReady.raw(), 1], &[])?;
-            check(
-                // SAFETY: Caller holds its Thread after the synchronous
-                // registration; the fixture never executes its user code.
-                unsafe { c.thread.as_ref() }.sched.state() == State::Ready
-                    // SAFETY: the same held Thread remains alive for this read.
-                    && unsafe { c.thread.as_ref() }.waits.is_none()
-                    // SAFETY: registration finished writing this held Thread's registers.
-                    && unsafe { c.thread.as_ref() }.regs.x[0] == Error::Interrupted.code(),
-                "registration did not interrupt the selected sender",
-            )?;
-            // Consume the registration's primary request before native End.
-            check(entry(c.thread).is_some(), "no registration forward")?;
-            returned(c.thread, false)?;
-            // SAFETY: no application executes this held test Thread. This is
-            // the common scheduler End path before its reference release.
-            unsafe { sched::exit(native, CAUSE) };
-            check(
-                entry(c.thread).is_some_and(|e| e.pc == USER_VA as u64),
-                "direct native End did not wake survivor",
-            )?;
-            returned(c.thread, false)?;
-            c.succeeds(control, &[C::ProcessLayerRequest.raw(), managed.0], &[])?;
-            Ok(())
-        })();
-        c.close(wrong)?;
-        c.close(plain)?;
-        c.close(managed)?;
-        // Non-running Threads leave at the paid Threads teardown stage.
-        // Keep the fixture references while that stage removes every role.
-        // SAFETY: Caller still owns its Process reference through teardown.
-        unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
-        cleanup::drain();
-        check(
-            // SAFETY: Caller's creation reference survives cleanup::drain.
-            unsafe { c.thread.as_ref() }.layer.is_none(),
-            "main role survived Process End",
+        thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
+        let control = Call::ThreadUpcallControl.number();
+        c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
+        c.succeeds(control, &[C::Enable.raw()], &[1, 0, 0])?;
+        let mut t = c.thread;
+        // SAFETY: this test's stopped thread never executes application code.
+        unsafe { t.as_mut() }
+            .upcall
+            .request()
+            .map_err(|_| "request failed")?;
+        let own = c.created(
+            Call::ObjectInfo.number(),
+            &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
         )?;
-        if let Some(native) = extra {
-            check(
-                // SAFETY: `extra` keeps the creation reference after scheduler
-                // End and Process teardown released their own references.
-                unsafe { native.as_ref() }.layer.is_none(),
-                "native role survived End",
-            )?;
-            // SAFETY: this drops the fixture's creation reference exactly once;
-            // this Thread is not accessed afterwards.
-            unsafe { thread::release(native, CAUSE) };
+        for raw in 5..=12 {
+            for args in [
+                [0, 0],
+                [own.0, 0],
+                [(USER_VA + PAGE) as u64, 0x8000],
+                [1, 2],
+            ] {
+                c.fails(control, &[raw, args[0], args[1]], Error::InvalidArgs)?;
+            }
         }
-        result
-    });
-    check(
-        (thread::in_use(), channel::in_use()) == baseline,
-        "Layer test leaked Thread or interrupted Channel reference",
-    )?;
-    result
+        c.close(own)?;
+        // Nothing moved: no entry was taken, the entry is still enabled, and
+        // the pending request still delivers.
+        c.fails(control, &[C::Take.raw()], Error::BadState)?;
+        let pc = (USER_VA + PAGE) as u64;
+        check(
+            // SAFETY: the held stopped Thread runs no user code.
+            unsafe { t.as_mut() }.upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
+            "the entry did not survive the retired numbers",
+        )?;
+        c.succeeds(control, &[C::Take.raw()], &[1, pc, 0])
+    })
 }
 
-/// Native ignored registers and observer TLS/innermost return share exact context checks.
-pub fn observer_wire_preserves_native_context_and_ignored_registers(
-    _: &Boot,
-) -> Result<(), &'static str> {
+/// A return restores the exact native context: every general register, the
+/// stack pointer, the program counter, TPIDR_EL0 and the FP registers.
+pub fn upcall_return_restores_the_native_context_exactly(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         use abi::UpcallControl as C;
         thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
@@ -2741,69 +2588,10 @@ pub fn observer_wire_preserves_native_context_and_ignored_registers(
             // SAFETY: Caller holds this stopped Thread; no user code runs,
             // and the preceding local mutable borrow has ended.
             unsafe { t.as_mut() }.upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
-            "no primary entry",
+            "no entry",
         )?;
-        // Omitted x1-x9 contain marks, as they do in the legacy trampoline.
         c.succeeds(control, &[C::Take.raw()], &[1, pc, 0])?;
         c.succeeds(control, &[C::Mask.raw()], &[1, 0, 0])?;
-        c.succeeds(control, &[C::Defer.raw()], &[1, 0, 0])?;
-        let observer = (USER_VA + 2 * PAGE) as u64;
-        let tls = (USER_VA + 3 * PAGE) as u64;
-        c.succeeds(control, &[C::ObserverBind.raw(), observer, tls], &[])?;
-        c.succeeds(control, &[C::ObserverEnable.raw()], &[1, 0, 0])?;
-        c.succeeds(control, &[C::Resume.raw()], &[1, 0, 0])?;
-        let none = c.created(Call::ObjectInfo.number(), &[0, abi::INFO_THREAD_SELF, 0])?;
-        c.fails(
-            control,
-            &[C::LayerRequest.raw(), none.0],
-            Error::AccessDenied,
-        )?;
-        let resource = c.insert(Object::Resource, Rights::MANAGE)?;
-        c.fails(
-            control,
-            &[C::LayerRequest.raw(), resource.0],
-            Error::WrongType,
-        )?;
-        c.fails(control, &[C::LayerRequest.raw(), 0], Error::BadHandle)?;
-        let managed = c.created(
-            Call::ObjectInfo.number(),
-            &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
-        )?;
-        // Self-target lookup completes before the scheduler mutates the same State.
-        c.fails(
-            control,
-            &[C::LayerRequest.raw(), managed.0],
-            Error::BadState,
-        )?;
-        c.fails(
-            Call::ThreadUpcallRequest.number(),
-            &[managed.0],
-            Error::BadState,
-        )?;
-        c.close(none)?;
-        c.close(resource)?;
-        c.close(managed)?;
-        // SAFETY: Caller still holds the stopped Thread, and the preceding
-        // synchronous dispatches have released their temporary State borrows.
-        unsafe { t.as_mut() }
-            .upcall
-            .request_layer()
-            .map_err(|_| "observer request failed")?;
-        // SAFETY: the same held stopped Thread has no concurrent user execution;
-        // the request_layer borrow above ended before this preparation.
-        let entry = unsafe { t.as_mut() }
-            .upcall
-            .prepare_with_tls(pc, 0, 0, false);
-        check(
-            entry
-                == Some(kcore::upcall::Entry {
-                    pc: observer,
-                    tls: Some(tls),
-                }),
-            "observer did not install resident TLS",
-        )?;
-        c.fails(control, &[C::Take.raw()], Error::BadState)?;
-        c.succeeds(control, &[C::ObserverTake.raw()], &[1, pc, 0, 0])?;
         let mut context = [0u64; 102];
         for (i, value) in context.iter_mut().enumerate() {
             *value = 0xABCD_0000 + i as u64;
@@ -2818,20 +2606,16 @@ pub fn observer_wire_preserves_native_context_and_ignored_registers(
         thread::write_words(c.thread, abi::UPCALL_CONTEXT_OFFSET, &context);
         // Every argument, including x0, is a marker. Return has no selector.
         c.call(Call::ThreadUpcallReturn.number(), &[]);
-        let exact = |t: NonNull<Thread>| {
-            // SAFETY: this retained test thread never runs while inspected.
-            let t = unsafe { t.as_ref() };
+        // SAFETY: this retained test thread never runs while inspected.
+        let t = unsafe { c.thread.as_ref() };
+        check(
             t.regs.x[..31] == context[..31]
                 && t.regs.sp == context[31]
                 && t.regs.elr == pc
                 && t.regs.tpidr == 0
-                && t.fp.v[0] == u128::from(context[36]) | (u128::from(context[37]) << 64)
-        };
-        check(exact(c.thread), "observer Return lost exact native context")?;
-        c.succeeds(control, &[C::Mask.raw()], &[1, 0, 0])?;
-        thread::write_words(c.thread, abi::UPCALL_CONTEXT_OFFSET, &context);
-        c.call(Call::ThreadUpcallReturn.number(), &[]);
-        check(exact(c.thread), "primary Return lost exact native context")
+                && t.fp.v[0] == u128::from(context[36]) | (u128::from(context[37]) << 64),
+            "Return lost the exact native context",
+        )
     })
 }
 
@@ -2845,7 +2629,7 @@ pub fn upcall_request_refuses_a_stopped_thread(_: &Boot) -> Result<(), &'static 
         let upcall = || unsafe { &mut (*t.as_ptr()).upcall };
         upcall().bind(USER_VA as u64).map_err(|_| "bind failed")?;
         upcall()
-            .control(abi::UpcallControl::Enable.raw())
+            .control(abi::UpcallControl::Enable)
             .map_err(|_| "enable failed")?;
         // SAFETY: the test holds the thread.
         let stopped = unsafe { t.as_ref() }.sched.state() == State::Stopped;
@@ -2933,7 +2717,7 @@ fn with_reply_wait(
                 let upcall = unsafe { &mut (*t.as_ptr()).upcall };
                 upcall.bind(USER_VA as u64).map_err(|_| "bind failed")?;
                 upcall
-                    .control(abi::UpcallControl::Enable.raw())
+                    .control(abi::UpcallControl::Enable)
                     .map_err(|_| "enable failed")?;
             }
             let sent = channel::send(
@@ -5328,7 +5112,7 @@ fn upcall_calls(
     let upcall = unsafe { &mut (*target.as_ptr()).upcall };
     upcall.bind(USER_VA as u64).map_err(|_| "bind failed")?;
     upcall
-        .control(abi::UpcallControl::Enable.raw())
+        .control(abi::UpcallControl::Enable)
         .map_err(|_| "enable failed")?;
     sender_in_transit(other, l, 0, &mut threads[1])?;
     let thread_handle =
@@ -6669,7 +6453,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
             (*t.as_ptr()).upcall.bind(USER_VA as u64).unwrap();
             (*t.as_ptr())
                 .upcall
-                .control(abi::UpcallControl::Enable.raw())
+                .control(abi::UpcallControl::Enable)
                 .unwrap();
         }
         check(
@@ -6761,9 +6545,11 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
             }
         }
         kprintln!(
-            "suspension layout: process={} slots={}",
+            "suspension layout: process={} slots={} thread={} thread_slots={}",
             core::mem::size_of::<Process>(),
-            kcore::slab::Pool::<Process>::PER_PAGE
+            kcore::slab::Pool::<Process>::PER_PAGE,
+            core::mem::size_of::<Thread>(),
+            kcore::slab::Pool::<Thread>::PER_PAGE
         );
         Ok([
             stop,

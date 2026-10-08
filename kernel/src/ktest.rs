@@ -374,12 +374,12 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_pays_its_budget_back_to_the_payer,
     ),
     (
-        "process_layer_roles_survive_partial_unbind_and_native_end",
-        calls::process_layer_roles_survive_partial_unbind_and_native_end,
+        "upcall_operations_5_to_12_are_invalid_and_change_nothing",
+        calls::upcall_operations_5_to_12_are_invalid_and_change_nothing,
     ),
     (
-        "observer_wire_preserves_native_context_and_ignored_registers",
-        calls::observer_wire_preserves_native_context_and_ignored_registers,
+        "upcall_return_restores_the_native_context_exactly",
+        calls::upcall_return_restores_the_native_context_exactly,
     ),
     (
         "upcall_request_refuses_a_stopped_thread",

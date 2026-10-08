@@ -7,7 +7,7 @@ use super::{Args, Values, cause, lookup, set_result};
 use crate::object::Object;
 use crate::sched;
 use crate::thread::{self, Thread};
-use abi::{Error, Rights};
+use abi::{Error, Rights, UpcallControl};
 use core::ptr::NonNull;
 
 pub(super) fn thread_upcall_bind(mut thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
@@ -16,88 +16,19 @@ pub(super) fn thread_upcall_bind(mut thread: NonNull<Thread>, a: &Args) -> Resul
     }
     // SAFETY: only the current thread configures its own entry under kernel serialization.
     unsafe { thread.as_mut() }.upcall.bind(a[0])?;
-    if a[0] == 0 {
-        // SAFETY: current Thread is held by the syscall.
-        unsafe {
-            sched::set_layer_role(
-                thread,
-                crate::process::layers::PRIMARY,
-                false,
-                cause(thread),
-            )
-        }?;
-    }
     Ok(Values::none())
 }
+/// One parse of x0: the numbers 5 to 12 left in epoch 2 and are INVALID_ARGS
+/// like any other unknown one (spec 11).
 pub(super) fn thread_upcall_control(
     mut thread: NonNull<Thread>,
     a: &Args,
 ) -> Result<Values, Error> {
-    if a[0] == abi::UpcallControl::ProcessLayerRequest.raw() {
-        let process = lookup(thread, a[1], Rights::MANAGE, Object::process)?;
-        // SAFETY: the capability keeps the Process and selection borrows its live head.
-        unsafe { sched::request_process_layer(process, cause(thread)) }?;
-        return Ok(Values::none());
-    }
-    if matches!(
-        abi::UpcallControl::from_raw(a[0]),
-        Some(abi::UpcallControl::PrimaryLayerReady | abi::UpcallControl::ObserverLayerReady)
-    ) {
-        if a[1] > 1 {
-            return Err(Error::InvalidArgs);
-        }
-        if a[1] != 0 && thread::buffer_page(thread).is_none() {
-            return Err(Error::BadState);
-        }
-        let role = if a[0] == abi::UpcallControl::ObserverLayerReady.raw() {
-            crate::process::layers::OBSERVER
-        } else {
-            crate::process::layers::PRIMARY
-        };
-        // SAFETY: the syscall operates on the exact current Thread.
-        unsafe { sched::set_layer_role(thread, role, a[1] == 1, cause(thread)) }?;
-        return Ok(Values::none());
-    }
-    // Resolve a target before mutably borrowing current-thread entry state.
-    // The target may be the caller itself.
-    if a[0] == abi::UpcallControl::LayerRequest.raw() {
-        let target = lookup(thread, a[1], Rights::MANAGE, Object::thread)?;
-        // SAFETY: the caller's capability retains this exact target.
-        unsafe { sched::request_layer_upcall(target, cause(thread)) }?;
-        return Ok(Values::none());
-    }
-    if a[0] == abi::UpcallControl::ObserverBind.raw() {
-        if thread::buffer_page(thread).is_none() {
-            return Err(Error::BadState);
-        }
-        // SAFETY: current-thread configuration is serialized by the kernel.
-        unsafe { thread.as_mut() }
-            .upcall
-            .bind_observer(a[1], a[2])?;
-        if a[1] == 0 {
-            // SAFETY: current Thread retains its remaining primary role.
-            unsafe {
-                sched::set_layer_role(
-                    thread,
-                    crate::process::layers::OBSERVER,
-                    false,
-                    cause(thread),
-                )
-            }?;
-        }
-        return Ok(Values::none());
-    }
+    let operation = UpcallControl::from_raw(a[0]).ok_or(Error::InvalidArgs)?;
     // SAFETY: only current-thread state changes; no user pointers are accessed.
-    let (was, pc, flags) = unsafe { thread.as_mut() }.upcall.control(a[0])?;
-    if a[0] == abi::UpcallControl::ObserverTake.raw() {
-        // SAFETY: the current entry has taken its snapshot before new delivery.
-        let tls = unsafe { thread.as_ref() }.upcall.interrupted_tls();
-        Ok(Values::new(&[was, pc, flags, tls]))
-    } else {
-        Ok(Values::new(&[was, pc, flags]))
-    }
+    let (was, pc, flags) = unsafe { thread.as_mut() }.upcall.control(operation)?;
+    Ok(Values::new(&[was, pc, flags]))
 }
-
 pub(super) fn thread_upcall_request(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
     // SAFETY: the caller's handle holds the target through the request.

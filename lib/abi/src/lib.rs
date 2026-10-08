@@ -1214,22 +1214,6 @@ pub enum UpcallControl {
     Defer = 3,
     /// End one level of entry deferral; BAD_STATE without one.
     Resume = 4,
-    /// Mask the current thread's observer entry.
-    ObserverMask = 5,
-    /// Enable its observer entry.
-    ObserverEnable = 6,
-    /// Take observer PC, PSTATE and interrupted TLS (x2-x4).
-    ObserverTake = 7,
-    /// Bind observer entry x1 with resident TLS ABI word x2.
-    ObserverBind = 8,
-    /// Request the observer of MANAGE Thread x1, with native-entry fallback.
-    LayerRequest = 9,
-    /// Publish or remove the current primary Layer role (x1=0/1).
-    PrimaryLayerReady = 10,
-    /// Request one registered Layer of MANAGE Process x1.
-    ProcessLayerRequest = 11,
-    /// Publish or remove the current observer Layer role (x1=0/1).
-    ObserverLayerReady = 12,
 }
 
 impl UpcallControl {
@@ -1241,14 +1225,6 @@ impl UpcallControl {
             2 => Some(UpcallControl::Take),
             3 => Some(UpcallControl::Defer),
             4 => Some(UpcallControl::Resume),
-            5 => Some(UpcallControl::ObserverMask),
-            6 => Some(UpcallControl::ObserverEnable),
-            7 => Some(UpcallControl::ObserverTake),
-            8 => Some(UpcallControl::ObserverBind),
-            9 => Some(UpcallControl::LayerRequest),
-            10 => Some(UpcallControl::PrimaryLayerReady),
-            11 => Some(UpcallControl::ProcessLayerRequest),
-            12 => Some(UpcallControl::ObserverLayerReady),
             _ => None,
         }
     }
@@ -1615,27 +1591,20 @@ mod tests {
     }
 
     #[test]
-    fn upcall_control_keeps_native_and_observer_operation_numbers() {
+    fn upcall_control_keeps_five_operations_and_retires_the_rest() {
         let operations = [
             (UpcallControl::Mask, 0),
             (UpcallControl::Enable, 1),
             (UpcallControl::Take, 2),
             (UpcallControl::Defer, 3),
             (UpcallControl::Resume, 4),
-            (UpcallControl::ObserverMask, 5),
-            (UpcallControl::ObserverEnable, 6),
-            (UpcallControl::ObserverTake, 7),
-            (UpcallControl::ObserverBind, 8),
-            (UpcallControl::LayerRequest, 9),
-            (UpcallControl::PrimaryLayerReady, 10),
-            (UpcallControl::ProcessLayerRequest, 11),
-            (UpcallControl::ObserverLayerReady, 12),
         ];
         for (operation, raw) in operations {
             assert_eq!(operation.raw(), raw);
             assert_eq!(UpcallControl::from_raw(raw), Some(operation));
         }
-        for raw in [13, 1 << 32, u64::MAX] {
+        // 5 to 12 are retired numbers, never issued again.
+        for raw in (5..=12).chain([13, 1 << 32, u64::MAX]) {
             assert_eq!(UpcallControl::from_raw(raw), None, "{raw:#x}");
         }
     }

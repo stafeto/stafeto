@@ -78,6 +78,9 @@ fn control(operation: UpcallControl) -> Result<bool, Error> {
     }
 }
 
+/// Binds the distributor in the kernel. The kernel keeps the thread's
+/// deferral count across the binding, so a thread under `defer_entries`
+/// binds as it is.
 fn kernel_bind(entry: u64) -> Result<(), Error> {
     // SAFETY: the caller answers for entries at this address.
     let result = unsafe {
@@ -86,27 +89,10 @@ fn kernel_bind(entry: u64) -> Result<(), Error> {
     Error::from_code(result[0]).map_or(Ok(()), Err)
 }
 
-/// Binds the distributor in the kernel, which refuses while an entry is
-/// deferred. Nothing can enter before the bind, so the deferrals are lifted
-/// for its duration and put back after it.
-fn kernel_bind_distributor() -> Result<(), Error> {
-    let mut lifted = 0;
-    let result = loop {
-        match kernel_bind(entry as *const () as u64) {
-            Err(Error::BadState) if control(UpcallControl::Resume).is_ok() => lifted += 1,
-            other => break other,
-        }
-    };
-    for _ in 0..lifted {
-        control(UpcallControl::Defer).expect("entry deferral back after the bind");
-    }
-    result
-}
-
 fn bind_kernel_once() -> Result<(), Error> {
     let flags = word(ENTRY_FLAGS);
     if flags.load(Ordering::Relaxed) & KERNEL_BOUND == 0 {
-        kernel_bind_distributor()?;
+        kernel_bind(entry as *const () as u64)?;
         flags.fetch_or(KERNEL_BOUND, Ordering::Relaxed);
     }
     Ok(())
