@@ -100,6 +100,11 @@ mod tests {
 
 /// Closed sessions may only inspect or settle exact existing operations.
 pub fn closed_method(method: u16) -> bool {
+    #[cfg(feature = "auth-probe")]
+    if method == 0xfffa {
+        // Scalar retained-image counts remain observable after owner death.
+        return true;
+    }
     use proto_fs::Method;
     matches!(
         Method::from_number(method),
@@ -120,6 +125,25 @@ pub fn closed_method(method: u16) -> bool {
 mod retained_tests {
     use super::*;
     use proto_fs::Method;
+    #[test]
+    fn closed_image_counts_require_probe_feature_and_exclude_neighbor_effects() {
+        assert_eq!(closed_method(0xfffa), cfg!(feature = "auth-probe"));
+        for method in [0xfff8, 0xfff9, 0xfffb, 0xfffc, 0xfffd] {
+            assert!(!closed_method(method));
+        }
+        for method in [
+            Method::Open,
+            Method::Read,
+            Method::ReadAt,
+            Method::ReadInto,
+            Method::Write,
+            Method::WriteAt,
+            Method::OpenExec,
+            Method::Bind,
+        ] {
+            assert!(!closed_method(method as u16));
+        }
+    }
     #[test]
     fn retained_dispatch_accepts_settlement_and_rejects_every_new_effect() {
         for method in [
