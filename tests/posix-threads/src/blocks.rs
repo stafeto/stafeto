@@ -244,14 +244,15 @@ pub(super) fn run() -> bool {
             error();
         }
     });
-    // raise delivers before it returns with two Defer/Resume pairs.
+    // raise retains its target under two TABLE priority calls and delivers
+    // before it returns with two Defer/Resume pairs.
     let before = HANDLED.load(Ordering::SeqCst);
     let raised = calls(|| {
         if api::raise(SIGUSR1) != 0 {
             error();
         }
     });
-    if block != 0 || raised != 4 || HANDLED.load(Ordering::SeqCst) != before + 8 {
+    if block != 0 || raised != 6 || HANDLED.load(Ordering::SeqCst) != before + 8 {
         rt::println!(
             "blocks-probe: {} calls for a mask, {} for raise",
             block,
@@ -276,7 +277,7 @@ pub(super) fn run() -> bool {
         return failed(642);
     }
     rt::println!(
-        "blocks-probe: pthread_sigmask makes zero calls; raise and lock-end delivery each use four deferral calls"
+        "blocks-probe: pthread_sigmask makes zero calls; raise uses six calls; lock-end delivery uses four deferral calls"
     );
 
     // pthread_kill wakes a sleeping thread at 30: its handler, EINTR, the
