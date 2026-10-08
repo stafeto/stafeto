@@ -3246,8 +3246,11 @@ const RAM_STEP_MAX: u64 = TERM_B;
 /// four runs at e1-g2-steps (identical to the tick, since -icount is
 /// deterministic for one build; with 4 and 7 branches: Create 61,378 and
 /// 61,378, SpawnStart 92,323 and 92,556, ExecStart 51,039 and 50,833,
-/// ForkStart 53,737 and 54,153) plus NOISE_MARGIN. The margin covers what
-/// moves between builds: the layout of the code and the processes of the
+/// ForkStart 53,737 and 54,153) plus NOISE_MARGIN; ForkStart again as the
+/// largest of four runs at the head of E1 with 4 and with 7 branches
+/// (53,772 and 55,793: the pin of relibc a5adc5f8, a table entry in
+/// `sysconf`, moved the 7-branch figure up from 54,610 at 30f48fe7). The
+/// margin covers what moves between builds: the layout of the code and the processes of the
 /// level above that run in the middle of a step (SpawnStart was 92,262 and
 /// 93,009 at 4e9abf5 and 92,369 at d7743c9 with the same source of the
 /// step).
@@ -3268,8 +3271,8 @@ const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64, u64); 4] = [
     (
         34,
         "ForkStart",
-        53_737 + NOISE_MARGIN,
-        54_153 + NOISE_MARGIN,
+        53_772 + NOISE_MARGIN,
+        55_793 + NOISE_MARGIN,
     ),
 ];
 
