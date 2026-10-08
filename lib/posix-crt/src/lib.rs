@@ -110,7 +110,7 @@ unsafe fn enter_relibc(stack: *const usize) -> ! {
     if layout
         != [
             rt::abi::msgbuf::ENTRIES,
-            rt::abi::msgbuf::ENTRIES + rt::abi::msgbuf::ENTRY_OUTER,
+            rt::abi::msgbuf::ENTRIES + entries::ENTRY_OUTER,
         ]
     {
         rt::println!("POSIX startup: relibc places the entry record elsewhere");

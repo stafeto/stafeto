@@ -9,11 +9,11 @@
 //! with its own TLS, and then the handler of the program. The decisions are
 //! in the `entries` package, which the host tests run.
 use crate::{msgbuf, sys};
-use abi::{
-    Call, Error, UpcallControl,
-    msgbuf::{ENTRIES, ENTRY_FLAGS, ENTRY_HOOK, ENTRY_OUTER, ENTRY_OWN, ENTRY_RESIDENT, ENTRY_TLS},
-};
+use abi::{Call, Error, UpcallControl, msgbuf::ENTRIES, msgbuf::ENTRIES_SIZE};
 use core::sync::atomic::{AtomicU64, Ordering};
+use entries::{
+    ENTRY_FLAGS, ENTRY_HOOK, ENTRY_OUTER, ENTRY_OWN, ENTRY_RESIDENT, ENTRY_TLS, ENTRY_WORDS_END,
+};
 
 /// Saved AArch64 execution state passed by a context-aware entry trampoline.
 /// The frame is live only until the dispatcher returns. The kernel validates
@@ -42,6 +42,9 @@ const _: () = {
 /// A handler of an entry: it gets the saved context of the interrupted
 /// code, live until it returns.
 pub type Dispatch = unsafe extern "C" fn(*mut Context);
+
+// Two words of the record stay in reserve.
+const _: () = assert!(ENTRY_WORDS_END + 16 <= ENTRIES_SIZE);
 
 /// The flag of the entry record that says the kernel entry is bound.
 const KERNEL_BOUND: u64 = 1;

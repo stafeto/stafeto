@@ -534,16 +534,8 @@ pub mod msgbuf {
     pub const ENTRIES: usize = CONTEXT_END;
     /// The size of the entry record in bytes.
     pub const ENTRIES_SIZE: usize = 64;
-    /// The words of the entry record, as byte offsets from `ENTRIES`: the
-    /// handler of the program, the resident handler of the layer, the TLS
-    /// of the resident handler, the frame of the live resident call (0 for
-    /// none), flags, the exit hook, and two words in reserve.
-    pub const ENTRY_OWN: usize = 0;
-    pub const ENTRY_RESIDENT: usize = 8;
-    pub const ENTRY_TLS: usize = 16;
-    pub const ENTRY_OUTER: usize = 24;
-    pub const ENTRY_FLAGS: usize = 32;
-    pub const ENTRY_HOOK: usize = 40;
+    // The words inside the record (handlers, TLS, flags) are the contract of
+    // `rt` and relibc: `entries::ENTRY_*`.
     /// The size of the buffer, one page.
     pub const SIZE: usize = 4096;
 
@@ -551,10 +543,6 @@ pub mod msgbuf {
         assert!(CONTEXT >= RESERVED);
         assert!(ENTRIES.is_multiple_of(8));
         assert!(ENTRIES + ENTRIES_SIZE <= SIZE);
-        assert!(ENTRY_HOOK + 8 <= ENTRIES_SIZE - 16);
-        assert!(ENTRY_FLAGS == ENTRY_OUTER + 8 && ENTRY_HOOK == ENTRY_FLAGS + 8);
-        assert!(ENTRY_OUTER == ENTRY_TLS + 8 && ENTRY_TLS == ENTRY_RESIDENT + 8);
-        assert!(ENTRY_RESIDENT == ENTRY_OWN + 8);
     };
 
     /// The info word of a handle to an object of `kind` with `rights`:
@@ -1600,17 +1588,6 @@ mod tests {
         assert_eq!(
             (CONTEXT, CONTEXT_END, ENTRIES, ENTRIES_SIZE),
             (1120, 1936, 1936, 64)
-        );
-        assert_eq!(
-            (
-                ENTRY_OWN,
-                ENTRY_RESIDENT,
-                ENTRY_TLS,
-                ENTRY_OUTER,
-                ENTRY_FLAGS,
-                ENTRY_HOOK
-            ),
-            (0, 8, 16, 24, 32, 40)
         );
         let word = info(ObjectKind::Channel, Rights::SEND | Rights::TRANSFER);
         assert_eq!(word, 3 << 32 | 0b110);

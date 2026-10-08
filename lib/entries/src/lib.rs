@@ -14,6 +14,20 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+/// The words of the entry record of a thread, as byte offsets from
+/// `abi::msgbuf::ENTRIES` (the kernel never touches the record): the handler
+/// of the program, the resident handler of the layer, the TLS of the
+/// resident handler, `outer` (the frame of the live resident call, 0 for
+/// none), flags, the exit hook; two words stay in reserve.
+pub const ENTRY_OWN: usize = 0;
+pub const ENTRY_RESIDENT: usize = 8;
+pub const ENTRY_TLS: usize = 16;
+pub const ENTRY_OUTER: usize = 24;
+pub const ENTRY_FLAGS: usize = 32;
+pub const ENTRY_HOOK: usize = 40;
+/// The end of the last word. `rt` checks it against `abi::msgbuf::ENTRIES_SIZE`.
+pub const ENTRY_WORDS_END: usize = ENTRY_HOOK + 8;
+
 /// Before the resident call of the entry whose frame is `frame`: whether the
 /// entry records its frame in `outer` (and so has to clear it afterwards).
 /// A nested entry, made while a resident call is live, records nothing.
@@ -211,5 +225,21 @@ mod tests {
         assert_eq!(after_resident(0x7000, 0x9000, true), 0x7000);
         assert_eq!(after_resident(0x9000, 0x9000, true), 0);
         assert_eq!(after_resident(0x9000, 0x8000, false), 0x9000);
+    }
+
+    #[test]
+    fn the_words_of_the_record_follow_one_another() {
+        assert_eq!(
+            [
+                ENTRY_OWN,
+                ENTRY_RESIDENT,
+                ENTRY_TLS,
+                ENTRY_OUTER,
+                ENTRY_FLAGS,
+                ENTRY_HOOK
+            ],
+            [0, 8, 16, 24, 32, 40]
+        );
+        assert_eq!(ENTRY_WORDS_END, 48);
     }
 }

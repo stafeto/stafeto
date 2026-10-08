@@ -20,6 +20,7 @@ bench = false
 uart-input = []
 
 [dependencies]
+entries = { path = "../entries" }
 proto-init = { path = "../../proto/init" }
 proto-loader = { path = "../../proto/loader" }
 posix-abi = { path = "../posix-abi" }

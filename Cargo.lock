@@ -274,6 +274,7 @@ dependencies = [
 name = "posix-crt"
 version = "0.1.0"
 dependencies = [
+ "entries",
  "posix-abi",
  "posix-fs",
  "posix-platform",
