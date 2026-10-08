@@ -63,6 +63,12 @@ pub trait MapEffects<M, D> {
     fn close(&mut self, owner: M) -> Result<(), M>;
 }
 
+/// One status-only reply effect for the retained initial CRT waiter.
+pub trait CrtEffects<D> {
+    fn is_live(&self, pending: &D) -> bool;
+    fn reply(&mut self, pending: &mut D, status: u32) -> MapDelivery;
+}
+
 pub struct InitialResident<M, C, T, D> {
     pub publication: Publication,
     pub originals: [Option<M>; ENTRIES],
@@ -553,6 +559,64 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         self.flags |= USER;
         self.phase = Phase::UserReleased;
         true
+    }
+    /// Replacing a consumed marker preserves the existing User phase.
+    pub fn begin_crt_wait<E: CrtEffects<D>>(
+        &mut self,
+        key: Key,
+        pending: D,
+        effects: &E,
+    ) -> Result<(), D> {
+        if key != self.publication.map.receipt.key
+            || self.flags & (MAPS_ACK | ENDED | CRT_REPLIED) != MAPS_ACK
+            || !effects.is_live(&pending)
+            || self
+                .operation_pending
+                .as_ref()
+                .is_some_and(|p| effects.is_live(p))
+        {
+            return Err(pending);
+        }
+        self.operation_pending = Some(pending);
+        Ok(())
+    }
+    /// A consumed normal reply remains recoverable through an exact retry.
+    /// Genuine End settles its marker without confirming a User reply.
+    pub fn crt_wait_step<E: CrtEffects<D>>(&mut self, effects: &mut E) -> bool {
+        if self.flags & MAPS_ACK == 0 || self.flags & (USER | ENDED) == 0 {
+            return false;
+        }
+        let Some(pending) = self.operation_pending.as_mut() else {
+            return false;
+        };
+        let ended = self.flags & ENDED != 0;
+        if !effects.is_live(pending) {
+            if ended {
+                self.operation_pending.take();
+            }
+            return false;
+        }
+        let status = if ended { self.end_reason } else { 0 };
+        match effects.reply(pending, status) {
+            MapDelivery::Completed => {
+                assert!(!effects.is_live(pending));
+                self.operation_pending.take();
+                if !ended {
+                    self.crt_reply_confirmed();
+                }
+            }
+            MapDelivery::ReturnedLive => assert!(effects.is_live(pending)),
+            MapDelivery::Consumed => {
+                assert!(!effects.is_live(pending));
+                if ended {
+                    self.operation_pending.take();
+                }
+            }
+        }
+        true
+    }
+    pub fn crt_was_replied(&self) -> bool {
+        self.flags & CRT_REPLIED != 0
     }
     pub fn crt_reply_confirmed(&mut self) {
         self.flags |= CRT_REPLIED;
@@ -1243,6 +1307,118 @@ mod tests {
         resident.flags |= INIT_ACK;
         assert!(resident.releasable());
         assert_eq!(log.borrow().as_slice(), &[20, 23, 30]);
+    }
+
+    impl CrtEffects<MapPending> for Effects {
+        fn is_live(&self, pending: &MapPending) -> bool {
+            pending.live
+        }
+        fn reply(&mut self, pending: &mut MapPending, status: u32) -> MapDelivery {
+            assert!(pending.live);
+            self.calls += 1;
+            assert!(status == 0 || status == abi::Error::BadState.code() as u32);
+            pending.live = self.outcome == MapDelivery::ReturnedLive;
+            self.outcome
+        }
+    }
+    #[test]
+    fn crt_wait_requires_user_and_confirmed_reply_before_release() {
+        let (mut resident, mut effects) = map_fixture(2);
+        let key = resident.publication.map.receipt.key;
+        assert!(
+            resident
+                .begin_crt_wait(key, MapPending { live: true }, &effects)
+                .is_err()
+        );
+        assert!(resident.map_ack(key).is_some());
+        resident.flags |= INIT_ACK;
+        assert!(
+            resident
+                .begin_crt_wait(key, MapPending { live: true }, &effects)
+                .is_ok()
+        );
+        let calls = effects.calls;
+        assert!(!resident.crt_wait_step(&mut effects));
+        assert_eq!(effects.calls, calls);
+        assert!(!resident.crt_was_replied());
+        assert!(!resident.releasable());
+        // The independent notary slot can coexist with the waiting CRT.
+        resident.crt_pending = Some(MapPending { live: true });
+        while resident.map_step(&mut effects) {}
+        assert!(resident.user_release(resident.key));
+        effects.outcome = MapDelivery::ReturnedLive;
+        let calls = effects.calls;
+        assert!(resident.crt_wait_step(&mut effects));
+        assert_eq!(effects.calls, calls + 1);
+        assert!(!resident.crt_was_replied());
+        assert!(
+            resident
+                .begin_crt_wait(key, MapPending { live: true }, &effects)
+                .is_err()
+        );
+        effects.outcome = MapDelivery::Consumed;
+        assert!(resident.crt_wait_step(&mut effects));
+        assert!(!resident.crt_was_replied());
+        assert!(!resident.releasable());
+        let calls = effects.calls;
+        assert!(!resident.crt_wait_step(&mut effects));
+        assert_eq!(effects.calls, calls);
+        let wrong = Key {
+            key: key.key - 1,
+            image: key.image,
+        };
+        assert!(
+            resident
+                .begin_crt_wait(wrong, MapPending { live: true }, &effects)
+                .is_err()
+        );
+        assert!(
+            resident
+                .begin_crt_wait(key, MapPending { live: true }, &effects)
+                .is_ok()
+        );
+        assert_eq!(resident.phase(), Phase::UserReleased);
+        effects.outcome = MapDelivery::Completed;
+        assert!(resident.crt_wait_step(&mut effects));
+        assert!(resident.crt_was_replied());
+        assert!(!resident.releasable());
+        resident.crt_pending.take();
+        assert!(resident.releasable());
+    }
+    #[test]
+    fn ended_crt_settles_consumed_terminal_marker_without_user_proof() {
+        for consumed_before_end in [false, true] {
+            let (mut resident, mut effects) = map_fixture(2);
+            let key = resident.publication.map.receipt.key;
+            assert!(resident.map_ack(key).is_some());
+            assert!(
+                resident
+                    .begin_crt_wait(key, MapPending { live: true }, &effects)
+                    .is_ok()
+            );
+            if consumed_before_end {
+                assert!(resident.user_release(resident.key));
+                effects.outcome = MapDelivery::Consumed;
+                assert!(resident.crt_wait_step(&mut effects));
+            }
+            assert!(resident.ended(resident.key, abi::Error::BadState.code() as u32));
+            if consumed_before_end {
+                assert!(!resident.crt_wait_step(&mut effects));
+            } else {
+                effects.outcome = MapDelivery::ReturnedLive;
+                assert!(resident.crt_wait_step(&mut effects));
+                assert!(resident.operation_pending.is_some());
+                effects.outcome = MapDelivery::Consumed;
+                assert!(resident.crt_wait_step(&mut effects));
+            }
+            assert!(resident.operation_pending.is_none());
+            assert!(!resident.crt_was_replied());
+            assert!(
+                resident
+                    .begin_crt_wait(key, MapPending { live: true }, &effects)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
