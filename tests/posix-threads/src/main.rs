@@ -70,6 +70,8 @@ mod one_thread;
 #[cfg(not(feature = "cancel-input"))]
 mod reentry;
 #[cfg(not(feature = "cancel-input"))]
+mod router;
+#[cfg(not(feature = "cancel-input"))]
 mod signal_context;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_preparation;
@@ -569,6 +571,9 @@ fn native_only(expected_parent: u32) -> c_int {
         return 13;
     }
     rt::println!("native-scopes: survivor and join ok");
+    if !router::run() {
+        return 17;
+    }
     0
 }
 
