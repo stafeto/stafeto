@@ -2156,6 +2156,66 @@ mod tests {
     }
 
     #[test]
+    fn captured_image_abort_survives_retiring_and_settled_job_without_releasing_owners() {
+        use crate::image::{ImageOutcome, ImagePhase, retry_status};
+        let mut ram = Ram::default();
+        let root = storage::Root {
+            id: 902,
+            generation: 4,
+        };
+        let mut parent = Fds {
+            root,
+            ..Fds::default()
+        };
+        let fd = ram.open(&mut parent, "/etc/motd", READ_ONLY).unwrap();
+        let slot = parent.description(fd).unwrap();
+        let token = ram.token(ram.descriptions[slot].unwrap().open.file);
+        let entry = ram.storage.node(token).unwrap().boot;
+        let mut image = Fds {
+            root,
+            ..Fds::default()
+        };
+        ram.hold_image(&mut image, token, entry).unwrap();
+        let outcome = ImageOutcome {
+            job: 71,
+            label: 81,
+            token,
+            phase: ImagePhase::AbortRequired,
+        };
+        parent.image_outcome = Some(outcome);
+        for retiring in [true, false] {
+            assert_eq!(
+                retry_status(parent.image_outcome, 71, retiring),
+                Some(proto_fs::IMAGE_ABORT_REQUIRED)
+            );
+            assert_eq!(parent.image_outcome, Some(outcome));
+            assert_eq!(ram.storage.usage(root).descriptions, 2);
+            assert!(image.image_hold.is_some());
+        }
+        assert_eq!(
+            retry_status(parent.image_outcome, 72, true),
+            Some(proto_fs::OPEN_RETIRED)
+        );
+        assert_eq!(retry_status(parent.image_outcome, 72, false), None);
+        for phase in [ImagePhase::Prepared, ImagePhase::Ready, ImagePhase::Retired] {
+            assert_eq!(
+                retry_status(Some(ImageOutcome { phase, ..outcome }), 71, true),
+                Some(proto_fs::OPEN_RETIRED)
+            );
+        }
+        assert_eq!(retry_status(None, 71, true), Some(proto_fs::OPEN_RETIRED));
+        assert_eq!(retry_status(None, 71, false), None);
+        assert!(ram.release_image(&mut image));
+        assert_eq!(ram.storage.usage(root).descriptions, 1);
+        assert_eq!(
+            retry_status(parent.image_outcome, 71, false),
+            Some(proto_fs::IMAGE_ABORT_REQUIRED)
+        );
+        assert!(ram.release_step(&mut parent));
+        assert_eq!(ram.storage.usage(root).descriptions, 0);
+    }
+
+    #[test]
     fn retained_label_live_duplicate_caps_keep_place_after_dead_and_window_debt() {
         use crate::maintenance::{retained_release_step, retirement_ready};
         use std::cell::Cell;

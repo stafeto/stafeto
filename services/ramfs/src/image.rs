@@ -32,6 +32,19 @@ pub struct ImageOutcome {
     pub phase: ImagePhase,
 }
 
+/// Captured ambiguous SetId remains terminal for its exact job during cancellation.
+pub fn retry_status(outcome: Option<ImageOutcome>, job: u64, retiring: bool) -> Option<u32> {
+    if outcome
+        .is_some_and(|outcome| outcome.job == job && outcome.phase == ImagePhase::AbortRequired)
+    {
+        Some(proto_fs::IMAGE_ABORT_REQUIRED)
+    } else if retiring {
+        Some(proto_fs::OPEN_RETIRED)
+    } else {
+        None
+    }
+}
+
 impl Ram<'_> {
     /// The service validates owner, path proof and execute permission before admission.
     pub fn hold_image(&mut self, fds: &mut Fds, token: Token, entry: u16) -> Result<(), u32> {

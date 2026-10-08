@@ -1005,11 +1005,11 @@ impl Fs {
         let (Ok(job), Ok(())) = (body.u64(), body.finish()) else {
             return Answer::Status(Status::BadSize);
         };
-        if self
+        let retiring = self
             .job_slot(job, r.label())
-            .is_ok_and(|slot| self.jobs[slot].as_ref().is_some_and(|job| job.retiring))
-        {
-            return status(proto_fs::OPEN_RETIRED);
+            .is_ok_and(|slot| self.jobs[slot].as_ref().is_some_and(|job| job.retiring));
+        if let Some(code) = ramfs::image::retry_status(fds.image_outcome, job, retiring) {
+            return status(code);
         }
         if fds.image_outcome.is_some_and(|outcome| {
             outcome.phase == ramfs::image::ImagePhase::Prepared
