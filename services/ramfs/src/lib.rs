@@ -2156,6 +2156,30 @@ mod tests {
     }
 
     #[test]
+    fn closed_pending_counts_inspection_preserves_descriptor_and_root_charge() {
+        let mut ram = Ram::default();
+        let root = storage::Root {
+            id: 903,
+            generation: 5,
+        };
+        let mut fds = Fds {
+            root,
+            ..Fds::default()
+        };
+        let fd = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
+        fds.closing = true;
+        let counts = fds.retained_counts();
+        assert_eq!(fds.permits_method(0xfffe), cfg!(feature = "auth-probe"));
+        assert!(!fds.permits_method(0xfff9));
+        assert!(!fds.permits_method(proto_fs::Method::Read as u16));
+        assert_eq!(fds.retained_counts(), counts);
+        assert!(fds.description(fd).is_ok());
+        assert_eq!(ram.storage.usage(root).descriptions, 1);
+        assert!(ram.release_step(&mut fds));
+        assert_eq!(ram.storage.usage(root).descriptions, 0);
+    }
+
+    #[test]
     fn captured_image_abort_survives_retiring_and_settled_job_without_releasing_owners() {
         use crate::image::{ImageOutcome, ImagePhase, retry_status};
         let mut ram = Ram::default();
