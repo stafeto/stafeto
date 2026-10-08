@@ -496,7 +496,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
 /// the whole step in which it happened.
 #[cfg(feature = "step-stats")]
 mod steps {
-    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
     /// The kinds: methods below this number, and the notifications.
     pub const NOTICE: usize = 64;
@@ -511,6 +511,13 @@ mod steps {
     static DEPARTED: AtomicBool = AtomicBool::new(false);
     /// The ticks the step in progress has waited in `sys::send`.
     static WAITED: AtomicU64 = AtomicU64::new(0);
+    /// The message buffer of the thread that leads the step in progress
+    /// (`msgbuf::address`, one per thread): only its sends count as the
+    /// step's waits. The other threads of a service (the adoption thread of
+    /// the process service, the supply thread of the entropy service) send
+    /// from their own loops, and their waits are the preemption of the step,
+    /// which stays in its own part.
+    static LEADER: AtomicUsize = AtomicUsize::new(0);
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static FULL: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
@@ -561,6 +568,7 @@ mod steps {
     /// (between steps) waited does not belong to it.
     pub fn restart() {
         WAITED.store(0, Ordering::Relaxed);
+        LEADER.store(crate::msgbuf::address(), Ordering::Relaxed);
         DEPARTED.store(false, Ordering::Relaxed);
     }
 
@@ -569,12 +577,15 @@ mod steps {
     }
 
     pub fn waited(ticks: u64) {
-        WAITED.fetch_add(ticks, Ordering::Relaxed);
+        if crate::msgbuf::address() == LEADER.load(Ordering::Relaxed) {
+            WAITED.fetch_add(ticks, Ordering::Relaxed);
+        }
     }
 
     pub fn end(began: u64, kind: usize) {
         let whole = super::time::now().saturating_sub(began);
-        let waited = WAITED.swap(0, Ordering::Relaxed).min(whole);
+        let counted = WAITED.swap(0, Ordering::Relaxed);
+        let waited = counted.min(whole);
         let took = whole - waited;
         let kind = if OWNED.swap(false, Ordering::Relaxed) {
             OWN
@@ -589,6 +600,11 @@ mod steps {
         }
         let tag = REPORT.load(Ordering::Relaxed);
         let printing = tag != 0 && !QUIET.load(Ordering::Relaxed);
+        if counted > whole {
+            // The sends of the leading thread cannot add up to more than
+            // the step: the accounting is lost, and `xtask` fails the run.
+            crate::println!("service wait cut: {tag} kind {kind} {counted} ticks of {whole}");
+        }
         if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
             DETAILS[kind].store(detail, Ordering::Relaxed);
             if printing {
