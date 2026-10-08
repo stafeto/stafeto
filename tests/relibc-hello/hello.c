@@ -168,6 +168,64 @@ static int end_badly(const char *how) {
     return 1;
 }
 
+/* The constants of <unistd.h> and what sysconf answers. The system claims a
+ * subprofile of POSIX.1-2024: the version is 202405, _POSIX_TIMERS stays out
+ * until timer_create works, and sysconf gives each option macro's value (-1,
+ * with errno untouched, for an option the header leaves out). */
+#ifndef _POSIX_SUBPROFILE
+#error "unistd.h does not define _POSIX_SUBPROFILE"
+#endif
+#ifdef _POSIX_TIMERS
+#error "unistd.h defines _POSIX_TIMERS while timer_create answers ENOSYS"
+#endif
+_Static_assert(_POSIX_VERSION == 202405L, "_POSIX_VERSION is not POSIX.1-2024");
+
+static int constants(void) {
+    struct {
+        const char *name;
+        int key;
+        long macro;
+    } options[] = {
+        {"_POSIX_VERSION", _SC_VERSION, _POSIX_VERSION},
+        {"_POSIX_BARRIERS", _SC_BARRIERS, _POSIX_BARRIERS},
+        {"_POSIX_MONOTONIC_CLOCK", _SC_MONOTONIC_CLOCK, _POSIX_MONOTONIC_CLOCK},
+        {"_POSIX_REALTIME_SIGNALS", _SC_REALTIME_SIGNALS, _POSIX_REALTIME_SIGNALS},
+        {"_POSIX_SEMAPHORES", _SC_SEMAPHORES, _POSIX_SEMAPHORES},
+        {"_POSIX_SHELL", _SC_SHELL, _POSIX_SHELL},
+        {"_POSIX_SHARED_MEMORY_OBJECTS", _SC_SHARED_MEMORY_OBJECTS,
+         _POSIX_SHARED_MEMORY_OBJECTS},
+        {"_POSIX_THREADS", _SC_THREADS, _POSIX_THREADS},
+        {"_POSIX_THREAD_ATTR_STACKADDR", _SC_THREAD_ATTR_STACKADDR,
+         _POSIX_THREAD_ATTR_STACKADDR},
+        {"_POSIX_THREAD_ATTR_STACKSIZE", _SC_THREAD_ATTR_STACKSIZE,
+         _POSIX_THREAD_ATTR_STACKSIZE},
+        {"_POSIX_TIMEOUTS", _SC_TIMEOUTS, _POSIX_TIMEOUTS},
+        {"_XOPEN_SHM", _SC_XOPEN_SHM, _XOPEN_SHM},
+    };
+    for (size_t i = 0; i < sizeof options / sizeof options[0]; i++) {
+        long got = sysconf(options[i].key);
+        if (got != options[i].macro) {
+            printf("relibc-hello: sysconf(%s) is %ld, the header says %ld\n", options[i].name, got,
+                   options[i].macro);
+            return 21;
+        }
+    }
+    /* The options the header leaves out: -1 and no errno. */
+    int left_out[] = {_SC_TIMERS, _SC_ASYNCHRONOUS_IO, _SC_MESSAGE_PASSING, _SC_MEMLOCK};
+    for (size_t i = 0; i < sizeof left_out / sizeof left_out[0]; i++) {
+        errno = 0;
+        long got = sysconf(left_out[i]);
+        if (got != -1 || errno != 0) {
+            printf("relibc-hello: sysconf(%d) is %ld, errno %d; expected -1 and no errno\n",
+                   left_out[i], got, errno);
+            return 22;
+        }
+    }
+    printf("relibc-hello: constants: _POSIX_VERSION %ld, _POSIX_SUBPROFILE %ld, timers %ld\n",
+           sysconf(_SC_VERSION), (long)_POSIX_SUBPROFILE, sysconf(_SC_TIMERS));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) return end_badly(argv[1]);
     printf("relibc-hello: printf argc=%d argv0=%s pi=%.3f\n", argc, argv[0], 3.14159);
@@ -207,6 +265,8 @@ int main(int argc, char **argv) {
     if (clock_gettime(CLOCK_MONOTONIC, &now)) return 8;
     printf("relibc-hello: monotonic %lld.%09ld\n", (long long)now.tv_sec, now.tv_nsec);
     int status = files();
+    if (status) return status;
+    status = constants();
     if (status) return status;
     /* No entropy service in this image: getentropy has no source. */
     unsigned char random_bytes[16];
