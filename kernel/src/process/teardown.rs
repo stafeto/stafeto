@@ -34,6 +34,10 @@ const REPLIES_PORTION: usize = 32;
 /// thread goes into the portion only when its units fit. The buffers of 16
 /// threads with no handles take one portion.
 const BUFFERS_PORTION: usize = 32;
+/// A thread goes into a portion only when its units fit, so the heaviest
+/// thread (its frame, the handles of its request and its long call) has to
+/// fit alone, or the stage would never end.
+const _: () = assert!(FRAME_UNITS + abi::MESSAGE_HANDLES + 1 <= BUFFERS_PORTION);
 
 /// Handle table entries a portion of the stage Handles releases, at most
 /// (spec 7.7): half a chunk, each last copy of a session telling its
@@ -500,7 +504,8 @@ unsafe fn wait_for_child(child: NonNull<Process>, level: u8) {
 }
 
 /// The stage Handles: one step of the table's release, HANDLES_PORTION
-/// entries, each handle's object released at `level`. True once the table holds nothing.
+/// entries, each handle's object released at `level`. True once the table
+/// holds nothing.
 ///
 /// # Safety
 /// `process` is alive and on its stages.

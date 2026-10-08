@@ -2181,7 +2181,7 @@ fn portions_one_by_one(base: usize, chain: usize, level: u8) -> Result<(), &'sta
 /// the process at its ceiling, where the stage Threads stops its ready and
 /// its stopped thread in one portion; with no request taken and no
 /// children, the stages Replies and Children take a portion each;
-/// the table a chunk a portion; the space first loses TTBR0 and its ASID,
+/// the table half a chunk a portion; the space first loses TTBR0 and its ASID,
 /// and no call reaches its tables from then on, then a table a portion; the
 /// buffers of the threads the end stopped in one portion, the process's
 /// frames and the stage Quota in one more each. Then the shell stays for

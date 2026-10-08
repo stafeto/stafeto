@@ -812,7 +812,7 @@ const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
 const UPCALL_ROWS: [&str; 5] = ["interrupt", "bind", "control", "request", "return"];
 /// The rows of the line of `teardown_portions_are_measured`, in its order
 /// (spec 15.3): the term B of the out-of-tree measurement is the longest of them.
-const TEARDOWN_ROWS: [&str; 9] = [
+const TEARDOWN_ROWS: [&str; 10] = [
     "buffers",
     "shell",
     "end_call",
@@ -821,6 +821,7 @@ const TEARDOWN_ROWS: [&str; 9] = [
     "child_threads",
     "session_buffers",
     "session_handles",
+    "teardown_any",
     "threads",
 ];
 /// Scoped direct-control, pick + park and continuation measurements.
@@ -6921,7 +6922,7 @@ mod tests {
             |what, rows: &'static [&'static str], ticks: &[u64]| (what, rows, ticks.to_vec());
         let memory = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
         let timers = [1, 2, 3, 4];
-        let teardown = [5, 15, 1, 24, 42, 30, 20, 21, 128];
+        let teardown = [5, 15, 1, 24, 42, 30, 20, 21, 7, 128];
         let mut measured = vec![
             line("ipc round trip", &ROUND_TRIP_ROWS, &[1, 2, 3, 4, 5, 99_999]),
             line("memory portions", &MEMORY_PORTION_ROWS, &memory),
@@ -6935,11 +6936,18 @@ mod tests {
             blocking_time(&measured),
             ("teardown portions", "teardown_threads", 42)
         );
-        measured[6].2 = vec![5, 15, 1, 24, 18, 30, 20, 21, 50_000];
+        measured[6].2 = vec![5, 15, 1, 24, 18, 30, 20, 21, 7, 50_000];
         assert_eq!(
             blocking_time(&measured),
             ("teardown portions", "child_threads", 30)
         );
+        // The longest portion of any teardown is B as well.
+        measured[6].2[8] = 31;
+        assert_eq!(
+            blocking_time(&measured),
+            ("teardown portions", "teardown_any", 31)
+        );
+        measured[6].2[8] = 7;
         // A memory portion above every teardown row is B.
         measured[1].2[8] = 31;
         assert_eq!(

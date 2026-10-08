@@ -76,7 +76,10 @@ pub unsafe trait ChunkSource<T> {
 /// Every entry below `used` is live, free (on the free list) or retired
 /// (freed at the last generation and never handed out again); retired
 /// entries still count toward the limit. While a stepwise release is under
-/// way the table takes nothing new, and only `len` still counts.
+/// way the table takes nothing new, and only `len` still counts. During
+/// the release the chunk `chunk_count - 1` lies above `used`: no handle
+/// reaches it, its entries from `released` on are still live, and only
+/// `release_step` goes there.
 pub struct HandleTable<T> {
     /// Present from the first chunk until the release ends.
     directory: Option<NonNull<Directory<T>>>,
@@ -393,7 +396,7 @@ impl<T> HandleTable<T> {
             self.used = self.used.min((c * CHUNK) as u32);
             let chunk = (*self.chunk_slot(c)).expect("an initialised chunk");
             let from = self.released;
-            let to = CHUNK.min(from + n);
+            let to = from + n.min(CHUNK - from);
             // SAFETY: the chunk's entries are initialised; each object is
             // taken out once, from the cursor on, and the cursor moves past
             // it before the chunk can be looked at again.
@@ -1063,6 +1066,24 @@ mod tests {
         assert!(t.release_step(&mut src, 32, |v, _| out.push(v)));
         assert_eq!((src.freed, src.directories, t.len()), (2, 0, 0));
         assert_eq!(t.room(), 1000);
+    }
+
+    #[test]
+    fn a_step_of_any_size_ends_with_the_chunk() {
+        let mut src = boxes(2);
+        let mut t = table(1000);
+        for i in 0..100 {
+            t.insert(&mut src, i, RW).unwrap();
+        }
+        let mut out = Vec::new();
+        assert!(!t.release_step(&mut src, 10, |v, _| out.push(v)));
+        // The cursor stands at 10 of the chunk; the sum with the largest
+        // step must not wrap around it.
+        assert!(!t.release_step(&mut src, usize::MAX, |v, _| out.push(v)));
+        assert_eq!((src.freed, t.len()), (1, 64));
+        assert_eq!(out, (64..100).collect::<Vec<u32>>());
+        assert!(t.release_step(&mut src, usize::MAX, |v, _| out.push(v)));
+        assert_eq!((src.freed, t.len()), (2, 0));
     }
 
     #[test]

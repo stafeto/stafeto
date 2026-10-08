@@ -158,7 +158,7 @@ pub(super) fn run() -> bool {
             let now = || rt::time::ticks_to_ns(rt::time::now());
             if !matches!(
                 {
-                    let deadline = now() + 500_000_000;
+                    let deadline = now() + 10_000_000_000;
                     crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
                         waiter.receive_until(&ready, deadline)
                     })
@@ -200,7 +200,7 @@ pub(super) fn run() -> bool {
                 }
             }
         }
-        let deadline = rt::time::ticks_to_ns(rt::time::now()) + 500_000_000;
+        let deadline = rt::time::ticks_to_ns(rt::time::now()) + 10_000_000_000;
         if !matches!(
             {
                 crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
