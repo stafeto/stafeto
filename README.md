@@ -173,13 +173,15 @@ BusyBox included; its platform is the layer's `stafeto_*` functions.
 os-test's io, malloc, process and signal suites, `basic/spawn`, `basic/unistd`
 `exec*` and the `basic` tests that call `fork` run on it in `ci` from files,
 one boot a suite. The current run of 242 tests gives 185 PASS, 49 FAIL,
-7 UNSUPPORTED and 1 UNKNOWN (UNSUPPORTED is a test of an option that
-`unistd.h` does not claim, or a test that exits by itself without passing;
+7 UNSUPPORTED and 1 UNKNOWN (UNSUPPORTED is a test that needs an option
+`unistd.h` does not claim and exits by itself without passing;
 UNKNOWN is a test whose only expectations are marked unknown); `ci` fails
 when a test that passed stops passing. The PTY and termios suites exercise
 the terminal APIs, and readiness tests cover all four waiting interfaces.
 `cargo xtask coverage` counts 754 of the 1,035 required XSH interfaces
-(72.9 %) and 124 of 206 optional ones (60.2 %); functions that only return
+(72.9 %) and 124 of 206 optional ones (60.2 %, 101 of the 124 belong to
+options `unistd.h` does not claim; the claimed options show 23 of 23);
+functions that only return
 `ENOSYS` (60 required, 20 optional) do not count. The `unistd.h` macros and
 `sysconf` agree and claim only what exists. Most of the 49 failures are
 `fcntl` open-file-description locks, which answer `ENOSYS`. relibc
@@ -237,7 +239,7 @@ cargo xtask ci           # formatting, clippy, licence checks, then everything t
 cargo xtask hvf          # the test set under HVF on Apple silicon; skips elsewhere
 cargo xtask rtbench      # throughput and 1 ms timer wakeups on TCG, HVF and VZ; --minutes N runs HVF and VZ together
 cargo xtask ash-shell    # interactive BusyBox ash over the QEMU UART
-cargo xtask os-test      # os-test's io and malloc suites on relibc, a table in target/measure/
+cargo xtask os-test      # os-test's suites on relibc, a table in target/measure/
 cargo xtask coverage     # POSIX.1-2024 symbol, macro and header inventory
 cargo xtask gdb          # QEMU halted at the first instruction, debugger on :1234
 cargo xtask help         # every command, including single probes

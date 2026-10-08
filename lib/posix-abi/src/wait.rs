@@ -276,7 +276,9 @@ fn run(
     let transport = pins.transport.ok_or(EIO)?;
     // The pipes' Watch, then the terminal's Watches of WATCH_MAX elements
     // each (`proto_tty::watch_group`), every one with a label of its own.
-    // Label bit 1 is the timer's.
+    // The low three bits of a label: 0 the pipes, 1 and 3 the terminal's
+    // Watches, 2 the timer.
+    const _: () = assert!(proto_tty::WATCH_GROUPS == 2);
     let mut subscriptions = [
         Subscription::new(Service::Pipe, TAG | id << 3),
         Subscription::new(Service::Terminal, TAG | id << 3 | 1),
@@ -409,7 +411,7 @@ fn run(
     if let Some(timer) = timer.as_ref() {
         let _ = sys::timer_cancel(timer);
     }
-    // Both groups cancel even after partial registration or an early error.
+    // Every subscription cancels even after partial registration or an early error.
     let mut cleanup_error = None;
     for subscription in &mut subscriptions {
         if let Err(error) = subscription.cancel(&mut ready) {

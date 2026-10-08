@@ -8,7 +8,7 @@
 //! the queue of retired sets has closed what it holds. A set of a clone is
 //! found by the place of the clone's label in the table of `Clones`; a
 //! session that is no clone of the service (a root: one that init or the
-//! service gave out, not Clone) has its set in a small table of roots,
+//! service gave out itself) has its set in a small table of roots,
 //! whose labels trusted parties choose and which is walked whole. A free
 //! list gives the next free set. No operation walks the sets.
 //!

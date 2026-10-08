@@ -11,7 +11,7 @@
 pub const PER_CLIENT: usize = 48;
 
 /// The clients that are not clones themselves (a root: a session that init
-/// or the service gave out, not Clone) that count clones at once, at most.
+/// or the service gave out itself) that count clones at once, at most.
 /// Trusted parties choose their labels, so the small table that holds them
 /// is walked whole.
 pub const ROOTS: usize = 32;
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(c.give_within(TAG, 1, 1), Err(Full));
     }
 
-    /// The clones a clone made count for it, not for its root; they go on
+    /// The clones a clone made count for the clone that made them; they go on
     /// after it went, and nothing is counted twice.
     #[test]
     fn a_clone_counts_the_clones_it_made() {

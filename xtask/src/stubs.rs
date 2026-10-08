@@ -193,8 +193,8 @@ fn without_strings(text: &str) -> String {
     out
 }
 
-/// The plain functions `body` calls (`name(` in snake case, not a method,
-/// a path, a macro or a variant such as `Err(`).
+/// The plain functions `body` calls (`name(` in snake case: a free function;
+/// methods, paths, macros and variants such as `Err(` are left out).
 fn plain_calls(body: &str) -> BTreeSet<String> {
     let body = &without_strings(body);
     let mut names = BTreeSet::new();
@@ -471,7 +471,7 @@ pub unsafe extern \"C\" fn mmap(len: usize) -> c_int {
                 "alarm",
                 "alarm_timespec",
                 "mkdtemp",
-                "realpath", // confirmed by hand, not in the test sources
+                "realpath", // confirmed by hand; the test sources lack it
                 "remove",
                 "statvfs"
             ]

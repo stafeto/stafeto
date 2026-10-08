@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn finds_a_vector_load_of_the_number_of_the_register() {
-        // ldr d8, [x0] writes v8, not x8; LLD leaves it, this check does not.
+        // ldr d8, [x0] writes v8; LLD leaves it, this check refuses it.
         let code = bytes(&[ADRP_X8, 0xfd40_0008, STR_X2_X8_8]);
         assert_eq!(sequences_843419(0x4000_0ff8, &code), [0x4000_0ff8]);
     }

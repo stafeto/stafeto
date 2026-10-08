@@ -260,9 +260,12 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let rows = interfaces(INVENTORY)?;
     let xbd = headers(XBD_HEADERS)?;
     let scan = header_macros(&rows, &include)?;
+    let unistd = crate::ostest::macros_of(&include)?;
     let mut counts = BTreeMap::<(&str, &str), usize>::new();
+    // The same for the interfaces of options that unistd.h claims.
+    let mut claimed_counts = BTreeMap::<&str, usize>::new();
     let mut output = String::from(
-        "# POSIX.1-2024 XSH interface inventory\nname\tpage\trequirement\theaders\toption_codes\tavailability\n",
+        "# POSIX.1-2024 XSH interface inventory\nname\tpage\trequirement\theaders\toption_codes\tavailability\tclaimed\n",
     );
     for row in &rows {
         let availability = if names.contains(row.name) && stubs.contains(row.name) {
@@ -279,9 +282,19 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             "unresolved"
         };
         *counts.entry((row.requirement, availability)).or_default() += 1;
+        let claimed = crate::ostest::unclaimed_need(row.option_codes, &unistd).is_none();
+        if row.requirement == "option" && claimed {
+            *claimed_counts.entry(availability).or_default() += 1;
+        }
         output.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\n",
-            row.name, row.page, row.requirement, row.headers, row.option_codes, availability,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row.name,
+            row.page,
+            row.requirement,
+            row.headers,
+            row.option_codes,
+            availability,
+            if claimed { "yes" } else { "no" },
         ));
     }
     let path = target_dir().join("measure/posix-coverage.tsv");
@@ -347,6 +360,13 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             100.0 * covered as f64 / total as f64
         );
     }
+    let claimed = |availability| claimed_counts.get(availability).copied().unwrap_or(0);
+    let covered = claimed("exported-symbol") + claimed("header-macro");
+    let total = covered + claimed("stub-enosys") + claimed("unresolved");
+    println!(
+        "XSH option coverage of the options unistd.h claims: {covered} of {total} ({:.1} %)",
+        100.0 * covered as f64 / total as f64
+    );
     println!("XSH interface inventory: {}", path.display());
     println!(
         "XBD required headers: {} present, {} missing; option headers: {} present, {} missing",

@@ -207,14 +207,38 @@ fn judge_expectations(files: &[(String, String)], outcome: &str) -> Expectation 
     }
 }
 
-/// The macro of `<unistd.h>` that claims an option of os-test's markers:
-/// the option is claimed when the header defines it. Options not listed
-/// here are taken as claimed, so that their failures stay FAILs.
-const OPTION_MACROS: [(&str, &str); 4] = [
-    ("PS", "_POSIX_PRIORITY_SCHEDULING"),
-    ("SPN", "_POSIX_SPAWN"),
-    ("TSH", "_POSIX_THREAD_PROCESS_SHARED"),
-    ("XSI", "_XOPEN_UNIX"),
+/// The macros of `<unistd.h>` that claim an option, by the option codes of
+/// os-test's markers and of the standard's inventory (`cargo xtask
+/// coverage` reads it too): the option is claimed when the header defines
+/// one of them. Options not listed here are taken as claimed, so that
+/// their failures stay FAILs.
+const OPTION_MACROS: [(&str, &[&str]); 23] = [
+    ("PS", &["_POSIX_PRIORITY_SCHEDULING"]),
+    ("SPN", &["_POSIX_SPAWN"]),
+    ("TSH", &["_POSIX_THREAD_PROCESS_SHARED"]),
+    ("XSI", &["_XOPEN_UNIX"]),
+    ("TPS", &["_POSIX_THREAD_PRIORITY_SCHEDULING"]),
+    ("TSA", &["_POSIX_THREAD_ATTR_STACKADDR"]),
+    ("TSS", &["_POSIX_THREAD_ATTR_STACKSIZE"]),
+    ("SHM", &["_POSIX_SHARED_MEMORY_OBJECTS"]),
+    ("TCT", &["_POSIX_THREAD_CPUTIME"]),
+    ("ADV", &["_POSIX_ADVISORY_INFO"]),
+    ("IP6", &["_POSIX_IPV6"]),
+    ("RPP", &["_POSIX_THREAD_PRIO_PROTECT"]),
+    ("TPP", &["_POSIX_THREAD_PRIO_PROTECT"]),
+    ("TPI", &["_POSIX_THREAD_PRIO_INHERIT"]),
+    (
+        "MC1",
+        &["_POSIX_THREAD_PRIO_INHERIT", "_POSIX_THREAD_PRIO_PROTECT"],
+    ),
+    ("MSG", &["_POSIX_MESSAGE_PASSING"]),
+    ("TYM", &["_POSIX_TYPED_MEMORY_OBJECTS"]),
+    ("SIO", &["_POSIX_SYNCHRONIZED_IO"]),
+    ("FSC", &["_POSIX_FSYNC"]),
+    ("ML", &["_POSIX_MEMLOCK"]),
+    ("MLR", &["_POSIX_MEMLOCK_RANGE"]),
+    ("CPT", &["_POSIX_CPUTIME"]),
+    ("DC", &["_POSIX_DEVICE_CONTROL"]),
 ];
 
 /// Whether `header` (the macros of unistd.h, one `#define NAME value` a
@@ -228,11 +252,21 @@ fn defines(header: &str, macro_name: &str) -> bool {
 }
 
 /// Whether the system claims `option`, by the macros of unistd.h in `header`.
-fn claims(header: &str, option: &str) -> bool {
+pub(crate) fn claims(header: &str, option: &str) -> bool {
     OPTION_MACROS
         .iter()
         .find(|(code, _)| *code == option)
-        .is_none_or(|(_, macro_name)| defines(header, macro_name))
+        .is_none_or(|(_, macros)| macros.iter().any(|name| defines(header, name)))
+}
+
+/// The first unclaimed need among option codes: `A B` needs A and B, `A|B`
+/// needs A or B.
+pub(crate) fn unclaimed_need(codes: &str, header: &str) -> Option<String> {
+    codes.split_whitespace().find_map(|need| {
+        need.split('|')
+            .all(|option| !claims(header, option))
+            .then(|| need.to_owned())
+    })
 }
 
 /// The unclaimed option a test needs, by the marker os-test puts first in
@@ -240,11 +274,7 @@ fn claims(header: &str, option: &str) -> bool {
 fn unclaimed_option(source: &str, header: &str) -> Option<String> {
     let marker = source.lines().next()?.strip_prefix("/*[")?;
     let marker = marker.split_once("]*/")?.0;
-    marker.split_whitespace().find_map(|need| {
-        need.split('|')
-            .all(|option| !claims(header, option))
-            .then(|| need.to_owned())
-    })
+    unclaimed_need(marker, header)
 }
 
 /// The verdict of a test by its expectations, whether it `exited` by
@@ -277,7 +307,7 @@ fn unistd_macros() -> Result<String, String> {
 }
 
 /// The macros of `include`/unistd.h, by the preprocessor.
-fn macros_of(include: &Path) -> Result<String, String> {
+pub(crate) fn macros_of(include: &Path) -> Result<String, String> {
     let brew = Path::new("/opt/homebrew/opt/llvm/bin/clang");
     let clang = if brew.exists() {
         brew.to_path_buf()
@@ -1207,7 +1237,13 @@ mod tests {
         assert_eq!(find("/*[TSH]*/\nint x;"), Some("TSH".to_owned()));
         assert_eq!(find("/*[SPN]*/\nint x;"), None);
         assert_eq!(find("/*[PS|SPN]*/\nint x;"), None);
-        assert_eq!(find("/*[RPP|TPP]*/\nint x;"), None);
+        assert_eq!(find("/*[ZZZ]*/\nint x;"), None);
+        assert_eq!(find("/*[RPP|TPP]*/\nint x;"), Some("RPP|TPP".to_owned()));
+        assert_eq!(find("/*[MC1]*/\nint x;"), Some("MC1".to_owned()));
+        assert_eq!(
+            unclaimed_option("/*[MC1]*/\n", "#define _POSIX_THREAD_PRIO_INHERIT 1\n"),
+            None
+        );
         assert_eq!(find("/*[PS|XSI]*/\nint x;"), Some("PS|XSI".to_owned()));
         assert_eq!(find("/* Test sigaltstack. */"), None);
         assert_eq!(find(""), None);
