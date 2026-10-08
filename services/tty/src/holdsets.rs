@@ -11,6 +11,12 @@
 //! service gave out, not Clone) has its set in a small table of roots,
 //! whose labels trusted parties choose and which is walked whole. A free
 //! list gives the next free set. No operation walks the sets.
+//!
+//! A set goes back to the free list (`release`) only after `unbind` took
+//! it out of the tables, and `unbind` comes with the end of the session's
+//! last handle (`closed`), which follows `gone` in the same notice. A
+//! service that hears `gone` alone (a session moved off its place) must
+//! unbind the set there before it can release it.
 
 use crate::endpoints::Holds;
 use proto_wire::clones::{Clones, ROOTS};
@@ -107,6 +113,9 @@ impl<const C: usize, const N: usize> HoldSets<C, N> {
     pub fn release(&mut self, set: usize) {
         #[cfg(test)]
         self.probe();
+        // Still bound: the session's end was not heard (see the module).
+        debug_assert!(!self.by_place.contains(&(set as u16)));
+        debug_assert!(!self.roots.iter().any(|&(_, bound)| bound == set as u16));
         self.sets[set] = HoldSet::new();
         self.next[set] = self.free;
         self.free = set as u16;
@@ -320,5 +329,15 @@ mod tests {
         assert!(sets.bind_root(label(ROOTS as u64), extra));
         assert_eq!(sets.for_root(label(ROOTS as u64)), Some(extra));
         sets.release(first);
+    }
+
+    /// A set that is still bound to a clone is not given back.
+    #[test]
+    #[should_panic]
+    fn a_bound_set_is_not_released() {
+        let mut clones = Clones::<C>::new();
+        let mut sets = filled(&mut clones, 1, 0);
+        let set = sets.for_clone(0).unwrap();
+        sets.release(set);
     }
 }

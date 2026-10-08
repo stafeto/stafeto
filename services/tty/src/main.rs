@@ -1759,6 +1759,9 @@ impl Tty {
             Ok(set) if r.handles.is_empty() => set,
             _ => return Answer::Status(Status::BadSize),
         };
+        if set.len > proto_tty::WATCH_MAX {
+            return Answer::Status(Status::BadSize);
+        }
         // The elements that name one description are met once: its
         // endpoint is resolved and its readiness read once for all of
         // them, and the pins they take are made in one step. Only the
@@ -1826,9 +1829,9 @@ impl Tty {
         }
         for (index, &(description, named)) in distinct[..distinct_len].iter().enumerate() {
             if description != CONSOLE
-                && let Err(error) =
-                    self.endpoints
-                        .pin_by(&self.holdsets[s.data.holding].holds, description, named)
+                // Resolved above, in this step: the table index is the
+                // low byte of the number.
+                && let Err(error) = self.endpoints.pin_at((description & 255) as usize, named)
             {
                 for &(previous, named) in &distinct[..index] {
                     if previous != CONSOLE {
@@ -2001,9 +2004,9 @@ impl Tty {
             holds: child,
             retired: false,
         };
-        if let Some(place) = self.clones.place_of(label) {
-            self.holdsets.bind_clone(place, slot);
-        }
+        // `give_within` just gave the label a place.
+        let place = self.clones.place_of(label).expect("a label just given");
+        self.holdsets.bind_clone(place, slot);
         let _ = r.reply().u32(0);
         Answer::Reply([session.erase()].into())
     }
