@@ -168,61 +168,276 @@ static int end_badly(const char *how) {
     return 1;
 }
 
-/* The constants of <unistd.h> and what sysconf answers. The system claims a
- * subprofile of POSIX.1-2024: the version is 202405, _POSIX_TIMERS stays out
- * until timer_create works, and sysconf gives each option macro's value (-1,
- * with errno untouched, for an option the header leaves out). */
+/* The constants of <unistd.h> and what sysconf answers, for every option of
+ * POSIX.1-2024 that has an _SC_ name. The system claims a subprofile: the
+ * version is 202405; a macro is defined only for an option that works, with
+ * the value the standard allows (202405L, or any positive value for
+ * JOB_CONTROL, REGEXP, SAVED_IDS and SHELL); sysconf then gives the macro's
+ * value, and -1 with errno untouched for an option without a macro, except
+ * the few that work at run time without a macro (runtime = 1). The XSI
+ * option is not claimed. */
 #ifndef _POSIX_SUBPROFILE
 #error "unistd.h does not define _POSIX_SUBPROFILE"
 #endif
 #ifdef _POSIX_TIMERS
 #error "unistd.h defines _POSIX_TIMERS while timer_create answers ENOSYS"
 #endif
+#if defined(_XOPEN_UNIX) || defined(_XOPEN_VERSION) || defined(_XOPEN_SHM)
+#error "unistd.h claims the XSI option"
+#endif
 _Static_assert(_POSIX_VERSION == 202405L, "_POSIX_VERSION is not POSIX.1-2024");
+
+/* pthread.h after unistd.h: it must not define _POSIX_THREADS again. */
+#include <pthread.h>
+_Static_assert(_POSIX_THREADS == 202405L, "_POSIX_THREADS changed with the include order");
 
 static int constants(void) {
     struct {
         const char *name;
         int key;
         long macro;
+        char kind; /* V: 202405L, P: positive, O: -1 or 202405L */
+        int runtime;
+        int defined;
     } options[] = {
-        {"_POSIX_VERSION", _SC_VERSION, _POSIX_VERSION},
-        {"_POSIX_BARRIERS", _SC_BARRIERS, _POSIX_BARRIERS},
-        {"_POSIX_MONOTONIC_CLOCK", _SC_MONOTONIC_CLOCK, _POSIX_MONOTONIC_CLOCK},
-        {"_POSIX_REALTIME_SIGNALS", _SC_REALTIME_SIGNALS, _POSIX_REALTIME_SIGNALS},
-        {"_POSIX_SEMAPHORES", _SC_SEMAPHORES, _POSIX_SEMAPHORES},
-        {"_POSIX_SHELL", _SC_SHELL, _POSIX_SHELL},
-        {"_POSIX_SHARED_MEMORY_OBJECTS", _SC_SHARED_MEMORY_OBJECTS,
-         _POSIX_SHARED_MEMORY_OBJECTS},
-        {"_POSIX_THREADS", _SC_THREADS, _POSIX_THREADS},
-        {"_POSIX_THREAD_ATTR_STACKADDR", _SC_THREAD_ATTR_STACKADDR,
-         _POSIX_THREAD_ATTR_STACKADDR},
-        {"_POSIX_THREAD_ATTR_STACKSIZE", _SC_THREAD_ATTR_STACKSIZE,
-         _POSIX_THREAD_ATTR_STACKSIZE},
-        {"_POSIX_TIMEOUTS", _SC_TIMEOUTS, _POSIX_TIMEOUTS},
-        {"_XOPEN_SHM", _SC_XOPEN_SHM, _XOPEN_SHM},
+#ifdef _POSIX_ADVISORY_INFO
+    {"_POSIX_ADVISORY_INFO", _SC_ADVISORY_INFO, _POSIX_ADVISORY_INFO, 'O', 0, 1},
+#else
+    {"_POSIX_ADVISORY_INFO", _SC_ADVISORY_INFO, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_ASYNCHRONOUS_IO
+    {"_POSIX_ASYNCHRONOUS_IO", _SC_ASYNCHRONOUS_IO, _POSIX_ASYNCHRONOUS_IO, 'V', 0, 1},
+#else
+    {"_POSIX_ASYNCHRONOUS_IO", _SC_ASYNCHRONOUS_IO, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_BARRIERS
+    {"_POSIX_BARRIERS", _SC_BARRIERS, _POSIX_BARRIERS, 'V', 0, 1},
+#else
+    {"_POSIX_BARRIERS", _SC_BARRIERS, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_CLOCK_SELECTION
+    {"_POSIX_CLOCK_SELECTION", _SC_CLOCK_SELECTION, _POSIX_CLOCK_SELECTION, 'V', 1, 1},
+#else
+    {"_POSIX_CLOCK_SELECTION", _SC_CLOCK_SELECTION, -1, 'V', 1, 0},
+#endif
+#ifdef _POSIX_CPUTIME
+    {"_POSIX_CPUTIME", _SC_CPUTIME, _POSIX_CPUTIME, 'O', 0, 1},
+#else
+    {"_POSIX_CPUTIME", _SC_CPUTIME, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_FSYNC
+    {"_POSIX_FSYNC", _SC_FSYNC, _POSIX_FSYNC, 'O', 0, 1},
+#else
+    {"_POSIX_FSYNC", _SC_FSYNC, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_IPV6
+    {"_POSIX_IPV6", _SC_IPV6, _POSIX_IPV6, 'O', 0, 1},
+#else
+    {"_POSIX_IPV6", _SC_IPV6, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_JOB_CONTROL
+    {"_POSIX_JOB_CONTROL", _SC_JOB_CONTROL, _POSIX_JOB_CONTROL, 'P', 0, 1},
+#else
+    {"_POSIX_JOB_CONTROL", _SC_JOB_CONTROL, -1, 'P', 0, 0},
+#endif
+#ifdef _POSIX_MAPPED_FILES
+    {"_POSIX_MAPPED_FILES", _SC_MAPPED_FILES, _POSIX_MAPPED_FILES, 'V', 0, 1},
+#else
+    {"_POSIX_MAPPED_FILES", _SC_MAPPED_FILES, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_MEMLOCK
+    {"_POSIX_MEMLOCK", _SC_MEMLOCK, _POSIX_MEMLOCK, 'O', 0, 1},
+#else
+    {"_POSIX_MEMLOCK", _SC_MEMLOCK, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_MEMLOCK_RANGE
+    {"_POSIX_MEMLOCK_RANGE", _SC_MEMLOCK_RANGE, _POSIX_MEMLOCK_RANGE, 'O', 0, 1},
+#else
+    {"_POSIX_MEMLOCK_RANGE", _SC_MEMLOCK_RANGE, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_MEMORY_PROTECTION
+    {"_POSIX_MEMORY_PROTECTION", _SC_MEMORY_PROTECTION, _POSIX_MEMORY_PROTECTION, 'V', 0, 1},
+#else
+    {"_POSIX_MEMORY_PROTECTION", _SC_MEMORY_PROTECTION, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_MESSAGE_PASSING
+    {"_POSIX_MESSAGE_PASSING", _SC_MESSAGE_PASSING, _POSIX_MESSAGE_PASSING, 'O', 0, 1},
+#else
+    {"_POSIX_MESSAGE_PASSING", _SC_MESSAGE_PASSING, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_MONOTONIC_CLOCK
+    {"_POSIX_MONOTONIC_CLOCK", _SC_MONOTONIC_CLOCK, _POSIX_MONOTONIC_CLOCK, 'V', 0, 1},
+#else
+    {"_POSIX_MONOTONIC_CLOCK", _SC_MONOTONIC_CLOCK, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_PRIORITIZED_IO
+    {"_POSIX_PRIORITIZED_IO", _SC_PRIORITIZED_IO, _POSIX_PRIORITIZED_IO, 'O', 0, 1},
+#else
+    {"_POSIX_PRIORITIZED_IO", _SC_PRIORITIZED_IO, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_PRIORITY_SCHEDULING
+    {"_POSIX_PRIORITY_SCHEDULING", _SC_PRIORITY_SCHEDULING, _POSIX_PRIORITY_SCHEDULING, 'O', 0, 1},
+#else
+    {"_POSIX_PRIORITY_SCHEDULING", _SC_PRIORITY_SCHEDULING, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_RAW_SOCKETS
+    {"_POSIX_RAW_SOCKETS", _SC_RAW_SOCKETS, _POSIX_RAW_SOCKETS, 'O', 0, 1},
+#else
+    {"_POSIX_RAW_SOCKETS", _SC_RAW_SOCKETS, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_READER_WRITER_LOCKS
+    {"_POSIX_READER_WRITER_LOCKS", _SC_READER_WRITER_LOCKS, _POSIX_READER_WRITER_LOCKS, 'V', 1, 1},
+#else
+    {"_POSIX_READER_WRITER_LOCKS", _SC_READER_WRITER_LOCKS, -1, 'V', 1, 0},
+#endif
+#ifdef _POSIX_REALTIME_SIGNALS
+    {"_POSIX_REALTIME_SIGNALS", _SC_REALTIME_SIGNALS, _POSIX_REALTIME_SIGNALS, 'V', 0, 1},
+#else
+    {"_POSIX_REALTIME_SIGNALS", _SC_REALTIME_SIGNALS, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_REGEXP
+    {"_POSIX_REGEXP", _SC_REGEXP, _POSIX_REGEXP, 'P', 1, 1},
+#else
+    {"_POSIX_REGEXP", _SC_REGEXP, -1, 'P', 1, 0},
+#endif
+#ifdef _POSIX_SAVED_IDS
+    {"_POSIX_SAVED_IDS", _SC_SAVED_IDS, _POSIX_SAVED_IDS, 'P', 0, 1},
+#else
+    {"_POSIX_SAVED_IDS", _SC_SAVED_IDS, -1, 'P', 0, 0},
+#endif
+#ifdef _POSIX_SEMAPHORES
+    {"_POSIX_SEMAPHORES", _SC_SEMAPHORES, _POSIX_SEMAPHORES, 'V', 0, 1},
+#else
+    {"_POSIX_SEMAPHORES", _SC_SEMAPHORES, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_SHARED_MEMORY_OBJECTS
+    {"_POSIX_SHARED_MEMORY_OBJECTS", _SC_SHARED_MEMORY_OBJECTS, _POSIX_SHARED_MEMORY_OBJECTS, 'O', 0, 1},
+#else
+    {"_POSIX_SHARED_MEMORY_OBJECTS", _SC_SHARED_MEMORY_OBJECTS, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_SHELL
+    {"_POSIX_SHELL", _SC_SHELL, _POSIX_SHELL, 'P', 0, 1},
+#else
+    {"_POSIX_SHELL", _SC_SHELL, -1, 'P', 0, 0},
+#endif
+#ifdef _POSIX_SPAWN
+    {"_POSIX_SPAWN", _SC_SPAWN, _POSIX_SPAWN, 'O', 0, 1},
+#else
+    {"_POSIX_SPAWN", _SC_SPAWN, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_SPIN_LOCKS
+    {"_POSIX_SPIN_LOCKS", _SC_SPIN_LOCKS, _POSIX_SPIN_LOCKS, 'V', 1, 1},
+#else
+    {"_POSIX_SPIN_LOCKS", _SC_SPIN_LOCKS, -1, 'V', 1, 0},
+#endif
+#ifdef _POSIX_SPORADIC_SERVER
+    {"_POSIX_SPORADIC_SERVER", _SC_SPORADIC_SERVER, _POSIX_SPORADIC_SERVER, 'O', 0, 1},
+#else
+    {"_POSIX_SPORADIC_SERVER", _SC_SPORADIC_SERVER, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_SYNCHRONIZED_IO
+    {"_POSIX_SYNCHRONIZED_IO", _SC_SYNCHRONIZED_IO, _POSIX_SYNCHRONIZED_IO, 'O', 0, 1},
+#else
+    {"_POSIX_SYNCHRONIZED_IO", _SC_SYNCHRONIZED_IO, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_THREAD_ATTR_STACKADDR
+    {"_POSIX_THREAD_ATTR_STACKADDR", _SC_THREAD_ATTR_STACKADDR, _POSIX_THREAD_ATTR_STACKADDR, 'O', 0, 1},
+#else
+    {"_POSIX_THREAD_ATTR_STACKADDR", _SC_THREAD_ATTR_STACKADDR, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_THREAD_ATTR_STACKSIZE
+    {"_POSIX_THREAD_ATTR_STACKSIZE", _SC_THREAD_ATTR_STACKSIZE, _POSIX_THREAD_ATTR_STACKSIZE, 'O', 0, 1},
+#else
+    {"_POSIX_THREAD_ATTR_STACKSIZE", _SC_THREAD_ATTR_STACKSIZE, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_THREAD_CPUTIME
+    {"_POSIX_THREAD_CPUTIME", _SC_THREAD_CPUTIME, _POSIX_THREAD_CPUTIME, 'O', 0, 1},
+#else
+    {"_POSIX_THREAD_CPUTIME", _SC_THREAD_CPUTIME, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_THREAD_PRIO_INHERIT
+    {"_POSIX_THREAD_PRIO_INHERIT", _SC_THREAD_PRIO_INHERIT, _POSIX_THREAD_PRIO_INHERIT, 'O', 0, 1},
+#else
+    {"_POSIX_THREAD_PRIO_INHERIT", _SC_THREAD_PRIO_INHERIT, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_THREAD_PRIO_PROTECT
+    {"_POSIX_THREAD_PRIO_PROTECT", _SC_THREAD_PRIO_PROTECT, _POSIX_THREAD_PRIO_PROTECT, 'O', 0, 1},
+#else
+    {"_POSIX_THREAD_PRIO_PROTECT", _SC_THREAD_PRIO_PROTECT, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_THREAD_PRIORITY_SCHEDULING
+    {"_POSIX_THREAD_PRIORITY_SCHEDULING", _SC_THREAD_PRIORITY_SCHEDULING, _POSIX_THREAD_PRIORITY_SCHEDULING, 'O', 0, 1},
+#else
+    {"_POSIX_THREAD_PRIORITY_SCHEDULING", _SC_THREAD_PRIORITY_SCHEDULING, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_THREAD_PROCESS_SHARED
+    {"_POSIX_THREAD_PROCESS_SHARED", _SC_THREAD_PROCESS_SHARED, _POSIX_THREAD_PROCESS_SHARED, 'O', 0, 1},
+#else
+    {"_POSIX_THREAD_PROCESS_SHARED", _SC_THREAD_PROCESS_SHARED, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_THREAD_SAFE_FUNCTIONS
+    {"_POSIX_THREAD_SAFE_FUNCTIONS", _SC_THREAD_SAFE_FUNCTIONS, _POSIX_THREAD_SAFE_FUNCTIONS, 'V', 1, 1},
+#else
+    {"_POSIX_THREAD_SAFE_FUNCTIONS", _SC_THREAD_SAFE_FUNCTIONS, -1, 'V', 1, 0},
+#endif
+#ifdef _POSIX_THREAD_SPORADIC_SERVER
+    {"_POSIX_THREAD_SPORADIC_SERVER", _SC_THREAD_SPORADIC_SERVER, _POSIX_THREAD_SPORADIC_SERVER, 'O', 0, 1},
+#else
+    {"_POSIX_THREAD_SPORADIC_SERVER", _SC_THREAD_SPORADIC_SERVER, -1, 'O', 0, 0},
+#endif
+#ifdef _POSIX_THREADS
+    {"_POSIX_THREADS", _SC_THREADS, _POSIX_THREADS, 'V', 0, 1},
+#else
+    {"_POSIX_THREADS", _SC_THREADS, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_TIMEOUTS
+    {"_POSIX_TIMEOUTS", _SC_TIMEOUTS, _POSIX_TIMEOUTS, 'V', 0, 1},
+#else
+    {"_POSIX_TIMEOUTS", _SC_TIMEOUTS, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_TIMERS
+    {"_POSIX_TIMERS", _SC_TIMERS, _POSIX_TIMERS, 'V', 0, 1},
+#else
+    {"_POSIX_TIMERS", _SC_TIMERS, -1, 'V', 0, 0},
+#endif
+#ifdef _POSIX_TYPED_MEMORY_OBJECTS
+    {"_POSIX_TYPED_MEMORY_OBJECTS", _SC_TYPED_MEMORY_OBJECTS, _POSIX_TYPED_MEMORY_OBJECTS, 'O', 0, 1},
+#else
+    {"_POSIX_TYPED_MEMORY_OBJECTS", _SC_TYPED_MEMORY_OBJECTS, -1, 'O', 0, 0},
+#endif
     };
+    int claimed = 0;
     for (size_t i = 0; i < sizeof options / sizeof options[0]; i++) {
-        long got = sysconf(options[i].key);
-        if (got != options[i].macro) {
-            printf("relibc-hello: sysconf(%s) is %ld, the header says %ld\n", options[i].name, got,
-                   options[i].macro);
-            return 21;
+        long macro = options[i].macro;
+        if (options[i].defined) {
+            int fits = options[i].kind == 'P' ? macro > 0 : macro == 202405L;
+            if (!fits) {
+                printf("relibc-hello: %s is %ld, which the standard does not allow\n",
+                       options[i].name, macro);
+                return 21;
+            }
+            claimed++;
         }
-    }
-    /* The options the header leaves out: -1 and no errno. */
-    int left_out[] = {_SC_TIMERS, _SC_ASYNCHRONOUS_IO, _SC_MESSAGE_PASSING, _SC_MEMLOCK};
-    for (size_t i = 0; i < sizeof left_out / sizeof left_out[0]; i++) {
         errno = 0;
-        long got = sysconf(left_out[i]);
-        if (got != -1 || errno != 0) {
-            printf("relibc-hello: sysconf(%d) is %ld, errno %d; expected -1 and no errno\n",
-                   left_out[i], got, errno);
+        long got = sysconf(options[i].key);
+        if (options[i].defined ? got != macro : (options[i].runtime ? got == 0 : got != -1)) {
+            printf("relibc-hello: sysconf(%s) is %ld, the header says %ld\n", options[i].name,
+                   got, macro);
             return 22;
         }
+        if (got == -1 && errno != 0) {
+            printf("relibc-hello: sysconf(%s) set errno %d\n", options[i].name, errno);
+            return 23;
+        }
     }
-    printf("relibc-hello: constants: _POSIX_VERSION %ld, _POSIX_SUBPROFILE %ld, timers %ld\n",
-           sysconf(_SC_VERSION), (long)_POSIX_SUBPROFILE, sysconf(_SC_TIMERS));
+    errno = 0;
+    if (sysconf(_SC_XOPEN_UNIX) != -1 || sysconf(_SC_XOPEN_VERSION) != -1 ||
+        sysconf(_SC_XOPEN_SHM) != -1 || sysconf(_SC_VERSION) != 202405L || errno != 0) {
+        printf("relibc-hello: sysconf claims the XSI option or the wrong version\n");
+        return 24;
+    }
+    printf("relibc-hello: constants: _POSIX_VERSION %ld, _POSIX_SUBPROFILE %ld, %d options claimed, timers %ld\n",
+           sysconf(_SC_VERSION), (long)_POSIX_SUBPROFILE, claimed, sysconf(_SC_TIMERS));
     return 0;
 }
 

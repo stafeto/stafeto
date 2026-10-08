@@ -497,7 +497,39 @@ static void clock_page(void) {
            reads, SETTINGS);
 }
 
+/* _POSIX_THREAD_ATTR_STACKADDR: a thread started with pthread_attr_setstack
+ * runs on that memory (the address of its local is inside it), and
+ * pthread_attr_getstack gives the region back. */
+#define OWN_STACK 65536
+static char *own_stack;
+static int on_own_stack;
+
+static void *report_stack(void *arg) {
+    char local = 0;
+    char *at = &local;
+    on_own_stack = at >= own_stack && at < own_stack + OWN_STACK;
+    return arg;
+}
+
+static void stack_address(void) {
+    own_stack = malloc(OWN_STACK);
+    CHECK(own_stack != NULL);
+    pthread_attr_t attr;
+    CHECK(pthread_attr_init(&attr) == 0);
+    CHECK(pthread_attr_setstack(&attr, own_stack, OWN_STACK) == 0);
+    void *got_address = NULL;
+    size_t got_size = 0;
+    CHECK(pthread_attr_getstack(&attr, &got_address, &got_size) == 0);
+    CHECK(got_address == own_stack && got_size == OWN_STACK);
+    pthread_t thread;
+    CHECK(pthread_create(&thread, &attr, report_stack, NULL) == 0);
+    CHECK(pthread_join(thread, NULL) == 0);
+    CHECK(on_own_stack == 1);
+    printf("relibc-threads: a thread ran on the stack given to pthread_attr_setstack\n");
+}
+
 int main(void) {
+    stack_address();
     CHECK(pthread_attr_init(&small) == 0);
     CHECK(pthread_attr_setstacksize(&small, 65536) == 0);
     pthread_t dog;

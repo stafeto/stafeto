@@ -2552,7 +2552,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: fread ",
         "relibc-hello: monotonic ",
         "relibc-hello: directories, stat, descriptors, mmap, math",
-        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, timers -1",
+        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 11 options claimed, timers -1",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
         "Assertion `how == NULL` failed.",
@@ -3514,6 +3514,10 @@ fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
         &kernel.elf,
     )?;
     qemu::expect_marker(&output, ENDED)?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: a thread ran on the stack given to pthread_attr_setstack",
+    )?;
     qemu::expect_marker(&output, "relibc-threads: ok")?;
     println!("relibc pthread guest probe passed");
     Ok(())
