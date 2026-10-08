@@ -260,7 +260,7 @@ fn counted_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
 
 /// SELF owns one paid NONE capability; CURRENT compares actual Thread objects.
 pub fn object_info_self_thread_has_exact_ownership(_: &Boot) -> Result<(), &'static str> {
-    let threads = thread::probe_in_use();
+    let threads = thread::in_use();
     let processes = process::in_use();
     let result = with_caller(|c| {
         let n = Call::ObjectInfo.number();
@@ -337,7 +337,7 @@ pub fn object_info_self_thread_has_exact_ownership(_: &Boot) -> Result<(), &'sta
     });
     result?;
     check(
-        thread::probe_in_use() == threads && process::in_use() == processes,
+        thread::in_use() == threads && process::in_use() == processes,
         "SELF leaked a Thread or Process reference after caller cleanup",
     )
 }
