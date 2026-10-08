@@ -77,7 +77,8 @@
 //!   controlling terminal of the caller's session; NOT_CONTROLLING
 //!   otherwise.
 //!
-//! WatchStart/Take/Cancel use proto_wire::watch: at most 32 descriptions,
+//! WatchStart/Take/Cancel use proto_wire::watch: at most WATCH_MAX (16)
+//! elements, which a poll of up to 32 splits into several Watches,
 //! one registration per actual description, READY through Cancel, which
 //! recomputes every original element and frees the registration.
 //!
@@ -95,6 +96,16 @@ use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 pub const VERSION: u16 = 4;
 /// The side tag of an opaque open description.
 pub const MASTER: u32 = 1 << 31;
+/// The elements of one Watch of the service at most. A poll of more
+/// terminal descriptions makes several (`WATCH_GROUPS`), a step each.
+pub const WATCH_MAX: usize = 16;
+/// The Watches a poll of `proto_wire::watch::MAX` terminal descriptions
+/// makes.
+pub const WATCH_GROUPS: usize = proto_wire::watch::MAX.div_ceil(WATCH_MAX);
+/// The Watch the `placed`-th terminal element of a poll joins.
+pub const fn watch_group(placed: usize) -> usize {
+    placed / WATCH_MAX
+}
 pub const BAD_DESCRIPTION: u32 = 809;
 pub const NO_ENTRY: u32 = 810;
 /// Stat by physical terminal: body u32::MAX followed by terminal, or
@@ -900,6 +911,53 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto_wire::watch;
+
+    /// A poll of `count` terminal descriptions as `posix-abi` makes it:
+    /// the elements join Watches of WATCH_MAX each (`watch_group`), the
+    /// service answers each Watch for its own elements, and the answers
+    /// go back to the positions of the poll. Description `n` is ready
+    /// when `n % 3 == 0`.
+    fn poll(count: usize) -> Option<[u32; watch::MAX]> {
+        if count > watch::MAX {
+            return None;
+        }
+        let mut sets = [watch::Set::new(); WATCH_GROUPS];
+        let mut original = [[0; WATCH_MAX]; WATCH_GROUPS];
+        for index in 0..count {
+            let group = watch_group(sets.iter().map(|s| s.len).sum());
+            let set = &mut sets[group];
+            original[group][set.len] = index;
+            set.items[set.len] = watch::Item {
+                description: 100 + index as u32,
+                events: watch::IN,
+            };
+            set.len += 1;
+        }
+        let mut ready = [0; watch::MAX];
+        for (set, original) in sets.iter().zip(&original) {
+            assert!(set.len <= WATCH_MAX);
+            let answer = set.ready(|id| if id % 3 == 0 { watch::IN } else { 0 });
+            for (event, index) in answer.events[..answer.len].iter().zip(original) {
+                ready[*index] |= event;
+            }
+        }
+        Some(ready)
+    }
+
+    #[test]
+    fn a_poll_of_32_terminal_descriptions_splits_into_watches_of_16() {
+        for count in [1, 16, 17, 31, 32] {
+            let ready = poll(count).unwrap();
+            for index in 0..watch::MAX {
+                let want = (index < count && (100 + index) % 3 == 0) as u32 * watch::IN;
+                assert_eq!(ready[index], want, "count {count}, position {index}");
+            }
+        }
+        // A 33rd element has no Watch to join, and the poll is refused.
+        assert_eq!(poll(33), None);
+        assert_eq!(watch_group(watch::MAX), WATCH_GROUPS);
+    }
 
     #[test]
     fn open_and_metadata_have_unambiguous_widths() {

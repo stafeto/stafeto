@@ -521,6 +521,8 @@ mod steps {
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static FULL: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// The same for the steps of detail 16 (the terminal's Watch).
+    static FULL_16: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static DETAILS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static QUIET: AtomicBool = AtomicBool::new(false);
     /// A number the handler of the step gives (`super::step_detail`), for
@@ -543,8 +545,10 @@ mod steps {
         ))
     }
 
-    pub fn full(kind: usize) -> Option<(u64, u64)> {
-        Some((FULL.get(kind)?.load(Ordering::Relaxed), 32))
+    /// The longest step of `kind` whose detail was `detail` (32 or 16).
+    pub fn full(kind: usize, detail: u64) -> Option<(u64, u64)> {
+        let table = if detail == 16 { &FULL_16 } else { &FULL };
+        Some((table.get(kind)?.load(Ordering::Relaxed), detail))
     }
 
     pub fn detail(value: u64) {
@@ -597,6 +601,8 @@ mod steps {
         let detail = DETAIL.swap(0, Ordering::Relaxed);
         if detail == 32 {
             FULL[kind].fetch_max(took, Ordering::Relaxed);
+        } else if detail == 16 {
+            FULL_16[kind].fetch_max(took, Ordering::Relaxed);
         }
         let tag = REPORT.load(Ordering::Relaxed);
         let printing = tag != 0 && !QUIET.load(Ordering::Relaxed);
@@ -666,7 +672,7 @@ pub fn step_snapshot(r: &mut Request<'_>) -> Answer {
         step_maximum(kind)
     } else {
         match body.u64() {
-            Ok(32) => steps::full(kind),
+            Ok(detail @ (16 | 32)) => steps::full(kind, detail),
             _ => None,
         }
     };

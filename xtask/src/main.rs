@@ -2703,26 +2703,38 @@ fn check_watch_steps(lines: &[String]) -> Result<(), String> {
                 return Err(format!("watch full case exceeded {RAM_STEP_MAX}: {ticks}"));
             }
         }
+        // The pipe service's Watch holds 32 elements, the terminal's 16
+        // (a poll of 32 makes two).
+        let elements = if tag == "5" { 16 } else { 32 };
         for method in methods {
             if !full
                 .iter()
-                .any(|&(kind, ticks, detail)| kind == method && ticks != 0 && detail == 32)
+                .any(|&(kind, ticks, detail)| kind == method && ticks != 0 && detail == elements)
             {
                 return Err(format!(
-                    "watch method {method} has no full 32-element measurement: {steps:?}"
+                    "watch method {method} has no full {elements}-element measurement: {steps:?}"
                 ));
             }
         }
-        // The terminal service's Watch of 32 elements keeps a margin under
-        // term B: it met each description once, and a walk of the 32
-        // elements for each would take 20 593 of the 20 410.
+        // The terminal service's Watch of 16 elements (two for a poll of 32) keeps a margin under
+        // term B: its elements are met once for each description and the
+        // descriptions are found by a bit test.
+        if tag == "5"
+            && let Some(&(kind, _, detail)) = steps
+                .iter()
+                .find(|&&(kind, _, detail)| methods.contains(&kind) && detail > 16)
+        {
+            return Err(format!(
+                "terminal service: a Watch step of kind {kind} had {detail} elements, past 16"
+            ));
+        }
         if tag == "5"
             && let Some(&(kind, ticks, _)) = full
                 .iter()
                 .find(|&&(kind, ticks, _)| methods.contains(&kind) && ticks > WATCH_FULL_MAX)
         {
             return Err(format!(
-                "terminal service: a Watch of 32 elements, kind {kind}, took {ticks}, past {WATCH_FULL_MAX}"
+                "terminal service: a Watch of 16 elements, kind {kind}, took {ticks}, past {WATCH_FULL_MAX}"
             ));
         }
         if ![64, 65].iter().all(|wanted| {

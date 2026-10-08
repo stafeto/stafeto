@@ -89,19 +89,63 @@ static int service_watches(void) {
     CHECK(tcgetattr(tty, &old) == 0);
     raw = old; raw.c_lflag &= ~ICANON; raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 1;
     CHECK(tcsetattr(tty, TCSANOW, &raw) == 0);
-    for (unsigned i = 0; i < 32; i++) { fds[i] = tty; events[i] = IN; }
-    CHECK(stafeto_watch_start(fds, events, 32, &key, ready) == 1);
-    CHECK(stafeto_watch_keyed(tty, key, 0, 1, ready, 32) == 1);
+    /* The terminal's Watch holds 16 elements at most (proto_tty
+     * WATCH_MAX); a longer one is refused. */
+    for (unsigned i = 0; i < 17; i++) { fds[i] = tty; events[i] = IN; }
+    CHECK(stafeto_watch_start(fds, events, 17, &key, ready) < 0);
+    for (unsigned i = 0; i < 16; i++) { fds[i] = tty; events[i] = IN; }
+    CHECK(stafeto_watch_start(fds, events, 16, &key, ready) == 1);
+    CHECK(stafeto_watch_keyed(tty, key, 0, 1, ready, 16) == 1);
     raw.c_cc[VTIME] = 0;
     CHECK(tcsetattr(tty, TCSANOW, &raw) == 0);
     CHECK(stafeto_watch_bit(key) == 0);
-    CHECK(stafeto_watch_keyed(tty, key, 0, 0, ready, 32) == 0);
-    CHECK(stafeto_watch_keyed(tty, key, 1, 0, ready, 32) == 0);
-    for (unsigned i = 0; i < 32; i++) CHECK(ready[i] == IN);
+    CHECK(stafeto_watch_keyed(tty, key, 0, 0, ready, 16) == 0);
+    CHECK(stafeto_watch_keyed(tty, key, 1, 0, ready, 16) == 0);
+    for (unsigned i = 0; i < 16; i++) CHECK(ready[i] == IN);
     CHECK(stafeto_watch_full_tty(tty, 0) == 0);
     CHECK(stafeto_watch_full_tty(tty, 1) == 0);
     CHECK(tcsetattr(tty, TCSANOW, &old) == 0);
     CHECK(close(tty) == 0);
+    return 0;
+}
+
+/* The worst Watch of the terminal: 32 different open descriptions of the
+ * console in one poll, which the library splits into two Watches of 16.
+ * The file table holds 32 descriptors, so all are closed and the console
+ * is opened on each of them (0, 1 and 2 are then descriptions of their
+ * own). The first poll waits and pins them all; the second answers by
+ * position. A 33rd element is refused. */
+static int tty_distinct_watches(void) {
+    fflush(stdout);
+    for (int fd = 0; fd < 32; fd++) close(fd);
+    struct pollfd p[33];
+    for (int i = 0; i < 32; i++) {
+        int fd = open("/dev/console", O_RDWR | O_NOCTTY);
+        CHECK(fd == i);
+        p[i].fd = fd; p[i].events = POLLIN; p[i].revents = 77;
+    }
+    struct termios old, raw;
+    CHECK(tcgetattr(0, &old) == 0);
+    raw = old; raw.c_lflag &= ~ICANON; raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
+    CHECK(tcsetattr(0, TCSANOW, &raw) == 0);
+    /* The steps grow with the number of different descriptions: one,
+     * sixteen (one Watch), then 32 (two Watches of 16). */
+    struct pollfd same[16];
+    for (int i = 0; i < 16; i++) same[i] = (struct pollfd){p[0].fd, POLLIN, 77};
+    printf("posix-poll: tty poll of 16 elements, 1 description\n");
+    CHECK(poll(same, 16, 3) == 0);
+    printf("posix-poll: tty poll of 16 elements, 16 descriptions\n");
+    CHECK(poll(p, 16, 3) == 0);
+    printf("posix-poll: tty poll of 32 elements, 32 descriptions\n");
+    CHECK(poll(p, 32, 3) == 0);
+    for (int i = 0; i < 32; i++) CHECK(p[i].revents == 0);
+    p[3].events = POLLOUT; p[20].events = POLLOUT;
+    CHECK(poll(p, 32, 3) == 2);
+    for (int i = 0; i < 32; i++) CHECK(p[i].revents == (i == 3 || i == 20 ? POLLOUT : 0));
+    p[32] = p[0];
+    CHECK(poll(p, 33, 0) < 0 && errno == EINVAL);
+    CHECK(tcsetattr(0, TCSANOW, &old) == 0);
+    for (int fd = 3; fd < 32; fd++) CHECK(close(fd) == 0);
     return 0;
 }
 
@@ -447,6 +491,8 @@ int main(int argc, char **argv) {
     int result = frontends();
     if (result != 0) return result;
     result = service_watches();
+    if (result != 0) return result;
+    result = tty_distinct_watches();
     if (result != 0) return result;
     int ends[2], tty = open("/dev/console", O_RDWR | O_NOCTTY);
     CHECK(tty >= 0 && pipe(ends) == 0);
