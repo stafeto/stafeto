@@ -127,7 +127,12 @@ pub(super) fn run() -> bool {
         0
     );
     if !matches!(
-        ready_waiter.receive_until(&ready, now() + 500_000_000),
+        {
+            let deadline = now() + 500_000_000;
+            crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                ready_waiter.receive_until(&ready, deadline)
+            })
+        },
         Ok(Waited::Got(_))
     ) {
         return failed(241);
@@ -136,7 +141,12 @@ pub(super) fn run() -> bool {
         return failed(242);
     }
     if !matches!(
-        done_waiter.receive_until(&done, now() + 500_000_000),
+        {
+            let deadline = now() + 500_000_000;
+            crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                done_waiter.receive_until(&done, deadline)
+            })
+        },
         Ok(Waited::Got(_))
     ) || CLEANED.load(Ordering::Acquire) != 1
     {

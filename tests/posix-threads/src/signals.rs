@@ -227,13 +227,23 @@ pub(super) fn run() -> bool {
         }
         if mode == 3 || mode == 4 || mode == 7 {
             if !matches!(
-                ready_waiter.receive_until(&ready, now() + 500_000_000),
+                {
+                    let deadline = now() + 500_000_000;
+                    crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                        ready_waiter.receive_until(&ready, deadline)
+                    })
+                },
                 Ok(Waited::Got(_))
             ) {
                 return failed(375);
             }
             if !matches!(
-                ready_waiter.receive_until(&ready, now() + 20_000_000),
+                {
+                    let deadline = now() + 20_000_000;
+                    crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                        ready_waiter.receive_until(&ready, deadline)
+                    })
+                },
                 Ok(Waited::Expired)
             ) {
                 return failed(376);
@@ -266,7 +276,14 @@ pub(super) fn run() -> bool {
                 }
                 if mode == 3 {
                     if !matches!(
-                        ready_waiter.receive_until(&ready, now() + 20_000_000),
+                        {
+                            let deadline = now() + 20_000_000;
+                            crate::watchdog::receive(
+                                deadline,
+                                rt::abi::Error::Interrupted,
+                                |deadline| ready_waiter.receive_until(&ready, deadline),
+                            )
+                        },
                         Ok(Waited::Expired)
                     ) {
                         return failed(380);
@@ -279,7 +296,12 @@ pub(super) fn run() -> bool {
             }
         }
         if !matches!(
-            done_waiter.receive_until(&done, now() + 500_000_000),
+            {
+                let deadline = now() + 500_000_000;
+                crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                    done_waiter.receive_until(&done, deadline)
+                })
+            },
             Ok(Waited::Got(_))
         ) {
             return failed(382);
@@ -423,8 +445,12 @@ fn under_pressure() -> bool {
         if now >= deadline {
             return failed(396);
         }
-        sys::timer_set(&timer, now + 1_000_000).unwrap();
-        sys::receive(&wake).unwrap();
+        let poll_deadline = now + 1_000_000;
+        sys::timer_set(&timer, poll_deadline).unwrap();
+        crate::watchdog::receive(poll_deadline, rt::abi::Error::Interrupted, |_| {
+            sys::receive(&wake)
+        })
+        .unwrap();
     }
     // Native Ended and the release/acquire publication precede all reclamation.
     let passed = delivered && PRESSURE_RESULT.load(Ordering::Acquire) == 1;

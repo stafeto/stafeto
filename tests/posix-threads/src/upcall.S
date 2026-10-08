@@ -211,3 +211,17 @@ ret
 native_upcall_redirect:
 mov x0, #0xf00d
 b native_upcall_resume
+
+// Enter the same register/FP/IPC probe with original TLS zero. Observer
+// dispatch installs its resident ABI word and returns this exact zero TLS.
+.global native_observer_register_probe
+native_observer_register_probe:
+stp x29, x30, [sp, #-32]!
+mrs x9, tpidr_el0
+str x9, [sp, #16]
+msr tpidr_el0, xzr
+bl native_upcall_register_probe
+ldr x9, [sp, #16]
+msr tpidr_el0, x9
+ldp x29, x30, [sp], #32
+ret

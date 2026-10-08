@@ -60,6 +60,7 @@ pub fn before_heap() -> bool {
     })
 }
 
+#[inline(never)]
 pub fn payload() -> bool {
     let Ok(fd) = abi::open(b"/tmp/probe", O_RDWR) else {
         return fail(67);

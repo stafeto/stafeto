@@ -913,11 +913,12 @@ impl Processes {
         let Some((named, Place::Loader, image)) = Label::parse_image(label) else {
             return refuse(proto_process::PERMISSION);
         };
-        let Some(index) = self.records.find_loader(label) else {
+        let index = usize::from(named.index);
+        let Some(record) = self.records.get(index) else {
             return refuse(proto_process::PERMISSION);
         };
-        let record = self.records.get(index).expect("an exact retained record");
-        if expected.pid != named.pid()
+        if record.label != named
+            || expected.pid != named.pid()
             || expected.index as usize != index
             || expected.image != image
             || expected.root != record.root
@@ -962,6 +963,18 @@ impl Processes {
         Answer::Reply(Outgoing::new())
     }
 
+    /// The prepaid Process authority chooses a genuinely live published Layer role.
+    fn request_router(&self, index: usize) {
+        let Some(record) = self.records.get(index) else {
+            return;
+        };
+        if sys::process_layer_request(&record.process) == Err(rt::abi::Error::BadState)
+            && let Some(router) = self.routers[index].as_ref()
+        {
+            let _ = sys::thread_upcall_request(router);
+        }
+    }
+
     /// Router of the record in `index`: one thread handle with MANAGE, the
     /// thread whose entry routes the process's signals (spec 2, 3.3); a
     /// signal that waits on the page already asks for its entry at once.
@@ -981,10 +994,10 @@ impl Processes {
                 )
                 != 0
         });
-        if waiting {
-            let _ = sys::thread_upcall_request(&thread);
-        }
         self.routers[index] = Some(thread);
+        if waiting {
+            self.request_router(index);
+        }
         Answer::Status(Status::Ok)
     }
 
@@ -1002,12 +1015,8 @@ impl Processes {
         let Some(page) = self.pages.page(target) else {
             return;
         };
-        if signals::post(page, signal, info) == Posted::Pending
-            && let Some(router) = self.routers[target].as_ref()
-        {
-            // A router that ended asks nothing; the signal waits on the
-            // page for a thread that unblocks or waits for it.
-            let _ = sys::thread_upcall_request(router);
+        if signals::post(page, signal, info) == Posted::Pending {
+            self.request_router(target);
         }
     }
 

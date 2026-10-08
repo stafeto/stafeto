@@ -181,14 +181,14 @@ static int metadata(void) {
             || value.st_nlink != 4 || value.st_dev != 1 || value.st_uid || value.st_gid) return 40;
     if (stat("motd", &value) || !S_ISREG(value.st_mode) || value.st_ino != 4
             || value.st_size != 14 || value.st_nlink != 1 || value.st_blocks != 1
-            || value.st_blksize != 1024 || (value.st_mode & 07777) != 0444) return 41;
+            || value.st_blksize != 4096 || (value.st_mode & 07777) != 0444) return 41;
     int fd = open("motd", O_RDONLY), alias = dup(fd);
     if (fd < 0 || alias < 0 || fstat(alias, &copy) || copy.st_ino != value.st_ino
             || copy.st_dev != value.st_dev || copy.st_size != value.st_size) return 42;
     if (close(fd) || fstat(alias, &copy) || close(alias)) return 43;
     if (lstat("motd", &copy) || copy.st_ino != value.st_ino) return 44;
     if (fstat(1, &copy) || !S_ISCHR(copy.st_mode) || copy.st_rdev != 1) return 45;
-    if (open("motd", O_WRONLY) != -1 || errno != EACCES) return 46;
+    if (open("motd", O_WRONLY) != -1 || errno != EROFS) return 46;
     value.st_ino = 987;
     if (stat("/missing", &value) != -1 || errno != ENOENT || value.st_ino != 987) return 47;
     if (stat("motd/", &value) != -1 || errno != ENOTDIR) return 48;

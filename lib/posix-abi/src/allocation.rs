@@ -251,6 +251,43 @@ pub fn probe_sleep_next(ns: u64) {
     PROBE_SLEEP.store(ns, Ordering::Release);
 }
 
+/// Whether heap ownership was published by startup.
+pub(crate) fn ready() -> bool {
+    READY.load(Ordering::Acquire)
+}
+
+/// Bootstrap admission never registers a waiter with its temporary Block.
+pub(crate) fn try_map_pages(size: usize) -> Result<NonNull<u8>, i32> {
+    if !ready() {
+        return Err(crate::constants::EAGAIN);
+    }
+    let _guard = HEAP_LOCK.try_lock().ok_or(crate::constants::EAGAIN)?;
+    // SAFETY: this successful guard provides the only heap/map borrow.
+    let state = unsafe { &mut *HEAP.0.get() };
+    let pointer = match state.allocator.allocate_pages(size) {
+        Ok(pointer) => pointer,
+        Err(_) => {
+            grow(state, size, PAGE).map_err(errno)?;
+            state.allocator.allocate_pages(size).map_err(errno)?
+        }
+    };
+    // SAFETY: the allocator gave this exact mapping exclusively to admission.
+    unsafe { core::ptr::write_bytes(pointer.as_ptr(), 0, size) };
+    Ok(pointer)
+}
+
+/// Give an ended or unpublished native page back without blocking under TABLE.
+/// # Safety
+/// The caller owns these whole pages and has ended every reader and waiter.
+pub(crate) unsafe fn try_unmap_pages(pointer: NonNull<u8>, size: usize) -> bool {
+    let Some(_guard) = HEAP_LOCK.try_lock() else {
+        return false;
+    };
+    // SAFETY: the guard gives the only allocator borrow; the caller owns the pages.
+    unsafe { (&mut *HEAP.0.get()).allocator.free_pages(pointer, size) };
+    true
+}
+
 /// Zeroed whole pages for an anonymous mapping (relibc's mmap): no header,
 /// so any whole pages of them go back with `unmap_pages`.
 pub fn map_pages(size: usize) -> Result<NonNull<u8>, i32> {

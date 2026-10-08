@@ -8,7 +8,10 @@
 //! order they came; 10^5 handoffs of a mutex between two threads lose no
 //! wakeup; an entry of signals inside the layer's lock waits for its end.
 use super::*;
+#[path = "futex_deadline.rs"]
+mod deadline_check;
 use crate::layer::signals::{self as api, SigAction};
+use crate::watchdog;
 use core::sync::atomic::AtomicU32;
 use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
 use posix_sync::{CLOCK_MONOTONIC, EAGAIN, ETIMEDOUT, LayerLock, futex_wait, futex_wake};
@@ -186,11 +189,34 @@ pub(super) fn run() -> bool {
         return failed(621);
     }
     let deadline = rt::time::ticks_to_ns(rt::time::now()) + 5_000_000;
-    if futex_wait(&WORD, 0, CLOCK_MONOTONIC, Some(deadline)) != Err(ETIMEDOUT)
-        || !rt::time::reached(deadline)
-        || posix_sync::bucket_waiters(&WORD) != 0
-    {
-        return failed(622);
+    loop {
+        let result = futex_wait(&WORD, 0, CLOCK_MONOTONIC, Some(deadline));
+        let reached = rt::time::reached(deadline);
+        let waiters = posix_sync::bucket_waiters(&WORD);
+        let word = WORD.load(Ordering::Acquire);
+        let outcome = match result {
+            Err(ETIMEDOUT) => deadline_check::Outcome::Timeout,
+            Ok(posix_sync::Woken::Woken) => deadline_check::Outcome::Woken,
+            _ => deadline_check::Outcome::Other,
+        };
+        match deadline_check::select(outcome, reached, word, waiters) {
+            deadline_check::Decision::Retry => continue,
+            deadline_check::Decision::Done => break,
+            deadline_check::Decision::Fail => {
+                let tag = match result {
+                    Err(errno) => -errno,
+                    Ok(posix_sync::Woken::Woken) => 1,
+                    Ok(posix_sync::Woken::Entry) => 2,
+                };
+                rt::println!(
+                    "futex-probe: deadline result={} reached={} waiters={}",
+                    tag,
+                    u32::from(reached),
+                    waiters
+                );
+                return failed(622);
+            }
+        }
     }
     rt::println!(
         "futex-probe: no kernel call without waiters or rivals; EAGAIN and a deadline leave the bucket empty"
@@ -206,16 +232,33 @@ pub(super) fn run() -> bool {
         id
     });
     for place in 0..4 {
-        if futex_wake(&GATE, 1) != 1
-            || !matches!(
-                waiter.receive_until(
-                    &done_channel,
-                    rt::time::ticks_to_ns(rt::time::now()) + 1_000_000_000
-                ),
-                Ok(Waited::Got(_))
-            )
-            || NEXT.load(Ordering::SeqCst) != place + 1
-        {
+        let wake = futex_wake(&GATE, 1);
+        let (received, receive_error) = if wake == 1 {
+            let deadline = rt::time::ticks_to_ns(rt::time::now()) + 1_000_000_000;
+            match watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                waiter.receive_until(&done_channel, deadline)
+            }) {
+                Ok(Waited::Got(_)) => (1u32, 0u64),
+                Ok(Waited::Expired) => (2, 0),
+                Err(error) => (3, error.code()),
+            }
+        } else {
+            (0, 0)
+        };
+        let next = NEXT.load(Ordering::SeqCst);
+        if wake != 1 || received != 1 || next != place + 1 {
+            let errors = ERRORS.load(Ordering::SeqCst);
+            let waiters = posix_sync::bucket_waiters(&GATE);
+            rt::println!(
+                "futex-probe: ordered place={} wake={} receive={} next={} errors={} waiters={} receive_error={}",
+                place,
+                wake,
+                received,
+                next,
+                errors,
+                waiters,
+                receive_error
+            );
             return failed(623);
         }
     }
@@ -231,11 +274,11 @@ pub(super) fn run() -> bool {
     // and the watchdog sees it.
     let pair = [create(handoff, 0), create(handoff, 1)];
     for _ in pair {
+        let deadline = rt::time::ticks_to_ns(rt::time::now()) + 10_000_000_000;
         if !matches!(
-            waiter.receive_until(
-                &done_channel,
-                rt::time::ticks_to_ns(rt::time::now()) + 10_000_000_000
-            ),
+            watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                waiter.receive_until(&done_channel, deadline)
+            }),
             Ok(Waited::Got(_))
         ) {
             rt::println!(
@@ -251,11 +294,11 @@ pub(super) fn run() -> bool {
     }
     // A higher thread that the holder's wake preempts at once.
     let pair = [create(holder, 0), create(visitor, 0)];
+    let deadline = rt::time::ticks_to_ns(rt::time::now()) + 10_000_000_000;
     if !matches!(
-        waiter.receive_until(
-            &done_channel,
-            rt::time::ticks_to_ns(rt::time::now()) + 10_000_000_000
-        ),
+        watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+            waiter.receive_until(&done_channel, deadline)
+        }),
         Ok(Waited::Got(_))
     ) {
         rt::println!(

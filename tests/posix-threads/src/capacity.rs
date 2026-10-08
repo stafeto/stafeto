@@ -36,12 +36,12 @@ fn receiving(native: &Handle<Thread>) -> bool {
         if sys::thread_info(native).is_ok_and(|info| info.state == ThreadState::Receiving) {
             return true;
         }
-        sys::timer_set(
-            &timer,
-            sys::clock_now().expect("capacity clock") + 1_000_000,
-        )
-        .expect("capacity deadline");
-        sys::receive(&wake).expect("capacity poll wake");
+        let deadline = sys::clock_now().expect("capacity clock") + 1_000_000;
+        sys::timer_set(&timer, deadline).expect("capacity deadline");
+        crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |_| {
+            sys::receive(&wake)
+        })
+        .expect("capacity poll wake");
     }
     false
 }

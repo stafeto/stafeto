@@ -360,6 +360,8 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
+    "boot-posix-native-scopes.img",
+    "boot-posix-native-scopes-vz.img",
     "boot-posix-jobs.img",
     "boot-posix-steps.img",
     "boot-posix-tty.img",
@@ -375,7 +377,10 @@ pub const IMAGES: &[&str] = &[
 pub fn files_of(name: &str) -> Vec<RootFile> {
     match name {
         "boot-ramfs.img" => ramfs(),
-        "boot-ramfs-cleanup.img" | "boot-loader-abort.img" | "boot-loader-abort-steps.img" => {
+        "boot-ramfs-cleanup.img"
+        | "boot-loader-abort.img"
+        | "boot-loader-abort-steps.img"
+        | "boot-loader-info.img" => {
             let mut files = vec![
                 dir("/bin"),
                 file("/bin/posix-files", 0o755, ROOT, "posix-files"),
@@ -384,7 +389,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
-        "boot-posix-files.img" | "boot-posix-files-steps.img" | "boot-posix-files-loss.img" => {
+        "boot-posix-files.img"
+        | "boot-posix-files-steps.img"
+        | "boot-posix-files-loss.img"
+        | "boot-posix-data-steps.img" => {
             let mut files = vec![dir("/dev")];
             files.extend(devices());
             files
@@ -406,6 +414,16 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ),
         ],
         "boot-ash-dialog.img" => dialog(),
+        "boot-posix-native-scopes.img" | "boot-posix-native-scopes-vz.img" => {
+            let mut files = procs();
+            files.push(file(
+                "/bin/native-scopes",
+                0o755,
+                ROOT,
+                "posix-thread-probe",
+            ));
+            files
+        }
         "boot-posix-procs.img" | "boot-posix-jobs.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
@@ -550,6 +568,8 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
+                "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
                 "boot-posix-tty.img" => &crate::POSIX_TTY_PROGRAMS,
                 "boot-posix-tty-steps.img" => &crate::POSIX_TTY_STEPS_PROGRAMS,

@@ -28,7 +28,12 @@ use kcore::args::{inline_len_arg, reserved_arg};
 /// channel and in x2 a handle of that channel with RECEIVE, and returns the
 /// copy's label in x1, O(1): ACCESS_DENIED for a copy of another channel,
 /// WRONG_TYPE for a channel handle without a label (the lookup of x2 comes
-/// first). LOG takes the system resource with
+/// first). SELF_THREAD requires x0 zero and x2 exactly NONE or MANAGE,
+/// returning a new owned handle of those rights to the actual caller. Its handle-table insertion is paid by that
+/// process; failure retains no new reference. THREAD_CURRENT requires x2
+/// zero and compares the supplied Thread object with the caller, returning
+/// only bool 0/1. Both preserve registers outside their one-word result.
+/// LOG takes the system resource with
 /// KSTATS, takes up to abi::LOG_BATCH records of the kernel log into the
 /// start of the caller's message buffer and returns abi::LogBatch in
 /// x1-x3 (spec 16.3, crate::log::take).
@@ -37,8 +42,14 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         if a[2] > 1 {
             return Err(Error::InvalidArgs);
         }
-    } else if a[1] != abi::INFO_LOG && a[1] != abi::INFO_LABEL {
+    } else if a[1] != abi::INFO_LOG && a[1] != abi::INFO_LABEL && a[1] != abi::INFO_THREAD_SELF {
         reserved_arg(a[2])?;
+    }
+    if a[1] == abi::INFO_THREAD_SELF {
+        reserved_arg(a[0])?;
+        if a[2] != u64::from(Rights::NONE.0) && a[2] != u64::from(Rights::MANAGE.0) {
+            return Err(Error::InvalidArgs);
+        }
     }
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
     match a[1] {
@@ -83,6 +94,25 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         abi::INFO_MEMORY => {
             let m = lookup(thread, a[0], Rights::NONE, Object::memory)?;
             Ok(Values::new(&memory::info(m).to_words()))
+        }
+        abi::INFO_THREAD_SELF => {
+            let process = super::caller(thread);
+            process::check_alive(process)?;
+            process::handle_room(process)?;
+            let handle = process::insert_handle(
+                process,
+                Object::Thread(thread),
+                if a[2] == 0 {
+                    Rights::NONE
+                } else {
+                    Rights::MANAGE
+                },
+            )?;
+            Ok(Values::new(&[handle.0]))
+        }
+        abi::INFO_THREAD_CURRENT => {
+            let supplied = lookup(thread, a[0], Rights::NONE, Object::thread)?;
+            Ok(Values::new(&[u64::from(supplied == thread)]))
         }
         abi::INFO_THREAD_STATE => {
             let t = lookup(thread, a[0], Rights::NONE, Object::thread)?;

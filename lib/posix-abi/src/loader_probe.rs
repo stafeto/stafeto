@@ -104,7 +104,7 @@ pub fn full(slot: u32) -> i32 {
         let files = crate::shared::with_files(|fs| Ok(fs.sessions().0.raw()))?;
         let ram_fd = if slot == Slot::Files as u32 {
             crate::shared::with_files(|fs| match fs.target(3) {
-                Ok(posix_fs::Target::Ram(fd)) => Ok(fd),
+                Ok(posix_fs::Target::Ram(fd)) => Ok(fd.fd()),
                 _ => Err(crate::constants::EIO),
             })?
         } else {

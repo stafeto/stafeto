@@ -16,6 +16,9 @@ fn run(cmd: &mut Command) {
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=files.c");
+    println!("cargo:rerun-if-changed=open-policy.c");
+    println!("cargo:rerun-if-changed=pending-open.c");
+    println!("cargo:rerun-if-changed=pending-fork.c");
     println!("cargo:rerun-if-changed=cleanup.c");
     println!("cargo:rerun-if-changed=jobs.c");
     println!("cargo:rerun-if-changed=loader-abort.c");
@@ -54,6 +57,18 @@ fn main() {
             u8::from(env::var_os("CARGO_FEATURE_LOADER_ABORT").is_some())
         ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
+        .arg(format!(
+            "-DNATIVE_SCOPES_LAUNCHER={}",
+            u8::from(env::var_os("CARGO_FEATURE_NATIVE_SCOPES_LAUNCHER").is_some())
+        ))
+        .arg(format!(
+            "-DIMAGE_INFO_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_IMAGE_INFO_PROBE").is_some())
+        ))
+        .arg(format!(
+            "-DPENDING_OPEN_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_PENDING_OPEN").is_some())
+        ))
         .arg(format!(
             "-DIMAGE_GATES_NORMAL={}",
             u8::from(env::var_os("CARGO_FEATURE_IMAGE_GATES_NORMAL").is_some())

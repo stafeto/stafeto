@@ -175,7 +175,7 @@
  * cut at the layer's message) and keeps nothing: every write returns a count, the size stays 0
  * (fstat, stat, lseek to the end), reads are at the end of the file, and an
  * ordinary file of the image next to it stays read-only; O_CREAT, O_TRUNC
- * and O_APPEND open the device (a shell's `> /dev/null`) and refuse the file.
+ * and O_APPEND open the device (a shell's `> /dev/null`); writes to the image file return EROFS.
  *
  * Stage 10: the probe is a record of init's table, and its end is init's
  * line: the probe execs a child's role that exits with 42, and init
@@ -201,6 +201,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#if PENDING_OPEN_PROBE
+#include "pending-fork.c"
+#endif
 
 /* The spawn-flags the process service takes are those of Linux, which
  * relibc's header gives (proto_process::SPAWN_SETPGROUP, SPAWN_SETSID). */
@@ -1834,6 +1838,9 @@ static int channel_child(const char *name);
 #endif
 
 static int role(const char *name) {
+#if PENDING_OPEN_PROBE
+    if (strcmp(name, "pendingfork") == 0) return check_pending_fork();
+#endif
 #if JOB_CONTROL_PROBE
     if (strcmp(name, "jobcontrol") == 0) return job_control();
     if (strcmp(name, "jobexec-local") == 0) return job_after_exec(0);
@@ -2427,6 +2434,9 @@ static void forks(void) {
     expect("a fork of a program init started", stafeto_probe_fork_bare(bare_park, NULL, NULL), -ENOSYS);
     run_role("/bin/procs-child", "forkbare", NULL);
     run_role("/bin/procs-child", "forkfull", NULL);
+#if PENDING_OPEN_PROBE
+    run_role("/bin/procs-child", "pendingfork", NULL);
+#endif
     run_role("/bin/procs-child", "forkthreads", NULL);
     run_role("/bin/procs-child", "forkthread", NULL);
     run_role("/bin/procs-child", "forkwaits", NULL);
@@ -3505,8 +3515,9 @@ static void null_device(void) {
     expect("a write in append mode", (int)write(fd, null_block, 100), 100);
     close(fd);
     /* A file of the image beside it is no device. */
-    expect("open of /bin/data with O_TRUNC", open("/bin/data", O_WRONLY | O_TRUNC) == -1 ? errno : 0, EINVAL);
-    expect("open of /bin/data for writing", open("/bin/data", O_WRONLY) == -1 ? errno : 0, EACCES);
+    expect("open of /bin/data with O_TRUNC", open("/bin/data", O_WRONLY | O_TRUNC) == -1 ? errno : 0, EROFS);
+    /* Boot regular files retain the staged read-only guard until writable image integration. */
+    expect("open of /bin/data for writing", open("/bin/data", O_WRONLY) == -1 ? errno : 0, EROFS);
     if (failures == 0) printf("posix-procs: /dev/null drops 1 MiB\n");
 }
 
@@ -3759,7 +3770,30 @@ static int loader_channels(void) {
     return 0;
 }
 
+#if NATIVE_SCOPES_LAUNCHER
+__attribute__((noinline)) static int native_scopes_supervisor(void) {
+    pid_t parent = getpid();
+    if (parent <= 0) return 101;
+    char observation[64];
+    int len = snprintf(observation, sizeof observation, "NATIVE_SCOPES_PARENT=%u", (unsigned)parent);
+    if (len < 0 || (size_t)len >= sizeof observation) return 102;
+    char *argv[] = {"posix-thread-probe", "native-scope-only", NULL};
+    char *envp[] = {observation, NULL};
+    pid_t child = -1;
+    int error = posix_spawn(&child, "/bin/native-scopes", NULL, NULL, argv, envp);
+    if (error != 0 || child <= 0) return 103;
+    int status = 0;
+    pid_t waited = waitpid(child, &status, 0);
+    if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 104;
+    printf("native-scopes-supervisor: ok parent=%u\n", (unsigned)parent);
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
+#if NATIVE_SCOPES_LAUNCHER
+    return native_scopes_supervisor();
+#endif
     argc_seen = argc;
     argv_seen = argv;
     if (argc > 1) return role(argv[1]);

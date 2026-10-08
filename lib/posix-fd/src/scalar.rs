@@ -135,7 +135,7 @@ impl<T: Copy, S: Copy> ScalarRecord<T, S> {
     }
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
     pub(super) fn scalar_pinned(&self, backend: T) -> bool {
         self.holds
             .iter()
@@ -221,6 +221,14 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy> Table<T, N, R, S> {
 
     pub fn scalar_snapshot(&self, token: ScalarToken) -> Result<ScalarSnapshot<T, S>, Error> {
         Ok(self.scalar_record(token)?.snapshot())
+    }
+
+    /// Inspect the exact current claim without changing the resident wait word.
+    pub fn scalar_claim_snapshot(
+        &self,
+        claim: ScalarClaimToken,
+    ) -> Result<ScalarSnapshot<T, S>, Error> {
+        Ok(self.scalar_claimed(claim)?.snapshot())
     }
 
     pub fn scalar_tokens(&self) -> impl Iterator<Item = ScalarToken> + '_ {
@@ -438,6 +446,33 @@ mod tests {
         let mut t = Table::default();
         t.place(0, 10, Flags::default()).unwrap();
         t
+    }
+
+    #[test]
+    fn claim_snapshot_preserves_wait_and_rejects_released_or_completed_claims() {
+        let mut t = table();
+        let (token, first) = t.begin_scalar(owner(1), 0, 71).unwrap();
+        let before = t.scalar_wait_snapshot(token).unwrap();
+        assert_eq!(t.scalar_claim_snapshot(first), t.scalar_snapshot(token));
+        assert_eq!(t.scalar_wait_snapshot(token).unwrap(), before);
+        t.release_scalar_claim(first).unwrap();
+        let ScalarClaim::Acquired { token: next, .. } = t.claim_scalar(token, owner(2)).unwrap()
+        else {
+            panic!("new current claim")
+        };
+        let before = t.scalar_wait_snapshot(token).unwrap();
+        assert_eq!(
+            t.scalar_claim_snapshot(first),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(t.scalar_claim_snapshot(next), t.scalar_snapshot(token));
+        assert_eq!(t.scalar_wait_snapshot(token).unwrap(), before);
+        t.complete_scalar(next, ScalarResult::Bytes(3)).unwrap();
+        assert_eq!(t.scalar_claim_snapshot(next), Err(Error::BadFileDescriptor));
+        assert_eq!(
+            t.scalar_snapshot(token).unwrap().result,
+            Some(ScalarResult::Bytes(3))
+        );
     }
 
     #[test]

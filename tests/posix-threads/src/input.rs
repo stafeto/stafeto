@@ -61,9 +61,12 @@ fn console_waiting(id: u64, native: &Handle<Thread>) -> bool {
         {
             return true;
         }
-        sys::timer_set(&timer, sys::clock_now().expect("console clock") + 1_000_000)
-            .expect("console deadline");
-        sys::receive(&wake).expect("console wake");
+        let deadline = sys::clock_now().expect("console clock") + 1_000_000;
+        sys::timer_set(&timer, deadline).expect("console deadline");
+        crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |_| {
+            sys::receive(&wake)
+        })
+        .expect("console wake");
     }
     false
 }

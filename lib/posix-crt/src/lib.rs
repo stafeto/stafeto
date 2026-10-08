@@ -200,11 +200,11 @@ pub unsafe extern "C" fn stafeto_start_handles(out: *mut u64) {
 /// The descriptors the start area names (proto_loader::Descriptor), as
 /// the layer's files take them.
 fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::DESCRIPTORS] {
-    use posix_fs::{Inherited, Target};
+    use posix_fs::{Inherited, InheritedTarget, Target};
     use proto_loader::{DESCRIPTOR, DESCRIPTORS, Descriptor, Names};
     let mut list = [Inherited {
         fd: 0,
-        target: Target::Input,
+        target: InheritedTarget::Ready(Target::Input),
     }; DESCRIPTORS];
     let count = (area.descriptor_count as usize).min(DESCRIPTORS);
     // SAFETY: the loader wrote `count` descriptors at `descriptors` in
@@ -219,13 +219,19 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             .filter_map(|c| Descriptor::read(c)),
     ) {
         let target = match d.names {
-            Names::Input => Target::Input,
-            Names::Output => Target::Output,
-            Names::Error => Target::Error,
-            Names::File(n) => Target::Ram(n),
-            Names::Pipe(n) => Target::Pipe(n),
-            Names::Terminal(n) => Target::Tty(n),
-            Names::Random(n) => Target::Random(n),
+            Names::Input => InheritedTarget::Ready(Target::Input),
+            Names::Output => InheritedTarget::Ready(Target::Output),
+            Names::Error => InheritedTarget::Ready(Target::Error),
+            Names::File(n) => InheritedTarget::RawRam {
+                fd: n,
+                random_hint: false,
+            },
+            Names::Pipe(n) => InheritedTarget::Ready(Target::Pipe(n)),
+            Names::Terminal(n) => InheritedTarget::Ready(Target::Tty(n)),
+            Names::Random(n) => InheritedTarget::RawRam {
+                fd: n,
+                random_hint: true,
+            },
             Names::PendingTerminal(_) => continue,
         };
         *place = Inherited { fd: d.fd, target };

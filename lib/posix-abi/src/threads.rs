@@ -25,6 +25,10 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// DUPLICATE, so the block names this one.
 static MAIN_SELF: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn ready() -> bool {
+    READY.load(Ordering::Acquire)
+}
+
 /// The calling thread's block.
 pub(crate) fn own_block() -> &'static Block {
     // SAFETY: an attached thread has its block for its life.
@@ -89,8 +93,10 @@ pub unsafe fn after_fork(own: Handle<Thread>) -> Result<(), i32> {
     let native = own.into_raw().0;
     // The main thread's block names its native handle; another place's a
     // copy with MANAGE, which `collect` closes apart from the native one.
-    let thread = if id == 1 {
-        MAIN_SELF.store(native, Ordering::Release);
+    let thread = if id == 1 || crate::relibc::native::is_resident(block) {
+        if id == 1 {
+            MAIN_SELF.store(native, Ordering::Release);
+        }
         native
     } else {
         let borrowed = Handle::<Thread>::borrowed(rt::abi::Handle(native));

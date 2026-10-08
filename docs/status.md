@@ -39,7 +39,20 @@ POSIX layer covers, and which commands check each piece. It describes
   (`console_poll` of the old VZ build) and 35 (`request_identity`) are
   retired and fail as unknown ones, and so does kind 10 of `object_info`;
   the process service names its clients by the labels of the sessions it
-  gives. Kind 11 of `object_info`, LABEL, gives the owner of a channel
+  gives. Kind 12 returns one owned NONE or exactly MANAGE capability of the actual calling
+  thread, paid by its handle table and quota. Kind 13 compares a supplied
+  Thread object with the caller and returns bool 0/1; raw handle values do
+  not establish identity. Both preserve the ordinary ObjectInfo result span.
+  The current thread can register a fixed resident observer alongside its
+  native upcall. Control operations 5-9 address observer mask, enable, Take
+  (including original TLS), registration and a MANAGE LayerRequest with
+  native-entry fallback. Operations 10 and 12 explicitly publish current
+  primary/observer Layer roles; operation 11 requests a registered Layer
+  through a MANAGE Process capability. A fixed intrusive list in paid
+  Thread objects preserves the surviving role and removes an ending thread.
+  Existing upcall calls retain their ignored registers;
+  Return remains argument-free and restores the innermost context.
+  Kind 11 of `object_info`, LABEL, gives the owner of a channel
   (with RECEIVE) the label of a labelled copy of it, O(1): the process
   service's Vouch. `process_kill` takes the level of the teardown it starts.
 - **Messages:** requests and replies of up to 1 KiB, the first 64 bytes in

@@ -74,6 +74,9 @@ pub mod flag {
     pub const DEPTH_ONE: u32 = 1 << DEPTH_SHIFT;
 }
 
+/// Independent fields of the resident scope word.
+pub mod scope;
+
 /// The block of the POSIX layer for one thread: relibc's `os_specific`:
 /// its signals, cancellation, its channel and timer, its node in the table
 /// of waits by address, its end and its number. errno and the file state
@@ -110,7 +113,8 @@ pub struct Block {
     /// Process-origin job assignments, tagged with their epoch.
     pub stop_origin: AtomicU64,
     pub cont_origin: AtomicU64,
-    unused: u64,
+    /// Resident scope depth, class, delivery preparation and errno snapshot.
+    pub scope: AtomicU64,
     /// The pthread number of the thread; 0 for a thread pthread does not
     /// know. Under relibc, the thread's number in the layer's table of
     /// threads plus 1 (its OsTid).
@@ -162,6 +166,7 @@ const _: () = {
     assert!(offset_of!(Block, previous) == 64);
     assert!(offset_of!(Block, end) == 92);
     assert!(offset_of!(Block, result) == 96);
+    assert!(offset_of!(Block, scope) == 120);
     assert!(offset_of!(Block, thread_id) == 128);
     assert!(offset_of!(Block, cancel_point) == 136);
     assert!(offset_of!(Page, tcb) == TCB_OFFSET);
@@ -226,7 +231,7 @@ impl Block {
             result: AtomicUsize::new(0),
             stop_origin: AtomicU64::new(0),
             cont_origin: AtomicU64::new(0),
-            unused: 0,
+            scope: AtomicU64::new(0),
             thread_id: 0,
             cancel_point: AtomicU64::new(0),
             probe: AtomicU64::new(0),

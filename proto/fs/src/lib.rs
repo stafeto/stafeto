@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 10 of the bounded RAM file service. Numbers are little endian.
+//! Version 12 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -89,15 +89,26 @@
 
 #![cfg_attr(not(test), no_std)]
 
+mod data;
+pub use data::{
+    DataDescription, DataKind, DataOutcome, DataPhase, DataResult, DataStart, FEED_MAX,
+    data_progress_reply, data_read_reply, data_start_reply, terminal_failure,
+};
 mod directory;
 pub use directory::DirectoryEntry;
 mod info;
+mod time;
 pub use info::NodeInfo;
+pub use time::Timestamp;
 
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
-pub const VERSION: u16 = 10;
+/// Explicit startup mode for standalone deterministic RAM probes.
+pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
+/// Explicit startup mode requiring the shared Clock realtime page.
+pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
+pub const VERSION: u16 = 12;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -159,6 +170,8 @@ pub const OPEN_RETIRED: u32 = 319;
 pub const FILE_TOO_LARGE: u32 = 320;
 /// A SetId outcome requires a genuine loader abort before another execution attempt.
 pub const IMAGE_ABORT_REQUIRED: u32 = 321;
+/// This exact final request made no effect while its paid record awaits Clock.
+pub const TIME_DEFERRED: u32 = 325;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -282,6 +295,14 @@ pub enum Method {
     CloseExact = 33,
     /// Count u32 and exact packed fd/slot u32 + generation u64 entries. Maximum 32.
     CloneExact = 34,
+    DataStart = 35,
+    DataFeed = 36,
+    DataStep = 37,
+    DataCommit = 38,
+    DataQuery = 39,
+    DataCancel = 40,
+    DataAck = 41,
+    DataReadResult = 42,
 }
 
 impl Method {
@@ -325,6 +346,14 @@ impl Method {
             32 => Some(Self::CaptureDescription),
             33 => Some(Self::CloseExact),
             34 => Some(Self::CloneExact),
+            35 => Some(Self::DataStart),
+            36 => Some(Self::DataFeed),
+            37 => Some(Self::DataStep),
+            38 => Some(Self::DataCommit),
+            39 => Some(Self::DataQuery),
+            40 => Some(Self::DataCancel),
+            41 => Some(Self::DataAck),
+            42 => Some(Self::DataReadResult),
             _ => None,
         }
     }
@@ -332,7 +361,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

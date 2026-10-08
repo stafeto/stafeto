@@ -138,6 +138,31 @@ pub enum OpenOutcome {
     Finished(PreparedOpen),
 }
 
+/// A canonical first final request retained its preparation without a file effect.
+pub struct OpenNoEffect {
+    key: proto_fs::OpenKey,
+    session: abi::Handle,
+    code: u32,
+}
+
+impl OpenNoEffect {
+    pub fn matches_request(&self, key: proto_fs::OpenKey, session: abi::Handle) -> bool {
+        self.key == key && self.session == session
+    }
+
+    pub fn status(&self) -> Status {
+        Status::from_code(self.code)
+    }
+}
+
+/// One native Finish request has no automatic binding or preparation retry.
+pub enum OpenFinalizeAttempt {
+    Finished(PreparedOpen),
+    Deferred(OpenNoEffect),
+    Rejected(Status),
+    Ambiguous(Status),
+}
+
 pub struct Files {
     channel: Handle<Channel>,
     uart: Option<Handle<Channel>>,
@@ -162,6 +187,81 @@ impl View {
     }
 }
 
+/// Header and existing descriptor requirement for the pending binding.
+fn pending_binding_request(require_fds: bool) -> [u8; 12] {
+    let mut request = [0; 12];
+    request[..8].copy_from_slice(&Method::BindPending.header().bytes());
+    request[8..].copy_from_slice(&u32::from(require_fds).to_le_bytes());
+    request
+}
+
+/// Header and exact paid job for the resolver and image handoff requests.
+fn job_request(method: Method, job: u64) -> [u8; 16] {
+    let mut request = [0; 16];
+    request[..8].copy_from_slice(&method.header().bytes());
+    request[8..].copy_from_slice(&job.to_le_bytes());
+    request
+}
+
+/// ResolveStep returns only the canonical status envelope, with no capabilities.
+fn proof_ready_status(len: usize, first: u64, handles: usize) -> Result<Status, Status> {
+    if len != proto_wire::HEADER_LEN || first >> 32 != 0 || handles != 0 {
+        return Err(Status::BadSize);
+    }
+    Ok(Status::from_code(first as u32))
+}
+
+/// Fill the existing resolver prefix and path in the caller's bounded request.
+fn resolve_start_request(
+    request: &mut [u8; 28 + proto_fs::MAX_PATH],
+    path: &[u8],
+) -> Result<usize, Status> {
+    if path.is_empty() {
+        return Err(Status::Unknown(proto_fs::NO_ENTRY));
+    }
+    if path.len() > proto_fs::MAX_PATH {
+        return Err(Status::Unknown(proto_fs::NAME_TOO_LONG));
+    }
+    if path.contains(&0) {
+        return Err(Status::BadSize);
+    }
+    request[..28].fill(0);
+    request[..8].copy_from_slice(&Method::ResolveStart.header().bytes());
+    request[12..20].copy_from_slice(&1_u64.to_le_bytes());
+    request[24..28].copy_from_slice(&1_u32.to_le_bytes());
+    request[28..28 + path.len()].copy_from_slice(path);
+    Ok(28 + path.len())
+}
+
+/// ResolveStart has a twelve-byte job reply or a canonical status-only refusal.
+fn resolve_start_job(len: usize, words: &[u64; 8], handles: usize) -> Result<u64, Status> {
+    if len < 4 || handles != 0 {
+        return Err(Status::BadSize);
+    }
+    let status = Status::from_code(words[0] as u32);
+    if status != Status::Ok {
+        return if len == proto_wire::HEADER_LEN && words[0] >> 32 == 0 {
+            Err(status)
+        } else {
+            Err(Status::BadSize)
+        };
+    }
+    if len != 12 {
+        return Err(Status::BadSize);
+    }
+    let mut bytes = [0; 12];
+    bytes[..8].copy_from_slice(&words[0].to_le_bytes());
+    bytes[8..].copy_from_slice(&(words[1] as u32).to_le_bytes());
+    let mut reader = Reader::new(&bytes);
+    reader.u32()?;
+    let job = reader.u64()?;
+    reader.finish()?;
+    if job == 0 {
+        return Err(Status::BadSize);
+    }
+    Ok(job)
+}
+
 /// A retained service preparation; cancellation also releases the captured base.
 struct Proof<'a> {
     files: &'a Files,
@@ -172,13 +272,10 @@ impl Proof<'_> {
         Files::send_on(&self.files.channel, request)
     }
     fn ready(&self) -> Result<(), Status> {
-        let mut w = Writer::new();
-        Method::ResolveStep.header().write(&mut w)?;
-        w.u64(self.id)?;
+        let request = job_request(Method::ResolveStep, self.id);
         loop {
-            let reply = self.send(w.as_bytes())?;
-            let mut buffer = [0; MESSAGE_MAX];
-            match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+            let reply = self.send(&request)?;
+            match proof_ready_status(reply.len, reply.words[0], reply.handles.len())? {
                 Status::Ok => return Ok(()),
                 Status::Unknown(proto_fs::RESOLVING) => {}
                 status => return Err(status),
@@ -188,15 +285,8 @@ impl Proof<'_> {
 }
 impl Drop for Proof<'_> {
     fn drop(&mut self) {
-        let mut w = Writer::new();
-        if Method::ResolveCancel
-            .header()
-            .write(&mut w)
-            .and_then(|()| w.u64(self.id))
-            .is_ok()
-        {
-            while let Err(Status::Kernel(Error::Interrupted)) = self.send(w.as_bytes()) {}
-        }
+        let request = job_request(Method::ResolveCancel, self.id);
+        while let Err(Status::Kernel(Error::Interrupted)) = self.send(&request) {}
     }
 }
 
@@ -364,6 +454,39 @@ impl Files {
     pub fn open_finish_once(&self, key: proto_fs::OpenKey) -> Result<PreparedOpen, Status> {
         let reply = self.open_key_once(Method::OpenFinish, key)?;
         Self::open_commit_reply(&reply)
+    }
+
+    /// Finalize a preparation atomically; an uncertain reply requires exact Query recovery.
+    pub fn open_finalize_once(&self, key: proto_fs::OpenKey) -> OpenFinalizeAttempt {
+        match self.open_key_once(Method::OpenFinish, key) {
+            Ok(reply) => Self::open_finalize_reply(&reply, key, self.channel.raw()),
+            Err(error) => OpenFinalizeAttempt::Ambiguous(error),
+        }
+    }
+
+    fn open_finalize_reply(
+        reply: &sys::Reply,
+        key: proto_fs::OpenKey,
+        session: abi::Handle,
+    ) -> OpenFinalizeAttempt {
+        let code = match Self::reply_code(reply) {
+            Ok(code) => code,
+            Err(error) => return OpenFinalizeAttempt::Ambiguous(error),
+        };
+        if code == 0 {
+            return match Self::open_commit_reply(reply) {
+                Ok(held) => OpenFinalizeAttempt::Finished(held),
+                Err(error) => OpenFinalizeAttempt::Ambiguous(error),
+            };
+        }
+        if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
+            return OpenFinalizeAttempt::Ambiguous(Status::BadSize);
+        }
+        if matches!(code, proto_fs::AUTHENTICATING | proto_fs::TIME_DEFERRED) {
+            OpenFinalizeAttempt::Deferred(OpenNoEffect { key, session, code })
+        } else {
+            OpenFinalizeAttempt::Rejected(Status::from_code(code))
+        }
     }
 
     pub fn open_query_once(&self, key: proto_fs::OpenKey) -> Result<OpenOutcome, Status> {
@@ -589,34 +712,13 @@ impl Files {
     }
 
     fn prepare<'a>(&'a self, path: &[u8]) -> Result<Proof<'a>, Status> {
-        if path.is_empty() {
-            return Err(Status::Unknown(proto_fs::NO_ENTRY));
-        }
-        if path.len() > proto_fs::MAX_PATH {
-            return Err(Status::Unknown(proto_fs::NAME_TOO_LONG));
-        }
-        if path.contains(&0) {
-            return Err(Status::BadSize);
-        }
-        let mut w = Writer::new();
-        Method::ResolveStart.header().write(&mut w)?;
-        w.u32(0)?;
-        w.u64(1)?;
-        w.u32(0)?;
-        w.u32(1)?;
-        w.bytes(path)?;
-        let reply = Self::send_on(&self.channel, w.as_bytes())?;
-        let mut buffer = [0; MESSAGE_MAX];
-        let mut r = Reader::new(reply.bytes(&mut buffer));
-        let status = Status::from_code(r.u32()?);
-        if status != Status::Ok {
-            return Err(status);
-        }
+        let mut request = [0; 28 + proto_fs::MAX_PATH];
+        let len = resolve_start_request(&mut request, path)?;
+        let reply = Self::send_on(&self.channel, &request[..len])?;
         let proof = Proof {
             files: self,
-            id: r.u64()?,
+            id: resolve_start_job(reply.len, &reply.words, reply.handles.len())?,
         };
-        r.finish()?;
         proof.ready()?;
         Ok(proof)
     }
@@ -660,9 +762,7 @@ impl Files {
             return Err(Status::BadSize);
         }
         let count = 1 + usize::from(offered.is_some());
-        let mut request = Writer::new();
-        Method::BindPending.header().write(&mut request)?;
-        request.u32(u32::from(require_fds))?;
+        let request = pending_binding_request(require_fds);
         loop {
             let mut outgoing = crate::handle::Outgoing::new();
             if let Some(channel) = offered.take() {
@@ -673,7 +773,7 @@ impl Files {
             outgoing
                 .push(identity.erase())
                 .map_err(|_| Status::BadSize)?;
-            let mut reply = sys::send_handles(root, request.as_bytes(), outgoing)
+            let mut reply = sys::send_handles(root, &request, outgoing)
                 .map_err(|refused| Status::Kernel(refused.error))?;
             let code = Self::reply_code(&reply)?;
             if code == proto_fs::AUTHENTICATING {
@@ -748,11 +848,9 @@ impl Files {
     /// The service requires a genuine Pending loader binding for the image handoff.
     pub fn open_exec_bound(&self, path: &[u8]) -> Result<Handle<Channel>, Status> {
         let proof = self.prepare(path)?;
-        let mut w = Writer::new();
-        Method::OpenExec.header().write(&mut w)?;
-        w.u64(proof.id)?;
+        let request = job_request(Method::OpenExec, proof.id);
         loop {
-            let mut reply = proof.send(w.as_bytes())?;
+            let mut reply = proof.send(&request)?;
             let code = Self::reply_code(&reply)?;
             if code == 0 {
                 if reply.len != 4
@@ -1164,4 +1262,342 @@ fn console_write(uart: Option<&Handle<Channel>>, bytes: &[u8]) -> Result<usize, 
     }
     console::write(bytes).map_err(Status::Kernel)?;
     Ok(bytes.len())
+}
+
+impl Files {
+    /// One native request. Refresh and recovery remain outside the final signal defer.
+    pub fn data_start_once(
+        &self,
+        args: proto_fs::DataStart,
+    ) -> Result<(proto_fs::DataPhase, u64), Status> {
+        let mut request = Writer::new();
+        Method::DataStart.header().write(&mut request)?;
+        args.write(&mut request)?;
+        let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_start_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+
+    pub fn data_feed_once(&self, job: u64, offset: u32, bytes: &[u8]) -> Result<(), Status> {
+        Self::open_job_id(job)?;
+        if bytes.len() > proto_fs::FEED_MAX {
+            return Err(Status::BadSize);
+        }
+        let mut request = Writer::new();
+        Method::DataFeed.header().write(&mut request)?;
+        request.u64(job)?;
+        request.u32(offset)?;
+        request.bytes(bytes)?;
+        let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+
+    pub fn data_step_once(&self, job: u64) -> Result<(), Status> {
+        let reply = self.data_job_once(Method::DataStep, job)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+
+    pub fn data_commit_once(
+        &self,
+        job: u64,
+        args: proto_fs::DataStart,
+    ) -> Result<proto_fs::DataOutcome, Status> {
+        let reply = self.data_job_once(Method::DataCommit, job)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let outcome =
+            proto_fs::DataOutcome::read(reply.bytes(&mut buffer), reply.handles.len(), args)?;
+        if outcome.job != job {
+            return Err(Status::BadSize);
+        }
+        Ok(outcome)
+    }
+
+    pub fn data_query_once(
+        &self,
+        args: proto_fs::DataStart,
+    ) -> Result<proto_fs::DataOutcome, Status> {
+        let reply = self.open_key_once(Method::DataQuery, args.key)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::DataOutcome::read(reply.bytes(&mut buffer), reply.handles.len(), args)
+    }
+
+    pub fn data_cancel_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        self.data_cleanup_once(Method::DataCancel, key)
+    }
+
+    pub fn data_ack_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        self.data_cleanup_once(Method::DataAck, key)
+    }
+
+    pub fn data_read_result_once(
+        &self,
+        key: proto_fs::OpenKey,
+        count: usize,
+        out: &mut [u8],
+    ) -> Result<usize, Status> {
+        if count > out.len() || count > MAX_READ {
+            return Err(Status::BadSize);
+        }
+        let reply = self.open_key_once(Method::DataReadResult, key)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let bytes =
+            proto_fs::data_read_reply(reply.bytes(&mut buffer), reply.handles.len(), count)?;
+        out[..count].copy_from_slice(bytes);
+        Ok(count)
+    }
+
+    fn data_job_once(&self, method: Method, job: u64) -> Result<sys::Reply, Status> {
+        Self::open_job_id(job)?;
+        let mut request = Writer::new();
+        method.header().write(&mut request)?;
+        request.u64(job)?;
+        sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)
+    }
+
+    fn data_cleanup_once(&self, method: Method, key: proto_fs::OpenKey) -> Result<(), Status> {
+        let reply = self.open_key_once(method, key)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_fs::data_progress_reply(reply.bytes(&mut buffer), reply.handles.len())
+    }
+}
+
+#[cfg(test)]
+mod finalize_reply_tests {
+    use super::*;
+    fn key() -> proto_fs::OpenKey {
+        proto_fs::OpenKey {
+            slot: 2,
+            generation: 9,
+        }
+    }
+    fn session() -> abi::Handle {
+        abi::Handle::new(7, 9)
+    }
+    fn reply(len: usize, first: u64, second: u64) -> sys::Reply {
+        let mut words = [0; 8];
+        words[0] = first;
+        words[1] = second;
+        sys::Reply {
+            len,
+            words,
+            handles: crate::handle::Incoming::none(),
+        }
+    }
+    #[test]
+    fn canonical_no_effect_receipt_binds_request_and_transport_generations() {
+        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+            let r = reply(8, code as u64, 0);
+            let OpenFinalizeAttempt::Deferred(receipt) =
+                Files::open_finalize_reply(&r, key(), session())
+            else {
+                panic!("canonical receipt");
+            };
+            assert_eq!(receipt.status(), Status::Unknown(code));
+            assert!(receipt.matches_request(key(), session()));
+            assert!(!receipt.matches_request(
+                proto_fs::OpenKey {
+                    slot: 2,
+                    generation: 10
+                },
+                session()
+            ));
+            assert!(!receipt.matches_request(key(), abi::Handle::new(7, 10)));
+        }
+    }
+    #[test]
+    fn malformed_no_effect_envelopes_remain_ambiguous() {
+        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+            for len in [0, 4, 7, 9, 12, 16, 32] {
+                assert!(matches!(
+                    Files::open_finalize_reply(&reply(len, code as u64, 0), key(), session()),
+                    OpenFinalizeAttempt::Ambiguous(_)
+                ));
+            }
+            assert!(matches!(
+                Files::open_finalize_reply(&reply(8, code as u64 | 1 << 32, 0), key(), session()),
+                OpenFinalizeAttempt::Ambiguous(_)
+            ));
+        }
+    }
+    #[test]
+    fn completed_finalization_requires_the_exact_descriptor_envelope() {
+        let held = PreparedOpen {
+            fd: 3,
+            slot: 127,
+            generation: 11,
+            random: true,
+        };
+        let first = (held.marked_fd() as u64) << 32;
+        assert!(
+            matches!(Files::open_finalize_reply(&reply(16, first, held.generation), key(), session()), OpenFinalizeAttempt::Finished(found) if found == held)
+        );
+        for len in [8, 15, 17, 32] {
+            assert!(matches!(
+                Files::open_finalize_reply(&reply(len, first, held.generation), key(), session()),
+                OpenFinalizeAttempt::Ambiguous(_)
+            ));
+        }
+        for (packed, generation) in [(first, 0), (35u64 << 32, 1), (first | 1 << 60, 1)] {
+            assert!(matches!(
+                Files::open_finalize_reply(&reply(16, packed, generation), key(), session()),
+                OpenFinalizeAttempt::Ambiguous(_)
+            ));
+        }
+    }
+    #[test]
+    fn canonical_terminal_refusal_creates_no_prepared_receipt() {
+        assert!(matches!(
+            Files::open_finalize_reply(
+                &reply(8, proto_fs::ACCESS_DENIED as u64, 0),
+                key(),
+                session()
+            ),
+            OpenFinalizeAttempt::Rejected(Status::Unknown(proto_fs::ACCESS_DENIED))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod resolver_small_wire_tests {
+    use super::*;
+
+    #[test]
+    fn paid_job_requests_match_the_existing_full_writer() {
+        for method in [Method::ResolveStep, Method::OpenExec, Method::ResolveCancel] {
+            for job in [1, 256, u64::MAX] {
+                let mut writer = Writer::new();
+                method.header().write(&mut writer).unwrap();
+                writer.u64(job).unwrap();
+                assert_eq!(job_request(method, job).as_slice(), writer.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn pending_binding_request_matches_the_existing_full_writer() {
+        for require_fds in [false, true] {
+            let mut writer = Writer::new();
+            Method::BindPending.header().write(&mut writer).unwrap();
+            writer.u32(u32::from(require_fds)).unwrap();
+            assert_eq!(
+                pending_binding_request(require_fds).as_slice(),
+                writer.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_start_matches_the_existing_full_writer_and_path_guards() {
+        let max = [b'x'; proto_fs::MAX_PATH];
+        for path in [b"/".as_slice(), b"../bin/probe", max.as_slice()] {
+            let mut request = [0xa5; 28 + proto_fs::MAX_PATH];
+            let len = resolve_start_request(&mut request, path).unwrap();
+            let mut writer = Writer::new();
+            Method::ResolveStart.header().write(&mut writer).unwrap();
+            writer.u32(0).unwrap();
+            writer.u64(1).unwrap();
+            writer.u32(0).unwrap();
+            writer.u32(1).unwrap();
+            writer.bytes(path).unwrap();
+            assert_eq!(&request[..len], writer.as_bytes());
+            assert_eq!(len, 28 + path.len());
+        }
+        let mut request = [0xa5; 28 + proto_fs::MAX_PATH];
+        for (path, status) in [
+            (b"".as_slice(), Status::Unknown(proto_fs::NO_ENTRY)),
+            (
+                &[0; proto_fs::MAX_PATH + 1],
+                Status::Unknown(proto_fs::NAME_TOO_LONG),
+            ),
+            (b"/a\0b".as_slice(), Status::BadSize),
+        ] {
+            assert_eq!(resolve_start_request(&mut request, path), Err(status));
+            assert_eq!(request, [0xa5; 28 + proto_fs::MAX_PATH]);
+        }
+    }
+
+    fn start_words(status: Status, job: u64) -> [u64; 8] {
+        let mut words = [0; 8];
+        words[0] = status.code() as u64 | (job & 0xffff_ffff) << 32;
+        words[1] = job >> 32;
+        words
+    }
+
+    #[test]
+    fn resolver_start_requires_exact_job_and_status_envelopes() {
+        for job in [1, 256, 1 << 32, u64::MAX] {
+            let words = start_words(Status::Ok, job);
+            assert_eq!(resolve_start_job(12, &words, 0), Ok(job));
+            for len in [0, 4, 8, 11, 13, 16, 64, MESSAGE_MAX, MESSAGE_MAX + 1] {
+                assert_eq!(resolve_start_job(len, &words, 0), Err(Status::BadSize));
+            }
+            for caps in [1, 2, 8] {
+                assert_eq!(resolve_start_job(12, &words, caps), Err(Status::BadSize));
+            }
+        }
+        assert_eq!(
+            resolve_start_job(12, &start_words(Status::Ok, 0), 0),
+            Err(Status::BadSize)
+        );
+        for status in [
+            Status::Unknown(proto_fs::ACCESS_DENIED),
+            Status::Kernel(Error::Interrupted),
+            Status::BadSize,
+        ] {
+            let words = start_words(status, 0);
+            assert_eq!(resolve_start_job(8, &words, 0), Err(status));
+            for len in [0, 4, 7, 9, 12, 16, MESSAGE_MAX] {
+                assert_eq!(resolve_start_job(len, &words, 0), Err(Status::BadSize));
+            }
+            for bit in 32..64 {
+                let mut reserved = words;
+                reserved[0] |= 1 << bit;
+                assert_eq!(resolve_start_job(8, &reserved, 0), Err(Status::BadSize));
+            }
+            assert_eq!(resolve_start_job(8, &words, 1), Err(Status::BadSize));
+        }
+    }
+
+    #[test]
+    fn ready_status_preserves_canonical_outcomes() {
+        for status in [
+            Status::Ok,
+            Status::Unknown(proto_fs::RESOLVING),
+            Status::Unknown(proto_fs::STALE_PROOF),
+            Status::Unknown(proto_fs::ACCESS_DENIED),
+            Status::Kernel(Error::Interrupted),
+            Status::BadSize,
+        ] {
+            let bytes = proto_wire::reply(status);
+            assert_eq!(bytes.len(), 8);
+            let first = u64::from_le_bytes(bytes);
+            assert_eq!(proof_ready_status(8, first, 0), Ok(status));
+        }
+    }
+
+    #[test]
+    fn ready_status_rejects_prefixes_reserved_bits_and_capabilities() {
+        for code in [0, proto_fs::RESOLVING, proto_fs::ACCESS_DENIED] {
+            for len in [0, 1, 4, 7, 9, 16, 32, MESSAGE_MAX, MESSAGE_MAX + 1] {
+                assert_eq!(
+                    proof_ready_status(len, code as u64, 0),
+                    Err(Status::BadSize)
+                );
+            }
+            for bit in 32..64 {
+                assert_eq!(
+                    proof_ready_status(8, code as u64 | 1 << bit, 0),
+                    Err(Status::BadSize)
+                );
+            }
+            for caps in [1, 2, 8] {
+                assert_eq!(
+                    proof_ready_status(8, code as u64, caps),
+                    Err(Status::BadSize)
+                );
+            }
+        }
+    }
 }

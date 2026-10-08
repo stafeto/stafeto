@@ -18,6 +18,7 @@ use proto_wire::Status;
 use proto_wire::clones::Clones;
 use ramfs::authority::{
     Admission, AuditStep, Binding, BindingPurpose, CleanupAudit, Identity, NotaryReply,
+    RetainedSourcePhase, retained_source_phase,
 };
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
@@ -30,6 +31,8 @@ use rt::handle::{Channel, Handle, Memory, Outgoing, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 
+mod clock_page;
+
 rt::entry!(main);
 
 #[cfg(not(feature = "auth-probe"))]
@@ -37,7 +40,8 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0xfff7, 0xfff8, 0xfff9, 0xfffa,
+    0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -86,7 +90,21 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let now = rt::time::ticks_to_ns(rt::time::now());
+    // Legacy diagnostic timestamp source; clocked profiles replace this at startup.
+    let Ok(args) = ServiceArgs::read(start.args()) else {
+        return 7;
+    };
+    let period_ns = args.period_ns;
+    let Ok(mode) = ramfs::time_source::Mode::parse(args.own) else {
+        return 7;
+    };
+    let Ok(time_source) = clock_page::TimeSource::attach(mode, &start.parent, &start.process)
+    else {
+        return 8;
+    };
+    let Ok(now) = time_source.initial() else {
+        return 9;
+    };
     let tree = image_tree(&mut start);
     let Ok(backing) = sys::mem_create((ramfs::storage::PAGES * ramfs::storage::PAGE) as u64) else {
         return 5;
@@ -106,7 +124,6 @@ fn main(_: u64) -> u64 {
     };
     state.initialize();
     let ram = Ram::with_storage(now, state, data, tree);
-    let args = ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
         return 2;
@@ -116,7 +133,7 @@ fn main(_: u64) -> u64 {
     }
     let heartbeat = Heartbeat {
         to: &start.parent,
-        period_ns: args.map_or(0, |args| args.period_ns),
+        period_ns,
         priority: level,
     };
     let config = Config {
@@ -135,6 +152,11 @@ fn main(_: u64) -> u64 {
     let tables = unsafe { &mut *TABLES.0.get() };
     let mut fs = Fs {
         ram,
+        time_source,
+        #[cfg(feature = "image-info-probe")]
+        image_info_backing: Handle::borrowed(backing.raw()),
+        #[cfg(feature = "image-info-probe")]
+        image_info_fault: None,
         process: Handle::borrowed(start.process.raw()),
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
@@ -151,6 +173,9 @@ fn main(_: u64) -> u64 {
         maintenance: ramfs::maintenance::Cursor::default(),
         next_audit_ns: 0,
         maintenance_jobs: false,
+        data_gc_turn: false,
+        orphan_cursor: 0,
+        orphan_count: 0,
     };
     // Prepare the authentic notary page after publishing the RAM endpoint.
     // Standalone boot profiles may have no Process service.
@@ -163,6 +188,12 @@ fn main(_: u64) -> u64 {
 
 struct Fs {
     ram: Ram<'static>,
+    time_source: clock_page::TimeSource,
+    // The startup-owned backing outlives this service loop and every outgoing copy.
+    #[cfg(feature = "image-info-probe")]
+    image_info_backing: ManuallyDrop<Handle<Memory>>,
+    #[cfg(feature = "image-info-probe")]
+    image_info_fault: Option<(u32, u32, u64, u32)>,
     /// The service's own process, to map the object of a READ_INTO in.
     process: ManuallyDrop<Handle<rt::handle::Process>>,
     /// The service's channel, which its own sessions are copies of, and
@@ -189,6 +220,9 @@ struct Fs {
     maintenance: ramfs::maintenance::Cursor,
     next_audit_ns: u64,
     maintenance_jobs: bool,
+    data_gc_turn: bool,
+    orphan_cursor: u8,
+    orphan_count: u16,
 }
 
 /// The clones the service keeps alive at most: one for each record of the
@@ -227,11 +261,34 @@ struct ResolveJob {
     root: u16,
     real: bool,
     authority: Option<ramfs::authority::Stamp>,
+    operation: JobOperation,
+    open_key: Option<proto_fs::OpenKey>,
+    raw_base: (u32, u64),
+    abandoned: bool,
+}
+struct PathJob {
     resolver: Resolve,
     second: Option<Resolve>,
     open: Option<OpenJournal>,
-    open_key: Option<proto_fs::OpenKey>,
-    raw_base: (u32, u64),
+}
+#[allow(clippy::large_enum_variant)]
+enum JobOperation {
+    Path(PathJob),
+    Data(ramfs::data::Journal),
+}
+impl ResolveJob {
+    fn path(&self) -> &PathJob {
+        match &self.operation {
+            JobOperation::Path(path) => path,
+            JobOperation::Data(_) => panic!("validated path job"),
+        }
+    }
+    fn path_mut(&mut self) -> &mut PathJob {
+        match &mut self.operation {
+            JobOperation::Path(path) => path,
+            JobOperation::Data(_) => panic!("validated path job"),
+        }
+    }
 }
 struct Tables {
     places: ramfs::places::Places,
@@ -456,9 +513,10 @@ impl Fs {
                 .iter()
                 .position(|b| b.as_ref().is_some_and(|(label, _)| *label == outcome.label))
             {
-                let (_, mut image) = self.births[i].take().unwrap();
-                self.drop_identity(&mut image);
-                self.ram.release(&mut image);
+                let (_, image) = self.births[i].as_mut().expect("retained image birth");
+                Self::drop_identity_fields(&mut self.ram, self.identities, image);
+                self.ram.release(image);
+                self.births[i] = None;
             }
             self.places.release(outcome.label);
         } else if let Some(identity) = self
@@ -472,10 +530,13 @@ impl Fs {
         }
     }
     fn finish_image_job(&mut self, fds: &mut Fds, id: u64, owner: u64) {
-        let i = self.job_slot(id, owner).expect("exact executable job");
+        let i = self.path_slot(id, owner).expect("exact executable job");
         let j = self.jobs[i].take().unwrap();
-        j.resolver.release(&mut self.ram.storage);
-        if let Some(second) = j.second {
+        let JobOperation::Path(path) = j.operation else {
+            unreachable!()
+        };
+        path.resolver.release(&mut self.ram.storage);
+        if let Some(second) = path.second {
             second.release(&mut self.ram.storage);
         }
         if j.root != NONE {
@@ -535,7 +596,7 @@ impl Fs {
         if let Err(code) = self.authenticate(fds, r.label()) {
             return status(code);
         }
-        if self.job_slot(job, r.label()).is_err() {
+        if self.path_slot(job, r.label()).is_err() {
             return status(proto_fs::OPEN_RETIRED);
         }
         let token = match self.proof(job, r.label(), Some(fds)) {
@@ -730,6 +791,39 @@ impl Fs {
                 }
                 match self.ram.held_image_information(fds) {
                     Ok(info) => {
+                        #[cfg(feature = "image-info-probe")]
+                        if self
+                            .image_info_fault
+                            .is_some_and(|(pid, image, ticket, _)| {
+                                fds.binding.snapshot_ref().is_some_and(|who| {
+                                    who.pid == pid
+                                        && who.image == image
+                                        && who.loader.is_some_and(|loader| loader.ticket == ticket)
+                                })
+                            })
+                        {
+                            let fault = self.image_info_fault.take().expect("armed exact loader").3;
+                            let mut body = proto_wire::Writer::new();
+                            if body.u32(0).and_then(|()| info.write(&mut body)).is_err() {
+                                return Answer::Status(Status::BadSize);
+                            }
+                            let length = body.as_bytes().len() - usize::from(fault == 2);
+                            if r.reply().bytes(&body.as_bytes()[..length]).is_err()
+                                || (fault == 1 && r.reply().u32(0).is_err())
+                            {
+                                return Answer::Status(Status::BadSize);
+                            }
+                            if fault == 3 {
+                                return match sys::handle_duplicate(
+                                    &self.image_info_backing,
+                                    Rights::MAP_READ | Rights::TRANSFER,
+                                ) {
+                                    Ok(copy) => Answer::Reply([copy.erase()].into()),
+                                    Err(error) => Answer::Status(Status::Kernel(error)),
+                                };
+                            }
+                            return Answer::Reply(Outgoing::new());
+                        }
                         let w = r.reply();
                         if w.u32(0).and_then(|()| info.write(w)).is_err() {
                             return Answer::Status(Status::BadSize);
@@ -894,7 +988,7 @@ impl Service<0> for Fs {
         self.clear_image_outcome(&mut s.data);
         for id in s.data.resolvers {
             if id != 0 {
-                self.cancel_job(id, s.label(), Some(&mut s.data));
+                self.abandon_job(id, s.label(), &mut s.data);
             }
         }
         self.drop_identity(&mut s.data);
@@ -915,7 +1009,7 @@ impl Service<0> for Fs {
             self.clear_image_outcome(&mut fds);
             for id in fds.resolvers {
                 if id != 0 {
-                    self.cancel_job(id, label, Some(&mut fds));
+                    self.abandon_job(id, label, &mut fds);
                 }
             }
             self.drop_identity(&mut fds);
@@ -941,8 +1035,19 @@ impl Service<0> for Fs {
         let mut work = false;
         self.maintenance_jobs = !self.maintenance_jobs;
         if self.maintenance_jobs {
-            work = self.ram.storage.reclaim_step();
-            if work || self.maintenance.remaining != 0 {
+            self.data_gc_turn = !self.data_gc_turn;
+            if self.data_gc_turn && self.orphan_count != 0 {
+                let slot = self.orphan_cursor as usize;
+                self.orphan_cursor = ((slot + 1) % ramfs::storage::PREPARATIONS) as u8;
+                if let Some(job) = self.jobs[slot].as_ref().filter(|job| job.abandoned) {
+                    let (id, owner) = (job.id, job.owner);
+                    self.cancel_job(id, owner, None);
+                    work = true;
+                }
+            } else {
+                work = self.ram.storage.reclaim_step();
+            }
+            if work || self.maintenance.remaining != 0 || self.orphan_count != 0 {
                 let _ = sys::notify(&self.channel, 1);
             }
             return;
@@ -961,7 +1066,7 @@ impl Service<0> for Fs {
         work |= client_work;
         self.maintenance.complete(client_work, SESSIONS + BIRTHS);
         // A maintenance notification makes reclamation progress with no client request.
-        if work || self.maintenance.remaining != 0 {
+        if work || self.maintenance.remaining != 0 || self.orphan_count != 0 {
             let _ = sys::notify(&self.channel, 1);
         }
     }
@@ -990,7 +1095,9 @@ impl Service<0> for Fs {
                 .iter_mut()
                 .find(|b| b.is_some_and(|(l, _)| l == label))
             {
-                s.data = birth.take().expect("a birth").1;
+                // RT creates unclaimed sessions from Fds::default, with no held references.
+                let claimed = s.data.claim_retained_birth(birth, label);
+                debug_assert!(claimed);
             } else if r.label() & proto_fs::OWN != 0 && self.clones.client_of(r.label()).is_some() {
                 // A Loader consumed this birth into a distinct label; surviving old copies
                 // have cleanup authority only, regardless of a creator's retained handle.
@@ -1002,6 +1109,27 @@ impl Service<0> for Fs {
             if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {
                 return status(proto_fs::RESOLVING);
             }
+        }
+        #[cfg(feature = "image-info-probe")]
+        if r.method() == 0xfff7 {
+            let mut body = r.body();
+            let Ok(fault) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if body.finish().is_err() || !r.handles.is_empty() || !(1..=3).contains(&fault) {
+                return Answer::Status(Status::BadSize);
+            }
+            let Some(who) = s.data.binding.snapshot_ref() else {
+                return status(proto_fs::PERMISSION);
+            };
+            let Some(loader) = who.loader else {
+                return status(proto_fs::PERMISSION);
+            };
+            if self.image_info_fault.is_some() {
+                return status(proto_fs::PERMISSION);
+            }
+            self.image_info_fault = Some((who.pid, who.image, loader.ticket, fault));
+            return Answer::Status(Status::Ok);
         }
         if first && proto_fs::is_loaders(r.label()) && r.method() == Method::BindPending as u16 {
             return self.pending_admission(r);
@@ -1203,6 +1331,8 @@ impl Service<0> for Fs {
                         | Method::CloseExact
                         | Method::ResolveCancel
                         | Method::OpenCancel
+                        | Method::DataCancel
+                        | Method::DataAck
                         | Method::VerifySession
                 )
             )
@@ -1214,6 +1344,21 @@ impl Service<0> for Fs {
         }
         if r.method() == Method::BindPending as u16 {
             return self.bind_pending(r);
+        }
+        if matches!(
+            Method::from_number(r.method()),
+            Some(
+                Method::DataStart
+                    | Method::DataFeed
+                    | Method::DataStep
+                    | Method::DataCommit
+                    | Method::DataQuery
+                    | Method::DataCancel
+                    | Method::DataAck
+                    | Method::DataReadResult
+            )
+        ) {
+            return self.data_request(&mut s.data, r);
         }
         if matches!(
             Method::from_number(r.method()),
@@ -1316,7 +1461,7 @@ impl Service<0> for Fs {
                     &mut s.data,
                     fd,
                     &mut bytes[..count as usize],
-                    rt::time::ticks_to_ns(rt::time::now()),
+                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
                 ) {
                     Ok(n) => {
                         let w = r.reply();
@@ -1345,7 +1490,7 @@ impl Service<0> for Fs {
                     fd,
                     offset,
                     &mut bytes[..count as usize],
-                    rt::time::ticks_to_ns(rt::time::now()),
+                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
                 ) {
                     Ok(n) => {
                         let w = r.reply();
@@ -1375,7 +1520,7 @@ impl Service<0> for Fs {
                     &mut s.data,
                     fd,
                     bytes,
-                    rt::time::ticks_to_ns(rt::time::now()),
+                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
                 ) {
                     Ok(n) => value(r, n as u32),
                     Err(code) => status(code),
@@ -1393,7 +1538,7 @@ impl Service<0> for Fs {
                     fd,
                     offset,
                     bytes,
-                    rt::time::ticks_to_ns(rt::time::now()),
+                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
                 ) {
                     Ok(n) => value(r, n as u32),
                     Err(code) => status(code),
@@ -1528,7 +1673,7 @@ impl Service<0> for Fs {
                     token,
                     index,
                     identity,
-                    rt::time::ticks_to_ns(rt::time::now()),
+                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
                 );
                 self.cancel_job(job, r.label(), Some(&mut s.data));
                 match found {
@@ -1557,7 +1702,7 @@ impl Service<0> for Fs {
                 match self.ram.directory_read(
                     &mut s.data,
                     fd,
-                    rt::time::ticks_to_ns(rt::time::now()),
+                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
                 ) {
                     Ok(entry) => {
                         let entry = entry.map(|entry| proto_fs::DirectoryEntry {
@@ -1640,7 +1785,17 @@ impl Service<0> for Fs {
                     Err(code) => status(code),
                 }
             }
-            None => Answer::Status(Status::UnknownMethod),
+            Some(
+                Method::DataStart
+                | Method::DataFeed
+                | Method::DataStep
+                | Method::DataCommit
+                | Method::DataQuery
+                | Method::DataCancel
+                | Method::DataAck
+                | Method::DataReadResult,
+            )
+            | None => Answer::Status(Status::UnknownMethod),
         }
     }
 }
@@ -1777,12 +1932,19 @@ impl Fs {
         Ok(())
     }
     fn drop_identity(&mut self, fds: &mut Fds) {
+        Self::drop_identity_fields(&mut self.ram, self.identities, fds);
+    }
+    fn drop_identity_fields(
+        ram: &mut Ram<'_>,
+        identities: &mut [Option<IdentityChannel>; SESSIONS],
+        fds: &mut Fds,
+    ) {
         if let Some(root) = fds.binding_preparation.take() {
-            self.ram.storage.release_preparation(root);
+            ram.storage.release_preparation(root);
         }
         fds.binding_source = None;
         if fds.authority_index != NONE {
-            self.identities[fds.authority_index as usize] = None;
+            identities[fds.authority_index as usize] = None;
             fds.authority_index = NONE;
         }
     }
@@ -1921,6 +2083,14 @@ impl Fs {
     }
 
     fn authenticate(&mut self, fds: &mut Fds, label: u64) -> Result<(), u32> {
+        Self::authenticate_fields(&mut self.ram, self.identities, fds, label)
+    }
+    fn authenticate_fields(
+        ram: &mut Ram<'_>,
+        identities: &mut [Option<IdentityChannel>; SESSIONS],
+        fds: &mut Fds,
+        label: u64,
+    ) -> Result<(), u32> {
         if matches!(fds.binding, Binding::Unbound) && proto_fs::is_boot_profile(label) {
             fds.binding = Binding::Boot;
             fds.root = Root {
@@ -1951,15 +2121,14 @@ impl Fs {
             return Err(proto_fs::TOO_MANY_OPEN_FILES);
         }
         let i = fds.authority_index as usize;
-        let identity = self
-            .identities
+        let identity = identities
             .get_mut(i)
             .and_then(Option::as_mut)
             .ok_or(proto_fs::PERMISSION)?;
         if identity.label != label {
             return Err(proto_fs::PERMISSION);
         }
-        self.ram.begin_binding(fds)?;
+        ram.begin_binding(fds)?;
         identity.admission = Admission::Unvouched;
         identity.audit.reset();
         identity.purpose = BindingPurpose::Refresh;
@@ -2066,6 +2235,7 @@ impl Fs {
         Ok((require == Ok(1), offered_index, identity_index))
     }
     /// Cold root admission returns every accepted object before paid child preparation.
+    #[inline(never)]
     fn pending_admission(&mut self, r: &mut Request<'_>) -> Answer {
         if let Err(code) = Self::pending_input(r) {
             return status(code);
@@ -2088,6 +2258,7 @@ impl Fs {
         }
         Answer::Reply(returned)
     }
+    #[inline(never)]
     fn bind_pending(&mut self, r: &mut Request<'_>) -> Answer {
         let (require, offered_index, identity_index) = match Self::pending_input(r) {
             Ok(input) => input,
@@ -2416,40 +2587,57 @@ impl Fs {
             let Some(creator) = source.binding.snapshot_ref() else {
                 return self.reject_binding(fds);
             };
-            if source.binding_preparation.is_some()
-                || generation(creator.index as usize) != creator.generation
-            {
-                let (_, mut source) = self.births[slot as usize].take().unwrap();
-                let code = if source.binding_preparation.is_some() {
-                    self.binding_phase(&mut source, label, progress)
-                } else {
-                    match self.authenticate(&mut source, label) {
-                        Ok(()) | Err(proto_fs::AUTHENTICATING) => proto_fs::RESOLVING,
-                        Err(code) => code,
-                    }
-                };
-                let valid = !matches!(source.binding, Binding::Cleanup);
-                self.births[slot as usize] = Some((label, source));
-                return if !valid {
-                    self.reject_binding(fds)
-                } else if code == 0 || code == proto_fs::RESOLVING {
-                    proto_fs::RESOLVING
-                } else {
-                    self.fail_binding(fds, code)
-                };
+            let purpose = self
+                .identities
+                .get(source.authority_index as usize)
+                .and_then(Option::as_ref)
+                .filter(|identity| identity.label == label)
+                .map(|identity| identity.purpose);
+            let source_phase = match retained_source_phase(
+                label,
+                *old_label,
+                source.binding_preparation.is_some(),
+                purpose,
+                generation(creator.index as usize),
+                creator.generation,
+            ) {
+                Err(_) => return self.reject_binding(fds),
+                Ok(phase) => phase,
+            };
+            *progress = source_phase.progresses();
+            match source_phase {
+                RetainedSourcePhase::WaitRefresh => {
+                    // The retained birth advances from its own maintenance visit.
+                    return proto_fs::RESOLVING;
+                }
+                RetainedSourcePhase::Authenticate => {
+                    let source = &mut self.births[slot as usize].as_mut().unwrap().1;
+                    let result =
+                        Self::authenticate_fields(&mut self.ram, self.identities, source, label);
+                    let valid = !matches!(source.binding, Binding::Cleanup);
+                    return if !valid {
+                        self.reject_binding(fds)
+                    } else {
+                        match result {
+                            Ok(()) | Err(proto_fs::AUTHENTICATING) => proto_fs::RESOLVING,
+                            Err(code) => self.fail_binding(fds, code),
+                        }
+                    };
+                }
+                RetainedSourcePhase::Ready => {}
             }
-            let (_, mut source) = self.births[slot as usize].take().unwrap();
             let mut bound = source.binding;
             if bound.bind_ref(Some(&who), true).is_err() || source.root != fds.root {
-                self.births[slot as usize] = Some((label, source));
                 return self.reject_binding(fds);
             }
-            self.drop_identity(&mut source);
+            let source = &mut self.births[slot as usize].as_mut().unwrap().1;
+            Self::drop_identity_fields(&mut self.ram, self.identities, source);
             source.binding = bound;
             source.authority_index = fds.authority_index;
             source.claimed = true;
             self.ram.complete_binding(fds, 0);
-            *fds = source;
+            core::mem::swap(fds, source);
+            self.births[slot as usize] = None;
         } else {
             self.ram.complete_binding(fds, 0);
         }
@@ -2462,6 +2650,255 @@ impl Fs {
         fds.binding_outcome = Some(0);
         0
     }
+    fn data_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        if proto_fs::is_loaders(r.label()) {
+            return status(proto_fs::PERMISSION);
+        }
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let method = Method::from_number(r.method()).expect("data method");
+        if method == Method::DataStart {
+            let args = match proto_fs::DataStart::read(r.body()) {
+                Ok(args) => args,
+                Err(error) => return Answer::Status(error),
+            };
+            if let Err(code) = self.authenticate(fds, r.label()) {
+                return status(code);
+            }
+            if let Some(job) = self
+                .jobs
+                .iter()
+                .flatten()
+                .find(|job| job.owner == r.label() && job.open_key == Some(args.key))
+            {
+                let JobOperation::Data(data) = &job.operation else {
+                    return status(proto_fs::PERMISSION);
+                };
+                if job.abandoned {
+                    return status(proto_fs::OPEN_RETIRED);
+                }
+                if data.args != args {
+                    return status(proto_fs::PERMISSION);
+                }
+                if !fds.resolvers.contains(&job.id)
+                    || job.authority.map(|stamp| stamp.image)
+                        != fds.binding.stamp().map(|stamp| stamp.image)
+                {
+                    return status(proto_fs::OPEN_RETIRED);
+                }
+                if r.reply()
+                    .u32(0)
+                    .and_then(|()| r.reply().u32(data.phase as u32))
+                    .and_then(|()| r.reply().u64(job.id))
+                    .is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                return Answer::Reply(Outgoing::new());
+            }
+            if self.jobs.iter().flatten().any(|job| {
+                job.owner == r.label() && job.open_key.is_some_and(|key| key.slot == args.key.slot)
+            }) {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            }
+            if args.key.generation <= fds.open_watermarks[args.key.slot as usize] {
+                return status(proto_fs::OPEN_RETIRED);
+            }
+            if !fds.preparation_available() {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            }
+            let Some(local) = fds.resolvers.iter().position(|&id| id == 0) else {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            };
+            let Some(slot) = self.jobs.iter().position(Option::is_none) else {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            };
+            let Some(generation) = self.job_generations[slot]
+                .checked_add(1)
+                .filter(|&generation| generation < 1 << 56)
+            else {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            };
+            let charge = match self.ram.storage.charge_preparation(fds.root) {
+                Ok(charge) => charge,
+                Err(code) => return status(code),
+            };
+            let data = match ramfs::data::Journal::capture(&mut self.ram, fds, args) {
+                Ok(data) => data,
+                Err(code) => {
+                    self.ram.storage.release_preparation(charge);
+                    return status(code);
+                }
+            };
+            let phase = data.phase;
+            let id = generation << 8 | slot as u64;
+            self.jobs[slot] = Some(ResolveJob {
+                id,
+                owner: r.label(),
+                root: charge,
+                real: false,
+                authority: fds.binding.stamp(),
+                operation: JobOperation::Data(data),
+                open_key: Some(args.key),
+                raw_base: (0, 0),
+                abandoned: false,
+            });
+            self.job_generations[slot] = generation;
+            fds.resolvers[local] = id;
+            fds.open_watermarks[args.key.slot as usize] = args.key.generation;
+            if r.reply()
+                .u32(0)
+                .and_then(|()| r.reply().u32(phase as u32))
+                .and_then(|()| r.reply().u64(id))
+                .is_err()
+            {
+                self.cancel_job(id, r.label(), Some(fds));
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply(Outgoing::new());
+        }
+        let mut body = r.body();
+        let keyed = matches!(
+            method,
+            Method::DataQuery | Method::DataCancel | Method::DataAck | Method::DataReadResult
+        );
+        let slot = if keyed {
+            let mut key_body = r.body();
+            let (Ok(slot), Ok(generation), Ok(())) =
+                (key_body.u32(), key_body.u64(), key_body.finish())
+            else {
+                return Answer::Status(Status::BadSize);
+            };
+            let key = proto_fs::OpenKey { slot, generation };
+            if let Err(code) = key.validate() {
+                return status(code);
+            }
+            let found = self.jobs.iter().position(|job| {
+                job.as_ref()
+                    .is_some_and(|job| job.owner == r.label() && job.open_key == Some(key))
+            });
+            let Some(slot) = found else {
+                if method == Method::DataCancel {
+                    let watermark = &mut fds.open_watermarks[key.slot as usize];
+                    *watermark = (*watermark).max(key.generation);
+                    return Answer::Status(Status::Ok);
+                }
+                return status(
+                    if key.generation <= fds.open_watermarks[key.slot as usize] {
+                        proto_fs::OPEN_RETIRED
+                    } else {
+                        proto_fs::NO_ENTRY
+                    },
+                );
+            };
+            slot
+        } else {
+            let Ok(id) = body.u64() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if method != Method::DataFeed && body.left() != 0 {
+                return Answer::Status(Status::BadSize);
+            }
+            match self.job_slot(id, r.label()) {
+                Ok(slot) => slot,
+                Err(code) => return status(code),
+            }
+        };
+        let job = self.jobs[slot].as_ref().expect("exact data job");
+        let id = job.id;
+        let JobOperation::Data(data) = &job.operation else {
+            return status(proto_fs::PERMISSION);
+        };
+        if !fds.resolvers.contains(&id) {
+            return status(proto_fs::PERMISSION);
+        }
+        if matches!(method, Method::DataAck | Method::DataCancel) {
+            if method == Method::DataAck && !data.ack_allowed() {
+                return status(proto_fs::INVALID_ARGUMENT);
+            }
+            let retire = method == Method::DataAck || !data.ack_allowed();
+            return if self.cancel_job_mode(id, r.label(), Some(fds), retire) {
+                Answer::Status(Status::Ok)
+            } else {
+                status(proto_fs::RESOLVING)
+            };
+        }
+        if job.abandoned {
+            return status(proto_fs::OPEN_RETIRED);
+        }
+        if let Err(code) = self.authenticate(fds, r.label()) {
+            return status(code);
+        }
+        let job = self.jobs[slot].as_mut().expect("owned data job");
+        if job.authority.map(|stamp| stamp.image) != fds.binding.stamp().map(|stamp| stamp.image) {
+            return status(proto_fs::OPEN_RETIRED);
+        }
+        let JobOperation::Data(data) = &mut job.operation else {
+            unreachable!()
+        };
+        match method {
+            Method::DataFeed => {
+                let Ok(offset) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Ok(bytes) = body.bytes(body.left()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match data.feed(offset as usize, bytes) {
+                    Ok(()) => Answer::Status(Status::Ok),
+                    Err(code) => status(code),
+                }
+            }
+            Method::DataStep => match data.step(&mut self.ram) {
+                Ok(true) => Answer::Status(Status::Ok),
+                Ok(false) => status(proto_fs::RESOLVING),
+                Err(code) => status(code),
+            },
+            Method::DataCommit => {
+                // The fixed envelope is prepaid before Clock or file effects.
+                if r.reply().bytes(&[0; 32]).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                *r.reply() = proto_wire::Writer::new();
+                let now = if data.needs_time() {
+                    match self.time_source.read_once() {
+                        Ok(now) => now,
+                        Err(error) => return Answer::Status(error),
+                    }
+                } else {
+                    None
+                };
+                if let Err(code) = data.commit(&mut self.ram, now) {
+                    return status(code);
+                }
+                data.outcome(id)
+                    .write(r.reply())
+                    .expect("prepaid fixed data response");
+                Answer::Reply(Outgoing::new())
+            }
+            Method::DataQuery => match data.outcome(id).write(r.reply()) {
+                Ok(()) => Answer::Reply(Outgoing::new()),
+                Err(error) => Answer::Status(error),
+            },
+            Method::DataReadResult => {
+                let bytes = match data.read_result() {
+                    Ok(bytes) => bytes,
+                    Err(code) => return status(code),
+                };
+                match r
+                    .reply()
+                    .u32(0)
+                    .and_then(|()| r.reply().u32(bytes.len() as u32))
+                    .and_then(|()| r.reply().bytes(bytes))
+                {
+                    Ok(()) => Answer::Reply(Outgoing::new()),
+                    Err(error) => Answer::Status(error),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
     fn job_slot(&self, id: u64, owner: u64) -> Result<usize, u32> {
         let i = (id & 255) as usize;
         if !self
@@ -2473,7 +2910,44 @@ impl Fs {
         }
         Ok(i)
     }
-    fn cancel_job(&mut self, id: u64, owner: u64, mut fds: Option<&mut Fds>) {
+    fn path_slot(&self, id: u64, owner: u64) -> Result<usize, u32> {
+        let slot = self.job_slot(id, owner)?;
+        if !matches!(
+            self.jobs[slot].as_ref().expect("exact job").operation,
+            JobOperation::Path(_)
+        ) {
+            return Err(proto_fs::PERMISSION);
+        }
+        Ok(slot)
+    }
+    fn abandon_job(&mut self, id: u64, owner: u64, fds: &mut Fds) {
+        let Ok(slot) = self.job_slot(id, owner) else {
+            return;
+        };
+        let job = self.jobs[slot].as_mut().expect("exact disappearing job");
+        if let JobOperation::Data(data) = &mut job.operation {
+            if !job.abandoned {
+                data.abandon();
+                job.abandoned = true;
+                self.orphan_count = self.orphan_count.checked_add(1).expect("bounded paid jobs");
+                assert!(self.orphan_count as usize <= ramfs::storage::PREPARATIONS);
+            }
+            let _ = sys::notify(&self.channel, 1);
+        } else {
+            self.cancel_job(id, owner, Some(fds));
+        }
+    }
+    fn cancel_job(&mut self, id: u64, owner: u64, fds: Option<&mut Fds>) {
+        self.cancel_job_mode(id, owner, fds, true);
+    }
+    /// Completed Data Cancel retains the paid result until exact ACK or abandonment.
+    fn cancel_job_mode(
+        &mut self,
+        id: u64,
+        owner: u64,
+        mut fds: Option<&mut Fds>,
+        retire: bool,
+    ) -> bool {
         if let Some(fds) = fds.as_deref_mut()
             && fds.image_outcome.is_some_and(|outcome| outcome.job == id)
         {
@@ -2490,22 +2964,42 @@ impl Fs {
                 });
             }
         }
-        if let Ok(i) = self.job_slot(id, owner)
-            && let Some(mut j) = self.jobs[i].take()
-        {
-            if let Some(open) = j.open.as_mut() {
-                let fds = fds
-                    .as_deref_mut()
-                    .expect("open job retains its owning session");
-                open.cancel(&mut self.ram, fds, &mut j.root)
-                    .expect("exact open job cleanup");
+        if let Ok(i) = self.job_slot(id, owner) {
+            if let Some(ResolveJob {
+                operation: JobOperation::Data(data),
+                ..
+            }) = self.jobs[i].as_mut()
+                && !data
+                    .cancel_step(&mut self.ram)
+                    .expect("exact data job cleanup")
+            {
+                return false;
             }
-            j.resolver.release(&mut self.ram.storage);
-            if let Some(second) = j.second {
-                second.release(&mut self.ram.storage);
+            if !retire {
+                return true;
+            }
+            let mut j = self.jobs[i].take().expect("owned canceled job");
+            if let JobOperation::Path(mut path) = j.operation {
+                if let Some(open) = path.open.as_mut() {
+                    let fds = fds
+                        .as_deref_mut()
+                        .expect("open job retains its owning session");
+                    open.cancel(&mut self.ram, fds, &mut j.root)
+                        .expect("exact open job cleanup");
+                }
+                path.resolver.release(&mut self.ram.storage);
+                if let Some(second) = path.second {
+                    second.release(&mut self.ram.storage);
+                }
             }
             if j.root != NONE {
                 self.ram.storage.release_preparation(j.root);
+            }
+            if j.abandoned {
+                self.orphan_count = self
+                    .orphan_count
+                    .checked_sub(1)
+                    .expect("owned abandoned count");
             }
         }
         if let Some(fds) = fds
@@ -2513,6 +3007,7 @@ impl Fs {
         {
             *place = 0;
         }
+        true
     }
     fn resolve_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if proto_fs::is_loaders(r.label()) {
@@ -2557,6 +3052,9 @@ impl Fs {
                 };
             };
             let j = self.jobs[i].as_ref().expect("exact client key");
+            if !matches!(j.operation, JobOperation::Path(_)) {
+                return status(proto_fs::PERMISSION);
+            }
             let id = j.id;
             if r.method() == Method::OpenCancel as u16 {
                 self.cancel_job(id, r.label(), Some(fds));
@@ -2568,29 +3066,79 @@ impl Fs {
             let j = self.jobs[i].as_ref().expect("retained query job");
             if !fds.resolvers.contains(&id)
                 || j.real
-                || j.second.is_some()
+                || j.path().second.is_some()
                 || j.authority.map(|stamp| stamp.image)
                     != fds.binding.stamp().map(|stamp| stamp.image)
             {
                 return status(proto_fs::OPEN_RETIRED);
             }
             if r.method() == Method::OpenFinish as u16 {
-                let OpenPhase::Committed { held, .. } = j.open.as_ref().expect("keyed Open").phase
-                else {
-                    return status(proto_fs::RESOLVING);
+                let j = self.jobs[i].as_mut().expect("retained finalization job");
+                let JobOperation::Path(path) = &mut j.operation else {
+                    unreachable!()
                 };
-                if let Err(code) = self.ram.validate_tentative(fds, held) {
-                    return status(code);
+                let open = path.open.as_mut().expect("keyed Open");
+                let first = matches!(open.phase, OpenPhase::Prepared { .. });
+                let held = match open.phase {
+                    OpenPhase::Prepared { held, .. } | OpenPhase::Committed { held, .. } => held,
+                    _ => return status(proto_fs::RESOLVING),
+                };
+                if first && j.authority != fds.binding.stamp() {
+                    return status(proto_fs::STALE_PROOF);
                 }
-                // Preflight the fixed response before transferring the descriptor reference.
-                if matches!(self.finished_reply(fds, r, held, false), Answer::Status(_)) {
+                let publication = match self.ram.preflight_finish_open(fds, key, held) {
+                    Ok(proof) => proof,
+                    Err(code) => return status(code),
+                };
+                let marked_fd = match self.ram.marked_open(fds, held) {
+                    Ok(fd) => fd,
+                    Err(code) => return status(code),
+                };
+                // Reply and receipt are paid before Clock or file effects.
+                if r.reply()
+                    .u32(0)
+                    .and_then(|()| r.reply().u32(marked_fd))
+                    .and_then(|()| r.reply().u64(held.description.generation))
+                    .is_err()
+                {
                     return Answer::Status(Status::BadSize);
                 }
-                if let Err(code) = self.ram.finish_open(fds, key, held) {
-                    return status(code);
+                if first {
+                    let identity = match fds.binding.identity(false) {
+                        Ok(identity) => identity,
+                        Err(code) => return status(code),
+                    };
+                    let proof = match path.resolver.result_proof(
+                        &self.ram.storage,
+                        identity,
+                        Intent::Open { flags: open.flags },
+                    ) {
+                        Ok(proof) => proof,
+                        Err(code) => return status(code),
+                    };
+                    let now = match open.needs_time(&self.ram, fds) {
+                        Ok(false) => proto_fs::Timestamp::ZERO,
+                        Ok(true) => match self.time_source.read_once() {
+                            Ok(Some(now)) => now,
+                            Ok(None) => return status(proto_fs::TIME_DEFERRED),
+                            Err(error) => return Answer::Status(error),
+                        },
+                        Err(code) => return status(code),
+                    };
+                    if let Err(code) =
+                        open.commit(&mut self.ram, fds, Some(proof), identity, &mut j.root, now)
+                    {
+                        return status(code);
+                    }
                 }
+                // Commit does not alter the prepaid descriptor/receipt mappings.
+                let published = self.ram.finish_preflighted(fds, publication);
+                debug_assert_eq!(published, held);
                 let completed = self.jobs[i].take().expect("finished paid Open");
-                completed.resolver.release(&mut self.ram.storage);
+                let JobOperation::Path(path) = completed.operation else {
+                    unreachable!()
+                };
+                path.resolver.release(&mut self.ram.storage);
                 if completed.root != NONE {
                     self.ram.storage.release_preparation(completed.root);
                 }
@@ -2600,7 +3148,7 @@ impl Fs {
                     .expect("owned finished slot") = 0;
                 return Answer::Reply(Outgoing::new());
             }
-            let phase = match j.open.as_ref().expect("keyed Open").phase {
+            let phase = match j.path().open.as_ref().expect("keyed Open").phase {
                 OpenPhase::Resolving => 0,
                 OpenPhase::Reserved(_) => 1,
                 OpenPhase::Prepared { .. } => 2,
@@ -2622,6 +3170,17 @@ impl Fs {
             let (Ok(id), Ok(())) = (body.u64(), body.finish()) else {
                 return Answer::Status(Status::BadSize);
             };
+            if let Ok(slot) = self.job_slot(id, r.label())
+                && matches!(
+                    self.jobs[slot]
+                        .as_ref()
+                        .expect("exact canceled job")
+                        .operation,
+                    JobOperation::Data(_)
+                )
+            {
+                return status(proto_fs::PERMISSION);
+            }
             self.cancel_job(id, r.label(), Some(fds));
             return Answer::Status(Status::Ok);
         }
@@ -2689,13 +3248,16 @@ impl Fs {
                     .flatten()
                     .find(|j| j.owner == r.label() && j.open_key == Some(key))
                 {
-                    let old = j.open.as_ref().expect("keyed Open");
+                    if !matches!(j.operation, JobOperation::Path(_)) {
+                        return status(proto_fs::PERMISSION);
+                    }
+                    let old = j.path().open.as_ref().expect("keyed Open");
                     let current = open.as_ref().expect("parsed Open");
                     if j.raw_base != raw_base
                         || old.flags != current.flags
                         || old.mode != current.mode
                         || old.umask != current.umask
-                        || j.resolver.original_path() != path
+                        || j.path().resolver.original_path() != path
                     {
                         return status(proto_fs::PERMISSION);
                     }
@@ -2771,11 +3333,14 @@ impl Fs {
                 root: charge,
                 real: real != 0,
                 authority: fds.binding.stamp(),
-                resolver,
-                second: None,
-                open,
+                operation: JobOperation::Path(PathJob {
+                    resolver,
+                    second: None,
+                    open,
+                }),
                 open_key,
                 raw_base,
+                abandoned: false,
             });
             fds.resolvers[place] = id;
             if let Some(key) = open_key {
@@ -2803,12 +3368,12 @@ impl Fs {
                 Ok(p) => p,
                 Err(_) => return Answer::Status(Status::BadSize),
             };
-            let i = match self.job_slot(id, r.label()) {
+            let i = match self.path_slot(id, r.label()) {
                 Ok(i) => i,
                 Err(code) => return status(code),
             };
             let j = self.jobs[i].as_mut().expect("owned job");
-            if j.second.is_some() || j.real || j.open.is_some() {
+            if j.path().second.is_some() || j.real || j.path().open.is_some() {
                 return status(proto_fs::PERMISSION);
             }
             let base = Token {
@@ -2821,7 +3386,7 @@ impl Fs {
             let identity = fds.binding.identity(false).expect("authenticated");
             match Resolve::new(&mut self.ram.storage, path, base, identity, follow != 0) {
                 Ok(second) => {
-                    j.second = Some(second);
+                    j.path_mut().second = Some(second);
                     return Answer::Status(Status::Ok);
                 }
                 Err(code) => return status(code),
@@ -2830,14 +3395,17 @@ impl Fs {
         let (Ok(id), Ok(())) = (body.u64(), body.finish()) else {
             return Answer::Status(Status::BadSize);
         };
-        let i = match self.job_slot(id, r.label()) {
+        let i = match self.path_slot(id, r.label()) {
             Ok(i) => i,
             Err(code) => return status(code),
         };
         let j = self.jobs[i].as_ref().expect("resolve job");
         let identity = fds.binding.identity(j.real).expect("authenticated");
         let j = self.jobs[i].as_mut().expect("resolve job");
-        if let Some(open) = j.open.as_mut() {
+        let JobOperation::Path(path) = &mut j.operation else {
+            return status(proto_fs::PERMISSION);
+        };
+        if let Some(open) = path.open.as_mut() {
             if matches!(
                 open.phase,
                 OpenPhase::Committed { .. } | OpenPhase::Canceled { .. }
@@ -2856,14 +3424,14 @@ impl Fs {
         }
         if j.authority != fds.binding.stamp() {
             j.authority = fds.binding.stamp();
-            j.resolver.invalidate();
-            if let Some(second) = j.second.as_mut() {
+            path.resolver.invalidate();
+            if let Some(second) = path.second.as_mut() {
                 second.invalidate();
             }
         }
-        let mut result = j.resolver.step(&mut self.ram.storage, identity);
+        let mut result = path.resolver.step(&mut self.ram.storage, identity);
         if matches!(result, Ok(Progress::Found(_) | Progress::Missing(_)))
-            && let Some(second) = j.second.as_mut()
+            && let Some(second) = path.second.as_mut()
         {
             result = second.step(&mut self.ram.storage, identity);
         }
@@ -2912,17 +3480,17 @@ impl Fs {
         let (Ok(id), Ok(())) = (body.u64(), body.finish()) else {
             return Answer::Status(Status::BadSize);
         };
-        let i = match self.job_slot(id, r.label()) {
+        let i = match self.path_slot(id, r.label()) {
             Ok(i) => i,
             Err(code) => return status(code),
         };
         let j = self.jobs[i].as_mut().expect("owned open job");
-        if !fds.resolvers.contains(&id) || j.real || j.second.is_some() {
+        if !fds.resolvers.contains(&id) || j.real || j.path().second.is_some() {
             return status(proto_fs::PERMISSION);
         }
         if j.authority != fds.binding.stamp() {
             return status(
-                if j.open.as_ref().is_some_and(|open| {
+                if j.path().open.as_ref().is_some_and(|open| {
                     matches!(
                         open.phase,
                         OpenPhase::Committed { .. } | OpenPhase::Canceled { .. }
@@ -2938,14 +3506,17 @@ impl Fs {
             Ok(identity) => identity,
             Err(code) => return status(code),
         };
-        let Some(open) = j.open.as_mut() else {
+        let JobOperation::Path(path) = &mut j.operation else {
+            return status(proto_fs::PERMISSION);
+        };
+        let Some(open) = path.open.as_mut() else {
             return status(proto_fs::PERMISSION);
         };
         let cached = matches!(open.phase, OpenPhase::Committed { .. });
         let proof = if cached {
             None
         } else {
-            match j.resolver.result_proof(
+            match path.resolver.result_proof(
                 &self.ram.storage,
                 identity,
                 Intent::Open { flags: open.flags },
@@ -2991,7 +3562,14 @@ impl Fs {
             return Answer::Status(Status::BadSize);
         }
         let now = rt::time::ticks_to_ns(rt::time::now());
-        match open.commit(&mut self.ram, fds, proof, identity, &mut j.root, now) {
+        match open.commit(
+            &mut self.ram,
+            fds,
+            proof,
+            identity,
+            &mut j.root,
+            proto_fs::Timestamp::legacy_ns(now),
+        ) {
             Ok(committed) => {
                 debug_assert_eq!(committed, held);
                 Answer::Reply(Outgoing::new())
@@ -3005,9 +3583,9 @@ impl Fs {
         owner: u64,
         fds: Option<&Fds>,
     ) -> Result<(Token, Option<proto_process::WhoReply>), u32> {
-        let i = self.job_slot(id, owner)?;
+        let i = self.path_slot(id, owner)?;
         let j = self.jobs[i].as_ref().expect("job");
-        if j.real || j.second.is_some() || j.open.is_some() {
+        if j.real || j.path().second.is_some() || j.path().open.is_some() {
             return Err(proto_fs::PERMISSION);
         }
         let fds = fds.ok_or(proto_fs::PERMISSION)?;
@@ -3018,6 +3596,6 @@ impl Fs {
             return Err(proto_fs::STALE_PROOF);
         }
         let identity = fds.binding.identity(j.real)?;
-        Ok((j.resolver.proof(&self.ram.storage, identity)?, None))
+        Ok((j.path().resolver.proof(&self.ram.storage, identity)?, None))
     }
 }

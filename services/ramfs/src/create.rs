@@ -153,7 +153,7 @@ impl CreateJournal {
         charge: &mut u16,
         proof: Option<NamespaceProof<'_>>,
         identity: Identity,
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<NamespaceOutcome, u32> {
         if let Some(outcome) = self.outcome {
             return Ok(outcome);
@@ -228,7 +228,7 @@ impl ReadLinkJournal {
         storage: &mut Storage<'_>,
         proof: Option<NamespaceProof<'_>>,
         identity: Identity,
-        now: u64,
+        now: proto_fs::Timestamp,
     ) -> Result<usize, u32> {
         if let Some(count) = self.count {
             return Ok(count as usize);

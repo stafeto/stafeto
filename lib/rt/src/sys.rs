@@ -508,6 +508,58 @@ pub fn thread_info(thread: &Handle<Thread>) -> Result<ThreadInfo, Error> {
     Ok(ThreadInfo::from_words([x[1], x[2], x[3], x[4]]))
 }
 
+/// One owned Rights::NONE capability of this actual calling thread.
+/// Its handle-table entry is paid by this process and must be closed.
+pub fn self_thread() -> Result<Handle<Thread>, Error> {
+    let x = call::<{ Call::ObjectInfo.number() }>(&[0, abi::INFO_THREAD_SELF, 0])?;
+    if x[1] == 0 {
+        return Err(Error::InvalidArgs);
+    }
+    Ok(returned(&x))
+}
+
+/// One owned MANAGE capability of this actual calling thread.
+/// The capability permits current-thread control and has no DUPLICATE or TRANSFER.
+pub fn self_thread_managed() -> Result<Handle<Thread>, Error> {
+    let x = call::<{ Call::ObjectInfo.number() }>(&[
+        0,
+        abi::INFO_THREAD_SELF,
+        u64::from(Rights::MANAGE.0),
+    ])?;
+    if x[1] == 0 {
+        return Err(Error::InvalidArgs);
+    }
+    Ok(returned(&x))
+}
+
+/// Request a resident observer, with native-entry fallback.
+pub fn thread_layer_request(thread: &Handle<Thread>) -> Result<(), Error> {
+    call::<{ Call::ThreadUpcallControl.number() }>(&[
+        abi::UpcallControl::LayerRequest.raw(),
+        thread.raw().0,
+    ])?;
+    Ok(())
+}
+
+/// Request an explicitly published resident Layer of this MANAGE Process.
+pub fn process_layer_request(process: &Handle<Process>) -> Result<(), Error> {
+    call::<{ Call::ThreadUpcallControl.number() }>(&[
+        abi::UpcallControl::ProcessLayerRequest.raw(),
+        process.raw().0,
+    ])?;
+    Ok(())
+}
+
+/// Kernel object comparison with this caller; raw handle equality is insufficient.
+pub fn is_current_thread(thread: &Handle<Thread>) -> Result<bool, Error> {
+    let x = call::<{ Call::ObjectInfo.number() }>(&[thread.raw().0, abi::INFO_THREAD_CURRENT, 0])?;
+    match x[1] {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
 /// object_info(CHANNEL) through a channel handle, a labelled copy too: the
 /// slots and requests in its queue, the receivers that wait there, its
 /// sources and whether it is closed.

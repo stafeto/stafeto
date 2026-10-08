@@ -10,6 +10,9 @@
 #[used]
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
+#[cfg(feature = "pending-open")]
+mod pending_open;
+
 #[cfg(feature = "loader-abort")]
 mod audit;
 #[cfg(feature = "image-gates")]
@@ -65,6 +68,8 @@ extern "C" fn files_fake_identity() -> i32 {
 
 #[cfg(feature = "auth-probe")]
 mod cleanup;
+#[cfg(feature = "files")]
+mod data_stages;
 #[cfg(feature = "files")]
 mod open_stages;
 #[cfg(feature = "ipc-loss")]

@@ -21,6 +21,18 @@
 //! the flags of SIGCHLD (`publish`). Real-time queues and
 //! alternate stacks still require
 //! implementation.
+#[path = "stop_barrier.rs"]
+mod stop_barrier;
+
+#[cfg(feature = "thread-probe")]
+#[path = "native_stop_probe.rs"]
+mod native_stop_probe;
+#[cfg(feature = "thread-probe")]
+pub use native_stop_probe::{
+    NativeStopSnapshot, probe_native_exit_queue, probe_native_stop_arm, probe_native_stop_outer,
+    probe_native_stop_snapshot,
+};
+
 use crate::{constants::*, threads};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
@@ -388,11 +400,34 @@ fn local_claim_window(signal: i32) {
     }
 }
 
+#[cfg(feature = "thread-probe")]
+static SETTLED_CLAIM_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+/// A one-shot guest hook after claim owners settle, before critical leave.
+#[cfg(feature = "thread-probe")]
+pub fn probe_settled_claim_window(hook: Option<extern "C" fn(i32)>) {
+    SETTLED_CLAIM_WINDOW.store(hook.map_or(0, |f| f as usize), Ordering::Release);
+}
+
 fn claim_thread_info(block: &Block, signal: i32) -> Option<(u64, Option<SigInfo>)> {
     // Defer nested entries through the snapshot and claim using the existing
     // in-memory depth; local delivery needs no kernel call or level change.
     posix_sync::enter();
     let _critical = ClaimCritical;
+    let claimed = claim_thread_snapshot(block, signal);
+    #[cfg(feature = "thread-probe")]
+    if claimed.is_some() {
+        let hook = SETTLED_CLAIM_WINDOW.swap(0, Ordering::AcqRel);
+        if hook != 0 {
+            // SAFETY: the one-shot registration stores this C signature.
+            let callback = unsafe { core::mem::transmute::<usize, extern "C" fn(i32)>(hook) };
+            callback(signal);
+        }
+    }
+    claimed
+}
+
+fn claim_thread_snapshot(block: &Block, signal: i32) -> Option<(u64, Option<SigInfo>)> {
     let bit = posix_signals::bit(signal).ok()?;
     let _assignment = loop {
         if let Some(claim) = AssignmentClaim::try_new(block, bit) {
@@ -583,7 +618,7 @@ pub(crate) fn route() {
         });
         if let Some(Some(thread)) = entry {
             let native = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(thread));
-            let _ = sys::thread_upcall_request(&native);
+            let _ = sys::thread_layer_request(&native);
         }
     }
 }
@@ -777,7 +812,7 @@ fn send(
             Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
         let _ = sys::notify(&channel, posix_sync::bit::WAKE);
     } else if flags & flag::SIGNALS_READY != 0 && bit & !block.mask.load(Ordering::SeqCst) != 0 {
-        let _ = sys::thread_upcall_request(native);
+        let _ = sys::thread_layer_request(native);
     }
 }
 
@@ -799,36 +834,40 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
         let action = action(signal);
         (action, ignored(signal, &action))
     });
-    let (block, native) = match crate::relibc::target(id) {
-        Ok(target) => target,
-        Err(code) => return code,
-    };
-    let ticket = if signal == SIGSTOP || proto_process::job::class(signal as u8).is_some() {
-        match crate::process::signal_generation(signal) {
-            Ok(ticket) => ticket,
-            Err(code) => return code,
+    let deliver = crate::relibc::with_target(id, |block, native| {
+        let ticket = if signal == SIGSTOP || proto_process::job::class(signal as u8).is_some() {
+            match crate::process::signal_generation(signal) {
+                Ok(ticket) => ticket,
+                Err(code) => return Err(code),
+            }
+        } else {
+            0
+        };
+        if signal == SIGSTOP {
+            return Ok(false);
         }
-    } else {
-        0
-    };
-    if signal == SIGSTOP {
-        return 0;
-    }
-    // A signal ignored by default that the target thread blocks stays
-    // pending on it, for sigwait or a later change of its action
-    // ([P24-XSH2] 2.4.1); SIG_IGN discards it at once.
-    let action = action.map(|(act, ignored)| {
-        let blocked = block.mask.load(Ordering::SeqCst) & bit != 0;
-        (act, ignored && (act.handler == IGNORE || !blocked))
+        // A signal ignored by default that the target thread blocks stays
+        // pending on it, for sigwait or a later change of its action
+        // ([P24-XSH2] 2.4.1); SIG_IGN discards it at once.
+        let action = action.map(|(act, ignored)| {
+            let blocked = block.mask.load(Ordering::SeqCst) & bit != 0;
+            (act, ignored && (act.handler == IGNORE || !blocked))
+        });
+        if core::ptr::eq(block, own()) {
+            if let Some((_, false)) = action {
+                assign(own(), signal, ticket, false);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        send(block, native, bit, action, ticket);
+        Ok(false)
     });
-    if core::ptr::eq(block, own()) {
-        if let Some((_, false)) = action {
-            assign(own(), signal, ticket, false);
-            deliver_now();
-        }
-        return 0;
+    match deliver {
+        Err(code) | Ok(Err(code)) => return code,
+        Ok(Ok(true)) => deliver_now(),
+        Ok(Ok(false)) => {}
     }
-    send(block, &native, bit, action, ticket);
     0
 }
 
@@ -1013,6 +1052,7 @@ pub fn sigtimedwait(
 }
 
 rt::upcall_entry!(entry, dispatch, context);
+rt::observer_upcall_entry!(observer_entry, dispatch, context);
 
 /// Where the calling thread's C errno lives: relibc's `__errno_location`. The entry saves and gives back
 /// the value there; it never moves the thread pointer (spec 2, 3.5).
@@ -1088,8 +1128,15 @@ pub(crate) fn stop_others() -> Result<(), i32> {
                 return;
             }
             let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(native));
-            let state = sys::thread_info(&thread).map_or(ThreadState::Ended, |i| i.state);
-            if matches!(state, ThreadState::Ended | ThreadState::Stopped) {
+            let state = match sys::thread_info(&thread).map(|info| info.state) {
+                Ok(ThreadState::Ended | ThreadState::Stopped) => stop_barrier::State::Terminal,
+                Ok(ThreadState::Receiving | ThreadState::Sending | ThreadState::AwaitingReply) => {
+                    stop_barrier::State::KernelWait
+                }
+                Ok(_) => stop_barrier::State::Running,
+                Err(_) => stop_barrier::State::Unknown,
+            };
+            if stop_barrier::confirmed_terminal(state) {
                 return;
             }
             let flags = block.flags.load(Ordering::SeqCst);
@@ -1099,12 +1146,8 @@ pub(crate) fn stop_others() -> Result<(), i32> {
             }
             if asked & 1 << index == 0 {
                 asked |= 1 << index;
-                let _ = sys::thread_upcall_request(&thread);
+                let _ = sys::thread_layer_request(&thread);
             }
-            let in_kernel = matches!(
-                state,
-                ThreadState::Receiving | ThreadState::Sending | ThreadState::AwaitingReply
-            );
             let page = crate::process::page();
             let holds_process = block.process.load(Ordering::SeqCst)
                 | (proto_process::job::live(
@@ -1117,11 +1160,16 @@ pub(crate) fn stop_others() -> Result<(), i32> {
                     &page.cont_word,
                     proto_process::job::class(proto_process::SIGCONT).unwrap(),
                 ) & 1);
-            if !(in_kernel
-                && flags >> flag::DEPTH_SHIFT == 0
-                && holds_process == 0
-                && RETURNING.load(Ordering::SeqCst) & (1 << index) == 0)
-            {
+            let quiet = stop_barrier::quiescent(
+                crate::relibc::native::is_resident(block),
+                state,
+                flags >> flag::DEPTH_SHIFT,
+                holds_process,
+                RETURNING.load(Ordering::SeqCst) & (1 << index) != 0,
+            );
+            #[cfg(feature = "thread-probe")]
+            native_stop_probe::scan(block, native, state, quiet);
+            if !quiet {
                 waiting = true;
             }
         });
@@ -1164,7 +1212,11 @@ pub(crate) unsafe fn after_fork() -> Result<(), i32> {
     for word in &CLAIMING {
         word.store(0, Ordering::Relaxed);
     }
-    attach()
+    if crate::relibc::native::is_resident(own()) {
+        attach_native(posix_thread::thread_pointer() as *mut u8)
+    } else {
+        attach()
+    }
 }
 
 /// The other threads go on: the exec failed before its commit, or the
@@ -1211,6 +1263,8 @@ fn park() {
     let channel = Handle::<Channel>::borrowed(rt::abi::Handle(raw));
     loop {
         place.store(raw, Ordering::SeqCst);
+        #[cfg(feature = "thread-probe")]
+        native_stop_probe::park(block, raw);
         if STOPPING.load(Ordering::SeqCst) == 0 {
             break;
         }
@@ -1231,7 +1285,20 @@ fn park() {
 /// process for an exec.
 fn stopped_by_other() -> bool {
     let stopping = STOPPING.load(Ordering::Acquire);
-    stopping != 0 && stopping != own() as *const Block as usize
+    stop_barrier::must_park(stopping, own() as *const Block as usize)
+}
+
+/// Called with installed resident TLS, outside TABLE, under common Defer.
+/// Publication precedes this check; scope renewal and user code follow it.
+pub(crate) fn native_scope_barrier(block: &Block) -> Result<(), i32> {
+    stop_barrier::before_renew(
+        || {
+            if stopped_by_other() {
+                park();
+            }
+        },
+        || crate::relibc::native::begin_scope(block),
+    )
 }
 
 /// Binds and enables the calling thread's entry, then delivers what came
@@ -1240,6 +1307,7 @@ pub(crate) fn attach() -> Result<(), i32> {
     // SAFETY: the dispatcher holds no interrupted Rust references or locks
     // and enters only caller-supplied C code.
     unsafe { upcall::bind(entry) }.map_err(|_| EIO)?;
+    unsafe { upcall::primary_layer_ready(true) }.map_err(|_| EIO)?;
     own().flags.fetch_or(flag::SIGNALS_READY, Ordering::SeqCst);
     unsafe { upcall::enable() }.map_err(|_| EIO)?;
     // A thread whose start ends while another stops the process parks
@@ -1252,6 +1320,43 @@ pub(crate) fn attach() -> Result<(), i32> {
         deliver_now();
     }
     Ok(())
+}
+
+/// Register the resident observer while common Defer keeps it from entering.
+pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
+    // SAFETY: admission owns this page through End and uses the fixed dispatcher.
+    unsafe { upcall::bind_observer(observer_entry, page as usize) }.map_err(|_| EIO)?;
+    // A failed publication removes the handler before bootstrap cleanup.
+    let result = unsafe { upcall::observer_layer_ready(true) }
+        .and_then(|()| unsafe { upcall::enable_observer() }.map(|_| ()));
+    if result.is_err() {
+        upcall::unbind_observer().expect("bootstrap observer rollback");
+        return Err(EIO);
+    }
+    // SAFETY: the page's ABI word points to its complete freshly built TCB.
+    let tcb = unsafe { *page.cast::<*mut posix_thread::Tcb>() };
+    unsafe {
+        (*tcb)
+            .block
+            .flags
+            .fetch_or(flag::SIGNALS_READY, Ordering::SeqCst)
+    };
+    Ok(())
+}
+
+fn entry_enable() -> Result<bool, rt::abi::Error> {
+    if crate::relibc::native::is_resident(own()) {
+        unsafe { upcall::enable_observer() }
+    } else {
+        unsafe { upcall::enable() }
+    }
+}
+fn entry_mask() -> Result<bool, rt::abi::Error> {
+    if crate::relibc::native::is_resident(own()) {
+        upcall::mask_observer()
+    } else {
+        upcall::mask()
+    }
 }
 
 /// Delivers the calling thread's pending unblocked signals now, with no call
@@ -1272,6 +1377,8 @@ pub(crate) fn deliver_deferred() {
 }
 
 unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
+    #[cfg(feature = "thread-probe")]
+    native_stop_probe::entry(own());
     // Inside a critical section of the layer the entry only marks itself
     // deferred; the end of the section delivers it.
     if posix_sync::defer_entry() {
@@ -1332,18 +1439,43 @@ fn take(block: &Block) -> Option<(i32, SigAction, Option<SigInfo>, u64)> {
     }
 }
 
-/// Runs the handlers of the calling thread's deliverable signals. Through
-/// the entry (`entered`) the kernel masked further entries: they are let
-/// in for the handler and masked again after it; a direct delivery makes
-/// no call. `native` is the entry's frame, or null for a direct delivery,
-/// which leaves a handler with SA_SIGINFO to the thread's entry.
+// Local ownership settles before the kernel deferral field is dropped.
+struct SignalPreparation {
+    // Fields drop in order: settle local preparation before kernel Resume.
+    local: posix_sync::DeliveryPreparation<'static>,
+    _kernel: upcall::DeferredEntry,
+}
+
+impl SignalPreparation {
+    fn begin() -> Self {
+        let deferred = upcall::defer_entries().expect("signal preparation deferral");
+        let block = own();
+        Self {
+            local: posix_sync::DeliveryPreparation::begin(block),
+            _kernel: deferred,
+        }
+    }
+
+    fn settle_for_exit(self) -> upcall::DeferredEntry {
+        let Self { local, _kernel } = self;
+        drop(local);
+        _kernel
+    }
+}
+
+/// Runs deliverable handlers with preparation protected by common deferral.
+/// An entered delivery enables nested entries for each user callback and
+/// masks them on return. A null native frame requests a context-aware entry
+/// for SA_SIGINFO handlers.
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
+    let mut preparation = Some(SignalPreparation::begin());
+    let block = own();
     if stopped_by_other() {
+        // Keep both forms of deferral through the parking effect.
         park();
     }
     // The process's signals first: one of them may be this thread's.
     route();
-    let block = own();
     // A wait by address of this thread ends before the first handler, and
     // before the lock of the actions, whose wait uses the same block
     // (posix_sync::abandon); it goes on as woken after the last one.
@@ -1361,6 +1493,9 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     let signal_wait =
         block.flags.fetch_and(!flag::SIGNAL_WAIT, Ordering::SeqCst) & flag::SIGNAL_WAIT;
     loop {
+        if preparation.as_ref().unwrap().local.take_deferred() {
+            route();
+        }
         let old_mask = block.mask.load(Ordering::SeqCst);
         if native.is_null() && next_wants_context(block) {
             // A handler with SA_SIGINFO gets the interrupted context: the
@@ -1368,23 +1503,34 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
                 block.thread.load(Ordering::Relaxed),
             ));
-            let _ = sys::thread_upcall_request(&thread);
+            let _ = sys::thread_layer_request(&thread);
             break;
         }
         let Some((signal, action, from_process, ticket)) = take(block) else {
+            if preparation.as_ref().unwrap().local.take_deferred() {
+                route();
+                continue;
+            }
             break;
         };
         let handler = action.handler;
         if handler == DEFAULT {
             match posix_signals::default_action(signal) {
                 posix_signals::DefaultAction::Stop => {
+                    // Stop commits before any deferred entry can run again.
                     let _ = crate::process::stop_self(signal, ticket);
+                    route();
                     continue;
                 }
                 posix_signals::DefaultAction::Continue | posix_signals::DefaultAction::Ignore => {
                     continue;
                 }
-                posix_signals::DefaultAction::Terminate => sys_exit_signal(signal),
+                posix_signals::DefaultAction::Terminate => {
+                    // Local ownership settles; kernel deferral remains owned
+                    // until the nonreturning ProcessExit destroys this thread.
+                    let _deferred = preparation.take().unwrap().settle_for_exit();
+                    sys_exit_signal(signal)
+                }
             }
         }
         if action.flags & SA_RESTART == 0 {
@@ -1412,14 +1558,16 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             // SAFETY: SA_SIGINFO registers this live three-argument C address.
             let callback: unsafe extern "C" fn(i32, *mut LinuxSigInfo, *mut core::ffi::c_void) =
                 unsafe { core::mem::transmute(handler as usize) };
+            drop(preparation.take());
             if entered {
-                unsafe { upcall::enable() }.expect("nested signal entry");
+                entry_enable().expect("nested signal entry");
             }
             unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
-            block.handled.fetch_add(1, Ordering::SeqCst);
             if entered {
-                upcall::mask().expect("signal handler mask restoration");
+                entry_mask().expect("signal handler mask restoration");
             }
+            preparation = Some(SignalPreparation::begin());
+            block.handled.fetch_add(1, Ordering::SeqCst);
             // The callback may edit the return context. Preserve private native
             // metadata and let the kernel validate machine state on return.
             // SAFETY: the frame is the entry's.
@@ -1430,14 +1578,16 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             // SAFETY: signal/sigaction callers supply a live void(int) C address.
             let callback: unsafe extern "C" fn(i32) =
                 unsafe { core::mem::transmute(handler as usize) };
+            drop(preparation.take());
             if entered {
-                unsafe { upcall::enable() }.expect("nested signal entry");
+                entry_enable().expect("nested signal entry");
             }
             unsafe { callback(signal) };
-            block.handled.fetch_add(1, Ordering::SeqCst);
             if entered {
-                upcall::mask().expect("signal handler mask restoration");
+                entry_mask().expect("signal handler mask restoration");
             }
+            preparation = Some(SignalPreparation::begin());
+            block.handled.fetch_add(1, Ordering::SeqCst);
         }
         block.mask.store(restore_mask, Ordering::SeqCst);
     }
@@ -1445,6 +1595,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     block.cancel_point.store(window, Ordering::SeqCst);
     unsafe { *errno = saved_errno };
     posix_sync::resume_wait(abandoned);
+    drop(preparation);
 }
 /// The siginfo_t of relibc's headers (Linux AArch64): 128 bytes, the
 /// signal, errno and code, then the sender's pid and uid and the value.
@@ -1703,4 +1854,10 @@ pub fn probe_route_newborn(id: u64, signal: i32) -> i32 {
     route();
     block.mask.store(mask, Ordering::SeqCst);
     0
+}
+
+/// Queue a genuine primary request after the selected native libc exit intent.
+#[cfg(feature = "thread-probe")]
+pub(crate) fn probe_queue_native_primary_after_intent(block: &Block) {
+    native_stop_probe::queue_after_intent(block);
 }

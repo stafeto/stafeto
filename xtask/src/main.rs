@@ -8,6 +8,12 @@ mod out;
 
 mod coverage;
 #[cfg(test)]
+#[path = "../../tests/posix-threads/src/futex_deadline.rs"]
+mod futex_deadline;
+#[cfg(test)]
+#[path = "../../tests/posix-threads/src/futex_watchdog.rs"]
+mod futex_watchdog;
+#[cfg(test)]
 #[path = "../../lib/posix-abi/src/relibc/lifetime.rs"]
 mod owner_lifetime;
 
@@ -16,6 +22,7 @@ mod entropy;
 mod image;
 mod jobs;
 mod measure;
+mod native_scopes;
 mod ostest;
 mod qemu;
 mod ring;
@@ -545,13 +552,47 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
         &[],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
+    (
+        "posix-procs",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["pending-open"],
+    ),
     // Pieces of 64 KiB: the probe's forks copy regions past one piece.
     ("loader", "loader", 0, &["small-pieces"]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
+const POSIX_NATIVE_SCOPE_PROGRAMS: [ImageProgram; 11] = {
+    let mut programs = [POSIX_PROCS_PROGRAMS[0]; 11];
+    let mut index = 0;
+    while index < POSIX_PROCS_PROGRAMS.len() {
+        programs[index] = POSIX_PROCS_PROGRAMS[index];
+        index += 1;
+    }
+    programs[5].3 = &["pending-open", "native-scopes-launcher"];
+    programs[10] = (
+        "posix-thread-probe",
+        "posix-thread-probe",
+        POSIX_STACK_SIZE,
+        &[],
+    );
+    programs
+};
+
+const POSIX_VZ_NATIVE_SCOPE_PROGRAMS: [ImageProgram; 12] = {
+    let mut programs = [POSIX_NATIVE_SCOPE_PROGRAMS[0]; 12];
+    let mut index = 0;
+    while index < POSIX_NATIVE_SCOPE_PROGRAMS.len() {
+        programs[index] = POSIX_NATIVE_SCOPE_PROGRAMS[index];
+        index += 1;
+    }
+    programs[0].3 = &["table-posix-native-vz"];
+    programs[11] = ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]);
+    programs
+};
+
 /// The probe of the longest step of the process service (xtask
 /// process-steps): the probe in its steps mode, and the process service
 /// that prints each new longest step.
@@ -1091,11 +1132,13 @@ commands:
   image-gates-steps measure retained image dispatches under icount
   image-gates-normal-steps measure normal SetId without reply corruption
   loader-abort verify retained file cleanup after genuine exec cancellation
+  loader-info verify strict retained image metadata and incoming handle cleanup
   ramfs-gc verify binding progress during queued page reclamation
   loader-abort-steps measure retained cleanup audits at resolver limits
   ramfs-cleanup verify unfinished binding cleanup with a foreign holder
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
+  posix-data-steps measure paid data cleanup and full mapping dispatches
   posix-files-loss verify native refused Open replies with a live sibling
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
@@ -1214,9 +1257,11 @@ fn main() {
         Some("image-gates-steps") => image_gates_probe(true, false),
         Some("image-gates-normal-steps") => image_gates_probe(true, true),
         Some("loader-abort") => loader_abort_probe(false),
+        Some("loader-info") => loader_info_probe(),
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-files-loss") => posix_files_loss(),
+        Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -1927,6 +1972,12 @@ fn posix_orphans() -> Result<(), String> {
 }
 
 fn posix_thread_probe(vz: bool) -> Result<(), String> {
+    native_scopes::both_images(vz, stock_thread_probe, native_scope_probe)?;
+    println!("Rust POSIX pthread lifecycle and native survivor guest probes passed");
+    Ok(())
+}
+
+fn stock_thread_probe(vz: bool) -> Result<(), String> {
     let image = if vz {
         build_boot_image(
             "boot-posix-threads-vz.img",
@@ -1964,6 +2015,26 @@ fn posix_thread_probe(vz: bool) -> Result<(), String> {
     }
     println!("Rust POSIX pthread lifecycle guest probe passed");
     Ok(())
+}
+
+fn native_scope_probe(vz: bool) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let (name, programs): (&str, &[ImageProgram]) = if vz {
+        (
+            "boot-posix-native-scopes-vz.img",
+            &POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
+        )
+    } else {
+        ("boot-posix-native-scopes.img", &POSIX_NATIVE_SCOPE_PROGRAMS)
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let (cmd, kernel) = probe_command(&image, vz)?;
+    const ENDED: &str = "init: posix-procs ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    let checked = qemu::expect_stopped_on(&output, ENDED)
+        .and_then(|()| native_scopes::check_markers(&output.lines));
+    if vz { vz::stop_hint(checked) } else { checked }
 }
 
 fn posix_cancel_input_probe(vz: bool) -> Result<(), String> {
@@ -2805,6 +2876,38 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn loader_info_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 6] = {
+        let mut programs = LOADER_ABORT_PROGRAMS;
+        programs[0].3 = &["table-posix-files", "loader-info"];
+        programs[1].3 = &["image-info-probe", "steps"];
+        programs[4].3 = &["image-info-probe"];
+        programs[5].3 = &["image-info-probe"];
+        programs
+    };
+    let image = build_boot_image("boot-loader-info.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut command = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    command.args(qemu::HEADLESS);
+    command.args(qemu::ICOUNT);
+    let ended = "init: posix-files ended: exit code 0, not restarted";
+    let output = run_until(command, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(
+        &output,
+        "posix-files: strict image metadata and incoming handle cleanup ok",
+    )?;
+    let steps = longest_steps(&output.lines, "2");
+    if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "RAM image metadata kind {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    println!("RAM image metadata dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    Ok(())
+}
+
 fn loader_abort_probe(measured: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
@@ -2887,6 +2990,10 @@ fn posix_files_probe() -> Result<(), String> {
 }
 
 fn posix_files_run(measured: bool) -> Result<(), String> {
+    posix_files_run_profile(measured, false)
+}
+
+fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     const MEASURED: [ImageProgram; 5] = {
@@ -2894,12 +3001,23 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
         programs[1].3 = &["steps"];
         programs
     };
-    let programs = if measured {
+    const DATA: [ImageProgram; 5] = {
+        let mut programs = POSIX_FILES_PROGRAMS;
+        programs[0].3 = &["table-posix-files", "data-carrier-probe"];
+        programs[1].3 = &["steps", "auth-probe"];
+        programs[4].3 = &["data-carrier-probe"];
+        programs
+    };
+    let programs = if data {
+        &DATA
+    } else if measured {
         &MEASURED
     } else {
         &POSIX_FILES_PROGRAMS
     };
-    let name = if measured {
+    let name = if data {
+        "boot-posix-data-steps.img"
+    } else if measured {
         "boot-posix-files-steps.img"
     } else {
         "boot-posix-files.img"
@@ -2916,7 +3034,12 @@ fn posix_files_run(measured: bool) -> Result<(), String> {
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
     if measured {
         let steps = longest_steps(&output.lines, "2");
-        for kind in [15, 19, 21, 25, 65] {
+        let required: &[usize] = if data {
+            &[15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 65]
+        } else {
+            &[15, 19, 21, 25, 65]
+        };
+        for &kind in required {
             if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
                 return Err(format!(
                     "RAM credential probe has no method {kind} measurement: {steps:?}"
@@ -3075,7 +3198,7 @@ const RAM_STEP_MAX: u64 = 20_538;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 14] = [
+const RAM_STEP_KINDS: [(usize, &str); 15] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
@@ -3088,6 +3211,7 @@ const RAM_STEP_KINDS: [(usize, &str); 14] = [
     (23, "ResolveCancel"),
     (24, "ResolveSecond"),
     (25, "FinishBinding"),
+    (34, "CloneExact"),
     (64, "notification"),
     (65, "maintenance"),
 ];
@@ -3280,11 +3404,11 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if !loader.iter().any(|(k, ..)| *k == 9) {
         return Err("no loader step of a copy: the forks did not run".into());
     }
-    // The Clone of a fork copies the descriptions of the whole table.
-    let clone = ram.iter().find(|(k, ..)| *k == 15).map_or(0, |r| r.1);
+    // A fork uses CloneExact to copy its retained descriptor list.
+    let clone = ram.iter().find(|(k, ..)| *k == 34).map_or(0, |r| r.1);
     if clone == 0 || clone > RAM_STEP_MAX {
         return Err(format!(
-            "the RAM file service: Clone took {clone} ticks, past {RAM_STEP_MAX}: {ram:?}"
+            "the RAM file service: CloneExact took {clone} ticks, past {RAM_STEP_MAX}: {ram:?}"
         ));
     }
     // Every step of the pipe service (5e) stays under term B: a copy of
@@ -3782,12 +3906,30 @@ fn ash_dialog() -> Result<(), String> {
         run.send("RANDOM=7; a=$RANDOM; RANDOM=7; b=$RANDOM; case $a in $b) echo repeats;; *) echo no-repeat;; esac")?;
         run.expect_line("repeats", |line| line == "repeats", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
-        // mktemp takes its names from the generator (mkstemp of relibc);
-        // no file can be created yet (5i), so every try meets the same
-        // refusal and it gives up with EEXIST, status 1.
+        // mktemp creates an exclusive file with a name from the generator.
         run.send("mktemp /tmp/dialog.XXXXXX; echo mktemp $?")?;
-        run.expect("File exists", DIALOG_STEP)?;
-        run.expect_line("mktemp 1", |line| line == "mktemp 1", DIALOG_STEP)?;
+        let temporary = run.expect_line(
+            "temporary file name",
+            |line| {
+                line.strip_prefix("/tmp/dialog.").is_some_and(|suffix| {
+                    suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+            },
+            DIALOG_STEP,
+        )?;
+        run.expect_line("mktemp 0", |line| line == "mktemp 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send(&format!("/bin/ls {temporary}; echo temporary-file $?"))?;
+        run.expect_line(
+            "created temporary file",
+            |line| line == temporary,
+            DIALOG_STEP,
+        )?;
+        run.expect_line(
+            "temporary-file 0",
+            |line| line == "temporary-file 0",
+            DIALOG_STEP,
+        )?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("exit")?;
         run.expect("exit", DIALOG_STEP)?;
@@ -6092,6 +6234,49 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_images_keep_the_loader_pool_and_both_platforms() {
+        use super::*;
+        assert_eq!(POSIX_NATIVE_SCOPE_PROGRAMS.len(), 11);
+        assert_eq!(POSIX_VZ_NATIVE_SCOPE_PROGRAMS.len(), 12);
+        for (index, expected) in POSIX_PROCS_PROGRAMS.iter().enumerate() {
+            if index != 5 {
+                assert_eq!(POSIX_NATIVE_SCOPE_PROGRAMS[index], *expected);
+            }
+        }
+        assert_eq!(
+            POSIX_NATIVE_SCOPE_PROGRAMS[5].3,
+            &["pending-open", "native-scopes-launcher"]
+        );
+        assert_eq!(
+            POSIX_VZ_NATIVE_SCOPE_PROGRAMS[0].3,
+            &["table-posix-native-vz"]
+        );
+        assert_eq!(
+            &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[1..11],
+            &POSIX_NATIVE_SCOPE_PROGRAMS[1..]
+        );
+        assert_eq!(
+            POSIX_VZ_NATIVE_SCOPE_PROGRAMS[11],
+            ("virtio-console", "virtio-console", UART_STACK_SIZE, &[][..])
+        );
+        for name in [
+            "boot-posix-native-scopes.img",
+            "boot-posix-native-scopes-vz.img",
+        ] {
+            let files = rootfs::files_of(name);
+            let native = files
+                .iter()
+                .find(|file| file.path == "/bin/native-scopes")
+                .unwrap();
+            assert_eq!(native.mode, 0o755);
+            assert_eq!(
+                native.source.as_ref().and_then(rootfs::Source::program),
+                Some("posix-thread-probe")
+            );
+        }
+    }
+
     #[test]
     fn full_watch_case_survives_a_longer_single_item_maximum() {
         let mut lines = Vec::new();

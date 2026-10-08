@@ -15,11 +15,15 @@ bench = false
 
 [features]
 jobs = []
+native-scopes-launcher = []
 auth-probe = ["files"]
+data-carrier-probe = ["files"]
 ipc-loss = ["files"]
-files = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt"]
+files = ["pending-open"]
+pending-open = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt", "dep:posix-fs", "dep:posix-sync"]
 loader-abort = ["files", "dep:proto-process", "dep:proto-loader", "dep:posix-fs"]
 image-gates = ["loader-abort"]
+image-info-probe = ["loader-abort"]
 image-gates-normal = ["image-gates"]
 terminal = ["posix-crt/uart-input"]
 
@@ -33,3 +37,5 @@ rt = { path = "../../lib/rt", optional = true }
 proto-process = { path = "../../proto/process", optional = true }
 proto-loader = { path = "../../proto/loader", optional = true }
 posix-fs = { path = "../../lib/posix-fs", optional = true }
+
+posix-sync = { path = "../../lib/posix-sync", optional = true }

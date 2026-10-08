@@ -172,7 +172,30 @@ fn in_native_thread(process: rt::abi::Handle) -> bool {
     }) else {
         return fail(27);
     };
-    if sys::thread_start(&thread).is_err() || sys::receive(&completion).is_err() {
+    let (started, start_error) = match sys::thread_start(&thread) {
+        Ok(()) => (true, 0u64),
+        Err(error) => (false, error.code()),
+    };
+    let (received, receive_error) = if started {
+        loop {
+            match sys::receive(&completion) {
+                Ok(_) => break (1u32, 0u64),
+                Err(rt::abi::Error::Interrupted) => continue,
+                Err(error) => break (2, error.code()),
+            }
+        }
+    } else {
+        (0, 0)
+    };
+    if !started || received == 2 {
+        let passed = PASSED.load(Ordering::Acquire);
+        rt::println!(
+            "posix-shared-probe: completion start_error={} receive={} receive_error={} done={}",
+            start_error,
+            received,
+            receive_error,
+            passed
+        );
         return fail(28);
     }
     PASSED.load(Ordering::Acquire) == 1
@@ -263,15 +286,7 @@ fn scenario(process: rt::abi::Handle) -> bool {
     {
         return fail(23);
     }
-    let mut expected = [0usize; 256];
-    for byte in b"stafeto ramfs\n" {
-        expected[*byte as usize] += 1;
-    }
-    if HISTOGRAM
-        .iter()
-        .zip(expected)
-        .any(|(count, expected)| count.load(Ordering::Acquire) != expected)
-    {
+    if histogram_mismatch() {
         return fail(26);
     }
     // The working directory the worker changed holds motd.
@@ -288,6 +303,19 @@ fn scenario(process: rt::abi::Handle) -> bool {
         return fail(25);
     }
     true
+}
+
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+#[inline(never)]
+fn histogram_mismatch() -> bool {
+    let mut expected = [0usize; 256];
+    for byte in b"stafeto ramfs\n" {
+        expected[*byte as usize] += 1;
+    }
+    HISTOGRAM
+        .iter()
+        .zip(expected)
+        .any(|(count, expected)| count.load(Ordering::Acquire) != expected)
 }
 
 /// The state of the hook of `outside_lock`: 1 armed, 2 a request waits in

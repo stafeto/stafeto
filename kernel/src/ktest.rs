@@ -229,6 +229,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_info_reports_what_the_kernel_counts,
     ),
     (
+        "object_info_self_thread_has_exact_ownership",
+        calls::object_info_self_thread_has_exact_ownership,
+    ),
+    (
         "object_info_label_answers_the_channels_owner",
         calls::object_info_label_answers_the_channels_owner,
     ),
@@ -368,6 +372,14 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "object_pays_its_budget_back_to_the_payer",
         calls::object_pays_its_budget_back_to_the_payer,
+    ),
+    (
+        "process_layer_roles_survive_partial_unbind_and_native_end",
+        calls::process_layer_roles_survive_partial_unbind_and_native_end,
+    ),
+    (
+        "observer_wire_preserves_native_context_and_ignored_registers",
+        calls::observer_wire_preserves_native_context_and_ignored_registers,
     ),
     (
         "upcall_request_refuses_a_stopped_thread",

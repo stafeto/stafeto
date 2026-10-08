@@ -244,7 +244,12 @@ pub(super) fn run() -> bool {
             }
             let now = || rt::time::ticks_to_ns(rt::time::now());
             if !matches!(
-                waiter.receive_until(&done, now() + 500_000_000),
+                {
+                    let deadline = now() + 500_000_000;
+                    crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                        waiter.receive_until(&done, deadline)
+                    })
+                },
                 Ok(Waited::Got(_))
             ) {
                 return failed(429);
@@ -257,7 +262,14 @@ pub(super) fn run() -> bool {
                     return failed(430);
                 }
                 if !matches!(
-                    waiter.receive_until(&done, now() + 500_000_000),
+                    {
+                        let deadline = now() + 500_000_000;
+                        crate::watchdog::receive(
+                            deadline,
+                            rt::abi::Error::Interrupted,
+                            |deadline| waiter.receive_until(&done, deadline),
+                        )
+                    },
                     Ok(Waited::Got(_))
                 ) {
                     return failed(431);

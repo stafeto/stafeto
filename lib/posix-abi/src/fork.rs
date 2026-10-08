@@ -598,24 +598,21 @@ fn sessions() -> Result<Sessions, i32> {
                     .map_err(clone_errno)?;
             out.clock = clone.into_raw().0;
         }
-        let mut kept = [0; posix_fs::OPEN_MAX];
+        let mut kept = [rt::fs::PreparedOpen {
+            fd: 0,
+            slot: 0,
+            generation: 0,
+            random: false,
+        }; posix_fs::OPEN_MAX];
         let count = crate::shared::kept_by_fork(&mut kept)?;
         let (files, uart) = crate::shared::with_files(|fs| {
             let (files, uart) = fs.sessions();
             Ok((files.raw(), uart.map(Handle::raw)))
         })?;
-        let mut w = Writer::new();
-        proto_fs::Method::Clone
-            .header()
-            .write(&mut w)
-            .map_err(|_| EIO)?;
-        w.u32(count as u32).map_err(|_| EIO)?;
-        for n in &kept[..count] {
-            w.u32(*n).map_err(|_| EIO)?;
-        }
-        // The sessions live as long as the process's files.
-        let clone = rt::fs::Files::clone_on(&Handle::<Channel>::borrowed(files), w.as_bytes())
-            .map_err(clone_errno)?;
+        // The complete captured list is validated before child references exist.
+        let clone =
+            rt::fs::Files::clone_exact_on(&Handle::<Channel>::borrowed(files), &kept[..count])
+                .map_err(clone_errno)?;
         out.files = clone.into_raw().0;
         if let Some(uart) = uart {
             let clone = rt::service::clone_session(
@@ -690,6 +687,18 @@ pub(crate) fn pipes_clone(pipes: rt::abi::Handle, ends: &[u32]) -> Result<Handle
         .map_err(clone_errno)
 }
 
+/// Whether this caller has the executable resume region required by fork.
+#[cfg(feature = "thread-probe")]
+pub fn probe_resume_read_exec() -> bool {
+    let at = resume as *const () as u64;
+    crate::allocation::regions(|map| {
+        map.iter().any(|r| {
+            r.access == Access::ReadExec
+                && (r.address as u64..r.address as u64 + r.pages as u64 * 4096).contains(&at)
+        })
+    })
+}
+
 /// The function the next fork runs in the parent once the loader took the
 /// first message of Regions (a probe of a parent that dies there), 0 for
 /// none.
@@ -762,8 +771,10 @@ fn child() -> Result<(), &'static str> {
         crate::signals::after_fork().map_err(|_| "its signals")?;
     }
     let id = crate::threads::thread_number();
-    let (_, native) = crate::relibc::target(id).map_err(|_| "its place")?;
-    crate::process::register_router(&native).map_err(|_| "its router")?;
+    if !crate::relibc::native::is_resident(crate::threads::own_block()) {
+        let (_, native) = crate::relibc::target(id).map_err(|_| "its place")?;
+        crate::process::register_router(&native).map_err(|_| "its router")?;
+    }
     let hook = AT_CHILD.load(Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `at_child` stores a value, a `fn()`.

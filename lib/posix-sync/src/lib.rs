@@ -53,6 +53,9 @@ pub mod bit {
     pub const CANCEL: u64 = 1 << 2;
 }
 
+mod preparation;
+pub use preparation::DeliveryPreparation;
+
 static CEILING: AtomicU8 = AtomicU8::new(0);
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
 
@@ -83,18 +86,10 @@ pub fn leave() {
     let Some(block) = current() else {
         return;
     };
-    let old = block.flags.fetch_sub(flag::DEPTH_ONE, Ordering::SeqCst);
-    debug_assert!(old >> flag::DEPTH_SHIFT != 0, "balanced critical sections");
-    if old >> flag::DEPTH_SHIFT == 1
-        && block
-            .flags
-            .fetch_and(!flag::ENTRY_DEFERRED, Ordering::SeqCst)
-            & flag::ENTRY_DEFERRED
-            != 0
-    {
+    if preparation::leave_block(block) {
         let deferred = DEFERRED.load(Ordering::Acquire);
         if deferred != 0 {
-            // SAFETY: `configure` stored a `fn()` there.
+            // SAFETY: configure stored a fn() there.
             let deliver: fn() = unsafe { core::mem::transmute(deferred) };
             deliver();
         }
@@ -418,6 +413,21 @@ pub fn abandon() -> bool {
     true
 }
 
+/// Unlink a resident wait node after its genuine kernel Thread ended.
+/// # Safety
+/// The caller holds the resident Block mapping through this operation and
+/// proved ThreadState::Ended. The ended thread cannot mutate its node again.
+pub unsafe fn abandon_ended(block: &Block) {
+    let address = block.address.load(Ordering::Acquire);
+    if address != 0 {
+        let held = lock(bucket(address));
+        if block.address.load(Ordering::Relaxed) == address {
+            remove(&held, block);
+        }
+    }
+    block.flags.fetch_and(!flag::WAITING, Ordering::SeqCst);
+}
+
 /// After the handlers of an entry that `abandon` ended a wait for: the wait
 /// goes on as one that was woken, with WAKE in its slot (a spurious wakeup,
 /// which `futex_wait` allows): its caller looks at its word again.
@@ -509,6 +519,25 @@ impl LayerLock {
         LayerLock {
             word: AtomicU32::new(0),
             raise: true,
+        }
+    }
+
+    /// Try one acquisition without registering a waiter or waiting recursively.
+    pub fn try_lock(&self) -> Option<LayerGuard<'_>> {
+        enter();
+        let raised = self.raise && raise();
+        if self
+            .word
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(LayerGuard { lock: self, raised })
+        } else {
+            if raised {
+                lower();
+            }
+            leave();
+            None
         }
     }
 

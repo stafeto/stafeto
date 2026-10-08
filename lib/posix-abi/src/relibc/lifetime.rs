@@ -62,6 +62,30 @@ impl Lifetime {
             && next != MAX_GENERATION
     }
 
+    /// Renew a detached native scope in the same live kernel-thread row.
+    /// The final generation keeps the resident row charged until actual End.
+    pub(super) fn renew_native_scope(&self) -> bool {
+        let old = self.load();
+        if old & FLAGS != LIVE | DETACHED || old >> 6 == MAX_GENERATION {
+            return false;
+        }
+        let next = (old >> 6) + 1;
+        let flags = if next == MAX_GENERATION {
+            LIVE | DETACHED
+        } else {
+            LIVE
+        };
+        self.0
+            .compare_exchange(
+                old,
+                (next << 6) | flags,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            && next != MAX_GENERATION
+    }
+
     pub(super) fn set_flags(&self, flags: u64) {
         self.0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
@@ -77,6 +101,20 @@ impl Lifetime {
                 Some((old & !LIVE) | MAKING)
             })
             .expect("rollback preserves the reserved lifetime");
+    }
+
+    /// Direct kernel exit has no libc join owner. A libc EXITED row retains
+    /// its published return value until join or detach supplies RELEASED.
+    pub(super) fn native_ended(&self) {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                Some(if old & LIVE == 0 {
+                    old
+                } else {
+                    old | EXITED | if old & EXITED == 0 { RELEASED } else { 0 }
+                })
+            })
+            .expect("End preserves lifetime generation");
     }
 
     pub(super) fn add_flags(&self, flags: u64) {
@@ -171,6 +209,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_cleanup_debt_stays_making_on_repeated_end_observation() {
+        let row = Lifetime::new();
+        assert!(row.reserve());
+        row.set_flags(LIVE);
+        let owner = row.owner(1).unwrap();
+        row.begin_detach(owner);
+        row.finish_detach(owner);
+        row.native_ended();
+        assert!(row.claim_collect());
+        let claimed = row.load();
+        row.native_ended();
+        assert_eq!(row.load(), claimed);
+        assert_eq!(row.flags(), MAKING | DETACHED);
+        assert!(!row.reserve());
+    }
+
+    #[test]
+    fn native_libc_joinable_end_keeps_return_value_until_release() {
+        let row = Lifetime::new();
+        assert!(row.reserve());
+        row.set_flags(LIVE);
+        let owner = row.owner(1).unwrap();
+        row.begin_detach(owner);
+        row.finish_detach(owner);
+        row.add_flags(EXITED);
+        row.native_ended();
+        assert_eq!(row.flags(), LIVE | EXITED | DETACHED);
+        assert!(!row.claim_collect());
+        row.add_flags(RELEASED);
+        assert!(row.claim_collect());
+    }
+
+    #[test]
+    fn native_direct_kernel_end_and_detached_libc_end_are_collectible() {
+        for libc_detached in [false, true] {
+            let row = Lifetime::new();
+            assert!(row.reserve());
+            row.set_flags(LIVE);
+            let owner = row.owner(1).unwrap();
+            row.begin_detach(owner);
+            row.finish_detach(owner);
+            if libc_detached {
+                row.add_flags(EXITED | RELEASED);
+            }
+            row.native_ended();
+            assert!(row.claim_collect());
+        }
+    }
+
+    #[test]
     fn layout_and_permanent_main() {
         assert_eq!(core::mem::size_of::<Lifetime>(), 8);
         let state = Lifetime::new();
@@ -215,6 +303,48 @@ mod tests {
         assert_eq!(state.owner(1), None);
         assert_eq!(state.token(1), None);
         assert!(!state.reserve());
+    }
+
+    #[test]
+    fn all_paid_rows_reuse_only_after_deferred_detach_retry() {
+        let rows: [Lifetime; 63] = core::array::from_fn(|_| Lifetime::new());
+        for (index, row) in rows.iter().enumerate() {
+            assert!(row.reserve());
+            row.set_flags(LIVE | EXITED | RELEASED);
+            row.begin_detach(row.token(index + 1).unwrap());
+        }
+        assert!(
+            rows.iter()
+                .all(|row| !row.reserve() && !row.claim_collect())
+        );
+        for (index, row) in rows.iter().enumerate() {
+            let owner = row.token(index + 1).unwrap();
+            assert_eq!(row.status(owner), OwnerStatus::Detaching);
+            assert!(row.finish_detach(owner));
+            assert!(row.claim_collect());
+            row.free();
+            assert!(row.reserve());
+            assert_ne!(row.token(index + 1), Some(owner));
+        }
+    }
+
+    #[test]
+    fn deferred_detach_preserves_charged_row_until_retry() {
+        let state = Lifetime::new();
+        assert!(state.reserve());
+        state.set_flags(LIVE | EXITED | RELEASED);
+        let owner = state.token(5).unwrap();
+        assert_eq!(state.begin_detach(owner), OwnerStatus::Detaching);
+        // A busy callback completes no local transition.
+        assert_eq!(state.status(owner), OwnerStatus::Detaching);
+        assert!(!state.claim_collect());
+        assert!(!state.reserve());
+        assert_eq!(state.token(5), Some(owner));
+        assert!(state.finish_detach(owner));
+        assert!(state.claim_collect());
+        state.free();
+        assert!(state.reserve());
+        assert_ne!(state.token(5), Some(owner));
     }
 
     #[test]
@@ -371,5 +501,44 @@ mod tests {
         assert!(table.open_snapshot(open).is_err());
         assert_eq!(table.dup2(source, pending.fd), Ok((pending.fd, None)));
         assert_eq!(table.get(pending.fd), Ok(12));
+    }
+    #[test]
+    fn native_sequential_scopes_preserve_row_and_reject_old_owner() {
+        let row = Lifetime::new();
+        row.reserve();
+        row.set_flags(LIVE);
+        let first = row.owner(7).unwrap();
+        row.begin_detach(first);
+        assert!(!row.renew_native_scope());
+        assert!(!row.reserve());
+        row.finish_detach(first);
+        assert!(row.renew_native_scope());
+        let second = row.owner(7).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(row.status(first), OwnerStatus::Gone);
+        assert!(!row.finish_detach(first));
+        assert!(!row.claim_collect());
+        assert!(!row.reserve());
+        row.begin_detach(second);
+        row.finish_detach(second);
+        assert!(!row.claim_collect());
+        row.add_flags(EXITED | RELEASED);
+        assert!(row.claim_collect());
+        row.free();
+        assert!(row.reserve());
+    }
+    #[test]
+    fn native_generation_exhaustion_keeps_resident_custody_until_end() {
+        let row = Lifetime(AtomicU64::new(
+            ((MAX_GENERATION - 1) << 6) | LIVE | DETACHED,
+        ));
+        assert!(!row.renew_native_scope());
+        assert_eq!(row.flags(), LIVE | DETACHED);
+        assert_eq!(row.token(5), None);
+        assert!(!row.reserve());
+        row.add_flags(EXITED | RELEASED);
+        assert!(row.claim_collect());
+        row.free();
+        assert!(!row.reserve());
     }
 }

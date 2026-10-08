@@ -155,9 +155,8 @@ impl Processes {
                 status: status as i32,
             },
         ) == Some(Posted::Pending)
-            && let Some(router) = self.routers[index].as_ref()
         {
-            let _ = sys::thread_upcall_request(router);
+            self.request_router(index);
         }
         Answer::Status(Status::Ok)
     }

@@ -157,7 +157,12 @@ pub(super) fn run() -> bool {
         if mode == 1 || mode == 2 {
             let now = || rt::time::ticks_to_ns(rt::time::now());
             if !matches!(
-                waiter.receive_until(&ready, now() + 500_000_000),
+                {
+                    let deadline = now() + 500_000_000;
+                    crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                        waiter.receive_until(&ready, deadline)
+                    })
+                },
                 Ok(Waited::Got(_))
             ) {
                 return failed(356);
@@ -169,7 +174,14 @@ pub(super) fn run() -> bool {
                 }
             } else {
                 if !matches!(
-                    waiter.receive_until(&ready, now() + 20_000_000),
+                    {
+                        let deadline = now() + 20_000_000;
+                        crate::watchdog::receive(
+                            deadline,
+                            rt::abi::Error::Interrupted,
+                            |deadline| waiter.receive_until(&ready, deadline),
+                        )
+                    },
                     Ok(Waited::Expired)
                 ) || sys::thread_info(&native()).unwrap().state != ThreadState::Receiving
                 {
@@ -190,7 +202,11 @@ pub(super) fn run() -> bool {
         }
         let deadline = rt::time::ticks_to_ns(rt::time::now()) + 500_000_000;
         if !matches!(
-            done_waiter.receive_until(&done, deadline),
+            {
+                crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                    done_waiter.receive_until(&done, deadline)
+                })
+            },
             Ok(Waited::Got(_))
         ) {
             return failed(369);
