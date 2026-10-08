@@ -519,33 +519,56 @@ step 5h.
 ### Own part and wait of a step
 
 A step that calls another service synchronously (`send`) has two parts.
-Under `step-stats` the library `rt` times each `send` inside a step: the
-line `service step` carries the own part (the whole step less the waits),
-and the line `service wait: T kind K W ticks of A` carries the longest wait
-W of a kind in a step of A ticks. `xtask` compares the own part of every
-kind of every service, heartbeats included, with term B, and each wait
-with WAIT_MAX (500,000 ticks); ramfs FinishBinding and the heartbeats of
-the pipe service and of the terminal service must show a wait, or the
-accounting is gone. The departure of a session counts as kind 66 in every
-service, apart from the heartbeat and the other notifications. FinishBinding
-with 248 children took 18,306 ticks whole, 12,246 of them wait and 8,279
-its own part, which does not grow with the children; the terminal's own
-step (kind 65) took 20,509 whole and 12,710 in its own part.
+Under `step-stats` the library `rt` times each `send` that the thread
+leading the step makes: the line `service step` carries the own part (the
+whole step less the waits), and the line `service wait: T kind K W ticks of
+A` carries the longest wait W of a kind in a step of A ticks. The sends of
+the service's other threads (the adoption and replace threads of the
+process service, the supply thread of the entropy service) are no waits of
+the step: they run at the loop's base level, and when one preempts the loop
+its time stays in the own part, from above. If the counted waits ever add
+up to more than the step, `rt` prints `service wait cut:` and `xtask` fails
+the run.
 
-For a client of a service S that calls a service T in a step, the wait is a
-blocking term of the response-time analysis:
+`xtask` compares the own part of every kind of every service, heartbeats
+included, with term B. A wait has CALL_WAIT_MAX (120,000 ticks) in a call
+to a service and WAIT_MAX (500,000) in a heartbeat, where the wait covers
+the volleys of the crowd above the service's level. Ramfs FinishBinding and
+the heartbeats of the pipe service and of the terminal service must show a
+wait, or the accounting is gone. The departure of a session counts as kind
+66 in the process service, ramfs and the terminal service; the pipe service
+marks it as its own step (kind 65), and the other notifications stay in kind
+64. FinishBinding with 248 children took 18,306 ticks whole, 12,246 of them
+wait and 8,279 its own part, which does not grow with the children; the
+terminal's own step (kind 65) took 20,509 whole and 12,710 in its own part.
 
-    B_client >= own(S) + wait(S -> T)
-    wait(S -> T) <= C_ipc + step_max(T) + step(T, request) + I
+The wall time of a `send` includes the entry to the kernel, the copy of the
+message and of the handles both ways and the return, which is the caller's
+own work, up to half a round trip (`round_trip` 2,034 ticks) a call. It
+counts as wait, so the own part is lower by some hundreds of ticks a call;
+the blocking term below takes it back through C_ipc.
 
-with C_ipc about 2,000 ticks (one round trip), step_max(T) the longest step
-of T that may be running when the request arrives (the service is a single
-thread), step(T, request) the step of the request itself, and I the
-preemption by levels above the one T inherits from S. The steps of T are
-bound by their own lines, so `xtask` bounds only own(S) with B and the wait
-with WAIT_MAX. For T the process service step_max is SpawnStart, 93,000
-ticks today, so a wait of the terminal or of ramfs on the process service
-is about 100,000 ticks in the worst case until step 5z splits it.
+For a client of a service S that calls services T_i in a step, the waits are
+a blocking term of the response-time analysis. The wait of a step is the sum
+over its sends:
+
+    wait(S) <= sum_i ( C_ipc + step_max(T_i) + step(T_i, request_i) + Q_i + I_i )
+
+with C_ipc about 2,000 ticks (one round trip); step_max(T_i) the longest
+whole step of T_i (its own part plus its own waits, so that a chain S, T, U
+carries the wait on U) that may be running when the request arrives; Q_i the
+steps of requests that stand ahead in T_i's queue, those of its own level in
+the order of arrival and those above; step(T_i, request_i) the step of the
+request itself; and I_i the preemption by levels above the one T_i inherits
+from S, with the work of T_i's other threads (they run at its base level
+and preempt its loop when it serves a client below that level). The term of
+the client is the largest own(S) + wait(S) of one step; the sum of the
+largest own part and the largest wait of two rows is an upper bound of it.
+The steps of T_i are bound by their own lines, so `xtask` bounds own(S) with
+B and each wait with CALL_WAIT_MAX or WAIT_MAX. For T the process service
+step_max is SpawnStart, 93,000 ticks today, so one send of the terminal or
+of ramfs to the process service waits about 100,000 ticks in the worst
+case until step 5z splits it.
 
 The own part is wall time at the service's level: a holder of a lock at a
 higher level that runs in the middle of a step adds its time to the step.
