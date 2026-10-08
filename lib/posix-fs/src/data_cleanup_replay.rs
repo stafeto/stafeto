@@ -327,8 +327,8 @@ fn exact_cleanup_replies_settle_twenty_overlapping_append_results() {
         assert!(driver.first.pauses > 0);
         assert!(driver.other_pauses > 0);
         assert!(driver.other_visits > 1);
-        // Acknowledgment below must free both exact holds, proving both cleanup
-        // completions rather than merely returning their cached results.
+        // Acknowledgment below must free both exact holds after the two
+        // cleanup completions.
         for (owner, (token, _, _)) in pair {
             assert_eq!(
                 client.acknowledge_data(token, owner, &mut []).unwrap(),
