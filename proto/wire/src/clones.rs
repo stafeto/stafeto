@@ -60,6 +60,9 @@ pub struct Clones<const N: usize, const BITS: u32 = 16> {
     /// entry).
     root: [u64; ROOTS],
     root_made: [u16; ROOTS],
+    /// How the table is filled: 1 once `give` was used, 2 once `adopt` was.
+    #[cfg(debug_assertions)]
+    mode: u8,
     /// The entries of the table of roots a test counted.
     #[cfg(test)]
     probes: core::cell::Cell<usize>,
@@ -92,6 +95,8 @@ impl<const N: usize, const BITS: u32> Clones<N, BITS> {
             given: 0,
             root: [0; ROOTS],
             root_made: [0; ROOTS],
+            #[cfg(debug_assertions)]
+            mode: 0,
             #[cfg(test)]
             probes: core::cell::Cell::new(0),
         }
@@ -164,6 +169,11 @@ impl<const N: usize, const BITS: u32> Clones<N, BITS> {
 
     /// `give` with `most` clones of `client` at most (`room_within`).
     pub fn give_within(&mut self, tag: u64, client: u64, most: usize) -> Result<u64, Full> {
+        #[cfg(debug_assertions)]
+        {
+            assert!(self.mode & 2 == 0, "a table uses give or adopt, not both");
+            self.mode |= 1;
+        }
         let account = self.account(client, most)?;
         let given = self.given + 1;
         if given >= 1 << (62 - BITS) || self.free == NONE {
@@ -179,12 +189,20 @@ impl<const N: usize, const BITS: u32> Clones<N, BITS> {
 
     /// The clone `label` of `client` is alive, with a label some other
     /// table made, whose low BITS bits name a place no other clone has.
+    /// A table is filled by `give` or by `adopt`, never both: `adopt` does
+    /// not take its place from the free list that `give` draws on, so a
+    /// mixed table would hand out a place twice (debug builds check it).
     pub fn adopt(&mut self, label: u64, client: u64) -> Result<(), Full> {
         self.adopt_within(label, client, PER_CLIENT)
     }
 
     /// `adopt` with `most` clones of `client` at most.
     pub fn adopt_within(&mut self, label: u64, client: u64, most: usize) -> Result<(), Full> {
+        #[cfg(debug_assertions)]
+        {
+            assert!(self.mode & 1 == 0, "a table uses give or adopt, not both");
+            self.mode |= 2;
+        }
         let account = self.account(client, most)?;
         let place = (label & Self::MASK) as usize;
         if label == 0 || place >= N || self.label[place] != 0 {
@@ -432,5 +450,15 @@ mod tests {
         assert_eq!(c.place_of(label), Some(5));
         c.gone(label);
         assert_eq!(c.adopt(TAG | (4 << 9) | 5, 1), Ok(()));
+    }
+
+    /// Mixing the two ways to fill a table is a mistake that debug builds
+    /// stop.
+    #[test]
+    #[should_panic(expected = "give or adopt")]
+    fn give_and_adopt_do_not_mix() {
+        let mut c = Clones::<8, 9>::new();
+        assert_eq!(c.adopt(TAG | 3, 1), Ok(()));
+        let _ = c.give(TAG, 1);
     }
 }

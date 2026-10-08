@@ -368,6 +368,17 @@ impl Fs {
         (label & ((1 << ramfs::places::SLOT_BITS) - 1)) as usize
     }
 
+    /// The index of the identity channel of the image `outcome` names: the
+    /// index it was prepared with, if the channel there still has its label.
+    fn image_identity(&self, outcome: &ramfs::image::ImageOutcome) -> Option<usize> {
+        let i = usize::from(outcome.identity);
+        self.identities
+            .get(i)?
+            .as_ref()
+            .is_some_and(|identity| identity.label == outcome.label)
+            .then_some(i)
+    }
+
     /// The index of the birth of `label`, if it holds one.
     fn birth_slot(&self, label: u64) -> Option<usize> {
         let i = Self::birth_index(label);
@@ -553,10 +564,12 @@ impl Fs {
             self.places.release(label);
             return Err(code);
         }
+        let identity = child.authority_index;
         self.births[Self::birth_index(label)] = Some((label, child));
         fds.image_outcome = Some(ramfs::image::ImageOutcome {
             job,
             label,
+            identity,
             token,
             phase: ramfs::image::ImagePhase::Prepared,
         });
@@ -575,12 +588,8 @@ impl Fs {
                 self.births[i] = None;
             }
             self.places.release(outcome.label);
-        } else if let Some(identity) = self
-            .identities
-            .iter_mut()
-            .filter_map(Option::as_mut)
-            .find(|identity| identity.label == outcome.label)
-            && let Some(image) = identity.image.as_mut()
+        } else if let Some(i) = self.image_identity(&outcome)
+            && let Some(image) = self.identities[i].as_mut().and_then(|i| i.image.as_mut())
         {
             image.private = None;
         }
@@ -623,10 +632,8 @@ impl Fs {
                     return status(code);
                 }
                 let copy = self
-                    .identities
-                    .iter()
-                    .filter_map(Option::as_ref)
-                    .find(|identity| identity.label == outcome.label)
+                    .image_identity(&outcome)
+                    .and_then(|i| self.identities[i].as_ref())
                     .and_then(|identity| identity.image.as_ref())
                     .filter(|image| image.token == outcome.token)
                     .and_then(|image| image.private.as_ref())
@@ -685,10 +692,8 @@ impl Fs {
         }
         let outcome = fds.image_outcome.unwrap();
         let expected = self
-            .identities
-            .iter()
-            .filter_map(Option::as_ref)
-            .find(|identity| identity.label == outcome.label)
+            .image_identity(&outcome)
+            .and_then(|i| self.identities[i].as_ref())
             .is_some_and(|identity| {
                 identity.original == fds.binding
                     && identity
@@ -711,11 +716,9 @@ impl Fs {
         // Every resource and reply field was prepaid before the first SetId attempt.
         self.finish_image_job(fds, job, r.label());
         fds.image_outcome.as_mut().unwrap().phase = ramfs::image::ImagePhase::Ready;
-        let image = self
-            .identities
-            .iter_mut()
-            .filter_map(Option::as_mut)
-            .find(|identity| identity.label == outcome.label)
+        let at = self.image_identity(&outcome).unwrap();
+        let image = self.identities[at]
+            .as_mut()
             .unwrap()
             .image
             .as_mut()
@@ -1018,7 +1021,8 @@ impl Fs {
                     return Answer::Status(Status::BadSize);
                 }
                 self.births[Self::birth_index(label)] = Some((label, child));
-                let _ = self.clones.adopt(label, r.label());
+                let adopted = self.clones.adopt(label, r.label());
+                debug_assert!(adopted.is_ok(), "the place of a new label is free");
                 Answer::Reply([session.erase()].into())
             }
             Err(e) => {
@@ -2342,7 +2346,8 @@ impl Fs {
         binding.pending = true;
         binding.require = require;
         self.births[Self::birth_index(label)] = Some((label, child));
-        let _ = self.clones.adopt_within(label, r.label(), CLONES);
+        let adopted = self.clones.adopt_within(label, r.label(), CLONES);
+        debug_assert!(adopted.is_ok(), "the place of a new label is free");
         if r.reply().u32(0).is_err() {
             return Answer::Status(Status::BadSize);
         }
