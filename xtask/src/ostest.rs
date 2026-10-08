@@ -496,6 +496,19 @@ fn linker_arguments(text: &str) -> Result<Vec<String>, String> {
     Ok(words[at + 1..].to_vec())
 }
 
+/// Fails unless the archive reaches the linker as one `-lostest` found in
+/// a `-L` directory (any other spelling would link every test with the
+/// object of the first) and the line asks for the erratum 843419 fix.
+fn check_link_line(args: &[String]) -> Result<(), String> {
+    if args.iter().filter(|a| *a == "-lostest").count() != 1 {
+        return Err("the link line of os-test-probe has not exactly one -lostest".into());
+    }
+    if !args.iter().any(|a| a == "--fix-cortex-a53-843419") {
+        return Err("the link line of os-test-probe lacks --fix-cortex-a53-843419".into());
+    }
+    Ok(())
+}
+
 impl ProbeLink {
     /// Builds the probe with `object` and reads how it was linked; `dir`
     /// keeps the object of the program.
@@ -522,6 +535,7 @@ impl ProbeLink {
             return Err(format!("{cmd:?} failed:\n{text}"));
         }
         let mut args = linker_arguments(&text)?;
+        check_link_line(&args)?;
         let mut objects = args.iter_mut().filter(|a| a.ends_with(".rcgu.o"));
         let (Some(program), None) = (objects.next(), objects.next()) else {
             return Err("os-test-probe is not one object of code".into());
@@ -842,6 +856,17 @@ mod tests {
             ]
         );
         assert!(linker_arguments("no link line here\n").is_err());
+    }
+
+    #[test]
+    fn the_link_line_needs_one_archive_and_the_erratum_fix() {
+        let line = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let fix = "--fix-cortex-a53-843419";
+        assert!(check_link_line(&line(&["a.o", "-lostest", fix])).is_ok());
+        assert!(check_link_line(&line(&["a.o", fix])).is_err());
+        assert!(check_link_line(&line(&["a.o", "-lostest", "-lostest", fix])).is_err());
+        assert!(check_link_line(&line(&["a.o", "/d/libostest.a", fix])).is_err());
+        assert!(check_link_line(&line(&["a.o", "-lostest"])).is_err());
     }
 
     /// The test's own lines between its marks, `exit: N` for an empty
