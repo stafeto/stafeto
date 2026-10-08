@@ -121,6 +121,15 @@ unsafe impl Sync for Table {}
 
 static TABLE: Table = Table(UnsafeCell::new([const { None }; SESSIONS]));
 
+/// The table of the clones, outside the loop's stack: about 6.7 K bytes of
+/// places and roots, with no guard page below the stack.
+struct CloneTable(UnsafeCell<Clones<CLONES>>);
+
+// SAFETY: only the main thread reaches it, once.
+unsafe impl Sync for CloneTable {}
+
+static CLONE_TABLE: CloneTable = CloneTable(UnsafeCell::new(Clones::new()));
+
 fn main(_: u64) -> u64 {
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
@@ -164,7 +173,8 @@ fn main(_: u64) -> u64 {
     let mut service = Entropy {
         source: Source::new(),
         ops: LongOps::new(),
-        clones: Clones::new(),
+        // SAFETY: only the main thread reaches CLONE_TABLE, here once.
+        clones: unsafe { &mut *CLONE_TABLE.0.get() },
         telling: [(0, 0); WAITING],
         told: 0,
         to_tell: 0,
@@ -196,7 +206,7 @@ struct Entropy {
     ops: LongOps<WAITING>,
     /// The sessions CLONE gave that live, bounded for each client; the
     /// channel they are copies of.
-    clones: Clones<CLONES>,
+    clones: &'static mut Clones<CLONES>,
     /// The seeds that waited when the first bytes came, told TELLS a step:
     /// `told` of `to_tell` so far.
     telling: [(u64, u64); WAITING],
@@ -555,3 +565,8 @@ fn call(
     posix_random::erase(data);
     result
 }
+
+/// The loop's structure stays small, as the stack is its home and has no
+/// guard page: it takes 4 152 bytes with the clones in `CLONE_TABLE`, and
+/// would take several K more with the table in it.
+const _: () = assert!(core::mem::size_of::<Entropy>() <= 5120);
