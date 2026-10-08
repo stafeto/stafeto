@@ -62,6 +62,14 @@ const USER: u16 = 16;
 const INIT_ACK: u16 = 32;
 const CRT_REPLIED: u16 = 64;
 const ENDED: u16 = 128;
+const PAGE_NARROW: u16 = 256;
+const PAGE_MAPPED: u16 = 512;
+const PAGE_SETTLED: u16 = 1024;
+const MAP_VALIDATING: u16 = 2048;
+const STOP_SENT: u16 = 4096;
+const IDENTITY_CHECKED: u16 = 8192;
+const IDENTITY_REFUSED: u16 = 16384;
+const NATIVE_END: u16 = 32768;
 
 impl<M, C, T, D> InitialResident<M, C, T, D> {
     pub fn reserved(key: SeedKey, receipt: Receipt, source: InitialSource) -> Option<Self> {
@@ -184,6 +192,80 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         self.phase = Phase::Loading;
         true
     }
+    pub fn maps_ready(&self) -> bool {
+        self.page_ready() && self.flags & (MAPS | ENDED) == MAPS
+    }
+    pub fn user_ready(&self) -> bool {
+        self.maps_ready() && self.flags & USER != 0
+    }
+    pub fn page_ready(&self) -> bool {
+        self.flags & (STAGE | PAGE_SETTLED | ENDED) == STAGE | PAGE_SETTLED
+    }
+    pub fn page_mapped(&self) -> bool {
+        self.flags & PAGE_MAPPED != 0
+    }
+    pub fn page_copy(&self) -> Option<&M> {
+        match self.cleanup[2].as_ref() {
+            Some(CleanupOwner::Memory(value)) => Some(value),
+            _ => None,
+        }
+    }
+    pub fn page_needs_copy(&self) -> bool {
+        self.phase == Phase::Loading && self.flags & (STAGE | PAGE_NARROW | ENDED) == STAGE
+    }
+    pub fn retain_page_copy(&mut self, owner: M) -> Result<(), M> {
+        if !self.page_needs_copy() || self.cleanup[2].is_some() {
+            return Err(owner);
+        }
+        self.cleanup[2] = Some(CleanupOwner::Memory(owner));
+        self.flags |= PAGE_NARROW;
+        Ok(())
+    }
+    pub fn confirm_page_map(&mut self) -> bool {
+        if self.flags & (PAGE_NARROW | PAGE_MAPPED | ENDED) != PAGE_NARROW
+            || self.page_copy().is_none()
+        {
+            return false;
+        }
+        self.flags |= PAGE_MAPPED;
+        true
+    }
+    /// Move the owner only after the native Close has succeeded.
+    pub fn remove_page_copy(&mut self) -> Option<M> {
+        if self.flags & PAGE_MAPPED == 0 {
+            return None;
+        }
+        match self.cleanup[2].take() {
+            Some(CleanupOwner::Memory(value)) => Some(value),
+            other => {
+                self.cleanup[2] = other;
+                None
+            }
+        }
+    }
+    pub fn confirm_page_settled(&mut self) -> bool {
+        if self.flags & (PAGE_MAPPED | ENDED) != PAGE_MAPPED || self.cleanup[2].is_some() {
+            return false;
+        }
+        self.flags |= PAGE_SETTLED;
+        true
+    }
+    /// Source::Exit is posted after kernel teardown released target mappings.
+    pub fn native_exited(&mut self, key: SeedKey, reason: u32) -> bool {
+        if key != self.key {
+            return false;
+        }
+        if self.flags & ENDED == 0 && !self.ended(key, reason) {
+            return false;
+        }
+        self.flags |= NATIVE_END;
+        self.flags &= !(PAGE_MAPPED | PAGE_SETTLED);
+        true
+    }
+    pub fn native_end_confirmed(&self) -> bool {
+        self.flags & NATIVE_END != 0
+    }
+
     /// Every failed or replayed admission returns the whole incoming tuple.
     pub fn publish(
         &mut self,
@@ -194,6 +276,7 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         if self.flags & ENDED != 0
             || self.flags & STAGE == 0
             || self.phase != Phase::Loading
+            || !self.page_ready()
             || self.flags & MAPS != 0
             || publication.validate().is_err()
             || publication.map.receipt != self.publication.map.receipt
@@ -211,12 +294,72 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         self.phase = Phase::MapsReady;
         Ok(())
     }
+    pub fn begin_publish(
+        &mut self,
+        publication: Publication,
+        objects: [Option<M>; ENTRIES],
+    ) -> Result<(), [Option<M>; ENTRIES]> {
+        self.publish(publication, objects)?;
+        self.flags = (self.flags & !MAPS) | MAP_VALIDATING;
+        self.phase = Phase::Loading;
+        self.cursor = 0;
+        Ok(())
+    }
+    pub fn memory_validation(&self) -> Option<(usize, &M, Entry)> {
+        if self.flags & (MAP_VALIDATING | ENDED) != MAP_VALIDATING {
+            return None;
+        }
+        let slot = usize::from(self.cursor);
+        Some((
+            slot,
+            self.originals.get(slot)?.as_ref()?,
+            self.publication.map.entries[slot],
+        ))
+    }
+    pub fn memory_validated(&mut self, slot: usize) -> bool {
+        if self.flags & (MAP_VALIDATING | ENDED) != MAP_VALIDATING
+            || slot != usize::from(self.cursor)
+            || slot >= usize::from(self.publication.map.count)
+        {
+            return false;
+        }
+        self.cursor += 1;
+        if usize::from(self.cursor) == usize::from(self.publication.map.count) {
+            self.flags = (self.flags & !MAP_VALIDATING) | MAPS;
+            self.phase = Phase::MapsReady;
+            self.cursor = 0;
+        }
+        true
+    }
+    pub fn identity_checked(&self) -> bool {
+        self.flags & IDENTITY_CHECKED != 0
+    }
+    pub fn identity_result(&mut self, genuine: bool) {
+        assert!(!self.identity_checked());
+        self.flags |= IDENTITY_CHECKED;
+        if !genuine {
+            self.flags |= IDENTITY_REFUSED;
+        }
+    }
+    pub fn identity_genuine(&self) -> bool {
+        self.flags & (IDENTITY_CHECKED | IDENTITY_REFUSED | ENDED) == IDENTITY_CHECKED
+    }
+    pub fn identity_finished(&mut self) {
+        assert!(self.retained_identity.is_none() && self.crt_pending.is_none());
+        self.flags &= !(IDENTITY_CHECKED | IDENTITY_REFUSED);
+    }
+    pub fn needs_stop(&self) -> bool {
+        self.flags & (ENDED | STOP_SENT | NATIVE_END) == ENDED
+    }
+    pub fn stop_sent(&mut self) {
+        assert!(self.needs_stop());
+        self.flags |= STOP_SENT;
+    }
     pub fn replay_matches(&self, publication: &Publication) -> bool {
         self.flags & MAPS != 0 && self.publication == *publication
     }
     pub fn bootstrap(&mut self, key: SeedKey) -> bool {
-        if key != self.key || self.flags & ENDED != 0 || self.flags & (MAPS | STAGE) != MAPS | STAGE
-        {
+        if key != self.key || !self.page_ready() || self.flags & (MAPS | STAGE) != MAPS | STAGE {
             return false;
         }
         self.flags |= BOOTSTRAP;
@@ -411,8 +554,44 @@ mod tests {
         assert_eq!(resident.key.epoch, 37);
         assert_eq!(resident.publication.map.entries[0], Entry::EMPTY);
         assert!(resident.pending_stage().is_none());
+        resident.flags |= PAGE_MAPPED | PAGE_SETTLED;
         assert!(resident.publish(publication, owners).is_ok());
         assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn target_page_owner_waits_for_proof_map_close_and_exact_native_end() {
+        let (mut resident, publication, log) = fixture();
+        assert!(resident.awaiting_guard());
+        assert!(!resident.page_needs_copy());
+        assert!(resident.retain_page_copy(Cap(7, log.clone())).is_err());
+        assert!(resident.authenticated_stage(resident.key, 71));
+        assert!(resident.page_needs_copy());
+        assert!(resident.retain_page_copy(Cap(8, log.clone())).is_ok());
+        assert!(!resident.page_ready());
+        assert!(!resident.confirm_page_settled());
+        assert!(resident.remove_page_copy().is_none());
+        let owners = resident.publish(publication, objects(&log)).err().unwrap();
+        assert!(resident.confirm_page_map());
+        assert!(resident.page_mapped());
+        assert!(!resident.confirm_page_settled());
+        let owner = resident.remove_page_copy().unwrap();
+        assert!(resident.confirm_page_settled());
+        assert!(resident.page_ready());
+        assert!(resident.publish(publication, owners).is_ok());
+        let foreign = SeedKey {
+            label: resident.key.label + 1,
+            ..resident.key
+        };
+        assert!(!resident.native_exited(foreign, 19));
+        assert!(resident.page_mapped());
+        assert!(resident.native_exited(resident.key, 19));
+        assert!(resident.native_end_confirmed());
+        assert!(!resident.page_mapped());
+        assert!(!resident.page_ready());
+        assert!(!resident.bootstrap(resident.key));
+        drop(owner);
+        assert_eq!(log.borrow().as_slice(), &[7, 8]);
     }
 
     #[test]
@@ -442,6 +621,7 @@ mod tests {
         assert!(log.borrow().is_empty());
         assert!(resident.awaiting_guard());
         assert!(resident.authenticated_stage(resident.key, 9));
+        resident.flags |= PAGE_MAPPED | PAGE_SETTLED;
         assert!(resident.publish(publication, back).is_ok());
         let replay = resident.publish(publication, objects(&log)).err().unwrap();
         assert!(resident.replay_matches(&publication));
@@ -454,6 +634,7 @@ mod tests {
         let (mut resident, publication, log) = fixture();
         assert!(resident.awaiting_guard());
         assert!(resident.authenticated_stage(resident.key, 9));
+        resident.flags |= PAGE_MAPPED | PAGE_SETTLED;
         assert!(resident.publish(publication, objects(&log)).is_ok());
         assert!(!resident.user_release(resident.key));
         assert!(!resident.init_ack(resident.key, publication.map.receipt));
@@ -483,6 +664,7 @@ mod tests {
         let (mut resident, publication, log) = fixture();
         assert!(resident.awaiting_guard());
         assert!(resident.authenticated_stage(resident.key, 9));
+        resident.flags |= PAGE_MAPPED | PAGE_SETTLED;
         assert!(resident.publish(publication, objects(&log)).is_ok());
         let foreign = SeedKey {
             epoch: 2,

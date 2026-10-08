@@ -26,6 +26,13 @@ impl Processes {
         mut birth: Birth,
         r: &mut Request<'_>,
     ) -> Answer {
+        if self.replacing[parent_index]
+            .as_ref()
+            .and_then(Work::initial)
+            .is_some_and(|resident| !resident.user_ready())
+        {
+            return kernel(abi::Error::BadState);
+        }
         if self.loader.is_none() || self.files.is_none() {
             return refuse(proto_process::NOT_FOUND);
         }
@@ -196,7 +203,7 @@ impl Processes {
         if work.key() != key {
             return Err(abi::Error::BadState);
         };
-        if let PrepareKind::Initial { create } = work.kind {
+        if let PrepareKind::Initial { create, .. } = work.kind {
             return Ok(create);
         };
         let parent = work.origin.parent.ok_or(abi::Error::BadState)?;
@@ -231,6 +238,14 @@ impl Processes {
     pub(super) fn prepare_step(&mut self) {
         let index = usize::from(self.preparing_cursor);
         self.preparing_cursor = ((index + 1) % RECORDS) as u16;
+        if self.replacing[index]
+            .as_ref()
+            .and_then(Work::initial)
+            .is_some()
+        {
+            self.initial_step(index);
+            return;
+        }
         let Some(work) = self.replacing[index].as_ref().and_then(Work::preparing) else {
             return;
         };
@@ -596,6 +611,19 @@ impl Processes {
             PreparePhase::Thread => return self.prepare_thread(index, key, create),
             PreparePhase::Start => return self.prepare_start(index, key),
             PreparePhase::Reply => {
+                if matches!(
+                    work.kind,
+                    PrepareKind::Initial {
+                        admission: Some(_),
+                        ..
+                    }
+                ) && work.resources.exit.is_some()
+                {
+                    if !crate::close_owned(&mut work.resources.exit) {
+                        return Err(abi::Error::BadState);
+                    }
+                    return Ok(());
+                }
                 if let Some(exit) = work.resources.exit.take() {
                     // The process retains its exit source. Close the temporary
                     // owner before the reply makes Loaded and Exec admissible.
@@ -761,7 +789,7 @@ impl Processes {
             .as_mut()
             .and_then(Work::preparing_mut)
             .ok_or(abi::Error::BadState)?;
-        let PrepareKind::Initial { create } = work.kind else {
+        let PrepareKind::Initial { create, admission } = work.kind else {
             return Err(abi::Error::BadState);
         };
         let credentials = if create.root {
@@ -794,12 +822,46 @@ impl Processes {
         self.witnesses[index] = work.resources.witness.take();
         self.tickets[index] = create.ticket;
         self.generations.raise(index);
+        let initial_receipt = proto_process::initial_map::Receipt {
+            key: proto_process::initial_map::Key {
+                key: create.ticket,
+                image: 1,
+            },
+            label: key.label.raw_at(1),
+            pid: key.label.pid(),
+            init_ticket: create.ticket,
+        };
+        if let Some(admission) = admission {
+            use posix_process_service::initial_origin::{InitialOrigin, SourceOrigin};
+            record.set_initial_origin(
+                InitialOrigin::new(admission.source.artifact, 0).expect("initial flags"),
+            );
+            record.source_origin = SourceOrigin::boot(
+                admission.source.artifact,
+                admission.source.canonical.is_none(),
+            )
+            .expect("validated initial artifact");
+        }
         let mut bytes = Writer::new();
-        bytes
-            .u32(0)
-            .and_then(|()| bytes.u32(key.label.pid()))
-            .and_then(|()| bytes.u64(key.label.raw()))
-            .expect("the fixed initial reply");
+        if admission.is_some() {
+            bytes
+                .u32(0)
+                .and_then(|()| bytes.u32(key.label.pid()))
+                .and_then(|()| bytes.u64(key.label.raw()))
+                .and_then(|()| {
+                    proto_process::initial_identity::Query {
+                        receipt: initial_receipt,
+                    }
+                    .write(&mut bytes)
+                })
+                .expect("the reserved initial receipt");
+        } else {
+            bytes
+                .u32(0)
+                .and_then(|()| bytes.u32(key.label.pid()))
+                .and_then(|()| bytes.u64(key.label.raw()))
+                .expect("the fixed initial reply");
+        }
         let copy = work
             .resources
             .copy
@@ -816,13 +878,40 @@ impl Processes {
             .take()
             .expect("the prepaid identity session");
         let returned = [copy.raw(), session.raw(), who.raw()];
-        let pending = work.pending.take().expect("the original Create request");
-        let failure = match pending.answer(
-            bytes.as_bytes(),
-            [copy.erase(), session.erase(), who.erase()],
-        ) {
+        let answer = if admission.is_some() {
+            let pending = work
+                .pending
+                .as_mut()
+                .expect("the retained CreateInitial request");
+            let token = pending.take_token().expect("the original initial token");
+            let result = token.reply_handles(
+                bytes.as_bytes(),
+                [copy.erase(), session.erase(), who.erase()],
+            );
+            result
+        } else {
+            work.pending
+                .take()
+                .expect("the original Create request")
+                .answer(
+                    bytes.as_bytes(),
+                    [copy.erase(), session.erase(), who.erase()],
+                )
+        };
+        let failure = match answer {
             Ok(()) => None,
             Err(mut refused) => {
+                if admission.is_some()
+                    && let Some(token) = refused.token.take()
+                {
+                    assert!(
+                        work.pending
+                            .as_mut()
+                            .expect("initial pending")
+                            .restore_token(token)
+                            .is_ok()
+                    );
+                }
                 if let Some(back) = refused.back.take() {
                     // The reply returns the complete original transfer on a
                     // refusal that keeps handles. Keep Drop disarmed while
@@ -849,12 +938,28 @@ impl Processes {
         if let Some(error) = failure {
             work.cancel(key, Status::Kernel(error).code(), true);
         } else {
+            work.pending.take(); // Its bounded token has crossed the Reply boundary.
             assert!(work.cancel(key, 0, false));
             assert!(work.finish_cleanup(key));
             // Every owner has crossed its transfer or close boundary. The
             // empty slot becomes available before the next request dispatch.
-            self.replacing[index] = None;
-            self.preparing_count -= 1;
+            if let Some(admission) = admission {
+                let mut resident = crate::NativeInitial::reserved(
+                    posix_process_service::initial_resident::SeedKey {
+                        epoch: 0,
+                        ticket: create.ticket,
+                        label: key.label.raw_at(1),
+                    },
+                    initial_receipt,
+                    admission.source,
+                )
+                .expect("the immutable reserved receipt");
+                assert!(resident.awaiting_guard());
+                self.replacing[index] = Some(Work::Initial(resident));
+            } else {
+                self.replacing[index] = None;
+                self.preparing_count -= 1;
+            }
         }
         self.publish_groups(index);
         Ok(())
@@ -874,7 +979,7 @@ impl Processes {
             return;
         };
         let level = match work.kind {
-            PrepareKind::Initial { create } => create.ceiling.min(self.level),
+            PrepareKind::Initial { create, .. } => create.ceiling.min(self.level),
             _ => self
                 .loaders
                 .of(index)

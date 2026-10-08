@@ -67,7 +67,7 @@ fn level() -> u8 {
 }
 
 /// The program `name` of the boot image.
-fn program(name: &Name, source: InitialSource) -> Option<Program<'static>> {
+pub(super) fn program(name: &Name, source: InitialSource) -> Option<Program<'static>> {
     let len = IMAGE[1].load(Ordering::Acquire);
     let addr = IMAGE[0].load(Ordering::Relaxed);
     if len == 0 {
@@ -84,6 +84,20 @@ fn program(name: &Name, source: InitialSource) -> Option<Program<'static>> {
     let bindings = Bindings::parse(metadata.data, boot.count()).ok()?;
     bindings.validate_layout(boot).ok()?;
     bindings.resolve(boot, source, name.as_bytes()).ok()
+}
+
+pub(super) fn initial_program(source: InitialSource) -> Option<Program<'static>> {
+    let len = IMAGE[1].load(Ordering::Acquire);
+    let addr = IMAGE[0].load(Ordering::Relaxed);
+    if len == 0 {
+        return None;
+    }
+    // SAFETY: the immutable boot mapping remains owned for the service lifetime.
+    let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(addr as *const u8, len) };
+    let boot = BootImage::parse(bytes).ok()?;
+    let file = boot.file_at(source.artifact)?;
+    let name = Name::new(file.name.as_bytes()).ok()?;
+    program(&name, source)
 }
 
 /// A process the service made and loaded, whose first thread waits for

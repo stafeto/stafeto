@@ -125,6 +125,7 @@ pub struct Birth {
 pub enum Kind {
     Initial {
         create: Create,
+        admission: Option<proto_process::initial_publication::Admission>,
     },
     Child {
         birth: Birth,
@@ -263,6 +264,17 @@ impl<P, C, M, T, D> StartPreparation<P, C, M, T, D> {
             Phase::Process => Phase::PageMemory,
             Phase::PageMemory => Phase::PageOwnMap,
             Phase::PageOwnMap => Phase::PageInit,
+            Phase::PageInit
+                if matches!(
+                    self.kind,
+                    Kind::Initial {
+                        admission: Some(_),
+                        ..
+                    }
+                ) =>
+            {
+                Phase::Reply
+            }
             Phase::PageInit => Phase::PageTargetMap,
             Phase::PageTargetMap if matches!(self.kind, Kind::Initial { .. }) => Phase::Reply,
             Phase::PageTargetMap => Phase::Code,
@@ -395,6 +407,7 @@ mod tests {
                     root: false,
                     ticket: 17,
                 },
+                admission: None,
             },
             Origin {
                 parent: None,

@@ -75,6 +75,7 @@ mod controller;
 mod ending;
 mod ends;
 mod generations;
+mod initial;
 mod jobs;
 mod loader;
 mod make;
@@ -511,13 +512,31 @@ impl Processes {
         let Ok(create) = Create::read(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
+        self.create_admission(r, create, None)
+    }
+
+    fn create_initial(&mut self, r: &mut Request<'_>) -> Answer {
+        let Ok(admission) = proto_process::initial_publication::Admission::read(
+            &r.bytes()[proto_wire::HEADER_LEN..],
+            r.handles.len(),
+        ) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if make::program(&admission.program, admission.source).is_none() {
+            return Answer::Status(Status::BadSize);
+        }
+        self.create_admission(r, admission.create, Some(admission))
+    }
+
+    fn create_admission(
+        &mut self,
+        r: &mut Request<'_>,
+        create: Create,
+        admission: Option<proto_process::initial_publication::Admission>,
+    ) -> Answer {
         if r.handles.len() != 2 {
             return Answer::Status(Status::BadSize);
         }
-        let (Ok(start), Ok(witness)) = (r.handles.take::<Channel>(0), r.handles.take::<Channel>(1))
-        else {
-            return Answer::Status(Status::BadSize);
-        };
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::FULL);
         };
@@ -530,6 +549,19 @@ impl Processes {
             self.records.retire_next(label);
             return refuse(proto_process::FULL);
         }
+        if r.handles
+            .info(0)
+            .is_none_or(|(kind, _)| kind != abi::ObjectKind::Channel)
+            || r.handles
+                .info(1)
+                .is_none_or(|(kind, _)| kind != abi::ObjectKind::Channel)
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        let (Ok(start), Ok(witness)) = (r.handles.take::<Channel>(0), r.handles.take::<Channel>(1))
+        else {
+            return Answer::Status(Status::BadSize);
+        };
         let Some(pending) = r.defer() else {
             return refuse(proto_process::FULL);
         };
@@ -540,7 +572,7 @@ impl Processes {
         let key = preparing::Key { label, image: 1 };
         let mut work = NativePreparation::new(
             key,
-            PrepareKind::Initial { create },
+            PrepareKind::Initial { create, admission },
             preparing::Origin {
                 parent: None,
                 credentials_generation: 0,
@@ -563,7 +595,7 @@ impl Processes {
     /// for a label of no such record.
     fn loaded(&mut self, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
-        let (Ok(label), Ok(thread)) = (body.u64(), r.handles.take::<Thread>(0)) else {
+        let Ok(label) = body.u64() else {
             return Answer::Status(Status::BadSize);
         };
         if body.finish().is_err() {
@@ -571,6 +603,16 @@ impl Processes {
         }
         let Some(index) = self.records.find(label) else {
             return refuse(proto_process::UNREGISTERED);
+        };
+        if self.replacing[index]
+            .as_ref()
+            .and_then(Work::initial)
+            .is_some_and(|resident| !resident.page_ready())
+        {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
+        let Ok(thread) = r.handles.take::<Thread>(0) else {
+            return Answer::Status(Status::BadSize);
         };
         let Some(record) = self
             .records
@@ -852,6 +894,9 @@ impl Processes {
         }
         if method == Method::SetId as u16 {
             return self.set_id(r);
+        }
+        if method == Method::InitialOf as u16 {
+            return self.initial_of(r);
         }
         if method == Method::StageExec as u16 {
             return self.stage_exec(r);
@@ -2534,6 +2579,13 @@ impl Processes {
     /// loader's identity; the parent's SpawnStart gets the PID and its
     /// copy of C.
     fn boot(&mut self, child: usize, slot: usize, r: &mut Request<'_>) -> Answer {
+        if self.replacing[child]
+            .as_ref()
+            .and_then(Work::initial)
+            .is_some_and(|resident| !resident.page_ready())
+        {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
         self.replacer.check_files = true;
         self.kick();
         if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Booting) {
@@ -2917,6 +2969,9 @@ impl Service<0> for Processes {
         let method = r.method();
         let own = [
             Method::Create,
+            Method::CreateInitial,
+            Method::StageInitial,
+            Method::InitialMaps,
             Method::Loaded,
             Method::Abandon,
             Method::Replace,
@@ -2929,6 +2984,9 @@ impl Service<0> for Processes {
             }
             return match method {
                 n if n == Method::Create as u16 => self.create(r),
+                n if n == Method::CreateInitial as u16 => self.create_initial(r),
+                n if n == Method::StageInitial as u16 => self.initial_stage(r),
+                n if n == Method::InitialMaps as u16 => self.initial_maps(r),
                 n if n == Method::Loaded as u16 => self.loaded(r),
                 n if n == Method::Replace as u16 => self.replace(r),
                 _ => self.abandon(r),
@@ -3130,7 +3188,10 @@ impl Service<0> for Processes {
         if let Some(resident) = self.replacing[index].as_mut().and_then(Work::initial_mut) {
             // This exact record/image Exit revokes the pending guard before
             // any later worker proof can commit authority.
-            assert!(resident.ended(resident.key, Status::from_code(proto_process::AGAIN).code()));
+            assert!(
+                resident
+                    .native_exited(resident.key, Status::from_code(proto_process::AGAIN).code())
+            );
         }
         self.generations.retire(index);
         if first {
