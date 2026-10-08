@@ -462,7 +462,7 @@ mod tests {
             step(10, 1, 900),
             step(10, 2, 1500),
             step(10, 65, 3000),
-            step(10, 64, 90_000),
+            step(10, 64, 1_100),
             step(11, 5, 1200),
             step(11, 6, 1300),
             step(11, 8, 5600),
@@ -484,6 +484,10 @@ mod tests {
         let mut long = good.clone();
         long.push(step(10, 65, RAM_STEP_MAX + 1));
         assert!(steps_verdict(&long).is_err());
+        // The heartbeat counts its own part only, and is bound like the rest.
+        let mut long = good.clone();
+        long.push(step(10, 64, RAM_STEP_MAX + 1));
+        assert!(steps_verdict(&long).is_err(), "a heartbeat past term B");
         for i in [0, 1, 2, 4, 5, 6, 7] {
             let mut missing = good.clone();
             missing.remove(i);
