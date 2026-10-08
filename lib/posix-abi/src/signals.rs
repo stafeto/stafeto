@@ -1371,6 +1371,12 @@ impl SignalPreparation {
             _kernel: deferred,
         }
     }
+
+    fn settle_for_exit(self) -> upcall::DeferredEntry {
+        let Self { local, _kernel } = self;
+        drop(local);
+        _kernel
+    }
 }
 
 /// Runs deliverable handlers with preparation protected by common deferral.
@@ -1381,9 +1387,8 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     let mut preparation = Some(SignalPreparation::begin());
     let block = own();
     if stopped_by_other() {
-        drop(preparation.take());
+        // Keep both forms of deferral through the parking effect.
         park();
-        preparation = Some(SignalPreparation::begin());
     }
     // The process's signals first: one of them may be this thread's.
     route();
@@ -1428,9 +1433,8 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
         if handler == DEFAULT {
             match posix_signals::default_action(signal) {
                 posix_signals::DefaultAction::Stop => {
-                    drop(preparation.take());
+                    // Stop commits before any deferred entry can run again.
                     let _ = crate::process::stop_self(signal, ticket);
-                    preparation = Some(SignalPreparation::begin());
                     route();
                     continue;
                 }
@@ -1438,7 +1442,9 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
                     continue;
                 }
                 posix_signals::DefaultAction::Terminate => {
-                    drop(preparation.take());
+                    // Local ownership settles; kernel deferral remains owned
+                    // until the nonreturning ProcessExit destroys this thread.
+                    let _deferred = preparation.take().unwrap().settle_for_exit();
                     sys_exit_signal(signal)
                 }
             }
