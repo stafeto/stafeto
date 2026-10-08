@@ -440,6 +440,16 @@ mod tests {
         }
     }
 
+    /// The stubs listed by hand name functions of the standard, so that a
+    /// renamed or misspelt entry cannot stay unnoticed.
+    #[test]
+    fn confirmed_stubs_are_in_the_inventory() {
+        let rows = interfaces(INVENTORY).unwrap();
+        for name in stubs::CONFIRMED {
+            assert!(rows.iter().any(|r| r.name == name), "{name}");
+        }
+    }
+
     #[test]
     fn xbd_inventory_covers_required_and_option_headers() {
         let rows = headers(XBD_HEADERS).unwrap();

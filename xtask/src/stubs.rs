@@ -8,8 +8,12 @@
 //! its whole body is `Err(Errno(ENOSYS))`. A method the platform leaves to
 //! the trait's default (`src/platform/pal`) is a stub when that default
 //! only calls stub methods (`access` calls `faccessat`). A public function
-//! (`src/header`) is a stub when it is named like a stub method or calls
-//! only stub methods through `Sys::` (`remove` calls `unlink` and `rmdir`).
+//! (`src/header`) is a stub when every call it makes is a stub: a stub
+//! method through `Sys::` (`remove` calls `unlink` and `rmdir`) or a
+//! function of relibc that is a stub (`alarm` calls `alarm_timespec`, which
+//! calls `timer_create`); opening and closing a descriptor do not count
+//! (`statvfs`). A call of a function that is not a stub, or that the sources do not define, keeps the
+//! function out (`posix_spawnp` calls `posix_spawn`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -189,14 +193,14 @@ fn without_strings(text: &str) -> String {
     out
 }
 
-/// Whether `body` calls a plain function (`name(` in snake case, not a
-/// method, a path, a macro or a variant such as `Err(`): such a body does more than hand its arguments to `Sys`.
-fn calls_a_function(body: &str) -> bool {
+/// The plain functions `body` calls (`name(` in snake case, not a method,
+/// a path, a macro or a variant such as `Err(`).
+fn plain_calls(body: &str) -> BTreeSet<String> {
     let body = &without_strings(body);
-    let bytes = body.as_bytes();
-    (0..bytes.len()).any(|i| {
-        if bytes[i] != b'(' {
-            return false;
+    let mut names = BTreeSet::new();
+    for (i, byte) in body.bytes().enumerate() {
+        if byte != b'(' {
+            continue;
         }
         let end = body[..i].trim_end().len();
         let name = body[..end]
@@ -204,15 +208,20 @@ fn calls_a_function(body: &str) -> bool {
             .next()
             .unwrap_or("");
         let before = body[..end - name.len()].trim_end();
-        !name.is_empty()
+        if !name.is_empty()
             && !before.ends_with('.')
             && !before.ends_with("::")
+            && !before.ends_with('!')
             && name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
             && !matches!(
                 name,
                 "unsafe" | "if" | "match" | "while" | "return" | "let" | "in" | "for" | "else"
             )
-    })
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    names
 }
 
 /// The platform methods that answer ENOSYS: their own stubs, and the
@@ -248,22 +257,67 @@ fn stub_methods(sources: &Sources) -> BTreeSet<String> {
     }
 }
 
-/// The public functions of relibc that answer ENOSYS on stafeto.
+/// The calls that do not decide whether a function works: opening and
+/// closing a descriptor (`statvfs` opens the path, asks `fstatvfs`, closes)
+/// and dropping a lock guard.
+const NEUTRAL: [&str; 4] = ["open", "openat", "close", "drop"];
+
+/// Stubs the reading above does not see, each confirmed by hand in relibc's
+/// sources: `mkdtemp` reaches `Sys::mkdir` through a closure it passes to
+/// `inner_mktemp`, and `realpath` asks `Sys::fpath` after a
+/// `File::open`. Each name must
+/// be in the XSH inventory (a test of `coverage`).
+pub(crate) const CONFIRMED: [&str; 2] = ["mkdtemp", "realpath"];
+
+/// The public functions of relibc that answer ENOSYS on stafeto, and the
+/// functions behind them: a function is a stub when it calls at least one
+/// platform method or function of relibc that is a stub, and every call it
+/// makes (`Sys::name(` or `name(` of a function of `src/header`) is a stub
+/// or neutral. A call of a function that is not a stub, or that the sources do not define, keeps the
+/// function out. The set is closed by repeating until it stops growing.
 pub(crate) fn stub_functions(sources: &Sources) -> BTreeSet<String> {
-    let stubs = stub_methods(sources);
-    let mut found = BTreeSet::new();
+    let methods = stub_methods(sources);
+    let mut found: BTreeSet<String> = CONFIRMED.iter().map(|name| (*name).to_owned()).collect();
+    let mut bodies: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for source in &sources.header {
         for (name, body) in functions(&without_comments(source)) {
-            let callees = calls(&body, "Sys::");
-            if !callees.is_empty()
-                && callees.iter().all(|callee| stubs.contains(*callee))
-                && !calls_a_function(&body)
-            {
-                found.insert(name);
-            }
+            bodies.entry(name).or_default().push(body);
         }
     }
-    found
+    loop {
+        let before = found.len();
+        for (name, versions) in &bodies {
+            // Every definition of the name must be a stub (the same name in
+            // two headers, as with a wrapper and its own caller).
+            let stub = versions.iter().all(|body| {
+                let methods_called = calls(body, "Sys::");
+                let plain = plain_calls(body);
+                let mut deciding = 0;
+                let mut all_stubs = true;
+                for callee in &methods_called {
+                    if NEUTRAL.contains(callee) {
+                        continue;
+                    }
+                    deciding += 1;
+                    all_stubs &= methods.contains(*callee);
+                }
+                for callee in &plain {
+                    if NEUTRAL.contains(&callee.as_str()) {
+                        continue;
+                    }
+                    deciding += 1;
+                    all_stubs &= found.contains(callee) && callee != name;
+                }
+                deciding > 0 && all_stubs
+            });
+            if stub {
+                found.insert(name.clone());
+            }
+        }
+        if found.len() == before {
+            return found;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +402,29 @@ pub unsafe extern \"C\" fn spawnp(path: *const c_char) -> c_int {
     }
     spawn(path)
 }
+fn alarm_timespec(seconds: u32) -> u32 {
+    Sys::faccessat(0, seconds, 0, 0);
+    Sys::unlinkat(0, seconds, 0);
+    0
+}
+#[unsafe(no_mangle)]
+pub unsafe extern \"C\" fn alarm(seconds: u32) -> u32 {
+    alarm_timespec(seconds)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern \"C\" fn statvfs(path: *const c_char) -> c_int {
+    let fd = Sys::open(path, 0);
+    let result = Sys::faccessat(fd, path, 0, 0);
+    Sys::close(fd);
+    result
+}
+#[unsafe(no_mangle)]
+pub unsafe extern \"C\" fn getcwd_twice(path: *const c_char) -> c_int {
+    Sys::open(path, 0);
+    Sys::chdir(path);
+    Sys::close(0);
+    0
+}
 #[unsafe(no_mangle)]
 pub unsafe extern \"C\" fn mmap(len: usize) -> c_int {
     Sys::mmap(len).map(|()| 0).or_minus_one_errno()
@@ -377,31 +454,40 @@ pub unsafe extern \"C\" fn mmap(len: usize) -> c_int {
         assert!(!stubs.contains("rename"));
     }
 
-    /// A public function is a stub when every platform method it calls is
-    /// one; a function that also calls a working method (`mkdtemp` opens)
-    /// or none is not.
+    /// A public function is a stub when every call it makes is a stub:
+    /// through `Sys::` (`remove`, `mkdtemp`), through a function of relibc
+    /// that is one (`alarm` over `alarm_timespec`), with opening and closing
+    /// a descriptor not counting (`statvfs`). One that also calls a working
+    /// method (`getcwd_twice`), a function the sources do not define
+    /// (`spawnp`) or none (`chdir` is working) is not.
     #[test]
     fn a_public_function_over_stubs_is_a_stub() {
         let found = stub_functions(&sources(PLATFORM, PAL, HEADER));
+        let names: Vec<_> = found.iter().map(String::as_str).collect();
         assert_eq!(
-            found,
-            BTreeSet::from(["access".to_owned(), "remove".to_owned()])
+            names,
+            [
+                "access",
+                "alarm",
+                "alarm_timespec",
+                "mkdtemp",
+                "realpath", // confirmed by hand, not in the test sources
+                "remove",
+                "statvfs"
+            ]
         );
     }
 
     /// Strings, macros, constructors and methods are not plain calls.
     #[test]
     fn only_plain_functions_count_as_calls() {
-        assert!(calls_a_function("spawn(path)"));
-        assert!(calls_a_function("let x = helper(1);"));
-        assert!(!calls_a_function(
-            "trace_expr!(Sys::socket(d), \"socket({})\", d)"
-        ));
-        assert!(!calls_a_function(
-            "let (Some(a), None) = (b.get(), Out::new(c))"
-        ));
-        assert!(!calls_a_function("Err(Errno(EINVAL)).or_minus_one_errno()"));
-        assert!(!calls_a_function("if x { 1 } else { 2 }"));
+        let names = |body| plain_calls(body).into_iter().collect::<Vec<_>>();
+        assert_eq!(names("spawn(path)"), ["spawn"]);
+        assert_eq!(names("let x = helper(1); other(x)"), ["helper", "other"]);
+        assert!(names("trace_expr!(Sys::socket(d), \"socket({})\", d)").is_empty());
+        assert!(names("let (Some(a), None) = (b.get(), Out::new(c))").is_empty());
+        assert!(names("Err(Errno(EINVAL)).or_minus_one_errno()").is_empty());
+        assert!(names("if x { 1 } else { 2 }").is_empty());
     }
 
     #[test]
