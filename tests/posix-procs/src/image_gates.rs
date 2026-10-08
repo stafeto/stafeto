@@ -409,6 +409,12 @@ fn ambiguous_setid(fd: i32) -> Result<(), Status> {
     open.u64(job)?;
     loop {
         let reply = Files::send_on(&pending, open.as_bytes())?;
+        rt::println!(
+            "posix-files: ambiguous OpenExec len {} caps {} word0 {}",
+            reply.len,
+            reply.handles.len(),
+            reply.words[0]
+        );
         if reply.len != 8 || !reply.handles.is_empty() {
             return Err(Status::BadSize);
         }
@@ -421,6 +427,13 @@ fn ambiguous_setid(fd: i32) -> Result<(), Status> {
         break;
     }
     let live = trace(ticket)?;
+    rt::println!(
+        "posix-files: ambiguous live {:?}, expected pid {} image {} credentials {:?}",
+        live,
+        before.pid,
+        image,
+        before.credentials.words()
+    );
     if live[0] != before.pid
         || live[1] != image
         || live[3..12] != [1, 1, 0, 1, 1, 37, 43, 1, 1]
