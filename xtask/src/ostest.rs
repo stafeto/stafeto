@@ -217,7 +217,8 @@ const OPTION_MACROS: [(&str, &str); 4] = [
     ("XSI", "_XOPEN_UNIX"),
 ];
 
-/// Whether `header` (the text of unistd.h) defines `macro`.
+/// Whether `header` (the macros of unistd.h, one `#define NAME value` a
+/// line as the preprocessor lists them) defines `macro_name`.
 fn defines(header: &str, macro_name: &str) -> bool {
     header.lines().any(|line| {
         line.strip_prefix("#define ")
@@ -226,7 +227,7 @@ fn defines(header: &str, macro_name: &str) -> bool {
     })
 }
 
-/// Whether the system claims `option`, by the unistd.h in `header`.
+/// Whether the system claims `option`, by the macros of unistd.h in `header`.
 fn claims(header: &str, option: &str) -> bool {
     OPTION_MACROS
         .iter()
@@ -266,12 +267,45 @@ fn decide(
     })
 }
 
-/// The unistd.h relibc was built with.
-fn unistd_header() -> Result<String, String> {
+/// The macros unistd.h defines in the sysroot of relibc, with the ones it
+/// takes from the headers it includes, as `clang -dM -E` lists them
+/// (`#define NAME value` a line).
+fn unistd_macros() -> Result<String, String> {
     let sysroot = std::env::var_os("STAFETO_RELIBC_SYSROOT")
         .map_or_else(|| target_dir().join("relibc/sysroot"), PathBuf::from);
-    let path = sysroot.join("include/unistd.h");
-    std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
+    macros_of(&sysroot.join("include"))
+}
+
+/// The macros of `include`/unistd.h, by the preprocessor.
+fn macros_of(include: &Path) -> Result<String, String> {
+    let brew = Path::new("/opt/homebrew/opt/llvm/bin/clang");
+    let clang = if brew.exists() {
+        brew.to_path_buf()
+    } else {
+        PathBuf::from("clang")
+    };
+    let resource = command_stdout(Command::new(&clang).arg("-print-resource-dir"))?;
+    let resource_include = Path::new(resource.trim()).join("include");
+    command_stdout(
+        Command::new(&clang)
+            .args(["--target=aarch64-linux-gnu", "-nostdinc", "-isystem"])
+            .arg(include)
+            .arg("-isystem")
+            .arg(resource_include)
+            .args(["-include", "unistd.h", "-E", "-dM", "-x", "c", "/dev/null"]),
+    )
+}
+
+/// The standard output of `command`, or its failure.
+fn command_stdout(command: &mut Command) -> Result<String, String> {
+    let output = command.output().map_err(|e| format!("{command:?}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| e.to_string())
 }
 
 /// Whether the text of an outcome ends with the status of a test that died
@@ -583,7 +617,7 @@ fn judge(work: &Path, test: &Test, ended: Ended) -> Result<(Verdict, String), St
     };
     let verdict = decide(met, exited, &text, || {
         let source = source_of(work, test)?;
-        Ok(unclaimed_option(&source, &unistd_header()?).is_some())
+        Ok(unclaimed_option(&source, &unistd_macros()?).is_some())
     })?;
     Ok((verdict, text))
 }
@@ -1009,6 +1043,31 @@ mod tests {
             unclaimed_option("/*[XSI]*/\n", "#define _XOPEN_UNIX 1\n"),
             None
         );
+    }
+
+    /// The macros come from the preprocessor: one that unistd.h takes from
+    /// an included header or writes as `# define` still counts, a comment
+    /// or a longer name does not.
+    #[test]
+    fn macros_come_from_the_preprocessor() {
+        let dir = std::env::temp_dir().join(format!("stafeto-macros-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("unistd.h"),
+            "#include <more.h>\n# define _POSIX_SPAWN 202405L\n// #define _XOPEN_UNIX 1\n#define _XOPEN_UNIX_X 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("more.h"),
+            "#define _POSIX_THREAD_PROCESS_SHARED 202405L\n",
+        )
+        .unwrap();
+        let macros = macros_of(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(claims(&macros, "SPN"));
+        assert!(claims(&macros, "TSH"));
+        assert!(!claims(&macros, "XSI"));
+        assert!(!claims(&macros, "PS"));
     }
 
     /// A test that hangs, faults or is killed is a FAIL even for an option

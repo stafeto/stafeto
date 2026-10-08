@@ -499,8 +499,12 @@ static void clock_page(void) {
 
 /* _POSIX_THREAD_ATTR_STACKADDR: a thread started with pthread_attr_setstack
  * runs on that memory (the address of its local is inside it), and
- * pthread_attr_getstack gives the region back. */
-#define OWN_STACK 65536
+ * pthread_attr_getstack gives the region back; the bytes after the end of
+ * the given size stay as they were; a misaligned stack is refused. */
+/* A size that is no multiple of a page: a stack rounded up to a page would
+ * start the thread beyond the memory it was given. */
+#define OWN_STACK (65536 + 64)
+#define GUARD_BYTES 4096
 static char *own_stack;
 static int on_own_stack;
 
@@ -512,8 +516,9 @@ static void *report_stack(void *arg) {
 }
 
 static void stack_address(void) {
-    own_stack = malloc(OWN_STACK);
+    own_stack = malloc(OWN_STACK + GUARD_BYTES);
     CHECK(own_stack != NULL);
+    memset(own_stack + OWN_STACK, 0xA5, GUARD_BYTES);
     pthread_attr_t attr;
     CHECK(pthread_attr_init(&attr) == 0);
     CHECK(pthread_attr_setstack(&attr, own_stack, OWN_STACK) == 0);
@@ -525,6 +530,11 @@ static void stack_address(void) {
     CHECK(pthread_create(&thread, &attr, report_stack, NULL) == 0);
     CHECK(pthread_join(thread, NULL) == 0);
     CHECK(on_own_stack == 1);
+    for (int i = 0; i < GUARD_BYTES; i++)
+        CHECK((unsigned char)own_stack[OWN_STACK + i] == 0xA5);
+    /* A misaligned address or end is refused. */
+    CHECK(pthread_attr_setstack(&attr, own_stack + 8, OWN_STACK) == EINVAL);
+    CHECK(pthread_attr_setstack(&attr, own_stack, OWN_STACK + 8) == EINVAL);
     printf("relibc-threads: a thread ran on the stack given to pthread_attr_setstack\n");
 }
 

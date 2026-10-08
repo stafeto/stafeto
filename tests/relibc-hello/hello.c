@@ -196,7 +196,7 @@ static int constants(void) {
         const char *name;
         int key;
         long macro;
-        char kind; /* V: 202405L, P: positive, O: -1 or 202405L */
+        char kind; /* V and O: 202405L when claimed (O is optional, V mandatory); P: positive */
         int runtime;
         int defined;
     } options[] = {
@@ -420,7 +420,9 @@ static int constants(void) {
         }
         errno = 0;
         long got = sysconf(options[i].key);
-        if (options[i].defined ? got != macro : (options[i].runtime ? got == 0 : got != -1)) {
+        if (options[i].defined ? got != macro : (options[i].runtime
+                                  ? (options[i].kind == 'P' ? got <= 0 : got != 202405L)
+                                  : got != -1)) {
             printf("relibc-hello: sysconf(%s) is %ld, the header says %ld\n", options[i].name,
                    got, macro);
             return 22;
