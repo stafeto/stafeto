@@ -305,11 +305,20 @@ unsafe extern "C" fn maker(_: *mut c_void) -> *mut c_void {
     abi::relibc::probe_start_window(Some(window));
     let mut made = 0;
     // SAFETY: `quick` is a complete thread routine.
-    if unsafe { ffi::pthread_create(&mut made, ptr::null(), Some(quick), ptr::null_mut()) } != 0 {
+    if unsafe { ffi::pthread_create(&mut made, ptr::null(), Some(idler), ptr::null_mut()) } != 0 {
         end_child(14);
     }
     let sleeper = Sleeper::new();
     finish(&sleeper, now() + 500_000_000)
+}
+
+/// R7: the new thread stays, so that leaving does not route the page for it.
+unsafe extern "C" fn idler(_: *mut c_void) -> *mut c_void {
+    let limit = now() + 2_000_000_000;
+    while ARRIVED.load(Ordering::SeqCst) == 0 && now() < limit {
+        let _ = sys::yield_now();
+    }
+    ptr::null_mut()
 }
 
 unsafe extern "C" fn quick(_: *mut c_void) -> *mut c_void {
