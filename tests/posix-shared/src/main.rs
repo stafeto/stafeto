@@ -263,15 +263,7 @@ fn scenario(process: rt::abi::Handle) -> bool {
     {
         return fail(23);
     }
-    let mut expected = [0usize; 256];
-    for byte in b"stafeto ramfs\n" {
-        expected[*byte as usize] += 1;
-    }
-    if HISTOGRAM
-        .iter()
-        .zip(expected)
-        .any(|(count, expected)| count.load(Ordering::Acquire) != expected)
-    {
+    if histogram_mismatch() {
         return fail(26);
     }
     // The working directory the worker changed holds motd.
@@ -288,6 +280,19 @@ fn scenario(process: rt::abi::Handle) -> bool {
         return fail(25);
     }
     true
+}
+
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+#[inline(never)]
+fn histogram_mismatch() -> bool {
+    let mut expected = [0usize; 256];
+    for byte in b"stafeto ramfs\n" {
+        expected[*byte as usize] += 1;
+    }
+    HISTOGRAM
+        .iter()
+        .zip(expected)
+        .any(|(count, expected)| count.load(Ordering::Acquire) != expected)
 }
 
 /// The state of the hook of `outside_lock`: 1 armed, 2 a request waits in
