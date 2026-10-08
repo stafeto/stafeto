@@ -29,6 +29,7 @@ mod ring;
 mod rootfs;
 mod rtbench;
 mod rtbench2;
+mod stubs;
 mod symbolize;
 mod vz;
 

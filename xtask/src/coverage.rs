@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Symbol inventory for the POSIX.1-2024 System Interfaces volume.
+//! Symbol inventory for the POSIX.1-2024 System Interfaces volume. A
+//! function that exists in relibc but answers ENOSYS on stafeto (found by
+//! `stubs`, in relibc's sources) is a stub and does not count as covered.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::stubs;
 use crate::{PROGRAM_TARGET, cargo, llvm_tool, relibc, run_cmd, stdout_of, target_dir};
 
 const INVENTORY: &str = include_str!("../../tests/posix/2024-xsh.tsv");
@@ -207,7 +210,10 @@ fn header_macros(rows: &[Interface<'_>], include: &Path) -> Result<HeaderScan, S
     Ok(scan)
 }
 
-fn library_paths(args: &[String]) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+/// The libc archive, the startup archive, relibc's headers and its sources.
+type Paths = (PathBuf, PathBuf, PathBuf, PathBuf);
+
+fn library_paths(args: &[String]) -> Result<Paths, String> {
     match args {
         [] => {
             relibc()?;
@@ -225,6 +231,7 @@ fn library_paths(args: &[String]) -> Result<(PathBuf, PathBuf, PathBuf), String>
                     .join(PROGRAM_TARGET)
                     .join("release/libposix_crt.a"),
                 target_dir().join("relibc/sysroot/include"),
+                target_dir().join("relibc/source"),
             ))
         }
         [flag, libc, flag2, crt] if flag == "--libc" && flag2 == "--crt" => {
@@ -234,14 +241,20 @@ fn library_paths(args: &[String]) -> Result<(PathBuf, PathBuf, PathBuf), String>
                 .and_then(Path::parent)
                 .ok_or("libc.a needs a sysroot/lib parent")?
                 .join("include");
-            Ok((libc, crt.into(), include))
+            let source = include
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("libc.a needs a sysroot/lib parent")?
+                .join("source");
+            Ok((libc, crt.into(), include, source))
         }
         _ => Err("usage: cargo xtask coverage [--libc PATH --crt PATH]".to_owned()),
     }
 }
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
-    let (libc, crt, include) = library_paths(args)?;
+    let (libc, crt, include, source) = library_paths(args)?;
+    let stubs = stubs::stub_functions(&stubs::Sources::read(&source)?);
     let mut names = names_in(&libc)?;
     names.extend(names_in(&crt)?);
     let rows = interfaces(INVENTORY)?;
@@ -252,7 +265,9 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         "# POSIX.1-2024 XSH interface inventory\nname\tpage\trequirement\theaders\toption_codes\tavailability\n",
     );
     for row in &rows {
-        let availability = if names.contains(row.name) {
+        let availability = if names.contains(row.name) && stubs.contains(row.name) {
+            "stub-enosys"
+        } else if names.contains(row.name) {
             "exported-symbol"
         } else if row.headers.split(',').any(|header| {
             scan.definitions
@@ -301,7 +316,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", header_path.display()))?;
     for requirement in ["required", "option"] {
         println!(
-            "XSH {requirement}: {} exported symbols, {} header macros, {} unresolved",
+            "XSH {requirement}: {} exported symbols, {} header macros, {} ENOSYS stubs, {} unresolved",
             counts
                 .get(&(requirement, "exported-symbol"))
                 .copied()
@@ -311,9 +326,25 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 .copied()
                 .unwrap_or(0),
             counts
+                .get(&(requirement, "stub-enosys"))
+                .copied()
+                .unwrap_or(0),
+            counts
                 .get(&(requirement, "unresolved"))
                 .copied()
                 .unwrap_or(0)
+        );
+        let count = |availability| {
+            counts
+                .get(&(requirement, availability))
+                .copied()
+                .unwrap_or(0)
+        };
+        let covered = count("exported-symbol") + count("header-macro");
+        let total = covered + count("stub-enosys") + count("unresolved");
+        println!(
+            "XSH {requirement} coverage: {covered} of {total} ({:.1} %), stubs do not count",
+            100.0 * covered as f64 / total as f64
         );
     }
     println!("XSH interface inventory: {}", path.display());
