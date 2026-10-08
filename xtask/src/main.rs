@@ -3198,7 +3198,7 @@ const RAM_STEP_MAX: u64 = 20_538;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 14] = [
+const RAM_STEP_KINDS: [(usize, &str); 15] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
@@ -3211,6 +3211,7 @@ const RAM_STEP_KINDS: [(usize, &str); 14] = [
     (23, "ResolveCancel"),
     (24, "ResolveSecond"),
     (25, "FinishBinding"),
+    (34, "CloneExact"),
     (64, "notification"),
     (65, "maintenance"),
 ];
@@ -3403,11 +3404,11 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if !loader.iter().any(|(k, ..)| *k == 9) {
         return Err("no loader step of a copy: the forks did not run".into());
     }
-    // The Clone of a fork copies the descriptions of the whole table.
-    let clone = ram.iter().find(|(k, ..)| *k == 15).map_or(0, |r| r.1);
+    // A fork uses CloneExact to copy its retained descriptor list.
+    let clone = ram.iter().find(|(k, ..)| *k == 34).map_or(0, |r| r.1);
     if clone == 0 || clone > RAM_STEP_MAX {
         return Err(format!(
-            "the RAM file service: Clone took {clone} ticks, past {RAM_STEP_MAX}: {ram:?}"
+            "the RAM file service: CloneExact took {clone} ticks, past {RAM_STEP_MAX}: {ram:?}"
         ));
     }
     // Every step of the pipe service (5e) stays under term B: a copy of
