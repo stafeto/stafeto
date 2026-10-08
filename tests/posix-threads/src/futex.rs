@@ -232,30 +232,31 @@ pub(super) fn run() -> bool {
     });
     for place in 0..4 {
         let wake = futex_wake(&GATE, 1);
-        let received = if wake == 1 {
+        let (received, receive_error) = if wake == 1 {
             match waiter.receive_until(
                 &done_channel,
                 rt::time::ticks_to_ns(rt::time::now()) + 1_000_000_000,
             ) {
-                Ok(Waited::Got(_)) => 1u32,
-                Ok(Waited::Expired) => 2,
-                Err(_) => 3,
+                Ok(Waited::Got(_)) => (1u32, 0u64),
+                Ok(Waited::Expired) => (2, 0),
+                Err(error) => (3, error.code()),
             }
         } else {
-            0
+            (0, 0)
         };
         let next = NEXT.load(Ordering::SeqCst);
         if wake != 1 || received != 1 || next != place + 1 {
             let errors = ERRORS.load(Ordering::SeqCst);
             let waiters = posix_sync::bucket_waiters(&GATE);
             rt::println!(
-                "futex-probe: ordered place={} wake={} receive={} next={} errors={} waiters={}",
+                "futex-probe: ordered place={} wake={} receive={} next={} errors={} waiters={} receive_error={}",
                 place,
                 wake,
                 received,
                 next,
                 errors,
-                waiters
+                waiters,
+                receive_error
             );
             return failed(623);
         }
