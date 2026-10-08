@@ -6,7 +6,8 @@
 //! current attempt and the actual Memory objects before accepting custody.
 
 use crate::{Create, initial_map};
-use bootimg::exec_bindings::{InitialSource, NONE};
+pub use bootimg::exec_bindings::InitialSource;
+use bootimg::exec_bindings::NONE;
 use proto_wire::{Name, Reader, Status, Writer};
 
 pub const ADMISSION: usize = 56;
@@ -23,7 +24,7 @@ fn source_valid(source: InitialSource) -> bool {
             .is_none_or(|n| n < bootimg::rootfs::ENTRIES_MAX as u32)
 }
 
-pub(crate) fn write_source(source: InitialSource, w: &mut Writer) -> Result<(), Status> {
+pub fn write_source(source: InitialSource, w: &mut Writer) -> Result<(), Status> {
     if !source_valid(source) {
         return Err(Status::BadSize);
     }
@@ -33,7 +34,7 @@ pub(crate) fn write_source(source: InitialSource, w: &mut Writer) -> Result<(), 
     w.u32(0)
 }
 
-pub(crate) fn read_source(r: &mut Reader<'_>) -> Result<InitialSource, Status> {
+pub fn read_source(r: &mut Reader<'_>) -> Result<InitialSource, Status> {
     let (artifact, raw, canonical, zero) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
     let source = InitialSource {
         artifact,

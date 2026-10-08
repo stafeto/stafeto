@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Initial source keys and terminal acknowledgement envelopes.
+//! Initial source admission, snapshots and acknowledgement envelopes.
 //! Native admission authenticates the endpoint, source and current record.
 use proto_wire::{Reader, Status, Writer};
 
@@ -299,6 +299,64 @@ impl Bind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum BeginMode {
+    First = 0,
+    RestartCurrent = 1,
+}
+/// The caller validates the source binding and the genuine Process handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Begin {
+    pub key: Key,
+    pub mode: BeginMode,
+    pub source: proto_process::initial_publication::InitialSource,
+    pub name: proto_wire::Name,
+    pub receipt: Receipt,
+}
+impl Begin {
+    pub fn write(self, out: &mut Writer) -> Result<(), Status> {
+        if !self.receipt.matches(self.key) {
+            return Err(Status::BadSize);
+        }
+        self.key.write(out)?;
+        out.u32(self.mode as u32)?;
+        out.u32(0)?;
+        proto_process::initial_publication::write_source(self.source, out)?;
+        out.name(Some(self.name))?;
+        self.receipt.write(out)
+    }
+    pub fn read(bytes: &[u8], caps: usize) -> Result<Self, Status> {
+        if caps != 1 {
+            return Err(Status::BadSize);
+        }
+        let mut input = Reader::new(bytes);
+        let key = Key::from_reader(&mut input)?;
+        let mode = match input.u32()? {
+            0 => BeginMode::First,
+            1 => BeginMode::RestartCurrent,
+            _ => return Err(Status::BadSize),
+        };
+        if input.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let source = proto_process::initial_publication::read_source(&mut input)?;
+        let name = input.name()?.ok_or(Status::BadSize)?;
+        let receipt = Receipt::read(&mut input)?;
+        input.finish()?;
+        if !receipt.matches(key) {
+            return Err(Status::BadSize);
+        }
+        Ok(Self {
+            key,
+            mode,
+            source,
+            name,
+            receipt,
+        })
+    }
+}
+
 /// The caller authenticates the RAM endpoint and current boot order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Seal {
@@ -355,6 +413,76 @@ impl Seal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn begin_literal_canonical_source_name_receipt_and_one_owner() {
+        let mut body = [0; 104];
+        body[..24].copy_from_slice(&literal()[..24]);
+        body[24] = 1;
+        body[32] = 1;
+        body[36] = 2;
+        body[40..44].copy_from_slice(&[255; 4]);
+        body[48..52].copy_from_slice(b"init");
+        let expected = Begin {
+            key: key(),
+            mode: BeginMode::RestartCurrent,
+            source: proto_process::initial_publication::InitialSource {
+                artifact: 1,
+                raw: 2,
+                canonical: None,
+            },
+            name: proto_wire::Name::new(b"init").unwrap(),
+            receipt: Receipt::Native,
+        };
+        assert_eq!(Begin::read(&body, 1), Ok(expected));
+        let mut writer = Writer::new();
+        expected.write(&mut writer).unwrap();
+        assert_eq!(writer.as_bytes(), body);
+        for caps in [0, 2, 3, 4] {
+            assert_eq!(Begin::read(&body, caps), Err(Status::BadSize));
+        }
+        for length in 0..104 {
+            assert_eq!(Begin::read(&body[..length], 1), Err(Status::BadSize));
+        }
+        let mut extended = [0; 105];
+        extended[..104].copy_from_slice(&body);
+        assert_eq!(Begin::read(&extended, 1), Err(Status::BadSize));
+        for offset in [24, 28, 44, 53] {
+            let mut bad = body;
+            bad[offset] = 3;
+            assert_eq!(Begin::read(&bad, 1), Err(Status::BadSize));
+        }
+        let mut bad = body;
+        bad[36..40].copy_from_slice(&body[32..36]);
+        assert_eq!(Begin::read(&bad, 1), Err(Status::BadSize));
+        let mut bad = body;
+        bad[32..36].copy_from_slice(&[255; 4]);
+        assert_eq!(Begin::read(&bad, 1), Err(Status::BadSize));
+        let mut bad = body;
+        bad[48..64].fill(0);
+        assert_eq!(Begin::read(&bad, 1), Err(Status::BadSize));
+        body[24] = 0;
+        body[48..64].copy_from_slice(b"0123456789abcdef");
+        let first = Begin::read(&body, 1).unwrap();
+        assert_eq!(first.mode, BeginMode::First);
+        assert_eq!(first.name.as_bytes(), b"0123456789abcdef");
+        let receipt = [
+            1, 0, 0, 0, 0, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 7, 0, 3, 0, 0, 1, 0, 128, 7, 3, 0, 0,
+            1, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        body[8..16].copy_from_slice(&19u64.to_le_bytes());
+        body[16..24].copy_from_slice(&receipt[16..24]);
+        body[64..].copy_from_slice(&receipt);
+        let posix = Begin::read(&body, 1).unwrap();
+        assert!(matches!(posix.receipt, Receipt::Posix(_)));
+        let mut writer = Writer::new();
+        posix.write(&mut writer).unwrap();
+        assert_eq!(writer.as_bytes(), body);
+        for offset in [8, 16, 64, 72, 80, 88, 92, 96] {
+            let mut bad = body;
+            bad[offset] ^= 1;
+            assert_eq!(Begin::read(&bad, 1), Err(Status::BadSize));
+        }
+    }
     #[test]
     fn seal_literal_full_width_and_exact_reply() {
         let body = [
