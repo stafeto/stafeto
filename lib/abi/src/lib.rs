@@ -779,9 +779,11 @@ pub const INFO_LOG: u64 = 9;
 /// (spec 5.3, 11). WRONG_TYPE for a copy without a label, ACCESS_DENIED
 /// for a copy of another channel.
 pub const INFO_LABEL: u64 = 11;
-/// SELF_THREAD requires x0 zero and x2 exactly NONE or MANAGE, returning
-/// one owned handle to the calling thread in x1 with those rights. Its handle table insertion is paid
-/// by the caller's quota; errors leave no new handle or thread reference.
+/// SELF_THREAD requires x0 zero and x2 a subset of MANAGE | DUPLICATE |
+/// TRANSFER (the rights the creator of a thread gets from thread_create),
+/// returning one owned handle to the calling thread in x1 with those rights.
+/// Its handle table insertion is paid by the caller's quota; errors leave no
+/// new handle or thread reference.
 pub const INFO_THREAD_SELF: u64 = 12;
 /// THREAD_CURRENT takes a thread handle with any rights and x2 zero. It
 /// compares its kernel object with the caller and returns only bool 0 or 1.

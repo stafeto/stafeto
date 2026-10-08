@@ -273,7 +273,23 @@ pub fn object_info_self_thread_has_exact_ownership(_: &Boot) -> Result<(), &'sta
             "failed SELF left a charge or handle",
         )?;
         c.fails(n, &[1, abi::INFO_THREAD_SELF, 0], Error::InvalidArgs)?;
-        c.fails(n, &[0, abi::INFO_THREAD_SELF, 1], Error::InvalidArgs)?;
+        // Only MANAGE, DUPLICATE and TRANSFER may be asked for.
+        for extra in [Rights::SEND, Rights::RECEIVE, Rights::DEVICE, Rights::ALL] {
+            c.fails(
+                n,
+                &[0, abi::INFO_THREAD_SELF, u64::from(extra.0)],
+                Error::InvalidArgs,
+            )?;
+            c.fails(
+                n,
+                &[
+                    0,
+                    abi::INFO_THREAD_SELF,
+                    u64::from(extra.union(Rights::MANAGE).0),
+                ],
+                Error::InvalidArgs,
+            )?;
+        }
         with_quota_left(c, 0, || {
             c.fails(
                 n,
@@ -281,16 +297,25 @@ pub fn object_info_self_thread_has_exact_ownership(_: &Boot) -> Result<(), &'sta
                 Error::NoMemory,
             )
         })?;
-        for rights in [
-            Rights::DUPLICATE,
-            Rights::TRANSFER,
-            Rights::MANAGE.union(Rights::DUPLICATE),
-        ] {
-            c.fails(
-                n,
-                &[0, abi::INFO_THREAD_SELF, u64::from(rights.0)],
-                Error::InvalidArgs,
-            )?;
+        // Every subset of MANAGE | DUPLICATE | TRANSFER is granted exactly.
+        for bits in 0..8u32 {
+            let mut rights = Rights::NONE;
+            for (bit, right) in [Rights::MANAGE, Rights::DUPLICATE, Rights::TRANSFER]
+                .into_iter()
+                .enumerate()
+            {
+                if bits & (1 << bit) != 0 {
+                    rights = rights.union(right);
+                }
+            }
+            let granted = c.created(n, &[0, abi::INFO_THREAD_SELF, u64::from(rights.0)])?;
+            // SAFETY: the caller retains its process while this table is read.
+            let (_, held) = unsafe { c.process.as_ref() }
+                .lookup_with_rights(granted, Rights::NONE, Object::thread)
+                .map_err(|_| "subset SELF lookup failed")?;
+            check(held == rights, "SELF granted other rights than asked for")?;
+            c.succeeds(n, &[granted.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
+            c.close(granted)?;
         }
         let managed = c.created(n, &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)])?;
         // SAFETY: the caller retains its process while this table is read.

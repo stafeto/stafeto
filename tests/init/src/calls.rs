@@ -1512,7 +1512,15 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         ]
         .into_iter()
         .flat_map(|kind| {
-            let bad = if kind == stats { 2 } else { 1 };
+            // THREAD_SELF takes a subset of MANAGE | DUPLICATE | TRANSFER:
+            // SEND (4) is outside it.
+            let bad = if kind == stats {
+                2
+            } else if kind == abi::INFO_THREAD_SELF {
+                4
+            } else {
+                1
+            };
             [[own, kind, bad], [0, kind, bad]]
         }),
     )

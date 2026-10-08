@@ -14,6 +14,13 @@ use abi::{Error, KernelStats, ProcessHandles, ProcessMemory, Rights};
 use core::ptr::NonNull;
 use kcore::args::{inline_len_arg, reserved_arg};
 
+/// The rights SELF_THREAD may grant: those the creator of a thread gets
+/// from thread_create, so a thread gets nothing on itself that its creator
+/// did not have.
+const SELF_RIGHTS: Rights = Rights::MANAGE
+    .union(Rights::DUPLICATE)
+    .union(Rights::TRANSFER);
+
 /// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2
 /// first (INVALID_ARGS), then the handle. For a process handle with any
 /// rights: PROCESS_STATE returns abi::ProcessState::to_words in x1-x4,
@@ -28,9 +35,11 @@ use kcore::args::{inline_len_arg, reserved_arg};
 /// channel and in x2 a handle of that channel with RECEIVE, and returns the
 /// copy's label in x1, O(1): ACCESS_DENIED for a copy of another channel,
 /// WRONG_TYPE for a channel handle without a label (the lookup of x2 comes
-/// first). SELF_THREAD requires x0 zero and x2 exactly NONE or MANAGE,
-/// returning a new owned handle of those rights to the actual caller. Its handle-table insertion is paid by that
-/// process; failure retains no new reference. THREAD_CURRENT requires x2
+/// first). SELF_THREAD requires x0 zero and x2 a subset of MANAGE | DUPLICATE |
+/// TRANSFER, the rights the creator of a thread gets from thread_create,
+/// returning a new owned handle of those rights to the actual caller. Its
+/// handle-table insertion is paid by that process; failure retains no new
+/// reference. THREAD_CURRENT requires x2
 /// zero and compares the supplied Thread object with the caller, returning
 /// only bool 0/1. Both preserve registers outside their one-word result.
 /// LOG takes the system resource with
@@ -47,7 +56,7 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
     }
     if a[1] == abi::INFO_THREAD_SELF {
         reserved_arg(a[0])?;
-        if a[2] != u64::from(Rights::NONE.0) && a[2] != u64::from(Rights::MANAGE.0) {
+        if a[2] & !u64::from(SELF_RIGHTS.0) != 0 {
             return Err(Error::InvalidArgs);
         }
     }
@@ -102,11 +111,8 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
             let handle = process::insert_handle(
                 process,
                 Object::Thread(thread),
-                if a[2] == 0 {
-                    Rights::NONE
-                } else {
-                    Rights::MANAGE
-                },
+                // Checked above: a subset of SELF_RIGHTS, so within u32.
+                Rights(a[2] as u32),
             )?;
             Ok(Values::new(&[handle.0]))
         }
