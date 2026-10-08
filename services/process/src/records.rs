@@ -187,6 +187,35 @@ impl<P, C> Record<P, C> {
         self.image_origin = epoch;
         true
     }
+    pub fn matches_initial_ack(
+        &self,
+        initial_ticket: u64,
+        ack: proto_process::initial_ack::Ack,
+    ) -> bool {
+        self.initial_epoch(initial_ticket) == Some(ack.epoch)
+            && initial_ticket == ack.ticket
+            && ack.label == self.label.raw_at(self.image)
+            && ack.receipt
+                == proto_process::initial_map::Receipt {
+                    key: proto_process::initial_map::Key {
+                        key: initial_ticket,
+                        image: self.image,
+                    },
+                    label: self.label.raw_at(self.image),
+                    pid: self.label.pid(),
+                    init_ticket: initial_ticket,
+                }
+    }
+    pub fn initial_ack_replay_matches(
+        &self,
+        initial_ticket: u64,
+        ack: proto_process::initial_ack::Ack,
+    ) -> bool {
+        self.matches_initial_ack(initial_ticket, ack)
+            && self
+                .initial_origin(initial_ticket)
+                .is_some_and(|origin| origin.flags & crate::initial_origin::INIT_ACKED != 0)
+    }
     pub fn set_loader_ticket(&mut self, ticket: u64) {
         self.source_origin.clear_initial_flags();
         self.image_origin = ticket;
@@ -1515,6 +1544,58 @@ pub struct ExitPlace {
 mod tests {
     use super::*;
 
+    #[test]
+    fn acknowledged_initial_replay_requires_every_current_key_and_receipt_field() {
+        use crate::initial_origin::{INIT_ACKED, InitialOrigin, SourceOrigin};
+        let mut table = Records::<u32>::new();
+        let label = add(&mut table).unwrap();
+        let record = table.get_mut(at(label)).unwrap();
+        let ticket = 83;
+        let epoch = 0x1234_5678_8765_4321;
+        record.source_origin = SourceOrigin::boot(4, false).unwrap();
+        assert!(record.set_initial_epoch(ticket, epoch));
+        let ack = proto_process::initial_ack::Ack {
+            epoch,
+            ticket,
+            label: label.raw_at(record.image),
+            receipt: proto_process::initial_map::Receipt {
+                key: proto_process::initial_map::Key {
+                    key: ticket,
+                    image: record.image,
+                },
+                label: label.raw_at(record.image),
+                pid: label.pid(),
+                init_ticket: ticket,
+            },
+        };
+        assert!(record.matches_initial_ack(ticket, ack));
+        assert!(!record.initial_ack_replay_matches(ticket, ack));
+        assert!(record.set_initial_origin(ticket, InitialOrigin::new(4, INIT_ACKED).unwrap()));
+        assert!(record.initial_ack_replay_matches(ticket, ack));
+        assert!(record.initial_ack_replay_matches(ticket, ack));
+        for field in 0..8 {
+            let mut other = ack;
+            match field {
+                0 => other.epoch ^= 1 << 48,
+                1 => other.ticket ^= 1,
+                2 => other.label ^= 1,
+                3 => other.receipt.key.key ^= 1,
+                4 => other.receipt.key.image += 1,
+                5 => other.receipt.label ^= 1,
+                6 => other.receipt.pid ^= 1,
+                _ => other.receipt.init_ticket ^= 1,
+            }
+            assert!(
+                !record.initial_ack_replay_matches(ticket, other),
+                "field {field}"
+            );
+        }
+        assert!(!record.initial_ack_replay_matches(ticket + 1, ack));
+        record.state = State::Zombie(End::Exited(0));
+        assert!(record.initial_ack_replay_matches(ticket, ack));
+        record.image += 1;
+        assert!(!record.initial_ack_replay_matches(ticket, ack));
+    }
     #[test]
     fn persistent_initial_epoch_keeps_high_bits_and_requires_boot_discriminator() {
         use crate::initial_origin::{INIT_ACKED, InitialOrigin, SourceOrigin};

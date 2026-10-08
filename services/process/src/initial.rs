@@ -10,6 +10,48 @@ use rt::handle::Channel;
 use rt::service::{Answer, Request};
 
 impl Processes {
+    pub(super) fn initial_ack(&mut self, request: &mut Request<'_>) -> Answer {
+        let Ok(ack) = proto_process::initial_ack::Ack::read(
+            &request.bytes()[proto_wire::HEADER_LEN..],
+            request.handles.len(),
+        ) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let Some(index) = self.records.find_pid(ack.receipt.pid) else {
+            return crate::refuse(proto_process::UNREGISTERED);
+        };
+        let ticket = self.tickets[index];
+        let record = self.records.get(index).expect("the current initial record");
+        if !record.matches_initial_ack(ticket, ack) {
+            return crate::refuse(proto_process::PERMISSION);
+        }
+        let key = posix_process_service::initial_resident::SeedKey {
+            epoch: ack.epoch,
+            ticket: ack.ticket,
+            label: ack.label,
+        };
+        if record.initial_ack_replay_matches(ticket, ack) {
+            return Answer::Status(Status::Ok);
+        }
+        let Some(resident) = self.replacing[index].as_mut().and_then(Work::initial_mut) else {
+            return crate::refuse(proto_process::PERMISSION);
+        };
+        if !resident.init_ack(key, ack.receipt) {
+            return crate::refuse(proto_process::PERMISSION);
+        }
+        let record = self
+            .records
+            .get_mut(index)
+            .expect("the acknowledged initial record");
+        let mut origin = record
+            .initial_origin(ticket)
+            .expect("the checked initial source");
+        origin.flags |= posix_process_service::initial_origin::INIT_ACKED;
+        assert!(record.set_initial_origin(ticket, origin));
+        self.kick();
+        Answer::Status(Status::Ok)
+    }
+
     pub(super) fn initial_stage(&mut self, request: &mut Request<'_>) -> Answer {
         let reconciliation = request.handles.is_empty();
         let decode = if reconciliation {
@@ -219,6 +261,23 @@ impl Processes {
         let Some(resident) = self.replacing[index].as_mut().and_then(Work::initial_mut) else {
             return;
         };
+        let ticket = self.tickets[index];
+        let releasable = self
+            .records
+            .get(index)
+            .is_some_and(|record| resident.releasable_for(record, ticket));
+        if releasable {
+            self.replacing[index] = None;
+            self.preparing_count -= 1;
+            if self
+                .records
+                .get(index)
+                .is_some_and(|record| record.state.end_pending())
+            {
+                self.start_ending(index, None);
+            }
+            return;
+        }
         if let Some(reason) = resident.end_reason() {
             // Exact native Exit has released the target's mappings. The shared
             // service PageGroup remains resident for all four record slots.

@@ -197,6 +197,7 @@ use proto_wire::{Header, Reader, Status, Writer};
 pub const VERSION: u16 = 12;
 
 mod executable;
+pub mod initial_ack;
 pub mod initial_identity;
 pub mod initial_stage;
 mod limits;
@@ -487,6 +488,8 @@ pub enum Method {
     StageInitial = 60,
     /// Authenticate the retained initial receipt with its actual identity Channel.
     InitialOf = 61,
+    /// Confirm the exact initial lifecycle key and receipt from Init.
+    InitialAck = 73,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -499,7 +502,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
     31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
-    59, 60, 61,
+    59, 60, 61, 73,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1392,6 +1395,7 @@ mod tests {
             Method::InitialMaps,
             Method::StageInitial,
             Method::InitialOf,
+            Method::InitialAck,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {

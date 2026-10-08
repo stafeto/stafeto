@@ -510,6 +510,22 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         }
     }
 
+    pub fn releasable_for<P, A>(
+        &self,
+        record: &crate::records::Record<P, A>,
+        initial_ticket: u64,
+    ) -> bool {
+        let ack = proto_process::initial_ack::Ack {
+            epoch: self.key.epoch,
+            ticket: self.key.ticket,
+            label: self.key.label,
+            receipt: self.publication.map.receipt,
+        };
+        self.releasable()
+            && record.initial_ack_replay_matches(initial_ticket, ack)
+            && (self.end_reason().is_none()
+                || (self.native_end_confirmed() && record.active_exec.is_none()))
+    }
     pub fn releasable(&self) -> bool {
         self.flags & INIT_ACK != 0
             && (self.flags & ENDED != 0 || self.flags & (USER | CRT_REPLIED) == USER | CRT_REPLIED)
@@ -596,6 +612,56 @@ mod tests {
             None,
             None,
         ]
+    }
+    #[test]
+    fn terminal_release_keeps_all_owners_until_native_end_and_exact_ack() {
+        use crate::initial_origin::{INIT_ACKED, InitialOrigin, SourceOrigin};
+        let (mut resident, publication, log) = fixture();
+        let mut table = crate::records::Records::<u32, u32>::with_exec_custody();
+        let label = table.next_label().unwrap();
+        assert_eq!(label.raw_at(1), resident.key.label);
+        table.insert(
+            label,
+            0,
+            None,
+            proto_process::Credentials::ROOT,
+            31,
+            crate::records::Join::Inherit,
+        );
+        let record = table.get_mut(usize::from(label.index)).unwrap();
+        let ticket = resident.key.ticket;
+        record.source_origin = SourceOrigin::boot(2, false).unwrap();
+        assert!(record.set_initial_epoch(ticket, resident.key.epoch));
+        assert!(resident.ended(resident.key, 9));
+        assert!(resident.init_ack(resident.key, publication.map.receipt));
+        assert!(!resident.releasable_for(record, ticket));
+        assert!(record.set_initial_origin(ticket, InitialOrigin::new(2, INIT_ACKED).unwrap()));
+        assert!(!resident.releasable_for(record, ticket));
+        assert!(resident.native_exited(resident.key, 9));
+        record.active_exec = Some(73);
+        assert!(!resident.releasable_for(record, ticket));
+        record.active_exec = None;
+        assert!(resident.releasable_for(record, ticket));
+        resident.operation_pending = Some(Cap(7, log.clone()));
+        resident.settle_operation(true);
+        assert!(!resident.releasable_for(record, ticket));
+        resident.settle_operation(false);
+        resident.cleanup[0] = Some(CleanupOwner::Channel(Cap(8, log.clone())));
+        assert!(!resident.releasable_for(record, ticket));
+        drop(resident.cleanup[0].take());
+        resident.retained_thread = Some(Cap(9, log.clone()));
+        let thread = resident.cleanup_thread().unwrap();
+        assert!(resident.retained_thread.replace(thread).is_none());
+        assert!(!resident.releasable_for(record, ticket));
+        drop(resident.cleanup_thread());
+        assert!(resident.releasable_for(record, ticket));
+        assert!(!resident.releasable_for(record, ticket - 1));
+        resident.key.epoch ^= 1 << 48;
+        assert!(!resident.releasable_for(record, ticket));
+        resident.key.epoch ^= 1 << 48;
+        record.image += 1;
+        assert!(!resident.releasable_for(record, ticket));
+        assert_eq!(*log.borrow(), [7, 8, 9]);
     }
     #[test]
     fn settled_replay_preserves_complete_stage_and_verified_original_custody() {
