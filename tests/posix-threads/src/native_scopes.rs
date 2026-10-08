@@ -111,6 +111,7 @@ fn await_return(channel: &Handle<Channel>, round: usize) -> bool {
     true
 }
 
+#[inline(never)]
 pub(super) fn run() -> bool {
     let main = unsafe { threads::probe_native(ffi::pthread_self()) }.expect("main identity");
     let original = sys::thread_info(&main).expect("main priority").base;
