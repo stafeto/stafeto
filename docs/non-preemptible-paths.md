@@ -473,7 +473,8 @@ surrounding exit-loop poll and decision setup are excluded. The first
 stop has no queued continuation. A separate stop cancels the remaining
 queued portion and releases its process reference.
 
-The continuation stays below B=20,538. The previous B=20,536 grew by two
+The continuation stays below B=20,538 (the member before E1-G1; the bound
+now is `KERNEL_B_MAX` 18,000). The previous B=20,536 grew by two
 instructions in the Handles chunk when the process-cleanup dispatch
 acquired its continuation case. The process shell is 1264 bytes and keeps
 three slots per pool page. The normal build reports null=262, clock=315,
@@ -676,8 +677,12 @@ table of live clones (`proto_wire::clones`, 320 places), as Clone of the
 clock and pipe services does: its longest step under -icount, with the
 table full (`cargo xtask entropy`, role `x` of tests/entropy), is 14,398
 ticks of term B 20,536. SEED is 5,623 ticks; its own step with 64 seeds
-waiting for the first bytes, 8 told a step, is 10,684. Making the walks of
-the clone tables O(1) in the three services is a task of its own.
+waiting for the first bytes, 8 told a step, is 10,684. (Dated before part V
+of E1; those numbers are history.) E1 now: the walks of the clone tables are
+O(1) in the three services (part V), CLONE with the table full is 5,648
+under -icount in `cargo xtask entropy` (bound `CLONE_FULL_MAX` 6,500), and
+the command compares the own part of each step with `TERM_B` 20,410 and
+checks the waits (see "Own part and wait of a step").
 
 ### The pipe service
 
@@ -709,7 +714,11 @@ spread of the volleys of the crowd (they interleave with the step in
 progress), and `process-steps` fails when any of them passes 20,536. Clone has the least
 margin: 17,382 ticks with 248 children, 85 % of B, since it goes through
 the 320 places of the births and of the clones; it is the first to split
-when the tables grow (with the steps of the process service, 5h). The
+when the tables grow (with the steps of the process service, 5h).
+E1 now: after part V the walk is gone (Clone is 5,967 with 128 and with 248
+children), and `process-steps` compares the own part of each step with
+`TERM_B` 20,410 and checks the waits (see "Own part and wait of a step");
+the numbers above are history. The
 heartbeat is the loop's wait for init's reply, in which processes of higher
 levels run (the volley of 248 children); that wait is counted apart (see
 "Own part and wait of a step"), the check bounds it at 500,000 ticks, and
@@ -738,7 +747,9 @@ SetPgrp, GetPgrp, GetSid and Controlling while all sixteen clients remain
 alive. Pipe gates keep at most eight waiting readers per pipe. The
 maxima persist across both phases. The C probe uses `-fno-builtin`.
 
-On integrated wiring `11275b9`, all complete intervals remain below B=20,538:
+On integrated wiring `11275b9`, all complete intervals remain below B=20,538 (the bound of that day; E1
+compares the own part with `TERM_B` 20,410, see "Own part and wait of a
+step"):
 
 | Terminal method | Full interval under -icount |
 |---|---:|
@@ -760,7 +771,8 @@ It checks the limit, releases one place, then performs a real fork and
 checks all 32 descriptors in the grandchild. After retirement completes,
 it snapshots Clone (7) and the service's own step (65) before printing.
 The measured interval includes receive return, dispatch, identity checks
-and reply, with B fixed at 20,538 and no overhead subtracted.
+and reply, with B fixed at 20,538 and no overhead subtracted (E1: both commands now
+subtract the wait and compare the own part with 20,410).
 
 On the implementation accepted at `76fa4b2`, Clone takes at most 17,670
 and the own step 7,138 ticks. Exact ID selection checks the complete

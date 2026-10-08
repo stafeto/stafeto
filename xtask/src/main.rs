@@ -2678,7 +2678,7 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// The most a step of the terminal service's Watch takes with 32 elements.
+/// The most a step of the terminal service's Watch takes with 16 elements.
 const WATCH_FULL_MAX: u64 = 18_000;
 
 fn check_watch_steps(lines: &[String]) -> Result<(), String> {
@@ -3219,7 +3219,9 @@ const VOUCH_TICKS_MAX: u64 = 8_000;
 /// line of `kernel_tests` (icount build) at 637d3a6, which lowered it from
 /// 20 538; the kernel has run under KERNEL_B_MAX since the stage Handles
 /// went by half chunks, so the room between them belongs to the services.
-/// The kernel's own checks and tests/posix-tty only print their numbers.
+/// The budget of the services' steps. `kernel_tests` fails above
+/// `KERNEL_B_MAX`; only the tests inside the kernel and tests/posix-tty
+/// print their numbers.
 const TERM_B: u64 = 20_410;
 
 /// The bound on the kernel itself: the longest row of the `B on` line of
@@ -3311,7 +3313,7 @@ const WAIT_MAX: u64 = 500_000;
 /// no heartbeat, in ticks under -icount: one round trip (C_ipc about
 /// 2,000), the longest step of the process service that may be running
 /// (SpawnStart, 94,056 with its margin), and the step of the request
-/// itself (term B), with room. Seen at most 15,038 (ramfs FinishBinding
+/// itself (term B), with room. Seen at most 9,946 (ramfs FinishBinding
 /// with 248 children).
 const CALL_WAIT_MAX: u64 = 120_000;
 
@@ -3628,11 +3630,12 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if let Some(row) = entropy.iter().find(|r| r.1 > RAM_STEP_MAX) {
         return Err(format!("the entropy service: a step past term B: {row:?}"));
     }
-    // The waits of all services stay under WAIT_MAX, so that a growth of
-    // a wait shows. The wait of FinishBinding (ramfs asks the process
-    // service) and of the heartbeat of the pipe service must have been
-    // counted: without them the accounting of waits is lost and the own
-    // parts above would hold the waits again.
+    // The waits of all services stay under CALL_WAIT_MAX (the heartbeat's
+    // under WAIT_MAX), so that a growth of a wait shows. The wait of
+    // FinishBinding (ramfs asks the process service) and of the heartbeat
+    // of the pipe service must have been counted: without them the
+    // accounting of waits is lost and the own parts above would hold the
+    // waits again.
     check_waits(
         &outcome.lines,
         &["1", "2", "4", "10", "11"],
