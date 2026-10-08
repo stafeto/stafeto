@@ -329,7 +329,7 @@ impl Endpoints {
         d.endpoint.flags = (d.endpoint.flags & !NONBLOCK) | (flags & NONBLOCK);
         Ok(())
     }
-    fn retain(&mut self, id: u32, real: bool) -> Result<(), Failure> {
+    fn retain(&mut self, id: u32, real: bool, by: u32) -> Result<(), Failure> {
         let index = self.locate(id)?;
         let d = self.descriptions[index];
         let i = &self.instances[d.endpoint.terminal];
@@ -341,11 +341,11 @@ impl Endpoints {
         } else {
             i.pins
         };
-        let references = d.references.checked_add(1).ok_or(Failure::Overflow)?;
-        let count = count.checked_add(1).ok_or(Failure::Overflow)?;
+        let references = d.references.checked_add(by).ok_or(Failure::Overflow)?;
+        let count = count.checked_add(by).ok_or(Failure::Overflow)?;
         let pins = d
             .pins
-            .checked_add(u32::from(!real))
+            .checked_add(if real { 0 } else { by })
             .ok_or(Failure::Overflow)?;
         self.descriptions[index].references = references;
         self.descriptions[index].pins = pins;
@@ -386,8 +386,13 @@ impl Endpoints {
         Ok(parent.clone())
     }
     pub fn pin(&mut self, holds: &Holds, id: u32) -> Result<(), Failure> {
+        self.pin_by(holds, id, 1)
+    }
+    /// `by` pins of one description in one step: the same as `by` calls of
+    /// `pin`, for the elements of a Watch that name it.
+    pub fn pin_by(&mut self, holds: &Holds, id: u32, by: u32) -> Result<(), Failure> {
         self.resolve(holds, id)?;
-        self.retain(id, false)
+        self.retain(id, false, by)
     }
     fn release(&mut self, id: u32, real: bool) -> Result<Option<Disconnect>, Failure> {
         let index = self.locate(id)?;
@@ -511,6 +516,24 @@ mod tests {
         assert_ne!(fresh, master);
         assert!(table.resolve(&parent, fresh).unwrap().generation > effect.generation);
         assert_eq!(table.pinned(master), Err(Failure::BadDescription));
+    }
+
+    /// The pins of the elements of a Watch that name one description are
+    /// made in one step, and end one by one as the cleanup ends them.
+    #[test]
+    fn pins_made_together_end_one_by_one() {
+        let mut table = Endpoints::new();
+        let mut parent = Holds::new();
+        let master = table.open_master(&mut parent, 2).unwrap();
+        table.pin_by(&parent, master, 3).unwrap();
+        assert!(table.close(&mut parent, master).is_ok());
+        for _ in 0..2 {
+            assert!(table.unpin(master).is_ok());
+            assert!(table.pinned(master).is_ok());
+        }
+        assert!(table.unpin(master).is_ok());
+        assert!(table.pinned(master).is_err());
+        assert_eq!(table.unpin(master), Err(Failure::BadDescription));
     }
 
     #[test]

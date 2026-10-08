@@ -2678,6 +2678,9 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The most a step of the terminal service's Watch takes with 32 elements.
+const WATCH_FULL_MAX: u64 = 18_000;
+
 fn check_watch_steps(lines: &[String]) -> Result<(), String> {
     for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
         check_waits(lines, &[tag], "watch steps")?;
@@ -2709,6 +2712,18 @@ fn check_watch_steps(lines: &[String]) -> Result<(), String> {
                     "watch method {method} has no full 32-element measurement: {steps:?}"
                 ));
             }
+        }
+        // The terminal service's Watch of 32 elements keeps a margin under
+        // term B: it met each description once, and a walk of the 32
+        // elements for each would take 20 593 of the 20 410.
+        if tag == "5"
+            && let Some(&(kind, ticks, _)) = full
+                .iter()
+                .find(|&&(kind, ticks, _)| methods.contains(&kind) && ticks > WATCH_FULL_MAX)
+        {
+            return Err(format!(
+                "terminal service: a Watch of 32 elements, kind {kind}, took {ticks}, past {WATCH_FULL_MAX}"
+            ));
         }
         if ![64, 65].iter().all(|wanted| {
             steps

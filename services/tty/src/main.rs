@@ -1759,16 +1759,41 @@ impl Tty {
             Ok(set) if r.handles.is_empty() => set,
             _ => return Answer::Status(Status::BadSize),
         };
+        // The elements that name one description are met once: its
+        // endpoint is resolved and its readiness read once for all of
+        // them, and the pins they take are made in one step. Only the
+        // elements are compared, a walk of at most `watch::MAX` squared.
         let mut terminals = [false; TERMINALS];
-        for item in set.unique() {
+        let mut ready = watch::Ready {
+            len: set.len,
+            events: [0; watch::MAX],
+        };
+        let mut distinct = [(0u32, 0u32); watch::MAX];
+        let mut distinct_len = 0;
+        for (i, item) in set.items[..set.len].iter().enumerate() {
+            if set.items[..i]
+                .iter()
+                .any(|before| before.description == item.description)
+            {
+                continue;
+            }
             let endpoint = match self.select_description(s, item.description) {
                 Ok(e) => e,
                 Err(code) => return status(code),
             };
             terminals[endpoint.terminal] = true;
+            let state = self.readiness(item.description);
+            let mut named = 0;
+            for (j, other) in set.items[i..set.len].iter().enumerate() {
+                if other.description == item.description {
+                    ready.events[i + j] = state & (other.events | watch::ALWAYS);
+                    named += 1;
+                }
+            }
+            distinct[distinct_len] = (item.description, named);
+            distinct_len += 1;
         }
         rt::service::step_detail(set.len as u64);
-        let ready = set.ready(|id| self.readiness(id));
         if ready.any() {
             return Self::watch_ready(r, ready);
         }
@@ -1799,15 +1824,17 @@ impl Tty {
             self.ops.finish(&mut s.data.long, label, key);
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
-        for (index, item) in set.items[..set.len].iter().enumerate() {
-            if item.description != CONSOLE
-                && let Err(error) = self
-                    .endpoints
-                    .pin(&self.holdsets[s.data.holding].holds, item.description)
+        for (index, &(description, named)) in distinct[..distinct_len].iter().enumerate() {
+            if description != CONSOLE
+                && let Err(error) =
+                    self.endpoints
+                        .pin_by(&self.holdsets[s.data.holding].holds, description, named)
             {
-                for previous in &set.items[..index] {
-                    if previous.description != CONSOLE {
-                        let _ = self.endpoints.unpin(previous.description);
+                for &(previous, named) in &distinct[..index] {
+                    if previous != CONSOLE {
+                        for _ in 0..named {
+                            let _ = self.endpoints.unpin(previous);
+                        }
                     }
                 }
                 self.watches.remove(label, key);
