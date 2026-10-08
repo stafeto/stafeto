@@ -67,10 +67,32 @@ impl Attempt {
     fn abort(&mut self) -> Result<(), Status> {
         if let Some(pid) = self.child {
             // Kill remains valid after Commit; SpawnAbort covers an unfinished load.
-            let _ = process_method(proto_process::Method::SpawnAbort, Some(pid));
-            posix_abi::process::kill(pid as i32, proto_process::SIGKILL as i32)
-                .map_err(|_| Status::BadSize)?;
-            let waited = posix_abi::process::waitpid(pid as i32, 0).map_err(|_| Status::BadSize)?;
+            let aborted = process_method(proto_process::Method::SpawnAbort, Some(pid));
+            rt::println!(
+                "posix-files: image abort SpawnAbort pid {} status {}",
+                pid,
+                aborted.map_or_else(|error| error.code(), |()| 0)
+            );
+            posix_abi::process::kill(pid as i32, proto_process::SIGKILL as i32).map_err(
+                |errno| {
+                    rt::println!("posix-files: image abort Kill pid {} errno {}", pid, errno);
+                    Status::BadSize
+                },
+            )?;
+            rt::println!("posix-files: image abort Kill pid {} ok", pid);
+            let waited = posix_abi::process::waitpid(pid as i32, 0).map_err(|errno| {
+                rt::println!(
+                    "posix-files: image abort WaitPid pid {} errno {}",
+                    pid,
+                    errno
+                );
+                Status::BadSize
+            })?;
+            rt::println!(
+                "posix-files: image abort WaitPid expected {} observed {}",
+                pid,
+                waited.pid
+            );
             if waited.pid != pid as i32 {
                 return Err(Status::BadSize);
             }
@@ -299,6 +321,7 @@ fn take(fd: i32) -> Result<(), Status> {
         super::image_hold::elf(held)?;
     }
     attempt.abort()?;
+    rt::println!("posix-files: image Take abort settled, checking released counts");
     super::image_hold::released(&images)?;
     rt::println!(
         "posix-files: actual Take retains exact Handoff reads and child death releases pins ok"
