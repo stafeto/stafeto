@@ -56,6 +56,8 @@ mod long;
 #[cfg(not(feature = "cancel-input"))]
 mod mutex;
 #[cfg(not(feature = "cancel-input"))]
+mod native_jump;
+#[cfg(not(feature = "cancel-input"))]
 mod native_mode;
 #[cfg(not(feature = "cancel-input"))]
 mod native_scopes;
@@ -505,6 +507,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !signal_preparation::run()
         || !signals::run()
         || !signal_context::run()
+        || !native_jump::run()
         || !signal_wait::run()
         || !cancellation::run()
     {
