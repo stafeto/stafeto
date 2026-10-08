@@ -2158,6 +2158,7 @@ fn posix_tty_control_steps() -> Result<(), String> {
             "quiet terminal controls failed; see target/measure/posix-tty-control-steps.log".into(),
         );
     }
+    check_waits(&outcome.lines, &["5"], "terminal control steps")?;
     let maxima = longest_steps(&outcome.lines, "5");
     for kind in 16..=20 {
         let ticks = maxima
@@ -2269,6 +2270,7 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
                 longest_steps(&output.lines, tag)
             );
         }
+        check_waits(&output.lines, &["1", "5"], "POSIX terminal steps")?;
         let tty = longest_steps(&output.lines, "5");
         for kind in 16..=20 {
             let ticks = tty.iter().find(|row| row.0 == kind).map_or(0, |row| row.1);
@@ -2654,6 +2656,7 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
     qemu::expect_marker(&output, "posix-pty: ok")?;
     qemu::expect_stopped_on(&output, "init: posix-pty ended: exit code 0, not restarted")?;
     if steps {
+        check_waits(&output.lines, &["5"], "terminal Clone steps")?;
         let measured = longest_steps(&output.lines, "5");
         for kind in [7, 65] {
             let ticks = measured
@@ -2672,6 +2675,7 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
 
 fn check_watch_steps(lines: &[String]) -> Result<(), String> {
     for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
+        check_waits(lines, &[tag], "watch steps")?;
         let steps = longest_steps(lines, tag);
         for &(kind, ticks, _) in &steps {
             if ticks == 0 || ticks > RAM_STEP_MAX {
@@ -2787,6 +2791,7 @@ fn ramfs_gc_probe() -> Result<(), String> {
         &output,
         "ramfs-gc: binding and page reclamation both progress ok",
     )?;
+    check_waits(&output.lines, &["2"], "RAM file service steps")?;
     let steps = longest_steps(&output.lines, "2");
     for kind in [22, 63, 65] {
         if !steps
@@ -2849,6 +2854,7 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
         },
     )?;
     if measured {
+        check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
         let required: &[usize] = if normal {
             &[14, 20, 21, 22, 65]
@@ -2894,6 +2900,7 @@ fn loader_info_probe() -> Result<(), String> {
         &output,
         "posix-files: strict image metadata and incoming handle cleanup ok",
     )?;
+    check_waits(&output.lines, &["2"], "RAM file service steps")?;
     let steps = longest_steps(&output.lines, "2");
     if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
         return Err(format!(
@@ -2939,6 +2946,7 @@ fn loader_abort_probe(measured: bool) -> Result<(), String> {
                 ),
             )?;
         }
+        check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
         for kind in [19, 21, 22, 23, 63, 65] {
             if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
@@ -3029,6 +3037,7 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     qemu::expect_stopped_on(&output, ended)?;
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
     if measured {
+        check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
         let required: &[usize] = if data {
             &[15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 65]
@@ -3168,8 +3177,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
 /// under -icount. Seen with 128 and 248 children: Vouch 4,849 to 5,636,
 /// RetainedLoader 4,798 to 6,013; preemption by holders of the lock at level
 /// 31 adds noise of up to 1,200 ticks to either. 8,000 is a third over the
-/// largest, and a walk over the entries costing more than 10 ticks an entry
-/// with 248 children fails it (5b's Vouch took 539 ticks an entry).
+/// largest, and a walk over the entries costing more than about 13 ticks an
+/// entry with 248 children fails it (5b's Vouch took 539 ticks an entry).
 const VOUCH_TICKS_MAX: u64 = 8_000;
 
 /// Term B of the kernel, the longest it runs with preemption off, in
@@ -3256,9 +3265,17 @@ const RAM_STEP_KINDS: [(usize, &str); 16] = [
 /// callee and the step of the request itself.
 const WAIT_MAX: u64 = 500_000;
 
+/// The most a step may wait for the answer of a service in a call that is
+/// no heartbeat, in ticks under -icount: one round trip (C_ipc about
+/// 2,000), the longest step of the process service that may be running
+/// (SpawnStart, 94,056 with its margin), and the step of the request
+/// itself (term B), with room. Seen at most 15,038 (ramfs FinishBinding
+/// with 248 children).
+const CALL_WAIT_MAX: u64 = 120_000;
+
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
 /// proto_pipe::Method.
-const PIPE_STEP_KINDS: [(usize, &str); 16] = [
+const PIPE_STEP_KINDS: [(usize, &str); 15] = [
     (1, "Create"),
     (2, "ReadStart"),
     (3, "ReadTake"),
@@ -3274,7 +3291,6 @@ const PIPE_STEP_KINDS: [(usize, &str); 16] = [
     (13, "Abandon"),
     (64, "heartbeat: its own part, the send to init is the wait"),
     (65, "own step: a description let go of, a session gone"),
-    (66, "session gone"),
 ];
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
@@ -3392,16 +3408,21 @@ fn wait_of(waits: &[(usize, u64, u64)], kind: usize) -> u64 {
     waits.iter().find(|r| r.0 == kind).map_or(0, |r| r.1)
 }
 
-/// Fails when a wait in the lines of any service passes WAIT_MAX.
+/// Fails when a wait in the lines of the services `tags` passes its limit
+/// (WAIT_MAX for the heartbeat, kind 64; CALL_WAIT_MAX for the others), or
+/// when `rt` cut an accounting that added up to more than its step.
 fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String> {
+    if let Some(line) = lines.iter().find(|l| l.starts_with("service wait cut:")) {
+        return Err(format!("{who}: the accounting of a wait was cut: {line}"));
+    }
     for tag in tags {
-        if let Some((kind, wait, whole)) = longest_waits(lines, tag)
-            .into_iter()
-            .find(|r| r.1 > WAIT_MAX)
-        {
-            return Err(format!(
-                "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past WAIT_MAX {WAIT_MAX}"
-            ));
+        for (kind, wait, whole) in longest_waits(lines, tag) {
+            let limit = if kind == 64 { WAIT_MAX } else { CALL_WAIT_MAX };
+            if wait > limit {
+                return Err(format!(
+                    "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past {limit}"
+                ));
+            }
         }
     }
     Ok(())
@@ -3463,11 +3484,10 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the longest Vouch took {vouch} ticks with {live} children, past {VOUCH_TICKS_MAX}"
         ));
     }
-    if let Some((_, ticks, _)) = rows.iter().find(|(kind, _, _)| *kind == 53)
-        && *ticks > VOUCH_TICKS_MAX
-    {
+    let retained = rows.iter().find(|r| r.0 == 53).map_or(0, |r| r.1);
+    if retained == 0 || retained > VOUCH_TICKS_MAX {
         return Err(format!(
-            "RetainedLoader took {ticks} ticks with {live} children, past {VOUCH_TICKS_MAX}"
+            "RetainedLoader took {retained} ticks with {live} children, past {VOUCH_TICKS_MAX} or none"
         ));
     }
     // One READ_INTO is a step of the RAM file service at level 40 whose
@@ -3564,7 +3584,11 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // service) and of the heartbeat of the pipe service must have been
     // counted: without them the accounting of waits is lost and the own
     // parts above would hold the waits again.
-    check_waits(&outcome.lines, &["1", "2", "4", "11"], "process-steps")?;
+    check_waits(
+        &outcome.lines,
+        &["1", "2", "4", "10", "11"],
+        "process-steps",
+    )?;
     let ram_waits = longest_waits(&outcome.lines, "2");
     let pipe_waits = longest_waits(&outcome.lines, "4");
     if wait_of(&ram_waits, 25) == 0 {
@@ -4375,7 +4399,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-poll", posix_poll_probe),
         job("posix-pty", posix_pty_probe),
         job("posix-pty-steps", posix_pty_steps),
-        // The longest step of the process service with 128 children, under
+        // The longest step of the process service with 248 children, under
         // -icount: the host's time changes none of its numbers.
         job("process-steps", || process_steps(&qemu::VIRT, 7)),
         // BusyBox on relibc guards the C surface (5a').
@@ -6448,6 +6472,12 @@ mod tests {
 
     #[test]
     fn a_wait_past_the_limit_fails() {
+        // A call has CALL_WAIT_MAX, the heartbeat WAIT_MAX, and a cut line fails.
+        let call = |w: u64| vec![format!("service wait: 2 kind 25 {w} ticks of {w}")];
+        assert!(check_waits(&call(CALL_WAIT_MAX), &["2"], "t").is_ok());
+        assert!(check_waits(&call(CALL_WAIT_MAX + 1), &["2"], "t").is_err());
+        let cut = vec!["service wait cut: 2 kind 25 9000 ticks of 8000".to_owned()];
+        assert!(check_waits(&cut, &["5"], "t").is_err());
         let ok = vec![format!(
             "service wait: 4 kind 64 {WAIT_MAX} ticks of 600000"
         )];
