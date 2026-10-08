@@ -75,13 +75,7 @@ pub mod flag {
 }
 
 /// Independent fields of the resident scope word.
-pub mod scope {
-    pub const DEPTH_MASK: u64 = (1 << 29) - 1;
-    pub const NATIVE: u64 = 1 << 29;
-    pub const FALLBACK: u64 = 1 << 30;
-    pub const DELIVERY_PREPARING: u64 = 1 << 31;
-    pub const ERRNO_SHIFT: u32 = 32;
-}
+pub mod scope;
 
 /// The block of the POSIX layer for one thread: relibc's `os_specific`:
 /// its signals, cancellation, its channel and timer, its node in the table

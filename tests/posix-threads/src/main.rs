@@ -56,6 +56,8 @@ mod long;
 #[cfg(not(feature = "cancel-input"))]
 mod mutex;
 #[cfg(not(feature = "cancel-input"))]
+mod native_scopes;
+#[cfg(not(feature = "cancel-input"))]
 mod once;
 #[cfg(not(feature = "cancel-input"))]
 mod one_thread;
@@ -344,6 +346,9 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         "process-identity-probe: Rust PID/PPID match the process service's record and preserve errno"
     );
     if !one_thread::run() {
+        return false;
+    }
+    if !native_scopes::run() {
         return false;
     }
     if !priorities() {

@@ -37,9 +37,36 @@ pub unsafe fn attach_installed(tcb: *mut Tcb, id: u64) {
 /// one on this stack for a thread that has none, which goes when `run`
 /// returns.
 pub fn with_process<R>(run: impl FnOnce() -> R) -> R {
-    if !posix_thread::block().is_null() {
+    if let Some(block) = unsafe { posix_thread::block().as_ref() } {
+        if crate::relibc::native::is_resident(block) {
+            let deferred = rt::upcall::defer_entries().expect("native scope entry deferral");
+            let before = block.scope.load(core::sync::atomic::Ordering::Acquire)
+                & posix_thread::scope::DEPTH_MASK;
+            let _ = crate::signals::native_scope_barrier(block);
+            drop(deferred);
+            let result = run();
+            let _deferred = rt::upcall::defer_entries().expect("native scope exit deferral");
+            if before != posix_thread::scope::DEPTH_MASK {
+                crate::relibc::native::end_scope(block);
+            }
+            return result;
+        }
         return run();
     }
+    let admission = crate::relibc::native::enter();
+    if let Ok(page) = admission {
+        let deferred = rt::upcall::defer_entries().expect("native TLS install deferral");
+        // SAFETY: genuine CURRENT/admission proves this resident page belongs to this Thread.
+        unsafe { posix_thread::activate(page) };
+        let block = unsafe { &*posix_thread::block() };
+        let _ = crate::signals::native_scope_barrier(block);
+        drop(deferred);
+        let result = run();
+        let _deferred = rt::upcall::defer_entries().expect("native scope exit deferral");
+        crate::relibc::native::end_scope(block);
+        return result;
+    }
+    let error = admission.unwrap_err();
     let mut transient = Transient {
         abi: [0; 2],
         tcb: Tcb {
@@ -59,6 +86,7 @@ pub fn with_process<R>(run: impl FnOnce() -> R) -> R {
         // goes back to 0 below.
         unsafe {
             posix_thread::build(page, core::mem::size_of::<Transient>());
+            crate::relibc::native::fallback(&transient.tcb.block, error);
             posix_thread::activate(page);
         }
     }

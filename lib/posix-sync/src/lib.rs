@@ -413,6 +413,21 @@ pub fn abandon() -> bool {
     true
 }
 
+/// Unlink a resident wait node after its genuine kernel Thread ended.
+/// # Safety
+/// The caller holds the resident Block mapping through this operation and
+/// proved ThreadState::Ended. The ended thread cannot mutate its node again.
+pub unsafe fn abandon_ended(block: &Block) {
+    let address = block.address.load(Ordering::Acquire);
+    if address != 0 {
+        let held = lock(bucket(address));
+        if block.address.load(Ordering::Relaxed) == address {
+            remove(&held, block);
+        }
+    }
+    block.flags.fetch_and(!flag::WAITING, Ordering::SeqCst);
+}
+
 /// After the handlers of an entry that `abandon` ended a wait for: the wait
 /// goes on as one that was woken, with WAKE in its slot (a spurious wakeup,
 /// which `futex_wait` allows): its caller looks at its word again.
