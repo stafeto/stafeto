@@ -13,6 +13,7 @@ pub mod discipline;
 pub mod endpoints;
 #[cfg(test)]
 mod fuzz;
+pub mod holdsets;
 pub mod jobs;
 #[cfg(test)]
 mod reference;

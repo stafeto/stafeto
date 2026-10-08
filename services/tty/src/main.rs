@@ -31,7 +31,7 @@ use proto_tty::{
     SetAttr, VERSION, VSTART, VSTOP, WAITERS, Write,
 };
 use proto_uart::{ReadKey, ReadRequest, RoomReply, WriteReply, WriteRequest};
-use proto_wire::clones::Clones;
+use proto_wire::clones::{Clones, ROOTS};
 use proto_wire::{Status, Writer, long, watch};
 use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
 use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Timer};
@@ -41,6 +41,7 @@ use rt::service::{
 use rt::{sys, time};
 use tty::discipline::{self, Signal, Terminal};
 use tty::endpoints::{Endpoint, Endpoints, Failure, Holds, Side, TERMINALS};
+use tty::holdsets::{HoldSet, HoldSets};
 use tty::jobs::{self, Caller, Departed, Departures, Jobs};
 use tty::{Driver, Pump, Pumped, Waiter, Waiters};
 
@@ -51,6 +52,8 @@ rt::entry!(main);
 const SESSIONS: usize = 320;
 /// The clones the service keeps alive at most.
 const CLONES: usize = 320;
+/// The sets of holds: one for each clone, and one for each root.
+const HOLDSETS: usize = CLONES + ROOTS;
 /// The live clones of one root at most: one for each record of the process
 /// service, so that a tree of processes has a session each, and the other
 /// roots keep CLONES - ROOT_CLONES of them.
@@ -118,22 +121,6 @@ const GENERATIONS_AT: usize = 0x41_0000_0000;
 
 /// The tables of the sessions and long operations and the console's
 /// discipline, in `.bss`: too big for the stack.
-struct HoldSet {
-    label: u64,
-    root: u64,
-    holds: Holds,
-    retired: bool,
-}
-impl HoldSet {
-    const fn new() -> Self {
-        Self {
-            label: 0,
-            root: 0,
-            holds: Holds::new(),
-            retired: false,
-        }
-    }
-}
 #[derive(Clone, Copy)]
 struct Pin {
     label: u64,
@@ -149,7 +136,7 @@ struct Tables {
     clones: Clones<CLONES>,
     devices: [Device; TERMINALS],
     endpoints: Endpoints,
-    holdsets: [HoldSet; SESSIONS],
+    holdsets: HoldSets<CLONES, HOLDSETS>,
     pins: [Option<Pin>; OPERATIONS],
 }
 
@@ -197,7 +184,7 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     clones: Clones::new(),
     devices: [const { Device::new() }; TERMINALS],
     endpoints: Endpoints::new(),
-    holdsets: [const { HoldSet::new() }; SESSIONS],
+    holdsets: HoldSets::new(),
     pins: [None; OPERATIONS],
 }));
 
@@ -353,9 +340,9 @@ struct Tty {
     devices: &'static mut [Device; TERMINALS],
     active: usize,
     endpoints: &'static mut Endpoints,
-    holdsets: &'static mut [HoldSet; SESSIONS],
+    holdsets: &'static mut HoldSets<CLONES, HOLDSETS>,
     pins: &'static mut [Option<Pin>; OPERATIONS],
-    retired: tty::retired::Retired<SESSIONS>,
+    retired: tty::retired::Retired<HOLDSETS>,
     pin_cleanup_due: bool,
     watch_cleanup_due: bool,
     disconnect_work_due: bool,
@@ -1028,7 +1015,7 @@ impl Tty {
                     self.disconnect(effect.terminal);
                 }
             } else {
-                self.holdsets[slot] = HoldSet::new();
+                self.holdsets.release(slot);
                 self.retired.pop();
             }
             self.kick();
@@ -1950,10 +1937,11 @@ impl Tty {
     }
 
     fn new_clone(&mut self, root: u64, parent: &Holds, r: &mut Request<'_>) -> Answer {
-        let Some(slot) = self.holdsets.iter().position(|h| h.label == 0) else {
+        let Ok(label) = self.clones.give_within(OWN, root, ROOT_CLONES) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
-        let Ok(label) = self.clones.give_within(OWN, root, ROOT_CLONES) else {
+        let Some(slot) = self.holdsets.take() else {
+            self.clones.gone(label);
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
         let priority = self.level.saturating_sub(1).max(1);
@@ -1965,6 +1953,7 @@ impl Tty {
         ) {
             Ok(session) => session,
             Err(error) => {
+                self.holdsets.release(slot);
                 self.clones.gone(label);
                 return Answer::Status(Status::Kernel(error));
             }
@@ -1974,6 +1963,7 @@ impl Tty {
         let child = match self.endpoints.clone_holds(parent) {
             Ok(child) => child,
             Err(error) => {
+                self.holdsets.release(slot);
                 self.clones.gone(label);
                 return status(Self::endpoint_error(error));
             }
@@ -1984,6 +1974,9 @@ impl Tty {
             holds: child,
             retired: false,
         };
+        if let Some(place) = self.clones.place_of(label) {
+            self.holdsets.bind_clone(place, slot);
+        }
         let _ = r.reply().u32(0);
         Answer::Reply([session.erase()].into())
     }
@@ -2569,7 +2562,7 @@ impl Tty {
     fn retire_holds(&mut self, slot: usize) {
         if !self.holdsets[slot].retired {
             // A slot remains occupied until the queue releases it.
-            // There are SESSIONS slots, and each enters only once.
+            // There are HOLDSETS slots, and each enters only once.
             assert!(self.retired.push(slot));
             self.holdsets[slot].retired = true;
         }
@@ -2635,20 +2628,25 @@ impl Service<0> for Tty {
         }
         if s.data.root == 0 {
             let label = r.label();
-            let Some(holding) = self
-                .holdsets
-                .iter()
-                .position(|h| h.label == label)
-                .or_else(|| self.holdsets.iter().position(|h| h.label == 0))
-            else {
-                return Answer::Status(Status::Kernel(Error::LimitReached));
+            // A clone's set is found by the place of its label, a root's
+            // in the small table of roots; a session with none takes one.
+            let holding = match self.holdsets.find(label, &*self.clones) {
+                Some(holding) => holding,
+                None => {
+                    let Some(holding) = self.holdsets.take() else {
+                        return Answer::Status(Status::Kernel(Error::LimitReached));
+                    };
+                    if !self.holdsets.bind_root(label, holding) {
+                        self.holdsets.release(holding);
+                        return Answer::Status(Status::Kernel(Error::LimitReached));
+                    }
+                    self.holdsets[holding].label = label;
+                    self.holdsets[holding].root = label;
+                    holding
+                }
             };
             if self.holdsets[holding].retired {
                 return Answer::Status(Status::Kernel(Error::BadState));
-            }
-            if self.holdsets[holding].label == 0 {
-                self.holdsets[holding].label = label;
-                self.holdsets[holding].root = label;
             }
             s.data.holding = holding;
             s.data.root = self.holdsets[holding].root;
@@ -2736,15 +2734,26 @@ impl Service<0> for Tty {
 
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         self.abandon(s);
-        if let Some(slot) = self.holdsets.iter().position(|h| h.label == s.label()) {
+        // The set was bound by the first request; a session that made
+        // none looks for it as a request would.
+        let set = if s.data.root != 0 {
+            Some(s.data.holding)
+        } else {
+            self.holdsets.find(s.label(), &*self.clones)
+        };
+        if let Some(slot) = set {
             self.retire_holds(slot);
         }
         self.kick();
     }
 
     fn closed(&mut self, label: u64) {
+        // The set is found by the place of the clone: unbind it before the
+        // place is free. It stays in the queue of retired sets until its
+        // holds are closed, and only then is it free for another session.
+        let set = self.holdsets.unbind(label, &*self.clones);
         self.clones.gone(label);
-        if let Some(slot) = self.holdsets.iter().position(|h| h.label == label) {
+        if let Some(slot) = set {
             self.retire_holds(slot);
         }
         self.kick();
