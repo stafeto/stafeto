@@ -224,7 +224,7 @@ fn writes_register(word: u32, register: u32) -> bool {
         return written_back && base == register;
     }
     // ST1 and the like: a post-indexed form writes its base back.
-    word & 0xbf20_0000 == 0x0c80_0000 && base == register
+    word & 0xbe00_0000 == 0x0c00_0000 && word & (1 << 23) != 0 && base == register
 }
 
 /// A branch, a call or a return.
