@@ -10,9 +10,8 @@
 use super::*;
 #[path = "futex_deadline.rs"]
 mod deadline_check;
-#[path = "futex_watchdog.rs"]
-mod watchdog;
 use crate::layer::signals::{self as api, SigAction};
+use crate::watchdog;
 use core::sync::atomic::AtomicU32;
 use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
 use posix_sync::{CLOCK_MONOTONIC, EAGAIN, ETIMEDOUT, LayerLock, futex_wait, futex_wake};

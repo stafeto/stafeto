@@ -82,6 +82,8 @@ mod tcb;
 mod timed;
 #[cfg(not(feature = "cancel-input"))]
 mod upcall;
+#[path = "futex_watchdog.rs"]
+mod watchdog;
 
 #[used]
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
@@ -148,9 +150,12 @@ fn waiting_registered(thread: &Handle<Thread>, registered: impl Fn() -> bool) ->
             return true;
         }
         // Let setup RPCs finish before checking the specific registered wait.
-        sys::timer_set(&timer, sys::clock_now().expect("poll clock") + 1_000_000)
-            .expect("poll deadline");
-        sys::receive(&wake).expect("poll wake");
+        let deadline = sys::clock_now().expect("poll clock") + 1_000_000;
+        sys::timer_set(&timer, deadline).expect("poll deadline");
+        watchdog::receive(deadline, rt::abi::Error::Interrupted, |_| {
+            sys::receive(&wake)
+        })
+        .expect("poll wake");
     }
     false
 }
@@ -165,9 +170,12 @@ fn futex_blocked(id: u64) -> bool {
         if threads::probe_futex_waiting(id) {
             return true;
         }
-        sys::timer_set(&timer, sys::clock_now().expect("poll clock") + 1_000_000)
-            .expect("poll deadline");
-        sys::receive(&wake).expect("poll wake");
+        let deadline = sys::clock_now().expect("poll clock") + 1_000_000;
+        sys::timer_set(&timer, deadline).expect("poll deadline");
+        watchdog::receive(deadline, rt::abi::Error::Interrupted, |_| {
+            sys::receive(&wake)
+        })
+        .expect("poll wake");
     }
     false
 }

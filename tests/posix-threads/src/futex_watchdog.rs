@@ -58,4 +58,26 @@ mod tests {
     fn immediate_got_does_not_receive_again() {
         check(&[Ok(Received::Got)], Ok(Received::Got));
     }
+
+    #[test]
+    fn armed_poll_retries_receive_without_rearming() {
+        let deadline = 123_456;
+        let timer_sets = core::cell::Cell::new(0);
+        let arm = |actual_deadline| {
+            assert_eq!(actual_deadline, deadline);
+            timer_sets.set(timer_sets.get() + 1);
+        };
+        arm(deadline);
+        let sequence = [Err(10), Err(10), Ok(Received::Got)];
+        let mut calls = 0;
+        let result = receive(deadline, 10, |actual_deadline| {
+            assert_eq!(actual_deadline, deadline);
+            let result = sequence[calls];
+            calls += 1;
+            result
+        });
+        assert_eq!(result, Ok(Received::Got));
+        assert_eq!(calls, 3);
+        assert_eq!(timer_sets.get(), 1);
+    }
 }

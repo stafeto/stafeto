@@ -8,14 +8,14 @@ mod out;
 
 mod coverage;
 #[cfg(test)]
-#[path = "../../lib/posix-abi/src/relibc/lifetime.rs"]
-mod owner_lifetime;
-#[cfg(test)]
 #[path = "../../tests/posix-threads/src/futex_deadline.rs"]
 mod futex_deadline;
 #[cfg(test)]
 #[path = "../../tests/posix-threads/src/futex_watchdog.rs"]
 mod futex_watchdog;
+#[cfg(test)]
+#[path = "../../lib/posix-abi/src/relibc/lifetime.rs"]
+mod owner_lifetime;
 
 mod disasm;
 mod entropy;
