@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -498,35 +499,46 @@ static void clock_page(void) {
 }
 
 /* _POSIX_THREAD_ATTR_STACKADDR: a thread started with pthread_attr_setstack
- * runs on that memory (the address of its local is inside it), and
- * pthread_attr_getstack gives the region back; the bytes after the end of
- * the given size stay as they were; a misaligned stack is refused. */
-/* A size that is no multiple of a page: a stack rounded up to a page would
- * start the thread beyond the memory it was given. */
+ * runs on that memory and gives none of it back. The stack is a mapping of
+ * the application next to a second mapping of its own: after the thread ran,
+ * ended, was joined and another thread was joined (the layer collects the
+ * first one then), every byte of both mappings is as the application left
+ * it (an unmapped page reads back as zeros), the thread's TLS was in neither,
+ * and the application can unmap both. The size is no multiple of a page, so
+ * a size rounded up would reach the pattern after the end. */
 #define OWN_STACK (65536 + 64)
 #define GUARD_BYTES 4096
+#define MAPPED (20 * 4096)
 static char *own_stack;
+static char *neighbour;
 static int on_own_stack;
+static int tls_apart;
 
 static void *report_stack(void *arg) {
     char local = 0;
     char *at = &local;
     on_own_stack = at >= own_stack && at < own_stack + OWN_STACK;
+    char *tls = (char *)&errno;
+    tls_apart = !(tls >= own_stack && tls < own_stack + MAPPED) &&
+                !(tls >= neighbour && tls < neighbour + 4 * 4096);
     return arg;
 }
 
-static void *report_stack_default(void *arg) {
+static void *report_default(void *arg) {
     return arg;
 }
 
 static void stack_address(void) {
-    /* Aligned to a page: the layer would unmap such a stack when the thread
-     * ended, and round the length up, over the bytes after it. */
-    void *memory = NULL;
-    CHECK(posix_memalign(&memory, 4096, OWN_STACK + GUARD_BYTES) == 0);
-    own_stack = memory;
+    own_stack = mmap(NULL, MAPPED, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(own_stack != MAP_FAILED);
+    neighbour = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(neighbour != MAP_FAILED);
+    /* Two mappings in a row do not overlap. */
+    CHECK(neighbour >= own_stack + MAPPED || neighbour + 4 * 4096 <= own_stack);
     memset(own_stack, 0x3C, 4096);
+    memset(own_stack + 4096, 0x77, OWN_STACK - 8192);
     memset(own_stack + OWN_STACK, 0xA5, GUARD_BYTES);
+    memset(neighbour, 0x5E, 4 * 4096);
     pthread_attr_t attr;
     CHECK(pthread_attr_init(&attr) == 0);
     CHECK(pthread_attr_setstack(&attr, own_stack, OWN_STACK) == 0);
@@ -538,24 +550,24 @@ static void stack_address(void) {
     CHECK(pthread_create(&thread, &attr, report_stack, NULL) == 0);
     CHECK(pthread_join(thread, NULL) == 0);
     CHECK(on_own_stack == 1);
-    /* Another thread, joined, so that the layer collects the first one. */
+    CHECK(tls_apart == 1);
+    /* Another thread, joined, so that the layer collects the first one; it
+     * does so as that thread ends, after its join returned: give it time. */
     pthread_t other;
-    CHECK(pthread_create(&other, NULL, report_stack_default, NULL) == 0);
+    CHECK(pthread_create(&other, NULL, report_default, NULL) == 0);
     CHECK(pthread_join(other, NULL) == 0);
-    /* The second thread collects the first as it ends, after its join
-     * returned: give it the time. */
     sleep_ms(100);
-    /* The memory is still the application's: the first page and the bytes
-     * after the end are as they were (a read of an unmapped page faults),
-     * and the heap takes the buffer back and gives memory again. */
     for (int i = 0; i < 4096; i++)
         CHECK((unsigned char)own_stack[i] == 0x3C);
     for (int i = 0; i < GUARD_BYTES; i++)
         CHECK((unsigned char)own_stack[OWN_STACK + i] == 0xA5);
+    for (int i = 0; i < 4 * 4096; i++)
+        CHECK((unsigned char)neighbour[i] == 0x5E);
     /* A misaligned address or end is refused. */
     CHECK(pthread_attr_setstack(&attr, own_stack + 8, OWN_STACK) == EINVAL);
     CHECK(pthread_attr_setstack(&attr, own_stack, OWN_STACK + 8) == EINVAL);
-    free(memory);
+    CHECK(munmap(own_stack, MAPPED) == 0);
+    CHECK(munmap(neighbour, 4 * 4096) == 0);
     void *again = malloc(OWN_STACK);
     CHECK(again != NULL);
     memset(again, 0, OWN_STACK);
