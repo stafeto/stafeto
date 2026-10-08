@@ -465,7 +465,7 @@ entry, syscall or exit-loop interval requires its own measurement boundaries.
 The rows above bound what a pending interrupt waits for. A step of a
 service is user-space work at the service's level, and a request that waits
 for the service waits for the steps ahead of it. `cargo xtask
-process-steps` (4 branches in `ci`) measures them under -icount with a
+process-steps` (7 branches in `ci`) measures them under -icount with a
 crowd of children from files (the same ticks as B; `rt` feature
 `step-stats` and the process service's feature `steps` in that image
 only, and the RAM file service's feature `steps`; the clock service is the shipping one). The longest
@@ -505,7 +505,7 @@ row grows with them and stops at 11,768 ticks, the walk of a record with 32 chil
 fixed costs above B: they make a process in the kernel, a call at a time
 (its space, the record's page, the loader's code, data and stack and its
 thread), each call bounded on its own. `process-steps` fails when the
-longest Vouch passes 6,000 ticks. Details are in
+own part of the longest Vouch or RetainedLoader passes 8,000 ticks. Details are in
 [notes/m5c-spawn-exec.md](../notes/m5c-spawn-exec.md).
 
 A thread below the service's level waits for at most one step that has
@@ -515,6 +515,43 @@ ticks, 4.3 times B, and it does not grow with the number of processes.
 Nothing of real time runs below level 52 yet; SpawnStart, ExecStart,
 ForkStart and Create are to be split into steps no longer than B before
 step 5h.
+
+### Own part and wait of a step
+
+A step that calls another service synchronously (`send`) has two parts.
+Under `step-stats` the library `rt` times each `send` inside a step: the
+line `service step` carries the own part (the whole step less the waits),
+and the line `service wait: T kind K W ticks of A` carries the longest wait
+W of a kind in a step of A ticks. `xtask` compares the own part of every
+kind of every service, heartbeats included, with term B, and each wait
+with WAIT_MAX (500,000 ticks); ramfs FinishBinding and the heartbeats of
+the pipe service and of the terminal service must show a wait, or the
+accounting is gone. The departure of a session counts as kind 66 in every
+service, apart from the heartbeat and the other notifications. FinishBinding
+with 248 children took 18,306 ticks whole, 12,246 of them wait and 8,279
+its own part, which does not grow with the children; the terminal's own
+step (kind 65) took 20,509 whole and 12,710 in its own part.
+
+For a client of a service S that calls a service T in a step, the wait is a
+blocking term of the response-time analysis:
+
+    B_client >= own(S) + wait(S -> T)
+    wait(S -> T) <= C_ipc + step_max(T) + step(T, request) + I
+
+with C_ipc about 2,000 ticks (one round trip), step_max(T) the longest step
+of T that may be running when the request arrives (the service is a single
+thread), step(T, request) the step of the request itself, and I the
+preemption by levels above the one T inherits from S. The steps of T are
+bound by their own lines, so `xtask` bounds only own(S) with B and the wait
+with WAIT_MAX. For T the process service step_max is SpawnStart, 93,000
+ticks today, so a wait of the terminal or of ramfs on the process service
+is about 100,000 ticks in the worst case until step 5z splits it.
+
+The own part is wall time at the service's level: a holder of a lock at a
+higher level that runs in the middle of a step adds its time to the step.
+The part therefore bounds the service's work from above and carries noise
+of up to 1,200 ticks between builds. Exact work needs a thread run time in
+the kernel and is outside this measurement.
 
 ### The loader's copy of a `fork`
 
@@ -619,8 +656,9 @@ margin: 17,382 ticks with 248 children, 85 % of B, since it goes through
 the 320 places of the births and of the clones; it is the first to split
 when the tables grow (with the steps of the process service, 5h). The
 heartbeat is the loop's wait for init's reply, in which processes of higher
-levels run (the volley of 248 children); it is no work of the service, and
-the check bounds it at 500,000 ticks apart from B. A thread below level 40
+levels run (the volley of 248 children); that wait is counted apart (see
+"Own part and wait of a step"), the check bounds it at 500,000 ticks, and
+the heartbeat's own part goes against B like every other step. A thread below level 40
 waits for at most one step of the service's own work that has begun; the
 wait for init's reply goes to threads above the client's level, so it adds
 nothing to the client's delay. No step allocates memory: the
