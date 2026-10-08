@@ -2538,10 +2538,14 @@ pub fn process_layer_roles_survive_partial_unbind_and_native_end(
             c.succeeds(control, &[C::Enable.raw()], &[1, 0, 0])?;
             c.succeeds(control, &[C::ObserverEnable.raw()], &[1, 0, 0])?;
             c.succeeds(control, &[C::ProcessLayerRequest.raw(), managed.0], &[])?;
+            // SAFETY: every supplied Thread is held by the fixture; no EL0
+            // code runs, and each synchronous dispatch finishes before this access.
             let entry = |t: NonNull<Thread>| unsafe {
                 (*t.as_ptr()).upcall.prepare_with_tls(0x4000, 0, 0, false)
             };
             let returned = |t: NonNull<Thread>, observer: bool| -> Result<(), &'static str> {
+                // SAFETY: the fixture holds `t` and does not execute its user
+                // code; this local State borrow ends before the next dispatch.
                 let state = unsafe { &mut (*t.as_ptr()).upcall };
                 state
                     .control(if observer { 7 } else { 2 })
@@ -2598,6 +2602,8 @@ pub fn process_layer_roles_survive_partial_unbind_and_native_end(
             thread::start(native).map_err(|_| "no native start")?;
             let queued = owned_channel(c.process)?;
             // The queued send is made by the scheduler's actual running sender.
+            // SAFETY: the scheduler lock protects its queues; start retained
+            // their Threads, and the fixture also holds both creation references.
             let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
             check(
                 matches!(picked, kcore::sched::Decision::Run(t) if t == c.thread),
@@ -2623,8 +2629,12 @@ pub fn process_layer_roles_survive_partial_unbind_and_native_end(
             )?;
             other.succeeds(control, &[C::ObserverLayerReady.raw(), 1], &[])?;
             check(
+                // SAFETY: Caller holds its Thread after the synchronous
+                // registration; the fixture never executes its user code.
                 unsafe { c.thread.as_ref() }.sched.state() == State::Ready
+                    // SAFETY: the same held Thread remains alive for this read.
                     && unsafe { c.thread.as_ref() }.waits.is_none()
+                    // SAFETY: registration finished writing this held Thread's registers.
                     && unsafe { c.thread.as_ref() }.regs.x[0] == Error::Interrupted.code(),
                 "registration did not interrupt the selected sender",
             )?;
@@ -2647,17 +2657,23 @@ pub fn process_layer_roles_survive_partial_unbind_and_native_end(
         c.close(managed)?;
         // Non-running Threads leave at the paid Threads teardown stage.
         // Keep the fixture references while that stage removes every role.
+        // SAFETY: Caller still owns its Process reference through teardown.
         unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
         cleanup::drain();
         check(
+            // SAFETY: Caller's creation reference survives cleanup::drain.
             unsafe { c.thread.as_ref() }.layer.is_none(),
             "main role survived Process End",
         )?;
         if let Some(native) = extra {
             check(
+                // SAFETY: `extra` keeps the creation reference after scheduler
+                // End and Process teardown released their own references.
                 unsafe { native.as_ref() }.layer.is_none(),
                 "native role survived End",
             )?;
+            // SAFETY: this drops the fixture's creation reference exactly once;
+            // this Thread is not accessed afterwards.
             unsafe { thread::release(native, CAUSE) };
         }
         result
@@ -2687,6 +2703,8 @@ pub fn observer_wire_preserves_native_context_and_ignored_registers(
             .map_err(|_| "native request failed")?;
         let pc = (USER_VA + PAGE) as u64;
         check(
+            // SAFETY: Caller holds this stopped Thread; no user code runs,
+            // and the preceding local mutable borrow has ended.
             unsafe { t.as_mut() }.upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
             "no primary entry",
         )?;
@@ -2730,10 +2748,14 @@ pub fn observer_wire_preserves_native_context_and_ignored_registers(
         c.close(none)?;
         c.close(resource)?;
         c.close(managed)?;
+        // SAFETY: Caller still holds the stopped Thread, and the preceding
+        // synchronous dispatches have released their temporary State borrows.
         unsafe { t.as_mut() }
             .upcall
             .request_layer()
             .map_err(|_| "observer request failed")?;
+        // SAFETY: the same held stopped Thread has no concurrent user execution;
+        // the request_layer borrow above ended before this preparation.
         let entry = unsafe { t.as_mut() }
             .upcall
             .prepare_with_tls(pc, 0, 0, false);
