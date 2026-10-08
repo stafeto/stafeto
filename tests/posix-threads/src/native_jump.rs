@@ -3,10 +3,10 @@
 
 //! A native thread with its own entry: a signal handler of the layer leaves
 //! by siglongjmp, then a request of the thread's own entry still ends its
-//! receive. Four variants cover what the jump leaves behind: a second wait
-//! deeper than the abandoned frame (1), a second wait whose entry frame
-//! overlaps the abandoned one (2), two jumps in a row (3) and a jump inside
-//! a handler (4).
+//! receive. Variants cover what the jump leaves behind: a second wait deeper
+//! than the abandoned frame (1), a second wait whose entry frame overlaps the
+//! abandoned one (2, the base scenario), two jumps in a row (3), a jump inside
+//! a handler (4) and a jump of the program's own that calls `abandon` (5).
 use super::*;
 use crate::layer::signals::{self as api, SigAction};
 use rt::{
@@ -34,7 +34,25 @@ core::arch::global_asm!(
     "ldp x29, x30, [sp], #32",
     "ret",
 );
+// A jump that restores what setjmp saved and nothing else: it does not
+// know the entry record, so the program calls `abandon` before it.
+core::arch::global_asm!(
+    ".global native_jump_raw",
+    ".type native_jump_raw,%function",
+    "native_jump_raw:",
+    "ldp x19, x20, [x0, #0]",
+    "ldp x21, x22, [x0, #16]",
+    "ldp x23, x24, [x0, #32]",
+    "ldp x25, x26, [x0, #48]",
+    "ldp x27, x28, [x0, #64]",
+    "ldp x29, x30, [x0, #80]",
+    "ldr x2, [x0, #104]",
+    "mov sp, x2",
+    "mov w0, w1",
+    "br x30",
+);
 unsafe extern "C" {
+    fn native_jump_raw(buffer: *mut u64, value: c_int) -> !;
     /// sigsetjmp(buffer, 1), then body(); 0 when body returns, the value
     /// of siglongjmp otherwise.
     fn native_jump_around(buffer: *mut u64, body: extern "C" fn()) -> c_int;
@@ -60,6 +78,8 @@ static DEEPER: AtomicUsize = AtomicUsize::new(0);
 /// The stack pointers of the first and of the last wait.
 static FIRST_SP: AtomicU64 = AtomicU64::new(0);
 static LAST_SP: AtomicU64 = AtomicU64::new(0);
+/// The handler is the jump of the program's own (`jump_raw`).
+static RAW: AtomicUsize = AtomicUsize::new(0);
 /// 0 checks nothing, 1 wants the last wait deeper than one entry frame
 /// below the first, 2 wants the two within one entry frame of each other.
 static SHAPE: AtomicUsize = AtomicUsize::new(0);
@@ -87,6 +107,17 @@ rt::upcall_entry!(primary_entry, primary);
 unsafe extern "C" fn jump_out(_signal: c_int) {
     // SAFETY: the worker's sigsetjmp frame is live below this handler.
     unsafe { siglongjmp((*BUFFER.0.get()).as_mut_ptr(), 1) }
+}
+/// The handler of the variant with a jump of the program's own: it names
+/// the target to `abandon` and jumps without relibc.
+unsafe extern "C" fn jump_raw(_signal: c_int) {
+    // SAFETY: the buffer was filled by sigsetjmp in a live frame below which
+    // this handler runs; word 13 is the stack pointer it saved.
+    unsafe {
+        let buffer = (*BUFFER.0.get()).as_mut_ptr();
+        upcall::abandon(*buffer.add(13) as usize);
+        native_jump_raw(buffer, 1)
+    }
 }
 unsafe extern "C" fn jump_inner(_signal: c_int) {
     // SAFETY: the sigsetjmp frame of the outer handler is live.
@@ -133,7 +164,11 @@ extern "C" fn worker(_: u64) -> ! {
     let jumped = tls::with_process(|| {
         ID.store(ffi::pthread_self(), Ordering::SeqCst);
         let action = SigAction {
-            handler: jump_out as *const () as u64,
+            handler: if RAW.load(Ordering::SeqCst) == 0 {
+                jump_out as *const () as u64
+            } else {
+                jump_raw as *const () as u64
+            },
             mask: 0,
             flags: 0,
         };
@@ -282,6 +317,7 @@ fn receiving(ctx: &Ctx, thread: &Handle<Thread>) -> bool {
 }
 
 struct Shape {
+    raw: usize,
     jumps: usize,
     deeper: usize,
     shape: usize,
@@ -307,6 +343,7 @@ fn scenario(
     JUMPS.store(shape.jumps, Ordering::SeqCst);
     DEEPER.store(shape.deeper, Ordering::SeqCst);
     SHAPE.store(shape.shape, Ordering::SeqCst);
+    RAW.store(shape.raw, Ordering::SeqCst);
     let Some((native, ended)) = spawn(worker, slot, level, base) else {
         return failed(code + 1);
     };
@@ -444,6 +481,7 @@ pub(super) fn run() -> bool {
     // The main scenario: one jump, the second wait close above the first,
     // so that the entry frame of the second overlaps the abandoned one (2).
     let one = Shape {
+        raw: 0,
         jumps: 1,
         deeper: 0,
         shape: 2,
@@ -453,6 +491,7 @@ pub(super) fn run() -> bool {
     }
     // 1: the second wait far below the abandoned frame.
     let deep = Shape {
+        raw: 0,
         jumps: 1,
         deeper: 1,
         shape: 1,
@@ -462,11 +501,22 @@ pub(super) fn run() -> bool {
     }
     // 3: two jumps in a row.
     let twice = Shape {
+        raw: 0,
         jumps: 2,
         deeper: 0,
         shape: 0,
     };
     if !scenario("two jumps", 1520, twice, 2, &ctx, level, base) {
+        return false;
+    }
+    // The jump of a program without relibc's: `abandon` does what the hook does.
+    let raw = Shape {
+        raw: 1,
+        jumps: 1,
+        deeper: 0,
+        shape: 2,
+    };
+    if !scenario("jump with abandon", 1550, raw, 3, &ctx, level, base) {
         return false;
     }
     // 4: a jump inside a handler.
