@@ -10,6 +10,9 @@
 //!   of a program stays in a scope of the layer and gets the signal.
 //! - R2: two native threads; the first becomes the router and ends through
 //!   `rt::sys::thread_exit`; the second gets the signal.
+//! - R5: as R2, but the first thread ends past the contract of `rt` (no exit
+//!   hook); the probe build notices it when the second thread collects the
+//!   table, says so and passes the role on in the name of the first.
 //! - R3: the main thread holds its entries deferred and, while it is leaving
 //!   after its last routing, the signal comes; the signal waits on the page
 //!   and reaches the native thread after the handoff.
@@ -18,7 +21,7 @@
 //!   the signal.
 use super::*;
 use crate::layer::signals::{self as api, SigAction};
-use rt::{Stack, abi::Policy, handle::Channel as Chan, wait::Waiter};
+use rt::{Stack, abi::Policy, handle::Channel as Chan, upcall, wait::Waiter};
 
 static STACK_A: Stack<16384> = Stack::new();
 static STACK_B: Stack<16384> = Stack::new();
@@ -169,6 +172,10 @@ extern "C" fn first(_: u64) -> ! {
             end_child(12);
         }
     });
+    if VARIANT.load(Ordering::SeqCst) == 5 {
+        // A program that ends its thread past the contract of `rt`.
+        upcall::set_exit_hook(None);
+    }
     sys::thread_exit()
 }
 
@@ -177,7 +184,15 @@ extern "C" fn second(_: u64) -> ! {
     let sleeper = Sleeper::new();
     tls::with_process(|| {
         ATTACHED.fetch_add(1, Ordering::SeqCst);
-        if !sleeper.until(2000, || main_ended() && ended(&FIRST_ENDED)) {
+        let probe = VARIANT.load(Ordering::SeqCst) == 5;
+        if !sleeper.until(2000, || {
+            if probe {
+                // The probe build notices a router that ended without a
+                // handoff when the table is collected.
+                abi::relibc::collect();
+            }
+            main_ended() && ended(&FIRST_ENDED)
+        }) {
             end_child(12);
         }
         ready();
@@ -201,6 +216,9 @@ fn marked(own: u64) {
             DEADLINE.store(now() + 500_000_000, Ordering::SeqCst);
         }
         4 if own == B_NUMBER.load(Ordering::SeqCst) => {
+            // A thread held here takes no entry: a request of its entry
+            // stays unserved, as it does for a thread that is gone.
+            core::mem::forget(rt::upcall::defer_entries().expect("router probe deferral"));
             MARKED.store(1, Ordering::SeqCst);
             let limit = now() + 3_000_000_000;
             while RELEASE.load(Ordering::SeqCst) == 0 && now() < limit {
@@ -257,7 +275,7 @@ fn child(variant: usize, fd: c_int) -> ! {
                 abi::relibc::probe_marked_hook(Some(marked));
             }
         }
-        2 => {
+        2 | 5 => {
             let one = spawn(first, &STACK_A, 0);
             FIRST_ENDED.store(one, Ordering::SeqCst);
             if !sleeper.until(2000, || ATTACHED.load(Ordering::SeqCst) == 1) {
@@ -348,7 +366,7 @@ pub(super) fn run() -> bool {
     if unsafe { api::sigaction(SIGUSR2, &action, &mut old) } != 0 {
         return failed(1600);
     }
-    let passed = (1..=4).all(variant);
+    let passed = (1..=5).all(variant);
     let _ = unsafe { api::sigaction(SIGUSR2, &old, ptr::null_mut()) };
     if passed {
         rt::println!(
