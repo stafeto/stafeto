@@ -93,14 +93,40 @@ pub struct Disconnect {
 /// Local dup creates another fd reference to this same session hold.
 #[derive(Clone)]
 pub struct Holds {
-    ids: [Option<u32>; HOLDS],
+    ids: Cells,
     /// The table indices (`id & 255`) of the held descriptions, a bit
     /// each. A description that is held cannot be freed, so no other
     /// generation of its index exists while the bit is set.
     mask: [u64; DESCRIPTIONS / 64],
-    /// The cells of `ids` a test counted `contains` reading.
+}
+
+/// The cells of a hold table. Every read goes through `get` or `iter`,
+/// which a test build counts, so a test can show that a lookup reads none.
+#[derive(Clone)]
+struct Cells {
+    items: [Option<u32>; HOLDS],
     #[cfg(test)]
     reads: core::cell::Cell<usize>,
+}
+impl Cells {
+    const fn new() -> Self {
+        Self {
+            items: [None; HOLDS],
+            #[cfg(test)]
+            reads: core::cell::Cell::new(0),
+        }
+    }
+    fn get(&self, place: usize) -> Option<u32> {
+        #[cfg(test)]
+        self.reads.set(self.reads.get() + 1);
+        self.items[place]
+    }
+    fn set(&mut self, place: usize, id: Option<u32>) {
+        self.items[place] = id;
+    }
+    fn iter(&self) -> impl Iterator<Item = Option<u32>> + '_ {
+        (0..HOLDS).map(|place| self.get(place))
+    }
 }
 impl Default for Holds {
     fn default() -> Self {
@@ -110,10 +136,8 @@ impl Default for Holds {
 impl Holds {
     pub const fn new() -> Self {
         Self {
-            ids: [None; HOLDS],
+            ids: Cells::new(),
             mask: [0; DESCRIPTIONS / 64],
-            #[cfg(test)]
-            reads: core::cell::Cell::new(0),
         }
     }
     /// True when a description of the table index of `id` is held: a
@@ -123,18 +147,19 @@ impl Holds {
         self.mask[index / 64] >> (index % 64) & 1 != 0
     }
     fn put(&mut self, place: usize, id: u32) {
-        self.ids[place] = Some(id);
+        self.ids.set(place, Some(id));
         let index = (id & 255) as usize;
         self.mask[index / 64] |= 1 << (index % 64);
     }
     fn remove(&mut self, place: usize) {
-        if let Some(id) = self.ids[place].take() {
+        if let Some(id) = self.ids.get(place) {
+            self.ids.set(place, None);
             let index = (id & 255) as usize;
             self.mask[index / 64] &= !(1 << (index % 64));
         }
     }
     pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.ids.iter().flatten().copied()
+        self.ids.iter().flatten()
     }
     pub fn first(&self) -> Option<u32> {
         self.ids().next()
@@ -174,7 +199,7 @@ impl Holds {
     fn room(&self) -> Result<usize, Failure> {
         self.ids
             .iter()
-            .position(Option::is_none)
+            .position(|item| item.is_none())
             .ok_or(Failure::Limit)
     }
 }
@@ -459,7 +484,7 @@ impl Endpoints {
         let place = holds
             .ids
             .iter()
-            .position(|&item| item == Some(id))
+            .position(|item| item == Some(id))
             .ok_or(Failure::BadDescription)?;
         self.locate(id)?;
         holds.remove(place);
@@ -502,10 +527,10 @@ mod tests {
         let mut holds = Holds::new();
         let first = table.open_master(&mut holds, 2).unwrap();
         let reads = |holds: &Holds| {
-            let before = holds.reads.get();
+            let before = holds.ids.reads.get();
             assert!(holds.contains(first));
             assert!(!holds.contains(first ^ 0x80));
-            holds.reads.get() - before
+            holds.ids.reads.get() - before
         };
         let few = reads(&holds);
         for _ in 1..PTYS {
