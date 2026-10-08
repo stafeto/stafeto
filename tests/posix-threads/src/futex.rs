@@ -10,6 +10,8 @@
 use super::*;
 #[path = "futex_deadline.rs"]
 mod deadline_check;
+#[path = "futex_watchdog.rs"]
+mod watchdog;
 use crate::layer::signals::{self as api, SigAction};
 use core::sync::atomic::AtomicU32;
 use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
@@ -233,10 +235,10 @@ pub(super) fn run() -> bool {
     for place in 0..4 {
         let wake = futex_wake(&GATE, 1);
         let (received, receive_error) = if wake == 1 {
-            match waiter.receive_until(
-                &done_channel,
-                rt::time::ticks_to_ns(rt::time::now()) + 1_000_000_000,
-            ) {
+            let deadline = rt::time::ticks_to_ns(rt::time::now()) + 1_000_000_000;
+            match watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                waiter.receive_until(&done_channel, deadline)
+            }) {
                 Ok(Waited::Got(_)) => (1u32, 0u64),
                 Ok(Waited::Expired) => (2, 0),
                 Err(error) => (3, error.code()),
@@ -273,11 +275,11 @@ pub(super) fn run() -> bool {
     // and the watchdog sees it.
     let pair = [create(handoff, 0), create(handoff, 1)];
     for _ in pair {
+        let deadline = rt::time::ticks_to_ns(rt::time::now()) + 10_000_000_000;
         if !matches!(
-            waiter.receive_until(
-                &done_channel,
-                rt::time::ticks_to_ns(rt::time::now()) + 10_000_000_000
-            ),
+            watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+                waiter.receive_until(&done_channel, deadline)
+            }),
             Ok(Waited::Got(_))
         ) {
             rt::println!(
@@ -293,11 +295,11 @@ pub(super) fn run() -> bool {
     }
     // A higher thread that the holder's wake preempts at once.
     let pair = [create(holder, 0), create(visitor, 0)];
+    let deadline = rt::time::ticks_to_ns(rt::time::now()) + 10_000_000_000;
     if !matches!(
-        waiter.receive_until(
-            &done_channel,
-            rt::time::ticks_to_ns(rt::time::now()) + 10_000_000_000
-        ),
+        watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
+            waiter.receive_until(&done_channel, deadline)
+        }),
         Ok(Waited::Got(_))
     ) {
         rt::println!(
