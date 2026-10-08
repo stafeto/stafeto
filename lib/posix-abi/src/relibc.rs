@@ -876,7 +876,7 @@ pub fn cancel(id: u64) -> i32 {
         let at_point = block.cancel_point.load(Ordering::SeqCst) != 0;
         if at_point || flags & flag::CANCEL_ASYNCHRONOUS != 0 {
             if flags & flag::SIGNALS_READY != 0 {
-                let _ = sys::thread_layer_request(native);
+                let _ = sys::thread_upcall_request(native);
             }
             let _ = sys::thread_interrupt(native);
         }

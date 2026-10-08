@@ -158,7 +158,7 @@ fn close_retained(field: &AtomicU64) -> bool {
 ///
 /// # Safety
 /// TABLE_LOCK protects this row. Its Thread has genuinely Ended, or the
-/// exact current creator rolled back before LIVE, removed its observer
+/// exact current creator rolled back before LIVE, removed its resident handler
 /// and restored its previous TLS. No execution can borrow its Block.
 unsafe fn clean_journal(place: &Place, ended: bool) -> bool {
     let block = place.block.load(Ordering::Acquire) as *const Block;
@@ -255,7 +255,7 @@ pub(crate) fn enter() -> Result<*mut u8, i32> {
         Ok(page) => {
             let attached = crate::signals::attach_native(page);
             if let Err(error) = attached {
-                // No TLS was installed and no published observer remains.
+                // No TLS was installed and no resident handler remains.
                 place.state.set_flags(lifetime::MAKING | DETACHED);
                 if unsafe { clean_journal(place, false) } {
                     place.stack.store(0, Ordering::Release);

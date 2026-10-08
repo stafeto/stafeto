@@ -8,11 +8,21 @@ use rt::upcall;
 use rt::wait::{Waited, Waiter};
 core::arch::global_asm!(include_str!("upcall.S"), options(raw));
 rt::upcall_entry!(entry, dispatch);
-rt::observer_upcall_entry!(observer_entry, observer_dispatch, context);
+rt::upcall_entry!(resident_entry, resident_dispatch, context);
+rt::upcall_entry!(own_entry, own_dispatch);
 unsafe extern "C" {
     fn native_upcall_register_probe(output: *mut u64, state: *const AtomicU64);
-    fn native_observer_register_probe(output: *mut u64, state: *const AtomicU64);
+    fn native_resident_register_probe(output: *mut u64, state: *const AtomicU64);
 }
+/// The resident handler's own TLS block of mode 5: not the thread's.
+#[repr(C, align(16))]
+struct Block([u64; 8]);
+static BLOCK: Block = Block([0; 8]);
+/// What TPIDR_EL0 holds in the interrupted code of mode 5.
+const INTERRUPTED_TLS: u64 = 0x5a5a_0010;
+/// What the handler of the program saw in TPIDR_EL0, and how often it ran.
+static OWN_TLS: AtomicU64 = AtomicU64::new(0);
+static OWN_RAN: AtomicUsize = AtomicUsize::new(0);
 struct Output(UnsafeCell<[u64; 106]>);
 // SAFETY: only one joined worker writes OUTPUT; publication uses RESULT.
 unsafe impl Sync for Output {}
@@ -26,12 +36,13 @@ static STATE: State = State {
     seeded: AtomicU64::new(0),
     done: AtomicU64::new(0),
 };
-static OBSERVER_TLS: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_TLS: AtomicU64 = AtomicU64::new(0);
 static MODE: AtomicUsize = AtomicUsize::new(0);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static DEEPEST: AtomicUsize = AtomicUsize::new(0);
 static HANDLER_ID: AtomicU64 = AtomicU64::new(0);
+static EXPECTED_ID: AtomicU64 = AtomicU64::new(0);
 static RESULT: AtomicUsize = AtomicUsize::new(0);
 static READY: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicU64 = AtomicU64::new(0);
@@ -48,17 +59,27 @@ fn poke() {
     let target = Handle::<Thread>::borrowed(rt::abi::Handle(NATIVE.load(Ordering::Acquire)));
     sys::thread_upcall_request(&target).unwrap();
 }
-unsafe extern "C" fn observer_dispatch(context: *mut upcall::Context) {
+/// The handler of the program in mode 5 runs after the resident one in
+/// the same entry. The resident handler left TPIDR_EL0 at zero; the entry
+/// must have put the interrupted value back.
+unsafe extern "C" fn own_dispatch() {
+    let tls: u64;
+    // SAFETY: reads the register only.
+    unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls, options(nomem, nostack)) };
+    OWN_TLS.store(tls, Ordering::SeqCst);
+    OWN_RAN.fetch_add(1, Ordering::SeqCst);
+}
+unsafe extern "C" fn resident_dispatch(context: *mut upcall::Context) {
     let tls: u64;
     // SAFETY: read only this handler's installed resident ABI word.
     unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls, options(nomem, nostack)) };
-    assert_eq!(tls, OBSERVER_TLS.load(Ordering::Acquire));
+    assert_eq!(tls, RESIDENT_TLS.load(Ordering::Acquire));
     // SAFETY: the trampoline supplies a live exact interrupted context.
     let original = unsafe { (*context).tls };
     assert_eq!(
         original,
         if ACTIVE.load(Ordering::Acquire) == 0 {
-            0
+            INTERRUPTED_TLS
         } else {
             tls
         }
@@ -66,26 +87,26 @@ unsafe extern "C" fn observer_dispatch(context: *mut upcall::Context) {
     unsafe { dispatch() };
 }
 unsafe extern "C" fn dispatch() {
-    HANDLER_ID.store(ffi::pthread_self(), Ordering::Release);
+    // The resident handler of mode 5 runs on a TLS block of its own, which
+    // is no TCB: the thread is named by its message buffer there.
+    HANDLER_ID.store(
+        if MODE.load(Ordering::Acquire) == 5 {
+            rt::msgbuf::address() as u64
+        } else {
+            ffi::pthread_self()
+        },
+        Ordering::Release,
+    );
     let depth = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
     DEEPEST.fetch_max(depth, Ordering::SeqCst);
     COUNT.fetch_add(1, Ordering::SeqCst);
     if matches!(MODE.load(Ordering::Acquire), 1 | 5) && depth == 1 {
-        if MODE.load(Ordering::Acquire) == 5 {
-            unsafe { upcall::enable_observer() }.unwrap();
-            let native =
-                Handle::<Thread>::borrowed(rt::abi::Handle(NATIVE.load(Ordering::Acquire)));
-            sys::thread_layer_request(&native).unwrap();
-            upcall::mask_observer().unwrap();
-        } else {
-            unsafe { upcall::enable() }.unwrap();
-            poke();
-            upcall::mask().unwrap();
-        }
+        unsafe { upcall::enable() }.unwrap();
+        poke();
+        upcall::mask().unwrap();
         assert_eq!(DEEPEST.load(Ordering::Acquire), 2);
     }
     if MODE.load(Ordering::Acquire) == 3 {
-        let base = rt::abi::UPCALL_CONTEXT_OFFSET;
         let pc = dispatch as *const () as u64;
         let buffer = rt::msgbuf::address() as u64;
         for (sp, pc, flags, buffer) in [
@@ -96,7 +117,7 @@ unsafe extern "C" fn dispatch() {
             (0x2000, pc + 2, 0, buffer),
         ] {
             for (index, value) in [(31, sp), (32, pc), (33, flags), (35, buffer)] {
-                rt::msgbuf::write(base + index * 8, &value.to_le_bytes());
+                upcall::write_context_word(index, value);
             }
             let result =
                 unsafe { sys::raw::<{ rt::abi::Call::ThreadUpcallReturn.number() }>([0; 10]) };
@@ -117,7 +138,8 @@ unsafe extern "C" fn dispatch() {
     }
 }
 unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
-    unsafe { upcall::bind(entry) }.unwrap();
+    let mode = MODE.load(Ordering::Acquire);
+    unsafe { upcall::bind(if mode == 5 { own_entry } else { entry }) }.unwrap();
     let self_native = unsafe { threads::probe_native(ffi::pthread_self()) }.unwrap();
     NATIVE.store(self_native.raw().0, Ordering::Release);
     sys::thread_set_priority(&self_native, 10, rt::abi::Policy::Fifo).unwrap();
@@ -126,14 +148,13 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     let drain = sys::channel_create(10).unwrap();
     assert_eq!(sys::try_receive(&drain), Err(rt::abi::Error::WouldBlock));
     drop(drain);
-    let mode = MODE.load(Ordering::Acquire);
     if mode == 5 {
-        let tls: u64;
-        unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls, options(nomem, nostack)) };
-        OBSERVER_TLS.store(tls, Ordering::Release);
+        EXPECTED_ID.store(rt::msgbuf::address() as u64, Ordering::Release);
+        let tls = &raw const BLOCK as u64;
+        RESIDENT_TLS.store(tls, Ordering::Release);
         let guard = upcall::defer_entries().unwrap();
-        unsafe { upcall::bind_observer(observer_entry, tls as usize) }.unwrap();
-        unsafe { upcall::enable_observer() }.unwrap();
+        unsafe { upcall::bind_resident(resident_entry, tls as usize) }.unwrap();
+        unsafe { upcall::enable() }.unwrap();
         drop(guard);
     }
     if mode != 2 {
@@ -155,7 +176,7 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
         // SAFETY: the probe retains OUTPUT and state; delivery preserves its registers.
         unsafe {
             if mode == 5 {
-                native_observer_register_probe((*OUTPUT.0.get()).as_mut_ptr(), &STATE.seeded);
+                native_resident_register_probe((*OUTPUT.0.get()).as_mut_ptr(), &STATE.seeded);
             } else {
                 native_upcall_register_probe((*OUTPUT.0.get()).as_mut_ptr(), &STATE.seeded);
             }
@@ -185,7 +206,11 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
         valid &= output[100] == 0x800000 && output[101] == 1;
     }
     if mode == 5 {
-        upcall::unbind_observer().unwrap();
+        // The handler of the program ran once, after the outermost
+        // resident call, with the interrupted TLS back in place.
+        valid &= OWN_RAN.load(Ordering::SeqCst) == 1
+            && OWN_TLS.load(Ordering::SeqCst) == INTERRUPTED_TLS;
+        upcall::unbind_resident().unwrap();
     }
     upcall::unbind().unwrap();
     RESULT.store(if valid { 1 } else { 2 }, Ordering::Release);
@@ -235,6 +260,8 @@ pub(super) fn run() -> bool {
         RESULT.store(0, Ordering::Release);
         STATE.seeded.store(0, Ordering::Release);
         STATE.done.store(0, Ordering::Release);
+        OWN_RAN.store(0, Ordering::Release);
+        OWN_TLS.store(0, Ordering::Release);
         GO.store(0, Ordering::Release);
         let mut id = 0;
         assert_eq!(
@@ -277,11 +304,7 @@ pub(super) fn run() -> bool {
         if mode == 4 && sys::thread_info(&native).unwrap().state != ThreadState::Receiving {
             return failed(235);
         }
-        if mode == 5 {
-            sys::thread_layer_request(&native).unwrap();
-        } else {
-            poke();
-        }
+        poke();
         if mode == 2 {
             poke();
             if !matches!(
@@ -300,7 +323,12 @@ pub(super) fn run() -> bool {
         }
         if !wait_flag(&done, &waiter, &RESULT)
             || RESULT.load(Ordering::Acquire) != 1
-            || HANDLER_ID.load(Ordering::Acquire) != id
+            || HANDLER_ID.load(Ordering::Acquire)
+                != if mode == 5 {
+                    EXPECTED_ID.load(Ordering::Acquire)
+                } else {
+                    id
+                }
             || COUNT.load(Ordering::Acquire) != if matches!(mode, 1 | 5) { 2 } else { 1 }
             || DEEPEST.load(Ordering::Acquire) != if matches!(mode, 1 | 5) { 2 } else { 1 }
         {

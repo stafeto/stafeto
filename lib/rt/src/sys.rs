@@ -355,6 +355,7 @@ pub fn thread_start(thread: &Handle<Thread>) -> Result<(), Error> {
 /// thread_exit: the calling thread ends; the last started thread of a
 /// process ends the process with code 0.
 pub fn thread_exit() -> ! {
+    crate::upcall::run_exit_hook();
     // SAFETY: the call ends the thread and does not return.
     unsafe {
         asm!(
@@ -530,15 +531,6 @@ pub fn self_thread_managed() -> Result<Handle<Thread>, Error> {
         return Err(Error::InvalidArgs);
     }
     Ok(returned(&x))
-}
-
-/// Request a resident observer, with native-entry fallback.
-pub fn thread_layer_request(thread: &Handle<Thread>) -> Result<(), Error> {
-    call::<{ Call::ThreadUpcallControl.number() }>(&[
-        abi::UpcallControl::LayerRequest.raw(),
-        thread.raw().0,
-    ])?;
-    Ok(())
 }
 
 /// Request an explicitly published resident Layer of this MANAGE Process.

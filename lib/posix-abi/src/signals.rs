@@ -618,7 +618,7 @@ pub(crate) fn route() {
         });
         if let Some(Some(thread)) = entry {
             let native = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(thread));
-            let _ = sys::thread_layer_request(&native);
+            let _ = sys::thread_upcall_request(&native);
         }
     }
 }
@@ -812,7 +812,7 @@ fn send(
             Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
         let _ = sys::notify(&channel, posix_sync::bit::WAKE);
     } else if flags & flag::SIGNALS_READY != 0 && bit & !block.mask.load(Ordering::SeqCst) != 0 {
-        let _ = sys::thread_layer_request(native);
+        let _ = sys::thread_upcall_request(native);
     }
 }
 
@@ -1052,7 +1052,6 @@ pub fn sigtimedwait(
 }
 
 rt::upcall_entry!(entry, dispatch, context);
-rt::observer_upcall_entry!(observer_entry, dispatch, context);
 
 /// Where the calling thread's C errno lives: relibc's `__errno_location`. The entry saves and gives back
 /// the value there; it never moves the thread pointer (spec 2, 3.5).
@@ -1146,7 +1145,7 @@ pub(crate) fn stop_others() -> Result<(), i32> {
             }
             if asked & 1 << index == 0 {
                 asked |= 1 << index;
-                let _ = sys::thread_layer_request(&thread);
+                let _ = sys::thread_upcall_request(&thread);
             }
             let page = crate::process::page();
             let holds_process = block.process.load(Ordering::SeqCst)
@@ -1322,15 +1321,17 @@ pub(crate) fn attach() -> Result<(), i32> {
     Ok(())
 }
 
-/// Register the resident observer while common Defer keeps it from entering.
+/// Register the resident handler while common Defer keeps it from entering.
+/// The page names the thread's TCB, and its ABI word is the TLS of the
+/// handler.
 pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
     // SAFETY: admission owns this page through End and uses the fixed dispatcher.
-    unsafe { upcall::bind_observer(observer_entry, page as usize) }.map_err(|_| EIO)?;
+    unsafe { upcall::bind_resident(entry, page as usize) }.map_err(|_| EIO)?;
     // A failed publication removes the handler before bootstrap cleanup.
-    let result = unsafe { upcall::observer_layer_ready(true) }
-        .and_then(|()| unsafe { upcall::enable_observer() }.map(|_| ()));
+    let result = unsafe { upcall::primary_layer_ready(true) }
+        .and_then(|()| unsafe { upcall::enable() }.map(|_| ()));
     if result.is_err() {
-        upcall::unbind_observer().expect("bootstrap observer rollback");
+        upcall::unbind_resident().expect("bootstrap resident rollback");
         return Err(EIO);
     }
     // SAFETY: the page's ABI word points to its complete freshly built TCB.
@@ -1342,21 +1343,6 @@ pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
             .fetch_or(flag::SIGNALS_READY, Ordering::SeqCst)
     };
     Ok(())
-}
-
-fn entry_enable() -> Result<bool, rt::abi::Error> {
-    if crate::relibc::native::is_resident(own()) {
-        unsafe { upcall::enable_observer() }
-    } else {
-        unsafe { upcall::enable() }
-    }
-}
-fn entry_mask() -> Result<bool, rt::abi::Error> {
-    if crate::relibc::native::is_resident(own()) {
-        upcall::mask_observer()
-    } else {
-        upcall::mask()
-    }
 }
 
 /// Delivers the calling thread's pending unblocked signals now, with no call
@@ -1503,7 +1489,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
                 block.thread.load(Ordering::Relaxed),
             ));
-            let _ = sys::thread_layer_request(&thread);
+            let _ = sys::thread_upcall_request(&thread);
             break;
         }
         let Some((signal, action, from_process, ticket)) = take(block) else {
@@ -1560,11 +1546,11 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
                 unsafe { core::mem::transmute(handler as usize) };
             drop(preparation.take());
             if entered {
-                entry_enable().expect("nested signal entry");
+                unsafe { upcall::enable() }.expect("nested signal entry");
             }
             unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
             if entered {
-                entry_mask().expect("signal handler mask restoration");
+                upcall::mask().expect("signal handler mask restoration");
             }
             preparation = Some(SignalPreparation::begin());
             block.handled.fetch_add(1, Ordering::SeqCst);
@@ -1580,11 +1566,11 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
                 unsafe { core::mem::transmute(handler as usize) };
             drop(preparation.take());
             if entered {
-                entry_enable().expect("nested signal entry");
+                unsafe { upcall::enable() }.expect("nested signal entry");
             }
             unsafe { callback(signal) };
             if entered {
-                entry_mask().expect("signal handler mask restoration");
+                upcall::mask().expect("signal handler mask restoration");
             }
             preparation = Some(SignalPreparation::begin());
             block.handled.fetch_add(1, Ordering::SeqCst);

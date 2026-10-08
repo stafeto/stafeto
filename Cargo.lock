@@ -685,6 +685,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "entries",
  "proto-fs",
  "proto-init",
  "proto-uart",
