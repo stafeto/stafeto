@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use crate::jobs::Job;
 use crate::{
-    BOOT_PROFILE, BUILD_LOCK, ImageProgram, PROGRAM_TARGET, Variant, build, cargo, cargo_output,
-    llvm_tool, qemu, rootfs, target_dir, write_boot_image_files,
+    BOOT_PROFILE, BUILD_LOCK, ImageProgram, PROGRAM_TARGET, Variant, build, cargo, llvm_tool, qemu,
+    rootfs, target_dir, write_boot_image_files,
 };
 
 /// The image of a suite: the RAM files with the tests, pipes, the console
@@ -434,23 +434,158 @@ fn passes(work: &Path, test: &Test, text: &str) -> Result<bool, String> {
     expected(&expect, &test.test, text)
 }
 
+/// The link of the program os-test-probe, taken once from the build of
+/// the probe with the first test's object: the arguments the linker got,
+/// and the places in them that differ from test to test. Cargo's build of
+/// the probe costs more than two seconds a test for a link that takes
+/// a tenth of one, so the other tests are linked by the linker itself
+/// with the same arguments, their own archive of one object first on the
+/// search path.
+struct ProbeLink {
+    lld: PathBuf,
+    ar: PathBuf,
+    /// The arguments for rust-lld: the output file is at `output`, and
+    /// the search path of libostest.a, ahead of the build script's own,
+    /// at `search`.
+    args: Vec<String>,
+    output: usize,
+    search: usize,
+}
+
+/// The words in double quotes of `line`, as rustc prints a command with
+/// `--print link-args` (the escapes of a Rust string).
+fn quoted_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut word = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => break,
+                '\\' => match chars.next() {
+                    Some('n') => word.push('\n'),
+                    Some('t') => word.push('\t'),
+                    Some('r') => word.push('\r'),
+                    Some('0') => word.push('\0'),
+                    Some(other) => word.push(other),
+                    None => break,
+                },
+                other => word.push(other),
+            }
+        }
+        words.push(word);
+    }
+    words
+}
+
+/// The arguments of the linker in the `--print link-args` text `text`:
+/// the words after its `rust-lld`.
+fn linker_arguments(text: &str) -> Result<Vec<String>, String> {
+    let line = text
+        .lines()
+        .find(|l| l.contains("rust-lld\""))
+        .ok_or("the build of os-test-probe printed no link line")?;
+    let words = quoted_words(line);
+    let at = words
+        .iter()
+        .position(|w| w.ends_with("rust-lld"))
+        .ok_or("no rust-lld in the link line")?;
+    Ok(words[at + 1..].to_vec())
+}
+
+impl ProbeLink {
+    /// Builds the probe with `object` and reads how it was linked; `dir`
+    /// keeps the object of the program.
+    fn new(object: &str, dir: &Path) -> Result<ProbeLink, String> {
+        let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        // A new cfg flag makes cargo compile and link the probe again
+        // even when nothing else changed, so that its link line prints.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut cmd = cargo();
+        cmd.env("STAFETO_OS_TEST_OBJECT", object)
+            .arg("rustc")
+            .args(BOOT_PROFILE.args())
+            .args(["--target", PROGRAM_TARGET, "--package", "os-test-probe"])
+            .args(["--bin", "os-test-probe", "--"])
+            .args(["--print", "link-args", "-C", "save-temps"])
+            .args(["-A", "unexpected_cfgs", "--cfg"])
+            .arg(format!("ostest_link_{stamp}"));
+        let output = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(format!("{cmd:?} failed:\n{text}"));
+        }
+        let mut args = linker_arguments(&text)?;
+        let mut objects = args.iter_mut().filter(|a| a.ends_with(".rcgu.o"));
+        let (Some(program), None) = (objects.next(), objects.next()) else {
+            return Err("os-test-probe is not one object of code".into());
+        };
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let kept = dir.join("os-test-probe.o");
+        std::fs::copy(&*program, &kept)
+            .map_err(|e| format!("{} -> {}: {e}", program, kept.display()))?;
+        *program = kept.display().to_string();
+        let output = args
+            .iter()
+            .position(|a| a == "-o")
+            .ok_or("no -o in the link line")?
+            + 1;
+        let search = args
+            .iter()
+            .position(|a| a == "-flavor")
+            .ok_or("no -flavor in the link line")?
+            + 2;
+        args.splice(search..search, ["-L".to_owned(), String::new()]);
+        Ok(ProbeLink {
+            lld: llvm_tool("rust-lld")?,
+            ar: llvm_tool("llvm-ar")?,
+            args,
+            output: if output > search { output + 2 } else { output },
+            search: search + 1,
+        })
+    }
+
+    /// The program of `object`, linked into `elf`; `dir` is the place of
+    /// its archive.
+    fn link(&self, object: &str, dir: &Path, elf: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let archive = dir.join("libostest.a");
+        let _ = std::fs::remove_file(&archive);
+        let mut ar = Command::new(&self.ar);
+        ar.arg("crs").arg(&archive).arg(object);
+        crate::run_cmd(&mut ar)?;
+        let mut args = self.args.clone();
+        args[self.search] = dir.display().to_string();
+        args[self.output] = elf.display().to_string();
+        let mut lld = Command::new(&self.lld);
+        lld.args(&args);
+        crate::run_cmd(&mut lld)
+    }
+}
+
 /// The ELF file of `test`, its object linked with the layer and relibc
 /// into the program os-test-probe, stripped of what the image does not
-/// need, `elfs`/`<name>` kept beside it.
+/// need, `elfs`/`<name>` kept beside it. The first call builds the probe
+/// (ProbeLink); every call links its test with the linker alone.
 fn test_elf(test: &Test, object: &str, elfs: &Path) -> Result<Vec<u8>, String> {
-    // The build and the copy of its output go together: another build in
-    // between would leave its own file at the path every build shares.
-    let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut cmd = cargo();
-    cmd.env("STAFETO_OS_TEST_OBJECT", object)
-        .arg("build")
-        .args(BOOT_PROFILE.args())
-        .args(["--target", PROGRAM_TARGET, "--package", "os-test-probe"]);
-    crate::run_cmd(&mut cmd)?;
-    let built = cargo_output(&target_dir(), PROGRAM_TARGET, BOOT_PROFILE, "os-test-probe");
+    static LINK: OnceLock<Result<ProbeLink, String>> = OnceLock::new();
+    let work = elfs.parent().unwrap_or(elfs).join("link");
+    let link = LINK
+        .get_or_init(|| ProbeLink::new(object, &work))
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let name = test.name.replace('/', "__");
+    let built = work.join(format!("{name}.elf"));
+    link.link(object, &work.join(&name), &built)?;
     crate::disasm::erratum_835769(&built, &llvm_tool("llvm-objdump")?)?;
     crate::disasm::erratum_843419(&built)?;
-    let kept = elfs.join(test.name.replace('/', "__"));
+    let kept = elfs.join(&name);
     crate::run_cmd(
         Command::new(llvm_tool("llvm-objcopy")?)
             .arg("--strip-all")
@@ -689,6 +824,24 @@ mod tests {
     /// A boot's log: the services' lines around the runner's marks.
     fn log(text: &[&str]) -> String {
         text.join("\n") + "\n"
+    }
+
+    #[test]
+    fn reads_the_link_line_of_rustc() {
+        let text = "warning: x\nLC_ALL=\"C\" PATH=\"/a b:/c\" \"/t/rust-lld\" \"-flavor\" \"gnu\" \
+            \"/o/a\\\\b \\\"q\\\".rcgu.o\" \"-lostest\" \"-o\" \"/o/out\"\n    Finished\n";
+        assert_eq!(
+            linker_arguments(text).unwrap(),
+            [
+                "-flavor",
+                "gnu",
+                "/o/a\\b \"q\".rcgu.o",
+                "-lostest",
+                "-o",
+                "/o/out"
+            ]
+        );
+        assert!(linker_arguments("no link line here\n").is_err());
     }
 
     /// The test's own lines between its marks, `exit: N` for an empty
