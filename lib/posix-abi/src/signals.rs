@@ -1314,6 +1314,11 @@ pub(crate) fn attach() -> Result<(), i32> {
     if stopped_by_other() {
         park();
     }
+    // The thread may be the router the service was told of before its entry
+    // was bound: the signals that wait on the page come now.
+    if process_pending() != 0 {
+        route();
+    }
     let block = own();
     if thread_pending(block) & !block.mask.load(Ordering::SeqCst) != 0 {
         deliver_now();

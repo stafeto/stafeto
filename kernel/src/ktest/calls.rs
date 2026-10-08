@@ -274,6 +274,16 @@ pub fn object_info_self_thread_has_exact_ownership(_: &Boot) -> Result<(), &'sta
         )?;
         c.fails(n, &[1, abi::INFO_THREAD_SELF, 0], Error::InvalidArgs)?;
         // Only MANAGE, DUPLICATE and TRANSFER may be asked for.
+        // Bits above the 32 of a right count too.
+        c.fails(
+            n,
+            &[
+                0,
+                abi::INFO_THREAD_SELF,
+                1 << 32 | u64::from(Rights::MANAGE.0),
+            ],
+            Error::InvalidArgs,
+        )?;
         for extra in [Rights::SEND, Rights::RECEIVE, Rights::DEVICE, Rights::ALL] {
             c.fails(
                 n,

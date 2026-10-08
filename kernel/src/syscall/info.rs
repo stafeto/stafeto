@@ -17,9 +17,7 @@ use kcore::args::{inline_len_arg, reserved_arg};
 /// The rights SELF_THREAD may grant: those the creator of a thread gets
 /// from thread_create, so a thread gets nothing on itself that its creator
 /// did not have.
-const SELF_RIGHTS: Rights = Rights::MANAGE
-    .union(Rights::DUPLICATE)
-    .union(Rights::TRANSFER);
+const SELF_RIGHTS: Rights = abi::OWNER_RIGHTS;
 
 /// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2
 /// first (INVALID_ARGS), then the handle. For a process handle with any
