@@ -949,9 +949,9 @@ mod tests {
     fn a_poll_of_32_terminal_descriptions_splits_into_watches_of_16() {
         for count in [1, 16, 17, 31, 32] {
             let ready = poll(count).unwrap();
-            for index in 0..watch::MAX {
+            for (index, &got) in ready.iter().enumerate() {
                 let want = (index < count && (100 + index) % 3 == 0) as u32 * watch::IN;
-                assert_eq!(ready[index], want, "count {count}, position {index}");
+                assert_eq!(got, want, "count {count}, position {index}");
             }
         }
         // A 33rd element has no Watch to join, and the poll is refused.
