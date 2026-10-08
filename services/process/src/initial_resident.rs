@@ -425,10 +425,13 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
         self.map_reply(key).is_some()
             && match self.phase {
                 Phase::CRTWait => self.operation_pending.is_none(),
-                Phase::MapReplyUncertain => self
-                    .operation_pending
-                    .as_ref()
-                    .is_some_and(|pending| !effects.is_live(pending)),
+                Phase::MapReplyUncertain => {
+                    key == self.publication.map.receipt.key
+                        && self
+                            .operation_pending
+                            .as_ref()
+                            .is_some_and(|pending| !effects.is_live(pending))
+                }
                 _ => false,
             }
     }
@@ -889,6 +892,7 @@ mod tests {
                     effects.returned = false;
                     assert!(resident.map_step(&mut effects));
                 } else if outcome == MapDelivery::Consumed {
+                    assert!(!resident.can_begin_map_reply(Key::FIRST, &effects));
                     let calls = effects.calls;
                     assert!(resident.map_step(&mut effects));
                     assert_eq!(effects.calls, calls);
