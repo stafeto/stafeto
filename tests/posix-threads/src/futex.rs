@@ -186,10 +186,21 @@ pub(super) fn run() -> bool {
         return failed(621);
     }
     let deadline = rt::time::ticks_to_ns(rt::time::now()) + 5_000_000;
-    if futex_wait(&WORD, 0, CLOCK_MONOTONIC, Some(deadline)) != Err(ETIMEDOUT)
-        || !rt::time::reached(deadline)
-        || posix_sync::bucket_waiters(&WORD) != 0
-    {
+    let result = futex_wait(&WORD, 0, CLOCK_MONOTONIC, Some(deadline));
+    let reached = rt::time::reached(deadline);
+    let waiters = posix_sync::bucket_waiters(&WORD);
+    if result != Err(ETIMEDOUT) || !reached || waiters != 0 {
+        let tag = match result {
+            Err(errno) => -errno,
+            Ok(posix_sync::Woken::Woken) => 1,
+            Ok(posix_sync::Woken::Entry) => 2,
+        };
+        rt::println!(
+            "futex-probe: deadline result={} reached={} waiters={}",
+            tag,
+            u32::from(reached),
+            waiters
+        );
         return failed(622);
     }
     rt::println!(
