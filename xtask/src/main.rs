@@ -3209,14 +3209,16 @@ const TERM_B: u64 = 20_410;
 const RAM_STEP_MAX: u64 = TERM_B;
 
 /// The steps of the process service that are longer than term B today,
-/// until step 5z splits them: (kind, name, the longest the
-/// measurement gave at 4e9abf5). A step above its number fails
-/// `process-steps`; a step at or under B shows that its entry can go.
-const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64); 4] = [
-    (1, "Create", 61_398),
-    (22, "SpawnStart", 93_009),
-    (28, "ExecStart", 51_030),
-    (34, "ForkStart", 54_398),
+/// until step 5z splits them: (kind, name, the longest the measurement
+/// gave at 4e9abf5 with 4 branches of children (`ci`), and with any other
+/// number, which the 7 branches of the plain command bound). A step above
+/// its number fails `process-steps`; a step at or under B shows that its
+/// entry can go.
+const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64, u64); 4] = [
+    (1, "Create", 61_398, 61_398),
+    (22, "SpawnStart", 92_262, 93_009),
+    (28, "ExecStart", 50_978, 51_030),
+    (34, "ForkStart", 54_369, 54_398),
 ];
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
@@ -3426,7 +3428,8 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     }
     // Every step of the process service stays under term B but the four
     // that the list PROCESS_STEPS_ABOVE_B holds, each within its number.
-    for &(kind, name, limit) in &PROCESS_STEPS_ABOVE_B {
+    for &(kind, name, at_4, at_7) in &PROCESS_STEPS_ABOVE_B {
+        let limit = if branches == 4 { at_4 } else { at_7 };
         let ticks = longest(kind);
         if ticks == 0 || ticks > limit {
             return Err(format!(
