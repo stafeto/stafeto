@@ -61,10 +61,99 @@ impl Ack {
     }
 }
 
+pub const REPLY: usize = 48;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reply {
+    pub receipt: Receipt,
+}
+impl Reply {
+    pub fn write(self, w: &mut Writer) -> Result<(), Status> {
+        if self.receipt.key.image != crate::IMAGE {
+            return Err(Status::BadSize);
+        }
+        w.bytes(&proto_wire::reply(Status::Ok))?;
+        Query {
+            receipt: self.receipt,
+        }
+        .write(w)
+    }
+    pub fn read_expected(bytes: &[u8], handles: usize, expected: Receipt) -> Result<Self, Status> {
+        if handles != 0 {
+            return Err(Status::BadSize);
+        }
+        let mut r = Reader::new(bytes);
+        let status = Status::from_code(r.u32()?);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        if status != Status::Ok {
+            r.finish()?;
+            return Err(status);
+        }
+        if bytes.len() != REPLY {
+            return Err(Status::BadSize);
+        }
+        let receipt = Query::read(r.bytes(40)?, 1)?.receipt;
+        r.finish()?;
+        if receipt != expected || receipt.key.image != crate::IMAGE {
+            return Err(Status::BadSize);
+        }
+        Ok(Self { receipt })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Label, initial_map::Key};
+    #[test]
+    fn success_reply_echoes_exact_receipt_and_status_only_success_is_refused() {
+        let label = Label {
+            index: 2,
+            generation: 7,
+        };
+        let receipt = Receipt {
+            key: Key {
+                key: 67,
+                image: crate::IMAGE,
+            },
+            label: label.raw_at(crate::IMAGE),
+            pid: label.pid(),
+            init_ticket: 67,
+        };
+        let reply = Reply { receipt };
+        let mut w = Writer::new();
+        reply.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), REPLY);
+        assert_eq!(Reply::read_expected(w.as_bytes(), 0, receipt), Ok(reply));
+        assert!(Reply::read_expected(w.as_bytes(), 1, receipt).is_err());
+        assert!(Reply::read_expected(&proto_wire::reply(Status::Ok), 0, receipt).is_err());
+        for end in 0..REPLY {
+            assert!(Reply::read_expected(&w.as_bytes()[..end], 0, receipt).is_err());
+        }
+        let mut trailing = [0; 49];
+        trailing[..48].copy_from_slice(w.as_bytes());
+        assert!(Reply::read_expected(&trailing, 0, receipt).is_err());
+        let mut bad = [0; 48];
+        bad.copy_from_slice(w.as_bytes());
+        bad[4] = 1;
+        assert!(Reply::read_expected(&bad, 0, receipt).is_err());
+        let mut other = receipt;
+        other.key.key += 1;
+        other.init_ticket += 1;
+        assert!(Reply::read_expected(w.as_bytes(), 0, other).is_err());
+        assert_eq!(
+            Reply::read_expected(
+                &proto_wire::reply(Status::Kernel(abi::Error::BadState)),
+                0,
+                receipt
+            ),
+            Err(Status::Kernel(abi::Error::BadState))
+        );
+        bad[..8].copy_from_slice(&proto_wire::reply(Status::Kernel(abi::Error::BadState)));
+        assert!(Reply::read_expected(&bad, 0, receipt).is_err());
+    }
     #[test]
     fn exact_body_preserves_epoch_and_rejects_capabilities_reserved_and_aliases() {
         let label = Label {

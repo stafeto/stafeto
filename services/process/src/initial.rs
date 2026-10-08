@@ -31,7 +31,7 @@ impl Processes {
             label: ack.label,
         };
         if record.initial_ack_replay_matches(ticket, ack) {
-            return Answer::Status(Status::Ok);
+            return receipt_reply(request, ack.receipt);
         }
         let Some(resident) = self.replacing[index].as_mut().and_then(Work::initial_mut) else {
             return crate::refuse(proto_process::PERMISSION);
@@ -49,7 +49,7 @@ impl Processes {
         origin.flags |= posix_process_service::initial_origin::INIT_ACKED;
         assert!(record.set_initial_origin(ticket, origin));
         self.kick();
-        Answer::Status(Status::Ok)
+        receipt_reply(request, ack.receipt)
     }
 
     pub(super) fn initial_stage(&mut self, request: &mut Request<'_>) -> Answer {
@@ -561,10 +561,8 @@ fn receipt_reply(
     request: &mut Request<'_>,
     receipt: proto_process::initial_map::Receipt,
 ) -> Answer {
-    request
-        .reply()
-        .bytes(&proto_wire::reply(Status::Ok))
-        .and_then(|()| proto_process::initial_identity::Query { receipt }.write(request.reply()))
+    proto_process::initial_ack::Reply { receipt }
+        .write(request.reply())
         .expect("the fixed initial receipt reply");
     Answer::Reply(rt::handle::Outgoing::new())
 }
