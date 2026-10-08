@@ -39,7 +39,7 @@ const BUFFERS_PORTION: usize = 32;
 /// (spec 7.7): half a chunk, each last copy of a session telling its
 /// receiver the client is gone.
 const HANDLES_PORTION: usize = kcore::handles::CHUNK / 2;
-const _: () = assert!(kcore::handles::CHUNK % HANDLES_PORTION == 0);
+const _: () = assert!(kcore::handles::CHUNK.is_multiple_of(HANDLES_PORTION));
 
 /// The units of work of a frame that goes back to the frame allocator
 /// (spec 7.7): its free may merge blocks up to kcore::frames::MAX_ORDER.
