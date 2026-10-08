@@ -515,9 +515,17 @@ static void *report_stack(void *arg) {
     return arg;
 }
 
+static void *report_stack_default(void *arg) {
+    return arg;
+}
+
 static void stack_address(void) {
-    own_stack = malloc(OWN_STACK + GUARD_BYTES);
-    CHECK(own_stack != NULL);
+    /* Aligned to a page: the layer would unmap such a stack when the thread
+     * ended, and round the length up, over the bytes after it. */
+    void *memory = NULL;
+    CHECK(posix_memalign(&memory, 4096, OWN_STACK + GUARD_BYTES) == 0);
+    own_stack = memory;
+    memset(own_stack, 0x3C, 4096);
     memset(own_stack + OWN_STACK, 0xA5, GUARD_BYTES);
     pthread_attr_t attr;
     CHECK(pthread_attr_init(&attr) == 0);
@@ -530,11 +538,28 @@ static void stack_address(void) {
     CHECK(pthread_create(&thread, &attr, report_stack, NULL) == 0);
     CHECK(pthread_join(thread, NULL) == 0);
     CHECK(on_own_stack == 1);
+    /* Another thread, joined, so that the layer collects the first one. */
+    pthread_t other;
+    CHECK(pthread_create(&other, NULL, report_stack_default, NULL) == 0);
+    CHECK(pthread_join(other, NULL) == 0);
+    /* The second thread collects the first as it ends, after its join
+     * returned: give it the time. */
+    sleep_ms(100);
+    /* The memory is still the application's: the first page and the bytes
+     * after the end are as they were (a read of an unmapped page faults),
+     * and the heap takes the buffer back and gives memory again. */
+    for (int i = 0; i < 4096; i++)
+        CHECK((unsigned char)own_stack[i] == 0x3C);
     for (int i = 0; i < GUARD_BYTES; i++)
         CHECK((unsigned char)own_stack[OWN_STACK + i] == 0xA5);
     /* A misaligned address or end is refused. */
     CHECK(pthread_attr_setstack(&attr, own_stack + 8, OWN_STACK) == EINVAL);
     CHECK(pthread_attr_setstack(&attr, own_stack, OWN_STACK + 8) == EINVAL);
+    free(memory);
+    void *again = malloc(OWN_STACK);
+    CHECK(again != NULL);
+    memset(again, 0, OWN_STACK);
+    free(again);
     printf("relibc-threads: a thread ran on the stack given to pthread_attr_setstack\n");
 }
 

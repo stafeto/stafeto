@@ -22,7 +22,7 @@ import sys
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
 # A commit of the fork's branch stafeto, tagged pin-<short hash>.
-COMMIT = "1bff15ca76d97c2ee4b43315c55157d1868aeea7"
+COMMIT = "abfb7f54be8bb4fae515ea58e3fca9223cc89c64"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
