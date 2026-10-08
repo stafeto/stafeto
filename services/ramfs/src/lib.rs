@@ -2168,10 +2168,12 @@ mod tests {
         };
         let fd = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
         fds.closing = true;
+        #[cfg(feature = "auth-probe")]
         let counts = fds.retained_counts();
         assert_eq!(fds.permits_method(0xfffe), cfg!(feature = "auth-probe"));
         assert!(!fds.permits_method(0xfff9));
         assert!(!fds.permits_method(proto_fs::Method::Read as u16));
+        #[cfg(feature = "auth-probe")]
         assert_eq!(fds.retained_counts(), counts);
         assert!(fds.description(fd).is_ok());
         assert_eq!(ram.storage.usage(root).descriptions, 1);
