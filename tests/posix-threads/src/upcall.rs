@@ -23,6 +23,9 @@ const INTERRUPTED_TLS: u64 = 0x5a5a_0010;
 /// What the handler of the program saw in TPIDR_EL0, and how often it ran.
 static OWN_TLS: AtomicU64 = AtomicU64::new(0);
 static OWN_RAN: AtomicUsize = AtomicUsize::new(0);
+/// 1 when the handler of the program did not run exactly once, 2 when it saw
+/// another TLS than the interrupted one.
+static OWN_FAIL: AtomicUsize = AtomicUsize::new(0);
 struct Output(UnsafeCell<[u64; 106]>);
 // SAFETY: only one joined worker writes OUTPUT; publication uses RESULT.
 unsafe impl Sync for Output {}
@@ -208,8 +211,12 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     if mode == 5 {
         // The handler of the program ran once, after the outermost
         // resident call, with the interrupted TLS back in place.
-        valid &= OWN_RAN.load(Ordering::SeqCst) == 1
-            && OWN_TLS.load(Ordering::SeqCst) == INTERRUPTED_TLS;
+        if OWN_RAN.load(Ordering::SeqCst) != 1 {
+            OWN_FAIL.store(1, Ordering::SeqCst);
+        } else if OWN_TLS.load(Ordering::SeqCst) != INTERRUPTED_TLS {
+            OWN_FAIL.store(2, Ordering::SeqCst);
+        }
+        valid &= OWN_FAIL.load(Ordering::SeqCst) == 0;
         upcall::unbind_resident().unwrap();
     }
     upcall::unbind().unwrap();
@@ -261,6 +268,7 @@ pub(super) fn run() -> bool {
         STATE.seeded.store(0, Ordering::Release);
         STATE.done.store(0, Ordering::Release);
         OWN_RAN.store(0, Ordering::Release);
+        OWN_FAIL.store(0, Ordering::Release);
         OWN_TLS.store(0, Ordering::Release);
         GO.store(0, Ordering::Release);
         let mut id = 0;
@@ -321,7 +329,11 @@ pub(super) fn run() -> bool {
             }
             GO.store(1, Ordering::Release);
         }
-        if !wait_flag(&done, &waiter, &RESULT)
+        let waited = wait_flag(&done, &waiter, &RESULT);
+        if waited && OWN_FAIL.load(Ordering::Acquire) != 0 {
+            return failed(2330 + OWN_FAIL.load(Ordering::Acquire));
+        }
+        if !waited
             || RESULT.load(Ordering::Acquire) != 1
             || HANDLER_ID.load(Ordering::Acquire)
                 != if mode == 5 {

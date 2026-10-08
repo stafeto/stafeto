@@ -109,20 +109,31 @@ fn bind_kernel_once() -> Result<(), Error> {
     Ok(())
 }
 
-/// Removes the entry from the kernel when the record has no handler left.
-fn unbind_kernel_if_empty() -> Result<(), Error> {
-    if word(ENTRY_OWN).load(Ordering::Relaxed) == 0
+/// Whether the record names no handler.
+fn empty() -> bool {
+    word(ENTRY_OWN).load(Ordering::Relaxed) == 0
         && word(ENTRY_RESIDENT).load(Ordering::Relaxed) == 0
-        && word(ENTRY_FLAGS).load(Ordering::Relaxed) & KERNEL_BOUND != 0
-    {
-        kernel_bind(0)?;
-        word(ENTRY_FLAGS).fetch_and(!KERNEL_BOUND, Ordering::Relaxed);
+}
+
+/// Once the last handler is gone the entry stays bound in the kernel and is
+/// masked: the distributor is bound once for the thread's life, and no
+/// state of the kernel decides whether a handler may be removed.
+fn mask_if_empty() -> Result<(), Error> {
+    if empty() {
+        mask()?;
     }
     Ok(())
 }
 
 /// Register the handler of the program on the current thread, replacing
-/// the one it had; the entry is masked until `enable`.
+/// the one it had; the entry is masked until `enable`. The mask is common
+/// to both handlers: until the program enables, the signals of the layer on
+/// this thread wait too, and the layer does not enable an entry whose
+/// handler the program bound (`bind_resident`).
+///
+/// A child of a `fork` made inside a handler does not return from that
+/// handler: it makes `_exit` or `exec` (its thread has depth 0 and no
+/// entry record, while its stack holds the frames of the parent's handlers).
 /// # Safety
 /// `dispatch` must be safe at every point where delivery is enabled,
 /// including reentry into interrupted Rust code. A long jump out of it
@@ -136,47 +147,49 @@ pub unsafe fn bind(dispatch: Dispatch) -> Result<(), Error> {
         // too: the program enables when its policy is set.
         mask()?;
     }
-    word(ENTRY_OWN).store(dispatch as usize as u64, Ordering::Relaxed);
+    // The last write: an entry on this thread between the writes sees the
+    // handler only after everything else is in place.
+    word(ENTRY_OWN).store(dispatch as usize as u64, Ordering::Release);
     Ok(())
 }
 
-/// Remove the handler of the program; the entry leaves the kernel with the
-/// last handler. BAD_STATE while a handler is live, an entry is deferred,
-/// or a handler was left by a long jump.
+/// Remove the handler of the program. The distributor stays bound in the
+/// kernel for the thread's life; with no handler left the entry is masked,
+/// and a request made later interrupts a wait for nothing until the next
+/// `bind` and `enable`. Removing the last handler from inside a handler takes
+/// effect for the next entries; the return of that handler lets the entry in
+/// again (the return of an entry always does), so requests interrupt waits
+/// until the next `mask`.
 pub fn unbind() -> Result<(), Error> {
-    let old = word(ENTRY_OWN).swap(0, Ordering::Relaxed);
-    if let Err(error) = unbind_kernel_if_empty() {
-        word(ENTRY_OWN).store(old, Ordering::Relaxed);
-        return Err(error);
-    }
-    Ok(())
+    word(ENTRY_OWN).store(0, Ordering::Release);
+    mask_if_empty()
 }
 
 /// Register the resident handler of a library on the current thread: it
 /// runs first in each entry, with `tls` in TPIDR_EL0, and TPIDR_EL0 comes
-/// back to the interrupted value when it returns.
+/// back to the interrupted value when it returns. Returns whether the
+/// record had no handler before: then the entry is masked and the caller
+/// owns the mask state and may `enable`; otherwise the program bound a
+/// handler and owns it, and the caller leaves the mask alone.
 /// # Safety
 /// `tls` names a resident ABI word whose TCB and block remain valid until
 /// this thread ends or the handler is removed; `dispatch` is safe as for
 /// `bind`.
-pub unsafe fn bind_resident(dispatch: Dispatch, tls: usize) -> Result<(), Error> {
+pub unsafe fn bind_resident(dispatch: Dispatch, tls: usize) -> Result<bool, Error> {
     if tls == 0 {
         return Err(Error::InvalidArgs);
     }
+    let was_empty = empty();
     bind_kernel_once()?;
     word(ENTRY_TLS).store(tls as u64, Ordering::Relaxed);
-    word(ENTRY_RESIDENT).store(dispatch as usize as u64, Ordering::Relaxed);
-    Ok(())
+    word(ENTRY_RESIDENT).store(dispatch as usize as u64, Ordering::Release);
+    Ok(was_empty)
 }
 
-/// Remove the resident handler. Refused as `unbind` is.
+/// Remove the resident handler; the rules of `unbind` apply.
 pub fn unbind_resident() -> Result<(), Error> {
-    let old = word(ENTRY_RESIDENT).swap(0, Ordering::Relaxed);
-    if let Err(error) = unbind_kernel_if_empty() {
-        word(ENTRY_RESIDENT).store(old, Ordering::Relaxed);
-        return Err(error);
-    }
-    Ok(())
+    word(ENTRY_RESIDENT).store(0, Ordering::Release);
+    mask_if_empty()
 }
 
 /// Publish or remove this current thread's primary Layer role.
@@ -213,9 +226,7 @@ pub fn mask() -> Result<bool, Error> {
 /// The bound handlers may run before this call returns; all interrupted code
 /// and live resources must permit this asynchronous reentry.
 pub unsafe fn enable() -> Result<bool, Error> {
-    if word(ENTRY_OWN).load(Ordering::Relaxed) == 0
-        && word(ENTRY_RESIDENT).load(Ordering::Relaxed) == 0
-    {
+    if empty() {
         return Ok(true);
     }
     control(UpcallControl::Enable)
@@ -311,6 +322,8 @@ macro_rules! upcall_entry {
 /// resident handler and then the handler of the program (see the `entries`
 /// package for the rules), and returns. IPC data and handle metadata survive.
 ///
+/// No `#[thread_local]` anywhere on this path (the handlers included, as far as
+/// they run with the resident TLS): the register holds the resident TLS there.
 /// TPIDR_EL0 is switched only here, in plain assembly: Rust code could keep
 /// the old thread pointer across a write to the register. The register is
 /// back at the interrupted value (word 34 of the frame) after the resident

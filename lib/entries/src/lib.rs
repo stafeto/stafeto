@@ -12,6 +12,7 @@
 //! Stacks grow down. A frame is named by its lowest address. A call and
 //! everything it calls lie below its frame.
 #![no_std]
+#![forbid(unsafe_code)]
 
 /// Before the resident call of the entry whose frame is `frame`: whether the
 /// entry records its frame in `outer` (and so has to clear it afterwards).

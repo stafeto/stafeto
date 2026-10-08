@@ -1324,13 +1324,35 @@ pub(crate) fn attach() -> Result<(), i32> {
 /// Register the resident handler while common Defer keeps it from entering.
 /// The page names the thread's TCB, and its ABI word is the TLS of the
 /// handler.
+/// Makes the next attachment of a native thread fail after its handler is
+/// bound and its role published, for the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_fail_next_attach() {
+    PROBE_FAIL_ATTACH.store(true, Ordering::SeqCst);
+}
+#[cfg(feature = "thread-probe")]
+static PROBE_FAIL_ATTACH: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
     // SAFETY: admission owns this page through End and uses the fixed dispatcher.
-    unsafe { upcall::bind_resident(entry, page as usize) }.map_err(|_| EIO)?;
-    // A failed publication removes the handler before bootstrap cleanup.
-    let result = unsafe { upcall::primary_layer_ready(true) }
-        .and_then(|()| unsafe { upcall::enable() }.map(|_| ()));
+    let owns_mask = unsafe { upcall::bind_resident(entry, page as usize) }.map_err(|_| EIO)?;
+    // The layer lets entries in only when it bound the first handler of the
+    // thread: a handler the program bound before keeps the program's mask.
+    // A failed step removes the role and the handler before bootstrap cleanup.
+    let published = unsafe { upcall::primary_layer_ready(true) };
+    let mut result = published;
+    #[cfg(feature = "thread-probe")]
+    if result.is_ok() && PROBE_FAIL_ATTACH.swap(false, Ordering::SeqCst) {
+        result = Err(Error::BadState);
+    }
+    if result.is_ok() && owns_mask {
+        result = unsafe { upcall::enable() }.map(|_| ());
+    }
     if result.is_err() {
+        if published.is_ok() {
+            unsafe { upcall::primary_layer_ready(false) }.expect("bootstrap role rollback");
+        }
         upcall::unbind_resident().expect("bootstrap resident rollback");
         return Err(EIO);
     }

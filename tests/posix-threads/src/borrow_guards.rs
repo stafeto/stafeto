@@ -36,7 +36,6 @@ fn simple() -> bool {
     poke();
     poke();
     if COUNT.load(Ordering::Acquire) != 0
-        || upcall::unbind() != Err(Error::BadState)
         || sys::receive(&gate) != Err(Error::Interrupted)
         || sys::try_receive(&gate) != Err(Error::WouldBlock)
     {

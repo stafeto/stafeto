@@ -33,6 +33,10 @@ pub unsafe fn attach_installed(tcb: *mut Tcb, id: u64) {
     unsafe { (*tcb).block.thread_id = id };
 }
 
+/// A long jump out of a handler of the layer does not cross the boundary of
+/// this scope: the `sigsetjmp` it jumps to lies inside the same scope, since
+/// the jump skips the end of the scope and leaves the resident TLS in place.
+///
 /// Runs `run` with a block of the layer: the thread's own, or a transient
 /// one on this stack for a thread that has none, which goes when `run`
 /// returns.

@@ -6,7 +6,8 @@
 //! receive. Variants cover what the jump leaves behind: a second wait deeper
 //! than the abandoned frame (1), a second wait whose entry frame overlaps the
 //! abandoned one (2, the base scenario), two jumps in a row (3), a jump inside
-//! a handler (4) and a jump of the program's own that calls `abandon` (5).
+//! a handler (4) and a jump of the program's own that calls `abandon` (5), a failed attachment of
+//! a native thread (6) and a program's mask that the layer leaves alone (7).
 use super::*;
 use crate::layer::signals::{self as api, SigAction};
 use rt::{
@@ -85,6 +86,10 @@ static RAW: AtomicUsize = AtomicUsize::new(0);
 static SHAPE: AtomicUsize = AtomicUsize::new(0);
 const ENTRY_FRAME: u64 = 1904;
 
+/// Records the first failed check; later ones do not overwrite it.
+fn fail(code: usize) {
+    let _ = ERROR.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
+}
 fn borrowed(raw: &AtomicU64) -> core::mem::ManuallyDrop<Handle<Channel>> {
     Handle::borrowed(rt::abi::Handle(raw.load(Ordering::SeqCst)))
 }
@@ -129,7 +134,7 @@ extern "C" fn body() {
     // Nobody sends here: only the entry of the signal ends this wait, and
     // its handler leaves by siglongjmp.
     let _ = sys::receive(&borrowed(&BLOCKING));
-    ERROR.store(1, Ordering::SeqCst);
+    fail(1);
 }
 static JUMP_STAGE: AtomicUsize = AtomicUsize::new(0);
 /// How often the exit hook of the worker ran.
@@ -195,7 +200,7 @@ extern "C" fn worker(_: u64) -> ! {
         result
     });
     if jumped != 1 {
-        ERROR.store(2, Ordering::SeqCst);
+        fail(2);
     }
     stage(JUMP_STAGE.fetch_add(1, Ordering::SeqCst) + 1);
     // Only a request of this thread's own entry ends this wait.
@@ -210,9 +215,9 @@ extern "C" fn worker(_: u64) -> ! {
         _ => true,
     };
     if result != Err(Error::Interrupted) || PRIMARY.load(Ordering::SeqCst) != 1 {
-        ERROR.store(3, Ordering::SeqCst);
+        fail(3);
     } else if !shape_ok {
-        ERROR.store(9, Ordering::SeqCst);
+        fail(9);
     }
     stage(JUMP_STAGE.fetch_add(1, Ordering::SeqCst) + 1);
     upcall::set_exit_hook(Some(exit_hook));
@@ -224,20 +229,20 @@ unsafe extern "C" fn outer_handler(_signal: c_int) {
     // SAFETY: the buffer outlives the jump; the body runs on this stack.
     let r = unsafe { native_jump_around((*INNER.0.get()).as_mut_ptr(), inner_body) };
     if r != 1 {
-        ERROR.store(4, Ordering::SeqCst);
+        fail(4);
     }
     stage(3);
     // The request of the own entry comes while this handler is live: the
     // nested entry may not call the program's handler.
     let result = sys::receive(&borrowed(&BLOCKING));
     if result != Err(Error::Interrupted) || PRIMARY.load(Ordering::SeqCst) != 0 {
-        ERROR.store(5, Ordering::SeqCst);
+        fail(5);
     }
 }
 extern "C" fn inner_body() {
     stage(2);
     let _ = sys::receive(&borrowed(&BLOCKING));
-    ERROR.store(6, Ordering::SeqCst);
+    fail(6);
 }
 /// The worker of variant 4.
 extern "C" fn worker_inside(_: u64) -> ! {
@@ -260,19 +265,19 @@ extern "C" fn worker_inside(_: u64) -> ! {
         if unsafe { api::sigaction(SIGUSR1, &outer, &mut old[0]) } != 0
             || unsafe { api::sigaction(SIGUSR2, &inner, &mut old[1]) } != 0
         {
-            ERROR.store(7, Ordering::SeqCst);
+            fail(7);
         }
         stage(1);
         // The entry of SIGUSR1 ends this wait once its handler returns.
         if sys::receive(&borrowed(&BLOCKING)) != Err(Error::Interrupted) {
-            ERROR.store(8, Ordering::SeqCst);
+            fail(8);
         }
         let _ = unsafe { api::sigaction(SIGUSR1, &old[0], ptr::null_mut()) };
         let _ = unsafe { api::sigaction(SIGUSR2, &old[1], ptr::null_mut()) };
     });
     // After the outer handler returned, the program's handler has run once.
     if PRIMARY.load(Ordering::SeqCst) != 1 {
-        ERROR.store(10, Ordering::SeqCst);
+        fail(10);
     }
     upcall::set_exit_hook(Some(exit_hook));
     stage(4);
@@ -290,6 +295,55 @@ struct Ctx {
 
 fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
+}
+
+/// The worker of variant 6: no handler of its own; the first attachment of
+/// the layer fails after it bound its handler and published its role, the
+/// rollback leaves the thread clean, and the second attachment works: a
+/// request of the thread's own entry ends a receive.
+extern "C" fn worker_rollback(_: u64) -> ! {
+    abi::signals::probe_fail_next_attach();
+    let mut ran = 0;
+    tls::with_process(|| ran += 1);
+    if ran != 1 {
+        fail(11);
+    }
+    tls::with_process(|| {
+        stage(1);
+        if sys::receive(&borrowed(&BLOCKING)) != Err(Error::Interrupted) {
+            fail(12);
+        }
+    });
+    stage(2);
+    sys::thread_exit()
+}
+
+/// The worker of variant 7: the program binds a handler and keeps the entry
+/// masked; the attachment of the layer does not enable it.
+extern "C" fn worker_masked(_: u64) -> ! {
+    // SAFETY: as in `worker`.
+    unsafe { upcall::bind(primary_entry) }.expect("native primary bind");
+    tls::with_process(|| {
+        stage(1);
+        // The request comes while the program holds the mask; the wait ends
+        // by the notification of the coordinator, not by the request.
+        if !matches!(
+            sys::receive(&borrowed(&BLOCKING)),
+            Ok(sys::Received::Notification { .. })
+        ) {
+            fail(13);
+        }
+        if PRIMARY.load(Ordering::SeqCst) != 0 {
+            fail(14);
+        }
+        // SAFETY: the handler is safe at this point.
+        unsafe { upcall::enable() }.expect("native primary enable");
+        if PRIMARY.load(Ordering::SeqCst) != 1 {
+            fail(15);
+        }
+    });
+    stage(2);
+    sys::thread_exit()
 }
 
 fn await_stage(ctx: &Ctx, value: usize) -> bool {
@@ -425,6 +479,43 @@ fn finish(name: &str, code: usize, ended: &Handle<Channel>) -> bool {
     true
 }
 
+/// Variants 6 and 7: workers with a single request of their own entry.
+#[inline(never)]
+fn attach(
+    name: &str,
+    code: usize,
+    entry: extern "C" fn(u64) -> !,
+    slot: usize,
+    ctx: &Ctx,
+    level: u8,
+    base: u8,
+) -> bool {
+    STAGE.store(0, Ordering::SeqCst);
+    HOOK_RAN.store(0, Ordering::SeqCst);
+    PRIMARY.store(0, Ordering::SeqCst);
+    ERROR.store(0, Ordering::SeqCst);
+    let Some((native, ended)) = spawn(entry, slot, level, base) else {
+        return failed(code + 1);
+    };
+    if !await_stage(ctx, 1) || !receiving(ctx, &native) {
+        return failed(code + 2);
+    }
+    if sys::thread_upcall_request(&native).is_err() {
+        return failed(code + 3);
+    }
+    // Variant 7 releases the masked receive by a notification.
+    if code == 1570 {
+        let _ = sys::notify(&borrowed(&BLOCKING), 1);
+    }
+    if !await_stage(ctx, 2) {
+        rt::println!("native-jump: no end of the wait ({name})");
+        return failed(code + 4);
+    }
+    // These workers exit through thread_exit with no hook set.
+    HOOK_RAN.store(1, Ordering::SeqCst);
+    finish(name, code, &ended)
+}
+
 /// Variant 4: a jump to a target inside the live handler of the layer.
 #[inline(never)]
 fn inside(ctx: &Ctx, level: u8, base: u8) -> bool {
@@ -521,6 +612,22 @@ pub(super) fn run() -> bool {
     }
     // 4: a jump inside a handler.
     if !inside(&ctx, level, base) {
+        return false;
+    }
+    // 6: a failed attachment is rolled back and the next one works.
+    if !attach(
+        "failed attachment",
+        1560,
+        worker_rollback,
+        5,
+        &ctx,
+        level,
+        base,
+    ) {
+        return false;
+    }
+    // 7: the layer leaves the mask of a program's handler alone.
+    if !attach("program mask", 1570, worker_masked, 6, &ctx, level, base) {
         return false;
     }
     rt::println!("native-jump: own entry after siglongjmp from a layer handler");
