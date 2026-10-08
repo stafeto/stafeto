@@ -824,12 +824,13 @@ const TEARDOWN_ROWS: [&str; 9] = [
     "threads",
 ];
 /// Scoped direct-control, pick + park and continuation measurements.
-const SUSPENSION_ROWS: [&str; 5] = [
+const SUSPENSION_ROWS: [&str; 6] = [
     "control_stop_no_queue",
     "control_stop_cancel",
     "pick_park_selected",
     "control_continue",
     "resume_64",
+    "longest_portion",
 ];
 /// The rows of the line of the test init's `normal_build_costs`, in its
 /// order: the costs of the build that ships (spec 15.3).
@@ -3194,10 +3195,13 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
 /// processes fails it at once (5b's Vouch took 539 ticks an entry).
 const VOUCH_TICKS_MAX: u64 = 6_000;
 
-/// Term B of the kernel (`abi::time::TERM_B_TICKS`, with its source):
-/// `kernel_tests` fails a run above it, and every step of a service is
-/// compared with it.
-const TERM_B: u64 = abi::time::TERM_B_TICKS;
+/// Term B of the kernel, the longest it runs with preemption off, in
+/// ticks under -icount: the longest row of the `B on` line of
+/// `kernel_tests` (icount build) at 637d3a6, which lowered it from
+/// 20 538. xtask is the one place of the number: `kernel_tests` fails a
+/// run above it, and every step of a service is compared with it. The
+/// kernel's own checks and tests/posix-tty only print their numbers.
+const TERM_B: u64 = 20_410;
 
 /// The most one step of a service may take (one READ_INTO of up to
 /// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for
@@ -5396,16 +5400,8 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
             measured.push((what, rows, ticks));
         }
-        let (what, row, n) = blocking_time(&measured);
-        println!("B on {}: {row}={n} ({what})", m.name);
-        if n > TERM_B {
-            return Err(format!(
-                "B on {}: {row}={n} ({what}) is {} past TERM_B {TERM_B}",
-                m.name,
-                n - TERM_B
-            ));
-        }
-        println!("B margin on {}: {} of {TERM_B}", m.name, TERM_B - n);
+        let margin = b_margin(m.name, &measured)?;
+        println!("B margin on {}: {margin} of {TERM_B}", m.name);
     }
     match variant {
         Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
@@ -5446,6 +5442,19 @@ fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, 
         .filter(|&(what, row, _)| (what, row) != ("teardown portions", "threads"))
         .max_by_key(|&(_, _, n)| n)
         .unwrap_or(("none", "none", 0))
+}
+
+/// The margin under term B of the longest portion in `measured`, which
+/// the `B on` line prints; an error when it is past TERM_B.
+fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<u64, String> {
+    let (what, row, n) = blocking_time(measured);
+    println!("B on {name}: {row}={n} ({what})");
+    TERM_B.checked_sub(n).ok_or_else(|| {
+        format!(
+            "B on {name}: {row}={n} ({what}) is {} past TERM_B {TERM_B}",
+            n - TERM_B
+        )
+    })
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -6897,6 +6906,22 @@ mod tests {
     /// B is the longest row of any line of portions or short calls, never
     /// the count of threads and never a row of the round trip, which spans
     /// two calls.
+    #[test]
+    fn a_suspension_number_past_term_b_fails_the_parse_of_the_log() {
+        let log = |n: u64| {
+            vec![format!(
+                "suspension scopes ticks: control_stop_no_queue=33 control_stop_cancel=99 \
+                 pick_park_selected=80 control_continue=94 resume_64=3731 longest_portion={n}"
+            )]
+        };
+        let margin = |n| {
+            let ticks = ticks_of(&log(n), "suspension scopes", &SUSPENSION_ROWS)?;
+            b_margin("t", &[("suspension scopes", &SUSPENSION_ROWS[..], ticks)])
+        };
+        assert_eq!(margin(TERM_B), Ok(0));
+        assert!(margin(TERM_B + 1).unwrap_err().contains("past TERM_B"));
+    }
+
     #[test]
     fn blocking_time_is_the_longest_row_but_threads() {
         let line =

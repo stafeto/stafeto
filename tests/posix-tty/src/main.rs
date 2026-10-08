@@ -82,9 +82,8 @@ pub extern "C" fn stafeto_terminal_control_stats() -> i32 {
         }
         *maximum = (ticks, detail);
     }
-    let invalid = maxima
-        .iter()
-        .any(|(ticks, _)| *ticks == 0 || *ticks > rt::abi::time::TERM_B_TICKS);
+    // xtask compares the numbers with term B.
+    let invalid = maxima.iter().any(|(ticks, _)| *ticks == 0);
     for (index, (ticks, detail)) in maxima.into_iter().enumerate() {
         rt::println!(
             "service step: 5 kind {} {} ticks detail {}",
