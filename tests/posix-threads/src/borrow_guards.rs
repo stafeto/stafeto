@@ -203,7 +203,6 @@ pub(super) fn run() -> bool {
         let deadline = rt::time::ticks_to_ns(rt::time::now()) + 500_000_000;
         if !matches!(
             {
-                let deadline = deadline;
                 crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
                     done_waiter.receive_until(&done, deadline)
                 })
