@@ -388,11 +388,34 @@ fn local_claim_window(signal: i32) {
     }
 }
 
+#[cfg(feature = "thread-probe")]
+static SETTLED_CLAIM_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+/// A one-shot guest hook after claim owners settle, before critical leave.
+#[cfg(feature = "thread-probe")]
+pub fn probe_settled_claim_window(hook: Option<extern "C" fn(i32)>) {
+    SETTLED_CLAIM_WINDOW.store(hook.map_or(0, |f| f as usize), Ordering::Release);
+}
+
 fn claim_thread_info(block: &Block, signal: i32) -> Option<(u64, Option<SigInfo>)> {
     // Defer nested entries through the snapshot and claim using the existing
     // in-memory depth; local delivery needs no kernel call or level change.
     posix_sync::enter();
     let _critical = ClaimCritical;
+    let claimed = claim_thread_snapshot(block, signal);
+    #[cfg(feature = "thread-probe")]
+    if claimed.is_some() {
+        let hook = SETTLED_CLAIM_WINDOW.swap(0, Ordering::AcqRel);
+        if hook != 0 {
+            // SAFETY: the one-shot registration stores this C signature.
+            let callback = unsafe { core::mem::transmute::<usize, extern "C" fn(i32)>(hook) };
+            callback(signal);
+        }
+    }
+    claimed
+}
+
+fn claim_thread_snapshot(block: &Block, signal: i32) -> Option<(u64, Option<SigInfo>)> {
     let bit = posix_signals::bit(signal).ok()?;
     let _assignment = loop {
         if let Some(claim) = AssignmentClaim::try_new(block, bit) {
@@ -1332,18 +1355,38 @@ fn take(block: &Block) -> Option<(i32, SigAction, Option<SigInfo>, u64)> {
     }
 }
 
-/// Runs the handlers of the calling thread's deliverable signals. Through
-/// the entry (`entered`) the kernel masked further entries: they are let
-/// in for the handler and masked again after it; a direct delivery makes
-/// no call. `native` is the entry's frame, or null for a direct delivery,
-/// which leaves a handler with SA_SIGINFO to the thread's entry.
+// Local ownership settles before the kernel deferral field is dropped.
+struct SignalPreparation {
+    // Fields drop in order: settle local preparation before kernel Resume.
+    local: posix_sync::DeliveryPreparation<'static>,
+    _kernel: upcall::DeferredEntry,
+}
+
+impl SignalPreparation {
+    fn begin() -> Self {
+        let deferred = upcall::defer_entries().expect("signal preparation deferral");
+        let block = own();
+        Self {
+            local: posix_sync::DeliveryPreparation::begin(block),
+            _kernel: deferred,
+        }
+    }
+}
+
+/// Runs deliverable handlers with preparation protected by common deferral.
+/// An entered delivery enables nested entries for each user callback and
+/// masks them on return. A null native frame requests a context-aware entry
+/// for SA_SIGINFO handlers.
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
+    let mut preparation = Some(SignalPreparation::begin());
+    let block = own();
     if stopped_by_other() {
+        drop(preparation.take());
         park();
+        preparation = Some(SignalPreparation::begin());
     }
     // The process's signals first: one of them may be this thread's.
     route();
-    let block = own();
     // A wait by address of this thread ends before the first handler, and
     // before the lock of the actions, whose wait uses the same block
     // (posix_sync::abandon); it goes on as woken after the last one.
@@ -1361,6 +1404,9 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     let signal_wait =
         block.flags.fetch_and(!flag::SIGNAL_WAIT, Ordering::SeqCst) & flag::SIGNAL_WAIT;
     loop {
+        if preparation.as_ref().unwrap().local.take_deferred() {
+            route();
+        }
         let old_mask = block.mask.load(Ordering::SeqCst);
         if native.is_null() && next_wants_context(block) {
             // A handler with SA_SIGINFO gets the interrupted context: the
@@ -1372,19 +1418,29 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             break;
         }
         let Some((signal, action, from_process, ticket)) = take(block) else {
+            if preparation.as_ref().unwrap().local.take_deferred() {
+                route();
+                continue;
+            }
             break;
         };
         let handler = action.handler;
         if handler == DEFAULT {
             match posix_signals::default_action(signal) {
                 posix_signals::DefaultAction::Stop => {
+                    drop(preparation.take());
                     let _ = crate::process::stop_self(signal, ticket);
+                    preparation = Some(SignalPreparation::begin());
+                    route();
                     continue;
                 }
                 posix_signals::DefaultAction::Continue | posix_signals::DefaultAction::Ignore => {
                     continue;
                 }
-                posix_signals::DefaultAction::Terminate => sys_exit_signal(signal),
+                posix_signals::DefaultAction::Terminate => {
+                    drop(preparation.take());
+                    sys_exit_signal(signal)
+                }
             }
         }
         if action.flags & SA_RESTART == 0 {
@@ -1412,14 +1468,16 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             // SAFETY: SA_SIGINFO registers this live three-argument C address.
             let callback: unsafe extern "C" fn(i32, *mut LinuxSigInfo, *mut core::ffi::c_void) =
                 unsafe { core::mem::transmute(handler as usize) };
+            drop(preparation.take());
             if entered {
                 unsafe { upcall::enable() }.expect("nested signal entry");
             }
             unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
-            block.handled.fetch_add(1, Ordering::SeqCst);
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }
+            preparation = Some(SignalPreparation::begin());
+            block.handled.fetch_add(1, Ordering::SeqCst);
             // The callback may edit the return context. Preserve private native
             // metadata and let the kernel validate machine state on return.
             // SAFETY: the frame is the entry's.
@@ -1430,14 +1488,16 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             // SAFETY: signal/sigaction callers supply a live void(int) C address.
             let callback: unsafe extern "C" fn(i32) =
                 unsafe { core::mem::transmute(handler as usize) };
+            drop(preparation.take());
             if entered {
                 unsafe { upcall::enable() }.expect("nested signal entry");
             }
             unsafe { callback(signal) };
-            block.handled.fetch_add(1, Ordering::SeqCst);
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }
+            preparation = Some(SignalPreparation::begin());
+            block.handled.fetch_add(1, Ordering::SeqCst);
         }
         block.mask.store(restore_mask, Ordering::SeqCst);
     }
@@ -1445,6 +1505,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     block.cancel_point.store(window, Ordering::SeqCst);
     unsafe { *errno = saved_errno };
     posix_sync::resume_wait(abandoned);
+    drop(preparation);
 }
 /// The siginfo_t of relibc's headers (Linux AArch64): 128 bytes, the
 /// signal, errno and code, then the sender's pid and uid and the value.

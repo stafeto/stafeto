@@ -53,6 +53,9 @@ pub mod bit {
     pub const CANCEL: u64 = 1 << 2;
 }
 
+mod preparation;
+pub use preparation::DeliveryPreparation;
+
 static CEILING: AtomicU8 = AtomicU8::new(0);
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
 
@@ -83,18 +86,10 @@ pub fn leave() {
     let Some(block) = current() else {
         return;
     };
-    let old = block.flags.fetch_sub(flag::DEPTH_ONE, Ordering::SeqCst);
-    debug_assert!(old >> flag::DEPTH_SHIFT != 0, "balanced critical sections");
-    if old >> flag::DEPTH_SHIFT == 1
-        && block
-            .flags
-            .fetch_and(!flag::ENTRY_DEFERRED, Ordering::SeqCst)
-            & flag::ENTRY_DEFERRED
-            != 0
-    {
+    if preparation::leave_block(block) {
         let deferred = DEFERRED.load(Ordering::Acquire);
         if deferred != 0 {
-            // SAFETY: `configure` stored a `fn()` there.
+            // SAFETY: configure stored a fn() there.
             let deliver: fn() = unsafe { core::mem::transmute(deferred) };
             deliver();
         }

@@ -63,6 +63,7 @@ mod one_thread;
 mod reentry;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_context;
+mod signal_preparation;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_wait;
 #[cfg(not(feature = "cancel-input"))]
@@ -488,6 +489,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !upcall::run()
         || !borrow_guards::run()
         || !reentry::run()
+        || !signal_preparation::run()
         || !signals::run()
         || !signal_context::run()
         || !signal_wait::run()
