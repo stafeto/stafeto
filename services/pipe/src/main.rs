@@ -127,7 +127,6 @@ fn main(_: u64) -> u64 {
         roots: &mut tables.roots,
         channel: Handle::borrowed(channel.raw()),
         level,
-        given: 0,
         births: &mut tables.births,
         clones: &mut tables.clones,
         step,
@@ -152,8 +151,6 @@ struct PipeService {
     /// The service's channel, which its own sessions are copies of.
     channel: ManuallyDrop<Handle<Channel>>,
     level: u8,
-    /// The sessions the service gave itself so far.
-    given: u64,
     /// The descriptions of the sessions Clone made that sent nothing yet,
     /// by their labels: the session's first request takes them, and the
     /// end of its last copy lets go of them.
@@ -555,9 +552,6 @@ impl PipeService {
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        let Some(free) = self.births.iter().position(Option::is_none) else {
-            return Answer::Status(Status::Kernel(Error::LimitReached));
-        };
         if self.clones.room_within(root, ROOT_CLONES).is_err() {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
@@ -565,8 +559,14 @@ impl PipeService {
             Ok(child) => child,
             Err(code) => return status(code),
         };
-        self.given += 1;
-        let label = OWN | self.given;
+        // The room was just checked, so the label comes; its place is the
+        // birth's.
+        let Ok(label) = self.clones.give_within(OWN, root, ROOT_CLONES) else {
+            if self.pipes.gone(&mut child) {
+                self.kick();
+            }
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        };
         let session = sys::handle_label(
             &self.channel,
             Rights::SEND | Rights::TRANSFER,
@@ -575,11 +575,13 @@ impl PipeService {
         );
         match session {
             Ok(session) if r.reply().u32(0).is_ok() => {
-                self.births[free] = Some((label, child, root));
-                let _ = self.clones.add_within(label, root, ROOT_CLONES);
+                if let Some(place) = self.clones.place_of(label) {
+                    self.births[place] = Some((label, child, root));
+                }
                 Answer::Reply([session.erase()].into())
             }
             other => {
+                self.clones.gone(label);
                 if self.pipes.gone(&mut child) {
                     self.kick();
                 }
@@ -640,11 +642,11 @@ impl Service<0> for PipeService {
             let label = r.label();
             s.data.root = label;
             if let Some(birth) = self
-                .births
-                .iter_mut()
-                .find(|b| b.is_some_and(|(l, ..)| l == label))
+                .clones
+                .place_of(label)
+                .and_then(|place| self.births[place].take_if(|b| b.0 == label))
             {
-                let (_, held, root) = birth.take().expect("a birth");
+                let (_, held, root) = birth;
                 s.data.held = held;
                 s.data.root = root;
             }
@@ -735,12 +737,12 @@ impl Service<0> for PipeService {
     /// the descriptions it was born with are let go of in steps.
     fn closed(&mut self, label: u64) {
         rt::service::step_own();
+        let birth = self
+            .clones
+            .place_of(label)
+            .and_then(|place| self.births[place].take_if(|b| b.0 == label));
         self.clones.gone(label);
-        if let Some(birth) = self
-            .births
-            .iter_mut()
-            .find(|b| b.is_some_and(|(l, ..)| l == label))
-            && let Some((_, mut held, _)) = birth.take()
+        if let Some((_, mut held, _)) = birth
             && self.pipes.gone(&mut held)
         {
             self.kick();

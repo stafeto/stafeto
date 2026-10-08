@@ -10,103 +10,136 @@
 /// The live clones of each client at most.
 pub const PER_CLIENT: usize = 48;
 
-/// Why a Clone is refused: the client or the service has its most.
+/// The clients that are not clones themselves (a root: a session that init
+/// or the service gave out, not Clone) that count clones at once, at most.
+/// Trusted parties choose their labels, so the small table that holds them
+/// is walked whole.
+pub const ROOTS: usize = 32;
+
+/// Why a Clone is refused: the client or the service has its most, or the
+/// table of roots is full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Full;
 
-/// No place: the end of a chain and of a free list.
+/// No place: the end of the free list.
 const NONE: u16 = u16::MAX;
 
-/// The bucket of `key` among `n`: a mix of its bits, so that labels that
-/// count up (a service gives its clones' labels one after another) spread.
-fn bucket(key: u64, n: usize) -> usize {
-    let mut x = key.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^= x >> 31;
-    ((u128::from(x) * n as u128) >> 64) as usize
+/// The count a new clone adds to: a place of the table (the client is a
+/// clone) or an entry of the table of roots.
+#[derive(Clone, Copy)]
+enum Account {
+    Place(usize),
+    Root(usize),
 }
 
 /// The live clones of a service: each one's label and its client's.
 ///
-/// No operation walks the table, so the cost of a Clone does not grow with
-/// the clones alive: the clones live in places with a free list, a table of
-/// N chained buckets finds a clone by its label, and a second one finds the
-/// record of a client, which holds the count of its clones. A chain holds 1
-/// entry on average (as many buckets as places stand) and the mix of
-/// `bucket` spreads the labels a service gives one after another; the
-/// longest chain a table of N places can have is N, as long as the walk
-/// of the table it replaces.
+/// A clone lives in a place of the table, and the place is in its label
+/// (`tag | generation << BITS | place`; the service names the tag, `give`
+/// counts the generation, so that a label is never given twice). A lookup
+/// reads the place of the label and compares the label there: it never
+/// walks the table, and a label that a client makes up finds nothing. The
+/// count of the clones a clone made sits in its own place; a client that is
+/// no clone of this table (a root) has its count in a table of ROOTS
+/// entries, whose labels the trusted parties choose. Every operation takes
+/// a bounded number of steps, whatever the clients do.
 ///
-/// A place and a record take 12 bytes each, in arrays of their own without
-/// padding: a table of 320 takes 9 KB, where a list of pairs took 7.7 KB.
-pub struct Clones<const N: usize> {
-    /// For each place of a clone: its label, the place of its client's
-    /// record, and the next place of its chain, or of the free list.
+/// A place takes 20 bytes: a table of 320 takes 6.4 KB.
+pub struct Clones<const N: usize, const BITS: u32 = 16> {
+    /// For each place: the label of its clone (0 for a free place), its
+    /// client's label, the clones it made as a client, and the next place
+    /// of the free list.
     label: [u64; N],
-    owner: [u16; N],
-    next: [u16; N],
-    /// The first place of the chain of each bucket of labels.
-    labels: [u16; N],
-    /// For each record of a client: its label, its count, and the next
-    /// record of its chain, or of the free list.
     client: [u64; N],
-    count: [u16; N],
-    after: [u16; N],
-    /// The first record of the chain of each bucket of clients.
-    owners: [u16; N],
-    free_clone: u16,
-    free_client: u16,
+    made: [u16; N],
+    next: [u16; N],
+    free: u16,
+    /// The labels `give` gave so far.
+    given: u64,
+    /// For each root: its label and the clones it has alive (0 for a free
+    /// entry).
+    root: [u64; ROOTS],
+    root_made: [u16; ROOTS],
+    /// The entries of the table of roots a test counted.
+    #[cfg(test)]
+    probes: core::cell::Cell<usize>,
 }
 
-impl<const N: usize> Default for Clones<N> {
+impl<const N: usize, const BITS: u32> Default for Clones<N, BITS> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> Clones<N> {
+impl<const N: usize, const BITS: u32> Clones<N, BITS> {
+    const MASK: u64 = (1 << BITS) - 1;
+
     pub const fn new() -> Self {
         assert!(N > 0 && N < NONE as usize, "places are 16 bits");
+        assert!(N as u64 <= Self::MASK + 1, "a place fits the label");
         let mut next = [NONE; N];
-        let mut after = [NONE; N];
         let mut i = 0;
         while i + 1 < N {
             next[i] = (i + 1) as u16;
-            after[i] = (i + 1) as u16;
             i += 1;
         }
         Self {
             label: [0; N],
-            owner: [NONE; N],
-            next,
-            labels: [NONE; N],
             client: [0; N],
-            count: [0; N],
-            after,
-            owners: [NONE; N],
-            free_clone: 0,
-            free_client: 0,
+            made: [0; N],
+            next,
+            free: 0,
+            given: 0,
+            root: [0; ROOTS],
+            root_made: [0; ROOTS],
+            #[cfg(test)]
+            probes: core::cell::Cell::new(0),
         }
     }
 
-    /// The place of the record of `client`, if it has clones alive.
-    fn record(&self, client: u64) -> Option<usize> {
-        let mut at = self.owners[bucket(client, N)];
-        while at != NONE {
-            let i = usize::from(at);
-            if self.client[i] == client {
-                return Some(i);
+    /// The place of the live clone `label`: the place its bits name, if the
+    /// label is the one there.
+    pub fn place_of(&self, label: u64) -> Option<usize> {
+        let place = (label & Self::MASK) as usize;
+        (label != 0 && place < N && self.label[place] == label).then_some(place)
+    }
+
+    /// The entry of the table of roots that counts `client`, in one walk
+    /// of the table.
+    fn root_of(&self, client: u64) -> Option<usize> {
+        (0..ROOTS).find(|&i| {
+            #[cfg(test)]
+            self.probes.set(self.probes.get() + 1);
+            self.root_made[i] != 0 && self.root[i] == client
+        })
+    }
+
+    /// Where `client` counts its clones, if it may have one more with
+    /// `most` of its own at most: the one walk of the table of roots that
+    /// a Clone makes.
+    fn account(&self, client: u64, most: usize) -> Result<Account, Full> {
+        if let Some(place) = self.place_of(client) {
+            return if usize::from(self.made[place]) < most {
+                Ok(Account::Place(place))
+            } else {
+                Err(Full)
+            };
+        }
+        let mut free = None;
+        for i in 0..ROOTS {
+            #[cfg(test)]
+            self.probes.set(self.probes.get() + 1);
+            if self.root_made[i] == 0 {
+                free = free.or(Some(i));
+            } else if self.root[i] == client {
+                return if usize::from(self.root_made[i]) < most {
+                    Ok(Account::Root(i))
+                } else {
+                    Err(Full)
+                };
             }
-            at = self.after[i];
         }
-        None
-    }
-
-    /// The clones `client` has alive.
-    fn own(&self, client: u64) -> usize {
-        self.record(client)
-            .map_or(0, |i| usize::from(self.count[i]))
+        free.map(Account::Root).ok_or(Full)
     }
 
     /// Whether `client` may have one clone more.
@@ -118,112 +151,94 @@ impl<const N: usize> Clones<N> {
     /// most, for a service that counts its clients otherwise (the pipe
     /// service counts the clones of a whole tree of processes).
     pub fn room_within(&self, client: u64, most: usize) -> Result<(), Full> {
-        if self.own(client) >= most || self.free_clone == NONE {
+        self.account(client, most).map(|_| ())
+    }
+
+    /// A new clone of `client` with a label of its own: `tag` (bits the
+    /// service keeps for itself, above the generation), the generation and
+    /// the place. Full past the limits. A service that cannot finish the
+    /// clone calls `gone` with the label.
+    pub fn give(&mut self, tag: u64, client: u64) -> Result<u64, Full> {
+        self.give_within(tag, client, PER_CLIENT)
+    }
+
+    /// `give` with `most` clones of `client` at most (`room_within`).
+    pub fn give_within(&mut self, tag: u64, client: u64, most: usize) -> Result<u64, Full> {
+        let account = self.account(client, most)?;
+        let given = self.given + 1;
+        if given >= 1 << (62 - BITS) || self.free == NONE {
             return Err(Full);
         }
-        Ok(())
+        self.given = given;
+        let place = usize::from(self.free);
+        let label = tag | given << BITS | place as u64;
+        self.free = self.next[place];
+        self.insert(place, label, client, account);
+        Ok(label)
     }
 
-    /// The clone `label` of `client` is alive; Full past the limits.
-    pub fn add(&mut self, label: u64, client: u64) -> Result<(), Full> {
-        self.add_within(label, client, PER_CLIENT)
+    /// The clone `label` of `client` is alive, with a label some other
+    /// table made, whose low BITS bits name a place no other clone has.
+    pub fn adopt(&mut self, label: u64, client: u64) -> Result<(), Full> {
+        self.adopt_within(label, client, PER_CLIENT)
     }
 
-    /// `add` with `most` clones of `client` at most (`room_within`).
-    pub fn add_within(&mut self, label: u64, client: u64, most: usize) -> Result<(), Full> {
-        self.room_within(client, most)?;
-        // A place is free, so fewer than N clones live, so fewer than N
-        // clients have records: a record is free too.
-        let record = match self.record(client) {
-            Some(i) => i,
-            None => {
-                let i = usize::from(self.free_client);
-                self.free_client = self.after[i];
-                let b = bucket(client, N);
-                self.client[i] = client;
-                self.count[i] = 0;
-                self.after[i] = self.owners[b];
-                self.owners[b] = i as u16;
-                i
-            }
-        };
-        self.count[record] += 1;
-        let place = usize::from(self.free_clone);
-        self.free_clone = self.next[place];
-        let b = bucket(label, N);
-        self.label[place] = label;
-        self.owner[place] = record as u16;
-        self.next[place] = self.labels[b];
-        self.labels[b] = place as u16;
-        Ok(())
-    }
-
-    /// The place of the live clone `label`.
-    fn place(&self, label: u64) -> Option<usize> {
-        let mut at = self.labels[bucket(label, N)];
-        while at != NONE {
-            let i = usize::from(at);
-            if self.label[i] == label {
-                return Some(i);
-            }
-            at = self.next[i];
+    /// `adopt` with `most` clones of `client` at most.
+    pub fn adopt_within(&mut self, label: u64, client: u64, most: usize) -> Result<(), Full> {
+        let account = self.account(client, most)?;
+        let place = (label & Self::MASK) as usize;
+        if label == 0 || place >= N || self.label[place] != 0 {
+            return Err(Full);
         }
-        None
+        self.insert(place, label, client, account);
+        Ok(())
+    }
+
+    /// The clone `label` of `client` takes `place`.
+    fn insert(&mut self, place: usize, label: u64, client: u64, account: Account) {
+        match account {
+            Account::Place(owner) => self.made[owner] += 1,
+            Account::Root(at) => {
+                self.root[at] = client;
+                self.root_made[at] += 1;
+            }
+        }
+        self.label[place] = label;
+        self.client[place] = client;
+        self.made[place] = 0;
+    }
+
+    /// The clones `client` has alive.
+    #[cfg(test)]
+    fn own(&self, client: u64) -> usize {
+        if let Some(place) = self.place_of(client) {
+            usize::from(self.made[place])
+        } else {
+            self.root_of(client)
+                .map_or(0, |i| usize::from(self.root_made[i]))
+        }
     }
 
     /// The client the live clone `label` was made for, if it is one.
     pub fn client_of(&self, label: u64) -> Option<u64> {
-        self.place(label)
-            .map(|i| self.client[usize::from(self.owner[i])])
+        self.place_of(label).map(|place| self.client[place])
     }
 
     /// The last copy of the clone `label` went.
     pub fn gone(&mut self, label: u64) {
-        let b = bucket(label, N);
-        let mut before = NONE;
-        let mut at = self.labels[b];
-        while at != NONE {
-            let i = usize::from(at);
-            if self.label[i] == label {
-                if before == NONE {
-                    self.labels[b] = self.next[i];
-                } else {
-                    self.next[usize::from(before)] = self.next[i];
-                }
-                let record = usize::from(self.owner[i]);
-                self.next[i] = self.free_clone;
-                self.free_clone = at;
-                self.count[record] -= 1;
-                if self.count[record] == 0 {
-                    self.drop_record(record);
-                }
-                return;
-            }
-            before = at;
-            at = self.next[i];
+        let Some(place) = self.place_of(label) else {
+            return;
+        };
+        // A client that went before its clone counts nothing any more.
+        let client = self.client[place];
+        if let Some(owner) = self.place_of(client) {
+            self.made[owner] = self.made[owner].saturating_sub(1);
+        } else if let Some(at) = self.root_of(client) {
+            self.root_made[at] = self.root_made[at].saturating_sub(1);
         }
-    }
-
-    /// The record `record`, which counts no clone, goes to the free list.
-    fn drop_record(&mut self, record: usize) {
-        let b = bucket(self.client[record], N);
-        let mut before = NONE;
-        let mut at = self.owners[b];
-        while at != NONE {
-            let i = usize::from(at);
-            if i == record {
-                if before == NONE {
-                    self.owners[b] = self.after[i];
-                } else {
-                    self.after[usize::from(before)] = self.after[i];
-                }
-                self.after[i] = self.free_client;
-                self.free_client = at;
-                return;
-            }
-            before = at;
-            at = self.after[i];
-        }
+        self.label[place] = 0;
+        self.next[place] = self.free;
+        self.free = place as u16;
     }
 }
 
@@ -231,91 +246,124 @@ impl<const N: usize> Clones<N> {
 mod tests {
     use super::*;
 
+    const TAG: u64 = 1 << 63;
+
     /// A client has PER_CLIENT live clones: the next is refused until one
     /// goes; the service's N bound all clients.
     #[test]
     fn clones_are_bounded_per_client_and_in_all() {
         let mut c = Clones::<64>::new();
-        for i in 0..PER_CLIENT as u64 {
-            assert_eq!(c.add(100 + i, 7), Ok(()));
+        let mut mine = Vec::new();
+        for _ in 0..PER_CLIENT {
+            mine.push(c.give(TAG, 7).unwrap());
         }
-        assert_eq!(c.add(999, 7), Err(Full), "one more of client 7");
-        assert_eq!(c.add(999, 8), Ok(()), "another client's");
-        c.gone(100);
-        assert_eq!(c.add(1000, 7), Ok(()));
-        for i in 0..15 {
-            assert_eq!(c.add(2000 + i, 9), Ok(()));
+        assert_eq!(c.give(TAG, 7), Err(Full), "one more of client 7");
+        assert!(c.give(TAG, 8).is_ok(), "another client's");
+        c.gone(mine[0]);
+        let again = c.give(TAG, 7).unwrap();
+        for _ in 0..15 {
+            assert!(c.give(TAG, 9).is_ok());
         }
-        assert_eq!(c.add(3000, 10), Err(Full), "the service's 64");
-        assert_eq!(c.client_of(1000), Some(7));
-        assert_eq!(c.client_of(100), None, "gone");
+        assert_eq!(c.give(TAG, 10), Err(Full), "the service's 64");
+        assert_eq!(c.client_of(again), Some(7));
+        assert_eq!(c.client_of(mine[0]), None, "gone");
     }
 
-    /// The longest walk a lookup of `label` makes along its chain.
-    fn walk<const N: usize>(c: &Clones<N>, label: u64) -> usize {
-        let mut steps = 0;
-        let mut at = c.labels[bucket(label, N)];
-        while at != NONE {
-            steps += 1;
-            if c.label[usize::from(at)] == label {
-                break;
-            }
-            at = c.next[usize::from(at)];
-        }
-        steps
-    }
-
-    /// The same for the record of `client`.
-    fn walk_client<const N: usize>(c: &Clones<N>, client: u64) -> usize {
-        let mut steps = 0;
-        let mut at = c.owners[bucket(client, N)];
-        while at != NONE {
-            steps += 1;
-            if c.client[usize::from(at)] == client {
-                break;
-            }
-            at = c.after[usize::from(at)];
-        }
-        steps
-    }
-
-    /// A full table of 320 clones, labels as the services give them (a
-    /// tag in the high bits and a count) of clients 1..=7 with roots as
-    /// the pipe service has them: no lookup walks more than a few places,
-    /// where the table it replaces walked all 320.
+    /// A label names its place and never repeats: a label of a clone that
+    /// went finds nothing, though a new clone took its place; a label made
+    /// up finds nothing.
     #[test]
-    fn lookups_stay_short_with_a_full_table() {
-        let mut c = Clones::<320>::new();
-        let tag = 1u64 << 63;
-        for i in 0..320u64 {
-            assert_eq!(c.add_within(tag | (i + 1), (i % 7) + 1, 320), Ok(()));
+    fn a_label_is_found_only_by_its_clone() {
+        let mut c = Clones::<8>::new();
+        let old = c.give(TAG, 1).unwrap();
+        c.gone(old);
+        let new = c.give(TAG, 1).unwrap();
+        assert_eq!(new & 0xffff, old & 0xffff, "the place came back");
+        assert_ne!(new, old);
+        assert_eq!(c.client_of(old), None);
+        c.gone(old);
+        assert_eq!(c.client_of(new), Some(1), "the old label did not end it");
+        for made_up in [0, 1, TAG, TAG | 5, new ^ (1 << 20), new + 1] {
+            assert_eq!(c.client_of(made_up), None);
         }
-        assert_eq!(c.add_within(tag | 999, 1, 320), Err(Full));
-        let longest = (0..320u64).map(|i| walk(&c, tag | (i + 1))).max().unwrap();
-        let clients = (1..=7u64).map(|k| walk_client(&c, k)).max().unwrap();
-        assert!(longest <= 8, "a label's chain is {longest} long");
-        assert!(clients <= 3, "a client's chain is {clients} long");
-        // Labels that count in the low bits and clients that are labels.
+        assert_eq!(c.give_within(TAG, 1, 1), Err(Full));
+    }
+
+    /// The clones a clone made count for it, not for its root; they go on
+    /// after it went, and nothing is counted twice.
+    #[test]
+    fn a_clone_counts_the_clones_it_made() {
+        let mut c = Clones::<16>::new();
+        let a = c.give(TAG, 1).unwrap();
+        let b1 = c.give_within(TAG, a, 2).unwrap();
+        let b2 = c.give_within(TAG, a, 2).unwrap();
+        assert_eq!(c.give_within(TAG, a, 2), Err(Full));
+        assert_eq!(c.client_of(b2), Some(a));
+        c.gone(b1);
+        let b3 = c.give_within(TAG, a, 2).unwrap();
+        // The client a goes before its clones: they end without a count.
+        c.gone(a);
+        c.gone(b2);
+        c.gone(b3);
+        assert_eq!(c.own(1), 0);
+        // Its place is taken again; the old clients' labels count nothing.
+        let d = c.give(TAG, 1).unwrap();
+        assert_eq!(c.own(d), 0);
+        assert_eq!(c.own(1), 1);
+    }
+
+    /// The attack on the table it replaces: clients and copies chosen so
+    /// that a hashed chain would grow. A lookup reads one place and the
+    /// table of roots is walked whole, so no chosen clients lengthen a step
+    /// past ROOTS entries, and clients past ROOTS roots are refused.
+    #[test]
+    fn chosen_clients_do_not_lengthen_a_step() {
         let mut c = Clones::<320>::new();
-        for i in 0..320u64 {
-            assert_eq!(c.add_within(i + 1, tag | (i * 4096), 320), Ok(()));
+        let mut labels = Vec::new();
+        let mut most = 0;
+        let mut step = |c: &Clones<320>, before: usize| {
+            most = most.max(c.probes.get() - before);
+        };
+        // Clients that are labels apart by 4096, a pattern that fills one
+        // bucket of a hash: ROOTS of them are admitted, the rest refused.
+        for i in 0..400u64 {
+            let client = TAG | 1 << 61 | (i * 4096);
+            let before = c.probes.get();
+            match c.give_within(TAG, client, 320) {
+                Ok(label) => labels.push(label),
+                Err(Full) => assert!(i as usize >= ROOTS),
+            }
+            step(&c, before);
         }
-        let longest = (0..320u64).map(|i| walk(&c, i + 1)).max().unwrap();
-        let clients = (0..320u64)
-            .map(|i| walk_client(&c, tag | (i * 4096)))
-            .max()
-            .unwrap();
-        assert!(longest <= 8, "a label's chain is {longest} long");
-        assert!(clients <= 8, "a client's chain is {clients} long");
+        assert_eq!(labels.len(), ROOTS);
+        // Clones of one root, made as clients of their own, down to the
+        // table's end.
+        let mut from = labels[0];
+        while let Ok(label) = c.give_within(TAG, from, 1) {
+            labels.push(label);
+            from = label;
+        }
+        assert!(c.give_within(TAG, from, 1).is_err());
+        for label in labels.iter().copied() {
+            let before = c.probes.get();
+            let _ = c.client_of(label);
+            c.gone(label);
+            step(&c, before);
+        }
+        assert!(c.give(TAG, labels[0]).is_ok());
+        assert!(
+            most <= ROOTS,
+            "a step walked {most} entries of the table of roots"
+        );
     }
 
     /// A long run of random Clone and end steps against a plain list: every
-    /// answer is the list's, the places and records all come back at the
-    /// end.
+    /// answer is the list's, the places all come back at the end.
     #[test]
     fn follows_a_plain_list_of_clones() {
         const N: usize = 40;
         let mut c = Clones::<N>::new();
+        // (label, client)
         let mut list: Vec<(u64, u64)> = Vec::new();
         let mut seed = 0x1234_5678_9abc_def0u64;
         let mut next = move || {
@@ -324,23 +372,23 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let mut given = 0u64;
         for _ in 0..20_000 {
-            let client = next() % 6;
+            // A client is a root (1..=6) or a live clone.
+            let client = if list.is_empty() || next() % 3 == 0 {
+                1 + next() % 6
+            } else {
+                list[next() as usize % list.len()].0
+            };
             match next() % 3 {
                 0 | 1 => {
-                    given += 1;
                     let most = 1 + (next() % 9) as usize;
                     let own = list.iter().filter(|(_, k)| *k == client).count();
-                    let expect = if own >= most || list.len() >= N {
-                        Err(Full)
-                    } else {
-                        Ok(())
-                    };
-                    assert_eq!(c.room_within(client, most), expect);
-                    assert_eq!(c.add_within(given, client, most), expect);
-                    if expect.is_ok() {
-                        list.push((given, client));
+                    let expect_full = own >= most || list.len() >= N;
+                    let got = c.give_within(TAG, client, most);
+                    assert_eq!(got.is_err(), expect_full);
+                    if let Ok(label) = got {
+                        assert!(!list.iter().any(|(l, _)| *l == label));
+                        list.push((label, client));
                     }
                 }
                 _ if !list.is_empty() => {
@@ -350,19 +398,39 @@ mod tests {
                 }
                 _ => {}
             }
-            let probe = given.saturating_sub(next() % 50);
-            let want = list.iter().find(|(l, _)| *l == probe).map(|(_, k)| *k);
-            assert_eq!(c.client_of(probe), want);
+            for &(label, k) in &list {
+                assert_eq!(c.client_of(label), Some(k));
+            }
+            let probe = list.first().map_or(7, |(l, _)| l ^ 1);
+            assert_eq!(c.client_of(probe), None);
         }
         for (label, _) in list.drain(..) {
             c.gone(label);
         }
-        for k in 0..6 {
+        for k in 1..=6 {
             assert_eq!(c.own(k), 0);
         }
         for i in 0..N as u64 {
-            assert_eq!(c.add_within(1_000_000 + i, i, 1), Ok(()), "a record each");
+            assert!(c.give_within(TAG, 1_000_000 + i, 1).is_ok() || i as usize >= ROOTS);
         }
-        assert_eq!(c.add_within(2_000_000, 99, 1), Err(Full));
+    }
+
+    /// `adopt` takes the label of another table, whose low bits name the
+    /// place: a place taken twice or out of the table is refused.
+    #[test]
+    fn adopt_takes_the_place_a_label_names() {
+        let mut c = Clones::<8, 9>::new();
+        let label = TAG | (3 << 9) | 5;
+        assert_eq!(c.adopt(label, 1), Ok(()));
+        assert_eq!(
+            c.adopt(TAG | (4 << 9) | 5, 1),
+            Err(Full),
+            "place 5 is taken"
+        );
+        assert_eq!(c.adopt(TAG | 8, 1), Err(Full), "place 8 is out");
+        assert_eq!(c.client_of(label), Some(1));
+        assert_eq!(c.place_of(label), Some(5));
+        c.gone(label);
+        assert_eq!(c.adopt(TAG | (4 << 9) | 5, 1), Ok(()));
     }
 }

@@ -245,7 +245,6 @@ fn main(_: u64) -> u64 {
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
         level,
-        given: 0,
         clones: &mut tables.clones,
         ops: &mut tables.ops,
         watches: &mut tables.watches,
@@ -344,7 +343,6 @@ struct Tty {
     /// again.
     parent: ManuallyDrop<Handle<Channel>>,
     level: u8,
-    given: u64,
     clones: &'static mut Clones<CLONES>,
     ops: &'static mut LongOps<OPERATIONS>,
     watches: &'static mut watch::Pool<OPERATIONS>,
@@ -1955,13 +1953,9 @@ impl Tty {
         let Some(slot) = self.holdsets.iter().position(|h| h.label == 0) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
-        let Some(given) = self.given.checked_add(1).filter(|n| *n < 1 << 62) else {
+        let Ok(label) = self.clones.give_within(OWN, root, ROOT_CLONES) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
-        let label = OWN | given;
-        if self.clones.add_within(label, root, ROOT_CLONES).is_err() {
-            return Answer::Status(Status::Kernel(Error::LimitReached));
-        }
         let priority = self.level.saturating_sub(1).max(1);
         let session = match sys::handle_label(
             &self.channel,
@@ -1976,8 +1970,7 @@ impl Tty {
             }
         };
         // The kernel may report this label's Gone after a later request.
-        // Every issued channel consumes its label even if inheritance fails.
-        self.given = given;
+        // Every label is given once, even if inheritance fails.
         let child = match self.endpoints.clone_holds(parent) {
             Ok(child) => child,
             Err(error) => {
