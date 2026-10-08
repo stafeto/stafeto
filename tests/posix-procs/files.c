@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 extern int files_fake_identity(void);
+extern void files_open_denial_diagnostic(int fd, int error);
 extern int files_full_sessions(void);
 extern int files_open_stages(void);
 extern int files_data_stages(void);
@@ -28,7 +29,12 @@ int main(void) {
     if (fd < 0 || close(fd)) return 3;
     if (seteuid(65533)) return 4;
     errno = 0; fd = open("/tmp/probe", O_WRONLY);
-    if (fd != -1 || errno != EACCES) return 5;
+    const int denied_fd = fd;
+    const int denied_errno = errno;
+    if (denied_fd != -1 || denied_errno != EACCES) {
+        files_open_denial_diagnostic(denied_fd, denied_errno);
+        return 5;
+    }
     printf("posix-files: uid %u euid %u denied %d\n", (unsigned)getuid(), (unsigned)geteuid(), errno);
     if (seteuid(0)) return 6;
     fd = open("/tmp/probe", O_WRONLY);

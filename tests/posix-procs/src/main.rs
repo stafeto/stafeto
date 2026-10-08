@@ -43,6 +43,13 @@ mod image_hold;
 #[cfg(feature = "loader-abort")]
 mod loader_abort;
 
+/// Print captured failure values without using buffered libc file output.
+#[cfg(feature = "files")]
+#[unsafe(no_mangle)]
+extern "C" fn files_open_denial_diagnostic(fd: i32, error: i32) {
+    rt::println!("posix-files: denied Open diagnostic fd={fd} errno={error}");
+}
+
 /// A counterfeit identity capability must leave the already bound session intact.
 #[cfg(feature = "files")]
 #[unsafe(no_mangle)]
