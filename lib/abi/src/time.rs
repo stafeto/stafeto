@@ -125,6 +125,13 @@ pub fn next_release(t0: u64, period: u64, now: u64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Term B of the kernel: the longest it runs with preemption off, in
+/// ticks under -icount. The longest row of the `B on` line of
+/// `kernel_tests` (icount build) at 637d3a6. `cargo xtask` fails a run
+/// above it, and the kernel's own checks and the probes compare their
+/// steps with it.
+pub const TERM_B_TICKS: u64 = 20_410;
+
 #[cfg(test)]
 mod tests {
     use super::*;

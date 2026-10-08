@@ -3194,14 +3194,10 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
 /// processes fails it at once (5b's Vouch took 539 ticks an entry).
 const VOUCH_TICKS_MAX: u64 = 6_000;
 
-/// Term B of the kernel, the longest the kernel runs with preemption off,
-/// in ticks under -icount: the longest row of the `B on` line of
-/// `kernel_tests` (icount build) at 637d3a6, which lowered it from
-/// 20 538. `kernel_tests` fails a run above it, and every step of a
-/// service is compared with it. The kernel's own checks
-/// (kernel/src/ktest/calls.rs) and tests/posix-tty keep 20 538 until the
-/// next change of those trees.
-const TERM_B: u64 = 20_410;
+/// Term B of the kernel (`abi::time::TERM_B_TICKS`, with its source):
+/// `kernel_tests` fails a run above it, and every step of a service is
+/// compared with it.
+const TERM_B: u64 = abi::time::TERM_B_TICKS;
 
 /// The most one step of a service may take (one READ_INTO of up to
 /// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for

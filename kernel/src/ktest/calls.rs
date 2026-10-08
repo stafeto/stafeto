@@ -6781,7 +6781,9 @@ pub fn suspension_paths_are_measured(_: &Boot) -> Result<(), &'static str> {
         "suspension scopes ticks: control_stop_no_queue={stop} control_stop_cancel={stop_cancel} pick_park_selected={park} control_continue={continue_call} resume_64={portion}"
     );
     check(
-        longest <= 20_538 && portion <= 20_538 && stop_cancel <= 20_538,
+        longest <= abi::time::TERM_B_TICKS
+            && portion <= abi::time::TERM_B_TICKS
+            && stop_cancel <= abi::time::TERM_B_TICKS,
         "a suspension scope exceeded B",
     )
 }

@@ -84,7 +84,7 @@ pub extern "C" fn stafeto_terminal_control_stats() -> i32 {
     }
     let invalid = maxima
         .iter()
-        .any(|(ticks, _)| *ticks == 0 || *ticks > 20_538);
+        .any(|(ticks, _)| *ticks == 0 || *ticks > rt::abi::time::TERM_B_TICKS);
     for (index, (ticks, detail)) in maxima.into_iter().enumerate() {
         rt::println!(
             "service step: 5 kind {} {} ticks detail {}",
