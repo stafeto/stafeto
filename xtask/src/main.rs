@@ -3194,9 +3194,30 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
 /// processes fails it at once (5b's Vouch took 539 ticks an entry).
 const VOUCH_TICKS_MAX: u64 = 6_000;
 
-/// The most one READ_INTO of up to proto_fs::READ_INTO_MAX bytes may take in
-/// the RAM file service's loop: term B of the kernel, in ticks under -icount.
-const RAM_STEP_MAX: u64 = 20_538;
+/// Term B of the kernel, the longest the kernel runs with preemption off,
+/// in ticks under -icount: the longest row of the `B on` line of
+/// `kernel_tests` (icount build) at 637d3a6, which lowered it from
+/// 20 538. `kernel_tests` fails a run above it, and every step of a
+/// service is compared with it. The kernel's own checks
+/// (kernel/src/ktest/calls.rs) and tests/posix-tty keep 20 538 until the
+/// next change of those trees.
+const TERM_B: u64 = 20_410;
+
+/// The most one step of a service may take (one READ_INTO of up to
+/// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for
+/// instance): term B, in ticks under -icount.
+const RAM_STEP_MAX: u64 = TERM_B;
+
+/// The steps of the process service that are longer than term B today,
+/// until step 5z splits them: (kind, name, the longest the
+/// measurement gave at 4e9abf5). A step above its number fails
+/// `process-steps`; a step at or under B shows that its entry can go.
+const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64); 4] = [
+    (1, "Create", 61_398),
+    (22, "SpawnStart", 93_009),
+    (28, "ExecStart", 51_030),
+    (34, "ForkStart", 54_398),
+];
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
@@ -3401,6 +3422,29 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if fork_start == 0 || fork_commit == 0 || fork_start > spawn {
         return Err(format!(
             "ForkStart took {fork_start} ticks and ForkCommit {fork_commit}, SpawnStart {spawn}"
+        ));
+    }
+    // Every step of the process service stays under term B but the four
+    // that the list PROCESS_STEPS_ABOVE_B holds, each within its number.
+    for &(kind, name, limit) in &PROCESS_STEPS_ABOVE_B {
+        let ticks = longest(kind);
+        if ticks == 0 || ticks > limit {
+            return Err(format!(
+                "the process service: {name} took {ticks} ticks, past its exception {limit} (B {TERM_B})"
+            ));
+        }
+        let verdict = if ticks > TERM_B {
+            format!("{} over B", ticks - TERM_B)
+        } else {
+            "under B: remove it from PROCESS_STEPS_ABOVE_B".to_owned()
+        };
+        println!("process service {name}: {ticks} of exception {limit}, B {TERM_B}: {verdict}");
+    }
+    if let Some((kind, ticks, _)) = rows.iter().find(|(kind, ticks, _)| {
+        *ticks > TERM_B && !PROCESS_STEPS_ABOVE_B.iter().any(|(k, ..)| k == kind)
+    }) {
+        return Err(format!(
+            "the process service: kind {kind} took {ticks} ticks, past B {TERM_B} and not in the exceptions"
         ));
     }
     if !loader.iter().any(|(k, ..)| *k == 9) {
@@ -5355,6 +5399,14 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         }
         let (what, row, n) = blocking_time(&measured);
         println!("B on {}: {row}={n} ({what})", m.name);
+        if n > TERM_B {
+            return Err(format!(
+                "B on {}: {row}={n} ({what}) is {} past TERM_B {TERM_B}",
+                m.name,
+                n - TERM_B
+            ));
+        }
+        println!("B margin on {}: {} of {TERM_B}", m.name, TERM_B - n);
     }
     match variant {
         Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
@@ -5382,7 +5434,7 @@ const PORTION_LINES: [&str; 7] = [
 /// rows, ticks), with its line: the blocking time B of every level (spec
 /// 15.3). The teardown row `threads` is a count of threads and takes no
 /// part. Shown on its own so that a change of the longest row stands out
-/// in the output of `ci`; no number fails it.
+/// in the output of `ci`; `kernel_tests` fails it above TERM_B.
 fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, &'a str, u64) {
     measured
         .iter()
