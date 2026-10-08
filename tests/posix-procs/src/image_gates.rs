@@ -408,9 +408,8 @@ fn ambiguous_setid(fd: i32) -> Result<(), Status> {
     proto_fs::Method::OpenExec.header().write(&mut open)?;
     open.u64(job)?;
     loop {
-        let reply = Files::send_on(&pending, open.as_bytes()).map_err(|error| {
+        let reply = Files::send_on(&pending, open.as_bytes()).inspect_err(|error| {
             rt::println!("posix-files: ambiguous OpenExec transport {}", error.code());
-            error
         })?;
         rt::println!(
             "posix-files: ambiguous OpenExec len {} caps {} word0 {}",
@@ -429,9 +428,8 @@ fn ambiguous_setid(fd: i32) -> Result<(), Status> {
         }
         break;
     }
-    let live = trace(ticket).map_err(|error| {
+    let live = trace(ticket).inspect_err(|error| {
         rt::println!("posix-files: ambiguous trace rejected {}", error.code());
-        error
     })?;
     rt::println!(
         "posix-files: ambiguous live {:?}, expected pid {} image {} credentials {:?}",
