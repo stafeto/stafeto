@@ -518,6 +518,40 @@ mod tests {
     }
 
     #[test]
+    fn canonical_denial_returns_permission_before_retained_admission_is_reset() {
+        let mut kernel = kernel(ResultKind::Denied);
+        let mut admission = Admission::Unvouched;
+        visit(&mut admission, 31, &mut kernel).unwrap();
+        assert_eq!(
+            visit(&mut admission, 31, &mut kernel),
+            Err(proto_fs::PERMISSION)
+        );
+        assert!(matches!(
+            admission,
+            Admission::Transport(Transport {
+                state: State::Copy { owner: None, .. },
+                ..
+            })
+        ));
+        let Admission::Transport(transport) = &mut admission else {
+            panic!()
+        };
+        let State::Copy { outcome, .. } = &mut transport.state else {
+            panic!()
+        };
+        *outcome = proto_fs::PERMISSION;
+        assert_eq!(
+            visit(&mut admission, 31, &mut kernel),
+            Err(proto_fs::PERMISSION)
+        );
+        assert!(matches!(admission, Admission::Unvouched));
+        assert_eq!(
+            CALLS.with(|calls| calls.borrow().clone()),
+            vec![("Duplicate", u64::MAX - 1), ("Send", u64::MAX - 1)]
+        );
+    }
+
+    #[test]
     fn cancellation_after_duplicate_retains_outcome_until_the_owner_is_closed() {
         let mut kernel = kernel(ResultKind::Denied);
         let mut admission = Admission::Unvouched;

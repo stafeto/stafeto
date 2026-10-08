@@ -2758,13 +2758,14 @@ impl Fs {
                 | NotaryState::Back { outcome, .. }
                 | NotaryState::Reply { outcome, .. } => {
                     *outcome = code;
-                    return proto_fs::RESOLVING;
+                    return code;
                 }
-                NotaryState::Rollback { .. } | NotaryState::Commit => return proto_fs::RESOLVING,
+                NotaryState::Rollback { outcome, .. } => return *outcome,
+                NotaryState::Commit => return code,
             }
         }
         self.begin_binding_failure(fds, code);
-        proto_fs::RESOLVING
+        code
     }
     /// Test setup queues real storage reclamation before releasing a live
     /// prepared binding to the unchanged alternating maintenance cursor.
