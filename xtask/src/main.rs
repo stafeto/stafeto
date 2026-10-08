@@ -2006,7 +2006,8 @@ fn stock_thread_probe(vz: bool) -> Result<(), String> {
             &output,
             "priority-probe: heap and files at the ceiling above main, no helper thread",
         )?;
-        qemu::expect_marker(&output, "posix-process: adoption refusals ok")
+        qemu::expect_marker(&output, "posix-process: adoption refusals ok")?;
+        native_scopes::check_ended_routers(&output.lines, 1)
     });
     if vz {
         vz::stop_hint(checked)?;
@@ -2033,7 +2034,8 @@ fn native_scope_probe(vz: bool) -> Result<(), String> {
     const ENDED: &str = "init: posix-procs ended: exit code 0, not restarted";
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
     let checked = qemu::expect_stopped_on(&output, ENDED)
-        .and_then(|()| native_scopes::check_markers(&output.lines));
+        .and_then(|()| native_scopes::check_markers(&output.lines))
+        .and_then(|()| native_scopes::check_ended_routers(&output.lines, 1));
     if vz { vz::stop_hint(checked) } else { checked }
 }
 

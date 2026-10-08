@@ -13,6 +13,11 @@
 //! - R5: as R2, but the first thread ends past the contract of `rt` (no exit
 //!   hook); the probe build notices it when the second thread collects the
 //!   table, says so and passes the role on in the name of the first.
+//! - R6: the last two threads leave at once; relibc's exit is called once.
+//! - R7: the main thread leaves while a new thread, live in the table but
+//!   without an entry, would be chosen first; the signal still arrives.
+//! - R8: B is chosen by the main thread, leaves before the main thread's
+//!   message and passes the role on to a third thread.
 //! - R3: the main thread holds its entries deferred and, while it is leaving
 //!   after its last routing, the signal comes; the signal waits on the page
 //!   and reaches the native thread after the handoff.
@@ -36,6 +41,13 @@ static LEAVE: AtomicUsize = AtomicUsize::new(0);
 static MARKED: AtomicUsize = AtomicUsize::new(0);
 static RELEASE: AtomicUsize = AtomicUsize::new(0);
 static B_NUMBER: AtomicU64 = AtomicU64::new(0);
+static B_PTHREAD: AtomicU64 = AtomicU64::new(0);
+static BARRIER: AtomicUsize = AtomicUsize::new(0);
+static MAKE: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" {
+    fn atexit(function: extern "C" fn()) -> c_int;
+}
 
 /// The buffers of the native threads of the variants.
 const BUFFER: usize = 0xe60000;
@@ -225,8 +237,102 @@ fn marked(own: u64) {
                 let _ = sys::yield_now();
             }
         }
+        8 if own == B_NUMBER.load(Ordering::SeqCst) => {
+            MARKED.store(1, Ordering::SeqCst);
+        }
         _ => {}
     }
+}
+
+/// R6: both of the last two threads pass their first steps before either
+/// takes the table.
+fn barrier(_own: u64) {
+    BARRIER.fetch_add(1, Ordering::SeqCst);
+    let limit = now() + 3_000_000_000;
+    while BARRIER.load(Ordering::SeqCst) < 2 && now() < limit {
+        let _ = sys::yield_now();
+    }
+}
+
+/// R6: the handler of atexit runs once; it waits so that a second call of
+/// exit has been counted, then ends the child with the verdict.
+extern "C" fn on_exit() {
+    let limit = now() + 200_000_000;
+    while now() < limit {
+        let _ = sys::yield_now();
+    }
+    end_child(if abi::relibc::probe_exit_calls() == 1 {
+        0
+    } else {
+        40
+    })
+}
+
+/// R8: the main thread, inside its handoff with the successor chosen and the
+/// service not told, lets B leave and waits until B marked itself. B then
+/// has to pass the role on after the main thread's message.
+fn in_handover(own: u64) {
+    if VARIANT.load(Ordering::SeqCst) == 8 && own == 1 {
+        LEAVE.store(1, Ordering::SeqCst);
+        let limit = now() + 2_000_000_000;
+        while MARKED.load(Ordering::SeqCst) == 0 && now() < limit {
+            let _ = sys::yield_now();
+        }
+    }
+}
+
+/// R7: the creator of a thread, with the new place live and the thread not
+/// started, lets the main thread leave and the signal come.
+extern "C" fn window(_id: u64) {
+    LEAVE.store(1, Ordering::SeqCst);
+    let limit = now() + 3_000_000_000;
+    while !main_ended() && now() < limit {
+        let _ = sys::yield_now();
+    }
+    ready();
+    let limit = now() + 2_000_000_000;
+    while abi::process::page().pending.load(Ordering::Acquire) == 0 && now() < limit {
+        let _ = sys::yield_now();
+    }
+}
+
+/// R7: makes the thread whose entry is not bound when the signal comes.
+unsafe extern "C" fn maker(_: *mut c_void) -> *mut c_void {
+    let limit = now() + 3_000_000_000;
+    while MAKE.load(Ordering::SeqCst) == 0 && now() < limit {
+        let _ = sys::yield_now();
+    }
+    abi::relibc::probe_start_window(Some(window));
+    let mut made = 0;
+    // SAFETY: `quick` is a complete thread routine.
+    if unsafe { ffi::pthread_create(&mut made, ptr::null(), Some(quick), ptr::null_mut()) } != 0 {
+        end_child(14);
+    }
+    let sleeper = Sleeper::new();
+    finish(&sleeper, now() + 500_000_000)
+}
+
+unsafe extern "C" fn quick(_: *mut c_void) -> *mut c_void {
+    ptr::null_mut()
+}
+
+/// R8: the thread that gets the signal once B passed the role on.
+unsafe extern "C" fn third_after(_: *mut c_void) -> *mut c_void {
+    let sleeper = Sleeper::new();
+    let b_ended = || {
+        // SAFETY: the pthread of B stays in the table until it is joined.
+        match unsafe { threads::probe_native(B_PTHREAD.load(Ordering::SeqCst)) } {
+            Ok(native) => {
+                sys::thread_info(&native).map(|info| info.state) == Ok(ThreadState::Ended)
+            }
+            Err(_) => true,
+        }
+    };
+    if !sleeper.until(3000, || main_ended() && b_ended()) {
+        end_child(12);
+    }
+    ready();
+    finish(&sleeper, now() + 500_000_000)
 }
 
 /// R4: the thread that is held in `leaving`.
@@ -286,6 +392,57 @@ fn child(variant: usize, fd: c_int) -> ! {
                 end_child(11);
             }
         }
+        6 => {
+            ready();
+            // SAFETY: on_exit is a complete handler.
+            unsafe { atexit(on_exit) };
+            abi::relibc::probe_before_table_hook(Some(barrier));
+            let mut other = 0;
+            // SAFETY: `held` is a complete thread routine.
+            if unsafe { ffi::pthread_create(&mut other, ptr::null(), Some(held), ptr::null_mut()) }
+                != 0
+            {
+                end_child(11);
+            }
+            if !sleeper.until(2000, || B_NUMBER.load(Ordering::SeqCst) != 0) {
+                end_child(11);
+            }
+            LEAVE.store(1, Ordering::SeqCst);
+        }
+        7 => {
+            let (mut d, mut x) = (0, 0);
+            // SAFETY: both routines are complete thread routines.
+            if unsafe { ffi::pthread_create(&mut d, ptr::null(), Some(quick), ptr::null_mut()) }
+                != 0
+                || unsafe { ffi::pthread_create(&mut x, ptr::null(), Some(maker), ptr::null_mut()) }
+                    != 0
+                || unsafe { ffi::pthread_join(d, ptr::null_mut()) } != 0
+            {
+                end_child(11);
+            }
+            abi::relibc::probe_in_handover_hook(None);
+            MAKE.store(1, Ordering::SeqCst);
+            if !sleeper.until(3000, || LEAVE.load(Ordering::SeqCst) != 0) {
+                end_child(11);
+            }
+        }
+        8 => {
+            abi::relibc::probe_marked_hook(Some(marked));
+            abi::relibc::probe_in_handover_hook(Some(in_handover));
+            let (mut b, mut c) = (0, 0);
+            // SAFETY: both routines are complete thread routines.
+            if unsafe { ffi::pthread_create(&mut b, ptr::null(), Some(held), ptr::null_mut()) } != 0
+                || unsafe {
+                    ffi::pthread_create(&mut c, ptr::null(), Some(third_after), ptr::null_mut())
+                } != 0
+            {
+                end_child(11);
+            }
+            B_PTHREAD.store(b, Ordering::SeqCst);
+            if !sleeper.until(2000, || B_NUMBER.load(Ordering::SeqCst) != 0) {
+                end_child(11);
+            }
+        }
         _ => {
             abi::relibc::probe_marked_hook(Some(marked));
             let (mut b, mut c) = (0, 0);
@@ -328,7 +485,8 @@ fn variant(number: usize) -> bool {
         return failed(1620 + number);
     }
     let _ = abi::close(read);
-    if abi::process::kill(pid, SIGUSR2).is_err() {
+    // R6 ends by itself: it needs no signal.
+    if number != 6 && abi::process::kill(pid, SIGUSR2).is_err() {
         return failed(1630 + number);
     }
     let waited = abi::process::wait(
@@ -366,7 +524,7 @@ pub(super) fn run() -> bool {
     if unsafe { api::sigaction(SIGUSR2, &action, &mut old) } != 0 {
         return failed(1600);
     }
-    let passed = (1..=5).all(variant);
+    let passed = (1..=8).all(variant);
     let _ = unsafe { api::sigaction(SIGUSR2, &old, ptr::null_mut()) };
     if passed {
         rt::println!(
