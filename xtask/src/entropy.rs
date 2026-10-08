@@ -109,7 +109,7 @@ const ENTROPY_STEP_KINDS: [(usize, &str); 4] = [
 ];
 /// The line of the probe's role `x` (QEMU): CLONE with the service's
 /// table of live clones full, so the measured CLONE (kind 8) is its
-/// longest: the walk of the table grows with the live clones.
+/// longest. It takes the same ticks with any number of live clones.
 const CLONES_FULL: &str = "entropy-probe: the service's table of clones is full: 320 clones";
 
 /// What a run of the probe printed, judged: the driver started twice, each
@@ -169,9 +169,17 @@ pub fn verdict(lines: &[String], driver: &str, reseed: bool) -> Result<(), Strin
 /// The longest step of each kind of a loop: (kind, ticks, detail).
 type Rows = Vec<(usize, u64, u64)>;
 
+/// The CLONE of the entropy service with its table of 320 clones full, in
+/// ticks: 5551 measured, where a walk of the table took 12 560. A client
+/// that is no clone makes the step walk the table of roots (32 entries,
+/// about 200 ticks more), so the bound sits above that and far below the
+/// walk of the table, so that a return to a walk fails.
+const CLONE_FULL_MAX: u64 = 6_500;
+
 /// The longest step of each kind of the loop of `tag`, from the lines of a
-/// run under -icount: every kind of `kinds` came, and every kind but the
-/// heartbeat (64) stayed under term B. Gives the rows.
+/// run under -icount: every kind of `kinds` came, and every kind stayed
+/// under term B, the heartbeat too (it counts its own part only). Gives
+/// the rows.
 fn loop_steps(
     lines: &[String],
     tag: &str,
@@ -184,7 +192,7 @@ fn loop_steps(
             return Err(format!("{who}: no step {name}: {rows:?}"));
         }
     }
-    if let Some(row) = rows.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+    if let Some(row) = rows.iter().find(|r| r.1 > RAM_STEP_MAX) {
         return Err(format!("{who}: a step past term B {RAM_STEP_MAX}: {row:?}"));
     }
     Ok(rows)
@@ -206,6 +214,15 @@ pub fn steps_verdict(lines: &[String]) -> Result<[Rows; 2], String> {
             "the entropy service",
         )?,
     ])
+    .and_then(|rows| {
+        let clone = rows[1].iter().find(|r| r.0 == 8).map_or(0, |r| r.1);
+        if clone > CLONE_FULL_MAX {
+            return Err(format!(
+                "the entropy service: CLONE with the table full took {clone} ticks, past {CLONE_FULL_MAX}"
+            ));
+        }
+        Ok(rows)
+    })
 }
 
 /// `cargo xtask entropy` and its boot in `test`: the probe on `machine`,
@@ -235,6 +252,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(&output, ENDED)?;
     if icount {
         let [rng, service] = steps_verdict(&output.lines)?;
+        crate::check_waits(&output.lines, &["10", "11"], "entropy")?;
         let text = |rows: &[(usize, u64, u64)]| {
             let rows: Vec<_> = rows
                 .iter()
@@ -444,10 +462,10 @@ mod tests {
             step(10, 1, 900),
             step(10, 2, 1500),
             step(10, 65, 3000),
-            step(10, 64, 90_000),
+            step(10, 64, 1_100),
             step(11, 5, 1200),
             step(11, 6, 1300),
-            step(11, 8, 9000),
+            step(11, 8, 5600),
             step(11, 65, 2000),
         ];
         assert_eq!(
@@ -458,8 +476,18 @@ mod tests {
         long.push(step(11, 6, RAM_STEP_MAX + 1));
         assert!(steps_verdict(&long).is_err());
         let mut long = good.clone();
+        long.push(step(11, 8, CLONE_FULL_MAX + 1));
+        assert!(
+            steps_verdict(&long).is_err(),
+            "a CLONE that walks the table"
+        );
+        let mut long = good.clone();
         long.push(step(10, 65, RAM_STEP_MAX + 1));
         assert!(steps_verdict(&long).is_err());
+        // The heartbeat counts its own part only, and is bound like the rest.
+        let mut long = good.clone();
+        long.push(step(10, 64, RAM_STEP_MAX + 1));
+        assert!(steps_verdict(&long).is_err(), "a heartbeat past term B");
         for i in [0, 1, 2, 4, 5, 6, 7] {
             let mut missing = good.clone();
             missing.remove(i);

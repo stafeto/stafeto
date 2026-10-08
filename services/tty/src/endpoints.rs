@@ -93,7 +93,40 @@ pub struct Disconnect {
 /// Local dup creates another fd reference to this same session hold.
 #[derive(Clone)]
 pub struct Holds {
-    ids: [Option<u32>; HOLDS],
+    ids: Cells,
+    /// The table indices (`id & 255`) of the held descriptions, a bit
+    /// each. A description that is held cannot be freed, so no other
+    /// generation of its index exists while the bit is set.
+    mask: [u64; DESCRIPTIONS / 64],
+}
+
+/// The cells of a hold table. Every read goes through `get` or `iter`,
+/// which a test build counts, so a test can show that a lookup reads none.
+#[derive(Clone)]
+struct Cells {
+    items: [Option<u32>; HOLDS],
+    #[cfg(test)]
+    reads: core::cell::Cell<usize>,
+}
+impl Cells {
+    const fn new() -> Self {
+        Self {
+            items: [None; HOLDS],
+            #[cfg(test)]
+            reads: core::cell::Cell::new(0),
+        }
+    }
+    fn get(&self, place: usize) -> Option<u32> {
+        #[cfg(test)]
+        self.reads.set(self.reads.get() + 1);
+        self.items[place]
+    }
+    fn set(&mut self, place: usize, id: Option<u32>) {
+        self.items[place] = id;
+    }
+    fn iter(&self) -> impl Iterator<Item = Option<u32>> + '_ {
+        (0..HOLDS).map(|place| self.get(place))
+    }
 }
 impl Default for Holds {
     fn default() -> Self {
@@ -102,13 +135,31 @@ impl Default for Holds {
 }
 impl Holds {
     pub const fn new() -> Self {
-        Self { ids: [None; HOLDS] }
+        Self {
+            ids: Cells::new(),
+            mask: [0; DESCRIPTIONS / 64],
+        }
     }
+    /// True when a description of the table index of `id` is held: a
+    /// bit test. `Endpoints::locate` checks the generation and the side.
     pub fn contains(&self, id: u32) -> bool {
-        self.ids.contains(&Some(id))
+        let index = (id & 255) as usize;
+        self.mask[index / 64] >> (index % 64) & 1 != 0
+    }
+    fn put(&mut self, place: usize, id: u32) {
+        self.ids.set(place, Some(id));
+        let index = (id & 255) as usize;
+        self.mask[index / 64] |= 1 << (index % 64);
+    }
+    fn remove(&mut self, place: usize) {
+        if let Some(id) = self.ids.get(place) {
+            self.ids.set(place, None);
+            let index = (id & 255) as usize;
+            self.mask[index / 64] &= !(1 << (index % 64));
+        }
     }
     pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.ids.iter().flatten().copied()
+        self.ids.iter().flatten()
     }
     pub fn first(&self) -> Option<u32> {
         self.ids().next()
@@ -134,7 +185,10 @@ impl Holds {
             }
             let bit = 1 << (index % 64);
             if selected[index / 64] & bit == 0 {
-                *result.ids.get_mut(next).ok_or(Failure::Limit)? = Some(id);
+                if next == HOLDS {
+                    return Err(Failure::Limit);
+                }
+                result.put(next, id);
                 next += 1;
                 selected[index / 64] |= bit;
             }
@@ -145,7 +199,7 @@ impl Holds {
     fn room(&self) -> Result<usize, Failure> {
         self.ids
             .iter()
-            .position(Option::is_none)
+            .position(|item| item.is_none())
             .ok_or(Failure::Limit)
     }
 }
@@ -228,7 +282,7 @@ impl Endpoints {
             } else {
                 0
             };
-        holds.ids[place] = Some(id);
+        holds.put(place, id);
         let i = &mut self.instances[endpoint.terminal];
         match endpoint.side {
             Side::Master => i.masters = count,
@@ -329,8 +383,11 @@ impl Endpoints {
         d.endpoint.flags = (d.endpoint.flags & !NONBLOCK) | (flags & NONBLOCK);
         Ok(())
     }
-    fn retain(&mut self, id: u32, real: bool) -> Result<(), Failure> {
+    fn retain(&mut self, id: u32, real: bool, by: u32) -> Result<(), Failure> {
         let index = self.locate(id)?;
+        self.retain_at(index, real, by)
+    }
+    fn retain_at(&mut self, index: usize, real: bool, by: u32) -> Result<(), Failure> {
         let d = self.descriptions[index];
         let i = &self.instances[d.endpoint.terminal];
         let count = if real {
@@ -341,11 +398,11 @@ impl Endpoints {
         } else {
             i.pins
         };
-        let references = d.references.checked_add(1).ok_or(Failure::Overflow)?;
-        let count = count.checked_add(1).ok_or(Failure::Overflow)?;
+        let references = d.references.checked_add(by).ok_or(Failure::Overflow)?;
+        let count = count.checked_add(by).ok_or(Failure::Overflow)?;
         let pins = d
             .pins
-            .checked_add(u32::from(!real))
+            .checked_add(if real { 0 } else { by })
             .ok_or(Failure::Overflow)?;
         self.descriptions[index].references = references;
         self.descriptions[index].pins = pins;
@@ -387,7 +444,12 @@ impl Endpoints {
     }
     pub fn pin(&mut self, holds: &Holds, id: u32) -> Result<(), Failure> {
         self.resolve(holds, id)?;
-        self.retain(id, false)
+        self.retain(id, false, 1)
+    }
+    /// `by` pins of the description at table index `index`, which a
+    /// `resolve` of the same step found: no second lookup.
+    pub fn pin_at(&mut self, index: usize, by: u32) -> Result<(), Failure> {
+        self.retain_at(index, false, by)
     }
     fn release(&mut self, id: u32, real: bool) -> Result<Option<Disconnect>, Failure> {
         let index = self.locate(id)?;
@@ -422,10 +484,10 @@ impl Endpoints {
         let place = holds
             .ids
             .iter()
-            .position(|&item| item == Some(id))
+            .position(|item| item == Some(id))
             .ok_or(Failure::BadDescription)?;
         self.locate(id)?;
-        holds.ids[place] = None;
+        holds.remove(place);
         self.release(id, true)
     }
     pub fn unpin(&mut self, id: u32) -> Result<Option<Disconnect>, Failure> {
@@ -456,6 +518,31 @@ impl Endpoints {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `contains` reads no cell of `ids`, whether one or all are held: a
+    /// walk of the cells (the former way) counts HOLDS reads.
+    #[test]
+    fn contains_does_not_walk_the_cells() {
+        let mut table = Endpoints::new();
+        let mut holds = Holds::new();
+        let first = table.open_master(&mut holds, 2).unwrap();
+        let reads = |holds: &Holds| {
+            let before = holds.ids.reads.get();
+            assert!(holds.contains(first));
+            assert!(!holds.contains(first ^ 0x80));
+            holds.ids.reads.get() - before
+        };
+        let few = reads(&holds);
+        for _ in 1..PTYS {
+            table.open_master(&mut holds, 2).unwrap();
+        }
+        for _ in PTYS..HOLDS {
+            table.open_console(&mut holds, 2).unwrap();
+        }
+        assert_eq!(holds.ids().count(), HOLDS);
+        assert_eq!(reads(&holds), few);
+        assert_eq!(few, 0);
+    }
 
     #[test]
     fn side_tags_and_publication_overflow_fail_before_mutation() {
@@ -511,6 +598,25 @@ mod tests {
         assert_ne!(fresh, master);
         assert!(table.resolve(&parent, fresh).unwrap().generation > effect.generation);
         assert_eq!(table.pinned(master), Err(Failure::BadDescription));
+    }
+
+    /// The pins of the elements of a Watch that name one description are
+    /// made in one step, and end one by one as the cleanup ends them.
+    #[test]
+    fn pins_made_together_end_one_by_one() {
+        let mut table = Endpoints::new();
+        let mut parent = Holds::new();
+        let master = table.open_master(&mut parent, 2).unwrap();
+        table.resolve(&parent, master).unwrap();
+        table.pin_at((master & 255) as usize, 3).unwrap();
+        assert!(table.close(&mut parent, master).is_ok());
+        for _ in 0..2 {
+            assert!(table.unpin(master).is_ok());
+            assert!(table.pinned(master).is_ok());
+        }
+        assert!(table.unpin(master).is_ok());
+        assert!(table.pinned(master).is_err());
+        assert_eq!(table.unpin(master), Err(Failure::BadDescription));
     }
 
     #[test]

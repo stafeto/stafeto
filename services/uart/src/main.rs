@@ -27,6 +27,7 @@ use proto_init::ServiceArgs;
 use proto_uart::{
     Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION, WriteReply, WriteRequest,
 };
+use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer, long};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
@@ -95,6 +96,15 @@ unsafe impl Sync for Cell {}
 /// with none of its bytes in the program's file.
 static STATE: Cell = Cell(UnsafeCell::new(MaybeUninit::uninit()));
 static TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// The table of the clones, outside the loop's stack: about 2.9 K bytes of
+/// places and roots, with no guard page below the stack.
+struct CloneTable(UnsafeCell<Clones<CLONES>>);
+
+// SAFETY: only the main thread reaches it, once.
+unsafe impl Sync for CloneTable {}
+
+static CLONE_TABLE: CloneTable = CloneTable(UnsafeCell::new(Clones::new()));
 
 /// The state, empty, at the first call only.
 fn state() -> Option<&'static mut State> {
@@ -166,8 +176,8 @@ fn main(_: u64) -> u64 {
     let mut uart = Uart {
         channel: Handle::borrowed(channel.raw()),
         level,
-        given: 0,
-        clones: proto_wire::clones::Clones::new(),
+        // SAFETY: only the main thread reaches CLONE_TABLE, here once.
+        clones: unsafe { &mut *CLONE_TABLE.0.get() },
         regs: Regs(REGS_AT),
         irq,
         log,
@@ -208,9 +218,8 @@ struct Uart {
     /// the level of its loop, and how many it gave.
     channel: core::mem::ManuallyDrop<Handle<Channel>>,
     level: u8,
-    given: u64,
     /// The sessions CLONE gave that live, bounded for each client.
-    clones: proto_wire::clones::Clones<CLONES>,
+    clones: &'static mut Clones<CLONES>,
     regs: Regs,
     irq: Handle<Interrupt>,
     log: Handle<Resource>,
@@ -653,21 +662,22 @@ impl Uart {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if self.clones.room(r.label()).is_err() {
+        let Ok(label) = self.clones.give(1 << 63, r.label()) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
-        }
-        self.given += 1;
+        };
         let rights = abi::Rights::SEND.union(abi::Rights::TRANSFER);
-        let label = 1 << 63 | self.given;
         match sys::handle_label(&self.channel, rights, label, self.level) {
             Ok(session) => {
                 if r.reply().u32(0).is_err() {
+                    self.clones.gone(label);
                     return Answer::Status(Status::BadSize);
                 }
-                let _ = self.clones.add(label, r.label());
                 Answer::Reply([session.erase()].into())
             }
-            Err(e) => Answer::Status(Status::Kernel(e)),
+            Err(e) => {
+                self.clones.gone(label);
+                Answer::Status(Status::Kernel(e))
+            }
         }
     }
 }
@@ -744,3 +754,8 @@ impl Write for Line {
         Ok(())
     }
 }
+
+/// The loop's structure stays small, as the stack is its home and has no
+/// guard page: it takes 96 bytes with the clones in `CLONE_TABLE`, and
+/// would take several K more with the table in it.
+const _: () = assert!(core::mem::size_of::<Uart>() <= 512);

@@ -5040,8 +5040,8 @@ pub fn windows_of_the_running_process_are_counted(_: &Boot) -> Result<(), &'stat
 
 /// Measures the teardown portions with a process that has 11 message
 /// buffers, 42 handles in transit, and 32 charged pool pages. The buffer
-/// work exactly fills its 64-unit portion; the shell's 32 pages take four
-/// or more portions. The handles use the permanent system resource so
+/// work, 64 units, takes three portions of the stage, the longest of them
+/// the result; the shell's 32 pages take four or more portions. The handles use the permanent system resource so
 /// they add no unrelated object cleanup. The rows after them
 /// (`threads_teardown`):
 /// - end_call: the part of an end in the call (process::end) of a process
@@ -5058,21 +5058,21 @@ pub fn windows_of_the_running_process_are_counted(_: &Boot) -> Result<(), &'stat
 /// - child_threads: the longest portion of the teardown of a parent whose
 ///   child has abi::MAX_THREADS such senders, its stage Stop ending the
 ///   child;
-/// - session_buffers: the portion of the stage Buffers of 42 handles in
+/// - session_buffers: the portion of the stage Buffers of 20 handles in
 ///   transit that are the last copies of sessions, each waking a receiver,
-///   and 11 buffers whose frames merge up to the highest order
+///   and 6 buffers whose frames merge up to the highest order
 ///   (session_buffers_ticks); the stage lets no reference to a thread go
 ///   (process::teardown, release_buffers), so the test's references to
 ///   them change nothing;
-/// - session_handles: the portion of the stage Handles of a chunk of the
-///   last copies of sessions, each waking a receiver
-///   (session_handles_ticks).
+/// - session_handles: the longest portion of the stage Handles of a chunk
+///   of the last copies of sessions, each waking a receiver, half the
+///   chunk a portion (session_handles_ticks);
+/// - teardown_any: the longest portion of any kind in the four teardowns
+///   of the rows above, the threads' own cleanup included.
 ///
-/// The last two are the session cases measured before this cleanup,
-/// whose worst portion was the term B of the blocking of every level
-/// (spec 15.3). No portion of the teardowns of the threads rows, those of
-/// the threads' own cleanup included, is longer than that term, the
-/// session_handles of the same run (KERNEL_STATS x5).
+/// The two session rows are the cases the portions are sized by
+/// (BUFFERS_PORTION, HANDLES_PORTION). Every row but `threads` is compared
+/// with the bound of the kernel by xtask (spec 15.3, KERNEL_B_MAX).
 #[cfg(feature = "icount")]
 pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     let before = (process::in_use(), thread::in_use());
@@ -5117,12 +5117,18 @@ pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
         process::measurement_stage(p) == Stage::Buffers,
         "the teardown did not reach buffers",
     )?;
-    let start = timer::now();
-    cleanup::portion();
-    let buffers = timer::now() - start;
+    let mut buffers = 0;
+    for _ in 0..4 {
+        if process::measurement_stage(p) != Stage::Buffers {
+            break;
+        }
+        let start = timer::now();
+        cleanup::portion();
+        buffers = buffers.max(timer::now() - start);
+    }
     check(
         process::measurement_stage(p) == Stage::Mappings,
-        "eleven buffers and 42 handles did not fit one portion",
+        "eleven buffers and 42 handles did not fit three portions",
     )?;
     for t in threads.into_iter().flatten() {
         // SAFETY: the measurement owns the thread reference; the process
@@ -5142,15 +5148,15 @@ pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     cleanup::drain();
     let session_buffers = session_buffers_ticks()?;
     let session_handles = session_handles_ticks()?;
-    let b = session_handles;
-    let (_, one_level) = threads_teardown(Crowd::Ready { spread: false }, false, b)?;
-    let (_, spread) = threads_teardown(Crowd::Ready { spread: true }, false, b)?;
+    let (_, one_level, any_one) = threads_teardown(Crowd::Ready { spread: false }, false)?;
+    let (_, spread, any_spread) = threads_teardown(Crowd::Ready { spread: true }, false)?;
     let ready = one_level.max(spread);
-    let (end_call, senders) = threads_teardown(Crowd::Senders, false, b)?;
-    let (_, child) = threads_teardown(Crowd::Senders, true, b)?;
+    let (end_call, senders, any_senders) = threads_teardown(Crowd::Senders, false)?;
+    let (_, child, any_child) = threads_teardown(Crowd::Senders, true)?;
+    let any = any_one.max(any_spread).max(any_senders).max(any_child);
     kprintln!("threads ready ticks: one_level={one_level} spread={spread}");
     kprintln!(
-        "teardown portions ticks: buffers={buffers} shell={shell} end_call={end_call} threads_ready={ready} teardown_threads={senders} child_threads={child} session_buffers={session_buffers} session_handles={session_handles} threads={}",
+        "teardown portions ticks: buffers={buffers} shell={shell} end_call={end_call} threads_ready={ready} teardown_threads={senders} child_threads={child} session_buffers={session_buffers} session_handles={session_handles} teardown_any={any} threads={}",
         abi::MAX_THREADS
     );
     check(
@@ -5407,9 +5413,10 @@ enum Crowd {
 /// parent does when `as_child`, and its whole teardown runs: the ticks of
 /// process::end, and of the longest portion while the process was at its
 /// stage Threads. Each portion of the teardown, of the processes and of
-/// the threads, is no longer than `b` (KERNEL_STATS x5).
+/// the threads, and of the longest portion of the whole teardown, the
+/// threads' own cleanup included (KERNEL_STATS x5).
 #[cfg(feature = "icount")]
-fn threads_teardown(crowd: Crowd, as_child: bool, b: u64) -> Result<(u64, u64), &'static str> {
+fn threads_teardown(crowd: Crowd, as_child: bool) -> Result<(u64, u64, u64), &'static str> {
     let service =
         process::create_root(QUOTA, 2 * abi::MAX_THREADS, CEILING).map_err(|_| "no service")?;
     let parent = if as_child {
@@ -5442,11 +5449,7 @@ fn threads_teardown(crowd: Crowd, as_child: bool, b: u64) -> Result<(u64, u64), 
                 }
             }
             check(cleanup::top().is_none(), "the teardown did not end")?;
-            check(
-                cleanup::take_longest() <= b,
-                "a portion of a teardown of abi::MAX_THREADS threads is longer than B",
-            )?;
-            Ok((end_call, threads))
+            Ok((end_call, threads, cleanup::take_longest()))
         });
         // SAFETY: the measurement owns the process reference.
         unsafe { process::release(p, CAUSE) };
@@ -5603,16 +5606,21 @@ impl Listeners {
 }
 
 /// session_buffers of `teardown_portions_are_measured`: the portion of the
-/// stage Buffers of a process with 11 stopped threads, ten with four
-/// handles in transit and one with two, which fill the portion's 64 units
-/// (BUFFERS_PORTION). Every handle is the last copy of a session whose
+/// stage Buffers of a process with 7 stopped threads, five with four
+/// handles in transit and two with none: the six newest fill the portion's
+/// 32 units (BUFFERS_PORTION), five times a frame of two units and four
+/// handles, and the frame of the sixth, and the oldest waits for the next
+/// portion (`buffers_portion`), so that the measurement follows the
+/// constant. Every handle is the last copy of a session whose
 /// receiver waits (Listeners), and every buffer's frame is alone in a free
 /// block of the highest order (`Apart`), so that its free merges up to it.
 #[cfg(feature = "icount")]
 fn session_buffers_ticks() -> Result<u64, &'static str> {
-    const MOVED: [usize; 11] = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2];
+    // The stage takes the newest thread first, so the oldest, the first,
+    // is the one that waits for the second portion.
+    const MOVED: [usize; 7] = [0, 4, 4, 4, 4, 4, 0];
     let free = phys::free_frames() + pages::taken() as u64;
-    let mut l = Listeners::new(42)?;
+    let mut l = Listeners::new(20)?;
     let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
     let mut threads = [None; MOVED.len()];
     let made = threads.iter_mut().try_for_each(|slot| {
@@ -5675,7 +5683,8 @@ fn session_buffers_ticks() -> Result<u64, &'static str> {
 
 /// The process `p`, which holds threads with buffers, ends; the portions
 /// before its stage Buffers run, and the ticks of the one portion of that
-/// stage, which must take every buffer, are the result.
+/// stage, which must take every buffer but the last thread's, are the
+/// result; one more portion takes that.
 #[cfg(feature = "icount")]
 fn buffers_portion(p: NonNull<Process>) -> Result<u64, &'static str> {
     // SAFETY: the measurement holds the process.
@@ -5694,8 +5703,13 @@ fn buffers_portion(p: NonNull<Process>) -> Result<u64, &'static str> {
     cleanup::portion();
     let took = timer::now() - start;
     check(
+        process::measurement_stage(p) == Stage::Buffers,
+        "the portion took more than its units, or the seventh thread",
+    )?;
+    cleanup::portion();
+    check(
         process::measurement_stage(p) == Stage::Mappings,
-        "the buffers did not fit one portion",
+        "the second portion did not take the last buffer",
     )?;
     Ok(took)
 }
@@ -5703,7 +5717,7 @@ fn buffers_portion(p: NonNull<Process>) -> Result<u64, &'static str> {
 /// session_handles of `teardown_portions_are_measured`: the longest
 /// portion of the stage Handles of a process that ends with CHUNK handles
 /// in its table, each the last copy of a session whose receiver waits
-/// (Listeners): a portion takes a chunk of the table.
+/// (Listeners): a portion takes HANDLES_PORTION entries, half of the chunk.
 #[cfg(feature = "icount")]
 fn session_handles_ticks() -> Result<u64, &'static str> {
     let mut l = Listeners::new(CHUNK)?;
@@ -5728,12 +5742,18 @@ fn session_handles_ticks() -> Result<u64, &'static str> {
                 cleanup::portion();
             }
             let mut longest = 0;
+            let mut portions = 0;
             while process::measurement_stage(p) == Stage::Handles {
                 let start = timer::now();
                 cleanup::portion();
                 longest = longest.max(timer::now() - start);
+                portions += 1;
             }
             check(longest > 0, "the teardown did not reach handles")?;
+            check(
+                portions == 2,
+                "the chunk did not take two portions of half its entries",
+            )?;
             check(
                 l.woken() == CHUNK,
                 "the last copies in the table did not wake every receiver",
@@ -6778,10 +6798,7 @@ pub fn suspended_reply_keeps_its_result(_: &Boot) -> Result<(), &'static str> {
 pub fn suspension_paths_are_measured(_: &Boot) -> Result<(), &'static str> {
     let [stop, park, continue_call, portion, stop_cancel, longest] = suspension_crowd(0, true)?;
     kprintln!(
-        "suspension scopes ticks: control_stop_no_queue={stop} control_stop_cancel={stop_cancel} pick_park_selected={park} control_continue={continue_call} resume_64={portion}"
+        "suspension scopes ticks: control_stop_no_queue={stop} control_stop_cancel={stop_cancel} pick_park_selected={park} control_continue={continue_call} resume_64={portion} longest_portion={longest}"
     );
-    check(
-        longest <= 20_538 && portion <= 20_538 && stop_cancel <= 20_538,
-        "a suspension scope exceeded B",
-    )
+    Ok(())
 }

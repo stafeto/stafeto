@@ -268,15 +268,21 @@ fn run(
     let block = threads::own_block();
     let id = NEXT
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            n.checked_add(1).filter(|next| *next < TAG >> 2)
+            n.checked_add(1).filter(|next| *next < TAG >> 3)
         })
         .map_err(|_| EAGAIN)?;
     let mut ready = [0; watch::MAX];
     let pins = Pins::snapshot(items, &mut ready)?;
     let transport = pins.transport.ok_or(EIO)?;
+    // The pipes' Watch, then the terminal's Watches of WATCH_MAX elements
+    // each (`proto_tty::watch_group`), every one with a label of its own.
+    // The low three bits of a label: 0 the pipes, 1 and 3 the terminal's
+    // Watches, 2 the timer.
+    const _: () = assert!(proto_tty::WATCH_GROUPS == 2);
     let mut subscriptions = [
-        Subscription::new(Service::Pipe, TAG | id << 2),
-        Subscription::new(Service::Terminal, TAG | id << 2 | 1),
+        Subscription::new(Service::Pipe, TAG | id << 3),
+        Subscription::new(Service::Terminal, TAG | id << 3 | 1),
+        Subscription::new(Service::Terminal, TAG | id << 3 | 3),
     ];
     for (index, (item, target)) in items.iter().zip(&pins.targets).enumerate() {
         let requested = (item.events as u16 as u32) & watch::EVENTS;
@@ -300,14 +306,20 @@ fn run(
                 subscriptions[0].add(*end, requested, index);
             }
             Some(Target::Tty(terminal)) => {
-                subscriptions[1].owner = transport.terminal().ok_or(EBADF)?.raw().0;
-                subscriptions[1].add(*terminal, requested, index);
+                let group =
+                    proto_tty::watch_group(subscriptions[1].set.len + subscriptions[2].set.len);
+                let owner = transport.terminal().ok_or(EBADF)?.raw().0;
+                subscriptions[1 + group].owner = owner;
+                subscriptions[1 + group].add(*terminal, requested, index);
             }
             Some(Target::Input | Target::Output | Target::Error)
                 if transport.terminal().is_some() =>
             {
-                subscriptions[1].owner = transport.terminal().ok_or(EIO)?.raw().0;
-                subscriptions[1].add(proto_tty::CONSOLE, requested, index);
+                let group =
+                    proto_tty::watch_group(subscriptions[1].set.len + subscriptions[2].set.len);
+                let owner = transport.terminal().ok_or(EIO)?.raw().0;
+                subscriptions[1 + group].owner = owner;
+                subscriptions[1 + group].add(proto_tty::CONSOLE, requested, index);
             }
             Some(_) => ready[index] = requested & (watch::READ | watch::WRITE),
             None => {}
@@ -382,7 +394,7 @@ fn run(
             if let Some(until) = until {
                 if timer.is_none() {
                     let labelled =
-                        sys::handle_label(&channel, Rights::RECEIVE, TAG | id << 2 | 2, level)
+                        sys::handle_label(&channel, Rights::RECEIVE, TAG | id << 3 | 2, level)
                             .map_err(kernel_error)?;
                     timer = Some(sys::timer_create(&labelled, level).map_err(kernel_error)?);
                 }
@@ -399,7 +411,7 @@ fn run(
     if let Some(timer) = timer.as_ref() {
         let _ = sys::timer_cancel(timer);
     }
-    // Both groups cancel even after partial registration or an early error.
+    // Every subscription cancels even after partial registration or an early error.
     let mut cleanup_error = None;
     for subscription in &mut subscriptions {
         if let Err(error) = subscription.cancel(&mut ready) {

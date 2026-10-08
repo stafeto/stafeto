@@ -121,6 +121,15 @@ unsafe impl Sync for Table {}
 
 static TABLE: Table = Table(UnsafeCell::new([const { None }; SESSIONS]));
 
+/// The table of the clones, outside the loop's stack: about 6.7 K bytes of
+/// places and roots, with no guard page below the stack.
+struct CloneTable(UnsafeCell<Clones<CLONES>>);
+
+// SAFETY: only the main thread reaches it, once.
+unsafe impl Sync for CloneTable {}
+
+static CLONE_TABLE: CloneTable = CloneTable(UnsafeCell::new(Clones::new()));
+
 fn main(_: u64) -> u64 {
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
@@ -164,8 +173,8 @@ fn main(_: u64) -> u64 {
     let mut service = Entropy {
         source: Source::new(),
         ops: LongOps::new(),
-        clones: Clones::new(),
-        given: 0,
+        // SAFETY: only the main thread reaches CLONE_TABLE, here once.
+        clones: unsafe { &mut *CLONE_TABLE.0.get() },
         telling: [(0, 0); WAITING],
         told: 0,
         to_tell: 0,
@@ -196,9 +205,8 @@ struct Entropy {
     source: Source,
     ops: LongOps<WAITING>,
     /// The sessions CLONE gave that live, bounded for each client; the
-    /// count of those given so far; the channel they are copies of.
-    clones: Clones<CLONES>,
-    given: u64,
+    /// channel they are copies of.
+    clones: &'static mut Clones<CLONES>,
     /// The seeds that waited when the first bytes came, told TELLS a step:
     /// `told` of `to_tell` so far.
     telling: [(u64, u64); WAITING],
@@ -279,21 +287,22 @@ impl Entropy {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if self.clones.room(r.label()).is_err() {
+        let Ok(label) = self.clones.give(OWN, r.label()) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
-        }
-        self.given += 1;
-        let label = OWN | self.given;
+        };
         let rights = Rights::SEND | Rights::TRANSFER;
         match sys::handle_label(&self.channel, rights, label, self.level) {
             Ok(session) => {
                 if r.reply().u32(Status::Ok.code()).is_err() {
+                    self.clones.gone(label);
                     return Answer::Status(Status::BadSize);
                 }
-                let _ = self.clones.add(label, r.label());
                 Answer::Reply([session.erase()].into())
             }
-            Err(error) => Answer::Status(Status::Kernel(error)),
+            Err(error) => {
+                self.clones.gone(label);
+                Answer::Status(Status::Kernel(error))
+            }
         }
     }
 
@@ -556,3 +565,8 @@ fn call(
     posix_random::erase(data);
     result
 }
+
+/// The loop's structure stays small, as the stack is its home and has no
+/// guard page: it takes 4 152 bytes with the clones in `CLONE_TABLE`, and
+/// would take several K more with the table in it.
+const _: () = assert!(core::mem::size_of::<Entropy>() <= 5120);

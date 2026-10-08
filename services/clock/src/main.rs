@@ -4,6 +4,7 @@
 //! System-wide realtime anchor. Starts at the Unix epoch until explicitly set.
 #![no_std]
 #![no_main]
+use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use posix_credentials::known::Known;
@@ -12,6 +13,7 @@ use proto_clock::Method;
 use proto_clock::page;
 use proto_init::ServiceArgs;
 use proto_wire::Status;
+use proto_wire::clones::Clones;
 use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
@@ -27,6 +29,15 @@ const CLONES: usize = 320;
 /// The mark of the labels the service gives itself (Clone): bit 63, which
 /// no label of init has.
 const OWN: u64 = 1 << 63;
+/// The table of the clones, outside the loop's stack: about 6.7 K bytes of
+/// places and roots, with no guard page below the stack.
+struct CloneTable(UnsafeCell<Clones<CLONES>>);
+
+// SAFETY: only the main thread reaches it, once.
+unsafe impl Sync for CloneTable {}
+
+static CLONE_TABLE: CloneTable = CloneTable(UnsafeCell::new(Clones::new()));
+
 fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
@@ -66,8 +77,8 @@ fn main(_: u64) -> u64 {
         &mut Clocks {
             channel: Handle::borrowed(channel.raw()),
             level,
-            given: 0,
-            clones: proto_wire::clones::Clones::new(),
+            // SAFETY: only the main thread reaches CLONE_TABLE, here once.
+            clones: unsafe { &mut *CLONE_TABLE.0.get() },
             clock,
             page,
             watches: core::array::from_fn(|_| None),
@@ -101,9 +112,8 @@ struct Clocks {
     /// of, at the loop's level, and how many it gave.
     channel: ManuallyDrop<Handle<Channel>>,
     level: u8,
-    given: u64,
     /// The sessions Clone gave that live, bounded for each client.
-    clones: proto_wire::clones::Clones<CLONES>,
+    clones: &'static mut Clones<CLONES>,
     clock: Clock,
     page: Page,
     watches: [Option<Watch>; 8],
@@ -301,21 +311,22 @@ impl Page {
 }
 impl Clocks {
     fn clone_session(&mut self, r: &mut Request<'_>) -> Answer {
-        if self.clones.room(r.label()).is_err() {
+        let Ok(label) = self.clones.give(OWN, r.label()) else {
             return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
-        }
-        self.given += 1;
+        };
         let rights = rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER;
-        let label = OWN | self.given;
         match sys::handle_label(&self.channel, rights, label, self.level) {
             Ok(session) => {
                 if r.reply().u32(0).is_err() {
+                    self.clones.gone(label);
                     return Answer::Status(Status::BadSize);
                 }
-                let _ = self.clones.add(label, r.label());
                 Answer::Reply([session.erase()].into())
             }
-            Err(e) => Answer::Status(Status::Kernel(e)),
+            Err(e) => {
+                self.clones.gone(label);
+                Answer::Status(Status::Kernel(e))
+            }
         }
     }
 
@@ -556,3 +567,8 @@ impl Service<0> for Clocks {
         }
     }
 }
+
+/// The loop's structure stays small, as the stack is its home and has no
+/// guard page: it takes 1 040 bytes with the clones in `CLONE_TABLE`, and
+/// would take several K more with the table in it.
+const _: () = assert!(core::mem::size_of::<Clocks>() <= 2048);

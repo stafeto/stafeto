@@ -29,6 +29,7 @@ mod ring;
 mod rootfs;
 mod rtbench;
 mod rtbench2;
+mod stubs;
 mod symbolize;
 mod vz;
 
@@ -694,7 +695,9 @@ const TTY_PROGRAMS: [ImageProgram; 4] = [
 const TTY_STEPS_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-tty-steps"]),
     ("tty", "tty", TTY_STACK_SIZE, &["steps"]),
-    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
+    // The chain of 255 clones and the replies asked of it need more than
+    // the 16 KB of the other probes.
+    ("tty-probe", "tty-probe", 2 * SVC_STACK_SIZE, &[]),
 ];
 /// The same over the Virtio console's driver on Apple VZ (xtask tty-vz).
 const TTY_VZ_PROGRAMS: [ImageProgram; 4] = [
@@ -812,7 +815,7 @@ const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
 const UPCALL_ROWS: [&str; 5] = ["interrupt", "bind", "control", "request", "return"];
 /// The rows of the line of `teardown_portions_are_measured`, in its order
 /// (spec 15.3): the term B of the out-of-tree measurement is the longest of them.
-const TEARDOWN_ROWS: [&str; 9] = [
+const TEARDOWN_ROWS: [&str; 10] = [
     "buffers",
     "shell",
     "end_call",
@@ -821,15 +824,17 @@ const TEARDOWN_ROWS: [&str; 9] = [
     "child_threads",
     "session_buffers",
     "session_handles",
+    "teardown_any",
     "threads",
 ];
 /// Scoped direct-control, pick + park and continuation measurements.
-const SUSPENSION_ROWS: [&str; 5] = [
+const SUSPENSION_ROWS: [&str; 6] = [
     "control_stop_no_queue",
     "control_stop_cancel",
     "pick_park_selected",
     "control_continue",
     "resume_64",
+    "longest_portion",
 ];
 /// The rows of the line of the test init's `normal_build_costs`, in its
 /// order: the costs of the build that ships (spec 15.3).
@@ -1044,7 +1049,6 @@ enum Variant {
     TestIcount,
     FaultProbe,
     OverflowProbe,
-    IpcLossProbe,
 }
 
 impl Variant {
@@ -1067,7 +1071,6 @@ impl Variant {
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
-            Variant::IpcLossProbe => Some("ipc-loss-probe"),
         }
     }
 
@@ -1078,11 +1081,9 @@ impl Variant {
             | Variant::TraceNormal
             | Variant::FaultProbe
             | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
-            Variant::Test
-            | Variant::Baseline
-            | Variant::Trace
-            | Variant::TestIcount
-            | Variant::IpcLossProbe => (TEST_KERNEL_LIMIT, "test builds"),
+            Variant::Test | Variant::Baseline | Variant::Trace | Variant::TestIcount => {
+                (TEST_KERNEL_LIMIT, "test builds")
+            }
         }
     }
 
@@ -1096,7 +1097,6 @@ impl Variant {
             Variant::TestIcount => "stafeto-ktest-icount",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
-            Variant::IpcLossProbe => "stafeto-ipc-loss",
         }
     }
 }
@@ -1139,7 +1139,6 @@ commands:
   posix-files verify authentic file identity and byte path proofs
   posix-files-steps measure full RAM dispatches across credential refresh
   posix-data-steps measure paid data cleanup and full mapping dispatches
-  posix-files-loss verify native refused Open replies with a live sibling
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
   posix-input-vz verify file progress during Virtio console reads on Apple VZ
@@ -1260,7 +1259,6 @@ fn main() {
         Some("loader-info") => loader_info_probe(),
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
-        Some("posix-files-loss") => posix_files_loss(),
         Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
@@ -1491,6 +1489,7 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
             .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
     }
     disasm::erratum_835769(&elf, &llvm_tool("llvm-objdump")?)?;
+    disasm::erratum_843419(&elf)?;
     run_cmd(
         Command::new(llvm_tool("llvm-objcopy")?)
             .args(["-O", "binary"])
@@ -1606,6 +1605,7 @@ fn write_elf_image(
     for (file, elf, stack) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
         disasm::erratum_835769(elf, &objdump)?;
+        disasm::erratum_843419(elf)?;
         // A program of stack 0 goes into the image as its ELF file alone:
         // the loader, and the programs only files of the table name.
         if *stack == 0 {
@@ -2162,6 +2162,7 @@ fn posix_tty_control_steps() -> Result<(), String> {
             "quiet terminal controls failed; see target/measure/posix-tty-control-steps.log".into(),
         );
     }
+    check_waits(&outcome.lines, &["5"], "terminal control steps")?;
     let maxima = longest_steps(&outcome.lines, "5");
     for kind in 16..=20 {
         let ticks = maxima
@@ -2273,6 +2274,7 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
                 longest_steps(&output.lines, tag)
             );
         }
+        check_waits(&output.lines, &["1", "5"], "POSIX terminal steps")?;
         let tty = longest_steps(&output.lines, "5");
         for kind in 16..=20 {
             let ticks = tty.iter().find(|row| row.0 == kind).map_or(0, |row| row.1);
@@ -2551,6 +2553,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: fread ",
         "relibc-hello: monotonic ",
         "relibc-hello: directories, stat, descriptors, mmap, math",
+        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 11 options claimed, timers -1",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
         "Assertion `how == NULL` failed.",
@@ -2658,6 +2661,7 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
     qemu::expect_marker(&output, "posix-pty: ok")?;
     qemu::expect_stopped_on(&output, "init: posix-pty ended: exit code 0, not restarted")?;
     if steps {
+        check_waits(&output.lines, &["5"], "terminal Clone steps")?;
         let measured = longest_steps(&output.lines, "5");
         for kind in [7, 65] {
             let ticks = measured
@@ -2674,8 +2678,12 @@ fn posix_pty_probe_in(steps: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The most a step of the terminal service's Watch takes with 16 elements.
+const WATCH_FULL_MAX: u64 = 18_000;
+
 fn check_watch_steps(lines: &[String]) -> Result<(), String> {
     for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
+        check_waits(lines, &[tag], "watch steps")?;
         let steps = longest_steps(lines, tag);
         for &(kind, ticks, _) in &steps {
             if ticks == 0 || ticks > RAM_STEP_MAX {
@@ -2695,15 +2703,39 @@ fn check_watch_steps(lines: &[String]) -> Result<(), String> {
                 return Err(format!("watch full case exceeded {RAM_STEP_MAX}: {ticks}"));
             }
         }
+        // The pipe service's Watch holds 32 elements, the terminal's 16
+        // (a poll of 32 makes two).
+        let elements = if tag == "5" { 16 } else { 32 };
         for method in methods {
             if !full
                 .iter()
-                .any(|&(kind, ticks, detail)| kind == method && ticks != 0 && detail == 32)
+                .any(|&(kind, ticks, detail)| kind == method && ticks != 0 && detail == elements)
             {
                 return Err(format!(
-                    "watch method {method} has no full 32-element measurement: {steps:?}"
+                    "watch method {method} has no full {elements}-element measurement: {steps:?}"
                 ));
             }
+        }
+        // The terminal service's Watch of 16 elements (two for a poll of 32) keeps a margin under
+        // term B: its elements are met once for each description and the
+        // descriptions are found by a bit test.
+        if tag == "5"
+            && let Some(&(kind, _, detail)) = steps
+                .iter()
+                .find(|&&(kind, _, detail)| methods.contains(&kind) && detail > 16)
+        {
+            return Err(format!(
+                "terminal service: a Watch step of kind {kind} had {detail} elements, past 16"
+            ));
+        }
+        if tag == "5"
+            && let Some(&(kind, ticks, _)) = full
+                .iter()
+                .find(|&&(kind, ticks, _)| methods.contains(&kind) && ticks > WATCH_FULL_MAX)
+        {
+            return Err(format!(
+                "terminal service: a Watch of 16 elements, kind {kind}, took {ticks}, past {WATCH_FULL_MAX}"
+            ));
         }
         if ![64, 65].iter().all(|wanted| {
             steps
@@ -2791,6 +2823,7 @@ fn ramfs_gc_probe() -> Result<(), String> {
         &output,
         "ramfs-gc: binding and page reclamation both progress ok",
     )?;
+    check_waits(&output.lines, &["2"], "RAM file service steps")?;
     let steps = longest_steps(&output.lines, "2");
     for kind in [22, 63, 65] {
         if !steps
@@ -2853,6 +2886,7 @@ fn image_gates_probe(measured: bool, normal: bool) -> Result<(), String> {
         },
     )?;
     if measured {
+        check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
         let required: &[usize] = if normal {
             &[14, 20, 21, 22, 65]
@@ -2898,6 +2932,7 @@ fn loader_info_probe() -> Result<(), String> {
         &output,
         "posix-files: strict image metadata and incoming handle cleanup ok",
     )?;
+    check_waits(&output.lines, &["2"], "RAM file service steps")?;
     let steps = longest_steps(&output.lines, "2");
     if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
         return Err(format!(
@@ -2943,6 +2978,7 @@ fn loader_abort_probe(measured: bool) -> Result<(), String> {
                 ),
             )?;
         }
+        check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
         for kind in [19, 21, 22, 23, 63, 65] {
             if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
@@ -3033,6 +3069,7 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     qemu::expect_stopped_on(&output, ended)?;
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
     if measured {
+        check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
         let required: &[usize] = if data {
             &[15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 65]
@@ -3053,25 +3090,6 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
         }
         println!("RAM credential dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     }
-    Ok(())
-}
-
-fn posix_files_loss() -> Result<(), String> {
-    relibc()?;
-    let kernel = build(Variant::IpcLossProbe)?;
-    const PROGRAMS: [ImageProgram; 5] = {
-        let mut programs = POSIX_FILES_PROGRAMS;
-        programs[1].3 = &["auth-probe"];
-        programs[4].3 = &["ipc-loss"];
-        programs
-    };
-    let image = build_boot_image("boot-posix-files-loss.img", &PROGRAMS, BOOT_PROFILE)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
-    cmd.args(qemu::HEADLESS);
-    let ended = "init: posix-files ended: exit code 0, not restarted";
-    let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
-    qemu::expect_stopped_on(&output, ended)?;
-    qemu::expect_marker(&output, "posix-files: genuine native reply loss ok")?;
     Ok(())
 }
 
@@ -3187,18 +3205,85 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
-/// The longest Vouch the measurement takes, in ticks under -icount: about
-/// 3,000 with 32 or with 248 children, so a step that grows with the
-/// processes fails it at once (5b's Vouch took 539 ticks an entry).
-const VOUCH_TICKS_MAX: u64 = 6_000;
+/// The most the own part of a Vouch or a RetainedLoader may take, in ticks
+/// under -icount. Seen with 128 and 248 children: Vouch 4,849 to 5,636,
+/// RetainedLoader 4,798 to 6,013; preemption by holders of the lock at level
+/// 31 adds noise of up to 1,200 ticks to either. 8,000 is a third over the
+/// largest, and a walk over the entries costing more than about 13 ticks an
+/// entry with 248 children fails it (5b's Vouch took 539 ticks an entry).
+const VOUCH_TICKS_MAX: u64 = 8_000;
 
-/// The most one READ_INTO of up to proto_fs::READ_INTO_MAX bytes may take in
-/// the RAM file service's loop: term B of the kernel, in ticks under -icount.
-const RAM_STEP_MAX: u64 = 20_538;
+/// Term B of the blocking of every level, in ticks under -icount: the
+/// budget the response-time analysis gives the kernel and every step of a
+/// service is compared with. The number is the longest row of the `B on`
+/// line of `kernel_tests` (icount build) at 637d3a6, which lowered it from
+/// 20 538; the kernel has run under KERNEL_B_MAX since the stage Handles
+/// went by half chunks, so the room between them belongs to the services.
+/// The budget of the services' steps. `kernel_tests` fails above
+/// `KERNEL_B_MAX`; only the tests inside the kernel and tests/posix-tty
+/// print their numbers.
+const TERM_B: u64 = 20_410;
+
+/// The bound on the kernel itself: the longest row of the `B on` line of
+/// `kernel_tests` (icount build) may not pass it. The longest paths at
+/// the time are first_map (16 738 on 512M) and release (16 060 on 2G);
+/// growth up to the bound goes unremarked, beyond it needs a decision
+/// (another split, or a higher bound with the reason written down), so
+/// that the kernel cannot spend the room TERM_B promises the services.
+const KERNEL_B_MAX: u64 = 18_000;
+const _: () = assert!(KERNEL_B_MAX < TERM_B);
+
+/// The most one step of a service may take (one READ_INTO of up to
+/// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for
+/// instance): term B, in ticks under -icount.
+const RAM_STEP_MAX: u64 = TERM_B;
+
+/// The steps of the process service that are longer than term B today,
+/// until step 5z splits them: (kind, name, the limit with 4 branches of
+/// children (`process-steps 4`), the limit with 7 (`ci` and the plain
+/// command)). A step above its number fails `process-steps`; a step at or
+/// under B shows that its entry can go. Each number is the largest of
+/// four runs at e1-g2-steps (identical to the tick, since -icount is
+/// deterministic for one build; with 4 and 7 branches: Create 61,378 and
+/// 61,378, SpawnStart 92,323 and 92,556, ExecStart 51,039 and 50,833,
+/// ForkStart 53,737 and 54,153) plus NOISE_MARGIN; ForkStart again as the
+/// largest of four runs at the head of E1 with 4 and with 7 branches
+/// (53,772 and 55,793: the pin of relibc a5adc5f8, a table entry in
+/// `sysconf`, moved the 7-branch figure up from 54,610 at 30f48fe7). The
+/// margin covers what moves between builds: the layout of the code and the processes of the
+/// level above that run in the middle of a step (SpawnStart was 92,262 and
+/// 93,009 at 4e9abf5 and 92,369 at d7743c9 with the same source of the
+/// step).
+const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64, u64); 4] = [
+    (1, "Create", 61_378 + NOISE_MARGIN, 61_378 + NOISE_MARGIN),
+    (
+        22,
+        "SpawnStart",
+        92_323 + NOISE_MARGIN,
+        92_556 + NOISE_MARGIN,
+    ),
+    (
+        28,
+        "ExecStart",
+        51_039 + NOISE_MARGIN,
+        50_833 + NOISE_MARGIN,
+    ),
+    (
+        34,
+        "ForkStart",
+        53_772 + NOISE_MARGIN,
+        55_793 + NOISE_MARGIN,
+    ),
+];
+
+/// The room the limits of PROCESS_STEPS_ABOVE_B leave over the largest
+/// measured step, in ticks: 1,200 is the noise the experts saw between
+/// builds, rounded up.
+const NOISE_MARGIN: u64 = 1_500;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 15] = [
+const RAM_STEP_KINDS: [(usize, &str); 16] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
@@ -3214,13 +3299,26 @@ const RAM_STEP_KINDS: [(usize, &str); 15] = [
     (34, "CloneExact"),
     (64, "notification"),
     (65, "maintenance"),
+    (66, "session gone"),
 ];
 
-/// The longest heartbeat of the pipe service's loop, in ticks under
-/// -icount: a send to init (level 63) and its reply, in which the processes
-/// of higher levels than the service's may run; 200,000 were seen once in
-/// a volley of the steps probe's crowd.
-const HEARTBEAT_STEP_MAX: u64 = 500_000;
+/// The most a step of a service may wait in `send` for the answer of
+/// another, in ticks under -icount. The wait measures other services' work
+/// (their own steps carry their own limits, each against term B) and
+/// the processes of higher levels that run in the middle of it: a send to
+/// init (level 63) in a heartbeat and its reply, 200,000 seen once in a
+/// volley of the steps probe's crowd. For the response-time analysis the
+/// wait of a client is a blocking term: C_ipc, the longest step of the
+/// callee and the step of the request itself.
+const WAIT_MAX: u64 = 500_000;
+
+/// The most a step may wait for the answer of a service in a call that is
+/// no heartbeat, in ticks under -icount: one round trip (C_ipc about
+/// 2,000), the longest step of the process service that may be running
+/// (SpawnStart, 94,056 with its margin), and the step of the request
+/// itself (term B), with room. Seen at most 9,946 (ramfs FinishBinding
+/// with 248 children).
+const CALL_WAIT_MAX: u64 = 120_000;
 
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
 /// proto_pipe::Method.
@@ -3238,13 +3336,13 @@ const PIPE_STEP_KINDS: [(usize, &str); 15] = [
     (11, "SetFlags"),
     (12, "Stat"),
     (13, "Abandon"),
-    (64, "heartbeat: a send to init and its reply"),
+    (64, "heartbeat: its own part, the send to init is the wait"),
     (65, "own step: a description let go of, a session gone"),
 ];
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
-const STEP_KINDS: [(usize, &str); 16] = [
+const STEP_KINDS: [(usize, &str); 17] = [
     (1, "Create"),
     (13, "Kill"),
     (21, "Vouch"),
@@ -3261,6 +3359,7 @@ const STEP_KINDS: [(usize, &str); 16] = [
     (36, "ForkAbort"),
     (10, "WaitStart"),
     (64, "notification"),
+    (66, "session gone"),
 ];
 
 /// The kinds of the lines `loader step: kind K N ticks detail D` of a
@@ -3312,6 +3411,68 @@ fn longest_steps(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
         }
     }
     out
+}
+
+/// The longest wait of each kind in `lines`: (kind, wait, whole step), from
+/// the lines `service wait: T kind K W ticks of A` that `rt` prints (feature
+/// `step-stats`) when the wait of a kind grows, so the last line of a kind
+/// is its longest. W is the time the step spent in `send` waiting for
+/// another service, A the whole step of that case.
+fn longest_waits(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
+    let mut out: Vec<(usize, u64, u64)> = Vec::new();
+    for line in lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "wait:",
+            line_tag,
+            "kind",
+            kind,
+            wait,
+            "ticks",
+            "of",
+            whole,
+        ] = words.as_slice()
+        else {
+            continue;
+        };
+        if *line_tag != tag {
+            continue;
+        }
+        let (Ok(kind), Ok(wait), Ok(whole)) = (kind.parse(), wait.parse(), whole.parse()) else {
+            continue;
+        };
+        match out.iter_mut().find(|(k, ..)| *k == kind) {
+            Some(row) => *row = (kind, wait, whole),
+            None => out.push((kind, wait, whole)),
+        }
+    }
+    out
+}
+
+/// The wait of kind `kind` in `waits`, 0 when none.
+fn wait_of(waits: &[(usize, u64, u64)], kind: usize) -> u64 {
+    waits.iter().find(|r| r.0 == kind).map_or(0, |r| r.1)
+}
+
+/// Fails when a wait in the lines of the services `tags` passes its limit
+/// (WAIT_MAX for the heartbeat, kind 64; CALL_WAIT_MAX for the others), or
+/// when `rt` cut an accounting that added up to more than its step.
+fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String> {
+    if let Some(line) = lines.iter().find(|l| l.starts_with("service wait cut:")) {
+        return Err(format!("{who}: the accounting of a wait was cut: {line}"));
+    }
+    for tag in tags {
+        for (kind, wait, whole) in longest_waits(lines, tag) {
+            let limit = if kind == 64 { WAIT_MAX } else { CALL_WAIT_MAX };
+            if wait > limit {
+                return Err(format!(
+                    "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past {limit}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The longest step of the process service under -icount with the crowd
@@ -3370,11 +3531,10 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the longest Vouch took {vouch} ticks with {live} children, past {VOUCH_TICKS_MAX}"
         ));
     }
-    if let Some((_, ticks, _)) = rows.iter().find(|(kind, _, _)| *kind == 53)
-        && *ticks > VOUCH_TICKS_MAX
-    {
+    let retained = rows.iter().find(|r| r.0 == 53).map_or(0, |r| r.1);
+    if retained == 0 || retained > VOUCH_TICKS_MAX {
         return Err(format!(
-            "RetainedLoader took {ticks} ticks with {live} children, past {VOUCH_TICKS_MAX}"
+            "RetainedLoader took {retained} ticks with {live} children, past {VOUCH_TICKS_MAX} or none"
         ));
     }
     // One READ_INTO is a step of the RAM file service at level 40 whose
@@ -3401,6 +3561,30 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "ForkStart took {fork_start} ticks and ForkCommit {fork_commit}, SpawnStart {spawn}"
         ));
     }
+    // Every step of the process service stays under term B but the four
+    // that the list PROCESS_STEPS_ABOVE_B holds, each within its number.
+    for &(kind, name, at_4, at_7) in &PROCESS_STEPS_ABOVE_B {
+        let limit = if branches == 4 { at_4 } else { at_7 };
+        let ticks = longest(kind);
+        if ticks == 0 || ticks > limit {
+            return Err(format!(
+                "the process service: {name} took {ticks} ticks, past its exception {limit} (B {TERM_B})"
+            ));
+        }
+        let verdict = if ticks > TERM_B {
+            format!("{} over B", ticks - TERM_B)
+        } else {
+            "under B: remove it from PROCESS_STEPS_ABOVE_B".to_owned()
+        };
+        println!("process service {name}: {ticks} of exception {limit}, B {TERM_B}: {verdict}");
+    }
+    if let Some((kind, ticks, _)) = rows.iter().find(|(kind, ticks, _)| {
+        *ticks > TERM_B && !PROCESS_STEPS_ABOVE_B.iter().any(|(k, ..)| k == kind)
+    }) {
+        return Err(format!(
+            "the process service: kind {kind} took {ticks} ticks, past B {TERM_B} and not in the exceptions"
+        ));
+    }
     if !loader.iter().any(|(k, ..)| *k == 9) {
         return Err("no loader step of a copy: the forks did not run".into());
     }
@@ -3424,41 +3608,62 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             ));
         }
     }
-    // The kind 64 holds the loop's heartbeat alone: the pipe service
-    // counts each of its own notifications (the step of a description, the
-    // departure of a session or of a clone that never sent) as 65. A
-    // heartbeat waits for init's reply, and a volley of the crowd's
-    // processes at a higher level may run in the middle of it: its ticks
-    // are no work of the pipe service.
-    if let Some(row) = pipe.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+    // Every kind counts the own part of the step, the heartbeat too: its
+    // send to init and the wait for the reply are the wait of the step
+    // (below), and a volley of the crowd's processes at a higher level may
+    // run in the middle of it.
+    if let Some(row) = pipe.iter().find(|r| r.1 > RAM_STEP_MAX) {
         return Err(format!("the pipe service: a step past term B: {row:?}"));
     }
+    // The entropy device's driver (tag 10): its own steps, under term B.
+    let driver = longest_steps(&outcome.lines, "10");
+    if let Some(row) = driver.iter().find(|r| r.1 > RAM_STEP_MAX) {
+        return Err(format!(
+            "the entropy device's driver: a step past term B: {row:?}"
+        ));
+    }
     // The entropy service (tag 11): CLONE for each child of the crowd,
-    // whose cost grows with the live clones (a walk of its table of 320),
-    // and its own steps; every one under term B but the heartbeat.
+    // whose cost stays the same with the live clones (entropy::CLONE_FULL_MAX
+    // bounds it with the table full), and its own steps; every one under term B.
     let entropy = longest_steps(&outcome.lines, "11");
     let clone = entropy.iter().find(|(k, ..)| *k == 8).map_or(0, |r| r.1);
     if clone == 0 {
         return Err(format!("the entropy service gave no CLONE: {entropy:?}"));
     }
-    if let Some(row) = entropy.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+    if let Some(row) = entropy.iter().find(|r| r.1 > RAM_STEP_MAX) {
         return Err(format!("the entropy service: a step past term B: {row:?}"));
     }
-    // The heartbeat has its own bound, so that a growth of that wait shows:
-    // the service answers no client while it waits for init.
-    let heartbeat = pipe.iter().find(|(k, ..)| *k == 64).map_or(0, |r| r.1);
-    if heartbeat > HEARTBEAT_STEP_MAX {
+    // The waits of all services stay under CALL_WAIT_MAX (the heartbeat's
+    // under WAIT_MAX), so that a growth of a wait shows. The wait of
+    // FinishBinding (ramfs asks the process service) and of the heartbeat
+    // of the pipe service must have been counted: without them the
+    // accounting of waits is lost and the own parts above would hold the
+    // waits again.
+    check_waits(
+        &outcome.lines,
+        &["1", "2", "4", "10", "11"],
+        "process-steps",
+    )?;
+    let ram_waits = longest_waits(&outcome.lines, "2");
+    let pipe_waits = longest_waits(&outcome.lines, "4");
+    if wait_of(&ram_waits, 25) == 0 {
         return Err(format!(
-            "the pipe service: a heartbeat took {heartbeat} ticks, past {HEARTBEAT_STEP_MAX}"
+            "the RAM file service: no wait of FinishBinding counted: {ram_waits:?}"
         ));
     }
-    let mut text = String::from("kind method ticks detail\n");
+    if wait_of(&pipe_waits, 64) == 0 {
+        return Err(format!(
+            "the pipe service: no wait of the heartbeat counted: {pipe_waits:?}"
+        ));
+    }
+    let rows_waits = longest_waits(&outcome.lines, "1");
+    let mut text = String::from("kind method ticks(own) detail wait\n");
     for (kind, ticks, detail) in &loader {
         let name = LOADER_STEP_KINDS
             .iter()
             .find(|(k, _)| k == kind)
             .map_or("other", |(_, n)| n);
-        text += &format!("loader {kind} {name} {ticks} {detail}\n");
+        text += &format!("loader {kind} {name} {ticks} {detail} 0\n");
     }
     for (kind, name, ticks, detail) in ram.iter().map(|(k, t, d)| {
         let name = RAM_STEP_KINDS
@@ -3467,21 +3672,24 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             .map_or("other", |(_, n)| n);
         (k, name, t, d)
     }) {
-        text += &format!("ramfs {kind} {name} {ticks} {detail}\n");
+        let wait = wait_of(&ram_waits, *kind);
+        text += &format!("ramfs {kind} {name} {ticks} {detail} {wait}\n");
     }
     for (kind, ticks, detail) in &pipe {
         let name = PIPE_STEP_KINDS
             .iter()
             .find(|(k, _)| k == kind)
             .map_or("other", |(_, n)| n);
-        text += &format!("pipe {kind} {name} {ticks} {detail}\n");
+        let wait = wait_of(&pipe_waits, *kind);
+        text += &format!("pipe {kind} {name} {ticks} {detail} {wait}\n");
     }
     for (kind, ticks, detail) in &rows {
         let name = STEP_KINDS
             .iter()
             .find(|(k, _)| k == kind)
             .map_or("other", |(_, n)| n);
-        text += &format!("{kind} {name} {ticks} {detail}\n");
+        let wait = wait_of(&rows_waits, *kind);
+        text += &format!("{kind} {name} {ticks} {detail} {wait}\n");
     }
     let path = dir.join("process-steps.txt");
     std::fs::write(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -3512,6 +3720,10 @@ fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
         &kernel.elf,
     )?;
     qemu::expect_marker(&output, ENDED)?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: a thread ran on the stack given to pthread_attr_setstack",
+    )?;
     qemu::expect_marker(&output, "relibc-threads: ok")?;
     println!("relibc pthread guest probe passed");
     Ok(())
@@ -3972,7 +4184,7 @@ fn ash_dialog() -> Result<(), String> {
 
 /// The kinds of the lines of the terminal service (tag 5), by the
 /// numbers of proto_tty::Method.
-const TTY_STEP_KINDS: [(usize, &str); 17] = [
+const TTY_STEP_KINDS: [(usize, &str); 18] = [
     (1, "ReadStart"),
     (2, "ReadTake"),
     (3, "ReadCancel"),
@@ -3988,11 +4200,12 @@ const TTY_STEP_KINDS: [(usize, &str); 17] = [
     (13, "DrainCancel"),
     (14, "FlushQueues"),
     (15, "Flow"),
-    (64, "heartbeat: a send to init and its reply"),
+    (64, "heartbeat: its own part, the send to init is the wait"),
     (
         65,
         "own step: input, room, the next step, the timer of VTIME",
     ),
+    (66, "session gone"),
 ];
 
 /// The probe of the terminal service (tests/tty) on QEMU, or over the
@@ -4094,21 +4307,26 @@ fn tty_steps() -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", log.display()))?;
     qemu::expect_stopped_on(&output, ENDED_TTY)?;
     qemu::expect_marker(&output, "tty-probe: ok")?;
+    // 255 clones of one root alive, each asked, then ended: the steps of
+    // Clone, GetAttr and a session's end below run with the tables full.
+    qemu::expect_marker(&output, "tty-probe: holdsets 255 clones live")?;
     let steps = longest_steps(&output.lines, "5");
-    let mut table = String::from("kind method ticks detail\n");
+    let waits = longest_waits(&output.lines, "5");
+    let mut table = String::from("kind method ticks(own) detail wait\n");
     for (kind, ticks, detail) in &steps {
         let name = TTY_STEP_KINDS
             .iter()
             .find(|(k, _)| k == kind)
             .map_or("other", |(_, n)| n);
-        table += &format!("tty {kind} {name} {ticks} {detail}\n");
+        let wait = wait_of(&waits, *kind);
+        table += &format!("tty {kind} {name} {ticks} {detail} {wait}\n");
     }
     let path = dir.join("tty-steps.txt");
     std::fs::write(&path, &table).map_err(|e| format!("{}: {e}", path.display()))?;
     print!("terminal service steps under icount:\n{table}");
     // Each method and the service's own notifications made a step, each
-    // under term B; the heartbeat, which waits for init, has its own bound.
-    for kind in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 65] {
+    // under term B in its own part; the waits have their own bound.
+    for kind in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 65, 66] {
         let ticks = steps.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
         if ticks == 0 || ticks > RAM_STEP_MAX {
             return Err(format!(
@@ -4116,13 +4334,13 @@ fn tty_steps() -> Result<(), String> {
             ));
         }
     }
-    if let Some(row) = steps.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+    if let Some(row) = steps.iter().find(|r| r.1 > RAM_STEP_MAX) {
         return Err(format!("the terminal service: a step past term B: {row:?}"));
     }
-    let heartbeat = steps.iter().find(|(k, ..)| *k == 64).map_or(0, |r| r.1);
-    if heartbeat > HEARTBEAT_STEP_MAX {
+    check_waits(&output.lines, &["5"], "the terminal service")?;
+    if wait_of(&waits, 64) == 0 {
         return Err(format!(
-            "the terminal service: a heartbeat took {heartbeat} ticks, past {HEARTBEAT_STEP_MAX}"
+            "the terminal service: no wait of the heartbeat counted: {waits:?}"
         ));
     }
     println!("terminal service steps passed: {}", log.display());
@@ -4243,9 +4461,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-poll", posix_poll_probe),
         job("posix-pty", posix_pty_probe),
         job("posix-pty-steps", posix_pty_steps),
-        // The longest step of the process service with 128 children, under
+        // The longest step of the process service with 248 children, under
         // -icount: the host's time changes none of its numbers.
-        job("process-steps", || process_steps(&qemu::VIRT, 4)),
+        job("process-steps", || process_steps(&qemu::VIRT, 7)),
         // BusyBox on relibc guards the C surface (5a').
         job("busybox", busybox_probe),
         job("ash", ash_probe),
@@ -5351,8 +5569,11 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
             measured.push((what, rows, ticks));
         }
-        let (what, row, n) = blocking_time(&measured);
-        println!("B on {}: {row}={n} ({what})", m.name);
+        let (margin, to_term) = b_margin(m.name, &measured)?;
+        println!(
+            "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
+            m.name
+        );
     }
     match variant {
         Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
@@ -5380,7 +5601,7 @@ const PORTION_LINES: [&str; 7] = [
 /// rows, ticks), with its line: the blocking time B of every level (spec
 /// 15.3). The teardown row `threads` is a count of threads and takes no
 /// part. Shown on its own so that a change of the longest row stands out
-/// in the output of `ci`; no number fails it.
+/// in the output of `ci`; `kernel_tests` fails it above KERNEL_B_MAX.
 fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, &'a str, u64) {
     measured
         .iter()
@@ -5393,6 +5614,21 @@ fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, 
         .filter(|&(what, row, _)| (what, row) != ("teardown portions", "threads"))
         .max_by_key(|&(_, _, n)| n)
         .unwrap_or(("none", "none", 0))
+}
+
+/// The margins of the longest portion in `measured`, which the `B on` line
+/// prints, under KERNEL_B_MAX and under TERM_B; an error when it is past
+/// KERNEL_B_MAX.
+fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, u64), String> {
+    let (what, row, n) = blocking_time(measured);
+    println!("B on {name}: {row}={n} ({what})");
+    match KERNEL_B_MAX.checked_sub(n) {
+        Some(margin) => Ok((margin, TERM_B - n)),
+        None => Err(format!(
+            "B on {name}: {row}={n} ({what}) is {} past KERNEL_B_MAX {KERNEL_B_MAX}",
+            n - KERNEL_B_MAX
+        )),
+    }
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -6278,15 +6514,60 @@ mod tests {
     }
 
     #[test]
+    fn longest_waits_reads_its_lines_only() {
+        let lines: Vec<String> = [
+            "service step: 2 kind 25 8000 ticks detail 0",
+            "service wait: 2 kind 25 9000 ticks of 17000",
+            "service wait: 4 kind 64 5000 ticks of 6000",
+            "service wait: 2 kind 25 12246 ticks of 18306",
+            "service wait: 2 kind 65 100 ticks of 200",
+            "service wait: 2 kind x 100 ticks of 200",
+            "service wait: 2 kind 7 100 ticks 200",
+        ]
+        .map(String::from)
+        .into();
+        // The last line of a kind is its longest; W is the wait and A the step.
+        assert_eq!(
+            longest_waits(&lines, "2"),
+            vec![(25, 12_246, 18_306), (65, 100, 200)]
+        );
+        assert_eq!(longest_waits(&lines, "4"), vec![(64, 5_000, 6_000)]);
+        assert!(longest_waits(&lines, "5").is_empty());
+        assert_eq!(wait_of(&longest_waits(&lines, "2"), 25), 12_246);
+        assert_eq!(wait_of(&longest_waits(&lines, "2"), 1), 0);
+    }
+
+    #[test]
+    fn a_wait_past_the_limit_fails() {
+        // A call has CALL_WAIT_MAX, the heartbeat WAIT_MAX, and a cut line fails.
+        let call = |w: u64| vec![format!("service wait: 2 kind 25 {w} ticks of {w}")];
+        assert!(check_waits(&call(CALL_WAIT_MAX), &["2"], "t").is_ok());
+        assert!(check_waits(&call(CALL_WAIT_MAX + 1), &["2"], "t").is_err());
+        let cut = vec!["service wait cut: 2 kind 25 9000 ticks of 8000".to_owned()];
+        assert!(check_waits(&cut, &["5"], "t").is_err());
+        let ok = vec![format!(
+            "service wait: 4 kind 64 {WAIT_MAX} ticks of 600000"
+        )];
+        assert!(check_waits(&ok, &["4"], "t").is_ok());
+        let bad = vec![format!(
+            "service wait: 4 kind 64 {} ticks of 600000",
+            WAIT_MAX + 1
+        )];
+        assert!(check_waits(&bad, &["4"], "t").is_err());
+        assert!(check_waits(&bad, &["5"], "t").is_ok());
+    }
+
+    #[test]
     fn full_watch_case_survives_a_longer_single_item_maximum() {
         let mut lines = Vec::new();
-        for (tag, methods) in [(4, [14, 15, 16]), (5, [25, 26, 27])] {
+        // The pipe service's full Watch has 32 elements, the terminal's 16.
+        for (tag, methods, full) in [(4, [14, 15, 16], 32), (5, [25, 26, 27], 16)] {
             for method in methods {
                 lines.push(format!(
                     "service step: {tag} kind {method} 15000 ticks detail 1"
                 ));
                 lines.push(format!(
-                    "service case: {tag} kind {method} 14000 ticks detail 32"
+                    "service case: {tag} kind {method} 14000 ticks detail {full}"
                 ));
             }
             for kind in [64, 65] {
@@ -6299,8 +6580,17 @@ mod tests {
         let mut missing = lines.clone();
         missing.retain(|line| !line.starts_with("service case: 5 kind 26 "));
         assert!(super::check_watch_steps(&missing).is_err());
-        lines.push("service case: 5 kind 26 20539 ticks detail 32".into());
-        assert!(super::check_watch_steps(&lines).is_err());
+        // A Watch of the terminal past B, past 18 000 under B, or with
+        // more than 16 elements fails.
+        for bad in [
+            "service case: 5 kind 26 20539 ticks detail 16",
+            "service case: 5 kind 25 18500 ticks detail 16",
+            "service step: 5 kind 25 15000 ticks detail 32",
+        ] {
+            let mut worse = lines.clone();
+            worse.push(bad.into());
+            assert!(super::check_watch_steps(&worse).is_err(), "{bad}");
+        }
     }
     use super::*;
 
@@ -6845,12 +7135,32 @@ mod tests {
     /// the count of threads and never a row of the round trip, which spans
     /// two calls.
     #[test]
+    fn a_suspension_number_past_the_kernel_bound_fails_the_parse_of_the_log() {
+        let log = |n: u64| {
+            vec![format!(
+                "suspension scopes ticks: control_stop_no_queue=33 control_stop_cancel=99 \
+                 pick_park_selected=80 control_continue=94 resume_64=3731 longest_portion={n}"
+            )]
+        };
+        let margin = |n| {
+            let ticks = ticks_of(&log(n), "suspension scopes", &SUSPENSION_ROWS)?;
+            b_margin("t", &[("suspension scopes", &SUSPENSION_ROWS[..], ticks)])
+        };
+        assert_eq!(margin(KERNEL_B_MAX), Ok((0, TERM_B - KERNEL_B_MAX)));
+        assert!(
+            margin(KERNEL_B_MAX + 1)
+                .unwrap_err()
+                .contains("past KERNEL_B_MAX")
+        );
+    }
+
+    #[test]
     fn blocking_time_is_the_longest_row_but_threads() {
         let line =
             |what, rows: &'static [&'static str], ticks: &[u64]| (what, rows, ticks.to_vec());
         let memory = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
         let timers = [1, 2, 3, 4];
-        let teardown = [5, 15, 1, 24, 42, 30, 20, 21, 128];
+        let teardown = [5, 15, 1, 24, 42, 30, 20, 21, 7, 128];
         let mut measured = vec![
             line("ipc round trip", &ROUND_TRIP_ROWS, &[1, 2, 3, 4, 5, 99_999]),
             line("memory portions", &MEMORY_PORTION_ROWS, &memory),
@@ -6864,11 +7174,18 @@ mod tests {
             blocking_time(&measured),
             ("teardown portions", "teardown_threads", 42)
         );
-        measured[6].2 = vec![5, 15, 1, 24, 18, 30, 20, 21, 50_000];
+        measured[6].2 = vec![5, 15, 1, 24, 18, 30, 20, 21, 7, 50_000];
         assert_eq!(
             blocking_time(&measured),
             ("teardown portions", "child_threads", 30)
         );
+        // The longest portion of any teardown is B as well.
+        measured[6].2[8] = 31;
+        assert_eq!(
+            blocking_time(&measured),
+            ("teardown portions", "teardown_any", 31)
+        );
+        measured[6].2[8] = 7;
         // A memory portion above every teardown row is B.
         measured[1].2[8] = 31;
         assert_eq!(

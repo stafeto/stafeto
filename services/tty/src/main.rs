@@ -31,7 +31,7 @@ use proto_tty::{
     SetAttr, VERSION, VSTART, VSTOP, WAITERS, Write,
 };
 use proto_uart::{ReadKey, ReadRequest, RoomReply, WriteReply, WriteRequest};
-use proto_wire::clones::Clones;
+use proto_wire::clones::{Clones, ROOTS};
 use proto_wire::{Status, Writer, long, watch};
 use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
 use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Timer};
@@ -41,6 +41,7 @@ use rt::service::{
 use rt::{sys, time};
 use tty::discipline::{self, Signal, Terminal};
 use tty::endpoints::{Endpoint, Endpoints, Failure, Holds, Side, TERMINALS};
+use tty::holdsets::{HoldSet, HoldSets};
 use tty::jobs::{self, Caller, Departed, Departures, Jobs};
 use tty::{Driver, Pump, Pumped, Waiter, Waiters};
 
@@ -51,6 +52,8 @@ rt::entry!(main);
 const SESSIONS: usize = 320;
 /// The clones the service keeps alive at most.
 const CLONES: usize = 320;
+/// The sets of holds: one for each clone, and one for each root.
+const HOLDSETS: usize = CLONES + ROOTS;
 /// The live clones of one root at most: one for each record of the process
 /// service, so that a tree of processes has a session each, and the other
 /// roots keep CLONES - ROOT_CLONES of them.
@@ -118,22 +121,6 @@ const GENERATIONS_AT: usize = 0x41_0000_0000;
 
 /// The tables of the sessions and long operations and the console's
 /// discipline, in `.bss`: too big for the stack.
-struct HoldSet {
-    label: u64,
-    root: u64,
-    holds: Holds,
-    retired: bool,
-}
-impl HoldSet {
-    const fn new() -> Self {
-        Self {
-            label: 0,
-            root: 0,
-            holds: Holds::new(),
-            retired: false,
-        }
-    }
-}
 #[derive(Clone, Copy)]
 struct Pin {
     label: u64,
@@ -149,7 +136,7 @@ struct Tables {
     clones: Clones<CLONES>,
     devices: [Device; TERMINALS],
     endpoints: Endpoints,
-    holdsets: [HoldSet; SESSIONS],
+    holdsets: HoldSets<CLONES, HOLDSETS>,
     pins: [Option<Pin>; OPERATIONS],
 }
 
@@ -197,7 +184,7 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     clones: Clones::new(),
     devices: [const { Device::new() }; TERMINALS],
     endpoints: Endpoints::new(),
-    holdsets: [const { HoldSet::new() }; SESSIONS],
+    holdsets: HoldSets::new(),
     pins: [None; OPERATIONS],
 }));
 
@@ -245,7 +232,6 @@ fn main(_: u64) -> u64 {
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
         level,
-        given: 0,
         clones: &mut tables.clones,
         ops: &mut tables.ops,
         watches: &mut tables.watches,
@@ -344,7 +330,6 @@ struct Tty {
     /// again.
     parent: ManuallyDrop<Handle<Channel>>,
     level: u8,
-    given: u64,
     clones: &'static mut Clones<CLONES>,
     ops: &'static mut LongOps<OPERATIONS>,
     watches: &'static mut watch::Pool<OPERATIONS>,
@@ -355,9 +340,9 @@ struct Tty {
     devices: &'static mut [Device; TERMINALS],
     active: usize,
     endpoints: &'static mut Endpoints,
-    holdsets: &'static mut [HoldSet; SESSIONS],
+    holdsets: &'static mut HoldSets<CLONES, HOLDSETS>,
     pins: &'static mut [Option<Pin>; OPERATIONS],
-    retired: tty::retired::Retired<SESSIONS>,
+    retired: tty::retired::Retired<HOLDSETS>,
     pin_cleanup_due: bool,
     watch_cleanup_due: bool,
     disconnect_work_due: bool,
@@ -1030,7 +1015,7 @@ impl Tty {
                     self.disconnect(effect.terminal);
                 }
             } else {
-                self.holdsets[slot] = HoldSet::new();
+                self.holdsets.release(slot);
                 self.retired.pop();
             }
             self.kick();
@@ -1774,16 +1759,44 @@ impl Tty {
             Ok(set) if r.handles.is_empty() => set,
             _ => return Answer::Status(Status::BadSize),
         };
+        if set.len > proto_tty::WATCH_MAX {
+            return Answer::Status(Status::BadSize);
+        }
+        // The elements that name one description are met once: its
+        // endpoint is resolved and its readiness read once for all of
+        // them, and the pins they take are made in one step. Only the
+        // elements are compared, a walk of at most `watch::MAX` squared.
         let mut terminals = [false; TERMINALS];
-        for item in set.unique() {
+        let mut ready = watch::Ready {
+            len: set.len,
+            events: [0; watch::MAX],
+        };
+        let mut distinct = [(0u32, 0u32); watch::MAX];
+        let mut distinct_len = 0;
+        for (i, item) in set.items[..set.len].iter().enumerate() {
+            if set.items[..i]
+                .iter()
+                .any(|before| before.description == item.description)
+            {
+                continue;
+            }
             let endpoint = match self.select_description(s, item.description) {
                 Ok(e) => e,
                 Err(code) => return status(code),
             };
             terminals[endpoint.terminal] = true;
+            let state = self.readiness(item.description);
+            let mut named = 0;
+            for (j, other) in set.items[i..set.len].iter().enumerate() {
+                if other.description == item.description {
+                    ready.events[i + j] = state & (other.events | watch::ALWAYS);
+                    named += 1;
+                }
+            }
+            distinct[distinct_len] = (item.description, named);
+            distinct_len += 1;
         }
         rt::service::step_detail(set.len as u64);
-        let ready = set.ready(|id| self.readiness(id));
         if ready.any() {
             return Self::watch_ready(r, ready);
         }
@@ -1814,15 +1827,17 @@ impl Tty {
             self.ops.finish(&mut s.data.long, label, key);
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
-        for (index, item) in set.items[..set.len].iter().enumerate() {
-            if item.description != CONSOLE
-                && let Err(error) = self
-                    .endpoints
-                    .pin(&self.holdsets[s.data.holding].holds, item.description)
+        for (index, &(description, named)) in distinct[..distinct_len].iter().enumerate() {
+            if description != CONSOLE
+                // Resolved above, in this step: the table index is the
+                // low byte of the number.
+                && let Err(error) = self.endpoints.pin_at((description & 255) as usize, named)
             {
-                for previous in &set.items[..index] {
-                    if previous.description != CONSOLE {
-                        let _ = self.endpoints.unpin(previous.description);
+                for &(previous, named) in &distinct[..index] {
+                    if previous != CONSOLE {
+                        for _ in 0..named {
+                            let _ = self.endpoints.unpin(previous);
+                        }
                     }
                 }
                 self.watches.remove(label, key);
@@ -1952,16 +1967,13 @@ impl Tty {
     }
 
     fn new_clone(&mut self, root: u64, parent: &Holds, r: &mut Request<'_>) -> Answer {
-        let Some(slot) = self.holdsets.iter().position(|h| h.label == 0) else {
+        let Ok(label) = self.clones.give_within(OWN, root, ROOT_CLONES) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
-        let Some(given) = self.given.checked_add(1).filter(|n| *n < 1 << 62) else {
+        let Some(slot) = self.holdsets.take() else {
+            self.clones.gone(label);
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
-        let label = OWN | given;
-        if self.clones.add_within(label, root, ROOT_CLONES).is_err() {
-            return Answer::Status(Status::Kernel(Error::LimitReached));
-        }
         let priority = self.level.saturating_sub(1).max(1);
         let session = match sys::handle_label(
             &self.channel,
@@ -1971,16 +1983,17 @@ impl Tty {
         ) {
             Ok(session) => session,
             Err(error) => {
+                self.holdsets.release(slot);
                 self.clones.gone(label);
                 return Answer::Status(Status::Kernel(error));
             }
         };
         // The kernel may report this label's Gone after a later request.
-        // Every issued channel consumes its label even if inheritance fails.
-        self.given = given;
+        // Every label is given once, even if inheritance fails.
         let child = match self.endpoints.clone_holds(parent) {
             Ok(child) => child,
             Err(error) => {
+                self.holdsets.release(slot);
                 self.clones.gone(label);
                 return status(Self::endpoint_error(error));
             }
@@ -1991,6 +2004,9 @@ impl Tty {
             holds: child,
             retired: false,
         };
+        // `give_within` just gave the label a place.
+        let place = self.clones.place_of(label).expect("a label just given");
+        self.holdsets.bind_clone(place, slot);
         let _ = r.reply().u32(0);
         Answer::Reply([session.erase()].into())
     }
@@ -2576,7 +2592,7 @@ impl Tty {
     fn retire_holds(&mut self, slot: usize) {
         if !self.holdsets[slot].retired {
             // A slot remains occupied until the queue releases it.
-            // There are SESSIONS slots, and each enters only once.
+            // There are HOLDSETS slots, and each enters only once.
             assert!(self.retired.push(slot));
             self.holdsets[slot].retired = true;
         }
@@ -2642,20 +2658,33 @@ impl Service<0> for Tty {
         }
         if s.data.root == 0 {
             let label = r.label();
-            let Some(holding) = self
-                .holdsets
-                .iter()
-                .position(|h| h.label == label)
-                .or_else(|| self.holdsets.iter().position(|h| h.label == 0))
-            else {
-                return Answer::Status(Status::Kernel(Error::LimitReached));
+            // A clone's set is found by the place of its label, a root's
+            // in the small table of roots; a session with none takes one.
+            let holding = match self.holdsets.find(label, &*self.clones) {
+                Some(holding) => holding,
+                // A label of the service's own that is no longer found is a
+                // clone that ended, and is no root. The roots with such a
+                // label are the service's own sessions, which carry bit 62
+                // too (`LOADERS`, the session the process service holds
+                // for the loaders); a clone's label never does.
+                None if label & OWN != 0 && label & 1 << 62 == 0 => {
+                    return Answer::Status(Status::Kernel(Error::BadState));
+                }
+                None => {
+                    let Some(holding) = self.holdsets.take() else {
+                        return Answer::Status(Status::Kernel(Error::LimitReached));
+                    };
+                    if !self.holdsets.bind_root(label, holding) {
+                        self.holdsets.release(holding);
+                        return Answer::Status(Status::Kernel(Error::LimitReached));
+                    }
+                    self.holdsets[holding].label = label;
+                    self.holdsets[holding].root = label;
+                    holding
+                }
             };
             if self.holdsets[holding].retired {
                 return Answer::Status(Status::Kernel(Error::BadState));
-            }
-            if self.holdsets[holding].label == 0 {
-                self.holdsets[holding].label = label;
-                self.holdsets[holding].root = label;
             }
             s.data.holding = holding;
             s.data.root = self.holdsets[holding].root;
@@ -2743,15 +2772,26 @@ impl Service<0> for Tty {
 
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         self.abandon(s);
-        if let Some(slot) = self.holdsets.iter().position(|h| h.label == s.label()) {
+        // The set was bound by the first request; a session that made
+        // none looks for it as a request would.
+        let set = if s.data.root != 0 {
+            Some(s.data.holding)
+        } else {
+            self.holdsets.find(s.label(), &*self.clones)
+        };
+        if let Some(slot) = set {
             self.retire_holds(slot);
         }
         self.kick();
     }
 
     fn closed(&mut self, label: u64) {
+        // The set is found by the place of the clone: unbind it before the
+        // place is free. It stays in the queue of retired sets until its
+        // holds are closed, and only then is it free for another session.
+        let set = self.holdsets.unbind(label, &*self.clones);
         self.clones.gone(label);
-        if let Some(slot) = self.holdsets.iter().position(|h| h.label == label) {
+        if let Some(slot) = set {
             self.retire_holds(slot);
         }
         self.kick();

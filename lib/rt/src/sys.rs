@@ -1003,7 +1003,15 @@ fn send_with(
     flags: u64,
 ) -> Result<Reply, Error> {
     let args = message_regs(channel.raw().0, bytes, handles, flags)?;
-    let x = call::<{ Call::Send.number() }>(&args)?;
+    // The wait of a service's step for the answer is counted apart from
+    // its own work (`service::waited`): the callee's steps carry their own
+    // limits.
+    #[cfg(feature = "step-stats")]
+    let began = crate::time::now();
+    let sent = call::<{ Call::Send.number() }>(&args);
+    #[cfg(feature = "step-stats")]
+    crate::service::waited(crate::time::now().saturating_sub(began));
+    let x = sent?;
     let mut words = [0; 11];
     words[..9].copy_from_slice(&x[1..]);
     let m = Message::from_words(words);

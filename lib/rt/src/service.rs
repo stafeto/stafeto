@@ -406,6 +406,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
         let (began, incoming) = sys::receive_measured(channel);
         #[cfg(not(feature = "step-stats"))]
         let incoming = sys::receive(channel);
+        steps::restart();
         let notice = match incoming {
             Err(e) => return e,
             Ok(Received::Message {
@@ -445,6 +446,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
         match (notice.source, notice.label, &mut beat) {
             (Source::Timer, 0, Some(beat)) => beat.expired(),
             (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
+                steps::gone();
                 let bits = notice.bits & !CLIENT_GONE;
                 if bits != 0 {
                     service.notification(Notice { bits, ..notice });
@@ -481,25 +483,46 @@ pub fn run_in<S: Service<K>, const K: usize>(
 /// The longest step of the loop (feature `step-stats`, which only the
 /// images of measurements and tests turn on): the ticks from the return of
 /// the Receive SVC to the handler's end and its reply, including register
-/// decode, message copying, header and session lookup. Kernel receive and
-/// idle before its return are outside the interval. For each method of the
-/// protocol and for notifications. A new longest of a kind goes to the
-/// console as a line `service step: T kind K N ticks detail D` after the step, so that
-/// the print does not count in it (`report_steps` turns it on and gives the tag T); K is the
-/// method, or `NOTICE` (`OWN` for a notification `step_own` marked).
+/// decode, message copying, header and session lookup, less the time the
+/// step waited in `sys::send` for the answer of another service (its own
+/// part). Kernel receive and idle before its return are outside the
+/// interval. For each method of the protocol and for notifications. A new
+/// longest own part of a kind goes to the console as a line
+/// `service step: T kind K N ticks detail D` after the step, so that the
+/// print does not count in it (`report_steps` turns it on and gives the tag
+/// T); K is the method, or `NOTICE` (`OWN` for a notification `step_own`
+/// marked, `GONE` for the departure of a session). A new longest wait of a
+/// kind goes out as `service wait: T kind K W ticks of A`, W the wait and A
+/// the whole step in which it happened.
 #[cfg(feature = "step-stats")]
 mod steps {
-    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
     /// The kinds: methods below this number, and the notifications.
     pub const NOTICE: usize = 64;
     /// The notifications a service counts apart (`super::step_own`).
     pub const OWN: usize = NOTICE + 1;
-    const KINDS: usize = OWN + 1;
+    /// The notifications of a departed session (CLIENT_GONE).
+    pub const GONE: usize = OWN + 1;
+    const KINDS: usize = GONE + 1;
     /// Whether the step in progress counts as `OWN`.
     static OWNED: AtomicBool = AtomicBool::new(false);
+    /// Whether the step in progress is the departure of a session.
+    static DEPARTED: AtomicBool = AtomicBool::new(false);
+    /// The ticks the step in progress has waited in `sys::send`.
+    static WAITED: AtomicU64 = AtomicU64::new(0);
+    /// The message buffer of the thread that leads the step in progress
+    /// (`msgbuf::address`, one per thread): only its sends count as the
+    /// step's waits. The other threads of a service (the adoption thread of
+    /// the process service, the supply thread of the entropy service) send
+    /// from their own loops, and their waits are the preemption of the step,
+    /// which stays in its own part.
+    static LEADER: AtomicUsize = AtomicUsize::new(0);
+    static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static FULL: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// The same for the steps of detail 16 (the terminal's Watch).
+    static FULL_16: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static DETAILS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static QUIET: AtomicBool = AtomicBool::new(false);
     /// A number the handler of the step gives (`super::step_detail`), for
@@ -522,8 +545,10 @@ mod steps {
         ))
     }
 
-    pub fn full(kind: usize) -> Option<(u64, u64)> {
-        Some((FULL.get(kind)?.load(Ordering::Relaxed), 32))
+    /// The longest step of `kind` whose detail was `detail` (32 or 16).
+    pub fn full(kind: usize, detail: u64) -> Option<(u64, u64)> {
+        let table = if detail == 16 { &FULL_16 } else { &FULL };
+        Some((table.get(kind)?.load(Ordering::Relaxed), detail))
     }
 
     pub fn detail(value: u64) {
@@ -543,23 +568,57 @@ mod steps {
         OWNED.store(true, Ordering::Relaxed);
     }
 
+    /// Starts the count of a step: what an earlier send of the loop
+    /// (between steps) waited does not belong to it.
+    pub fn restart() {
+        WAITED.store(0, Ordering::Relaxed);
+        LEADER.store(crate::msgbuf::address(), Ordering::Relaxed);
+        DEPARTED.store(false, Ordering::Relaxed);
+    }
+
+    pub fn gone() {
+        DEPARTED.store(true, Ordering::Relaxed);
+    }
+
+    pub fn waited(ticks: u64) {
+        if crate::msgbuf::address() == LEADER.load(Ordering::Relaxed) {
+            WAITED.fetch_add(ticks, Ordering::Relaxed);
+        }
+    }
+
     pub fn end(began: u64, kind: usize) {
-        let took = super::time::now().saturating_sub(began);
+        let whole = super::time::now().saturating_sub(began);
+        let counted = WAITED.swap(0, Ordering::Relaxed);
+        let waited = counted.min(whole);
+        let took = whole - waited;
         let kind = if OWNED.swap(false, Ordering::Relaxed) {
             OWN
+        } else if DEPARTED.swap(false, Ordering::Relaxed) {
+            GONE
         } else {
             kind
         };
         let detail = DETAIL.swap(0, Ordering::Relaxed);
         if detail == 32 {
             FULL[kind].fetch_max(took, Ordering::Relaxed);
+        } else if detail == 16 {
+            FULL_16[kind].fetch_max(took, Ordering::Relaxed);
         }
         let tag = REPORT.load(Ordering::Relaxed);
+        let printing = tag != 0 && !QUIET.load(Ordering::Relaxed);
+        if counted > whole {
+            // The sends of the leading thread cannot add up to more than
+            // the step: the accounting is lost, and `xtask` fails the run.
+            crate::println!("service wait cut: {tag} kind {kind} {counted} ticks of {whole}");
+        }
         if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
             DETAILS[kind].store(detail, Ordering::Relaxed);
-            if tag != 0 && !QUIET.load(Ordering::Relaxed) {
+            if printing {
                 crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
             }
+        }
+        if waited > WAITS[kind].fetch_max(waited, Ordering::Relaxed) && printing {
+            crate::println!("service wait: {tag} kind {kind} {waited} ticks of {whole}");
         }
     }
 }
@@ -574,6 +633,8 @@ mod steps {
         0
     }
     pub fn end(_: u64, _: usize) {}
+    pub fn restart() {}
+    pub fn gone() {}
     pub fn detail(_: u64) {}
     pub fn own() {}
     pub fn report(_: u8) {}
@@ -611,7 +672,7 @@ pub fn step_snapshot(r: &mut Request<'_>) -> Answer {
         step_maximum(kind)
     } else {
         match body.u64() {
-            Ok(32) => steps::full(kind),
+            Ok(detail @ (16 | 32)) => steps::full(kind, detail),
             _ => None,
         }
     };
@@ -627,6 +688,14 @@ pub fn step_snapshot(r: &mut Request<'_>) -> Answer {
         return Answer::Status(Status::BadSize);
     }
     Answer::Reply(Outgoing::new())
+}
+
+/// Adds the ticks a send waited to the step in progress (feature
+/// `step-stats`; `sys::send_with` calls it): the step's own part leaves them
+/// out.
+#[cfg(feature = "step-stats")]
+pub(crate) fn waited(ticks: u64) {
+    steps::waited(ticks);
 }
 
 /// Counts the notification step in progress apart from the others (feature

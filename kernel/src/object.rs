@@ -25,7 +25,7 @@ use crate::timer::{self, Timer};
 use abi::{MESSAGE_HANDLES, ObjectKind, Rights};
 use core::mem::{MaybeUninit, align_of, size_of};
 use core::ptr::NonNull;
-#[cfg(any(feature = "ktest", feature = "ipc-loss-probe"))]
+#[cfg(feature = "ktest")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kcore::handles::{Chunk, ChunkSource, Directory, HandleTable};
 use kcore::slab::{PaidPages, Pool};
@@ -210,19 +210,19 @@ impl Refs {
 
 /// The objects of one kind whose places have not gone back to their pool,
 /// counted in test builds (crate::ktest); nothing in the build that ships.
-pub struct Live(#[cfg(any(feature = "ktest", feature = "ipc-loss-probe"))] AtomicUsize);
+pub struct Live(#[cfg(feature = "ktest")] AtomicUsize);
 
 impl Live {
     pub const fn new() -> Live {
         Live(
-            #[cfg(any(feature = "ktest", feature = "ipc-loss-probe"))]
+            #[cfg(feature = "ktest")]
             AtomicUsize::new(0),
         )
     }
 
     /// One more object of the kind.
     pub fn made(&self) {
-        #[cfg(any(feature = "ktest", feature = "ipc-loss-probe"))]
+        #[cfg(feature = "ktest")]
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -234,10 +234,9 @@ impl Live {
     /// The place is the pool's again, its first 8 bytes the pool's link, and
     /// nothing uses the object afterwards.
     pub unsafe fn gone<T>(&self, _object: NonNull<T>) {
-        #[cfg(any(feature = "ktest", feature = "ipc-loss-probe"))]
-        self.0.fetch_sub(1, Ordering::Relaxed);
         #[cfg(feature = "ktest")]
         {
+            self.0.fetch_sub(1, Ordering::Relaxed);
             // SAFETY: the caller's promise; the link stays.
             unsafe {
                 core::ptr::write_bytes(
@@ -250,7 +249,7 @@ impl Live {
     }
 
     /// The objects of the kind now.
-    #[cfg(any(feature = "ktest", feature = "ipc-loss-probe"))]
+    #[cfg(feature = "ktest")]
     pub fn count(&self) -> usize {
         self.0.load(Ordering::Relaxed)
     }

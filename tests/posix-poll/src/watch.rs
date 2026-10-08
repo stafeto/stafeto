@@ -360,7 +360,7 @@ pub extern "C" fn stafeto_watch_full_tty(fd: u32, gone: u32) -> i32 {
             .map_err(|_| 5)?;
         let channel = rt::service::clone_session(parent, clone.as_bytes()).map_err(|_| 5)?;
         let mut set = watch::Set::new();
-        set.len = watch::MAX;
+        set.len = proto_tty::WATCH_MAX;
         set.items.fill(watch::Item {
             description,
             events: 0,
@@ -445,7 +445,7 @@ pub extern "C" fn stafeto_watch_stats(pipe: u32, tty: u32) -> i32 {
                     .map_err(|_| 5)?;
                     request.u32(kind as u32).map_err(|_| 5)?;
                     if case == 1 {
-                        request.u64(32).map_err(|_| 5)?;
+                        request.u64(if terminal { 16 } else { 32 }).map_err(|_| 5)?;
                     }
                     let reply = sys::send(channel, request.as_bytes()).map_err(|_| 5)?;
                     let mut buffer = [0; rt::abi::MESSAGE_MAX];

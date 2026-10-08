@@ -205,14 +205,16 @@ image is a memory object over frames the allocator never gets, whose chunk
 gives back only its place. From the same part on, a frame that goes back
 to the allocator is two units of work of a chunk, since its free may merge
 free blocks up to the highest order and costs about two releases of a
-handle: the Buffers stage gives back the buffers of 32 threads with no
+handle: the Buffers stage gives back the buffers of 16 threads with no
 handles a chunk, and the Shell stage eight pages; a thread goes into a chunk
 of the Buffers stage only when its units fit, so that a chunk does at
-most 64 units. The chunks that give frames back are measured with each
+most 32 units (64 until the cleanup of part E1-G1, below). The chunks
+that give frames back are measured with each
 frame alone in its free block of 4 MiB, which it merges back up to. The
 Buffers chunk is measured with the threads whose units fill it with the
-most handles: eleven threads, ten with four handles on their way and one
-with two, each handle the last copy of a session whose receiver waits.
+most handles: six threads, five with four handles on their way and one
+with none, each handle the last copy of a session whose receiver waits
+(eleven threads, ten with four handles and one with two, at 64 units).
 
 Part 1.4e adds in-tree `icount` cases for 11 buffers with 42 handles in
 transit, 32 charged shell pages, a 64-thread stop, a first `mem_create`
@@ -264,6 +266,36 @@ the measurement fails when any chunk of them, the threads' own cleanup
 included, is longer than the `session_handles` of the same run
 (`KERNEL_STATS` `x5`). B stays 20,536 (`session_handles`). A process
 whose only thread ends it skips the Threads stage.
+
+Part E1-G1 gives the kernel room under B. `session_handles`, the longest
+row, ran exactly as long as the budget B (20,410 ticks since 637d3a6), and
+`session_buffers` (20,029) came next, so any growth of a path broke the
+bound at once. The Handles stage now releases 32 entries a portion, half
+a chunk (`HandleTable::release_step` takes the count and keeps a cursor
+inside the last chunk; the chunk goes back with its last half, the
+directory with the last chunk), and the Buffers stage does 32 units
+(`BUFFERS_PORTION`). The same rows measure 10,313 and 10,051 ticks on both
+machines, `buffers` 2,560 (512M) and 2,534 (2G). The longest path of the
+kernel is then `first_map`, 16,738 on 512M (six tables when a range
+crosses the bound of `REGION`), and `release`, 16,060 on 2G (32 frames
+with merging), `shell` and `threads_ready` following with 14,938 and
+14,556. The price is twice the portions of the Handles stage for a
+process with full chunks, each adding the choice of a cleanup queue; the
+work and the response of the threads above the level of the cleanup are
+unchanged. Two numbers now stand in `xtask`: `TERM_B` (20,410), the
+budget of the blocking term for the response-time analysis and for the
+steps of the services, and `KERNEL_B_MAX` (18,000), the bound on the
+kernel's own longest row, which `kernel-test icount` fails above; the
+margins print as `B margin on <machine>`: 1,262 of 18,000 and 3,672 of
+`TERM_B` on 512M, 1,940 and 4,350 on 2G. Growth of the kernel up to
+18,000 goes unremarked, beyond it needs a decision (another split, or a
+higher bound with the reason written down), and the services keep the
+budget they were promised. The row `session_handles` no longer bounds the
+threads rows: every row of the line, the new `teardown_any` among
+them (the longest portion of any kind in the four teardowns of the threads
+rows, 14,495), is compared with `KERNEL_B_MAX` by xtask. `session_buffers`
+now measures 10,082: a seventh thread with no handles waits for the next
+portion, so a larger `BUFFERS_PORTION` fails the measurement itself.
 
 Between the end and its Threads chunks, a thread of the ended process
 that waits in `receive` stays in the channel's queue: on a channel that
@@ -362,9 +394,9 @@ window that goes.
 | a chunk of the Replies stage (`process::clean`, `wake_clients`) | up to 32 clients of the top level of the queue of requests the process's threads accepted, under one hold of the scheduler's lock: each leaves the queue and gets `PEER_CLOSED` in `x0`, and goes to the tail of its level with a new quantum; with clients left, the process goes to the head of the higher of R and their new top level, otherwise on to the Children stage at the head of level R; with no client, one chunk that only moves on. The stage stands at the higher of R and the top client | up to 32 clients at O(1) each | 2,686 (test build): 32 clients |
 | a chunk of the Children stage (`process::clean`) | the first child in the list, terminated by the Stop stage: the process goes to the head of level R, and the child to the head of its stage's level right before it (`process::hasten`) | constant: an insertion at the head and a raise |  |
 | `process::hasten` (the Children stage, `process_kill` of a terminated process) | R grows to the level of the call; a process in its stages goes to the head of its stage's level (`cleanup::raise`); a shell has nothing to raise | constant: a removal from a list and an insertion at the head |  |
-| a chunk of the Handles stage (`process::clean`) | `HandleTable::release_step`: one table chunk; each entry's object is released in O(1): the last copy of a session posts `CLIENT_GONE` as `notify` does, and the last handle with `RECEIVE` closes its channel; the chunk directory goes with the last chunk | up to 64 entries, each no costlier than `notify` | 20,538 (test build, `session_handles`, since process suspension): 64 last copies of sessions, each `CLIENT_GONE` waking a receiver of its own channel; 19,960 after stage 1.3 by the out-of-tree measurement after stage 1.3; 8,166 when nobody waits |
+| a chunk of the Handles stage (`process::clean`) | `HandleTable::release_step`: up to 32 entries (`HANDLES_PORTION`, half a table chunk, with a cursor inside the chunk); each entry's object is released in O(1): the last copy of a session posts `CLIENT_GONE` as `notify` does, and the last handle with `RECEIVE` closes its channel; the chunk goes back with its last half and the directory with the last chunk | up to 32 entries, each no costlier than `notify` | 20,538 (test build, `session_handles`, since process suspension): 64 last copies of sessions, each `CLIENT_GONE` waking a receiver of its own channel; 19,960 after stage 1.3 by the out-of-tree measurement after stage 1.3; 8,166 when nobody waits (a full chunk of 64, until E1-G1); 10,313 (E1-G1, `session_handles`): 32 last copies, each waking a receiver |
 | a chunk of the Space stage (`process::clean`) | the first chunk takes the space away from the process and does `AddressSpace::retire`; each following one does `SpaceRelease::step` | see the `AddressSpace::retire` row | 4,264 (test build): a step |
-| a chunk of the Buffers stage (`process::clean`) | returns the message-buffer frames of threads stopped by termination, releases the handles of the requests of those that waited in `send`, up to 4 each, as `handle_close` does (the last copy of a session posts `CLIENT_GONE` as `notify` does), and what a long call a thread was making held: the object of a `mem_create`, whose last reference puts it on the cleanup queue, or a mapping a change left midway, which keeps what its chunks did; and removes the threads from the process's list; 64 units of work a chunk, a frame two and each handle or object one more, a thread going into a chunk only when its units fit, so the frames of 32 threads with no handles take one chunk | up to 32 frames, each through merging free blocks in `FRAMES` up to the highest order and returning the frame to the quota, and with handles up to 64 units, since a thread goes into a chunk only when its units fit, each handle no costlier than `notify`: under -icount within 3 % of a Handles chunk of 64 last copies of sessions, the longest teardown chunk measured; the first measurement on hardware should record which stage set the longest time (the `KERNEL_STATS` kind in `x5`), so the limit of 64 units in Buffers is tuned separately from the handle-table chunk size | 19,354 (test build): 32 frames, each merging up to the highest order; 20,079 (test build, `session_buffers`): 11 frames, each merging up to the highest order, and 42 handles, each the last copy of a session whose `CLIENT_GONE` wakes a receiver (20,069 after stage 1.3 by the out-of-tree measurement after stage 1.3) |
+| a chunk of the Buffers stage (`process::clean`) | returns the message-buffer frames of threads stopped by termination, releases the handles of the requests of those that waited in `send`, up to 4 each, as `handle_close` does (the last copy of a session posts `CLIENT_GONE` as `notify` does), and what a long call a thread was making held: the object of a `mem_create`, whose last reference puts it on the cleanup queue, or a mapping a change left midway, which keeps what its chunks did; and removes the threads from the process's list; 32 units of work a chunk (64 until E1-G1), a frame two and each handle or object one more, a thread going into a chunk only when its units fit, so the frames of 16 threads with no handles take one chunk | up to 16 frames (32 before E1-G1), each through merging free blocks in `FRAMES` up to the highest order and returning the frame to the quota, and with handles up to 32 units (64 before E1-G1), since a thread goes into a chunk only when its units fit, each handle no costlier than `notify`: at E1-G1 `session_buffers` is 10,051, level with a Handles portion of 32 last copies of sessions (10,313); before it, within 3 % of a Handles chunk of 64 last copies of sessions, the longest teardown chunk then; the first measurement on hardware should record which stage set the longest time (the `KERNEL_STATS` kind in `x5`), so the limit of 32 units in Buffers is tuned separately from the handle-table portion | 19,354 (test build): 32 frames, each merging up to the highest order; 20,079 (test build, `session_buffers`): 11 frames, each merging up to the highest order, and 42 handles, each the last copy of a session whose `CLIENT_GONE` wakes a receiver (20,069 after stage 1.3 by the out-of-tree measurement after stage 1.3); 10,051 at E1-G1 (`session_buffers`): 5 frames and 20 handles in 32 units |
 | a chunk of the Mappings stage (`process::clean`, `maps::release_all`) | every mapping of the process's table, busy or not, leaves it and releases its memory object, whose last reference puts it on the cleanup queue; the paid table page stays in the page log until shell cleanup | up to 128 mappings at O(1) each | 4,221 (test build): 64 mappings, 62 of them the last references to their objects |
 | a chunk of the Quota stage (`process::clean`) | returns the free part of the quota to the parent (`Account::return_free`) and removes the process from the parent's list of children | constant |  |
 | a chunk of the Notify stage (`process::clean`, `notify_exit`) | if the process has an exit channel, posts bit 0 into the slot in its shell as `notify` does: delivery to a waiting receiver, or enqueuing in the channel's queue, where the slot holds the shell; a closed channel gets nothing | constant: as `notify` |  |
@@ -419,7 +451,7 @@ window that goes.
 | the last reference to a binding (`irq::release`: the last handle, or `receive` or the Close stage that took its slot) | puts the binding at the tail of the cleanup queue at the level of the cause | constant |  |
 | a binding chunk (`irq::clean`) | returns its slot to the channel's limit and its place to its payer's pool of bindings (nothing goes back to the quota), and releases the references to the channel and to the payer's shell | constant | 252 (test build) |
 | a teardown that a thread at a high level starts (`process_kill`, the last handle to a big process or to a channel with many waiters) | runs at the level of its cause (spec 7.7), the Close and Replies stages at the higher of the cause and their top waiter: the chunks of the whole teardown follow one another at that level, with interrupt polls between them, and no thread at or below that level runs until they end | each chunk as in its row; in all, the sum of the object's chunks | no single number since stage 3, which took the end into chunks: the call part, 350 (`end_call`), then the Threads chunks at S, the longest 13,213 (`threads_ready`), then the chunks of the later stages, each at most B (the rows above); in stage 1.3c, when the call stopped the threads, `process_kill` of a child with 64 threads that never ran took 42,961 with its whole teardown; closing a channel with 60 waiting receivers is no single path: two chunks of the Close stage at their level, the longer 3,844 (test build), then each of the 60 receivers it wakes runs above the closer and exits on its own, about 1,100 instructions each |
-| B, the blocking time of any thread, level 63 included (spec 15.3) | the longest row above, which a pending interrupt waits for; firings of timers are chunks of their levels, and no series of them blocks a higher level | the longest row | 20,538 under -icount (test build) since process suspension (20,536 after stage 3): a Handles chunk of 64 last copies of sessions each waking a receiver (42,539 after the cleanup of audit 3, the end of a process with 128 threads waiting in `send` through the last copies of sessions, until the Threads stage took that end into chunks); of the chunks, 20,536, a Handles chunk of 64 last copies of sessions each waking a receiver, then 20,079, a Buffers chunk whose 11 frames each merge up to the highest order and whose 42 handles each wake a receiver (20,069 after stage 1.3 by the out-of-tree measurement after stage 1.3), and 19,354, a Buffers chunk of 32 frames; printing costs nothing there; B does not grow with the number of timers, bindings, slots or threads of an ending process; the longest Threads chunk is 13,213; on hardware `debug_write` and the fault line are longer (their rows); a chunk of firings, 13,276 since the timer heap of 8,192 timers (depth 13), stays below it |
+| B, the blocking time of any thread, level 63 included (spec 15.3) | the longest row above, which a pending interrupt waits for; firings of timers are chunks of their levels, and no series of them blocks a higher level | the longest row | 16,738 under -icount at E1-G1 (`first_map`, 512M; `release`, 16,060, on 2G), bound `KERNEL_B_MAX` 18,000, budget of the services `TERM_B` 20,410; before that 20,538 under -icount (test build) since process suspension (20,536 after stage 3): a Handles chunk of 64 last copies of sessions each waking a receiver (42,539 after the cleanup of audit 3, the end of a process with 128 threads waiting in `send` through the last copies of sessions, until the Threads stage took that end into chunks); of the chunks, 20,536, a Handles chunk of 64 last copies of sessions each waking a receiver, then 20,079, a Buffers chunk whose 11 frames each merge up to the highest order and whose 42 handles each wake a receiver (20,069 after stage 1.3 by the out-of-tree measurement after stage 1.3), and 19,354, a Buffers chunk of 32 frames; printing costs nothing there; B does not grow with the number of timers, bindings, slots or threads of an ending process; the longest Threads chunk is 13,213; on hardware `debug_write` and the fault line are longer (their rows); a chunk of firings, 13,276 since the timer heap of 8,192 timers (depth 13), stays below it |
 
 ## Process suspension
 
@@ -441,7 +473,8 @@ surrounding exit-loop poll and decision setup are excluded. The first
 stop has no queued continuation. A separate stop cancels the remaining
 queued portion and releases its process reference.
 
-The continuation stays below B=20,538. The previous B=20,536 grew by two
+The continuation stays below B=20,538 (the member before E1-G1; the bound
+now is `KERNEL_B_MAX` 18,000). The previous B=20,536 grew by two
 instructions in the Handles chunk when the process-cleanup dispatch
 acquired its continuation case. The process shell is 1264 bytes and keeps
 three slots per pool page. The normal build reports null=262, clock=315,
@@ -465,7 +498,7 @@ entry, syscall or exit-loop interval requires its own measurement boundaries.
 The rows above bound what a pending interrupt waits for. A step of a
 service is user-space work at the service's level, and a request that waits
 for the service waits for the steps ahead of it. `cargo xtask
-process-steps` (4 branches in `ci`) measures them under -icount with a
+process-steps` (7 branches in `ci`) measures them under -icount with a
 crowd of children from files (the same ticks as B; `rt` feature
 `step-stats` and the process service's feature `steps` in that image
 only, and the RAM file service's feature `steps`; the clock service is the shipping one). The longest
@@ -505,7 +538,7 @@ row grows with them and stops at 11,768 ticks, the walk of a record with 32 chil
 fixed costs above B: they make a process in the kernel, a call at a time
 (its space, the record's page, the loader's code, data and stack and its
 thread), each call bounded on its own. `process-steps` fails when the
-longest Vouch passes 6,000 ticks. Details are in
+own part of the longest Vouch or RetainedLoader passes 8,000 ticks. Details are in
 [notes/m5c-spawn-exec.md](../notes/m5c-spawn-exec.md).
 
 A thread below the service's level waits for at most one step that has
@@ -515,6 +548,66 @@ ticks, 4.3 times B, and it does not grow with the number of processes.
 Nothing of real time runs below level 52 yet; SpawnStart, ExecStart,
 ForkStart and Create are to be split into steps no longer than B before
 step 5h.
+
+### Own part and wait of a step
+
+A step that calls another service synchronously (`send`) has two parts.
+Under `step-stats` the library `rt` times each `send` that the thread
+leading the step makes: the line `service step` carries the own part (the
+whole step less the waits), and the line `service wait: T kind K W ticks of
+A` carries the longest wait W of a kind in a step of A ticks. The sends of
+the service's other threads (the adoption and replace threads of the
+process service, the supply thread of the entropy service) are no waits of
+the step: they run at the loop's base level, and when one preempts the loop
+its time stays in the own part, from above. If the counted waits ever add
+up to more than the step, `rt` prints `service wait cut:` and `xtask` fails
+the run.
+
+`xtask` compares the own part of every kind of every service, heartbeats
+included, with term B. A wait has CALL_WAIT_MAX (120,000 ticks) in a call
+to a service and WAIT_MAX (500,000) in a heartbeat, where the wait covers
+the volleys of the crowd above the service's level. Ramfs FinishBinding and
+the heartbeats of the pipe service and of the terminal service must show a
+wait, or the accounting is gone. The departure of a session counts as kind
+66 in the process service, ramfs and the terminal service; the pipe service
+marks it as its own step (kind 65), and the other notifications stay in kind
+64. FinishBinding with 248 children took 18,306 ticks whole, 12,246 of them
+wait and 8,279 its own part, which does not grow with the children; the
+terminal's own step (kind 65) took 20,509 whole and 12,710 in its own part.
+
+The wall time of a `send` includes the entry to the kernel, the copy of the
+message and of the handles both ways and the return, which is the caller's
+own work, up to half a round trip (`round_trip` 2,034 ticks) a call. It
+counts as wait, so the own part is lower by some hundreds of ticks a call;
+the blocking term below takes it back through C_ipc.
+
+For a client of a service S that calls services T_i in a step, the waits are
+a blocking term of the response-time analysis. The wait of a step is the sum
+over its sends:
+
+    wait(S) <= sum_i ( C_ipc + step_max(T_i) + step(T_i, request_i) + Q_i + I_i )
+
+with C_ipc about 2,000 ticks (one round trip); step_max(T_i) the longest
+whole step of T_i (its own part plus its own waits, so that a chain S, T, U
+carries the wait on U) that may be running when the request arrives; Q_i the
+steps of requests that stand ahead in T_i's queue, those of its own level in
+the order of arrival and those above; step(T_i, request_i) the step of the
+request itself; and I_i the preemption by levels above the one T_i inherits
+from S, with the work of T_i's other threads (they run at its base level
+and preempt its loop when it serves a client below that level). The term of
+the client is the largest own(S) + wait(S) of one step; the sum of the
+largest own part and the largest wait of two rows is an upper bound of it.
+The steps of T_i are bound by their own lines, so `xtask` bounds own(S) with
+B and each wait with CALL_WAIT_MAX or WAIT_MAX. For T the process service
+step_max is SpawnStart, 93,000 ticks today, so one send of the terminal or
+of ramfs to the process service waits about 100,000 ticks in the worst
+case until step 5z splits it.
+
+The own part is wall time at the service's level: a holder of a lock at a
+higher level that runs in the middle of a step adds its time to the step.
+The part therefore bounds the service's work from above and carries noise
+of up to 1,200 ticks between builds. Exact work needs a thread run time in
+the kernel and is outside this measurement.
 
 ### The loader's copy of a `fork`
 
@@ -584,8 +677,12 @@ table of live clones (`proto_wire::clones`, 320 places), as Clone of the
 clock and pipe services does: its longest step under -icount, with the
 table full (`cargo xtask entropy`, role `x` of tests/entropy), is 14,398
 ticks of term B 20,536. SEED is 5,623 ticks; its own step with 64 seeds
-waiting for the first bytes, 8 told a step, is 10,684. Making the walks of
-the clone tables O(1) in the three services is a task of its own.
+waiting for the first bytes, 8 told a step, is 10,684. (Dated before part V
+of E1; those numbers are history.) E1 now: the walks of the clone tables are
+O(1) in the three services (part V), CLONE with the table full is 5,648
+under -icount in `cargo xtask entropy` (bound `CLONE_FULL_MAX` 6,500), and
+the command compares the own part of each step with `TERM_B` 20,410 and
+checks the waits (see "Own part and wait of a step").
 
 ### The pipe service
 
@@ -617,10 +714,15 @@ spread of the volleys of the crowd (they interleave with the step in
 progress), and `process-steps` fails when any of them passes 20,536. Clone has the least
 margin: 17,382 ticks with 248 children, 85 % of B, since it goes through
 the 320 places of the births and of the clones; it is the first to split
-when the tables grow (with the steps of the process service, 5h). The
+when the tables grow (with the steps of the process service, 5h).
+E1 now: after part V the walk is gone (Clone is 5,967 with 128 and with 248
+children), and `process-steps` compares the own part of each step with
+`TERM_B` 20,410 and checks the waits (see "Own part and wait of a step");
+the numbers above are history. The
 heartbeat is the loop's wait for init's reply, in which processes of higher
-levels run (the volley of 248 children); it is no work of the service, and
-the check bounds it at 500,000 ticks apart from B. A thread below level 40
+levels run (the volley of 248 children); that wait is counted apart (see
+"Own part and wait of a step"), the check bounds it at 500,000 ticks, and
+the heartbeat's own part goes against B like every other step. A thread below level 40
 waits for at most one step of the service's own work that has begun; the
 wait for init's reply goes to threads above the client's level, so it adds
 nothing to the client's delay. No step allocates memory: the
@@ -645,7 +747,9 @@ SetPgrp, GetPgrp, GetSid and Controlling while all sixteen clients remain
 alive. Pipe gates keep at most eight waiting readers per pipe. The
 maxima persist across both phases. The C probe uses `-fno-builtin`.
 
-On integrated wiring `11275b9`, all complete intervals remain below B=20,538:
+On integrated wiring `11275b9`, all complete intervals remain below B=20,538 (the bound of that day; E1
+compares the own part with `TERM_B` 20,410, see "Own part and wait of a
+step"):
 
 | Terminal method | Full interval under -icount |
 |---|---:|
@@ -667,7 +771,8 @@ It checks the limit, releases one place, then performs a real fork and
 checks all 32 descriptors in the grandchild. After retirement completes,
 it snapshots Clone (7) and the service's own step (65) before printing.
 The measured interval includes receive return, dispatch, identity checks
-and reply, with B fixed at 20,538 and no overhead subtracted.
+and reply, with B fixed at 20,538 and no overhead subtracted (E1: both commands now
+subtract the wait and compare the own part with 20,410).
 
 On the implementation accepted at `76fa4b2`, Clone takes at most 17,670
 and the own step 7,138 ticks. Exact ID selection checks the complete
