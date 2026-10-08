@@ -177,8 +177,9 @@ type Rows = Vec<(usize, u64, u64)>;
 const CLONE_FULL_MAX: u64 = 6_500;
 
 /// The longest step of each kind of the loop of `tag`, from the lines of a
-/// run under -icount: every kind of `kinds` came, and every kind but the
-/// heartbeat (64) stayed under term B. Gives the rows.
+/// run under -icount: every kind of `kinds` came, and every kind stayed
+/// under term B, the heartbeat too (it counts its own part only). Gives
+/// the rows.
 fn loop_steps(
     lines: &[String],
     tag: &str,
@@ -191,7 +192,7 @@ fn loop_steps(
             return Err(format!("{who}: no step {name}: {rows:?}"));
         }
     }
-    if let Some(row) = rows.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+    if let Some(row) = rows.iter().find(|r| r.1 > RAM_STEP_MAX) {
         return Err(format!("{who}: a step past term B {RAM_STEP_MAX}: {row:?}"));
     }
     Ok(rows)
@@ -251,6 +252,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(&output, ENDED)?;
     if icount {
         let [rng, service] = steps_verdict(&output.lines)?;
+        crate::check_waits(&output.lines, &["10", "11"], "entropy")?;
         let text = |rows: &[(usize, u64, u64)]| {
             let rows: Vec<_> = rows
                 .iter()

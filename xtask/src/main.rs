@@ -3610,6 +3610,13 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if let Some(row) = pipe.iter().find(|r| r.1 > RAM_STEP_MAX) {
         return Err(format!("the pipe service: a step past term B: {row:?}"));
     }
+    // The entropy device's driver (tag 10): its own steps, under term B.
+    let driver = longest_steps(&outcome.lines, "10");
+    if let Some(row) = driver.iter().find(|r| r.1 > RAM_STEP_MAX) {
+        return Err(format!(
+            "the entropy device's driver: a step past term B: {row:?}"
+        ));
+    }
     // The entropy service (tag 11): CLONE for each child of the crowd,
     // whose cost stays the same with the live clones (entropy::CLONE_FULL_MAX
     // bounds it with the table full), and its own steps; every one under term B.
