@@ -438,6 +438,11 @@ static int constants(void) {
         printf("relibc-hello: sysconf claims the XSI option or the wrong version\n");
         return 24;
     }
+    /* The layer's descriptor table holds 32, and poll answers EINVAL past it. */
+    if (sysconf(_SC_OPEN_MAX) != 32 || errno != 0) {
+        printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 32\n", sysconf(_SC_OPEN_MAX));
+        return 25;
+    }
     printf("relibc-hello: constants: _POSIX_VERSION %ld, _POSIX_SUBPROFILE %ld, %d options claimed, timers %ld\n",
            sysconf(_SC_VERSION), (long)_POSIX_SUBPROFILE, claimed, sysconf(_SC_TIMERS));
     return 0;
