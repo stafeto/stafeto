@@ -199,6 +199,7 @@ pub const VERSION: u16 = 12;
 mod executable;
 pub mod initial_ack;
 pub mod initial_identity;
+pub mod initial_release;
 pub mod initial_stage;
 mod limits;
 mod retained;
