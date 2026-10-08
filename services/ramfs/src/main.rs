@@ -3202,6 +3202,30 @@ impl Fs {
             return Ok(());
         }
         if fds.binding_preparation.is_some() {
+            if let Some(identity) = identities
+                .get(fds.authority_index as usize)
+                .and_then(Option::as_ref)
+                && let Admission::Transport(transport) = &identity.admission
+                && ramfs::authority::failed_candidate_allows(
+                    fds,
+                    label,
+                    identity
+                        .original
+                        .snapshot_ref()
+                        .map_or(0, |who| generation(who.index as usize)),
+                    ramfs::authority::FailedCandidate {
+                        label: identity.label,
+                        original: &identity.original,
+                        original_root: identity.original_root,
+                        purpose: identity.purpose,
+                        closing: identity.closing,
+                        retained_failure: transport
+                            .failed_original_outcome(identity.previous.is_some()),
+                    },
+                )
+            {
+                return Ok(());
+            }
             return Err(proto_fs::AUTHENTICATING);
         }
         if fds.binding.awaits_child_identity() {

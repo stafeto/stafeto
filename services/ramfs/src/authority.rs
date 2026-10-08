@@ -19,6 +19,41 @@ pub fn binding_reply(fds: &crate::Fds) -> Option<u32> {
         .filter(|code| *code != 0 || fds.binding_preparation.is_none())
 }
 
+/// The old capability stays paid while a failed candidate's transport settles.
+#[derive(Clone, Copy)]
+pub struct FailedCandidate<'a> {
+    pub label: u64,
+    pub original: &'a Binding,
+    pub original_root: Root,
+    pub purpose: BindingPurpose,
+    pub closing: bool,
+    pub retained_failure: Option<u32>,
+}
+
+/// A captured refusal does not revoke an unchanged exact live original authority.
+pub fn failed_candidate_allows(
+    fds: &crate::Fds,
+    label: u64,
+    current: u64,
+    candidate: FailedCandidate<'_>,
+) -> bool {
+    fds.binding_preparation.is_some()
+        && !fds.closing
+        && !candidate.closing
+        && candidate.label == label
+        && candidate.purpose == BindingPurpose::Candidate
+        && *candidate.original == fds.binding
+        && candidate.original_root == fds.root
+        && candidate.original.root() == Some(fds.root)
+        && matches!(candidate.original, Binding::Active(_) | Binding::Pending(_))
+        && current != 0
+        && current & proto_process::GENERATION_DEAD == 0
+        && candidate.original.valid(current)
+        && fds
+            .binding_outcome
+            .is_some_and(|code| code != 0 && candidate.retained_failure == Some(code))
+}
+
 /// A single paid receive advances one authentication phase.
 pub type Admission = AdmissionState<()>;
 

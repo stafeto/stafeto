@@ -43,6 +43,22 @@ pub struct Transport<O: Owners> {
     pub state: State<O>,
 }
 impl<O: Owners> Transport<O> {
+    /// Only the exact paid old owner authorizes ordinary work during failed rollback.
+    pub fn failed_original_outcome(&self, previous_live: bool) -> Option<u32> {
+        let outcome = match &self.state {
+            State::Copy { outcome, .. }
+            | State::Back { outcome, .. }
+            | State::Reply { outcome, .. }
+                if previous_live =>
+            {
+                *outcome
+            }
+            State::Rollback { outcome, .. } if !previous_live => *outcome,
+            _ => return None,
+        };
+        (outcome != 0).then_some(outcome)
+    }
+
     /// None is a finish phase; Some(None) retains debt; Some(Some(code)) is empty.
     pub fn drain(&mut self) -> Option<Option<u32>> {
         let outcome = match &mut self.state {
@@ -515,6 +531,237 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn failed_candidate_original_authority_preserves_actual_access_and_each_paid_transport_owner() {
+        use crate::authority::{
+            Binding, BindingPurpose, FailedCandidate, binding_reply, capture_binding_failure,
+            failed_candidate_allows,
+        };
+        let who = proto_process::WhoReply {
+            pid: 300,
+            credentials: proto_process::Credentials::ROOT,
+            generation: 7,
+            loader: None,
+            index: 44,
+            ctty: None,
+            image: 1,
+            groups: proto_process::Groups::EMPTY,
+            limits: proto_process::ResourceLimits::initial(2 * 1024 * 1024),
+            root: proto_process::ExpenditureRoot {
+                pid: 300,
+                generation: 1,
+            },
+        };
+        let original = Binding::Active(who);
+        let root = original.root().unwrap();
+        for phase in 0..4 {
+            let _kernel = kernel(ResultKind::Wire);
+            let mut ram = crate::Ram::default();
+            let mut fds = crate::Fds {
+                binding: original,
+                root,
+                ..crate::Fds::default()
+            };
+            let fd = ram
+                .open(&mut fds, "/etc/motd", proto_fs::READ_ONLY)
+                .unwrap();
+            ram.begin_binding(&mut fds).unwrap();
+            capture_binding_failure(&mut fds, proto_fs::PERMISSION);
+            let mut old_cap = Some(Cap::new(72));
+            let mut transport = Transport::<Owned> {
+                epoch: 7,
+                state: match phase {
+                    0 => State::Copy {
+                        owner: Some(Cap::new(73)),
+                        outcome: proto_fs::PERMISSION,
+                    },
+                    1 => State::Back {
+                        owners: vec![Cap::new(73)],
+                        held: None,
+                        outcome: proto_fs::PERMISSION,
+                    },
+                    2 => State::Reply {
+                        owners: vec![Some(Cap::new(73))],
+                        held: None,
+                        cursor: 0,
+                        outcome: proto_fs::PERMISSION,
+                    },
+                    _ => State::Rollback {
+                        rejected: Some(Cap::new(73)),
+                        outcome: proto_fs::PERMISSION,
+                    },
+                },
+            };
+            let context = FailedCandidate {
+                label: 81,
+                original: &original,
+                original_root: root,
+                purpose: BindingPurpose::Candidate,
+                closing: false,
+                retained_failure: transport.failed_original_outcome(phase != 3),
+            };
+            assert!(failed_candidate_allows(&fds, 81, 7, context));
+            let mut bytes = [0; 3];
+            assert_eq!(ram.read(&mut fds, fd, &mut bytes), Ok(3));
+            assert_eq!(&bytes, b"sta");
+            let pending = Binding::Pending(who);
+            fds.binding = pending;
+            assert!(failed_candidate_allows(
+                &fds,
+                81,
+                7,
+                FailedCandidate {
+                    original: &pending,
+                    ..context
+                }
+            ));
+            fds.binding = original;
+            let foreign = Binding::Active(proto_process::WhoReply { pid: 301, ..who });
+            assert!(!failed_candidate_allows(
+                &fds,
+                81,
+                7,
+                FailedCandidate {
+                    original: &foreign,
+                    ..context
+                }
+            ));
+            assert!(old_cap.is_some());
+            assert_eq!(ram.storage.usage(root).descriptions, 1);
+            assert_eq!(ram.storage.preparations_used(), 1);
+            assert_eq!(binding_reply(&fds), Some(proto_fs::PERMISSION));
+            assert!(CALLS.with(|calls| calls.borrow().is_empty()));
+            for current in [0, 8, proto_process::GENERATION_DEAD | 7] {
+                assert!(!failed_candidate_allows(&fds, 81, current, context));
+            }
+            assert!(!failed_candidate_allows(&fds, 82, 7, context));
+            assert!(!failed_candidate_allows(
+                &fds,
+                81,
+                7,
+                FailedCandidate {
+                    label: 82,
+                    ..context
+                }
+            ));
+            assert!(!failed_candidate_allows(
+                &fds,
+                81,
+                7,
+                FailedCandidate {
+                    original_root: crate::storage::Root { id: 301, ..root },
+                    ..context
+                }
+            ));
+            for purpose in [BindingPurpose::Refresh, BindingPurpose::Audit] {
+                assert!(!failed_candidate_allows(
+                    &fds,
+                    81,
+                    7,
+                    FailedCandidate { purpose, ..context }
+                ));
+            }
+            assert!(!failed_candidate_allows(
+                &fds,
+                81,
+                7,
+                FailedCandidate {
+                    closing: true,
+                    ..context
+                }
+            ));
+            assert!(!failed_candidate_allows(
+                &fds,
+                81,
+                7,
+                FailedCandidate {
+                    retained_failure: None,
+                    ..context
+                }
+            ));
+            assert!(!failed_candidate_allows(
+                &fds,
+                81,
+                7,
+                FailedCandidate {
+                    retained_failure: Some(proto_fs::STALE_PROOF),
+                    ..context
+                }
+            ));
+            assert_eq!(transport.failed_original_outcome(phase == 3), None);
+            for binding in [
+                Binding::Handoff(who),
+                Binding::Inherited(who),
+                Binding::Unbound,
+                Binding::Cleanup,
+            ] {
+                fds.binding = binding;
+                assert!(!failed_candidate_allows(
+                    &fds,
+                    81,
+                    7,
+                    FailedCandidate {
+                        original: &binding,
+                        ..context
+                    }
+                ));
+            }
+            fds.binding = original;
+            fds.closing = true;
+            assert!(!failed_candidate_allows(&fds, 81, 7, context));
+            fds.closing = false;
+            fds.binding_outcome = Some(0);
+            assert!(!failed_candidate_allows(&fds, 81, 7, context));
+            fds.binding_outcome = Some(proto_fs::PERMISSION);
+            FAIL_CLOSE.with(|count| *count.borrow_mut() = 1);
+            if phase == 3 {
+                let mut offered = None;
+                let mut previous = None;
+                for _ in 0..4 {
+                    match finish(&mut transport, &mut offered, &mut previous).unwrap() {
+                        Finish::Pending => {
+                            assert!(failed_candidate_allows(&fds, 81, 7, context));
+                        }
+                        Finish::Rollback(code) => {
+                            ram.complete_binding(&mut fds, code);
+                            break;
+                        }
+                        Finish::Commit => panic!(),
+                    }
+                }
+            } else {
+                for _ in 0..4 {
+                    if let Some(Some(code)) = transport.drain() {
+                        ram.complete_binding(&mut fds, code);
+                        break;
+                    }
+                    assert!(failed_candidate_allows(&fds, 81, 7, context));
+                }
+            }
+            assert_eq!(ram.storage.preparations_used(), 0);
+            assert_eq!(binding_reply(&fds), Some(proto_fs::PERMISSION));
+            assert!(fds.binding.valid(7));
+            assert!(!failed_candidate_allows(&fds, 81, 7, context));
+            assert!(old_cap.is_some());
+            Owned::close_copy(&mut old_cap);
+            assert!(ram.release_step(&mut fds));
+            assert_eq!(ram.storage.usage(root).descriptions, 0);
+        }
+        let commit = Transport::<Owned> {
+            epoch: 7,
+            state: State::Commit,
+        };
+        assert_eq!(commit.failed_original_outcome(true), None);
+        let zero = Transport::<Owned> {
+            epoch: 7,
+            state: State::Copy {
+                owner: None,
+                outcome: 0,
+            },
+        };
+        assert_eq!(zero.failed_original_outcome(true), None);
     }
 
     #[test]
