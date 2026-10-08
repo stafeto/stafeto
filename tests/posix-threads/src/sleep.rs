@@ -163,12 +163,13 @@ fn blocked(id: u64) -> bool {
 fn finished(channel: &Handle<Channel>, waiter: &Waiter, expected: usize) -> bool {
     let limit = now() + 500_000_000;
     loop {
-        match {
+        let result = {
             let deadline = limit;
             crate::watchdog::receive(deadline, rt::abi::Error::Interrupted, |deadline| {
                 waiter.receive_until(channel, deadline)
             })
-        } {
+        };
+        match result {
             Ok(Waited::Got(_)) if DONE.load(Ordering::Acquire) == expected => return true,
             Ok(Waited::Got(_)) if DONE.load(Ordering::Acquire) == 0 => {}
             _ => return false,
