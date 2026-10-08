@@ -495,7 +495,9 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 
 /// The steps probe and each spawned child: the enlarged image plus its
 /// checked 64 KiB malloc, including the allocator mapping and alignment.
-const STEPS_QUOTA: u64 = (256 + 16) * PAGE;
+// The steps child pays for the measured image, allocator growth and fork
+// metadata: 413 pages at the conservative peak, plus the existing reserve.
+const STEPS_QUOTA: u64 = (413 + 16) * PAGE;
 
 /// The probe and each child it spawns inherit this budget. Its 1 MiB
 /// allocator growth needs 538 transient pages: 261 live, 274 for the
