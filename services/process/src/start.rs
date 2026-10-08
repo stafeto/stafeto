@@ -833,14 +833,15 @@ impl Processes {
         };
         if let Some(admission) = admission {
             use posix_process_service::initial_origin::{InitialOrigin, SourceOrigin};
-            record.set_initial_origin(
-                InitialOrigin::new(admission.source.artifact, 0).expect("initial flags"),
-            );
             record.source_origin = SourceOrigin::boot(
                 admission.source.artifact,
                 admission.source.canonical.is_none(),
             )
             .expect("validated initial artifact");
+            assert!(record.set_initial_origin(
+                create.ticket,
+                InitialOrigin::new(admission.source.artifact, 0).expect("initial flags"),
+            ));
         }
         let mut bytes = Writer::new();
         if admission.is_some() {

@@ -127,7 +127,7 @@ pub struct Record<P, C = ()> {
     /// The last image number an exec of the record took, committed or
     /// not: the next exec takes one more, so no number names two attempts.
     pub tried: u32,
-    /// Exact successful loader ticket of the current image, retained after Take.
+    /// Initial full epoch or successful loader ticket, retained after Take.
     image_origin: u64,
     pub source_origin: crate::initial_origin::SourceOrigin,
     pub active_guard_label: u64,
@@ -164,13 +164,31 @@ impl<P, C> Record<P, C> {
         initial_ticket: u64,
     ) -> Option<crate::initial_origin::InitialOrigin> {
         (self.image == proto_process::IMAGE && initial_ticket != 0)
-            .then(|| crate::initial_origin::InitialOrigin::from_raw(self.image_origin))
+            .then(|| self.source_origin.initial_origin())
             .flatten()
     }
-    pub fn set_initial_origin(&mut self, origin: crate::initial_origin::InitialOrigin) {
-        self.image_origin = origin.raw();
+    pub fn set_initial_origin(
+        &mut self,
+        initial_ticket: u64,
+        origin: crate::initial_origin::InitialOrigin,
+    ) -> bool {
+        self.image == proto_process::IMAGE
+            && initial_ticket != 0
+            && self.source_origin.set_initial_origin(origin)
+    }
+    pub fn initial_epoch(&self, initial_ticket: u64) -> Option<u64> {
+        self.initial_origin(initial_ticket)
+            .map(|_| self.image_origin)
+    }
+    pub fn set_initial_epoch(&mut self, initial_ticket: u64, epoch: u64) -> bool {
+        if self.initial_origin(initial_ticket).is_none() || epoch == 0 || self.image_origin != 0 {
+            return false;
+        }
+        self.image_origin = epoch;
+        true
     }
     pub fn set_loader_ticket(&mut self, ticket: u64) {
+        self.source_origin.clear_initial_flags();
         self.image_origin = ticket;
     }
 }
@@ -1496,6 +1514,49 @@ pub struct ExitPlace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_initial_epoch_keeps_high_bits_and_requires_boot_discriminator() {
+        use crate::initial_origin::{INIT_ACKED, InitialOrigin, SourceOrigin};
+        let mut table = Records::<u32>::new();
+        let label = add(&mut table).unwrap();
+        let record = table.get_mut(at(label)).unwrap();
+        let ticket = 91;
+        assert_eq!(record.initial_epoch(ticket), None);
+        assert!(!record.set_initial_epoch(ticket, 7));
+        record.source_origin = SourceOrigin::boot(3, false).unwrap();
+        assert!(record.set_initial_origin(ticket, InitialOrigin::new(3, 0).unwrap()));
+        assert_eq!(record.initial_epoch(ticket), Some(0));
+        assert!(!record.set_initial_epoch(ticket, 0));
+        let epoch = 0x9876_5432_1234_5678;
+        assert!(record.set_initial_epoch(ticket, epoch));
+        assert!(!record.set_initial_epoch(ticket, epoch + 1));
+        assert!(record.set_initial_origin(ticket, InitialOrigin::new(3, INIT_ACKED).unwrap()));
+        assert_eq!(record.initial_epoch(ticket), Some(epoch));
+        assert_eq!(record.initial_epoch(0), None);
+        assert_eq!(record.loader_ticket(ticket), None);
+        record.source_origin.capture_suspend(true);
+        record.source_origin.finish_suspend();
+        assert_eq!(record.initial_epoch(ticket), Some(epoch));
+        assert_eq!(
+            record
+                .source_origin
+                .inherited()
+                .initial_origin()
+                .unwrap()
+                .flags,
+            0
+        );
+        record.state = State::Zombie(End::Exited(0));
+        assert_eq!(record.initial_epoch(ticket), Some(epoch));
+        record.image += 1;
+        assert_eq!(record.initial_epoch(ticket), None);
+        record.set_loader_ticket(29);
+        assert_eq!(record.loader_ticket(ticket), Some(29));
+        assert_eq!(record.source_origin.initial_origin().unwrap().flags, 0);
+        record.source_origin = SourceOrigin::UNKNOWN;
+        assert_eq!(record.initial_origin(ticket), None);
+    }
 
     #[test]
     fn native_end_pending_revokes_lookup_without_releasing_namespace_or_first_reason() {

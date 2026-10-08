@@ -36,6 +36,7 @@ impl SourceOrigin {
     pub const SUSPENDED: u64 = 1 << 40;
     pub const WAS_RUNNABLE: u64 = 1 << 41;
     const RECOVERY: u64 = Self::SUSPENDED | Self::WAS_RUNNABLE;
+    const INITIAL_FLAGS: u64 = (FLAGS as u64) << 34;
 
     pub fn boot(artifact: u32, none: bool) -> Option<Self> {
         let artifact = artifact.checked_add(1)?;
@@ -50,10 +51,27 @@ impl SourceOrigin {
         ((raw >> 32 == 1 || raw >> 32 == 2) && raw as u32 != 0).then_some(Self(raw))
     }
     pub const fn wire(self) -> u64 {
-        self.0 & !Self::RECOVERY
+        self.0 & !(Self::RECOVERY | Self::INITIAL_FLAGS)
     }
     pub fn artifact(self) -> Option<u32> {
-        (self.wire() != 0).then(|| (self.0 as u32) - 1)
+        let wire = Self::from_wire(self.wire())?;
+        (wire.0 != 0).then(|| (wire.0 as u32) - 1)
+    }
+    pub fn initial_origin(self) -> Option<InitialOrigin> {
+        InitialOrigin::new(
+            self.artifact()?,
+            ((self.0 & Self::INITIAL_FLAGS) >> 34) as u32,
+        )
+    }
+    pub fn set_initial_origin(&mut self, origin: InitialOrigin) -> bool {
+        if self.artifact() != Some(origin.artifact) || origin.flags & !FLAGS != 0 {
+            return false;
+        }
+        self.0 = (self.0 & !Self::INITIAL_FLAGS) | (u64::from(origin.flags) << 34);
+        true
+    }
+    pub fn clear_initial_flags(&mut self) {
+        self.0 &= !Self::INITIAL_FLAGS;
     }
     pub fn none(self) -> bool {
         self.wire() >> 32 == 2
@@ -83,6 +101,46 @@ impl SourceOrigin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_initial_phases_preserve_source_and_recovery_without_child_ack() {
+        for none in [false, true] {
+            for flags in 0..=FLAGS {
+                let mut source = SourceOrigin::boot(17, none).unwrap();
+                let wire = source.wire();
+                source.capture_suspend(true);
+                assert!(source.set_initial_origin(InitialOrigin::new(17, flags).unwrap()));
+                assert_eq!(source.initial_origin(), InitialOrigin::new(17, flags));
+                assert_eq!(source.wire(), wire);
+                assert_eq!(source.none(), none);
+                assert!(source.recovery_was_runnable());
+                if flags != 0 {
+                    assert!(SourceOrigin::from_wire(source.0 & !SourceOrigin::RECOVERY).is_none());
+                }
+                let child = source.inherited();
+                assert_eq!(child.initial_origin(), InitialOrigin::new(17, 0));
+                assert!(!child.recovery_suspended());
+                source.finish_suspend();
+                assert_eq!(source.initial_origin(), InitialOrigin::new(17, flags));
+                let saved = source;
+                assert!(!source.set_initial_origin(InitialOrigin {
+                    artifact: 18,
+                    flags
+                }));
+                assert!(!source.set_initial_origin(InitialOrigin {
+                    artifact: 17,
+                    flags: 64
+                }));
+                assert_eq!(source, saved);
+            }
+        }
+        let mut unknown = SourceOrigin::UNKNOWN;
+        assert!(!unknown.set_initial_origin(InitialOrigin::new(0, INIT_ACKED).unwrap()));
+        assert!(
+            SourceOrigin(SourceOrigin::INITIAL_FLAGS)
+                .initial_origin()
+                .is_none()
+        );
+    }
     #[test]
     fn initial_flags_reject_unknown_and_retain_terminal_ack() {
         assert_eq!(

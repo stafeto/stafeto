@@ -561,11 +561,13 @@ impl Processes {
                         && proof.stage.ticket == ticket
                         && proof.stage.epoch == epoch;
                     if matches
+                        && self.tickets[index] == ticket
                         && self.records.get(index).is_some_and(|record| {
                             record.label == label
                                 && record.image == 1
                                 && record.state == crate::State::Loading
                                 && record.active_exec.is_none()
+                                && record.initial_epoch(ticket) == Some(0)
                         })
                     {
                         use posix_process_service::initial_resident::{CleanupOwner, SeedKey};
@@ -586,6 +588,10 @@ impl Processes {
                                 .records
                                 .get_mut(index)
                                 .expect("the exact initial record");
+                            assert!(record.set_initial_epoch(ticket, epoch));
+                            let mut origin = record.initial_origin(ticket).expect("initial source");
+                            origin.flags |= posix_process_service::initial_origin::STAGE_COMMITTED;
+                            assert!(record.set_initial_origin(ticket, origin));
                             record.active_exec = Some(candidate);
                             record.active_guard_label = proof.source_label;
                         }
