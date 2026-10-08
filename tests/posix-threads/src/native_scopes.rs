@@ -114,19 +114,31 @@ fn await_return(channel: &Handle<Channel>, round: usize) -> bool {
 #[inline(never)]
 pub(super) fn run() -> bool {
     let main = unsafe { threads::probe_native(ffi::pthread_self()) }.expect("main identity");
-    let original = sys::thread_info(&main).expect("main priority").base;
+    let original_info = sys::thread_info(&main).expect("main priority");
+    let original = original_info.base;
     if original < 3 || threads::set_level(original - 2).is_err() {
         return failed(730);
     }
     let main_info = sys::thread_info(&main).expect("lowered main priority");
-    let mut raised = 0;
+    let mut raised_info = main_info;
     abi::shared::probe_hold(|| {
-        raised = sys::thread_info(&main)
-            .expect("actual raising lock priority")
-            .priority;
+        raised_info = sys::thread_info(&main).expect("actual raising lock priority");
     });
+    let raised = raised_info.priority;
     let level = original - 1;
     if !(main_info.priority < level && level < raised) {
+        rt::println!(
+            "native-scopes: priority original={}/{}/{} main={}/{}/{} raised={}/{}/{}",
+            u32::from(original_info.base),
+            u32::from(original_info.priority),
+            original_info.policy.map_or(u32::MAX, |policy| policy as u32),
+            u32::from(main_info.base),
+            u32::from(main_info.priority),
+            main_info.policy.map_or(u32::MAX, |policy| policy as u32),
+            u32::from(raised_info.base),
+            u32::from(raised_info.priority),
+            raised_info.policy.map_or(u32::MAX, |policy| policy as u32)
+        );
         return failed(731);
     }
     // Both raising locks use the same process ceiling; the scan hook itself has no SVC.
