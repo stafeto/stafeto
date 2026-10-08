@@ -15,6 +15,7 @@ bench = false
 
 [features]
 jobs = []
+native-scopes-launcher = []
 auth-probe = ["files"]
 data-carrier-probe = ["files"]
 ipc-loss = ["files"]

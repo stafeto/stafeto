@@ -738,6 +738,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-relibc") as usize
     + cfg!(feature = "table-relibc-threads") as usize
     + cfg!(feature = "table-posix-procs") as usize
+    + cfg!(feature = "table-posix-native-vz") as usize
     + cfg!(feature = "table-posix-files") as usize
     + cfg!(feature = "table-loader-channels") as usize
     + cfg!(feature = "table-posix-poll") as usize
@@ -779,6 +780,7 @@ const _: () = assert!(
     feature = "table-relibc",
     feature = "table-relibc-threads",
     feature = "table-posix-procs",
+    feature = "table-posix-native-vz",
     feature = "table-posix-files",
     feature = "table-loader-channels",
     feature = "table-posix-poll",
@@ -816,6 +818,8 @@ pub const TABLE: &[Record] = ramfs::POSIX_POLL_TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_PTY_TABLE;
 #[cfg(feature = "table-posix-procs")]
 pub const TABLE: &[Record] = ramfs::POSIX_PROCS_TABLE;
+#[cfg(feature = "table-posix-native-vz")]
+pub const TABLE: &[Record] = vz::POSIX_NATIVE_TABLE;
 #[cfg(feature = "table-posix-steps")]
 pub const TABLE: &[Record] = ramfs::POSIX_STEPS_TABLE;
 #[cfg(feature = "table-relibc-threads")]
@@ -980,6 +984,18 @@ mod tests {
     /// Why `check` refuses `table`, as init prints it.
     fn refused(table: &[Record]) -> String {
         check(table).expect_err("the table is refused").to_string()
+    }
+
+    #[test]
+    fn native_vz_keeps_the_existing_paid_pool_and_hardware_owners() {
+        let table = vz::POSIX_NATIVE_TABLE;
+        check(table).unwrap();
+        assert_eq!(table.len(), ramfs::POSIX_PROCS_TABLE.len() + 1);
+        assert_eq!(table[0], vz::CONSOLE);
+        assert_eq!(&table[1..6], &ramfs::POSIX_PROCS_TABLE[..5]);
+        assert_eq!(table[6], entropy::RNG_VZ);
+        assert_eq!(table[7], ramfs::POSIX_PROCS_TABLE[6]);
+        assert_eq!(table[2].quota, ramfs::POSIX_PROCS_TABLE[1].quota);
     }
 
     #[test]
@@ -1550,6 +1566,7 @@ mod tests {
             ramfs::POSIX_POLL_TABLE,
             ramfs::POSIX_PTY_TABLE,
             vz::POSIX_ABI_TABLE,
+            vz::POSIX_NATIVE_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,
             vz::POSIX_TTY_TABLE,
             vz::POSIX_DIALOG_TABLE,
@@ -1760,6 +1777,7 @@ mod tests {
             ramfs::OS_TEST_TABLE,
             ramfs::POSIX_PTY_TABLE,
             vz::POSIX_ABI_TABLE,
+            vz::POSIX_NATIVE_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
             vz::RTBENCH_POSIX_TABLE,

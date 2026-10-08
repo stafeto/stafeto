@@ -360,6 +360,8 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
+    "boot-posix-native-scopes.img",
+    "boot-posix-native-scopes-vz.img",
     "boot-posix-jobs.img",
     "boot-posix-steps.img",
     "boot-posix-tty.img",
@@ -412,6 +414,16 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ),
         ],
         "boot-ash-dialog.img" => dialog(),
+        "boot-posix-native-scopes.img" | "boot-posix-native-scopes-vz.img" => {
+            let mut files = procs();
+            files.push(file(
+                "/bin/native-scopes",
+                0o755,
+                ROOT,
+                "posix-thread-probe",
+            ));
+            files
+        }
         "boot-posix-procs.img" | "boot-posix-jobs.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![

@@ -56,6 +56,8 @@ mod long;
 #[cfg(not(feature = "cancel-input"))]
 mod mutex;
 #[cfg(not(feature = "cancel-input"))]
+mod native_mode;
+#[cfg(not(feature = "cancel-input"))]
 mod native_scopes;
 #[cfg(not(feature = "cancel-input"))]
 mod once;
@@ -348,9 +350,6 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     if !one_thread::run() {
         return false;
     }
-    if !native_scopes::run() {
-        return false;
-    }
     if !priorities() {
         return false;
     }
@@ -527,11 +526,69 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     unsafe { ffi::pthread_exit(VALUE as *mut c_void) }
 }
 
+#[cfg(not(feature = "cancel-input"))]
+#[inline(never)]
+fn native_only(expected_parent: u32) -> c_int {
+    let parent = abi::process::getppid();
+    if parent <= proto_process::INIT_PID as i32 || parent as u32 != expected_parent {
+        return 10;
+    }
+    let block = posix_thread::block();
+    if block.is_null() || posix_thread::thread_pointer() == 0 {
+        return 11;
+    }
+    // SAFETY: startup installed this caller's TCB before entering main.
+    let block = unsafe { &*block };
+    if block.thread_id == 0
+        || block.flags.load(Ordering::SeqCst) & posix_thread::flag::SIGNALS_READY == 0
+        || block.channel.load(Ordering::SeqCst) == 0
+        || block.timer.load(Ordering::SeqCst) == 0
+        || !sys::is_current_thread(&threads::main_handle()).unwrap_or(false)
+        || !abi::fork::probe_resume_read_exec()
+    {
+        return 12;
+    }
+    PROCESS.store(abi::allocation::process().raw().0, Ordering::Release);
+    rt::println!("native-scopes: loader-ready parent={parent}");
+    if !native_scopes::run() {
+        return 13;
+    }
+    rt::println!("native-scopes: survivor and join ok");
+    0
+}
+
 /// The probe's C main, which relibc calls once posix-crt started the
 /// process (files, clocks, heap, the process service) and relibc the
 /// thread.
 #[unsafe(no_mangle)]
-extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
+extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
+    #[cfg(not(feature = "cancel-input"))]
+    if argc > 1 && !argv.is_null() {
+        // SAFETY: libc supplies argc live NUL-terminated argument strings.
+        let argument = unsafe { *argv.add(1) };
+        if !argument.is_null()
+            && unsafe { core::ffi::CStr::from_ptr(argument) }.to_bytes() == native_mode::ARGUMENT
+        {
+            if argc != 2 {
+                return 14;
+            }
+            unsafe extern "C" {
+                fn getenv(name: *const c_char) -> *mut c_char;
+            }
+            // SAFETY: the test environment is read before any worker starts.
+            let value = unsafe { getenv(c"NATIVE_SCOPES_PARENT".as_ptr()) };
+            if value.is_null() {
+                return 15;
+            }
+            // SAFETY: getenv returned a live NUL-terminated environment value.
+            let Some(parent) =
+                native_mode::parent_pid(unsafe { core::ffi::CStr::from_ptr(value).to_bytes() })
+            else {
+                return 16;
+            };
+            return native_only(parent);
+        }
+    }
     #[cfg(not(feature = "cancel-input"))]
     let parent = posix_crt::parent();
     #[cfg(not(feature = "cancel-input"))]

@@ -687,6 +687,18 @@ pub(crate) fn pipes_clone(pipes: rt::abi::Handle, ends: &[u32]) -> Result<Handle
         .map_err(clone_errno)
 }
 
+/// Whether this caller has the executable resume region required by fork.
+#[cfg(feature = "thread-probe")]
+pub fn probe_resume_read_exec() -> bool {
+    let at = resume as *const () as u64;
+    crate::allocation::regions(|map| {
+        map.iter().any(|r| {
+            r.access == Access::ReadExec
+                && (r.address as u64..r.address as u64 + r.pages as u64 * 4096).contains(&at)
+        })
+    })
+}
+
 /// The function the next fork runs in the parent once the loader took the
 /// first message of Regions (a probe of a parent that dies there), 0 for
 /// none.

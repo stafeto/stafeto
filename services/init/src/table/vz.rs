@@ -135,6 +135,18 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     super::ramfs::POSIX_ABI_TABLE[6],
 ];
 
+/// The paid process pool and native loader fixture on VZ's PCI devices.
+pub const POSIX_NATIVE_TABLE: &[Record] = &[
+    CONSOLE,
+    super::ramfs::POSIX_PROCS_TABLE[0],
+    super::ramfs::POSIX_PROCS_TABLE[1],
+    super::ramfs::POSIX_PROCS_TABLE[2],
+    super::ramfs::POSIX_PROCS_TABLE[3],
+    super::ramfs::POSIX_PROCS_TABLE[4],
+    super::entropy::RNG_VZ,
+    super::ramfs::POSIX_PROCS_TABLE[6],
+];
+
 /// The RAM file service and a probe that reads the console, as
 /// `ramfs::BUSYBOX_DIALOG_TABLE` on QEMU.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[

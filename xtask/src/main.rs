@@ -16,6 +16,7 @@ mod entropy;
 mod image;
 mod jobs;
 mod measure;
+mod native_scopes;
 mod ostest;
 mod qemu;
 mod ring;
@@ -557,6 +558,35 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
+const POSIX_NATIVE_SCOPE_PROGRAMS: [ImageProgram; 11] = {
+    let mut programs = [POSIX_PROCS_PROGRAMS[0]; 11];
+    let mut index = 0;
+    while index < POSIX_PROCS_PROGRAMS.len() {
+        programs[index] = POSIX_PROCS_PROGRAMS[index];
+        index += 1;
+    }
+    programs[5].3 = &["pending-open", "native-scopes-launcher"];
+    programs[10] = (
+        "posix-thread-probe",
+        "posix-thread-probe",
+        POSIX_STACK_SIZE,
+        &[],
+    );
+    programs
+};
+
+const POSIX_VZ_NATIVE_SCOPE_PROGRAMS: [ImageProgram; 12] = {
+    let mut programs = [POSIX_NATIVE_SCOPE_PROGRAMS[0]; 12];
+    let mut index = 0;
+    while index < POSIX_NATIVE_SCOPE_PROGRAMS.len() {
+        programs[index] = POSIX_NATIVE_SCOPE_PROGRAMS[index];
+        index += 1;
+    }
+    programs[0].3 = &["table-posix-native-vz"];
+    programs[11] = ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]);
+    programs
+};
+
 /// The probe of the longest step of the process service (xtask
 /// process-steps): the probe in its steps mode, and the process service
 /// that prints each new longest step.
@@ -1936,6 +1966,12 @@ fn posix_orphans() -> Result<(), String> {
 }
 
 fn posix_thread_probe(vz: bool) -> Result<(), String> {
+    native_scopes::both_images(vz, stock_thread_probe, native_scope_probe)?;
+    println!("Rust POSIX pthread lifecycle and native survivor guest probes passed");
+    Ok(())
+}
+
+fn stock_thread_probe(vz: bool) -> Result<(), String> {
     let image = if vz {
         build_boot_image(
             "boot-posix-threads-vz.img",
@@ -1973,6 +2009,26 @@ fn posix_thread_probe(vz: bool) -> Result<(), String> {
     }
     println!("Rust POSIX pthread lifecycle guest probe passed");
     Ok(())
+}
+
+fn native_scope_probe(vz: bool) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let (name, programs): (&str, &[ImageProgram]) = if vz {
+        (
+            "boot-posix-native-scopes-vz.img",
+            &POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
+        )
+    } else {
+        ("boot-posix-native-scopes.img", &POSIX_NATIVE_SCOPE_PROGRAMS)
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let (cmd, kernel) = probe_command(&image, vz)?;
+    const ENDED: &str = "init: posix-procs ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    let checked = qemu::expect_stopped_on(&output, ENDED)
+        .and_then(|()| native_scopes::check_markers(&output.lines));
+    if vz { vz::stop_hint(checked) } else { checked }
 }
 
 fn posix_cancel_input_probe(vz: bool) -> Result<(), String> {
@@ -6153,6 +6209,49 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_images_keep_the_loader_pool_and_both_platforms() {
+        use super::*;
+        assert_eq!(POSIX_NATIVE_SCOPE_PROGRAMS.len(), 11);
+        assert_eq!(POSIX_VZ_NATIVE_SCOPE_PROGRAMS.len(), 12);
+        for (index, expected) in POSIX_PROCS_PROGRAMS.iter().enumerate() {
+            if index != 5 {
+                assert_eq!(POSIX_NATIVE_SCOPE_PROGRAMS[index], *expected);
+            }
+        }
+        assert_eq!(
+            POSIX_NATIVE_SCOPE_PROGRAMS[5].3,
+            &["pending-open", "native-scopes-launcher"]
+        );
+        assert_eq!(
+            POSIX_VZ_NATIVE_SCOPE_PROGRAMS[0].3,
+            &["table-posix-native-vz"]
+        );
+        assert_eq!(
+            &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[1..11],
+            &POSIX_NATIVE_SCOPE_PROGRAMS[1..]
+        );
+        assert_eq!(
+            POSIX_VZ_NATIVE_SCOPE_PROGRAMS[11],
+            ("virtio-console", "virtio-console", UART_STACK_SIZE, &[][..])
+        );
+        for name in [
+            "boot-posix-native-scopes.img",
+            "boot-posix-native-scopes-vz.img",
+        ] {
+            let files = rootfs::files_of(name);
+            let native = files
+                .iter()
+                .find(|file| file.path == "/bin/native-scopes")
+                .unwrap();
+            assert_eq!(native.mode, 0o755);
+            assert_eq!(
+                native.source.as_ref().and_then(rootfs::Source::program),
+                Some("posix-thread-probe")
+            );
+        }
+    }
+
     #[test]
     fn full_watch_case_survives_a_longer_single_item_maximum() {
         let mut lines = Vec::new();

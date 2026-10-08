@@ -3770,7 +3770,30 @@ static int loader_channels(void) {
     return 0;
 }
 
+#if NATIVE_SCOPES_LAUNCHER
+__attribute__((noinline)) static int native_scopes_supervisor(void) {
+    pid_t parent = getpid();
+    if (parent <= 0) return 101;
+    char observation[64];
+    int len = snprintf(observation, sizeof observation, "NATIVE_SCOPES_PARENT=%u", (unsigned)parent);
+    if (len < 0 || (size_t)len >= sizeof observation) return 102;
+    char *argv[] = {"posix-thread-probe", "native-scope-only", NULL};
+    char *envp[] = {observation, NULL};
+    pid_t child = -1;
+    int error = posix_spawn(&child, "/bin/native-scopes", NULL, NULL, argv, envp);
+    if (error != 0 || child <= 0) return 103;
+    int status = 0;
+    pid_t waited = waitpid(child, &status, 0);
+    if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 104;
+    printf("native-scopes-supervisor: ok parent=%u\n", (unsigned)parent);
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
+#if NATIVE_SCOPES_LAUNCHER
+    return native_scopes_supervisor();
+#endif
     argc_seen = argc;
     argv_seen = argv;
     if (argc > 1) return role(argv[1]);
