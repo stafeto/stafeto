@@ -20,7 +20,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from step 5e (`m5e-pipes`).
+Numbers below are from the head of the E1 cleanup (`cleanup-1008`, db64046); the sections on pipes and random numbers keep the figures of their own steps.
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -44,7 +44,11 @@ is never writable and executable at once, and long operations run in
 bounded portions. Device interrupts reach drivers as notifications, and
 a driver gets contiguous, optionally uncached memory for DMA. The kernel
 drives no device with DMA. A fault ends only its own process. The kernel
-image is 158,784 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
+image is 162,880 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
+The longest stretch the kernel runs without taking an interrupt (term B of the
+kernel) is 16,738 ticks under `-icount`, below the limit of 18,000 that
+`xtask` enforces; teardown of a session and its message buffers runs in
+portions of 32 entries.
 
 **User space and services.** `init` starts services from a table in
 dependency order, hands out sessions by name, restarts a service that
@@ -143,7 +147,7 @@ operations in two steps that a signal cancels (`SA_RESTART` continues them),
 cross `fork`, `posix_spawn` (`adddup2`) and `exec`, and the service sees a
 dead process as an end that closes (the reader gets end of file). `/dev/null`
 is a null device of the RAM service. Every step of the service stays below
-the kernel's term B of 20,536 ticks (`cargo xtask process-steps`). On HVF
+the services' budget of 20,410 ticks (`cargo xtask process-steps`). On HVF
 (10 minutes, p50) a byte goes through two pipes to another process and back
 in 5.5 us (S19), 1 MiB goes through a pipe at 250 MB/s in writes of 512
 bytes and 432 MB/s in writes of 4 KiB (S20), and `ls /etc | cat` as two
@@ -168,20 +172,26 @@ the services and the limits.
 BusyBox included; its platform is the layer's `stafeto_*` functions.
 os-test's io, malloc, process and signal suites, `basic/spawn`, `basic/unistd`
 `exec*` and the `basic` tests that call `fork` run on it in `ci` from files,
-one boot a suite. The baseline before the terminal extension had 121
-passes, 73 failures and 11 unsupported cases out of 205; `ci` fails when
-a test that passed stops passing. The PTY and termios suites now exercise
+one boot a suite. The current run of 242 tests gives 185 PASS, 49 FAIL,
+7 UNSUPPORTED and 1 UNKNOWN (UNSUPPORTED is a test of an option that
+`unistd.h` does not claim, or a test that exits by itself without passing;
+UNKNOWN is a test whose only expectations are marked unknown); `ci` fails
+when a test that passed stops passing. The PTY and termios suites exercise
 the terminal APIs, and readiness tests cover all four waiting interfaces.
-The remaining file and signal work includes `mkstemp`, `access` and
-`sigaltstack`. relibc
+`cargo xtask coverage` counts 754 of the 1,035 required XSH interfaces
+(72.9 %) and 124 of 206 optional ones (60.2 %); functions that only return
+`ENOSYS` (60 required, 20 optional) do not count. The `unistd.h` macros and
+`sysconf` agree and claim only what exists. Most of the 49 failures are
+`fcntl` open-file-description locks, which answer `ENOSYS`. relibc
 builds at its own level 3: user-space programs have no size limit, only
 the kernel has one. Details are in
 [docs/status.md](docs/status.md).
 
-**Tests.** The kernel test image runs 182 tests (197 under `-icount`),
-the EL0 test `init` runs 228 and `kcore` has 407 host tests; `cargo xtask
+**Tests.** The kernel test image runs 192 tests (208 under `-icount`),
+the EL0 test `init` runs 229 and `kcore` has 416 host tests; `cargo xtask
 ci` runs them with the guest probes, and `cargo xtask hvf` runs them on
-Apple silicon.
+Apple silicon. A full `cargo xtask ci` takes 3 min 34 s on a warm cache
+(it took 736 s before the E1 cleanup).
 
 **Known limits.**
 
@@ -297,7 +307,8 @@ Bounded kernel paths and their costs:
 | POSIX: pipes | a pipe service, `pipe`, ends across `fork`, `posix_spawn` and `exec`, `SA_RESTART` and `SIGCHLD` in the shell, `setpgid` of a child, `/dev/null`; `ash` runs `ls \| cat`; rtbench rows of pipes | ✅ [#80](https://github.com/stafeto/stafeto/pull/80) |
 | POSIX: terminal | a terminal service with `termios`, pseudo-terminals, job control, `poll` and `select`, Ctrl-C to the foreground group, the missing `ash` built-ins | ✅ [#83](https://github.com/stafeto/stafeto/pull/83) |
 | POSIX: random numbers | a Virtio entropy driver and an entropy service, a ChaCha20 generator in the layer, `getentropy`, `getrandom`, `arc4random`, `/dev/random` and `/dev/urandom`, names of `mkstemp` from the generator; rtbench rows of the generator | ✅ [#82](https://github.com/stafeto/stafeto/pull/82) |
-| POSIX: files with writing | the RAM file service creates files and directories, `/tmp`, `fcntl` locks, FIFOs | ⬜ |
+| POSIX: files with writing | the RAM file service creates files and directories, `/tmp`, `fcntl` locks, FIFOs | 🚧 parts [#86](https://github.com/stafeto/stafeto/pull/86), [#87](https://github.com/stafeto/stafeto/pull/87), [#88](https://github.com/stafeto/stafeto/pull/88) merged; the rest in four parts (5i-5 to 5i-8) |
+| Cleanup E1 | honest os-test and coverage counts, the services' budget of 20,410 ticks and the kernel's of 18,000 in `xtask`, a faster `ci`, clone counting in O(1), the IPC loss probe removed, erratum 843419 check, terminal `Watch` of at most 16 elements | 🚧 on `cleanup-1008`, ready to merge |
 | POSIX: conformance | the full os-test suite and Open POSIX in `ci`, honest headers and `sysconf`, `cargo xtask coverage` checking the standard's interface list against the C library at every step | ⬜ |
 | POSIX: timers and scheduling | POSIX timers, CPU time, `SCHED_FIFO` and `SCHED_RR`, queued signals | ⬜ |
 | POSIX: shared memory | file `mmap`, `mprotect`, `shm_open`, named semaphores | ⬜ |

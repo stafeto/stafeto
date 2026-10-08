@@ -3,7 +3,7 @@
 The README gives the short status. This page keeps the details that are
 useful when working on the code: what the kernel offers, what the Rust
 POSIX layer covers, and which commands check each piece. It describes
-`main` at a2eb60a (step 5c, `posix_spawn` and `exec` from files) with step 5d (`fork`) and step 5e (pipes) on top.
+`main` at a2eb60a (step 5c, `posix_spawn` and `exec` from files) with step 5d (`fork`) and step 5e (pipes) on top. The cleanup branch `cleanup-1008` (db64046) changes the counts: os-test 185 PASS, 49 FAIL, 7 UNSUPPORTED, 1 UNKNOWN of 242; the services' budget 20,410 ticks, the kernel's longest path 16,738 of 18,000; the terminal's `Watch` takes at most 16 elements and `poll` splits larger sets.
 
 ## Kernel
 
