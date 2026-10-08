@@ -12,11 +12,19 @@ pub(super) fn image_counts(image: &Handle<Channel>) -> Result<[u32; 4], Status> 
     let reply = sys::send(image, &Header::new(0xfffa, proto_fs::VERSION).bytes())
         .map_err(Status::Kernel)?;
     if reply.len != 20 || !reply.handles.is_empty() {
+        rt::println!(
+            "posix-files: image counts reply len {} caps {} word0 {}",
+            reply.len,
+            reply.handles.len(),
+            reply.words[0]
+        );
         return Err(Status::BadSize);
     }
     let bytes = rt::abi::inline_bytes(&reply.words);
     let mut body = Reader::new(&bytes[..reply.len]);
-    if body.u32()? != 0 {
+    let code = body.u32()?;
+    if code != 0 {
+        rt::println!("posix-files: image counts status {}", code);
         return Err(Status::BadSize);
     }
     let mut counts = [0; 4];
@@ -150,21 +158,40 @@ pub(super) fn capture(pending: &Handle<Channel>) -> Result<CapturedImages, Statu
 pub(super) fn released(captured: &CapturedImages) -> Result<(), Status> {
     let images = &captured.handles;
     let mut after = [0; 4];
-    for _ in 0..200 {
+    for visit in 0..200 {
         after = image_counts(&images[0])?;
+        if visit == 0 {
+            rt::println!(
+                "posix-files: image release first counts {:?}, expected descriptions {}",
+                after,
+                captured.descriptions_after_release
+            );
+        }
         if after == [0, 0, captured.descriptions_after_release, 0] {
             break;
         }
         // SAFETY: the existing C helper takes no pointers and performs a timed wait.
-        if unsafe { super::loader_abort::sleep_for_cleanup() } != 0 {
+        let slept = unsafe { super::loader_abort::sleep_for_cleanup() };
+        if slept != 0 {
+            rt::println!("posix-files: image release sleep result {}", slept);
             return Err(Status::BadSize);
         }
     }
-    if after != [0, 0, captured.descriptions_after_release, 0] || image_counts(&images[1])? != after
-    {
+    if after != [0, 0, captured.descriptions_after_release, 0] {
+        rt::println!("posix-files: image release unsettled counts {:?}", after);
+        return Err(Status::BadSize);
+    }
+    let duplicate = image_counts(&images[1])?;
+    if duplicate != after {
+        rt::println!(
+            "posix-files: image release duplicate counts {:?}, original {:?}",
+            duplicate,
+            after
+        );
         return Err(Status::BadSize);
     }
     if elf(&images[0]).is_ok() {
+        rt::println!("posix-files: image release still readable after counts settled");
         return Err(Status::BadSize);
     }
     rt::println!("posix-files: aborted held image released {:?}", after);
