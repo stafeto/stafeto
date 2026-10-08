@@ -10,9 +10,9 @@
 //!   of a program stays in a scope of the layer and gets the signal.
 //! - R2: two native threads; the first becomes the router and ends through
 //!   `rt::sys::thread_exit`; the second gets the signal.
-//! - R3: the main thread holds its entries deferred while the signal comes,
-//!   then calls pthread_exit; the signal waited on the page and reaches the
-//!   native thread after the handoff.
+//! - R3: the main thread holds its entries deferred and, while it is leaving
+//!   after its last routing, the signal comes; the signal waits on the page
+//!   and reaches the native thread after the handoff.
 //! - R4: a thread B marked itself as leaving and is held there; the main
 //!   thread leaves meanwhile; a third thread C becomes the router and gets
 //!   the signal.
@@ -186,14 +186,28 @@ extern "C" fn second(_: u64) -> ! {
     end_child(13)
 }
 
-/// R4: the hook of `leaving` after a thread marked itself as leaving.
+/// The hook of `leaving` after a thread marked itself as leaving. R3: the
+/// main thread says the signal may be sent now, when it routed its last and
+/// is about to name the next router, and goes on once the signal waits on the
+/// page. R4: the thread B is held until the third thread got the signal.
 fn marked(own: u64) {
-    if own == B_NUMBER.load(Ordering::SeqCst) {
-        MARKED.store(1, Ordering::SeqCst);
-        let limit = now() + 3_000_000_000;
-        while RELEASE.load(Ordering::SeqCst) == 0 && now() < limit {
-            let _ = sys::yield_now();
+    match VARIANT.load(Ordering::SeqCst) {
+        3 if own == 1 => {
+            ready();
+            let limit = now() + 2_000_000_000;
+            while abi::process::page().pending.load(Ordering::Acquire) == 0 && now() < limit {
+                let _ = sys::yield_now();
+            }
+            DEADLINE.store(now() + 500_000_000, Ordering::SeqCst);
         }
+        4 if own == B_NUMBER.load(Ordering::SeqCst) => {
+            MARKED.store(1, Ordering::SeqCst);
+            let limit = now() + 3_000_000_000;
+            while RELEASE.load(Ordering::SeqCst) == 0 && now() < limit {
+                let _ = sys::yield_now();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -214,9 +228,7 @@ unsafe extern "C" fn third(_: *mut c_void) -> *mut c_void {
         end_child(12);
     }
     ready();
-    let limit = now() + 500_000_000;
     let arrived = sleeper.until(500, || ARRIVED.load(Ordering::SeqCst) != 0);
-    let _ = limit;
     RELEASE.store(1, Ordering::SeqCst);
     end_child(if arrived { 0 } else { 24 })
 }
@@ -238,15 +250,11 @@ fn child(variant: usize, fd: c_int) -> ! {
             }
             if variant == 3 {
                 // The entries of this thread stay deferred for good, so
-                // the signal waits on the page.
+                // nothing routes the signal but the thread that is named
+                // the router; `marked` sends the signal while the role
+                // passes.
                 core::mem::forget(rt::upcall::defer_entries().expect("router probe deferral"));
-                ready();
-                if !sleeper.until(1000, || {
-                    abi::process::page().pending.load(Ordering::Acquire) != 0
-                }) {
-                    end_child(13);
-                }
-                DEADLINE.store(now() + 500_000_000, Ordering::SeqCst);
+                abi::relibc::probe_marked_hook(Some(marked));
             }
         }
         2 => {
