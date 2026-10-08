@@ -602,7 +602,29 @@ mod tests {
                 closing: false,
                 retained_failure: transport.failed_original_outcome(phase != 3),
             };
-            assert!(failed_candidate_allows(&fds, 81, 7, context));
+            let ordinary_allowed = failed_candidate_allows(&fds, 81, 7, context);
+            // This is the same early decision called before production request dispatch.
+            assert!(!crate::authority::preparation_rejects(
+                proto_fs::Method::OpenStart as u16,
+                fds.binding_preparation.is_some(),
+                false,
+                ordinary_allowed,
+            ));
+            for current in [0, 8, proto_process::GENERATION_DEAD | 7] {
+                assert!(crate::authority::preparation_rejects(
+                    proto_fs::Method::OpenStart as u16,
+                    fds.binding_preparation.is_some(),
+                    false,
+                    failed_candidate_allows(&fds, 81, current, context),
+                ));
+            }
+            assert!(crate::authority::preparation_rejects(
+                proto_fs::Method::OpenStart as u16,
+                fds.binding_preparation.is_some(),
+                false,
+                failed_candidate_allows(&fds, 82, 7, context),
+            ));
+            assert!(ordinary_allowed);
             let mut bytes = [0; 3];
             assert_eq!(ram.read(&mut fds, fd, &mut bytes), Ok(3));
             assert_eq!(&bytes, b"sta");
@@ -744,6 +766,12 @@ mod tests {
             assert_eq!(binding_reply(&fds), Some(proto_fs::PERMISSION));
             assert!(fds.binding.valid(7));
             assert!(!failed_candidate_allows(&fds, 81, 7, context));
+            assert!(!crate::authority::preparation_rejects(
+                proto_fs::Method::OpenStart as u16,
+                fds.binding_preparation.is_some(),
+                false,
+                false,
+            ));
             assert!(old_cap.is_some());
             Owned::close_copy(&mut old_cap);
             assert!(ram.release_step(&mut fds));

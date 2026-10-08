@@ -54,6 +54,71 @@ pub fn failed_candidate_allows(
             .is_some_and(|code| code != 0 && candidate.retained_failure == Some(code))
 }
 
+/// Ordinary work retains its own downstream authority and ownership checks.
+pub fn failed_candidate_method(method: u16) -> bool {
+    use proto_fs::Method;
+    matches!(
+        Method::from_number(method),
+        Some(
+            Method::Open
+                | Method::Read
+                | Method::Write
+                | Method::Seek
+                | Method::Stat
+                | Method::ReadDir
+                | Method::Lookup
+                | Method::SeekFrom
+                | Method::InfoFd
+                | Method::InfoPath
+                | Method::ReadDirFd
+                | Method::ReadAt
+                | Method::Clone
+                | Method::WriteAt
+                | Method::ResolveStart
+                | Method::ResolveStep
+                | Method::ResolveSecond
+                | Method::OpenStart
+                | Method::OpenPrepare
+                | Method::OpenCommit
+                | Method::OpenFinish
+                | Method::OpenQuery
+                | Method::CaptureDescription
+                | Method::CloneExact
+                | Method::DataStart
+                | Method::DataFeed
+                | Method::DataStep
+                | Method::DataCommit
+                | Method::DataQuery
+                | Method::DataReadResult
+        )
+    )
+}
+
+/// The request boundary blocks preparations before any ordinary dispatch effect.
+pub fn preparation_rejects(
+    method: u16,
+    preparation: bool,
+    can_replace_refresh: bool,
+    failed_candidate: bool,
+) -> bool {
+    use proto_fs::Method;
+    preparation
+        && !(method == Method::Bind as u16 && can_replace_refresh)
+        && !matches!(
+            Method::from_number(method),
+            Some(
+                Method::Close
+                    | Method::CloseExact
+                    | Method::ResolveCancel
+                    | Method::OpenCancel
+                    | Method::DataCancel
+                    | Method::DataAck
+                    | Method::VerifySession
+            )
+        )
+        && !(failed_candidate && failed_candidate_method(method))
+}
+
 /// A single paid receive advances one authentication phase.
 pub type Admission = AdmissionState<()>;
 
@@ -641,5 +706,55 @@ mod retained_source_tests {
             retained_source_phase(19, 19, false, None, 7, 7),
             Ok(RetainedSourcePhase::Ready)
         );
+    }
+}
+
+#[cfg(test)]
+mod preparation_boundary_tests {
+    use super::{failed_candidate_method, preparation_rejects};
+    use proto_fs::Method;
+
+    #[test]
+    fn request_preparation_boundary_requires_exact_ordinary_recovery() {
+        // The real Files fixture retries OpenStart while the refusal debt is paid.
+        assert!(!preparation_rejects(
+            Method::OpenStart as u16,
+            true,
+            false,
+            true
+        ));
+        let ordinary = [
+            1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15, 16, 21, 22, 24, 26, 27, 28, 29, 31, 32, 34,
+            35, 36, 37, 38, 39, 42,
+        ];
+        let cleanup = [6, 18, 23, 30, 33, 40, 41];
+        for method in 0..=u16::MAX {
+            assert_eq!(failed_candidate_method(method), ordinary.contains(&method));
+            assert!(!preparation_rejects(method, false, false, false));
+            assert_eq!(
+                preparation_rejects(method, true, false, false),
+                !cleanup.contains(&method)
+            );
+            assert_eq!(
+                preparation_rejects(method, true, false, true),
+                !(ordinary.contains(&method) || cleanup.contains(&method))
+            );
+        }
+        assert!(!preparation_rejects(
+            Method::OpenStart as u16,
+            true,
+            false,
+            true
+        ));
+        assert!(preparation_rejects(Method::Bind as u16, true, false, true));
+        assert!(!preparation_rejects(Method::Bind as u16, true, true, false));
+        for method in [
+            Method::BindPending,
+            Method::FinishBinding,
+            Method::OpenExec,
+            Method::ReadInto,
+        ] {
+            assert!(preparation_rejects(method as u16, true, true, true));
+        }
     }
 }

@@ -2041,21 +2041,27 @@ impl Service<0> for Fs {
         if r.method() == Method::FinishBinding as u16 {
             return self.finish_binding(&mut s.data, r);
         }
-        if s.data.binding_preparation.is_some()
-            && !(r.method() == Method::Bind as u16 && self.can_replace_refresh(&s.data))
-            && !matches!(
-                Method::from_number(r.method()),
-                Some(
-                    Method::Close
-                        | Method::CloseExact
-                        | Method::ResolveCancel
-                        | Method::OpenCancel
-                        | Method::DataCancel
-                        | Method::DataAck
-                        | Method::VerifySession
-                )
-            )
-        {
+        let failed_candidate = s.data.binding_preparation.is_some()
+            && ramfs::authority::failed_candidate_method(r.method())
+            && Self::failed_candidate_allowed(self.identities, &s.data, r.label());
+        let preparation_rejected = ramfs::authority::preparation_rejects(
+            r.method(),
+            s.data.binding_preparation.is_some(),
+            self.can_replace_refresh(&s.data),
+            failed_candidate,
+        );
+        #[cfg(feature = "steps")]
+        if s.data.binding_preparation.is_some() {
+            rt::service::step_detail(Self::preparation_detail(
+                self.identities,
+                &s.data,
+                r.label(),
+                r.method(),
+                failed_candidate,
+                preparation_rejected,
+            ));
+        }
+        if preparation_rejected {
             return status(proto_fs::AUTHENTICATING);
         }
         if r.method() == Method::Bind as u16 {
@@ -3185,6 +3191,106 @@ impl Fs {
     fn authenticate(&mut self, fds: &mut Fds, label: u64) -> Result<(), u32> {
         Self::authenticate_fields(&mut self.ram, self.identities, fds, label)
     }
+    /// Borrow the paid old authority without advancing admission or refresh.
+    fn failed_candidate_allowed(
+        identities: &[Option<IdentityChannel>],
+        fds: &Fds,
+        label: u64,
+    ) -> bool {
+        let Some(identity) = identities
+            .get(fds.authority_index as usize)
+            .and_then(Option::as_ref)
+        else {
+            return false;
+        };
+        let Admission::Transport(transport) = &identity.admission else {
+            return false;
+        };
+        ramfs::authority::failed_candidate_allows(
+            fds,
+            label,
+            identity
+                .original
+                .snapshot_ref()
+                .map_or(0, |who| generation(who.index as usize)),
+            ramfs::authority::FailedCandidate {
+                label: identity.label,
+                original: &identity.original,
+                original_root: identity.original_root,
+                purpose: identity.purpose,
+                closing: identity.closing,
+                retained_failure: transport.failed_original_outcome(identity.previous.is_some()),
+            },
+        )
+    }
+
+    /// Measurement-only scalar snapshot; visibility follows the existing maxima.
+    #[cfg(feature = "steps")]
+    fn preparation_detail(
+        identities: &[Option<IdentityChannel>],
+        fds: &Fds,
+        label: u64,
+        method: u16,
+        allowed: bool,
+        rejected: bool,
+    ) -> u64 {
+        let binding = match fds.binding {
+            Binding::Unbound => 0,
+            Binding::Boot => 1,
+            Binding::Active(_) => 2,
+            Binding::Pending(_) => 3,
+            Binding::Handoff(_) => 4,
+            Binding::Inherited(_) => 5,
+            Binding::Cleanup => 6,
+        };
+        let mut bits = (0x5d_u64 << 56)
+            | (u64::from(method) << 40)
+            | (binding << 8)
+            | u64::from(allowed)
+            | (u64::from(rejected) << 1)
+            | (u64::from(fds.binding_preparation.is_some()) << 2)
+            | (u64::from(fds.closing) << 3)
+            | (u64::from(fds.binding_outcome.is_some_and(|c| c != 0)) << 4)
+            | (u64::from(ramfs::authority::failed_candidate_method(method)) << 5);
+        if let Some(identity) = identities
+            .get(fds.authority_index as usize)
+            .and_then(Option::as_ref)
+        {
+            bits |=
+                (1 << 12)
+                    | (u64::from(identity.label == label) << 13)
+                    | (u64::from(identity.closing) << 14)
+                    | (u64::from(identity.original == fds.binding) << 15)
+                    | (u64::from(identity.original_root == fds.root) << 16)
+                    | (u64::from(identity.previous.is_some()) << 17)
+                    | (u64::from(identity.original.snapshot_ref().is_some_and(|who| {
+                        identity.original.valid(generation(who.index as usize))
+                    })) << 18);
+            let purpose = match identity.purpose {
+                BindingPurpose::Candidate => 0,
+                BindingPurpose::Refresh => 1,
+                BindingPurpose::Audit => 2,
+            };
+            bits |= purpose << 20;
+            if let Admission::Transport(transport) = &identity.admission {
+                let phase = match &transport.state {
+                    NotaryState::Copy { .. } => 1,
+                    NotaryState::Back { .. } => 2,
+                    NotaryState::Reply { .. } => 3,
+                    NotaryState::Rollback { .. } => 4,
+                    NotaryState::Commit => 5,
+                };
+                bits |= (phase << 24)
+                    | (u64::from(
+                        transport
+                            .failed_original_outcome(identity.previous.is_some())
+                            .is_some_and(|code| fds.binding_outcome == Some(code)),
+                    ) << 28);
+            }
+        }
+        bits
+    }
+
     fn authenticate_fields(
         ram: &mut Ram<'_>,
         identities: &mut [Option<IdentityChannel>; SESSIONS],
@@ -3202,28 +3308,7 @@ impl Fs {
             return Ok(());
         }
         if fds.binding_preparation.is_some() {
-            if let Some(identity) = identities
-                .get(fds.authority_index as usize)
-                .and_then(Option::as_ref)
-                && let Admission::Transport(transport) = &identity.admission
-                && ramfs::authority::failed_candidate_allows(
-                    fds,
-                    label,
-                    identity
-                        .original
-                        .snapshot_ref()
-                        .map_or(0, |who| generation(who.index as usize)),
-                    ramfs::authority::FailedCandidate {
-                        label: identity.label,
-                        original: &identity.original,
-                        original_root: identity.original_root,
-                        purpose: identity.purpose,
-                        closing: identity.closing,
-                        retained_failure: transport
-                            .failed_original_outcome(identity.previous.is_some()),
-                    },
-                )
-            {
+            if Self::failed_candidate_allowed(identities, fds, label) {
                 return Ok(());
             }
             return Err(proto_fs::AUTHENTICATING);
