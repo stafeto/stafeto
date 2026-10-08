@@ -299,35 +299,36 @@ fn exact_cleanup_replies_settle_twenty_overlapping_append_results() {
                 .save_data_result(claim, outcome, &[], |_| 24)
                 .unwrap();
         }
-        let mut settled = [false; 2];
-        let mut pending = [0; 2];
-        for _ in 0..32 {
-            for (i, (owner, (token, _, _))) in pair.iter().copied().enumerate() {
-                if settled[i] {
-                    continue;
-                }
-                let context = client.begin_data_cleanup(token).unwrap();
-                client.validate_data_cleanup_context(&context).unwrap();
-                match context.attempt_with(&mut server) {
-                    Ok(proof) => {
-                        client
-                            .finish_data_cleanup_from_context(&context, proof)
-                            .unwrap();
-                        settled[i] = true;
-                    }
-                    Err(failure) => {
-                        assert_eq!(failure.disposition(), CleanupDisposition::Retry);
-                        pending[i] += 1;
-                        assert_eq!(client.data_state(token).unwrap().owner, Some(owner));
-                    }
-                }
-            }
-            if settled.iter().all(|done| *done) {
-                break;
-            }
+        // Both original results are cached before either driver starts cleanup.
+        for (owner, (token, _, _)) in pair {
+            let state = client.data_state(token).unwrap();
+            assert_eq!(state.result, Some(ScalarResult::Bytes(1)));
+            assert_eq!(state.owner, Some(owner));
         }
-        assert_eq!(settled, [true; 2]);
-        assert!(pending[0] > 0 && pending[1] > 0);
+        let mut driver = ParallelCachedDriver {
+            first: CachedDriver {
+                client: &mut client,
+                effects: &mut server,
+                token: first.0,
+                requested: false,
+                cancel_after_pause: false,
+                visits: 0,
+                pauses: 0,
+            },
+            other: second.0,
+            other_visits: 0,
+            other_pauses: 0,
+        };
+        cleanup_cached(&mut driver);
+        assert_eq!(
+            driver.first.client.data_state(first.0).unwrap().phase,
+            ScalarPhase::Cleaned
+        );
+        assert!(driver.first.pauses > 0);
+        assert!(driver.other_pauses > 0);
+        assert!(driver.other_visits > 1);
+        // Acknowledgment below must free both exact holds, proving both cleanup
+        // completions rather than merely returning their cached results.
         for (owner, (token, _, _)) in pair {
             assert_eq!(
                 client.acknowledge_data(token, owner, &mut []).unwrap(),
@@ -671,6 +672,41 @@ impl<E: CleanupEffects> CachedCleanupEffects for CachedDriver<'_, E> {
     fn pause(&mut self) -> bool {
         self.pauses += 1;
         self.requested |= self.cancel_after_pause;
+        true
+    }
+}
+
+struct ParallelCachedDriver<'a> {
+    first: CachedDriver<'a, Server>,
+    other: ScalarToken,
+    other_visits: usize,
+    other_pauses: usize,
+}
+impl CachedCleanupEffects for ParallelCachedDriver<'_> {
+    fn requested(&mut self) -> bool {
+        self.first.requested()
+    }
+    fn visit(&mut self) -> CleanupDisposition {
+        self.first.visit()
+    }
+    fn pause(&mut self) -> bool {
+        self.first.pauses += 1;
+        // The first owner's table borrow and native visit have ended. Its
+        // scheduler pause permits another paid owner to complete real cleanup.
+        if self.other_visits == 0 {
+            let mut other = CachedDriver {
+                client: &mut *self.first.client,
+                effects: &mut *self.first.effects,
+                token: self.other,
+                requested: false,
+                cancel_after_pause: false,
+                visits: 0,
+                pauses: 0,
+            };
+            cleanup_cached(&mut other);
+            self.other_visits = other.visits;
+            self.other_pauses = other.pauses;
+        }
         true
     }
 }
