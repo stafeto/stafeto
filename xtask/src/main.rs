@@ -3408,8 +3408,8 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         return Err(format!("the pipe service: a step past term B: {row:?}"));
     }
     // The entropy service (tag 11): CLONE for each child of the crowd,
-    // whose cost grows with the live clones (a walk of its table of 320),
-    // and its own steps; every one under term B but the heartbeat.
+    // whose cost stays the same with the live clones (entropy::CLONE_FULL_MAX
+    // bounds it with the table full), and its own steps; every one under term B but the heartbeat.
     let entropy = longest_steps(&outcome.lines, "11");
     let clone = entropy.iter().find(|(k, ..)| *k == 8).map_or(0, |r| r.1);
     if clone == 0 {
