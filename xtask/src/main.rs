@@ -3169,13 +3169,23 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
 /// processes fails it at once (5b's Vouch took 539 ticks an entry).
 const VOUCH_TICKS_MAX: u64 = 6_000;
 
-/// Term B of the kernel, the longest it runs with preemption off, in
-/// ticks under -icount: the longest row of the `B on` line of
-/// `kernel_tests` (icount build) at 637d3a6, which lowered it from
-/// 20 538. xtask is the one place of the number: `kernel_tests` fails a
-/// run above it, and every step of a service is compared with it. The
-/// kernel's own checks and tests/posix-tty only print their numbers.
+/// Term B of the blocking of every level, in ticks under -icount: the
+/// budget the response-time analysis gives the kernel and every step of a
+/// service is compared with. The number is the longest row of the `B on`
+/// line of `kernel_tests` (icount build) at 637d3a6, which lowered it from
+/// 20 538; the kernel has run under KERNEL_B_MAX since the stage Handles
+/// went by half chunks, so the room between them belongs to the services.
+/// The kernel's own checks and tests/posix-tty only print their numbers.
 const TERM_B: u64 = 20_410;
+
+/// The bound on the kernel itself: the longest row of the `B on` line of
+/// `kernel_tests` (icount build) may not pass it. The longest paths at
+/// the time are first_map (16 738 on 512M) and release (16 060 on 2G);
+/// growth up to the bound goes unremarked, beyond it needs a decision
+/// (another split, or a higher bound with the reason written down), so
+/// that the kernel cannot spend the room TERM_B promises the services.
+const KERNEL_B_MAX: u64 = 18_000;
+const _: () = assert!(KERNEL_B_MAX < TERM_B);
 
 /// The most one step of a service may take (one READ_INTO of up to
 /// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for
@@ -5374,8 +5384,11 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
             measured.push((what, rows, ticks));
         }
-        let margin = b_margin(m.name, &measured)?;
-        println!("B margin on {}: {margin} of {TERM_B}", m.name);
+        let (margin, to_term) = b_margin(m.name, &measured)?;
+        println!(
+            "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
+            m.name
+        );
     }
     match variant {
         Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
@@ -5403,7 +5416,7 @@ const PORTION_LINES: [&str; 7] = [
 /// rows, ticks), with its line: the blocking time B of every level (spec
 /// 15.3). The teardown row `threads` is a count of threads and takes no
 /// part. Shown on its own so that a change of the longest row stands out
-/// in the output of `ci`; `kernel_tests` fails it above TERM_B.
+/// in the output of `ci`; `kernel_tests` fails it above KERNEL_B_MAX.
 fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, &'a str, u64) {
     measured
         .iter()
@@ -5418,17 +5431,19 @@ fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, 
         .unwrap_or(("none", "none", 0))
 }
 
-/// The margin under term B of the longest portion in `measured`, which
-/// the `B on` line prints; an error when it is past TERM_B.
-fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<u64, String> {
+/// The margins of the longest portion in `measured`, which the `B on` line
+/// prints, under KERNEL_B_MAX and under TERM_B; an error when it is past
+/// KERNEL_B_MAX.
+fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, u64), String> {
     let (what, row, n) = blocking_time(measured);
     println!("B on {name}: {row}={n} ({what})");
-    TERM_B.checked_sub(n).ok_or_else(|| {
-        format!(
-            "B on {name}: {row}={n} ({what}) is {} past TERM_B {TERM_B}",
-            n - TERM_B
-        )
-    })
+    match KERNEL_B_MAX.checked_sub(n) {
+        Some(margin) => Ok((margin, TERM_B - n)),
+        None => Err(format!(
+            "B on {name}: {row}={n} ({what}) is {} past KERNEL_B_MAX {KERNEL_B_MAX}",
+            n - KERNEL_B_MAX
+        )),
+    }
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -6881,7 +6896,7 @@ mod tests {
     /// the count of threads and never a row of the round trip, which spans
     /// two calls.
     #[test]
-    fn a_suspension_number_past_term_b_fails_the_parse_of_the_log() {
+    fn a_suspension_number_past_the_kernel_bound_fails_the_parse_of_the_log() {
         let log = |n: u64| {
             vec![format!(
                 "suspension scopes ticks: control_stop_no_queue=33 control_stop_cancel=99 \
@@ -6892,8 +6907,12 @@ mod tests {
             let ticks = ticks_of(&log(n), "suspension scopes", &SUSPENSION_ROWS)?;
             b_margin("t", &[("suspension scopes", &SUSPENSION_ROWS[..], ticks)])
         };
-        assert_eq!(margin(TERM_B), Ok(0));
-        assert!(margin(TERM_B + 1).unwrap_err().contains("past TERM_B"));
+        assert_eq!(margin(KERNEL_B_MAX), Ok((0, TERM_B - KERNEL_B_MAX)));
+        assert!(
+            margin(KERNEL_B_MAX + 1)
+                .unwrap_err()
+                .contains("past KERNEL_B_MAX")
+        );
     }
 
     #[test]

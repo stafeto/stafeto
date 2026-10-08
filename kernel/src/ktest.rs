@@ -2219,10 +2219,11 @@ const CARRIERS: usize = 16;
 /// The stage Buffers counts the handles of the threads' requests as work
 /// (spec 7.7): CARRIERS threads of a process that never ran, each with a
 /// buffer and four handles on their way (Thread::transit), as a request
-/// that waited in a queue leaves them. The first portion of the stage gives
-/// 10 buffers back, whose units of six, a frame two and a handle one, fill
-/// 60 of its 64, where the six of the next do not fit, and the second the
-/// other 6; the handles go with them, and their channel then too.
+/// that waited in a queue leaves them. Each of the first three portions of
+/// the stage gives 5 buffers back, whose units of six, a frame two and a
+/// handle one, fill 30 of its 32, where the six of the next do not fit, and
+/// the fourth the last one; the handles go with them, and their channel
+/// then too.
 fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
     const LEVEL: u8 = 9;
     cleanup::drain();
@@ -2263,15 +2264,15 @@ fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
 /// Threads with a buffer and no handle on their way, one more than a
 /// portion of the stage Buffers takes: two units of work each.
 const BARE: usize = BUFFERS_PER_PORTION + 1;
-const BUFFERS_PER_PORTION: usize = 32;
+const BUFFERS_PER_PORTION: usize = 16;
 /// Threads in the middle of a long call, with a buffer and no handle on
 /// their way, one more than a portion of the stage Buffers takes: three
 /// units of work each, the frame two and the call one.
 const CALLERS: usize = CALLERS_PER_PORTION + 1;
-const CALLERS_PER_PORTION: usize = 21;
+const CALLERS_PER_PORTION: usize = 10;
 
 /// The first portion of the stage Buffers of BARE threads with no handles
-/// gives back BUFFERS_PER_PORTION buffers, a frame two units of its 64,
+/// gives back BUFFERS_PER_PORTION buffers, a frame two units of its 32,
 /// and the second the last one (spec 7.7).
 fn bare_buffers_take_two_units(level: u8) -> Result<(), &'static str> {
     buffers_in_two_portions(level, BARE, BUFFERS_PER_PORTION, false)
@@ -2279,7 +2280,7 @@ fn bare_buffers_take_two_units(level: u8) -> Result<(), &'static str> {
 
 /// The first portion of the stage Buffers of CALLERS threads, each in the
 /// middle of a mem_create, gives back CALLERS_PER_PORTION buffers, a frame
-/// two units of its 64 and the call one, and the second the last one; the
+/// two units of its 32 and the call one, and the second the last one; the
 /// objects the calls held go with them (spec 7.7).
 fn long_calls_take_a_unit_more(level: u8) -> Result<(), &'static str> {
     let objects = memory::in_use();
@@ -2425,15 +2426,17 @@ fn check_buffer_portions(p: NonNull<process::Process>, level: u8) -> Result<(), 
         cleanup::portion();
     }
     let frames = phys::free_frames();
-    cleanup::portion();
-    check(
-        process::progress(p).0 == Stage::Buffers && phys::free_frames() == frames + 10,
-        "the first portion of the stage Buffers did not stop at 10 buffers",
-    )?;
+    for portion in 1..=3 {
+        cleanup::portion();
+        check(
+            process::progress(p).0 == Stage::Buffers && phys::free_frames() == frames + 5 * portion,
+            "a portion of the stage Buffers did not stop at 5 buffers",
+        )?;
+    }
     cleanup::portion();
     check(
         process::progress(p).0 == Stage::Mappings && phys::free_frames() == frames + 16,
-        "the second portion of the stage Buffers did not give the other 6 back",
+        "the fourth portion of the stage Buffers did not give the last one back",
     )
 }
 
@@ -2504,7 +2507,10 @@ fn check_stages(
         process::progress(p) == (Stage::Handles, 3 * CHUNK as u32, 0),
         "the stage Children of a process with no child took more than a portion",
     )?;
-    for left in [2, 1, 0] {
+    // Two portions a chunk, the table's own count of 32 entries each.
+    const HALF: u32 = 32;
+    assert!(HALF as usize * 2 == CHUNK);
+    for left in (0..3 * 2).rev() {
         cleanup::portion();
         let stage = if left > 0 {
             Stage::Handles
@@ -2512,8 +2518,8 @@ fn check_stages(
             Stage::Space
         };
         check(
-            process::progress(p) == (stage, left * CHUNK as u32, 0) && cleanup::len() == 1,
-            "a portion of the stage Handles did not take one chunk",
+            process::progress(p) == (stage, left * HALF, 0) && cleanup::len() == 1,
+            "a portion of the stage Handles did not take half a chunk",
         )?;
     }
     cleanup::portion();

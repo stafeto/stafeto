@@ -6,7 +6,8 @@
 //! retired, so a table never hands out the same value twice. Rights only
 //! shrink when copied. A table grows by chunks up to a limit fixed at
 //! creation; a directory, an object of its own, says where the chunks lie.
-//! The table goes a chunk at a time (`release_step`), the directory last.
+//! The table goes a few entries at a time (`release_step`), a chunk in
+//! several steps, the directory last.
 
 use abi::{Error, Handle, Rights};
 use core::ptr::NonNull;
@@ -93,6 +94,8 @@ pub struct HandleTable<T> {
     first_generation: u64,
     /// A stepwise release is under way.
     closing: bool,
+    /// Entries of the last chunk that a stepwise release already took.
+    released: usize,
 }
 
 // SAFETY: the table owns its chunks and the objects in them.
@@ -116,6 +119,7 @@ impl<T> HandleTable<T> {
             #[cfg(test)]
             first_generation: 1,
             closing: false,
+            released: 0,
         })
     }
 
@@ -362,38 +366,59 @@ impl<T> HandleTable<T> {
     /// references, leave this way.
     #[cfg(test)]
     pub fn release_with(&mut self, src: &mut impl ChunkSource<T>, mut f: impl FnMut(T, Rights)) {
-        while !self.release_step(src, &mut f) {}
+        while !self.release_step(src, CHUNK, &mut f) {}
     }
 
-    /// One step of a release: the last chunk goes, its live objects
-    /// handed to `f` with the rights of their handles, at most CHUNK of
-    /// them; with the last chunk, or when there is none, the directory.
-    /// True when the table holds no memory any more: it is then empty and
-    /// fresh, with its limit. From the first step until then the table
-    /// takes nothing new, handles into chunks that went are bad, and `len`
-    /// counts the objects left.
+    /// One step of a release: up to `n` entries of the last chunk, from
+    /// where the previous step stopped, their live objects handed to `f`
+    /// with the rights of their handles; with the last entries of the
+    /// chunk, the chunk goes back, and with the last chunk, or when there
+    /// is none, the directory. `n` is at least 1, and a step takes at
+    /// most CHUNK entries whatever `n` is. True when the table holds no
+    /// memory any more: it is then empty and fresh, with its limit. From
+    /// the first step until then the table takes nothing new, handles
+    /// into the chunk being released and into chunks that went are bad,
+    /// and `len` counts the objects left.
     pub fn release_step(
         &mut self,
         src: &mut impl ChunkSource<T>,
+        n: usize,
         mut f: impl FnMut(T, Rights),
     ) -> bool {
+        assert!(n > 0, "a release step of no entries");
         if let Some(c) = self.chunk_count.checked_sub(1) {
             self.closing = true;
             self.free_head = NO_ENTRY;
-            let chunk = self.chunk_slot(c).take().expect("an initialised chunk");
-            self.chunk_count = c;
+            // From the first part of a chunk on, no handle reaches it.
             self.used = self.used.min((c * CHUNK) as u32);
+            let chunk = (*self.chunk_slot(c)).expect("an initialised chunk");
+            let from = self.released;
+            let to = CHUNK.min(from + n);
             // SAFETY: the chunk's entries are initialised; each object is
-            // taken out once, then each entry is dropped once before its
-            // memory goes back.
+            // taken out once, from the cursor on, and the cursor moves past
+            // it before the chunk can be looked at again.
             unsafe {
                 let entries = (&raw mut (*chunk.as_ptr()).entries).cast::<Entry<T>>();
-                for i in 0..CHUNK {
+                for i in from..to {
                     let entry = &mut *entries.add(i);
                     if let Some(object) = entry.object.take() {
                         self.live -= 1;
                         f(object, entry.rights);
                     }
+                }
+            }
+            self.released = to;
+            if to < CHUNK {
+                return false;
+            }
+            self.released = 0;
+            *self.chunk_slot(c) = None;
+            self.chunk_count = c;
+            // SAFETY: every object is out, so each entry drops once before
+            // its memory goes back.
+            unsafe {
+                let entries = (&raw mut (*chunk.as_ptr()).entries).cast::<Entry<T>>();
+                for i in 0..CHUNK {
                     entries.add(i).drop_in_place();
                 }
                 src.free_chunk(chunk);
@@ -961,7 +986,7 @@ mod tests {
             t.insert(&mut src, i as u32, *r).unwrap();
         }
         let mut out = Vec::new();
-        assert!(t.release_step(&mut src, |v, r| out.push((v, r))));
+        assert!(t.release_step(&mut src, CHUNK, |v, r| out.push((v, r))));
         out.sort_by_key(|&(v, _)| v);
         assert_eq!(out, vec![(0, Rights::RECEIVE), (1, Rights::NONE), (2, RW)]);
     }
@@ -976,7 +1001,7 @@ mod tests {
         t.remove(hs[199]).unwrap();
         // The last chunk goes first: entries 192-198 are live in it.
         let mut out = Vec::new();
-        assert!(!t.release_step(&mut src, |v, _| out.push(v)));
+        assert!(!t.release_step(&mut src, CHUNK, |v, _| out.push(v)));
         assert_eq!(out, (192..199).collect::<Vec<u32>>());
         assert_eq!((src.freed, src.back.as_str(), t.len()), (1, "c", 192));
         // Handles into the chunk that went are bad, the others still hold.
@@ -986,10 +1011,10 @@ mod tests {
         assert_eq!(t.room(), 0);
         assert_eq!(t.insert(&mut src, 9, RW), Err(Error::LimitReached));
         out.clear();
-        assert!(!t.release_step(&mut src, |v, _| out.push(v)));
+        assert!(!t.release_step(&mut src, CHUNK, |v, _| out.push(v)));
         assert_eq!(out, (128..192).collect::<Vec<u32>>());
         let mut steps = 2;
-        while !t.release_step(&mut src, |v, _| out.push(v)) {
+        while !t.release_step(&mut src, CHUNK, |v, _| out.push(v)) {
             steps += 1;
         }
         assert_eq!((steps + 1, out.len()), (4, 192));
@@ -1002,6 +1027,45 @@ mod tests {
     }
 
     #[test]
+    fn release_step_takes_part_of_a_chunk() {
+        let mut src = boxes(4);
+        let mut t = table(1000);
+        let hs: Vec<Handle> = (0..100)
+            .map(|i| t.insert(&mut src, i, RW).unwrap())
+            .collect();
+        t.remove(hs[70]).unwrap();
+        // The last chunk, entries 64-99, in parts of 16 entries.
+        let mut out = Vec::new();
+        assert!(!t.release_step(&mut src, 16, |v, _| out.push(v)));
+        assert_eq!(out, (64..70).chain(71..80).collect::<Vec<u32>>());
+        assert_eq!((src.freed, t.len()), (0, 84));
+        // The whole chunk is out of reach from its first part.
+        assert_eq!(t.get(hs[64]), Err(Error::BadHandle));
+        assert_eq!(t.get(hs[90]), Err(Error::BadHandle));
+        assert_eq!(t.get(hs[63]), Ok((&63, RW)));
+        assert_eq!(t.insert(&mut src, 9, RW), Err(Error::LimitReached));
+        out.clear();
+        // The next two parts take entries 80-95 and 96-111.
+        assert!(!t.release_step(&mut src, 16, |v, _| out.push(v)));
+        assert_eq!(src.freed, 0);
+        assert!(!t.release_step(&mut src, 16, |v, _| out.push(v)));
+        assert_eq!(out, (80..100).collect::<Vec<u32>>());
+        // The fourth part, entries 112-127, is the last of the chunk.
+        assert_eq!(src.freed, 0);
+        assert!(!t.release_step(&mut src, 16, |v, _| out.push(v)));
+        assert_eq!((src.freed, t.len()), (1, 64));
+        // The first chunk starts again at its first entry.
+        out.clear();
+        assert!(!t.release_step(&mut src, 32, |v, _| out.push(v)));
+        assert_eq!(out, (0..32).collect::<Vec<u32>>());
+        assert_eq!((src.freed, src.directories), (1, 1));
+        // Its last part takes the chunk and the directory with it.
+        assert!(t.release_step(&mut src, 32, |v, _| out.push(v)));
+        assert_eq!((src.freed, src.directories, t.len()), (2, 0, 0));
+        assert_eq!(t.room(), 1000);
+    }
+
+    #[test]
     fn directory_goes_last() {
         let mut src = boxes(3);
         let mut t = table(1000);
@@ -1009,17 +1073,19 @@ mod tests {
             t.insert(&mut src, i, RW).unwrap();
         }
         assert_eq!(src.directories, 1);
-        while !t.release_step(&mut src, |_, _| {}) {
+        while !t.release_step(&mut src, CHUNK, |_, _| {}) {
             assert_eq!(src.directories, 1, "the directory went before a chunk");
         }
         assert_eq!(src.back, "cccd");
-        assert!(t.release_step(&mut src, |_, _| panic!("an empty table has no objects")));
+        assert!(t.release_step(&mut src, CHUNK, |_, _| panic!(
+            "an empty table has no objects"
+        )));
         assert_eq!(src.back, "cccd");
         // A directory that came without a chunk goes in one step.
         let mut empty = boxes(0);
         assert_eq!(t.insert(&mut empty, 1, RW), Err(Error::NoMemory));
         assert_eq!(empty.directories, 1);
-        assert!(t.release_step(&mut empty, |_, _| {}));
+        assert!(t.release_step(&mut empty, CHUNK, |_, _| {}));
         assert_eq!((empty.back.as_str(), empty.directories), ("d", 0));
     }
 

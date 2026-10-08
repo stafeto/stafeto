@@ -31,9 +31,15 @@ const REPLIES_PORTION: usize = 32;
 /// The work a portion of the stage Buffers does, at most (spec 7.7): the
 /// buffer of each thread is FRAME_UNITS units, and each handle of a request
 /// it made and the long call it was making one more (thread::held); a
-/// thread goes into the portion only when its units fit. The buffers of 32
+/// thread goes into the portion only when its units fit. The buffers of 16
 /// threads with no handles take one portion.
-const BUFFERS_PORTION: usize = 64;
+const BUFFERS_PORTION: usize = 32;
+
+/// Handle table entries a portion of the stage Handles releases, at most
+/// (spec 7.7): half a chunk, each last copy of a session telling its
+/// receiver the client is gone.
+const HANDLES_PORTION: usize = kcore::handles::CHUNK / 2;
+const _: () = assert!(kcore::handles::CHUNK % HANDLES_PORTION == 0);
 
 /// The units of work of a frame that goes back to the frame allocator
 /// (spec 7.7): its free may merge blocks up to kcore::frames::MAX_ORDER.
@@ -90,9 +96,9 @@ pub enum Stage {
     /// list at its own stage Quota. Descendants go depth first, and the
     /// kernel stack does not grow with the depth of the tree (spec 4).
     Children,
-    /// A chunk of the handle table a portion, up to 64 handles, each
-    /// releasing its object; the chunk directory with the last chunk
-    /// (HandleTable::release_step).
+    /// Half a chunk of the handle table a portion, up to HANDLES_PORTION
+    /// handles, each releasing its object; the chunk directory with the
+    /// last part of the last chunk (HandleTable::release_step).
     Handles,
     /// The first portion takes the space: TTBR0 leaves its tables and
     /// their TLB entries go with the ASID (AddressSpace::retire). Then a
@@ -493,8 +499,8 @@ unsafe fn wait_for_child(child: NonNull<Process>, level: u8) {
     unsafe { hasten(child, level) };
 }
 
-/// The stage Handles: one step of the table's release, each handle's
-/// object released at `level`. True once the table holds nothing.
+/// The stage Handles: one step of the table's release, HANDLES_PORTION
+/// entries, each handle's object released at `level`. True once the table holds nothing.
 ///
 /// # Safety
 /// `process` is alive and on its stages.
@@ -502,7 +508,7 @@ unsafe fn release_handles(process: NonNull<Process>, level: u8) -> bool {
     // SAFETY: releasing its objects reaches no other field but `refs`,
     // through raw pointers, since a release only counts and queues.
     let (handles, mut chunks) = unsafe { table(process) };
-    handles.release_step(&mut chunks, |object, rights| {
+    handles.release_step(&mut chunks, HANDLES_PORTION, |object, rights| {
         // SAFETY: the table let the handle go, and its reference with it.
         unsafe { object::release(object, rights, level) }
     })
