@@ -913,11 +913,12 @@ impl Processes {
         let Some((named, Place::Loader, image)) = Label::parse_image(label) else {
             return refuse(proto_process::PERMISSION);
         };
-        let Some(index) = self.records.find_loader(label) else {
+        let index = usize::from(named.index);
+        let Some(record) = self.records.get(index) else {
             return refuse(proto_process::PERMISSION);
         };
-        let record = self.records.get(index).expect("an exact retained record");
-        if expected.pid != named.pid()
+        if record.label != named
+            || expected.pid != named.pid()
             || expected.index as usize != index
             || expected.image != image
             || expected.root != record.root
