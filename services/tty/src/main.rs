@@ -2662,6 +2662,14 @@ impl Service<0> for Tty {
             // in the small table of roots; a session with none takes one.
             let holding = match self.holdsets.find(label, &*self.clones) {
                 Some(holding) => holding,
+                // A label of the service's own that is no longer found is a
+                // clone that ended, and is no root. The roots with such a
+                // label are the service's own sessions, which carry bit 62
+                // too (`LOADERS`, the session the process service holds
+                // for the loaders); a clone's label never does.
+                None if label & OWN != 0 && label & 1 << 62 == 0 => {
+                    return Answer::Status(Status::Kernel(Error::BadState));
+                }
                 None => {
                     let Some(holding) = self.holdsets.take() else {
                         return Answer::Status(Status::Kernel(Error::LimitReached));

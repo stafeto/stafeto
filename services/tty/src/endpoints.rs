@@ -98,6 +98,9 @@ pub struct Holds {
     /// each. A description that is held cannot be freed, so no other
     /// generation of its index exists while the bit is set.
     mask: [u64; DESCRIPTIONS / 64],
+    /// The cells of `ids` a test counted `contains` reading.
+    #[cfg(test)]
+    reads: core::cell::Cell<usize>,
 }
 impl Default for Holds {
     fn default() -> Self {
@@ -109,6 +112,8 @@ impl Holds {
         Self {
             ids: [None; HOLDS],
             mask: [0; DESCRIPTIONS / 64],
+            #[cfg(test)]
+            reads: core::cell::Cell::new(0),
         }
     }
     /// True when a description of the table index of `id` is held: a
@@ -488,6 +493,31 @@ impl Endpoints {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `contains` reads no cell of `ids`, whether one or all are held: a
+    /// walk of the cells (the former way) counts HOLDS reads.
+    #[test]
+    fn contains_does_not_walk_the_cells() {
+        let mut table = Endpoints::new();
+        let mut holds = Holds::new();
+        let first = table.open_master(&mut holds, 2).unwrap();
+        let reads = |holds: &Holds| {
+            let before = holds.reads.get();
+            assert!(holds.contains(first));
+            assert!(!holds.contains(first ^ 0x80));
+            holds.reads.get() - before
+        };
+        let few = reads(&holds);
+        for _ in 1..PTYS {
+            table.open_master(&mut holds, 2).unwrap();
+        }
+        for _ in PTYS..HOLDS {
+            table.open_console(&mut holds, 2).unwrap();
+        }
+        assert_eq!(holds.ids().count(), HOLDS);
+        assert_eq!(reads(&holds), few);
+        assert_eq!(few, 0);
+    }
 
     #[test]
     fn side_tags_and_publication_overflow_fail_before_mutation() {
