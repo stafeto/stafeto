@@ -570,15 +570,15 @@ fn native_only(expected_parent: u32) -> c_int {
 /// process (files, clocks, heap, the process service) and relibc the
 /// thread.
 #[unsafe(no_mangle)]
-extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
+extern "C" fn main(_argc: isize, _argv: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
     #[cfg(not(feature = "cancel-input"))]
-    if argc > 1 && !argv.is_null() {
+    if _argc > 1 && !_argv.is_null() {
         // SAFETY: libc supplies argc live NUL-terminated argument strings.
-        let argument = unsafe { *argv.add(1) };
+        let argument = unsafe { *_argv.add(1) };
         if !argument.is_null()
             && unsafe { core::ffi::CStr::from_ptr(argument) }.to_bytes() == native_mode::ARGUMENT
         {
-            if argc != 2 {
+            if _argc != 2 {
                 return 14;
             }
             unsafe extern "C" {
