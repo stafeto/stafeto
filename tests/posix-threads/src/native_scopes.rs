@@ -139,7 +139,9 @@ pub(super) fn run() -> bool {
             "native-scopes: priority original={}/{}/{} main={}/{}/{} raised={}/{}/{}",
             u32::from(original_info.base),
             u32::from(original_info.priority),
-            original_info.policy.map_or(u32::MAX, |policy| policy as u32),
+            original_info
+                .policy
+                .map_or(u32::MAX, |policy| policy as u32),
             u32::from(main_info.base),
             u32::from(main_info.priority),
             main_info.policy.map_or(u32::MAX, |policy| policy as u32),
