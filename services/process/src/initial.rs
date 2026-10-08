@@ -3,13 +3,176 @@
 
 //! Initial record custody and one-effect native steps in the existing Work.
 use crate::{Processes, Work, controller, pages};
-use posix_process_service::initial_resident::{CleanupOwner, Phase};
+use posix_process_service::initial_resident::{CleanupOwner, MapDelivery, MapEffects, Phase};
 use proto_wire::Status;
 use rt::abi;
 use rt::handle::Channel;
 use rt::service::{Answer, Request};
 
+const MAP_ADMISSION_FLAGS: u32 = posix_process_service::initial_origin::MAPS_PUBLISHED
+    | posix_process_service::initial_origin::STAGE_COMMITTED
+    | posix_process_service::initial_origin::BOOTSTRAP_RELEASED;
+struct NativeMaps;
+impl MapEffects<rt::handle::Handle<rt::handle::Memory>, rt::service::Pending> for NativeMaps {
+    fn is_live(&self, pending: &rt::service::Pending) -> bool {
+        pending.has_token()
+    }
+    fn duplicate(
+        &mut self,
+        original: &rt::handle::Handle<rt::handle::Memory>,
+        entry: proto_process::initial_map::Entry,
+    ) -> Option<rt::handle::Handle<rt::handle::Memory>> {
+        rt::sys::handle_duplicate(
+            original,
+            entry.access.rights() | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
+        )
+        .ok()
+    }
+    fn send(
+        &mut self,
+        reply: &proto_process::initial_map::Reply,
+        copies: &mut [Option<rt::handle::Handle<rt::handle::Memory>>; 4],
+        pending: &mut rt::service::Pending,
+    ) -> MapDelivery {
+        let mut bytes = proto_wire::Writer::new();
+        reply
+            .write(&mut bytes)
+            .expect("the validated initial map reply");
+        let count = usize::from(reply.count);
+        let expected: [abi::Handle; 4] = core::array::from_fn(|slot| {
+            copies[slot]
+                .as_ref()
+                .map_or(abi::Handle::INVALID, |owner| owner.raw())
+        });
+        let mut outgoing = rt::handle::Outgoing::new();
+        for owner in copies[..count].iter_mut() {
+            assert!(
+                outgoing
+                    .push(owner.take().expect("the retained map copy").erase())
+                    .is_ok()
+            );
+        }
+        let token = pending.take_token().expect("the live map reply authority");
+        match token.reply_handles(bytes.as_bytes(), outgoing) {
+            Ok(()) => MapDelivery::Completed,
+            Err(mut refused) => {
+                if let Some(back) = refused.back.take() {
+                    // Disarm all returned owners before validating the complete tuple.
+                    let mut back = core::mem::ManuallyDrop::new(back);
+                    let returned_count = back.len();
+                    let mut returned = [abi::Handle::INVALID; 4];
+                    for slot in (0..returned_count).rev() {
+                        returned[slot] = back.pop().expect("the returned copy").into_raw();
+                    }
+                    assert_eq!(returned_count, count);
+                    assert_eq!(returned, expected);
+                    for slot in 0..count {
+                        copies[slot] = Some(rt::handle::Handle::from_raw(returned[slot]));
+                    }
+                }
+                if let Some(token) = refused.token.take() {
+                    assert!(copies[..count].iter().all(Option::is_some));
+                    assert!(pending.restore_token(token).is_ok());
+                    MapDelivery::ReturnedLive
+                } else {
+                    // Includes BadState with returned copies and all consumed
+                    // errors, including Interrupted and Unknown, without copies.
+                    MapDelivery::Consumed
+                }
+            }
+        }
+    }
+    fn close(
+        &mut self,
+        owner: rt::handle::Handle<rt::handle::Memory>,
+    ) -> Result<(), rt::handle::Handle<rt::handle::Memory>> {
+        match controller::raw_close(owner.raw().0) {
+            Ok(()) => {
+                owner.into_raw();
+                Ok(())
+            }
+            Err(_) => Err(owner),
+        }
+    }
+}
+
 impl Processes {
+    pub(super) fn initial_map_query(&mut self, index: usize, request: &mut Request<'_>) -> Answer {
+        let Ok(key) = proto_process::initial_map::Key::read_query(
+            &request.bytes()[proto_wire::HEADER_LEN..],
+            request.handles.len(),
+        ) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let ticket = self.tickets[index];
+        let record = self.records.get(index).expect("the own initial record");
+        let Some(resident) = self.replacing[index].as_mut().and_then(Work::initial_mut) else {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        };
+        let exact = record.initial_epoch(ticket) == Some(resident.key.epoch)
+            && ticket == resident.key.ticket
+            && resident.matches_image(request.label(), record.image)
+            && record.active_guard_label != 0
+            && record.active_exec.is_some()
+            && record.initial_origin(ticket).is_some_and(|origin| {
+                origin.artifact == resident.publication.source.artifact
+                    && origin.flags & MAP_ADMISSION_FLAGS == MAP_ADMISSION_FLAGS
+            });
+        if !exact || !resident.can_begin_map_reply(key, &NativeMaps) {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
+        let Some(pending) = request.defer() else {
+            return Answer::Status(Status::BadSize);
+        };
+        assert!(resident.begin_map_reply(key, pending, &NativeMaps).is_ok());
+        self.kick();
+        Answer::Deferred
+    }
+    pub(super) fn initial_map_ack(&mut self, index: usize, request: &mut Request<'_>) -> Answer {
+        let Ok(key) = proto_process::initial_map::Key::read_ack(
+            &request.bytes()[proto_wire::HEADER_LEN..],
+            request.handles.len(),
+        ) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let ticket = self.tickets[index];
+        let record = self.records.get(index).expect("the own initial record");
+        let Some(mut origin) = record.initial_origin(ticket) else {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        };
+        if key.key != ticket
+            || key.image != record.image
+            || origin.flags & MAP_ADMISSION_FLAGS != MAP_ADMISSION_FLAGS
+        {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
+        if origin.flags & posix_process_service::initial_origin::MAPS_ACKED != 0 {
+            return Answer::Status(Status::Ok);
+        }
+        let Some(resident) = self.replacing[index].as_mut().and_then(Work::initial_mut) else {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        };
+        if record.initial_epoch(ticket) != Some(resident.key.epoch)
+            || ticket != resident.key.ticket
+            || origin.artifact != resident.publication.source.artifact
+            || !resident.matches_image(request.label(), record.image)
+            || record.active_guard_label == 0
+            || record.active_exec.is_none()
+            || resident.acknowledge_maps(key, &NativeMaps).is_none()
+        {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
+        origin.flags |= posix_process_service::initial_origin::MAPS_ACKED;
+        assert!(
+            self.records
+                .get_mut(index)
+                .expect("the acknowledged initial map record")
+                .set_initial_origin(ticket, origin)
+        );
+        self.kick();
+        Answer::Status(Status::Ok)
+    }
+
     pub(super) fn initial_ack(&mut self, request: &mut Request<'_>) -> Answer {
         let Ok(ack) = proto_process::initial_ack::Ack::read(
             &request.bytes()[proto_wire::HEADER_LEN..],
@@ -470,34 +633,38 @@ impl Processes {
             }
             return;
         }
+        if resident.map_step(&mut NativeMaps) {
+            return;
+        }
         if resident.page_needs_copy() {
             if let Ok(copy) = self.pages.narrow(index) {
                 assert!(resident.retain_page_copy(copy).is_ok());
             }
             return;
         }
-        if resident.phase() == Phase::Loading && !resident.page_ready() {
-            if let Some(copy) = resident.page_copy() {
-                if !resident.page_mapped() {
-                    let record = self
-                        .records
-                        .get(index)
-                        .expect("the reserved initial record");
-                    if record.label.raw_at(1) == resident.key.label
-                        && record.image == 1
-                        && pages::Pages::map_prepared(index, &record.process, copy).is_ok()
-                    {
-                        assert!(resident.confirm_page_map());
-                    }
-                } else if controller::raw_close(copy.raw().0).is_ok() {
-                    resident
-                        .remove_page_copy()
-                        .expect("the removed narrow owner")
-                        .into_raw();
-                    assert!(resident.confirm_page_settled());
+        if resident.phase() == Phase::Loading
+            && !resident.page_ready()
+            && let Some(copy) = resident.page_copy()
+        {
+            if !resident.page_mapped() {
+                let record = self
+                    .records
+                    .get(index)
+                    .expect("the reserved initial record");
+                if record.label.raw_at(1) == resident.key.label
+                    && record.image == 1
+                    && pages::Pages::map_prepared(index, &record.process, copy).is_ok()
+                {
+                    assert!(resident.confirm_page_map());
                 }
-                return;
+            } else if controller::raw_close(copy.raw().0).is_ok() {
+                resident
+                    .remove_page_copy()
+                    .expect("the removed narrow owner")
+                    .into_raw();
+                assert!(resident.confirm_page_settled());
             }
+            return;
         }
         if let Some((slot, memory, entry)) = resident.memory_validation() {
             match rt::sys::memory_info(memory) {
@@ -506,6 +673,17 @@ impl Processes {
                         && info.pages == u64::from(entry.pages) =>
                 {
                     assert!(resident.memory_validated(slot));
+                    if resident.maps_ready() {
+                        let record = self
+                            .records
+                            .get_mut(index)
+                            .expect("the validated initial maps record");
+                        let mut origin = record
+                            .initial_origin(ticket)
+                            .expect("the initial map provenance");
+                        origin.flags |= posix_process_service::initial_origin::MAPS_PUBLISHED;
+                        assert!(record.set_initial_origin(ticket, origin));
+                    }
                 }
                 Ok(_) => {
                     assert!(resident.ended(resident.key, Status::BadSize.code()));
@@ -552,7 +730,6 @@ impl Processes {
             } else {
                 resident.settle_operation(false);
             }
-            return;
         }
     }
 }

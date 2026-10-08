@@ -3038,6 +3038,12 @@ impl Service<0> for Processes {
         {
             return self.image_probe_request(index, r);
         }
+        if method == Method::InitialMapQuery as u16 {
+            return self.initial_map_query(index, r);
+        }
+        if method == Method::InitialMapAck as u16 {
+            return self.initial_map_ack(index, r);
+        }
         if method == Method::WaitTake as u16 {
             return self.wait_take(index, s, r);
         }

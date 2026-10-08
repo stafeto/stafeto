@@ -53,7 +53,7 @@ pub enum MapDelivery {
 /// copies in their exact slots and retains a consumed Pending as a marker.
 pub trait MapEffects<M, D> {
     fn is_live(&self, pending: &D) -> bool;
-    fn duplicate(&mut self, original: &M) -> Option<M>;
+    fn duplicate(&mut self, original: &M, entry: Entry) -> Option<M>;
     fn send(
         &mut self,
         reply: &Reply,
@@ -473,7 +473,9 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
                 let count = usize::from(self.publication.map.count);
                 if let Some(slot) = (0..count).find(|&slot| self.reply_copies[slot].is_none()) {
                     let original = self.originals[slot].as_ref().expect("retained initial map");
-                    if let Some(copy) = effects.duplicate(original) {
+                    if let Some(copy) =
+                        effects.duplicate(original, self.publication.map.entries[slot])
+                    {
                         self.reply_copies[slot] = Some(copy);
                     }
                 } else {
@@ -758,7 +760,7 @@ mod tests {
         fn is_live(&self, pending: &MapPending) -> bool {
             pending.live
         }
-        fn duplicate(&mut self, original: &Cap) -> Option<Cap> {
+        fn duplicate(&mut self, original: &Cap, _entry: Entry) -> Option<Cap> {
             self.calls += 1;
             if self.dup_fail {
                 return None;

@@ -885,11 +885,10 @@ impl Processes {
                 .as_mut()
                 .expect("the retained CreateInitial request");
             let token = pending.take_token().expect("the original initial token");
-            let result = token.reply_handles(
+            token.reply_handles(
                 bytes.as_bytes(),
                 [copy.erase(), session.erase(), who.erase()],
-            );
-            result
+            )
         } else {
             work.pending
                 .take()
