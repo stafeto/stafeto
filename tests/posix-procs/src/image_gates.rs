@@ -446,8 +446,15 @@ fn ambiguous_setid(fd: i32) -> Result<(), Status> {
         return Err(Status::BadSize);
     }
     let held = super::loader_abort::counts(&pending)?;
-    for _ in 0..2 {
+    for repeat in 0..2 {
         let reply = Files::send_on(&pending, open.as_bytes())?;
+        rt::println!(
+            "posix-files: ambiguous repeat {} len {} caps {} word0 {}",
+            repeat,
+            reply.len,
+            reply.handles.len(),
+            reply.words[0]
+        );
         if reply.len != 8
             || reply.words[0] != u64::from(proto_fs::IMAGE_ABORT_REQUIRED)
             || !reply.handles.is_empty()
@@ -459,13 +466,30 @@ fn ambiguous_setid(fd: i32) -> Result<(), Status> {
             .header()
             .write(&mut cancel)?;
         cancel.u64(job)?;
-        canonical(&Files::send_on(&pending, cancel.as_bytes())?)?;
-        if trace(ticket)? != live {
+        let canceled = Files::send_on(&pending, cancel.as_bytes())?;
+        rt::println!(
+            "posix-files: ambiguous cancel {} len {} caps {} word0 {}",
+            repeat,
+            canceled.len,
+            canceled.handles.len(),
+            canceled.words[0]
+        );
+        canonical(&canceled)?;
+        let traced = trace(ticket)?;
+        rt::println!(
+            "posix-files: ambiguous repeat {} trace equal {} {:?}",
+            repeat,
+            traced == live,
+            traced
+        );
+        if traced != live {
             return Err(Status::BadSize);
         }
     }
+    rt::println!("posix-files: ambiguous repeats settled, aborting");
     attempt.abort()?;
     let terminal = trace(ticket)?;
+    rt::println!("posix-files: ambiguous terminal {:?}", terminal);
     if terminal[0..5] != live[0..5]
         || terminal[5..12] != [1, 0, 0, proto_process::NO_ID, proto_process::NO_ID, 0, 1]
         || terminal[12..] != before.credentials.words()
