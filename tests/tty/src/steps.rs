@@ -56,6 +56,10 @@ const ROOT_CLONES: usize = 255;
 /// A chain of clones, each made by the one before, as a chain of forks
 /// makes them: the service counts them all by the root, so the one past
 /// ROOT_CLONES is refused, and a session of another root still clones.
+/// With all of them alive each one asks GET_ATTR (the first request of the
+/// last, which has made no clone), then they end in the reverse order of
+/// their making: the steps of Clone, GetAttr and a session's end (66) run
+/// with the service's tables as full as a root may fill them.
 fn clone_chain(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> {
     let request = Method::Clone.header().bytes();
     let mut chain: [Option<Handle<Channel>>; ROOT_CLONES] = [const { None }; ROOT_CLONES];
@@ -74,6 +78,18 @@ fn clone_chain(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static s
     let other = rt::service::connect(parent, "tty").map_err(|_| "a second session")?;
     let _ = rt::service::clone_session(&other, &request).map_err(|_| "a clone of another root")?;
     rt::println!("tty-probe: {ROOT_CLONES} clones of one root, then a refusal");
+    let mut buffer = [0; MESSAGE_MAX];
+    let mut get = Writer::new();
+    proto_tty::get_attr(CONSOLE, &mut get).map_err(|_| "GET_ATTR of a clone")?;
+    for session in chain.iter().flatten() {
+        let reply = Probe::call_on(session, get.as_bytes(), None, &mut buffer)
+            .map_err(|_| "GET_ATTR of a clone")?;
+        proto_tty::attr_reply(reply).map_err(|_| "GET_ATTR of a clone")?;
+    }
+    rt::println!("tty-probe: holdsets {ROOT_CLONES} clones live");
+    for session in chain.iter_mut().rev() {
+        drop(session.take());
+    }
     Ok(())
 }
 

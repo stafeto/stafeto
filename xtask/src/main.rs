@@ -694,7 +694,9 @@ const TTY_PROGRAMS: [ImageProgram; 4] = [
 const TTY_STEPS_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-tty-steps"]),
     ("tty", "tty", TTY_STACK_SIZE, &["steps"]),
-    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
+    // The chain of 255 clones and the replies asked of it need more than
+    // the 16 KB of the other probes.
+    ("tty-probe", "tty-probe", 2 * SVC_STACK_SIZE, &[]),
 ];
 /// The same over the Virtio console's driver on Apple VZ (xtask tty-vz).
 const TTY_VZ_PROGRAMS: [ImageProgram; 4] = [
@@ -4248,6 +4250,9 @@ fn tty_steps() -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", log.display()))?;
     qemu::expect_stopped_on(&output, ENDED_TTY)?;
     qemu::expect_marker(&output, "tty-probe: ok")?;
+    // 255 clones of one root alive, each asked, then ended: the steps of
+    // Clone, GetAttr and a session's end below run with the tables full.
+    qemu::expect_marker(&output, "tty-probe: holdsets 255 clones live")?;
     let steps = longest_steps(&output.lines, "5");
     let waits = longest_waits(&output.lines, "5");
     let mut table = String::from("kind method ticks(own) detail wait\n");
@@ -4264,7 +4269,7 @@ fn tty_steps() -> Result<(), String> {
     print!("terminal service steps under icount:\n{table}");
     // Each method and the service's own notifications made a step, each
     // under term B in its own part; the waits have their own bound.
-    for kind in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 65] {
+    for kind in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 65, 66] {
         let ticks = steps.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
         if ticks == 0 || ticks > RAM_STEP_MAX {
             return Err(format!(
