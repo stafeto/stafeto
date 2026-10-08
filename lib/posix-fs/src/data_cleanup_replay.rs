@@ -640,3 +640,156 @@ fn ack_refusal_never_replays_commit_and_retired_ack_requires_canonical_absence()
     assert_eq!(server.ram.storage.read(inode, 0, &mut bytes).unwrap(), 1);
     assert_eq!(bytes[0], b'A');
 }
+
+struct CachedDriver<'a, E> {
+    client: &'a mut PosixFs,
+    effects: &'a mut E,
+    token: ScalarToken,
+    requested: bool,
+    cancel_after_pause: bool,
+    visits: usize,
+    pauses: usize,
+}
+impl<E: CleanupEffects> CachedCleanupEffects for CachedDriver<'_, E> {
+    fn requested(&mut self) -> bool {
+        self.requested
+    }
+    fn visit(&mut self) -> CleanupDisposition {
+        self.visits += 1;
+        let context = self.client.begin_data_cleanup(self.token).unwrap();
+        self.client.validate_data_cleanup_context(&context).unwrap();
+        match context.attempt_with(self.effects) {
+            Ok(proof) => {
+                self.client
+                    .finish_data_cleanup_from_context(&context, proof)
+                    .unwrap();
+                CleanupDisposition::Continue
+            }
+            Err(failure) => failure.disposition(),
+        }
+    }
+    fn pause(&mut self) -> bool {
+        self.pauses += 1;
+        self.requested |= self.cancel_after_pause;
+        true
+    }
+}
+
+#[test]
+fn cached_driver_cancellation_preserves_original_result_and_paid_debt() {
+    assert!(!cancel_before_result(true, true));
+    assert!(cancel_before_result(false, true));
+    for already_requested in [true, false] {
+        let (mut server, mut client, fds) = Server::new();
+        let owner = OwnerToken::new(1).unwrap();
+        let token = completed(&mut server, &mut client, fds[0], owner, b"A").unwrap();
+        let mut driver = CachedDriver {
+            client: &mut client,
+            effects: &mut server,
+            token,
+            requested: already_requested,
+            cancel_after_pause: true,
+            visits: 0,
+            pauses: 0,
+        };
+        cleanup_cached(&mut driver);
+        assert_eq!(driver.visits, usize::from(!already_requested));
+        assert_eq!(driver.pauses, usize::from(!already_requested));
+        assert_eq!(driver.client.data_state(token).unwrap().owner, Some(owner));
+        assert_eq!(
+            driver.client.data_state(token).unwrap().result,
+            Some(ScalarResult::Bytes(1))
+        );
+        assert_eq!(
+            driver
+                .client
+                .acknowledge_data(token, owner, &mut [])
+                .unwrap(),
+            ScalarResult::Bytes(1)
+        );
+        assert_eq!(driver.client.data_state(token).unwrap().owner, None);
+        assert_eq!(server.ram.storage.preparations_used(), 1);
+        assert_eq!(server.releases, 0);
+    }
+}
+
+#[test]
+fn cached_driver_retries_actual_cleanup_to_canonical_proof() {
+    let (mut server, mut client, fds) = Server::new();
+    let owner = OwnerToken::new(1).unwrap();
+    let token = completed(&mut server, &mut client, fds[0], owner, b"A").unwrap();
+    let mut driver = CachedDriver {
+        client: &mut client,
+        effects: &mut server,
+        token,
+        requested: false,
+        cancel_after_pause: false,
+        visits: 0,
+        pauses: 0,
+    };
+    cleanup_cached(&mut driver);
+    assert!(driver.visits > 1);
+    assert_eq!(driver.pauses + 1, driver.visits);
+    assert_eq!(
+        driver
+            .client
+            .acknowledge_data(token, owner, &mut [])
+            .unwrap(),
+        ScalarResult::Bytes(1)
+    );
+    assert_eq!(driver.client.data_tokens().count(), 0);
+    assert_eq!(server.ram.storage.preparations_used(), 0);
+    assert!(server.jobs.is_empty());
+}
+
+#[test]
+fn cached_driver_nonretryable_returns_cached_failure_without_proof_or_spin() {
+    for status in [
+        Status::Kernel(rt::abi::Error::Unknown(777)),
+        Status::Kernel(rt::abi::Error::Interrupted),
+        Status::Kernel(rt::abi::Error::PeerClosed),
+        Status::Unknown(proto_fs::OPEN_RETIRED),
+    ] {
+        let (mut server, mut client, fds) = Server::new();
+        let owner = OwnerToken::new(1).unwrap();
+        let (token, claim, id) = admitted(&mut server, &mut client, fds[0], owner, b"A").unwrap();
+        server.jobs[0]
+            .journal
+            .fail_cleanup_replay(proto_fs::NO_SPACE);
+        let outcome = server.jobs[0].journal.outcome(id);
+        client
+            .save_data_result(claim, outcome, &[], |_| 28)
+            .unwrap();
+        let mut fault = Fault {
+            server: &mut server,
+            stage: CleanupStage::Cancel,
+            error: status,
+            cancel_calls: 0,
+            ack_calls: 0,
+        };
+        let mut driver = CachedDriver {
+            client: &mut client,
+            effects: &mut fault,
+            token,
+            requested: false,
+            cancel_after_pause: false,
+            visits: 0,
+            pauses: 0,
+        };
+        cleanup_cached(&mut driver);
+        assert_eq!(driver.visits, 1);
+        assert_eq!(driver.pauses, 0);
+        assert_eq!(
+            driver
+                .client
+                .acknowledge_data(token, owner, &mut [])
+                .unwrap(),
+            ScalarResult::Failed(28)
+        );
+        assert_eq!(driver.client.data_state(token).unwrap().owner, None);
+        assert_eq!(fault.cancel_calls, 1);
+        assert_eq!(fault.ack_calls, 0);
+        assert_eq!(server.releases, 0);
+        assert_eq!(server.ram.storage.preparations_used(), 1);
+    }
+}

@@ -146,12 +146,15 @@ impl Operation {
         #[cfg(feature = "full-capacity-probe")] retain: bool,
     ) -> Result<u64, i32> {
         loop {
-            if crate::threads::cancel::requested() {
-                return Err(EINTR);
-            }
             let snapshot = crate::shared::with_files(|files| {
                 files.data_state(self.token).map_err(crate::error)
             })?;
+            if posix_fs::data::cancel_before_result(
+                snapshot.result.is_some(),
+                crate::threads::cancel::requested(),
+            ) {
+                return Err(EINTR);
+            }
             if snapshot.result.is_some() {
                 #[cfg(feature = "full-capacity-probe")]
                 if retain {
@@ -175,7 +178,7 @@ impl Operation {
                 }
                 self.claim = None;
                 // Canonical remote cleanup preserves the result in this ownerSome hold.
-                cleanup(self.token);
+                posix_fs::data::cleanup_cached(&mut CachedCleanup(self.token));
                 let defer = Defer::enter();
                 let result = crate::shared::with_files(|files| {
                     files
@@ -500,6 +503,41 @@ fn terminal_retired(claim: ScalarClaimToken, owner: OwnerToken) -> Result<(), i3
         release(claim);
     }
     Ok(())
+}
+
+struct CachedCleanup(ScalarToken);
+impl posix_fs::data::CachedCleanupEffects for CachedCleanup {
+    fn requested(&mut self) -> bool {
+        crate::threads::cancel::requested()
+    }
+    fn visit(&mut self) -> posix_fs::data::CleanupDisposition {
+        use posix_fs::data::CleanupDisposition;
+        let context = crate::shared::with_files(|files| {
+            let context = files.begin_data_cleanup(self.0).map_err(crate::error)?;
+            files
+                .validate_data_cleanup_context(&context)
+                .map_err(crate::error)?;
+            Ok(context)
+        });
+        let Ok(context) = context else {
+            return CleanupDisposition::Retain;
+        };
+        match context.attempt_small_once() {
+            Ok(proof) => {
+                let _ = crate::shared::with_files(|files| {
+                    files
+                        .finish_data_cleanup_from_context(&context, proof)
+                        .map_err(crate::error)
+                });
+                wake(self.0);
+                CleanupDisposition::Continue
+            }
+            Err(failure) => failure.disposition(),
+        }
+    }
+    fn pause(&mut self) -> bool {
+        crate::threads::sleep::pause(1_000_000).is_ok()
+    }
 }
 
 #[inline(never)]

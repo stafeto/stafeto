@@ -1544,6 +1544,39 @@ pub enum CleanupDisposition {
     Abandon,
 }
 
+/// Borrowed operations for cleanup of an already cached result.
+/// A visit must finish every table borrow before IPC; pause owns no table guard.
+pub trait CachedCleanupEffects {
+    fn requested(&mut self) -> bool;
+    fn visit(&mut self) -> CleanupDisposition;
+    fn pause(&mut self) -> bool;
+}
+
+/// Return to the original result on cancellation or an unproven terminal reply.
+/// Only the effects adapter can settle custody using an actual cleanup proof.
+pub fn cleanup_cached(effects: &mut impl CachedCleanupEffects) {
+    loop {
+        if effects.requested() {
+            return;
+        }
+        match effects.visit() {
+            CleanupDisposition::Retry => {
+                if !effects.pause() {
+                    return;
+                }
+            }
+            CleanupDisposition::Continue
+            | CleanupDisposition::Retain
+            | CleanupDisposition::Abandon => return,
+        }
+    }
+}
+
+/// Cached completion precedes cancellation of an operation without a result.
+pub fn cancel_before_result(cached: bool, requested: bool) -> bool {
+    !cached && requested
+}
+
 pub fn cleanup_disposition(stage: CleanupStage, error: Status) -> CleanupDisposition {
     match error {
         Status::Unknown(proto_fs::OPEN_RETIRED) if stage == CleanupStage::Ack => {
