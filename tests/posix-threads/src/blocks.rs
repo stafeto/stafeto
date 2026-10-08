@@ -3,8 +3,8 @@
 
 //! Signals and cancellation in the threads' blocks, without a pthread
 //! owner: pthread_sigmask makes no kernel call, raise delivers before it
-//! returns with none, a signal raised inside the layer's lock comes at its
-//! end with none; pthread_kill wakes a thread at 30 that sleeps, whose
+//! returns with four entry-deferral calls, a signal raised inside the layer's lock
+//! comes at its end with the same four calls; pthread_kill wakes a thread at 30 that sleeps, whose
 //! handler runs and whose sleep gives EINTR with the time left; a thread
 //! that only counts is not cancelled until it reaches a point; a handler
 //! that runs while its thread waits by address, which sleeps or waits for
@@ -244,14 +244,14 @@ pub(super) fn run() -> bool {
             error();
         }
     });
-    // raise delivers before it returns, with no call.
+    // raise delivers before it returns with two Defer/Resume pairs.
     let before = HANDLED.load(Ordering::SeqCst);
     let raised = calls(|| {
         if api::raise(SIGUSR1) != 0 {
             error();
         }
     });
-    if block != 0 || raised != 0 || HANDLED.load(Ordering::SeqCst) != before + 8 {
+    if block != 0 || raised != 4 || HANDLED.load(Ordering::SeqCst) != before + 8 {
         rt::println!(
             "blocks-probe: {} calls for a mask, {} for raise",
             block,
@@ -260,7 +260,7 @@ pub(super) fn run() -> bool {
         return failed(641);
     }
     // Inside the layer's lock the signal waits for its end, which delivers
-    // it with no call.
+    // it with two Defer/Resume pairs.
     let before = HANDLED.load(Ordering::SeqCst);
     let guard = LAYER.lock();
     let _ = api::raise(SIGUSR1);
@@ -268,7 +268,7 @@ pub(super) fn run() -> bool {
     let start = sys::calls();
     drop(guard);
     let leave = sys::calls() - start;
-    if inside != before || HANDLED.load(Ordering::SeqCst) != before + 1 || leave != 0 {
+    if inside != before || HANDLED.load(Ordering::SeqCst) != before + 1 || leave != 4 {
         rt::println!(
             "blocks-probe: {} calls to deliver at the end of the lock",
             leave
@@ -276,7 +276,7 @@ pub(super) fn run() -> bool {
         return failed(642);
     }
     rt::println!(
-        "blocks-probe: pthread_sigmask, raise and delivery at the end of the layer's lock make no kernel call"
+        "blocks-probe: pthread_sigmask makes zero calls; raise and lock-end delivery each use four deferral calls"
     );
 
     // pthread_kill wakes a sleeping thread at 30: its handler, EINTR, the
