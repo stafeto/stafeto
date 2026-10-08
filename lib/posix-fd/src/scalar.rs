@@ -67,6 +67,25 @@ pub struct ScalarSnapshot<T, S> {
     pub last_target: Option<T>,
 }
 
+/// The caller keeps this borrow inside its table lock, before remote work.
+pub struct ScalarView<'a, T, S> {
+    pub owner: Option<OwnerToken>,
+    pub claimant: Option<OwnerToken>,
+    pub phase: ScalarPhase,
+    pub recovery: &'a S,
+    pub pin: Option<T>,
+    pub result: Option<ScalarResult>,
+    pub last_target: Option<T>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScalarClaimState {
+    Acquired(ScalarClaimToken),
+    Busy(OwnerToken),
+    Complete(ScalarResult),
+    Cleanup,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScalarClaim<T, S> {
     Acquired {
@@ -115,7 +134,25 @@ pub(super) struct ScalarRecord<T, S> {
 }
 
 impl<T: Copy, S: Copy> ScalarRecord<T, S> {
-    fn snapshot(self) -> ScalarSnapshot<T, S> {
+    fn view(&self) -> ScalarView<'_, T, S> {
+        let (phase, last_target) = match self.cleanup {
+            Cleanup::Running { last_target } => (ScalarPhase::Cleaning, last_target),
+            Cleanup::Done => (ScalarPhase::Cleaned, None),
+            Cleanup::Pending if self.result.is_some() => (ScalarPhase::Complete, None),
+            Cleanup::Pending if self.serial == u64::MAX => (ScalarPhase::CleanupRequired, None),
+            Cleanup::Pending => (ScalarPhase::Working, None),
+        };
+        ScalarView {
+            owner: self.owner,
+            claimant: self.claimant,
+            phase,
+            recovery: &self.recovery,
+            pin: self.pin,
+            result: self.result,
+            last_target,
+        }
+    }
+    fn snapshot(&self) -> ScalarSnapshot<T, S> {
         let (phase, last_target) = match self.cleanup {
             Cleanup::Running { last_target } => (ScalarPhase::Cleaning, last_target),
             Cleanup::Done => (ScalarPhase::Cleaned, None),
@@ -142,19 +179,23 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             .any(|slot| matches!(slot.held, Held::Scalar(r) if r.pin == Some(backend)))
     }
 
-    fn scalar_record(&self, token: ScalarToken) -> Result<ScalarRecord<T, S>, Error> {
+    fn scalar_record_ref(&self, token: ScalarToken) -> Result<&ScalarRecord<T, S>, Error> {
         let slot = self.holds.get(token.slot).ok_or(Error::BadFileDescriptor)?;
         if slot.generation != token.generation {
             return Err(Error::BadFileDescriptor);
         }
-        match slot.held {
+        match &slot.held {
             Held::Scalar(record) => Ok(record),
             _ => Err(Error::BadFileDescriptor),
         }
     }
 
-    fn scalar_claimed(&self, token: ScalarClaimToken) -> Result<ScalarRecord<T, S>, Error> {
-        let record = self.scalar_record(token.scalar)?;
+    fn scalar_record(&self, token: ScalarToken) -> Result<ScalarRecord<T, S>, Error> {
+        self.scalar_record_ref(token).copied()
+    }
+
+    fn scalar_claim_ref(&self, token: ScalarClaimToken) -> Result<&ScalarRecord<T, S>, Error> {
+        let record = self.scalar_record_ref(token.scalar)?;
         if record.serial != token.serial
             || record.claimant.is_none()
             || !matches!(record.cleanup, Cleanup::Pending)
@@ -164,6 +205,33 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             return Err(Error::BadFileDescriptor);
         }
         Ok(record)
+    }
+
+    pub fn scalar_view(&self, token: ScalarToken) -> Result<ScalarView<'_, T, S>, Error> {
+        Ok(self.scalar_record_ref(token)?.view())
+    }
+
+    pub fn scalar_claim_view(
+        &self,
+        claim: ScalarClaimToken,
+    ) -> Result<ScalarView<'_, T, S>, Error> {
+        Ok(self.scalar_claim_ref(claim)?.view())
+    }
+
+    /// The caller validates every domain constraint before this infallible update.
+    pub fn update_scalar_with(
+        &mut self,
+        claim: ScalarClaimToken,
+        update: impl FnOnce(&mut S),
+    ) -> Result<(), Error> {
+        self.scalar_claim_ref(claim)?;
+        let slot = &mut self.holds[claim.scalar.slot];
+        let Held::Scalar(record) = &mut slot.held else {
+            unreachable!()
+        };
+        update(&mut record.recovery);
+        slot.change();
+        Ok(())
     }
 
     fn save_scalar(&mut self, token: ScalarToken, record: ScalarRecord<T, S>) {
@@ -220,7 +288,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     pub fn scalar_snapshot(&self, token: ScalarToken) -> Result<ScalarSnapshot<T, S>, Error> {
-        Ok(self.scalar_record(token)?.snapshot())
+        Ok(self.scalar_record_ref(token)?.snapshot())
     }
 
     /// Inspect the exact current claim without changing the resident wait word.
@@ -228,7 +296,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         &self,
         claim: ScalarClaimToken,
     ) -> Result<ScalarSnapshot<T, S>, Error> {
-        Ok(self.scalar_claimed(claim)?.snapshot())
+        Ok(self.scalar_claim_ref(claim)?.snapshot())
     }
 
     pub fn scalar_tokens(&self) -> impl Iterator<Item = ScalarToken> + '_ {
@@ -245,45 +313,63 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         token: ScalarToken,
         helper: OwnerToken,
     ) -> Result<ScalarClaim<T, S>, Error> {
-        let mut record = self.scalar_record(token)?;
+        match self.claim_scalar_token(token, helper)? {
+            ScalarClaimState::Acquired(claim) => Ok(ScalarClaim::Acquired {
+                token: claim,
+                snapshot: self.scalar_snapshot(token)?,
+            }),
+            ScalarClaimState::Busy(owner) => Ok(ScalarClaim::Busy(owner)),
+            ScalarClaimState::Complete(result) => Ok(ScalarClaim::Complete(result)),
+            ScalarClaimState::Cleanup => Ok(ScalarClaim::Cleanup(self.scalar_snapshot(token)?)),
+        }
+    }
+
+    pub fn claim_scalar_token(
+        &mut self,
+        token: ScalarToken,
+        helper: OwnerToken,
+    ) -> Result<ScalarClaimState, Error> {
+        self.scalar_record_ref(token)?;
+        let slot = &mut self.holds[token.slot];
+        let Held::Scalar(record) = &mut slot.held else {
+            unreachable!()
+        };
         if !matches!(record.cleanup, Cleanup::Pending) || record.serial == u64::MAX {
-            return Ok(ScalarClaim::Cleanup(record.snapshot()));
+            return Ok(ScalarClaimState::Cleanup);
         }
         if let Some(result) = record.result {
-            return Ok(ScalarClaim::Complete(result));
+            return Ok(ScalarClaimState::Complete(result));
         }
         if let Some(owner) = record.claimant {
-            return Ok(ScalarClaim::Busy(owner));
+            return Ok(ScalarClaimState::Busy(owner));
         }
         let Some(serial) = record.serial.checked_add(1).filter(|&s| s < u64::MAX) else {
             record.serial = u64::MAX;
             record.claimant = None;
-            self.save_scalar(token, record);
-            return Ok(ScalarClaim::Cleanup(record.snapshot()));
+            slot.change();
+            return Ok(ScalarClaimState::Cleanup);
         };
         record.serial = serial;
         record.claimant = Some(helper);
-        self.save_scalar(token, record);
-        Ok(ScalarClaim::Acquired {
-            token: ScalarClaimToken {
-                scalar: token,
-                serial,
-            },
-            snapshot: record.snapshot(),
-        })
+        slot.change();
+        Ok(ScalarClaimState::Acquired(ScalarClaimToken {
+            scalar: token,
+            serial,
+        }))
     }
 
     pub fn update_scalar(&mut self, claim: ScalarClaimToken, recovery: S) -> Result<(), Error> {
-        let mut record = self.scalar_claimed(claim)?;
-        record.recovery = recovery;
-        self.save_scalar(claim.scalar, record);
-        Ok(())
+        self.update_scalar_with(claim, |resident| *resident = recovery)
     }
 
     pub fn release_scalar_claim(&mut self, claim: ScalarClaimToken) -> Result<(), Error> {
-        let mut record = self.scalar_claimed(claim)?;
+        self.scalar_claim_ref(claim)?;
+        let slot = &mut self.holds[claim.scalar.slot];
+        let Held::Scalar(record) = &mut slot.held else {
+            unreachable!()
+        };
         record.claimant = None;
-        self.save_scalar(claim.scalar, record);
+        slot.change();
         Ok(())
     }
 
@@ -295,10 +381,14 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         if matches!(result, ScalarResult::Failed(errno) if errno <= 0) {
             return Err(Error::InvalidArgument);
         }
-        let mut record = self.scalar_claimed(claim)?;
+        self.scalar_claim_ref(claim)?;
+        let slot = &mut self.holds[claim.scalar.slot];
+        let Held::Scalar(record) = &mut slot.held else {
+            unreachable!()
+        };
         record.result = Some(result);
         record.claimant = None;
-        self.save_scalar(claim.scalar, record);
+        slot.change();
         Ok(())
     }
 
@@ -308,16 +398,20 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         token: ScalarToken,
         owner: OwnerToken,
     ) -> Result<ScalarResult, Error> {
-        let mut record = self.scalar_record(token)?;
+        let record = self.scalar_record_ref(token)?;
         if record.owner != Some(owner) {
             return Err(Error::BadFileDescriptor);
         }
         let result = record.result.ok_or(Error::InvalidArgument)?;
-        record.owner = None;
         if matches!(record.cleanup, Cleanup::Done) {
             self.free_scalar(token);
         } else {
-            self.save_scalar(token, record);
+            let slot = &mut self.holds[token.slot];
+            let Held::Scalar(record) = &mut slot.held else {
+                unreachable!()
+            };
+            record.owner = None;
+            slot.change();
         }
         Ok(result)
     }
@@ -328,19 +422,10 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         &mut self,
         token: ScalarToken,
     ) -> Result<ScalarCleanup<T, S>, Error> {
-        let mut record = self.scalar_record(token)?;
-        let last_target = match record.cleanup {
-            Cleanup::Running { last_target } => last_target,
-            Cleanup::Done => return Err(Error::BadFileDescriptor),
-            Cleanup::Pending => {
-                let backend = record.pin.take().expect("pending scalar pin");
-                record.claimant = None;
-                self.save_scalar(token, record);
-                let last_target = self.left(backend);
-                record.cleanup = Cleanup::Running { last_target };
-                self.save_scalar(token, record);
-                last_target
-            }
+        self.scalar_mark_cleanup(token)?;
+        let record = self.scalar_record_ref(token)?;
+        let Cleanup::Running { last_target } = record.cleanup else {
+            unreachable!()
         };
         Ok(ScalarCleanup {
             token,
@@ -349,15 +434,43 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         })
     }
 
+    /// Revoke authority in place without copying the resident recovery payload.
+    pub fn scalar_mark_cleanup(&mut self, token: ScalarToken) -> Result<(), Error> {
+        match self.scalar_record_ref(token)?.cleanup {
+            Cleanup::Running { .. } => {}
+            Cleanup::Done => return Err(Error::BadFileDescriptor),
+            Cleanup::Pending => {
+                let slot = &mut self.holds[token.slot];
+                let Held::Scalar(record) = &mut slot.held else {
+                    unreachable!()
+                };
+                let backend = record.pin.take().expect("pending scalar pin");
+                record.claimant = None;
+                slot.change();
+                let last_target = self.left(backend);
+                let slot = &mut self.holds[token.slot];
+                let Held::Scalar(record) = &mut slot.held else {
+                    unreachable!()
+                };
+                record.cleanup = Cleanup::Running { last_target };
+                slot.change();
+            }
+        };
+        Ok(())
+    }
+
     /// The caller proves canonical exact remote cleanup. An unresolved outcome
     /// becomes terminal EIO; it can include an earlier committed effect.
     pub fn scalar_finish_cleanup(&mut self, token: ScalarToken) -> Result<(), Error> {
-        let mut record = self.scalar_record(token)?;
-        match record.cleanup {
+        match self.scalar_record_ref(token)?.cleanup {
             Cleanup::Pending => return Err(Error::BadFileDescriptor),
             Cleanup::Done => return Ok(()),
             Cleanup::Running { .. } => {}
         }
+        let slot = &mut self.holds[token.slot];
+        let Held::Scalar(record) = &mut slot.held else {
+            unreachable!()
+        };
         if record.result.is_none() {
             record.result = Some(ScalarResult::Failed(5));
         }
@@ -366,7 +479,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         if record.owner.is_none() {
             self.free_scalar(token);
         } else {
-            self.save_scalar(token, record);
+            slot.change();
         }
         Ok(())
     }

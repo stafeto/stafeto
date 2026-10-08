@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 12 of the bounded RAM file service. Numbers are little endian.
+//! Version 13 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -58,14 +58,18 @@
 //! LOOKUP/INFO_PATH: proof u64. Reply: status then metadata/NodeInfo.
 //! READ_DIR: index u32, proof u64. Reply: status, kind u32, name bytes.
 //! OPEN_EXEC through a bound Pending session takes the original proof u64.
-//! Its prepaid image resources return RESOLVING before a separate SetId effect.
+//! Its prepaid image resources return RESOLVING before atomic StageExec custody.
 //! Success replies with one SEND|TRANSFER image channel and status0 (4 bytes).
-//! Replays of that exact proof return the same retained image without another SetId.
+//! Replays of that exact proof return the same retained image without another StageExec.
 //! ResolveCancel retires the source's private recovery copy; external caps retain
 //! the inode pin, fd0/root description charge and exact loader identity.
 //! Completed ProofCancel retains terminal OPEN_RETIRED metadata for the old attempt.
 //! Image labels carry opaque places/generations; ReadAt/ReadInto/InfoFd use fd0.
-//! IMAGE_ABORT_REQUIRED is terminal after an uncertain SetId outcome.
+//! IMAGE_ABORT_REQUIRED is terminal after an uncertain StageExec outcome.
+//! CLONE_EXEC has an empty body and one private source Channel SEND|DUPLICATE|TRANSFER.
+//! A genuine Loading Fork pays an independent image hold on the source originating root.
+//! RESOLVING advances its existing paid preparation; OK4 carries one SEND|TRANSFER image.
+//! Same source replay preserves the exact child binding; Fork StageExec has no SetId/atime.
 //! Other final path operations consume their proofs. Cancellation is idempotent.
 //! READ/WRITE: fd u32, count u32 or bytes. Reply: status, count u32, read bytes.
 //! READ_AT/WRITE_AT add an offset u64; they preserve the description's position.
@@ -108,7 +112,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 12;
+pub const VERSION: u16 = 13;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -303,6 +307,8 @@ pub enum Method {
     DataCancel = 40,
     DataAck = 41,
     DataReadResult = 42,
+    /// Genuine Pending fork: empty body and one retained private image source channel.
+    CloneExec = 43,
 }
 
 impl Method {
@@ -354,6 +360,7 @@ impl Method {
             40 => Some(Self::DataCancel),
             41 => Some(Self::DataAck),
             42 => Some(Self::DataReadResult),
+            43 => Some(Self::CloneExec),
             _ => None,
         }
     }
@@ -361,7 +368,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

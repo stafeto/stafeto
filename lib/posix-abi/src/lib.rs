@@ -12,11 +12,18 @@
 pub mod allocation;
 pub mod clock;
 pub mod constants;
+mod data_driver;
+#[cfg(feature = "data-driver-probe")]
+pub mod data_probe;
 pub mod fork;
+mod io_driver;
 pub mod loader_probe;
 pub mod long;
 pub mod metadata;
 mod open_driver;
+#[cfg(feature = "open-finalize-clock-probe")]
+pub mod open_finalize_probe;
+mod owner_detach;
 pub mod pipes;
 pub mod process;
 pub mod random;
@@ -186,28 +193,40 @@ pub fn read(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
 
 // Keep cancellation outside frames holding transport resources and buffers.
 fn read_inner(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
-    let mut message = [0; MESSAGE_MAX];
     let fd = fd(number)?;
     let count = buffer.len().min(posix_request::MAX_READ);
-    match shared::dispatch(
-        Request::Read {
-            fd,
-            count: count as u32,
-        },
-        &mut message,
-    )? {
+    loop {
+        if let Some(operation) =
+            data_driver::begin(fd, posix_fs::data::DataKind::Read, count as u32, 0, &[])?
+        {
+            return operation.run(&mut buffer[..count]).map(|n| n as usize);
+        }
+        if let Some(count) = read_nonram_inner(fd, &mut buffer[..count])? {
+            return Ok(count);
+        }
+    }
+}
+
+#[inline(never)]
+fn read_nonram_inner(fd: u32, buffer: &mut [u8]) -> Result<Option<usize>, c_int> {
+    let mut message = [0; MESSAGE_MAX];
+    let count = buffer.len();
+    let Some(reply) = shared::read_nonram(fd, count as u32, &mut message)? else {
+        return Ok(None);
+    };
+    match reply {
         Reply::Bytes(bytes) => {
             if bytes.len() > count {
                 return Err(EIO);
             }
             buffer[..bytes.len()].copy_from_slice(bytes);
-            Ok(bytes.len())
+            Ok(Some(bytes.len()))
         }
         Reply::Input { uart, extent } => {
             if extent as usize > count {
                 return Err(EIO);
             }
-            console_read(uart, &mut buffer[..extent as usize])
+            console_read(uart, &mut buffer[..extent as usize]).map(Some)
         }
         _ => Err(EIO),
     }
@@ -266,7 +285,7 @@ fn console_read(uart: Option<u64>, buffer: &mut [u8]) -> Result<usize, i32> {
 pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
     let point = threads::cancel::Point::begin();
     let result = fd(number)
-        .and_then(|fd| shared::number(Request::Write { fd, bytes }))
+        .and_then(|fd| shared::write(fd, bytes))
         .map(|n| n as usize);
     if result == Err(EPIPE) {
         let _ = signals::raise(SIGPIPE);
@@ -277,6 +296,68 @@ pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
         point.finish();
     }
     result
+}
+
+/// Positioned reads retain the exact description and their full cached prefix.
+pub fn pread(number: c_int, out: &mut [u8], offset: i64) -> Result<usize, c_int> {
+    let point = threads::cancel::Point::begin();
+    let result = (|| {
+        let fd = fd(number)?;
+        shared::with_files(|files| files.target(fd).map_err(error))?;
+        let position = u64::try_from(offset).map_err(|_| EINVAL)?;
+        let count = out.len().min(proto_fs::MAX_READ);
+        let operation = data_driver::begin(
+            fd,
+            posix_fs::data::DataKind::PRead,
+            count as u32,
+            position,
+            &[],
+        )?
+        .ok_or(ESPIPE)?;
+        operation.run(&mut out[..count]).map(|n| n as usize)
+    })();
+    if result.is_ok_and(|n| n > 0) {
+        point.end();
+    } else {
+        point.finish();
+    }
+    result
+}
+
+/// Positioned writes preserve their immutable offset across exact-key recovery.
+pub fn pwrite(number: c_int, input: &[u8], offset: i64) -> Result<usize, c_int> {
+    let point = threads::cancel::Point::begin();
+    let result = (|| {
+        let fd = fd(number)?;
+        shared::with_files(|files| files.target(fd).map_err(error))?;
+        let position = u64::try_from(offset).map_err(|_| EINVAL)?;
+        let bytes = &input[..input.len().min(proto_fs::MAX_WRITE)];
+        let operation = data_driver::begin(
+            fd,
+            posix_fs::data::DataKind::PWrite,
+            bytes.len() as u32,
+            position,
+            bytes,
+        )?
+        .ok_or(ESPIPE)?;
+        operation.run(&mut []).map(|n| n as usize)
+    })();
+    if result.is_ok_and(|n| n > 0) {
+        point.end();
+    } else {
+        point.finish();
+    }
+    result
+}
+
+/// Truncate uses the same prepaid scalar custody and one final native effect.
+pub fn ftruncate(number: c_int, length: i64) -> Result<(), c_int> {
+    let fd = fd(number)?;
+    shared::with_files(|files| files.target(fd).map_err(error))?;
+    let length = u64::try_from(length).map_err(|_| EINVAL)?;
+    let operation = data_driver::begin(fd, posix_fs::data::DataKind::Truncate, 0, length, &[])?
+        .ok_or(EINVAL)?;
+    operation.run(&mut []).map(|_| ())
 }
 
 pub fn lseek(number: c_int, offset: i64, origin: c_int) -> Result<i64, c_int> {

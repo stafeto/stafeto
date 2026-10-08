@@ -11,6 +11,12 @@ extern int files_open_stages(void);
 extern int files_data_stages(void);
 #include "pending-open.c"
 #include "open-policy.c"
+#if PUBLIC_DATA_PROBE
+#include "public-data.c"
+#endif
+#if PUBLIC_DATA_LOSS_PROBE
+#include "public-data-loss.c"
+#endif
 #if LOADER_ABORT_PROBE
 #include "loader-abort.c"
 #endif
@@ -54,6 +60,15 @@ int main(void) {
     int data = files_data_stages();
     if (data) { printf("posix-files: Data stages failed %d\n", data); return 24; }
     puts("posix-files: paid Data bytes, replay, exact lease and cleanup ok");
+#if PUBLIC_DATA_PROBE
+    int public_data = check_public_data();
+    if (public_data) { printf("posix-files: public Data failed %d\n", public_data); return 25; }
+    puts("posix-files: public pread/pwrite/ftruncate and device routes ok");
+#endif
+#if PUBLIC_DATA_LOSS_PROBE
+    int public_loss = check_public_data_loss();
+    if (public_loss) { printf("posix-files: public Data loss failed %d\n", public_loss); return 26; }
+#endif
     if (files_full_sessions()) return 12;
     puts("posix-files: 16 sessions with 32 retained descriptors ok");
 #if LOADER_ABORT_PROBE

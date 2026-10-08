@@ -13,6 +13,24 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 #[cfg(feature = "pending-open")]
 mod pending_open;
 
+/// The C probe supplies two writable words for the actual process accounting.
+#[cfg(feature = "public-data-probe")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn files_data_memory(out: *mut u64) -> i32 {
+    let Ok(memory) = rt::sys::process_memory(posix_abi::allocation::process()) else {
+        return -1;
+    };
+    if out.is_null() || memory.used > memory.quota {
+        return -1;
+    }
+    // SAFETY: the C caller provides two writable u64 words for this call.
+    unsafe {
+        out.write(memory.used);
+        out.add(1).write(memory.quota);
+    }
+    0
+}
+
 #[cfg(feature = "loader-abort")]
 mod audit;
 #[cfg(feature = "image-gates")]
@@ -21,6 +39,8 @@ mod image_gates;
 mod image_hold;
 #[cfg(feature = "loader-abort")]
 mod loader_abort;
+#[cfg(feature = "t6-runtime")]
+mod t6_runtime;
 
 /// A counterfeit identity capability must leave the already bound session intact.
 #[cfg(feature = "files")]
@@ -70,8 +90,12 @@ extern "C" fn files_fake_identity() -> i32 {
 mod cleanup;
 #[cfg(feature = "files")]
 mod data_stages;
+#[cfg(feature = "open-finalize-clock-probe")]
+mod open_finalize_clock;
 #[cfg(feature = "files")]
 mod open_stages;
+#[cfg(feature = "public-data-loss-probe")]
+mod public_data_loss;
 #[cfg(feature = "ipc-loss")]
 mod reply_death;
 #[cfg(feature = "ipc-loss")]

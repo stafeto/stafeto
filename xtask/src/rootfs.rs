@@ -362,6 +362,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-procs.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
+    "boot-posix-initial-fork.img",
     "boot-posix-jobs.img",
     "boot-posix-steps.img",
     "boot-posix-tty.img",
@@ -392,14 +393,17 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-posix-files.img"
         | "boot-posix-files-steps.img"
         | "boot-posix-files-loss.img"
-        | "boot-posix-data-steps.img" => {
+        | "boot-posix-data-steps.img"
+        | "boot-posix-open-finalize-clock.img" => {
             let mut files = vec![dir("/dev")];
             files.extend(devices());
             files
         }
         "boot-image-gates.img"
         | "boot-image-gates-steps.img"
-        | "boot-image-gates-normal-steps.img" => vec![
+        | "boot-image-gates-normal-steps.img"
+        | "boot-t6-runtime.img"
+        | "boot-t6-runtime-steps.img" => vec![
             dir("/bin"),
             file("/bin/posix-files", 0o755, ROOT, "posix-files"),
             of(
@@ -424,7 +428,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ));
             files
         }
-        "boot-posix-procs.img" | "boot-posix-jobs.img" => procs(),
+        "boot-posix-procs.img" | "boot-posix-initial-fork.img" | "boot-posix-jobs.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -534,6 +538,31 @@ mod tests {
     use bootimg::rootfs::Rootfs;
 
     #[test]
+    fn runtime_custody_images_keep_the_canonical_setid_artifact() {
+        for name in ["boot-t6-runtime.img", "boot-t6-runtime-steps.img"] {
+            let files = files_of(name);
+            let bytes = table(&files, 0, 7).unwrap();
+            let parsed = Rootfs::parse(&bytes, 7).unwrap();
+            let entry = parsed.entry(parsed.find("/bin/setid-image").unwrap() as u32);
+            assert_eq!(
+                (entry.mode, entry.uid, entry.gid),
+                (rootfs::REGULAR | 0o6755, 37, 43)
+            );
+            assert!(files.iter().any(|file| file.path == "/bin/setid-image"
+                && matches!(
+                    file.source,
+                    Some(Source::Variant {
+                        program: "posix-files",
+                        tag: "setid",
+                        extra: 0
+                    })
+                )));
+            assert!(files.iter().any(|file| file.path == "/bin/posix-files"
+                && matches!(file.source, Some(Source::Elf("posix-files")))));
+        }
+    }
+
+    #[test]
     fn hard_links_of_a_program_share_one_file_and_the_table_reads_back() {
         let bytes = table(&ramfs(), 5, 9).unwrap();
         let read = Rootfs::parse(&bytes, 9).unwrap();
@@ -570,6 +599,7 @@ mod tests {
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
+                "boot-posix-initial-fork.img" => &crate::POSIX_INITIAL_FORK_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
                 "boot-posix-tty.img" => &crate::POSIX_TTY_PROGRAMS,
                 "boot-posix-tty-steps.img" => &crate::POSIX_TTY_STEPS_PROGRAMS,

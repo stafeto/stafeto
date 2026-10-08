@@ -67,9 +67,33 @@ pub(crate) fn open(
         while !files.open_advance(recovery.job, false).map_err(protocol)? {}
         recovery.phase = Phase::Preparing;
         save(claim, recovery)?;
-        loop {
+        'prepare: loop {
+            if recovery.phase == Phase::Traversing {
+                while !files.open_advance(recovery.job, false).map_err(protocol)? {}
+                recovery.phase = Phase::Preparing;
+                save(claim, recovery)?;
+            }
             // Binding and preparation retries run without a numeric reservation or defer.
-            while !files.open_advance(recovery.job, true).map_err(protocol)? {}
+            loop {
+                match files.open_advance(recovery.job, true) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(Status::Unknown(proto_fs::STALE_PROOF)) => {
+                        recovery.phase = Phase::Traversing;
+                        save(claim, recovery)?;
+                        continue 'prepare;
+                    }
+                    Err(error) => return Err(protocol(error)),
+                }
+            }
+            #[cfg(feature = "open-finalize-clock-probe")]
+            crate::open_finalize_probe::prepared(crate::open_finalize_probe::Prepared {
+                owner,
+                token,
+                claim,
+                job: recovery.job,
+                session: files.sessions().0.raw(),
+            })?;
             let defer = Defer::enter();
             let final_result = (|| {
                 let (entry, context) = crate::shared::with_files(|files| {
@@ -83,6 +107,8 @@ pub(crate) fn open(
                 let finished = match context.send_once() {
                     FinalizeResult::Finished(held) => Ok(held),
                     FinalizeResult::Deferred { proof, reason } => {
+                        #[cfg(feature = "open-finalize-clock-probe")]
+                        crate::open_finalize_probe::deferred(owner, token, reason);
                         crate::shared::with_files(|files| {
                             files
                                 .unreserve_open_record(claim, entry, proof)
@@ -146,6 +172,9 @@ pub(crate) fn open(
                     })?;
                     if reason == Status::Unknown(proto_fs::AUTHENTICATING) {
                         files.finish_binding().map_err(protocol)?;
+                    } else if reason == Status::Unknown(proto_fs::STALE_PROOF) {
+                        recovery.phase = Phase::Traversing;
+                        save(claim, recovery)?;
                     } else {
                         rt::sys::yield_now().map_err(|error| protocol(Status::Kernel(error)))?;
                     }

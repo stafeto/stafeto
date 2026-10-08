@@ -132,16 +132,7 @@ impl Ram<'_> {
             return;
         };
         assert_eq!(shared.generation, held.description.generation);
-        shared.refs -= 1;
-        if shared.refs == 0 {
-            let shared = self.descriptions[slot]
-                .take()
-                .expect("retained description");
-            self.storage
-                .unpin(self.token(shared.open.file), storage::Pin::Fd)
-                .expect("retained inode");
-            self.storage.release_description(shared.root);
-        }
+        self.release_shared(slot).expect("retained inode");
     }
 
     /// Capture the complete description identity before the service acknowledges Start.

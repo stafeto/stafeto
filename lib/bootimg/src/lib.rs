@@ -32,6 +32,7 @@
 extern crate alloc;
 
 pub mod elf;
+pub mod exec_bindings;
 pub mod rootfs;
 
 use abi::INIT_STACK_TOP;

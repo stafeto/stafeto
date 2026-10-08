@@ -304,6 +304,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-initial-fork"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "posix-map"
 version = "0.1.0"
 dependencies = [
@@ -353,6 +360,7 @@ dependencies = [
 name = "posix-process-service"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "bootimg",
  "posix-credentials",
  "proto-init",
@@ -367,9 +375,12 @@ name = "posix-procs"
 version = "0.1.0"
 dependencies = [
  "posix-abi",
+ "posix-clock",
  "posix-crt",
  "posix-fs",
  "posix-sync",
+ "posix-time",
+ "proto-clock",
  "proto-fs",
  "proto-loader",
  "proto-process",
@@ -553,6 +564,7 @@ name = "proto-init"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "bootimg",
  "proto-wire",
 ]
 
@@ -577,6 +589,7 @@ name = "proto-process"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "bootimg",
  "proto-wire",
 ]
 
@@ -685,6 +698,14 @@ dependencies = [
  "proto-init",
  "proto-uart",
  "proto-wire",
+]
+
+[[package]]
+name = "rt-loader-retained-tests"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "bootimg",
 ]
 
 [[package]]

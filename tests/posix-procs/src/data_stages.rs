@@ -157,7 +157,7 @@ fn full_mapping(files: &Files) -> Result<(), i32> {
 }
 
 #[cfg(feature = "data-carrier-probe")]
-fn counters(files: &Files) -> Result<([u32; 4], u32), Status> {
+pub(super) fn counters(files: &Files) -> Result<([u32; 4], u32), Status> {
     fn query(files: &Files, method: u16, phase: Option<u32>) -> Result<rt::sys::Reply, Status> {
         let mut request = proto_wire::Writer::new();
         proto_wire::Header::new(method, proto_fs::VERSION).write(&mut request)?;

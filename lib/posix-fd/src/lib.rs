@@ -1115,6 +1115,19 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         }
     }
 
+    /// Outstanding local custody includes cleanup debt whose original has ended.
+    pub fn has_holds(&self) -> bool {
+        self.holds
+            .iter()
+            .any(|slot| !matches!(slot.held, Held::Empty))
+    }
+
+    pub fn has_pending_entries(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry.state, EntryState::Pending(_)))
+    }
+
     /// This address remains stable through slot reuse. The caller pins Table.
     /// Wake occurs after unlocking; every waiter then revalidates its token.
     pub fn wait_word(&self, token: OpenToken) -> Result<&AtomicU32, Error> {

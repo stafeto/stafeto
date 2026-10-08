@@ -18,6 +18,9 @@ jobs = []
 native-scopes-launcher = []
 auth-probe = ["files"]
 data-carrier-probe = ["files"]
+public-data-probe = ["files"]
+public-data-loss-probe = ["data-carrier-probe", "public-data-probe", "posix-abi/data-driver-probe"]
+open-finalize-clock-probe = ["data-carrier-probe", "posix-abi/open-finalize-clock-probe", "dep:posix-clock", "dep:posix-time", "dep:proto-clock"]
 ipc-loss = ["files"]
 files = ["pending-open"]
 pending-open = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt", "dep:posix-fs", "dep:posix-sync"]
@@ -25,6 +28,7 @@ loader-abort = ["files", "dep:proto-process", "dep:proto-loader", "dep:posix-fs"
 image-gates = ["loader-abort"]
 image-info-probe = ["loader-abort"]
 image-gates-normal = ["image-gates"]
+t6-runtime = ["image-gates"]
 terminal = ["posix-crt/uart-input"]
 
 [dependencies]
@@ -39,3 +43,7 @@ proto-loader = { path = "../../proto/loader", optional = true }
 posix-fs = { path = "../../lib/posix-fs", optional = true }
 
 posix-sync = { path = "../../lib/posix-sync", optional = true }
+
+posix-clock = { path = "../../lib/posix-clock", optional = true }
+posix-time = { path = "../../lib/posix-time", optional = true }
+proto-clock = { path = "../../proto/clock", optional = true }

@@ -586,10 +586,13 @@ impl<'a> Ram<'a> {
     /// The open description `fd` of `fds` names takes `open`.
     fn put(&mut self, fds: &Fds, fd: u32, open: Open) -> Result<(), u32> {
         let index = fds.description(fd)?;
-        self.descriptions[index]
+        let shared = self.descriptions[index]
             .as_mut()
-            .expect("a named description")
-            .open = open;
+            .expect("a named description");
+        if shared.open.file != open.file || shared.open.flags & 3 != open.flags & 3 {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        shared.open = open;
         Ok(())
     }
 
@@ -612,6 +615,16 @@ impl<'a> Ram<'a> {
             .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
         self.storage.charge_description(fds.root)?;
         if let Err(code) = self.storage.pin(self.token(open.file), Pin::Fd) {
+            self.storage.release_description(fds.root);
+            return Err(code);
+        }
+        if self.storage.node(self.token(open.file))?.kind == REG
+            && open.flags & 3 != READ_ONLY
+            && let Err(code) = self.storage.acquire_writer(self.token(open.file))
+        {
+            self.storage
+                .unpin(self.token(open.file), Pin::Fd)
+                .expect("new inode pin");
             self.storage.release_description(fds.root);
             return Err(code);
         }
@@ -683,6 +696,9 @@ impl<'a> Ram<'a> {
         }
         if node.kind == DIR && (access != READ_ONLY || flags & proto_fs::TRUNCATE != 0) {
             return Err(IS_DIRECTORY);
+        }
+        if node.kind == REG && (access != READ_ONLY || flags & proto_fs::TRUNCATE != 0) {
+            self.storage.content_guard(token)?;
         }
         if node.kind == REG
             && (access != READ_ONLY || flags & proto_fs::TRUNCATE != 0)
@@ -871,17 +887,23 @@ impl<'a> Ram<'a> {
     pub fn close(&mut self, fds: &mut Fds, fd: u32) -> Result<(), u32> {
         let index = fds.description(fd)?;
         fds.slots[(fd - 3) as usize] = None;
+        self.release_shared(index)
+    }
+
+    /// Release one exact shared reference, including its final writer and root charge.
+    fn release_shared(&mut self, index: usize) -> Result<(), u32> {
         let shared = self.descriptions[index]
             .as_mut()
-            .expect("a named description");
+            .expect("retained description");
         shared.refs -= 1;
         if shared.refs == 0 {
-            let file = shared.open.file;
-            let root = shared.root;
-            let token = self.token(file);
-            self.descriptions[index] = None;
+            let shared = self.descriptions[index].take().expect("last description");
+            let token = self.token(shared.open.file);
+            if self.storage.node(token)?.kind == REG && shared.open.flags & 3 != READ_ONLY {
+                self.storage.release_writer(token);
+            }
             self.storage.unpin(token, Pin::Fd)?;
-            self.storage.release_description(root);
+            self.storage.release_description(shared.root);
         }
         Ok(())
     }
@@ -999,7 +1021,7 @@ impl<'a> Ram<'a> {
             let _ = self.storage.cancel(r);
             return true;
         }
-        if self.release_image(fds) {
+        if self.release_loading_image(fds) {
             return true;
         }
         if let Some(cwd) = fds.cwd.take() {
@@ -1025,6 +1047,27 @@ impl<'a> Ram<'a> {
                 .expect("named description")
                 .generation,
         })
+    }
+
+    /// Observe executable accounting for this running probe caller's exact descriptor.
+    #[cfg(feature = "auth-probe")]
+    pub fn probe_exec_pin(&self, fds: &Fds, fd: u32, expected: Token) -> Result<[u32; 4], u32> {
+        if !matches!(fds.binding, authority::Binding::Active(who) if who.loader.is_none()) {
+            return Err(proto_fs::PERMISSION);
+        }
+        if self.description_token(fds, fd)? != expected {
+            return Err(BAD_FD);
+        }
+        let node = self.storage.node(self.token(self.get(fds, fd)?.file))?;
+        if node.kind != REG {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        Ok([
+            u32::from(node.pins[Pin::Image as usize]),
+            u32::from(node.writers),
+            u32::from(self.storage.usage(fds.root).descriptions),
+            self.storage.probe_description_charges(),
+        ])
     }
 
     /// A raw token can serve as a relative base only when this session retains it.
@@ -1228,6 +1271,9 @@ impl<'a> Ram<'a> {
         if file.is_directory() && flags != READ_ONLY {
             return Err(IS_DIRECTORY);
         }
+        if file.kind() == REG && flags != READ_ONLY {
+            self.storage.content_guard(self.token(file))?;
+        }
         if matches!(file, File::Motd | File::ImageRegular(_)) && flags != READ_ONLY {
             return Err(proto_fs::ACCESS_DENIED);
         }
@@ -1334,6 +1380,7 @@ impl<'a> Ram<'a> {
         let File::ImageRegular(entry) = file else {
             return Err(proto_fs::ACCESS_DENIED);
         };
+        self.storage.exec_guard(self.token(file))?;
         Ok(Exec {
             entry,
             mode: info.permissions,
@@ -1344,10 +1391,20 @@ impl<'a> Ram<'a> {
 
     /// The information of the program file of an image session.
     pub fn exec_token(&self, token: Token, identity: authority::Identity) -> Result<Exec, u32> {
-        let n = self.storage.node(token)?;
-        if n.kind != REG || n.boot == storage::NONE || !identity.permits(n, 1) {
+        let exec = self.exec_inode(token, identity)?;
+        if exec.entry == storage::NONE {
             return Err(proto_fs::ACCESS_DENIED);
         }
+        Ok(exec)
+    }
+
+    /// Canonical executable metadata; custody is supplied by the image hold caller.
+    pub fn exec_inode(&self, token: Token, identity: authority::Identity) -> Result<Exec, u32> {
+        let n = self.storage.node(token)?;
+        if n.kind != REG || !identity.permits(n, 1) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        self.storage.exec_guard(token)?;
         Ok(Exec {
             entry: n.boot,
             mode: n.mode,

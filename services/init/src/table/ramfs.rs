@@ -185,18 +185,34 @@ pub const POSIX_DIALOG_TABLE: &[Record] = &[
     },
 ];
 
-#[cfg(not(feature = "data-carrier-probe"))]
+#[cfg(all(not(feature = "data-carrier-probe"), not(feature = "t6-runtime")))]
 const RAM_POSIX_FILES: Record = RAM_CLOCKED;
-#[cfg(feature = "data-carrier-probe")]
+#[cfg(all(
+    feature = "data-carrier-probe",
+    not(feature = "open-finalize-clock-probe"),
+    not(feature = "t6-runtime")
+))]
 const RAM_POSIX_FILES: Record = Record {
-    // The steps,auth-probe ELF maps 10 RO + 36 RX + 925 RW pages.
+    // The joint steps,auth-probe ELF maps 10 RO + 37 RX + 925 RW pages.
     // Data pages, stack and allowance are paid separately in this fixture.
-    quota: (4096 + 971 + 12 + 128) * PAGE,
+    quota: (4096 + 972 + 12 + 128) * PAGE,
+    ..RAM_CLOCKED
+};
+
+#[cfg(feature = "open-finalize-clock-probe")]
+const RAM_POSIX_FILES: Record = Record {
+    // The joint steps,open-finalize-clock-probe ELF maps 10 RO + 37 RX + 925 RW pages.
+    quota: (4096 + 972 + 12 + 128) * PAGE,
     ..RAM_CLOCKED
 };
 
 /// The authentic identity and bounded file proof fixture, before public mutation APIs.
-#[cfg(not(any(feature = "ramfs-cleanup", feature = "loader-abort")))]
+#[cfg(not(any(
+    feature = "ramfs-cleanup",
+    feature = "loader-abort",
+    feature = "public-data-probe",
+    feature = "t6-runtime"
+)))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
     RAM_POSIX_FILES,
     POSIX_ABI_TABLE[1],
@@ -212,10 +228,41 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
     },
 ];
 
+/// The public data fixture retains genuine pipe and random device routes.
+#[cfg(all(
+    feature = "public-data-probe",
+    not(any(
+        feature = "ramfs-cleanup",
+        feature = "loader-abort",
+        feature = "t6-runtime"
+    ))
+))]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    RAM_POSIX_FILES,
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "clock", "posix", "pipe", "entropy"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
+];
+
 /// Genuine uncommitted exec attempts with one pending image at a time.
-#[cfg(all(feature = "loader-abort", not(feature = "loader-info")))]
+#[cfg(all(
+    feature = "loader-abort",
+    not(feature = "loader-info"),
+    not(feature = "t6-runtime")
+))]
 const RAM_LOADER_INFO: Record = RAM_CLOCKED;
-#[cfg(feature = "loader-info")]
+#[cfg(all(feature = "loader-info", not(feature = "t6-runtime")))]
 const RAM_LOADER_INFO: Record = Record {
     // This diagnostic ELF maps 9 RO + 31 RX + 920 RW pages.
     // The fixed data pool, stack and runtime allowance are paid separately.
@@ -223,7 +270,7 @@ const RAM_LOADER_INFO: Record = Record {
     ..RAM_CLOCKED
 };
 
-#[cfg(feature = "loader-abort")]
+#[cfg(all(feature = "loader-abort", not(feature = "t6-runtime")))]
 pub const POSIX_FILES_TABLE: &[Record] = &[
     RAM_LOADER_INFO,
     Record {
@@ -236,6 +283,32 @@ pub const POSIX_FILES_TABLE: &[Record] = &[
         program: "posix-files",
         args: b"posix-files\0",
         connects: &["ramfs", "clock", "posix"],
+        quota: 2048 * PAGE,
+        root: true,
+        ..POSIX
+    },
+];
+
+/// Three independently held runtime images use real pipe handshakes.
+/// The measured image-gates,steps ELF maps 10 RO + 38 RX + 928 RW pages.
+/// Data pool, stack and runtime allowance are paid separately.
+#[cfg(feature = "t6-runtime")]
+pub const POSIX_FILES_TABLE: &[Record] = &[
+    Record {
+        quota: (4096 + 976 + 12 + 128) * PAGE,
+        ..RAM_CLOCKED
+    },
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 3 * 2048 * PAGE + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "posix-files",
+        program: "posix-files",
+        args: b"posix-files\0",
+        connects: &["ramfs", "pipe", "clock", "posix"],
         quota: 2048 * PAGE,
         root: true,
         ..POSIX
@@ -315,8 +388,9 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     Record {
         name: "posix",
         program: "posix-process-service",
-        // Its own, and the eight objects of the pages of its records
-        // (32 pages each); what its POSIX records take init adds.
+        // Its own, and the 64 objects of the pages of its records
+        // (four data pages and one page-list node each); init adds what
+        // its POSIX records take.
         quota: 640 * PAGE,
         // A process handle for each of its 256 records.
         handle_limit: 1024,
@@ -500,9 +574,10 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 const STEPS_QUOTA: u64 = (413 + 16) * PAGE;
 
 /// The probe and each child it spawns inherit this budget. Its 1 MiB
-/// allocator growth needs 538 transient pages: 261 live, 274 for the
-/// memory object and 3 prepaid page tables. Retain the 16-page reserve.
-const PROCS_QUOTA: u64 = (538 + 16) * PAGE;
+/// allocator growth needs 556 transient pages: 279 live, 274 for the
+/// memory object and 3 prepaid page tables. The image maps 29/109/40 pages.
+/// Retain the 16-page reserve.
+const PROCS_QUOTA: u64 = (556 + 16) * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and
