@@ -3906,12 +3906,22 @@ fn ash_dialog() -> Result<(), String> {
         run.send("RANDOM=7; a=$RANDOM; RANDOM=7; b=$RANDOM; case $a in $b) echo repeats;; *) echo no-repeat;; esac")?;
         run.expect_line("repeats", |line| line == "repeats", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
-        // mktemp takes its names from the generator (mkstemp of relibc);
-        // no file can be created yet (5i), so every try meets the same
-        // refusal and it gives up with EEXIST, status 1.
+        // mktemp creates an exclusive file with a name from the generator.
         run.send("mktemp /tmp/dialog.XXXXXX; echo mktemp $?")?;
-        run.expect("File exists", DIALOG_STEP)?;
-        run.expect_line("mktemp 1", |line| line == "mktemp 1", DIALOG_STEP)?;
+        let temporary = run.expect_line(
+            "temporary file name",
+            |line| {
+                line.strip_prefix("/tmp/dialog.").is_some_and(|suffix| {
+                    suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+            },
+            DIALOG_STEP,
+        )?;
+        run.expect_line("mktemp 0", |line| line == "mktemp 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send(&format!("/bin/ls {temporary}; echo temporary-file $?"))?;
+        run.expect_line("created temporary file", |line| line == temporary, DIALOG_STEP)?;
+        run.expect_line("temporary-file 0", |line| line == "temporary-file 0", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("exit")?;
         run.expect("exit", DIALOG_STEP)?;
