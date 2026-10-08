@@ -187,7 +187,10 @@ fn expectation_files(expect: &Path, test: &str) -> Result<Vec<(String, String)>,
 
 /// Whether `outcome` meets the expectations in `files` (the part of a
 /// file name after `<test>.` and its text): a defined one, or an
-/// `unknown.*` one when the test has no defined expectation at all.
+/// `unknown.*` one when the test has no defined expectation at all. os-test's
+/// own classifier (misc/html.c) calls any match of an `unknown.*` file
+/// UNKNOWN; this is stricter, so that a test with both kinds (such as
+/// pty/tcsetpgrp-wrong-pid) can still PASS and be guarded by pass.txt.
 fn judge_expectations(files: &[(String, String)], outcome: &str) -> Expectation {
     let open = |name: &str| name.starts_with("unknown.");
     if files
@@ -204,21 +207,81 @@ fn judge_expectations(files: &[(String, String)], outcome: &str) -> Expectation 
     }
 }
 
-/// The options of os-test's tests the system does not claim: process
-/// scheduling (PS), and the XSI extensions, which the POSIX design leaves
-/// out (specs/2026-10-01-subproject-2-posix-design.md, section 1).
-const UNCLAIMED: [&str; 2] = ["PS", "XSI"];
+/// The macro of `<unistd.h>` that claims an option of os-test's markers:
+/// the option is claimed when the header defines it. Options not listed
+/// here are taken as claimed, so that their failures stay FAILs.
+const OPTION_MACROS: [(&str, &str); 4] = [
+    ("PS", "_POSIX_PRIORITY_SCHEDULING"),
+    ("SPN", "_POSIX_SPAWN"),
+    ("TSH", "_POSIX_THREAD_PROCESS_SHARED"),
+    ("XSI", "_XOPEN_UNIX"),
+];
+
+/// Whether `header` (the text of unistd.h) defines `macro`.
+fn defines(header: &str, macro_name: &str) -> bool {
+    header.lines().any(|line| {
+        line.strip_prefix("#define ")
+            .and_then(|rest| rest.strip_prefix(macro_name))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+    })
+}
+
+/// Whether the system claims `option`, by the unistd.h in `header`.
+fn claims(header: &str, option: &str) -> bool {
+    OPTION_MACROS
+        .iter()
+        .find(|(code, _)| *code == option)
+        .is_none_or(|(_, macro_name)| defines(header, macro_name))
+}
 
 /// The unclaimed option a test needs, by the marker os-test puts first in
 /// its source: `/*[A B]*/` needs A and B, `/*[A|B]*/` needs A or B.
-fn unclaimed_option(source: &str) -> Option<String> {
+fn unclaimed_option(source: &str, header: &str) -> Option<String> {
     let marker = source.lines().next()?.strip_prefix("/*[")?;
     let marker = marker.split_once("]*/")?.0;
     marker.split_whitespace().find_map(|need| {
         need.split('|')
-            .all(|option| UNCLAIMED.contains(&option))
+            .all(|option| !claims(header, option))
             .then(|| need.to_owned())
     })
+}
+
+/// The verdict of a test by its expectations, whether it `exited` by
+/// itself and its `text`; `unclaimed` tells whether it needs an option the
+/// system does not claim (asked only when that can matter). A test that did
+/// not exit, or died by a signal, is never UNSUPPORTED.
+fn decide(
+    met: Expectation,
+    exited: bool,
+    text: &str,
+    unclaimed: impl FnOnce() -> Result<bool, String>,
+) -> Result<Verdict, String> {
+    Ok(match met {
+        Expectation::Defined => Verdict::Pass,
+        Expectation::Open => Verdict::Unknown,
+        Expectation::Unmet if exited && !died_by_signal(text) && unclaimed()? => {
+            Verdict::Unsupported
+        }
+        Expectation::Unmet => Verdict::Fail,
+    })
+}
+
+/// The unistd.h relibc was built with.
+fn unistd_header() -> Result<String, String> {
+    let sysroot = std::env::var_os("STAFETO_RELIBC_SYSROOT")
+        .map_or_else(|| target_dir().join("relibc/sysroot"), PathBuf::from);
+    let path = sysroot.join("include/unistd.h");
+    std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Whether the text of an outcome ends with the status of a test that died
+/// by a signal (128 or more as the shell sees it).
+fn died_by_signal(text: &str) -> bool {
+    text.lines()
+        .next_back()
+        .and_then(|line| line.strip_prefix("exit: "))
+        .and_then(|code| code.parse::<i64>().ok())
+        .is_some_and(|code| code >= 128)
 }
 
 /// Finds readiness calls, including ppoll and pselect.
@@ -505,7 +568,9 @@ fn expectation(work: &Path, test: &Test, text: &str) -> Result<Expectation, Stri
 
 /// The verdict and text of a test that `ended`: PASS for a defined
 /// expectation, UNKNOWN for an open one, UNSUPPORTED when it needs an
-/// option the system does not claim, else FAIL.
+/// option unistd.h does not claim and ended by itself (it did not fault, was
+/// not killed and did not hang: those are FAILs whatever the option), else
+/// FAIL.
 fn judge(work: &Path, test: &Test, ended: Ended) -> Result<(Verdict, String), String> {
     let (text, exited) = match ended {
         Ended::Exited(text) => (text, true),
@@ -516,14 +581,10 @@ fn judge(work: &Path, test: &Test, ended: Ended) -> Result<(Verdict, String), St
     } else {
         Expectation::Unmet
     };
-    let verdict = match met {
-        Expectation::Defined => Verdict::Pass,
-        Expectation::Open => Verdict::Unknown,
-        Expectation::Unmet if unclaimed_option(&source_of(work, test)?).is_some() => {
-            Verdict::Unsupported
-        }
-        Expectation::Unmet => Verdict::Fail,
-    };
+    let verdict = decide(met, exited, &text, || {
+        let source = source_of(work, test)?;
+        Ok(unclaimed_option(&source, &unistd_header()?).is_some())
+    })?;
     Ok((verdict, text))
 }
 
@@ -920,28 +981,59 @@ mod tests {
         assert_eq!(judge_expectations(&plain, "a\n"), Expectation::Defined);
     }
 
-    /// The marker of a test names the options it needs: one the system does
-    /// not claim makes it UNSUPPORTED, an alternative with a claimed option
-    /// does not.
+    const HEADER: &str = "#define _POSIX_SPAWN 202405L\n#define _POSIX_SHELL 1\n";
+
+    /// The marker of a test names the options it needs: one unistd.h does
+    /// not define makes it UNSUPPORTED, an alternative with a claimed option
+    /// does not, and an option without a macro in the table stays claimed.
     #[test]
     fn unclaimed_options_are_read_from_the_marker() {
+        let find = |source| unclaimed_option(source, HEADER);
+        assert_eq!(find("/*[SPN PS]*/\n/* Test */"), Some("PS".to_owned()));
+        assert_eq!(find("/*[XSI]*/\nint x;"), Some("XSI".to_owned()));
+        assert_eq!(find("/*[TSH]*/\nint x;"), Some("TSH".to_owned()));
+        assert_eq!(find("/*[SPN]*/\nint x;"), None);
+        assert_eq!(find("/*[PS|SPN]*/\nint x;"), None);
+        assert_eq!(find("/*[RPP|TPP]*/\nint x;"), None);
+        assert_eq!(find("/*[PS|XSI]*/\nint x;"), Some("PS|XSI".to_owned()));
+        assert_eq!(find("/* Test sigaltstack. */"), None);
+        assert_eq!(find(""), None);
+        // The header decides: with _POSIX_SPAWN gone SPN is unclaimed, and
+        // a longer macro name does not stand for a shorter one.
+        assert_eq!(unclaimed_option("/*[SPN]*/\n", ""), Some("SPN".to_owned()));
         assert_eq!(
-            unclaimed_option("/*[SPN PS]*/\n/* Test */"),
-            Some("PS".to_owned())
-        );
-        assert_eq!(
-            unclaimed_option("/*[XSI]*/\nint x;"),
+            unclaimed_option("/*[XSI]*/\n", "#define _XOPEN_UNIX_X 1\n"),
             Some("XSI".to_owned())
         );
-        assert_eq!(unclaimed_option("/*[SPN]*/\nint x;"), None);
-        assert_eq!(unclaimed_option("/*[PS|SPN]*/\nint x;"), None);
-        assert_eq!(unclaimed_option("/*[RPP|TPP]*/\nint x;"), None);
         assert_eq!(
-            unclaimed_option("/*[PS|XSI]*/\nint x;"),
-            Some("PS|XSI".to_owned())
+            unclaimed_option("/*[XSI]*/\n", "#define _XOPEN_UNIX 1\n"),
+            None
         );
-        assert_eq!(unclaimed_option("/* Test sigaltstack. */"), None);
-        assert_eq!(unclaimed_option(""), None);
+    }
+
+    /// A test that hangs, faults or is killed is a FAIL even for an option
+    /// the system does not claim; one that exits by itself is UNSUPPORTED.
+    #[test]
+    fn a_crash_is_not_an_unsupported_option() {
+        let unclaimed = || Ok(true);
+        let by = |met, exited, text| decide(met, exited, text, unclaimed).unwrap();
+        let unmet = || Expectation::Unmet;
+        assert_eq!(by(unmet(), true, "first: EINVAL\n"), Verdict::Unsupported);
+        assert_eq!(by(unmet(), true, "exit: 1\n"), Verdict::Unsupported);
+        assert_eq!(by(unmet(), true, "partial\nexit: 139\n"), Verdict::Fail);
+        assert_eq!(by(unmet(), true, "exit: 128\n"), Verdict::Fail);
+        assert_eq!(by(unmet(), false, "timeout: no end\n"), Verdict::Fail);
+        // A claimed option, a pass and an open outcome keep their verdicts.
+        let claimed = || Ok(false);
+        assert_eq!(
+            decide(unmet(), true, "x\n", claimed).unwrap(),
+            Verdict::Fail
+        );
+        assert_eq!(by(Expectation::Defined, true, "exit: 0\n"), Verdict::Pass);
+        assert_eq!(by(Expectation::Open, true, "0\n"), Verdict::Unknown);
+        assert!(!died_by_signal("first lockf: EINVAL\n"));
+        assert!(!died_by_signal("exit: 127\n"));
+        assert!(!died_by_signal(""));
     }
 
     #[test]
