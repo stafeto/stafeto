@@ -22,3 +22,7 @@ proto-wire = { path = "../../proto/wire" }
 rt = { path = "../rt" }
 proto-pipe = { path = "../../proto/pipe" }
 proto-tty = { path = "../../proto/tty" }
+
+[dev-dependencies]
+ramfs = { path = "../../services/ramfs", features = ["host-replay"] }
+proto-process = { path = "../../proto/process" }

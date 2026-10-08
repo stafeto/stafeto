@@ -1528,6 +1528,76 @@ pub struct SmallCleanupProof {
     last_target: Option<Target>,
     session: u64,
 }
+/// The native cleanup stage retains its own rejection semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupStage {
+    Cancel,
+    Ack,
+}
+
+/// This selector never releases custody or changes a cached application result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupDisposition {
+    Continue,
+    Retry,
+    Retain,
+    Abandon,
+}
+
+pub fn cleanup_disposition(stage: CleanupStage, error: Status) -> CleanupDisposition {
+    match error {
+        Status::Unknown(proto_fs::OPEN_RETIRED) if stage == CleanupStage::Ack => {
+            CleanupDisposition::Continue
+        }
+        Status::Unknown(proto_fs::RESOLVING) => CleanupDisposition::Retry,
+        Status::Kernel(rt::abi::Error::Interrupted) => CleanupDisposition::Retain,
+        Status::Unknown(proto_fs::OPEN_RETIRED) if stage == CleanupStage::Cancel => {
+            CleanupDisposition::Retain
+        }
+        Status::Unknown(_) => CleanupDisposition::Retain,
+        _ => CleanupDisposition::Abandon,
+    }
+}
+
+/// Failure preserves the exact native stage before errno conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupFailure {
+    Native { stage: CleanupStage, status: Status },
+    Release(FsError),
+}
+impl CleanupFailure {
+    pub fn disposition(self) -> CleanupDisposition {
+        match self {
+            Self::Native { stage, status } => cleanup_disposition(stage, status),
+            Self::Release(_) => CleanupDisposition::Retain,
+        }
+    }
+    pub fn error(self) -> FsError {
+        match self {
+            Self::Native { status, .. } => FsError::from(status),
+            Self::Release(error) => error,
+        }
+    }
+}
+
+trait CleanupEffects {
+    fn cancel(&mut self, key: OpenKey) -> Result<(), Status>;
+    fn ack(&mut self, key: OpenKey) -> Result<(), Status>;
+    fn release(&mut self, target: Option<Target>) -> Result<(), FsError>;
+}
+struct NativeCleanup<'a>(&'a Transport);
+impl CleanupEffects for NativeCleanup<'_> {
+    fn cancel(&mut self, key: OpenKey) -> Result<(), Status> {
+        self.0.files().data_cancel_once(key)
+    }
+    fn ack(&mut self, key: OpenKey) -> Result<(), Status> {
+        self.0.files().data_ack_once(key)
+    }
+    fn release(&mut self, target: Option<Target>) -> Result<(), FsError> {
+        release_data_target(self.0, target)
+    }
+}
+
 impl CleanupContext {
     /// Cancel fences an uncertain Start; ACK retires any completed cache.
     /// CloseExact consumes only the captured description lifetime.
@@ -1544,15 +1614,40 @@ impl CleanupContext {
 
     #[inline(never)]
     pub fn send_small_once(&self) -> Result<SmallCleanupProof, FsError> {
-        let files = self.transport.files();
-        files
-            .data_cancel_once(key(self.cleanup.token))
-            .map_err(FsError::from)?;
-        match files.data_ack_once(key(self.cleanup.token)) {
+        self.attempt_small_once().map_err(CleanupFailure::error)
+    }
+
+    pub fn attempt_small_once(&self) -> Result<SmallCleanupProof, CleanupFailure> {
+        self.attempt_with(&mut NativeCleanup(&self.transport))
+    }
+
+    #[cfg(test)]
+    fn send_with(&self, effects: &mut impl CleanupEffects) -> Result<SmallCleanupProof, FsError> {
+        self.attempt_with(effects).map_err(CleanupFailure::error)
+    }
+
+    fn attempt_with(
+        &self,
+        effects: &mut impl CleanupEffects,
+    ) -> Result<SmallCleanupProof, CleanupFailure> {
+        effects
+            .cancel(key(self.cleanup.token))
+            .map_err(|status| CleanupFailure::Native {
+                stage: CleanupStage::Cancel,
+                status,
+            })?;
+        match effects.ack(key(self.cleanup.token)) {
             Ok(()) | Err(Status::Unknown(proto_fs::OPEN_RETIRED)) => {}
-            Err(error) => return Err(FsError::from(error)),
+            Err(status) => {
+                return Err(CleanupFailure::Native {
+                    stage: CleanupStage::Ack,
+                    status,
+                });
+            }
         }
-        release_data_target(&self.transport, self.cleanup.last_target)?;
+        effects
+            .release(self.cleanup.last_target)
+            .map_err(CleanupFailure::Release)?;
         Ok(SmallCleanupProof {
             token: self.cleanup.token,
             last_target: self.cleanup.last_target,
@@ -2084,6 +2179,19 @@ impl PosixFs {
             transport: self.transport(),
         })
     }
+    /// Borrowed validation ends before any cleanup IPC can begin.
+    pub fn validate_data_cleanup_context(&self, context: &CleanupContext) -> Result<(), FsError> {
+        let view = self.descriptors.scalar_view(context.cleanup.token)?;
+        if view.phase != ScalarPhase::Cleaning
+            || view.last_target != context.cleanup.last_target
+            || view.recovery != &context.cleanup.recovery
+            || context.session != self.sessions().0.raw().0
+        {
+            return Err(FsError::Io);
+        }
+        Ok(())
+    }
+
     pub fn finish_data_cleanup_from_context(
         &mut self,
         context: &CleanupContext,
@@ -2155,3 +2263,7 @@ impl PosixFs {
             .map_err(FsError::from)
     }
 }
+
+#[cfg(test)]
+#[path = "data_cleanup_replay.rs"]
+mod cleanup_replay;

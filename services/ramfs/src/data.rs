@@ -60,6 +60,14 @@ impl Journal {
         })
     }
 
+    /// Host fault injection retains prepared pages through a cached terminal result.
+    #[cfg(feature = "host-replay")]
+    pub fn fail_cleanup_replay(&mut self, code: u32) {
+        assert!(proto_fs::terminal_failure(code));
+        assert_eq!(self.result, DataResult::None);
+        let _ = self.fail(code);
+    }
+
     pub fn originating_root(&self) -> crate::storage::Root {
         self.originating_root
     }

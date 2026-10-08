@@ -291,8 +291,10 @@ dependencies = [
  "posix-path",
  "proto-fs",
  "proto-pipe",
+ "proto-process",
  "proto-tty",
  "proto-wire",
+ "ramfs",
  "rt",
 ]
 

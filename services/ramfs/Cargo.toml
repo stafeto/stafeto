@@ -16,6 +16,8 @@ test = false
 bench = false
 
 [features]
+# Host custody replay injects terminal pre-effect failure after private page preparation.
+host-replay = []
 # Read-only retained-session observation for the owner-death regression.
 auth-probe = []
 # Private full physical-page and retained-job measurements.
