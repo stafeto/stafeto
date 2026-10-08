@@ -299,9 +299,107 @@ impl Bind {
     }
 }
 
+/// The caller authenticates the RAM endpoint and current boot order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seal {
+    pub epoch: u64,
+    pub order: u64,
+}
+impl Seal {
+    pub fn write(self, out: &mut Writer) -> Result<(), Status> {
+        if self.epoch == 0 || self.order == 0 {
+            return Err(Status::BadSize);
+        }
+        out.u64(self.epoch)?;
+        out.u64(self.order)
+    }
+    pub fn read(bytes: &[u8], caps: usize) -> Result<Self, Status> {
+        if caps != 0 {
+            return Err(Status::BadSize);
+        }
+        let mut input = Reader::new(bytes);
+        let value = Self {
+            epoch: input.u64()?,
+            order: input.u64()?,
+        };
+        input.finish()?;
+        if value.epoch == 0 || value.order == 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(value)
+    }
+    pub fn write_reply(self, out: &mut Writer) -> Result<(), Status> {
+        out.bytes(&proto_wire::reply(Status::Ok))?;
+        self.write(out)
+    }
+    pub fn read_reply(bytes: &[u8], caps: usize) -> Result<Self, Status> {
+        if caps != 0 {
+            return Err(Status::BadSize);
+        }
+        let mut input = Reader::new(bytes);
+        let status = Status::from_code(input.u32()?);
+        if input.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        if status != Status::Ok {
+            input.finish()?;
+            return Err(status);
+        }
+        Self::read(input.bytes(16)?, 0).and_then(|value| {
+            input.finish()?;
+            Ok(value)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn seal_literal_full_width_and_exact_reply() {
+        let body = [
+            255, 255, 255, 255, 255, 255, 255, 255, 2, 0, 0, 0, 1, 0, 0, 0,
+        ];
+        let value = Seal {
+            epoch: u64::MAX,
+            order: 0x100000002,
+        };
+        assert_eq!(Seal::read(&body, 0), Ok(value));
+        let mut writer = Writer::new();
+        value.write(&mut writer).unwrap();
+        assert_eq!(writer.as_bytes(), body);
+        let mut reply = [0; 24];
+        reply[8..].copy_from_slice(&body);
+        let mut writer = Writer::new();
+        value.write_reply(&mut writer).unwrap();
+        assert_eq!(writer.as_bytes(), reply);
+        assert_eq!(Seal::read_reply(&reply, 0), Ok(value));
+        for caps in 1..=4 {
+            assert_eq!(Seal::read(&body, caps), Err(Status::BadSize));
+            assert_eq!(Seal::read_reply(&reply, caps), Err(Status::BadSize));
+        }
+        for length in 0..24 {
+            assert_eq!(Seal::read_reply(&reply[..length], 0), Err(Status::BadSize));
+        }
+        for offset in [0, 8] {
+            let mut malformed = body;
+            malformed[offset..offset + 8].fill(0);
+            assert_eq!(Seal::read(&malformed, 0), Err(Status::BadSize));
+        }
+        let mut extended = [0; 25];
+        extended[..24].copy_from_slice(&reply);
+        assert_eq!(Seal::read_reply(&extended, 0), Err(Status::BadSize));
+        reply[4] = 1;
+        assert_eq!(Seal::read_reply(&reply, 0), Err(Status::BadSize));
+        let refusal = proto_wire::reply(Status::Kernel(abi::Error::BadState));
+        assert_eq!(
+            Seal::read_reply(&refusal, 0),
+            Err(Status::Kernel(abi::Error::BadState))
+        );
+        let mut bad_refusal = [0; 24];
+        bad_refusal[..8].copy_from_slice(&refusal);
+        assert_eq!(Seal::read_reply(&bad_refusal, 0), Err(Status::BadSize));
+    }
     fn literal() -> [u8; 40] {
         // Literal full-width key, committed result and retirement action.
         [
