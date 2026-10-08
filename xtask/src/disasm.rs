@@ -184,6 +184,26 @@ fn executable_segments(bytes: &[u8]) -> Result<Vec<(u64, &[u8])>, String> {
     Ok(segments)
 }
 
+/// ST1 (store of vector registers) in the groups of the structure
+/// accesses, the opcodes of LLD's `isST1MultipleOpcode` and
+/// `isST1SingleOpcode`; ST2 to ST4 are no part of the sequence.
+fn st1(word: u32) -> bool {
+    let (opcode, size, store) = ((word >> 12) & 0xf, (word >> 10) & 3, word & (1 << 22) == 0);
+    if !store {
+        return false;
+    }
+    if word & 0xbf20_0000 == 0x0c00_0000 {
+        return matches!(opcode, 0b0111 | 0b1010 | 0b0110 | 0b0010);
+    }
+    if word & 0xbf20_0000 == 0x0d00_0000 {
+        let (opcode, s) = (opcode >> 1, opcode & 1);
+        return opcode == 0
+            || (opcode == 2 && size & 1 == 0)
+            || (opcode == 4 && (size == 0 || (size == 1 && s == 0)));
+    }
+    false
+}
+
 /// Whether `word` is a load or store that may stand second in an erratum
 /// 843419 sequence (the classes of the LLD test `is843419ErratumSequence`):
 /// a single register access of any addressing form, an exclusive access, a
@@ -194,19 +214,31 @@ fn second_access(word: u32) -> bool {
         || word & 0x3f00_0000 == 0x0800_0000
         || word & 0x3b00_0000 == 0x1800_0000
         || (word & 0x3a00_0000 == 0x2800_0000 && store)
-        || (word & 0xbf00_0000 == 0x0c00_0000 && store)
-        || (word & 0xbf20_0000 == 0x0d00_0000 && store)
+        || st1(word)
+}
+
+/// Whether the single register access `word` loads a general or vector
+/// register (LLD's `isV8NonStructureLoad`: opc not 0, but the 128-bit
+/// vector store and PRFM, whose opc is 2, are no loads; LDRSB, LDRSH and
+/// LDRSW into X have a clear bit 22 and are loads).
+fn single_load(word: u32) -> bool {
+    let (size, vector, opc) = (word >> 30, word & (1 << 26) != 0, (word >> 22) & 3);
+    opc != 0 && !(opc == 2 && ((size == 0 && vector) || (size == 3 && !vector)))
 }
 
 /// Whether the second instruction `word` of a sequence writes the
 /// register `register`: a load into it, a status register of a store
-/// exclusive, or a base register written back.
+/// exclusive, or a base register written back. A load of a vector
+/// register of the same number does not count (LLD counts it, so the
+/// check is stricter there: it finds a sequence that the linker leaves,
+/// and the code has to change when it does).
 fn writes_register(word: u32, register: u32) -> bool {
     let (rt, base) = (word & 0x1f, (word >> 5) & 0x1f);
     let load = word & (1 << 22) != 0;
     let vector = word & (1 << 26) != 0;
     if word & 0x3b00_0000 == 0x1800_0000 {
-        return !vector && rt == register;
+        // Literal: PRFM (opc 3) writes nothing.
+        return !vector && word >> 30 != 3 && rt == register;
     }
     if word & 0x3f00_0000 == 0x0800_0000 {
         return if load {
@@ -217,13 +249,14 @@ fn writes_register(word: u32, register: u32) -> bool {
     }
     if word & 0x3a00_0000 == 0x3800_0000 {
         let written_back = word & (1 << 24) == 0 && word & (1 << 21) == 0 && (word >> 10) & 1 == 1;
-        return (load && !vector && rt == register) || (written_back && base == register);
+        return (single_load(word) && !vector && rt == register)
+            || (written_back && base == register);
     }
     if word & 0x3a00_0000 == 0x2800_0000 {
         let written_back = matches!((word >> 23) & 3, 1 | 3);
         return written_back && base == register;
     }
-    // ST1 and the like: a post-indexed form writes its base back.
+    // ST1: a post-indexed form writes its base back.
     word & 0xbe00_0000 == 0x0c00_0000 && word & (1 << 23) != 0 && base == register
 }
 
@@ -281,7 +314,8 @@ fn sequences_843419(base: u64, code: &[u8]) -> Vec<u64> {
 /// kernel's rustflags pass and the hard-float program target passes by
 /// default), and this finds a sequence that the linker left, which a
 /// build that loses the flag shows only when an ADRP lands at the end of
-/// a page (the flag itself is checked where the link line is read). The segments are
+/// a page. Only the link line of the os-test programs is checked for the
+/// flag itself (ostest.rs). The segments are
 /// loaded on 4 KiB pages, so the offset in the page is the offset of the
 /// address. Every kernel build and every program of a boot image goes
 /// through it, with the 835769 check.
@@ -423,6 +457,23 @@ mod tests {
         assert!(at(&[ADRP_X8, LDR_X1_X8_POST, STR_X2_X8_8]).is_empty());
         // The same access to another base is a sequence.
         assert_eq!(at(&[ADRP_X8, LDR_X1_X0, STR_X2_X8_8]), [0x4000_0ff8]);
+    }
+
+    #[test]
+    fn spares_a_signed_load_into_the_register_and_st2() {
+        let at = |code: &[u32]| sequences_843419(0x4000_0ff8, &bytes(code));
+        // adrp x8; ldrsw x8, [x8]; ldr x0, [x8]: the pointer is loaded.
+        assert!(at(&[ADRP_X8, 0xb980_0108, LDR_X0_X8]).is_empty());
+        // st1 {v0.16b}, [x0] is a sequence, st2 {v0.4s, v1.4s}, [x0] is not.
+        assert_eq!(at(&[ADRP_X8, 0x4c00_7000, STR_X2_X8_8]), [0x4000_0ff8]);
+        assert!(at(&[ADRP_X8, 0x4c00_8800, STR_X2_X8_8]).is_empty());
+    }
+
+    #[test]
+    fn finds_a_vector_load_of_the_number_of_the_register() {
+        // ldr d8, [x0] writes v8, not x8; LLD leaves it, this check does not.
+        let code = bytes(&[ADRP_X8, 0xfd40_0008, STR_X2_X8_8]);
+        assert_eq!(sequences_843419(0x4000_0ff8, &code), [0x4000_0ff8]);
     }
 
     #[test]
