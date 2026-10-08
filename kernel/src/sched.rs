@@ -375,6 +375,7 @@ pub unsafe fn set_layer_role(
         // SAFETY: SCHED guards publication and immediate pending delivery together.
         let selected = unsafe { crate::process::layers::set_role(t, role, enabled) }?;
         match selected {
+            // SAFETY: the selected live list member remains under this SCHED guard.
             Some(selected) => unsafe { request_role_locked(selected, k) },
             None => Ok(None),
         }
@@ -393,6 +394,7 @@ pub unsafe fn request_process_layer(
     let interrupted = locked(|k| {
         // SAFETY: selection and request share one guard; no head borrow escapes.
         let selected = unsafe { crate::process::layers::select(p, true) }?;
+        // SAFETY: the selected live list member remains under this SCHED guard.
         unsafe { request_role_locked(selected, k) }
     })?;
     finish_role_interrupt(interrupted, cause);
