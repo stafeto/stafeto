@@ -423,6 +423,13 @@ fn cleanup_status_dispositions_never_turn_failure_into_done_or_new_effect() {
         CleanupDisposition::Retain
     );
     assert_eq!(
+        cleanup_disposition(
+            CleanupStage::Cancel,
+            Status::Kernel(rt::abi::Error::Unknown(777))
+        ),
+        CleanupDisposition::Retain
+    );
+    assert_eq!(
         cleanup_disposition(CleanupStage::Cancel, Status::Unknown(9999)),
         CleanupDisposition::Retain
     );
@@ -482,6 +489,10 @@ fn native_pending_unknown_and_nonretryable_keep_exact_cached_result_and_debt() {
             CleanupDisposition::Retry,
         ),
         (Status::Unknown(9999), CleanupDisposition::Retain),
+        (
+            Status::Kernel(rt::abi::Error::Unknown(777)),
+            CleanupDisposition::Retain,
+        ),
         (
             Status::Kernel(rt::abi::Error::Interrupted),
             CleanupDisposition::Retain,
@@ -572,6 +583,7 @@ fn ack_refusal_never_replays_commit_and_retired_ack_requires_canonical_absence()
     for error in [
         Status::Unknown(proto_fs::RESOLVING),
         Status::Unknown(9999),
+        Status::Kernel(rt::abi::Error::Unknown(777)),
         Status::Kernel(rt::abi::Error::Interrupted),
     ] {
         let (mut server, mut client, fds) = Server::new();

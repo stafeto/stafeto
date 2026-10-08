@@ -1550,7 +1550,9 @@ pub fn cleanup_disposition(stage: CleanupStage, error: Status) -> CleanupDisposi
             CleanupDisposition::Continue
         }
         Status::Unknown(proto_fs::RESOLVING) => CleanupDisposition::Retry,
-        Status::Kernel(rt::abi::Error::Interrupted) => CleanupDisposition::Retain,
+        Status::Kernel(rt::abi::Error::Interrupted | rt::abi::Error::Unknown(_)) => {
+            CleanupDisposition::Retain
+        }
         Status::Unknown(proto_fs::OPEN_RETIRED) if stage == CleanupStage::Cancel => {
             CleanupDisposition::Retain
         }
