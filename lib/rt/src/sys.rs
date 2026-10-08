@@ -541,6 +541,15 @@ pub fn thread_layer_request(thread: &Handle<Thread>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Request an explicitly published resident Layer of this MANAGE Process.
+pub fn process_layer_request(process: &Handle<Process>) -> Result<(), Error> {
+    call::<{ Call::ThreadUpcallControl.number() }>(&[
+        abi::UpcallControl::ProcessLayerRequest.raw(),
+        process.raw().0,
+    ])?;
+    Ok(())
+}
+
 /// Kernel object comparison with this caller; raw handle equality is insufficient.
 pub fn is_current_thread(thread: &Handle<Thread>) -> Result<bool, Error> {
     let x = call::<{ Call::ObjectInfo.number() }>(&[thread.raw().0, abi::INFO_THREAD_CURRENT, 0])?;

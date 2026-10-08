@@ -16,12 +16,48 @@ pub(super) fn thread_upcall_bind(mut thread: NonNull<Thread>, a: &Args) -> Resul
     }
     // SAFETY: only the current thread configures its own entry under kernel serialization.
     unsafe { thread.as_mut() }.upcall.bind(a[0])?;
+    if a[0] == 0 {
+        // SAFETY: current Thread is held by the syscall.
+        unsafe {
+            sched::set_layer_role(
+                thread,
+                crate::process::layers::PRIMARY,
+                false,
+                cause(thread),
+            )
+        }?;
+    }
     Ok(Values::none())
 }
 pub(super) fn thread_upcall_control(
     mut thread: NonNull<Thread>,
     a: &Args,
 ) -> Result<Values, Error> {
+    if a[0] == abi::UpcallControl::ProcessLayerRequest.raw() {
+        let process = lookup(thread, a[1], Rights::MANAGE, Object::process)?;
+        // SAFETY: the capability keeps the Process and selection borrows its live head.
+        unsafe { sched::request_process_layer(process, cause(thread)) }?;
+        return Ok(Values::none());
+    }
+    if matches!(
+        abi::UpcallControl::from_raw(a[0]),
+        Some(abi::UpcallControl::PrimaryLayerReady | abi::UpcallControl::ObserverLayerReady)
+    ) {
+        if a[1] > 1 {
+            return Err(Error::InvalidArgs);
+        }
+        if a[1] != 0 && thread::buffer_page(thread).is_none() {
+            return Err(Error::BadState);
+        }
+        let role = if a[0] == abi::UpcallControl::ObserverLayerReady.raw() {
+            crate::process::layers::OBSERVER
+        } else {
+            crate::process::layers::PRIMARY
+        };
+        // SAFETY: the syscall operates on the exact current Thread.
+        unsafe { sched::set_layer_role(thread, role, a[1] == 1, cause(thread)) }?;
+        return Ok(Values::none());
+    }
     // Resolve a target before mutably borrowing current-thread entry state.
     // The target may be the caller itself.
     if a[0] == abi::UpcallControl::LayerRequest.raw() {
@@ -38,6 +74,17 @@ pub(super) fn thread_upcall_control(
         unsafe { thread.as_mut() }
             .upcall
             .bind_observer(a[1], a[2])?;
+        if a[1] == 0 {
+            // SAFETY: current Thread retains its remaining primary role.
+            unsafe {
+                sched::set_layer_role(
+                    thread,
+                    crate::process::layers::OBSERVER,
+                    false,
+                    cause(thread),
+                )
+            }?;
+        }
         return Ok(Values::none());
     }
     // SAFETY: only current-thread state changes; no user pointers are accessed.

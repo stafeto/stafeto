@@ -150,6 +150,18 @@ impl State {
     pub fn request(&mut self) -> Result<bool, Error> {
         self.request_lane(false)
     }
+    /// Whether this exact lane has a handler.
+    pub fn registered(&self, observer: bool) -> bool {
+        if observer {
+            self.observer.entry != 0
+        } else {
+            self.primary.entry != 0
+        }
+    }
+    /// Request the observer without primary fallback.
+    pub fn request_observer(&mut self) -> Result<bool, Error> {
+        self.request_lane(true)
+    }
     /// Prefer the resident observer; a thread without one uses its native entry.
     pub fn request_layer(&mut self) -> Result<bool, Error> {
         self.request_lane(self.observer.entry != 0)
@@ -183,7 +195,11 @@ impl State {
                 self.deferred = self.deferred.checked_sub(1).ok_or(Error::BadState)?;
                 return Ok((was, 0, 0));
             }
-            UpcallControl::ObserverBind | UpcallControl::LayerRequest => {
+            UpcallControl::ObserverBind
+            | UpcallControl::LayerRequest
+            | UpcallControl::PrimaryLayerReady
+            | UpcallControl::ProcessLayerRequest
+            | UpcallControl::ObserverLayerReady => {
                 return Err(Error::InvalidArgs);
             }
             _ => {}
@@ -289,6 +305,54 @@ mod tests {
     const TAKE: u64 = UpcallControl::Take.raw();
     const DEFER: u64 = UpcallControl::Defer.raw();
     const RESUME: u64 = UpcallControl::Resume.raw();
+    #[test]
+    fn published_primary_request_ignores_unpublished_observer() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.bind_observer(0x2000, 0x3000).unwrap();
+        state.control(1).unwrap();
+        state.control(6).unwrap();
+        assert!(state.registered(false) && state.registered(true));
+        state.request().unwrap();
+        assert_eq!(
+            state.prepare_with_tls(0x4000, 0, 0, false),
+            Some(Entry {
+                pc: 0x1000,
+                tls: None
+            })
+        );
+        state.control(2).unwrap();
+        state.returned().unwrap();
+        state.request_observer().unwrap();
+        assert_eq!(
+            state.prepare_with_tls(0x4000, 0, 0, false),
+            Some(Entry {
+                pc: 0x2000,
+                tls: Some(0x3000)
+            })
+        );
+    }
+
+    #[test]
+    fn observer_unbind_requires_new_primary_request_for_retained_page_signal() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.bind_observer(0x2000, 0x3000).unwrap();
+        state.control(1).unwrap();
+        state.request_observer().unwrap();
+        state.bind_observer(0, 0).unwrap();
+        assert!(state.registered(false) && !state.registered(true));
+        assert_eq!(state.prepare_with_tls(0x4000, 0, 0, false), None);
+        state.request().unwrap();
+        assert_eq!(
+            state.prepare_with_tls(0x4000, 0, 0, false),
+            Some(Entry {
+                pc: 0x1000,
+                tls: None
+            })
+        );
+    }
+
     #[test]
     fn restoration_rejects_privilege_interrupt_masks_and_foreign_buffer() {
         let check =

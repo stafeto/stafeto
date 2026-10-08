@@ -2487,6 +2487,164 @@ fn with_interrupt_pending(
     result
 }
 
+/// Current-only roles retain the surviving lane and forward a direct Thread End.
+pub fn process_layer_roles_survive_partial_unbind_and_native_end(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    let baseline = thread::in_use();
+    let result = with_caller(|c| {
+        use abi::UpcallControl as C;
+        let managed = c.insert(Object::Process(c.process), Rights::MANAGE)?;
+        let plain = c.insert(Object::Process(c.process), Rights::NONE)?;
+        let wrong = c.insert(Object::Thread(c.thread), Rights::MANAGE)?;
+        let mut extra = None;
+        let result = (|| {
+            thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no main buffer")?;
+            thread::start(c.thread).map_err(|_| "no main start")?;
+            let control = Call::ThreadUpcallControl.number();
+            c.fails(
+                control,
+                &[C::ProcessLayerRequest.raw(), managed.0],
+                Error::BadState,
+            )?;
+            c.fails(
+                control,
+                &[C::ProcessLayerRequest.raw(), plain.0],
+                Error::AccessDenied,
+            )?;
+            c.fails(
+                control,
+                &[C::ProcessLayerRequest.raw(), wrong.0],
+                Error::WrongType,
+            )?;
+            c.fails(
+                control,
+                &[C::ProcessLayerRequest.raw(), 0],
+                Error::BadHandle,
+            )?;
+            c.fails(
+                control,
+                &[C::PrimaryLayerReady.raw(), 2],
+                Error::InvalidArgs,
+            )?;
+            c.fails(control, &[C::PrimaryLayerReady.raw(), 1], Error::BadState)?;
+            c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
+            c.succeeds(control, &[C::PrimaryLayerReady.raw(), 1], &[])?;
+            c.succeeds(
+                control,
+                &[C::ObserverBind.raw(), (USER_VA + PAGE) as u64, 0x8000],
+                &[],
+            )?;
+            c.succeeds(control, &[C::Enable.raw()], &[1, 0, 0])?;
+            c.succeeds(control, &[C::ObserverEnable.raw()], &[1, 0, 0])?;
+            c.succeeds(control, &[C::ProcessLayerRequest.raw(), managed.0], &[])?;
+            let entry = |t: NonNull<Thread>| unsafe {
+                (*t.as_ptr()).upcall.prepare_with_tls(0x4000, 0, 0, false)
+            };
+            let returned = |t: NonNull<Thread>, observer: bool| -> Result<(), &'static str> {
+                let state = unsafe { &mut (*t.as_ptr()).upcall };
+                state
+                    .control(if observer { 7 } else { 2 })
+                    .map_err(|_| "no take")?;
+                state.returned().map_err(|_| "no return")
+            };
+            check(
+                entry(c.thread).is_some_and(|e| e.pc == USER_VA as u64 && e.tls.is_none()),
+                "unpublished observer stole primary role",
+            )?;
+            returned(c.thread, false)?;
+            c.succeeds(control, &[C::ObserverLayerReady.raw(), 1], &[])?;
+            check(
+                entry(c.thread).is_some_and(|e| e.tls == Some(0x8000)),
+                "published observer not preferred",
+            )?;
+            returned(c.thread, true)?;
+            c.succeeds(control, &[C::ProcessLayerRequest.raw(), managed.0], &[])?;
+            c.succeeds(control, &[C::ObserverBind.raw(), 0, 0], &[])?;
+            check(
+                entry(c.thread).is_some_and(|e| e.tls.is_none()),
+                "same head lost pending on observer unbind",
+            )?;
+            returned(c.thread, false)?;
+            c.succeeds(
+                control,
+                &[C::ObserverBind.raw(), (USER_VA + PAGE) as u64, 0x8000],
+                &[],
+            )?;
+            c.succeeds(control, &[C::ObserverLayerReady.raw(), 1], &[])?;
+            c.succeeds(control, &[C::PrimaryLayerReady.raw(), 0], &[])?;
+            c.succeeds(Call::ThreadUpcallBind.number(), &[0], &[])?;
+            c.succeeds(control, &[C::ObserverEnable.raw()], &[1, 0, 0])?;
+            check(
+                entry(c.thread).is_some_and(|e| e.tls == Some(0x8000)),
+                "primary removal lost observer",
+            )?;
+            returned(c.thread, true)?;
+            c.succeeds(control, &[C::ObserverLayerReady.raw(), 0], &[])?;
+            c.fails(
+                control,
+                &[C::ProcessLayerRequest.raw(), managed.0],
+                Error::BadState,
+            )?;
+            c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
+            c.succeeds(control, &[C::PrimaryLayerReady.raw(), 1], &[])?;
+            c.succeeds(control, &[C::Enable.raw()], &[1, 0, 0])?;
+            check(entry(c.thread).is_some(), "no survivor initial entry")?;
+            returned(c.thread, false)?;
+            let native = thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+                .map_err(|_| "no native")?;
+            extra = Some(native);
+            thread::give_buffer(native, BUFFER as usize + PAGE).map_err(|_| "no native buffer")?;
+            thread::start(native).map_err(|_| "no native start")?;
+            let other = Caller {
+                process: c.process,
+                thread: native,
+            };
+            other.succeeds(
+                control,
+                &[C::ObserverBind.raw(), (USER_VA + PAGE) as u64, 0x9000],
+                &[],
+            )?;
+            other.succeeds(control, &[C::ObserverLayerReady.raw(), 1], &[])?;
+            // Consume the registration's primary request before native End.
+            check(entry(c.thread).is_some(), "no registration forward")?;
+            returned(c.thread, false)?;
+            // SAFETY: no application executes this held test Thread. This is
+            // the common scheduler End path before its reference release.
+            unsafe { sched::exit(native, CAUSE) };
+            check(
+                entry(c.thread).is_some_and(|e| e.pc == USER_VA as u64),
+                "direct native End did not wake survivor",
+            )?;
+            returned(c.thread, false)?;
+            c.succeeds(control, &[C::ProcessLayerRequest.raw(), managed.0], &[])?;
+            Ok(())
+        })();
+        // End clears roles before cleanup and suppresses forwarding into this Process.
+        unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+        check(
+            unsafe { c.thread.as_ref() }.layer.is_none(),
+            "main role survived Process End",
+        )?;
+        if let Some(native) = extra {
+            check(
+                unsafe { native.as_ref() }.layer.is_none(),
+                "native role survived End",
+            )?;
+            unsafe { thread::release(native, CAUSE) };
+        }
+        c.close(wrong)?;
+        c.close(plain)?;
+        c.close(managed)?;
+        result
+    });
+    check(
+        thread::in_use() == baseline,
+        "Layer test leaked Thread reference",
+    )?;
+    result
+}
+
 /// Native ignored registers and observer TLS/innermost return share exact context checks.
 pub fn observer_wire_preserves_native_context_and_ignored_registers(
     _: &Boot,

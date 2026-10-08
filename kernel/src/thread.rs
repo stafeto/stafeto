@@ -92,6 +92,8 @@ pub struct Thread {
     /// which process::end walks; None once the thread left it. Only
     /// process::{add_thread, remove_thread} change them.
     pub siblings: Option<Siblings>,
+    /// One circular node for the published primary and observer Layer roles.
+    pub(crate) layer: Option<process::LayerLinks>,
     /// The page `give_buffer` mapped for messages (spec 6.2); it goes when
     /// the thread exits (`exit`), at the stage Buffers of its process, or
     /// when the thread goes.
@@ -255,6 +257,7 @@ pub fn create_with_exit(
         index: None,
         boost_token: 0,
         siblings: None,
+        layer: None,
         buffer: None,
         process,
         refs: Refs::one(),
@@ -794,6 +797,10 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
         if let Some(source) = (*thread.as_ptr()).exit.as_mut() {
             source.detach(level);
         }
+        assert!(
+            (*thread.as_ptr()).layer.is_none(),
+            "Layer links survived Thread cleanup"
+        );
         process::paid_free(process, thread);
         LIVE.gone(thread);
     }

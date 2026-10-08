@@ -694,3 +694,17 @@ readiness record. Replacing each WatchTake notification session makes
 S29 fail; omitting the native worker notices makes S28 fail. Hardware
 rows retain n, minimum, p50, p99, maximum and the full histogram in
 `target/measure/rtbench-hvf.txt` and `rtbench-vz.txt`.
+
+
+### Process Layer routing
+
+Upcall Control operations 10/12 publish current primary/observer roles;
+operation 11 checks MANAGE Process ownership and lifecycle before selecting
+one published role. Both roles share one intrusive node in each paid Thread.
+The preferred lane is the published observer, then the published primary.
+Registration, partial unbind, rotation and End removal take constant work.
+A preferred-lane change requests the surviving head even when its node is
+unchanged. End forwarding runs inside the existing scheduler guard and ends
+before Thread reference release; ended Processes receive no new request.
+An interrupted send/receive retains its Thread until bounded transit cleanup
+finishes outside the guard. Fresh operation timings remain a runtime gate.

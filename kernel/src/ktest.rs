@@ -374,6 +374,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_pays_its_budget_back_to_the_payer,
     ),
     (
+        "process_layer_roles_survive_partial_unbind_and_native_end",
+        calls::process_layer_roles_survive_partial_unbind_and_native_end,
+    ),
+    (
         "observer_wire_preserves_native_context_and_ignored_registers",
         calls::observer_wire_preserves_native_context_and_ignored_registers,
     ),

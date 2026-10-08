@@ -57,7 +57,9 @@ use kcore::slab::{PageLog, PaidPages, Pool};
 use kcore::sync::Lock;
 
 pub(crate) mod control;
+pub(crate) mod layers;
 mod maps;
+pub(crate) use layers::LayerLinks;
 mod table;
 mod teardown;
 
@@ -146,6 +148,8 @@ pub struct Process {
     /// Buffers after the end stopped it, or when it goes. Shells of
     /// threads that ended are not in it.
     threads: Option<NonNull<Thread>>,
+    /// Published resident Layer roles, linked in the existing Thread objects.
+    layer_head: Option<NonNull<Thread>>,
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
     /// Guarded by the scheduler lock; tested before every EL0 return.
@@ -329,6 +333,7 @@ fn create(
         ceiling,
         life: Life::new(),
         threads: None,
+        layer_head: None,
         thread_count: 0,
         suspended: false,
         parked: ParkedList::new(),

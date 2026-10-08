@@ -113,6 +113,38 @@ pub unsafe fn enable_observer() -> Result<bool, Error> {
     control(UpcallControl::ObserverEnable)
 }
 
+/// Publish or remove this current thread's primary Layer role.
+/// # Safety
+/// While published, its dispatcher and all layer metadata remain resident
+/// until Thread End or explicit role removal.
+pub unsafe fn primary_layer_ready(ready: bool) -> Result<(), Error> {
+    layer_ready(UpcallControl::PrimaryLayerReady, ready)
+}
+/// Publish or remove the current resident observer's Layer role.
+/// # Safety
+/// Its observer TLS, dispatcher and Block remain valid until End or removal.
+pub unsafe fn observer_layer_ready(ready: bool) -> Result<(), Error> {
+    layer_ready(UpcallControl::ObserverLayerReady, ready)
+}
+fn layer_ready(operation: UpcallControl, ready: bool) -> Result<(), Error> {
+    // SAFETY: current-only metadata publication uses no user pointer.
+    let result = unsafe {
+        sys::raw::<{ Call::ThreadUpcallControl.number() }>([
+            operation.raw(),
+            u64::from(ready),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ])
+    };
+    Error::from_code(result[0]).map_or(Ok(()), Err)
+}
+
 /// Stop entries until enable; returns whether they were already masked.
 pub fn mask() -> Result<bool, Error> {
     control(UpcallControl::Mask)

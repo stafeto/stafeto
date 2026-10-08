@@ -1191,6 +1191,12 @@ pub enum UpcallControl {
     ObserverBind = 8,
     /// Request the observer of MANAGE Thread x1, with native-entry fallback.
     LayerRequest = 9,
+    /// Publish or remove the current primary Layer role (x1=0/1).
+    PrimaryLayerReady = 10,
+    /// Request one registered Layer of MANAGE Process x1.
+    ProcessLayerRequest = 11,
+    /// Publish or remove the current observer Layer role (x1=0/1).
+    ObserverLayerReady = 12,
 }
 
 impl UpcallControl {
@@ -1207,6 +1213,9 @@ impl UpcallControl {
             7 => Some(UpcallControl::ObserverTake),
             8 => Some(UpcallControl::ObserverBind),
             9 => Some(UpcallControl::LayerRequest),
+            10 => Some(UpcallControl::PrimaryLayerReady),
+            11 => Some(UpcallControl::ProcessLayerRequest),
+            12 => Some(UpcallControl::ObserverLayerReady),
             _ => None,
         }
     }
@@ -1581,12 +1590,15 @@ mod tests {
             (UpcallControl::ObserverTake, 7),
             (UpcallControl::ObserverBind, 8),
             (UpcallControl::LayerRequest, 9),
+            (UpcallControl::PrimaryLayerReady, 10),
+            (UpcallControl::ProcessLayerRequest, 11),
+            (UpcallControl::ObserverLayerReady, 12),
         ];
         for (operation, raw) in operations {
             assert_eq!(operation.raw(), raw);
             assert_eq!(UpcallControl::from_raw(raw), Some(operation));
         }
-        for raw in [10, 1 << 32, u64::MAX] {
+        for raw in [13, 1 << 32, u64::MAX] {
             assert_eq!(UpcallControl::from_raw(raw), None, "{raw:#x}");
         }
     }
