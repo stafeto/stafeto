@@ -28,6 +28,8 @@ pub enum ImagePhase {
 pub struct ImageOutcome {
     pub job: u64,
     pub label: u64,
+    /// The index of the image's identity channel in the service's table.
+    pub identity: u16,
     pub token: Token,
     pub phase: ImagePhase,
 }

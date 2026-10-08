@@ -166,7 +166,6 @@ fn main(_: u64) -> u64 {
     let mut uart = Uart {
         channel: Handle::borrowed(channel.raw()),
         level,
-        given: 0,
         clones: proto_wire::clones::Clones::new(),
         regs: Regs(REGS_AT),
         irq,
@@ -208,7 +207,6 @@ struct Uart {
     /// the level of its loop, and how many it gave.
     channel: core::mem::ManuallyDrop<Handle<Channel>>,
     level: u8,
-    given: u64,
     /// The sessions CLONE gave that live, bounded for each client.
     clones: proto_wire::clones::Clones<CLONES>,
     regs: Regs,
@@ -653,21 +651,22 @@ impl Uart {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        if self.clones.room(r.label()).is_err() {
+        let Ok(label) = self.clones.give(1 << 63, r.label()) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
-        }
-        self.given += 1;
+        };
         let rights = abi::Rights::SEND.union(abi::Rights::TRANSFER);
-        let label = 1 << 63 | self.given;
         match sys::handle_label(&self.channel, rights, label, self.level) {
             Ok(session) => {
                 if r.reply().u32(0).is_err() {
+                    self.clones.gone(label);
                     return Answer::Status(Status::BadSize);
                 }
-                let _ = self.clones.add(label, r.label());
                 Answer::Reply([session.erase()].into())
             }
-            Err(e) => Answer::Status(Status::Kernel(e)),
+            Err(e) => {
+                self.clones.gone(label);
+                Answer::Status(Status::Kernel(e))
+            }
         }
     }
 }

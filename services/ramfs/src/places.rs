@@ -8,6 +8,8 @@ use core::cell::Cell;
 use proto_fs::{IMAGE_SESSION, OWN};
 
 pub const COUNT: usize = 320;
+/// The bits of a session label that name its slot (labels of `issue`).
+pub const SLOT_BITS: u32 = 9;
 const NONE: u16 = u16::MAX;
 pub struct Places {
     labels: [Cell<u64>; COUNT],

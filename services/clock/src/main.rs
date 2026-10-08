@@ -66,7 +66,6 @@ fn main(_: u64) -> u64 {
         &mut Clocks {
             channel: Handle::borrowed(channel.raw()),
             level,
-            given: 0,
             clones: proto_wire::clones::Clones::new(),
             clock,
             page,
@@ -101,7 +100,6 @@ struct Clocks {
     /// of, at the loop's level, and how many it gave.
     channel: ManuallyDrop<Handle<Channel>>,
     level: u8,
-    given: u64,
     /// The sessions Clone gave that live, bounded for each client.
     clones: proto_wire::clones::Clones<CLONES>,
     clock: Clock,
@@ -301,21 +299,22 @@ impl Page {
 }
 impl Clocks {
     fn clone_session(&mut self, r: &mut Request<'_>) -> Answer {
-        if self.clones.room(r.label()).is_err() {
+        let Ok(label) = self.clones.give(OWN, r.label()) else {
             return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
-        }
-        self.given += 1;
+        };
         let rights = rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER;
-        let label = OWN | self.given;
         match sys::handle_label(&self.channel, rights, label, self.level) {
             Ok(session) => {
                 if r.reply().u32(0).is_err() {
+                    self.clones.gone(label);
                     return Answer::Status(Status::BadSize);
                 }
-                let _ = self.clones.add(label, r.label());
                 Answer::Reply([session.erase()].into())
             }
-            Err(e) => Answer::Status(Status::Kernel(e)),
+            Err(e) => {
+                self.clones.gone(label);
+                Answer::Status(Status::Kernel(e))
+            }
         }
     }
 

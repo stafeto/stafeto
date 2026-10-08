@@ -50,14 +50,8 @@ mod points {
     /// Whether a test took system call `number` of `thread` before its
     /// dispatch (syscall::dispatch): never.
     #[inline(always)]
-    pub fn test_call(thread: NonNull<Thread>, number: u16) -> bool {
-        #[cfg(feature = "ipc-loss-probe")]
-        return crate::ipc_loss_probe::test_call(thread, number);
-        #[cfg(not(feature = "ipc-loss-probe"))]
-        {
-            let _ = (thread, number);
-            false
-        }
+    pub fn test_call(_: NonNull<Thread>, _: u16) -> bool {
+        false
     }
 
     /// Init ended (process::init_ended); the kernel then panics.

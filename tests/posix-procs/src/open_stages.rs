@@ -804,8 +804,5 @@ pub extern "C" fn files_open_stages() -> i32 {
     let Ok(files) = clone_bound(&files, &[]) else {
         return 91;
     };
-    let result = run(&files);
-    #[cfg(feature = "ipc-loss")]
-    let result = result.and_then(|()| super::reply_loss::run(&files));
-    result.err().unwrap_or(0)
+    run(&files).err().unwrap_or(0)
 }

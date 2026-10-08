@@ -211,9 +211,9 @@ struct Fs {
     /// end of its last copy closes them.
     births: &'static mut [Option<(u64, Fds)>; BIRTHS],
     /// The clones alive, bounded for each client and in all.
-    clones: &'static mut Clones<CLONES>,
+    clones: &'static mut Clones<CLONES, { ramfs::places::SLOT_BITS }>,
     places: &'static ramfs::places::Places,
-    identities: &'static mut [Option<IdentityChannel>; SESSIONS],
+    identities: &'static mut Identities,
     jobs: &'static mut [Option<ResolveJob>; ramfs::storage::PREPARATIONS],
     job_generations: &'static mut [u64; ramfs::storage::PREPARATIONS],
     generations: Option<Handle<Memory>>,
@@ -233,6 +233,56 @@ const CLONES: usize = 320;
 /// LIMIT_REACHED. A child that never touches a file keeps its birth, so
 /// there is room for every record and its transient binding preparation.
 const BIRTHS: usize = CLONES;
+
+/// The identity channels of the sessions, by index, with a list of the
+/// free indexes: taking one costs the same with any number alive.
+struct Identities {
+    slots: [Option<IdentityChannel>; SESSIONS],
+    next: [u16; SESSIONS],
+    free: u16,
+}
+impl Identities {
+    const fn new() -> Self {
+        let mut next = [u16::MAX; SESSIONS];
+        let mut i = 0;
+        while i + 1 < SESSIONS {
+            next[i] = (i + 1) as u16;
+            i += 1;
+        }
+        Self {
+            slots: [const { None }; SESSIONS],
+            next,
+            free: 0,
+        }
+    }
+    /// The first free index, which the caller fills at once.
+    fn take_free(&mut self) -> Option<usize> {
+        let i = usize::from(self.free);
+        if self.free == u16::MAX {
+            return None;
+        }
+        self.free = self.next[i];
+        Some(i)
+    }
+    /// The identity at `i` goes; its index is free again.
+    fn release(&mut self, i: usize) {
+        if self.slots[i].take().is_some() {
+            self.next[i] = self.free;
+            self.free = i as u16;
+        }
+    }
+}
+impl core::ops::Deref for Identities {
+    type Target = [Option<IdentityChannel>; SESSIONS];
+    fn deref(&self) -> &Self::Target {
+        &self.slots
+    }
+}
+impl core::ops::DerefMut for Identities {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slots
+    }
+}
 
 /// The tables of the sessions and of the births, in `.bss`: too big for
 /// the service's stack.
@@ -292,10 +342,10 @@ impl ResolveJob {
 }
 struct Tables {
     places: ramfs::places::Places,
-    clones: Clones<CLONES>,
+    clones: Clones<CLONES, { ramfs::places::SLOT_BITS }>,
     sessions: [Option<Session<Fds, 0>>; SESSIONS],
     births: [Option<(u64, Fds)>; BIRTHS],
-    identities: [Option<IdentityChannel>; SESSIONS],
+    identities: Identities,
     jobs: [Option<ResolveJob>; ramfs::storage::PREPARATIONS],
     job_generations: [u64; ramfs::storage::PREPARATIONS],
 }
@@ -307,12 +357,38 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     clones: Clones::new(),
     sessions: [const { None }; SESSIONS],
     births: [None; BIRTHS],
-    identities: [const { None }; SESSIONS],
+    identities: Identities::new(),
     jobs: [const { None }; ramfs::storage::PREPARATIONS],
     job_generations: [0; ramfs::storage::PREPARATIONS],
 }));
 
 impl Fs {
+    /// The index of the birth of the session `label`: its slot.
+    fn birth_index(label: u64) -> usize {
+        (label & ((1 << ramfs::places::SLOT_BITS) - 1)) as usize
+    }
+
+    /// The index of the identity channel of the image `outcome` names: the
+    /// index it was prepared with, if the channel there still has its label.
+    fn image_identity(&self, outcome: &ramfs::image::ImageOutcome) -> Option<usize> {
+        let i = usize::from(outcome.identity);
+        self.identities
+            .get(i)?
+            .as_ref()
+            .is_some_and(|identity| identity.label == outcome.label)
+            .then_some(i)
+    }
+
+    /// The index of the birth of `label`, if it holds one.
+    fn birth_slot(&self, label: u64) -> Option<usize> {
+        let i = Self::birth_index(label);
+        self.births
+            .get(i)?
+            .as_ref()
+            .is_some_and(|(l, _)| *l == label)
+            .then_some(i)
+    }
+
     /// A dead or superseded authority releases one retained reference per pass.
     fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
         if fds
@@ -447,11 +523,6 @@ impl Fs {
         token: Token,
         entry: u16,
     ) -> Result<(), u32> {
-        let free = self
-            .births
-            .iter()
-            .position(Option::is_none)
-            .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
         let identity = self
             .identities
             .get(fds.authority_index as usize)
@@ -493,10 +564,12 @@ impl Fs {
             self.places.release(label);
             return Err(code);
         }
-        self.births[free] = Some((label, child));
+        let identity = child.authority_index;
+        self.births[Self::birth_index(label)] = Some((label, child));
         fds.image_outcome = Some(ramfs::image::ImageOutcome {
             job,
             label,
+            identity,
             token,
             phase: ramfs::image::ImagePhase::Prepared,
         });
@@ -508,23 +581,15 @@ impl Fs {
             return;
         };
         if outcome.phase == ramfs::image::ImagePhase::Prepared {
-            if let Some(i) = self
-                .births
-                .iter()
-                .position(|b| b.as_ref().is_some_and(|(label, _)| *label == outcome.label))
-            {
+            if let Some(i) = self.birth_slot(outcome.label) {
                 let (_, image) = self.births[i].as_mut().expect("retained image birth");
                 Self::drop_identity_fields(&mut self.ram, self.identities, image);
                 self.ram.release(image);
                 self.births[i] = None;
             }
             self.places.release(outcome.label);
-        } else if let Some(identity) = self
-            .identities
-            .iter_mut()
-            .filter_map(Option::as_mut)
-            .find(|identity| identity.label == outcome.label)
-            && let Some(image) = identity.image.as_mut()
+        } else if let Some(i) = self.image_identity(&outcome)
+            && let Some(image) = self.identities[i].as_mut().and_then(|i| i.image.as_mut())
         {
             image.private = None;
         }
@@ -567,10 +632,8 @@ impl Fs {
                     return status(code);
                 }
                 let copy = self
-                    .identities
-                    .iter()
-                    .filter_map(Option::as_ref)
-                    .find(|identity| identity.label == outcome.label)
+                    .image_identity(&outcome)
+                    .and_then(|i| self.identities[i].as_ref())
                     .and_then(|identity| identity.image.as_ref())
                     .filter(|image| image.token == outcome.token)
                     .and_then(|image| image.private.as_ref())
@@ -629,10 +692,8 @@ impl Fs {
         }
         let outcome = fds.image_outcome.unwrap();
         let expected = self
-            .identities
-            .iter()
-            .filter_map(Option::as_ref)
-            .find(|identity| identity.label == outcome.label)
+            .image_identity(&outcome)
+            .and_then(|i| self.identities[i].as_ref())
             .is_some_and(|identity| {
                 identity.original == fds.binding
                     && identity
@@ -655,11 +716,9 @@ impl Fs {
         // Every resource and reply field was prepaid before the first SetId attempt.
         self.finish_image_job(fds, job, r.label());
         fds.image_outcome.as_mut().unwrap().phase = ramfs::image::ImagePhase::Ready;
-        let image = self
-            .identities
-            .iter_mut()
-            .filter_map(Option::as_mut)
-            .find(|identity| identity.label == outcome.label)
+        let at = self.image_identity(&outcome).unwrap();
+        let image = self.identities[at]
+            .as_mut()
             .unwrap()
             .image
             .as_mut()
@@ -920,9 +979,6 @@ impl Fs {
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        let Some(free) = self.births.iter().position(Option::is_none) else {
-            return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
-        };
         if self.clones.room(r.label()).is_err() {
             return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
         }
@@ -964,8 +1020,9 @@ impl Fs {
                     self.ram.release(&mut child);
                     return Answer::Status(Status::BadSize);
                 }
-                self.births[free] = Some((label, child));
-                let _ = self.clones.add(label, r.label());
+                self.births[Self::birth_index(label)] = Some((label, child));
+                let adopted = self.clones.adopt(label, r.label());
+                debug_assert!(adopted.is_ok(), "the place of a new label is free");
                 Answer::Reply([session.erase()].into())
             }
             Err(e) => {
@@ -1000,11 +1057,8 @@ impl Service<0> for Fs {
     fn closed(&mut self, label: u64) {
         self.places.release(label);
         self.clones.gone(label);
-        if let Some(birth) = self
-            .births
-            .iter_mut()
-            .find(|b| b.is_some_and(|(l, _)| l == label))
-            && let Some((_, mut fds)) = birth.take()
+        if let Some(i) = self.birth_slot(label)
+            && let Some((_, mut fds)) = self.births[i].take()
         {
             self.clear_image_outcome(&mut fds);
             for id in fds.resolvers {
@@ -1090,11 +1144,7 @@ impl Service<0> for Fs {
             // The first request of a session Clone made takes its
             // descriptors.
             let label = r.label();
-            if let Some(birth) = self
-                .births
-                .iter_mut()
-                .find(|b| b.is_some_and(|(l, _)| l == label))
-            {
+            if let Some(birth) = self.birth_slot(label).map(|i| &mut self.births[i]) {
                 // RT creates unclaimed sessions from Fds::default, with no held references.
                 let claimed = s.data.claim_retained_birth(birth, label);
                 debug_assert!(claimed);
@@ -1898,8 +1948,7 @@ impl Fs {
     ) -> Result<(), u32> {
         let i = if fds.authority_index == NONE {
             self.identities
-                .iter()
-                .position(Option::is_none)
+                .take_free()
                 .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?
         } else {
             fds.authority_index as usize
@@ -1934,17 +1983,13 @@ impl Fs {
     fn drop_identity(&mut self, fds: &mut Fds) {
         Self::drop_identity_fields(&mut self.ram, self.identities, fds);
     }
-    fn drop_identity_fields(
-        ram: &mut Ram<'_>,
-        identities: &mut [Option<IdentityChannel>; SESSIONS],
-        fds: &mut Fds,
-    ) {
+    fn drop_identity_fields(ram: &mut Ram<'_>, identities: &mut Identities, fds: &mut Fds) {
         if let Some(root) = fds.binding_preparation.take() {
             ram.storage.release_preparation(root);
         }
         fds.binding_source = None;
         if fds.authority_index != NONE {
-            identities[fds.authority_index as usize] = None;
+            identities.release(fds.authority_index as usize);
             fds.authority_index = NONE;
         }
     }
@@ -2087,7 +2132,7 @@ impl Fs {
     }
     fn authenticate_fields(
         ram: &mut Ram<'_>,
-        identities: &mut [Option<IdentityChannel>; SESSIONS],
+        identities: &mut Identities,
         fds: &mut Fds,
         label: u64,
     ) -> Result<(), u32> {
@@ -2170,11 +2215,7 @@ impl Fs {
         if self.clones.client_of(label) != Some(r.label()) {
             return status(proto_fs::PERMISSION);
         }
-        let Some(i) = self
-            .births
-            .iter()
-            .position(|b| b.is_some_and(|(l, _)| l == label))
-        else {
+        let Some(i) = self.birth_slot(label) else {
             return status(proto_fs::PERMISSION);
         };
         let (_, mut child) = self.births[i].take().expect("own clone");
@@ -2274,9 +2315,6 @@ impl Fs {
         let Ok(identity) = r.handles.take::<Channel>(identity_index) else {
             return status(proto_fs::PERMISSION);
         };
-        let Some(slot) = self.births.iter().position(Option::is_none) else {
-            return status(proto_fs::TOO_MANY_OPEN_FILES);
-        };
         if self.clones.room_within(r.label(), CLONES).is_err() {
             return status(proto_fs::TOO_MANY_OPEN_FILES);
         }
@@ -2307,8 +2345,9 @@ impl Fs {
         binding.offered = offered;
         binding.pending = true;
         binding.require = require;
-        self.births[slot] = Some((label, child));
-        let _ = self.clones.add_within(label, r.label(), CLONES);
+        self.births[Self::birth_index(label)] = Some((label, child));
+        let adopted = self.clones.adopt_within(label, r.label(), CLONES);
+        debug_assert!(adopted.is_ok(), "the place of a new label is free");
         if r.reply().u32(0).is_err() {
             return Answer::Status(Status::BadSize);
         }
@@ -2537,11 +2576,7 @@ impl Fs {
                     .offered
                     .as_ref()
                     .and_then(|offered| sys::copy_label(&self.channel, offered).ok());
-                let original = offered_label.and_then(|label| {
-                    self.births
-                        .iter()
-                        .position(|b| b.is_some_and(|(l, _)| l == label))
-                });
+                let original = offered_label.and_then(|label| self.birth_slot(label));
                 if binding.require && original.is_none() {
                     return self.reject_binding(fds);
                 }
