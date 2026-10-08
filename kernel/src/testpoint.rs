@@ -50,8 +50,7 @@ mod points {
     /// Whether a test took system call `number` of `thread` before its
     /// dispatch (syscall::dispatch): never.
     #[inline(always)]
-    pub fn test_call(thread: NonNull<Thread>, number: u16) -> bool {
-        let _ = (thread, number);
+    pub fn test_call(_: NonNull<Thread>, _: u16) -> bool {
         false
     }
 

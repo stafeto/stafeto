@@ -235,9 +235,8 @@ impl Live {
     /// nothing uses the object afterwards.
     pub unsafe fn gone<T>(&self, _object: NonNull<T>) {
         #[cfg(feature = "ktest")]
-        self.0.fetch_sub(1, Ordering::Relaxed);
-        #[cfg(feature = "ktest")]
         {
+            self.0.fetch_sub(1, Ordering::Relaxed);
             // SAFETY: the caller's promise; the link stays.
             unsafe {
                 core::ptr::write_bytes(

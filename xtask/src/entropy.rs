@@ -170,9 +170,11 @@ pub fn verdict(lines: &[String], driver: &str, reseed: bool) -> Result<(), Strin
 type Rows = Vec<(usize, u64, u64)>;
 
 /// The CLONE of the entropy service with its table of 320 clones full, in
-/// ticks: 5557 measured, where a walk of the table took 12 560. The bound
-/// sits between the two, so that a return to a walk fails.
-const CLONE_FULL_MAX: u64 = 8_000;
+/// ticks: 5551 measured, where a walk of the table took 12 560. A client
+/// that is no clone makes the step walk the table of roots (32 entries,
+/// about 200 ticks more), so the bound sits above that and far below the
+/// walk of the table, so that a return to a walk fails.
+const CLONE_FULL_MAX: u64 = 6_500;
 
 /// The longest step of each kind of the loop of `tag`, from the lines of a
 /// run under -icount: every kind of `kinds` came, and every kind but the
