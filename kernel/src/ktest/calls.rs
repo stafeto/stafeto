@@ -274,6 +274,36 @@ pub fn object_info_self_thread_has_exact_ownership(_: &Boot) -> Result<(), &'sta
         )?;
         c.fails(n, &[1, abi::INFO_THREAD_SELF, 0], Error::InvalidArgs)?;
         c.fails(n, &[0, abi::INFO_THREAD_SELF, 1], Error::InvalidArgs)?;
+        with_quota_left(c, 0, || {
+            c.fails(
+                n,
+                &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
+                Error::NoMemory,
+            )
+        })?;
+        for rights in [
+            Rights::DUPLICATE,
+            Rights::TRANSFER,
+            Rights::MANAGE.union(Rights::DUPLICATE),
+        ] {
+            c.fails(
+                n,
+                &[0, abi::INFO_THREAD_SELF, u64::from(rights.0)],
+                Error::InvalidArgs,
+            )?;
+        }
+        let managed = c.created(n, &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)])?;
+        // SAFETY: the caller retains its process while this table is read.
+        let (_, rights) = unsafe { c.process.as_ref() }
+            .lookup_with_rights(managed, Rights::MANAGE, Object::thread)
+            .map_err(|_| "managed SELF lookup failed")?;
+        check(rights == Rights::MANAGE, "SELF granted extra rights")?;
+        c.fails(
+            Call::HandleDuplicate.number(),
+            &[managed.0, u64::from(Rights::NONE.0), 0, 0],
+            Error::AccessDenied,
+        )?;
+        c.close(managed)?;
         let first = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
         let second = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
         check(first != second, "SELF reused a live numeric handle")?;
@@ -322,6 +352,11 @@ pub fn object_info_self_thread_has_exact_ownership(_: &Boot) -> Result<(), &'sta
             *h = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
         }
         c.fails(n, &[0, abi::INFO_THREAD_SELF, 0], Error::LimitReached)?;
+        c.fails(
+            n,
+            &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
+            Error::LimitReached,
+        )?;
         check(
             process::quota(c.process).used() == warmed
                 && process::handle_counts(c.process).0 == LIMIT,
@@ -2450,6 +2485,115 @@ fn with_interrupt_pending(
     timer::disarm();
     gic::end(ack?);
     result
+}
+
+/// Native ignored registers and observer TLS/innermost return share exact context checks.
+pub fn observer_wire_preserves_native_context_and_ignored_registers(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_caller(|c| {
+        use abi::UpcallControl as C;
+        thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
+        let control = Call::ThreadUpcallControl.number();
+        c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
+        c.succeeds(control, &[C::Enable.raw()], &[1, 0, 0])?;
+        let mut t = c.thread;
+        // SAFETY: this test's stopped thread never executes application code.
+        unsafe { t.as_mut() }
+            .upcall
+            .request()
+            .map_err(|_| "native request failed")?;
+        let pc = (USER_VA + PAGE) as u64;
+        check(
+            unsafe { t.as_mut() }.upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
+            "no primary entry",
+        )?;
+        // Omitted x1-x9 contain marks, as they do in the legacy trampoline.
+        c.succeeds(control, &[C::Take.raw()], &[1, pc, 0])?;
+        c.succeeds(control, &[C::Mask.raw()], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Defer.raw()], &[1, 0, 0])?;
+        let observer = (USER_VA + 2 * PAGE) as u64;
+        let tls = (USER_VA + 3 * PAGE) as u64;
+        c.succeeds(control, &[C::ObserverBind.raw(), observer, tls], &[])?;
+        c.succeeds(control, &[C::ObserverEnable.raw()], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Resume.raw()], &[1, 0, 0])?;
+        let none = c.created(Call::ObjectInfo.number(), &[0, abi::INFO_THREAD_SELF, 0])?;
+        c.fails(
+            control,
+            &[C::LayerRequest.raw(), none.0],
+            Error::AccessDenied,
+        )?;
+        let resource = c.insert(Object::Resource, Rights::MANAGE)?;
+        c.fails(
+            control,
+            &[C::LayerRequest.raw(), resource.0],
+            Error::WrongType,
+        )?;
+        c.fails(control, &[C::LayerRequest.raw(), 0], Error::BadHandle)?;
+        let managed = c.created(
+            Call::ObjectInfo.number(),
+            &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
+        )?;
+        // Self-target lookup completes before the scheduler mutates the same State.
+        c.fails(
+            control,
+            &[C::LayerRequest.raw(), managed.0],
+            Error::BadState,
+        )?;
+        c.fails(
+            Call::ThreadUpcallRequest.number(),
+            &[managed.0],
+            Error::BadState,
+        )?;
+        c.close(none)?;
+        c.close(resource)?;
+        c.close(managed)?;
+        unsafe { t.as_mut() }
+            .upcall
+            .request_layer()
+            .map_err(|_| "observer request failed")?;
+        let entry = unsafe { t.as_mut() }
+            .upcall
+            .prepare_with_tls(pc, 0, 0, false);
+        check(
+            entry
+                == Some(kcore::upcall::Entry {
+                    pc: observer,
+                    tls: Some(tls),
+                }),
+            "observer did not install resident TLS",
+        )?;
+        c.fails(control, &[C::Take.raw()], Error::BadState)?;
+        c.succeeds(control, &[C::ObserverTake.raw()], &[1, pc, 0, 0])?;
+        let mut context = [0u64; 102];
+        for (i, value) in context.iter_mut().enumerate() {
+            *value = 0xABCD_0000 + i as u64;
+        }
+        context[31] = 0x80_1000;
+        context[32] = pc;
+        context[33] = 0;
+        context[34] = 0;
+        context[35] = BUFFER;
+        context[100] = 0;
+        context[101] = 0;
+        thread::write_words(c.thread, abi::UPCALL_CONTEXT_OFFSET, &context);
+        // Every argument, including x0, is a marker. Return has no selector.
+        c.call(Call::ThreadUpcallReturn.number(), &[]);
+        let exact = |t: NonNull<Thread>| {
+            // SAFETY: this retained test thread never runs while inspected.
+            let t = unsafe { t.as_ref() };
+            t.regs.x[..31] == context[..31]
+                && t.regs.sp == context[31]
+                && t.regs.elr == pc
+                && t.regs.tpidr == 0
+                && t.fp.v[0] == u128::from(context[36]) | (u128::from(context[37]) << 64)
+        };
+        check(exact(c.thread), "observer Return lost exact native context")?;
+        c.succeeds(control, &[C::Mask.raw()], &[1, 0, 0])?;
+        thread::write_words(c.thread, abi::UPCALL_CONTEXT_OFFSET, &context);
+        c.call(Call::ThreadUpcallReturn.number(), &[]);
+        check(exact(c.thread), "primary Return lost exact native context")
+    })
 }
 
 /// thread_upcall_request looks at its target under the scheduler's lock

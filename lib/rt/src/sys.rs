@@ -518,6 +518,29 @@ pub fn self_thread() -> Result<Handle<Thread>, Error> {
     Ok(returned(&x))
 }
 
+/// One owned MANAGE capability of this actual calling thread.
+/// The capability permits current-thread control and has no DUPLICATE or TRANSFER.
+pub fn self_thread_managed() -> Result<Handle<Thread>, Error> {
+    let x = call::<{ Call::ObjectInfo.number() }>(&[
+        0,
+        abi::INFO_THREAD_SELF,
+        u64::from(Rights::MANAGE.0),
+    ])?;
+    if x[1] == 0 {
+        return Err(Error::InvalidArgs);
+    }
+    Ok(returned(&x))
+}
+
+/// Request a resident observer, with native-entry fallback.
+pub fn thread_layer_request(thread: &Handle<Thread>) -> Result<(), Error> {
+    call::<{ Call::ThreadUpcallControl.number() }>(&[
+        abi::UpcallControl::LayerRequest.raw(),
+        thread.raw().0,
+    ])?;
+    Ok(())
+}
+
 /// Kernel object comparison with this caller; raw handle equality is insufficient.
 pub fn is_current_thread(thread: &Handle<Thread>) -> Result<bool, Error> {
     let x = call::<{ Call::ObjectInfo.number() }>(&[thread.raw().0, abi::INFO_THREAD_CURRENT, 0])?;

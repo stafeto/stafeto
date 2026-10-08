@@ -8,8 +8,10 @@ use rt::upcall;
 use rt::wait::{Waited, Waiter};
 core::arch::global_asm!(include_str!("upcall.S"), options(raw));
 rt::upcall_entry!(entry, dispatch);
+rt::observer_upcall_entry!(observer_entry, observer_dispatch, context);
 unsafe extern "C" {
     fn native_upcall_register_probe(output: *mut u64, state: *const AtomicU64);
+    fn native_observer_register_probe(output: *mut u64, state: *const AtomicU64);
 }
 struct Output(UnsafeCell<[u64; 106]>);
 // SAFETY: only one joined worker writes OUTPUT; publication uses RESULT.
@@ -24,6 +26,7 @@ static STATE: State = State {
     seeded: AtomicU64::new(0),
     done: AtomicU64::new(0),
 };
+static OBSERVER_TLS: AtomicU64 = AtomicU64::new(0);
 static MODE: AtomicUsize = AtomicUsize::new(0);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -45,16 +48,41 @@ fn poke() {
     let target = Handle::<Thread>::borrowed(rt::abi::Handle(NATIVE.load(Ordering::Acquire)));
     sys::thread_upcall_request(&target).unwrap();
 }
+unsafe extern "C" fn observer_dispatch(context: *mut upcall::Context) {
+    let tls: u64;
+    // SAFETY: read only this handler's installed resident ABI word.
+    unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls, options(nomem, nostack)) };
+    assert_eq!(tls, OBSERVER_TLS.load(Ordering::Acquire));
+    // SAFETY: the trampoline supplies a live exact interrupted context.
+    let original = unsafe { (*context).tls };
+    assert_eq!(
+        original,
+        if ACTIVE.load(Ordering::Acquire) == 0 {
+            0
+        } else {
+            tls
+        }
+    );
+    unsafe { dispatch() };
+}
 unsafe extern "C" fn dispatch() {
     HANDLER_ID.store(ffi::pthread_self(), Ordering::Release);
     let depth = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
     DEEPEST.fetch_max(depth, Ordering::SeqCst);
     COUNT.fetch_add(1, Ordering::SeqCst);
-    if MODE.load(Ordering::Acquire) == 1 && depth == 1 {
-        unsafe { upcall::enable() }.unwrap();
-        poke();
+    if matches!(MODE.load(Ordering::Acquire), 1 | 5) && depth == 1 {
+        if MODE.load(Ordering::Acquire) == 5 {
+            unsafe { upcall::enable_observer() }.unwrap();
+            let native =
+                Handle::<Thread>::borrowed(rt::abi::Handle(NATIVE.load(Ordering::Acquire)));
+            sys::thread_layer_request(&native).unwrap();
+            upcall::mask_observer().unwrap();
+        } else {
+            unsafe { upcall::enable() }.unwrap();
+            poke();
+            upcall::mask().unwrap();
+        }
         assert_eq!(DEEPEST.load(Ordering::Acquire), 2);
-        upcall::mask().unwrap();
     }
     if MODE.load(Ordering::Acquire) == 3 {
         let base = rt::abi::UPCALL_CONTEXT_OFFSET;
@@ -99,6 +127,15 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     assert_eq!(sys::try_receive(&drain), Err(rt::abi::Error::WouldBlock));
     drop(drain);
     let mode = MODE.load(Ordering::Acquire);
+    if mode == 5 {
+        let tls: u64;
+        unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls, options(nomem, nostack)) };
+        OBSERVER_TLS.store(tls, Ordering::Release);
+        let guard = upcall::defer_entries().unwrap();
+        unsafe { upcall::bind_observer(observer_entry, tls as usize) }.unwrap();
+        unsafe { upcall::enable_observer() }.unwrap();
+        drop(guard);
+    }
     if mode != 2 {
         unsafe { upcall::enable() }.unwrap();
     }
@@ -116,7 +153,13 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
         valid &= STATE.done.load(Ordering::Acquire) == 1;
     } else {
         // SAFETY: the probe retains OUTPUT and state; delivery preserves its registers.
-        unsafe { native_upcall_register_probe((*OUTPUT.0.get()).as_mut_ptr(), &STATE.seeded) };
+        unsafe {
+            if mode == 5 {
+                native_observer_register_probe((*OUTPUT.0.get()).as_mut_ptr(), &STATE.seeded);
+            } else {
+                native_upcall_register_probe((*OUTPUT.0.get()).as_mut_ptr(), &STATE.seeded);
+            }
+        };
     }
     let mut bytes = [0; rt::abi::msgbuf::RESERVED];
     rt::msgbuf::read(0, &mut bytes);
@@ -140,6 +183,9 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
             valid &= output[36 + index * 2] == expected && output[37 + index * 2] == expected;
         }
         valid &= output[100] == 0x800000 && output[101] == 1;
+    }
+    if mode == 5 {
+        upcall::unbind_observer().unwrap();
     }
     upcall::unbind().unwrap();
     RESULT.store(if valid { 1 } else { 2 }, Ordering::Release);
@@ -173,7 +219,7 @@ pub(super) fn run() -> bool {
     let before_used = sys::process_memory(&process).unwrap().used;
     let inactive = unsafe { sys::raw::<{ rt::abi::Call::ThreadUpcallReturn.number() }>([0; 10]) };
     assert_eq!(inactive[0], rt::abi::Error::BadState.code());
-    for mode in [0, 1, 2, 3, 4] {
+    for mode in [0, 1, 2, 3, 4, 5] {
         MODE.store(mode, Ordering::Release);
         COUNT.store(0, Ordering::Release);
         ACTIVE.store(0, Ordering::Release);
@@ -213,7 +259,11 @@ pub(super) fn run() -> bool {
         if mode == 4 && sys::thread_info(&native).unwrap().state != ThreadState::Receiving {
             return failed(235);
         }
-        poke();
+        if mode == 5 {
+            sys::thread_layer_request(&native).unwrap();
+        } else {
+            poke();
+        }
         if mode == 2 {
             poke();
             if !matches!(
@@ -228,8 +278,8 @@ pub(super) fn run() -> bool {
         if !wait_flag(&done, &waiter, &RESULT)
             || RESULT.load(Ordering::Acquire) != 1
             || HANDLER_ID.load(Ordering::Acquire) != id
-            || COUNT.load(Ordering::Acquire) != if mode == 1 { 2 } else { 1 }
-            || DEEPEST.load(Ordering::Acquire) != if mode == 1 { 2 } else { 1 }
+            || COUNT.load(Ordering::Acquire) != if matches!(mode, 1 | 5) { 2 } else { 1 }
+            || DEEPEST.load(Ordering::Acquire) != if matches!(mode, 1 | 5) { 2 } else { 1 }
         {
             return failed(233);
         }

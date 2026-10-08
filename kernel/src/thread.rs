@@ -837,12 +837,16 @@ pub fn run(next: NonNull<Thread>) -> ! {
         let mut process = next.as_ref().process;
         process.as_mut().activate();
         let thread = &mut *next.as_ptr();
-        if let Some(entry) =
-            thread
-                .upcall
-                .prepare(thread.regs.elr, thread.regs.spsr, thread.long.is_some())
-        {
-            thread.regs.elr = entry;
+        if let Some(entry) = thread.upcall.prepare_with_tls(
+            thread.regs.elr,
+            thread.regs.spsr,
+            thread.regs.tpidr,
+            thread.long.is_some(),
+        ) {
+            thread.regs.elr = entry.pc;
+            if let Some(tls) = entry.tls {
+                thread.regs.tpidr = tls;
+            }
             // The dispatcher starts a new control flow and leaves the
             // interrupted indirect branch unfinished. Return restores the old BTYPE.
             thread.regs.spsr &= !kcore::upcall::BRANCH_TYPE;

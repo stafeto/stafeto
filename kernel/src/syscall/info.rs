@@ -28,8 +28,8 @@ use kcore::args::{inline_len_arg, reserved_arg};
 /// channel and in x2 a handle of that channel with RECEIVE, and returns the
 /// copy's label in x1, O(1): ACCESS_DENIED for a copy of another channel,
 /// WRONG_TYPE for a channel handle without a label (the lookup of x2 comes
-/// first). SELF_THREAD requires x0/x2 zero and returns a new owned NONE
-/// handle to the actual caller. Its handle-table insertion is paid by that
+/// first). SELF_THREAD requires x0 zero and x2 exactly NONE or MANAGE,
+/// returning a new owned handle of those rights to the actual caller. Its handle-table insertion is paid by that
 /// process; failure retains no new reference. THREAD_CURRENT requires x2
 /// zero and compares the supplied Thread object with the caller, returning
 /// only bool 0/1. Both preserve registers outside their one-word result.
@@ -42,11 +42,14 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         if a[2] > 1 {
             return Err(Error::InvalidArgs);
         }
-    } else if a[1] != abi::INFO_LOG && a[1] != abi::INFO_LABEL {
+    } else if a[1] != abi::INFO_LOG && a[1] != abi::INFO_LABEL && a[1] != abi::INFO_THREAD_SELF {
         reserved_arg(a[2])?;
     }
     if a[1] == abi::INFO_THREAD_SELF {
         reserved_arg(a[0])?;
+        if a[2] != u64::from(Rights::NONE.0) && a[2] != u64::from(Rights::MANAGE.0) {
+            return Err(Error::InvalidArgs);
+        }
     }
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
     match a[1] {
@@ -96,7 +99,15 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
             let process = super::caller(thread);
             process::check_alive(process)?;
             process::handle_room(process)?;
-            let handle = process::insert_handle(process, Object::Thread(thread), Rights::NONE)?;
+            let handle = process::insert_handle(
+                process,
+                Object::Thread(thread),
+                if a[2] == 0 {
+                    Rights::NONE
+                } else {
+                    Rights::MANAGE
+                },
+            )?;
             Ok(Values::new(&[handle.0]))
         }
         abi::INFO_THREAD_CURRENT => {

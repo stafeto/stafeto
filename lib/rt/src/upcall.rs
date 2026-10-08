@@ -73,6 +73,46 @@ pub unsafe fn bind(entry: unsafe extern "C" fn()) -> Result<(), Error> {
     };
     Error::from_code(result[0]).map_or(Ok(()), Err)
 }
+/// Bind a resident observer on this current thread, initially masked.
+/// # Safety
+/// The entry uses observer_upcall_entry! and `tls` names a resident ABI word
+/// whose TCB and block remain valid until this thread ends or the observer is removed.
+pub unsafe fn bind_observer(entry: unsafe extern "C" fn(), tls: usize) -> Result<(), Error> {
+    observer_bind(entry as usize as u64, tls as u64)
+}
+fn observer_bind(entry: u64, tls: u64) -> Result<(), Error> {
+    // SAFETY: registration touches only this current thread's observer state.
+    let result = unsafe {
+        sys::raw::<{ Call::ThreadUpcallControl.number() }>([
+            UpcallControl::ObserverBind.raw(),
+            entry,
+            tls,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ])
+    };
+    Error::from_code(result[0]).map_or(Ok(()), Err)
+}
+/// Remove an inactive observer; pending observer state is discarded.
+pub fn unbind_observer() -> Result<(), Error> {
+    observer_bind(0, 0)
+}
+/// Mask observer entries while preserving native delivery state.
+pub fn mask_observer() -> Result<bool, Error> {
+    control(UpcallControl::ObserverMask)
+}
+/// Enable observer entries, including immediately pending requests.
+/// # Safety
+/// The resident observer dispatcher must permit asynchronous reentry.
+pub unsafe fn enable_observer() -> Result<bool, Error> {
+    control(UpcallControl::ObserverEnable)
+}
+
 /// Stop entries until enable; returns whether they were already masked.
 pub fn mask() -> Result<bool, Error> {
     control(UpcallControl::Mask)
@@ -116,12 +156,12 @@ impl Drop for DeferredEntry {
 #[macro_export]
 macro_rules! upcall_entry {
     ($visibility:vis $name:ident, $dispatch:path) => {
-        $crate::upcall_entry!(@frame $visibility $name, $dispatch, "");
+        $crate::upcall_entry!(@frame $visibility $name, $dispatch, "", Take, Mask, "");
     };
     ($visibility:vis $name:ident, $dispatch:path, context) => {
-        $crate::upcall_entry!(@frame $visibility $name, $dispatch, "mov x0, sp");
+        $crate::upcall_entry!(@frame $visibility $name, $dispatch, "mov x0, sp", Take, Mask, "");
     };
-    (@frame $visibility:vis $name:ident, $dispatch:path, $argument:literal) => {
+    (@frame $visibility:vis $name:ident, $dispatch:path, $argument:literal, $take:ident, $mask:ident, $tls:literal) => {
         #[unsafe(naked)]
         $visibility unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
@@ -152,7 +192,7 @@ macro_rules! upcall_entry {
                 "2:", "ldp x12, x13, [x9], #16", "stp x12, x13, [x10], #16",
                 "subs x11, x11, #16", "b.ne 2b",
                 "mov x0, #{take}", "svc #{control}", "cbnz x0, 9f",
-                "str x2, [sp, #256]", "str x3, [sp, #264]",
+                "str x2, [sp, #256]", "str x3, [sp, #264]", $tls,
                 $argument, "bl {dispatch}",
                 "mov x0, #{mask}", "svc #{control}", "cbnz x0, 9f",
                 "mrs x9, tpidrro_el0", "add x10, sp, #816", "mov x11, #1088",
@@ -166,12 +206,24 @@ macro_rules! upcall_entry {
                 "9:", "brk #0",
                 dispatch = sym $dispatch,
                 control = const $crate::abi::Call::ThreadUpcallControl.number(),
-                take = const $crate::abi::UpcallControl::Take.raw(),
-                mask = const $crate::abi::UpcallControl::Mask.raw(),
+                take = const $crate::abi::UpcallControl::$take.raw(),
+                mask = const $crate::abi::UpcallControl::$mask.raw(),
                 restore = const $crate::abi::Call::ThreadUpcallReturn.number(),
                 offset = const $crate::abi::UPCALL_CONTEXT_OFFSET,
                 size = const $crate::abi::UPCALL_CONTEXT_SIZE,
             );
         }
+    };
+}
+
+/// Define an observer entry with the same context and IPC preservation as
+/// upcall_entry!. The observer receives resident TLS and restores interrupted TLS.
+#[macro_export]
+macro_rules! observer_upcall_entry {
+    ($visibility:vis $name:ident, $dispatch:path) => {
+        $crate::upcall_entry!(@frame $visibility $name, $dispatch, "", ObserverTake, ObserverMask, "str x4, [sp, #272]");
+    };
+    ($visibility:vis $name:ident, $dispatch:path, context) => {
+        $crate::upcall_entry!(@frame $visibility $name, $dispatch, "mov x0, sp", ObserverTake, ObserverMask, "str x4, [sp, #272]");
     };
 }

@@ -736,8 +736,8 @@ pub const INFO_LOG: u64 = 9;
 /// (spec 5.3, 11). WRONG_TYPE for a copy without a label, ACCESS_DENIED
 /// for a copy of another channel.
 pub const INFO_LABEL: u64 = 11;
-/// SELF_THREAD requires x0 and x2 zero and returns one owned handle to the
-/// calling thread in x1 with Rights::NONE. Its handle table insertion is paid
+/// SELF_THREAD requires x0 zero and x2 exactly NONE or MANAGE, returning
+/// one owned handle to the calling thread in x1 with those rights. Its handle table insertion is paid
 /// by the caller's quota; errors leave no new handle or thread reference.
 pub const INFO_THREAD_SELF: u64 = 12;
 /// THREAD_CURRENT takes a thread handle with any rights and x2 zero. It
@@ -1181,6 +1181,16 @@ pub enum UpcallControl {
     Defer = 3,
     /// End one level of entry deferral; BAD_STATE without one.
     Resume = 4,
+    /// Mask the current thread's observer entry.
+    ObserverMask = 5,
+    /// Enable its observer entry.
+    ObserverEnable = 6,
+    /// Take observer PC, PSTATE and interrupted TLS (x2-x4).
+    ObserverTake = 7,
+    /// Bind observer entry x1 with resident TLS ABI word x2.
+    ObserverBind = 8,
+    /// Request the observer of MANAGE Thread x1, with native-entry fallback.
+    LayerRequest = 9,
 }
 
 impl UpcallControl {
@@ -1192,6 +1202,11 @@ impl UpcallControl {
             2 => Some(UpcallControl::Take),
             3 => Some(UpcallControl::Defer),
             4 => Some(UpcallControl::Resume),
+            5 => Some(UpcallControl::ObserverMask),
+            6 => Some(UpcallControl::ObserverEnable),
+            7 => Some(UpcallControl::ObserverTake),
+            8 => Some(UpcallControl::ObserverBind),
+            9 => Some(UpcallControl::LayerRequest),
             _ => None,
         }
     }
@@ -1554,19 +1569,24 @@ mod tests {
     }
 
     #[test]
-    fn upcall_control_keeps_five_numbered_operations() {
+    fn upcall_control_keeps_native_and_observer_operation_numbers() {
         let operations = [
             (UpcallControl::Mask, 0),
             (UpcallControl::Enable, 1),
             (UpcallControl::Take, 2),
             (UpcallControl::Defer, 3),
             (UpcallControl::Resume, 4),
+            (UpcallControl::ObserverMask, 5),
+            (UpcallControl::ObserverEnable, 6),
+            (UpcallControl::ObserverTake, 7),
+            (UpcallControl::ObserverBind, 8),
+            (UpcallControl::LayerRequest, 9),
         ];
         for (operation, raw) in operations {
             assert_eq!(operation.raw(), raw);
             assert_eq!(UpcallControl::from_raw(raw), Some(operation));
         }
-        for raw in [5, 1 << 32, u64::MAX] {
+        for raw in [10, 1 << 32, u64::MAX] {
             assert_eq!(UpcallControl::from_raw(raw), None, "{raw:#x}");
         }
     }

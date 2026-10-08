@@ -275,14 +275,30 @@ pub unsafe fn interrupt(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
 /// # Safety
 /// As for `interrupt`.
 pub unsafe fn request_upcall(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
+    // SAFETY: the caller retains the target.
+    unsafe { request_selected_upcall(t, cause, false) }
+}
+
+/// Request a resident observer with native-entry fallback.
+/// # Safety
+/// The caller retains the target through scheduler mutation.
+pub unsafe fn request_layer_upcall(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
+    // SAFETY: the caller's target retention promise.
+    unsafe { request_selected_upcall(t, cause, true) }
+}
+
+unsafe fn request_selected_upcall(t: NonNull<Thread>, cause: u8, layer: bool) -> Result<(), Error> {
     // SAFETY: as the caller promises.
     unsafe {
         interrupt_if(t, cause, |thread| {
             if matches!(thread.sched.state(), State::Stopped | State::Dead) {
                 return Err(Error::BadState);
             }
-            Ok(thread.upcall.request()?
-                && matches!(thread.waits, Some(Wait::Receive(_) | Wait::Send(_))))
+            Ok((if layer {
+                thread.upcall.request_layer()?
+            } else {
+                thread.upcall.request()?
+            }) && matches!(thread.waits, Some(Wait::Receive(_) | Wait::Send(_))))
         })
     }
 }

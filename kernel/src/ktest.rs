@@ -374,6 +374,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_pays_its_budget_back_to_the_payer,
     ),
     (
+        "observer_wire_preserves_native_context_and_ignored_registers",
+        calls::observer_wire_preserves_native_context_and_ignored_registers,
+    ),
+    (
         "upcall_request_refuses_a_stopped_thread",
         calls::upcall_request_refuses_a_stopped_thread,
     ),
