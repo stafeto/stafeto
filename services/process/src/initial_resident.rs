@@ -106,6 +106,13 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
             operation_pending: None,
         })
     }
+    /// Every native custody effect remains bound to the full current image.
+    pub fn matches_image(&self, label: u64, image: u32) -> bool {
+        label == self.key.label
+            && label == self.publication.map.receipt.label
+            && image == self.publication.map.receipt.key.image
+    }
+
     pub fn phase(&self) -> Phase {
         self.phase
     }
@@ -114,9 +121,6 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
     }
     pub fn end_reason(&self) -> Option<u32> {
         (self.flags & ENDED != 0).then_some(self.end_reason)
-    }
-    pub fn guard_label(&self) -> u64 {
-        self.guard_label
     }
     pub fn awaiting_guard(&mut self) -> bool {
         if self.phase != Phase::Reserved {
@@ -175,23 +179,43 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
             return false;
         }
         if self.flags & STAGE != 0 {
-            return key == self.key && self.guard_label == source_label;
+            return false;
         }
         if self.key.epoch == 0 {
             if self.pending_stage().map(|value| value.0) != Some(key.epoch) {
                 return false;
             }
             self.clear_pending_epoch();
-            self.end_reason = 0;
             self.key.epoch = key.epoch;
         } else if key != self.key || self.phase != Phase::GuardWait {
             return false;
         }
-        self.guard_label = source_label;
         self.flags |= STAGE;
         self.phase = Phase::Loading;
         true
     }
+    /// The caller also checks the actual source label retained in its Record.
+    pub fn stage_replay_matches(&self, stage: &proto_process::initial_stage::Stage) -> bool {
+        self.page_ready()
+            && self.operation_pending.is_none()
+            && stage.epoch == self.key.epoch
+            && stage.ticket == self.key.ticket
+            && stage.label == self.key.label
+            && stage.query.receipt == self.publication.map.receipt
+            && stage.source == self.publication.source
+            && stage.uid == self.end_reason
+            && (u64::from(stage.gid) | (u64::from(stage.mode) << 32)) == self.guard_label
+    }
+
+    pub fn maps_replay_matches(&self, publication: &Publication) -> bool {
+        self.maps_ready()
+            && self.operation_pending.is_none()
+            && self.publication == *publication
+            && self.originals.iter().enumerate().all(|(slot, owner)| {
+                owner.is_some() == (slot < usize::from(self.publication.map.count))
+            })
+    }
+
     pub fn maps_ready(&self) -> bool {
         self.page_ready() && self.flags & (MAPS | ENDED) == MAPS
     }
@@ -445,6 +469,20 @@ impl<M, C, T, D> InitialResident<M, C, T, D> {
             _ => Err(owner),
         }
     }
+    /// A terminal reply can leave an empty Pending that has no Drop effect.
+    pub fn settle_operation(&mut self, token_returned: bool) {
+        if !token_returned {
+            self.operation_pending.take();
+        }
+    }
+
+    pub fn settle_identity(&mut self, token_returned: bool) {
+        if !token_returned {
+            self.crt_pending.take();
+            self.identity_finished();
+        }
+    }
+
     pub fn releasable(&self) -> bool {
         self.flags & INIT_ACK != 0
             && (self.flags & ENDED != 0 || self.flags & (USER | CRT_REPLIED) == USER | CRT_REPLIED)
@@ -532,6 +570,169 @@ mod tests {
             None,
         ]
     }
+    #[test]
+    fn settled_replay_preserves_complete_stage_and_verified_original_custody() {
+        let (mut resident, publication, log) = fixture();
+        resident.key.epoch = 0;
+        let stage = proto_process::initial_stage::Stage {
+            epoch: 37,
+            ticket: resident.key.ticket,
+            label: resident.key.label,
+            source: publication.source,
+            query: proto_process::initial_identity::Query {
+                receipt: publication.map.receipt,
+            },
+            uid: u32::MAX,
+            gid: u32::MAX - 1,
+            mode: 1,
+        };
+        assert!(!resident.stage_replay_matches(&stage));
+        assert!(resident.awaiting_guard());
+        assert!(resident.queue_stage(stage.epoch, stage.uid, stage.gid, stage.mode));
+        resident.operation_pending = Some(Cap(90, log.clone()));
+        assert!(!resident.stage_replay_matches(&stage));
+        assert!(!resident.authenticated_stage(
+            SeedKey {
+                epoch: 38,
+                ..resident.key
+            },
+            71
+        ));
+        assert!(resident.authenticated_stage(
+            SeedKey {
+                epoch: 37,
+                ..resident.key
+            },
+            71
+        ));
+        assert!(!resident.authenticated_stage(resident.key, 72));
+        assert!(!resident.stage_replay_matches(&stage));
+        assert!(resident.retain_page_copy(Cap(80, log.clone())).is_ok());
+        assert!(resident.confirm_page_map());
+        assert!(!resident.stage_replay_matches(&stage));
+        drop(resident.remove_page_copy().unwrap());
+        assert!(resident.confirm_page_settled());
+        assert!(!resident.stage_replay_matches(&stage));
+        resident.settle_operation(true);
+        assert!(resident.operation_pending.is_some());
+        resident.settle_operation(false);
+        assert!(resident.stage_replay_matches(&stage));
+        for field in 0..12 {
+            let mut foreign = stage;
+            match field {
+                0 => foreign.epoch += 1,
+                1 => foreign.ticket -= 1,
+                2 => foreign.label += 1 << 32,
+                3 => foreign.source.artifact += 1,
+                4 => foreign.source.raw += 1,
+                5 => foreign.source.canonical = None,
+                6 => foreign.query.receipt.pid += 1,
+                7 => foreign.query.receipt.key.image += 1,
+                8 => foreign.query.receipt.init_ticket -= 1,
+                9 => foreign.uid -= 1,
+                10 => foreign.gid -= 1,
+                _ => foreign.mode = 0,
+            }
+            assert!(
+                !resident.stage_replay_matches(&foreign),
+                "stage field {field}"
+            );
+        }
+        assert!(!resident.maps_replay_matches(&publication));
+        assert!(resident.begin_publish(publication, objects(&log)).is_ok());
+        assert!(!resident.maps_replay_matches(&publication));
+        resident.operation_pending = Some(Cap(91, log.clone()));
+        assert!(!resident.maps_replay_matches(&publication));
+        assert!(resident.memory_validated(0));
+        assert!(!resident.maps_replay_matches(&publication));
+        assert!(resident.memory_validated(1));
+        assert!(resident.maps_ready());
+        assert!(!resident.maps_replay_matches(&publication));
+        resident.settle_operation(false);
+        assert!(resident.maps_replay_matches(&publication));
+        assert!(resident.stage_replay_matches(&stage));
+        for field in 0..9 {
+            let mut foreign = publication;
+            match field {
+                0 => foreign.source.artifact += 1,
+                1 => foreign.source.raw += 1,
+                2 => foreign.source.canonical = None,
+                3 => foreign.map.receipt.key.key -= 1,
+                4 => foreign.map.receipt.label += 1 << 32,
+                5 => foreign.map.receipt.pid += 1,
+                6 => foreign.map.receipt.init_ticket -= 1,
+                7 => foreign.map.entries[0].address += 4096,
+                _ => foreign.map.entries[1].access = Access::Read,
+            }
+            assert!(
+                !resident.maps_replay_matches(&foreign),
+                "publication field {field}"
+            );
+        }
+        let duplicates = resident
+            .begin_publish(publication, objects(&log))
+            .err()
+            .unwrap();
+        assert_eq!(resident.originals[0].as_ref().unwrap().0, 1);
+        assert!(resident.maps_replay_matches(&publication));
+        drop(duplicates);
+        resident.flags &= !PAGE_SETTLED;
+        assert!(!resident.maps_replay_matches(&publication));
+        assert!(!resident.stage_replay_matches(&stage));
+        resident.flags |= PAGE_SETTLED;
+        assert!(resident.native_exited(resident.key, 19));
+        assert!(!resident.maps_replay_matches(&publication));
+        assert!(!resident.stage_replay_matches(&stage));
+        assert_eq!(resident.end_reason(), Some(19));
+    }
+
+    #[test]
+    fn source_custody_stays_bound_to_full_generation_and_current_image() {
+        let (mut resident, _, _) = fixture();
+        let label = resident.key.label;
+        assert!(resident.matches_image(label, 1));
+        assert!(!resident.matches_image(label, 2));
+        assert!(!resident.matches_image(label + (1 << 32), 1));
+        assert!(!resident.matches_image(label ^ (1 << 16), 1));
+        assert!(resident.awaiting_guard());
+        assert!(!resident.authenticated_stage(resident.key, 0));
+        assert!(resident.authenticated_stage(resident.key, 71));
+        assert!(!resident.authenticated_stage(resident.key, 72));
+        assert!(!resident.authenticated_stage(resident.key, 71));
+        assert!(resident.native_exited(resident.key, 19));
+        assert!(!resident.matches_image(label, 2));
+    }
+
+    #[test]
+    fn new_identity_attempt_clears_previous_proof_after_consumed_reply() {
+        let (mut resident, publication, log) = fixture();
+        assert!(!resident.maps_ready());
+        assert!(resident.awaiting_guard());
+        assert!(resident.authenticated_stage(resident.key, 71));
+        resident.flags |= PAGE_MAPPED | PAGE_SETTLED;
+        assert!(resident.begin_publish(publication, objects(&log)).is_ok());
+        assert!(!resident.maps_ready());
+        assert!(resident.memory_validated(0));
+        assert!(resident.memory_validated(1));
+        assert!(resident.maps_ready());
+        resident.crt_pending = Some(Cap(40, log.clone()));
+        resident.identity_result(true);
+        assert!(resident.identity_genuine());
+        resident.settle_identity(true);
+        assert!(resident.crt_pending.is_some());
+        assert!(resident.identity_genuine());
+        resident.settle_identity(false);
+        assert!(resident.crt_pending.is_none());
+        assert!(!resident.identity_checked());
+        resident.crt_pending = Some(Cap(41, log.clone()));
+        assert!(!resident.identity_genuine());
+        resident.identity_result(false);
+        assert!(!resident.identity_genuine());
+        resident.settle_identity(false);
+        assert!(!resident.identity_checked());
+        assert_eq!(log.borrow().as_slice(), &[40, 41]);
+    }
+
     #[test]
     fn reserved_epoch_is_private_until_exact_proof_and_cleared_before_maps() {
         let (mut resident, publication, log) = fixture();

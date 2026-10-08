@@ -1390,6 +1390,8 @@ mod tests {
             Method::InitialMapAck,
             Method::CreateInitial,
             Method::InitialMaps,
+            Method::StageInitial,
+            Method::InitialOf,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {

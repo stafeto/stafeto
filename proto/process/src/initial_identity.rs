@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn literal_wire_matches_canonical_query_and_reply() {
         assert_eq!(Method::InitialOf as u16, 61);
-        assert!(!crate::METHODS.contains(&61));
+        assert!(crate::METHODS.contains(&61));
         assert_eq!(Query::read(&query_bytes(), 1), Ok(expected()));
         let mut w = Writer::new();
         expected().write(&mut w).unwrap();

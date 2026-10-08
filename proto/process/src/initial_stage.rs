@@ -22,6 +22,14 @@ pub struct Stage {
     pub mode: u32,
 }
 impl Stage {
+    /// A settled reconciliation carries metadata and no new owner.
+    pub fn read_reconciliation(bytes: &[u8], handles: usize) -> Result<Self, Status> {
+        if handles != 0 {
+            return Err(Status::BadSize);
+        }
+        Self::read(bytes, 1)
+    }
+
     pub fn read(bytes: &[u8], handles: usize) -> Result<Self, Status> {
         if bytes.len() != BODY || handles != 1 {
             return Err(Status::BadSize);
@@ -148,6 +156,29 @@ mod tests {
             mode: 1,
         }
     }
+    #[test]
+    fn reconciliation_has_exact_canonical_body_and_zero_new_owners() {
+        let mut w = Writer::new();
+        stage().write(&mut w).unwrap();
+        let bytes = w.as_bytes();
+        assert_eq!(Stage::read_reconciliation(bytes, 0), Ok(stage()));
+        assert!(Stage::read(bytes, 0).is_err());
+        for caps in 1..=4 {
+            assert!(Stage::read_reconciliation(bytes, caps).is_err());
+        }
+        for length in 0..bytes.len() {
+            assert!(Stage::read_reconciliation(&bytes[..length], 0).is_err());
+        }
+        for offset in [36, 40, 44, 48, 52, 92] {
+            let mut bad = bytes.to_vec();
+            bad[offset] ^= 1;
+            assert_eq!(Stage::read_reconciliation(&bad, 0), Stage::read(&bad, 1));
+        }
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        assert!(Stage::read_reconciliation(&trailing, 0).is_err());
+    }
+
     #[test]
     fn source_proof_requires_complete_echo_and_canonical_status() {
         let mut w = Writer::new();

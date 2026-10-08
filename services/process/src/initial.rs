@@ -11,7 +11,13 @@ use rt::service::{Answer, Request};
 
 impl Processes {
     pub(super) fn initial_stage(&mut self, request: &mut Request<'_>) -> Answer {
-        let Ok(stage) = proto_process::initial_stage::Stage::read(
+        let reconciliation = request.handles.is_empty();
+        let decode = if reconciliation {
+            proto_process::initial_stage::Stage::read_reconciliation
+        } else {
+            proto_process::initial_stage::Stage::read
+        };
+        let Ok(stage) = decode(
             &request.bytes()[proto_wire::HEADER_LEN..],
             request.handles.len(),
         ) else {
@@ -23,6 +29,18 @@ impl Processes {
         let Some(resident) = self.replacing[index].as_mut().and_then(Work::initial_mut) else {
             return crate::refuse(proto_process::PERMISSION);
         };
+        if reconciliation {
+            let exact = self.records.get(index).is_some_and(|record| {
+                resident.matches_image(record.label.raw_at(record.image), record.image)
+                    && record.active_guard_label != 0
+                    && record.active_exec.is_some()
+            });
+            return if exact && resident.stage_replay_matches(&stage) {
+                receipt_reply(request, resident.publication.map.receipt)
+            } else {
+                Answer::Status(Status::Kernel(abi::Error::BadState))
+            };
+        }
         if resident.key.ticket != stage.ticket
             || resident.key.label != stage.label
             || resident.publication.source != stage.source
@@ -93,7 +111,13 @@ impl Processes {
     }
 
     pub(super) fn initial_maps(&mut self, request: &mut Request<'_>) -> Answer {
-        let Ok(publication) = proto_process::initial_publication::Publication::read(
+        let reconciliation = request.handles.is_empty();
+        let decode = if reconciliation {
+            proto_process::initial_publication::Publication::read_reconciliation
+        } else {
+            proto_process::initial_publication::Publication::read
+        };
+        let Ok(publication) = decode(
             &request.bytes()[proto_wire::HEADER_LEN..],
             request.handles.len(),
         ) else {
@@ -105,6 +129,18 @@ impl Processes {
         let Some(resident) = self.replacing[index].as_mut().and_then(Work::initial_mut) else {
             return crate::refuse(proto_process::PERMISSION);
         };
+        if reconciliation {
+            let exact = self.records.get(index).is_some_and(|record| {
+                resident.matches_image(record.label.raw_at(record.image), record.image)
+                    && record.active_guard_label != 0
+                    && record.active_exec.is_some()
+            });
+            return if exact && resident.maps_replay_matches(&publication) {
+                receipt_reply(request, resident.publication.map.receipt)
+            } else {
+                Answer::Status(Status::Kernel(abi::Error::BadState))
+            };
+        }
         if !resident.page_ready()
             || resident.phase() != Phase::Loading
             || resident.publication.source != publication.source
@@ -253,10 +289,9 @@ impl Processes {
                     match token.reply_handles(&reply, rt::handle::Outgoing::new()) {
                         Ok(()) => {
                             if notary {
-                                resident.crt_pending.take();
-                                resident.identity_finished();
+                                resident.settle_identity(false);
                             } else {
-                                resident.operation_pending.take();
+                                resident.settle_operation(false);
                             }
                         }
                         Err(mut refused) => {
@@ -269,12 +304,17 @@ impl Processes {
                             if let Some(token) = refused.token.take() {
                                 assert!(pending.restore_token(token).is_ok());
                             } else if notary {
-                                resident.crt_pending.take();
-                                resident.identity_finished();
+                                resident.settle_identity(false);
                             } else {
-                                resident.operation_pending.take();
+                                resident.settle_operation(false);
                             }
                         }
+                    }
+                } else {
+                    if notary {
+                        resident.settle_identity(false);
+                    } else {
+                        resident.settle_operation(false);
                     }
                 }
             }
@@ -284,7 +324,8 @@ impl Processes {
             if let Some(identity) = resident.retained_identity.as_ref() {
                 if !resident.identity_checked() {
                     let expected = self.records.get(index).expect("the exact initial record");
-                    let genuine = expected.label.raw_at(expected.image) == resident.key.label
+                    let genuine = resident
+                        .matches_image(expected.label.raw_at(expected.image), expected.image)
                         && rt::sys::copy_label(&self.identities, identity)
                             == Ok(expected.label.identity_at(expected.image));
                     resident.identity_result(genuine);
@@ -319,8 +360,7 @@ impl Processes {
             if let Some(token) = pending.take_token() {
                 match token.reply_handles(reply.as_bytes(), rt::handle::Outgoing::new()) {
                     Ok(()) => {
-                        resident.crt_pending.take();
-                        resident.identity_finished();
+                        resident.settle_identity(false);
                     }
                     Err(mut refused) => {
                         assert!(
@@ -332,11 +372,12 @@ impl Processes {
                         if let Some(token) = refused.token.take() {
                             assert!(pending.restore_token(token).is_ok());
                         } else {
-                            resident.crt_pending.take();
-                            resident.identity_finished();
+                            resident.settle_identity(false);
                         }
                     }
                 }
+            } else {
+                resident.settle_identity(false);
             }
             return;
         }
@@ -403,7 +444,7 @@ impl Processes {
             if let Some(token) = pending.take_token() {
                 match token.reply_handles(reply.as_bytes(), rt::handle::Outgoing::new()) {
                     Ok(()) => {
-                        resident.operation_pending.take();
+                        resident.settle_operation(false);
                     }
                     Err(mut refused) => {
                         assert!(
@@ -415,12 +456,26 @@ impl Processes {
                         if let Some(token) = refused.token.take() {
                             assert!(pending.restore_token(token).is_ok());
                         } else {
-                            resident.operation_pending.take();
+                            resident.settle_operation(false);
                         }
                     }
                 }
+            } else {
+                resident.settle_operation(false);
             }
             return;
         }
     }
+}
+
+fn receipt_reply(
+    request: &mut Request<'_>,
+    receipt: proto_process::initial_map::Receipt,
+) -> Answer {
+    request
+        .reply()
+        .bytes(&proto_wire::reply(Status::Ok))
+        .and_then(|()| proto_process::initial_identity::Query { receipt }.write(request.reply()))
+        .expect("the fixed initial receipt reply");
+    Answer::Reply(rt::handle::Outgoing::new())
 }

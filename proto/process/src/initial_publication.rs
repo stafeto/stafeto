@@ -120,6 +120,15 @@ impl Publication {
         }
         Ok(())
     }
+    /// A settled reconciliation carries the complete publication without owners.
+    pub fn read_reconciliation(bytes: &[u8], handles: usize) -> Result<Self, Status> {
+        if handles != 0 {
+            return Err(Status::BadSize);
+        }
+        let count = bytes.get(10..12).ok_or(Status::BadSize)?;
+        Self::read(bytes, usize::from(u16::from_le_bytes([count[0], count[1]])))
+    }
+
     pub fn read(bytes: &[u8], handles: usize) -> Result<Self, Status> {
         if !(HEADER..=MAX).contains(&bytes.len()) {
             return Err(Status::BadSize);
@@ -249,6 +258,33 @@ mod tests {
             assert!(Publication::read(&b, usize::from(count)).is_err());
         }
     }
+    #[test]
+    fn reconciliation_preserves_all_publication_checks_and_transfers_no_owner() {
+        for count in 1..=4 {
+            let publication = fixture(count);
+            let mut w = Writer::new();
+            publication.write(&mut w).unwrap();
+            let bytes = w.as_bytes();
+            assert_eq!(Publication::read_reconciliation(bytes, 0), Ok(publication));
+            assert!(Publication::read(bytes, 0).is_err());
+            for caps in 1..=4 {
+                assert!(Publication::read_reconciliation(bytes, caps).is_err());
+            }
+            for length in 0..bytes.len() {
+                assert!(Publication::read_reconciliation(&bytes[..length], 0).is_err());
+            }
+            for offset in 0..bytes.len() {
+                let mut bad = bytes.to_vec();
+                bad[offset] ^= 1;
+                let expected = Publication::read(&bad, usize::from(count));
+                assert_eq!(Publication::read_reconciliation(&bad, 0), expected);
+            }
+            let mut trailing = bytes.to_vec();
+            trailing.push(0);
+            assert!(Publication::read_reconciliation(&trailing, 0).is_err());
+        }
+    }
+
     #[test]
     fn publication_rejects_invalid_source_receipt_and_ranges() {
         let p = fixture(2);
