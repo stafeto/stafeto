@@ -1492,7 +1492,7 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
     let kinds = [
         [own, 0, 0],
         [own, abi::INFO_LOG + 1, 0],
-        [own, abi::INFO_LABEL + 1, 0],
+        [own, abi::INFO_THREAD_CURRENT + 1, 0],
         [own, state | 1 << 32, 0],
         [own, state, 8],
         [0, 0, 0],
@@ -1505,6 +1505,8 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
             stats,
             abi::INFO_MEMORY,
             thread_state,
+            abi::INFO_THREAD_SELF,
+            abi::INFO_THREAD_CURRENT,
             channel_kind,
             irq,
         ]
@@ -1521,6 +1523,8 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (0, table, Error::BadHandle),
         (0, stats, Error::BadHandle),
         (0, thread_state, Error::BadHandle),
+        (0, abi::INFO_THREAD_CURRENT, Error::BadHandle),
+        (own, abi::INFO_THREAD_CURRENT, Error::WrongType),
         (0, channel_kind, Error::BadHandle),
         (0, irq, Error::BadHandle),
         (resource, state, Error::WrongType),

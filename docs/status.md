@@ -39,7 +39,11 @@ POSIX layer covers, and which commands check each piece. It describes
   (`console_poll` of the old VZ build) and 35 (`request_identity`) are
   retired and fail as unknown ones, and so does kind 10 of `object_info`;
   the process service names its clients by the labels of the sessions it
-  gives. Kind 11 of `object_info`, LABEL, gives the owner of a channel
+  gives. Kind 12 returns one owned NONE capability of the actual calling
+  thread, paid by its handle table and quota. Kind 13 compares a supplied
+  Thread object with the caller and returns bool 0/1; raw handle values do
+  not establish identity. Both preserve the ordinary ObjectInfo result span.
+  Kind 11 of `object_info`, LABEL, gives the owner of a channel
   (with RECEIVE) the label of a labelled copy of it, O(1): the process
   service's Vouch. `process_kill` takes the level of the teardown it starts.
 - **Messages:** requests and replies of up to 1 KiB, the first 64 bytes in

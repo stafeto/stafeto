@@ -736,6 +736,13 @@ pub const INFO_LOG: u64 = 9;
 /// (spec 5.3, 11). WRONG_TYPE for a copy without a label, ACCESS_DENIED
 /// for a copy of another channel.
 pub const INFO_LABEL: u64 = 11;
+/// SELF_THREAD requires x0 and x2 zero and returns one owned handle to the
+/// calling thread in x1 with Rights::NONE. Its handle table insertion is paid
+/// by the caller's quota; errors leave no new handle or thread reference.
+pub const INFO_THREAD_SELF: u64 = 12;
+/// THREAD_CURRENT takes a thread handle with any rights and x2 zero. It
+/// compares its kernel object with the caller and returns only bool 0 or 1.
+pub const INFO_THREAD_CURRENT: u64 = 13;
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
@@ -1311,6 +1318,15 @@ pub const PANIC_EXIT_CODE: u64 = 101;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_thread_selectors_preserve_existing_numbers() {
+        assert_eq!(INFO_THREAD_SELF, 12);
+        assert_eq!(INFO_THREAD_CURRENT, 13);
+        assert_eq!(INFO_LABEL, 11);
+        assert_eq!(Call::ObjectInfo.number(), 27);
+        assert_eq!(Call::ALL.len(), 34);
+    }
 
     #[test]
     fn handle_packs_index_and_generation() {

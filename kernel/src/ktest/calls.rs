@@ -258,6 +258,90 @@ fn counted_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// SELF owns one paid NONE capability; CURRENT compares actual Thread objects.
+pub fn object_info_self_thread_has_exact_ownership(_: &Boot) -> Result<(), &'static str> {
+    let threads = thread::probe_in_use();
+    let processes = process::in_use();
+    let result = with_caller(|c| {
+        let n = Call::ObjectInfo.number();
+        let used = process::quota(c.process).used();
+        with_quota_left(c, 0, || {
+            c.fails(n, &[0, abi::INFO_THREAD_SELF, 0], Error::NoMemory)
+        })?;
+        check(
+            process::quota(c.process).used() == used && process::handle_counts(c.process).0 == 0,
+            "failed SELF left a charge or handle",
+        )?;
+        c.fails(n, &[1, abi::INFO_THREAD_SELF, 0], Error::InvalidArgs)?;
+        c.fails(n, &[0, abi::INFO_THREAD_SELF, 1], Error::InvalidArgs)?;
+        let first = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
+        let second = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
+        check(first != second, "SELF reused a live numeric handle")?;
+        c.succeeds(n, &[first.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
+        c.succeeds(n, &[second.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
+        c.fails(
+            Call::HandleDuplicate.number(),
+            &[first.0, Rights::NONE.0.into(), 0, 0],
+            Error::AccessDenied,
+        )?;
+        c.fails(Call::ThreadStart.number(), &[first.0], Error::AccessDenied)?;
+        let resource = c.insert(Object::Resource, Rights::NONE)?;
+        c.fails(
+            n,
+            &[resource.0, abi::INFO_THREAD_CURRENT, 0],
+            Error::WrongType,
+        )?;
+        c.fails(n, &[0, abi::INFO_THREAD_CURRENT, 0], Error::BadHandle)?;
+        c.fails(
+            n,
+            &[resource.0, abi::INFO_THREAD_CURRENT, 1],
+            Error::InvalidArgs,
+        )?;
+        c.close(resource)?;
+        let other = Caller::new()?;
+        let supplied = c.insert(Object::Thread(other.thread), Rights::NONE)?;
+        let compared = c.succeeds(n, &[supplied.0, abi::INFO_THREAD_CURRENT, 0], &[0]);
+        c.close(supplied)?;
+        other.release();
+        compared?;
+        let before = thread::info(c.thread);
+        c.close(first)?;
+        c.fails(n, &[first.0, abi::INFO_THREAD_CURRENT, 0], Error::BadHandle)?;
+        check(
+            thread::info(c.thread).to_words() == before.to_words(),
+            "SELF Close changed the thread",
+        )?;
+        let fresh = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
+        check(fresh != first, "SELF revived a stale handle generation")?;
+        c.succeeds(n, &[fresh.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
+        c.close(fresh)?;
+        c.close(second)?;
+        let warmed = process::quota(c.process).used();
+        let mut full = [Handle::INVALID; LIMIT as usize];
+        for h in &mut full {
+            *h = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
+        }
+        c.fails(n, &[0, abi::INFO_THREAD_SELF, 0], Error::LimitReached)?;
+        check(
+            process::quota(c.process).used() == warmed
+                && process::handle_counts(c.process).0 == LIMIT,
+            "full-table SELF left an extra charge or handle",
+        )?;
+        for h in full {
+            c.close(h)?;
+        }
+        check(
+            process::handle_counts(c.process).0 == 0,
+            "SELF handles remained live",
+        )
+    });
+    result?;
+    check(
+        thread::probe_in_use() == threads && process::in_use() == processes,
+        "SELF leaked a Thread or Process reference after caller cleanup",
+    )
+}
+
 /// object_info LABEL (spec 5.3, 11): a labelled copy's label goes to a
 /// caller that holds the same channel with RECEIVE, through its handle or
 /// through a labelled copy with RECEIVE, and to nobody else: a receiver

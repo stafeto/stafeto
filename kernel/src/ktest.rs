@@ -229,6 +229,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_info_reports_what_the_kernel_counts,
     ),
     (
+        "object_info_self_thread_has_exact_ownership",
+        calls::object_info_self_thread_has_exact_ownership,
+    ),
+    (
         "object_info_label_answers_the_channels_owner",
         calls::object_info_label_answers_the_channels_owner,
     ),
