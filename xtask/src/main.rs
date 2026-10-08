@@ -1491,6 +1491,7 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
             .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
     }
     disasm::erratum_835769(&elf, &llvm_tool("llvm-objdump")?)?;
+    disasm::erratum_843419(&elf)?;
     run_cmd(
         Command::new(llvm_tool("llvm-objcopy")?)
             .args(["-O", "binary"])
@@ -1606,6 +1607,7 @@ fn write_elf_image(
     for (file, elf, stack) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
         disasm::erratum_835769(elf, &objdump)?;
+        disasm::erratum_843419(elf)?;
         // A program of stack 0 goes into the image as its ELF file alone:
         // the loader, and the programs only files of the table name.
         if *stack == 0 {

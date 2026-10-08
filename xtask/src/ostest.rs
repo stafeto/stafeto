@@ -449,6 +449,7 @@ fn test_elf(test: &Test, object: &str, elfs: &Path) -> Result<Vec<u8>, String> {
     crate::run_cmd(&mut cmd)?;
     let built = cargo_output(&target_dir(), PROGRAM_TARGET, BOOT_PROFILE, "os-test-probe");
     crate::disasm::erratum_835769(&built, &llvm_tool("llvm-objdump")?)?;
+    crate::disasm::erratum_843419(&built)?;
     let kept = elfs.join(test.name.replace('/', "__"));
     crate::run_cmd(
         Command::new(llvm_tool("llvm-objcopy")?)
