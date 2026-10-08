@@ -496,6 +496,16 @@ impl ObjectKind {
 /// Bytes 0-63 of a message travel in x2-x9, and the kernel neither reads
 /// nor writes them here; it copies bytes 64 up to the length from the
 /// sender's buffer into the receiver's, at the same offsets.
+///
+/// | Bytes | Name | Owner |
+/// |---|---|---|
+/// | 0-1023 | `DATA` | the message (`COPIED` and up copied by the kernel) |
+/// | 1024-1055 | `HANDLES` | the handle values of a message |
+/// | 1056-1087 | `INFO` | an info word for each handle that came |
+/// | 1088-1119 | | unused |
+/// | 1120-1935 | `CONTEXT` | the saved context of an entry, read at its return |
+/// | 1936-1999 | `ENTRIES` | the entry record of `rt`, which the kernel never touches |
+/// | 2000-4095 | | unused |
 pub mod msgbuf {
     use crate::{INLINE_MAX, MESSAGE_HANDLES, MESSAGE_MAX, ObjectKind, Rights};
 
@@ -509,10 +519,43 @@ pub mod msgbuf {
     /// An info word for each handle that came (`info`), MESSAGE_HANDLES
     /// words, written by the kernel at delivery.
     pub const INFO: usize = HANDLES + 8 * MESSAGE_HANDLES;
-    /// The kernel's reserve, to the end of the page: no program uses it.
+    /// The end of the part a message uses: the offsets of `DATA` up to
+    /// here are those of messages, handles and info words.
     pub const RESERVED: usize = INFO + 8 * MESSAGE_HANDLES;
+    /// The saved context of an entry (`UPCALL_CONTEXT_OFFSET`).
+    pub const CONTEXT: usize = crate::UPCALL_CONTEXT_OFFSET;
+    /// The end of the saved context.
+    pub const CONTEXT_END: usize = CONTEXT + crate::UPCALL_CONTEXT_SIZE;
+    /// The entry record of `rt`: eight words, which only the thread that
+    /// owns the page reads and writes. The kernel writes `HANDLES` and
+    /// `INFO`, copies bytes from `COPIED` up to the length of a message,
+    /// and reads `CONTEXT` at the return of an entry; it leaves these bytes
+    /// alone.
+    pub const ENTRIES: usize = CONTEXT_END;
+    /// The size of the entry record in bytes.
+    pub const ENTRIES_SIZE: usize = 64;
+    /// The words of the entry record, as byte offsets from `ENTRIES`: the
+    /// handler of the program, the resident handler of the layer, the TLS
+    /// of the resident handler, the frame of the live resident call (0 for
+    /// none), flags, the exit hook, and two words in reserve.
+    pub const ENTRY_OWN: usize = 0;
+    pub const ENTRY_RESIDENT: usize = 8;
+    pub const ENTRY_TLS: usize = 16;
+    pub const ENTRY_OUTER: usize = 24;
+    pub const ENTRY_FLAGS: usize = 32;
+    pub const ENTRY_HOOK: usize = 40;
     /// The size of the buffer, one page.
     pub const SIZE: usize = 4096;
+
+    const _: () = {
+        assert!(CONTEXT >= RESERVED);
+        assert!(ENTRIES.is_multiple_of(8));
+        assert!(ENTRIES + ENTRIES_SIZE <= SIZE);
+        assert!(ENTRY_HOOK + 8 <= ENTRIES_SIZE - 16);
+        assert!(ENTRY_FLAGS == ENTRY_OUTER + 8 && ENTRY_HOOK == ENTRY_FLAGS + 8);
+        assert!(ENTRY_OUTER == ENTRY_TLS + 8 && ENTRY_TLS == ENTRY_RESIDENT + 8);
+        assert!(ENTRY_RESIDENT == ENTRY_OWN + 8);
+    };
 
     /// The info word of a handle to an object of `kind` with `rights`:
     /// bits 0-31 the rights, bits 32-39 the kind.
@@ -1551,6 +1594,21 @@ mod tests {
         assert_eq!(
             (DATA, COPIED, HANDLES, INFO, RESERVED, SIZE),
             (0, 64, 1024, 1056, 1088, 4096)
+        );
+        assert_eq!(
+            (CONTEXT, CONTEXT_END, ENTRIES, ENTRIES_SIZE),
+            (1120, 1936, 1936, 64)
+        );
+        assert_eq!(
+            (
+                ENTRY_OWN,
+                ENTRY_RESIDENT,
+                ENTRY_TLS,
+                ENTRY_OUTER,
+                ENTRY_FLAGS,
+                ENTRY_HOOK
+            ),
+            (0, 8, 16, 24, 32, 40)
         );
         let word = info(ObjectKind::Channel, Rights::SEND | Rights::TRANSFER);
         assert_eq!(word, 3 << 32 | 0b110);

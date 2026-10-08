@@ -1,0 +1,11 @@
+[package]
+name = "entries"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "Decisions of the entry distributor of rt over plain numbers, tested on the host"
+
+[lib]
+bench = false
