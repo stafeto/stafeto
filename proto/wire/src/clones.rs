@@ -21,8 +21,10 @@ pub const ROOTS: usize = 32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Full;
 
-/// No place: the end of the free list.
-const NONE: u16 = u16::MAX;
+/// The largest table: places are 16 bits, and the free list holds a place
+/// plus one, so that zero ends it and an empty table is all zeros (in
+/// `.bss`).
+const MAX_PLACES: usize = u16::MAX as usize;
 
 /// The count a new clone adds to: a place of the table (the client is a
 /// clone) or an entry of the table of roots.
@@ -47,13 +49,17 @@ enum Account {
 /// A place takes 20 bytes: a table of 320 takes 6.4 KB.
 pub struct Clones<const N: usize, const BITS: u32 = 16> {
     /// For each place: the label of its clone (0 for a free place), its
-    /// client's label, the clones it made as a client, and the next place
-    /// of the free list.
+    /// client's label, the clones it made as a client, and the place after
+    /// it in the list of the places that went (plus one; 0 ends it).
     label: [u64; N],
     client: [u64; N],
     made: [u16; N],
     next: [u16; N],
+    /// The first place of that list (plus one; 0 for none), and how many
+    /// places were never used: they come after the list. A new table is
+    /// all zeros.
     free: u16,
+    fresh: u16,
     /// The labels `give` gave so far.
     given: u64,
     /// For each root: its label and the clones it has alive (0 for a free
@@ -78,20 +84,15 @@ impl<const N: usize, const BITS: u32> Clones<N, BITS> {
     const MASK: u64 = (1 << BITS) - 1;
 
     pub const fn new() -> Self {
-        assert!(N > 0 && N < NONE as usize, "places are 16 bits");
+        assert!(N > 0 && N < MAX_PLACES, "places are 16 bits");
         assert!(N as u64 <= Self::MASK + 1, "a place fits the label");
-        let mut next = [NONE; N];
-        let mut i = 0;
-        while i + 1 < N {
-            next[i] = (i + 1) as u16;
-            i += 1;
-        }
         Self {
             label: [0; N],
             client: [0; N],
             made: [0; N],
-            next,
+            next: [0; N],
             free: 0,
+            fresh: 0,
             given: 0,
             root: [0; ROOTS],
             root_made: [0; ROOTS],
@@ -176,13 +177,22 @@ impl<const N: usize, const BITS: u32> Clones<N, BITS> {
         }
         let account = self.account(client, most)?;
         let given = self.given + 1;
-        if given >= 1 << (62 - BITS) || self.free == NONE {
+        if given >= 1 << (62 - BITS) {
             return Err(Full);
         }
+        // A place that went comes first; else the next never used.
+        let place = if self.free != 0 {
+            let place = usize::from(self.free) - 1;
+            self.free = self.next[place];
+            place
+        } else if usize::from(self.fresh) < N {
+            self.fresh += 1;
+            usize::from(self.fresh) - 1
+        } else {
+            return Err(Full);
+        };
         self.given = given;
-        let place = usize::from(self.free);
         let label = tag | given << BITS | place as u64;
-        self.free = self.next[place];
         self.insert(place, label, client, account);
         Ok(label)
     }
@@ -256,7 +266,7 @@ impl<const N: usize, const BITS: u32> Clones<N, BITS> {
         }
         self.label[place] = 0;
         self.next[place] = self.free;
-        self.free = place as u16;
+        self.free = place as u16 + 1;
     }
 }
 
@@ -268,6 +278,41 @@ mod tests {
 
     /// A client has PER_CLIENT live clones: the next is refused until one
     /// goes; the service's N bound all clients.
+    /// An empty table is all zeros, so that a static one lies in `.bss`
+    /// with none of its bytes in the program's file.
+    #[test]
+    fn an_empty_table_is_all_zeros() {
+        // SAFETY: integers, and a Cell of one in tests.
+        let zeros: Clones<8> = unsafe { core::mem::zeroed() };
+        let new = Clones::<8>::new();
+        assert_eq!(new.label, zeros.label);
+        assert_eq!(new.client, zeros.client);
+        assert_eq!(new.made, zeros.made);
+        assert_eq!(new.next, zeros.next);
+        assert_eq!((new.free, new.fresh, new.given), (0, 0, 0));
+        assert_eq!(new.root, zeros.root);
+        assert_eq!(new.root_made, zeros.root_made);
+    }
+
+    /// Places come in order while none went, a place that went comes
+    /// first, and the table is full after N places.
+    #[test]
+    fn places_come_fresh_then_gone_ones_first() {
+        let mut c = Clones::<4>::new();
+        let root = TAG | 1 << 40;
+        let a: Vec<u64> = (0..4).map(|_| c.give(TAG, root).unwrap()).collect();
+        assert_eq!(
+            a.iter().map(|l| l & 0xffff).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert!(c.give(TAG, root).is_err());
+        c.gone(a[2]);
+        c.gone(a[1]);
+        assert_eq!(c.give(TAG, root).unwrap() & 0xffff, 1);
+        assert_eq!(c.give(TAG, root).unwrap() & 0xffff, 2);
+        assert!(c.give(TAG, root).is_err());
+    }
+
     #[test]
     fn clones_are_bounded_per_client_and_in_all() {
         let mut c = Clones::<64>::new();
