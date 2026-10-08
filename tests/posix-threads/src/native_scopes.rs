@@ -71,7 +71,7 @@ extern "C" fn worker(_: u64) -> ! {
         });
         report();
         // The coordinator validates the full trace before allowing its reset/reuse.
-        sys::receive(&borrowed(&GATE)).expect("native next scenario");
+        receive_completion(&borrowed(&GATE)).expect("native next scenario");
     }
     tls::with_process(|| {
         let trace = signals::probe_native_stop_arm().expect("native fork scope");
@@ -84,7 +84,7 @@ extern "C" fn worker(_: u64) -> ! {
         RETURNED.store(3, Ordering::SeqCst);
     });
     report();
-    sys::receive(&borrowed(&GATE)).expect("native libc exit release");
+    receive_completion(&borrowed(&GATE)).expect("native libc exit release");
     tls::with_process(|| {
         let trace = signals::probe_native_stop_arm().expect("native exit scope");
         OWNER.store(trace.owner, Ordering::SeqCst);
@@ -94,9 +94,18 @@ extern "C" fn worker(_: u64) -> ! {
     })
 }
 
+fn receive_completion(channel: &Handle<Channel>) -> Result<sys::Received, Error> {
+    loop {
+        match sys::receive(channel) {
+            Err(Error::Interrupted) => continue,
+            result => return result,
+        }
+    }
+}
+
 fn await_round(channel: &Handle<Channel>, round: usize) -> bool {
     while ROUND.load(Ordering::SeqCst) != round {
-        if sys::receive(channel).is_err() {
+        if receive_completion(channel).is_err() {
             return false;
         }
     }
@@ -104,7 +113,7 @@ fn await_round(channel: &Handle<Channel>, round: usize) -> bool {
 }
 fn await_return(channel: &Handle<Channel>, round: usize) -> bool {
     while RETURNED.load(Ordering::SeqCst) != round {
-        if sys::receive(channel).is_err() {
+        if receive_completion(channel).is_err() {
             return false;
         }
     }
@@ -234,11 +243,24 @@ pub(super) fn run() -> bool {
         Ok(pid) => pid,
         Err(_) => return failed(739),
     };
-    if !abi::process::wait(proto_process::Selector::Pid(pid as u32), 0)
-        .is_ok_and(|waited| waited.end == Some(proto_process::End::exited(0)))
-        || !await_return(&completion, 3)
-    {
+    let waited = abi::process::wait(
+        proto_process::Selector::Pid(pid as u32),
+        proto_process::WEXITED,
+    );
+    if !waited.is_ok_and(|waited| waited.end == Some(proto_process::End::exited(0))) {
+        let (errno, end_tag, status) = match waited {
+            Err(errno) => (errno, 0, 0),
+            Ok(waited) => match waited.end {
+                None => (0, 0, 0),
+                Some(end @ proto_process::End::Exited(_)) => (0, 1, end.wait_status()),
+                Some(end @ proto_process::End::Signaled(_)) => (0, 2, end.wait_status()),
+            },
+        };
+        rt::println!("native wait: errno={errno} end={end_tag} status={status}");
         return failed(740);
+    }
+    if !await_return(&completion, 3) {
+        return failed(7402);
     }
     let trace = signals::probe_native_stop_snapshot();
     if trace.parked == 0 || trace.parked != trace.channel {
@@ -247,7 +269,7 @@ pub(super) fn run() -> bool {
     if sys::notify(&gate, 1).is_err() {
         return failed(742);
     }
-    match sys::receive(&ended) {
+    match receive_completion(&ended) {
         Ok(sys::Received::Notification {
             source: Source::Exit,
             ..
