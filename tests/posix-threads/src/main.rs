@@ -67,6 +67,7 @@ mod one_thread;
 mod reentry;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_context;
+#[cfg(not(feature = "cancel-input"))]
 mod signal_preparation;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_wait;
