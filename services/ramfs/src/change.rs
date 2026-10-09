@@ -338,6 +338,10 @@ impl ChangeJob {
         if self.stage == Stage::Done {
             return Ok(());
         }
+        // Reclamation keeps the pace of the operations: a client that makes
+        // and removes nodes in a loop does not outrun the maintenance of the
+        // service, which gives one step to reclamation for each notification.
+        ram.storage.reclaim_step();
         let outcome = self.advance(ram, fds, identity, charge, second.as_deref_mut(), clock);
         let now = self.resolver_restarts(second.as_deref());
         if now > self.seen {

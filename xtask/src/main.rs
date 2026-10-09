@@ -4017,15 +4017,16 @@ fn ash_probe() -> Result<(), String> {
 }
 
 /// What the script of the ash probe (tests/busybox/src/main.rs) prints after
-/// `shell-ready`: a file moved, read back and removed, a listing of `/tmp`
-/// without the nodes made while the system runs (5i-5b), a directory made and
-/// removed, a link read back, the mode `chmod` set.
-const ASH_NAMES_OUTPUT: [&str; 9] = [
+/// `shell-ready`: a file moved, read back and removed, a directory made, a
+/// listing of `/tmp` with the directory just made and the node of the image,
+/// the directory removed, a link read back, the mode `chmod` set.
+const ASH_NAMES_OUTPUT: [&str; 10] = [
     "a-gone",
     "x",
     "b-gone",
-    "probe",
     "d-made",
+    "d",
+    "probe",
     "d-gone",
     "b",
     "mode -rw-------",

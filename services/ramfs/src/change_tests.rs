@@ -2866,3 +2866,19 @@ fn the_listing_by_index_agrees_with_the_listing_by_position() {
     assert_eq!(by_index, [".", "..", "x", "y", "z"]);
     env.assert_quiet();
 }
+
+#[test]
+fn a_loop_of_mkdir_and_rmdir_does_not_outrun_the_reclamation_of_the_nodes() {
+    // The share of a root is 192 nodes and a removed directory is reclaimed
+    // later. Without the maintenance of the service, which is absent here,
+    // the steps of the operations reclaim as fast as the operations make.
+    let mut env = Env::new();
+    let mut fds = session();
+    for round in 0..800 {
+        let made = env.go_result(&mut fds, mkdir(0, 1, b"/tmp/r", 0o755, 0), None);
+        assert_eq!(made, 0, "mkdir in round {round}");
+        let removed = env.go_result(&mut fds, rmdir_op(b"/tmp/r"), None);
+        assert_eq!(removed, 0, "rmdir in round {round}");
+    }
+    env.assert_quiet();
+}
