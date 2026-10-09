@@ -550,7 +550,7 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
 /// probe's children are files of it.
 const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
-    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["signal-probe"]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
@@ -3180,10 +3180,19 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     // It ends in an exec (stage 10) of the role that exits with 42: init
     // reports the new image's end. The authenticated component proofs add
     // bounded IPC rounds across this large spawn/fork/exec scenario.
-    let ended = run.expect_seen(
-        "init: posix-procs ended: exit code 42, not restarted",
-        Duration::from_secs(60),
-    );
+    let ended = run
+        .expect_line(
+            "the POSIX process probe to exit",
+            |line| line.starts_with("init: posix-procs ended:"),
+            Duration::from_secs(60),
+        )
+        .and_then(|line| {
+            if line == "init: posix-procs ended: exit code 42, not restarted" {
+                Ok(())
+            } else {
+                Err(format!("the POSIX process probe failed: {line}"))
+            }
+        });
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;

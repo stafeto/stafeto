@@ -15,12 +15,15 @@
  *   c. seventeen such exits in a row, and the next operation passes with no
  *      EAGAIN.
  * The driver's answer to a request the kernel takes back (Interrupted) is
- * tested with the hook of the driver (names_loss.rs and names_fork.rs); the count of such
- * requests in this probe is printed. Included by procs.c, in the role names. */
+ * tested here with a bounded receive pause, which requires a queued request
+ * to be taken back. The driver hooks also cover lost replies. Included by procs.c, in the role names. */
 #include <setjmp.h>
 
 extern int files_names_places_in_use(void);
 extern unsigned files_names_interrupted(void);
+extern int files_names_pause(void);
+static int sg_queued;
+static int sg_entered;
 
 #define SG_BASE "/tmp/sgd"
 #define SG_DEPTH 40
@@ -59,10 +62,17 @@ static void sg_handler(int signal) {
 struct sg_sender {
     pthread_t target;
     long delay_us;
+    int abort;
 };
 
 static void *sg_send(void *argument) {
     struct sg_sender *sender = argument;
+    if (sg_queued) {
+        while (!__atomic_load_n(&sg_entered, __ATOMIC_ACQUIRE)) {
+            if (__atomic_load_n(&sender->abort, __ATOMIC_ACQUIRE)) return NULL;
+            sched_yield();
+        }
+    }
     struct timespec delay = {sender->delay_us / 1000000, (sender->delay_us % 1000000) * 1000};
     nanosleep(&delay, NULL);
     pthread_kill(sender->target, SIGALRM);
@@ -92,7 +102,8 @@ static long sg_now_us(void) {
  * of the rename, or 0 with *left set when the handler left the operation.
  * The sender is joined before the return. */
 static int sg_try(long delay_us, int *left, int from_new) {
-    struct sg_sender sender = {pthread_self(), delay_us};
+    struct sg_sender sender = {pthread_self(), delay_us, 0};
+    __atomic_store_n(&sg_entered, 0, __ATOMIC_RELEASE);
     pthread_t thread;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -100,8 +111,15 @@ static int sg_try(long delay_us, int *left, int from_new) {
     int result = -2;
     *left = 0;
     if (pthread_create(&thread, &attr, sg_send, &sender) != 0) return -3;
+    if (sg_queued && files_names_pause() != 0) {
+        __atomic_store_n(&sender.abort, 1, __ATOMIC_RELEASE);
+        pthread_join(thread, NULL);
+        pthread_attr_destroy(&attr);
+        return -4;
+    }
     if (sigsetjmp(sg_jump, 1) == 0) {
         sg_in_rename = 1;
+        __atomic_store_n(&sg_entered, 1, __ATOMIC_RELEASE);
         result = from_new ? rename(SG_NEW, SG_LAST) : rename(SG_LAST, SG_NEW);
         sg_in_rename = 0;
     } else {
@@ -162,6 +180,27 @@ static int names_signals(void) {
     if (whole < 200) whole = 200;
     printf("posix-procs: names signal: a rename takes %ld us\n", whole);
 
+    /* A queued Start is cancelled by a genuine signal, without a driver hook. */
+    unsigned before = files_names_interrupted();
+    sg_queued = 1;
+    sg_leaves = 0;
+    for (int attempt = 0; attempt < 8 && files_names_interrupted() == before; attempt++) {
+        int left = 0;
+        int from_new = sg_exists(SG_NEW);
+        int result = sg_try(2000, &left, from_new);
+        if (result != 0 || left) {
+            printf("posix-procs: names queued signal failed: rename %d errno %d, %u requests taken back by the kernel\n",
+                   result, errno, files_names_interrupted() - before);
+        }
+        SG_CHECK(result == 0 && !left);
+        SG_CHECK(!sg_handler_bad && sg_one_name());
+        SG_CHECK(files_names_places_in_use() == 0);
+    }
+    sg_queued = 0;
+    SG_CHECK(files_names_interrupted() > before);
+    printf("posix-procs: names queued signal: %u requests taken back by the kernel, rename returned 0\n",
+           files_names_interrupted() - before);
+
     /* a. Operations in the handler. */
     sg_leaves = 0;
     for (int attempt = 0; attempt < 150 && sg_hits < 3; attempt++) {
@@ -175,9 +214,7 @@ static int names_signals(void) {
     }
     SG_CHECK(sg_hits >= 3);
     SG_CHECK(files_names_places_in_use() == 0);
-    /* The kernel takes a request back from the queue of a service only when
-     * the request waits there, which one processor and a service of a higher
-     * level seldom allow: the count is printed, and 0 is an answer. */
+    /* The controlled receive pause above requires genuine queued cancellation. */
     printf("posix-procs: names signal: %d handlers ran inside a rename that ended with 0, "
            "%u requests taken back by the kernel\n",
            (int)sg_hits, files_names_interrupted());

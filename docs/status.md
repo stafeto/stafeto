@@ -133,6 +133,8 @@ Bounded paths with interrupts masked are listed in
 The [E3 cleanup followups](../notes/e3-followups.md) remove the directory
 restart cap, reserve independent Control custody, separate its FS version 14
 keys, and bound maintenance self-notifications without cleanup progress.
+The [queued signal probe](../notes/e3-queued-signals.md) requires a genuine
+kernel Interrupted while rename retains its operation through the handler.
 
 Since step 5a′ the C library is relibc (`tools/build-relibc.py`, the fork
 pinned there): its headers and `libc.a` under `target/relibc/sysroot`, its
