@@ -146,6 +146,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             return Err(Error::BadFileDescriptor);
         }
         self.holds[token.slot].held = Held::Empty;
+        self.job_gone();
         let release = self.left(record.backend);
         let result = match release {
             None => IoEnd::Released,
@@ -205,6 +206,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         self.disposal_snapshot(token)?;
         self.holds[token.slot].held = Held::Empty;
         self.holds[token.slot].change();
+        self.job_gone();
         Ok(())
     }
 }

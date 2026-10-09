@@ -530,7 +530,8 @@ fn the_virtual_names_are_refused_by_the_table_of_the_layer() {
     use Refusal::*;
     let cases = [
         (Unlink, true, false, Some(Busy)),
-        (Rmdir, true, false, Some(Busy)),
+        (Rmdir, true, false, Some(NotDirectory)),
+        (ReadLink, true, false, Some(NotLink)),
         (Mkdir, true, false, Some(Exists)),
         (Symlink, true, false, Some(Exists)),
         (Link, true, false, Some(CrossDevice)),

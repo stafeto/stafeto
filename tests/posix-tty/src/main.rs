@@ -158,6 +158,9 @@ mod virtual_names {
         ) -> c_int;
         fn stafeto_openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: u32) -> c_int;
         fn stafeto_close(fd: c_int) -> c_int;
+        fn stafeto_readlinkat(dirfd: c_int, path: *const c_char, buf: *mut u8, len: usize)
+        -> isize;
+        fn stafeto_realpath(path: *const c_char, buf: *mut u8, len: usize) -> isize;
     }
 
     const AT_FDCWD: c_int = -100;
@@ -168,6 +171,7 @@ mod virtual_names {
     const EROFS: c_int = 30;
     const EACCES: c_int = 13;
     const ENOTDIR: c_int = 20;
+    const EINVAL: c_int = 22;
     const O_RDWR: c_int = 2;
     const O_NOCTTY: c_int = 0o400;
     const O_DIRECTORY: c_int = 0o40000;
@@ -248,13 +252,31 @@ mod virtual_names {
             // They cannot go.
             expect(stafeto_unlinkat(AT_FDCWD, console.pointer(), 0), EBUSY, 9)?;
             expect(stafeto_unlinkat(AT_FDCWD, tty.pointer(), 0), EBUSY, 10)?;
+            // A name of the terminal is no directory: rmdir says so, as it does
+            // for a file of the RAM service.
             expect(
                 stafeto_unlinkat(AT_FDCWD, ptmx.pointer(), AT_REMOVEDIR),
-                EBUSY,
+                ENOTDIR,
                 11,
             )?;
             let slash = name(b"/dev/console/");
             expect(stafeto_unlinkat(AT_FDCWD, slash.pointer(), 0), ENOTDIR, 12)?;
+            // They are no links, and a slash after them is no directory.
+            let mut link = [0u8; 16];
+            expect(
+                stafeto_readlinkat(AT_FDCWD, console.pointer(), link.as_mut_ptr(), link.len())
+                    as c_int,
+                EINVAL,
+                36,
+            )?;
+            let slash_tty = name(b"/dev/tty/");
+            let mut canonical = [0u8; 64];
+            expect(
+                stafeto_realpath(slash_tty.pointer(), canonical.as_mut_ptr(), canonical.len())
+                    as c_int,
+                ENOTDIR,
+                37,
+            )?;
             // Their metadata is the terminal service's.
             expect(
                 stafeto_fchmodat(AT_FDCWD, console.pointer(), 0o600, 0),

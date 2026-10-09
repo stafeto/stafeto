@@ -475,14 +475,22 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     /// Whether `owner` may take a place for a new job now. The check and the
     /// `begin_*` that follows it run under the same lock of the caller.
+    /// A place needs a free slot of the holds as well as a count of jobs
+    /// under the bound: the slots are shared with the holds of reads and
+    /// writes that wait in other threads, and a slot that goes moves the
+    /// word like a job that goes.
     pub fn job_place(&self, owner: OwnerToken) -> JobPlace {
         let used = self.jobs_in_use();
-        if used < JOBS_MAX {
+        let slot = self
+            .holds
+            .iter()
+            .any(|slot| matches!(slot.held, Held::Empty));
+        if used < JOBS_MAX && slot {
             return JobPlace::Free;
         }
         JobPlace::Full {
             sequence: self.jobs.load(Ordering::Acquire),
-            own: self.jobs_owned_by(owner) >= used,
+            own: used >= JOBS_MAX && self.jobs_owned_by(owner) >= used,
         }
     }
 
@@ -630,6 +638,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         }
         let closed = hold.closed && !hold.released;
         slot.held = Held::Empty;
+        self.job_gone();
         (closed
             && !self.referenced(backend)
             && !self.scalar_pinned(backend)
@@ -648,6 +657,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 unreachable!()
             };
             slot.held = Held::Empty;
+            self.job_gone();
             if hold.closed
                 && !hold.released
                 && !self.referenced(hold.backend)

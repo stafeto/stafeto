@@ -301,31 +301,47 @@ pub(crate) fn take_place<R>(
     enum Step<R> {
         Taken(R),
         Wait(usize, u32),
+        /// Wait on the word as it stands now.
+        WaitNow(usize),
     }
     loop {
         collect(Some(owner), here, None, true);
         let step = crate::shared::with_files(|files| match files.job_place(owner) {
-            JobPlace::Free => begin(files).map(Step::Taken).map_err(crate::error),
+            // A place the table has but the begin cannot take (no slot of the
+            // holds) is a full table: the word moves when a slot goes.
+            JobPlace::Free => match begin(files) {
+                Ok(taken) => Ok(Step::Taken(taken)),
+                Err(FsError::TooManyOpenFiles) => Ok(Step::WaitNow(files.jobs_wait_address())),
+                Err(error) => Err(crate::error(error)),
+            },
             JobPlace::Full { own: true, .. } => Err(EAGAIN),
             JobPlace::Full { sequence, .. } => Ok(Step::Wait(files.jobs_wait_address(), sequence)),
         })?;
         match step {
             Step::Taken(taken) => return Ok(taken),
-            Step::Wait(address, sequence) => {
+            Step::Wait(address, sequence) => wait_on(address, sequence),
+            Step::WaitNow(address) => {
                 // SAFETY: the table lives in the pinned state of the layer.
                 let word = unsafe { &*(address as *const AtomicU32) };
-                // The word moves when a place goes; a millisecond bounds the
-                // wait for a wake that raced with this check.
-                let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(1_000_000);
-                let _ = posix_sync::futex_wait(
-                    word,
-                    sequence,
-                    crate::clock::CLOCK_MONOTONIC as u32,
-                    Some(deadline),
-                );
+                wait_on(address, word.load(core::sync::atomic::Ordering::Acquire));
             }
         }
     }
+}
+
+/// Sleeps on the word of the places while it stays at `sequence`.
+fn wait_on(address: usize, sequence: u32) {
+    // SAFETY: the table lives in the pinned state of the layer.
+    let word = unsafe { &*(address as *const AtomicU32) };
+    // The word moves when a place goes; a millisecond bounds the wait for a
+    // wake that raced with this check.
+    let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(1_000_000);
+    let _ = posix_sync::futex_wait(
+        word,
+        sequence,
+        crate::clock::CLOCK_MONOTONIC as u32,
+        Some(deadline),
+    );
 }
 
 /// Releases the jobs of the records that no operation owns any more: those of

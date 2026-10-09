@@ -260,6 +260,7 @@ pub enum Named {
     Symlink,
     Link,
     Rename,
+    ReadLink,
     Access,
     Chmod,
     Chown,
@@ -273,6 +274,10 @@ pub enum Refusal {
     Exists,
     /// EBUSY: the name cannot go.
     Busy,
+    /// ENOTDIR: the name is no directory (rmdir).
+    NotDirectory,
+    /// EINVAL: the name is no link (readlink).
+    NotLink,
     /// EXDEV: the name lies on another device than the RAM service.
     CrossDevice,
     /// EROFS: the service of the terminal keeps its metadata.
@@ -289,7 +294,9 @@ pub enum Refusal {
 /// the new name is looked at.
 pub fn virtual_refusal(op: Named, first: bool, second: bool) -> Option<Refusal> {
     match op {
-        Named::Unlink | Named::Rmdir if first => Some(Refusal::Busy),
+        Named::Unlink if first => Some(Refusal::Busy),
+        Named::Rmdir if first => Some(Refusal::NotDirectory),
+        Named::ReadLink if first => Some(Refusal::NotLink),
         Named::Mkdir | Named::Symlink if first => Some(Refusal::Exists),
         Named::Link | Named::Rename if first => Some(Refusal::CrossDevice),
         Named::Link if second => Some(Refusal::Exists),
