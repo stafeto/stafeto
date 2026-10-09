@@ -1125,11 +1125,13 @@ commands:
             with --short, one round of them on TCG; with --short --icount, as
             ci runs it, under -icount, where the instructions of S5 stay under
             S5_ICOUNT_MAX; with --marks added, the segments of that path
-  rtbench-check SESSION... compare the base and head runs of at least four alternating
-            sessions (each a directory with `order`, `base/`, `head/`, the files
-            rtbench-hvf.txt and rtbench-vz.txt) against the limits of epoch 2
-            (S5 p50, median S5 p99 difference, median S10 p50 ratio) and fail
-            naming the rows that are over
+  rtbench-check [--same-guest OLD=NEW] SESSION... compare the base and head runs of
+            at least four alternating sessions (each a directory with `order`,
+            `base/`, `head/`, the files rtbench-hvf.txt and rtbench-vz.txt)
+            against the limits of epoch 2 (S5 p50, median S5 p99 difference,
+            median S10 p50 ratio) and fail naming the rows that are over; `order`
+            has to agree with the `uptime before` lines of the runs, and
+            --same-guest declares that commit OLD in a file is the guest of NEW
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-cancel-input verify cancelled UART reads and cleanup handlers
