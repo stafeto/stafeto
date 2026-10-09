@@ -21,7 +21,7 @@ birth has 128 additional watermark bytes. Custody slots retain their existing
 payload union and initialization rules.
 
 Maintenance has 1,792 consecutive own dispatches without confirmed progress:
-four orphan-table scans and two session/birth scans fit in that bound. Returning
+four turns per orphan slot and two per session/birth slot fit in that bound. Returning
 a page or retiring an orphan proves progress. A cancellation attempt alone
 does not. A full paid page pool can drain across multiple bursts through real
 page releases. After exhaustion the service stops posting own notifications;
