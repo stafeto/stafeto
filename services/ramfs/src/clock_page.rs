@@ -66,3 +66,9 @@ impl TimeSource {
         }
     }
 }
+
+impl ramfs::change::Clock for TimeSource {
+    fn read_once(&self) -> Result<Option<Timestamp>, Status> {
+        TimeSource::read_once(self)
+    }
+}

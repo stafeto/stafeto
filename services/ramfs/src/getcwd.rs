@@ -74,6 +74,13 @@ pub struct GetcwdJournal {
     read_page: u16,
     read_start: u32,
     outcome: Option<GetcwdOutcome>,
+    /// The result of a path operation fits the inline buffer or fails with
+    /// ENAMETOOLONG; it never grows pages.
+    inline_only: bool,
+    /// What the walk needs of each parent: read and search for getcwd, search alone otherwise.
+    parent_bits: u32,
+    /// The length of the final name a path operation puts after the directory's path.
+    initial: u32,
 }
 impl Ram<'_> {
     /// This capture is the paid server-admission linearization point for CWD.
@@ -119,7 +126,74 @@ impl Ram<'_> {
             read_page: NONE,
             read_start: 0,
             outcome: None,
+            inline_only: false,
+            parent_bits: 5,
+            initial: 1,
         })
+    }
+    /// The canonical path of the directory `base`, followed by `/tail` when a
+    /// name is given. The result is at most 511 bytes. `search` demands the
+    /// search permission of the directory itself.
+    pub fn prepare_path(
+        &mut self,
+        root: Root,
+        charge: u16,
+        identity: Identity,
+        base: Token,
+        tail: Option<&[u8]>,
+        search: bool,
+    ) -> Result<GetcwdJournal, u32> {
+        self.storage.namespace_charge(root, charge)?;
+        let node = self.storage.node(base)?;
+        if node.kind != crate::DIR {
+            return Err(NOT_DIRECTORY);
+        }
+        if search && !identity.permits(node, 1) {
+            return Err(ACCESS_DENIED);
+        }
+        let tail = tail.unwrap_or(b"");
+        if tail.len() > 255 {
+            return Err(proto_fs::NAME_TOO_LONG);
+        }
+        self.storage.pin(base, Pin::Pending)?;
+        let mut journal = GetcwdJournal {
+            root,
+            charge,
+            identity,
+            epoch: self.storage.state.epoch,
+            base,
+            current: base,
+            parent: ROOT,
+            base_pinned: true,
+            current_pinned: false,
+            scan: 0,
+            depth: 0,
+            phase: Phase::Scan,
+            building: false,
+            name: [0; 256],
+            name_len: 0,
+            remaining: 0,
+            inline: [0; INLINE],
+            length: 1,
+            expected: 0,
+            caller_size: u64::MAX,
+            pages: ResultPages::empty(charge),
+            read_offset: None,
+            read_page: NONE,
+            read_start: 0,
+            outcome: None,
+            inline_only: true,
+            parent_bits: 1,
+            initial: 1,
+        };
+        if !tail.is_empty() {
+            let length = tail.len() + 2;
+            journal.inline[INLINE - length] = b'/';
+            journal.inline[INLINE - length + 1..INLINE - 1].copy_from_slice(tail);
+            journal.length = length as u32;
+            journal.initial = length as u32;
+        }
+        Ok(journal)
     }
 }
 impl GetcwdJournal {
@@ -157,11 +231,13 @@ impl GetcwdJournal {
                 self.parent = ROOT;
                 self.scan = 0;
                 self.depth = 0;
-                self.length = 1;
+                self.length = self.initial;
                 self.expected = 0;
                 self.building = false;
                 self.phase = Phase::Scan;
-                self.inline.fill(0);
+                if self.initial == 1 {
+                    self.inline.fill(0);
+                }
                 self.read_offset = None;
                 Ok(false)
             }
@@ -213,7 +289,7 @@ impl GetcwdJournal {
                 }
                 let parent = node.parent;
                 let parent_node = storage.node(parent)?;
-                if !identity.permits(parent_node, 5) {
+                if !identity.permits(parent_node, self.parent_bits) {
                     return Ok(self.fail(ACCESS_DENIED));
                 }
                 let end = (self.scan as usize + 8).min(storage.entries());
@@ -232,6 +308,9 @@ impl GetcwdJournal {
                             self.phase = Phase::Copy;
                         } else {
                             self.length += u32::from(self.name_len);
+                            if self.inline_only && self.length as usize > INLINE {
+                                return Ok(self.fail(proto_fs::NAME_TOO_LONG));
+                            }
                             if self.length as usize <= INLINE {
                                 let first = INLINE - self.length as usize;
                                 self.inline[first..first + self.name_len as usize]
@@ -266,6 +345,9 @@ impl GetcwdJournal {
             self.length = 2;
             self.inline[INLINE - 2] = b'/';
         }
+        if self.inline_only && self.length as usize > INLINE {
+            return Ok(self.fail(proto_fs::NAME_TOO_LONG));
+        }
         if self.length as usize > MAX_LENGTH {
             return Ok(self.fail(NO_ENTRY));
         }
@@ -295,6 +377,13 @@ impl GetcwdJournal {
         self.building = true;
         self.phase = Phase::BeginPage;
         Ok(false)
+    }
+    /// The bytes of a ready result that fits the inline buffer, without the terminator.
+    pub fn inline_bytes(&self) -> Option<&[u8]> {
+        let Some(GetcwdOutcome::Ready { length }) = self.outcome else {
+            return None;
+        };
+        (self.pages.head == NONE).then(|| &self.inline[INLINE - length as usize..INLINE - 1])
     }
     /// Locate at most eight page links, then copy at most MAX_READ immutable bytes.
     /// A chunk result leaves this record paid until the original full-result ACK.

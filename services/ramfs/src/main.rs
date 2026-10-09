@@ -20,6 +20,7 @@ use ramfs::authority::{
     Admission, AuditStep, Binding, BindingPurpose, CleanupAudit, Identity, NotaryReply,
     RetainedSourcePhase, retained_source_phase,
 };
+use ramfs::job::{JobOperation, PathJob, ResolveJob, Seconds};
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
 use ramfs::storage::{NONE, Root, Token};
@@ -40,8 +41,8 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0xfff7, 0xfff8, 0xfff9, 0xfffa,
-    0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 0xfff7,
+    0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -169,6 +170,7 @@ fn main(_: u64) -> u64 {
         identities: &mut tables.identities,
         jobs: &mut tables.jobs,
         job_generations: &mut tables.job_generations,
+        seconds: &mut tables.seconds,
         generations: None,
         maintenance: ramfs::maintenance::Cursor::default(),
         next_audit_ns: 0,
@@ -216,6 +218,7 @@ struct Fs {
     identities: &'static mut Identities,
     jobs: &'static mut [Option<ResolveJob>; ramfs::storage::PREPARATIONS],
     job_generations: &'static mut [u64; ramfs::storage::PREPARATIONS],
+    seconds: &'static mut Seconds,
     generations: Option<Handle<Memory>>,
     maintenance: ramfs::maintenance::Cursor,
     next_audit_ns: u64,
@@ -305,41 +308,6 @@ struct IdentityChannel {
     audit: CleanupAudit,
     image: Option<ImageContext>,
 }
-struct ResolveJob {
-    id: u64,
-    owner: u64,
-    root: u16,
-    real: bool,
-    authority: Option<ramfs::authority::Stamp>,
-    operation: JobOperation,
-    open_key: Option<proto_fs::OpenKey>,
-    raw_base: (u32, u64),
-    abandoned: bool,
-}
-struct PathJob {
-    resolver: Resolve,
-    second: Option<Resolve>,
-    open: Option<OpenJournal>,
-}
-#[allow(clippy::large_enum_variant)]
-enum JobOperation {
-    Path(PathJob),
-    Data(ramfs::data::Journal),
-}
-impl ResolveJob {
-    fn path(&self) -> &PathJob {
-        match &self.operation {
-            JobOperation::Path(path) => path,
-            JobOperation::Data(_) => panic!("validated path job"),
-        }
-    }
-    fn path_mut(&mut self) -> &mut PathJob {
-        match &mut self.operation {
-            JobOperation::Path(path) => path,
-            JobOperation::Data(_) => panic!("validated path job"),
-        }
-    }
-}
 struct Tables {
     places: ramfs::places::Places,
     clones: Clones<CLONES, { ramfs::places::SLOT_BITS }>,
@@ -348,6 +316,7 @@ struct Tables {
     identities: Identities,
     jobs: [Option<ResolveJob>; ramfs::storage::PREPARATIONS],
     job_generations: [u64; ramfs::storage::PREPARATIONS],
+    seconds: Seconds,
 }
 struct Bss(UnsafeCell<Tables>);
 // SAFETY: only the main thread reaches it, once (`main`).
@@ -360,6 +329,7 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     identities: Identities::new(),
     jobs: [const { None }; ramfs::storage::PREPARATIONS],
     job_generations: [0; ramfs::storage::PREPARATIONS],
+    seconds: [const { None }; ramfs::change::SECONDS],
 }));
 
 impl Fs {
@@ -1383,6 +1353,7 @@ impl Service<0> for Fs {
                         | Method::OpenCancel
                         | Method::DataCancel
                         | Method::DataAck
+                        | Method::ChangeRelease
                         | Method::VerifySession
                 )
             )
@@ -1409,6 +1380,18 @@ impl Service<0> for Fs {
             )
         ) {
             return self.data_request(&mut s.data, r);
+        }
+        if matches!(
+            Method::from_number(r.method()),
+            Some(
+                Method::ChangeStart
+                    | Method::ChangeSecond
+                    | Method::ChangeStep
+                    | Method::ChangeQuery
+                    | Method::ChangeRelease
+            )
+        ) {
+            return self.change_request(&mut s.data, r);
         }
         if matches!(
             Method::from_number(r.method()),
@@ -1843,7 +1826,12 @@ impl Service<0> for Fs {
                 | Method::DataQuery
                 | Method::DataCancel
                 | Method::DataAck
-                | Method::DataReadResult,
+                | Method::DataReadResult
+                | Method::ChangeStart
+                | Method::ChangeSecond
+                | Method::ChangeStep
+                | Method::ChangeQuery
+                | Method::ChangeRelease,
             )
             | None => Answer::Status(Status::UnknownMethod),
         }
@@ -2934,6 +2922,70 @@ impl Fs {
             _ => unreachable!(),
         }
     }
+    /// The five methods of the Change family (44 to 48).
+    fn change_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        if proto_fs::is_loaders(r.label()) {
+            return status(proto_fs::PERMISSION);
+        }
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let method = Method::from_number(r.method()).expect("change method");
+        let owner = r.label();
+        // Release is cleanup: it needs no live authority.
+        if method != Method::ChangeRelease
+            && let Err(code) = self.authenticate(fds, owner)
+        {
+            return status(code);
+        }
+        let mut out = proto_wire::Writer::new();
+        let mut ctx = ramfs::change::Ctx {
+            ram: &mut self.ram,
+            jobs: &mut *self.jobs,
+            generations: &mut *self.job_generations,
+            seconds: &mut *self.seconds,
+        };
+        let result = match method {
+            Method::ChangeStart => match proto_fs::ChangeStart::read(r.body()) {
+                Ok(req) => ramfs::change::start(&mut ctx, fds, owner, &req, &mut out),
+                Err(error) => Err(error.code()),
+            },
+            Method::ChangeSecond => match proto_fs::ChangeSecond::read(r.body()) {
+                Ok(req) => ramfs::change::second(&mut ctx, fds, owner, &req),
+                Err(error) => Err(error.code()),
+            },
+            Method::ChangeStep | Method::ChangeQuery => match proto_fs::read_key_body(r.body()) {
+                Ok(key) => ramfs::change::step(
+                    &mut ctx,
+                    fds,
+                    owner,
+                    key,
+                    if method == Method::ChangeStep {
+                        ramfs::change::Advance::Step
+                    } else {
+                        ramfs::change::Advance::Query
+                    },
+                    &self.time_source,
+                    &mut out,
+                ),
+                Err(error) => Err(error.code()),
+            },
+            _ => match proto_fs::read_key_body(r.body()) {
+                Ok(key) => ramfs::change::release(&mut ctx, fds, owner, key),
+                Err(error) => Err(error.code()),
+            },
+        };
+        match result {
+            Ok(()) => {
+                if method == Method::ChangeSecond || method == Method::ChangeRelease {
+                    return Answer::Status(Status::Ok);
+                }
+                *r.reply() = out;
+                Answer::Reply(Outgoing::new())
+            }
+            Err(code) => status(code),
+        }
+    }
     fn job_slot(&self, id: u64, owner: u64) -> Result<usize, u32> {
         let i = (id & 255) as usize;
         if !self
@@ -2960,9 +3012,14 @@ impl Fs {
             return;
         };
         let job = self.jobs[slot].as_mut().expect("exact disappearing job");
-        if let JobOperation::Data(data) = &mut job.operation {
+        if matches!(
+            job.operation,
+            JobOperation::Data(_) | JobOperation::Change(_)
+        ) {
             if !job.abandoned {
-                data.abandon();
+                if let JobOperation::Data(data) = &mut job.operation {
+                    data.abandon();
+                }
                 job.abandoned = true;
                 self.orphan_count = self.orphan_count.checked_add(1).expect("bounded paid jobs");
                 assert!(self.orphan_count as usize <= ramfs::storage::PREPARATIONS);
@@ -3000,6 +3057,24 @@ impl Fs {
             }
         }
         if let Ok(i) = self.job_slot(id, owner) {
+            if matches!(
+                self.jobs[i].as_ref().map(|job| &job.operation),
+                Some(JobOperation::Change(_))
+            ) {
+                let mut ctx = ramfs::change::Ctx {
+                    ram: &mut self.ram,
+                    jobs: &mut *self.jobs,
+                    generations: &mut *self.job_generations,
+                    seconds: &mut *self.seconds,
+                };
+                if ramfs::change::cancel_slot(&mut ctx, fds.as_deref_mut(), i) {
+                    self.orphan_count = self
+                        .orphan_count
+                        .checked_sub(1)
+                        .expect("owned abandoned count");
+                }
+                return true;
+            }
             if let Some(ResolveJob {
                 operation: JobOperation::Data(data),
                 ..
@@ -3211,7 +3286,7 @@ impl Fs {
                         .as_ref()
                         .expect("exact canceled job")
                         .operation,
-                    JobOperation::Data(_)
+                    JobOperation::Data(_) | JobOperation::Change(_)
                 )
             {
                 return status(proto_fs::PERMISSION);

@@ -9,6 +9,9 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod authority;
+pub mod change;
+#[cfg(test)]
+mod change_tests;
 pub mod cwd;
 #[cfg(test)]
 mod cwd_tests;
@@ -22,6 +25,7 @@ mod image_tests;
 pub mod io;
 #[cfg(test)]
 mod io_tests;
+pub mod job;
 pub mod maintenance;
 pub mod metadata;
 #[cfg(test)]
@@ -1025,6 +1029,19 @@ impl<'a> Ram<'a> {
                 .expect("named description")
                 .generation,
         })
+    }
+
+    /// The node the description of `fd` stands for, if the description is
+    /// the one the caller names (BAD_FD otherwise).
+    pub fn description_node(&self, fds: &Fds, fd: u32, generation: u64) -> Result<Token, u32> {
+        let description = self.description_token(fds, fd)?;
+        if description.generation != generation {
+            return Err(BAD_FD);
+        }
+        let shared = self.descriptions[description.slot as usize]
+            .as_ref()
+            .ok_or(BAD_FD)?;
+        Ok(self.token(shared.open.file))
     }
 
     /// A raw token can serve as a relative base only when this session retains it.

@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Raw requests of the Change family against the RAM service on a genuinely
+//! bound session. Every operation prints a line with an observable result.
+use proto_fs::{
+    Base, ChangeOp, ChangePhase, ChangeReply, ChangeSecond, ChangeStart, Method, OpenKey,
+};
+use proto_wire::{Reader, Status, Writer};
+use rt::abi::MESSAGE_MAX;
+use rt::fs::{Files, PreparedOpen};
+
+/// What a finished job answered: its result code and the bytes of its result.
+pub struct Done {
+    pub result: u32,
+    pub restarts: u32,
+    pub length: usize,
+    pub bytes: [u8; 512],
+}
+
+pub fn key(slot: u32, generation: u64) -> OpenKey {
+    OpenKey { slot, generation }
+}
+
+fn send(files: &Files, w: &Writer) -> Result<([u8; MESSAGE_MAX], usize), Status> {
+    let reply = Files::send_on(files.sessions().0, w.as_bytes())?;
+    if !reply.handles.is_empty() {
+        return Err(Status::BadSize);
+    }
+    let mut buffer = [0; MESSAGE_MAX];
+    let length = reply.bytes(&mut buffer).len();
+    Ok((buffer, length))
+}
+
+pub fn start(files: &Files, req: &ChangeStart<'_>) -> Result<ChangePhase, Status> {
+    let mut w = Writer::new();
+    Method::ChangeStart.header().write(&mut w)?;
+    req.write(&mut w)?;
+    let (bytes, length) = send(files, &w)?;
+    proto_fs::change_start_reply(&bytes[..length], 0)
+}
+
+pub fn second(files: &Files, key: OpenKey, base: Base, bytes: &[u8]) -> Result<(), Status> {
+    let mut w = Writer::new();
+    Method::ChangeSecond.header().write(&mut w)?;
+    ChangeSecond { key, base, bytes }.write(&mut w)?;
+    let (reply, length) = send(files, &w)?;
+    status_only(&reply[..length])
+}
+
+fn status_only(reply: &[u8]) -> Result<(), Status> {
+    let mut input = Reader::new(reply);
+    match Status::from_code(input.u32()?) {
+        Status::Ok => {
+            if input.u32()? != 0 {
+                return Err(Status::BadSize);
+            }
+            input.finish()
+        }
+        status => Err(status),
+    }
+}
+
+/// One Step or Query. `Ok(None)` is a job that still runs.
+pub fn step(files: &Files, key: OpenKey, query: bool) -> Result<Option<Done>, Status> {
+    let mut w = Writer::new();
+    (if query {
+        Method::ChangeQuery
+    } else {
+        Method::ChangeStep
+    })
+    .header()
+    .write(&mut w)?;
+    proto_fs::write_key_body(&mut w, key)?;
+    let (bytes, length) = send(files, &w)?;
+    let reply = ChangeReply::read(&bytes[..length], 0)?;
+    if !reply.done {
+        return Ok(None);
+    }
+    let mut done = Done {
+        result: reply.result,
+        restarts: reply.restarts,
+        length: reply.bytes.len(),
+        bytes: [0; 512],
+    };
+    done.bytes[..reply.bytes.len()].copy_from_slice(reply.bytes);
+    Ok(Some(done))
+}
+
+pub fn release(files: &Files, key: OpenKey) -> Result<(), Status> {
+    let mut w = Writer::new();
+    Method::ChangeRelease.header().write(&mut w)?;
+    proto_fs::write_key_body(&mut w, key)?;
+    let (reply, length) = send(files, &w)?;
+    status_only(&reply[..length])
+}
+
+/// Start, Second, Step until done, Release.
+pub fn run(
+    files: &Files,
+    req: &ChangeStart<'_>,
+    second_path: Option<(Base, &[u8])>,
+) -> Result<Done, Status> {
+    start(files, req)?;
+    if let Some((base, bytes)) = second_path {
+        second(files, req.key, base, bytes)?;
+    }
+    let mut done = None;
+    for _ in 0..100_000 {
+        if let Some(finished) = step(files, req.key, false)? {
+            done = Some(finished);
+            break;
+        }
+    }
+    let done = done.ok_or(Status::BadSize)?;
+    // The outcome stays until Release, for a Query as for a repeated Step.
+    let again = step(files, req.key, true)?.ok_or(Status::BadSize)?;
+    if again.result != done.result || again.length != done.length || again.restarts != done.restarts
+    {
+        return Err(Status::BadSize);
+    }
+    release(files, req.key)?;
+    Ok(done)
+}
+
+fn req(slot: u32, generation: u64, op: ChangeOp, path: &[u8]) -> ChangeStart<'_> {
+    ChangeStart {
+        key: key(slot, generation),
+        op,
+        flags: 0,
+        base: Base::Absolute,
+        args: [0; 4],
+        path,
+    }
+}
+
+fn mkdir(slot: u32, generation: u64, path: &[u8], mode: u64) -> ChangeStart<'_> {
+    let mut start = req(slot, generation, ChangeOp::Mkdir, path);
+    start.args = [mode, 0o022, 0, 0];
+    start
+}
+
+fn rmdir(slot: u32, generation: u64, path: &[u8]) -> ChangeStart<'_> {
+    let mut start = req(slot, generation, ChangeOp::Unlink, path);
+    start.flags = proto_fs::UNLINK_REMOVEDIR;
+    start
+}
+
+fn access(slot: u32, generation: u64, path: &[u8], bits: u64) -> ChangeStart<'_> {
+    let mut start = req(slot, generation, ChangeOp::Access, path);
+    start.args[0] = bits;
+    start
+}
+
+/// A prepared open of `path`, with the generation of its description.
+fn open(files: &Files, generation: u64, path: &[u8], flags: u32) -> Result<PreparedOpen, Status> {
+    let key = OpenKey {
+        slot: 30,
+        generation,
+    };
+    let id = files.open_start(key, path, flags, 0o600, 0)?;
+    super::open_stages::prepared(files, id)?;
+    let held = files.open_commit(id)?;
+    if files.open_finish(key)? != held {
+        return Err(Status::BadSize);
+    }
+    Ok(held)
+}
+
+/// Whether `path` opens now.
+fn exists(files: &Files, generation: u64, path: &[u8], flags: u32) -> Result<bool, Status> {
+    match open(files, generation, path, flags) {
+        Ok(held) => {
+            files.close_exact(held)?;
+            Ok(true)
+        }
+        Err(Status::Unknown(proto_fs::NO_ENTRY)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn expect(result: Result<Done, Status>, code: u32, line: i32) -> Result<(), i32> {
+    match result {
+        Ok(done) if done.result == code => Ok(()),
+        _ => Err(line),
+    }
+}
+
+fn run_stages(files: &Files) -> Result<(), i32> {
+    let dir_flags = proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY;
+    // mkdir: made once, then it exists.
+    expect(run(files, &mkdir(0, 1, b"/tmp/cs", 0o777), None), 0, 1)?;
+    if !exists(files, 1, b"/tmp/cs", dir_flags).map_err(|_| 2)? {
+        return Err(2);
+    }
+    expect(
+        run(files, &mkdir(0, 2, b"/tmp/cs", 0o777), None),
+        proto_fs::ALREADY_EXISTS,
+        3,
+    )?;
+    rt::println!("posix-files: change mkdir made /tmp/cs and refused it twice");
+    // A relative path from a directory descriptor.
+    let held = open(files, 2, b"/tmp/cs", dir_flags).map_err(|_| 4)?;
+    let at = |slot, generation, path, base| ChangeStart {
+        base,
+        ..mkdir(slot, generation, path, 0o755)
+    };
+    let base = Base::Fd {
+        fd: held.fd,
+        generation: held.generation,
+    };
+    expect(run(files, &at(0, 3, b"sub", base), None), 0, 5)?;
+    if !exists(files, 3, b"/tmp/cs/sub", dir_flags).map_err(|_| 6)? {
+        return Err(6);
+    }
+    let wrong = Base::Fd {
+        fd: held.fd,
+        generation: held.generation + 1,
+    };
+    expect(
+        run(files, &at(0, 4, b"other", wrong), None),
+        proto_fs::BAD_FD,
+        7,
+    )?;
+    expect(
+        run(files, &at(0, 5, b"other", Base::Cwd), None),
+        proto_fs::BAD_FD,
+        8,
+    )?;
+    expect(
+        run(files, &at(0, 6, b"other", Base::Absolute), None),
+        proto_fs::BAD_FD,
+        9,
+    )?;
+    // The absolute path ignores a base that means nothing.
+    expect(
+        run(
+            files,
+            &ChangeStart {
+                base: wrong,
+                ..mkdir(0, 7, b"/tmp/cs/abs", 0o755)
+            },
+            None,
+        ),
+        0,
+        10,
+    )?;
+    if exists(files, 4, b"/tmp/cs/other", dir_flags).map_err(|_| 11)? {
+        return Err(11);
+    }
+    rt::println!(
+        "posix-files: change mkdir from a descriptor, a wrong generation and a reserved base"
+    );
+    // access.
+    expect(run(files, &access(0, 8, b"/tmp/cs/sub", 7), None), 0, 12)?;
+    expect(
+        run(files, &access(0, 9, b"/tmp/cs/none", 0), None),
+        proto_fs::NO_ENTRY,
+        13,
+    )?;
+    expect(run(files, &access(0, 10, b"/etc/motd", 4), None), 0, 14)?;
+    rt::println!("posix-files: change access of a directory, a missing name and a file");
+    // unlink and rmdir.
+    expect(
+        run(files, &req(0, 11, ChangeOp::Unlink, b"/tmp/cs"), None),
+        proto_fs::PERMISSION,
+        15,
+    )?;
+    expect(
+        run(files, &rmdir(0, 12, b"/tmp/cs"), None),
+        proto_fs::NOT_EMPTY,
+        16,
+    )?;
+    expect(run(files, &rmdir(0, 13, b"/tmp/cs/sub/"), None), 0, 17)?;
+    expect(run(files, &rmdir(0, 14, b"/tmp/cs/abs"), None), 0, 18)?;
+    files.close_exact(held).map_err(|_| 19)?;
+    expect(run(files, &rmdir(0, 15, b"/tmp/cs"), None), 0, 20)?;
+    if exists(files, 5, b"/tmp/cs", dir_flags).map_err(|_| 21)? {
+        return Err(21);
+    }
+    // A file made by open goes by unlink.
+    let file = open(
+        files,
+        6,
+        b"/tmp/cs-file",
+        proto_fs::CREATE | proto_fs::READ_WRITE,
+    )
+    .map_err(|_| 22)?;
+    files.close_exact(file).map_err(|_| 23)?;
+    expect(
+        run(files, &req(0, 16, ChangeOp::Unlink, b"/tmp/cs-file/"), None),
+        proto_fs::NOT_DIRECTORY,
+        24,
+    )?;
+    expect(
+        run(files, &req(0, 17, ChangeOp::Unlink, b"/tmp/cs-file"), None),
+        0,
+        25,
+    )?;
+    if exists(files, 7, b"/tmp/cs-file", proto_fs::READ_ONLY).map_err(|_| 26)? {
+        return Err(26);
+    }
+    rt::println!("posix-files: change unlink and rmdir by kind, with a slash and by a held name");
+    // Keys: the same Start returns the job, other arguments are refused, a
+    // released key is retired.
+    let first = mkdir(1, 20, b"/tmp/cs-key", 0o755);
+    if start(files, &first) != Ok(ChangePhase::Resolving)
+        || start(files, &first) != Ok(ChangePhase::Resolving)
+    {
+        return Err(27);
+    }
+    if start(files, &mkdir(1, 20, b"/tmp/cs-other", 0o755))
+        != Err(Status::Unknown(proto_fs::PERMISSION))
+    {
+        return Err(28);
+    }
+    if start(files, &mkdir(1, 21, b"/tmp/cs-other", 0o755))
+        != Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES))
+    {
+        return Err(29);
+    }
+    release(files, first.key).map_err(|_| 30)?;
+    release(files, first.key).map_err(|_| 31)?;
+    if start(files, &first) != Err(Status::Unknown(proto_fs::OPEN_RETIRED)) {
+        return Err(32);
+    }
+    if step(files, first.key, false).err() != Some(Status::Unknown(proto_fs::OPEN_RETIRED)) {
+        return Err(33);
+    }
+    if step(files, key(9, 1), true).err() != Some(Status::Unknown(proto_fs::NO_ENTRY)) {
+        return Err(34);
+    }
+    if exists(files, 8, b"/tmp/cs-key", dir_flags).map_err(|_| 35)? {
+        return Err(35);
+    }
+    // An operation number that does not exist is a protocol error.
+    let mut w = Writer::new();
+    Method::ChangeStart.header().write(&mut w).map_err(|_| 36)?;
+    req(2, 1, ChangeOp::Unlink, b"/tmp/x")
+        .write(&mut w)
+        .map_err(|_| 36)?;
+    let mut raw = [0; MESSAGE_MAX];
+    let length = w.as_bytes().len();
+    raw[..length].copy_from_slice(w.as_bytes());
+    raw[8 + 12..8 + 16].copy_from_slice(&99u32.to_le_bytes());
+    let reply = Files::send_on(files.sessions().0, &raw[..length]).map_err(|_| 37)?;
+    let mut buffer = [0; MESSAGE_MAX];
+    let bytes = reply.bytes(&mut buffer);
+    if status_only(bytes) != Err(Status::Unknown(proto_fs::INVALID_ARGUMENT)) {
+        return Err(38);
+    }
+    rt::println!("posix-files: change keys, retired keys and a refused operation number");
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn files_change_stages() -> i32 {
+    let Ok(raw) = posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
+        return 90;
+    };
+    let original =
+        core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+    let Ok(files) = super::open_stages::clone_bound(&original, &[]) else {
+        return 91;
+    };
+    run_stages(&files).err().unwrap_or(0)
+}

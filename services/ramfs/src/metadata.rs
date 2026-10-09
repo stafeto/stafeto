@@ -187,6 +187,8 @@ impl MetadataJournal {
                             || identity.groups.contains(gid)))
             }
             MetadataIntent::Times(settings) => {
+                // Only the owner sets a time of its own choosing; two "now"
+                // need write permission as well; two omissions need nothing.
                 owner
                     || settings == [TimeSetting::Omit; 2]
                     || (settings == [TimeSetting::Now; 2] && identity.permits(&node, 2))
@@ -194,10 +196,12 @@ impl MetadataJournal {
             MetadataIntent::Access { bits, .. } => identity.permits(&node, bits),
         };
         let outcome = if !allowed {
-            MetadataOutcome::Failed(if matches!(self.intent, MetadataIntent::Access { .. }) {
-                ACCESS_DENIED
-            } else {
-                PERMISSION
+            MetadataOutcome::Failed(match self.intent {
+                MetadataIntent::Access { .. } => ACCESS_DENIED,
+                MetadataIntent::Times(settings) if settings == [TimeSetting::Now; 2] => {
+                    ACCESS_DENIED
+                }
+                _ => PERMISSION,
             })
         } else if !self.intent.needs_time() {
             MetadataOutcome::Unchanged

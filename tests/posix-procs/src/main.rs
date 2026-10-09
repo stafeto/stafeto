@@ -66,6 +66,8 @@ extern "C" fn files_fake_identity() -> i32 {
     }
 }
 
+#[cfg(feature = "files")]
+mod change_stages;
 #[cfg(feature = "auth-probe")]
 mod cleanup;
 #[cfg(feature = "files")]

@@ -3112,6 +3112,7 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     let ended = "init: posix-files ended: exit code 0, not restarted";
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(&output, "posix-files: raw Change requests ok")?;
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
     if measured {
         check_waits(&output.lines, &["2"], "RAM file service steps")?;
