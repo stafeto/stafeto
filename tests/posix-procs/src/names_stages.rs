@@ -3,8 +3,8 @@
 
 //! The operations on names and metadata through the bridges `stafeto_*` of the
 //! layer, which relibc's platform calls. Every function answers with an effect
-//! that is looked at afterwards (the node information of the path, not the
-//! return value alone), and every refusal leaves the tree as it was.
+//! that is looked at afterwards (the node information of the path, besides the
+//! return value), and every refusal leaves the tree as it was.
 use core::ffi::{c_char, c_int};
 use proto_fs::NodeInfo;
 use proto_wire::Status;
@@ -166,7 +166,7 @@ fn utimens(path: &[u8], times: Option<[i64; 4]>, flags: c_int) -> c_int {
 }
 
 /// The node information of `path` with the last link not followed, from the
-/// service itself and not through the bridges under test.
+/// service itself, outside the bridges under test.
 fn lstat(path: &[u8]) -> Result<NodeInfo, Status> {
     let transport = posix_abi::shared::with_files(|files| Ok(files.transport()))
         .map_err(|_| Status::BadSize)?;
@@ -534,7 +534,7 @@ fn metadata() -> Result<(), i32> {
         access != before.access_time && modify != before.modify_time,
         251,
     )?;
-    // The clock, and not a time of zero.
+    // The clock gives a time other than zero.
     check(
         (access.seconds, access.nanos) != (0, 0) && (modify.seconds, modify.nanos) != (0, 0),
         251,
@@ -660,7 +660,7 @@ fn physical_chdir() -> Result<(), i32> {
     ok(mkdir(b"/tmp/pc/b", 0o777), 312)?;
     ok(mkdir(b"/tmp/pc/b/c", 0o777), 313)?;
     ok(symlink(b"/tmp/pc/b/c", b"/tmp/pc/a/l"), 314)?;
-    // Through the link: the path of the place, not of the way.
+    // Through the link: the answer is the path of the place.
     ok(chdir(b"/tmp/pc/a/l"), 315)?;
     check(cwd_is(b"/tmp/pc/b/c"), 316)?;
     // `..` of the place is the parent of the place; the lexical `..` of the
@@ -765,7 +765,7 @@ fn against_descriptors() -> Result<(), i32> {
     expect(status.err().map_or(0, |e| -e), EACCES, 379)?;
     restored.map_err(|_| 380)?;
     ok(chmod(b"/tmp/pc2", 0o755, 0), 381)?;
-    // Not a directory, not open, not of the file service.
+    // A descriptor of a file, a number that is closed, and one of another service.
     ok(create(b"/tmp/pc2/file2"), 382)?;
     let regular = open_at(AT_FDCWD, b"/tmp/pc2/file2", O_RDONLY);
     check(regular >= 0, 383)?;

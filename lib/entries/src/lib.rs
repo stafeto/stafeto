@@ -359,7 +359,7 @@ mod tests {
         assert!(!nested(main(0x9000), main(0x8000)));
         assert!(!nested(main(0x9000), main(0x9000)));
         // A frame on the alternate stack lies inside any frame of the main
-        // stack, whatever the addresses, and not the other way.
+        // stack, whatever the addresses, and no frame of the main stack lies inside one of the alternate stack.
         assert!(nested(alternate(0x1000), main(0x9000)));
         assert!(nested(alternate(0xf000), main(0x1000)));
         assert!(!nested(main(0x1000), alternate(0xf000)));
