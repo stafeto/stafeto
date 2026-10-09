@@ -3036,9 +3036,9 @@ mod index_check {
                     "count of {slot}"
                 );
             }
-            for i in 0..total {
-                assert_eq!(listed[i], self.published(i), "entry {i} listed or not");
-                if !listed[i] {
+            for (i, &is_listed) in listed.iter().enumerate() {
+                assert_eq!(is_listed, self.published(i), "entry {i} listed or not");
+                if !is_listed {
                     assert_eq!(self.state.child_next[i], NONE, "entry {i} child next");
                     assert_eq!(self.state.child_prev[i], NONE, "entry {i} child prev");
                 }

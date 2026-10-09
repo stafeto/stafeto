@@ -2679,8 +2679,8 @@ fn a_name_that_exists_all_the_time_is_listed_once_whatever_else_changes() {
             }
         }
         if round == 5 {
-            for i in 10..24 {
-                let path = std::format!("/d/{}", others[i]);
+            for other in &others[10..] {
+                let path = std::format!("/d/{other}");
                 assert_eq!(
                     env.go_result(&mut fds, op(ChangeOp::Unlink, path.as_bytes()), None),
                     0
