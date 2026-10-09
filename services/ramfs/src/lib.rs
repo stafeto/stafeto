@@ -239,6 +239,7 @@ enum File {
 }
 
 /// What the walk to the next name of a directory gave.
+#[allow(clippy::large_enum_variant)]
 enum Walked {
     Entry(u64, u16, DirectoryRecord),
     End,

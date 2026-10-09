@@ -2350,3 +2350,41 @@ fn a_file_change_and_a_name_in_another_directory_leave_a_walk_and_its_proof_as_t
     assert_eq!(job.restarts, 0);
     job.release(&mut r.storage);
 }
+
+#[test]
+fn a_path_of_32_links_of_255_components_takes_a_step_for_each_component_and_link() {
+    // The worst path of the plan: thirty-two links, each of 255 components
+    // ("." is a component) and the name of the next link. Without the index
+    // each name of the walk cost 193 steps in a full table; now it is one.
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let count = 32;
+    let dots = "./".repeat(254);
+    for i in 0..count {
+        let link = create(&mut r, ROOT, format!("l{i}").as_bytes(), SYMLINK, 0o777);
+        let target = if i + 1 < count {
+            format!("{dots}l{}", i + 1)
+        } else {
+            format!("{dots}end")
+        };
+        r.storage
+            .write(link, ROOT_ACCOUNT, 0, target.as_bytes())
+            .unwrap();
+    }
+    let end = create(&mut r, ROOT, b"end", REG, 0o644);
+    let mut job = Resolve::new(&mut r.storage, b"/l0", ROOT, OWNER, true).unwrap();
+    let mut steps = 0;
+    let found = loop {
+        steps += 1;
+        assert!(steps < 20_000, "the walk does not end");
+        if let Progress::Found(token) = job.step(&mut r.storage, OWNER).unwrap() {
+            break token;
+        }
+    };
+    assert_eq!(found, end);
+    assert_eq!(job.restarts, 0);
+    std::eprintln!("T4 path of 32 links of 255 components: {steps} steps");
+    // 255 components and a link for each of the 32 links, and the name of the first.
+    assert!(steps <= 8_500, "{steps} steps");
+    assert!(steps >= 8_000, "{steps} steps: the dots are components");
+    job.release(&mut r.storage);
+}
