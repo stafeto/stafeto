@@ -45,10 +45,21 @@ unsafe extern "C" {
         flags: c_int,
     ) -> c_int;
     fn stafeto_pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+    fn stafeto_chdir(path: *const c_char) -> c_int;
+    fn stafeto_getcwd(buf: *mut u8, len: usize) -> c_int;
+    fn stafeto_fstatat(
+        dirfd: c_int,
+        path: *const c_char,
+        out: *mut [u64; 16],
+        flags: c_int,
+    ) -> c_int;
 }
 
 const AT_FDCWD: c_int = -100;
 const AT_REMOVEDIR: c_int = 0x200;
+const O_RDONLY: c_int = 0;
+const O_DIRECTORY: c_int = 0o40000;
+const EBADF: c_int = 9;
 const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
 const AT_SYMLINK_FOLLOW: c_int = 0x400;
 const AT_EMPTY_PATH: c_int = 0x1000;
@@ -591,6 +602,225 @@ pub extern "C" fn files_names_stages() -> i32 {
     first_four()
         .and_then(|()| two_paths())
         .and_then(|()| metadata())
+        .and_then(|()| physical_chdir())
+        .and_then(|()| against_descriptors())
         .err()
         .unwrap_or(0)
+}
+
+fn chdir(path: &[u8]) -> c_int {
+    let path = name(path);
+    // SAFETY: a live C string.
+    unsafe { stafeto_chdir(path.pointer()) }
+}
+
+fn getcwd() -> Result<([u8; 520], usize), i32> {
+    let mut buffer = [0; 520];
+    // SAFETY: a writable buffer.
+    if unsafe { stafeto_getcwd(buffer.as_mut_ptr(), buffer.len()) } < 0 {
+        return Err(300);
+    }
+    let length = buffer.iter().position(|&b| b == 0).ok_or(301)?;
+    Ok((buffer, length))
+}
+
+fn cwd_is(expected: &[u8]) -> bool {
+    getcwd().is_ok_and(|(buffer, length)| &buffer[..length] == expected)
+}
+
+/// The inode and the mode of `fstatat` through the bridge.
+fn fstatat(dirfd: c_int, path: Option<&[u8]>, flags: c_int) -> Result<(u64, u32), c_int> {
+    let path = path.map(name);
+    let pointer = path.as_ref().map_or(core::ptr::null(), Name::pointer);
+    let mut out = [0u64; 16];
+    // SAFETY: null or a live C string, and a buffer of a struct stat.
+    let result = unsafe { stafeto_fstatat(dirfd, pointer, &mut out, flags) };
+    if result < 0 {
+        return Err(-result);
+    }
+    Ok((out[1], out[2] as u32))
+}
+
+fn open_at(dirfd: c_int, path: &[u8], flags: c_int) -> c_int {
+    let path = name(path);
+    // SAFETY: a live C string.
+    unsafe { stafeto_openat(dirfd, path.pointer(), flags, 0) }
+}
+
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
+
+/// The current directory is a place: chdir takes the canonical path, and `..`
+/// goes to the parent of that place.
+fn physical_chdir() -> Result<(), i32> {
+    ok(mkdir(b"/tmp/pc", 0o777), 310)?;
+    ok(mkdir(b"/tmp/pc/a", 0o777), 311)?;
+    ok(mkdir(b"/tmp/pc/b", 0o777), 312)?;
+    ok(mkdir(b"/tmp/pc/b/c", 0o777), 313)?;
+    ok(symlink(b"/tmp/pc/b/c", b"/tmp/pc/a/l"), 314)?;
+    // Through the link: the path of the place, not of the way.
+    ok(chdir(b"/tmp/pc/a/l"), 315)?;
+    check(cwd_is(b"/tmp/pc/b/c"), 316)?;
+    // `..` of the place is the parent of the place; the lexical `..` of the
+    // way would be /tmp/pc/a.
+    ok(chdir(b".."), 317)?;
+    check(cwd_is(b"/tmp/pc/b"), 318)?;
+    ok(chdir(b"c/./../c"), 319)?;
+    check(cwd_is(b"/tmp/pc/b/c"), 320)?;
+    // The same through a path that is not a directory change.
+    let beyond = fstatat(AT_FDCWD, Some(b"/tmp/pc/a/l/.."), 0).map_err(|_| 321)?;
+    let parent = fstatat(AT_FDCWD, Some(b"/tmp/pc/b"), 0).map_err(|_| 322)?;
+    let lexical = fstatat(AT_FDCWD, Some(b"/tmp/pc/a"), 0).map_err(|_| 323)?;
+    check(beyond.0 == parent.0 && beyond.0 != lexical.0, 324)?;
+    // A relative name against the place.
+    ok(create(b"f"), 325)?;
+    check(is(b"/tmp/pc/b/c/f", REG), 326)?;
+    ok(unlink(b"f", 0), 327)?;
+    // Refusals leave the place where it was.
+    ok(create(b"/tmp/pc/file"), 328)?;
+    expect(chdir(b"/tmp/pc/file"), ENOTDIR, 329)?;
+    expect(chdir(b"/tmp/pc/none"), ENOENT, 330)?;
+    expect(chdir(b""), ENOENT, 331)?;
+    expect(chdir(b"/tmp/pc/file/x"), ENOTDIR, 332)?;
+    check(cwd_is(b"/tmp/pc/b/c"), 333)?;
+    // A directory the caller cannot search.
+    ok(mkdir(b"/tmp/pc/closed", 0o700), 334)?;
+    posix_abi::process::seteuid(65533).map_err(|_| 335)?;
+    let refused = chdir(b"/tmp/pc/closed");
+    let restored = posix_abi::process::seteuid(0);
+    expect(refused, EACCES, 336)?;
+    restored.map_err(|_| 337)?;
+    check(cwd_is(b"/tmp/pc/b/c"), 338)?;
+    ok(chdir(b"/"), 339)?;
+    check(cwd_is(b"/"), 340)?;
+    rt::println!("posix-files: layer chdir took the canonical path of the place");
+    Ok(())
+}
+
+/// A path against a descriptor: openat and fstatat follow the directory the
+/// descriptor holds, wherever it goes.
+fn against_descriptors() -> Result<(), i32> {
+    ok(unlink(b"/tmp/pc/closed", AT_REMOVEDIR), 349)?;
+    ok(create(b"/tmp/pc/b/c/f"), 350)?;
+    let dir = open_at(AT_FDCWD, b"/tmp/pc", O_RDONLY | O_DIRECTORY);
+    check(dir >= 0, 351)?;
+    // Through the link, in another branch.
+    let fd = open_at(dir, b"a/l/f", O_RDONLY);
+    check(fd >= 0, 352)?;
+    // SAFETY: a descriptor the layer gave.
+    unsafe { stafeto_close(fd) };
+    let (_, mode) = fstatat(dir, Some(b"b/c/f"), 0).map_err(|_| 353)?;
+    check(mode & S_IFMT == S_IFREG, 354)?;
+    let (_, mode) = fstatat(dir, Some(b"a/l"), AT_SYMLINK_NOFOLLOW).map_err(|_| 355)?;
+    check(mode & S_IFMT == S_IFLNK, 356)?;
+    let (_, mode) = fstatat(dir, Some(b"a/l"), 0).map_err(|_| 357)?;
+    check(mode & S_IFMT == S_IFDIR, 358)?;
+    // The descriptor itself.
+    let (itself, _) = fstatat(dir, None, 0).map_err(|_| 359)?;
+    let (empty, _) = fstatat(dir, Some(b""), AT_EMPTY_PATH).map_err(|_| 360)?;
+    let (named, _) = fstatat(AT_FDCWD, Some(b"/tmp/pc"), 0).map_err(|_| 361)?;
+    check(itself == named && empty == named, 362)?;
+    expect(
+        fstatat(dir, Some(b""), 0).err().map_or(0, |e| -e),
+        ENOENT,
+        363,
+    )?;
+    expect(
+        fstatat(dir, Some(b"b"), 2).err().map_or(0, |e| -e),
+        EINVAL,
+        364,
+    )?;
+    // The creating calls use it too.
+    let dir_name = name(b"n");
+    // SAFETY: a live C string and a descriptor of the layer.
+    ok(
+        unsafe { stafeto_mkdirat(dir, dir_name.pointer(), 0o777) },
+        365,
+    )?;
+    check(is(b"/tmp/pc/n", DIR), 366)?;
+    // SAFETY: as above.
+    ok(
+        unsafe { stafeto_unlinkat(dir, dir_name.pointer(), AT_REMOVEDIR) },
+        367,
+    )?;
+    check(absent(b"/tmp/pc/n"), 368)?;
+    // The directory moves; the descriptor goes with it.
+    ok(rename(b"/tmp/pc", b"/tmp/pc2"), 370)?;
+    let (_, mode) = fstatat(dir, Some(b"b/c/f"), 0).map_err(|_| 371)?;
+    check(mode & S_IFMT == S_IFREG, 372)?;
+    check(absent(b"/tmp/pc"), 373)?;
+    let moved = name(b"b/c/f");
+    // SAFETY: as above.
+    ok(unsafe { stafeto_unlinkat(dir, moved.pointer(), 0) }, 374)?;
+    check(absent(b"/tmp/pc2/b/c/f"), 375)?;
+    // The search permission of the directory is checked at each call.
+    ok(chmod(b"/tmp/pc2", 0, 0), 376)?;
+    posix_abi::process::seteuid(65533).map_err(|_| 377)?;
+    let search = open_at(dir, b"b", O_RDONLY | O_DIRECTORY);
+    let status = fstatat(dir, Some(b"b"), 0);
+    let restored = posix_abi::process::seteuid(0);
+    expect(search, EACCES, 378)?;
+    expect(status.err().map_or(0, |e| -e), EACCES, 379)?;
+    restored.map_err(|_| 380)?;
+    ok(chmod(b"/tmp/pc2", 0o755, 0), 381)?;
+    // Not a directory, not open, not of the file service.
+    ok(create(b"/tmp/pc2/file2"), 382)?;
+    let regular = open_at(AT_FDCWD, b"/tmp/pc2/file2", O_RDONLY);
+    check(regular >= 0, 383)?;
+    expect(open_at(regular, b"x", O_RDONLY), ENOTDIR, 384)?;
+    expect(
+        fstatat(regular, Some(b"x"), 0).err().map_or(0, |e| -e),
+        ENOTDIR,
+        385,
+    )?;
+    expect(open_at(29, b"x", O_RDONLY), EBADF, 386)?;
+    expect(
+        fstatat(29, Some(b"x"), 0).err().map_or(0, |e| -e),
+        EBADF,
+        387,
+    )?;
+    expect(open_at(1, b"x", O_RDONLY), ENOTDIR, 388)?;
+    expect(
+        fstatat(1, Some(b"x"), 0).err().map_or(0, |e| -e),
+        ENOTDIR,
+        389,
+    )?;
+    let mkdir_there = name(b"x");
+    // SAFETY: as above.
+    expect(
+        unsafe { stafeto_mkdirat(regular, mkdir_there.pointer(), 0o777) },
+        ENOTDIR,
+        390,
+    )?;
+    // An absolute path does not look at the descriptor.
+    let motd = open_at(29, b"/etc/motd", O_RDONLY);
+    check(motd >= 0, 391)?;
+    // SAFETY: a descriptor the layer gave.
+    unsafe { stafeto_close(motd) };
+    // A path with an empty name is no path.
+    expect(open_at(dir, b"", O_RDONLY), ENOENT, 392)?;
+    // SAFETY: descriptors of the layer.
+    unsafe {
+        stafeto_close(regular);
+        stafeto_close(dir);
+    }
+    for leaf in [
+        b"/tmp/pc2/file2".as_slice(),
+        b"/tmp/pc2/file",
+        b"/tmp/pc2/a/l",
+    ] {
+        ok(unlink(leaf, 0), 393)?;
+    }
+    for leaf in [
+        b"/tmp/pc2/b/c".as_slice(),
+        b"/tmp/pc2/b",
+        b"/tmp/pc2/a",
+        b"/tmp/pc2",
+    ] {
+        ok(unlink(leaf, AT_REMOVEDIR), 394)?;
+    }
+    rt::println!("posix-files: layer openat and fstatat followed a descriptor through a rename");
+    Ok(())
 }

@@ -781,16 +781,11 @@ impl Shadow {
             FileAction::Chdir(path) => {
                 let mut full = [0; proto_loader::PATH_MAX];
                 let full = self.absolute(path, &mut full)?;
-                let directory = crate::shared::resolved(full, |transport, path| {
-                    Ok(transport.stat(path).map_err(crate::error)?.kind
-                        == posix_fs::FileKind::Directory)
-                })?;
-                if !directory {
-                    return Err(ENOTDIR);
-                }
-                let len = full.len();
+                // The child starts in the canonical path of the directory.
+                let mut canonical = [0; crate::names::MAX_PATH + 1];
+                let len = crate::names::directory_path(full, &mut canonical)?;
                 let mut copy = [0; proto_loader::PATH_MAX];
-                copy[..len].copy_from_slice(full);
+                copy[..len].copy_from_slice(&canonical[..len]);
                 self.cwd = copy;
                 self.cwd_len = len;
             }

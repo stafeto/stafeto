@@ -29,7 +29,7 @@ pub const AT_EMPTY_PATH: c_int = 0x1000;
 pub const UTIME_NOW: i64 = proto_fs::TIME_NOW as i64;
 pub const UTIME_OMIT: i64 = proto_fs::TIME_OMIT as i64;
 
-const MAX_PATH: usize = proto_fs::MAX_PATH;
+pub const MAX_PATH: usize = proto_fs::MAX_PATH;
 
 /// A path ready for a request: where it starts and its bytes.
 struct Placed {
@@ -60,7 +60,7 @@ fn error(error: FsError) -> c_int {
 /// the file service. EBADF for a number that is closed, ENOTDIR for a
 /// descriptor of another service (a pipe, a terminal, the console), which is
 /// no directory.
-fn descriptor_base(dirfd: c_int) -> Result<Base, c_int> {
+pub(crate) fn descriptor_base(dirfd: c_int) -> Result<Base, c_int> {
     let fd = u32::try_from(dirfd).map_err(|_| EBADF)?;
     crate::shared::with_files(|files| match files.target(fd).map_err(error)? {
         Target::Ram(target) | Target::Random(target) => Ok(Base::Fd {
@@ -433,4 +433,73 @@ pub fn utimensat(
         flags,
         [access_seconds, access_nanos, modify_seconds, modify_nanos],
     )
+}
+
+/// fstatat: the node information of a path, or with no path (or an empty
+/// one and AT_EMPTY_PATH) of the descriptor itself. The last link is not
+/// followed with AT_SYMLINK_NOFOLLOW, unless the path ends with a slash, which
+/// names the directory the link leads to. Other flags are EINVAL, an empty
+/// path without AT_EMPTY_PATH is ENOENT, a relative path against a descriptor
+/// of another service is ENOTDIR.
+pub fn fstatat(
+    dirfd: c_int,
+    path: Option<&[u8]>,
+    flags: c_int,
+) -> Result<proto_fs::NodeInfo, c_int> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    let nonempty = path.filter(|path| !path.is_empty());
+    if let Some(path) = nonempty {
+        let placed = place(dirfd, path)?;
+        let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
+        if let Some((kind, number)) = transport
+            .terminal_leaf(placed.start_fd(), placed.path(), placed.trailing_slash)
+            .map_err(error)?
+        {
+            return transport
+                .terminal_leaf_information(kind, number)
+                .map_err(error);
+        }
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0 || placed.trailing_slash;
+        let info = transport
+            .files()
+            .node_information_from(placed.start_fd(), placed.path(), follow)
+            .map_err(|status| error(FsError::from(status)))?;
+        if placed.trailing_slash && info.kind != 1 {
+            return Err(ENOTDIR);
+        }
+        return Ok(info);
+    }
+    if path.is_some() && flags & AT_EMPTY_PATH == 0 {
+        return Err(ENOENT);
+    }
+    if dirfd == AT_FDCWD {
+        // The current directory itself.
+        return fstatat(dirfd, Some(b"."), flags & !AT_EMPTY_PATH);
+    }
+    let fd = u32::try_from(dirfd).map_err(|_| EBADF)?;
+    crate::shared::held(fd, |transport, target| {
+        transport.descriptor_information(target).map_err(error)
+    })
+}
+
+/// The canonical path of the directory `path` names, against the current
+/// directory: the service resolves the links, `.` and `..`, and checks that
+/// the caller may search it. The path of a name of the terminal is ENOTDIR.
+pub fn directory_path(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+    let placed = place(AT_FDCWD, path)?;
+    let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
+    if virtual_leaf(transport, &placed, false)?.is_some() {
+        return Err(ENOTDIR);
+    }
+    let mut query = request(ChangeOp::Path, &placed);
+    query.flags = proto_fs::PATH_REQUIRE_DIR | proto_fs::PATH_FOLLOW_LAST;
+    let mut buffer = [0; RESULT_MAX];
+    let outcome = run(&query, &mut buffer)?;
+    if outcome.length == 0 || outcome.length > MAX_PATH {
+        return Err(EIO);
+    }
+    out[..outcome.length].copy_from_slice(&buffer[..outcome.length]);
+    Ok(outcome.length)
 }

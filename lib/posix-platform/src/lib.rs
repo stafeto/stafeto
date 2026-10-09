@@ -139,7 +139,6 @@ pub unsafe extern "C" fn stafeto_read(fd: c_int, buf: *mut u8, len: usize) -> is
 }
 
 /// relibc's open flags (its headers for AArch64 Linux, asm/fcntl.h).
-const AT_FDCWD: c_int = -100;
 const O_ACCMODE: c_int = 0o3;
 const O_CREAT: c_int = 0o100;
 const O_EXCL: c_int = 0o200;
@@ -191,7 +190,8 @@ fn open_flags(flags: c_int) -> Result<c_int, c_int> {
     Ok(mapped)
 }
 
-/// Opens an absolute path or a path under the current directory with captured mode and umask.
+/// Opens a path with captured mode and umask: an absolute one, one under the
+/// current directory (`AT_FDCWD`), or one under the directory `dirfd` names.
 ///
 /// # Safety
 /// `path` is a live C string.
@@ -202,11 +202,6 @@ pub unsafe extern "C" fn stafeto_openat(
     flags: c_int,
     mode: u32,
 ) -> c_int {
-    // SAFETY: the caller's promise.
-    let absolute = !path.is_null() && unsafe { *path } == b'/' as c_char;
-    if dirfd != AT_FDCWD && !absolute {
-        return -EINVAL;
-    }
     let mapped = match open_flags(flags) {
         Ok(mapped) => mapped,
         Err(errno) => return -errno,
@@ -217,8 +212,9 @@ pub unsafe extern "C" fn stafeto_openat(
         Err(errno) => return -errno,
     };
     let captured_umask = files::umask();
-    value(call(|| posix_abi::open_policy(name, mapped, mode, captured_umask)).map(i64::from))
-        as c_int
+    value(
+        call(|| posix_abi::openat_policy(dirfd, name, mapped, mode, captured_umask)).map(i64::from),
+    ) as c_int
 }
 
 /// pipe2: the read end into `fds[0]` and the write end into `fds[1]`

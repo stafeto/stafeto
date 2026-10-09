@@ -55,9 +55,6 @@ const DT_FIFO: u8 = 1;
 const DT_CHR: u8 = 2;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
-/// relibc's (Linux's) AT_ values.
-const AT_FDCWD: c_int = -100;
-const AT_EMPTY_PATH: c_int = 0x1000;
 
 fn time(time: posix_fs::Timestamp) -> [i64; 2] {
     [time.seconds, i64::from(time.nanos)]
@@ -104,8 +101,9 @@ unsafe fn bytes<'a>(path: *const c_char) -> &'a [u8] {
     unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes()
 }
 
-/// fstat (`path` null or empty with AT_EMPTY_PATH), stat and lstat (no
-/// symbolic links yet) in relibc's struct stat.
+/// fstat (`path` null or empty with AT_EMPTY_PATH), stat, lstat
+/// (AT_SYMLINK_NOFOLLOW) and fstatat of a path against a descriptor in
+/// relibc's struct stat.
 ///
 /// # Safety
 /// `path` is null or a live C string; `out` is writable for a LinuxStat.
@@ -121,26 +119,7 @@ pub unsafe extern "C" fn stafeto_fstatat(
     }
     // SAFETY: the caller's promise.
     let path = (!path.is_null()).then(|| unsafe { bytes(path) });
-    use posix_abi::shared::{held, resolved};
-    let info = match path {
-        Some(path) if !path.is_empty() => {
-            if fd != AT_FDCWD && path.first() != Some(&b'/') {
-                Err(ENOSYS)
-            } else {
-                resolved(path, |transport, path| {
-                    transport.stat_information(path).map_err(posix_abi::error)
-                })
-            }
-        }
-        _ if path.is_none() || flags & AT_EMPTY_PATH != 0 => number(fd).and_then(|fd| {
-            held(fd, |transport, target| {
-                transport
-                    .descriptor_information(target)
-                    .map_err(posix_abi::error)
-            })
-        }),
-        _ => Err(posix_abi::constants::ENOENT),
-    };
+    let info = call(|| posix_abi::names::fstatat(fd, path, flags));
     match info {
         Ok(info) => {
             // SAFETY: the caller's promise.

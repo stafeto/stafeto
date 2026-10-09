@@ -40,6 +40,7 @@ impl Drop for Defer {
 /// All closure bodies inspect local state; requests execute after releasing FILES_LOCK.
 pub(crate) fn open(
     transport: Transport,
+    base: Option<(u32, u64)>,
     path: &[u8],
     flags: u32,
     mode: u32,
@@ -61,7 +62,7 @@ pub(crate) fn open(
     }
     let result = (|| {
         recovery.job = files
-            .open_start(key(token), path, flags, mode, umask)
+            .open_start_from(key(token), base, path, flags, mode, umask)
             .map_err(protocol)?;
         recovery.phase = Phase::Traversing;
         save(claim, recovery)?;

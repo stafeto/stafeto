@@ -175,6 +175,30 @@ pub fn open_policy(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c
     .map(|fd| fd as c_int)
 }
 
+/// openat: a relative path starts at the directory the descriptor `dirfd`
+/// names; an absolute path, `AT_FDCWD` and the rest are `open_policy`. EBADF
+/// for a closed number, ENOTDIR for a descriptor of another service and,
+/// from the file service, for one that is no directory, EACCES for a
+/// directory the caller cannot search.
+pub fn openat_policy(
+    dirfd: c_int,
+    name: &[u8],
+    flags: c_int,
+    mode: u32,
+    umask: u32,
+) -> Result<c_int, c_int> {
+    if dirfd == names::AT_FDCWD || name.first() == Some(&b'/') {
+        return open_policy(name, flags, mode, umask);
+    }
+    if name.is_empty() {
+        return Err(ENOENT);
+    }
+    let proto_fs::Base::Fd { fd, generation } = names::descriptor_base(dirfd)? else {
+        return Err(EBADF);
+    };
+    shared::open_from(Some((fd, generation)), name, flags, mode, umask).map(|fd| fd as c_int)
+}
+
 pub fn close(number: c_int) -> Result<(), c_int> {
     shared::unit(Request::Close { fd: fd(number)? })
 }

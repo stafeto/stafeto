@@ -309,12 +309,33 @@ impl Files {
         mode: u32,
         umask: u32,
     ) -> Result<u64, Status> {
+        self.open_start_from(key, None, path, flags, mode, umask)
+    }
+    /// The same for a path that starts at a descriptor of the session (its
+    /// number and the generation of its description), None for the root.
+    pub fn open_start_from(
+        &self,
+        key: proto_fs::OpenKey,
+        base: Option<(u32, u64)>,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+        umask: u32,
+    ) -> Result<u64, Status> {
         let mut w = Writer::new();
         Method::OpenStart.header().write(&mut w)?;
         w.u32(key.slot)?;
         w.u64(key.generation)?;
-        w.u32(0)?;
-        w.u64(1)?;
+        match base {
+            None => {
+                w.u32(0)?;
+                w.u64(1)?;
+            }
+            Some((fd, generation)) => {
+                w.u32(fd | 1 << 31)?;
+                w.u64(generation)?;
+            }
+        }
         w.u32(flags)?;
         w.u32(mode)?;
         w.u32(umask)?;
