@@ -14,10 +14,7 @@ use proto_fs::{
     STALE_PROOF,
 };
 
-// The Files wire owner publishes these statuses with the namespace methods.
-pub const TOO_MANY_LINKS: u32 = 322;
-pub const DIRECTORY_NOT_EMPTY: u32 = 323;
-pub const BUSY: u32 = 324;
+pub use proto_fs::{BUSY, NOT_EMPTY, TOO_MANY_LINKS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NamespaceIntent {
@@ -295,7 +292,7 @@ impl Preparation {
                             break;
                         }
                         if storage.entry(target, self.cursor as usize).is_some() {
-                            return Err(DIRECTORY_NOT_EMPTY);
+                            return Err(NOT_EMPTY);
                         }
                         self.cursor += 1;
                     }

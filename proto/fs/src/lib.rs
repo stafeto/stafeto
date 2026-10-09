@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 12 of the bounded RAM file service. Numbers are little endian.
+//! Version 13 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -89,6 +89,13 @@
 
 #![cfg_attr(not(test), no_std)]
 
+mod change;
+pub use change::{
+    ACCESS_EFFECTIVE, BASE_ABSOLUTE, BASE_CWD, Base, ChangeOp, ChangePhase, ChangeReply,
+    ChangeSecond, ChangeStart, ID_UNCHANGED, LINK_FOLLOW, MODE_MASK, NOFOLLOW, PATH_FOLLOW_LAST,
+    PATH_REQUIRE_DIR, RESULT_MAX, STATVFS_BYTES, TIME_NOW, TIME_OMIT, UNLINK_REMOVEDIR,
+    change_start_reply, read_key_body, write_key_body, write_start_reply,
+};
 mod data;
 pub use data::{
     DataDescription, DataKind, DataOutcome, DataPhase, DataResult, DataStart, FEED_MAX,
@@ -108,7 +115,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 12;
+pub const VERSION: u16 = 13;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -170,8 +177,22 @@ pub const OPEN_RETIRED: u32 = 319;
 pub const FILE_TOO_LARGE: u32 = 320;
 /// A SetId outcome requires a genuine loader abort before another execution attempt.
 pub const IMAGE_ABORT_REQUIRED: u32 = 321;
+/// EMLINK: a link count would pass its limit.
+pub const TOO_MANY_LINKS: u32 = 322;
+/// ENOTEMPTY: the directory still has entries.
+pub const NOT_EMPTY: u32 = 323;
+/// EBUSY: the root, or a name the service does not own.
+pub const BUSY: u32 = 324;
 /// This exact final request made no effect while its paid record awaits Clock.
 pub const TIME_DEFERRED: u32 = 325;
+/// EXDEV: a rename or link between two filesystems.
+pub const CROSS_DEVICE: u32 = 326;
+/// EOPNOTSUPP: the operation has no meaning for this object.
+pub const NOT_SUPPORTED: u32 = 327;
+/// The table of paid jobs (the share of the root or the service) is full.
+/// The request made no effect and raised no mark; the same key can be
+/// sent again after a pause.
+pub const JOBS_FULL: u32 = 328;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -303,6 +324,12 @@ pub enum Method {
     DataCancel = 40,
     DataAck = 41,
     DataReadResult = 42,
+    /// Number 43 stays reserved for CloneExec.
+    ChangeStart = 44,
+    ChangeSecond = 45,
+    ChangeStep = 46,
+    ChangeQuery = 47,
+    ChangeRelease = 48,
 }
 
 impl Method {
@@ -354,6 +381,11 @@ impl Method {
             40 => Some(Self::DataCancel),
             41 => Some(Self::DataAck),
             42 => Some(Self::DataReadResult),
+            44 => Some(Self::ChangeStart),
+            45 => Some(Self::ChangeSecond),
+            46 => Some(Self::ChangeStep),
+            47 => Some(Self::ChangeQuery),
+            48 => Some(Self::ChangeRelease),
             _ => None,
         }
     }
@@ -361,7 +393,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
@@ -397,7 +429,7 @@ mod tests {
 
     #[test]
     fn every_method_number_round_trips_and_is_listed() {
-        for number in 0..=31u16 {
+        for number in 0..=64u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(method) = method {
