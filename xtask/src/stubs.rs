@@ -263,11 +263,11 @@ fn stub_methods(sources: &Sources) -> BTreeSet<String> {
 const NEUTRAL: [&str; 4] = ["open", "openat", "close", "drop"];
 
 /// Stubs the reading above does not see, each confirmed by hand in relibc's
-/// sources: `mkdtemp` reaches `Sys::mkdir` through a closure it passes to
-/// `inner_mktemp`, and `realpath` asks `Sys::fpath` after a
-/// `File::open`. Each name must
-/// be in the XSH inventory (a test of `coverage`).
-pub(crate) const CONFIRMED: [&str; 2] = ["mkdtemp", "realpath"];
+/// sources. None now: `mkdtemp` reaches `Sys::mkdir` through a closure and
+/// `realpath` asked `Sys::fpath` after a `File::open`, and both work since
+/// 5i-5 (`Sys::mkdirat` and `Sys::realpath` are the platform's). Each name
+/// must be in the XSH inventory (a test of `coverage`).
+pub(crate) const CONFIRMED: [&str; 0] = [];
 
 /// The public functions of relibc that answer ENOSYS on stafeto, and the
 /// functions behind them: a function is a stub when it calls at least one
@@ -471,7 +471,6 @@ pub unsafe extern \"C\" fn mmap(len: usize) -> c_int {
                 "alarm",
                 "alarm_timespec",
                 "mkdtemp",
-                "realpath", // confirmed by hand; the test sources lack it
                 "remove",
                 "statvfs"
             ]
