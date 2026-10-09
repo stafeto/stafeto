@@ -775,6 +775,8 @@ static int exec_spawning(void) {
 #if CHANGE_STEPS
 extern int files_change_stages(void);
 extern int files_closed_sessions(int count);
+extern int files_gone_child(int exec);
+extern int files_gone_places(void);
 #endif
 #if NAMES_PROBE
 extern int files_names_pipe(void);
@@ -1000,6 +1002,63 @@ static int steps_branch(void) {
 #include "names-volley.c"
 #endif
 
+#if CHANGE_STEPS
+/* A process that goes in the middle of a prepaid rename of a directory over
+ * an empty one, once with _exit and once with execve: the service gives back
+ * the job, the names stay where they were, and the next volley gets all 24
+ * places of the side table of the root. */
+static int gone_pair(const char *a, const char *b) {
+    char path[48];
+    snprintf(path, sizeof path, "/tmp/gn/%s", a);
+    if (mkdir(path, 0755) != 0) return 1;
+    snprintf(path, sizeof path, "/tmp/gn/%s", b);
+    return mkdir(path, 0755) != 0;
+}
+
+static int gone_exists(const char *name) {
+    char path[48];
+    struct stat st;
+    snprintf(path, sizeof path, "/tmp/gn/%s", name);
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int names_gone(void) {
+    static const char *const names[2][4] = {{"p1", "q1", "p2", "q2"}, {"r1", "s1", "r2", "s2"}};
+    if (mkdir("/tmp/gn", 0755) != 0) return 1;
+    for (int exec = 0; exec < 2; exec++) {
+        const char *const *n = names[exec];
+        if (gone_pair(n[0], n[1]) || gone_pair(n[2], n[3])) return 2;
+        pid_t pid = -1;
+        if (steps_spawn(&pid, "gonechild", exec ? "1" : "0") != 0) return 3;
+        int status = -1;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 7) {
+            printf("posix-procs: steps: the %s child ended with status %#x\n",
+                   exec ? "execve" : "_exit", status);
+            return 4;
+        }
+        /* The first pair moved, the second did not: no effect of the job. */
+        if (gone_exists(n[0]) || !gone_exists(n[1]) || !gone_exists(n[2]) || !gone_exists(n[3])) {
+            printf("posix-procs: steps: names after the %s child are not as they were\n",
+                   exec ? "execve" : "_exit");
+            return 5;
+        }
+        if (files_gone_places() != 0) {
+            printf("posix-procs: steps: the places of the job of the %s child stayed taken\n",
+                   exec ? "execve" : "_exit");
+            return 6;
+        }
+        char path[48];
+        for (int i = 1; i < 4; i++) {
+            snprintf(path, sizeof path, "/tmp/gn/%s", n[i]);
+            if (rmdir(path) != 0) return 7;
+        }
+    }
+    if (rmdir("/tmp/gn") != 0) return 8;
+    printf("posix-procs: names gone ok\n");
+    return 0;
+}
+#endif
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
@@ -1011,6 +1070,13 @@ static int steps_run(void) {
     int volley = names_volley();
     if (volley) {
         printf("posix-procs: steps: the names volley failed %d\n", volley);
+        return 6;
+    }
+#endif
+#if CHANGE_STEPS
+    int gone = names_gone();
+    if (gone) {
+        printf("posix-procs: steps: the names gone probe failed %d\n", gone);
         return 6;
     }
 #endif
@@ -1904,6 +1970,7 @@ static int role(const char *name) {
     if (strcmp(name, "steps") == 0) return steps_run();
 #if CHANGE_STEPS
     if (strcmp(name, "volley") == 0) return vz_child();
+    if (strcmp(name, "gonechild") == 0) return files_gone_child(atoi(argv_seen[2]));
 #endif
     if (strcmp(name, "branch") == 0) return steps_branch();
     if (strcmp(name, "armed") == 0) return steps_armed();

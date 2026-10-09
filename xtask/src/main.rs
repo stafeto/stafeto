@@ -3711,6 +3711,9 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
         ));
     }
     find("names volley ok")?;
+    // A process that goes in the middle of a prepaid rename, by _exit and by
+    // execve: the names stay, and the places of the root come back.
+    find("names gone ok")?;
     Ok(shown.iter().map(|line| (*line).clone()).collect())
 }
 
@@ -6844,6 +6847,7 @@ mod tests {
             repeats,
             "posix-procs: names volley in directories: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 120, the most restarts of one rename 31, the longest rename 98000000 ticks, 6879297680 ticks",
             "posix-procs: names volley ok",
+            "posix-procs: names gone ok",
         ]
         .iter()
         .map(|line| (*line).to_owned())
@@ -6881,6 +6885,9 @@ mod tests {
         let mut without_directories = names_log(good);
         without_directories.retain(|line| !line.contains("in directories"));
         assert!(super::names_lines(&without_directories).is_err());
+        let mut without_gone = names_log(good);
+        without_gone.retain(|line| !line.contains("names gone ok"));
+        assert!(super::names_lines(&without_gone).is_err());
         let mut short_directories = names_log(good);
         for line in &mut short_directories {
             if line.contains("in directories") {

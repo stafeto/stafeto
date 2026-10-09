@@ -830,3 +830,133 @@ pub extern "C" fn files_closed_sessions(count: i32) -> i32 {
     }
     0
 }
+
+unsafe extern "C" {
+    fn _exit(code: i32) -> !;
+    fn execve(
+        path: *const core::ffi::c_char,
+        argv: *const *const core::ffi::c_char,
+        envp: *const *const core::ffi::c_char,
+    ) -> i32;
+    fn nanosleep(request: *const [i64; 2], remaining: *mut [i64; 2]) -> i32;
+}
+
+/// The process that goes in the middle of a prepaid rename. A first rename
+/// of one directory over an empty one runs to its end, to count its steps;
+/// the same rename of the second pair is started, paid and taken to a step
+/// a few before its last (the count of the first varies by one or two). The
+/// process then ends with `_exit(7)` (`exec` 0) or calls `execve` of a program that ends with 7 (`exec` 1), with the job alive in
+/// its session. The parent looks at the names and at the places afterwards
+/// (`files_gone_places`). The pairs are in /tmp/gn: p1 q1 p2 q2 for the
+/// first, r1 s1 r2 s2 for the second.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_gone_child(exec: i32) -> i32 {
+    fn run(exec: i32) -> Result<(), i32> {
+        let raw =
+            posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())).map_err(|_| 90)?;
+        let original =
+            core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+        let files = super::open_stages::clone_bound(&original, &[]).map_err(|_| 91)?;
+        let (dry_old, dry_new, old, new): (&[u8], &[u8], &[u8], &[u8]) = if exec == 0 {
+            (b"/tmp/gn/p1", b"/tmp/gn/q1", b"/tmp/gn/p2", b"/tmp/gn/q2")
+        } else {
+            (b"/tmp/gn/r1", b"/tmp/gn/s1", b"/tmp/gn/r2", b"/tmp/gn/s2")
+        };
+        let dry = req(0, 1, ChangeOp::Rename, dry_old);
+        start(&files, &dry).map_err(|_| 92)?;
+        second(&files, dry.key, Base::Absolute, dry_new).map_err(|_| 93)?;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 10_000 {
+                return Err(94);
+            }
+            if step(&files, dry.key, false).map_err(|_| 95)?.is_some() {
+                break;
+            }
+        }
+        release(&files, dry.key).map_err(|_| 96)?;
+        let job = req(1, 2, ChangeOp::Rename, old);
+        start(&files, &job).map_err(|_| 97)?;
+        second(&files, job.key, Base::Absolute, new).map_err(|_| 98)?;
+        for taken in 1..steps.saturating_sub(5) {
+            if step(&files, job.key, false).map_err(|_| 99)?.is_some() {
+                rt::println!("posix-files: gone: the job ended at step {taken} of {steps}");
+                return Err(100);
+            }
+        }
+        // The job is paid and has staged nearly all its steps. The process
+        // goes with it.
+        if exec == 0 {
+            // SAFETY: relibc's _exit.
+            unsafe { _exit(7) };
+        }
+        let program = c"/bin/procs-child";
+        let argv = [
+            c"procs-child".as_ptr(),
+            c"exit7".as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp = [core::ptr::null()];
+        // SAFETY: relibc's execve over live C strings.
+        unsafe { execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+        Err(101)
+    }
+    run(exec).err().unwrap_or(0)
+}
+
+/// Whether the root can hold all 24 places of the side table again: two
+/// sessions start 16 and 8 renames, which a job left behind by a process that
+/// went would cut to 23 until the service has cancelled it. The service does
+/// it a job a turn of its maintenance, so the volley is repeated for a second
+/// (a hundred times with a pause of 10 ms). 0 when all 24 went through; 1 when the places stayed taken.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_gone_places() -> i32 {
+    fn volley(a: &Files, b: &Files, generation: u64) -> Result<bool, i32> {
+        let mut held: [Option<(&Files, OpenKey)>; 24] = [None; 24];
+        let mut full = false;
+        for (i, entry) in held.iter_mut().enumerate() {
+            let (files, slot) = if i < 16 {
+                (a, i as u32)
+            } else {
+                (b, (i - 16) as u32)
+            };
+            let job = req(slot, generation, ChangeOp::Rename, b"/tmp/gn");
+            match start(files, &job) {
+                Ok(_) => *entry = Some((files, job.key)),
+                Err(Status::Unknown(code)) if code == proto_fs::JOBS_FULL => {
+                    full = true;
+                    break;
+                }
+                Err(_) => return Err(110),
+            }
+        }
+        for (files, key) in held.into_iter().flatten() {
+            release(files, key).map_err(|_| 111)?;
+        }
+        Ok(!full)
+    }
+    fn run() -> Result<bool, i32> {
+        let raw =
+            posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())).map_err(|_| 90)?;
+        let original =
+            core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+        let a = super::open_stages::clone_bound(&original, &[]).map_err(|_| 91)?;
+        let b = super::open_stages::clone_bound(&original, &[]).map_err(|_| 91)?;
+        for attempt in 0..100u64 {
+            if volley(&a, &b, 10 + attempt)? {
+                return Ok(true);
+            }
+            let ten_ms = [0i64, 10_000_000];
+            let mut left = [0i64; 2];
+            // SAFETY: relibc's nanosleep over live arrays.
+            unsafe { nanosleep(&ten_ms, &mut left) };
+        }
+        Ok(false)
+    }
+    match run() {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(code) => code,
+    }
+}
