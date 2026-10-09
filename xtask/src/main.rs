@@ -3705,7 +3705,10 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     // name elsewhere, the rename of a directory under a chain of 64 against
     // the mode of a file: both end, with no restart. G4 and G5 (the same
     // directory, the moves of directories) are printed for the report.
-    for (tag, what) in [("G2", "a path of 32 links"), ("G3", "the rename of a directory")] {
+    for (tag, what) in [
+        ("G2", "a path of 32 links"),
+        ("G3", "the rename of a directory"),
+    ] {
         let line = find(&format!("names interference {tag}:"))?;
         if !line.contains("0 restarts, finished within 10 s: yes") || !line.contains(what) {
             return Err(format!(
@@ -3741,8 +3744,8 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
                 .ok_or_else(|| format!("the volley ({what}) line has no {number:?}: {volley}"))?;
         }
         // G6: the wait for room keeps the repeats of a thread down.
-        let repeats = qemu::number_after(&lines, "the most repeats of JOBS_FULL of one thread ")
-            .unwrap_or(0);
+        let repeats =
+            qemu::number_after(&lines, "the most repeats of JOBS_FULL of one thread ").unwrap_or(0);
         if repeats > VOLLEY_REPEATS_MAX {
             return Err(format!(
                 "G6: a thread of the volley ({what}) repeated its Start {repeats} times, past \
@@ -3805,8 +3808,14 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     let log = dir.join("process-steps.log");
     std::fs::write(&log, outcome.lines.join("\n") + "\n")
         .map_err(|e| format!("{}: {e}", log.display()))?;
-    if outcome.lines.iter().any(|l| l.contains("posix-procs: names volley ok"))
-        && !outcome.lines.iter().any(|l| l.contains("posix-procs: names gone ok"))
+    if outcome
+        .lines
+        .iter()
+        .any(|l| l.contains("posix-procs: names volley ok"))
+        && !outcome
+            .lines
+            .iter()
+            .any(|l| l.contains("posix-procs: names gone ok"))
     {
         let tail: Vec<&String> = outcome.lines.iter().rev().take(6).collect();
         return Err(format!(

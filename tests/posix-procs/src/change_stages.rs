@@ -1064,7 +1064,10 @@ pub extern "C" fn files_bounds_start() -> i32 {
         )
         .map_err(|_| 93)?;
         if done.result != proto_fs::NO_ENTRY {
-            rt::println!("posix-procs: bounds: the rename of 511 bytes gave {}", done.result);
+            rt::println!(
+                "posix-procs: bounds: the rename of 511 bytes gave {}",
+                done.result
+            );
             return Err(94);
         }
         files.close_exact(held).map_err(|_| 95)?;
@@ -1127,7 +1130,11 @@ pub extern "C" fn files_bounds_stale() -> i32 {
         }
         // The empty directory goes and comes back.
         expect(run(&files, &rmdir(3, 53, b"/tmp/bs/b2"), None), 0, 110)?;
-        expect(run(&files, &mkdir(3, 54, b"/tmp/bs/b2", 0o755), None), 0, 111)?;
+        expect(
+            run(&files, &mkdir(3, 54, b"/tmp/bs/b2", 0o755), None),
+            0,
+            111,
+        )?;
         let mut last = None;
         for _ in 0..10_000 {
             if let Some(done) = step(&files, job.key, false).map_err(|_| 112)? {
