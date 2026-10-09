@@ -2744,8 +2744,12 @@ impl Fs {
             let Some(local) = fds.resolvers.iter().position(|&id| id == 0) else {
                 return status(proto_fs::TOO_MANY_OPEN_FILES);
             };
+            // The full side table and the full share of the root keep the key
+            // free and make no effect: JOBS_FULL, as in Change, and the client
+            // sleeps and asks again. TOO_MANY_OPEN_FILES stays for what the
+            // client counts itself and for a key taken by another generation.
             let Some(slot) = self.jobs.iter().position(Option::is_none) else {
-                return status(proto_fs::TOO_MANY_OPEN_FILES);
+                return status(proto_fs::JOBS_FULL);
             };
             let Some(generation) = self.job_generations[slot]
                 .checked_add(1)
@@ -2755,7 +2759,13 @@ impl Fs {
             };
             let charge = match self.ram.storage.charge_preparation(fds.root) {
                 Ok(charge) => charge,
-                Err(code) => return status(code),
+                Err(code) => {
+                    return status(if code == proto_fs::TOO_MANY_OPEN_FILES {
+                        proto_fs::JOBS_FULL
+                    } else {
+                        code
+                    });
+                }
             };
             let data = match ramfs::data::Journal::capture(&mut self.ram, fds, args) {
                 Ok(data) => data,

@@ -291,6 +291,54 @@ fn retained_completions(files: &Files, held: PreparedOpen) -> Result<(), i32> {
     Ok(())
 }
 
+/// The share of a root in the table of jobs (96) is full while no session
+/// holds more than its own 16: the Start is refused with JOBS_FULL (the client
+/// sleeps and asks again), and the refused Start leaves nothing behind. The
+/// caller's session holds 16 jobs already; clones of it take 15 each, so that
+/// the binding of the next clone (which takes a place of the share while it
+/// lasts) still finds one.
+fn full_table(files: &Files, held: PreparedOpen) -> Result<(), i32> {
+    let mut sessions: [Option<Files>; 8] = [const { None }; 8];
+    let mut refused = None;
+    'sessions: for session in sessions.iter_mut() {
+        let child = super::open_stages::clone_bound(files, &[held.fd]).map_err(|_| 150)?;
+        for slot in 0..15 {
+            match child.data_start_once(args(held, slot, DataKind::PWrite, 1, 0)) {
+                Ok(_) => {}
+                Err(error) => {
+                    refused = Some((error, slot));
+                    *session = Some(child);
+                    break 'sessions;
+                }
+            }
+        }
+        *session = Some(child);
+    }
+    let Some((error, taken)) = refused else {
+        return Err(151);
+    };
+    if error != Status::Unknown(proto_fs::JOBS_FULL) {
+        return Err(152);
+    }
+    // The refused Start is asked again with the same key, and refused again.
+    let last = sessions.iter().flatten().last().ok_or(153)?;
+    if last.data_start_once(args(held, taken, DataKind::PWrite, 1, 0)) != Err(error) {
+        return Err(154);
+    }
+    // A job that goes frees a place for the Start.
+    let first = sessions.iter().flatten().next().ok_or(155)?;
+    cleanup(first, args(held, 0, DataKind::PWrite, 1, 0).key, false).map_err(|_| 156)?;
+    last.data_start_once(args(held, taken, DataKind::PWrite, 1, 0))
+        .map_err(|_| 157)?;
+    for child in sessions.iter().flatten() {
+        for slot in 0..15 {
+            // A key without a job is NO_ENTRY or retired; the others end.
+            let _ = cleanup(child, args(held, slot, DataKind::PWrite, 1, 0).key, false);
+        }
+    }
+    Ok(())
+}
+
 fn run(files: &Files) -> Result<(), i32> {
     let held = open(files, 1, b"/tmp/data-stages").map_err(|_| 1)?;
     let input = [0x57; proto_fs::MAX_WRITE];
@@ -298,6 +346,13 @@ fn run(files: &Files) -> Result<(), i32> {
     let (_, job) = files.data_start_once(write).map_err(|_| 2)?;
     if files.data_start_once(write) != Ok((DataPhase::Captured, job)) {
         return Err(3);
+    }
+    // The place of the key is held by the job of generation 1: a Start of
+    // generation 2 at the same place is TOO_MANY_OPEN_FILES, never JOBS_FULL.
+    let mut later = write;
+    later.key.generation = 2;
+    if files.data_start_once(later) != Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) {
+        return Err(158);
     }
     if files.open_cancel(job) != Err(Status::Unknown(proto_fs::PERMISSION))
         || files.open_advance(job, false) != Err(Status::Unknown(proto_fs::PERMISSION))
@@ -438,6 +493,7 @@ fn run(files: &Files) -> Result<(), i32> {
     {
         return Err(51);
     }
+    full_table(files, reused)?;
     for slot in 8..24 {
         cleanup(
             files,

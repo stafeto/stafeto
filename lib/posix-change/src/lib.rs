@@ -176,8 +176,9 @@ pub fn drive_data<W: DataWire>(wire: &mut W, args: &DataStart) -> Result<(), Fai
         }
         match wire.start(args) {
             Ok((_, job)) => break job,
-            // No place for the job in the service: the table is full.
-            Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => wire.wait_for_room(),
+            // JOBS_FULL (no place for the job in the service) waits for room;
+            // TOO_MANY_OPEN_FILES (the key is taken by another generation, or
+            // the client's own count is wrong) is an I/O error, as in Change.
             Err(status) => again(wire, status, true)?,
         }
     };

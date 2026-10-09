@@ -616,6 +616,7 @@ struct DataModel {
     commits: u32,
     retired: bool,
     full: u32,
+    key_taken: bool,
     deferred: u32,
     step_refusal: Option<u32>,
     commit_refusal: Option<u32>,
@@ -659,9 +660,12 @@ impl DataWire for DataModel {
     }
     fn start(&mut self, args: &DataStart) -> Result<(DataPhase, u64), Status> {
         self.starts += 1;
+        if self.key_taken {
+            return Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES));
+        }
         if self.full > 0 {
             self.full -= 1;
-            return Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES));
+            return Err(Status::Unknown(proto_fs::JOBS_FULL));
         }
         if self.retired {
             return Err(Status::Unknown(proto_fs::OPEN_RETIRED));
@@ -786,6 +790,19 @@ fn a_full_table_of_the_service_makes_the_start_wait_and_go_again() {
     };
     assert_eq!(drive_data(&mut model, &data_args()), Ok(()));
     assert_eq!((model.starts, model.waits), (5, 4));
+}
+
+/// The place of the key held by another job of the session is no table full:
+/// waiting would not end (a Release that never got its reply leaves the job
+/// at the place of the key), so the answer is an I/O error after one Start.
+#[test]
+fn a_key_taken_by_another_generation_is_an_io_error_without_waiting() {
+    let mut model = DataModel {
+        key_taken: true,
+        ..DataModel::default()
+    };
+    assert_eq!(drive_data(&mut model, &data_args()), Err(Failure::Io));
+    assert_eq!((model.starts, model.waits), (1, 0));
 }
 
 #[test]
