@@ -565,11 +565,17 @@ pub fn probe_no_pipes_session(on: bool) {
 const SPAWN_WINDOW: usize = 0x3000_0000;
 static SPAWN_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::raising();
 
-/// A file action of posix_spawn (spawn.h): open `path` with `flags` at
-/// `fd`, close `fd`, dup2, chdir and fchdir.
+/// A file action of posix_spawn (spawn.h): open `path` with `flags` (and
+/// `mode` when it creates the file) at `fd`, close `fd`, dup2, chdir and
+/// fchdir.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileAction<'a> {
-    Open { fd: u32, path: &'a [u8], flags: i32 },
+    Open {
+        fd: u32,
+        path: &'a [u8],
+        flags: i32,
+        mode: u32,
+    },
     Close(u32),
     Dup2(u32, u32),
     Chdir(&'a [u8]),
@@ -587,6 +593,9 @@ struct Shadow {
     opened: [Option<u32>; posix_fs::OPEN_MAX],
     cwd: [u8; proto_loader::PATH_MAX],
     cwd_len: usize,
+    /// The creation mask the child starts with: the mode of a file an Open
+    /// action creates is cut by it.
+    umask: u32,
     terminal_opens: [proto_loader::TerminalAction; proto_loader::TERMINAL_ACTIONS],
     terminal_count: usize,
     terminal_open_count: usize,
@@ -602,6 +611,7 @@ impl Shadow {
             opened: [None; posix_fs::OPEN_MAX],
             cwd: [0; proto_loader::PATH_MAX],
             cwd_len: 0,
+            umask: 0,
             terminal_opens: [proto_loader::TerminalAction::default();
                 proto_loader::TERMINAL_ACTIONS],
             terminal_count: 0,
@@ -631,6 +641,14 @@ impl Shadow {
 
     fn cwd(&self) -> &[u8] {
         &self.cwd[..self.cwd_len]
+    }
+
+    /// The child starts in the directory with this canonical path.
+    fn set_cwd(&mut self, canonical: &[u8]) {
+        let mut copy = [0; proto_loader::PATH_MAX];
+        copy[..canonical.len()].copy_from_slice(canonical);
+        self.cwd = copy;
+        self.cwd_len = canonical.len();
     }
 
     /// `path` against the shadow's current directory, into `out`.
@@ -696,7 +714,7 @@ impl Shadow {
 
     /// One file action, in order ([P24-SPAWN]).
     fn apply(&mut self, action: FileAction<'_>) -> Result<(), i32> {
-        use crate::constants::{EBADF, ENOSYS, ENOTDIR};
+        use crate::constants::{EBADF, ENOTDIR};
         let slot = |fd: u32| -> Result<usize, i32> {
             ((fd as usize) < posix_fs::OPEN_MAX)
                 .then_some(fd as usize)
@@ -712,13 +730,18 @@ impl Shadow {
                 // dup2 names twice ([P24-SPAWN]).
                 self.replace_entry(slot(new)?, Some((target, false)), self.pending[slot(fd)?])?;
             }
-            FileAction::Open { fd, path, flags } => {
+            FileAction::Open {
+                fd,
+                path,
+                flags,
+                mode,
+            } => {
                 let place = slot(fd)?;
                 let mut full = [0; proto_loader::PATH_MAX];
                 let full = self.absolute(path, &mut full)?;
                 use crate::constants::{
-                    EINVAL, EMFILE, O_ACCMODE, O_CHANGES, O_CLOEXEC, O_CLOFORK, O_DIRECTORY,
-                    O_NOCTTY, O_NONBLOCK,
+                    EINVAL, EMFILE, O_ACCMODE, O_APPEND, O_CHANGES, O_CLOEXEC, O_CLOFORK, O_CREAT,
+                    O_DIRECTORY, O_EXCL, O_NOCTTY, O_NONBLOCK, O_TRUNC,
                 };
                 if flags
                     & !(O_ACCMODE
@@ -727,7 +750,11 @@ impl Shadow {
                         | O_CLOFORK
                         | O_CHANGES
                         | O_NOCTTY
-                        | O_NONBLOCK)
+                        | O_NONBLOCK
+                        | O_CREAT
+                        | O_EXCL
+                        | O_TRUNC
+                        | O_APPEND)
                     != 0
                     || flags & O_ACCMODE == O_ACCMODE
                 {
@@ -767,7 +794,12 @@ impl Shadow {
                 // FD_CLOEXEC, so that an exec or spawn of another thread in
                 // the meantime does not inherit it. The child's flag is the
                 // action's.
-                let own = crate::open(full, flags | crate::constants::O_CLOEXEC)?;
+                let own = crate::open_policy(
+                    full,
+                    flags | crate::constants::O_CLOEXEC,
+                    mode,
+                    self.umask,
+                )?;
                 let own = own as u32;
                 let target =
                     crate::shared::with_files(|files| files.target(own).map_err(crate::error));
@@ -784,13 +816,16 @@ impl Shadow {
                 // The child starts in the canonical path of the directory.
                 let mut canonical = [0; crate::names::MAX_PATH + 1];
                 let len = crate::names::directory_path(full, &mut canonical)?;
-                let mut copy = [0; proto_loader::PATH_MAX];
-                copy[..len].copy_from_slice(&canonical[..len]);
-                self.cwd = copy;
-                self.cwd_len = len;
+                self.set_cwd(&canonical[..len]);
             }
-            // The layer keeps no path of a descriptor yet.
-            FileAction::Fchdir(_) => return Err(ENOSYS),
+            FileAction::Fchdir(fd) => {
+                let (target, _) = self.entries[slot(fd)?].ok_or(EBADF)?;
+                // The directory the descriptor names now, by the path the
+                // service gives it; a descriptor of another service is ENOTDIR.
+                let mut canonical = [0; crate::names::MAX_PATH + 1];
+                let len = crate::names::descriptor_path(target, &mut canonical)?;
+                self.set_cwd(&canonical[..len]);
+            }
         }
         Ok(())
     }
@@ -1110,8 +1145,27 @@ pub fn spawn_file<'s, 'a>(
     attributes: SpawnAttributes,
     actions: impl Iterator<Item = FileAction<'a>>,
 ) -> Result<i32, i32> {
+    spawn_search(path, None, argv, envp, attributes, actions)
+}
+
+/// posix_spawnp: `file` is a name with no slash, searched in the
+/// directories of `search` (the value of PATH, `None` for the plain
+/// posix_spawn of `file` as a path). The search comes after the file
+/// actions, as an execvp in the child would make it: in the directory the
+/// actions left as the current one, with the descriptors they made. A
+/// directory that is empty stands for the current directory. The first file
+/// the caller may execute is the program; ENOENT when none exists, EACCES
+/// when one exists that the caller may not execute.
+pub fn spawn_search<'s, 'a>(
+    file: &[u8],
+    search: Option<&[u8]>,
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    attributes: SpawnAttributes,
+    actions: impl Iterator<Item = FileAction<'a>>,
+) -> Result<i32, i32> {
     use crate::constants::{EINVAL, ENOENT};
-    if path.is_empty() {
+    if file.is_empty() {
         return Err(ENOENT);
     }
     let pgroup = attributes.pgroup;
@@ -1119,12 +1173,63 @@ pub fn spawn_file<'s, 'a>(
         return Err(EINVAL);
     }
     let mut shadow = Shadow::take()?;
+    shadow.umask = attributes.umask;
     let spawned = actions
         .into_iter()
         .try_for_each(|action| shadow.apply(action))
-        .and_then(|()| spawn_shadowed(path, argv, envp, attributes, &shadow));
+        .and_then(|()| match search {
+            None => spawn_shadowed(file, argv, envp, attributes, &shadow),
+            Some(search) => {
+                let mut program = [0; proto_loader::PATH_MAX];
+                let program = shadow.find_program(file, search, &mut program)?;
+                spawn_shadowed(program, argv, envp, attributes, &shadow)
+            }
+        });
     shadow.finish();
     spawned
+}
+
+impl Shadow {
+    /// The first directory of `search` with a file `file` the caller may
+    /// execute, as an absolute path against the shadow's current directory.
+    fn find_program<'o>(
+        &self,
+        file: &[u8],
+        search: &[u8],
+        out: &'o mut [u8; proto_loader::PATH_MAX],
+    ) -> Result<&'o [u8], i32> {
+        use crate::constants::{EACCES, ENOENT};
+        const X_OK: i32 = 1;
+        let mut denied = false;
+        for directory in search.split(|&byte| byte == b':') {
+            let directory: &[u8] = if directory.is_empty() {
+                b"."
+            } else {
+                directory
+            };
+            let mut candidate = [0; proto_loader::PATH_MAX];
+            let length = directory.len() + 1 + file.len();
+            if length > candidate.len() {
+                continue;
+            }
+            candidate[..directory.len()].copy_from_slice(directory);
+            candidate[directory.len()] = b'/';
+            candidate[directory.len() + 1..length].copy_from_slice(file);
+            let mut full = [0; proto_loader::PATH_MAX];
+            let Ok(full) = self.absolute(&candidate[..length], &mut full) else {
+                continue;
+            };
+            match crate::names::faccessat(crate::names::AT_FDCWD, full, X_OK, 0) {
+                Ok(()) => {
+                    out[..full.len()].copy_from_slice(full);
+                    return Ok(&out[..full.len()]);
+                }
+                Err(EACCES) => denied = true,
+                Err(_) => {}
+            }
+        }
+        Err(if denied { EACCES } else { ENOENT })
+    }
 }
 
 /// spawn_file once the file actions shaped the child's descriptors and
@@ -1782,6 +1887,7 @@ pub fn probe_addopen_cloexec(path: &[u8]) -> i32 {
         fd: 20,
         path,
         flags: 0,
+        mode: 0,
     }) {
         Ok(()) => {
             let own = shadow.opened.iter().flatten().next().copied();

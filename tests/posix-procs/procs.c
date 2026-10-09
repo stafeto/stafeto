@@ -1874,6 +1874,8 @@ static int channel_child(const char *name);
 #include "jobs.c"
 #endif
 
+static void spawn_names(void);
+
 static int role(const char *name) {
 #if PENDING_OPEN_PROBE
     if (strcmp(name, "pendingfork") == 0) return check_pending_fork();
@@ -1993,6 +1995,16 @@ static int role(const char *name) {
         if (!getcwd(cwd, sizeof cwd)) return 1;
         printf("posix-procs: the child's directory is %s\n", cwd);
         return strcmp(cwd, "/bin") == 0 ? 0 : 2;
+    }
+    if (strcmp(name, "spawnnames") == 0) {
+        /* A child of its own: the environment this stage sets stays out of
+         * the process whose heap other stages measure. */
+        spawn_names();
+        return failures != 0;
+    }
+    if (strcmp(name, "writefd6") == 0) {
+        /* The file the open action made at 6: two bytes. */
+        return write(6, "hi", 2) == 2 ? 0 : 1;
     }
     if (strcmp(name, "execls") == 0) {
         char *ls[] = {"ls", "/etc", NULL};
@@ -2356,6 +2368,113 @@ static void descriptors(void) {
     posix_spawn_file_actions_addchdir(&actions, "/bin");
     run_with("procs-child", "cwd", NULL, &actions);
     posix_spawn_file_actions_destroy(&actions);
+}
+
+/* posix_spawnp of `file` in the role `name`, with PATH `search` in the
+ * environment of the caller. The error of the call, or the status of the
+ * child. */
+static int spawnp_with(const char *file, const char *search, const char *name,
+                       const posix_spawn_file_actions_t *actions, int *status) {
+    char *argv[] = {"procs-child", (char *)name, NULL};
+    char *envp[] = {NULL};
+    char *saved = getenv("PATH");
+    char keep[256];
+    if (saved) snprintf(keep, sizeof keep, "%s", saved);
+    setenv("PATH", search, 1);
+    pid_t pid = -1;
+    int e = posix_spawnp(&pid, file, actions, NULL, argv, envp);
+    if (saved) setenv("PATH", keep, 1);
+    else unsetenv("PATH");
+    if (e != 0) return e;
+    int wait_status = 0;
+    if (waitpid(pid, &wait_status, 0) != pid) return -1;
+    *status = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : 1000;
+    return 0;
+}
+
+/* Stage 8b (5i-5), the names of posix_spawn, run in a child of the probe: an open action that creates,
+ * truncates and appends with its mode, the search of PATH after the actions
+ * of the files, and fchdir. */
+static void spawn_names(void) {
+    posix_spawn_file_actions_t actions;
+    int status = -1;
+    mode_t old = umask(027);
+    unlink("/tmp/spawned");
+    /* The mode of the file the action creates, cut by the mask. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 6, "/tmp/spawned", O_WRONLY | O_CREAT | O_EXCL, 0666);
+    run_with("/bin/procs-child", "writefd6", NULL, &actions);
+    struct stat st;
+    expect("the created file has the mode 0640", stat("/tmp/spawned", &st) == 0 && (st.st_mode & 0777) == 0640, 1);
+    expect("and the two bytes of the child", stat("/tmp/spawned", &st) == 0 && st.st_size == 2, 1);
+    /* O_EXCL refuses the existing file before the child lives. */
+    pid_t pid = -1;
+    char *argv[] = {"procs-child", "writefd6", NULL};
+    char *envp[] = {NULL};
+    expect("O_EXCL of an existing file", posix_spawn(&pid, "/bin/procs-child", &actions, NULL, argv, envp), EEXIST);
+    posix_spawn_file_actions_destroy(&actions);
+    /* O_APPEND adds, O_TRUNC empties. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 6, "/tmp/spawned", O_WRONLY | O_APPEND, 0);
+    run_with("/bin/procs-child", "writefd6", NULL, &actions);
+    posix_spawn_file_actions_destroy(&actions);
+    expect("O_APPEND adds two bytes", stat("/tmp/spawned", &st) == 0 && st.st_size == 4, 1);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 6, "/tmp/spawned", O_WRONLY | O_TRUNC, 0);
+    run_with("/bin/procs-child", "writefd6", NULL, &actions);
+    posix_spawn_file_actions_destroy(&actions);
+    expect("O_TRUNC empties before the two bytes", stat("/tmp/spawned", &st) == 0 && st.st_size == 2, 1);
+    expect("O_CREAT of the parent's table leaves no descriptor behind", fstat(6, &st) == -1 && errno == EBADF, 1);
+    unlink("/tmp/spawned");
+    umask(old);
+
+    /* PATH is searched after the actions: from the directory they chose,
+     * the empty element is that directory, and the first match wins. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addchdir(&actions, "/bin");
+    expect("posix_spawnp from the directory of addchdir", spawnp_with("procs-child", ".", "cwd", &actions, &status), 0);
+    expect("and the child stands in /bin", status, 0);
+    status = -1;
+    expect("an empty element of PATH is the directory", spawnp_with("procs-child", "/nonexistent::/etc", "cwd", &actions, &status), 0);
+    expect("and the child stands in /bin again", status, 0);
+    status = -1;
+    expect("a name that is in the second directory", spawnp_with("procs-child", "/etc:/bin", "cwd", NULL, &status), 0);
+    expect("and the child ran", status == 2 || status == 0, 1);
+    expect("a name that is in no directory", spawnp_with("no-such-program", "/etc:/bin:.", "cwd", &actions, &status), ENOENT);
+    expect("a name in a directory that is not there", spawnp_with("procs-child", "/nonexistent", "cwd", NULL, &status), ENOENT);
+    expect("no directory in PATH", spawnp_with("procs-child", "", "cwd", NULL, &status), ENOENT);
+    posix_spawn_file_actions_destroy(&actions);
+
+    /* fchdir: the directory a descriptor names. */
+    int dirfd = open("/bin", O_RDONLY | O_DIRECTORY);
+    expect("open of /bin", dirfd >= 0, 1);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addfchdir(&actions, dirfd);
+    status = -1;
+    expect("posix_spawnp from the directory of addfchdir", spawnp_with("procs-child", ".", "cwd", &actions, &status), 0);
+    expect("and the child stands in /bin through the descriptor", status, 0);
+    posix_spawn_file_actions_destroy(&actions);
+    int filefd = open("/etc/motd", O_RDONLY);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addfchdir(&actions, filefd);
+    expect("addfchdir of a file", spawnp_with("procs-child", "/bin", "cwd", &actions, &status), ENOTDIR);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addfchdir(&actions, 99);
+    expect("addfchdir of a closed number", spawnp_with("procs-child", "/bin", "cwd", &actions, &status), EBADF);
+    posix_spawn_file_actions_destroy(&actions);
+    /* A descriptor an earlier action closed is closed for fchdir too. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, dirfd);
+    posix_spawn_file_actions_addfchdir(&actions, dirfd);
+    expect("addfchdir after addclose of the same number", spawnp_with("procs-child", "/bin", "cwd", &actions, &status), EBADF);
+    posix_spawn_file_actions_destroy(&actions);
+    close(dirfd);
+    close(filefd);
+    /* The caller is where it was. */
+    char cwd[64];
+    expect("the caller's directory stays", getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, "/") == 0, 1);
+    if (!failures) printf("posix-procs: the names of posix_spawn ok\n");
 }
 
 /* Stage 9, the window of exec: old images that end before ExecCommit, 20
@@ -3906,6 +4025,8 @@ int main(int argc, char **argv) {
     printf("posix-procs: stage names\n");
     names();
 #endif
+    printf("posix-procs: stage spawn_names\n");
+    run_with("/bin/procs-child", "spawnnames", NULL, NULL);
     if (failures != 0) return 1;
     printf("posix-procs: ok\n");
     /* Stage 10: this process is a record of init's table, whose end line
