@@ -3005,6 +3005,28 @@ fn what_another_client_does_between_the_steps_of_an_unlink_restarts_it_only_when
             (0, 0),
             "a write, early {early}"
         );
+        // Bytes through a descriptor (a write that clears set-id bits, a truncation).
+        assert_eq!(
+            unlink_against(
+                |env, other| {
+                    let g = env.lookup(b"/e/g").unwrap();
+                    env.ram.storage.set_attributes(g, 0o6755, 0, 0).unwrap();
+                    let fd = env
+                        .ram
+                        .open_token(other, g, proto_fs::READ_WRITE, ROOT_USER)
+                        .unwrap();
+                    assert_eq!(env.ram.pwrite(other, fd, 0, b"xy", Env::now()), Ok(2));
+                    let mut prep = env.ram.prepare_truncate(other, fd, 1).unwrap();
+                    while !prep.step(&mut env.ram).unwrap() {}
+                    prep.commit(&mut env.ram, Env::now()).unwrap();
+                    while !prep.cancel(&mut env.ram).unwrap() {}
+                    env.ram.close(other, fd).unwrap();
+                },
+                early
+            ),
+            (0, 0),
+            "bytes through a descriptor, early {early}"
+        );
         // A file of the directory of the name: its mode too.
         assert_eq!(unlink_against(chmod(b"/d/h", 0o600), early), (0, 0));
         // Names of another directory, a directory made and a mode of it.
@@ -3115,22 +3137,26 @@ fn by_turns(
 
 #[test]
 fn two_renames_of_directories_that_meet_make_one_success_and_one_refusal_and_no_cycle() {
+    // The parents of the edges are not touched by the other rename: only the
+    // epoch of the moves stands between the two and a cycle.
     let mut env = Env::new();
     let mut fds = session();
-    env.node(ROOT, b"a", DIR, 0o755);
-    env.node(ROOT, b"b", DIR, 0o755);
+    let x = env.node(ROOT, b"x", DIR, 0o755);
+    let y = env.node(ROOT, b"y", DIR, 0o755);
+    env.node(x, b"a", DIR, 0o755);
+    env.node(y, b"b", DIR, 0o755);
     let first = ChangeStart {
         key: key(4, 1),
-        ..op(ChangeOp::Rename, b"/a")
+        ..op(ChangeOp::Rename, b"/x/a")
     };
     let second = ChangeStart {
         key: key(5, 1),
-        ..op(ChangeOp::Rename, b"/b")
+        ..op(ChangeOp::Rename, b"/y/b")
     };
     let [one, two] = by_turns(
         &mut env,
         &mut fds,
-        [(&first, Some(b"/b/a")), (&second, Some(b"/a/b"))],
+        [(&first, Some(b"/y/b/a")), (&second, Some(b"/x/a/b"))],
     );
     // The one that commits second walks its paths again and finds the
     // other directory moved: no entry. Both do not succeed.
@@ -3138,11 +3164,11 @@ fn two_renames_of_directories_that_meet_make_one_success_and_one_refusal_and_no_
     results.sort_unstable();
     assert_eq!(results, [0, NO_ENTRY], "{one:?} {two:?}");
     assert_eq!(one.restarts + two.restarts, 1);
-    // Exactly one of the two names is the root's, the other directory is inside it.
-    let a = env.lookup(b"/a");
-    let b = env.lookup(b"/b");
+    // Exactly one of the two directories is where it was, the other is inside it.
+    let a = env.lookup(b"/x/a");
+    let b = env.lookup(b"/y/b");
     assert!(a.is_ok() != b.is_ok(), "one directory is inside the other");
-    let inside = if a.is_ok() { b"/a/b" } else { b"/b/a" };
+    let inside = if a.is_ok() { b"/x/a/b" } else { b"/y/b/a" };
     assert!(env.lookup(inside).is_ok());
     env.assert_quiet();
 }
