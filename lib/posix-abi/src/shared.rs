@@ -662,9 +662,13 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
 
 /// Final lifetime callbacks perform local transitions and retain remote ownership.
 pub fn detach_open_owner(owner: u64) -> bool {
-    crate::open_driver::detach(owner)
+    let opens = crate::open_driver::detach(owner);
+    // Both run: the records of the Change jobs lose the owner too.
+    let changes = crate::change::detach(owner);
+    opens && changes
 }
 /// A surviving caller or collector pays one cleanup phase outside the layer locks.
 pub fn help_open_recovery() {
     crate::open_driver::help();
+    crate::change::help();
 }

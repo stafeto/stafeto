@@ -47,10 +47,11 @@ pub(crate) fn open(
     descriptor_flags: DescriptorFlags,
 ) -> Result<u32, i32> {
     let owner = OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)?;
-    let (token, mut claim) = crate::shared::with_files(|files| {
-        files
-            .begin_open_record(owner, flags & 3, descriptor_flags)
-            .map_err(crate::error)
+    // The record stands for one job of the session: a place of the table of
+    // sixteen is taken first, and waited for when none is free.
+    let here = crate::change::frame();
+    let (token, mut claim) = crate::change::take_place(owner, here, |files| {
+        files.begin_open_record(owner, flags & 3, descriptor_flags)
     })?;
     let mut recovery = Recovery::starting(flags & 3, descriptor_flags).map_err(crate::error)?;
     let files = transport.files();
@@ -244,7 +245,9 @@ pub(crate) fn detach(owner: u64) -> bool {
 }
 
 /// Wake uses the pinned header after releasing FILES_LOCK, including exact slot reuse.
+/// A record that goes frees a place of a job too: its waiters wake as well.
 fn wake(token: OpenToken) {
+    crate::change::wake_places();
     let address =
         crate::shared::with_files(|files| files.open_wait_address(token).map_err(crate::error));
     if let Ok(address) = address {
