@@ -12,6 +12,7 @@
 extern int files_loss_arm(int kind);
 extern int files_loss_lost(void);
 extern int files_loss_seen(int kind);
+extern unsigned long long files_loss_time(void);
 extern void files_loss_disarm(void);
 
 #define LOSS_ROOT "/tmp/loss"
@@ -139,6 +140,14 @@ static int loss_truncate(void) {
         LOST_ONCE(kinds[i]);
         OK(fstat(fd, &st));
         CHECK(st.st_size == sizes[i]);
+        /* The effect was made before the reply was lost, and the repeat
+         * must not make it again: a second execution would have set a ctime
+         * later than the reading of the clock at the loss. The Start is lost
+         * before the effect, so its ctime comes after the reading. */
+        unsigned long long ctime = (unsigned long long)st.st_ctim.tv_sec * 1000000000ull +
+                                   (unsigned long long)st.st_ctim.tv_nsec;
+        if (kinds[i] == LOSS_START) CHECK(ctime >= files_loss_time());
+        else CHECK(ctime <= files_loss_time());
     }
     char bytes[12];
     CHECK(pread(fd, bytes, sizeof bytes, 0) == 12);
