@@ -7,7 +7,10 @@
 //! than the abandoned frame (1), a second wait whose entry frame overlaps the
 //! abandoned one (2, the base scenario), two jumps in a row (3), a jump inside
 //! a handler (4) and a jump of the program's own that calls `abandon` (5), a failed attachment of
-//! a native thread (6) and a program's mask that the layer leaves alone (7).
+//! a native thread (6), a program's mask that the layer leaves alone (7) and
+//! a request that a nested entry spent and left to the abandoned entry, which
+//! the jump gives back to the kernel (8, with relibc's jump and with
+//! `abandon`).
 use super::*;
 use crate::layer::signals::{self as api, SigAction};
 use rt::{
@@ -244,6 +247,79 @@ extern "C" fn inner_body() {
     let _ = sys::receive(&borrowed(&BLOCKING));
     fail(6);
 }
+/// The handler of variant 8: it waits inside the resident call of the
+/// entry of its signal until a request of the thread's own entry comes (a
+/// nested entry, which leaves the handler of the program to the outer one),
+/// then leaves by a jump above the outer entry.
+unsafe extern "C" fn owed_handler(_signal: c_int) {
+    stage(2);
+    let result = sys::receive(&borrowed(&BLOCKING));
+    if result != Err(Error::Interrupted) || PRIMARY.load(Ordering::SeqCst) != 0 {
+        fail(16);
+    }
+    stage(3);
+    // SAFETY: the worker's sigsetjmp frame is live below this handler; word
+    // 13 of the buffer is the stack pointer it saved.
+    unsafe {
+        let buffer = (*BUFFER.0.get()).as_mut_ptr();
+        if RAW.load(Ordering::SeqCst) == 0 {
+            siglongjmp(buffer, 1)
+        } else {
+            upcall::abandon(*buffer.add(13) as usize);
+            native_jump_raw(buffer, 1)
+        }
+    }
+}
+extern "C" fn body_owed() {
+    stage(1);
+    // The signal ends this wait; its handler leaves by a jump.
+    let _ = sys::receive(&borrowed(&BLOCKING));
+    fail(17);
+}
+/// The worker of variant 8. After the jump nobody sends it anything: the
+/// handler of the program runs only if the jump gave the request back.
+extern "C" fn worker_owed(_: u64) -> ! {
+    // SAFETY: as in `worker`.
+    unsafe { upcall::bind(primary_entry) }.expect("native primary bind");
+    unsafe { upcall::enable() }.expect("native primary enable");
+    let jumped = tls::with_process(|| {
+        ID.store(ffi::pthread_self(), Ordering::SeqCst);
+        let action = SigAction {
+            handler: owed_handler as *const () as u64,
+            mask: 0,
+            flags: 0,
+        };
+        let mut previous = SigAction {
+            handler: 0,
+            mask: 0,
+            flags: 0,
+        };
+        if unsafe { api::sigaction(SIGUSR1, &action, &mut previous) } != 0 {
+            return -1;
+        }
+        // SAFETY: the buffer outlives the jump; body_owed runs on this stack.
+        let result = unsafe { native_jump_around((*BUFFER.0.get()).as_mut_ptr(), body_owed) };
+        if unsafe { api::sigaction(SIGUSR1, &previous, ptr::null_mut()) } != 0 {
+            return -2;
+        }
+        result
+    });
+    if jumped != 1 {
+        fail(2);
+    }
+    stage(4);
+    let limit = now() + 200_000_000;
+    while PRIMARY.load(Ordering::SeqCst) == 0 && now() < limit {
+        let _ = sys::yield_now();
+    }
+    if PRIMARY.load(Ordering::SeqCst) != 1 {
+        fail(18);
+    }
+    stage(5);
+    upcall::set_exit_hook(Some(exit_hook));
+    sys::thread_exit()
+}
+
 /// The worker of variant 4.
 extern "C" fn worker_inside(_: u64) -> ! {
     // SAFETY: as in `worker`.
@@ -516,6 +592,47 @@ fn attach(
     finish(name, code, &ended)
 }
 
+/// Variant 8: the request of a nested entry goes back to the kernel when a
+/// jump abandons the outer entry, so the handler of the program runs once
+/// without a second request.
+#[inline(never)]
+fn owed(name: &str, raw: usize, slot: usize, ctx: &Ctx, level: u8, base: u8) -> bool {
+    const CODE: usize = 1580;
+    STAGE.store(0, Ordering::SeqCst);
+    HOOK_RAN.store(0, Ordering::SeqCst);
+    PRIMARY.store(0, Ordering::SeqCst);
+    ERROR.store(0, Ordering::SeqCst);
+    RAW.store(raw, Ordering::SeqCst);
+    let Some((native, ended)) = spawn(worker_owed, slot, level, base) else {
+        return failed(CODE + 1);
+    };
+    if !await_stage(ctx, 1) || !receiving(ctx, &native) {
+        return failed(CODE + 2);
+    }
+    if ffi::pthread_kill(ID.load(Ordering::SeqCst), SIGUSR1) != 0 {
+        return failed(CODE + 2);
+    }
+    // The handler of the signal waits inside its resident call.
+    if !await_stage(ctx, 2) || !receiving(ctx, &native) {
+        return failed(CODE + 2);
+    }
+    // The request of the thread's own entry: a nested entry takes it, calls
+    // nothing for the program and ends the wait of the handler.
+    if sys::thread_upcall_request(&native).is_err() {
+        return failed(CODE + 3);
+    }
+    if !await_stage(ctx, 4) {
+        rt::println!("native-jump: no end of the jump ({name})");
+        return failed(CODE + 4);
+    }
+    // Stage 5 comes after the worker waited for its handler to run.
+    if !await_stage(ctx, 5) || PRIMARY.load(Ordering::SeqCst) != 1 {
+        rt::println!("native-jump: the handler of the program lost its request ({name})");
+        return failed(CODE + 5);
+    }
+    finish(name, CODE, &ended)
+}
+
 /// Variant 4: a jump to a target inside the live handler of the layer.
 #[inline(never)]
 fn inside(ctx: &Ctx, level: u8, base: u8) -> bool {
@@ -628,6 +745,16 @@ pub(super) fn run() -> bool {
     }
     // 7: the layer leaves the mask of a program's handler alone.
     if !attach("program mask", 1570, worker_masked, 6, &ctx, level, base) {
+        return false;
+    }
+    // 8: a nested entry spent a request and left the handler of the program
+    // to the entry that the jump abandons; the jump gives the request back,
+    // with relibc's siglongjmp and with `abandon` before a jump of the
+    // program's own.
+    if !owed("owed request", 0, 7, &ctx, level, base) {
+        return false;
+    }
+    if !owed("owed request, abandon", 1, 8, &ctx, level, base) {
         return false;
     }
     rt::println!("native-jump: own entry after siglongjmp from a layer handler");

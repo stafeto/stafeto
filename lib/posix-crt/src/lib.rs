@@ -31,8 +31,9 @@ unsafe extern "C" {
     fn main(argc: isize, argv: *mut *mut c_char, envp: *mut *mut c_char) -> c_int;
     fn relibc_start_v1(stack: *const usize, main: Main) -> !;
     /// The offset of the entry record in the thread's message buffer and
-    /// the offset of its word `outer`, as relibc's long jump has them.
-    fn relibc_stafeto_entries_layout_v1(out: *mut usize);
+    /// the offsets of its words `outer`, `owed` and `thread`, as relibc's
+    /// long jump has them.
+    fn relibc_stafeto_entries_layout_v2(out: *mut usize);
     /// The process's umask (posix-platform).
     fn stafeto_umask(mask: u32) -> u32;
     /// The ELF header, which lld maps with the read-only data.
@@ -104,13 +105,15 @@ unsafe fn enter_relibc(stack: *const usize) -> ! {
     // relibc's long jump and rt's entry distributor share the entry record
     // of the thread; a relibc that places it elsewhere would leave a dead
     // resident call marked live, so the process ends before `main`.
-    let mut layout = [0usize; 2];
-    // SAFETY: relibc fills the two words.
-    unsafe { relibc_stafeto_entries_layout_v1(layout.as_mut_ptr()) };
+    let mut layout = [0usize; 4];
+    // SAFETY: relibc fills the four words.
+    unsafe { relibc_stafeto_entries_layout_v2(layout.as_mut_ptr()) };
     if layout
         != [
             rt::abi::msgbuf::ENTRIES,
             rt::abi::msgbuf::ENTRIES + entries::ENTRY_OUTER,
+            rt::abi::msgbuf::ENTRIES + entries::ENTRY_OWED,
+            rt::abi::msgbuf::ENTRIES + entries::ENTRY_THREAD,
         ]
     {
         rt::println!("POSIX startup: relibc places the entry record elsewhere");

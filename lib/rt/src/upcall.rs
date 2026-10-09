@@ -8,11 +8,13 @@
 //! the resident handler of a library such as the POSIX layer, which runs
 //! with its own TLS, and then the handler of the program. The decisions are
 //! in the `entries` package, which the host tests run.
+use crate::handle::{Handle, Thread};
 use crate::{msgbuf, sys};
 use abi::{Call, Error, UpcallControl, msgbuf::ENTRIES, msgbuf::ENTRIES_SIZE};
 use core::sync::atomic::{AtomicU64, Ordering};
 use entries::{
-    ENTRY_FLAGS, ENTRY_HOOK, ENTRY_OUTER, ENTRY_OWN, ENTRY_RESIDENT, ENTRY_TLS, ENTRY_WORDS_END,
+    ENTRY_FLAGS, ENTRY_HOOK, ENTRY_OUTER, ENTRY_OWED, ENTRY_OWN, ENTRY_RESIDENT, ENTRY_THREAD,
+    ENTRY_TLS, ENTRY_WORDS_END,
 };
 
 /// Saved AArch64 execution state passed by a context-aware entry trampoline.
@@ -43,8 +45,8 @@ const _: () = {
 /// code, live until it returns.
 pub type Dispatch = unsafe extern "C" fn(*mut Context);
 
-// Two words of the record stay in reserve.
-const _: () = assert!(ENTRY_WORDS_END + 16 <= ENTRIES_SIZE);
+// The record fills its eight words.
+const _: () = assert!(ENTRY_WORDS_END <= ENTRIES_SIZE);
 
 /// The flag of the entry record that says the kernel entry is bound.
 const KERNEL_BOUND: u64 = 1;
@@ -125,8 +127,11 @@ fn mask_if_empty() -> Result<(), Error> {
 /// entry record, while its stack holds the frames of the parent's handlers).
 /// # Safety
 /// `dispatch` must be safe at every point where delivery is enabled,
-/// including reentry into interrupted Rust code. A long jump out of it
-/// needs `abandon`. The caller owns the handler's full lifetime.
+/// including reentry into interrupted Rust code. The handler of the program
+/// runs only when no resident call is live, so a long jump out of it changes
+/// nothing in the record; `abandon` serves a jump that leaves a resident
+/// call without relibc's `longjmp`. The caller owns the handler's full
+/// lifetime.
 pub unsafe fn bind(dispatch: Dispatch) -> Result<(), Error> {
     let bound = word(ENTRY_FLAGS).load(Ordering::Relaxed) & KERNEL_BOUND != 0;
     bind_kernel_once()?;
@@ -163,14 +168,21 @@ pub fn unbind() -> Result<(), Error> {
 /// # Safety
 /// `tls` names a resident ABI word whose TCB and block remain valid until
 /// this thread ends or the handler is removed; `dispatch` is safe as for
-/// `bind`.
-pub unsafe fn bind_resident(dispatch: Dispatch, tls: usize) -> Result<bool, Error> {
-    if tls == 0 {
+/// `bind`. `thread` is a handle of the calling thread with MANAGE, valid
+/// as long as the resident handler: the distributor gives a request back to
+/// the kernel through it (see `abandon`).
+pub unsafe fn bind_resident(
+    dispatch: Dispatch,
+    tls: usize,
+    thread: abi::Handle,
+) -> Result<bool, Error> {
+    if tls == 0 || thread.0 == 0 {
         return Err(Error::InvalidArgs);
     }
     let was_empty = empty();
     bind_kernel_once()?;
     word(ENTRY_TLS).store(tls as u64, Ordering::Relaxed);
+    word(ENTRY_THREAD).store(thread.0, Ordering::Relaxed);
     word(ENTRY_RESIDENT).store(dispatch as usize as u64, Ordering::Release);
     Ok(was_empty)
 }
@@ -198,19 +210,32 @@ pub unsafe fn enable() -> Result<bool, Error> {
     control(UpcallControl::Enable)
 }
 
-/// Tells the entry record that the program is about to leave a handler
-/// by a long jump to the stack pointer `target_sp`: a resident call whose
-/// frame lies below the target is abandoned, and the next entry may call
-/// the handler of the program again. relibc's `longjmp` does the same;
-/// a program with its own jump calls this first.
+/// Tells the entry record that the program is about to leave a resident
+/// call by a long jump to the stack pointer `target_sp`: a resident call
+/// whose frame lies below the target is abandoned, and the next entry may
+/// call the handler of the program again. When a nested entry spent a
+/// request and left the handler of the program to the abandoned entry, the
+/// request goes back to the kernel (`entries::jump_returns`). relibc's
+/// `longjmp` does the same; only a jump that leaves a resident call by other
+/// means calls this first.
 /// # Safety
 /// The jump to `target_sp` follows at once.
 pub unsafe fn abandon(target_sp: usize) {
     let outer = word(ENTRY_OUTER);
-    outer.store(
-        entries::after_jump(outer.load(Ordering::Relaxed), target_sp as u64),
-        Ordering::Relaxed,
+    let (live, owed) = (
+        outer.load(Ordering::Relaxed),
+        word(ENTRY_OWED).load(Ordering::Relaxed),
     );
+    let target = target_sp as u64;
+    let returns = entries::jump_returns(live, owed, target);
+    outer.store(entries::after_jump(live, target), Ordering::Relaxed);
+    if returns {
+        word(ENTRY_OWED).store(0, Ordering::Relaxed);
+        let thread =
+            Handle::<Thread>::borrowed(abi::Handle(word(ENTRY_THREAD).load(Ordering::Relaxed)));
+        // A refused request leaves nothing to repair: the thread ends.
+        let _ = sys::thread_upcall_request(&thread);
+    }
 }
 
 /// Sets or removes the hook `sys::thread_exit` runs, once, before its call.
@@ -341,8 +366,13 @@ unsafe extern "C" fn entry() {
         "str xzr, [x20, #{outer}]",
         "5:",
         "ldr x21, [x20, #{own}]", "cbz x21, 6f",
-        "ldr x9, [x20, #{outer}]", "cbnz x9, 6f",
+        "ldr x9, [x20, #{outer}]", "cbnz x9, 8f",
+        "str xzr, [x20, #{owed}]",
         "mov x0, sp", "blr x21",
+        "b 6f",
+        // A resident call is live: the entry that made it calls the handler
+        // of the program, and owes it the request this entry spent.
+        "8:", "mov x9, #1", "str x9, [x20, #{owed}]",
         "6:",
         "mov x0, #{mask}", "svc #{control}", "cbnz x0, 9f",
         "mrs x9, tpidrro_el0", "add x10, sp, #816", "mov x11, #1088",
@@ -365,5 +395,6 @@ unsafe extern "C" fn entry() {
         resident = const ENTRY_RESIDENT,
         tls = const ENTRY_TLS,
         outer = const ENTRY_OUTER,
+        owed = const ENTRY_OWED,
     );
 }

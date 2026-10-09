@@ -18,15 +18,19 @@
 /// `abi::msgbuf::ENTRIES` (the kernel never touches the record): the handler
 /// of the program, the resident handler of the layer, the TLS of the
 /// resident handler, `outer` (the frame of the live resident call, 0 for
-/// none), flags, the exit hook; two words stay in reserve.
+/// none), flags, the exit hook, `owed` (nonzero when a nested entry left the
+/// handler of the program to the entry of `outer`) and `thread` (a handle of
+/// the thread itself with MANAGE, to give a request back to the kernel).
 pub const ENTRY_OWN: usize = 0;
 pub const ENTRY_RESIDENT: usize = 8;
 pub const ENTRY_TLS: usize = 16;
 pub const ENTRY_OUTER: usize = 24;
 pub const ENTRY_FLAGS: usize = 32;
 pub const ENTRY_HOOK: usize = 40;
+pub const ENTRY_OWED: usize = 48;
+pub const ENTRY_THREAD: usize = 56;
 /// The end of the last word. `rt` checks it against `abi::msgbuf::ENTRIES_SIZE`.
-pub const ENTRY_WORDS_END: usize = ENTRY_HOOK + 8;
+pub const ENTRY_WORDS_END: usize = ENTRY_THREAD + 8;
 
 /// Before the resident call of the entry whose frame is `frame`: whether the
 /// entry records its frame in `outer` (and so has to clear it afterwards).
@@ -47,9 +51,18 @@ pub const fn after_resident(outer: u64, frame: u64, recorded: bool) -> u64 {
 /// Whether the entry calls the handler of the program: the program has one,
 /// and no resident call is live. A nested entry leaves it to the entry that
 /// made the live resident call, which calls it after the resident call
-/// returns, so a request is never lost.
+/// returns; the nested entry writes `owed` meanwhile (`owes`), so that a jump
+/// which abandons the outer entry gives the request back (`jump_returns`).
 pub const fn own_runs(own: u64, outer: u64) -> bool {
     own != 0 && outer == 0
+}
+
+/// Whether an entry that does not call the handler of the program owes it
+/// to the outer entry: the program has a handler and a resident call is
+/// live. The entry sets `owed`; the outer entry clears it before it calls
+/// the handler of the program.
+pub const fn owes(own: u64, outer: u64) -> bool {
+    own != 0 && outer != 0
 }
 
 /// The hook of a long jump to the stack pointer `target`: whether the
@@ -65,6 +78,16 @@ pub const fn after_jump(outer: u64, target: u64) -> u64 {
     if jump_clears(outer, target) { 0 } else { outer }
 }
 
+/// Whether a long jump to `target` gives a request back to the kernel: it
+/// abandons the outer entry (`jump_clears`) while the handler of the program
+/// is owed. The request was spent by the nested entry that left the handler
+/// to the abandoned one; without a new request the handler would wait for
+/// the next event. The hook and `abandon` clear `owed` and ask the kernel
+/// for an entry of the thread itself.
+pub const fn jump_returns(outer: u64, owed: u64, target: u64) -> bool {
+    jump_clears(outer, target) && owed != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,8 +98,11 @@ mod tests {
         own: u64,
         resident: u64,
         outer: u64,
+        owed: u64,
         own_calls: usize,
         resident_calls: usize,
+        /// Requests given back to the kernel by a jump.
+        returned: usize,
     }
     impl Thread {
         fn new(own: u64, resident: u64) -> Self {
@@ -84,9 +110,19 @@ mod tests {
                 own,
                 resident,
                 outer: 0,
+                owed: 0,
                 own_calls: 0,
                 resident_calls: 0,
+                returned: 0,
             }
+        }
+        /// The hook of a long jump to `target`.
+        fn jump(&mut self, target: u64) {
+            if jump_returns(self.outer, self.owed, target) {
+                self.owed = 0;
+                self.returned += 1;
+            }
+            self.outer = after_jump(self.outer, target);
         }
         /// An entry whose frame is `frame`; `inside` runs during the
         /// resident call and may enter again or jump.
@@ -109,7 +145,10 @@ mod tests {
                 self.outer = after_resident(self.outer, frame, recorded);
             }
             if own_runs(self.own, self.outer) {
+                self.owed = 0;
                 self.own_calls += 1;
+            } else if owes(self.own, self.outer) {
+                self.owed = 1;
             }
         }
     }
@@ -176,6 +215,59 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_entry_then_a_jump_above_the_outer_frame_gives_the_request_back() {
+        let mut t = Thread::new(1, 2);
+        t.enter(0x9000, |t| {
+            // The nested entry spent the request and left the handler of
+            // the program to the outer entry.
+            t.enter(0x8000, |_| false);
+            assert_eq!((t.owed, t.own_calls), (1, 0));
+            // The handler leaves by a jump above the outer frame.
+            t.jump(0xa000);
+            true
+        });
+        assert_eq!((t.outer, t.owed, t.returned, t.own_calls), (0, 0, 1, 0));
+        // The kernel enters again for the request that was given back; the
+        // handler of the program runs once.
+        t.enter(0x9000, |_| false);
+        assert_eq!((t.own_calls, t.owed, t.returned), (1, 0, 1));
+    }
+
+    #[test]
+    fn the_outer_entry_that_returns_clears_the_debt_and_nothing_is_given_back() {
+        let mut t = Thread::new(1, 2);
+        t.enter(0x9000, |t| {
+            t.enter(0x8000, |_| false);
+            assert_eq!(t.owed, 1);
+            false
+        });
+        assert_eq!((t.owed, t.own_calls, t.returned), (0, 1, 0));
+    }
+
+    #[test]
+    fn a_jump_that_keeps_the_outer_frame_keeps_the_debt() {
+        let mut t = Thread::new(1, 2);
+        t.enter(0x9000, |t| {
+            t.enter(0x8000, |_| false);
+            t.jump(0x8f00);
+            assert_eq!((t.outer, t.owed, t.returned), (0x9000, 1, 0));
+            false
+        });
+        assert_eq!((t.owed, t.own_calls, t.returned), (0, 1, 0));
+    }
+
+    #[test]
+    fn a_jump_with_no_debt_gives_nothing_back() {
+        assert!(!jump_returns(0x9000, 0, 0xa000));
+        assert!(!jump_returns(0, 1, 0xa000));
+        assert!(!jump_returns(0x9000, 1, 0x9000));
+        assert!(jump_returns(0x9000, 1, 0xa000));
+        assert!(owes(1, 0x9000));
+        assert!(!owes(0, 0x9000));
+        assert!(!owes(1, 0));
+    }
+
+    #[test]
     fn a_jump_below_the_outer_frame_keeps_the_word() {
         let mut t = Thread::new(1, 2);
         t.enter(0x9000, |t| {
@@ -236,10 +328,12 @@ mod tests {
                 ENTRY_TLS,
                 ENTRY_OUTER,
                 ENTRY_FLAGS,
-                ENTRY_HOOK
+                ENTRY_HOOK,
+                ENTRY_OWED,
+                ENTRY_THREAD
             ],
-            [0, 8, 16, 24, 32, 40]
+            [0, 8, 16, 24, 32, 40, 48, 56]
         );
-        assert_eq!(ENTRY_WORDS_END, 48);
+        assert_eq!(ENTRY_WORDS_END, 64);
     }
 }

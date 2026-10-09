@@ -156,7 +156,7 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
         let tls = &raw const BLOCK as u64;
         RESIDENT_TLS.store(tls, Ordering::Release);
         let guard = upcall::defer_entries().unwrap();
-        unsafe { upcall::bind_resident(resident_entry, tls as usize) }.unwrap();
+        unsafe { upcall::bind_resident(resident_entry, tls as usize, self_native.raw()) }.unwrap();
         unsafe { upcall::enable() }.unwrap();
         drop(guard);
     }

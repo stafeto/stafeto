@@ -1414,8 +1414,14 @@ static PROBE_FAIL_ATTACH: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
+    // SAFETY: the page's ABI word points to its complete TCB, whose block
+    // holds the thread's MANAGE handle (admission or the child of a fork
+    // filled it before this call).
+    let tcb = unsafe { *page.cast::<*mut posix_thread::Tcb>() };
+    let thread = unsafe { (*tcb).block.thread.load(Ordering::Relaxed) };
     // SAFETY: admission owns this page through End and uses the fixed dispatcher.
-    let owns_mask = unsafe { upcall::bind_resident(entry, page as usize) }.map_err(|_| EIO)?;
+    let owns_mask = unsafe { upcall::bind_resident(entry, page as usize, rt::abi::Handle(thread)) }
+        .map_err(|_| EIO)?;
     // The layer lets entries in only when it bound the first handler of the
     // thread: a handler the program bound before keeps the program's mask.
     // A failed step removes the handler before bootstrap cleanup.
@@ -1434,8 +1440,6 @@ pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
     // The thread ends through `rt::sys::thread_exit` without the library:
     // its way out of the routing of the process's signals runs there.
     upcall::set_exit_hook(Some(crate::relibc::exit_hook));
-    // SAFETY: the page's ABI word points to its complete freshly built TCB.
-    let tcb = unsafe { *page.cast::<*mut posix_thread::Tcb>() };
     unsafe {
         (*tcb)
             .block
