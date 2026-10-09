@@ -55,12 +55,48 @@ core::arch::global_asm!(
     "mov w0, w1",
     "br x30",
 );
+// longjmp(buffer, 0) with garbage in the upper half of x1: the argument is an
+// int, so the upper half is undefined and the jump returns 1 all the same.
+core::arch::global_asm!(
+    ".global native_jump_garbage",
+    ".type native_jump_garbage,%function",
+    "native_jump_garbage:",
+    "movz x1, #1, lsl #32",
+    "b longjmp",
+);
 unsafe extern "C" {
+    fn native_jump_garbage(buffer: *mut u64) -> !;
     fn native_jump_raw(buffer: *mut u64, value: c_int) -> !;
     /// sigsetjmp(buffer, 1), then body(); 0 when body returns, the value
     /// of siglongjmp otherwise.
     fn native_jump_around(buffer: *mut u64, body: extern "C" fn()) -> c_int;
     fn siglongjmp(buffer: *mut u64, value: c_int) -> !;
+}
+
+/// How often the body of the zero-value jump ran.
+static GARBAGE_RUNS: AtomicUsize = AtomicUsize::new(0);
+extern "C" fn body_garbage() {
+    // A second run means sigsetjmp returned 0 again, the old behaviour.
+    if GARBAGE_RUNS.fetch_add(1, Ordering::SeqCst) == 0 {
+        // SAFETY: the sigsetjmp frame of native_jump_around is live below.
+        unsafe { native_jump_garbage((*BUFFER.0.get()).as_mut_ptr()) }
+    }
+}
+/// longjmp with a value of 0 makes setjmp return 1, whatever x1 holds above
+/// its low half.
+#[inline(never)]
+fn zero_value() -> bool {
+    GARBAGE_RUNS.store(0, Ordering::SeqCst);
+    // SAFETY: the buffer outlives the jump; the body runs on this stack.
+    let r = unsafe { native_jump_around((*BUFFER.0.get()).as_mut_ptr(), body_garbage) };
+    if r != 1 || GARBAGE_RUNS.load(Ordering::SeqCst) != 1 {
+        rt::println!(
+            "native-jump: longjmp(env, 0) returned {r} after {} runs",
+            GARBAGE_RUNS.load(Ordering::SeqCst)
+        );
+        return failed(1600);
+    }
+    true
 }
 
 struct JumpBuffer(core::cell::UnsafeCell<[u64; 64]>);
@@ -755,6 +791,10 @@ pub(super) fn run() -> bool {
         return false;
     }
     if !owed("owed request, abandon", 1, 8, &ctx, level, base) {
+        return false;
+    }
+    // longjmp(env, 0) returns 1 with garbage above the low half of x1.
+    if !zero_value() {
         return false;
     }
     rt::println!("native-jump: own entry after siglongjmp from a layer handler");
