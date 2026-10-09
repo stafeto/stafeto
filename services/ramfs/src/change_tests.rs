@@ -1045,7 +1045,7 @@ fn rename_into_a_full_parent_is_emlink_and_a_directory_that_cannot_be_written_st
     );
     assert!(env.lookup(b"/src/d").is_ok());
     env.ram.storage.node_mut(target).unwrap().links = 2;
-    // User 500 may write both parents but not the directory it moves.
+    // User 500 may write both parents; the directory it moves refuses writes.
     env.ram.storage.set_attributes(src, 0o777, 0, 0).unwrap();
     let mut user = credentials(500, 500, 500, 500);
     assert_eq!(
