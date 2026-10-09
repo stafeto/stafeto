@@ -8,6 +8,7 @@
 //! the delivery path shows here at once.
 use super::*;
 use crate::layer::signals::{self as api, SigAction};
+use abi::signals;
 
 /// The calls from the mark of the sender to the first line of the handler,
 /// without the sender's receive: the entry request of the sender, and the
@@ -21,6 +22,14 @@ const ENTRY_CALLS_TO_HANDLER: u64 = 2;
 /// entry again after the handler. Measured: 2 + 1 (9 when a delivery inside
 /// an entry takes the kernel's deferral, as it did before).
 const ENTRY_DELIVERY_CALLS: u64 = 3;
+
+/// The calls from the mark of the sender to the first line of the program's
+/// own handler when an entry is requested and nothing waits to be delivered,
+/// without the sender's receive: the request itself. The layer's resident
+/// handler finds nothing to do (`idle`) and returns before `deliver`; the
+/// probe counts the deliveries too, since an empty `deliver` makes no call of
+/// the kernel when the page of the process is empty.
+const IDLE_ENTRY_CALLS: u64 = 1;
 
 static READY: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicU64 = AtomicU64::new(0);
@@ -51,6 +60,84 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     AT_END.store(sys::calls(), Ordering::SeqCst);
     sys::notify(&channel(&DONE), 1).unwrap();
     ptr::null_mut()
+}
+
+static OWN_CALLS: AtomicU64 = AtomicU64::new(0);
+unsafe extern "C" fn own_end() {
+    OWN_CALLS.store(sys::calls(), Ordering::SeqCst);
+    STOP.store(1, Ordering::SeqCst);
+}
+rt::upcall_entry!(own_entry, own_end);
+
+static IDLE_STACK: rt::Stack<16384> = rt::Stack::new();
+
+/// A native thread with the layer's resident handler and a handler of its
+/// own beside it (the program's), which spins at a level below main until
+/// that handler has run.
+extern "C" fn idle_worker(_: u64) -> ! {
+    unsafe { rt::upcall::bind(own_entry) }.expect("own entry");
+    unsafe { rt::upcall::enable() }.expect("own entry enable");
+    abi::tls::with_process(|| {
+        sys::notify(&channel(&READY), 1).unwrap();
+        while STOP.load(Ordering::SeqCst) == 0 {
+            core::hint::spin_loop();
+        }
+    });
+    sys::notify(&channel(&DONE), 1).unwrap();
+    sys::thread_exit()
+}
+
+/// An entry requested with no signal pending reaches the program's handler
+/// at the cost of the request alone, and the resident handler does not
+/// deliver.
+fn idle_entry() -> bool {
+    STOP.store(0, Ordering::Release);
+    let main = unsafe { threads::probe_native(ffi::pthread_self()) }.unwrap();
+    let base = sys::thread_info(&main).unwrap().base;
+    let level = base - 20;
+    let ended = sys::channel_create(base).unwrap();
+    let native = unsafe {
+        sys::thread_create_with(
+            abi::allocation::process(),
+            idle_worker,
+            IDLE_STACK.top(),
+            0,
+            level,
+            rt::abi::Policy::Fifo,
+            0xe00000,
+            Some((&ended, base)),
+        )
+    }
+    .expect("idle entry thread");
+    let ready = channel(&READY);
+    let done = channel(&DONE);
+    if sys::thread_start(&native).is_err() || sys::receive(&ready).is_err() {
+        return failed(1612);
+    }
+    let delivered = signals::probe_entry_deliveries();
+    let mark = sys::calls();
+    if sys::thread_upcall_request(&native).is_err() {
+        return failed(1613);
+    }
+    // One call for this receive, counted before the target runs.
+    if sys::receive(&done).is_err() {
+        return failed(1614);
+    }
+    let calls = OWN_CALLS.load(Ordering::SeqCst).wrapping_sub(mark + 1);
+    // The thread ends and the layer takes its place back.
+    if sys::receive(&ended).is_err() {
+        return failed(1615);
+    }
+    // The resident handler returned at `idle`: `deliver` did not run.
+    let ran = signals::probe_entry_deliveries() - delivered;
+    if calls != IDLE_ENTRY_CALLS || ran != 0 {
+        rt::println!(
+            "entry-calls: {calls} kernel calls to the handler of an idle entry (expected {IDLE_ENTRY_CALLS}), {ran} deliveries (expected 0)"
+        );
+        return failed(1616);
+    }
+    rt::println!("entry-calls: an entry with nothing to deliver costs {calls} kernel call");
+    true
 }
 
 pub(super) fn run() -> bool {
@@ -115,5 +202,5 @@ pub(super) fn run() -> bool {
     rt::println!(
         "entry-calls: {to_handler} kernel calls from pthread_kill to the handler, {calls} to the return"
     );
-    true
+    idle_entry()
 }

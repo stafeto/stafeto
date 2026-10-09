@@ -1406,6 +1406,16 @@ unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
     unsafe { deliver(native, true) };
 }
 
+/// The entries that went past the fast path of `idle` into `deliver`, for the
+/// probe that pins the fast path.
+#[cfg(feature = "thread-probe")]
+static ENTRY_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "thread-probe")]
+pub fn probe_entry_deliveries() -> u64 {
+    ENTRY_DELIVERIES.load(Ordering::Relaxed)
+}
+
 /// Whether a delivery now would do nothing: no signal of the thread that its
 /// mask lets through, none of the process on the page (nor a stop or
 /// continue word), no stop by another thread, no deferred entry mark and no
@@ -1503,6 +1513,10 @@ impl SignalPreparation {
 /// masks them on return. A null native frame requests a context-aware entry
 /// for SA_SIGINFO handlers.
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
+    #[cfg(feature = "thread-probe")]
+    if entered {
+        ENTRY_DELIVERIES.fetch_add(1, Ordering::Relaxed);
+    }
     let mut preparation = Some(SignalPreparation::begin(entered));
     let block = own();
     if stopped_by_other() {
