@@ -1713,11 +1713,13 @@ impl Service<0> for Fs {
                 self.cancel_job(job, r.label(), Some(&mut s.data));
                 match found {
                     Ok(entry) => {
-                        let (name, kind) = entry.map_or(("", 0), |entry| (entry.name, entry.kind));
+                        let (name, kind) = entry
+                            .as_ref()
+                            .map_or((&b""[..], 0), |entry| (entry.name(), entry.kind));
                         let w = r.reply();
                         if w.u32(0)
                             .and_then(|()| w.u32(kind))
-                            .and_then(|()| w.bytes(name.as_bytes()))
+                            .and_then(|()| w.bytes(name))
                             .is_err()
                         {
                             return Answer::Status(Status::BadSize);
@@ -1739,8 +1741,8 @@ impl Service<0> for Fs {
                     .directory_read(&mut s.data, fd, self.time_source.now())
                 {
                     Ok(entry) => {
-                        let entry = entry.map(|entry| proto_fs::DirectoryEntry {
-                            name: entry.name.as_bytes(),
+                        let entry = entry.as_ref().map(|entry| proto_fs::DirectoryEntry {
+                            name: entry.name(),
                             kind: entry.kind,
                             inode: entry.inode,
                         });

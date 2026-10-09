@@ -321,6 +321,10 @@ pub struct State {
     name_heads: [u16; BUCKETS],
     name_next: [u16; NAME_ENTRIES],
     name_prev: [u16; NAME_ENTRIES],
+    child_next: [u16; NAME_ENTRIES],
+    child_prev: [u16; NAME_ENTRIES],
+    /// First and last entry of the names in each node that is a directory.
+    children: [[u16; 2]; NODES],
 }
 impl State {
     pub const fn new() -> Self {
@@ -356,6 +360,9 @@ impl State {
             name_heads: [NONE; BUCKETS],
             name_next: [NONE; NAME_ENTRIES],
             name_prev: [NONE; NAME_ENTRIES],
+            child_next: [NONE; NAME_ENTRIES],
+            child_prev: [NONE; NAME_ENTRIES],
+            children: [[NONE; 2]; NODES],
         }
     }
 }
@@ -382,6 +389,9 @@ impl State {
         self.name_heads.fill(NONE);
         self.name_next.fill(NONE);
         self.name_prev.fill(NONE);
+        self.child_next.fill(NONE);
+        self.child_prev.fill(NONE);
+        self.children.fill([NONE; 2]);
     }
 }
 impl Default for State {
@@ -938,6 +948,9 @@ impl<'a> Storage<'a> {
         out.state.name_heads.fill(NONE);
         out.state.name_next.fill(NONE);
         out.state.name_prev.fill(NONE);
+        out.state.child_next.fill(NONE);
+        out.state.child_prev.fill(NONE);
+        out.state.children.fill([NONE; 2]);
         for (i, (kind, mode, links, length, parent)) in [
             (crate::DIR, 0o555, 4, 0, ROOT),
             (crate::DIR, 0o555, 2, 0, ROOT),
@@ -1032,12 +1045,11 @@ impl<'a> Storage<'a> {
         }
         for i in 0..out.state.original_len {
             let original = out.state.originals[i];
-            out.state.nodes[original.parent.slot as usize].names += 1;
             let node = &mut out.state.nodes[original.node.slot as usize];
             if node.kind == crate::DIR {
                 node.name_entry = i as u16;
             }
-            out.chain_insert(i);
+            out.publish(i);
         }
         // Canonical hard-link aliases occupy one initialized Node. Empty original
         // slots add no inode capacity. Boot capacity remains fixed after startup.
@@ -1271,6 +1283,126 @@ impl<'a> Storage<'a> {
             self.state.name_prev[head as usize] = index as u16;
         }
         self.state.name_heads[bucket] = index as u16;
+    }
+    /// The cookie of an entry: the position it keeps in its directory.
+    pub(crate) fn entry_cookie(&self, index: usize) -> u64 {
+        if index < self.state.original_len {
+            3 + index as u64
+        } else {
+            self.state.dentries[index - self.state.original_len].cookie
+        }
+    }
+    /// An entry becomes a name of its directory: found by its name, listed
+    /// in cookie order, counted. The cookie of an entry that reserved its
+    /// number earlier than a rival that published first is behind it; the
+    /// walk back from the end is as long as the reservations in flight.
+    pub(crate) fn publish(&mut self, index: usize) {
+        self.chain_insert(index);
+        let parent = self.entry_key(index).0.slot as usize;
+        let cookie = self.entry_cookie(index);
+        let mut after = self.state.children[parent][1];
+        while after != NONE && self.entry_cookie(after as usize) > cookie {
+            after = self.state.child_prev[after as usize];
+        }
+        let next = if after == NONE {
+            self.state.children[parent][0]
+        } else {
+            self.state.child_next[after as usize]
+        };
+        self.state.child_prev[index] = after;
+        self.state.child_next[index] = next;
+        if after == NONE {
+            self.state.children[parent][0] = index as u16;
+        } else {
+            self.state.child_next[after as usize] = index as u16;
+        }
+        if next == NONE {
+            self.state.children[parent][1] = index as u16;
+        } else {
+            self.state.child_prev[next as usize] = index as u16;
+        }
+        self.state.nodes[parent].names += 1;
+    }
+    /// The entry stops being a name; its parent and name are still the
+    /// published ones.
+    pub(crate) fn unpublish(&mut self, index: usize) {
+        self.chain_remove(index);
+        let parent = self.entry_key(index).0.slot as usize;
+        let prev = self.state.child_prev[index];
+        let next = self.state.child_next[index];
+        if prev == NONE {
+            self.state.children[parent][0] = next;
+        } else {
+            self.state.child_next[prev as usize] = next;
+        }
+        if next == NONE {
+            self.state.children[parent][1] = prev;
+        } else {
+            self.state.child_prev[next as usize] = prev;
+        }
+        self.state.child_next[index] = NONE;
+        self.state.child_prev[index] = NONE;
+        self.state.nodes[parent].names -= 1;
+    }
+    /// The first name of the directory after `cookie`, and the one after
+    /// the entry `hint` when that entry is the one the cookie belongs to.
+    pub(crate) fn child_after(&self, dir: Token, cookie: u64, hint: u16) -> Option<usize> {
+        let children = self.state.children.get(dir.slot as usize)?;
+        let last = children[1];
+        if last == NONE || self.entry_cookie(last as usize) <= cookie {
+            return None;
+        }
+        if hint != NONE
+            && (hint as usize) < self.entries()
+            && self.published(hint as usize)
+            && self.entry_key(hint as usize).0 == dir
+            && self.entry_cookie(hint as usize) == cookie
+        {
+            return Some(self.state.child_next[hint as usize] as usize)
+                .filter(|&i| i != NONE as usize);
+        }
+        let mut at = children[0];
+        while at != NONE && self.entry_cookie(at as usize) <= cookie {
+            at = self.state.child_next[at as usize];
+        }
+        (at != NONE).then_some(at as usize)
+    }
+    /// The entry after `index` in the list of its directory.
+    pub(crate) fn child_next(&self, index: usize) -> Option<usize> {
+        Some(self.state.child_next[index] as usize).filter(|&i| i != NONE as usize)
+    }
+    /// The first name of the directory, if it has one.
+    pub(crate) fn first_child(&self, dir: Token) -> Option<usize> {
+        let first = self.state.children.get(dir.slot as usize)?[0];
+        (first != NONE).then_some(first as usize)
+    }
+    /// The cookie of the last name of the directory, 2 when it has none.
+    pub(crate) fn last_cookie(&self, dir: Token) -> u64 {
+        match self.state.children.get(dir.slot as usize).map(|c| c[1]) {
+            Some(last) if last != NONE => self.entry_cookie(last as usize),
+            _ => 2,
+        }
+    }
+    /// The published name of an entry with its cookie and node.
+    pub(crate) fn entry_record(&self, index: usize) -> Option<(u64, &[u8], Token)> {
+        if index >= self.entries() || !self.published(index) {
+            return None;
+        }
+        let name = self.entry_key(index).1;
+        let node = if index < self.state.original_len {
+            self.state.originals[index].node
+        } else {
+            self.state.dentries[index - self.state.original_len].node
+        };
+        Some((self.entry_cookie(index), name, node))
+    }
+    pub(crate) fn published(&self, index: usize) -> bool {
+        if index < self.state.original_len {
+            !self.state.originals[index].hidden
+        } else {
+            let d = &self.state.dentries[index - self.state.original_len];
+            d.len != 0 && !d.reserved
+        }
     }
     /// Takes an entry out of its chain; its parent and name are still the
     /// published ones. Constant work.
@@ -1534,8 +1666,7 @@ impl<'a> Storage<'a> {
         };
         self.state.dentries[reservation.dentry as usize].reserved = false;
         let entry = self.state.original_len + reservation.dentry as usize;
-        self.chain_insert(entry);
-        self.state.nodes[d.parent.slot as usize].names += 1;
+        self.publish(entry);
         let n = &mut self.state.nodes[reservation.token.slot as usize];
         n.pins[Pin::Pending.index()] -= 1;
         n.links = if n.kind == crate::DIR { 2 } else { 1 };
@@ -1621,8 +1752,7 @@ impl<'a> Storage<'a> {
     fn drop_dentry(&mut self, i: usize) {
         let d = self.state.dentries[i];
         if d.len != 0 && !d.reserved {
-            self.chain_remove(self.state.original_len + i);
-            self.state.nodes[d.parent.slot as usize].names -= 1;
+            self.unpublish(self.state.original_len + i);
         }
         let root = d.root as usize;
         self.state.dentries[i] = Dentry::EMPTY;
@@ -2841,14 +2971,6 @@ mod index_check {
     use std::vec;
 
     impl Storage<'_> {
-        fn published(&self, index: usize) -> bool {
-            if index < self.state.original_len {
-                !self.state.originals[index].hidden
-            } else {
-                let d = &self.state.dentries[index - self.state.original_len];
-                d.len != 0 && !d.reserved
-            }
-        }
         /// Panics unless every published name is in exactly the chain of its
         /// key, no other entry is in a chain, the links agree both ways, and
         /// the counts and back references of the directories are exact.
@@ -2872,6 +2994,39 @@ mod index_check {
                     at = self.state.name_next[i];
                     guard += 1;
                     assert!(guard <= total, "a chain loops");
+                }
+            }
+            let mut listed = vec![false; total];
+            for slot in 0..NODES {
+                let mut previous = NONE;
+                let mut cookie = 0;
+                let mut count = 0;
+                let mut at = self.state.children[slot][0];
+                while at != NONE {
+                    let i = at as usize;
+                    assert!(i < total && !listed[i], "listing of {slot} loops");
+                    listed[i] = true;
+                    assert!(self.published(i));
+                    assert_eq!(self.entry_key(i).0.slot as usize, slot, "entry {i} listed");
+                    assert!(self.entry_cookie(i) > cookie, "cookies of {slot} rise");
+                    cookie = self.entry_cookie(i);
+                    assert_eq!(self.state.child_prev[i], previous, "entry {i} back link");
+                    previous = at;
+                    at = self.state.child_next[i];
+                    count += 1;
+                }
+                assert_eq!(self.state.children[slot][1], previous, "end of {slot}");
+                assert_eq!(
+                    u32::from(self.state.nodes[slot].names),
+                    count,
+                    "count of {slot}"
+                );
+            }
+            for i in 0..total {
+                assert_eq!(listed[i], self.published(i), "entry {i} listed or not");
+                if !listed[i] {
+                    assert_eq!(self.state.child_next[i], NONE, "entry {i} child next");
+                    assert_eq!(self.state.child_prev[i], NONE, "entry {i} child prev");
                 }
             }
             let mut names = vec![0u32; NODES];

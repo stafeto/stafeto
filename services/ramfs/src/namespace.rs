@@ -395,6 +395,14 @@ impl Preparation {
                 return Err(STALE_PROOF);
             }
         }
+        // A name that moves to another directory takes a new cookie.
+        if self.intent == NamespaceIntent::Rename
+            && matches!(self.edges[0].location, Location::Dynamic(_))
+            && self.edges[0].parent != self.edges[1].parent
+            && storage.state.next_cookie >= i64::MAX as u64
+        {
+            return Err(NO_SPACE);
+        }
         // Every fallible check and resource payment precedes this publication.
         for i in 0..2 {
             if let Some(held) = self.reserves.overlays[i].take() {
@@ -431,21 +439,38 @@ impl Preparation {
                 self.reserves.dentries[2].take().expect("paid new name")
             };
             let entry = storage.state.original_len + slot as usize;
-            if storage.state.dentries[slot as usize].len != 0 {
-                // A published name moves: it leaves the chain of the old name
-                // and the count of the old directory.
-                storage.chain_remove(entry);
-                let old = storage.state.dentries[slot as usize].parent;
-                storage.state.nodes[old.slot as usize].names -= 1;
+            // A published name that moves keeps its row. In the same directory
+            // it keeps its place in the listing; in another directory it takes
+            // a new place at the end, with a new cookie.
+            let published = storage.state.dentries[slot as usize].len != 0;
+            let moves =
+                published && storage.state.dentries[slot as usize].parent != self.edges[1].parent;
+            if published {
+                if moves {
+                    storage.unpublish(entry);
+                } else {
+                    storage.chain_remove(entry);
+                }
             }
+            let cookie = moves.then(|| {
+                storage
+                    .next_directory_cookie()
+                    .expect("checked before publication")
+            });
             let d = &mut storage.state.dentries[slot as usize];
             d.parent = self.edges[1].parent;
             d.node = source;
             d.len = self.destination_len;
             d.name[..d.len as usize].copy_from_slice(&self.destination_name[..d.len as usize]);
             d.reserved = false;
-            storage.chain_insert(entry);
-            storage.state.nodes[self.edges[1].parent.slot as usize].names += 1;
+            if let Some(cookie) = cookie {
+                d.cookie = cookie;
+            }
+            if published && !moves {
+                storage.chain_insert(entry);
+            } else {
+                storage.publish(entry);
+            }
             if storage.state.nodes[source.slot as usize].kind == crate::DIR {
                 storage.state.nodes[source.slot as usize].parent = self.edges[1].parent;
                 storage.state.nodes[source.slot as usize].name_entry = entry as u16;
@@ -608,9 +633,8 @@ impl Storage<'_> {
                 let slot = tombstone.expect("paid original tombstone");
                 self.state.dentries[slot as usize].parent = edge.parent;
                 self.state.dentries[slot as usize].node = edge.target.unwrap();
-                self.chain_remove(i as usize);
+                self.unpublish(i as usize);
                 self.state.originals[i as usize].hidden = true;
-                self.state.nodes[edge.parent.slot as usize].names -= 1;
             }
             Location::Dynamic(i) if drop_dynamic => self.drop_dentry(i as usize),
             Location::Dynamic(_) => {}

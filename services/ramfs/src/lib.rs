@@ -193,11 +193,28 @@ fn may(info: &NodeInfo, who: Who, bit: u32) -> bool {
     class & bit != 0
 }
 
+/// One name of a directory as the listing gives it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DirectoryRecord<'a> {
-    pub name: &'a str,
+pub struct DirectoryRecord {
+    name: [u8; 255],
+    length: u8,
     pub kind: u32,
     pub inode: u64,
+}
+impl DirectoryRecord {
+    fn new(name: &[u8], kind: u32, inode: u64) -> Self {
+        let mut bytes = [0; 255];
+        bytes[..name.len()].copy_from_slice(name);
+        Self {
+            name: bytes,
+            length: name.len() as u8,
+            kind,
+            inode,
+        }
+    }
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.length as usize]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,8 +241,13 @@ enum File {
 #[derive(Clone, Copy)]
 struct Open {
     file: File,
+    /// For a directory the cookie of the last name given: the next name is
+    /// the first one with a greater cookie.
     offset: i64,
     flags: u32,
+    /// For a directory the entry that has the cookie `offset`, a shortcut
+    /// that is checked before it is used.
+    hint: u16,
 }
 
 /// The descriptors of one session: each names an open description of the
@@ -718,6 +740,7 @@ impl<'a> Ram<'a> {
             Open {
                 file: self.file(token),
                 offset: 0,
+                hint: crate::storage::NONE,
                 flags: access | (flags & proto_fs::APPEND),
             },
         )?;
@@ -1311,6 +1334,7 @@ impl<'a> Ram<'a> {
             Open {
                 file,
                 offset: 0,
+                hint: crate::storage::NONE,
                 flags,
             },
         )
@@ -1439,7 +1463,7 @@ impl<'a> Ram<'a> {
         index: u32,
         identity: authority::Identity,
         now: proto_fs::Timestamp,
-    ) -> Result<Option<DirectoryRecord<'a>>, u32> {
+    ) -> Result<Option<DirectoryRecord>, u32> {
         let node = self.storage.node(token)?;
         if node.kind != DIR {
             return Err(proto_fs::NOT_DIRECTORY);
@@ -1447,7 +1471,7 @@ impl<'a> Ram<'a> {
         if !identity.permits(node, 4) {
             return Err(proto_fs::ACCESS_DENIED);
         }
-        Ok(self.entry_of(self.file(token), index, now))
+        Ok(self.nth_entry(self.file(token), index, now))
     }
 
     pub fn image_information(&self, entry: u16) -> Result<NodeInfo, u32> {
@@ -1591,15 +1615,19 @@ impl<'a> Ram<'a> {
         fds: &mut Fds,
         fd: u32,
         now: proto_fs::Timestamp,
-    ) -> Result<Option<DirectoryRecord<'a>>, u32> {
+    ) -> Result<Option<DirectoryRecord>, u32> {
         let mut open = self.get(fds, fd)?;
         if !open.file.is_directory() {
             return Err(proto_fs::NOT_DIRECTORY);
         }
-        let index = u32::try_from(open.offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
-        let entry = self.entry_of(open.file, index, now);
+        let after = u64::try_from(open.offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
+        let found = self.entry_after(open.file, after, open.hint, now);
+        let entry = found.map(|(cookie, hint, record)| {
+            open.offset = cookie as i64;
+            open.hint = hint;
+            record
+        });
         if entry.is_some() {
-            open.offset += 1;
             self.put(fds, fd, open)?;
         }
         Ok(entry)
@@ -1610,92 +1638,86 @@ impl<'a> Ram<'a> {
         path: &str,
         index: u32,
         now: proto_fs::Timestamp,
-    ) -> Result<Option<DirectoryRecord<'a>>, u32> {
+    ) -> Result<Option<DirectoryRecord>, u32> {
         let file = self.resolve(path)?;
         if !file.is_directory() {
             return Err(proto_fs::NOT_DIRECTORY);
         }
-        Ok(self.entry_of(file, index, now))
+        Ok(self.nth_entry(file, index, now))
     }
 
-    /// Entry `index` of directory `dir`: `.`, `..`, then the fixed
-    /// entries, then the children from the table; the access time of the
-    /// directory is `now`.
-    fn entry_of(
+    /// The record of the entry `.` or `..` of `dir`, or of the name at `entry`.
+    fn record_of(&self, dir: Token, cookie: u64, entry: u16) -> Option<DirectoryRecord> {
+        match cookie {
+            1 => {
+                let file = self.file(dir);
+                Some(DirectoryRecord::new(b".", DIR, self.inode(file)))
+            }
+            2 => {
+                let parent = self.storage.node(dir).ok()?.parent;
+                let inode = self.inode(self.file(parent));
+                Some(DirectoryRecord::new(b"..", DIR, inode))
+            }
+            _ => {
+                let (_, name, token) = self.storage.entry_record(entry as usize)?;
+                let file = self.file(token);
+                Some(DirectoryRecord::new(name, file.kind(), self.inode(file)))
+            }
+        }
+    }
+
+    /// The name of directory `dir` that follows the position `after`, a
+    /// cookie: 0 is before `.`, 1 before `..`, 2 before the first name. A name
+    /// that exists from start to end of a listing is given exactly once,
+    /// whatever else the directory goes through, because a position is the
+    /// cookie of the name before it and cookies only rise along the listing.
+    /// Gives the cookie, the entry (a shortcut for the next call) and the
+    /// record; the access time of the directory is `now`.
+    fn entry_after(
+        &mut self,
+        dir: File,
+        after: u64,
+        hint: u16,
+        now: proto_fs::Timestamp,
+    ) -> Option<(u64, u16, DirectoryRecord)> {
+        self.touch_access(dir, now);
+        let token = self.token(dir);
+        let (cookie, entry) = match after {
+            0 | 1 => (after + 1, storage::NONE),
+            _ => {
+                let entry = self.storage.child_after(token, after, hint)?;
+                (self.storage.entry_cookie(entry), entry as u16)
+            }
+        };
+        let record = self.record_of(token, cookie, entry)?;
+        Some((cookie, entry, record))
+    }
+
+    /// Entry `index` of directory `dir`: `.`, `..`, then the names in the
+    /// order of their cookies; the access time of the directory is `now`.
+    fn nth_entry(
         &mut self,
         dir: File,
         index: u32,
         now: proto_fs::Timestamp,
-    ) -> Option<DirectoryRecord<'a>> {
+    ) -> Option<DirectoryRecord> {
         self.touch_access(dir, now);
-        let tree = self.tree;
-        let index = index as usize;
-        let name_of = |tree: &Tree<'a>, n: u16| {
-            let path = tree.entry(n).path;
-            &path[path.rfind('/').map_or(0, |slash| slash + 1)..]
-        };
-        // The fixed children of the directory, which come before the image's.
-        let fixed: &[(&'static str, File)] = match dir {
-            File::Root => &[("etc", File::Etc), ("tmp", File::Tmp)],
-            File::Etc => &[("motd", File::Motd)],
-            File::Tmp => &[("probe", File::Scratch)],
-            _ => &[],
-        };
+        let token = self.token(dir);
         match index {
-            0 => Some(DirectoryRecord {
-                name: ".",
-                kind: DIR,
-                inode: self.inode(dir),
-            }),
-            1 => {
-                let parent = match dir {
-                    File::ImageDir(n) => self.tree().parent(n).map(File::ImageDir),
-                    _ => None,
-                };
-                Some(DirectoryRecord {
-                    name: "..",
-                    kind: DIR,
-                    inode: parent.map_or(1, |parent| self.inode(parent)),
-                })
-            }
+            0 | 1 => self.record_of(token, u64::from(index) + 1, storage::NONE),
             _ => {
-                let index = index - 2;
-                if let Some(&(name, file)) = fixed.get(index) {
-                    return Some(DirectoryRecord {
-                        name,
-                        kind: file.kind(),
-                        inode: self.inode(file),
-                    });
+                let mut entry = self.storage.first_child(token)?;
+                for _ in 2..index {
+                    entry = self.storage.child_next(entry)?;
                 }
-                let tree = tree?;
-                let parent = match dir {
-                    File::ImageDir(n) => Some(n),
-                    File::Root => None,
-                    _ => return None,
-                };
-                let n = *tree.children(parent).get(index - fixed.len())?;
-                let file = image_file(&tree, n);
-                Some(DirectoryRecord {
-                    name: name_of(&tree, n),
-                    kind: file.kind(),
-                    inode: self.inode(file),
-                })
+                self.record_of(token, 3, entry as u16)
             }
         }
     }
 
-    /// The entries of a directory, with `.` and `..`.
+    /// The position after the last name of the directory.
     fn directory_count(&self, dir: File) -> i64 {
-        let kids = |parent: Option<u16>| {
-            self.tree
-                .as_ref()
-                .map_or(0, |tree| tree.children(parent).len() as i64)
-        };
-        match dir {
-            File::Root => 4 + kids(None),
-            File::ImageDir(n) => 2 + kids(Some(n)),
-            _ => 3,
-        }
+        self.storage.last_cookie(self.token(dir)) as i64
     }
 
     pub fn lookup(&self, path: &str) -> Result<Metadata, u32> {
@@ -1918,7 +1940,7 @@ mod tests {
         {
             assert_eq!(
                 ram.directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(now)),
-                Ok(Some(DirectoryRecord { name, kind, inode }))
+                Ok(Some(DirectoryRecord::new(name.as_bytes(), kind, inode)))
             );
         }
         assert_eq!(
@@ -1927,7 +1949,8 @@ mod tests {
         );
         assert_eq!(
             ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current),
-            Ok(3)
+            Ok(5),
+            "the position is the cookie of `motd`, the third entry of the table"
         );
         let info = ram.information("/etc").unwrap();
         assert_eq!(
@@ -1942,8 +1965,8 @@ mod tests {
             ram.directory_read(&mut fds, second, proto_fs::Timestamp::legacy_ns(60))
                 .unwrap()
                 .unwrap()
-                .name,
-            "."
+                .name(),
+            b"."
         );
         assert_eq!(
             ram.seek_from(&mut fds, fd, 1, proto_fs::SeekFrom::Start),
@@ -1953,8 +1976,8 @@ mod tests {
             ram.directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(70))
                 .unwrap()
                 .unwrap()
-                .name,
-            ".."
+                .name(),
+            b".."
         );
         let before = ram.information("/etc").unwrap();
         assert_eq!(
@@ -2335,13 +2358,18 @@ mod tests {
     }
 
     /// The entries of the directory `path`, one call each.
-    fn names<'a>(ram: &mut Ram<'a>, path: &str) -> Vec<(&'a str, u32, u64)> {
+    fn names<'a>(ram: &mut Ram<'a>, path: &str) -> Vec<(&'static str, u32, u64)> {
         let mut out = Vec::new();
         while let Some(entry) = ram
             .directory_read_path(path, out.len() as u32, proto_fs::Timestamp::legacy_ns(20))
             .unwrap()
         {
-            out.push((entry.name, entry.kind, entry.inode));
+            let name = std::string::String::from_utf8(entry.name().to_vec()).unwrap();
+            out.push((
+                &*std::boxed::Box::leak(name.into_boxed_str()),
+                entry.kind,
+                entry.inode,
+            ));
         }
         out
     }
@@ -2388,21 +2416,22 @@ mod tests {
             ram.directory_read_path("/bin/ash", 0, proto_fs::Timestamp::legacy_ns(20)),
             Err(proto_fs::NOT_DIRECTORY)
         );
-        // An open directory advances through the same entries, and its
-        // size for seeking counts them (`.`, `..` and the children).
+        // An open directory advances through the same entries, and its end
+        // for seeking is the cookie of the last name.
         let fd = ram.open(&mut fds, "/bin", READ_ONLY | proto_fs::DIRECTORY_ONLY);
         let fd = fd.unwrap();
         assert_eq!(
             ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::End),
-            Ok(5)
+            Ok(10),
+            "the end is the cookie of the last name"
         );
-        ram.seek_from(&mut fds, fd, 4, proto_fs::SeekFrom::Start)
+        ram.seek_from(&mut fds, fd, 9, proto_fs::SeekFrom::Start)
             .unwrap();
         let last = ram
             .directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(30))
             .unwrap()
             .unwrap();
-        assert_eq!(last.name, "sub");
+        assert_eq!(last.name(), b"sub");
         assert_eq!(
             ram.directory_read(&mut fds, fd, proto_fs::Timestamp::legacy_ns(30)),
             Ok(None)
@@ -2410,7 +2439,7 @@ mod tests {
         let root_fd = ram.open(&mut fds, "/", READ_ONLY).unwrap();
         assert_eq!(
             ram.seek_from(&mut fds, root_fd, 0, proto_fs::SeekFrom::End),
-            Ok(6)
+            Ok(12)
         );
         assert_eq!(ram.open(&mut fds, "/bin", WRITE_ONLY), Err(IS_DIRECTORY));
     }
@@ -2559,17 +2588,29 @@ mod tests {
         let other = ram.open(&mut fds, "/dev/other", READ_ONLY).unwrap();
         assert!(!ram.is_random(&fds, other));
         assert_eq!(ram.lookup("/dev/other").map(|m| m.kind), Ok(REG));
-        let kinds: Vec<(&str, u32)> = (0..8)
+        let kinds: Vec<(std::string::String, u32)> = (0..8)
             .filter_map(|i| {
                 ram.directory_read_path("/dev", i, proto_fs::Timestamp::legacy_ns(30))
                     .unwrap()
             })
-            .map(|r| (r.name, r.kind))
+            .map(|r| {
+                (
+                    std::string::String::from_utf8(r.name().to_vec()).unwrap(),
+                    r.kind,
+                )
+            })
             .collect();
-        assert!(kinds.contains(&("null", CHAR)), "{kinds:?}");
-        assert!(kinds.contains(&("random", CHAR)), "{kinds:?}");
-        assert!(kinds.contains(&("urandom", CHAR)), "{kinds:?}");
-        assert!(kinds.contains(&("other", REG)), "{kinds:?}");
+        for expected in [
+            ("null", CHAR),
+            ("random", CHAR),
+            ("urandom", CHAR),
+            ("other", REG),
+        ] {
+            assert!(
+                kinds.contains(&(expected.0.into(), expected.1)),
+                "{kinds:?}"
+            );
+        }
     }
 
     #[test]
