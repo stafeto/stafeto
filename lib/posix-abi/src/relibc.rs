@@ -396,11 +396,16 @@ pub fn target(id: u64) -> Result<(&'static Block, core::mem::ManuallyDrop<Handle
 /// the handle. The collector writes the word (`claim_collect`) and then
 /// reads the pin; both are SeqCst, so either the sender sees the claim and
 /// leaves with ESRCH or the collector sees the pin and gives the place back
-/// until the sender's release. The sender waits for nothing and calls the
-/// kernel for nothing (the release of the last pin wakes `reserve` only
-/// when the collector passed the place over). A critical section keeps a
-/// handler of signals from leaving the callback with the pin held. The
-/// higher-ranked borrow cannot escape into the callback result.
+/// until the sender's release. The sender waits for nothing. For a row of
+/// relibc it calls the kernel for nothing either (the release of the last
+/// pin wakes `reserve` only when the collector passed the place over); for
+/// a thread of the program's own (`stack == 1`) it makes one `thread_info`
+/// call, to see that the thread has not ended. A critical section keeps a
+/// handler of signals from leaving the callback with the pin held. A long
+/// jump out of a handler of the program through this callback is outside
+/// the contract (the layer's callbacks return) and would leave the pin
+/// held, so that the place is never freed. The higher-ranked borrow cannot
+/// escape into the callback result.
 pub(crate) fn with_target<R>(
     id: u64,
     f: impl for<'a> FnOnce(&'a Block, &'a Handle<Thread>) -> R,
