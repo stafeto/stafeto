@@ -12,7 +12,8 @@ pub struct ControlToken {
 }
 impl ControlToken {
     pub fn slot(self) -> usize {
-        self.slot
+        // Open and Scalar keys occupy the original 32 wire places.
+        32 + self.slot
     }
     pub fn generation(self) -> u64 {
         self.generation
@@ -679,6 +680,20 @@ mod tests {
         let (next, _) = table.begin_control(owner(2), [18; 15]).unwrap();
         assert!(next.generation > token.generation);
         assert_eq!(table.get(fd), Ok(17));
+    }
+
+    #[test]
+    fn simultaneous_open_and_control_have_distinct_wire_keys() {
+        let mut table = Table::<u32, 32, u64, u64, u64>::default();
+        let (open, _) = table.begin_open(owner(1), 1).unwrap();
+        let (control, _) = table.begin_control(owner(1), 2).unwrap();
+        assert_eq!(open.generation(), control.generation());
+        assert_ne!(open.slot(), control.slot());
+        assert_eq!(control.slot(), 32);
+        for _ in 1..JOBS_MAX {
+            table.begin_control(owner(1), 2).unwrap();
+        }
+        assert_eq!(table.control_tokens().map(|t| t.slot()).max(), Some(47));
     }
 
     #[test]

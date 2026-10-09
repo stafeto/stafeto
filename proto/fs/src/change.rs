@@ -560,7 +560,7 @@ mod tests {
         stat.args[2] = 1;
         assert!(stat.validate().is_err());
         let mut key = start(ChangeOp::Unlink, b"/a");
-        key.key.slot = 32;
+        key.key.slot = crate::JOB_KEY_PLACES as u32;
         assert!(key.validate().is_err());
         key.key = OpenKey {
             slot: 0,
