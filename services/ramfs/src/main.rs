@@ -187,6 +187,7 @@ fn main(_: u64) -> u64 {
         seconds: &mut tables.seconds,
         generations: None,
         maintenance: ramfs::maintenance::Cursor::default(),
+        maintenance_burst: ramfs::maintenance::Burst::default(),
         next_audit_ns: 0,
         maintenance_jobs: false,
         data_gc_turn: false,
@@ -238,6 +239,8 @@ struct Fs {
     seconds: &'static mut Seconds,
     generations: Option<Handle<Memory>>,
     maintenance: ramfs::maintenance::Cursor,
+    maintenance_burst:
+        ramfs::maintenance::Burst<{ 4 * ramfs::storage::PREPARATIONS + 2 * (SESSIONS + BIRTHS) }>,
     next_audit_ns: u64,
     maintenance_jobs: bool,
     data_gc_turn: bool,
@@ -462,8 +465,9 @@ impl Fs {
             return true;
         }
         if let Some(id) = fds.resolvers.iter().copied().find(|&id| id != 0) {
+            let before = (fds.resolvers, self.ram.storage.available().pages);
             self.cancel_job(id, label, Some(fds));
-            return true;
+            return fds.resolvers != before.0 || self.ram.storage.available().pages > before.1;
         }
         #[cfg(feature = "auth-probe")]
         if fds.auth_probe_gc.take().is_some() {
@@ -1047,6 +1051,7 @@ impl Service<0> for Fs {
     /// The last copy of a session Clone made went before it sent anything:
     /// the descriptors it was born with close.
     fn closed(&mut self, label: u64) {
+        self.maintenance_burst.restart();
         #[cfg(feature = "steps")]
         if self.steps_reclaim_owner == Some(label) {
             self.steps_reclaim_owner = None;
@@ -1074,6 +1079,7 @@ impl Service<0> for Fs {
         notice: rt::service::Notice,
     ) {
         if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
+            self.maintenance_burst.restart();
             let _ = sys::notify(&self.channel, 1);
             return;
         }
@@ -1099,8 +1105,10 @@ impl Service<0> for Fs {
                 self.orphan_cursor = ((slot + 1) % ramfs::storage::PREPARATIONS) as u8;
                 if let Some(job) = self.jobs[slot].as_ref().filter(|job| job.abandoned) {
                     let (id, owner) = (job.id, job.owner);
+                    let before = (self.orphan_count, self.ram.storage.available().pages);
                     self.cancel_job(id, owner, None);
-                    work = true;
+                    let after = (self.orphan_count, self.ram.storage.available().pages);
+                    work = ramfs::maintenance::orphan_progress(before, after);
                 }
             } else {
                 #[cfg(feature = "steps")]
@@ -1111,7 +1119,10 @@ impl Service<0> for Fs {
                     work = self.ram.storage.reclaim_step();
                 }
             }
-            if work || self.maintenance.remaining != 0 || self.orphan_count != 0 {
+            if self.maintenance_burst.again(
+                work,
+                work || self.maintenance.remaining != 0 || self.orphan_count != 0,
+            ) {
                 let _ = sys::notify(&self.channel, 1);
             }
             return;
@@ -1130,7 +1141,10 @@ impl Service<0> for Fs {
         work |= client_work;
         self.maintenance.complete(client_work, SESSIONS + BIRTHS);
         // A maintenance notification makes reclamation progress with no client request.
-        if work || self.maintenance.remaining != 0 || self.orphan_count != 0 {
+        if self.maintenance_burst.again(
+            work,
+            work || self.maintenance.remaining != 0 || self.orphan_count != 0,
+        ) {
             let _ = sys::notify(&self.channel, 1);
         }
     }
@@ -1149,6 +1163,7 @@ impl Service<0> for Fs {
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        self.maintenance_burst.restart();
         let first = !s.data.claimed;
         if !s.data.claimed {
             // The first request of a session Clone made takes its
