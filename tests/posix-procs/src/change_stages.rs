@@ -555,6 +555,189 @@ fn names(files: &Files) -> Result<(), i32> {
     Ok(())
 }
 
+fn word(bytes: &[u8], i: usize) -> u64 {
+    let mut word = [0; 8];
+    word.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+    u64::from_le_bytes(word)
+}
+
+/// OpenStart from a base the caller chose, then the whole open.
+fn open_from(
+    files: &Files,
+    key: OpenKey,
+    base: (u32, u64),
+    path: &[u8],
+    flags: u32,
+) -> Result<PreparedOpen, Status> {
+    let mut w = Writer::new();
+    Method::OpenStart.header().write(&mut w)?;
+    w.u32(key.slot)?;
+    w.u64(key.generation)?;
+    w.u32(base.0)?;
+    w.u64(base.1)?;
+    w.u32(flags)?;
+    w.u32(0o600)?;
+    w.u32(0)?;
+    w.bytes(path)?;
+    let reply = Files::send_on(files.sessions().0, w.as_bytes())?;
+    let id = Files::open_start_reply(&reply)?;
+    super::open_stages::prepared(files, id)?;
+    let held = files.open_commit(id)?;
+    if files.open_finish(key)? != held {
+        return Err(Status::BadSize);
+    }
+    Ok(held)
+}
+
+fn volume_and_paths(files: &Files) -> Result<(), i32> {
+    let mut generation = 200;
+    let mut next = || {
+        generation += 1;
+        generation
+    };
+    // statvfs: the numbers, and one directory less of free inodes.
+    let mut stat = req(4, next(), ChangeOp::StatVfs, b"/tmp");
+    let before = run(files, &stat, None).map_err(|_| 201)?;
+    if before.result != 0 || before.length != proto_fs::STATVFS_BYTES {
+        return Err(202);
+    }
+    if word(&before.bytes, 0) != 4096 || word(&before.bytes, 10) != 255 {
+        return Err(203);
+    }
+    expect(
+        run(files, &mkdir(4, next(), b"/tmp/cs3", 0o777), None),
+        0,
+        204,
+    )?;
+    stat.key = key(4, next());
+    let after = run(files, &stat, None).map_err(|_| 205)?;
+    if word(&after.bytes, 6) + 1 != word(&before.bytes, 6)
+        || word(&after.bytes, 2) != word(&before.bytes, 2)
+    {
+        return Err(206);
+    }
+    stat.key = key(4, next());
+    stat.path = b"/tmp/none";
+    expect(run(files, &stat, None), proto_fs::NO_ENTRY, 207)?;
+    rt::println!("posix-files: change statvfs gave the sizes and counted a free inode less");
+    // path: canonical names, links and a descriptor.
+    expect(
+        run(
+            files,
+            &req(4, next(), ChangeOp::Symlink, b"/tmp/cs3/l"),
+            Some((Base::Absolute, b".")),
+        ),
+        0,
+        208,
+    )?;
+    let mut path = req(4, next(), ChangeOp::Path, b"/tmp/cs3/l/l/../cs3/./l");
+    path.flags = proto_fs::PATH_FOLLOW_LAST;
+    let done = run(files, &path, None).map_err(|_| 209)?;
+    if done.result != 0 || &done.bytes[..done.length] != b"/tmp/cs3" {
+        return Err(210);
+    }
+    path.key = key(4, next());
+    path.flags = 0;
+    path.path = b"/tmp/cs3/l";
+    let done = run(files, &path, None).map_err(|_| 211)?;
+    if done.result != 0 || &done.bytes[..done.length] != b"/tmp/cs3/l" {
+        return Err(212);
+    }
+    path.key = key(4, next());
+    path.flags = proto_fs::PATH_REQUIRE_DIR;
+    path.path = b"/etc/motd";
+    expect(run(files, &path, None), proto_fs::NOT_DIRECTORY, 213)?;
+    let held = open(
+        files,
+        next(),
+        b"/tmp/cs3",
+        proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY,
+    )
+    .map_err(|_| 214)?;
+    let mut by_fd = req(4, next(), ChangeOp::Path, b"");
+    by_fd.flags = proto_fs::PATH_REQUIRE_DIR;
+    by_fd.base = Base::Fd {
+        fd: held.fd,
+        generation: held.generation,
+    };
+    let done = run(files, &by_fd, None).map_err(|_| 215)?;
+    if done.result != 0 || &done.bytes[..done.length] != b"/tmp/cs3" {
+        return Err(216);
+    }
+    rt::println!("posix-files: change path gave canonical names of paths and descriptors");
+    // OpenStart from the descriptor, and from the reserved current directory.
+    let key = OpenKey {
+        slot: 30,
+        generation: next(),
+    };
+    let marker = open_from(
+        files,
+        key,
+        (held.fd | 1 << 31, held.generation),
+        b"marker",
+        proto_fs::CREATE | proto_fs::READ_WRITE,
+    )
+    .map_err(|_| 217)?;
+    files.close_exact(marker).map_err(|_| 218)?;
+    if info(files, b"/tmp/cs3/marker")?.kind != 2 {
+        return Err(219);
+    }
+    let key = OpenKey {
+        slot: 30,
+        generation: next(),
+    };
+    if open_from(
+        files,
+        key,
+        (held.fd | 1 << 31, held.generation + 1),
+        b"marker",
+        proto_fs::READ_ONLY,
+    )
+    .err()
+        != Some(Status::Unknown(proto_fs::BAD_FD))
+    {
+        return Err(220);
+    }
+    let key = OpenKey {
+        slot: 30,
+        generation: next(),
+    };
+    if open_from(
+        files,
+        key,
+        (proto_fs::BASE_CWD, 0),
+        b"marker",
+        proto_fs::READ_ONLY,
+    )
+    .err()
+        != Some(Status::Unknown(proto_fs::BAD_FD))
+    {
+        return Err(221);
+    }
+    files.close_exact(held).map_err(|_| 222)?;
+    expect(
+        run(
+            files,
+            &req(4, next(), ChangeOp::Unlink, b"/tmp/cs3/marker"),
+            None,
+        ),
+        0,
+        223,
+    )?;
+    expect(
+        run(
+            files,
+            &req(4, next(), ChangeOp::Unlink, b"/tmp/cs3/l"),
+            None,
+        ),
+        0,
+        224,
+    )?;
+    expect(run(files, &rmdir(4, next(), b"/tmp/cs3"), None), 0, 225)?;
+    rt::println!("posix-files: change open from a descriptor and from the reserved base");
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn files_change_stages() -> i32 {
     let Ok(raw) = posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
@@ -567,6 +750,7 @@ pub extern "C" fn files_change_stages() -> i32 {
     };
     run_stages(&files)
         .and_then(|()| names(&files))
+        .and_then(|()| volume_and_paths(&files))
         .err()
         .unwrap_or(0)
 }

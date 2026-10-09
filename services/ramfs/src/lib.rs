@@ -1044,6 +1044,42 @@ impl<'a> Ram<'a> {
         Ok(self.token(shared.open.file))
     }
 
+    /// The base of a path in ResolveStart, ResolveSecond and OpenStart. A slot
+    /// with bit 31 set names a descriptor of the session and the generation
+    /// of its description; the value 0xFFFF_FFFE of that form stands for the
+    /// current directory of the session, which the service does not hold yet
+    /// (BAD_FD). Any other slot is a node token the session retains. An
+    /// absolute path takes the root whatever the base says.
+    pub fn request_base(
+        &self,
+        fds: &Fds,
+        slot: u32,
+        generation: u64,
+        relative: bool,
+    ) -> Result<Token, u32> {
+        if !relative {
+            return Ok(Token {
+                slot: u16::try_from(slot).unwrap_or(storage::NONE),
+                generation,
+            });
+        }
+        if slot == proto_fs::BASE_CWD {
+            return Err(BAD_FD);
+        }
+        if slot & (1 << 31) != 0 {
+            return self.description_node(fds, slot & !(1 << 31), generation);
+        }
+        let token = Token {
+            slot: u16::try_from(slot).unwrap_or(storage::NONE),
+            generation,
+        };
+        if self.owns_directory_base(fds, token) {
+            Ok(token)
+        } else {
+            Err(BAD_FD)
+        }
+    }
+
     /// A raw token can serve as a relative base only when this session retains it.
     pub fn owns_directory_base(&self, fds: &Fds, token: Token) -> bool {
         if !self.storage.node(token).is_ok_and(|n| n.kind == DIR) {

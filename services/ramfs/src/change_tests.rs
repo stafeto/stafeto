@@ -1621,3 +1621,278 @@ fn an_unstable_clock_defers_the_effect_and_the_step_goes_on_without_one() {
     env.release(&mut fds, OWNER, start.key).unwrap();
     env.assert_quiet();
 }
+
+fn words(bytes: &[u8]) -> Vec<u64> {
+    assert_eq!(bytes.len(), proto_fs::STATVFS_BYTES);
+    bytes
+        .chunks(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+#[test]
+fn statvfs_needs_only_search_in_the_ancestors_and_counts_the_free_inodes() {
+    let mut env = Env::new();
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    let sealed = env.node(dir, b"sealed", REG, 0o000);
+    let hidden = env.node(ROOT, b"hidden", DIR, 0o700);
+    env.node(hidden, b"inside", REG, 0o644);
+    let mut user = credentials(500, 500, 500, 500);
+    let stat = |path| op(ChangeOp::StatVfs, path);
+    // A file nobody may open answers, because only the search in "/d" counts.
+    let done = env.go(&mut user, stat(b"/d/sealed"), None);
+    assert_eq!(done.result, 0);
+    let before = words(&done.bytes);
+    let info = env.ram.storage.filesystem_information(user.root);
+    assert_eq!(
+        before,
+        [
+            info.block_size,
+            info.fragment_size,
+            info.blocks,
+            info.free_blocks,
+            info.available_blocks,
+            info.files,
+            info.free_files,
+            info.available_files,
+            info.filesystem_id,
+            info.flags,
+            info.name_max
+        ]
+    );
+    assert_eq!((before[0], before[10]), (4096, 255));
+    let _ = sealed;
+    // A directory the user cannot search refuses before the file is looked at.
+    assert_eq!(
+        env.go_result(&mut user, stat(b"/hidden/inside"), None),
+        proto_fs::ACCESS_DENIED
+    );
+    // One more directory is one free inode less.
+    assert_eq!(
+        env.go_result(&mut user, mkdir(0, 1, b"/d/new", 0o777, 0), None),
+        proto_fs::ACCESS_DENIED,
+        "no write permission in /d"
+    );
+    env.ram.storage.set_attributes(dir, 0o777, 0, 0).unwrap();
+    assert_eq!(
+        env.go_result(&mut user, mkdir(0, 1, b"/d/new", 0o777, 0), None),
+        0
+    );
+    let after = words(&env.go(&mut user, stat(b"/d/sealed"), None).bytes);
+    assert_eq!(after[6], before[6] - 1, "f_ffree");
+    assert_eq!(after[2], before[2], "f_blocks");
+    // By descriptor, with the generation of the description.
+    let fd = env
+        .ram
+        .open_token(&mut user, dir, proto_fs::READ_ONLY, ROOT_USER)
+        .unwrap();
+    let generation = env.ram.description_token(&user, fd).unwrap().generation;
+    let by_fd = |generation| ChangeStart {
+        base: Base::Fd { fd, generation },
+        ..stat(b"")
+    };
+    assert_eq!(
+        words(&env.go(&mut user, by_fd(generation), None).bytes),
+        after
+    );
+    assert_eq!(
+        env.go_result(&mut user, by_fd(generation + 1), None),
+        BAD_FD
+    );
+    env.ram.close(&mut user, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn path_answers_the_canonical_name_without_links_dots_or_dotdots() {
+    use proto_fs::{PATH_FOLLOW_LAST, PATH_REQUIRE_DIR};
+    let mut env = Env::new();
+    let mut fds = session();
+    let p = env.node(ROOT, b"p", DIR, 0o755);
+    let q = env.node(p, b"q", DIR, 0o755);
+    env.node(q, b"f", REG, 0o644);
+    let l = env.node(p, b"l", crate::storage::SYMLINK, 0o777);
+    env.ram.storage.write(l, FIXTURE, 0, b"q").unwrap();
+    let up = env.node(q, b"up", crate::storage::SYMLINK, 0o777);
+    env.ram.storage.write(up, FIXTURE, 0, b"../..").unwrap();
+    env.node(ROOT, b"rootfile", REG, 0o644);
+    let path = |path, flags| with_args(ChangeOp::Path, path, flags, [0; 4]);
+    let real = |env: &mut Env, fds: &mut Fds, p, flags| {
+        let done = env.go(fds, path(p, flags), None);
+        (
+            done.result,
+            std::string::String::from_utf8(done.bytes).unwrap(),
+        )
+    };
+    let follow = PATH_FOLLOW_LAST;
+    assert_eq!(
+        real(&mut env, &mut fds, b"/p/l/f", follow),
+        (0, "/p/q/f".into())
+    );
+    assert_eq!(
+        real(&mut env, &mut fds, b"/p/l", follow),
+        (0, "/p/q".into())
+    );
+    assert_eq!(
+        real(&mut env, &mut fds, b"/p/l", 0),
+        (0, "/p/l".into()),
+        "the link itself"
+    );
+    assert_eq!(
+        real(&mut env, &mut fds, b"/p/q/.", follow),
+        (0, "/p/q".into())
+    );
+    assert_eq!(
+        real(&mut env, &mut fds, b"/p/q/../q/f", follow),
+        (0, "/p/q/f".into())
+    );
+    assert_eq!(
+        real(&mut env, &mut fds, b"/p/q/up", follow),
+        (0, "/".into())
+    );
+    assert_eq!(real(&mut env, &mut fds, b"/", follow), (0, "/".into()));
+    assert_eq!(
+        real(&mut env, &mut fds, b"//rootfile", follow),
+        (0, "/rootfile".into())
+    );
+    assert_eq!(
+        real(&mut env, &mut fds, b"/p/none", follow),
+        (NO_ENTRY, "".into())
+    );
+    assert_eq!(
+        real(&mut env, &mut fds, b"/p/q/f/", follow),
+        (NOT_DIRECTORY, "".into())
+    );
+    // The physical path follows a rename of an ancestor.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/p"), Some(b"/moved")),
+        0
+    );
+    assert_eq!(
+        real(&mut env, &mut fds, b"/moved/l/f", follow),
+        (0, "/moved/q/f".into())
+    );
+    // REQUIRE_DIR: a file is not a directory, a directory without search is refused.
+    assert_eq!(
+        real(&mut env, &mut fds, b"/moved/q/f", PATH_REQUIRE_DIR),
+        (NOT_DIRECTORY, "".into())
+    );
+    assert_eq!(
+        real(&mut env, &mut fds, b"/moved/q", PATH_REQUIRE_DIR),
+        (0, "/moved/q".into())
+    );
+    env.ram.storage.set_attributes(q, 0o600, 0, 0).unwrap();
+    let mut user = credentials(500, 500, 500, 500);
+    let (result, _) = real(&mut env, &mut user, b"/moved/q", PATH_REQUIRE_DIR);
+    assert_eq!(result, proto_fs::ACCESS_DENIED);
+    // The final name needs no right of its own; the directories passed through do.
+    assert_eq!(
+        real(&mut env, &mut user, b"/moved/l", follow),
+        (0, "/moved/q".into())
+    );
+    let (result, _) = real(&mut env, &mut user, b"/moved/l/f", follow);
+    assert_eq!(result, proto_fs::ACCESS_DENIED, "q cannot be searched");
+    env.assert_quiet();
+}
+
+#[test]
+fn path_by_descriptor_and_a_name_past_the_limit() {
+    use proto_fs::{PATH_FOLLOW_LAST, PATH_REQUIRE_DIR};
+    let mut env = Env::new();
+    let mut fds = session();
+    let long = std::vec![b'a'; 255];
+    let first = env.node(ROOT, &long, DIR, 0o755);
+    let second_name = std::vec![b'b'; 255];
+    env.node(first, &second_name, DIR, 0o755);
+    let file = env.node(ROOT, b"file", REG, 0o644);
+    let fd = env
+        .ram
+        .open_token(&mut fds, first, proto_fs::READ_ONLY, ROOT_USER)
+        .unwrap();
+    let generation = env.ram.description_token(&fds, fd).unwrap().generation;
+    let at = |path, flags, generation| ChangeStart {
+        base: Base::Fd { fd, generation },
+        ..with_args(ChangeOp::Path, path, flags, [0; 4])
+    };
+    // fchdir: the canonical path of the directory the descriptor names.
+    let done = env.go(&mut fds, at(b"", PATH_REQUIRE_DIR, generation), None);
+    let mut expected = std::vec![b'/'];
+    expected.extend_from_slice(&long);
+    assert_eq!((done.result, done.bytes), (0, expected.clone()));
+    assert_eq!(
+        env.go_result(&mut fds, at(b"", PATH_REQUIRE_DIR, generation + 1), None),
+        BAD_FD
+    );
+    // Relative to it, with the name past 511 bytes: 1 + 255 + 1 + 255 = 512.
+    assert_eq!(
+        env.go_result(
+            &mut fds,
+            at(&second_name, PATH_FOLLOW_LAST, generation),
+            None
+        ),
+        proto_fs::NAME_TOO_LONG
+    );
+    // A short name past the same directory fits.
+    assert_eq!(
+        env.go(&mut fds, at(b".", PATH_FOLLOW_LAST, generation), None)
+            .bytes,
+        expected
+    );
+    // A file descriptor with REQUIRE_DIR is NOT_DIRECTORY.
+    let file_fd = env
+        .ram
+        .open_token(&mut fds, file, proto_fs::READ_ONLY, ROOT_USER)
+        .unwrap();
+    let file_generation = env.ram.description_token(&fds, file_fd).unwrap().generation;
+    let on_file = ChangeStart {
+        base: Base::Fd {
+            fd: file_fd,
+            generation: file_generation,
+        },
+        ..with_args(ChangeOp::Path, b"", PATH_REQUIRE_DIR, [0; 4])
+    };
+    assert_eq!(env.go_result(&mut fds, on_file, None), NOT_DIRECTORY);
+    env.ram.close(&mut fds, fd).unwrap();
+    env.ram.close(&mut fds, file_fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn the_base_of_a_resolve_or_an_open_names_a_descriptor_a_node_or_the_reserved_directory() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    let file = env.node(dir, b"f", REG, 0o644);
+    let fd = env
+        .ram
+        .open_token(&mut fds, dir, proto_fs::READ_ONLY, ROOT_USER)
+        .unwrap();
+    let generation = env.ram.description_token(&fds, fd).unwrap().generation;
+    let base = |env: &Env, slot, generation, relative| {
+        env.ram.request_base(&fds, slot, generation, relative)
+    };
+    // The new form: bit 31, the descriptor, the generation of its description.
+    assert_eq!(base(&env, fd | 1 << 31, generation, true), Ok(dir));
+    assert_eq!(base(&env, fd | 1 << 31, generation + 1, true), Err(BAD_FD));
+    assert_eq!(
+        base(&env, (fd + 1) | 1 << 31, generation, true),
+        Err(BAD_FD)
+    );
+    // The reserved value is the current directory of the session: BAD_FD.
+    assert_eq!(base(&env, proto_fs::BASE_CWD, 0, true), Err(BAD_FD));
+    assert_eq!(base(&env, proto_fs::BASE_ABSOLUTE, 0, true), Err(BAD_FD));
+    // The earlier form: the root token, and a token of a directory the session holds.
+    assert_eq!(base(&env, 0, 1, true), Ok(ROOT));
+    assert_eq!(
+        base(&env, u32::from(dir.slot), dir.generation, true),
+        Ok(dir)
+    );
+    assert_eq!(
+        base(&env, u32::from(file.slot), file.generation, true),
+        Err(BAD_FD),
+        "a file is no base in the earlier form"
+    );
+    // An absolute path asks nothing of the base.
+    assert!(base(&env, proto_fs::BASE_CWD, 0, false).is_ok());
+    env.ram.close(&mut fds, fd).unwrap();
+}

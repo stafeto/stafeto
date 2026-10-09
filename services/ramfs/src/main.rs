@@ -3416,17 +3416,17 @@ impl Fs {
                 Ok(c) => c,
                 Err(code) => return status(code),
             };
-            let base = Token {
-                slot: match u16::try_from(slot) {
-                    Ok(s) => s,
-                    Err(_) => NONE,
-                },
-                generation,
-            };
-            if path.first() != Some(&b'/') && !self.ram.owns_directory_base(fds, base) {
-                self.ram.storage.release_preparation(charge);
-                return status(proto_fs::BAD_FD);
-            }
+            let base =
+                match self
+                    .ram
+                    .request_base(fds, slot, generation, path.first() != Some(&b'/'))
+                {
+                    Ok(base) => base,
+                    Err(code) => {
+                        self.ram.storage.release_preparation(charge);
+                        return status(code);
+                    }
+                };
             let resolver =
                 match Resolve::with_intent(&mut self.ram.storage, path, base, identity, intent) {
                     Ok(r) => r,
@@ -3486,13 +3486,14 @@ impl Fs {
             if j.path().second.is_some() || j.real || j.path().open.is_some() {
                 return status(proto_fs::PERMISSION);
             }
-            let base = Token {
-                slot: u16::try_from(slot).unwrap_or(NONE),
-                generation,
-            };
-            if path.first() != Some(&b'/') && !self.ram.owns_directory_base(fds, base) {
-                return status(proto_fs::BAD_FD);
-            }
+            let base =
+                match self
+                    .ram
+                    .request_base(fds, slot, generation, path.first() != Some(&b'/'))
+                {
+                    Ok(base) => base,
+                    Err(code) => return status(code),
+                };
             let identity = fds.binding.identity(false).expect("authenticated");
             match Resolve::new(&mut self.ram.storage, path, base, identity, follow != 0) {
                 Ok(second) => {
