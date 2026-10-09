@@ -142,6 +142,8 @@ pub fn release<W: Wire>(wire: &mut W, key: OpenKey) {
 /// frame does not contain `current` is abandoned: the operation that made it
 /// has left by a long jump, or its thread frame is gone. A record without an
 /// owner belongs to a thread that ended; it is released by whoever finds it.
+/// A record left by a long jump stays until the thread begins an operation
+/// from a frame no deeper than the left one (see the test of that limit).
 /// The second field says that the record is `me`'s own, to be acknowledged
 /// after its Release.
 pub fn pick_abandoned(

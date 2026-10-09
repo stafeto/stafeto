@@ -414,6 +414,38 @@ fn a_record_whose_frame_is_gone_is_abandoned() {
     );
 }
 
+// A known limit of the order of frames. The order says only that a record
+// whose frame does not contain the current one is gone; it cannot tell a
+// record left by a long jump from one whose operation is still above. A
+// record at 0x9000 that a jump out of its operation left stays while each
+// next operation of the thread begins deeper than 0x9000, that is, at a
+// lower address; the first operation from a frame at 0x9000 or above
+// collects it. The sigaltstack part adds a mark of the jump to the position
+// of a frame, which removes the limit. Until then the record holds its place
+// of the job table and its job of the service for that time.
+#[test]
+fn a_record_left_by_a_jump_stays_while_the_next_operations_begin_deeper() {
+    let mut table = Records::default();
+    let (token, _) = table.begin_control(owner(1), Frame::main(0x9000)).unwrap();
+    // The operation at 0x9000 was left by a long jump. The next ones begin
+    // below it, as a longer chain of calls does: the record looks alive.
+    for sp in [0x8800, 0x8000, 0x1000] {
+        assert_eq!(
+            pick(&table, Some(owner(1)), Frame::main(sp), None),
+            None,
+            "sp {sp:#x}"
+        );
+    }
+    // The first operation from the same frame or above collects it.
+    for sp in [0x9000, 0xA000] {
+        assert_eq!(
+            pick(&table, Some(owner(1)), Frame::main(sp), None),
+            Some((token, true)),
+            "sp {sp:#x}"
+        );
+    }
+}
+
 #[test]
 fn the_operation_itself_is_never_picked() {
     let mut table = Records::default();
