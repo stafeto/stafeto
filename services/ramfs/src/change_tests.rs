@@ -3016,6 +3016,10 @@ fn what_another_client_does_between_the_steps_of_an_unlink_restarts_it_only_when
                         .open_token(other, g, proto_fs::READ_WRITE, ROOT_USER)
                         .unwrap();
                     assert_eq!(env.ram.pwrite(other, fd, 0, b"xy", Env::now()), Ok(2));
+                    let mut write = env.ram.prepare_write(other, fd, b"zw", Some(0)).unwrap();
+                    while !write.step(&mut env.ram).unwrap() {}
+                    write.commit(&mut env.ram, Env::now()).unwrap();
+                    while !write.cancel(&mut env.ram).unwrap() {}
                     let mut prep = env.ram.prepare_truncate(other, fd, 1).unwrap();
                     while !prep.step(&mut env.ram).unwrap() {}
                     prep.commit(&mut env.ram, Env::now()).unwrap();
