@@ -324,7 +324,8 @@ fn epoch_restart_cleans_old_result_before_rebuild_and_identity_failure_keeps_cus
         }
     }
     assert_eq!(pages - ram.storage.available().pages, 2);
-    ram.storage.set_attributes(ROOT, 0o755, 0, 0).unwrap();
+    // A directory moved: the epoch of the moves rises.
+    ram.storage.state.epoch += 1;
     assert_eq!(j.step(&mut ram.storage, ADMIN), Err(STALE_PROOF));
     assert_eq!(pages - ram.storage.available().pages, 2);
     assert!(!j.step(&mut ram.storage, OWNER).unwrap());

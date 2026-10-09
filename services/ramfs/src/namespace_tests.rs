@@ -637,7 +637,7 @@ fn full_preparation_pool_uses_the_existing_admission_and_cancel_is_exact() {
 #[test]
 fn step_failure_keeps_reserved_names_until_explicit_cancel_and_blocks_stale_effect() {
     let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
-    let source = create(&mut ram, FIRST, ROOT, b"source", REG, 0o644);
+    create(&mut ram, FIRST, ROOT, b"source", REG, 0o644);
     let charge = ram.storage.charge_preparation(FIRST).unwrap();
     let mut prep = begin(
         &mut ram,
@@ -655,9 +655,10 @@ fn step_failure_keeps_reserved_names_until_explicit_cancel_and_blocks_stale_effe
     while ram.storage.usage(FIRST).dentries == usage.dentries {
         assert!(!prep.step(&mut ram.storage, ROOT_USER).unwrap());
     }
-    ram.storage.set_attributes(source, 0o600, 37, 43).unwrap();
+    // A name made in the directory of the new name since the proof.
+    create(&mut ram, FIRST, ROOT, b"foreign", REG, 0o644);
     assert_eq!(prep.step(&mut ram.storage, ROOT_USER), Err(STALE_PROOF));
-    assert_eq!(ram.storage.usage(FIRST).dentries, usage.dentries + 1);
+    assert_eq!(ram.storage.usage(FIRST).dentries, usage.dentries + 2);
     assert_eq!(
         prep.commit(
             &mut ram.storage,
@@ -667,7 +668,11 @@ fn step_failure_keeps_reserved_names_until_explicit_cancel_and_blocks_stale_effe
         Err(STALE_PROOF)
     );
     cleanup(&mut ram, &mut prep);
-    assert_eq!(ram.storage.usage(FIRST), usage);
+    let after = ram.storage.usage(FIRST);
+    assert_eq!(
+        (after.inodes, after.dentries),
+        (usage.inodes + 1, usage.dentries + 1)
+    );
     ram.storage.release_preparation(charge);
 }
 
@@ -864,8 +869,8 @@ fn native_role_mismatch_and_group_change_preserve_the_prepared_namespace() {
 
 #[test]
 fn namespace_actual_layout_uses_the_existing_paid_job_and_node_padding() {
-    assert_eq!(core::mem::size_of::<Preparation>(), 648);
-    assert_eq!(core::mem::size_of::<Node>(), 136);
+    assert_eq!(core::mem::size_of::<Preparation>(), 664);
+    assert_eq!(core::mem::size_of::<Node>(), 144);
     std::println!(
         "T4 actual layout: Preparation={} Node={} State={}",
         core::mem::size_of::<Preparation>(),

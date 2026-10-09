@@ -23,6 +23,12 @@ pub struct Resolve {
     /// The entry of the last name the walk matched, or NONE.
     found: u16,
     looking: bool,
+    /// The generation of the directory `current` when its component began.
+    dir_gen: u64,
+    /// The bucket of the name being looked for and the count of the names that
+    /// left it when the lookup began.
+    bucket: usize,
+    bucket_gen: u32,
     link: Option<Token>,
     links: u8,
     epoch: u64,
@@ -30,6 +36,8 @@ pub struct Resolve {
     follow: bool,
     intent: Intent,
     edge_parent: Option<Token>,
+    /// The generation of the parent of the edge when the walk took the edge.
+    edge_gen: u64,
     edge_start: usize,
     edge_end: usize,
     missing: bool,
@@ -131,6 +139,9 @@ impl Resolve {
             search: NONE,
             found: NONE,
             looking: false,
+            dir_gen: 0,
+            bucket: 0,
+            bucket_gen: 0,
             link: None,
             links: 0,
             epoch: storage.state.epoch,
@@ -138,6 +149,7 @@ impl Resolve {
             follow: intent.follows(),
             intent,
             edge_parent: None,
+            edge_gen: 0,
             edge_start: 0,
             edge_end: 0,
             missing: false,
@@ -169,6 +181,9 @@ impl Resolve {
             search: NONE,
             found: NONE,
             looking: false,
+            dir_gen: 0,
+            bucket: 0,
+            bucket_gen: 0,
             link: None,
             links: 0,
             epoch: storage.state.epoch,
@@ -180,6 +195,7 @@ impl Resolve {
             follow: false,
             intent: Intent::Lookup { follow: false },
             edge_parent: None,
+            edge_gen: 0,
             edge_start: 0,
             edge_end: 0,
             missing: false,
@@ -188,6 +204,11 @@ impl Resolve {
             inert: true,
             retired: false,
         })
+    }
+    /// Whether the walk is in the chain of a name.
+    #[cfg(test)]
+    pub(crate) fn looking_in(&self, directory: Token) -> bool {
+        self.looking && self.current == directory
     }
     pub fn is_inert(&self) -> bool {
         self.inert
@@ -259,10 +280,33 @@ impl Resolve {
         if let Some(result) = self.result {
             return Ok(Progress::Found(result));
         }
+        if self.missing
+            && let Some(parent) = self.edge_parent
+            && storage.node(parent)?.name_gen != self.edge_gen
+        {
+            // A name taken in the directory since: the name is perhaps there.
+            self.restarts = self.restarts.saturating_add(1);
+            self.restart(storage, identity)?;
+            return Ok(Progress::More);
+        }
         if self.missing {
             return Ok(Progress::Missing(
                 self.edge_parent.expect("retained missing parent"),
             ));
+        }
+        // A change of the names, mode or owner of the directory the walk
+        // stands in sends the walk back to the start of this component: its
+        // search permission, the head of its chain and a link found in it are
+        // taken again. The components behind stay as they were.
+        // The same holds when a name leaves the chain the walk follows, whoever
+        // the directory is: the place of the walk in the chain is gone.
+        if (self.looking || self.link.is_some())
+            && (storage.node(self.current)?.name_gen != self.dir_gen
+                || self.looking && storage.removals(self.bucket) != self.bucket_gen)
+        {
+            self.looking = false;
+            self.link = None;
+            self.search = NONE;
         }
         if let Some(link) = self.link.take() {
             if self.links == 32 {
@@ -336,6 +380,9 @@ impl Resolve {
                 self.at = self.end;
                 return Ok(Progress::More);
             }
+            self.dir_gen = directory.name_gen;
+            self.bucket = crate::storage::name_bucket(self.current, &self.path[self.at..self.end]);
+            self.bucket_gen = storage.removals(self.bucket);
             self.search = storage.name_head(self.current, &self.path[self.at..self.end]);
             self.looking = true;
         }
@@ -404,6 +451,7 @@ impl Resolve {
         if let Some(parent) = self.edge_parent.replace(self.current) {
             storage.unpin(parent, Pin::Pending)?;
         }
+        self.edge_gen = storage.node(self.current)?.name_gen;
         self.edge_start = self.at;
         self.edge_end = self.end;
         Ok(())
@@ -427,11 +475,17 @@ impl Resolve {
         } else {
             storage.namespace_location(self.found as usize)?
         };
+        let dir_gen = if self.edge_parent.is_some() {
+            self.edge_gen
+        } else {
+            storage.node(proof.parent)?.name_gen
+        };
         Ok(NamespaceProof {
             edge: Edge {
                 parent: proof.parent,
                 target: proof.target,
                 location,
+                dir_gen,
                 syntax: RawSyntax::of(self.original_path()),
             },
             leaf: proof.leaf,
@@ -483,7 +537,9 @@ impl Resolve {
         storage.node(parent)?;
         if let Some(result) = self.result {
             storage.node(result)?;
-        } else if !self.missing {
+        } else if !self.missing || storage.node(parent)?.name_gen != self.edge_gen {
+            // The proof that the name is not there lasts while the directory
+            // keeps its generation.
             return Err(STALE_PROOF);
         }
         Ok(ResultProof {

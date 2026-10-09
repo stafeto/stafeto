@@ -71,6 +71,10 @@ pub(crate) struct Edge {
     pub parent: Token,
     pub target: Option<Token>,
     pub location: Location,
+    /// The generation of the parent when the edge was proved. The edge holds
+    /// while the parent keeps it: a name that is there is the same name, and
+    /// a name that is not there is still not.
+    pub dir_gen: u64,
     pub syntax: RawSyntax,
 }
 /// Native construction is restricted to the retained resolver's verified result.
@@ -368,7 +372,15 @@ impl Preparation {
             return Err(STALE_PROOF);
         }
         self.check(storage, identity)?;
-        let next_epoch = storage.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
+        // Only the move of a directory changes the epoch of the moves.
+        let source_token = self.edges[0].target.ok_or(NO_ENTRY)?;
+        let moves_directory = self.intent == NamespaceIntent::Rename
+            && storage.node(source_token)?.kind == crate::DIR;
+        let next_epoch = if moves_directory {
+            storage.state.epoch.checked_add(1).ok_or(NO_SPACE)?
+        } else {
+            storage.state.epoch
+        };
         for delta in self.links.iter().flatten() {
             if storage.node(delta.token)?.links != delta.previous {
                 return Err(STALE_PROOF);
@@ -558,6 +570,9 @@ impl Storage<'_> {
         }
         if let Some(target) = edge.target {
             self.node(target)?;
+        }
+        if edge.location != Location::ModelToken && parent.name_gen != edge.dir_gen {
+            return Err(STALE_PROOF);
         }
         let valid = match edge.location {
             Location::Missing => edge.target.is_none(),
@@ -819,6 +834,7 @@ fn model_edge<'a>(
             location: found.map_or(Ok(Location::Missing), |(i, _)| {
                 storage.namespace_location(i)
             })?,
+            dir_gen: storage.node(parent)?.name_gen,
             syntax: RawSyntax::of(name),
         },
         leaf: name,
@@ -891,6 +907,7 @@ pub(super) fn model_link(
                 parent: ROOT,
                 target: Some(token),
                 location: Location::ModelToken,
+                dir_gen: 0,
                 syntax: RawSyntax {
                     final_component: FinalComponent::Ordinary,
                     trailing_slash: false,

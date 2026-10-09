@@ -5,6 +5,7 @@
 extern crate std;
 use crate::authority::{Binding, Identity};
 use crate::resolve::{Progress, Resolve};
+use crate::storage::tests_support::OneBucket;
 use crate::storage::{Pin, ROOT, Root, SYMLINK, Token};
 use crate::{DIR, Fds, REG, Ram};
 use proto_process::{Credentials, ExpenditureRoot, Groups, LoaderOf, ResourceLimits, WhoReply};
@@ -694,17 +695,21 @@ fn proof_restarts_after_namespace_and_authority_changes_and_retains_base() {
         Err(proto_fs::ACCESS_DENIED)
     );
     assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    // A walk that stands in the directory meets the change of its mode at
+    // the check of its search permission; a finished proof is not touched.
     r.storage.set_attributes(directory, 0o600, 11, 22).unwrap();
-    assert_eq!(job.proof(&r.storage, OWNER), Err(proto_fs::STALE_PROOF));
-    assert_eq!(
-        finish(&mut r, &mut job, OWNER),
-        Err(proto_fs::ACCESS_DENIED)
-    );
+    assert_eq!(job.proof(&r.storage, OWNER), Ok(file));
     r.storage.set_attributes(directory, 0o700, 11, 22).unwrap();
-    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    // A name made in another directory changes nothing of the proof.
     create(&mut r, ROOT, b"change", REG, 0o644);
+    assert_eq!(job.proof(&r.storage, OWNER), Ok(file));
+    // The move of a directory does.
+    r.storage.state.epoch += 1;
     assert_eq!(job.proof(&r.storage, OWNER), Err(proto_fs::STALE_PROOF));
+    assert_eq!(job.step(&mut r.storage, OWNER), Ok(Progress::More));
     assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    // Two changes of identity and one move of a directory.
+    assert_eq!(job.restarts, 3);
     let mut fds = Fds::default();
     r.set_cwd_token(&mut fds, ROOT).unwrap();
     assert_eq!(
@@ -1916,7 +1921,8 @@ fn original_open_args_survive_real_link_expansion_and_namespace_restart() {
         Progress::Found(target)
     );
     assert_eq!(resolver.original_path(), b"/source");
-    create(&mut ram, ROOT, b"changed", REG, 0o600);
+    // A directory moved: the walk starts again.
+    ram.storage.state.epoch += 1;
     assert_eq!(resolver.step(&mut ram.storage, OWNER), Ok(Progress::More));
     assert_eq!(
         intent_ready(&mut ram, &mut resolver, OWNER).unwrap().0,
@@ -2257,4 +2263,89 @@ fn clone_into_requires_fresh_destination_including_operation_tombstones() {
     assert_eq!(destinations[1].open_receipts[31].key.generation, 1);
     assert_eq!(destinations[2].open_receipts[31].description.slot, 1);
     assert_eq!(ram.open_descriptions(), 0);
+}
+
+/// A directory with a file, and `count` names of the root made after them:
+/// with one bucket, the file is the last of the chain.
+fn long_chain(r: &mut Ram<'_>, count: usize) -> (Token, Token) {
+    let directory = create(r, ROOT, b"chain", DIR, 0o700);
+    let tail = create(r, directory, b"tail", REG, 0o644);
+    for i in 0..count {
+        create(r, ROOT, format!("n{i}").as_bytes(), REG, 0o644);
+    }
+    (directory, tail)
+}
+
+/// Steps until the walk looks for a name of `directory` and has passed the first eight of its chain.
+fn walk_into(r: &mut Ram<'_>, job: &mut Resolve, directory: Token) {
+    for _ in 0..100 {
+        if job.looking_in(directory) {
+            assert_eq!(job.step(&mut r.storage, OWNER), Ok(Progress::More));
+            return;
+        }
+        assert_eq!(job.step(&mut r.storage, OWNER), Ok(Progress::More));
+    }
+    panic!("the walk does not reach the directory");
+}
+
+#[test]
+fn a_name_removed_ahead_of_the_walk_in_its_chain_does_not_lose_the_name_behind() {
+    let _one = OneBucket::new();
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let (directory, tail) = long_chain(&mut r, 30);
+    let mut job = Resolve::new(&mut r.storage, b"/chain/tail", ROOT, OWNER, true).unwrap();
+    // The walk is in the chain of "tail", behind names of the root.
+    walk_into(&mut r, &mut job, directory);
+    // The names at the front of the chain go away: the place of the walk in it is gone.
+    for i in 0..30 {
+        r.storage
+            .unlink(ROOT, format!("n{i}").as_bytes(), ROOT_ACCOUNT)
+            .unwrap();
+    }
+    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(tail));
+    assert_eq!(job.restarts, 0, "only the component is looked up again");
+    job.release(&mut r.storage);
+}
+
+#[test]
+fn a_mode_change_of_the_directory_in_the_middle_of_a_chain_checks_search_permission_again() {
+    let _one = OneBucket::new();
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let (directory, _tail) = long_chain(&mut r, 30);
+    let mut job = Resolve::new(&mut r.storage, b"/chain/tail", ROOT, OWNER, true).unwrap();
+    walk_into(&mut r, &mut job, directory);
+    r.storage.set_attributes(directory, 0o600, 11, 22).unwrap();
+    assert_eq!(
+        finish(&mut r, &mut job, OWNER),
+        Err(proto_fs::ACCESS_DENIED)
+    );
+    job.release(&mut r.storage);
+}
+
+#[test]
+fn a_file_change_and_a_name_in_another_directory_leave_a_walk_and_its_proof_as_they_are() {
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let one = create(&mut r, ROOT, b"one", DIR, 0o755);
+    let other = create(&mut r, ROOT, b"other", DIR, 0o755);
+    let file = create(&mut r, one, b"file", REG, 0o644);
+    let stranger = create(&mut r, other, b"stranger", REG, 0o644);
+    let intent = crate::resolve::Intent::Namespace {
+        path: crate::namespace::NamespacePath::Victim,
+    };
+    let mut job = Resolve::with_intent(&mut r.storage, b"/one/file", ROOT, OWNER, intent).unwrap();
+    assert_eq!(job.step(&mut r.storage, OWNER), Ok(Progress::More));
+    // Mode, owner and size of a file, a new name and a gone name elsewhere.
+    r.storage.set_attributes(stranger, 0o600, 5, 5).unwrap();
+    r.storage.write(stranger, ROOT_ACCOUNT, 0, b"data").unwrap();
+    create(&mut r, other, b"another", REG, 0o644);
+    r.storage.unlink(other, b"another", ROOT_ACCOUNT).unwrap();
+    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    assert!(job.result_proof(&r.storage, OWNER, intent).is_ok());
+    create(&mut r, other, b"later", REG, 0o644);
+    assert!(
+        job.namespace_proof(&r.storage, OWNER, crate::namespace::NamespacePath::Victim)
+            .is_ok()
+    );
+    assert_eq!(job.restarts, 0);
+    job.release(&mut r.storage);
 }

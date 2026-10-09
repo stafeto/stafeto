@@ -229,7 +229,7 @@ fn stale_scan_and_counter_exhaustion_preserve_original_bytes() {
         Err(proto_fs::INVALID_ARGUMENT)
     );
     while !prep.cancel(&mut ram).unwrap() {}
-    ram.storage.state.epoch = u64::MAX;
+    ram.storage.node_mut(token).unwrap().data_generation = u64::MAX;
     assert!(matches!(
         ram.prepare_write(&fds, fd, b"bad", None),
         Err(NO_SPACE)
