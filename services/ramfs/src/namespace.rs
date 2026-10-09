@@ -481,7 +481,12 @@ impl Preparation {
         }
         for held in &mut self.reserves.overlays {
             if let Some(held) = held.take() {
-                storage.state.overlays[held.slot as usize] = Overlay::EMPTY;
+                // A slot that was reserved holds nothing but the two links
+                // of its owner (no page was mapped); the pages are NONE as
+                // `initialize` left them and as a free slot keeps them.
+                let overlay = &mut storage.state.overlays[held.slot as usize];
+                overlay.node = NONE;
+                overlay.root = NONE;
                 storage.state.inode_free[storage.state.inode_len] = held.slot;
                 storage.state.inode_len += 1;
                 storage.uncharge(held.root as usize, |u| &mut u.inodes);

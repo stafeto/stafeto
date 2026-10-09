@@ -259,6 +259,18 @@ fn posix_tty() -> Vec<RootFile> {
     ]
 }
 
+/// Four directories of the boot table for the probe of the change jobs:
+/// renames of names that are in the table stage the most the service pays.
+fn change_dirs() -> [RootFile; 5] {
+    [
+        dir("/chg"),
+        dir("/chg/a"),
+        dir("/chg/b"),
+        dir("/chg/c"),
+        dir("/chg/d"),
+    ]
+}
+
 /// The probe of the longest step of the process service (5c): the probe
 /// itself as the file its children run.
 fn steps() -> Vec<RootFile> {
@@ -268,6 +280,7 @@ fn steps() -> Vec<RootFile> {
         dir("/dev"),
     ];
     files.extend(devices());
+    files.extend(change_dirs());
     files
 }
 
@@ -392,6 +405,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-posix-files.img" | "boot-posix-files-steps.img" | "boot-posix-data-steps.img" => {
             let mut files = vec![dir("/dev")];
             files.extend(devices());
+            files.extend(change_dirs());
             files
         }
         "boot-image-gates.img"

@@ -769,6 +769,10 @@ static int exec_spawning(void) {
 #endif
 #define STEPS_LEAVES 31
 
+#if CHANGE_STEPS
+extern int files_change_stages(void);
+#endif
+
 static int steps_spawn(pid_t *pid, const char *role, const char *index) {
     char *argv[] = {"procs-child", (char *)role, (char *)index, NULL};
     char *envp[] = {NULL};
@@ -1009,6 +1013,15 @@ static int steps_run(void) {
         pause_ms(10);
     }
     printf("posix-procs: steps %d children live\n", STEPS_BRANCHES * (STEPS_LEAVES + 1) + own);
+#if CHANGE_STEPS
+    /* The change jobs of the RAM file service among the crowd: every
+     * method of the family, and the cancel of a rename in flight. */
+    int change = files_change_stages();
+    if (change) {
+        printf("posix-procs: steps: Change stages failed %d\n", change);
+        failed++;
+    }
+#endif
     /* kill(-1) in a loop: signal 0 and a signal that is ignored by default. */
     for (int i = 0; i < 20; i++) {
         if (kill(-1, 0) != 0 || kill(-1, SIGCHLD) != 0) {

@@ -609,7 +609,12 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
         &["steps"],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
+    (
+        "posix-procs",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["change-steps"],
+    ),
     ("loader", "loader", 0, &["steps"]),
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
     ("entropy", "entropy", 32 * 1024, &["steps"]),
@@ -3118,9 +3123,11 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
         check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
         let required: &[usize] = if data {
-            &[15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 65]
+            &[
+                15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 65,
+            ]
         } else {
-            &[15, 19, 21, 25, 65]
+            &[15, 19, 21, 25, 44, 45, 46, 47, 48, 65]
         };
         for &kind in required {
             if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
@@ -3337,7 +3344,11 @@ const RAM_STEP_MAX: u64 = TERM_B;
 /// ForkStart 53,737 and 54,153) plus NOISE_MARGIN; ForkStart again as the
 /// largest of four runs at the head of E1 with 4 and with 7 branches
 /// (53,772 and 55,793: the pin of relibc a5adc5f8, a table entry in
-/// `sysconf`, moved the 7-branch figure up from 54,610 at 30f48fe7). The
+/// `sysconf`, moved the 7-branch figure up from 54,610 at 30f48fe7).
+/// ExecStart with 7 branches is 52,825 since the probe runs the raw change
+/// jobs among the crowd: the identity session it clones and closes leaves
+/// an end in the channel, which the next exec drains (50,778 with the
+/// same program and no such call). The
 /// margin covers what moves between builds: the layout of the code and the processes of the
 /// level above that run in the middle of a step (SpawnStart was 92,262 and
 /// 93,009 at 4e9abf5 and 92,369 at d7743c9 with the same source of the
@@ -3354,7 +3365,7 @@ const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64, u64); 4] = [
         28,
         "ExecStart",
         51_039 + NOISE_MARGIN,
-        50_833 + NOISE_MARGIN,
+        52_825 + NOISE_MARGIN,
     ),
     (
         34,
@@ -3371,7 +3382,7 @@ const NOISE_MARGIN: u64 = 1_500;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 16] = [
+const RAM_STEP_KINDS: [(usize, &str); 21] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
@@ -3385,6 +3396,11 @@ const RAM_STEP_KINDS: [(usize, &str); 16] = [
     (24, "ResolveSecond"),
     (25, "FinishBinding"),
     (34, "CloneExact"),
+    (44, "ChangeStart"),
+    (45, "ChangeSecond"),
+    (46, "ChangeStep"),
+    (47, "ChangeQuery"),
+    (48, "ChangeRelease"),
     (64, "notification"),
     (65, "maintenance"),
     (66, "session gone"),
@@ -3675,6 +3691,16 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     }
     if !loader.iter().any(|(k, ..)| *k == 9) {
         return Err("no loader step of a copy: the forks did not run".into());
+    }
+    // The five methods of the change jobs (44 to 48) ran among the crowd, and
+    // the longest of each stays under term B like every step of the service.
+    for kind in 44..=48 {
+        let ticks = ram.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
+        if ticks == 0 || ticks > RAM_STEP_MAX {
+            return Err(format!(
+                "the RAM file service: change method {kind} took {ticks} ticks, none or past {RAM_STEP_MAX}: {ram:?}"
+            ));
+        }
     }
     // A fork uses CloneExact to copy its retained descriptor list.
     let clone = ram.iter().find(|(k, ..)| *k == 34).map_or(0, |r| r.1);

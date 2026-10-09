@@ -738,6 +738,57 @@ fn volume_and_paths(files: &Files) -> Result<(), i32> {
     Ok(())
 }
 
+/// The cancel of a rename of names of the boot table at every phase near the
+/// end: the most the service has staged is a name for the tombstone of each
+/// side, one for the new name and an inode for each node. The renames that
+/// are cancelled leave both directories where they were.
+fn release_in_flight(files: &Files) -> Result<(), i32> {
+    let mut generation = 300;
+    let mut next = || {
+        generation += 1;
+        generation
+    };
+    // The same rename on two other names, to count its steps.
+    let dry = req(5, next(), ChangeOp::Rename, b"/chg/c");
+    start(files, &dry).map_err(|_| 301)?;
+    second(files, dry.key, Base::Absolute, b"/chg/d").map_err(|_| 302)?;
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps > 10_000 {
+            return Err(303);
+        }
+        if step(files, dry.key, false).map_err(|_| 304)?.is_some() {
+            break;
+        }
+    }
+    release(files, dry.key).map_err(|_| 305)?;
+    for taken in steps.saturating_sub(12)..steps {
+        let job = req(5, next(), ChangeOp::Rename, b"/chg/a");
+        start(files, &job).map_err(|_| 306)?;
+        second(files, job.key, Base::Absolute, b"/chg/b").map_err(|_| 307)?;
+        let mut finished = false;
+        for _ in 0..taken {
+            if step(files, job.key, false).map_err(|_| 308)?.is_some() {
+                finished = true;
+                break;
+            }
+        }
+        release(files, job.key).map_err(|_| 309)?;
+        if finished {
+            break;
+        }
+        // Cancelled: nothing moved.
+        if files.node_information_bytes(b"/chg/a").is_err()
+            || files.node_information_bytes(b"/chg/b").is_err()
+        {
+            return Err(310);
+        }
+    }
+    rt::println!("posix-files: change release of a rename in flight left both names");
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn files_change_stages() -> i32 {
     let Ok(raw) = posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
@@ -751,6 +802,7 @@ pub extern "C" fn files_change_stages() -> i32 {
     run_stages(&files)
         .and_then(|()| names(&files))
         .and_then(|()| volume_and_paths(&files))
+        .and_then(|()| release_in_flight(&files))
         .err()
         .unwrap_or(0)
 }

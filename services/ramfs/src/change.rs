@@ -168,53 +168,41 @@ impl ChangeJob {
         second_place: Option<u8>,
     ) -> Result<Self, u32> {
         let relative = req.path.first() != Some(&b'/');
-        let target = anchor(ram, fds, req.base, relative);
-        let mut job = Self {
-            op: req.op,
-            flags: req.flags,
-            base: req.base,
-            args: req.args,
-            second_base: None,
-            first: Resolve::scratch(&mut ram.storage, b"")?,
-            second_place,
-            stage: Stage::Resolve,
-            work: Work::None,
-            result: 0,
-            length: 0,
-            restarts: 0,
-            seen: 0,
-        };
-        match target {
-            Ok(token) if !req.path.is_empty() => {
-                // A path to walk. The scratch placeholder gives way.
-                let first = Resolve::with_intent(
+        let (first, stage, result) = match anchor(ram, fds, req.base, relative) {
+            Ok(token) if !req.path.is_empty() => (
+                Resolve::with_intent(
                     &mut ram.storage,
                     req.path,
                     token,
                     identity,
                     first_intent(req.op, req.flags),
-                );
-                match first {
-                    Ok(first) => {
-                        core::mem::replace(&mut job.first, first).release(&mut ram.storage)
-                    }
-                    Err(code) => {
-                        job.first.release(&mut ram.storage);
-                        return Err(code);
-                    }
-                }
-            }
-            Ok(_) => {}
+                )?,
+                Stage::Resolve,
+                0,
+            ),
+            Ok(_) => (Resolve::scratch(&mut ram.storage, b"")?, Stage::Resolve, 0),
             Err(code) => {
-                // Keep the bytes so that a repeated Start compares equal.
-                let kept = Resolve::scratch(&mut ram.storage, req.path)?;
-                core::mem::replace(&mut job.first, kept).release(&mut ram.storage);
-                job.stage = Stage::Done;
-                job.result = code;
-                job.first.retire(&mut ram.storage);
+                // The bytes stay so that a repeated Start compares equal.
+                let mut kept = Resolve::scratch(&mut ram.storage, req.path)?;
+                kept.retire(&mut ram.storage);
+                (kept, Stage::Done, code)
             }
-        }
-        Ok(job)
+        };
+        Ok(Self {
+            op: req.op,
+            flags: req.flags,
+            base: req.base,
+            args: req.args,
+            second_base: None,
+            first,
+            second_place,
+            stage,
+            work: Work::None,
+            result,
+            length: 0,
+            restarts: 0,
+            seen: 0,
+        })
     }
 
     pub fn phase(&self) -> ChangePhase {
@@ -278,7 +266,6 @@ impl ChangeJob {
         if req.bytes.contains(&0) {
             return Err(INVALID_ARGUMENT);
         }
-        let placeholder = slot.take();
         if self.op == ChangeOp::Symlink {
             *slot = Some(Resolve::scratch(&mut ram.storage, req.bytes)?);
         } else {
@@ -300,21 +287,12 @@ impl ChangeJob {
                     // The job ends with that result; the bytes stay for a repeat.
                     *slot = Some(Resolve::scratch(&mut ram.storage, req.bytes)?);
                     self.second_base = Some(req.base);
-                    if let Some(old) = placeholder {
-                        old.release(&mut ram.storage);
-                    }
                     let mut none = 0;
                     self.fail(ram, &mut none, slot.as_mut(), code);
                     return Ok(());
                 }
-                Err(code) => {
-                    *slot = placeholder;
-                    return Err(code);
-                }
+                Err(code) => return Err(code),
             }
-        }
-        if let Some(old) = placeholder {
-            old.release(&mut ram.storage);
         }
         self.second_base = Some(req.base);
         Ok(())
@@ -892,45 +870,35 @@ pub fn start(
         .filter(|&generation| generation < 1 << 56)
         .ok_or(TOO_MANY_OPEN_FILES)?;
     let second_place = if req.op.needs_second() {
-        Some(
-            ctx.seconds
-                .iter()
-                .position(Option::is_none)
-                .ok_or(JOBS_FULL)? as u8,
-        )
+        Some(ctx.seconds.reserve().ok_or(JOBS_FULL)? as u8)
     } else {
         None
     };
     let real = uses_real_identity(req.op, req.flags);
     let identity = fds.binding.identity(real)?;
-    let mut charge = ctx
-        .ram
-        .storage
-        .charge_preparation(fds.root)
-        .map_err(|code| {
-            if code == TOO_MANY_OPEN_FILES {
+    let charge = match ctx.ram.storage.charge_preparation(fds.root) {
+        Ok(charge) => charge,
+        Err(code) => {
+            if let Some(place) = second_place {
+                ctx.seconds.free(place as usize);
+            }
+            return Err(if code == TOO_MANY_OPEN_FILES {
                 JOBS_FULL
             } else {
                 code
-            }
-        })?;
-    let mut change = match ChangeJob::capture(ctx.ram, fds, identity, req, second_place) {
+            });
+        }
+    };
+    let change = match ChangeJob::capture(ctx.ram, fds, identity, req, second_place) {
         Ok(change) => change,
         Err(code) => {
             ctx.ram.storage.release_preparation(charge);
+            if let Some(place) = second_place {
+                ctx.seconds.free(place as usize);
+            }
             return Err(code);
         }
     };
-    if let Some(place) = second_place {
-        match Resolve::scratch(&mut ctx.ram.storage, b"") {
-            Ok(held) => ctx.seconds[place as usize] = Some(held),
-            Err(code) => {
-                change.cancel(ctx.ram, &mut charge, None);
-                ctx.ram.storage.release_preparation(charge);
-                return Err(code);
-            }
-        }
-    }
     let phase = change.phase();
     let id = generation << 8 | slot as u64;
     ctx.jobs[slot] = Some(ResolveJob {
@@ -984,7 +952,7 @@ pub fn second(
         ctx.ram,
         fds,
         identity,
-        place.map(|place| &mut ctx.seconds[place]),
+        place.map(|place| &mut ctx.seconds.slots[place]),
         req,
     )
 }
@@ -1030,7 +998,7 @@ pub fn step(
         let place = change.second_place();
         let mut none: Option<Resolve> = None;
         let second = match place {
-            Some(place) => &mut ctx.seconds[place],
+            Some(place) => &mut ctx.seconds.slots[place],
             None => &mut none,
         };
         if new_authority {
@@ -1073,21 +1041,24 @@ pub fn release(ctx: &mut Ctx<'_, '_>, fds: &mut Fds, owner: u64, key: OpenKey) -
 /// charge and the place of the session. Returns whether the job had been
 /// abandoned by a session that went.
 pub fn cancel_slot(ctx: &mut Ctx<'_, '_>, fds: Option<&mut Fds>, slot: usize) -> bool {
-    let Some(mut job) = ctx.jobs[slot].take() else {
+    let Some(job) = ctx.jobs[slot].as_mut() else {
         return false;
     };
-    let abandoned = job.abandoned;
+    let (id, abandoned) = (job.id, job.abandoned);
     if let JobOperation::Change(change) = &mut job.operation {
-        let second = change
-            .second_place()
-            .and_then(|place| ctx.seconds[place].take());
+        let place = change.second_place();
+        let second = place.and_then(|place| ctx.seconds.slots[place].take());
         change.cancel(ctx.ram, &mut job.root, second);
+        if let Some(place) = place {
+            ctx.seconds.free(place);
+        }
     }
     if job.root != NONE {
         ctx.ram.storage.release_preparation(job.root);
     }
+    ctx.jobs[slot] = None;
     if let Some(fds) = fds
-        && let Some(place) = fds.resolvers.iter_mut().find(|id| **id == job.id)
+        && let Some(place) = fds.resolvers.iter_mut().find(|place| **place == id)
     {
         *place = 0;
     }

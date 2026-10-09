@@ -4,7 +4,7 @@
 //! The change jobs through the five methods, on the live RAM backend.
 extern crate std;
 use crate::authority::{Binding, Identity};
-use crate::change::{Advance, Clock, Ctx, SECONDS};
+use crate::change::{Advance, Clock, Ctx};
 use crate::job::{JobGenerations, JobOperation, JobTable, Seconds};
 use crate::resolve::{Progress, Resolve};
 use crate::storage::{BOOT_ROOT, ROOT, Root, Token};
@@ -117,7 +117,7 @@ impl Env {
             ram,
             jobs: Box::new([const { None }; crate::storage::PREPARATIONS]),
             generations: Box::new([0; crate::storage::PREPARATIONS]),
-            seconds: Box::new([const { None }; SECONDS]),
+            seconds: Box::new(Seconds::new()),
             clock: Fixed(Cell::new(Some(Timestamp::legacy_ns(7_000_000_000)))),
             counter: 0,
         }
@@ -286,7 +286,7 @@ impl Env {
     fn assert_quiet(&mut self) {
         assert_eq!(self.ram.storage.preparations_used(), 0);
         assert!(self.jobs.iter().all(Option::is_none));
-        assert!(self.seconds.iter().all(Option::is_none));
+        assert!(self.seconds.is_clear());
         let mut guard = 0;
         while self.ram.storage.reclaim_step() {
             guard += 1;
@@ -300,6 +300,7 @@ impl Env {
             .iter()
             .position(|n| n.pins != [0; 5]);
         assert_eq!(held, None, "a node keeps a pin");
+        assert!(self.ram.storage.free_overlays_are_empty());
     }
 }
 
@@ -1895,4 +1896,79 @@ fn the_base_of_a_resolve_or_an_open_names_a_descriptor_a_node_or_the_reserved_di
     // An absolute path asks nothing of the base.
     assert!(base(&env, proto_fs::BASE_CWD, 0, false).is_ok());
     env.ram.close(&mut fds, fd).unwrap();
+}
+
+fn phase_of(env: &Env) -> ChangePhase {
+    match &env.jobs.iter().flatten().next().unwrap().operation {
+        JobOperation::Change(change) => change.phase(),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn a_change_during_the_walk_counts_one_restart_and_the_answer_is_the_same() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let start = mkdir(7, 1, b"/walked", 0o755, 0);
+    env.start(&mut fds, OWNER, &start).unwrap();
+    // The walk is under way: the table of names is scanned eight at a time.
+    for _ in 0..3 {
+        let (done, _, restarts, _) = env.step(&fds, OWNER, start.key).unwrap();
+        assert!(!done && restarts == 0);
+    }
+    assert_eq!(phase_of(&env), ChangePhase::Resolving);
+    env.node(ROOT, b"foreign", REG, 0o644);
+    let mut last = 0;
+    for _ in 0..2000 {
+        let (done, result, restarts, _) = env.step(&fds, OWNER, start.key).unwrap();
+        last = restarts;
+        if done {
+            assert_eq!(result, 0);
+            break;
+        }
+    }
+    assert_eq!(last, 1);
+    assert!(env.lookup(b"/walked").is_ok());
+    env.release(&mut fds, OWNER, start.key).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn a_change_after_the_reservation_gives_the_reservation_back_and_the_job_goes_on() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let start = mkdir(7, 1, b"/reserved", 0o755, 0);
+    env.start(&mut fds, OWNER, &start).unwrap();
+    let mut steps = 0;
+    while env.ram.storage.usage(BOOT_ROOT).dentries == 0 {
+        steps += 1;
+        assert!(steps < 500);
+        env.step(&fds, OWNER, start.key).unwrap();
+    }
+    assert_eq!(env.lookup(b"/reserved"), Err(NO_ENTRY), "not published");
+    env.node(ROOT, b"foreign", REG, 0o644);
+    let mut restarts = 0;
+    for _ in 0..3000 {
+        let (done, result, count, _) = env.step(&fds, OWNER, start.key).unwrap();
+        restarts = count;
+        if done {
+            assert_eq!(result, 0);
+            break;
+        }
+    }
+    assert_eq!(restarts, 1);
+    let made = env.lookup(b"/reserved").unwrap();
+    assert_eq!(env.ram.storage.node(made).unwrap().kind, DIR);
+    // One directory is paid for, and only one: the first reservation went back
+    // (its inode is reclaimed by the service's maintenance, a step at a time).
+    while env.ram.storage.reclaim_step() {}
+    let mut plain = Env::new();
+    let mut other = session();
+    plain.go(&mut other, mkdir(7, 1, b"/reserved", 0o755, 0), None);
+    assert_eq!(
+        env.ram.storage.usage(BOOT_ROOT),
+        plain.ram.storage.usage(BOOT_ROOT)
+    );
+    env.release(&mut fds, OWNER, start.key).unwrap();
+    env.assert_quiet();
 }

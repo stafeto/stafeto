@@ -1815,6 +1815,24 @@ impl<'a> Storage<'a> {
         }
     }
 
+    /// Every free overlay slot is as `Overlay::EMPTY` has it: the cancel of a
+    /// reserved overlay relies on it.
+    #[cfg(test)]
+    pub(crate) fn free_overlays_are_empty(&self) -> bool {
+        self.state.inode_free[..self.state.inode_len]
+            .iter()
+            .all(|&slot| {
+                let overlay = &self.state.overlays[slot as usize];
+                overlay.node == NONE
+                    && overlay.root == NONE
+                    && overlay.head == NONE
+                    && overlay.mapped_count == 0
+                    && overlay.shadow_boot_sectors == 0
+                    && overlay.pages.iter().all(|&page| page == NONE)
+                    && overlay.group_tail.iter().all(|&tail| tail == NONE)
+            })
+    }
+
     /// Live backing in 512-byte units; sparse holes and retired pages are excluded.
     pub fn blocks(&self, token: Token) -> u64 {
         let node = &self.state.nodes[token.slot as usize];

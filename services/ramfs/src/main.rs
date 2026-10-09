@@ -329,7 +329,7 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     identities: Identities::new(),
     jobs: [const { None }; ramfs::storage::PREPARATIONS],
     job_generations: [0; ramfs::storage::PREPARATIONS],
-    seconds: [const { None }; ramfs::change::SECONDS],
+    seconds: Seconds::new(),
 }));
 
 impl Fs {
