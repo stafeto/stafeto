@@ -153,6 +153,7 @@ fn run(
     });
     cleanup(ram, &mut prep);
     ram.storage.release_preparation(charge);
+    ram.storage.check_name_index();
     result
 }
 fn pins(ram: &Ram<'_>) -> Vec<[u16; 5]> {

@@ -294,6 +294,7 @@ impl Env {
     }
     /// Nothing is paid, pinned or staged any more.
     fn assert_quiet(&mut self) {
+        self.ram.storage.check_name_index();
         assert_eq!(self.ram.cancel_refusals, 0, "a cancel step was refused");
         assert_eq!(self.ram.storage.preparations_used(), 0);
         assert!(self.jobs.iter().all(Option::is_none));
@@ -2139,10 +2140,13 @@ fn phase_of(env: &Env) -> ChangePhase {
 fn a_change_during_the_walk_counts_one_restart_and_the_answer_is_the_same() {
     let mut env = Env::new();
     let mut fds = session();
-    let start = mkdir(7, 1, b"/walked", 0o755, 0);
+    let one = env.node(ROOT, b"one", DIR, 0o755);
+    let two = env.node(one, b"two", DIR, 0o755);
+    env.node(two, b"three", DIR, 0o755);
+    let start = mkdir(7, 1, b"/one/two/three/walked", 0o755, 0);
     env.start(&mut fds, OWNER, &start).unwrap();
-    // The walk is under way: the table of names is scanned eight at a time.
-    for _ in 0..3 {
+    // The walk is under way: a component takes a step.
+    for _ in 0..2 {
         let (done, _, restarts, _) = env.step(&fds, OWNER, start.key).unwrap();
         assert!(!done && restarts == 0);
     }
@@ -2158,7 +2162,7 @@ fn a_change_during_the_walk_counts_one_restart_and_the_answer_is_the_same() {
         }
     }
     assert_eq!(last, 1);
-    assert!(env.lookup(b"/walked").is_ok());
+    assert!(env.lookup(b"/one/two/three/walked").is_ok());
     env.release(&mut fds, OWNER, start.key).unwrap();
     env.assert_quiet();
 }
@@ -2200,5 +2204,342 @@ fn a_change_after_the_reservation_gives_the_reservation_back_and_the_job_goes_on
         plain.ram.storage.usage(BOOT_ROOT)
     );
     env.release(&mut fds, OWNER, start.key).unwrap();
+    env.assert_quiet();
+}
+
+/// `count` more names of one file in the root directory, over several roots
+/// because a root may hold only part of the table.
+fn fill_names(env: &mut Env, prefix: &str, count: usize) {
+    let seed = env.node(ROOT, std::format!("{prefix}seed").as_bytes(), REG, 0o644);
+    for i in 0..count {
+        let root = Root {
+            id: 100 + (i / 200) as u64,
+            generation: 1,
+        };
+        let name = std::format!("{prefix}{i}");
+        env.ram
+            .storage
+            .link(root, ROOT, name.as_bytes(), seed)
+            .unwrap();
+    }
+}
+
+/// Every name goes into one bucket while the guard lives.
+struct OneBucket;
+impl OneBucket {
+    fn new() -> Self {
+        crate::storage::tests_support::FORCED_BUCKET.with(|b| b.set(Some(5)));
+        Self
+    }
+}
+impl Drop for OneBucket {
+    fn drop(&mut self) {
+        crate::storage::tests_support::FORCED_BUCKET.with(|b| b.set(None));
+    }
+}
+
+/// Steps of the walk of `path` to its end, found or missing.
+fn walk_steps(env: &mut Env, path: &[u8]) -> (usize, Result<Progress, u32>) {
+    let mut walk = Resolve::new(&mut env.ram.storage, path, ROOT, ROOT_USER, true).unwrap();
+    let mut steps = 0;
+    let end = loop {
+        steps += 1;
+        assert!(steps < 20_000);
+        match walk.step(&mut env.ram.storage, ROOT_USER) {
+            Ok(Progress::More) => {}
+            other => break other,
+        }
+    };
+    walk.release(&mut env.ram.storage);
+    (steps, end)
+}
+
+#[test]
+fn the_name_index_follows_create_unlink_link_and_every_kind_of_rename() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let a = env.node(ROOT, b"a", DIR, 0o755);
+    let b = env.node(ROOT, b"b", DIR, 0o755);
+    let f = env.node(a, b"f", REG, 0o644);
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/a/f"), Ok(f));
+    // A name moved to another directory is found there and not in the old one.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/a/f"), Some(b"/b/g")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/b/g"), Ok(f));
+    assert_eq!(env.lookup(b"/a/f"), Err(NO_ENTRY));
+    // A second name, then the first one goes.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/b/g"), Some(b"/a/h")),
+        0
+    );
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/b/g"), None),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/b/g"), Err(NO_ENTRY));
+    assert_eq!(env.lookup(b"/a/h"), Ok(f));
+    // A name replaced by a rename: the victim leaves, the source arrives.
+    let victim = env.node(b, b"v", REG, 0o644);
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/a/h"), Some(b"/b/v")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/b/v"), Ok(f));
+    assert_ne!(env.lookup(b"/b/v"), Ok(victim));
+    assert_eq!(env.lookup(b"/a/h"), Err(NO_ENTRY));
+    // A directory moves, and a name of the image does too.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/a"), Some(b"/b/a2")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert!(env.lookup(b"/b/a2").is_ok() && env.lookup(b"/a").is_err());
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/tmp/probe"), Some(b"/b/p")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert!(env.lookup(b"/b/p").is_ok() && env.lookup(b"/tmp/probe").is_err());
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/etc/motd"), None),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/etc/motd"), Err(NO_ENTRY));
+    // A reserved name is no name for anyone else until it is published.
+    let r = env
+        .ram
+        .storage
+        .reserve(FIXTURE, ROOT, b"pending", (REG, 0o644, 0, 0))
+        .unwrap();
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/pending"), Err(NO_ENTRY));
+    env.ram.storage.commit(r).unwrap();
+    env.ram.storage.check_name_index();
+    assert!(env.lookup(b"/pending").is_ok());
+    let r = env
+        .ram
+        .storage
+        .reserve(FIXTURE, ROOT, b"given-back", (REG, 0o644, 0, 0))
+        .unwrap();
+    env.ram.storage.cancel(r).unwrap();
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/given-back"), Err(NO_ENTRY));
+    env.assert_quiet();
+}
+
+#[test]
+fn all_names_in_one_bucket_cost_no_more_steps_than_the_scan_of_the_table() {
+    let _one = OneBucket::new();
+    let mut env = Env::new();
+    fill_names(&mut env, "n", crate::storage::DENTRIES - 2);
+    env.ram.storage.check_name_index();
+    let entries = env.ram.storage.entries();
+    let (missing, end) = walk_steps(&mut env, b"/absent");
+    assert!(matches!(end, Err(NO_ENTRY)));
+    assert!(
+        missing <= entries / 8 + 1,
+        "{missing} steps, {entries} entries"
+    );
+    let (last, end) = walk_steps(&mut env, b"/n0");
+    assert!(matches!(end, Ok(Progress::Found(_))));
+    assert!(last <= entries / 8 + 2);
+    // Names go from the middle and the ends of the chain.
+    let mut fds = session();
+    for name in [&b"/n0"[..], b"/n250", b"/n509"] {
+        assert_eq!(env.go_result(&mut fds, op(ChangeOp::Unlink, name), None), 0);
+        env.ram.storage.check_name_index();
+        assert_eq!(env.lookup(name), Err(NO_ENTRY));
+    }
+}
+
+#[test]
+fn the_names_of_a_full_image_and_a_full_table_are_one_chain_in_the_worst_case() {
+    use bootimg::rootfs::{Entry, REGULAR};
+    let _one = OneBucket::new();
+    let paths: Vec<std::string::String> = (0..bootimg::rootfs::ENTRIES_MAX)
+        .map(|i| std::format!("/i{i}"))
+        .collect();
+    let entries: Vec<Entry<'_>> = paths
+        .iter()
+        .map(|path| Entry {
+            path,
+            mode: REGULAR | 0o644,
+            uid: 0,
+            gid: 0,
+            file: 1,
+        })
+        .collect();
+    let image: &'static [u8] = std::vec::Vec::leak(crate::tree::test_image(&entries));
+    let index: &'static mut crate::tree::Index = Box::leak(Box::new(crate::tree::Index::new()));
+    let tree = crate::tree::load(image, index).unwrap();
+    let mut env = Env::new();
+    env.ram = Ram::with_tree(Timestamp::legacy_ns(1), tree);
+    env.ram.storage.node_mut(ROOT).unwrap().mode = 0o777;
+    fill_names(&mut env, "d", crate::storage::DENTRIES - 2);
+    env.ram.storage.check_name_index();
+    let total = env.ram.storage.entries();
+    let (missing, end) = walk_steps(&mut env, b"/absent");
+    assert!(matches!(end, Err(NO_ENTRY)));
+    // The scan of the table took entries / 8 steps for a miss.
+    assert!(missing <= total / 8 + 1, "{missing} steps, {total} entries");
+    std::println!("one bucket, {total} names: a miss takes {missing} steps");
+}
+
+#[test]
+fn a_miss_and_a_hit_take_one_step_a_component_with_ordinary_chains() {
+    let mut env = Env::new();
+    fill_names(&mut env, "file-", crate::storage::DENTRIES - 2);
+    env.ram.storage.check_name_index();
+    let (missing, end) = walk_steps(&mut env, b"/absent");
+    assert!(matches!(end, Err(NO_ENTRY)));
+    assert!(missing <= 2, "{missing}");
+    let (hit, end) = walk_steps(&mut env, b"/file-100");
+    assert!(matches!(end, Ok(Progress::Found(_))));
+    assert!(hit <= 3, "{hit}");
+}
+
+fn rmdir_op(path: &[u8]) -> ChangeStart<'_> {
+    with_args(ChangeOp::Unlink, path, UNLINK_REMOVEDIR, [0; 4])
+}
+
+#[test]
+fn the_count_of_names_decides_rmdir_and_follows_every_change() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let d = env.node(ROOT, b"d", DIR, 0o755);
+    let e = env.node(ROOT, b"e", DIR, 0o755);
+    let names = |env: &Env, t: Token| env.ram.storage.node(t).unwrap().names;
+    assert_eq!((names(&env, d), names(&env, e)), (0, 0));
+    env.node(d, b"x", REG, 0o644);
+    env.node(d, b"y", REG, 0o644);
+    env.node(d, b"sub", DIR, 0o755);
+    assert_eq!(names(&env, d), 3);
+    assert_eq!(
+        env.go_result(&mut fds, rmdir_op(b"/d"), None),
+        proto_fs::NOT_EMPTY
+    );
+    // A name between directories moves one count; a replaced name takes none.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/d/x"), Some(b"/e/x")),
+        0
+    );
+    assert_eq!((names(&env, d), names(&env, e)), (2, 1));
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/e/x"), Some(b"/e/x2")),
+        0
+    );
+    assert_eq!(names(&env, e), 2);
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/e/x2"), Some(b"/d/y")),
+        0
+    );
+    assert_eq!((names(&env, d), names(&env, e)), (2, 1));
+    // A directory moves with its own count.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/d/sub"), Some(b"/e/sub")),
+        0
+    );
+    assert_eq!((names(&env, d), names(&env, e)), (1, 2));
+    // The last name goes, and the empty directory goes with rmdir.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/d/y"), None),
+        0
+    );
+    assert_eq!(names(&env, d), 0);
+    assert_eq!(env.go_result(&mut fds, rmdir_op(b"/d"), None), 0);
+    assert_eq!(env.lookup(b"/d"), Err(NO_ENTRY));
+    // A directory of the image: its names are counted at the start.
+    let tmp = env.lookup(b"/tmp").unwrap();
+    assert_eq!(names(&env, tmp), 1);
+    assert_eq!(
+        env.go_result(&mut fds, rmdir_op(b"/tmp"), None),
+        proto_fs::NOT_EMPTY
+    );
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/tmp/probe"), None),
+        0
+    );
+    assert_eq!(names(&env, tmp), 0);
+    assert_eq!(env.go_result(&mut fds, rmdir_op(b"/tmp"), None), 0);
+    env.assert_quiet();
+}
+
+#[test]
+fn rmdir_and_unlink_take_a_few_steps_however_many_names_the_table_holds() {
+    let mut env = Env::new();
+    let mut fds = session();
+    fill_names(&mut env, "pad", 400);
+    let d = env.node(ROOT, b"d", DIR, 0o755);
+    env.node(d, b"a", REG, 0o644);
+    let unlink = env.go(&mut fds, op(ChangeOp::Unlink, b"/d/a"), None);
+    assert_eq!(unlink.result, 0);
+    let rmdir = env.go(&mut fds, rmdir_op(b"/d"), None);
+    assert_eq!(rmdir.result, 0);
+    std::println!("unlink {} steps, rmdir {} steps", unlink.steps, rmdir.steps);
+    assert!(unlink.steps <= 10, "{}", unlink.steps);
+    assert!(rmdir.steps <= unlink.steps + 1, "{}", rmdir.steps);
+    env.assert_quiet();
+}
+
+#[test]
+fn path_follows_the_back_reference_of_a_renamed_directory_in_one_step_a_level() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let mut parent = ROOT;
+    let mut text = std::string::String::new();
+    for level in 0..64 {
+        let name = std::format!("l{level}");
+        parent = env.node(parent, name.as_bytes(), DIR, 0o755);
+        text.push('/');
+        text.push_str(&name);
+    }
+    let path = with_args(
+        ChangeOp::Path,
+        text.as_bytes(),
+        proto_fs::PATH_FOLLOW_LAST,
+        [0; 4],
+    );
+    let done = env.go(&mut fds, path, None);
+    assert_eq!(done.result, 0);
+    assert_eq!(done.bytes, text.as_bytes());
+    std::println!("path of depth 64: {} steps", done.steps);
+    assert!(done.steps <= 200, "{}", done.steps);
+    // A directory of the image renamed: the new entry names it.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/etc"), Some(b"/cfg")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    let path = with_args(
+        ChangeOp::Path,
+        b"/cfg/.",
+        proto_fs::PATH_FOLLOW_LAST,
+        [0; 4],
+    );
+    let done = env.go(&mut fds, path, None);
+    assert_eq!((done.result, done.bytes.as_slice()), (0, &b"/cfg"[..]));
+    // And a directory made at run time, moved below another.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/l0"), Some(b"/cfg/moved")),
+        0
+    );
+    let path = with_args(
+        ChangeOp::Path,
+        b"/cfg/moved/l1",
+        proto_fs::PATH_FOLLOW_LAST,
+        [0; 4],
+    );
+    let done = env.go(&mut fds, path, None);
+    assert_eq!(
+        (done.result, done.bytes.as_slice()),
+        (0, &b"/cfg/moved/l1"[..])
+    );
     env.assert_quiet();
 }

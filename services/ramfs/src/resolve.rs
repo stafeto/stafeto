@@ -6,7 +6,7 @@
 use crate::authority::Identity;
 use crate::metadata::{MetadataPath, MetadataProof};
 use crate::namespace::{Edge, Location, NamespacePath, NamespaceProof, RawSyntax};
-use crate::storage::{Pin, ROOT, SYMLINK, Storage, Token};
+use crate::storage::{CHAIN_PORTION, NONE, Pin, ROOT, SYMLINK, Storage, Token};
 use proto_fs::{LOOP, MAX_PATH, NAME_TOO_LONG, NO_ENTRY, NOT_DIRECTORY, STALE_PROOF};
 
 pub struct Resolve {
@@ -18,7 +18,10 @@ pub struct Resolve {
     current: Token,
     at: usize,
     end: usize,
-    search: usize,
+    /// The next entry of the chain of the name being looked for, or NONE.
+    search: u16,
+    /// The entry of the last name the walk matched, or NONE.
+    found: u16,
     looking: bool,
     link: Option<Token>,
     links: u8,
@@ -125,7 +128,8 @@ impl Resolve {
             current: base,
             at: 0,
             end: 0,
-            search: 0,
+            search: NONE,
+            found: NONE,
             looking: false,
             link: None,
             links: 0,
@@ -162,7 +166,8 @@ impl Resolve {
             current: ROOT,
             at: 0,
             end: 0,
-            search: 0,
+            search: NONE,
+            found: NONE,
             looking: false,
             link: None,
             links: 0,
@@ -228,7 +233,8 @@ impl Resolve {
         self.current = self.base;
         self.at = 0;
         self.end = 0;
-        self.search = 0;
+        self.search = NONE;
+        self.found = NONE;
         self.looking = false;
         self.link = None;
         self.links = 0;
@@ -330,11 +336,11 @@ impl Resolve {
                 self.at = self.end;
                 return Ok(Progress::More);
             }
-            self.search = 0;
+            self.search = storage.name_head(self.current, &self.path[self.at..self.end]);
             self.looking = true;
         }
-        for _ in 0..8 {
-            if self.search == storage.entries() {
+        for _ in 0..CHAIN_PORTION {
+            if self.search == NONE {
                 if self.final_component() && self.intent.permits_missing() {
                     // A new name may end in a slash when a directory can take it:
                     // the journal of the operation decides whether one can.
@@ -356,10 +362,11 @@ impl Resolve {
                 return Err(NO_ENTRY);
             }
             let i = self.search;
-            self.search += 1;
-            if let Some((name, token)) = storage.entry(self.current, i)
+            self.search = storage.name_next(i);
+            if let Some((name, token)) = storage.entry(self.current, i as usize)
                 && name == &self.path[self.at..self.end]
             {
+                self.found = i;
                 let node = storage.node(token)?;
                 if node.kind == SYMLINK
                     && (self.follow
@@ -415,14 +422,10 @@ impl Resolve {
             _ => Intent::Namespace { path },
         };
         let proof = self.result_proof(storage, identity, intent)?;
-        let location = if proof.target.is_none() {
+        let location = if proof.target.is_none() || self.found == NONE {
             Location::Missing
         } else {
-            self.search
-                .checked_sub(1)
-                .map(|i| storage.namespace_location(i))
-                .transpose()?
-                .unwrap_or(Location::Missing)
+            storage.namespace_location(self.found as usize)?
         };
         Ok(NamespaceProof {
             edge: Edge {

@@ -72,7 +72,8 @@ fn create_intent_retains_missing_edge_and_restarts_before_publication() {
         Resolve::with_intent(&mut r.storage, b"/parent/\xff", ROOT, OWNER, intent).unwrap();
     let (progress, steps) = intent_ready(&mut r, &mut resolver, OWNER).unwrap();
     assert_eq!(progress, Progress::Missing(parent));
-    assert!(steps >= crate::storage::DENTRIES / 8);
+    // One step for a component, however many names the table holds.
+    assert!(steps <= 3);
     let proof = resolver.result_proof(&r.storage, OWNER, intent).unwrap();
     assert_eq!(proof.parent, parent);
     assert_eq!(proof.leaf, b"\xff");

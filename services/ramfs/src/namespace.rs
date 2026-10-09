@@ -105,7 +105,6 @@ struct Reserves {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    Empty,
     Ancestors,
     Prepay,
     Ready,
@@ -126,7 +125,6 @@ pub struct Preparation {
     epoch: u64,
     reserves: Reserves,
     links: [Option<LinkDelta>; 4],
-    cursor: u16,
     ancestor: Option<Token>,
     ancestor_steps: u16,
     pins_held: u8,
@@ -282,7 +280,18 @@ impl Preparation {
             _ => None,
         }
     }
-    /// One empty-directory portion, ancestor hop, allocation or page-map initialization.
+    /// A directory that goes away or is replaced has no names (the count of
+    /// its node); the prepayment follows.
+    fn finish_ancestors(&mut self, storage: &Storage<'_>) -> Result<(), u32> {
+        if let Some(target) = self.empty_target(storage)
+            && storage.node(target)?.names != 0
+        {
+            return Err(NOT_EMPTY);
+        }
+        self.phase = Phase::Prepay;
+        Ok(())
+    }
+    /// One ancestor hop, allocation or page-map initialization.
     pub fn step(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<bool, u32> {
         if self.outcome.is_some() {
             return Ok(true);
@@ -292,22 +301,6 @@ impl Preparation {
         }
         self.check(storage, identity)?;
         match self.phase {
-            Phase::Empty => {
-                if let Some(target) = self.empty_target(storage) {
-                    for _ in 0..8 {
-                        if self.cursor as usize == storage.entries() {
-                            self.phase = Phase::Prepay;
-                            break;
-                        }
-                        if storage.entry(target, self.cursor as usize).is_some() {
-                            return Err(NOT_EMPTY);
-                        }
-                        self.cursor += 1;
-                    }
-                } else {
-                    self.phase = Phase::Prepay;
-                }
-            }
             Phase::Ancestors => {
                 if self.intent == NamespaceIntent::Rename
                     && storage.node(self.edges[0].target.unwrap())?.kind == crate::DIR
@@ -317,7 +310,7 @@ impl Preparation {
                         return Err(INVALID_ARGUMENT);
                     }
                     if at == ROOT {
-                        self.phase = Phase::Empty;
+                        self.finish_ancestors(storage)?;
                     } else {
                         if self.ancestor_steps == NODES as u16 {
                             return Err(INVALID_ARGUMENT);
@@ -326,7 +319,7 @@ impl Preparation {
                         self.ancestor_steps += 1;
                     }
                 } else {
-                    self.phase = Phase::Empty;
+                    self.finish_ancestors(storage)?;
                 }
             }
             Phase::Prepay => {
@@ -382,7 +375,7 @@ impl Preparation {
             }
         }
         if let Some(victim) = self.empty_target(storage) {
-            if storage.node(victim)?.links != 2 {
+            if storage.node(victim)?.links != 2 || storage.node(victim)?.names != 0 {
                 return Err(STALE_PROOF);
             }
             let parent = if self.intent == NamespaceIntent::Rename {
@@ -437,14 +430,25 @@ impl Preparation {
             } else {
                 self.reserves.dentries[2].take().expect("paid new name")
             };
+            let entry = storage.state.original_len + slot as usize;
+            if storage.state.dentries[slot as usize].len != 0 {
+                // A published name moves: it leaves the chain of the old name
+                // and the count of the old directory.
+                storage.chain_remove(entry);
+                let old = storage.state.dentries[slot as usize].parent;
+                storage.state.nodes[old.slot as usize].names -= 1;
+            }
             let d = &mut storage.state.dentries[slot as usize];
             d.parent = self.edges[1].parent;
             d.node = source;
             d.len = self.destination_len;
             d.name[..d.len as usize].copy_from_slice(&self.destination_name[..d.len as usize]);
             d.reserved = false;
+            storage.chain_insert(entry);
+            storage.state.nodes[self.edges[1].parent.slot as usize].names += 1;
             if storage.state.nodes[source.slot as usize].kind == crate::DIR {
                 storage.state.nodes[source.slot as usize].parent = self.edges[1].parent;
+                storage.state.nodes[source.slot as usize].name_entry = entry as u16;
             }
         }
         for delta in self.links.iter().flatten() {
@@ -604,7 +608,9 @@ impl Storage<'_> {
                 let slot = tombstone.expect("paid original tombstone");
                 self.state.dentries[slot as usize].parent = edge.parent;
                 self.state.dentries[slot as usize].node = edge.target.unwrap();
+                self.chain_remove(i as usize);
                 self.state.originals[i as usize].hidden = true;
+                self.state.nodes[edge.parent.slot as usize].names -= 1;
             }
             Location::Dynamic(i) if drop_dynamic => self.drop_dentry(i as usize),
             Location::Dynamic(_) => {}
@@ -735,7 +741,6 @@ impl Storage<'_> {
                 overlays: [None; 2],
             },
             links: [None; 4],
-            cursor: 0,
             ancestor: None,
             ancestor_steps: 0,
             pins_held: 0,
@@ -782,12 +787,7 @@ fn model_edge<'a>(
     name: &'a [u8],
     role: NamespacePath,
 ) -> Result<NamespaceProof<'a>, u32> {
-    let found = (0..storage.entries()).find_map(|i| {
-        storage
-            .entry(parent, i)
-            .filter(|(n, _)| *n == name)
-            .map(|(_, token)| (i, token))
-    });
+    let found = storage.find(parent, name);
     Ok(NamespaceProof {
         edge: Edge {
             parent,

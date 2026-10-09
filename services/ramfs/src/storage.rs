@@ -25,7 +25,37 @@ pub const PREPARATION_SHARE: u16 = 96;
 pub const ORIGINALS: usize = bootimg::rootfs::ENTRIES_MAX + 5;
 pub const NODES: usize = ORIGINALS + INODES;
 pub const NONE: u16 = u16::MAX;
+/// Heads of the name chains: one per bucket of (parent, name).
+pub const BUCKETS: usize = 2048;
+/// Links of a chain a resolution step follows.
+pub const CHAIN_PORTION: usize = 8;
+/// Entries of the name index: the boot entries then the dynamic ones.
+const NAME_ENTRIES: usize = ORIGINALS + DENTRIES;
 pub const SYMLINK: u32 = 5;
+
+/// The bucket of a name in a directory. The function is fixed; a local user
+/// who finds colliding names only returns the cost to the length of the
+/// table, which is the cost before the index.
+pub(crate) fn name_bucket(parent: Token, name: &[u8]) -> usize {
+    #[cfg(test)]
+    if let Some(bucket) = tests_support::FORCED_BUCKET.with(|b| b.get()) {
+        return bucket;
+    }
+    let mut hash: u32 = 0x811c_9dc5 ^ u32::from(parent.slot);
+    for &byte in name {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    ((hash ^ (hash >> 15)) as usize) & (BUCKETS - 1)
+}
+#[cfg(test)]
+pub(crate) mod tests_support {
+    extern crate std;
+    use std::cell::Cell;
+    std::thread_local! {
+        /// A test puts every name into one bucket.
+        pub static FORCED_BUCKET: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+}
 
 pub fn canonical(tree: &Tree<'_>, n: u16) -> u16 {
     tree.canonical(n)
@@ -108,6 +138,10 @@ pub struct Node {
     overlay: u16,
     reclaim: bool,
     orphan_parent: bool,
+    /// Published names directly in this directory (zero for other kinds).
+    pub names: u16,
+    /// The entry that names this directory (a directory has one name), or NONE.
+    pub name_entry: u16,
 }
 impl Node {
     const EMPTY: Self = Self {
@@ -127,6 +161,8 @@ impl Node {
         overlay: NONE,
         reclaim: false,
         orphan_parent: false,
+        names: 0,
+        name_entry: NONE,
     };
     pub fn live(&self) -> bool {
         self.kind != 0 && !self.reclaim
@@ -282,6 +318,9 @@ pub struct State {
     retired_turn: bool,
     page_next: [u16; PAGES],
     page_logical: [u16; PAGES],
+    name_heads: [u16; BUCKETS],
+    name_next: [u16; NAME_ENTRIES],
+    name_prev: [u16; NAME_ENTRIES],
 }
 impl State {
     pub const fn new() -> Self {
@@ -314,6 +353,9 @@ impl State {
             retired_turn: false,
             page_next: [NONE; PAGES],
             page_logical: [0; PAGES],
+            name_heads: [NONE; BUCKETS],
+            name_next: [NONE; NAME_ENTRIES],
+            name_prev: [NONE; NAME_ENTRIES],
         }
     }
 }
@@ -337,6 +379,9 @@ impl State {
         self.retired_head = 0;
         self.retired_len = 0;
         self.retired_turn = false;
+        self.name_heads.fill(NONE);
+        self.name_next.fill(NONE);
+        self.name_prev.fill(NONE);
     }
 }
 impl Default for State {
@@ -889,7 +934,10 @@ impl<'a> Storage<'a> {
         for (i, free) in state.page_free.iter_mut().enumerate() {
             *free = (PAGES - i - 1) as u16;
         }
-        let out = Self { state, data, tree };
+        let mut out = Self { state, data, tree };
+        out.state.name_heads.fill(NONE);
+        out.state.name_next.fill(NONE);
+        out.state.name_prev.fill(NONE);
         for (i, (kind, mode, links, length, parent)) in [
             (crate::DIR, 0o555, 4, 0, ROOT),
             (crate::DIR, 0o555, 2, 0, ROOT),
@@ -981,6 +1029,15 @@ impl<'a> Storage<'a> {
                 };
             }
             out.state.original_len += tree.len() as usize;
+        }
+        for i in 0..out.state.original_len {
+            let original = out.state.originals[i];
+            out.state.nodes[original.parent.slot as usize].names += 1;
+            let node = &mut out.state.nodes[original.node.slot as usize];
+            if node.kind == crate::DIR {
+                node.name_entry = i as u16;
+            }
+            out.chain_insert(i);
         }
         // Canonical hard-link aliases occupy one initialized Node. Empty original
         // slots add no inode capacity. Boot capacity remains fixed after startup.
@@ -1167,25 +1224,70 @@ impl<'a> Storage<'a> {
         self.state.original_len + DENTRIES
     }
     pub fn lookup(&self, parent: Token, name: &[u8]) -> Result<Token, u32> {
-        for (i, original) in self.state.originals[..self.state.original_len]
-            .iter()
-            .enumerate()
-        {
-            if !original.hidden && original.parent == parent && self.original_name(i) == name {
-                return Ok(original.node);
-            }
-        }
-        for dentry in &self.state.dentries {
-            if dentry.len != 0
-                && !dentry.reserved
-                && dentry.parent == parent
-                && dentry.len as usize == name.len()
-                && &dentry.name[..dentry.len as usize] == name
+        self.find(parent, name)
+            .map(|(_, token)| token)
+            .ok_or(NO_ENTRY)
+    }
+    /// The entry that holds the published name, whole chain.
+    pub(crate) fn find(&self, parent: Token, name: &[u8]) -> Option<(usize, Token)> {
+        let mut i = self.name_head(parent, name);
+        while i != NONE {
+            if let Some((found, token)) = self.entry(parent, i as usize)
+                && found == name
             {
-                return Ok(dentry.node);
+                return Some((i as usize, token));
             }
+            i = self.name_next(i);
         }
-        Err(NO_ENTRY)
+        None
+    }
+    /// The first entry of the chain of (parent, name), or NONE.
+    pub(crate) fn name_head(&self, parent: Token, name: &[u8]) -> u16 {
+        self.state.name_heads[name_bucket(parent, name)]
+    }
+    pub(crate) fn name_next(&self, entry: u16) -> u16 {
+        self.state.name_next[entry as usize]
+    }
+    /// The parent and name of an entry that is or was published.
+    fn entry_key(&self, index: usize) -> (Token, &[u8]) {
+        if index < self.state.original_len {
+            (
+                self.state.originals[index].parent,
+                self.original_name(index),
+            )
+        } else {
+            let d = &self.state.dentries[index - self.state.original_len];
+            (d.parent, &d.name[..d.len as usize])
+        }
+    }
+    /// Puts a published entry at the head of its chain. Constant work.
+    pub(crate) fn chain_insert(&mut self, index: usize) {
+        let (parent, name) = self.entry_key(index);
+        let bucket = name_bucket(parent, name);
+        let head = self.state.name_heads[bucket];
+        self.state.name_next[index] = head;
+        self.state.name_prev[index] = NONE;
+        if head != NONE {
+            self.state.name_prev[head as usize] = index as u16;
+        }
+        self.state.name_heads[bucket] = index as u16;
+    }
+    /// Takes an entry out of its chain; its parent and name are still the
+    /// published ones. Constant work.
+    pub(crate) fn chain_remove(&mut self, index: usize) {
+        let prev = self.state.name_prev[index];
+        let next = self.state.name_next[index];
+        if prev == NONE {
+            let (parent, name) = self.entry_key(index);
+            self.state.name_heads[name_bucket(parent, name)] = next;
+        } else {
+            self.state.name_next[prev as usize] = next;
+        }
+        if next != NONE {
+            self.state.name_prev[next as usize] = prev;
+        }
+        self.state.name_next[index] = NONE;
+        self.state.name_prev[index] = NONE;
     }
     pub fn resolve(&self, path: &[u8]) -> Result<Token, u32> {
         let mut token = ROOT;
@@ -1431,10 +1533,14 @@ impl<'a> Storage<'a> {
             parent.links
         };
         self.state.dentries[reservation.dentry as usize].reserved = false;
+        let entry = self.state.original_len + reservation.dentry as usize;
+        self.chain_insert(entry);
+        self.state.nodes[d.parent.slot as usize].names += 1;
         let n = &mut self.state.nodes[reservation.token.slot as usize];
         n.pins[Pin::Pending.index()] -= 1;
         n.links = if n.kind == crate::DIR { 2 } else { 1 };
         if n.kind == crate::DIR {
+            n.name_entry = entry as u16;
             self.state.nodes[d.parent.slot as usize].links = parent_links;
         }
         self.unpin(d.parent, Pin::Pending)?;
@@ -1513,7 +1619,12 @@ impl<'a> Storage<'a> {
     }
 
     fn drop_dentry(&mut self, i: usize) {
-        let root = self.state.dentries[i].root as usize;
+        let d = self.state.dentries[i];
+        if d.len != 0 && !d.reserved {
+            self.chain_remove(self.state.original_len + i);
+            self.state.nodes[d.parent.slot as usize].names -= 1;
+        }
+        let root = d.root as usize;
         self.state.dentries[i] = Dentry::EMPTY;
         self.state.dentry_free[self.state.dentry_len] = i as u16;
         self.state.dentry_len += 1;
@@ -2718,6 +2829,74 @@ mod root_sorted_review {
             assert_eq!(storage.read(token, offset as u64, &mut bytes), Ok(2));
             assert_eq!(&bytes, b"XY");
             chain(storage, token);
+        }
+    }
+}
+
+/// The name index checked against the tables, for the host tests.
+#[cfg(test)]
+mod index_check {
+    extern crate std;
+    use super::*;
+    use std::vec;
+
+    impl Storage<'_> {
+        fn published(&self, index: usize) -> bool {
+            if index < self.state.original_len {
+                !self.state.originals[index].hidden
+            } else {
+                let d = &self.state.dentries[index - self.state.original_len];
+                d.len != 0 && !d.reserved
+            }
+        }
+        /// Panics unless every published name is in exactly the chain of its
+        /// key, no other entry is in a chain, the links agree both ways, and
+        /// the counts and back references of the directories are exact.
+        pub(crate) fn check_name_index(&self) {
+            let total = self.entries();
+            let mut seen = vec![false; total];
+            for bucket in 0..BUCKETS {
+                let mut previous = NONE;
+                let mut at = self.state.name_heads[bucket];
+                let mut guard = 0;
+                while at != NONE {
+                    let i = at as usize;
+                    assert!(i < total, "a chain leaves the table");
+                    assert!(!seen[i], "entry {i} is in a chain twice");
+                    seen[i] = true;
+                    assert!(self.published(i), "entry {i} is not published");
+                    let (parent, name) = self.entry_key(i);
+                    assert_eq!(name_bucket(parent, name), bucket, "entry {i} in a bucket");
+                    assert_eq!(self.state.name_prev[i], previous, "entry {i} back link");
+                    previous = at;
+                    at = self.state.name_next[i];
+                    guard += 1;
+                    assert!(guard <= total, "a chain loops");
+                }
+            }
+            let mut names = vec![0u32; NODES];
+            for i in 0..total {
+                assert_eq!(seen[i], self.published(i), "entry {i} membership");
+                if !seen[i] {
+                    assert_eq!(self.state.name_next[i], NONE, "entry {i} next");
+                    assert_eq!(self.state.name_prev[i], NONE, "entry {i} prev");
+                } else {
+                    names[self.entry_key(i).0.slot as usize] += 1;
+                }
+            }
+            for (slot, node) in self.state.nodes.iter().enumerate() {
+                if node.kind == 0 {
+                    continue;
+                }
+                assert_eq!(u32::from(node.names), names[slot], "names of node {slot}");
+                if node.kind == crate::DIR && slot != 0 && node.links != 0 {
+                    let (name, target) = self
+                        .entry(node.parent, node.name_entry as usize)
+                        .unwrap_or_else(|| panic!("directory {slot} has no name entry"));
+                    assert_eq!(target.slot as usize, slot, "name of directory {slot}");
+                    assert!(!name.is_empty());
+                }
+            }
         }
     }
 }
