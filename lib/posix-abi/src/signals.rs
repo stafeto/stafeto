@@ -381,6 +381,78 @@ fn taken(block: &Block, signal: i32) -> SigInfo {
     }
 }
 
+/// Marks along the path of `pthread_kill` for rtbench's S5 (feature
+/// `rtbench-marks`, `cargo xtask rtbench --short --icount --marks`): the
+/// counter and the kernel calls at five places, printed as one `MARKS`
+/// line per signal handled. Without the feature `mark` and `report` are
+/// empty and the path is the one that ships.
+#[cfg(feature = "rtbench-marks")]
+mod marks {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static CALLS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static ARMED: AtomicU64 = AtomicU64::new(0);
+
+    #[inline(always)]
+    fn counter() -> u64 {
+        let value: u64;
+        // SAFETY: reads the virtual counter, no memory is touched.
+        unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) value) };
+        value
+    }
+
+    /// Mark 0 arms the marks (the request), the others count while armed.
+    #[inline(always)]
+    pub fn mark(i: usize) {
+        if i == 0 {
+            ARMED.store(1, Ordering::Relaxed);
+        } else if ARMED.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        CALLS[i].store(rt::sys::calls(), Ordering::Relaxed);
+        COUNTER[i].store(counter(), Ordering::Relaxed);
+    }
+
+    /// The line `MARKS` with the counter and calls of the four segments:
+    /// `kill_relibc_thread` to the request, to `dispatch`, to `deliver`, to
+    /// the handler.
+    pub fn report() {
+        if ARMED.swap(0, Ordering::Relaxed) == 0 {
+            return;
+        }
+        let ticks = |a: usize, b: usize| {
+            COUNTER[b]
+                .load(Ordering::Relaxed)
+                .wrapping_sub(COUNTER[a].load(Ordering::Relaxed))
+        };
+        let calls = |a: usize, b: usize| {
+            CALLS[b]
+                .load(Ordering::Relaxed)
+                .wrapping_sub(CALLS[a].load(Ordering::Relaxed))
+        };
+        rt::println!(
+            "MARKS {} {} {} {} {} {} {} {}",
+            ticks(0, 1),
+            calls(0, 1),
+            ticks(1, 2),
+            calls(1, 2),
+            ticks(2, 3),
+            calls(2, 3),
+            ticks(3, 4),
+            calls(3, 4)
+        );
+    }
+}
+
+#[cfg(not(feature = "rtbench-marks"))]
+mod marks {
+    #[inline(always)]
+    pub fn mark(_: usize) {}
+    #[inline(always)]
+    pub fn report() {}
+}
+
 struct ClaimCritical;
 impl Drop for ClaimCritical {
     fn drop(&mut self) {
@@ -808,6 +880,7 @@ fn send(
         return;
     }
     let flags = block.flags.load(Ordering::SeqCst);
+    marks::mark(1);
     if flags & flag::SIGNAL_WAIT != 0 && block.wait_set.load(Ordering::SeqCst) & bit != 0 {
         let channel =
             Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
@@ -823,6 +896,7 @@ fn send(
 /// return. Job-control generations and process-wide effects go through
 /// the process service. 0 or an error number.
 pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
+    marks::mark(0);
     let bit = if signal == 0 {
         0
     } else {
@@ -1389,6 +1463,7 @@ pub(crate) fn deliver_deferred() {
 }
 
 unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
+    marks::mark(2);
     #[cfg(feature = "thread-probe")]
     native_stop_probe::entry(own());
     // Inside a critical section of the layer the entry only marks itself
@@ -1513,6 +1588,7 @@ impl SignalPreparation {
 /// masks them on return. A null native frame requests a context-aware entry
 /// for SA_SIGINFO handlers.
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
+    marks::mark(3);
     #[cfg(feature = "thread-probe")]
     if entered {
         ENTRY_DELIVERIES.fetch_add(1, Ordering::Relaxed);
@@ -1611,7 +1687,9 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             if entered {
                 unsafe { upcall::enable() }.expect("nested signal entry");
             }
+            marks::mark(4);
             unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
+            marks::report();
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }
@@ -1631,7 +1709,9 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             if entered {
                 unsafe { upcall::enable() }.expect("nested signal entry");
             }
+            marks::mark(4);
             unsafe { callback(signal) };
+            marks::report();
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }

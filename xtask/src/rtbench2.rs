@@ -16,8 +16,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::{
-    BOOT_PROFILE, ImageProgram, RTBENCH_POSIX_PROGRAMS, RTBENCH_POSIX_VZ_PROGRAMS, Variant, build,
-    hvf_host, qemu, target_dir, vz, write_boot_image_with,
+    BOOT_PROFILE, ImageProgram, RTBENCH_POSIX_PROGRAMS, RTBENCH_POSIX_VZ_PROGRAMS, S5_ICOUNT_MAX,
+    S5_ICOUNT_SLACK, Variant, build, guard_lower_hint, guard_margin, hvf_host, qemu, target_dir,
+    vz, write_boot_image_with,
 };
 
 /// The rows of a run, in its order: each comes once, as numbers or as
@@ -311,6 +312,11 @@ fn image(name: &str, programs: &[ImageProgram], seconds: u64) -> Result<PathBuf,
 /// One run of `cmd` for `seconds`, its file and log under target/measure
 /// as `machine`; the parsed run.
 fn measure(cmd: Command, machine: &str, seconds: u64) -> Result<Run, String> {
+    measure_lines(cmd, machine, seconds).map(|(run, _)| run)
+}
+
+/// `measure` with the lines of the machine's output.
+fn measure_lines(cmd: Command, machine: &str, seconds: u64) -> Result<(Run, Vec<String>), String> {
     println!("rtbench 2: {machine}, {seconds} s");
     let before = output("uptime", &[]);
     let timeout = Duration::from_secs(seconds) + ROUND * 2;
@@ -338,7 +344,7 @@ fn measure(cmd: Command, machine: &str, seconds: u64) -> Result<Run, String> {
     std::fs::write(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
     print!("{text}");
     println!("rtbench 2: {} and {}", path.display(), log.display());
-    Ok(run)
+    Ok((run, outcome.lines))
 }
 
 /// How `rtbench --minutes N` places its two runs.
@@ -392,16 +398,134 @@ pub fn run(minutes: u64, placing: Placing) -> Result<(), String> {
     Ok(())
 }
 
-/// One round on QEMU TCG (`ci`): the scenarios run and their rows are
-/// whole; its numbers compare nothing.
-pub fn short() -> Result<(), String> {
+/// How `rtbench --short` runs its round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Short {
+    /// On TCG at its own speed: the rows are whole, the numbers compare
+    /// nothing.
+    Plain,
+    /// Under -icount (`ci`): a tick is an instruction, and the path of
+    /// `pthread_kill` (S5) stays under `S5_ICOUNT_MAX`.
+    Icount,
+    /// Under -icount with the marks of posix-abi along that path: the
+    /// segments are printed and the guard is not checked (the marks add
+    /// instructions).
+    Marks,
+}
+
+/// The instructions of the three rows of S5: the `min` of each, in ticks of
+/// the counter, which under -icount are instructions.
+fn s5_ticks(run: &Run) -> Result<Vec<u64>, String> {
+    S5_ROWS
+        .iter()
+        .map(|name| match run.rows.iter().find(|(n, _)| n == name) {
+            // The file keeps nanoseconds: a tick is 1e9 / hz of them.
+            Some((_, Row::Numbers(r))) => {
+                Ok((u128::from(r.min) * u128::from(run.hz) + 500_000_000) as u64 / 1_000_000_000)
+            }
+            _ => Err(format!("no numbers for {name}")),
+        })
+        .collect()
+}
+
+const S5_ROWS: [&str; 3] = ["s5_kill_sleeping", "s5_kill_reading", "s5_kill_busy_25"];
+
+/// The room the S5 rows of an -icount run leave under `max` (the least of
+/// the three), or the error that names the row past it.
+fn s5_room(run: &Run, max: u64) -> Result<u64, String> {
+    let ticks = s5_ticks(run)?;
+    let mut room = u64::MAX;
+    for name in S5_ROWS {
+        room = room.min(guard_margin(
+            "S5 under icount",
+            &S5_ROWS,
+            &ticks,
+            name,
+            max,
+        )?);
+    }
+    Ok(room)
+}
+
+/// The lines `MARKS a b c d e f g h` that posix-abi prints (feature
+/// `rtbench-marks`): the counter ticks and kernel calls of the segments
+/// `kill_relibc_thread` to the request, the request to `dispatch`,
+/// `dispatch` to `deliver`, `deliver` to the handler.
+/// The rows of the three scenarios come in turn, `size` each; the first
+/// signal of each is a warm-up. Returns the median of each scenario.
+fn marks_summary(lines: &[String]) -> Result<Vec<String>, String> {
+    let rows: Vec<Vec<i64>> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("MARKS "))
+        .map(|l| l.split_whitespace().map(|w| w.parse::<i64>()).collect())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("bad MARKS line: {e}"))?;
+    let size = rows.len() / S5_ROWS.len();
+    if size < 2 || rows.iter().any(|r| r.len() != 8) {
+        return Err(format!(
+            "{} MARKS lines do not make three scenarios",
+            rows.len()
+        ));
+    }
+    let mut out = Vec::new();
+    for (g, name) in S5_ROWS.iter().enumerate() {
+        let part = &rows[g * size + 1..(g + 1) * size];
+        let med: Vec<i64> = (0..8)
+            .map(|i| {
+                let mut column: Vec<i64> = part.iter().map(|r| r[i]).collect();
+                column.sort_unstable();
+                column[column.len() / 2]
+            })
+            .collect();
+        out.push(format!(
+            "{name} ({} signals): kill_relibc_thread to request {}/{}, request to dispatch {}/{}, dispatch to deliver {}/{}, deliver to handler {}/{} (ticks/kernel calls)",
+            part.len(), med[0], med[1], med[2], med[3], med[4], med[5], med[6], med[7]
+        ));
+    }
+    Ok(out)
+}
+
+/// `cargo xtask rtbench --short [--icount [--marks]]`: one round on QEMU
+/// TCG (`ci`); the scenarios run and their rows are whole.
+pub fn short(how: Short) -> Result<(), String> {
     crate::relibc()?;
     crate::busybox_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = image("rtbench-posix-short.img", &RTBENCH_POSIX_PROGRAMS, 0)?;
+    let mut programs = RTBENCH_POSIX_PROGRAMS;
+    if how == Short::Marks {
+        let at = programs
+            .iter()
+            .position(|p| p.1 == "rtbench-posix")
+            .ok_or("no rtbench-posix in the image")?;
+        programs[at].3 = &["rtbench-marks"];
+    }
+    let image = image("rtbench-posix-short.img", &programs, 0)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    measure(cmd, "tcg", 0).map(drop)
+    if how == Short::Plain {
+        return measure(cmd, "tcg", 0).map(drop);
+    }
+    cmd.args(qemu::ICOUNT);
+    let (run, lines) = measure_lines(cmd, "icount", 0)?;
+    if how == Short::Marks {
+        for line in marks_summary(&lines)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    let room = s5_room(&run, S5_ICOUNT_MAX)?;
+    println!(
+        "S5 instructions under icount: {} of S5_ICOUNT_MAX {S5_ICOUNT_MAX}, room {room}",
+        s5_ticks(&run)?
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if let Some(hint) = guard_lower_hint("S5_ICOUNT_MAX", room, S5_ICOUNT_SLACK, S5_ICOUNT_MAX) {
+        println!("{hint}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -550,5 +674,72 @@ mod tests {
         let mut lines = self::lines();
         lines.pop();
         assert_eq!(parse(&lines).unwrap_err(), "no RTB2 DONE");
+    }
+
+    fn run_with_s5(min_ns: u64) -> Run {
+        let mut lines = lines();
+        lines[0] = "RTB2 START hz=62500000 seconds=0".to_owned();
+        for name in S5_ROWS {
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with(&format!("RTB2 {name} ")))
+                .unwrap();
+            lines[at] =
+                format!("RTB2 {name} n=3 min={min_ns} p50={min_ns} p99={min_ns} max={min_ns} h=3");
+        }
+        parse(&lines).unwrap()
+    }
+
+    /// 16 ns a tick under -icount: 2 772 instructions are 44 352 ns.
+    #[test]
+    fn the_guard_of_s5_holds_at_its_number_and_fires_one_over() {
+        let at = run_with_s5(S5_ICOUNT_MAX * 16);
+        assert_eq!(s5_ticks(&at).unwrap(), [S5_ICOUNT_MAX; 3]);
+        assert_eq!(s5_room(&at, S5_ICOUNT_MAX), Ok(0));
+        let head = run_with_s5(2_756 * 16);
+        assert_eq!(s5_room(&head, S5_ICOUNT_MAX), Ok(16));
+        let over = run_with_s5((S5_ICOUNT_MAX + 1) * 16);
+        let error = s5_room(&over, S5_ICOUNT_MAX).unwrap_err();
+        assert!(
+            error.contains("s5_kill_sleeping=2773") && error.contains("1 past its guard 2772"),
+            "{error}"
+        );
+        // One row alone over the number fires too.
+        let mut one = run_with_s5(2_756 * 16);
+        let at = one
+            .rows
+            .iter()
+            .position(|(n, _)| *n == "s5_kill_busy_25")
+            .unwrap();
+        if let Row::Numbers(r) = &mut one.rows[at].1 {
+            r.min = 2_790 * 16;
+        }
+        assert!(
+            s5_room(&one, S5_ICOUNT_MAX)
+                .unwrap_err()
+                .contains("s5_kill_busy_25=2790")
+        );
+    }
+
+    #[test]
+    fn marks_give_the_median_of_each_scenario_without_its_warm_up() {
+        let mut lines = vec!["noise".to_owned()];
+        for scenario in 0..3 {
+            // The warm-up is far off; the others are 100, 101, 102.
+            lines.push("MARKS 9999 9 9999 9 9999 9 9999 9".to_owned());
+            for i in 0..3 {
+                let t = 100 + i + scenario * 10;
+                lines.push(format!("MARKS {t} 1 {t} 0 {t} 1 {t} 0"));
+            }
+        }
+        let out = marks_summary(&lines).unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out[0].contains("to request 101/1, request to dispatch 101/0"));
+        assert!(
+            out[2].contains("dispatch to deliver 121/1, deliver to handler 121/0"),
+            "{}",
+            out[2]
+        );
+        assert!(marks_summary(&lines[..3]).is_err());
     }
 }

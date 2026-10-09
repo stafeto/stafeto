@@ -1122,7 +1122,9 @@ commands:
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ;
             with --minutes N, the POSIX scenarios of rtbench 2 on HVF and VZ,
             at the same time or, with --serial, one after the other;
-            with --short, one round of them on TCG, as ci runs it
+            with --short, one round of them on TCG; with --short --icount, as
+            ci runs it, under -icount, where the instructions of S5 stay under
+            S5_ICOUNT_MAX; with --marks added, the segments of that path
   rtbench-check SESSION... compare the base and head runs of at least four alternating
             sessions (each a directory with `order`, `base/`, `head/`, the files
             rtbench-hvf.txt and rtbench-vz.txt) against the limits of epoch 2
@@ -1239,7 +1241,17 @@ fn main() {
                     };
                     rtbench2::run(minutes, placing)
                 }),
-            [flag] if flag == "--short" => relibc().and_then(|()| rtbench2::short()),
+            [flag, rest @ ..] if flag == "--short" => {
+                let how = match rest {
+                    [] => Ok(rtbench2::Short::Plain),
+                    [icount] if icount == "--icount" => Ok(rtbench2::Short::Icount),
+                    [icount, marks] if icount == "--icount" && marks == "--marks" => {
+                        Ok(rtbench2::Short::Marks)
+                    }
+                    _ => Err("usage: rtbench --short [--icount [--marks]]".to_owned()),
+                };
+                how.and_then(|how| relibc().and_then(|()| rtbench2::short(how)))
+            }
             rest => rtbench::run(rest),
         },
         Some("rtbench-check") => rtbench_check::run(&args[1..]),
@@ -3265,10 +3277,14 @@ const KERNEL_B_MAX: u64 = 18_000;
 const _: () = assert!(KERNEL_B_MAX < TERM_B);
 
 /// The guards of the paths epoch 2 made shorter, in ticks under -icount on
-/// the normal build (`init_tests`, row `null` of `normal build`) and on the
-/// test build (`kernel_tests`, row `threads_ready` of `teardown portions`).
-/// Each sits four ticks above the measure at the end of epoch 2 (262 and
-/// 12 764); a higher number needs a decision with its reason written down.
+/// the normal build (`init_tests`, row `null` of `normal build`), on the
+/// test build (`kernel_tests`, row `threads_ready` of `teardown portions`)
+/// and on the benchmark's image (`rtbench --short --icount`, the `min` of
+/// the three `s5_*` rows: the whole path of `pthread_kill` to the handler
+/// of the target, in instructions). The first two sit four ticks above the
+/// measure at the end of epoch 2 (262 and 12 764), the third sixteen above
+/// the measure at e0c670e (2 756, 4f3c7d0 had 2 562); a higher number needs
+/// a decision with its reason written down.
 ///
 /// Rules for a guard that fires (the paths are deterministic under -icount,
 /// so a firing is no noise and a repeat does not clear it):
@@ -3276,10 +3292,12 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    the constant in the same commit, with a line here: the new number,
 ///    the commit, the reason.
 /// 2. When the source of the path did not change (the compiler moved the
-///    code) and the excess is at most `NULL_SLACK` for `null` or
-///    `THREADS_READY_SLACK` for `threads_ready` (one instruction a thread),
-///    the author raises it with that line; a larger excess or a changed
-///    path needs the decision of the reviewer of the kernel.
+///    code) and the excess is at most `NULL_SLACK` for `null`,
+///    `THREADS_READY_SLACK` for `threads_ready` (one instruction a thread)
+///    or `S5_ICOUNT_SLACK` for the S5 rows, the author raises it with that
+///    line; a larger excess or a changed path needs the decision of the
+///    reviewer of the kernel (for the S5 rows, of the realtime reviewer:
+///    `rtbench --short --icount --marks` prints the segments of the path).
 /// 3. A change of the Rust toolchain measures both rows again and sets the
 ///    constants anew in the same commit.
 /// 4. The guard looks down too: when the room is larger than the slack,
@@ -3288,9 +3306,11 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    turn into room for later growth.
 const NULL_MAX: u64 = 266;
 const THREADS_READY_MAX: u64 = 12_768;
+const S5_ICOUNT_MAX: u64 = 2_772;
 /// The room above which a guard asks to be lowered (rule 4).
 const NULL_SLACK: u64 = 16;
 const THREADS_READY_SLACK: u64 = 128;
+const S5_ICOUNT_SLACK: u64 = 16;
 
 /// The most one step of a service may take (one READ_INTO of up to
 /// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for
@@ -4528,7 +4548,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("ash", ash_probe),
         job("ash-dialog", ash_dialog),
         job("ls", ls_probe),
-        job("rtbench-short", rtbench2::short),
+        // One round of the benchmark under -icount: its rows are whole and
+        // the path of pthread_kill stays under S5_ICOUNT_MAX.
+        job("rtbench-short", || rtbench2::short(rtbench2::Short::Icount)),
         job("boot 512M GICv2", || {
             boot_smoke(&qemu::VIRT, GIC_V2_LINE).map(drop)
         }),
