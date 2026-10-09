@@ -118,9 +118,24 @@ pub fn probe_hook(hook: Option<fn(Probe) -> bool>) {
     );
 }
 
+/// How many requests the kernel itself took back from the queue of a service
+/// because a signal came while they waited (the replies of the hook that are
+/// lost on purpose are not counted).
+#[cfg(feature = "change-probe")]
+static INTERRUPTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The requests the kernel took back since the start of the process.
+#[cfg(feature = "change-probe")]
+pub fn interrupted_requests() -> u32 {
+    INTERRUPTED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// The reply of the request stands as it came, or is lost.
 #[cfg(feature = "change-probe")]
 fn probe<T>(kind: Probe, reply: Result<T, Status>) -> Result<T, Status> {
+    if matches!(reply, Err(Status::Kernel(rt::abi::Error::Interrupted))) {
+        INTERRUPTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     let hook = HOOK.load(core::sync::atomic::Ordering::Acquire);
     if hook == 0 {
         return reply;

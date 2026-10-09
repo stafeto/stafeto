@@ -782,12 +782,16 @@ extern int files_gone_places(void);
 extern int files_names_pipe(void);
 extern int files_names_fork_in_flight(void);
 
+#include "names-signal.c"
+
 /* The role: a child of the loader, which can fork. */
 static int names_role(void) {
     int pipes = files_names_pipe();
     if (pipes) { printf("posix-procs: names on a pipe gave %d\n", pipes); return 2; }
     int forks = files_names_fork_in_flight();
     if (forks) { printf("posix-procs: fork in the middle of a rename gave %d\n", forks); return 3; }
+    int signals = names_signals();
+    if (signals) { printf("posix-procs: a signal in the middle of a rename gave %d\n", signals); return 4; }
     return 0;
 }
 #endif

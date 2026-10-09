@@ -86,3 +86,10 @@ pub extern "C" fn files_names_fork_in_flight() -> i32 {
         .err()
         .unwrap_or(0)
 }
+
+/// How many requests of the operations on names the kernel took back from
+/// the queue of the service because a signal came (names-signal.c reads it).
+#[unsafe(no_mangle)]
+pub extern "C" fn files_names_interrupted() -> u32 {
+    posix_abi::change::interrupted_requests()
+}
