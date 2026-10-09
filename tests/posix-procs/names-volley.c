@@ -15,6 +15,8 @@
 extern void files_volley_start(void);
 extern void files_volley_stop(void);
 extern unsigned files_volley_requests(void);
+extern void files_volley_thread_start(void);
+extern unsigned files_volley_thread_requests(void);
 extern unsigned long long files_volley_ticks(void);
 extern unsigned long long files_volley_frequency(void);
 extern unsigned files_volley_restarts(int op);
@@ -266,6 +268,7 @@ static volatile int vz_flood_stop;
 static volatile int vz_rmdir_result = -2;
 static volatile int vz_rmdir_done;
 static unsigned long long vz_rmdir_ticks;
+static unsigned vz_rmdir_requests;
 
 static void *vz_flood(void *unused) {
     struct timespec times[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
@@ -279,9 +282,11 @@ static void *vz_flood(void *unused) {
 }
 
 static void *vz_long_rmdir(void *unused) {
+    files_volley_thread_start();
     unsigned long long begin = files_volley_ticks();
     vz_rmdir_result = rmdir(VZ "/e");
     vz_rmdir_ticks = files_volley_ticks() - begin;
+    vz_rmdir_requests = files_volley_thread_requests();
     vz_rmdir_done = 1;
     return unused;
 }
@@ -302,6 +307,7 @@ static int vz_starvation(void) {
     vz_mark();
     VZ_CHECK(rmdir(VZ "/e") == 0);
     unsigned long long quiet_ticks = files_volley_ticks() - vz_ticks0;
+    unsigned quiet_requests = files_volley_requests() - vz_requests0;
     vz_line("rmdir with a full table");
     VZ_CHECK(mkdir(VZ "/e", 0755) == 0);
     files_volley_start();
@@ -324,9 +330,9 @@ static int vz_starvation(void) {
     VZ_CHECK(vz_flood_stop == 1);
     VZ_CHECK(vz_rmdir_result == 0);
     printf("posix-procs: names starvation: rmdir in a table of %d names against a loop of utimensat: "
-           "%u restarts, finished within 10 s: %s, took %llu ticks, alone %llu ticks\n",
+           "%u restarts, finished within 10 s: %s, took %llu ticks, alone %llu ticks, requests %u, alone requests %u\n",
            made + VZ_PAD, files_volley_restarts(VZ_OP_UNLINK), within ? "yes" : "no", vz_rmdir_ticks,
-           quiet_ticks);
+           quiet_ticks, vz_rmdir_requests, quiet_requests);
     for (int i = 0; i < made; i++) {
         char name[40];
         snprintf(name, sizeof name, VZ "/q%d", i);

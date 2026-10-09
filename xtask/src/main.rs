@@ -3674,7 +3674,7 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
         find(row)?;
     }
     // G1: the long rmdir against the loop of utimensat of a file of its own:
-    // it ends, no restart, in at most twice the time it takes alone.
+    // It ends with the same request count and at most 2.5 times the time alone.
     let starvation = find("names starvation:")?;
     let verdict = format!("finished within 10 s: {STARVATION_ENDS_WITHIN_10_S}");
     if !starvation.contains(&verdict) {
@@ -3695,9 +3695,16 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
         number(&starvation_line, "took ")?,
         number(&starvation_line, "alone ")?,
     );
-    if took > 2 * alone {
+    let requests = number(&starvation_line, ", requests ")?;
+    let alone_requests = number(&starvation_line, "alone requests ")?;
+    if requests != alone_requests || requests == 0 {
         return Err(format!(
-            "G1: the long rmdir took {took} ticks against the flood, more than twice the \
+            "G1: request count changed from {alone_requests} to {requests}: {starvation}"
+        ));
+    }
+    if took.saturating_mul(2) > alone.saturating_mul(5) {
+        return Err(format!(
+            "G1: the long rmdir took {took} ticks against the flood, more than 2.5 times the \
              {alone} ticks it takes alone: {starvation}"
         ));
     }
@@ -6930,7 +6937,7 @@ mod tests {
             "posix-procs: names time rename of a directory under a chain 64 deep: 1559 requests, 15679606 ticks",
             "posix-procs: names time rmdir with a full table: 96 requests, 855238 ticks",
             "posix-procs: names thread cost: 28672 bytes (7 pages) for the first thread, 28672 bytes the last, 86016 bytes for 3, stack 20480 bytes",
-            "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 0 restarts, finished within 10 s: yes, took 218444 ticks, alone 110180 ticks",
+            "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 0 restarts, finished within 10 s: yes, took 218444 ticks, alone 110180 ticks, requests 10, alone requests 10",
             "posix-procs: names interference G2: a path of 32 links against a name made and removed in another directory: 0 restarts, finished within 10 s: yes, result 0, took 1356992 ticks, alone 629874 ticks",
             "posix-procs: names interference G2b: a rename against a colliding name in another directory: 0 restarts, finished within 10 s: yes, result 0, took 2900000 ticks, alone 1300000 ticks",
             "posix-procs: names interference G3: the rename of a directory under a chain 64 deep against chmod of a file: 0 restarts, finished within 10 s: yes, result 0, took 2895999 ticks, alone 1308386 ticks",
@@ -6971,7 +6978,7 @@ mod tests {
             }
         }
         assert!(super::names_lines(&turned).is_err());
-        // G1: a restart, or more than twice the time alone, fails.
+        // G1 rejects restarts, extra requests and more than 2.5 times the quiet time.
         let mut restarted = names_log(good);
         for line in &mut restarted {
             if line.contains("names starvation") {
@@ -6982,12 +6989,29 @@ mod tests {
         let mut slow = names_log(good);
         for line in &mut slow {
             if line.contains("names starvation") {
-                *line = line.replace("took 218444 ticks", "took 220361 ticks");
+                *line = line.replace("took 218444 ticks", "took 275451 ticks");
             }
         }
         assert!(super::names_lines(&slow).is_err());
+        for replacement in [
+            ", requests 11, alone requests 10",
+            ", requests 0, alone requests 0",
+        ] {
+            let changed: Vec<String> = names_log(good)
+                .iter()
+                .map(|line| line.replace(", requests 10, alone requests 10", replacement))
+                .collect();
+            assert!(super::names_lines(&changed).is_err());
+        }
+        for ticks in [220361, 275450] {
+            let boundary: Vec<String> = names_log(good)
+                .iter()
+                .map(|line| line.replace("took 218444 ticks", &format!("took {ticks} ticks")))
+                .collect();
+            assert!(super::names_lines(&boundary).is_ok());
+        }
         // G2 and G3 end with no restart; G4 and G5 only have to be printed.
-        for tag in ["G2", "G3"] {
+        for tag in ["G2", "G2b", "G3"] {
             let mut bad = names_log(good);
             for line in &mut bad {
                 if line.contains(&format!("interference {tag}")) {

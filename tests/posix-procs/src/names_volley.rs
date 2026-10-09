@@ -5,13 +5,36 @@
 //! one operation sent to the service (the hook of the driver counts them), the
 //! counter, the restarts of the resolution an operation of a kind reported,
 //! and the most repeats of a Start answered with JOBS_FULL.
-use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use posix_abi::change::{Probe, probe_hook, stats};
 
 static REQUESTS: AtomicU32 = AtomicU32::new(0);
+static TRACKED_TLS: AtomicU64 = AtomicU64::new(0);
+static TRACKED_REQUESTS: AtomicU32 = AtomicU32::new(0);
+fn caller_tls() -> u64 {
+    let tls;
+    // SAFETY: reads the current thread's TLS register without accessing memory.
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) tls, options(nomem, nostack, preserves_flags));
+    }
+    tls
+}
+/// Count only the calling thread while the interference thread also runs.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_volley_thread_start() {
+    TRACKED_REQUESTS.store(0, Relaxed);
+    TRACKED_TLS.store(caller_tls(), Relaxed);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn files_volley_thread_requests() -> u32 {
+    TRACKED_REQUESTS.load(Relaxed)
+}
 
 fn count(_: Probe) -> bool {
     REQUESTS.fetch_add(1, Relaxed);
+    if TRACKED_TLS.load(Relaxed) == caller_tls() {
+        TRACKED_REQUESTS.fetch_add(1, Relaxed);
+    }
     false
 }
 
