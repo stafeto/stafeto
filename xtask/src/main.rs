@@ -1123,9 +1123,11 @@ commands:
             with --minutes N, the POSIX scenarios of rtbench 2 on HVF and VZ,
             at the same time or, with --serial, one after the other;
             with --short, one round of them on TCG, as ci runs it
-  rtbench-check BASE HEAD compare the files rtbench-hvf.txt and rtbench-vz.txt in the
-            directories of two runs against the limits of epoch 2 (S5 p50 and p99,
-            S10 p50) and fail naming the rows that are over
+  rtbench-check SESSION... compare the base and head runs of at least four alternating
+            sessions (each a directory with `order`, `base/`, `head/`, the files
+            rtbench-hvf.txt and rtbench-vz.txt) against the limits of epoch 2
+            (S5 p50, median S5 p99 difference, median S10 p50 ratio) and fail
+            naming the rows that are over
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-cancel-input verify cancelled UART reads and cleanup handlers
