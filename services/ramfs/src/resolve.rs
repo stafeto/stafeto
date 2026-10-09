@@ -2,6 +2,19 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Retained byte paths. Every step handles one component, eight names or one link.
+//!
+//! What a walk and its proofs hold on to, and what raises it:
+//! - the epoch of the moves (`State::epoch`) rises when a directory moves
+//!   (rename of a directory); a walk in another epoch starts again, and so
+//!   does a preparation that walked the ancestors of a directory;
+//! - the access count of a directory (`Node::access_gen`) rises with its mode
+//!   or owner; a walk in a chain of names that sees it changed takes its
+//!   component again, with the search permission;
+//! - the count of a bucket of names (`State::bucket_stamps`) rises when a
+//!   name comes to the bucket or leaves it; a walk in the chain of the bucket
+//!   takes its component again, and a proof of a name (an edge, a missing
+//!   name, a reservation) is stale. A name elsewhere, the times, the mode, the
+//!   owner or the bytes of a file change none of it.
 
 use crate::authority::Identity;
 use crate::metadata::{MetadataPath, MetadataProof};
@@ -45,8 +58,9 @@ pub struct Resolve {
     edge_end: usize,
     missing: bool,
     result: Option<Token>,
-    /// Restarts of the walk the resolver made by itself: a change of the
-    /// tree, of the authority or of the identity between two steps.
+    /// Restarts of the walk the resolver made by itself: a move of a
+    /// directory, a change of the authority or of the identity between two
+    /// steps, or a name that came to the bucket of a name proved missing.
     pub restarts: u32,
     /// Holds bytes only and walks nothing (see `scratch`).
     inert: bool,
