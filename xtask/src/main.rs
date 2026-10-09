@@ -3620,14 +3620,11 @@ fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String>
 /// seconds, which is "no" until 5i-5b), and the volley of 112 renames, which
 /// all end and in which a Start is refused with JOBS_FULL and repeated. The
 /// lines go to the output for the report.
-fn names_lines(lines: &[String]) -> Result<(), String> {
+fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     let shown: Vec<&String> = lines
         .iter()
         .filter(|line| line.starts_with("posix-procs: names "))
         .collect();
-    for line in &shown {
-        println!("{line}");
-    }
     let find = |what: &str| {
         shown
             .iter()
@@ -3668,7 +3665,7 @@ fn names_lines(lines: &[String]) -> Result<(), String> {
         ));
     }
     find("names volley ok")?;
-    Ok(())
+    Ok(shown.iter().map(|line| (*line).clone()).collect())
 }
 
 fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
@@ -3695,7 +3692,9 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     std::fs::write(&log, outcome.lines.join("\n") + "\n")
         .map_err(|e| format!("{}: {e}", log.display()))?;
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
-    names_lines(&outcome.lines)?;
+    for line in names_lines(&outcome.lines)? {
+        println!("{line}");
+    }
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
     let pipe = longest_steps(&outcome.lines, "4");
