@@ -48,7 +48,7 @@ pub struct DirectoryJournal {
     node: Token,
     epoch: u64,
     /// The generation of the directory when the read began: a change of its names ends the read.
-    dir_gen: u64,
+    dir_gen: u32,
     held: Option<Held>,
     format: DirectoryFormat,
     limit: u16,

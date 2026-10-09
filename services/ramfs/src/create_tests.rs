@@ -379,7 +379,13 @@ fn changed_creation_identity_and_epoch_keep_staged_resources_until_cancel() {
         Err(STALE_PROOF)
     );
     r2.release(&mut ram.storage);
-    create(&mut ram, ROOT, b"interference", REG);
+    // A name of another bucket changes nothing of the proof of "new"
+    // (the old resolver is stale for its identity alone), a name of the same
+    // bucket does.
+    let elsewhere = crate::storage::tests_support::other_bucket(ROOT, b"new");
+    create(&mut ram, ROOT, &elsewhere, REG);
+    let rival = crate::storage::tests_support::same_bucket(ROOT, b"new");
+    create(&mut ram, ROOT, &rival, REG);
     assert_eq!(
         commit(&mut ram, &mut j, &r, &mut charge, OWNER, 88),
         Err(STALE_PROOF)

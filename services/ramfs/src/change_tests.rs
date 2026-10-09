@@ -1672,8 +1672,9 @@ fn a_change_of_the_tree_between_steps_restarts_the_job_and_the_client_sees_only_
         let (done, ..) = env.step(&fds, OWNER, start.key).unwrap();
         assert!(!done);
     }
-    // Another client changes the directory of the names: a new name in it.
-    env.node(dir, b"unrelated", REG, 0o644);
+    // Another client makes a name of the bucket of the new name.
+    let rival = same_bucket(dir, b"g");
+    env.node(dir, &rival, REG, 0o644);
     let mut restarts = 0;
     for _ in 0..1000 {
         match env.step(&fds, OWNER, start.key) {
@@ -1788,7 +1789,8 @@ fn a_refused_rewind_of_a_restart_stops_a_debug_build_and_is_counted() {
         .storage
         .unpin(etc, crate::storage::Pin::Pending)
         .unwrap();
-    env.node(ROOT, b"foreign", REG, 0o644);
+    let rival = same_bucket(ROOT, b"dst");
+    env.node(ROOT, &rival, REG, 0o644);
     let _ = env.step(&fds, OWNER, start.key);
 }
 
@@ -2215,7 +2217,8 @@ fn a_change_after_the_reservation_gives_the_reservation_back_and_the_job_goes_on
         env.step(&fds, OWNER, start.key).unwrap();
     }
     assert_eq!(env.lookup(b"/reserved"), Err(NO_ENTRY), "not published");
-    env.node(ROOT, b"foreign", REG, 0o644);
+    let rival = same_bucket(ROOT, b"reserved");
+    env.node(ROOT, &rival, REG, 0o644);
     let mut restarts = 0;
     for _ in 0..3000 {
         let (done, result, count, _) = env.step(&fds, OWNER, start.key).unwrap();
@@ -2259,7 +2262,7 @@ fn fill_names(env: &mut Env, prefix: &str, count: usize) {
     }
 }
 
-use crate::storage::tests_support::OneBucket;
+use crate::storage::tests_support::{OneBucket, other_bucket, same_bucket};
 
 /// Steps of the walk of `path` to its end, found or missing.
 fn walk_steps(env: &mut Env, path: &[u8]) -> (usize, Result<Progress, u32>) {
@@ -3067,22 +3070,49 @@ fn what_another_client_does_between_the_steps_of_an_unlink_restarts_it_only_when
             ),
             (0, 0)
         );
-        // The name of a file in the directory of the victim: the proof of its edge goes.
-        // (A walk that has not yet reached the end of the path looks the component up again
-        // without a restart.)
-        let expected = if early { (0, 0) } else { (1, 0) };
+        // Another name in the directory of the victim leaves the proof of the
+        // edge as it is; a name of the bucket of the victim does not (a walk
+        // that has not yet reached the end of the path looks the component up
+        // again without a restart).
         assert_eq!(
             unlink_against(
                 |env, _| {
                     let d = env.lookup(b"/d").unwrap();
-                    env.node(d, b"new", REG, 0o644);
+                    let name = other_bucket(d, b"f");
+                    env.node(d, &name, REG, 0o644);
                 },
                 early
             ),
-            expected,
-            "a name in the directory, early {early}"
+            (0, 0),
+            "a name of another bucket in the directory, early {early}"
         );
-        assert_eq!(unlink_against(chmod(b"/d", 0o711), early), expected);
+        assert_eq!(
+            unlink_against(
+                |env, _| {
+                    let d = env.lookup(b"/d").unwrap();
+                    let name = same_bucket(d, b"f");
+                    env.node(d, &name, REG, 0o644);
+                },
+                early
+            ),
+            if early { (0, 0) } else { (1, 0) },
+            "a name of the bucket of the victim, early {early}"
+        );
+        assert_eq!(
+            unlink_against(
+                |env, _| {
+                    let d = env.lookup(b"/d").unwrap();
+                    let name = same_bucket(d, b"f");
+                    env.node(d, &name, REG, 0o644);
+                    env.ram.storage.unlink(d, &name, FIXTURE).unwrap();
+                },
+                early
+            ),
+            if early { (0, 0) } else { (1, 0) },
+            "a name that came and went, early {early}"
+        );
+        // The mode of the directory is checked when the job commits, not by the proof.
+        assert_eq!(unlink_against(chmod(b"/d", 0o711), early), (0, 0));
         // The move of a directory anywhere restarts every job.
         assert_eq!(
             unlink_against(
@@ -3100,20 +3130,16 @@ fn what_another_client_does_between_the_steps_of_an_unlink_restarts_it_only_when
     }
 }
 
-/// Two jobs started together and stepped by turns until both are done.
-fn by_turns(
-    env: &mut Env,
-    fds: &mut Fds,
-    jobs: [(&ChangeStart<'_>, Option<&[u8]>); 2],
-) -> [Done; 2] {
-    for (start, second) in &jobs {
+/// Jobs started together and stepped by turns until all are done.
+fn by_turns(env: &mut Env, fds: &mut Fds, jobs: &[(&ChangeStart<'_>, Option<&[u8]>)]) -> Vec<Done> {
+    for (start, second) in jobs {
         env.start(fds, OWNER, start).unwrap();
         if let Some(bytes) = second {
             env.second(fds, OWNER, start.key, Base::Absolute, bytes)
                 .unwrap();
         }
     }
-    let mut done: [Option<Done>; 2] = [None, None];
+    let mut done: Vec<Option<Done>> = jobs.iter().map(|_| None).collect();
     for round in 0..3000 {
         for (i, (start, _)) in jobs.iter().enumerate() {
             if done[i].is_some() {
@@ -3133,10 +3159,59 @@ fn by_turns(
             break;
         }
     }
-    for (start, _) in &jobs {
+    for (start, _) in jobs {
         env.release(fds, OWNER, start.key).unwrap();
     }
-    done.map(|d| d.expect("both jobs end"))
+    done.into_iter()
+        .map(|d| d.expect("every job ends"))
+        .collect()
+}
+
+#[test]
+fn renames_of_distinct_names_in_one_directory_do_not_restart_each_other() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"shared", DIR, 0o755);
+    // Twelve renames f<i> to g<i>, from buckets that differ, started together.
+    let mut taken = std::vec::Vec::new();
+    let mut pairs = std::vec::Vec::new();
+    let mut i = 0;
+    while pairs.len() < 12 {
+        let (from, to) = (format!("f{i}"), format!("g{i}"));
+        i += 1;
+        let buckets = [
+            crate::storage::name_bucket(dir, from.as_bytes()),
+            crate::storage::name_bucket(dir, to.as_bytes()),
+        ];
+        if buckets[0] == buckets[1] || buckets.iter().any(|b| taken.contains(b)) {
+            continue;
+        }
+        taken.extend(buckets);
+        env.node(dir, from.as_bytes(), REG, 0o644);
+        pairs.push((format!("/shared/{from}"), format!("/shared/{to}")));
+    }
+    let starts: Vec<ChangeStart<'_>> = pairs
+        .iter()
+        .enumerate()
+        .map(|(n, (from, _))| ChangeStart {
+            key: key(n as u32, 1),
+            ..op(ChangeOp::Rename, from.as_bytes())
+        })
+        .collect();
+    let jobs: Vec<(&ChangeStart<'_>, Option<&[u8]>)> = starts
+        .iter()
+        .zip(&pairs)
+        .map(|(start, (_, to))| (start, Some(to.as_bytes())))
+        .collect();
+    let done = by_turns(&mut env, &mut fds, &jobs);
+    assert!(
+        done.iter().all(|d| d.result == 0 && d.restarts == 0),
+        "{done:?}"
+    );
+    for (_, to) in &pairs {
+        assert!(env.lookup(to.as_bytes()).is_ok());
+    }
+    env.assert_quiet();
 }
 
 #[test]
@@ -3160,8 +3235,10 @@ fn two_renames_of_directories_that_meet_make_one_success_and_one_refusal_and_no_
     let [one, two] = by_turns(
         &mut env,
         &mut fds,
-        [(&first, Some(b"/y/b/a")), (&second, Some(b"/x/a/b"))],
-    );
+        &[(&first, Some(b"/y/b/a")), (&second, Some(b"/x/a/b"))],
+    )
+    .try_into()
+    .unwrap_or_else(|_| unreachable!());
     // The one that commits second walks its paths again and finds the
     // other directory moved: no entry. Both do not succeed.
     let mut results = [one.result, two.result];
@@ -3183,7 +3260,9 @@ fn two_creations_of_one_name_make_one_success_and_one_exists() {
     let mut fds = session();
     let first = mkdir(4, 1, b"/same", 0o755, 0);
     let second = mkdir(5, 1, b"/same", 0o700, 0);
-    let [one, two] = by_turns(&mut env, &mut fds, [(&first, None), (&second, None)]);
+    let [one, two] = by_turns(&mut env, &mut fds, &[(&first, None), (&second, None)])
+        .try_into()
+        .unwrap_or_else(|_| unreachable!());
     let mut results = [one.result, two.result];
     results.sort_unstable();
     assert_eq!(results, [0, proto_fs::ALREADY_EXISTS], "{one:?} {two:?}");

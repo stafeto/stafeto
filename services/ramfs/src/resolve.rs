@@ -23,12 +23,13 @@ pub struct Resolve {
     /// The entry of the last name the walk matched, or NONE.
     found: u16,
     looking: bool,
-    /// The generation of the directory `current` when its component began.
-    dir_gen: u64,
-    /// The bucket of the name being looked for and the count of the names that
-    /// left it when the lookup began.
-    bucket: usize,
-    bucket_gen: u32,
+    /// The count of the changes of the mode and owner of the directory
+    /// `current` when its component began.
+    access_gen: u32,
+    /// The bucket of the name being looked for and its count of changes when
+    /// the lookup began.
+    bucket: u16,
+    bucket_stamp: u32,
     link: Option<Token>,
     links: u8,
     epoch: u64,
@@ -36,8 +37,10 @@ pub struct Resolve {
     follow: bool,
     intent: Intent,
     edge_parent: Option<Token>,
-    /// The generation of the parent of the edge when the walk took the edge.
-    edge_gen: u64,
+    /// The bucket of the name of the edge and its count when the walk took
+    /// the edge (NONE for an edge that has no name: `.` and `..`).
+    edge_bucket: u16,
+    edge_stamp: u32,
     edge_start: usize,
     edge_end: usize,
     missing: bool,
@@ -139,9 +142,9 @@ impl Resolve {
             search: NONE,
             found: NONE,
             looking: false,
-            dir_gen: 0,
+            access_gen: 0,
             bucket: 0,
-            bucket_gen: 0,
+            bucket_stamp: 0,
             link: None,
             links: 0,
             epoch: storage.state.epoch,
@@ -149,7 +152,8 @@ impl Resolve {
             follow: intent.follows(),
             intent,
             edge_parent: None,
-            edge_gen: 0,
+            edge_bucket: NONE,
+            edge_stamp: 0,
             edge_start: 0,
             edge_end: 0,
             missing: false,
@@ -181,9 +185,9 @@ impl Resolve {
             search: NONE,
             found: NONE,
             looking: false,
-            dir_gen: 0,
+            access_gen: 0,
             bucket: 0,
-            bucket_gen: 0,
+            bucket_stamp: 0,
             link: None,
             links: 0,
             epoch: storage.state.epoch,
@@ -195,7 +199,8 @@ impl Resolve {
             follow: false,
             intent: Intent::Lookup { follow: false },
             edge_parent: None,
-            edge_gen: 0,
+            edge_bucket: NONE,
+            edge_stamp: 0,
             edge_start: 0,
             edge_end: 0,
             missing: false,
@@ -281,10 +286,10 @@ impl Resolve {
             return Ok(Progress::Found(result));
         }
         if self.missing
-            && let Some(parent) = self.edge_parent
-            && storage.node(parent)?.name_gen != self.edge_gen
+            && self.edge_bucket != NONE
+            && storage.stamp(self.edge_bucket as usize) != self.edge_stamp
         {
-            // A name taken in the directory since: the name is perhaps there.
+            // A name came to the bucket since: the name is perhaps there.
             self.restarts = self.restarts.saturating_add(1);
             self.restart(storage, identity)?;
             return Ok(Progress::More);
@@ -294,15 +299,15 @@ impl Resolve {
                 self.edge_parent.expect("retained missing parent"),
             ));
         }
-        // A change of the names, mode or owner of the directory the walk
-        // stands in sends the walk back to the start of this component: its
-        // search permission, the head of its chain and a link found in it are
-        // taken again. The components behind stay as they were.
-        // The same holds when a name leaves the chain the walk follows, whoever
-        // the directory is: the place of the walk in the chain is gone.
+        // A change of the mode or owner of the directory the walk stands in
+        // sends the walk back to the start of this component: its search
+        // permission, the head of its chain and a link found in it are taken
+        // again. So does a name that comes to the bucket of the name looked
+        // for or leaves it, whatever the directory is: the place of the walk
+        // in the chain is gone. The components behind stay as they were.
         if (self.looking || self.link.is_some())
-            && (storage.node(self.current)?.name_gen != self.dir_gen
-                || self.looking && storage.removals(self.bucket) != self.bucket_gen)
+            && (storage.node(self.current)?.access_gen != self.access_gen
+                || self.looking && storage.stamp(self.bucket as usize) != self.bucket_stamp)
         {
             self.looking = false;
             self.link = None;
@@ -372,7 +377,7 @@ impl Resolve {
             if name == b"." || name == b".." {
                 let parent_component = name == b"..";
                 if self.final_component() {
-                    self.capture_edge(storage)?;
+                    self.capture_edge(storage, false)?;
                 }
                 if parent_component {
                     self.current = directory_parent;
@@ -380,9 +385,10 @@ impl Resolve {
                 self.at = self.end;
                 return Ok(Progress::More);
             }
-            self.dir_gen = directory.name_gen;
-            self.bucket = crate::storage::name_bucket(self.current, &self.path[self.at..self.end]);
-            self.bucket_gen = storage.removals(self.bucket);
+            self.access_gen = directory.access_gen;
+            let bucket = crate::storage::name_bucket(self.current, &self.path[self.at..self.end]);
+            self.bucket = bucket as u16;
+            self.bucket_stamp = storage.stamp(bucket);
             self.search = storage.name_head(self.current, &self.path[self.at..self.end]);
             self.looking = true;
         }
@@ -402,7 +408,7 @@ impl Resolve {
                     {
                         return Err(NO_ENTRY);
                     }
-                    self.capture_edge(storage)?;
+                    self.capture_edge(storage, true)?;
                     self.missing = true;
                     return Ok(Progress::Missing(self.current));
                 }
@@ -430,7 +436,7 @@ impl Resolve {
                     self.link = Some(token);
                 } else {
                     if self.final_component() {
-                        self.capture_edge(storage)?;
+                        self.capture_edge(storage, true)?;
                     }
                     self.current = token;
                     self.at = self.end;
@@ -446,12 +452,18 @@ impl Resolve {
             .iter()
             .all(|&byte| byte == b'/')
     }
-    fn capture_edge(&mut self, storage: &mut Storage<'_>) -> Result<(), u32> {
+    /// Takes the edge into `current`; `named` when the component is a name
+    /// of the chain just followed (and not `.` or `..`).
+    fn capture_edge(&mut self, storage: &mut Storage<'_>, named: bool) -> Result<(), u32> {
         storage.pin(self.current, Pin::Pending)?;
         if let Some(parent) = self.edge_parent.replace(self.current) {
             storage.unpin(parent, Pin::Pending)?;
         }
-        self.edge_gen = storage.node(self.current)?.name_gen;
+        (self.edge_bucket, self.edge_stamp) = if named {
+            (self.bucket, self.bucket_stamp)
+        } else {
+            (NONE, 0)
+        };
         self.edge_start = self.at;
         self.edge_end = self.end;
         Ok(())
@@ -475,17 +487,18 @@ impl Resolve {
         } else {
             storage.namespace_location(self.found as usize)?
         };
-        let dir_gen = if self.edge_parent.is_some() {
-            self.edge_gen
+        let (bucket, stamp) = if self.edge_parent.is_some() {
+            (self.edge_bucket, self.edge_stamp)
         } else {
-            storage.node(proof.parent)?.name_gen
+            (NONE, 0)
         };
         Ok(NamespaceProof {
             edge: Edge {
                 parent: proof.parent,
                 target: proof.target,
                 location,
-                dir_gen,
+                bucket,
+                stamp,
                 syntax: RawSyntax::of(self.original_path()),
             },
             leaf: proof.leaf,
@@ -537,9 +550,12 @@ impl Resolve {
         storage.node(parent)?;
         if let Some(result) = self.result {
             storage.node(result)?;
-        } else if !self.missing || storage.node(parent)?.name_gen != self.edge_gen {
-            // The proof that the name is not there lasts while the directory
-            // keeps its generation.
+        } else if !self.missing
+            || self.edge_bucket != NONE
+                && storage.stamp(self.edge_bucket as usize) != self.edge_stamp
+        {
+            // The proof that the name is not there lasts while its bucket
+            // keeps its count.
             return Err(STALE_PROOF);
         }
         Ok(ResultProof {

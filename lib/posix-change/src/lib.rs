@@ -28,7 +28,7 @@ use proto_wire::Status;
 /// The pause before a Start is sent again after `refusals` answers of
 /// JOBS_FULL, in nanoseconds: 1, 2, 4, 8 and then 16 milliseconds. A thread
 /// that waits for room long leaves the service to the work that frees it.
-pub fn room_pause_ns(refusals: u32) -> u64 {
+pub fn room_pause_ns(refusals: u32) -> i64 {
     1_000_000 << refusals.min(4)
 }
 

@@ -244,7 +244,7 @@ impl MetadataJournal {
             node.gid = gid;
             node.times = times;
             if node.kind == crate::DIR && access_changed {
-                node.name_gen += 1;
+                node.access_gen = node.access_gen.wrapping_add(1);
             }
             MetadataOutcome::Applied
         };

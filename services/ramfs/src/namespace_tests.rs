@@ -655,8 +655,9 @@ fn step_failure_keeps_reserved_names_until_explicit_cancel_and_blocks_stale_effe
     while ram.storage.usage(FIRST).dentries == usage.dentries {
         assert!(!prep.step(&mut ram.storage, ROOT_USER).unwrap());
     }
-    // A name made in the directory of the new name since the proof.
-    create(&mut ram, FIRST, ROOT, b"foreign", REG, 0o644);
+    // A name of the bucket of the new name since the proof.
+    let rival = crate::storage::tests_support::same_bucket(ROOT, b"new");
+    create(&mut ram, FIRST, ROOT, &rival, REG, 0o644);
     assert_eq!(prep.step(&mut ram.storage, ROOT_USER), Err(STALE_PROOF));
     assert_eq!(ram.storage.usage(FIRST).dentries, usage.dentries + 2);
     assert_eq!(

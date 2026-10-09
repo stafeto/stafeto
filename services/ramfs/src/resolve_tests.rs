@@ -1633,9 +1633,10 @@ fn creation_access_requires_a_fresh_exact_reservation_in_its_owner_root() {
             (REG, 0o600, OWNER.uid, OWNER.gid),
         )
         .unwrap();
-    let other = create(&mut ram, ROOT, b"other", REG, 0o600);
+    let rival = crate::storage::tests_support::same_bucket(ROOT, b"provenance");
+    let other = create(&mut ram, ROOT, &rival, REG, 0o600);
     let before = ram.storage.usage(ROOT_ACCOUNT);
-    // An unrelated namespace publication makes the old proof stale.
+    // A publication in the bucket of the name makes the old proof stale.
     assert!(matches!(
         ram.prepare_open_token(&mut fds, r.token, proto_fs::READ_WRITE, OWNER, Some(r)),
         Err(proto_fs::STALE_PROOF)

@@ -55,6 +55,22 @@ pub(crate) mod tests_support {
         /// A test puts every name into one bucket.
         pub static FORCED_BUCKET: Cell<Option<usize>> = const { Cell::new(None) };
     }
+    /// A name of the bucket of `name` in `parent`, another than `name`.
+    pub(crate) fn same_bucket(parent: super::Token, name: &[u8]) -> std::vec::Vec<u8> {
+        let wanted = super::name_bucket(parent, name);
+        (0..)
+            .map(|i| std::format!("c{i}").into_bytes())
+            .find(|candidate| candidate != name && super::name_bucket(parent, candidate) == wanted)
+            .expect("a name of the bucket")
+    }
+    /// A name that does not share the bucket of `name` in `parent`.
+    pub(crate) fn other_bucket(parent: super::Token, name: &[u8]) -> std::vec::Vec<u8> {
+        let wanted = super::name_bucket(parent, name);
+        (0..)
+            .map(|i| std::format!("o{i}").into_bytes())
+            .find(|candidate| super::name_bucket(parent, candidate) != wanted)
+            .expect("a name of another bucket")
+    }
     /// Every name goes into one bucket while the guard lives.
     pub(crate) struct OneBucket;
     impl OneBucket {
@@ -155,10 +171,12 @@ pub struct Node {
     pub names: u16,
     /// The entry that names this directory (a directory has one name), or NONE.
     pub name_entry: u16,
-    /// The generation of the directory: any change of its names, mode, owner
-    /// or group raises it. A proof of a name taken in the directory (a name
-    /// that is there or is not) holds while the generation stays.
-    pub name_gen: u64,
+    /// Raised by every change of the names of the directory (a model of the
+    /// listing is stale after it).
+    pub name_gen: u32,
+    /// Raised by a change of the mode or the owner of the directory: a walk
+    /// that stands in it checks its search permission again.
+    pub access_gen: u32,
 }
 impl Node {
     const EMPTY: Self = Self {
@@ -181,6 +199,7 @@ impl Node {
         names: 0,
         name_entry: NONE,
         name_gen: 0,
+        access_gen: 0,
     };
     pub fn live(&self) -> bool {
         self.kind != 0 && !self.reclaim
@@ -337,9 +356,11 @@ pub struct State {
     page_next: [u16; PAGES],
     page_logical: [u16; PAGES],
     name_heads: [u16; BUCKETS],
-    /// Names that left each bucket (wrapping): a walk in a chain starts the
-    /// component again when it changes.
-    bucket_removals: [u32; BUCKETS],
+    /// Changes of each bucket, a name that came or left (wrapping). A proof
+    /// of a name, that it is there or is not, holds while the count of its
+    /// bucket stays; a walk in a chain starts the component again when it
+    /// changes.
+    bucket_stamps: [u32; BUCKETS],
     name_next: [u16; NAME_ENTRIES],
     name_prev: [u16; NAME_ENTRIES],
     child_next: [u16; NAME_ENTRIES],
@@ -379,7 +400,7 @@ impl State {
             page_next: [NONE; PAGES],
             page_logical: [0; PAGES],
             name_heads: [NONE; BUCKETS],
-            bucket_removals: [0; BUCKETS],
+            bucket_stamps: [0; BUCKETS],
             name_next: [NONE; NAME_ENTRIES],
             name_prev: [NONE; NAME_ENTRIES],
             child_next: [NONE; NAME_ENTRIES],
@@ -409,7 +430,7 @@ impl State {
         self.retired_len = 0;
         self.retired_turn = false;
         self.name_heads.fill(NONE);
-        self.bucket_removals.fill(0);
+        self.bucket_stamps.fill(0);
         self.name_next.fill(NONE);
         self.name_prev.fill(NONE);
         self.child_next.fill(NONE);
@@ -429,9 +450,10 @@ pub struct Reservation {
     pub token: Token,
     dentry: u16,
     epoch: u64,
-    /// The generation of the parent when the name was reserved: the proof
-    /// that the name was not there.
-    dir_gen: u64,
+    /// The bucket of the name and its count when the name was reserved: the
+    /// proof that the name was not there.
+    bucket: u16,
+    stamp: u32,
     place: u16,
     root: u16,
 }
@@ -1120,13 +1142,17 @@ impl<'a> Storage<'a> {
         node.uid = uid;
         node.gid = gid;
         if node.kind == crate::DIR {
-            node.name_gen += 1;
+            node.access_gen = node.access_gen.wrapping_add(1);
         }
         Ok(())
     }
-    /// The generation of a directory.
-    pub fn name_gen(&self, token: Token) -> Result<u64, u32> {
+    /// The count of the names changed in a directory, modulo 2^32.
+    pub fn name_gen(&self, token: Token) -> Result<u32, u32> {
         Ok(self.node(token)?.name_gen)
+    }
+    /// The count of the changes of a bucket of names, modulo 2^32.
+    pub(crate) fn stamp(&self, bucket: usize) -> u32 {
+        self.state.bucket_stamps[bucket]
     }
     fn account(&mut self, key: Root) -> Result<usize, u32> {
         if let Some(i) = self
@@ -1286,10 +1312,6 @@ impl<'a> Storage<'a> {
     pub(crate) fn name_head(&self, parent: Token, name: &[u8]) -> u16 {
         self.state.name_heads[name_bucket(parent, name)]
     }
-    /// The number of names that left a bucket, modulo 2^32.
-    pub(crate) fn removals(&self, bucket: usize) -> u32 {
-        self.state.bucket_removals[bucket]
-    }
     pub(crate) fn name_next(&self, entry: u16) -> u16 {
         self.state.name_next[entry as usize]
     }
@@ -1305,11 +1327,17 @@ impl<'a> Storage<'a> {
             (d.parent, &d.name[..d.len as usize])
         }
     }
+    /// A name of `parent` came or left the bucket.
+    fn touch_name(&mut self, parent: Token, bucket: usize) {
+        let node = &mut self.state.nodes[parent.slot as usize];
+        node.name_gen = node.name_gen.wrapping_add(1);
+        self.state.bucket_stamps[bucket] = self.state.bucket_stamps[bucket].wrapping_add(1);
+    }
     /// Puts a published entry at the head of its chain. Constant work.
     pub(crate) fn chain_insert(&mut self, index: usize) {
         let (parent, name) = self.entry_key(index);
         let bucket = name_bucket(parent, name);
-        self.state.nodes[parent.slot as usize].name_gen += 1;
+        self.touch_name(parent, bucket);
         let head = self.state.name_heads[bucket];
         self.state.name_next[index] = head;
         self.state.name_prev[index] = NONE;
@@ -1443,8 +1471,7 @@ impl<'a> Storage<'a> {
     pub(crate) fn chain_remove(&mut self, index: usize) {
         let (parent, name) = self.entry_key(index);
         let bucket = name_bucket(parent, name);
-        self.state.nodes[parent.slot as usize].name_gen += 1;
-        self.state.bucket_removals[bucket] = self.state.bucket_removals[bucket].wrapping_add(1);
+        self.touch_name(parent, bucket);
         let prev = self.state.name_prev[index];
         let next = self.state.name_next[index];
         if prev == NONE {
@@ -1618,7 +1645,8 @@ impl<'a> Storage<'a> {
             token,
             dentry: d as u16,
             epoch: self.state.epoch,
-            dir_gen: self.node(parent)?.name_gen,
+            bucket: name_bucket(parent, name) as u16,
+            stamp: self.stamp(name_bucket(parent, name)),
             place: place as u16,
             root: a as u16,
         };
@@ -1641,8 +1669,7 @@ impl<'a> Storage<'a> {
         {
             return Err(proto_fs::PERMISSION);
         }
-        let parent = self.state.dentries[r.dentry as usize].parent;
-        if r.epoch != self.state.epoch || self.node(parent)?.name_gen != r.dir_gen {
+        if r.epoch != self.state.epoch || self.stamp(r.bucket as usize) != r.stamp {
             return Err(proto_fs::STALE_PROOF);
         }
         Ok(r.token)
@@ -1687,7 +1714,7 @@ impl<'a> Storage<'a> {
         if !d.reserved
             || d.node != reservation.token
             || reservation.epoch != self.state.epoch
-            || self.node(d.parent)?.name_gen != reservation.dir_gen
+            || self.stamp(reservation.bucket as usize) != reservation.stamp
         {
             return Err(proto_fs::INVALID_ARGUMENT);
         }

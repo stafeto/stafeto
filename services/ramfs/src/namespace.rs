@@ -71,10 +71,12 @@ pub(crate) struct Edge {
     pub parent: Token,
     pub target: Option<Token>,
     pub location: Location,
-    /// The generation of the parent when the edge was proved. The edge holds
-    /// while the parent keeps it: a name that is there is the same name, and
-    /// a name that is not there is still not.
-    pub dir_gen: u64,
+    /// The bucket of the name of the edge and its count of changes when the
+    /// edge was proved (the bucket is NONE for an edge without a name). The
+    /// edge holds while the count stays: a name that is there is the same
+    /// name, and a name that is not there is still not.
+    pub bucket: u16,
+    pub stamp: u32,
     pub syntax: RawSyntax,
 }
 /// Native construction is restricted to the retained resolver's verified result.
@@ -571,7 +573,7 @@ impl Storage<'_> {
         if let Some(target) = edge.target {
             self.node(target)?;
         }
-        if edge.location != Location::ModelToken && parent.name_gen != edge.dir_gen {
+        if edge.bucket != NONE && self.stamp(edge.bucket as usize) != edge.stamp {
             return Err(STALE_PROOF);
         }
         let valid = match edge.location {
@@ -834,7 +836,8 @@ fn model_edge<'a>(
             location: found.map_or(Ok(Location::Missing), |(i, _)| {
                 storage.namespace_location(i)
             })?,
-            dir_gen: storage.node(parent)?.name_gen,
+            bucket: name_bucket(parent, name) as u16,
+            stamp: storage.stamp(name_bucket(parent, name)),
             syntax: RawSyntax::of(name),
         },
         leaf: name,
@@ -907,7 +910,8 @@ pub(super) fn model_link(
                 parent: ROOT,
                 target: Some(token),
                 location: Location::ModelToken,
-                dir_gen: 0,
+                bucket: NONE,
+                stamp: 0,
                 syntax: RawSyntax {
                     final_component: FinalComponent::Ordinary,
                     trailing_slash: false,

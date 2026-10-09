@@ -753,8 +753,11 @@ fn what_changes_names_raises_the_generation_of_their_directory_and_what_changes_
         .reserve(FIRST, d2, b"x", (crate::REG, 0o644, 0, 0))
         .unwrap();
     assert_eq!(generation_of(&ram, d2), d2_gen);
+    let bucket = name_bucket(d2, b"x");
+    let stamp = ram.storage.stamp(bucket);
     let x = ram.storage.commit(r).unwrap();
     assert!(generation_of(&ram, d2) > d2_gen, "a name made");
+    assert_eq!(ram.storage.stamp(bucket), stamp + 1, "the bucket counts it");
     let g = generation_of(&ram, d2);
     // The bytes, mode, owner and times of a file are no part of any directory.
     ram.storage.write(x, FIRST, 0, b"bytes").unwrap();
@@ -766,10 +769,11 @@ fn what_changes_names_raises_the_generation_of_their_directory_and_what_changes_
         (generation_of(&ram, d2), generation_of(&ram, ROOT)),
         (g, root_gen)
     );
-    // The mode of a directory is.
+    // The mode of a directory is not a name, and has a generation of its own.
+    let access = ram.storage.node(d2).unwrap().access_gen;
     ram.storage.set_attributes(d2, 0o700, 0, 0).unwrap();
-    assert!(generation_of(&ram, d2) > g, "a mode changed");
-    let g = generation_of(&ram, d2);
+    assert_eq!(generation_of(&ram, d2), g);
+    assert_eq!(ram.storage.node(d2).unwrap().access_gen, access + 1);
     ram.storage.unlink(d2, b"x", FIRST).unwrap();
     assert!(generation_of(&ram, d2) > g, "a name gone");
     let _ = dir;
