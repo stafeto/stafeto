@@ -37,13 +37,26 @@ mod clock_page;
 rt::entry!(main);
 
 #[cfg(not(feature = "auth-probe"))]
-const METHODS: &[u16] = proto_fs::METHODS;
+const BASE_METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
-const METHODS: &[u16] = &[
+const BASE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 0xfff7,
     0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
+#[cfg(not(feature = "steps"))]
+const METHODS: &[u16] = BASE_METHODS;
+#[cfg(feature = "steps")]
+const METHODS: &[u16] = &{
+    let mut methods = [0; BASE_METHODS.len() + 1];
+    let mut i = 0;
+    while i < BASE_METHODS.len() {
+        methods[i] = BASE_METHODS[i];
+        i += 1;
+    }
+    methods[i] = 0xfff5;
+    methods
+};
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
 const SESSIONS: usize = ramfs::places::COUNT;
@@ -117,6 +130,7 @@ fn main(_: u64) -> u64 {
     }
     // SAFETY: the sole service thread owns this fixed data mapping and STORAGE.
     let data = unsafe { core::slice::from_raw_parts_mut(DATA as *mut u8, size as usize) };
+    // SAFETY: the sole service thread initializes STORAGE before creating references.
     let state = unsafe {
         let pointer = (*STORAGE.0.get()).as_mut_ptr();
         // State's integer, boolean and Option<Account> fields admit zero values.
@@ -176,6 +190,8 @@ fn main(_: u64) -> u64 {
         next_audit_ns: 0,
         maintenance_jobs: false,
         data_gc_turn: false,
+        #[cfg(feature = "steps")]
+        steps_reclaim_owner: None,
         orphan_cursor: 0,
         orphan_count: 0,
         cancel_reported: 0,
@@ -225,6 +241,9 @@ struct Fs {
     next_audit_ns: u64,
     maintenance_jobs: bool,
     data_gc_turn: bool,
+    /// The steps fixture retains queued nodes until the measured commit.
+    #[cfg(feature = "steps")]
+    steps_reclaim_owner: Option<u64>,
     orphan_cursor: u8,
     orphan_count: u16,
     /// The refused steps of a cancel the service has printed so far.
@@ -1028,6 +1047,11 @@ impl Service<0> for Fs {
     /// The last copy of a session Clone made went before it sent anything:
     /// the descriptors it was born with close.
     fn closed(&mut self, label: u64) {
+        #[cfg(feature = "steps")]
+        if self.steps_reclaim_owner == Some(label) {
+            self.steps_reclaim_owner = None;
+            let _ = sys::notify(&self.channel, 1);
+        }
         self.places.release(label);
         self.clones.gone(label);
         if let Some(i) = self.birth_slot(label)
@@ -1079,7 +1103,13 @@ impl Service<0> for Fs {
                     work = true;
                 }
             } else {
-                work = self.ram.storage.reclaim_step();
+                #[cfg(feature = "steps")]
+                let retained = self.steps_reclaim_owner.is_some();
+                #[cfg(not(feature = "steps"))]
+                let retained = false;
+                if !retained {
+                    work = self.ram.storage.reclaim_step();
+                }
             }
             if work || self.maintenance.remaining != 0 || self.orphan_count != 0 {
                 let _ = sys::notify(&self.channel, 1);
@@ -1436,6 +1466,34 @@ impl Service<0> for Fs {
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
+        }
+        #[cfg(feature = "steps")]
+        if r.method() == 0xfff5 {
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let mut body = r.body();
+            let Ok(command) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            match command {
+                0 if self.steps_reclaim_owner.is_none() => {
+                    self.steps_reclaim_owner = Some(r.label());
+                }
+                1 if self.steps_reclaim_owner == Some(r.label()) => {}
+                3 if self.steps_reclaim_owner == Some(r.label()) => {
+                    return value(r, u32::from(self.ram.storage.usage(s.data.root).pages));
+                }
+                2 if self.steps_reclaim_owner == Some(r.label()) => {
+                    self.steps_reclaim_owner = None;
+                    let _ = sys::notify(&self.channel, 1);
+                }
+                _ => return status(proto_fs::INVALID_ARGUMENT),
+            }
+            return value(r, self.ram.storage.reclaim_backlog() as u32);
         }
         let mut body = r.body();
         match Method::from_number(r.method()) {

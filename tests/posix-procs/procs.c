@@ -782,6 +782,7 @@ extern int files_bounds_release(void);
 extern int files_bounds_start(void);
 extern int files_bounds_stale(void);
 extern int files_bounds_publish(void);
+extern int files_bounds_reclaim(void);
 #endif
 #if NAMES_PROBE
 extern int files_names_pipe(void);
@@ -1131,6 +1132,11 @@ static int names_bounds(void) {
     if (stale != 0) {
         printf("posix-procs: steps: bounds: the restart after a stale proof gave %d\n", stale);
         return 7;
+    }
+    int reclaim = files_bounds_reclaim();
+    if (reclaim) {
+        printf("posix-procs: steps: bounds: reclaim gave %d\n", reclaim);
+        return 9;
     }
     printf("posix-procs: names bounds ok\n");
     return 0;

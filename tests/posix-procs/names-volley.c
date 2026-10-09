@@ -792,3 +792,18 @@ int files_bounds_fill(int stage) {
     }
     return 0;
 }
+
+/* Ordinary writes pay for a page on each of the nodes queued for reclamation. */
+int files_bounds_garbage(int count) {
+    char byte = 0x5a;
+    for (int i = 0; i < count; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/bg/gc/q%d", i);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0 || write(fd, &byte, 1) != 1 || close(fd) || unlink(path)) {
+            printf("posix-procs: bounds: garbage %d errno %d\n", i, errno);
+            return i + 1;
+        }
+    }
+    return 0;
+}

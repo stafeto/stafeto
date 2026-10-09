@@ -3483,3 +3483,35 @@ fn the_call_by_index_serves_the_first_names_and_refuses_the_rest() {
     );
     env.assert_quiet();
 }
+
+#[test]
+fn change_step_reclaims_one_paid_page_only_at_the_backlog_threshold() {
+    for count in [1, 31, 32] {
+        let mut env = Env::new();
+        let mut fds = session();
+        for i in 0..count {
+            let name = format!("garbage{i}");
+            let token = env.node(ROOT, name.as_bytes(), REG, 0o644);
+            env.ram
+                .storage
+                .write(token, FIXTURE, 0, &[0x5a; crate::storage::PAGE])
+                .unwrap();
+            env.ram
+                .storage
+                .unlink(ROOT, name.as_bytes(), FIXTURE)
+                .unwrap();
+        }
+        assert_eq!(env.ram.storage.reclaim_backlog(), count);
+        let before = env.ram.storage.available().pages;
+        let start = op(ChangeOp::Access, b"/");
+        env.start(&mut fds, OWNER, &start).unwrap();
+        env.step(&fds, OWNER, start.key).unwrap();
+        assert_eq!(
+            env.ram.storage.available().pages,
+            before + u16::from(count >= 32)
+        );
+        assert_eq!(env.ram.storage.reclaim_backlog(), count);
+        env.ram.storage.check_name_index();
+        env.release(&mut fds, OWNER, start.key).unwrap();
+    }
+}

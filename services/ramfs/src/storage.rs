@@ -2171,9 +2171,12 @@ impl<'a> Storage<'a> {
             return false;
         }
         let i = self.state.reclaim_queue[self.state.reclaim_head] as usize;
-        let overlay = self.state.overlays[i];
-        if overlay.head != NONE {
-            let page = overlay.head;
+        let (head, owner, root) = {
+            let overlay = &self.state.overlays[i];
+            (overlay.head, overlay.node, overlay.root)
+        };
+        if head != NONE {
+            let page = head;
             let p = self.state.page_logical[page as usize] as usize;
             self.state.overlays[i].head = self.state.page_next[page as usize];
             self.state.overlays[i].pages[p] = NONE;
@@ -2181,16 +2184,14 @@ impl<'a> Storage<'a> {
                 self.state.overlays[i].group_tail[p / 64] = NONE;
             }
             self.state.overlays[i].mapped_count -= 1;
-            self.state.overlays[i].shadow_boot_sectors -= boot_sectors(
-                p,
-                self.state.nodes[overlay.node as usize].boot_visible_length,
-            );
+            self.state.overlays[i].shadow_boot_sectors -=
+                boot_sectors(p, self.state.nodes[owner as usize].boot_visible_length);
             self.state.page_free[self.state.page_len] = page;
             self.state.page_len += 1;
-            self.uncharge(overlay.root as usize, |u| &mut u.pages);
+            self.uncharge(root as usize, |u| &mut u.pages);
         } else {
-            let node = self.state.nodes[overlay.node as usize];
-            self.state.nodes[overlay.node as usize] = Node {
+            let node = self.state.nodes[owner as usize];
+            self.state.nodes[owner as usize] = Node {
                 generation: node.generation,
                 ..Node::EMPTY
             };
@@ -2207,7 +2208,7 @@ impl<'a> Storage<'a> {
             self.state.overlays[i].root = NONE;
             self.state.inode_free[self.state.inode_len] = i as u16;
             self.state.inode_len += 1;
-            self.uncharge(overlay.root as usize, |u| &mut u.inodes);
+            self.uncharge(root as usize, |u| &mut u.inodes);
             self.state.reclaim_head = (self.state.reclaim_head + 1) % INODES;
             self.state.reclaim_len -= 1;
             if node.orphan_parent {

@@ -3781,6 +3781,28 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     // for a base, and the restart after a stale proof at the commit of a
     // rename of a directory over an empty one.
     find("names bounds commit after 500 rival names: 0 restarts")?;
+    for count in [1, 32] {
+        let row = find(&format!("names bounds reclaim: {count} nodes with pages"))?;
+        if !row.contains(&format!("backlog {count} -> {}", count + 1))
+            || !row.ends_with("0 restarts")
+        {
+            return Err(format!(
+                "the reclamation commit has wrong queue counts: {row}"
+            ));
+        }
+        let pages = row
+            .split(", pages ")
+            .nth(1)
+            .ok_or_else(|| format!("no paid pages in {row}"))?;
+        let pages_line = [format!("pages {pages}")];
+        let before = number(&pages_line, "pages ")?;
+        let after = number(&pages_line, " -> ")?;
+        if before < count || after + u64::from(count >= 32) != before {
+            return Err(format!(
+                "the reclamation commit released the wrong number of pages: {row}"
+            ));
+        }
+    }
     find("names bounds ok")?;
     Ok(shown.iter().map(|line| (*line).clone()).collect())
 }
@@ -6948,6 +6970,8 @@ mod tests {
             "posix-procs: names volley ok",
             "posix-procs: names gone ok",
             "posix-procs: names bounds commit after 500 rival names: 0 restarts",
+            "posix-procs: names bounds reclaim: 1 nodes with pages, backlog 1 -> 2, pages 2 -> 2, commit 12369 ticks, 0 restarts",
+            "posix-procs: names bounds reclaim: 32 nodes with pages, backlog 32 -> 33, pages 33 -> 32, commit 12488 ticks, 0 restarts",
             "posix-procs: names bounds ok",
         ]
         .iter()
@@ -7025,6 +7049,25 @@ mod tests {
             without.retain(|line| !line.contains(&format!("interference {tag}")));
             assert!(super::names_lines(&without).is_err(), "{tag}");
         }
+        for prefix in [
+            "bounds reclaim: 1 nodes",
+            "bounds reclaim: 32 nodes",
+            "bounds commit after 500",
+        ] {
+            let mut missing = names_log(good);
+            missing.retain(|line| !line.contains(prefix));
+            assert!(super::names_lines(&missing).is_err());
+        }
+        let extra_page: Vec<String> = names_log(good)
+            .iter()
+            .map(|line| line.replace("pages 2 -> 2", "pages 2 -> 1"))
+            .collect();
+        assert!(super::names_lines(&extra_page).is_err());
+        let lost_page: Vec<String> = names_log(good)
+            .iter()
+            .map(|line| line.replace("pages 33 -> 32", "pages 33 -> 33"))
+            .collect();
+        assert!(super::names_lines(&lost_page).is_err());
         let mut without_bounds = names_log(good);
         without_bounds.retain(|line| !line.contains("names bounds ok"));
         assert!(super::names_lines(&without_bounds).is_err());
