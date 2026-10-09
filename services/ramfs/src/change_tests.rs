@@ -282,6 +282,16 @@ impl Env {
         }
         panic!("lookup does not finish");
     }
+    /// The change jobs that hold a place of the side table.
+    fn seconds_held(&self) -> usize {
+        self.jobs
+            .iter()
+            .flatten()
+            .filter(
+                |job| matches!(&job.operation, JobOperation::Change(c) if c.second_place().is_some()),
+            )
+            .count()
+    }
     /// Nothing is paid, pinned or staged any more.
     fn assert_quiet(&mut self) {
         assert_eq!(self.ram.storage.preparations_used(), 0);
@@ -662,6 +672,125 @@ fn a_start_refused_for_its_identity_leaves_no_place_of_the_side_table() {
             .is_ok()
     );
     env.release(&mut fds, OWNER, key(0, 1)).unwrap();
+    env.assert_quiet();
+}
+
+/// Sessions of the root `id`, each with the 16 places a session has.
+fn sessions_of(id: u64, count: usize) -> Vec<Fds> {
+    (0..count)
+        .map(|_| Fds {
+            root: Root { id, generation: 1 },
+            ..session()
+        })
+        .collect()
+}
+
+#[test]
+fn the_side_table_gives_a_root_24_of_32_places_and_the_rest_to_the_others() {
+    let mut env = Env::new();
+    let rename = |slot, generation| req(slot, generation, ChangeOp::Rename, b"/a");
+    // One root takes its share of 24 places in two sessions.
+    let mut first = sessions_of(1000, 2);
+    for n in 0..24usize {
+        let (session, slot) = (n / 16, (n % 16) as u32);
+        assert!(
+            env.start(&mut first[session], 10 + session as u64, &rename(slot, 1))
+                .is_ok(),
+            "the {}th place",
+            n + 1
+        );
+    }
+    // The 25th Start is JOBS_FULL, however often it is repeated, and the
+    // mark of its key does not rise: after one Release the key is taken.
+    let late = rename(8, 1);
+    assert_eq!(env.start(&mut first[1], 11, &late), Err(JOBS_FULL));
+    assert_eq!(env.start(&mut first[1], 11, &late), Err(JOBS_FULL));
+    // Nothing else is held for the refusal: 24 jobs, 24 charges.
+    assert_eq!(env.ram.storage.preparations_used(), 24);
+    // A job of the same root that needs no second path goes on.
+    assert!(
+        env.start(&mut first[1], 11, &mkdir(9, 1, b"/m", 0o755, 0))
+            .is_ok()
+    );
+    env.release(&mut first[0], 10, key(0, 1)).unwrap();
+    assert!(env.start(&mut first[1], 11, &late).is_ok());
+    // Another root finds the 8 places the first root leaves.
+    let mut other = sessions_of(2000, 1);
+    for slot in 0..8u32 {
+        assert!(
+            env.start(&mut other[0], 20, &rename(slot, 1)).is_ok(),
+            "the other root, place {}",
+            slot + 1
+        );
+    }
+    assert_eq!(env.seconds_held(), 32);
+    // The 33rd place is nobody's: JOBS_FULL for either root.
+    assert_eq!(env.start(&mut other[0], 20, &rename(8, 1)), Err(JOBS_FULL));
+    env.release(&mut first[1], 11, key(8, 1)).unwrap();
+    assert!(env.start(&mut other[0], 20, &rename(8, 1)).is_ok());
+    // Everything goes back through Release.
+    let held: Vec<(u64, OpenKey)> = env
+        .jobs
+        .iter()
+        .flatten()
+        .map(|job| (job.owner, job.open_key.unwrap()))
+        .collect();
+    for (owner, k) in held {
+        let fds = match owner {
+            10 => &mut first[0],
+            11 => &mut first[1],
+            _ => &mut other[0],
+        };
+        env.release(fds, owner, k).unwrap();
+    }
+    env.assert_quiet();
+}
+
+#[test]
+fn a_refused_start_gives_back_its_charge_and_its_place_of_the_side_table() {
+    let mut env = Env::new();
+    let rename = |slot, generation| req(slot, generation, ChangeOp::Rename, b"/a");
+    // A root at its share of 24 places: the refusal gives the charge back.
+    let mut fds = sessions_of(1000, 2);
+    for n in 0..24usize {
+        let (session, slot) = (n / 16, (n % 16) as u32);
+        env.start(&mut fds[session], 10 + session as u64, &rename(slot, 1))
+            .unwrap();
+    }
+    let charges = env.ram.storage.preparations_used();
+    assert_eq!(env.start(&mut fds[1], 11, &rename(8, 1)), Err(JOBS_FULL));
+    assert_eq!(env.ram.storage.preparations_used(), charges);
+    assert_eq!(env.seconds_held(), 24);
+    // A path the capture refuses gives back both.
+    let long = [b'a'; 5000];
+    let before = env.ram.storage.preparations_used();
+    let mut spare = sessions_of(3000, 1);
+    let refused = env.start(&mut spare[0], 30, &req(0, 1, ChangeOp::Rename, &long));
+    assert!(refused.is_err(), "a path of 5000 bytes is refused");
+    assert_eq!(env.ram.storage.preparations_used(), before);
+    assert_eq!(env.seconds_held(), 24);
+    for n in 0..24usize {
+        let (session, slot) = (n / 16, (n % 16) as u32);
+        env.release(&mut fds[session], 10 + session as u64, key(slot, 1))
+            .unwrap();
+    }
+    env.assert_quiet();
+    // A root at its share of 96 charges takes no place of the side table
+    // for the Start it refuses.
+    let mut crowd = sessions_of(4000, 7);
+    for (i, fds) in crowd.iter_mut().enumerate().take(6) {
+        for slot in 0..16 {
+            env.start(fds, 100 + i as u64, &mkdir(slot, 1, b"/a", 0o755, 0))
+                .unwrap();
+        }
+    }
+    assert_eq!(env.start(&mut crowd[6], 106, &rename(0, 1)), Err(JOBS_FULL));
+    assert_eq!(env.seconds_held(), 0);
+    for (i, fds) in crowd.iter_mut().enumerate().take(6) {
+        for slot in 0..16 {
+            env.release(fds, 100 + i as u64, key(slot, 1)).unwrap();
+        }
+    }
     env.assert_quiet();
 }
 

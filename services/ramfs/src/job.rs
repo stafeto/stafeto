@@ -54,7 +54,8 @@ pub type JobGenerations = [u64; PREPARATIONS];
 /// The second paths of the change jobs that have one (rename, link) and the
 /// contents of the links that symlink makes. A job reserves its place when
 /// it starts, so that a full side table is JOBS_FULL before any effect; the
-/// resolver itself comes with the Second.
+/// resolver itself comes with the Second. A root holds at most
+/// `change::SECOND_SHARE` of the places.
 pub struct Seconds {
     pub slots: [Option<Resolve>; SECONDS],
     reserved: u32,

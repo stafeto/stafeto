@@ -33,6 +33,10 @@ use proto_wire::{Status, Writer};
 
 /// The places for second paths and link contents.
 pub const SECONDS: usize = 32;
+/// The places of the side table one root may hold: 24 of 32, as its share
+/// of the table of jobs is 96 of 128.
+pub const SECOND_SHARE: usize = 24;
+const _: () = assert!(SECOND_SHARE * 4 == SECONDS * 3);
 
 /// The source of calendar time. `None` is an unstable snapshot: the step
 /// makes no effect and the client asks again.
@@ -806,6 +810,26 @@ fn same_image(job: &ResolveJob, fds: &Fds) -> bool {
     job.authority.map(|stamp: Stamp| stamp.image) == fds.binding.stamp().map(|stamp| stamp.image)
 }
 
+/// A place of the side table for a job of the root whose account is
+/// `charge`: the root holds at most SECOND_SHARE of them, in the same
+/// proportion as its share of the table of jobs, so the places left are for
+/// the other roots.
+fn reserve_second(ctx: &mut Ctx<'_, '_>, charge: u16) -> Option<u8> {
+    let held = ctx
+        .jobs
+        .iter()
+        .flatten()
+        .filter(|job| {
+            job.root == charge
+                && matches!(&job.operation, JobOperation::Change(c) if c.second_place().is_some())
+        })
+        .count();
+    if held >= SECOND_SHARE {
+        return None;
+    }
+    ctx.seconds.reserve().map(|place| place as u8)
+}
+
 /// Method 44. The job is paid and keyed before it has any effect; the same
 /// key with the same arguments returns the same job.
 pub fn start(
@@ -860,8 +884,8 @@ pub fn start(
     let Some(place) = fds.resolvers.iter().position(|&id| id == 0) else {
         return Err(TOO_MANY_OPEN_FILES);
     };
-    // A full table, a full share of the root or a full place for a second
-    // path make no effect and keep the key free: the client sleeps and tries again.
+    // A full table, a full share of the root or a full side table
+    // make no effect and keep the key free: the client sleeps and tries again.
     let Some(slot) = ctx.jobs.iter().position(Option::is_none) else {
         return Err(JOBS_FULL);
     };
@@ -869,27 +893,32 @@ pub fn start(
         .checked_add(1)
         .filter(|&generation| generation < 1 << 56)
         .ok_or(TOO_MANY_OPEN_FILES)?;
-    // The identity comes before the place of the side table, so that no
-    // early exit leaves the place reserved.
+    // The identity comes before every charge and place, so that no early
+    // exit leaves one held.
     let real = uses_real_identity(req.op, req.flags);
     let identity = fds.binding.identity(real)?;
-    let second_place = if req.op.needs_second() {
-        Some(ctx.seconds.reserve().ok_or(JOBS_FULL)? as u8)
-    } else {
-        None
-    };
     let charge = match ctx.ram.storage.charge_preparation(fds.root) {
         Ok(charge) => charge,
         Err(code) => {
-            if let Some(place) = second_place {
-                ctx.seconds.free(place as usize);
-            }
             return Err(if code == TOO_MANY_OPEN_FILES {
                 JOBS_FULL
             } else {
                 code
             });
         }
+    };
+    // The place of the side table follows the charge, which names the
+    // account of the root whose share of the places it counts against.
+    let second_place = if req.op.needs_second() {
+        match reserve_second(ctx, charge) {
+            Some(place) => Some(place),
+            None => {
+                ctx.ram.storage.release_preparation(charge);
+                return Err(JOBS_FULL);
+            }
+        }
+    } else {
+        None
     };
     let change = match ChangeJob::capture(ctx.ram, fds, identity, req, second_place) {
         Ok(change) => change,
