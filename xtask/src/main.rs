@@ -3614,6 +3614,63 @@ fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String>
 /// 24 children of the probe's own beside them).
 /// Prints a row for each kind of step, checks that the longest Vouch stays
 /// under VOUCH_TICKS_MAX, and the numbers go to `target/measure`.
+/// The lines of the operations on names that the steps probe prints before the
+/// crowd (names-volley.c): the times of the operations alone, the long rmdir
+/// against the loop of utimensat (its restarts and whether it ended within ten
+/// seconds, which is "no" until 5i-5b), and the volley of 112 renames, which
+/// all end and in which a Start is refused with JOBS_FULL and repeated. The
+/// lines go to the output for the report.
+fn names_lines(lines: &[String]) -> Result<(), String> {
+    let shown: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("posix-procs: names "))
+        .collect();
+    for line in &shown {
+        println!("{line}");
+    }
+    let find = |what: &str| {
+        shown
+            .iter()
+            .find(|line| line.contains(what))
+            .map(|line| line.as_str())
+            .ok_or_else(|| format!("the steps probe printed no line with {what:?}"))
+    };
+    for row in [
+        "names time a missing component:",
+        "names time unlink /tmp/a:",
+        "names time rmdir:",
+        "names time chdir to depth 64:",
+        "names time getcwd at depth 64:",
+        "names time a path of 32 links:",
+        "names time rename of a directory under a chain 64 deep:",
+        "names time rmdir with a full table:",
+    ] {
+        find(row)?;
+    }
+    let starvation = find("names starvation:")?;
+    if !starvation.contains("finished within 10 s: yes")
+        && !starvation.contains("finished within 10 s: no")
+    {
+        return Err(format!("the starvation line has no verdict: {starvation}"));
+    }
+    let volley = find("names volley:")?;
+    if !volley.contains("112 renames, all done") {
+        return Err(format!("the volley did not end in 112 renames: {volley}"));
+    }
+    let repeats = qemu::number_after(
+        &[(*volley).to_owned()],
+        "repeats of JOBS_FULL of one thread ",
+    )
+    .ok_or_else(|| format!("the volley line has no number of repeats: {volley}"))?;
+    if repeats == 0 {
+        return Err(format!(
+            "no thread of the volley met JOBS_FULL, the refused Start was not exercised: {volley}"
+        ));
+    }
+    find("names volley ok")?;
+    Ok(())
+}
+
 fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
@@ -3638,6 +3695,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     std::fs::write(&log, outcome.lines.join("\n") + "\n")
         .map_err(|e| format!("{}: {e}", log.display()))?;
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
+    names_lines(&outcome.lines)?;
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
     let pipe = longest_steps(&outcome.lines, "4");
@@ -6726,6 +6784,43 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    fn names_log(repeats: &str) -> Vec<String> {
+        [
+            "posix-procs: names time a missing component: 73 requests, 617628 ticks",
+            "posix-procs: names time unlink /tmp/a: 27 requests, 250823 ticks",
+            "posix-procs: names time rmdir: 96 requests, 853412 ticks",
+            "posix-procs: names time chdir to depth 64: 130 requests, 900000 ticks",
+            "posix-procs: names time getcwd at depth 64: 0 requests, 1971 ticks",
+            "posix-procs: names time a path of 32 links: 672 requests, 5704952 ticks",
+            "posix-procs: names time rename of a directory under a chain 64 deep: 1559 requests, 15679606 ticks",
+            "posix-procs: names time rmdir with a full table: 96 requests, 855238 ticks",
+            "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 2569 restarts, finished within 10 s: no, took 626453622 ticks",
+            repeats,
+            "posix-procs: names volley ok",
+        ]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect()
+    }
+
+    /// The lines of the names volley are all there, the volley ended in 112
+    /// renames and some thread met JOBS_FULL.
+    #[test]
+    fn the_names_volley_lines_are_read_strictly() {
+        let good = "posix-procs: names volley: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 130, 6879297680 ticks";
+        assert!(super::names_lines(&names_log(good)).is_ok());
+        let none = good.replace("thread 130", "thread 0");
+        assert!(super::names_lines(&names_log(&none)).is_err());
+        let fewer = good.replace("112 renames, all done", "97 renames");
+        assert!(super::names_lines(&names_log(&fewer)).is_err());
+        let mut without_row = names_log(good);
+        without_row.remove(2);
+        assert!(super::names_lines(&without_row).is_err());
+        let mut without_volley = names_log(good);
+        without_volley.retain(|line| !line.contains("names volley:"));
+        assert!(super::names_lines(&without_volley).is_err());
+    }
+
     /// The lines of the ash script are checked exactly, in order, after
     /// `shell-ready`.
     #[test]

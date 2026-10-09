@@ -996,11 +996,24 @@ static int steps_branch(void) {
     for (;;) pause_ms(1000);
 }
 
+#if CHANGE_STEPS
+#include "names-volley.c"
+#endif
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
     unsigned char zeros[STEPS_BRANCHES] = {0};
     if (fd < 0 || pwrite(fd, zeros, sizeof zeros, 0) != (ssize_t)sizeof zeros) return 2;
+#if CHANGE_STEPS
+    /* The operations on names alone, in a table full of names, against a
+     * flood of changes and from 112 threads, before the crowd arrives. */
+    int volley = names_volley();
+    if (volley) {
+        printf("posix-procs: steps: the names volley failed %d\n", volley);
+        return 6;
+    }
+#endif
     pid_t branches[STEPS_BRANCHES];
     for (int b = 0; b < STEPS_BRANCHES; b++) {
         char index[8];
@@ -1889,6 +1902,9 @@ static int role(const char *name) {
     if (strcmp(name, "loaderchannels") == 0) return loader_channels();
     if (strncmp(name, "channels_", 9) == 0) return channel_child(name);
     if (strcmp(name, "steps") == 0) return steps_run();
+#if CHANGE_STEPS
+    if (strcmp(name, "volley") == 0) return vz_child();
+#endif
     if (strcmp(name, "branch") == 0) return steps_branch();
     if (strcmp(name, "armed") == 0) return steps_armed();
 #if NAMES_PROBE

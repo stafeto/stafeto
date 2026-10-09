@@ -18,6 +18,7 @@ fn main() {
     println!("cargo:rerun-if-changed=files.c");
     println!("cargo:rerun-if-changed=names.c");
     println!("cargo:rerun-if-changed=names-loss.c");
+    println!("cargo:rerun-if-changed=names-volley.c");
     println!("cargo:rerun-if-changed=open-policy.c");
     println!("cargo:rerun-if-changed=pending-open.c");
     println!("cargo:rerun-if-changed=pending-fork.c");

@@ -139,6 +139,33 @@ fn probe<T>(_: Probe, reply: Result<T, Status>) -> Result<T, Status> {
     reply
 }
 
+/// What the probes read back of the operations that ended: the most restarts
+/// of the resolution an operation of each kind reported (the kind is the
+/// number of `ChangeOp`), and the most repeats of a Start refused with
+/// JOBS_FULL that one operation made.
+#[cfg(feature = "change-probe")]
+pub mod stats {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    pub static RESTARTS: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
+    pub static FULL_REPEATS: AtomicU32 = AtomicU32::new(0);
+
+    /// Counts afresh.
+    pub fn reset() {
+        for restarts in &RESTARTS {
+            restarts.store(0, Relaxed);
+        }
+        FULL_REPEATS.store(0, Relaxed);
+    }
+
+    pub(super) fn note(op: u32, restarts: u32, full_repeats: u32) {
+        if let Some(slot) = RESTARTS.get(op as usize) {
+            slot.fetch_max(restarts, Relaxed);
+        }
+        FULL_REPEATS.fetch_max(full_repeats, Relaxed);
+    }
+}
+
 /// The requests of one operation, sent to the session of the process.
 struct Live {
     files: ManuallyDrop<Files>,
@@ -148,6 +175,9 @@ struct Live {
     /// None for a collector that only releases.
     claim: Option<ControlClaimToken>,
     here: Frame,
+    /// How many times the Start was refused with JOBS_FULL and sent again.
+    #[cfg(feature = "change-probe")]
+    full_repeats: u32,
 }
 
 impl Service for Live {
@@ -158,6 +188,10 @@ impl Service for Live {
         self.files.finish_binding()
     }
     fn wait_for_room(&mut self) {
+        #[cfg(feature = "change-probe")]
+        {
+            self.full_repeats += 1;
+        }
         // What this process left behind may be what fills the table.
         collect(self.owner, self.here, Some(self.token), true);
         // One millisecond on the timer of the thread, outside the deferral
@@ -321,6 +355,8 @@ pub(crate) fn collect(
             token,
             claim: None,
             here: current,
+            #[cfg(feature = "change-probe")]
+            full_repeats: 0,
         };
         posix_change::release(&mut wire, key_of(token));
         let _ = crate::shared::with_files(|files| {
@@ -393,8 +429,16 @@ pub fn run(request: &Request<'_>, out: &mut [u8; RESULT_MAX]) -> Result<Outcome,
         token,
         claim: Some(claim),
         here,
+        #[cfg(feature = "change-probe")]
+        full_repeats: 0,
     };
     let driven = posix_change::drive(&mut wire, &start, request.second, out);
+    #[cfg(feature = "change-probe")]
+    stats::note(
+        request.op as u32,
+        driven.as_ref().map_or(0, |done| done.restarts),
+        wire.full_repeats,
+    );
     let result = match driven {
         Ok(done) if done.result == 0 => Ok(Outcome {
             value: done.value,
@@ -474,6 +518,8 @@ pub fn truncate(target: posix_fs::RamTarget, length: u64) -> Result<(), i32> {
         token,
         claim: Some(claim),
         here,
+        #[cfg(feature = "change-probe")]
+        full_repeats: 0,
     };
     let driven = posix_change::drive_data(&mut wire, &args);
     let result = match driven {
