@@ -643,6 +643,8 @@ impl Service for DataModel {
         Ok(())
     }
     fn wait_for_room(&mut self) {
+        // A taken key is no room to wait for: it stays taken.
+        assert!(!self.key_taken, "waited for room on a key that is taken");
         self.waits += 1;
     }
 }
