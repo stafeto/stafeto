@@ -1132,6 +1132,7 @@ commands:
   posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
+  posix-threads-hvf run the pthread probe on the host's processor (Hypervisor framework)
   image-gates verify genuine Take and accepted SetId ambiguity
   image-gates-steps measure retained image dispatches under icount
   image-gates-normal-steps measure normal SetId without reply corruption
@@ -1294,6 +1295,7 @@ fn main() {
         Some("posix-cancel-input-vz") => posix_cancel_input_probe(true),
         Some("posix-threads") => posix_thread_probe(false),
         Some("posix-threads-vz") => posix_thread_probe(true),
+        Some("posix-threads-hvf") => posix_thread_probe_hvf(),
         Some("posix-abi") => posix_abi_probe(),
         Some("posix-shared") => posix_shared_probe(),
         Some("posix-input") => posix_input_probe(false),
@@ -1949,7 +1951,12 @@ fn probe_command(image: &Path, vz: bool) -> Result<(Command, Artifacts), String>
     let cmd = if vz {
         vz::command(&kernel.image, image)?
     } else {
-        let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(image));
+        let machine = if PROBES_ON_HVF.load(std::sync::atomic::Ordering::Relaxed) {
+            &qemu::HVF_V3
+        } else {
+            &qemu::VIRT
+        };
+        let mut cmd = qemu::command(machine, &kernel.image, Some(image));
         cmd.args(qemu::HEADLESS);
         cmd
     };
@@ -1974,6 +1981,21 @@ fn posix_orphans() -> Result<(), String> {
     qemu::expect_line(&output, PEER)?;
     println!("POSIX processes whose service ended fail their loads");
     Ok(())
+}
+
+/// Set by `posix-threads-hvf`: the QEMU probes of the pthread images run on
+/// the host's processor (HVF, GICv3) and not on TCG.
+static PROBES_ON_HVF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `posix-threads-hvf`: the pthread and native survivor images (native jump,
+/// router R1 to R8, signals) on the real processor.
+fn posix_thread_probe_hvf() -> Result<(), String> {
+    if let Err(why) = hvf_host() {
+        println!("posix-threads-hvf: skipped: {why}");
+        return Ok(());
+    }
+    PROBES_ON_HVF.store(true, std::sync::atomic::Ordering::Relaxed);
+    posix_thread_probe(false)
 }
 
 fn posix_thread_probe(vz: bool) -> Result<(), String> {
