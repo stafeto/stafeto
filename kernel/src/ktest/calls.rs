@@ -2711,7 +2711,9 @@ pub fn upcall_operations_5_to_12_are_invalid_and_change_nothing(
 }
 
 /// A return restores the exact native context: every general register, the
-/// stack pointer, the program counter, TPIDR_EL0 and the FP registers.
+/// stack pointer, the program counter, the flags of PSTATE, TPIDR_EL0 and the
+/// FP registers with FPCR and FPSR. The thread starts with all of those at
+/// zero, so the context sets each of them to a value that differs.
 pub fn upcall_return_restores_the_native_context_exactly(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         use abi::UpcallControl as C;
@@ -2740,11 +2742,12 @@ pub fn upcall_return_restores_the_native_context_exactly(_: &Boot) -> Result<(),
         }
         context[31] = 0x80_1000;
         context[32] = pc;
-        context[33] = 0;
-        context[34] = 0;
+        // N and C of NZCV, a thread pointer, FPCR.DN and FPSR.IOC.
+        context[33] = 0xA000_0000;
+        context[34] = 0x7E57_0000_1000;
         context[35] = BUFFER;
-        context[100] = 0;
-        context[101] = 0;
+        context[100] = 0x0200_0000;
+        context[101] = 1;
         thread::write_words(c.thread, abi::UPCALL_CONTEXT_OFFSET, &context);
         // Every argument, including x0, is a marker. Return has no selector.
         c.call(Call::ThreadUpcallReturn.number(), &[]);
@@ -2754,8 +2757,12 @@ pub fn upcall_return_restores_the_native_context_exactly(_: &Boot) -> Result<(),
             t.regs.x[..31] == context[..31]
                 && t.regs.sp == context[31]
                 && t.regs.elr == pc
-                && t.regs.tpidr == 0
-                && t.fp.v[0] == u128::from(context[36]) | (u128::from(context[37]) << 64),
+                && t.regs.spsr == context[33]
+                && t.regs.tpidr == context[34]
+                && t.fp.v[0] == u128::from(context[36]) | (u128::from(context[37]) << 64)
+                && t.fp.v[31] == u128::from(context[98]) | (u128::from(context[99]) << 64)
+                && t.fp.fpcr == context[100]
+                && t.fp.fpsr == context[101],
             "Return lost the exact native context",
         )
     })
