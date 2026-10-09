@@ -1764,6 +1764,34 @@ fn a_refused_step_of_a_cancel_stops_a_debug_build_and_is_counted() {
 }
 
 #[test]
+#[should_panic(expected = "a step of a cancel was refused")]
+fn a_refused_rewind_of_a_restart_stops_a_debug_build_and_is_counted() {
+    let mut env = Env::new();
+    let mut fds = session();
+    env.node(ROOT, b"dst", DIR, 0o755);
+    let start = ChangeStart {
+        key: key(6, 1),
+        ..op(ChangeOp::Rename, b"/etc")
+    };
+    env.start(&mut fds, OWNER, &start).unwrap();
+    env.second(&fds, OWNER, start.key, Base::Absolute, b"/dst")
+        .unwrap();
+    while phase_of(&env) != ChangePhase::Ready {
+        env.step(&fds, OWNER, start.key).unwrap();
+    }
+    // Something else lets go of the pin the walk holds on /etc, and the tree
+    // changes: the step finds the proof stale, the cancel of the journal
+    // goes well and the rewind of the walk finds its pin gone.
+    let etc = env.lookup(b"/etc").unwrap();
+    env.ram
+        .storage
+        .unpin(etc, crate::storage::Pin::Pending)
+        .unwrap();
+    env.node(ROOT, b"foreign", REG, 0o644);
+    let _ = env.step(&fds, OWNER, start.key);
+}
+
+#[test]
 fn an_unknown_second_path_component_ends_the_job_with_the_result_of_the_walk() {
     let mut env = Env::new();
     let mut fds = session();
