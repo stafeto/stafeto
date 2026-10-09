@@ -190,8 +190,8 @@ struct Live {
     /// None for a collector that only releases.
     claim: Option<ControlClaimToken>,
     here: Frame,
-    /// How many times the Start was refused with JOBS_FULL and sent again.
-    #[cfg(feature = "change-probe")]
+    /// How many times the Start was refused with JOBS_FULL and sent again;
+    /// the pause before the next one grows with it.
     full_repeats: u32,
 }
 
@@ -203,17 +203,18 @@ impl Service for Live {
         self.files.finish_binding()
     }
     fn wait_for_room(&mut self) {
-        #[cfg(feature = "change-probe")]
-        {
-            self.full_repeats += 1;
-        }
+        let pause = posix_change::room_pause_ns(self.full_repeats);
+        self.full_repeats = self.full_repeats.saturating_add(1);
         // What this process left behind may be what fills the table.
         collect(self.owner, self.here, Some(self.token), true);
-        // One millisecond on the timer of the thread, outside the deferral
-        // of signals: a handler that runs ends the sleep, the request goes
-        // again either way. A spin without a sleep would starve the holder
-        // of the place when it runs on this processor at a lower level.
-        let _ = crate::threads::sleep::pause(1_000_000);
+        // The pause grows from one millisecond to sixteen (a sleep of the
+        // timer of the thread, outside the deferral of signals: a handler
+        // that runs ends the sleep, the request goes again either way). The
+        // many threads that wait at once ask the service a few times in a
+        // second each, not a thousand times. A spin without a sleep would
+        // starve the holder of the place when it runs on this processor at a
+        // lower level.
+        let _ = crate::threads::sleep::pause(pause);
     }
 }
 
@@ -370,7 +371,6 @@ pub(crate) fn collect(
             token,
             claim: None,
             here: current,
-            #[cfg(feature = "change-probe")]
             full_repeats: 0,
         };
         posix_change::release(&mut wire, key_of(token));
@@ -444,7 +444,6 @@ pub fn run(request: &Request<'_>, out: &mut [u8; RESULT_MAX]) -> Result<Outcome,
         token,
         claim: Some(claim),
         here,
-        #[cfg(feature = "change-probe")]
         full_repeats: 0,
     };
     let driven = posix_change::drive(&mut wire, &start, request.second, out);
@@ -533,7 +532,6 @@ pub fn truncate(target: posix_fs::RamTarget, length: u64) -> Result<(), i32> {
         token,
         claim: Some(claim),
         here,
-        #[cfg(feature = "change-probe")]
         full_repeats: 0,
     };
     let driven = posix_change::drive_data(&mut wire, &args);

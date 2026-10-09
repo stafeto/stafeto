@@ -25,6 +25,13 @@ use proto_fs::{
 };
 use proto_wire::Status;
 
+/// The pause before a Start is sent again after `refusals` answers of
+/// JOBS_FULL, in nanoseconds: 1, 2, 4, 8 and then 16 milliseconds. A thread
+/// that waits for room long leaves the service to the work that frees it.
+pub fn room_pause_ns(refusals: u32) -> u64 {
+    1_000_000 << refusals.min(4)
+}
+
 /// What every loop needs of the service apart from its own requests: the
 /// Release that ends a job, the refresh of the credentials, and the wait for
 /// room in the table.

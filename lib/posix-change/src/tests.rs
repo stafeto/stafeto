@@ -865,3 +865,13 @@ fn release_of_a_data_job_goes_again_while_the_service_cleans_it_up() {
     release(&mut model, key(3, 9));
     assert_eq!(model.released, 3);
 }
+
+#[test]
+fn the_pause_for_room_doubles_from_one_millisecond_to_sixteen_and_stays() {
+    let pauses: Vec<u64> = (0..8).map(room_pause_ns).collect();
+    assert_eq!(
+        pauses,
+        [1, 2, 4, 8, 16, 16, 16, 16].map(|ms| ms * 1_000_000)
+    );
+    assert_eq!(room_pause_ns(u32::MAX), 16_000_000);
+}
