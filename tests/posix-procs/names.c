@@ -983,9 +983,9 @@ static long long names_realtime(void) {
  * a creation must not come after a later chmod. */
 static int names_clocks(void) {
     struct stat st;
-    long long before, after, created, changed, first, second;
+    long long before, after, created, written, changed, first, second;
 
-    /* The creation, then chmod: the change time of the creation is no later. */
+    /* The creation, a write, then chmod: the change times come in that order. */
     before = names_realtime();
     int fd = open(NAMES_ROOT "/k1", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     CHECK(fd >= 0);
@@ -994,6 +994,11 @@ static int names_clocks(void) {
     created = names_ns(st.st_ctim);
     CHECK(before <= created && created <= after);
     CHECK(names_ns(st.st_mtim) >= before && names_ns(st.st_mtim) <= after);
+    names_pause();
+    CHECK(write(fd, "x", 1) == 1);
+    OK(fstat(fd, &st));
+    written = names_ns(st.st_ctim);
+    CHECK(created < written);
     CHECK(close(fd) == 0);
     names_pause();
     before = names_realtime();
@@ -1001,7 +1006,7 @@ static int names_clocks(void) {
     after = names_realtime();
     OK(stat(NAMES_ROOT "/k1", &st));
     changed = names_ns(st.st_ctim);
-    CHECK(created < changed);
+    CHECK(written < changed);
     CHECK(before <= changed && changed <= after);
 
     /* A write of an older method, then a truncate of a Data job on another
