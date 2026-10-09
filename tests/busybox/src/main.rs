@@ -178,7 +178,7 @@ test -d /tmp/d || echo d-gone
 ln -s b /tmp/l
 readlink /tmp/l
 touch /tmp/t
-chmod 0600 /tmp/t
+chmod 600 /tmp/t
 ls -ld /tmp/t > /tmp/o
 read mode rest < /tmp/o
 echo mode $mode
