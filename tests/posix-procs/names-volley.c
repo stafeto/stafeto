@@ -7,8 +7,9 @@
  * against a client that changes the times of its own file in a loop. The
  * service prints its longest steps itself; this file prints the cost of each
  * operation alone (requests of the layer to the service, and ticks of the
- * counter), the repeats of JOBS_FULL of the volley and the restarts of the
- * long rmdir. Included by procs.c. */
+ * counter), the volley's most repeats of JOBS_FULL of one thread, most
+ * restarts of one rename and longest rename, and the restarts of the long
+ * rmdir. Included by procs.c. */
 
 extern void files_volley_start(void);
 extern void files_volley_stop(void);
@@ -231,6 +232,7 @@ struct vz_thread {
     int index;
     unsigned long long start;
     int result;
+    unsigned long long ticks;
 };
 
 static void *vz_rename_thread(void *argument) {
@@ -242,14 +244,19 @@ static void *vz_rename_thread(void *argument) {
         struct timespec delay = {0, 1000000};
         nanosleep(&delay, NULL);
     }
+    unsigned long long begin = files_volley_ticks();
     work->result = rename(from, to) == 0 ? 0 : errno;
+    work->ticks = files_volley_ticks() - begin;
     return NULL;
 }
 
-/* The role of a process of the volley: seven threads. The process writes the
- * most repeats of JOBS_FULL one of them made to /tmp/probe, two bytes at
- * VZ_REPEATS + 2 * process, and exits with 0, or 100 and more for a failure. */
+/* The role of a process of the volley: seven threads. The process writes to
+ * /tmp/probe, at VZ_REPEATS + VZ_RECORD * process, the most repeats of
+ * JOBS_FULL one of them made (4 bytes), the most restarts of the resolution
+ * one rename reported (4 bytes) and the longest rename in ticks (8 bytes),
+ * and exits with 0, or 100 and more for a failure. */
 #define VZ_REPEATS 64
+#define VZ_RECORD 16
 static int vz_child(void) {
     int process = atoi(argv_seen[2]);
     unsigned long long start = strtoull(argv_seen[3], NULL, 10);
@@ -259,24 +266,29 @@ static int vz_child(void) {
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 20480);
     for (int i = 0; i < VZ_THREADS; i++) {
-        work[i] = (struct vz_thread){process * VZ_THREADS + i, start, -1};
+        work[i] = (struct vz_thread){process * VZ_THREADS + i, start, -1, 0};
         int e = pthread_create(&threads[i], &attr, vz_rename_thread, &work[i]);
         if (e != 0) {
             printf("posix-procs: volley: thread %d of process %d gave %d\n", i, process, e);
             return 101;
         }
     }
+    unsigned long long longest = 0;
     for (int i = 0; i < VZ_THREADS; i++) {
         if (pthread_join(threads[i], NULL) != 0) return 102;
+        if (work[i].ticks > longest) longest = work[i].ticks;
         if (work[i].result != 0) {
             printf("posix-procs: volley: rename %d gave %d\n", work[i].index, work[i].result);
             return 103;
         }
     }
-    unsigned repeats = files_volley_full_repeats();
-    unsigned char bytes[2] = {(unsigned char)repeats, (unsigned char)(repeats >> 8)};
+    unsigned numbers[2] = {files_volley_full_repeats(), files_volley_restarts(VZ_OP_RENAME)};
+    unsigned char bytes[VZ_RECORD];
+    memcpy(bytes, numbers, sizeof numbers);
+    memcpy(bytes + sizeof numbers, &longest, sizeof longest);
     int fd = open("/tmp/probe", O_WRONLY);
-    if (fd < 0 || pwrite(fd, bytes, 2, VZ_REPEATS + 2 * process) != 2 || close(fd)) return 104;
+    if (fd < 0 || pwrite(fd, bytes, VZ_RECORD, VZ_REPEATS + VZ_RECORD * process) != VZ_RECORD || close(fd))
+        return 104;
     return 0;
 }
 
@@ -304,7 +316,8 @@ static int vz_volley(void) {
         }
         VZ_CHECK(e == 0);
     }
-    unsigned most = 0;
+    unsigned most = 0, most_restarts = 0;
+    unsigned long long longest = 0;
     int probe = open("/tmp/probe", O_RDWR);
     VZ_CHECK(probe >= 0);
     for (int p = 0; p < VZ_PROCESSES; p++) {
@@ -313,10 +326,15 @@ static int vz_volley(void) {
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
             printf("posix-procs: volley: process %d ended with status 0x%x\n", p, status);
         VZ_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-        unsigned char bytes[2];
-        VZ_CHECK(pread(probe, bytes, 2, VZ_REPEATS + 2 * p) == 2);
-        unsigned repeats = bytes[0] | ((unsigned)bytes[1] << 8);
-        if (repeats > most) most = repeats;
+        unsigned char bytes[VZ_RECORD];
+        VZ_CHECK(pread(probe, bytes, VZ_RECORD, VZ_REPEATS + VZ_RECORD * p) == VZ_RECORD);
+        unsigned numbers[2];
+        unsigned long long ticks_of_process;
+        memcpy(numbers, bytes, sizeof numbers);
+        memcpy(&ticks_of_process, bytes + sizeof numbers, sizeof ticks_of_process);
+        if (numbers[0] > most) most = numbers[0];
+        if (numbers[1] > most_restarts) most_restarts = numbers[1];
+        if (ticks_of_process > longest) longest = ticks_of_process;
     }
     VZ_CHECK(close(probe) == 0);
     unsigned long long ticks = files_volley_ticks() - begin;
@@ -329,8 +347,9 @@ static int vz_volley(void) {
         VZ_CHECK(unlink(to) == 0);
     }
     printf("posix-procs: names volley: %d processes of %d threads, %d renames, all done, "
-           "the most repeats of JOBS_FULL of one thread %u, %llu ticks\n",
-           VZ_PROCESSES, VZ_THREADS, total, most, ticks);
+           "the most repeats of JOBS_FULL of one thread %u, the most restarts of one rename %u, "
+           "the longest rename %llu ticks, %llu ticks\n",
+           VZ_PROCESSES, VZ_THREADS, total, most, most_restarts, longest, ticks);
     return 0;
 }
 

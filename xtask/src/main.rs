@@ -3664,6 +3664,15 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
             "no thread of the volley met JOBS_FULL, the refused Start was not exercised: {volley}"
         ));
     }
+    // The restarts of one rename and the longest rename: the numbers 5i-5b
+    // compares with.
+    for what in [
+        "the most restarts of one rename ",
+        "the longest rename ",
+    ] {
+        qemu::number_after(&[(*volley).to_owned()], what)
+            .ok_or_else(|| format!("the volley line has no {what:?}: {volley}"))?;
+    }
     find("names volley ok")?;
     Ok(shown.iter().map(|line| (*line).clone()).collect())
 }
@@ -6806,10 +6815,14 @@ mod tests {
     /// renames and some thread met JOBS_FULL.
     #[test]
     fn the_names_volley_lines_are_read_strictly() {
-        let good = "posix-procs: names volley: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 130, 6879297680 ticks";
+        let good = "posix-procs: names volley: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 130, the most restarts of one rename 40, the longest rename 99000000 ticks, 6879297680 ticks";
         assert!(super::names_lines(&names_log(good)).is_ok());
         let none = good.replace("thread 130", "thread 0");
         assert!(super::names_lines(&names_log(&none)).is_err());
+        let no_restarts = good.replace("the most restarts of one rename 40, ", "");
+        assert!(super::names_lines(&names_log(&no_restarts)).is_err());
+        let no_longest = good.replace("the longest rename 99000000 ticks, ", "");
+        assert!(super::names_lines(&names_log(&no_longest)).is_err());
         let fewer = good.replace("112 renames, all done", "97 renames");
         assert!(super::names_lines(&names_log(&fewer)).is_err());
         let mut without_row = names_log(good);
