@@ -17,6 +17,7 @@ pub mod fork;
 pub mod loader_probe;
 pub mod long;
 pub mod metadata;
+pub mod names;
 mod open_driver;
 pub mod pipes;
 pub mod process;

@@ -10,6 +10,7 @@ extern int files_full_sessions(void);
 extern int files_open_stages(void);
 extern int files_data_stages(void);
 extern int files_change_stages(void);
+extern int files_names_stages(void);
 #include "pending-open.c"
 #include "open-policy.c"
 #if LOADER_ABORT_PROBE
@@ -58,6 +59,9 @@ int main(void) {
     int change = files_change_stages();
     if (change) { printf("posix-files: Change stages failed %d\n", change); return 25; }
     puts("posix-files: raw Change requests ok");
+    int names = files_names_stages();
+    if (names) { printf("posix-files: names stages failed %d\n", names); return 26; }
+    puts("posix-files: layer names ok");
     if (files_full_sessions()) return 12;
     puts("posix-files: 16 sessions with 32 retained descriptors ok");
 #if LOADER_ABORT_PROBE

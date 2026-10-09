@@ -73,6 +73,8 @@ mod cleanup;
 #[cfg(feature = "files")]
 mod data_stages;
 #[cfg(feature = "stages")]
+mod names_stages;
+#[cfg(feature = "stages")]
 mod open_stages;
 /// Sixteen real sessions retain all thirty-two descriptions during both
 /// credential changes. Every reply and retained byte is checked by the guest.

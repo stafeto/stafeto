@@ -16,6 +16,7 @@
 #![no_std]
 
 mod files;
+mod names;
 mod signals;
 mod wait;
 

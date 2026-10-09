@@ -609,18 +609,34 @@ impl Transport {
     /// A virtual terminal leaf whose parent the RAM service resolved by inode.
     /// Parent search includes dot components and links under the actual identity.
     pub fn terminal_open(&self, path: &Resolved) -> Result<Option<(u32, u32)>, FsError> {
+        self.terminal_leaf(None, path.as_bytes(), path.trailing_slash)
+    }
+
+    /// The same for a path that starts at a descriptor of the session: `base`
+    /// is that descriptor and the generation of its description, None for a
+    /// path from the root. A path with a slash in the end names a directory,
+    /// which a virtual leaf is not: `trailing_slash` makes that ENOTDIR.
+    pub fn terminal_leaf(
+        &self,
+        base: Option<(u32, u64)>,
+        bytes: &[u8],
+        trailing_slash: bool,
+    ) -> Result<Option<(u32, u32)>, FsError> {
         if self.terminal().is_none() {
             return Ok(None);
         }
-        let bytes = path.as_bytes();
         let mut end = bytes.len();
         while end > 0 && bytes[end - 1] == b'/' {
             end -= 1;
         }
-        let Some(slash) = bytes[..end].iter().rposition(|&b| b == b'/') else {
-            return Ok(None);
+        // The slash before the leaf. A path from a descriptor may have none:
+        // its parent is the descriptor's directory itself.
+        let slash = match bytes[..end].iter().rposition(|&b| b == b'/') {
+            Some(slash) => Some(slash),
+            None if base.is_some() => None,
+            None => return Ok(None),
         };
-        let leaf = &bytes[slash + 1..end];
+        let leaf = &bytes[slash.map_or(0, |slash| slash + 1)..end];
         let (named, parent): ((u32, u32), &[u8]) = match leaf {
             b"console" => ((proto_tty::OPEN_CONSOLE, 0), b"/dev/."),
             b"tty" => ((proto_tty::OPEN_CONTROLLING, 0), b"/dev/."),
@@ -633,26 +649,41 @@ impl Transport {
                 None => return Ok(None),
             },
         };
-        let mut directory = [0; MAX_PATH + 1];
-        directory[..slash].copy_from_slice(&bytes[..slash]);
-        directory[slash..slash + 2].copy_from_slice(b"/.");
-        let (actual, parent) = match self.files().node_information_bytes(&directory[..slash + 2]) {
-            Ok(actual) => (actual, parent),
-            Err(Status::Unknown(proto_fs::NO_ENTRY))
-                if named.0 == proto_tty::OPEN_SLAVE && bytes[..slash].ends_with(b"/pts") =>
-            {
-                // The terminal service also mounts pts for boot profiles whose
-                // immutable RAM image contains only /dev. Resolve its real parent.
-                let mount = slash - 4;
-                directory[mount..mount + 2].copy_from_slice(b"/.");
-                (
-                    self.files()
-                        .node_information_bytes(&directory[..mount + 2])?,
-                    b"/dev/.".as_slice(),
-                )
+        let mut directory = [0; MAX_PATH + 2];
+        let length = match slash {
+            Some(slash) => {
+                directory[..slash].copy_from_slice(&bytes[..slash]);
+                directory[slash..slash + 2].copy_from_slice(b"/.");
+                slash + 2
             }
-            Err(error) => return Err(error.into()),
+            None => {
+                directory[0] = b'.';
+                1
+            }
         };
+        let (actual, parent) =
+            match self
+                .files()
+                .node_information_from(base, &directory[..length], true)
+            {
+                Ok(actual) => (actual, parent),
+                Err(Status::Unknown(proto_fs::NO_ENTRY))
+                    if named.0 == proto_tty::OPEN_SLAVE
+                        && base.is_none()
+                        && slash.is_some_and(|slash| bytes[..slash].ends_with(b"/pts")) =>
+                {
+                    // The terminal service also mounts pts for boot profiles whose
+                    // immutable RAM image contains only /dev. Resolve its real parent.
+                    let mount = slash.unwrap_or(0) - 4;
+                    directory[mount..mount + 2].copy_from_slice(b"/.");
+                    (
+                        self.files()
+                            .node_information_bytes(&directory[..mount + 2])?,
+                        b"/dev/.".as_slice(),
+                    )
+                }
+                Err(error) => return Err(error.into()),
+            };
         let expected = match self.files().node_information_bytes(parent) {
             Ok(info) => info,
             Err(Status::Unknown(proto_fs::NO_ENTRY)) => return Ok(None),
@@ -661,10 +692,24 @@ impl Transport {
         if actual.kind != 1 || actual.device != expected.device || actual.inode != expected.inode {
             return Ok(None);
         }
-        if path.trailing_slash {
+        if trailing_slash {
             return Err(FsError::NotDirectory);
         }
         Ok(Some(named))
+    }
+
+    /// The node information of a virtual leaf `terminal_leaf` found.
+    pub fn terminal_leaf_information(&self, kind: u32, number: u32) -> Result<NodeInfo, FsError> {
+        match kind {
+            proto_tty::OPEN_MASTER => {
+                self.terminal_information(proto_tty::STAT_PATH, Some(proto_tty::STAT_PATH))
+            }
+            proto_tty::OPEN_SLAVE => self.terminal_information(
+                proto_tty::STAT_PATH,
+                Some(number.checked_add(1).ok_or(FsError::NoEntry)?),
+            ),
+            _ => Ok(CONSOLE_INFO),
+        }
     }
 
     pub fn stat(&self, path: &Resolved) -> Result<Metadata, FsError> {
@@ -690,16 +735,7 @@ impl Transport {
 
     pub fn stat_information(&self, path: &Resolved) -> Result<NodeInfo, FsError> {
         if let Some((kind, number)) = self.terminal_open(path)? {
-            return match kind {
-                proto_tty::OPEN_MASTER => {
-                    self.terminal_information(proto_tty::STAT_PATH, Some(proto_tty::STAT_PATH))
-                }
-                proto_tty::OPEN_SLAVE => self.terminal_information(
-                    proto_tty::STAT_PATH,
-                    Some(number.checked_add(1).ok_or(FsError::NoEntry)?),
-                ),
-                _ => Ok(CONSOLE_INFO),
-            };
+            return self.terminal_leaf_information(kind, number);
         }
         let info = self
             .files()
