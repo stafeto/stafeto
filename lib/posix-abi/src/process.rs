@@ -1154,8 +1154,9 @@ pub fn spawn_file<'s, 'a>(
 /// actions, as an execvp in the child would make it: in the directory the
 /// actions left as the current one, with the descriptors they made. A
 /// directory that is empty stands for the current directory. The first file
-/// the caller may execute is the program; ENOENT when none exists, EACCES
-/// when one exists that the caller may not execute.
+/// the caller may execute is the program (a regular file, by the effective
+/// IDs); ENOENT when none exists, EACCES when one exists that the caller may
+/// not execute (a directory of that name counts).
 pub fn spawn_search<'s, 'a>(
     file: &[u8],
     search: Option<&[u8]>,
@@ -1219,7 +1220,25 @@ impl Shadow {
             let Ok(full) = self.absolute(&candidate[..length], &mut full) else {
                 continue;
             };
-            match crate::names::faccessat(crate::names::AT_FDCWD, full, X_OK, 0) {
+            // A candidate that execve would refuse is passed over, as execvp
+            // passes it: a directory has the search permission for X_OK and
+            // is no program (execve answers EACCES, which execvp remembers
+            // and reports when no later directory has the program). The
+            // permission is that of the effective IDs, as execve checks it.
+            match crate::names::fstatat(crate::names::AT_FDCWD, Some(full), 0) {
+                Ok(info) if info.kind == 2 => {}
+                Ok(_) => {
+                    denied = true;
+                    continue;
+                }
+                Err(_) => continue,
+            }
+            match crate::names::faccessat(
+                crate::names::AT_FDCWD,
+                full,
+                X_OK,
+                crate::names::AT_EACCESS,
+            ) {
                 Ok(()) => {
                     out[..full.len()].copy_from_slice(full);
                     return Ok(&out[..full.len()]);

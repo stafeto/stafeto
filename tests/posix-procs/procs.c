@@ -2461,6 +2461,17 @@ static void spawn_names(void) {
     expect("a name that is in no directory", spawnp_with("no-such-program", "/etc:/bin:.", "cwd", &actions, &status), ENOENT);
     expect("a name in a directory that is not there", spawnp_with("procs-child", "/nonexistent", "cwd", NULL, &status), ENOENT);
     expect("no directory in PATH", spawnp_with("procs-child", "", "cwd", NULL, &status), ENOENT);
+    /* A directory of the name has the search permission for X_OK and is no
+     * program: execvp passes it over, and reports EACCES when no later
+     * directory has the program. */
+    mkdir("/tmp/spdir", 0755);
+    mkdir("/tmp/spdir/procs-child", 0755);
+    status = -1;
+    expect("a directory of the name is passed over", spawnp_with("procs-child", "/tmp/spdir:/bin", "cwd", NULL, &status), 0);
+    expect("and the program of the later directory ran", status == 2 || status == 0, 1);
+    expect("a directory of the name alone is EACCES", spawnp_with("procs-child", "/tmp/spdir", "cwd", NULL, &status), EACCES);
+    rmdir("/tmp/spdir/procs-child");
+    rmdir("/tmp/spdir");
     posix_spawn_file_actions_destroy(&actions);
 
     /* fchdir: the directory a descriptor names. */
