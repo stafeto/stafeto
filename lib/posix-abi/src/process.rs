@@ -600,6 +600,14 @@ struct Shadow {
     terminal_count: usize,
     terminal_open_count: usize,
     pending: [Option<u32>; posix_fs::OPEN_MAX],
+    /// POSIX_SPAWN_RESETIDS with effective IDs that differ from the real
+    /// ones: the child runs under the real IDs, and the actions of files and
+    /// the search of PATH, which run here under the effective ones, check
+    /// the permissions with the real ones first (a temporary check until
+    /// issue #176 moves the actions into the child, which has the IDs after
+    /// the reset: this window between the check and the use stays, issue
+    /// #150).
+    real_ids: bool,
 }
 
 impl Shadow {
@@ -617,6 +625,7 @@ impl Shadow {
             terminal_count: 0,
             terminal_open_count: 0,
             pending: [None; posix_fs::OPEN_MAX],
+            real_ids: false,
         };
         crate::shared::with_files(|files| {
             let mut open = [None; posix_fs::OPEN_MAX];
@@ -790,6 +799,9 @@ impl Shadow {
                     return Ok(());
                 }
                 self.replace_entry(place, None, None)?;
+                if self.real_ids {
+                    self.real_open_allowed(full, flags)?;
+                }
                 // The caller's own descriptor lives only for the spawn: with
                 // FD_CLOEXEC, so that an exec or spawn of another thread in
                 // the meantime does not inherit it. The child's flag is the
@@ -813,6 +825,9 @@ impl Shadow {
             FileAction::Chdir(path) => {
                 let mut full = [0; proto_loader::PATH_MAX];
                 let full = self.absolute(path, &mut full)?;
+                if self.real_ids {
+                    real_access(full, X_OK)?;
+                }
                 // The child starts in the canonical path of the directory.
                 let mut canonical = [0; crate::names::MAX_PATH + 1];
                 let len = crate::names::directory_path(full, &mut canonical)?;
@@ -824,6 +839,9 @@ impl Shadow {
                 // service gives it; a descriptor of another service is ENOTDIR.
                 let mut canonical = [0; crate::names::MAX_PATH + 1];
                 let len = crate::names::descriptor_path(target, &mut canonical)?;
+                if self.real_ids {
+                    real_access(&canonical[..len], X_OK)?;
+                }
                 self.set_cwd(&canonical[..len]);
             }
         }
@@ -1175,6 +1193,8 @@ pub fn spawn_search<'s, 'a>(
     }
     let mut shadow = Shadow::take()?;
     shadow.umask = attributes.umask;
+    shadow.real_ids = attributes.flags & proto_process::SPAWN_RESETIDS != 0
+        && (geteuid() != getuid() || getegid() != getgid());
     let spawned = actions
         .into_iter()
         .try_for_each(|action| shadow.apply(action))
@@ -1190,7 +1210,45 @@ pub fn spawn_search<'s, 'a>(
     spawned
 }
 
+/// X_OK of faccessat.
+const X_OK: i32 = 1;
+
+/// Whether the real IDs of the caller have the access `bits` (R_OK 4, W_OK 2,
+/// X_OK 1) to `path`: EACCES or the error of the lookup.
+fn real_access(path: &[u8], bits: i32) -> Result<(), i32> {
+    crate::names::faccessat(crate::names::AT_FDCWD, path, bits, 0)
+}
+
 impl Shadow {
+    /// An Open action under RESETIDS with differing IDs: what the real IDs
+    /// may do to the file. An existing file needs the bits of the access
+    /// mode (and write for O_TRUNC); a name to create needs write and search
+    /// in its directory.
+    fn real_open_allowed(&self, full: &[u8], flags: i32) -> Result<(), i32> {
+        use crate::constants::{ENOENT, O_ACCMODE, O_CREAT, O_RDWR, O_TRUNC, O_WRONLY};
+        match crate::names::fstatat(crate::names::AT_FDCWD, Some(full), 0) {
+            Ok(_) => {
+                let mut bits = match flags & O_ACCMODE {
+                    O_WRONLY => 2,
+                    O_RDWR => 6,
+                    _ => 4,
+                };
+                if flags & O_TRUNC != 0 {
+                    bits |= 2;
+                }
+                real_access(full, bits)
+            }
+            Err(ENOENT) if flags & O_CREAT != 0 => {
+                let slash = full.iter().rposition(|&byte| byte == b'/').unwrap_or(0);
+                let parent: &[u8] = if slash == 0 { b"/" } else { &full[..slash] };
+                real_access(parent, 2 | X_OK)
+            }
+            // A lookup that fails otherwise (a missing directory above, no
+            // search permission) is the answer of the open that follows.
+            Err(_) => Ok(()),
+        }
+    }
+
     /// The first directory of `search` with a file `file` the caller may
     /// execute, as an absolute path against the shadow's current directory.
     fn find_program<'o>(
@@ -1200,7 +1258,6 @@ impl Shadow {
         out: &'o mut [u8; proto_loader::PATH_MAX],
     ) -> Result<&'o [u8], i32> {
         use crate::constants::{EACCES, ENOENT};
-        const X_OK: i32 = 1;
         let mut denied = false;
         for directory in search.split(|&byte| byte == b':') {
             let directory: &[u8] = if directory.is_empty() {
@@ -1233,12 +1290,14 @@ impl Shadow {
                 }
                 Err(_) => continue,
             }
-            match crate::names::faccessat(
-                crate::names::AT_FDCWD,
-                full,
-                X_OK,
-                crate::names::AT_EACCESS,
-            ) {
+            // With RESETIDS and differing IDs the child runs under the real
+            // ones: they decide.
+            let how = if self.real_ids {
+                0
+            } else {
+                crate::names::AT_EACCESS
+            };
+            match crate::names::faccessat(crate::names::AT_FDCWD, full, X_OK, how) {
                 Ok(()) => {
                     out[..full.len()].copy_from_slice(full);
                     return Ok(&out[..full.len()]);

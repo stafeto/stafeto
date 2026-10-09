@@ -1956,6 +1956,84 @@ static int channel_child(const char *name);
 static void spawn_names(void);
 static void dup3_across_fork(void);
 
+/* A set-ID program of root (real UID 65534, effective 0) that spawns with
+ * POSIX_SPAWN_RESETIDS: the actions of files and the search of PATH run in
+ * this process under the effective IDs, so the layer checks them with the
+ * real ones first (until issue #176 moves them into the child). The
+ * directory /tmp/rs is root's, mode 0700. */
+static int setid_spawn(void) {
+    char *argv[] = {"procs-child", "child", NULL};
+    char *envp[] = {NULL};
+    struct stat st;
+    posix_spawnattr_t reset;
+    posix_spawnattr_init(&reset);
+    posix_spawnattr_setflags(&reset, POSIX_SPAWN_RESETIDS);
+    if (getuid() != 65534 || geteuid() != 0) return 1;
+    if (mkdir("/tmp/rs", 0700) != 0) return 2;
+    int bad = 0;
+    posix_spawn_file_actions_t actions;
+    pid_t pid;
+
+    /* An Open action that creates a file in a directory the real IDs may
+     * not write: EACCES and no file. Without RESETIDS the child runs under
+     * the effective IDs, and the file appears. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 5, "/tmp/rs/made", O_WRONLY | O_CREAT, 0600);
+    pid = -7;
+    int e = posix_spawn(&pid, "/bin/procs-child", &actions, &reset, argv, envp);
+    if (e != EACCES || stat("/tmp/rs/made", &st) == 0) {
+        printf("posix-procs: setid spawn: RESETIDS and addopen gave %d (%s)\n", e, strerror(e));
+        bad |= 4;
+    }
+    e = posix_spawn(&pid, "/bin/procs-child", &actions, NULL, argv, envp);
+    if (e != 0 || waitpid(pid, NULL, 0) != pid || stat("/tmp/rs/made", &st) != 0) {
+        printf("posix-procs: setid spawn: addopen without RESETIDS gave %d (%s)\n", e, strerror(e));
+        bad |= 8;
+    }
+    posix_spawn_file_actions_destroy(&actions);
+
+    /* A directory the real IDs may not search. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addchdir(&actions, "/tmp/rs");
+    e = posix_spawn(&pid, "/bin/procs-child", &actions, &reset, argv, envp);
+    if (e != EACCES) {
+        printf("posix-procs: setid spawn: RESETIDS and addchdir gave %d (%s)\n", e, strerror(e));
+        bad |= 16;
+    }
+    e = posix_spawn(&pid, "/bin/procs-child", &actions, NULL, argv, envp);
+    if (e != 0 || waitpid(pid, NULL, 0) != pid) {
+        printf("posix-procs: setid spawn: addchdir without RESETIDS gave %d (%s)\n", e, strerror(e));
+        bad |= 32;
+    }
+    posix_spawn_file_actions_destroy(&actions);
+
+    /* The search of PATH: /tmp/rs holds a file procs-child that only root may
+     * execute. Under the real IDs the directory cannot be searched, and the
+     * search goes on to /bin; under the effective IDs it stops at the empty
+     * file, which is no program, and the spawn fails. */
+    int fd = open("/tmp/rs/procs-child", O_WRONLY | O_CREAT, 0700);
+    if (fd < 0) return 64;
+    close(fd);
+    setenv("PATH", "/tmp/rs:/bin", 1);
+    e = posix_spawnp(&pid, "procs-child", NULL, &reset, argv, envp);
+    if (e != 0 || waitpid(pid, NULL, 0) != pid) {
+        printf("posix-procs: setid spawn: RESETIDS and a path search gave %d (%s)\n", e, strerror(e));
+        bad |= 128;
+    }
+    e = posix_spawnp(&pid, "procs-child", NULL, NULL, argv, envp);
+    if (e == 0) {
+        printf("posix-procs: setid spawn: a path search under the effective IDs gave %d (%s)\n", e,
+               strerror(e));
+        bad |= 256;
+    }
+    unlink("/tmp/rs/procs-child");
+    unlink("/tmp/rs/made");
+    rmdir("/tmp/rs");
+    posix_spawnattr_destroy(&reset);
+    if (!bad) printf("posix-procs: setid spawn ok\n");
+    return bad;
+}
+
 static int role(const char *name) {
 #if PENDING_OPEN_PROBE
     if (strcmp(name, "pendingfork") == 0) return check_pending_fork();
@@ -2051,6 +2129,7 @@ static int role(const char *name) {
                (int)geteuid(), getauxval(23), fd);
         return ok ? 0 : 1;
     }
+    if (strcmp(name, "setidspawn") == 0) return setid_spawn();
     if (strcmp(name, "nobody") == 0) {
         int ok = getuid() == 65534 && geteuid() == 65534 && getauxval(23) == 0;
         printf("posix-procs: nobody uid %d euid %d\n", (int)getuid(), (int)geteuid());
@@ -2679,6 +2758,7 @@ static void files_nobody(void) {
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_RESETIDS);
     run_role("/bin/procs-setid", "setid", &attr);
     posix_spawnattr_destroy(&attr);
+    run_role("/bin/procs-setid", "setidspawn", NULL);
     /* A set-ID file that the loader opens and cannot load: its SetId goes
      * with the attempt, and the next child of the same place is nobody. */
     char *child[] = {"procs-child", "child", NULL};
