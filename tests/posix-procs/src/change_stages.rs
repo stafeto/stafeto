@@ -333,6 +333,13 @@ fn run_stages(files: &Files) -> Result<(), i32> {
     if exists(files, 8, b"/tmp/cs-key", dir_flags).map_err(|_| 35)? {
         return Err(35);
     }
+    // A Release before its Start closes the key: the late Start is retired.
+    release(files, key(8, 5)).map_err(|_| 39)?;
+    if start(files, &mkdir(8, 5, b"/tmp/cs-late", 0o755))
+        != Err(Status::Unknown(proto_fs::OPEN_RETIRED))
+    {
+        return Err(40);
+    }
     // An operation number that does not exist is a protocol error.
     let mut w = Writer::new();
     Method::ChangeStart.header().write(&mut w).map_err(|_| 36)?;

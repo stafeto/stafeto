@@ -777,6 +777,42 @@ fn a_directory_without_search_permission_refuses_a_relative_path_by_its_current_
 }
 
 #[test]
+fn search_permission_of_the_base_is_checked_by_the_mode_it_has_when_the_path_is_walked() {
+    let mut env = Env::new();
+    let dir = env.node(ROOT, b"dir", DIR, 0o755);
+    env.node(dir, b"f", REG, 0o644);
+    let mut fds = credentials(500, 500, 500, 500);
+    let fd = env
+        .ram
+        .open_token(&mut fds, dir, proto_fs::READ_ONLY, ROOT_USER)
+        .unwrap();
+    let generation = env.ram.description_token(&fds, fd).unwrap().generation;
+    let access = |base| ChangeStart {
+        base,
+        ..with_args(ChangeOp::Access, b"f", 0, [0, 0, 0, 0])
+    };
+    let from = Base::Fd { fd, generation };
+    assert_eq!(env.go_result(&mut fds, access(from), None), 0);
+    // The mode changes after the descriptor was opened: the next walk sees it.
+    env.ram.storage.set_attributes(dir, 0o644, 0, 0).unwrap();
+    assert_eq!(
+        env.go_result(&mut fds, access(from), None),
+        proto_fs::ACCESS_DENIED
+    );
+    env.ram.storage.set_attributes(dir, 0o711, 0, 0).unwrap();
+    assert_eq!(env.go_result(&mut fds, access(from), None), 0);
+    // An empty path names the descriptor's own object and asks no search.
+    env.ram.storage.set_attributes(dir, 0o644, 0, 0).unwrap();
+    let own = ChangeStart {
+        base: from,
+        ..with_args(ChangeOp::StatVfs, b"", 0, [0; 4])
+    };
+    assert_eq!(env.go_result(&mut fds, own, None), 0);
+    env.ram.close(&mut fds, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
 fn release_of_a_job_in_the_middle_gives_back_the_reservation_in_one_call() {
     let mut env = Env::new();
     let mut fds = session();
