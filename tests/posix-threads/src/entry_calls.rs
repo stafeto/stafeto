@@ -10,15 +10,17 @@ use super::*;
 use crate::layer::signals::{self as api, SigAction};
 
 /// The calls from the mark of the sender to the first line of the handler,
-/// without the sender's receive: the sender's `pthread_kill` and the layer's
-/// calls on the target before its handler runs (the one that enables nested
-/// entries).
-const ENTRY_CALLS_TO_HANDLER: u64 = 4;
+/// without the sender's receive: the entry request of the sender, and the
+/// resolution of the nested entry on the target. `pthread_kill` pins the
+/// target's place and takes no lock of the table, so the two calls that
+/// raised the sender to the ceiling of the process and lowered it again
+/// are gone.
+const ENTRY_CALLS_TO_HANDLER: u64 = 2;
 /// The calls from the mark to the return into the interrupted code,
 /// without the sender's receive: the former plus the call that masks the
-/// entry again after the handler. Measured: 4 + 1 (9 when a delivery inside
+/// entry again after the handler. Measured: 2 + 1 (9 when a delivery inside
 /// an entry takes the kernel's deferral, as it did before).
-const ENTRY_DELIVERY_CALLS: u64 = 5;
+const ENTRY_DELIVERY_CALLS: u64 = 3;
 
 static READY: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicU64 = AtomicU64::new(0);
@@ -52,6 +54,21 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
 }
 
 pub(super) fn run() -> bool {
+    // The process ceiling is above main's level, so the lock with a lift
+    // that `pthread_kill` once took did two calls of the kernel; with no
+    // ceiling the count could not show their removal.
+    let main = unsafe { threads::probe_native(ffi::pthread_self()) }.unwrap();
+    let base = sys::thread_info(&main).unwrap();
+    let mut lifted = base;
+    abi::shared::probe_hold(|| lifted = sys::thread_info(&main).unwrap());
+    if lifted.priority <= base.priority {
+        return failed(1609);
+    }
+    rt::println!(
+        "entry-calls: the process ceiling lifts a holder to {} from main's {}",
+        lifted.priority,
+        base.priority
+    );
     let ready = sys::channel_create(30).unwrap();
     let done = sys::channel_create(30).unwrap();
     READY.store(ready.raw().0, Ordering::Release);

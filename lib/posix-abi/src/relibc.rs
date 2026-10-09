@@ -50,7 +50,7 @@ mod lifetime;
 pub(crate) mod native;
 mod native_owner;
 pub use lifetime::OwnerStatus;
-use lifetime::{DETACHED, DETACHING, EXITED, FREE, LIVE, Lifetime, RELEASED};
+use lifetime::{Claim, DETACHED, DETACHING, EXITED, FREE, LIVE, Lifetime, RELEASED};
 
 /// A place of the table: 64 bytes.
 #[repr(C, align(64))]
@@ -88,6 +88,41 @@ static TABLE: [Place; PLACES] = [const {
         floating: AtomicU64::new(0),
     }
 }; PLACES];
+
+/// How many senders (`pthread_kill`, `pthread_cancel`) pinned each place:
+/// the collector never frees a pinned place and tries again on its next
+/// pass. A place is 64 bytes, so the counts are a table of their own.
+static PINS: [AtomicU32; PLACES] = [const { AtomicU32::new(0) }; PLACES];
+
+/// The places that the collector passed over because a sender pinned them:
+/// the sender whose release empties such a place wakes `reserve`.
+static PIN_WAIT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a sender pins place `index`. When one does, the place is marked
+/// for the wake of the last sender and the count is read once more: a
+/// sender that left between the two reads has nobody left to wake us.
+fn pinned(index: usize) -> bool {
+    if PINS[index].load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    PIN_WAIT.fetch_or(1 << index, Ordering::SeqCst);
+    if PINS[index].load(Ordering::SeqCst) != 0 {
+        return true;
+    }
+    PIN_WAIT.fetch_and(!(1 << index), Ordering::SeqCst);
+    false
+}
+
+/// The release of the last pin of place `index`: wakes `reserve` when the
+/// collector passed the place over.
+fn pin_released(index: usize) {
+    let bit = 1u64 << index;
+    if PIN_WAIT.load(Ordering::SeqCst) & bit != 0 {
+        PIN_WAIT.fetch_and(!bit, Ordering::SeqCst);
+        FREE_EPOCH.fetch_add(1, Ordering::SeqCst);
+        posix_sync::futex_wake(&FREE_EPOCH, u32::MAX);
+    }
+}
 
 /// The channel every thread's end is told on (thread_create x7).
 static EXITS: AtomicU64 = AtomicU64::new(0);
@@ -320,6 +355,12 @@ pub unsafe fn after_fork(id: u64, native: u64) {
         place.state.after_fork(false);
     }
     EXITS.store(0, Ordering::Release);
+    // The child has no other thread: the pins of the parent's senders mean
+    // nothing in it.
+    for pins in &PINS {
+        pins.store(0, Ordering::Relaxed);
+    }
+    PIN_WAIT.store(0, Ordering::Relaxed);
     LEFT.store(0, Ordering::Release);
     ROUTER.store(id, Ordering::Release);
 }
@@ -348,34 +389,77 @@ pub fn target(id: u64) -> Result<(&'static Block, core::mem::ManuallyDrop<Handle
     ))
 }
 
-/// A target's resident page and native capability stay held through this callback.
-/// The higher-ranked borrow cannot escape into the callback result.
+/// A target's resident page and native capability stay held through this
+/// callback, without the table's lock: the sender pins the place (one
+/// atomic increment of `PINS`), looks at the word of the place once more
+/// (same generation, LIVE, not MAKING) and only then reads the block and
+/// the handle. The collector writes the word (`claim_collect`) and then
+/// reads the pin; both are SeqCst, so either the sender sees the claim and
+/// leaves with ESRCH or the collector sees the pin and gives the place back
+/// until the sender's release. The sender waits for nothing and calls the
+/// kernel for nothing (the release of the last pin wakes `reserve` only
+/// when the collector passed the place over). A critical section keeps a
+/// handler of signals from leaving the callback with the pin held. The
+/// higher-ranked borrow cannot escape into the callback result.
 pub(crate) fn with_target<R>(
     id: u64,
     f: impl for<'a> FnOnce(&'a Block, &'a Handle<Thread>) -> R,
 ) -> Result<R, i32> {
-    let _guard = TABLE_LOCK.lock();
     let index = usize::try_from(id)
         .ok()
         .and_then(|id| id.checked_sub(1))
         .ok_or(ESRCH)?;
     let place = TABLE.get(index).ok_or(ESRCH)?;
-    if place.state.flags() & LIVE == 0 {
-        return Err(ESRCH);
-    }
+    posix_sync::enter();
+    let _critical = Critical;
+    let _pin = place
+        .state
+        .try_pin(&PINS[index], index, pin_released)
+        .ok_or(ESRCH)?;
     let native = borrowed::<Thread>(place.native.load(Ordering::Acquire));
     if place.stack.load(Ordering::Acquire) == 1
         && !sys::thread_info(&native).is_ok_and(|i| i.state != ThreadState::Ended)
     {
         return Err(ESRCH);
     }
-    // SAFETY: LIVE publication and TABLE keep this exact resident page mapped.
+    // SAFETY: the pin keeps this exact LIVE place and its resident page: the
+    // collector does not free a pinned place.
     let block = unsafe { &*(place.block.load(Ordering::Acquire) as *const Block) };
+    #[cfg(feature = "thread-probe")]
+    target_pin_window(id);
     Ok(f(block, &native))
 }
 
-/// Held while a block of the table is read (`each_block`) and while
-/// `collect` frees a place, so that no block is read after its TCB went.
+struct Critical;
+impl Drop for Critical {
+    fn drop(&mut self) {
+        posix_sync::leave();
+    }
+}
+
+#[cfg(feature = "thread-probe")]
+static TARGET_PIN_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+/// A one-shot guest hook in `with_target`, after the block was read and
+/// before the callback: the place is pinned there.
+#[cfg(feature = "thread-probe")]
+pub fn probe_target_pin_window(hook: Option<extern "C" fn(u64)>) {
+    TARGET_PIN_WINDOW.store(hook.map_or(0, |f| f as usize), Ordering::Release);
+}
+
+#[cfg(feature = "thread-probe")]
+fn target_pin_window(id: u64) {
+    let hook = TARGET_PIN_WINDOW.swap(0, Ordering::AcqRel);
+    if hook != 0 {
+        // SAFETY: probe_target_pin_window stores a C function of this signature.
+        let hook = unsafe { core::mem::transmute::<usize, extern "C" fn(u64)>(hook) };
+        hook(id);
+    }
+}
+
+/// Held while a block of the table is read (`each_block`, `each_live`) and
+/// while `collect` frees a place, so that no block is read after its TCB
+/// went. The senders of `with_target` pin their place instead.
 static TABLE_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::raising();
 
 /// Runs `f` on the block of every live thread.
@@ -412,12 +496,26 @@ pub fn occupied() -> usize {
         .count()
 }
 
+/// What a pass of `collect` left: `deferred` when an owner's recovery waits
+/// for a detach, `pinned` when a place was passed over because a sender
+/// pins it (the next pass frees it).
+struct Collected {
+    deferred: bool,
+    pinned: bool,
+}
+
 /// Frees what the threads that ended and were released held: their TCB,
-/// stack and handles; drains the exit channel.
+/// stack and handles; drains the exit channel. Whether an owner's recovery
+/// is still deferred.
 pub fn collect() -> bool {
+    collect_pass().deferred
+}
+
+fn collect_pass() -> Collected {
     #[cfg(feature = "thread-probe")]
     probe_router_ended();
     let mut deferred = false;
+    let mut pinned_any = false;
     let exits = EXITS.load(Ordering::Acquire);
     if exits != 0 {
         let channel = borrowed::<Channel>(exits);
@@ -433,7 +531,7 @@ pub fn collect() -> bool {
     for (index, place) in TABLE.iter().enumerate().skip(1) {
         if place.stack.load(Ordering::Acquire) == 1 {
             let _guard = TABLE_LOCK.lock();
-            native::collect_row(index, place);
+            pinned_any |= native::collect_row(index, place) == native::Row::Pinned;
             continue;
         }
         if place.state.flags() != LIVE | EXITED | RELEASED | DETACHED {
@@ -446,8 +544,17 @@ pub fn collect() -> bool {
         let native = place.native.load(Ordering::Relaxed);
         let ended = sys::thread_info(&borrowed::<Thread>(native))
             .is_ok_and(|info| info.state == ThreadState::Ended);
-        if !ended || !place.state.claim_collect() {
+        if !ended {
             continue;
+        }
+        // A sender that pinned the place keeps it until its release.
+        match place.state.claim_collect_unpinned(|| pinned(index)) {
+            Claim::Taken => {}
+            Claim::Unready => continue,
+            Claim::Pinned => {
+                pinned_any = true;
+                continue;
+            }
         }
         // SAFETY: the TCB is mapped until the unmap below.
         let block = unsafe { &*(place.block.load(Ordering::Relaxed) as *const Block) };
@@ -468,7 +575,10 @@ pub fn collect() -> bool {
         unmap(tcb, tcb_len);
         publish_free(place);
     }
-    deferred
+    Collected {
+        deferred,
+        pinned: pinned_any,
+    }
 }
 
 /// Whether some place holds a thread relibc released (joined, or detached):
@@ -513,28 +623,34 @@ fn exits() -> Result<u64, i32> {
 fn reserve() -> Result<usize, i32> {
     loop {
         let snapshot = FREE_EPOCH.load(Ordering::SeqCst);
-        let deferred = collect();
+        let Collected { deferred, pinned } = collect_pass();
         for (index, place) in TABLE.iter().enumerate().skip(1) {
             if place.state.reserve() {
                 return Ok(index);
             }
         }
-        if deferred || posix_sync::critical() || !future_exit() {
-            return Err(EAGAIN);
-        }
-        // Recheck admission and exact deferred debt before registering an Exit wait.
-        for (index, place) in TABLE.iter().enumerate().skip(1) {
-            if place.state.reserve() {
-                return Ok(index);
+        // A pinned place frees itself on a later pass: the sender's section
+        // ends soon, and its last release wakes this wait (a short deadline
+        // backs it). `pthread_create` on a full table can wait for the end
+        // of another thread's `pthread_kill` or `pthread_cancel` here.
+        if !(pinned && !posix_sync::critical()) {
+            if deferred || posix_sync::critical() || !future_exit() {
+                return Err(EAGAIN);
             }
-        }
-        if TABLE
-            .iter()
-            .any(|place| place.state.flags() & DETACHING != 0)
-            || posix_sync::critical()
-            || !future_exit()
-        {
-            return Err(EAGAIN);
+            // Recheck admission and exact deferred debt before registering an Exit wait.
+            for (index, place) in TABLE.iter().enumerate().skip(1) {
+                if place.state.reserve() {
+                    return Ok(index);
+                }
+            }
+            if TABLE
+                .iter()
+                .any(|place| place.state.flags() & DETACHING != 0)
+                || posix_sync::critical()
+                || !future_exit()
+            {
+                return Err(EAGAIN);
+            }
         }
         let deadline = rt::time::ticks_to_ns(rt::time::now())
             .checked_add(1_000_000)

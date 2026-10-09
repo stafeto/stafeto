@@ -52,6 +52,8 @@ mod heap_lock;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
+mod kill_collect;
+#[cfg(not(feature = "cancel-input"))]
 mod layer;
 #[cfg(not(feature = "cancel-input"))]
 mod long;
@@ -513,6 +515,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !signal_context::run()
         || !native_jump::run()
         || !entry_calls::run()
+        || !kill_collect::run()
         || !signal_wait::run()
         || !cancellation::run()
     {
