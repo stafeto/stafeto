@@ -610,7 +610,15 @@ static int names_truncate(void) {
 static int names_statvfs(void) {
     OK(mkdir(NAMES_ROOT "/v", 0777));
     struct statvfs before, after, file;
+    /* The service gives the nodes of earlier sections back in the background:
+     * the count of free nodes is read until it stands still. */
     OK(statvfs(NAMES_ROOT "/v", &before));
+    for (int steady = 0; steady < 5;) {
+        names_pause();
+        OK(statvfs(NAMES_ROOT "/v", &after));
+        steady = after.f_ffree == before.f_ffree ? steady + 1 : 0;
+        before = after;
+    }
     CHECK(before.f_namemax == 255 && before.f_bsize > 0 && before.f_files > 0);
     OK(mkdir(NAMES_ROOT "/v/d", 0755));
     OK(statvfs(NAMES_ROOT "/v", &after));
