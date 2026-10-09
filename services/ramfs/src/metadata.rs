@@ -11,7 +11,8 @@ use crate::{
     storage::{Pin, Root, Storage, Token},
 };
 use proto_fs::{
-    ACCESS_DENIED, INVALID_ARGUMENT, NO_SPACE, PERMISSION, RESOLVING, STALE_PROOF, Timestamp,
+    ACCESS_DENIED, INVALID_ARGUMENT, NO_SPACE, NOT_SUPPORTED, PERMISSION, RESOLVING, STALE_PROOF,
+    Timestamp,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +160,15 @@ impl MetadataJournal {
             }
         }
         let node = *ram.storage.node(self.target)?;
+        // A link has no mode of its own to change.
+        if matches!(self.intent, MetadataIntent::Chmod(_))
+            && self.path.is_some_and(|path| !path.follow)
+            && node.kind == crate::storage::SYMLINK
+        {
+            let outcome = MetadataOutcome::Failed(NOT_SUPPORTED);
+            self.outcome = Some(outcome);
+            return Ok(outcome);
+        }
         let owner = identity.uid == 0 || identity.uid == node.uid;
         let mut mode = node.mode;
         let mut uid = node.uid;

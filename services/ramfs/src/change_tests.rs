@@ -42,6 +42,7 @@ struct Env {
     generations: Box<JobGenerations>,
     seconds: Box<Seconds>,
     clock: Fixed,
+    counter: u64,
 }
 
 /// What a finished job answered.
@@ -118,7 +119,46 @@ impl Env {
             generations: Box::new([0; crate::storage::PREPARATIONS]),
             seconds: Box::new([const { None }; SECONDS]),
             clock: Fixed(Cell::new(Some(Timestamp::legacy_ns(7_000_000_000)))),
+            counter: 0,
         }
+    }
+    /// A fresh key for each call, so that no test has to count.
+    fn go(&mut self, fds: &mut Fds, mut start: ChangeStart<'_>, second: Option<&[u8]>) -> Done {
+        self.counter += 1;
+        start.key = key((self.counter % 32) as u32, self.counter);
+        self.run(
+            fds,
+            OWNER,
+            &start,
+            second.map(|bytes| (Base::Absolute, bytes)),
+        )
+        .expect("the protocol accepts the request")
+    }
+    fn go_result(&mut self, fds: &mut Fds, start: ChangeStart<'_>, second: Option<&[u8]>) -> u32 {
+        self.go(fds, start, second).result
+    }
+    fn now() -> Timestamp {
+        Timestamp::legacy_ns(7_000_000_000)
+    }
+    fn times(&mut self, token: Token) -> [Timestamp; 3] {
+        self.ram.storage.node(token).unwrap().times
+    }
+    fn lookup_link(&mut self, path: &[u8]) -> Result<Token, u32> {
+        let mut walk = Resolve::new(&mut self.ram.storage, path, ROOT, ROOT_USER, false)?;
+        for _ in 0..20_000 {
+            match walk.step(&mut self.ram.storage, ROOT_USER) {
+                Ok(Progress::Found(token)) => {
+                    walk.release(&mut self.ram.storage);
+                    return Ok(token);
+                }
+                Ok(_) => {}
+                Err(code) => {
+                    walk.release(&mut self.ram.storage);
+                    return Err(code);
+                }
+            }
+        }
+        panic!("lookup does not finish");
     }
     fn ctx(&mut self) -> Ctx<'_, 'static> {
         Ctx {
@@ -842,4 +882,742 @@ fn a_change_job_makes_no_record_of_the_table_bigger() {
         size_of::<Resolve>(),
     );
     assert!(size_of::<crate::job::ResolveJob>() <= size_of::<EarlierJob>());
+}
+
+fn op<'a>(op: ChangeOp, path: &'a [u8]) -> ChangeStart<'a> {
+    req(0, 1, op, path)
+}
+fn with_args<'a>(op_: ChangeOp, path: &'a [u8], flags: u32, args: [u64; 4]) -> ChangeStart<'a> {
+    ChangeStart {
+        flags,
+        args,
+        ..req(0, 1, op_, path)
+    }
+}
+const STAMP: Timestamp = Timestamp::legacy_ns(7_000_000_000);
+
+#[test]
+fn rename_moves_a_file_keeps_its_inode_and_stamps_what_the_standard_names() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir_a = env.node(ROOT, b"a", DIR, 0o755);
+    let dir_b = env.node(ROOT, b"b", DIR, 0o755);
+    let file = env.node(dir_a, b"f", REG, 0o644);
+    let epoch = env.ram.storage.state.epoch;
+    let done = env.go(&mut fds, op(ChangeOp::Rename, b"/a/f"), Some(b"/b/g"));
+    assert_eq!(done.result, 0);
+    assert_eq!(env.lookup(b"/b/g"), Ok(file));
+    assert_eq!(env.lookup(b"/a/f"), Err(NO_ENTRY));
+    assert_eq!(env.ram.storage.state.epoch, epoch + 1);
+    // st_ctime of the node, st_mtime and st_ctime of both parents.
+    assert_eq!(env.times(file)[2], STAMP);
+    for parent in [dir_a, dir_b] {
+        assert_eq!(env.times(parent)[1..], [STAMP; 2]);
+    }
+    // A name over an existing file replaces it.
+    let old = env.node(dir_b, b"h", REG, 0o644);
+    let second = env.node(dir_a, b"i", REG, 0o600);
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/a/i"), Some(b"/b/h")),
+        0
+    );
+    assert_eq!(env.lookup(b"/b/h"), Ok(second));
+    assert!(env.ram.storage.node(old).map_or(true, |n| n.links == 0));
+    // Two names of one inode: nothing happens.
+    env.go_result(&mut fds, op(ChangeOp::Link, b"/b/g"), Some(b"/b/g2"));
+    let epoch = env.ram.storage.state.epoch;
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/b/g"), Some(b"/b/g2")),
+        0
+    );
+    assert_eq!(env.ram.storage.state.epoch, epoch);
+    assert!(env.lookup(b"/b/g").is_ok() && env.lookup(b"/b/g2").is_ok());
+    env.assert_quiet();
+}
+
+#[test]
+fn rename_of_a_directory_follows_the_standard_for_kinds_slashes_and_descendants() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let top = env.node(ROOT, b"top", DIR, 0o755);
+    let sub = env.node(top, b"sub", DIR, 0o755);
+    let deep = env.node(sub, b"deep", DIR, 0o755);
+    env.node(ROOT, b"file", REG, 0o644);
+    let empty = env.node(ROOT, b"empty", DIR, 0o755);
+    let full = env.node(ROOT, b"full", DIR, 0o755);
+    env.node(full, b"x", REG, 0o644);
+    let epoch = env.ram.storage.state.epoch;
+    let rename = |env: &mut Env, fds: &mut Fds, from: &[u8], to: &[u8]| {
+        env.go_result(fds, op(ChangeOp::Rename, from), Some(to))
+    };
+    use proto_fs::{BUSY, IS_DIRECTORY, NOT_EMPTY};
+    assert_eq!(
+        rename(&mut env, &mut fds, b"/top", b"/top/sub/deep/x"),
+        proto_fs::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        rename(&mut env, &mut fds, b"/top", b"/top/sub"),
+        proto_fs::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        rename(&mut env, &mut fds, b"/top/sub", b"/empty/.."),
+        proto_fs::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        rename(&mut env, &mut fds, b"/top/.", b"/z"),
+        proto_fs::INVALID_ARGUMENT
+    );
+    assert_eq!(rename(&mut env, &mut fds, b"/", b"/z"), BUSY);
+    assert_eq!(rename(&mut env, &mut fds, b"/top", b"/full"), NOT_EMPTY);
+    assert_eq!(rename(&mut env, &mut fds, b"/top", b"/file"), NOT_DIRECTORY);
+    assert_eq!(rename(&mut env, &mut fds, b"/file", b"/top"), IS_DIRECTORY);
+    assert_eq!(rename(&mut env, &mut fds, b"/file/", b"/f2"), NOT_DIRECTORY);
+    assert_eq!(rename(&mut env, &mut fds, b"/file", b"/f2/"), NOT_DIRECTORY);
+    assert_eq!(rename(&mut env, &mut fds, b"/missing", b"/f2"), NO_ENTRY);
+    assert_eq!(
+        env.ram.storage.state.epoch, epoch,
+        "every refusal left no effect"
+    );
+    // A directory takes a new name with a slash, and replaces an empty one.
+    assert_eq!(rename(&mut env, &mut fds, b"/top/sub", b"/moved/"), 0);
+    assert_eq!(env.lookup(b"/moved/deep"), Ok(deep));
+    assert_eq!(env.ram.storage.node(sub).unwrap().parent, ROOT);
+    assert_eq!(rename(&mut env, &mut fds, b"/moved", b"/empty"), 0);
+    assert_eq!(env.lookup(b"/empty/deep"), Ok(deep));
+    assert!(env.ram.storage.node(empty).map_or(true, |n| n.links == 0));
+    // The link counts follow: top lost a child directory, root gained none overall.
+    assert_eq!(env.ram.storage.node(top).unwrap().links, 2);
+    env.assert_quiet();
+}
+
+#[test]
+fn rename_into_a_full_parent_is_emlink_and_a_directory_that_cannot_be_written_stays() {
+    let mut env = Env::new();
+    let mut root_session = session();
+    let target = env.node(ROOT, b"target", DIR, 0o777);
+    let src = env.node(ROOT, b"src", DIR, 0o755);
+    env.node(src, b"d", DIR, 0o755);
+    env.ram.storage.node_mut(target).unwrap().links = u32::MAX;
+    assert_eq!(
+        env.go_result(
+            &mut root_session,
+            op(ChangeOp::Rename, b"/src/d"),
+            Some(b"/target/d")
+        ),
+        proto_fs::TOO_MANY_LINKS
+    );
+    assert!(env.lookup(b"/src/d").is_ok());
+    env.ram.storage.node_mut(target).unwrap().links = 2;
+    // User 500 may write both parents but not the directory it moves.
+    env.ram.storage.set_attributes(src, 0o777, 0, 0).unwrap();
+    let mut user = credentials(500, 500, 500, 500);
+    assert_eq!(
+        env.go_result(
+            &mut user,
+            op(ChangeOp::Rename, b"/src/d"),
+            Some(b"/target/d")
+        ),
+        proto_fs::ACCESS_DENIED
+    );
+    assert!(env.lookup(b"/src/d").is_ok());
+    // In one parent the directory keeps its ".." and needs no write.
+    assert_eq!(
+        env.go_result(&mut user, op(ChangeOp::Rename, b"/src/d"), Some(b"/src/e")),
+        0
+    );
+    let moved = env.lookup(b"/src/e").unwrap();
+    env.ram.storage.set_attributes(moved, 0o777, 0, 0).unwrap();
+    assert_eq!(
+        env.go_result(
+            &mut user,
+            op(ChangeOp::Rename, b"/src/e"),
+            Some(b"/target/e")
+        ),
+        0
+    );
+    env.assert_quiet();
+}
+
+#[test]
+fn sticky_directories_keep_a_file_from_a_user_who_owns_neither() {
+    let mut env = Env::new();
+    let tmp = env.node(ROOT, b"sticky", DIR, 0o1777);
+    let theirs = env.node(tmp, b"theirs", REG, 0o666);
+    env.ram
+        .storage
+        .set_attributes(theirs, 0o666, 100, 100)
+        .unwrap();
+    let mut other = credentials(200, 200, 200, 200);
+    for start in [
+        op(ChangeOp::Unlink, b"/sticky/theirs"),
+        with_args(
+            ChangeOp::Unlink,
+            b"/sticky/theirs",
+            UNLINK_REMOVEDIR,
+            [0; 4],
+        ),
+    ] {
+        let result = env.go_result(&mut other, start, None);
+        assert!(result == PERMISSION || result == NOT_DIRECTORY, "{result}");
+    }
+    assert_eq!(
+        env.go_result(
+            &mut other,
+            op(ChangeOp::Rename, b"/sticky/theirs"),
+            Some(b"/sticky/mine")
+        ),
+        PERMISSION
+    );
+    assert!(env.lookup(b"/sticky/theirs").is_ok());
+    let mut owner = credentials(100, 100, 100, 100);
+    assert_eq!(
+        env.go_result(&mut owner, op(ChangeOp::Unlink, b"/sticky/theirs"), None),
+        0
+    );
+    env.assert_quiet();
+}
+
+#[test]
+fn rename_never_follows_its_last_component() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let target = env.node(ROOT, b"target", REG, 0o644);
+    let link = env.node(ROOT, b"link", crate::storage::SYMLINK, 0o777);
+    env.ram.storage.write(link, FIXTURE, 0, b"target").unwrap();
+    let other = env.node(ROOT, b"other", REG, 0o644);
+    // The link itself moves.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/link"), Some(b"/moved")),
+        0
+    );
+    assert_eq!(env.lookup_link(b"/moved"), Ok(link));
+    assert_eq!(env.lookup(b"/target"), Ok(target));
+    // A file replaces the link at the new name and leaves what it pointed to.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/other"), Some(b"/moved")),
+        0
+    );
+    assert_eq!(env.lookup_link(b"/moved"), Ok(other));
+    assert_eq!(env.ram.storage.node(target).unwrap().links, 1);
+    env.assert_quiet();
+}
+
+#[test]
+fn link_makes_a_second_name_of_the_inode_or_of_the_link_itself() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    let file = env.node(ROOT, b"file", REG, 0o644);
+    let link = env.node(ROOT, b"link", crate::storage::SYMLINK, 0o777);
+    env.ram.storage.write(link, FIXTURE, 0, b"file").unwrap();
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/file"), Some(b"/d/second")),
+        0
+    );
+    assert_eq!(env.lookup(b"/d/second"), Ok(file));
+    assert_eq!(env.ram.storage.node(file).unwrap().links, 2);
+    // st_ctime of the file, st_mtime and st_ctime of the new parent.
+    assert_eq!(env.times(file)[2], STAMP);
+    assert_eq!(env.times(dir)[1..], [STAMP; 2]);
+    // Without FOLLOW the new name is the link; with it, the file.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/link"), Some(b"/d/of-link")),
+        0
+    );
+    assert_eq!(env.lookup_link(b"/d/of-link"), Ok(link));
+    assert_eq!(env.ram.storage.node(link).unwrap().links, 2);
+    assert_eq!(
+        env.go_result(
+            &mut fds,
+            with_args(ChangeOp::Link, b"/link", proto_fs::LINK_FOLLOW, [0; 4]),
+            Some(b"/d/of-file")
+        ),
+        0
+    );
+    assert_eq!(env.lookup_link(b"/d/of-file"), Ok(file));
+    // Refusals.
+    use proto_fs::ALREADY_EXISTS;
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/file"), Some(b"/link")),
+        ALREADY_EXISTS
+    );
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/d"), Some(b"/d2")),
+        PERMISSION
+    );
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/none"), Some(b"/n")),
+        NO_ENTRY
+    );
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/file"), Some(b"/new/")),
+        NO_ENTRY
+    );
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/file/"), Some(b"/new")),
+        NOT_DIRECTORY
+    );
+    env.ram.storage.node_mut(file).unwrap().links = u32::MAX;
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/file"), Some(b"/d/third")),
+        proto_fs::TOO_MANY_LINKS
+    );
+    env.ram.storage.node_mut(file).unwrap().links = 2;
+    env.assert_quiet();
+}
+
+#[test]
+fn symlink_keeps_its_contents_raw_and_readlink_returns_them_cut_to_the_buffer() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    let symlink = |path| op(ChangeOp::Symlink, path);
+    let readlink = |path, size| with_args(ChangeOp::ReadLink, path, 0, [size, 0, 0, 0]);
+    assert_eq!(
+        env.go_result(&mut fds, symlink(b"/d/l"), Some(b"../where/to")),
+        0
+    );
+    let token = env.lookup_link(b"/d/l").unwrap();
+    assert_eq!(env.times(token), [STAMP; 3]);
+    assert_eq!(env.times(dir)[1..], [STAMP; 2]);
+    let done = env.go(&mut fds, readlink(b"/d/l", 511), None);
+    assert_eq!(
+        (done.result, done.bytes.as_slice()),
+        (0, b"../where/to".as_slice())
+    );
+    let done = env.go(&mut fds, readlink(b"/d/l", 5), None);
+    assert_eq!(done.bytes.as_slice(), b"../wh");
+    // An empty target is kept, and reads back as nothing.
+    assert_eq!(env.go_result(&mut fds, symlink(b"/d/empty"), Some(b"")), 0);
+    let done = env.go(&mut fds, readlink(b"/d/empty", 10), None);
+    assert_eq!((done.result, done.bytes.len()), (0, 0));
+    // The longest target.
+    let long = [b'x'; 511];
+    assert_eq!(env.go_result(&mut fds, symlink(b"/d/long"), Some(&long)), 0);
+    let done = env.go(&mut fds, readlink(b"/d/long", 511), None);
+    assert_eq!(done.bytes.as_slice(), &long[..]);
+    // Refusals: a file is no link, a name exists, a target holds no NUL.
+    assert_eq!(
+        env.go_result(&mut fds, readlink(b"/d", 10), None),
+        proto_fs::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        env.go_result(&mut fds, symlink(b"/d/l"), Some(b"x")),
+        proto_fs::ALREADY_EXISTS
+    );
+    assert_eq!(
+        env.go_result(&mut fds, readlink(b"/d/none", 10), None),
+        NO_ENTRY
+    );
+    assert_eq!(
+        env.start(
+            &mut fds,
+            OWNER,
+            &ChangeStart {
+                key: key(1, 900),
+                ..symlink(b"/d/nul")
+            }
+        ),
+        Ok(ChangePhase::AwaitingSecond)
+    );
+    assert_eq!(
+        env.second(&fds, OWNER, key(1, 900), Base::Absolute, b"a\0b"),
+        Err(INVALID_ARGUMENT)
+    );
+    env.release(&mut fds, OWNER, key(1, 900)).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn chmod_chown_and_times_follow_the_ownership_rules() {
+    let mut env = Env::new();
+    let file = env.node(ROOT, b"f", REG, 0o644);
+    env.ram
+        .storage
+        .set_attributes(file, 0o644, 100, 50)
+        .unwrap();
+    let chmod = |mode: u64, flags| with_args(ChangeOp::Chmod, b"/f", flags, [mode, 0, 0, 0]);
+    let chown = |uid: u64, gid: u64| with_args(ChangeOp::Chown, b"/f", 0, [uid, gid, 0, 0]);
+    let times = |a: [u64; 4]| with_args(ChangeOp::Times, b"/f", 0, a);
+    let mut owner = credentials(100, 100, 100, 100);
+    let mut other = credentials(200, 200, 200, 200);
+    // chmod: the owner may, another may not; a group that is not the owner's drops S_ISGID.
+    assert_eq!(env.go_result(&mut other, chmod(0o600, 0), None), PERMISSION);
+    assert_eq!(env.ram.storage.node(file).unwrap().mode & 0o7777, 0o644);
+    assert_eq!(env.go_result(&mut owner, chmod(0o2755, 0), None), 0);
+    assert_eq!(
+        env.ram.storage.node(file).unwrap().mode & 0o7777,
+        0o755,
+        "S_ISGID of a foreign group goes"
+    );
+    assert_eq!(env.times(file)[2], STAMP);
+    assert_eq!(env.go_result(&mut owner, chmod(0o4755, 0), None), 0);
+    assert_eq!(env.ram.storage.node(file).unwrap().mode & 0o7777, 0o4755);
+    // chown: an owner may only pick its own group, and set-id goes with a change.
+    assert_eq!(
+        env.go_result(&mut owner, chown(200, proto_fs::ID_UNCHANGED), None),
+        PERMISSION
+    );
+    assert_eq!(
+        env.go_result(&mut owner, chown(proto_fs::ID_UNCHANGED, 77), None),
+        PERMISSION
+    );
+    assert_eq!(
+        env.go_result(&mut owner, chown(proto_fs::ID_UNCHANGED, 100), None),
+        0
+    );
+    let node = *env.ram.storage.node(file).unwrap();
+    assert_eq!((node.uid, node.gid, node.mode & 0o7777), (100, 100, 0o755));
+    let mut root = session();
+    assert_eq!(env.go_result(&mut root, chown(300, 400), None), 0);
+    let node = *env.ram.storage.node(file).unwrap();
+    assert_eq!((node.uid, node.gid), (300, 400));
+    // times: explicit by the owner alone, "now" by write permission, two omissions by anyone.
+    let mut owner = credentials(300, 300, 400, 400);
+    let explicit = times([5, 6, 7, 8]);
+    assert_eq!(env.go_result(&mut other, explicit, None), PERMISSION);
+    assert_eq!(env.go_result(&mut owner, explicit, None), 0);
+    let t = env.times(file);
+    assert_eq!(
+        (t[0], t[1]),
+        (Timestamp::new(5, 6).unwrap(), Timestamp::new(7, 8).unwrap())
+    );
+    assert_eq!(t[2], STAMP);
+    let now = times([0, proto_fs::TIME_NOW, 0, proto_fs::TIME_NOW]);
+    env.ram
+        .storage
+        .set_attributes(file, 0o644, 300, 400)
+        .unwrap();
+    assert_eq!(
+        env.go_result(&mut other, now, None),
+        proto_fs::ACCESS_DENIED
+    );
+    env.ram
+        .storage
+        .set_attributes(file, 0o666, 300, 400)
+        .unwrap();
+    assert_eq!(env.go_result(&mut other, now, None), 0);
+    assert_eq!(env.times(file)[..2], [STAMP; 2]);
+    // Two omissions need no right and leave st_ctime alone.
+    env.ram
+        .storage
+        .set_attributes(file, 0o600, 300, 400)
+        .unwrap();
+    let before = env.times(file);
+    let epoch = env.ram.storage.state.epoch;
+    let omit = times([0, proto_fs::TIME_OMIT, 0, proto_fs::TIME_OMIT]);
+    assert_eq!(env.go_result(&mut other, omit, None), 0);
+    assert_eq!(env.times(file), before);
+    assert_eq!(env.ram.storage.state.epoch, epoch);
+    env.assert_quiet();
+}
+
+#[test]
+fn a_link_has_no_mode_and_utimensat_with_nofollow_stamps_the_link() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let file = env.node(ROOT, b"f", REG, 0o644);
+    let link = env.node(ROOT, b"l", crate::storage::SYMLINK, 0o777);
+    env.ram.storage.write(link, FIXTURE, 0, b"f").unwrap();
+    let chmod = |flags| with_args(ChangeOp::Chmod, b"/l", flags, [0o600, 0, 0, 0]);
+    assert_eq!(
+        env.go_result(&mut fds, chmod(proto_fs::NOFOLLOW), None),
+        proto_fs::NOT_SUPPORTED
+    );
+    assert_eq!(env.ram.storage.node(link).unwrap().mode & 0o7777, 0o777);
+    assert_eq!(
+        env.go_result(&mut fds, chmod(0), None),
+        0,
+        "followed, the file changes"
+    );
+    assert_eq!(env.ram.storage.node(file).unwrap().mode & 0o7777, 0o600);
+    let stamp = with_args(ChangeOp::Times, b"/l", proto_fs::NOFOLLOW, [1, 2, 3, 4]);
+    assert_eq!(env.go_result(&mut fds, stamp, None), 0);
+    assert_eq!(env.times(link)[0], Timestamp::new(1, 2).unwrap());
+    assert_ne!(env.times(file)[0], Timestamp::new(1, 2).unwrap());
+    env.assert_quiet();
+}
+
+#[test]
+fn metadata_by_descriptor_uses_an_empty_path_and_the_description_generation() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let file = env.node(ROOT, b"f", REG, 0o644);
+    let fd = env
+        .ram
+        .open_token(&mut fds, file, proto_fs::READ_ONLY, ROOT_USER)
+        .unwrap();
+    let generation = env.ram.description_token(&fds, fd).unwrap().generation;
+    let fchmod = |generation| ChangeStart {
+        base: Base::Fd { fd, generation },
+        ..with_args(ChangeOp::Chmod, b"", 0, [0o640, 0, 0, 0])
+    };
+    assert_eq!(env.go_result(&mut fds, fchmod(generation), None), 0);
+    assert_eq!(env.ram.storage.node(file).unwrap().mode & 0o7777, 0o640);
+    assert_eq!(
+        env.go_result(&mut fds, fchmod(generation + 1), None),
+        BAD_FD
+    );
+    assert_eq!(env.ram.storage.node(file).unwrap().mode & 0o7777, 0o640);
+    env.ram.close(&mut fds, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn second_is_repeated_safely_in_every_phase_and_refused_where_it_does_not_belong() {
+    let mut env = Env::new();
+    let mut fds = session();
+    env.node(ROOT, b"f", REG, 0o644);
+    let start = ChangeStart {
+        key: key(2, 5),
+        ..op(ChangeOp::Rename, b"/f")
+    };
+    assert_eq!(
+        env.start(&mut fds, OWNER, &start),
+        Ok(ChangePhase::AwaitingSecond)
+    );
+    // Step before Second advances nothing.
+    assert_eq!(
+        env.step(&fds, OWNER, start.key).map(|_| ()),
+        Err(INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        env.second(&fds, OWNER, start.key, Base::Absolute, b""),
+        Err(INVALID_ARGUMENT),
+        "an empty second path"
+    );
+    assert_eq!(
+        env.second(&fds, OWNER, start.key, Base::Absolute, b"/g"),
+        Ok(())
+    );
+    assert_eq!(
+        env.second(&fds, OWNER, start.key, Base::Absolute, b"/g"),
+        Ok(())
+    );
+    assert_eq!(
+        env.second(&fds, OWNER, start.key, Base::Absolute, b"/h"),
+        Err(PERMISSION)
+    );
+    assert_eq!(
+        env.second(&fds, OWNER, start.key, Base::Cwd, b"/g"),
+        Err(PERMISSION)
+    );
+    // After the first Step the resolution has begun; a repeat is still 0.
+    env.step(&fds, OWNER, start.key).unwrap();
+    assert_eq!(
+        env.second(&fds, OWNER, start.key, Base::Absolute, b"/g"),
+        Ok(())
+    );
+    let mut done = false;
+    for _ in 0..1000 {
+        if env.step(&fds, OWNER, start.key).unwrap().0 {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    // After Done as well, and a different one is refused without a change.
+    assert_eq!(
+        env.second(&fds, OWNER, start.key, Base::Absolute, b"/g"),
+        Ok(())
+    );
+    assert_eq!(
+        env.second(&fds, OWNER, start.key, Base::Absolute, b"/x"),
+        Err(PERMISSION)
+    );
+    assert!(env.lookup(b"/g").is_ok() && env.lookup(b"/f").is_err());
+    env.release(&mut fds, OWNER, start.key).unwrap();
+    // Second for a one-path operation, and for an unknown key.
+    let single = ChangeStart {
+        key: key(2, 6),
+        ..op(ChangeOp::Unlink, b"/g")
+    };
+    env.start(&mut fds, OWNER, &single).unwrap();
+    assert_eq!(
+        env.second(&fds, OWNER, single.key, Base::Absolute, b"/y"),
+        Err(INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        env.second(&fds, OWNER, key(3, 1), Base::Absolute, b"/y"),
+        Err(NO_ENTRY)
+    );
+    env.release(&mut fds, OWNER, single.key).unwrap();
+    // A second path from a bad base ends the job with that result.
+    let both = ChangeStart {
+        key: key(2, 7),
+        ..op(ChangeOp::Link, b"/g")
+    };
+    env.start(&mut fds, OWNER, &both).unwrap();
+    assert_eq!(env.second(&fds, OWNER, both.key, Base::Cwd, b"rel"), Ok(()));
+    assert_eq!(env.second(&fds, OWNER, both.key, Base::Cwd, b"rel"), Ok(()));
+    let (finished, result, _, _) = env.step(&fds, OWNER, both.key).unwrap();
+    assert!(finished && result == BAD_FD);
+    env.release(&mut fds, OWNER, both.key).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn a_change_of_the_tree_between_steps_restarts_the_job_and_the_client_sees_only_the_count() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    let file = env.node(dir, b"f", REG, 0o644);
+    let start = ChangeStart {
+        key: key(4, 1),
+        ..op(ChangeOp::Rename, b"/d/f")
+    };
+    env.start(&mut fds, OWNER, &start).unwrap();
+    env.second(&fds, OWNER, start.key, Base::Absolute, b"/d/g")
+        .unwrap();
+    // Step until the journal is ready to publish.
+    let phase = |env: &Env| match &env.jobs.iter().flatten().next().unwrap().operation {
+        JobOperation::Change(change) => change.phase(),
+        _ => unreachable!(),
+    };
+    let mut steps = 0;
+    while phase(&env) != ChangePhase::Ready {
+        steps += 1;
+        assert!(steps < 200);
+        let (done, ..) = env.step(&fds, OWNER, start.key).unwrap();
+        assert!(!done);
+    }
+    // Another client changes the tree: a new name in the root.
+    env.node(ROOT, b"unrelated", REG, 0o644);
+    let mut restarts = 0;
+    for _ in 0..1000 {
+        match env.step(&fds, OWNER, start.key) {
+            Ok((true, result, count, _)) => {
+                assert_eq!(result, 0);
+                restarts = count;
+                break;
+            }
+            Ok((false, result, count, bytes)) => {
+                assert_eq!((result, bytes.len()), (0, 0));
+                restarts = count;
+            }
+            Err(code) => panic!("status {code}: the client must never see STALE_PROOF"),
+        }
+    }
+    assert_eq!(restarts, 1);
+    assert_eq!(env.lookup(b"/d/g"), Ok(file));
+    env.release(&mut fds, OWNER, start.key).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn release_gives_back_a_prepared_rename_over_a_directory_in_one_call() {
+    let mut env = Env::new();
+    let mut fds = session();
+    // Two directories of the boot tree: every name and inode of both is staged.
+    let tmp = env.node(ROOT, b"dst", DIR, 0o755);
+    let etc = env.lookup(b"/etc").unwrap();
+    let start = ChangeStart {
+        key: key(6, 1),
+        ..op(ChangeOp::Rename, b"/etc")
+    };
+    env.start(&mut fds, OWNER, &start).unwrap();
+    env.second(&fds, OWNER, start.key, Base::Absolute, b"/dst")
+        .unwrap();
+    let phase = |env: &Env| match &env.jobs.iter().flatten().next().unwrap().operation {
+        JobOperation::Change(change) => change.phase(),
+        _ => unreachable!(),
+    };
+    let mut steps = 0;
+    while phase(&env) != ChangePhase::Ready {
+        steps += 1;
+        assert!(steps < 200);
+        let (done, result, ..) = env.step(&fds, OWNER, start.key).unwrap();
+        assert!(!done, "the rename ends with {result}");
+    }
+    let before = env.ram.storage.usage(BOOT_ROOT);
+    assert!(before.dentries >= 2 && before.inodes >= 1, "{before:?}");
+    let epoch = env.ram.storage.state.epoch;
+    env.release(&mut fds, OWNER, start.key).unwrap();
+    assert_eq!(env.ram.storage.usage(BOOT_ROOT), Default::default());
+    assert_eq!(env.ram.storage.state.epoch, epoch);
+    env.assert_quiet();
+    assert_eq!(env.lookup(b"/etc"), Ok(etc));
+    assert_eq!(env.lookup(b"/dst"), Ok(tmp));
+}
+
+#[test]
+fn an_unknown_second_path_component_ends_the_job_with_the_result_of_the_walk() {
+    let mut env = Env::new();
+    let mut fds = session();
+    env.node(ROOT, b"f", REG, 0o644);
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/f"), Some(b"/nodir/g")),
+        NO_ENTRY
+    );
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/f"), Some(b"/f/g")),
+        NOT_DIRECTORY
+    );
+    assert!(env.lookup(b"/f").is_ok());
+    env.assert_quiet();
+}
+
+#[test]
+fn unlink_rmdir_and_mkdir_stamp_the_nodes_the_standard_names_and_a_refusal_stamps_nothing() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    let file = env.node(dir, b"f", REG, 0o644);
+    env.go_result(&mut fds, op(ChangeOp::Link, b"/d/f"), Some(b"/d/g"));
+    let before = [env.times(dir), env.times(file)];
+    // A refusal changes no time.
+    let refused = op(ChangeOp::Unlink, b"/d/none");
+    assert_eq!(env.go_result(&mut fds, refused, None), NO_ENTRY);
+    assert_eq!([env.times(dir), env.times(file)], before);
+    // Unlink: st_mtime and st_ctime of the parent, st_ctime of a file that stays.
+    env.ram.storage.node_mut(dir).unwrap().times = [Timestamp::ZERO; 3];
+    env.ram.storage.node_mut(file).unwrap().times = [Timestamp::ZERO; 3];
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/d/g"), None),
+        0
+    );
+    assert_eq!(env.times(dir), [Timestamp::ZERO, STAMP, STAMP]);
+    assert_eq!(env.times(file), [Timestamp::ZERO, Timestamp::ZERO, STAMP]);
+    // mkdir: the three times of the new node, mtime and ctime of the parent.
+    env.ram.storage.node_mut(dir).unwrap().times = [Timestamp::ZERO; 3];
+    assert_eq!(
+        env.go_result(&mut fds, mkdir(0, 1, b"/d/sub", 0o755, 0), None),
+        0
+    );
+    let sub = env.lookup(b"/d/sub").unwrap();
+    assert_eq!(env.times(sub), [STAMP; 3]);
+    assert_eq!(env.times(dir), [Timestamp::ZERO, STAMP, STAMP]);
+    // rmdir: the parent.
+    env.ram.storage.node_mut(dir).unwrap().times = [Timestamp::ZERO; 3];
+    let rmdir = with_args(ChangeOp::Unlink, b"/d/sub", UNLINK_REMOVEDIR, [0; 4]);
+    assert_eq!(env.go_result(&mut fds, rmdir, None), 0);
+    assert_eq!(env.times(dir), [Timestamp::ZERO, STAMP, STAMP]);
+    env.assert_quiet();
+}
+
+#[test]
+fn an_unstable_clock_defers_the_effect_and_the_step_goes_on_without_one() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let start = mkdir(0, 1, b"/late", 0o755, 0);
+    env.start(&mut fds, OWNER, &start).unwrap();
+    env.clock.0.set(None);
+    let epoch = env.ram.storage.state.epoch;
+    // The walk takes its steps (8 names each); then the job waits for a time.
+    for _ in 0..300 {
+        let (done, ..) = env.step(&fds, OWNER, start.key).unwrap();
+        assert!(!done, "no effect without a time");
+    }
+    assert_eq!(env.ram.storage.state.epoch, epoch);
+    let phase = match &env.jobs.iter().flatten().next().unwrap().operation {
+        JobOperation::Change(change) => change.phase(),
+        _ => unreachable!(),
+    };
+    assert_eq!(phase, ChangePhase::Ready);
+    env.clock.0.set(Some(Env::now()));
+    let (done, result, ..) = env.step(&fds, OWNER, start.key).unwrap();
+    assert!(done && result == 0);
+    assert!(env.lookup(b"/late").is_ok());
+    env.release(&mut fds, OWNER, start.key).unwrap();
+    env.assert_quiet();
 }

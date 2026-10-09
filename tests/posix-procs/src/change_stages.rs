@@ -353,6 +353,208 @@ fn run_stages(files: &Files) -> Result<(), i32> {
     Ok(())
 }
 
+fn info(files: &Files, path: &[u8]) -> Result<proto_fs::NodeInfo, i32> {
+    files.node_information_bytes(path).map_err(|_| 200)
+}
+
+fn names(files: &Files) -> Result<(), i32> {
+    let dir_flags = proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY;
+    let mut generation = 100;
+    let mut next = || {
+        generation += 1;
+        generation
+    };
+    let _ = dir_flags;
+    expect(
+        run(files, &mkdir(3, next(), b"/tmp/cs2", 0o777), None),
+        0,
+        101,
+    )?;
+    // A file to work on.
+    let held = open(
+        files,
+        next(),
+        b"/tmp/cs2/a",
+        proto_fs::CREATE | proto_fs::READ_WRITE,
+    )
+    .map_err(|_| 102)?;
+    let inode = info(files, b"/tmp/cs2/a")?.inode;
+    files.close_exact(held).map_err(|_| 103)?;
+    // rename: Second, a repeat of Second, then the Steps; the inode is kept.
+    let rename = req(3, next(), ChangeOp::Rename, b"/tmp/cs2/a");
+    start(files, &rename).map_err(|_| 104)?;
+    if step(files, rename.key, false).err() != Some(Status::Unknown(proto_fs::INVALID_ARGUMENT)) {
+        return Err(105);
+    }
+    second(files, rename.key, Base::Absolute, b"/tmp/cs2/b").map_err(|_| 106)?;
+    second(files, rename.key, Base::Absolute, b"/tmp/cs2/b").map_err(|_| 107)?;
+    if second(files, rename.key, Base::Absolute, b"/tmp/cs2/c").err()
+        != Some(Status::Unknown(proto_fs::PERMISSION))
+    {
+        return Err(108);
+    }
+    let mut done = None;
+    for _ in 0..10_000 {
+        if let Some(finished) = step(files, rename.key, false).map_err(|_| 109)? {
+            done = Some(finished);
+            break;
+        }
+    }
+    if done.map(|d| d.result) != Some(0) {
+        return Err(110);
+    }
+    second(files, rename.key, Base::Absolute, b"/tmp/cs2/b").map_err(|_| 111)?;
+    release(files, rename.key).map_err(|_| 112)?;
+    if info(files, b"/tmp/cs2/b")?.inode != inode
+        || files.node_information_bytes(b"/tmp/cs2/a").err()
+            != Some(Status::Unknown(proto_fs::NO_ENTRY))
+    {
+        return Err(113);
+    }
+    rt::println!("posix-files: change rename kept the inode and repeated Second safely");
+    // A directory cannot go into itself; a missing name is NO_ENTRY.
+    expect(
+        run(
+            files,
+            &req(3, next(), ChangeOp::Rename, b"/tmp/cs2"),
+            Some((Base::Absolute, b"/tmp/cs2/inside")),
+        ),
+        proto_fs::INVALID_ARGUMENT,
+        114,
+    )?;
+    expect(
+        run(
+            files,
+            &req(3, next(), ChangeOp::Rename, b"/tmp/cs2/none"),
+            Some((Base::Absolute, b"/tmp/cs2/x")),
+        ),
+        proto_fs::NO_ENTRY,
+        115,
+    )?;
+    // link: a second name, one more link.
+    expect(
+        run(
+            files,
+            &req(3, next(), ChangeOp::Link, b"/tmp/cs2/b"),
+            Some((Base::Absolute, b"/tmp/cs2/c")),
+        ),
+        0,
+        116,
+    )?;
+    let c = info(files, b"/tmp/cs2/c")?;
+    if c.inode != inode || c.links != 2 {
+        return Err(117);
+    }
+    expect(
+        run(
+            files,
+            &req(3, next(), ChangeOp::Link, b"/tmp/cs2/b"),
+            Some((Base::Absolute, b"/tmp/cs2/c")),
+        ),
+        proto_fs::ALREADY_EXISTS,
+        118,
+    )?;
+    rt::println!("posix-files: change link made a second name and refused an existing one");
+    // symlink and readlink.
+    expect(
+        run(
+            files,
+            &req(3, next(), ChangeOp::Symlink, b"/tmp/cs2/s"),
+            Some((Base::Absolute, b"b")),
+        ),
+        0,
+        119,
+    )?;
+    if info(files, b"/tmp/cs2/s")?.inode != inode {
+        return Err(120);
+    }
+    let mut read = req(3, next(), ChangeOp::ReadLink, b"/tmp/cs2/s");
+    read.args[0] = 511;
+    let done = run(files, &read, None).map_err(|_| 121)?;
+    if done.result != 0 || done.length != 1 || done.bytes[0] != b'b' {
+        return Err(122);
+    }
+    read.key = key(3, next());
+    read.path = b"/tmp/cs2/b";
+    let done = run(files, &read, None).map_err(|_| 123)?;
+    if done.result != proto_fs::INVALID_ARGUMENT {
+        return Err(124);
+    }
+    expect(
+        run(
+            files,
+            &req(3, next(), ChangeOp::Symlink, b"/tmp/cs2/e"),
+            Some((Base::Absolute, b"")),
+        ),
+        0,
+        125,
+    )?;
+    read.key = key(3, next());
+    read.path = b"/tmp/cs2/e";
+    let done = run(files, &read, None).map_err(|_| 126)?;
+    if done.result != 0 || done.length != 0 {
+        return Err(127);
+    }
+    rt::println!("posix-files: change symlink and readlink kept the bytes and the empty target");
+    // chmod, chown and times by path, then by descriptor.
+    let mut chmod = req(3, next(), ChangeOp::Chmod, b"/tmp/cs2/b");
+    chmod.args[0] = 0o640;
+    expect(run(files, &chmod, None), 0, 128)?;
+    if info(files, b"/tmp/cs2/b")?.permissions != 0o640 {
+        return Err(129);
+    }
+    let mut chown = req(3, next(), ChangeOp::Chown, b"/tmp/cs2/b");
+    chown.args = [1000, proto_fs::ID_UNCHANGED, 0, 0];
+    expect(run(files, &chown, None), 0, 130)?;
+    let b = info(files, b"/tmp/cs2/b")?;
+    if b.uid != 1000 || b.gid != 0 {
+        return Err(131);
+    }
+    let mut times = req(3, next(), ChangeOp::Times, b"/tmp/cs2/b");
+    times.args = [11, 12, 13, 14];
+    expect(run(files, &times, None), 0, 132)?;
+    let b = info(files, b"/tmp/cs2/b")?;
+    if (b.access_time.seconds, b.access_time.nanos) != (11, 12)
+        || (b.modify_time.seconds, b.modify_time.nanos) != (13, 14)
+    {
+        return Err(133);
+    }
+    let held = open(files, next(), b"/tmp/cs2/b", proto_fs::READ_ONLY).map_err(|_| 134)?;
+    let mut fchmod = req(3, next(), ChangeOp::Chmod, b"");
+    fchmod.args[0] = 0o600;
+    fchmod.base = Base::Fd {
+        fd: held.fd,
+        generation: held.generation,
+    };
+    expect(run(files, &fchmod, None), 0, 135)?;
+    if info(files, b"/tmp/cs2/b")?.permissions != 0o600 {
+        return Err(136);
+    }
+    fchmod.key = key(3, next());
+    fchmod.base = Base::Fd {
+        fd: held.fd,
+        generation: held.generation + 1,
+    };
+    expect(run(files, &fchmod, None), proto_fs::BAD_FD, 137)?;
+    files.close_exact(held).map_err(|_| 138)?;
+    rt::println!("posix-files: change chmod, chown and times by path and by descriptor");
+    // Clean up the names.
+    for name in [
+        &b"/tmp/cs2/b"[..],
+        b"/tmp/cs2/c",
+        b"/tmp/cs2/s",
+        b"/tmp/cs2/e",
+    ] {
+        expect(
+            run(files, &req(3, next(), ChangeOp::Unlink, name), None),
+            0,
+            139,
+        )?;
+    }
+    expect(run(files, &rmdir(3, next(), b"/tmp/cs2"), None), 0, 140)?;
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn files_change_stages() -> i32 {
     let Ok(raw) = posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
@@ -363,5 +565,8 @@ pub extern "C" fn files_change_stages() -> i32 {
     let Ok(files) = super::open_stages::clone_bound(&original, &[]) else {
         return 91;
     };
-    run_stages(&files).err().unwrap_or(0)
+    run_stages(&files)
+        .and_then(|()| names(&files))
+        .err()
+        .unwrap_or(0)
 }

@@ -387,7 +387,7 @@ fn constructor_refusals_preserve_charge_usage_pins_epoch_and_exact_root() {
             Some(b"/missing/"),
             ROOT_USER
         ),
-        Err(NO_ENTRY)
+        Err(proto_fs::NOT_DIRECTORY)
     ));
     assert_eq!(ram.storage.usage(FIRST), usage);
     assert_eq!(pins(&ram), before_pins);

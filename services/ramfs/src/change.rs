@@ -828,9 +828,6 @@ fn same_image(job: &ResolveJob, fds: &Fds) -> bool {
     job.authority.map(|stamp: Stamp| stamp.image) == fds.binding.stamp().map(|stamp| stamp.image)
 }
 
-/// The operations the service takes so far.
-const SUPPORTED: &[ChangeOp] = &[ChangeOp::Unlink, ChangeOp::Mkdir, ChangeOp::Access];
-
 /// Method 44. The job is paid and keyed before it has any effect; the same
 /// key with the same arguments returns the same job.
 pub fn start(
@@ -840,9 +837,6 @@ pub fn start(
     req: &ChangeStart<'_>,
     out: &mut Writer,
 ) -> Result<(), u32> {
-    if !SUPPORTED.contains(&req.op) {
-        return Err(INVALID_ARGUMENT);
-    }
     let key = req.key;
     if let Some(i) = find(ctx.jobs, owner, key) {
         let job = ctx.jobs[i].as_ref().expect("found");

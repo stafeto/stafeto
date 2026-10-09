@@ -336,8 +336,16 @@ impl Resolve {
         for _ in 0..8 {
             if self.search == storage.entries() {
                 if self.final_component() && self.intent.permits_missing() {
+                    // A new name may end in a slash when a directory can take it:
+                    // the journal of the operation decides whether one can.
                     if self.path[self.length - 1] == b'/'
-                        && !matches!(self.intent, Intent::DirectoryCreate)
+                        && !matches!(
+                            self.intent,
+                            Intent::DirectoryCreate
+                                | Intent::Namespace {
+                                    path: NamespacePath::Destination
+                                }
+                        )
                     {
                         return Err(NO_ENTRY);
                     }
