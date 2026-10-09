@@ -251,6 +251,43 @@ static void *vz_rename_thread(void *argument) {
     return NULL;
 }
 
+static volatile int vz_hold;
+
+static void *vz_idle(void *unused) {
+    while (!vz_hold) {
+        struct timespec delay = {0, 1000000};
+        nanosleep(&delay, NULL);
+    }
+    return unused;
+}
+
+/* What one thread costs the quota of its process: the bytes charged before
+ * and after the creation of a thread with a stack of 20480 bytes (the block
+ * of the thread, its TLS and the stack), alone in the process. */
+static int vz_thread_cost(void) {
+    enum { COUNT = 3 };
+    pthread_t threads[COUNT];
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 20480);
+    vz_hold = 0;
+    unsigned long long first = 0, last = 0, total = 0;
+    for (int i = 0; i < COUNT; i++) {
+        unsigned long long before = stafeto_probe_memory_used();
+        VZ_CHECK(pthread_create(&threads[i], &attr, vz_idle, NULL) == 0);
+        unsigned long long cost = stafeto_probe_memory_used() - before;
+        if (i == 0) first = cost;
+        last = cost;
+        total += cost;
+    }
+    vz_hold = 1;
+    for (int i = 0; i < COUNT; i++) VZ_CHECK(pthread_join(threads[i], NULL) == 0);
+    printf("posix-procs: names thread cost: %llu bytes (%llu pages) for the first thread, %llu bytes the last, "
+           "%llu bytes for %d, stack 20480 bytes\n",
+           first, first / 4096, last, total, (int)COUNT);
+    return 0;
+}
+
 /* The role of a process of the volley: seven threads. The process writes to
  * /tmp/probe, at VZ_REPEATS + VZ_RECORD * process, the most repeats of
  * JOBS_FULL one of them made (4 bytes), the most restarts of the resolution
@@ -272,6 +309,19 @@ static int vz_child(void) {
         if (e != 0) {
             printf("posix-procs: volley: thread %d of process %d gave %d\n", i, process, e);
             return 101;
+        }
+    }
+    /* The eighth thread does not fit the quota of the process: the lack of a
+     * resource for a thread is EAGAIN (XSH pthread_create), the code a pool
+     * of threads retries on. */
+    {
+        pthread_t eighth;
+        vz_hold = 1;
+        int e = pthread_create(&eighth, &attr, vz_idle, NULL);
+        if (e != EAGAIN) {
+            printf("posix-procs: volley: the eighth thread of process %d gave %d, wanted EAGAIN\n", process, e);
+            if (e == 0) pthread_join(eighth, NULL);
+            return 105;
         }
     }
     unsigned long long longest = 0;
@@ -358,7 +408,8 @@ static int names_volley(void) {
     int failed;
     VZ_CHECK(mkdir(VZ, 0777) == 0);
     files_volley_start();
-    failed = vz_quiet();
+    failed = vz_thread_cost();
+    if (!failed) failed = vz_quiet();
     if (!failed) failed = vz_starvation();
     if (!failed) failed = vz_volley();
     files_volley_stop();

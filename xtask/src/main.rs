@@ -3647,6 +3647,7 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
         "names time a path of 32 links:",
         "names time rename of a directory under a chain 64 deep:",
         "names time rmdir with a full table:",
+        "names thread cost:",
     ] {
         find(row)?;
     }
@@ -6812,6 +6813,7 @@ mod tests {
             "posix-procs: names time a path of 32 links: 672 requests, 5704952 ticks",
             "posix-procs: names time rename of a directory under a chain 64 deep: 1559 requests, 15679606 ticks",
             "posix-procs: names time rmdir with a full table: 96 requests, 855238 ticks",
+            "posix-procs: names thread cost: 28672 bytes (7 pages) for the first thread, 28672 bytes the last, 86016 bytes for 3, stack 20480 bytes",
             "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 2569 restarts, finished within 10 s: no, took 626453622 ticks",
             repeats,
             "posix-procs: names volley ok",
