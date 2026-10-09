@@ -65,7 +65,6 @@ const AT_SYMLINK_FOLLOW: c_int = 0x400;
 const AT_EMPTY_PATH: c_int = 0x1000;
 const UTIME_NOW: i64 = (1 << 30) - 1;
 const UTIME_OMIT: i64 = (1 << 30) - 2;
-const EIO: c_int = 5;
 const EISDIR: c_int = 21;
 const EROFS: c_int = 30;
 const EOPNOTSUPP: c_int = 95;
@@ -174,25 +173,25 @@ fn lstat(path: &[u8]) -> Result<NodeInfo, Status> {
     transport.files().node_information_from(None, path, false)
 }
 
-fn absent(path: &[u8]) -> bool {
+pub(crate) fn absent(path: &[u8]) -> bool {
     lstat(path) == Err(Status::Unknown(proto_fs::NO_ENTRY))
 }
 
-fn is(path: &[u8], kind: u32) -> bool {
+pub(crate) fn is(path: &[u8], kind: u32) -> bool {
     lstat(path).is_ok_and(|info| info.kind == kind)
 }
 
 const DIR: u32 = 1;
-const REG: u32 = 2;
+pub(crate) const REG: u32 = 2;
 
 /// A result of 0 or the negated errno, or the line of the failure.
 fn expect(result: c_int, errno: c_int, line: i32) -> Result<(), i32> {
     if result == -errno { Ok(()) } else { Err(line) }
 }
-fn ok(result: c_int, line: i32) -> Result<(), i32> {
+pub(crate) fn ok(result: c_int, line: i32) -> Result<(), i32> {
     expect(result, 0, line)
 }
-fn check(condition: bool, line: i32) -> Result<(), i32> {
+pub(crate) fn check(condition: bool, line: i32) -> Result<(), i32> {
     if condition { Ok(()) } else { Err(line) }
 }
 
@@ -604,6 +603,7 @@ pub extern "C" fn files_names_stages() -> i32 {
         .and_then(|()| metadata())
         .and_then(|()| physical_chdir())
         .and_then(|()| against_descriptors())
+        .and_then(|()| own_places())
         .err()
         .unwrap_or(0)
 }
@@ -826,8 +826,8 @@ fn against_descriptors() -> Result<(), i32> {
 }
 
 /// The names of the big directory: the number, in the four digits after `f`.
-const BIG: u32 = 360;
-fn big_name(index: u32) -> [u8; 14] {
+pub(crate) const BIG: u32 = 360;
+pub(crate) fn big_name(index: u32) -> [u8; 14] {
     let mut path = *b"/tmp/big/f0000";
     let mut rest = index;
     for digit in (10..14).rev() {
@@ -860,7 +860,8 @@ pub extern "C" fn files_names_big() -> i32 {
 
 /// Moves the last name of the big directory to a new name, or back. The
 /// negated errno of the answer, 0 for success.
-fn slow_rename() -> i32 {
+#[cfg(feature = "names-probe")]
+pub(crate) fn slow_rename() -> i32 {
     let last = big_name(BIG - 1);
     if is(b"/tmp/big/n", REG) {
         -rename(b"/tmp/big/n", &last)
@@ -888,80 +889,128 @@ pub extern "C" fn files_names_big_gone() -> i32 {
 }
 
 unsafe extern "C" {
-    fn fork() -> c_int;
-    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
-    fn _exit(code: c_int) -> !;
+    fn nanosleep(request: *const [i64; 2], remaining: *mut [i64; 2]) -> c_int;
 }
 
-static STEPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static FORKED: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-2);
-static MODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The sixteen places of the jobs of a session, taken by hand: records the
+/// way a thread leaves them when it is inside sixteen operations (frames that
+/// contain this one) or has left them by a long jump (frames that do not).
+mod places {
+    use super::*;
+    use entries::Frame;
+    use posix_fs::change::{ControlClaimToken, ControlResult, ControlToken, OwnerToken};
 
-/// The fork in the middle of an operation. Mode 0: at the fifth Step of the
-/// rename the process forks. Mode 1: the reply of the Start is lost, and the
-/// process forks before the Start goes again. The child finds the record of
-/// the operation dropped and answers EIO without another request; the job
-/// belongs to the parent, whose rename ends with success, once.
-fn fork_hook(kind: posix_abi::change::Probe) -> bool {
-    use core::sync::atomic::Ordering::SeqCst;
-    use posix_abi::change::Probe;
-    match (MODE.load(SeqCst), kind) {
-        (0, Probe::Step) if STEPS.fetch_add(1, SeqCst) == 4 => {
-            // SAFETY: the C function of relibc.
-            FORKED.store(unsafe { fork() }, SeqCst);
-            false
+    pub const EAGAIN: c_int = 11;
+
+    fn owner() -> Result<OwnerToken, i32> {
+        let value = posix_abi::relibc::open_owner().map_err(|_| 500)?;
+        OwnerToken::new(value).map_err(|_| 501)
+    }
+
+    /// Sixteen records of this thread with this frame, or the places that
+    /// were free.
+    pub fn take(frame: Frame) -> Result<[Option<(ControlToken, ControlClaimToken)>; 16], i32> {
+        let owner = owner()?;
+        let mut held = [None; 16];
+        for place in &mut held {
+            *place = posix_abi::shared::with_files(|files| {
+                files
+                    .begin_change_record(owner, frame)
+                    .map(Some)
+                    .map_err(|_| 502)
+            })?;
         }
-        (1, Probe::Start) if FORKED.load(SeqCst) == -2 => {
-            // SAFETY: the C function of relibc.
-            FORKED.store(unsafe { fork() }, SeqCst);
-            // The parent and the child both lose the reply of the Start.
-            true
-        }
-        _ => false,
+        Ok(held)
+    }
+
+    /// The operation behind the record ends: its place goes. These jobs
+    /// never started in the service, so no Release is owed.
+    pub fn give(token: ControlToken, claim: ControlClaimToken) -> Result<(), i32> {
+        let owner = owner()?;
+        posix_abi::shared::with_files(|files| {
+            files
+                .complete_change_record(claim, ControlResult::Value(0))
+                .map_err(|_| 503)?;
+            files.begin_change_cleanup(token).map_err(|_| 504)?;
+            files.finish_change_cleanup(token).map_err(|_| 505)?;
+            files.ack_change_record(token, owner).map_err(|_| 506)?;
+            Ok(())
+        })
+    }
+
+    pub fn in_use() -> Result<usize, i32> {
+        posix_abi::shared::with_files(|files| Ok(files.change_tokens().count()))
     }
 }
 
-/// One fork in the middle of the rename of the big directory.
-fn fork_once(mode: u32, line: i32) -> Result<(), i32> {
-    use core::sync::atomic::Ordering::SeqCst;
-    ok(files_names_big(), line)?;
-    STEPS.store(0, SeqCst);
-    FORKED.store(-2, SeqCst);
-    MODE.store(mode, SeqCst);
-    posix_abi::change::probe_hook(Some(fork_hook));
-    let answer = slow_rename();
-    posix_abi::change::probe_hook(None);
-    let forked = FORKED.load(SeqCst);
-    if forked == 0 {
-        // The child: EIO, and nothing of the operation sent after it.
-        // SAFETY: relibc's _exit.
-        unsafe { _exit(if answer == EIO { 0 } else { 100 + answer }) };
+/// A thread inside sixteen operations answers EAGAIN to a seventeenth, and
+/// the places its records have left behind are released by its next operation.
+fn own_places() -> Result<(), i32> {
+    use entries::Frame;
+    // Sixteen operations the thread is inside of: the frames lie above this one.
+    let held = places::take(Frame::main(u64::MAX))?;
+    expect(mkdir(b"/tmp/pl", 0o777), places::EAGAIN, 440)?;
+    check(absent(b"/tmp/pl"), 441)?;
+    // One of them ends: there is room, and the others are left alone.
+    let (token, claim) = held[0].ok_or(442)?;
+    places::give(token, claim)?;
+    ok(mkdir(b"/tmp/pl", 0o777), 443)?;
+    check(places::in_use()? == 15, 444)?;
+    ok(unlink(b"/tmp/pl", AT_REMOVEDIR), 445)?;
+    for (token, claim) in held[1..].iter().flatten() {
+        places::give(*token, *claim)?;
     }
-    check(forked > 0, line + 1)?;
-    let mut status = 0;
-    // SAFETY: relibc's waitpid and a live int.
-    let waited = unsafe { waitpid(forked, &mut status, 0) };
-    check(waited == forked, line + 2)?;
-    // The child exited with code 0: its answer was EIO.
-    check(status == 0, line + 3)?;
-    // The parent's rename succeeded, once: the name moved and stays moved.
-    check(answer == 0, line + 4)?;
-    check(
-        is(b"/tmp/big/n", REG) && absent(&big_name(BIG - 1)),
-        line + 5,
-    )?;
-    // The job of the parent was released: places and keys are free.
-    for _ in 0..20 {
-        ok(slow_rename(), line + 6)?;
-    }
-    ok(files_names_big_gone(), line + 7)
+    check(places::in_use()? == 0, 446)?;
+    // Sixteen operations the thread has left by a long jump: the frames lie
+    // below this one. The next operation releases them and goes on.
+    let _left = places::take(Frame::main(0))?;
+    check(places::in_use()? == 16, 447)?;
+    ok(mkdir(b"/tmp/pl", 0o777), 448)?;
+    check(places::in_use()? == 0, 449)?;
+    ok(unlink(b"/tmp/pl", AT_REMOVEDIR), 450)?;
+    rt::println!(
+        "posix-files: layer answered EAGAIN to a thread inside sixteen operations and released the places it left"
+    );
+    Ok(())
 }
 
-/// Run in a child of the loader, which can fork.
 #[unsafe(no_mangle)]
-pub extern "C" fn files_names_fork_in_flight() -> i32 {
-    fork_once(0, 420)
-        .and_then(|()| fork_once(1, 430))
-        .err()
-        .unwrap_or(0)
+pub extern "C" fn files_names_own_places() -> i32 {
+    own_places().err().unwrap_or(0)
+}
+
+/// The body of a thread that holds the sixteen places for `tenths` of a
+/// millisecond: the records of operations in flight, which end when it wakes.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_names_hold_places(tenths: i32) -> i32 {
+    use entries::Frame;
+    fn hold(tenths: i32) -> Result<(), i32> {
+        let held = places::take(Frame::main(u64::MAX))?;
+        let pause = [0, i64::from(tenths) * 100_000];
+        // SAFETY: relibc's nanosleep and a live timespec.
+        unsafe { nanosleep(&pause, core::ptr::null_mut()) };
+        for (token, claim) in held.iter().flatten() {
+            places::give(*token, *claim)?;
+        }
+        posix_abi::change::wake_places();
+        Ok(())
+    }
+    hold(tenths).err().unwrap_or(0)
+}
+
+/// The seventeenth operation of another thread: it waits for the places of
+/// the holder and ends with success.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_names_wait_for_places() -> i32 {
+    let result = mkdir(b"/tmp/pw", 0o777);
+    if result != 0 {
+        return 510;
+    }
+    unlink(b"/tmp/pw", AT_REMOVEDIR).abs()
+}
+
+/// How many places of jobs are taken now.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_names_places_in_use() -> i32 {
+    places::in_use().map_or(-1, |used| used as i32)
 }

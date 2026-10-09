@@ -385,6 +385,7 @@ dependencies = [
 name = "posix-procs"
 version = "0.1.0"
 dependencies = [
+ "entries",
  "posix-abi",
  "posix-crt",
  "posix-fs",

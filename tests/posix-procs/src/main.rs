@@ -72,6 +72,8 @@ mod change_stages;
 mod cleanup;
 #[cfg(feature = "files")]
 mod data_stages;
+#[cfg(feature = "names-probe")]
+mod names_fork;
 #[cfg(feature = "stages")]
 mod names_stages;
 #[cfg(feature = "stages")]

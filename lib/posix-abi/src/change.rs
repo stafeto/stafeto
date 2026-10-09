@@ -188,7 +188,7 @@ fn key_of(token: ControlToken) -> OpenKey {
 }
 
 /// Wakes the threads that wait for a place of a job.
-pub(crate) fn wake_places() {
+pub fn wake_places() {
     let address = crate::shared::with_files(|files| Ok(files.jobs_wait_address()));
     if let Ok(address) = address {
         posix_sync::futex_wake(address as *const AtomicU32, u32::MAX);

@@ -22,7 +22,7 @@ files = ["pending-open", "stages"]
 stages = ["pending-open"]
 change-steps = ["stages"]
 names-probe = ["stages", "posix-abi/change-probe"]
-pending-open = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt", "dep:posix-fs", "dep:posix-sync"]
+pending-open = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt", "dep:posix-fs", "dep:posix-sync", "dep:entries"]
 loader-abort = ["files", "dep:proto-process", "dep:proto-loader", "dep:posix-fs"]
 image-gates = ["loader-abort"]
 image-info-probe = ["loader-abort"]
@@ -41,3 +41,4 @@ proto-loader = { path = "../../proto/loader", optional = true }
 posix-fs = { path = "../../lib/posix-fs", optional = true }
 
 posix-sync = { path = "../../lib/posix-sync", optional = true }
+entries = { path = "../../lib/entries", optional = true }
