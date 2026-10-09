@@ -10,11 +10,10 @@
 //! - the access count of a directory (`Node::access_gen`) rises with its mode
 //!   or owner; a walk in a chain of names that sees it changed takes its
 //!   component again, with the search permission;
-//! - the count of a bucket of names (`State::bucket_stamps`) rises when a
-//!   name comes to the bucket or leaves it; a walk in the chain of the bucket
-//!   takes its component again, and a proof of a name (an edge, a missing
-//!   name, a reservation) is stale. A name elsewhere, the times, the mode, the
-//!   owner or the bytes of a file change none of it.
+//! - bucket and directory name counters rise when a name comes or leaves.
+//!   A name proof is stale when both counters change. Foreign bucket edits
+//!   retain a live cursor in that bucket. Times, mode, owner and bytes of a
+//!   file leave the counters unchanged.
 
 use crate::authority::Identity;
 use crate::metadata::{MetadataPath, MetadataProof};
@@ -43,6 +42,7 @@ pub struct Resolve {
     /// the lookup began.
     bucket: u16,
     bucket_stamp: u32,
+    name_gen: u32,
     link: Option<Token>,
     links: u8,
     epoch: u64,
@@ -54,6 +54,7 @@ pub struct Resolve {
     /// the edge (NONE for an edge that has no name: `.` and `..`).
     edge_bucket: u16,
     edge_stamp: u32,
+    edge_name_gen: u32,
     edge_start: usize,
     edge_end: usize,
     missing: bool,
@@ -159,6 +160,7 @@ impl Resolve {
             access_gen: 0,
             bucket: 0,
             bucket_stamp: 0,
+            name_gen: 0,
             link: None,
             links: 0,
             epoch: storage.state.epoch,
@@ -168,6 +170,7 @@ impl Resolve {
             edge_parent: None,
             edge_bucket: NONE,
             edge_stamp: 0,
+            edge_name_gen: 0,
             edge_start: 0,
             edge_end: 0,
             missing: false,
@@ -202,6 +205,7 @@ impl Resolve {
             access_gen: 0,
             bucket: 0,
             bucket_stamp: 0,
+            name_gen: 0,
             link: None,
             links: 0,
             epoch: storage.state.epoch,
@@ -215,6 +219,7 @@ impl Resolve {
             edge_parent: None,
             edge_bucket: NONE,
             edge_stamp: 0,
+            edge_name_gen: 0,
             edge_start: 0,
             edge_end: 0,
             missing: false,
@@ -301,7 +306,12 @@ impl Resolve {
         }
         if self.missing
             && self.edge_bucket != NONE
-            && storage.stamp(self.edge_bucket as usize) != self.edge_stamp
+            && !storage.name_unchanged(
+                self.edge_parent.ok_or(STALE_PROOF)?,
+                self.edge_bucket,
+                self.edge_stamp,
+                self.edge_name_gen,
+            )?
         {
             // A name came to the bucket since: the name is perhaps there.
             self.restarts = self.restarts.saturating_add(1);
@@ -316,12 +326,15 @@ impl Resolve {
         // A change of the mode or owner of the directory the walk stands in
         // sends the walk back to the start of this component: its search
         // permission, the head of its chain and a link found in it are taken
-        // again. So does a name that comes to the bucket of the name looked
-        // for or leaves it, whatever the directory is: the place of the walk
-        // in the chain is gone. The components behind stay as they were.
+        // again. A name edit in this directory and bucket restarts the
+        // component too. Foreign edits retain a live cursor in the bucket.
+        // The components behind stay as they were.
         if (self.looking || self.link.is_some())
             && (storage.node(self.current)?.access_gen != self.access_gen
-                || self.looking && storage.stamp(self.bucket as usize) != self.bucket_stamp)
+                || self.looking
+                    && storage.stamp(self.bucket as usize) != self.bucket_stamp
+                    && (storage.node(self.current)?.name_gen != self.name_gen
+                        || !storage.chain_cursor_valid(self.search, self.bucket)))
         {
             self.looking = false;
             self.link = None;
@@ -400,6 +413,7 @@ impl Resolve {
                 return Ok(Progress::More);
             }
             self.access_gen = directory.access_gen;
+            self.name_gen = directory.name_gen;
             let bucket = crate::storage::name_bucket(self.current, &self.path[self.at..self.end]);
             self.bucket = bucket as u16;
             self.bucket_stamp = storage.stamp(bucket);
@@ -478,6 +492,7 @@ impl Resolve {
         } else {
             (NONE, 0)
         };
+        self.edge_name_gen = self.name_gen;
         self.edge_start = self.at;
         self.edge_end = self.end;
         Ok(())
@@ -513,6 +528,7 @@ impl Resolve {
                 location,
                 bucket,
                 stamp,
+                name_gen: self.edge_name_gen,
                 syntax: RawSyntax::of(self.original_path()),
             },
             leaf: proof.leaf,
@@ -566,10 +582,14 @@ impl Resolve {
             storage.node(result)?;
         } else if !self.missing
             || self.edge_bucket != NONE
-                && storage.stamp(self.edge_bucket as usize) != self.edge_stamp
+                && !storage.name_unchanged(
+                    self.edge_parent.ok_or(STALE_PROOF)?,
+                    self.edge_bucket,
+                    self.edge_stamp,
+                    self.edge_name_gen,
+                )?
         {
-            // The proof that the name is not there lasts while its bucket
-            // keeps its count.
+            // Either retained count proves that the name is still absent.
             return Err(STALE_PROOF);
         }
         Ok(ResultProof {

@@ -46,6 +46,13 @@ extern int files_volley_read_dir_index(const char *path, unsigned index);
         }                                                                      \
     } while (0)
 
+/* The parent slot used by the service's name hash is exposed by st_ino. */
+static unsigned vz_name_bucket(unsigned slot, const char *name) {
+    unsigned hash = 0x811c9dc5u ^ slot;
+    for (; *name; name++) hash = (hash ^ (unsigned char)*name) * 0x01000193u;
+    return (hash ^ (hash >> 15)) & 2047u;
+}
+
 static unsigned vz_requests0;
 static unsigned long long vz_ticks0;
 
@@ -340,6 +347,7 @@ static volatile int vz_scene_done;
 static unsigned long long vz_scene_ticks;
 static char vz_scene_moved[700];
 static char vz_scene_deep[600];
+static char vz_collision_path[80];
 
 static void *vz_scene_flood(void *unused) {
     struct timespec times[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
@@ -354,6 +362,12 @@ static void *vz_scene_flood(void *unused) {
                 close(fd);
                 if (unlink(VZ "/fd/x") != 0) bad = 1;
             }
+            break;
+        }
+        case 5: /* a name in another directory, in the source's bucket */ {
+            int fd = open(vz_collision_path, O_WRONLY | O_CREAT, 0600);
+            if (fd < 0) bad = 1;
+            else { close(fd); bad = unlink(vz_collision_path) != 0; }
             break;
         }
         case 2: /* the mode of a file in a loop */
@@ -470,6 +484,20 @@ static int vz_scenes(void) {
     vz_deep(vz_scene_deep, VZ_DEPTH);
     snprintf(vz_scene_moved, sizeof vz_scene_moved, "%s/a", vz_scene_deep);
     VZ_CHECK(mkdir(VZ "/a", 0755) == 0);
+    VZ_CHECK(mkdir(VZ "/fd", 0755) == 0);
+    struct stat parent, other;
+    VZ_CHECK(stat(VZ, &parent) == 0 && stat(VZ "/fd", &other) == 0);
+    unsigned wanted = vz_name_bucket((unsigned)parent.st_ino - 1u, "a");
+    for (unsigned i = 0;; i++) {
+        char leaf[40];
+        snprintf(leaf, sizeof leaf, "collision%u", i);
+        if (vz_name_bucket((unsigned)other.st_ino - 1u, leaf) == wanted) {
+            snprintf(vz_collision_path, sizeof vz_collision_path, VZ "/fd/%s", leaf);
+            break;
+        }
+    }
+    VZ_CHECK(vz_scene("G2b", "a rename against a colliding name in another directory", 5, 2, VZ_OP_RENAME) == 0);
+    VZ_CHECK(rmdir(VZ "/fd") == 0);
     VZ_CHECK(vz_scene("G3", "the rename of a directory under a chain 64 deep against chmod of a file", 2, 2,
                       VZ_OP_RENAME) == 0);
     VZ_CHECK(rmdir(VZ "/a") == 0);
@@ -714,13 +742,6 @@ static int names_volley(void) {
     VZ_CHECK(rmdir(VZ) == 0);
     printf("posix-procs: names volley ok\n");
     return 0;
-}
-
-/* The parent slot used by the service's name hash is exposed by st_ino. */
-static unsigned vz_name_bucket(unsigned slot, const char *name) {
-    unsigned hash = 0x811c9dc5u ^ slot;
-    for (; *name; name++) hash = (hash ^ (unsigned char)*name) * 0x01000193u;
-    return (hash ^ (hash >> 15)) & 2047u;
 }
 
 /* A second root waits for the gate before publishing its 250 names. */

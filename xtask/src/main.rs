@@ -3708,6 +3708,7 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     for (tag, what) in [
         ("G2", "a path of 32 links"),
         ("G3", "the rename of a directory"),
+        ("G2b", "a rename against a colliding name"),
     ] {
         let line = find(&format!("names interference {tag}:"))?;
         if !line.contains("0 restarts, finished within 10 s: yes") || !line.contains(what) {
@@ -6931,6 +6932,7 @@ mod tests {
             "posix-procs: names thread cost: 28672 bytes (7 pages) for the first thread, 28672 bytes the last, 86016 bytes for 3, stack 20480 bytes",
             "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 0 restarts, finished within 10 s: yes, took 218444 ticks, alone 110180 ticks",
             "posix-procs: names interference G2: a path of 32 links against a name made and removed in another directory: 0 restarts, finished within 10 s: yes, result 0, took 1356992 ticks, alone 629874 ticks",
+            "posix-procs: names interference G2b: a rename against a colliding name in another directory: 0 restarts, finished within 10 s: yes, result 0, took 2900000 ticks, alone 1300000 ticks",
             "posix-procs: names interference G3: the rename of a directory under a chain 64 deep against chmod of a file: 0 restarts, finished within 10 s: yes, result 0, took 2895999 ticks, alone 1308386 ticks",
             "posix-procs: names interference G4: a rename over a name that is made and removed in the same directory: 3042 restarts, finished within 10 s: no, result 0, took 624667089 ticks, alone 145549 ticks",
             "posix-procs: names interference G5: the canonical path of a directory 64 deep against directories that move: 1602 restarts, finished within 10 s: no, result 0, took 625555306 ticks, alone 1172516 ticks",

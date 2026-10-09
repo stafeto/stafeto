@@ -2388,3 +2388,61 @@ fn a_path_of_32_links_of_255_components_takes_a_step_for_each_component_and_link
     assert!(steps >= 8_000, "{steps} steps: the dots are components");
     job.release(&mut r.storage);
 }
+
+#[test]
+fn foreign_bucket_churn_keeps_a_twenty_name_chain_cursor() {
+    let _one = OneBucket::new();
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (directory, tail) = long_chain(&mut ram, 20);
+    let mut job = Resolve::new(&mut ram.storage, b"/chain/tail", ROOT, OWNER, true).unwrap();
+    walk_into(&mut ram, &mut job, directory);
+    let mut finished = false;
+    for _ in 0..3 {
+        create(&mut ram, ROOT, b"foreign", REG, 0o644);
+        ram.storage.unlink(ROOT, b"foreign", ROOT_ACCOUNT).unwrap();
+        match job.step(&mut ram.storage, OWNER).unwrap() {
+            Progress::Found(token) => {
+                assert_eq!(token, tail);
+                finished = true;
+                break;
+            }
+            Progress::More => {}
+            _ => panic!("existing tail"),
+        }
+    }
+    assert!(
+        finished,
+        "the retained chain must finish without another head walk"
+    );
+    assert_eq!(job.restarts, 0);
+    ram.storage.check_name_index();
+    job.release(&mut ram.storage);
+}
+
+#[test]
+fn foreign_bucket_changes_keep_missing_proofs_and_reservations() {
+    let _one = OneBucket::new();
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let dir = create(&mut ram, ROOT, b"dir", DIR, 0o755);
+    let other = create(&mut ram, ROOT, b"other", DIR, 0o755);
+    let intent = crate::resolve::Intent::DirectoryCreate;
+    let mut job = Resolve::with_intent(&mut ram.storage, b"/dir/new", ROOT, OWNER, intent).unwrap();
+    assert_eq!(
+        intent_ready(&mut ram, &mut job, OWNER).unwrap().0,
+        Progress::Missing(dir)
+    );
+    let pending = ram
+        .storage
+        .reserve(ROOT_ACCOUNT, dir, b"new", (DIR, 0o755, 11, 22))
+        .unwrap();
+    create(&mut ram, other, b"foreign", REG, 0o644);
+    assert_eq!(
+        job.step(&mut ram.storage, OWNER),
+        Ok(Progress::Missing(dir))
+    );
+    assert!(job.result_proof(&ram.storage, OWNER, intent).is_ok());
+    assert!(ram.storage.reserved_token(pending, ROOT_ACCOUNT).is_ok());
+    assert_eq!(ram.storage.commit(pending), Ok(pending.token));
+    ram.storage.check_name_index();
+    job.release(&mut ram.storage);
+}

@@ -72,11 +72,11 @@ pub(crate) struct Edge {
     pub target: Option<Token>,
     pub location: Location,
     /// The bucket of the name of the edge and its count of changes when the
-    /// edge was proved (the bucket is NONE for an edge without a name). The
-    /// edge holds while the count stays: a name that is there is the same
-    /// name, and a name that is not there is still not.
+    /// edge was proved (NONE for an edge without a name). Either an unchanged
+    /// bucket count or an unchanged parent name generation retains the proof.
     pub bucket: u16,
     pub stamp: u32,
+    pub name_gen: u32,
     pub syntax: RawSyntax,
 }
 /// Native construction is restricted to the retained resolver's verified result.
@@ -590,7 +590,9 @@ impl Storage<'_> {
         if let Some(target) = edge.target {
             self.node(target)?;
         }
-        if edge.bucket != NONE && self.stamp(edge.bucket as usize) != edge.stamp {
+        if edge.bucket != NONE
+            && !self.name_unchanged(edge.parent, edge.bucket, edge.stamp, edge.name_gen)?
+        {
             return Err(STALE_PROOF);
         }
         let valid = match edge.location {
@@ -849,6 +851,7 @@ fn model_edge<'a>(
             })?,
             bucket: name_bucket(parent, name) as u16,
             stamp: storage.stamp(name_bucket(parent, name)),
+            name_gen: storage.name_gen(parent)?,
             syntax: RawSyntax::of(name),
         },
         leaf: name,
@@ -923,6 +926,7 @@ pub(super) fn model_link(
                 location: Location::ModelToken,
                 bucket: NONE,
                 stamp: 0,
+                name_gen: 0,
                 syntax: RawSyntax {
                     final_component: FinalComponent::Ordinary,
                     trailing_slash: false,

@@ -3065,6 +3065,23 @@ fn what_another_client_does_between_the_steps_of_an_unlink_restarts_it_only_when
             (0, 0),
             "bytes through a descriptor, early {early}"
         );
+        assert_eq!(
+            unlink_against(
+                |env, _| {
+                    let d = env.lookup(b"/d").unwrap();
+                    let e = env.lookup(b"/e").unwrap();
+                    let bucket = crate::storage::name_bucket(d, b"f");
+                    let name = (0..)
+                        .map(|i| format!("foreign{i}"))
+                        .find(|name| crate::storage::name_bucket(e, name.as_bytes()) == bucket)
+                        .unwrap();
+                    env.node(e, name.as_bytes(), REG, 0o644);
+                },
+                early
+            ),
+            (0, 0),
+            "a colliding name of another directory, early {early}"
+        );
         // A file of the directory of the name: its mode too.
         assert_eq!(unlink_against(chmod(b"/d/h", 0o600), early), (0, 0));
         // Names of another directory, a directory made and a mode of it.

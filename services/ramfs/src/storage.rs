@@ -468,6 +468,7 @@ pub struct Reservation {
     /// proof that the name was not there.
     bucket: u16,
     stamp: u32,
+    name_gen: u32,
     place: u16,
     root: u16,
 }
@@ -1168,6 +1169,27 @@ impl<'a> Storage<'a> {
     pub(crate) fn stamp(&self, bucket: usize) -> u32 {
         self.state.bucket_stamps[bucket]
     }
+    /// Either unchanged counter proves that this directory's name is unchanged.
+    pub(crate) fn name_unchanged(
+        &self,
+        parent: Token,
+        bucket: u16,
+        stamp: u32,
+        generation: u32,
+    ) -> Result<bool, u32> {
+        Ok(self.name_gen(parent)? == generation || self.stamp(bucket as usize) == stamp)
+    }
+    /// A retained chain cursor survives foreign edits if its row is still in the bucket.
+    pub(crate) fn chain_cursor_valid(&self, entry: u16, bucket: u16) -> bool {
+        if entry == NONE {
+            return true;
+        }
+        if !self.published(entry as usize) {
+            return false;
+        }
+        let (parent, name) = self.entry_key(entry as usize);
+        name_bucket(parent, name) == bucket as usize
+    }
     fn account(&mut self, key: Root) -> Result<usize, u32> {
         if let Some(i) = self
             .state
@@ -1677,6 +1699,7 @@ impl<'a> Storage<'a> {
             epoch: self.state.epoch,
             bucket: name_bucket(parent, name) as u16,
             stamp: self.stamp(name_bucket(parent, name)),
+            name_gen: self.name_gen(parent)?,
             place: place as u16,
             root: a as u16,
         };
@@ -1699,7 +1722,10 @@ impl<'a> Storage<'a> {
         {
             return Err(proto_fs::PERMISSION);
         }
-        if r.epoch != self.state.epoch || self.stamp(r.bucket as usize) != r.stamp {
+        let parent = self.state.dentries[r.dentry as usize].parent;
+        if r.epoch != self.state.epoch
+            || !self.name_unchanged(parent, r.bucket, r.stamp, r.name_gen)?
+        {
             return Err(proto_fs::STALE_PROOF);
         }
         Ok(r.token)
@@ -1744,7 +1770,12 @@ impl<'a> Storage<'a> {
         if !d.reserved
             || d.node != reservation.token
             || reservation.epoch != self.state.epoch
-            || self.stamp(reservation.bucket as usize) != reservation.stamp
+            || !self.name_unchanged(
+                d.parent,
+                reservation.bucket,
+                reservation.stamp,
+                reservation.name_gen,
+            )?
         {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
