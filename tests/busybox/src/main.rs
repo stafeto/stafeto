@@ -154,6 +154,36 @@ extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> 
     unsafe { busybox_main(argc as c_int, argv.cast()) }
 }
 
+/// The script of the ash probe: the builtins, then the applets on names run
+/// inside the shell (5i-5). Each step shows its result: a file read back, a
+/// test of existence, a listing, the target of a link and the mode a chmod
+/// set. `ls` of a directory shows the image's nodes and none made while the
+/// system runs (5i-5b), so it comes after the last `rm` of a file in `/tmp`
+/// and the mode is read from `ls -ld` of the path. The mode has a leading
+/// zero because relibc's `strtoul("600", &end, 8)` returns 0 and stops at the
+/// first digit, which BusyBox's `chmod` takes for an invalid mode.
+#[cfg(feature = "ash-probe")]
+const ASH_SCRIPT: &core::ffi::CStr = c"echo shell-ready
+echo x > /tmp/a
+mv /tmp/a /tmp/b
+test -e /tmp/a || echo a-gone
+cat /tmp/b
+rm /tmp/b
+test -e /tmp/b || echo b-gone
+ls /tmp
+mkdir /tmp/d
+test -d /tmp/d && echo d-made
+rmdir /tmp/d
+test -d /tmp/d || echo d-gone
+ln -s b /tmp/l
+readlink /tmp/l
+touch /tmp/t
+chmod 0600 /tmp/t
+ls -ld /tmp/t > /tmp/o
+read mode rest < /tmp/o
+echo mode $mode
+exit 0";
+
 /// The probe's C main: the applet and its arguments of the build's
 /// feature, then BusyBox's dispatcher.
 #[cfg(not(feature = "applets"))]
@@ -171,7 +201,7 @@ extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int 
         c"busybox".as_ptr(),
         c"ash".as_ptr(),
         c"-c".as_ptr(),
-        c"echo shell-ready; exit 0".as_ptr(),
+        ASH_SCRIPT.as_ptr(),
         core::ptr::null(),
     ];
     #[cfg(feature = "ls-probe")]

@@ -3905,9 +3905,56 @@ fn ash_probe() -> Result<(), String> {
     const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ENDED)?;
-    qemu::expect_marker(&output, "shell-ready")?;
+    expect_ash_names(&output.lines)?;
     println!("BusyBox ash builtin guest probe passed");
     Ok(())
+}
+
+/// What the script of the ash probe (tests/busybox/src/main.rs) prints after
+/// `shell-ready`: a file moved, read back and removed, a listing of `/tmp`
+/// without the nodes made while the system runs (5i-5b), a directory made and
+/// removed, a link read back, the mode `chmod` set.
+const ASH_NAMES_OUTPUT: [&str; 9] = [
+    "a-gone",
+    "x",
+    "b-gone",
+    "probe",
+    "d-made",
+    "d-gone",
+    "b",
+    "mode -rw-------",
+    "init: busybox-probe ended: exit code 0, not restarted",
+];
+
+/// The lines of the guest after `shell-ready` are exactly those of the
+/// script, in order.
+fn expect_ash_names(lines: &[String]) -> Result<(), String> {
+    let at = lines
+        .iter()
+        .position(|line| line == "shell-ready")
+        .ok_or_else(|| {
+            format!(
+                "no shell-ready; last lines: {:?}",
+                &lines[lines.len().saturating_sub(8)..]
+            )
+        })?;
+    let got = &lines[at + 1..];
+    if got.len() >= ASH_NAMES_OUTPUT.len()
+        && got
+            .iter()
+            .zip(ASH_NAMES_OUTPUT)
+            .all(|(line, want)| line == want)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "the ash script printed {:?}, wanted {:?}",
+            got.iter()
+                .take(ASH_NAMES_OUTPUT.len() + 2)
+                .collect::<Vec<_>>(),
+            ASH_NAMES_OUTPUT
+        ))
+    }
 }
 
 fn ash_dialog() -> Result<(), String> {
@@ -6679,6 +6726,31 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The lines of the ash script are checked exactly, in order, after
+    /// `shell-ready`.
+    #[test]
+    fn the_output_of_the_ash_names_script_is_exact() {
+        let log = |lines: &[&str]| -> Vec<String> {
+            ["boot", "shell-ready"]
+                .iter()
+                .chain(lines)
+                .map(|line| (*line).to_owned())
+                .collect()
+        };
+        assert!(super::expect_ash_names(&log(&super::ASH_NAMES_OUTPUT)).is_ok());
+        // A line missing (a `mv` that did not run), another text, another order.
+        let mut without = super::ASH_NAMES_OUTPUT.to_vec();
+        without.remove(1);
+        assert!(super::expect_ash_names(&log(&without)).is_err());
+        let mut other = super::ASH_NAMES_OUTPUT.to_vec();
+        other[7] = "mode -rw-r--r--";
+        assert!(super::expect_ash_names(&log(&other)).is_err());
+        let mut swapped = super::ASH_NAMES_OUTPUT.to_vec();
+        swapped.swap(0, 1);
+        assert!(super::expect_ash_names(&log(&swapped)).is_err());
+        assert!(super::expect_ash_names(&["boot".to_owned()]).is_err());
+    }
+
     #[test]
     fn native_images_keep_the_loader_pool_and_both_platforms() {
         use super::*;

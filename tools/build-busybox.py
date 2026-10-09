@@ -32,7 +32,7 @@ STAMP = WORK / "config"
 A53_ERRATA = "-mfix-cortex-a53-835769"
 # BusyBox's main becomes busybox_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
-PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-traps math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769"
+PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-traps names-nofork-cat math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769"
 
 
 def relibc_commit() -> str:
@@ -60,6 +60,10 @@ OBJECTS = (
     "vfork_daemon_rexec.o",
     "wfopen.o", "fclose_nonstdin.o", "fflush_stdout_and_exit.o",
     "perror_nomsg_and_die.o", "get_line_from_file.o",
+    # The applets on names (mv, rm, mkdir, ln, readlink).
+    "ask_confirmation.o", "make_directory.o", "copy_file.o", "inode_hash.o",
+    "concat_subpath_file.o", "isdirectory.o", "recursive_action.o", "xgetcwd.o",
+    "remove_file.o",
 )
 
 
@@ -97,7 +101,8 @@ def main() -> None:
             and (SOURCE / "libbb/lib.a").exists()
             and (SOURCE / "coreutils/lib.a").exists()
             and (SOURCE / "shell/lib.a").exists()
-            and (SOURCE / "procps/lib.a").exists()):
+            and (SOURCE / "procps/lib.a").exists()
+            and (SOURCE / "coreutils/libcoreutils/lib.a").exists()):
         print(f"BusyBox objects ready: {SOURCE}")
         return
     WORK.mkdir(parents=True, exist_ok=True)
@@ -111,9 +116,19 @@ def main() -> None:
         shutil.rmtree(SOURCE)
     run("tar", "-xjf", str(ARCHIVE), "-C", str(WORK))
     (WORK / f"busybox-{VERSION}").rename(SOURCE)
+    replace(SOURCE / "coreutils/cat.c",
+            "APPLET(cat, BB_DIR_BIN, BB_SUID_DROP)",
+            "APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat)")
     replace(SOURCE / "coreutils/ls.c",
             "APPLET_NOEXEC(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)",
             "APPLET_NOFORK(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)")
+    # The applets of names run inside ash without a fork, as ls does: the
+    # probe's image has no process to fork for them.
+    for applet, directory in (("mv", "BB_DIR_BIN"), ("rm", "BB_DIR_BIN"),
+                              ("ln", "BB_DIR_BIN"), ("chmod", "BB_DIR_BIN")):
+        replace(SOURCE / f"coreutils/{applet}.c",
+                f"APPLET_NOEXEC({applet}, {applet}, {directory}, BB_SUID_DROP, {applet})",
+                f"APPLET_NOFORK({applet}, {applet}, {directory}, BB_SUID_DROP, {applet})")
     # relibc next to the other C libraries of platform.h: the glibc
     # extensions it lacks, alloca from its own header, and the declaration
     # of settimeofday, which libbb's xsettimeofday names and no probe calls.
@@ -170,6 +185,10 @@ def main() -> None:
     replace(config, "# CONFIG_ECHO is not set", "CONFIG_ECHO=y")
     replace(config, "# CONFIG_CAT is not set", "CONFIG_CAT=y")
     replace(config, "# CONFIG_LS is not set", "CONFIG_LS=y")
+    # The applets on names (5i-5): move, remove, make and remove a
+    # directory, link, change the mode, touch, read a link.
+    for name in ("MV", "RM", "MKDIR", "RMDIR", "LN", "CHMOD", "TOUCH", "READLINK"):
+        replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
     replace(config, "# CONFIG_WC is not set", "CONFIG_WC=y")
     replace(config, "# CONFIG_SLEEP is not set", "CONFIG_SLEEP=y")
     # The applets that take bytes or names from the random devices (5e').
@@ -201,14 +220,15 @@ def main() -> None:
     include = RELIBC / "include"
     if not (include / "stdio.h").exists():
         raise SystemExit("build relibc with cargo xtask relibc first")
-    run("make", "-j4", "libbb", "coreutils", "shell", "procps", f"CC={clang}", f"LD={lld}",
+    run("make", "-j4", "libbb", "coreutils", "coreutils/libcoreutils/", "shell", "procps", f"CC={clang}", f"LD={lld}",
         f"AR={ar}", "HOSTCC=cc",
         "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-linux-gnu", "-nostdinc",
             f"-isystem {include}", f"-idirafter {COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
             "-ffunction-sections", "-fdata-sections", "-Dmain=busybox_main",
             A53_ERRATA)), cwd=SOURCE)
     for archive in [SOURCE / "libbb/lib.a", SOURCE / "coreutils/lib.a",
-                    SOURCE / "shell/lib.a", SOURCE / "procps/lib.a"]:
+                    SOURCE / "shell/lib.a", SOURCE / "procps/lib.a",
+                    SOURCE / "coreutils/libcoreutils/lib.a"]:
         if not archive.exists():
             raise SystemExit(f"BusyBox did not produce {archive}")
     STAMP.write_text(config_stamp)
