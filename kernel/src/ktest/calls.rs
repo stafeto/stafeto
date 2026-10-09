@@ -258,157 +258,215 @@ fn counted_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The handles a test made through `created` and `insert`, so that a
+/// failing test still closes them: a handle closed a second time is
+/// BAD_HANDLE, which `close_all` ignores.
+struct Made {
+    handles: [core::cell::Cell<u64>; 32],
+    count: core::cell::Cell<usize>,
+}
+
+impl Made {
+    fn new() -> Made {
+        Made {
+            handles: [const { core::cell::Cell::new(0) }; 32],
+            count: core::cell::Cell::new(0),
+        }
+    }
+
+    fn keep(&self, h: Handle) -> Result<Handle, &'static str> {
+        let at = self.count.get();
+        self.handles
+            .get(at)
+            .ok_or("the test made more handles than Made keeps")?
+            .set(h.0);
+        self.count.set(at + 1);
+        Ok(h)
+    }
+
+    fn created(&self, c: &Caller, number: u16, args: &[u64]) -> Result<Handle, &'static str> {
+        self.keep(c.created(number, args)?)
+    }
+
+    fn insert(&self, c: &Caller, object: Object, rights: Rights) -> Result<Handle, &'static str> {
+        self.keep(c.insert(object, rights)?)
+    }
+
+    fn close_all(&self, c: &Caller) {
+        for handle in &self.handles[..self.count.get()] {
+            let _ = process::close_handle(c.process, Handle(handle.get()), CAUSE);
+        }
+    }
+}
+
 /// SELF owns one paid NONE capability; CURRENT compares actual Thread objects.
 pub fn object_info_self_thread_has_exact_ownership(_: &Boot) -> Result<(), &'static str> {
     let threads = thread::in_use();
     let processes = process::in_use();
     let result = with_caller(|c| {
-        let n = Call::ObjectInfo.number();
-        let used = process::quota(c.process).used();
-        with_quota_left(c, 0, || {
-            c.fails(n, &[0, abi::INFO_THREAD_SELF, 0], Error::NoMemory)
-        })?;
-        check(
-            process::quota(c.process).used() == used && process::handle_counts(c.process).0 == 0,
-            "failed SELF left a charge or handle",
-        )?;
-        c.fails(n, &[1, abi::INFO_THREAD_SELF, 0], Error::InvalidArgs)?;
-        // Only MANAGE, DUPLICATE and TRANSFER may be asked for.
-        // Bits above the 32 of a right count too.
-        c.fails(
-            n,
-            &[
-                0,
-                abi::INFO_THREAD_SELF,
-                1 << 32 | u64::from(Rights::MANAGE.0),
-            ],
-            Error::InvalidArgs,
-        )?;
-        for extra in [Rights::SEND, Rights::RECEIVE, Rights::DEVICE, Rights::ALL] {
-            c.fails(
-                n,
-                &[0, abi::INFO_THREAD_SELF, u64::from(extra.0)],
-                Error::InvalidArgs,
-            )?;
-            c.fails(
-                n,
-                &[
-                    0,
-                    abi::INFO_THREAD_SELF,
-                    u64::from(extra.union(Rights::MANAGE).0),
-                ],
-                Error::InvalidArgs,
-            )?;
-        }
-        with_quota_left(c, 0, || {
-            c.fails(
-                n,
-                &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
-                Error::NoMemory,
-            )
-        })?;
-        // Every subset of MANAGE | DUPLICATE | TRANSFER is granted exactly.
-        for bits in 0..8u32 {
-            let mut rights = Rights::NONE;
-            for (bit, right) in [Rights::MANAGE, Rights::DUPLICATE, Rights::TRANSFER]
-                .into_iter()
-                .enumerate()
-            {
-                if bits & (1 << bit) != 0 {
-                    rights = rights.union(right);
-                }
-            }
-            let granted = c.created(n, &[0, abi::INFO_THREAD_SELF, u64::from(rights.0)])?;
-            // SAFETY: the caller retains its process while this table is read.
-            let (_, held) = unsafe { c.process.as_ref() }
-                .lookup_with_rights(granted, Rights::NONE, Object::thread)
-                .map_err(|_| "subset SELF lookup failed")?;
-            check(held == rights, "SELF granted other rights than asked for")?;
-            c.succeeds(n, &[granted.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
-            c.close(granted)?;
-        }
-        let managed = c.created(n, &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)])?;
-        // SAFETY: the caller retains its process while this table is read.
-        let (_, rights) = unsafe { c.process.as_ref() }
-            .lookup_with_rights(managed, Rights::MANAGE, Object::thread)
-            .map_err(|_| "managed SELF lookup failed")?;
-        check(rights == Rights::MANAGE, "SELF granted extra rights")?;
-        c.fails(
-            Call::HandleDuplicate.number(),
-            &[managed.0, u64::from(Rights::NONE.0), 0, 0],
-            Error::AccessDenied,
-        )?;
-        c.close(managed)?;
-        let first = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
-        let second = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
-        check(first != second, "SELF reused a live numeric handle")?;
-        c.succeeds(n, &[first.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
-        c.succeeds(n, &[second.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
-        c.fails(
-            Call::HandleDuplicate.number(),
-            &[first.0, Rights::NONE.0.into(), 0, 0],
-            Error::AccessDenied,
-        )?;
-        c.fails(Call::ThreadStart.number(), &[first.0], Error::AccessDenied)?;
-        let resource = c.insert(Object::Resource, Rights::NONE)?;
-        c.fails(
-            n,
-            &[resource.0, abi::INFO_THREAD_CURRENT, 0],
-            Error::WrongType,
-        )?;
-        c.fails(n, &[0, abi::INFO_THREAD_CURRENT, 0], Error::BadHandle)?;
-        c.fails(
-            n,
-            &[resource.0, abi::INFO_THREAD_CURRENT, 1],
-            Error::InvalidArgs,
-        )?;
-        c.close(resource)?;
-        let other = Caller::new()?;
-        let supplied = c.insert(Object::Thread(other.thread), Rights::NONE)?;
-        let compared = c.succeeds(n, &[supplied.0, abi::INFO_THREAD_CURRENT, 0], &[0]);
-        c.close(supplied)?;
-        other.release();
-        compared?;
-        let before = thread::info(c.thread);
-        c.close(first)?;
-        c.fails(n, &[first.0, abi::INFO_THREAD_CURRENT, 0], Error::BadHandle)?;
-        check(
-            thread::info(c.thread).to_words() == before.to_words(),
-            "SELF Close changed the thread",
-        )?;
-        let fresh = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
-        check(fresh != first, "SELF revived a stale handle generation")?;
-        c.succeeds(n, &[fresh.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
-        c.close(fresh)?;
-        c.close(second)?;
-        let warmed = process::quota(c.process).used();
-        let mut full = [Handle::INVALID; LIMIT as usize];
-        for h in &mut full {
-            *h = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
-        }
-        c.fails(n, &[0, abi::INFO_THREAD_SELF, 0], Error::LimitReached)?;
-        c.fails(
-            n,
-            &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
-            Error::LimitReached,
-        )?;
-        check(
-            process::quota(c.process).used() == warmed
-                && process::handle_counts(c.process).0 == LIMIT,
-            "full-table SELF left an extra charge or handle",
-        )?;
-        for h in full {
-            c.close(h)?;
-        }
-        check(
-            process::handle_counts(c.process).0 == 0,
-            "SELF handles remained live",
-        )
+        let made = Made::new();
+        // The handles are closed whatever the checks found.
+        let checked = self_thread_cases(c, &made);
+        made.close_all(c);
+        checked
     });
     result?;
     check(
         thread::in_use() == threads && process::in_use() == processes,
         "SELF leaked a Thread or Process reference after caller cleanup",
+    )
+}
+
+fn self_thread_cases(c: &Caller, made: &Made) -> Result<(), &'static str> {
+    let n = Call::ObjectInfo.number();
+    let used = process::quota(c.process).used();
+    with_quota_left(c, 0, || {
+        c.fails(n, &[0, abi::INFO_THREAD_SELF, 0], Error::NoMemory)
+    })?;
+    check(
+        process::quota(c.process).used() == used && process::handle_counts(c.process).0 == 0,
+        "failed SELF left a charge or handle",
+    )?;
+    c.fails(n, &[1, abi::INFO_THREAD_SELF, 0], Error::InvalidArgs)?;
+    // Only MANAGE, DUPLICATE and TRANSFER may be asked for.
+    // Bits above the 32 of a right count too.
+    c.fails(
+        n,
+        &[
+            0,
+            abi::INFO_THREAD_SELF,
+            1 << 32 | u64::from(Rights::MANAGE.0),
+        ],
+        Error::InvalidArgs,
+    )?;
+    for extra in [Rights::SEND, Rights::RECEIVE, Rights::DEVICE, Rights::ALL] {
+        c.fails(
+            n,
+            &[0, abi::INFO_THREAD_SELF, u64::from(extra.0)],
+            Error::InvalidArgs,
+        )?;
+        c.fails(
+            n,
+            &[
+                0,
+                abi::INFO_THREAD_SELF,
+                u64::from(extra.union(Rights::MANAGE).0),
+            ],
+            Error::InvalidArgs,
+        )?;
+    }
+    with_quota_left(c, 0, || {
+        c.fails(
+            n,
+            &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
+            Error::NoMemory,
+        )
+    })?;
+    // Every subset of MANAGE | DUPLICATE | TRANSFER is granted exactly.
+    for bits in 0..8u32 {
+        let mut rights = Rights::NONE;
+        for (bit, right) in [Rights::MANAGE, Rights::DUPLICATE, Rights::TRANSFER]
+            .into_iter()
+            .enumerate()
+        {
+            if bits & (1 << bit) != 0 {
+                rights = rights.union(right);
+            }
+        }
+        let granted = made.created(c, n, &[0, abi::INFO_THREAD_SELF, u64::from(rights.0)])?;
+        // SAFETY: the caller retains its process while this table is read.
+        let (_, held) = unsafe { c.process.as_ref() }
+            .lookup_with_rights(granted, Rights::NONE, Object::thread)
+            .map_err(|_| "subset SELF lookup failed")?;
+        check(held == rights, "SELF granted other rights than asked for")?;
+        c.succeeds(n, &[granted.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
+        c.close(granted)?;
+    }
+    let managed = made.created(
+        c,
+        n,
+        &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
+    )?;
+    // SAFETY: the caller retains its process while this table is read.
+    let (_, rights) = unsafe { c.process.as_ref() }
+        .lookup_with_rights(managed, Rights::MANAGE, Object::thread)
+        .map_err(|_| "managed SELF lookup failed")?;
+    check(rights == Rights::MANAGE, "SELF granted extra rights")?;
+    c.fails(
+        Call::HandleDuplicate.number(),
+        &[managed.0, u64::from(Rights::NONE.0), 0, 0],
+        Error::AccessDenied,
+    )?;
+    c.close(managed)?;
+    let first = made.created(c, n, &[0, abi::INFO_THREAD_SELF, 0])?;
+    let second = made.created(c, n, &[0, abi::INFO_THREAD_SELF, 0])?;
+    check(first != second, "SELF reused a live numeric handle")?;
+    c.succeeds(n, &[first.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
+    c.succeeds(n, &[second.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
+    c.fails(
+        Call::HandleDuplicate.number(),
+        &[first.0, Rights::NONE.0.into(), 0, 0],
+        Error::AccessDenied,
+    )?;
+    c.fails(Call::ThreadStart.number(), &[first.0], Error::AccessDenied)?;
+    let resource = made.insert(c, Object::Resource, Rights::NONE)?;
+    c.fails(
+        n,
+        &[resource.0, abi::INFO_THREAD_CURRENT, 0],
+        Error::WrongType,
+    )?;
+    c.fails(n, &[0, abi::INFO_THREAD_CURRENT, 0], Error::BadHandle)?;
+    c.fails(
+        n,
+        &[resource.0, abi::INFO_THREAD_CURRENT, 1],
+        Error::InvalidArgs,
+    )?;
+    c.close(resource)?;
+    let other = Caller::new()?;
+    let supplied = match made.insert(c, Object::Thread(other.thread), Rights::NONE) {
+        Ok(supplied) => supplied,
+        Err(e) => {
+            other.release();
+            return Err(e);
+        }
+    };
+    let compared = c.succeeds(n, &[supplied.0, abi::INFO_THREAD_CURRENT, 0], &[0]);
+    c.close(supplied)?;
+    other.release();
+    compared?;
+    let before = thread::info(c.thread);
+    c.close(first)?;
+    c.fails(n, &[first.0, abi::INFO_THREAD_CURRENT, 0], Error::BadHandle)?;
+    check(
+        thread::info(c.thread).to_words() == before.to_words(),
+        "SELF Close changed the thread",
+    )?;
+    let fresh = made.created(c, n, &[0, abi::INFO_THREAD_SELF, 0])?;
+    check(fresh != first, "SELF revived a stale handle generation")?;
+    c.succeeds(n, &[fresh.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
+    c.close(fresh)?;
+    c.close(second)?;
+    let warmed = process::quota(c.process).used();
+    let mut full = [Handle::INVALID; LIMIT as usize];
+    for h in &mut full {
+        *h = made.created(c, n, &[0, abi::INFO_THREAD_SELF, 0])?;
+    }
+    c.fails(n, &[0, abi::INFO_THREAD_SELF, 0], Error::LimitReached)?;
+    c.fails(
+        n,
+        &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
+        Error::LimitReached,
+    )?;
+    check(
+        process::quota(c.process).used() == warmed && process::handle_counts(c.process).0 == LIMIT,
+        "full-table SELF left an extra charge or handle",
+    )?;
+    for h in full {
+        c.close(h)?;
+    }
+    check(
+        process::handle_counts(c.process).0 == 0,
+        "SELF handles remained live",
     )
 }
 
