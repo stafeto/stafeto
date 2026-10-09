@@ -66,6 +66,10 @@ fn main() {
             u8::from(env::var_os("CARGO_FEATURE_IMAGE_INFO_PROBE").is_some())
         ))
         .arg(format!(
+            "-DNAMES_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_NAMES_PROBE").is_some())
+        ))
+        .arg(format!(
             "-DCHANGE_STEPS={}",
             u8::from(env::var_os("CARGO_FEATURE_CHANGE_STEPS").is_some())
         ))

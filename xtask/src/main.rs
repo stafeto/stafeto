@@ -558,7 +558,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
         "posix-procs",
         "posix-procs",
         POSIX_STACK_SIZE,
-        &["pending-open"],
+        &["pending-open", "names-probe"],
     ),
     // Pieces of 64 KiB: the probe's forks copy regions past one piece.
     ("loader", "loader", 0, &["small-pieces"]),
@@ -2279,6 +2279,10 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
         run.expect("<\x13>(\x11)", DIALOG_STEP)?;
         run.expect("posix-tty: output flushed", DIALOG_STEP)?;
         run.expect("posix-tty: output ok", DIALOG_STEP)?;
+        run.expect(
+            "posix-tty: the layer refused the operations on the names of the terminal",
+            DIALOG_STEP,
+        )?;
         run.expect("posix-tty: written through /dev/console", DIALOG_STEP)?;
         run.expect("posix-tty: child wrote through /dev/console", DIALOG_STEP)?;
         run.expect(
@@ -3168,6 +3172,7 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;
+    qemu::expect_marker(&outcome, "posix-procs: names ok")?;
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
     qemu::expect_marker(&outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;

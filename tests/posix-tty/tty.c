@@ -293,8 +293,12 @@ static int output(void) {
 
 /* The names of terminals: opened by the layer, the same terminal through
  * every descriptor, carried to a child by fork. */
+extern int tty_virtual_names(void);
 static int names(const struct termios *saved) {
     struct stat info;
+    int refused = tty_virtual_names();
+    if (refused) { say("posix-tty: names of the terminal gave %d\n", refused); return 80 + refused; }
+    say("posix-tty: the layer refused the operations on the names of the terminal\n");
     CHECK(stat("/dev/console", &info) == 0 && S_ISCHR(info.st_mode));
     CHECK(stat("/dev/tty", &info) == 0 && S_ISCHR(info.st_mode));
     int fd = open("/dev/console", O_RDWR | O_NOCTTY);

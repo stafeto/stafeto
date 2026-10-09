@@ -84,6 +84,51 @@ fn errno_of_result(code: u32) -> i32 {
     }
 }
 
+/// The requests a probe hook sees.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Probe {
+    Start,
+    Second,
+    Step,
+}
+
+/// The hook of the probes, called after each request of an operation was
+/// answered. It answers true to lose the reply: the loop sees an interrupted
+/// send, as if the request had been taken off the queue, and sends it again.
+#[cfg(feature = "change-probe")]
+static HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the hook (None for none): a probe forks, or loses a reply, in the
+/// middle of an operation with it.
+#[cfg(feature = "change-probe")]
+pub fn probe_hook(hook: Option<fn(Probe) -> bool>) {
+    HOOK.store(
+        hook.map_or(0, |hook| hook as usize),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+/// The reply of the request stands as it came, or is lost.
+#[cfg(feature = "change-probe")]
+fn probe<T>(kind: Probe, reply: Result<T, Status>) -> Result<T, Status> {
+    let hook = HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if hook == 0 {
+        return reply;
+    }
+    // SAFETY: only `probe_hook` stores a value, a `fn(Probe) -> bool`.
+    let hook: fn(Probe) -> bool = unsafe { core::mem::transmute::<usize, fn(Probe) -> bool>(hook) };
+    if hook(kind) {
+        return Err(Status::Kernel(rt::abi::Error::Interrupted));
+    }
+    reply
+}
+
+#[cfg(not(feature = "change-probe"))]
+#[inline(always)]
+fn probe<T>(_: Probe, reply: Result<T, Status>) -> Result<T, Status> {
+    reply
+}
+
 /// The requests of one operation, sent to the session of the process.
 struct Live {
     files: ManuallyDrop<Files>,
@@ -103,17 +148,20 @@ impl Wire for Live {
         crate::shared::with_files(|files| Ok(files.change_is_live(claim))).unwrap_or(false)
     }
     fn start(&mut self, start: &ChangeStart<'_>) -> Result<ChangePhase, Status> {
-        self.files.change_start_once(start)
+        probe(Probe::Start, self.files.change_start_once(start))
     }
     fn second(&mut self, key: OpenKey, base: Base, bytes: &[u8]) -> Result<(), Status> {
-        self.files.change_second_once(key, base, bytes)
+        probe(
+            Probe::Second,
+            self.files.change_second_once(key, base, bytes),
+        )
     }
     fn step(
         &mut self,
         key: OpenKey,
         out: &mut [u8; RESULT_MAX],
     ) -> Result<Option<ChangeDone>, Status> {
-        self.files.change_step_once(key, out)
+        probe(Probe::Step, self.files.change_step_once(key, out))
     }
     fn release(&mut self, key: OpenKey) -> Result<(), Status> {
         self.files.change_release_once(key)

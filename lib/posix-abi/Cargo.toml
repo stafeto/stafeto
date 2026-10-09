@@ -22,6 +22,9 @@ thread-probe = []
 # Counter and kernel-call marks along the path of pthread_kill, printed as
 # `MARKS` lines (`cargo xtask rtbench --short --icount --marks`).
 rtbench-marks = ["rt/count-calls"]
+# A hook of the probes at each Step of a Change job (`change::probe_hook`):
+# the probe forks in the middle of an operation (tests/posix-procs).
+change-probe = []
 
 [dependencies]
 posix-types = { path = "../posix-types" }

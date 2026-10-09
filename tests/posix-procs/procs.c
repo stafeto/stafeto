@@ -771,8 +771,19 @@ static int exec_spawning(void) {
 
 #if CHANGE_STEPS
 extern int files_change_stages(void);
-extern int files_names_stages(void);
+#endif
+#if NAMES_PROBE
 extern int files_names_pipe(void);
+extern int files_names_fork_in_flight(void);
+
+/* The role: a child of the loader, which can fork. */
+static int names_role(void) {
+    int pipes = files_names_pipe();
+    if (pipes) { printf("posix-procs: names on a pipe gave %d\n", pipes); return 2; }
+    int forks = files_names_fork_in_flight();
+    if (forks) { printf("posix-procs: fork in the middle of a rename gave %d\n", forks); return 3; }
+    return 0;
+}
 #endif
 
 static int steps_spawn(pid_t *pid, const char *role, const char *index) {
@@ -1021,16 +1032,6 @@ static int steps_run(void) {
     int change = files_change_stages();
     if (change) {
         printf("posix-procs: steps: Change stages failed %d\n", change);
-        failed++;
-    }
-    int names = files_names_stages();
-    if (names) {
-        printf("posix-procs: steps: names stages failed %d\n", names);
-        failed++;
-    }
-    int pipes = files_names_pipe();
-    if (pipes) {
-        printf("posix-procs: steps: names on a pipe failed %d\n", pipes);
         failed++;
     }
 #endif
@@ -1876,6 +1877,9 @@ static int role(const char *name) {
     if (strcmp(name, "steps") == 0) return steps_run();
     if (strcmp(name, "branch") == 0) return steps_branch();
     if (strcmp(name, "armed") == 0) return steps_armed();
+#if NAMES_PROBE
+    if (strcmp(name, "names") == 0) return names_role();
+#endif
     if (strcmp(name, "stepfork") == 0) return steps_fork();
     if (strcmp(name, "steppipes") == 0) return steps_pipes();
     if (strcmp(name, "child") == 0) {
@@ -3815,6 +3819,18 @@ __attribute__((noinline)) static int native_scopes_supervisor(void) {
 }
 #endif
 
+#if NAMES_PROBE
+/* The functions on names through the bridges of the layer, on a pipe, and a
+ * fork in a handler in the middle of a long rename. */
+static void names(void) {
+    pid_t child = -1;
+    expect("spawn of the names role", spawn(&child, "names", NULL, NULL), 0);
+    if (child > 0) reap("the names role", child, 0, 0);
+    if (!failures) printf("posix-procs: names ok\n");
+}
+
+#endif
+
 int main(int argc, char **argv) {
 #if NATIVE_SCOPES_LAUNCHER
     return native_scopes_supervisor();
@@ -3875,6 +3891,10 @@ int main(int argc, char **argv) {
     null_device();
     printf("posix-procs: stage wave\n");
     wave();
+#if NAMES_PROBE
+    printf("posix-procs: stage names\n");
+    names();
+#endif
     if (failures != 0) return 1;
     printf("posix-procs: ok\n");
     /* Stage 10: this process is a record of init's table, whose end line
