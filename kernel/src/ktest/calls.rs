@@ -402,6 +402,12 @@ fn self_thread_cases(c: &Caller, made: &Made) -> Result<(), &'static str> {
     let second = made.created(c, n, &[0, abi::INFO_THREAD_SELF, 0])?;
     check(first != second, "SELF reused a live numeric handle")?;
     c.succeeds(n, &[first.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
+    // The reserved register of CURRENT is refused on a handle that fits.
+    c.fails(
+        n,
+        &[first.0, abi::INFO_THREAD_CURRENT, 1],
+        Error::InvalidArgs,
+    )?;
     c.succeeds(n, &[second.0, abi::INFO_THREAD_CURRENT, 0], &[1])?;
     c.fails(
         Call::HandleDuplicate.number(),
@@ -468,6 +474,79 @@ fn self_thread_cases(c: &Caller, made: &Made) -> Result<(), &'static str> {
         process::handle_counts(c.process).0 == 0,
         "SELF handles remained live",
     )
+}
+
+/// The register x2 of object_info is reserved for the kinds that make no use
+/// of it (spec 11): with a handle of the kind's own type and x2 other than 0
+/// the call is INVALID_ARGS, before the handle is looked at (a bad handle
+/// gives INVALID_ARGS too), and with x2 = 0 the same handle is answered.
+/// KERNEL_STATS takes 0 and 1, so 2 is refused. One case for each kind, so
+/// that a kind which loses its check does not pass unseen.
+pub fn object_info_refuses_a_reserved_x2_for_every_kind(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let made = Made::new();
+        let checked = reserved_x2_cases(c, &made);
+        made.close_all(c);
+        checked
+    })?;
+    cleanup::drain();
+    with_binding(LINE, false, |c, _, binding| {
+        reserved_x2_case(c, binding, INFO_IRQ, "IRQ", 1)
+    })
+}
+
+/// The call on `handle` with `kind` answers x2 = 0, and refuses `refused`
+/// and the largest value in x2, on `handle` and on a bad handle alike.
+fn reserved_x2_case(
+    c: &Caller,
+    handle: Handle,
+    kind: u64,
+    name: &str,
+    refused: u64,
+) -> Result<(), &'static str> {
+    let n = Call::ObjectInfo.number();
+    if c.call(n, &[handle.0, kind, 0])[0] != 0 {
+        kprintln!("object_info {name}: x2 = 0 was refused on a handle of the kind");
+        return Err("object_info refused x2 = 0");
+    }
+    for x2 in [refused, u64::MAX] {
+        if c.fails(n, &[handle.0, kind, x2], Error::InvalidArgs)
+            .is_err()
+        {
+            kprintln!("object_info {name}: x2 = {x2:#x} was not refused");
+            return Err("object_info took a reserved x2");
+        }
+        if c.fails(n, &[0, kind, x2], Error::InvalidArgs).is_err() {
+            kprintln!("object_info {name}: x2 = {x2:#x} was not checked before the handle");
+            return Err("object_info looked at the handle before the reserved x2");
+        }
+    }
+    Ok(())
+}
+
+fn reserved_x2_cases(c: &Caller, made: &Made) -> Result<(), &'static str> {
+    let n = Call::ObjectInfo.number();
+    let process = made.insert(c, Object::Process(c.process), Rights::NONE)?;
+    let stats = made.insert(c, Object::Resource, Rights::KSTATS)?;
+    let thread = made.created(c, n, &[0, abi::INFO_THREAD_SELF, 0])?;
+    let (memory, _) = make_memory(c, 1)?;
+    let memory = made.keep(memory)?;
+    let channel = made.created(c, Call::CreateChannel.number(), &[10])?;
+    for (kind, name, handle) in [
+        (abi::INFO_PROCESS_STATE, "PROCESS_STATE", process),
+        (INFO_PROCESS_MEMORY, "PROCESS_MEMORY", process),
+        (INFO_PROCESS_HANDLES, "PROCESS_HANDLES", process),
+        (abi::INFO_MEMORY, "MEMORY", memory),
+        (abi::INFO_THREAD_STATE, "THREAD_STATE", thread),
+        (abi::INFO_THREAD_CURRENT, "THREAD_CURRENT", thread),
+        (abi::INFO_CHANNEL, "CHANNEL", channel),
+        (INFO_KERNEL_STATS, "KERNEL_STATS", stats),
+    ] {
+        // KERNEL_STATS takes 0 and 1.
+        let refused = if kind == INFO_KERNEL_STATS { 2 } else { 1 };
+        reserved_x2_case(c, handle, kind, name, refused)?;
+    }
+    Ok(())
 }
 
 /// object_info LABEL (spec 5.3, 11): a labelled copy's label goes to a

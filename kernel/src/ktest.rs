@@ -233,6 +233,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_info_self_thread_has_exact_ownership,
     ),
     (
+        "object_info_refuses_a_reserved_x2_for_every_kind",
+        calls::object_info_refuses_a_reserved_x2_for_every_kind,
+    ),
+    (
         "object_info_label_answers_the_channels_owner",
         calls::object_info_label_answers_the_channels_owner,
     ),
