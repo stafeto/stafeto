@@ -118,11 +118,22 @@ mod tests {
         }
         /// The hook of a long jump to `target`.
         fn jump(&mut self, target: u64) {
-            if jump_returns(self.outer, self.owed, target) {
+            if self.jump_clear(target) {
+                self.jump_settle();
+            }
+        }
+        /// First step of the hook: clear `outer`.
+        fn jump_clear(&mut self, target: u64) -> bool {
+            let clears = jump_clears(self.outer, target);
+            self.outer = after_jump(self.outer, target);
+            clears
+        }
+        /// Second step: take `owed`, and give the request back when it was set.
+        fn jump_settle(&mut self) {
+            if self.owed != 0 {
                 self.owed = 0;
                 self.returned += 1;
             }
-            self.outer = after_jump(self.outer, target);
         }
         /// An entry whose frame is `frame`; `inside` runs during the
         /// resident call and may enter again or jump.
@@ -231,6 +242,32 @@ mod tests {
         // handler of the program runs once.
         t.enter(0x9000, |_| false);
         assert_eq!((t.own_calls, t.owed, t.returned), (1, 0, 1));
+    }
+
+    #[test]
+    fn a_nested_entry_between_the_two_steps_of_a_jump_pays_the_debt_itself() {
+        let mut t = Thread::new(1, 2);
+        t.enter(0x9000, |t| {
+            assert!(t.jump_clear(0xa000));
+            // An entry that nests after `outer` is clear calls the handler
+            // of the program, so nothing is owed or given back.
+            t.enter(0x8000, |_| false);
+            t.jump_settle();
+            true
+        });
+        assert_eq!((t.owed, t.own_calls, t.returned), (0, 1, 0));
+    }
+
+    #[test]
+    fn a_nested_entry_before_the_jump_leaves_the_debt_to_be_given_back() {
+        let mut t = Thread::new(1, 2);
+        t.enter(0x9000, |t| {
+            t.enter(0x8000, |_| false);
+            assert!(t.jump_clear(0xa000));
+            t.jump_settle();
+            true
+        });
+        assert_eq!((t.owed, t.own_calls, t.returned), (0, 0, 1));
     }
 
     #[test]

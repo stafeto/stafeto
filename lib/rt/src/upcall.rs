@@ -11,6 +11,7 @@
 use crate::handle::{Handle, Thread};
 use crate::{msgbuf, sys};
 use abi::{Call, Error, UpcallControl, msgbuf::ENTRIES, msgbuf::ENTRIES_SIZE};
+use core::sync::atomic::compiler_fence;
 use core::sync::atomic::{AtomicU64, Ordering};
 use entries::{
     ENTRY_FLAGS, ENTRY_HOOK, ENTRY_OUTER, ENTRY_OWED, ENTRY_OWN, ENTRY_RESIDENT, ENTRY_THREAD,
@@ -187,9 +188,13 @@ pub unsafe fn bind_resident(
     Ok(was_empty)
 }
 
-/// Remove the resident handler; the rules of `unbind` apply.
+/// Remove the resident handler; the rules of `unbind` apply. The word of the
+/// thread handle is cleared with it: the layer may close the handle now, and
+/// a jump out of a resident call that is still live (`abandon`) then stops
+/// loudly where it owes a request, which a stale number would not.
 pub fn unbind_resident() -> Result<(), Error> {
     word(ENTRY_RESIDENT).store(0, Ordering::Release);
+    word(ENTRY_THREAD).store(0, Ordering::Relaxed);
     mask_if_empty()
 }
 
@@ -222,19 +227,27 @@ pub unsafe fn enable() -> Result<bool, Error> {
 /// The jump to `target_sp` follows at once.
 pub unsafe fn abandon(target_sp: usize) {
     let outer = word(ENTRY_OUTER);
-    let (live, owed) = (
-        outer.load(Ordering::Relaxed),
-        word(ENTRY_OWED).load(Ordering::Relaxed),
-    );
     let target = target_sp as u64;
-    let returns = entries::jump_returns(live, owed, target);
-    outer.store(entries::after_jump(live, target), Ordering::Relaxed);
-    if returns {
-        word(ENTRY_OWED).store(0, Ordering::Relaxed);
+    if !entries::jump_clears(outer.load(Ordering::Relaxed), target) {
+        return;
+    }
+    // The order is the one of the hook in relibc's `longjmp`: clear `outer`
+    // first, then take `owed`. An entry that nests before the clear leaves
+    // its debt for this read; one that nests after it finds `outer` clear
+    // and pays the debt itself. Reading `owed` first would lose a debt left
+    // in between. The fence keeps the compiler from moving the two accesses
+    // past each other; the handler runs on this thread.
+    outer.store(0, Ordering::Relaxed);
+    compiler_fence(Ordering::SeqCst);
+    if word(ENTRY_OWED).swap(0, Ordering::Relaxed) != 0 {
         let thread =
             Handle::<Thread>::borrowed(abi::Handle(word(ENTRY_THREAD).load(Ordering::Relaxed)));
-        // A refused request leaves nothing to repair: the thread ends.
-        let _ = sys::thread_upcall_request(&thread);
+        // The thread is running and its entry is bound for its life, so only
+        // the handle can make the kernel refuse: the program closed the
+        // handle of the thread that the layer gave `bind_resident`. The
+        // request would be lost, so the refusal stops the thread loudly.
+        sys::thread_upcall_request(&thread)
+            .expect("the handle of the thread, given to bind_resident, takes the request back");
     }
 }
 
