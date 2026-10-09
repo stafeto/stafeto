@@ -960,3 +960,197 @@ pub extern "C" fn files_gone_places() -> i32 {
         Err(code) => code,
     }
 }
+
+// The worst states of the steps of the service, built on purpose (the steps
+// run reads the longest step of each kind from the service itself): a Start
+// with the share of the root in the table taken, with two paths of 511 bytes and a descriptor for a
+// base, and the restart that follows a stale proof at the commit of a rename
+// of a directory over an empty one, after the prepayment.
+
+/// The cloned sessions that hold jobs, with how many each holds.
+struct HeldSessions(core::cell::UnsafeCell<[Option<(Files, u32)>; 7]>);
+// SAFETY: the probe uses it from its main thread alone.
+unsafe impl Sync for HeldSessions {}
+static HELD: HeldSessions = HeldSessions(core::cell::UnsafeCell::new([const { None }; 7]));
+
+/// Starts `count` jobs (an access of `/`, never stepped) in cloned sessions,
+/// sixteen to a session, and keeps them: the places of the table and of the
+/// root stay taken until `files_bounds_release`. The count of jobs, or a
+/// negative number.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_bounds_hold(count: i32) -> i32 {
+    fn run(count: i32) -> Result<(), i32> {
+        let raw =
+            posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())).map_err(|_| -1)?;
+        let original =
+            core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+        // SAFETY: the main thread alone touches the sessions.
+        let held = unsafe { &mut *HELD.0.get() };
+        let mut left = count as u32;
+        for entry in held.iter_mut() {
+            if left == 0 {
+                break;
+            }
+            let files = super::open_stages::clone_bound(&original, &[]).map_err(|_| -2)?;
+            let here = left.min(16);
+            for slot in 0..here {
+                if let Err(status) = start(&files, &access(slot, 1, b"/", 0)) {
+                    rt::println!("posix-procs: bounds: the start of a held job gave {status:?}");
+                    return Err(-3);
+                }
+            }
+            *entry = Some((files, here));
+            left -= here;
+        }
+        Ok(())
+    }
+    match run(count) {
+        Ok(()) => count,
+        Err(code) => code,
+    }
+}
+
+/// Gives the held jobs back and closes the sessions.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_bounds_release() -> i32 {
+    // SAFETY: the main thread alone touches the sessions.
+    let held = unsafe { &mut *HELD.0.get() };
+    let mut failed = 0;
+    for entry in held.iter_mut() {
+        if let Some((files, count)) = entry.take() {
+            for slot in 0..count {
+                if release(&files, key(slot, 1)).is_err() {
+                    failed += 1;
+                }
+            }
+        }
+    }
+    failed
+}
+
+/// A name of `length` bytes, then a slash and one more of the same, of one
+/// letter: a relative path of 2 * length + 1 bytes.
+fn long_path(letter: u8, length: usize) -> ([u8; 511], usize) {
+    let mut bytes = [letter; 511];
+    bytes[length] = b'/';
+    (bytes, 2 * length + 1)
+}
+
+/// The Start of a rename with two relative paths of 511 bytes from a
+/// directory descriptor, with every place of the share of the root taken but
+/// one (the caller holds 95 jobs): the job ends with ENOENT after its steps.
+/// 0 when it did.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_bounds_start() -> i32 {
+    fn work() -> Result<(), i32> {
+        let raw =
+            posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())).map_err(|_| 90)?;
+        let original =
+            core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+        let files = super::open_stages::clone_bound(&original, &[]).map_err(|_| 91)?;
+        let dir_flags = proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY;
+        let held = open(&files, 40, b"/tmp", dir_flags).map_err(|_| 92)?;
+        let (first, first_length) = long_path(b'a', 255);
+        let (second_path, second_length) = long_path(b'b', 255);
+        let mut job = req(2, 41, ChangeOp::Rename, &first[..first_length]);
+        job.base = Base::Fd {
+            fd: held.fd,
+            generation: held.generation,
+        };
+        let done = run(
+            &files,
+            &job,
+            Some((job.base, &second_path[..second_length])),
+        )
+        .map_err(|_| 93)?;
+        if done.result != proto_fs::NO_ENTRY {
+            rt::println!("posix-procs: bounds: the rename of 511 bytes gave {}", done.result);
+            return Err(94);
+        }
+        files.close_exact(held).map_err(|_| 95)?;
+        Ok(())
+    }
+    work().err().unwrap_or(0)
+}
+
+/// The commit of a rename of a directory over an empty one finds the proof
+/// stale: another client takes the empty directory away and makes it again
+/// after the prepayment. The next step restarts the job with the journal at
+/// its heaviest. 0 when the job restarted and ended with success.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_bounds_stale() -> i32 {
+    fn run_all() -> Result<(), i32> {
+        let raw =
+            posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())).map_err(|_| 90)?;
+        let original =
+            core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+        let files = super::open_stages::clone_bound(&original, &[]).map_err(|_| 91)?;
+        for (generation, path) in [
+            &b"/tmp/bs"[..],
+            b"/tmp/bs/a1",
+            b"/tmp/bs/a2",
+            b"/tmp/bs/b1",
+            b"/tmp/bs/b2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            expect(
+                run(&files, &mkdir(0, 50 + generation as u64, path, 0o755), None),
+                0,
+                100,
+            )?;
+        }
+        // A rename to count its steps.
+        let dry = req(1, 51, ChangeOp::Rename, b"/tmp/bs/a1");
+        start(&files, &dry).map_err(|_| 101)?;
+        second(&files, dry.key, Base::Absolute, b"/tmp/bs/a2").map_err(|_| 102)?;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 10_000 {
+                return Err(103);
+            }
+            if step(&files, dry.key, false).map_err(|_| 104)?.is_some() {
+                break;
+            }
+        }
+        release(&files, dry.key).map_err(|_| 105)?;
+        // The same, stopped before the commit.
+        let job = req(2, 52, ChangeOp::Rename, b"/tmp/bs/b1");
+        start(&files, &job).map_err(|_| 106)?;
+        second(&files, job.key, Base::Absolute, b"/tmp/bs/b2").map_err(|_| 107)?;
+        for _ in 1..steps {
+            if step(&files, job.key, false).map_err(|_| 108)?.is_some() {
+                return Err(109);
+            }
+        }
+        // The empty directory goes and comes back.
+        expect(run(&files, &rmdir(3, 53, b"/tmp/bs/b2"), None), 0, 110)?;
+        expect(run(&files, &mkdir(3, 54, b"/tmp/bs/b2", 0o755), None), 0, 111)?;
+        let mut last = None;
+        for _ in 0..10_000 {
+            if let Some(done) = step(&files, job.key, false).map_err(|_| 112)? {
+                last = Some(done);
+                break;
+            }
+        }
+        let done = last.ok_or(113)?;
+        release(&files, job.key).map_err(|_| 114)?;
+        if done.result != 0 || done.restarts == 0 {
+            rt::println!(
+                "posix-procs: bounds: the rename gave {} with {} restarts",
+                done.result,
+                done.restarts
+            );
+            return Err(115);
+        }
+        for (generation, path) in [(55, &b"/tmp/bs/a2"[..]), (56, b"/tmp/bs/b2")] {
+            expect(run(&files, &rmdir(3, generation, path), None), 0, 116)?;
+        }
+        // The directories a1 and b1 went over a2 and b2; what is left goes.
+        expect(run(&files, &rmdir(3, 57, b"/tmp/bs"), None), 0, 117)?;
+        Ok(())
+    }
+    run_all().err().unwrap_or(0)
+}

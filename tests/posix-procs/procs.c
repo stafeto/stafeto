@@ -777,6 +777,10 @@ extern int files_change_stages(void);
 extern int files_closed_sessions(int count);
 extern int files_gone_child(int exec);
 extern int files_gone_places(void);
+extern int files_bounds_hold(int count);
+extern int files_bounds_release(void);
+extern int files_bounds_start(void);
+extern int files_bounds_stale(void);
 #endif
 #if NAMES_PROBE
 extern int files_names_pipe(void);
@@ -1101,6 +1105,35 @@ static int names_gone(void) {
 }
 #endif
 
+/* The worst states of the steps of the service, built on purpose. A Start
+ * with the root's share of the table of jobs taken (96 of its 128 places:
+ * 95 held by sessions of this process, and the Start itself; the 32 places
+ * beyond are for other roots, which the steps image has none to fill them),
+ * two paths of 511 bytes and a descriptor for a base; then the restart that
+ * follows a stale proof at the commit of a rename of a directory over an
+ * empty one, after the prepayment. The service prints its longest steps
+ * itself; the run checks them against B. */
+static int names_bounds(void) {
+    int held = files_bounds_hold(95);
+    if (held != 95) {
+        printf("posix-procs: steps: bounds: held %d of 95\n", held);
+        return 5;
+    }
+    int start = files_bounds_start();
+    int released = files_bounds_release();
+    if (start != 0 || released != 0) {
+        printf("posix-procs: steps: bounds: the Start gave %d, the release %d\n", start, released);
+        return 6;
+    }
+    int stale = files_bounds_stale();
+    if (stale != 0) {
+        printf("posix-procs: steps: bounds: the restart after a stale proof gave %d\n", stale);
+        return 7;
+    }
+    printf("posix-procs: names bounds ok\n");
+    return 0;
+}
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
@@ -1119,6 +1152,13 @@ static int steps_run(void) {
     int gone = names_gone();
     if (gone) {
         printf("posix-procs: steps: the names gone probe failed %d\n", gone);
+        return 6;
+    }
+#endif
+#if CHANGE_STEPS
+    int bounds = names_bounds();
+    if (bounds) {
+        printf("posix-procs: steps: the bounds probe failed %d\n", bounds);
         return 6;
     }
 #endif

@@ -34,6 +34,8 @@ extern int files_volley_read_dir_index(const char *path, unsigned index);
 /* The numbers of ChangeOp. */
 #define VZ_OP_UNLINK 1
 #define VZ_OP_RENAME 3
+#define VZ_OP_ACCESS 10
+#define VZ_OP_PATH 12
 
 #define VZ_CHECK(condition)                                                    \
     do {                                                                       \
@@ -292,6 +294,7 @@ static int vz_starvation(void) {
     /* A full table: removing an empty directory looks at every name. */
     vz_mark();
     VZ_CHECK(rmdir(VZ "/e") == 0);
+    unsigned long long quiet_ticks = files_volley_ticks() - vz_ticks0;
     vz_line("rmdir with a full table");
     VZ_CHECK(mkdir(VZ "/e", 0755) == 0);
     files_volley_start();
@@ -314,13 +317,174 @@ static int vz_starvation(void) {
     VZ_CHECK(vz_flood_stop == 1);
     VZ_CHECK(vz_rmdir_result == 0);
     printf("posix-procs: names starvation: rmdir in a table of %d names against a loop of utimensat: "
-           "%u restarts, finished within 10 s: %s, took %llu ticks\n",
-           made + VZ_PAD, files_volley_restarts(VZ_OP_UNLINK), within ? "yes" : "no", vz_rmdir_ticks);
+           "%u restarts, finished within 10 s: %s, took %llu ticks, alone %llu ticks\n",
+           made + VZ_PAD, files_volley_restarts(VZ_OP_UNLINK), within ? "yes" : "no", vz_rmdir_ticks,
+           quiet_ticks);
     for (int i = 0; i < made; i++) {
         char name[40];
         snprintf(name, sizeof name, VZ "/q%d", i);
         VZ_CHECK(unlink(name) == 0);
     }
+    return 0;
+}
+
+/* One long operation against a client that changes the tree in a loop (the
+ * lines G2 to G5 of the plan; the long rmdir of the line G1 is below). The
+ * operation runs alone first, then against the flood; the line says the
+ * restarts the service gave it (the most of its kind), whether it ended
+ * within ten seconds, its result and the ticks of both runs. */
+static volatile int vz_scene_flood_mode;
+static volatile int vz_scene_long_mode;
+static volatile int vz_scene_result = -2;
+static volatile int vz_scene_done;
+static unsigned long long vz_scene_ticks;
+static char vz_scene_moved[700];
+static char vz_scene_deep[600];
+
+static void *vz_scene_flood(void *unused) {
+    struct timespec times[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
+    int flip = 0;
+    while (!vz_flood_stop) {
+        int bad = 0;
+        switch (vz_scene_flood_mode) {
+        case 1: /* a name made and removed in another directory */ {
+            int fd = open(VZ "/fd/x", O_WRONLY | O_CREAT, 0600);
+            if (fd < 0) bad = 1;
+            else {
+                close(fd);
+                if (unlink(VZ "/fd/x") != 0) bad = 1;
+            }
+            break;
+        }
+        case 2: /* the mode of a file in a loop */
+            flip ^= 1;
+            bad = chmod(VZ "/p0", flip ? 0600 : 0644) != 0;
+            break;
+        case 3: /* the name the operation renames over, made and removed in the same directory */ {
+            int fd = open(VZ "/n", O_WRONLY | O_CREAT, 0600);
+            if (fd >= 0) close(fd);
+            unlink(VZ "/n");
+            break;
+        }
+        case 4: /* directories that move */
+            if (rename(VZ "/m1", VZ "/m2") != 0 && rename(VZ "/m2", VZ "/m1") != 0) bad = 1;
+            break;
+        default:
+            bad = utimensat(AT_FDCWD, VZ "/p0", times, 0) != 0;
+        }
+        if (bad) {
+            vz_flood_stop = 2;
+            break;
+        }
+    }
+    return unused;
+}
+
+static int vz_scene_operation(void) {
+    char buffer[700];
+    switch (vz_scene_long_mode) {
+    case 1: return access(VZ "/s31", F_OK);
+    case 2: return rename(VZ "/a", vz_scene_moved);
+    case 3: return rename(VZ "/m", VZ "/n");
+    case 4: return realpath(vz_scene_deep, buffer) == NULL ? -1 : 0;
+    }
+    return -3;
+}
+
+static void *vz_scene_long(void *unused) {
+    unsigned long long begin = files_volley_ticks();
+    vz_scene_result = vz_scene_operation() == 0 ? 0 : errno;
+    vz_scene_ticks = files_volley_ticks() - begin;
+    vz_scene_done = 1;
+    return unused;
+}
+
+/* The operation `long_mode` against the flood `flood_mode`; `op` is the
+ * number of its kind of ChangeOp, `tag` the line of the plan. */
+static int vz_scene(const char *tag, const char *what, int flood_mode, int long_mode, int op) {
+    /* Alone. */
+    vz_scene_long_mode = long_mode;
+    unsigned long long alone_begin = files_volley_ticks();
+    int alone = vz_scene_operation();
+    unsigned long long alone_ticks = files_volley_ticks() - alone_begin;
+    VZ_CHECK(alone == 0);
+    /* Back to the start when the operation moved something. */
+    if (long_mode == 2) VZ_CHECK(rename(vz_scene_moved, VZ "/a") == 0);
+    if (long_mode == 3) {
+        VZ_CHECK(rename(VZ "/n", VZ "/m") == 0);
+    }
+    files_volley_start();
+    vz_flood_stop = 0;
+    vz_scene_flood_mode = flood_mode;
+    vz_scene_done = 0;
+    vz_scene_result = -2;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 65536);
+    pthread_t flood, runner;
+    unsigned long long begin = vz_now_ns();
+    VZ_CHECK(pthread_create(&flood, &attr, vz_scene_flood, NULL) == 0);
+    /* The flood is in its loop before the operation starts. */
+    pause_ms(20);
+    VZ_CHECK(pthread_create(&runner, &attr, vz_scene_long, NULL) == 0);
+    while (!vz_scene_done && vz_now_ns() - begin < 10000000000ull) {
+        struct timespec delay = {0, 20000000};
+        nanosleep(&delay, NULL);
+    }
+    int within = vz_scene_done;
+    vz_flood_stop = vz_flood_stop ? vz_flood_stop : 1;
+    VZ_CHECK(pthread_join(flood, NULL) == 0);
+    VZ_CHECK(pthread_join(runner, NULL) == 0);
+    VZ_CHECK(vz_flood_stop == 1);
+    printf("posix-procs: names interference %s: %s: %u restarts, finished within 10 s: %s, "
+           "result %d, took %llu ticks, alone %llu ticks\n",
+           tag, what, files_volley_restarts(op), within ? "yes" : "no", vz_scene_result,
+           vz_scene_ticks, alone_ticks);
+    files_volley_stop();
+    /* Back where it was, when the operation moved something. */
+    if (long_mode == 2 && access(vz_scene_moved, F_OK) == 0) VZ_CHECK(rename(vz_scene_moved, VZ "/a") == 0);
+    return 0;
+}
+
+/* G2 to G5. */
+static int vz_scenes(void) {
+    /* G2: a path of 32 links against a name made and removed in another directory. */
+    VZ_CHECK(mkdir(VZ "/fd", 0755) == 0);
+    VZ_CHECK(symlink("p0", VZ "/s0") == 0);
+    for (int i = 1; i <= 31; i++) {
+        char target[16], name[40];
+        snprintf(target, sizeof target, "s%d", i - 1);
+        snprintf(name, sizeof name, VZ "/s%d", i);
+        VZ_CHECK(symlink(target, name) == 0);
+    }
+    VZ_CHECK(vz_scene("G2", "a path of 32 links against a name made and removed in another directory", 1, 1,
+                      VZ_OP_ACCESS) == 0);
+    for (int i = 31; i >= 0; i--) {
+        char name[40];
+        snprintf(name, sizeof name, VZ "/s%d", i);
+        VZ_CHECK(unlink(name) == 0);
+    }
+    VZ_CHECK(rmdir(VZ "/fd") == 0);
+    /* G3: the rename of a directory under a chain 64 deep against the mode of a file. */
+    VZ_CHECK(vz_deep_build() == 0);
+    vz_deep(vz_scene_deep, VZ_DEPTH);
+    snprintf(vz_scene_moved, sizeof vz_scene_moved, "%s/a", vz_scene_deep);
+    VZ_CHECK(mkdir(VZ "/a", 0755) == 0);
+    VZ_CHECK(vz_scene("G3", "the rename of a directory under a chain 64 deep against chmod of a file", 2, 2,
+                      VZ_OP_RENAME) == 0);
+    VZ_CHECK(rmdir(VZ "/a") == 0);
+    /* G4: a rename against a client that makes and removes the name it renames over, in the same directory. */
+    VZ_CHECK(vz_create(VZ "/m") == 0);
+    VZ_CHECK(vz_scene("G4", "a rename over a name that is made and removed in the same directory", 3, 3,
+                      VZ_OP_RENAME) == 0);
+    unlink(VZ "/m");
+    unlink(VZ "/n");
+    /* G5: the path of a directory 64 deep against directories that move. */
+    VZ_CHECK(mkdir(VZ "/m1", 0755) == 0);
+    VZ_CHECK(vz_scene("G5", "the canonical path of a directory 64 deep against directories that move", 4, 4,
+                      VZ_OP_PATH) == 0);
+    VZ_CHECK(rmdir(VZ "/m1") == 0 || rmdir(VZ "/m2") == 0);
+    VZ_CHECK(vz_deep_remove() == 0);
     return 0;
 }
 
@@ -537,6 +701,7 @@ static int names_volley(void) {
     if (!failed) failed = vz_quiet();
     if (!failed) failed = vz_listing();
     if (!failed) failed = vz_starvation();
+    if (!failed) failed = vz_scenes();
     if (!failed) failed = vz_volley(0);
     if (!failed) failed = vz_volley(1);
     files_volley_stop();
