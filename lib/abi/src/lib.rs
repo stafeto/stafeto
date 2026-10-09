@@ -283,7 +283,11 @@ pub enum Call {
     /// for the reply to an accepted request is not taken back, and the
     /// reply comes once (spec 6.1).
     ThreadInterrupt = 30,
-    /// Register the current thread's upcall entry (zero disables it).
+    /// Register the current thread's upcall entry (zero disables it). The
+    /// entry starts masked with no pending request. BadState inside a
+    /// handler and, for the rest of the thread, after a handler was left by
+    /// a long jump (the depth stays above zero). Allowed under a deferral,
+    /// whose count it keeps.
     ThreadUpcallBind = 31,
     /// Current upcall control: x0 is an `UpcallControl`. Deferral preserves
     /// the mask and interrupts enabled IPC waits while delaying dispatcher
@@ -499,7 +503,7 @@ impl ObjectKind {
 ///
 /// | Bytes | Name | Owner |
 /// |---|---|---|
-/// | 0-1023 | `DATA` | the message (`COPIED` and up copied by the kernel) |
+/// | 0-1023 | `DATA` | the message (`COPIED` and up copied by the kernel); the kernel also writes the records of `object_info` `LOG` (up to 960 bytes) and `KERNEL_STATS` with x2 = 1 (296 bytes) here, from offset 0 |
 /// | 1024-1055 | `HANDLES` | the handle values of a message |
 /// | 1056-1087 | `INFO` | an info word for each handle that came |
 /// | 1088-1119 | | unused |
