@@ -301,17 +301,15 @@ pub(crate) fn take_place<R>(
     enum Step<R> {
         Taken(R),
         Wait(usize, u32),
-        /// Wait on the word as it stands now.
-        WaitNow(usize),
     }
     loop {
         collect(Some(owner), here, None, true);
         let step = crate::shared::with_files(|files| match files.job_place(owner) {
-            // A place the table has but the begin cannot take (no slot of the
-            // holds) is a full table: the word moves when a slot goes.
+            // An Open may still find every I/O hold occupied. Waiting could
+            // depend on this caller completing another operation.
             JobPlace::Free => match begin(files) {
                 Ok(taken) => Ok(Step::Taken(taken)),
-                Err(FsError::TooManyOpenFiles) => Ok(Step::WaitNow(files.jobs_wait_address())),
+                Err(FsError::TooManyOpenFiles) => Err(EAGAIN),
                 Err(error) => Err(crate::error(error)),
             },
             JobPlace::Full { own: true, .. } => Err(EAGAIN),
@@ -320,11 +318,6 @@ pub(crate) fn take_place<R>(
         match step {
             Step::Taken(taken) => return Ok(taken),
             Step::Wait(address, sequence) => wait_on(address, sequence),
-            Step::WaitNow(address) => {
-                // SAFETY: the table lives in the pinned state of the layer.
-                let word = unsafe { &*(address as *const AtomicU32) };
-                wait_on(address, word.load(core::sync::atomic::Ordering::Acquire));
-            }
         }
     }
 }

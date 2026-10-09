@@ -520,8 +520,8 @@ mod tests {
         type Small = Table<u32, 4, [u64; 3]>;
         assert_eq!(size_of::<IoRecord<u32, [u64; 3]>>(), 40);
         assert_eq!(size_of::<DisposalSnapshot<u32, [u64; 3]>>(), 32);
-        assert_eq!(size_of::<Table<u32, 32, [u64; 3]>>(), 3856);
-        assert_eq!(size_of::<Table<u32, 32, [u64; 3], [u8; 1012]>>(), 35600);
+        assert_eq!(size_of::<Table<u32, 32, [u64; 3]>>(), 5392);
+        assert_eq!(size_of::<Table<u32, 32, [u64; 3], [u8; 1012]>>(), 53008);
         let mut place = MaybeUninit::<Small>::uninit();
         // SAFETY: aligned uninitialized complete allocation is exclusively owned.
         unsafe {
