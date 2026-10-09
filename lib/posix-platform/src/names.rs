@@ -1,13 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The names of relibc's stafeto platform: unlink, mkdir and access as the
+//! The names and metadata of relibc's stafeto platform: unlink, mkdir,
+//! rename, link, symlink, readlink, chmod, chown, access and utimens as the
 //! `*at` forms of Linux AArch64 (the values of AT_FDCWD and of the flags are
 //! Linux's, as relibc's headers have them). Each returns 0 or a value, or the
-//! negated errno.
+//! negated errno. `fchmod`, `fchown` and `futimens` are the `*at` calls with an
+//! empty path and AT_EMPTY_PATH.
 
 use super::{call, files, value};
 use core::ffi::{c_char, c_int};
+use posix_abi::constants::EFAULT;
+use posix_abi::names::Time;
+
+/// relibc's struct timespec on AArch64 Linux.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LinuxTimespec {
+    seconds: i64,
+    nanos: i64,
+}
+const _: () = {
+    assert!(core::mem::size_of::<LinuxTimespec>() == 16);
+};
 
 /// The path of a C string, or the errno that is its answer.
 macro_rules! path {
@@ -63,5 +78,144 @@ pub unsafe extern "C" fn stafeto_faccessat(
     let path = path!(path);
     unit(call(|| {
         posix_abi::names::faccessat(dirfd, path, mode, flags)
+    }))
+}
+
+/// rename and renameat.
+///
+/// # Safety
+/// `old` and `new` are live C strings or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_renameat(
+    old_dirfd: c_int,
+    old: *const c_char,
+    new_dirfd: c_int,
+    new: *const c_char,
+) -> c_int {
+    let old = path!(old);
+    let new = path!(new);
+    unit(call(|| {
+        posix_abi::names::renameat(old_dirfd, old, new_dirfd, new)
+    }))
+}
+
+/// link and linkat (`flags` 0 or AT_SYMLINK_FOLLOW).
+///
+/// # Safety
+/// `old` and `new` are live C strings or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_linkat(
+    old_dirfd: c_int,
+    old: *const c_char,
+    new_dirfd: c_int,
+    new: *const c_char,
+    flags: c_int,
+) -> c_int {
+    let old = path!(old);
+    let new = path!(new);
+    unit(call(|| {
+        posix_abi::names::linkat(old_dirfd, old, new_dirfd, new, flags)
+    }))
+}
+
+/// symlink and symlinkat.
+///
+/// # Safety
+/// `target` and `linkpath` are live C strings or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_symlinkat(
+    target: *const c_char,
+    new_dirfd: c_int,
+    linkpath: *const c_char,
+) -> c_int {
+    let target = path!(target);
+    let linkpath = path!(linkpath);
+    unit(call(|| {
+        posix_abi::names::symlinkat(target, new_dirfd, linkpath)
+    }))
+}
+
+/// readlink and readlinkat: the bytes of the link, no NUL.
+///
+/// # Safety
+/// `path` is a live C string or null; `buf` is writable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_readlinkat(
+    dirfd: c_int,
+    path: *const c_char,
+    buf: *mut u8,
+    len: usize,
+) -> isize {
+    if buf.is_null() {
+        return -(EFAULT as isize);
+    }
+    // SAFETY: the caller's promise.
+    let path = match unsafe { posix_abi::path(path) } {
+        Ok(path) => path,
+        Err(errno) => return -(errno as isize),
+    };
+    // SAFETY: the caller's promise.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    value(call(|| posix_abi::names::readlinkat(dirfd, path, out)).map(|n| n as i64)) as isize
+}
+
+/// chmod, fchmod and fchmodat (`flags`: AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH).
+///
+/// # Safety
+/// `path` is a live C string or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fchmodat(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: u32,
+    flags: c_int,
+) -> c_int {
+    let path = path!(path);
+    unit(call(|| {
+        posix_abi::names::fchmodat(dirfd, path, mode, flags)
+    }))
+}
+
+/// chown, lchown, fchown and fchownat (an ID of -1 keeps the field).
+///
+/// # Safety
+/// `path` is a live C string or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fchownat(
+    dirfd: c_int,
+    path: *const c_char,
+    uid: u32,
+    gid: u32,
+    flags: c_int,
+) -> c_int {
+    let path = path!(path);
+    unit(call(|| {
+        posix_abi::names::fchownat(dirfd, path, uid, gid, flags)
+    }))
+}
+
+/// utimensat and futimens: `times` points at two timespecs, null for now.
+///
+/// # Safety
+/// `path` is a live C string or null; `times` is null or readable for two
+/// timespecs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_utimensat(
+    dirfd: c_int,
+    path: *const c_char,
+    times: *const LinuxTimespec,
+    flags: c_int,
+) -> c_int {
+    let path = path!(path);
+    let times = (!times.is_null()).then(|| {
+        // SAFETY: the caller's promise.
+        let pair = unsafe { core::slice::from_raw_parts(times, 2) };
+        [pair[0], pair[1]].map(|time| Time {
+            seconds: time.seconds,
+            nanos: time.nanos,
+        })
+    });
+    unit(call(|| {
+        posix_abi::names::utimensat(dirfd, path, times, flags)
     }))
 }

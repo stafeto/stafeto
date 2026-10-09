@@ -771,6 +771,8 @@ static int exec_spawning(void) {
 
 #if CHANGE_STEPS
 extern int files_change_stages(void);
+extern int files_names_stages(void);
+extern int files_names_pipe(void);
 #endif
 
 static int steps_spawn(pid_t *pid, const char *role, const char *index) {
@@ -1019,6 +1021,16 @@ static int steps_run(void) {
     int change = files_change_stages();
     if (change) {
         printf("posix-procs: steps: Change stages failed %d\n", change);
+        failed++;
+    }
+    int names = files_names_stages();
+    if (names) {
+        printf("posix-procs: steps: names stages failed %d\n", names);
+        failed++;
+    }
+    int pipes = files_names_pipe();
+    if (pipes) {
+        printf("posix-procs: steps: names on a pipe failed %d\n", pipes);
         failed++;
     }
 #endif

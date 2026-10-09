@@ -15,10 +15,49 @@ unsafe extern "C" {
     fn stafeto_faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flags: c_int) -> c_int;
     fn stafeto_openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: u32) -> c_int;
     fn stafeto_close(fd: c_int) -> c_int;
+    fn stafeto_renameat(
+        old_dirfd: c_int,
+        old: *const c_char,
+        new_dirfd: c_int,
+        new: *const c_char,
+    ) -> c_int;
+    fn stafeto_linkat(
+        old_dirfd: c_int,
+        old: *const c_char,
+        new_dirfd: c_int,
+        new: *const c_char,
+        flags: c_int,
+    ) -> c_int;
+    fn stafeto_symlinkat(target: *const c_char, dirfd: c_int, linkpath: *const c_char) -> c_int;
+    fn stafeto_readlinkat(dirfd: c_int, path: *const c_char, buf: *mut u8, len: usize) -> isize;
+    fn stafeto_fchmodat(dirfd: c_int, path: *const c_char, mode: u32, flags: c_int) -> c_int;
+    fn stafeto_fchownat(
+        dirfd: c_int,
+        path: *const c_char,
+        uid: u32,
+        gid: u32,
+        flags: c_int,
+    ) -> c_int;
+    fn stafeto_utimensat(
+        dirfd: c_int,
+        path: *const c_char,
+        times: *const [i64; 4],
+        flags: c_int,
+    ) -> c_int;
+    fn stafeto_pipe2(fds: *mut c_int, flags: c_int) -> c_int;
 }
 
 const AT_FDCWD: c_int = -100;
 const AT_REMOVEDIR: c_int = 0x200;
+const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
+const AT_SYMLINK_FOLLOW: c_int = 0x400;
+const AT_EMPTY_PATH: c_int = 0x1000;
+const UTIME_NOW: i64 = (1 << 30) - 1;
+const UTIME_OMIT: i64 = (1 << 30) - 2;
+const EXDEV: c_int = 18;
+const EISDIR: c_int = 21;
+const EROFS: c_int = 30;
+const EOPNOTSUPP: c_int = 95;
 const AT_EACCESS: c_int = 0x200;
 const EPERM: c_int = 1;
 const ENOENT: c_int = 2;
@@ -73,6 +112,47 @@ fn create(path: &[u8]) -> c_int {
     }
     // SAFETY: a descriptor the layer gave.
     unsafe { stafeto_close(fd) }
+}
+
+fn rename(old: &[u8], new: &[u8]) -> c_int {
+    let (old, new) = (name(old), name(new));
+    // SAFETY: live C strings.
+    unsafe { stafeto_renameat(AT_FDCWD, old.pointer(), AT_FDCWD, new.pointer()) }
+}
+fn link(old: &[u8], new: &[u8], flags: c_int) -> c_int {
+    let (old, new) = (name(old), name(new));
+    // SAFETY: live C strings.
+    unsafe { stafeto_linkat(AT_FDCWD, old.pointer(), AT_FDCWD, new.pointer(), flags) }
+}
+fn symlink(target: &[u8], path: &[u8]) -> c_int {
+    let (target, path) = (name(target), name(path));
+    // SAFETY: live C strings.
+    unsafe { stafeto_symlinkat(target.pointer(), AT_FDCWD, path.pointer()) }
+}
+/// The bytes of a link, or the negated errno.
+fn readlink(path: &[u8], buffer: &mut [u8]) -> isize {
+    let path = name(path);
+    // SAFETY: a live C string and a writable buffer.
+    unsafe { stafeto_readlinkat(AT_FDCWD, path.pointer(), buffer.as_mut_ptr(), buffer.len()) }
+}
+fn chmod(path: &[u8], mode: u32, flags: c_int) -> c_int {
+    let path = name(path);
+    // SAFETY: a live C string.
+    unsafe { stafeto_fchmodat(AT_FDCWD, path.pointer(), mode, flags) }
+}
+fn chown(path: &[u8], uid: u32, gid: u32, flags: c_int) -> c_int {
+    let path = name(path);
+    // SAFETY: a live C string.
+    unsafe { stafeto_fchownat(AT_FDCWD, path.pointer(), uid, gid, flags) }
+}
+/// utimensat with the times as the four numbers of two timespecs, or none.
+fn utimens(path: &[u8], times: Option<[i64; 4]>, flags: c_int) -> c_int {
+    let path = name(path);
+    let pointer = times
+        .as_ref()
+        .map_or(core::ptr::null(), core::ptr::from_ref);
+    // SAFETY: a live C string, and null or two timespecs.
+    unsafe { stafeto_utimensat(AT_FDCWD, path.pointer(), pointer, flags) }
 }
 
 /// The node information of `path` with the last link not followed, from the
@@ -198,7 +278,319 @@ fn first_four() -> Result<(), i32> {
     Ok(())
 }
 
+fn inode(path: &[u8]) -> Option<u64> {
+    lstat(path).ok().map(|info| info.inode)
+}
+
+/// rename, link, symlink and readlink in a directory of their own.
+fn two_paths() -> Result<(), i32> {
+    ok(mkdir(b"/tmp/nm3", 0o777), 100)?;
+    ok(create(b"/tmp/nm3/a"), 101)?;
+    let file = inode(b"/tmp/nm3/a").ok_or(102)?;
+    // rename: the node moves and keeps its identity.
+    ok(rename(b"/tmp/nm3/a", b"/tmp/nm3/b"), 103)?;
+    check(
+        absent(b"/tmp/nm3/a") && inode(b"/tmp/nm3/b") == Some(file),
+        104,
+    )?;
+    expect(rename(b"/tmp/nm3/a", b"/tmp/nm3/c"), ENOENT, 105)?;
+    expect(rename(b"", b"/tmp/nm3/c"), ENOENT, 106)?;
+    expect(rename(b"/tmp/nm3/b", b""), ENOENT, 107)?;
+    check(inode(b"/tmp/nm3/b") == Some(file), 108)?;
+    // Directories: into itself, over a file, a file over a directory, a full one.
+    ok(mkdir(b"/tmp/nm3/d", 0o777), 109)?;
+    ok(mkdir(b"/tmp/nm3/d/e", 0o777), 110)?;
+    expect(rename(b"/tmp/nm3/d", b"/tmp/nm3/d/e/f"), EINVAL, 111)?;
+    check(is(b"/tmp/nm3/d/e", DIR) && absent(b"/tmp/nm3/d/e/f"), 112)?;
+    expect(rename(b"/tmp/nm3/d", b"/tmp/nm3/b"), ENOTDIR, 113)?;
+    expect(rename(b"/tmp/nm3/b", b"/tmp/nm3/d"), EISDIR, 114)?;
+    ok(mkdir(b"/tmp/nm3/g", 0o777), 115)?;
+    expect(rename(b"/tmp/nm3/g", b"/tmp/nm3/d"), ENOTEMPTY, 116)?;
+    expect(rename(b"/tmp/nm3/b/", b"/tmp/nm3/h"), ENOTDIR, 117)?;
+    check(
+        inode(b"/tmp/nm3/b") == Some(file) && absent(b"/tmp/nm3/h"),
+        118,
+    )?;
+    ok(rename(b"/tmp/nm3/g", b"/tmp/nm3/g"), 119)?;
+    ok(rename(b"/tmp/nm3/d/e", b"/tmp/nm3/g2"), 120)?;
+    ok(unlink(b"/tmp/nm3/g2", AT_REMOVEDIR), 121)?;
+    rt::println!("posix-files: layer rename moved a node and refused seven pairs");
+    // link: a second name for the same node.
+    ok(link(b"/tmp/nm3/b", b"/tmp/nm3/b2", 0), 130)?;
+    check(
+        inode(b"/tmp/nm3/b2") == Some(file)
+            && lstat(b"/tmp/nm3/b").is_ok_and(|info| info.links == 2),
+        131,
+    )?;
+    expect(link(b"/tmp/nm3/b", b"/tmp/nm3/b2", 0), EEXIST, 132)?;
+    expect(link(b"/tmp/nm3/d", b"/tmp/nm3/d2", 0), EPERM, 133)?;
+    check(absent(b"/tmp/nm3/d2"), 134)?;
+    expect(link(b"/tmp/nm3/none", b"/tmp/nm3/n", 0), ENOENT, 135)?;
+    expect(link(b"/tmp/nm3/b", b"/tmp/nm3/n", 1), EINVAL, 136)?;
+    expect(link(b"", b"/tmp/nm3/n", 0), ENOENT, 137)?;
+    expect(link(b"/tmp/nm3/b", b"", 0), ENOENT, 138)?;
+    // symlink and readlink.
+    ok(symlink(b"/tmp/nm3/b", b"/tmp/nm3/l"), 140)?;
+    check(is(b"/tmp/nm3/l", 5), 141)?;
+    let mut bytes = [0xaa; 600];
+    check(
+        readlink(b"/tmp/nm3/l", &mut bytes) == 10 && &bytes[..10] == b"/tmp/nm3/b",
+        142,
+    )?;
+    check(bytes[10] == 0xaa, 143)?;
+    let mut short = [0xaa; 4];
+    check(
+        readlink(b"/tmp/nm3/l", &mut short[..3]) == 3 && &short[..3] == b"/tm",
+        144,
+    )?;
+    check(short[3] == 0xaa, 145)?;
+    expect(symlink(b"x", b"/tmp/nm3/l"), EEXIST, 146)?;
+    expect(readlink(b"/tmp/nm3/b", &mut bytes) as c_int, EINVAL, 147)?;
+    expect(readlink(b"/tmp/nm3/none", &mut bytes) as c_int, ENOENT, 148)?;
+    expect(
+        readlink(b"/tmp/nm3/l", &mut bytes[..0]) as c_int,
+        EINVAL,
+        149,
+    )?;
+    expect(readlink(b"", &mut bytes) as c_int, ENOENT, 150)?;
+    // An empty target is a link too; 511 bytes fit and 512 do not.
+    ok(symlink(b"", b"/tmp/nm3/empty"), 151)?;
+    check(
+        is(b"/tmp/nm3/empty", 5) && readlink(b"/tmp/nm3/empty", &mut bytes) == 0,
+        152,
+    )?;
+    ok(symlink(&[b'z'; 511], b"/tmp/nm3/long"), 153)?;
+    check(readlink(b"/tmp/nm3/long", &mut bytes) == 511, 154)?;
+    expect(
+        symlink(&[b'z'; 512], b"/tmp/nm3/toolong"),
+        ENAMETOOLONG,
+        155,
+    )?;
+    check(absent(b"/tmp/nm3/toolong"), 156)?;
+    expect(symlink(b"x", b""), ENOENT, 157)?;
+    // A link without the flag is a link to the link; with the flag, to the file.
+    let symbolic = inode(b"/tmp/nm3/l").ok_or(158)?;
+    ok(link(b"/tmp/nm3/l", b"/tmp/nm3/l2", 0), 159)?;
+    check(
+        inode(b"/tmp/nm3/l2") == Some(symbolic) && is(b"/tmp/nm3/l2", 5),
+        160,
+    )?;
+    ok(link(b"/tmp/nm3/l", b"/tmp/nm3/l3", AT_SYMLINK_FOLLOW), 161)?;
+    check(
+        inode(b"/tmp/nm3/l3") == Some(file) && is(b"/tmp/nm3/l3", REG),
+        162,
+    )?;
+    // rename moves the link itself.
+    ok(rename(b"/tmp/nm3/l", b"/tmp/nm3/m"), 163)?;
+    check(
+        is(b"/tmp/nm3/m", 5) && absent(b"/tmp/nm3/l") && is(b"/tmp/nm3/b", REG),
+        164,
+    )?;
+    rt::println!("posix-files: layer link, symlink and readlink kept their bytes and names");
+    Ok(())
+}
+
+/// The metadata of a pipe belongs to no file: EINVAL for every call by
+/// descriptor. The image of the files has no pipe service; this runs where
+/// there is one.
+fn pipe_metadata() -> Result<(), i32> {
+    let mut ends = [0; 2];
+    // SAFETY: two ints.
+    check(unsafe { stafeto_pipe2(ends.as_mut_ptr(), 0) } == 0, 170)?;
+    let empty = name(b"");
+    // SAFETY: a live C string and descriptors of the layer.
+    let (chmod, chown, times) = unsafe {
+        (
+            stafeto_fchmodat(ends[0], empty.pointer(), 0o600, AT_EMPTY_PATH),
+            stafeto_fchownat(ends[1], empty.pointer(), 1, 1, AT_EMPTY_PATH),
+            stafeto_utimensat(ends[0], empty.pointer(), core::ptr::null(), AT_EMPTY_PATH),
+        )
+    };
+    // SAFETY: descriptors of the layer.
+    unsafe {
+        stafeto_close(ends[0]);
+        stafeto_close(ends[1]);
+    }
+    expect(chmod, EINVAL, 171)?;
+    expect(chown, EINVAL, 172)?;
+    expect(times, EINVAL, 173)?;
+    rt::println!("posix-files: layer refused the metadata of a pipe");
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn files_names_pipe() -> i32 {
+    pipe_metadata().err().unwrap_or(0)
+}
+
+/// chmod, chown and the times, by path and by descriptor.
+fn metadata() -> Result<(), i32> {
+    let file = b"/tmp/nm3/b";
+    ok(chmod(file, 0o640, 0), 200)?;
+    check(lstat(file).is_ok_and(|info| info.permissions == 0o640), 201)?;
+    expect(chmod(b"/tmp/nm3/none", 0o600, 0), ENOENT, 202)?;
+    expect(chmod(b"", 0o600, 0), ENOENT, 203)?;
+    expect(chmod(file, 0o600, 1), EINVAL, 204)?;
+    // The link itself cannot take a mode.
+    expect(
+        chmod(b"/tmp/nm3/m", 0o600, AT_SYMLINK_NOFOLLOW),
+        EOPNOTSUPP,
+        205,
+    )?;
+    // By descriptor: an empty path with AT_EMPTY_PATH.
+    let path = name(file);
+    // SAFETY: a live C string.
+    let fd = unsafe { stafeto_openat(AT_FDCWD, path.pointer(), O_WRONLY, 0) };
+    check(fd >= 0, 206)?;
+    let empty = name(b"");
+    // SAFETY: a live C string and a descriptor of the layer.
+    ok(
+        unsafe { stafeto_fchmodat(fd, empty.pointer(), 0o604, AT_EMPTY_PATH) },
+        207,
+    )?;
+    check(lstat(file).is_ok_and(|info| info.permissions == 0o604), 208)?;
+    // SAFETY: as above.
+    expect(
+        unsafe { stafeto_fchmodat(fd, empty.pointer(), 0o604, 0) },
+        ENOENT,
+        209,
+    )?;
+    // The console keeps its metadata out of the file service.
+    // SAFETY: as above.
+    expect(
+        unsafe { stafeto_fchmodat(1, empty.pointer(), 0o600, AT_EMPTY_PATH) },
+        EROFS,
+        211,
+    )?;
+    rt::println!("posix-files: layer chmod set the mode by path and by descriptor");
+    // chown: the superuser changes both; minus one keeps a field.
+    ok(chown(file, 1234, 5678, 0), 220)?;
+    check(
+        lstat(file).is_ok_and(|info| (info.uid, info.gid) == (1234, 5678)),
+        221,
+    )?;
+    ok(chown(file, u32::MAX, 99, 0), 222)?;
+    check(
+        lstat(file).is_ok_and(|info| (info.uid, info.gid) == (1234, 99)),
+        223,
+    )?;
+    ok(chown(file, u32::MAX, u32::MAX, 0), 224)?;
+    check(
+        lstat(file).is_ok_and(|info| (info.uid, info.gid) == (1234, 99)),
+        225,
+    )?;
+    expect(chown(b"/tmp/nm3/none", 1, 1, 0), ENOENT, 226)?;
+    expect(chown(file, 1, 1, 2), EINVAL, 227)?;
+    // A user who is not the owner cannot give a file away.
+    posix_abi::process::seteuid(65533).map_err(|_| 228)?;
+    let refused = chown(file, 65533, u32::MAX, 0);
+    let restored = posix_abi::process::seteuid(0);
+    expect(refused, EPERM, 229)?;
+    restored.map_err(|_| 230)?;
+    check(lstat(file).is_ok_and(|info| info.uid == 1234), 231)?;
+    // SAFETY: as above.
+    ok(
+        unsafe { stafeto_fchownat(fd, empty.pointer(), 1, 2, AT_EMPTY_PATH) },
+        232,
+    )?;
+    check(
+        lstat(file).is_ok_and(|info| (info.uid, info.gid) == (1, 2)),
+        233,
+    )?;
+    rt::println!("posix-files: layer chown kept a field at minus one and refused a stranger");
+    // The times.
+    let stamp = |path: &[u8]| lstat(path).map(|info| (info.access_time, info.modify_time));
+    ok(utimens(file, Some([100, 5, 200, 6]), 0), 240)?;
+    let (access, modify) = stamp(file).map_err(|_| 241)?;
+    check(
+        (access.seconds, access.nanos) == (100, 5) && (modify.seconds, modify.nanos) == (200, 6),
+        242,
+    )?;
+    // OMIT leaves a time as it is; the seconds beside a mark mean nothing.
+    ok(utimens(file, Some([7, UTIME_OMIT, 300, 0]), 0), 243)?;
+    let (access, modify) = stamp(file).map_err(|_| 244)?;
+    check(
+        (access.seconds, access.nanos) == (100, 5) && (modify.seconds, modify.nanos) == (300, 0),
+        245,
+    )?;
+    // Two marks of OMIT change nothing, the change time too.
+    let before = lstat(file).map_err(|_| 246)?;
+    ok(utimens(file, Some([0, UTIME_OMIT, 0, UTIME_OMIT]), 0), 247)?;
+    check(lstat(file) == Ok(before), 248)?;
+    // NOW and a null pointer put the clock in.
+    ok(utimens(file, Some([0, UTIME_NOW, 0, UTIME_NOW]), 0), 249)?;
+    let (access, modify) = stamp(file).map_err(|_| 250)?;
+    check(
+        access != before.access_time && modify != before.modify_time,
+        251,
+    )?;
+    // The clock, and not a time of zero.
+    check(
+        (access.seconds, access.nanos) != (0, 0) && (modify.seconds, modify.nanos) != (0, 0),
+        251,
+    )?;
+    ok(utimens(file, Some([1, 2, 3, 4]), 0), 252)?;
+    ok(utimens(file, None, 0), 253)?;
+    let (access, modify) = stamp(file).map_err(|_| 254)?;
+    check(
+        (access.seconds, access.nanos) != (1, 2) && (modify.seconds, modify.nanos) != (3, 4),
+        255,
+    )?;
+    // The nanoseconds out of range change nothing.
+    let before = lstat(file).map_err(|_| 256)?;
+    expect(
+        utimens(file, Some([0, 1_000_000_000, 0, 0]), 0),
+        EINVAL,
+        257,
+    )?;
+    expect(utimens(file, Some([0, -1, 0, 0]), 0), EINVAL, 258)?;
+    expect(
+        utimens(file, Some([0, 0, 0, 1_000_000_000]), 0),
+        EINVAL,
+        259,
+    )?;
+    expect(utimens(file, None, 1), EINVAL, 260)?;
+    expect(utimens(b"/tmp/nm3/none", None, 0), ENOENT, 261)?;
+    expect(utimens(b"", None, 0), ENOENT, 262)?;
+    check(lstat(file) == Ok(before), 263)?;
+    // By descriptor.
+    let times = [11, 12, 13, 14];
+    // SAFETY: as above.
+    ok(
+        unsafe { stafeto_utimensat(fd, empty.pointer(), &times, AT_EMPTY_PATH) },
+        264,
+    )?;
+    let (access, modify) = stamp(file).map_err(|_| 265)?;
+    check(
+        (access.seconds, access.nanos) == (11, 12) && (modify.seconds, modify.nanos) == (13, 14),
+        266,
+    )?;
+    // SAFETY: a descriptor of the layer.
+    unsafe { stafeto_close(fd) };
+    rt::println!("posix-files: layer utimensat set, kept and refused times");
+    // The directory goes.
+    for leaf in [
+        b"/tmp/nm3/b".as_slice(),
+        b"/tmp/nm3/b2",
+        b"/tmp/nm3/m",
+        b"/tmp/nm3/empty",
+        b"/tmp/nm3/long",
+        b"/tmp/nm3/l2",
+        b"/tmp/nm3/l3",
+    ] {
+        ok(unlink(leaf, 0), 270)?;
+    }
+    ok(unlink(b"/tmp/nm3/d", AT_REMOVEDIR), 271)?;
+    ok(unlink(b"/tmp/nm3/g", AT_REMOVEDIR), 271)?;
+    ok(unlink(b"/tmp/nm3", AT_REMOVEDIR), 272)?;
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn files_names_stages() -> i32 {
-    first_four().err().unwrap_or(0)
+    first_four()
+        .and_then(|()| two_paths())
+        .and_then(|()| metadata())
+        .err()
+        .unwrap_or(0)
 }

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The operations on names and metadata that start at a path: unlink, mkdir
-//! and access to begin with, each as one Change job (`crate::change`). This layer checks what it can without
+//! The operations on names and metadata that start at a path: unlink, mkdir,
+//! rename, link, symlink, readlink, chmod, chown, access and utimens, each as
+//! one Change job (`crate::change`). This layer checks what it can without
 //! the service (an empty path, the length of a path, the flags, the base of a
 //! relative path, the virtual names of the terminal) and sends the rest.
 //!
@@ -19,8 +20,14 @@ use posix_fs::{FsError, Target, Transport};
 use proto_fs::{Base, ChangeOp, RESULT_MAX};
 
 pub const AT_FDCWD: c_int = -100;
+pub const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
 pub const AT_REMOVEDIR: c_int = 0x200;
 pub const AT_EACCESS: c_int = 0x200;
+pub const AT_SYMLINK_FOLLOW: c_int = 0x400;
+pub const AT_EMPTY_PATH: c_int = 0x1000;
+/// The values of tv_nsec that stand for "now" and "leave it".
+pub const UTIME_NOW: i64 = proto_fs::TIME_NOW as i64;
+pub const UTIME_OMIT: i64 = proto_fs::TIME_OMIT as i64;
 
 const MAX_PATH: usize = proto_fs::MAX_PATH;
 
@@ -235,4 +242,195 @@ pub fn faccessat(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result
     };
     access.args = [mode as u64, 0, 0, 0];
     run_unit(&access)
+}
+
+/// rename: `renameat2` without flags.
+pub fn renameat(old_dirfd: c_int, old: &[u8], new_dirfd: c_int, new: &[u8]) -> Result<(), c_int> {
+    let first = place(old_dirfd, old)?;
+    let second = place(new_dirfd, new)?;
+    check_virtual(Named::Rename, &first, Some(&second), true)?;
+    let mut rename = request(ChangeOp::Rename, &first);
+    rename.second = Some((second.base, second.path()));
+    run_unit(&rename)
+}
+
+/// link and linkat: the new name is a link to the old name itself unless
+/// AT_SYMLINK_FOLLOW says to follow a symbolic link at the old name.
+pub fn linkat(
+    old_dirfd: c_int,
+    old: &[u8],
+    new_dirfd: c_int,
+    new: &[u8],
+    flags: c_int,
+) -> Result<(), c_int> {
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return Err(EINVAL);
+    }
+    let first = place(old_dirfd, old)?;
+    let second = place(new_dirfd, new)?;
+    check_virtual(Named::Link, &first, Some(&second), true)?;
+    let mut link = request(ChangeOp::Link, &first);
+    link.flags = if flags & AT_SYMLINK_FOLLOW != 0 {
+        proto_fs::LINK_FOLLOW
+    } else {
+        0
+    };
+    link.second = Some((second.base, second.path()));
+    run_unit(&link)
+}
+
+/// symlink: `target` is stored as it is, up to 511 bytes, empty too.
+pub fn symlinkat(target: &[u8], new_dirfd: c_int, linkpath: &[u8]) -> Result<(), c_int> {
+    if target.len() > MAX_PATH {
+        return Err(ENAMETOOLONG);
+    }
+    let placed = place(new_dirfd, linkpath)?;
+    check_virtual(Named::Symlink, &placed, None, false)?;
+    let mut symlink = request(ChangeOp::Symlink, &placed);
+    symlink.second = Some((Base::Absolute, target));
+    run_unit(&symlink)
+}
+
+/// readlink: the contents of the link, cut to the size of `out`, without a
+/// NUL. EINVAL for a buffer of no bytes and for a node that is no link.
+pub fn readlinkat(dirfd: c_int, path: &[u8], out: &mut [u8]) -> Result<usize, c_int> {
+    if out.is_empty() {
+        return Err(EINVAL);
+    }
+    let placed = place(dirfd, path)?;
+    let mut read = request(ChangeOp::ReadLink, &placed);
+    read.args = [out.len().min(RESULT_MAX) as u64, 0, 0, 0];
+    let mut buffer = [0; RESULT_MAX];
+    let outcome = run(&read, &mut buffer)?;
+    let length = outcome.length.min(out.len());
+    out[..length].copy_from_slice(&buffer[..length]);
+    Ok(length)
+}
+
+/// What a metadata call names: a path, or with AT_EMPTY_PATH the object of a
+/// descriptor. A descriptor of another service answers here: a pipe has no
+/// such metadata (EINVAL), the terminal keeps its own (EROFS).
+fn metadata_target(dirfd: c_int, path: &[u8], at_flags: c_int) -> Result<(Placed, bool), c_int> {
+    if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    if !path.is_empty() {
+        return Ok((place(dirfd, path)?, false));
+    }
+    if at_flags & AT_EMPTY_PATH == 0 {
+        return Err(ENOENT);
+    }
+    let mut placed = Placed {
+        base: Base::Absolute,
+        bytes: [0; MAX_PATH + 1],
+        length: 0,
+        trailing_slash: false,
+    };
+    if dirfd == AT_FDCWD {
+        // The current directory itself.
+        placed.length = crate::shared::with_files(|files| {
+            let cwd = files.cwd();
+            placed.bytes[..cwd.len()].copy_from_slice(cwd);
+            Ok(cwd.len())
+        })?;
+        return Ok((placed, true));
+    }
+    let fd = u32::try_from(dirfd).map_err(|_| EBADF)?;
+    let target = crate::shared::with_files(|files| files.target(fd).map_err(error))?;
+    match target {
+        Target::Ram(target) | Target::Random(target) => {
+            placed.base = Base::Fd {
+                fd: target.fd(),
+                generation: target.generation(),
+            };
+        }
+        Target::Pipe(_) => return Err(EINVAL),
+        _ => return Err(EROFS),
+    }
+    Ok((placed, true))
+}
+
+fn metadata(
+    op: ChangeOp,
+    named: Named,
+    dirfd: c_int,
+    path: &[u8],
+    at_flags: c_int,
+    args: [u64; 4],
+) -> Result<(), c_int> {
+    let (placed, itself) = metadata_target(dirfd, path, at_flags)?;
+    if !itself {
+        check_virtual(named, &placed, None, true)?;
+    }
+    let mut change = request(op, &placed);
+    change.flags = if at_flags & AT_SYMLINK_NOFOLLOW != 0 {
+        proto_fs::NOFOLLOW
+    } else {
+        0
+    };
+    change.args = args;
+    run_unit(&change)
+}
+
+/// chmod, fchmod (AT_EMPTY_PATH) and fchmodat.
+pub fn fchmodat(dirfd: c_int, path: &[u8], mode: u32, flags: c_int) -> Result<(), c_int> {
+    metadata(
+        ChangeOp::Chmod,
+        Named::Chmod,
+        dirfd,
+        path,
+        flags,
+        [u64::from(mode & 0o7777), 0, 0, 0],
+    )
+}
+
+/// chown, lchown, fchown and fchownat: an ID of `u32::MAX` keeps the field.
+pub fn fchownat(dirfd: c_int, path: &[u8], uid: u32, gid: u32, flags: c_int) -> Result<(), c_int> {
+    metadata(
+        ChangeOp::Chown,
+        Named::Chown,
+        dirfd,
+        path,
+        flags,
+        [u64::from(uid), u64::from(gid), 0, 0],
+    )
+}
+
+/// One time of utimensat: the seconds and the nanoseconds or a mark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Time {
+    pub seconds: i64,
+    pub nanos: i64,
+}
+
+fn time_args(time: Time) -> Result<(u64, u64), c_int> {
+    match time.nanos {
+        UTIME_NOW | UTIME_OMIT => Ok((0, time.nanos as u64)),
+        0..=999_999_999 => Ok((time.seconds as u64, time.nanos as u64)),
+        _ => Err(EINVAL),
+    }
+}
+
+/// utimensat and futimens (AT_EMPTY_PATH): no times is now for both.
+pub fn utimensat(
+    dirfd: c_int,
+    path: &[u8],
+    times: Option<[Time; 2]>,
+    flags: c_int,
+) -> Result<(), c_int> {
+    let now = Time {
+        seconds: 0,
+        nanos: UTIME_NOW,
+    };
+    let [access, modify] = times.unwrap_or([now, now]);
+    let (access_seconds, access_nanos) = time_args(access)?;
+    let (modify_seconds, modify_nanos) = time_args(modify)?;
+    metadata(
+        ChangeOp::Times,
+        Named::Times,
+        dirfd,
+        path,
+        flags,
+        [access_seconds, access_nanos, modify_seconds, modify_nanos],
+    )
 }
