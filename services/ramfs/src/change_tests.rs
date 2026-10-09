@@ -644,6 +644,28 @@ fn a_full_share_or_table_is_jobs_full_without_effect_and_the_same_key_goes_later
 }
 
 #[test]
+fn a_start_refused_for_its_identity_leaves_no_place_of_the_side_table() {
+    let mut env = Env::new();
+    // An unbound session has no identity: each Start of a rename fails
+    // before it reserves anything, however many are made.
+    let mut unbound = Fds::default();
+    for n in 0..40 {
+        let mut start = req(0, 1 + n, ChangeOp::Rename, b"/a");
+        start.args = [0; 4];
+        assert_eq!(env.start(&mut unbound, OWNER, &start), Err(PERMISSION));
+    }
+    assert!(env.seconds.is_clear());
+    // The 33rd place is free for a session that has an identity.
+    let mut fds = session();
+    assert!(
+        env.start(&mut fds, OWNER, &req(0, 1, ChangeOp::Rename, b"/a"))
+            .is_ok()
+    );
+    env.release(&mut fds, OWNER, key(0, 1)).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
 fn bases_a_descriptor_a_wrong_generation_and_the_reserved_current_directory() {
     let mut env = Env::new();
     let mut fds = session();

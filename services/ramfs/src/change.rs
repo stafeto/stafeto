@@ -869,13 +869,15 @@ pub fn start(
         .checked_add(1)
         .filter(|&generation| generation < 1 << 56)
         .ok_or(TOO_MANY_OPEN_FILES)?;
+    // The identity comes before the place of the side table, so that no
+    // early exit leaves the place reserved.
+    let real = uses_real_identity(req.op, req.flags);
+    let identity = fds.binding.identity(real)?;
     let second_place = if req.op.needs_second() {
         Some(ctx.seconds.reserve().ok_or(JOBS_FULL)? as u8)
     } else {
         None
     };
-    let real = uses_real_identity(req.op, req.flags);
-    let identity = fds.binding.identity(real)?;
     let charge = match ctx.ram.storage.charge_preparation(fds.root) {
         Ok(charge) => charge,
         Err(code) => {
