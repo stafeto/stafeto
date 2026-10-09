@@ -1151,14 +1151,21 @@ impl<'a> Storage<'a> {
         uid: u32,
         gid: u32,
     ) -> Result<(), u32> {
-        self.node(token)?;
+        let current = self.node(token)?;
+        let (access_gen, epoch) = if current.kind == crate::DIR {
+            match current.access_gen.checked_add(1) {
+                Some(next) => (next, self.state.epoch),
+                None => (0, self.state.epoch.checked_add(1).ok_or(NO_SPACE)?),
+            }
+        } else {
+            (current.access_gen, self.state.epoch)
+        };
         let node = &mut self.state.nodes[token.slot as usize];
         node.mode = mode;
         node.uid = uid;
         node.gid = gid;
-        if node.kind == crate::DIR {
-            node.access_gen = node.access_gen.wrapping_add(1);
-        }
+        node.access_gen = access_gen;
+        self.state.epoch = epoch;
         Ok(())
     }
     /// The count of the names changed in a directory, modulo 2^32.
@@ -1363,11 +1370,51 @@ impl<'a> Storage<'a> {
             (d.parent, &d.name[..d.len as usize])
         }
     }
+    /// Preflight every name edit of a commit, including repeated parent/bucket edits.
+    /// The list has at most three entries: source, victim, destination.
+    pub(crate) fn name_change_room(
+        &self,
+        changes: &[Option<(Token, u16)>],
+        moves: bool,
+    ) -> Result<(), u32> {
+        let mut wraps = u64::from(moves);
+        for (i, change) in changes.iter().enumerate() {
+            let Some((parent, bucket)) = *change else {
+                continue;
+            };
+            let previous = &changes[..i];
+            let names_before = previous
+                .iter()
+                .flatten()
+                .filter(|(p, _)| *p == parent)
+                .count() as u32;
+            let bucket_before = previous
+                .iter()
+                .flatten()
+                .filter(|(_, b)| *b == bucket)
+                .count() as u32;
+            wraps += u64::from(self.name_gen(parent)?.wrapping_add(names_before) == u32::MAX);
+            wraps += u64::from(self.stamp(bucket as usize).wrapping_add(bucket_before) == u32::MAX);
+        }
+        self.state.epoch.checked_add(wraps).ok_or(NO_SPACE)?;
+        Ok(())
+    }
+    /// Counter reuse invalidates every proof captured before the wrap.
+    fn next_name_count(value: u32, epoch: &mut u64) -> u32 {
+        match value.checked_add(1) {
+            Some(next) => next,
+            None => {
+                *epoch = epoch.checked_add(1).expect("preflighted counter wrap");
+                0
+            }
+        }
+    }
     /// A name of `parent` came or left the bucket.
     fn touch_name(&mut self, parent: Token, bucket: usize) {
         let node = &mut self.state.nodes[parent.slot as usize];
-        node.name_gen = node.name_gen.wrapping_add(1);
-        self.state.bucket_stamps[bucket] = self.state.bucket_stamps[bucket].wrapping_add(1);
+        node.name_gen = Self::next_name_count(node.name_gen, &mut self.state.epoch);
+        self.state.bucket_stamps[bucket] =
+            Self::next_name_count(self.state.bucket_stamps[bucket], &mut self.state.epoch);
     }
     /// Puts a published entry at the head of its chain. Constant work.
     pub(crate) fn chain_insert(&mut self, index: usize) {
@@ -1792,6 +1839,7 @@ impl<'a> Storage<'a> {
         } else {
             parent.links
         };
+        self.name_change_room(&[Some((d.parent, reservation.bucket))], false)?;
         let cookie = self.next_directory_cookie()?;
         self.state.dentries[reservation.dentry as usize].cookie = cookie;
         self.state.dentries[reservation.dentry as usize].reserved = false;
@@ -3188,5 +3236,79 @@ mod index_check {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod counter_wrap_tests {
+    use super::*;
+    const EXPENSE: Root = Root {
+        id: 11,
+        generation: 7,
+    };
+    #[test]
+    fn each_name_counter_wrap_invalidates_an_old_creation_reservation() {
+        for (names, bucket) in [(false, true), (true, false), (true, true)] {
+            let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+            let slot = name_bucket(ROOT, b"new");
+            ram.storage.state.nodes[ROOT.slot as usize].name_gen = 0;
+            ram.storage.state.bucket_stamps[slot] = 0;
+            let old = ram
+                .storage
+                .reserve(EXPENSE, ROOT, b"new", (crate::REG, 0o644, 0, 0))
+                .unwrap();
+            if names {
+                ram.storage.state.nodes[ROOT.slot as usize].name_gen = u32::MAX;
+            }
+            if bucket {
+                ram.storage.state.bucket_stamps[slot] = u32::MAX;
+            }
+            let rival = ram
+                .storage
+                .reserve(EXPENSE, ROOT, b"new", (crate::REG, 0o644, 0, 0))
+                .unwrap();
+            let epoch = ram.storage.state.epoch;
+            ram.storage.commit(rival).unwrap();
+            assert_eq!(
+                ram.storage.reserved_token(old, EXPENSE),
+                Err(proto_fs::STALE_PROOF)
+            );
+            assert_eq!(ram.storage.commit(old), Err(proto_fs::INVALID_ARGUMENT));
+            assert_eq!(ram.storage.lookup(ROOT, b"new"), Ok(rival.token));
+            assert_eq!(
+                ram.storage.state.epoch,
+                epoch + u64::from(names) + u64::from(bucket)
+            );
+            ram.storage.cancel(old).unwrap();
+            ram.storage.check_name_index();
+        }
+    }
+    #[test]
+    fn exhausted_epoch_refuses_name_and_access_wrap_before_writes() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let pending = ram
+            .storage
+            .reserve(EXPENSE, ROOT, b"new", (crate::REG, 0o644, 0, 0))
+            .unwrap();
+        ram.storage.state.epoch = u64::MAX;
+        // Capture the final epoch in a fresh reservation.
+        ram.storage.cancel(pending).unwrap();
+        let pending = ram
+            .storage
+            .reserve(EXPENSE, ROOT, b"new", (crate::REG, 0o644, 0, 0))
+            .unwrap();
+        ram.storage.state.bucket_stamps[pending.bucket as usize] = u32::MAX;
+        let cookie = ram.storage.state.next_cookie;
+        let usage = ram.storage.usage(EXPENSE);
+        assert_eq!(ram.storage.commit(pending), Err(NO_SPACE));
+        assert_eq!(ram.storage.state.next_cookie, cookie);
+        assert_eq!(ram.storage.usage(EXPENSE), usage);
+        assert_eq!(ram.storage.lookup(ROOT, b"new"), Err(NO_ENTRY));
+        ram.storage.cancel(pending).unwrap();
+        ram.storage.state.nodes[ROOT.slot as usize].access_gen = u32::MAX;
+        let mode = ram.storage.node(ROOT).unwrap().mode;
+        assert_eq!(ram.storage.set_attributes(ROOT, 0o700, 1, 2), Err(NO_SPACE));
+        assert_eq!(ram.storage.node(ROOT).unwrap().mode, mode);
+        assert_eq!(ram.storage.node(ROOT).unwrap().access_gen, u32::MAX);
     }
 }

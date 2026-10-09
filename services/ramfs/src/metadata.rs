@@ -234,18 +234,14 @@ impl MetadataJournal {
             // generation (the walks in it check search permission again);
             // the times and the attributes of a file change nothing that
             // another operation has proved.
-            let node = ram
-                .storage
-                .node_mut(self.target)
-                .expect("retained metadata target");
             let access_changed = node.mode != mode || node.uid != uid || node.gid != gid;
-            node.mode = mode;
-            node.uid = uid;
-            node.gid = gid;
-            node.times = times;
-            if node.kind == crate::DIR && access_changed {
-                node.access_gen = node.access_gen.wrapping_add(1);
+            if access_changed {
+                ram.storage.set_attributes(self.target, mode, uid, gid)?;
             }
+            ram.storage
+                .node_mut(self.target)
+                .expect("retained metadata target")
+                .times = times;
             MetadataOutcome::Applied
         };
         self.outcome = Some(outcome);

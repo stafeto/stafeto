@@ -378,11 +378,6 @@ impl Preparation {
         let source_token = self.edges[0].target.ok_or(NO_ENTRY)?;
         let moves_directory = self.intent == NamespaceIntent::Rename
             && storage.node(source_token)?.kind == crate::DIR;
-        let next_epoch = if moves_directory {
-            storage.state.epoch.checked_add(1).ok_or(NO_SPACE)?
-        } else {
-            storage.state.epoch
-        };
         for delta in self.links.iter().flatten() {
             if storage.node(delta.token)?.links != delta.previous {
                 return Err(STALE_PROOF);
@@ -414,6 +409,16 @@ impl Preparation {
             && matches!(self.edges[0].location, Location::Dynamic(_))
             && self.edges[0].parent == self.edges[1].parent
             && !replacement;
+        storage.name_change_room(
+            &[
+                self.removes_source()
+                    .then_some((self.edges[0].parent, self.edges[0].bucket)),
+                replacement.then_some((self.edges[1].parent, self.edges[1].bucket)),
+                self.has_destination()
+                    .then_some((self.edges[1].parent, self.edges[1].bucket)),
+            ],
+            moves_directory,
+        )?;
         let cookie = if replacement {
             let index = match self.edges[1].location {
                 Location::Original(i) => i as usize,
@@ -522,7 +527,13 @@ impl Preparation {
         {
             storage.state.nodes[victim.slot as usize].times[2] = now;
         }
-        storage.state.epoch = next_epoch;
+        if moves_directory {
+            storage.state.epoch = storage
+                .state
+                .epoch
+                .checked_add(1)
+                .expect("preflighted directory move");
+        }
         self.outcome = Some(NamespaceOutcome::Applied);
         self.phase = Phase::Committed;
         Ok(NamespaceOutcome::Applied)

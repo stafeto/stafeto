@@ -726,3 +726,38 @@ fn actual_metadata_layout_is_reported() {
         core::mem::size_of::<MetadataIntent>()
     );
 }
+
+#[test]
+fn directory_access_counter_wrap_raises_epoch_and_exhaustion_preserves_metadata() {
+    let mut ram = Ram::new(Timestamp::ZERO);
+    let dir = file(&mut ram, ROOT, b"wrap-dir", crate::DIR, 0o755);
+    ram.storage.node_mut(dir).unwrap().access_gen = u32::MAX;
+    let epoch = ram.storage.state.epoch;
+    assert_eq!(
+        apply(
+            &mut ram,
+            b"/wrap-dir",
+            OWNER,
+            MetadataIntent::Chmod(0o700),
+            Some(NOW)
+        ),
+        MetadataOutcome::Applied
+    );
+    assert_eq!(ram.storage.node(dir).unwrap().access_gen, 0);
+    assert_eq!(ram.storage.state.epoch, epoch + 1);
+    ram.storage.node_mut(dir).unwrap().access_gen = u32::MAX;
+    ram.storage.state.epoch = u64::MAX;
+    let times = ram.storage.node(dir).unwrap().times;
+    let intent = MetadataIntent::Chmod(0o755);
+    let (mut journal, resolver, charge) = begin(&mut ram, b"/wrap-dir", OWNER, intent);
+    let proof = resolver
+        .metadata_proof(&ram.storage, OWNER, intent.path(true))
+        .unwrap();
+    assert_eq!(
+        journal.commit(&mut ram, EXPENSE, OWNER, Some(proof), Some(NOW)),
+        Err(NO_SPACE)
+    );
+    cleanup(&mut ram, journal, Some(resolver), charge);
+    assert_eq!(ram.storage.node(dir).unwrap().mode, 0o700);
+    assert_eq!(ram.storage.node(dir).unwrap().times, times);
+}

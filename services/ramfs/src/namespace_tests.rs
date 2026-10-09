@@ -1310,3 +1310,19 @@ fn reserved_name_commits_at_tail_after_500_rival_publications() {
         Walk::End
     );
 }
+
+#[test]
+fn exhausted_epoch_checks_repeated_parent_edits_before_rename_publication() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let source = create(&mut ram, FIRST, ROOT, b"a", REG, 0o644);
+    ram.storage.node_mut(ROOT).unwrap().name_gen = u32::MAX - 1;
+    ram.storage.state.epoch = u64::MAX;
+    assert_eq!(
+        run(&mut ram, NamespaceIntent::Rename, b"/a", Some(b"/b"), 1),
+        Err(NO_SPACE)
+    );
+    assert_eq!(ram.storage.lookup(ROOT, b"a"), Ok(source));
+    assert_eq!(ram.storage.lookup(ROOT, b"b"), Err(NO_ENTRY));
+    assert_eq!(ram.storage.node(ROOT).unwrap().name_gen, u32::MAX - 1);
+    ram.storage.check_name_index();
+}
