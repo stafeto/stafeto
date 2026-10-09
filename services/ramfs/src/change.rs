@@ -135,6 +135,10 @@ fn first_intent(op: ChangeOp, flags: u32) -> Intent {
 }
 
 /// Whether the operation reads the real identity of the caller.
+/// The nodes waiting for reclamation from which a step of a change job also
+/// reclaims (the share of a root is 192 nodes).
+const RECLAIM_PACE: usize = 32;
+
 pub fn uses_real_identity(op: ChangeOp, flags: u32) -> bool {
     op == ChangeOp::Access && flags & ACCESS_EFFECTIVE == 0
 }
@@ -341,7 +345,11 @@ impl ChangeJob {
         // Reclamation keeps the pace of the operations: a client that makes
         // and removes nodes in a loop does not outrun the maintenance of the
         // service, which gives one step to reclamation for each notification.
-        ram.storage.reclaim_step();
+        // Past a backlog of RECLAIM_PACE nodes the step pays one reclamation
+        // step; below it the step costs what it did.
+        if ram.storage.reclaim_backlog() >= RECLAIM_PACE {
+            ram.storage.reclaim_step();
+        }
         let outcome = self.advance(ram, fds, identity, charge, second.as_deref_mut(), clock);
         let now = self.resolver_restarts(second.as_deref());
         if now > self.seen {

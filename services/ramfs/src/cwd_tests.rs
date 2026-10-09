@@ -550,3 +550,30 @@ fn deleted_cwd_is_preserved_for_clone_but_has_no_absolute_name() {
     while ram.storage.reclaim_step() {}
     assert!(ram.storage.node(target).is_err());
 }
+
+#[test]
+fn getcwd_takes_a_step_a_level_through_the_back_reference() {
+    let mut ram = Ram::new(Timestamp::ZERO);
+    // 64 levels of short names: the path fits the inline buffer, so no page is built.
+    let (fds, path) = deep_cwd(&mut ram, 64, b"d");
+    let charge = ram.storage.charge_preparation(EXPENSE).unwrap();
+    let mut j = ram
+        .prepare_getcwd(&fds, charge, OWNER, path.len() as u64)
+        .unwrap();
+    let mut steps = 0;
+    while !j.step(&mut ram.storage, OWNER).unwrap() {
+        steps += 1;
+        assert!(steps < 1000);
+    }
+    steps += 1;
+    std::println!("getcwd of depth 64: {steps} steps");
+    assert!(steps <= 66, "{steps} steps for 64 levels");
+    assert_eq!(
+        j.outcome(),
+        Some(GetcwdOutcome::Ready {
+            length: path.len() as u32
+        })
+    );
+    getcwd_cancel(&mut ram, &mut j);
+    ram.storage.release_preparation(charge);
+}

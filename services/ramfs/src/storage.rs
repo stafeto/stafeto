@@ -1968,6 +1968,10 @@ impl<'a> Storage<'a> {
         Ok(())
     }
     /// One page or inode slot per call, alternating two independently paid queues.
+    /// The nodes that wait for reclamation.
+    pub fn reclaim_backlog(&self) -> usize {
+        self.state.reclaim_len
+    }
     pub fn reclaim_step(&mut self) -> bool {
         if self.state.retired_len != 0 && (self.state.reclaim_len == 0 || self.state.retired_turn) {
             self.state.retired_turn = false;
@@ -2023,7 +2027,17 @@ impl<'a> Storage<'a> {
                 generation: node.generation,
                 ..Node::EMPTY
             };
-            self.state.overlays[i] = Overlay::EMPTY;
+            // The page steps left the rest as a free slot has it: no page, no
+            // group tail, no count. Writing the two owner fields is all that
+            // remains, where the whole record is 4 KiB of work.
+            debug_assert!(
+                self.state.overlays[i].pages.iter().all(|&p| p == NONE)
+                    && self.state.overlays[i].group_tail.iter().all(|&t| t == NONE)
+                    && self.state.overlays[i].mapped_count == 0
+                    && self.state.overlays[i].shadow_boot_sectors == 0
+            );
+            self.state.overlays[i].node = NONE;
+            self.state.overlays[i].root = NONE;
             self.state.inode_free[self.state.inode_len] = i as u16;
             self.state.inode_len += 1;
             self.uncharge(overlay.root as usize, |u| &mut u.inodes);
