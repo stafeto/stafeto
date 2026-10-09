@@ -3240,8 +3240,28 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// test build (`kernel_tests`, row `threads_ready` of `teardown portions`).
 /// Each sits four ticks above the measure at the end of epoch 2 (262 and
 /// 12 764); a higher number needs a decision with its reason written down.
+///
+/// Rules for a guard that fires (the paths are deterministic under -icount,
+/// so a firing is no noise and a repeat does not clear it):
+/// 1. The commit that trips a guard either gives the path back or raises
+///    the constant in the same commit, with a line here: the new number,
+///    the commit, the reason.
+/// 2. When the source of the path did not change (the compiler moved the
+///    code) and the excess is at most `NULL_SLACK` for `null` or
+///    `THREADS_READY_SLACK` for `threads_ready` (one instruction a thread),
+///    the author raises it with that line; a larger excess or a changed
+///    path needs the decision of the reviewer of the kernel.
+/// 3. A change of the Rust toolchain measures both rows again and sets the
+///    constants anew in the same commit.
+/// 4. The guard looks down too: when the room is larger than the slack,
+///    `guard_lower_hint` prints "lower <NAME> to N" (it does not fail) and
+///    the next commit lowers the constant, so that a shorter path does not
+///    turn into room for later growth.
 const NULL_MAX: u64 = 266;
 const THREADS_READY_MAX: u64 = 12_768;
+/// The room above which a guard asks to be lowered (rule 4).
+const NULL_SLACK: u64 = 16;
+const THREADS_READY_SLACK: u64 = 128;
 
 /// The most one step of a service may take (one READ_INTO of up to
 /// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for
@@ -5601,6 +5621,14 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             "threads_ready margin on {}: {room} of THREADS_READY_MAX {THREADS_READY_MAX}",
             m.name
         );
+        if let Some(hint) = guard_lower_hint(
+            "THREADS_READY_MAX",
+            room,
+            THREADS_READY_SLACK,
+            THREADS_READY_MAX,
+        ) {
+            println!("{hint}");
+        }
     }
     match variant {
         Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
@@ -5674,6 +5702,13 @@ fn guard_margin(
         .ok_or_else(|| format!("the {what} line has no row {row}"))?;
     max.checked_sub(n)
         .ok_or_else(|| format!("{what} {row}={n} is {} past its guard {max}", n - max))
+}
+
+/// The line that asks to lower the guard `name` when its `room` under `max`
+/// is larger than `slack`: the new number is the measure plus four ticks,
+/// the room the guards keep.
+fn guard_lower_hint(name: &str, room: u64, slack: u64, max: u64) -> Option<String> {
+    (room > slack).then(|| format!("lower {name} to {}", max - room + 4))
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -5780,6 +5815,9 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
         );
         let room = guard_margin("normal build", &NORMAL_BUILD_ROWS, &ticks, "null", NULL_MAX)?;
         println!("null margin on {}: {room} of NULL_MAX {NULL_MAX}", m.name);
+        if let Some(hint) = guard_lower_hint("NULL_MAX", room, NULL_SLACK, NULL_MAX) {
+            println!("{hint}");
+        }
         let ticks = ticks_of(&o.lines, "log", &LOG_ROWS)?;
         println!("log ticks on {}: {}", m.name, rows_of(&LOG_ROWS, &ticks));
     }
@@ -7216,6 +7254,30 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("threads_ready=12776"), "{error}");
         assert!(guard_margin("x", &NORMAL_BUILD_ROWS, &[0; 5], "none", 1).is_err());
+    }
+
+    /// A guard with more room than its slack asks to be lowered; at the slack
+    /// it stays quiet.
+    #[test]
+    fn a_guard_with_much_room_asks_to_be_lowered() {
+        assert_eq!(guard_lower_hint("NULL_MAX", 4, NULL_SLACK, NULL_MAX), None);
+        assert_eq!(
+            guard_lower_hint("NULL_MAX", NULL_SLACK, NULL_SLACK, NULL_MAX),
+            None
+        );
+        assert_eq!(
+            guard_lower_hint("NULL_MAX", 17, NULL_SLACK, NULL_MAX),
+            Some("lower NULL_MAX to 253".to_owned())
+        );
+        assert_eq!(
+            guard_lower_hint(
+                "THREADS_READY_MAX",
+                129,
+                THREADS_READY_SLACK,
+                THREADS_READY_MAX
+            ),
+            Some("lower THREADS_READY_MAX to 12643".to_owned())
+        );
     }
 
     /// B is the longest row of any line of portions or short calls, never
