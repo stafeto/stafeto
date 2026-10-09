@@ -30,6 +30,10 @@ type Main = unsafe extern "C" fn(isize, *mut *mut c_char, *mut *mut c_char) -> c
 unsafe extern "C" {
     fn main(argc: isize, argv: *mut *mut c_char, envp: *mut *mut c_char) -> c_int;
     fn relibc_start_v1(stack: *const usize, main: Main) -> !;
+    /// The offset of the entry record in the thread's message buffer and
+    /// the offsets of its words `outer`, `owed` and `thread`, as relibc's
+    /// long jump has them.
+    fn relibc_stafeto_entries_layout_v2(out: *mut usize);
     /// The process's umask (posix-platform).
     fn stafeto_umask(mask: u32) -> u32;
     /// The ELF header, which lld maps with the read-only data.
@@ -98,6 +102,23 @@ fn start_relibc(arguments: &[*mut c_char]) -> ! {
 /// `stack` holds a Linux initial stack (argc, argv, NULL, envp, NULL, the
 /// auxiliary vector) that lives for the program's life.
 unsafe fn enter_relibc(stack: *const usize) -> ! {
+    // relibc's long jump and rt's entry distributor share the entry record
+    // of the thread; a relibc that places it elsewhere would leave a dead
+    // resident call marked live, so the process ends before `main`.
+    let mut layout = [0usize; 4];
+    // SAFETY: relibc fills the four words.
+    unsafe { relibc_stafeto_entries_layout_v2(layout.as_mut_ptr()) };
+    if layout
+        != [
+            rt::abi::msgbuf::ENTRIES,
+            rt::abi::msgbuf::ENTRIES + entries::ENTRY_OUTER,
+            rt::abi::msgbuf::ENTRIES + entries::ENTRY_OWED,
+            rt::abi::msgbuf::ENTRIES + entries::ENTRY_THREAD,
+        ]
+    {
+        rt::println!("POSIX startup: relibc places the entry record elsewhere");
+        rt::sys::process_exit(127);
+    }
     // relibc builds the TCB and the static TLS only when the register is
     // 0; the layer's start left no TCB there, and this says so.
     // SAFETY: no TCB of the layer is installed on this thread.

@@ -4,6 +4,7 @@
 //! Native scope state in the resident Block's existing metadata word.
 
 use super::*;
+use lifetime::Claim;
 
 const NATIVE: u64 = posix_thread::scope::NATIVE;
 const FALLBACK: u64 = posix_thread::scope::FALLBACK;
@@ -90,7 +91,7 @@ pub(crate) fn end_scope(block: &Block) {
 /// TABLE_LOCK and common entry deferral cover every resource insertion.
 /// Each successful SVC moves its exact owner into this prepaid MAKING row.
 fn populate(place: &Place, index: usize) -> Result<*mut u8, i32> {
-    let native = sys::self_thread_managed().map_err(|_| EAGAIN)?;
+    let native = sys::self_thread_shared().map_err(|_| EAGAIN)?;
     let raw = native.into_raw().0;
     place.native.store(raw, Ordering::Release);
     let info = sys::thread_info(&borrowed::<Thread>(raw)).map_err(|_| EIO)?;
@@ -158,7 +159,7 @@ fn close_retained(field: &AtomicU64) -> bool {
 ///
 /// # Safety
 /// TABLE_LOCK protects this row. Its Thread has genuinely Ended, or the
-/// exact current creator rolled back before LIVE, removed its observer
+/// exact current creator rolled back before LIVE, removed its resident handler
 /// and restored its previous TLS. No execution can borrow its Block.
 unsafe fn clean_journal(place: &Place, ended: bool) -> bool {
     let block = place.block.load(Ordering::Acquire) as *const Block;
@@ -255,7 +256,7 @@ pub(crate) fn enter() -> Result<*mut u8, i32> {
         Ok(page) => {
             let attached = crate::signals::attach_native(page);
             if let Err(error) = attached {
-                // No TLS was installed and no published observer remains.
+                // No TLS was installed and no resident handler remains.
                 place.state.set_flags(lifetime::MAKING | DETACHED);
                 if unsafe { clean_journal(place, false) } {
                     place.stack.store(0, Ordering::Release);
@@ -281,10 +282,23 @@ pub(crate) fn enter() -> Result<*mut u8, i32> {
     }
 }
 
+/// What `collect_row` found in a row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Row {
+    /// Not a native row.
+    Other,
+    /// A native row, collected or not yet collectible.
+    Native,
+    /// A native row that a sender pins: the next pass takes it.
+    Pinned,
+}
+
 /// Called under TABLE_LOCK; failed resource cleanup keeps every journal owner.
-pub(super) fn collect_row(index: usize, place: &Place) -> bool {
+/// A row that a sender pins (`with_target`) is left alone, whether it ended
+/// or is a bootstrap rollback that was LIVE a moment ago.
+pub(super) fn collect_row(index: usize, place: &Place) -> Row {
     if place.stack.load(Ordering::Acquire) != 1 {
-        return false;
+        return Row::Other;
     }
     let native = place.native.load(Ordering::Acquire);
     let ended = native != 0
@@ -295,18 +309,27 @@ pub(super) fn collect_row(index: usize, place: &Place) -> bool {
     }
     let flags = place.state.flags();
     let collectible = ended && flags == LIVE | EXITED | RELEASED | DETACHED;
-    if collectible && !place.state.claim_collect() {
-        return true;
-    }
-    if collectible || flags == lifetime::MAKING | DETACHED {
-        // SAFETY: genuine End or exact bootstrap rollback prevents live readers.
-        if unsafe { clean_journal(place, ended) } {
-            place.stack.store(0, Ordering::Release);
-            publish_free(place);
+    if collectible {
+        match place.state.claim_collect_unpinned(|| pinned(index)) {
+            Claim::Taken => {}
+            Claim::Unready => return Row::Native,
+            Claim::Pinned => return Row::Pinned,
         }
+    } else if flags == lifetime::MAKING | DETACHED {
+        // The bootstrap rollback: a sender may have pinned the row while it
+        // was LIVE.
+        if pinned(index) {
+            return Row::Pinned;
+        }
+    } else {
+        return Row::Native;
     }
-    let _ = index;
-    true
+    // SAFETY: genuine End or exact bootstrap rollback prevents live readers.
+    if unsafe { clean_journal(place, ended) } {
+        place.stack.store(0, Ordering::Release);
+        publish_free(place);
+    }
+    Row::Native
 }
 
 /// Opportunistic End collection never waits with an uninstalled or borrowed Block.

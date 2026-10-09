@@ -12,7 +12,8 @@
 //!
 //! Signals sent to the process (kill) wait on the page of the process's
 //! record, where the process service sets their bits and asks for the
-//! entry of the router, the main thread (spec 2, 3.3). The thread that
+//! entry of the router: the main thread first, then the thread a leaving
+//! router names (`relibc::leaving`; spec 2, 3.3). The thread that
 //! takes one is chosen late, when a thread looks at the page (`route`):
 //! one in sigwait for that signal, else the first in the table of threads
 //! whose mask lets it through; with none the signal stays on the page, and
@@ -380,6 +381,78 @@ fn taken(block: &Block, signal: i32) -> SigInfo {
     }
 }
 
+/// Marks along the path of `pthread_kill` for rtbench's S5 (feature
+/// `rtbench-marks`, `cargo xtask rtbench --short --icount --marks`): the
+/// counter and the kernel calls at five places, printed as one `MARKS`
+/// line per signal handled. Without the feature `mark` and `report` are
+/// empty and the path is the one that ships.
+#[cfg(feature = "rtbench-marks")]
+mod marks {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static CALLS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static ARMED: AtomicU64 = AtomicU64::new(0);
+
+    #[inline(always)]
+    fn counter() -> u64 {
+        let value: u64;
+        // SAFETY: reads the virtual counter, no memory is touched.
+        unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) value) };
+        value
+    }
+
+    /// Mark 0 arms the marks (the request), the others count while armed.
+    #[inline(always)]
+    pub fn mark(i: usize) {
+        if i == 0 {
+            ARMED.store(1, Ordering::Relaxed);
+        } else if ARMED.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        CALLS[i].store(rt::sys::calls(), Ordering::Relaxed);
+        COUNTER[i].store(counter(), Ordering::Relaxed);
+    }
+
+    /// The line `MARKS` with the counter and calls of the four segments:
+    /// `kill_relibc_thread` to the request, to `dispatch`, to `deliver`, to
+    /// the handler.
+    pub fn report() {
+        if ARMED.swap(0, Ordering::Relaxed) == 0 {
+            return;
+        }
+        let ticks = |a: usize, b: usize| {
+            COUNTER[b]
+                .load(Ordering::Relaxed)
+                .wrapping_sub(COUNTER[a].load(Ordering::Relaxed))
+        };
+        let calls = |a: usize, b: usize| {
+            CALLS[b]
+                .load(Ordering::Relaxed)
+                .wrapping_sub(CALLS[a].load(Ordering::Relaxed))
+        };
+        rt::println!(
+            "MARKS {} {} {} {} {} {} {} {}",
+            ticks(0, 1),
+            calls(0, 1),
+            ticks(1, 2),
+            calls(1, 2),
+            ticks(2, 3),
+            calls(2, 3),
+            ticks(3, 4),
+            calls(3, 4)
+        );
+    }
+}
+
+#[cfg(not(feature = "rtbench-marks"))]
+mod marks {
+    #[inline(always)]
+    pub fn mark(_: usize) {}
+    #[inline(always)]
+    pub fn report() {}
+}
+
 struct ClaimCritical;
 impl Drop for ClaimCritical {
     fn drop(&mut self) {
@@ -618,7 +691,7 @@ pub(crate) fn route() {
         });
         if let Some(Some(thread)) = entry {
             let native = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(thread));
-            let _ = sys::thread_layer_request(&native);
+            let _ = sys::thread_upcall_request(&native);
         }
     }
 }
@@ -807,12 +880,13 @@ fn send(
         return;
     }
     let flags = block.flags.load(Ordering::SeqCst);
+    marks::mark(1);
     if flags & flag::SIGNAL_WAIT != 0 && block.wait_set.load(Ordering::SeqCst) & bit != 0 {
         let channel =
             Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
         let _ = sys::notify(&channel, posix_sync::bit::WAKE);
     } else if flags & flag::SIGNALS_READY != 0 && bit & !block.mask.load(Ordering::SeqCst) != 0 {
-        let _ = sys::thread_layer_request(native);
+        let _ = sys::thread_upcall_request(native);
     }
 }
 
@@ -822,6 +896,7 @@ fn send(
 /// return. Job-control generations and process-wide effects go through
 /// the process service. 0 or an error number.
 pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
+    marks::mark(0);
     let bit = if signal == 0 {
         0
     } else {
@@ -1052,7 +1127,6 @@ pub fn sigtimedwait(
 }
 
 rt::upcall_entry!(entry, dispatch, context);
-rt::observer_upcall_entry!(observer_entry, dispatch, context);
 
 /// Where the calling thread's C errno lives: relibc's `__errno_location`. The entry saves and gives back
 /// the value there; it never moves the thread pointer (spec 2, 3.5).
@@ -1146,7 +1220,7 @@ pub(crate) fn stop_others() -> Result<(), i32> {
             }
             if asked & 1 << index == 0 {
                 asked |= 1 << index;
-                let _ = sys::thread_layer_request(&thread);
+                let _ = sys::thread_upcall_request(&thread);
             }
             let page = crate::process::page();
             let holds_process = block.process.load(Ordering::SeqCst)
@@ -1307,13 +1381,17 @@ pub(crate) fn attach() -> Result<(), i32> {
     // SAFETY: the dispatcher holds no interrupted Rust references or locks
     // and enters only caller-supplied C code.
     unsafe { upcall::bind(entry) }.map_err(|_| EIO)?;
-    unsafe { upcall::primary_layer_ready(true) }.map_err(|_| EIO)?;
     own().flags.fetch_or(flag::SIGNALS_READY, Ordering::SeqCst);
     unsafe { upcall::enable() }.map_err(|_| EIO)?;
     // A thread whose start ends while another stops the process parks
     // now: the stopper waits for it (`stop_others`).
     if stopped_by_other() {
         park();
+    }
+    // The thread may be the router the service was told of before its entry
+    // was bound: the signals that wait on the page come now.
+    if process_pending() != 0 {
+        route();
     }
     let block = own();
     if thread_pending(block) & !block.mask.load(Ordering::SeqCst) != 0 {
@@ -1322,19 +1400,46 @@ pub(crate) fn attach() -> Result<(), i32> {
     Ok(())
 }
 
-/// Register the resident observer while common Defer keeps it from entering.
+/// Register the resident handler while common Defer keeps it from entering.
+/// The page names the thread's TCB, and its ABI word is the TLS of the
+/// handler.
+/// Makes the next attachment of a native thread fail after its handler is
+/// bound, for the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_fail_next_attach() {
+    PROBE_FAIL_ATTACH.store(true, Ordering::SeqCst);
+}
+#[cfg(feature = "thread-probe")]
+static PROBE_FAIL_ATTACH: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
+    // SAFETY: the page's ABI word points to its complete TCB, whose block
+    // holds the thread's MANAGE handle (admission or the child of a fork
+    // filled it before this call).
+    let tcb = unsafe { *page.cast::<*mut posix_thread::Tcb>() };
+    let thread = unsafe { (*tcb).block.thread.load(Ordering::Relaxed) };
     // SAFETY: admission owns this page through End and uses the fixed dispatcher.
-    unsafe { upcall::bind_observer(observer_entry, page as usize) }.map_err(|_| EIO)?;
-    // A failed publication removes the handler before bootstrap cleanup.
-    let result = unsafe { upcall::observer_layer_ready(true) }
-        .and_then(|()| unsafe { upcall::enable_observer() }.map(|_| ()));
+    let owns_mask = unsafe { upcall::bind_resident(entry, page as usize, rt::abi::Handle(thread)) }
+        .map_err(|_| EIO)?;
+    // The layer lets entries in only when it bound the first handler of the
+    // thread: a handler the program bound before keeps the program's mask.
+    // A failed step removes the handler before bootstrap cleanup.
+    let mut result: Result<(), Error> = Ok(());
+    #[cfg(feature = "thread-probe")]
+    if PROBE_FAIL_ATTACH.swap(false, Ordering::SeqCst) {
+        result = Err(Error::BadState);
+    }
+    if result.is_ok() && owns_mask {
+        result = unsafe { upcall::enable() }.map(|_| ());
+    }
     if result.is_err() {
-        upcall::unbind_observer().expect("bootstrap observer rollback");
+        upcall::unbind_resident().expect("bootstrap resident rollback");
         return Err(EIO);
     }
-    // SAFETY: the page's ABI word points to its complete freshly built TCB.
-    let tcb = unsafe { *page.cast::<*mut posix_thread::Tcb>() };
+    // The thread ends through `rt::sys::thread_exit` without the library:
+    // its way out of the routing of the process's signals runs there.
+    upcall::set_exit_hook(Some(crate::relibc::exit_hook));
     unsafe {
         (*tcb)
             .block
@@ -1342,21 +1447,6 @@ pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
             .fetch_or(flag::SIGNALS_READY, Ordering::SeqCst)
     };
     Ok(())
-}
-
-fn entry_enable() -> Result<bool, rt::abi::Error> {
-    if crate::relibc::native::is_resident(own()) {
-        unsafe { upcall::enable_observer() }
-    } else {
-        unsafe { upcall::enable() }
-    }
-}
-fn entry_mask() -> Result<bool, rt::abi::Error> {
-    if crate::relibc::native::is_resident(own()) {
-        upcall::mask_observer()
-    } else {
-        upcall::mask()
-    }
 }
 
 /// Delivers the calling thread's pending unblocked signals now, with no call
@@ -1377,6 +1467,7 @@ pub(crate) fn deliver_deferred() {
 }
 
 unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
+    marks::mark(2);
     #[cfg(feature = "thread-probe")]
     native_stop_probe::entry(own());
     // Inside a critical section of the layer the entry only marks itself
@@ -1384,8 +1475,36 @@ unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
     if posix_sync::defer_entry() {
         return;
     }
+    // An entry that asked for nothing here (the other handler of the same
+    // entry, a request that another entry already served) returns with no
+    // call of the kernel and no lock.
+    if idle(own()) {
+        return;
+    }
     // SAFETY: the entry's frame.
     unsafe { deliver(native, true) };
+}
+
+/// The entries that went past the fast path of `idle` into `deliver`, for the
+/// probe that pins the fast path.
+#[cfg(feature = "thread-probe")]
+static ENTRY_DELIVERIES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "thread-probe")]
+pub fn probe_entry_deliveries() -> u64 {
+    ENTRY_DELIVERIES.load(Ordering::Relaxed)
+}
+
+/// Whether a delivery now would do nothing: no signal of the thread that its
+/// mask lets through, none of the process on the page (nor a stop or
+/// continue word), no stop by another thread, no deferred entry mark and no
+/// request of cancellation.
+fn idle(block: &Block) -> bool {
+    block.flags.load(Ordering::Relaxed) & flag::ENTRY_DEFERRED == 0
+        && !stopped_by_other()
+        && !threads::cancel::requested()
+        && process_pending() == 0
+        && thread_pending(block) & !block.mask.load(Ordering::SeqCst) == 0
 }
 
 /// Whether the next signal `take` would give has a handler with SA_SIGINFO.
@@ -1443,12 +1562,17 @@ fn take(block: &Block) -> Option<(i32, SigAction, Option<SigInfo>, u64)> {
 struct SignalPreparation {
     // Fields drop in order: settle local preparation before kernel Resume.
     local: posix_sync::DeliveryPreparation<'static>,
-    _kernel: upcall::DeferredEntry,
+    _kernel: Option<upcall::DeferredEntry>,
 }
 
 impl SignalPreparation {
-    fn begin() -> Self {
-        let deferred = upcall::defer_entries().expect("signal preparation deferral");
+    /// Inside an entry the kernel's mask keeps the next entry out: the
+    /// kernel masks the entry when it starts one and the layer masks it
+    /// again after each handler, so the kernel deferral (two calls) is
+    /// taken only outside an entry. `entered` says the caller is an entry.
+    fn begin(entered: bool) -> Self {
+        let deferred =
+            (!entered).then(|| upcall::defer_entries().expect("signal preparation deferral"));
         let block = own();
         Self {
             local: posix_sync::DeliveryPreparation::begin(block),
@@ -1456,7 +1580,7 @@ impl SignalPreparation {
         }
     }
 
-    fn settle_for_exit(self) -> upcall::DeferredEntry {
+    fn settle_for_exit(self) -> Option<upcall::DeferredEntry> {
         let Self { local, _kernel } = self;
         drop(local);
         _kernel
@@ -1468,7 +1592,12 @@ impl SignalPreparation {
 /// masks them on return. A null native frame requests a context-aware entry
 /// for SA_SIGINFO handlers.
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
-    let mut preparation = Some(SignalPreparation::begin());
+    marks::mark(3);
+    #[cfg(feature = "thread-probe")]
+    if entered {
+        ENTRY_DELIVERIES.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut preparation = Some(SignalPreparation::begin(entered));
     let block = own();
     if stopped_by_other() {
         // Keep both forms of deferral through the parking effect.
@@ -1503,7 +1632,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
                 block.thread.load(Ordering::Relaxed),
             ));
-            let _ = sys::thread_layer_request(&thread);
+            let _ = sys::thread_upcall_request(&thread);
             break;
         }
         let Some((signal, action, from_process, ticket)) = take(block) else {
@@ -1560,13 +1689,15 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
                 unsafe { core::mem::transmute(handler as usize) };
             drop(preparation.take());
             if entered {
-                entry_enable().expect("nested signal entry");
+                unsafe { upcall::enable() }.expect("nested signal entry");
             }
+            marks::mark(4);
             unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
+            marks::report();
             if entered {
-                entry_mask().expect("signal handler mask restoration");
+                upcall::mask().expect("signal handler mask restoration");
             }
-            preparation = Some(SignalPreparation::begin());
+            preparation = Some(SignalPreparation::begin(entered));
             block.handled.fetch_add(1, Ordering::SeqCst);
             // The callback may edit the return context. Preserve private native
             // metadata and let the kernel validate machine state on return.
@@ -1580,13 +1711,15 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
                 unsafe { core::mem::transmute(handler as usize) };
             drop(preparation.take());
             if entered {
-                entry_enable().expect("nested signal entry");
+                unsafe { upcall::enable() }.expect("nested signal entry");
             }
+            marks::mark(4);
             unsafe { callback(signal) };
+            marks::report();
             if entered {
-                entry_mask().expect("signal handler mask restoration");
+                upcall::mask().expect("signal handler mask restoration");
             }
-            preparation = Some(SignalPreparation::begin());
+            preparation = Some(SignalPreparation::begin(entered));
             block.handled.fetch_add(1, Ordering::SeqCst);
         }
         block.mask.store(restore_mask, Ordering::SeqCst);

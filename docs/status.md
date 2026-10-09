@@ -43,15 +43,14 @@ POSIX layer covers, and which commands check each piece. It describes
   thread, paid by its handle table and quota. Kind 13 compares a supplied
   Thread object with the caller and returns bool 0/1; raw handle values do
   not establish identity. Both preserve the ordinary ObjectInfo result span.
-  The current thread can register a fixed resident observer alongside its
-  native upcall. Control operations 5-9 address observer mask, enable, Take
-  (including original TLS), registration and a MANAGE LayerRequest with
-  native-entry fallback. Operations 10 and 12 explicitly publish current
-  primary/observer Layer roles; operation 11 requests a registered Layer
-  through a MANAGE Process capability. A fixed intrusive list in paid
-  Thread objects preserves the surviving role and removes an ending thread.
-  Existing upcall calls retain their ignored registers;
-  Return remains argument-free and restores the innermost context.
+  A thread has one entry: a handler address, a mask, a pending request and a
+  nested deferral. Control operations 0-4 are Mask, Enable, Take, Defer and
+  Resume; the numbers 5-12 of epoch 1 are retired, fail as INVALID_ARGS and
+  are never issued again. Return remains argument-free and restores the
+  innermost context. The layers above the kernel share the one entry (the
+  resident handler of the POSIX layer runs first, then the program's), and
+  the choice of the thread that receives a signal of the process lies in
+  the POSIX layer.
   Kind 11 of `object_info`, LABEL, gives the owner of a channel
   (with RECEIVE) the label of a labelled copy of it, O(1): the process
   service's Vouch. `process_kill` takes the level of the teardown it starts.

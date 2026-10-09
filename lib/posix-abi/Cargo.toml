@@ -19,6 +19,9 @@ rtbench = []
 # the file and heap workers, a cancellation window and a borrow of the
 # file state (tests/posix-threads, tests/posix-shared).
 thread-probe = []
+# Counter and kernel-call marks along the path of pthread_kill, printed as
+# `MARKS` lines (`cargo xtask rtbench --short --icount --marks`).
+rtbench-marks = ["rt/count-calls"]
 
 [dependencies]
 posix-types = { path = "../posix-types" }

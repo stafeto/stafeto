@@ -42,7 +42,7 @@ fn new_stop_after_false_check_requests_entry_before_closure() {
                 pending.set(true);
             },
         );
-        // Resume delivers the requested observer before user code.
+        // Resume delivers the requested entry before user code.
         if pending.replace(false) {
             parked.set(true);
         }
@@ -109,11 +109,11 @@ fn external_defer_receive_interrupt_does_not_release_stopper() {
     // The inner barrier checks before the new stop. An outer DeferredEntry remains.
     assert!(!barrier::must_park(0, 11));
     owner_effects.set(1); // Renewal precedes STOPPING in this ordering.
-    let pending_observer = true;
+    let pending_entry = true;
     // The scan sees native Receive with critical depth0, under external Defer.
     let stopper_complete = barrier::quiescent(true, KernelWait, 0, 0, false);
     assert!(!stopper_complete);
-    // Receive returns Interrupted. No observer enters until outer Resume.
+    // Receive returns Interrupted. No entry enters until outer Resume.
     closure_progress.set(1);
     assert!(
         !stopper_complete,
@@ -121,8 +121,8 @@ fn external_defer_receive_interrupt_does_not_release_stopper() {
     );
     assert_eq!(owner_effects.get(), 1);
     assert_eq!(closure_progress.get(), 1);
-    assert!(pending_observer);
-    // Outer Resume enters observer; PARKING proves the stop before commit.
+    assert!(pending_entry);
+    // Outer Resume enters the entry; PARKING proves the stop before commit.
     let parking = true;
     assert!(parking);
     let before_commit = closure_progress.get();

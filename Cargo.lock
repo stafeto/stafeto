@@ -43,6 +43,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "entries"
+version = "0.1.0"
+
+[[package]]
 name = "entropy"
 version = "0.1.0"
 dependencies = [
@@ -270,6 +274,7 @@ dependencies = [
 name = "posix-crt"
 version = "0.1.0"
 dependencies = [
+ "entries",
  "posix-abi",
  "posix-fs",
  "posix-platform",
@@ -681,6 +686,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "entries",
  "proto-fs",
  "proto-init",
  "proto-uart",

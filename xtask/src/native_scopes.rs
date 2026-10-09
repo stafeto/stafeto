@@ -15,6 +15,25 @@ pub fn both_images(
     native(vz)
 }
 
+/// The probe build says "router ended without handoff" when it repairs a
+/// router that ended past `rt`; each image has exactly one such thread
+/// by design (the thread that ends past the library in the pthread image,
+/// variant R5 in the native one). More lines would hide a handoff that
+/// another path lost.
+pub fn check_ended_routers(lines: &[String], expected: usize) -> Result<(), String> {
+    let found = lines
+        .iter()
+        .filter(|line| line.trim() == "router ended without handoff")
+        .count();
+    if found == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{found} lines \"router ended without handoff\", expected {expected}"
+        ))
+    }
+}
+
 pub fn check_markers(lines: &[String]) -> Result<(), String> {
     let selected = |prefix: &str| -> Result<u32, String> {
         let mut values = lines
@@ -77,6 +96,13 @@ mod tests {
         assert!(check_markers(&wrong).is_err());
         wrong[2] = "native-scopes-supervisor: ok parent=4294967296".into();
         assert!(check_markers(&wrong).is_err());
+    }
+    #[test]
+    fn repaired_routers_are_counted() {
+        let line = || "router ended without handoff".to_string();
+        assert!(check_ended_routers(&[line()], 1).is_ok());
+        assert!(check_ended_routers(&[], 1).is_err());
+        assert!(check_ended_routers(&[line(), line()], 1).is_err());
     }
     #[test]
     fn parent_observation_is_strict_and_bounded() {

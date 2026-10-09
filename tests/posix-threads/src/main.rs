@@ -44,17 +44,23 @@ mod clocks;
 #[cfg(not(feature = "cancel-input"))]
 mod credentials;
 #[cfg(not(feature = "cancel-input"))]
+mod entry_calls;
+#[cfg(not(feature = "cancel-input"))]
 mod futex;
 #[cfg(not(feature = "cancel-input"))]
 mod heap_lock;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
+mod kill_collect;
+#[cfg(not(feature = "cancel-input"))]
 mod layer;
 #[cfg(not(feature = "cancel-input"))]
 mod long;
 #[cfg(not(feature = "cancel-input"))]
 mod mutex;
+#[cfg(not(feature = "cancel-input"))]
+mod native_jump;
 #[cfg(not(feature = "cancel-input"))]
 mod native_mode;
 #[cfg(not(feature = "cancel-input"))]
@@ -65,6 +71,8 @@ mod once;
 mod one_thread;
 #[cfg(not(feature = "cancel-input"))]
 mod reentry;
+#[cfg(not(feature = "cancel-input"))]
+mod router;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_context;
 #[cfg(not(feature = "cancel-input"))]
@@ -505,6 +513,9 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !signal_preparation::run()
         || !signals::run()
         || !signal_context::run()
+        || !native_jump::run()
+        || !entry_calls::run()
+        || !kill_collect::run()
         || !signal_wait::run()
         || !cancellation::run()
     {
@@ -563,6 +574,9 @@ fn native_only(expected_parent: u32) -> c_int {
         return 13;
     }
     rt::println!("native-scopes: survivor and join ok");
+    if !router::run() {
+        return 17;
+    }
     0
 }
 

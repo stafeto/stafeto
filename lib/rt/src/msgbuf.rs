@@ -11,7 +11,7 @@
 //! of a message lie there too: `sys` puts those the thread sends, and the
 //! kernel writes those that came, with an info word each (`handle`).
 
-use abi::msgbuf::{HANDLES, INFO, SIZE};
+use abi::msgbuf::{HANDLES, INFO, RESERVED};
 use abi::{MESSAGE_HANDLES, ObjectKind, Rights};
 use core::arch::asm;
 
@@ -26,13 +26,14 @@ pub fn address() -> usize {
 
 /// Writes `bytes` into the calling thread's buffer at `offset` (spec
 /// 6.2); `bytes` may lie in the buffer itself, as a message that came does.
-/// Panics past the end of the buffer.
+/// Panics past `RESERVED`: the saved context and the entry record that lie
+/// after it have their own writers (`upcall`).
 pub fn write(offset: usize, bytes: &[u8]) {
     assert!(
         offset
             .checked_add(bytes.len())
-            .is_some_and(|end| end <= SIZE),
-        "past the message buffer"
+            .is_some_and(|end| end <= RESERVED),
+        "past the part of the message buffer a message uses"
     );
     // SAFETY: the buffer is the calling thread's page, mapped writable
     // while the thread lives (spec 6.2); only its own thread reaches it
@@ -41,13 +42,13 @@ pub fn write(offset: usize, bytes: &[u8]) {
 }
 
 /// Reads the calling thread's buffer at `offset` into `bytes` (spec 6.2),
-/// which may lie in the buffer itself. Panics past the end of the buffer.
+/// which may lie in the buffer itself. Panics past `RESERVED`.
 pub fn read(offset: usize, bytes: &mut [u8]) {
     assert!(
         offset
             .checked_add(bytes.len())
-            .is_some_and(|end| end <= SIZE),
-        "past the message buffer"
+            .is_some_and(|end| end <= RESERVED),
+        "past the part of the message buffer a message uses"
     );
     // SAFETY: as in `write`.
     unsafe {

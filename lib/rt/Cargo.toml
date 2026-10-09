@@ -24,6 +24,7 @@ step-stats = []
 
 [dependencies]
 abi = { path = "../abi" }
+entries = { path = "../entries" }
 bootimg = { path = "../bootimg" }
 proto-fs = { path = "../../proto/fs" }
 proto-init = { path = "../../proto/init" }

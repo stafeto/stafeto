@@ -29,6 +29,7 @@ mod ring;
 mod rootfs;
 mod rtbench;
 mod rtbench2;
+mod rtbench_check;
 mod stubs;
 mod symbolize;
 mod vz;
@@ -1121,13 +1122,23 @@ commands:
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ;
             with --minutes N, the POSIX scenarios of rtbench 2 on HVF and VZ,
             at the same time or, with --serial, one after the other;
-            with --short, one round of them on TCG, as ci runs it
+            with --short, one round of them on TCG; with --short --icount, as
+            ci runs it, under -icount, where the instructions of S5 stay under
+            S5_ICOUNT_MAX; with --marks added, the segments of that path
+  rtbench-check [--same-guest OLD=NEW] SESSION... compare the base and head runs of
+            at least four alternating sessions (each a directory with `order`,
+            `base/`, `head/`, the files rtbench-hvf.txt and rtbench-vz.txt)
+            against the limits of epoch 2 (S5 p50, median S5 p99 difference,
+            median S10 p50 ratio) and fail naming the rows that are over; `order`
+            has to agree with the `uptime before` lines of the runs, and
+            --same-guest declares that commit OLD in a file is the guest of NEW
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-cancel-input verify cancelled UART reads and cleanup handlers
   posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
+  posix-threads-hvf run the pthread probe on the host's processor (Hypervisor framework)
   image-gates verify genuine Take and accepted SetId ambiguity
   image-gates-steps measure retained image dispatches under icount
   image-gates-normal-steps measure normal SetId without reply corruption
@@ -1232,9 +1243,20 @@ fn main() {
                     };
                     rtbench2::run(minutes, placing)
                 }),
-            [flag] if flag == "--short" => relibc().and_then(|()| rtbench2::short()),
+            [flag, rest @ ..] if flag == "--short" => {
+                let how = match rest {
+                    [] => Ok(rtbench2::Short::Plain),
+                    [icount] if icount == "--icount" => Ok(rtbench2::Short::Icount),
+                    [icount, marks] if icount == "--icount" && marks == "--marks" => {
+                        Ok(rtbench2::Short::Marks)
+                    }
+                    _ => Err("usage: rtbench --short [--icount [--marks]]".to_owned()),
+                };
+                how.and_then(|how| relibc().and_then(|()| rtbench2::short(how)))
+            }
             rest => rtbench::run(rest),
         },
+        Some("rtbench-check") => rtbench_check::run(&args[1..]),
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
@@ -1289,6 +1311,7 @@ fn main() {
         Some("posix-cancel-input-vz") => posix_cancel_input_probe(true),
         Some("posix-threads") => posix_thread_probe(false),
         Some("posix-threads-vz") => posix_thread_probe(true),
+        Some("posix-threads-hvf") => posix_thread_probe_hvf(),
         Some("posix-abi") => posix_abi_probe(),
         Some("posix-shared") => posix_shared_probe(),
         Some("posix-input") => posix_input_probe(false),
@@ -1944,7 +1967,12 @@ fn probe_command(image: &Path, vz: bool) -> Result<(Command, Artifacts), String>
     let cmd = if vz {
         vz::command(&kernel.image, image)?
     } else {
-        let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(image));
+        let machine = if PROBES_ON_HVF.load(std::sync::atomic::Ordering::Relaxed) {
+            &qemu::HVF_V3
+        } else {
+            &qemu::VIRT
+        };
+        let mut cmd = qemu::command(machine, &kernel.image, Some(image));
         cmd.args(qemu::HEADLESS);
         cmd
     };
@@ -1969,6 +1997,21 @@ fn posix_orphans() -> Result<(), String> {
     qemu::expect_line(&output, PEER)?;
     println!("POSIX processes whose service ended fail their loads");
     Ok(())
+}
+
+/// Set by `posix-threads-hvf`: the QEMU probes of the pthread images run on
+/// the host's processor (HVF, GICv3) and not on TCG.
+static PROBES_ON_HVF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `posix-threads-hvf`: the pthread and native survivor images (native jump,
+/// router R1 to R8, signals) on the real processor.
+fn posix_thread_probe_hvf() -> Result<(), String> {
+    if let Err(why) = hvf_host() {
+        println!("posix-threads-hvf: skipped: {why}");
+        return Ok(());
+    }
+    PROBES_ON_HVF.store(true, std::sync::atomic::Ordering::Relaxed);
+    posix_thread_probe(false)
 }
 
 fn posix_thread_probe(vz: bool) -> Result<(), String> {
@@ -2006,7 +2049,8 @@ fn stock_thread_probe(vz: bool) -> Result<(), String> {
             &output,
             "priority-probe: heap and files at the ceiling above main, no helper thread",
         )?;
-        qemu::expect_marker(&output, "posix-process: adoption refusals ok")
+        qemu::expect_marker(&output, "posix-process: adoption refusals ok")?;
+        native_scopes::check_ended_routers(&output.lines, 1)
     });
     if vz {
         vz::stop_hint(checked)?;
@@ -2033,7 +2077,8 @@ fn native_scope_probe(vz: bool) -> Result<(), String> {
     const ENDED: &str = "init: posix-procs ended: exit code 0, not restarted";
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
     let checked = qemu::expect_stopped_on(&output, ENDED)
-        .and_then(|()| native_scopes::check_markers(&output.lines));
+        .and_then(|()| native_scopes::check_markers(&output.lines))
+        .and_then(|()| native_scopes::check_ended_routers(&output.lines, 1));
     if vz { vz::stop_hint(checked) } else { checked }
 }
 
@@ -3232,6 +3277,48 @@ const TERM_B: u64 = 20_410;
 /// that the kernel cannot spend the room TERM_B promises the services.
 const KERNEL_B_MAX: u64 = 18_000;
 const _: () = assert!(KERNEL_B_MAX < TERM_B);
+
+/// The guards of the paths epoch 2 made shorter, in ticks under -icount on
+/// the normal build (`init_tests`, row `null` of `normal build`), on the
+/// test build (`kernel_tests`, row `threads_ready` of `teardown portions`)
+/// and on the benchmark's image (`rtbench --short --icount`, the `min` of
+/// the three `s5_*` rows: the whole path of `pthread_kill` to the handler
+/// of the target, in instructions). The first two sit four ticks above the
+/// measure at the end of epoch 2 (262 and 12 764), the third sixteen above
+/// the measure (2 754; 2 756 at e0c670e, when the distributor saved the
+/// flags twice, and 4f3c7d0 had 2 562); a higher number needs a decision
+/// with its reason written down.
+///
+/// Rules for a guard that fires (the paths are deterministic under -icount,
+/// so a firing is no noise and a repeat does not clear it):
+/// 1. The commit that trips a guard either gives the path back or raises
+///    the constant in the same commit, with a line here: the new number,
+///    the commit, the reason.
+/// 2. When the source of the path did not change (the compiler moved the
+///    code) and the excess is at most `NULL_SLACK` for `null`,
+///    `THREADS_READY_SLACK` for `threads_ready` (one instruction a thread)
+///    or `S5_ICOUNT_SLACK` for the S5 rows, the author raises it with that
+///    line; a larger excess or a changed path needs the decision of the
+///    reviewer of the kernel (for the S5 rows, of the realtime reviewer:
+///    `rtbench --short --icount --marks` prints the segments of the path).
+/// 3. A change of the Rust toolchain measures both rows again and sets the
+///    constants anew in the same commit.
+/// 4. The guard looks down too: when the room is larger than the slack,
+///    `guard_lower_hint` prints "lower <NAME> to N", the measure plus the
+///    room the guard keeps (4, and 16 for S5; it does not fail), and
+///    the next commit lowers the constant, so that a shorter path does not
+///    turn into room for later growth.
+const NULL_MAX: u64 = 266;
+const THREADS_READY_MAX: u64 = 12_768;
+const S5_ICOUNT_MAX: u64 = 2_770;
+/// The room above which a guard asks to be lowered (rule 4).
+const NULL_SLACK: u64 = 16;
+/// The room each guard keeps above its measure when it is set or lowered.
+const NULL_KEEP: u64 = 4;
+const THREADS_READY_KEEP: u64 = 4;
+const S5_ICOUNT_KEEP: u64 = 16;
+const THREADS_READY_SLACK: u64 = 128;
+const S5_ICOUNT_SLACK: u64 = 16;
 
 /// The most one step of a service may take (one READ_INTO of up to
 /// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for
@@ -4469,7 +4556,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("ash", ash_probe),
         job("ash-dialog", ash_dialog),
         job("ls", ls_probe),
-        job("rtbench-short", rtbench2::short),
+        // One round of the benchmark under -icount: its rows are whole and
+        // the path of pthread_kill stays under S5_ICOUNT_MAX.
+        job("rtbench-short", || rtbench2::short(rtbench2::Short::Icount)),
         job("boot 512M GICv2", || {
             boot_smoke(&qemu::VIRT, GIC_V2_LINE).map(drop)
         }),
@@ -4569,6 +4658,8 @@ fn host_tests() -> Result<(), String> {
         "posix-signals",
         "--package",
         "posix-signal-queue",
+        "--package",
+        "entries",
         "--package",
         "posix-credentials",
         "--package",
@@ -5574,6 +5665,30 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
             m.name
         );
+        let (_, rows, ticks) = measured
+            .iter()
+            .find(|(what, ..)| *what == "teardown portions")
+            .ok_or("no teardown portions measured")?;
+        let room = guard_margin(
+            "teardown portions",
+            rows,
+            ticks,
+            "threads_ready",
+            THREADS_READY_MAX,
+        )?;
+        println!(
+            "threads_ready margin on {}: {room} of THREADS_READY_MAX {THREADS_READY_MAX}",
+            m.name
+        );
+        if let Some(hint) = guard_lower_hint(
+            "THREADS_READY_MAX",
+            room,
+            THREADS_READY_SLACK,
+            THREADS_READY_MAX,
+            THREADS_READY_KEEP,
+        ) {
+            println!("{hint}");
+        }
     }
     match variant {
         Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
@@ -5629,6 +5744,32 @@ fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, 
             n - KERNEL_B_MAX
         )),
     }
+}
+
+/// The row `row` of `rows` among the `ticks`, which may not pass `max`: the
+/// room left under it, or an error that names the row. The caller prints it.
+fn guard_margin(
+    what: &str,
+    rows: &[&str],
+    ticks: &[u64],
+    row: &str,
+    max: u64,
+) -> Result<u64, String> {
+    let n = rows
+        .iter()
+        .zip(ticks)
+        .find_map(|(r, &n)| (*r == row).then_some(n))
+        .ok_or_else(|| format!("the {what} line has no row {row}"))?;
+    max.checked_sub(n)
+        .ok_or_else(|| format!("{what} {row}={n} is {} past its guard {max}", n - max))
+}
+
+/// The line that asks to lower the guard `name` when its `room` under `max`
+/// is larger than `slack`: the new number is the measure plus `keep` ticks,
+/// the room the rule of that guard keeps (`NULL_KEEP` and `THREADS_READY_KEEP`
+/// 4, `S5_ICOUNT_KEEP` 16).
+fn guard_lower_hint(name: &str, room: u64, slack: u64, max: u64, keep: u64) -> Option<String> {
+    (room > slack).then(|| format!("lower {name} to {}", max - room + keep))
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -5733,6 +5874,11 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
             m.name,
             rows_of(&NORMAL_BUILD_ROWS, &ticks)
         );
+        let room = guard_margin("normal build", &NORMAL_BUILD_ROWS, &ticks, "null", NULL_MAX)?;
+        println!("null margin on {}: {room} of NULL_MAX {NULL_MAX}", m.name);
+        if let Some(hint) = guard_lower_hint("NULL_MAX", room, NULL_SLACK, NULL_MAX, NULL_KEEP) {
+            println!("{hint}");
+        }
         let ticks = ticks_of(&o.lines, "log", &LOG_ROWS)?;
         println!("log ticks on {}: {}", m.name, rows_of(&LOG_ROWS, &ticks));
     }
@@ -6196,6 +6342,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "posix-signal-queue",
         "--package",
+        "entries",
+        "--package",
         "posix-credentials",
         "--package",
         "proto-process",
@@ -6305,6 +6453,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-fs",
         "--package",
         "posix-signal-queue",
+        "--package",
+        "entries",
         "--package",
         "posix-abi",
         "--package",
@@ -7129,6 +7279,82 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// The guards of the paths of epoch 2 name the row and the excess.
+    #[test]
+    fn a_path_past_its_guard_fails_with_the_row_named() {
+        let null = |n| {
+            guard_margin(
+                "normal build",
+                &NORMAL_BUILD_ROWS,
+                &[n, 1, 1, 1, 1],
+                "null",
+                NULL_MAX,
+            )
+        };
+        assert_eq!(null(NULL_MAX), Ok(0));
+        assert_eq!(null(262), Ok(4));
+        let error = null(NULL_MAX + 1).unwrap_err();
+        assert!(
+            error.contains("null=267") && error.contains("1 past"),
+            "{error}"
+        );
+        let mut teardown = [0; 10];
+        teardown[TEARDOWN_ROWS
+            .iter()
+            .position(|r| *r == "threads_ready")
+            .unwrap()] = THREADS_READY_MAX + 8;
+        let error = guard_margin(
+            "teardown portions",
+            &TEARDOWN_ROWS,
+            &teardown,
+            "threads_ready",
+            THREADS_READY_MAX,
+        )
+        .unwrap_err();
+        assert!(error.contains("threads_ready=12776"), "{error}");
+        assert!(guard_margin("x", &NORMAL_BUILD_ROWS, &[0; 5], "none", 1).is_err());
+    }
+
+    /// A guard with more room than its slack asks to be lowered; at the slack
+    /// it stays quiet.
+    #[test]
+    fn a_guard_with_much_room_asks_to_be_lowered() {
+        assert_eq!(
+            guard_lower_hint("NULL_MAX", 4, NULL_SLACK, NULL_MAX, NULL_KEEP),
+            None
+        );
+        assert_eq!(
+            guard_lower_hint("NULL_MAX", NULL_SLACK, NULL_SLACK, NULL_MAX, NULL_KEEP),
+            None
+        );
+        assert_eq!(
+            guard_lower_hint("NULL_MAX", 17, NULL_SLACK, NULL_MAX, NULL_KEEP),
+            Some("lower NULL_MAX to 253".to_owned())
+        );
+        assert_eq!(
+            guard_lower_hint(
+                "THREADS_READY_MAX",
+                129,
+                THREADS_READY_SLACK,
+                THREADS_READY_MAX,
+                THREADS_READY_KEEP
+            ),
+            Some("lower THREADS_READY_MAX to 12643".to_owned())
+        );
+        // S5 keeps 16 above its measure: a measure 17 under the number
+        // (room 17) asks for the measure plus 16, which leaves room 16.
+        assert_eq!(
+            guard_lower_hint(
+                "S5_ICOUNT_MAX",
+                17,
+                S5_ICOUNT_SLACK,
+                S5_ICOUNT_MAX,
+                S5_ICOUNT_KEEP
+            ),
+            Some("lower S5_ICOUNT_MAX to 2769".to_owned())
+        );
     }
 
     /// B is the longest row of any line of portions or short calls, never

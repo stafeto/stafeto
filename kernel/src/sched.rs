@@ -209,7 +209,7 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 /// `t` is alive. When the kernel's reference is its last, `t` is queued
 /// for cleanup here, and the caller does not use it afterwards.
 pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
-    let (held, waited, forwarded) = locked(|k| {
+    let (held, waited) = locked(|k| {
         // SAFETY: `t` is alive; its node is read before the scheduler takes it.
         let state = unsafe { t.as_ref() }.sched.state();
         if state == State::Parked {
@@ -219,22 +219,13 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
         // SAFETY: `t` and the scheduler's threads are alive; the queue
         // gives up the thread before the scheduler ends it.
         let waited = unsafe { channel::cancel(t, k) };
-        // Remove the Layer before End and before releasing its scheduler reference.
-        // SAFETY: the lock guards this Thread and every role neighbour.
-        let forwarded = unsafe { crate::process::layers::ending(t) }
-            .and_then(|selected| unsafe { request_role_locked(selected, k) }.ok().flatten());
         // SAFETY: as above.
         unsafe {
             k.s.exit(t);
             thread::give_number(t, k.tokens);
         }
-        (
-            !matches!(state, State::Stopped | State::Dead),
-            waited,
-            forwarded,
-        )
+        (!matches!(state, State::Stopped | State::Dead), waited)
     });
-    finish_role_interrupt(forwarded, cause);
     if let Some(via) = waited {
         // SAFETY: the reference was the wait's.
         unsafe { via.let_go(cause) };
@@ -282,121 +273,16 @@ pub unsafe fn interrupt(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
 /// # Safety
 /// As for `interrupt`.
 pub unsafe fn request_upcall(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
-    // SAFETY: the caller retains the target.
-    unsafe { request_selected_upcall(t, cause, false) }
-}
-
-/// Request a resident observer with native-entry fallback.
-/// # Safety
-/// The caller retains the target through scheduler mutation.
-pub unsafe fn request_layer_upcall(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
-    // SAFETY: the caller's target retention promise.
-    unsafe { request_selected_upcall(t, cause, true) }
-}
-
-unsafe fn request_selected_upcall(t: NonNull<Thread>, cause: u8, layer: bool) -> Result<(), Error> {
     // SAFETY: as the caller promises.
     unsafe {
         interrupt_if(t, cause, |thread| {
             if matches!(thread.sched.state(), State::Stopped | State::Dead) {
                 return Err(Error::BadState);
             }
-            Ok((if layer {
-                thread.upcall.request_layer()?
-            } else {
-                thread.upcall.request()?
-            }) && matches!(thread.waits, Some(Wait::Receive(_) | Wait::Send(_))))
+            Ok(thread.upcall.request()?
+                && matches!(thread.waits, Some(Wait::Receive(_) | Wait::Send(_))))
         })
     }
-}
-
-/// One interrupted IPC wait, whose transit/reference finish outside SCHED.
-type RoleInterrupt = Option<(NonNull<Thread>, Option<channel::Via>)>;
-
-/// Request an exact published lane using the caller's existing SCHED guard.
-/// # Safety
-/// The selected pointer remains inside its live process list under this guard.
-unsafe fn request_role_locked(
-    selected: crate::process::layers::Selected,
-    k: &mut Locked<'_>,
-) -> Result<RoleInterrupt, Error> {
-    // SAFETY: the list's scheduler reference retains the selected Thread.
-    unsafe {
-        let t = selected.thread;
-        let interrupt = {
-            let thread = &mut *t.as_ptr();
-            if matches!(thread.sched.state(), State::Stopped | State::Dead) {
-                return Err(Error::BadState);
-            }
-            let enabled = if selected.observer {
-                thread.upcall.request_observer()?
-            } else {
-                thread.upcall.request()?
-            };
-            enabled && matches!(thread.waits, Some(Wait::Receive(_) | Wait::Send(_)))
-        };
-        if !interrupt {
-            return Ok(None);
-        }
-        let via = channel::withdraw(t, k);
-        syscall::set_result(t, Err(Error::Interrupted));
-        k.s.wake(t);
-        // Retain the interrupted Thread across transit/reference cleanup
-        // after this guard ends. The selected head itself never escapes.
-        thread::retain(t);
-        Ok(Some((t, via)))
-    }
-}
-
-fn finish_role_interrupt(interrupted: RoleInterrupt, cause: u8) {
-    let Some((t, via)) = interrupted else { return };
-    // SAFETY: withdraw returned its exact wait and the Thread still owns transit.
-    unsafe {
-        thread::drop_transit(t, cause);
-        if let Some(via) = via {
-            via.let_go(cause);
-        }
-        thread::release(t, cause);
-    }
-}
-
-/// Current-only publication after the resident handler and Block are ready.
-/// # Safety
-/// The caller holds this Thread throughout the operation.
-pub unsafe fn set_layer_role(
-    t: NonNull<Thread>,
-    role: u8,
-    enabled: bool,
-    cause: u8,
-) -> Result<(), Error> {
-    let interrupted = locked(|k| {
-        // SAFETY: SCHED guards publication and immediate pending delivery together.
-        let selected = unsafe { crate::process::layers::set_role(t, role, enabled) }?;
-        match selected {
-            // SAFETY: the selected live list member remains under this SCHED guard.
-            Some(selected) => unsafe { request_role_locked(selected, k) },
-            None => Ok(None),
-        }
-    })?;
-    finish_role_interrupt(interrupted, cause);
-    Ok(())
-}
-
-/// O(1) request through an explicitly held MANAGE Process capability.
-/// # Safety
-/// The caller retains this Process through the complete operation.
-pub unsafe fn request_process_layer(
-    p: NonNull<crate::process::Process>,
-    cause: u8,
-) -> Result<(), Error> {
-    let interrupted = locked(|k| {
-        // SAFETY: selection and request share one guard; no head borrow escapes.
-        let selected = unsafe { crate::process::layers::select(p, true) }?;
-        // SAFETY: the selected live list member remains under this SCHED guard.
-        unsafe { request_role_locked(selected, k) }
-    })?;
-    finish_role_interrupt(interrupted, cause);
-    Ok(())
 }
 
 /// Under the lock, `decide` says whether to end the send or receive of

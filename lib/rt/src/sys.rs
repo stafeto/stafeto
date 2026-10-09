@@ -355,6 +355,7 @@ pub fn thread_start(thread: &Handle<Thread>) -> Result<(), Error> {
 /// thread_exit: the calling thread ends; the last started thread of a
 /// process ends the process with code 0.
 pub fn thread_exit() -> ! {
+    crate::upcall::run_exit_hook();
     // SAFETY: the call ends the thread and does not return.
     unsafe {
         asm!(
@@ -518,36 +519,19 @@ pub fn self_thread() -> Result<Handle<Thread>, Error> {
     Ok(returned(&x))
 }
 
-/// One owned MANAGE capability of this actual calling thread.
-/// The capability permits current-thread control and has no DUPLICATE or TRANSFER.
-pub fn self_thread_managed() -> Result<Handle<Thread>, Error> {
+/// One owned MANAGE | DUPLICATE | TRANSFER capability of this actual
+/// calling thread: the rights the creator of a thread has on it, so that the
+/// thread's role can be copied to another process's service.
+pub fn self_thread_shared() -> Result<Handle<Thread>, Error> {
     let x = call::<{ Call::ObjectInfo.number() }>(&[
         0,
         abi::INFO_THREAD_SELF,
-        u64::from(Rights::MANAGE.0),
+        u64::from((Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER).0),
     ])?;
     if x[1] == 0 {
         return Err(Error::InvalidArgs);
     }
     Ok(returned(&x))
-}
-
-/// Request a resident observer, with native-entry fallback.
-pub fn thread_layer_request(thread: &Handle<Thread>) -> Result<(), Error> {
-    call::<{ Call::ThreadUpcallControl.number() }>(&[
-        abi::UpcallControl::LayerRequest.raw(),
-        thread.raw().0,
-    ])?;
-    Ok(())
-}
-
-/// Request an explicitly published resident Layer of this MANAGE Process.
-pub fn process_layer_request(process: &Handle<Process>) -> Result<(), Error> {
-    call::<{ Call::ThreadUpcallControl.number() }>(&[
-        abi::UpcallControl::ProcessLayerRequest.raw(),
-        process.raw().0,
-    ])?;
-    Ok(())
 }
 
 /// Kernel object comparison with this caller; raw handle equality is insufficient.

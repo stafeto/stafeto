@@ -56,44 +56,21 @@ pub fn validate_context(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Lane {
+/// The state of the one entry of a thread. Everything above this single
+/// lane lives at EL0 (`rt`, relibc): the order of several handlers, nesting
+/// and the reset after a long jump (design note "what cannot move out").
+#[derive(Debug)]
+pub struct State {
     entry: u64,
+    pc: u64,
+    flags: u64,
     depth: u32,
+    deferred: u32,
     masked: bool,
     pending: bool,
     entering: bool,
 }
-impl Lane {
-    const fn new(entry: u64) -> Self {
-        Self {
-            entry,
-            depth: 0,
-            masked: true,
-            pending: false,
-            entering: false,
-        }
-    }
-}
-
-/// One selected entry; an observer installs its resident TLS for dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Entry {
-    pub pc: u64,
-    pub tls: Option<u64>,
-}
-
-#[derive(Debug)]
-pub struct State {
-    primary: Lane,
-    observer: Lane,
-    pc: u64,
-    flags: u64,
-    observer_tls: u64,
-    interrupted_tls: u64,
-    deferred: u32,
-    next_observer: bool,
-}
+const _: () = assert!(core::mem::size_of::<State>() <= 40);
 impl Default for State {
     fn default() -> Self {
         Self::new()
@@ -102,197 +79,93 @@ impl Default for State {
 impl State {
     pub const fn new() -> Self {
         Self {
-            primary: Lane::new(0),
-            observer: Lane::new(0),
+            entry: 0,
             pc: 0,
             flags: 0,
-            observer_tls: 0,
-            interrupted_tls: 0,
+            depth: 0,
             deferred: 0,
-            next_observer: false,
+            masked: true,
+            pending: false,
+            entering: false,
         }
     }
+    /// Replace the entry: masked, nothing pending. Refused inside a handler
+    /// (`entering` implies a depth above 0) and after one was left by a long
+    /// jump (the depth stays above 0; `rt` binds once per thread). The
+    /// deferral count belongs to the thread's own sections and survives.
     pub fn bind(&mut self, entry: u64) -> Result<(), Error> {
-        if self.primary.depth != 0 || self.deferred != 0 {
+        if self.depth != 0 {
             return Err(Error::BadState);
         }
         crate::args::check_start(entry, 0, 1)?;
-        self.primary = Lane::new(entry);
+        self.entry = entry;
+        self.masked = true;
+        self.pending = false;
         Ok(())
     }
-    /// Install the current thread's observer while both entries are deferred.
-    pub fn bind_observer(&mut self, entry: u64, tls: u64) -> Result<(), Error> {
-        if self.observer.depth != 0 || self.observer.entering {
-            return Err(Error::BadState);
-        }
-        if (entry == 0) != (tls == 0) {
-            return Err(Error::InvalidArgs);
-        }
-        crate::args::check_start(entry, tls, 1)?;
-        self.observer = Lane::new(entry);
-        self.observer_tls = tls;
-        Ok(())
-    }
-    fn request_lane(&mut self, observer: bool) -> Result<bool, Error> {
-        let available = observer || self.observer.depth == 0;
-        let lane = if observer {
-            &mut self.observer
-        } else {
-            &mut self.primary
-        };
-        if lane.entry == 0 {
-            return Err(Error::BadState);
-        }
-        lane.pending = true;
-        Ok(!lane.masked && available)
-    }
-    /// Preserve the native request and its coalesced pending state.
+    /// Return whether an existing IPC wait should be interrupted now.
     pub fn request(&mut self) -> Result<bool, Error> {
-        self.request_lane(false)
-    }
-    /// Whether this exact lane has a handler.
-    pub fn registered(&self, observer: bool) -> bool {
-        if observer {
-            self.observer.entry != 0
-        } else {
-            self.primary.entry != 0
+        if self.entry == 0 {
+            return Err(Error::BadState);
         }
+        self.pending = true;
+        Ok(!self.masked)
     }
-    /// Request the observer without primary fallback.
-    pub fn request_observer(&mut self) -> Result<bool, Error> {
-        self.request_lane(true)
-    }
-    /// Prefer the resident observer; a thread without one uses its native entry.
-    pub fn request_layer(&mut self) -> Result<bool, Error> {
-        self.request_lane(self.observer.entry != 0)
-    }
-    fn active_observer(&self) -> bool {
-        self.observer.depth != 0
-    }
-    pub fn interrupted_tls(&self) -> u64 {
-        self.interrupted_tls
-    }
-    /// Old operations keep their native result span and share entry deferral.
-    pub fn control(&mut self, operation: u64) -> Result<(u64, u64, u64), Error> {
-        let op = UpcallControl::from_raw(operation).ok_or(Error::InvalidArgs)?;
-        let observer = matches!(
-            op,
-            UpcallControl::ObserverMask
-                | UpcallControl::ObserverEnable
-                | UpcallControl::ObserverTake
-        );
-        let was = u64::from(if observer {
-            self.observer.masked
-        } else {
-            self.primary.masked
-        });
-        match op {
+    /// `thread_upcall_control` with the parsed operation of x0.
+    pub fn control(&mut self, operation: UpcallControl) -> Result<(u64, u64, u64), Error> {
+        let was = u64::from(self.masked);
+        match operation {
+            UpcallControl::Mask => {
+                self.masked = true;
+                Ok((was, 0, 0))
+            }
+            UpcallControl::Enable if !self.entering => {
+                self.masked = false;
+                Ok((was, 0, 0))
+            }
+            UpcallControl::Take if self.entering => {
+                self.entering = false;
+                Ok((was, self.pc, self.flags))
+            }
             UpcallControl::Defer => {
                 self.deferred = self.deferred.checked_add(1).ok_or(Error::NoMemory)?;
-                return Ok((was, 0, 0));
+                Ok((was, 0, 0))
             }
             UpcallControl::Resume => {
                 self.deferred = self.deferred.checked_sub(1).ok_or(Error::BadState)?;
-                return Ok((was, 0, 0));
+                Ok((was, 0, 0))
             }
-            UpcallControl::ObserverBind
-            | UpcallControl::LayerRequest
-            | UpcallControl::PrimaryLayerReady
-            | UpcallControl::ProcessLayerRequest
-            | UpcallControl::ObserverLayerReady => {
-                return Err(Error::InvalidArgs);
-            }
-            _ => {}
+            UpcallControl::Enable | UpcallControl::Take => Err(Error::BadState),
         }
-        let active = self.active_observer();
-        let lane = if observer {
-            &mut self.observer
-        } else {
-            &mut self.primary
-        };
-        match op {
-            UpcallControl::Mask | UpcallControl::ObserverMask => lane.masked = true,
-            UpcallControl::Enable | UpcallControl::ObserverEnable if !lane.entering => {
-                lane.masked = false
-            }
-            UpcallControl::Take | UpcallControl::ObserverTake
-                if lane.entering && observer == active =>
-            {
-                lane.entering = false;
-                return Ok((was, self.pc, self.flags));
-            }
-            _ => return Err(Error::BadState),
-        }
-        Ok((was, 0, 0))
     }
-    /// Native compatibility helper; real delivery also captures interrupted TLS.
     pub fn prepare(&mut self, pc: u64, flags: u64, long_call: bool) -> Option<u64> {
-        self.prepare_with_tls(pc, flags, 0, long_call)
-            .map(|entry| entry.pc)
-    }
-    pub fn prepare_with_tls(
-        &mut self,
-        pc: u64,
-        flags: u64,
-        tls: u64,
-        long_call: bool,
-    ) -> Option<Entry> {
-        if self.deferred != 0 || long_call || self.primary.entering || self.observer.entering {
+        if self.entry == 0 || self.masked || self.deferred != 0 || !self.pending || long_call {
             return None;
         }
-        let primary = self.primary.entry != 0
-            && !self.primary.masked
-            && self.primary.pending
-            && self.observer.depth == 0;
-        let observer = self.observer.entry != 0 && !self.observer.masked && self.observer.pending;
-        if !primary && !observer {
-            return None;
-        }
-        let selected = observer && (!primary || self.next_observer);
-        self.next_observer = !selected;
-        let lane = if selected {
-            &mut self.observer
-        } else {
-            &mut self.primary
-        };
-        lane.masked = true;
-        lane.pending = false;
-        lane.entering = true;
-        lane.depth = lane.depth.saturating_add(1);
+        self.masked = true;
+        self.pending = false;
+        self.entering = true;
         self.pc = pc;
         self.flags = flags;
-        self.interrupted_tls = tls;
-        Some(Entry {
-            pc: lane.entry,
-            tls: selected.then_some(self.observer_tls),
-        })
+        // A handler that leaves its entry by a long jump never returns it:
+        // the count stays at its top then, and entries go on (`can_return`
+        // and `bind` only ask whether it is 0).
+        self.depth = self.depth.saturating_add(1);
+        Some(self.entry)
     }
-    /// Deferred eligible requests keep an enabled IPC wait interruptible.
+    /// A request deferred by an internal borrow must not strand a new wait.
     pub fn interrupt_wait(&self) -> bool {
-        self.deferred != 0
-            && ((self.primary.pending && !self.primary.masked && self.observer.depth == 0)
-                || (self.observer.pending && !self.observer.masked))
+        self.deferred != 0 && self.pending && !self.masked
     }
     pub fn can_return(&self) -> bool {
-        let lane = if self.active_observer() {
-            &self.observer
-        } else {
-            &self.primary
-        };
-        lane.depth != 0 && self.deferred == 0 && lane.masked && !lane.entering
+        self.depth != 0 && self.deferred == 0 && self.masked && !self.entering
     }
-    /// The observer nesting restriction identifies the innermost active entry.
     pub fn returned(&mut self) -> Result<(), Error> {
         if !self.can_return() {
             return Err(Error::BadState);
         }
-        let lane = if self.active_observer() {
-            &mut self.observer
-        } else {
-            &mut self.primary
-        };
-        lane.depth -= 1;
-        lane.masked = false;
+        self.depth -= 1;
+        self.masked = false;
         Ok(())
     }
 }
@@ -300,59 +173,11 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const MASK: u64 = UpcallControl::Mask.raw();
-    const ENABLE: u64 = UpcallControl::Enable.raw();
-    const TAKE: u64 = UpcallControl::Take.raw();
-    const DEFER: u64 = UpcallControl::Defer.raw();
-    const RESUME: u64 = UpcallControl::Resume.raw();
-    #[test]
-    fn published_primary_request_ignores_unpublished_observer() {
-        let mut state = State::new();
-        state.bind(0x1000).unwrap();
-        state.bind_observer(0x2000, 0x3000).unwrap();
-        state.control(1).unwrap();
-        state.control(6).unwrap();
-        assert!(state.registered(false) && state.registered(true));
-        state.request().unwrap();
-        assert_eq!(
-            state.prepare_with_tls(0x4000, 0, 0, false),
-            Some(Entry {
-                pc: 0x1000,
-                tls: None
-            })
-        );
-        state.control(2).unwrap();
-        state.returned().unwrap();
-        state.request_observer().unwrap();
-        assert_eq!(
-            state.prepare_with_tls(0x4000, 0, 0, false),
-            Some(Entry {
-                pc: 0x2000,
-                tls: Some(0x3000)
-            })
-        );
-    }
-
-    #[test]
-    fn observer_unbind_requires_new_primary_request_for_retained_page_signal() {
-        let mut state = State::new();
-        state.bind(0x1000).unwrap();
-        state.bind_observer(0x2000, 0x3000).unwrap();
-        state.control(1).unwrap();
-        state.request_observer().unwrap();
-        state.bind_observer(0, 0).unwrap();
-        assert!(state.registered(false) && !state.registered(true));
-        assert_eq!(state.prepare_with_tls(0x4000, 0, 0, false), None);
-        state.request().unwrap();
-        assert_eq!(
-            state.prepare_with_tls(0x4000, 0, 0, false),
-            Some(Entry {
-                pc: 0x1000,
-                tls: None
-            })
-        );
-    }
-
+    const MASK: UpcallControl = UpcallControl::Mask;
+    const ENABLE: UpcallControl = UpcallControl::Enable;
+    const TAKE: UpcallControl = UpcallControl::Take;
+    const DEFER: UpcallControl = UpcallControl::Defer;
+    const RESUME: UpcallControl = UpcallControl::Resume;
     #[test]
     fn restoration_rejects_privilege_interrupt_masks_and_foreign_buffer() {
         let check =
@@ -399,7 +224,7 @@ mod tests {
     fn entries_left_by_long_jumps_do_not_shut_the_entry() {
         let mut state = State::new();
         state.bind(0x1000).unwrap();
-        state.primary.depth = u32::MAX - 1;
+        state.depth = u32::MAX - 1;
         for _ in 0..3 {
             state.control(ENABLE).unwrap();
             assert_eq!(state.request(), Ok(true));
@@ -407,10 +232,10 @@ mod tests {
             assert_eq!(state.control(TAKE), Ok((1, 0x2000, 0)));
             // The handler jumps out: the thread unmasks with no return.
         }
-        assert_eq!(state.primary.depth, u32::MAX);
+        assert_eq!(state.depth, u32::MAX);
         assert!(state.can_return());
         state.returned().unwrap();
-        assert_eq!(state.primary.depth, u32::MAX - 1);
+        assert_eq!(state.depth, u32::MAX - 1);
     }
     #[test]
     fn requests_wait_for_registration_enable_and_long_call_completion() {
@@ -460,7 +285,6 @@ mod tests {
         assert_eq!(state.request(), Ok(true));
         assert!(state.interrupt_wait());
         assert_eq!(state.prepare(0x2000, 0, false), None);
-        assert_eq!(state.bind(0), Err(Error::BadState));
         state.control(RESUME).unwrap();
         assert_eq!(state.prepare(0x2000, 0, false), None);
         state.control(RESUME).unwrap();
@@ -513,142 +337,67 @@ mod tests {
         state.bind(0x1000).unwrap();
         state.request().unwrap();
         assert_eq!(state.bind(0x1002), Err(Error::InvalidArgs));
-        assert_eq!(state.control(10), Err(Error::InvalidArgs));
         assert_eq!(state.control(TAKE), Err(Error::BadState));
         state.control(ENABLE).unwrap();
         assert_eq!(state.prepare(0, 0, false), Some(0x1000));
         assert_eq!(state.control(TAKE), Ok((1, 0, 0)));
         state.returned().unwrap();
     }
+    /// The binding replaces the entry and nothing else: the deferral count
+    /// of the thread's own sections stays (the rt used to lift it around the
+    /// call), and the entry opens only after the last `Resume`.
     #[test]
-    fn observer_install_preserves_active_native_entry_and_both_pending_masks() {
-        let mut s = State::new();
-        s.bind(0x1000).unwrap();
-        s.control(ENABLE).unwrap();
-        s.request().unwrap();
-        assert_eq!(s.prepare(0x2000, NZCV, false), Some(0x1000));
-        s.control(TAKE).unwrap();
-        s.request().unwrap();
-        let primary = (
-            s.primary.entry,
-            s.primary.depth,
-            s.primary.masked,
-            s.primary.pending,
-        );
-        s.control(DEFER).unwrap();
-        s.bind_observer(0x3000, 0x4000).unwrap();
-        s.control(UpcallControl::ObserverEnable.raw()).unwrap();
-        s.request_layer().unwrap();
-        assert_eq!(
-            (
-                s.primary.entry,
-                s.primary.depth,
-                s.primary.masked,
-                s.primary.pending
-            ),
-            primary
-        );
-        assert!(s.interrupt_wait());
-        assert_eq!(s.prepare_with_tls(0x2100, 0, 0, false), None);
-        s.control(RESUME).unwrap();
-        assert_eq!(
-            s.prepare_with_tls(0x2100, NZCV, 0, false),
-            Some(Entry {
-                pc: 0x3000,
-                tls: Some(0x4000)
-            })
-        );
-        assert_eq!(s.control(TAKE), Err(Error::BadState));
-        assert_eq!(
-            s.control(UpcallControl::ObserverTake.raw()),
-            Ok((1, 0x2100, NZCV))
-        );
-        assert_eq!(s.interrupted_tls(), 0);
-        s.returned().unwrap();
-        assert_eq!(s.primary.depth, 1);
-        assert!(s.primary.pending);
-        s.control(MASK).unwrap();
-        s.returned().unwrap();
-        assert_eq!(s.primary.depth, 0);
+    fn binding_under_deferral_keeps_the_count() {
+        let mut state = State::new();
+        state.control(DEFER).unwrap();
+        state.control(DEFER).unwrap();
+        state.bind(0x1000).unwrap();
+        assert_eq!(state.control(MASK), Ok((1, 0, 0)));
+        state.control(ENABLE).unwrap();
+        assert_eq!(state.request(), Ok(true));
+        assert!(state.interrupt_wait());
+        assert_eq!(state.prepare(0x2000, 0, false), None);
+        state.control(RESUME).unwrap();
+        assert_eq!(state.prepare(0x2000, 0, false), None);
+        state.control(RESUME).unwrap();
+        assert_eq!(state.prepare(0x2000, 0, false), Some(0x1000));
+        assert_eq!(state.control(RESUME), Err(Error::BadState));
+        // A second binding drops the entry and the pending request; the debt stays.
+        state.control(TAKE).unwrap();
+        state.returned().unwrap();
+        state.control(DEFER).unwrap();
+        state.bind(0x3000).unwrap();
+        assert_eq!(state.control(RESUME), Ok((1, 0, 0)));
+        assert_eq!(state.control(RESUME), Err(Error::BadState));
     }
+    /// Inside a handler, between its entry and its return, the entry cannot
+    /// be replaced; after a long jump out of it (depth stays above 0) it
+    /// cannot either, for the rest of the thread.
     #[test]
-    fn observer_nesting_restores_innermost_and_delays_primary_until_outer_return() {
-        let mut s = State::new();
-        s.bind(0x1000).unwrap();
-        s.bind_observer(0x3000, 0x4000).unwrap();
-        s.control(ENABLE).unwrap();
-        s.control(UpcallControl::ObserverEnable.raw()).unwrap();
-        s.request_layer().unwrap();
-        s.prepare_with_tls(0x2000, NZCV, 0, false).unwrap();
-        s.control(UpcallControl::ObserverTake.raw()).unwrap();
-        assert_eq!(s.request(), Ok(false));
-        s.control(UpcallControl::ObserverEnable.raw()).unwrap();
-        assert_eq!(s.prepare(0x5000, 0, false), None);
-        s.request_layer().unwrap();
-        s.prepare_with_tls(0x5000, NZCV, 0x4000, false).unwrap();
-        assert_eq!(
-            s.control(UpcallControl::ObserverTake.raw()),
-            Ok((1, 0x5000, NZCV))
-        );
-        assert_eq!(s.interrupted_tls(), 0x4000);
-        assert_eq!(s.bind_observer(0, 0), Err(Error::BadState));
-        s.returned().unwrap();
-        assert_eq!(s.observer.depth, 1);
-        assert_eq!(s.prepare(0x5000, 0, false), None);
-        s.control(UpcallControl::ObserverMask.raw()).unwrap();
-        s.returned().unwrap();
-        assert_eq!(s.observer.depth, 0);
-        assert_eq!(s.prepare(0x2000, 0, false), Some(0x1000));
-    }
-    #[test]
-    fn eligible_pending_lanes_are_fair_and_layer_falls_back() {
-        let mut s = State::new();
-        s.bind(0x1000).unwrap();
-        s.control(ENABLE).unwrap();
-        s.request_layer().unwrap();
-        assert_eq!(s.prepare(0x2000, 0, false), Some(0x1000));
-        s.control(TAKE).unwrap();
-        s.returned().unwrap();
-        s.bind_observer(0x3000, 0x4000).unwrap();
-        s.control(UpcallControl::ObserverEnable.raw()).unwrap();
-        let mut entered = [0; 4];
-        for entry in &mut entered {
-            s.request().unwrap();
-            s.request_layer().unwrap();
-            *entry = s.prepare(0x2000, 0, false).unwrap();
-            s.control(if *entry == 0x1000 {
-                TAKE
-            } else {
-                UpcallControl::ObserverTake.raw()
-            })
-            .unwrap();
-            s.returned().unwrap();
-        }
-        assert!(entered.windows(2).all(|w| w[0] != w[1]));
-    }
-    #[test]
-    fn failed_observer_bind_and_shared_deferral_preserve_resident_debt() {
-        let mut s = State::new();
-        s.bind(0x1000).unwrap();
-        s.bind_observer(0x3000, 0x4000).unwrap();
-        s.control(UpcallControl::ObserverEnable.raw()).unwrap();
-        s.request_layer().unwrap();
-        for (entry, tls) in [(0x3002, 0x4000), (0x3000, 0x4008), (0, 0x4000), (0x3000, 0)] {
-            assert_eq!(s.bind_observer(entry, tls), Err(Error::InvalidArgs));
-        }
-        s.control(DEFER).unwrap();
-        assert_eq!(s.bind(0), Err(Error::BadState));
-        assert!(s.interrupt_wait());
-        assert_eq!(s.prepare(0x2000, 0, false), None);
-        s.control(RESUME).unwrap();
-        assert_eq!(
-            s.prepare_with_tls(0x2000, 0, 0x9000, false),
-            Some(Entry {
-                pc: 0x3000,
-                tls: Some(0x4000)
-            })
-        );
-        assert_eq!(s.interrupted_tls(), 0x9000);
-        assert_eq!(s.returned(), Err(Error::BadState));
+    fn binding_inside_a_handler_and_after_a_jump_is_refused() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.control(ENABLE).unwrap();
+        state.request().unwrap();
+        assert_eq!(state.prepare(0x2000, 0, false), Some(0x1000));
+        // Entered, not yet taken.
+        assert_eq!(state.bind(0x3000), Err(Error::BadState));
+        state.control(TAKE).unwrap();
+        // Taken, the handler runs.
+        assert_eq!(state.bind(0x3000), Err(Error::BadState));
+        assert_eq!(state.bind(0), Err(Error::BadState));
+        // The handler leaves by a long jump: the thread unmasks, no return.
+        state.control(ENABLE).unwrap();
+        assert_eq!(state.bind(0x3000), Err(Error::BadState));
+        // A later entry works, and the binding stays refused.
+        state.request().unwrap();
+        assert_eq!(state.prepare(0x4000, 0, false), Some(0x1000));
+        assert_eq!(state.bind(0x3000), Err(Error::BadState));
+        // Returned from both levels the entry can be replaced again.
+        state.control(TAKE).unwrap();
+        state.returned().unwrap();
+        state.control(MASK).unwrap();
+        state.returned().unwrap();
+        state.bind(0x3000).unwrap();
     }
 }

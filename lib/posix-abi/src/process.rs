@@ -192,10 +192,29 @@ pub fn identity() -> Option<&'static Handle<Channel>> {
 /// thread at the start, the next live one when the router leaves
 /// (relibc::leaving).
 pub fn register_router(thread: &Handle<rt::handle::Thread>) -> Result<(), i32> {
+    send_router(router_copy(thread)?)
+}
+
+/// The copy of `thread` the service keeps as the router: MANAGE and
+/// TRANSFER, made from a handle with DUPLICATE.
+pub(crate) fn router_copy(
+    thread: &Handle<rt::handle::Thread>,
+) -> Result<Handle<rt::handle::Thread>, i32> {
     use crate::constants::EIO;
     use rt::abi::Rights;
-    let copy =
-        rt::sys::handle_duplicate(thread, Rights::MANAGE | Rights::TRANSFER).map_err(|_| EIO)?;
+    rt::sys::handle_duplicate(thread, Rights::MANAGE | Rights::TRANSFER).map_err(|_| EIO)
+}
+
+/// Tells the service that the thread of `copy` routes the process's
+/// signals. Never under the table lock of the threads: the service may
+/// take long to answer.
+pub(crate) fn send_router(copy: Handle<rt::handle::Thread>) -> Result<(), i32> {
+    use crate::constants::EIO;
+    #[cfg(feature = "thread-probe")]
+    assert!(
+        !crate::relibc::probe_table_held_by_caller(),
+        "the router is named to the service under the table lock"
+    );
     let request = proto_process::Method::Router.header().bytes();
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
     let reply =

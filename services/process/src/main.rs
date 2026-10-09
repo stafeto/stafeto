@@ -963,14 +963,10 @@ impl Processes {
         Answer::Reply(Outgoing::new())
     }
 
-    /// The prepaid Process authority chooses a genuinely live published Layer role.
+    /// Asks for the entry of the router of the record in `index`, the
+    /// thread that routes the signals on its page.
     fn request_router(&self, index: usize) {
-        let Some(record) = self.records.get(index) else {
-            return;
-        };
-        if sys::process_layer_request(&record.process) == Err(rt::abi::Error::BadState)
-            && let Some(router) = self.routers[index].as_ref()
-        {
+        if let Some(router) = self.routers.get(index).and_then(Option::as_ref) {
             let _ = sys::thread_upcall_request(router);
         }
     }

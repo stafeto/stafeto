@@ -3,7 +3,7 @@
 
 //! Generations and detach states in the existing Place state word.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub(super) const FREE: u64 = 0;
 pub(super) const MAKING: u64 = 1;
@@ -26,6 +26,33 @@ pub enum OwnerStatus {
 #[repr(transparent)]
 pub(super) struct Lifetime(AtomicU64);
 
+/// What `claim_collect_unpinned` did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Claim {
+    /// The row is the collector's.
+    Taken,
+    /// The row is not collectible yet.
+    Unready,
+    /// A sender pins the row; it stays for the next pass.
+    Pinned,
+}
+
+/// A sender's pin of a row: the collector leaves the row alone while a pin
+/// stands. Dropping it gives the pin back.
+pub(super) struct Pin<'a> {
+    pins: &'a AtomicU32,
+    index: usize,
+    on_last: fn(usize),
+}
+
+impl Drop for Pin<'_> {
+    fn drop(&mut self) {
+        if self.pins.fetch_sub(1, Ordering::SeqCst) == 1 {
+            (self.on_last)(self.index);
+        }
+    }
+}
+
 impl Lifetime {
     pub(super) const fn new() -> Self {
         Self(AtomicU64::new(0))
@@ -33,6 +60,12 @@ impl Lifetime {
 
     pub(super) fn load(&self) -> u64 {
         self.0.load(Ordering::Acquire)
+    }
+
+    /// The word with the order of the pin protocol: a total order with the
+    /// sender's `PINS` increment and the collector's claim.
+    pub(super) fn load_seq(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
     }
 
     pub(super) fn flags(&self) -> u64 {
@@ -97,7 +130,7 @@ impl Lifetime {
     /// A failed native start preserves a concurrent final detach.
     pub(super) fn rollback(&self) {
         self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
                 Some((old & !LIVE) | MAKING)
             })
             .expect("rollback preserves the reserved lifetime");
@@ -179,18 +212,81 @@ impl Lifetime {
             .is_ok()
     }
 
-    pub(super) fn claim_collect(&self) -> bool {
+    /// Takes the row for collection; gives its word before the claim.
+    /// SeqCst: the claim and the sender's pin are ordered in one total order.
+    pub(super) fn claim_collect(&self) -> Option<u64> {
         let state = self.load();
-        state & FLAGS == LIVE | EXITED | RELEASED | DETACHED
+        (state & FLAGS == LIVE | EXITED | RELEASED | DETACHED
             && self
                 .0
                 .compare_exchange(
                     state,
                     (state & !FLAGS) | MAKING | DETACHED,
-                    Ordering::AcqRel,
+                    Ordering::SeqCst,
                     Ordering::Acquire,
                 )
-                .is_ok()
+                .is_ok())
+        .then_some(state)
+    }
+
+    /// Gives back a claim whose row a sender pinned: the word `prior`
+    /// returns. Only the collector holds the row in MAKING | DETACHED, so
+    /// the exchange cannot fail.
+    pub(super) fn unclaim(&self, prior: u64) {
+        self.0
+            .compare_exchange(
+                (prior & !FLAGS) | MAKING | DETACHED,
+                prior,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .expect("unclaim of a row that is not the collector's claim");
+    }
+
+    /// Claims the row for collection unless a sender pins it: `pinned`
+    /// tells whether one does. Both sides of the claim are looked at, so a
+    /// sender whose pin came after the first look sees MAKING (and goes)
+    /// or the collector sees the pin (and gives the row back).
+    pub(super) fn claim_collect_unpinned(&self, pinned: impl Fn() -> bool) -> Claim {
+        if pinned() {
+            return Claim::Pinned;
+        }
+        let Some(prior) = self.claim_collect() else {
+            return Claim::Unready;
+        };
+        if pinned() {
+            self.unclaim(prior);
+            return Claim::Pinned;
+        }
+        Claim::Taken
+    }
+
+    /// The sender's side: pins the row of a live thread, or None (ESRCH).
+    /// The pin is a count in `pins` (SeqCst), then the word is read again
+    /// (SeqCst): the collector writes the word and then reads the count, so
+    /// one of the two sees the other. The generation must be the same and
+    /// the row LIVE and not MAKING; the flags that the live thread changes
+    /// itself (EXITED, RELEASED, DETACHING, DETACHED) are not compared.
+    /// `on_last` runs for the sender whose release brought the count to
+    /// zero.
+    pub(super) fn try_pin<'a>(
+        &self,
+        pins: &'a AtomicU32,
+        index: usize,
+        on_last: fn(usize),
+    ) -> Option<Pin<'a>> {
+        let seen = self.load();
+        if seen & (LIVE | MAKING) != LIVE {
+            return None;
+        }
+        pins.fetch_add(1, Ordering::SeqCst);
+        let pin = Pin {
+            pins,
+            index,
+            on_last,
+        };
+        let now = self.load_seq();
+        (now >> 6 == seen >> 6 && now & (LIVE | MAKING) == LIVE).then_some(pin)
     }
 
     /// Child-exclusive fork discards the inherited recovery records first.
@@ -217,7 +313,7 @@ mod tests {
         row.begin_detach(owner);
         row.finish_detach(owner);
         row.native_ended();
-        assert!(row.claim_collect());
+        assert!(row.claim_collect().is_some());
         let claimed = row.load();
         row.native_ended();
         assert_eq!(row.load(), claimed);
@@ -236,9 +332,9 @@ mod tests {
         row.add_flags(EXITED);
         row.native_ended();
         assert_eq!(row.flags(), LIVE | EXITED | DETACHED);
-        assert!(!row.claim_collect());
+        assert!(row.claim_collect().is_none());
         row.add_flags(RELEASED);
-        assert!(row.claim_collect());
+        assert!(row.claim_collect().is_some());
     }
 
     #[test]
@@ -254,7 +350,7 @@ mod tests {
                 row.add_flags(EXITED | RELEASED);
             }
             row.native_ended();
-            assert!(row.claim_collect());
+            assert!(row.claim_collect().is_some());
         }
     }
 
@@ -276,7 +372,7 @@ mod tests {
         state.begin_detach(first);
         assert!(state.finish_detach(first));
         state.add_flags(EXITED | RELEASED);
-        assert!(state.claim_collect());
+        assert!(state.claim_collect().is_some());
         state.free();
         assert!(state.reserve());
         state.set_flags(LIVE);
@@ -315,13 +411,13 @@ mod tests {
         }
         assert!(
             rows.iter()
-                .all(|row| !row.reserve() && !row.claim_collect())
+                .all(|row| !row.reserve() && row.claim_collect().is_none())
         );
         for (index, row) in rows.iter().enumerate() {
             let owner = row.token(index + 1).unwrap();
             assert_eq!(row.status(owner), OwnerStatus::Detaching);
             assert!(row.finish_detach(owner));
-            assert!(row.claim_collect());
+            assert!(row.claim_collect().is_some());
             row.free();
             assert!(row.reserve());
             assert_ne!(row.token(index + 1), Some(owner));
@@ -337,11 +433,11 @@ mod tests {
         assert_eq!(state.begin_detach(owner), OwnerStatus::Detaching);
         // A busy callback completes no local transition.
         assert_eq!(state.status(owner), OwnerStatus::Detaching);
-        assert!(!state.claim_collect());
+        assert!(state.claim_collect().is_none());
         assert!(!state.reserve());
         assert_eq!(state.token(5), Some(owner));
         assert!(state.finish_detach(owner));
-        assert!(state.claim_collect());
+        assert!(state.claim_collect().is_some());
         state.free();
         assert!(state.reserve());
         assert_ne!(state.token(5), Some(owner));
@@ -355,13 +451,13 @@ mod tests {
         let owner = state.owner(2).unwrap();
         assert_eq!(state.begin_detach(owner), OwnerStatus::Detaching);
         assert_eq!(state.owner(2), None);
-        assert!(!state.claim_collect());
+        assert!(state.claim_collect().is_none());
         state.finish_detach(owner);
-        assert!(!state.claim_collect());
+        assert!(state.claim_collect().is_none());
         state.add_flags(EXITED);
-        assert!(!state.claim_collect());
+        assert!(state.claim_collect().is_none());
         state.add_flags(RELEASED);
-        assert!(state.claim_collect());
+        assert!(state.claim_collect().is_some());
     }
 
     #[test]
@@ -370,11 +466,11 @@ mod tests {
         state.reserve();
         state.set_flags(LIVE | EXITED | RELEASED);
         let owner = state.token(1).unwrap();
-        assert!(!state.claim_collect());
+        assert!(state.claim_collect().is_none());
         state.begin_detach(owner);
-        assert!(!state.claim_collect());
+        assert!(state.claim_collect().is_none());
         state.finish_detach(owner);
-        assert!(state.claim_collect());
+        assert!(state.claim_collect().is_some());
     }
 
     #[test]
@@ -492,7 +588,7 @@ mod tests {
         state.begin_detach(value);
         table.abandon_owner(owner).unwrap();
         state.finish_detach(value);
-        assert!(!state.claim_collect());
+        assert!(state.claim_collect().is_none());
         let Claim::Acquired { token: claim, .. } = table.claim_open(open, helper).unwrap() else {
             panic!("sibling acquires the abandoned exact operation")
         };
@@ -517,13 +613,13 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(row.status(first), OwnerStatus::Gone);
         assert!(!row.finish_detach(first));
-        assert!(!row.claim_collect());
+        assert!(row.claim_collect().is_none());
         assert!(!row.reserve());
         row.begin_detach(second);
         row.finish_detach(second);
-        assert!(!row.claim_collect());
+        assert!(row.claim_collect().is_none());
         row.add_flags(EXITED | RELEASED);
-        assert!(row.claim_collect());
+        assert!(row.claim_collect().is_some());
         row.free();
         assert!(row.reserve());
     }
@@ -537,8 +633,167 @@ mod tests {
         assert_eq!(row.token(5), None);
         assert!(!row.reserve());
         row.add_flags(EXITED | RELEASED);
-        assert!(row.claim_collect());
+        assert!(row.claim_collect().is_some());
         row.free();
         assert!(!row.reserve());
+    }
+
+    #[test]
+    fn claim_gives_the_prior_word_and_unclaim_restores_it() {
+        let row = Lifetime::new();
+        assert!(row.reserve());
+        row.set_flags(LIVE | EXITED | RELEASED | DETACHED);
+        let before = row.load();
+        let prior = row.claim_collect().expect("collectible");
+        assert_eq!(prior, before);
+        assert_eq!(row.flags(), MAKING | DETACHED);
+        row.unclaim(prior);
+        assert_eq!(row.load(), before);
+        assert_eq!(before >> 6, 1, "the generation is the same");
+        assert!(row.claim_collect().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "unclaim of a row that is not the collector's claim")]
+    fn unclaim_of_a_foreign_word_panics() {
+        let row = Lifetime::new();
+        assert!(row.reserve());
+        row.set_flags(LIVE | EXITED | RELEASED | DETACHED);
+        let prior = row.claim_collect().unwrap();
+        row.free();
+        row.unclaim(prior);
+    }
+
+    #[test]
+    fn a_pin_stops_the_claim_and_leaves_the_row_whole() {
+        let row = Lifetime::new();
+        assert!(row.reserve());
+        row.set_flags(LIVE | EXITED | RELEASED | DETACHED);
+        let pins = AtomicU32::new(0);
+        let pin = row.try_pin(&pins, 0, |_| {}).expect("a live row");
+        let before = row.load();
+        let pinned = || pins.load(Ordering::SeqCst) != 0;
+        assert_eq!(row.claim_collect_unpinned(pinned), Claim::Pinned);
+        assert_eq!(row.load(), before);
+        drop(pin);
+        assert_eq!(pins.load(Ordering::SeqCst), 0);
+        assert_eq!(row.claim_collect_unpinned(pinned), Claim::Taken);
+        assert!(row.try_pin(&pins, 0, |_| {}).is_none());
+        assert_eq!(
+            pins.load(Ordering::SeqCst),
+            0,
+            "a refused pin is given back"
+        );
+    }
+
+    #[test]
+    fn a_pin_taken_between_the_looks_is_given_back_by_the_collector() {
+        let row = Lifetime::new();
+        assert!(row.reserve());
+        row.set_flags(LIVE | EXITED | RELEASED | DETACHED);
+        let pins = AtomicU32::new(0);
+        let before = row.load();
+        let looks = core::cell::Cell::new(0);
+        // The first look finds no pin, the second finds one: the pin of a
+        // sender that came between the two.
+        let claim = row.claim_collect_unpinned(|| {
+            looks.set(looks.get() + 1);
+            if looks.get() == 2 {
+                pins.store(1, Ordering::SeqCst);
+            }
+            pins.load(Ordering::SeqCst) != 0
+        });
+        assert_eq!(claim, Claim::Pinned);
+        assert_eq!(row.load(), before);
+    }
+
+    #[test]
+    fn the_last_release_runs_on_last_once() {
+        use core::sync::atomic::AtomicUsize;
+        static LAST: AtomicUsize = AtomicUsize::new(0);
+        fn on_last(index: usize) {
+            LAST.fetch_add(index + 1, Ordering::SeqCst);
+        }
+        let row = Lifetime::new();
+        assert!(row.reserve());
+        row.set_flags(LIVE);
+        let pins = AtomicU32::new(0);
+        let first = row.try_pin(&pins, 6, on_last).unwrap();
+        let second = row.try_pin(&pins, 6, on_last).unwrap();
+        drop(first);
+        assert_eq!(LAST.load(Ordering::SeqCst), 0);
+        drop(second);
+        assert_eq!(LAST.load(Ordering::SeqCst), 7);
+    }
+
+    /// Senders pin a place and read its resource; the collector frees the
+    /// resource only for a place it took, and then makes a new generation.
+    /// No sender reads a freed resource.
+    #[test]
+    fn senders_never_read_a_resource_the_collector_freed() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        const FREED: u64 = u64::MAX;
+        const ROUNDS: u64 = 100_000;
+        struct Shared {
+            row: Lifetime,
+            pins: AtomicU32,
+            resource: AtomicU64,
+            done: AtomicBool,
+            bad: AtomicU64,
+            reads: AtomicU64,
+        }
+        let shared = Arc::new(Shared {
+            row: Lifetime::new(),
+            pins: AtomicU32::new(0),
+            resource: AtomicU64::new(1),
+            done: AtomicBool::new(false),
+            bad: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+        });
+        assert!(shared.row.reserve());
+        shared.row.set_flags(LIVE);
+        let senders: std::vec::Vec<_> = (0..4)
+            .map(|_| {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    while !shared.done.load(Ordering::Relaxed) {
+                        if let Some(_pin) = shared.row.try_pin(&shared.pins, 0, |_| {}) {
+                            if shared.resource.load(Ordering::Acquire) == FREED {
+                                shared.bad.fetch_add(1, Ordering::SeqCst);
+                            }
+                            shared.reads.fetch_add(1, Ordering::Relaxed);
+                        }
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for round in 0..ROUNDS {
+            // The thread ended and was released.
+            shared.row.set_flags(LIVE | EXITED | RELEASED | DETACHED);
+            while shared
+                .row
+                .claim_collect_unpinned(|| shared.pins.load(Ordering::SeqCst) != 0)
+                != Claim::Taken
+            {
+                std::thread::yield_now();
+            }
+            shared.resource.store(FREED, Ordering::Release);
+            shared.row.free();
+            assert!(shared.row.reserve());
+            shared.resource.store(round + 2, Ordering::Release);
+            shared.row.set_flags(LIVE);
+        }
+        shared.done.store(true, Ordering::Relaxed);
+        for sender in senders {
+            sender.join().unwrap();
+        }
+        assert_eq!(
+            shared.bad.load(Ordering::SeqCst),
+            0,
+            "a freed resource was read under a pin"
+        );
+        assert!(shared.reads.load(Ordering::SeqCst) > 0);
     }
 }

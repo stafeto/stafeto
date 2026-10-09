@@ -13,6 +13,10 @@ name = "rtbench-posix"
 test = false
 bench = false
 
+[features]
+# The marks of posix-abi along the path of pthread_kill.
+rtbench-marks = ["posix-abi/rtbench-marks"]
+
 [dependencies]
 abi = { path = "../../lib/abi" }
 posix-abi = { path = "../../lib/posix-abi", features = ["rtbench"] }

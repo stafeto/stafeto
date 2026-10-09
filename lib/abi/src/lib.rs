@@ -283,7 +283,11 @@ pub enum Call {
     /// for the reply to an accepted request is not taken back, and the
     /// reply comes once (spec 6.1).
     ThreadInterrupt = 30,
-    /// Register the current thread's upcall entry (zero disables it).
+    /// Register the current thread's upcall entry (zero disables it). The
+    /// entry starts masked with no pending request. BadState inside a
+    /// handler and, for the rest of the thread, after a handler was left by
+    /// a long jump (the depth stays above zero). Allowed under a deferral,
+    /// whose count it keeps.
     ThreadUpcallBind = 31,
     /// Current upcall control: x0 is an `UpcallControl`. Deferral preserves
     /// the mask and interrupts enabled IPC waits while delaying dispatcher
@@ -496,6 +500,16 @@ impl ObjectKind {
 /// Bytes 0-63 of a message travel in x2-x9, and the kernel neither reads
 /// nor writes them here; it copies bytes 64 up to the length from the
 /// sender's buffer into the receiver's, at the same offsets.
+///
+/// | Bytes | Name | Owner |
+/// |---|---|---|
+/// | 0-1023 | `DATA` | the message (`COPIED` and up copied by the kernel); the kernel also writes the records of `object_info` `LOG` (up to 960 bytes) and `KERNEL_STATS` with x2 = 1 (296 bytes) here, from offset 0 |
+/// | 1024-1055 | `HANDLES` | the handle values of a message |
+/// | 1056-1087 | `INFO` | an info word for each handle that came |
+/// | 1088-1119 | | unused |
+/// | 1120-1935 | `CONTEXT` | the saved context of an entry, read at its return |
+/// | 1936-1999 | `ENTRIES` | the entry record of `rt`, which the kernel never touches |
+/// | 2000-4095 | | unused |
 pub mod msgbuf {
     use crate::{INLINE_MAX, MESSAGE_HANDLES, MESSAGE_MAX, ObjectKind, Rights};
 
@@ -509,10 +523,31 @@ pub mod msgbuf {
     /// An info word for each handle that came (`info`), MESSAGE_HANDLES
     /// words, written by the kernel at delivery.
     pub const INFO: usize = HANDLES + 8 * MESSAGE_HANDLES;
-    /// The kernel's reserve, to the end of the page: no program uses it.
+    /// The end of the part a message uses: the offsets of `DATA` up to
+    /// here are those of messages, handles and info words.
     pub const RESERVED: usize = INFO + 8 * MESSAGE_HANDLES;
+    /// The saved context of an entry (`UPCALL_CONTEXT_OFFSET`).
+    pub const CONTEXT: usize = crate::UPCALL_CONTEXT_OFFSET;
+    /// The end of the saved context.
+    pub const CONTEXT_END: usize = CONTEXT + crate::UPCALL_CONTEXT_SIZE;
+    /// The entry record of `rt`: eight words, which only the thread that
+    /// owns the page reads and writes. The kernel writes `HANDLES` and
+    /// `INFO`, copies bytes from `COPIED` up to the length of a message,
+    /// and reads `CONTEXT` at the return of an entry; it leaves these bytes
+    /// alone.
+    pub const ENTRIES: usize = CONTEXT_END;
+    /// The size of the entry record in bytes.
+    pub const ENTRIES_SIZE: usize = 64;
+    // The words inside the record (handlers, TLS, flags) are the contract of
+    // `rt` and relibc: `entries::ENTRY_*`.
     /// The size of the buffer, one page.
     pub const SIZE: usize = 4096;
+
+    const _: () = {
+        assert!(CONTEXT >= RESERVED);
+        assert!(ENTRIES.is_multiple_of(8));
+        assert!(ENTRIES + ENTRIES_SIZE <= SIZE);
+    };
 
     /// The info word of a handle to an object of `kind` with `rights`:
     /// bits 0-31 the rights, bits 32-39 the kind.
@@ -736,9 +771,11 @@ pub const INFO_LOG: u64 = 9;
 /// (spec 5.3, 11). WRONG_TYPE for a copy without a label, ACCESS_DENIED
 /// for a copy of another channel.
 pub const INFO_LABEL: u64 = 11;
-/// SELF_THREAD requires x0 zero and x2 exactly NONE or MANAGE, returning
-/// one owned handle to the calling thread in x1 with those rights. Its handle table insertion is paid
-/// by the caller's quota; errors leave no new handle or thread reference.
+/// SELF_THREAD requires x0 zero and x2 a subset of MANAGE | DUPLICATE |
+/// TRANSFER (the rights the creator of a thread gets from thread_create),
+/// returning one owned handle to the calling thread in x1 with those rights.
+/// Its handle table insertion is paid by the caller's quota; errors leave no
+/// new handle or thread reference.
 pub const INFO_THREAD_SELF: u64 = 12;
 /// THREAD_CURRENT takes a thread handle with any rights and x2 zero. It
 /// compares its kernel object with the caller and returns only bool 0 or 1.
@@ -1167,7 +1204,9 @@ pub const PRIORITY_LEVELS: u8 = 64;
 pub const RR_QUANTUM_NS: u64 = 4_000_000;
 
 /// The operations of `thread_upcall_control` (x0), each on the current
-/// thread's entry state; any other value is INVALID_ARGS.
+/// thread's entry state; any other value is INVALID_ARGS. The numbers 5 to
+/// 12 were retired in epoch 2 and are never issued again: a new operation
+/// takes 13 or above.
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpcallControl {
@@ -1181,22 +1220,6 @@ pub enum UpcallControl {
     Defer = 3,
     /// End one level of entry deferral; BAD_STATE without one.
     Resume = 4,
-    /// Mask the current thread's observer entry.
-    ObserverMask = 5,
-    /// Enable its observer entry.
-    ObserverEnable = 6,
-    /// Take observer PC, PSTATE and interrupted TLS (x2-x4).
-    ObserverTake = 7,
-    /// Bind observer entry x1 with resident TLS ABI word x2.
-    ObserverBind = 8,
-    /// Request the observer of MANAGE Thread x1, with native-entry fallback.
-    LayerRequest = 9,
-    /// Publish or remove the current primary Layer role (x1=0/1).
-    PrimaryLayerReady = 10,
-    /// Request one registered Layer of MANAGE Process x1.
-    ProcessLayerRequest = 11,
-    /// Publish or remove the current observer Layer role (x1=0/1).
-    ObserverLayerReady = 12,
 }
 
 impl UpcallControl {
@@ -1208,14 +1231,6 @@ impl UpcallControl {
             2 => Some(UpcallControl::Take),
             3 => Some(UpcallControl::Defer),
             4 => Some(UpcallControl::Resume),
-            5 => Some(UpcallControl::ObserverMask),
-            6 => Some(UpcallControl::ObserverEnable),
-            7 => Some(UpcallControl::ObserverTake),
-            8 => Some(UpcallControl::ObserverBind),
-            9 => Some(UpcallControl::LayerRequest),
-            10 => Some(UpcallControl::PrimaryLayerReady),
-            11 => Some(UpcallControl::ProcessLayerRequest),
-            12 => Some(UpcallControl::ObserverLayerReady),
             _ => None,
         }
     }
@@ -1552,6 +1567,10 @@ mod tests {
             (DATA, COPIED, HANDLES, INFO, RESERVED, SIZE),
             (0, 64, 1024, 1056, 1088, 4096)
         );
+        assert_eq!(
+            (CONTEXT, CONTEXT_END, ENTRIES, ENTRIES_SIZE),
+            (1120, 1936, 1936, 64)
+        );
         let word = info(ObjectKind::Channel, Rights::SEND | Rights::TRANSFER);
         assert_eq!(word, 3 << 32 | 0b110);
         assert_eq!(
@@ -1578,27 +1597,20 @@ mod tests {
     }
 
     #[test]
-    fn upcall_control_keeps_native_and_observer_operation_numbers() {
+    fn upcall_control_keeps_five_operations_and_retires_the_rest() {
         let operations = [
             (UpcallControl::Mask, 0),
             (UpcallControl::Enable, 1),
             (UpcallControl::Take, 2),
             (UpcallControl::Defer, 3),
             (UpcallControl::Resume, 4),
-            (UpcallControl::ObserverMask, 5),
-            (UpcallControl::ObserverEnable, 6),
-            (UpcallControl::ObserverTake, 7),
-            (UpcallControl::ObserverBind, 8),
-            (UpcallControl::LayerRequest, 9),
-            (UpcallControl::PrimaryLayerReady, 10),
-            (UpcallControl::ProcessLayerRequest, 11),
-            (UpcallControl::ObserverLayerReady, 12),
         ];
         for (operation, raw) in operations {
             assert_eq!(operation.raw(), raw);
             assert_eq!(UpcallControl::from_raw(raw), Some(operation));
         }
-        for raw in [13, 1 << 32, u64::MAX] {
+        // 5 to 12 are retired numbers, never issued again.
+        for raw in (5..=12).chain([13, 1 << 32, u64::MAX]) {
             assert_eq!(UpcallControl::from_raw(raw), None, "{raw:#x}");
         }
     }

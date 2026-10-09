@@ -33,7 +33,14 @@ fn mark_error(stage: usize) {
 fn report() {
     let _ = sys::notify(&borrowed(&COMPLETION), 1);
 }
+/// Set just before the libc leaving tail: every entry calls the handler of
+/// the program after the resident one, so only the entry that follows this
+/// mark ends the thread.
+static ARMED: AtomicUsize = AtomicUsize::new(0);
 unsafe extern "C" fn primary_end() {
+    if ARMED.load(Ordering::SeqCst) == 0 {
+        return;
+    }
     PRIMARY_RAN.store(1, Ordering::SeqCst);
     sys::thread_exit()
 }
@@ -42,7 +49,7 @@ rt::upcall_entry!(primary_entry, primary_end);
 extern "C" fn worker(_: u64) -> ! {
     let created = Handle::<Thread>::borrowed(rt::abi::Handle(CREATED.load(Ordering::SeqCst)));
     assert!(sys::is_current_thread(&created).expect("genuine selected native caller"));
-    // Preserve a genuine application primary handler alongside the resident observer.
+    // Preserve a genuine application primary handler alongside the resident handler.
     unsafe { upcall::bind(primary_entry) }.expect("native primary bind");
     unsafe { upcall::enable() }.expect("native primary enable");
     for round in 1..=2 {
@@ -65,7 +72,7 @@ extern "C" fn worker(_: u64) -> ! {
                 mark_error(2);
             }
             signals::probe_native_stop_outer(false);
-            // This last Resume enters the observer, which parks before Drop returns.
+            // This last Resume enters the resident handler, which parks before Drop returns.
             drop(outer);
             RETURNED.store(round, Ordering::SeqCst);
         });
@@ -88,6 +95,7 @@ extern "C" fn worker(_: u64) -> ! {
     tls::with_process(|| {
         let trace = signals::probe_native_stop_arm().expect("native exit scope");
         OWNER.store(trace.owner, Ordering::SeqCst);
+        ARMED.store(1, Ordering::SeqCst);
         signals::probe_native_exit_queue();
         // The actual libc leaving tail queues primary_end while its own Defer is held.
         unsafe { ffi::pthread_exit(37usize as *mut c_void) }
