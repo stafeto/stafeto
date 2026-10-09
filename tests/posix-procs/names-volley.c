@@ -21,8 +21,9 @@ extern unsigned files_volley_full_repeats(void);
 
 #define VZ "/tmp/vz"
 #define VZ_PAD 120
-/* A spawned process creates seven threads (the eighth gives ENOMEM: the
- * quota of the process), so 112 renames take sixteen processes. */
+/* A spawned process creates seven threads (the eighth gives EAGAIN: the
+ * quota of the process in the steps mode, STEPS_QUOTA, 429 pages), so 112
+ * renames take sixteen processes. */
 #define VZ_PROCESSES 16
 #define VZ_THREADS 7
 #define VZ_DEPTH 64
