@@ -343,10 +343,30 @@ impl<T, R, S, C> HoldSlot<T, R, S, C> {
     }
 }
 
+/// The most jobs of one session of a file service a process keeps in flight:
+/// the service holds 16 for a session, whatever their kind.
+pub const JOBS_MAX: usize = 16;
+
+/// Whether the table has a place for one more job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobPlace {
+    Free,
+    /// All places are taken. `sequence` is the value of the wait word the
+    /// caller waits on; `own` says that the caller's own live operations
+    /// hold every place, so no other thread can free one.
+    Full {
+        sequence: u32,
+        own: bool,
+    },
+}
+
 pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Copy = ()> {
     entries: [EntrySlot<T>; N],
     holds: [HoldSlot<T, R, S, C>; N],
     release_early: fn(T) -> bool,
+    /// Counts the records of jobs that went; a thread that waits for a place
+    /// waits on it. The caller wakes it after unlocking.
+    jobs: AtomicU32,
 }
 
 impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<T, N, R, S, C> {
@@ -364,6 +384,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<
                 }
             }; N],
             release_early: |_| false,
+            jobs: AtomicU32::new(0),
         }
     }
 }
@@ -414,7 +435,61 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         // SAFETY: exclusive startup ownership permits initializing this field.
         unsafe {
             core::ptr::addr_of_mut!((*destination).release_early).write(release_early);
+            core::ptr::addr_of_mut!((*destination).jobs).write(AtomicU32::new(0));
         }
+    }
+
+    fn job_gone(&self) {
+        let value = self.jobs.load(Ordering::Relaxed);
+        self.jobs.store(value.wrapping_add(1), Ordering::Release);
+    }
+
+    /// The places of jobs in use: Open, Scalar and Control records. Each
+    /// stands for one job of the session in the service from before its
+    /// first request until the operation has let it go.
+    pub fn jobs_in_use(&self) -> usize {
+        self.holds
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot.held,
+                    Held::Open(_) | Held::Scalar(_) | Held::Control(_)
+                )
+            })
+            .count()
+    }
+
+    /// The places that records owned by `owner` take: the operations of one
+    /// thread that are still in flight, those it left by a jump included.
+    pub fn jobs_owned_by(&self, owner: OwnerToken) -> usize {
+        self.holds
+            .iter()
+            .filter(|slot| match slot.held {
+                Held::Open(record) => record.owner == Some(owner),
+                Held::Scalar(record) => record.owner() == Some(owner),
+                Held::Control(record) => record.owner() == Some(owner),
+                _ => false,
+            })
+            .count()
+    }
+
+    /// Whether `owner` may take a place for a new job now. The check and the
+    /// `begin_*` that follows it run under the same lock of the caller.
+    pub fn job_place(&self, owner: OwnerToken) -> JobPlace {
+        let used = self.jobs_in_use();
+        if used < JOBS_MAX {
+            return JobPlace::Free;
+        }
+        JobPlace::Full {
+            sequence: self.jobs.load(Ordering::Acquire),
+            own: self.jobs_owned_by(owner) >= used,
+        }
+    }
+
+    /// The word of the places of jobs. The address stays through the life of
+    /// the table, which the caller pins while a thread waits on it.
+    pub fn jobs_wait_word(&self) -> &AtomicU32 {
+        &self.jobs
     }
 
     fn entry(&self, fd: u32) -> Result<Entry<T>, Error> {
@@ -720,6 +795,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         let slot = &mut self.holds[token.slot];
         slot.held = Held::Empty;
         slot.change();
+        self.job_gone();
     }
 
     /// Pay a resident record before Prepare or any irreversible effect.
@@ -1113,6 +1189,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 slot.change();
             }
         }
+        self.job_gone();
     }
 
     /// This address remains stable through slot reuse. The caller pins Table.

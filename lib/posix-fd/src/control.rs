@@ -98,6 +98,9 @@ pub(super) struct ControlRecord<C> {
     cleanup: Cleanup,
 }
 impl<C: Copy> ControlRecord<C> {
+    pub(super) fn owner(&self) -> Option<OwnerToken> {
+        self.owner
+    }
     fn snapshot(self) -> ControlSnapshot<C> {
         let phase = match self.cleanup {
             Cleanup::Running => ControlPhase::Cleaning,
@@ -150,6 +153,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         let slot = &mut self.holds[token.slot];
         slot.held = Held::Empty;
         slot.change();
+        self.job_gone();
     }
     /// Pay resident custody before creating endpoints or sending the first request.
     pub fn begin_control(
@@ -186,6 +190,10 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         });
         slot.change();
         Ok((token, claim))
+    }
+    /// Whether the claim is the one of a record still in the operation's hands.
+    pub fn control_is_working(&self, claim: ControlClaimToken) -> bool {
+        self.control_claimed(claim).is_ok()
     }
     pub fn control_snapshot(&self, token: ControlToken) -> Result<ControlSnapshot<C>, Error> {
         Ok(self.control_record(token)?.snapshot())
@@ -395,10 +403,10 @@ mod tests {
         type Write = Table<u32, 32, [u64; 3], [u8; 1012], [u64; 15]>;
         type Read = Table<u32, 32, [u64; 3], [u8; 1016], [u64; 15]>;
         assert_eq!(size_of::<ControlRecord<[u64; 15]>>(), 168);
-        assert_eq!(size_of::<Base>(), 3848);
+        assert_eq!(size_of::<Base>(), 3856);
         assert!(size_of::<Control>() > size_of::<Base>());
         assert_eq!(size_of::<Write>(), size_of::<ExistingWrite>());
-        assert_eq!(size_of::<Write>(), 35592);
+        assert_eq!(size_of::<Write>(), 35600);
         assert_eq!(size_of::<Read>(), size_of::<Write>());
     }
     fn owner(id: u64) -> OwnerToken {
@@ -670,5 +678,90 @@ mod tests {
         let (next, _) = table.begin_control(owner(2), [18; 15]).unwrap();
         assert!(next.generation > token.generation);
         assert_eq!(table.get(fd), Ok(17));
+    }
+
+    #[test]
+    fn sixteen_places_of_jobs_are_taken_by_records_of_every_kind() {
+        type Big = Table<u32, 32, u64, u64, u64>;
+        let mut table = Big::default();
+        let fd = table.insert(5, Flags::default()).unwrap();
+        for index in 0..JOBS_MAX {
+            assert_eq!(table.job_place(owner(1)), JobPlace::Free, "place {index}");
+            match index % 3 {
+                0 => {
+                    table.begin_control(owner(1), 7).unwrap();
+                }
+                1 => {
+                    table.begin_open(owner(1), 7).unwrap();
+                }
+                _ => {
+                    table.begin_scalar(owner(1), fd, 7).unwrap();
+                }
+            }
+        }
+        assert_eq!(table.jobs_in_use(), JOBS_MAX);
+        // All sixteen are the caller's own: nobody else can free one.
+        let before = table.jobs_wait_word().load(Ordering::Relaxed);
+        assert_eq!(
+            table.job_place(owner(1)),
+            JobPlace::Full {
+                sequence: before,
+                own: true
+            }
+        );
+        // For another thread the same table is full, and the places are not its own.
+        assert_eq!(
+            table.job_place(owner(2)),
+            JobPlace::Full {
+                sequence: before,
+                own: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_record_that_goes_frees_a_place_and_moves_the_word() {
+        type Big = Table<u32, 32, u64, u64, u64>;
+        let mut table = Big::default();
+        let mut first = None;
+        for index in 0..JOBS_MAX {
+            let (token, claim) = table
+                .begin_control(owner(1 + (index as u64 % 2)), 7)
+                .unwrap();
+            if index == 0 {
+                first = Some((token, claim));
+            }
+        }
+        let (token, claim) = first.unwrap();
+        let JobPlace::Full { sequence, own } = table.job_place(owner(1)) else {
+            panic!("full")
+        };
+        // Two threads share the places: neither holds all of them.
+        assert!(!own);
+        table
+            .complete_control(claim, ControlResult::Value(0))
+            .unwrap();
+        // A completed record keeps its place until the owner acknowledges it
+        // and its cleanup (the Release of the job) is paid.
+        assert!(matches!(table.job_place(owner(1)), JobPlace::Full { .. }));
+        table.ack_control(token, owner(1)).unwrap();
+        assert!(matches!(table.job_place(owner(1)), JobPlace::Full { .. }));
+        table.control_begin_cleanup(token).unwrap();
+        table.control_finish_cleanup(token).unwrap();
+        assert_eq!(table.job_place(owner(1)), JobPlace::Free);
+        assert_ne!(table.jobs_wait_word().load(Ordering::Relaxed), sequence);
+    }
+
+    #[test]
+    fn a_fork_child_has_all_places_free() {
+        type Big = Table<u32, 32, u64, u64, u64>;
+        let mut table = Big::default();
+        for _ in 0..JOBS_MAX {
+            table.begin_control(owner(1), 7).unwrap();
+        }
+        assert_eq!(table.jobs_in_use(), JOBS_MAX);
+        table.discard_open_after_fork();
+        assert_eq!(table.jobs_in_use(), 0);
+        assert_eq!(table.job_place(owner(1)), JobPlace::Free);
     }
 }

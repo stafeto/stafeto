@@ -857,14 +857,14 @@ mod tests {
             core::mem::align_of::<PosixFs>(),
             core::mem::align_of::<LegacyFs>()
         );
-        assert_eq!(size_of::<posix_fd::Table<Target, 32, Recovery>>(), 4872);
+        assert_eq!(size_of::<posix_fd::Table<Target, 32, Recovery>>(), 4880);
         assert_eq!(
             size_of::<posix_fd::Table<Target, 32, Recovery>>(),
             size_of::<posix_fd::Table<Target, 32, Legacy>>()
         );
         assert_eq!(
             size_of::<posix_fd::Table<Target, 32, Recovery, [u8; 1016]>>(),
-            37128
+            37136
         );
     }
 }

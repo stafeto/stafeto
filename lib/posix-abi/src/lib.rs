@@ -101,6 +101,11 @@ pub fn error(error: FsError) -> c_int {
         FsError::Again => EAGAIN,
         FsError::Broken => EPIPE,
         FsError::TooManyInSystem => ENFILE,
+        FsError::TooManyLinks => EMLINK,
+        FsError::NotEmpty => ENOTEMPTY,
+        FsError::Busy => EBUSY,
+        FsError::CrossDevice => EXDEV,
+        FsError::NotSupported => EOPNOTSUPP,
         FsError::Io => EIO,
     }
 }

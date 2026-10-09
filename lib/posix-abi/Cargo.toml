@@ -26,6 +26,8 @@ rtbench-marks = ["rt/count-calls"]
 [dependencies]
 posix-types = { path = "../posix-types" }
 posix-fs = { path = "../posix-fs" }
+posix-change = { path = "../posix-change" }
+entries = { path = "../entries" }
 rt = { path = "../rt" }
 posix-heap = { path = "../posix-heap" }
 posix-map = { path = "../posix-map" }

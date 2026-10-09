@@ -91,10 +91,10 @@
 
 mod change;
 pub use change::{
-    ACCESS_EFFECTIVE, BASE_ABSOLUTE, BASE_CWD, Base, ChangeOp, ChangePhase, ChangeReply,
-    ChangeSecond, ChangeStart, ID_UNCHANGED, LINK_FOLLOW, MODE_MASK, NOFOLLOW, PATH_FOLLOW_LAST,
-    PATH_REQUIRE_DIR, RESULT_MAX, STATVFS_BYTES, TIME_NOW, TIME_OMIT, UNLINK_REMOVEDIR,
-    change_start_reply, read_key_body, write_key_body, write_start_reply,
+    ACCESS_EFFECTIVE, BASE_ABSOLUTE, BASE_CWD, Base, ChangeDone, ChangeOp, ChangePhase,
+    ChangeReply, ChangeSecond, ChangeStart, ID_UNCHANGED, LINK_FOLLOW, MODE_MASK, NOFOLLOW,
+    PATH_FOLLOW_LAST, PATH_REQUIRE_DIR, RESULT_MAX, STATVFS_BYTES, TIME_NOW, TIME_OMIT,
+    UNLINK_REMOVEDIR, change_start_reply, read_key_body, write_key_body, write_start_reply,
 };
 mod data;
 pub use data::{

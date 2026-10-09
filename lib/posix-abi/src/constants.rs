@@ -81,6 +81,10 @@ pub use posix_types::constants::*;
 
 pub const EPERM: i32 = 1;
 pub const EBUSY: i32 = 16;
+pub const EXDEV: i32 = 18;
+pub const EMLINK: i32 = 31;
+pub const ENOTEMPTY: i32 = 39;
+pub const EOPNOTSUPP: i32 = 95;
 pub const PTHREAD_MUTEX_NORMAL: i32 = 0;
 pub const PTHREAD_MUTEX_ERRORCHECK: i32 = 1;
 pub const PTHREAD_MUTEX_RECURSIVE: i32 = 2;

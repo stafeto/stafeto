@@ -6,6 +6,7 @@
 
 #![no_std]
 
+pub mod change;
 pub mod open;
 mod target;
 pub use target::RamTarget;
@@ -51,6 +52,16 @@ pub enum FsError {
     Broken,
     /// Every pipe of the service in use.
     TooManyInSystem,
+    /// A directory with too many links (EMLINK).
+    TooManyLinks,
+    /// A directory that is not empty (ENOTEMPTY).
+    NotEmpty,
+    /// A name or a directory in use that cannot go (EBUSY).
+    Busy,
+    /// A rename or a link between two devices (EXDEV).
+    CrossDevice,
+    /// An operation the object does not support (EOPNOTSUPP).
+    NotSupported,
     Io,
 }
 
@@ -96,6 +107,11 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::INVALID_ARGUMENT) | Status::BadSize => Self::InvalidArgument,
             Status::Unknown(proto_fs::OFFSET_OVERFLOW) => Self::OffsetOverflow,
             Status::Unknown(proto_fs::NO_DATA) => Self::NoData,
+            Status::Unknown(proto_fs::TOO_MANY_LINKS) => Self::TooManyLinks,
+            Status::Unknown(proto_fs::NOT_EMPTY) => Self::NotEmpty,
+            Status::Unknown(proto_fs::BUSY) => Self::Busy,
+            Status::Unknown(proto_fs::CROSS_DEVICE) => Self::CrossDevice,
+            Status::Unknown(proto_fs::NOT_SUPPORTED) => Self::NotSupported,
             _ => Self::Io,
         }
     }
@@ -193,8 +209,16 @@ pub struct PosixFs {
     /// the console's input, output and error go there (5f).
     terminal: Option<Handle<Channel>>,
     paths: PathState,
-    descriptors: Table<Target, OPEN_MAX, open::Recovery>,
+    descriptors: Table<Target, OPEN_MAX, open::Recovery, (), entries::Frame>,
 }
+
+// The record of a Change job (an owner, a claim, the frame of the operation
+// and a result) fits in the payload union of the holds: the table is as large
+// as it was without the record.
+const _: () = assert!(
+    core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), entries::Frame>>()
+        == core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery>>()
+);
 
 /// Owned startup transports, prepared before the pinned descriptor table exists.
 pub struct StartupFiles {

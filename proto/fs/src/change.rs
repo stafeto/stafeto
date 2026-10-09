@@ -330,6 +330,18 @@ pub fn write_start_reply(out: &mut Writer, phase: ChangePhase) -> Result<(), Sta
     out.u32(phase as u32)
 }
 
+/// What a finished job answered, as a client keeps it: the code of the
+/// operation (0 or the code of an error), the restarts of its resolution, the
+/// value, and the length of the bytes of its result (they lie in the buffer
+/// the caller gave).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChangeDone {
+    pub result: u32,
+    pub restarts: u32,
+    pub value: u64,
+    pub length: usize,
+}
+
 /// The reply of Step and Query. `state` 0 is running, 1 is done. A running
 /// job has no result. `restarts` counts the restarts of resolution after a
 /// change of the tree between steps.
