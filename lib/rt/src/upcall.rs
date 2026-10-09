@@ -332,7 +332,6 @@ unsafe extern "C" fn entry() {
         "stp x24, x25, [sp, #192]", "stp x26, x27, [sp, #208]",
         "stp x28, x29, [sp, #224]", "str x30, [sp, #240]",
         "add x9, sp, #1904", "str x9, [sp, #248]",
-        "mrs x9, nzcv", "str x9, [sp, #264]",
         "mrs x9, tpidr_el0", "str x9, [sp, #272]",
         "mrs x9, tpidrro_el0", "str x9, [sp, #280]",
         "stp q0, q1, [sp, #288]", "stp q2, q3, [sp, #320]",
@@ -349,6 +348,7 @@ unsafe extern "C" fn entry() {
         "2:", "ldp x12, x13, [x9], #16", "stp x12, x13, [x10], #16",
         "subs x11, x11, #16", "b.ne 2b",
         "mov x0, #{take}", "svc #{control}", "cbnz x0, 9f",
+        // The interrupted PC and PSTATE (flags included) come from Take.
         "str x2, [sp, #256]", "str x3, [sp, #264]",
         // x20: the entry record; x21: a handler; x22: the frame this entry
         // recorded in `outer`, or 0. Callee-saved, so the handlers keep them.
@@ -363,16 +363,11 @@ unsafe extern "C" fn entry() {
         "ldr x9, [sp, #272]", "msr tpidr_el0, x9",
         "cbz x22, 5f",
         "ldr x9, [x20, #{outer}]", "cmp x9, x22", "b.ne 5f",
-        "str xzr, [x20, #{outer}]",
+        "str xzr, [x20, #{outer}]", "str xzr, [x20, #{owed}]",
         "5:",
         "ldr x21, [x20, #{own}]", "cbz x21, 6f",
         "ldr x9, [x20, #{outer}]", "cbnz x9, 8f",
-        "str xzr, [x20, #{owed}]",
         "mov x0, sp", "blr x21",
-        "b 6f",
-        // A resident call is live: the entry that made it calls the handler
-        // of the program, and owes it the request this entry spent.
-        "8:", "mov x9, #1", "str x9, [x20, #{owed}]",
         "6:",
         "mov x0, #{mask}", "svc #{control}", "cbnz x0, 9f",
         "mrs x9, tpidrro_el0", "add x10, sp, #816", "mov x11, #1088",
@@ -384,6 +379,11 @@ unsafe extern "C" fn entry() {
         "subs x11, x11, #16", "b.ne 7b",
         "svc #{restore}",
         "9:", "brk #0",
+        // A resident call is live: the entry that made it calls the handler
+        // of the program after the call, and owes it the request this entry
+        // spent (it clears `owed` with `outer`). Out of line, so that the
+        // path of a thread without a resident handler stays as it was.
+        "8:", "mov x9, #1", "str x9, [x20, #{owed}]", "b 6b",
         control = const Call::ThreadUpcallControl.number(),
         take = const UpcallControl::Take.raw(),
         mask = const UpcallControl::Mask.raw(),
