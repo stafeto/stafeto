@@ -15,13 +15,30 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod dirent;
+
 use entries::{Frame, nested};
 use posix_fd::{ControlPhase, ControlSnapshot, ControlToken, OwnerToken};
-use proto_fs::{Base, ChangeDone, ChangeOp, ChangePhase, ChangeStart, OpenKey, RESULT_MAX};
+use proto_fs::{
+    Base, ChangeDone, ChangeOp, ChangePhase, ChangeStart, DataOutcome, DataPhase, DataResult,
+    DataStart, OpenKey, RESULT_MAX,
+};
 use proto_wire::Status;
 
+/// What every loop needs of the service apart from its own requests: the
+/// Release that ends a job, the refresh of the credentials, and the wait for
+/// room in the table.
+pub trait Service {
+    fn release(&mut self, key: OpenKey) -> Result<(), Status>;
+    /// Complete a refresh of the credentials the service asked for.
+    fn authenticate(&mut self) -> Result<(), Status>;
+    /// The table of the service is full: free what this process can free, and
+    /// sleep one millisecond outside the deferral of signals.
+    fn wait_for_room(&mut self);
+}
+
 /// What the loop needs of the world around one operation.
-pub trait Wire {
+pub trait Wire: Service {
     /// Whether the record of the operation is still the operation's own. A
     /// child of `fork` made in a handler has dropped it: the job belongs to
     /// the parent, and the child answers EIO when the handler returns.
@@ -33,12 +50,6 @@ pub trait Wire {
         key: OpenKey,
         out: &mut [u8; RESULT_MAX],
     ) -> Result<Option<ChangeDone>, Status>;
-    fn release(&mut self, key: OpenKey) -> Result<(), Status>;
-    /// Complete a refresh of the credentials the service asked for.
-    fn authenticate(&mut self) -> Result<(), Status>;
-    /// The table of the service is full: free what this process can free, and
-    /// sleep one millisecond outside the deferral of signals.
-    fn wait_for_room(&mut self);
 }
 
 /// Why an operation did not run to the end.
@@ -53,7 +64,7 @@ pub enum Failure {
 
 /// Whether a failed request goes again unchanged. `room` says that the
 /// request may meet JOBS_FULL (Start alone does).
-fn again<W: Wire>(wire: &mut W, status: Status, room: bool) -> Result<(), Failure> {
+fn again<W: Service>(wire: &mut W, status: Status, room: bool) -> Result<(), Failure> {
     match status {
         // The handler ran, or the request never left: send it again.
         Status::Kernel(abi::Error::Interrupted) => Ok(()),
@@ -119,17 +130,82 @@ pub fn drive<W: Wire>(
 /// Release until the service answers. A session that is gone has no job to
 /// release, and a refusal the service never gives ends the loop too: the
 /// record of the job has done what it can.
-pub fn release<W: Wire>(wire: &mut W, key: OpenKey) {
+pub fn release<W: Service>(wire: &mut W, key: OpenKey) {
     loop {
         match wire.release(key) {
             Ok(()) => return,
             Err(Status::Kernel(abi::Error::Interrupted)) => {}
+            // The cleanup of a Data job takes a step for each private page.
+            Err(Status::Unknown(proto_fs::RESOLVING)) => {}
             Err(Status::Unknown(proto_fs::AUTHENTICATING)) => {
                 if wire.authenticate().is_err() {
                     return;
                 }
             }
             Err(_) => return,
+        }
+    }
+}
+
+/// What the loop of a Data job needs of the world: the requests of the
+/// service by the key and by the job, on top of what every loop needs.
+pub trait DataWire: Service {
+    /// As `Wire::live`.
+    fn live(&mut self) -> bool;
+    fn start(&mut self, args: &DataStart) -> Result<(DataPhase, u64), Status>;
+    fn step(&mut self, job: u64) -> Result<(), Status>;
+    fn commit(&mut self, job: u64, args: &DataStart) -> Result<DataOutcome, Status>;
+    /// The service wants the clock read again before the effect: let the
+    /// other threads run, and ask again.
+    fn pause(&mut self);
+}
+
+/// One Data operation that moves no bytes (a truncate): Start, Step until the
+/// job is ready, Commit. The key is the caller's and stays the same through
+/// every repeat; a lost reply is answered by the same request, and the
+/// service gives the saved outcome of a Commit it already made, so the effect
+/// happens at most once. The caller sends Release afterwards, whatever this
+/// returns: the service ends the Data job with it.
+///
+/// A terminal refusal of the service (a status that comes with the job
+/// completed and without effect) is `Failure::Status`.
+pub fn drive_data<W: DataWire>(wire: &mut W, args: &DataStart) -> Result<(), Failure> {
+    let job = loop {
+        if !wire.live() {
+            return Err(Failure::Io);
+        }
+        match wire.start(args) {
+            Ok((_, job)) => break job,
+            // No place for the job in the service: the table is full.
+            Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)) => wire.wait_for_room(),
+            Err(status) => again(wire, status, true)?,
+        }
+    };
+    loop {
+        if !wire.live() {
+            return Err(Failure::Io);
+        }
+        match wire.step(job) {
+            Ok(()) => break,
+            Err(Status::Unknown(proto_fs::RESOLVING)) => {}
+            Err(status) => again(wire, status, false)?,
+        }
+    }
+    loop {
+        if !wire.live() {
+            return Err(Failure::Io);
+        }
+        match wire.commit(job, args) {
+            Ok(outcome) => {
+                return match outcome.result {
+                    DataResult::Bytes(_) => Ok(()),
+                    DataResult::FailedNoEffect(code) => Err(Failure::Status(Status::Unknown(code))),
+                    DataResult::None => Err(Failure::Io),
+                };
+            }
+            // The service reads the clock for the effect: ask again.
+            Err(Status::Unknown(proto_fs::TIME_DEFERRED | proto_fs::RESOLVING)) => wire.pause(),
+            Err(status) => again(wire, status, false)?,
         }
     }
 }

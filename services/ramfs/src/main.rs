@@ -2942,6 +2942,24 @@ impl Fs {
         }
         let method = Method::from_number(r.method()).expect("change method");
         let owner = r.label();
+        if method == Method::ChangeRelease
+            && let Ok(key) = proto_fs::read_key_body(r.body())
+        {
+            // The key of a Data job (a truncate) ends with the same Release:
+            // the cleanup of its journal, step by step, and the job forgotten.
+            let data = self.jobs.iter().flatten().find(|job| {
+                job.owner == owner
+                    && job.open_key == Some(key)
+                    && matches!(job.operation, JobOperation::Data(_))
+            });
+            if let Some(id) = data.map(|job| job.id) {
+                return if self.cancel_job_mode(id, owner, Some(fds), true) {
+                    Answer::Status(Status::Ok)
+                } else {
+                    status(proto_fs::RESOLVING)
+                };
+            }
+        }
         // Release is cleanup: it needs no live authority.
         if method != Method::ChangeRelease
             && let Err(code) = self.authenticate(fds, owner)

@@ -161,7 +161,9 @@ impl Wire for Model {
             length: 3,
         }))
     }
+}
 
+impl Service for Model {
     fn release(&mut self, _key: OpenKey) -> Result<(), Status> {
         self.released += 1;
         if self.releases.is_empty() {
@@ -585,4 +587,262 @@ fn two_path_operations_are_rename_and_link() {
     assert!(!two_paths(ChangeOp::Symlink));
     assert!(!two_paths(ChangeOp::Unlink));
     assert_eq!(MAX_PATH, 511);
+}
+
+// The Data job of a truncate.
+
+fn data_args() -> DataStart {
+    DataStart {
+        key: key(3, 9),
+        kind: proto_fs::DataKind::Truncate,
+        description: proto_fs::DataDescription {
+            packed: 5 | (2 << proto_fs::OPEN_DESCRIPTION_SHIFT),
+            generation: 4,
+        },
+        count: 0,
+        position: 10,
+    }
+}
+
+/// The service as the loop of a Data job sees it: the job lives under its
+/// key, and the effect happens once, in the first Commit that arrives.
+#[derive(Default)]
+struct DataModel {
+    job: Option<(DataStart, u64)>,
+    steps_left: u32,
+    effects: u32,
+    starts: u32,
+    steps: u32,
+    commits: u32,
+    retired: bool,
+    full: u32,
+    deferred: u32,
+    step_refusal: Option<u32>,
+    commit_refusal: Option<u32>,
+    lose_start: bool,
+    lose_step: bool,
+    lose_commit: bool,
+    live_until: Option<u32>,
+    pauses: u32,
+    waits: u32,
+    released: u32,
+    releases: Vec<Result<(), Status>>,
+}
+
+impl Service for DataModel {
+    fn release(&mut self, _key: OpenKey) -> Result<(), Status> {
+        self.released += 1;
+        if self.releases.is_empty() {
+            Ok(())
+        } else {
+            self.releases.remove(0)
+        }
+    }
+    fn authenticate(&mut self) -> Result<(), Status> {
+        Ok(())
+    }
+    fn wait_for_room(&mut self) {
+        self.waits += 1;
+    }
+}
+
+impl DataWire for DataModel {
+    fn live(&mut self) -> bool {
+        match &mut self.live_until {
+            None => true,
+            Some(0) => false,
+            Some(left) => {
+                *left -= 1;
+                true
+            }
+        }
+    }
+    fn start(&mut self, args: &DataStart) -> Result<(DataPhase, u64), Status> {
+        self.starts += 1;
+        if self.full > 0 {
+            self.full -= 1;
+            return Err(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES));
+        }
+        if self.retired {
+            return Err(Status::Unknown(proto_fs::OPEN_RETIRED));
+        }
+        match &self.job {
+            Some((known, _)) if known != args => {
+                return Err(Status::Unknown(proto_fs::PERMISSION));
+            }
+            Some(_) => {}
+            None => self.job = Some((*args, 0x1_00)),
+        }
+        if core::mem::take(&mut self.lose_start) {
+            return Err(LOST);
+        }
+        Ok((DataPhase::Captured, 0x1_00))
+    }
+    fn step(&mut self, job: u64) -> Result<(), Status> {
+        self.steps += 1;
+        assert_eq!(Some(job), self.job.map(|(_, id)| id));
+        if let Some(code) = self.step_refusal {
+            return Err(Status::Unknown(code));
+        }
+        if core::mem::take(&mut self.lose_step) {
+            return Err(LOST);
+        }
+        if self.steps_left > 0 {
+            self.steps_left -= 1;
+            return Err(Status::Unknown(proto_fs::RESOLVING));
+        }
+        Ok(())
+    }
+    fn commit(&mut self, job: u64, args: &DataStart) -> Result<DataOutcome, Status> {
+        self.commits += 1;
+        assert_eq!(Some((*args, job)), self.job);
+        if self.deferred > 0 {
+            self.deferred -= 1;
+            return Err(Status::Unknown(proto_fs::TIME_DEFERRED));
+        }
+        let result = match self.commit_refusal {
+            Some(code) => DataResult::FailedNoEffect(code),
+            None => {
+                // The effect is the first Commit's; a repeat gives its saved
+                // outcome.
+                if self.effects == 0 {
+                    self.effects = 1;
+                }
+                DataResult::Bytes(0)
+            }
+        };
+        if core::mem::take(&mut self.lose_commit) {
+            return Err(LOST);
+        }
+        Ok(DataOutcome {
+            phase: DataPhase::Completed,
+            job,
+            result,
+        })
+    }
+    fn pause(&mut self) {
+        self.pauses += 1;
+    }
+}
+
+#[test]
+fn a_truncate_runs_from_start_through_the_steps_to_one_commit() {
+    let mut model = DataModel {
+        steps_left: 3,
+        ..DataModel::default()
+    };
+    assert_eq!(drive_data(&mut model, &data_args()), Ok(()));
+    assert_eq!(
+        (model.starts, model.steps, model.commits, model.effects),
+        (1, 4, 1, 1)
+    );
+}
+
+#[test]
+fn a_lost_reply_of_start_gets_the_same_request_and_the_same_job() {
+    let mut model = DataModel {
+        lose_start: true,
+        ..DataModel::default()
+    };
+    assert_eq!(drive_data(&mut model, &data_args()), Ok(()));
+    assert_eq!((model.starts, model.effects), (2, 1));
+}
+
+#[test]
+fn a_lost_reply_of_a_step_is_asked_again() {
+    let mut model = DataModel {
+        lose_step: true,
+        ..DataModel::default()
+    };
+    assert_eq!(drive_data(&mut model, &data_args()), Ok(()));
+    assert_eq!((model.steps, model.effects), (2, 1));
+}
+
+#[test]
+fn a_lost_reply_of_the_commit_gives_the_saved_outcome_and_one_effect() {
+    let mut model = DataModel {
+        lose_commit: true,
+        ..DataModel::default()
+    };
+    assert_eq!(drive_data(&mut model, &data_args()), Ok(()));
+    assert_eq!((model.commits, model.effects), (2, 1));
+}
+
+#[test]
+fn a_commit_that_waits_for_the_clock_is_asked_again_after_a_pause() {
+    let mut model = DataModel {
+        deferred: 3,
+        ..DataModel::default()
+    };
+    assert_eq!(drive_data(&mut model, &data_args()), Ok(()));
+    assert_eq!((model.commits, model.pauses, model.effects), (4, 3, 1));
+}
+
+#[test]
+fn a_full_table_of_the_service_makes_the_start_wait_and_go_again() {
+    let mut model = DataModel {
+        full: 4,
+        ..DataModel::default()
+    };
+    assert_eq!(drive_data(&mut model, &data_args()), Ok(()));
+    assert_eq!((model.starts, model.waits), (5, 4));
+}
+
+#[test]
+fn a_refusal_of_a_step_is_the_answer_without_a_commit() {
+    let mut model = DataModel {
+        step_refusal: Some(proto_fs::FILE_TOO_LARGE),
+        ..DataModel::default()
+    };
+    assert_eq!(
+        drive_data(&mut model, &data_args()),
+        Err(Failure::Status(Status::Unknown(proto_fs::FILE_TOO_LARGE)))
+    );
+    assert_eq!((model.commits, model.effects), (0, 0));
+}
+
+#[test]
+fn an_outcome_without_effect_is_the_answer() {
+    let mut model = DataModel {
+        commit_refusal: Some(proto_fs::BAD_FD),
+        ..DataModel::default()
+    };
+    assert_eq!(
+        drive_data(&mut model, &data_args()),
+        Err(Failure::Status(Status::Unknown(proto_fs::BAD_FD)))
+    );
+    assert_eq!(model.effects, 0);
+}
+
+#[test]
+fn a_retired_key_of_a_data_job_is_an_io_error() {
+    let mut model = DataModel {
+        retired: true,
+        ..DataModel::default()
+    };
+    assert_eq!(drive_data(&mut model, &data_args()), Err(Failure::Io));
+}
+
+#[test]
+fn a_data_job_whose_record_went_with_a_fork_sends_nothing_more() {
+    let mut model = DataModel {
+        steps_left: 5,
+        live_until: Some(2),
+        ..DataModel::default()
+    };
+    assert_eq!(drive_data(&mut model, &data_args()), Err(Failure::Io));
+    assert_eq!((model.starts, model.steps, model.commits), (1, 1, 0));
+}
+
+#[test]
+fn release_of_a_data_job_goes_again_while_the_service_cleans_it_up() {
+    let mut model = DataModel {
+        releases: std::vec![
+            Err(Status::Unknown(proto_fs::RESOLVING)),
+            Err(Status::Unknown(proto_fs::RESOLVING)),
+        ],
+        ..DataModel::default()
+    };
+    release(&mut model, key(3, 9));
+    assert_eq!(model.released, 3);
 }

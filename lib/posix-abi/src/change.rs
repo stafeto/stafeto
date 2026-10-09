@@ -19,12 +19,15 @@ use crate::constants::*;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::AtomicU32;
 use entries::Frame;
-use posix_change::{Failure, Wire};
+use posix_change::{DataWire, Failure, Service, Wire};
 use posix_fs::change::{
     ControlClaimToken, ControlResult, ControlToken, JOBS_MAX, JobPlace, OwnerToken,
 };
 use posix_fs::{FsError, PosixFs};
-use proto_fs::{Base, ChangeDone, ChangeOp, ChangePhase, ChangeStart, OpenKey, RESULT_MAX};
+use proto_fs::{
+    Base, ChangeDone, ChangeOp, ChangePhase, ChangeStart, DataOutcome, DataPhase, DataStart,
+    OpenKey, RESULT_MAX,
+};
 use proto_wire::Status;
 use rt::fs::Files;
 
@@ -90,6 +93,7 @@ pub enum Probe {
     Start,
     Second,
     Step,
+    Commit,
 }
 
 /// The hook of the probes, called after each request of an operation was
@@ -140,12 +144,36 @@ struct Live {
     here: Frame,
 }
 
-impl Wire for Live {
-    fn live(&mut self) -> bool {
+impl Service for Live {
+    fn release(&mut self, key: OpenKey) -> Result<(), Status> {
+        self.files.change_release_once(key)
+    }
+    fn authenticate(&mut self) -> Result<(), Status> {
+        self.files.finish_binding()
+    }
+    fn wait_for_room(&mut self) {
+        // What this process left behind may be what fills the table.
+        collect(self.owner, self.here, Some(self.token), true);
+        // One millisecond on the timer of the thread, outside the deferral
+        // of signals: a handler that runs ends the sleep, the request goes
+        // again either way. A spin without a sleep would starve the holder
+        // of the place when it runs on this processor at a lower level.
+        let _ = crate::threads::sleep::pause(1_000_000);
+    }
+}
+
+impl Live {
+    fn still_live(&mut self) -> bool {
         let Some(claim) = self.claim else {
             return true;
         };
         crate::shared::with_files(|files| Ok(files.change_is_live(claim))).unwrap_or(false)
+    }
+}
+
+impl Wire for Live {
+    fn live(&mut self) -> bool {
+        self.still_live()
     }
     fn start(&mut self, start: &ChangeStart<'_>) -> Result<ChangePhase, Status> {
         probe(Probe::Start, self.files.change_start_once(start))
@@ -163,20 +191,23 @@ impl Wire for Live {
     ) -> Result<Option<ChangeDone>, Status> {
         probe(Probe::Step, self.files.change_step_once(key, out))
     }
-    fn release(&mut self, key: OpenKey) -> Result<(), Status> {
-        self.files.change_release_once(key)
+}
+
+impl DataWire for Live {
+    fn live(&mut self) -> bool {
+        self.still_live()
     }
-    fn authenticate(&mut self) -> Result<(), Status> {
-        self.files.finish_binding()
+    fn start(&mut self, args: &DataStart) -> Result<(DataPhase, u64), Status> {
+        probe(Probe::Start, self.files.data_start_once(*args))
     }
-    fn wait_for_room(&mut self) {
-        // What this process left behind may be what fills the table.
-        collect(self.owner, self.here, Some(self.token), true);
-        // One millisecond on the timer of the thread, outside the deferral
-        // of signals: a handler that runs ends the sleep, the request goes
-        // again either way. A spin without a sleep would starve the holder
-        // of the place when it runs on this processor at a lower level.
-        let _ = crate::threads::sleep::pause(1_000_000);
+    fn step(&mut self, job: u64) -> Result<(), Status> {
+        probe(Probe::Step, self.files.data_step_once(job))
+    }
+    fn commit(&mut self, job: u64, args: &DataStart) -> Result<DataOutcome, Status> {
+        probe(Probe::Commit, self.files.data_commit_once(job, *args))
+    }
+    fn pause(&mut self) {
+        let _ = rt::sys::yield_now();
     }
 }
 
@@ -361,9 +392,21 @@ pub fn run(request: &Request<'_>, out: &mut [u8; RESULT_MAX]) -> Result<Outcome,
         Err(Failure::Io) => Err(EIO),
         Err(Failure::Status(status)) => Err(errno_of(status)),
     };
-    // The outcome is saved before the Release, so that a collector that frees
-    // the place keeps it. A record that is gone is the child of a `fork`: the
-    // parent owns the job, and the child sends nothing.
+    conclude(&mut wire, token, claim, owner, result)
+}
+
+/// The end of every operation: the outcome is saved before the Release, so
+/// that a collector that frees the place keeps it. A record that is gone is
+/// the child of a `fork`: the parent owns the job, and the child sends
+/// nothing.
+fn conclude(
+    wire: &mut Live,
+    token: ControlToken,
+    claim: ControlClaimToken,
+    owner: OwnerToken,
+    result: Result<Outcome, i32>,
+) -> Result<Outcome, i32> {
+    let key = key_of(token);
     let saved = match result {
         Ok(outcome) => ControlResult::Value(outcome.value),
         Err(errno) => ControlResult::Failed(errno),
@@ -379,7 +422,7 @@ pub fn run(request: &Request<'_>, out: &mut [u8; RESULT_MAX]) -> Result<Outcome,
         wake_places();
         return Err(EIO);
     }
-    posix_change::release(&mut wire, key);
+    posix_change::release(wire, key);
     let _ = crate::shared::with_files(|files| {
         files.finish_change_cleanup(token).map_err(crate::error)?;
         files
@@ -389,4 +432,45 @@ pub fn run(request: &Request<'_>, out: &mut [u8; RESULT_MAX]) -> Result<Outcome,
     });
     wake_places();
     result
+}
+
+/// ftruncate of the file of the open description `target` stands for: a Data
+/// job of the service by the key of a paid record, driven to the commit and
+/// ended with the Release. The same errors as `run`, and what the service
+/// refuses: EBADF for a description opened without write, EINVAL for a
+/// device, EISDIR, EFBIG.
+#[inline(never)]
+pub fn truncate(target: posix_fs::RamTarget, length: u64) -> Result<(), i32> {
+    let description = proto_fs::DataDescription {
+        packed: target.fd() | (target.description_slot() << proto_fs::OPEN_DESCRIPTION_SHIFT),
+        generation: target.generation(),
+    };
+    let here = here();
+    let owner = OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)?;
+    let (token, claim) = take_place(owner, here, |files| files.begin_change_record(owner, here))?;
+    let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
+    let args = DataStart {
+        key: key_of(token),
+        kind: proto_fs::DataKind::Truncate,
+        description,
+        count: 0,
+        position: length,
+    };
+    let mut wire = Live {
+        files: transport.files(),
+        owner: Some(owner),
+        token,
+        claim: Some(claim),
+        here,
+    };
+    let driven = posix_change::drive_data(&mut wire, &args);
+    let result = match driven {
+        Ok(()) => Ok(Outcome {
+            value: 0,
+            length: 0,
+        }),
+        Err(Failure::Io) => Err(EIO),
+        Err(Failure::Status(status)) => Err(errno_of(status)),
+    };
+    conclude(&mut wire, token, claim, owner, result).map(|_| ())
 }

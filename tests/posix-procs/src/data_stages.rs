@@ -458,6 +458,56 @@ fn run(files: &Files) -> Result<(), i32> {
     full_gone(files, reused)?;
     files.close_exact(reused).map_err(|_| 57)?;
     full_mapping(files)?;
+    release_ends_data_job(files)?;
+    Ok(())
+}
+
+/// The Release of the Change family ends a Data job by its key, as the
+/// collector of a record left by a long jump sends it: a job that was
+/// completed and a job in the middle of its steps (the effect is not made),
+/// and the key is retired after it.
+fn release_ends_data_job(files: &Files) -> Result<(), i32> {
+    let held = open(files, 5000, b"/tmp/data-release").map_err(|_| 130)?;
+    // The keys of this probe are of the second generation of their places.
+    let keyed = |slot: u32, position: u64| {
+        let mut request = args(held, slot, DataKind::Truncate, 0, position);
+        request.key.generation = 2;
+        request
+    };
+    // A completed job: its outcome is there until the Release.
+    let done = keyed(20, 100);
+    let (_, job) = files.data_start_once(done).map_err(|_| 131)?;
+    complete(files, job, done).map_err(|_| 132)?;
+    files.change_release_once(done.key).map_err(|_| 133)?;
+    if files.data_query_once(done).is_ok() {
+        return Err(134);
+    }
+    if files.data_start_once(done) != Err(Status::Unknown(proto_fs::OPEN_RETIRED)) {
+        return Err(135);
+    }
+    if files.descriptor_information(held.fd).map_err(|_| 136)?.size != 100 {
+        return Err(137);
+    }
+    // A job that took no step: the Release ends it, and the file stays.
+    let early = keyed(21, 7);
+    files.data_start_once(early).map_err(|_| 138)?;
+    files.change_release_once(early.key).map_err(|_| 139)?;
+    if files.data_start_once(early) != Err(Status::Unknown(proto_fs::OPEN_RETIRED)) {
+        return Err(140);
+    }
+    if files.descriptor_information(held.fd).map_err(|_| 141)?.size != 100 {
+        return Err(142);
+    }
+    // The places of the jobs are free again: sixteen keys fit once more.
+    for slot in 0..16 {
+        files.data_start_once(keyed(slot, 100)).map_err(|_| 143)?;
+    }
+    for slot in 0..16 {
+        files
+            .change_release_once(keyed(slot, 100).key)
+            .map_err(|_| 144)?;
+    }
+    files.close_exact(held).map_err(|_| 145)?;
     Ok(())
 }
 
