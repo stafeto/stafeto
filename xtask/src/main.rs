@@ -3666,7 +3666,10 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     // numbers 5i-5b compares with.
     for (what, volley) in [
         ("common directory", find("names volley:")?),
-        ("directory for each process", find("names volley in directories:")?),
+        (
+            "directory for each process",
+            find("names volley in directories:")?,
+        ),
     ] {
         if !volley.contains("112 renames, all done") {
             return Err(format!(

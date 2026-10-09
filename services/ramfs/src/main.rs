@@ -1559,12 +1559,10 @@ impl Service<0> for Fs {
                 if bytes.len() > MAX_WRITE {
                     return Answer::Status(Status::BadSize);
                 }
-                match self.ram.write_at(
-                    &mut s.data,
-                    fd,
-                    bytes,
-                    self.time_source.now(),
-                ) {
+                match self
+                    .ram
+                    .write_at(&mut s.data, fd, bytes, self.time_source.now())
+                {
                     Ok(n) => value(r, n as u32),
                     Err(code) => status(code),
                 }
@@ -1576,13 +1574,10 @@ impl Service<0> for Fs {
                 let Ok(bytes) = body.bytes(body.left()) else {
                     return Answer::Status(Status::BadSize);
                 };
-                match self.ram.pwrite(
-                    &mut s.data,
-                    fd,
-                    offset,
-                    bytes,
-                    self.time_source.now(),
-                ) {
+                match self
+                    .ram
+                    .pwrite(&mut s.data, fd, offset, bytes, self.time_source.now())
+                {
                     Ok(n) => value(r, n as u32),
                     Err(code) => status(code),
                 }
@@ -1712,12 +1707,9 @@ impl Service<0> for Fs {
                     .binding
                     .identity(false)
                     .expect("authenticated session");
-                let found = self.ram.directory_read_token(
-                    token,
-                    index,
-                    identity,
-                    self.time_source.now(),
-                );
+                let found =
+                    self.ram
+                        .directory_read_token(token, index, identity, self.time_source.now());
                 self.cancel_job(job, r.label(), Some(&mut s.data));
                 match found {
                     Ok(entry) => {
@@ -1742,11 +1734,10 @@ impl Service<0> for Fs {
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                match self.ram.directory_read(
-                    &mut s.data,
-                    fd,
-                    self.time_source.now(),
-                ) {
+                match self
+                    .ram
+                    .directory_read(&mut s.data, fd, self.time_source.now())
+                {
                     Ok(entry) => {
                         let entry = entry.map(|entry| proto_fs::DirectoryEntry {
                             name: entry.name.as_bytes(),
