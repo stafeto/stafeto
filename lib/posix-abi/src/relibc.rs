@@ -113,12 +113,49 @@ fn pinned(index: usize) -> bool {
     false
 }
 
+/// The wakes `pin_released` made for a `reserve` that waits (probes).
+#[cfg(feature = "thread-probe")]
+static PIN_WAKES: AtomicUsize = AtomicUsize::new(0);
+
+/// When the last of those releases woke, and when a wait of `reserve` for
+/// a free place last returned, in nanoseconds.
+#[cfg(feature = "thread-probe")]
+static PIN_RELEASED_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "thread-probe")]
+static RESERVE_WOKE_AT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "thread-probe")]
+fn probe_now() -> u64 {
+    rt::time::ticks_to_ns(rt::time::now())
+}
+
+/// How many times the release of a pin woke a waiting `reserve`.
+#[cfg(feature = "thread-probe")]
+pub fn probe_pin_wakes() -> usize {
+    PIN_WAKES.load(Ordering::Relaxed)
+}
+
+/// Nanoseconds from the last wake of `pin_released` to the next return of
+/// the wait of `reserve` (0 when that wait did not return after the wake:
+/// `reserve` found the place without waiting again).
+#[cfg(feature = "thread-probe")]
+pub fn probe_pin_wake_delay() -> u64 {
+    let released = PIN_RELEASED_AT.load(Ordering::SeqCst);
+    let woke = RESERVE_WOKE_AT.load(Ordering::SeqCst);
+    woke.saturating_sub(released)
+}
+
 /// The release of the last pin of place `index`: wakes `reserve` when the
 /// collector passed the place over.
 fn pin_released(index: usize) {
     let bit = 1u64 << index;
     if PIN_WAIT.load(Ordering::SeqCst) & bit != 0 {
         PIN_WAIT.fetch_and(!bit, Ordering::SeqCst);
+        #[cfg(feature = "thread-probe")]
+        {
+            PIN_WAKES.fetch_add(1, Ordering::Relaxed);
+            PIN_RELEASED_AT.store(probe_now(), Ordering::SeqCst);
+        }
         FREE_EPOCH.fetch_add(1, Ordering::SeqCst);
         posix_sync::futex_wake(&FREE_EPOCH, u32::MAX);
     }
@@ -669,6 +706,8 @@ fn reserve() -> Result<usize, i32> {
             Ok(_) | Err(EAGAIN | ETIMEDOUT) => {}
             Err(_) => return Err(EAGAIN),
         }
+        #[cfg(feature = "thread-probe")]
+        RESERVE_WOKE_AT.store(probe_now(), Ordering::SeqCst);
     }
 }
 
