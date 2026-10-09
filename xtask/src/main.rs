@@ -3122,6 +3122,7 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ended)?;
     qemu::expect_marker(&output, "posix-files: raw Change requests ok")?;
+    qemu::expect_marker(&output, "posix-files: names and metadata functions ok")?;
     qemu::expect_marker(&output, "posix-files: layer names ok")?;
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
     if measured {
@@ -3173,6 +3174,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;
     qemu::expect_marker(&outcome, "posix-procs: names ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: the names of posix_spawn ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: dup3 with O_CLOFORK across fork ok")?;
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
     qemu::expect_marker(&outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;

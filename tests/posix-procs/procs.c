@@ -1875,6 +1875,7 @@ static int channel_child(const char *name);
 #endif
 
 static void spawn_names(void);
+static void dup3_across_fork(void);
 
 static int role(const char *name) {
 #if PENDING_OPEN_PROBE
@@ -2000,6 +2001,7 @@ static int role(const char *name) {
         /* A child of its own: the environment this stage sets stays out of
          * the process whose heap other stages measure. */
         spawn_names();
+        dup3_across_fork();
         return failures != 0;
     }
     if (strcmp(name, "writefd6") == 0) {
@@ -2475,6 +2477,28 @@ static void spawn_names(void) {
     char cwd[64];
     expect("the caller's directory stays", getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, "/") == 0, 1);
     if (!failures) printf("posix-procs: the names of posix_spawn ok\n");
+}
+
+/* dup3 with O_CLOFORK: the child of a fork sees the descriptor closed, the
+ * parent keeps it. */
+static void dup3_across_fork(void) {
+    int fd = open("/etc/motd", O_RDONLY);
+    expect("dup3 to 31 with O_CLOFORK", dup3(fd, 31, O_CLOFORK), 31);
+    expect("dup3 to 30 with O_CLOEXEC", dup3(fd, 30, O_CLOEXEC), 30);
+    pid_t child = fork();
+    if (child == 0) {
+        errno = 0;
+        int closed = fcntl(31, F_GETFD) == -1 && errno == EBADF;
+        int kept = fcntl(30, F_GETFD) >= 0;
+        _exit(closed && kept ? 0 : closed ? 2 : 1);
+    }
+    expect("fork", child > 0, 1);
+    reap("a child of a fork sees the O_CLOFORK descriptor closed", child, 0, 0);
+    expect("the parent keeps the descriptor", fcntl(31, F_GETFD) >= 0, 1);
+    close(31);
+    close(30);
+    close(fd);
+    if (!failures) printf("posix-procs: dup3 with O_CLOFORK across fork ok\n");
 }
 
 /* Stage 9, the window of exec: old images that end before ExecCommit, 20
