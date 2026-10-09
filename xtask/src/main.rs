@@ -3607,6 +3607,12 @@ fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Whether the long rmdir of the starvation line ends within ten seconds
+/// against the flood of utimensat: "no" until 5i-5b (a change of the file
+/// has no effect on the directory it lies in), then "yes". A change either
+/// way is a change of the expectation, made here.
+const STARVATION_ENDS_WITHIN_10_S: &str = "no";
+
 /// The longest step of the process service under -icount with the crowd
 /// of children of tests/posix-procs in its steps mode: kill(-1), spawn,
 /// exec, the ends of all, and a Vouch with the identity channel full.
@@ -3645,10 +3651,14 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
         find(row)?;
     }
     let starvation = find("names starvation:")?;
-    if !starvation.contains("finished within 10 s: yes")
-        && !starvation.contains("finished within 10 s: no")
-    {
-        return Err(format!("the starvation line has no verdict: {starvation}"));
+    let verdict = format!("finished within 10 s: {STARVATION_ENDS_WITHIN_10_S}");
+    if !starvation.contains(&verdict) {
+        return Err(format!(
+            "the starvation line does not say {verdict:?}: update the expectation \
+             STARVATION_ENDS_WITHIN_10_S if the change is meant (5i-5b turns it to \
+             \"yes\" and wants restarts 0 and a time of at most twice the time without \
+             interference): {starvation}"
+        ));
     }
     let volley = find("names volley:")?;
     if !volley.contains("112 renames, all done") {
@@ -6819,6 +6829,14 @@ mod tests {
         assert!(super::names_lines(&names_log(good)).is_ok());
         let none = good.replace("thread 130", "thread 0");
         assert!(super::names_lines(&names_log(&none)).is_err());
+        // A change of the verdict of the starvation line is a change of the
+        // expectation: the line that says "yes" is refused until the
+        // constant says so.
+        let mut turned = names_log(good);
+        for line in &mut turned {
+            *line = line.replace("finished within 10 s: no", "finished within 10 s: yes");
+        }
+        assert!(super::names_lines(&turned).is_err());
         let no_restarts = good.replace("the most restarts of one rename 40, ", "");
         assert!(super::names_lines(&names_log(&no_restarts)).is_err());
         let no_longest = good.replace("the longest rename 99000000 ticks, ", "");
