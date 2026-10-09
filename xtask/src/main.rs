@@ -3661,28 +3661,38 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
              interference): {starvation}"
         ));
     }
-    let volley = find("names volley:")?;
-    if !volley.contains("112 renames, all done") {
-        return Err(format!("the volley did not end in 112 renames: {volley}"));
+    // The volley of 112 renames in one directory, and the same with a
+    // directory for each process: both end in all renames, both give the
+    // numbers 5i-5b compares with.
+    for (what, volley) in [
+        ("common directory", find("names volley:")?),
+        ("directory for each process", find("names volley in directories:")?),
+    ] {
+        if !volley.contains("112 renames, all done") {
+            return Err(format!(
+                "the volley ({what}) did not end in 112 renames: {volley}"
+            ));
+        }
+        let lines = [volley.to_owned()];
+        for number in [
+            "the most repeats of JOBS_FULL of one thread ",
+            "the most restarts of one rename ",
+            "the longest rename ",
+        ] {
+            qemu::number_after(&lines, number)
+                .ok_or_else(|| format!("the volley ({what}) line has no {number:?}: {volley}"))?;
+        }
     }
     let repeats = qemu::number_after(
-        &[(*volley).to_owned()],
+        &[find("names volley:")?.to_owned()],
         "repeats of JOBS_FULL of one thread ",
     )
-    .ok_or_else(|| format!("the volley line has no number of repeats: {volley}"))?;
+    .unwrap_or(0);
     if repeats == 0 {
         return Err(format!(
-            "no thread of the volley met JOBS_FULL, the refused Start was not exercised: {volley}"
+            "no thread of the volley met JOBS_FULL, the refused Start was not exercised: {}",
+            find("names volley:")?
         ));
-    }
-    // The restarts of one rename and the longest rename: the numbers 5i-5b
-    // compares with.
-    for what in [
-        "the most restarts of one rename ",
-        "the longest rename ",
-    ] {
-        qemu::number_after(&[(*volley).to_owned()], what)
-            .ok_or_else(|| format!("the volley line has no {what:?}: {volley}"))?;
     }
     find("names volley ok")?;
     Ok(shown.iter().map(|line| (*line).clone()).collect())
@@ -6816,6 +6826,7 @@ mod tests {
             "posix-procs: names thread cost: 28672 bytes (7 pages) for the first thread, 28672 bytes the last, 86016 bytes for 3, stack 20480 bytes",
             "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 2569 restarts, finished within 10 s: no, took 626453622 ticks",
             repeats,
+            "posix-procs: names volley in directories: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 120, the most restarts of one rename 31, the longest rename 98000000 ticks, 6879297680 ticks",
             "posix-procs: names volley ok",
         ]
         .iter()
@@ -6851,6 +6862,16 @@ mod tests {
         let mut without_volley = names_log(good);
         without_volley.retain(|line| !line.contains("names volley:"));
         assert!(super::names_lines(&without_volley).is_err());
+        let mut without_directories = names_log(good);
+        without_directories.retain(|line| !line.contains("in directories"));
+        assert!(super::names_lines(&without_directories).is_err());
+        let mut short_directories = names_log(good);
+        for line in &mut short_directories {
+            if line.contains("in directories") {
+                *line = line.replace("112 renames, all done", "97 renames");
+            }
+        }
+        assert!(super::names_lines(&short_directories).is_err());
     }
 
     /// The lines of the ash script are checked exactly, in order, after

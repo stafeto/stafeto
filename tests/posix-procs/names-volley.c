@@ -3,7 +3,8 @@
 /* The operations on names in the steps mode (xtask process-steps), before the
  * crowd: a path of 32 links, the rename of a directory under a chain 64 deep,
  * getcwd at depth 64, the rmdir with a full table of names, a volley of 112
- * long renames from sixteen processes of seven threads, and a long rmdir
+ * long renames from sixteen processes of seven threads (once in a common
+ * directory, once with a directory for each process), and a long rmdir
  * against a client that changes the times of its own file in a loop. The
  * service prints its longest steps itself; this file prints the cost of each
  * operation alone (requests of the layer to the service, and ticks of the
@@ -234,13 +235,21 @@ struct vz_thread {
     unsigned long long start;
     int result;
     unsigned long long ticks;
+    /* The directory of the thread's names, or -1 for the common one. */
+    int directory;
 };
+
+/* The name /tmp/vz/<kind><index>, or /tmp/vz/d<directory>/<kind><index>. */
+static void vz_volley_name(char *name, size_t size, int directory, char kind, int index) {
+    if (directory < 0) snprintf(name, size, VZ "/%c%03d", kind, index);
+    else snprintf(name, size, VZ "/d%02d/%c%03d", directory, kind, index);
+}
 
 static void *vz_rename_thread(void *argument) {
     struct vz_thread *work = argument;
     char from[40], to[40];
-    snprintf(from, sizeof from, VZ "/f%03d", work->index);
-    snprintf(to, sizeof to, VZ "/g%03d", work->index);
+    vz_volley_name(from, sizeof from, work->directory, 'f', work->index);
+    vz_volley_name(to, sizeof to, work->directory, 'g', work->index);
     while (vz_now_ns() < work->start) {
         struct timespec delay = {0, 1000000};
         nanosleep(&delay, NULL);
@@ -298,13 +307,15 @@ static int vz_thread_cost(void) {
 static int vz_child(void) {
     int process = atoi(argv_seen[2]);
     unsigned long long start = strtoull(argv_seen[3], NULL, 10);
+    /* A fifth argument "d" gives the process a directory of its own. */
+    int directory = argc_seen > 4 && argv_seen[4][0] == 'd' ? process : -1;
     struct vz_thread work[VZ_THREADS];
     pthread_t threads[VZ_THREADS];
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 20480);
     for (int i = 0; i < VZ_THREADS; i++) {
-        work[i] = (struct vz_thread){process * VZ_THREADS + i, start, -1, 0};
+        work[i] = (struct vz_thread){process * VZ_THREADS + i, start, -1, 0, directory};
         int e = pthread_create(&threads[i], &attr, vz_rename_thread, &work[i]);
         if (e != 0) {
             printf("posix-procs: volley: thread %d of process %d gave %d\n", i, process, e);
@@ -343,11 +354,21 @@ static int vz_child(void) {
     return 0;
 }
 
-static int vz_volley(void) {
+/* The volley of 112 renames. With `per_directory` each process renames in a
+ * directory of its own, so that the renames of two processes share no
+ * parent and the common table of the places is what they wait for. */
+static int vz_volley(int per_directory) {
     int total = VZ_PROCESSES * VZ_THREADS;
+    if (per_directory) {
+        for (int p = 0; p < VZ_PROCESSES; p++) {
+            char name[40];
+            snprintf(name, sizeof name, VZ "/d%02d", p);
+            VZ_CHECK(mkdir(name, 0755) == 0);
+        }
+    }
     for (int i = 0; i < total; i++) {
         char name[40];
-        snprintf(name, sizeof name, VZ "/f%03d", i);
+        vz_volley_name(name, sizeof name, per_directory ? i / VZ_THREADS : -1, 'f', i);
         VZ_CHECK(link(VZ "/p0", name) == 0);
     }
     files_volley_start();
@@ -358,7 +379,7 @@ static int vz_volley(void) {
     for (int p = 0; p < VZ_PROCESSES; p++) {
         char index[8];
         snprintf(index, sizeof index, "%d", p);
-        char *argv[] = {"procs-child", "volley", index, stamp, NULL};
+        char *argv[] = {"procs-child", "volley", index, stamp, per_directory ? "d" : NULL, NULL};
         char *envp[] = {NULL};
         int e = EAGAIN;
         for (int tries = 0; tries < 5000 && e == EAGAIN; tries++) {
@@ -392,15 +413,24 @@ static int vz_volley(void) {
     files_volley_stop();
     for (int i = 0; i < total; i++) {
         char from[40], to[40];
-        snprintf(from, sizeof from, VZ "/f%03d", i);
-        snprintf(to, sizeof to, VZ "/g%03d", i);
+        int directory = per_directory ? i / VZ_THREADS : -1;
+        vz_volley_name(from, sizeof from, directory, 'f', i);
+        vz_volley_name(to, sizeof to, directory, 'g', i);
         VZ_CHECK(access(from, F_OK) == -1 && access(to, F_OK) == 0);
         VZ_CHECK(unlink(to) == 0);
     }
-    printf("posix-procs: names volley: %d processes of %d threads, %d renames, all done, "
+    if (per_directory) {
+        for (int p = 0; p < VZ_PROCESSES; p++) {
+            char name[40];
+            snprintf(name, sizeof name, VZ "/d%02d", p);
+            VZ_CHECK(rmdir(name) == 0);
+        }
+    }
+    printf("posix-procs: names volley%s: %d processes of %d threads, %d renames, all done, "
            "the most repeats of JOBS_FULL of one thread %u, the most restarts of one rename %u, "
            "the longest rename %llu ticks, %llu ticks\n",
-           VZ_PROCESSES, VZ_THREADS, total, most, most_restarts, longest, ticks);
+           per_directory ? " in directories" : "", VZ_PROCESSES, VZ_THREADS, total, most, most_restarts,
+           longest, ticks);
     return 0;
 }
 
@@ -411,7 +441,8 @@ static int names_volley(void) {
     failed = vz_thread_cost();
     if (!failed) failed = vz_quiet();
     if (!failed) failed = vz_starvation();
-    if (!failed) failed = vz_volley();
+    if (!failed) failed = vz_volley(0);
+    if (!failed) failed = vz_volley(1);
     files_volley_stop();
     if (failed) return failed;
     for (int i = 0; i < VZ_PAD; i++) {
