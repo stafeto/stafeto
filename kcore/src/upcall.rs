@@ -362,7 +362,7 @@ mod tests {
         state.control(RESUME).unwrap();
         assert_eq!(state.prepare(0x2000, 0, false), Some(0x1000));
         assert_eq!(state.control(RESUME), Err(Error::BadState));
-        // A second binding drops the entry and the pending request, not the debt.
+        // A second binding drops the entry and the pending request; the debt stays.
         state.control(TAKE).unwrap();
         state.returned().unwrap();
         state.control(DEFER).unwrap();

@@ -2544,17 +2544,22 @@ pub fn upcall_operations_5_to_12_are_invalid_and_change_nothing(
             Call::ObjectInfo.number(),
             &[0, abi::INFO_THREAD_SELF, u64::from(Rights::MANAGE.0)],
         )?;
-        for raw in 5..=12 {
-            for args in [
-                [0, 0],
-                [own.0, 0],
-                [(USER_VA + PAGE) as u64, 0x8000],
-                [1, 2],
-            ] {
-                c.fails(control, &[raw, args[0], args[1]], Error::InvalidArgs)?;
+        // The descriptor is closed whatever the refusals did.
+        let refused = (|| {
+            for raw in 5..=12 {
+                for args in [
+                    [0, 0],
+                    [own.0, 0],
+                    [(USER_VA + PAGE) as u64, 0x8000],
+                    [1, 2],
+                ] {
+                    c.fails(control, &[raw, args[0], args[1]], Error::InvalidArgs)?;
+                }
             }
-        }
+            Ok(())
+        })();
         c.close(own)?;
+        refused?;
         // Nothing moved: no entry was taken, the entry is still enabled, and
         // the pending request still delivers.
         c.fails(control, &[C::Take.raw()], Error::BadState)?;

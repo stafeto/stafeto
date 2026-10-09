@@ -1200,7 +1200,9 @@ pub const PRIORITY_LEVELS: u8 = 64;
 pub const RR_QUANTUM_NS: u64 = 4_000_000;
 
 /// The operations of `thread_upcall_control` (x0), each on the current
-/// thread's entry state; any other value is INVALID_ARGS.
+/// thread's entry state; any other value is INVALID_ARGS. The numbers 5 to
+/// 12 were retired in epoch 2 and are never issued again: a new operation
+/// takes 13 or above.
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpcallControl {
