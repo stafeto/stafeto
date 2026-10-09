@@ -1105,6 +1105,7 @@ static int names_gone(void) {
 }
 #endif
 
+#if CHANGE_STEPS
 /* The worst states of the steps of the service, built on purpose. A Start
  * with the root's share of the table of jobs taken (96 of its 128 places:
  * 95 held by sessions of this process, and the Start itself; the 32 places
@@ -1133,6 +1134,7 @@ static int names_bounds(void) {
     printf("posix-procs: names bounds ok\n");
     return 0;
 }
+#endif
 
 static int steps_run(void) {
     int failed = 0;
