@@ -766,6 +766,9 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The crowd of the steps probe under -icount, on the host's clock.
 const STEPS_TIMEOUT: Duration = Duration::from_secs(600);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The probe of the departed process in the steps run, on the host's clock
+/// (a few seconds when it passes).
+const GONE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// Tests only the `icount` build has, where virtual time counts
@@ -3729,17 +3732,36 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::ICOUNT);
-    let outcome = run_until(
+    // The probe of the departed process takes a few seconds of the host's
+    // clock. A service that does not give back the job of a process that
+    // went keeps the probe waiting, and in a guest the service starves (it
+    // spins in its maintenance) the probe cannot say so: the run is cut here.
+    let outcome = qemu::run_until_staged(
         cmd,
         STEPS_TIMEOUT,
         Some("init: posix-procs ended"),
-        &kernel.elf,
+        Some(qemu::Stage {
+            after: "posix-procs: names volley ok",
+            until: "posix-procs: names gone ok",
+            within: GONE_PROBE_TIMEOUT,
+        }),
     )?;
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
     let dir = target_dir().join("measure");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let log = dir.join("process-steps.log");
     std::fs::write(&log, outcome.lines.join("\n") + "\n")
         .map_err(|e| format!("{}: {e}", log.display()))?;
+    if outcome.lines.iter().any(|l| l.contains("posix-procs: names volley ok"))
+        && !outcome.lines.iter().any(|l| l.contains("posix-procs: names gone ok"))
+    {
+        let tail: Vec<&String> = outcome.lines.iter().rev().take(6).collect();
+        return Err(format!(
+            "the probe of the departed process printed no \"names gone ok\" within {GONE_PROBE_TIMEOUT:?} \
+             of the volley: the service does not give back the job of a process that went, or the places \
+             stay taken; the last lines, the last first: {tail:?}"
+        ));
+    }
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");

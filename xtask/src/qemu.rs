@@ -597,8 +597,31 @@ pub fn run_until(
     timeout: Duration,
     stop_marker: Option<&str>,
 ) -> Result<Outcome, String> {
+    run_until_staged(cmd, timeout, stop_marker, None)
+}
+
+/// A limit on one stage of a run: once a line contains `after`, a line that
+/// contains `until` must come within `within` of the clock of the host, or
+/// the run is cut as timed out. The probes that a broken service leaves
+/// waiting (a starved guest cannot say so itself) fail in `within` and not
+/// at the end of the whole run.
+#[derive(Clone, Copy)]
+pub struct Stage<'a> {
+    pub after: &'a str,
+    pub until: &'a str,
+    pub within: Duration,
+}
+
+/// `run_until` with an optional stage limit.
+pub fn run_until_staged(
+    cmd: Command,
+    timeout: Duration,
+    stop_marker: Option<&str>,
+    stage: Option<Stage<'_>>,
+) -> Result<Outcome, String> {
     let mut run = Run::start(cmd, Input::Null)?;
     let deadline = Instant::now() + timeout;
+    let mut stage_deadline: Option<Instant> = None;
     let mut checked = 0;
     loop {
         if let Some(marker) = stop_marker
@@ -606,8 +629,18 @@ pub fn run_until(
         {
             return Ok(run.end(End::Marker(checked + at)));
         }
+        if let Some(stage) = stage {
+            for line in &run.lines[checked..] {
+                if line.contains(stage.until) {
+                    stage_deadline = None;
+                } else if line.contains(stage.after) {
+                    stage_deadline = Some(Instant::now() + stage.within);
+                }
+            }
+        }
         checked = run.lines.len();
-        match run.wait(deadline) {
+        let limit = stage_deadline.map_or(deadline, |at| at.min(deadline));
+        match run.wait(limit) {
             Wait::Came => {}
             Wait::Deadline => return Ok(run.end(End::TimedOut)),
             Wait::Ended if run.line_start < run.transcript.bytes.len() => run.end_line(),
