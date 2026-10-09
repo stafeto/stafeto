@@ -3381,13 +3381,24 @@ const RAM_STEP_MAX: u64 = TERM_B;
 /// level above that run in the middle of a step (SpawnStart was 92,262 and
 /// 93,009 at 4e9abf5 and 92,369 at d7743c9 with the same source of the
 /// step).
+/// SpawnStart with 7 branches is 94,134 (95,634 with the margin): a run
+/// of fix round 2 of E3-1 part 1 with another layout of the code of the
+/// probe gave 94,134, 1,578 over the base of 92,556 that held before, more
+/// than the margin; the head of that round gives 92,231. The step is O(1)
+/// (one page of the loader's data is copied, `start_child` of
+/// services/process/src/main.rs), so the figure moves with the layout of
+/// the code and with the processes of the level above that run in the
+/// middle of the step. The entry goes in E5 (rv8.P3: Create, SpawnStart,
+/// ExecStart and ForkStart are cut into pieces no longer than B), and the
+/// base for 4 branches stays. Raising it again needs a new look at
+/// CALL_WAIT_MAX.
 const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64, u64); 4] = [
     (1, "Create", 61_378 + NOISE_MARGIN, 61_378 + NOISE_MARGIN),
     (
         22,
         "SpawnStart",
         92_323 + NOISE_MARGIN,
-        92_556 + NOISE_MARGIN,
+        94_134 + NOISE_MARGIN,
     ),
     (
         28,
@@ -3447,9 +3458,11 @@ const WAIT_MAX: u64 = 500_000;
 /// The most a step may wait for the answer of a service in a call that is
 /// no heartbeat, in ticks under -icount: one round trip (C_ipc about
 /// 2,000), the longest step of the process service that may be running
-/// (SpawnStart, 94,056 with its margin), and the step of the request
-/// itself (term B), with room. Seen at most 9,946 (ramfs FinishBinding
-/// with 248 children).
+/// (SpawnStart, 95,634 with its margin), and the step of the request
+/// itself (term B), with room: 95,634 + 20,410 + 2,034 = 118,078 under
+/// 120,000, 1,922 of room, so a next rise of SpawnStart needs a new look
+/// at this limit. Seen at most 9,946 (ramfs FinishBinding with 248
+/// children).
 const CALL_WAIT_MAX: u64 = 120_000;
 
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
@@ -6967,6 +6980,19 @@ mod tests {
         assert!(longest_waits(&lines, "5").is_empty());
         assert_eq!(wait_of(&longest_waits(&lines, "2"), 25), 12_246);
         assert_eq!(wait_of(&longest_waits(&lines, "2"), 1), 0);
+    }
+
+    #[test]
+    fn the_spawn_start_limit_holds_the_largest_run_and_the_call_wait_sum() {
+        // 94,134 is the run of fix round 2 with another layout of the probe;
+        // the limit of the call wait must hold the longest step of the
+        // process service, a step of the callee (term B) and a round trip.
+        let spawn = PROCESS_STEPS_ABOVE_B
+            .iter()
+            .find(|(k, ..)| *k == 22)
+            .expect("SpawnStart is in the list");
+        assert!(spawn.3 >= 94_134 + NOISE_MARGIN);
+        assert!(spawn.3 + TERM_B + 2_034 <= CALL_WAIT_MAX);
     }
 
     #[test]
