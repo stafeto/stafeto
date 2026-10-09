@@ -462,6 +462,7 @@ unsafe fn actions<'a>(
                 fd: number(a.fd),
                 path: path(),
                 flags: a.flags,
+                mode: a.mode,
             },
             2 => FileAction::Close(number(a.fd)),
             3 => FileAction::Dup2(number(a.fd), number(a.newfd)),
@@ -525,6 +526,56 @@ pub unsafe extern "C" fn stafeto_spawn(
     count: usize,
 ) -> c_int {
     // SAFETY: the caller's promise.
+    unsafe { spawn(path, None, argv, envp, attributes, file_actions, count) }
+}
+
+/// posix_spawnp: `file` is a name without a slash. The directories of
+/// `search` (the value of PATH; null for no PATH) are searched after the
+/// file actions, from the current directory they left.
+///
+/// # Safety
+/// As `stafeto_spawn`; `search` is null or a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_spawnp(
+    file: *const c_char,
+    search: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    attributes: *const SpawnAttributes,
+    file_actions: *const SpawnAction,
+    count: usize,
+) -> c_int {
+    if search.is_null() {
+        return -posix_abi::constants::ENOENT;
+    }
+    // SAFETY: the caller's promise.
+    let search = unsafe { bytes_of(search) };
+    // SAFETY: the caller's promise.
+    unsafe {
+        spawn(
+            file,
+            Some(search),
+            argv,
+            envp,
+            attributes,
+            file_actions,
+            count,
+        )
+    }
+}
+
+/// # Safety
+/// As `stafeto_spawn`.
+unsafe fn spawn(
+    path: *const c_char,
+    search: Option<&[u8]>,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    attributes: *const SpawnAttributes,
+    file_actions: *const SpawnAction,
+    count: usize,
+) -> c_int {
+    // SAFETY: the caller's promise.
     let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
     // SAFETY: as above.
     let attributes = unsafe { attributes.as_ref() };
@@ -550,8 +601,9 @@ pub unsafe extern "C" fn stafeto_spawn(
     let (argv, envp, file_actions) =
         unsafe { (strings(argv), strings(envp), actions(file_actions, count)) };
     match call(|| {
-        posix_abi::process::spawn_file(
+        posix_abi::process::spawn_search(
             path,
+            search,
             argv.clone(),
             envp.clone(),
             attributes,

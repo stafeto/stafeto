@@ -13,6 +13,7 @@ bench = false
 
 [dependencies]
 posix-abi = { path = "../posix-abi" }
+posix-change = { path = "../posix-change" }
 posix-thread = { path = "../posix-thread" }
 posix-types = { path = "../posix-types" }
 posix-signals = { path = "../posix-signals" }

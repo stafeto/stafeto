@@ -10,7 +10,7 @@
 
 use super::{call, files, value};
 use core::ffi::{c_char, c_int};
-use posix_abi::constants::EFAULT;
+use posix_abi::constants::{EFAULT, ERANGE};
 use posix_abi::names::Time;
 
 /// relibc's struct timespec on AArch64 Linux.
@@ -218,4 +218,89 @@ pub unsafe extern "C" fn stafeto_utimensat(
     unit(call(|| {
         posix_abi::names::utimensat(dirfd, path, times, flags)
     }))
+}
+
+/// fstatvfs and statvfs in relibc's struct statvfs (eleven unsigned long).
+#[repr(C)]
+pub struct LinuxStatvfs {
+    words: [u64; 11],
+}
+const _: () = {
+    assert!(core::mem::size_of::<LinuxStatvfs>() == 88);
+};
+
+/// statvfs of a path.
+///
+/// # Safety
+/// `path` is a live C string or null; `out` is writable for a LinuxStatvfs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_statvfs(path: *const c_char, out: *mut LinuxStatvfs) -> c_int {
+    if out.is_null() {
+        return -EFAULT;
+    }
+    let path = path!(path);
+    match call(|| posix_abi::names::statvfs(path)) {
+        Ok(words) => {
+            // SAFETY: the caller's promise.
+            unsafe { out.write(LinuxStatvfs { words }) };
+            0
+        }
+        Err(errno) => -errno,
+    }
+}
+
+/// fstatvfs of a descriptor.
+///
+/// # Safety
+/// `out` is writable for a LinuxStatvfs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fstatvfs(fd: c_int, out: *mut LinuxStatvfs) -> c_int {
+    if out.is_null() {
+        return -EFAULT;
+    }
+    match call(|| posix_abi::names::fstatvfs(fd)) {
+        Ok(words) => {
+            // SAFETY: the caller's promise.
+            unsafe { out.write(LinuxStatvfs { words }) };
+            0
+        }
+        Err(errno) => -errno,
+    }
+}
+
+/// fchdir: the current directory becomes the directory `fd` names.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fchdir(fd: c_int) -> c_int {
+    unit(call(|| posix_abi::names::fchdir(fd)))
+}
+
+/// realpath: the canonical path of `path` into `buf`, with its NUL; its
+/// length, or the negated errno. `len` is the size of the buffer: ERANGE
+/// when the path and its NUL do not fit.
+///
+/// # Safety
+/// `path` is a live C string or null; `buf` is writable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_realpath(path: *const c_char, buf: *mut u8, len: usize) -> isize {
+    if buf.is_null() {
+        return -(EFAULT as isize);
+    }
+    // SAFETY: the caller's promise.
+    let path = match unsafe { posix_abi::path(path) } {
+        Ok(path) => path,
+        Err(errno) => return -(errno as isize),
+    };
+    let mut canonical = [0; posix_abi::names::MAX_PATH + 1];
+    let length = match call(|| posix_abi::names::realpath(path, &mut canonical)) {
+        Ok(length) => length,
+        Err(errno) => return -(errno as isize),
+    };
+    if length >= len {
+        return -(ERANGE as isize);
+    }
+    // SAFETY: the caller's promise: `len` bytes, and `length < len`.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    out[..length].copy_from_slice(&canonical[..length]);
+    out[length] = 0;
+    length as isize
 }

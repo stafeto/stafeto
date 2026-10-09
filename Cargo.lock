@@ -345,6 +345,7 @@ name = "posix-platform"
 version = "0.1.0"
 dependencies = [
  "posix-abi",
+ "posix-change",
  "posix-fs",
  "posix-signals",
  "posix-sync",

@@ -493,8 +493,41 @@ pub fn directory_path(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize
     if virtual_leaf(transport, &placed, false)?.is_some() {
         return Err(ENOTDIR);
     }
-    let mut query = request(ChangeOp::Path, &placed);
-    query.flags = proto_fs::PATH_REQUIRE_DIR | proto_fs::PATH_FOLLOW_LAST;
+    path_query(
+        &placed,
+        proto_fs::PATH_REQUIRE_DIR | proto_fs::PATH_FOLLOW_LAST,
+        out,
+    )
+}
+
+/// The canonical path of the object of `target` (a directory of the file
+/// service), or the errno: ENOTDIR for any other descriptor, EACCES without
+/// the right to search the directory. The service names it by its path from
+/// the root, without links, `.` and `..`.
+pub fn descriptor_path(target: Target, out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+    let base = match target {
+        Target::Ram(target) | Target::Random(target) => Base::Fd {
+            fd: target.fd(),
+            generation: target.generation(),
+        },
+        _ => return Err(ENOTDIR),
+    };
+    let placed = Placed {
+        base,
+        bytes: [0; MAX_PATH + 1],
+        length: 0,
+        trailing_slash: false,
+    };
+    path_query(
+        &placed,
+        proto_fs::PATH_REQUIRE_DIR | proto_fs::PATH_FOLLOW_LAST,
+        out,
+    )
+}
+
+fn path_query(placed: &Placed, flags: u32, out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+    let mut query = request(ChangeOp::Path, placed);
+    query.flags = flags;
     let mut buffer = [0; RESULT_MAX];
     let outcome = run(&query, &mut buffer)?;
     if outcome.length == 0 || outcome.length > MAX_PATH {
@@ -502,4 +535,116 @@ pub fn directory_path(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize
     }
     out[..outcome.length].copy_from_slice(&buffer[..outcome.length]);
     Ok(outcome.length)
+}
+
+/// fchdir: the current directory becomes the directory `fd` names.
+pub fn fchdir(fd: c_int) -> Result<(), c_int> {
+    let fd = u32::try_from(fd).map_err(|_| EBADF)?;
+    crate::shared::held(fd, |_, target| {
+        let mut canonical = [0; MAX_PATH + 1];
+        let length = descriptor_path(target, &mut canonical)?;
+        crate::shared::with_files(|files| files.set_cwd(&canonical[..length]).map_err(error))
+    })
+}
+
+/// realpath: the canonical path of `path` against the current directory,
+/// the last link followed, `.` and `..` gone: its length, and the bytes in
+/// `out`. ENOENT for an empty path and for a name that does not exist,
+/// ENOTDIR for a part that is no directory, ELOOP, EACCES. A name of the
+/// terminal service is its directory's path and its name.
+pub fn realpath(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
+    let placed = place(AT_FDCWD, path)?;
+    let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
+    if virtual_leaf(transport, &placed, false)?.is_none() {
+        return path_query(&placed, proto_fs::PATH_FOLLOW_LAST, out);
+    }
+    let bytes = placed.path();
+    let end = bytes
+        .iter()
+        .rposition(|&byte| byte != b'/')
+        .map_or(0, |last| last + 1);
+    let split = bytes[..end]
+        .iter()
+        .rposition(|&byte| byte == b'/')
+        .unwrap_or(0);
+    let leaf = &bytes[split + 1..end];
+    let directory = Placed {
+        base: Base::Absolute,
+        bytes: {
+            let mut copy = [0; MAX_PATH + 1];
+            let head = &bytes[..split.max(1)];
+            copy[..head.len()].copy_from_slice(head);
+            copy
+        },
+        length: split.max(1),
+        trailing_slash: false,
+    };
+    let length = path_query(
+        &directory,
+        proto_fs::PATH_REQUIRE_DIR | proto_fs::PATH_FOLLOW_LAST,
+        out,
+    )?;
+    let slash = usize::from(out[length - 1] != b'/');
+    if length + slash + leaf.len() > MAX_PATH {
+        return Err(ENAMETOOLONG);
+    }
+    if slash == 1 {
+        out[length] = b'/';
+    }
+    out[length + slash..length + slash + leaf.len()].copy_from_slice(leaf);
+    Ok(length + slash + leaf.len())
+}
+
+/// The fields of statvfs in the order of relibc's struct: f_bsize, f_frsize,
+/// f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail, f_fsid, f_flag,
+/// f_namemax.
+pub type Statvfs = [u64; 11];
+
+/// What a descriptor or a name of another service reports: no blocks, no
+/// files, names of 255 bytes.
+const NO_FILESYSTEM: Statvfs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255];
+
+fn statvfs_words(request: &Request<'_>) -> Result<Statvfs, c_int> {
+    let mut buffer = [0; RESULT_MAX];
+    let outcome = run(request, &mut buffer)?;
+    if outcome.length != proto_fs::STATVFS_BYTES {
+        return Err(EIO);
+    }
+    let mut words = [0; 11];
+    for (i, word) in words.iter_mut().enumerate() {
+        let bytes: [u8; 8] = buffer[i * 8..i * 8 + 8].try_into().map_err(|_| EIO)?;
+        *word = u64::from_le_bytes(bytes);
+    }
+    Ok(words)
+}
+
+/// statvfs: the file system of `path`. The right to search the directories
+/// above it is all it needs: a file of mode 0 answers.
+pub fn statvfs(path: &[u8]) -> Result<Statvfs, c_int> {
+    let placed = place(AT_FDCWD, path)?;
+    let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
+    if virtual_leaf(transport, &placed, true)?.is_some() {
+        return Ok(NO_FILESYSTEM);
+    }
+    statvfs_words(&request(ChangeOp::StatVfs, &placed))
+}
+
+/// fstatvfs: the file system of the file `fd` names.
+pub fn fstatvfs(fd: c_int) -> Result<Statvfs, c_int> {
+    let fd = u32::try_from(fd).map_err(|_| EBADF)?;
+    let target = crate::shared::with_files(|files| files.target(fd).map_err(error))?;
+    let base = match target {
+        Target::Ram(target) | Target::Random(target) => Base::Fd {
+            fd: target.fd(),
+            generation: target.generation(),
+        },
+        _ => return Ok(NO_FILESYSTEM),
+    };
+    let placed = Placed {
+        base,
+        bytes: [0; MAX_PATH + 1],
+        length: 0,
+        trailing_slash: false,
+    };
+    statvfs_words(&request(ChangeOp::StatVfs, &placed))
 }
