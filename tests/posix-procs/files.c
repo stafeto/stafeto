@@ -17,6 +17,9 @@ extern int files_names_places_in_use(void);
 #include "pending-open.c"
 #include "open-policy.c"
 #include "names.c"
+#if NAMES_LOSS
+#include "names-loss.c"
+#endif
 #if LOADER_ABORT_PROBE
 #include "loader-abort.c"
 #endif
@@ -101,6 +104,10 @@ int main(void) {
     int names_probe = names_all();
     if (names_probe) { printf("posix-files: names failed %d\n", names_probe); return 29; }
     puts("posix-files: names and metadata functions ok");
+#if NAMES_LOSS
+    int loss = names_loss_all();
+    if (loss) return 30;
+#endif
     puts("posix-files: layer names ok");
     if (files_full_sessions()) return 12;
     puts("posix-files: 16 sessions with 32 retained descriptors ok");

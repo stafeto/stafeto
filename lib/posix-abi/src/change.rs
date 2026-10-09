@@ -92,13 +92,19 @@ fn errno_of_result(code: u32) -> i32 {
 pub enum Probe {
     Start,
     Second,
+    /// A Step whose reply says the job is not done.
     Step,
+    /// A Step whose reply carries the outcome: the one that committed.
+    Done,
+    /// The Commit of a Data job.
     Commit,
+    Release,
 }
 
 /// The hook of the probes, called after each request of an operation was
 /// answered. It answers true to lose the reply: the loop sees an interrupted
-/// send, as if the request had been taken off the queue, and sends it again.
+/// send, and sends the same request again, while the service has done what
+/// the request asked.
 #[cfg(feature = "change-probe")]
 static HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -146,7 +152,7 @@ struct Live {
 
 impl Service for Live {
     fn release(&mut self, key: OpenKey) -> Result<(), Status> {
-        self.files.change_release_once(key)
+        probe(Probe::Release, self.files.change_release_once(key))
     }
     fn authenticate(&mut self) -> Result<(), Status> {
         self.files.finish_binding()
@@ -189,7 +195,13 @@ impl Wire for Live {
         key: OpenKey,
         out: &mut [u8; RESULT_MAX],
     ) -> Result<Option<ChangeDone>, Status> {
-        probe(Probe::Step, self.files.change_step_once(key, out))
+        let reply = self.files.change_step_once(key, out);
+        let kind = if matches!(reply, Ok(Some(_))) {
+            Probe::Done
+        } else {
+            Probe::Step
+        };
+        probe(kind, reply)
     }
 }
 

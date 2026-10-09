@@ -159,7 +159,12 @@ const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
         &[],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-files", "posix-procs", POSIX_STACK_SIZE, &["files"]),
+    (
+        "posix-files",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["files", "names-loss"],
+    ),
 ];
 const LOADER_ABORT_PROGRAMS: [ImageProgram; 6] = [
     (
@@ -3125,6 +3130,12 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     qemu::expect_marker(&output, "posix-files: names and metadata functions ok")?;
     qemu::expect_marker(&output, "posix-files: layer names ok")?;
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
+    if !data {
+        qemu::expect_marker(
+            &output,
+            "posix-files: a lost reply of Start, Second, Step, Commit and Release leaves one effect",
+        )?;
+    }
     if measured {
         check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");

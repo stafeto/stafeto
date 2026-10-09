@@ -17,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=files.c");
     println!("cargo:rerun-if-changed=names.c");
+    println!("cargo:rerun-if-changed=names-loss.c");
     println!("cargo:rerun-if-changed=open-policy.c");
     println!("cargo:rerun-if-changed=pending-open.c");
     println!("cargo:rerun-if-changed=pending-fork.c");
@@ -74,6 +75,10 @@ fn main() {
         .arg(format!(
             "-DNAMES_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_NAMES_PROBE").is_some())
+        ))
+        .arg(format!(
+            "-DNAMES_LOSS={}",
+            u8::from(env::var_os("CARGO_FEATURE_NAMES_LOSS").is_some())
         ))
         .arg(format!(
             "-DCHANGE_STEPS={}",
