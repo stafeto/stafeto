@@ -3283,8 +3283,9 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// the three `s5_*` rows: the whole path of `pthread_kill` to the handler
 /// of the target, in instructions). The first two sit four ticks above the
 /// measure at the end of epoch 2 (262 and 12 764), the third sixteen above
-/// the measure at e0c670e (2 756, 4f3c7d0 had 2 562); a higher number needs
-/// a decision with its reason written down.
+/// the measure (2 754; 2 756 at e0c670e, when the distributor saved the
+/// flags twice, and 4f3c7d0 had 2 562); a higher number needs a decision
+/// with its reason written down.
 ///
 /// Rules for a guard that fires (the paths are deterministic under -icount,
 /// so a firing is no noise and a repeat does not clear it):
@@ -3301,14 +3302,19 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// 3. A change of the Rust toolchain measures both rows again and sets the
 ///    constants anew in the same commit.
 /// 4. The guard looks down too: when the room is larger than the slack,
-///    `guard_lower_hint` prints "lower <NAME> to N" (it does not fail) and
+///    `guard_lower_hint` prints "lower <NAME> to N", the measure plus the
+///    room the guard keeps (4, and 16 for S5; it does not fail), and
 ///    the next commit lowers the constant, so that a shorter path does not
 ///    turn into room for later growth.
 const NULL_MAX: u64 = 266;
 const THREADS_READY_MAX: u64 = 12_768;
-const S5_ICOUNT_MAX: u64 = 2_772;
+const S5_ICOUNT_MAX: u64 = 2_770;
 /// The room above which a guard asks to be lowered (rule 4).
 const NULL_SLACK: u64 = 16;
+/// The room each guard keeps above its measure when it is set or lowered.
+const NULL_KEEP: u64 = 4;
+const THREADS_READY_KEEP: u64 = 4;
+const S5_ICOUNT_KEEP: u64 = 16;
 const THREADS_READY_SLACK: u64 = 128;
 const S5_ICOUNT_SLACK: u64 = 16;
 
@@ -5677,6 +5683,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             room,
             THREADS_READY_SLACK,
             THREADS_READY_MAX,
+            THREADS_READY_KEEP,
         ) {
             println!("{hint}");
         }
@@ -5756,10 +5763,11 @@ fn guard_margin(
 }
 
 /// The line that asks to lower the guard `name` when its `room` under `max`
-/// is larger than `slack`: the new number is the measure plus four ticks,
-/// the room the guards keep.
-fn guard_lower_hint(name: &str, room: u64, slack: u64, max: u64) -> Option<String> {
-    (room > slack).then(|| format!("lower {name} to {}", max - room + 4))
+/// is larger than `slack`: the new number is the measure plus `keep` ticks,
+/// the room the rule of that guard keeps (`NULL_KEEP` and `THREADS_READY_KEEP`
+/// 4, `S5_ICOUNT_KEEP` 16).
+fn guard_lower_hint(name: &str, room: u64, slack: u64, max: u64, keep: u64) -> Option<String> {
+    (room > slack).then(|| format!("lower {name} to {}", max - room + keep))
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -5866,7 +5874,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
         );
         let room = guard_margin("normal build", &NORMAL_BUILD_ROWS, &ticks, "null", NULL_MAX)?;
         println!("null margin on {}: {room} of NULL_MAX {NULL_MAX}", m.name);
-        if let Some(hint) = guard_lower_hint("NULL_MAX", room, NULL_SLACK, NULL_MAX) {
+        if let Some(hint) = guard_lower_hint("NULL_MAX", room, NULL_SLACK, NULL_MAX, NULL_KEEP) {
             println!("{hint}");
         }
         let ticks = ticks_of(&o.lines, "log", &LOG_ROWS)?;
@@ -7311,13 +7319,16 @@ mod tests {
     /// it stays quiet.
     #[test]
     fn a_guard_with_much_room_asks_to_be_lowered() {
-        assert_eq!(guard_lower_hint("NULL_MAX", 4, NULL_SLACK, NULL_MAX), None);
         assert_eq!(
-            guard_lower_hint("NULL_MAX", NULL_SLACK, NULL_SLACK, NULL_MAX),
+            guard_lower_hint("NULL_MAX", 4, NULL_SLACK, NULL_MAX, NULL_KEEP),
             None
         );
         assert_eq!(
-            guard_lower_hint("NULL_MAX", 17, NULL_SLACK, NULL_MAX),
+            guard_lower_hint("NULL_MAX", NULL_SLACK, NULL_SLACK, NULL_MAX, NULL_KEEP),
+            None
+        );
+        assert_eq!(
+            guard_lower_hint("NULL_MAX", 17, NULL_SLACK, NULL_MAX, NULL_KEEP),
             Some("lower NULL_MAX to 253".to_owned())
         );
         assert_eq!(
@@ -7325,9 +7336,22 @@ mod tests {
                 "THREADS_READY_MAX",
                 129,
                 THREADS_READY_SLACK,
-                THREADS_READY_MAX
+                THREADS_READY_MAX,
+                THREADS_READY_KEEP
             ),
             Some("lower THREADS_READY_MAX to 12643".to_owned())
+        );
+        // S5 keeps 16 above its measure: a measure 17 under the number
+        // (room 17) asks for the measure plus 16, which leaves room 16.
+        assert_eq!(
+            guard_lower_hint(
+                "S5_ICOUNT_MAX",
+                17,
+                S5_ICOUNT_SLACK,
+                S5_ICOUNT_MAX,
+                S5_ICOUNT_KEEP
+            ),
+            Some("lower S5_ICOUNT_MAX to 2769".to_owned())
         );
     }
 

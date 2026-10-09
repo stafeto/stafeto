@@ -16,9 +16,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::{
-    BOOT_PROFILE, ImageProgram, RTBENCH_POSIX_PROGRAMS, RTBENCH_POSIX_VZ_PROGRAMS, S5_ICOUNT_MAX,
-    S5_ICOUNT_SLACK, Variant, build, guard_lower_hint, guard_margin, hvf_host, qemu, target_dir,
-    vz, write_boot_image_with,
+    BOOT_PROFILE, ImageProgram, RTBENCH_POSIX_PROGRAMS, RTBENCH_POSIX_VZ_PROGRAMS, S5_ICOUNT_KEEP,
+    S5_ICOUNT_MAX, S5_ICOUNT_SLACK, Variant, build, guard_lower_hint, guard_margin, hvf_host, qemu,
+    target_dir, vz, write_boot_image_with,
 };
 
 /// The rows of a run, in its order: each comes once, as numbers or as
@@ -431,9 +431,20 @@ fn s5_ticks(run: &Run) -> Result<Vec<u64>, String> {
 const S5_ROWS: [&str; 3] = ["s5_kill_sleeping", "s5_kill_reading", "s5_kill_busy_25"];
 
 /// The room the S5 rows of an -icount run leave under `max` (the least of
-/// the three), or the error that names the row past it.
+/// the three), or the error that names the row past it. A row under half of
+/// `max` is no instruction count: on TCG at its own speed the path of S5 is
+/// a few microseconds, some hundred ticks of the counter, so such a run did
+/// not use -icount (or the path got much shorter, and then `max` goes down).
 fn s5_room(run: &Run, max: u64) -> Result<u64, String> {
     let ticks = s5_ticks(run)?;
+    for (name, &n) in S5_ROWS.iter().zip(&ticks) {
+        if n < max / 2 {
+            return Err(format!(
+                "S5 under icount {name}={n} is under half of its guard {max}: \
+                 the run is not under -icount"
+            ));
+        }
+    }
     let mut room = u64::MAX;
     for name in S5_ROWS {
         room = room.min(guard_margin(
@@ -522,7 +533,13 @@ pub fn short(how: Short) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    if let Some(hint) = guard_lower_hint("S5_ICOUNT_MAX", room, S5_ICOUNT_SLACK, S5_ICOUNT_MAX) {
+    if let Some(hint) = guard_lower_hint(
+        "S5_ICOUNT_MAX",
+        room,
+        S5_ICOUNT_SLACK,
+        S5_ICOUNT_MAX,
+        S5_ICOUNT_KEEP,
+    ) {
         println!("{hint}");
     }
     Ok(())
@@ -690,22 +707,29 @@ mod tests {
         parse(&lines).unwrap()
     }
 
-    /// 16 ns a tick under -icount: 2 772 instructions are 44 352 ns.
+    /// 16 ns a tick under -icount: 2 770 instructions are 44 320 ns.
     #[test]
     fn the_guard_of_s5_holds_at_its_number_and_fires_one_over() {
         let at = run_with_s5(S5_ICOUNT_MAX * 16);
         assert_eq!(s5_ticks(&at).unwrap(), [S5_ICOUNT_MAX; 3]);
         assert_eq!(s5_room(&at, S5_ICOUNT_MAX), Ok(0));
-        let head = run_with_s5(2_756 * 16);
+        let head = run_with_s5(2_754 * 16);
         assert_eq!(s5_room(&head, S5_ICOUNT_MAX), Ok(16));
         let over = run_with_s5((S5_ICOUNT_MAX + 1) * 16);
         let error = s5_room(&over, S5_ICOUNT_MAX).unwrap_err();
         assert!(
-            error.contains("s5_kill_sleeping=2773") && error.contains("1 past its guard 2772"),
+            error.contains("s5_kill_sleeping=2771") && error.contains("1 past its guard 2770"),
             "{error}"
         );
+        // A run at its own speed shows a few hundred ticks, not instructions.
+        let own = run_with_s5(190 * 16);
+        assert!(
+            s5_room(&own, S5_ICOUNT_MAX)
+                .unwrap_err()
+                .contains("the run is not under -icount")
+        );
         // One row alone over the number fires too.
-        let mut one = run_with_s5(2_756 * 16);
+        let mut one = run_with_s5(2_754 * 16);
         let at = one
             .rows
             .iter()
