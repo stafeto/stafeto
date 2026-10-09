@@ -402,13 +402,14 @@ pub unsafe fn after_fork(id: u64, native: u64) {
     ROUTER.store(id, Ordering::Release);
 }
 
-/// The block and the handle of live thread `id`, for a signal or a
-/// request of cancellation; ESRCH for none. A thread stays in its place
-/// until relibc released it, which relibc does after the last use of its
-/// number.
-/// The block is read without the lock of the table: `collect` frees only a
-/// place relibc released, and after that the thread's `pthread_t` is no
-/// longer valid (POSIX), so no caller asks for it.
+/// The block and the handle of live thread `id`, without the lock of the
+/// table and without a pin on the place: nothing keeps `collect` from
+/// freeing the place while the caller uses the result. Safe only for the
+/// calling thread itself, the only thread of a child of `fork` and the guest
+/// probes, which keep the thread alive. A sender to another thread takes
+/// `with_target`, which pins the place; a detached or native thread can end
+/// and be collected while its `pthread_t` is still in use, so "no longer
+/// valid after release" does not protect a caller of this function.
 pub fn target(id: u64) -> Result<(&'static Block, core::mem::ManuallyDrop<Handle<Thread>>), i32> {
     let place = usize::try_from(id)
         .ok()
