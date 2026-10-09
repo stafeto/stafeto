@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# The os-test tests that fail on stafeto in a way the project knows (cargo
+# xtask os-test): the outcome is EXCEPTED while the exit code and the whole
+# output are exactly the listed ones, and FAIL for any other. `ci` fails when
+# a listed test has another outcome; a test that starts to pass leaves this
+# file and joins pass.txt.
+#
+# Fields separated by tabs: name, exit code, output (\n is a newline, \\ a
+# backslash), the norm the outcome departs from, the stage that revisits it.
+io/dup3-clofork-fork	1	dup3: EBADF\n	POSIX.1-2024 dup: EBADF when fildes2 is not less than {OPEN_MAX}; dup3(1, 32, O_CLOFORK) must give EBADF, and {OPEN_MAX} is 32 here	5g
