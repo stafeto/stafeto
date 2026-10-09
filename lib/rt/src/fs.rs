@@ -1203,13 +1203,10 @@ impl Files {
         let mut reply = [0; MESSAGE_MAX];
         // The service walks a long list a portion at a time: RESOLVING says
         // the walk goes on in the next call (a list of 1,541 names is seven).
-        let mut portions = 0;
-        let bytes = loop {
-            match self.call(w.as_bytes(), &mut reply) {
-                Err(Status::Unknown(proto_fs::RESOLVING)) if portions < 32 => portions += 1,
-                other => break other?,
-            }
-        };
+        let length = proto_fs::directory_walk(|| {
+            self.call(w.as_bytes(), &mut reply).map(|bytes| bytes.len())
+        })?;
+        let bytes = &reply[..length];
         let mut r = Reader::new(bytes);
         if r.u32()? != 0 {
             return Err(Status::BadSize);

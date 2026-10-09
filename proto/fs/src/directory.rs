@@ -5,6 +5,17 @@
 
 use proto_wire::{Reader, Status, Writer};
 
+/// A directory walk may restart while its current child is removed. Each
+/// request is bounded by the service's portion; transport errors end the walk.
+pub fn directory_walk<R>(mut call: impl FnMut() -> Result<R, Status>) -> Result<R, Status> {
+    loop {
+        match call() {
+            Err(Status::Unknown(crate::RESOLVING)) => {}
+            result => return result,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectoryEntry<'a> {
     pub kind: u32,
@@ -56,6 +67,23 @@ impl<'a> DirectoryEntry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_walk_survives_restarts_and_preserves_terminal_errors() {
+        for terminal in [Ok(19), Err(Status::Unknown(10)), Err(Status::BadSize)] {
+            let mut calls = 0;
+            let result = directory_walk(|| {
+                calls += 1;
+                if calls <= 64 {
+                    Err(Status::Unknown(crate::RESOLVING))
+                } else {
+                    terminal
+                }
+            });
+            assert_eq!(calls, 65);
+            assert_eq!(result, terminal);
+        }
+    }
 
     #[test]
     fn directory_records_preserve_wide_inodes_and_byte_names() {

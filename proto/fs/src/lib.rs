@@ -102,7 +102,7 @@ pub use data::{
     data_progress_reply, data_read_reply, data_start_reply, terminal_failure,
 };
 mod directory;
-pub use directory::DirectoryEntry;
+pub use directory::{DirectoryEntry, directory_walk};
 mod info;
 mod time;
 pub use info::NodeInfo;
