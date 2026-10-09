@@ -2069,6 +2069,15 @@ fn the_base_of_a_resolve_or_an_open_names_a_descriptor_a_node_or_the_reserved_di
     // The reserved value is the current directory of the session: BAD_FD.
     assert_eq!(base(&env, proto_fs::BASE_CWD, 0, true), Err(BAD_FD));
     assert_eq!(base(&env, proto_fs::BASE_ABSOLUTE, 0, true), Err(BAD_FD));
+    // A reserved value with a generation is malformed, as in the Change codec.
+    assert_eq!(
+        base(&env, proto_fs::BASE_CWD, 1, true),
+        Err(proto_wire::BAD_SIZE)
+    );
+    assert_eq!(
+        base(&env, proto_fs::BASE_ABSOLUTE, 1, true),
+        Err(proto_wire::BAD_SIZE)
+    );
     // The earlier form: the root token, and a token of a directory the session holds.
     assert_eq!(base(&env, 0, 1, true), Ok(ROOT));
     assert_eq!(

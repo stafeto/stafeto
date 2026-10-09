@@ -1045,10 +1045,11 @@ impl<'a> Ram<'a> {
     }
 
     /// The base of a path in ResolveStart, ResolveSecond and OpenStart. A slot
-    /// with bit 31 set names a descriptor of the session and the generation
-    /// of its description; the value 0xFFFF_FFFE of that form stands for the
+    /// with bit 31 set is read by `proto_fs::Base::from_wire`: a descriptor of
+    /// the session with the generation of its description, the reserved
     /// current directory of the session, which the service does not hold yet
-    /// (BAD_FD). Any other slot is a node token the session retains. An
+    /// (BAD_FD), or the reserved absolute base (BAD_FD for a relative path);
+    /// a reserved value with a generation is BAD_SIZE. Any other slot is a node token the session retains. An
     /// absolute path takes the root whatever the base says.
     pub fn request_base(
         &self,
@@ -1063,11 +1064,18 @@ impl<'a> Ram<'a> {
                 generation,
             });
         }
-        if slot == proto_fs::BASE_CWD {
-            return Err(BAD_FD);
-        }
         if slot & (1 << 31) != 0 {
-            return self.description_node(fds, slot & !(1 << 31), generation);
+            // The same reading of the base as the Change family has; the
+            // descriptor travels with bit 31 set in this form.
+            return match proto_fs::Base::from_wire(slot, generation) {
+                Err(status) => Err(status.code()),
+                // The service does not hold the current directory yet
+                // (5i-7), and a relative path has no root to start from.
+                Ok(proto_fs::Base::Absolute | proto_fs::Base::Cwd) => Err(BAD_FD),
+                Ok(proto_fs::Base::Fd { fd, generation }) => {
+                    self.description_node(fds, fd & !(1 << 31), generation)
+                }
+            };
         }
         let token = Token {
             slot: u16::try_from(slot).unwrap_or(storage::NONE),
