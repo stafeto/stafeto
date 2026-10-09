@@ -11,7 +11,8 @@ use crate::{
     storage::{Pin, Root, Storage, Token},
 };
 use proto_fs::{
-    ACCESS_DENIED, INVALID_ARGUMENT, NO_SPACE, PERMISSION, RESOLVING, STALE_PROOF, Timestamp,
+    ACCESS_DENIED, INVALID_ARGUMENT, NO_SPACE, NOT_SUPPORTED, PERMISSION, RESOLVING, STALE_PROOF,
+    Timestamp,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +160,15 @@ impl MetadataJournal {
             }
         }
         let node = *ram.storage.node(self.target)?;
+        // A link has no mode of its own to change.
+        if matches!(self.intent, MetadataIntent::Chmod(_))
+            && self.path.is_some_and(|path| !path.follow)
+            && node.kind == crate::storage::SYMLINK
+        {
+            let outcome = MetadataOutcome::Failed(NOT_SUPPORTED);
+            self.outcome = Some(outcome);
+            return Ok(outcome);
+        }
         let owner = identity.uid == 0 || identity.uid == node.uid;
         let mut mode = node.mode;
         let mut uid = node.uid;
@@ -187,6 +197,8 @@ impl MetadataJournal {
                             || identity.groups.contains(gid)))
             }
             MetadataIntent::Times(settings) => {
+                // Only the owner sets a time of its own choosing; two "now"
+                // need write permission as well; two omissions need nothing.
                 owner
                     || settings == [TimeSetting::Omit; 2]
                     || (settings == [TimeSetting::Now; 2] && identity.permits(&node, 2))
@@ -194,10 +206,12 @@ impl MetadataJournal {
             MetadataIntent::Access { bits, .. } => identity.permits(&node, bits),
         };
         let outcome = if !allowed {
-            MetadataOutcome::Failed(if matches!(self.intent, MetadataIntent::Access { .. }) {
-                ACCESS_DENIED
-            } else {
-                PERMISSION
+            MetadataOutcome::Failed(match self.intent {
+                MetadataIntent::Access { .. } => ACCESS_DENIED,
+                MetadataIntent::Times(settings) if settings == [TimeSetting::Now; 2] => {
+                    ACCESS_DENIED
+                }
+                _ => PERMISSION,
             })
         } else if !self.intent.needs_time() {
             MetadataOutcome::Unchanged

@@ -215,6 +215,8 @@ fn proof_ready_status(len: usize, first: u64, handles: usize) -> Result<Status, 
 fn resolve_start_request(
     request: &mut [u8; 28 + proto_fs::MAX_PATH],
     path: &[u8],
+    base: Option<(u32, u64)>,
+    follow: bool,
 ) -> Result<usize, Status> {
     if path.is_empty() {
         return Err(Status::Unknown(proto_fs::NO_ENTRY));
@@ -227,8 +229,15 @@ fn resolve_start_request(
     }
     request[..28].fill(0);
     request[..8].copy_from_slice(&Method::ResolveStart.header().bytes());
-    request[12..20].copy_from_slice(&1_u64.to_le_bytes());
-    request[24..28].copy_from_slice(&1_u32.to_le_bytes());
+    // The root, or a descriptor of the session: its number with bit 31 set
+    // and the generation of its description.
+    let (slot, generation) = match base {
+        None => (0, 1),
+        Some((fd, generation)) => (fd | 1 << 31, generation),
+    };
+    request[8..12].copy_from_slice(&slot.to_le_bytes());
+    request[12..20].copy_from_slice(&generation.to_le_bytes());
+    request[24..28].copy_from_slice(&u32::from(follow).to_le_bytes());
     request[28..28 + path.len()].copy_from_slice(path);
     Ok(28 + path.len())
 }
@@ -300,12 +309,33 @@ impl Files {
         mode: u32,
         umask: u32,
     ) -> Result<u64, Status> {
+        self.open_start_from(key, None, path, flags, mode, umask)
+    }
+    /// The same for a path that starts at a descriptor of the session (its
+    /// number and the generation of its description), None for the root.
+    pub fn open_start_from(
+        &self,
+        key: proto_fs::OpenKey,
+        base: Option<(u32, u64)>,
+        path: &[u8],
+        flags: u32,
+        mode: u32,
+        umask: u32,
+    ) -> Result<u64, Status> {
         let mut w = Writer::new();
         Method::OpenStart.header().write(&mut w)?;
         w.u32(key.slot)?;
         w.u64(key.generation)?;
-        w.u32(0)?;
-        w.u64(1)?;
+        match base {
+            None => {
+                w.u32(0)?;
+                w.u64(1)?;
+            }
+            Some((fd, generation)) => {
+                w.u32(fd | 1 << 31)?;
+                w.u64(generation)?;
+            }
+        }
         w.u32(flags)?;
         w.u32(mode)?;
         w.u32(umask)?;
@@ -712,8 +742,16 @@ impl Files {
     }
 
     fn prepare<'a>(&'a self, path: &[u8]) -> Result<Proof<'a>, Status> {
+        self.prepare_from(None, path, true)
+    }
+    fn prepare_from<'a>(
+        &'a self,
+        base: Option<(u32, u64)>,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<Proof<'a>, Status> {
         let mut request = [0; 28 + proto_fs::MAX_PATH];
-        let len = resolve_start_request(&mut request, path)?;
+        let len = resolve_start_request(&mut request, path, base, follow)?;
         let reply = Self::send_on(&self.channel, &request[..len])?;
         let proof = Proof {
             files: self,
@@ -1363,6 +1401,145 @@ impl Files {
     }
 }
 
+// The family of Change requests. Each call is one request and no more: an
+// interrupted send, AUTHENTICATING and JOBS_FULL come back to the caller, who
+// decides whether to send the same request again.
+impl Files {
+    fn change_send(&self, request: &Writer) -> Result<([u8; MESSAGE_MAX], usize), Status> {
+        let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
+        if !reply.handles.is_empty() {
+            return Err(Status::BadSize);
+        }
+        let mut buffer = [0; MESSAGE_MAX];
+        let length = reply.bytes(&mut buffer).len();
+        Ok((buffer, length))
+    }
+
+    /// A reply that carries the status and nothing else.
+    fn change_status_only(bytes: &[u8]) -> Result<(), Status> {
+        let mut input = Reader::new(bytes);
+        match Status::from_code(input.u32()?) {
+            Status::Ok => {
+                if input.u32()? != 0 {
+                    return Err(Status::BadSize);
+                }
+                input.finish()
+            }
+            status => Err(status),
+        }
+    }
+
+    pub fn change_start_once(
+        &self,
+        start: &proto_fs::ChangeStart<'_>,
+    ) -> Result<proto_fs::ChangePhase, Status> {
+        let mut request = Writer::new();
+        Method::ChangeStart.header().write(&mut request)?;
+        start.write(&mut request)?;
+        let (bytes, length) = self.change_send(&request)?;
+        proto_fs::change_start_reply(&bytes[..length], 0)
+    }
+
+    pub fn change_second_once(
+        &self,
+        key: proto_fs::OpenKey,
+        base: proto_fs::Base,
+        bytes: &[u8],
+    ) -> Result<(), Status> {
+        let mut request = Writer::new();
+        Method::ChangeSecond.header().write(&mut request)?;
+        proto_fs::ChangeSecond { key, base, bytes }.write(&mut request)?;
+        let (reply, length) = self.change_send(&request)?;
+        Self::change_status_only(&reply[..length])
+    }
+
+    fn change_progress(
+        &self,
+        method: Method,
+        key: proto_fs::OpenKey,
+        out: &mut [u8; proto_fs::RESULT_MAX],
+    ) -> Result<Option<proto_fs::ChangeDone>, Status> {
+        key.validate().map_err(Status::from_code)?;
+        let mut request = Writer::new();
+        method.header().write(&mut request)?;
+        proto_fs::write_key_body(&mut request, key)?;
+        let (bytes, length) = self.change_send(&request)?;
+        let reply = proto_fs::ChangeReply::read(&bytes[..length], 0)?;
+        if !reply.done {
+            return Ok(None);
+        }
+        out[..reply.bytes.len()].copy_from_slice(reply.bytes);
+        Ok(Some(proto_fs::ChangeDone {
+            result: reply.result,
+            restarts: reply.restarts,
+            value: reply.value,
+            length: reply.bytes.len(),
+        }))
+    }
+
+    /// One Step. `Ok(None)` is a job that still runs.
+    pub fn change_step_once(
+        &self,
+        key: proto_fs::OpenKey,
+        out: &mut [u8; proto_fs::RESULT_MAX],
+    ) -> Result<Option<proto_fs::ChangeDone>, Status> {
+        self.change_progress(Method::ChangeStep, key, out)
+    }
+
+    /// One Query: the same reply as Step, without advancing the job.
+    pub fn change_query_once(
+        &self,
+        key: proto_fs::OpenKey,
+        out: &mut [u8; proto_fs::RESULT_MAX],
+    ) -> Result<Option<proto_fs::ChangeDone>, Status> {
+        self.change_progress(Method::ChangeQuery, key, out)
+    }
+
+    /// Release answers 0 for any key; the caller repeats it until it does.
+    pub fn change_release_once(&self, key: proto_fs::OpenKey) -> Result<(), Status> {
+        key.validate().map_err(Status::from_code)?;
+        let mut request = Writer::new();
+        Method::ChangeRelease.header().write(&mut request)?;
+        proto_fs::write_key_body(&mut request, key)?;
+        let (reply, length) = self.change_send(&request)?;
+        Self::change_status_only(&reply[..length])
+    }
+
+    /// A path against a base, for the requests that read: the node information
+    /// of the node `path` names under the base, the last link followed or not.
+    pub fn node_information_from(
+        &self,
+        base: Option<(u32, u64)>,
+        path: &[u8],
+        follow: bool,
+    ) -> Result<proto_fs::NodeInfo, Status> {
+        let proof = self.prepare_from(base, path, follow)?;
+        let mut w = Writer::new();
+        Method::InfoPath.header().write(&mut w)?;
+        w.u64(proof.id)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        loop {
+            let reply = Self::send_on(&self.channel, w.as_bytes())?;
+            let bytes = reply.bytes(&mut buffer);
+            let status = Status::from_code(Reader::new(bytes).u32()?);
+            if status == Status::Unknown(proto_fs::STALE_PROOF) {
+                proof.ready()?;
+                continue;
+            }
+            if status != Status::Ok {
+                return Err(status);
+            }
+            let mut r = Reader::new(bytes);
+            if r.u32()? != 0 {
+                return Err(Status::BadSize);
+            }
+            let info = proto_fs::NodeInfo::read(&mut r)?;
+            r.finish()?;
+            return Ok(info);
+        }
+    }
+}
+
 #[cfg(test)]
 mod finalize_reply_tests {
     use super::*;
@@ -1493,7 +1670,7 @@ mod resolver_small_wire_tests {
         let max = [b'x'; proto_fs::MAX_PATH];
         for path in [b"/".as_slice(), b"../bin/probe", max.as_slice()] {
             let mut request = [0xa5; 28 + proto_fs::MAX_PATH];
-            let len = resolve_start_request(&mut request, path).unwrap();
+            let len = resolve_start_request(&mut request, path, None, true).unwrap();
             let mut writer = Writer::new();
             Method::ResolveStart.header().write(&mut writer).unwrap();
             writer.u32(0).unwrap();
@@ -1513,7 +1690,10 @@ mod resolver_small_wire_tests {
             ),
             (b"/a\0b".as_slice(), Status::BadSize),
         ] {
-            assert_eq!(resolve_start_request(&mut request, path), Err(status));
+            assert_eq!(
+                resolve_start_request(&mut request, path, None, true),
+                Err(status)
+            );
             assert_eq!(request, [0xa5; 28 + proto_fs::MAX_PATH]);
         }
     }

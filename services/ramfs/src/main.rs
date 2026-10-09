@@ -20,6 +20,7 @@ use ramfs::authority::{
     Admission, AuditStep, Binding, BindingPurpose, CleanupAudit, Identity, NotaryReply,
     RetainedSourcePhase, retained_source_phase,
 };
+use ramfs::job::{JobOperation, PathJob, ResolveJob, Seconds};
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
 use ramfs::storage::{NONE, Root, Token};
@@ -40,8 +41,8 @@ const METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0xfff7, 0xfff8, 0xfff9, 0xfffa,
-    0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 0xfff7,
+    0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 /// Genuine ordinary and image sessions each retain one exact place.
 /// The fixed table covers process records and transient loader bindings.
@@ -169,6 +170,7 @@ fn main(_: u64) -> u64 {
         identities: &mut tables.identities,
         jobs: &mut tables.jobs,
         job_generations: &mut tables.job_generations,
+        seconds: &mut tables.seconds,
         generations: None,
         maintenance: ramfs::maintenance::Cursor::default(),
         next_audit_ns: 0,
@@ -176,6 +178,7 @@ fn main(_: u64) -> u64 {
         data_gc_turn: false,
         orphan_cursor: 0,
         orphan_count: 0,
+        cancel_reported: 0,
     };
     // Prepare the authentic notary page after publishing the RAM endpoint.
     // Standalone boot profiles may have no Process service.
@@ -216,6 +219,7 @@ struct Fs {
     identities: &'static mut Identities,
     jobs: &'static mut [Option<ResolveJob>; ramfs::storage::PREPARATIONS],
     job_generations: &'static mut [u64; ramfs::storage::PREPARATIONS],
+    seconds: &'static mut Seconds,
     generations: Option<Handle<Memory>>,
     maintenance: ramfs::maintenance::Cursor,
     next_audit_ns: u64,
@@ -223,6 +227,8 @@ struct Fs {
     data_gc_turn: bool,
     orphan_cursor: u8,
     orphan_count: u16,
+    /// The refused steps of a cancel the service has printed so far.
+    cancel_reported: u32,
 }
 
 /// The clones the service keeps alive at most: one for each record of the
@@ -305,41 +311,6 @@ struct IdentityChannel {
     audit: CleanupAudit,
     image: Option<ImageContext>,
 }
-struct ResolveJob {
-    id: u64,
-    owner: u64,
-    root: u16,
-    real: bool,
-    authority: Option<ramfs::authority::Stamp>,
-    operation: JobOperation,
-    open_key: Option<proto_fs::OpenKey>,
-    raw_base: (u32, u64),
-    abandoned: bool,
-}
-struct PathJob {
-    resolver: Resolve,
-    second: Option<Resolve>,
-    open: Option<OpenJournal>,
-}
-#[allow(clippy::large_enum_variant)]
-enum JobOperation {
-    Path(PathJob),
-    Data(ramfs::data::Journal),
-}
-impl ResolveJob {
-    fn path(&self) -> &PathJob {
-        match &self.operation {
-            JobOperation::Path(path) => path,
-            JobOperation::Data(_) => panic!("validated path job"),
-        }
-    }
-    fn path_mut(&mut self) -> &mut PathJob {
-        match &mut self.operation {
-            JobOperation::Path(path) => path,
-            JobOperation::Data(_) => panic!("validated path job"),
-        }
-    }
-}
 struct Tables {
     places: ramfs::places::Places,
     clones: Clones<CLONES, { ramfs::places::SLOT_BITS }>,
@@ -348,6 +319,7 @@ struct Tables {
     identities: Identities,
     jobs: [Option<ResolveJob>; ramfs::storage::PREPARATIONS],
     job_generations: [u64; ramfs::storage::PREPARATIONS],
+    seconds: Seconds,
 }
 struct Bss(UnsafeCell<Tables>);
 // SAFETY: only the main thread reaches it, once (`main`).
@@ -360,6 +332,7 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     identities: Identities::new(),
     jobs: [const { None }; ramfs::storage::PREPARATIONS],
     job_generations: [0; ramfs::storage::PREPARATIONS],
+    seconds: Seconds::new(),
 }));
 
 impl Fs {
@@ -1081,6 +1054,13 @@ impl Service<0> for Fs {
             return;
         }
         rt::service::step_own();
+        if self.ram.cancel_refusals != self.cancel_reported {
+            self.cancel_reported = self.ram.cancel_refusals;
+            rt::println!(
+                "ramfs: {} steps of a cancel were refused",
+                self.cancel_reported
+            );
+        }
         let now = rt::time::ticks_to_ns(rt::time::now());
         if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
             self.next_audit_ns = now.saturating_add(250_000_000);
@@ -1383,6 +1363,7 @@ impl Service<0> for Fs {
                         | Method::OpenCancel
                         | Method::DataCancel
                         | Method::DataAck
+                        | Method::ChangeRelease
                         | Method::VerifySession
                 )
             )
@@ -1409,6 +1390,18 @@ impl Service<0> for Fs {
             )
         ) {
             return self.data_request(&mut s.data, r);
+        }
+        if matches!(
+            Method::from_number(r.method()),
+            Some(
+                Method::ChangeStart
+                    | Method::ChangeSecond
+                    | Method::ChangeStep
+                    | Method::ChangeQuery
+                    | Method::ChangeRelease
+            )
+        ) {
+            return self.change_request(&mut s.data, r);
         }
         if matches!(
             Method::from_number(r.method()),
@@ -1511,7 +1504,7 @@ impl Service<0> for Fs {
                     &mut s.data,
                     fd,
                     &mut bytes[..count as usize],
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
+                    self.time_source.now(),
                 ) {
                     Ok(n) => {
                         let w = r.reply();
@@ -1540,7 +1533,7 @@ impl Service<0> for Fs {
                     fd,
                     offset,
                     &mut bytes[..count as usize],
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
+                    self.time_source.now(),
                 ) {
                     Ok(n) => {
                         let w = r.reply();
@@ -1566,12 +1559,10 @@ impl Service<0> for Fs {
                 if bytes.len() > MAX_WRITE {
                     return Answer::Status(Status::BadSize);
                 }
-                match self.ram.write_at(
-                    &mut s.data,
-                    fd,
-                    bytes,
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
-                ) {
+                match self
+                    .ram
+                    .write_at(&mut s.data, fd, bytes, self.time_source.now())
+                {
                     Ok(n) => value(r, n as u32),
                     Err(code) => status(code),
                 }
@@ -1583,13 +1574,10 @@ impl Service<0> for Fs {
                 let Ok(bytes) = body.bytes(body.left()) else {
                     return Answer::Status(Status::BadSize);
                 };
-                match self.ram.pwrite(
-                    &mut s.data,
-                    fd,
-                    offset,
-                    bytes,
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
-                ) {
+                match self
+                    .ram
+                    .pwrite(&mut s.data, fd, offset, bytes, self.time_source.now())
+                {
                     Ok(n) => value(r, n as u32),
                     Err(code) => status(code),
                 }
@@ -1719,12 +1707,9 @@ impl Service<0> for Fs {
                     .binding
                     .identity(false)
                     .expect("authenticated session");
-                let found = self.ram.directory_read_token(
-                    token,
-                    index,
-                    identity,
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
-                );
+                let found =
+                    self.ram
+                        .directory_read_token(token, index, identity, self.time_source.now());
                 self.cancel_job(job, r.label(), Some(&mut s.data));
                 match found {
                     Ok(entry) => {
@@ -1749,11 +1734,10 @@ impl Service<0> for Fs {
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                match self.ram.directory_read(
-                    &mut s.data,
-                    fd,
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
-                ) {
+                match self
+                    .ram
+                    .directory_read(&mut s.data, fd, self.time_source.now())
+                {
                     Ok(entry) => {
                         let entry = entry.map(|entry| proto_fs::DirectoryEntry {
                             name: entry.name.as_bytes(),
@@ -1843,7 +1827,12 @@ impl Service<0> for Fs {
                 | Method::DataQuery
                 | Method::DataCancel
                 | Method::DataAck
-                | Method::DataReadResult,
+                | Method::DataReadResult
+                | Method::ChangeStart
+                | Method::ChangeSecond
+                | Method::ChangeStep
+                | Method::ChangeQuery
+                | Method::ChangeRelease,
             )
             | None => Answer::Status(Status::UnknownMethod),
         }
@@ -2746,8 +2735,12 @@ impl Fs {
             let Some(local) = fds.resolvers.iter().position(|&id| id == 0) else {
                 return status(proto_fs::TOO_MANY_OPEN_FILES);
             };
+            // The full side table and the full share of the root keep the key
+            // free and make no effect: JOBS_FULL, as in Change, and the client
+            // sleeps and asks again. TOO_MANY_OPEN_FILES stays for what the
+            // client counts itself and for a key taken by another generation.
             let Some(slot) = self.jobs.iter().position(Option::is_none) else {
-                return status(proto_fs::TOO_MANY_OPEN_FILES);
+                return status(proto_fs::JOBS_FULL);
             };
             let Some(generation) = self.job_generations[slot]
                 .checked_add(1)
@@ -2757,7 +2750,13 @@ impl Fs {
             };
             let charge = match self.ram.storage.charge_preparation(fds.root) {
                 Ok(charge) => charge,
-                Err(code) => return status(code),
+                Err(code) => {
+                    return status(if code == proto_fs::TOO_MANY_OPEN_FILES {
+                        proto_fs::JOBS_FULL
+                    } else {
+                        code
+                    });
+                }
             };
             let data = match ramfs::data::Journal::capture(&mut self.ram, fds, args) {
                 Ok(data) => data,
@@ -2934,6 +2933,88 @@ impl Fs {
             _ => unreachable!(),
         }
     }
+    /// The five methods of the Change family (44 to 48).
+    fn change_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        if proto_fs::is_loaders(r.label()) {
+            return status(proto_fs::PERMISSION);
+        }
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let method = Method::from_number(r.method()).expect("change method");
+        let owner = r.label();
+        if method == Method::ChangeRelease
+            && let Ok(key) = proto_fs::read_key_body(r.body())
+        {
+            // The key of a Data job (a truncate) ends with the same Release:
+            // the cleanup of its journal, step by step, and the job forgotten.
+            let data = self.jobs.iter().flatten().find(|job| {
+                job.owner == owner
+                    && job.open_key == Some(key)
+                    && matches!(job.operation, JobOperation::Data(_))
+            });
+            if let Some(id) = data.map(|job| job.id) {
+                return if self.cancel_job_mode(id, owner, Some(fds), true) {
+                    Answer::Status(Status::Ok)
+                } else {
+                    status(proto_fs::RESOLVING)
+                };
+            }
+        }
+        // Release is cleanup: it needs no live authority.
+        if method != Method::ChangeRelease
+            && let Err(code) = self.authenticate(fds, owner)
+        {
+            return status(code);
+        }
+        let mut out = proto_wire::Writer::new();
+        let mut ctx = ramfs::change::Ctx {
+            ram: &mut self.ram,
+            jobs: &mut *self.jobs,
+            generations: &mut *self.job_generations,
+            seconds: &mut *self.seconds,
+        };
+        let result = match method {
+            Method::ChangeStart => match proto_fs::ChangeStart::read(r.body()) {
+                Ok(req) => ramfs::change::start(&mut ctx, fds, owner, &req, &mut out),
+                Err(error) => Err(error.code()),
+            },
+            Method::ChangeSecond => match proto_fs::ChangeSecond::read(r.body()) {
+                Ok(req) => ramfs::change::second(&mut ctx, fds, owner, &req),
+                Err(error) => Err(error.code()),
+            },
+            Method::ChangeStep | Method::ChangeQuery => match proto_fs::read_key_body(r.body()) {
+                Ok(key) => ramfs::change::step(
+                    &mut ctx,
+                    fds,
+                    owner,
+                    key,
+                    if method == Method::ChangeStep {
+                        ramfs::change::Advance::Step
+                    } else {
+                        ramfs::change::Advance::Query
+                    },
+                    &self.time_source,
+                    &mut out,
+                ),
+                Err(error) => Err(error.code()),
+            },
+            _ => match proto_fs::read_key_body(r.body()) {
+                Ok(key) => ramfs::change::release(&mut ctx, fds, owner, key),
+                Err(error) => Err(error.code()),
+            },
+        };
+        match result {
+            Ok(()) => {
+                if method == Method::ChangeSecond || method == Method::ChangeRelease {
+                    return Answer::Status(Status::Ok);
+                }
+                *r.reply() = out;
+                Answer::Reply(Outgoing::new())
+            }
+            Err(code) => status(code),
+        }
+    }
     fn job_slot(&self, id: u64, owner: u64) -> Result<usize, u32> {
         let i = (id & 255) as usize;
         if !self
@@ -2960,9 +3041,14 @@ impl Fs {
             return;
         };
         let job = self.jobs[slot].as_mut().expect("exact disappearing job");
-        if let JobOperation::Data(data) = &mut job.operation {
+        if matches!(
+            job.operation,
+            JobOperation::Data(_) | JobOperation::Change(_)
+        ) {
             if !job.abandoned {
-                data.abandon();
+                if let JobOperation::Data(data) = &mut job.operation {
+                    data.abandon();
+                }
                 job.abandoned = true;
                 self.orphan_count = self.orphan_count.checked_add(1).expect("bounded paid jobs");
                 assert!(self.orphan_count as usize <= ramfs::storage::PREPARATIONS);
@@ -3000,6 +3086,24 @@ impl Fs {
             }
         }
         if let Ok(i) = self.job_slot(id, owner) {
+            if matches!(
+                self.jobs[i].as_ref().map(|job| &job.operation),
+                Some(JobOperation::Change(_))
+            ) {
+                let mut ctx = ramfs::change::Ctx {
+                    ram: &mut self.ram,
+                    jobs: &mut *self.jobs,
+                    generations: &mut *self.job_generations,
+                    seconds: &mut *self.seconds,
+                };
+                if ramfs::change::cancel_slot(&mut ctx, fds.as_deref_mut(), i) {
+                    self.orphan_count = self
+                        .orphan_count
+                        .checked_sub(1)
+                        .expect("owned abandoned count");
+                }
+                return true;
+            }
             if let Some(ResolveJob {
                 operation: JobOperation::Data(data),
                 ..
@@ -3211,7 +3315,7 @@ impl Fs {
                         .as_ref()
                         .expect("exact canceled job")
                         .operation,
-                    JobOperation::Data(_)
+                    JobOperation::Data(_) | JobOperation::Change(_)
                 )
             {
                 return status(proto_fs::PERMISSION);
@@ -3341,17 +3445,17 @@ impl Fs {
                 Ok(c) => c,
                 Err(code) => return status(code),
             };
-            let base = Token {
-                slot: match u16::try_from(slot) {
-                    Ok(s) => s,
-                    Err(_) => NONE,
-                },
-                generation,
-            };
-            if path.first() != Some(&b'/') && !self.ram.owns_directory_base(fds, base) {
-                self.ram.storage.release_preparation(charge);
-                return status(proto_fs::BAD_FD);
-            }
+            let base =
+                match self
+                    .ram
+                    .request_base(fds, slot, generation, path.first() != Some(&b'/'))
+                {
+                    Ok(base) => base,
+                    Err(code) => {
+                        self.ram.storage.release_preparation(charge);
+                        return status(code);
+                    }
+                };
             let resolver =
                 match Resolve::with_intent(&mut self.ram.storage, path, base, identity, intent) {
                     Ok(r) => r,
@@ -3411,13 +3515,14 @@ impl Fs {
             if j.path().second.is_some() || j.real || j.path().open.is_some() {
                 return status(proto_fs::PERMISSION);
             }
-            let base = Token {
-                slot: u16::try_from(slot).unwrap_or(NONE),
-                generation,
-            };
-            if path.first() != Some(&b'/') && !self.ram.owns_directory_base(fds, base) {
-                return status(proto_fs::BAD_FD);
-            }
+            let base =
+                match self
+                    .ram
+                    .request_base(fds, slot, generation, path.first() != Some(&b'/'))
+                {
+                    Ok(base) => base,
+                    Err(code) => return status(code),
+                };
             let identity = fds.binding.identity(false).expect("authenticated");
             match Resolve::new(&mut self.ram.storage, path, base, identity, follow != 0) {
                 Ok(second) => {
@@ -3596,15 +3701,8 @@ impl Fs {
         {
             return Answer::Status(Status::BadSize);
         }
-        let now = rt::time::ticks_to_ns(rt::time::now());
-        match open.commit(
-            &mut self.ram,
-            fds,
-            proof,
-            identity,
-            &mut j.root,
-            proto_fs::Timestamp::legacy_ns(now),
-        ) {
+        let now = self.time_source.now();
+        match open.commit(&mut self.ram, fds, proof, identity, &mut j.root, now) {
             Ok(committed) => {
                 debug_assert_eq!(committed, held);
                 Answer::Reply(Outgoing::new())

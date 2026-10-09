@@ -769,6 +769,33 @@ static int exec_spawning(void) {
 #endif
 #define STEPS_LEAVES 31
 
+#ifndef STEPS_SESSIONS
+#define STEPS_SESSIONS 0
+#endif
+#if CHANGE_STEPS
+extern int files_change_stages(void);
+extern int files_closed_sessions(int count);
+extern int files_gone_child(int exec);
+extern int files_gone_places(void);
+#endif
+#if NAMES_PROBE
+extern int files_names_pipe(void);
+extern int files_names_fork_in_flight(void);
+
+#include "names-signal.c"
+
+/* The role: a child of the loader, which can fork. */
+static int names_role(void) {
+    int pipes = files_names_pipe();
+    if (pipes) { printf("posix-procs: names on a pipe gave %d\n", pipes); return 2; }
+    int forks = files_names_fork_in_flight();
+    if (forks) { printf("posix-procs: fork in the middle of a rename gave %d\n", forks); return 3; }
+    int signals = names_signals();
+    if (signals) { printf("posix-procs: a signal in the middle of a rename gave %d\n", signals); return 4; }
+    return 0;
+}
+#endif
+
 static int steps_spawn(pid_t *pid, const char *role, const char *index) {
     char *argv[] = {"procs-child", (char *)role, (char *)index, NULL};
     char *envp[] = {NULL};
@@ -975,11 +1002,88 @@ static int steps_branch(void) {
     for (;;) pause_ms(1000);
 }
 
+#if CHANGE_STEPS
+#include "names-volley.c"
+#endif
+
+#if CHANGE_STEPS
+/* A process that goes in the middle of a prepaid rename of a directory over
+ * an empty one, once with _exit and once with execve: the service gives back
+ * the job, the names stay where they were, and the next volley gets all 24
+ * places of the side table of the root. */
+static int gone_pair(const char *a, const char *b) {
+    char path[48];
+    snprintf(path, sizeof path, "/tmp/gn/%s", a);
+    if (mkdir(path, 0755) != 0) return 1;
+    snprintf(path, sizeof path, "/tmp/gn/%s", b);
+    return mkdir(path, 0755) != 0;
+}
+
+static int gone_exists(const char *name) {
+    char path[48];
+    struct stat st;
+    snprintf(path, sizeof path, "/tmp/gn/%s", name);
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int names_gone(void) {
+    static const char *const names[2][4] = {{"p1", "q1", "p2", "q2"}, {"r1", "s1", "r2", "s2"}};
+    if (mkdir("/tmp/gn", 0755) != 0) return 1;
+    for (int exec = 0; exec < 2; exec++) {
+        const char *const *n = names[exec];
+        if (gone_pair(n[0], n[1]) || gone_pair(n[2], n[3])) return 2;
+        pid_t pid = -1;
+        if (steps_spawn(&pid, "gonechild", exec ? "1" : "0") != 0) return 3;
+        int status = -1;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 7) {
+            printf("posix-procs: steps: the %s child ended with status %#x\n",
+                   exec ? "execve" : "_exit", status);
+            return 4;
+        }
+        /* The first pair moved, the second did not: no effect of the job. */
+        if (gone_exists(n[0]) || !gone_exists(n[1]) || !gone_exists(n[2]) || !gone_exists(n[3])) {
+            printf("posix-procs: steps: names after the %s child are not as they were\n",
+                   exec ? "execve" : "_exit");
+            return 5;
+        }
+        if (files_gone_places() != 0) {
+            printf("posix-procs: steps: the places of the job of the %s child stayed taken\n",
+                   exec ? "execve" : "_exit");
+            return 6;
+        }
+        char path[48];
+        for (int i = 1; i < 4; i++) {
+            snprintf(path, sizeof path, "/tmp/gn/%s", n[i]);
+            if (rmdir(path) != 0) return 7;
+        }
+    }
+    if (rmdir("/tmp/gn") != 0) return 8;
+    printf("posix-procs: names gone ok\n");
+    return 0;
+}
+#endif
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
     unsigned char zeros[STEPS_BRANCHES] = {0};
     if (fd < 0 || pwrite(fd, zeros, sizeof zeros, 0) != (ssize_t)sizeof zeros) return 2;
+#if CHANGE_STEPS
+    /* The operations on names alone, in a table full of names, against a
+     * flood of changes and from 112 threads, before the crowd arrives. */
+    int volley = names_volley();
+    if (volley) {
+        printf("posix-procs: steps: the names volley failed %d\n", volley);
+        return 6;
+    }
+#endif
+#if CHANGE_STEPS
+    int gone = names_gone();
+    if (gone) {
+        printf("posix-procs: steps: the names gone probe failed %d\n", gone);
+        return 6;
+    }
+#endif
     pid_t branches[STEPS_BRANCHES];
     for (int b = 0; b < STEPS_BRANCHES; b++) {
         char index[8];
@@ -1009,6 +1113,22 @@ static int steps_run(void) {
         pause_ms(10);
     }
     printf("posix-procs: steps %d children live\n", STEPS_BRANCHES * (STEPS_LEAVES + 1) + own);
+#if CHANGE_STEPS
+    /* The change jobs of the RAM file service among the crowd: every
+     * method of the family, and the cancel of a rename in flight. */
+    int change = files_change_stages();
+    if (change) {
+        printf("posix-procs: steps: Change stages failed %d\n", change);
+        failed++;
+    }
+    /* Identity sessions cloned and closed before the exec steps: the ends
+     * they leave in the channel are taken by the thread of the process
+     * service's ends, so the exec steps stay as long as with one. */
+    if (files_closed_sessions(STEPS_SESSIONS) != 0) {
+        printf("posix-procs: steps: closing %d sessions failed\n", STEPS_SESSIONS);
+        failed++;
+    }
+#endif
     /* kill(-1) in a loop: signal 0 and a signal that is ignored by default. */
     for (int i = 0; i < 20; i++) {
         if (kill(-1, 0) != 0 || kill(-1, SIGCHLD) != 0) {
@@ -1837,6 +1957,87 @@ static int channel_child(const char *name);
 #include "jobs.c"
 #endif
 
+static void spawn_names(void);
+static void dup3_across_fork(void);
+
+/* A set-ID program of root (real UID 65534, effective 0) that spawns with
+ * POSIX_SPAWN_RESETIDS: the actions of files and the search of PATH run in
+ * this process under the effective IDs, so the layer checks them with the
+ * real ones first (until issue #176 moves them into the child). The
+ * directory /tmp/rs is root's, mode 0700. */
+static int setid_spawn(void) {
+    char *argv[] = {"procs-child", "child", NULL};
+    char *envp[] = {NULL};
+    struct stat st;
+    posix_spawnattr_t reset;
+    posix_spawnattr_init(&reset);
+    posix_spawnattr_setflags(&reset, POSIX_SPAWN_RESETIDS);
+    if (getuid() != 65534 || geteuid() != 0) return 1;
+    if (mkdir("/tmp/rs", 0700) != 0) return 2;
+    int bad = 0;
+    posix_spawn_file_actions_t actions;
+    pid_t pid;
+
+    /* An Open action that creates a file in a directory the real IDs may
+     * not write: EACCES and no file. Without RESETIDS the child runs under
+     * the effective IDs, and the file appears. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 5, "/tmp/rs/made", O_WRONLY | O_CREAT, 0600);
+    pid = -7;
+    int e = posix_spawn(&pid, "/bin/procs-child", &actions, &reset, argv, envp);
+    if (e != EACCES || stat("/tmp/rs/made", &st) == 0) {
+        printf("posix-procs: setid spawn: RESETIDS and addopen gave %d (%s)\n", e, strerror(e));
+        bad |= 4;
+    }
+    e = posix_spawn(&pid, "/bin/procs-child", &actions, NULL, argv, envp);
+    if (e != 0 || waitpid(pid, NULL, 0) != pid || stat("/tmp/rs/made", &st) != 0) {
+        printf("posix-procs: setid spawn: addopen without RESETIDS gave %d (%s)\n", e, strerror(e));
+        bad |= 8;
+    }
+    posix_spawn_file_actions_destroy(&actions);
+
+    /* A directory the real IDs may not search. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addchdir(&actions, "/tmp/rs");
+    e = posix_spawn(&pid, "/bin/procs-child", &actions, &reset, argv, envp);
+    if (e != EACCES) {
+        printf("posix-procs: setid spawn: RESETIDS and addchdir gave %d (%s)\n", e, strerror(e));
+        bad |= 16;
+    }
+    e = posix_spawn(&pid, "/bin/procs-child", &actions, NULL, argv, envp);
+    if (e != 0 || waitpid(pid, NULL, 0) != pid) {
+        printf("posix-procs: setid spawn: addchdir without RESETIDS gave %d (%s)\n", e, strerror(e));
+        bad |= 32;
+    }
+    posix_spawn_file_actions_destroy(&actions);
+
+    /* The search of PATH: /tmp/rs holds a file procs-child that only root may
+     * execute. Under the real IDs the directory cannot be searched, and the
+     * search goes on to /bin; under the effective IDs it stops at the empty
+     * file, which is no program, and the spawn fails. */
+    int fd = open("/tmp/rs/procs-child", O_WRONLY | O_CREAT, 0700);
+    if (fd < 0) return 64;
+    close(fd);
+    setenv("PATH", "/tmp/rs:/bin", 1);
+    e = posix_spawnp(&pid, "procs-child", NULL, &reset, argv, envp);
+    if (e != 0 || waitpid(pid, NULL, 0) != pid) {
+        printf("posix-procs: setid spawn: RESETIDS and a path search gave %d (%s)\n", e, strerror(e));
+        bad |= 128;
+    }
+    e = posix_spawnp(&pid, "procs-child", NULL, NULL, argv, envp);
+    if (e == 0) {
+        printf("posix-procs: setid spawn: a path search under the effective IDs gave %d (%s)\n", e,
+               strerror(e));
+        bad |= 256;
+    }
+    unlink("/tmp/rs/procs-child");
+    unlink("/tmp/rs/made");
+    rmdir("/tmp/rs");
+    posix_spawnattr_destroy(&reset);
+    if (!bad) printf("posix-procs: setid spawn ok\n");
+    return bad;
+}
+
 static int role(const char *name) {
 #if PENDING_OPEN_PROBE
     if (strcmp(name, "pendingfork") == 0) return check_pending_fork();
@@ -1849,8 +2050,15 @@ static int role(const char *name) {
     if (strcmp(name, "loaderchannels") == 0) return loader_channels();
     if (strncmp(name, "channels_", 9) == 0) return channel_child(name);
     if (strcmp(name, "steps") == 0) return steps_run();
+#if CHANGE_STEPS
+    if (strcmp(name, "volley") == 0) return vz_child();
+    if (strcmp(name, "gonechild") == 0) return files_gone_child(atoi(argv_seen[2]));
+#endif
     if (strcmp(name, "branch") == 0) return steps_branch();
     if (strcmp(name, "armed") == 0) return steps_armed();
+#if NAMES_PROBE
+    if (strcmp(name, "names") == 0) return names_role();
+#endif
     if (strcmp(name, "stepfork") == 0) return steps_fork();
     if (strcmp(name, "steppipes") == 0) return steps_pipes();
     if (strcmp(name, "child") == 0) {
@@ -1925,6 +2133,7 @@ static int role(const char *name) {
                (int)geteuid(), getauxval(23), fd);
         return ok ? 0 : 1;
     }
+    if (strcmp(name, "setidspawn") == 0) return setid_spawn();
     if (strcmp(name, "nobody") == 0) {
         int ok = getuid() == 65534 && geteuid() == 65534 && getauxval(23) == 0;
         printf("posix-procs: nobody uid %d euid %d\n", (int)getuid(), (int)geteuid());
@@ -1953,6 +2162,17 @@ static int role(const char *name) {
         if (!getcwd(cwd, sizeof cwd)) return 1;
         printf("posix-procs: the child's directory is %s\n", cwd);
         return strcmp(cwd, "/bin") == 0 ? 0 : 2;
+    }
+    if (strcmp(name, "spawnnames") == 0) {
+        /* A child of its own: the environment this stage sets stays out of
+         * the process whose heap other stages measure. */
+        spawn_names();
+        dup3_across_fork();
+        return failures != 0;
+    }
+    if (strcmp(name, "writefd6") == 0) {
+        /* The file the open action made at 6: two bytes. */
+        return write(6, "hi", 2) == 2 ? 0 : 1;
     }
     if (strcmp(name, "execls") == 0) {
         char *ls[] = {"ls", "/etc", NULL};
@@ -2318,6 +2538,146 @@ static void descriptors(void) {
     posix_spawn_file_actions_destroy(&actions);
 }
 
+/* posix_spawnp of `file` in the role `name`, with PATH `search` in the
+ * environment of the caller. The error of the call, or the status of the
+ * child. */
+static int spawnp_with(const char *file, const char *search, const char *name,
+                       const posix_spawn_file_actions_t *actions, int *status) {
+    char *argv[] = {"procs-child", (char *)name, NULL};
+    char *envp[] = {NULL};
+    char *saved = getenv("PATH");
+    char keep[256];
+    if (saved) snprintf(keep, sizeof keep, "%s", saved);
+    setenv("PATH", search, 1);
+    pid_t pid = -1;
+    int e = posix_spawnp(&pid, file, actions, NULL, argv, envp);
+    if (saved) setenv("PATH", keep, 1);
+    else unsetenv("PATH");
+    if (e != 0) return e;
+    int wait_status = 0;
+    if (waitpid(pid, &wait_status, 0) != pid) return -1;
+    *status = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : 1000;
+    return 0;
+}
+
+/* Stage 8b (5i-5), the names of posix_spawn, run in a child of the probe: an open action that creates,
+ * truncates and appends with its mode, the search of PATH after the actions
+ * of the files, and fchdir. */
+static void spawn_names(void) {
+    posix_spawn_file_actions_t actions;
+    int status = -1;
+    mode_t old = umask(027);
+    unlink("/tmp/spawned");
+    /* The mode of the file the action creates, cut by the mask. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 6, "/tmp/spawned", O_WRONLY | O_CREAT | O_EXCL, 0666);
+    run_with("/bin/procs-child", "writefd6", NULL, &actions);
+    struct stat st;
+    expect("the created file has the mode 0640", stat("/tmp/spawned", &st) == 0 && (st.st_mode & 0777) == 0640, 1);
+    expect("and the two bytes of the child", stat("/tmp/spawned", &st) == 0 && st.st_size == 2, 1);
+    /* O_EXCL refuses the existing file before the child lives. */
+    pid_t pid = -1;
+    char *argv[] = {"procs-child", "writefd6", NULL};
+    char *envp[] = {NULL};
+    expect("O_EXCL of an existing file", posix_spawn(&pid, "/bin/procs-child", &actions, NULL, argv, envp), EEXIST);
+    posix_spawn_file_actions_destroy(&actions);
+    /* O_APPEND adds, O_TRUNC empties. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 6, "/tmp/spawned", O_WRONLY | O_APPEND, 0);
+    run_with("/bin/procs-child", "writefd6", NULL, &actions);
+    posix_spawn_file_actions_destroy(&actions);
+    expect("O_APPEND adds two bytes", stat("/tmp/spawned", &st) == 0 && st.st_size == 4, 1);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 6, "/tmp/spawned", O_WRONLY | O_TRUNC, 0);
+    run_with("/bin/procs-child", "writefd6", NULL, &actions);
+    posix_spawn_file_actions_destroy(&actions);
+    expect("O_TRUNC empties before the two bytes", stat("/tmp/spawned", &st) == 0 && st.st_size == 2, 1);
+    expect("O_CREAT of the parent's table leaves no descriptor behind", fstat(6, &st) == -1 && errno == EBADF, 1);
+    unlink("/tmp/spawned");
+    umask(old);
+
+    /* PATH is searched after the actions: from the directory they chose,
+     * the empty element is that directory, and the first match wins. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addchdir(&actions, "/bin");
+    expect("posix_spawnp from the directory of addchdir", spawnp_with("procs-child", ".", "cwd", &actions, &status), 0);
+    expect("and the child stands in /bin", status, 0);
+    status = -1;
+    expect("an empty element of PATH is the directory", spawnp_with("procs-child", "/nonexistent::/etc", "cwd", &actions, &status), 0);
+    expect("and the child stands in /bin again", status, 0);
+    status = -1;
+    expect("a name that is in the second directory", spawnp_with("procs-child", "/etc:/bin", "cwd", NULL, &status), 0);
+    expect("and the child ran", status == 2 || status == 0, 1);
+    expect("a name that is in no directory", spawnp_with("no-such-program", "/etc:/bin:.", "cwd", &actions, &status), ENOENT);
+    expect("a name in a directory that is not there", spawnp_with("procs-child", "/nonexistent", "cwd", NULL, &status), ENOENT);
+    expect("no directory in PATH", spawnp_with("procs-child", "", "cwd", NULL, &status), ENOENT);
+    /* A directory of the name has the search permission for X_OK and is no
+     * program: execvp passes it over, and reports EACCES when no later
+     * directory has the program. */
+    mkdir("/tmp/spdir", 0755);
+    mkdir("/tmp/spdir/procs-child", 0755);
+    status = -1;
+    expect("a directory of the name is passed over", spawnp_with("procs-child", "/tmp/spdir:/bin", "cwd", NULL, &status), 0);
+    expect("and the program of the later directory ran", status == 2 || status == 0, 1);
+    expect("a directory of the name alone is EACCES", spawnp_with("procs-child", "/tmp/spdir", "cwd", NULL, &status), EACCES);
+    rmdir("/tmp/spdir/procs-child");
+    rmdir("/tmp/spdir");
+    posix_spawn_file_actions_destroy(&actions);
+
+    /* fchdir: the directory a descriptor names. */
+    int dirfd = open("/bin", O_RDONLY | O_DIRECTORY);
+    expect("open of /bin", dirfd >= 0, 1);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addfchdir(&actions, dirfd);
+    status = -1;
+    expect("posix_spawnp from the directory of addfchdir", spawnp_with("procs-child", ".", "cwd", &actions, &status), 0);
+    expect("and the child stands in /bin through the descriptor", status, 0);
+    posix_spawn_file_actions_destroy(&actions);
+    int filefd = open("/etc/motd", O_RDONLY);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addfchdir(&actions, filefd);
+    expect("addfchdir of a file", spawnp_with("procs-child", "/bin", "cwd", &actions, &status), ENOTDIR);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addfchdir(&actions, 99);
+    expect("addfchdir of a closed number", spawnp_with("procs-child", "/bin", "cwd", &actions, &status), EBADF);
+    posix_spawn_file_actions_destroy(&actions);
+    /* A descriptor an earlier action closed is closed for fchdir too. */
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, dirfd);
+    posix_spawn_file_actions_addfchdir(&actions, dirfd);
+    expect("addfchdir after addclose of the same number", spawnp_with("procs-child", "/bin", "cwd", &actions, &status), EBADF);
+    posix_spawn_file_actions_destroy(&actions);
+    close(dirfd);
+    close(filefd);
+    /* The caller is where it was. */
+    char cwd[64];
+    expect("the caller's directory stays", getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, "/") == 0, 1);
+    if (!failures) printf("posix-procs: the names of posix_spawn ok\n");
+}
+
+/* dup3 with O_CLOFORK: the child of a fork sees the descriptor closed, the
+ * parent keeps it. */
+static void dup3_across_fork(void) {
+    int fd = open("/etc/motd", O_RDONLY);
+    expect("dup3 to 31 with O_CLOFORK", dup3(fd, 31, O_CLOFORK), 31);
+    expect("dup3 to 30 with O_CLOEXEC", dup3(fd, 30, O_CLOEXEC), 30);
+    pid_t child = fork();
+    if (child == 0) {
+        errno = 0;
+        int closed = fcntl(31, F_GETFD) == -1 && errno == EBADF;
+        int kept = fcntl(30, F_GETFD) >= 0;
+        _exit(closed && kept ? 0 : closed ? 2 : 1);
+    }
+    expect("fork", child > 0, 1);
+    reap("a child of a fork sees the O_CLOFORK descriptor closed", child, 0, 0);
+    expect("the parent keeps the descriptor", fcntl(31, F_GETFD) >= 0, 1);
+    close(31);
+    close(30);
+    close(fd);
+    if (!failures) printf("posix-procs: dup3 with O_CLOFORK across fork ok\n");
+}
+
 /* Stage 9, the window of exec: old images that end before ExecCommit, 20
  * by exit and 20 by their own SIGKILL, and 8 execs while another thread
  * spawns, give the service's pool back; an exec while other threads wait
@@ -2402,6 +2762,7 @@ static void files_nobody(void) {
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_RESETIDS);
     run_role("/bin/procs-setid", "setid", &attr);
     posix_spawnattr_destroy(&attr);
+    run_role("/bin/procs-setid", "setidspawn", NULL);
     /* A set-ID file that the loader opens and cannot load: its SetId goes
      * with the attempt, and the next child of the same place is nobody. */
     char *child[] = {"procs-child", "child", NULL};
@@ -3790,6 +4151,18 @@ __attribute__((noinline)) static int native_scopes_supervisor(void) {
 }
 #endif
 
+#if NAMES_PROBE
+/* The functions on names through the bridges of the layer, on a pipe, and a
+ * fork in a handler in the middle of a long rename. */
+static void names(void) {
+    pid_t child = -1;
+    expect("spawn of the names role", spawn(&child, "names", NULL, NULL), 0);
+    if (child > 0) reap("the names role", child, 0, 0);
+    if (!failures) printf("posix-procs: names ok\n");
+}
+
+#endif
+
 int main(int argc, char **argv) {
 #if NATIVE_SCOPES_LAUNCHER
     return native_scopes_supervisor();
@@ -3850,6 +4223,12 @@ int main(int argc, char **argv) {
     null_device();
     printf("posix-procs: stage wave\n");
     wave();
+#if NAMES_PROBE
+    printf("posix-procs: stage names\n");
+    names();
+#endif
+    printf("posix-procs: stage spawn_names\n");
+    run_with("/bin/procs-child", "spawnnames", NULL, NULL);
     if (failures != 0) return 1;
     printf("posix-procs: ok\n");
     /* Stage 10: this process is a record of init's table, whose end line

@@ -115,6 +115,9 @@ pub(super) struct ScalarRecord<T, S> {
 }
 
 impl<T: Copy, S: Copy> ScalarRecord<T, S> {
+    pub(super) fn owner(&self) -> Option<OwnerToken> {
+        self.owner
+    }
     fn snapshot(self) -> ScalarSnapshot<T, S> {
         let (phase, last_target) = match self.cleanup {
             Cleanup::Running { last_target } => (ScalarPhase::Cleaning, last_target),
@@ -176,6 +179,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         let slot = &mut self.holds[token.slot];
         slot.held = Held::Empty;
         slot.change();
+        self.job_gone();
     }
 
     /// Pay recovery and a backend pin together before any remote effect.
@@ -885,7 +889,7 @@ mod tests {
         type Payload = Table<u32, 32, [u64; 3], [u8; 1012]>;
         assert_eq!(size_of::<ScalarToken>(), 16);
         assert_eq!(size_of::<ScalarRecord<u32, [u8; 1012]>>(), 1072);
-        assert_eq!(size_of::<Base>(), 3848);
-        assert_eq!(size_of::<Payload>(), 35592);
+        assert_eq!(size_of::<Base>(), 3856);
+        assert_eq!(size_of::<Payload>(), 35600);
     }
 }

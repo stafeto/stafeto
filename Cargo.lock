@@ -195,6 +195,8 @@ dependencies = [
 name = "posix-abi"
 version = "0.1.0"
 dependencies = [
+ "entries",
+ "posix-change",
  "posix-clock",
  "posix-fs",
  "posix-heap",
@@ -225,6 +227,17 @@ name = "posix-abi-probe"
 version = "0.1.0"
 dependencies = [
  "posix-crt",
+]
+
+[[package]]
+name = "posix-change"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "entries",
+ "posix-fd",
+ "proto-fs",
+ "proto-wire",
 ]
 
 [[package]]
@@ -292,6 +305,7 @@ version = "0.1.0"
 name = "posix-fs"
 version = "0.1.0"
 dependencies = [
+ "entries",
  "posix-fd",
  "posix-path",
  "proto-fs",
@@ -331,6 +345,7 @@ name = "posix-platform"
 version = "0.1.0"
 dependencies = [
  "posix-abi",
+ "posix-change",
  "posix-fs",
  "posix-signals",
  "posix-sync",
@@ -371,6 +386,7 @@ dependencies = [
 name = "posix-procs"
 version = "0.1.0"
 dependencies = [
+ "entries",
  "posix-abi",
  "posix-crt",
  "posix-fs",

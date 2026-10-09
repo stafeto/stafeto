@@ -158,7 +158,7 @@ pub fn valid_job(job: u64) -> bool {
 pub fn terminal_failure(code: u32) -> bool {
     match code {
         1..=255 => abi::Error::from_code(code as u64).is_some(),
-        256..=258 | 300..=313 | 316..=318 | 320 | 322..=324 => true,
+        256..=258 | 300..=313 | 316..=318 | 320 | 322..=324 | 326..=327 => true,
         _ => false,
     }
 }

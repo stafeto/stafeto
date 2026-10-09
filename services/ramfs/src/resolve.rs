@@ -31,6 +31,13 @@ pub struct Resolve {
     edge_end: usize,
     missing: bool,
     result: Option<Token>,
+    /// Restarts of the walk the resolver made by itself: a change of the
+    /// tree, of the authority or of the identity between two steps.
+    pub restarts: u32,
+    /// Holds bytes only and walks nothing (see `scratch`).
+    inert: bool,
+    /// The pins are gone (see `retire`).
+    retired: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -131,7 +138,82 @@ impl Resolve {
             edge_end: 0,
             missing: false,
             result: None,
+            restarts: 0,
+            inert: false,
+            retired: false,
         })
+    }
+    /// A resolver that only carries bytes of 0 to 511: the contents of a new
+    /// link, or the empty path of an operation on a descriptor. It never
+    /// walks; its working buffer is free for a result once nothing else needs it.
+    pub fn scratch(storage: &mut Storage<'_>, bytes: &[u8]) -> Result<Self, u32> {
+        if bytes.len() > MAX_PATH {
+            return Err(NAME_TOO_LONG);
+        }
+        storage.pin(ROOT, Pin::Pending)?;
+        let mut original = [0; MAX_PATH];
+        original[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            path: original,
+            original,
+            original_len: bytes.len(),
+            length: bytes.len(),
+            base: ROOT,
+            current: ROOT,
+            at: 0,
+            end: 0,
+            search: 0,
+            looking: false,
+            link: None,
+            links: 0,
+            epoch: storage.state.epoch,
+            identity: Identity {
+                uid: 0,
+                gid: 0,
+                groups: proto_process::Groups::EMPTY,
+            },
+            follow: false,
+            intent: Intent::Lookup { follow: false },
+            edge_parent: None,
+            edge_start: 0,
+            edge_end: 0,
+            missing: false,
+            result: None,
+            restarts: 0,
+            inert: true,
+            retired: false,
+        })
+    }
+    pub fn is_inert(&self) -> bool {
+        self.inert
+    }
+    /// The working buffer, free once the resolution has ended for good.
+    pub fn buffer(&mut self) -> &mut [u8; MAX_PATH] {
+        &mut self.path
+    }
+    pub fn buffer_ref(&self) -> &[u8; MAX_PATH] {
+        &self.path
+    }
+    /// Starts the walk again from the original path without counting a restart.
+    pub fn rewind(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<(), u32> {
+        if self.inert {
+            return Ok(());
+        }
+        self.restart(storage, identity)
+    }
+    /// Releases every pin and keeps the bytes. The walk cannot go on.
+    pub fn retire(&mut self, storage: &mut Storage<'_>) {
+        if self.retired {
+            return;
+        }
+        self.retired = true;
+        if let Some(result) = self.result.take() {
+            let _ = storage.unpin(result, Pin::Pending);
+        }
+        if let Some(parent) = self.edge_parent.take() {
+            let _ = storage.unpin(parent, Pin::Pending);
+        }
+        let _ = storage.unpin(self.base, Pin::Pending);
     }
     fn restart(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<(), u32> {
         if let Some(result) = self.result.take() {
@@ -164,6 +246,7 @@ impl Resolve {
     }
     pub fn step(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<Progress, u32> {
         if self.epoch != storage.state.epoch || self.identity != identity {
+            self.restarts = self.restarts.saturating_add(1);
             self.restart(storage, identity)?;
             return Ok(Progress::More);
         }
@@ -253,8 +336,16 @@ impl Resolve {
         for _ in 0..8 {
             if self.search == storage.entries() {
                 if self.final_component() && self.intent.permits_missing() {
+                    // A new name may end in a slash when a directory can take it:
+                    // the journal of the operation decides whether one can.
                     if self.path[self.length - 1] == b'/'
-                        && !matches!(self.intent, Intent::DirectoryCreate)
+                        && !matches!(
+                            self.intent,
+                            Intent::DirectoryCreate
+                                | Intent::Namespace {
+                                    path: NamespacePath::Destination
+                                }
+                        )
                     {
                         return Err(NO_ENTRY);
                     }
@@ -412,6 +503,9 @@ impl Resolve {
         Ok(token)
     }
     pub fn release(mut self, storage: &mut Storage<'_>) {
+        if self.retired {
+            return;
+        }
         if let Some(result) = self.result.take() {
             let _ = storage.unpin(result, Pin::Pending);
         }

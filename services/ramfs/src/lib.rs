@@ -9,6 +9,9 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod authority;
+pub mod change;
+#[cfg(test)]
+mod change_tests;
 pub mod cwd;
 #[cfg(test)]
 mod cwd_tests;
@@ -22,6 +25,7 @@ mod image_tests;
 pub mod io;
 #[cfg(test)]
 mod io_tests;
+pub mod job;
 pub mod maintenance;
 pub mod metadata;
 #[cfg(test)]
@@ -484,6 +488,9 @@ pub struct Ram<'a> {
     descriptions: [Option<Shared>; DESCRIPTIONS],
     description_generations: [u64; DESCRIPTIONS],
     tree: Option<Tree<'a>>,
+    /// The steps of a cancel that were refused or did not end; the service
+    /// prints the count when it moves.
+    pub cancel_refusals: u32,
 }
 
 #[cfg(test)]
@@ -528,7 +535,15 @@ impl<'a> Ram<'a> {
             descriptions: [None; DESCRIPTIONS],
             description_generations: [0; DESCRIPTIONS],
             tree,
+            cancel_refusals: 0,
         }
+    }
+
+    /// A cancel left something held. A debug build and the host tests stop
+    /// here; any build counts it.
+    pub fn refused_cancel(&mut self) {
+        self.cancel_refusals = self.cancel_refusals.saturating_add(1);
+        debug_assert!(false, "a step of a cancel was refused");
     }
 
     fn token(&self, file: File) -> Token {
@@ -1025,6 +1040,63 @@ impl<'a> Ram<'a> {
                 .expect("named description")
                 .generation,
         })
+    }
+
+    /// The node the description of `fd` stands for, if the description is
+    /// the one the caller names (BAD_FD otherwise).
+    pub fn description_node(&self, fds: &Fds, fd: u32, generation: u64) -> Result<Token, u32> {
+        let description = self.description_token(fds, fd)?;
+        if description.generation != generation {
+            return Err(BAD_FD);
+        }
+        let shared = self.descriptions[description.slot as usize]
+            .as_ref()
+            .ok_or(BAD_FD)?;
+        Ok(self.token(shared.open.file))
+    }
+
+    /// The base of a path in ResolveStart, ResolveSecond and OpenStart. A slot
+    /// with bit 31 set is read by `proto_fs::Base::from_wire`: a descriptor of
+    /// the session with the generation of its description, the reserved
+    /// current directory of the session, which the service does not hold yet
+    /// (BAD_FD), or the reserved absolute base (BAD_FD for a relative path);
+    /// a reserved value with a generation is BAD_SIZE. Any other slot is a node token the session retains. An
+    /// absolute path takes the root whatever the base says.
+    pub fn request_base(
+        &self,
+        fds: &Fds,
+        slot: u32,
+        generation: u64,
+        relative: bool,
+    ) -> Result<Token, u32> {
+        if !relative {
+            return Ok(Token {
+                slot: u16::try_from(slot).unwrap_or(storage::NONE),
+                generation,
+            });
+        }
+        if slot & (1 << 31) != 0 {
+            // The same reading of the base as the Change family has; the
+            // descriptor travels with bit 31 set in this form.
+            return match proto_fs::Base::from_wire(slot, generation) {
+                Err(status) => Err(status.code()),
+                // The service does not hold the current directory yet
+                // (5i-7), and a relative path has no root to start from.
+                Ok(proto_fs::Base::Absolute | proto_fs::Base::Cwd) => Err(BAD_FD),
+                Ok(proto_fs::Base::Fd { fd, generation }) => {
+                    self.description_node(fds, fd & !(1 << 31), generation)
+                }
+            };
+        }
+        let token = Token {
+            slot: u16::try_from(slot).unwrap_or(storage::NONE),
+            generation,
+        };
+        if self.owns_directory_base(fds, token) {
+            Ok(token)
+        } else {
+            Err(BAD_FD)
+        }
     }
 
     /// A raw token can serve as a relative base only when this session retains it.

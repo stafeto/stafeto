@@ -65,12 +65,41 @@ pub const fn owes(own: u64, outer: u64) -> bool {
     own != 0 && outer != 0
 }
 
+/// The place of a frame among the stacks of a thread: `z` is 1 when the stack
+/// pointer `sp` lies in the range of the alternate signal stack of the thread,
+/// 0 on the main stack. Until `sigaltstack` fills the range, `z` is 0 always.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Frame {
+    pub z: u8,
+    pub sp: u64,
+}
+
+impl Frame {
+    /// A frame on the main stack.
+    pub const fn main(sp: u64) -> Self {
+        Self { z: 0, sp }
+    }
+}
+
+/// Whether the frame `inner` lies inside the frame `outer`: it was called by
+/// it, directly or through others. The order of the frames of one thread is
+/// total. A handler on the alternate stack is entered from the main stack
+/// only (`SA_ONSTACK` switches stacks from the main one, a handler on the
+/// alternate stack stays on it, and `sigaltstack` refuses to change the
+/// stack while the thread is on it), so a frame on the alternate stack lies
+/// inside every frame of the main stack, and on one stack the lower address
+/// is the inner one. A frame is not inside itself.
+pub const fn nested(inner: Frame, outer: Frame) -> bool {
+    inner.z > outer.z || (inner.z == outer.z && inner.sp < outer.sp)
+}
+
 /// The hook of a long jump to the stack pointer `target`: whether the
 /// word `outer` is cleared. The resident call is abandoned when the target
 /// lies above its frame; a target at the frame or below it (a jump inside the
-/// handler) keeps the word.
+/// handler) keeps the word. The frame of the live resident call is inside the
+/// frame of the target (`nested`); the hook of relibc repeats this formula.
 pub const fn jump_clears(outer: u64, target: u64) -> bool {
-    outer != 0 && target > outer
+    outer != 0 && nested(Frame::main(outer), Frame::main(target))
 }
 
 /// The new `outer` after a long jump to `target`.
@@ -319,6 +348,38 @@ mod tests {
         });
         assert_eq!(t.own_calls, 1);
         assert_eq!(t.outer, 0);
+    }
+
+    #[test]
+    fn nested_orders_the_frames_of_a_thread() {
+        let main = |sp| Frame { z: 0, sp };
+        let alternate = |sp| Frame { z: 1, sp };
+        // Both on the main stack: the lower address is the inner frame.
+        assert!(nested(main(0x8000), main(0x9000)));
+        assert!(!nested(main(0x9000), main(0x8000)));
+        assert!(!nested(main(0x9000), main(0x9000)));
+        // A frame on the alternate stack lies inside any frame of the main
+        // stack, whatever the addresses, and no frame of the main stack lies inside one of the alternate stack.
+        assert!(nested(alternate(0x1000), main(0x9000)));
+        assert!(nested(alternate(0xf000), main(0x1000)));
+        assert!(!nested(main(0x1000), alternate(0xf000)));
+        assert!(!nested(main(0x9000), alternate(0x1000)));
+        // Both on the alternate stack: the lower address is the inner frame.
+        assert!(nested(alternate(0x1000), alternate(0x2000)));
+        assert!(!nested(alternate(0x2000), alternate(0x1000)));
+        assert!(!nested(alternate(0x2000), alternate(0x2000)));
+    }
+
+    #[test]
+    fn a_jump_clears_the_word_by_the_order_of_the_frames() {
+        for outer in [0x1000_u64, 0x9000, 0xffff_0000] {
+            for target in [0x800_u64, 0x1000, 0x9000, 0x9001, 0xffff_0001] {
+                assert_eq!(
+                    jump_clears(outer, target),
+                    nested(Frame::main(outer), Frame::main(target))
+                );
+            }
+        }
     }
 
     #[test]

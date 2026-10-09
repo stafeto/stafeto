@@ -327,6 +327,19 @@ enum Opened {
 /// Open: the path resolved under the lock, the service's open outside it,
 /// then the descriptor under it again.
 fn open(path: &[u8], flags: i32, mode: u32, umask: u32) -> Result<u64, i32> {
+    open_from(None, path, flags, mode, umask)
+}
+
+/// Open of a path that starts at a descriptor of the session (`base`: its
+/// number and the generation of its description), or against the current
+/// directory when there is none.
+pub(crate) fn open_from(
+    base: Option<(u32, u64)>,
+    path: &[u8],
+    flags: i32,
+    mode: u32,
+    umask: u32,
+) -> Result<u64, i32> {
     if flags
         & !(O_ACCMODE
             | O_DIRECTORY
@@ -359,40 +372,68 @@ fn open(path: &[u8], flags: i32, mode: u32, umask: u32) -> Result<u64, i32> {
             policy |= backend;
         }
     }
-    let (transport, opened) = resolved(path, |transport, path| {
-        if path.trailing_slash
-            && transport.stat(path).map_err(crate::error)?.kind == posix_fs::FileKind::Regular
-        {
-            return Err(ENOTDIR);
-        }
-        if let Some((kind, number)) = transport.terminal_open(path).map_err(crate::error)? {
-            if flags & O_DIRECTORY != 0 || path.trailing_slash {
+    // What an open does with a resolved path once the layer knows whether it
+    // is a regular file with a slash after it (ENOTDIR) and whether it names a
+    // terminal of the terminal service.
+    let finish =
+        |transport: Transport, bytes: &[u8], trailing_slash: bool, terminal: Option<(u32, u32)>| {
+            if let Some((kind, number)) = terminal {
+                if flags & O_DIRECTORY != 0 || trailing_slash {
+                    return Err(ENOTDIR);
+                }
+                let id = crate::terminal::open(
+                    transport,
+                    kind,
+                    (flags & (O_ACCMODE | O_NONBLOCK)) as u32,
+                    number,
+                )?;
+                return Ok((
+                    transport,
+                    Opened::Terminal(
+                        id,
+                        kind == proto_tty::OPEN_CONTROLLING || kind == proto_tty::OPEN_MASTER,
+                    ),
+                ));
+            }
+            let fd = crate::open_driver::open(
+                transport,
+                base,
+                bytes,
+                policy,
+                mode,
+                umask,
+                crate::descriptor_flags(flags),
+            )?;
+            Ok((transport, Opened::Resident(fd)))
+        };
+    let (transport, opened) = match base {
+        None => resolved(path, |transport, path| {
+            if path.trailing_slash
+                && transport.stat(path).map_err(crate::error)?.kind == posix_fs::FileKind::Regular
+            {
                 return Err(ENOTDIR);
             }
-            let id = crate::terminal::open(
-                transport,
-                kind,
-                (flags & (O_ACCMODE | O_NONBLOCK)) as u32,
-                number,
-            )?;
-            return Ok((
-                transport,
-                Opened::Terminal(
-                    id,
-                    kind == proto_tty::OPEN_CONTROLLING || kind == proto_tty::OPEN_MASTER,
-                ),
-            ));
+            let terminal = transport.terminal_open(path).map_err(crate::error)?;
+            finish(transport, path.as_bytes(), path.trailing_slash, terminal)
+        })?,
+        Some(_) => {
+            let transport = process_state(|files| Ok(files.transport()))?;
+            let trailing_slash = path.last() == Some(&b'/');
+            if trailing_slash {
+                let info = transport
+                    .files()
+                    .node_information_from(base, path, true)
+                    .map_err(|status| crate::error(posix_fs::FsError::from(status)))?;
+                if info.kind == 2 {
+                    return Err(ENOTDIR);
+                }
+            }
+            let terminal = transport
+                .terminal_leaf(base, path, false)
+                .map_err(crate::error)?;
+            finish(transport, path, trailing_slash, terminal)?
         }
-        let fd = crate::open_driver::open(
-            transport,
-            path.as_bytes(),
-            policy,
-            mode,
-            umask,
-            crate::descriptor_flags(flags),
-        )?;
-        Ok((transport, Opened::Resident(fd)))
-    })?;
+    };
     let inserted = process_state(|files| {
         let flags = crate::descriptor_flags(flags);
         match opened {
@@ -524,14 +565,11 @@ fn perform(request: Request<'_>, out: &mut Writer) -> Result<(), i32> {
         }
         Read { fd, count } => read_reply(fd, count, out),
         Chdir { path } => {
-            let directory = resolved(path, |transport, path| {
-                Ok(transport.stat(path).map_err(crate::error)?.kind
-                    == posix_fs::FileKind::Directory)
-            })?;
-            if !directory {
-                return Err(ENOTDIR);
-            }
-            process_state(|files| files.set_cwd(path).map_err(crate::error))?;
+            // The service names the directory by its canonical path, without
+            // links, `.` and `..`: the current directory is a place.
+            let mut canonical = [0; crate::names::MAX_PATH + 1];
+            let length = crate::names::directory_path(path, &mut canonical)?;
+            process_state(|files| files.set_cwd(&canonical[..length]).map_err(crate::error))?;
             write(Reply::Unit, out)
         }
         Cwd => {
@@ -662,9 +700,13 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
 
 /// Final lifetime callbacks perform local transitions and retain remote ownership.
 pub fn detach_open_owner(owner: u64) -> bool {
-    crate::open_driver::detach(owner)
+    let opens = crate::open_driver::detach(owner);
+    // Both run: the records of the Change jobs lose the owner too.
+    let changes = crate::change::detach(owner);
+    opens && changes
 }
 /// A surviving caller or collector pays one cleanup phase outside the layer locks.
 pub fn help_open_recovery() {
     crate::open_driver::help();
+    crate::change::help();
 }

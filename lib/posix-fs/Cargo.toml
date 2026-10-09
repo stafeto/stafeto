@@ -12,6 +12,7 @@ test = false
 bench = false
 
 [dependencies]
+entries = { path = "../entries" }
 posix-fd = { path = "../posix-fd" }
 posix-path = { path = "../posix-path" }
 proto-fs = { path = "../../proto/fs" }

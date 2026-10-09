@@ -81,6 +81,10 @@ pub enum Verdict {
     /// The standard leaves the outcome open: every expectation of the test
     /// is a `.unknown` file and the outcome is one of them.
     Unknown,
+    /// A FAIL the project knows and has written down in
+    /// `tests/os-test/exceptions.txt`: the exit code and the output are
+    /// exactly the listed ones.
+    Excepted,
 }
 
 impl Verdict {
@@ -90,6 +94,7 @@ impl Verdict {
             Verdict::Fail => "FAIL",
             Verdict::Unsupported => "UNSUPPORTED",
             Verdict::Unknown => "UNKNOWN",
+            Verdict::Excepted => "EXCEPTED",
         }
     }
 }
@@ -97,8 +102,9 @@ impl Verdict {
 /// The end of a test as the runner's marks tell it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ended {
-    /// It exited: what misc/run.sh writes, which its expectations judge.
-    Exited(String),
+    /// It exited: what misc/run.sh writes, which its expectations judge, and
+    /// the exit status (a death by signal N is 128 + N).
+    Exited(String, i64),
     /// It faulted, was killed or gave no end: a FAIL whatever it wrote.
     Failed(String),
 }
@@ -152,7 +158,7 @@ pub fn outcome(log: &str, name: &str) -> Ended {
     if text.is_empty() || code >= 2 {
         text.push_str(&format!("exit: {code}\n"));
     }
-    Ended::Exited(text)
+    Ended::Exited(text, code)
 }
 
 /// How an outcome stands against the expectations of a test.
@@ -373,6 +379,78 @@ const BUDGET: Duration = Duration::from_secs(900);
 /// The tests that pass on stafeto: `ci` fails when one of them does not.
 const PASSING: &str = "tests/os-test/pass.txt";
 
+/// The known failures with their exact outcome: a line a test, five fields
+/// separated by tabs (name, exit code, output, norm, stage of the revision).
+const EXCEPTIONS: &str = "tests/os-test/exceptions.txt";
+
+/// One line of `EXCEPTIONS`.
+#[derive(Debug, PartialEq, Eq)]
+struct Exception {
+    name: String,
+    code: i64,
+    /// The output as the runner reports it, with `\n` for a newline and
+    /// `\\` for a backslash in the file.
+    output: String,
+}
+
+/// The lines of the file of the exceptions (`#` for a comment). Every line
+/// has the five fields, a numeric code, an output that ends with a newline,
+/// a norm and a stage; a name may be listed once.
+fn parse_exceptions(text: &str) -> Result<Vec<Exception>, String> {
+    let mut list: Vec<Exception> = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let bad = |what: &str| format!("{EXCEPTIONS}:{}: {what}", number + 1);
+        let [name, code, output, norm, stage] = fields[..] else {
+            return Err(bad("five fields separated by tabs wanted"));
+        };
+        let code = code.parse().map_err(|_| bad("the code is no number"))?;
+        let mut decoded = String::new();
+        let mut chars = output.chars();
+        while let Some(c) = chars.next() {
+            decoded.push(if c == '\\' {
+                match chars.next() {
+                    Some('n') => '\n',
+                    Some('\\') => '\\',
+                    _ => return Err(bad("an escape of the output is \\n or \\\\")),
+                }
+            } else {
+                c
+            });
+        }
+        if name.is_empty() || norm.is_empty() || stage.is_empty() || !decoded.ends_with('\n') {
+            return Err(bad(
+                "a name, an output with its newline, a norm and a stage wanted",
+            ));
+        }
+        if list.iter().any(|e| e.name == name) {
+            return Err(bad("the name is listed twice"));
+        }
+        list.push(Exception {
+            name: name.to_owned(),
+            code,
+            output: decoded,
+        });
+    }
+    Ok(list)
+}
+
+fn read_exceptions() -> Result<Vec<Exception>, String> {
+    let path = crate::root().join(EXCEPTIONS);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{EXCEPTIONS}: {e}"))?;
+    parse_exceptions(&text)
+}
+
+/// Whether the failure of `name` with this exit `code` and `output` is
+/// listed: the name, the code and the whole output must match.
+fn excepted(list: &[Exception], name: &str, code: i64, output: &str) -> bool {
+    list.iter()
+        .any(|e| e.name == name && e.code == code && e.output == output)
+}
+
 /// The name of os-test's licence (ISC) in an image with a test.
 pub const LICENCE: &str = "OS-TEST-LICENSE";
 
@@ -471,7 +549,7 @@ fn plan_suite(suite: Option<&str>) -> Result<(Vec<Job>, Plan), String> {
             ))
         } else if let Some(failed) = test.built.strip_prefix('!') {
             // A test that did not compile: os-test's outcome for it.
-            let (verdict, text) = judge(&work, test, Ended::Exited(format!("{failed}\n")))?;
+            let (verdict, text) = judge(&work, test, Ended::Exited(format!("{failed}\n"), 1))?;
             Some((test.name.clone(), verdict, text))
         } else {
             None
@@ -532,6 +610,14 @@ pub fn finish(plan: Plan) -> Result<(), String> {
         None => list,
     };
     let (lost, new) = compare(&list, &rows);
+    let held = exceptions_not_held(&read_exceptions()?, &rows, plan.suite.as_deref());
+    if !held.is_empty() {
+        return Err(format!(
+            "os-test: {} of {EXCEPTIONS} are no longer the outcome of their tests: {}",
+            held.len(),
+            held.join(", ")
+        ));
+    }
     for name in &new {
         println!("os-test {name} passes and is not in {PASSING}");
     }
@@ -544,6 +630,21 @@ pub fn finish(plan: Plan) -> Result<(), String> {
             lost.join(", ")
         ))
     }
+}
+
+/// The exceptions (of `suite`, or of all) whose test has no row EXCEPTED:
+/// the outcome changed, so that the line is stale or the test fails in a new
+/// way. A test that now passes belongs to `pass.txt` and leaves the file.
+fn exceptions_not_held(list: &[Exception], rows: &[Row], suite: Option<&str>) -> Vec<String> {
+    list.iter()
+        .filter(|e| suite.is_none_or(|suite| in_suite(&e.name, suite)))
+        .filter(|e| {
+            !rows
+                .iter()
+                .any(|(name, verdict, _)| *name == e.name && *verdict == Verdict::Excepted)
+        })
+        .map(|e| e.name.clone())
+        .collect()
 }
 
 /// The tests of `list` (one name a line, `#` for a comment) that do not
@@ -636,9 +737,9 @@ fn expectation(work: &Path, test: &Test, text: &str) -> Result<Expectation, Stri
 /// not killed and did not hang: those are FAILs whatever the option), else
 /// FAIL.
 fn judge(work: &Path, test: &Test, ended: Ended) -> Result<(Verdict, String), String> {
-    let (text, exited) = match ended {
-        Ended::Exited(text) => (text, true),
-        Ended::Failed(text) => (text, false),
+    let (text, exited, code) = match ended {
+        Ended::Exited(text, code) => (text, true, Some(code)),
+        Ended::Failed(text) => (text, false, None),
     };
     let met = if exited {
         expectation(work, test, &text)?
@@ -649,6 +750,12 @@ fn judge(work: &Path, test: &Test, ended: Ended) -> Result<(Verdict, String), St
         let source = source_of(work, test)?;
         Ok(unclaimed_option(&source, &unistd_macros()?).is_some())
     })?;
+    if verdict == Verdict::Fail
+        && let Some(code) = code
+        && excepted(&read_exceptions()?, &test.name, code, &text)
+    {
+        return Ok((Verdict::Excepted, text));
+    }
     Ok((verdict, text))
 }
 
@@ -865,7 +972,7 @@ fn runner_check(kernel: &crate::Artifacts) -> Result<(), String> {
         other => return Err(format!("the runner did not kill a hung test: {other:?}")),
     }
     match outcome(&log, "check/quick") {
-        Ended::Exited(text) if text == "exit: 7\n" => {}
+        Ended::Exited(text, 7) if text == "exit: 7\n" => {}
         other => return Err(format!("the runner did not go on after a kill: {other:?}")),
     }
     println!("os-test runner check passed");
@@ -1017,13 +1124,14 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
 }
 
-/// `PASS n, FAIL n, UNSUPPORTED n, UNKNOWN n of n`.
+/// `PASS n, FAIL n, EXCEPTED n, UNSUPPORTED n, UNKNOWN n of n`.
 fn score(rows: &[Row]) -> String {
     let count = |v| rows.iter().filter(|row| row.1 == v).count();
     format!(
-        "PASS {}, FAIL {}, UNSUPPORTED {}, UNKNOWN {} of {}",
+        "PASS {}, FAIL {}, EXCEPTED {}, UNSUPPORTED {}, UNKNOWN {} of {}",
         count(Verdict::Pass),
         count(Verdict::Fail),
+        count(Verdict::Excepted),
         count(Verdict::Unsupported),
         count(Verdict::Unknown),
         rows.len()
@@ -1119,19 +1227,19 @@ mod tests {
         ]);
         assert_eq!(
             outcome(&log, "io/open"),
-            Ended::Exited("open: EISDIR\n".to_owned())
+            Ended::Exited("open: EISDIR\n".to_owned(), 1)
         );
         assert_eq!(
             outcome(&log, "io/silent"),
-            Ended::Exited("exit: 0\n".to_owned())
+            Ended::Exited("exit: 0\n".to_owned(), 0)
         );
         assert_eq!(
             outcome(&log, "io/aborted"),
-            Ended::Exited("NULL\nexit: 134\n".to_owned())
+            Ended::Exited("NULL\nexit: 134\n".to_owned(), 134)
         );
         assert_eq!(
             outcome(&log, "io/unexpected"),
-            Ended::Exited("tty: unexpected failure\n".to_owned())
+            Ended::Exited("tty: unexpected failure\n".to_owned(), 1)
         );
     }
 
@@ -1151,11 +1259,11 @@ mod tests {
         ]);
         assert_eq!(
             outcome(&log, "signal/raise"),
-            Ended::Exited("SIGUSR1".to_owned())
+            Ended::Exited("SIGUSR1".to_owned(), 0)
         );
         assert_eq!(
             outcome(&log, "signal/fault"),
-            Ended::Exited("partial\nexit: 139\n".to_owned())
+            Ended::Exited("partial\nexit: 139\n".to_owned(), 139)
         );
     }
 
@@ -1310,6 +1418,51 @@ mod tests {
         assert!(!died_by_signal(""));
     }
 
+    const DUP3: &str = "# comment\n\nio/dup3\t1\tdup3: EBADF\\n\tnorm\t5g\n";
+
+    /// The exception holds on the exact name, code and output.
+    #[test]
+    fn an_exception_holds_on_the_exact_outcome() {
+        let list = parse_exceptions(DUP3).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(excepted(&list, "io/dup3", 1, "dup3: EBADF\n"));
+        // Another text of the output, another code, a name outside the file.
+        assert!(!excepted(&list, "io/dup3", 1, "dup3: EINVAL\n"));
+        assert!(!excepted(&list, "io/dup3", 1, "dup3: EBADF\nmore\n"));
+        assert!(!excepted(&list, "io/dup3", 2, "dup3: EBADF\n"));
+        assert!(!excepted(&list, "io/dup2", 1, "dup3: EBADF\n"));
+    }
+
+    #[test]
+    fn the_file_of_exceptions_is_read_strictly() {
+        assert!(parse_exceptions("a\t1\tx\\n\tnorm\n").is_err());
+        assert!(parse_exceptions("a\tone\tx\\n\tnorm\tstage\n").is_err());
+        assert!(parse_exceptions("a\t1\tx\tnorm\tstage\n").is_err());
+        assert!(parse_exceptions("a\t1\tx\\q\\n\tnorm\tstage\n").is_err());
+        assert!(parse_exceptions("a\t1\tx\\n\tn\ts\na\t1\tx\\n\tn\ts\n").is_err());
+        assert_eq!(
+            parse_exceptions("a\t1\tx\\\\\\n\tn\ts\n").unwrap()[0].output,
+            "x\\\n"
+        );
+    }
+
+    /// A line whose test is not EXCEPTED is named, so that `ci` fails.
+    #[test]
+    fn a_stale_exception_is_named() {
+        let list = parse_exceptions(DUP3).unwrap();
+        let row = |verdict| ("io/dup3".to_owned(), verdict, String::new());
+        assert!(exceptions_not_held(&list, &[row(Verdict::Excepted)], None).is_empty());
+        assert_eq!(
+            exceptions_not_held(&list, &[row(Verdict::Fail)], None),
+            ["io/dup3"]
+        );
+        assert_eq!(
+            exceptions_not_held(&list, &[row(Verdict::Pass)], None),
+            ["io/dup3"]
+        );
+        assert!(exceptions_not_held(&list, &[], Some("basic")).is_empty());
+    }
+
     #[test]
     fn the_score_counts_every_verdict() {
         let row = |verdict| (String::new(), verdict, String::new());
@@ -1319,10 +1472,11 @@ mod tests {
             row(Verdict::Unsupported),
             row(Verdict::Unknown),
             row(Verdict::Unknown),
+            row(Verdict::Excepted),
         ];
         assert_eq!(
             score(&rows),
-            "PASS 1, FAIL 1, UNSUPPORTED 1, UNKNOWN 2 of 5"
+            "PASS 1, FAIL 1, EXCEPTED 1, UNSUPPORTED 1, UNKNOWN 2 of 6"
         );
     }
 

@@ -55,9 +55,6 @@ const DT_FIFO: u8 = 1;
 const DT_CHR: u8 = 2;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
-/// relibc's (Linux's) AT_ values.
-const AT_FDCWD: c_int = -100;
-const AT_EMPTY_PATH: c_int = 0x1000;
 
 fn time(time: posix_fs::Timestamp) -> [i64; 2] {
     [time.seconds, i64::from(time.nanos)]
@@ -104,8 +101,9 @@ unsafe fn bytes<'a>(path: *const c_char) -> &'a [u8] {
     unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes()
 }
 
-/// fstat (`path` null or empty with AT_EMPTY_PATH), stat and lstat (no
-/// symbolic links yet) in relibc's struct stat.
+/// fstat (`path` null or empty with AT_EMPTY_PATH), stat, lstat
+/// (AT_SYMLINK_NOFOLLOW) and fstatat of a path against a descriptor in
+/// relibc's struct stat.
 ///
 /// # Safety
 /// `path` is null or a live C string; `out` is writable for a LinuxStat.
@@ -121,26 +119,7 @@ pub unsafe extern "C" fn stafeto_fstatat(
     }
     // SAFETY: the caller's promise.
     let path = (!path.is_null()).then(|| unsafe { bytes(path) });
-    use posix_abi::shared::{held, resolved};
-    let info = match path {
-        Some(path) if !path.is_empty() => {
-            if fd != AT_FDCWD && path.first() != Some(&b'/') {
-                Err(ENOSYS)
-            } else {
-                resolved(path, |transport, path| {
-                    transport.stat_information(path).map_err(posix_abi::error)
-                })
-            }
-        }
-        _ if path.is_none() || flags & AT_EMPTY_PATH != 0 => number(fd).and_then(|fd| {
-            held(fd, |transport, target| {
-                transport
-                    .descriptor_information(target)
-                    .map_err(posix_abi::error)
-            })
-        }),
-        _ => Err(posix_abi::constants::ENOENT),
-    };
+    let info = call(|| posix_abi::names::fstatat(fd, path, flags));
     match info {
         Ok(info) => {
             // SAFETY: the caller's promise.
@@ -151,21 +130,6 @@ pub unsafe extern "C" fn stafeto_fstatat(
     }
 }
 
-/// Writes one dirent64 record at `out`, `reclen` bytes; false when it
-/// does not fit.
-fn record(out: &mut [u8], inode: u64, next: i64, kind: u8, name: &[u8]) -> Option<usize> {
-    // ino 8, off 8, reclen 2, type 1, the name and its NUL; 8-byte steps.
-    let length = (19 + name.len() + 1).next_multiple_of(8);
-    let record = out.get_mut(..length)?;
-    record.fill(0);
-    record[..8].copy_from_slice(&inode.to_ne_bytes());
-    record[8..16].copy_from_slice(&next.to_ne_bytes());
-    record[16..18].copy_from_slice(&(length as u16).to_ne_bytes());
-    record[18] = kind;
-    record[19..19 + name.len()].copy_from_slice(name);
-    Some(length)
-}
-
 fn entries(files: Transport, fd: Target, out: &mut [u8], position: u64) -> Result<usize, c_int> {
     let error = posix_abi::error;
     if files.fstat(fd).map_err(error)?.kind != FileKind::Directory {
@@ -173,34 +137,36 @@ fn entries(files: Transport, fd: Target, out: &mut [u8], position: u64) -> Resul
     }
     let position = i64::try_from(position).map_err(|_| EINVAL)?;
     files.lseek(fd, position, SeekFrom::Start).map_err(error)?;
-    let mut used = 0;
-    loop {
-        let before = files.lseek(fd, 0, SeekFrom::Current).map_err(error)?;
-        let mut name = [0u8; 256];
-        let Some(entry) = files.readdir(fd, &mut name).map_err(error)? else {
-            break;
-        };
-        let after = files.lseek(fd, 0, SeekFrom::Current).map_err(error)?;
-        let kind = match entry.kind {
-            FileKind::Directory => DT_DIR,
-            FileKind::Regular => DT_REG,
-            FileKind::Character => DT_CHR,
-            FileKind::Fifo => DT_FIFO,
-        };
-        let name = &name[..entry.name_len.min(name.len())];
-        match record(&mut out[used..], entry.inode, after, kind, name) {
-            Some(length) => used += length,
-            None => {
-                // The next call takes this entry again.
-                files.lseek(fd, before, SeekFrom::Start).map_err(error)?;
-                if used == 0 {
-                    return Err(EINVAL);
-                }
-                break;
-            }
-        }
-    }
-    Ok(used)
+    posix_change::dirent::fill(
+        out,
+        |name| {
+            let before = files.lseek(fd, 0, SeekFrom::Current).map_err(error)?;
+            let Some(entry) = files.readdir(fd, name).map_err(error)? else {
+                return Ok(None);
+            };
+            let after = files.lseek(fd, 0, SeekFrom::Current).map_err(error)?;
+            let kind = match entry.kind {
+                FileKind::Directory => DT_DIR,
+                FileKind::Regular => DT_REG,
+                FileKind::Character => DT_CHR,
+                FileKind::Fifo => DT_FIFO,
+            };
+            Ok(Some(posix_change::dirent::Item {
+                inode: entry.inode,
+                kind,
+                name_len: entry.name_len,
+                before,
+                after,
+            }))
+        },
+        |offset| {
+            // The next call takes this entry again.
+            files
+                .lseek(fd, offset, SeekFrom::Start)
+                .map(|_| ())
+                .map_err(error)
+        },
+    )
 }
 
 /// Linux dirent64 records of directory `fd` from `position` (the d_off of
@@ -847,4 +813,55 @@ pub unsafe extern "C" fn stafeto_clock_settime(
         return -EFAULT;
     };
     value(call(|| posix_abi::clock::settime(clock, time)).map(|()| 0)) as c_int
+}
+
+/// ftruncate: `length` bytes. EINVAL for a negative length and for a
+/// descriptor that is no file of the service; the service answers EBADF
+/// for a description opened without write, EISDIR, EFBIG.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_ftruncate(fd: c_int, length: i64) -> c_int {
+    let result = call(|| {
+        posix_abi::shared::held(number(fd)?, |_, target| {
+            let Target::Ram(target) = target else {
+                return Err(EINVAL);
+            };
+            let length = u64::try_from(length).map_err(|_| EINVAL)?;
+            posix_abi::change::truncate(target, length)
+        })
+    });
+    value(result.map(|()| 0)) as c_int
+}
+
+/// posix_getdents: the records of directory `fd` from its offset, in the
+/// layout of dirent64 that posix_dent has, and the offset moves past them.
+/// How many bytes, 0 at the end; EINVAL when the buffer holds no entry.
+///
+/// # Safety
+/// `buf` is writable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_posix_getdents(fd: c_int, buf: *mut u8, len: usize) -> isize {
+    // SAFETY: the caller's promise.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    let result = number(fd).and_then(|fd| {
+        posix_abi::shared::held(fd, |transport, target| {
+            let position = transport
+                .lseek(target, 0, SeekFrom::Current)
+                .map_err(posix_abi::error)?;
+            entries(transport, target, out, position.cast_unsigned())
+        })
+    });
+    match result {
+        Ok(used) => used as isize,
+        Err(errno) => -(errno as isize),
+    }
+}
+
+/// dup3: `target` named by `fd` with the flags O_CLOEXEC and O_CLOFORK.
+/// EINVAL for equal descriptors.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_dup3(fd: c_int, target: c_int, flags: c_int) -> c_int {
+    if fd == target {
+        return -EINVAL;
+    }
+    value(call(|| posix_abi::dup3(fd, target, flags)).map(i64::from)) as c_int
 }

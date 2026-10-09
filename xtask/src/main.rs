@@ -159,7 +159,12 @@ const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
         &[],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-files", "posix-procs", POSIX_STACK_SIZE, &["files"]),
+    (
+        "posix-files",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["files", "names-loss"],
+    ),
 ];
 const LOADER_ABORT_PROGRAMS: [ImageProgram; 6] = [
     (
@@ -558,7 +563,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
         "posix-procs",
         "posix-procs",
         POSIX_STACK_SIZE,
-        &["pending-open"],
+        &["pending-open", "names-probe"],
     ),
     // Pieces of 64 KiB: the probe's forks copy regions past one piece.
     ("loader", "loader", 0, &["small-pieces"]),
@@ -609,7 +614,12 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
         &["steps"],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
+    (
+        "posix-procs",
+        "posix-procs",
+        POSIX_STACK_SIZE,
+        &["change-steps"],
+    ),
     ("loader", "loader", 0, &["steps"]),
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
     ("entropy", "entropy", 32 * 1024, &["steps"]),
@@ -2274,6 +2284,10 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
         run.expect("<\x13>(\x11)", DIALOG_STEP)?;
         run.expect("posix-tty: output flushed", DIALOG_STEP)?;
         run.expect("posix-tty: output ok", DIALOG_STEP)?;
+        run.expect(
+            "posix-tty: the layer refused the operations on the names of the terminal",
+            DIALOG_STEP,
+        )?;
         run.expect("posix-tty: written through /dev/console", DIALOG_STEP)?;
         run.expect("posix-tty: child wrote through /dev/console", DIALOG_STEP)?;
         run.expect(
@@ -3112,14 +3126,25 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     let ended = "init: posix-files ended: exit code 0, not restarted";
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ended), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ended)?;
+    qemu::expect_marker(&output, "posix-files: raw Change requests ok")?;
+    qemu::expect_marker(&output, "posix-files: names and metadata functions ok")?;
+    qemu::expect_marker(&output, "posix-files: layer names ok")?;
     qemu::expect_marker(&output, "posix-files: identity and proofs ok")?;
+    if !data {
+        qemu::expect_marker(
+            &output,
+            "posix-files: a lost reply of Start, Second, Step, Commit and Release leaves one effect",
+        )?;
+    }
     if measured {
         check_waits(&output.lines, &["2"], "RAM file service steps")?;
         let steps = longest_steps(&output.lines, "2");
         let required: &[usize] = if data {
-            &[15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 65]
+            &[
+                15, 19, 21, 25, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 65,
+            ]
         } else {
-            &[15, 19, 21, 25, 65]
+            &[15, 19, 21, 25, 44, 45, 46, 47, 48, 65]
         };
         for &kind in required {
             if !steps.iter().any(|(k, ticks, _)| *k == kind && *ticks != 0) {
@@ -3159,6 +3184,9 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;
+    qemu::expect_marker(&outcome, "posix-procs: names ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: the names of posix_spawn ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: dup3 with O_CLOFORK across fork ok")?;
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
     qemu::expect_marker(&outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
@@ -3336,24 +3364,47 @@ const RAM_STEP_MAX: u64 = TERM_B;
 /// ForkStart 53,737 and 54,153) plus NOISE_MARGIN; ForkStart again as the
 /// largest of four runs at the head of E1 with 4 and with 7 branches
 /// (53,772 and 55,793: the pin of relibc a5adc5f8, a table entry in
-/// `sysconf`, moved the 7-branch figure up from 54,610 at 30f48fe7). The
+/// `sysconf`, moved the 7-branch figure up from 54,610 at 30f48fe7).
+/// ExecStart with 7 branches is 52,895 (the largest of the runs at
+/// a604c161; 52,562 at the head of E3-1 part 1) since the probe runs the
+/// raw change jobs among the crowd. No step of the loop drains the closed
+/// ends of the identity sessions the probe clones: the thread `ends::taker`
+/// of services/process/src/ends.rs receives them one at a time, each a
+/// bounded call. The run with STEPS_SESSIONS (identity sessions cloned and
+/// closed before the exec steps, beside the one of the change stages)
+/// shows it: 1, 8 and 32 closed sessions give ExecStart 50,888, 50,670
+/// and 50,491, so the step does not grow with their number. The same
+/// source with one more call that does nothing (0 sessions) gives 50,888
+/// where the head gives 52,562: the figure moves by about 1,700 with the
+/// layout of the code. The
 /// margin covers what moves between builds: the layout of the code and the processes of the
 /// level above that run in the middle of a step (SpawnStart was 92,262 and
 /// 93,009 at 4e9abf5 and 92,369 at d7743c9 with the same source of the
 /// step).
+/// SpawnStart with 7 branches is 94,134 (95,634 with the margin): a run
+/// of fix round 2 of E3-1 part 1 with another layout of the code of the
+/// probe gave 94,134, 1,578 over the base of 92,556 that held before, more
+/// than the margin; the head of that round gives 92,231. The step is O(1)
+/// (one page of the loader's data is copied, `start_child` of
+/// services/process/src/main.rs), so the figure moves with the layout of
+/// the code and with the processes of the level above that run in the
+/// middle of the step. The entry goes in E5 (rv8.P3: Create, SpawnStart,
+/// ExecStart and ForkStart are cut into pieces no longer than B), and the
+/// base for 4 branches stays. Raising it again needs a new look at
+/// CALL_WAIT_MAX.
 const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64, u64); 4] = [
     (1, "Create", 61_378 + NOISE_MARGIN, 61_378 + NOISE_MARGIN),
     (
         22,
         "SpawnStart",
         92_323 + NOISE_MARGIN,
-        92_556 + NOISE_MARGIN,
+        94_134 + NOISE_MARGIN,
     ),
     (
         28,
         "ExecStart",
         51_039 + NOISE_MARGIN,
-        50_833 + NOISE_MARGIN,
+        52_895 + NOISE_MARGIN,
     ),
     (
         34,
@@ -3370,7 +3421,7 @@ const NOISE_MARGIN: u64 = 1_500;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 16] = [
+const RAM_STEP_KINDS: [(usize, &str); 21] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
@@ -3384,6 +3435,11 @@ const RAM_STEP_KINDS: [(usize, &str); 16] = [
     (24, "ResolveSecond"),
     (25, "FinishBinding"),
     (34, "CloneExact"),
+    (44, "ChangeStart"),
+    (45, "ChangeSecond"),
+    (46, "ChangeStep"),
+    (47, "ChangeQuery"),
+    (48, "ChangeRelease"),
     (64, "notification"),
     (65, "maintenance"),
     (66, "session gone"),
@@ -3402,9 +3458,11 @@ const WAIT_MAX: u64 = 500_000;
 /// The most a step may wait for the answer of a service in a call that is
 /// no heartbeat, in ticks under -icount: one round trip (C_ipc about
 /// 2,000), the longest step of the process service that may be running
-/// (SpawnStart, 94,056 with its margin), and the step of the request
-/// itself (term B), with room. Seen at most 9,946 (ramfs FinishBinding
-/// with 248 children).
+/// (SpawnStart, 95,634 with its margin), and the step of the request
+/// itself (term B), with room: 95,634 + 20,410 + 2,034 = 118,078 under
+/// 120,000, 1,922 of room, so a next rise of SpawnStart needs a new look
+/// at this limit. Seen at most 9,946 (ramfs FinishBinding with 248
+/// children).
 const CALL_WAIT_MAX: u64 = 120_000;
 
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
@@ -3562,6 +3620,12 @@ fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Whether the long rmdir of the starvation line ends within ten seconds
+/// against the flood of utimensat: "no" until 5i-5b (a change of the file
+/// has no effect on the directory it lies in), then "yes". A change either
+/// way is a change of the expectation, made here.
+const STARVATION_ENDS_WITHIN_10_S: &str = "no";
+
 /// The longest step of the process service under -icount with the crowd
 /// of children of tests/posix-procs in its steps mode: kill(-1), spawn,
 /// exec, the ends of all, and a Vouch with the identity channel full.
@@ -3569,6 +3633,90 @@ fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String>
 /// 24 children of the probe's own beside them).
 /// Prints a row for each kind of step, checks that the longest Vouch stays
 /// under VOUCH_TICKS_MAX, and the numbers go to `target/measure`.
+/// The lines of the operations on names that the steps probe prints before the
+/// crowd (names-volley.c): the times of the operations alone, the long rmdir
+/// against the loop of utimensat (its restarts and whether it ended within ten
+/// seconds, which is "no" until 5i-5b), and the volley of 112 renames, which
+/// all end and in which a Start is refused with JOBS_FULL and repeated. The
+/// lines go to the output for the report.
+fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
+    let shown: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("posix-procs: names "))
+        .collect();
+    let find = |what: &str| {
+        shown
+            .iter()
+            .find(|line| line.contains(what))
+            .map(|line| line.as_str())
+            .ok_or_else(|| format!("the steps probe printed no line with {what:?}"))
+    };
+    for row in [
+        "names time a missing component:",
+        "names time unlink /tmp/a:",
+        "names time rmdir:",
+        "names time chdir to depth 64:",
+        "names time getcwd at depth 64:",
+        "names time a path of 32 links:",
+        "names time rename of a directory under a chain 64 deep:",
+        "names time rmdir with a full table:",
+        "names thread cost:",
+    ] {
+        find(row)?;
+    }
+    let starvation = find("names starvation:")?;
+    let verdict = format!("finished within 10 s: {STARVATION_ENDS_WITHIN_10_S}");
+    if !starvation.contains(&verdict) {
+        return Err(format!(
+            "the starvation line does not say {verdict:?}: update the expectation \
+             STARVATION_ENDS_WITHIN_10_S if the change is meant (5i-5b turns it to \
+             \"yes\" and wants restarts 0 and a time of at most twice the time without \
+             interference): {starvation}"
+        ));
+    }
+    // The volley of 112 renames in one directory, and the same with a
+    // directory for each process: both end in all renames, both give the
+    // numbers 5i-5b compares with.
+    for (what, volley) in [
+        ("common directory", find("names volley:")?),
+        (
+            "directory for each process",
+            find("names volley in directories:")?,
+        ),
+    ] {
+        if !volley.contains("112 renames, all done") {
+            return Err(format!(
+                "the volley ({what}) did not end in 112 renames: {volley}"
+            ));
+        }
+        let lines = [volley.to_owned()];
+        for number in [
+            "the most repeats of JOBS_FULL of one thread ",
+            "the most restarts of one rename ",
+            "the longest rename ",
+        ] {
+            qemu::number_after(&lines, number)
+                .ok_or_else(|| format!("the volley ({what}) line has no {number:?}: {volley}"))?;
+        }
+    }
+    let repeats = qemu::number_after(
+        &[find("names volley:")?.to_owned()],
+        "repeats of JOBS_FULL of one thread ",
+    )
+    .unwrap_or(0);
+    if repeats == 0 {
+        return Err(format!(
+            "no thread of the volley met JOBS_FULL, the refused Start was not exercised: {}",
+            find("names volley:")?
+        ));
+    }
+    find("names volley ok")?;
+    // A process that goes in the middle of a prepaid rename, by _exit and by
+    // execve: the names stay, and the places of the root come back.
+    find("names gone ok")?;
+    Ok(shown.iter().map(|line| (*line).clone()).collect())
+}
+
 fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
@@ -3593,6 +3741,9 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     std::fs::write(&log, outcome.lines.join("\n") + "\n")
         .map_err(|e| format!("{}: {e}", log.display()))?;
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
+    for line in names_lines(&outcome.lines)? {
+        println!("{line}");
+    }
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
     let pipe = longest_steps(&outcome.lines, "4");
@@ -3674,6 +3825,16 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     }
     if !loader.iter().any(|(k, ..)| *k == 9) {
         return Err("no loader step of a copy: the forks did not run".into());
+    }
+    // The five methods of the change jobs (44 to 48) ran among the crowd, and
+    // the longest of each stays under term B like every step of the service.
+    for kind in 44..=48 {
+        let ticks = ram.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
+        if ticks == 0 || ticks > RAM_STEP_MAX {
+            return Err(format!(
+                "the RAM file service: change method {kind} took {ticks} ticks, none or past {RAM_STEP_MAX}: {ram:?}"
+            ));
+        }
     }
     // A fork uses CloneExact to copy its retained descriptor list.
     let clone = ram.iter().find(|(k, ..)| *k == 34).map_or(0, |r| r.1);
@@ -3850,9 +4011,56 @@ fn ash_probe() -> Result<(), String> {
     const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ENDED)?;
-    qemu::expect_marker(&output, "shell-ready")?;
+    expect_ash_names(&output.lines)?;
     println!("BusyBox ash builtin guest probe passed");
     Ok(())
+}
+
+/// What the script of the ash probe (tests/busybox/src/main.rs) prints after
+/// `shell-ready`: a file moved, read back and removed, a listing of `/tmp`
+/// without the nodes made while the system runs (5i-5b), a directory made and
+/// removed, a link read back, the mode `chmod` set.
+const ASH_NAMES_OUTPUT: [&str; 9] = [
+    "a-gone",
+    "x",
+    "b-gone",
+    "probe",
+    "d-made",
+    "d-gone",
+    "b",
+    "mode -rw-------",
+    "init: busybox-probe ended: exit code 0, not restarted",
+];
+
+/// The lines of the guest after `shell-ready` are exactly those of the
+/// script, in order.
+fn expect_ash_names(lines: &[String]) -> Result<(), String> {
+    let at = lines
+        .iter()
+        .position(|line| line == "shell-ready")
+        .ok_or_else(|| {
+            format!(
+                "no shell-ready; last lines: {:?}",
+                &lines[lines.len().saturating_sub(8)..]
+            )
+        })?;
+    let got = &lines[at + 1..];
+    if got.len() >= ASH_NAMES_OUTPUT.len()
+        && got
+            .iter()
+            .zip(ASH_NAMES_OUTPUT)
+            .all(|(line, want)| line == want)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "the ash script printed {:?}, wanted {:?}",
+            got.iter()
+                .take(ASH_NAMES_OUTPUT.len() + 2)
+                .collect::<Vec<_>>(),
+            ASH_NAMES_OUTPUT
+        ))
+    }
 }
 
 fn ash_dialog() -> Result<(), String> {
@@ -4642,6 +4850,8 @@ fn host_tests() -> Result<(), String> {
         "posix-path",
         "--package",
         "posix-fd",
+        "--package",
+        "posix-change",
         "--package",
         "posix-types",
         "--package",
@@ -6326,6 +6536,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "posix-fd",
         "--package",
+        "posix-change",
+        "--package",
         "posix-types",
         "--package",
         "posix-heap",
@@ -6620,6 +6832,96 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    fn names_log(repeats: &str) -> Vec<String> {
+        [
+            "posix-procs: names time a missing component: 73 requests, 617628 ticks",
+            "posix-procs: names time unlink /tmp/a: 27 requests, 250823 ticks",
+            "posix-procs: names time rmdir: 96 requests, 853412 ticks",
+            "posix-procs: names time chdir to depth 64: 130 requests, 900000 ticks",
+            "posix-procs: names time getcwd at depth 64: 0 requests, 1971 ticks",
+            "posix-procs: names time a path of 32 links: 672 requests, 5704952 ticks",
+            "posix-procs: names time rename of a directory under a chain 64 deep: 1559 requests, 15679606 ticks",
+            "posix-procs: names time rmdir with a full table: 96 requests, 855238 ticks",
+            "posix-procs: names thread cost: 28672 bytes (7 pages) for the first thread, 28672 bytes the last, 86016 bytes for 3, stack 20480 bytes",
+            "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 2569 restarts, finished within 10 s: no, took 626453622 ticks",
+            repeats,
+            "posix-procs: names volley in directories: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 120, the most restarts of one rename 31, the longest rename 98000000 ticks, 6879297680 ticks",
+            "posix-procs: names volley ok",
+            "posix-procs: names gone ok",
+        ]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect()
+    }
+
+    /// The lines of the names volley are all there, the volley ended in 112
+    /// renames and some thread met JOBS_FULL.
+    #[test]
+    fn the_names_volley_lines_are_read_strictly() {
+        let good = "posix-procs: names volley: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 130, the most restarts of one rename 40, the longest rename 99000000 ticks, 6879297680 ticks";
+        assert!(super::names_lines(&names_log(good)).is_ok());
+        let none = good.replace("thread 130", "thread 0");
+        assert!(super::names_lines(&names_log(&none)).is_err());
+        // A change of the verdict of the starvation line is a change of the
+        // expectation: the line that says "yes" is refused until the
+        // constant says so.
+        let mut turned = names_log(good);
+        for line in &mut turned {
+            *line = line.replace("finished within 10 s: no", "finished within 10 s: yes");
+        }
+        assert!(super::names_lines(&turned).is_err());
+        let no_restarts = good.replace("the most restarts of one rename 40, ", "");
+        assert!(super::names_lines(&names_log(&no_restarts)).is_err());
+        let no_longest = good.replace("the longest rename 99000000 ticks, ", "");
+        assert!(super::names_lines(&names_log(&no_longest)).is_err());
+        let fewer = good.replace("112 renames, all done", "97 renames");
+        assert!(super::names_lines(&names_log(&fewer)).is_err());
+        let mut without_row = names_log(good);
+        without_row.remove(2);
+        assert!(super::names_lines(&without_row).is_err());
+        let mut without_volley = names_log(good);
+        without_volley.retain(|line| !line.contains("names volley:"));
+        assert!(super::names_lines(&without_volley).is_err());
+        let mut without_directories = names_log(good);
+        without_directories.retain(|line| !line.contains("in directories"));
+        assert!(super::names_lines(&without_directories).is_err());
+        let mut without_gone = names_log(good);
+        without_gone.retain(|line| !line.contains("names gone ok"));
+        assert!(super::names_lines(&without_gone).is_err());
+        let mut short_directories = names_log(good);
+        for line in &mut short_directories {
+            if line.contains("in directories") {
+                *line = line.replace("112 renames, all done", "97 renames");
+            }
+        }
+        assert!(super::names_lines(&short_directories).is_err());
+    }
+
+    /// The lines of the ash script are checked exactly, in order, after
+    /// `shell-ready`.
+    #[test]
+    fn the_output_of_the_ash_names_script_is_exact() {
+        let log = |lines: &[&str]| -> Vec<String> {
+            ["boot", "shell-ready"]
+                .iter()
+                .chain(lines)
+                .map(|line| (*line).to_owned())
+                .collect()
+        };
+        assert!(super::expect_ash_names(&log(&super::ASH_NAMES_OUTPUT)).is_ok());
+        // A line missing (a `mv` that did not run), another text, another order.
+        let mut without = super::ASH_NAMES_OUTPUT.to_vec();
+        without.remove(1);
+        assert!(super::expect_ash_names(&log(&without)).is_err());
+        let mut other = super::ASH_NAMES_OUTPUT.to_vec();
+        other[7] = "mode -rw-r--r--";
+        assert!(super::expect_ash_names(&log(&other)).is_err());
+        let mut swapped = super::ASH_NAMES_OUTPUT.to_vec();
+        swapped.swap(0, 1);
+        assert!(super::expect_ash_names(&log(&swapped)).is_err());
+        assert!(super::expect_ash_names(&["boot".to_owned()]).is_err());
+    }
+
     #[test]
     fn native_images_keep_the_loader_pool_and_both_platforms() {
         use super::*;
@@ -6685,6 +6987,19 @@ mod tests {
         assert!(longest_waits(&lines, "5").is_empty());
         assert_eq!(wait_of(&longest_waits(&lines, "2"), 25), 12_246);
         assert_eq!(wait_of(&longest_waits(&lines, "2"), 1), 0);
+    }
+
+    #[test]
+    fn the_spawn_start_limit_holds_the_largest_run_and_the_call_wait_sum() {
+        // 94,134 is the run of fix round 2 with another layout of the probe;
+        // the limit of the call wait must hold the longest step of the
+        // process service, a step of the callee (term B) and a round trip.
+        let spawn = PROCESS_STEPS_ABOVE_B
+            .iter()
+            .find(|(k, ..)| *k == 22)
+            .expect("SpawnStart is in the list");
+        assert!(spawn.3 >= 94_134 + NOISE_MARGIN);
+        assert!(spawn.3 + TERM_B + 2_034 <= CALL_WAIT_MAX);
     }
 
     #[test]

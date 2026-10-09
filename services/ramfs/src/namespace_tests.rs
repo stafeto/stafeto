@@ -387,7 +387,7 @@ fn constructor_refusals_preserve_charge_usage_pins_epoch_and_exact_root() {
             Some(b"/missing/"),
             ROOT_USER
         ),
-        Err(NO_ENTRY)
+        Err(proto_fs::NOT_DIRECTORY)
     ));
     assert_eq!(ram.storage.usage(FIRST), usage);
     assert_eq!(pins(&ram), before_pins);
@@ -447,7 +447,7 @@ fn rename_rejects_ancestor_and_nonempty_destination_with_bounded_cancel() {
             Some(b"/other"),
             11
         ),
-        Err(DIRECTORY_NOT_EMPTY)
+        Err(NOT_EMPTY)
     );
     assert_eq!(ram.storage.usage(FIRST), usage);
     assert_eq!(ram.storage.state.epoch, epoch);

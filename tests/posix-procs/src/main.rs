@@ -66,11 +66,21 @@ extern "C" fn files_fake_identity() -> i32 {
     }
 }
 
+#[cfg(feature = "stages")]
+mod change_stages;
 #[cfg(feature = "auth-probe")]
 mod cleanup;
 #[cfg(feature = "files")]
 mod data_stages;
-#[cfg(feature = "files")]
+#[cfg(feature = "names-probe")]
+mod names_fork;
+#[cfg(feature = "names-loss")]
+mod names_loss;
+#[cfg(feature = "stages")]
+mod names_stages;
+#[cfg(feature = "change-steps")]
+mod names_volley;
+#[cfg(feature = "stages")]
 mod open_stages;
 /// Sixteen real sessions retain all thirty-two descriptions during both
 /// credential changes. Every reply and retained byte is checked by the guest.

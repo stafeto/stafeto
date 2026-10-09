@@ -21,6 +21,7 @@ fn main() {
         ("coreutils/lib.a", "busybox_coreutils"),
         ("shell/lib.a", "busybox_shell"),
         ("procps/lib.a", "busybox_procps"),
+        ("coreutils/libcoreutils/lib.a", "busybox_libcoreutils"),
     ] {
         let path = root.join(archive);
         assert!(

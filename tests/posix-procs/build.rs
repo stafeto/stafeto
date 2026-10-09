@@ -16,6 +16,10 @@ fn run(cmd: &mut Command) {
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=files.c");
+    println!("cargo:rerun-if-changed=names.c");
+    println!("cargo:rerun-if-changed=names-loss.c");
+    println!("cargo:rerun-if-changed=names-volley.c");
+    println!("cargo:rerun-if-changed=names-signal.c");
     println!("cargo:rerun-if-changed=open-policy.c");
     println!("cargo:rerun-if-changed=pending-open.c");
     println!("cargo:rerun-if-changed=pending-fork.c");
@@ -28,6 +32,10 @@ fn main() {
     // The branches of the steps mode (xtask process-steps N).
     println!("cargo:rerun-if-env-changed=STEPS_BRANCHES");
     let branches = env::var("STEPS_BRANCHES").unwrap_or_else(|_| "7".to_owned());
+    // The identity sessions the steps mode clones and closes before the
+    // exec steps, beside the one of the change stages (a measurement knob).
+    println!("cargo:rerun-if-env-changed=STEPS_SESSIONS");
+    let sessions = env::var("STEPS_SESSIONS").unwrap_or_else(|_| "0".to_owned());
     let manifest =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
     let sysroot = env::var_os("STAFETO_RELIBC_SYSROOT")
@@ -57,6 +65,7 @@ fn main() {
             u8::from(env::var_os("CARGO_FEATURE_LOADER_ABORT").is_some())
         ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
+        .arg(format!("-DSTEPS_SESSIONS={sessions}"))
         .arg(format!(
             "-DNATIVE_SCOPES_LAUNCHER={}",
             u8::from(env::var_os("CARGO_FEATURE_NATIVE_SCOPES_LAUNCHER").is_some())
@@ -64,6 +73,18 @@ fn main() {
         .arg(format!(
             "-DIMAGE_INFO_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_IMAGE_INFO_PROBE").is_some())
+        ))
+        .arg(format!(
+            "-DNAMES_PROBE={}",
+            u8::from(env::var_os("CARGO_FEATURE_NAMES_PROBE").is_some())
+        ))
+        .arg(format!(
+            "-DNAMES_LOSS={}",
+            u8::from(env::var_os("CARGO_FEATURE_NAMES_LOSS").is_some())
+        ))
+        .arg(format!(
+            "-DCHANGE_STEPS={}",
+            u8::from(env::var_os("CARGO_FEATURE_CHANGE_STEPS").is_some())
         ))
         .arg(format!(
             "-DPENDING_OPEN_PROBE={}",

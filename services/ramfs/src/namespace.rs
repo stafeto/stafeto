@@ -14,10 +14,7 @@ use proto_fs::{
     STALE_PROOF,
 };
 
-// The Files wire owner publishes these statuses with the namespace methods.
-pub const TOO_MANY_LINKS: u32 = 322;
-pub const DIRECTORY_NOT_EMPTY: u32 = 323;
-pub const BUSY: u32 = 324;
+pub use proto_fs::{BUSY, NOT_EMPTY, TOO_MANY_LINKS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NamespaceIntent {
@@ -203,6 +200,14 @@ impl Preparation {
             {
                 return Err(PERMISSION);
             }
+            // A directory that changes its parent changes its own "..".
+            if self.intent == NamespaceIntent::Rename
+                && source.kind == crate::DIR
+                && self.edges[0].parent != self.edges[1].parent
+                && !identity.permits(source, 2)
+            {
+                return Err(ACCESS_DENIED);
+            }
         }
         Ok(())
     }
@@ -291,16 +296,16 @@ impl Preparation {
                 if let Some(target) = self.empty_target(storage) {
                     for _ in 0..8 {
                         if self.cursor as usize == storage.entries() {
-                            self.phase = Phase::Ancestors;
+                            self.phase = Phase::Prepay;
                             break;
                         }
                         if storage.entry(target, self.cursor as usize).is_some() {
-                            return Err(DIRECTORY_NOT_EMPTY);
+                            return Err(NOT_EMPTY);
                         }
                         self.cursor += 1;
                     }
                 } else {
-                    self.phase = Phase::Ancestors;
+                    self.phase = Phase::Prepay;
                 }
             }
             Phase::Ancestors => {
@@ -312,7 +317,7 @@ impl Preparation {
                         return Err(INVALID_ARGUMENT);
                     }
                     if at == ROOT {
-                        self.phase = Phase::Prepay;
+                        self.phase = Phase::Empty;
                     } else {
                         if self.ancestor_steps == NODES as u16 {
                             return Err(INVALID_ARGUMENT);
@@ -321,7 +326,7 @@ impl Preparation {
                         self.ancestor_steps += 1;
                     }
                 } else {
-                    self.phase = Phase::Prepay;
+                    self.phase = Phase::Empty;
                 }
             }
             Phase::Prepay => {
@@ -476,7 +481,12 @@ impl Preparation {
         }
         for held in &mut self.reserves.overlays {
             if let Some(held) = held.take() {
-                storage.state.overlays[held.slot as usize] = Overlay::EMPTY;
+                // A slot that was reserved holds nothing but the two links
+                // of its owner (no page was mapped); the pages are NONE as
+                // `initialize` left them and as a free slot keeps them.
+                let overlay = &mut storage.state.overlays[held.slot as usize];
+                overlay.node = NONE;
+                overlay.root = NONE;
                 storage.state.inode_free[storage.state.inode_len] = held.slot;
                 storage.state.inode_len += 1;
                 storage.uncharge(held.root as usize, |u| &mut u.inodes);
@@ -660,7 +670,10 @@ impl Storage<'_> {
         if matches!(intent, NamespaceIntent::Link { .. }) && source_kind == crate::DIR {
             return Err(PERMISSION);
         }
-        for edge in &edges[..if has_destination { 2 } else { 1 }] {
+        for (i, edge) in edges[..if has_destination { 2 } else { 1 }]
+            .iter()
+            .enumerate()
+        {
             match edge.syntax.final_component {
                 FinalComponent::Root => return Err(BUSY),
                 FinalComponent::Dot | FinalComponent::DotDot => return Err(INVALID_ARGUMENT),
@@ -671,9 +684,18 @@ impl Storage<'_> {
             }
             self.namespace_edge(*edge)?;
             if edge.syntax.trailing_slash {
-                let token = edge.target.ok_or(NO_ENTRY)?;
-                if self.node(token)?.kind != crate::DIR {
-                    return Err(NOT_DIRECTORY);
+                match edge.target {
+                    Some(token) if self.node(token)?.kind != crate::DIR => {
+                        return Err(NOT_DIRECTORY);
+                    }
+                    Some(_) => {}
+                    // A new name with a slash is for a directory alone.
+                    None if i == 1 && intent == NamespaceIntent::Rename => {
+                        if source_kind != crate::DIR {
+                            return Err(NOT_DIRECTORY);
+                        }
+                    }
+                    None => return Err(NO_ENTRY),
                 }
             }
         }
@@ -717,7 +739,7 @@ impl Storage<'_> {
             ancestor: None,
             ancestor_steps: 0,
             pins_held: 0,
-            phase: Phase::Empty,
+            phase: Phase::Ancestors,
             outcome: None,
         };
         prep.check(self, identity)?;

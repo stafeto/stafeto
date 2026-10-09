@@ -55,6 +55,26 @@ impl TimeSource {
         )
     }
 
+    /// The time for a method that sets times and has no reply to ask again
+    /// (Read, Write, ReadDir and the older Open): the clock of the mode, the
+    /// one Change and Data use, so that the times of every method order
+    /// together. A snapshot of the page that the clock service is changing
+    /// is read again after a yield; the monotonic reading stands in only
+    /// when the page stays unstable for 64 tries (or its value is out of
+    /// range).
+    pub fn now(&self) -> Timestamp {
+        for _ in 0..64 {
+            match self.read_once() {
+                Ok(Some(timestamp)) => return timestamp,
+                Ok(None) => {
+                    let _ = sys::yield_now();
+                }
+                Err(_) => break,
+            }
+        }
+        Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now()))
+    }
+
     /// Each unstable startup attempt yields before reading again; Ready follows
     /// one complete snapshot. The mapped page remains owned across the yield.
     pub fn initial(&self) -> Result<Timestamp, Status> {
@@ -64,5 +84,11 @@ impl TimeSource {
             }
             sys::yield_now().map_err(Status::Kernel)?;
         }
+    }
+}
+
+impl ramfs::change::Clock for TimeSource {
+    fn read_once(&self) -> Result<Option<Timestamp>, Status> {
+        TimeSource::read_once(self)
     }
 }

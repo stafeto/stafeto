@@ -501,8 +501,18 @@ const STEPS_QUOTA: u64 = (413 + 16) * PAGE;
 
 /// The probe and each child it spawns inherit this budget. Its 1 MiB
 /// allocator growth needs 538 transient pages: 261 live, 274 for the
-/// memory object and 3 prepaid page tables. Retain the 16-page reserve.
-const PROCS_QUOTA: u64 = (538 + 16) * PAGE;
+/// memory object and 3 prepaid page tables. Retain the 16-page reserve, and
+/// 16 pages more for the image of the probe, which grows with its stages
+/// (the stage of the names of posix_spawn, 5i-5): the growth of an image
+/// takes the reserve, and a probe of the forks that allocates 1 MiB fails
+/// without it. Measured: the loaded segments of the posix-procs image are
+/// 30 + 113 + 32 = 175 pages (read-only, executable, writable) at a4572a55
+/// and 31 + 116 + 32 = 179 after part 5i-5 step 3 (8038e7e0, unchanged to
+/// 9a18874b and after the fixes of the review), so 4 pages of growth; the
+/// probe of the forks passes with 4 extra pages on top of 538 + 16 and
+/// fails with none. The other 12 pages are the reserve for the stages up
+/// to 5i-5b.
+const PROCS_QUOTA: u64 = (538 + 16 + 16) * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and
