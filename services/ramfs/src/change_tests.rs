@@ -3269,3 +3269,37 @@ fn two_creations_of_one_name_make_one_success_and_one_exists() {
     assert!(env.lookup(b"/same").is_ok());
     env.assert_quiet();
 }
+
+#[test]
+fn a_chmod_or_chown_of_a_directory_raises_its_access_generation_and_nothing_else_does() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"dir", DIR, 0o755);
+    let file = env.node(dir, b"file", REG, 0o644);
+    let access = |env: &Env, token| env.ram.storage.node(token).unwrap().access_gen;
+    let names = |env: &Env, token| env.ram.storage.node(token).unwrap().name_gen;
+    let (before, names_before) = (access(&env, dir), names(&env, dir));
+    let chmod = |path, mode: u64| with_args(ChangeOp::Chmod, path, 0, [mode, 0, 0, 0]);
+    // The file, the times and the same mode again change nothing of the directory.
+    assert_eq!(env.go_result(&mut fds, chmod(b"/dir/file", 0o600), None), 0);
+    let times = [1, 2, 3, 4];
+    assert_eq!(
+        env.go_result(
+            &mut fds,
+            with_args(ChangeOp::Times, b"/dir", 0, times),
+            None
+        ),
+        0
+    );
+    assert_eq!(env.go_result(&mut fds, chmod(b"/dir", 0o755), None), 0);
+    assert_eq!(access(&env, dir), before);
+    // A new mode of the directory, and a new owner.
+    assert_eq!(env.go_result(&mut fds, chmod(b"/dir", 0o700), None), 0);
+    assert_eq!(access(&env, dir), before + 1);
+    let chown = with_args(ChangeOp::Chown, b"/dir", 0, [5, 6, 0, 0]);
+    assert_eq!(env.go_result(&mut fds, chown, None), 0);
+    assert_eq!(access(&env, dir), before + 2);
+    assert_eq!(names(&env, dir), names_before, "no name changed");
+    let _ = file;
+    env.assert_quiet();
+}
