@@ -30,6 +30,7 @@ fn create(ram: &mut Ram<'_>, root: Root, name: &[u8]) -> (Fds, u32, Token) {
                 file: File::Node(token),
                 offset: 0,
                 hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags: READ_WRITE,
             },
         )
@@ -272,6 +273,7 @@ fn empty_write_validates_descriptor_access_and_signed_position() {
                 file: File::Node(token),
                 offset: 0,
                 hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags: READ_ONLY,
             },
         )
@@ -451,6 +453,7 @@ fn retained_description_writes_original_inode_after_numeric_fd_reuse() {
                 file: File::Node(replacement),
                 offset: 0,
                 hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags: READ_WRITE,
             },
         )
@@ -667,6 +670,7 @@ fn lease_admission_checks_full_token_and_survives_bare_fd_reuse_before_feed() {
                 file: File::Node(replacement),
                 offset: 0,
                 hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags: READ_WRITE
             }
         )

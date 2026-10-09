@@ -19,6 +19,9 @@ extern unsigned long long files_volley_ticks(void);
 extern unsigned long long files_volley_frequency(void);
 extern unsigned files_volley_restarts(int op);
 extern unsigned files_volley_full_repeats(void);
+extern int files_volley_read_dir_index(const char *path, unsigned index);
+
+#include <dirent.h>
 
 #define VZ "/tmp/vz"
 #define VZ_PAD 120
@@ -154,6 +157,98 @@ static int vz_quiet(void) {
     VZ_CHECK(strcmp(here, deep) == 0);
     VZ_CHECK(chdir("/") == 0);
     VZ_CHECK(vz_deep_remove() == 0);
+    return 0;
+}
+
+/* The longest walks of a listing (the worry of 5i-5b step 1): the list of the
+ * names of a directory is walked from its head when the hint of a position is
+ * stale, by a seek to a late position, and by the call of the service that
+ * counts the entries from the head. The service prints its longest steps; this
+ * only builds the worst states and counts the entries it walked. */
+static int vz_count_entries(const char *path, long *late) {
+    DIR *dir = opendir(path);
+    if (dir == NULL) return 0;
+    long count = 0, before_last = -1, previous = -1;
+    struct dirent *entry;
+    while (1) {
+        long here = telldir(dir);
+        entry = readdir(dir);
+        if (entry == NULL) break;
+        count++;
+        before_last = previous;
+        previous = here;
+    }
+    *late = before_last;
+    VZ_CHECK(closedir(dir) == 0);
+    return (int)count;
+}
+
+/* A seek to the position before the last entry after a listing to the end
+ * (the hint is the last entry, so it does not match), then one readdir: the
+ * service walks the list from the head to that position. The call by index of
+ * the service walks the same list to the entry before the last. */
+static int vz_stale_seek(const char *path, const char *what) {
+    DIR *dir = opendir(path);
+    VZ_CHECK(dir != NULL);
+    static long positions[1100];
+    int count = 0;
+    while (count < 1100) {
+        positions[count] = telldir(dir);
+        if (readdir(dir) == NULL) break;
+        count++;
+    }
+    VZ_CHECK(count > 2 && count < 1100);
+    for (int round = 0; round < 3; round++) {
+        seekdir(dir, positions[count - 1]);
+        VZ_CHECK(readdir(dir) != NULL);
+        /* To the end again, so that the hint is the last entry. */
+        while (readdir(dir) != NULL) {}
+    }
+    VZ_CHECK(closedir(dir) == 0);
+    /* The call by index serves the first 258 entries (the two dots and 256 names) and
+     * refuses the rest: the longest it walks, and the first it refuses. */
+    int served = count - 1 < 258 ? count - 1 : 258;
+    VZ_CHECK(files_volley_read_dir_index(path, (unsigned)served) > 0);
+    if (count > 259) VZ_CHECK(files_volley_read_dir_index(path, 259) < 0);
+    printf("posix-procs: names listing: %s, %d entries, a seek to the last but one and a call by index\n",
+           what, count);
+    return 0;
+}
+
+/* The directory of the image with the most names, with the names the table
+ * can still take added to it, then the common directory of the probe filled
+ * the same way: the lists of the longest walks. */
+static int vz_listing(void) {
+    const char *candidates[] = {"/", "/bin", "/etc", "/usr", "/usr/bin", "/lib", "/sbin", "/dev"};
+    const char *biggest = NULL;
+    int most = 0;
+    for (unsigned i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
+        long late;
+        int count = vz_count_entries(candidates[i], &late);
+        printf("posix-procs: names listing: %s has %d entries\n", candidates[i], count);
+        if (count > most) {
+            most = count;
+            biggest = candidates[i];
+        }
+    }
+    VZ_CHECK(biggest != NULL);
+    const char *places[2] = {biggest, VZ};
+    for (int place = 0; place < 2; place++) {
+        int made = 0;
+        for (;; made++) {
+            char name[80];
+            snprintf(name, sizeof name, "%s/z%d", places[place], made);
+            if (link(VZ "/p0", name) != 0) break;
+        }
+        if (made <= 100) printf("posix-procs: names listing: %s took %d names, errno %d\n", places[place], made, errno);
+        VZ_CHECK(made > 100);
+        VZ_CHECK(vz_stale_seek(places[place], place == 0 ? "the biggest directory of the image" : "the common directory") == 0);
+        for (int i = 0; i < made; i++) {
+            char name[80];
+            snprintf(name, sizeof name, "%s/z%d", places[place], i);
+            VZ_CHECK(unlink(name) == 0);
+        }
+    }
     return 0;
 }
 
@@ -440,6 +535,7 @@ static int names_volley(void) {
     files_volley_start();
     failed = vz_thread_cost();
     if (!failed) failed = vz_quiet();
+    if (!failed) failed = vz_listing();
     if (!failed) failed = vz_starvation();
     if (!failed) failed = vz_volley(0);
     if (!failed) failed = vz_volley(1);

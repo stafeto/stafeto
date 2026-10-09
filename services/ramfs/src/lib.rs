@@ -238,6 +238,18 @@ enum File {
     Random(u16),
 }
 
+/// What the walk to the next name of a directory gave.
+enum Walked {
+    Entry(u64, u16, DirectoryRecord),
+    End,
+    More(u16),
+}
+
+/// The last index the call by index of the service serves: it counts from the
+/// head of the list, so that its step is bounded by the portion of the list
+/// (the layer lists by descriptor, a portion of the list at a time).
+pub const INDEX_MAX: u32 = 2 + storage::LIST_PORTION as u32;
+
 #[derive(Clone, Copy)]
 struct Open {
     file: File,
@@ -248,6 +260,9 @@ struct Open {
     /// For a directory the entry that has the cookie `offset`, a shortcut
     /// that is checked before it is used.
     hint: u16,
+    /// For a directory the entry a walk to `offset` has reached when its
+    /// portion ran out, or NONE; checked before it is used.
+    scan: u16,
 }
 
 /// The descriptors of one session: each names an open description of the
@@ -741,6 +756,7 @@ impl<'a> Ram<'a> {
                 file: self.file(token),
                 offset: 0,
                 hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags: access | (flags & proto_fs::APPEND),
             },
         )?;
@@ -1335,6 +1351,7 @@ impl<'a> Ram<'a> {
                 file,
                 offset: 0,
                 hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags,
             },
         )
@@ -1470,6 +1487,9 @@ impl<'a> Ram<'a> {
         }
         if !identity.permits(node, 4) {
             return Err(proto_fs::ACCESS_DENIED);
+        }
+        if index > INDEX_MAX {
+            return Err(proto_fs::INVALID_ARGUMENT);
         }
         Ok(self.nth_entry(self.file(token), index, now))
     }
@@ -1621,16 +1641,26 @@ impl<'a> Ram<'a> {
             return Err(proto_fs::NOT_DIRECTORY);
         }
         let after = u64::try_from(open.offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
-        let found = self.entry_after(open.file, after, open.hint, now);
-        let entry = found.map(|(cookie, hint, record)| {
-            open.offset = cookie as i64;
-            open.hint = hint;
-            record
-        });
-        if entry.is_some() {
-            self.put(fds, fd, open)?;
+        match self.entry_after(open.file, after, open.hint, open.scan, now) {
+            Walked::Entry(cookie, hint, record) => {
+                open.offset = cookie as i64;
+                open.hint = hint;
+                open.scan = storage::NONE;
+                self.put(fds, fd, open)?;
+                Ok(Some(record))
+            }
+            Walked::End => {
+                open.scan = storage::NONE;
+                self.put(fds, fd, open)?;
+                Ok(None)
+            }
+            // A long list: the walk goes on in the next call.
+            Walked::More(scan) => {
+                open.scan = scan;
+                self.put(fds, fd, open)?;
+                Err(proto_fs::RESOLVING)
+            }
         }
-        Ok(entry)
     }
 
     pub fn directory_read_path(
@@ -1672,25 +1702,31 @@ impl<'a> Ram<'a> {
     /// whatever else the directory goes through, because a position is the
     /// cookie of the name before it and cookies only rise along the listing.
     /// Gives the cookie, the entry (a shortcut for the next call) and the
-    /// record; the access time of the directory is `now`.
+    /// record; the access time of the directory is `now`. A walk of a long
+    /// list that does not reach the position within a portion gives the entry
+    /// it reached, which the next call starts from.
     fn entry_after(
         &mut self,
         dir: File,
         after: u64,
         hint: u16,
+        scan: u16,
         now: proto_fs::Timestamp,
-    ) -> Option<(u64, u16, DirectoryRecord)> {
+    ) -> Walked {
         self.touch_access(dir, now);
         let token = self.token(dir);
         let (cookie, entry) = match after {
             0 | 1 => (after + 1, storage::NONE),
-            _ => {
-                let entry = self.storage.child_after(token, after, hint)?;
-                (self.storage.entry_cookie(entry), entry as u16)
-            }
+            _ => match self.storage.child_after(token, after, hint, scan) {
+                storage::Walk::Found(entry) => (self.storage.entry_cookie(entry), entry as u16),
+                storage::Walk::End => return Walked::End,
+                storage::Walk::More(reached) => return Walked::More(reached),
+            },
         };
-        let record = self.record_of(token, cookie, entry)?;
-        Some((cookie, entry, record))
+        match self.record_of(token, cookie, entry) {
+            Some(record) => Walked::Entry(cookie, entry, record),
+            None => Walked::End,
+        }
     }
 
     /// Entry `index` of directory `dir`: `.`, `..`, then the names in the

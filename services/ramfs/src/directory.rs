@@ -118,6 +118,7 @@ impl Ram<'_> {
             return Err(INVALID_ARGUMENT);
         }
         open.offset = cookie;
+        open.scan = crate::storage::NONE;
         self.put(fds, fd, open)?;
         Ok(cookie)
     }

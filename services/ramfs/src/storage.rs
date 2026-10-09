@@ -32,6 +32,19 @@ pub const CHAIN_PORTION: usize = 8;
 /// Entries of the name index: the boot entries then the dynamic ones.
 const NAME_ENTRIES: usize = ORIGINALS + DENTRIES;
 pub const SYMLINK: u32 = 5;
+/// Links of the list of the names of a directory a step walks to find a position.
+pub const LIST_PORTION: usize = 256;
+
+/// Where the walk of the list of a directory to a position ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Walk {
+    /// The entry after the position.
+    Found(usize),
+    /// No name after the position.
+    End,
+    /// The portion is spent; this entry stands before the position.
+    More(u16),
+}
 
 /// The bucket of a name in a directory. The function is fixed; a local user
 /// who finds colliding names only returns the cost to the length of the
@@ -1408,11 +1421,17 @@ impl<'a> Storage<'a> {
     }
     /// The first name of the directory after `cookie`, and the one after
     /// the entry `hint` when that entry is the one the cookie belongs to.
-    pub(crate) fn child_after(&self, dir: Token, cookie: u64, hint: u16) -> Option<usize> {
-        let children = self.state.children.get(dir.slot as usize)?;
+    /// Without a hint the walk goes from the head of the list, or from the
+    /// entry `scan` of an earlier call when that entry still stands before
+    /// the cookie, and takes at most `LIST_PORTION` links: the entry it
+    /// reached is the `scan` of the next call.
+    pub(crate) fn child_after(&self, dir: Token, cookie: u64, hint: u16, scan: u16) -> Walk {
+        let Some(children) = self.state.children.get(dir.slot as usize) else {
+            return Walk::End;
+        };
         let last = children[1];
         if last == NONE || self.entry_cookie(last as usize) <= cookie {
-            return None;
+            return Walk::End;
         }
         if hint != NONE
             && (hint as usize) < self.entries()
@@ -1420,14 +1439,32 @@ impl<'a> Storage<'a> {
             && self.entry_key(hint as usize).0 == dir
             && self.entry_cookie(hint as usize) == cookie
         {
-            return Some(self.state.child_next[hint as usize] as usize)
-                .filter(|&i| i != NONE as usize);
+            return match self.state.child_next[hint as usize] {
+                NONE => Walk::End,
+                next => Walk::Found(next as usize),
+            };
         }
         let mut at = children[0];
-        while at != NONE && self.entry_cookie(at as usize) <= cookie {
+        if scan != NONE
+            && (scan as usize) < self.entries()
+            && self.published(scan as usize)
+            && self.entry_key(scan as usize).0 == dir
+            && self.entry_cookie(scan as usize) <= cookie
+        {
+            at = self.state.child_next[scan as usize];
+        }
+        let mut reached = scan;
+        for _ in 0..LIST_PORTION {
+            if at == NONE {
+                return Walk::End;
+            }
+            if self.entry_cookie(at as usize) > cookie {
+                return Walk::Found(at as usize);
+            }
+            reached = at;
             at = self.state.child_next[at as usize];
         }
-        (at != NONE).then_some(at as usize)
+        Walk::More(reached)
     }
     /// The entry after `index` in the list of its directory.
     pub(crate) fn child_next(&self, index: usize) -> Option<usize> {

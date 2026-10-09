@@ -64,3 +64,34 @@ pub extern "C" fn files_volley_restarts(op: i32) -> u32 {
 pub extern "C" fn files_volley_full_repeats() -> u32 {
     stats::FULL_REPEATS.load(Relaxed)
 }
+
+/// Entry `index` of the directory `path` by the call of the service that
+/// counts the entries from the head of the list (the call of the tests of
+/// the service, not used by the layer): the length of the name, 0 at the end
+/// of the directory, or a negative number for a refusal.
+///
+/// # Safety
+/// `path` is a live C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn files_volley_read_dir_index(
+    path: *const core::ffi::c_char,
+    index: u32,
+) -> i32 {
+    use core::mem::ManuallyDrop;
+    use rt::fs::Files;
+    use rt::handle::Handle;
+    // SAFETY: the caller's promise.
+    let Ok(path) = unsafe { core::ffi::CStr::from_ptr(path) }.to_str() else {
+        return -1;
+    };
+    let Ok(raw) = posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
+        return -2;
+    };
+    let files = ManuallyDrop::new(Files::from_sessions(Handle::from_raw(raw), None));
+    let mut name = [0; 256];
+    match files.read_dir(path, index, &mut name) {
+        Ok(Some((length, _))) => length as i32,
+        Ok(None) => 0,
+        Err(_) => -3,
+    }
+}

@@ -1026,15 +1026,50 @@ static int gone_exists(const char *name) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/* The stage the probe of the departed process is in, for the watchdog: when
+ * a stage lasts too long (a service that does not give a job back leaves the
+ * probe waiting for a place or for the child), the watchdog says which one
+ * and ends the probe, so that the failure shows at once and not after the
+ * timeout of the whole run. 0 when the probe is over. */
+static volatile int gone_stage;
+
+static void *gone_watchdog(void *unused) {
+    int last = -1, still = 0;
+    while (gone_stage != 0) {
+        struct timespec delay = {0, 100000000};
+        nanosleep(&delay, NULL);
+        if (gone_stage == last) {
+            if (++still > 200) {
+                printf("posix-procs: steps: the names gone probe waits for 20 s at stage %d "
+                       "(1 names, 2 the child, 3 its end, 4 the places of the job)\n", gone_stage);
+                _exit(6);
+            }
+        } else {
+            last = gone_stage;
+            still = 0;
+        }
+    }
+    return unused;
+}
+
 static int names_gone(void) {
     static const char *const names[2][4] = {{"p1", "q1", "p2", "q2"}, {"r1", "s1", "r2", "s2"}};
     if (mkdir("/tmp/gn", 0755) != 0) return 1;
+    pthread_t watch;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 65536);
+    gone_stage = 1;
+    if (pthread_create(&watch, &attr, gone_watchdog, NULL) != 0) return 9;
     for (int exec = 0; exec < 2; exec++) {
         const char *const *n = names[exec];
+        gone_stage = 1;
         if (gone_pair(n[0], n[1]) || gone_pair(n[2], n[3])) return 2;
         pid_t pid = -1;
+        gone_stage = 2;
         if (steps_spawn(&pid, "gonechild", exec ? "1" : "0") != 0) return 3;
         int status = -1;
+        gone_stage = 3;
         if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 7) {
             printf("posix-procs: steps: the %s child ended with status %#x\n",
                    exec ? "execve" : "_exit", status);
@@ -1046,6 +1081,7 @@ static int names_gone(void) {
                    exec ? "execve" : "_exit");
             return 5;
         }
+        gone_stage = 4;
         if (files_gone_places() != 0) {
             printf("posix-procs: steps: the places of the job of the %s child stayed taken\n",
                    exec ? "execve" : "_exit");
@@ -1058,6 +1094,8 @@ static int names_gone(void) {
         }
     }
     if (rmdir("/tmp/gn") != 0) return 8;
+    gone_stage = 0;
+    pthread_join(watch, NULL);
     printf("posix-procs: names gone ok\n");
     return 0;
 }

@@ -2245,6 +2245,21 @@ fn a_change_after_the_reservation_gives_the_reservation_back_and_the_job_goes_on
     env.assert_quiet();
 }
 
+/// The names of one file in the directory `dir`, over several roots.
+fn link_names(env: &mut Env, dir: Token, names: &[std::string::String]) {
+    let seed = env.node(dir, b"seed", REG, 0o644);
+    for (i, name) in names.iter().enumerate() {
+        let root = Root {
+            id: 300 + (i / 200) as u64,
+            generation: 1,
+        };
+        env.ram
+            .storage
+            .link(root, dir, name.as_bytes(), seed)
+            .unwrap();
+    }
+}
+
 /// `count` more names of one file in the root directory, over several roots
 /// because a root may hold only part of the table.
 fn fill_names(env: &mut Env, prefix: &str, count: usize) {
@@ -2571,15 +2586,31 @@ fn path_follows_the_back_reference_of_a_renamed_directory_in_one_step_a_level() 
 }
 
 fn read_name(env: &mut Env, fds: &mut Fds, fd: u32) -> Option<(std::string::String, u32)> {
-    env.ram
-        .directory_read(fds, fd, Timestamp::legacy_ns(5))
-        .unwrap()
-        .map(|record| {
-            (
-                std::string::String::from_utf8(record.name().to_vec()).unwrap(),
-                record.kind,
-            )
-        })
+    read_portioned(env, fds, fd).0
+}
+/// One name by `directory_read`, called again while the service says it is
+/// still walking (RESOLVING), as the client does. Gives the name and the calls.
+fn read_portioned(
+    env: &mut Env,
+    fds: &mut Fds,
+    fd: u32,
+) -> (Option<(std::string::String, u32)>, u32) {
+    for calls in 1.. {
+        match env.ram.directory_read(fds, fd, Timestamp::legacy_ns(5)) {
+            Ok(record) => {
+                let name = record.map(|record| {
+                    (
+                        std::string::String::from_utf8(record.name().to_vec()).unwrap(),
+                        record.kind,
+                    )
+                });
+                return (name, calls);
+            }
+            Err(proto_fs::RESOLVING) => assert!(calls < 64, "the walk does not end"),
+            Err(code) => panic!("status {code}"),
+        }
+    }
+    unreachable!()
 }
 fn open_directory(env: &mut Env, fds: &mut Fds, path: &str) -> u32 {
     env.ram
@@ -3301,5 +3332,137 @@ fn a_chmod_or_chown_of_a_directory_raises_its_access_generation_and_nothing_else
     assert_eq!(access(&env, dir), before + 2);
     assert_eq!(names(&env, dir), names_before, "no name changed");
     let _ = file;
+    env.assert_quiet();
+}
+
+#[test]
+fn a_position_far_down_a_long_list_is_walked_a_portion_at_a_time_and_found() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"long", DIR, 0o755);
+    let names: Vec<std::string::String> = (0..480).map(|i| format!("n{i:03}")).collect();
+    link_names(&mut env, dir, &names);
+    let fd = open_directory(&mut env, &mut fds, "/long");
+    let portion = crate::storage::LIST_PORTION as u32;
+    // Read to the position of n419 and remember it.
+    for _ in 0..422 {
+        read_name(&mut env, &mut fds, fd).unwrap();
+    }
+    let late = env
+        .ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current)
+        .unwrap();
+    // The sequential steps with the hint never take more than one call.
+    let (name, calls) = read_portioned(&mut env, &mut fds, fd);
+    assert_eq!((name.unwrap().0.as_str(), calls), ("n419", 1));
+    // Rewound and back to the late position: the hint is stale, the walk takes portions.
+    env.ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    read_name(&mut env, &mut fds, fd).unwrap();
+    env.ram
+        .seek_from(&mut fds, fd, late, proto_fs::SeekFrom::Start)
+        .unwrap();
+    let (name, calls) = read_portioned(&mut env, &mut fds, fd);
+    assert_eq!(name.unwrap().0, "n419");
+    // The seed and 419 names stand before the position: 420 links, and one
+    // more call finds the name after them.
+    assert_eq!(calls, 421u32.div_ceil(portion));
+    assert!(calls >= 2, "a walk of 420 links is more than one portion");
+    // The telldir pattern: a seek to the position just read, before each read.
+    env.ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut most = 0;
+    loop {
+        let here = env
+            .ram
+            .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current)
+            .unwrap();
+        env.ram
+            .seek_from(&mut fds, fd, here, proto_fs::SeekFrom::Start)
+            .unwrap();
+        let (name, calls) = read_portioned(&mut env, &mut fds, fd);
+        most = most.max(calls);
+        let Some((name, _)) = name else { break };
+        if name != "." && name != ".." {
+            seen.push(name);
+        }
+    }
+    let mut expected = vec![std::string::String::from("seed")];
+    expected.extend(names.iter().cloned());
+    assert!(seen == expected, "every name once, in order");
+    assert!(
+        most <= 481u32.div_ceil(portion) + 1,
+        "{most} calls for one name"
+    );
+    env.ram.close(&mut fds, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn a_walk_that_waits_for_its_next_portion_survives_the_removal_of_the_entry_it_reached() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"long", DIR, 0o755);
+    let names: Vec<std::string::String> = (0..480).map(|i| format!("n{i:03}")).collect();
+    link_names(&mut env, dir, &names);
+    let fd = open_directory(&mut env, &mut fds, "/long");
+    for _ in 0..450 {
+        read_name(&mut env, &mut fds, fd).unwrap();
+    }
+    let late = env
+        .ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current)
+        .unwrap();
+    env.ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    read_name(&mut env, &mut fds, fd).unwrap();
+    env.ram
+        .seek_from(&mut fds, fd, late, proto_fs::SeekFrom::Start)
+        .unwrap();
+    // One portion, and the walk stands at an entry of the list.
+    assert_eq!(
+        env.ram
+            .directory_read(&mut fds, fd, Timestamp::legacy_ns(5))
+            .err(),
+        Some(proto_fs::RESOLVING)
+    );
+    // The entry it reached goes with its neighbours, and a new name takes the place.
+    for i in 100..160 {
+        let path = format!("/long/n{i:03}");
+        assert_eq!(
+            env.go_result(&mut fds, op(ChangeOp::Unlink, path.as_bytes()), None),
+            0
+        );
+    }
+    env.node(dir, b"zz", REG, 0o644);
+    // The next name after the position, whatever happened to the places behind it.
+    assert_eq!(read_name(&mut env, &mut fds, fd).unwrap().0, "n447");
+    env.ram.close(&mut fds, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn the_call_by_index_serves_the_first_names_and_refuses_the_rest() {
+    let mut env = Env::new();
+    let dir = env.node(ROOT, b"idx", DIR, 0o755);
+    let names: Vec<std::string::String> = (0..300).map(|i| format!("n{i:03}")).collect();
+    link_names(&mut env, dir, &names);
+    let read = |env: &mut Env, index| {
+        env.ram
+            .directory_read_token(dir, index, ROOT_USER, Timestamp::legacy_ns(5))
+    };
+    assert_eq!(
+        read(&mut env, 2).unwrap().unwrap().name(),
+        b"seed".as_slice()
+    );
+    assert!(read(&mut env, crate::INDEX_MAX).unwrap().is_some());
+    assert_eq!(
+        read(&mut env, crate::INDEX_MAX + 1).err(),
+        Some(proto_fs::INVALID_ARGUMENT)
+    );
     env.assert_quiet();
 }

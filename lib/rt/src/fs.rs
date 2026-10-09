@@ -1201,7 +1201,15 @@ impl Files {
         Method::ReadDirFd.header().write(&mut w)?;
         w.u32(fd)?;
         let mut reply = [0; MESSAGE_MAX];
-        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        // The service walks a long list a portion at a time: RESOLVING says
+        // the walk goes on in the next call (a list of 1,541 names is seven).
+        let mut portions = 0;
+        let bytes = loop {
+            match self.call(w.as_bytes(), &mut reply) {
+                Err(Status::Unknown(proto_fs::RESOLVING)) if portions < 32 => portions += 1,
+                other => break other?,
+            }
+        };
         let mut r = Reader::new(bytes);
         if r.u32()? != 0 {
             return Err(Status::BadSize);
