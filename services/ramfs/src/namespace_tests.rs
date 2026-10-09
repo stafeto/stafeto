@@ -1216,3 +1216,97 @@ fn rename_ancestors_cycle_refuses_with_exact_paid_cleanup() {
     assert_eq!(ram.storage.preparations_used(), 1);
     ram.storage.release_preparation(charge);
 }
+
+#[test]
+fn replacement_keeps_destination_cookie_and_listing_position() {
+    for (source, destination) in [(b"a", b"b"), (b"c", b"b"), (b"a", b"c"), (b"c", b"a")] {
+        let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+        for name in [b"a", b"b", b"c"] {
+            create(&mut ram, FIRST, ROOT, name, REG, 0o644);
+        }
+        let dest = ram.storage.find(ROOT, destination).unwrap().0;
+        let cookie = ram.storage.entry_cookie(dest);
+        let source_path = format!("/{}", std::str::from_utf8(source).unwrap());
+        let dest_path = format!("/{}", std::str::from_utf8(destination).unwrap());
+        run(
+            &mut ram,
+            NamespaceIntent::Rename,
+            source_path.as_bytes(),
+            Some(dest_path.as_bytes()),
+            0,
+        )
+        .unwrap();
+        ram.storage.check_name_index();
+        let entry = ram.storage.find(ROOT, destination).unwrap().0;
+        assert_eq!(ram.storage.entry_cookie(entry), cookie);
+        // A cursor that already emitted the destination never emits it again.
+        let mut after = cookie;
+        for _ in 0..20 {
+            match ram.storage.child_after(ROOT, after, NONE, NONE) {
+                Walk::Found(i) => {
+                    let (next, name, _) = ram.storage.directory_entry(ROOT, i).unwrap();
+                    assert_ne!(name, destination);
+                    after = next;
+                }
+                Walk::End => break,
+                Walk::More(_) => panic!("short listing"),
+            }
+        }
+        // Starting before it emits the destination exactly once.
+        let mut count = 0;
+        let mut after = 2;
+        for _ in 0..20 {
+            match ram.storage.child_after(ROOT, after, NONE, NONE) {
+                Walk::Found(i) => {
+                    let (next, name, _) = ram.storage.directory_entry(ROOT, i).unwrap();
+                    count += usize::from(name == destination);
+                    after = next;
+                }
+                Walk::End => break,
+                Walk::More(_) => panic!("short listing"),
+            }
+        }
+        assert_eq!(count, 1);
+    }
+}
+
+#[test]
+fn reserved_name_commits_at_tail_after_500_rival_publications() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let target = create(&mut ram, FIRST, ROOT, b"target", REG, 0o644);
+    let pending = ram
+        .storage
+        .reserve(FIRST, ROOT, b"pending", (REG, 0o644, 0, 0))
+        .unwrap();
+    let bucket = name_bucket(ROOT, b"pending");
+    let mut created = 0;
+    for i in 0..2000 {
+        let name = format!("late{i}");
+        if name_bucket(ROOT, name.as_bytes()) == bucket {
+            continue;
+        }
+        ram.storage
+            .link(
+                if created < 300 { SECOND } else { FIRST },
+                ROOT,
+                name.as_bytes(),
+                target,
+            )
+            .unwrap();
+        created += 1;
+        if created == 500 {
+            break;
+        }
+    }
+    assert_eq!(created, 500);
+    tests_support::COOKIE_LINKS.with(|count| count.set(0));
+    ram.storage.commit(pending).unwrap();
+    tests_support::COOKIE_LINKS.with(|count| assert_eq!(count.get(), 0));
+    ram.storage.check_name_index();
+    let index = ram.storage.find(ROOT, b"pending").unwrap().0;
+    assert_eq!(
+        ram.storage
+            .child_after(ROOT, ram.storage.entry_cookie(index), NONE, NONE),
+        Walk::End
+    );
+}

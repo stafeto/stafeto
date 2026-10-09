@@ -67,6 +67,7 @@ pub(crate) mod tests_support {
     std::thread_local! {
         /// A test puts every name into one bucket.
         pub static FORCED_BUCKET: Cell<Option<usize>> = const { Cell::new(None) };
+        pub static COOKIE_LINKS: Cell<usize> = const { Cell::new(0) };
     }
     /// A name of the bucket of `name` in `parent`, another than `name`.
     pub(crate) fn same_bucket(parent: super::Token, name: &[u8]) -> std::vec::Vec<u8> {
@@ -1361,29 +1362,23 @@ impl<'a> Storage<'a> {
     }
     /// The cookie of an entry: the position it keeps in its directory.
     pub(crate) fn entry_cookie(&self, index: usize) -> u64 {
+        #[cfg(test)]
+        tests_support::COOKIE_LINKS.with(|count| count.set(count.get() + 1));
         if index < self.state.original_len {
             3 + index as u64
         } else {
             self.state.dentries[index - self.state.original_len].cookie
         }
     }
-    /// An entry becomes a name of its directory: found by its name, listed
-    /// in cookie order, counted. The cookie of an entry that reserved its
-    /// number earlier than a rival that published first is behind it; the
-    /// walk back from the end is as long as the reservations in flight.
+    /// Appends a newly published name. Its cookie was allocated at commit.
     pub(crate) fn publish(&mut self, index: usize) {
+        let parent = self.entry_key(index).0.slot as usize;
+        self.publish_at(index, self.state.children[parent][1], NONE);
+    }
+    /// Inserts a replacement at the removed destination's exact position.
+    pub(crate) fn publish_at(&mut self, index: usize, after: u16, next: u16) {
         self.chain_insert(index);
         let parent = self.entry_key(index).0.slot as usize;
-        let cookie = self.entry_cookie(index);
-        let mut after = self.state.children[parent][1];
-        while after != NONE && self.entry_cookie(after as usize) > cookie {
-            after = self.state.child_prev[after as usize];
-        }
-        let next = if after == NONE {
-            self.state.children[parent][0]
-        } else {
-            self.state.child_next[after as usize]
-        };
         self.state.child_prev[index] = after;
         self.state.child_next[index] = next;
         if after == NONE {
@@ -1646,7 +1641,6 @@ impl<'a> Storage<'a> {
             slot: (ORIGINALS + i) as u16,
             generation,
         };
-        let cookie = self.next_directory_cookie()?;
         self.state.inode_len -= 1;
         self.state.dentry_len -= 1;
         let d = self.state.dentry_free[self.state.dentry_len] as usize;
@@ -1670,7 +1664,6 @@ impl<'a> Storage<'a> {
             len: name.len() as u8,
             root: a as u16,
             reserved: true,
-            cookie,
             ..Dentry::EMPTY
         };
         entry.name[..name.len()].copy_from_slice(name);
@@ -1768,6 +1761,8 @@ impl<'a> Storage<'a> {
         } else {
             parent.links
         };
+        let cookie = self.next_directory_cookie()?;
+        self.state.dentries[reservation.dentry as usize].cookie = cookie;
         self.state.dentries[reservation.dentry as usize].reserved = false;
         let entry = self.state.original_len + reservation.dentry as usize;
         self.publish(entry);
@@ -2320,23 +2315,25 @@ mod directory_cookie_tests {
             .unwrap();
         assert_eq!(
             ram.storage.state.dentries[reserved.dentry as usize].cookie,
-            i64::MAX as u64 - 1
+            0
         );
+        ram.storage.commit(reserved).unwrap();
         assert_eq!(ram.storage.state.next_cookie, i64::MAX as u64);
+        let over = ram
+            .storage
+            .reserve(EXPENSE, ROOT, b"over", (crate::REG, 0o644, 0, 0))
+            .unwrap();
         let before = ram.storage.available();
         let usage = ram.storage.usage(EXPENSE);
         let pins = ram.storage.node(ROOT).unwrap().pins;
         let epoch = ram.storage.state.epoch;
-        assert_eq!(
-            ram.storage
-                .reserve(EXPENSE, ROOT, b"over", (crate::REG, 0o644, 0, 0)),
-            Err(NO_SPACE)
-        );
+        assert_eq!(ram.storage.commit(over), Err(NO_SPACE));
         assert_eq!(ram.storage.available(), before);
         assert_eq!(ram.storage.usage(EXPENSE), usage);
         assert_eq!(ram.storage.node(ROOT).unwrap().pins, pins);
         assert_eq!(ram.storage.state.epoch, epoch);
-        ram.storage.cancel(reserved).unwrap();
+        ram.storage.cancel(over).unwrap();
+        ram.storage.unlink(ROOT, b"last", EXPENSE).unwrap();
         while ram.storage.reclaim_step() {}
         assert_eq!(ram.storage.usage(EXPENSE), Usage::EMPTY);
         assert_eq!(ram.storage.state.next_cookie, i64::MAX as u64);

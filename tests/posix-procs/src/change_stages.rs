@@ -1161,3 +1161,64 @@ pub extern "C" fn files_bounds_stale() -> i32 {
     }
     run_all().err().unwrap_or(0)
 }
+
+/// A creation commits after 500 other names were published in its directory.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_bounds_publish() -> i32 {
+    unsafe extern "C" {
+        fn files_bounds_fill(remove_names: i32) -> i32;
+    }
+    fn work() -> Result<(), i32> {
+        let raw =
+            posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())).map_err(|_| 90)?;
+        let original =
+            core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+        let files = super::open_stages::clone_bound(&original, &[]).map_err(|_| 89)?;
+        expect(run(&files, &mkdir(0, 70, b"/tmp/bp", 0o755), None), 0, 91)?;
+        let dry = mkdir(1, 71, b"/tmp/bp/pending", 0o755);
+        start(&files, &dry).map_err(|_| 92)?;
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            if steps > 1000 {
+                return Err(93);
+            }
+            if step(&files, dry.key, false).map_err(|_| 94)?.is_some() {
+                break;
+            }
+        }
+        release(&files, dry.key).map_err(|_| 95)?;
+        expect(run(&files, &rmdir(0, 72, dry.path), None), 0, 96)?;
+        // SAFETY: the helper starts with no raw job in flight.
+        let prepare = unsafe { files_bounds_fill(-1) };
+        if prepare != 0 {
+            return Err(120 + prepare);
+        }
+        let job = mkdir(1, 73, dry.path, 0o755);
+        start(&files, &job).map_err(|_| 97)?;
+        for _ in 1..steps {
+            if step(&files, job.key, false).map_err(|_| 98)?.is_some() {
+                return Err(99);
+            }
+        }
+        // SAFETY: the C helper takes only a scalar and owns its strings.
+        let fill = unsafe { files_bounds_fill(0) };
+        if fill != 0 {
+            return Err(100 + fill);
+        }
+        let done = step(&files, job.key, false).map_err(|_| 110)?.ok_or(111)?;
+        if done.result != 0 || done.restarts != 0 {
+            return Err(112);
+        }
+        release(&files, job.key).map_err(|_| 113)?;
+        rt::println!("posix-procs: names bounds commit after 500 rival names: 0 restarts");
+        // SAFETY: the helper removes the names it created.
+        if unsafe { files_bounds_fill(1) } != 0 {
+            return Err(114);
+        }
+        expect(run(&files, &rmdir(0, 74, dry.path), None), 0, 115)?;
+        expect(run(&files, &rmdir(0, 75, b"/tmp/bp"), None), 0, 116)?;
+        Ok(())
+    }
+    work().err().unwrap_or(0)
+}

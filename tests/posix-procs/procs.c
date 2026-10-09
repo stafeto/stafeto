@@ -781,6 +781,7 @@ extern int files_bounds_hold(int count);
 extern int files_bounds_release(void);
 extern int files_bounds_start(void);
 extern int files_bounds_stale(void);
+extern int files_bounds_publish(void);
 #endif
 #if NAMES_PROBE
 extern int files_names_pipe(void);
@@ -1142,6 +1143,11 @@ static int steps_run(void) {
     unsigned char zeros[STEPS_BRANCHES] = {0};
     if (fd < 0 || pwrite(fd, zeros, sizeof zeros, 0) != (ssize_t)sizeof zeros) return 2;
 #if CHANGE_STEPS
+    int publication = files_bounds_publish();
+    if (publication) {
+        printf("posix-procs: steps: bounds: publication gave %d\n", publication);
+        return 8;
+    }
     /* The operations on names alone, in a table full of names, against a
      * flood of changes and from 112 threads, before the crowd arrives. */
     int volley = names_volley();
@@ -2131,6 +2137,7 @@ static int role(const char *name) {
     if (strncmp(name, "channels_", 9) == 0) return channel_child(name);
     if (strcmp(name, "steps") == 0) return steps_run();
 #if CHANGE_STEPS
+    if (strcmp(name, "bounds-fill") == 0) return files_bounds_fill(-2);
     if (strcmp(name, "volley") == 0) return vz_child();
     if (strcmp(name, "gonechild") == 0) return files_gone_child(atoi(argv_seen[2]));
 #endif

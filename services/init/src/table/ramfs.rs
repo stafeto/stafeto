@@ -485,6 +485,16 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
         quota: STEPS_QUOTA,
         ..POSIX
     },
+    // An initial process has its own expenditure root for 500-name publication.
+    Record {
+        name: "names-rival",
+        program: "posix-procs",
+        args: b"posix-procs\0bounds-fill\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        root: false,
+        quota: STEPS_QUOTA,
+        ..POSIX
+    },
     super::entropy::RNG,
     super::entropy::ENTROPY,
 ];

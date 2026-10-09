@@ -332,7 +332,7 @@ impl Preparation {
                 for i in 0..3 {
                     if self.dentry_needed(i) && self.reserves.dentries[i].is_none() {
                         self.reserves.dentries[i] =
-                            Some(storage.namespace_reserve_dentry(self.charge, i == 2)?);
+                            Some(storage.namespace_reserve_dentry(self.charge)?);
                         return Ok(false);
                     }
                 }
@@ -409,14 +409,23 @@ impl Preparation {
                 return Err(STALE_PROOF);
             }
         }
-        // A name that moves to another directory takes a new cookie.
-        if self.intent == NamespaceIntent::Rename
+        let replacement = self.intent == NamespaceIntent::Rename && self.edges[1].target.is_some();
+        let keeps_place = self.intent == NamespaceIntent::Rename
             && matches!(self.edges[0].location, Location::Dynamic(_))
-            && self.edges[0].parent != self.edges[1].parent
-            && storage.state.next_cookie >= i64::MAX as u64
-        {
-            return Err(NO_SPACE);
-        }
+            && self.edges[0].parent == self.edges[1].parent
+            && !replacement;
+        let cookie = if replacement {
+            let index = match self.edges[1].location {
+                Location::Original(i) => i as usize,
+                Location::Dynamic(i) => storage.state.original_len + i as usize,
+                _ => unreachable!("proved replacement"),
+            };
+            Some(storage.entry_cookie(index))
+        } else if self.has_destination() && !keeps_place {
+            Some(storage.next_directory_cookie()?)
+        } else {
+            None
+        };
         // Every fallible check and resource payment precedes this publication.
         for i in 0..2 {
             if let Some(held) = self.reserves.overlays[i].take() {
@@ -441,9 +450,33 @@ impl Preparation {
                 self.intent != NamespaceIntent::Rename,
             );
         }
-        if self.intent == NamespaceIntent::Rename && self.edges[1].target.is_some() {
-            storage.namespace_remove_edge(self.edges[1], self.reserves.dentries[1].take(), true);
+        // Detach the source before capturing the destination's neighbours:
+        // source and destination can be adjacent in either direction.
+        if self.intent == NamespaceIntent::Rename
+            && let Location::Dynamic(slot) = self.edges[0].location
+        {
+            let entry = storage.state.original_len + slot as usize;
+            if keeps_place {
+                storage.chain_remove(entry);
+            } else {
+                storage.unpublish(entry);
+            }
         }
+        let position = if replacement {
+            let entry = match self.edges[1].location {
+                Location::Original(i) => i as usize,
+                Location::Dynamic(i) => storage.state.original_len + i as usize,
+                _ => unreachable!("proved replacement"),
+            };
+            let position = (
+                storage.state.child_prev[entry],
+                storage.state.child_next[entry],
+            );
+            storage.namespace_remove_edge(self.edges[1], self.reserves.dentries[1].take(), true);
+            Some(position)
+        } else {
+            None
+        };
         if self.has_destination() {
             let slot = if self.intent == NamespaceIntent::Rename
                 && let Location::Dynamic(slot) = self.edges[0].location
@@ -453,24 +486,6 @@ impl Preparation {
                 self.reserves.dentries[2].take().expect("paid new name")
             };
             let entry = storage.state.original_len + slot as usize;
-            // A published name that moves keeps its row. In the same directory
-            // it keeps its place in the listing; in another directory it takes
-            // a new place at the end, with a new cookie.
-            let published = storage.state.dentries[slot as usize].len != 0;
-            let moves =
-                published && storage.state.dentries[slot as usize].parent != self.edges[1].parent;
-            if published {
-                if moves {
-                    storage.unpublish(entry);
-                } else {
-                    storage.chain_remove(entry);
-                }
-            }
-            let cookie = moves.then(|| {
-                storage
-                    .next_directory_cookie()
-                    .expect("checked before publication")
-            });
             let d = &mut storage.state.dentries[slot as usize];
             d.parent = self.edges[1].parent;
             d.node = source;
@@ -480,8 +495,10 @@ impl Preparation {
             if let Some(cookie) = cookie {
                 d.cookie = cookie;
             }
-            if published && !moves {
+            if keeps_place {
                 storage.chain_insert(entry);
+            } else if let Some((after, next)) = position {
+                storage.publish_at(entry, after, next);
             } else {
                 storage.publish(entry);
             }
@@ -597,24 +614,18 @@ impl Storage<'_> {
             Err(STALE_PROOF)
         }
     }
-    fn namespace_reserve_dentry(&mut self, charge: u16, visible: bool) -> Result<u16, u32> {
+    fn namespace_reserve_dentry(&mut self, charge: u16) -> Result<u16, u32> {
         let a = self.state.accounts[charge as usize]
             .as_ref()
             .ok_or(INVALID_ARGUMENT)?;
         if self.state.dentry_len == 0 || a.usage.dentries == DENTRY_SHARE {
             return Err(NO_SPACE);
         }
-        let cookie = if visible {
-            self.next_directory_cookie()?
-        } else {
-            0
-        };
         self.state.dentry_len -= 1;
         let i = self.state.dentry_free[self.state.dentry_len];
         self.state.dentries[i as usize] = Dentry {
             root: charge,
             reserved: true,
-            cookie,
             ..Dentry::EMPTY
         };
         self.state.accounts[charge as usize]

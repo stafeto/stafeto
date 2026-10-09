@@ -3772,6 +3772,7 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     // into a table of 127 jobs with two paths of 511 bytes and a descriptor
     // for a base, and the restart after a stale proof at the commit of a
     // rename of a directory over an empty one.
+    find("names bounds commit after 500 rival names: 0 restarts")?;
     find("names bounds ok")?;
     Ok(shown.iter().map(|line| (*line).clone()).collect())
 }
@@ -6937,6 +6938,7 @@ mod tests {
             "posix-procs: names volley in directories: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 12, the most restarts of one rename 2, the longest rename 25107135 ticks, 177424279 ticks",
             "posix-procs: names volley ok",
             "posix-procs: names gone ok",
+            "posix-procs: names bounds commit after 500 rival names: 0 restarts",
             "posix-procs: names bounds ok",
         ]
         .iter()

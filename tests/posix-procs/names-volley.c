@@ -715,3 +715,53 @@ static int names_volley(void) {
     printf("posix-procs: names volley ok\n");
     return 0;
 }
+
+/* The parent slot used by the service's name hash is exposed by st_ino. */
+static unsigned vz_name_bucket(unsigned slot, const char *name) {
+    unsigned hash = 0x811c9dc5u ^ slot;
+    for (; *name; name++) hash = (hash ^ (unsigned char)*name) * 0x01000193u;
+    return (hash ^ (hash >> 15)) & 2047u;
+}
+
+/* A second root waits for the gate before publishing its 250 names. */
+int files_bounds_fill(int stage) {
+    if (stage == -2) {
+        while (access("/tmp/bp-go", F_OK)) pause_ms(1);
+    }
+    struct stat st;
+    if (stat("/tmp/bp", &st)) return 1;
+    unsigned slot = (unsigned)st.st_ino - 1u;
+    unsigned wanted = vz_name_bucket(slot, "pending");
+    if (stage == -1) {
+        int fd = open("/tmp/bp/target", O_WRONLY | O_CREAT, 0600);
+        if (fd < 0 || close(fd) || chmod("/tmp/bp", 0777)) return 2;
+        return 0;
+    }
+    if (stage == 0) {
+        int fd = open("/tmp/bp-go", O_WRONLY | O_CREAT, 0600);
+        if (fd < 0 || close(fd)) return 8;
+    }
+    int begin = stage == 0 ? 250 : 0;
+    int end = stage == -2 ? 250 : 500;
+    int made = 0;
+    for (unsigned i = 0; made < end; i++) {
+        char leaf[40], path[64];
+        snprintf(leaf, sizeof leaf, "late%u", i);
+        if (vz_name_bucket(slot, leaf) == wanted) continue;
+        if (made++ < begin) continue;
+        snprintf(path, sizeof path, "/tmp/bp/%s", leaf);
+        if (stage == 1 ? unlink(path) : link("/tmp/bp/target", path)) {
+            printf("posix-procs: bounds: name %d stage %d errno %d\n", made, stage, errno);
+            return 4;
+        }
+    }
+    if (stage == 0) {
+        while (access("/tmp/bp-done", F_OK)) pause_ms(1);
+        if (unlink("/tmp/bp-done")) return 5;
+    } else if (stage == 1 && (unlink("/tmp/bp/target") || unlink("/tmp/bp-go"))) return 6;
+    else if (stage == -2) {
+        int fd = open("/tmp/bp-done", O_WRONLY | O_CREAT, 0600);
+        if (fd < 0 || close(fd)) return 9;
+    }
+    return 0;
+}
