@@ -367,12 +367,17 @@ impl ChangeJob {
         second: Option<&mut Resolve>,
     ) {
         self.cancel_work(ram, charge);
-        let _ = self.first.rewind(&mut ram.storage, identity);
+        // A refused rewind leaves a pin held, like a refused cancel step:
+        // it is counted and stops a debug build.
+        let mut refused = self.first.rewind(&mut ram.storage, identity).is_err();
         if let Some(second) = second {
-            let _ = second.rewind(&mut ram.storage, identity);
+            refused |= second.rewind(&mut ram.storage, identity).is_err();
             self.seen = self.resolver_restarts(Some(second));
         } else {
             self.seen = self.resolver_restarts(None);
+        }
+        if refused {
+            ram.refused_cancel();
         }
         self.stage = Stage::Resolve;
         self.restarts = self.restarts.saturating_add(1);
