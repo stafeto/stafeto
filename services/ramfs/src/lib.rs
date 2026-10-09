@@ -488,6 +488,9 @@ pub struct Ram<'a> {
     descriptions: [Option<Shared>; DESCRIPTIONS],
     description_generations: [u64; DESCRIPTIONS],
     tree: Option<Tree<'a>>,
+    /// The steps of a cancel that were refused or did not end; the service
+    /// prints the count when it moves.
+    pub cancel_refusals: u32,
 }
 
 #[cfg(test)]
@@ -532,7 +535,15 @@ impl<'a> Ram<'a> {
             descriptions: [None; DESCRIPTIONS],
             description_generations: [0; DESCRIPTIONS],
             tree,
+            cancel_refusals: 0,
         }
+    }
+
+    /// A cancel left something held. A debug build and the host tests stop
+    /// here; any build counts it.
+    pub fn refused_cancel(&mut self) {
+        self.cancel_refusals = self.cancel_refusals.saturating_add(1);
+        debug_assert!(false, "a step of a cancel was refused");
     }
 
     fn token(&self, file: File) -> Token {

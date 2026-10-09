@@ -178,6 +178,7 @@ fn main(_: u64) -> u64 {
         data_gc_turn: false,
         orphan_cursor: 0,
         orphan_count: 0,
+        cancel_reported: 0,
     };
     // Prepare the authentic notary page after publishing the RAM endpoint.
     // Standalone boot profiles may have no Process service.
@@ -226,6 +227,8 @@ struct Fs {
     data_gc_turn: bool,
     orphan_cursor: u8,
     orphan_count: u16,
+    /// The refused steps of a cancel the service has printed so far.
+    cancel_reported: u32,
 }
 
 /// The clones the service keeps alive at most: one for each record of the
@@ -1051,6 +1054,13 @@ impl Service<0> for Fs {
             return;
         }
         rt::service::step_own();
+        if self.ram.cancel_refusals != self.cancel_reported {
+            self.cancel_reported = self.ram.cancel_refusals;
+            rt::println!(
+                "ramfs: {} steps of a cancel were refused",
+                self.cancel_reported
+            );
+        }
         let now = rt::time::ticks_to_ns(rt::time::now());
         if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
             self.next_audit_ns = now.saturating_add(250_000_000);

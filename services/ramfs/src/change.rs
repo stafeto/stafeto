@@ -151,6 +151,19 @@ fn anchor(ram: &Ram<'_>, fds: &Fds, base: Base, relative: bool) -> Result<Token,
     }
 }
 
+/// Runs the steps of a cancel until one says it is done: true when it
+/// ended within the bound, false when a step was refused or the bound passed.
+fn drain(mut step: impl FnMut() -> Result<bool, u32>) -> bool {
+    for _ in 0..64 {
+        match step() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 fn timestamp(seconds: u64, nanos: u64) -> TimeSetting {
     match nanos {
         TIME_NOW => TimeSetting::Now,
@@ -733,31 +746,19 @@ impl ChangeJob {
     }
 
     fn cancel_work(&mut self, ram: &mut Ram<'_>, charge: &mut u16) {
-        match core::mem::replace(&mut self.work, Work::None) {
-            Work::None => {}
-            Work::Namespace(mut prep) => {
-                for _ in 0..64 {
-                    if prep.cancel_step(&mut ram.storage).unwrap_or(true) {
-                        break;
-                    }
-                }
-            }
-            Work::Create(mut journal) => {
-                let _ = journal.cancel_step(&mut ram.storage, charge);
-            }
-            Work::ReadLink(mut journal) => {
-                let _ = journal.cancel_step(&mut ram.storage);
-            }
-            Work::Metadata(mut journal) => {
-                let _ = journal.cancel_step(ram);
-            }
-            Work::Path(mut journal) => {
-                for _ in 0..64 {
-                    if journal.cancel_step(&mut ram.storage).unwrap_or(true) {
-                        break;
-                    }
-                }
-            }
+        // A cancel step that is refused or does not end leaves a pin or a
+        // reservation held until the service restarts. It cannot happen on
+        // a consistent store, so it is counted and stops a debug build.
+        let refused = match core::mem::replace(&mut self.work, Work::None) {
+            Work::None => false,
+            Work::Namespace(mut prep) => !drain(|| prep.cancel_step(&mut ram.storage)),
+            Work::Create(mut journal) => journal.cancel_step(&mut ram.storage, charge).is_err(),
+            Work::ReadLink(mut journal) => journal.cancel_step(&mut ram.storage).is_err(),
+            Work::Metadata(mut journal) => journal.cancel_step(ram).is_err(),
+            Work::Path(mut journal) => !drain(|| journal.cancel_step(&mut ram.storage)),
+        };
+        if refused {
+            ram.refused_cancel();
         }
     }
 

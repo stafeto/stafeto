@@ -294,6 +294,7 @@ impl Env {
     }
     /// Nothing is paid, pinned or staged any more.
     fn assert_quiet(&mut self) {
+        assert_eq!(self.ram.cancel_refusals, 0, "a cancel step was refused");
         assert_eq!(self.ram.storage.preparations_used(), 0);
         assert!(self.jobs.iter().all(Option::is_none));
         assert!(self.seconds.is_clear());
@@ -1726,6 +1727,39 @@ fn release_gives_back_a_prepared_rename_over_a_directory_in_one_call() {
     env.assert_quiet();
     assert_eq!(env.lookup(b"/etc"), Ok(etc));
     assert_eq!(env.lookup(b"/dst"), Ok(tmp));
+}
+
+#[test]
+#[should_panic(expected = "a step of a cancel was refused")]
+fn a_refused_step_of_a_cancel_stops_a_debug_build_and_is_counted() {
+    let mut env = Env::new();
+    let mut fds = session();
+    env.node(ROOT, b"dst", DIR, 0o755);
+    let start = ChangeStart {
+        key: key(6, 1),
+        ..op(ChangeOp::Rename, b"/etc")
+    };
+    env.start(&mut fds, OWNER, &start).unwrap();
+    env.second(&fds, OWNER, start.key, Base::Absolute, b"/dst")
+        .unwrap();
+    let phase = |env: &Env| match &env.jobs.iter().flatten().next().unwrap().operation {
+        JobOperation::Change(change) => change.phase(),
+        _ => unreachable!(),
+    };
+    while phase(&env) != ChangePhase::Ready {
+        env.step(&fds, OWNER, start.key).unwrap();
+    }
+    // Something else lets go of the pins held on /etc: the cancel of the
+    // job finds them gone.
+    let etc = env.lookup(b"/etc").unwrap();
+    let pending = env.ram.storage.node(etc).unwrap().pins[crate::storage::Pin::Pending as usize];
+    for _ in 0..pending {
+        env.ram
+            .storage
+            .unpin(etc, crate::storage::Pin::Pending)
+            .unwrap();
+    }
+    let _ = env.release(&mut fds, OWNER, start.key);
 }
 
 #[test]
