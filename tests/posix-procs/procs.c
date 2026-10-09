@@ -769,8 +769,12 @@ static int exec_spawning(void) {
 #endif
 #define STEPS_LEAVES 31
 
+#ifndef STEPS_SESSIONS
+#define STEPS_SESSIONS 0
+#endif
 #if CHANGE_STEPS
 extern int files_change_stages(void);
+extern int files_closed_sessions(int count);
 #endif
 #if NAMES_PROBE
 extern int files_names_pipe(void);
@@ -1032,6 +1036,13 @@ static int steps_run(void) {
     int change = files_change_stages();
     if (change) {
         printf("posix-procs: steps: Change stages failed %d\n", change);
+        failed++;
+    }
+    /* Identity sessions cloned and closed before the exec steps: the ends
+     * they leave in the channel are taken by the thread of the process
+     * service's ends, so the exec steps stay as long as with one. */
+    if (files_closed_sessions(STEPS_SESSIONS) != 0) {
+        printf("posix-procs: steps: closing %d sessions failed\n", STEPS_SESSIONS);
         failed++;
     }
 #endif

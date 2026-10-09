@@ -3351,10 +3351,18 @@ const RAM_STEP_MAX: u64 = TERM_B;
 /// largest of four runs at the head of E1 with 4 and with 7 branches
 /// (53,772 and 55,793: the pin of relibc a5adc5f8, a table entry in
 /// `sysconf`, moved the 7-branch figure up from 54,610 at 30f48fe7).
-/// ExecStart with 7 branches is 52,825 since the probe runs the raw change
-/// jobs among the crowd: the identity session it clones and closes leaves
-/// an end in the channel, which the next exec drains (50,778 with the
-/// same program and no such call). The
+/// ExecStart with 7 branches is 52,895 (the largest of the runs at
+/// a604c161; 52,562 at the head of E3-1 part 1) since the probe runs the
+/// raw change jobs among the crowd. No step of the loop drains the closed
+/// ends of the identity sessions the probe clones: the thread `ends::taker`
+/// of services/process/src/ends.rs receives them one at a time, each a
+/// bounded call. The run with STEPS_SESSIONS (identity sessions cloned and
+/// closed before the exec steps, beside the one of the change stages)
+/// shows it: 1, 8 and 32 closed sessions give ExecStart 50,888, 50,670
+/// and 50,491, so the step does not grow with their number. The same
+/// source with one more call that does nothing (0 sessions) gives 50,888
+/// where the head gives 52,562: the figure moves by about 1,700 with the
+/// layout of the code. The
 /// margin covers what moves between builds: the layout of the code and the processes of the
 /// level above that run in the middle of a step (SpawnStart was 92,262 and
 /// 93,009 at 4e9abf5 and 92,369 at d7743c9 with the same source of the
@@ -3371,7 +3379,7 @@ const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64, u64); 4] = [
         28,
         "ExecStart",
         51_039 + NOISE_MARGIN,
-        52_825 + NOISE_MARGIN,
+        52_895 + NOISE_MARGIN,
     ),
     (
         34,

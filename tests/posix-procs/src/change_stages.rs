@@ -813,3 +813,20 @@ pub extern "C" fn files_change_stages() -> i32 {
         .err()
         .unwrap_or(0)
 }
+
+/// Clones `count` identity sessions of the bound one and closes each: every
+/// close leaves an end in the identity channel of the process service.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_closed_sessions(count: i32) -> i32 {
+    let Ok(raw) = posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
+        return 90;
+    };
+    let original =
+        core::mem::ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+    for _ in 0..count {
+        if super::open_stages::clone_bound(&original, &[]).is_err() {
+            return 91;
+        }
+    }
+    0
+}
