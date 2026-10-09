@@ -970,6 +970,93 @@ static int names_mkdtemp(void) {
     return 0;
 }
 
+static long long names_realtime(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    return names_ns(now);
+}
+
+/* The times of the two families of methods order together: the older
+ * methods (open with creation, write, read, readdir) and the operations of
+ * Change and Data (chmod, utimensat, ftruncate) read the same calendar
+ * clock. A program such as make compares the times of different files, and
+ * a creation must not come after a later chmod. */
+static int names_clocks(void) {
+    struct stat st;
+    long long before, after, created, changed, first, second;
+
+    /* The creation, then chmod: the change time of the creation is no later. */
+    before = names_realtime();
+    int fd = open(NAMES_ROOT "/k1", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0);
+    after = names_realtime();
+    OK(fstat(fd, &st));
+    created = names_ns(st.st_ctim);
+    CHECK(before <= created && created <= after);
+    CHECK(names_ns(st.st_mtim) >= before && names_ns(st.st_mtim) <= after);
+    CHECK(close(fd) == 0);
+    names_pause();
+    before = names_realtime();
+    OK(chmod(NAMES_ROOT "/k1", 0600));
+    after = names_realtime();
+    OK(stat(NAMES_ROOT "/k1", &st));
+    changed = names_ns(st.st_ctim);
+    CHECK(created < changed);
+    CHECK(before <= changed && changed <= after);
+
+    /* A write of an older method, then a truncate of a Data job on another
+     * file: the later one has the later modification time. */
+    CHECK(names_put(NAMES_ROOT "/k2", "0123456789") == 0);
+    CHECK(names_put(NAMES_ROOT "/k3", "0123456789") == 0);
+    names_pause();
+    before = names_realtime();
+    fd = open(NAMES_ROOT "/k2", O_WRONLY);
+    CHECK(fd >= 0 && write(fd, "x", 1) == 1 && close(fd) == 0);
+    after = names_realtime();
+    OK(stat(NAMES_ROOT "/k2", &st));
+    first = names_ns(st.st_mtim);
+    CHECK(before <= first && first <= after);
+    names_pause();
+    OK(truncate(NAMES_ROOT "/k3", 4));
+    OK(stat(NAMES_ROOT "/k3", &st));
+    second = names_ns(st.st_mtim);
+    CHECK(first < second);
+    CHECK(second <= names_realtime());
+
+    /* The other way round: the truncate first, then the write. */
+    names_pause();
+    OK(truncate(NAMES_ROOT "/k2", 3));
+    OK(stat(NAMES_ROOT "/k2", &st));
+    first = names_ns(st.st_mtim);
+    names_pause();
+    fd = open(NAMES_ROOT "/k3", O_WRONLY);
+    CHECK(fd >= 0 && write(fd, "y", 1) == 1 && close(fd) == 0);
+    OK(stat(NAMES_ROOT "/k3", &st));
+    second = names_ns(st.st_mtim);
+    CHECK(first < second);
+
+    /* utimensat with the time of now (Change) against a read (an older
+     * method sets the access time). */
+    names_pause();
+    struct timespec now_times[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
+    OK(utimensat(AT_FDCWD, NAMES_ROOT "/k2", now_times, 0));
+    OK(stat(NAMES_ROOT "/k2", &st));
+    first = names_ns(st.st_mtim);
+    names_pause();
+    char byte;
+    fd = open(NAMES_ROOT "/k3", O_RDONLY);
+    CHECK(fd >= 0 && read(fd, &byte, 1) == 1 && close(fd) == 0);
+    OK(stat(NAMES_ROOT "/k3", &st));
+    second = names_ns(st.st_atim);
+    CHECK(first < second);
+    CHECK(second <= names_realtime());
+
+    OK(unlink(NAMES_ROOT "/k1"));
+    OK(unlink(NAMES_ROOT "/k2"));
+    OK(unlink(NAMES_ROOT "/k3"));
+    return 0;
+}
+
 static int names_all(void) {
     umask(022);
     OK(mkdir(NAMES_ROOT, 0777));
@@ -994,6 +1081,7 @@ static int names_all(void) {
         {"limits of the links", names_limits},
         {"remove and the sticky bit", names_remove_sticky},
         {"mkdtemp", names_mkdtemp},
+        {"times of the two families of methods", names_clocks},
     };
     for (unsigned i = 0; i < sizeof sections / sizeof sections[0]; i++) {
         int failed = sections[i].run();

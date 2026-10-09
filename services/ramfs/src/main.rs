@@ -1504,7 +1504,7 @@ impl Service<0> for Fs {
                     &mut s.data,
                     fd,
                     &mut bytes[..count as usize],
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
+                    self.time_source.now(),
                 ) {
                     Ok(n) => {
                         let w = r.reply();
@@ -1533,7 +1533,7 @@ impl Service<0> for Fs {
                     fd,
                     offset,
                     &mut bytes[..count as usize],
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
+                    self.time_source.now(),
                 ) {
                     Ok(n) => {
                         let w = r.reply();
@@ -1563,7 +1563,7 @@ impl Service<0> for Fs {
                     &mut s.data,
                     fd,
                     bytes,
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
+                    self.time_source.now(),
                 ) {
                     Ok(n) => value(r, n as u32),
                     Err(code) => status(code),
@@ -1581,7 +1581,7 @@ impl Service<0> for Fs {
                     fd,
                     offset,
                     bytes,
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
+                    self.time_source.now(),
                 ) {
                     Ok(n) => value(r, n as u32),
                     Err(code) => status(code),
@@ -1716,7 +1716,7 @@ impl Service<0> for Fs {
                     token,
                     index,
                     identity,
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
+                    self.time_source.now(),
                 );
                 self.cancel_job(job, r.label(), Some(&mut s.data));
                 match found {
@@ -1745,7 +1745,7 @@ impl Service<0> for Fs {
                 match self.ram.directory_read(
                     &mut s.data,
                     fd,
-                    proto_fs::Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now())),
+                    self.time_source.now(),
                 ) {
                     Ok(entry) => {
                         let entry = entry.map(|entry| proto_fs::DirectoryEntry {
@@ -3710,15 +3710,8 @@ impl Fs {
         {
             return Answer::Status(Status::BadSize);
         }
-        let now = rt::time::ticks_to_ns(rt::time::now());
-        match open.commit(
-            &mut self.ram,
-            fds,
-            proof,
-            identity,
-            &mut j.root,
-            proto_fs::Timestamp::legacy_ns(now),
-        ) {
+        let now = self.time_source.now();
+        match open.commit(&mut self.ram, fds, proof, identity, &mut j.root, now) {
             Ok(committed) => {
                 debug_assert_eq!(committed, held);
                 Answer::Reply(Outgoing::new())
