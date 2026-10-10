@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod discipline;
+pub mod drain;
 pub mod endpoints;
 #[cfg(test)]
 mod fuzz;
@@ -81,6 +82,17 @@ impl Pump {
         driver: &mut D,
         writes: usize,
     ) -> Result<Pumped, D::Error> {
+        self.run_prefix(terminal, driver, writes, None)
+    }
+
+    /// Stop at a captured terminal prefix; later writes remain in the ring.
+    pub fn run_prefix<D: Driver>(
+        &mut self,
+        terminal: &mut Terminal,
+        driver: &mut D,
+        writes: usize,
+        target: Option<u64>,
+    ) -> Result<Pumped, D::Error> {
         for _ in 0..writes {
             if terminal.stopped() {
                 return Ok(Pumped::Idle);
@@ -89,7 +101,10 @@ impl Pump {
                 return Ok(Pumped::WaitsRoom);
             }
             let piece = terminal.output();
-            let piece = &piece[..piece.len().min(PIECE)];
+            let remaining = target.map_or(usize::MAX, |target| {
+                target.wrapping_sub(terminal.sent_total()) as usize
+            });
+            let piece = &piece[..piece.len().min(PIECE).min(remaining)];
             if piece.is_empty() {
                 return Ok(Pumped::Idle);
             }
@@ -101,11 +116,13 @@ impl Pump {
                 return Ok(Pumped::WaitsRoom);
             }
         }
-        Ok(if terminal.output_len() == 0 {
-            Pumped::Idle
-        } else {
-            Pumped::More
-        })
+        Ok(
+            if terminal.output_len() == 0 || target == Some(terminal.sent_total()) {
+                Pumped::Idle
+            } else {
+                Pumped::More
+            },
+        )
     }
 }
 
@@ -178,6 +195,10 @@ impl<const N: usize> Waiters<N> {
                 *place = None;
             }
         }
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Waiter> {
+        self.list.iter_mut().flatten()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Waiter> {
@@ -258,6 +279,29 @@ mod tests {
             self.armed = true;
             Ok(false)
         }
+    }
+
+    #[test]
+    fn pump_stops_at_captured_prefix_and_retains_later_writes() {
+        let mut terminal = Terminal::new();
+        terminal.write(b"before");
+        let target = terminal.output_target();
+        terminal.write(b"after");
+        let mut driver = Fake::new(100);
+        let mut pump = Pump::new();
+        assert_eq!(
+            pump.run_prefix(&mut terminal, &mut driver, 1, Some(target)),
+            Ok(Pumped::Idle)
+        );
+        assert_eq!(driver.ring, b"before");
+        assert_eq!(terminal.output(), b"after");
+        assert_eq!(
+            pump.run_prefix(&mut terminal, &mut driver, 1, Some(target)),
+            Ok(Pumped::Idle)
+        );
+        assert_eq!(driver.writes, 1);
+        assert_eq!(pump.run(&mut terminal, &mut driver, 1), Ok(Pumped::Idle));
+        assert_eq!(driver.ring, b"beforeafter");
     }
 
     /// A write to a terminal whose driver's ring is full waits for room

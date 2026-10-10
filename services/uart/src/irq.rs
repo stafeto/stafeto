@@ -60,6 +60,11 @@ impl Irq {
         self.imsc & TX != 0
     }
 
+    /// Whether an absolute transmit or physical-drain retry is held.
+    pub fn deferred(&self) -> bool {
+        self.tx_deadline != 0
+    }
+
     /// The most bytes a pass for `mis` reads from the receive FIFO into a
     /// ring with room for `room`: RX_PASS or the room, whichever is less;
     /// none when `mis` shows no input.

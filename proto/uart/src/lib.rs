@@ -57,6 +57,18 @@
 //! terminal kind (the terminal service) writes so and never waits for the
 //! port.
 //!
+//! DRAIN_START (13), DRAIN_TAKE (14), DRAIN_RELEASE (15): a nonzero full
+//! terminal operation key u64 follows the header. START captures the accepted
+//! client prefix in its existing ROOM record. TAKE observes that exact key;
+//! RELEASE removes it, retaining ROOM's handle. The reply is status 0 and
+//! ready u32 (0 or 1). Bit 1 of ROOM's existing notification announces ready.
+//! Later writers and new log batches cannot extend the captured prefix.
+//! DRAIN_STATE (19): header alone, the same reply, and no observer allocated;
+//! it tests immediate completion of all accepted client output. PL011 requires
+//! FIFO empty and shift register idle; Virtio requires its TX token returned
+//! through the used ring. These methods retain no RPC reply. Numbers 16–18
+//! remain available to the terminal measurement stand-in's existing methods.
+//!
 //! Number 4 belongs to TRACE, which comes with milestone 1.4e; 5 and 6
 //! (READ_CANCELABLE, CANCEL_READ of version 1) are retired.
 
@@ -66,7 +78,7 @@ use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
 /// The version of the protocol, in the header of each request.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// The number kept for TRACE (milestone 1.4e): no method of this version.
 pub const TRACE: u16 = 4;
@@ -94,10 +106,14 @@ pub enum Method {
     Clone = 10,
     WriteSome = 11,
     Room = 12,
+    DrainStart = 13,
+    DrainTake = 14,
+    DrainRelease = 15,
+    DrainState = 19,
 }
 
 impl Method {
-    pub const ALL: [Method; 9] = [
+    pub const ALL: [Method; 13] = [
         Method::Write,
         Method::Read,
         Method::Crash,
@@ -107,6 +123,10 @@ impl Method {
         Method::Clone,
         Method::WriteSome,
         Method::Room,
+        Method::DrainStart,
+        Method::DrainTake,
+        Method::DrainRelease,
+        Method::DrainState,
     ];
 
     pub const fn number(self) -> u16 {
@@ -293,6 +313,59 @@ impl ReadKey {
     }
 }
 
+/// A physical output observer in an existing ROOM, identified by its
+/// terminal operation's full key. Start captures the accepted client prefix;
+/// Take replays it; Release removes only that exact observation. Bit 1 of the
+/// existing ROOM notification announces physical completion, independently
+/// of bit 0 announcing software room. None of these requests retains a reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainKey {
+    pub key: u64,
+}
+
+impl DrainKey {
+    pub fn write(&self, method: Method, w: &mut Writer) -> Result<(), Status> {
+        if self.key == 0
+            || !matches!(
+                method,
+                Method::DrainStart | Method::DrainTake | Method::DrainRelease
+            )
+        {
+            return Err(Status::BadSize);
+        }
+        method.header().write(w)?;
+        w.u64(self.key)
+    }
+
+    pub fn read(body: Reader<'_>) -> Result<Self, Status> {
+        ReadKey::read(body).map(|request| Self { key: request.key })
+    }
+}
+
+/// Physical completion of the captured prefix, including the shift register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainReply {
+    pub ready: bool,
+}
+
+impl DrainReply {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(Status::Ok.code())?;
+        w.u32(u32::from(self.ready))
+    }
+
+    pub fn read(bytes: &[u8]) -> Result<Self, Status> {
+        let mut r = Reader::new(bytes);
+        let status = r.u32()?;
+        let ready = r.u32()?;
+        r.finish()?;
+        if status != Status::Ok.code() || ready > 1 {
+            return Err(Status::BadSize);
+        }
+        Ok(Self { ready: ready != 0 })
+    }
+}
+
 /// A reply to READ that is no refusal: the bytes that came, at least one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadReply<'a> {
@@ -332,10 +405,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn drain_wire_preserves_full_keys_and_rejects_malformed_outcomes() {
+        let key = DrainKey { key: u64::MAX };
+        for method in [Method::DrainStart, Method::DrainTake, Method::DrainRelease] {
+            let mut request = Writer::new();
+            key.write(method, &mut request).unwrap();
+            assert_eq!(
+                DrainKey::read(Reader::new(&request.as_bytes()[8..])),
+                Ok(key)
+            );
+        }
+        assert_eq!(
+            DrainKey { key: 0 }.write(Method::DrainStart, &mut Writer::new()),
+            Err(Status::BadSize)
+        );
+        assert_eq!(
+            key.write(Method::Room, &mut Writer::new()),
+            Err(Status::BadSize)
+        );
+        assert_eq!(DrainKey::read(Reader::new(&[1; 9])), Err(Status::BadSize));
+        assert_eq!(
+            DrainReply::read(&[0, 0, 0, 0, 2, 0, 0, 0]),
+            Err(Status::BadSize)
+        );
+        assert_eq!(DrainReply::read(&[0; 9]), Err(Status::BadSize));
+        assert_eq!(
+            DrainReply::read(&[1, 0, 0, 0, 0, 0, 0, 0]),
+            Err(Status::BadSize)
+        );
+        for ready in [false, true] {
+            let mut reply = Writer::new();
+            DrainReply { ready }.write(&mut reply).unwrap();
+            assert_eq!(DrainReply::read(reply.as_bytes()), Ok(DrainReply { ready }));
+        }
+    }
+
+    #[test]
     fn method_numbers_are_fixed() {
         assert_eq!(
             Method::ALL.map(Method::number),
-            [1, 2, 3, 7, 8, 9, 10, 11, 12]
+            [1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19]
         );
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
@@ -346,9 +455,9 @@ mod tests {
         assert_eq!(Method::from_number(0), None);
         assert_eq!(Method::from_number(5), None);
         assert_eq!(Method::from_number(6), None);
-        assert_eq!(VERSION, 2);
+        assert_eq!(VERSION, 3);
         assert_eq!((WRITE_MAX, READ_MAX), (1016, 1016));
-        assert_eq!(Method::Crash.header().bytes(), [3, 0, 2, 0, 0, 0, 0, 0]);
+        assert_eq!(Method::Crash.header().bytes(), [3, 0, 3, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -357,7 +466,7 @@ mod tests {
         ReadRequest { max: 2 }.write_start(&mut w).unwrap();
         assert_eq!(
             w.as_bytes(),
-            [7, 0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
+            [7, 0, 3, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
         );
         let key = ReadKey {
             key: 0x0807060504030201,
@@ -367,7 +476,7 @@ mod tests {
             key.write(method, &mut w).unwrap();
             assert_eq!(
                 w.as_bytes(),
-                [number, 0, 2, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]
+                [number, 0, 3, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]
             );
             assert_eq!(ReadKey::read(Reader::new(&w.as_bytes()[8..])), Ok(key));
         }

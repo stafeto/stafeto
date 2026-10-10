@@ -37,7 +37,8 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use proto_init::ServiceArgs;
 use proto_uart::{
-    Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION, WriteReply, WriteRequest,
+    DrainKey, DrainReply, Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION, WriteReply,
+    WriteRequest,
 };
 use proto_wire::{Status, Writer, long};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
@@ -496,6 +497,7 @@ impl Driver {
     /// waits for the host: the interrupt that shows the buffer used starts
     /// the next transmission (`interrupt`).
     fn kick(&mut self) {
+        self.refresh_drain();
         let State {
             output,
             writes,
@@ -517,6 +519,19 @@ impl Driver {
             // A client that went closed it: nothing to tell then.
             let _ = sys::notify(notify, 1);
         });
+        self.refresh_drain();
+    }
+
+    /// The fixed prefix completes only after the existing TX token returned.
+    fn refresh_drain(&mut self) {
+        let State { output, rooms, .. } = &mut *self.state;
+        output.fence(rooms.drain_target(output.submitted()));
+        if output.at_fence() && !self.port.sending() {
+            rooms.drain_complete(output.submitted(), |notify| {
+                let _ = sys::notify(notify, 2);
+            });
+            output.fence(rooms.drain_target(output.submitted()));
+        }
     }
 
     /// Takes the input the device holds into the ring while it has room,
@@ -573,7 +588,7 @@ impl Driver {
             let State {
                 output, records, ..
             } = &mut *self.state;
-            if !output.log_done() {
+            if !output.log_done() || !output.accepts_log() {
                 return;
             }
             let Ok(batch) = sys::log_take(&self.log, records) else {
@@ -621,6 +636,56 @@ impl Driver {
     }
 
     /// WRITE_SOME (5f), as the PL011's driver answers it.
+    /// Observe only an existing paid ROOM and a full terminal operation key.
+    fn drain(&mut self, r: &mut Request<'_>) -> Answer {
+        if Method::from_number(r.method()) == Some(Method::DrainState) {
+            if r.body().finish().is_err() || !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let ready = self.state.output.clients_empty()
+                && self.state.writes.is_empty()
+                && !self.port.sending();
+            return match (DrainReply { ready }).write(r.reply()) {
+                Ok(()) => Answer::Reply(Outgoing::new()),
+                Err(status) => Answer::Status(status),
+            };
+        }
+        let key = match DrainKey::read(r.body()) {
+            Ok(request) if r.handles.is_empty() => request.key,
+            Ok(_) => return Answer::Status(Status::BadSize),
+            Err(status) => return Answer::Status(status),
+        };
+        let label = r.label();
+        let method = Method::from_number(r.method());
+        let State {
+            output,
+            writes,
+            rooms,
+            ..
+        } = &mut *self.state;
+        let ready = match method {
+            Some(Method::DrainStart) => rooms.drain_begin(
+                label,
+                key,
+                output.target().wrapping_add(writes.queued_bytes() as u64),
+            ),
+            Some(Method::DrainTake) => rooms.drain(label, key),
+            Some(Method::DrainRelease) => rooms.drain_release(label, key).then_some(false),
+            _ => None,
+        };
+        let Some(mut ready) = ready else {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        };
+        self.kick();
+        if method != Some(Method::DrainRelease) {
+            ready = self.state.rooms.drain(label, key).unwrap_or(ready);
+        }
+        match (DrainReply { ready }).write(r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
     fn write_some(&mut self, r: &mut Request<'_>) -> Answer {
         let bytes = match WriteRequest::read(r.body()) {
             Ok(request) => request.bytes,
@@ -765,6 +830,10 @@ const METHODS: &[u16] = &[
     Method::ReadCancel.number(),
     Method::WriteSome.number(),
     Method::Room.number(),
+    Method::DrainStart.number(),
+    Method::DrainTake.number(),
+    Method::DrainRelease.number(),
+    Method::DrainState.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -776,6 +845,10 @@ const METHODS: &[u16] = &[
     Method::ReadCancel.number(),
     Method::WriteSome.number(),
     Method::Room.number(),
+    Method::DrainStart.number(),
+    Method::DrainTake.number(),
+    Method::DrainRelease.number(),
+    Method::DrainState.number(),
 ];
 
 #[cfg(feature = "crash")]
@@ -813,6 +886,9 @@ impl Service<HELD> for Driver {
             Some(Method::ReadCancel) => self.read_take(r, true),
             Some(Method::WriteSome) => self.write_some(r),
             Some(Method::Room) => self.room(r),
+            Some(
+                Method::DrainStart | Method::DrainTake | Method::DrainRelease | Method::DrainState,
+            ) => self.drain(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => {
                 self.drain();
@@ -825,14 +901,18 @@ impl Service<HELD> for Driver {
     fn gone(&mut self, s: &mut Session<(), HELD>) {
         let label = s.label();
         let State {
+            output,
             writes,
             input,
             rooms,
             ..
         } = &mut *self.state;
-        writes.gone(label, drop);
+        writes.gone_before(label, output.target(), drop, |start, len| {
+            rooms.drain_discard(output.submitted(), start, len);
+        });
         rooms.gone(label);
         drop(input.gone(label));
+        self.kick();
     }
 
     fn notification(&mut self, n: Notice) {
