@@ -3213,10 +3213,13 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
         return Err("the PID lifetime probe failed".into());
     }
     qemu::expect_marker(&outcome, "posix-procs: PID lifetime page ok")?;
-    qemu::expect_marker(
-        &outcome,
+    for marker in [
         "posix-procs: public nonblocking locks, canonical fields, PID close and OFD fork ok",
-    )?;
+        "posix-procs: public lock reply loss, exact keys, full GET receipt, numeric close and reuse ok ticks=",
+        "posix-procs: lock depth within 16 KiB, nested SIGUSR1 close, siglongjmp and thread departure ok",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
     qemu::expect_marker(
         &outcome,
         "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok",
