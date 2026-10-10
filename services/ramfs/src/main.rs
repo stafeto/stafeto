@@ -2760,6 +2760,21 @@ impl Fs {
             .expect("canonical WAIT before Notify retirement");
         self.refresh_wait_timer();
     }
+    /// Positive Proof already retained this exact registration through its gate.
+    fn publish_wait_registration(
+        &mut self,
+        registration: ramfs::locks::waiters::RegistrationToken,
+    ) {
+        self.wait_events
+            .detach(registration)
+            .expect("exact proved WAIT wake retirement");
+        self.wait_notify
+            .complete_registration(self.wait_jobs, self.wait_pool, registration, |handle| {
+                let _ = sys::notify(handle, 1);
+            })
+            .expect("canonical proved WAIT before exact Notify retirement");
+        self.refresh_wait_timer();
+    }
     fn wait_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if proto_fs::is_loaders(r.label()) {
             return status(proto_fs::PERMISSION);
@@ -3088,7 +3103,7 @@ impl Fs {
                 if let Some(snapshot) = self.wait_proof.probe_snapshot() {
                     self.ring_probe.proved(snapshot);
                 }
-                self.publish_wait(outcome.candidate);
+                self.publish_wait_registration(outcome.registration);
             }
             return;
         }
@@ -3160,28 +3175,9 @@ impl Fs {
         outcome: ramfs::locks::wait_proof::Outcome,
     ) -> bool {
         let id = outcome.candidate;
-        let Some(registration) = self.wait_pool.find(id) else {
-            return false;
-        };
-        if !self
-            .wait_pool
-            .snapshot(registration)
-            .is_ok_and(|(input, phase)| {
-                phase == ramfs::locks::waiters::Phase::Sleeping
-                    && input.root == outcome.captured.root
-                    && input.inode == outcome.captured.request.inode
-                    && input.range == outcome.captured.request.range
-                    && outcome.captured.request.command
-                        == ramfs::locks::actor::Command::Set(Some(input.kind))
-            })
-            || !self
-                .wait_jobs
-                .snapshot(id)
-                .is_ok_and(|(captured, phase, cancelling)| {
-                    captured == outcome.captured
-                        && phase == ramfs::locks::wait_receipts::Phase::Sleeping
-                        && !cancelling
-                })
+        if outcome
+            .sleeping_registration(self.wait_jobs, self.wait_pool)
+            .is_none()
         {
             return false;
         }
