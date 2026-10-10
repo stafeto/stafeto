@@ -567,7 +567,7 @@ impl Fs {
         if fds.departed && fds.wait_departure < 16 {
             let progress = ramfs::locks::wait_departure::part(
                 self.wait_jobs,
-                self.wait_pool,
+                (self.wait_pool, self.wait_events),
                 self.wait_notify,
                 self.ram,
                 (self.places.place(label), label),
