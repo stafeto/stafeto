@@ -13,6 +13,7 @@ pub mod allocation;
 pub mod change;
 pub mod clock;
 mod close_driver;
+mod drain_driver;
 #[cfg(feature = "close-probe")]
 pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;

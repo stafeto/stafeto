@@ -96,6 +96,7 @@ enum Kind {
     Change,
     Closing { prefer_wait: bool },
     Lock(LockRecovery),
+    Drain(super::drain::Recovery),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Recovery {
@@ -132,11 +133,33 @@ impl Recovery {
     pub fn lock(self) -> Option<LockRecovery> {
         match self.kind {
             Kind::Lock(lock) => Some(lock),
-            Kind::Change | Kind::Closing { .. } => None,
+            Kind::Change | Kind::Closing { .. } | Kind::Drain(_) => None,
         }
     }
     pub fn is_change(self) -> bool {
         matches!(self.kind, Kind::Change)
+    }
+    pub(crate) fn from_drain(frame: Frame, recovery: super::drain::Recovery) -> Self {
+        Self {
+            frame,
+            kind: Kind::Drain(recovery),
+        }
+    }
+    pub fn drain(self) -> Option<super::drain::Recovery> {
+        match self.kind {
+            Kind::Drain(recovery) => Some(recovery),
+            _ => None,
+        }
+    }
+    pub(crate) fn update_drain(
+        mut self,
+        recovery: super::drain::Recovery,
+    ) -> Result<Self, posix_fd::Error> {
+        if !matches!(self.kind, Kind::Drain(_)) {
+            return Err(posix_fd::Error::InvalidArgument);
+        }
+        self.kind = Kind::Drain(recovery);
+        Ok(self)
     }
     fn save_terminal(mut self, terminal: TerminalReply) -> Result<Self, posix_fd::Error> {
         let Kind::Lock(ref mut lock) = self.kind else {
@@ -155,6 +178,23 @@ impl Recovery {
 
 pub type Snapshot = ControlSnapshot<Recovery>;
 impl PosixFs {
+    /// A valid main-stack jump locally abandons exact owner frames, once.
+    /// Complete receipts survive; no transport or capability is touched here.
+    pub fn mark_control_jump(&mut self, owner: OwnerToken, target: Frame) {
+        let mut tokens = [None; posix_fd::JOBS_MAX];
+        for (index, token) in self.control_tokens().enumerate() {
+            tokens[index] = Some(token);
+        }
+        for token in tokens.into_iter().flatten() {
+            if let Ok(snapshot) = self.control_snapshot(token)
+                && snapshot.owner == Some(owner)
+                && nested(snapshot.recovery.frame(), target)
+            {
+                let _ = self.descriptors.abandon_control(token);
+            }
+        }
+    }
+
     pub fn control_tokens(&self) -> impl Iterator<Item = ControlToken> + '_ {
         self.descriptors.control_tokens()
     }

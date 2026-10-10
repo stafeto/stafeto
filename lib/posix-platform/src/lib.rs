@@ -29,7 +29,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 14;
+pub const PLATFORM_INTERFACE: u64 = 15;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -38,6 +38,13 @@ pub const PLATFORM_INTERFACE: u64 = 14;
 pub static STAFETO_PLATFORM_ABI: u64 = posix_thread::BLOCK_SIZE as u64
     | (posix_thread::BLOCK_OFFSET as u64) << 16
     | PLATFORM_INTERFACE << 32;
+
+/// Local custody mark before relibc restores a valid main-stack jump target.
+/// The caller holds one kernel entry deferral through the actual restoration.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_longjmp_mark_v1(target_sp: u64) {
+    posix_abi::shared::jump_mark(target_sp);
+}
 
 /// Runs one call of the layer on a thread with a block: its own, or
 /// before relibc attached the main thread (its start) a transient one

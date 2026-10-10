@@ -199,6 +199,18 @@ pub fn current() -> u64 {
     unsafe { posix_thread::block().as_ref() }.map_or(0, |block| block.thread_id)
 }
 
+/// Already published custody only; the jump callback cannot admit a native row.
+pub(crate) fn jump_owner() -> Option<u64> {
+    let pointer = posix_thread::block();
+    // SAFETY: installed TLS keeps this current thread's Block alive.
+    let block = unsafe { pointer.as_ref() }?;
+    let index = usize::try_from(block.thread_id).ok()?.checked_sub(1)?;
+    let place = TABLE.get(index)?;
+    (place.block.load(Ordering::Acquire) == pointer as usize)
+        .then(|| place.state.owner(index))
+        .flatten()
+}
+
 /// Fixed callbacks installed by shared initialization before its Ready state.
 static OPEN_DETACH: AtomicUsize = AtomicUsize::new(0);
 static OPEN_HELP: AtomicUsize = AtomicUsize::new(0);
