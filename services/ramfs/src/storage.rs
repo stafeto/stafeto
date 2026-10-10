@@ -188,7 +188,9 @@ pub enum Pin {
     Image,
     Pending,
     Parent,
+    Lock,
 }
+pub const PIN_KINDS: usize = 6;
 impl Pin {
     const fn index(self) -> usize {
         self as usize
@@ -210,7 +212,7 @@ pub struct Node {
     /// Shrinking never makes truncated boot bytes visible after a later extension.
     pub boot_visible_length: u64,
     pub times: [proto_fs::Timestamp; 3],
-    pub pins: [u16; 5],
+    pub pins: [u16; PIN_KINDS],
     /// The boot entry (canonical for regular hard links), or NONE for fixed nodes.
     pub boot: u16,
     overlay: u16,
@@ -240,7 +242,7 @@ impl Node {
         data_generation: 0,
         boot_visible_length: 0,
         times: [proto_fs::Timestamp::ZERO; 3],
-        pins: [0; 5],
+        pins: [0; PIN_KINDS],
         boot: NONE,
         overlay: NONE,
         reclaim: false,
@@ -1802,7 +1804,7 @@ impl<'a> Storage<'a> {
             gid,
             parent,
             overlay: i as u16,
-            pins: [0, 0, 0, 1, 0],
+            pins: [0, 0, 0, 1, 0, 0],
             ..Node::EMPTY
         };
         let entry = &mut self.state.dentries[d];

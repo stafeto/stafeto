@@ -136,5 +136,8 @@ fn full_root_description_account_refuses_image_before_pin_and_recovers_one_credi
         ram.release(fds);
     }
     assert_eq!(ram.storage.usage(EXPENSE).descriptions, 0);
-    assert_eq!(ram.storage.node(token).unwrap().pins, [0; 5]);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
 }

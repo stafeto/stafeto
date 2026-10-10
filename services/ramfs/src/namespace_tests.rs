@@ -156,7 +156,7 @@ fn run(
     ram.storage.check_name_index();
     result
 }
-fn pins(ram: &Ram<'_>) -> Vec<[u16; 5]> {
+fn pins(ram: &Ram<'_>) -> Vec<[u16; crate::storage::PIN_KINDS]> {
     ram.storage.state.nodes.iter().map(|n| n.pins).collect()
 }
 fn drain(ram: &mut Ram<'_>) -> usize {
@@ -869,9 +869,9 @@ fn native_role_mismatch_and_group_change_preserve_the_prepared_namespace() {
 }
 
 #[test]
-fn namespace_actual_layout_uses_the_existing_paid_job_and_node_padding() {
+fn namespace_actual_layout_keeps_paid_jobs_and_accounts_the_lock_pin() {
     assert_eq!(core::mem::size_of::<Preparation>(), 664);
-    assert_eq!(core::mem::size_of::<Node>(), 144);
+    assert_eq!(core::mem::size_of::<Node>(), 152);
     std::println!(
         "T4 actual layout: Preparation={} Node={} State={}",
         core::mem::size_of::<Preparation>(),

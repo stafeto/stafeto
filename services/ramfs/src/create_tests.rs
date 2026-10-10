@@ -104,7 +104,7 @@ fn finish(ram: &mut Ram<'_>, journal: &mut CreateJournal, r: Resolve, charge: &m
         assert!(steps <= PAGES + INODES);
     }
 }
-fn pins(ram: &Ram<'_>) -> std::vec::Vec<[u16; 5]> {
+fn pins(ram: &Ram<'_>) -> std::vec::Vec<[u16; crate::storage::PIN_KINDS]> {
     ram.storage.state.nodes.iter().map(|n| n.pins).collect()
 }
 fn read(ram: &mut Ram<'_>, path: &[u8], requested: usize, now: u64) -> (ReadLinkJournal, Resolve) {

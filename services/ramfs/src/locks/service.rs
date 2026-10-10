@@ -5,17 +5,19 @@
 
 use super::actor::{Actor, Command, Error, GroupEvent, Progress, Request};
 use super::{Owner, budget, groups::Id};
-use crate::storage::{LockAnchor, Root, Storage, Token};
+use crate::storage::{LockAnchor, Pin, Root, Storage, Token};
 pub const GROUPS: usize = 512;
 type Table = Actor<GROUPS, { crate::storage::NODES }, 256, 128, { crate::storage::ROOTS }, 256>;
 struct PaidGroup {
     id: Id,
     root: LockAnchor,
+    inode: Token,
 }
 pub struct LockService {
     actor: Table,
     groups: [Option<PaidGroup>; GROUPS],
     request_root: Option<LockAnchor>,
+    request_inode: Option<Token>,
 }
 impl LockService {
     /// Initialize every field directly in permanent aligned storage.
@@ -31,6 +33,7 @@ impl LockService {
                 groups.add(index).write(None);
             }
             core::ptr::addr_of_mut!((*destination).request_root).write(None);
+            core::ptr::addr_of_mut!((*destination).request_inode).write(None);
         }
     }
     pub fn busy(&self) -> bool {
@@ -56,6 +59,7 @@ impl LockService {
             return Err(Error::Busy);
         }
         assert!(self.request_root.is_none());
+        assert!(self.request_inode.is_none());
         request.root = 0;
         self.actor.validate_request(request)?;
         let anchor = if matches!(request.command, Command::Set(Some(_))) {
@@ -69,7 +73,18 @@ impl LockService {
         if let Some(anchor) = &anchor {
             request.root = anchor.index();
         }
+        if storage.pin(request.inode, Pin::Lock).is_err() {
+            if let Some(anchor) = anchor {
+                storage
+                    .release_lock_anchor(anchor)
+                    .expect("unstarted exact root");
+            }
+            return Err(Error::Invalid);
+        }
         if let Err(error) = self.actor.start(request) {
+            storage
+                .unpin(request.inode, Pin::Lock)
+                .expect("unadmitted exact inode");
             if let Some(anchor) = anchor {
                 storage
                     .release_lock_anchor(anchor)
@@ -78,6 +93,7 @@ impl LockService {
             return Err(error);
         }
         self.request_root = anchor;
+        self.request_inode = Some(request.inode);
         Ok(())
     }
     pub fn cancel(&mut self) -> bool {
@@ -108,11 +124,16 @@ impl LockService {
                 assert_eq!(request.index(), root);
                 let slot = &mut self.groups[id.slot()];
                 assert!(slot.is_none(), "previous full group lifetime released");
+                let inode = self.request_inode.expect("new group has an exact inode");
+                storage
+                    .pin(inode, Pin::Lock)
+                    .expect("bounded exact group inode");
                 *slot = Some(PaidGroup {
                     id,
                     root: storage
                         .retain_lock_anchor(request)
                         .expect("bounded group retention"),
+                    inode,
                 });
             }
             Some(GroupEvent::Released { id, root }) => {
@@ -120,17 +141,24 @@ impl LockService {
                 assert_eq!(group.id, id);
                 assert_eq!(group.root.index(), root);
                 storage
+                    .unpin(group.inode, Pin::Lock)
+                    .expect("exact group inode");
+                storage
                     .release_lock_anchor(group.root)
                     .expect("exact group payer");
             }
             None => {}
         }
-        if progress.completed.is_some()
-            && let Some(anchor) = self.request_root.take()
-        {
+        if progress.completed.is_some() {
+            let inode = self.request_inode.take().expect("completed request inode");
             storage
-                .release_lock_anchor(anchor)
-                .expect("completed request payer");
+                .unpin(inode, Pin::Lock)
+                .expect("completed exact inode");
+            if let Some(anchor) = self.request_root.take() {
+                storage
+                    .release_lock_anchor(anchor)
+                    .expect("completed request payer");
+            }
         }
         progress
     }
@@ -153,17 +181,40 @@ mod tests {
     fn root(id: u64, generation: u64) -> Root {
         Root { id, generation }
     }
-    fn request(node: u16, pid: u32, command: Command, start: i64, len: i64) -> Request {
+    fn request(inode: Token, pid: u32, command: Command, start: i64, len: i64) -> Request {
         Request {
-            inode: Token {
-                slot: node,
-                generation: 1,
-            },
+            inode,
             owner: Owner::Process(pid),
             root: u16::MAX,
             range: Range::relative(0, start, len).unwrap(),
             command,
         }
+    }
+    fn fixture() -> (crate::Ram<'static>, [Token; 9]) {
+        let paths: std::vec::Vec<_> = (0..9).map(|i| std::format!("/lock{i}")).collect();
+        let entries: std::vec::Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| bootimg::rootfs::Entry {
+                path,
+                mode: bootimg::rootfs::REGULAR | 0o600,
+                uid: 0,
+                gid: 0,
+                file: (i + 1) as u32,
+            })
+            .collect();
+        let table = bootimg::rootfs::write::rootfs(&entries, 11).unwrap();
+        let mut files = std::vec![("init", &b"init"[..])];
+        for path in &paths {
+            files.push((path.as_str(), &b"x"[..]));
+        }
+        files.push(("rootfs", &table));
+        let bytes = Box::leak(bootimg::write::image(&files).unwrap().into_boxed_slice());
+        let index = Box::leak(Box::new(crate::tree::Index::new()));
+        let tree = crate::tree::load(bytes, index).unwrap();
+        let ram = crate::Ram::with_tree(proto_fs::Timestamp::ZERO, tree);
+        let inodes = core::array::from_fn(|i| ram.storage.resolve(paths[i].as_bytes()).unwrap());
+        (ram, inodes)
     }
     fn page() -> proto_process::lifetimes::Page {
         let page = proto_process::lifetimes::Page::new();
@@ -182,6 +233,22 @@ mod tests {
             assert!(service.group_charge(group.root.index()).unwrap() > 0);
         }
     }
+    fn check_pins(service: &LockService, storage: &Storage<'_>) {
+        let mut expected = [0u16; crate::storage::NODES];
+        for group in service.groups.iter().flatten() {
+            storage
+                .node(group.inode)
+                .expect("retained exact group inode");
+            expected[group.inode.slot as usize] += 1;
+        }
+        if let Some(inode) = service.request_inode {
+            storage.node(inode).expect("retained exact worker inode");
+            expected[inode.slot as usize] += 1;
+        }
+        for (node, expected) in storage.state.nodes.iter().zip(expected) {
+            assert_eq!(node.pins[Pin::Lock as usize], expected);
+        }
+    }
     fn drain(
         service: &mut LockService,
         storage: &mut Storage<'_>,
@@ -190,12 +257,14 @@ mod tests {
         for _ in 0..4000 {
             if !service.busy() {
                 check(service);
+                check_pins(service, storage);
                 return;
             }
             let progress = service.step(storage, |pid| page.live(pid));
             assert!(progress.visited <= 8);
             assert!(progress.completed.is_none());
             check(service);
+            check_pins(service, storage);
         }
         panic!("service debt did not finish");
     }
@@ -207,11 +276,13 @@ mod tests {
         root: Root,
     ) -> Result<Response, Error> {
         service.start(storage, request, root)?;
+        check_pins(service, storage);
         let mut result = None;
         for _ in 0..4000 {
             let progress = service.step(storage, |pid| page.live(pid));
             assert!(progress.visited <= 8);
             check(service);
+            check_pins(service, storage);
             if let Some(done) = progress.completed {
                 assert!(result.replace(done).is_none());
             }
@@ -222,16 +293,170 @@ mod tests {
         panic!("service request did not finish");
     }
     #[test]
+    fn deleted_inode_stays_paid_until_dead_group_release_then_reuses_its_place() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let mut service = fresh();
+        let page = page();
+        let payer = root(10, 1);
+        let parent = ram.storage.resolve(b"/tmp").unwrap();
+        let reservation = ram
+            .storage
+            .reserve(payer, parent, b"held", (crate::REG, 0o600, 0, 0))
+            .unwrap();
+        let inode = ram.storage.commit(reservation).unwrap();
+        let identity = crate::authority::Identity {
+            uid: 0,
+            gid: 0,
+            groups: proto_process::Groups::EMPTY,
+        };
+        let mut fds = crate::Fds {
+            root: payer,
+            ..crate::Fds::default()
+        };
+        let fd = ram
+            .open_token(&mut fds, inode, proto_fs::READ_WRITE, identity)
+            .unwrap();
+        assert_eq!(ram.write(&mut fds, fd, b"x"), Ok(1));
+        run(
+            &mut service,
+            &mut ram.storage,
+            &page,
+            request(inode, 256, Command::Set(Some(Kind::Write)), 0, 1),
+            payer,
+        )
+        .unwrap();
+        assert_eq!(ram.storage.unlink(parent, b"held", payer), Ok(inode));
+        assert!(page.retire(256));
+        ram.close(&mut fds, fd).unwrap();
+        for _ in 0..32 {
+            ram.storage.reclaim_step();
+        }
+        assert_eq!(ram.storage.node(inode).unwrap().pins[Pin::Lock as usize], 1);
+        assert_eq!(ram.storage.usage(payer).pages, 1);
+        check_pins(&service, &ram.storage);
+        let next_payer = root(20, 1);
+        let reservation = ram
+            .storage
+            .reserve(next_payer, parent, b"next", (crate::REG, 0o600, 0, 0))
+            .unwrap();
+        let next = ram.storage.commit(reservation).unwrap();
+        assert_ne!(next.slot, inode.slot);
+        assert_eq!(
+            run(
+                &mut service,
+                &mut ram.storage,
+                &page,
+                request(next, 257, Command::Set(Some(Kind::Write)), 0, 1),
+                next_payer
+            ),
+            Ok(Response::Changed)
+        );
+        assert!(service.audit_pid(0, |pid| page.live(pid)).unwrap());
+        drain(&mut service, &mut ram.storage, &page);
+        for _ in 0..32 {
+            ram.storage.reclaim_step();
+        }
+        assert!(ram.storage.node(inode).is_err());
+        assert_eq!(ram.storage.usage(payer).pages, 0);
+        let reservation = ram
+            .storage
+            .reserve(payer, parent, b"replacement", (crate::REG, 0o600, 0, 0))
+            .unwrap();
+        let replacement = ram.storage.commit(reservation).unwrap();
+        assert_eq!(replacement.slot, inode.slot);
+        assert!(replacement.generation > inode.generation);
+        assert_eq!(
+            run(
+                &mut service,
+                &mut ram.storage,
+                &page,
+                request(replacement, 258, Command::Set(Some(Kind::Read)), 0, 1),
+                payer
+            ),
+            Ok(Response::Changed)
+        );
+    }
+    #[test]
+    fn query_worker_keeps_deleted_inode_until_its_cancelled_terminal() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let mut service = fresh();
+        let page = page();
+        let payer = root(10, 1);
+        let parent = ram.storage.resolve(b"/tmp").unwrap();
+        let reservation = ram
+            .storage
+            .reserve(payer, parent, b"held", (crate::REG, 0o600, 0, 0))
+            .unwrap();
+        let inode = ram.storage.commit(reservation).unwrap();
+        service
+            .start(
+                &mut ram.storage,
+                request(inode, 256, Command::Get(Kind::Read), 0, 1),
+                root(999, 1),
+            )
+            .unwrap();
+        assert!(service.request_root.is_none());
+        ram.storage.unlink(parent, b"held", payer).unwrap();
+        for _ in 0..32 {
+            ram.storage.reclaim_step();
+        }
+        assert_eq!(ram.storage.node(inode).unwrap().pins[Pin::Lock as usize], 1);
+        assert!(service.cancel());
+        assert_eq!(ram.storage.node(inode).unwrap().pins[Pin::Lock as usize], 1);
+        let terminal = service.step(&mut ram.storage, |pid| page.live(pid));
+        assert_eq!(terminal.completed, Some(Err(Error::Cancelled)));
+        assert!(service.request_inode.is_none());
+        check_pins(&service, &ram.storage);
+        for _ in 0..32 {
+            ram.storage.reclaim_step();
+        }
+        assert!(ram.storage.node(inode).is_err());
+        let peer = ram.storage.lock_anchor(root(999, 1)).unwrap();
+        assert_eq!(peer.index(), 0);
+        ram.storage.release_lock_anchor(peer).unwrap();
+    }
+    #[test]
+    fn stale_inode_start_returns_its_root_and_leaves_all_pins_unchanged() {
+        let (mut ram, inodes) = fixture();
+        let mut service = fresh();
+        let mut stale = inodes[0];
+        stale.generation += 1;
+        assert_eq!(
+            service.start(
+                &mut ram.storage,
+                request(stale, 256, Command::Set(Some(Kind::Write)), 0, 1),
+                root(10, 1)
+            ),
+            Err(Error::Invalid)
+        );
+        check_pins(&service, &ram.storage);
+        assert!(!service.busy());
+        assert!(service.request_inode.is_none());
+        assert!(service.request_root.is_none());
+        let peer = ram.storage.lock_anchor(root(20, 1)).unwrap();
+        assert_eq!(peer.index(), 0);
+        ram.storage.release_lock_anchor(peer).unwrap();
+        assert_eq!(
+            service.start(
+                &mut ram.storage,
+                request(stale, 256, Command::Get(Kind::Read), 0, 1),
+                root(30, 1)
+            ),
+            Err(Error::Invalid)
+        );
+        check_pins(&service, &ram.storage);
+    }
+    #[test]
     fn own_dispatches_finish_a_stalled_client_and_reclaim_death_without_take() {
         use super::super::dispatch::{Dispatch, Work};
-        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let (mut ram, inodes) = fixture();
         let mut service = fresh();
         let page = page();
         let mut dispatch = Dispatch::default();
         service
             .start(
                 &mut ram.storage,
-                request(0, 256, Command::Set(Some(Kind::Write)), 0, 1),
+                request(inodes[0], 256, Command::Set(Some(Kind::Write)), 0, 1),
                 root(10, 1),
             )
             .unwrap();
@@ -298,8 +523,8 @@ mod tests {
             bytes.div_ceil(4096),
             core::mem::size_of::<Option<PaidGroup>>()
         );
-        assert_eq!(bytes, 868904);
-        assert_eq!(core::mem::size_of::<Option<PaidGroup>>(), 40);
+        assert_eq!(bytes, 877120);
+        assert_eq!(core::mem::size_of::<Option<PaidGroup>>(), 56);
         assert!(!service.busy());
         assert!(service.request_root.is_none());
         assert!(service.groups.iter().all(Option::is_none));
@@ -307,13 +532,13 @@ mod tests {
     }
     #[test]
     fn busy_and_invalid_requests_do_not_allocate_an_expenditure_root() {
-        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let (mut ram, inodes) = fixture();
         let mut service = fresh();
         let page = page();
         assert_eq!(
             service.start(
                 &mut ram.storage,
-                request(0, 0, Command::Set(Some(Kind::Write)), 0, 1),
+                request(inodes[0], 0, Command::Set(Some(Kind::Write)), 0, 1),
                 root(10, 1)
             ),
             Err(Error::Invalid)
@@ -321,7 +546,7 @@ mod tests {
         assert_eq!(
             service.start(
                 &mut ram.storage,
-                request(0, 256, Command::Set(Some(Kind::Write)), 0, 1),
+                request(inodes[0], 256, Command::Set(Some(Kind::Write)), 0, 1),
                 root(10, 0)
             ),
             Err(Error::Invalid)
@@ -330,7 +555,7 @@ mod tests {
         service
             .start(
                 &mut ram.storage,
-                request(0, 256, Command::Set(Some(Kind::Write)), 0, 1),
+                request(inodes[0], 256, Command::Set(Some(Kind::Write)), 0, 1),
                 root(10, 1),
             )
             .unwrap();
@@ -338,7 +563,7 @@ mod tests {
         assert_eq!(
             service.start(
                 &mut ram.storage,
-                request(1, 257, Command::Set(Some(Kind::Read)), 0, 1),
+                request(inodes[1], 257, Command::Set(Some(Kind::Read)), 0, 1),
                 root(11, 1)
             ),
             Err(Error::Busy)
@@ -357,13 +582,13 @@ mod tests {
     }
     #[test]
     fn terminal_cancel_keeps_group_root_until_physical_debt_finishes() {
-        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let (mut ram, inodes) = fixture();
         let mut service = fresh();
         let page = page();
         service
             .start(
                 &mut ram.storage,
-                request(0, 256, Command::Set(Some(Kind::Write)), 0, 1),
+                request(inodes[0], 256, Command::Set(Some(Kind::Write)), 0, 1),
                 root(10, 1),
             )
             .unwrap();
@@ -391,7 +616,7 @@ mod tests {
     }
     #[test]
     fn changed_caller_root_keeps_group_original_payer_and_returns_request_root() {
-        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let (mut ram, inodes) = fixture();
         let mut service = fresh();
         let page = page();
         let first = root(11, 3);
@@ -400,7 +625,7 @@ mod tests {
             &mut service,
             &mut ram.storage,
             &page,
-            request(0, 256, Command::Set(Some(Kind::Write)), 0, 1),
+            request(inodes[0], 256, Command::Set(Some(Kind::Write)), 0, 1),
             first,
         )
         .unwrap();
@@ -408,7 +633,7 @@ mod tests {
             &mut service,
             &mut ram.storage,
             &page,
-            request(0, 256, Command::Set(Some(Kind::Write)), 1, 1),
+            request(inodes[0], 256, Command::Set(Some(Kind::Write)), 1, 1),
             later,
         )
         .unwrap();
@@ -420,15 +645,7 @@ mod tests {
         let other = ram.storage.lock_anchor(later).unwrap();
         assert_eq!(other.index(), 1);
         ram.storage.release_lock_anchor(other).unwrap();
-        service
-            .close(
-                Token {
-                    slot: 0,
-                    generation: 1,
-                },
-                Owner::Process(256),
-            )
-            .unwrap();
+        service.close(inodes[0], Owner::Process(256)).unwrap();
         drain(&mut service, &mut ram.storage, &page);
         let other = ram.storage.lock_anchor(later).unwrap();
         assert_eq!(other.index(), 0);
@@ -436,14 +653,14 @@ mod tests {
     }
     #[test]
     fn get_and_unlock_need_no_new_account_when_all_320_places_are_retained() {
-        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let (mut ram, inodes) = fixture();
         let mut service = fresh();
         let page = page();
         run(
             &mut service,
             &mut ram.storage,
             &page,
-            request(0, 256, Command::Set(Some(Kind::Write)), 0, 1),
+            request(inodes[0], 256, Command::Set(Some(Kind::Write)), 0, 1),
             root(11, 1),
         )
         .unwrap();
@@ -459,7 +676,7 @@ mod tests {
             &mut service,
             &mut ram.storage,
             &page,
-            request(0, 257, Command::Get(Kind::Read), 0, 1),
+            request(inodes[0], 257, Command::Get(Kind::Read), 0, 1),
             root(999, 1),
         )
         .unwrap();
@@ -469,7 +686,7 @@ mod tests {
                 &mut service,
                 &mut ram.storage,
                 &page,
-                request(0, 256, Command::Set(None), 0, 0),
+                request(inodes[0], 256, Command::Set(None), 0, 0),
                 root(999, 1)
             ),
             Ok(Response::Changed)
@@ -484,16 +701,16 @@ mod tests {
     }
     #[test]
     fn ninth_root_failure_establishes_group_custody_before_terminal() {
-        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let (mut ram, inodes) = fixture();
         let mut service = fresh();
         let page = page();
-        for index in 0..8 {
+        for index in 0u16..8 {
             run(
                 &mut service,
                 &mut ram.storage,
                 &page,
                 request(
-                    index,
+                    inodes[index as usize],
                     256 + u32::from(index),
                     Command::Set(Some(Kind::Write)),
                     0,
@@ -506,7 +723,7 @@ mod tests {
         service
             .start(
                 &mut ram.storage,
-                request(8, 264, Command::Set(Some(Kind::Write)), 0, 1),
+                request(inodes[8], 264, Command::Set(Some(Kind::Write)), 0, 1),
                 root(99, 1),
             )
             .unwrap();
@@ -540,14 +757,14 @@ mod tests {
     }
     #[test]
     fn idle_death_observation_releases_exact_root_without_a_client() {
-        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let (mut ram, inodes) = fixture();
         let mut service = fresh();
         let page = page();
         run(
             &mut service,
             &mut ram.storage,
             &page,
-            request(0, 256, Command::Set(Some(Kind::Write)), 0, 1),
+            request(inodes[0], 256, Command::Set(Some(Kind::Write)), 0, 1),
             root(11, 1),
         )
         .unwrap();
