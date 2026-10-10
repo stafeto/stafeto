@@ -171,41 +171,7 @@ fn step(token: CloseToken) -> Result<bool, i32> {
         return Ok(false);
     }
     if !snapshot.complete {
-        let held = ram(snapshot.backend).ok_or(EIO)?;
-        let event = proto_fs::CloseEvent {
-            key: proto_fs::CloseKey {
-                slot: token.slot() as u32,
-                generation: token.generation(),
-            },
-            packed: held.prepared().marked_fd(),
-            description_generation: held.generation(),
-            last_alias: snapshot.last_alias,
-        };
-        let receipt = transport.files().close_event_once(event);
-        #[cfg(feature = "close-probe")]
-        let mut receipt = receipt;
-        #[cfg(feature = "close-probe")]
-        if probed(Probe::Event, token) && receipt.is_ok() {
-            receipt = Err(Status::Kernel(rt::abi::Error::Interrupted));
-        }
-        let confirmed = crate::shared::with_files(|files| {
-            // A concurrent helper can retire this exact generation during send.
-            let Ok(current) = files.close_snapshot(token) else {
-                return Ok(true);
-            };
-            if current.complete {
-                return Ok(false);
-            }
-            match receipt {
-                Ok(()) => {
-                    files.finish_close_record(token).map_err(crate::error)?;
-                    Ok(false)
-                }
-                Err(Status::BadSize | Status::Kernel(rt::abi::Error::Interrupted)) => Ok(false),
-                Err(error) => Err(protocol(error)),
-            }
-        })?;
-        return Ok(confirmed);
+        return event_step(token, transport, snapshot);
     }
     if let Some(target) = snapshot.release {
         let held = ram(target).ok_or(EIO)?;
@@ -253,6 +219,50 @@ fn step(token: CloseToken) -> Result<bool, i32> {
         crate::change::wake_places();
     }
     Ok(true)
+}
+
+// Keep the event request storage out of Lock cleanup and physical release.
+#[inline(never)]
+fn event_step(
+    token: CloseToken,
+    transport: Transport,
+    snapshot: posix_fs::closing::Snapshot,
+) -> Result<bool, i32> {
+    let held = ram(snapshot.backend).ok_or(EIO)?;
+    let event = proto_fs::CloseEvent {
+        key: proto_fs::CloseKey {
+            slot: token.slot() as u32,
+            generation: token.generation(),
+        },
+        packed: held.prepared().marked_fd(),
+        description_generation: held.generation(),
+        last_alias: snapshot.last_alias,
+    };
+    let receipt = transport.files().close_event_once(event);
+    #[cfg(feature = "close-probe")]
+    let mut receipt = receipt;
+    #[cfg(feature = "close-probe")]
+    if probed(Probe::Event, token) && receipt.is_ok() {
+        receipt = Err(Status::Kernel(rt::abi::Error::Interrupted));
+    }
+    let confirmed = crate::shared::with_files(|files| {
+        // A concurrent helper can retire this exact generation during send.
+        let Ok(current) = files.close_snapshot(token) else {
+            return Ok(true);
+        };
+        if current.complete {
+            return Ok(false);
+        }
+        match receipt {
+            Ok(()) => {
+                files.finish_close_record(token).map_err(crate::error)?;
+                Ok(false)
+            }
+            Err(Status::BadSize | Status::Kernel(rt::abi::Error::Interrupted)) => Ok(false),
+            Err(error) => Err(protocol(error)),
+        }
+    })?;
+    Ok(confirmed)
 }
 
 fn help_once() -> bool {
