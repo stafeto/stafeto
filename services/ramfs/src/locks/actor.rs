@@ -55,20 +55,32 @@ pub enum Response {
     Changed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupEvent {
+    Created { id: Id, root: u16 },
+    Released { id: Id, root: u16 },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Progress {
     pub visited: usize,
+    pub group_event: Option<GroupEvent>,
     pub completed: Option<Result<Response, Error>>,
 }
 impl Progress {
+    fn with_event(mut self, event: Option<GroupEvent>) -> Self {
+        self.group_event = event;
+        self
+    }
     fn pending(visited: usize) -> Self {
         Self {
             visited,
+            group_event: None,
             completed: None,
         }
     }
     fn complete(visited: usize, result: Result<Response, Error>) -> Self {
         Self {
             visited,
+            group_event: None,
             completed: Some(result),
         }
     }
@@ -405,10 +417,13 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             cleanup.released += progress.released;
             if progress.complete {
                 assert_eq!(cleanup.released, cleanup.expected);
+                let root = cleanup.root;
                 self.group_cleanup = None;
                 self.groups.release(id).expect("paid empty group");
                 self.views[id.slot()] = View::EMPTY;
                 self.revoked = view.next;
+                return Progress::pending(progress.released + 2)
+                    .with_event(Some(GroupEvent::Released { id, root }));
             }
             return Progress::pending(progress.released + 2);
         }
@@ -522,6 +537,10 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
                     };
                 }
                 let snapshot = self.groups.snapshot(capture).expect("admitted group");
+                let event = old.is_none().then_some(GroupEvent::Created {
+                    id: capture.id(),
+                    root: snapshot.root,
+                });
                 let view = self.view(capture.id()).expect("admitted view");
                 let Command::Set(kind) = request.command else {
                     unreachable!()
@@ -542,10 +561,10 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
                             self.retire_view(capture.id(), snapshot.root)
                                 .expect("new empty debt");
                         }
-                        return Progress::complete(3, Err(error.into()));
+                        return Progress::complete(3, Err(error.into())).with_event(event);
                     }
                 }
-                Progress::pending(3)
+                Progress::pending(3).with_event(event)
             }
             Phase::Prepare { capture, work } => {
                 if !self.groups.valid(*capture) {
@@ -1194,5 +1213,278 @@ mod tests {
         .unwrap();
         assert_eq!(blocker.kind, Kind::Write);
         assert_eq!(blocker.range, Range::relative(0, 0, 10).unwrap());
+    }
+    fn event_run(a: &mut Small, request: Request) -> std::vec::Vec<GroupEvent> {
+        a.start(request).unwrap();
+        let mut events = std::vec::Vec::new();
+        let mut completed = false;
+        for _ in 0..2000 {
+            let progress = a.step();
+            assert!(progress.visited <= 8);
+            check(a);
+            if let Some(event) = progress.group_event {
+                events.push(event);
+            }
+            if let Some(result) = progress.completed {
+                assert_eq!(result, Ok(Response::Changed));
+                assert!(!completed);
+                completed = true;
+            }
+            if !a.busy() {
+                assert!(completed);
+                return events;
+            }
+        }
+        panic!("event worker did not finish");
+    }
+    fn event_cleanup(a: &mut Small) -> std::vec::Vec<GroupEvent> {
+        let mut events = std::vec::Vec::new();
+        for _ in 0..2000 {
+            if !a.busy() {
+                return events;
+            }
+            let progress = a.step();
+            assert!(progress.visited <= 8);
+            assert!(progress.completed.is_none());
+            check(a);
+            if let Some(event) = progress.group_event {
+                let GroupEvent::Released { root, .. } = event else {
+                    panic!("cleanup created a group")
+                };
+                assert_eq!(a.record_charge(root), Some(0));
+                assert_eq!(a.group_charge(root), Some(0));
+                events.push(event);
+            }
+        }
+        panic!("event cleanup did not finish");
+    }
+    #[test]
+    fn group_events_keep_original_payer_until_final_close_cleanup() {
+        let mut a: Box<Small> = fresh();
+        let owner = Owner::Process(256);
+        let first = event_run(&mut a, request(0, owner, Some(Kind::Write), 0, 10, 0));
+        let [GroupEvent::Created { id, root: 0 }] = first.as_slice() else {
+            panic!("exact created event missing")
+        };
+        let id = *id;
+        assert!(event_run(&mut a, request(0, owner, Some(Kind::Write), 10, 10, 1)).is_empty());
+        assert_eq!(a.group_charge(0), Some(1));
+        assert_eq!(a.group_charge(1), Some(0));
+        a.close(inode(0), owner).unwrap();
+        assert_eq!(a.record_charge(0), Some(1));
+        assert_eq!(
+            event_cleanup(&mut a),
+            [GroupEvent::Released { id, root: 0 }]
+        );
+        let second = event_run(&mut a, request(0, owner, Some(Kind::Write), 0, 10, 1));
+        let [GroupEvent::Created { id: new, root: 1 }] = second.as_slice() else {
+            panic!("new payer event missing")
+        };
+        assert_ne!(*new, id);
+        assert_eq!(
+            event_run(&mut a, request(0, owner, None, 0, 0, 0)),
+            [GroupEvent::Released { id: *new, root: 1 }]
+        );
+    }
+    #[test]
+    fn cancelled_private_copy_releases_group_event_after_last_record() {
+        let mut a: Box<Small> = fresh();
+        a.start(request(0, Owner::Process(256), Some(Kind::Write), 0, 10, 1))
+            .unwrap();
+        let mut created = None;
+        for _ in 0..100 {
+            let progress = a.step();
+            assert!(progress.completed.is_none());
+            if let Some(GroupEvent::Created { id, root: 1 }) = progress.group_event {
+                assert!(created.replace(id).is_none());
+            } else {
+                assert!(progress.group_event.is_none());
+            }
+            if a.counts().private != 0 {
+                break;
+            }
+        }
+        let id = created.expect("private group created event");
+        assert_eq!(a.counts().private, 1);
+        assert!(a.cancel());
+        let terminal = a.step();
+        assert_eq!(terminal.completed, Some(Err(Error::Cancelled)));
+        assert!(terminal.group_event.is_none());
+        assert_eq!(a.record_charge(1), Some(1));
+        assert_eq!(a.group_charge(1), Some(1));
+        assert_eq!(
+            event_cleanup(&mut a),
+            [GroupEvent::Released { id, root: 1 }]
+        );
+    }
+    #[test]
+    fn refused_ninth_root_still_delivers_created_and_released_empty_group() {
+        let mut a: Box<Small> = fresh();
+        for root in 0..8 {
+            let owner = Owner::Description {
+                slot: root,
+                generation: 1,
+            };
+            assert_eq!(
+                event_run(&mut a, request(root, owner, Some(Kind::Read), 0, 10, root)).len(),
+                1
+            );
+        }
+        a.start(request(0, Owner::Process(256), Some(Kind::Read), 0, 10, 8))
+            .unwrap();
+        let mut created = None;
+        for _ in 0..100 {
+            let progress = a.step();
+            if let Some(GroupEvent::Created { id, root: 8 }) = progress.group_event {
+                assert!(created.replace(id).is_none());
+            } else {
+                assert!(progress.group_event.is_none());
+            }
+            if let Some(result) = progress.completed {
+                assert_eq!(result, Err(Error::NoLocks));
+                break;
+            }
+        }
+        let id = created.expect("failed preparation retains new group");
+        assert_eq!(a.group_charge(8), Some(1));
+        assert_eq!(a.record_charge(8), Some(0));
+        assert_eq!(
+            event_cleanup(&mut a),
+            [GroupEvent::Released { id, root: 8 }]
+        );
+        for root in 0..8 {
+            assert_eq!(a.group_charge(root), Some(1));
+            assert_eq!(a.record_charge(root), Some(1));
+        }
+    }
+    #[test]
+    fn departed_groups_each_return_their_exact_original_root_event() {
+        let mut a: Box<Small> = fresh();
+        let owner = Owner::Process(256);
+        let mut created = std::vec::Vec::new();
+        for node in 0..3 {
+            created.extend(event_run(
+                &mut a,
+                request(node, owner, Some(Kind::Write), 0, 10, node),
+            ));
+        }
+        a.depart_pid(256).unwrap();
+        let released = event_cleanup(&mut a);
+        assert_eq!(released.len(), 3);
+        for event in created {
+            let GroupEvent::Created { id, root } = event else {
+                panic!("unexpected created list")
+            };
+            assert_eq!(
+                released
+                    .iter()
+                    .filter(|&&event| event == GroupEvent::Released { id, root })
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(a.counts().paid(), 0);
+    }
+    #[test]
+    fn long_group_retirement_reports_release_only_after_all_portions() {
+        let mut a: Box<Small> = fresh();
+        let owner = Owner::Process(256);
+        let mut created = None;
+        for region in 0..12 {
+            let events = event_run(
+                &mut a,
+                request(0, owner, Some(Kind::Write), region * 2, 1, 2),
+            );
+            if region == 0 {
+                let [GroupEvent::Created { id, root: 2 }] = events.as_slice() else {
+                    panic!("created event")
+                };
+                created = Some(*id);
+            } else {
+                assert!(events.is_empty());
+            }
+        }
+        assert_eq!(a.record_charge(2), Some(12));
+        a.close(inode(0), owner).unwrap();
+        let first = a.step();
+        assert_eq!(first.visited, 8);
+        assert!(first.group_event.is_none());
+        assert_eq!(a.record_charge(2), Some(6));
+        assert_eq!(a.group_charge(2), Some(1));
+        assert_eq!(
+            event_cleanup(&mut a),
+            [GroupEvent::Released {
+                id: created.unwrap(),
+                root: 2
+            }]
+        );
+    }
+    #[test]
+    fn storage_payer_survives_cancel_reply_until_actor_returns_all_debt() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let mut a: Box<Small> = fresh();
+        let key = crate::storage::Root {
+            id: 17,
+            generation: 3,
+        };
+        let job = ram.storage.lock_anchor(key).unwrap();
+        let root = job.index();
+        let mut group = None;
+        let mut group_anchor = None;
+        a.start(request(
+            0,
+            Owner::Process(256),
+            Some(Kind::Write),
+            0,
+            10,
+            root,
+        ))
+        .unwrap();
+        for _ in 0..100 {
+            let progress = a.step();
+            if let Some(GroupEvent::Created { id, root: payer }) = progress.group_event {
+                assert_eq!(payer, root);
+                assert!(group.replace(id).is_none());
+                assert!(
+                    group_anchor
+                        .replace(ram.storage.retain_lock_anchor(&job).unwrap())
+                        .is_none()
+                );
+            }
+            if a.counts().private != 0 {
+                break;
+            }
+        }
+        assert!(group.is_some());
+        assert_eq!(a.counts().private, 1);
+        a.cancel();
+        assert_eq!(a.step().completed, Some(Err(Error::Cancelled)));
+        ram.storage.release_lock_anchor(job).unwrap();
+        let next_key = crate::storage::Root {
+            id: 17,
+            generation: 4,
+        };
+        let peer = ram.storage.lock_anchor(next_key).unwrap();
+        assert_ne!(peer.index(), root);
+        ram.storage.release_lock_anchor(peer).unwrap();
+        for _ in 0..100 {
+            if !a.busy() {
+                break;
+            }
+            let progress = a.step();
+            if let Some(GroupEvent::Released { id, root: payer }) = progress.group_event {
+                assert_eq!(Some(id), group);
+                assert_eq!(payer, root);
+                assert_eq!(a.counts().paid(), 0);
+                ram.storage
+                    .release_lock_anchor(group_anchor.take().expect("one retained group root"))
+                    .unwrap();
+            }
+        }
+        assert!(!a.busy());
+        assert!(group_anchor.is_none());
+        let replacement = ram.storage.lock_anchor(next_key).unwrap();
+        assert_eq!(replacement.index(), root);
+        ram.storage.release_lock_anchor(replacement).unwrap();
     }
 }
