@@ -550,7 +550,7 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
 /// probe's children are files of it.
 const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
-    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["signal-probe"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
@@ -571,6 +571,12 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
+/// Only the names and real-signal probe can pause the RAM service.
+const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[1].3 = &["signal-probe"];
+    programs
+};
 const POSIX_NATIVE_SCOPE_PROGRAMS: [ImageProgram; 11] = {
     let mut programs = [POSIX_PROCS_PROGRAMS[0]; 11];
     let mut index = 0;
@@ -3171,7 +3177,7 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     // BusyBox is /bin/ls of the image's files (5c).
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-posix-procs.img", &POSIX_PROCS_PROGRAMS, BOOT_PROFILE)?;
+    let image = build_boot_image("boot-posix-procs.img", &POSIX_NAMES_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
@@ -7130,6 +7136,24 @@ mod tests {
         swapped.swap(0, 1);
         assert!(super::expect_ash_names(&log(&swapped)).is_err());
         assert!(super::expect_ash_names(&["boot".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn only_names_image_enables_service_signal_pause() {
+        use super::*;
+        assert_eq!(POSIX_NAMES_PROGRAMS[1].3, &["signal-probe"]);
+        for programs in [
+            &POSIX_PROCS_PROGRAMS[..],
+            &POSIX_NATIVE_SCOPE_PROGRAMS[..],
+            &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[..],
+            &POSIX_STEPS_PROGRAMS[..],
+        ] {
+            assert!(
+                programs
+                    .iter()
+                    .all(|program| !program.3.contains(&"signal-probe"))
+            );
+        }
     }
 
     #[test]
