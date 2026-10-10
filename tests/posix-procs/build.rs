@@ -15,6 +15,7 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
+    println!("cargo:rerun-if-changed=lifetime.c");
     println!("cargo:rerun-if-changed=files.c");
     println!("cargo:rerun-if-changed=names.c");
     println!("cargo:rerun-if-changed=names-loss.c");
@@ -123,7 +124,9 @@ fn main() {
         .arg(sysroot.join("include"))
         .args([
             "-c",
-            if env::var_os("CARGO_FEATURE_IMAGE_GATES").is_some() {
+            if env::var_os("CARGO_FEATURE_LIFETIME_PROBE").is_some() {
+                "lifetime.c"
+            } else if env::var_os("CARGO_FEATURE_IMAGE_GATES").is_some() {
                 "image-gates.c"
             } else if env::var_os("CARGO_FEATURE_AUTH_PROBE").is_some() {
                 "cleanup.c"

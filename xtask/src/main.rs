@@ -572,6 +572,12 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// Only the names and real-signal probe can pause the RAM service.
+const POSIX_LIFETIMES_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[3].3 = &["lifetime-probe"];
+    programs[5].3 = &["lifetime-probe"];
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1302,6 +1308,7 @@ fn main() {
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
@@ -3172,6 +3179,31 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-lifetimes.img",
+        &POSIX_LIFETIMES_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let ended = run.expect_line(
+        "the PID lifetime probe to exit",
+        |line| line.starts_with("init: posix-procs ended:"),
+        Duration::from_secs(30),
+    );
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    if ended? != "init: posix-procs ended: exit code 0, not restarted" {
+        return Err("the PID lifetime probe failed".into());
+    }
+    qemu::expect_marker(&outcome, "posix-procs: PID lifetime page ok")
+}
+
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
@@ -4888,6 +4920,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files", posix_files_probe),
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
+        job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
@@ -7160,6 +7193,7 @@ mod tests {
         assert_eq!(POSIX_NAMES_PROGRAMS[1].3, &["signal-probe"]);
         for programs in [
             &POSIX_PROCS_PROGRAMS[..],
+            &POSIX_LIFETIMES_PROGRAMS[..],
             &POSIX_NATIVE_SCOPE_PROGRAMS[..],
             &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[..],
             &POSIX_STEPS_PROGRAMS[..],
@@ -7168,6 +7202,26 @@ mod tests {
                 programs
                     .iter()
                     .all(|program| !program.3.contains(&"signal-probe"))
+            );
+        }
+    }
+
+    #[test]
+    fn lifetime_probe_has_its_own_process_and_program_features() {
+        assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
+        assert_eq!(POSIX_LIFETIMES_PROGRAMS[5].3, &["lifetime-probe"]);
+        for programs in [
+            &POSIX_PROCS_PROGRAMS[..],
+            &POSIX_NAMES_PROGRAMS[..],
+            &POSIX_NATIVE_SCOPE_PROGRAMS[..],
+            &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[..],
+            &POSIX_STEPS_PROGRAMS[..],
+            &POSIX_FILES_PROGRAMS[..],
+        ] {
+            assert!(
+                programs
+                    .iter()
+                    .all(|program| !program.3.contains(&"lifetime-probe"))
             );
         }
     }
