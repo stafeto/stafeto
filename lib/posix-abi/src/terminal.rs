@@ -430,23 +430,41 @@ pub fn set_winsize(
     })
 }
 
-/// tcdrain: returns once the service has given the driver all the output
-/// of the terminal `number`; a signal ends the wait with EINTR.
+/// The C tcdrain cancellation boundary. Finish the descriptor hold and all
+/// transport resources before relibc cancellation runs user cleanup.
+pub fn drain_fd(fd: u32) -> Result<(), i32> {
+    let point = crate::threads::cancel::Point::begin();
+    let result = crate::shared::held(fd, |transport, target| {
+        let number = transport.terminal_number(target).ok_or(ENOTTY)?;
+        drain(transport, number)
+    });
+    if result.is_ok() {
+        point.end();
+    } else {
+        point.finish();
+    }
+    result
+}
+
+/// tcdrain: waits for the captured terminal output to complete at its
+/// backend: PL011 FIFO and shift register, Virtio used ring, or PTY master
+/// consumption. A signal ends a pending wait with EINTR.
 #[inline(never)]
 pub fn drain(transport: Transport, number: u32) -> Result<(), i32> {
     let terminal = transport.terminal().ok_or(EBADF)?;
     retry(|| {
-        let mut start = Writer::new();
-        Drain {
-            key: None,
-            terminal: number,
-            blocked: blocked(proto_process::SIGTTOU),
-        }
-        .write(&mut start)
-        .map_err(|_| EIO)?;
-        crate::long::run_with_identity(
+        crate::long::run_drain(
             &terminal,
-            start.as_bytes(),
+            || {
+                let mut start = Writer::new();
+                Drain {
+                    key: None,
+                    terminal: number,
+                    blocked: blocked(proto_process::SIGTTOU),
+                }
+                .write(&mut start)?;
+                Ok(start)
+            },
             |cancel, key, w| {
                 if cancel {
                     Cancel {
@@ -463,10 +481,8 @@ pub fn drain(transport: Transport, number: u32) -> Result<(), i32> {
                     .write(w)
                 }
             },
-            &mut [],
             &refusal,
         )
-        .map(drop)
     })
 }
 

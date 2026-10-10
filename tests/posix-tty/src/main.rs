@@ -358,3 +358,54 @@ mod virtual_names {
         run().err().unwrap_or(0)
     }
 }
+
+/// Populate or release ordinary paid reads without extra guest thread
+/// stacks. This fixture exists only in this test executable; no service
+/// method or POSIX library hook is added.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_drain_read(key: u64) -> u64 {
+    use proto_wire::{Writer, long};
+    use rt::abi::Rights;
+    use rt::handle::{Channel, Handle};
+    let result = (|| {
+        let terminal = posix_abi::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))
+            .ok()
+            .flatten()?;
+        let identity = rt::sys::handle_duplicate(
+            posix_abi::process::identity()?,
+            Rights::NOTIFY | Rights::TRANSFER,
+        )
+        .ok()?;
+        let mut request = Writer::new();
+        if key == 0 {
+            proto_tty::Read {
+                key: None,
+                terminal: proto_tty::CONSOLE,
+                blocked: 0,
+                count: 1,
+            }
+            .write(&mut request)
+            .ok()?;
+        } else {
+            proto_tty::Cancel {
+                key,
+                terminal: proto_tty::CONSOLE,
+            }
+            .write(proto_tty::Method::ReadCancel, &mut request)
+            .ok()?;
+        }
+        let reply = rt::sys::send_handles(
+            &Handle::<Channel>::borrowed(terminal),
+            request.as_bytes(),
+            [identity.erase()],
+        )
+        .ok()?;
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        match long::Reply::read(reply.bytes(&mut buffer)).ok()? {
+            long::Reply::Wait(key) if key != 0 => Some(key),
+            long::Reply::Cancelled => Some(0),
+            _ => None,
+        }
+    })();
+    result.unwrap_or(u64::MAX)
+}

@@ -36,6 +36,8 @@ enum At {
 /// The output: the ring of the clients, the text of the log, and where
 /// the line stands.
 pub struct Output {
+    submitted: u64,
+    fence: Option<u64>,
     ring: [u8; TX_RING],
     ring_start: usize,
     ring_len: usize,
@@ -65,6 +67,8 @@ impl Output {
     /// An empty output at the start of a line.
     pub const fn new() -> Output {
         Output {
+            submitted: 0,
+            fence: None,
             ring: [0; TX_RING],
             ring_start: 0,
             ring_len: 0,
@@ -85,6 +89,40 @@ impl Output {
     /// The bytes of the clients the ring has room for.
     pub fn room(&self) -> usize {
         TX_RING - self.ring_len
+    }
+
+    /// No accepted client bytes or already formed client continuation remain.
+    pub fn clients_empty(&self) -> bool {
+        self.ring_len == 0 && self.pending.is_empty() && self.repeat.is_none() && !self.cut
+    }
+
+    /// The position of the next original client byte, modulo 2^64.
+    pub fn submitted(&self) -> u64 {
+        self.submitted
+    }
+
+    /// The position after all client bytes currently held in the ring.
+    pub fn target(&self) -> u64 {
+        self.submitted.wrapping_add(self.ring_len as u64)
+    }
+
+    /// Hold new hardware loads at this captured client prefix.
+    pub fn fence(&mut self, target: Option<u64>) {
+        self.fence = target;
+    }
+
+    /// All original bytes of the prefix and its translated LF were loaded.
+    pub fn at_fence(&self) -> bool {
+        self.fence == Some(self.submitted)
+            && self.pending.is_empty()
+            && self.repeat.is_none()
+            && !self.cut
+            && !(self.at == At::Log && self.log_has())
+    }
+
+    /// The existing log batch finishes before another batch is taken.
+    pub fn accepts_log(&self) -> bool {
+        self.fence.is_none()
     }
 
     /// Puts `bytes` of a client into the ring, all or none: false, with
@@ -139,6 +177,7 @@ impl Output {
     /// them: for a stand-in of the driver whose port sends at once (the
     /// measure of the terminal service's steps, tests/tty).
     pub fn discard_clients(&mut self) {
+        self.submitted = self.submitted.wrapping_add(self.ring_len as u64);
         self.ring_start = (self.ring_start + self.ring_len) % TX_RING;
         self.ring_len = 0;
     }
@@ -171,7 +210,11 @@ impl Output {
 
     /// Whether `next_byte` has nothing to give now.
     pub fn is_idle(&self) -> bool {
-        if !self.pending.is_empty() {
+        if self.at_fence() {
+            return true;
+        }
+        if !self.pending.is_empty() || (self.fence.is_some() && (self.cut || self.repeat.is_some()))
+        {
             return false;
         }
         let clients = self.ring_len > 0;
@@ -192,13 +235,16 @@ impl Output {
     /// above).
     pub fn next_byte(&mut self) -> Option<u8> {
         loop {
+            if self.at_fence() {
+                return None;
+            }
             if let Some((&b, rest)) = self.pending.split_first() {
                 self.pending = rest;
                 return Some(b);
             }
             match self.at {
                 At::Start => {
-                    if self.log_has() {
+                    if self.log_has() && (self.fence.is_none() || self.cut) {
                         self.at = At::Log;
                     } else if self.cut {
                         self.cut = false;
@@ -222,12 +268,16 @@ impl Output {
                             return Some(self.line[i]);
                         }
                         self.repeat = None;
+                        if self.at_fence() {
+                            return None;
+                        }
                     }
                     if self.ring_len > 0 {
                         let at = self.ring_start;
                         let raw = self.raw[at / 8] & (1 << (at % 8)) != 0;
                         self.ring_start = (at + 1) % TX_RING;
                         self.ring_len -= 1;
+                        self.submitted = self.submitted.wrapping_add(1);
                         return Some(self.client_byte(self.ring[at], raw));
                     }
                     if !self.log_has() {
@@ -247,7 +297,7 @@ impl Output {
                         }
                         return Some(b);
                     }
-                    if self.ring_len == 0 {
+                    if self.ring_len == 0 && !(self.cut && self.fence.is_some()) {
                         return None;
                     }
                     self.end_line();
@@ -296,6 +346,93 @@ impl Default for Output {
 mod tests {
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn paced_fence_resolves_exhausted_replay_at_exact_tx_portion_boundary() {
+        let mut output = Output::new();
+        output.put_raw(&[b'x'; 32]);
+        assert_eq!(take(&mut output, 32), [b'x'; 32]);
+        output.put_log(b"k\n");
+        assert_eq!(take(&mut output, 5), b"\r\nk\r\n");
+        output.fence(Some(output.target()));
+        assert!(!output.is_idle());
+        assert_eq!(take(&mut output, 32), [b'x'; 32]);
+        assert!(
+            !output.is_idle(),
+            "the next bounded pass must settle replay state"
+        );
+        assert_eq!(output.next_byte(), None);
+        assert!(output.at_fence());
+    }
+
+    #[test]
+    fn fence_resolves_a_cut_line_too_long_to_replay() {
+        let mut output = Output::new();
+        output.put_raw(&[b'x'; REPEAT_MAX + 1]);
+        assert_eq!(take(&mut output, REPEAT_MAX + 1), [b'x'; REPEAT_MAX + 1]);
+        output.put_log(b"k\n");
+        assert_eq!(take(&mut output, 5), b"\r\nk\r\n");
+        output.fence(Some(output.target()));
+        assert!(!output.is_idle());
+        assert_eq!(output.next_byte(), None);
+        assert!(output.at_fence());
+    }
+
+    #[test]
+    fn captured_prefix_finishes_an_existing_cut_line_without_loading_new_bytes() {
+        let mut output = Output::new();
+        output.put_raw(b"old");
+        assert_eq!(take(&mut output, 3), b"old");
+        output.put_log(b"log\n");
+        assert_eq!(take(&mut output, 3), b"\r\nl");
+        output.fence(Some(output.target()));
+        output.put_raw(b"new");
+        assert_eq!(drain(&mut output), b"og\r\nold");
+        assert!(output.at_fence());
+        output.fence(None);
+        assert_eq!(drain(&mut output), b"new");
+    }
+
+    #[test]
+    fn captured_prefix_finishes_translation_and_keeps_later_bytes() {
+        let mut output = Output::new();
+        output.put(b"a\n");
+        let target = output.target();
+        output.fence(Some(target));
+        output.put_raw(b"later");
+        assert_eq!(output.next_byte(), Some(b'a'));
+        assert_eq!(output.next_byte(), Some(b'\r'));
+        assert!(
+            !output.at_fence(),
+            "the translated LF still belongs to prefix"
+        );
+        assert_eq!(output.next_byte(), Some(b'\n'));
+        assert!(output.at_fence());
+        assert_eq!(output.next_byte(), None);
+        assert!(!output.accepts_log());
+        output.fence(None);
+        assert_eq!(drain(&mut output), b"later");
+    }
+
+    #[test]
+    fn captured_prefix_wraps_and_cannot_be_extended_by_log_or_writers() {
+        let mut output = Output::new();
+        output.submitted = u64::MAX;
+        output.put_raw(b"x");
+        let target = output.target();
+        assert_eq!(target, 0);
+        output.put_log(b"log\n");
+        output.fence(Some(target));
+        output.put_raw(b"y");
+        assert_eq!(output.next_byte(), Some(b'x'));
+        assert_eq!(output.next_byte(), None);
+        assert_eq!(output.submitted(), 0);
+        assert!(output.at_fence());
+        output.fence(None);
+        let rest = drain(&mut output);
+        assert!(rest.contains(&b'y'));
+        assert!(rest.windows(3).any(|p| p == b"log"));
+    }
 
     /// What `next_byte` gives until it has nothing, 10 000 bytes at most;
     /// the output is idle then.

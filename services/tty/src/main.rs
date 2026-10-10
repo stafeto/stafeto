@@ -127,6 +127,7 @@ struct Pin {
     key: u64,
     description: u32,
     kind: u8,
+    drain: tty::drain::Prefix,
 }
 
 struct Tables {
@@ -237,6 +238,7 @@ fn main(_: u64) -> u64 {
         watches: &mut tables.watches,
         driver,
         room_given: false,
+        draining: None,
         devices: &mut tables.devices,
         active: 0,
         endpoints: &mut tables.endpoints,
@@ -297,7 +299,7 @@ enum Wait {
     /// A read, with the deadline of its VTIME.
     Read(Option<u64>),
     Write,
-    Drain,
+    Drain(u64),
     MasterRead,
     MasterWrite,
 }
@@ -306,7 +308,7 @@ impl Wait {
         match self {
             Self::Read(_) => 1,
             Self::Write => 2,
-            Self::Drain => 3,
+            Self::Drain(_) => 3,
             Self::MasterRead => 4,
             Self::MasterWrite => 5,
         }
@@ -337,6 +339,7 @@ struct Tty {
     /// handle of ROOM.
     driver: Handle<Channel>,
     room_given: bool,
+    draining: Option<u64>,
     devices: &'static mut [Device; TERMINALS],
     active: usize,
     endpoints: &'static mut Endpoints,
@@ -1069,23 +1072,153 @@ impl Tty {
             self.driver = driver;
         }
         self.room_given = false;
+        self.draining = None;
+        for waiter in self.devices[0].drainers.iter() {
+            if let Some(pin) = self.pins[(waiter.key as u32 - 1) as usize].as_mut() {
+                if !pin.drain.ready {
+                    pin.drain.failed = true;
+                }
+                self.ops.tell(waiter.label, waiter.key);
+            }
+        }
         self.pump.room_came();
         self.input = Input::Idle;
     }
 
     /// Output to the driver: WRITES messages at most, then the writers
     /// hear of room; the next step goes on with what is left.
+    /// Update sticky terminal prefixes immediately after send or existing flush.
+    fn mark_drains(&mut self) {
+        let sent = self.devices[self.active].console.sent_total();
+        for waiter in self.devices[self.active].drainers.iter() {
+            if let Some(pin) = self.pins[(waiter.key as u32 - 1) as usize].as_mut() {
+                pin.drain.advance(sent, waiter.started);
+                if self.active != 0 {
+                    pin.drain.complete();
+                }
+                if pin.drain.ready || pin.drain.failed {
+                    self.ops.tell(waiter.label, waiter.key);
+                }
+            }
+        }
+    }
+
+    fn driver_drain(&self, method: proto_uart::Method, key: Option<u64>) -> Result<bool, Error> {
+        let mut request = Writer::new();
+        match key {
+            Some(key) => proto_uart::DrainKey { key }.write(method, &mut request),
+            None => method.header().write(&mut request),
+        }
+        .map_err(|_| Error::InvalidArgs)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let reply = call(&self.driver, request.as_bytes(), None, &mut buffer)?;
+        proto_uart::DrainReply::read(reply)
+            .map(|reply| reply.ready)
+            .map_err(|_| Error::BadState)
+    }
+
+    /// One driver observation RPC per output step. Future bytes remain in TTY
+    /// until the captured UART prefix physically completes.
+    fn observe_drain(&mut self) -> bool {
+        if self.active != 0 {
+            return false;
+        }
+        let reached = self.devices[0]
+            .drainers
+            .iter()
+            .find(|waiter| {
+                self.pins[(waiter.key as u32 - 1) as usize]
+                    .is_some_and(|pin| pin.drain.reached && !pin.drain.ready && !pin.drain.failed)
+            })
+            .map(|waiter| waiter.key);
+        let key = self.draining.or(reached);
+        let Some(key) = key else { return false };
+        if !self.room_given {
+            let mut port = Port {
+                driver: &self.driver,
+                channel: &self.channel,
+                level: self.level,
+                room_given: &mut self.room_given,
+            };
+            if port.room().is_err() {
+                self.reconnect();
+            }
+            self.kick();
+            return true;
+        }
+        // Bind all already reached TTY prefixes to this immutable observer key.
+        for waiter in self.devices[0].drainers.iter_mut() {
+            if self.pins[(waiter.key as u32 - 1) as usize]
+                .is_some_and(|pin| pin.drain.reached && !pin.drain.ready && !pin.drain.failed)
+            {
+                waiter.deadline = Some(key);
+            }
+        }
+        let has_waiters = self.devices[0]
+            .drainers
+            .iter()
+            .any(|waiter| waiter.deadline == Some(key));
+        let method = if !has_waiters {
+            proto_uart::Method::DrainRelease
+        } else if self.draining.is_some() {
+            proto_uart::Method::DrainTake
+        } else {
+            proto_uart::Method::DrainStart
+        };
+        match self.driver_drain(method, Some(key)) {
+            Ok(ready) => {
+                self.draining = has_waiters.then_some(key);
+                if ready {
+                    for waiter in self.devices[0].drainers.iter() {
+                        if waiter.deadline == Some(key)
+                            && let Some(pin) = self.pins[(waiter.key as u32 - 1) as usize].as_mut()
+                        {
+                            pin.drain.complete();
+                            self.ops.tell(waiter.label, waiter.key);
+                        }
+                    }
+                    self.draining = None;
+                }
+                if ready || !has_waiters {
+                    self.kick();
+                }
+            }
+            Err(_) => {
+                self.reconnect();
+                self.kick();
+            }
+        }
+        true
+    }
+
     fn push(&mut self) {
+        self.mark_drains();
+        if self.observe_drain() {
+            return;
+        }
+        let target = self.devices[self.active]
+            .drainers
+            .iter()
+            .filter(|waiter| {
+                self.pins[(waiter.key as u32 - 1) as usize]
+                    .is_some_and(|pin| !pin.drain.reached && !pin.drain.failed)
+            })
+            .map(|waiter| waiter.started)
+            .min_by_key(|target| {
+                target.wrapping_sub(self.devices[self.active].console.sent_total())
+            });
         let mut port = Port {
             driver: &self.driver,
             channel: &self.channel,
             level: self.level,
             room_given: &mut self.room_given,
         };
-        match self
-            .pump
-            .run(&mut self.devices[self.active].console, &mut port, WRITES)
-        {
+        match self.pump.run_prefix(
+            &mut self.devices[self.active].console,
+            &mut port,
+            WRITES,
+            target,
+        ) {
             Ok(Pumped::More) => self.kick(),
             Ok(Pumped::Idle | Pumped::WaitsRoom) => {}
             Err(_) => {
@@ -1094,6 +1227,9 @@ impl Tty {
             }
         }
         self.tell_output();
+        if target == Some(self.devices[self.active].console.sent_total()) {
+            self.kick();
+        }
     }
 
     /// The writes that wait hear of room, and the drains of an output that
@@ -1110,11 +1246,7 @@ impl Tty {
                 self.ops.tell(w.label, w.key);
             }
         }
-        if self.devices[self.active].console.output_len() == 0 {
-            for d in self.devices[self.active].drainers.iter() {
-                self.ops.tell(d.label, d.key);
-            }
-        }
+        self.mark_drains();
     }
 
     /// Input from the driver: a read in two steps, a chunk of CHUNK bytes
@@ -1326,7 +1458,7 @@ impl Tty {
         let label = s.label();
         let reader = match kind {
             Wait::Read(deadline) => Some(deadline),
-            Wait::Write | Wait::Drain | Wait::MasterRead | Wait::MasterWrite => None,
+            Wait::Write | Wait::Drain(_) | Wait::MasterRead | Wait::MasterWrite => None,
         };
         match key {
             None => {
@@ -1347,7 +1479,7 @@ impl Tty {
                 let list = match kind {
                     Wait::Read(_) => &mut self.devices[self.active].readers,
                     Wait::Write => &mut self.devices[self.active].writers,
-                    Wait::Drain => &mut self.devices[self.active].drainers,
+                    Wait::Drain(_) => &mut self.devices[self.active].drainers,
                     Wait::MasterRead => &mut self.devices[self.active].master_readers,
                     Wait::MasterWrite => &mut self.devices[self.active].master_writers,
                 };
@@ -1377,11 +1509,15 @@ impl Tty {
                     key,
                     description,
                     kind: kind.number(),
+                    drain: tty::drain::Prefix::default(),
                 });
                 list.add(Waiter {
                     label,
                     key,
-                    started: now(),
+                    started: match kind {
+                        Wait::Drain(target) => target,
+                        _ => now(),
+                    },
                     deadline: reader.flatten(),
                 });
                 self.arm_timer();
@@ -1677,8 +1813,7 @@ impl Tty {
         }
     }
 
-    /// DRAIN_START (`take` false) or DRAIN_TAKE: READY once no output is
-    /// left for the driver.
+    /// DRAIN_START or DRAIN_TAKE: captured output is physically transmitted.
     fn drain(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
         let drain = match Drain::parse(r.body(), take) {
             Ok(drain) => drain,
@@ -1710,13 +1845,36 @@ impl Tty {
         {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
-        if self.devices[self.active].console.output_len() == 0 {
-            self.finish(s, drain.key);
-            return long_answer(r, long::Reply::Ready(&[]));
+        self.mark_drains();
+        if let Some(key) = drain.key {
+            let pin = self.pins[(key as u32 - 1) as usize].expect("a pinned drain");
+            if pin.drain.failed {
+                self.finish(s, Some(key));
+                return status(proto_tty::IO_ERROR);
+            }
+            if pin.drain.ready {
+                self.finish(s, Some(key));
+                return long_answer(r, long::Reply::Ready(&[]));
+            }
+        } else if self.devices[self.active].console.output_len() == 0 {
+            let ready = if self.active == 0 {
+                match self.driver_drain(proto_uart::Method::DrainState, None) {
+                    Ok(ready) => ready,
+                    Err(_) => {
+                        self.reconnect();
+                        return status(proto_tty::IO_ERROR);
+                    }
+                }
+            } else {
+                true
+            };
+            if ready {
+                return long_answer(r, long::Reply::Ready(&[]));
+            }
         }
-        // The output goes to the driver in the step, which tells the drain.
+        let target = self.devices[self.active].console.output_target();
         self.kick();
-        self.wait(s, r, drain.key, Wait::Drain, drain.terminal, notify)
+        self.wait(s, r, drain.key, Wait::Drain(target), drain.terminal, notify)
     }
 
     /// READ_CANCEL, WRITE_CANCEL or DRAIN_CANCEL: the operation goes, with
@@ -1742,8 +1900,20 @@ impl Tty {
         if let Err(code) = self.operation(s, cancel.terminal, Some(cancel.key), kind) {
             return status(code);
         }
+        let ready = kind == 3
+            && self.pins[(cancel.key as u32 - 1) as usize].is_some_and(|pin| pin.drain.ready);
         self.finish(s, Some(cancel.key));
-        long_answer(r, long::Reply::Cancelled)
+        if kind == 3 {
+            self.kick();
+        }
+        long_answer(
+            r,
+            if ready {
+                long::Reply::Ready(&[])
+            } else {
+                long::Reply::Cancelled
+            },
+        )
     }
 
     fn watch_ready(r: &mut Request<'_>, ready: watch::Ready) -> Answer {
@@ -2822,7 +2992,9 @@ impl Service<0> for Tty {
             }
             (Source::Session, DRIVER_ROOM) => {
                 rt::service::step_own();
-                self.pump.room_came();
+                if n.bits & 1 != 0 {
+                    self.pump.room_came();
+                }
                 self.push();
             }
             (Source::Session, STEP) => {

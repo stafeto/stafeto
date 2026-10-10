@@ -25,7 +25,8 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use proto_init::ServiceArgs;
 use proto_uart::{
-    Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION, WriteReply, WriteRequest,
+    DrainKey, DrainReply, Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION, WriteReply,
+    WriteRequest,
 };
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer, long};
@@ -279,6 +280,7 @@ impl Uart {
         regs.read(IMSC);
         // The binding lives as long as the driver.
         let _ = sys::irq_ack(&self.irq);
+        self.defer_output(false);
     }
 
     /// Formats a line of the driver into its output, the way the clients'
@@ -301,17 +303,42 @@ impl Uart {
     /// timer, preserving the held deadline across new writes and RX IRQs.
     fn kick(&mut self) {
         self.flush();
+        self.refresh_drain();
         let regs = &self.regs;
         let output = &mut self.state.output;
         let tx_full = || regs.read(FR) & FR_TXFF != 0;
-        if self
+        let started = self
             .irqs
             .start(output, tx_full, |b| regs.write(DR, u32::from(b)))
-            .is_some()
-        {
+            .is_some();
+        self.refresh_drain();
+        self.defer_output(started);
+    }
+
+    /// Latch physical completion before lifting a captured prefix's fence.
+    fn refresh_drain(&mut self) {
+        let State { output, rooms, .. } = &mut *self.state;
+        output.fence(rooms.drain_target(output.submitted()));
+        if output.at_fence() && uart::regs::drained(self.regs.read(FR)) {
+            rooms.drain_complete(output.submitted(), |notify| {
+                let _ = sys::notify(notify, 2);
+            });
+            output.fence(rooms.drain_target(output.submitted()));
+        }
+    }
+
+    /// The same paid timer paces data and polls an unfinished hardware tail.
+    fn defer_output(&mut self, started: bool) {
+        let waiting = !self.state.output.is_idle()
+            || self
+                .state
+                .rooms
+                .drain_target(self.state.output.submitted())
+                .is_some();
+        if started || (waiting && !self.irqs.deferred()) {
             let deadline = self.irqs.defer_transmit(time::ticks_to_ns(time::now()));
-            regs.write(IMSC, self.irqs.imsc());
-            regs.read(IMSC);
+            self.regs.write(IMSC, self.irqs.imsc());
+            self.regs.read(IMSC);
             let _ = sys::timer_set(&self.tx_timer, deadline);
         }
     }
@@ -361,6 +388,7 @@ impl Uart {
         self.answer_read();
         self.tell();
         self.flush();
+        self.refresh_drain();
         if self.left > 0 {
             self.take_log();
         }
@@ -371,6 +399,7 @@ impl Uart {
         self.regs.read(IMSC);
         // The binding lives as long as the driver.
         let _ = sys::irq_ack(&self.irq);
+        self.defer_output(false);
     }
 
     /// The read that waits gets what came.
@@ -392,7 +421,7 @@ impl Uart {
             let State {
                 output, records, ..
             } = &mut *self.state;
-            if !output.log_done() {
+            if !output.log_done() || !output.accepts_log() {
                 return;
             }
             let Ok(batch) = sys::log_take(&self.log, records) else {
@@ -417,6 +446,56 @@ impl Uart {
         self.deadline = next_release(self.t0, LOG_PERIOD_NS, now);
         // The driver's own timer: timer_set has no error to give.
         let _ = sys::timer_set(&self.timer, self.deadline);
+    }
+
+    /// Observe only an existing paid ROOM and a full terminal operation key.
+    fn drain(&mut self, r: &mut Request<'_>) -> Answer {
+        if Method::from_number(r.method()) == Some(Method::DrainState) {
+            if r.body().finish().is_err() || !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let ready = self.state.output.clients_empty()
+                && self.state.writes.is_empty()
+                && uart::regs::drained(self.regs.read(FR));
+            return match (DrainReply { ready }).write(r.reply()) {
+                Ok(()) => Answer::Reply(Outgoing::new()),
+                Err(status) => Answer::Status(status),
+            };
+        }
+        let key = match DrainKey::read(r.body()) {
+            Ok(request) if r.handles.is_empty() => request.key,
+            Ok(_) => return Answer::Status(Status::BadSize),
+            Err(status) => return Answer::Status(status),
+        };
+        let label = r.label();
+        let method = Method::from_number(r.method());
+        let State {
+            output,
+            writes,
+            rooms,
+            ..
+        } = &mut *self.state;
+        let ready = match method {
+            Some(Method::DrainStart) => rooms.drain_begin(
+                label,
+                key,
+                output.target().wrapping_add(writes.queued_bytes() as u64),
+            ),
+            Some(Method::DrainTake) => rooms.drain(label, key),
+            Some(Method::DrainRelease) => rooms.drain_release(label, key).then_some(false),
+            _ => None,
+        };
+        let Some(mut ready) = ready else {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        };
+        self.kick();
+        if method != Some(Method::DrainRelease) {
+            ready = self.state.rooms.drain(label, key).unwrap_or(ready);
+        }
+        match (DrainReply { ready }).write(r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
     }
 
     /// WRITE (spec 13.5, 13.8): the bytes go into the ring whole and the
@@ -602,6 +681,10 @@ const METHODS: &[u16] = &[
     Method::Clone.number(),
     Method::WriteSome.number(),
     Method::Room.number(),
+    Method::DrainStart.number(),
+    Method::DrainTake.number(),
+    Method::DrainRelease.number(),
+    Method::DrainState.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -614,6 +697,10 @@ const METHODS: &[u16] = &[
     Method::Clone.number(),
     Method::WriteSome.number(),
     Method::Room.number(),
+    Method::DrainStart.number(),
+    Method::DrainTake.number(),
+    Method::DrainRelease.number(),
+    Method::DrainState.number(),
 ];
 
 impl Service<HELD> for Uart {
@@ -631,6 +718,9 @@ impl Service<HELD> for Uart {
             Some(Method::Clone) => self.clone_session(r),
             Some(Method::WriteSome) => self.write_some(r),
             Some(Method::Room) => self.room(r),
+            Some(
+                Method::DrainStart | Method::DrainTake | Method::DrainRelease | Method::DrainState,
+            ) => self.drain(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => crash(r),
             _ => Answer::Status(Status::UnknownMethod),
@@ -643,14 +733,18 @@ impl Service<HELD> for Uart {
     fn gone(&mut self, s: &mut Session<(), HELD>) {
         let label = s.label();
         let State {
+            output,
             writes,
             input,
             rooms,
             ..
         } = &mut *self.state;
-        writes.gone(label, drop);
+        writes.gone_before(label, output.target(), drop, |start, len| {
+            rooms.drain_discard(output.submitted(), start, len);
+        });
         rooms.gone(label);
         drop(input.gone(label));
+        self.kick();
     }
 
     /// The last copy of a session CLONE gave went.

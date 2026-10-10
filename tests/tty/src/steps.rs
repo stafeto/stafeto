@@ -481,3 +481,134 @@ pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(
     rt::println!("tty-probe: mixed waits and full tcflow ok");
     Ok(())
 }
+
+/// The software prefix has left TTY, while its backend acknowledgment waits.
+/// Later output cannot erase a completed drain retained for canonical Cancel.
+pub fn physical_drain_prefix(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> {
+    let stub = rt::service::connect(parent, "uart").map_err(|_| "no driver")?;
+    let before = stub_call(&stub, TAKEN, &[]).map_err(fail)?;
+    stub_call(&stub, HOLD, &2u32.to_le_bytes()).map_err(fail)?;
+    let mut out = [0; 16];
+    let mut write = Writer::new();
+    write_request(None, b"prefix", &mut write).map_err(fail)?;
+    if probe.step_on(&probe.tty, write.as_bytes(), None, &mut out) != Ok(Step::Ready(4)) {
+        return Err("physical prefix write");
+    }
+    let mut transferred = false;
+    for _ in 0..32 {
+        if stub_call(&stub, TAKEN, &[]).map_err(fail)? >= before + 6 {
+            transferred = true;
+            break;
+        }
+    }
+    if !transferred {
+        return Err("physical prefix never reached driver");
+    }
+    let mut start = Writer::new();
+    Drain {
+        key: None,
+        terminal: CONSOLE,
+        blocked: 0,
+    }
+    .write(&mut start)
+    .map_err(fail)?;
+    // The hardware-only wait must still preserve the existing paid limit.
+    // A client retries this short refusal; it has not captured a prefix.
+    let mut reads = [0u64; WAITERS];
+    for key in &mut reads {
+        let mut request = Writer::new();
+        read_request(None, 1, &mut request).map_err(fail)?;
+        let Ok(Step::Wait(waiting)) = probe.step_on(&probe.tty, request.as_bytes(), None, &mut out)
+        else {
+            return Err("physical admission could not fill existing reads");
+        };
+        *key = waiting;
+    }
+    if probe.step_on(&probe.tty, start.as_bytes(), None, &mut out)
+        != Err(Status::Kernel(abi::Error::LimitReached))
+    {
+        return Err("physical admission changed existing paid capacity");
+    }
+    let mut release = Writer::new();
+    Cancel {
+        key: reads[0],
+        terminal: CONSOLE,
+    }
+    .write(Method::ReadCancel, &mut release)
+    .map_err(fail)?;
+    if probe.step_on(&probe.tty, release.as_bytes(), None, &mut out) != Ok(Step::Cancelled) {
+        return Err("physical admission read release");
+    }
+    let Ok(Step::Wait(key)) = probe.step_on(&probe.tty, start.as_bytes(), None, &mut out) else {
+        return Err("empty TTY ignored busy backend");
+    };
+    let mut take = Writer::new();
+    Drain {
+        key: Some(key),
+        terminal: CONSOLE,
+        blocked: 0,
+    }
+    .write(&mut take)
+    .map_err(fail)?;
+    if probe.step_on(
+        &probe.tty,
+        take.as_bytes(),
+        Some(probe.labelled(key).map_err(fail)?),
+        &mut out,
+    ) != Ok(Step::Armed)
+    {
+        return Err("busy physical drain did not arm");
+    }
+    let mut later = Writer::new();
+    write_request(None, b"later", &mut later).map_err(fail)?;
+    if probe.step_on(&probe.tty, later.as_bytes(), None, &mut out) != Ok(Step::Ready(4)) {
+        return Err("later output was not retained");
+    }
+    if stub_call(&stub, TAKEN, &[]).map_err(fail)? != before + 6 {
+        return Err("later output crossed physical fence");
+    }
+    stub_call(&stub, HOLD, &0u32.to_le_bytes()).map_err(fail)?;
+    probe.bit(key).map_err(fail)?;
+    let mut cancel = Writer::new();
+    Cancel {
+        key,
+        terminal: CONSOLE,
+    }
+    .write(Method::DrainCancel, &mut cancel)
+    .map_err(fail)?;
+    if probe.step_on(&probe.tty, cancel.as_bytes(), None, &mut out) != Ok(Step::Ready(0)) {
+        return Err("completed physical drain lost canonical READY");
+    }
+    if probe
+        .step_on(&probe.tty, take.as_bytes(), None, &mut out)
+        .is_ok()
+    {
+        return Err("finished physical drain key was replayed");
+    }
+    let mut drained = false;
+    for _ in 0..32 {
+        if stub_call(&stub, TAKEN, &[]).map_err(fail)? == before + 11 {
+            drained = true;
+            break;
+        }
+    }
+    if !drained {
+        return Err("later output stranded after physical drain");
+    }
+    for key in &reads[1..] {
+        let mut release = Writer::new();
+        Cancel {
+            key: *key,
+            terminal: CONSOLE,
+        }
+        .write(Method::ReadCancel, &mut release)
+        .map_err(fail)?;
+        if probe.step_on(&probe.tty, release.as_bytes(), None, &mut out) != Ok(Step::Cancelled) {
+            return Err("physical admission retained a reader");
+        }
+    }
+    rt::println!(
+        "tty-probe: physical drain waits past software acceptance; prefix and canonical READY kept"
+    );
+    Ok(())
+}
