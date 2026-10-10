@@ -108,3 +108,106 @@ pub extern "C" fn process_lifetime(pid: i32) -> i32 {
     })();
     result.unwrap_or_else(|error| error)
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ram_close_event() -> i32 {
+    let result = (|| {
+        let began = rt::time::now();
+        let transport =
+            posix_abi::shared::with_files(|files| Ok(files.transport())).map_err(|_| -1)?;
+        let files = transport.files();
+        let mut held = [rt::fs::PreparedOpen {
+            fd: 0,
+            slot: 0,
+            generation: 0,
+            random: false,
+        }; 32];
+        for item in &mut held[..2] {
+            let fd = files
+                .open("/etc/motd", proto_fs::READ_ONLY)
+                .map_err(|_| -2)?;
+            *item = files.capture_description(fd).map_err(|_| -3)?.held;
+        }
+        let endpoint =
+            rt::fs::Files::clone_exact_on(files.sessions().0, &held[..2]).map_err(|_| -4)?;
+        let child = rt::fs::Files::from_sessions(endpoint, None);
+        let event = proto_fs::CloseEvent {
+            key: proto_fs::CloseKey {
+                slot: 63,
+                generation: 9,
+            },
+            packed: held[0].marked_fd(),
+            description_generation: held[0].generation,
+            last_alias: true,
+        };
+        child.close_event_once(event).map_err(|_| -5)?;
+        if child.close_exact(held[0]).map_err(|_| -6)? != rt::fs::CloseOutcome::Closed {
+            return Err(-7);
+        }
+        child.close_event_once(event).map_err(|_| -8)?;
+        let other = proto_fs::CloseEvent {
+            packed: held[1].marked_fd(),
+            description_generation: held[1].generation,
+            ..event
+        };
+        if child.close_event_once(other)
+            != Err(proto_wire::Status::Unknown(proto_fs::INVALID_ARGUMENT))
+        {
+            return Err(-9);
+        }
+        let newer = proto_fs::CloseKey {
+            generation: 10,
+            ..event.key
+        };
+        if child.close_event_once(proto_fs::CloseEvent {
+            key: newer,
+            ..event
+        }) != Err(proto_wire::Status::Unknown(proto_fs::BAD_FD))
+        {
+            return Err(-10);
+        }
+        child.close_event_once(event).map_err(|_| -11)?;
+        child
+            .close_event_once(proto_fs::CloseEvent {
+                key: newer,
+                ..other
+            })
+            .map_err(|_| -12)?;
+        if child.close_event_once(event) != Err(proto_wire::Status::Unknown(proto_fs::OPEN_RETIRED))
+        {
+            return Err(-13);
+        }
+        if child.close_exact(held[1]).map_err(|_| -14)? != rt::fs::CloseOutcome::Closed {
+            return Err(-15);
+        }
+        for item in &held[..2] {
+            if files.read_at(item.fd, 0, &mut [0; 1]).map_err(|_| -16)? != 1 {
+                return Err(-17);
+            }
+            if files.close_exact(*item).map_err(|_| -18)? != rt::fs::CloseOutcome::Closed {
+                return Err(-19);
+            }
+        }
+        drop(child);
+        for item in &mut held {
+            let fd = files
+                .open("/etc/motd", proto_fs::READ_ONLY)
+                .map_err(|_| -20)?;
+            *item = files.capture_description(fd).map_err(|_| -21)?.held;
+        }
+        // An unopened inherited session leaves all 32 references in its birth.
+        let born = rt::fs::Files::clone_exact_on(files.sessions().0, &held).map_err(|_| -22)?;
+        drop(born);
+        for item in &held {
+            if files.close_exact(*item).map_err(|_| -23)? != rt::fs::CloseOutcome::Closed {
+                return Err(-24);
+            }
+        }
+        rt::println!(
+            "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok, ticks={}",
+            rt::time::now().saturating_sub(began)
+        );
+        Ok(0)
+    })();
+    result.unwrap_or_else(|error| error)
+}

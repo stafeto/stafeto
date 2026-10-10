@@ -12,6 +12,7 @@ pub mod authority;
 pub mod change;
 #[cfg(test)]
 mod change_tests;
+pub mod close;
 pub mod cwd;
 #[cfg(test)]
 mod cwd_tests;
@@ -281,6 +282,8 @@ pub struct Fds {
     /// Published session references, independent of physical operation holds.
     live_fds: u32,
     pub claimed: bool,
+    /// The endpoint ended; this paid cell awaits bounded physical cleanup.
+    pub departed: bool,
     pub binding: authority::Binding,
     pub authority_index: u16,
     pub binding_preparation: Option<u16>,
@@ -295,6 +298,8 @@ pub struct Fds {
     pub auth_probe_gc_reservation: Option<storage::Reservation>,
     pub resolvers: [u64; 16],
     pub open_watermarks: [u64; proto_fs::JOB_KEY_PLACES],
+    /// Independent exact numeric-close receipts survive physical descriptor reuse.
+    close_receipts: [Option<proto_fs::CloseEvent>; proto_fs::CLOSE_KEY_PLACES],
     pub image_hold: Option<image::ImageHold>,
     pub image_outcome: Option<image::ImageOutcome>,
     /// Exact completed operations survive Close as tombstones until this fd is reused.
@@ -311,6 +316,7 @@ impl Default for Fds {
             tentative: 0,
             live_fds: 0,
             claimed: false,
+            departed: false,
             binding: authority::Binding::Unbound,
             authority_index: storage::NONE,
             binding_preparation: None,
@@ -324,6 +330,7 @@ impl Default for Fds {
             auth_probe_gc_reservation: None,
             resolvers: [0; 16],
             open_watermarks: [0; proto_fs::JOB_KEY_PLACES],
+            close_receipts: [None; proto_fs::CLOSE_KEY_PLACES],
             image_hold: None,
             image_outcome: None,
             open_receipts: [OpenReceipt::EMPTY; OPEN_MAX],
@@ -335,6 +342,22 @@ impl Default for Fds {
 }
 
 impl Fds {
+    /// Admission ownership returns only after every physical hold has gone.
+    pub fn custody_empty(&self) -> bool {
+        #[cfg(feature = "auth-probe")]
+        if self.auth_probe_gc.is_some() || self.auth_probe_gc_reservation.is_some() {
+            return false;
+        }
+        self.slots.iter().all(Option::is_none)
+            && self.resolvers.iter().all(|&id| id == 0)
+            && self.preparations.iter().all(Option::is_none)
+            && self.image_hold.is_none()
+            && self.image_outcome.is_none()
+            && self.cwd.is_none()
+            && self.binding_preparation.is_none()
+            && self.binding_source.is_none()
+            && self.authority_index == storage::NONE
+    }
     /// Transfer one exact retained birth into an unclaimed RT default session.
     pub fn claim_retained_birth(&mut self, birth: &mut Option<(u64, Self)>, label: u64) -> bool {
         let Some((owner, source)) = birth.as_mut().filter(|(owner, _)| *owner == label) else {
@@ -351,6 +374,7 @@ impl Fds {
             || self.tentative != 0
             || self.live_fds != 0
             || self.claimed
+            || self.departed
             || self.binding != authority::Binding::Unbound
             || self.authority_index != storage::NONE
             || self.binding_preparation.is_some()
@@ -361,6 +385,7 @@ impl Fds {
                 .open_watermarks
                 .iter()
                 .any(|&generation| generation != 0)
+            || self.close_receipts.iter().any(Option::is_some)
             || self.image_hold.is_some()
             || self.image_outcome.is_some()
             || self

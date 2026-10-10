@@ -239,6 +239,8 @@ fn main(_: u64) -> u64 {
         maintenance_burst: ramfs::maintenance::Burst::default(),
         next_audit_ns: 0,
         maintenance_jobs: false,
+        departure_turn: false,
+        departures: ramfs::maintenance::Departures::new(SESSIONS + BIRTHS),
         data_gc_turn: false,
         #[cfg(feature = "steps")]
         steps_reclaim_owner: None,
@@ -297,6 +299,8 @@ struct Fs {
         ramfs::maintenance::Burst<{ 4 * ramfs::storage::PREPARATIONS + 2 * (SESSIONS + BIRTHS) }>,
     next_audit_ns: u64,
     maintenance_jobs: bool,
+    departure_turn: bool,
+    departures: ramfs::maintenance::Departures<{ (SESSIONS + BIRTHS).div_ceil(64) }>,
     data_gc_turn: bool,
     /// The steps fixture retains queued nodes until the measured commit.
     #[cfg(feature = "steps")]
@@ -519,6 +523,14 @@ impl Fs {
             return true;
         }
         if let Some(id) = fds.resolvers.iter().copied().find(|&id| id != 0) {
+            if fds.departed
+                && self
+                    .job_slot(id, label)
+                    .is_ok_and(|i| self.jobs[i].as_ref().is_some_and(|job| !job.abandoned))
+            {
+                self.abandon_job(id, label, fds);
+                return true;
+            }
             let before = (fds.resolvers, self.ram.storage.available().pages);
             self.cancel_job(id, label, Some(fds));
             return fds.resolvers != before.0 || self.ram.storage.available().pages > before.1;
@@ -631,13 +643,8 @@ impl Fs {
             return;
         };
         if outcome.phase == ramfs::image::ImagePhase::Prepared {
-            if let Some(i) = self.birth_slot(outcome.label) {
-                let (_, image) = self.births[i].as_mut().expect("retained image birth");
-                Self::drop_identity_fields(self.ram, self.identities, image);
-                self.ram.release(image);
-                self.births[i] = None;
-            }
-            self.places.release(outcome.label);
+            // A prepared image can hold all 32 inherited descriptions too.
+            self.closed(outcome.label);
         } else if let Some(i) = self.image_identity(&outcome)
             && let Some(image) = self.identities[i].as_mut().and_then(|i| i.image.as_mut())
         {
@@ -1090,21 +1097,21 @@ impl Service<0> for Fs {
     const PLACED: usize = SESSIONS;
     type Data = Fds;
 
-    /// The client of `s` went: its descriptors close.
+    /// Logical FD death precedes bounded physical reclamation.
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
+        self.maintenance_burst.restart();
         self.legacy_pending = true;
-        self.clear_image_outcome(&mut s.data);
-        for id in s.data.resolvers {
-            if id != 0 {
-                self.abandon_job(id, s.label(), &mut s.data);
-            }
+        Self::depart_fields(self.ram, self.locks, self.identities, &mut s.data);
+        if !s.data.custody_empty() {
+            self.departures.admit(self.places.place(s.label()));
         }
-        self.drop_identity(&mut s.data);
-        self.ram.release(&mut s.data);
     }
 
-    /// The last copy of a session Clone made went before it sent anything:
-    /// the descriptors it was born with close.
+    fn keep_departed(&self, s: &Session<Fds, 0>) -> bool {
+        s.data.departed && !s.data.custody_empty()
+    }
+
+    /// A never-used clone retains its paid birth until cleanup finishes.
     fn closed(&mut self, label: u64) {
         self.maintenance_burst.restart();
         self.legacy_pending = true;
@@ -1113,20 +1120,20 @@ impl Service<0> for Fs {
             self.steps_reclaim_owner = None;
             let _ = sys::notify(&self.channel, 1);
         }
+        if self.departures.contains(self.places.place(label)) {
+            return;
+        }
+        if let Some(i) = self.birth_slot(label) {
+            let (_, fds) = self.births[i].as_mut().expect("exact retained birth");
+            Self::depart_fields(self.ram, self.locks, self.identities, fds);
+            if !fds.custody_empty() {
+                self.departures.admit(SESSIONS + i);
+                return;
+            }
+            self.births[i] = None;
+        }
         self.places.release(label);
         self.clones.gone(label);
-        if let Some(i) = self.birth_slot(label)
-            && let Some((_, mut fds)) = self.births[i].take()
-        {
-            self.clear_image_outcome(&mut fds);
-            for id in fds.resolvers {
-                if id != 0 {
-                    self.abandon_job(id, label, &mut fds);
-                }
-            }
-            self.drop_identity(&mut fds);
-            self.ram.release(&mut fds);
-        }
     }
 
     fn maintenance(
@@ -1218,14 +1225,55 @@ impl Service<0> for Fs {
             }
             self.legacy_pending = self.maintenance_burst.again(
                 work,
-                work || self.maintenance.remaining != 0 || self.orphan_count != 0,
+                work || self.departures.pending()
+                    || self.maintenance.remaining != 0
+                    || self.orphan_count != 0,
+            );
+            self.notify_maintenance();
+            return;
+        }
+        self.departure_turn = !self.departure_turn;
+        if self.departure_turn
+            && let Some(i) = self.departures.next_place()
+        {
+            let (label, complete) = if i < SESSIONS {
+                let s = sessions[i].as_mut().expect("retained departed session");
+                let label = s.label();
+                work = self.cleanup_step(&mut s.data, label);
+                (label, s.data.custody_empty())
+            } else {
+                let birth = &mut self.births[i - SESSIONS];
+                let (label, mut fds) = birth.take().expect("retained departed birth");
+                work = self.cleanup_step(&mut fds, label);
+                let complete = fds.custody_empty();
+                self.births[i - SESSIONS] = Some((label, fds));
+                (label, complete)
+            };
+            if complete {
+                if i < SESSIONS {
+                    sessions[i] = None;
+                } else {
+                    self.births[i - SESSIONS] = None;
+                }
+                self.departures.release(i);
+                self.places.release(label);
+                self.clones.gone(label);
+                work = true;
+            }
+            self.legacy_pending = self.maintenance_burst.again(
+                work,
+                work || self.departures.pending()
+                    || self.maintenance.remaining != 0
+                    || self.orphan_count != 0,
             );
             self.notify_maintenance();
             return;
         }
         let mut client_work = false;
         let i = self.maintenance.position;
-        if i < SESSIONS {
+        if self.departures.contains(i) {
+            // Queued cells receive separate fair bounded cleanup turns.
+        } else if i < SESSIONS {
             if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
                 let label = s.label();
                 client_work = self.cleanup_step(&mut s.data, label);
@@ -1239,7 +1287,9 @@ impl Service<0> for Fs {
         // A maintenance notification makes reclamation progress with no client request.
         self.legacy_pending = self.maintenance_burst.again(
             work,
-            work || self.maintenance.remaining != 0 || self.orphan_count != 0,
+            work || self.departures.pending()
+                || self.maintenance.remaining != 0
+                || self.orphan_count != 0,
         );
         self.notify_maintenance();
     }
@@ -1500,6 +1550,7 @@ impl Service<0> for Fs {
                 Some(
                     Method::Close
                         | Method::CloseExact
+                        | Method::CloseEvent
                         | Method::ResolveCancel
                         | Method::OpenCancel
                         | Method::DataCancel
@@ -1573,7 +1624,7 @@ impl Service<0> for Fs {
         }
         let cleanup = matches!(
             Method::from_number(r.method()),
-            Some(Method::Close | Method::CloseExact | Method::ResolveCancel)
+            Some(Method::Close | Method::CloseExact | Method::CloseEvent | Method::ResolveCancel)
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
@@ -1893,6 +1944,22 @@ impl Service<0> for Fs {
                     return Answer::Status(Status::BadSize);
                 }
                 Answer::Reply(Outgoing::new())
+            }
+            Some(Method::CloseEvent) => {
+                if !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let event = match proto_fs::CloseEvent::read(body) {
+                    Ok(event) => event,
+                    Err(error) => return Answer::Status(error),
+                };
+                match self.ram.close_event(&mut s.data, self.locks, event) {
+                    Ok(()) => {
+                        self.notify_maintenance();
+                        Answer::Status(Status::Ok)
+                    }
+                    Err(code) => status(code),
+                }
             }
             Some(Method::CloseExact) => {
                 let (Ok(packed), Ok(generation)) = (body.u32(), body.u64()) else {
@@ -2234,6 +2301,21 @@ impl Fs {
         }
         Ok(())
     }
+    fn depart_fields(
+        ram: &mut Ram<'_>,
+        locks: &mut LockService,
+        identities: &mut Identities,
+        fds: &mut Fds,
+    ) {
+        if fds.departed {
+            return;
+        }
+        ram.detach_session_descriptions(fds, locks);
+        Self::drop_identity_fields(ram, identities, fds);
+        fds.binding = Binding::Cleanup;
+        fds.departed = true;
+    }
+
     fn drop_identity(&mut self, fds: &mut Fds) {
         Self::drop_identity_fields(self.ram, self.identities, fds);
     }

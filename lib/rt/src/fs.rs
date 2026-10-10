@@ -586,6 +586,14 @@ impl Files {
         Self::open_reply(&reply, 8)?;
         Ok(true)
     }
+    /// Replay one exact close event independently of physical backend cleanup.
+    pub fn close_event_once(&self, event: proto_fs::CloseEvent) -> Result<(), Status> {
+        let mut request = Writer::new();
+        event.write(&mut request)?;
+        let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
+        Self::open_reply(&reply, 8)
+    }
+
     /// Renew an unpublished path proof using the same paid operation.
     /// Every retry sends one bounded request without a numeric reservation.
     pub fn open_prepare_recover(&self, id: u64) -> Result<(), Status> {

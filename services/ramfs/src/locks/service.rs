@@ -327,6 +327,19 @@ mod tests {
         request: Request,
         payer: Root,
     ) -> Result<Response, Error> {
+        for _ in 0..4000 {
+            if !service.busy() {
+                break;
+            }
+            let progress = real_step(service, ram, page);
+            assert!(progress.visited <= 8);
+            assert!(progress.completed.is_none());
+            check_pins(service, &ram.storage);
+        }
+        assert!(
+            !service.busy(),
+            "previous close debt drains before admission"
+        );
         service.start(&mut ram.storage, request, payer)?;
         let mut response = None;
         for _ in 0..4000 {
@@ -348,6 +361,420 @@ mod tests {
             generation: description.generation,
         };
         request
+    }
+    fn close_blocker(
+        service: &mut LockService,
+        ram: &mut crate::Ram<'_>,
+        page: &proto_process::lifetimes::Page,
+        inode: Token,
+        start: i64,
+    ) -> Option<Owner> {
+        match real_run(
+            service,
+            ram,
+            Some(page),
+            request(inode, 259, Command::Get(Kind::Write), start, 1),
+            root(999, 1),
+        )
+        .unwrap()
+        {
+            Response::Blocker(blocker) => blocker.map(|lock| lock.owner),
+            Response::Changed => panic!("GET result"),
+        }
+    }
+    fn close_who(pid: u32) -> proto_process::WhoReply {
+        proto_process::WhoReply {
+            pid,
+            credentials: proto_process::Credentials::NOBODY,
+            generation: 1,
+            loader: None,
+            index: pid & 255,
+            ctty: None,
+            image: 1,
+            groups: proto_process::Groups::EMPTY,
+            limits: proto_process::ResourceLimits::initial(2 * 1024 * 1024),
+            root: proto_process::ExpenditureRoot {
+                pid: 10,
+                generation: 1,
+            },
+        }
+    }
+    fn close_event(
+        ram: &crate::Ram<'_>,
+        fds: &crate::Fds,
+        fd: u32,
+        slot: u32,
+        generation: u64,
+        last_alias: bool,
+    ) -> proto_fs::CloseEvent {
+        let description = ram.capture_description(fds, fd).unwrap().0.description;
+        proto_fs::CloseEvent {
+            key: proto_fs::CloseKey { slot, generation },
+            packed: fd | u32::from(description.slot) << proto_fs::OPEN_DESCRIPTION_SHIFT,
+            description_generation: description.generation,
+            last_alias,
+        }
+    }
+    #[test]
+    fn numeric_alias_close_revokes_only_that_inode_pid_and_replay_preserves_new_locks() {
+        let (mut ram, inodes) = fixture();
+        let mut service = fresh();
+        let page = page();
+        let payer = root(10, 1);
+        let mut fds = crate::Fds {
+            root: payer,
+            binding: crate::authority::Binding::Active(close_who(257)),
+            ..crate::Fds::default()
+        };
+        let fd = ram.open(&mut fds, "/lock0", proto_fs::READ_ONLY).unwrap();
+        let description = ram.capture_description(&fds, fd).unwrap().0.description;
+        for start in [0, 6] {
+            real_run(
+                &mut service,
+                &mut ram,
+                Some(&page),
+                request(inodes[0], 257, Command::Set(Some(Kind::Read)), start, 1),
+                payer,
+            )
+            .unwrap();
+        }
+        for r in [
+            owned(
+                request(inodes[0], 257, Command::Set(Some(Kind::Read)), 2, 1),
+                description,
+            ),
+            request(inodes[0], 258, Command::Set(Some(Kind::Read)), 4, 1),
+            request(inodes[1], 257, Command::Set(Some(Kind::Read)), 0, 1),
+        ] {
+            real_run(&mut service, &mut ram, Some(&page), r, payer).unwrap();
+        }
+        let event = close_event(&ram, &fds, fd, 48, 1, false);
+        ram.close_event(&mut fds, &mut service, event).unwrap();
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[0], 0),
+            None
+        );
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[1], 0),
+            Some(Owner::Process(257))
+        );
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[0], 4),
+            Some(Owner::Process(258))
+        );
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[0], 2),
+            Some(Owner::Description {
+                slot: description.slot,
+                generation: description.generation
+            })
+        );
+        assert!(
+            ram.live_description(&fds, ram.capture_description(&fds, fd).unwrap().0)
+                .is_ok()
+        );
+        assert_eq!(ram.read(&mut fds, fd, &mut [0; 1]), Ok(1));
+        real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            request(inodes[0], 257, Command::Set(Some(Kind::Read)), 0, 1),
+            payer,
+        )
+        .unwrap();
+        ram.close_event(&mut fds, &mut service, event).unwrap();
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[0], 0),
+            Some(Owner::Process(257))
+        );
+    }
+    #[test]
+    fn inherited_last_fd_close_preserves_parent_pid_and_excludes_ofd_before_physical_io() {
+        let (mut ram, inodes) = fixture();
+        let mut service = fresh();
+        let page = page();
+        let payer = root(10, 1);
+        let who = close_who(257);
+        let mut parent = crate::Fds {
+            root: payer,
+            binding: crate::authority::Binding::Active(who),
+            ..crate::Fds::default()
+        };
+        let fd = ram
+            .open(&mut parent, "/lock0", proto_fs::READ_ONLY)
+            .unwrap();
+        let held = ram.capture_description(&parent, fd).unwrap().0;
+        let mut child = ram.clone_fds(&parent, &[fd]).unwrap();
+        child.binding = crate::authority::Binding::Inherited(who);
+        real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            owned(
+                request(inodes[0], 257, Command::Set(Some(Kind::Read)), 2, 1),
+                held.description,
+            ),
+            payer,
+        )
+        .unwrap();
+        let event = close_event(&ram, &parent, fd, 48, 1, true);
+        ram.close_event(&mut parent, &mut service, event).unwrap();
+        assert!(ram.lock_parts().1.live(held.description));
+        let next = ram
+            .open(&mut parent, "/lock0", proto_fs::READ_ONLY)
+            .unwrap();
+        real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            request(inodes[0], 257, Command::Set(Some(Kind::Read)), 0, 1),
+            payer,
+        )
+        .unwrap();
+        let event = close_event(&ram, &child, fd, 48, 1, true);
+        ram.close_event(&mut child, &mut service, event).unwrap();
+        assert_eq!(
+            service.counts().published,
+            1,
+            "OFD revocation precedes the reply and audit"
+        );
+        assert!(!ram.lock_parts().1.live(held.description));
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[0], 0),
+            Some(Owner::Process(257))
+        );
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[0], 2),
+            None
+        );
+        assert_eq!(ram.read(&mut parent, fd, &mut [0; 1]), Ok(1));
+        assert_eq!(
+            ram.pread(&child, fd, 0, &mut [0; 1], proto_fs::Timestamp::ZERO),
+            Ok(1)
+        );
+        assert!(
+            ram.live_description(&parent, ram.capture_description(&parent, next).unwrap().0)
+                .is_ok()
+        );
+    }
+    #[test]
+    fn cached_close_precedes_reused_descriptor_and_rejected_new_body_preserves_the_old_receipt() {
+        let (mut ram, inodes) = fixture();
+        let mut service = fresh();
+        let page = page();
+        let payer = root(10, 1);
+        let mut fds = crate::Fds {
+            root: payer,
+            binding: crate::authority::Binding::Active(close_who(257)),
+            ..crate::Fds::default()
+        };
+        let fd = ram.open(&mut fds, "/lock0", proto_fs::READ_ONLY).unwrap();
+        let original = close_event(&ram, &fds, fd, 48, 9, true);
+        ram.close_event(&mut fds, &mut service, original).unwrap();
+        ram.close(&mut fds, fd).unwrap();
+        let next = ram.open(&mut fds, "/lock1", proto_fs::READ_ONLY).unwrap();
+        assert_eq!(fd, next);
+        let replacement = close_event(&ram, &fds, next, 48, 10, true);
+        assert_ne!(
+            original.description_generation,
+            replacement.description_generation
+        );
+        real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            request(inodes[1], 257, Command::Set(Some(Kind::Read)), 0, 1),
+            payer,
+        )
+        .unwrap();
+        assert_eq!(ram.close_event(&mut fds, &mut service, original), Ok(()));
+        assert_eq!(
+            ram.close_event(
+                &mut fds,
+                &mut service,
+                proto_fs::CloseEvent {
+                    key: original.key,
+                    ..replacement
+                }
+            ),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            ram.close_event(
+                &mut fds,
+                &mut service,
+                proto_fs::CloseEvent {
+                    key: proto_fs::CloseKey {
+                        generation: 8,
+                        ..original.key
+                    },
+                    ..original
+                }
+            ),
+            Err(proto_fs::OPEN_RETIRED)
+        );
+        assert_eq!(
+            ram.close_event(
+                &mut fds,
+                &mut service,
+                proto_fs::CloseEvent {
+                    key: replacement.key,
+                    ..original
+                }
+            ),
+            Err(proto_fs::BAD_FD)
+        );
+        assert_eq!(ram.close_event(&mut fds, &mut service, original), Ok(()));
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[1], 0),
+            Some(Owner::Process(257))
+        );
+        assert!(
+            ram.live_description(&fds, ram.capture_description(&fds, next).unwrap().0)
+                .is_ok()
+        );
+        ram.close_event(&mut fds, &mut service, replacement)
+            .unwrap();
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[1], 0),
+            None
+        );
+        assert_eq!(
+            ram.close_event(&mut fds, &mut service, original),
+            Err(proto_fs::OPEN_RETIRED)
+        );
+    }
+    #[test]
+    fn pending_and_handoff_close_use_the_exact_target_pid_while_unvouched_states_do_not() {
+        let who = close_who(257);
+        for binding in [
+            crate::authority::Binding::Active(who),
+            crate::authority::Binding::Pending(who),
+            crate::authority::Binding::Handoff(who),
+        ] {
+            let (mut ram, inodes) = fixture();
+            let mut service = fresh();
+            let page = page();
+            let payer = root(10, 1);
+            let mut fds = crate::Fds {
+                root: payer,
+                binding,
+                ..crate::Fds::default()
+            };
+            let fd = ram.open(&mut fds, "/lock0", proto_fs::READ_ONLY).unwrap();
+            real_run(
+                &mut service,
+                &mut ram,
+                Some(&page),
+                request(inodes[0], 257, Command::Set(Some(Kind::Read)), 0, 1),
+                payer,
+            )
+            .unwrap();
+            let event = close_event(&ram, &fds, fd, 48, 1, false);
+            ram.close_event(&mut fds, &mut service, event).unwrap();
+            assert_eq!(
+                close_blocker(&mut service, &mut ram, &page, inodes[0], 0),
+                None
+            );
+        }
+        for binding in [
+            crate::authority::Binding::Boot,
+            crate::authority::Binding::Unbound,
+            crate::authority::Binding::Cleanup,
+            crate::authority::Binding::Inherited(who),
+        ] {
+            assert_eq!(binding.close_pid(), None);
+        }
+    }
+    #[test]
+    fn all_close_domains_leave_open_watermarks_independent_and_fork_starts_with_fresh_receipts() {
+        let mut ram = crate::Ram::default();
+        let mut service = fresh();
+        let mut parent = crate::Fds {
+            binding: crate::authority::Binding::Boot,
+            ..crate::Fds::default()
+        };
+        parent.open_watermarks.fill(97);
+        let fd = ram
+            .open(&mut parent, "/etc/motd", proto_fs::READ_ONLY)
+            .unwrap();
+        for slot in 48..64 {
+            let event = close_event(&ram, &parent, fd, slot, 7, false);
+            ram.close_event(&mut parent, &mut service, event).unwrap();
+        }
+        assert!(parent.open_watermarks.iter().all(|&g| g == 97));
+        let mut child = ram.clone_fds(&parent, &[fd]).unwrap();
+        assert!(child.close_receipts.iter().all(Option::is_none));
+        let held = ram.capture_description(&child, fd).unwrap().0;
+        let event = close_event(&ram, &child, fd, 48, 1, true);
+        ram.close_event(&mut child, &mut service, event).unwrap();
+        assert!(ram.lock_parts().1.live(held.description));
+        assert!(parent.close_receipts.iter().all(Option::is_some));
+    }
+    #[test]
+    fn disappearance_of_32_true_descriptors_excludes_ofds_and_preserves_the_live_pid_group() {
+        let (mut ram, inodes) = fixture();
+        let mut service = fresh();
+        let page = page();
+        let payer = root(10, 1);
+        let mut fds = crate::Fds {
+            root: payer,
+            binding: crate::authority::Binding::Active(close_who(257)),
+            ..crate::Fds::default()
+        };
+        let mut held = std::vec::Vec::new();
+        for _ in 0..32 {
+            let fd = ram.open(&mut fds, "/lock0", proto_fs::READ_ONLY).unwrap();
+            let description = ram.capture_description(&fds, fd).unwrap().0;
+            real_run(
+                &mut service,
+                &mut ram,
+                Some(&page),
+                owned(
+                    request(inodes[0], 257, Command::Set(Some(Kind::Read)), 2, 1),
+                    description.description,
+                ),
+                payer,
+            )
+            .unwrap();
+            held.push(description);
+        }
+        real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            request(inodes[0], 257, Command::Set(Some(Kind::Read)), 0, 1),
+            payer,
+        )
+        .unwrap();
+        assert_eq!(ram.detach_session_descriptions(&mut fds, &mut service), 32);
+        assert_eq!(ram.detach_session_descriptions(&mut fds, &mut service), 0);
+        assert_eq!(
+            service.counts().published,
+            1,
+            "all 32 OFDs retire before audit"
+        );
+        for item in held {
+            assert!(!ram.lock_parts().1.live(item.description));
+            assert_eq!(ram.read(&mut fds, item.fd, &mut [0; 1]), Ok(1));
+        }
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[0], 0),
+            Some(Owner::Process(257))
+        );
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[0], 2),
+            None
+        );
+        assert_eq!(service.counts().published, 1);
+        ram.release(&mut fds);
+        assert_eq!(ram.open_descriptions(), 0);
+        assert_eq!(ram.storage.usage(payer).descriptions, 0);
+        assert_eq!(
+            close_blocker(&mut service, &mut ram, &page, inodes[0], 0),
+            Some(Owner::Process(257))
+        );
+        check_pins(&service, &ram.storage);
     }
     #[test]
     fn last_real_ofd_close_excludes_foreign_blocker_while_physical_read_and_payer_remain() {

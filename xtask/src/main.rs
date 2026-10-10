@@ -574,7 +574,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
 /// Lifetime observations exist only in this dedicated image.
 const POSIX_LIFETIMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
-    programs[1].3 = &["lifetime-probe"];
+    programs[1].3 = &["lifetime-probe", "steps"];
     programs[3].3 = &["lifetime-probe"];
     programs[5].3 = &["lifetime-probe"];
     programs
@@ -3194,6 +3194,7 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
     )?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::ICOUNT);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
     let ended = run.expect_line(
         "the PID lifetime probe to exit",
@@ -3205,7 +3206,30 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
     if ended? != "init: posix-procs ended: exit code 0, not restarted" {
         return Err("the PID lifetime probe failed".into());
     }
-    qemu::expect_marker(&outcome, "posix-procs: PID lifetime page ok")
+    qemu::expect_marker(&outcome, "posix-procs: PID lifetime page ok")?;
+    qemu::expect_marker(
+        &outcome,
+        "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok",
+    )?;
+    check_waits(&outcome.lines, &["2"], "RAM close event steps")?;
+    let steps = longest_steps(&outcome.lines, "2");
+    for kind in [49, 66] {
+        if !steps
+            .iter()
+            .any(|(measured, ticks, _)| *measured == kind && *ticks != 0)
+        {
+            return Err(format!(
+                "RAM close event probe has no method {kind} measurement: {steps:?}"
+            ));
+        }
+    }
+    if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "RAM close event method {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    println!("RAM close event dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    Ok(())
 }
 
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
@@ -7212,7 +7236,7 @@ mod tests {
 
     #[test]
     fn lifetime_probe_has_its_own_process_and_program_features() {
-        assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe"]);
+        assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe", "steps"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[5].3, &["lifetime-probe"]);
         for programs in [

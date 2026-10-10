@@ -13,6 +13,7 @@
 
 extern int process_lifetime(int pid);
 extern int ram_lifetime(int pid);
+extern int ram_close_event(void);
 static int failures;
 static void expect(const char *what, int actual, int wanted) {
     if (actual != wanted) {
@@ -58,6 +59,7 @@ int main(int argc, char **argv) {
     expect_life("PID lives with changed credentials", getpid(), 1);
     expect("restore effective UID", seteuid(0), 0);
     expect_life("PID lives with restored credentials", getpid(), 1);
+    expect("native close receipt and 32-reference birth", ram_close_event(), 0);
     char *sleep_argv[] = {"procs-child", "sleep", NULL};
     char *environment[] = {NULL};
     pid_t child = -1;

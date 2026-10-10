@@ -158,7 +158,11 @@ fn real_reference_bookkeeping_has_measured_fixed_layout() {
         core::mem::size_of::<Fds>()
     );
     assert_eq!(core::mem::size_of::<Shared>(), 72);
-    assert_eq!(core::mem::size_of::<Fds>(), 2816);
+    assert_eq!(core::mem::size_of::<Fds>(), 3328);
+    assert_eq!(
+        core::mem::size_of::<[Option<proto_fs::CloseEvent>; 16]>(),
+        512
+    );
 }
 
 #[test]
@@ -188,4 +192,41 @@ fn authoritative_ofd_life_checks_slot_generation_and_real_count_independently_of
     let (_, descriptions) = ram.lock_parts();
     assert!(!descriptions.live(old.description));
     assert!(descriptions.live(next.description));
+}
+
+#[test]
+fn detached_true_fds_keep_admission_until_all_32_physical_holds_return() {
+    let mut ram = Ram::default();
+    let mut fds = Fds::default();
+    assert!(fds.custody_empty());
+    let mut held_fds = [0; OPEN_MAX];
+    for fd in &mut held_fds {
+        *fd = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
+    }
+    for fd in held_fds {
+        let opened = held(&ram, &fds, fd);
+        ram.detach_descriptor(&mut fds, opened).unwrap();
+    }
+    assert_eq!(fds.live_fds, 0);
+    assert!(!fds.custody_empty());
+    for left in (0..OPEN_MAX).rev() {
+        assert!(ram.release_step(&mut fds));
+        assert_eq!(fds.custody_empty(), left == 0);
+        assert_eq!(ram.open_descriptions(), left);
+    }
+    assert!(!ram.release_step(&mut fds));
+    assert!(fds.custody_empty());
+}
+
+#[test]
+fn stalled_job_retains_admission_even_with_no_physical_fds() {
+    let mut fds = Fds::default();
+    fds.resolvers[15] = 999;
+    assert!(!fds.custody_empty());
+    fds.resolvers[15] = 0;
+    assert!(fds.custody_empty());
+    fds.binding_source = Some((17, 9));
+    assert!(!fds.custody_empty());
+    fds.binding_source = None;
+    assert!(fds.custody_empty());
 }
