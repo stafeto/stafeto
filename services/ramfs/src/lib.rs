@@ -26,6 +26,7 @@ pub mod io;
 #[cfg(test)]
 mod io_tests;
 pub mod job;
+pub mod locks;
 pub mod maintenance;
 pub mod metadata;
 #[cfg(test)]
