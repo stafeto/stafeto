@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 16 of the bounded RAM file service. Numbers are little endian.
+//! Version 18 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -114,6 +114,12 @@ pub use locks::{
     write_lock_key,
 };
 
+mod wait;
+pub use wait::{
+    WAIT_KEY_BODY_BYTES, WAIT_KEY_PLACES, WAIT_REPLY_BYTES, WAIT_START_BODY_BYTES, WaitKey,
+    WaitMode, WaitPhase, WaitReply, WaitStart, read_wait_key, write_wait_key,
+};
+
 mod close;
 pub use close::{CLOSE_KEY_FIRST, CLOSE_KEY_PLACES, CloseEvent, CloseKey};
 
@@ -124,7 +130,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 17;
+pub const VERSION: u16 = 18;
 /// Original descriptor custody keys and sixteen independent Control keys.
 pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
@@ -210,6 +216,8 @@ pub const NO_LOCKS: u32 = 329;
 pub const LOCK_CONFLICT: u32 = 330;
 /// Internal retry: a concurrent close cancelled unpublished preparation.
 pub const LOCK_CANCELLED: u32 = 331;
+/// EDEADLK: a proven PID wait cycle contains this candidate.
+pub const LOCK_DEADLOCK: u32 = 332;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -358,6 +366,12 @@ pub enum Method {
     LockRelease = 52,
     /// Retain a canonical cancellation outcome until explicit Release.
     LockCancel = 53,
+    WaitStart = 54,
+    WaitQuery = 55,
+    WaitCancel = 56,
+    WaitRelease = 57,
+    /// Exactly one notification channel, without a retained reply capability.
+    WaitArm = 58,
 }
 
 impl Method {
@@ -419,6 +433,11 @@ impl Method {
             51 => Some(Self::LockQuery),
             52 => Some(Self::LockRelease),
             53 => Some(Self::LockCancel),
+            54 => Some(Self::WaitStart),
+            55 => Some(Self::WaitQuery),
+            56 => Some(Self::WaitCancel),
+            57 => Some(Self::WaitRelease),
+            58 => Some(Self::WaitArm),
             _ => None,
         }
     }
@@ -427,7 +446,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53,
+    52, 53, 54, 55, 56, 57, 58,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

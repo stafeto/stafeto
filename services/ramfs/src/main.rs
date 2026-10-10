@@ -2277,7 +2277,12 @@ impl Service<0> for Fs {
                 | Method::LockStart
                 | Method::LockQuery
                 | Method::LockCancel
-                | Method::LockRelease,
+                | Method::LockRelease
+                | Method::WaitStart
+                | Method::WaitQuery
+                | Method::WaitCancel
+                | Method::WaitRelease
+                | Method::WaitArm,
             )
             | None => Answer::Status(Status::UnknownMethod),
         }
