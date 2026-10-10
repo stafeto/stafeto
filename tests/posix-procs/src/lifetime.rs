@@ -38,6 +38,8 @@ pub extern "C" fn ram_lifetime(pid: i32) -> i32 {
             let live = body.u32().map_err(|_| -8)?;
             let quota = body.u64().map_err(|_| -13)?;
             let used = body.u64().map_err(|_| -14)?;
+            let _lock_jobs = body.u32().map_err(|_| -16)?;
+            let _places = body.u32().map_err(|_| -17)?;
             body.finish().map_err(|_| -9)?;
             if quota.saturating_sub(used) < 128 * 4096 {
                 return Err(-15);
@@ -510,3 +512,6 @@ pub extern "C" fn close_driver_full_places() -> i32 {
     })();
     result.unwrap_or_else(|error| error)
 }
+
+#[path = "lock_commands.rs"]
+mod lock_commands;

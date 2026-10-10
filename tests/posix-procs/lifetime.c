@@ -16,6 +16,7 @@
 extern int process_lifetime(int pid);
 extern int ram_lifetime(int pid);
 extern int ram_close_event(void);
+extern int ram_lock_commands(int pid);
 extern int close_driver_receipts(void);
 extern int close_driver_full_places(void);
 extern void close_driver_jump_arm(int fd);
@@ -73,6 +74,7 @@ int main(int argc, char **argv) {
     expect_life("PID lives with changed credentials", getpid(), 1);
     expect("restore effective UID", seteuid(0), 0);
     expect_life("PID lives with restored credentials", getpid(), 1);
+    expect("native lock commands and exact custody", ram_lock_commands(getpid()), 0);
     expect("native close receipt and 32-reference birth", ram_close_event(), 0);
     expect("public close receipts and helper reuse", close_driver_receipts(), 0);
     expect("public close with all independent places full", close_driver_full_places(), 0);

@@ -12,11 +12,14 @@ const AUDIT_PERIOD_NS: u64 = 250_000_000;
 pub enum Work {
     Legacy,
     Actor,
+    Request { cleanup: bool },
     Audit { first: usize, end: usize },
 }
 #[derive(Default)]
 pub struct Dispatch {
     turn: u8,
+    request_turn: u8,
+    request_cleanup: bool,
     next_audit_ns: u64,
     audit_position: usize,
     audit_remaining: usize,
@@ -57,6 +60,23 @@ impl Dispatch {
             _ => Work::Legacy,
         }
     }
+    /// Queued admission and release cleanup each receive their own bounded turn.
+    pub fn next_with_requests(
+        &mut self,
+        now_ns: u64,
+        actor_pending: bool,
+        request_pending: bool,
+        mapped: bool,
+    ) -> Work {
+        self.request_turn = (self.request_turn + 1) % 4;
+        if self.request_turn == 2 && request_pending {
+            self.request_cleanup = !self.request_cleanup;
+            return Work::Request {
+                cleanup: self.request_cleanup,
+            };
+        }
+        self.next(now_ns, actor_pending, mapped)
+    }
     pub fn pending(&self, actor_pending: bool) -> bool {
         actor_pending || self.audit_remaining != 0
     }
@@ -69,6 +89,37 @@ impl Dispatch {
 mod tests {
     use super::*;
     #[test]
+    fn queued_requests_and_cleanup_preserve_actor_audit_and_legacy_turns() {
+        let mut dispatch = Dispatch::default();
+        let (mut legacy, mut actor, mut audit, mut ready, mut cleanup) = (0, 0, 0, 0, 0);
+        let mut seen = [0; OWNER_PLACES];
+        for _ in 0..192 {
+            match dispatch.next_with_requests(0, true, true, true) {
+                Work::Legacy => legacy += 1,
+                Work::Actor => actor += 1,
+                Work::Request { cleanup: false } => ready += 1,
+                Work::Request { cleanup: true } => cleanup += 1,
+                Work::Audit { first, end } => {
+                    assert!(end - first <= 8);
+                    audit += 1;
+                    for visit in &mut seen[first..end] {
+                        *visit += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!((legacy, actor, audit, ready, cleanup), (48, 48, 48, 24, 24));
+        assert!(seen.into_iter().all(|visits| visits == 1));
+        assert!(dispatch.audited());
+        assert!(!dispatch.pending(false));
+        for _ in 0..16 {
+            assert_eq!(
+                dispatch.next_with_requests(1, false, false, true),
+                Work::Legacy
+            );
+        }
+    }
+    #[test]
     fn continuous_actor_work_preserves_legacy_turns_and_one_exact_owner_round() {
         let mut dispatch = Dispatch::default();
         let mut seen = [0; OWNER_PLACES];
@@ -77,6 +128,7 @@ mod tests {
             match dispatch.next(0, true, true) {
                 Work::Legacy => legacy += 1,
                 Work::Actor => actor += 1,
+                Work::Request { .. } => panic!("legacy dispatch produced a request turn"),
                 Work::Audit { first, end } => {
                     assert!(end - first <= 8);
                     for visits in &mut seen[first..end] {
@@ -112,6 +164,7 @@ mod tests {
             match dispatch.next(0, true, false) {
                 Work::Legacy => legacy += 1,
                 Work::Actor => actor += 1,
+                Work::Request { .. } => panic!("legacy dispatch produced a request turn"),
                 Work::Audit { first, end } => {
                     assert!(first >= PID_PLACES && end <= OWNER_PLACES);
                     assert!(end - first <= 8);

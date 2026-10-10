@@ -63,6 +63,7 @@ pub struct Queue {
     cleanup: u16,
     active: Option<Id>,
     work: u16,
+    held: u16,
 }
 impl Queue {
     pub const fn new() -> Self {
@@ -72,6 +73,7 @@ impl Queue {
             cleanup: 0,
             active: None,
             work: 0,
+            held: 0,
         }
     }
     ///
@@ -88,6 +90,7 @@ impl Queue {
             core::ptr::addr_of_mut!((*destination).cleanup).write(0);
             core::ptr::addr_of_mut!((*destination).active).write(None);
             core::ptr::addr_of_mut!((*destination).work).write(0);
+            core::ptr::addr_of_mut!((*destination).held).write(0);
         }
     }
     fn job(&self, id: Id) -> Result<&Job, u32> {
@@ -109,6 +112,41 @@ impl Queue {
         let id = Id { slot, owner, key };
         self.job(id)?;
         Ok(id)
+    }
+    /// A Control place has one family and one generation until its custody ends.
+    pub fn occupied(&self, place: usize, owner: u64, key_slot: u32) -> Result<Option<Id>, u32> {
+        if place >= crate::places::COUNT || !(32..48).contains(&key_slot) || owner == 0 {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let slot = place * SHARE + (key_slot - 32) as usize;
+        match &self.jobs[slot] {
+            Some(job) if job.owner == owner => Ok(Some(job.id(slot))),
+            Some(_) => Err(proto_fs::OPEN_RETIRED),
+            None => Ok(None),
+        }
+    }
+    /// Sixteen prepaid cells retain the genuine session label during departure.
+    pub fn retains(&self, place: usize, owner: u64) -> bool {
+        assert!(place < crate::places::COUNT);
+        self.jobs[place * SHARE..(place + 1) * SHARE]
+            .iter()
+            .flatten()
+            .any(|job| job.owner == owner)
+    }
+    /// Mark one half of a departed session; active preparation cancels separately.
+    pub fn depart(&mut self, place: usize, owner: u64, first: usize) -> bool {
+        assert!(place < crate::places::COUNT && matches!(first, 0 | 8));
+        let mut cancel_active = false;
+        for local in first..first + PORTION {
+            let slot = place * SHARE + local;
+            if let Some(job) = &self.jobs[slot]
+                && job.owner == owner
+            {
+                let id = job.id(slot);
+                cancel_active |= self.request_release(id).expect("exact departed lock job");
+            }
+        }
+        cancel_active
     }
     pub fn same_start(&self, id: Id, mut wire: LockStart) -> Result<(), u32> {
         wire.validate().map_err(|error| error.code())?;
@@ -187,6 +225,7 @@ impl Queue {
         assert!(self.jobs[slot].is_none());
         self.jobs[slot] = Some(job);
         self.work += 1;
+        self.held += 1;
         Ok(id)
     }
     pub fn snapshot(&self, id: Id) -> Result<(Captured, Phase, bool), u32> {
@@ -198,6 +237,9 @@ impl Queue {
     }
     pub fn active(&self) -> Option<Id> {
         self.active
+    }
+    pub fn retained(&self) -> usize {
+        usize::from(self.held)
     }
     pub fn has_work(&self) -> bool {
         self.work != 0
@@ -271,6 +313,7 @@ impl Queue {
             return Ok(false);
         }
         let job = self.jobs[id.slot as usize].take().expect("exact release");
+        self.held -= 1;
         if job.phase != Phase::Complete || job.releasing {
             self.work -= 1;
         }
@@ -354,6 +397,80 @@ mod tests {
     }
 
     #[test]
+    fn direct_control_family_lookup_retains_complete_label_and_current_generation() {
+        let mut ram = Ram::default();
+        let (wire, captured) = fixture(&mut ram);
+        let mut queue = queue();
+        assert_eq!(queue.occupied(19, 41, 32), Ok(None));
+        let id = queue
+            .admit(19, 41, wire, captured, &mut ram.storage)
+            .unwrap();
+        assert_eq!(queue.occupied(19, 41, 32), Ok(Some(id)));
+        assert_eq!(queue.occupied(19, 42, 32), Err(proto_fs::OPEN_RETIRED));
+        assert_eq!(queue.occupied(19, 41, 31), Err(proto_fs::INVALID_ARGUMENT));
+        assert_eq!(
+            queue.occupied(crate::places::COUNT, 41, 32),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert!(queue.retains(19, 41));
+        assert!(!queue.retains(19, 42));
+        queue.release(id, &mut ram.storage).unwrap();
+        let next = LockStart {
+            key: OpenKey {
+                generation: 2,
+                ..wire.key
+            },
+            ..wire
+        };
+        let next = queue
+            .admit(19, 41, next, captured, &mut ram.storage)
+            .unwrap();
+        assert_eq!(queue.occupied(19, 41, 32), Ok(Some(next)));
+        assert_eq!(queue.query(id), Err(proto_fs::OPEN_RETIRED));
+    }
+
+    #[test]
+    fn departure_marks_eight_exact_jobs_and_retains_active_custody() {
+        let mut ram = Ram::default();
+        let (wire, captured) = fixture(&mut ram);
+        let mut queue = queue();
+        let mut ids = std::vec::Vec::new();
+        for local in 0..SHARE {
+            let wire = LockStart {
+                key: OpenKey {
+                    slot: 32 + local as u32,
+                    ..wire.key
+                },
+                ..wire
+            };
+            ids.push(
+                queue
+                    .admit(3, 41, wire, captured, &mut ram.storage)
+                    .unwrap(),
+            );
+        }
+        queue.activate(ids[3]).unwrap();
+        assert!(queue.depart(3, 41, 0));
+        for (local, id) in ids.iter().copied().enumerate() {
+            assert_eq!(queue.snapshot(id).unwrap().2, local < 8);
+        }
+        assert!(!queue.depart(3, 42, 8));
+        assert!(!queue.snapshot(ids[8]).unwrap().2);
+        assert!(!queue.depart(3, 41, 8));
+        for _ in 0..PLACES.div_ceil(PORTION) {
+            queue.cleanup_released(&mut ram.storage);
+        }
+        assert!(queue.retains(3, 41));
+        assert_eq!(queue.snapshot(ids[3]).unwrap().1, Phase::Active);
+        queue.complete_active(Err(Error::Cancelled)).unwrap();
+        for _ in 0..PLACES.div_ceil(PORTION) {
+            queue.cleanup_released(&mut ram.storage);
+        }
+        assert!(!queue.retains(3, 41));
+        assert!(!queue.has_work());
+    }
+
+    #[test]
     fn every_prepaid_session_keeps_sixteen_places_without_an_active_root_limit() {
         let mut ram = Ram::default();
         let (wire, captured) = fixture(&mut ram);
@@ -383,6 +500,7 @@ mod tests {
             }
         }
         assert_eq!(ids.len(), PLACES);
+        assert_eq!(queue.retained(), PLACES);
         assert_eq!(
             ram.storage.node(captured.request.inode).unwrap().pins[Pin::Lock as usize],
             PLACES as u16
@@ -395,6 +513,7 @@ mod tests {
             assert_eq!(queue.release(id, &mut ram.storage), Ok(true));
         }
         assert!(!queue.has_work());
+        assert_eq!(queue.retained(), 0);
         assert_eq!(
             ram.storage.node(captured.request.inode).unwrap().pins[Pin::Lock as usize],
             0
@@ -602,6 +721,7 @@ mod tests {
     fn permanent_queue_geometry_and_empty_initialization_are_exact() {
         let queue = queue();
         assert_eq!(queue.work, 0);
+        assert_eq!(queue.retained(), 0);
         assert!(queue.jobs.iter().all(Option::is_none));
         let bytes = core::mem::size_of::<Queue>();
         std::println!(

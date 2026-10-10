@@ -1387,6 +1387,7 @@ mod tests {
                     }
                 }
                 Work::Legacy => legacy += 1,
+                Work::Request { .. } => panic!("legacy dispatch request"),
             }
             if !dispatch.pending(service.busy()) {
                 break;
@@ -1417,6 +1418,7 @@ mod tests {
                     }
                 }
                 Work::Legacy => {}
+                Work::Request { .. } => panic!("legacy dispatch request"),
             }
             if !dispatch.pending(service.busy()) {
                 break;

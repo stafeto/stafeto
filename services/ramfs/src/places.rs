@@ -15,6 +15,7 @@ pub struct Places {
     labels: [Cell<u64>; COUNT],
     next: [Cell<u16>; COUNT],
     head: Cell<u16>,
+    used: Cell<u16>,
 }
 impl Places {
     pub const fn new() -> Self {
@@ -28,6 +29,7 @@ impl Places {
             labels: [const { Cell::new(0) }; COUNT],
             next,
             head: Cell::new(1),
+            used: Cell::new(0),
         }
     }
     fn allocate(&self, label: impl FnOnce(u16) -> u64) -> Option<u64> {
@@ -38,7 +40,11 @@ impl Places {
         self.head.set(self.next[slot as usize].get());
         let label = label(slot);
         self.labels[slot as usize].set(label);
+        self.used.set(self.used.get() + 1);
         Some(label)
+    }
+    pub fn used(&self) -> usize {
+        usize::from(self.used.get())
     }
     pub fn issue(&self, generation: u64) -> Option<u64> {
         if generation >= 1 << 53 {
@@ -90,6 +96,12 @@ impl Places {
             return;
         }
         self.labels[slot].set(0);
+        self.used.set(
+            self.used
+                .get()
+                .checked_sub(1)
+                .expect("exact occupied place"),
+        );
         self.next[slot].set(self.head.get());
         self.head.set(slot as u16);
     }
@@ -103,6 +115,32 @@ impl Default for Places {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paid_label_count_survives_lookup_stale_release_and_numeric_reuse() {
+        let places = Places::new();
+        assert_eq!(places.used(), 0);
+        let named = places.place(17);
+        assert_eq!(places.used(), 1);
+        assert_eq!(places.place(17), named);
+        assert_eq!(places.used(), 1);
+        let issued = places.issue(41).unwrap();
+        let slot = places.place(issued);
+        assert_eq!(places.used(), 2);
+        places.release(issued + (1 << SLOT_BITS));
+        assert_eq!(places.used(), 2);
+        places.release(issued);
+        assert_eq!(places.used(), 1);
+        places.release(issued);
+        assert_eq!(places.used(), 1);
+        let fresh = places.issue(42).unwrap();
+        assert_eq!(places.place(fresh), slot);
+        assert_eq!(places.used(), 2);
+        places.release(issued);
+        assert_eq!(places.used(), 2);
+        places.release(fresh);
+        places.release(17);
+        assert_eq!(places.used(), 0);
+    }
     #[test]
     fn every_admitted_session_has_a_distinct_place_and_exhaustion_does_not_evict() {
         let places = Places::new();

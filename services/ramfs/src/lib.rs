@@ -284,6 +284,8 @@ pub struct Fds {
     pub claimed: bool,
     /// The endpoint ended; this paid cell awaits bounded physical cleanup.
     pub departed: bool,
+    /// Bounded marking of the sixteen native lock requests after endpoint death.
+    pub lock_departure: u8,
     pub binding: authority::Binding,
     pub authority_index: u16,
     pub binding_preparation: Option<u16>,
@@ -317,6 +319,7 @@ impl Default for Fds {
             live_fds: 0,
             claimed: false,
             departed: false,
+            lock_departure: 16,
             binding: authority::Binding::Unbound,
             authority_index: storage::NONE,
             binding_preparation: None,

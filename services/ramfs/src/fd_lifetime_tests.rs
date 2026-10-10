@@ -158,7 +158,7 @@ fn real_reference_bookkeeping_has_measured_fixed_layout() {
         core::mem::size_of::<Fds>()
     );
     assert_eq!(core::mem::size_of::<Shared>(), 72);
-    assert_eq!(core::mem::size_of::<Fds>(), 3328);
+    assert_eq!(core::mem::size_of::<Fds>(), 3336);
     assert_eq!(
         core::mem::size_of::<[Option<proto_fs::CloseEvent>; 16]>(),
         512

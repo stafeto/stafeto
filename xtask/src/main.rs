@@ -3222,7 +3222,15 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
     }
     check_waits(&outcome.lines, &["2"], "RAM close event steps")?;
     let steps = longest_steps(&outcome.lines, "2");
-    for kind in [49, 66] {
+    qemu::expect_marker(
+        &outcome,
+        "RAM native locks: genuine PID, OFD conflict, unlocked query, replay, cross-family release and late Start fence ok",
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "RAM native lock departure: sixteen held outcomes and genuine paid label return without another RAM request ok",
+    )?;
+    for kind in [49, 50, 51, 52, 66] {
         if !steps
             .iter()
             .any(|(measured, ticks, _)| *measured == kind && *ticks != 0)
