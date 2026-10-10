@@ -666,3 +666,6 @@ fn lock_collector_detached_owner_preserves_complete_receipt_until_remote_release
 
 #[path = "../../posix-abi/src/change/lock_collect.rs"]
 mod lock_collect;
+
+#[path = "typed_lock_helper_tests.rs"]
+mod helper_retirement;

@@ -45,6 +45,18 @@ pub trait Session {
     fn acknowledge(&mut self) -> Result<Self::Completion, i32>;
 }
 
+/// An unlocked RPC error may arrive after another helper saved or retired this debt.
+fn advanced_after_error(session: &mut impl Session, previously_saved: bool) -> Result<bool, i32> {
+    let current = session.state()?;
+    if matches!(current.phase, Phase::Gone | Phase::Cleaned) {
+        return Ok(true);
+    }
+    if !previously_saved && current.saved {
+        return Ok(false);
+    }
+    Err(EIO)
+}
+
 /// A helper sends at most one request and saves the canonical result before Release.
 pub fn cleanup_step(session: &mut impl Session) -> Result<bool, i32> {
     let state = session.state()?;
@@ -60,17 +72,19 @@ pub fn cleanup_step(session: &mut impl Session) -> Result<bool, i32> {
         match session.release() {
             Ok(()) => session.finish_cleanup()?,
             Err(Failure::Interrupted | Failure::Resolving | Failure::Room) => {}
-            Err(Failure::Authenticating) => return Err(EIO),
+            Err(Failure::Authenticating) => return advanced_after_error(session, state.saved),
             Err(Failure::Retired) => session.finish_cleanup()?,
-            Err(Failure::Rejected(_) | Failure::Fatal(_)) => return Err(EIO),
+            Err(Failure::Rejected(_) | Failure::Fatal(_)) => {
+                return advanced_after_error(session, state.saved);
+            }
         }
     } else {
         match session.cancel() {
             Ok(reply) if reply.phase == LockPhase::Complete => session.publish(reply)?,
             Ok(_) | Err(Failure::Interrupted | Failure::Resolving | Failure::Room) => {}
-            Err(Failure::Authenticating) => return Err(EIO),
+            Err(Failure::Authenticating) => return advanced_after_error(session, state.saved),
             Err(Failure::Retired | Failure::Rejected(_) | Failure::Fatal(_)) => {
-                return Err(EIO);
+                return advanced_after_error(session, state.saved);
             }
         }
     }

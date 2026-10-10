@@ -13,6 +13,13 @@ use proto_wire::{Reader, Status, Writer};
 use rt::abi as inline_abi;
 
 mod core;
+mod local;
+mod local_types {
+    pub(super) use posix_fs::change::{
+        ControlClaimToken, ControlPhase, ControlResult, ControlToken, OwnerToken,
+    };
+    pub(super) use posix_fs::{FsError, PosixFs, control};
+}
 mod reply_bytes;
 mod status;
 use core::{Failure, Phase, Session, State};
@@ -118,7 +125,9 @@ impl Session for Live {
     type Completion = LockReply;
     fn state(&mut self) -> Result<State, i32> {
         crate::shared::with_files(|files| {
-            let Ok(snapshot) = files.lock_snapshot(self.token) else {
+            let Some(snapshot) =
+                local::snapshot(files, self.token, self.owner).map_err(crate::error)?
+            else {
                 return Ok(State {
                     phase: Phase::Gone,
                     claim_live: false,
@@ -198,7 +207,11 @@ impl Session for Live {
     fn publish(&mut self, reply: LockReply) -> Result<(), i32> {
         let terminal = TerminalReply::from_reply(reply).map_err(crate::error)?;
         crate::shared::with_files(|files| {
-            let snapshot = files.lock_snapshot(self.token).map_err(crate::error)?;
+            let Some(snapshot) =
+                local::snapshot(files, self.token, self.owner).map_err(crate::error)?
+            else {
+                return Ok(());
+            };
             if snapshot.result.is_some() {
                 return Ok(());
             }
@@ -219,38 +232,19 @@ impl Session for Live {
                 };
                 ControlResult::Failed(errno)
             };
-            if let Some(claim) = self.claim.filter(|&claim| files.lock_is_live(claim)) {
-                files
-                    .complete_lock_record(claim, result, terminal)
-                    .map_err(crate::error)?;
-            } else {
-                if snapshot.phase != ControlPhase::Cleaning {
-                    files
-                        .begin_lock_cleanup(self.token, lock.cancel_reason())
-                        .map_err(crate::error)?;
-                }
-                files
-                    .publish_lock_cleanup(self.token, result, terminal)
-                    .map_err(crate::error)?;
-            }
+            local::publish(files, self.token, self.claim, self.owner, result, terminal)
+                .map_err(crate::error)?;
             Ok(())
         })
     }
     fn begin_cleanup(&mut self) -> Result<(), i32> {
         crate::shared::with_files(|files| {
-            let snapshot = files.lock_snapshot(self.token).map_err(crate::error)?;
-            if snapshot.phase != ControlPhase::Cleaning {
-                let reason = snapshot.recovery.lock().ok_or(EIO)?.cancel_reason();
-                files
-                    .begin_lock_cleanup(self.token, reason)
-                    .map_err(crate::error)?;
-            }
-            Ok(())
+            local::begin(files, self.token, self.owner).map_err(crate::error)
         })
     }
     fn finish_cleanup(&mut self) -> Result<(), i32> {
         crate::shared::with_files(|files| {
-            files.finish_lock_cleanup(self.token).map_err(crate::error)
+            local::finish(files, self.token, self.owner).map_err(crate::error)
         })
     }
     fn acknowledge(&mut self) -> Result<LockReply, i32> {
@@ -303,7 +297,9 @@ pub(crate) fn operation(fd: u32, input: crate::lock_fields::Input) -> Result<Loc
 /// A close or lifetime helper keeps the same key and pays one bounded cleanup turn.
 pub(crate) fn cleanup_step(token: ControlToken) -> Result<bool, i32> {
     let transport = crate::shared::with_files(|files| {
-        Ok(files.lock_snapshot(token).ok().map(|_| files.transport()))
+        Ok(local::snapshot(files, token, None)
+            .map_err(crate::error)?
+            .map(|_| files.transport()))
     })?;
     let Some(transport) = transport else {
         return Ok(true);
