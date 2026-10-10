@@ -22,6 +22,7 @@ use ramfs::authority::{
 };
 use ramfs::job::{JobOperation, PathJob, ResolveJob, Seconds};
 use ramfs::locks::dispatch::{Dispatch as LockDispatch, Work as LockWork};
+use ramfs::locks::jobs::Queue as LockQueue;
 use ramfs::locks::service::LockService;
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
@@ -103,6 +104,10 @@ struct LocksBss(UnsafeCell<core::mem::MaybeUninit<LockService>>);
 // SAFETY: the sole service thread initializes and owns all lock tables.
 unsafe impl Sync for LocksBss {}
 static LOCKS: LocksBss = LocksBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct LockJobsBss(UnsafeCell<core::mem::MaybeUninit<LockQueue>>);
+// SAFETY: the sole service thread initializes and owns prepaid request custody.
+unsafe impl Sync for LockJobsBss {}
+static LOCK_JOBS: LockJobsBss = LockJobsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 struct RamBss(UnsafeCell<core::mem::MaybeUninit<Ram<'static>>>);
 // SAFETY: the sole service thread initializes and owns the RAM descriptors.
 unsafe impl Sync for RamBss {}
@@ -176,6 +181,12 @@ fn main(_: u64) -> u64 {
         LockService::initialize_at(pointer);
         &mut *pointer
     };
+    // SAFETY: initialization writes each field directly into exclusive permanent storage.
+    let lock_jobs = unsafe {
+        let pointer = (*LOCK_JOBS.0.get()).as_mut_ptr();
+        LockQueue::initialize_at(pointer);
+        &mut *pointer
+    };
     // SAFETY: RAM is exclusive permanent storage; every field is written first.
     let ram = unsafe {
         let pointer = (*RAM.0.get()).as_mut_ptr();
@@ -205,6 +216,7 @@ fn main(_: u64) -> u64 {
             + core::mem::size_of::<Tables>()
             + core::mem::size_of::<Index>()
             + core::mem::size_of::<LockService>()
+            + core::mem::size_of::<LockQueue>()
             + core::mem::size_of::<Ram<'static>>()
     );
     rt::println!("ramfs: ready");
@@ -213,6 +225,7 @@ fn main(_: u64) -> u64 {
     let mut fs = Fs {
         ram,
         locks,
+        lock_jobs,
         lock_dispatch: LockDispatch::default(),
         lifetimes: None,
         legacy_pending: true,
@@ -261,6 +274,7 @@ fn main(_: u64) -> u64 {
 struct Fs {
     ram: &'static mut Ram<'static>,
     locks: &'static mut LockService,
+    lock_jobs: &'static mut LockQueue,
     lock_dispatch: LockDispatch,
     lifetimes: Option<lifetime_page::Lifetimes>,
     legacy_pending: bool,
@@ -2142,7 +2156,10 @@ impl Service<0> for Fs {
                 | Method::ChangeSecond
                 | Method::ChangeStep
                 | Method::ChangeQuery
-                | Method::ChangeRelease,
+                | Method::ChangeRelease
+                | Method::LockStart
+                | Method::LockQuery
+                | Method::LockRelease,
             )
             | None => Answer::Status(Status::UnknownMethod),
         }
@@ -2162,7 +2179,11 @@ fn generation(index: usize) -> u64 {
 }
 impl Fs {
     fn notify_maintenance(&self) {
-        if self.legacy_pending || self.lock_dispatch.pending(self.locks.busy()) {
+        if self.legacy_pending
+            || self
+                .lock_dispatch
+                .pending(self.locks.busy() || self.lock_jobs.has_work())
+        {
             let _ = sys::notify(&self.channel, 1);
         }
     }

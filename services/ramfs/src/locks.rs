@@ -8,6 +8,7 @@ pub mod actor;
 pub mod budget;
 pub mod dispatch;
 pub mod groups;
+pub mod jobs;
 pub mod preparation;
 pub mod records;
 pub mod request;
