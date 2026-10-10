@@ -46,9 +46,13 @@ static void *deadlock_worker(void *ignored) {
     __atomic_store_n(&deadlock_done, 1, __ATOMIC_RELEASE);
     return NULL;
 }
-static void deadlock_child(int inherited_a, int inherited_b, int read_end, int report, int ofd) {
+static void deadlock_child(int inherited_a, int inherited_b, int inherited_anchor, int read_end, int report, int ofd) {
     close(read_end); close(inherited_a); close(inherited_b);
+    if (inherited_anchor >= 0) close(inherited_anchor);
     int a = open("/tmp/deadlock-a", O_RDWR), b = open("/tmp/deadlock-b", O_RDWR);
+    int anchor = ofd ? open("/tmp/deadlock-d", O_CREAT | O_RDWR, 0666) : -1;
+    /* Establish real local PID life without a conflict on either cycle inode. */
+    if (ofd && (anchor < 0 || deadlock_lock(anchor, F_SETLK, F_WRLCK))) _exit(118);
     int command = ofd ? 37 : F_SETLK;
     if (a < 0 || b < 0 || deadlock_lock(b, command, F_WRLCK)) _exit(112);
     char held = 'B';
@@ -62,7 +66,7 @@ static void deadlock_child(int inherited_a, int inherited_b, int read_end, int r
     if (!result && deadlock_lock(a, F_SETLK, F_UNLCK)) _exit(115);
     char outcome = !result ? 'O' : error == EDEADLK ? 'D' : 'X';
     if (write(report, &outcome, 1) != 1) _exit(116);
-    close(a); close(b); close(report);
+    close(a); close(b); if (anchor >= 0) close(anchor); close(report);
     _exit(outcome == 'X' ? 117 : 0);
 }
 static void deadlock_case(int ofd) {
@@ -72,14 +76,19 @@ static void deadlock_case(int ofd) {
     if (a < 0 || b < 0) { if (a >= 0) close(a); if (b >= 0) close(b); return; }
     int command = ofd ? 37 : F_SETLK;
     expect("parent publishes actual A blocker", deadlock_lock(a, command, F_WRLCK), 0);
+    int anchor = ofd ? open("/tmp/deadlock-c", O_CREAT | O_RDWR, 0666) : -1;
+    if (ofd) {
+        expect("parent unrelated real PID anchor", anchor >= 0 && deadlock_lock(anchor, F_SETLK, F_WRLCK) == 0, 1);
+        if (anchor < 0) { close(a); close(b); return; }
+    }
     int reports[2];
-    if (pipe(reports)) { expect("deadlock report pipe", 0, 1); close(a); close(b); return; }
+    if (pipe(reports)) { expect("deadlock report pipe", 0, 1); close(a); close(b); if (anchor >= 0) close(anchor); return; }
     expect("finite deadlock report reads", fcntl(reports[0], F_SETFL, O_NONBLOCK), 0);
     pid_t child = fork();
-    if (!child) deadlock_child(a, b, reports[0], reports[1], ofd);
+    if (!child) deadlock_child(a, b, anchor, reports[0], reports[1], ofd);
     expect("actual deadlock child PID", child > 0, 1);
     close(reports[1]);
-    if (child < 0) { close(reports[0]); close(a); close(b); return; }
+    if (child < 0) { close(reports[0]); close(a); close(b); if (anchor >= 0) close(anchor); return; }
     expect("distinct real PID", child != getpid(), 1);
     expect("deadlock child true Page live", process_lifetime(child), 1);
     char byte = 0;
@@ -141,7 +150,9 @@ static void deadlock_case(int ofd) {
     expect("deadlock child completed normally", WIFEXITED(status) && WEXITSTATUS(status) == 0, 1);
     expect("deadlock child true Page dead", process_lifetime(child), 0);
     expect("close deadlock A", close(a), 0); expect("close deadlock B", close(b), 0);
+    if (anchor >= 0) expect("close unrelated PID anchor", close(anchor), 0);
     unlink("/tmp/deadlock-a"); unlink("/tmp/deadlock-b");
+    unlink("/tmp/deadlock-c"); unlink("/tmp/deadlock-d");
 }
 static void public_lock_deadlocks(void) {
     int before = failures;
