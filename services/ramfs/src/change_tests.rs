@@ -294,6 +294,7 @@ impl Env {
     }
     /// Nothing is paid, pinned or staged any more.
     fn assert_quiet(&mut self) {
+        self.ram.storage.check_name_index();
         assert_eq!(self.ram.cancel_refusals, 0, "a cancel step was refused");
         assert_eq!(self.ram.storage.preparations_used(), 0);
         assert!(self.jobs.iter().all(Option::is_none));
@@ -1097,7 +1098,8 @@ fn rename_moves_a_file_keeps_its_inode_and_stamps_what_the_standard_names() {
     assert_eq!(done.result, 0);
     assert_eq!(env.lookup(b"/b/g"), Ok(file));
     assert_eq!(env.lookup(b"/a/f"), Err(NO_ENTRY));
-    assert_eq!(env.ram.storage.state.epoch, epoch + 1);
+    // The move of a file changes no epoch of moves; the parents change their generations.
+    assert_eq!(env.ram.storage.state.epoch, epoch);
     // st_ctime of the node, st_mtime and st_ctime of both parents.
     assert_eq!(env.times(file)[2], STAMP);
     for parent in [dir_a, dir_b] {
@@ -1670,8 +1672,9 @@ fn a_change_of_the_tree_between_steps_restarts_the_job_and_the_client_sees_only_
         let (done, ..) = env.step(&fds, OWNER, start.key).unwrap();
         assert!(!done);
     }
-    // Another client changes the tree: a new name in the root.
-    env.node(ROOT, b"unrelated", REG, 0o644);
+    // Another client makes a name of the bucket of the new name.
+    let rival = same_bucket(dir, b"g");
+    env.node(dir, &rival, REG, 0o644);
     let mut restarts = 0;
     for _ in 0..1000 {
         match env.step(&fds, OWNER, start.key) {
@@ -1760,6 +1763,35 @@ fn a_refused_step_of_a_cancel_stops_a_debug_build_and_is_counted() {
             .unwrap();
     }
     let _ = env.release(&mut fds, OWNER, start.key);
+}
+
+#[test]
+#[should_panic(expected = "a step of a cancel was refused")]
+fn a_refused_rewind_of_a_restart_stops_a_debug_build_and_is_counted() {
+    let mut env = Env::new();
+    let mut fds = session();
+    env.node(ROOT, b"dst", DIR, 0o755);
+    let start = ChangeStart {
+        key: key(6, 1),
+        ..op(ChangeOp::Rename, b"/etc")
+    };
+    env.start(&mut fds, OWNER, &start).unwrap();
+    env.second(&fds, OWNER, start.key, Base::Absolute, b"/dst")
+        .unwrap();
+    while phase_of(&env) != ChangePhase::Ready {
+        env.step(&fds, OWNER, start.key).unwrap();
+    }
+    // Something else lets go of the pin the walk holds on /etc, and the tree
+    // changes: the step finds the proof stale, the cancel of the journal
+    // goes well and the rewind of the walk finds its pin gone.
+    let etc = env.lookup(b"/etc").unwrap();
+    env.ram
+        .storage
+        .unpin(etc, crate::storage::Pin::Pending)
+        .unwrap();
+    let rival = same_bucket(ROOT, b"dst");
+    env.node(ROOT, &rival, REG, 0o644);
+    let _ = env.step(&fds, OWNER, start.key);
 }
 
 #[test]
@@ -2139,15 +2171,24 @@ fn phase_of(env: &Env) -> ChangePhase {
 fn a_change_during_the_walk_counts_one_restart_and_the_answer_is_the_same() {
     let mut env = Env::new();
     let mut fds = session();
-    let start = mkdir(7, 1, b"/walked", 0o755, 0);
+    let one = env.node(ROOT, b"one", DIR, 0o755);
+    let two = env.node(one, b"two", DIR, 0o755);
+    env.node(two, b"three", DIR, 0o755);
+    let start = mkdir(7, 1, b"/one/two/three/walked", 0o755, 0);
     env.start(&mut fds, OWNER, &start).unwrap();
-    // The walk is under way: the table of names is scanned eight at a time.
-    for _ in 0..3 {
+    // The walk is under way: a component takes a step.
+    for _ in 0..2 {
         let (done, _, restarts, _) = env.step(&fds, OWNER, start.key).unwrap();
         assert!(!done && restarts == 0);
     }
     assert_eq!(phase_of(&env), ChangePhase::Resolving);
-    env.node(ROOT, b"foreign", REG, 0o644);
+    // The move of a directory under the walk: the epoch of the moves rises.
+    env.node(ROOT, b"mover", DIR, 0o755);
+    let mut other = session();
+    assert_eq!(
+        env.go_result(&mut other, op(ChangeOp::Rename, b"/mover"), Some(b"/moved")),
+        0
+    );
     let mut last = 0;
     for _ in 0..2000 {
         let (done, result, restarts, _) = env.step(&fds, OWNER, start.key).unwrap();
@@ -2158,7 +2199,7 @@ fn a_change_during_the_walk_counts_one_restart_and_the_answer_is_the_same() {
         }
     }
     assert_eq!(last, 1);
-    assert!(env.lookup(b"/walked").is_ok());
+    assert!(env.lookup(b"/one/two/three/walked").is_ok());
     env.release(&mut fds, OWNER, start.key).unwrap();
     env.assert_quiet();
 }
@@ -2176,7 +2217,8 @@ fn a_change_after_the_reservation_gives_the_reservation_back_and_the_job_goes_on
         env.step(&fds, OWNER, start.key).unwrap();
     }
     assert_eq!(env.lookup(b"/reserved"), Err(NO_ENTRY), "not published");
-    env.node(ROOT, b"foreign", REG, 0o644);
+    let rival = same_bucket(ROOT, b"reserved");
+    env.node(ROOT, &rival, REG, 0o644);
     let mut restarts = 0;
     for _ in 0..3000 {
         let (done, result, count, _) = env.step(&fds, OWNER, start.key).unwrap();
@@ -2201,4 +2243,1275 @@ fn a_change_after_the_reservation_gives_the_reservation_back_and_the_job_goes_on
     );
     env.release(&mut fds, OWNER, start.key).unwrap();
     env.assert_quiet();
+}
+
+/// The names of one file in the directory `dir`, over several roots.
+fn link_names(env: &mut Env, dir: Token, names: &[std::string::String]) {
+    let seed = env.node(dir, b"seed", REG, 0o644);
+    for (i, name) in names.iter().enumerate() {
+        let root = Root {
+            id: 300 + (i / 200) as u64,
+            generation: 1,
+        };
+        env.ram
+            .storage
+            .link(root, dir, name.as_bytes(), seed)
+            .unwrap();
+    }
+}
+
+/// `count` more names of one file in the root directory, over several roots
+/// because a root may hold only part of the table.
+fn fill_names(env: &mut Env, prefix: &str, count: usize) {
+    let seed = env.node(ROOT, std::format!("{prefix}seed").as_bytes(), REG, 0o644);
+    for i in 0..count {
+        let root = Root {
+            id: 100 + (i / 200) as u64,
+            generation: 1,
+        };
+        let name = std::format!("{prefix}{i}");
+        env.ram
+            .storage
+            .link(root, ROOT, name.as_bytes(), seed)
+            .unwrap();
+    }
+}
+
+use crate::storage::tests_support::{OneBucket, other_bucket, same_bucket};
+
+/// Steps of the walk of `path` to its end, found or missing.
+fn walk_steps(env: &mut Env, path: &[u8]) -> (usize, Result<Progress, u32>) {
+    let mut walk = Resolve::new(&mut env.ram.storage, path, ROOT, ROOT_USER, true).unwrap();
+    let mut steps = 0;
+    let end = loop {
+        steps += 1;
+        assert!(steps < 20_000);
+        match walk.step(&mut env.ram.storage, ROOT_USER) {
+            Ok(Progress::More) => {}
+            other => break other,
+        }
+    };
+    walk.release(&mut env.ram.storage);
+    (steps, end)
+}
+
+#[test]
+fn the_name_index_follows_create_unlink_link_and_every_kind_of_rename() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let a = env.node(ROOT, b"a", DIR, 0o755);
+    let b = env.node(ROOT, b"b", DIR, 0o755);
+    let f = env.node(a, b"f", REG, 0o644);
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/a/f"), Ok(f));
+    // A name moved to another directory is found there and not in the old one.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/a/f"), Some(b"/b/g")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/b/g"), Ok(f));
+    assert_eq!(env.lookup(b"/a/f"), Err(NO_ENTRY));
+    // A second name, then the first one goes.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/b/g"), Some(b"/a/h")),
+        0
+    );
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/b/g"), None),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/b/g"), Err(NO_ENTRY));
+    assert_eq!(env.lookup(b"/a/h"), Ok(f));
+    // A name replaced by a rename: the victim leaves, the source arrives.
+    let victim = env.node(b, b"v", REG, 0o644);
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/a/h"), Some(b"/b/v")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/b/v"), Ok(f));
+    assert_ne!(env.lookup(b"/b/v"), Ok(victim));
+    assert_eq!(env.lookup(b"/a/h"), Err(NO_ENTRY));
+    // A directory moves, and a name of the image does too.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/a"), Some(b"/b/a2")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert!(env.lookup(b"/b/a2").is_ok() && env.lookup(b"/a").is_err());
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/tmp/probe"), Some(b"/b/p")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert!(env.lookup(b"/b/p").is_ok() && env.lookup(b"/tmp/probe").is_err());
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/etc/motd"), None),
+        0
+    );
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/etc/motd"), Err(NO_ENTRY));
+    // A reserved name is no name for anyone else until it is published.
+    let r = env
+        .ram
+        .storage
+        .reserve(FIXTURE, ROOT, b"pending", (REG, 0o644, 0, 0))
+        .unwrap();
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/pending"), Err(NO_ENTRY));
+    env.ram.storage.commit(r).unwrap();
+    env.ram.storage.check_name_index();
+    assert!(env.lookup(b"/pending").is_ok());
+    let r = env
+        .ram
+        .storage
+        .reserve(FIXTURE, ROOT, b"given-back", (REG, 0o644, 0, 0))
+        .unwrap();
+    env.ram.storage.cancel(r).unwrap();
+    env.ram.storage.check_name_index();
+    assert_eq!(env.lookup(b"/given-back"), Err(NO_ENTRY));
+    env.assert_quiet();
+}
+
+#[test]
+fn all_names_in_one_bucket_cost_no_more_steps_than_the_scan_of_the_table() {
+    let _one = OneBucket::new();
+    let mut env = Env::new();
+    fill_names(&mut env, "n", crate::storage::DENTRIES - 2);
+    env.ram.storage.check_name_index();
+    let entries = env.ram.storage.entries();
+    let (missing, end) = walk_steps(&mut env, b"/absent");
+    assert!(matches!(end, Err(NO_ENTRY)));
+    assert!(
+        missing <= entries / 8 + 1,
+        "{missing} steps, {entries} entries"
+    );
+    let (last, end) = walk_steps(&mut env, b"/n0");
+    assert!(matches!(end, Ok(Progress::Found(_))));
+    assert!(last <= entries / 8 + 2);
+    // Names go from the middle and the ends of the chain.
+    let mut fds = session();
+    for name in [&b"/n0"[..], b"/n250", b"/n509"] {
+        assert_eq!(env.go_result(&mut fds, op(ChangeOp::Unlink, name), None), 0);
+        env.ram.storage.check_name_index();
+        assert_eq!(env.lookup(name), Err(NO_ENTRY));
+    }
+}
+
+#[test]
+fn the_names_of_a_full_image_and_a_full_table_are_one_chain_in_the_worst_case() {
+    use bootimg::rootfs::{Entry, REGULAR};
+    let _one = OneBucket::new();
+    let paths: Vec<std::string::String> = (0..bootimg::rootfs::ENTRIES_MAX)
+        .map(|i| std::format!("/i{i}"))
+        .collect();
+    let entries: Vec<Entry<'_>> = paths
+        .iter()
+        .map(|path| Entry {
+            path,
+            mode: REGULAR | 0o644,
+            uid: 0,
+            gid: 0,
+            file: 1,
+        })
+        .collect();
+    let image: &'static [u8] = std::vec::Vec::leak(crate::tree::test_image(&entries));
+    let index: &'static mut crate::tree::Index = Box::leak(Box::new(crate::tree::Index::new()));
+    let tree = crate::tree::load(image, index).unwrap();
+    let mut env = Env::new();
+    env.ram = Ram::with_tree(Timestamp::legacy_ns(1), tree);
+    env.ram.storage.node_mut(ROOT).unwrap().mode = 0o777;
+    fill_names(&mut env, "d", crate::storage::DENTRIES - 2);
+    env.ram.storage.check_name_index();
+    let total = env.ram.storage.entries();
+    let (missing, end) = walk_steps(&mut env, b"/absent");
+    assert!(matches!(end, Err(NO_ENTRY)));
+    // The scan of the table took entries / 8 steps for a miss.
+    assert!(missing <= total / 8 + 1, "{missing} steps, {total} entries");
+    std::println!("one bucket, {total} names: a miss takes {missing} steps");
+}
+
+#[test]
+fn a_miss_and_a_hit_take_one_step_a_component_with_ordinary_chains() {
+    let mut env = Env::new();
+    fill_names(&mut env, "file-", crate::storage::DENTRIES - 2);
+    env.ram.storage.check_name_index();
+    let (missing, end) = walk_steps(&mut env, b"/absent");
+    assert!(matches!(end, Err(NO_ENTRY)));
+    assert!(missing <= 2, "{missing}");
+    let (hit, end) = walk_steps(&mut env, b"/file-100");
+    assert!(matches!(end, Ok(Progress::Found(_))));
+    assert!(hit <= 3, "{hit}");
+}
+
+fn rmdir_op(path: &[u8]) -> ChangeStart<'_> {
+    with_args(ChangeOp::Unlink, path, UNLINK_REMOVEDIR, [0; 4])
+}
+
+#[test]
+fn the_count_of_names_decides_rmdir_and_follows_every_change() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let d = env.node(ROOT, b"d", DIR, 0o755);
+    let e = env.node(ROOT, b"e", DIR, 0o755);
+    let names = |env: &Env, t: Token| env.ram.storage.node(t).unwrap().names;
+    assert_eq!((names(&env, d), names(&env, e)), (0, 0));
+    env.node(d, b"x", REG, 0o644);
+    env.node(d, b"y", REG, 0o644);
+    env.node(d, b"sub", DIR, 0o755);
+    assert_eq!(names(&env, d), 3);
+    assert_eq!(
+        env.go_result(&mut fds, rmdir_op(b"/d"), None),
+        proto_fs::NOT_EMPTY
+    );
+    // A name between directories moves one count; a replaced name takes none.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/d/x"), Some(b"/e/x")),
+        0
+    );
+    assert_eq!((names(&env, d), names(&env, e)), (2, 1));
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Link, b"/e/x"), Some(b"/e/x2")),
+        0
+    );
+    assert_eq!(names(&env, e), 2);
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/e/x2"), Some(b"/d/y")),
+        0
+    );
+    assert_eq!((names(&env, d), names(&env, e)), (2, 1));
+    // A directory moves with its own count.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/d/sub"), Some(b"/e/sub")),
+        0
+    );
+    assert_eq!((names(&env, d), names(&env, e)), (1, 2));
+    // The last name goes, and the empty directory goes with rmdir.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/d/y"), None),
+        0
+    );
+    assert_eq!(names(&env, d), 0);
+    assert_eq!(env.go_result(&mut fds, rmdir_op(b"/d"), None), 0);
+    assert_eq!(env.lookup(b"/d"), Err(NO_ENTRY));
+    // A directory of the image: its names are counted at the start.
+    let tmp = env.lookup(b"/tmp").unwrap();
+    assert_eq!(names(&env, tmp), 1);
+    assert_eq!(
+        env.go_result(&mut fds, rmdir_op(b"/tmp"), None),
+        proto_fs::NOT_EMPTY
+    );
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/tmp/probe"), None),
+        0
+    );
+    assert_eq!(names(&env, tmp), 0);
+    assert_eq!(env.go_result(&mut fds, rmdir_op(b"/tmp"), None), 0);
+    env.assert_quiet();
+}
+
+#[test]
+fn rmdir_and_unlink_take_a_few_steps_however_many_names_the_table_holds() {
+    let mut env = Env::new();
+    let mut fds = session();
+    fill_names(&mut env, "pad", 400);
+    let d = env.node(ROOT, b"d", DIR, 0o755);
+    env.node(d, b"a", REG, 0o644);
+    let unlink = env.go(&mut fds, op(ChangeOp::Unlink, b"/d/a"), None);
+    assert_eq!(unlink.result, 0);
+    let rmdir = env.go(&mut fds, rmdir_op(b"/d"), None);
+    assert_eq!(rmdir.result, 0);
+    std::println!("unlink {} steps, rmdir {} steps", unlink.steps, rmdir.steps);
+    assert!(unlink.steps <= 10, "{}", unlink.steps);
+    assert!(rmdir.steps <= unlink.steps + 1, "{}", rmdir.steps);
+    env.assert_quiet();
+}
+
+#[test]
+fn path_follows_the_back_reference_of_a_renamed_directory_in_one_step_a_level() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let mut parent = ROOT;
+    let mut text = std::string::String::new();
+    for level in 0..64 {
+        let name = std::format!("l{level}");
+        parent = env.node(parent, name.as_bytes(), DIR, 0o755);
+        text.push('/');
+        text.push_str(&name);
+    }
+    let path = with_args(
+        ChangeOp::Path,
+        text.as_bytes(),
+        proto_fs::PATH_FOLLOW_LAST,
+        [0; 4],
+    );
+    let done = env.go(&mut fds, path, None);
+    assert_eq!(done.result, 0);
+    assert_eq!(done.bytes, text.as_bytes());
+    std::println!("path of depth 64: {} steps", done.steps);
+    assert!(done.steps <= 200, "{}", done.steps);
+    // A directory of the image renamed: the new entry names it.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/etc"), Some(b"/cfg")),
+        0
+    );
+    env.ram.storage.check_name_index();
+    let path = with_args(
+        ChangeOp::Path,
+        b"/cfg/.",
+        proto_fs::PATH_FOLLOW_LAST,
+        [0; 4],
+    );
+    let done = env.go(&mut fds, path, None);
+    assert_eq!((done.result, done.bytes.as_slice()), (0, &b"/cfg"[..]));
+    // And a directory made at run time, moved below another.
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/l0"), Some(b"/cfg/moved")),
+        0
+    );
+    let path = with_args(
+        ChangeOp::Path,
+        b"/cfg/moved/l1",
+        proto_fs::PATH_FOLLOW_LAST,
+        [0; 4],
+    );
+    let done = env.go(&mut fds, path, None);
+    assert_eq!(
+        (done.result, done.bytes.as_slice()),
+        (0, &b"/cfg/moved/l1"[..])
+    );
+    env.assert_quiet();
+}
+
+fn read_name(env: &mut Env, fds: &mut Fds, fd: u32) -> Option<(std::string::String, u32)> {
+    read_portioned(env, fds, fd).0
+}
+/// One name by `directory_read`, called again while the service says it is
+/// still walking (RESOLVING), as the client does. Gives the name and the calls.
+fn read_portioned(
+    env: &mut Env,
+    fds: &mut Fds,
+    fd: u32,
+) -> (Option<(std::string::String, u32)>, u32) {
+    for calls in 1.. {
+        match env.ram.directory_read(fds, fd, Timestamp::legacy_ns(5)) {
+            Ok(record) => {
+                let name = record.map(|record| {
+                    (
+                        std::string::String::from_utf8(record.name().to_vec()).unwrap(),
+                        record.kind,
+                    )
+                });
+                return (name, calls);
+            }
+            Err(proto_fs::RESOLVING) => assert!(calls < 64, "the walk does not end"),
+            Err(code) => panic!("status {code}"),
+        }
+    }
+    unreachable!()
+}
+fn open_directory(env: &mut Env, fds: &mut Fds, path: &str) -> u32 {
+    env.ram
+        .open(fds, path, proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY)
+        .unwrap()
+}
+/// Every name from the start to the end, with `.` and `..` left out.
+fn list(env: &mut Env, fds: &mut Fds, path: &str) -> Vec<std::string::String> {
+    let fd = open_directory(env, fds, path);
+    let mut names = Vec::new();
+    while let Some((name, _)) = read_name(env, fds, fd) {
+        if name != "." && name != ".." {
+            names.push(name);
+        }
+    }
+    env.ram.close(fds, fd).unwrap();
+    names
+}
+/// `rm -r`: one name read, then removed, at every level.
+fn remove_tree(env: &mut Env, fds: &mut Fds, path: &str) {
+    let fd = open_directory(env, fds, path);
+    while let Some((name, kind)) = read_name(env, fds, fd) {
+        if name == "." || name == ".." {
+            continue;
+        }
+        let child = std::format!("{path}/{name}");
+        if kind == DIR {
+            remove_tree(env, fds, &child);
+            assert_eq!(env.go_result(fds, rmdir_op(child.as_bytes()), None), 0);
+        } else {
+            assert_eq!(
+                env.go_result(fds, op(ChangeOp::Unlink, child.as_bytes()), None),
+                0
+            );
+        }
+    }
+    env.ram.close(fds, fd).unwrap();
+}
+
+#[test]
+fn a_directory_made_at_run_time_lists_its_names_with_their_kinds_and_inodes() {
+    let mut env = Env::new();
+    let mut fds = session();
+    assert_eq!(
+        env.go_result(&mut fds, mkdir(0, 1, b"/tmp/d", 0o755, 0), None),
+        0
+    );
+    assert_eq!(
+        env.go_result(&mut fds, mkdir(0, 1, b"/tmp/d/sub", 0o755, 0), None),
+        0
+    );
+    let tmp_d = env.lookup(b"/tmp/d").unwrap();
+    let file = env.node(tmp_d, b"f", REG, 0o644);
+    assert_eq!(list(&mut env, &mut fds, "/tmp/d"), ["sub", "f"]);
+    // The boot names stay, the new ones come after them.
+    assert_eq!(list(&mut env, &mut fds, "/tmp"), ["probe", "d"]);
+    assert_eq!(list(&mut env, &mut fds, "/"), ["etc", "tmp"]);
+    let fd = open_directory(&mut env, &mut fds, "/tmp/d");
+    let dot = env
+        .ram
+        .directory_read(&mut fds, fd, Timestamp::legacy_ns(5));
+    let dir = env.lookup(b"/tmp/d").unwrap();
+    assert_eq!(
+        dot.unwrap().unwrap().inode,
+        env.ram.inode(env.ram.file(dir))
+    );
+    let dotdot = env
+        .ram
+        .directory_read(&mut fds, fd, Timestamp::legacy_ns(5));
+    assert_eq!(dotdot.unwrap().unwrap().inode, 3, "the inode of /tmp");
+    let sub = env
+        .ram
+        .directory_read(&mut fds, fd, Timestamp::legacy_ns(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!((sub.name(), sub.kind), (&b"sub"[..], DIR));
+    let f = env
+        .ram
+        .directory_read(&mut fds, fd, Timestamp::legacy_ns(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!((f.name(), f.kind), (&b"f"[..], REG));
+    assert_eq!(f.inode, env.ram.inode(env.ram.file(file)));
+    assert_eq!(
+        env.ram
+            .directory_read(&mut fds, fd, Timestamp::legacy_ns(5)),
+        Ok(None)
+    );
+    env.ram.close(&mut fds, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn a_name_that_exists_all_the_time_is_listed_once_whatever_else_changes() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    let kept: Vec<std::string::String> = (0..24).map(|i| std::format!("keep{i:02}")).collect();
+    let others: Vec<std::string::String> = (0..24).map(|i| std::format!("gone{i:02}")).collect();
+    // Kept and doomed names alternate.
+    for i in 0..24 {
+        env.node(dir, kept[i].as_bytes(), REG, 0o644);
+        env.node(dir, others[i].as_bytes(), REG, 0o644);
+    }
+    let fd = open_directory(&mut env, &mut fds, "/d");
+    let mut seen = Vec::new();
+    let mut round = 0;
+    while let Some((name, _)) = read_name(&mut env, &mut fds, fd) {
+        if name == "." || name == ".." {
+            continue;
+        }
+        seen.push(name.clone());
+        round += 1;
+        // The name just given may go; names ahead go; new ones and a name that
+        // moves in and out of the directory come.
+        if round % 3 == 0 {
+            let path = std::format!("/d/{name}");
+            if name.starts_with("gone") {
+                assert_eq!(
+                    env.go_result(&mut fds, op(ChangeOp::Unlink, path.as_bytes()), None),
+                    0
+                );
+            }
+        }
+        if round == 5 {
+            for other in &others[10..] {
+                let path = std::format!("/d/{other}");
+                assert_eq!(
+                    env.go_result(&mut fds, op(ChangeOp::Unlink, path.as_bytes()), None),
+                    0
+                );
+            }
+        }
+        if round == 7 {
+            for i in 0..6 {
+                env.node(dir, std::format!("late{i}").as_bytes(), REG, 0o644);
+            }
+            let moved = env.lookup(b"/d/keep00").unwrap();
+            let _ = moved;
+        }
+        env.ram.storage.check_name_index();
+    }
+    for name in &kept {
+        assert_eq!(
+            seen.iter().filter(|n| *n == name).count(),
+            1,
+            "{name} is listed once"
+        );
+    }
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), seen.len(), "no name twice");
+    env.ram.close(&mut fds, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn rm_r_of_a_tree_of_three_levels_reads_and_removes_name_by_name() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let top = env.node(ROOT, b"top", DIR, 0o755);
+    for a in 0..3 {
+        let one = env.node(top, std::format!("a{a}").as_bytes(), DIR, 0o755);
+        env.node(top, std::format!("fa{a}").as_bytes(), REG, 0o644);
+        for b in 0..3 {
+            let two = env.node(one, std::format!("b{b}").as_bytes(), DIR, 0o755);
+            env.node(one, std::format!("fb{b}").as_bytes(), REG, 0o644);
+            for c in 0..3 {
+                env.node(two, std::format!("c{c}").as_bytes(), REG, 0o644);
+            }
+        }
+    }
+    assert_eq!(list(&mut env, &mut fds, "/top").len(), 6);
+    remove_tree(&mut env, &mut fds, "/top");
+    assert_eq!(env.go_result(&mut fds, rmdir_op(b"/top"), None), 0);
+    assert_eq!(list(&mut env, &mut fds, "/"), ["etc", "tmp"]);
+    env.assert_quiet();
+}
+
+#[test]
+fn boot_names_leave_and_arrive_in_the_listing_with_renames_and_unlinks() {
+    let mut env = Env::new();
+    let mut fds = session();
+    assert_eq!(list(&mut env, &mut fds, "/etc"), ["motd"]);
+    assert_eq!(
+        env.go_result(
+            &mut fds,
+            op(ChangeOp::Rename, b"/etc/motd"),
+            Some(b"/tmp/m")
+        ),
+        0
+    );
+    assert!(list(&mut env, &mut fds, "/etc").is_empty());
+    assert_eq!(list(&mut env, &mut fds, "/tmp"), ["probe", "m"]);
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/tmp/probe"), None),
+        0
+    );
+    assert_eq!(list(&mut env, &mut fds, "/tmp"), ["m"]);
+    // A name moved to another directory is listed there and no longer here;
+    // a name renamed within its directory keeps its place.
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    env.node(dir, b"one", REG, 0o644);
+    env.node(dir, b"two", REG, 0o644);
+    env.node(dir, b"three", REG, 0o644);
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/d/two"), Some(b"/d/zwei")),
+        0
+    );
+    assert_eq!(list(&mut env, &mut fds, "/d"), ["one", "zwei", "three"]);
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Rename, b"/d/one"), Some(b"/tmp/one")),
+        0
+    );
+    assert_eq!(list(&mut env, &mut fds, "/d"), ["zwei", "three"]);
+    assert_eq!(list(&mut env, &mut fds, "/tmp"), ["m", "one"]);
+    // A name from the middle of the past takes the end of the new directory,
+    // after the names that are younger than it.
+    let old = env.node(ROOT, b"old", DIR, 0o755);
+    env.node(old, b"first", REG, 0o644);
+    let young = env.node(ROOT, b"young", DIR, 0o755);
+    for name in ["y1", "y2", "y3"] {
+        env.node(young, name.as_bytes(), REG, 0o644);
+    }
+    assert_eq!(
+        env.go_result(
+            &mut fds,
+            op(ChangeOp::Rename, b"/old/first"),
+            Some(b"/young/first")
+        ),
+        0
+    );
+    assert_eq!(
+        list(&mut env, &mut fds, "/young"),
+        ["y1", "y2", "y3", "first"]
+    );
+    assert!(list(&mut env, &mut fds, "/old").is_empty());
+    env.assert_quiet();
+}
+
+#[test]
+fn a_position_is_a_cookie_that_can_be_taken_again_and_survives_the_removal_of_its_name() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    for name in ["a", "b", "c", "d"] {
+        env.node(dir, name.as_bytes(), REG, 0o644);
+    }
+    let fd = open_directory(&mut env, &mut fds, "/d");
+    let position = |env: &mut Env, fds: &mut Fds| {
+        env.ram
+            .seek_from(fds, fd, 0, proto_fs::SeekFrom::Current)
+            .unwrap()
+    };
+    let mut at = Vec::new();
+    for _ in 0..4 {
+        read_name(&mut env, &mut fds, fd);
+        at.push(position(&mut env, &mut fds));
+    }
+    // After `a`: the position that precedes `b`.
+    assert!(at.windows(2).all(|w| w[0] < w[1]));
+    env.ram
+        .seek_from(&mut fds, fd, at[2], proto_fs::SeekFrom::Start)
+        .unwrap();
+    assert_eq!(read_name(&mut env, &mut fds, fd).unwrap().0, "b");
+    // The name before the position goes: the next one is still the next.
+    env.ram
+        .seek_from(&mut fds, fd, at[2], proto_fs::SeekFrom::Start)
+        .unwrap();
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/d/a"), None),
+        0
+    );
+    assert_eq!(read_name(&mut env, &mut fds, fd).unwrap().0, "b");
+    env.ram
+        .seek_from(&mut fds, fd, at[3], proto_fs::SeekFrom::Start)
+        .unwrap();
+    assert_eq!(
+        env.go_result(&mut fds, op(ChangeOp::Unlink, b"/d/b"), None),
+        0
+    );
+    assert_eq!(read_name(&mut env, &mut fds, fd).unwrap().0, "c");
+    assert_eq!(read_name(&mut env, &mut fds, fd).unwrap().0, "d");
+    assert_eq!(read_name(&mut env, &mut fds, fd), None);
+    // Rewound, the rest.
+    env.ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    assert_eq!(list(&mut env, &mut fds, "/d"), ["c", "d"]);
+    env.ram.close(&mut fds, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn the_listing_by_index_agrees_with_the_listing_by_position() {
+    let mut env = Env::new();
+    let dir = env.node(ROOT, b"d", DIR, 0o755);
+    for name in ["x", "y", "z"] {
+        env.node(dir, name.as_bytes(), REG, 0o644);
+    }
+    let mut by_index = Vec::new();
+    while let Some(record) = env
+        .ram
+        .directory_read_path("/d", by_index.len() as u32, Timestamp::legacy_ns(6))
+        .unwrap()
+    {
+        by_index.push(std::string::String::from_utf8(record.name().to_vec()).unwrap());
+    }
+    assert_eq!(by_index, [".", "..", "x", "y", "z"]);
+    env.assert_quiet();
+}
+
+#[test]
+fn a_loop_of_mkdir_and_rmdir_does_not_outrun_the_reclamation_of_the_nodes() {
+    // The share of a root is 192 nodes and a removed directory is reclaimed
+    // later. Without the maintenance of the service, which is absent here,
+    // the steps of the operations reclaim as fast as the operations make.
+    let mut env = Env::new();
+    let mut fds = session();
+    for round in 0..800 {
+        let made = env.go_result(&mut fds, mkdir(0, 1, b"/tmp/r", 0o755, 0), None);
+        assert_eq!(made, 0, "mkdir in round {round}");
+        let removed = env.go_result(&mut fds, rmdir_op(b"/tmp/r"), None);
+        assert_eq!(removed, 0, "rmdir in round {round}");
+    }
+    env.assert_quiet();
+}
+
+/// An unlink of `/d/f` that stands ready to publish when another client acts
+/// (`early`: walks its path). Returns the restarts the job counted and its result.
+fn unlink_against(action: impl FnOnce(&mut Env, &mut Fds), early: bool) -> (u32, u32) {
+    let mut env = Env::new();
+    let mut fds = session();
+    let d = env.node(ROOT, b"d", DIR, 0o755);
+    env.node(d, b"f", REG, 0o644);
+    env.node(d, b"h", REG, 0o644);
+    let e = env.node(ROOT, b"e", DIR, 0o755);
+    env.node(e, b"g", REG, 0o644);
+    env.node(e, b"sub", DIR, 0o755);
+    let start = ChangeStart {
+        key: key(4, 1),
+        ..op(ChangeOp::Unlink, b"/d/f")
+    };
+    env.start(&mut fds, OWNER, &start).unwrap();
+    let mut steps = 0;
+    let wanted = if early {
+        ChangePhase::Resolving
+    } else {
+        ChangePhase::Ready
+    };
+    if early {
+        // One step: the root is walked, "d" is the current directory.
+        env.step(&fds, OWNER, start.key).unwrap();
+        assert_eq!(phase_of(&env), wanted);
+    } else {
+        while phase_of(&env) != wanted {
+            steps += 1;
+            assert!(steps < 200);
+            let (done, ..) = env.step(&fds, OWNER, start.key).unwrap();
+            assert!(!done);
+        }
+    }
+    let mut other = session();
+    action(&mut env, &mut other);
+    let mut last = (0, 0);
+    for _ in 0..1000 {
+        let (done, result, restarts, _) = env.step(&fds, OWNER, start.key).unwrap();
+        last = (restarts, result);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(env.lookup(b"/d/f"), Err(NO_ENTRY), "the name is gone");
+    env.release(&mut fds, OWNER, start.key).unwrap();
+    last
+}
+
+#[test]
+fn what_another_client_does_between_the_steps_of_an_unlink_restarts_it_only_when_it_touches_the_proof()
+ {
+    use proto_fs::ID_UNCHANGED;
+    let chmod = |path: &'static [u8], mode: u64| {
+        move |env: &mut Env, other: &mut Fds| {
+            assert_eq!(
+                env.go_result(
+                    other,
+                    with_args(ChangeOp::Chmod, path, 0, [mode, 0, 0, 0]),
+                    None
+                ),
+                0
+            );
+        }
+    };
+    let times = |env: &mut Env, other: &mut Fds| {
+        let args = [5, 6, 7, 8];
+        assert_eq!(
+            env.go_result(other, with_args(ChangeOp::Times, b"/e/g", 0, args), None),
+            0
+        );
+    };
+    let chown = |env: &mut Env, other: &mut Fds| {
+        let args = [7, ID_UNCHANGED, 0, 0];
+        assert_eq!(
+            env.go_result(other, with_args(ChangeOp::Chown, b"/e/g", 0, args), None),
+            0
+        );
+    };
+    for early in [false, true] {
+        // The file of another directory: its times, mode, owner and bytes.
+        assert_eq!(
+            unlink_against(times, early),
+            (0, 0),
+            "utimensat, early {early}"
+        );
+        assert_eq!(unlink_against(chmod(b"/e/g", 0o600), early), (0, 0));
+        assert_eq!(unlink_against(chown, early), (0, 0));
+        assert_eq!(
+            unlink_against(
+                |env, _| {
+                    let g = env.lookup(b"/e/g").unwrap();
+                    env.ram.storage.write(g, FIXTURE, 0, b"bytes").unwrap();
+                },
+                early
+            ),
+            (0, 0),
+            "a write, early {early}"
+        );
+        // Bytes through a descriptor (a write that clears set-id bits, a truncation).
+        assert_eq!(
+            unlink_against(
+                |env, other| {
+                    let g = env.lookup(b"/e/g").unwrap();
+                    env.ram.storage.set_attributes(g, 0o6755, 0, 0).unwrap();
+                    let fd = env
+                        .ram
+                        .open_token(other, g, proto_fs::READ_WRITE, ROOT_USER)
+                        .unwrap();
+                    assert_eq!(env.ram.pwrite(other, fd, 0, b"xy", Env::now()), Ok(2));
+                    let mut write = env.ram.prepare_write(other, fd, b"zw", Some(0)).unwrap();
+                    while !write.step(&mut env.ram).unwrap() {}
+                    write.commit(&mut env.ram, Env::now()).unwrap();
+                    while !write.cancel(&mut env.ram).unwrap() {}
+                    let mut prep = env.ram.prepare_truncate(other, fd, 1).unwrap();
+                    while !prep.step(&mut env.ram).unwrap() {}
+                    prep.commit(&mut env.ram, Env::now()).unwrap();
+                    while !prep.cancel(&mut env.ram).unwrap() {}
+                    env.ram.close(other, fd).unwrap();
+                },
+                early
+            ),
+            (0, 0),
+            "bytes through a descriptor, early {early}"
+        );
+        assert_eq!(
+            unlink_against(
+                |env, _| {
+                    let d = env.lookup(b"/d").unwrap();
+                    let e = env.lookup(b"/e").unwrap();
+                    let bucket = crate::storage::name_bucket(d, b"f");
+                    let name = (0..)
+                        .map(|i| format!("foreign{i}"))
+                        .find(|name| crate::storage::name_bucket(e, name.as_bytes()) == bucket)
+                        .unwrap();
+                    env.node(e, name.as_bytes(), REG, 0o644);
+                },
+                early
+            ),
+            (0, 0),
+            "a colliding name of another directory, early {early}"
+        );
+        // A file of the directory of the name: its mode too.
+        assert_eq!(unlink_against(chmod(b"/d/h", 0o600), early), (0, 0));
+        // Names of another directory, a directory made and a mode of it.
+        assert_eq!(
+            unlink_against(
+                |env, _| {
+                    let e = env.lookup(b"/e").unwrap();
+                    env.node(e, b"new", REG, 0o644);
+                },
+                early
+            ),
+            (0, 0),
+            "a name made elsewhere, early {early}"
+        );
+        assert_eq!(
+            unlink_against(
+                |env, other| {
+                    assert_eq!(env.go_result(other, op(ChangeOp::Unlink, b"/e/g"), None), 0);
+                },
+                early
+            ),
+            (0, 0)
+        );
+        assert_eq!(unlink_against(chmod(b"/e", 0o700), early), (0, 0));
+        assert_eq!(
+            unlink_against(
+                |env, other| {
+                    assert_eq!(
+                        env.go_result(other, mkdir(9, 9, b"/e/made", 0o755, 0), None),
+                        0
+                    );
+                },
+                early
+            ),
+            (0, 0)
+        );
+        // Another name in the directory of the victim leaves the proof of the
+        // edge as it is; a name of the bucket of the victim does not (a walk
+        // that has not yet reached the end of the path looks the component up
+        // again without a restart).
+        assert_eq!(
+            unlink_against(
+                |env, _| {
+                    let d = env.lookup(b"/d").unwrap();
+                    let name = other_bucket(d, b"f");
+                    env.node(d, &name, REG, 0o644);
+                },
+                early
+            ),
+            (0, 0),
+            "a name of another bucket in the directory, early {early}"
+        );
+        assert_eq!(
+            unlink_against(
+                |env, _| {
+                    let d = env.lookup(b"/d").unwrap();
+                    let name = same_bucket(d, b"f");
+                    env.node(d, &name, REG, 0o644);
+                },
+                early
+            ),
+            if early { (0, 0) } else { (1, 0) },
+            "a name of the bucket of the victim, early {early}"
+        );
+        assert_eq!(
+            unlink_against(
+                |env, _| {
+                    let d = env.lookup(b"/d").unwrap();
+                    let name = same_bucket(d, b"f");
+                    env.node(d, &name, REG, 0o644);
+                    env.ram.storage.unlink(d, &name, FIXTURE).unwrap();
+                },
+                early
+            ),
+            if early { (0, 0) } else { (1, 0) },
+            "a name that came and went, early {early}"
+        );
+        // The mode of the directory is checked when the job commits, not by the proof.
+        assert_eq!(unlink_against(chmod(b"/d", 0o711), early), (0, 0));
+        // The move of a directory anywhere restarts every job.
+        assert_eq!(
+            unlink_against(
+                |env, other| {
+                    assert_eq!(
+                        env.go_result(other, op(ChangeOp::Rename, b"/e/sub"), Some(b"/e/sub2")),
+                        0
+                    );
+                },
+                early
+            ),
+            (1, 0),
+            "a directory moved, early {early}"
+        );
+    }
+}
+
+/// Jobs started together and stepped by turns until all are done.
+fn by_turns(env: &mut Env, fds: &mut Fds, jobs: &[(&ChangeStart<'_>, Option<&[u8]>)]) -> Vec<Done> {
+    for (start, second) in jobs {
+        env.start(fds, OWNER, start).unwrap();
+        if let Some(bytes) = second {
+            env.second(fds, OWNER, start.key, Base::Absolute, bytes)
+                .unwrap();
+        }
+    }
+    let mut done: Vec<Option<Done>> = jobs.iter().map(|_| None).collect();
+    for round in 0..3000 {
+        for (i, (start, _)) in jobs.iter().enumerate() {
+            if done[i].is_some() {
+                continue;
+            }
+            let (finished, result, restarts, bytes) = env.step(fds, OWNER, start.key).unwrap();
+            if finished {
+                done[i] = Some(Done {
+                    result,
+                    restarts,
+                    bytes,
+                    steps: round,
+                });
+            }
+        }
+        if done.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    for (start, _) in jobs {
+        env.release(fds, OWNER, start.key).unwrap();
+    }
+    done.into_iter()
+        .map(|d| d.expect("every job ends"))
+        .collect()
+}
+
+#[test]
+fn renames_of_distinct_names_in_one_directory_do_not_restart_each_other() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"shared", DIR, 0o755);
+    // Twelve renames f<i> to g<i>, from buckets that differ, started together.
+    let mut taken = std::vec::Vec::new();
+    let mut pairs = std::vec::Vec::new();
+    let mut i = 0;
+    while pairs.len() < 12 {
+        let (from, to) = (format!("f{i}"), format!("g{i}"));
+        i += 1;
+        let buckets = [
+            crate::storage::name_bucket(dir, from.as_bytes()),
+            crate::storage::name_bucket(dir, to.as_bytes()),
+        ];
+        if buckets[0] == buckets[1] || buckets.iter().any(|b| taken.contains(b)) {
+            continue;
+        }
+        taken.extend(buckets);
+        env.node(dir, from.as_bytes(), REG, 0o644);
+        pairs.push((format!("/shared/{from}"), format!("/shared/{to}")));
+    }
+    let starts: Vec<ChangeStart<'_>> = pairs
+        .iter()
+        .enumerate()
+        .map(|(n, (from, _))| ChangeStart {
+            key: key(n as u32, 1),
+            ..op(ChangeOp::Rename, from.as_bytes())
+        })
+        .collect();
+    let jobs: Vec<(&ChangeStart<'_>, Option<&[u8]>)> = starts
+        .iter()
+        .zip(&pairs)
+        .map(|(start, (_, to))| (start, Some(to.as_bytes())))
+        .collect();
+    let done = by_turns(&mut env, &mut fds, &jobs);
+    assert!(
+        done.iter().all(|d| d.result == 0 && d.restarts == 0),
+        "{done:?}"
+    );
+    for (_, to) in &pairs {
+        assert!(env.lookup(to.as_bytes()).is_ok());
+    }
+    env.assert_quiet();
+}
+
+#[test]
+fn two_renames_of_directories_that_meet_make_one_success_and_one_refusal_and_no_cycle() {
+    // The parents of the edges are not touched by the other rename: only the
+    // epoch of the moves stands between the two and a cycle.
+    let mut env = Env::new();
+    let mut fds = session();
+    let x = env.node(ROOT, b"x", DIR, 0o755);
+    let y = env.node(ROOT, b"y", DIR, 0o755);
+    env.node(x, b"a", DIR, 0o755);
+    env.node(y, b"b", DIR, 0o755);
+    let first = ChangeStart {
+        key: key(4, 1),
+        ..op(ChangeOp::Rename, b"/x/a")
+    };
+    let second = ChangeStart {
+        key: key(5, 1),
+        ..op(ChangeOp::Rename, b"/y/b")
+    };
+    let [one, two] = by_turns(
+        &mut env,
+        &mut fds,
+        &[(&first, Some(b"/y/b/a")), (&second, Some(b"/x/a/b"))],
+    )
+    .try_into()
+    .unwrap_or_else(|_| unreachable!());
+    // The one that commits second walks its paths again and finds the
+    // other directory moved: no entry. Both do not succeed.
+    let mut results = [one.result, two.result];
+    results.sort_unstable();
+    assert_eq!(results, [0, NO_ENTRY], "{one:?} {two:?}");
+    assert_eq!(one.restarts + two.restarts, 1);
+    // Exactly one of the two directories is where it was, the other is inside it.
+    let a = env.lookup(b"/x/a");
+    let b = env.lookup(b"/y/b");
+    assert!(a.is_ok() != b.is_ok(), "one directory is inside the other");
+    let inside = if a.is_ok() { b"/x/a/b" } else { b"/y/b/a" };
+    assert!(env.lookup(inside).is_ok());
+    env.assert_quiet();
+}
+
+#[test]
+fn two_creations_of_one_name_make_one_success_and_one_exists() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let first = mkdir(4, 1, b"/same", 0o755, 0);
+    let second = mkdir(5, 1, b"/same", 0o700, 0);
+    let [one, two] = by_turns(&mut env, &mut fds, &[(&first, None), (&second, None)])
+        .try_into()
+        .unwrap_or_else(|_| unreachable!());
+    let mut results = [one.result, two.result];
+    results.sort_unstable();
+    assert_eq!(results, [0, proto_fs::ALREADY_EXISTS], "{one:?} {two:?}");
+    assert!(env.lookup(b"/same").is_ok());
+    env.assert_quiet();
+}
+
+#[test]
+fn a_chmod_or_chown_of_a_directory_raises_its_access_generation_and_nothing_else_does() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"dir", DIR, 0o755);
+    let file = env.node(dir, b"file", REG, 0o644);
+    let access = |env: &Env, token| env.ram.storage.node(token).unwrap().access_gen;
+    let names = |env: &Env, token| env.ram.storage.node(token).unwrap().name_gen;
+    let (before, names_before) = (access(&env, dir), names(&env, dir));
+    let chmod = |path, mode: u64| with_args(ChangeOp::Chmod, path, 0, [mode, 0, 0, 0]);
+    // The file, the times and the same mode again change nothing of the directory.
+    assert_eq!(env.go_result(&mut fds, chmod(b"/dir/file", 0o600), None), 0);
+    let times = [1, 2, 3, 4];
+    assert_eq!(
+        env.go_result(
+            &mut fds,
+            with_args(ChangeOp::Times, b"/dir", 0, times),
+            None
+        ),
+        0
+    );
+    assert_eq!(env.go_result(&mut fds, chmod(b"/dir", 0o755), None), 0);
+    assert_eq!(access(&env, dir), before);
+    // A new mode of the directory, and a new owner.
+    assert_eq!(env.go_result(&mut fds, chmod(b"/dir", 0o700), None), 0);
+    assert_eq!(access(&env, dir), before + 1);
+    let chown = with_args(ChangeOp::Chown, b"/dir", 0, [5, 6, 0, 0]);
+    assert_eq!(env.go_result(&mut fds, chown, None), 0);
+    assert_eq!(access(&env, dir), before + 2);
+    assert_eq!(names(&env, dir), names_before, "no name changed");
+    let _ = file;
+    env.assert_quiet();
+}
+
+#[test]
+fn a_position_far_down_a_long_list_is_walked_a_portion_at_a_time_and_found() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"long", DIR, 0o755);
+    let names: Vec<std::string::String> = (0..480).map(|i| format!("n{i:03}")).collect();
+    link_names(&mut env, dir, &names);
+    let fd = open_directory(&mut env, &mut fds, "/long");
+    let portion = crate::storage::LIST_PORTION as u32;
+    // Read to the position of n419 and remember it.
+    for _ in 0..422 {
+        read_name(&mut env, &mut fds, fd).unwrap();
+    }
+    let late = env
+        .ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current)
+        .unwrap();
+    // The sequential steps with the hint never take more than one call.
+    let (name, calls) = read_portioned(&mut env, &mut fds, fd);
+    assert_eq!((name.unwrap().0.as_str(), calls), ("n419", 1));
+    // Rewound and back to the late position: the hint is stale, the walk takes portions.
+    env.ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    read_name(&mut env, &mut fds, fd).unwrap();
+    env.ram
+        .seek_from(&mut fds, fd, late, proto_fs::SeekFrom::Start)
+        .unwrap();
+    let (name, calls) = read_portioned(&mut env, &mut fds, fd);
+    assert_eq!(name.unwrap().0, "n419");
+    // The seed and 419 names stand before the position: 420 links, and one
+    // more call finds the name after them.
+    assert_eq!(calls, 421u32.div_ceil(portion));
+    assert!(calls >= 2, "a walk of 420 links is more than one portion");
+    // The telldir pattern: a seek to the position just read, before each read.
+    env.ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut most = 0;
+    loop {
+        let here = env
+            .ram
+            .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current)
+            .unwrap();
+        env.ram
+            .seek_from(&mut fds, fd, here, proto_fs::SeekFrom::Start)
+            .unwrap();
+        let (name, calls) = read_portioned(&mut env, &mut fds, fd);
+        most = most.max(calls);
+        let Some((name, _)) = name else { break };
+        if name != "." && name != ".." {
+            seen.push(name);
+        }
+    }
+    let mut expected = vec![std::string::String::from("seed")];
+    expected.extend(names.iter().cloned());
+    assert!(seen == expected, "every name once, in order");
+    assert!(
+        most <= 481u32.div_ceil(portion) + 1,
+        "{most} calls for one name"
+    );
+    env.ram.close(&mut fds, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn a_walk_that_waits_for_its_next_portion_survives_the_removal_of_the_entry_it_reached() {
+    let mut env = Env::new();
+    let mut fds = session();
+    let dir = env.node(ROOT, b"long", DIR, 0o755);
+    let names: Vec<std::string::String> = (0..480).map(|i| format!("n{i:03}")).collect();
+    link_names(&mut env, dir, &names);
+    let fd = open_directory(&mut env, &mut fds, "/long");
+    for _ in 0..450 {
+        read_name(&mut env, &mut fds, fd).unwrap();
+    }
+    let late = env
+        .ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current)
+        .unwrap();
+    env.ram
+        .seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Start)
+        .unwrap();
+    read_name(&mut env, &mut fds, fd).unwrap();
+    env.ram
+        .seek_from(&mut fds, fd, late, proto_fs::SeekFrom::Start)
+        .unwrap();
+    // One portion, and the walk stands at an entry of the list.
+    assert_eq!(
+        env.ram
+            .directory_read(&mut fds, fd, Timestamp::legacy_ns(5))
+            .err(),
+        Some(proto_fs::RESOLVING)
+    );
+    // The entry it reached goes with its neighbours, and a new name takes the place.
+    for i in 100..160 {
+        let path = format!("/long/n{i:03}");
+        assert_eq!(
+            env.go_result(&mut fds, op(ChangeOp::Unlink, path.as_bytes()), None),
+            0
+        );
+    }
+    env.node(dir, b"zz", REG, 0o644);
+    // The next name after the position, whatever happened to the places behind it.
+    assert_eq!(read_name(&mut env, &mut fds, fd).unwrap().0, "n447");
+    env.ram.close(&mut fds, fd).unwrap();
+    env.assert_quiet();
+}
+
+#[test]
+fn the_call_by_index_serves_the_first_names_and_refuses_the_rest() {
+    let mut env = Env::new();
+    let dir = env.node(ROOT, b"idx", DIR, 0o755);
+    let names: Vec<std::string::String> = (0..300).map(|i| format!("n{i:03}")).collect();
+    link_names(&mut env, dir, &names);
+    let read = |env: &mut Env, index| {
+        env.ram
+            .directory_read_token(dir, index, ROOT_USER, Timestamp::legacy_ns(5))
+    };
+    assert_eq!(
+        read(&mut env, 2).unwrap().unwrap().name(),
+        b"seed".as_slice()
+    );
+    assert!(read(&mut env, crate::INDEX_MAX).unwrap().is_some());
+    assert_eq!(
+        read(&mut env, crate::INDEX_MAX + 1).err(),
+        Some(proto_fs::INVALID_ARGUMENT)
+    );
+    env.assert_quiet();
+}
+
+#[test]
+fn change_step_reclaims_one_paid_page_only_at_the_backlog_threshold() {
+    for count in [1, 31, 32] {
+        let mut env = Env::new();
+        let mut fds = session();
+        for i in 0..count {
+            let name = format!("garbage{i}");
+            let token = env.node(ROOT, name.as_bytes(), REG, 0o644);
+            env.ram
+                .storage
+                .write(token, FIXTURE, 0, &[0x5a; crate::storage::PAGE])
+                .unwrap();
+            env.ram
+                .storage
+                .unlink(ROOT, name.as_bytes(), FIXTURE)
+                .unwrap();
+        }
+        assert_eq!(env.ram.storage.reclaim_backlog(), count);
+        let before = env.ram.storage.available().pages;
+        let start = op(ChangeOp::Access, b"/");
+        env.start(&mut fds, OWNER, &start).unwrap();
+        env.step(&fds, OWNER, start.key).unwrap();
+        assert_eq!(
+            env.ram.storage.available().pages,
+            before + u16::from(count >= 32)
+        );
+        assert_eq!(env.ram.storage.reclaim_backlog(), count);
+        env.ram.storage.check_name_index();
+        env.release(&mut fds, OWNER, start.key).unwrap();
+    }
 }

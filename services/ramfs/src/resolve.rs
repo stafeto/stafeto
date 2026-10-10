@@ -2,11 +2,23 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Retained byte paths. Every step handles one component, eight names or one link.
+//!
+//! What a walk and its proofs hold on to, and what raises it:
+//! - the epoch of the moves (`State::epoch`) rises when a directory moves
+//!   (rename of a directory); a walk in another epoch starts again, and so
+//!   does a preparation that walked the ancestors of a directory;
+//! - the access count of a directory (`Node::access_gen`) rises with its mode
+//!   or owner; a walk in a chain of names that sees it changed takes its
+//!   component again, with the search permission;
+//! - bucket and directory name counters rise when a name comes or leaves.
+//!   A name proof is stale when both counters change. Foreign bucket edits
+//!   retain a live cursor in that bucket. Times, mode, owner and bytes of a
+//!   file leave the counters unchanged.
 
 use crate::authority::Identity;
 use crate::metadata::{MetadataPath, MetadataProof};
 use crate::namespace::{Edge, Location, NamespacePath, NamespaceProof, RawSyntax};
-use crate::storage::{Pin, ROOT, SYMLINK, Storage, Token};
+use crate::storage::{CHAIN_PORTION, NONE, Pin, ROOT, SYMLINK, Storage, Token};
 use proto_fs::{LOOP, MAX_PATH, NAME_TOO_LONG, NO_ENTRY, NOT_DIRECTORY, STALE_PROOF};
 
 pub struct Resolve {
@@ -18,8 +30,19 @@ pub struct Resolve {
     current: Token,
     at: usize,
     end: usize,
-    search: usize,
+    /// The next entry of the chain of the name being looked for, or NONE.
+    search: u16,
+    /// The entry of the last name the walk matched, or NONE.
+    found: u16,
     looking: bool,
+    /// The count of the changes of the mode and owner of the directory
+    /// `current` when its component began.
+    access_gen: u32,
+    /// The bucket of the name being looked for and its count of changes when
+    /// the lookup began.
+    bucket: u16,
+    bucket_stamp: u32,
+    name_gen: u32,
     link: Option<Token>,
     links: u8,
     epoch: u64,
@@ -27,12 +50,18 @@ pub struct Resolve {
     follow: bool,
     intent: Intent,
     edge_parent: Option<Token>,
+    /// The bucket of the name of the edge and its count when the walk took
+    /// the edge (NONE for an edge that has no name: `.` and `..`).
+    edge_bucket: u16,
+    edge_stamp: u32,
+    edge_name_gen: u32,
     edge_start: usize,
     edge_end: usize,
     missing: bool,
     result: Option<Token>,
-    /// Restarts of the walk the resolver made by itself: a change of the
-    /// tree, of the authority or of the identity between two steps.
+    /// Restarts of the walk the resolver made by itself: a move of a
+    /// directory, a change of the authority or of the identity between two
+    /// steps, or a name that came to the bucket of a name proved missing.
     pub restarts: u32,
     /// Holds bytes only and walks nothing (see `scratch`).
     inert: bool,
@@ -125,8 +154,13 @@ impl Resolve {
             current: base,
             at: 0,
             end: 0,
-            search: 0,
+            search: NONE,
+            found: NONE,
             looking: false,
+            access_gen: 0,
+            bucket: 0,
+            bucket_stamp: 0,
+            name_gen: 0,
             link: None,
             links: 0,
             epoch: storage.state.epoch,
@@ -134,6 +168,9 @@ impl Resolve {
             follow: intent.follows(),
             intent,
             edge_parent: None,
+            edge_bucket: NONE,
+            edge_stamp: 0,
+            edge_name_gen: 0,
             edge_start: 0,
             edge_end: 0,
             missing: false,
@@ -162,8 +199,13 @@ impl Resolve {
             current: ROOT,
             at: 0,
             end: 0,
-            search: 0,
+            search: NONE,
+            found: NONE,
             looking: false,
+            access_gen: 0,
+            bucket: 0,
+            bucket_stamp: 0,
+            name_gen: 0,
             link: None,
             links: 0,
             epoch: storage.state.epoch,
@@ -175,6 +217,9 @@ impl Resolve {
             follow: false,
             intent: Intent::Lookup { follow: false },
             edge_parent: None,
+            edge_bucket: NONE,
+            edge_stamp: 0,
+            edge_name_gen: 0,
             edge_start: 0,
             edge_end: 0,
             missing: false,
@@ -183,6 +228,11 @@ impl Resolve {
             inert: true,
             retired: false,
         })
+    }
+    /// Whether the walk is in the chain of a name.
+    #[cfg(test)]
+    pub(crate) fn looking_in(&self, directory: Token) -> bool {
+        self.looking && self.current == directory
     }
     pub fn is_inert(&self) -> bool {
         self.inert
@@ -228,7 +278,8 @@ impl Resolve {
         self.current = self.base;
         self.at = 0;
         self.end = 0;
-        self.search = 0;
+        self.search = NONE;
+        self.found = NONE;
         self.looking = false;
         self.link = None;
         self.links = 0;
@@ -253,10 +304,41 @@ impl Resolve {
         if let Some(result) = self.result {
             return Ok(Progress::Found(result));
         }
+        if self.missing
+            && self.edge_bucket != NONE
+            && !storage.name_unchanged(
+                self.edge_parent.ok_or(STALE_PROOF)?,
+                self.edge_bucket,
+                self.edge_stamp,
+                self.edge_name_gen,
+            )?
+        {
+            // A name came to the bucket since: the name is perhaps there.
+            self.restarts = self.restarts.saturating_add(1);
+            self.restart(storage, identity)?;
+            return Ok(Progress::More);
+        }
         if self.missing {
             return Ok(Progress::Missing(
                 self.edge_parent.expect("retained missing parent"),
             ));
+        }
+        // A change of the mode or owner of the directory the walk stands in
+        // sends the walk back to the start of this component: its search
+        // permission, the head of its chain and a link found in it are taken
+        // again. A name edit in this directory and bucket restarts the
+        // component too. Foreign edits retain a live cursor in the bucket.
+        // The components behind stay as they were.
+        if (self.looking || self.link.is_some())
+            && (storage.node(self.current)?.access_gen != self.access_gen
+                || self.looking
+                    && storage.stamp(self.bucket as usize) != self.bucket_stamp
+                    && (storage.node(self.current)?.name_gen != self.name_gen
+                        || !storage.chain_cursor_valid(self.search, self.bucket)))
+        {
+            self.looking = false;
+            self.link = None;
+            self.search = NONE;
         }
         if let Some(link) = self.link.take() {
             if self.links == 32 {
@@ -322,7 +404,7 @@ impl Resolve {
             if name == b"." || name == b".." {
                 let parent_component = name == b"..";
                 if self.final_component() {
-                    self.capture_edge(storage)?;
+                    self.capture_edge(storage, false)?;
                 }
                 if parent_component {
                     self.current = directory_parent;
@@ -330,11 +412,16 @@ impl Resolve {
                 self.at = self.end;
                 return Ok(Progress::More);
             }
-            self.search = 0;
+            self.access_gen = directory.access_gen;
+            self.name_gen = directory.name_gen;
+            let bucket = crate::storage::name_bucket(self.current, &self.path[self.at..self.end]);
+            self.bucket = bucket as u16;
+            self.bucket_stamp = storage.stamp(bucket);
+            self.search = storage.name_head(self.current, &self.path[self.at..self.end]);
             self.looking = true;
         }
-        for _ in 0..8 {
-            if self.search == storage.entries() {
+        for _ in 0..CHAIN_PORTION {
+            if self.search == NONE {
                 if self.final_component() && self.intent.permits_missing() {
                     // A new name may end in a slash when a directory can take it:
                     // the journal of the operation decides whether one can.
@@ -349,17 +436,18 @@ impl Resolve {
                     {
                         return Err(NO_ENTRY);
                     }
-                    self.capture_edge(storage)?;
+                    self.capture_edge(storage, true)?;
                     self.missing = true;
                     return Ok(Progress::Missing(self.current));
                 }
                 return Err(NO_ENTRY);
             }
             let i = self.search;
-            self.search += 1;
-            if let Some((name, token)) = storage.entry(self.current, i)
+            self.search = storage.name_next(i);
+            if let Some((name, token)) = storage.entry(self.current, i as usize)
                 && name == &self.path[self.at..self.end]
             {
+                self.found = i;
                 let node = storage.node(token)?;
                 if node.kind == SYMLINK
                     && (self.follow
@@ -376,7 +464,7 @@ impl Resolve {
                     self.link = Some(token);
                 } else {
                     if self.final_component() {
-                        self.capture_edge(storage)?;
+                        self.capture_edge(storage, true)?;
                     }
                     self.current = token;
                     self.at = self.end;
@@ -392,11 +480,19 @@ impl Resolve {
             .iter()
             .all(|&byte| byte == b'/')
     }
-    fn capture_edge(&mut self, storage: &mut Storage<'_>) -> Result<(), u32> {
+    /// Takes the edge into `current`; `named` when the component is a name
+    /// of the chain just followed (and not `.` or `..`).
+    fn capture_edge(&mut self, storage: &mut Storage<'_>, named: bool) -> Result<(), u32> {
         storage.pin(self.current, Pin::Pending)?;
         if let Some(parent) = self.edge_parent.replace(self.current) {
             storage.unpin(parent, Pin::Pending)?;
         }
+        (self.edge_bucket, self.edge_stamp) = if named {
+            (self.bucket, self.bucket_stamp)
+        } else {
+            (NONE, 0)
+        };
+        self.edge_name_gen = self.name_gen;
         self.edge_start = self.at;
         self.edge_end = self.end;
         Ok(())
@@ -415,20 +511,24 @@ impl Resolve {
             _ => Intent::Namespace { path },
         };
         let proof = self.result_proof(storage, identity, intent)?;
-        let location = if proof.target.is_none() {
+        let location = if proof.target.is_none() || self.found == NONE {
             Location::Missing
         } else {
-            self.search
-                .checked_sub(1)
-                .map(|i| storage.namespace_location(i))
-                .transpose()?
-                .unwrap_or(Location::Missing)
+            storage.namespace_location(self.found as usize)?
+        };
+        let (bucket, stamp) = if self.edge_parent.is_some() {
+            (self.edge_bucket, self.edge_stamp)
+        } else {
+            (NONE, 0)
         };
         Ok(NamespaceProof {
             edge: Edge {
                 parent: proof.parent,
                 target: proof.target,
                 location,
+                bucket,
+                stamp,
+                name_gen: self.edge_name_gen,
                 syntax: RawSyntax::of(self.original_path()),
             },
             leaf: proof.leaf,
@@ -480,7 +580,16 @@ impl Resolve {
         storage.node(parent)?;
         if let Some(result) = self.result {
             storage.node(result)?;
-        } else if !self.missing {
+        } else if !self.missing
+            || self.edge_bucket != NONE
+                && !storage.name_unchanged(
+                    self.edge_parent.ok_or(STALE_PROOF)?,
+                    self.edge_bucket,
+                    self.edge_stamp,
+                    self.edge_name_gen,
+                )?
+        {
+            // Either retained count proves that the name is still absent.
             return Err(STALE_PROOF);
         }
         Ok(ResultProof {

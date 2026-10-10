@@ -681,6 +681,38 @@ mod tests {
     }
 
     #[test]
+    fn holds_of_reads_that_wait_fill_the_slots_and_a_job_waits_for_one_to_go() {
+        type Big = Table<u32, 32, u64, u64, u64>;
+        let mut table = Big::default();
+        // Thirty-two reads of different descriptors wait in other threads.
+        let mut backends = [0u32; 32];
+        for (index, backend) in backends.iter_mut().enumerate() {
+            *backend = 100 + index as u32;
+            let fd = table.insert(*backend, Flags::default()).unwrap();
+            assert_eq!(table.hold(fd), Ok(*backend));
+        }
+        // No job is held, and still there is no place: the slots are taken.
+        assert_eq!(table.jobs_in_use(), 0);
+        let before = table.jobs_wait_word().load(Ordering::Relaxed);
+        assert_eq!(
+            table.job_place(owner(1)),
+            JobPlace::Full {
+                sequence: before,
+                own: false
+            }
+        );
+        // A hold that goes frees a slot and moves the word.
+        assert_eq!(table.unhold(backends[5]), None);
+        assert_eq!(table.job_place(owner(1)), JobPlace::Free);
+        assert_ne!(table.jobs_wait_word().load(Ordering::Relaxed), before);
+        table.begin_control(owner(1), 7).unwrap();
+        assert!(matches!(
+            table.job_place(owner(1)),
+            JobPlace::Full { own: false, .. }
+        ));
+    }
+
+    #[test]
     fn sixteen_places_of_jobs_are_taken_by_records_of_every_kind() {
         type Big = Table<u32, 32, u64, u64, u64>;
         let mut table = Big::default();

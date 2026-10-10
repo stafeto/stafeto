@@ -776,8 +776,8 @@ static int names_directories(void) {
 
 /* The records of posix_getdents. The directories that the service lists
  * are the fixed ones and those of the boot image: /etc holds `motd`, the root
- * holds `etc` and `tmp`. A directory made at run time lists `.` and `..`
- * only (the service has no listing of such nodes yet). */
+ * holds `etc` and `tmp`. The listing of a directory made at run time is the
+ * next section. */
 static int names_entries(void) {
     int fd = open("/etc", O_RDONLY | O_DIRECTORY);
     CHECK(fd >= 0);
@@ -858,6 +858,118 @@ static int names_entries(void) {
     CHECK(fd >= 0);
     FAILS(posix_getdents(fd, buffer.bytes, sizeof buffer, 0), ENOTDIR);
     CHECK(close(fd) == 0);
+    return 0;
+}
+
+/* The records of one directory from its start: how many times each wanted
+ * name came, and how many names not wanted. */
+static int names_tally(const char *path, const char *const *want, int *seen, int count) {
+    union {
+        char bytes[2048];
+        struct posix_dent align;
+    } buffer;
+    int fd = open(path, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return -1;
+    int other = 0;
+    for (int i = 0; i < count; i++) seen[i] = 0;
+    for (;;) {
+        ssize_t total = posix_getdents(fd, buffer.bytes, sizeof buffer, 0);
+        if (total <= 0) {
+            close(fd);
+            return total < 0 ? -1 : other;
+        }
+        for (ssize_t used = 0; used < total;) {
+            struct posix_dent *record = (struct posix_dent *)(buffer.bytes + used);
+            int known = 0;
+            for (int i = 0; i < count; i++) {
+                if (!strcmp(record->d_name, want[i])) {
+                    seen[i]++;
+                    known = 1;
+                }
+            }
+            if (!known) other++;
+            used += record->d_reclen;
+        }
+    }
+}
+
+/* `rm -r`: every name read from the directory is removed before the next
+ * one is read, at three levels. */
+static int names_remove_tree(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        char child[256];
+        snprintf(child, sizeof child, "%s/%s", path, entry->d_name);
+        if (entry->d_type == DT_DIR) {
+            if (names_remove_tree(child)) {
+                closedir(dir);
+                return -1;
+            }
+        } else if (unlink(child)) {
+            closedir(dir);
+            return -1;
+        }
+    }
+    closedir(dir);
+    return rmdir(path);
+}
+
+/* The directories under /tmp list the names made while the system runs. */
+static int names_listing(void) {
+    OK(mkdir(NAMES_ROOT "/ls", 0777));
+    OK(names_put(NAMES_ROOT "/ls/f1", "x"));
+    int fd = creat(NAMES_ROOT "/ls/f2", 0644);
+    CHECK(fd >= 0 && close(fd) == 0);
+    OK(mkdir(NAMES_ROOT "/ls/sub", 0777));
+    const char *const want[] = {".", "..", "f1", "f2", "f3", "sub"};
+    int seen[6];
+    CHECK(names_tally(NAMES_ROOT "/ls", want, seen, 6) == 0);
+    CHECK(seen[0] == 1 && seen[1] == 1 && seen[2] == 1 && seen[3] == 1 && seen[4] == 0 && seen[5] == 1);
+    /* A name removed is not listed, a name made is. */
+    OK(unlink(NAMES_ROOT "/ls/f1"));
+    OK(names_put(NAMES_ROOT "/ls/f3", "y"));
+    CHECK(names_tally(NAMES_ROOT "/ls", want, seen, 6) == 0);
+    CHECK(seen[0] == 1 && seen[1] == 1 && seen[2] == 0 && seen[3] == 1 && seen[4] == 1 && seen[5] == 1);
+    /* A name renamed into another directory leaves this listing. */
+    OK(rename(NAMES_ROOT "/ls/f3", NAMES_ROOT "/ls/sub/f3"));
+    CHECK(names_tally(NAMES_ROOT "/ls", want, seen, 6) == 0);
+    CHECK(seen[3] == 1 && seen[4] == 0 && seen[5] == 1);
+    const char *const inner[] = {"f3"};
+    int one;
+    CHECK(names_tally(NAMES_ROOT "/ls/sub", inner, &one, 1) == 2 && one == 1);
+    /* The stream of readdir. */
+    DIR *dir = opendir(NAMES_ROOT "/ls");
+    CHECK(dir != NULL);
+    int count = 0, sub = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        count++;
+        if (!strcmp(entry->d_name, "sub")) {
+            sub++;
+            CHECK(entry->d_type == DT_DIR);
+        }
+        if (!strcmp(entry->d_name, "f2")) CHECK(entry->d_type == DT_REG);
+    }
+    CHECK(closedir(dir) == 0 && count == 4 && sub == 1);
+    OK(unlink(NAMES_ROOT "/ls/sub/f3"));
+    OK(unlink(NAMES_ROOT "/ls/f2"));
+    OK(rmdir(NAMES_ROOT "/ls/sub"));
+    OK(rmdir(NAMES_ROOT "/ls"));
+    /* A tree of three levels. */
+    OK(mkdir(NAMES_ROOT "/tree", 0777));
+    OK(names_put(NAMES_ROOT "/tree/f", "0"));
+    OK(mkdir(NAMES_ROOT "/tree/a", 0777));
+    OK(names_put(NAMES_ROOT "/tree/a/f", "1"));
+    OK(names_put(NAMES_ROOT "/tree/a/g", "1"));
+    OK(mkdir(NAMES_ROOT "/tree/a/b", 0777));
+    OK(names_put(NAMES_ROOT "/tree/a/b/f", "2"));
+    OK(mkdir(NAMES_ROOT "/tree/a/b/c", 0777));
+    OK(mkdir(NAMES_ROOT "/tree/z", 0777));
+    CHECK(names_remove_tree(NAMES_ROOT "/tree") == 0);
+    CHECK(!names_exists(NAMES_ROOT "/tree"));
     return 0;
 }
 
@@ -1090,6 +1202,7 @@ static int names_all(void) {
         {"paths against descriptors", names_descriptor_bases},
         {"fchdir, getcwd and realpath", names_directories},
         {"posix_getdents", names_entries},
+        {"listing of names made at run time and rm -r", names_listing},
         {"dup3", names_dup3},
         {"limits of the links", names_limits},
         {"remove and the sticky bit", names_remove_sticky},

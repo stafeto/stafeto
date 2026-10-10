@@ -124,6 +124,8 @@ fn refused(refusal: Refusal) -> c_int {
     match refusal {
         Refusal::Exists => EEXIST,
         Refusal::Busy => EBUSY,
+        Refusal::NotDirectory => ENOTDIR,
+        Refusal::NotLink => EINVAL,
         Refusal::CrossDevice => EXDEV,
         Refusal::ReadOnly => EROFS,
         // The caller checks the metadata; no refusal of its own.
@@ -298,6 +300,8 @@ pub fn readlinkat(dirfd: c_int, path: &[u8], out: &mut [u8]) -> Result<usize, c_
         return Err(EINVAL);
     }
     let placed = place(dirfd, path)?;
+    // A name of the terminal exists and is no link.
+    check_virtual(Named::ReadLink, &placed, None, false)?;
     let mut read = request(ChangeOp::ReadLink, &placed);
     read.args = [out.len().min(RESULT_MAX) as u64, 0, 0, 0];
     let mut buffer = [0; RESULT_MAX];
@@ -555,7 +559,8 @@ pub fn fchdir(fd: c_int) -> Result<(), c_int> {
 pub fn realpath(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
     let placed = place(AT_FDCWD, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
-    if virtual_leaf(transport, &placed, false)?.is_none() {
+    // A slash after a name of the terminal makes ENOTDIR.
+    if virtual_leaf(transport, &placed, true)?.is_none() {
         return path_query(&placed, proto_fs::PATH_FOLLOW_LAST, out);
     }
     let bytes = placed.path();

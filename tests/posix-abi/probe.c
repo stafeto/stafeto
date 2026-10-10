@@ -230,7 +230,8 @@ static int directories(void) {
     entry = readdir(dir);
     if (!entry || !same(entry->d_name, "motd", 5) || entry->d_ino != 4 || entry->d_type != DT_REG) return 68;
     errno = 123;
-    if (readdir(dir) != NULL || errno != 123 || telldir(dir) != 3) return 69;
+    /* The position after `motd` is its cookie: the third entry of the table, 3 + 2. */
+    if (readdir(dir) != NULL || errno != 123 || telldir(dir) != 5) return 69;
     seekdir(dir, cookie);
     entry = readdir(dir);
     if (!entry || !same(entry->d_name, "..", 3)) return 70;

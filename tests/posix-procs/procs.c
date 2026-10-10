@@ -777,6 +777,12 @@ extern int files_change_stages(void);
 extern int files_closed_sessions(int count);
 extern int files_gone_child(int exec);
 extern int files_gone_places(void);
+extern int files_bounds_hold(int count);
+extern int files_bounds_release(void);
+extern int files_bounds_start(void);
+extern int files_bounds_stale(void);
+extern int files_bounds_publish(void);
+extern int files_bounds_reclaim(void);
 #endif
 #if NAMES_PROBE
 extern int files_names_pipe(void);
@@ -1026,15 +1032,50 @@ static int gone_exists(const char *name) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+/* The stage the probe of the departed process is in, for the watchdog: when
+ * a stage lasts too long (a service that does not give a job back leaves the
+ * probe waiting for a place or for the child), the watchdog says which one
+ * and ends the probe, so that the failure shows at once and not after the
+ * timeout of the whole run. 0 when the probe is over. */
+static volatile int gone_stage;
+
+static void *gone_watchdog(void *unused) {
+    int last = -1, still = 0;
+    while (gone_stage != 0) {
+        struct timespec delay = {0, 100000000};
+        nanosleep(&delay, NULL);
+        if (gone_stage == last) {
+            if (++still > 200) {
+                printf("posix-procs: steps: the names gone probe waits for 20 s at stage %d "
+                       "(1 names, 2 the child, 3 its end, 4 the places of the job)\n", gone_stage);
+                _exit(6);
+            }
+        } else {
+            last = gone_stage;
+            still = 0;
+        }
+    }
+    return unused;
+}
+
 static int names_gone(void) {
     static const char *const names[2][4] = {{"p1", "q1", "p2", "q2"}, {"r1", "s1", "r2", "s2"}};
     if (mkdir("/tmp/gn", 0755) != 0) return 1;
+    pthread_t watch;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 65536);
+    gone_stage = 1;
+    if (pthread_create(&watch, &attr, gone_watchdog, NULL) != 0) return 9;
     for (int exec = 0; exec < 2; exec++) {
         const char *const *n = names[exec];
+        gone_stage = 1;
         if (gone_pair(n[0], n[1]) || gone_pair(n[2], n[3])) return 2;
         pid_t pid = -1;
+        gone_stage = 2;
         if (steps_spawn(&pid, "gonechild", exec ? "1" : "0") != 0) return 3;
         int status = -1;
+        gone_stage = 3;
         if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 7) {
             printf("posix-procs: steps: the %s child ended with status %#x\n",
                    exec ? "execve" : "_exit", status);
@@ -1046,6 +1087,7 @@ static int names_gone(void) {
                    exec ? "execve" : "_exit");
             return 5;
         }
+        gone_stage = 4;
         if (files_gone_places() != 0) {
             printf("posix-procs: steps: the places of the job of the %s child stayed taken\n",
                    exec ? "execve" : "_exit");
@@ -1058,7 +1100,45 @@ static int names_gone(void) {
         }
     }
     if (rmdir("/tmp/gn") != 0) return 8;
+    gone_stage = 0;
+    pthread_join(watch, NULL);
     printf("posix-procs: names gone ok\n");
+    return 0;
+}
+#endif
+
+#if CHANGE_STEPS
+/* The worst states of the steps of the service, built on purpose. A Start
+ * with the root's share of the table of jobs taken (96 of its 128 places:
+ * 95 held by sessions of this process, and the Start itself; the 32 places
+ * beyond are for other roots, which the steps image has none to fill them),
+ * two paths of 511 bytes and a descriptor for a base; then the restart that
+ * follows a stale proof at the commit of a rename of a directory over an
+ * empty one, after the prepayment. The service prints its longest steps
+ * itself; the run checks them against B. */
+static int names_bounds(void) {
+    int held = files_bounds_hold(95);
+    if (held != 95) {
+        printf("posix-procs: steps: bounds: held %d of 95\n", held);
+        return 5;
+    }
+    int start = files_bounds_start();
+    int released = files_bounds_release();
+    if (start != 0 || released != 0) {
+        printf("posix-procs: steps: bounds: the Start gave %d, the release %d\n", start, released);
+        return 6;
+    }
+    int stale = files_bounds_stale();
+    if (stale != 0) {
+        printf("posix-procs: steps: bounds: the restart after a stale proof gave %d\n", stale);
+        return 7;
+    }
+    int reclaim = files_bounds_reclaim();
+    if (reclaim) {
+        printf("posix-procs: steps: bounds: reclaim gave %d\n", reclaim);
+        return 9;
+    }
+    printf("posix-procs: names bounds ok\n");
     return 0;
 }
 #endif
@@ -1069,6 +1149,11 @@ static int steps_run(void) {
     unsigned char zeros[STEPS_BRANCHES] = {0};
     if (fd < 0 || pwrite(fd, zeros, sizeof zeros, 0) != (ssize_t)sizeof zeros) return 2;
 #if CHANGE_STEPS
+    int publication = files_bounds_publish();
+    if (publication) {
+        printf("posix-procs: steps: bounds: publication gave %d\n", publication);
+        return 8;
+    }
     /* The operations on names alone, in a table full of names, against a
      * flood of changes and from 112 threads, before the crowd arrives. */
     int volley = names_volley();
@@ -1081,6 +1166,13 @@ static int steps_run(void) {
     int gone = names_gone();
     if (gone) {
         printf("posix-procs: steps: the names gone probe failed %d\n", gone);
+        return 6;
+    }
+#endif
+#if CHANGE_STEPS
+    int bounds = names_bounds();
+    if (bounds) {
+        printf("posix-procs: steps: the bounds probe failed %d\n", bounds);
         return 6;
     }
 #endif
@@ -2051,6 +2143,7 @@ static int role(const char *name) {
     if (strncmp(name, "channels_", 9) == 0) return channel_child(name);
     if (strcmp(name, "steps") == 0) return steps_run();
 #if CHANGE_STEPS
+    if (strcmp(name, "bounds-fill") == 0) return files_bounds_fill(-2);
     if (strcmp(name, "volley") == 0) return vz_child();
     if (strcmp(name, "gonechild") == 0) return files_gone_child(atoi(argv_seen[2]));
 #endif

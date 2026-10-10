@@ -15,10 +15,15 @@
 extern void files_volley_start(void);
 extern void files_volley_stop(void);
 extern unsigned files_volley_requests(void);
+extern void files_volley_thread_start(void);
+extern unsigned files_volley_thread_requests(void);
 extern unsigned long long files_volley_ticks(void);
 extern unsigned long long files_volley_frequency(void);
 extern unsigned files_volley_restarts(int op);
 extern unsigned files_volley_full_repeats(void);
+extern int files_volley_read_dir_index(const char *path, unsigned index);
+
+#include <dirent.h>
 
 #define VZ "/tmp/vz"
 #define VZ_PAD 120
@@ -31,6 +36,8 @@ extern unsigned files_volley_full_repeats(void);
 /* The numbers of ChangeOp. */
 #define VZ_OP_UNLINK 1
 #define VZ_OP_RENAME 3
+#define VZ_OP_ACCESS 10
+#define VZ_OP_PATH 12
 
 #define VZ_CHECK(condition)                                                    \
     do {                                                                       \
@@ -40,6 +47,13 @@ extern unsigned files_volley_full_repeats(void);
             return __LINE__;                                                   \
         }                                                                      \
     } while (0)
+
+/* The parent slot used by the service's name hash is exposed by st_ino. */
+static unsigned vz_name_bucket(unsigned slot, const char *name) {
+    unsigned hash = 0x811c9dc5u ^ slot;
+    for (; *name; name++) hash = (hash ^ (unsigned char)*name) * 0x01000193u;
+    return (hash ^ (hash >> 15)) & 2047u;
+}
 
 static unsigned vz_requests0;
 static unsigned long long vz_ticks0;
@@ -157,11 +171,104 @@ static int vz_quiet(void) {
     return 0;
 }
 
+/* The longest walks of a listing (the worry of 5i-5b step 1): the list of the
+ * names of a directory is walked from its head when the hint of a position is
+ * stale, by a seek to a late position, and by the call of the service that
+ * counts the entries from the head. The service prints its longest steps; this
+ * only builds the worst states and counts the entries it walked. */
+static int vz_count_entries(const char *path, long *late) {
+    DIR *dir = opendir(path);
+    if (dir == NULL) return 0;
+    long count = 0, before_last = -1, previous = -1;
+    struct dirent *entry;
+    while (1) {
+        long here = telldir(dir);
+        entry = readdir(dir);
+        if (entry == NULL) break;
+        count++;
+        before_last = previous;
+        previous = here;
+    }
+    *late = before_last;
+    VZ_CHECK(closedir(dir) == 0);
+    return (int)count;
+}
+
+/* A seek to the position before the last entry after a listing to the end
+ * (the hint is the last entry, so it does not match), then one readdir: the
+ * service walks the list from the head to that position. The call by index of
+ * the service walks the same list to the entry before the last. */
+static int vz_stale_seek(const char *path, const char *what) {
+    DIR *dir = opendir(path);
+    VZ_CHECK(dir != NULL);
+    static long positions[1100];
+    int count = 0;
+    while (count < 1100) {
+        positions[count] = telldir(dir);
+        if (readdir(dir) == NULL) break;
+        count++;
+    }
+    VZ_CHECK(count > 2 && count < 1100);
+    for (int round = 0; round < 3; round++) {
+        seekdir(dir, positions[count - 1]);
+        VZ_CHECK(readdir(dir) != NULL);
+        /* To the end again, so that the hint is the last entry. */
+        while (readdir(dir) != NULL) {}
+    }
+    VZ_CHECK(closedir(dir) == 0);
+    /* The call by index serves the first 258 entries (the two dots and 256 names) and
+     * refuses the rest: the longest it walks, and the first it refuses. */
+    int served = count - 1 < 258 ? count - 1 : 258;
+    VZ_CHECK(files_volley_read_dir_index(path, (unsigned)served) > 0);
+    if (count > 259) VZ_CHECK(files_volley_read_dir_index(path, 259) < 0);
+    printf("posix-procs: names listing: %s, %d entries, a seek to the last but one and a call by index\n",
+           what, count);
+    return 0;
+}
+
+/* The directory of the image with the most names, with the names the table
+ * can still take added to it, then the common directory of the probe filled
+ * the same way: the lists of the longest walks. */
+static int vz_listing(void) {
+    const char *candidates[] = {"/", "/bin", "/etc", "/usr", "/usr/bin", "/lib", "/sbin", "/dev"};
+    const char *biggest = NULL;
+    int most = 0;
+    for (unsigned i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
+        long late;
+        int count = vz_count_entries(candidates[i], &late);
+        printf("posix-procs: names listing: %s has %d entries\n", candidates[i], count);
+        if (count > most) {
+            most = count;
+            biggest = candidates[i];
+        }
+    }
+    VZ_CHECK(biggest != NULL);
+    const char *places[2] = {biggest, VZ};
+    for (int place = 0; place < 2; place++) {
+        int made = 0;
+        for (;; made++) {
+            char name[80];
+            snprintf(name, sizeof name, "%s/z%d", places[place], made);
+            if (link(VZ "/p0", name) != 0) break;
+        }
+        if (made <= 100) printf("posix-procs: names listing: %s took %d names, errno %d\n", places[place], made, errno);
+        VZ_CHECK(made > 100);
+        VZ_CHECK(vz_stale_seek(places[place], place == 0 ? "the biggest directory of the image" : "the common directory") == 0);
+        for (int i = 0; i < made; i++) {
+            char name[80];
+            snprintf(name, sizeof name, "%s/z%d", places[place], i);
+            VZ_CHECK(unlink(name) == 0);
+        }
+    }
+    return 0;
+}
+
 /* The long rmdir against the flood of utimensat. */
 static volatile int vz_flood_stop;
 static volatile int vz_rmdir_result = -2;
 static volatile int vz_rmdir_done;
 static unsigned long long vz_rmdir_ticks;
+static unsigned vz_rmdir_requests;
 
 static void *vz_flood(void *unused) {
     struct timespec times[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
@@ -175,9 +282,11 @@ static void *vz_flood(void *unused) {
 }
 
 static void *vz_long_rmdir(void *unused) {
+    files_volley_thread_start();
     unsigned long long begin = files_volley_ticks();
     vz_rmdir_result = rmdir(VZ "/e");
     vz_rmdir_ticks = files_volley_ticks() - begin;
+    vz_rmdir_requests = files_volley_thread_requests();
     vz_rmdir_done = 1;
     return unused;
 }
@@ -197,6 +306,8 @@ static int vz_starvation(void) {
     /* A full table: removing an empty directory looks at every name. */
     vz_mark();
     VZ_CHECK(rmdir(VZ "/e") == 0);
+    unsigned long long quiet_ticks = files_volley_ticks() - vz_ticks0;
+    unsigned quiet_requests = files_volley_requests() - vz_requests0;
     vz_line("rmdir with a full table");
     VZ_CHECK(mkdir(VZ "/e", 0755) == 0);
     files_volley_start();
@@ -219,13 +330,195 @@ static int vz_starvation(void) {
     VZ_CHECK(vz_flood_stop == 1);
     VZ_CHECK(vz_rmdir_result == 0);
     printf("posix-procs: names starvation: rmdir in a table of %d names against a loop of utimensat: "
-           "%u restarts, finished within 10 s: %s, took %llu ticks\n",
-           made + VZ_PAD, files_volley_restarts(VZ_OP_UNLINK), within ? "yes" : "no", vz_rmdir_ticks);
+           "%u restarts, finished within 10 s: %s, took %llu ticks, alone %llu ticks, requests %u, alone requests %u\n",
+           made + VZ_PAD, files_volley_restarts(VZ_OP_UNLINK), within ? "yes" : "no", vz_rmdir_ticks,
+           quiet_ticks, vz_rmdir_requests, quiet_requests);
     for (int i = 0; i < made; i++) {
         char name[40];
         snprintf(name, sizeof name, VZ "/q%d", i);
         VZ_CHECK(unlink(name) == 0);
     }
+    return 0;
+}
+
+/* One long operation against a client that changes the tree in a loop (the
+ * lines G2 to G5 of the plan; the long rmdir of the line G1 is below). The
+ * operation runs alone first, then against the flood; the line says the
+ * restarts the service gave it (the most of its kind), whether it ended
+ * within ten seconds, its result and the ticks of both runs. */
+static volatile int vz_scene_flood_mode;
+static volatile int vz_scene_long_mode;
+static volatile int vz_scene_result = -2;
+static volatile int vz_scene_done;
+static unsigned long long vz_scene_ticks;
+static char vz_scene_moved[700];
+static char vz_scene_deep[600];
+static char vz_collision_path[80];
+
+static void *vz_scene_flood(void *unused) {
+    struct timespec times[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
+    int flip = 0;
+    while (!vz_flood_stop) {
+        int bad = 0;
+        switch (vz_scene_flood_mode) {
+        case 1: /* a name made and removed in another directory */ {
+            int fd = open(VZ "/fd/x", O_WRONLY | O_CREAT, 0600);
+            if (fd < 0) bad = 1;
+            else {
+                close(fd);
+                if (unlink(VZ "/fd/x") != 0) bad = 1;
+            }
+            break;
+        }
+        case 5: /* a name in another directory, in the source's bucket */ {
+            int fd = open(vz_collision_path, O_WRONLY | O_CREAT, 0600);
+            if (fd < 0) bad = 1;
+            else { close(fd); bad = unlink(vz_collision_path) != 0; }
+            break;
+        }
+        case 2: /* the mode of a file in a loop */
+            flip ^= 1;
+            bad = chmod(VZ "/p0", flip ? 0600 : 0644) != 0;
+            break;
+        case 3: /* the name the operation renames over, made and removed in the same directory */ {
+            int fd = open(VZ "/n", O_WRONLY | O_CREAT, 0600);
+            if (fd >= 0) close(fd);
+            unlink(VZ "/n");
+            break;
+        }
+        case 4: /* directories that move */
+            if (rename(VZ "/m1", VZ "/m2") != 0 && rename(VZ "/m2", VZ "/m1") != 0) bad = 1;
+            break;
+        default:
+            bad = utimensat(AT_FDCWD, VZ "/p0", times, 0) != 0;
+        }
+        if (bad) {
+            vz_flood_stop = 2;
+            break;
+        }
+    }
+    return unused;
+}
+
+static int vz_scene_operation(void) {
+    char buffer[700];
+    switch (vz_scene_long_mode) {
+    case 1: return access(VZ "/s31", F_OK);
+    case 2: return rename(VZ "/a", vz_scene_moved);
+    case 3: return rename(VZ "/m", VZ "/n");
+    case 4: return realpath(vz_scene_deep, buffer) == NULL ? -1 : 0;
+    }
+    return -3;
+}
+
+static void *vz_scene_long(void *unused) {
+    unsigned long long begin = files_volley_ticks();
+    vz_scene_result = vz_scene_operation() == 0 ? 0 : errno;
+    vz_scene_ticks = files_volley_ticks() - begin;
+    vz_scene_done = 1;
+    return unused;
+}
+
+/* The operation `long_mode` against the flood `flood_mode`; `op` is the
+ * number of its kind of ChangeOp, `tag` the line of the plan. */
+static int vz_scene(const char *tag, const char *what, int flood_mode, int long_mode, int op) {
+    /* Alone. */
+    vz_scene_long_mode = long_mode;
+    unsigned long long alone_begin = files_volley_ticks();
+    int alone = vz_scene_operation();
+    unsigned long long alone_ticks = files_volley_ticks() - alone_begin;
+    VZ_CHECK(alone == 0);
+    /* Back to the start when the operation moved something. */
+    if (long_mode == 2) VZ_CHECK(rename(vz_scene_moved, VZ "/a") == 0);
+    if (long_mode == 3) {
+        VZ_CHECK(rename(VZ "/n", VZ "/m") == 0);
+    }
+    files_volley_start();
+    vz_flood_stop = 0;
+    vz_scene_flood_mode = flood_mode;
+    vz_scene_done = 0;
+    vz_scene_result = -2;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 65536);
+    pthread_t flood, runner;
+    unsigned long long begin = vz_now_ns();
+    VZ_CHECK(pthread_create(&flood, &attr, vz_scene_flood, NULL) == 0);
+    /* The flood is in its loop before the operation starts. */
+    pause_ms(20);
+    VZ_CHECK(pthread_create(&runner, &attr, vz_scene_long, NULL) == 0);
+    while (!vz_scene_done && vz_now_ns() - begin < 10000000000ull) {
+        struct timespec delay = {0, 20000000};
+        nanosleep(&delay, NULL);
+    }
+    int within = vz_scene_done;
+    vz_flood_stop = vz_flood_stop ? vz_flood_stop : 1;
+    VZ_CHECK(pthread_join(flood, NULL) == 0);
+    VZ_CHECK(pthread_join(runner, NULL) == 0);
+    VZ_CHECK(vz_flood_stop == 1);
+    printf("posix-procs: names interference %s: %s: %u restarts, finished within 10 s: %s, "
+           "result %d, took %llu ticks, alone %llu ticks\n",
+           tag, what, files_volley_restarts(op), within ? "yes" : "no", vz_scene_result,
+           vz_scene_ticks, alone_ticks);
+    files_volley_stop();
+    /* Back where it was, when the operation moved something. */
+    if (long_mode == 2 && access(vz_scene_moved, F_OK) == 0) VZ_CHECK(rename(vz_scene_moved, VZ "/a") == 0);
+    return 0;
+}
+
+/* G2 to G5. */
+static int vz_scenes(void) {
+    /* G2: a path of 32 links against a name made and removed in another directory. */
+    VZ_CHECK(mkdir(VZ "/fd", 0755) == 0);
+    VZ_CHECK(symlink("p0", VZ "/s0") == 0);
+    for (int i = 1; i <= 31; i++) {
+        char target[16], name[40];
+        snprintf(target, sizeof target, "s%d", i - 1);
+        snprintf(name, sizeof name, VZ "/s%d", i);
+        VZ_CHECK(symlink(target, name) == 0);
+    }
+    VZ_CHECK(vz_scene("G2", "a path of 32 links against a name made and removed in another directory", 1, 1,
+                      VZ_OP_ACCESS) == 0);
+    for (int i = 31; i >= 0; i--) {
+        char name[40];
+        snprintf(name, sizeof name, VZ "/s%d", i);
+        VZ_CHECK(unlink(name) == 0);
+    }
+    VZ_CHECK(rmdir(VZ "/fd") == 0);
+    /* G3: the rename of a directory under a chain 64 deep against the mode of a file. */
+    VZ_CHECK(vz_deep_build() == 0);
+    vz_deep(vz_scene_deep, VZ_DEPTH);
+    snprintf(vz_scene_moved, sizeof vz_scene_moved, "%s/a", vz_scene_deep);
+    VZ_CHECK(mkdir(VZ "/a", 0755) == 0);
+    VZ_CHECK(mkdir(VZ "/fd", 0755) == 0);
+    struct stat parent, other;
+    VZ_CHECK(stat(VZ, &parent) == 0 && stat(VZ "/fd", &other) == 0);
+    unsigned wanted = vz_name_bucket((unsigned)parent.st_ino - 1u, "a");
+    for (unsigned i = 0;; i++) {
+        char leaf[40];
+        snprintf(leaf, sizeof leaf, "collision%u", i);
+        if (vz_name_bucket((unsigned)other.st_ino - 1u, leaf) == wanted) {
+            snprintf(vz_collision_path, sizeof vz_collision_path, VZ "/fd/%s", leaf);
+            break;
+        }
+    }
+    VZ_CHECK(vz_scene("G2b", "a rename against a colliding name in another directory", 5, 2, VZ_OP_RENAME) == 0);
+    VZ_CHECK(rmdir(VZ "/fd") == 0);
+    VZ_CHECK(vz_scene("G3", "the rename of a directory under a chain 64 deep against chmod of a file", 2, 2,
+                      VZ_OP_RENAME) == 0);
+    VZ_CHECK(rmdir(VZ "/a") == 0);
+    /* G4: a rename against a client that makes and removes the name it renames over, in the same directory. */
+    VZ_CHECK(vz_create(VZ "/m") == 0);
+    VZ_CHECK(vz_scene("G4", "a rename over a name that is made and removed in the same directory", 3, 3,
+                      VZ_OP_RENAME) == 0);
+    unlink(VZ "/m");
+    unlink(VZ "/n");
+    /* G5: the path of a directory 64 deep against directories that move. */
+    VZ_CHECK(mkdir(VZ "/m1", 0755) == 0);
+    VZ_CHECK(vz_scene("G5", "the canonical path of a directory 64 deep against directories that move", 4, 4,
+                      VZ_OP_PATH) == 0);
+    VZ_CHECK(rmdir(VZ "/m1") == 0 || rmdir(VZ "/m2") == 0);
+    VZ_CHECK(vz_deep_remove() == 0);
     return 0;
 }
 
@@ -440,7 +733,9 @@ static int names_volley(void) {
     files_volley_start();
     failed = vz_thread_cost();
     if (!failed) failed = vz_quiet();
+    if (!failed) failed = vz_listing();
     if (!failed) failed = vz_starvation();
+    if (!failed) failed = vz_scenes();
     if (!failed) failed = vz_volley(0);
     if (!failed) failed = vz_volley(1);
     files_volley_stop();
@@ -452,5 +747,63 @@ static int names_volley(void) {
     }
     VZ_CHECK(rmdir(VZ) == 0);
     printf("posix-procs: names volley ok\n");
+    return 0;
+}
+
+/* A second root waits for the gate before publishing its 250 names. */
+int files_bounds_fill(int stage) {
+    if (stage == -2) {
+        while (access("/tmp/bp-go", F_OK)) pause_ms(1);
+    }
+    struct stat st;
+    if (stat("/tmp/bp", &st)) return 1;
+    unsigned slot = (unsigned)st.st_ino - 1u;
+    unsigned wanted = vz_name_bucket(slot, "pending");
+    if (stage == -1) {
+        int fd = open("/tmp/bp/target", O_WRONLY | O_CREAT, 0600);
+        if (fd < 0 || close(fd) || chmod("/tmp/bp", 0777)) return 2;
+        return 0;
+    }
+    if (stage == 0) {
+        int fd = open("/tmp/bp-go", O_WRONLY | O_CREAT, 0600);
+        if (fd < 0 || close(fd)) return 8;
+    }
+    int begin = stage == 0 ? 250 : 0;
+    int end = stage == -2 ? 250 : 500;
+    int made = 0;
+    for (unsigned i = 0; made < end; i++) {
+        char leaf[40], path[64];
+        snprintf(leaf, sizeof leaf, "late%u", i);
+        if (vz_name_bucket(slot, leaf) == wanted) continue;
+        if (made++ < begin) continue;
+        snprintf(path, sizeof path, "/tmp/bp/%s", leaf);
+        if (stage == 1 ? unlink(path) : link("/tmp/bp/target", path)) {
+            printf("posix-procs: bounds: name %d stage %d errno %d\n", made, stage, errno);
+            return 4;
+        }
+    }
+    if (stage == 0) {
+        while (access("/tmp/bp-done", F_OK)) pause_ms(1);
+        if (unlink("/tmp/bp-done")) return 5;
+    } else if (stage == 1 && (unlink("/tmp/bp/target") || unlink("/tmp/bp-go"))) return 6;
+    else if (stage == -2) {
+        int fd = open("/tmp/bp-done", O_WRONLY | O_CREAT, 0600);
+        if (fd < 0 || close(fd)) return 9;
+    }
+    return 0;
+}
+
+/* Ordinary writes pay for a page on each of the nodes queued for reclamation. */
+int files_bounds_garbage(int count) {
+    char byte = 0x5a;
+    for (int i = 0; i < count; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/bg/gc/q%d", i);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0 || write(fd, &byte, 1) != 1 || close(fd) || unlink(path)) {
+            printf("posix-procs: bounds: garbage %d errno %d\n", i, errno);
+            return i + 1;
+        }
+    }
     return 0;
 }

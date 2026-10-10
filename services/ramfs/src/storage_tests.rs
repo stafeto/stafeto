@@ -705,15 +705,76 @@ fn truncation_masks_boot_bytes_and_exhaustion_preserves_live_payload() {
     assert_eq!(ram.storage.usage(FIRST), before);
     assert!(!ram.storage.reclaim_step());
     ram.storage.node_mut(token).unwrap().data_generation = 1;
-    ram.storage.state.epoch = u64::MAX;
-    assert_eq!(
-        ram.storage
-            .truncate_zero(token, proto_fs::Timestamp::legacy_ns(100)),
-        Err(NO_SPACE)
-    );
     assert_eq!(ram.storage.read(token, 0, &mut bytes), Ok(4));
     assert_eq!(&bytes[..4], b"kept");
     assert_eq!(ram.storage.node(token).unwrap().data_generation, 1);
     assert_eq!(ram.storage.usage(FIRST), before);
     assert!(!ram.storage.reclaim_step());
+}
+
+#[test]
+fn a_reservation_of_a_name_cannot_commit_after_another_one_of_the_same_name_did() {
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let first = ram
+        .storage
+        .reserve(FIRST, ROOT, b"same", (crate::REG, 0o644, 0, 0))
+        .unwrap();
+    let second = ram
+        .storage
+        .reserve(FIRST, ROOT, b"same", (crate::REG, 0o600, 0, 0))
+        .unwrap();
+    let before = ram.storage.name_gen(ROOT).unwrap();
+    ram.storage.commit(first).unwrap();
+    assert!(ram.storage.name_gen(ROOT).unwrap() > before);
+    // The proof that the name was not there went with the first name.
+    assert_eq!(
+        ram.storage.reserved_token(second, FIRST),
+        Err(proto_fs::STALE_PROOF)
+    );
+    assert_eq!(ram.storage.commit(second), Err(proto_fs::INVALID_ARGUMENT));
+    ram.storage.cancel(second).unwrap();
+    ram.storage.check_name_index();
+}
+
+#[test]
+fn what_changes_names_raises_the_generation_of_their_directory_and_what_changes_a_file_does_not() {
+    let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let dir = create(&mut ram, FIRST, b"dir");
+    let r = ram
+        .storage
+        .reserve(FIRST, ROOT, b"d2", (crate::DIR, 0o755, 0, 0))
+        .unwrap();
+    let d2 = ram.storage.commit(r).unwrap();
+    let generation_of = |ram: &Ram<'_>, t| ram.storage.name_gen(t).unwrap();
+    let (root_gen, d2_gen) = (generation_of(&ram, ROOT), generation_of(&ram, d2));
+    // A reservation publishes nothing.
+    let r = ram
+        .storage
+        .reserve(FIRST, d2, b"x", (crate::REG, 0o644, 0, 0))
+        .unwrap();
+    assert_eq!(generation_of(&ram, d2), d2_gen);
+    let bucket = name_bucket(d2, b"x");
+    let stamp = ram.storage.stamp(bucket);
+    let x = ram.storage.commit(r).unwrap();
+    assert!(generation_of(&ram, d2) > d2_gen, "a name made");
+    assert_eq!(ram.storage.stamp(bucket), stamp + 1, "the bucket counts it");
+    let g = generation_of(&ram, d2);
+    // The bytes, mode, owner and times of a file are no part of any directory.
+    ram.storage.write(x, FIRST, 0, b"bytes").unwrap();
+    ram.storage.set_attributes(x, 0o600, 5, 5).unwrap();
+    ram.storage
+        .truncate_zero(x, proto_fs::Timestamp::legacy_ns(5))
+        .unwrap();
+    assert_eq!(
+        (generation_of(&ram, d2), generation_of(&ram, ROOT)),
+        (g, root_gen)
+    );
+    // The mode of a directory is not a name, and has a generation of its own.
+    let access = ram.storage.node(d2).unwrap().access_gen;
+    ram.storage.set_attributes(d2, 0o700, 0, 0).unwrap();
+    assert_eq!(generation_of(&ram, d2), g);
+    assert_eq!(ram.storage.node(d2).unwrap().access_gen, access + 1);
+    ram.storage.unlink(d2, b"x", FIRST).unwrap();
+    assert!(generation_of(&ram, d2) > g, "a name gone");
+    let _ = dir;
 }

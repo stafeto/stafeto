@@ -314,6 +314,8 @@ mod tests {
                     file: File::Node(inode),
                     flags: READ_WRITE,
                     offset: 0,
+                    hint: crate::storage::NONE,
+                    scan: crate::storage::NONE,
                 },
             )
             .unwrap();
@@ -423,6 +425,8 @@ mod tests {
                 Open {
                     file: File::Node(inode),
                     offset: 0,
+                    hint: crate::storage::NONE,
+                    scan: crate::storage::NONE,
                     flags: READ_WRITE | proto_fs::APPEND,
                 },
             )

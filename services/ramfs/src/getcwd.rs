@@ -58,7 +58,6 @@ pub struct GetcwdJournal {
     parent: Token,
     base_pinned: bool,
     current_pinned: bool,
-    scan: u16,
     depth: u16,
     phase: Phase,
     building: bool,
@@ -110,7 +109,6 @@ impl Ram<'_> {
             parent: ROOT,
             base_pinned: true,
             current_pinned: false,
-            scan: 0,
             depth: 0,
             phase: Phase::Scan,
             building: false,
@@ -166,7 +164,6 @@ impl Ram<'_> {
             parent: ROOT,
             base_pinned: true,
             current_pinned: false,
-            scan: 0,
             depth: 0,
             phase: Phase::Scan,
             building: false,
@@ -205,7 +202,7 @@ impl GetcwdJournal {
         self.phase = Phase::Ready;
         true
     }
-    /// Scan eight naming rows, copy one component, or initialize one result page.
+    /// Name one level, copy one component, or initialize one result page.
     /// Every error keeps existing pins and pages attached until cancellation.
     pub fn step(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<bool, u32> {
         if self.outcome.is_some() {
@@ -229,7 +226,6 @@ impl GetcwdJournal {
                 self.epoch = storage.state.epoch;
                 self.current = self.base;
                 self.parent = ROOT;
-                self.scan = 0;
                 self.depth = 0;
                 self.length = self.initial;
                 self.expected = 0;
@@ -265,15 +261,7 @@ impl GetcwdJournal {
                 Ok(false)
             }
             Phase::Move => {
-                storage.pin(self.parent, Pin::Pending)?;
-                if self.current_pinned {
-                    storage.unpin(self.current, Pin::Pending)?;
-                }
-                self.current = self.parent;
-                self.current_pinned = true;
-                self.scan = 0;
-                self.depth += 1;
-                self.phase = Phase::Scan;
+                self.move_up(storage)?;
                 Ok(false)
             }
             Phase::Scan => {
@@ -292,43 +280,48 @@ impl GetcwdJournal {
                 if !identity.permits(parent_node, self.parent_bits) {
                     return Ok(self.fail(ACCESS_DENIED));
                 }
-                let end = (self.scan as usize + 8).min(storage.entries());
-                while (self.scan as usize) < end {
-                    let row = self.scan as usize;
-                    self.scan += 1;
-                    if let Some((name, target)) = storage.entry(parent, row)
-                        && target == self.current
-                    {
-                        self.name[0] = b'/';
-                        self.name[1..name.len() + 1].copy_from_slice(name);
-                        self.name_len = (name.len() + 1) as u16;
-                        self.parent = parent;
-                        if self.building {
-                            self.remaining = self.name_len;
-                            self.phase = Phase::Copy;
-                        } else {
-                            self.length += u32::from(self.name_len);
-                            if self.inline_only && self.length as usize > INLINE {
-                                return Ok(self.fail(proto_fs::NAME_TOO_LONG));
-                            }
-                            if self.length as usize <= INLINE {
-                                let first = INLINE - self.length as usize;
-                                self.inline[first..first + self.name_len as usize]
-                                    .copy_from_slice(&self.name[..self.name_len as usize]);
-                            }
-                            self.phase = Phase::Move;
-                        }
-                        return Ok(false);
-                    }
+                // A directory has one name, and its node knows the entry.
+                let Some((name, target)) = storage.entry(parent, node.name_entry as usize) else {
+                    return Ok(self.fail(NO_ENTRY));
+                };
+                if target != self.current {
+                    return Ok(self.fail(NO_ENTRY));
                 }
-                if self.scan as usize == storage.entries() {
-                    Ok(self.fail(NO_ENTRY))
+                self.name[0] = b'/';
+                self.name[1..name.len() + 1].copy_from_slice(name);
+                self.name_len = (name.len() + 1) as u16;
+                self.parent = parent;
+                if self.building {
+                    self.remaining = self.name_len;
+                    self.phase = Phase::Copy;
                 } else {
-                    Ok(false)
+                    self.length += u32::from(self.name_len);
+                    if self.inline_only && self.length as usize > INLINE {
+                        return Ok(self.fail(proto_fs::NAME_TOO_LONG));
+                    }
+                    if self.length as usize <= INLINE {
+                        let first = INLINE - self.length as usize;
+                        self.inline[first..first + self.name_len as usize]
+                            .copy_from_slice(&self.name[..self.name_len as usize]);
+                    }
+                    self.move_up(storage)?;
                 }
+                Ok(false)
             }
             _ => Err(STALE_PROOF),
         }
+    }
+    /// The walk goes to the parent of the directory just named.
+    fn move_up(&mut self, storage: &mut Storage<'_>) -> Result<(), u32> {
+        storage.pin(self.parent, Pin::Pending)?;
+        if self.current_pinned {
+            storage.unpin(self.current, Pin::Pending)?;
+        }
+        self.current = self.parent;
+        self.current_pinned = true;
+        self.depth += 1;
+        self.phase = Phase::Scan;
+        Ok(())
     }
     fn finish_walk(&mut self, storage: &mut Storage<'_>) -> Result<bool, u32> {
         if self.building {
@@ -372,7 +365,6 @@ impl GetcwdJournal {
             self.current_pinned = false;
         }
         self.current = self.base;
-        self.scan = 0;
         self.depth = 0;
         self.building = true;
         self.phase = Phase::BeginPage;

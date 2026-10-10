@@ -11,8 +11,7 @@ use crate::{
     storage::{Pin, Root, Storage, Token},
 };
 use proto_fs::{
-    ACCESS_DENIED, INVALID_ARGUMENT, NO_SPACE, NOT_SUPPORTED, PERMISSION, RESOLVING, STALE_PROOF,
-    Timestamp,
+    ACCESS_DENIED, INVALID_ARGUMENT, NOT_SUPPORTED, PERMISSION, RESOLVING, STALE_PROOF, Timestamp,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,17 +229,19 @@ impl MetadataJournal {
                 }
             }
             times[2] = now;
-            // All fallible authority/time/epoch checks precede this publication.
-            let epoch = ram.storage.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
-            let node = ram
-                .storage
+            // All fallible authority and time checks precede this publication.
+            // A change of the mode or owner of a directory raises its
+            // generation (the walks in it check search permission again);
+            // the times and the attributes of a file change nothing that
+            // another operation has proved.
+            let access_changed = node.mode != mode || node.uid != uid || node.gid != gid;
+            if access_changed {
+                ram.storage.set_attributes(self.target, mode, uid, gid)?;
+            }
+            ram.storage
                 .node_mut(self.target)
-                .expect("retained metadata target");
-            node.mode = mode;
-            node.uid = uid;
-            node.gid = gid;
-            node.times = times;
-            ram.storage.state.epoch = epoch;
+                .expect("retained metadata target")
+                .times = times;
             MetadataOutcome::Applied
         };
         self.outcome = Some(outcome);

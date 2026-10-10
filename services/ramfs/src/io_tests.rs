@@ -29,6 +29,8 @@ fn create(ram: &mut Ram<'_>, root: Root, name: &[u8]) -> (Fds, u32, Token) {
             Open {
                 file: File::Node(token),
                 offset: 0,
+                hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags: READ_WRITE,
             },
         )
@@ -228,7 +230,7 @@ fn stale_scan_and_counter_exhaustion_preserve_original_bytes() {
         Err(proto_fs::INVALID_ARGUMENT)
     );
     while !prep.cancel(&mut ram).unwrap() {}
-    ram.storage.state.epoch = u64::MAX;
+    ram.storage.node_mut(token).unwrap().data_generation = u64::MAX;
     assert!(matches!(
         ram.prepare_write(&fds, fd, b"bad", None),
         Err(NO_SPACE)
@@ -270,6 +272,8 @@ fn empty_write_validates_descriptor_access_and_signed_position() {
             Open {
                 file: File::Node(token),
                 offset: 0,
+                hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags: READ_ONLY,
             },
         )
@@ -448,6 +452,8 @@ fn retained_description_writes_original_inode_after_numeric_fd_reuse() {
             Open {
                 file: File::Node(replacement),
                 offset: 0,
+                hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags: READ_WRITE,
             },
         )
@@ -663,6 +669,8 @@ fn lease_admission_checks_full_token_and_survives_bare_fd_reuse_before_feed() {
             Open {
                 file: File::Node(replacement),
                 offset: 0,
+                hint: crate::storage::NONE,
+                scan: crate::storage::NONE,
                 flags: READ_WRITE
             }
         )

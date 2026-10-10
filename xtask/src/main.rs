@@ -766,6 +766,9 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The crowd of the steps probe under -icount, on the host's clock.
 const STEPS_TIMEOUT: Duration = Duration::from_secs(600);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The probe of the departed process in the steps run, on the host's clock
+/// (a few seconds when it passes).
+const GONE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// Tests only the `icount` build has, where virtual time counts
@@ -3620,11 +3623,16 @@ fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String>
     Ok(())
 }
 
-/// Whether the long rmdir of the starvation line ends within ten seconds
-/// against the flood of utimensat: "no" until 5i-5b (a change of the file
-/// has no effect on the directory it lies in), then "yes". A change either
-/// way is a change of the expectation, made here.
-const STARVATION_ENDS_WITHIN_10_S: &str = "no";
+/// Whether the long rmdir of the starvation line (G1 of 5i-5b) ends within
+/// ten seconds against the flood of utimensat: "no" until 5i-5b step 2 (a
+/// change of the file raised the epoch every operation proved its path in),
+/// "yes" since the epoch of a directory (a change of a file raises nothing).
+/// A change either way is a change of the expectation, made here.
+const STARVATION_ENDS_WITHIN_10_S: &str = "yes";
+
+/// The most repeats of JOBS_FULL one thread of a volley makes (G6): the wait
+/// for room doubles from one millisecond to sixteen.
+const VOLLEY_REPEATS_MAX: u64 = 64;
 
 /// The longest step of the process service under -icount with the crowd
 /// of children of tests/posix-procs in its steps mode: kill(-1), spawn,
@@ -3636,7 +3644,8 @@ const STARVATION_ENDS_WITHIN_10_S: &str = "no";
 /// The lines of the operations on names that the steps probe prints before the
 /// crowd (names-volley.c): the times of the operations alone, the long rmdir
 /// against the loop of utimensat (its restarts and whether it ended within ten
-/// seconds, which is "no" until 5i-5b), and the volley of 112 renames, which
+/// seconds), the long operations against the other floods (G2 to G5), and the
+/// volley of 112 renames, which
 /// all end and in which a Start is refused with JOBS_FULL and repeated. The
 /// lines go to the output for the report.
 fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
@@ -3664,15 +3673,59 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     ] {
         find(row)?;
     }
+    // G1: the long rmdir against the loop of utimensat of a file of its own:
+    // It ends with the same request count and at most 2.5 times the time alone.
     let starvation = find("names starvation:")?;
     let verdict = format!("finished within 10 s: {STARVATION_ENDS_WITHIN_10_S}");
     if !starvation.contains(&verdict) {
         return Err(format!(
             "the starvation line does not say {verdict:?}: update the expectation \
-             STARVATION_ENDS_WITHIN_10_S if the change is meant (5i-5b turns it to \
-             \"yes\" and wants restarts 0 and a time of at most twice the time without \
-             interference): {starvation}"
+             STARVATION_ENDS_WITHIN_10_S if the change is meant: {starvation}"
         ));
+    }
+    let starvation_line = [starvation.to_owned()];
+    let number = |lines: &[String], prefix: &str| {
+        qemu::number_after(lines, prefix)
+            .ok_or_else(|| format!("the line has no number after {prefix:?}: {lines:?}"))
+    };
+    if number(&starvation_line, "against a loop of utimensat: ")? != 0 {
+        return Err(format!("G1: the long rmdir restarted: {starvation}"));
+    }
+    let (took, alone) = (
+        number(&starvation_line, "took ")?,
+        number(&starvation_line, "alone ")?,
+    );
+    let requests = number(&starvation_line, ", requests ")?;
+    let alone_requests = number(&starvation_line, "alone requests ")?;
+    if requests != alone_requests || requests == 0 {
+        return Err(format!(
+            "G1: request count changed from {alone_requests} to {requests}: {starvation}"
+        ));
+    }
+    if took.saturating_mul(2) > alone.saturating_mul(5) {
+        return Err(format!(
+            "G1: the long rmdir took {took} ticks against the flood, more than 2.5 times the \
+             {alone} ticks it takes alone: {starvation}"
+        ));
+    }
+    // G2 and G3: a long path of links against the creation and removal of a
+    // name elsewhere, the rename of a directory under a chain of 64 against
+    // the mode of a file: both end, with no restart. G4 and G5 (the same
+    // directory, the moves of directories) are printed for the report.
+    for (tag, what) in [
+        ("G2", "a path of 32 links"),
+        ("G3", "the rename of a directory"),
+        ("G2b", "a rename against a colliding name"),
+    ] {
+        let line = find(&format!("names interference {tag}:"))?;
+        if !line.contains("0 restarts, finished within 10 s: yes") || !line.contains(what) {
+            return Err(format!(
+                "{tag}: the operation must end within 10 s with no restart: {line}"
+            ));
+        }
+    }
+    for tag in ["G4", "G5"] {
+        find(&format!("names interference {tag}:"))?;
     }
     // The volley of 112 renames in one directory, and the same with a
     // directory for each process: both end in all renames, both give the
@@ -3698,6 +3751,15 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
             qemu::number_after(&lines, number)
                 .ok_or_else(|| format!("the volley ({what}) line has no {number:?}: {volley}"))?;
         }
+        // G6: the wait for room keeps the repeats of a thread down.
+        let repeats =
+            qemu::number_after(&lines, "the most repeats of JOBS_FULL of one thread ").unwrap_or(0);
+        if repeats > VOLLEY_REPEATS_MAX {
+            return Err(format!(
+                "G6: a thread of the volley ({what}) repeated its Start {repeats} times, past \
+                 {VOLLEY_REPEATS_MAX}: {volley}"
+            ));
+        }
     }
     let repeats = qemu::number_after(
         &[find("names volley:")?.to_owned()],
@@ -3714,6 +3776,34 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     // A process that goes in the middle of a prepaid rename, by _exit and by
     // execve: the names stay, and the places of the root come back.
     find("names gone ok")?;
+    // The worst states of the steps of the service built on purpose: a Start
+    // into a table of 127 jobs with two paths of 511 bytes and a descriptor
+    // for a base, and the restart after a stale proof at the commit of a
+    // rename of a directory over an empty one.
+    find("names bounds commit after 500 rival names: 0 restarts")?;
+    for count in [1, 32] {
+        let row = find(&format!("names bounds reclaim: {count} nodes with pages"))?;
+        if !row.contains(&format!("backlog {count} -> {}", count + 1))
+            || !row.ends_with("0 restarts")
+        {
+            return Err(format!(
+                "the reclamation commit has wrong queue counts: {row}"
+            ));
+        }
+        let pages = row
+            .split(", pages ")
+            .nth(1)
+            .ok_or_else(|| format!("no paid pages in {row}"))?;
+        let pages_line = [format!("pages {pages}")];
+        let before = number(&pages_line, "pages ")?;
+        let after = number(&pages_line, " -> ")?;
+        if before < count || after + u64::from(count >= 32) != before {
+            return Err(format!(
+                "the reclamation commit released the wrong number of pages: {row}"
+            ));
+        }
+    }
+    find("names bounds ok")?;
     Ok(shown.iter().map(|line| (*line).clone()).collect())
 }
 
@@ -3729,17 +3819,42 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::ICOUNT);
-    let outcome = run_until(
+    // The probe of the departed process takes a few seconds of the host's
+    // clock. A service that does not give back the job of a process that
+    // went keeps the probe waiting, and in a guest the service starves (it
+    // spins in its maintenance) the probe cannot say so: the run is cut here.
+    let outcome = qemu::run_until_staged(
         cmd,
         STEPS_TIMEOUT,
         Some("init: posix-procs ended"),
-        &kernel.elf,
+        Some(qemu::Stage {
+            after: "posix-procs: names volley ok",
+            until: "posix-procs: names gone ok",
+            within: GONE_PROBE_TIMEOUT,
+        }),
     )?;
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
     let dir = target_dir().join("measure");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let log = dir.join("process-steps.log");
     std::fs::write(&log, outcome.lines.join("\n") + "\n")
         .map_err(|e| format!("{}: {e}", log.display()))?;
+    if outcome
+        .lines
+        .iter()
+        .any(|l| l.contains("posix-procs: names volley ok"))
+        && !outcome
+            .lines
+            .iter()
+            .any(|l| l.contains("posix-procs: names gone ok"))
+    {
+        let tail: Vec<&String> = outcome.lines.iter().rev().take(6).collect();
+        return Err(format!(
+            "the probe of the departed process printed no \"names gone ok\" within {GONE_PROBE_TIMEOUT:?} \
+             of the volley: the service does not give back the job of a process that went, or the places \
+             stay taken; the last lines, the last first: {tail:?}"
+        ));
+    }
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
@@ -4017,15 +4132,16 @@ fn ash_probe() -> Result<(), String> {
 }
 
 /// What the script of the ash probe (tests/busybox/src/main.rs) prints after
-/// `shell-ready`: a file moved, read back and removed, a listing of `/tmp`
-/// without the nodes made while the system runs (5i-5b), a directory made and
-/// removed, a link read back, the mode `chmod` set.
-const ASH_NAMES_OUTPUT: [&str; 9] = [
+/// `shell-ready`: a file moved, read back and removed, a directory made, a
+/// listing of `/tmp` with the directory just made and the node of the image,
+/// the directory removed, a link read back, the mode `chmod` set.
+const ASH_NAMES_OUTPUT: [&str; 10] = [
     "a-gone",
     "x",
     "b-gone",
-    "probe",
     "d-made",
+    "d",
+    "probe",
     "d-gone",
     "b",
     "mode -rw-------",
@@ -6843,11 +6959,20 @@ mod tests {
             "posix-procs: names time rename of a directory under a chain 64 deep: 1559 requests, 15679606 ticks",
             "posix-procs: names time rmdir with a full table: 96 requests, 855238 ticks",
             "posix-procs: names thread cost: 28672 bytes (7 pages) for the first thread, 28672 bytes the last, 86016 bytes for 3, stack 20480 bytes",
-            "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 2569 restarts, finished within 10 s: no, took 626453622 ticks",
+            "posix-procs: names starvation: rmdir in a table of 382 names against a loop of utimensat: 0 restarts, finished within 10 s: yes, took 218444 ticks, alone 110180 ticks, requests 10, alone requests 10",
+            "posix-procs: names interference G2: a path of 32 links against a name made and removed in another directory: 0 restarts, finished within 10 s: yes, result 0, took 1356992 ticks, alone 629874 ticks",
+            "posix-procs: names interference G2b: a rename against a colliding name in another directory: 0 restarts, finished within 10 s: yes, result 0, took 2900000 ticks, alone 1300000 ticks",
+            "posix-procs: names interference G3: the rename of a directory under a chain 64 deep against chmod of a file: 0 restarts, finished within 10 s: yes, result 0, took 2895999 ticks, alone 1308386 ticks",
+            "posix-procs: names interference G4: a rename over a name that is made and removed in the same directory: 3042 restarts, finished within 10 s: no, result 0, took 624667089 ticks, alone 145549 ticks",
+            "posix-procs: names interference G5: the canonical path of a directory 64 deep against directories that move: 1602 restarts, finished within 10 s: no, result 0, took 625555306 ticks, alone 1172516 ticks",
             repeats,
-            "posix-procs: names volley in directories: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 120, the most restarts of one rename 31, the longest rename 98000000 ticks, 6879297680 ticks",
+            "posix-procs: names volley in directories: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 12, the most restarts of one rename 2, the longest rename 25107135 ticks, 177424279 ticks",
             "posix-procs: names volley ok",
             "posix-procs: names gone ok",
+            "posix-procs: names bounds commit after 500 rival names: 0 restarts",
+            "posix-procs: names bounds reclaim: 1 nodes with pages, backlog 1 -> 2, pages 2 -> 2, commit 12369 ticks, 0 restarts",
+            "posix-procs: names bounds reclaim: 32 nodes with pages, backlog 32 -> 33, pages 33 -> 32, commit 12488 ticks, 0 restarts",
+            "posix-procs: names bounds ok",
         ]
         .iter()
         .map(|line| (*line).to_owned())
@@ -6858,19 +6983,95 @@ mod tests {
     /// renames and some thread met JOBS_FULL.
     #[test]
     fn the_names_volley_lines_are_read_strictly() {
-        let good = "posix-procs: names volley: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 130, the most restarts of one rename 40, the longest rename 99000000 ticks, 6879297680 ticks";
+        let good = "posix-procs: names volley: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 13, the most restarts of one rename 4, the longest rename 99000000 ticks, 6879297680 ticks";
         assert!(super::names_lines(&names_log(good)).is_ok());
-        let none = good.replace("thread 130", "thread 0");
+        let none = good.replace("thread 13", "thread 0");
         assert!(super::names_lines(&names_log(&none)).is_err());
+        // G6: no thread repeats its Start more than 64 times.
+        let many = good.replace("thread 13", "thread 65");
+        assert!(super::names_lines(&names_log(&many)).is_err());
+        let limit = good.replace("thread 13", "thread 64");
+        assert!(super::names_lines(&names_log(&limit)).is_ok());
         // A change of the verdict of the starvation line is a change of the
-        // expectation: the line that says "yes" is refused until the
+        // expectation: the line that says "no" is refused until the
         // constant says so.
         let mut turned = names_log(good);
         for line in &mut turned {
-            *line = line.replace("finished within 10 s: no", "finished within 10 s: yes");
+            if line.contains("names starvation") {
+                *line = line.replace("finished within 10 s: yes", "finished within 10 s: no");
+            }
         }
         assert!(super::names_lines(&turned).is_err());
-        let no_restarts = good.replace("the most restarts of one rename 40, ", "");
+        // G1 rejects restarts, extra requests and more than 2.5 times the quiet time.
+        let mut restarted = names_log(good);
+        for line in &mut restarted {
+            if line.contains("names starvation") {
+                *line = line.replace("utimensat: 0 restarts", "utimensat: 1 restarts");
+            }
+        }
+        assert!(super::names_lines(&restarted).is_err());
+        let mut slow = names_log(good);
+        for line in &mut slow {
+            if line.contains("names starvation") {
+                *line = line.replace("took 218444 ticks", "took 275451 ticks");
+            }
+        }
+        assert!(super::names_lines(&slow).is_err());
+        for replacement in [
+            ", requests 11, alone requests 10",
+            ", requests 0, alone requests 0",
+        ] {
+            let changed: Vec<String> = names_log(good)
+                .iter()
+                .map(|line| line.replace(", requests 10, alone requests 10", replacement))
+                .collect();
+            assert!(super::names_lines(&changed).is_err());
+        }
+        for ticks in [220361, 275450] {
+            let boundary: Vec<String> = names_log(good)
+                .iter()
+                .map(|line| line.replace("took 218444 ticks", &format!("took {ticks} ticks")))
+                .collect();
+            assert!(super::names_lines(&boundary).is_ok());
+        }
+        // G2 and G3 end with no restart; G4 and G5 only have to be printed.
+        for tag in ["G2", "G2b", "G3"] {
+            let mut bad = names_log(good);
+            for line in &mut bad {
+                if line.contains(&format!("interference {tag}")) {
+                    *line = line.replace(": 0 restarts", ": 1 restarts");
+                }
+            }
+            assert!(super::names_lines(&bad).is_err(), "{tag}");
+        }
+        for tag in ["G4", "G5"] {
+            let mut without = names_log(good);
+            without.retain(|line| !line.contains(&format!("interference {tag}")));
+            assert!(super::names_lines(&without).is_err(), "{tag}");
+        }
+        for prefix in [
+            "bounds reclaim: 1 nodes",
+            "bounds reclaim: 32 nodes",
+            "bounds commit after 500",
+        ] {
+            let mut missing = names_log(good);
+            missing.retain(|line| !line.contains(prefix));
+            assert!(super::names_lines(&missing).is_err());
+        }
+        let extra_page: Vec<String> = names_log(good)
+            .iter()
+            .map(|line| line.replace("pages 2 -> 2", "pages 2 -> 1"))
+            .collect();
+        assert!(super::names_lines(&extra_page).is_err());
+        let lost_page: Vec<String> = names_log(good)
+            .iter()
+            .map(|line| line.replace("pages 33 -> 32", "pages 33 -> 33"))
+            .collect();
+        assert!(super::names_lines(&lost_page).is_err());
+        let mut without_bounds = names_log(good);
+        without_bounds.retain(|line| !line.contains("names bounds ok"));
+        assert!(super::names_lines(&without_bounds).is_err());
+        let no_restarts = good.replace("the most restarts of one rename 4, ", "");
         assert!(super::names_lines(&names_log(&no_restarts)).is_err());
         let no_longest = good.replace("the longest rename 99000000 ticks, ", "");
         assert!(super::names_lines(&names_log(&no_longest)).is_err());

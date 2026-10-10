@@ -157,9 +157,10 @@ extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> 
 /// The script of the ash probe: the builtins, then the applets on names run
 /// inside the shell (5i-5). Each step shows its result: a file read back, a
 /// test of existence, a listing, the target of a link and the mode a chmod
-/// set. `ls` of a directory shows the image's nodes and none made while the
-/// system runs (5i-5b), so it comes after the last `rm` of a file in `/tmp`
-/// and the mode is read from `ls -ld` of the path. The mode has a leading
+/// set. `ls` of a directory shows the nodes of the image and those made while
+/// the system runs, so `ls -1 /tmp` (one name a line) comes after `mkdir
+/// /tmp/d` and prints the new name; the mode is read from `ls -ld` of the
+/// path. The mode has a leading
 /// zero because relibc's `strtoul("600", &end, 8)` returns 0 and stops at the
 /// first digit, which BusyBox's `chmod` takes for an invalid mode.
 #[cfg(feature = "ash-probe")]
@@ -170,9 +171,9 @@ test -e /tmp/a || echo a-gone
 cat /tmp/b
 rm /tmp/b
 test -e /tmp/b || echo b-gone
-ls /tmp
 mkdir /tmp/d
 test -d /tmp/d && echo d-made
+ls -1 /tmp
 rmdir /tmp/d
 test -d /tmp/d || echo d-gone
 ln -s b /tmp/l

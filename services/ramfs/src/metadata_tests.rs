@@ -445,17 +445,6 @@ fn constructor_failures_clock_deferral_epoch_and_identity_refuse_before_effect()
     assert_eq!(ram.storage.node(token).unwrap().mode, 0o644);
     assert_eq!(ram.storage.node(token).unwrap().times, [Timestamp::ZERO; 3]);
     cleanup(&mut ram, journal, Some(resolver), charge);
-    ram.storage.state.epoch = u64::MAX;
-    let (mut journal, resolver, charge) = begin(&mut ram, b"/checked", OWNER, intent);
-    let proof = resolver
-        .metadata_proof(&ram.storage, OWNER, intent.path(true))
-        .unwrap();
-    assert_eq!(
-        journal.commit(&mut ram, EXPENSE, OWNER, Some(proof), Some(NOW)),
-        Err(NO_SPACE)
-    );
-    assert_eq!(ram.storage.node(token).unwrap().mode, 0o644);
-    cleanup(&mut ram, journal, Some(resolver), charge);
 }
 
 #[test]
@@ -675,16 +664,18 @@ fn nonzero_legacy_write_clears_set_id_before_proof_reuse_and_zero_preserves_it()
     assert_eq!(ram.storage.state.epoch, epoch);
     assert_eq!(ram.write_at(&mut fds, fd, b"x", NOW), Ok(1));
     assert_eq!(ram.storage.node(token).unwrap().mode, 0o755);
-    assert!(ram.storage.state.epoch > epoch);
-    assert!(matches!(
-        resolver.metadata_proof(&ram.storage, OWNER, intent.path(true)),
-        Err(STALE_PROOF)
-    ));
+    // The mode of a file is no part of what a path proof holds.
+    assert_eq!(ram.storage.state.epoch, epoch);
+    assert!(
+        resolver
+            .metadata_proof(&ram.storage, OWNER, intent.path(true))
+            .is_ok()
+    );
     resolver.release(&mut ram.storage);
     ram.storage
         .set_attributes(token, 0o6755, OWNER.uid, OWNER.gid)
         .unwrap();
-    ram.storage.state.epoch = u64::MAX;
+    ram.storage.node_mut(token).unwrap().data_generation = u64::MAX;
     let usage = ram.storage.usage(EXPENSE);
     let data_generation = ram.storage.node(token).unwrap().data_generation;
     assert_eq!(ram.pwrite(&mut fds, fd, 0, b"bad", NOW), Err(NO_SPACE));
@@ -734,4 +725,39 @@ fn actual_metadata_layout_is_reported() {
         core::mem::size_of::<MetadataProof>(),
         core::mem::size_of::<MetadataIntent>()
     );
+}
+
+#[test]
+fn directory_access_counter_wrap_raises_epoch_and_exhaustion_preserves_metadata() {
+    let mut ram = Ram::new(Timestamp::ZERO);
+    let dir = file(&mut ram, ROOT, b"wrap-dir", crate::DIR, 0o755);
+    ram.storage.node_mut(dir).unwrap().access_gen = u32::MAX;
+    let epoch = ram.storage.state.epoch;
+    assert_eq!(
+        apply(
+            &mut ram,
+            b"/wrap-dir",
+            OWNER,
+            MetadataIntent::Chmod(0o700),
+            Some(NOW)
+        ),
+        MetadataOutcome::Applied
+    );
+    assert_eq!(ram.storage.node(dir).unwrap().access_gen, 0);
+    assert_eq!(ram.storage.state.epoch, epoch + 1);
+    ram.storage.node_mut(dir).unwrap().access_gen = u32::MAX;
+    ram.storage.state.epoch = u64::MAX;
+    let times = ram.storage.node(dir).unwrap().times;
+    let intent = MetadataIntent::Chmod(0o755);
+    let (mut journal, resolver, charge) = begin(&mut ram, b"/wrap-dir", OWNER, intent);
+    let proof = resolver
+        .metadata_proof(&ram.storage, OWNER, intent.path(true))
+        .unwrap();
+    assert_eq!(
+        journal.commit(&mut ram, EXPENSE, OWNER, Some(proof), Some(NOW)),
+        Err(NO_SPACE)
+    );
+    cleanup(&mut ram, journal, Some(resolver), charge);
+    assert_eq!(ram.storage.node(dir).unwrap().mode, 0o700);
+    assert_eq!(ram.storage.node(dir).unwrap().times, times);
 }

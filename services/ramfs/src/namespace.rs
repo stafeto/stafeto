@@ -71,6 +71,12 @@ pub(crate) struct Edge {
     pub parent: Token,
     pub target: Option<Token>,
     pub location: Location,
+    /// The bucket of the name of the edge and its count of changes when the
+    /// edge was proved (NONE for an edge without a name). Either an unchanged
+    /// bucket count or an unchanged parent name generation retains the proof.
+    pub bucket: u16,
+    pub stamp: u32,
+    pub name_gen: u32,
     pub syntax: RawSyntax,
 }
 /// Native construction is restricted to the retained resolver's verified result.
@@ -105,7 +111,6 @@ struct Reserves {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    Empty,
     Ancestors,
     Prepay,
     Ready,
@@ -126,7 +131,6 @@ pub struct Preparation {
     epoch: u64,
     reserves: Reserves,
     links: [Option<LinkDelta>; 4],
-    cursor: u16,
     ancestor: Option<Token>,
     ancestor_steps: u16,
     pins_held: u8,
@@ -282,7 +286,18 @@ impl Preparation {
             _ => None,
         }
     }
-    /// One empty-directory portion, ancestor hop, allocation or page-map initialization.
+    /// A directory that goes away or is replaced has no names (the count of
+    /// its node); the prepayment follows.
+    fn finish_ancestors(&mut self, storage: &Storage<'_>) -> Result<(), u32> {
+        if let Some(target) = self.empty_target(storage)
+            && storage.node(target)?.names != 0
+        {
+            return Err(NOT_EMPTY);
+        }
+        self.phase = Phase::Prepay;
+        Ok(())
+    }
+    /// One ancestor hop, allocation or page-map initialization.
     pub fn step(&mut self, storage: &mut Storage<'_>, identity: Identity) -> Result<bool, u32> {
         if self.outcome.is_some() {
             return Ok(true);
@@ -292,22 +307,6 @@ impl Preparation {
         }
         self.check(storage, identity)?;
         match self.phase {
-            Phase::Empty => {
-                if let Some(target) = self.empty_target(storage) {
-                    for _ in 0..8 {
-                        if self.cursor as usize == storage.entries() {
-                            self.phase = Phase::Prepay;
-                            break;
-                        }
-                        if storage.entry(target, self.cursor as usize).is_some() {
-                            return Err(NOT_EMPTY);
-                        }
-                        self.cursor += 1;
-                    }
-                } else {
-                    self.phase = Phase::Prepay;
-                }
-            }
             Phase::Ancestors => {
                 if self.intent == NamespaceIntent::Rename
                     && storage.node(self.edges[0].target.unwrap())?.kind == crate::DIR
@@ -317,7 +316,7 @@ impl Preparation {
                         return Err(INVALID_ARGUMENT);
                     }
                     if at == ROOT {
-                        self.phase = Phase::Empty;
+                        self.finish_ancestors(storage)?;
                     } else {
                         if self.ancestor_steps == NODES as u16 {
                             return Err(INVALID_ARGUMENT);
@@ -326,14 +325,14 @@ impl Preparation {
                         self.ancestor_steps += 1;
                     }
                 } else {
-                    self.phase = Phase::Empty;
+                    self.finish_ancestors(storage)?;
                 }
             }
             Phase::Prepay => {
                 for i in 0..3 {
                     if self.dentry_needed(i) && self.reserves.dentries[i].is_none() {
                         self.reserves.dentries[i] =
-                            Some(storage.namespace_reserve_dentry(self.charge, i == 2)?);
+                            Some(storage.namespace_reserve_dentry(self.charge)?);
                         return Ok(false);
                     }
                 }
@@ -375,14 +374,17 @@ impl Preparation {
             return Err(STALE_PROOF);
         }
         self.check(storage, identity)?;
-        let next_epoch = storage.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
+        // Only the move of a directory changes the epoch of the moves.
+        let source_token = self.edges[0].target.ok_or(NO_ENTRY)?;
+        let moves_directory = self.intent == NamespaceIntent::Rename
+            && storage.node(source_token)?.kind == crate::DIR;
         for delta in self.links.iter().flatten() {
             if storage.node(delta.token)?.links != delta.previous {
                 return Err(STALE_PROOF);
             }
         }
         if let Some(victim) = self.empty_target(storage) {
-            if storage.node(victim)?.links != 2 {
+            if storage.node(victim)?.links != 2 || storage.node(victim)?.names != 0 {
                 return Err(STALE_PROOF);
             }
             let parent = if self.intent == NamespaceIntent::Rename {
@@ -402,6 +404,33 @@ impl Preparation {
                 return Err(STALE_PROOF);
             }
         }
+        let replacement = self.intent == NamespaceIntent::Rename && self.edges[1].target.is_some();
+        let keeps_place = self.intent == NamespaceIntent::Rename
+            && matches!(self.edges[0].location, Location::Dynamic(_))
+            && self.edges[0].parent == self.edges[1].parent
+            && !replacement;
+        storage.name_change_room(
+            &[
+                self.removes_source()
+                    .then_some((self.edges[0].parent, self.edges[0].bucket)),
+                replacement.then_some((self.edges[1].parent, self.edges[1].bucket)),
+                self.has_destination()
+                    .then_some((self.edges[1].parent, self.edges[1].bucket)),
+            ],
+            moves_directory,
+        )?;
+        let cookie = if replacement {
+            let index = match self.edges[1].location {
+                Location::Original(i) => i as usize,
+                Location::Dynamic(i) => storage.state.original_len + i as usize,
+                _ => unreachable!("proved replacement"),
+            };
+            Some(storage.entry_cookie(index))
+        } else if self.has_destination() && !keeps_place {
+            Some(storage.next_directory_cookie()?)
+        } else {
+            None
+        };
         // Every fallible check and resource payment precedes this publication.
         for i in 0..2 {
             if let Some(held) = self.reserves.overlays[i].take() {
@@ -426,9 +455,33 @@ impl Preparation {
                 self.intent != NamespaceIntent::Rename,
             );
         }
-        if self.intent == NamespaceIntent::Rename && self.edges[1].target.is_some() {
-            storage.namespace_remove_edge(self.edges[1], self.reserves.dentries[1].take(), true);
+        // Detach the source before capturing the destination's neighbours:
+        // source and destination can be adjacent in either direction.
+        if self.intent == NamespaceIntent::Rename
+            && let Location::Dynamic(slot) = self.edges[0].location
+        {
+            let entry = storage.state.original_len + slot as usize;
+            if keeps_place {
+                storage.chain_remove(entry);
+            } else {
+                storage.unpublish(entry);
+            }
         }
+        let position = if replacement {
+            let entry = match self.edges[1].location {
+                Location::Original(i) => i as usize,
+                Location::Dynamic(i) => storage.state.original_len + i as usize,
+                _ => unreachable!("proved replacement"),
+            };
+            let position = (
+                storage.state.child_prev[entry],
+                storage.state.child_next[entry],
+            );
+            storage.namespace_remove_edge(self.edges[1], self.reserves.dentries[1].take(), true);
+            Some(position)
+        } else {
+            None
+        };
         if self.has_destination() {
             let slot = if self.intent == NamespaceIntent::Rename
                 && let Location::Dynamic(slot) = self.edges[0].location
@@ -437,14 +490,26 @@ impl Preparation {
             } else {
                 self.reserves.dentries[2].take().expect("paid new name")
             };
+            let entry = storage.state.original_len + slot as usize;
             let d = &mut storage.state.dentries[slot as usize];
             d.parent = self.edges[1].parent;
             d.node = source;
             d.len = self.destination_len;
             d.name[..d.len as usize].copy_from_slice(&self.destination_name[..d.len as usize]);
             d.reserved = false;
+            if let Some(cookie) = cookie {
+                d.cookie = cookie;
+            }
+            if keeps_place {
+                storage.chain_insert(entry);
+            } else if let Some((after, next)) = position {
+                storage.publish_at(entry, after, next);
+            } else {
+                storage.publish(entry);
+            }
             if storage.state.nodes[source.slot as usize].kind == crate::DIR {
                 storage.state.nodes[source.slot as usize].parent = self.edges[1].parent;
+                storage.state.nodes[source.slot as usize].name_entry = entry as u16;
             }
         }
         for delta in self.links.iter().flatten() {
@@ -462,7 +527,13 @@ impl Preparation {
         {
             storage.state.nodes[victim.slot as usize].times[2] = now;
         }
-        storage.state.epoch = next_epoch;
+        if moves_directory {
+            storage.state.epoch = storage
+                .state
+                .epoch
+                .checked_add(1)
+                .expect("preflighted directory move");
+        }
         self.outcome = Some(NamespaceOutcome::Applied);
         self.phase = Phase::Committed;
         Ok(NamespaceOutcome::Applied)
@@ -530,6 +601,11 @@ impl Storage<'_> {
         if let Some(target) = edge.target {
             self.node(target)?;
         }
+        if edge.bucket != NONE
+            && !self.name_unchanged(edge.parent, edge.bucket, edge.stamp, edge.name_gen)?
+        {
+            return Err(STALE_PROOF);
+        }
         let valid = match edge.location {
             Location::Missing => edge.target.is_none(),
             Location::ModelToken => edge.target.is_some(),
@@ -551,24 +627,18 @@ impl Storage<'_> {
             Err(STALE_PROOF)
         }
     }
-    fn namespace_reserve_dentry(&mut self, charge: u16, visible: bool) -> Result<u16, u32> {
+    fn namespace_reserve_dentry(&mut self, charge: u16) -> Result<u16, u32> {
         let a = self.state.accounts[charge as usize]
             .as_ref()
             .ok_or(INVALID_ARGUMENT)?;
         if self.state.dentry_len == 0 || a.usage.dentries == DENTRY_SHARE {
             return Err(NO_SPACE);
         }
-        let cookie = if visible {
-            self.next_directory_cookie()?
-        } else {
-            0
-        };
         self.state.dentry_len -= 1;
         let i = self.state.dentry_free[self.state.dentry_len];
         self.state.dentries[i as usize] = Dentry {
             root: charge,
             reserved: true,
-            cookie,
             ..Dentry::EMPTY
         };
         self.state.accounts[charge as usize]
@@ -604,6 +674,7 @@ impl Storage<'_> {
                 let slot = tombstone.expect("paid original tombstone");
                 self.state.dentries[slot as usize].parent = edge.parent;
                 self.state.dentries[slot as usize].node = edge.target.unwrap();
+                self.unpublish(i as usize);
                 self.state.originals[i as usize].hidden = true;
             }
             Location::Dynamic(i) if drop_dynamic => self.drop_dentry(i as usize),
@@ -735,7 +806,6 @@ impl Storage<'_> {
                 overlays: [None; 2],
             },
             links: [None; 4],
-            cursor: 0,
             ancestor: None,
             ancestor_steps: 0,
             pins_held: 0,
@@ -782,12 +852,7 @@ fn model_edge<'a>(
     name: &'a [u8],
     role: NamespacePath,
 ) -> Result<NamespaceProof<'a>, u32> {
-    let found = (0..storage.entries()).find_map(|i| {
-        storage
-            .entry(parent, i)
-            .filter(|(n, _)| *n == name)
-            .map(|(_, token)| (i, token))
-    });
+    let found = storage.find(parent, name);
     Ok(NamespaceProof {
         edge: Edge {
             parent,
@@ -795,6 +860,9 @@ fn model_edge<'a>(
             location: found.map_or(Ok(Location::Missing), |(i, _)| {
                 storage.namespace_location(i)
             })?,
+            bucket: name_bucket(parent, name) as u16,
+            stamp: storage.stamp(name_bucket(parent, name)),
+            name_gen: storage.name_gen(parent)?,
             syntax: RawSyntax::of(name),
         },
         leaf: name,
@@ -867,6 +935,9 @@ pub(super) fn model_link(
                 parent: ROOT,
                 target: Some(token),
                 location: Location::ModelToken,
+                bucket: NONE,
+                stamp: 0,
+                name_gen: 0,
                 syntax: RawSyntax {
                     final_component: FinalComponent::Ordinary,
                     trailing_slash: false,

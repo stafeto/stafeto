@@ -103,6 +103,19 @@ Bounded paths with interrupts masked are listed in
   service reads from its read-only mapping of the image without a copy;
   `READ_AT` reads at an offset. Paths are at most 511 bytes (512 with the
   terminator, as `PATH_MAX`), names at most 255.
+  Naming proofs retain the bucket counter and the parent's name generation:
+  `name_valid = bucket_same || parent_same`. A directory move or a counter
+  wrap raises the checked global epoch. Foreign colliding names retain a
+  proof; a chain walk retains a published cursor in its bucket. Repeated
+  changes of names in the operation's directories and buckets, directory
+  moves or access checks can keep an operation waiting.
+  New names allocate their listing cookie at commit and append in constant
+  work; a replacing rename takes the destination's cookie and position.
+  `process-steps` checks publication after 500 rival names and a replacing
+  rename with 32 page-owning nodes queued for reclamation. The Start fixture
+  fills 96 jobs (the expenditure root's share); extending the observed slope
+  of about 20 ticks per place to 127 jobs estimates about 17,800 ticks against
+  B = 20,410. The 127-place number is an estimate.
 - `services/clock` and `services/process`: realtime clock, process
   identity and credentials for the POSIX layer (`proto/clock`,
   `proto/process`). The process service keeps 256 records, PID = index +

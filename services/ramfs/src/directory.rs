@@ -47,6 +47,8 @@ pub struct DirectoryJournal {
     charge: u16,
     node: Token,
     epoch: u64,
+    /// The generation of the directory when the read began: a change of its names ends the read.
+    dir_gen: u32,
     held: Option<Held>,
     format: DirectoryFormat,
     limit: u16,
@@ -92,6 +94,7 @@ impl Ram<'_> {
             charge,
             node,
             epoch: self.storage.state.epoch,
+            dir_gen: self.storage.name_gen(node)?,
             held: Some(held),
             format,
             limit: limit as u16,
@@ -141,6 +144,7 @@ impl DirectoryJournal {
         if self.phase == Phase::Canceled
             || self.identity != identity
             || self.epoch != ram.storage.state.epoch
+            || ram.storage.name_gen(self.node)? != self.dir_gen
         {
             return Err(STALE_PROOF);
         }

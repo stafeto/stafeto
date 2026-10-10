@@ -270,11 +270,15 @@ pub enum Method {
     Seek = 4,
     Stat = 5,
     Close = 6,
+    /// Entry `index` of a directory by path, counted from the head of its list:
+    /// the first 258 only (INVALID_ARGUMENT beyond). Layers list by `ReadDirFd`.
     ReadDir = 7,
     Lookup = 8,
     SeekFrom = 9,
     InfoFd = 10,
     InfoPath = 11,
+    /// The next name of the directory description `fd`. A long list is walked a
+    /// portion at a time: RESOLVING says the walk goes on in the next call.
     ReadDirFd = 12,
     ReadAt = 13,
     OpenExec = 14,

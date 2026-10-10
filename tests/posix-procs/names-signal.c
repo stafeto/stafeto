@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 /* A real signal in the middle of a long operation on names (spec 2, 3.3 and
- * table 2.4): a rename of a name in the directory of 360 names takes forty
- * steps of the service, and a thread that sleeps for a part of that time
+ * table 2.4): a rename of a name at the end of a chain of 40
+ * directories takes more than eighty steps of the service (a step for each
+ * component of the two paths), and a thread that sleeps for a part of that time
  * sends SIGALRM to the thread that renames (the timers of POSIX are not in
  * the layer yet). The handler is installed without SA_RESTART. Three runs:
  *   a. the handler makes operations of its own (mkdir, rmdir): the rename
@@ -18,13 +19,16 @@
  * requests in this probe is printed. Included by procs.c, in the role names. */
 #include <setjmp.h>
 
-extern int files_names_big(void);
-extern int files_names_big_gone(void);
 extern int files_names_places_in_use(void);
 extern unsigned files_names_interrupted(void);
 
-#define SG_LAST "/tmp/big/f0359"
-#define SG_NEW "/tmp/big/n"
+#define SG_BASE "/tmp/sgd"
+#define SG_DEPTH 40
+/* The two names of the renamed file, at the end of the chain. */
+static char sg_last_path[SG_DEPTH * 2 + 32];
+static char sg_new_path[SG_DEPTH * 2 + 32];
+#define SG_LAST sg_last_path
+#define SG_NEW sg_new_path
 
 #define SG_CHECK(condition)                                                    \
     do {                                                                       \
@@ -110,17 +114,51 @@ static int sg_try(long delay_us, int *left, int from_new) {
     return result;
 }
 
+/* The chain of directories and the file at its end. */
+static int sg_build(void) {
+    char path[SG_DEPTH * 2 + 32];
+    strcpy(path, SG_BASE);
+    SG_CHECK(mkdir(path, 0777) == 0);
+    for (int level = 0; level < SG_DEPTH; level++) {
+        strcat(path, "/d");
+        SG_CHECK(mkdir(path, 0777) == 0);
+    }
+    snprintf(sg_last_path, sizeof sg_last_path, "%s/f", path);
+    snprintf(sg_new_path, sizeof sg_new_path, "%s/n", path);
+    int fd = open(sg_last_path, O_WRONLY | O_CREAT, 0644);
+    SG_CHECK(fd >= 0 && close(fd) == 0);
+    return 0;
+}
+
+/* The chain goes. */
+static int sg_remove(void) {
+    if (sg_exists(SG_NEW)) SG_CHECK(unlink(SG_NEW) == 0);
+    if (sg_exists(SG_LAST)) SG_CHECK(unlink(SG_LAST) == 0);
+    char path[SG_DEPTH * 2 + 32];
+    for (int level = SG_DEPTH; level >= 0; level--) {
+        strcpy(path, SG_BASE);
+        for (int i = 0; i < level; i++) strcat(path, "/d");
+        SG_CHECK(rmdir(path) == 0);
+    }
+    return 0;
+}
+
 static int names_signals(void) {
     struct sigaction action;
     memset(&action, 0, sizeof action);
     action.sa_handler = sg_handler;
     sigemptyset(&action.sa_mask);
     SG_CHECK(sigaction(SIGALRM, &action, NULL) == 0);
-    SG_CHECK(files_names_big() == 0);
-    /* How long a rename takes alone. */
-    long begin = sg_now_us();
-    for (int i = 0; i < 4; i++) SG_CHECK(sg_plain() == 0);
-    long whole = (sg_now_us() - begin) / 4;
+    SG_CHECK(sg_build() == 0);
+    /* How long a rename takes alone: the calls to lstat are left out. */
+    long spent = 0;
+    for (int i = 0; i < 4; i++) {
+        int from_new = sg_exists(SG_NEW);
+        long begin = sg_now_us();
+        SG_CHECK((from_new ? rename(SG_NEW, SG_LAST) : rename(SG_LAST, SG_NEW)) == 0);
+        spent += sg_now_us() - begin;
+    }
+    long whole = spent / 4;
     if (whole < 200) whole = 200;
     printf("posix-procs: names signal: a rename takes %ld us\n", whole);
 
@@ -156,18 +194,18 @@ static int names_signals(void) {
         SG_CHECK(result == 0);
         if (left && sg_jumps <= 3) {
             /* The next operation, in the main frame, collects the record. */
-            SG_CHECK(access("/tmp/big", F_OK) == 0);
+            SG_CHECK(access(SG_BASE, F_OK) == 0);
             SG_CHECK(files_names_places_in_use() == 0);
             SG_CHECK(sg_one_name());
         }
     }
     SG_CHECK(sg_jumps >= 17);
-    SG_CHECK(access("/tmp/big", F_OK) == 0);
+    SG_CHECK(access(SG_BASE, F_OK) == 0);
     SG_CHECK(files_names_places_in_use() == 0);
     SG_CHECK(sg_one_name());
     sg_leaves = 0;
     for (int i = 0; i < 20; i++) SG_CHECK(sg_plain() == 0);
-    SG_CHECK(files_names_big_gone() == 0);
+    SG_CHECK(sg_remove() == 0);
     printf("posix-procs: names signal ok, %d exits by siglongjmp\n", (int)sg_jumps);
     return 0;
 }

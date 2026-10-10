@@ -5,6 +5,7 @@
 extern crate std;
 use crate::authority::{Binding, Identity};
 use crate::resolve::{Progress, Resolve};
+use crate::storage::tests_support::OneBucket;
 use crate::storage::{Pin, ROOT, Root, SYMLINK, Token};
 use crate::{DIR, Fds, REG, Ram};
 use proto_process::{Credentials, ExpenditureRoot, Groups, LoaderOf, ResourceLimits, WhoReply};
@@ -72,7 +73,8 @@ fn create_intent_retains_missing_edge_and_restarts_before_publication() {
         Resolve::with_intent(&mut r.storage, b"/parent/\xff", ROOT, OWNER, intent).unwrap();
     let (progress, steps) = intent_ready(&mut r, &mut resolver, OWNER).unwrap();
     assert_eq!(progress, Progress::Missing(parent));
-    assert!(steps >= crate::storage::DENTRIES / 8);
+    // One step for a component, however many names the table holds.
+    assert!(steps <= 3);
     let proof = resolver.result_proof(&r.storage, OWNER, intent).unwrap();
     assert_eq!(proof.parent, parent);
     assert_eq!(proof.leaf, b"\xff");
@@ -693,17 +695,21 @@ fn proof_restarts_after_namespace_and_authority_changes_and_retains_base() {
         Err(proto_fs::ACCESS_DENIED)
     );
     assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    // A walk that stands in the directory meets the change of its mode at
+    // the check of its search permission; a finished proof is not touched.
     r.storage.set_attributes(directory, 0o600, 11, 22).unwrap();
-    assert_eq!(job.proof(&r.storage, OWNER), Err(proto_fs::STALE_PROOF));
-    assert_eq!(
-        finish(&mut r, &mut job, OWNER),
-        Err(proto_fs::ACCESS_DENIED)
-    );
+    assert_eq!(job.proof(&r.storage, OWNER), Ok(file));
     r.storage.set_attributes(directory, 0o700, 11, 22).unwrap();
-    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    // A name made in another directory changes nothing of the proof.
     create(&mut r, ROOT, b"change", REG, 0o644);
+    assert_eq!(job.proof(&r.storage, OWNER), Ok(file));
+    // The move of a directory does.
+    r.storage.state.epoch += 1;
     assert_eq!(job.proof(&r.storage, OWNER), Err(proto_fs::STALE_PROOF));
+    assert_eq!(job.step(&mut r.storage, OWNER), Ok(Progress::More));
     assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    // Two changes of identity and one move of a directory.
+    assert_eq!(job.restarts, 3);
     let mut fds = Fds::default();
     r.set_cwd_token(&mut fds, ROOT).unwrap();
     assert_eq!(
@@ -1627,9 +1633,10 @@ fn creation_access_requires_a_fresh_exact_reservation_in_its_owner_root() {
             (REG, 0o600, OWNER.uid, OWNER.gid),
         )
         .unwrap();
-    let other = create(&mut ram, ROOT, b"other", REG, 0o600);
+    let rival = crate::storage::tests_support::same_bucket(ROOT, b"provenance");
+    let other = create(&mut ram, ROOT, &rival, REG, 0o600);
     let before = ram.storage.usage(ROOT_ACCOUNT);
-    // An unrelated namespace publication makes the old proof stale.
+    // A publication in the bucket of the name makes the old proof stale.
     assert!(matches!(
         ram.prepare_open_token(&mut fds, r.token, proto_fs::READ_WRITE, OWNER, Some(r)),
         Err(proto_fs::STALE_PROOF)
@@ -1915,7 +1922,8 @@ fn original_open_args_survive_real_link_expansion_and_namespace_restart() {
         Progress::Found(target)
     );
     assert_eq!(resolver.original_path(), b"/source");
-    create(&mut ram, ROOT, b"changed", REG, 0o600);
+    // A directory moved: the walk starts again.
+    ram.storage.state.epoch += 1;
     assert_eq!(resolver.step(&mut ram.storage, OWNER), Ok(Progress::More));
     assert_eq!(
         intent_ready(&mut ram, &mut resolver, OWNER).unwrap().0,
@@ -2256,4 +2264,185 @@ fn clone_into_requires_fresh_destination_including_operation_tombstones() {
     assert_eq!(destinations[1].open_receipts[31].key.generation, 1);
     assert_eq!(destinations[2].open_receipts[31].description.slot, 1);
     assert_eq!(ram.open_descriptions(), 0);
+}
+
+/// A directory with a file, and `count` names of the root made after them:
+/// with one bucket, the file is the last of the chain.
+fn long_chain(r: &mut Ram<'_>, count: usize) -> (Token, Token) {
+    let directory = create(r, ROOT, b"chain", DIR, 0o700);
+    let tail = create(r, directory, b"tail", REG, 0o644);
+    for i in 0..count {
+        create(r, ROOT, format!("n{i}").as_bytes(), REG, 0o644);
+    }
+    (directory, tail)
+}
+
+/// Steps until the walk looks for a name of `directory` and has passed the first eight of its chain.
+fn walk_into(r: &mut Ram<'_>, job: &mut Resolve, directory: Token) {
+    for _ in 0..100 {
+        if job.looking_in(directory) {
+            assert_eq!(job.step(&mut r.storage, OWNER), Ok(Progress::More));
+            return;
+        }
+        assert_eq!(job.step(&mut r.storage, OWNER), Ok(Progress::More));
+    }
+    panic!("the walk does not reach the directory");
+}
+
+#[test]
+fn a_name_removed_ahead_of_the_walk_in_its_chain_does_not_lose_the_name_behind() {
+    let _one = OneBucket::new();
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let (directory, tail) = long_chain(&mut r, 30);
+    let mut job = Resolve::new(&mut r.storage, b"/chain/tail", ROOT, OWNER, true).unwrap();
+    // The walk is in the chain of "tail", behind names of the root.
+    walk_into(&mut r, &mut job, directory);
+    // The names at the front of the chain go away: the place of the walk in it is gone.
+    for i in 0..30 {
+        r.storage
+            .unlink(ROOT, format!("n{i}").as_bytes(), ROOT_ACCOUNT)
+            .unwrap();
+    }
+    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(tail));
+    assert_eq!(job.restarts, 0, "only the component is looked up again");
+    job.release(&mut r.storage);
+}
+
+#[test]
+fn a_mode_change_of_the_directory_in_the_middle_of_a_chain_checks_search_permission_again() {
+    let _one = OneBucket::new();
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let (directory, _tail) = long_chain(&mut r, 30);
+    let mut job = Resolve::new(&mut r.storage, b"/chain/tail", ROOT, OWNER, true).unwrap();
+    walk_into(&mut r, &mut job, directory);
+    r.storage.set_attributes(directory, 0o600, 11, 22).unwrap();
+    assert_eq!(
+        finish(&mut r, &mut job, OWNER),
+        Err(proto_fs::ACCESS_DENIED)
+    );
+    job.release(&mut r.storage);
+}
+
+#[test]
+fn a_file_change_and_a_name_in_another_directory_leave_a_walk_and_its_proof_as_they_are() {
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let one = create(&mut r, ROOT, b"one", DIR, 0o755);
+    let other = create(&mut r, ROOT, b"other", DIR, 0o755);
+    let file = create(&mut r, one, b"file", REG, 0o644);
+    let stranger = create(&mut r, other, b"stranger", REG, 0o644);
+    let intent = crate::resolve::Intent::Namespace {
+        path: crate::namespace::NamespacePath::Victim,
+    };
+    let mut job = Resolve::with_intent(&mut r.storage, b"/one/file", ROOT, OWNER, intent).unwrap();
+    assert_eq!(job.step(&mut r.storage, OWNER), Ok(Progress::More));
+    // Mode, owner and size of a file, a new name and a gone name elsewhere.
+    r.storage.set_attributes(stranger, 0o600, 5, 5).unwrap();
+    r.storage.write(stranger, ROOT_ACCOUNT, 0, b"data").unwrap();
+    create(&mut r, other, b"another", REG, 0o644);
+    r.storage.unlink(other, b"another", ROOT_ACCOUNT).unwrap();
+    assert_eq!(finish(&mut r, &mut job, OWNER), Ok(file));
+    assert!(job.result_proof(&r.storage, OWNER, intent).is_ok());
+    create(&mut r, other, b"later", REG, 0o644);
+    assert!(
+        job.namespace_proof(&r.storage, OWNER, crate::namespace::NamespacePath::Victim)
+            .is_ok()
+    );
+    assert_eq!(job.restarts, 0);
+    job.release(&mut r.storage);
+}
+
+#[test]
+fn a_path_of_32_links_of_255_components_takes_a_step_for_each_component_and_link() {
+    // The worst path of the plan: thirty-two links, each of 255 components
+    // ("." is a component) and the name of the next link. Without the index
+    // each name of the walk cost 193 steps in a full table; now it is one.
+    let mut r = Ram::new(proto_fs::Timestamp::legacy_ns(0));
+    let count = 32;
+    let dots = "./".repeat(254);
+    for i in 0..count {
+        let link = create(&mut r, ROOT, format!("l{i}").as_bytes(), SYMLINK, 0o777);
+        let target = if i + 1 < count {
+            format!("{dots}l{}", i + 1)
+        } else {
+            format!("{dots}end")
+        };
+        r.storage
+            .write(link, ROOT_ACCOUNT, 0, target.as_bytes())
+            .unwrap();
+    }
+    let end = create(&mut r, ROOT, b"end", REG, 0o644);
+    let mut job = Resolve::new(&mut r.storage, b"/l0", ROOT, OWNER, true).unwrap();
+    let mut steps = 0;
+    let found = loop {
+        steps += 1;
+        assert!(steps < 20_000, "the walk does not end");
+        if let Progress::Found(token) = job.step(&mut r.storage, OWNER).unwrap() {
+            break token;
+        }
+    };
+    assert_eq!(found, end);
+    assert_eq!(job.restarts, 0);
+    std::eprintln!("T4 path of 32 links of 255 components: {steps} steps");
+    // 255 components and a link for each of the 32 links, and the name of the first.
+    assert!(steps <= 8_500, "{steps} steps");
+    assert!(steps >= 8_000, "{steps} steps: the dots are components");
+    job.release(&mut r.storage);
+}
+
+#[test]
+fn foreign_bucket_churn_keeps_a_twenty_name_chain_cursor() {
+    let _one = OneBucket::new();
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (directory, tail) = long_chain(&mut ram, 20);
+    let mut job = Resolve::new(&mut ram.storage, b"/chain/tail", ROOT, OWNER, true).unwrap();
+    walk_into(&mut ram, &mut job, directory);
+    let mut finished = false;
+    for _ in 0..3 {
+        create(&mut ram, ROOT, b"foreign", REG, 0o644);
+        ram.storage.unlink(ROOT, b"foreign", ROOT_ACCOUNT).unwrap();
+        match job.step(&mut ram.storage, OWNER).unwrap() {
+            Progress::Found(token) => {
+                assert_eq!(token, tail);
+                finished = true;
+                break;
+            }
+            Progress::More => {}
+            _ => panic!("existing tail"),
+        }
+    }
+    assert!(
+        finished,
+        "the retained chain must finish without another head walk"
+    );
+    assert_eq!(job.restarts, 0);
+    ram.storage.check_name_index();
+    job.release(&mut ram.storage);
+}
+
+#[test]
+fn foreign_bucket_changes_keep_missing_proofs_and_reservations() {
+    let _one = OneBucket::new();
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let dir = create(&mut ram, ROOT, b"dir", DIR, 0o755);
+    let other = create(&mut ram, ROOT, b"other", DIR, 0o755);
+    let intent = crate::resolve::Intent::DirectoryCreate;
+    let mut job = Resolve::with_intent(&mut ram.storage, b"/dir/new", ROOT, OWNER, intent).unwrap();
+    assert_eq!(
+        intent_ready(&mut ram, &mut job, OWNER).unwrap().0,
+        Progress::Missing(dir)
+    );
+    let pending = ram
+        .storage
+        .reserve(ROOT_ACCOUNT, dir, b"new", (DIR, 0o755, 11, 22))
+        .unwrap();
+    create(&mut ram, other, b"foreign", REG, 0o644);
+    assert_eq!(
+        job.step(&mut ram.storage, OWNER),
+        Ok(Progress::Missing(dir))
+    );
+    assert!(job.result_proof(&ram.storage, OWNER, intent).is_ok());
+    assert!(ram.storage.reserved_token(pending, ROOT_ACCOUNT).is_ok());
+    assert_eq!(ram.storage.commit(pending), Ok(pending.token));
+    ram.storage.check_name_index();
+    job.release(&mut ram.storage);
 }

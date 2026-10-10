@@ -25,7 +25,80 @@ pub const PREPARATION_SHARE: u16 = 96;
 pub const ORIGINALS: usize = bootimg::rootfs::ENTRIES_MAX + 5;
 pub const NODES: usize = ORIGINALS + INODES;
 pub const NONE: u16 = u16::MAX;
+/// Heads of the name chains: one per bucket of (parent, name).
+pub const BUCKETS: usize = 2048;
+/// Links of a chain a resolution step follows.
+pub const CHAIN_PORTION: usize = 8;
+/// Entries of the name index: the boot entries then the dynamic ones.
+const NAME_ENTRIES: usize = ORIGINALS + DENTRIES;
 pub const SYMLINK: u32 = 5;
+/// Links of the list of the names of a directory a step walks to find a position.
+pub const LIST_PORTION: usize = 256;
+
+/// Where the walk of the list of a directory to a position ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Walk {
+    /// The entry after the position.
+    Found(usize),
+    /// No name after the position.
+    End,
+    /// The portion is spent; this entry stands before the position.
+    More(u16),
+}
+
+/// The bucket of a name in a directory. The function is fixed; a local user
+/// who finds colliding names only returns the cost to the length of the
+/// table, which is the cost before the index.
+pub(crate) fn name_bucket(parent: Token, name: &[u8]) -> usize {
+    #[cfg(test)]
+    if let Some(bucket) = tests_support::FORCED_BUCKET.with(|b| b.get()) {
+        return bucket;
+    }
+    let mut hash: u32 = 0x811c_9dc5 ^ u32::from(parent.slot);
+    for &byte in name {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    ((hash ^ (hash >> 15)) as usize) & (BUCKETS - 1)
+}
+#[cfg(test)]
+pub(crate) mod tests_support {
+    extern crate std;
+    use std::cell::Cell;
+    std::thread_local! {
+        /// A test puts every name into one bucket.
+        pub static FORCED_BUCKET: Cell<Option<usize>> = const { Cell::new(None) };
+        pub static COOKIE_LINKS: Cell<usize> = const { Cell::new(0) };
+    }
+    /// A name of the bucket of `name` in `parent`, another than `name`.
+    pub(crate) fn same_bucket(parent: super::Token, name: &[u8]) -> std::vec::Vec<u8> {
+        let wanted = super::name_bucket(parent, name);
+        (0..)
+            .map(|i| std::format!("c{i}").into_bytes())
+            .find(|candidate| candidate != name && super::name_bucket(parent, candidate) == wanted)
+            .expect("a name of the bucket")
+    }
+    /// A name that does not share the bucket of `name` in `parent`.
+    pub(crate) fn other_bucket(parent: super::Token, name: &[u8]) -> std::vec::Vec<u8> {
+        let wanted = super::name_bucket(parent, name);
+        (0..)
+            .map(|i| std::format!("o{i}").into_bytes())
+            .find(|candidate| super::name_bucket(parent, candidate) != wanted)
+            .expect("a name of another bucket")
+    }
+    /// Every name goes into one bucket while the guard lives.
+    pub(crate) struct OneBucket;
+    impl OneBucket {
+        pub(crate) fn new() -> Self {
+            FORCED_BUCKET.with(|b| b.set(Some(5)));
+            Self
+        }
+    }
+    impl Drop for OneBucket {
+        fn drop(&mut self) {
+            FORCED_BUCKET.with(|b| b.set(None));
+        }
+    }
+}
 
 pub fn canonical(tree: &Tree<'_>, n: u16) -> u16 {
     tree.canonical(n)
@@ -108,6 +181,16 @@ pub struct Node {
     overlay: u16,
     reclaim: bool,
     orphan_parent: bool,
+    /// Published names directly in this directory (zero for other kinds).
+    pub names: u16,
+    /// The entry that names this directory (a directory has one name), or NONE.
+    pub name_entry: u16,
+    /// Raised by every change of the names of the directory (a model of the
+    /// listing is stale after it).
+    pub name_gen: u32,
+    /// Raised by a change of the mode or the owner of the directory: a walk
+    /// that stands in it checks its search permission again.
+    pub access_gen: u32,
 }
 impl Node {
     const EMPTY: Self = Self {
@@ -127,6 +210,10 @@ impl Node {
         overlay: NONE,
         reclaim: false,
         orphan_parent: false,
+        names: 0,
+        name_entry: NONE,
+        name_gen: 0,
+        access_gen: 0,
     };
     pub fn live(&self) -> bool {
         self.kind != 0 && !self.reclaim
@@ -282,6 +369,18 @@ pub struct State {
     retired_turn: bool,
     page_next: [u16; PAGES],
     page_logical: [u16; PAGES],
+    name_heads: [u16; BUCKETS],
+    /// Changes of each bucket, a name that came or left (wrapping). A proof
+    /// of a name, that it is there or is not, holds while the count of its
+    /// bucket stays; a walk in a chain starts the component again when it
+    /// changes.
+    bucket_stamps: [u32; BUCKETS],
+    name_next: [u16; NAME_ENTRIES],
+    name_prev: [u16; NAME_ENTRIES],
+    child_next: [u16; NAME_ENTRIES],
+    child_prev: [u16; NAME_ENTRIES],
+    /// First and last entry of the names in each node that is a directory.
+    children: [[u16; 2]; NODES],
 }
 impl State {
     pub const fn new() -> Self {
@@ -314,6 +413,13 @@ impl State {
             retired_turn: false,
             page_next: [NONE; PAGES],
             page_logical: [0; PAGES],
+            name_heads: [NONE; BUCKETS],
+            bucket_stamps: [0; BUCKETS],
+            name_next: [NONE; NAME_ENTRIES],
+            name_prev: [NONE; NAME_ENTRIES],
+            child_next: [NONE; NAME_ENTRIES],
+            child_prev: [NONE; NAME_ENTRIES],
+            children: [[NONE; 2]; NODES],
         }
     }
 }
@@ -337,6 +443,13 @@ impl State {
         self.retired_head = 0;
         self.retired_len = 0;
         self.retired_turn = false;
+        self.name_heads.fill(NONE);
+        self.bucket_stamps.fill(0);
+        self.name_next.fill(NONE);
+        self.name_prev.fill(NONE);
+        self.child_next.fill(NONE);
+        self.child_prev.fill(NONE);
+        self.children.fill([NONE; 2]);
     }
 }
 impl Default for State {
@@ -351,6 +464,11 @@ pub struct Reservation {
     pub token: Token,
     dentry: u16,
     epoch: u64,
+    /// The bucket of the name and its count when the name was reserved: the
+    /// proof that the name was not there.
+    bucket: u16,
+    stamp: u32,
+    name_gen: u32,
     place: u16,
     root: u16,
 }
@@ -451,7 +569,6 @@ impl Storage<'_> {
             .data_generation
             .checked_add(1)
             .ok_or(NO_SPACE)?;
-        self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
         Ok(())
     }
 
@@ -661,7 +778,6 @@ impl Storage<'_> {
         node.times[1] = now;
         node.times[2] = now;
         node.mode &= !0o6000;
-        self.state.epoch += 1;
         data.private_overlay = false;
         data.committed = true;
         Ok(())
@@ -858,7 +974,6 @@ impl Storage<'_> {
         node.times[1] = now;
         node.times[2] = now;
         node.mode &= !0o6000;
-        self.state.epoch += 1;
         data.committed = true;
         Ok(())
     }
@@ -889,7 +1004,13 @@ impl<'a> Storage<'a> {
         for (i, free) in state.page_free.iter_mut().enumerate() {
             *free = (PAGES - i - 1) as u16;
         }
-        let out = Self { state, data, tree };
+        let mut out = Self { state, data, tree };
+        out.state.name_heads.fill(NONE);
+        out.state.name_next.fill(NONE);
+        out.state.name_prev.fill(NONE);
+        out.state.child_next.fill(NONE);
+        out.state.child_prev.fill(NONE);
+        out.state.children.fill([NONE; 2]);
         for (i, (kind, mode, links, length, parent)) in [
             (crate::DIR, 0o555, 4, 0, ROOT),
             (crate::DIR, 0o555, 2, 0, ROOT),
@@ -982,6 +1103,14 @@ impl<'a> Storage<'a> {
             }
             out.state.original_len += tree.len() as usize;
         }
+        for i in 0..out.state.original_len {
+            let original = out.state.originals[i];
+            let node = &mut out.state.nodes[original.node.slot as usize];
+            if node.kind == crate::DIR {
+                node.name_entry = i as u16;
+            }
+            out.publish(i);
+        }
         // Canonical hard-link aliases occupy one initialized Node. Empty original
         // slots add no inode capacity. Boot capacity remains fixed after startup.
         for node in &out.state.nodes[..ORIGINALS] {
@@ -1013,7 +1142,8 @@ impl<'a> Storage<'a> {
         self.node(token)?;
         Ok(&mut self.state.nodes[token.slot as usize])
     }
-    /// Metadata changes invalidate every retained path proof before publishing fields.
+    /// A change of the mode or owner of a directory raises its generation,
+    /// which sends the walks that stand in it back to its search check.
     pub fn set_attributes(
         &mut self,
         token: Token,
@@ -1021,14 +1151,51 @@ impl<'a> Storage<'a> {
         uid: u32,
         gid: u32,
     ) -> Result<(), u32> {
-        self.node(token)?;
-        let next = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
+        let current = self.node(token)?;
+        let (access_gen, epoch) = if current.kind == crate::DIR {
+            match current.access_gen.checked_add(1) {
+                Some(next) => (next, self.state.epoch),
+                None => (0, self.state.epoch.checked_add(1).ok_or(NO_SPACE)?),
+            }
+        } else {
+            (current.access_gen, self.state.epoch)
+        };
         let node = &mut self.state.nodes[token.slot as usize];
         node.mode = mode;
         node.uid = uid;
         node.gid = gid;
-        self.state.epoch = next;
+        node.access_gen = access_gen;
+        self.state.epoch = epoch;
         Ok(())
+    }
+    /// The count of the names changed in a directory, modulo 2^32.
+    pub fn name_gen(&self, token: Token) -> Result<u32, u32> {
+        Ok(self.node(token)?.name_gen)
+    }
+    /// The count of the changes of a bucket of names, modulo 2^32.
+    pub(crate) fn stamp(&self, bucket: usize) -> u32 {
+        self.state.bucket_stamps[bucket]
+    }
+    /// Either unchanged counter proves that this directory's name is unchanged.
+    pub(crate) fn name_unchanged(
+        &self,
+        parent: Token,
+        bucket: u16,
+        stamp: u32,
+        generation: u32,
+    ) -> Result<bool, u32> {
+        Ok(self.name_gen(parent)? == generation || self.stamp(bucket as usize) == stamp)
+    }
+    /// A retained chain cursor survives foreign edits if its row is still in the bucket.
+    pub(crate) fn chain_cursor_valid(&self, entry: u16, bucket: u16) -> bool {
+        if entry == NONE {
+            return true;
+        }
+        if !self.published(entry as usize) {
+            return false;
+        }
+        let (parent, name) = self.entry_key(entry as usize);
+        name_bucket(parent, name) == bucket as usize
     }
     fn account(&mut self, key: Root) -> Result<usize, u32> {
         if let Some(i) = self
@@ -1167,25 +1334,257 @@ impl<'a> Storage<'a> {
         self.state.original_len + DENTRIES
     }
     pub fn lookup(&self, parent: Token, name: &[u8]) -> Result<Token, u32> {
-        for (i, original) in self.state.originals[..self.state.original_len]
-            .iter()
-            .enumerate()
-        {
-            if !original.hidden && original.parent == parent && self.original_name(i) == name {
-                return Ok(original.node);
-            }
-        }
-        for dentry in &self.state.dentries {
-            if dentry.len != 0
-                && !dentry.reserved
-                && dentry.parent == parent
-                && dentry.len as usize == name.len()
-                && &dentry.name[..dentry.len as usize] == name
+        self.find(parent, name)
+            .map(|(_, token)| token)
+            .ok_or(NO_ENTRY)
+    }
+    /// The entry that holds the published name, whole chain.
+    pub(crate) fn find(&self, parent: Token, name: &[u8]) -> Option<(usize, Token)> {
+        let mut i = self.name_head(parent, name);
+        while i != NONE {
+            if let Some((found, token)) = self.entry(parent, i as usize)
+                && found == name
             {
-                return Ok(dentry.node);
+                return Some((i as usize, token));
+            }
+            i = self.name_next(i);
+        }
+        None
+    }
+    /// The first entry of the chain of (parent, name), or NONE.
+    pub(crate) fn name_head(&self, parent: Token, name: &[u8]) -> u16 {
+        self.state.name_heads[name_bucket(parent, name)]
+    }
+    pub(crate) fn name_next(&self, entry: u16) -> u16 {
+        self.state.name_next[entry as usize]
+    }
+    /// The parent and name of an entry that is or was published.
+    fn entry_key(&self, index: usize) -> (Token, &[u8]) {
+        if index < self.state.original_len {
+            (
+                self.state.originals[index].parent,
+                self.original_name(index),
+            )
+        } else {
+            let d = &self.state.dentries[index - self.state.original_len];
+            (d.parent, &d.name[..d.len as usize])
+        }
+    }
+    /// Preflight every name edit of a commit, including repeated parent/bucket edits.
+    /// The list has at most three entries: source, victim, destination.
+    pub(crate) fn name_change_room(
+        &self,
+        changes: &[Option<(Token, u16)>],
+        moves: bool,
+    ) -> Result<(), u32> {
+        let mut wraps = u64::from(moves);
+        for (i, change) in changes.iter().enumerate() {
+            let Some((parent, bucket)) = *change else {
+                continue;
+            };
+            let previous = &changes[..i];
+            let names_before = previous
+                .iter()
+                .flatten()
+                .filter(|(p, _)| *p == parent)
+                .count() as u32;
+            let bucket_before = previous
+                .iter()
+                .flatten()
+                .filter(|(_, b)| *b == bucket)
+                .count() as u32;
+            wraps += u64::from(self.name_gen(parent)?.wrapping_add(names_before) == u32::MAX);
+            wraps += u64::from(self.stamp(bucket as usize).wrapping_add(bucket_before) == u32::MAX);
+        }
+        self.state.epoch.checked_add(wraps).ok_or(NO_SPACE)?;
+        Ok(())
+    }
+    /// Counter reuse invalidates every proof captured before the wrap.
+    fn next_name_count(value: u32, epoch: &mut u64) -> u32 {
+        match value.checked_add(1) {
+            Some(next) => next,
+            None => {
+                *epoch = epoch.checked_add(1).expect("preflighted counter wrap");
+                0
             }
         }
-        Err(NO_ENTRY)
+    }
+    /// A name of `parent` came or left the bucket.
+    fn touch_name(&mut self, parent: Token, bucket: usize) {
+        let node = &mut self.state.nodes[parent.slot as usize];
+        node.name_gen = Self::next_name_count(node.name_gen, &mut self.state.epoch);
+        self.state.bucket_stamps[bucket] =
+            Self::next_name_count(self.state.bucket_stamps[bucket], &mut self.state.epoch);
+    }
+    /// Puts a published entry at the head of its chain. Constant work.
+    pub(crate) fn chain_insert(&mut self, index: usize) {
+        let (parent, name) = self.entry_key(index);
+        let bucket = name_bucket(parent, name);
+        self.touch_name(parent, bucket);
+        let head = self.state.name_heads[bucket];
+        self.state.name_next[index] = head;
+        self.state.name_prev[index] = NONE;
+        if head != NONE {
+            self.state.name_prev[head as usize] = index as u16;
+        }
+        self.state.name_heads[bucket] = index as u16;
+    }
+    /// The cookie of an entry: the position it keeps in its directory.
+    pub(crate) fn entry_cookie(&self, index: usize) -> u64 {
+        #[cfg(test)]
+        tests_support::COOKIE_LINKS.with(|count| count.set(count.get() + 1));
+        if index < self.state.original_len {
+            3 + index as u64
+        } else {
+            self.state.dentries[index - self.state.original_len].cookie
+        }
+    }
+    /// Appends a newly published name. Its cookie was allocated at commit.
+    pub(crate) fn publish(&mut self, index: usize) {
+        let parent = self.entry_key(index).0.slot as usize;
+        self.publish_at(index, self.state.children[parent][1], NONE);
+    }
+    /// Inserts a replacement at the removed destination's exact position.
+    pub(crate) fn publish_at(&mut self, index: usize, after: u16, next: u16) {
+        self.chain_insert(index);
+        let parent = self.entry_key(index).0.slot as usize;
+        self.state.child_prev[index] = after;
+        self.state.child_next[index] = next;
+        if after == NONE {
+            self.state.children[parent][0] = index as u16;
+        } else {
+            self.state.child_next[after as usize] = index as u16;
+        }
+        if next == NONE {
+            self.state.children[parent][1] = index as u16;
+        } else {
+            self.state.child_prev[next as usize] = index as u16;
+        }
+        self.state.nodes[parent].names += 1;
+    }
+    /// The entry stops being a name; its parent and name are still the
+    /// published ones.
+    pub(crate) fn unpublish(&mut self, index: usize) {
+        self.chain_remove(index);
+        let parent = self.entry_key(index).0.slot as usize;
+        let prev = self.state.child_prev[index];
+        let next = self.state.child_next[index];
+        if prev == NONE {
+            self.state.children[parent][0] = next;
+        } else {
+            self.state.child_next[prev as usize] = next;
+        }
+        if next == NONE {
+            self.state.children[parent][1] = prev;
+        } else {
+            self.state.child_prev[next as usize] = prev;
+        }
+        self.state.child_next[index] = NONE;
+        self.state.child_prev[index] = NONE;
+        self.state.nodes[parent].names -= 1;
+    }
+    /// The first name of the directory after `cookie`, and the one after
+    /// the entry `hint` when that entry is the one the cookie belongs to.
+    /// Without a hint the walk goes from the head of the list, or from the
+    /// entry `scan` of an earlier call when that entry still stands before
+    /// the cookie, and takes at most `LIST_PORTION` links: the entry it
+    /// reached is the `scan` of the next call.
+    pub(crate) fn child_after(&self, dir: Token, cookie: u64, hint: u16, scan: u16) -> Walk {
+        let Some(children) = self.state.children.get(dir.slot as usize) else {
+            return Walk::End;
+        };
+        let last = children[1];
+        if last == NONE || self.entry_cookie(last as usize) <= cookie {
+            return Walk::End;
+        }
+        if hint != NONE
+            && (hint as usize) < self.entries()
+            && self.published(hint as usize)
+            && self.entry_key(hint as usize).0 == dir
+            && self.entry_cookie(hint as usize) == cookie
+        {
+            return match self.state.child_next[hint as usize] {
+                NONE => Walk::End,
+                next => Walk::Found(next as usize),
+            };
+        }
+        let mut at = children[0];
+        if scan != NONE
+            && (scan as usize) < self.entries()
+            && self.published(scan as usize)
+            && self.entry_key(scan as usize).0 == dir
+            && self.entry_cookie(scan as usize) <= cookie
+        {
+            at = self.state.child_next[scan as usize];
+        }
+        let mut reached = scan;
+        for _ in 0..LIST_PORTION {
+            if at == NONE {
+                return Walk::End;
+            }
+            if self.entry_cookie(at as usize) > cookie {
+                return Walk::Found(at as usize);
+            }
+            reached = at;
+            at = self.state.child_next[at as usize];
+        }
+        Walk::More(reached)
+    }
+    /// The entry after `index` in the list of its directory.
+    pub(crate) fn child_next(&self, index: usize) -> Option<usize> {
+        Some(self.state.child_next[index] as usize).filter(|&i| i != NONE as usize)
+    }
+    /// The first name of the directory, if it has one.
+    pub(crate) fn first_child(&self, dir: Token) -> Option<usize> {
+        let first = self.state.children.get(dir.slot as usize)?[0];
+        (first != NONE).then_some(first as usize)
+    }
+    /// The cookie of the last name of the directory, 2 when it has none.
+    pub(crate) fn last_cookie(&self, dir: Token) -> u64 {
+        match self.state.children.get(dir.slot as usize).map(|c| c[1]) {
+            Some(last) if last != NONE => self.entry_cookie(last as usize),
+            _ => 2,
+        }
+    }
+    /// The published name of an entry with its cookie and node.
+    pub(crate) fn entry_record(&self, index: usize) -> Option<(u64, &[u8], Token)> {
+        if index >= self.entries() || !self.published(index) {
+            return None;
+        }
+        let name = self.entry_key(index).1;
+        let node = if index < self.state.original_len {
+            self.state.originals[index].node
+        } else {
+            self.state.dentries[index - self.state.original_len].node
+        };
+        Some((self.entry_cookie(index), name, node))
+    }
+    pub(crate) fn published(&self, index: usize) -> bool {
+        if index < self.state.original_len {
+            !self.state.originals[index].hidden
+        } else {
+            let d = &self.state.dentries[index - self.state.original_len];
+            d.len != 0 && !d.reserved
+        }
+    }
+    /// Takes an entry out of its chain; its parent and name are still the
+    /// published ones. Constant work.
+    pub(crate) fn chain_remove(&mut self, index: usize) {
+        let (parent, name) = self.entry_key(index);
+        let bucket = name_bucket(parent, name);
+        self.touch_name(parent, bucket);
+        let prev = self.state.name_prev[index];
+        let next = self.state.name_next[index];
+        if prev == NONE {
+            self.state.name_heads[bucket] = next;
+        } else {
+            self.state.name_next[prev as usize] = next;
+        }
+        if next != NONE {
+            self.state.name_prev[next as usize] = prev;
+        }
+        self.state.name_next[index] = NONE;
+        self.state.name_prev[index] = NONE;
     }
     pub fn resolve(&self, path: &[u8]) -> Result<Token, u32> {
         let mut token = ROOT;
@@ -1211,13 +1610,11 @@ impl<'a> Storage<'a> {
         {
             return Err(NO_SPACE);
         }
-        let next = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
         self.state.inode_len -= 1;
         let i = self.state.inode_free[self.state.inode_len] as usize;
         self.state.overlays[i].initialize(token.slot, a as u16);
         self.state.nodes[token.slot as usize].overlay = i as u16;
         self.state.accounts[a].as_mut().unwrap().usage.inodes += 1;
-        self.state.epoch = next;
         Ok(i)
     }
     pub fn reserve(
@@ -1313,7 +1710,6 @@ impl<'a> Storage<'a> {
             slot: (ORIGINALS + i) as u16,
             generation,
         };
-        let cookie = self.next_directory_cookie()?;
         self.state.inode_len -= 1;
         self.state.dentry_len -= 1;
         let d = self.state.dentry_free[self.state.dentry_len] as usize;
@@ -1337,7 +1733,6 @@ impl<'a> Storage<'a> {
             len: name.len() as u8,
             root: a as u16,
             reserved: true,
-            cookie,
             ..Dentry::EMPTY
         };
         entry.name[..name.len()].copy_from_slice(name);
@@ -1349,6 +1744,9 @@ impl<'a> Storage<'a> {
             token,
             dentry: d as u16,
             epoch: self.state.epoch,
+            bucket: name_bucket(parent, name) as u16,
+            stamp: self.stamp(name_bucket(parent, name)),
+            name_gen: self.name_gen(parent)?,
             place: place as u16,
             root: a as u16,
         };
@@ -1371,7 +1769,10 @@ impl<'a> Storage<'a> {
         {
             return Err(proto_fs::PERMISSION);
         }
-        if r.epoch != self.state.epoch {
+        let parent = self.state.dentries[r.dentry as usize].parent;
+        if r.epoch != self.state.epoch
+            || !self.name_unchanged(parent, r.bucket, r.stamp, r.name_gen)?
+        {
             return Err(proto_fs::STALE_PROOF);
         }
         Ok(r.token)
@@ -1413,10 +1814,18 @@ impl<'a> Storage<'a> {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         let d = self.state.dentries[reservation.dentry as usize];
-        if !d.reserved || d.node != reservation.token || reservation.epoch != self.state.epoch {
+        if !d.reserved
+            || d.node != reservation.token
+            || reservation.epoch != self.state.epoch
+            || !self.name_unchanged(
+                d.parent,
+                reservation.bucket,
+                reservation.stamp,
+                reservation.name_gen,
+            )?
+        {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
-        let next = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
         let directory = self.node(reservation.token)?.kind == crate::DIR;
         let parent = self.node(d.parent)?;
         if parent.links == 0 {
@@ -1430,15 +1839,20 @@ impl<'a> Storage<'a> {
         } else {
             parent.links
         };
+        self.name_change_room(&[Some((d.parent, reservation.bucket))], false)?;
+        let cookie = self.next_directory_cookie()?;
+        self.state.dentries[reservation.dentry as usize].cookie = cookie;
         self.state.dentries[reservation.dentry as usize].reserved = false;
+        let entry = self.state.original_len + reservation.dentry as usize;
+        self.publish(entry);
         let n = &mut self.state.nodes[reservation.token.slot as usize];
         n.pins[Pin::Pending.index()] -= 1;
         n.links = if n.kind == crate::DIR { 2 } else { 1 };
         if n.kind == crate::DIR {
+            n.name_entry = entry as u16;
             self.state.nodes[d.parent.slot as usize].links = parent_links;
         }
         self.unpin(d.parent, Pin::Pending)?;
-        self.state.epoch = next;
         self.state.pending[reservation.place as usize] = None;
         Ok(reservation.token)
     }
@@ -1513,7 +1927,11 @@ impl<'a> Storage<'a> {
     }
 
     fn drop_dentry(&mut self, i: usize) {
-        let root = self.state.dentries[i].root as usize;
+        let d = self.state.dentries[i];
+        if d.len != 0 && !d.reserved {
+            self.unpublish(self.state.original_len + i);
+        }
+        let root = d.root as usize;
         self.state.dentries[i] = Dentry::EMPTY;
         self.state.dentry_free[self.state.dentry_len] = i as u16;
         self.state.dentry_len += 1;
@@ -1621,11 +2039,6 @@ impl<'a> Storage<'a> {
             .data_generation
             .checked_add(1)
             .ok_or(NO_SPACE)?;
-        let permission_epoch = if self.node(token)?.mode & 0o6000 != 0 {
-            Some(self.state.epoch.checked_add(1).ok_or(NO_SPACE)?)
-        } else {
-            None
-        };
         let first = offset / PAGE;
         let last = (end - 1) / PAGE;
         let existing = self.node(token)?.overlay;
@@ -1675,10 +2088,7 @@ impl<'a> Storage<'a> {
         self.state.nodes[token.slot as usize].length =
             self.state.nodes[token.slot as usize].length.max(end as u64);
         self.state.nodes[token.slot as usize].data_generation = data_generation;
-        if let Some(epoch) = permission_epoch {
-            self.state.nodes[token.slot as usize].mode &= !0o6000;
-            self.state.epoch = epoch;
-        }
+        self.state.nodes[token.slot as usize].mode &= !0o6000;
         Ok(bytes.len())
     }
     /// All fallible preflight precedes the single detachment of a live file's data.
@@ -1689,7 +2099,6 @@ impl<'a> Storage<'a> {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         let data_generation = node.data_generation.checked_add(1).ok_or(NO_SPACE)?;
-        let epoch = self.state.epoch.checked_add(1).ok_or(NO_SPACE)?;
         let overlay = node.overlay;
         let chain = if overlay == NONE {
             RetiredPages::EMPTY
@@ -1723,10 +2132,13 @@ impl<'a> Storage<'a> {
         node.data_generation = data_generation;
         node.times[1] = now;
         node.times[2] = now;
-        self.state.epoch = epoch;
         Ok(())
     }
     /// One page or inode slot per call, alternating two independently paid queues.
+    /// The nodes that wait for reclamation.
+    pub fn reclaim_backlog(&self) -> usize {
+        self.state.reclaim_len
+    }
     pub fn reclaim_step(&mut self) -> bool {
         if self.state.retired_len != 0 && (self.state.reclaim_len == 0 || self.state.retired_turn) {
             self.state.retired_turn = false;
@@ -1759,9 +2171,12 @@ impl<'a> Storage<'a> {
             return false;
         }
         let i = self.state.reclaim_queue[self.state.reclaim_head] as usize;
-        let overlay = self.state.overlays[i];
-        if overlay.head != NONE {
-            let page = overlay.head;
+        let (head, owner, root) = {
+            let overlay = &self.state.overlays[i];
+            (overlay.head, overlay.node, overlay.root)
+        };
+        if head != NONE {
+            let page = head;
             let p = self.state.page_logical[page as usize] as usize;
             self.state.overlays[i].head = self.state.page_next[page as usize];
             self.state.overlays[i].pages[p] = NONE;
@@ -1769,23 +2184,31 @@ impl<'a> Storage<'a> {
                 self.state.overlays[i].group_tail[p / 64] = NONE;
             }
             self.state.overlays[i].mapped_count -= 1;
-            self.state.overlays[i].shadow_boot_sectors -= boot_sectors(
-                p,
-                self.state.nodes[overlay.node as usize].boot_visible_length,
-            );
+            self.state.overlays[i].shadow_boot_sectors -=
+                boot_sectors(p, self.state.nodes[owner as usize].boot_visible_length);
             self.state.page_free[self.state.page_len] = page;
             self.state.page_len += 1;
-            self.uncharge(overlay.root as usize, |u| &mut u.pages);
+            self.uncharge(root as usize, |u| &mut u.pages);
         } else {
-            let node = self.state.nodes[overlay.node as usize];
-            self.state.nodes[overlay.node as usize] = Node {
+            let node = self.state.nodes[owner as usize];
+            self.state.nodes[owner as usize] = Node {
                 generation: node.generation,
                 ..Node::EMPTY
             };
-            self.state.overlays[i] = Overlay::EMPTY;
+            // The page steps left the rest as a free slot has it: no page, no
+            // group tail, no count. Writing the two owner fields is all that
+            // remains, where the whole record is 4 KiB of work.
+            debug_assert!(
+                self.state.overlays[i].pages.iter().all(|&p| p == NONE)
+                    && self.state.overlays[i].group_tail.iter().all(|&t| t == NONE)
+                    && self.state.overlays[i].mapped_count == 0
+                    && self.state.overlays[i].shadow_boot_sectors == 0
+            );
+            self.state.overlays[i].node = NONE;
+            self.state.overlays[i].root = NONE;
             self.state.inode_free[self.state.inode_len] = i as u16;
             self.state.inode_len += 1;
-            self.uncharge(overlay.root as usize, |u| &mut u.inodes);
+            self.uncharge(root as usize, |u| &mut u.inodes);
             self.state.reclaim_head = (self.state.reclaim_head + 1) % INODES;
             self.state.reclaim_len -= 1;
             if node.orphan_parent {
@@ -1972,23 +2395,25 @@ mod directory_cookie_tests {
             .unwrap();
         assert_eq!(
             ram.storage.state.dentries[reserved.dentry as usize].cookie,
-            i64::MAX as u64 - 1
+            0
         );
+        ram.storage.commit(reserved).unwrap();
         assert_eq!(ram.storage.state.next_cookie, i64::MAX as u64);
+        let over = ram
+            .storage
+            .reserve(EXPENSE, ROOT, b"over", (crate::REG, 0o644, 0, 0))
+            .unwrap();
         let before = ram.storage.available();
         let usage = ram.storage.usage(EXPENSE);
         let pins = ram.storage.node(ROOT).unwrap().pins;
         let epoch = ram.storage.state.epoch;
-        assert_eq!(
-            ram.storage
-                .reserve(EXPENSE, ROOT, b"over", (crate::REG, 0o644, 0, 0)),
-            Err(NO_SPACE)
-        );
+        assert_eq!(ram.storage.commit(over), Err(NO_SPACE));
         assert_eq!(ram.storage.available(), before);
         assert_eq!(ram.storage.usage(EXPENSE), usage);
         assert_eq!(ram.storage.node(ROOT).unwrap().pins, pins);
         assert_eq!(ram.storage.state.epoch, epoch);
-        ram.storage.cancel(reserved).unwrap();
+        ram.storage.cancel(over).unwrap();
+        ram.storage.unlink(ROOT, b"last", EXPENSE).unwrap();
         while ram.storage.reclaim_step() {}
         assert_eq!(ram.storage.usage(EXPENSE), Usage::EMPTY);
         assert_eq!(ram.storage.state.next_cookie, i64::MAX as u64);
@@ -2719,5 +3144,172 @@ mod root_sorted_review {
             assert_eq!(&bytes, b"XY");
             chain(storage, token);
         }
+    }
+}
+
+/// The name index checked against the tables, for the host tests.
+#[cfg(test)]
+mod index_check {
+    extern crate std;
+    use super::*;
+    use std::vec;
+
+    impl Storage<'_> {
+        /// Panics unless every published name is in exactly the chain of its
+        /// key, no other entry is in a chain, the links agree both ways, and
+        /// the counts and back references of the directories are exact.
+        pub(crate) fn check_name_index(&self) {
+            let total = self.entries();
+            let mut seen = vec![false; total];
+            for bucket in 0..BUCKETS {
+                let mut previous = NONE;
+                let mut at = self.state.name_heads[bucket];
+                let mut guard = 0;
+                while at != NONE {
+                    let i = at as usize;
+                    assert!(i < total, "a chain leaves the table");
+                    assert!(!seen[i], "entry {i} is in a chain twice");
+                    seen[i] = true;
+                    assert!(self.published(i), "entry {i} is not published");
+                    let (parent, name) = self.entry_key(i);
+                    assert_eq!(name_bucket(parent, name), bucket, "entry {i} in a bucket");
+                    assert_eq!(self.state.name_prev[i], previous, "entry {i} back link");
+                    previous = at;
+                    at = self.state.name_next[i];
+                    guard += 1;
+                    assert!(guard <= total, "a chain loops");
+                }
+            }
+            let mut listed = vec![false; total];
+            for slot in 0..NODES {
+                let mut previous = NONE;
+                let mut cookie = 0;
+                let mut count = 0;
+                let mut at = self.state.children[slot][0];
+                while at != NONE {
+                    let i = at as usize;
+                    assert!(i < total && !listed[i], "listing of {slot} loops");
+                    listed[i] = true;
+                    assert!(self.published(i));
+                    assert_eq!(self.entry_key(i).0.slot as usize, slot, "entry {i} listed");
+                    assert!(self.entry_cookie(i) > cookie, "cookies of {slot} rise");
+                    cookie = self.entry_cookie(i);
+                    assert_eq!(self.state.child_prev[i], previous, "entry {i} back link");
+                    previous = at;
+                    at = self.state.child_next[i];
+                    count += 1;
+                }
+                assert_eq!(self.state.children[slot][1], previous, "end of {slot}");
+                assert_eq!(
+                    u32::from(self.state.nodes[slot].names),
+                    count,
+                    "count of {slot}"
+                );
+            }
+            for (i, &is_listed) in listed.iter().enumerate() {
+                assert_eq!(is_listed, self.published(i), "entry {i} listed or not");
+                if !is_listed {
+                    assert_eq!(self.state.child_next[i], NONE, "entry {i} child next");
+                    assert_eq!(self.state.child_prev[i], NONE, "entry {i} child prev");
+                }
+            }
+            let mut names = vec![0u32; NODES];
+            for i in 0..total {
+                assert_eq!(seen[i], self.published(i), "entry {i} membership");
+                if !seen[i] {
+                    assert_eq!(self.state.name_next[i], NONE, "entry {i} next");
+                    assert_eq!(self.state.name_prev[i], NONE, "entry {i} prev");
+                } else {
+                    names[self.entry_key(i).0.slot as usize] += 1;
+                }
+            }
+            for (slot, node) in self.state.nodes.iter().enumerate() {
+                if node.kind == 0 {
+                    continue;
+                }
+                assert_eq!(u32::from(node.names), names[slot], "names of node {slot}");
+                if node.kind == crate::DIR && slot != 0 && node.links != 0 {
+                    let (name, target) = self
+                        .entry(node.parent, node.name_entry as usize)
+                        .unwrap_or_else(|| panic!("directory {slot} has no name entry"));
+                    assert_eq!(target.slot as usize, slot, "name of directory {slot}");
+                    assert!(!name.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod counter_wrap_tests {
+    use super::*;
+    const EXPENSE: Root = Root {
+        id: 11,
+        generation: 7,
+    };
+    #[test]
+    fn each_name_counter_wrap_invalidates_an_old_creation_reservation() {
+        for (names, bucket) in [(false, true), (true, false), (true, true)] {
+            let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+            let slot = name_bucket(ROOT, b"new");
+            ram.storage.state.nodes[ROOT.slot as usize].name_gen = 0;
+            ram.storage.state.bucket_stamps[slot] = 0;
+            let old = ram
+                .storage
+                .reserve(EXPENSE, ROOT, b"new", (crate::REG, 0o644, 0, 0))
+                .unwrap();
+            if names {
+                ram.storage.state.nodes[ROOT.slot as usize].name_gen = u32::MAX;
+            }
+            if bucket {
+                ram.storage.state.bucket_stamps[slot] = u32::MAX;
+            }
+            let rival = ram
+                .storage
+                .reserve(EXPENSE, ROOT, b"new", (crate::REG, 0o644, 0, 0))
+                .unwrap();
+            let epoch = ram.storage.state.epoch;
+            ram.storage.commit(rival).unwrap();
+            assert_eq!(
+                ram.storage.reserved_token(old, EXPENSE),
+                Err(proto_fs::STALE_PROOF)
+            );
+            assert_eq!(ram.storage.commit(old), Err(proto_fs::INVALID_ARGUMENT));
+            assert_eq!(ram.storage.lookup(ROOT, b"new"), Ok(rival.token));
+            assert_eq!(
+                ram.storage.state.epoch,
+                epoch + u64::from(names) + u64::from(bucket)
+            );
+            ram.storage.cancel(old).unwrap();
+            ram.storage.check_name_index();
+        }
+    }
+    #[test]
+    fn exhausted_epoch_refuses_name_and_access_wrap_before_writes() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let pending = ram
+            .storage
+            .reserve(EXPENSE, ROOT, b"new", (crate::REG, 0o644, 0, 0))
+            .unwrap();
+        ram.storage.state.epoch = u64::MAX;
+        // Capture the final epoch in a fresh reservation.
+        ram.storage.cancel(pending).unwrap();
+        let pending = ram
+            .storage
+            .reserve(EXPENSE, ROOT, b"new", (crate::REG, 0o644, 0, 0))
+            .unwrap();
+        ram.storage.state.bucket_stamps[pending.bucket as usize] = u32::MAX;
+        let cookie = ram.storage.state.next_cookie;
+        let usage = ram.storage.usage(EXPENSE);
+        assert_eq!(ram.storage.commit(pending), Err(NO_SPACE));
+        assert_eq!(ram.storage.state.next_cookie, cookie);
+        assert_eq!(ram.storage.usage(EXPENSE), usage);
+        assert_eq!(ram.storage.lookup(ROOT, b"new"), Err(NO_ENTRY));
+        ram.storage.cancel(pending).unwrap();
+        ram.storage.state.nodes[ROOT.slot as usize].access_gen = u32::MAX;
+        let mode = ram.storage.node(ROOT).unwrap().mode;
+        assert_eq!(ram.storage.set_attributes(ROOT, 0o700, 1, 2), Err(NO_SPACE));
+        assert_eq!(ram.storage.node(ROOT).unwrap().mode, mode);
+        assert_eq!(ram.storage.node(ROOT).unwrap().access_gen, u32::MAX);
     }
 }
