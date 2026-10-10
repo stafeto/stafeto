@@ -12,6 +12,8 @@ use proto_fs::{MAX_READ, MAX_WRITE, Metadata, Method, valid_path};
 use proto_uart::{ReadReply, ReadRequest, WriteReply, WriteRequest};
 use proto_wire::{Reader, Status, Writer};
 
+mod change_release_reply;
+
 /// A console transport snapshot, without a borrow of the file owner.
 /// It carries no application buffer or file-state pointer. The owning Files
 /// must remain alive while this snapshot is used; it does not retain a UART
@@ -1522,8 +1524,8 @@ impl Files {
         let mut request = Writer::new();
         Method::ChangeRelease.header().write(&mut request)?;
         proto_fs::write_key_body(&mut request, key)?;
-        let (reply, length) = self.change_send(&request)?;
-        Self::change_status_only(&reply[..length])
+        let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
+        change_release_reply::read(&reply.words, reply.len, reply.handles.len())
     }
 
     /// A path against a base, for the requests that read: the node information

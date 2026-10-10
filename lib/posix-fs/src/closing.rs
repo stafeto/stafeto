@@ -24,6 +24,7 @@ impl PosixFs {
     pub fn close_snapshot(&self, token: CloseToken) -> Result<Snapshot, FsError> {
         self.descriptors
             .close_snapshot(token)
+            .map(snapshot_frame)
             .map_err(FsError::from)
     }
     pub fn close_place(&self, owner: OwnerToken) -> JobPlace {
@@ -42,9 +43,15 @@ impl PosixFs {
         frame: Frame,
     ) -> Result<Admission, FsError> {
         match owner {
-            Some(owner) => self.descriptors.begin_close(owner, fd, frame),
-            None => self.descriptors.begin_close_unowned(fd, frame),
+            Some(owner) => {
+                self.descriptors
+                    .begin_close(owner, fd, super::control::Recovery::change(frame))
+            }
+            None => self
+                .descriptors
+                .begin_close_unowned(fd, super::control::Recovery::change(frame)),
         }
+        .map(admission_frame)
         .map_err(FsError::from)
     }
     pub fn begin_replace_record(
@@ -56,13 +63,21 @@ impl PosixFs {
         frame: Frame,
     ) -> Result<Admission, FsError> {
         match owner {
-            Some(owner) => self
-                .descriptors
-                .begin_replace(owner, source, target, flags, frame),
-            None => self
-                .descriptors
-                .begin_replace_unowned(source, target, flags, frame),
+            Some(owner) => self.descriptors.begin_replace(
+                owner,
+                source,
+                target,
+                flags,
+                super::control::Recovery::change(frame),
+            ),
+            None => self.descriptors.begin_replace_unowned(
+                source,
+                target,
+                flags,
+                super::control::Recovery::change(frame),
+            ),
         }
+        .map(admission_frame)
         .map_err(FsError::from)
     }
     pub fn finish_close_record(&mut self, token: CloseToken) -> Result<Option<Target>, FsError> {
@@ -87,6 +102,32 @@ impl PosixFs {
             .map_err(FsError::from)
     }
     pub fn abandon_close_owner(&mut self, owner: OwnerToken) -> Option<(CloseToken, Snapshot)> {
-        self.descriptors.abandon_close_owner(owner)
+        self.descriptors
+            .abandon_close_owner(owner)
+            .map(|(token, snapshot)| (token, snapshot_frame(snapshot)))
+    }
+}
+
+fn snapshot_frame(snapshot: CloseSnapshot<Target, super::control::Recovery>) -> Snapshot {
+    CloseSnapshot {
+        owner: snapshot.owner,
+        recovery: snapshot.recovery.frame(),
+        entry: snapshot.entry,
+        backend: snapshot.backend,
+        last_alias: snapshot.last_alias,
+        replacement: snapshot.replacement,
+        complete: snapshot.complete,
+        release: snapshot.release,
+    }
+}
+fn admission_frame(admission: CloseAdmission<Target, super::control::Recovery>) -> Admission {
+    match admission {
+        CloseAdmission::Started { token, snapshot } => CloseAdmission::Started {
+            token,
+            snapshot: snapshot_frame(snapshot),
+        },
+        CloseAdmission::PendingOpen(token) => CloseAdmission::PendingOpen(token),
+        CloseAdmission::PendingClose(token) => CloseAdmission::PendingClose(token),
+        CloseAdmission::Replaced(number) => CloseAdmission::Replaced(number),
     }
 }

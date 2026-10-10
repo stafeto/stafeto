@@ -123,6 +123,7 @@ pub fn cancel(
     let Some(id) = id else {
         return Ok((reply(Err(super::actor::Error::Cancelled)), false));
     };
+    queue.request_cancel(id)?;
     let (_, phase, _) = queue.snapshot(id)?;
     if phase == super::jobs::Phase::Queued {
         queue.complete_queued(id, reply(Err(super::actor::Error::Cancelled)))?;
@@ -203,6 +204,34 @@ pub fn begin(
 }
 
 /// The canonical actor result precedes releasing cancelled request custody.
+pub fn finish_with_source(
+    queue: &mut Queue,
+    ram: &mut Ram<'_>,
+    result: Result<Response, super::actor::Error>,
+    fds: Option<&Fds>,
+    pid_live: impl FnOnce(u32) -> bool,
+) -> bool {
+    if result == Err(super::actor::Error::Cancelled) {
+        let id = queue.active().expect("exact active lock request");
+        let captured = queue.snapshot(id).expect("active capture").0;
+        let source_live = fds
+            .filter(|fds| !fds.departed)
+            .and_then(|fds| ram.live_description(fds, captured.source).ok())
+            .is_some_and(|(inode, _)| inode == captured.request.inode);
+        let owner_live = match captured.request.owner {
+            super::Owner::Process(pid) => pid_live(pid),
+            super::Owner::Description { slot, generation } => ram
+                .lock_parts()
+                .1
+                .live(crate::storage::Token { slot, generation }),
+        };
+        if source_live && owner_live && queue.retry_active().expect("active retry") {
+            return false;
+        }
+    }
+    finish(queue, ram, result)
+}
+
 pub fn finish(
     queue: &mut Queue,
     ram: &mut Ram<'_>,

@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Exact resident Control drives lock requests outside the descriptor-table lock.
+
+use crate::constants;
+use constants::{EBADF, EIO, ENOLCK};
+use posix_fs::Transport;
+use posix_fs::change::{ControlClaimToken, ControlPhase, ControlResult, ControlToken, OwnerToken};
+use posix_fs::control::{CancelReason, Input, TerminalReply};
+use proto_fs::{LockReply, Method};
+use proto_wire::{Reader, Status, Writer};
+use rt::abi as inline_abi;
+
+mod core;
+mod local;
+mod local_types {
+    pub(super) use posix_fs::change::{
+        ControlClaimToken, ControlPhase, ControlResult, ControlToken, OwnerToken,
+    };
+    pub(super) use posix_fs::{FsError, PosixFs, control};
+}
+mod reply_bytes;
+mod status;
+use core::{Failure, Phase, Session, State};
+
+#[cfg(feature = "lock-probe")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Probe {
+    Start,
+    Query,
+    Cancel,
+    Release,
+}
+#[cfg(feature = "lock-probe")]
+static HOOK: ::core::sync::atomic::AtomicUsize = ::core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "lock-probe")]
+pub fn probe_hook(hook: Option<fn(Probe, ControlToken) -> bool>) {
+    HOOK.store(
+        hook.map_or(0, |hook| hook as usize),
+        ::core::sync::atomic::Ordering::Release,
+    );
+}
+#[cfg(feature = "lock-probe")]
+fn probed(method: Method, token: ControlToken) -> bool {
+    let phase = match method {
+        Method::LockStart => Probe::Start,
+        Method::LockQuery => Probe::Query,
+        Method::LockCancel => Probe::Cancel,
+        Method::LockRelease => Probe::Release,
+        _ => return false,
+    };
+    let raw = HOOK.load(::core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: probe_hook stores exactly a function with this signature.
+    let hook = unsafe { ::core::mem::transmute::<usize, fn(Probe, ControlToken) -> bool>(raw) };
+    hook(phase, token)
+}
+
+fn failure(status: Status) -> Failure {
+    match status {
+        Status::Kernel(rt::abi::Error::Interrupted) => Failure::Interrupted,
+        Status::Unknown(proto_fs::JOBS_FULL) => Failure::Room,
+        Status::Unknown(proto_fs::AUTHENTICATING) => Failure::Authenticating,
+        Status::Unknown(proto_fs::RESOLVING) => Failure::Resolving,
+        Status::Unknown(proto_fs::OPEN_RETIRED) => Failure::Retired,
+        Status::Unknown(code) => Failure::Rejected(code),
+        error => Failure::Fatal(crate::error(error.into())),
+    }
+}
+
+struct Live {
+    token: ControlToken,
+    claim: Option<ControlClaimToken>,
+    owner: Option<OwnerToken>,
+    transport: Transport,
+    room_repeats: u32,
+}
+impl Live {
+    /// One native request; a helper never runs an implicit Bind inside its turn.
+    fn send(&self, request: &Writer) -> Result<rt::sys::Reply, Failure> {
+        let files = self.transport.files();
+        let response = rt::sys::send(files.sessions().0, request.as_bytes())
+            .map_err(|error| failure(Status::Kernel(error)))?;
+        #[cfg(feature = "lock-probe")]
+        {
+            let bytes = request.as_bytes();
+            if let Some(method) = Method::from_number(u16::from_le_bytes([bytes[0], bytes[1]]))
+                && probed(method, self.token)
+            {
+                return Err(Failure::Interrupted);
+            }
+        }
+        Ok(response)
+    }
+    fn decode(&self, response: rt::sys::Reply) -> Result<LockReply, Failure> {
+        if !response.handles.is_empty() {
+            return Err(Failure::Fatal(EIO));
+        }
+        let bytes = reply_bytes::InlineReply::read(&response.words, response.len)?;
+        let bytes = bytes.as_bytes();
+        let mut status = Reader::new(bytes);
+        let code = status.u32().map_err(failure)?;
+        if code != 0 {
+            status::read(bytes).map_err(failure)?;
+            return Err(failure(Status::from_code(code)));
+        }
+        LockReply::read(Reader::new(bytes)).map_err(failure)
+    }
+    fn keyed(&self, method: Method) -> Result<LockReply, Failure> {
+        let mut request = Writer::new();
+        proto_fs::write_lock_key(method, self.key(), &mut request).map_err(failure)?;
+        self.decode(self.send(&request)?)
+    }
+    fn key(&self) -> proto_fs::OpenKey {
+        proto_fs::OpenKey {
+            slot: self.token.slot() as u32,
+            generation: self.token.generation(),
+        }
+    }
+}
+impl Session for Live {
+    type Completion = LockReply;
+    fn state(&mut self) -> Result<State, i32> {
+        crate::shared::with_files(|files| {
+            let Some(snapshot) =
+                local::snapshot(files, self.token, self.owner).map_err(crate::error)?
+            else {
+                return Ok(State {
+                    phase: Phase::Gone,
+                    claim_live: false,
+                    saved: false,
+                });
+            };
+            let lock = snapshot.recovery.lock().ok_or(EIO)?;
+            if snapshot.result.is_some() != lock.outcome().is_some() {
+                return Err(EIO);
+            }
+            Ok(State {
+                phase: match snapshot.phase {
+                    ControlPhase::Working => Phase::Live,
+                    ControlPhase::Complete | ControlPhase::CleanupRequired => Phase::Complete,
+                    ControlPhase::Cleaning => Phase::Cleaning,
+                    ControlPhase::Cleaned => Phase::Cleaned,
+                },
+                claim_live: self.claim.is_some_and(|claim| files.lock_is_live(claim)),
+                saved: snapshot.result.is_some(),
+            })
+        })
+    }
+    fn start(&mut self) -> Result<LockReply, Failure> {
+        let wire = crate::shared::with_files(|files| {
+            let claim = self.claim.ok_or(EIO)?;
+            if !files.lock_is_live(claim) {
+                return Ok(None);
+            }
+            let snapshot = files.lock_snapshot(self.token).map_err(crate::error)?;
+            Ok(Some(
+                snapshot.recovery.lock().ok_or(EIO)?.request(self.token),
+            ))
+        })
+        .map_err(Failure::Fatal)?;
+        let Some(wire) = wire else {
+            return Err(Failure::Retired);
+        };
+        let mut request = Writer::new();
+        wire.write(&mut request).map_err(failure)?;
+        self.decode(self.send(&request)?)
+    }
+    fn query(&mut self) -> Result<LockReply, Failure> {
+        self.keyed(Method::LockQuery)
+    }
+    fn cancel(&mut self) -> Result<LockReply, Failure> {
+        self.keyed(Method::LockCancel)
+    }
+    // Keep Release storage separate from Cancel and Query cleanup turns.
+    #[inline(never)]
+    fn release(&mut self) -> Result<(), Failure> {
+        let mut request = Writer::new();
+        proto_fs::write_lock_key(Method::LockRelease, self.key(), &mut request).map_err(failure)?;
+        let response = self.send(&request)?;
+        if !response.handles.is_empty() {
+            return Err(Failure::Fatal(EIO));
+        }
+        let bytes = reply_bytes::InlineReply::read(&response.words, response.len)?;
+        let code = status::read(bytes.as_bytes()).map_err(failure)?;
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(failure(Status::from_code(code)))
+        }
+    }
+    fn authenticate(&mut self) -> Result<(), Failure> {
+        self.transport.files().finish_binding().map_err(failure)
+    }
+    fn pause(&mut self, room: bool) {
+        if room {
+            let pause = posix_change::room_pause_ns(self.room_repeats);
+            self.room_repeats = self.room_repeats.saturating_add(1);
+            let _ = crate::threads::sleep::pause(pause);
+        } else {
+            let _ = rt::sys::yield_now();
+        }
+    }
+    fn publish(&mut self, reply: LockReply) -> Result<(), i32> {
+        let terminal = TerminalReply::from_reply(reply).map_err(crate::error)?;
+        crate::shared::with_files(|files| {
+            let Some(snapshot) =
+                local::snapshot(files, self.token, self.owner).map_err(crate::error)?
+            else {
+                return Ok(());
+            };
+            if snapshot.result.is_some() {
+                return Ok(());
+            }
+            let lock = snapshot.recovery.lock().ok_or(EIO)?;
+            let result = if reply.result == 0 {
+                ControlResult::Value(0)
+            } else {
+                let errno = if reply.result == proto_fs::LOCK_CANCELLED {
+                    match lock.cancel_reason() {
+                        CancelReason::Close => EBADF,
+                        CancelReason::Abandoned => EIO,
+                    }
+                } else {
+                    match crate::lock_fields::terminal_result(reply.result) {
+                        Err(errno) if errno != EIO => errno,
+                        _ => crate::error(Status::Unknown(reply.result).into()),
+                    }
+                };
+                ControlResult::Failed(errno)
+            };
+            local::publish(files, self.token, self.claim, self.owner, result, terminal)
+                .map_err(crate::error)?;
+            Ok(())
+        })
+    }
+    fn begin_cleanup(&mut self) -> Result<(), i32> {
+        crate::shared::with_files(|files| {
+            local::begin(files, self.token, self.owner).map_err(crate::error)
+        })
+    }
+    fn finish_cleanup(&mut self) -> Result<(), i32> {
+        crate::shared::with_files(|files| {
+            local::finish(files, self.token, self.owner).map_err(crate::error)
+        })
+    }
+    fn acknowledge(&mut self) -> Result<LockReply, i32> {
+        let owner = self.owner.ok_or(EIO)?;
+        crate::shared::with_files(|files| {
+            let (result, reply) = files
+                .ack_lock_record(self.token, owner)
+                .map_err(crate::error)?;
+            result.into_result()?;
+            reply.ok_or(EIO)
+        })
+    }
+}
+
+/// The copied input contains no caller pointer. Public activation follows close fencing.
+pub(crate) fn operation(fd: u32, input: crate::lock_fields::Input) -> Result<LockReply, i32> {
+    let owner = OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)?;
+    let frame = crate::change::frame();
+    let input = Input {
+        command: input.command,
+        kind: input.kind,
+        whence: input.whence,
+        start: input.start,
+        length: input.length,
+        pid: input.pid,
+    };
+    let (token, claim, transport) = crate::change::take_place(owner, frame, |files| {
+        let source = files.lock_source(fd)?;
+        let (token, claim) = files.begin_lock_record(owner, source, frame, input)?;
+        Ok((token, claim, files.transport()))
+    })
+    .map_err(|errno| {
+        if errno == constants::EAGAIN {
+            ENOLCK
+        } else {
+            errno
+        }
+    })?;
+    let result = core::drive(&mut Live {
+        token,
+        claim: Some(claim),
+        owner: Some(owner),
+        transport,
+        room_repeats: 0,
+    });
+    crate::change::wake_places();
+    result
+}
+
+/// A close or lifetime helper keeps the same key and pays one bounded cleanup turn.
+pub(crate) fn cleanup_step(token: ControlToken) -> Result<bool, i32> {
+    let transport = crate::shared::with_files(|files| {
+        Ok(local::snapshot(files, token, None)
+            .map_err(crate::error)?
+            .map(|_| files.transport()))
+    })?;
+    let Some(transport) = transport else {
+        return Ok(true);
+    };
+    let completed = core::cleanup_step(&mut Live {
+        token,
+        claim: None,
+        owner: None,
+        transport,
+        room_repeats: 0,
+    })?;
+    if completed {
+        crate::change::wake_places();
+    }
+    Ok(completed)
+}

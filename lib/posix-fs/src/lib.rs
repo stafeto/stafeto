@@ -8,6 +8,7 @@
 
 pub mod change;
 pub mod closing;
+pub mod control;
 pub mod open;
 mod target;
 pub use target::RamTarget;
@@ -210,15 +211,13 @@ pub struct PosixFs {
     /// the console's input, output and error go there (5f).
     terminal: Option<Handle<Channel>>,
     paths: PathState,
-    descriptors: Table<Target, OPEN_MAX, open::Recovery, (), entries::Frame>,
+    descriptors: Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>,
 }
 
-// Control frame recovery fits in the existing custody payload union.
-// Dedicated close records additionally retain one frame apiece.
+// Typed control receipts retain their complete immutable source and outcome.
+const _: () = assert!(core::mem::size_of::<control::Recovery>() == 120);
 const _: () = assert!(
-    core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), entries::Frame>>()
-        == core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery>>()
-            + posix_fd::JOBS_MAX * core::mem::size_of::<entries::Frame>()
+    core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>>() == 14096
 );
 
 /// Owned startup transports, prepared before the pinned descriptor table exists.
