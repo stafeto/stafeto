@@ -53,6 +53,8 @@ enum Phase {
 }
 pub struct Proof {
     graph: Graph,
+    #[cfg(feature = "lifetime-probe")]
+    probe_snapshot: Option<[u32; 3]>,
     candidate: Option<Seed>,
     seeds: [Option<Seed>; CAPACITY],
     watches: [Option<SavedWatch>; CAPACITY],
@@ -101,6 +103,8 @@ impl Proof {
     pub unsafe fn initialize_at(destination: *mut Self) {
         // SAFETY: each field is within the caller's complete exclusive allocation.
         unsafe {
+            #[cfg(feature = "lifetime-probe")]
+            core::ptr::addr_of_mut!((*destination).probe_snapshot).write(None);
             Graph::initialize_empty_at(core::ptr::addr_of_mut!((*destination).graph));
             let seeds = core::ptr::addr_of_mut!((*destination).seeds).cast::<Option<Seed>>();
             let watches =
@@ -116,6 +120,11 @@ impl Proof {
             core::ptr::addr_of_mut!((*destination).blocked).write(false);
             core::ptr::addr_of_mut!((*destination).phase).write(Phase::Idle);
         }
+    }
+    /// Counts saved before cleanup of a genuinely verified candidate cycle.
+    #[cfg(feature = "lifetime-probe")]
+    pub fn probe_snapshot(&self) -> Option<[u32; 3]> {
+        self.probe_snapshot
     }
     /// False means decline optional detection, never a new public errno.
     pub fn start(
@@ -152,6 +161,10 @@ impl Proof {
         self.reader_watch = None;
         self.used = 0;
         self.blocked = false;
+        #[cfg(feature = "lifetime-probe")]
+        {
+            self.probe_snapshot = None;
+        }
         self.phase = Phase::ClearSeeds(0);
         true
     }
@@ -426,6 +439,12 @@ impl Proof {
                 }
                 let visited = end - *first;
                 if end == CAPACITY {
+                    #[cfg(feature = "lifetime-probe")]
+                    {
+                        let (vertices, watches) = self.graph.probe_counts();
+                        self.probe_snapshot =
+                            Some([vertices as u32, self.used.count_ones(), watches as u32]);
+                    }
                     self.graph.cleanup().expect("proven terminal cleanup");
                     self.phase = Phase::Cleanup(Verdict::Deadlock);
                 } else {

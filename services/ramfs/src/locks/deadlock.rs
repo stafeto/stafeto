@@ -206,6 +206,10 @@ impl Graph {
             }
         }
     }
+    #[cfg(feature = "lifetime-probe")]
+    pub fn probe_counts(&self) -> (usize, usize) {
+        (self.count, self.watch_count)
+    }
     pub fn seed_ready(&self) -> bool {
         matches!(self.phase, Phase::Vertices)
     }
