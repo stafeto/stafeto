@@ -893,7 +893,7 @@ mod tests {
         type Payload = Table<u32, 32, [u64; 3], [u8; 1012]>;
         assert_eq!(size_of::<ScalarToken>(), 16);
         assert_eq!(size_of::<ScalarRecord<u32, [u8; 1012]>>(), 1072);
-        assert_eq!(size_of::<Base>(), 6544);
-        assert_eq!(size_of::<Payload>(), 54160);
+        assert_eq!(size_of::<Base>(), 6672);
+        assert_eq!(size_of::<Payload>(), 54288);
     }
 }

@@ -227,3 +227,286 @@ pub extern "C" fn ram_close_event() -> i32 {
     })();
     result.unwrap_or_else(|error| error)
 }
+
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+static CLOSE_MODE: AtomicUsize = AtomicUsize::new(0);
+static CLOSE_FD: AtomicI32 = AtomicI32::new(-1);
+static CLOSE_NEW_FD: AtomicI32 = AtomicI32::new(-1);
+static CLOSE_ERROR: AtomicI32 = AtomicI32::new(0);
+static CLOSE_EVENTS: AtomicUsize = AtomicUsize::new(0);
+static CLOSE_PHYSICAL: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" {
+    fn close_probe_signal_jump();
+}
+
+fn close_hook(phase: posix_abi::CloseProbe, token: posix_fs::closing::CloseToken) -> bool {
+    let proof = posix_abi::shared::with_files(|files| {
+        Ok((
+            files.transport(),
+            files.close_snapshot(token).map_err(posix_abi::error)?,
+        ))
+    });
+    match proof {
+        Ok((transport, snapshot)) => {
+            if let posix_fs::Target::Ram(held) | posix_fs::Target::Random(held) = snapshot.backend {
+                let confirmed = match phase {
+                    posix_abi::CloseProbe::Event => {
+                        let other = proto_fs::CloseEvent {
+                            key: proto_fs::CloseKey {
+                                slot: token.slot() as u32,
+                                generation: token.generation(),
+                            },
+                            packed: held.prepared().marked_fd(),
+                            description_generation: held.generation(),
+                            last_alias: !snapshot.last_alias,
+                        };
+                        transport.files().close_event_once(other)
+                            == Err(proto_wire::Status::Unknown(proto_fs::INVALID_ARGUMENT))
+                    }
+                    posix_abi::CloseProbe::Physical => {
+                        transport.files().close_exact(held.prepared())
+                            == Ok(rt::fs::CloseOutcome::AlreadyGone)
+                    }
+                };
+                if !confirmed {
+                    CLOSE_ERROR.store(-33, Ordering::SeqCst);
+                }
+            } else {
+                CLOSE_ERROR.store(-34, Ordering::SeqCst);
+            }
+        }
+        Err(_) => {
+            CLOSE_ERROR.store(-35, Ordering::SeqCst);
+        }
+    }
+    let wanted = match phase {
+        posix_abi::CloseProbe::Event => {
+            CLOSE_EVENTS.fetch_add(1, Ordering::SeqCst);
+            [1, 3]
+        }
+        posix_abi::CloseProbe::Physical => {
+            CLOSE_PHYSICAL.fetch_add(1, Ordering::SeqCst);
+            [2, 4]
+        }
+    };
+    let mode = CLOSE_MODE.load(Ordering::SeqCst);
+    if !wanted.contains(&mode)
+        || CLOSE_MODE
+            .compare_exchange(mode, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        return false;
+    }
+    if mode == 1 || mode == 2 {
+        return true;
+    }
+    if mode == 3 {
+        let fd = CLOSE_FD.load(Ordering::SeqCst);
+        if posix_abi::shared::held(fd as u32, |_, _| Ok(())) != Err(posix_abi::constants::EBADF) {
+            CLOSE_ERROR.store(-30, Ordering::SeqCst);
+        }
+        match posix_abi::open(b"/etc/motd", posix_abi::constants::O_RDONLY) {
+            Ok(next) => CLOSE_NEW_FD.store(next, Ordering::SeqCst),
+            Err(_) => CLOSE_ERROR.store(-31, Ordering::SeqCst),
+        }
+    } else {
+        // The C handler takes a genuine SIGUSR1 and abandons this unlocked frame.
+        unsafe {
+            close_probe_signal_jump();
+        }
+        CLOSE_ERROR.store(-32, Ordering::SeqCst);
+    }
+    false
+}
+fn install_close_hook(mode: usize, fd: i32) {
+    CLOSE_MODE.store(mode, Ordering::SeqCst);
+    CLOSE_FD.store(fd, Ordering::SeqCst);
+    CLOSE_NEW_FD.store(-1, Ordering::SeqCst);
+    CLOSE_ERROR.store(0, Ordering::SeqCst);
+    CLOSE_EVENTS.store(0, Ordering::SeqCst);
+    CLOSE_PHYSICAL.store(0, Ordering::SeqCst);
+    posix_abi::probe_close_hook(Some(close_hook));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn close_driver_receipts() -> i32 {
+    let began = rt::time::now();
+    let result = (|| {
+        for mode in 1..=3 {
+            let fd =
+                posix_abi::open(b"/etc/motd", posix_abi::constants::O_RDONLY).map_err(|_| -1)?;
+            install_close_hook(mode, fd);
+            let closed = posix_abi::close(fd);
+            posix_abi::probe_close_hook(None);
+            closed.map_err(|_| -2)?;
+            if CLOSE_MODE.load(Ordering::SeqCst) != 0 || CLOSE_ERROR.load(Ordering::SeqCst) != 0 {
+                return Err(-3);
+            }
+            let events = CLOSE_EVENTS.load(Ordering::SeqCst);
+            let physical = CLOSE_PHYSICAL.load(Ordering::SeqCst);
+            if (events, physical) != if mode == 2 { (1, 2) } else { (2, 1) } {
+                return Err(-4);
+            }
+            if mode == 3 {
+                let next = CLOSE_NEW_FD.load(Ordering::SeqCst);
+                if next != fd || posix_abi::read(next, &mut [0; 1]) != Ok(1) {
+                    return Err(-5);
+                }
+                posix_abi::close(next).map_err(|_| -6)?;
+            }
+        }
+        for mode in 1..=2 {
+            let source =
+                posix_abi::open(b"/etc/motd", posix_abi::constants::O_RDONLY).map_err(|_| -40)?;
+            let target =
+                posix_abi::open(b"/etc/motd", posix_abi::constants::O_RDONLY).map_err(|_| -41)?;
+            install_close_hook(mode, target);
+            let replaced = posix_abi::dup2(source, target);
+            posix_abi::probe_close_hook(None);
+            if replaced != Ok(target)
+                || CLOSE_ERROR.load(Ordering::SeqCst) != 0
+                || CLOSE_MODE.load(Ordering::SeqCst) != 0
+                || (
+                    CLOSE_EVENTS.load(Ordering::SeqCst),
+                    CLOSE_PHYSICAL.load(Ordering::SeqCst),
+                ) != if mode == 2 { (1, 2) } else { (2, 1) }
+            {
+                return Err(-42);
+            }
+            posix_abi::close(source).map_err(|_| -43)?;
+            if posix_abi::read(target, &mut [0; 1]) != Ok(1) {
+                return Err(-44);
+            }
+            posix_abi::close(target).map_err(|_| -45)?;
+        }
+        rt::println!(
+            "POSIX close receipts: event loss, physical loss and helper reuse ok, ticks={}",
+            rt::time::now().saturating_sub(began)
+        );
+        Ok(0)
+    })();
+    posix_abi::probe_close_hook(None);
+    result.unwrap_or_else(|error| error)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn close_driver_jump_arm(fd: i32) {
+    install_close_hook(4, fd);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn close_driver_jump_recover(old_fd: i32) -> i32 {
+    posix_abi::probe_close_hook(None);
+    let began = rt::time::now();
+    let result = (|| {
+        if CLOSE_MODE.load(Ordering::SeqCst) != 0 || CLOSE_ERROR.load(Ordering::SeqCst) != 0 {
+            return Err(-10);
+        }
+        let debt = posix_abi::shared::with_files(|files| {
+            Ok(files.close_tokens().any(|token| {
+                files
+                    .close_snapshot(token)
+                    .is_ok_and(|snapshot| snapshot.complete && snapshot.release.is_some())
+            }))
+        })
+        .map_err(|_| -11)?;
+        if !debt {
+            return Err(-12);
+        }
+        let next =
+            posix_abi::open(b"/etc/motd", posix_abi::constants::O_RDONLY).map_err(|_| -13)?;
+        if next != old_fd {
+            return Err(-14);
+        }
+        for _ in 0..64 {
+            posix_abi::shared::help_open_recovery();
+        }
+        if posix_abi::shared::with_files(|files| Ok(files.close_tokens().next().is_none()))
+            != Ok(true)
+        {
+            return Err(-15);
+        }
+        if posix_abi::read(next, &mut [0; 1]) != Ok(1) {
+            return Err(-16);
+        }
+        posix_abi::close(next).map_err(|_| -17)?;
+        rt::println!(
+            "POSIX close signal: genuine SIGUSR1 siglongjmp preserves physical debt and reused fd ok, ticks={}",
+            rt::time::now().saturating_sub(began)
+        );
+        Ok(0)
+    })();
+    result.unwrap_or_else(|error| error)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn close_driver_full_places() -> i32 {
+    let began = rt::time::now();
+    let result = (|| {
+        let mut fds = [0; 17];
+        for fd in &mut fds {
+            *fd = posix_abi::open(b"/etc/motd", posix_abi::constants::O_RDONLY).map_err(|_| -20)?;
+        }
+        let owner =
+            posix_fs::change::OwnerToken::new(posix_abi::relibc::open_owner().map_err(|_| -21)?)
+                .map_err(|_| -22)?;
+        let sp: u64;
+        // SAFETY: this live fixture frame encloses all registered control work.
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+        }
+        let frame = entries::Frame::main(sp);
+        let controls = posix_abi::shared::with_files(|files| {
+            let mut controls = [None; 16];
+            for control in &mut controls {
+                *control = Some(
+                    files
+                        .begin_change_record(owner, frame)
+                        .map_err(posix_abi::error)?,
+                );
+            }
+            for &fd in &fds[..16] {
+                if !matches!(
+                    files
+                        .begin_close_record(None, fd as u32, frame)
+                        .map_err(posix_abi::error)?,
+                    posix_fs::closing::CloseAdmission::Started { .. }
+                ) {
+                    return Err(-23);
+                }
+            }
+            Ok(controls)
+        })
+        .map_err(|_| -24)?;
+        posix_abi::close(fds[16]).map_err(|_| -25)?;
+        for _ in 0..128 {
+            posix_abi::shared::help_open_recovery();
+        }
+        posix_abi::shared::with_files(|files| {
+            if files.close_tokens().next().is_some() || files.change_tokens().count() != 16 {
+                return Err(-26);
+            }
+            for &fd in &fds {
+                if files.target(fd as u32).is_ok() {
+                    return Err(-27);
+                }
+            }
+            for (token, claim) in controls.into_iter().flatten() {
+                files
+                    .complete_change_record(claim, posix_fs::change::ControlResult::Value(0))
+                    .map_err(posix_abi::error)?;
+                files
+                    .ack_change_record(token, owner)
+                    .map_err(posix_abi::error)?;
+            }
+            Ok(())
+        })
+        .map_err(|_| -28)?;
+        rt::println!(
+            "POSIX close places: all 16 Closing and 16 Control slots retain independent progress ok, ticks={}",
+            rt::time::now().saturating_sub(began)
+        );
+        Ok(0)
+    })();
+    result.unwrap_or_else(|error| error)
+}

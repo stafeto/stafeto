@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Frozen numeric close events and their exact physical cleanup receipts.
+
+use super::{DescriptorFlags, FsError, PosixFs, Target};
+use entries::Frame;
+pub use posix_fd::{CloseAdmission, CloseSnapshot, CloseToken, JobPlace, OwnerToken, WaitValue};
+
+pub type Snapshot = CloseSnapshot<Target, Frame>;
+pub type Admission = CloseAdmission<Target, Frame>;
+
+impl PosixFs {
+    pub fn pending_open(&self, fd: u32) -> Option<posix_fd::OpenToken> {
+        self.descriptors.pending(fd)
+    }
+
+    pub fn closing(&self, fd: u32) -> Option<CloseToken> {
+        self.descriptors.closing(fd)
+    }
+    pub fn close_tokens(&self) -> impl Iterator<Item = CloseToken> + '_ {
+        self.descriptors.close_tokens()
+    }
+    pub fn close_snapshot(&self, token: CloseToken) -> Result<Snapshot, FsError> {
+        self.descriptors
+            .close_snapshot(token)
+            .map_err(FsError::from)
+    }
+    pub fn close_place(&self, owner: OwnerToken) -> JobPlace {
+        self.descriptors.close_place(owner)
+    }
+    pub fn close_wait_address(&self, token: CloseToken) -> Result<usize, FsError> {
+        self.descriptors
+            .close_wait_word(token)
+            .map(|word| core::ptr::from_ref(word) as usize)
+            .map_err(FsError::from)
+    }
+    pub fn begin_close_record(
+        &mut self,
+        owner: Option<OwnerToken>,
+        fd: u32,
+        frame: Frame,
+    ) -> Result<Admission, FsError> {
+        match owner {
+            Some(owner) => self.descriptors.begin_close(owner, fd, frame),
+            None => self.descriptors.begin_close_unowned(fd, frame),
+        }
+        .map_err(FsError::from)
+    }
+    pub fn begin_replace_record(
+        &mut self,
+        owner: Option<OwnerToken>,
+        source: u32,
+        target: u32,
+        flags: Option<DescriptorFlags>,
+        frame: Frame,
+    ) -> Result<Admission, FsError> {
+        match owner {
+            Some(owner) => self
+                .descriptors
+                .begin_replace(owner, source, target, flags, frame),
+            None => self
+                .descriptors
+                .begin_replace_unowned(source, target, flags, frame),
+        }
+        .map_err(FsError::from)
+    }
+    pub fn finish_close_record(&mut self, token: CloseToken) -> Result<Option<Target>, FsError> {
+        self.descriptors.finish_close(token).map_err(FsError::from)
+    }
+    pub fn finish_close_release(
+        &mut self,
+        token: CloseToken,
+        target: Target,
+    ) -> Result<(), FsError> {
+        self.descriptors
+            .finish_close_release(token, target)
+            .map_err(FsError::from)
+    }
+    pub fn ack_close_record(
+        &mut self,
+        token: CloseToken,
+        owner: Option<OwnerToken>,
+    ) -> Result<(), FsError> {
+        self.descriptors
+            .ack_close(token, owner)
+            .map_err(FsError::from)
+    }
+    pub fn abandon_close_owner(&mut self, owner: OwnerToken) -> Option<(CloseToken, Snapshot)> {
+        self.descriptors.abandon_close_owner(owner)
+    }
+}

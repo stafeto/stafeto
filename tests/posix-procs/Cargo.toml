@@ -14,7 +14,7 @@ test = false
 bench = false
 
 [features]
-lifetime-probe = ["pending-open", "dep:proto-process"]
+lifetime-probe = ["pending-open", "dep:proto-process", "posix-abi/close-probe"]
 jobs = []
 native-scopes-launcher = []
 auth-probe = ["files"]

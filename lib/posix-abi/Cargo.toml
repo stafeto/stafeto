@@ -25,6 +25,8 @@ rtbench-marks = ["rt/count-calls"]
 # A hook of the probes at each Step of a Change job (`change::probe_hook`):
 # the probe forks in the middle of an operation (tests/posix-procs).
 change-probe = []
+# Exact reply-loss and lifecycle hooks in the dedicated lifetime image.
+close-probe = []
 
 [dependencies]
 posix-types = { path = "../posix-types" }

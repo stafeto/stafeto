@@ -590,6 +590,7 @@ pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
 /// process has.
 fn sessions() -> Result<Sessions, i32> {
     use crate::process::clone_errno;
+    crate::close_driver::settle_all()?;
     let mut out = Sessions::default();
     let made = (|| {
         if let Some(clock) = crate::clock::session() {

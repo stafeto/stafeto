@@ -627,7 +627,8 @@ impl Shadow {
             pending: [None; posix_fs::OPEN_MAX],
             real_ids: false,
         };
-        crate::shared::with_files(|files| {
+        let numbers = core::array::from_fn::<_, { posix_fs::OPEN_MAX }, _>(|fd| fd as u32);
+        crate::shared::with_descriptors(&numbers, |files| {
             let mut open = [None; posix_fs::OPEN_MAX];
             for (fd, target, flags) in files.descriptors() {
                 open[fd as usize] = Some((target, flags.close_on_exec));
@@ -814,7 +815,7 @@ impl Shadow {
                 )?;
                 let own = own as u32;
                 let target =
-                    crate::shared::with_files(|files| files.target(own).map_err(crate::error));
+                    crate::shared::with_fd(own, |files| files.target(own).map_err(crate::error));
                 let Some(free) = self.opened.iter_mut().find(|o| o.is_none()) else {
                     let _ = crate::close(own as i32);
                     return Err(crate::constants::EMFILE);

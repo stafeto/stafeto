@@ -3211,6 +3211,13 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
         &outcome,
         "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok",
     )?;
+    for marker in [
+        "POSIX close receipts: event loss, physical loss and helper reuse ok",
+        "POSIX close signal: genuine SIGUSR1 siglongjmp preserves physical debt and reused fd ok",
+        "POSIX close places: all 16 Closing and 16 Control slots retain independent progress ok",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
     check_waits(&outcome.lines, &["2"], "RAM close event steps")?;
     let steps = longest_steps(&outcome.lines, "2");
     for kind in [49, 66] {
@@ -7236,6 +7243,13 @@ mod tests {
 
     #[test]
     fn lifetime_probe_has_its_own_process_and_program_features() {
+        let manifest = include_str!("../../tests/posix-procs/Cargo.toml");
+        let close_features: Vec<_> = manifest
+            .lines()
+            .filter(|line| line.contains("posix-abi/close-probe"))
+            .collect();
+        assert_eq!(close_features.len(), 1);
+        assert!(close_features[0].starts_with("lifetime-probe = "));
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe", "steps"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[5].3, &["lifetime-probe"]);

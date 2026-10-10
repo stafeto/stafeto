@@ -28,6 +28,8 @@ pub struct CloseSnapshot<T, C> {
     pub last_alias: bool,
     pub replacement: Option<(T, Flags)>,
     pub complete: bool,
+    /// Exact physical cleanup remains paid until its canonical reply is confirmed.
+    pub release: Option<T>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloseAdmission<T, C> {
@@ -136,6 +138,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                         .replacement
                         .is_some_and(|(next, _)| next == backend)
             }
+            Some(record) => physical && record.snapshot.release == Some(backend),
             _ => false,
         })
     }
@@ -154,12 +157,42 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         if let Some(blocked) = self.close_blocked(fd) {
             return Ok(blocked);
         }
-        self.start_close(owner, fd, recovery, None)
+        self.start_close(Some(owner), fd, recovery, None)
+    }
+    /// Cleanup retains immutable work without requiring a new caller admission.
+    pub fn begin_close_unowned(
+        &mut self,
+        fd: u32,
+        recovery: C,
+    ) -> Result<CloseAdmission<T, C>, Error> {
+        if let Some(blocked) = self.close_blocked(fd) {
+            return Ok(blocked);
+        }
+        self.start_close(None, fd, recovery, None)
     }
     /// Freeze a replacement before the close event can leave the table lock.
     pub fn begin_replace(
         &mut self,
         owner: OwnerToken,
+        source: u32,
+        target: u32,
+        flags: Option<Flags>,
+        recovery: C,
+    ) -> Result<CloseAdmission<T, C>, Error> {
+        self.begin_replace_with_owner(Some(owner), source, target, flags, recovery)
+    }
+    pub fn begin_replace_unowned(
+        &mut self,
+        source: u32,
+        target: u32,
+        flags: Option<Flags>,
+        recovery: C,
+    ) -> Result<CloseAdmission<T, C>, Error> {
+        self.begin_replace_with_owner(None, source, target, flags, recovery)
+    }
+    fn begin_replace_with_owner(
+        &mut self,
+        owner: Option<OwnerToken>,
         source: u32,
         target: u32,
         flags: Option<Flags>,
@@ -198,7 +231,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
     fn start_close(
         &mut self,
-        owner: OwnerToken,
+        owner: Option<OwnerToken>,
         fd: u32,
         recovery: C,
         replacement: Option<(T, Flags)>,
@@ -228,13 +261,14 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             ) && !self.closing_references(backend, false)
                 && !replacement.is_some_and(|(next, _)| next == backend);
         let snapshot = CloseSnapshot {
-            owner: Some(owner),
+            owner,
             recovery,
             entry,
             backend,
             last_alias,
             replacement,
             complete: false,
+            release: None,
         };
         self.save_close(token, CloseRecord { snapshot });
         Ok(CloseAdmission::Started { token, snapshot })
@@ -258,12 +292,28 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         }
         record.snapshot.complete = true;
         self.save_close(token, record);
-        Ok(self.left(snapshot.backend))
+        let release = self.left(snapshot.backend);
+        record.snapshot.release = release;
+        self.save_close(token, record);
+        Ok(release)
+    }
+    /// Confirm the exact physical cleanup receipt without altering a reused fd.
+    pub fn finish_close_release(&mut self, token: CloseToken, backend: T) -> Result<(), Error> {
+        let mut record = self.close_record(token)?;
+        if !record.snapshot.complete || record.snapshot.backend != backend {
+            return Err(Error::BadFileDescriptor);
+        }
+        record.snapshot.release = None;
+        self.save_close(token, record);
+        Ok(())
     }
     /// The owner or its collector acknowledges the retained completion.
     pub fn ack_close(&mut self, token: CloseToken, owner: Option<OwnerToken>) -> Result<(), Error> {
         let record = self.close_record(token)?;
-        if !record.snapshot.complete || record.snapshot.owner != owner {
+        if !record.snapshot.complete
+            || record.snapshot.release.is_some()
+            || record.snapshot.owner != owner
+        {
             return Err(Error::BadFileDescriptor);
         }
         let slot = &mut self.closings[token.slot];
@@ -306,6 +356,114 @@ mod tests {
             _ => panic!("close did not start"),
         }
     }
+    #[test]
+    fn unregistered_cleanup_has_its_own_receipt_through_full_io_and_control_tables() {
+        let mut table = TestTable::default();
+        for fd in 0..32 {
+            table.place(fd, 100 + fd, Flags::default()).unwrap();
+            table.hold(fd).unwrap();
+        }
+        for _ in 0..JOBS_MAX {
+            table.begin_control(owner(1), 7).unwrap();
+        }
+        let CloseAdmission::Started { token, snapshot } = table.begin_close_unowned(0, 42).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(snapshot.owner, None);
+        assert_eq!(snapshot.recovery, 42);
+        assert!(snapshot.last_alias);
+        assert_eq!(table.finish_close(token), Ok(None));
+        assert_eq!(table.unhold(100), Some(100));
+        assert!(table.ack_close(token, Some(owner(1))).is_err());
+        table.ack_close(token, None).unwrap();
+        assert_eq!(table.jobs_in_use(), JOBS_MAX);
+        assert_eq!(table.get(1), Ok(101));
+    }
+
+    #[test]
+    fn unregistered_replacement_keeps_source_and_physical_target_until_confirmation() {
+        let mut table = TestTable::default();
+        let source = table.insert(100, Flags::default()).unwrap();
+        let target = table.insert(200, Flags::default()).unwrap();
+        let flags = Flags {
+            close_on_exec: true,
+            close_on_fork: false,
+        };
+        let CloseAdmission::Started { token, snapshot } = table
+            .begin_replace_unowned(source, target, Some(flags), 42)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(snapshot.owner, None);
+        assert_eq!(snapshot.replacement, Some((100, flags)));
+        assert_eq!(table.close(source), Ok(None));
+        assert_eq!(table.finish_close(token), Ok(Some(200)));
+        assert_eq!(table.get(target), Ok(100));
+        assert_eq!(table.flags(target), Ok(flags));
+        assert!(table.ack_close(token, None).is_err());
+        table.finish_close_release(token, 200).unwrap();
+        table.ack_close(token, None).unwrap();
+        assert_eq!(table.close(target), Ok(Some(100)));
+    }
+
+    #[test]
+    fn lost_owner_after_numeric_completion_preserves_exact_physical_cleanup_debt() {
+        let mut table = TestTable::default();
+        let fd = table.insert(100, Flags::default()).unwrap();
+        let (token, _) = start(&mut table, fd);
+        assert!(table.finish_close_release(token, 100).is_err());
+        assert_eq!(table.finish_close(token), Ok(Some(100)));
+        assert_eq!(table.insert(200, Flags::default()), Ok(fd));
+        let (debt, snapshot) = table.abandon_close_owner(owner(1)).unwrap();
+        assert_eq!(debt, token);
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.release, Some(100));
+        assert!(table.referenced(100));
+        assert!(table.ack_close(token, None).is_err());
+        assert!(table.finish_close_release(token, 200).is_err());
+        assert_eq!(table.close_snapshot(token).unwrap().release, Some(100));
+        assert_eq!(table.finish_close(token), Ok(None));
+        table.finish_close_release(token, 100).unwrap();
+        table.finish_close_release(token, 100).unwrap();
+        assert!(!table.referenced(100));
+        table.ack_close(token, None).unwrap();
+        assert_eq!(table.get(fd), Ok(200));
+        let (next, _) = start(&mut table, fd);
+        assert_eq!(next.slot(), token.slot());
+        assert!(table.finish_close_release(token, 100).is_err());
+        assert_eq!(table.closing(fd), Some(next));
+    }
+
+    #[test]
+    fn full_close_table_cannot_return_any_place_before_physical_receipts() {
+        let mut table = TestTable::default();
+        let mut tokens = [None; JOBS_MAX];
+        for (fd, token) in tokens.iter_mut().enumerate() {
+            table
+                .place(fd as u32, 100 + fd as u32, Flags::default())
+                .unwrap();
+            let (next, _) = start(&mut table, fd as u32);
+            assert_eq!(table.finish_close(next), Ok(Some(100 + fd as u32)));
+            *token = Some(next);
+        }
+        assert!(matches!(
+            table.close_place(owner(1)),
+            JobPlace::Full { own: true, .. }
+        ));
+        for token in tokens.into_iter().flatten() {
+            assert!(table.ack_close(token, Some(owner(1))).is_err());
+        }
+        let first = tokens[0].unwrap();
+        table.finish_close_release(first, 100).unwrap();
+        table.ack_close(first, Some(owner(1))).unwrap();
+        assert_eq!(table.close_place(owner(2)), JobPlace::Free);
+        for token in tokens[1..].iter().copied().flatten() {
+            assert!(table.close_snapshot(token).unwrap().release.is_some());
+        }
+    }
+
     #[test]
     fn closing_number_stays_reserved_until_confirmation_and_retains_exact_completion() {
         let mut table = TestTable::default();
@@ -352,6 +510,7 @@ mod tests {
         assert_eq!(table.get(fd), Ok(101));
         assert!(table.close_snapshot(token).unwrap().complete);
         assert!(table.ack_close(token, Some(owner(2))).is_err());
+        table.finish_close_release(token, 100).unwrap();
         table.ack_close(token, Some(owner(1))).unwrap();
         let (next, _) = start(&mut table, fd);
         assert_eq!(next.slot(), token.slot());
@@ -376,6 +535,9 @@ mod tests {
         assert_eq!(table.unhold(100), None);
         assert_eq!(table.finish_close(a), Ok(Some(100)));
         assert_eq!(table.finish_close(b), Ok(None));
+        assert!(table.referenced(100));
+        assert_eq!(table.close_snapshot(a).unwrap().release, Some(100));
+        table.finish_close_release(a, 100).unwrap();
         assert!(!table.referenced(100));
     }
     #[test]
@@ -531,6 +693,7 @@ mod tests {
         assert!(table.ack_close(token, None).is_err());
         assert_eq!(table.finish_close(token), Ok(Some(100)));
         assert!(table.ack_close(token, Some(owner(1))).is_err());
+        table.finish_close_release(token, 100).unwrap();
         table.ack_close(token, None).unwrap();
         assert_eq!(table.close_tokens().count(), 0);
         assert_eq!(table.abandon_close_owner(owner(1)), None);
@@ -580,6 +743,7 @@ mod tests {
         assert_eq!(table.close_wait_value(close), Ok(WaitValue::NeverSleep));
         assert_eq!(table.finish_close(close), Ok(Some(100)));
         assert_eq!(table.close_wait_value(close), Ok(WaitValue::NeverSleep));
+        table.finish_close_release(close, 100).unwrap();
         table.ack_close(close, Some(owner(1))).unwrap();
     }
 }

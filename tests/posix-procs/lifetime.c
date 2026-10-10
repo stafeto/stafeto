@@ -3,6 +3,8 @@
 
 /* Actual Loaded, spawn, fork, credentials, exec and death transitions. */
 #include <errno.h>
+#include <fcntl.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -14,6 +16,18 @@
 extern int process_lifetime(int pid);
 extern int ram_lifetime(int pid);
 extern int ram_close_event(void);
+extern int close_driver_receipts(void);
+extern int close_driver_full_places(void);
+extern void close_driver_jump_arm(int fd);
+extern int close_driver_jump_recover(int fd);
+static sigjmp_buf close_jump;
+static volatile sig_atomic_t close_signal_seen;
+static void close_signal(int number) {
+    close_signal_seen = number;
+    siglongjmp(close_jump, 1);
+}
+void close_probe_signal_jump(void) { raise(SIGUSR1); }
+
 static int failures;
 static void expect(const char *what, int actual, int wanted) {
     if (actual != wanted) {
@@ -60,6 +74,25 @@ int main(int argc, char **argv) {
     expect("restore effective UID", seteuid(0), 0);
     expect_life("PID lives with restored credentials", getpid(), 1);
     expect("native close receipt and 32-reference birth", ram_close_event(), 0);
+    expect("public close receipts and helper reuse", close_driver_receipts(), 0);
+    expect("public close with all independent places full", close_driver_full_places(), 0);
+    struct sigaction close_action, close_previous;
+    memset(&close_action, 0, sizeof close_action);
+    close_action.sa_handler = close_signal;
+    sigemptyset(&close_action.sa_mask);
+    expect("install close signal", sigaction(SIGUSR1, &close_action, &close_previous), 0);
+    int close_fd = open("/etc/motd", O_RDONLY);
+    expect("open before close signal", close_fd >= 0, 1);
+    close_signal_seen = 0;
+    if (close_fd >= 0 && sigsetjmp(close_jump, 1) == 0) {
+        close_driver_jump_arm(close_fd);
+        close(close_fd);
+        expect("close signal must leave through siglongjmp", 0, 1);
+    }
+    expect("genuine close signal", close_signal_seen, SIGUSR1);
+    expect("recover physical close after siglongjmp", close_driver_jump_recover(close_fd), 0);
+    expect("restore close signal", sigaction(SIGUSR1, &close_previous, NULL), 0);
+
     char *sleep_argv[] = {"procs-child", "sleep", NULL};
     char *environment[] = {NULL};
     pid_t child = -1;
