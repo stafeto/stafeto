@@ -35,24 +35,37 @@ impl PosixFs {
         frame: Frame,
     ) -> Result<(ControlToken, ControlClaimToken), FsError> {
         self.descriptors
-            .begin_control(owner, frame)
+            .begin_control(owner, super::control::Recovery::change(frame))
             .map_err(FsError::from)
     }
 
     pub fn change_snapshot(&self, token: ControlToken) -> Result<ControlSnapshot<Frame>, FsError> {
-        self.descriptors
+        let snapshot = self
+            .descriptors
             .control_snapshot(token)
-            .map_err(FsError::from)
+            .map_err(FsError::from)?;
+        if !snapshot.recovery.is_change() {
+            return Err(FsError::InvalidArgument);
+        }
+        Ok(ControlSnapshot {
+            owner: snapshot.owner,
+            claimant: snapshot.claimant,
+            phase: snapshot.phase,
+            recovery: snapshot.recovery.frame(),
+            result: snapshot.result,
+        })
     }
 
     pub fn change_tokens(&self) -> impl Iterator<Item = ControlToken> + '_ {
-        self.descriptors.control_tokens()
+        self.descriptors
+            .control_tokens()
+            .filter(|&token| self.change_snapshot(token).is_ok())
     }
 
     /// Whether the record is still the one the operation began with: a child
     /// of `fork` has dropped it.
     pub fn change_is_live(&self, claim: ControlClaimToken) -> bool {
-        self.descriptors.control_is_working(claim)
+        self.change_snapshot(claim.control()).is_ok() && self.descriptors.control_is_working(claim)
     }
 
     pub fn complete_change_record(
@@ -60,6 +73,7 @@ impl PosixFs {
         claim: ControlClaimToken,
         result: ControlResult,
     ) -> Result<(), FsError> {
+        self.change_snapshot(claim.control())?;
         self.descriptors
             .complete_control(claim, result)
             .map_err(FsError::from)
@@ -70,6 +84,7 @@ impl PosixFs {
         token: ControlToken,
         owner: OwnerToken,
     ) -> Result<ControlResult, FsError> {
+        self.change_snapshot(token)?;
         self.descriptors
             .ack_control(token, owner)
             .map_err(FsError::from)
@@ -81,13 +96,20 @@ impl PosixFs {
         &mut self,
         token: ControlToken,
     ) -> Result<ControlCleanup<Frame>, FsError> {
-        self.descriptors
+        self.change_snapshot(token)?;
+        let cleanup = self
+            .descriptors
             .control_begin_cleanup(token)
-            .map_err(FsError::from)
+            .map_err(FsError::from)?;
+        Ok(ControlCleanup {
+            token: cleanup.token,
+            recovery: cleanup.recovery.frame(),
+        })
     }
 
     /// The Release was answered: the place goes when nobody owns the record.
     pub fn finish_change_cleanup(&mut self, token: ControlToken) -> Result<(), FsError> {
+        self.change_snapshot(token)?;
         self.descriptors
             .control_finish_cleanup(token)
             .map_err(FsError::from)
@@ -96,6 +118,21 @@ impl PosixFs {
     /// A thread's lifetime ended: one of its records loses its owner, to be
     /// released by whoever collects. None when the thread owns no more.
     pub fn abandon_change_owner(&mut self, owner: OwnerToken) -> Option<ControlAbandoned<Frame>> {
-        self.descriptors.abandon_control_owner(owner)
+        self.descriptors
+            .abandon_control_owner_if(owner, |recovery| recovery.is_change())
+            .map(|abandoned| match abandoned {
+                ControlAbandoned::Recover { token, snapshot } => ControlAbandoned::Recover {
+                    token,
+                    snapshot: ControlSnapshot {
+                        owner: snapshot.owner,
+                        claimant: snapshot.claimant,
+                        phase: snapshot.phase,
+                        recovery: snapshot.recovery.frame(),
+                        result: snapshot.result,
+                    },
+                },
+                ControlAbandoned::ClaimReleased(token) => ControlAbandoned::ClaimReleased(token),
+                ControlAbandoned::Discarded(token) => ControlAbandoned::Discarded(token),
+            })
     }
 }

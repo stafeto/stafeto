@@ -27,6 +27,7 @@ rtbench-marks = ["rt/count-calls"]
 change-probe = []
 # Exact reply-loss and lifecycle hooks in the dedicated lifetime image.
 close-probe = []
+lock-probe = []
 
 [dependencies]
 posix-types = { path = "../posix-types" }

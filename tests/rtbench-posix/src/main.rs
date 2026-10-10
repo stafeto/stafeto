@@ -196,9 +196,29 @@ pub unsafe extern "C" fn rtbench_say(text: *const c_char, length: usize) {
     let _ = rt::console::write(bytes);
 }
 
+// One startup attempt owns the staging address through construction and cleanup.
+struct IoStaging(UnsafeCell<core::mem::MaybeUninit<posix_fs::PosixFs>>);
+// SAFETY: IO_STARTED allows one caller ever; no other code reads staging.
+unsafe impl Sync for IoStaging {}
+static IO_STAGING: IoStaging = IoStaging(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+static IO_STARTED: AtomicBool = AtomicBool::new(false);
+
+struct InitializedIo(*mut posix_fs::PosixFs);
+impl Drop for InitializedIo {
+    fn drop(&mut self) {
+        // SAFETY: this guard is created only after full initialization. The
+        // byte swap leaves exactly one valid owned object at this address.
+        unsafe { core::ptr::drop_in_place(self.0) };
+    }
+}
+
 /// Preserve the original long-operation UART for S5/S6 before any file opens.
+/// Repeated or concurrent startup attempts fail without accessing staging.
 #[unsafe(no_mangle)]
 pub extern "C" fn rtbench_io_init() -> c_int {
+    if IO_STARTED.swap(true, Ordering::AcqRel) {
+        return -1;
+    }
     let parent = posix_crt::parent();
     let (Ok(ram), Ok(uart), Ok(pipe)) = (
         rt::service::connect(&parent, "ramfs"),
@@ -207,26 +227,48 @@ pub extern "C" fn rtbench_io_init() -> c_int {
     ) else {
         return -1;
     };
-    let Ok(mut fresh) = posix_fs::PosixFs::from_sessions(ram, Some(uart), b"/", None, false) else {
-        return -1;
-    };
+    let startup = posix_fs::StartupFiles::from_sessions(ram, Some(uart), Some(pipe), None);
     let Some(identity) = posix_abi::process::identity() else {
         return -1;
     };
-    if fresh.bind(identity).is_err() {
+    if startup.bind(identity).is_err() {
         return -1;
     }
-    fresh.set_pipes(Some(pipe));
-    posix_abi::shared::with_files(|files| {
+    // SAFETY: the once guard provides exclusive uninitialized static storage.
+    // initialize_at consumes startup and leaves the destination untouched on error.
+    let destination = unsafe { (*IO_STAGING.0.get()).as_mut_ptr() };
+    if unsafe { posix_fs::PosixFs::initialize_at(destination, startup, b"/", None, false) }.is_err()
+    {
+        return -1;
+    }
+    let initialized = InitializedIo(destination);
+    let result = posix_abi::shared::with_files(|files| {
         if files.descriptors().any(|(fd, _, _)| fd > 2) {
             return Err(posix_abi::constants::EBUSY);
         }
-        Ok(core::mem::replace(files, fresh))
-    })
-    .map_or(-1, |old| {
-        drop(old);
-        0
-    })
+        if files.open_tokens().next().is_some()
+            || files.close_tokens().next().is_some()
+            || files.control_tokens().next().is_some()
+        {
+            return Err(posix_abi::constants::EBUSY);
+        }
+        // SAFETY: disjoint initialized objects are exchanged exclusively under
+        // FILES_LOCK. Neither has a live record or pinned waiter. Byte elements
+        // include padding without requiring initialized bytes. The shared address
+        // stays fixed and no object-sized stack temporary is created.
+        unsafe {
+            core::ptr::swap_nonoverlapping(
+                core::ptr::from_mut(files).cast::<core::mem::MaybeUninit<u8>>(),
+                destination.cast::<core::mem::MaybeUninit<u8>>(),
+                core::mem::size_of::<posix_fs::PosixFs>(),
+            );
+        }
+        Ok(())
+    });
+    // Drop either the old state after installation or the unused fresh state
+    // after rejection outside FILES_LOCK, including all owned session handles.
+    drop(initialized);
+    result.map_or(-1, |()| 0)
 }
 
 /// TTY is attached only while the new scenarios run; existing fds survive.

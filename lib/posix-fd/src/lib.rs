@@ -10,6 +10,11 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate self as posix_fd;
+#[cfg(test)]
+mod typed_lock_tests;
+
 mod io;
 pub use io::*;
 mod closing;

@@ -18,6 +18,10 @@ pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;
 pub mod fork;
 pub mod loader_probe;
+mod lock_driver;
+#[cfg(feature = "lock-probe")]
+pub use lock_driver::{Probe as LockProbe, probe_hook as probe_lock_hook};
+pub mod lock_fields;
 pub mod long;
 pub mod metadata;
 pub mod names;
@@ -35,6 +39,20 @@ pub mod wait;
 
 use constants::*;
 use core::ffi::{c_char, c_int};
+
+/// Execute a nonblocking advisory lock command with copied caller fields.
+///
+/// # Safety
+/// `pointer` names readable flock fields and writable fields for a successful GET.
+pub unsafe fn file_lock(fd: c_int, command: c_int, pointer: *mut u8) -> Result<c_int, c_int> {
+    let fd = u32::try_from(fd).map_err(|_| constants::EBADF)?;
+    shared::with_fd(fd, |files| files.lock_source(fd).map(|_| ()).map_err(error))?;
+    // SAFETY: the calling platform supplies flock fields for this invocation.
+    let input = unsafe { lock_fields::Input::read(command, pointer) }?;
+    let outcome = lock_driver::operation(fd, input);
+    // SAFETY: successful GET writes fields only in the same active invocation.
+    unsafe { input.finish(pointer, outcome) }
+}
 use core::sync::atomic::{AtomicU8, Ordering};
 use posix_fs::{DescriptorFlags, FsError, SeekFrom};
 use posix_request::{MAX_PATH, MESSAGE_MAX, Reply, Request};
@@ -203,7 +221,7 @@ pub fn openat_policy(
 }
 
 pub fn close(number: c_int) -> Result<(), c_int> {
-    shared::unit(Request::Close { fd: fd(number)? })
+    close_driver::close(fd(number)?)
 }
 
 /// Reads into `buffer`: a point of cancellation.
