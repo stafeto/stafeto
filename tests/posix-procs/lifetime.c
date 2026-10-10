@@ -302,6 +302,7 @@ static void public_lock_signals(void) {
     if (!failures) printf("posix-procs: lock depth within 16 KiB, nested SIGUSR1 close, siglongjmp and thread departure ok\n");
 }
 #include "wait-locks.c"
+#include "wait-fifo.c"
 
 int main(int argc, char **argv) {
     expect_life("running full PID", getpid(), 1);
@@ -339,6 +340,7 @@ int main(int argc, char **argv) {
     }
     public_lock_signals();
     public_wait_locks();
+    public_wait_fifo();
     expect("native lock commands and exact custody", ram_lock_commands(getpid()), 0);
     expect("native close receipt and 32-reference birth", ram_close_event(), 0);
     expect("public close receipts and helper reuse", close_driver_receipts(), 0);

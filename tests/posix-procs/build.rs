@@ -17,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=lifetime.c");
     println!("cargo:rerun-if-changed=wait-locks.c");
+    println!("cargo:rerun-if-changed=wait-fifo.c");
     println!("cargo:rerun-if-changed=files.c");
     println!("cargo:rerun-if-changed=names.c");
     println!("cargo:rerun-if-changed=names-loss.c");
