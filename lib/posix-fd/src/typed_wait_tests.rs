@@ -148,6 +148,42 @@ fn exact_jump_debt_retires_and_reuses_more_than_sixteen_generations() {
     }
     assert!(files.descriptors.entry_token(entry.fd).is_ok());
 }
+
+#[test]
+fn common_jump_marks_both_paid_families_and_preserves_live_foreign_frames() {
+    let (mut files, entry, _, control_input) = fixture();
+    let mut records = std::vec::Vec::new();
+    for i in 0..16 {
+        let who = if i == 2 {
+            OwnerToken::new((1 << 32) | 1).unwrap()
+        } else {
+            owner()
+        };
+        let frame = Frame::main(match i {
+            0 => 220,
+            1 => 200,
+            _ => 100 + i,
+        });
+        let (control, control_claim) = files
+            .begin_lock_record(who, entry, frame, control_input)
+            .unwrap();
+        let (wait, wait_claim) = files.begin_wait_record(who, entry, frame, input()).unwrap();
+        records.push((control, control_claim, wait, wait_claim, who));
+    }
+    files.mark_jump(owner(), Frame::main(200));
+    for (i, (control, control_claim, wait, wait_claim, who)) in records.into_iter().enumerate() {
+        let control = files.control_snapshot(control).unwrap();
+        let wait = files.wait_snapshot(wait).unwrap();
+        assert_eq!(control.owner, if i < 3 { Some(who) } else { None });
+        assert_eq!(wait.owner, if i < 3 { Some(who) } else { None });
+        assert_eq!(files.lock_is_live(control_claim), i < 3);
+        assert_eq!(files.wait_is_live(wait_claim), i < 3);
+        assert!(control.result.is_none());
+        assert!(wait.result.is_none());
+    }
+    assert_eq!(files.control_tokens().count(), 16);
+    assert_eq!(files.wait_tokens().count(), 16);
+}
 #[test]
 fn canonical_reply_reason_and_channel_debt_survive_exact_helper_publication() {
     let (mut files, entry, _, _) = fixture();

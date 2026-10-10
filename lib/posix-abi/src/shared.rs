@@ -244,7 +244,7 @@ pub fn jump_mark(target_sp: u64) {
         crate::relibc::jump_owner().and_then(|owner| posix_fs::change::OwnerToken::new(owner).ok())
     {
         let _ = process_state(|files| {
-            files.mark_control_jump(owner, entries::Frame::main(target_sp));
+            files.mark_jump(owner, entries::Frame::main(target_sp));
             Ok(())
         });
     }
