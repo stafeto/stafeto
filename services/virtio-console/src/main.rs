@@ -269,7 +269,9 @@ unsafe impl Sync for Cell {}
 static STATE: Cell = Cell(UnsafeCell::new(MaybeUninit::uninit()));
 static TAKEN: AtomicBool = AtomicBool::new(false);
 
-/// The state, empty, at the first call only.
+/// The state, empty, at the first call only. The construction frame ends
+/// before the service loop retains its own reply and request buffers.
+#[inline(never)]
 fn state() -> Option<&'static mut State> {
     if TAKEN.swap(true, Ordering::Relaxed) {
         return None;
