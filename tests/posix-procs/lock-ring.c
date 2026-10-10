@@ -113,6 +113,8 @@ static int ring_coordinator(void) {
                 if (roots[j] == roots[i / 4] && generations[j] == generations[i / 4]) return -1;
         } else if (records[i].root != roots[i / 4] || records[i].generation != generations[i / 4]) return -1;
     }
+    for (unsigned i = 0; i < 4; ++i)
+        printf("posix-procs: ring16 payer family=%u root=%u generation=%u\n", i, roots[i], generations[i]);
     if (ring_publish("/tmp/lock-ring-start")) return -1;
     pthread_t worker;
     if (pthread_create(&worker, NULL, ring_worker, NULL)) return -1;
@@ -148,8 +150,8 @@ static int ring_coordinator(void) {
         if (actual[10]) break;
     }
     if (actual[5] != 16 || actual[6] != 16 || actual[7] != 16 || actual[8] > 20410 || actual[9] > 8 || !actual[8] || !actual[10] || actual[10] > 48 * 1024) bad = 1;
-    printf("posix-procs: ring16 result deadlock=%u success=%u vertices=%u registrations=%u watches=%u ticks=%u visited=%u stack=%u\n",
-           deadlocked, succeeded, actual[5], actual[6], actual[7], actual[8], actual[9], actual[10]);
+    printf("posix-procs: ring16 result deadlock=%u success=%u vertices=%u registrations=%u watches=%u ticks=%u visited=%u stack=%u free=%u\n",
+           deadlocked, succeeded, actual[5], actual[6], actual[7], actual[8], actual[9], actual[10], actual[4]);
     if (deadlocked != 1 || succeeded != 15) bad = 1;
     return bad ? -1 : 0;
 }
