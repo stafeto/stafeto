@@ -57,6 +57,10 @@ impl Range {
         self.last
     }
 
+    pub const fn overlaps(self, other: Self) -> bool {
+        self.first <= other.last && other.first <= self.last
+    }
+
     /// The canonical SEEK_SET pair. A range through OFFSET_MAX uses zero
     /// length, including a finite request ending at that same final byte.
     pub const fn start_and_length(self) -> (i64, i64) {
@@ -66,6 +70,39 @@ impl Range {
             (self.last - self.first + 1) as i64
         };
         (self.first as i64, length)
+    }
+}
+
+/// The process PID already includes the process service's record generation.
+/// An OFD names one exact lifetime in the shared-description table. The two
+/// kinds remain independent even when the process opened that description.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner {
+    Process(u32),
+    Description { slot: u16, generation: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Read,
+    Write,
+}
+
+/// One region of a single file. The service authenticates its owner and
+/// selects the file's records before checking conflicts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lock {
+    pub owner: Owner,
+    pub kind: Kind,
+    pub range: Range,
+}
+
+impl Lock {
+    /// Existing regions of the same exact owner are replaced by a request.
+    pub fn conflicts(self, request: Self) -> bool {
+        self.owner != request.owner
+            && self.range.overlaps(request.range)
+            && (matches!(self.kind, Kind::Write) || matches!(request.kind, Kind::Write))
     }
 }
 
@@ -134,6 +171,57 @@ mod tests {
                 Range::relative(origin, start, length),
                 Err(RangeError::Overflow)
             );
+        }
+    }
+
+    fn lock(owner: Owner, kind: Kind, start: i64, length: i64) -> Lock {
+        Lock {
+            owner,
+            kind,
+            range: Range::relative(0, start, length).unwrap(),
+        }
+    }
+
+    #[test]
+    fn shared_reads_and_exact_owners_define_conflicts() {
+        let a = lock(Owner::Process(256), Kind::Read, 10, 20);
+        let b = lock(Owner::Process(512), Kind::Read, 20, 20);
+        assert!(!a.conflicts(b));
+        assert!(a.conflicts(Lock {
+            kind: Kind::Write,
+            ..b
+        }));
+        assert!(!a.conflicts(Lock {
+            owner: a.owner,
+            kind: Kind::Write,
+            ..b
+        }));
+        assert!(!a.conflicts(lock(b.owner, Kind::Write, 30, 1)));
+        assert!(a.conflicts(lock(b.owner, Kind::Write, 29, 1)));
+        assert!(a.conflicts(lock(b.owner, Kind::Write, 0, 0)));
+    }
+
+    #[test]
+    fn description_lifetimes_and_process_owners_stay_independent() {
+        let owner = Owner::Description {
+            slot: 0,
+            generation: 256,
+        };
+        let held = lock(owner, Kind::Write, 10, 20);
+        assert!(!held.conflicts(lock(owner, Kind::Write, 10, 20)));
+        for other in [
+            Owner::Description {
+                slot: 0,
+                generation: 512,
+            },
+            Owner::Description {
+                slot: 1,
+                generation: 256,
+            },
+            Owner::Process(256),
+        ] {
+            assert!(held.conflicts(lock(other, Kind::Read, 10, 20)));
+            assert!(lock(other, Kind::Read, 10, 20).conflicts(held));
         }
     }
 }
