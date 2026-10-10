@@ -143,3 +143,64 @@ static void public_wait_lifecycle(void) {
     if(executed_child>0)expect("RAM exec child lifetime after all locks released",ram_lifetime(executed_child),0);
     if(!failures)printf("posix-procs: genuine WAIT End exact debts and live parent fork exec custody ok\n");
 }
+
+extern int wait_process_discover(int fd,unsigned pid,unsigned long long nonce);
+extern int wait_process_receipt_gone(int fd,unsigned pid,unsigned long long nonce);
+extern unsigned long long wait_process_owner(void);
+/* Root wires this only after genuine read-only RAM method 0xfff7 is present. */
+void public_wait_process_exit(void) {
+    lifecycle_fd=open("/tmp/public-wait-process-exit",O_CREAT|O_RDWR,0666);
+    expect("open process-exit source",lifecycle_fd>=0,1);if(lifecycle_fd<0)return;
+    int holder_commands[2],holder_replies[2];
+    if(pipe(holder_commands)||pipe(holder_replies)){expect("process-exit holder pipes",0,1);close(lifecycle_fd);return;}
+    pid_t holder=fork();expect("fork process-exit blocker",holder>=0,1);
+    if(holder==0){close(holder_commands[1]);close(holder_replies[0]);char command;
+        while(read(holder_commands[0],&command,1)==1){if(command=='Q')_exit(0);
+            struct flock lock={.l_type=command=='L'?F_WRLCK:F_UNLCK,.l_whence=SEEK_SET,.l_len=1};
+            if(fcntl(lifecycle_fd,F_SETLK,&lock)||write(holder_replies[1],&command,1)!=1)_exit(81);
+        }_exit(82);
+    }
+    close(holder_commands[0]);close(holder_replies[1]);
+    if(holder<0){close(holder_commands[1]);close(holder_replies[0]);close(lifecycle_fd);return;}
+    expect("process-exit genuine blocker remains held",wait_holder_exchange(holder_commands[1],holder_replies[0],'L'),1);
+    unsigned previous_pid=0;unsigned long long previous_owner=0;
+    for(unsigned turn=0;turn<2;turn++){
+        int control[2],ready[2];if(pipe(control)||pipe(ready)){expect("process-exit peer pipes",0,1);break;}
+        pid_t peer=fork();expect("fork pending WAIT process",peer>=0,1);
+        if(peer==0){
+            close(control[1]);close(ready[0]);
+            __atomic_store_n(&lifecycle_ready,0,__ATOMIC_RELEASE);
+            if(wait_lifecycle_arm(3))_exit(83);
+            pthread_attr_t attr;if(pthread_attr_init(&attr)||pthread_attr_setstacksize(&attr,PTHREAD_STACK_MIN))_exit(84);
+            pthread_t worker;if(pthread_create(&worker,&attr,lifecycle_worker,NULL)||pthread_attr_destroy(&attr))_exit(84);
+            if(!lifecycle_stage())_exit(85);
+            struct timespec tick={0,1000000};int waiting=0;
+            for(unsigned n=0;n<10000;n++){waiting=wait_lifecycle_receiver_waiting();if(waiting)break;nanosleep(&tick,NULL);}
+            if(waiting!=1||write(ready[1],"W",1)!=1)_exit(86);
+            char exit_permission=0;if(read(control[0],&exit_permission,1)!=1||exit_permission!='E')_exit(87);
+            /* No join, source close, Cancel, Release or test-induced cancellation. */
+            _exit(0);
+        }
+        close(control[0]);close(ready[1]);
+        if(peer<0){close(control[1]);close(ready[0]);break;}
+        char accepted=0;expect("child actual kernel WAIT before process exit",read(ready[0],&accepted,1),1);expect("child WAIT ready marker",accepted,'W');
+        unsigned long long nonce=(2ULL<<32)|((unsigned long long)turn+1);
+        struct timespec tick={0,1000000};int discovered=0;
+        for(unsigned n=0;n<128;n++){discovered=wait_process_discover(lifecycle_fd,(unsigned)peer,nonce);if(discovered)break;nanosleep(&tick,NULL);}
+        expect("discover actual full paid receipt before exit",discovered,1);
+        unsigned long long owner=wait_process_owner();expect("process-exit fresh full PID",(unsigned)peer!=previous_pid,1);expect("process-exit fresh full paid owner",owner!=0&&owner!=previous_owner,1);
+        previous_pid=(unsigned)peer;previous_owner=owner;
+        expect("authorize actual _exit with pending WAIT",write(control[1],"E",1),1);close(control[1]);close(ready[0]);lifecycle_reap(peer);
+        int gone=0;
+        if(discovered==1){
+            for(unsigned n=0;n<128;n++){gone=wait_process_receipt_gone(lifecycle_fd,(unsigned)peer,nonce);if(gone)break;nanosleep(&tick,NULL);}
+            expect("dead process exact Queue and both Pool halves absent",gone,1);
+        }
+        expect("parent source remains open through peer death",fcntl(lifecycle_fd,F_GETFD)>=0,1);
+        struct flock get={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_len=1};expect("original blocker still real after process exit",fcntl(lifecycle_fd,F_GETLK,&get),0);expect("blocker stays Write",get.l_type,F_WRLCK);expect("blocker remains full holder PID",get.l_pid,holder);
+        if(discovered!=1||gone!=1)break;
+    }
+    char quit='Q';expect("stop process-exit holder",write(holder_commands[1],&quit,1),1);close(holder_commands[1]);close(holder_replies[0]);lifecycle_reap(holder);
+    expect("close process-exit source only after exact debt checks",close(lifecycle_fd),0);
+    if(!failures)printf("posix-procs: genuine pending WAIT process exit retires exact paid receipt without rescue close ok\n");
+}

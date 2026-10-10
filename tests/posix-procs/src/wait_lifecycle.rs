@@ -168,3 +168,134 @@ pub extern "C" fn wait_lifecycle_receiver_waiting() -> i32 {
         Err(_) => -22,
     }
 }
+
+static PEER_OWNER: AtomicU64 = AtomicU64::new(0);
+static PEER_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
+static PEER_GENERATION: AtomicU64 = AtomicU64::new(0);
+static PEER_REGISTRATION: AtomicU32 = AtomicU32::new(u32::MAX);
+fn peer_observe(fd: i32, pid: u32, nonce: u64, first: u32, exact: bool) -> Result<bool, i32> {
+    if nonce == 0 || pid == 0 || !matches!(first, 0 | 8) {
+        return Err(-30);
+    }
+    let (transport, backend) = posix_abi::shared::with_files(|files| {
+        let posix_fs::Target::Ram(backend) = files.target(fd as u32).map_err(|_| -31)? else {
+            return Err(-32);
+        };
+        Ok((files.transport(), backend))
+    })?;
+    let mut request = Writer::new();
+    proto_wire::Header::new(0xfff7, proto_fs::VERSION)
+        .write(&mut request)
+        .map_err(|_| -33)?;
+    request.u32(if exact { 2 } else { 1 }).map_err(|_| -34)?;
+    request.u64(nonce).map_err(|_| -34)?;
+    request
+        .u32(backend.fd() | backend.description_slot() << proto_fs::OPEN_DESCRIPTION_SHIFT)
+        .map_err(|_| -34)?;
+    request.u64(backend.generation()).map_err(|_| -34)?;
+    request.u32(pid).map_err(|_| -34)?;
+    request.u32(first).map_err(|_| -34)?;
+    if exact {
+        request
+            .u64(PEER_OWNER.load(Ordering::Acquire))
+            .map_err(|_| -34)?;
+        request
+            .u32(PEER_SLOT.load(Ordering::Acquire))
+            .map_err(|_| -34)?;
+        request
+            .u64(PEER_GENERATION.load(Ordering::Acquire))
+            .map_err(|_| -34)?;
+    }
+    let _scope = rt::upcall::defer_entries().map_err(|_| -35)?;
+    let reply =
+        rt::sys::send(transport.files().sessions().0, request.as_bytes()).map_err(|_| -36)?;
+    if !reply.handles.is_empty() || reply.len != 48 {
+        return Err(-37);
+    }
+    let bytes = rt::abi::inline_bytes(&reply.words);
+    let mut r = Reader::new(&bytes[..reply.len]);
+    if r.u32().map_err(|_| -38)? != 0
+        || r.u64().map_err(|_| -39)? != nonce
+        || r.u32().map_err(|_| -40)? != pid
+    {
+        return Err(-41);
+    }
+    let visited = r.u32().map_err(|_| -42)?;
+    let present = r.u32().map_err(|_| -43)?;
+    let owner = r.u64().map_err(|_| -44)?;
+    let slot = r.u32().map_err(|_| -45)?;
+    let generation = r.u64().map_err(|_| -46)?;
+    let registration = r.u32().map_err(|_| -47)?;
+    r.finish().map_err(|_| -48)?;
+    if !(1..=8).contains(&visited) || present > 1 {
+        return Err(-49);
+    }
+    if present == 0 {
+        if owner != 0 || slot != 0 || generation != 0 || registration != 0 {
+            return Err(-50);
+        }
+        return Ok(false);
+    }
+    if owner == 0 || (proto_fs::WaitKey { slot, generation }).validate().is_err() {
+        return Err(-51);
+    }
+    if exact {
+        if owner != PEER_OWNER.load(Ordering::Acquire)
+            || slot != PEER_SLOT.load(Ordering::Acquire)
+            || generation != PEER_GENERATION.load(Ordering::Acquire)
+            || !(registration == u32::MAX || (first..first + 8).contains(&registration))
+        {
+            return Err(-52);
+        }
+    } else {
+        if !(first..first + 8).contains(&registration) {
+            return Err(-53);
+        }
+        PEER_OWNER.store(owner, Ordering::Release);
+        PEER_SLOT.store(slot, Ordering::Release);
+        PEER_GENERATION.store(generation, Ordering::Release);
+        PEER_REGISTRATION.store(registration, Ordering::Release);
+    }
+    Ok(true)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wait_process_discover(fd: i32, pid: u32, nonce: u64) -> i32 {
+    PEER_OWNER.store(0, Ordering::Release);
+    PEER_GENERATION.store(0, Ordering::Release);
+    for first in [0, 8] {
+        match peer_observe(fd, pid, nonce, first, false) {
+            Ok(true) => {
+                rt::println!(
+                    "posix-procs: WAIT exit full PID {} owner {} key {}/{} registration {}",
+                    pid,
+                    PEER_OWNER.load(Ordering::Acquire),
+                    PEER_SLOT.load(Ordering::Acquire),
+                    PEER_GENERATION.load(Ordering::Acquire),
+                    PEER_REGISTRATION.load(Ordering::Acquire)
+                );
+                return 1;
+            }
+            Ok(false) => (),
+            Err(error) => return error,
+        }
+    }
+    0
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wait_process_receipt_gone(fd: i32, pid: u32, nonce: u64) -> i32 {
+    if PEER_OWNER.load(Ordering::Acquire) == 0 || PEER_GENERATION.load(Ordering::Acquire) == 0 {
+        return -54;
+    }
+    let mut present = false;
+    for first in [0, 8] {
+        match peer_observe(fd, pid, nonce, first, true) {
+            Ok(value) => present |= value,
+            Err(error) => return error,
+        }
+    }
+    i32::from(!present)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn wait_process_owner() -> u64 {
+    PEER_OWNER.load(Ordering::Acquire)
+}
