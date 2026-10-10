@@ -324,3 +324,125 @@ fn rejected_first_start_is_saved_before_its_release_fence() {
     assert_eq!(s.effects, 0);
     assert!(!s.events.contains(&Event::Cancel));
 }
+
+#[path = "../../posix-abi/src/wait_lock_driver/packet.rs"]
+mod packet;
+#[test]
+fn fixed_inline_packets_match_the_real_protocol_and_strict_envelopes() {
+    use proto_fs::{DataDescription, LockKind, Method, WaitKey, WaitMode, WaitStart};
+    use proto_wire::{Header, Reader, Status, Writer};
+    let key = WaitKey {
+        slot: 15,
+        generation: u64::MAX,
+    };
+    let wire = WaitStart {
+        key,
+        description: DataDescription {
+            packed: 7,
+            generation: 9,
+        },
+        mode: WaitMode::Ofd,
+        kind: LockKind::Write,
+        whence: 2,
+        start: i64::MIN,
+        length: i64::MAX,
+        pid: 0,
+    };
+    let p = packet::Packet::start(wire).unwrap();
+    let mut expected = Writer::new();
+    wire.write(&mut expected).unwrap();
+    assert_eq!(p.as_bytes(), expected.as_bytes());
+    assert_eq!(p.as_bytes().len(), 64);
+    let mut r = Reader::new(p.as_bytes());
+    assert_eq!(Header::read(&mut r).unwrap(), Method::WaitStart.header());
+    assert_eq!(WaitStart::read(r), Ok(wire));
+    for method in [
+        Method::WaitQuery,
+        Method::WaitArm,
+        Method::WaitCancel,
+        Method::WaitRelease,
+    ] {
+        let p = packet::Packet::keyed(method, key).unwrap();
+        let mut expected = Writer::new();
+        proto_fs::write_wait_key(method, key, &mut expected).unwrap();
+        assert_eq!(p.as_bytes(), expected.as_bytes());
+    }
+    assert!(packet::Packet::keyed(Method::LockQuery, key).is_err());
+    let mut out = Writer::new();
+    reply(WaitPhase::Sleeping, 0).write(&mut out).unwrap();
+    assert_eq!(
+        packet::reply(out.as_bytes()),
+        Ok(reply(WaitPhase::Sleeping, 0))
+    );
+    let error = [proto_fs::NO_LOCKS.to_le_bytes(), 0u32.to_le_bytes()].concat();
+    assert_eq!(
+        packet::reply(&error),
+        Err(Status::from_code(proto_fs::NO_LOCKS))
+    );
+    assert!(packet::reply(&error[..4]).is_err());
+    let mut bad_reserved = error.clone();
+    bad_reserved[4] = 1;
+    assert_eq!(packet::reply(&bad_reserved), Err(Status::BadSize));
+    let mut padded = error.clone();
+    padded.extend_from_slice(&0u32.to_le_bytes());
+    assert!(packet::reply(&padded).is_err());
+    assert_eq!(packet::released(&[0; 8]), Ok(()));
+    assert!(packet::released(&[0; 16]).is_err());
+    let mut malformed = [0; 8];
+    malformed[4] = 1;
+    assert!(packet::released(&malformed).is_err());
+}
+
+#[test]
+fn channel_capacity_failure_never_starts_and_pays_absent_release_before_ack() {
+    let mut s = Script::new();
+    s.channel = false;
+    driver::prepared(&mut s, Err(Failure::Room)).unwrap();
+    assert_eq!(
+        driver::drive(&mut s),
+        Ok(reply(WaitPhase::Complete, proto_fs::NO_LOCKS))
+    );
+    assert_eq!(s.events, vec![Event::Publish, Event::Release, Event::Ack]);
+    assert_eq!(s.starts, 0);
+    assert_eq!(s.effects, 0);
+    assert!(!s.channel);
+}
+#[test]
+fn fatal_channel_setup_revokes_claim_and_retains_cancel_cleanup() {
+    let mut s = Script::new();
+    s.channel = false;
+    assert_eq!(driver::prepared(&mut s, Err(Failure::Fatal(5))), Err(5));
+    assert_eq!(s.phase, Phase::Cleaning);
+    assert!(!s.claim);
+    assert!(s.local.is_none());
+    assert!(!driver::cleanup_step(&mut s).unwrap());
+    assert!(!driver::cleanup_step(&mut s).unwrap());
+    assert!(driver::cleanup_step(&mut s).unwrap());
+    assert_eq!(s.starts, 0);
+    assert!(s.events.contains(&Event::Cancel));
+}
+
+use abi::{Error, Source};
+#[path = "../../posix-abi/src/wait_lock_driver/raw_channel.rs"]
+mod raw_channel;
+#[test]
+fn exact_raw_channel_decoders_accept_only_confirmed_gone_and_notifications() {
+    assert_eq!(raw_channel::close_result(0), Ok(()));
+    assert_eq!(raw_channel::close_result(Error::BadHandle.code()), Ok(()));
+    for e in Error::KNOWN.into_iter().filter(|e| *e != Error::BadHandle) {
+        assert_eq!(raw_channel::close_result(e.code()), Err(e));
+    }
+    let mut regs = [0; 10];
+    regs[1] = 0x123456789abcd007;
+    assert_eq!(raw_channel::duplicate_result(&regs), Ok(regs[1]));
+    regs[0] = Error::BadHandle.code();
+    assert_eq!(raw_channel::duplicate_result(&regs), Err(Error::BadHandle));
+    assert_eq!(raw_channel::receive_result(&regs), Err(Error::BadHandle));
+    regs[0] = 0;
+    regs[1] = Source::Unlabeled.code() << abi::SOURCE_SHIFT;
+    assert_eq!(raw_channel::receive_result(&regs), Ok(()));
+    regs[1] = Source::Session.code() << abi::SOURCE_SHIFT;
+    assert_eq!(raw_channel::receive_result(&regs), Ok(()));
+    regs[1] = 0;
+    assert_eq!(raw_channel::receive_result(&regs), Err(Error::BadState));
+}

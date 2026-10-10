@@ -56,6 +56,25 @@ pub trait Session {
 
 const EIO: i32 = 5;
 
+/// Channel admission runs before Start; a proven resource refusal has no effect.
+pub fn prepared(session: &mut impl Session, created: Result<(), Failure>) -> Result<(), i32> {
+    match created {
+        Ok(()) | Err(Failure::Retired) => Ok(()),
+        Err(Failure::Room) => session.publish(WaitReply {
+            phase: WaitPhase::Complete,
+            result: proto_fs::NO_LOCKS,
+        }),
+        Err(Failure::Fatal(error)) => {
+            session.begin_cleanup(Reason::Abandoned)?;
+            Err(error)
+        }
+        Err(_) => {
+            session.begin_cleanup(Reason::Abandoned)?;
+            Err(EIO)
+        }
+    }
+}
+
 /// An error can race a helper that already saved the canonical receipt.
 fn failed_turn(session: &mut impl Session, saved: bool) -> Result<bool, i32> {
     let now = session.state()?;

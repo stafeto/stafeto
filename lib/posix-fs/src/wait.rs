@@ -6,9 +6,9 @@
 
 use super::{FsError, PosixFs, RamTarget, Target};
 use entries::{Frame, nested};
-use posix_fd::{
-    EntryToken, OwnerToken, WaitCancelReason, WaitChannelDebt, WaitClaim, WaitRecordPhase,
-    WaitResult, WaitSnapshot, WaitToken,
+pub use posix_fd::{
+    EntryToken, OwnerToken, WaitCancelReason, WaitChannelDebt, WaitClaim, WaitPlace,
+    WaitRecordPhase, WaitResult, WaitSnapshot, WaitToken,
 };
 use proto_fs::{DataDescription, LockKind, WaitKey, WaitMode, WaitPhase, WaitReply, WaitStart};
 use proto_wire::Reader;
@@ -104,7 +104,7 @@ impl Recovery {
 pub type Snapshot = WaitSnapshot<Recovery>;
 impl PosixFs {
     /// Capacity is independent from Open, Control and ordinary I/O holds.
-    pub fn wait_place(&self, owner: OwnerToken, current: Frame) -> posix_fd::WaitPlace {
+    pub fn wait_place(&self, owner: OwnerToken, current: Frame) -> WaitPlace {
         self.waits
             .place(|s| s.owner == Some(owner) && nested(current, s.recovery.frame()))
     }
