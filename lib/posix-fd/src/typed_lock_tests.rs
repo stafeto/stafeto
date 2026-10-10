@@ -1056,3 +1056,33 @@ fn drain_fork_discards_copied_debt_without_releasing_original_descriptors() {
     );
     assert_eq!(files.control_tokens().count(), 0);
 }
+
+#[test]
+fn drain_return_hands_off_canonical_result_without_erasing_cleanup_debt() {
+    let (mut files, source) = drain_fixture(false);
+    let (token, claim) = paid_drain(&mut files, source);
+    files.publish_drain_wait(claim, 0x1234_0000_0007).unwrap();
+    files
+        .complete_drain_record(claim, ControlResult::Failed(4))
+        .unwrap();
+    assert_eq!(
+        files.handoff_drain_record(token, owner()),
+        Ok(ControlResult::Failed(4))
+    );
+    let saved = files.drain_snapshot(token).unwrap();
+    assert_eq!(saved.owner, None);
+    let debt = saved.recovery.drain().unwrap();
+    assert!(debt.held());
+    assert_eq!(debt.server(), drain::Server::Waiting);
+    assert_eq!(
+        files.pick_drain_cleanup(Some(owner()), Frame::main(50), None),
+        Ok(Some(token))
+    );
+    files
+        .confirm_drain_gone(token, debt.session(), debt.key())
+        .unwrap();
+    files.release_drain_hold(token).unwrap();
+    files.finish_drain_cleanup(token).unwrap();
+    assert_eq!(files.drain_snapshot(token), Err(FsError::BadFileDescriptor));
+    assert_eq!(files.descriptors.get(source.fd), Ok(Target::Tty(0x1a02)));
+}

@@ -319,6 +319,7 @@ pub(crate) fn take_place<R>(
     loop {
         collect(Some(owner), here, None, true);
         let lock_pending = collect_lock(Some(owner), here, None, true);
+        crate::drain_driver::collect(Some(owner), here, None, true);
         let step = crate::shared::with_files(|files| match files.job_place(owner) {
             // Every job kind has custody separate from ordinary I/O holds.
             JobPlace::Free => match begin(files) {

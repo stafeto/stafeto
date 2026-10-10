@@ -280,6 +280,17 @@ impl PosixFs {
             .ack_control(token, owner)
             .map_err(FsError::from)
     }
+    /// Return the caller's saved outcome while unpaid cleanup stays resident.
+    pub fn handoff_drain_record(
+        &mut self,
+        token: ControlToken,
+        owner: OwnerToken,
+    ) -> Result<ControlResult, FsError> {
+        self.drain_snapshot(token)?;
+        self.descriptors
+            .ack_control(token, owner)
+            .map_err(FsError::from)
+    }
     pub fn abandon_drain_owner(
         &mut self,
         owner: OwnerToken,
