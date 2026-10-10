@@ -46,6 +46,12 @@ impl Places {
     pub fn used(&self) -> usize {
         usize::from(self.used.get())
     }
+    /// Inspect a previously observed issued label after its Place was retired.
+    #[cfg(feature = "lifetime-probe")]
+    pub fn probe_place(label: u64) -> Option<usize> {
+        let slot = (label & 511) as usize;
+        (label & OWN != 0 && slot != 0 && slot < COUNT).then_some(slot)
+    }
     pub fn issue(&self, generation: u64) -> Option<u64> {
         if generation >= 1 << 53 {
             return None;

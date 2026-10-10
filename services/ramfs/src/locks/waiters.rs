@@ -257,6 +257,31 @@ impl Pool {
         }
     }
 
+    /// Lifetime image observer: one physical half, including empty slots.
+    #[cfg(feature = "lifetime-probe")]
+    pub fn probe_part(
+        &self,
+        first: usize,
+        mut visit: impl FnMut(RegistrationToken, Input, Phase),
+    ) -> Result<usize, u32> {
+        if first != 0 && first != PORTION {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        for (slot, record) in self.records.iter().enumerate().skip(first).take(PORTION) {
+            if let Some(record) = record {
+                visit(
+                    RegistrationToken {
+                        slot: slot as u8,
+                        receipt: record.input.receipt,
+                    },
+                    record.input,
+                    record.phase,
+                );
+            }
+        }
+        Ok(PORTION)
+    }
+
     /// Visit at most eight FIFO entries. Retirement invalidates a cursor instead
     /// of granting authority to a reused slot; the caller restarts its bounded scan.
     pub fn scan(

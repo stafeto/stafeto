@@ -73,7 +73,7 @@ const METHODS: &[u16] = BASE_METHODS;
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
         + cfg!(feature = "steps") as usize
-        + 3 * cfg!(feature = "lifetime-probe") as usize
+        + 4 * cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
@@ -92,6 +92,7 @@ const METHODS: &[u16] = &{
         methods[i] = 0xfff3;
         methods[i + 1] = 0xfff2;
         methods[i + 2] = 0xfff6;
+        methods[i + 3] = 0xfff7;
     }
     methods
 };
@@ -2085,6 +2086,10 @@ impl Service<0> for Fs {
             return self.fifo_probe_request(&s.data, r);
         }
         #[cfg(feature = "lifetime-probe")]
+        if r.method() == 0xfff7 {
+            return self.wait_process_probe_request(&s.data, r);
+        }
+        #[cfg(feature = "lifetime-probe")]
         if r.method() == 0xfff6 {
             if !r.handles.is_empty() {
                 return Answer::Status(Status::BadSize);
@@ -3246,6 +3251,130 @@ impl Fs {
             if !valid {
                 self.fifo_probe.invalidate(scope.owner);
             }
+        }
+    }
+    #[cfg(feature = "lifetime-probe")]
+    fn wait_process_probe_request(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
+        use ramfs::locks::{Owner, wait_receipts::Id, waiters::Phase};
+        if !r.handles.is_empty() || fds.binding.snapshot_ref().is_none() {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut body = r.body();
+        let (Ok(action), Ok(nonce)) = (body.u32(), body.u64()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        #[cfg(feature = "steps")]
+        if action == 63 && nonce == 32 && body.left() == 0 {
+            return rt::service::step_snapshot(r);
+        }
+        rt::service::step_detail(32);
+        let (Ok(packed), Ok(generation), Ok(pid), Ok(first)) =
+            (body.u32(), body.u64(), body.u32(), body.u32())
+        else {
+            return Answer::Status(Status::BadSize);
+        };
+        if nonce == 0
+            || pid == 0
+            || generation == 0
+            || !matches!(first, 0 | 8)
+            || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+        {
+            return status(proto_fs::INVALID_ARGUMENT);
+        }
+        let exact = match action {
+            1 => None,
+            2 => {
+                let (Ok(owner), Ok(slot), Ok(generation)) = (body.u64(), body.u32(), body.u64())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Some(place) = ramfs::places::Places::probe_place(owner) else {
+                    return status(proto_fs::INVALID_ARGUMENT);
+                };
+                match Id::new(place, owner, proto_fs::WaitKey { slot, generation }) {
+                    Ok(id) => Some(id),
+                    Err(code) => return status(code),
+                }
+            }
+            _ => return status(proto_fs::INVALID_ARGUMENT),
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let description = proto_fs::DataDescription { packed, generation };
+        let source = ramfs::TentativeOpen {
+            fd: description.fd(),
+            description: Token {
+                slot: description.slot() as u16,
+                generation,
+            },
+        };
+        let inode = match self.ram.live_description(fds, source) {
+            Ok((inode, _)) => inode,
+            Err(code) => return status(code),
+        };
+        if !self.register_lifetimes()
+            || exact.is_none() && !self.lifetimes.as_ref().is_some_and(|page| page.live(pid))
+        {
+            return status(proto_fs::PERMISSION);
+        }
+        let queue = &*self.wait_jobs;
+        let mut found = None;
+        let mut registration = u32::MAX;
+        if let Some(id) = exact
+            && let Ok((captured, _, _)) = queue.snapshot(id)
+        {
+            if captured.request.inode != inode || captured.request.owner != Owner::Process(pid) {
+                return status(proto_fs::PERMISSION);
+            }
+            found = Some(id);
+        }
+        let scanned = self
+            .wait_pool
+            .probe_part(first as usize, |token, input, phase| {
+                let id = token.receipt();
+                if let Some(exact) = exact {
+                    if id == exact {
+                        found = Some(id);
+                        registration = token.slot() as u32;
+                    }
+                } else if input.inode == inode
+                    && phase == Phase::Sleeping
+                    && queue
+                        .snapshot(id)
+                        .is_ok_and(|(captured, phase, cancelling)| {
+                            captured.request.inode == inode
+                                && captured.request.owner == Owner::Process(pid)
+                                && phase == ramfs::locks::wait_receipts::Phase::Sleeping
+                                && !cancelling
+                        })
+                {
+                    found = Some(id);
+                    registration = token.slot() as u32;
+                }
+            });
+        let visited = match scanned {
+            Ok(visited) => visited,
+            Err(code) => return status(code),
+        };
+        let (owner, slot, generation) = found.map_or((0, 0, 0), |id| {
+            (id.owner(), id.key().slot, id.key().generation)
+        });
+        let reply = r.reply();
+        let result = (|| {
+            reply.u32(0)?;
+            reply.u64(nonce)?;
+            reply.u32(pid)?;
+            reply.u32(visited as u32)?;
+            reply.u32(u32::from(found.is_some()))?;
+            reply.u64(owner)?;
+            reply.u32(slot)?;
+            reply.u64(generation)?;
+            reply.u32(if found.is_some() { registration } else { 0 })
+        })();
+        match result {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(code) => Answer::Status(code),
         }
     }
     #[cfg(feature = "lifetime-probe")]
