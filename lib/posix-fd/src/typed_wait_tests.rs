@@ -319,3 +319,164 @@ fn wait_capacity_is_independent_and_protected_owner_cannot_wait_for_itself() {
             .is_ok()
     );
 }
+
+fn closing_token(files: &mut PosixFs, fd: u32) -> crate::CloseToken {
+    match files
+        .begin_close_record(Some(owner()), fd, Frame::main(777))
+        .unwrap()
+    {
+        closing::Admission::Started { token, .. } => token,
+        other => panic!("unexpected admission: {other:?}"),
+    }
+}
+#[test]
+fn close_selects_both_families_fairly_and_closes_cleaned_receiver_before_event() {
+    use closing::CloseCommandFence::{Control, Wait};
+    let (mut files, entry, _, control_input) = fixture();
+    let (c, cc) = files
+        .begin_lock_record(owner(), entry, Frame::main(100), control_input)
+        .unwrap();
+    let terminal = control::TerminalReply::from_reply(LockReply {
+        phase: LockPhase::Complete,
+        result: 0,
+        blocker: None,
+    })
+    .unwrap();
+    files
+        .complete_lock_record(cc, ControlResult::Value(0), terminal)
+        .unwrap();
+    let (w, wc) = files
+        .begin_wait_record(owner(), entry, Frame::main(101), input())
+        .unwrap();
+    files.attach_wait_channel(wc, 0x123456789abc0007).unwrap();
+    files
+        .begin_wait_cleanup(w, WaitCancelReason::Signal)
+        .unwrap();
+    files
+        .publish_wait_cleanup(w, WaitResult::Value(0), done(0))
+        .unwrap();
+    let close = closing_token(&mut files, entry.fd);
+    let before = files.close_snapshot(close).unwrap();
+    let sequence: closing::WaitValue = files.descriptors.close_wait_value(close).unwrap();
+    for expected in [Control(c), Wait(w), Control(c), Wait(w)] {
+        assert_eq!(files.close_command_fence(close), Ok(Some(expected)));
+    }
+    assert_eq!(files.descriptors.close_wait_value(close).unwrap(), sequence);
+    assert_eq!(files.close_snapshot(close).unwrap(), before);
+    assert_eq!(
+        files.lock_snapshot(c).unwrap().result,
+        Some(ControlResult::Value(0))
+    );
+    assert_eq!(
+        files.wait_snapshot(w).unwrap().reason,
+        Some(WaitCancelReason::Signal)
+    );
+    assert_eq!(
+        files.wait_snapshot(w).unwrap().result,
+        Some(WaitResult::Value(0))
+    );
+    files.finish_lock_cleanup(c).unwrap();
+    files.finish_wait_cleanup(w).unwrap();
+    assert_eq!(
+        files.close_command_fence(close),
+        Ok(Some(Wait(w))),
+        "Cleaned still owes exact receiver close"
+    );
+    let debt = files.wait_channel_debt(w).unwrap().unwrap();
+    assert_eq!(debt.raw(), 0x123456789abc0007);
+    files.confirm_wait_channel_closed(debt).unwrap();
+    assert_eq!(files.close_command_fence(close), Ok(None));
+    let (result, recovery) = files.ack_wait_record(w, owner()).unwrap();
+    assert_eq!(result, WaitResult::Value(0));
+    assert_eq!(recovery.outcome(), Some(done(0).reply()));
+}
+#[test]
+fn full_wait_and_control_custody_leave_close_admission_and_other_alias_intact() {
+    use closing::CloseCommandFence::{Control, Wait};
+    let (mut files, entry, target, control_input) = fixture();
+    let alias = files
+        .descriptors
+        .duplicate(entry.fd, 0, Flags::default())
+        .unwrap();
+    let alias_entry = files.lock_source(alias).unwrap();
+    let mut control_token = None;
+    let mut wait_token = None;
+    for i in 0..16 {
+        let source = if i == 0 { entry } else { alias_entry };
+        let (c, _) = files
+            .begin_lock_record(owner(), source, Frame::main(100 + i), control_input)
+            .unwrap();
+        let (w, _) = files
+            .begin_wait_record(owner(), source, Frame::main(200 + i), input())
+            .unwrap();
+        if i == 0 {
+            control_token = Some(c);
+            wait_token = Some(w);
+        }
+    }
+    let close = closing_token(&mut files, entry.fd);
+    assert_eq!(
+        files.close_command_fence(close),
+        Ok(Some(Control(control_token.unwrap())))
+    );
+    assert_eq!(
+        files.close_command_fence(close),
+        Ok(Some(Wait(wait_token.unwrap())))
+    );
+    let alien = files
+        .wait_tokens()
+        .find(|&t| t != wait_token.unwrap())
+        .unwrap();
+    assert_eq!(
+        files.wait_snapshot(alien).unwrap().phase,
+        WaitRecordPhase::Working
+    );
+    assert_eq!(files.descriptors.get(alias), Ok(Target::Ram(target)));
+}
+#[test]
+fn closing_recovery_is_not_change_and_local_preference_preserves_frame() {
+    let recovery = control::Recovery::closing(Frame::main(901));
+    assert!(!recovery.is_change());
+    assert!(recovery.lock().is_none());
+    let (recovery, first) = recovery.next_close_fence().unwrap();
+    let (recovery, second) = recovery.next_close_fence().unwrap();
+    assert!(!first);
+    assert!(second);
+    assert_eq!(recovery.frame(), Frame::main(901));
+    assert!(
+        control::Recovery::change(Frame::main(901))
+            .next_close_fence()
+            .is_err()
+    );
+    assert_eq!(core::mem::size_of::<control::Recovery>(), 120);
+    assert_eq!(
+        core::mem::size_of::<Table<Target, 32, (), (), control::Recovery>>(),
+        14096
+    );
+}
+
+#[test]
+fn already_confirmed_close_receipt_does_not_repeat_fencing_or_mutate_outcomes() {
+    let (mut files, entry, _, control_input) = fixture();
+    let (c, _) = files
+        .begin_lock_record(owner(), entry, Frame::main(100), control_input)
+        .unwrap();
+    let (w, _) = files
+        .begin_wait_record(owner(), entry, Frame::main(101), input())
+        .unwrap();
+    let close = closing_token(&mut files, entry.fd);
+    // Model the authoritative receipt observed by a delayed competing helper.
+    files.finish_close_record(close).unwrap();
+    let snapshot = files.close_snapshot(close).unwrap();
+    assert!(snapshot.complete);
+    assert_eq!(files.close_command_fence(close), Ok(None));
+    assert_eq!(files.close_snapshot(close).unwrap(), snapshot);
+    assert_eq!(
+        files.control_snapshot(c).unwrap().phase,
+        ControlPhase::Working
+    );
+    assert_eq!(
+        files.wait_snapshot(w).unwrap().phase,
+        WaitRecordPhase::Working
+    );
+}

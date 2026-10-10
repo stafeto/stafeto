@@ -212,8 +212,10 @@ impl PosixFs {
         source: EntryToken,
     ) -> Result<Option<WaitToken>, FsError> {
         let token = self.wait_tokens().find(|&t| {
-            self.wait_snapshot(t)
-                .is_ok_and(|s| s.recovery.source() == source && s.phase != WaitRecordPhase::Cleaned)
+            self.wait_snapshot(t).is_ok_and(|s| {
+                s.recovery.source() == source
+                    && (s.phase != WaitRecordPhase::Cleaned || s.channel.is_some())
+            })
         });
         if let Some(t) = token {
             self.begin_wait_cleanup(t, WaitCancelReason::Close)?;

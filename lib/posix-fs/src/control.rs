@@ -94,6 +94,7 @@ impl LockRecovery {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
     Change,
+    Closing { prefer_wait: bool },
     Lock(LockRecovery),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,13 +109,30 @@ impl Recovery {
             kind: Kind::Change,
         }
     }
+    pub(crate) fn closing(frame: Frame) -> Self {
+        Self {
+            frame,
+            kind: Kind::Closing { prefer_wait: false },
+        }
+    }
+    pub(crate) fn next_close_fence(mut self) -> Result<(Self, bool), posix_fd::Error> {
+        let Kind::Closing {
+            ref mut prefer_wait,
+        } = self.kind
+        else {
+            return Err(posix_fd::Error::InvalidArgument);
+        };
+        let selected = *prefer_wait;
+        *prefer_wait = !selected;
+        Ok((self, selected))
+    }
     pub fn frame(self) -> Frame {
         self.frame
     }
     pub fn lock(self) -> Option<LockRecovery> {
         match self.kind {
             Kind::Lock(lock) => Some(lock),
-            Kind::Change => None,
+            Kind::Change | Kind::Closing { .. } => None,
         }
     }
     pub fn is_change(self) -> bool {

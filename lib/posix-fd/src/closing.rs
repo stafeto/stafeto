@@ -81,6 +81,19 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     pub fn close_snapshot(&self, token: CloseToken) -> Result<CloseSnapshot<T, C>, Error> {
         Ok(self.close_record(token)?.snapshot)
     }
+    /// Exact local recovery metadata only; the frozen receipt and wait sequence stay put.
+    pub fn update_close_metadata<V>(
+        &mut self,
+        token: CloseToken,
+        update: impl FnOnce(C) -> Result<(C, V), Error>,
+    ) -> Result<V, Error> {
+        let mut record = self.close_record(token)?;
+        let (recovery, value) = update(record.snapshot.recovery)?;
+        record.snapshot.recovery = recovery;
+        // Metadata is not a new CloseEvent/physical outcome or waiter sequence.
+        self.closings[token.slot].record = Some(record);
+        Ok(value)
+    }
     pub fn closing(&self, fd: u32) -> Option<CloseToken> {
         match self.entries.get(fd as usize)?.state {
             EntryState::Closing(token) => Some(token),
@@ -745,5 +758,37 @@ mod tests {
         assert_eq!(table.close_wait_value(close), Ok(WaitValue::NeverSleep));
         table.finish_close_release(close, 100).unwrap();
         table.ack_close(close, Some(owner(1))).unwrap();
+    }
+    #[test]
+    fn exact_metadata_update_rejects_retired_generation_without_calling_callback() {
+        let mut table = TestTable::default();
+        let fd = table.insert(100, Flags::default()).unwrap();
+        let (old, _) = start(&mut table, fd);
+        let sequence = table.close_wait_value(old).unwrap();
+        assert_eq!(table.update_close_metadata(old, |r| Ok((r + 1, 7))), Ok(7));
+        assert_eq!(table.close_snapshot(old).unwrap().recovery, 43);
+        assert_eq!(table.close_wait_value(old).unwrap(), sequence);
+        assert_eq!(
+            table.update_close_metadata(old, |_| Err::<(u64, ()), _>(Error::InvalidArgument)),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(table.close_snapshot(old).unwrap().recovery, 43);
+        table.finish_close(old).unwrap();
+        table.finish_close_release(old, 100).unwrap();
+        table.ack_close(old, Some(owner(1))).unwrap();
+        let fd = table.insert(101, Flags::default()).unwrap();
+        let (current, snapshot) = start(&mut table, fd);
+        assert_eq!(old.slot(), current.slot());
+        assert_ne!(old.generation(), current.generation());
+        let mut called = false;
+        assert_eq!(
+            table.update_close_metadata(old, |r| {
+                called = true;
+                Ok((r, ()))
+            }),
+            Err(Error::BadFileDescriptor)
+        );
+        assert!(!called);
+        assert_eq!(table.close_snapshot(current).unwrap(), snapshot);
     }
 }
