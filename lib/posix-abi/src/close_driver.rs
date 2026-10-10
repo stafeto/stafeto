@@ -151,14 +151,25 @@ fn drive(token: CloseToken) -> Result<(), i32> {
 /// One canonical request or one local retirement; every RPC occurs unlocked.
 fn step(token: CloseToken) -> Result<bool, i32> {
     let state = crate::shared::with_files(|files| {
-        Ok(files
-            .close_snapshot(token)
-            .ok()
-            .map(|snapshot| (files.transport(), snapshot)))
+        let Ok(snapshot) = files.close_snapshot(token) else {
+            return Ok(None);
+        };
+        let fence = if snapshot.complete {
+            None
+        } else {
+            files
+                .fence_lock_for_close(snapshot.entry)
+                .map_err(crate::error)?
+        };
+        Ok(Some((files.transport(), snapshot, fence)))
     })?;
-    let Some((transport, snapshot)) = state else {
+    let Some((transport, snapshot, fence)) = state else {
         return Ok(true);
     };
+    if let Some(debt) = fence {
+        crate::lock_driver::cleanup_step(debt)?;
+        return Ok(false);
+    }
     if !snapshot.complete {
         let held = ram(snapshot.backend).ok_or(EIO)?;
         let event = proto_fs::CloseEvent {

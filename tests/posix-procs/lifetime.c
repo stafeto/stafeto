@@ -32,7 +32,7 @@ void close_probe_signal_jump(void) { raise(SIGUSR1); }
 static int failures;
 static void expect(const char *what, int actual, int wanted) {
     if (actual != wanted) {
-        printf("PID lifetime: %s: got %d, expected %d\n", what, actual, wanted);
+        printf("PID lifetime: %s: got %d, expected %d, errno %d\n", what, actual, wanted, errno);
         failures++;
     }
 }
@@ -46,6 +46,101 @@ static void reap(pid_t child, int killed) {
     expect("wait status", killed ? WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL
                                 : WIFEXITED(status) && WEXITSTATUS(status) == 0, 1);
     expect_life("dead before wait returns", child, 0);
+}
+static void public_lock_commands(void) {
+    int fd = open("/tmp/public-lock-fields", O_CREAT | O_TRUNC | O_RDWR, 0666);
+    expect("open public lock file", fd >= 0, 1);
+    if (fd < 0) return;
+    int alias = dup(fd);
+    expect("alias public lock file", alias >= 0, 1);
+    if (alias < 0) { close(fd); return; }
+    expect("seek before accepted relative lock", lseek(fd, 16, SEEK_SET), 16);
+    struct flock lock;
+    memset(&lock, 0xa5, sizeof lock);
+    lock.l_type = F_WRLCK; lock.l_whence = SEEK_CUR;
+    lock.l_start = 4; lock.l_len = 8; lock.l_pid = 123;
+    struct flock original;
+    memcpy(&original, &lock, sizeof lock);
+    expect("public PID SET relative", fcntl(fd, F_SETLK, &lock), 0);
+    expect("SET preserves all caller fields and padding", memcmp(&lock, &original, sizeof lock), 0);
+    expect("accepted lock leaves cursor", lseek(fd, 0, SEEK_CUR), 16);
+    memset(&lock, 0, sizeof lock);
+    lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET; lock.l_len = 0;
+    expect("public OFD GET sees PID blocker", fcntl(alias, 36, &lock), 0);
+    expect("PID blocker type", lock.l_type, F_WRLCK);
+    expect("PID blocker absolute origin", lock.l_whence, SEEK_SET);
+    expect("PID blocker start", lock.l_start, 20);
+    expect("PID blocker length", lock.l_len, 8);
+    expect("PID blocker genuine identity", lock.l_pid, getpid());
+    pid_t child = fork();
+    if (child == 0) {
+        struct flock query;
+        memset(&query, 0, sizeof query);
+        query.l_type = F_WRLCK; query.l_whence = SEEK_SET; query.l_len = 0;
+        if (fcntl(fd, F_GETLK, &query) || query.l_pid != getppid() || query.l_start != 20)
+            _exit(71);
+        query.l_type = F_WRLCK; query.l_whence = SEEK_SET; query.l_start = 20;
+        query.l_len = 8; query.l_pid = 0;
+        struct flock before;
+        memcpy(&before, &query, sizeof query);
+        if (fcntl(fd, F_SETLK, &query) != -1 || errno != EAGAIN ||
+            memcmp(&query, &before, sizeof query)) _exit(72);
+        _exit(0);
+    }
+    expect("fork PID conflict child", child >= 0, 1);
+    if (child > 0) {
+        int status = 0;
+        expect("wait PID conflict child", waitpid(child, &status, 0), child);
+        expect("PID conflict child exit", WIFEXITED(status) ? WEXITSTATUS(status) : -1, 0);
+        expect("PID conflict child is dead", process_lifetime(child), 0);
+    }
+    expect("close alias releases all PID locks", close(alias), 0);
+    memset(&lock, 0xa5, sizeof lock);
+    lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET;
+    lock.l_start = 20; lock.l_len = 8; lock.l_pid = 0;
+    memcpy(&original, &lock, sizeof lock);
+    expect("public OFD GET after alias close", fcntl(fd, 36, &lock), 0);
+    original.l_type = F_UNLCK;
+    expect("unlocked GET changes only type", memcmp(&lock, &original, sizeof lock), 0);
+    memset(&lock, 0, sizeof lock);
+    lock.l_type = F_RDLCK; lock.l_whence = SEEK_SET; lock.l_start = 30; lock.l_len = 0;
+    expect("public OFD SET", fcntl(fd, 37, &lock), 0);
+    child = fork();
+    if (child == 0) {
+        struct flock query;
+        memset(&query, 0, sizeof query);
+        query.l_type = F_WRLCK; query.l_whence = SEEK_SET; query.l_len = 0;
+        if (fcntl(fd, 36, &query) || query.l_type != F_UNLCK) _exit(73);
+        query.l_type = F_WRLCK;
+        if (fcntl(fd, F_GETLK, &query) || query.l_type != F_RDLCK ||
+            query.l_start != 30 || query.l_len != 0 || query.l_pid != -1) _exit(74);
+        if (close(fd)) _exit(75);
+        _exit(0);
+    }
+    expect("fork OFD inheritance child", child >= 0, 1);
+    if (child > 0) {
+        int status = 0;
+        expect("wait OFD inheritance child", waitpid(child, &status, 0), child);
+        expect("OFD inheritance child exit", WIFEXITED(status) ? WEXITSTATUS(status) : -1, 0);
+        expect("OFD inheritance child is dead", process_lifetime(child), 0);
+    }
+    memset(&lock, 0, sizeof lock);
+    lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET; lock.l_len = 0;
+    expect("parent OFD survives child close", fcntl(fd, F_GETLK, &lock), 0);
+    expect("surviving OFD blocker", lock.l_pid, -1);
+    expect("last OFD close", close(fd), 0);
+    fd = open("/tmp/public-lock-fields", O_RDWR);
+    expect("reopen after OFD retirement", fd >= 0, 1);
+    if (fd >= 0) {
+        memset(&lock, 0, sizeof lock);
+        lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET; lock.l_len = 0;
+        expect("last close clears OFD lock", fcntl(fd, F_GETLK, &lock), 0);
+        expect("retired OFD is unlocked", lock.l_type, F_UNLCK);
+        expect("close reopened file", close(fd), 0);
+    }
+    expect("invalid lock fd", fcntl(-1, F_GETLK, NULL), -1);
+    expect("invalid lock fd errno", errno, EBADF);
+    if (!failures) printf("posix-procs: public nonblocking locks, canonical fields, PID close and OFD fork ok\n");
 }
 int main(int argc, char **argv) {
     expect_life("running full PID", getpid(), 1);
@@ -74,6 +169,7 @@ int main(int argc, char **argv) {
     expect_life("PID lives with changed credentials", getpid(), 1);
     expect("restore effective UID", seteuid(0), 0);
     expect_life("PID lives with restored credentials", getpid(), 1);
+    public_lock_commands();
     expect("native lock commands and exact custody", ram_lock_commands(getpid()), 0);
     expect("native close receipt and 32-reference birth", ram_close_event(), 0);
     expect("public close receipts and helper reuse", close_driver_receipts(), 0);

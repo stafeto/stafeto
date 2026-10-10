@@ -3215,6 +3215,10 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(&outcome, "posix-procs: PID lifetime page ok")?;
     qemu::expect_marker(
         &outcome,
+        "posix-procs: public nonblocking locks, canonical fields, PID close and OFD fork ok",
+    )?;
+    qemu::expect_marker(
+        &outcome,
         "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok",
     )?;
     for marker in [

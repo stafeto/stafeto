@@ -18,10 +18,8 @@ pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;
 pub mod fork;
 pub mod loader_probe;
-pub mod lock_fields;
-// Activated with the descriptor close fence in the following integration stage.
-#[allow(dead_code)]
 mod lock_driver;
+pub mod lock_fields;
 pub mod long;
 pub mod metadata;
 pub mod names;
@@ -39,6 +37,20 @@ pub mod wait;
 
 use constants::*;
 use core::ffi::{c_char, c_int};
+
+/// Execute a nonblocking advisory lock command with copied caller fields.
+///
+/// # Safety
+/// `pointer` names readable flock fields and writable fields for a successful GET.
+pub unsafe fn file_lock(fd: c_int, command: c_int, pointer: *mut u8) -> Result<c_int, c_int> {
+    let fd = u32::try_from(fd).map_err(|_| constants::EBADF)?;
+    shared::with_fd(fd, |files| files.lock_source(fd).map(|_| ()).map_err(error))?;
+    // SAFETY: the calling platform supplies flock fields for this invocation.
+    let input = unsafe { lock_fields::Input::read(command, pointer) }?;
+    let outcome = lock_driver::operation(fd, input);
+    // SAFETY: successful GET writes fields only in the same active invocation.
+    unsafe { input.finish(pointer, outcome) }
+}
 use core::sync::atomic::{AtomicU8, Ordering};
 use posix_fs::{DescriptorFlags, FsError, SeekFrom};
 use posix_request::{MAX_PATH, MESSAGE_MAX, Reply, Request};
