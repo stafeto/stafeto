@@ -10,6 +10,9 @@
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "lifetime-probe")]
+mod fifo_probe;
+
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use proto_fs::{MAX_READ, MAX_WRITE, Method, VERSION};
@@ -68,7 +71,7 @@ const METHODS: &[u16] = BASE_METHODS;
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
         + cfg!(feature = "steps") as usize
-        + cfg!(feature = "lifetime-probe") as usize
+        + 2 * cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
@@ -85,6 +88,7 @@ const METHODS: &[u16] = &{
     }
     if cfg!(feature = "lifetime-probe") {
         methods[i] = 0xfff3;
+        methods[i + 1] = 0xfff2;
     }
     methods
 };
@@ -314,6 +318,8 @@ fn main(_: u64) -> u64 {
         wait_proof_serial: 0,
         wait_proof_disabled: false,
         wait_proof_turn: false,
+        #[cfg(feature = "lifetime-probe")]
+        fifo_probe: fifo_probe::Gate::new(),
         wait_timer,
         _wait_view: wait_view,
         wait_timer_armed: false,
@@ -388,6 +394,8 @@ struct Fs {
     wait_proof_serial: u64,
     wait_proof_disabled: bool,
     wait_proof_turn: bool,
+    #[cfg(feature = "lifetime-probe")]
+    fifo_probe: fifo_probe::Gate,
     wait_timer: Handle<Timer>,
     _wait_view: Handle<Channel>,
     wait_timer_armed: bool,
@@ -1335,6 +1343,8 @@ impl Service<0> for Fs {
         sessions: &mut [Option<Session<Fds, 0>>],
         notice: rt::service::Notice,
     ) {
+        #[cfg(feature = "lifetime-probe")]
+        self.check_fifo_probe(sessions);
         if notice.source == rt::abi::Source::Timer && notice.label == WAIT_TIMER_LABEL {
             self.wait_timer_armed = false;
             if self.wait_pool.count() != 0 {
@@ -1430,6 +1440,8 @@ impl Service<0> for Fs {
                             .expect("exact Control capture")
                             .0;
                         self.wait_events.changed(captured.request.inode);
+                        #[cfg(feature = "lifetime-probe")]
+                        self.fifo_probe.changed(captured);
                     }
                     let place = usize::from(id.slot()) / ramfs::locks::jobs::SHARE;
                     let source = sessions
@@ -1476,6 +1488,7 @@ impl Service<0> for Fs {
                         self.legacy_pending = true;
                     }
                 } else if !self.locks.busy()
+                    && !self.fifo_pause_wait()
                     && self.wait_jobs.has_work()
                     && (self.wait_request_turn || !self.lock_jobs.has_work())
                 {
@@ -1510,7 +1523,7 @@ impl Service<0> for Fs {
                             self.publish_wait(id);
                         }
                     }
-                } else if !self.locks.busy() {
+                } else if !self.locks.busy() && !self.fifo_frozen() {
                     self.wait_request_turn = true;
                     self.select_control(sessions);
                 }
@@ -2041,12 +2054,23 @@ impl Service<0> for Fs {
         if proto_fs::is_loaders(r.label()) {
             return status(proto_fs::PERMISSION);
         }
+        #[cfg(feature = "lifetime-probe")]
+        if matches!(
+            Method::from_number(r.method()),
+            Some(Method::Close | Method::CloseExact | Method::CloseEvent)
+        ) {
+            self.fifo_probe.invalidate(r.label());
+        }
         let cleanup = matches!(
             Method::from_number(r.method()),
             Some(Method::Close | Method::CloseExact | Method::CloseEvent | Method::ResolveCancel)
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
+        }
+        #[cfg(feature = "lifetime-probe")]
+        if r.method() == 0xfff2 {
+            return self.fifo_probe_request(&s.data, r);
         }
         #[cfg(feature = "lifetime-probe")]
         if r.method() == 0xfff3 {
@@ -2778,7 +2802,15 @@ impl Fs {
         let id = if let Some(id) = self.wait_selection {
             id
         } else {
-            let Some(id) = self.lock_jobs.next_ready() else {
+            #[cfg(feature = "lifetime-probe")]
+            let chosen = if self.fifo_probe.phase == fifo_probe::Phase::Selecting {
+                self.fifo_probe.control
+            } else {
+                None
+            };
+            #[cfg(not(feature = "lifetime-probe"))]
+            let chosen = None;
+            let Some(id) = chosen.or_else(|| self.lock_jobs.next_ready()) else {
                 return;
             };
             let Ok((captured, phase, cancelling)) = self.lock_jobs.snapshot(id) else {
@@ -2818,6 +2850,8 @@ impl Fs {
             |pid| page.is_some_and(|page| page.live(pid)) && locks.pid_visible(pid),
             |ofd| descriptions.live(ofd),
         );
+        #[cfg(feature = "lifetime-probe")]
+        self.fifo_probe.visit(id, progress.visited);
         let Some(decision) = progress.decision else {
             return;
         };
@@ -2862,9 +2896,13 @@ impl Fs {
                     .run(candidate.registration)
                     .expect("eligible registration ready");
                 self.begin_wait(receipt, sessions);
+                #[cfg(feature = "lifetime-probe")]
+                self.fifo_probe.finish(id, Some(candidate.registration));
                 return;
             }
         }
+        #[cfg(feature = "lifetime-probe")]
+        self.fifo_probe.finish(id, None);
         let place = usize::from(id.slot()) / ramfs::locks::jobs::SHARE;
         let source = sessions
             .get(place)
@@ -3079,12 +3117,158 @@ impl Fs {
             .and_then(|fds| self.ram.live_description(fds, outcome.captured.source).ok())
             .is_some_and(|(inode, _)| inode == outcome.captured.request.inode)
     }
+    fn fifo_frozen(&self) -> bool {
+        #[cfg(feature = "lifetime-probe")]
+        {
+            self.fifo_probe.frozen()
+        }
+        #[cfg(not(feature = "lifetime-probe"))]
+        {
+            false
+        }
+    }
+    fn fifo_pause_wait(&self) -> bool {
+        #[cfg(feature = "lifetime-probe")]
+        {
+            self.fifo_probe.pause_wait()
+        }
+        #[cfg(not(feature = "lifetime-probe"))]
+        {
+            false
+        }
+    }
+    #[cfg(feature = "lifetime-probe")]
+    fn check_fifo_probe(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        self.fifo_probe
+            .expire(rt::time::ticks_to_ns(rt::time::now()));
+        if self.fifo_probe.active()
+            && let Some(scope) = self.fifo_probe.scope
+        {
+            let place = self.places.place(scope.owner);
+            let valid = sessions
+                .get(place)
+                .and_then(Option::as_ref)
+                .filter(|s| s.label() == scope.owner && s.data.claimed)
+                .is_some_and(|s| {
+                    self.ram
+                        .live_description(&s.data, scope.source)
+                        .is_ok_and(|(inode, _)| inode == scope.inode)
+                });
+            if !valid {
+                self.fifo_probe.invalidate(scope.owner);
+            }
+        }
+    }
+    #[cfg(feature = "lifetime-probe")]
+    fn fifo_probe_request(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty() || fds.binding.snapshot_ref().is_none() {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut body = r.body();
+        let (Ok(action), Ok(nonce)) = (body.u32(), body.u64()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if action == 1 {
+            let (Ok(packed), Ok(generation), Ok(holder)) = (body.u32(), body.u64(), body.u32())
+            else {
+                return Answer::Status(Status::BadSize);
+            };
+            if body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            let source = ramfs::TentativeOpen {
+                fd: proto_fs::DataDescription { packed, generation }.fd(),
+                description: Token {
+                    slot: proto_fs::DataDescription { packed, generation }.slot() as u16,
+                    generation,
+                },
+            };
+            let inode = match self.ram.live_description(fds, source) {
+                Ok((inode, _)) => inode,
+                Err(code) => return status(code),
+            };
+            if !self.register_lifetimes()
+                || !self
+                    .lifetimes
+                    .as_ref()
+                    .is_some_and(|page| page.live(holder))
+            {
+                return status(proto_fs::PERMISSION);
+            }
+            if self.locks.busy() || self.lock_jobs.has_work() {
+                return status(proto_fs::RESOLVING);
+            }
+            if let Err(code) = self.fifo_probe.arm(
+                fifo_probe::Scope {
+                    owner: r.label(),
+                    source,
+                    inode,
+                    holder,
+                },
+                nonce,
+                rt::time::ticks_to_ns(rt::time::now()),
+            ) {
+                return status(code);
+            }
+            if let Err(error) = sys::timer_set(&self.wait_timer, self.fifo_probe.deadline) {
+                self.fifo_probe.invalidate(r.label());
+                return Answer::Status(Status::Kernel(error));
+            }
+            self.wait_timer_armed = true;
+            Answer::Status(Status::Ok)
+        } else if action == 2
+            && body.finish().is_ok()
+            && self.fifo_probe.scope.is_some_and(|s| s.owner == r.label())
+            && self.fifo_probe.nonce == nonce
+        {
+            self.fifo_probe
+                .expire(rt::time::ticks_to_ns(rt::time::now()));
+            let reply = r.reply();
+            let outcome = (|| {
+                reply.u32(0)?;
+                reply.u32(self.fifo_probe.phase as u32)?;
+                reply.u64(nonce)?;
+                reply.u32(self.fifo_probe.visited)?;
+                reply.u32(0)?;
+                if let Some(id) = self.fifo_probe.control {
+                    reply.u64(id.owner())?;
+                    reply.u32(id.key().slot)?;
+                    reply.u64(id.key().generation)?;
+                } else {
+                    reply.u64(0)?;
+                    reply.u32(0)?;
+                    reply.u64(0)?;
+                }
+                if let Some(token) = self.fifo_probe.selected {
+                    let id = token.receipt();
+                    reply.u32(token.slot() as u32)?;
+                    reply.u64(id.owner())?;
+                    reply.u32(id.key().slot)?;
+                    reply.u64(id.key().generation)?;
+                } else {
+                    reply.u32(u32::MAX)?;
+                    reply.u64(0)?;
+                    reply.u32(0)?;
+                    reply.u64(0)?;
+                }
+                Ok::<(), Status>(())
+            })();
+            match outcome {
+                Ok(()) => Answer::Reply(Outgoing::new()),
+                Err(error) => Answer::Status(error),
+            }
+        } else {
+            Answer::Status(Status::BadSize)
+        }
+    }
     fn notify_maintenance(&self) {
         if self.legacy_pending
             || self.wait_events.pending()
             || self.wait_proof_pending()
             || self.lock_dispatch.pending(
-                self.locks.busy() || self.lock_jobs.has_work() || self.wait_jobs.has_work(),
+                self.locks.busy()
+                    || (!self.fifo_frozen()
+                        && (self.lock_jobs.has_work() || self.wait_jobs.has_work())),
             )
         {
             let _ = sys::notify(&self.channel, 1);
@@ -4251,7 +4435,23 @@ impl Fs {
                     if self.common_control_busy(fds, owner, wire.key.slot) {
                         return status(proto_fs::JOBS_FULL);
                     }
-                    ramfs::locks::server::start(self.lock_jobs, self.ram, fds, place, owner, wire)
+                    let accepted = ramfs::locks::server::start(
+                        self.lock_jobs,
+                        self.ram,
+                        fds,
+                        place,
+                        owner,
+                        wire,
+                    );
+                    #[cfg(feature = "lifetime-probe")]
+                    if accepted.is_ok()
+                        && wire.command == proto_fs::LockCommand::SetPid
+                        && let Ok(Some(id)) = self.lock_jobs.occupied(place, owner, wire.key.slot)
+                        && let Ok((captured, _, _)) = self.lock_jobs.snapshot(id)
+                    {
+                        self.fifo_probe.accepted(id, captured);
+                    }
+                    accepted
                 }
             }
         } else {

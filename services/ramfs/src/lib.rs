@@ -3568,3 +3568,7 @@ mod birth_claim_tests {
         assert!(destination.fresh_clone_destination());
     }
 }
+
+#[cfg(all(test, feature = "lifetime-probe"))]
+#[path = "fifo_probe.rs"]
+mod fifo_probe;
