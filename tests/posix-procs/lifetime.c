@@ -305,11 +305,13 @@ static void public_lock_signals(void) {
 #include "lock-ring.c"
 #include "wait-locks.c"
 #include "wait-fifo.c"
+#include "wait-lifecycle.c"
 #include "lock-deadlock.c"
 
 int main(int argc, char **argv) {
     int ring_result;
     if (ring_dispatch(argc, argv, &ring_result)) return ring_result;
+    if(argc>1 && strcmp(argv[1],"wait-lifecycle-exec")==0)return public_wait_lifecycle_exec(argc,argv);
     expect_life("running full PID", getpid(), 1);
     if (argc > 1 && strcmp(argv[1], "sleep") == 0) {
         for (;;) pause();
@@ -346,6 +348,7 @@ int main(int argc, char **argv) {
     public_lock_signals();
     public_wait_locks();
     public_wait_fifo();
+    public_wait_lifecycle();
     public_lock_deadlocks();
     expect("native lock commands and exact custody", ram_lock_commands(getpid()), 0);
     expect("native close receipt and 32-reference birth", ram_close_event(), 0);

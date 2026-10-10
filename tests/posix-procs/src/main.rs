@@ -21,6 +21,8 @@ mod lock_signal;
 #[cfg(feature = "lifetime-probe")]
 mod wait_fifo;
 #[cfg(feature = "lifetime-probe")]
+mod wait_lifecycle;
+#[cfg(feature = "lifetime-probe")]
 mod wait_locks;
 
 #[cfg(feature = "pending-open")]

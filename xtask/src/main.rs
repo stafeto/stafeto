@@ -3276,6 +3276,7 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: true WAIT unlock, SIGUSR1, restart, close/reuse and canonical success ok",
         "posix-procs: genuine FIFO oldest eligible Read, blocked older Write and later PID SET ok",
         "posix-procs: FIFO own dispatch ",
+        "posix-procs: genuine WAIT End exact debts and live parent fork exec custody ok",
         "posix-procs: genuine PID cycle EDEADLK and OFD noncycle ok",
     ] {
         qemu::expect_marker(&outcome, marker)?;
@@ -5046,6 +5047,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
+        job("posix-lock-ring", || posix_lock_ring_probe(&qemu::VIRT)),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
@@ -7319,6 +7321,7 @@ mod tests {
         for programs in [
             &POSIX_PROCS_PROGRAMS[..],
             &POSIX_LIFETIMES_PROGRAMS[..],
+            &POSIX_LOCK_RING_PROGRAMS[..],
             &POSIX_NATIVE_SCOPE_PROGRAMS[..],
             &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[..],
             &POSIX_STEPS_PROGRAMS[..],
@@ -7343,6 +7346,11 @@ mod tests {
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe", "steps"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[5].3, &["lifetime-probe"]);
+        assert_eq!(
+            &POSIX_LOCK_RING_PROGRAMS[1..],
+            &POSIX_LIFETIMES_PROGRAMS[1..]
+        );
+        assert_eq!(POSIX_LOCK_RING_PROGRAMS[0].3, &["table-posix-lock-ring"]);
         for programs in [
             &POSIX_PROCS_PROGRAMS[..],
             &POSIX_NAMES_PROGRAMS[..],
