@@ -26,7 +26,11 @@ pub struct Input {
 pub struct TerminalReply(LockReply);
 impl TerminalReply {
     pub fn read(bytes: &[u8]) -> Result<Self, FsError> {
-        let reply = LockReply::read(Reader::new(bytes)).map_err(FsError::from)?;
+        Self::from_reply(LockReply::read(Reader::new(bytes)).map_err(FsError::from)?)
+    }
+    /// Validate an already decoded receipt without a second wire buffer.
+    pub fn from_reply(reply: LockReply) -> Result<Self, FsError> {
+        reply.validate().map_err(FsError::from)?;
         if reply.phase != LockPhase::Complete {
             return Err(FsError::InvalidArgument);
         }

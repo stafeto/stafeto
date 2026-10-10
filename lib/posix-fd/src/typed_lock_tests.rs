@@ -301,3 +301,33 @@ fn typed_lock_owner_detach_keeps_change_custody_and_cleaned_owner_ack_is_local()
     files.finish_lock_cleanup(lock).unwrap();
     assert_eq!(files.lock_snapshot(lock), Err(FsError::BadFileDescriptor));
 }
+
+#[test]
+fn typed_decoded_terminal_constructor_checks_phase_and_blocker_without_wire_buffer() {
+    assert_eq!(
+        control::TerminalReply::from_reply(blocker())
+            .unwrap()
+            .reply(),
+        blocker()
+    );
+    assert_eq!(
+        control::TerminalReply::from_reply(LockReply {
+            phase: LockPhase::Pending,
+            result: 0,
+            blocker: None
+        }),
+        Err(FsError::InvalidArgument)
+    );
+    let mut invalid = blocker();
+    invalid.blocker.as_mut().unwrap().start = -1;
+    assert_eq!(
+        control::TerminalReply::from_reply(invalid),
+        Err(FsError::InvalidArgument)
+    );
+    let mut invalid = blocker();
+    invalid.blocker.as_mut().unwrap().pid = 0;
+    assert_eq!(
+        control::TerminalReply::from_reply(invalid),
+        Err(FsError::InvalidArgument)
+    );
+}
