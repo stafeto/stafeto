@@ -17,7 +17,7 @@ use core::sync::atomic::Ordering;
 use posix_thread::flag;
 use proto_wire::{Status, Writer, long};
 use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
-use rt::handle::{Channel, Handle};
+use rt::handle::{Channel, Handle, Timer};
 use rt::sys;
 
 /// The errno of a refusal of the service's own, which `run_with` takes;
@@ -148,7 +148,15 @@ pub fn run_with(
     out: &mut [u8],
     refusal: Refusal<'_>,
 ) -> Result<usize, i32> {
-    run_in(service, start, keyed, out, refusal, true, false)
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        true,
+        false,
+    )
 }
 
 /// `run_with` for an operation that is no point of cancellation
@@ -162,7 +170,15 @@ pub fn run_no_point(
     out: &mut [u8],
     refusal: Refusal<'_>,
 ) -> Result<usize, i32> {
-    run_in(service, start, keyed, out, refusal, false, false)
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        false,
+        false,
+    )
 }
 
 /// A terminal operation authenticates every actual request. The identity
@@ -175,7 +191,7 @@ pub fn run_with_identity(
     out: &mut [u8],
     refusal: Refusal<'_>,
 ) -> Result<usize, i32> {
-    run_in(service, start, keyed, out, refusal, true, true)
+    run_in(service, Start::Once(start), keyed, out, refusal, true, true)
 }
 
 /// Terminal slave requests authenticate; master requests use their owning
@@ -188,12 +204,85 @@ pub(crate) fn run_terminal(
     out: &mut [u8],
     refusal: Refusal<'_>,
 ) -> Result<usize, i32> {
-    run_in(service, start, keyed, out, refusal, true, !master)
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        true,
+        !master,
+    )
+}
+
+// Private sentinel: only a decoded service START refusal produces it.
+const ADMISSION_LIMIT: i32 = -31002;
+
+enum Start<'a> {
+    Once(&'a [u8]),
+    Admission(&'a dyn Fn() -> Result<Writer, Status>),
+}
+
+/// Physical tcdrain waits for existing paid capacity before it captures a
+/// prefix. Every retry refreshes job-control arguments. TAKE and CANCEL
+/// retain their original identity and never retry as a new START.
+pub(crate) fn run_drain(
+    service: &Handle<Channel>,
+    start: impl Fn() -> Result<Writer, Status>,
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    refusal: Refusal<'_>,
+) -> Result<(), i32> {
+    run_in(
+        service,
+        Start::Admission(&start),
+        keyed,
+        &mut [],
+        refusal,
+        true,
+        true,
+    )
+    .map(drop)
+}
+
+/// No server state is retained yet. Use the thread's already paid timer;
+/// signal deferral closes the race between the flags check and receive.
+fn admission_pause() -> Result<(), i32> {
+    let block = crate::threads::own_block();
+    let channel =
+        Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
+    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
+    let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(1_000_000);
+    let result = loop {
+        let guard = match rt::upcall::defer_entries() {
+            Ok(guard) => guard,
+            Err(_) => break Err(EIO),
+        };
+        if ending(&block.flags, true) {
+            drop(guard);
+            break Err(EINTR);
+        }
+        if rt::time::reached(deadline) {
+            drop(guard);
+            break Ok(());
+        }
+        if sys::timer_set(&timer, deadline).is_err() {
+            drop(guard);
+            break Err(EIO);
+        }
+        let got = sys::receive(&channel);
+        drop(guard);
+        match got {
+            Ok(_) | Err(Error::Interrupted) => {}
+            Err(_) => break Err(EIO),
+        }
+    };
+    let _ = sys::timer_cancel(&timer);
+    result
 }
 
 fn run_in(
     service: &Handle<Channel>,
-    start: &[u8],
+    start: Start<'_>,
     keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
     out: &mut [u8],
     refusal: Refusal<'_>,
@@ -204,10 +293,40 @@ fn run_in(
     // from a reply, outside `receive`, leaves its mark for the wait.
     let block = crate::threads::own_block();
     let _outer = OuterRestart::enter(&block.flags);
-    let key = match call(service, start, None, out, refusal, authenticated)? {
-        (long::READY, n, _) => return Ok(n),
-        (long::WAIT, _, key) => key,
-        _ => return Err(EIO),
+    let admission = matches!(start, Start::Admission(_));
+    let start_refusal = |status| {
+        if admission && status == Status::Kernel(Error::LimitReached) {
+            Some(ADMISSION_LIMIT)
+        } else {
+            refusal(status)
+        }
+    };
+    let key = loop {
+        if admission && ending(&block.flags, point) {
+            return Err(EINTR);
+        }
+        let reply = match &start {
+            Start::Once(bytes) => call(service, bytes, None, out, &start_refusal, authenticated),
+            Start::Admission(build) => {
+                let request = build().map_err(|_| EIO)?;
+                call(
+                    service,
+                    request.as_bytes(),
+                    None,
+                    out,
+                    &start_refusal,
+                    authenticated,
+                )
+            }
+        };
+        match reply {
+            Ok((long::READY, n, _)) => return Ok(n),
+            Ok((long::WAIT, _, key)) => break key,
+            Err(ADMISSION_LIMIT) => admission_pause()?,
+            Err(EINTR) if admission && !ending(&block.flags, point) => {}
+            Err(error) => return Err(error),
+            Ok(_) => return Err(EIO),
+        }
     };
     let request = |cancel: bool| {
         let mut w = Writer::new();

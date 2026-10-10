@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <setjmp.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -259,6 +260,127 @@ static void *release(void *arg) {
     return (void *)(long)tcflow(1, TCOON);
 }
 
+static volatile sig_atomic_t drain_signal_count;
+static volatile sig_atomic_t drain_admission_jumping;
+static sigjmp_buf drain_admission_jump;
+static void on_drain_signal(int signal) {
+    (void)signal;
+    ++drain_signal_count;
+    if (drain_admission_jumping) siglongjmp(drain_admission_jump, 1);
+}
+struct drain_signal_run { pthread_t to; int restart; };
+static void *interrupt_drain(void *argument) {
+    struct drain_signal_run *run = argument;
+    pause_ms(20);
+    if (pthread_kill(run->to, SIGUSR1) != 0) return (void *)1;
+    if (run->restart) {
+        pause_ms(20);
+        if (tcflow(1, TCOON) != 0) return (void *)2;
+    }
+    return NULL;
+}
+
+/* A real signal cancels pending output twice; restart keeps waiting until
+ * the stopped output is released. These timings do not identify a wire step. */
+static int drain_signals(void) {
+    struct sigaction action = {0}, previous;
+    action.sa_handler = on_drain_signal;
+    CHECK(sigemptyset(&action.sa_mask) == 0);
+    CHECK(sigaction(SIGUSR1, &action, &previous) == 0);
+    for (int pass = 0; pass < 3; ++pass) {
+        action.sa_flags = pass == 2 ? SA_RESTART : 0;
+        CHECK(sigaction(SIGUSR1, &action, NULL) == 0);
+        CHECK(tcflow(1, TCOOFF) == 0);
+        CHECK(PUT(1, "posix-tty: signalled drain prefix\n"));
+        struct drain_signal_run run = {pthread_self(), pass == 2};
+        pthread_t sender;
+        CHECK(pthread_create(&sender, NULL, interrupt_drain, &run) == 0);
+        errno = 0;
+        int result = tcdrain(1), error = errno;
+        void *sent = (void *)1;
+        CHECK(pthread_join(sender, &sent) == 0 && sent == NULL);
+        CHECK(drain_signal_count == pass + 1);
+        if (pass == 2) {
+            CHECK(result == 0);
+        } else {
+            CHECK(result == -1 && error == EINTR);
+            CHECK(tcflow(1, TCOON) == 0 && tcdrain(1) == 0);
+        }
+    }
+    CHECK(sigaction(SIGUSR1, &previous, NULL) == 0);
+    say("posix-tty: tcdrain real signals twice and SA_RESTART ok\n");
+    return 0;
+}
+
+/* The test executable fills normal authenticated read records directly;
+ * actual tcdrain and its real signal handling use the POSIX interface. */
+extern unsigned long long stafeto_probe_drain_read(unsigned long long key);
+struct admission_release { pthread_t main; unsigned long long reader; int release; };
+static void *admission_signal(void *argument) {
+    struct admission_release *run = argument;
+    pause_ms(20);
+    if (pthread_kill(run->main, SIGUSR1) != 0) return (void *)1;
+    if (run->release) {
+        pause_ms(20);
+        if (stafeto_probe_drain_read(run->reader) != 0) return (void *)2;
+        if (tcflow(1, TCOON) != 0) return (void *)4;
+    }
+    return NULL;
+}
+static int drain_admission(void) {
+    struct sigaction action = {0}, previous;
+    action.sa_handler = on_drain_signal;
+    CHECK(sigemptyset(&action.sa_mask) == 0);
+    CHECK(sigaction(SIGUSR1, &action, &previous) == 0);
+    enum { DRAIN_READS = 8 };
+    unsigned long long readers[DRAIN_READS];
+    for (int i = 0; i < DRAIN_READS; ++i) {
+        readers[i] = stafeto_probe_drain_read(0);
+        if (readers[i] == 0 || readers[i] == ~0ULL) say("posix-tty: admission reader %d failed\n", i);
+        CHECK(readers[i] != 0 && readers[i] != ~0ULL);
+    }
+    CHECK(stafeto_probe_drain_read(0) == ~0ULL);
+    CHECK(tcflow(1, TCOOFF) == 0);
+    CHECK(PUT(1, "posix-tty: abandoned admission prefix\n"));
+    struct admission_release jumping = {pthread_self(), readers[0], 0};
+    pthread_t jumper;
+    CHECK(pthread_create(&jumper, NULL, admission_signal, &jumping) == 0);
+    if (sigsetjmp(drain_admission_jump, 1) == 0) {
+        drain_admission_jumping = 1;
+        (void)tcdrain(1);
+        drain_admission_jumping = 0;
+        CHECK(0);
+    }
+    drain_admission_jumping = 0;
+    void *jumped;
+    CHECK(pthread_join(jumper, &jumped) == 0 && jumped == NULL);
+    CHECK(stafeto_probe_drain_read(0) == ~0ULL);
+    for (int restart = 0; restart < 2; ++restart) {
+        action.sa_flags = restart ? SA_RESTART : 0;
+        CHECK(sigaction(SIGUSR1, &action, NULL) == 0);
+        CHECK(tcflow(1, TCOOFF) == 0);
+        CHECK(PUT(1, "posix-tty: admission drain prefix\n"));
+        struct admission_release run = {pthread_self(), readers[0], restart};
+        pthread_t sender;
+        CHECK(pthread_create(&sender, NULL, admission_signal, &run) == 0);
+        errno = 0;
+        int drained = tcdrain(1), error = errno;
+        void *result;
+        CHECK(pthread_join(sender, &result) == 0 && result == NULL);
+        if (restart) CHECK(drained == 0);
+        else {
+            CHECK(drained == -1 && error == EINTR);
+            CHECK(tcflow(1, TCOON) == 0 && tcdrain(1) == 0);
+        }
+    }
+    for (int i = 1; i < DRAIN_READS; ++i) {
+        CHECK(stafeto_probe_drain_read(readers[i]) == 0);
+    }
+    CHECK(sigaction(SIGUSR1, &previous, NULL) == 0);
+    say("posix-tty: drain admission waits at eight reads; EINTR, SA_RESTART and siglongjmp ok\n");
+    return 0;
+}
+
 static int output(void) {
     /* STOP and START go out as they are, between the bytes written. */
     CHECK(PUT(1, "<") && tcflow(1, TCIOFF) == 0 && PUT(1, ">"));
@@ -287,6 +409,8 @@ static int output(void) {
     say("posix-tty: tcdrain waited %lld ms\n", waited);
     CHECK(waited >= 150);
     CHECK(tcsendbreak(0, 0) == 0);
+    CHECK(drain_signals() == 0);
+    CHECK(drain_admission() == 0);
     say("posix-tty: output ok\n");
     return 0;
 }
