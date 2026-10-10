@@ -20,7 +20,7 @@
 //!   ROOM stays;
 //! - FEED (16): bytes of input, after the header;
 //! - HOLD (17): a u32, 1 to hold the output, 0 to let it go, which tells
-//!   an armed ROOM;
+//!   an armed ROOM; 2 holds physical TX, 3 holds the RX notification; 4 also fails input flush;
 //! - TAKEN (18): status 0 and the count u64 of the bytes WRITE_SOME took.
 
 use crate::FAILED;
@@ -66,10 +66,13 @@ struct Stub {
     next_key: u64,
     hold: bool,
     tx_busy: bool,
+    rx_hold: bool,
+    rx_failed: bool,
     room: Option<Handle<Channel>>,
     armed: bool,
     taken: u64,
     drain_key: Option<u64>,
+    last_flush: u64,
     rings: &'static mut Rings,
 }
 
@@ -84,7 +87,7 @@ impl Stub {
     }
 
     fn tell_reader(&mut self) {
-        if self.len == 0 {
+        if self.len == 0 || self.rx_hold {
             return;
         }
         if let Some((_, Some(notify), told, _)) = self.reader.as_mut()
@@ -151,7 +154,7 @@ fn long_answer(r: &mut Request<'_>, reply: long::Reply<'_>) -> Answer {
     }
 }
 
-const METHODS: &[u16] = &[7, 8, 9, 11, 12, 13, 14, 15, 19, FEED, HOLD, TAKEN];
+const METHODS: &[u16] = &[7, 8, 9, 11, 12, 13, 14, 15, 19, 20, FEED, HOLD, TAKEN];
 
 impl Service<0> for Stub {
     const VERSION: u16 = VERSION;
@@ -177,6 +180,9 @@ impl Service<0> for Stub {
                 };
                 self.hold = hold == 1;
                 self.tx_busy = hold == 2;
+                self.rx_hold = matches!(hold, 3 | 4);
+                self.rx_failed = hold == 4;
+                self.tell_reader();
                 if !self.tx_busy
                     && self.drain_key.is_some()
                     && let Some(room) = &self.room
@@ -228,6 +234,26 @@ impl Service<0> for Stub {
                 // This measurement stand-in's port transmits accepted bytes
                 // immediately. Real FIFO/shift-register behavior is tested in
                 // the production UART's host tests and the physical driver.
+                Some(Method::InputFlush) => {
+                    let request = match proto_uart::InputFlush::read(r.body()) {
+                        Ok(request) if r.handles.is_empty() => request,
+                        _ => return Answer::Status(Status::BadSize),
+                    };
+                    if self.rx_failed
+                        || (self.last_flush != request.nonce
+                            && self.last_flush.wrapping_add(1).max(1) != request.nonce)
+                    {
+                        return Answer::Status(Status::Kernel(Error::BadState));
+                    }
+                    if self.last_flush != request.nonce {
+                        self.len = 0;
+                        if let Some((_, _, told, _)) = self.reader.as_mut() {
+                            *told = false;
+                        }
+                        self.last_flush = request.nonce;
+                    }
+                    Answer::Status(Status::Ok)
+                }
                 Some(Method::DrainState) => {
                     if r.body().finish().is_err() || !r.handles.is_empty() {
                         return Answer::Status(Status::BadSize);
@@ -301,10 +327,13 @@ pub fn run(s: Startup) -> u64 {
         next_key: 0,
         hold: false,
         tx_busy: false,
+        rx_hold: false,
+        rx_failed: false,
         room: None,
         armed: false,
         taken: 0,
         drain_key: None,
+        last_flush: 0,
         // SAFETY: only this thread reaches RINGS, here once.
         rings: unsafe { &mut *RINGS.0.get() },
     };
