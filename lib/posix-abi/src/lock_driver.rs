@@ -15,6 +15,41 @@ mod core;
 mod status;
 use core::{Failure, Phase, Session, State};
 
+#[cfg(feature = "lock-probe")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Probe {
+    Start,
+    Query,
+    Cancel,
+    Release,
+}
+#[cfg(feature = "lock-probe")]
+static HOOK: ::core::sync::atomic::AtomicUsize = ::core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "lock-probe")]
+pub fn probe_hook(hook: Option<fn(Probe, ControlToken) -> bool>) {
+    HOOK.store(
+        hook.map_or(0, |hook| hook as usize),
+        ::core::sync::atomic::Ordering::Release,
+    );
+}
+#[cfg(feature = "lock-probe")]
+fn probed(method: Method, token: ControlToken) -> bool {
+    let phase = match method {
+        Method::LockStart => Probe::Start,
+        Method::LockQuery => Probe::Query,
+        Method::LockCancel => Probe::Cancel,
+        Method::LockRelease => Probe::Release,
+        _ => return false,
+    };
+    let raw = HOOK.load(::core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: probe_hook stores exactly a function with this signature.
+    let hook = unsafe { ::core::mem::transmute::<usize, fn(Probe, ControlToken) -> bool>(raw) };
+    hook(phase, token)
+}
+
 fn failure(status: Status) -> Failure {
     match status {
         Status::Kernel(rt::abi::Error::Interrupted) => Failure::Interrupted,
@@ -38,8 +73,18 @@ impl Live {
     /// One native request; a helper never runs an implicit Bind inside its turn.
     fn send(&self, request: &Writer) -> Result<rt::sys::Reply, Failure> {
         let files = self.transport.files();
-        rt::sys::send(files.sessions().0, request.as_bytes())
-            .map_err(|error| failure(Status::Kernel(error)))
+        let response = rt::sys::send(files.sessions().0, request.as_bytes())
+            .map_err(|error| failure(Status::Kernel(error)))?;
+        #[cfg(feature = "lock-probe")]
+        {
+            let bytes = request.as_bytes();
+            if let Some(method) = Method::from_number(u16::from_le_bytes([bytes[0], bytes[1]]))
+                && probed(method, self.token)
+            {
+                return Err(Failure::Interrupted);
+            }
+        }
+        Ok(response)
     }
     fn decode(&self, response: rt::sys::Reply) -> Result<LockReply, Failure> {
         if !response.handles.is_empty() {

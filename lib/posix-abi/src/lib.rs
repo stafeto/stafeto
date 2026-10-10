@@ -19,6 +19,8 @@ pub mod constants;
 pub mod fork;
 pub mod loader_probe;
 mod lock_driver;
+#[cfg(feature = "lock-probe")]
+pub use lock_driver::{Probe as LockProbe, probe_hook as probe_lock_hook};
 pub mod lock_fields;
 pub mod long;
 pub mod metadata;
