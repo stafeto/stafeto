@@ -55,4 +55,4 @@ pub fn part<H>(
 
 #[cfg(test)]
 #[path = "wait_departure_tests.rs"]
-mod tests;
+pub(super) mod tests;

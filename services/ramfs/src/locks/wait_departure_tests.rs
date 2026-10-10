@@ -19,7 +19,7 @@ impl Drop for Tracked {
         self.events.borrow_mut().push(self.id);
     }
 }
-fn fixture() -> (Ram<'static>, std::boxed::Box<Queue>, Pool, Vec<Id>) {
+pub(crate) fn fixture() -> (Ram<'static>, std::boxed::Box<Queue>, Pool, Vec<Id>) {
     let mut ram = Ram::default();
     let mut fds = Fds::default();
     let fd = ram
