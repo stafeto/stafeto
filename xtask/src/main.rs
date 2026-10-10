@@ -6,6 +6,8 @@
 #[macro_use]
 mod out;
 
+#[cfg(test)]
+mod change_release_reply_tests;
 mod coverage;
 #[cfg(test)]
 #[path = "../../tests/posix-threads/src/futex_deadline.rs"]
