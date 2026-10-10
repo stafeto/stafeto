@@ -729,6 +729,11 @@ static int vz_volley(int per_directory) {
 
 static int names_volley(void) {
     int failed;
+    /* Kept with guest_collision_hash_fixtures_match_the_service in RAM host tests. */
+    VZ_CHECK(vz_name_bucket(0u, "a") == 308u);
+    VZ_CHECK(vz_name_bucket(1u, "c3477") == 308u);
+    VZ_CHECK(vz_name_bucket(17u, "pending") == 968u);
+    VZ_CHECK(vz_name_bucket(29u, "c792") == 968u);
     VZ_CHECK(mkdir(VZ, 0777) == 0);
     files_volley_start();
     failed = vz_thread_cost();

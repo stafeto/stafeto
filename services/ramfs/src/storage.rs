@@ -69,6 +69,26 @@ pub(crate) mod tests_support {
         pub static FORCED_BUCKET: Cell<Option<usize>> = const { Cell::new(None) };
         pub static COOKIE_LINKS: Cell<usize> = const { Cell::new(0) };
     }
+    #[test]
+    fn guest_collision_hash_fixtures_match_the_service() {
+        for (slot, name, wanted) in [
+            (0, &b"a"[..], 308),
+            (1, &b"c3477"[..], 308),
+            (17, &b"pending"[..], 968),
+            (29, &b"c792"[..], 968),
+        ] {
+            assert_eq!(
+                super::name_bucket(
+                    super::Token {
+                        slot,
+                        generation: 1
+                    },
+                    name
+                ),
+                wanted
+            );
+        }
+    }
     /// A name of the bucket of `name` in `parent`, another than `name`.
     pub(crate) fn same_bucket(parent: super::Token, name: &[u8]) -> std::vec::Vec<u8> {
         let wanted = super::name_bucket(parent, name);
