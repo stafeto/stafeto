@@ -27,6 +27,7 @@ use ramfs::locks::service::LockService;
 use ramfs::locks::wait_events::Events as WaitEvents;
 use ramfs::locks::wait_notifications::Notifications as WaitNotifications;
 use ramfs::locks::wait_receipts::Queue as WaitQueue;
+use ramfs::locks::wait_select::{Decision as WaitDecision, Selector as WaitSelector};
 use ramfs::locks::waiters::Pool as WaitPool;
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
@@ -130,6 +131,11 @@ struct WaitEventsBss(UnsafeCell<core::mem::MaybeUninit<WaitEvents>>);
 unsafe impl Sync for WaitEventsBss {}
 static WAIT_EVENTS: WaitEventsBss =
     WaitEventsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct WaitSelectorBss(UnsafeCell<core::mem::MaybeUninit<WaitSelector>>);
+// SAFETY: the sole service thread owns read-only FIFO selection scratch.
+unsafe impl Sync for WaitSelectorBss {}
+static WAIT_SELECTOR: WaitSelectorBss =
+    WaitSelectorBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 // The service loop reserves label zero for its heartbeat timer.
 const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
 const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
@@ -224,6 +230,12 @@ fn main(_: u64) -> u64 {
         WaitEvents::initialize_at(events);
         (&mut *jobs, &mut *pool, &mut *notify, &mut *events)
     };
+    // SAFETY: selection scratch is an exclusive permanent aligned allocation.
+    let wait_selector = unsafe {
+        let selector = (*WAIT_SELECTOR.0.get()).as_mut_ptr();
+        WaitSelector::initialize_at(selector);
+        &mut *selector
+    };
     // SAFETY: RAM is exclusive permanent storage; every field is written first.
     let ram = unsafe {
         let pointer = (*RAM.0.get()).as_mut_ptr();
@@ -265,6 +277,7 @@ fn main(_: u64) -> u64 {
             + core::mem::size_of::<WaitPool>()
             + core::mem::size_of::<WaitNotifications<Handle<Channel>>>()
             + core::mem::size_of::<WaitEvents>()
+            + core::mem::size_of::<WaitSelector>()
             + core::mem::size_of::<Ram<'static>>()
     );
     rt::println!("ramfs: ready");
@@ -278,6 +291,8 @@ fn main(_: u64) -> u64 {
         wait_pool,
         wait_notify,
         wait_events,
+        wait_selector,
+        wait_selection: None,
         wait_timer,
         _wait_view: wait_view,
         wait_timer_armed: false,
@@ -337,6 +352,8 @@ struct Fs {
     wait_pool: &'static mut WaitPool,
     wait_notify: &'static mut WaitNotifications<Handle<Channel>>,
     wait_events: &'static mut WaitEvents,
+    wait_selector: &'static mut WaitSelector,
+    wait_selection: Option<ramfs::locks::jobs::Id>,
     wait_timer: Handle<Timer>,
     _wait_view: Handle<Channel>,
     wait_timer_armed: bool,
@@ -1449,24 +1466,9 @@ impl Service<0> for Fs {
                             self.publish_wait(id);
                         }
                     }
-                } else if !self.locks.busy()
-                    && let Some(id) = self.lock_jobs.next_ready()
-                {
+                } else if !self.locks.busy() {
                     self.wait_request_turn = true;
-                    let place = usize::from(id.slot()) / ramfs::locks::jobs::SHARE;
-                    let source = sessions
-                        .get(place)
-                        .and_then(Option::as_ref)
-                        .filter(|session| session.label() == id.owner() && session.data.claimed)
-                        .map(|session| &session.data)
-                        .or_else(|| {
-                            self.births
-                                .get(Self::birth_index(id.owner()))
-                                .and_then(Option::as_ref)
-                                .filter(|(label, _)| *label == id.owner())
-                                .map(|(_, fds)| fds)
-                        });
-                    ramfs::locks::server::begin(self.lock_jobs, self.locks, self.ram, id, source);
+                    self.select_control(sessions);
                 }
                 self.notify_maintenance();
                 return;
@@ -2724,6 +2726,142 @@ impl Fs {
                 Err(error) => Answer::Status(error),
             },
             Err(code) => status(code),
+        }
+    }
+    /// Retain only the full paid Control key while the finite read-only selector
+    /// runs; its credit survives internal cancellation and another queue turn.
+    fn select_control(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        let id = if let Some(id) = self.wait_selection {
+            id
+        } else {
+            let Some(id) = self.lock_jobs.next_ready() else {
+                return;
+            };
+            let Ok((captured, phase, cancelling)) = self.lock_jobs.snapshot(id) else {
+                return;
+            };
+            if phase != ramfs::locks::jobs::Phase::Queued || cancelling {
+                return;
+            }
+            if self
+                .wait_selector
+                .begin(id, captured, self.wait_pool, self.lock_jobs)
+                .is_err()
+            {
+                return;
+            }
+            self.wait_selection = Some(id);
+            id
+        };
+        if !self
+            .lock_jobs
+            .snapshot(id)
+            .is_ok_and(|(_, phase, cancelling)| {
+                phase == ramfs::locks::jobs::Phase::Queued && !cancelling
+            })
+        {
+            self.wait_selection = None;
+            return;
+        }
+        let page = self.lifetimes.as_ref();
+        let locks = &*self.locks;
+        let (_, descriptions) = self.ram.lock_parts();
+        let progress = locks.select_part(
+            self.wait_selector,
+            self.wait_pool,
+            self.wait_jobs,
+            self.lock_jobs,
+            |pid| page.is_some_and(|page| page.live(pid)) && locks.pid_visible(pid),
+            |ofd| descriptions.live(ofd),
+        );
+        let Some(decision) = progress.decision else {
+            return;
+        };
+        self.wait_selection = None;
+        if let WaitDecision::Wait(candidate) = decision {
+            let receipt = candidate.registration.receipt();
+            // Final full custody/capture gate; actual fd authority is checked by begin.
+            if self
+                .wait_pool
+                .snapshot(candidate.registration)
+                .is_ok_and(|(_, phase)| {
+                    matches!(
+                        phase,
+                        ramfs::locks::waiters::Phase::Ready
+                            | ramfs::locks::waiters::Phase::Sleeping
+                    )
+                })
+                && self
+                    .wait_jobs
+                    .snapshot(receipt)
+                    .is_ok_and(|(captured, phase, cancelling)| {
+                        captured == candidate.captured
+                            && !cancelling
+                            && matches!(
+                                phase,
+                                ramfs::locks::wait_receipts::Phase::Ready
+                                    | ramfs::locks::wait_receipts::Phase::Sleeping
+                            )
+                    })
+            {
+                if self.wait_jobs.snapshot(receipt).is_ok_and(|(_, phase, _)| {
+                    phase == ramfs::locks::wait_receipts::Phase::Sleeping
+                }) {
+                    self.wait_jobs
+                        .ready(receipt)
+                        .expect("exact eligible sleeping receipt");
+                }
+                self.wait_pool
+                    .ready(candidate.registration)
+                    .expect("exact eligible registration");
+                self.wait_pool
+                    .run(candidate.registration)
+                    .expect("eligible registration ready");
+                self.begin_wait(receipt, sessions);
+                return;
+            }
+        }
+        let place = usize::from(id.slot()) / ramfs::locks::jobs::SHARE;
+        let source = sessions
+            .get(place)
+            .and_then(Option::as_ref)
+            .filter(|session| session.label() == id.owner() && session.data.claimed)
+            .map(|session| &session.data)
+            .or_else(|| {
+                self.births
+                    .get(Self::birth_index(id.owner()))
+                    .and_then(Option::as_ref)
+                    .filter(|(label, _)| *label == id.owner())
+                    .map(|(_, fds)| fds)
+            });
+        ramfs::locks::server::begin(self.lock_jobs, self.locks, self.ram, id, source);
+    }
+    fn begin_wait(
+        &mut self,
+        id: ramfs::locks::wait_receipts::Id,
+        sessions: &[Option<Session<Fds, 0>>],
+    ) {
+        let place = usize::from(id.slot()) / ramfs::locks::wait_receipts::SHARE;
+        let source = sessions
+            .get(place)
+            .and_then(Option::as_ref)
+            .filter(|session| session.label() == id.owner() && session.data.claimed)
+            .map(|session| &session.data)
+            .or_else(|| {
+                self.births
+                    .get(Self::birth_index(id.owner()))
+                    .and_then(Option::as_ref)
+                    .filter(|(label, _)| *label == id.owner())
+                    .map(|(_, fds)| fds)
+            });
+        ramfs::locks::wait_server::begin(self.wait_jobs, self.locks, self.ram, id, source)
+            .expect("exact queued WAIT attempt");
+        if self
+            .wait_jobs
+            .query(id)
+            .is_ok_and(|reply| reply.phase == proto_fs::WaitPhase::Complete)
+        {
+            self.publish_wait(id);
         }
     }
     fn notify_maintenance(&self) {

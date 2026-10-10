@@ -134,6 +134,18 @@ impl LockService {
         }
         self.actor.reader_part(reader, pid_live, ofd_live)
     }
+    /// A read-only FIFO eligibility portion owns no Actor reservation.
+    pub fn select_part(
+        &self,
+        selector: &mut super::wait_select::Selector,
+        pool: &super::waiters::Pool,
+        waits: &super::wait_receipts::Queue,
+        jobs: &mut super::jobs::Queue,
+        pid_live: impl FnMut(u32) -> bool,
+        ofd_live: impl FnMut(Token) -> bool,
+    ) -> super::wait_select::Progress {
+        selector.part(pool, waits, jobs, &self.actor, pid_live, ofd_live)
+    }
     pub fn cancel(&mut self) -> bool {
         self.actor.cancel()
     }
