@@ -46,6 +46,7 @@ struct Job {
     phase: Phase,
     result: LockReply,
     releasing: bool,
+    cancel_requested: bool,
 }
 impl Job {
     fn id(&self, slot: usize) -> Id {
@@ -220,6 +221,7 @@ impl Queue {
                 blocker: None,
             },
             releasing: false,
+            cancel_requested: false,
         };
         let id = job.id(slot);
         assert!(self.jobs[slot].is_none());
@@ -237,6 +239,23 @@ impl Queue {
     }
     pub fn active(&self) -> Option<Id> {
         self.active
+    }
+    /// An explicit client cancellation remains distinct from internal actor invalidation.
+    pub fn request_cancel(&mut self, id: Id) -> Result<(), u32> {
+        self.job_mut(id)?.cancel_requested = true;
+        Ok(())
+    }
+    /// Retry private preparation using its original paid capture and exact key.
+    pub fn retry_active(&mut self) -> Result<bool, u32> {
+        let id = self.active.ok_or(proto_fs::INVALID_ARGUMENT)?;
+        let job = self.job_mut(id)?;
+        if job.releasing || job.cancel_requested {
+            return Ok(false);
+        }
+        assert_eq!(job.phase, Phase::Active);
+        job.phase = Phase::Queued;
+        self.active = None;
+        Ok(true)
     }
     pub fn retained(&self) -> usize {
         usize::from(self.held)

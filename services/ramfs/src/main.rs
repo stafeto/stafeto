@@ -1203,11 +1203,31 @@ impl Service<0> for Fs {
                     |pid| page.is_some_and(|page| page.live(pid)),
                     |token| descriptions.live(token),
                 );
-                if let Some(result) = progress.completed
-                    && ramfs::locks::server::finish(self.lock_jobs, self.ram, result)
-                {
-                    self.maintenance_burst.restart();
-                    self.legacy_pending = true;
+                if let Some(result) = progress.completed {
+                    let id = self.lock_jobs.active().expect("completed active request");
+                    let place = usize::from(id.slot()) / ramfs::locks::jobs::SHARE;
+                    let source = sessions
+                        .get(place)
+                        .and_then(Option::as_ref)
+                        .filter(|session| session.label() == id.owner() && session.data.claimed)
+                        .map(|session| &session.data)
+                        .or_else(|| {
+                            self.births
+                                .get(Self::birth_index(id.owner()))
+                                .and_then(Option::as_ref)
+                                .filter(|(label, _)| *label == id.owner())
+                                .map(|(_, fds)| fds)
+                        });
+                    if ramfs::locks::server::finish_with_source(
+                        self.lock_jobs,
+                        self.ram,
+                        result,
+                        source,
+                        |pid| page.is_some_and(|page| page.live(pid)),
+                    ) {
+                        self.maintenance_burst.restart();
+                        self.legacy_pending = true;
+                    }
                 }
                 self.notify_maintenance();
                 return;
