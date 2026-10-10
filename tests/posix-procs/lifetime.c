@@ -301,11 +301,15 @@ static void public_lock_signals(void) {
     expect("restore public lock signal", sigaction(SIGUSR1, &previous, NULL), 0);
     if (!failures) printf("posix-procs: lock depth within 16 KiB, nested SIGUSR1 close, siglongjmp and thread departure ok\n");
 }
+#include <stddef.h>
+#include "lock-ring.c"
 #include "wait-locks.c"
 #include "wait-fifo.c"
 #include "lock-deadlock.c"
 
 int main(int argc, char **argv) {
+    int ring_result;
+    if (ring_dispatch(argc, argv, &ring_result)) return ring_result;
     expect_life("running full PID", getpid(), 1);
     if (argc > 1 && strcmp(argv[1], "sleep") == 0) {
         for (;;) pause();

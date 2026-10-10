@@ -585,6 +585,11 @@ const POSIX_LIFETIMES_PROGRAMS: [ImageProgram; 10] = {
     programs[5].3 = &["lifetime-probe"];
     programs
 };
+const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_LIFETIMES_PROGRAMS;
+    programs[0].3 = &["table-posix-lock-ring"];
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1316,6 +1321,7 @@ fn main() {
         Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
+        Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
@@ -3188,6 +3194,54 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
         }
         println!("RAM credential dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     }
+    Ok(())
+}
+
+fn posix_lock_ring_probe(machine: &qemu::Machine) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-lock-ring.img",
+        &POSIX_LOCK_RING_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let mut ended = 0u8;
+    let result = (|| {
+        while ended != 15 {
+            let line = run.expect_line(
+                "all four genuine payer families to exit",
+                |line| line.starts_with("init: lock-ring-") && line.contains(" ended:"),
+                Duration::from_secs(30),
+            )?;
+            for family in 0..4 {
+                if line.starts_with(&format!("init: lock-ring-{family} ended:")) {
+                    if line != format!("init: lock-ring-{family} ended: exit code 0, not restarted")
+                    {
+                        return Err(format!("genuine ring family failed: {line}"));
+                    }
+                    ended |= 1 << family;
+                }
+            }
+        }
+        Ok(())
+    })();
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    result?;
+    for family in 0..4 {
+        qemu::expect_marker(
+            &outcome,
+            &format!("posix-procs: genuine ring16 family {family} ok"),
+        )?;
+    }
+    qemu::expect_marker(
+        &outcome,
+        "posix-procs: ring16 result deadlock=1 success=15 vertices=16 registrations=16 watches=16 ticks=",
+    )?;
     Ok(())
 }
 

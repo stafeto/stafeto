@@ -46,6 +46,8 @@ use rt::sys;
 
 mod clock_page;
 mod lifetime_page;
+#[cfg(feature = "lifetime-probe")]
+mod ring_probe;
 
 rt::entry!(main);
 
@@ -71,7 +73,7 @@ const METHODS: &[u16] = BASE_METHODS;
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
         + cfg!(feature = "steps") as usize
-        + 2 * cfg!(feature = "lifetime-probe") as usize
+        + 3 * cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
@@ -89,6 +91,7 @@ const METHODS: &[u16] = &{
     if cfg!(feature = "lifetime-probe") {
         methods[i] = 0xfff3;
         methods[i + 1] = 0xfff2;
+        methods[i + 2] = 0xfff6;
     }
     methods
 };
@@ -319,6 +322,8 @@ fn main(_: u64) -> u64 {
         wait_proof_disabled: false,
         wait_proof_turn: false,
         #[cfg(feature = "lifetime-probe")]
+        ring_probe: ring_probe::RingProbe::new(),
+        #[cfg(feature = "lifetime-probe")]
         fifo_probe: fifo_probe::Gate::new(),
         wait_timer,
         _wait_view: wait_view,
@@ -361,6 +366,11 @@ fn main(_: u64) -> u64 {
         orphan_count: 0,
         cancel_reported: 0,
     };
+    #[cfg(feature = "lifetime-probe")]
+    // SAFETY: cold sole-thread startup owns the unchanged mapped 48 KiB stack.
+    unsafe {
+        fs.ring_probe.paint()
+    };
     // Prepare the authentic notary page after publishing the RAM endpoint.
     // Standalone boot profiles may have no Process service.
     let _ = fs.notary_register();
@@ -394,6 +404,8 @@ struct Fs {
     wait_proof_serial: u64,
     wait_proof_disabled: bool,
     wait_proof_turn: bool,
+    #[cfg(feature = "lifetime-probe")]
+    ring_probe: ring_probe::RingProbe,
     #[cfg(feature = "lifetime-probe")]
     fifo_probe: fifo_probe::Gate,
     wait_timer: Handle<Timer>,
@@ -2073,6 +2085,69 @@ impl Service<0> for Fs {
             return self.fifo_probe_request(&s.data, r);
         }
         #[cfg(feature = "lifetime-probe")]
+        if r.method() == 0xfff6 {
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let mut body = r.body();
+            let (Ok(nonce), Ok(target)) = (body.u64(), body.u32()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            if nonce == 0 || body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            let Some(who) = s.data.binding.snapshot_ref() else {
+                return status(proto_fs::PERMISSION);
+            };
+            if !self
+                .lifetimes
+                .as_ref()
+                .is_some_and(|page| page.live(who.pid))
+            {
+                return status(proto_fs::PERMISSION);
+            }
+            let Ok(memory) = sys::process_memory(&self.process) else {
+                return status(proto_fs::PERMISSION);
+            };
+            let free = memory.quota.saturating_sub(memory.used) / 4096;
+            if free < 128 {
+                return status(proto_fs::NO_SPACE);
+            }
+            self.ring_probe.measure_stack();
+            let words = [
+                who.pid,
+                u32::from(
+                    self.lifetimes
+                        .as_ref()
+                        .is_some_and(|page| page.live(target)),
+                ),
+                who.root.pid,
+                who.root.generation,
+                free as u32,
+                self.ring_probe.proved[0],
+                self.ring_probe.proved[1],
+                self.ring_probe.proved[2],
+                self.ring_probe.ticks.min(u64::from(u32::MAX)) as u32,
+                self.ring_probe.visited,
+                self.ring_probe.stack_peak,
+            ];
+            let reply = r.reply();
+            if reply
+                .u32(0)
+                .and_then(|()| reply.u64(nonce))
+                .and_then(|()| reply.u32(target))
+                .is_err()
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            for word in words {
+                if reply.u32(word).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+            }
+            return Answer::Reply(Outgoing::new());
+        }
+        #[cfg(feature = "lifetime-probe")]
         if r.method() == 0xfff3 {
             if !r.handles.is_empty() || s.data.binding.snapshot_ref().is_none() {
                 return Answer::Status(Status::BadSize);
@@ -2966,6 +3041,14 @@ impl Fs {
     /// Caller gives this helper its own maintenance turn; never follow an
     /// eight-object Actor/Reader/Selector portion in the same turn.
     fn tick_wait_proof(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        #[cfg(feature = "lifetime-probe")]
+        let began = rt::time::now();
+        self.tick_wait_proof_part(sessions);
+        #[cfg(feature = "lifetime-probe")]
+        self.ring_probe
+            .part(rt::time::now().saturating_sub(began), 0);
+    }
+    fn tick_wait_proof_part(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
         if self.wait_proof_active {
             let page = self.lifetimes.as_ref();
             let (storage, descriptions) = self.ram.lock_parts();
@@ -2978,6 +3061,8 @@ impl Fs {
                 |pid| page.is_some_and(|page| page.live(pid)) && locks.pid_visible(pid),
                 |ofd| descriptions.live(ofd),
             );
+            #[cfg(feature = "lifetime-probe")]
+            self.ring_probe.part(0, progress.visited);
             let Some(outcome) = progress.outcome else {
                 return;
             };
@@ -2994,6 +3079,10 @@ impl Fs {
                         },
                     )
                     .expect("exact pending proof candidate canonical completion");
+                #[cfg(feature = "lifetime-probe")]
+                if let Some(snapshot) = self.wait_proof.probe_snapshot() {
+                    self.ring_probe.proved(snapshot);
+                }
                 self.publish_wait(outcome.candidate);
             }
             return;

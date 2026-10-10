@@ -170,3 +170,6 @@ extern "C" fn files_full_sessions() -> i32 {
         -1
     }
 }
+
+#[cfg(feature = "lifetime-probe")]
+mod lock_ring;

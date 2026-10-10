@@ -16,6 +16,7 @@ fn run(cmd: &mut Command) {
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=lifetime.c");
+    println!("cargo:rerun-if-changed=lock-ring.c");
     println!("cargo:rerun-if-changed=wait-locks.c");
     println!("cargo:rerun-if-changed=wait-fifo.c");
     println!("cargo:rerun-if-changed=lock-deadlock.c");
