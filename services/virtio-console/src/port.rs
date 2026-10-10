@@ -11,14 +11,13 @@
 
 use crate::Host;
 use alloc::boxed::Box;
+pub use virtio_console::receive::RX_BYTES;
+use virtio_console::receive::Receive;
 use virtio_drivers::device::common::Feature;
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::Transport;
 use virtio_drivers::transport::pci::PciTransport;
 
-/// The bytes of a receive buffer: a pass of the ring of input (uart's
-/// RX_RING), so a bounce page copies no more than that back.
-pub const RX_BYTES: usize = 256;
 /// The bytes one transmission takes at most, within a bounce page.
 pub const TX_BYTES: usize = 1024;
 
@@ -30,13 +29,7 @@ pub struct Port {
     receiveq: VirtQueue<Host, 2>,
     transmitq: VirtQueue<Host, 2>,
     rx: Box<[u8; RX_BYTES]>,
-    /// The receive the device holds, if any.
-    rx_token: Option<u16>,
-    /// The bytes of the last receive, and the next one to take.
-    rx_len: usize,
-    rx_at: usize,
-    /// The host's input ended (a receive of no bytes).
-    rx_ended: bool,
+    received: Receive,
     tx: Box<[u8; TX_BYTES]>,
     tx_len: usize,
     /// The transmission the device holds, if any.
@@ -57,10 +50,7 @@ impl Port {
             receiveq,
             transmitq,
             rx: Box::new([0; RX_BYTES]),
-            rx_token: None,
-            rx_len: 0,
-            rx_at: 0,
-            rx_ended: false,
+            received: Receive::default(),
             tx: Box::new([0; TX_BYTES]),
             tx_len: 0,
             tx_token: None,
@@ -79,13 +69,13 @@ impl Port {
     /// Gives the receive buffer to the device when it has none and the
     /// bytes of the last receive are all taken.
     fn give_receive(&mut self) -> Result<(), virtio_drivers::Error> {
-        if self.rx_token.is_some() || self.rx_ended || self.rx_at < self.rx_len {
+        if !self.received.should_post() {
             return Ok(());
         }
         // SAFETY: the buffer lives in the port, which the queue does not
         // outlive, and nothing touches it until `pop_used` gives it back.
         let token = unsafe { self.receiveq.add(&[], &mut [&mut self.rx[..]]) }?;
-        self.rx_token = Some(token);
+        self.received.token = Some(token);
         if self.receiveq.should_notify() {
             self.ring(RECEIVEQ);
         }
@@ -102,20 +92,15 @@ impl Port {
     }
 
     fn finish_receive(&mut self) {
-        let Some(token) = self.rx_token else { return };
-        if self.receiveq.peek_used() != Some(token) {
-            return;
-        }
-        // SAFETY: the same buffer `give_receive` added with this token.
-        let len = unsafe { self.receiveq.pop_used(token, &[], &mut [&mut self.rx[..]]) };
-        self.rx_token = None;
-        match len {
-            Ok(0) | Err(_) => self.rx_ended = true,
-            Ok(n) => {
-                self.rx_len = (n as usize).min(RX_BYTES);
-                self.rx_at = 0;
-            }
-        }
+        let queue = &mut self.receiveq;
+        let buffer = &mut self.rx;
+        self.received.finish(queue.peek_used(), |token| {
+            // SAFETY: the same buffer give_receive added under this exact token;
+            // Receive calls this only after its used completion is visible.
+            unsafe { queue.pop_used(token, &[], &mut [&mut buffer[..]]) }
+                .ok()
+                .map(|n| n as usize)
+        });
     }
 
     fn finish_transmit(&mut self) -> bool {
@@ -137,20 +122,26 @@ impl Port {
     /// The next byte of input, if one came; the receive buffer goes back
     /// to the device once its bytes are all taken.
     pub fn next_byte(&mut self) -> Option<u8> {
-        if self.rx_at == self.rx_len {
-            return None;
-        }
-        let b = self.rx[self.rx_at];
-        self.rx_at += 1;
-        if self.rx_at == self.rx_len {
+        let at = self.received.next_index()?;
+        let b = self.rx[at];
+        if self.received.should_post() {
             let _ = self.give_receive();
         }
         Some(b)
     }
 
+    /// Discard the returned receive prefix, including one completion already
+    /// visible in the used ring. An unreturned DMA buffer remains with the device;
+    /// bytes arriving after this observation belong to a later receive.
+    pub fn flush_receive(&mut self) -> Result<(), virtio_drivers::Error> {
+        self.finish_receive();
+        self.received.discard();
+        self.give_receive()
+    }
+
     /// Whether the host's input ended.
     pub fn input_ended(&self) -> bool {
-        self.rx_ended
+        self.received.ended()
     }
 
     /// Whether a transmission is with the device.

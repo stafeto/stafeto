@@ -288,6 +288,7 @@ fn main(_: u64) -> u64 {
     let done = match role {
         Some(b's') => steps::run(&probe, &start.parent)
             .and_then(|()| steps::drain_flush_flow(&probe, &start.parent))
+            .and_then(|()| steps::input_flush_prefix(&probe, &start.parent))
             .and_then(|()| steps::mixed_waits_and_flow(&probe, &start.parent))
             .and_then(|()| steps::physical_drain_prefix(&probe, &start.parent)),
         _ => run(&probe),

@@ -187,6 +187,36 @@ pub fn receive<T, H>(
     n
 }
 
+/// Discard at most one bounded receive pass. New arrivals cannot extend it.
+/// No interrupt mask, transmit FIFO or output state is changed.
+pub fn discard_receive(mut rx_empty: impl FnMut() -> bool, mut dr: impl FnMut() -> u32) -> usize {
+    let mut n = 0;
+    while n < RX_PASS && !rx_empty() {
+        let _ = dr();
+        n += 1;
+    }
+    n
+}
+
+/// Apply the console input flush and restore RX/RT if the old full ring
+/// masked them. Return the IMSC to write and read back; TX state is preserved.
+pub fn flush_input<T, H>(
+    input: &mut Input<T, H>,
+    irqs: &mut Irq,
+    label: u64,
+    nonce: u64,
+    rx_empty: impl FnMut() -> bool,
+    dr: impl FnMut() -> u32,
+) -> Result<Option<u32>, abi::Error> {
+    if !input.flush(label, nonce, || {
+        discard_receive(rx_empty, dr);
+        true
+    }) {
+        return Err(abi::Error::BadState);
+    }
+    Ok(irqs.drained(input.is_full()))
+}
+
 /// Writes bytes of `output` to the transmit FIFO: up to `limit`, while
 /// `tx_full` (FR.TXFF) says there is room, each as `dr` writes DR. Gives
 /// the count.
@@ -209,6 +239,69 @@ pub fn transmit(
 mod tests {
     use super::*;
     use crate::regs::{FE, OE, RT, RX};
+
+    #[test]
+    fn input_flush_reopens_full_ring_rx_and_preserves_transmit_state() {
+        let mut input: Input<(), &str> = Input::new();
+        let mut irqs = Irq::new();
+        let mut out = [0; 2];
+        assert_eq!(input.start(7, 2, &mut out), crate::input::Start::Wait(1));
+        input.take(7, 1, Some("reader"), &mut out);
+        for _ in 0..crate::input::RX_RING {
+            assert!(input.push(u32::from(b'o')));
+        }
+        assert_eq!(input.to_tell(), Some(&"reader"));
+        irqs.end(INPUT, true, false);
+        assert_eq!(irqs.imsc() & INPUT, 0);
+        assert!(irqs.transmitting());
+        assert_eq!(
+            flush_input(
+                &mut input,
+                &mut irqs,
+                7,
+                1,
+                || true,
+                || panic!("empty FIFO read")
+            ),
+            Ok(Some(INPUT | TX))
+        );
+        assert!(irqs.transmitting());
+        assert_eq!(
+            input.take(7, 1, None, &mut out),
+            crate::input::Taken2::Armed
+        );
+        assert!(input.push(u32::from(b'n')));
+        assert_eq!(input.to_tell(), Some(&"reader"));
+    }
+
+    #[test]
+    fn receive_flush_is_bounded_even_when_the_fifo_continuously_refills() {
+        let mut reads = 0;
+        assert_eq!(
+            discard_receive(
+                || false,
+                || {
+                    reads += 1;
+                    0
+                }
+            ),
+            RX_PASS
+        );
+        assert_eq!(reads, 32);
+        let left = core::cell::Cell::new(16);
+        assert_eq!(
+            discard_receive(
+                || left.get() == 0,
+                || {
+                    left.set(left.get() - 1);
+                    0
+                }
+            ),
+            16
+        );
+        assert_eq!(discard_receive(|| true, || panic!("empty FIFO read")), 0);
+    }
+
     use std::collections::VecDeque;
     use std::vec::Vec;
 
