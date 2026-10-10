@@ -1,6 +1,6 @@
 # E3 genuine cancellation of a queued name request
 
-The POSIX process image builds RAM with `signal-probe`. Method 0xfff4 accepts
+Only the POSIX names/process probe image builds RAM with `signal-probe`. Method 0xfff4 accepts
 no arguments or handles and requires an authenticated session. It creates a
 private channel and a timer for 20 ms, acknowledges its caller through the
 real deferred reply, then receives only from the private channel. Normal RAM
@@ -16,9 +16,13 @@ the sender waits another 2 ms and sends SIGALRM to that thread. The handler,
 installed without SA_RESTART, performs mkdir and rmdir. The operation must
 finish with zero, preserve exactly one name, release its custody record, and
 increase the count of genuine Interrupted replies. Eight attempts bound a
-failure to reach the queued interval. The driver hooks remain disabled during
-this scenario, and fake lost replies never increase its genuine counter.
-The genuine scenario runs first, before the synthetic lost-reply checks.
+failure to reach the queued interval. The Start scenario keeps driver hooks disabled. A second scenario counts five
+completed Steps, then requests the same service pause. Its observation hook
+preserves every reply. The sender waits for the pause acknowledgement before
+signalling, so the cancelled request is the next Step of a live job. A separate
+counter requires a genuine Step interruption, successful rename, one name and
+zero held records. Both scenarios precede the synthetic lost-reply checks.
+Fake lost replies never increase either genuine counter.
 
 Failure output includes the rename result, errno and the genuine counter.
 The QEMU process runner observes any termination of its initial process and

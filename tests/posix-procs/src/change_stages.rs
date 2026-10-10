@@ -1178,12 +1178,15 @@ pub extern "C" fn files_bounds_publish() -> i32 {
         let dry = mkdir(1, 71, b"/tmp/bp/pending", 0o755);
         start(&files, &dry).map_err(|_| 92)?;
         let mut steps = 0;
+        let baseline_ticks;
         loop {
             steps += 1;
             if steps > 1000 {
                 return Err(93);
             }
+            let begin = rt::time::now();
             if step(&files, dry.key, false).map_err(|_| 94)?.is_some() {
+                baseline_ticks = rt::time::now() - begin;
                 break;
             }
         }
@@ -1206,12 +1209,18 @@ pub extern "C" fn files_bounds_publish() -> i32 {
         if fill != 0 {
             return Err(100 + fill);
         }
+        let begin = rt::time::now();
         let done = step(&files, job.key, false).map_err(|_| 110)?.ok_or(111)?;
+        let commit_ticks = rt::time::now() - begin;
         if done.result != 0 || done.restarts != 0 {
             return Err(112);
         }
         release(&files, job.key).map_err(|_| 113)?;
-        rt::println!("posix-procs: names bounds commit after 500 rival names: 0 restarts");
+        rt::println!(
+            "posix-procs: names bounds commit after 500 rival names: 0 restarts, commit {} ticks, baseline {} ticks",
+            commit_ticks,
+            baseline_ticks
+        );
         // SAFETY: the helper removes the names it created.
         if unsafe { files_bounds_fill(1) } != 0 {
             return Err(114);

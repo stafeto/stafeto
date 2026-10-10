@@ -22,8 +22,15 @@
 extern int files_names_places_in_use(void);
 extern unsigned files_names_interrupted(void);
 extern int files_names_pause(void);
+extern void files_names_step_pause(int enabled);
+extern unsigned files_names_interrupted_steps(void);
+static int sg_pause_bad;
 static int sg_queued;
 static int sg_entered;
+void files_names_step_pause_ready(int status) {
+    __atomic_store_n(&sg_pause_bad, status, __ATOMIC_RELEASE);
+    __atomic_store_n(&sg_entered, 2, __ATOMIC_RELEASE);
+}
 
 #define SG_BASE "/tmp/sgd"
 #define SG_DEPTH 40
@@ -68,7 +75,7 @@ struct sg_sender {
 static void *sg_send(void *argument) {
     struct sg_sender *sender = argument;
     if (sg_queued) {
-        while (!__atomic_load_n(&sg_entered, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&sg_entered, __ATOMIC_ACQUIRE) < sg_queued) {
             if (__atomic_load_n(&sender->abort, __ATOMIC_ACQUIRE)) return NULL;
             sched_yield();
         }
@@ -104,6 +111,7 @@ static long sg_now_us(void) {
 static int sg_try(long delay_us, int *left, int from_new) {
     struct sg_sender sender = {pthread_self(), delay_us, 0};
     __atomic_store_n(&sg_entered, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&sg_pause_bad, 0, __ATOMIC_RELEASE);
     pthread_t thread;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -111,12 +119,13 @@ static int sg_try(long delay_us, int *left, int from_new) {
     int result = -2;
     *left = 0;
     if (pthread_create(&thread, &attr, sg_send, &sender) != 0) return -3;
-    if (sg_queued && files_names_pause() != 0) {
+    if (sg_queued == 1 && files_names_pause() != 0) {
         __atomic_store_n(&sender.abort, 1, __ATOMIC_RELEASE);
         pthread_join(thread, NULL);
         pthread_attr_destroy(&attr);
         return -4;
     }
+    if (sg_queued == 2) files_names_step_pause(1);
     if (sigsetjmp(sg_jump, 1) == 0) {
         sg_in_rename = 1;
         __atomic_store_n(&sg_entered, 1, __ATOMIC_RELEASE);
@@ -128,8 +137,12 @@ static int sg_try(long delay_us, int *left, int from_new) {
         sg_jumps++;
         result = 0;
     }
+    if (sg_queued == 2 && __atomic_load_n(&sg_entered, __ATOMIC_ACQUIRE) < 2)
+        __atomic_store_n(&sender.abort, 1, __ATOMIC_RELEASE);
     pthread_join(thread, NULL);
+    if (sg_queued == 2) files_names_step_pause(0);
     pthread_attr_destroy(&attr);
+    if (__atomic_load_n(&sg_pause_bad, __ATOMIC_ACQUIRE)) return -5;
     return result;
 }
 
@@ -201,6 +214,21 @@ static int names_signals(void) {
     SG_CHECK(files_names_interrupted() > before);
     printf("posix-procs: names queued signal: %u requests taken back by the kernel, rename returned 0\n",
            files_names_interrupted() - before);
+
+    /* The next queued Step belongs to a job with five completed Steps. */
+    before = files_names_interrupted_steps();
+    sg_queued = 2;
+    for (int attempt = 0; attempt < 8 && files_names_interrupted_steps() == before; attempt++) {
+        int left = 0;
+        int result = sg_try(2000, &left, sg_exists(SG_NEW));
+        SG_CHECK(result == 0 && !left);
+        SG_CHECK(!sg_handler_bad && sg_one_name());
+        SG_CHECK(files_names_places_in_use() == 0);
+    }
+    sg_queued = 0;
+    SG_CHECK(files_names_interrupted_steps() > before);
+    printf("posix-procs: names queued Step signal: %u requests taken back by the kernel, rename returned 0\n",
+           files_names_interrupted_steps() - before);
 
     /* a. Operations in the handler. */
     sg_leaves = 0;

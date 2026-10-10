@@ -3,8 +3,8 @@
 
 //! Process-local descriptors sharing backend open descriptions. The owner
 //! serializes table access and releases backends after unlocking. Ordinary
-//! operation holds and resident Open/Scalar records share the fixed hold budget.
-//! Control records have sixteen additional slots with the common job limit.
+//! operation holds have a separate budget from resident job records.
+//! Open, Scalar and Control use sixteen independent resident job slots.
 //! A live Open record preserves its completion through fd replacement.
 //! The caller pins this table's address while records or waiters exist.
 
@@ -60,7 +60,7 @@ pub struct OpenToken {
 
 impl OpenToken {
     pub fn slot(self) -> usize {
-        self.slot
+        32 + self.slot
     }
 
     pub fn generation(self) -> u64 {
@@ -364,8 +364,8 @@ pub enum JobPlace {
 pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Copy = ()> {
     entries: [EntrySlot<T>; N],
     holds: [HoldSlot<T, R, S, C>; N],
-    /// Control jobs have independent custody while every I/O hold is occupied.
-    controls: [HoldSlot<T, R, S, C>; JOBS_MAX],
+    /// All job kinds retain custody while every ordinary I/O hold is occupied.
+    residents: [HoldSlot<T, R, S, C>; JOBS_MAX],
     release_early: fn(T) -> bool,
     /// Counts the records of jobs that went; a thread that waits for a place
     /// waits on it. The caller wakes it after unlocking.
@@ -386,7 +386,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<
                     held: Held::Empty,
                 }
             }; N],
-            controls: [const {
+            residents: [const {
                 HoldSlot {
                     generation: 0,
                     changed: AtomicU32::new(0),
@@ -443,13 +443,12 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             }
         }
         // SAFETY: forming a field address does not read uninitialized storage.
-        let controls =
-            unsafe { core::ptr::addr_of_mut!((*destination).controls) }
-                .cast::<HoldSlot<T, R, S, C>>();
+        let residents = unsafe { core::ptr::addr_of_mut!((*destination).residents) }
+            .cast::<HoldSlot<T, R, S, C>>();
         for index in 0..JOBS_MAX {
             // SAFETY: exclusive startup access initializes each additional slot.
             unsafe {
-                controls.add(index).write(HoldSlot {
+                residents.add(index).write(HoldSlot {
                     generation: 0,
                     changed: AtomicU32::new(0),
                     held: Held::Empty,
@@ -472,9 +471,8 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     /// stands for one job of the session in the service from before its
     /// first request until the operation has let it go.
     pub fn jobs_in_use(&self) -> usize {
-        self.holds
+        self.residents
             .iter()
-            .chain(self.controls.iter())
             .filter(|slot| {
                 matches!(
                     slot.held,
@@ -487,9 +485,8 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     /// The places that records owned by `owner` take: the operations of one
     /// thread that are still in flight, those it left by a jump included.
     pub fn jobs_owned_by(&self, owner: OwnerToken) -> usize {
-        self.holds
+        self.residents
             .iter()
-            .chain(self.controls.iter())
             .filter(|slot| match slot.held {
                 Held::Open(record) => record.owner == Some(owner),
                 Held::Scalar(record) => record.owner() == Some(owner),
@@ -707,7 +704,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         let EntryState::Pending(slot) = self.entries.get(fd as usize)?.state else {
             return None;
         };
-        let held = self.holds.get(slot)?;
+        let held = self.residents.get(slot)?;
         matches!(held.held, Held::Open(_)).then_some(OpenToken {
             slot,
             generation: held.generation,
@@ -796,7 +793,10 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     fn record(&self, token: OpenToken) -> Result<OpenRecord<T, R>, Error> {
-        let slot = self.holds.get(token.slot).ok_or(Error::BadFileDescriptor)?;
+        let slot = self
+            .residents
+            .get(token.slot)
+            .ok_or(Error::BadFileDescriptor)?;
         if slot.generation != token.generation {
             return Err(Error::BadFileDescriptor);
         }
@@ -815,13 +815,13 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     fn save(&mut self, token: OpenToken, record: OpenRecord<T, R>) {
-        let slot = &mut self.holds[token.slot];
+        let slot = &mut self.residents[token.slot];
         slot.held = Held::Open(record);
         slot.change();
     }
 
     fn free_open(&mut self, token: OpenToken) {
-        let slot = &mut self.holds[token.slot];
+        let slot = &mut self.residents[token.slot];
         slot.held = Held::Empty;
         slot.change();
         self.job_gone();
@@ -834,8 +834,9 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         recovery: R,
     ) -> Result<(OpenToken, ClaimToken), Error> {
         let (index, slot) = self
-            .holds
+            .residents
             .iter_mut()
+            .take(N.min(JOBS_MAX))
             .enumerate()
             .find(|(_, slot)| {
                 matches!(slot.held, Held::Empty)
@@ -864,7 +865,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     pub fn open_tokens(&self) -> impl Iterator<Item = OpenToken> + '_ {
-        self.holds.iter().enumerate().filter_map(|(slot, h)| {
+        self.residents.iter().enumerate().filter_map(|(slot, h)| {
             matches!(h.held, Held::Open(_)).then_some(OpenToken {
                 slot,
                 generation: h.generation,
@@ -1168,21 +1169,21 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     /// Detach one original owner or helper claim per call, before slot reuse.
     pub fn abandon_owner(&mut self, owner: OwnerToken) -> Option<Abandoned<T, R>> {
-        let (slot, record) = self
-            .holds
-            .iter()
-            .enumerate()
-            .find_map(|(slot, h)| match h.held {
-                Held::Open(record)
-                    if record.owner == Some(owner) || record.claimant == Some(owner) =>
-                {
-                    Some((slot, record))
-                }
-                _ => None,
-            })?;
+        let (slot, record) =
+            self.residents
+                .iter()
+                .enumerate()
+                .find_map(|(slot, h)| match h.held {
+                    Held::Open(record)
+                        if record.owner == Some(owner) || record.claimant == Some(owner) =>
+                    {
+                        Some((slot, record))
+                    }
+                    _ => None,
+                })?;
         let token = OpenToken {
             slot,
-            generation: self.holds[slot].generation,
+            generation: self.residents[slot].generation,
         };
         if record.owner == Some(owner) {
             return self.abandon_open(token).ok();
@@ -1205,7 +1206,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 entry.state = EntryState::Empty;
             }
         }
-        for slot in self.holds.iter_mut().chain(self.controls.iter_mut()) {
+        for slot in self.holds.iter_mut().chain(self.residents.iter_mut()) {
             if matches!(
                 slot.held,
                 Held::Open(_)
@@ -1224,7 +1225,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     /// This address remains stable through slot reuse. The caller pins Table.
     /// Wake occurs after unlocking; every waiter then revalidates its token.
     pub fn wait_word(&self, token: OpenToken) -> Result<&AtomicU32, Error> {
-        self.holds
+        self.residents
             .get(token.slot)
             .map(|slot| &slot.changed)
             .ok_or(Error::BadFileDescriptor)
@@ -1232,7 +1233,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     pub fn wait_snapshot(&self, token: OpenToken) -> Result<WaitValue, Error> {
         self.record(token)?;
-        let sequence = self.holds[token.slot].changed.load(Ordering::Acquire);
+        let sequence = self.residents[token.slot].changed.load(Ordering::Acquire);
         Ok(if sequence == u32::MAX {
             WaitValue::NeverSleep
         } else {
@@ -1244,6 +1245,44 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thirty_two_waiting_reads_leave_all_open_and_scalar_places_available() {
+        type Big = Table<u32, 32, u64, u64, u64>;
+        for scalar in [false, true] {
+            let mut table = Big::default();
+            for index in 0..32 {
+                let fd = table.insert(100 + index, Flags::default()).unwrap();
+                assert_eq!(table.hold(fd), Ok(100 + index));
+            }
+            for index in 0..JOBS_MAX {
+                assert_eq!(table.job_place(owner(1)), JobPlace::Free);
+                let key = if scalar {
+                    table
+                        .begin_scalar(owner(1), 0, index as u64)
+                        .unwrap()
+                        .0
+                        .slot()
+                } else {
+                    table.begin_open(owner(1), index as u64).unwrap().0.slot()
+                };
+                assert_eq!(key, 32 + index);
+                assert_eq!(table.jobs_in_use(), index + 1);
+            }
+            assert!(matches!(
+                table.job_place(owner(2)),
+                JobPlace::Full { own: false, .. }
+            ));
+            assert_eq!(table.begin_open(owner(2), 99), Err(Error::TooManyOpenFiles));
+            assert_eq!(
+                table.begin_scalar(owner(2), 0, 99),
+                Err(Error::TooManyOpenFiles)
+            );
+            for fd in 0..32 {
+                assert_eq!(table.get(fd), Ok(100 + fd));
+            }
+        }
+    }
 
     #[test]
     fn last_fd_releases_early_once_while_generation_hold_survives() {
@@ -1617,7 +1656,7 @@ mod tests {
     fn deferred_open_keeps_paid_hold_and_ended_owner_cleanup() {
         let mut table = Table::<u32, 32, u64>::default();
         let mut last = None;
-        for i in 0..32 {
+        for i in 0..JOBS_MAX as u64 {
             let (open, claim) = table.begin_open(owner(1), i).unwrap();
             let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
             table.unreserve_open(claim, entry, i).unwrap();
@@ -1708,7 +1747,7 @@ mod tests {
         let mut table = Table::<u32, 1, u64>::default();
         let (open, claim) = table.begin_open(owner(1), 80).unwrap();
         let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
-        let Held::Open(record) = &mut table.holds[0].held else {
+        let Held::Open(record) = &mut table.residents[0].held else {
             panic!("open")
         };
         record.serial = u64::MAX - 1;
@@ -1821,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn all_32_credits_are_shared_by_io_and_unacked_completions() {
+    fn io_credits_remain_available_with_all_unacked_job_completions() {
         let mut table = Table::<u32, 32>::default();
         for backend in 0..16 {
             let fd = table.insert(backend, Flags::default()).unwrap();
@@ -1836,9 +1875,10 @@ mod tests {
             *token = Some(open);
         }
         assert_eq!(table.begin_open(owner(1), ()), Err(Error::TooManyOpenFiles));
-        assert_eq!(table.hold(31), Err(Error::TooManyOpenFiles));
+        assert_eq!(table.hold(31), Ok(31));
         assert_eq!(table.hold(0), Ok(0));
-        assert_eq!(table.close(31), Ok(Some(31)));
+        assert_eq!(table.close(31), Ok(None));
+        assert_eq!(table.unhold(31), Some(31));
         assert_eq!(table.begin_open(owner(1), ()), Err(Error::TooManyOpenFiles));
         table.ack_open(opens[15].unwrap(), owner(1)).unwrap();
         assert!(table.begin_open(owner(1), ()).is_ok());
@@ -1849,7 +1889,7 @@ mod tests {
     #[test]
     fn exhausted_generations_reject_admission_and_existing_cleanup_finishes() {
         let mut table = Table::<u32, 1>::default();
-        table.holds[0].generation = u64::MAX - 1;
+        table.residents[0].generation = u64::MAX - 1;
         table.entries[0].generation = u64::MAX - 1;
         let (open, claim) = table.begin_open(owner(1), ()).unwrap();
         let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
@@ -1884,7 +1924,7 @@ mod tests {
         let (open, claim) = table.begin_open(owner(1), 70).unwrap();
         let entry = table.reserve_open(claim, 0, Flags::default()).unwrap();
         table.stage_committed(claim, 10).unwrap();
-        let Held::Open(record) = &mut table.holds[0].held else {
+        let Held::Open(record) = &mut table.residents[0].held else {
             panic!("open")
         };
         record.serial = u64::MAX;
@@ -1911,7 +1951,7 @@ mod tests {
         let mut table = Table::<u32, 1>::default();
         let (open, claim) = table.begin_open(owner(1), ()).unwrap();
         let address = table.wait_word(open).unwrap() as *const AtomicU32;
-        table.holds[0]
+        table.residents[0]
             .changed
             .store(u32::MAX - 1, Ordering::Relaxed);
         let before = table.wait_snapshot(open).unwrap();
@@ -2025,7 +2065,7 @@ mod tests {
         let entry = table.reserve_open(original, 0, Flags::default()).unwrap();
         table.stage_committed(original, 10).unwrap();
         table.release_claim(original).unwrap();
-        let Held::Open(record) = &mut table.holds[0].held else {
+        let Held::Open(record) = &mut table.residents[0].held else {
             panic!("open")
         };
         record.serial = u64::MAX - 2;
@@ -2036,7 +2076,7 @@ mod tests {
             matches!(table.claim_open(open, owner(3)), Ok(Claim::Canceling(snapshot))
             if snapshot.phase == OpenPhase::Canceling && snapshot.claimant.is_none())
         );
-        let Held::Open(record) = table.holds[0].held else {
+        let Held::Open(record) = table.residents[0].held else {
             panic!("open")
         };
         assert_eq!(record.serial, u64::MAX);
@@ -2089,11 +2129,14 @@ mod tests {
     }
 
     #[test]
-    fn published_cleanup_stays_paid_in_full_mixed_32_budget() {
+    fn published_cleanup_stays_paid_with_full_io_and_job_budgets() {
         let mut table = Table::<u32, 32, u64>::default();
         for backend in 0..31 {
             let fd = table.insert(backend, Flags::default()).unwrap();
             table.hold(fd).unwrap();
+        }
+        for _ in 1..JOBS_MAX {
+            table.begin_open(owner(2), 80).unwrap();
         }
         let (open, late, entry) = publish(&mut table, 50);
         assert_eq!(table.begin_open(owner(2), 80), Err(Error::TooManyOpenFiles));
@@ -2236,13 +2279,15 @@ mod tests {
     #[test]
     fn published_cleanup_terminal_counters_need_no_new_authority() {
         let mut table = Table::<u32, 1, u64>::default();
-        table.holds[0].generation = u64::MAX - 1;
+        table.residents[0].generation = u64::MAX - 1;
         let (open, _, _) = publish(&mut table, 10);
-        let Held::Open(record) = &mut table.holds[0].held else {
+        let Held::Open(record) = &mut table.residents[0].held else {
             panic!("open")
         };
         record.serial = u64::MAX;
-        table.holds[0].changed.store(u32::MAX, Ordering::Relaxed);
+        table.residents[0]
+            .changed
+            .store(u32::MAX, Ordering::Relaxed);
         table.abandon_open_with_recovery(open, 500).unwrap();
         assert_eq!(table.wait_snapshot(open), Ok(WaitValue::NeverSleep));
         assert!(matches!(

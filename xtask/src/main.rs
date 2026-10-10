@@ -550,7 +550,7 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
 /// probe's children are files of it.
 const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
-    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["signal-probe"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
@@ -571,6 +571,12 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
+/// Only the names and real-signal probe can pause the RAM service.
+const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[1].3 = &["signal-probe"];
+    programs
+};
 const POSIX_NATIVE_SCOPE_PROGRAMS: [ImageProgram; 11] = {
     let mut programs = [POSIX_PROCS_PROGRAMS[0]; 11];
     let mut index = 0;
@@ -3171,7 +3177,7 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     // BusyBox is /bin/ls of the image's files (5c).
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-posix-procs.img", &POSIX_PROCS_PROGRAMS, BOOT_PROFILE)?;
+    let image = build_boot_image("boot-posix-procs.img", &POSIX_NAMES_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
@@ -3789,7 +3795,13 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     // into a table of 127 jobs with two paths of 511 bytes and a descriptor
     // for a base, and the restart after a stale proof at the commit of a
     // rename of a directory over an empty one.
-    find("names bounds commit after 500 rival names: 0 restarts")?;
+    let publish = find("names bounds commit after 500 rival names: 0 restarts")?;
+    let publish_line = [publish.to_owned()];
+    let ticks = number(&publish_line, ", commit ")?;
+    let baseline = number(&publish_line, "baseline ")?;
+    if ticks == 0 || baseline == 0 || ticks > baseline.saturating_add(NOISE_MARGIN) {
+        return Err(format!("publication grew with 500 rival names: {publish}"));
+    }
     for count in [1, 32] {
         let row = find(&format!("names bounds reclaim: {count} nodes with pages"))?;
         if !row.contains(&format!("backlog {count} -> {}", count + 1))
@@ -6978,7 +6990,7 @@ mod tests {
             "posix-procs: names volley in directories: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 12, the most restarts of one rename 2, the longest rename 25107135 ticks, 177424279 ticks",
             "posix-procs: names volley ok",
             "posix-procs: names gone ok",
-            "posix-procs: names bounds commit after 500 rival names: 0 restarts",
+            "posix-procs: names bounds commit after 500 rival names: 0 restarts, commit 14000 ticks, baseline 13900 ticks",
             "posix-procs: names bounds reclaim: 1 nodes with pages, backlog 1 -> 2, pages 2 -> 2, commit 12369 ticks, 0 restarts",
             "posix-procs: names bounds reclaim: 32 nodes with pages, backlog 32 -> 33, pages 33 -> 32, commit 12488 ticks, 0 restarts",
             "posix-procs: names bounds ok",
@@ -6996,6 +7008,16 @@ mod tests {
         assert!(super::names_lines(&names_log(good)).is_ok());
         let none = good.replace("thread 13", "thread 0");
         assert!(super::names_lines(&names_log(&none)).is_err());
+        let slow_publish: Vec<String> = names_log(good)
+            .iter()
+            .map(|line| line.replace("commit 14000 ticks", "commit 15401 ticks"))
+            .collect();
+        assert!(super::names_lines(&slow_publish).is_err());
+        let missing_publish_ticks: Vec<String> = names_log(good)
+            .iter()
+            .map(|line| line.replace(", commit 14000 ticks", ""))
+            .collect();
+        assert!(super::names_lines(&missing_publish_ticks).is_err());
         // G6: no thread repeats its Start more than 64 times.
         let many = good.replace("thread 13", "thread 65");
         assert!(super::names_lines(&names_log(&many)).is_err());
@@ -7130,6 +7152,24 @@ mod tests {
         swapped.swap(0, 1);
         assert!(super::expect_ash_names(&log(&swapped)).is_err());
         assert!(super::expect_ash_names(&["boot".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn only_names_image_enables_service_signal_pause() {
+        use super::*;
+        assert_eq!(POSIX_NAMES_PROGRAMS[1].3, &["signal-probe"]);
+        for programs in [
+            &POSIX_PROCS_PROGRAMS[..],
+            &POSIX_NATIVE_SCOPE_PROGRAMS[..],
+            &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[..],
+            &POSIX_STEPS_PROGRAMS[..],
+        ] {
+            assert!(
+                programs
+                    .iter()
+                    .all(|program| !program.3.contains(&"signal-probe"))
+            );
+        }
     }
 
     #[test]
