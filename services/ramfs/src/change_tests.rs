@@ -310,7 +310,7 @@ impl Env {
             .state
             .nodes
             .iter()
-            .position(|n| n.pins != [0; 5]);
+            .position(|n| n.pins != [0; crate::storage::PIN_KINDS]);
         assert_eq!(held, None, "a node keeps a pin");
         assert!(self.ram.storage.free_overlays_are_empty());
     }

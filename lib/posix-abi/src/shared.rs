@@ -175,8 +175,9 @@ fn window() {
 /// RAM and pipe close waits until `run` is over. Terminal last-fd close
 /// releases the real hold immediately; armed I/O retains a service pin.
 pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -> Result<R, i32> {
-    let (transport, target) =
-        process_state(|files| Ok((files.transport(), files.hold(fd).map_err(crate::error)?)))?;
+    let (transport, target) = with_fd(fd, |files| {
+        Ok((files.transport(), files.hold(fd).map_err(crate::error)?))
+    })?;
     window();
     let result = run(transport, target);
     let release = process_state(|files| Ok(files.unhold(target)))?;
@@ -198,19 +199,6 @@ pub fn resolved<R>(
     })?;
     window();
     run(transport, &resolved)
-}
-
-/// Runs `change` on the table under the lock, then releases what it
-/// handed back outside it.
-fn releasing<R>(
-    change: impl FnOnce(&mut PosixFs) -> Result<(R, Option<Target>), i32>,
-) -> Result<R, i32> {
-    let (value, transport, release) = process_state(|files| {
-        let (value, release) = change(files)?;
-        Ok((value, files.transport(), release))
-    })?;
-    transport.release(release).map_err(crate::error)?;
-    Ok(value)
 }
 
 /// The holds of the threads an exec stopped go, and the descriptions
@@ -501,7 +489,7 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                 .map(|value| value as u64)
                 .map_err(crate::error)
         }),
-        Dup { fd } => process_state(|files| {
+        Dup { fd } => with_fd(fd, |files| {
             files
                 .dup(fd)
                 .map(|value| value as u64)
@@ -529,25 +517,7 @@ fn duplicate_replacing(
     target: u32,
     flags: Option<posix_fs::DescriptorFlags>,
 ) -> Result<u64, i32> {
-    loop {
-        let (replacement, transport) = process_state(|files| {
-            Ok((
-                files
-                    .try_take_dup3(source, target, flags)
-                    .map_err(crate::error)?,
-                files.transport(),
-            ))
-        })?;
-        match replacement {
-            posix_fs::open::Replacement::Complete { fd, release } => {
-                transport.release(release).map_err(crate::error)?;
-                return Ok(fd as u64);
-            }
-            posix_fs::open::Replacement::Pending(token) => {
-                crate::open_driver::wait_pending(token)?;
-            }
-        }
-    }
+    crate::close_driver::replace(source, target, flags).map(u64::from)
 }
 
 fn perform(request: Request<'_>, out: &mut Writer) -> Result<(), i32> {
@@ -555,12 +525,7 @@ fn perform(request: Request<'_>, out: &mut Writer) -> Result<(), i32> {
     let write = |reply: Reply<'_>, out: &mut Writer| reply.write(out).map_err(|_| EIO);
     match request {
         Close { fd } => {
-            releasing(|files| {
-                files
-                    .take_close(fd)
-                    .map(|release| ((), release))
-                    .map_err(crate::error)
-            })?;
+            crate::close_driver::close(fd)?;
             write(Reply::Unit, out)
         }
         Read { fd, count } => read_reply(fd, count, out),
@@ -597,12 +562,10 @@ fn perform(request: Request<'_>, out: &mut Writer) -> Result<(), i32> {
         ),
         Cleanup => {
             for fd in 0..posix_fs::OPEN_MAX as u32 {
-                let closed = releasing(|files| match files.take_close(fd) {
-                    Ok(release) => Ok(((), release)),
-                    Err(posix_fs::FsError::BadFileDescriptor) => Ok(((), None)),
-                    Err(error) => Err(crate::error(error)),
-                });
-                closed?;
+                match crate::close_driver::close(fd) {
+                    Ok(()) | Err(EBADF) => {}
+                    Err(error) => return Err(error),
+                }
             }
             write(Reply::Unit, out)
         }
@@ -639,6 +602,35 @@ pub(crate) fn try_with_files<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) 
     // SAFETY: READY published the state and the successful guard is exclusive.
     let files = unsafe { (&mut *STATE.0.get()).files.assume_init_mut() };
     f(files)
+}
+
+/// Inspect competing Closing records under the same lock as the fd operation.
+/// The original closure runs once, after every exact event is confirmed unlocked.
+pub fn with_fd<R>(fd: u32, f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
+    with_descriptors(&[fd], f)
+}
+
+pub fn with_descriptors<R>(
+    fds: &[u32],
+    f: impl FnOnce(&mut PosixFs) -> Result<R, i32>,
+) -> Result<R, i32> {
+    enum Step<R> {
+        Close(posix_fs::closing::CloseToken),
+        Done(Result<R, i32>),
+    }
+    let mut f = Some(f);
+    loop {
+        let step = process_state(|files| {
+            if let Some(token) = fds.iter().find_map(|&fd| files.closing(fd)) {
+                return Ok(Step::Close(token));
+            }
+            Ok(Step::Done(f.take().expect("one fd operation")(files)))
+        })?;
+        match step {
+            Step::Close(token) => crate::close_driver::settle_token(token)?,
+            Step::Done(result) => return result,
+        }
+    }
 }
 
 pub fn with_files<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
@@ -703,10 +695,12 @@ pub fn detach_open_owner(owner: u64) -> bool {
     let opens = crate::open_driver::detach(owner);
     // Both run: the records of the Change jobs lose the owner too.
     let changes = crate::change::detach(owner);
-    opens && changes
+    let closes = crate::close_driver::detach(owner);
+    opens && changes && closes
 }
 /// A surviving caller or collector pays one cleanup phase outside the layer locks.
 pub fn help_open_recovery() {
     crate::open_driver::help();
     crate::change::help();
+    crate::close_driver::help();
 }

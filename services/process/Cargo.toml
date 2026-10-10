@@ -30,6 +30,8 @@ steps = ["rt/step-stats"]
 tty-probe = []
 # Exact SetId reply corruption and readonly Image handoff diagnostics.
 image-probe = []
+# Only the dedicated PID-lifetime image can query the shared page.
+lifetime-probe = []
 
 [dependencies]
 proto-process = { path = "../../proto/process" }

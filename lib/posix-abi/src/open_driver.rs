@@ -71,7 +71,7 @@ pub(crate) fn open(
         save(claim, recovery)?;
         loop {
             // Binding and preparation retries run without a numeric reservation or defer.
-            while !files.open_advance(recovery.job, true).map_err(protocol)? {}
+            files.open_prepare_recover(recovery.job).map_err(protocol)?;
             let defer = Defer::enter();
             let final_result = (|| {
                 let (entry, context) = crate::shared::with_files(|files| {

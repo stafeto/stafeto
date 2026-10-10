@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 13 of the bounded RAM file service. Numbers are little endian.
+//! Version 16 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -108,6 +108,15 @@ mod time;
 pub use info::NodeInfo;
 pub use time::Timestamp;
 
+mod locks;
+pub use locks::{
+    LockBlocker, LockCommand, LockKind, LockPhase, LockReply, LockStart, read_lock_key,
+    write_lock_key,
+};
+
+mod close;
+pub use close::{CLOSE_KEY_FIRST, CLOSE_KEY_PLACES, CloseEvent, CloseKey};
+
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
@@ -115,7 +124,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 14;
+pub const VERSION: u16 = 17;
 /// Original descriptor custody keys and sixteen independent Control keys.
 pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
@@ -195,6 +204,12 @@ pub const NOT_SUPPORTED: u32 = 327;
 /// The request made no effect and raised no mark; the same key can be
 /// sent again after a pause.
 pub const JOBS_FULL: u32 = 328;
+/// ENOLCK: the prepaid lock records cannot admit this change.
+pub const NO_LOCKS: u32 = 329;
+/// EAGAIN: a nonblocking lock conflicts with another owner.
+pub const LOCK_CONFLICT: u32 = 330;
+/// Internal retry: a concurrent close cancelled unpublished preparation.
+pub const LOCK_CANCELLED: u32 = 331;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -336,6 +351,13 @@ pub enum Method {
     ChangeStep = 46,
     ChangeQuery = 47,
     ChangeRelease = 48,
+    /// Exact close key and description; detach the last local alias and retain its outcome.
+    CloseEvent = 49,
+    LockStart = 50,
+    LockQuery = 51,
+    LockRelease = 52,
+    /// Retain a canonical cancellation outcome until explicit Release.
+    LockCancel = 53,
 }
 
 impl Method {
@@ -392,6 +414,11 @@ impl Method {
             46 => Some(Self::ChangeStep),
             47 => Some(Self::ChangeQuery),
             48 => Some(Self::ChangeRelease),
+            49 => Some(Self::CloseEvent),
+            50 => Some(Self::LockStart),
+            51 => Some(Self::LockQuery),
+            52 => Some(Self::LockRelease),
+            53 => Some(Self::LockCancel),
             _ => None,
         }
     }
@@ -399,7 +426,8 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
+    52, 53,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

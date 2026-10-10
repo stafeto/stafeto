@@ -322,53 +322,57 @@ pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_i
             Err(errno) => return -errno,
         }
     }
-    let result = posix_abi::shared::with_files(|files| {
-        let error = posix_abi::error;
-        let fd = number(fd)?;
-        match command {
-            F_DUPFD | F_DUPFD_CLOEXEC | F_DUPFD_CLOFORK => {
-                let minimum = u32::try_from(argument).map_err(|_| EINVAL)?;
-                let flags = DescriptorFlags {
-                    close_on_exec: command == F_DUPFD_CLOEXEC,
-                    close_on_fork: command == F_DUPFD_CLOFORK,
-                };
-                files
-                    .dup_from(fd, minimum, flags)
-                    .map(|new| new as c_int)
-                    .map_err(error)
-            }
-            F_GETFD => {
-                let flags = files.descriptor_flags(fd).map_err(error)?;
-                let exec = if flags.close_on_exec { FD_CLOEXEC } else { 0 };
-                let fork = if flags.close_on_fork { FD_CLOFORK } else { 0 };
-                Ok(exec | fork)
-            }
-            F_SETFD => {
-                let mut flags = files.descriptor_flags(fd).map_err(error)?;
-                flags.close_on_exec = argument as c_int & (FD_CLOEXEC | LINUX_FD_CLOEXEC) != 0;
-                flags.close_on_fork = argument as c_int & FD_CLOFORK != 0;
-                files.set_descriptor_flags(fd, flags).map_err(error)?;
-                Ok(0)
-            }
-            F_GETFL => {
-                files.descriptor_flags(fd).map_err(error)?;
-                Ok(if files.console_input(fd).map_err(error)? {
-                    O_RDONLY
-                } else if files.console_route(fd).map_err(error)?.is_some() {
-                    O_WRONLY
-                } else {
-                    O_RDWR
-                })
-            }
-            F_SETFL => {
-                files.descriptor_flags(fd).map_err(error)?;
-                if argument & UNSUPPORTED_STATUS != 0 {
-                    return Err(EINVAL);
+    let result = call(|| {
+        number(fd).and_then(|fd| {
+            posix_abi::shared::with_fd(fd, |files| {
+                let error = posix_abi::error;
+                match command {
+                    F_DUPFD | F_DUPFD_CLOEXEC | F_DUPFD_CLOFORK => {
+                        let minimum = u32::try_from(argument).map_err(|_| EINVAL)?;
+                        let flags = DescriptorFlags {
+                            close_on_exec: command == F_DUPFD_CLOEXEC,
+                            close_on_fork: command == F_DUPFD_CLOFORK,
+                        };
+                        files
+                            .dup_from(fd, minimum, flags)
+                            .map(|new| new as c_int)
+                            .map_err(error)
+                    }
+                    F_GETFD => {
+                        let flags = files.descriptor_flags(fd).map_err(error)?;
+                        let exec = if flags.close_on_exec { FD_CLOEXEC } else { 0 };
+                        let fork = if flags.close_on_fork { FD_CLOFORK } else { 0 };
+                        Ok(exec | fork)
+                    }
+                    F_SETFD => {
+                        let mut flags = files.descriptor_flags(fd).map_err(error)?;
+                        flags.close_on_exec =
+                            argument as c_int & (FD_CLOEXEC | LINUX_FD_CLOEXEC) != 0;
+                        flags.close_on_fork = argument as c_int & FD_CLOFORK != 0;
+                        files.set_descriptor_flags(fd, flags).map_err(error)?;
+                        Ok(0)
+                    }
+                    F_GETFL => {
+                        files.descriptor_flags(fd).map_err(error)?;
+                        Ok(if files.console_input(fd).map_err(error)? {
+                            O_RDONLY
+                        } else if files.console_route(fd).map_err(error)?.is_some() {
+                            O_WRONLY
+                        } else {
+                            O_RDWR
+                        })
+                    }
+                    F_SETFL => {
+                        files.descriptor_flags(fd).map_err(error)?;
+                        if argument & UNSUPPORTED_STATUS != 0 {
+                            return Err(EINVAL);
+                        }
+                        Ok(0)
+                    }
+                    _ => Err(EINVAL),
                 }
-                Ok(0)
-            }
-            _ => Err(EINVAL),
-        }
+            })
+        })
     });
     result.unwrap_or_else(|errno| -errno)
 }

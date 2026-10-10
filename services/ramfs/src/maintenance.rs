@@ -124,3 +124,126 @@ mod tests {
         assert_eq!(cursor.remaining, 1);
     }
 }
+
+/// Departure debt keeps the existing session cells until every physical hold returns.
+pub struct Departures<const WORDS: usize> {
+    bits: [u64; WORDS],
+    position: usize,
+    limit: usize,
+    count: usize,
+}
+impl<const WORDS: usize> Departures<WORDS> {
+    pub const fn new(limit: usize) -> Self {
+        assert!(limit > 0 && limit <= WORDS * 64);
+        Self {
+            bits: [0; WORDS],
+            position: 0,
+            limit,
+            count: 0,
+        }
+    }
+    pub fn contains(&self, index: usize) -> bool {
+        index < self.limit && self.bits[index / 64] & (1 << (index % 64)) != 0
+    }
+    pub fn admit(&mut self, index: usize) {
+        assert!(index < self.limit);
+        if !self.contains(index) {
+            self.bits[index / 64] |= 1 << (index % 64);
+            self.count += 1;
+        }
+    }
+    pub fn release(&mut self, index: usize) {
+        assert!(self.contains(index));
+        self.bits[index / 64] &= !(1 << (index % 64));
+        self.count -= 1;
+    }
+    pub fn pending(&self) -> bool {
+        self.count != 0
+    }
+    /// Inspect at most WORDS + 1 bitmap words and rotate among all retained cells.
+    pub fn next_place(&mut self) -> Option<usize> {
+        if !self.pending() {
+            return None;
+        }
+        let first = self.position / 64;
+        let low = self.position % 64;
+        for word in first..WORDS {
+            let bits = self.bits[word]
+                & if word == first {
+                    u64::MAX << low
+                } else {
+                    u64::MAX
+                };
+            if bits != 0 {
+                return Some(self.advance(word, bits));
+            }
+        }
+        for word in 0..=first {
+            let bits = self.bits[word]
+                & if word == first {
+                    (1u64 << low).wrapping_sub(1)
+                } else {
+                    u64::MAX
+                };
+            if bits != 0 {
+                return Some(self.advance(word, bits));
+            }
+        }
+        unreachable!("nonempty bounded departure bitmap")
+    }
+    fn advance(&mut self, word: usize, bits: u64) -> usize {
+        let index = word * 64 + bits.trailing_zeros() as usize;
+        assert!(index < self.limit);
+        self.position = (index + 1) % self.limit;
+        index
+    }
+}
+
+#[cfg(test)]
+mod departure_tests {
+    use super::*;
+    #[test]
+    fn departures_visit_all_641_cells_once_per_round_and_release_only_exact_debt() {
+        let mut queue = Departures::<11>::new(641);
+        for index in 0..641 {
+            queue.admit(index);
+            queue.admit(index);
+        }
+        for index in 0..641 {
+            assert_eq!(queue.next_place(), Some(index));
+        }
+        for index in 0..641 {
+            assert_eq!(queue.next_place(), Some(index));
+            queue.release(index);
+        }
+        assert!(!queue.pending());
+        assert_eq!(queue.next_place(), None);
+        assert!(!queue.contains(641));
+    }
+    #[test]
+    fn departure_cursor_remains_fair_across_new_arrivals_and_word_boundaries() {
+        let mut queue = Departures::<3>::new(129);
+        for index in [0, 63, 64, 128] {
+            queue.admit(index);
+        }
+        assert_eq!(queue.next_place(), Some(0));
+        queue.release(0);
+        assert_eq!(queue.next_place(), Some(63));
+        queue.admit(0);
+        assert_eq!(queue.next_place(), Some(64));
+        assert_eq!(queue.next_place(), Some(128));
+        assert_eq!(queue.next_place(), Some(0));
+        assert_eq!(queue.next_place(), Some(63));
+        queue.release(63);
+        queue.release(64);
+        queue.release(128);
+        queue.release(0);
+        queue.admit(128);
+        assert_eq!(queue.next_place(), Some(128));
+    }
+    #[test]
+    #[should_panic]
+    fn departure_admission_rejects_a_place_past_the_actual_table() {
+        Departures::<11>::new(641).admit(641);
+    }
+}

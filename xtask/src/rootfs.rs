@@ -373,6 +373,7 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
+    "boot-posix-lifetimes.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
     "boot-posix-jobs.img",
@@ -435,7 +436,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ));
             files
         }
-        "boot-posix-procs.img" | "boot-posix-jobs.img" => procs(),
+        "boot-posix-procs.img" | "boot-posix-jobs.img" | "boot-posix-lifetimes.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -579,6 +580,7 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-posix-lifetimes.img" => &crate::POSIX_LIFETIMES_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
@@ -675,6 +677,7 @@ mod tests {
         for name in [
             "boot-ash-dialog.img",
             "boot-posix-procs.img",
+            "boot-posix-lifetimes.img",
             "boot-posix-random.img",
             "boot-posix-pty.img",
             "boot-posix-steps.img",

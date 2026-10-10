@@ -386,6 +386,13 @@ impl Binding {
             _ => None,
         }
     }
+    /// Only a genuine target identity can revoke its PID locks during close.
+    pub fn close_pid(&self) -> Option<u32> {
+        match self {
+            Self::Active(who) | Self::Pending(who) | Self::Handoff(who) => Some(who.pid),
+            _ => None,
+        }
+    }
     pub fn stamp(&self) -> Option<Stamp> {
         self.snapshot_ref().map(|who| Stamp {
             generation: who.generation,

@@ -71,6 +71,13 @@ pub trait Service<const K: usize> {
         let _ = s;
     }
 
+    /// Keep paid cleanup data in its existing cell until maintenance releases it.
+    /// Services using this hook also return every held handle and deferred reply.
+    fn keep_departed(&self, session: &Session<Self::Data, K>) -> bool {
+        let _ = session;
+        false
+    }
+
     /// CLIENT_GONE of `label`, whether or not it had a session: after
     /// `gone`, for a service that hears of the last copy of a handle it
     /// gave away, such as the start channel of a program.
@@ -465,10 +472,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                     if placed.is_some() && slot.is_none() {
                         *slot = Some(Session::new(label, S::Data::default(), config.issued));
                     }
-                    if let Some(s) = slot.as_mut() {
-                        service.gone(s);
-                    }
-                    *slot = None;
+                    depart_session(service, slot);
                 }
                 service.closed(label);
             }
@@ -771,6 +775,19 @@ fn refuse(token: Token, status: Status) {
     let _ = reply(token, &proto_wire::reply(status), Outgoing::new());
 }
 
+/// End logical ownership without discarding retained physical cleanup debt.
+fn depart_session<S: Service<K>, const K: usize>(
+    service: &mut S,
+    slot: &mut Option<Session<S::Data, K>>,
+) {
+    if let Some(s) = slot.as_mut() {
+        service.gone(s);
+    }
+    if !slot.as_ref().is_some_and(|s| service.keep_departed(s)) {
+        *slot = None;
+    }
+}
+
 /// The session of `label`: at `place` when the service gives one
 /// (Service::place), or else found from PLACED on; made in that place, or
 /// in the first free one from PLACED on, when there is none; a session of
@@ -789,8 +806,9 @@ fn session<'a, S: Service<K>, const K: usize>(
             let s = table.get_mut(i)?;
             if s.as_ref().is_some_and(|s| s.label != label) {
                 // A session of a label the service gave the place up for.
-                if let Some(mut old) = s.take() {
-                    service.gone(&mut old);
+                depart_session(service, s);
+                if s.is_some() {
+                    return None;
                 }
             }
             i
@@ -1173,5 +1191,106 @@ impl<const N: usize> LongOps<N> {
                 )
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod departure_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Debt {
+        remaining: usize,
+        logically_dead: bool,
+    }
+    struct Keeper {
+        retain: bool,
+        calls: usize,
+    }
+    impl Service<0> for Keeper {
+        const VERSION: u16 = 1;
+        const METHODS: &'static [u16] = &[];
+        const PLACED: usize = 1;
+        type Data = Debt;
+        fn request(&mut self, _: &mut Session<Debt, 0>, _: &mut Request<'_>) -> Answer {
+            Answer::Status(Status::Ok)
+        }
+        fn gone(&mut self, s: &mut Session<Debt, 0>) {
+            self.calls += 1;
+            s.data.logically_dead = true;
+        }
+        fn keep_departed(&self, s: &Session<Debt, 0>) -> bool {
+            self.retain && s.data.remaining != 0
+        }
+    }
+
+    #[test]
+    fn gone_retains_exact_debt_until_every_hold_is_returned() {
+        let mut service = Keeper {
+            retain: true,
+            calls: 0,
+        };
+        let mut slot = Some(Session::new(
+            17,
+            Debt {
+                remaining: 32,
+                logically_dead: false,
+            },
+            0,
+        ));
+        depart_session(&mut service, &mut slot);
+        let held = slot.as_mut().expect("cleanup debt remains paid");
+        assert_eq!(held.label(), 17);
+        assert!(held.data.logically_dead);
+        assert_eq!(held.data.remaining, 32);
+        held.data.remaining = 1;
+        depart_session(&mut service, &mut slot);
+        assert!(slot.is_some());
+        slot.as_mut().unwrap().data.remaining = 0;
+        depart_session(&mut service, &mut slot);
+        assert!(slot.is_none());
+        assert_eq!(service.calls, 3);
+    }
+
+    #[test]
+    fn collision_cannot_replace_old_generation_while_its_debt_remains() {
+        let mut service = Keeper {
+            retain: true,
+            calls: 0,
+        };
+        let mut table = [Some(Session::new(
+            17,
+            Debt {
+                remaining: 1,
+                logically_dead: false,
+            },
+            0,
+        ))];
+        assert!(session(&mut service, &mut table, 18, Some(0), 0).is_none());
+        assert_eq!(table[0].as_ref().unwrap().label(), 17);
+        assert_eq!(table[0].as_ref().unwrap().data.remaining, 1);
+        table[0].as_mut().unwrap().data.remaining = 0;
+        let next = session(&mut service, &mut table, 18, Some(0), 0).unwrap();
+        assert_eq!(next.label(), 18);
+        assert!(!next.data.logically_dead);
+    }
+
+    #[test]
+    fn services_without_retention_drop_departed_sessions_immediately() {
+        let mut service = Keeper {
+            retain: false,
+            calls: 0,
+        };
+        let mut slot = Some(Session::new(
+            17,
+            Debt {
+                remaining: 32,
+                logically_dead: false,
+            },
+            0,
+        ));
+        depart_session(&mut service, &mut slot);
+        assert!(slot.is_none());
+        assert_eq!(service.calls, 1);
     }
 }

@@ -159,11 +159,26 @@ impl Usage {
         descriptions: 0,
     };
 }
+/// A linear retention of the exact expenditure account until lock debt is returned.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LockAnchor {
+    index: u16,
+    key: Root,
+}
+impl LockAnchor {
+    pub const fn index(&self) -> u16 {
+        self.index
+    }
+    pub const fn root(&self) -> Root {
+        self.key
+    }
+}
 #[derive(Clone, Copy)]
 struct Account {
     key: Root,
     usage: Usage,
     pending: u16,
+    lock_refs: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,7 +188,9 @@ pub enum Pin {
     Image,
     Pending,
     Parent,
+    Lock,
 }
+pub const PIN_KINDS: usize = 6;
 impl Pin {
     const fn index(self) -> usize {
         self as usize
@@ -195,7 +212,7 @@ pub struct Node {
     /// Shrinking never makes truncated boot bytes visible after a later extension.
     pub boot_visible_length: u64,
     pub times: [proto_fs::Timestamp; 3],
-    pub pins: [u16; 5],
+    pub pins: [u16; PIN_KINDS],
     /// The boot entry (canonical for regular hard links), or NONE for fixed nodes.
     pub boot: u16,
     overlay: u16,
@@ -225,7 +242,7 @@ impl Node {
         data_generation: 0,
         boot_visible_length: 0,
         times: [proto_fs::Timestamp::ZERO; 3],
-        pins: [0; 5],
+        pins: [0; PIN_KINDS],
         boot: NONE,
         overlay: NONE,
         reclaim: false,
@@ -1230,14 +1247,58 @@ impl<'a> Storage<'a> {
             .state
             .accounts
             .iter()
-            .position(|a| a.is_none_or(|a| a.usage == Usage::EMPTY && a.pending == 0))
+            .position(|a| {
+                a.is_none_or(|a| a.usage == Usage::EMPTY && a.pending == 0 && a.lock_refs == 0)
+            })
             .ok_or(NO_SPACE)?;
         self.state.accounts[i] = Some(Account {
             key,
             usage: Usage::EMPTY,
             pending: 0,
+            lock_refs: 0,
         });
         Ok(i)
+    }
+    pub fn lock_anchor(&mut self, root: Root) -> Result<LockAnchor, u32> {
+        let index = self.account(root)?;
+        let account = self.state.accounts[index]
+            .as_mut()
+            .expect("allocated account");
+        let next = account.lock_refs.checked_add(1).ok_or(NO_SPACE)?;
+        account.lock_refs = next;
+        Ok(LockAnchor {
+            index: index as u16,
+            key: root,
+        })
+    }
+    /// Constant-time retention; no scan or preparation quota is involved.
+    pub fn retain_lock_anchor(&mut self, anchor: &LockAnchor) -> Result<LockAnchor, u32> {
+        let account = self
+            .state
+            .accounts
+            .get_mut(anchor.index as usize)
+            .and_then(Option::as_mut)
+            .filter(|account| account.key == anchor.key && account.lock_refs != 0)
+            .ok_or(proto_fs::INVALID_ARGUMENT)?;
+        account.lock_refs = account.lock_refs.checked_add(1).ok_or(NO_SPACE)?;
+        Ok(LockAnchor {
+            index: anchor.index,
+            key: anchor.key,
+        })
+    }
+    pub fn release_lock_anchor(&mut self, anchor: LockAnchor) -> Result<(), u32> {
+        let account = self
+            .state
+            .accounts
+            .get_mut(anchor.index as usize)
+            .and_then(Option::as_mut)
+            .filter(|account| account.key == anchor.key && account.lock_refs != 0)
+            .ok_or(proto_fs::INVALID_ARGUMENT)?;
+        account.lock_refs -= 1;
+        if account.lock_refs == 0 && account.pending == 0 && account.usage == Usage::EMPTY {
+            self.state.accounts[anchor.index as usize] = None;
+        }
+        Ok(())
     }
     pub fn usage(&self, root: Root) -> Usage {
         self.state
@@ -1258,7 +1319,7 @@ impl<'a> Storage<'a> {
     fn uncharge(&mut self, root: usize, field: fn(&mut Usage) -> &mut u16) {
         let a = self.state.accounts[root].as_mut().expect("charged account");
         *field(&mut a.usage) -= 1;
-        if a.usage == Usage::EMPTY && a.pending == 0 {
+        if a.usage == Usage::EMPTY && a.pending == 0 && a.lock_refs == 0 {
             self.state.accounts[root] = None;
         }
     }
@@ -1743,7 +1804,7 @@ impl<'a> Storage<'a> {
             gid,
             parent,
             overlay: i as u16,
-            pins: [0, 0, 0, 1, 0],
+            pins: [0, 0, 0, 1, 0, 0],
             ..Node::EMPTY
         };
         let entry = &mut self.state.dentries[d];
@@ -1941,7 +2002,7 @@ impl<'a> Storage<'a> {
             .expect("paid preparation");
         a.pending -= 1;
         self.state.preparation_used -= 1;
-        if a.pending == 0 && a.usage == Usage::EMPTY {
+        if a.pending == 0 && a.usage == Usage::EMPTY && a.lock_refs == 0 {
             self.state.accounts[root as usize] = None;
         }
     }
@@ -3331,5 +3392,153 @@ mod counter_wrap_tests {
         assert_eq!(ram.storage.set_attributes(ROOT, 0o700, 1, 2), Err(NO_SPACE));
         assert_eq!(ram.storage.node(ROOT).unwrap().mode, mode);
         assert_eq!(ram.storage.node(ROOT).unwrap().access_gen, u32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod lock_anchor_tests {
+    extern crate std;
+    use super::*;
+    fn root(id: u64, generation: u64) -> Root {
+        Root { id, generation }
+    }
+    #[test]
+    fn lock_anchor_preserves_empty_payer_through_repeated_account_reuse() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let old = ram.storage.lock_anchor(root(1, 3)).unwrap();
+        assert_eq!(core::mem::size_of::<Account>(), 32);
+        assert_eq!(ram.storage.usage(old.root()), Usage::EMPTY);
+        for id in 2..602 {
+            let other = ram.storage.lock_anchor(root(id, 7)).unwrap();
+            assert_ne!(old.index(), other.index());
+            ram.storage.release_lock_anchor(other).unwrap();
+            assert_eq!(
+                ram.storage.state.accounts[old.index() as usize]
+                    .unwrap()
+                    .key,
+                old.root()
+            );
+        }
+        ram.storage.release_lock_anchor(old).unwrap();
+        assert!(ram.storage.state.accounts.iter().all(Option::is_none));
+    }
+    #[test]
+    fn last_description_and_preparation_cannot_release_lock_retained_root() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let key = root(11, 9);
+        let anchor = ram.storage.lock_anchor(key).unwrap();
+        ram.storage.charge_description(key).unwrap();
+        ram.storage.release_description(key);
+        assert!(ram.storage.state.accounts[anchor.index() as usize].is_some());
+        let preparation = ram.storage.charge_preparation(key).unwrap();
+        ram.storage.release_preparation(preparation);
+        assert!(ram.storage.state.accounts[anchor.index() as usize].is_some());
+        let mut retained = std::vec::Vec::new();
+        for _ in 0..512 {
+            retained.push(ram.storage.retain_lock_anchor(&anchor).unwrap());
+        }
+        assert_eq!(ram.storage.preparations_used(), 0);
+        assert_eq!(
+            ram.storage.state.accounts[anchor.index() as usize]
+                .unwrap()
+                .pending,
+            0
+        );
+        assert_eq!(ram.storage.usage(key), Usage::EMPTY);
+        ram.storage.release_lock_anchor(anchor).unwrap();
+        for anchor in retained {
+            ram.storage.release_lock_anchor(anchor).unwrap();
+        }
+        assert!(ram.storage.state.accounts.iter().all(Option::is_none));
+    }
+    #[test]
+    fn stale_lock_anchor_cannot_debit_a_new_root_generation() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let old_key = root(12, 1);
+        let old = ram.storage.lock_anchor(old_key).unwrap();
+        let index = old.index();
+        ram.storage.release_lock_anchor(old).unwrap();
+        let new = ram.storage.lock_anchor(root(12, 2)).unwrap();
+        assert_eq!(new.index(), index);
+        let stale = LockAnchor {
+            index,
+            key: old_key,
+        };
+        assert_eq!(
+            ram.storage.retain_lock_anchor(&stale),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            ram.storage.release_lock_anchor(stale),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        let bad = LockAnchor {
+            index: u16::MAX,
+            key: new.root(),
+        };
+        assert_eq!(
+            ram.storage.retain_lock_anchor(&bad),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            ram.storage.release_lock_anchor(bad),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            ram.storage.state.accounts[index as usize]
+                .unwrap()
+                .lock_refs,
+            1
+        );
+        ram.storage.release_lock_anchor(new).unwrap();
+    }
+    #[test]
+    fn terminal_lock_retention_counter_refuses_before_any_effect() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let anchor = ram.storage.lock_anchor(root(13, 3)).unwrap();
+        let index = anchor.index() as usize;
+        ram.storage.state.accounts[index]
+            .as_mut()
+            .unwrap()
+            .lock_refs = u16::MAX;
+        assert_eq!(ram.storage.lock_anchor(anchor.root()), Err(NO_SPACE));
+        assert_eq!(ram.storage.retain_lock_anchor(&anchor), Err(NO_SPACE));
+        let account = ram.storage.state.accounts[index].unwrap();
+        assert_eq!(account.key, anchor.root());
+        assert_eq!(account.lock_refs, u16::MAX);
+        assert_eq!(account.usage, Usage::EMPTY);
+        assert_eq!(account.pending, 0);
+        ram.storage.state.accounts[index]
+            .as_mut()
+            .unwrap()
+            .lock_refs = 1;
+        ram.storage.release_lock_anchor(anchor).unwrap();
+    }
+    #[test]
+    fn full_lock_retained_accounts_refuse_until_one_exact_lifetime_releases() {
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let mut anchors = std::vec::Vec::new();
+        for id in 0..ROOTS {
+            anchors.push(ram.storage.lock_anchor(root(id as u64, 7)).unwrap());
+        }
+        assert_eq!(ram.storage.lock_anchor(root(999, 2)), Err(NO_SPACE));
+        let old = anchors.remove(17);
+        let index = old.index();
+        ram.storage.release_lock_anchor(old).unwrap();
+        let new = ram.storage.lock_anchor(root(999, 2)).unwrap();
+        assert_eq!(new.index(), index);
+        for anchor in &anchors {
+            assert_eq!(
+                ram.storage.state.accounts[anchor.index() as usize]
+                    .unwrap()
+                    .key,
+                anchor.root()
+            );
+        }
+        for anchor in anchors {
+            ram.storage.release_lock_anchor(anchor).unwrap();
+        }
+        ram.storage.release_lock_anchor(new).unwrap();
+        assert!(ram.storage.state.accounts.iter().all(Option::is_none));
     }
 }

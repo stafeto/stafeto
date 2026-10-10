@@ -62,7 +62,7 @@ fn error(error: FsError) -> c_int {
 /// no directory.
 pub(crate) fn descriptor_base(dirfd: c_int) -> Result<Base, c_int> {
     let fd = u32::try_from(dirfd).map_err(|_| EBADF)?;
-    crate::shared::with_files(|files| match files.target(fd).map_err(error)? {
+    crate::shared::with_fd(fd, |files| match files.target(fd).map_err(error)? {
         Target::Ram(target) | Target::Random(target) => Ok(Base::Fd {
             fd: target.fd(),
             generation: target.generation(),
@@ -340,7 +340,7 @@ fn metadata_target(dirfd: c_int, path: &[u8], at_flags: c_int) -> Result<(Placed
         return Ok((placed, true));
     }
     let fd = u32::try_from(dirfd).map_err(|_| EBADF)?;
-    let target = crate::shared::with_files(|files| files.target(fd).map_err(error))?;
+    let target = crate::shared::with_fd(fd, |files| files.target(fd).map_err(error))?;
     match target {
         Target::Ram(target) | Target::Random(target) => {
             placed.base = Base::Fd {
@@ -637,7 +637,7 @@ pub fn statvfs(path: &[u8]) -> Result<Statvfs, c_int> {
 /// fstatvfs: the file system of the file `fd` names.
 pub fn fstatvfs(fd: c_int) -> Result<Statvfs, c_int> {
     let fd = u32::try_from(fd).map_err(|_| EBADF)?;
-    let target = crate::shared::with_files(|files| files.target(fd).map_err(error))?;
+    let target = crate::shared::with_fd(fd, |files| files.target(fd).map_err(error))?;
     let base = match target {
         Target::Ram(target) | Target::Random(target) => Base::Fd {
             fd: target.fd(),

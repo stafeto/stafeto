@@ -7,6 +7,7 @@
 #![no_std]
 
 pub mod change;
+pub mod closing;
 pub mod open;
 mod target;
 pub use target::RamTarget;
@@ -212,11 +213,12 @@ pub struct PosixFs {
     descriptors: Table<Target, OPEN_MAX, open::Recovery, (), entries::Frame>,
 }
 
-// The record of a Change job fits in the custody payload union.
-// Sixteen dedicated Control slots keep name operations independent of I/O holds.
+// Control frame recovery fits in the existing custody payload union.
+// Dedicated close records additionally retain one frame apiece.
 const _: () = assert!(
     core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), entries::Frame>>()
         == core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery>>()
+            + posix_fd::JOBS_MAX * core::mem::size_of::<entries::Frame>()
 );
 
 /// Owned startup transports, prepared before the pinned descriptor table exists.

@@ -644,7 +644,10 @@ fn metadata_pin_exhaustion_and_paid_admission_preserve_all_resources() {
     ram.storage.node_mut(token).unwrap().pins[Pin::Pending as usize] = 1;
     resolver.release(&mut ram.storage);
     ram.storage.release_preparation(charge);
-    assert_eq!(ram.storage.node(token).unwrap().pins, [0; 5]);
+    assert_eq!(
+        ram.storage.node(token).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
 }
 
 #[test]

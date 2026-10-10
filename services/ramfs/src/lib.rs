@@ -12,6 +12,7 @@ pub mod authority;
 pub mod change;
 #[cfg(test)]
 mod change_tests;
+pub mod close;
 pub mod cwd;
 #[cfg(test)]
 mod cwd_tests;
@@ -19,6 +20,8 @@ pub mod data;
 pub mod directory;
 #[cfg(test)]
 mod directory_tests;
+#[cfg(test)]
+mod fd_lifetime_tests;
 pub mod image;
 #[cfg(test)]
 mod image_tests;
@@ -26,6 +29,7 @@ pub mod io;
 #[cfg(test)]
 mod io_tests;
 pub mod job;
+pub mod locks;
 pub mod maintenance;
 pub mod metadata;
 #[cfg(test)]
@@ -275,7 +279,13 @@ pub struct Fds {
     slots: [Option<u8>; OPEN_MAX],
     /// Reserved descriptions are paid and held, but are not yet public descriptors.
     tentative: u32,
+    /// Published session references, independent of physical operation holds.
+    live_fds: u32,
     pub claimed: bool,
+    /// The endpoint ended; this paid cell awaits bounded physical cleanup.
+    pub departed: bool,
+    /// Bounded marking of the sixteen native lock requests after endpoint death.
+    pub lock_departure: u8,
     pub binding: authority::Binding,
     pub authority_index: u16,
     pub binding_preparation: Option<u16>,
@@ -290,6 +300,8 @@ pub struct Fds {
     pub auth_probe_gc_reservation: Option<storage::Reservation>,
     pub resolvers: [u64; 16],
     pub open_watermarks: [u64; proto_fs::JOB_KEY_PLACES],
+    /// Independent exact numeric-close receipts survive physical descriptor reuse.
+    close_receipts: [Option<proto_fs::CloseEvent>; proto_fs::CLOSE_KEY_PLACES],
     pub image_hold: Option<image::ImageHold>,
     pub image_outcome: Option<image::ImageOutcome>,
     /// Exact completed operations survive Close as tombstones until this fd is reused.
@@ -304,7 +316,10 @@ impl Default for Fds {
         Self {
             slots: [None; OPEN_MAX],
             tentative: 0,
+            live_fds: 0,
             claimed: false,
+            departed: false,
+            lock_departure: 16,
             binding: authority::Binding::Unbound,
             authority_index: storage::NONE,
             binding_preparation: None,
@@ -318,6 +333,7 @@ impl Default for Fds {
             auth_probe_gc_reservation: None,
             resolvers: [0; 16],
             open_watermarks: [0; proto_fs::JOB_KEY_PLACES],
+            close_receipts: [None; proto_fs::CLOSE_KEY_PLACES],
             image_hold: None,
             image_outcome: None,
             open_receipts: [OpenReceipt::EMPTY; OPEN_MAX],
@@ -329,6 +345,22 @@ impl Default for Fds {
 }
 
 impl Fds {
+    /// Admission ownership returns only after every physical hold has gone.
+    pub fn custody_empty(&self) -> bool {
+        #[cfg(feature = "auth-probe")]
+        if self.auth_probe_gc.is_some() || self.auth_probe_gc_reservation.is_some() {
+            return false;
+        }
+        self.slots.iter().all(Option::is_none)
+            && self.resolvers.iter().all(|&id| id == 0)
+            && self.preparations.iter().all(Option::is_none)
+            && self.image_hold.is_none()
+            && self.image_outcome.is_none()
+            && self.cwd.is_none()
+            && self.binding_preparation.is_none()
+            && self.binding_source.is_none()
+            && self.authority_index == storage::NONE
+    }
     /// Transfer one exact retained birth into an unclaimed RT default session.
     pub fn claim_retained_birth(&mut self, birth: &mut Option<(u64, Self)>, label: u64) -> bool {
         let Some((owner, source)) = birth.as_mut().filter(|(owner, _)| *owner == label) else {
@@ -343,7 +375,9 @@ impl Fds {
     fn fresh_clone_destination(&self) -> bool {
         if self.slots.iter().any(Option::is_some)
             || self.tentative != 0
+            || self.live_fds != 0
             || self.claimed
+            || self.departed
             || self.binding != authority::Binding::Unbound
             || self.authority_index != storage::NONE
             || self.binding_preparation.is_some()
@@ -354,6 +388,7 @@ impl Fds {
                 .open_watermarks
                 .iter()
                 .any(|&generation| generation != 0)
+            || self.close_receipts.iter().any(Option::is_some)
             || self.image_hold.is_some()
             || self.image_outcome.is_some()
             || self
@@ -426,6 +461,14 @@ pub struct TentativeOpen {
     pub description: Token,
 }
 
+/// The exact OFD close event, independent of retained physical I/O references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorClose {
+    pub inode: Token,
+    pub description: Token,
+    pub last_fd: bool,
+}
+
 /// Move-only publication authority, produced before the file effect.
 /// Apply within the same service step and Fds, without changing its descriptors.
 #[derive(Debug)]
@@ -466,8 +509,22 @@ impl OpenReceipt {
 struct Shared {
     open: Open,
     refs: u16,
+    fd_refs: u16,
     root: storage::Root,
     generation: u64,
+}
+
+/// Read-only authoritative OFD generations and actual published fd counts.
+pub struct DescriptionLifetimes<'a> {
+    descriptions: &'a [Option<Shared>; DESCRIPTIONS],
+}
+impl DescriptionLifetimes<'_> {
+    pub fn live(&self, token: Token) -> bool {
+        self.descriptions
+            .get(token.slot as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|shared| shared.generation == token.generation && shared.fd_refs > 0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -577,6 +634,34 @@ impl<'a> Ram<'a> {
         }
     }
 
+    /// Initialize permanent service storage without a whole Ram stack temporary.
+    ///
+    /// # Safety
+    /// The destination is exclusive aligned writable uninitialized Self storage.
+    pub unsafe fn initialize_at(
+        destination: *mut Self,
+        now: proto_fs::Timestamp,
+        state: &'a mut storage::State,
+        data: &'a mut [u8],
+        tree: Option<Tree<'a>>,
+    ) {
+        // SAFETY: all field destinations lie in the caller's exclusive allocation.
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).storage)
+                .write(Storage::new(state, data, tree, now));
+            let descriptions =
+                core::ptr::addr_of_mut!((*destination).descriptions).cast::<Option<Shared>>();
+            let generations =
+                core::ptr::addr_of_mut!((*destination).description_generations).cast::<u64>();
+            for index in 0..DESCRIPTIONS {
+                descriptions.add(index).write(None);
+                generations.add(index).write(0);
+            }
+            core::ptr::addr_of_mut!((*destination).tree).write(tree);
+            core::ptr::addr_of_mut!((*destination).cancel_refusals).write(0);
+        }
+    }
+
     /// A cancel left something held. A debug build and the host tests stop
     /// here; any build counts it.
     pub fn refused_cancel(&mut self) {
@@ -650,6 +735,10 @@ impl<'a> Ram<'a> {
     /// `fds`: TOO_MANY_OPEN_FILES with the session's descriptors or the
     /// service's descriptions taken.
     fn insert(&mut self, fds: &mut Fds, open: Open) -> Result<u32, u32> {
+        self.insert_mode(fds, open, true)
+    }
+
+    fn insert_mode(&mut self, fds: &mut Fds, open: Open, published: bool) -> Result<u32, u32> {
         let slot = fds
             .slots
             .iter()
@@ -671,11 +760,15 @@ impl<'a> Ram<'a> {
         self.descriptions[index] = Some(Shared {
             open,
             refs: 1,
+            fd_refs: u16::from(published),
             root: fds.root,
             generation,
         });
         self.description_generations[index] = generation;
         fds.slots[slot] = Some(index as u8);
+        if published {
+            fds.live_fds |= 1 << slot;
+        }
         Ok(slot as u32 + 3)
     }
 
@@ -751,7 +844,7 @@ impl<'a> Ram<'a> {
         if !created && !identity.permits(node, bits) {
             return Err(proto_fs::ACCESS_DENIED);
         }
-        let fd = self.insert(
+        let fd = self.insert_mode(
             fds,
             Open {
                 file: self.file(token),
@@ -760,6 +853,7 @@ impl<'a> Ram<'a> {
                 scan: crate::storage::NONE,
                 flags: access | (flags & proto_fs::APPEND),
             },
+            false,
         )?;
         let description = self.description_token(fds, fd)?;
         fds.tentative |= 1 << (fd - 3);
@@ -798,6 +892,7 @@ impl<'a> Ram<'a> {
     /// This publication cannot allocate or fail after a successful effect preflight.
     pub fn publish_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<u32, u32> {
         let slot = self.tentative_slot(fds, held)?;
+        self.publish_descriptor(fds, slot);
         fds.tentative &= !(1 << slot);
         Ok(held.fd)
     }
@@ -837,6 +932,7 @@ impl<'a> Ram<'a> {
                 key: proof.key,
                 description: proof.held.description,
             };
+            self.publish_descriptor(fds, proof.slot);
             fds.tentative &= !(1 << proof.slot);
         }
         proof.held
@@ -921,15 +1017,83 @@ impl<'a> Ram<'a> {
         true
     }
 
+    fn publish_descriptor(&mut self, fds: &mut Fds, slot: usize) {
+        assert_eq!(fds.live_fds & (1 << slot), 0);
+        let index = fds.slots[slot].expect("prepaid description") as usize;
+        let shared = self.descriptions[index]
+            .as_mut()
+            .expect("prepaid description");
+        shared.fd_refs = shared
+            .fd_refs
+            .checked_add(1)
+            .expect("bounded session references");
+        assert!(shared.fd_refs <= shared.refs);
+        fds.live_fds |= 1 << slot;
+    }
+
+    /// A new lock request names an exact, currently published session reference.
+    pub fn live_description(&self, fds: &Fds, held: TentativeOpen) -> Result<(Token, u32), u32> {
+        let description = self.description_token(fds, held.fd)?;
+        if description != held.description || fds.live_fds & (1 << (held.fd - 3)) == 0 {
+            return Err(BAD_FD);
+        }
+        let shared = self.descriptions[description.slot as usize]
+            .as_ref()
+            .expect("live description");
+        Ok((self.token(shared.open.file), shared.open.flags))
+    }
+
+    /// Retire one exact real fd reference while physical I/O can keep its slot.
+    /// Repeated cleanup and a stale generation leave current references intact.
+    pub fn detach_descriptor(
+        &mut self,
+        fds: &mut Fds,
+        held: TentativeOpen,
+    ) -> Result<Option<DescriptorClose>, u32> {
+        if self.description_token(fds, held.fd) != Ok(held.description) {
+            return Ok(None);
+        }
+        let slot = (held.fd - 3) as usize;
+        if fds.live_fds & (1 << slot) == 0 {
+            return Ok(None);
+        }
+        let index = held.description.slot as usize;
+        let inode = self.token(
+            self.descriptions[index]
+                .as_ref()
+                .expect("retained description")
+                .open
+                .file,
+        );
+        let shared = self.descriptions[index]
+            .as_mut()
+            .expect("retained description");
+        assert!(shared.fd_refs > 0);
+        shared.fd_refs -= 1;
+        fds.live_fds &= !(1 << slot);
+        Ok(Some(DescriptorClose {
+            inode,
+            description: held.description,
+            last_fd: shared.fd_refs == 0,
+        }))
+    }
+
     /// Close: the descriptor goes, and its description with the last one
     /// that names it, in any session.
     pub fn close(&mut self, fds: &mut Fds, fd: u32) -> Result<(), u32> {
         let index = fds.description(fd)?;
+        let held = TentativeOpen {
+            fd,
+            description: self.description_token(fds, fd)?,
+        };
+        self.detach_descriptor(fds, held)?;
         fds.slots[(fd - 3) as usize] = None;
         let shared = self.descriptions[index]
             .as_mut()
             .expect("a named description");
+        assert!(shared.refs > 0);
         shared.refs -= 1;
+        assert!(shared.fd_refs <= shared.refs);
         if shared.refs == 0 {
             let file = shared.open.file;
             let root = shared.root;
@@ -1070,6 +1234,16 @@ impl<'a> Ram<'a> {
             return true;
         }
         false
+    }
+
+    /// Split disjoint storage mutation and authoritative description reads.
+    pub fn lock_parts(&mut self) -> (&mut Storage<'a>, DescriptionLifetimes<'_>) {
+        (
+            &mut self.storage,
+            DescriptionLifetimes {
+                descriptions: &self.descriptions,
+            },
+        )
     }
 
     pub fn description_token(&self, fds: &Fds, fd: u32) -> Result<Token, u32> {
@@ -1237,6 +1411,9 @@ impl<'a> Ram<'a> {
         let mut slots = [None; OPEN_MAX];
         for &fd in list {
             let index = fds.description(fd)?;
+            if fds.live_fds & (1 << (fd - 3)) == 0 {
+                return Err(BAD_FD);
+            }
             slots[(fd - 3) as usize] = Some(index as u8);
         }
         if let Some(cwd) = fds.cwd {
@@ -1244,13 +1421,17 @@ impl<'a> Ram<'a> {
         }
         out.root = fds.root;
         out.slots = slots;
+        out.live_fds = out.slots.iter().enumerate().fold(0, |mask, (slot, value)| {
+            mask | (u32::from(value.is_some()) << slot)
+        });
         out.cwd = fds.cwd;
         // At most 641 session/birth records, including this child, own 32 references each.
         for index in out.slots.iter().flatten() {
-            self.descriptions[usize::from(*index)]
+            let shared = self.descriptions[usize::from(*index)]
                 .as_mut()
-                .expect("a named description")
-                .refs += 1;
+                .expect("a named description");
+            shared.refs += 1;
+            shared.fd_refs += 1;
         }
         Ok(())
     }
@@ -2326,6 +2507,77 @@ mod tests {
         ])
     }
 
+    fn initialize_in_box<'a>(
+        state: &'a mut storage::State,
+        data: &'a mut [u8],
+        tree: Option<Tree<'a>>,
+    ) -> std::boxed::Box<Ram<'a>> {
+        let mut allocation = std::boxed::Box::<Ram>::new_uninit();
+        // SAFETY: the Box exclusively supplies aligned storage for every Ram field.
+        unsafe {
+            Ram::initialize_at(
+                allocation.as_mut_ptr(),
+                proto_fs::Timestamp::ZERO,
+                state,
+                data,
+                tree,
+            );
+            allocation.assume_init()
+        }
+    }
+    #[test]
+    fn directly_initialized_ram_opens_shared_descriptions_and_reuses_after_close() {
+        // SAFETY: State admits zeroes and initialize establishes its free tables.
+        let mut state = unsafe { std::boxed::Box::<storage::State>::new_zeroed().assume_init() };
+        state.initialize();
+        let mut data = vec![0; storage::PAGES * storage::PAGE];
+        let mut ram = initialize_in_box(&mut state, &mut data, None);
+        let mut fds = Fds::default();
+        let fd = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
+        assert_eq!(fd, 3);
+        assert_eq!(
+            ram.description_token(&fds, fd),
+            Ok(Token {
+                slot: 0,
+                generation: 1
+            })
+        );
+        assert_eq!(ram.write(&mut fds, fd, b"abc"), Ok(3));
+        assert_eq!(ram.seek(&mut fds, fd, 0), Ok(0));
+        let mut copy = ram.clone_fds(&fds, &[fd]).unwrap();
+        ram.close(&mut fds, fd).unwrap();
+        let mut out = [0; 3];
+        assert_eq!(ram.read(&mut copy, fd, &mut out), Ok(3));
+        assert_eq!(&out, b"abc");
+        ram.close(&mut copy, fd).unwrap();
+        let next = ram.open(&mut fds, "/tmp/probe", READ_ONLY).unwrap();
+        assert_eq!(
+            ram.description_token(&fds, next),
+            Ok(Token {
+                slot: 0,
+                generation: 2
+            })
+        );
+        ram.close(&mut fds, next).unwrap();
+    }
+    #[test]
+    fn directly_initialized_ram_keeps_original_boot_tree_bytes() {
+        let bytes = image();
+        let mut index = Index::new();
+        let tree = load(&bytes, &mut index).unwrap();
+        // SAFETY: State admits zeroes and initialize establishes its free tables.
+        let mut state = unsafe { std::boxed::Box::<storage::State>::new_zeroed().assume_init() };
+        state.initialize();
+        let mut data = vec![0; storage::PAGES * storage::PAGE];
+        let mut ram = initialize_in_box(&mut state, &mut data, Some(tree));
+        let mut fds = Fds::default();
+        let fd = ram.open(&mut fds, "/bin/ash", READ_ONLY).unwrap();
+        let mut out = [0; 11];
+        assert_eq!(ram.read(&mut fds, fd, &mut out), Ok(11));
+        assert_eq!(&out, b"alpha bytes");
+        assert_eq!(ram.information("/bin/ash").unwrap().links, 2);
+        ram.close(&mut fds, fd).unwrap();
+    }
     #[test]
     fn image_files_have_the_mode_owner_size_inode_and_links_of_the_table() {
         let bytes = image();

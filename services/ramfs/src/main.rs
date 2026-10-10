@@ -21,6 +21,9 @@ use ramfs::authority::{
     RetainedSourcePhase, retained_source_phase,
 };
 use ramfs::job::{JobOperation, PathJob, ResolveJob, Seconds};
+use ramfs::locks::dispatch::{Dispatch as LockDispatch, Work as LockWork};
+use ramfs::locks::jobs::Queue as LockQueue;
+use ramfs::locks::service::LockService;
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
 use ramfs::storage::{NONE, Root, Token};
@@ -33,6 +36,7 @@ use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 
 mod clock_page;
+mod lifetime_page;
 
 rt::entry!(main);
 
@@ -41,21 +45,24 @@ const BASE_METHODS: &[u16] = proto_fs::METHODS;
 #[cfg(feature = "auth-probe")]
 const BASE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 0xfff7,
-    0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
+    52, 53, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 #[cfg(not(any(
     feature = "steps",
+    feature = "lifetime-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 )))]
 const METHODS: &[u16] = BASE_METHODS;
 #[cfg(any(
     feature = "steps",
+    feature = "lifetime-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 ))]
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
         + cfg!(feature = "steps") as usize
+        + cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
@@ -68,6 +75,10 @@ const METHODS: &[u16] = &{
     }
     if cfg!(all(feature = "signal-probe", not(feature = "steps"))) {
         methods[i] = 0xfff4;
+        i += 1;
+    }
+    if cfg!(feature = "lifetime-probe") {
+        methods[i] = 0xfff3;
     }
     methods
 };
@@ -89,6 +100,18 @@ struct StorageBss(UnsafeCell<core::mem::MaybeUninit<ramfs::storage::State>>);
 // SAFETY: only the service thread accesses the storage tables.
 unsafe impl Sync for StorageBss {}
 static STORAGE: StorageBss = StorageBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct LocksBss(UnsafeCell<core::mem::MaybeUninit<LockService>>);
+// SAFETY: the sole service thread initializes and owns all lock tables.
+unsafe impl Sync for LocksBss {}
+static LOCKS: LocksBss = LocksBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct LockJobsBss(UnsafeCell<core::mem::MaybeUninit<LockQueue>>);
+// SAFETY: the sole service thread initializes and owns prepaid request custody.
+unsafe impl Sync for LockJobsBss {}
+static LOCK_JOBS: LockJobsBss = LockJobsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct RamBss(UnsafeCell<core::mem::MaybeUninit<Ram<'static>>>);
+// SAFETY: the sole service thread initializes and owns the RAM descriptors.
+unsafe impl Sync for RamBss {}
+static RAM: RamBss = RamBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 
 /// The files of the boot image's table: the image is mapped from the
 /// start data (`bootimage`, given to this record by init), and the table is
@@ -152,7 +175,24 @@ fn main(_: u64) -> u64 {
         &mut *pointer
     };
     state.initialize();
-    let ram = Ram::with_storage(now, state, data, tree);
+    // SAFETY: initialization writes directly into exclusive aligned permanent storage.
+    let locks = unsafe {
+        let pointer = (*LOCKS.0.get()).as_mut_ptr();
+        LockService::initialize_at(pointer);
+        &mut *pointer
+    };
+    // SAFETY: initialization writes each field directly into exclusive permanent storage.
+    let lock_jobs = unsafe {
+        let pointer = (*LOCK_JOBS.0.get()).as_mut_ptr();
+        LockQueue::initialize_at(pointer);
+        &mut *pointer
+    };
+    // SAFETY: RAM is exclusive permanent storage; every field is written first.
+    let ram = unsafe {
+        let pointer = (*RAM.0.get()).as_mut_ptr();
+        Ram::initialize_at(pointer, now, state, data, tree);
+        &mut *pointer
+    };
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
         return 2;
@@ -175,12 +215,20 @@ fn main(_: u64) -> u64 {
         core::mem::size_of::<ramfs::storage::State>()
             + core::mem::size_of::<Tables>()
             + core::mem::size_of::<Index>()
+            + core::mem::size_of::<LockService>()
+            + core::mem::size_of::<LockQueue>()
+            + core::mem::size_of::<Ram<'static>>()
     );
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
     let tables = unsafe { &mut *TABLES.0.get() };
     let mut fs = Fs {
         ram,
+        locks,
+        lock_jobs,
+        lock_dispatch: LockDispatch::default(),
+        lifetimes: None,
+        legacy_pending: true,
         time_source,
         #[cfg(feature = "image-info-probe")]
         image_info_backing: Handle::borrowed(backing.raw()),
@@ -204,6 +252,8 @@ fn main(_: u64) -> u64 {
         maintenance_burst: ramfs::maintenance::Burst::default(),
         next_audit_ns: 0,
         maintenance_jobs: false,
+        departure_turn: false,
+        departures: ramfs::maintenance::Departures::new(SESSIONS + BIRTHS),
         data_gc_turn: false,
         #[cfg(feature = "steps")]
         steps_reclaim_owner: None,
@@ -214,6 +264,7 @@ fn main(_: u64) -> u64 {
     // Prepare the authentic notary page after publishing the RAM endpoint.
     // Standalone boot profiles may have no Process service.
     let _ = fs.notary_register();
+    let _ = fs.register_lifetimes();
     #[cfg(feature = "steps")]
     rt::service::report_steps(2);
     let _ = rt::service::run_in(&channel, &mut fs, config, &mut tables.sessions);
@@ -221,7 +272,12 @@ fn main(_: u64) -> u64 {
 }
 
 struct Fs {
-    ram: Ram<'static>,
+    ram: &'static mut Ram<'static>,
+    locks: &'static mut LockService,
+    lock_jobs: &'static mut LockQueue,
+    lock_dispatch: LockDispatch,
+    lifetimes: Option<lifetime_page::Lifetimes>,
+    legacy_pending: bool,
     time_source: clock_page::TimeSource,
     // The startup-owned backing outlives this service loop and every outgoing copy.
     #[cfg(feature = "image-info-probe")]
@@ -257,6 +313,8 @@ struct Fs {
         ramfs::maintenance::Burst<{ 4 * ramfs::storage::PREPARATIONS + 2 * (SESSIONS + BIRTHS) }>,
     next_audit_ns: u64,
     maintenance_jobs: bool,
+    departure_turn: bool,
+    departures: ramfs::maintenance::Departures<{ (SESSIONS + BIRTHS).div_ceil(64) }>,
     data_gc_turn: bool,
     /// The steps fixture retains queued nodes until the measured commit.
     #[cfg(feature = "steps")]
@@ -388,6 +446,15 @@ impl Fs {
             .then_some(i)
     }
 
+    fn lock_custody_empty(
+        queue: &LockQueue,
+        places: &ramfs::places::Places,
+        fds: &Fds,
+        label: u64,
+    ) -> bool {
+        ramfs::locks::server::custody_empty(queue, fds, places.place(label), label)
+    }
+
     /// The index of the birth of `label`, if it holds one.
     fn birth_slot(&self, label: u64) -> Option<usize> {
         let i = Self::birth_index(label);
@@ -400,6 +467,15 @@ impl Fs {
 
     /// A dead or superseded authority releases one retained reference per pass.
     fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
+        if ramfs::locks::server::depart(
+            self.lock_jobs,
+            self.locks,
+            fds,
+            self.places.place(label),
+            label,
+        ) {
+            return true;
+        }
         if fds
             .binding
             .snapshot_ref()
@@ -479,6 +555,14 @@ impl Fs {
             return true;
         }
         if let Some(id) = fds.resolvers.iter().copied().find(|&id| id != 0) {
+            if fds.departed
+                && self
+                    .job_slot(id, label)
+                    .is_ok_and(|i| self.jobs[i].as_ref().is_some_and(|job| !job.abandoned))
+            {
+                self.abandon_job(id, label, fds);
+                return true;
+            }
             let before = (fds.resolvers, self.ram.storage.available().pages);
             self.cancel_job(id, label, Some(fds));
             return fds.resolvers != before.0 || self.ram.storage.available().pages > before.1;
@@ -591,13 +675,8 @@ impl Fs {
             return;
         };
         if outcome.phase == ramfs::image::ImagePhase::Prepared {
-            if let Some(i) = self.birth_slot(outcome.label) {
-                let (_, image) = self.births[i].as_mut().expect("retained image birth");
-                Self::drop_identity_fields(&mut self.ram, self.identities, image);
-                self.ram.release(image);
-                self.births[i] = None;
-            }
-            self.places.release(outcome.label);
+            // A prepared image can hold all 32 inherited descriptions too.
+            self.closed(outcome.label);
         } else if let Some(i) = self.image_identity(&outcome)
             && let Some(image) = self.identities[i].as_mut().and_then(|i| i.image.as_mut())
         {
@@ -1050,41 +1129,44 @@ impl Service<0> for Fs {
     const PLACED: usize = SESSIONS;
     type Data = Fds;
 
-    /// The client of `s` went: its descriptors close.
+    /// Logical FD death precedes bounded physical reclamation.
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
-        self.clear_image_outcome(&mut s.data);
-        for id in s.data.resolvers {
-            if id != 0 {
-                self.abandon_job(id, s.label(), &mut s.data);
-            }
+        self.maintenance_burst.restart();
+        self.legacy_pending = true;
+        Self::depart_fields(self.ram, self.locks, self.identities, &mut s.data);
+        if !Self::lock_custody_empty(self.lock_jobs, self.places, &s.data, s.label()) {
+            self.departures.admit(self.places.place(s.label()));
         }
-        self.drop_identity(&mut s.data);
-        self.ram.release(&mut s.data);
     }
 
-    /// The last copy of a session Clone made went before it sent anything:
-    /// the descriptors it was born with close.
+    fn keep_departed(&self, s: &Session<Fds, 0>) -> bool {
+        s.data.departed
+            && !Self::lock_custody_empty(self.lock_jobs, self.places, &s.data, s.label())
+    }
+
+    /// A never-used clone retains its paid birth until cleanup finishes.
     fn closed(&mut self, label: u64) {
         self.maintenance_burst.restart();
+        self.legacy_pending = true;
         #[cfg(feature = "steps")]
         if self.steps_reclaim_owner == Some(label) {
             self.steps_reclaim_owner = None;
             let _ = sys::notify(&self.channel, 1);
         }
+        if self.departures.contains(self.places.place(label)) {
+            return;
+        }
+        if let Some(i) = self.birth_slot(label) {
+            let (_, fds) = self.births[i].as_mut().expect("exact retained birth");
+            Self::depart_fields(self.ram, self.locks, self.identities, fds);
+            if !Self::lock_custody_empty(self.lock_jobs, self.places, fds, label) {
+                self.departures.admit(SESSIONS + i);
+                return;
+            }
+            self.births[i] = None;
+        }
         self.places.release(label);
         self.clones.gone(label);
-        if let Some(i) = self.birth_slot(label)
-            && let Some((_, mut fds)) = self.births[i].take()
-        {
-            self.clear_image_outcome(&mut fds);
-            for id in fds.resolvers {
-                if id != 0 {
-                    self.abandon_job(id, label, &mut fds);
-                }
-            }
-            self.drop_identity(&mut fds);
-            self.ram.release(&mut fds);
-        }
     }
 
     fn maintenance(
@@ -1094,6 +1176,7 @@ impl Service<0> for Fs {
     ) {
         if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
             self.maintenance_burst.restart();
+            self.legacy_pending = true;
             let _ = sys::notify(&self.channel, 1);
             return;
         }
@@ -1106,6 +1189,77 @@ impl Service<0> for Fs {
             );
         }
         let now = rt::time::ticks_to_ns(rt::time::now());
+        match self.lock_dispatch.next_with_requests(
+            now,
+            self.locks.busy(),
+            self.lock_jobs.has_work(),
+            self.lifetimes.is_some(),
+        ) {
+            LockWork::Actor => {
+                let page = self.lifetimes.as_ref();
+                let (storage, descriptions) = self.ram.lock_parts();
+                let progress = self.locks.step_with_owners(
+                    storage,
+                    |pid| page.is_some_and(|page| page.live(pid)),
+                    |token| descriptions.live(token),
+                );
+                if let Some(result) = progress.completed
+                    && ramfs::locks::server::finish(self.lock_jobs, self.ram, result)
+                {
+                    self.maintenance_burst.restart();
+                    self.legacy_pending = true;
+                }
+                self.notify_maintenance();
+                return;
+            }
+            LockWork::Request { cleanup } => {
+                if cleanup {
+                    if self.lock_jobs.cleanup_released(&mut self.ram.storage) != 0 {
+                        self.maintenance_burst.restart();
+                        self.legacy_pending = true;
+                    }
+                } else if !self.locks.busy()
+                    && let Some(id) = self.lock_jobs.next_ready()
+                {
+                    let place = usize::from(id.slot()) / ramfs::locks::jobs::SHARE;
+                    let source = sessions
+                        .get(place)
+                        .and_then(Option::as_ref)
+                        .filter(|session| session.label() == id.owner() && session.data.claimed)
+                        .map(|session| &session.data)
+                        .or_else(|| {
+                            self.births
+                                .get(Self::birth_index(id.owner()))
+                                .and_then(Option::as_ref)
+                                .filter(|(label, _)| *label == id.owner())
+                                .map(|(_, fds)| fds)
+                        });
+                    ramfs::locks::server::begin(self.lock_jobs, self.locks, self.ram, id, source);
+                }
+                self.notify_maintenance();
+                return;
+            }
+            LockWork::Audit { first, end } => {
+                let page = self.lifetimes.as_ref();
+                let (_, descriptions) = self.ram.lock_parts();
+                for index in first..end {
+                    if index < proto_process::RECORDS {
+                        self.locks
+                            .audit_pid(index, |pid| page.is_some_and(|page| page.live(pid)))
+                            .expect("bounded genuine PID place");
+                    } else {
+                        self.locks
+                            .audit_description(index - proto_process::RECORDS, |token| {
+                                descriptions.live(token)
+                            })
+                            .expect("bounded actual OFD place");
+                    }
+                }
+                self.notify_maintenance();
+                return;
+            }
+            LockWork::Legacy => {}
+        }
         if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
             self.next_audit_ns = now.saturating_add(250_000_000);
             self.maintenance.remaining = SESSIONS + BIRTHS - 1;
@@ -1133,17 +1287,60 @@ impl Service<0> for Fs {
                     work = self.ram.storage.reclaim_step();
                 }
             }
-            if self.maintenance_burst.again(
+            self.legacy_pending = self.maintenance_burst.again(
                 work,
-                work || self.maintenance.remaining != 0 || self.orphan_count != 0,
-            ) {
-                let _ = sys::notify(&self.channel, 1);
+                work || self.departures.pending()
+                    || self.maintenance.remaining != 0
+                    || self.orphan_count != 0,
+            );
+            self.notify_maintenance();
+            return;
+        }
+        self.departure_turn = !self.departure_turn;
+        if self.departure_turn
+            && let Some(i) = self.departures.next_place()
+        {
+            let (label, complete) = if i < SESSIONS {
+                let s = sessions[i].as_mut().expect("retained departed session");
+                let label = s.label();
+                work = self.cleanup_step(&mut s.data, label);
+                (
+                    label,
+                    Self::lock_custody_empty(self.lock_jobs, self.places, &s.data, label),
+                )
+            } else {
+                let birth = &mut self.births[i - SESSIONS];
+                let (label, mut fds) = birth.take().expect("retained departed birth");
+                work = self.cleanup_step(&mut fds, label);
+                let complete = Self::lock_custody_empty(self.lock_jobs, self.places, &fds, label);
+                self.births[i - SESSIONS] = Some((label, fds));
+                (label, complete)
+            };
+            if complete {
+                if i < SESSIONS {
+                    sessions[i] = None;
+                } else {
+                    self.births[i - SESSIONS] = None;
+                }
+                self.departures.release(i);
+                self.places.release(label);
+                self.clones.gone(label);
+                work = true;
             }
+            self.legacy_pending = self.maintenance_burst.again(
+                work,
+                work || self.departures.pending()
+                    || self.maintenance.remaining != 0
+                    || self.orphan_count != 0,
+            );
+            self.notify_maintenance();
             return;
         }
         let mut client_work = false;
         let i = self.maintenance.position;
-        if i < SESSIONS {
+        if self.departures.contains(i) {
+            // Queued cells receive separate fair bounded cleanup turns.
+        } else if i < SESSIONS {
             if let Some(s) = sessions.get_mut(i).and_then(Option::as_mut) {
                 let label = s.label();
                 client_work = self.cleanup_step(&mut s.data, label);
@@ -1155,12 +1352,13 @@ impl Service<0> for Fs {
         work |= client_work;
         self.maintenance.complete(client_work, SESSIONS + BIRTHS);
         // A maintenance notification makes reclamation progress with no client request.
-        if self.maintenance_burst.again(
+        self.legacy_pending = self.maintenance_burst.again(
             work,
-            work || self.maintenance.remaining != 0 || self.orphan_count != 0,
-        ) {
-            let _ = sys::notify(&self.channel, 1);
-        }
+            work || self.departures.pending()
+                || self.maintenance.remaining != 0
+                || self.orphan_count != 0,
+        );
+        self.notify_maintenance();
     }
 
     fn between_notifications(&mut self, notice: rt::service::Notice) {
@@ -1178,6 +1376,7 @@ impl Service<0> for Fs {
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
         self.maintenance_burst.restart();
+        self.legacy_pending = true;
         let first = !s.data.claimed;
         if !s.data.claimed {
             // The first request of a session Clone made takes its
@@ -1418,11 +1617,16 @@ impl Service<0> for Fs {
                 Some(
                     Method::Close
                         | Method::CloseExact
+                        | Method::CloseEvent
                         | Method::ResolveCancel
                         | Method::OpenCancel
                         | Method::DataCancel
                         | Method::DataAck
                         | Method::ChangeRelease
+                        | Method::LockStart
+                        | Method::LockQuery
+                        | Method::LockCancel
+                        | Method::LockRelease
                         | Method::VerifySession
                 )
             )
@@ -1434,6 +1638,44 @@ impl Service<0> for Fs {
         }
         if r.method() == Method::BindPending as u16 {
             return self.bind_pending(r);
+        }
+        if matches!(
+            Method::from_number(r.method()),
+            Some(Method::LockStart | Method::LockQuery | Method::LockRelease | Method::LockCancel)
+        ) {
+            return self.lock_request(&mut s.data, r);
+        }
+        // Keyed common operations preserve the native lock family's custody.
+        if matches!(
+            Method::from_number(r.method()),
+            Some(
+                Method::DataStart
+                    | Method::DataQuery
+                    | Method::DataCancel
+                    | Method::DataAck
+                    | Method::DataReadResult
+                    | Method::ChangeStart
+                    | Method::ChangeSecond
+                    | Method::ChangeStep
+                    | Method::ChangeQuery
+                    | Method::ChangeRelease
+                    | Method::OpenStart
+                    | Method::OpenCancel
+                    | Method::OpenQuery
+                    | Method::OpenFinish
+            )
+        ) {
+            let mut body = r.body();
+            if let (Ok(slot), Ok(generation)) = (body.u32(), body.u64())
+                && (32..48).contains(&slot)
+                && generation != 0
+            {
+                let place = self.places.place(r.label());
+                match self.lock_jobs.occupied(place, r.label(), slot) {
+                    Ok(None) => {}
+                    Ok(Some(_)) | Err(_) => return status(proto_fs::PERMISSION),
+                }
+            }
         }
         if matches!(
             Method::from_number(r.method()),
@@ -1491,10 +1733,54 @@ impl Service<0> for Fs {
         }
         let cleanup = matches!(
             Method::from_number(r.method()),
-            Some(Method::Close | Method::CloseExact | Method::ResolveCancel)
+            Some(Method::Close | Method::CloseExact | Method::CloseEvent | Method::ResolveCancel)
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
+        }
+        #[cfg(feature = "lifetime-probe")]
+        if r.method() == 0xfff3 {
+            if !r.handles.is_empty() || s.data.binding.snapshot_ref().is_none() {
+                return Answer::Status(Status::BadSize);
+            }
+            let mut body = r.body();
+            let Ok(pid) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            if !self.register_lifetimes() {
+                return status(proto_fs::PERMISSION);
+            }
+            if !self.lock_dispatch.audited() {
+                return status(proto_fs::RESOLVING);
+            }
+            let live = self.lifetimes.as_ref().expect("registered page").live(pid);
+            let counts = self.locks.counts();
+            if self.locks.busy() || counts != ramfs::locks::budget::Counts::default() {
+                return status(proto_fs::PERMISSION);
+            }
+            let Ok(memory) = sys::process_memory(&self.process) else {
+                return status(proto_fs::PERMISSION);
+            };
+            let free = memory.quota.saturating_sub(memory.used) / 4096;
+            if free < 128 {
+                return status(proto_fs::NO_SPACE);
+            }
+            let reply = r.reply();
+            if reply
+                .u32(0)
+                .and_then(|()| reply.u32(u32::from(live)))
+                .and_then(|()| reply.u64(memory.quota))
+                .and_then(|()| reply.u64(memory.used))
+                .and_then(|()| reply.u32(self.lock_jobs.retained() as u32))
+                .and_then(|()| reply.u32(self.places.used() as u32))
+                .is_err()
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply(Outgoing::new());
         }
         #[cfg(all(feature = "signal-probe", not(feature = "steps")))]
         if r.method() == 0xfff4 {
@@ -1770,6 +2056,22 @@ impl Service<0> for Fs {
                 }
                 Answer::Reply(Outgoing::new())
             }
+            Some(Method::CloseEvent) => {
+                if !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let event = match proto_fs::CloseEvent::read(body) {
+                    Ok(event) => event,
+                    Err(error) => return Answer::Status(error),
+                };
+                match self.ram.close_event(&mut s.data, self.locks, event) {
+                    Ok(()) => {
+                        self.notify_maintenance();
+                        Answer::Status(Status::Ok)
+                    }
+                    Err(code) => status(code),
+                }
+            }
             Some(Method::CloseExact) => {
                 let (Ok(packed), Ok(generation)) = (body.u32(), body.u64()) else {
                     return Answer::Status(Status::BadSize);
@@ -1951,7 +2253,11 @@ impl Service<0> for Fs {
                 | Method::ChangeSecond
                 | Method::ChangeStep
                 | Method::ChangeQuery
-                | Method::ChangeRelease,
+                | Method::ChangeRelease
+                | Method::LockStart
+                | Method::LockQuery
+                | Method::LockCancel
+                | Method::LockRelease,
             )
             | None => Answer::Status(Status::UnknownMethod),
         }
@@ -1970,6 +2276,32 @@ fn generation(index: usize) -> u64 {
     }
 }
 impl Fs {
+    fn notify_maintenance(&self) {
+        if self.legacy_pending
+            || self
+                .lock_dispatch
+                .pending(self.locks.busy() || self.lock_jobs.has_work())
+        {
+            let _ = sys::notify(&self.channel, 1);
+        }
+    }
+    fn register_lifetimes(&mut self) -> bool {
+        if self.lifetimes.is_some() {
+            return true;
+        }
+        let Some(notary) = self.notary() else {
+            return false;
+        };
+        let Some(page) = lifetime_page::Lifetimes::receive(notary) else {
+            return false;
+        };
+        let Some(page) = lifetime_page::Lifetimes::map(page, &self.process) else {
+            return false;
+        };
+        self.lifetimes = Some(page);
+        let _ = sys::notify(&self.channel, 1);
+        true
+    }
     fn notary_register(&mut self) -> bool {
         if self.generations.is_some() {
             return true;
@@ -2088,8 +2420,24 @@ impl Fs {
         }
         Ok(())
     }
+    fn depart_fields(
+        ram: &mut Ram<'_>,
+        locks: &mut LockService,
+        identities: &mut Identities,
+        fds: &mut Fds,
+    ) {
+        if fds.departed {
+            return;
+        }
+        ram.detach_session_descriptions(fds, locks);
+        Self::drop_identity_fields(ram, identities, fds);
+        fds.binding = Binding::Cleanup;
+        fds.departed = true;
+        fds.lock_departure = 0;
+    }
+
     fn drop_identity(&mut self, fds: &mut Fds) {
-        Self::drop_identity_fields(&mut self.ram, self.identities, fds);
+        Self::drop_identity_fields(self.ram, self.identities, fds);
     }
     fn drop_identity_fields(ram: &mut Ram<'_>, identities: &mut Identities, fds: &mut Fds) {
         if let Some(root) = fds.binding_preparation.take() {
@@ -2236,7 +2584,7 @@ impl Fs {
     }
 
     fn authenticate(&mut self, fds: &mut Fds, label: u64) -> Result<(), u32> {
-        Self::authenticate_fields(&mut self.ram, self.identities, fds, label)
+        Self::authenticate_fields(self.ram, self.identities, fds, label)
     }
     fn authenticate_fields(
         ram: &mut Ram<'_>,
@@ -2756,7 +3104,7 @@ impl Fs {
                 RetainedSourcePhase::Authenticate => {
                     let source = &mut self.births[slot as usize].as_mut().unwrap().1;
                     let result =
-                        Self::authenticate_fields(&mut self.ram, self.identities, source, label);
+                        Self::authenticate_fields(self.ram, self.identities, source, label);
                     let valid = !matches!(source.binding, Binding::Cleanup);
                     return if !valid {
                         self.reject_binding(fds)
@@ -2774,7 +3122,7 @@ impl Fs {
                 return self.reject_binding(fds);
             }
             let source = &mut self.births[slot as usize].as_mut().unwrap().1;
-            Self::drop_identity_fields(&mut self.ram, self.identities, source);
+            Self::drop_identity_fields(self.ram, self.identities, source);
             source.binding = bound;
             source.authority_index = fds.authority_index;
             source.claimed = true;
@@ -2877,7 +3225,7 @@ impl Fs {
                     });
                 }
             };
-            let data = match ramfs::data::Journal::capture(&mut self.ram, fds, args) {
+            let data = match ramfs::data::Journal::capture(self.ram, fds, args) {
                 Ok(data) => data,
                 Err(code) => {
                     self.ram.storage.release_preparation(charge);
@@ -3003,7 +3351,7 @@ impl Fs {
                     Err(code) => status(code),
                 }
             }
-            Method::DataStep => match data.step(&mut self.ram) {
+            Method::DataStep => match data.step(self.ram) {
                 Ok(true) => Answer::Status(Status::Ok),
                 Ok(false) => status(proto_fs::RESOLVING),
                 Err(code) => status(code),
@@ -3022,7 +3370,7 @@ impl Fs {
                 } else {
                     None
                 };
-                if let Err(code) = data.commit(&mut self.ram, now) {
+                if let Err(code) = data.commit(self.ram, now) {
                     return status(code);
                 }
                 data.outcome(id)
@@ -3052,6 +3400,100 @@ impl Fs {
             _ => unreachable!(),
         }
     }
+    fn common_control_busy(&self, fds: &Fds, owner: u64, slot: u32) -> bool {
+        fds.resolvers
+            .iter()
+            .copied()
+            .filter(|&id| id != 0)
+            .any(|id| {
+                self.jobs
+                    .get((id & 255) as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|job| {
+                        job.id == id
+                            && job.owner == owner
+                            && job.open_key.is_some_and(|key| key.slot == slot)
+                    })
+            })
+    }
+
+    fn lock_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        if proto_fs::is_loaders(r.label()) {
+            return status(proto_fs::PERMISSION);
+        }
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let owner = r.label();
+        let place = self.places.place(owner);
+        let method = Method::from_number(r.method()).expect("native lock method");
+        let result = if method == Method::LockStart {
+            let wire = match proto_fs::LockStart::read(r.body()) {
+                Ok(wire) => wire,
+                Err(error) => return Answer::Status(error),
+            };
+            match ramfs::locks::server::replay(self.lock_jobs, place, owner, wire) {
+                Ok(Some(result)) => Ok(result),
+                Err(code) => Err(code),
+                Ok(None) => {
+                    if let Err(code) = self.authenticate(fds, owner) {
+                        return status(code);
+                    }
+                    if !wire.command.ofd() && !self.register_lifetimes() {
+                        return status(proto_fs::NO_LOCKS);
+                    }
+                    if self.common_control_busy(fds, owner, wire.key.slot) {
+                        return status(proto_fs::JOBS_FULL);
+                    }
+                    ramfs::locks::server::start(self.lock_jobs, self.ram, fds, place, owner, wire)
+                }
+            }
+        } else {
+            let key = match proto_fs::read_lock_key(r.body()) {
+                Ok(key) => key,
+                Err(error) => return Answer::Status(error),
+            };
+            if self.common_control_busy(fds, owner, key.slot) {
+                return status(proto_fs::PERMISSION);
+            }
+            if method == Method::LockRelease {
+                let result =
+                    ramfs::locks::server::release(self.lock_jobs, self.ram, fds, place, owner, key);
+                let answer = match result {
+                    Ok(true) => {
+                        self.locks.cancel();
+                        status(proto_fs::RESOLVING)
+                    }
+                    Ok(false) => Answer::Status(Status::Ok),
+                    Err(code) => status(code),
+                };
+                self.notify_maintenance();
+                return answer;
+            }
+            if method == Method::LockCancel {
+                match ramfs::locks::server::cancel(self.lock_jobs, fds, place, owner, key) {
+                    Ok((result, active)) => {
+                        if active {
+                            self.locks.cancel();
+                        }
+                        Ok(result)
+                    }
+                    Err(code) => Err(code),
+                }
+            } else {
+                ramfs::locks::server::query(self.lock_jobs, fds, place, owner, key)
+            }
+        };
+        self.notify_maintenance();
+        match result {
+            Ok(result) => match result.write(r.reply()) {
+                Ok(()) => Answer::Reply(Outgoing::new()),
+                Err(error) => Answer::Status(error),
+            },
+            Err(code) => status(code),
+        }
+    }
+
     /// The five methods of the Change family (44 to 48).
     fn change_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
         if proto_fs::is_loaders(r.label()) {
@@ -3088,7 +3530,7 @@ impl Fs {
         }
         let mut out = proto_wire::Writer::new();
         let mut ctx = ramfs::change::Ctx {
-            ram: &mut self.ram,
+            ram: self.ram,
             jobs: &mut *self.jobs,
             generations: &mut *self.job_generations,
             seconds: &mut *self.seconds,
@@ -3210,7 +3652,7 @@ impl Fs {
                 Some(JobOperation::Change(_))
             ) {
                 let mut ctx = ramfs::change::Ctx {
-                    ram: &mut self.ram,
+                    ram: self.ram,
                     jobs: &mut *self.jobs,
                     generations: &mut *self.job_generations,
                     seconds: &mut *self.seconds,
@@ -3227,9 +3669,7 @@ impl Fs {
                 operation: JobOperation::Data(data),
                 ..
             }) = self.jobs[i].as_mut()
-                && !data
-                    .cancel_step(&mut self.ram)
-                    .expect("exact data job cleanup")
+                && !data.cancel_step(self.ram).expect("exact data job cleanup")
             {
                 return false;
             }
@@ -3242,7 +3682,7 @@ impl Fs {
                     let fds = fds
                         .as_deref_mut()
                         .expect("open job retains its owning session");
-                    open.cancel(&mut self.ram, fds, &mut j.root)
+                    open.cancel(self.ram, fds, &mut j.root)
                         .expect("exact open job cleanup");
                 }
                 path.resolver.release(&mut self.ram.storage);
@@ -3374,7 +3814,7 @@ impl Fs {
                         Ok(proof) => proof,
                         Err(code) => return status(code),
                     };
-                    let now = match open.needs_time(&self.ram, fds) {
+                    let now = match open.needs_time(self.ram, fds) {
                         Ok(false) => proto_fs::Timestamp::ZERO,
                         Ok(true) => match self.time_source.read_once() {
                             Ok(Some(now)) => now,
@@ -3384,7 +3824,7 @@ impl Fs {
                         Err(code) => return status(code),
                     };
                     if let Err(code) =
-                        open.commit(&mut self.ram, fds, Some(proof), identity, &mut j.root, now)
+                        open.commit(self.ram, fds, Some(proof), identity, &mut j.root, now)
                     {
                         return status(code);
                     }
@@ -3676,7 +4116,7 @@ impl Fs {
                 };
             }
             if !matches!(open.phase, OpenPhase::Resolving)
-                && let Err(code) = open.reset_unpublished(&mut self.ram, fds, &mut j.root)
+                && let Err(code) = open.reset_unpublished(self.ram, fds, &mut j.root)
             {
                 return status(code);
             }
@@ -3792,7 +4232,7 @@ impl Fs {
                 };
             }
             return match open.prepare(
-                &mut self.ram,
+                self.ram,
                 fds,
                 proof.expect("uncommitted path proof"),
                 identity,
@@ -3821,7 +4261,7 @@ impl Fs {
             return Answer::Status(Status::BadSize);
         }
         let now = self.time_source.now();
-        match open.commit(&mut self.ram, fds, proof, identity, &mut j.root, now) {
+        match open.commit(self.ram, fds, proof, identity, &mut j.root, now) {
             Ok(committed) => {
                 debug_assert_eq!(committed, held);
                 Answer::Reply(Outgoing::new())

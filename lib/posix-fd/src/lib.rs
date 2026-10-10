@@ -12,7 +12,9 @@
 
 mod io;
 pub use io::*;
+mod closing;
 mod control;
+pub use closing::*;
 mod scalar;
 pub use control::*;
 pub use scalar::*;
@@ -185,6 +187,7 @@ struct Entry<T> {
 enum EntryState<T> {
     Empty,
     Pending(usize),
+    Closing(CloseToken),
     Open(Entry<T>),
 }
 
@@ -366,6 +369,7 @@ pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Co
     holds: [HoldSlot<T, R, S, C>; N],
     /// All job kinds retain custody while every ordinary I/O hold is occupied.
     residents: [HoldSlot<T, R, S, C>; JOBS_MAX],
+    closings: [closing::CloseSlot<T, C>; JOBS_MAX],
     release_early: fn(T) -> bool,
     /// Counts the records of jobs that went; a thread that waits for a place
     /// waits on it. The caller wakes it after unlocking.
@@ -391,6 +395,13 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<
                     generation: 0,
                     changed: AtomicU32::new(0),
                     held: Held::Empty,
+                }
+            }; JOBS_MAX],
+            closings: [const {
+                closing::CloseSlot {
+                    generation: 0,
+                    changed: AtomicU32::new(0),
+                    record: None,
                 }
             }; JOBS_MAX],
             release_early: |_| false,
@@ -452,6 +463,19 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                     generation: 0,
                     changed: AtomicU32::new(0),
                     held: Held::Empty,
+                });
+            }
+        }
+        // SAFETY: this field is within the complete exclusive startup allocation.
+        let closings = unsafe { core::ptr::addr_of_mut!((*destination).closings) }
+            .cast::<closing::CloseSlot<T, C>>();
+        for index in 0..JOBS_MAX {
+            // SAFETY: each bounded close slot receives valid enum and atomic values.
+            unsafe {
+                closings.add(index).write(closing::CloseSlot {
+                    generation: 0,
+                    changed: AtomicU32::new(0),
+                    record: None,
                 });
             }
         }
@@ -593,6 +617,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         self.entries
             .iter()
             .any(|slot| matches!(slot.state, EntryState::Open(e) if e.backend == backend))
+            || self.closing_references(backend, true)
     }
 
     fn left(&mut self, backend: T) -> Option<T> {
@@ -769,6 +794,9 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         }
         if let Some(token) = self.pending(target) {
             return Ok(Replacement::Pending(token));
+        }
+        if self.closing(target).is_some() {
+            return Err(Error::Io);
         }
         let old = self.entry(target).ok();
         self.install(target, backend, flags)?;
@@ -1202,7 +1230,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     /// The caller establishes child-exclusive access before this operation.
     pub fn discard_open_after_fork(&mut self) {
         for entry in &mut self.entries {
-            if matches!(entry.state, EntryState::Pending(_)) {
+            if matches!(entry.state, EntryState::Pending(_) | EntryState::Closing(_)) {
                 entry.state = EntryState::Empty;
             }
         }
@@ -1218,6 +1246,12 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 slot.held = Held::Empty;
                 slot.change();
             }
+        }
+        for slot in &mut self.closings {
+            slot.record = None;
+            let value = slot.changed.load(Ordering::Relaxed);
+            slot.changed
+                .store(value.saturating_add(1), Ordering::Release);
         }
         self.job_gone();
     }

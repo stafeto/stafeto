@@ -51,6 +51,7 @@ mod adopt;
 mod ends;
 mod generations;
 mod jobs;
+mod lifetime_page;
 mod loader;
 mod make;
 mod pages;
@@ -99,13 +100,27 @@ struct Walking {
 /// The walks of the service that wait for an earlier walk of their sender
 /// at most; past them kill is EAGAIN.
 const LATER: usize = 64;
-#[cfg(any(feature = "tty-probe", feature = "image-probe"))]
+#[cfg(any(
+    feature = "tty-probe",
+    feature = "image-probe",
+    feature = "lifetime-probe"
+))]
 const PROBE_METHODS: [u16; proto_process::METHODS.len()
     + if cfg!(feature = "tty-probe") { 2 } else { 0 }
-    + if cfg!(feature = "image-probe") { 3 } else { 0 }] = {
+    + if cfg!(feature = "image-probe") { 3 } else { 0 }
+    + if cfg!(feature = "lifetime-probe") {
+        1
+    } else {
+        0
+    }] = {
     let mut methods = [0; proto_process::METHODS.len()
         + if cfg!(feature = "tty-probe") { 2 } else { 0 }
-        + if cfg!(feature = "image-probe") { 3 } else { 0 }];
+        + if cfg!(feature = "image-probe") { 3 } else { 0 }
+        + if cfg!(feature = "lifetime-probe") {
+            1
+        } else {
+            0
+        }];
     let mut i = 0;
     while i < proto_process::METHODS.len() {
         methods[i] = proto_process::METHODS[i];
@@ -122,6 +137,13 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
         methods[offset] = image_probe::ARM;
         methods[offset + 1] = image_probe::TRACE;
         methods[offset + 2] = image_probe::CHILD_HANDOFF;
+    }
+    #[cfg(feature = "lifetime-probe")]
+    {
+        let offset = i
+            + if cfg!(feature = "tty-probe") { 2 } else { 0 }
+            + if cfg!(feature = "image-probe") { 3 } else { 0 };
+        methods[offset] = 0xfff0;
     }
     methods
 };
@@ -179,6 +201,8 @@ struct Processes {
     pages: pages::Pages,
     /// The page of the credentials generations.
     generations: generations::Generations,
+    /// Complete PID life stays independent of credentials and image changes.
+    lifetimes: lifetime_page::Lifetimes,
     /// The thread of each record's process whose entry the service asks
     /// for once it set a signal on the page (Router).
     routers: [Option<Handle<Thread>>; RECORDS],
@@ -232,6 +256,7 @@ impl Processes {
             replacer: None,
             pages: pages::Pages::new(),
             generations: generations::Generations::new(),
+            lifetimes: lifetime_page::Lifetimes::new(),
             witnesses: [const { None }; RECORDS],
             routers: [const { None }; RECORDS],
             ops: LongOps::new(),
@@ -335,6 +360,9 @@ fn main(_: u64) -> u64 {
     owner.identities = Handle::borrowed(identities.raw());
     owner.level = level;
     if owner.generations.make(&start.process).is_err() {
+        return 7;
+    }
+    if owner.lifetimes.make(&start.process).is_err() {
         return 7;
     }
     // The notification of a step goes to the loop's own channel at its
@@ -520,6 +548,7 @@ impl Processes {
             return refuse(proto_process::UNREGISTERED);
         };
         record.state = State::Alive;
+        self.lifetimes.publish(record.label.pid());
         // The first thread routes the process's signals (spec 2, 3.3).
         self.routers[index] = Some(thread);
         Answer::Status(Status::Ok)
@@ -813,6 +842,18 @@ impl Processes {
         }
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
+        }
+        if method == Method::RegisterLifetimes as u16 {
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let Ok(copy) = self.lifetimes.copy() else {
+                return Answer::Status(Status::Kernel(abi::Error::NoMemory));
+            };
+            if r.reply().u32(0).is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply([copy.erase()].into());
         }
         if method == Method::Register as u16
             && (r.handles.is_empty()
@@ -2465,6 +2506,7 @@ impl Processes {
         let committed_ticket = self.loaders.ticket(committed_slot);
         let record = self.records.get_mut(child).expect("a loading record");
         record.state = State::Alive;
+        self.lifetimes.publish(record.label.pid());
         record.committed_loader_ticket = committed_ticket;
         // A child of posix_spawn runs its own program from the start; one
         // of fork runs its parent's copy until it execs.
@@ -2554,11 +2596,19 @@ impl Processes {
 impl Service<0> for Processes {
     const VERSION: u16 = proto_process::VERSION;
     const METHODS: &'static [u16] = {
-        #[cfg(any(feature = "tty-probe", feature = "image-probe"))]
+        #[cfg(any(
+            feature = "tty-probe",
+            feature = "image-probe",
+            feature = "lifetime-probe"
+        ))]
         {
             &PROBE_METHODS
         }
-        #[cfg(not(any(feature = "tty-probe", feature = "image-probe")))]
+        #[cfg(not(any(
+            feature = "tty-probe",
+            feature = "image-probe",
+            feature = "lifetime-probe"
+        )))]
         {
             proto_process::METHODS
         }
@@ -2629,6 +2679,27 @@ impl Service<0> for Processes {
         let Some(index) = self.records.find(r.label()) else {
             return refuse(proto_process::UNREGISTERED);
         };
+        #[cfg(feature = "lifetime-probe")]
+        if method == 0xfff0 {
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let mut body = r.body();
+            let Ok(pid) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            let Ok(copy) = self.lifetimes.copy() else {
+                return Answer::Status(Status::Kernel(abi::Error::NoMemory));
+            };
+            let _ = r.reply().u32(0);
+            let _ = r.reply().u32(u32::from(self.lifetimes.live(pid)));
+            let mut out = Outgoing::new();
+            let _ = out.push(copy.erase());
+            return Answer::Reply(out);
+        }
         #[cfg(feature = "image-probe")]
         if [
             image_probe::ARM,
@@ -2756,6 +2827,7 @@ impl Service<0> for Processes {
             }
             return;
         }
+        self.lifetimes.retire(record.label.pid());
         self.generations.retire(index);
         let end = End::of(sys::process_state(&record.process).unwrap_or(abi::ProcessState::Killed))
             .unwrap_or(End::Signaled(SIGKILL));

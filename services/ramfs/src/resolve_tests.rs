@@ -104,7 +104,10 @@ fn create_intent_retains_missing_edge_and_restarts_before_publication() {
     );
     resolver.release(&mut r.storage);
     assert_eq!(r.storage.node(parent).unwrap().pins, before);
-    assert_eq!(r.storage.node(new).unwrap().pins, [0; 5]);
+    assert_eq!(
+        r.storage.node(new).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
 }
 
 #[test]
@@ -144,7 +147,10 @@ fn create_intent_requires_search_and_absence_only_at_final_component() {
             .trailing_slash
     );
     directory.release(&mut r.storage);
-    assert_eq!(r.storage.node(ROOT).unwrap().pins, [0; 5]);
+    assert_eq!(
+        r.storage.node(ROOT).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
 }
 
 #[test]
@@ -187,8 +193,14 @@ fn exclusive_intent_captures_dangling_symlink_and_existing_naming_edge() {
         b"missing"
     );
     resolver.release(&mut r.storage);
-    assert_eq!(r.storage.node(link).unwrap().pins, [0; 5]);
-    assert_eq!(r.storage.node(ROOT).unwrap().pins, [0; 5]);
+    assert_eq!(
+        r.storage.node(link).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
+    assert_eq!(
+        r.storage.node(ROOT).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
 }
 fn who() -> WhoReply {
     WhoReply {
@@ -1931,8 +1943,14 @@ fn original_open_args_survive_real_link_expansion_and_namespace_restart() {
     );
     assert_eq!(resolver.original_path(), b"/source");
     resolver.release(&mut ram.storage);
-    assert_eq!(ram.storage.node(ROOT).unwrap().pins, [0; 5]);
-    assert_eq!(ram.storage.node(target).unwrap().pins, [0; 5]);
+    assert_eq!(
+        ram.storage.node(ROOT).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
+    assert_eq!(
+        ram.storage.node(target).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
 }
 
 #[test]
@@ -2020,8 +2038,14 @@ fn finished_open_receipt_preserves_exact_reference_across_close_reuse_and_clone(
     ram.release(&mut child);
     ram.release(&mut owner);
     assert_eq!(ram.open_descriptions(), 0);
-    assert_eq!(ram.storage.node(inode).unwrap().pins, [0; 5]);
-    assert_eq!(ram.storage.node(replacement).unwrap().pins, [0; 5]);
+    assert_eq!(
+        ram.storage.node(inode).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
+    assert_eq!(
+        ram.storage.node(replacement).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
 }
 
 #[test]
@@ -2188,7 +2212,10 @@ fn clone_into_rejects_last_fd_and_cwd_failure_without_reference_changes() {
     ram.storage.node_mut(directory).unwrap().pins = pins;
     ram.release(&mut source);
     assert_eq!(ram.open_descriptions(), 0);
-    assert_eq!(ram.storage.node(directory).unwrap().pins, [0; 5]);
+    assert_eq!(
+        ram.storage.node(directory).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
 }
 
 #[test]
@@ -2209,6 +2236,7 @@ fn clone_into_deduplicates_numeric_fds_and_retains_distinct_alias_slots() {
         .as_mut()
         .unwrap()
         .refs += 1;
+    ram.publish_descriptor(&mut source, 1);
     let mut out = Fds::default();
     ram.clone_fds_into(&source, &[fd, fd, 4, 4], &mut out)
         .unwrap();
@@ -2236,7 +2264,10 @@ fn clone_into_deduplicates_numeric_fds_and_retains_distinct_alias_slots() {
     );
     ram.release(&mut source);
     assert_eq!(ram.open_descriptions(), 0);
-    assert_eq!(ram.storage.node(inode).unwrap().pins, [0; 5]);
+    assert_eq!(
+        ram.storage.node(inode).unwrap().pins,
+        [0; crate::storage::PIN_KINDS]
+    );
 }
 
 #[test]

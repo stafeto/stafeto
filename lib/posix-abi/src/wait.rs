@@ -38,7 +38,13 @@ impl Pins {
             targets: [None; watch::MAX],
             transport: None,
         };
-        shared::with_files(|files| {
+        let mut numbers = [u32::MAX; watch::MAX];
+        for (number, item) in numbers.iter_mut().zip(items) {
+            if item.fd >= 0 {
+                *number = item.fd as u32;
+            }
+        }
+        shared::with_descriptors(&numbers[..items.len()], |files| {
             pins.transport = Some(files.transport());
             for (index, item) in items.iter().enumerate() {
                 if item.fd >= 0 {

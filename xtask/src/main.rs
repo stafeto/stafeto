@@ -571,7 +571,14 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-/// Only the names and real-signal probe can pause the RAM service.
+/// Lifetime observations exist only in this dedicated image.
+const POSIX_LIFETIMES_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[1].3 = &["lifetime-probe", "steps"];
+    programs[3].3 = &["lifetime-probe"];
+    programs[5].3 = &["lifetime-probe"];
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1302,6 +1309,7 @@ fn main() {
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
@@ -1648,6 +1656,9 @@ fn write_elf_image(
         let why = |e: String| format!("{}: {e}", elf.display());
         disasm::erratum_835769(elf, &objdump)?;
         disasm::erratum_843419(elf)?;
+        if *file == "ramfs" {
+            disasm::ram_main_frame(elf, &objdump)?;
+        }
         // A program of stack 0 goes into the image as its ELF file alone:
         // the loader, and the programs only files of the table name.
         if *stack == 0 {
@@ -3171,6 +3182,74 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
         }
         println!("RAM credential dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     }
+    Ok(())
+}
+
+fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-lifetimes.img",
+        &POSIX_LIFETIMES_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::ICOUNT);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let ended = run.expect_line(
+        "the PID lifetime probe to exit",
+        |line| line.starts_with("init: posix-procs ended:"),
+        Duration::from_secs(30),
+    );
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    if ended? != "init: posix-procs ended: exit code 0, not restarted" {
+        return Err("the PID lifetime probe failed".into());
+    }
+    qemu::expect_marker(&outcome, "posix-procs: PID lifetime page ok")?;
+    qemu::expect_marker(
+        &outcome,
+        "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok",
+    )?;
+    for marker in [
+        "POSIX close receipts: event loss, physical loss and helper reuse ok",
+        "POSIX close signal: genuine SIGUSR1 siglongjmp preserves physical debt and reused fd ok",
+        "POSIX close places: all 16 Closing and 16 Control slots retain independent progress ok",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
+    check_waits(&outcome.lines, &["2"], "RAM close event steps")?;
+    let steps = longest_steps(&outcome.lines, "2");
+    qemu::expect_marker(
+        &outcome,
+        "RAM native locks: genuine PID, OFD conflict, unlocked query, replay, cross-family release and late Start fence ok",
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "RAM native lock cancel: retained canonical blocker, lost reply, absent Start fence and separate Release ok",
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "RAM native lock departure: sixteen held outcomes and genuine paid label return without another RAM request ok",
+    )?;
+    for kind in [49, 50, 51, 52, 53, 66] {
+        if !steps
+            .iter()
+            .any(|(measured, ticks, _)| *measured == kind && *ticks != 0)
+        {
+            return Err(format!(
+                "RAM close event probe has no method {kind} measurement: {steps:?}"
+            ));
+        }
+    }
+    if let Some((kind, ticks, _)) = steps.iter().find(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "RAM close event method {kind} took {ticks} ticks, past {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    println!("RAM close event dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
     Ok(())
 }
 
@@ -4895,6 +4974,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files", posix_files_probe),
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
+        job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
@@ -7167,6 +7247,7 @@ mod tests {
         assert_eq!(POSIX_NAMES_PROGRAMS[1].3, &["signal-probe"]);
         for programs in [
             &POSIX_PROCS_PROGRAMS[..],
+            &POSIX_LIFETIMES_PROGRAMS[..],
             &POSIX_NATIVE_SCOPE_PROGRAMS[..],
             &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[..],
             &POSIX_STEPS_PROGRAMS[..],
@@ -7175,6 +7256,34 @@ mod tests {
                 programs
                     .iter()
                     .all(|program| !program.3.contains(&"signal-probe"))
+            );
+        }
+    }
+
+    #[test]
+    fn lifetime_probe_has_its_own_process_and_program_features() {
+        let manifest = include_str!("../../tests/posix-procs/Cargo.toml");
+        let close_features: Vec<_> = manifest
+            .lines()
+            .filter(|line| line.contains("posix-abi/close-probe"))
+            .collect();
+        assert_eq!(close_features.len(), 1);
+        assert!(close_features[0].starts_with("lifetime-probe = "));
+        assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe", "steps"]);
+        assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
+        assert_eq!(POSIX_LIFETIMES_PROGRAMS[5].3, &["lifetime-probe"]);
+        for programs in [
+            &POSIX_PROCS_PROGRAMS[..],
+            &POSIX_NAMES_PROGRAMS[..],
+            &POSIX_NATIVE_SCOPE_PROGRAMS[..],
+            &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[..],
+            &POSIX_STEPS_PROGRAMS[..],
+            &POSIX_FILES_PROGRAMS[..],
+        ] {
+            assert!(
+                programs
+                    .iter()
+                    .all(|program| !program.3.contains(&"lifetime-probe"))
             );
         }
     }
