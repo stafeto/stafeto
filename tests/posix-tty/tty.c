@@ -327,6 +327,10 @@ static void *admission_signal(void *argument) {
     }
     return NULL;
 }
+static void *cancelled_admission_drain(void *unused) {
+    (void)unused;
+    return (void *)(long)(tcdrain(1) == 0 ? 1 : 2);
+}
 static int drain_admission(void) {
     struct sigaction action = {0}, previous;
     action.sa_handler = on_drain_signal;
@@ -342,6 +346,17 @@ static int drain_admission(void) {
     CHECK(stafeto_probe_drain_read(0) == ~0ULL);
     CHECK(tcflow(1, TCOOFF) == 0);
     CHECK(PUT(1, "posix-tty: abandoned admission prefix\n"));
+    pthread_t cancelled;
+    CHECK(pthread_create(&cancelled, NULL, cancelled_admission_drain, NULL) == 0);
+    pause_ms(20);
+    CHECK(pthread_cancel(cancelled) == 0);
+    void *cancelled_result;
+    CHECK(pthread_join(cancelled, &cancelled_result) == 0);
+    if (cancelled_result != PTHREAD_CANCELED) {
+        (void)tcflow(1, TCOON);
+        say("posix-tty: pending drain cancellation returned %ld instead of PTHREAD_CANCELED\n", (long)cancelled_result);
+    }
+    CHECK(cancelled_result == PTHREAD_CANCELED);
     struct admission_release jumping = {pthread_self(), readers[0], 0};
     pthread_t jumper;
     CHECK(pthread_create(&jumper, NULL, admission_signal, &jumping) == 0);
@@ -376,8 +391,22 @@ static int drain_admission(void) {
     for (int i = 1; i < DRAIN_READS; ++i) {
         CHECK(stafeto_probe_drain_read(readers[i]) == 0);
     }
+    // With capacity available, the same real cancellation must release
+    // an admitted WAIT and its physical observer before thread cleanup.
+    CHECK(tcflow(1, TCOOFF) == 0);
+    CHECK(PUT(1, "posix-tty: admitted cancellation prefix\n"));
+    CHECK(pthread_create(&cancelled, NULL, cancelled_admission_drain, NULL) == 0);
+    pause_ms(20);
+    CHECK(pthread_cancel(cancelled) == 0);
+    CHECK(pthread_join(cancelled, &cancelled_result) == 0 && cancelled_result == PTHREAD_CANCELED);
+    for (int i = 0; i < DRAIN_READS; ++i) {
+        readers[i] = stafeto_probe_drain_read(0);
+        CHECK(readers[i] != 0 && readers[i] != ~0ULL);
+    }
+    for (int i = 0; i < DRAIN_READS; ++i) CHECK(stafeto_probe_drain_read(readers[i]) == 0);
+    CHECK(tcflow(1, TCOON) == 0 && tcdrain(1) == 0);
     CHECK(sigaction(SIGUSR1, &previous, NULL) == 0);
-    say("posix-tty: drain admission waits at eight reads; EINTR, SA_RESTART and siglongjmp ok\n");
+    say("posix-tty: drain admission waits at eight reads; EINTR, SA_RESTART, cancellation and siglongjmp ok\n");
     return 0;
 }
 

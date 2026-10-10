@@ -430,6 +430,22 @@ pub fn set_winsize(
     })
 }
 
+/// The C tcdrain cancellation boundary. Finish the descriptor hold and all
+/// transport resources before relibc cancellation runs user cleanup.
+pub fn drain_fd(fd: u32) -> Result<(), i32> {
+    let point = crate::threads::cancel::Point::begin();
+    let result = crate::shared::held(fd, |transport, target| {
+        let number = transport.terminal_number(target).ok_or(ENOTTY)?;
+        drain(transport, number)
+    });
+    if result.is_ok() {
+        point.end();
+    } else {
+        point.finish();
+    }
+    result
+}
+
 /// tcdrain: waits for the captured terminal output to complete at its
 /// backend: PL011 FIFO and shift register, Virtio used ring, or PTY master
 /// consumption. A signal ends a pending wait with EINTR.
