@@ -4,6 +4,7 @@
 //! Byte ranges for advisory file locks. Arithmetic is independent of the
 //! service's paid records and captures SEEK_CUR and SEEK_END before waiting.
 
+pub mod actor;
 pub mod budget;
 pub mod groups;
 pub mod preparation;

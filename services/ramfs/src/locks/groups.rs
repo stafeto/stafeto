@@ -259,6 +259,11 @@ impl<
             Err(_) => false,
         }
     }
+    #[cfg(test)]
+    pub(super) fn set_test_epoch(&mut self, id: Id, epoch: u64) {
+        self.group_mut(id).expect("test paid group").snapshot.epoch = epoch;
+    }
+
     pub fn valid(&self, capture: Capture) -> bool {
         self.group(capture.id).is_ok_and(|group| {
             group.active
@@ -266,6 +271,21 @@ impl<
                 && self.owner_live(group.snapshot.owner)
         })
     }
+    /// A paid exact identity can be absent from the live view after revocation.
+    pub fn capture(&self, id: Id) -> Result<Option<Capture>, Error> {
+        let group = self.group(id)?;
+        let capture = Capture {
+            id,
+            epoch: group.snapshot.epoch,
+        };
+        Ok(self.valid(capture).then_some(capture))
+    }
+
+    /// Cleanup keeps the payer accessible through an exact revoked lifetime.
+    pub fn retained_snapshot(&self, id: Id) -> Result<Snapshot, Error> {
+        Ok(self.group(id)?.snapshot)
+    }
+
     pub fn snapshot(&self, capture: Capture) -> Result<Snapshot, Error> {
         if !self.valid(capture) {
             return Err(Error::Invalid);

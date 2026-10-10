@@ -73,6 +73,32 @@ impl<const N: usize, const ROOTS: usize, const SHARE: usize> Pool<N, ROOTS, SHAR
         }
     }
 
+    /// Initialize the permanent pool without an intermediate stack array.
+    ///
+    /// # Safety
+    /// The caller exclusively owns aligned writable uninitialized Self storage.
+    pub unsafe fn initialize_at(destination: *mut Self) {
+        assert!(N > 0 && N <= NONE as usize);
+        assert!(ROOTS > 0 && ROOTS <= NONE as usize);
+        assert!(SHARE > 0 && SHARE <= N);
+        // SAFETY: the caller provides the complete exclusive destination.
+        unsafe {
+            let slots = core::ptr::addr_of_mut!((*destination).slots).cast::<Slot>();
+            let generations = core::ptr::addr_of_mut!((*destination).generations).cast::<u64>();
+            for index in 0..N {
+                slots.add(index).write(Slot::Fresh);
+                generations.add(index).write(0);
+            }
+            let used = core::ptr::addr_of_mut!((*destination).used).cast::<u16>();
+            for root in 0..ROOTS {
+                used.add(root).write(0);
+            }
+            core::ptr::addr_of_mut!((*destination).fresh).write(0);
+            core::ptr::addr_of_mut!((*destination).free).write(NONE);
+            core::ptr::addr_of_mut!((*destination).available).write(N as u16);
+        }
+    }
+
     pub const fn available(&self) -> usize {
         self.available as usize
     }
