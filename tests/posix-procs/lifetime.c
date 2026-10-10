@@ -349,6 +349,7 @@ int main(int argc, char **argv) {
     public_wait_locks();
     public_wait_fifo();
     public_wait_lifecycle();
+    public_wait_process_exit();
     public_lock_deadlocks();
     expect("native lock commands and exact custody", ram_lock_commands(getpid()), 0);
     expect("native close receipt and 32-reference birth", ram_close_event(), 0);

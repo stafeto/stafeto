@@ -3277,6 +3277,7 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: genuine FIFO oldest eligible Read, blocked older Write and later PID SET ok",
         "posix-procs: FIFO own dispatch ",
         "posix-procs: genuine WAIT End exact debts and live parent fork exec custody ok",
+        "posix-procs: genuine pending WAIT process exit retires exact paid receipt without rescue close ok",
         "posix-procs: genuine PID cycle EDEADLK and OFD noncycle ok",
     ] {
         qemu::expect_marker(&outcome, marker)?;
