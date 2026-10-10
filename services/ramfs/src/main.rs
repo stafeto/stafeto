@@ -313,6 +313,7 @@ fn main(_: u64) -> u64 {
         wait_proof_next: 0,
         wait_proof_serial: 0,
         wait_proof_disabled: false,
+        wait_proof_turn: false,
         wait_timer,
         _wait_view: wait_view,
         wait_timer_armed: false,
@@ -386,6 +387,7 @@ struct Fs {
     wait_proof_next: u8,
     wait_proof_serial: u64,
     wait_proof_disabled: bool,
+    wait_proof_turn: bool,
     wait_timer: Handle<Timer>,
     _wait_view: Handle<Channel>,
     wait_timer_armed: bool,
@@ -1337,6 +1339,7 @@ impl Service<0> for Fs {
             self.wait_timer_armed = false;
             if self.wait_pool.count() != 0 {
                 self.wait_events.poll();
+                self.schedule_wait_proof();
                 self.maintenance_burst.restart();
                 self.legacy_pending = true;
                 self.refresh_wait_timer();
@@ -1362,7 +1365,10 @@ impl Service<0> for Fs {
         match self.lock_dispatch.next_with_requests(
             now,
             self.locks.busy(),
-            self.lock_jobs.has_work() || self.wait_jobs.has_work() || self.wait_events.pending(),
+            self.lock_jobs.has_work()
+                || self.wait_jobs.has_work()
+                || self.wait_events.pending()
+                || self.wait_proof_pending(),
             self.lifetimes.is_some(),
         ) {
             LockWork::Actor => {
@@ -1410,6 +1416,7 @@ impl Service<0> for Fs {
                             self.wait_events
                                 .attach(self.wait_pool, registration)
                                 .expect("paid genuine WAIT inode wake mask");
+                            self.schedule_wait_proof();
                         }
                         self.refresh_wait_timer();
                         self.notify_maintenance();
@@ -1452,12 +1459,17 @@ impl Service<0> for Fs {
                 return;
             }
             LockWork::Request { cleanup } => {
+                if cleanup && self.wait_proof_pending() {
+                    self.wait_proof_turn = !self.wait_proof_turn;
+                }
                 if self.wait_events.pending() {
                     self.wait_events
                         .part(self.wait_jobs, self.wait_pool)
                         .expect("exact bounded WAIT wake masks");
                     self.wait_ready_scan = None;
                     self.wait_ready_scanned = false;
+                } else if cleanup && self.wait_proof_pending() && self.wait_proof_turn {
+                    self.tick_wait_proof(sessions);
                 } else if cleanup {
                     if self.lock_jobs.cleanup_released(&mut self.ram.storage) != 0 {
                         self.maintenance_burst.restart();
@@ -2919,12 +2931,13 @@ impl Fs {
         if self.wait_proof_active {
             let page = self.lifetimes.as_ref();
             let (storage, descriptions) = self.ram.lock_parts();
+            let locks = &*self.locks;
             let progress = self.wait_proof.step(
                 self.wait_jobs,
                 self.wait_pool,
                 self.locks,
                 storage,
-                |pid| page.is_some_and(|page| page.live(pid)),
+                |pid| page.is_some_and(|page| page.live(pid)) && locks.pid_visible(pid),
                 |ofd| descriptions.live(ofd),
             );
             let Some(outcome) = progress.outcome else {
@@ -2970,15 +2983,17 @@ impl Fs {
                     *choice = Some((rank, token, captured));
                 }
             });
-            if scanned.is_err() {
-                self.wait_proof_scan = None;
-                self.wait_proof_choice = None;
-            } else {
-                self.wait_proof_scan_remaining = self
-                    .wait_proof_scan_remaining
-                    .saturating_sub(scanned.expect("successful finite proof scan") as u8);
-                if cursor.done() || self.wait_proof_scan_remaining == 0 {
+            match scanned {
+                Err(_) => {
                     self.wait_proof_scan = None;
+                    self.wait_proof_choice = None;
+                }
+                Ok(visited) => {
+                    self.wait_proof_scan_remaining =
+                        self.wait_proof_scan_remaining.saturating_sub(visited as u8);
+                    if cursor.done() || self.wait_proof_scan_remaining == 0 {
+                        self.wait_proof_scan = None;
+                    }
                 }
             }
             return;
@@ -3067,6 +3082,7 @@ impl Fs {
     fn notify_maintenance(&self) {
         if self.legacy_pending
             || self.wait_events.pending()
+            || self.wait_proof_pending()
             || self.lock_dispatch.pending(
                 self.locks.busy() || self.lock_jobs.has_work() || self.wait_jobs.has_work(),
             )
