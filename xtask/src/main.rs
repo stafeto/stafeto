@@ -2344,7 +2344,9 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
         }
         check_waits(&output.lines, &["1", "5"], "POSIX terminal steps")?;
         let tty = longest_steps(&output.lines, "5");
-        for kind in 16..=20 {
+        // This POSIX fixture calls Acquire, SetPgrp, GetPgrp and GetSid.
+        // The separate native control probe also measures Controlling.
+        for kind in 16..=19 {
             let ticks = tty.iter().find(|row| row.0 == kind).map_or(0, |row| row.1);
             if ticks == 0 {
                 return Err(format!(
@@ -4676,7 +4678,12 @@ fn tty_probe(vz: bool) -> Result<(), String> {
         run.expect_bytes(b"\nbare-lf\n", DIALOG_STEP)?;
         run.expect("tty-probe: wrote", DIALOG_STEP)?;
         run.expect("tty-probe: ok", DIALOG_STEP)?;
-        run.expect(ENDED_TTY, DIALOG_STEP)
+        run.expect(ENDED_TTY, DIALOG_STEP)?;
+        // The debug completion can precede bytes already accepted by UART.
+        run.expect_seen(
+            "tty-probe line 199 abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            DIALOG_STEP,
+        )
     })();
     let output = run.stop();
     if vz {
