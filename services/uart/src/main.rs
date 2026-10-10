@@ -50,6 +50,8 @@ const PAGE: u64 = 4096;
 const LOG_PERIOD_NS: u64 = 50_000_000;
 /// The label of the copy of the driver's channel its timer posts through.
 const TIMER_LABEL: u64 = 1;
+/// A separate one-shot timer resumes paced transmit portions.
+const TX_TIMER_LABEL: u64 = 2;
 /// How long the driver waits for the transmitter to go idle before it
 /// sets the PL011 up: the kernel wrote to the port until the window came.
 const IDLE_NS: u64 = 10_000_000;
@@ -173,6 +175,13 @@ fn main(_: u64) -> u64 {
     let Ok(timer) = sys::timer_create(&view, level) else {
         return NOT_REGISTERED;
     };
+    let Ok(tx_view) = sys::handle_label(&channel, abi::Rights::RECEIVE, TX_TIMER_LABEL, level)
+    else {
+        return NOT_REGISTERED;
+    };
+    let Ok(tx_timer) = sys::timer_create(&tx_view, level) else {
+        return NOT_REGISTERED;
+    };
     let mut uart = Uart {
         channel: Handle::borrowed(channel.raw()),
         level,
@@ -183,6 +192,8 @@ fn main(_: u64) -> u64 {
         log,
         timer,
         _view: view,
+        tx_timer,
+        _tx_view: tx_view,
         t0: time::ticks_to_ns(time::now()),
         deadline: 0,
         left: 0,
@@ -227,6 +238,9 @@ struct Uart {
     /// The copy of the channel with RECEIVE the timer posts through, with
     /// TIMER_LABEL: it lives as long as the timer.
     _view: Handle<Channel>,
+    /// The fixed timer and labelled receiver for paced output.
+    tx_timer: Handle<Timer>,
+    _tx_view: Handle<Channel>,
     /// The timer fires at t0 + k * LOG_PERIOD_NS; `deadline` is the next.
     t0: u64,
     deadline: u64,
@@ -283,19 +297,22 @@ impl Uart {
     /// Starts output after bytes came into it outside a pass (spec 13.5):
     /// the writes that wait go into the ring as room allows, and while the
     /// transmit interrupt is masked the driver writes the first bytes to
-    /// the FIFO itself, since the interrupt comes only as the FIFO drains,
-    /// and lets it out while bytes wait (Irq::start).
+    /// the FIFO itself. Remaining bytes resume through a separate absolute
+    /// timer, preserving the held deadline across new writes and RX IRQs.
     fn kick(&mut self) {
         self.flush();
         let regs = &self.regs;
         let output = &mut self.state.output;
         let tx_full = || regs.read(FR) & FR_TXFF != 0;
-        if let Some(imsc) = self
+        if self
             .irqs
             .start(output, tx_full, |b| regs.write(DR, u32::from(b)))
+            .is_some()
         {
-            regs.write(IMSC, imsc);
+            let deadline = self.irqs.defer_transmit(time::ticks_to_ns(time::now()));
+            regs.write(IMSC, self.irqs.imsc());
             regs.read(IMSC);
+            let _ = sys::timer_set(&self.tx_timer, deadline);
         }
     }
 
@@ -646,6 +663,11 @@ impl Service<HELD> for Uart {
     fn notification(&mut self, n: Notice) {
         match (n.source, n.label) {
             (Source::Interrupt, _) => self.interrupt(),
+            (Source::Timer, TX_TIMER_LABEL)
+                if self.irqs.resume_transmit(time::ticks_to_ns(time::now())) =>
+            {
+                self.kick();
+            }
             (Source::Timer, TIMER_LABEL) if time::reached(self.deadline) => {
                 self.take_log();
                 self.arm();
