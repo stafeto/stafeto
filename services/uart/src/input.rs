@@ -81,6 +81,8 @@ pub struct Input<T, H = ()> {
     next_key: u64,
     /// Bytes that came with an error: framing, parity, break or overrun.
     errors: u64,
+    /// The last successfully acknowledged input-flush nonce of the owner.
+    last_flush: u64,
 }
 
 impl<T, H> Input<T, H> {
@@ -94,7 +96,31 @@ impl<T, H> Input<T, H> {
             reader: None,
             next_key: 1,
             errors: 0,
+            last_flush: 0,
         }
+    }
+
+    /// Flush only the owning console. The backend discards its received prefix
+    /// before the software ring is cleared. An exact retry never calls it twice.
+    /// A waiting reader retains its key and notification, which fresh input rearms.
+    pub fn flush(&mut self, label: u64, nonce: u64, discard: impl FnOnce() -> bool) -> bool {
+        if nonce == 0 || self.owner.is_some_and(|owner| owner != label) {
+            return false;
+        }
+        if self.last_flush == nonce {
+            return true;
+        }
+        if !discard() {
+            return false;
+        }
+        self.owner = Some(label);
+        self.start = 0;
+        self.len = 0;
+        if let Some(reader) = &mut self.reader {
+            reader.told = false;
+        }
+        self.last_flush = nonce;
+        true
     }
 
     /// The bytes the ring has room for.
@@ -285,6 +311,7 @@ impl<T, H> Input<T, H> {
             return None;
         }
         self.owner = None;
+        self.last_flush = 0;
         self.reader = None;
         self.waiting.take().map(|(_, token)| token)
     }
@@ -299,6 +326,76 @@ impl<T, H> Default for Input<T, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_flush_keeps_waiter_rearms_and_replays_without_discarding_fresh_bytes() {
+        let mut input: Input<char, &str> = Input::new();
+        let mut out = [0; RX_RING];
+        assert_eq!(input.start(7, 2, &mut out), Start::Wait(1));
+        assert_eq!(input.take(7, 1, Some("reader"), &mut out), Taken2::Armed);
+        assert!(input.push(u32::from(b'o')));
+        assert_eq!(input.to_tell(), Some(&"reader"));
+        let nonce = (1_u64 << 32) | 5;
+        assert!(input.flush(7, nonce, || true));
+        // A stale notification cannot deliver input predating the flush.
+        assert_eq!(input.take(7, 1, None, &mut out), Taken2::Armed);
+        assert!(input.push(u32::from(b'n')));
+        assert_eq!(input.to_tell(), Some(&"reader"));
+        // Model loss of the first acknowledgment and identical request replay.
+        assert!(input.flush(7, nonce, || panic!("replayed hardware discard")));
+        assert_eq!(input.take(7, 1, None, &mut out), Taken2::Ready(1));
+        assert_eq!(out[0], b'n');
+        assert!(input.push(u32::from(b'q')));
+        // The high half belongs to the identity, even with the same low half.
+        assert!(input.flush(7, (2_u64 << 32) | 5, || true));
+        assert_eq!(input.start(7, 2, &mut out), Start::Wait(2));
+    }
+
+    #[test]
+    fn input_flush_discards_a_full_wrapped_ring() {
+        let mut input: Input<()> = Input::new();
+        let mut out = [0; RX_RING];
+        for _ in 0..RX_RING {
+            assert!(input.push(u32::from(b'o')));
+        }
+        assert_eq!(input.start(7, 17, &mut out), Start::Now(17));
+        for _ in 0..17 {
+            assert!(input.push(u32::from(b'o')));
+        }
+        assert!(input.is_full());
+        assert!(input.flush(7, 1, || true));
+        assert!(input.push(u32::from(b'n')));
+        assert_eq!(input.start(7, RX_RING, &mut out), Start::Now(1));
+        assert_eq!(out[0], b'n');
+    }
+
+    #[test]
+    fn input_flush_validates_owner_and_zero_and_commits_only_backend_success() {
+        let mut input: Input<char> = Input::new();
+        let mut out = [0; RX_RING];
+        assert!(!input.flush(7, 0, || panic!("zero reached backend")));
+        assert_eq!(input.read(7, 2, 'r', &mut out), Taken::Waits);
+        assert!(input.push(u32::from(b'o')));
+        assert!(!input.flush(8, 1, || panic!("foreign owner reached backend")));
+        let hardware_discarded = core::cell::Cell::new(false);
+        assert!(!input.flush(7, 1, || {
+            // A failed repost may have already discarded a hardware prefix.
+            hardware_discarded.set(true);
+            false
+        }));
+        assert!(hardware_discarded.get());
+        assert_eq!(input.room(), RX_RING - 1);
+        assert!(input.flush(7, 1, || true));
+        assert!(input.push(u32::from(b'n')));
+        assert_eq!(input.answer(&mut out), Some(('r', 1)));
+        assert_eq!(out[0], b'n');
+        input.gone(7);
+        assert!(input.push(u32::from(b'q')));
+        // An actual new owner may reuse a nonce from the old session.
+        assert!(input.flush(8, 1, || true));
+        assert_eq!(input.owner(), Some(8));
+        assert_eq!(input.room(), RX_RING);
+    }
 
     #[test]
     fn a_read_in_two_steps_keeps_its_bytes_until_take_or_cancel() {

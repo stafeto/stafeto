@@ -375,6 +375,87 @@ pub fn drain_flush_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &
     Ok(())
 }
 
+/// Old received input stays upstream until the flush; the existing read
+/// remains usable and later input must wake it with only the fresh line.
+pub fn input_flush_prefix(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> {
+    let stub = rt::service::connect(parent, "uart").map_err(fail)?;
+    let settings = probe.get_attr().map_err(fail)?;
+    for action in [QUEUE_IN, QUEUE_BOTH, u32::MAX] {
+        let mut out = [0; MAX_READ];
+        let mut start = Writer::new();
+        read_request(None, MAX_READ as u32, &mut start).map_err(fail)?;
+        let Step::Wait(key) = probe
+            .step_on(&probe.tty, start.as_bytes(), None, &mut out)
+            .map_err(fail)?
+        else {
+            return Err("input flush read did not wait");
+        };
+        let mut take = Writer::new();
+        read_request(Some(key), MAX_READ as u32, &mut take).map_err(fail)?;
+        let notify = probe.labelled(key).map_err(fail)?;
+        if probe.step_on(&probe.tty, take.as_bytes(), Some(notify), &mut out) != Ok(Step::Armed) {
+            return Err("input flush read did not arm");
+        }
+        // This test-only role keeps the received bytes and delays its notice.
+        stub_call(&stub, HOLD, &3_u32.to_le_bytes()).map_err(fail)?;
+        stub_call(&stub, FEED, b"old\n").map_err(fail)?;
+        if action == u32::MAX {
+            probe.set_attr(settings, FLUSH).map_err(fail)?;
+        } else {
+            let mut flush = Writer::new();
+            Control {
+                terminal: CONSOLE,
+                blocked: 0,
+                word: action,
+            }
+            .write(Method::FlushQueues, &mut flush)
+            .map_err(fail)?;
+            let mut reply = [0; MESSAGE_MAX];
+            status_of(
+                probe
+                    .call(flush.as_bytes(), None, &mut reply)
+                    .map_err(fail)?,
+            )
+            .map_err(fail)?;
+        }
+        stub_call(&stub, HOLD, &0_u32.to_le_bytes()).map_err(fail)?;
+        stub_call(&stub, FEED, b"new\n").map_err(fail)?;
+        probe.bit(key).map_err(fail)?;
+        if probe.step_on(&probe.tty, take.as_bytes(), None, &mut out) != Ok(Step::Ready(4))
+            || &out[..4] != b"new\n"
+        {
+            return Err("input flush delivered upstream old bytes or lost its reader");
+        }
+    }
+    // A broken backend cannot be reported as a successful local-only flush.
+    // The stub also checks that a failed acknowledgment consumes no nonce.
+    stub_call(&stub, HOLD, &4_u32.to_le_bytes()).map_err(fail)?;
+    let mut flush = Writer::new();
+    Control {
+        terminal: CONSOLE,
+        blocked: 0,
+        word: QUEUE_IN,
+    }
+    .write(Method::FlushQueues, &mut flush)
+    .map_err(fail)?;
+    let mut reply = [0; MESSAGE_MAX];
+    let failed = probe
+        .call(flush.as_bytes(), None, &mut reply)
+        .map_err(|_| "input flush retry consumed a failed nonce")?;
+    if failed.get(..4) != Some(&proto_tty::IO_ERROR.to_le_bytes()) {
+        return Err("broken input backend was not reported as EIO");
+    }
+    stub_call(&stub, HOLD, &0_u32.to_le_bytes()).map_err(fail)?;
+    status_of(
+        probe
+            .call(flush.as_bytes(), None, &mut reply)
+            .map_err(fail)?,
+    )
+    .map_err(|_| "input flush retry consumed a failed nonce")?;
+    rt::println!("tty-probe: input flush discards upstream old bytes and preserves fresh read");
+    Ok(())
+}
+
 /// Full control-character output and mixed waits exercise shared limits.
 pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> {
     let stub = rt::service::connect(parent, "uart").map_err(|_| "no driver")?;

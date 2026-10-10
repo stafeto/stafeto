@@ -25,8 +25,8 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use proto_init::ServiceArgs;
 use proto_uart::{
-    DrainKey, DrainReply, Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION, WriteReply,
-    WriteRequest,
+    DrainKey, DrainReply, InputFlush, Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION,
+    WriteReply, WriteRequest,
 };
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer, long};
@@ -448,6 +448,33 @@ impl Uart {
         let _ = sys::timer_set(&self.timer, self.deadline);
     }
 
+    /// A short, replay-safe flush of received console input only.
+    fn flush_input(&mut self, r: &mut Request<'_>) -> Answer {
+        let request = match InputFlush::read(r.body()) {
+            Ok(request) if r.handles.is_empty() => request,
+            Ok(_) => return Answer::Status(Status::BadSize),
+            Err(status) => return Answer::Status(status),
+        };
+        let regs = &self.regs;
+        match irq::flush_input(
+            &mut self.state.input,
+            &mut self.irqs,
+            r.label(),
+            request.nonce,
+            || regs.read(FR) & FR_RXFE != 0,
+            || regs.read(DR),
+        ) {
+            Ok(mask) => {
+                if let Some(mask) = mask {
+                    self.regs.write(IMSC, mask);
+                    self.regs.read(IMSC);
+                }
+                Answer::Status(Status::Ok)
+            }
+            Err(error) => Answer::Status(Status::Kernel(error)),
+        }
+    }
+
     /// Observe only an existing paid ROOM and a full terminal operation key.
     fn drain(&mut self, r: &mut Request<'_>) -> Answer {
         if Method::from_number(r.method()) == Some(Method::DrainState) {
@@ -685,6 +712,7 @@ const METHODS: &[u16] = &[
     Method::DrainTake.number(),
     Method::DrainRelease.number(),
     Method::DrainState.number(),
+    Method::InputFlush.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -701,6 +729,7 @@ const METHODS: &[u16] = &[
     Method::DrainTake.number(),
     Method::DrainRelease.number(),
     Method::DrainState.number(),
+    Method::InputFlush.number(),
 ];
 
 impl Service<HELD> for Uart {
@@ -718,6 +747,7 @@ impl Service<HELD> for Uart {
             Some(Method::Clone) => self.clone_session(r),
             Some(Method::WriteSome) => self.write_some(r),
             Some(Method::Room) => self.room(r),
+            Some(Method::InputFlush) => self.flush_input(r),
             Some(
                 Method::DrainStart | Method::DrainTake | Method::DrainRelease | Method::DrainState,
             ) => self.drain(r),

@@ -37,8 +37,8 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use proto_init::ServiceArgs;
 use proto_uart::{
-    DrainKey, DrainReply, Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION, WriteReply,
-    WriteRequest,
+    DrainKey, DrainReply, InputFlush, Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION,
+    WriteReply, WriteRequest,
 };
 use proto_wire::{Status, Writer, long};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
@@ -638,6 +638,25 @@ impl Driver {
     }
 
     /// WRITE_SOME (5f), as the PL011's driver answers it.
+    /// A short, replay-safe flush of received console input only.
+    fn flush_input(&mut self, r: &mut Request<'_>) -> Answer {
+        let request = match InputFlush::read(r.body()) {
+            Ok(request) if r.handles.is_empty() => request,
+            Ok(_) => return Answer::Status(Status::BadSize),
+            Err(status) => return Answer::Status(status),
+        };
+        let port = &mut self.port;
+        let accepted = self
+            .state
+            .input
+            .flush(r.label(), request.nonce, || port.flush_receive().is_ok());
+        if accepted {
+            Answer::Status(Status::Ok)
+        } else {
+            Answer::Status(Status::Kernel(Error::BadState))
+        }
+    }
+
     /// Observe only an existing paid ROOM and a full terminal operation key.
     fn drain_request(&mut self, r: &mut Request<'_>) -> Answer {
         if Method::from_number(r.method()) == Some(Method::DrainState) {
@@ -836,6 +855,7 @@ const METHODS: &[u16] = &[
     Method::DrainTake.number(),
     Method::DrainRelease.number(),
     Method::DrainState.number(),
+    Method::InputFlush.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -851,6 +871,7 @@ const METHODS: &[u16] = &[
     Method::DrainTake.number(),
     Method::DrainRelease.number(),
     Method::DrainState.number(),
+    Method::InputFlush.number(),
 ];
 
 #[cfg(feature = "crash")]
@@ -888,6 +909,7 @@ impl Service<HELD> for Driver {
             Some(Method::ReadCancel) => self.read_take(r, true),
             Some(Method::WriteSome) => self.write_some(r),
             Some(Method::Room) => self.room(r),
+            Some(Method::InputFlush) => self.flush_input(r),
             Some(
                 Method::DrainStart | Method::DrainTake | Method::DrainRelease | Method::DrainState,
             ) => self.drain_request(r),

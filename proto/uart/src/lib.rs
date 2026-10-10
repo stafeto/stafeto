@@ -69,6 +69,10 @@
 //! through the used ring. These methods retain no RPC reply. Numbers 16–18
 //! remain available to the terminal measurement stand-in's existing methods.
 //!
+//! INPUT_FLUSH (20): a nonzero nonce u64; the owning console discards received
+//! input, preserving a waiting reader. Exact replay does not discard newer input.
+//! Its acknowledgment is exactly status 0. It retains no RPC reply.
+//!
 //! Number 4 belongs to TRACE, which comes with milestone 1.4e; 5 and 6
 //! (READ_CANCELABLE, CANCEL_READ of version 1) are retired.
 
@@ -78,7 +82,7 @@ use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
 /// The version of the protocol, in the header of each request.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 /// The number kept for TRACE (milestone 1.4e): no method of this version.
 pub const TRACE: u16 = 4;
@@ -110,10 +114,11 @@ pub enum Method {
     DrainTake = 14,
     DrainRelease = 15,
     DrainState = 19,
+    InputFlush = 20,
 }
 
 impl Method {
-    pub const ALL: [Method; 13] = [
+    pub const ALL: [Method; 14] = [
         Method::Write,
         Method::Read,
         Method::Crash,
@@ -127,6 +132,7 @@ impl Method {
         Method::DrainTake,
         Method::DrainRelease,
         Method::DrainState,
+        Method::InputFlush,
     ];
 
     pub const fn number(self) -> u16 {
@@ -342,6 +348,32 @@ impl DrainKey {
     }
 }
 
+/// Discard received input once for the owning console's nonzero nonce.
+/// Exact replay acknowledges the previous flush without discarding newer input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputFlush {
+    pub nonce: u64,
+}
+
+impl InputFlush {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        if self.nonce == 0 {
+            return Err(Status::BadSize);
+        }
+        Method::InputFlush.header().write(w)?;
+        w.u64(self.nonce)
+    }
+
+    pub fn read(body: Reader<'_>) -> Result<Self, Status> {
+        ReadKey::read(body).map(|request| Self { nonce: request.key })
+    }
+
+    /// The successful acknowledgment is the canonical status reply: OK and zero reserved.
+    pub fn acknowledged(bytes: &[u8]) -> bool {
+        bytes == proto_wire::reply(Status::Ok)
+    }
+}
+
 /// Physical completion of the captured prefix, including the shift register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrainReply {
@@ -441,10 +473,38 @@ mod tests {
     }
 
     #[test]
+    fn input_flush_preserves_full_nonce_and_requires_exact_ok_ack() {
+        let request = InputFlush { nonce: u64::MAX };
+        let mut w = Writer::new();
+        request.write(&mut w).unwrap();
+        assert_eq!(
+            InputFlush::read(Reader::new(&w.as_bytes()[8..])),
+            Ok(request)
+        );
+        assert_eq!(
+            InputFlush { nonce: 0 }.write(&mut Writer::new()),
+            Err(Status::BadSize)
+        );
+        assert_eq!(InputFlush::read(Reader::new(&[0; 8])), Err(Status::BadSize));
+        assert_eq!(InputFlush::read(Reader::new(&[1; 9])), Err(Status::BadSize));
+        assert!(InputFlush::acknowledged(&proto_wire::reply(Status::Ok)));
+        for bytes in [
+            &[][..],
+            &[0; 4],
+            &[0; 7],
+            &[0; 9],
+            &[1, 0, 0, 0, 0, 0, 0, 0],
+            &[0, 0, 0, 0, 1, 0, 0, 0],
+        ] {
+            assert!(!InputFlush::acknowledged(bytes));
+        }
+    }
+
+    #[test]
     fn method_numbers_are_fixed() {
         assert_eq!(
             Method::ALL.map(Method::number),
-            [1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19]
+            [1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20]
         );
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
@@ -455,9 +515,9 @@ mod tests {
         assert_eq!(Method::from_number(0), None);
         assert_eq!(Method::from_number(5), None);
         assert_eq!(Method::from_number(6), None);
-        assert_eq!(VERSION, 3);
+        assert_eq!(VERSION, 4);
         assert_eq!((WRITE_MAX, READ_MAX), (1016, 1016));
-        assert_eq!(Method::Crash.header().bytes(), [3, 0, 3, 0, 0, 0, 0, 0]);
+        assert_eq!(Method::Crash.header().bytes(), [3, 0, 4, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -466,7 +526,7 @@ mod tests {
         ReadRequest { max: 2 }.write_start(&mut w).unwrap();
         assert_eq!(
             w.as_bytes(),
-            [7, 0, 3, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
+            [7, 0, 4, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
         );
         let key = ReadKey {
             key: 0x0807060504030201,
@@ -476,7 +536,7 @@ mod tests {
             key.write(method, &mut w).unwrap();
             assert_eq!(
                 w.as_bytes(),
-                [number, 0, 3, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]
+                [number, 0, 4, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]
             );
             assert_eq!(ReadKey::read(Reader::new(&w.as_bytes()[8..])), Ok(key));
         }

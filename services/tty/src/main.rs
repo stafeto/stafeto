@@ -238,6 +238,7 @@ fn main(_: u64) -> u64 {
         watches: &mut tables.watches,
         driver,
         room_given: false,
+        input_flush: 0,
         draining: None,
         devices: &mut tables.devices,
         active: 0,
@@ -339,6 +340,8 @@ struct Tty {
     /// handle of ROOM.
     driver: Handle<Channel>,
     room_given: bool,
+    /// Last validated input-flush acknowledgment on this driver session.
+    input_flush: u64,
     draining: Option<u64>,
     devices: &'static mut [Device; TERMINALS],
     active: usize,
@@ -1070,6 +1073,7 @@ impl Tty {
     fn reconnect(&mut self) {
         if let Ok(driver) = rt::service::connect(&self.parent, "uart") {
             self.driver = driver;
+            self.input_flush = 0;
         }
         self.room_given = false;
         self.draining = None;
@@ -1083,6 +1087,27 @@ impl Tty {
         }
         self.pump.room_came();
         self.input = Input::Idle;
+    }
+
+    /// Flush the upstream console before its local discipline. Advance the
+    /// nonce only after a validated acknowledgment; call retries identical bytes.
+    fn flush_driver_input(&mut self) -> Result<(), u32> {
+        if self.active != 0 {
+            return Ok(());
+        }
+        let nonce = self.input_flush.wrapping_add(1).max(1);
+        let mut request = Writer::new();
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_uart::InputFlush { nonce }
+            .write(&mut request)
+            .map_err(|_| proto_tty::IO_ERROR)?;
+        match call(&self.driver, request.as_bytes(), None, &mut buffer) {
+            Ok(reply) if proto_uart::InputFlush::acknowledged(reply) => {
+                self.input_flush = nonce;
+                Ok(())
+            }
+            _ => Err(proto_tty::IO_ERROR),
+        }
     }
 
     /// Output to the driver: WRITES messages at most, then the writers
@@ -2274,6 +2299,9 @@ impl Tty {
             return status(INVALID);
         }
         if control.word != QUEUE_OUT {
+            if let Err(code) = self.flush_driver_input() {
+                return status(code);
+            }
             self.devices[self.active].console.flush_input();
             self.tell_readers();
         }
@@ -2344,6 +2372,11 @@ impl Tty {
         }
         if set.action > FLUSH {
             return status(INVALID);
+        }
+        if set.action == FLUSH {
+            if let Err(code) = self.flush_driver_input() {
+                return status(code);
+            }
         }
         self.devices[self.active]
             .console
