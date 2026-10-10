@@ -4,7 +4,7 @@
 //! Exact source entries and typed terminal payloads survive lock cleanup.
 
 use super::{FsError, PosixFs, RamTarget, Target};
-use entries::Frame;
+use entries::{Frame, nested};
 use posix_fd::{
     ControlClaimToken, ControlPhase, ControlResult, ControlSnapshot, ControlToken, EntryToken,
     OwnerToken,
@@ -304,6 +304,41 @@ impl PosixFs {
             self.begin_lock_cleanup(token, CancelReason::Close)?;
         }
         Ok(token)
+    }
+    /// Select one abandoned Lock debt and acknowledge already cleaned local frames.
+    /// Every candidate is an exact resident token copied in one bounded table scan.
+    pub fn pick_lock_cleanup(
+        &mut self,
+        me: Option<OwnerToken>,
+        current: Frame,
+        skip: Option<ControlToken>,
+    ) -> Result<Option<ControlToken>, FsError> {
+        let mut tokens = [None; posix_fd::JOBS_MAX];
+        for (index, token) in self.control_tokens().enumerate() {
+            tokens[index] = Some(token);
+        }
+        for token in tokens.into_iter().flatten() {
+            if Some(token) == skip {
+                continue;
+            }
+            let snapshot = self.control_snapshot(token)?;
+            if snapshot.recovery.lock().is_none() {
+                continue;
+            }
+            let mine = snapshot.owner.is_some() && snapshot.owner == me;
+            if snapshot.owner.is_some() && (!mine || nested(current, snapshot.recovery.frame())) {
+                continue;
+            }
+            if snapshot.phase == ControlPhase::Cleaned {
+                if let Some(owner) = snapshot.owner.filter(|_| mine) {
+                    self.ack_lock_record(token, owner)?;
+                }
+                continue;
+            }
+            self.begin_lock_cleanup(token, CancelReason::Abandoned)?;
+            return Ok(Some(token));
+        }
+        Ok(None)
     }
     pub fn abandon_lock_owner(
         &mut self,

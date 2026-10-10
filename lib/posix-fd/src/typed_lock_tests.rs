@@ -511,3 +511,158 @@ fn full_sixteen_controls_preserve_close_admission_and_all_fence_debts() {
     }
     assert_eq!(files.control_tokens().count(), 0);
 }
+
+#[test]
+fn lock_collector_preserves_nested_foreign_skipped_and_change_records() {
+    let (mut files, entry, _, input) = fixture();
+    let current = Frame::main(200);
+    let (nested, nested_claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(300), input)
+        .unwrap();
+    let foreign = OwnerToken::new(2).unwrap();
+    let (foreign_token, foreign_claim) = files
+        .begin_lock_record(foreign, entry, Frame::main(100), input)
+        .unwrap();
+    let (skipped, skipped_claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(100), input)
+        .unwrap();
+    let (change, change_claim) = files
+        .begin_change_record(owner(), Frame::main(100))
+        .unwrap();
+    let (left, left_claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(100), input)
+        .unwrap();
+    assert_eq!(
+        files.pick_lock_cleanup(Some(owner()), current, Some(skipped)),
+        Ok(Some(left))
+    );
+    assert!(!files.lock_is_live(left_claim));
+    assert!(files.lock_is_live(nested_claim));
+    assert!(files.lock_is_live(foreign_claim));
+    assert!(files.lock_is_live(skipped_claim));
+    assert!(files.change_is_live(change_claim));
+    assert_eq!(
+        files
+            .lock_snapshot(left)
+            .unwrap()
+            .recovery
+            .lock()
+            .unwrap()
+            .cancel_reason(),
+        control::CancelReason::Abandoned
+    );
+    assert_eq!(
+        files.lock_snapshot(nested).unwrap().phase,
+        ControlPhase::Working
+    );
+    assert_eq!(
+        files.lock_snapshot(foreign_token).unwrap().owner,
+        Some(foreign)
+    );
+    assert_eq!(
+        files.change_snapshot(change).unwrap().phase,
+        ControlPhase::Working
+    );
+    assert_eq!(files.pick_lock_cleanup(None, current, None), Ok(None));
+}
+
+#[test]
+fn lock_collector_acknowledges_sixteen_cleaned_longjmp_frames_without_rpc() {
+    let (mut files, entry, _, input) = fixture();
+    let mut tokens = [None; super::JOBS_MAX];
+    for slot in &mut tokens {
+        let (token, claim) = files
+            .begin_lock_record(owner(), entry, Frame::main(100), input)
+            .unwrap();
+        files
+            .complete_lock_record(claim, ControlResult::Value(0), terminal(blocker()))
+            .unwrap();
+        files
+            .begin_lock_cleanup(token, control::CancelReason::Close)
+            .unwrap();
+        files.finish_lock_cleanup(token).unwrap();
+        *slot = Some(token);
+    }
+    assert_eq!(files.control_tokens().count(), 16);
+    assert_eq!(
+        files.pick_lock_cleanup(Some(owner()), Frame::main(90), None),
+        Ok(None)
+    );
+    assert_eq!(files.control_tokens().count(), 16);
+    assert_eq!(
+        files.pick_lock_cleanup(Some(owner()), Frame::main(200), None),
+        Ok(None)
+    );
+    assert_eq!(files.control_tokens().count(), 0);
+    for token in tokens.into_iter().flatten() {
+        assert_eq!(files.lock_snapshot(token), Err(FsError::BadFileDescriptor));
+    }
+    assert!(
+        files
+            .begin_lock_record(owner(), entry, Frame::main(200), input)
+            .is_ok()
+    );
+}
+
+#[test]
+fn lock_collector_detached_owner_preserves_complete_receipt_until_remote_release() {
+    let (mut files, entry, _, input) = fixture();
+    let (completed, claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(100), input)
+        .unwrap();
+    files
+        .complete_lock_record(claim, ControlResult::Value(0), terminal(blocker()))
+        .unwrap();
+    let (pending, pending_claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(100), input)
+        .unwrap();
+    let foreign = OwnerToken::new(2).unwrap();
+    let (live, live_claim) = files
+        .begin_lock_record(foreign, entry, Frame::main(100), input)
+        .unwrap();
+    let (change, change_claim) = files
+        .begin_change_record(owner(), Frame::main(100))
+        .unwrap();
+    while files.abandon_lock_owner(owner()).is_some() {}
+    assert_eq!(files.control_tokens().count(), 4);
+    assert!(!files.lock_is_live(pending_claim));
+    assert_eq!(
+        files.pick_lock_cleanup(None, Frame::main(0), None),
+        Ok(Some(completed))
+    );
+    let before = files.lock_snapshot(completed).unwrap();
+    assert_eq!(before.owner, None);
+    assert_eq!(before.result, Some(ControlResult::Value(0)));
+    assert_eq!(before.recovery.lock().unwrap().outcome(), Some(blocker()));
+    files
+        .publish_lock_cleanup(completed, ControlResult::Failed(5), terminal(cancelled()))
+        .unwrap();
+    assert_eq!(
+        files.lock_snapshot(completed).unwrap().result,
+        Some(ControlResult::Value(0))
+    );
+    files.finish_lock_cleanup(completed).unwrap();
+    assert_eq!(
+        files.lock_snapshot(completed),
+        Err(FsError::BadFileDescriptor)
+    );
+    assert_eq!(
+        files.pick_lock_cleanup(None, Frame::main(0), None),
+        Ok(Some(pending))
+    );
+    files
+        .publish_lock_cleanup(pending, ControlResult::Failed(5), terminal(cancelled()))
+        .unwrap();
+    files.finish_lock_cleanup(pending).unwrap();
+    assert_eq!(
+        files.pick_lock_cleanup(None, Frame::main(0), None),
+        Ok(None)
+    );
+    assert_eq!(files.lock_snapshot(live).unwrap().owner, Some(foreign));
+    assert!(files.lock_is_live(live_claim));
+    assert!(files.change_is_live(change_claim));
+    assert_eq!(files.change_snapshot(change).unwrap().owner, Some(owner()));
+}
+
+#[path = "../../posix-abi/src/change/lock_collect.rs"]
+mod lock_collect;
