@@ -512,7 +512,10 @@ impl Files {
         if reply.len != 8 || reply.words[0] >> 32 != 0 || !reply.handles.is_empty() {
             return OpenFinalizeAttempt::Ambiguous(Status::BadSize);
         }
-        if matches!(code, proto_fs::AUTHENTICATING | proto_fs::TIME_DEFERRED) {
+        if matches!(
+            code,
+            proto_fs::AUTHENTICATING | proto_fs::TIME_DEFERRED | proto_fs::STALE_PROOF
+        ) {
             OpenFinalizeAttempt::Deferred(OpenNoEffect { key, session, code })
         } else {
             OpenFinalizeAttempt::Rejected(Status::from_code(code))
@@ -582,6 +585,11 @@ impl Files {
         }
         Self::open_reply(&reply, 8)?;
         Ok(true)
+    }
+    /// Renew an unpublished path proof using the same paid operation.
+    /// Every retry sends one bounded request without a numeric reservation.
+    pub fn open_prepare_recover(&self, id: u64) -> Result<(), Status> {
+        open_prepare_with(|prepare| self.open_advance(id, prepare))
     }
     /// Retry this same operation ID to recover its exact committed result.
     pub fn open_commit(&self, id: u64) -> Result<PreparedOpen, Status> {
@@ -1545,6 +1553,20 @@ impl Files {
     }
 }
 
+/// A stale preparation returns to traversal before its next prepayment.
+fn open_prepare_with(mut advance: impl FnMut(bool) -> Result<bool, Status>) -> Result<(), Status> {
+    let mut prepare = true;
+    loop {
+        match advance(prepare) {
+            Ok(true) if prepare => return Ok(()),
+            Ok(true) => prepare = true,
+            Ok(false) => {}
+            Err(Status::Unknown(proto_fs::STALE_PROOF)) => prepare = false,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod finalize_reply_tests {
     use super::*;
@@ -1569,7 +1591,11 @@ mod finalize_reply_tests {
     }
     #[test]
     fn canonical_no_effect_receipt_binds_request_and_transport_generations() {
-        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+        for code in [
+            proto_fs::AUTHENTICATING,
+            proto_fs::TIME_DEFERRED,
+            proto_fs::STALE_PROOF,
+        ] {
             let r = reply(8, code as u64, 0);
             let OpenFinalizeAttempt::Deferred(receipt) =
                 Files::open_finalize_reply(&r, key(), session())
@@ -1590,7 +1616,11 @@ mod finalize_reply_tests {
     }
     #[test]
     fn malformed_no_effect_envelopes_remain_ambiguous() {
-        for code in [proto_fs::AUTHENTICATING, proto_fs::TIME_DEFERRED] {
+        for code in [
+            proto_fs::AUTHENTICATING,
+            proto_fs::TIME_DEFERRED,
+            proto_fs::STALE_PROOF,
+        ] {
             for len in [0, 4, 7, 9, 12, 16, 32] {
                 assert!(matches!(
                     Files::open_finalize_reply(&reply(len, code as u64, 0), key(), session()),
@@ -1784,5 +1814,52 @@ mod resolver_small_wire_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod open_preparation_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn stale_prepaid_open_retraverses_and_prepays_only_after_the_new_proof_is_ready() {
+        let mut script = [
+            (true, Err(Status::Unknown(proto_fs::STALE_PROOF))),
+            (false, Ok(false)),
+            (false, Ok(false)),
+            (false, Ok(true)),
+            (true, Ok(false)),
+            (true, Err(Status::Unknown(proto_fs::STALE_PROOF))),
+            (false, Ok(true)),
+            (true, Ok(true)),
+        ]
+        .into_iter();
+        assert_eq!(
+            open_prepare_with(|prepare| {
+                let (expected, result) = script.next().expect("exact bounded request");
+                assert_eq!(prepare, expected);
+                result
+            }),
+            Ok(())
+        );
+        assert!(script.next().is_none());
+    }
+
+    #[test]
+    fn traversal_errors_stop_recovery_without_another_preparation_or_effect() {
+        let mut script = [
+            (true, Err(Status::Unknown(proto_fs::STALE_PROOF))),
+            (false, Err(Status::Unknown(proto_fs::NO_ENTRY))),
+        ]
+        .into_iter();
+        assert_eq!(
+            open_prepare_with(|prepare| {
+                let (expected, result) = script.next().expect("no request after failure");
+                assert_eq!(prepare, expected);
+                result
+            }),
+            Err(Status::Unknown(proto_fs::NO_ENTRY))
+        );
+        assert!(script.next().is_none());
     }
 }
