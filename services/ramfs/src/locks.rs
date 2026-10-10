@@ -14,6 +14,10 @@ pub mod records;
 pub mod request;
 pub mod server;
 pub mod service;
+pub mod wait_receipts;
+pub mod waiters;
+#[cfg(test)]
+mod waiters_tests;
 
 /// The greatest byte offset representable by relibc's off_t.
 pub const OFFSET_MAX: u64 = i64::MAX as u64;
