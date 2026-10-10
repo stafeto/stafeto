@@ -9,6 +9,7 @@ pub mod budget;
 pub mod groups;
 pub mod preparation;
 pub mod records;
+pub mod service;
 
 /// The greatest byte offset representable by relibc's off_t.
 pub const OFFSET_MAX: u64 = i64::MAX as u64;

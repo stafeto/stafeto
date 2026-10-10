@@ -219,13 +219,18 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
     pub fn group_charge(&self, root: u16) -> Option<usize> {
         self.groups.used(root)
     }
+    /// Read-only admission key validation precedes any new expenditure account.
+    pub fn validate_request(&self, request: Request) -> Result<(), Error> {
+        self.groups.lookup(request.inode, request.owner)?;
+        self.budget.root(request.root).ok_or(Error::Invalid)?;
+        Ok(())
+    }
     /// Busy is internal admission; the service keeps the paid request waiting.
     pub fn start(&mut self, request: Request) -> Result<(), Error> {
         if self.busy() {
             return Err(Error::Busy);
         }
-        self.groups.lookup(request.inode, request.owner)?;
-        self.budget.root(request.root).ok_or(Error::Invalid)?;
+        self.validate_request(request)?;
         let phase = if request.command == Command::Set(None) {
             Phase::Admit
         } else {
