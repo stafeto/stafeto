@@ -77,7 +77,7 @@ impl<H> Notifications<H> {
         queue: &Queue,
         sleepers: &mut Pool,
         id: Id,
-        mut notify: impl FnMut(&H),
+        notify: impl FnMut(&H),
     ) -> Result<(), u32> {
         if queue.query(id)?.phase != WaitPhase::Complete {
             return Err(proto_fs::INVALID_ARGUMENT);
@@ -85,6 +85,21 @@ impl<H> Notifications<H> {
         let Some(registration) = sleepers.find(id) else {
             return Ok(());
         };
+        self.complete_registration(queue, sleepers, registration, notify)
+    }
+
+    /// O(1) completion for an already validated full registration, without lookup.
+    pub fn complete_registration(
+        &mut self,
+        queue: &Queue,
+        sleepers: &mut Pool,
+        registration: RegistrationToken,
+        mut notify: impl FnMut(&H),
+    ) -> Result<(), u32> {
+        if queue.query(registration.receipt())?.phase != WaitPhase::Complete {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        sleepers.snapshot(registration)?;
         let cell = &mut self.cells[registration.slot()];
         if cell
             .as_ref()

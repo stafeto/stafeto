@@ -560,3 +560,31 @@ fn final_exact_inode_barrier_rejects_edges_removed_after_genuine_readers() {
     assert!(f.ram.storage.node(extra.request.inode).is_ok());
     assert_eq!(f.finish().verdict, Verdict::NoCycle);
 }
+
+#[test]
+fn positive_outcome_carries_direct_registration_and_never_other_receipt_or_reuse() {
+    let (mut f, a, _) = Fixture::cycle();
+    // Same payer, inode, range and kind; a different full PID and full receipt.
+    let other = f.wait(258, "/b", 2);
+    assert!(f.start(a, 1));
+    let outcome = f.finish();
+    assert_eq!(outcome.registration, a);
+    assert_eq!(outcome.sleeping_registration(&f.queue, &f.pool), Some(a));
+    let wrong = Outcome {
+        registration: other,
+        ..outcome
+    };
+    assert_eq!(wrong.sleeping_registration(&f.queue, &f.pool), None);
+    f.pool.ready(a).unwrap();
+    assert_eq!(outcome.sleeping_registration(&f.queue, &f.pool), None);
+    f.pool.run(a).unwrap();
+    f.pool.sleep(a).unwrap();
+    f.queue.request_cancel(a.receipt()).unwrap();
+    assert_eq!(outcome.sleeping_registration(&f.queue, &f.pool), None);
+    f.pool.complete(a).unwrap();
+    f.queue.release(a.receipt(), &mut f.ram.storage).unwrap();
+    let reused = f.wait(256, "/b", 3);
+    assert_eq!(reused.slot(), a.slot());
+    assert_ne!(reused.receipt(), a.receipt());
+    assert_eq!(outcome.sleeping_registration(&f.queue, &f.pool), None);
+}

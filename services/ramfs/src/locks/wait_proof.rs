@@ -30,7 +30,30 @@ struct SavedWatch {
 pub struct Outcome {
     pub verdict: Verdict,
     pub candidate: Id,
+    pub registration: RegistrationToken,
     pub captured: Captured,
+}
+impl Outcome {
+    /// O(1) exact candidate authority for the final source check and publication.
+    pub fn sleeping_registration(self, queue: &Queue, pool: &Pool) -> Option<RegistrationToken> {
+        if self.verdict != Verdict::Deadlock || self.registration.receipt() != self.candidate {
+            return None;
+        }
+        let (input, phase) = pool.snapshot(self.registration).ok()?;
+        let (captured, canonical, cancelling) = queue.snapshot(self.candidate).ok()?;
+        if phase != PoolPhase::Sleeping
+            || canonical != ReceiptPhase::Sleeping
+            || cancelling
+            || captured != self.captured
+            || input.root != captured.root
+            || input.inode != captured.request.inode
+            || input.range != captured.request.range
+            || captured.request.command != super::actor::Command::Set(Some(input.kind))
+        {
+            return None;
+        }
+        Some(self.registration)
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Progress {
@@ -472,6 +495,7 @@ impl Proof {
                         let outcome = Outcome {
                             verdict,
                             candidate: candidate.token.receipt(),
+                            registration: candidate.token,
                             captured: candidate.captured,
                         };
                         self.phase = Phase::Finished(outcome);

@@ -205,3 +205,125 @@ fn stale_full_receipt_cannot_replace_or_close_reused_notifications() {
         .unwrap();
     assert_eq!(*closed.borrow(), [1, 3, 2]);
 }
+
+#[test]
+fn direct_completion_rejects_stale_pool_before_touching_new_notify() {
+    let (mut ram, mut q, mut pool, old) = fixture();
+    let input = pool.snapshot(pool.find(old).unwrap()).unwrap().0;
+    let captured = q.snapshot(old).unwrap().0;
+    let closed = Rc::new(RefCell::new(Vec::new()));
+    let mut notifications = Notifications::new();
+    notifications
+        .arm(&mut q, &pool, old, handle(1, &closed))
+        .unwrap();
+    let stale = pool.find(old).unwrap();
+    assert_eq!(
+        notifications.complete_registration(&q, &mut pool, stale, |_| panic!("unfinished")),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert!(closed.borrow().is_empty());
+    q.complete(old, done()).unwrap();
+    notifications
+        .complete_registration(&q, &mut pool, stale, |_| {})
+        .unwrap();
+    assert_eq!(*closed.borrow(), [1]);
+    // Keep the old terminal receipt resident while a new receipt reuses its Pool slot.
+    let next_key = WaitKey {
+        slot: 1,
+        generation: 1,
+    };
+    let wire = WaitStart {
+        key: next_key,
+        description: DataDescription {
+            packed: captured.source.fd
+                | u32::from(captured.source.description.slot) << proto_fs::OPEN_DESCRIPTION_SHIFT,
+            generation: captured.source.description.generation,
+        },
+        mode: WaitMode::Ofd,
+        kind: LockKind::Read,
+        whence: 0,
+        start: 0,
+        length: 2,
+        pid: 0,
+    };
+    let next = q.admit(0, 77, wire, captured, &mut ram.storage).unwrap();
+    q.sleep(next, false).unwrap();
+    let token = pool
+        .register(Input {
+            receipt: next,
+            ..input
+        })
+        .unwrap();
+    assert_eq!(token.slot(), stale.slot());
+    notifications
+        .arm(&mut q, &pool, next, handle(2, &closed))
+        .unwrap();
+    assert_eq!(
+        notifications.complete_registration(&q, &mut pool, stale, |_| panic!("stale notify")),
+        Err(proto_fs::OPEN_RETIRED)
+    );
+    assert_eq!(*closed.borrow(), [1]);
+    assert_eq!(pool.snapshot(token).unwrap().0.receipt, next);
+    assert_eq!(q.query(old), Ok(done()));
+    q.complete(next, done()).unwrap();
+    let mut called = 0;
+    notifications
+        .complete_registration(&q, &mut pool, token, |h| {
+            assert_eq!(h.id, 2);
+            called += 1;
+        })
+        .unwrap();
+    assert_eq!(called, 1);
+    assert_eq!(*closed.borrow(), [1, 2]);
+    assert_eq!(q.query(next), Ok(done()));
+}
+
+#[test]
+fn direct_completion_never_notifies_capability_of_another_full_registration() {
+    let (mut ram, mut q, mut pool, old) = fixture();
+    let input = pool.snapshot(pool.find(old).unwrap()).unwrap().0;
+    let captured = q.snapshot(old).unwrap().0;
+    let closed = Rc::new(RefCell::new(Vec::new()));
+    let mut notifications = Notifications::new();
+    notifications
+        .arm(&mut q, &pool, old, handle(1, &closed))
+        .unwrap();
+    q.complete(old, done()).unwrap();
+    // A retained notification must not become authority if another subsystem recycled Pool.
+    pool.complete(pool.find(old).unwrap()).unwrap();
+    let wire = WaitStart {
+        key: WaitKey {
+            slot: 1,
+            generation: 1,
+        },
+        description: DataDescription {
+            packed: captured.source.fd
+                | u32::from(captured.source.description.slot) << proto_fs::OPEN_DESCRIPTION_SHIFT,
+            generation: captured.source.description.generation,
+        },
+        mode: WaitMode::Ofd,
+        kind: LockKind::Read,
+        whence: 0,
+        start: 0,
+        length: 2,
+        pid: 0,
+    };
+    let next = q.admit(0, 77, wire, captured, &mut ram.storage).unwrap();
+    q.sleep(next, false).unwrap();
+    let token = pool
+        .register(Input {
+            receipt: next,
+            ..input
+        })
+        .unwrap();
+    q.complete(next, done()).unwrap();
+    assert_eq!(
+        notifications
+            .complete_registration(&q, &mut pool, token, |_| panic!("wrong full capability")),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert!(closed.borrow().is_empty());
+    assert_eq!(pool.count(), 1);
+    assert_eq!(q.query(old), Ok(done()));
+    assert_eq!(q.query(next), Ok(done()));
+}
