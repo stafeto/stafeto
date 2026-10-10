@@ -124,7 +124,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 16;
+pub const VERSION: u16 = 17;
 /// Original descriptor custody keys and sixteen independent Control keys.
 pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
@@ -356,6 +356,8 @@ pub enum Method {
     LockStart = 50,
     LockQuery = 51,
     LockRelease = 52,
+    /// Retain a canonical cancellation outcome until explicit Release.
+    LockCancel = 53,
 }
 
 impl Method {
@@ -416,6 +418,7 @@ impl Method {
             50 => Some(Self::LockStart),
             51 => Some(Self::LockQuery),
             52 => Some(Self::LockRelease),
+            53 => Some(Self::LockCancel),
             _ => None,
         }
     }
@@ -424,7 +427,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52,
+    52, 53,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

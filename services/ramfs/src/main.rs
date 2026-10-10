@@ -46,7 +46,7 @@ const BASE_METHODS: &[u16] = proto_fs::METHODS;
 const BASE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    52, 53, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 #[cfg(not(any(
     feature = "steps",
@@ -1625,6 +1625,7 @@ impl Service<0> for Fs {
                         | Method::ChangeRelease
                         | Method::LockStart
                         | Method::LockQuery
+                        | Method::LockCancel
                         | Method::LockRelease
                         | Method::VerifySession
                 )
@@ -1640,7 +1641,7 @@ impl Service<0> for Fs {
         }
         if matches!(
             Method::from_number(r.method()),
-            Some(Method::LockStart | Method::LockQuery | Method::LockRelease)
+            Some(Method::LockStart | Method::LockQuery | Method::LockRelease | Method::LockCancel)
         ) {
             return self.lock_request(&mut s.data, r);
         }
@@ -2255,6 +2256,7 @@ impl Service<0> for Fs {
                 | Method::ChangeRelease
                 | Method::LockStart
                 | Method::LockQuery
+                | Method::LockCancel
                 | Method::LockRelease,
             )
             | None => Answer::Status(Status::UnknownMethod),
@@ -3468,7 +3470,19 @@ impl Fs {
                 self.notify_maintenance();
                 return answer;
             }
-            ramfs::locks::server::query(self.lock_jobs, fds, place, owner, key)
+            if method == Method::LockCancel {
+                match ramfs::locks::server::cancel(self.lock_jobs, fds, place, owner, key) {
+                    Ok((result, active)) => {
+                        if active {
+                            self.locks.cancel();
+                        }
+                        Ok(result)
+                    }
+                    Err(code) => Err(code),
+                }
+            } else {
+                ramfs::locks::server::query(self.lock_jobs, fds, place, owner, key)
+            }
         };
         self.notify_maintenance();
         match result {

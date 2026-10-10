@@ -49,6 +49,14 @@ fn replay_during_bind(files: &Files, wire: LockStart, expected: LockReply) -> Re
     if result != expected {
         return Err(Status::BadSize);
     }
+    let mut cancel = Writer::new();
+    proto_fs::write_lock_key(Method::LockCancel, wire.key, &mut cancel)?;
+    let response = rt::sys::send(files.sessions().0, cancel.as_bytes()).map_err(Status::Kernel)?;
+    if !response.handles.is_empty()
+        || LockReply::read(Reader::new(response.bytes(&mut bytes)))? != expected
+    {
+        return Err(Status::BadSize);
+    }
     files.finish_binding()
 }
 
@@ -73,6 +81,12 @@ fn release(files: &Files, key: OpenKey) -> Result<(), Status> {
     }
     Err(Status::BadSize)
 }
+fn cancel(files: &Files, key: OpenKey) -> Result<LockReply, Status> {
+    let mut request = Writer::new();
+    proto_fs::write_lock_key(Method::LockCancel, key, &mut request)?;
+    send(files, &request)
+}
+
 fn command(files: &Files, wire: LockStart) -> Result<LockReply, Status> {
     let mut start = Writer::new();
     wire.write(&mut start)?;
@@ -260,6 +274,21 @@ pub extern "C" fn ram_lock_commands(pid: i32) -> i32 {
         if response.words[0] as u32 != proto_fs::PERMISSION {
             return Err(-49);
         }
+        let mut wrong_cancel = Writer::new();
+        proto_fs::write_lock_key(
+            Method::LockCancel,
+            OpenKey {
+                slot: 33,
+                generation: 100,
+            },
+            &mut wrong_cancel,
+        )
+        .map_err(|_| -92)?;
+        let response =
+            Files::send_on(files.sessions().0, wrong_cancel.as_bytes()).map_err(|_| -93)?;
+        if response.words[0] as u32 != proto_fs::PERMISSION {
+            return Err(-94);
+        }
         let mut frame = Writer::new();
         Method::ChangeRelease
             .header()
@@ -296,6 +325,16 @@ pub extern "C" fn ram_lock_commands(pid: i32) -> i32 {
             lock.pid == pid && lock.start == 2 && lock.length == 7 && lock.kind == LockKind::Read
         }) {
             return Err(-22);
+        }
+        // Losing a terminal Cancel reply preserves the complete blocker for replay.
+        let _lost = cancel(&files, wire.key).map_err(|_| -69)?;
+        if cancel(&files, wire.key).map_err(|_| -70)? != conflict {
+            return Err(-71);
+        }
+        let mut saved = Writer::new();
+        proto_fs::write_lock_key(Method::LockQuery, wire.key, &mut saved).map_err(|_| -72)?;
+        if send(&files, &saved).map_err(|_| -73)? != conflict {
+            return Err(-74);
         }
         release(&files, wire.key).map_err(|_| -23)?;
         wire.key.generation += 1;
@@ -339,6 +378,64 @@ pub extern "C" fn ram_lock_commands(pid: i32) -> i32 {
             return Err(-37);
         }
         release(&files, wire.key).map_err(|_| -38)?;
+        // Cancel before admission fences a late Start without losing a live alias.
+        let cancelled_wire = LockStart {
+            key: OpenKey {
+                slot: 34,
+                generation: 80,
+            },
+            command: LockCommand::GetOfd,
+            kind: LockKind::Write,
+            ..wire
+        };
+        let absent = cancel(&files, cancelled_wire.key).map_err(|_| -75)?;
+        if absent.phase != LockPhase::Complete || absent.result != proto_fs::LOCK_CANCELLED {
+            return Err(-76);
+        }
+        let mut late = Writer::new();
+        cancelled_wire.write(&mut late).map_err(|_| -77)?;
+        if send(&files, &late) != Err(Status::Unknown(proto_fs::OPEN_RETIRED)) {
+            return Err(-78);
+        }
+        // An admitted cancellation remains readable until a separately confirmed Release.
+        let admitted = LockStart {
+            key: OpenKey {
+                slot: 35,
+                generation: 80,
+            },
+            ..cancelled_wire
+        };
+        let mut start = Writer::new();
+        admitted.write(&mut start).map_err(|_| -79)?;
+        send(&files, &start).map_err(|_| -80)?;
+        let mut outcome = cancel(&files, admitted.key).map_err(|_| -81)?;
+        for _ in 0..16384 {
+            if outcome.phase == LockPhase::Complete {
+                break;
+            }
+            rt::sys::yield_now().map_err(|_| -82)?;
+            outcome = cancel(&files, admitted.key).map_err(|_| -83)?;
+        }
+        if outcome.phase != LockPhase::Complete
+            || !matches!(outcome.result, 0 | proto_fs::LOCK_CANCELLED)
+            || outcome.blocker.is_some()
+        {
+            return Err(-84);
+        }
+        if cancel(&files, admitted.key).map_err(|_| -85)? != outcome
+            || custody(&parent, pid).map_err(|_| -86)? != (baseline.0 + 1, baseline.1 + 1)
+        {
+            return Err(-87);
+        }
+        release(&files, admitted.key).map_err(|_| -88)?;
+        release(&files, admitted.key).map_err(|_| -89)?;
+        if custody(&parent, pid).map_err(|_| -90)? != (baseline.0, baseline.1 + 1) {
+            return Err(-91);
+        }
+        rt::println!(
+            "RAM native lock cancel: retained canonical blocker, lost reply, absent Start fence and separate Release ok, ticks={}",
+            rt::time::now().saturating_sub(began)
+        );
         // Completed answers retain all sixteen prepaid cells without active work.
         for slot in 32..48 {
             let wire = LockStart {

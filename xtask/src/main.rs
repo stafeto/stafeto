@@ -3228,9 +3228,13 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
     )?;
     qemu::expect_marker(
         &outcome,
+        "RAM native lock cancel: retained canonical blocker, lost reply, absent Start fence and separate Release ok",
+    )?;
+    qemu::expect_marker(
+        &outcome,
         "RAM native lock departure: sixteen held outcomes and genuine paid label return without another RAM request ok",
     )?;
-    for kind in [49, 50, 51, 52, 66] {
+    for kind in [49, 50, 51, 52, 53, 66] {
         if !steps
             .iter()
             .any(|(measured, ticks, _)| *measured == kind && *ticks != 0)

@@ -60,7 +60,10 @@ fn validate_key(key: OpenKey) -> Result<(), Status> {
 
 pub fn write_lock_key(method: Method, key: OpenKey, out: &mut Writer) -> Result<(), Status> {
     validate_key(key)?;
-    if !matches!(method, Method::LockQuery | Method::LockRelease) {
+    if !matches!(
+        method,
+        Method::LockQuery | Method::LockRelease | Method::LockCancel
+    ) {
         return Err(Status::from_code(INVALID_ARGUMENT));
     }
     method.header().write(out)?;
@@ -158,7 +161,8 @@ pub struct LockReply {
     pub blocker: Option<LockBlocker>,
 }
 impl LockReply {
-    fn validate(self) -> Result<(), Status> {
+    /// Validate an already decoded immutable reply without another wire buffer.
+    pub fn validate(self) -> Result<(), Status> {
         if self.phase == LockPhase::Pending && (self.result != 0 || self.blocker.is_some())
             || self.result != 0 && self.blocker.is_some()
             || self.blocker.is_some_and(|b| {
@@ -258,7 +262,7 @@ mod tests {
             })
             .is_err()
         );
-        for method in [Method::LockQuery, Method::LockRelease] {
+        for method in [Method::LockQuery, Method::LockRelease, Method::LockCancel] {
             let mut out = Writer::new();
             write_lock_key(method, request().key, &mut out).unwrap();
             let mut input = Reader::new(out.as_bytes());
@@ -310,6 +314,7 @@ mod tests {
             (50, Method::LockStart),
             (51, Method::LockQuery),
             (52, Method::LockRelease),
+            (53, Method::LockCancel),
         ] {
             assert_eq!(Method::from_number(number), Some(method));
             assert!(crate::METHODS.contains(&number));

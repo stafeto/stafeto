@@ -105,6 +105,31 @@ pub fn release(
     Ok(cancel)
 }
 
+/// Cancellation preserves a repeatable canonical outcome until explicit Release.
+/// The caller cancels the active actor only when the returned flag is true.
+pub fn cancel(
+    queue: &mut Queue,
+    fds: &mut Fds,
+    place: usize,
+    owner: u64,
+    key: OpenKey,
+) -> Result<(LockReply, bool), u32> {
+    validate_key(key)?;
+    let id = queue
+        .occupied(place, owner, key.slot)?
+        .filter(|id| id.key() == key);
+    fds.open_watermarks[key.slot as usize] =
+        fds.open_watermarks[key.slot as usize].max(key.generation);
+    let Some(id) = id else {
+        return Ok((reply(Err(super::actor::Error::Cancelled)), false));
+    };
+    let (_, phase, _) = queue.snapshot(id)?;
+    if phase == super::jobs::Phase::Queued {
+        queue.complete_queued(id, reply(Err(super::actor::Error::Cancelled)))?;
+    }
+    Ok((queue.query(id)?, phase == super::jobs::Phase::Active))
+}
+
 fn validate_key(key: OpenKey) -> Result<(), u32> {
     key.validate()?;
     if !(32..48).contains(&key.slot) {
@@ -587,5 +612,142 @@ mod tests {
             Ok(false)
         );
         assert!(!queue.retains(1, 41));
+    }
+    #[test]
+    fn cancel_before_start_fences_generation_without_custody_or_effect() {
+        let mut ram = Ram::default();
+        let (mut fds, wire) = fixture(&mut ram);
+        let mut queue = queue();
+        let cancelled = reply(Err(Error::Cancelled));
+        assert_eq!(
+            cancel(&mut queue, &mut fds, 1, 41, wire.key),
+            Ok((cancelled, false))
+        );
+        assert_eq!(
+            cancel(&mut queue, &mut fds, 1, 41, wire.key),
+            Ok((cancelled, false))
+        );
+        assert_eq!(queue.retained(), 0);
+        assert_eq!(
+            start(&mut queue, &mut ram, &mut fds, 1, 41, wire),
+            Err(proto_fs::OPEN_RETIRED)
+        );
+        let fresh = LockStart {
+            key: OpenKey {
+                generation: 2,
+                ..wire.key
+            },
+            ..wire
+        };
+        start(&mut queue, &mut ram, &mut fds, 1, 41, fresh).unwrap();
+        assert_eq!(
+            cancel(&mut queue, &mut fds, 1, 41, wire.key),
+            Ok((cancelled, false))
+        );
+        assert_eq!(
+            query(&queue, &fds, 1, 41, fresh.key).unwrap().phase,
+            LockPhase::Pending
+        );
+        release(&mut queue, &mut ram, &mut fds, 1, 41, fresh.key).unwrap();
+    }
+
+    #[test]
+    fn queued_cancel_retains_repeatable_outcome_until_acknowledged_release() {
+        let mut ram = Ram::default();
+        let (mut fds, wire) = fixture(&mut ram);
+        let mut queue = queue();
+        start(&mut queue, &mut ram, &mut fds, 1, 41, wire).unwrap();
+        let cancelled = reply(Err(Error::Cancelled));
+        assert_eq!(
+            cancel(&mut queue, &mut fds, 1, 41, wire.key),
+            Ok((cancelled, false))
+        );
+        assert_eq!(queue.retained(), 1);
+        assert!(!queue.has_work());
+        assert!(queue.next_ready().is_none());
+        assert_eq!(query(&queue, &fds, 1, 41, wire.key), Ok(cancelled));
+        assert_eq!(
+            cancel(&mut queue, &mut fds, 1, 41, wire.key),
+            Ok((cancelled, false))
+        );
+        assert_eq!(
+            start(&mut queue, &mut ram, &mut fds, 1, 41, wire),
+            Ok(cancelled)
+        );
+        assert_eq!(
+            release(&mut queue, &mut ram, &mut fds, 1, 41, wire.key),
+            Ok(false)
+        );
+        assert_eq!(queue.retained(), 0);
+    }
+
+    #[test]
+    fn completed_query_keeps_blocker_when_cancel_races_after_pending_observation() {
+        let mut ram = Ram::default();
+        let (mut fds, wire) = fixture(&mut ram);
+        let mut queue = queue();
+        let pending = start(&mut queue, &mut ram, &mut fds, 1, 41, wire).unwrap();
+        assert_eq!(pending.phase, LockPhase::Pending);
+        let id = queue.occupied(1, 41, 32).unwrap().unwrap();
+        let terminal = LockReply {
+            phase: LockPhase::Complete,
+            result: 0,
+            blocker: Some(proto_fs::LockBlocker {
+                kind: LockKind::Write,
+                start: 7,
+                length: 11,
+                pid: -1,
+            }),
+        };
+        queue.complete_queued(id, terminal).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                cancel(&mut queue, &mut fds, 1, 41, wire.key),
+                Ok((terminal, false))
+            );
+            assert_eq!(query(&queue, &fds, 1, 41, wire.key), Ok(terminal));
+            assert_eq!(queue.retained(), 1);
+        }
+        release(&mut queue, &mut ram, &mut fds, 1, 41, wire.key).unwrap();
+        assert_eq!(queue.retained(), 0);
+    }
+
+    #[test]
+    fn active_cancel_keeps_canonical_actor_outcome_until_explicit_release() {
+        let mut ram = Ram::default();
+        let (mut fds, wire) = fixture(&mut ram);
+        let mut queue = queue();
+        let mut service = service();
+        start(&mut queue, &mut ram, &mut fds, 1, 41, wire).unwrap();
+        let id = queue.occupied(1, 41, 32).unwrap().unwrap();
+        begin(&mut queue, &mut service, &mut ram, id, Some(&fds));
+        let (pending, active) = cancel(&mut queue, &mut fds, 1, 41, wire.key).unwrap();
+        assert!(active);
+        assert_eq!(pending.phase, LockPhase::Pending);
+        service.cancel();
+        for _ in 0..512 {
+            let (storage, descriptions) = ram.lock_parts();
+            let progress =
+                service.step_with_owners(storage, |_| true, |token| descriptions.live(token));
+            assert!(progress.visited <= 8);
+            if let Some(result) = progress.completed {
+                assert_eq!(result, Err(Error::Cancelled));
+                assert!(!finish(&mut queue, &mut ram, result));
+                break;
+            }
+        }
+        let terminal = reply(Err(Error::Cancelled));
+        assert_eq!(query(&queue, &fds, 1, 41, wire.key), Ok(terminal));
+        assert_eq!(queue.retained(), 1);
+        assert!(!queue.has_work());
+        assert_eq!(
+            cancel(&mut queue, &mut fds, 1, 41, wire.key),
+            Ok((terminal, false))
+        );
+        assert_eq!(
+            release(&mut queue, &mut ram, &mut fds, 1, 41, wire.key),
+            Ok(false)
+        );
+        assert_eq!(queue.retained(), 0);
     }
 }
