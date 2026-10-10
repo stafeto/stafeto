@@ -137,6 +137,23 @@ impl Recovery {
 
 pub type Snapshot = ControlSnapshot<Recovery>;
 impl PosixFs {
+    /// A valid main-stack jump locally abandons exact owner frames, once.
+    /// Complete receipts survive; no transport or capability is touched here.
+    pub fn mark_control_jump(&mut self, owner: OwnerToken, target: Frame) {
+        let mut tokens = [None; posix_fd::JOBS_MAX];
+        for (index, token) in self.control_tokens().enumerate() {
+            tokens[index] = Some(token);
+        }
+        for token in tokens.into_iter().flatten() {
+            if let Ok(snapshot) = self.control_snapshot(token)
+                && snapshot.owner == Some(owner)
+                && nested(snapshot.recovery.frame(), target)
+            {
+                let _ = self.descriptors.abandon_control(token);
+            }
+        }
+    }
+
     pub fn control_tokens(&self) -> impl Iterator<Item = ControlToken> + '_ {
         self.descriptors.control_tokens()
     }

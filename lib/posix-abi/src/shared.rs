@@ -211,6 +211,33 @@ pub fn abandon_holds() {
     }
 }
 
+/// The assembly longjmp keeps kernel entries deferred until its restored SP.
+/// Preparation also prevents synchronous delivery from FILES_LOCK's unlock.
+pub fn jump_mark(target_sp: u64) {
+    // SAFETY: a published current Block lives through this callback.
+    let Some(block) = (unsafe { posix_thread::block().as_ref() }) else {
+        return;
+    };
+    let preparation = posix_sync::DeliveryPreparation::begin(block);
+    if let Some(owner) =
+        crate::relibc::jump_owner().and_then(|owner| posix_fs::change::OwnerToken::new(owner).ok())
+    {
+        let _ = process_state(|files| {
+            files.mark_control_jump(owner, entries::Frame::main(target_sp));
+            Ok(())
+        });
+    }
+    // Unlock cannot consume this local marker. Give it a real pending entry
+    // before assembly resumes, even when no kernel entry was already pending.
+    if block.flags.load(Ordering::SeqCst) & posix_thread::flag::ENTRY_DEFERRED != 0 {
+        let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
+            block.thread.load(Ordering::Relaxed),
+        ));
+        rt::sys::thread_upcall_request(&thread).expect("jump deferred delivery owner");
+    }
+    drop(preparation);
+}
+
 /// Close of the service's open description `fd`, which the table handed
 /// back to release, outside the lock.
 pub fn release(fd: posix_fs::RamTarget) -> Result<(), i32> {

@@ -96,6 +96,69 @@ fn fixture() -> (PosixFs, EntryToken, RamTarget, control::Input) {
 fn owner() -> OwnerToken {
     OwnerToken::new(1).unwrap()
 }
+
+#[test]
+fn exact_jump_marks_departing_frames_even_before_a_deeper_next_call() {
+    let (mut files, entry, _, input) = fixture();
+    let other = OwnerToken::new(2).unwrap();
+    let (gone, claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(100), input)
+        .unwrap();
+    let (equal, equal_claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(200), input)
+        .unwrap();
+    let (outer, outer_claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(300), input)
+        .unwrap();
+    let (foreign, foreign_claim) = files
+        .begin_lock_record(other, entry, Frame::main(100), input)
+        .unwrap();
+    let (change, change_claim) = files
+        .begin_change_record(owner(), Frame::main(100))
+        .unwrap();
+    files.mark_control_jump(owner(), Frame::main(200));
+    assert!(!files.lock_is_live(claim));
+    assert!(!files.change_is_live(change_claim));
+    assert_eq!(files.lock_snapshot(gone).unwrap().owner, None);
+    assert_eq!(files.change_snapshot(change).unwrap().owner, None);
+    assert!(files.lock_is_live(equal_claim));
+    assert!(files.lock_is_live(outer_claim));
+    assert!(files.lock_is_live(foreign_claim));
+    assert_eq!(files.lock_snapshot(equal).unwrap().owner, Some(owner()));
+    assert_eq!(files.lock_snapshot(outer).unwrap().owner, Some(owner()));
+    assert_eq!(files.lock_snapshot(foreign).unwrap().owner, Some(other));
+    // A deeper call cannot resurrect the departed frame after an explicit mark.
+    assert_eq!(
+        files.pick_lock_cleanup(Some(owner()), Frame::main(50), None),
+        Ok(Some(gone))
+    );
+}
+
+#[test]
+fn jump_keeps_completed_receipt_and_close_reason_until_exact_release() {
+    let (mut files, entry, _, input) = fixture();
+    let (token, claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(100), input)
+        .unwrap();
+    files
+        .complete_lock_record(claim, ControlResult::Value(0), terminal(blocker()))
+        .unwrap();
+    files
+        .begin_lock_cleanup(token, control::CancelReason::Close)
+        .unwrap();
+    files.mark_control_jump(owner(), Frame::main(200));
+    let saved = files.lock_snapshot(token).unwrap();
+    assert_eq!(saved.result, Some(ControlResult::Value(0)));
+    assert_eq!(saved.recovery.lock().unwrap().outcome(), Some(blocker()));
+    assert_eq!(
+        saved.recovery.lock().unwrap().cancel_reason(),
+        control::CancelReason::Close
+    );
+    files.mark_control_jump(owner(), Frame::main(400));
+    assert_eq!(files.lock_snapshot(token).unwrap().result, saved.result);
+    files.finish_lock_cleanup(token).unwrap();
+    assert_eq!(files.lock_snapshot(token), Err(FsError::BadFileDescriptor));
+}
 fn terminal(reply: LockReply) -> control::TerminalReply {
     let mut wire = Writer::new();
     reply.write(&mut wire).unwrap();
