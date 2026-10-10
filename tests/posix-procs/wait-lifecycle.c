@@ -207,3 +207,130 @@ void public_wait_process_exit(void) {
     expect("close process-exit source only after exact debt checks",close(lifecycle_fd),0);
     if(!failures)printf("posix-procs: genuine pending WAIT process exit retires exact paid receipt without rescue close ok\n");
 }
+
+
+/* Genuine arbitrary siglongjmp consumer; Root enables only with accepted pin. */
+extern int wait_lifecycle_complete_success(void);
+static sigjmp_buf lifecycle_jump_target;
+static volatile sig_atomic_t lifecycle_jump_seen;
+static unsigned lifecycle_jump_turn, lifecycle_jump_ready, lifecycle_jump_complete;
+static int lifecycle_jump_error;
+static unsigned long long lifecycle_jump_previous_generation;
+static void lifecycle_jump_signal(int signal) {
+    lifecycle_jump_seen=signal;
+    siglongjmp(lifecycle_jump_target,1);
+}
+void wait_lifecycle_jump_receive_stage(void) {
+    __atomic_store_n(&lifecycle_jump_ready,__atomic_load_n(&lifecycle_jump_turn,__ATOMIC_ACQUIRE),__ATOMIC_RELEASE);
+}
+void wait_lifecycle_jump_complete_stage(void) {
+    __atomic_store_n(&lifecycle_jump_complete,1,__ATOMIC_RELEASE);
+    /* A distinct sender supplies the real signal after canonical server success. */
+    while(lifecycle_jump_seen!=SIGUSR1)sched_yield();
+}
+__attribute__((noinline)) static int lifecycle_deeper_wait(void) {
+    volatile unsigned char workspace[256];
+    for(unsigned i=0;i<sizeof workspace;i++)workspace[i]=(unsigned char)i;
+    struct flock lock={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_len=1};
+    int result=fcntl(lifecycle_fd,7,&lock);
+    /* Keep this genuine deeper caller frame live across the WAIT operation. */
+    if(workspace[17]!=17)return -2;
+    return result;
+}
+static void *lifecycle_jump_worker(void *ignored) {
+    (void)ignored;
+    pthread_attr_t attr;void *base=NULL;size_t size=0;
+    if(pthread_getattr_np(pthread_self(),&attr)||pthread_attr_getstack(&attr,&base,&size)||pthread_attr_destroy(&attr)||size!=PTHREAD_STACK_MIN)return (void *)101;
+    uintptr_t here;__asm__ volatile("mov %0, sp":"=r"(here));
+    lifecycle_base=(uintptr_t)base;lifecycle_top=lifecycle_base+size;lifecycle_painted=here-512;
+    if(lifecycle_painted<lifecycle_base||here>lifecycle_top)return (void *)102;
+    for(uintptr_t p=lifecycle_base;p<lifecycle_painted;p++)*(volatile unsigned char *)p=0xa7;
+    for(;;){
+        unsigned turn=__atomic_load_n(&lifecycle_jump_turn,__ATOMIC_ACQUIRE);
+        if(turn>=21)break;
+        lifecycle_jump_seen=0;
+        __atomic_store_n(&lifecycle_ready,0,__ATOMIC_RELEASE);
+        __atomic_store_n(&lifecycle_jump_ready,UINT_MAX,__ATOMIC_RELEASE);
+        if(sigsetjmp(lifecycle_jump_target,1)==0){
+            if(wait_lifecycle_arm(turn==20?5:4)){__atomic_store_n(&lifecycle_jump_error,103,__ATOMIC_RELEASE);return (void *)103;}
+            (void)lifecycle_deeper_wait();
+            __atomic_store_n(&lifecycle_jump_error,104,__ATOMIC_RELEASE);return (void *)104;
+        }
+        /* Automatic turn is reread: only globals survive modification at jump. */
+        turn=__atomic_load_n(&lifecycle_jump_turn,__ATOMIC_ACQUIRE);
+        if(lifecycle_jump_seen!=SIGUSR1){__atomic_store_n(&lifecycle_jump_error,105,__ATOMIC_RELEASE);return (void *)105;}
+        unsigned long long generation=wait_lifecycle_generation();
+        if(generation<=lifecycle_jump_previous_generation){__atomic_store_n(&lifecycle_jump_error,106,__ATOMIC_RELEASE);return (void *)106;}
+        lifecycle_jump_previous_generation=generation;
+        if(turn==20&&wait_lifecycle_complete_success()!=1){__atomic_store_n(&lifecycle_jump_error,107,__ATOMIC_RELEASE);return (void *)107;}
+        int recovered=lifecycle_collect();
+        if(recovered!=1){__atomic_store_n(&lifecycle_jump_error,108,__ATOMIC_RELEASE);return (void *)108;}
+        if(fcntl(lifecycle_fd,F_GETFD)<0){__atomic_store_n(&lifecycle_jump_error,109,__ATOMIC_RELEASE);return (void *)109;}
+        lifecycle_peak=lifecycle_stack_peak();
+        if(lifecycle_peak==0||lifecycle_peak>16384){__atomic_store_n(&lifecycle_jump_error,110,__ATOMIC_RELEASE);return (void *)110;}
+        printf("posix-procs: WAIT arbitrary jump same owner turn %u full generation %llu stack %zu bytes\n",turn,generation,lifecycle_peak);
+        wait_lifecycle_disarm();
+        __atomic_store_n(&lifecycle_jump_turn,turn+1,__ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+static int lifecycle_jump_stage(unsigned turn) {
+    struct timespec tick={0,1000000};
+    for(unsigned n=0;n<10000;n++){
+        if(__atomic_load_n(&lifecycle_jump_ready,__ATOMIC_ACQUIRE)==turn)return 1;
+        if(__atomic_load_n(&lifecycle_jump_error,__ATOMIC_ACQUIRE))return 0;
+        nanosleep(&tick,NULL);
+    }return 0;
+}
+/* Root calls only after accepted arbitrary-jump callback + WAIT consumer. */
+void public_wait_arbitrary_jumps(void) {
+    lifecycle_fd=open("/tmp/public-wait-arbitrary-jump",O_CREAT|O_RDWR,0666);
+    expect("open arbitrary jump stable source",lifecycle_fd>=0,1);if(lifecycle_fd<0)return;
+    int commands[2],replies[2];if(pipe(commands)||pipe(replies)){expect("arbitrary jump pipes",0,1);close(lifecycle_fd);return;}
+    pid_t parent=getpid(),holder=fork();expect("fork arbitrary jump real blocker",holder>=0,1);
+    if(holder==0){close(commands[1]);close(replies[0]);char command;
+        while(read(commands[0],&command,1)==1){
+            if(command=='Q')_exit(0);
+            if(command=='C'){
+                struct flock get={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_len=1};
+                char answer=fcntl(lifecycle_fd,F_GETLK,&get)==0&&get.l_type==F_WRLCK&&get.l_pid==parent?'C':'X';
+                if(write(replies[1],&answer,1)!=1)_exit(111);
+                continue;
+            }
+            struct flock lock={.l_type=command=='L'?F_WRLCK:F_UNLCK,.l_whence=SEEK_SET,.l_len=1};
+            if(fcntl(lifecycle_fd,F_SETLK,&lock)||write(replies[1],&command,1)!=1)_exit(112);
+        }_exit(113);
+    }
+    close(commands[0]);close(replies[1]);if(holder<0){close(commands[1]);close(replies[0]);close(lifecycle_fd);return;}
+    expect("arbitrary jump genuine blocker stays held",wait_holder_exchange(commands[1],replies[0],'L'),1);
+    struct sigaction action={0},previous;action.sa_handler=lifecycle_jump_signal;sigemptyset(&action.sa_mask);
+    expect("install genuine arbitrary jump handler",sigaction(SIGUSR1,&action,&previous),0);
+    lifecycle_jump_seen=0;lifecycle_jump_error=0;lifecycle_jump_previous_generation=0;
+    __atomic_store_n(&lifecycle_jump_turn,0,__ATOMIC_RELEASE);
+    __atomic_store_n(&lifecycle_jump_ready,UINT_MAX,__ATOMIC_RELEASE);
+    __atomic_store_n(&lifecycle_jump_complete,0,__ATOMIC_RELEASE);
+    pthread_attr_t attr;expect("jump worker attrs",pthread_attr_init(&attr),0);expect("jump actual64K",pthread_attr_setstacksize(&attr,PTHREAD_STACK_MIN),0);
+    pthread_t worker;int created=pthread_create(&worker,&attr,lifecycle_jump_worker,NULL);expect("create same owner jump worker",created,0);
+    if(!created){
+        for(unsigned turn=0;turn<21;turn++){
+            int stage=lifecycle_jump_stage(turn);expect("same owner deeper WAIT reached real stage",stage,1);if(!stage)break;
+            struct timespec tick={0,1000000};int waiting=0;
+            for(unsigned n=0;n<10000;n++){waiting=wait_lifecycle_receiver_waiting();if(waiting)break;nanosleep(&tick,NULL);}
+            expect("jump from actual blocked private Receive",waiting,1);
+            if(turn==20){
+                expect("unlock before canonical success jump",wait_holder_exchange(commands[1],replies[0],'U'),1);
+                unsigned ready=0;for(unsigned n=0;n<10000;n++){ready=__atomic_load_n(&lifecycle_jump_complete,__ATOMIC_ACQUIRE);if(ready)break;nanosleep(&tick,NULL);}
+                expect("strict decoded Complete precedes jump",ready,1);
+            }
+            expect("actual sibling pthread_kill causes arbitrary jump",pthread_kill(worker,SIGUSR1),0);
+        }
+        void *result=NULL;expect("join live owner after21 jumps",pthread_join(worker,&result),0);expect("same owner jump cleanup marker",(int)(uintptr_t)result,0);expect("same owner no cleanup error",__atomic_load_n(&lifecycle_jump_error,__ATOMIC_ACQUIRE),0);
+        expect("more than16 exact jump cycles completed",__atomic_load_n(&lifecycle_jump_turn,__ATOMIC_ACQUIRE),21);
+        expect("other PID observes success survived jump cleanup",wait_holder_exchange(commands[1],replies[0],'C'),1);
+    }
+    wait_lifecycle_disarm();expect("restore arbitrary jump handler",sigaction(SIGUSR1,&previous,NULL),0);expect("destroy jump attrs",pthread_attr_destroy(&attr),0);
+    char quit='Q';expect("stop jump holder after debt checks",write(commands[1],&quit,1),1);close(commands[1]);close(replies[0]);lifecycle_reap(holder);
+    struct flock unlock={.l_type=F_UNLCK,.l_whence=SEEK_SET,.l_len=1};expect("unlock preserved canonical success after assertions",fcntl(lifecycle_fd,F_SETLK,&unlock),0);
+    expect("close unchanged jump source after all exact debts",close(lifecycle_fd),0);
+    if(!failures)printf("posix-procs: genuine21 arbitrary WAIT jumps same owner and canonical success preserve exact debts ok\n");
+}

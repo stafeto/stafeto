@@ -14,9 +14,23 @@ static RAW: AtomicU64 = AtomicU64::new(0);
 unsafe extern "C" {
     fn wait_lifecycle_stage();
     fn wait_lifecycle_exit();
+    fn wait_lifecycle_jump_receive_stage();
+    fn wait_lifecycle_jump_complete_stage();
 }
 fn hook(phase: WaitProbe, token: WaitToken) -> bool {
-    if phase != WaitProbe::Receive || !ARMED.swap(false, Ordering::AcqRel) {
+    let mode = MODE.load(Ordering::Acquire);
+    if mode == 5 && phase == WaitProbe::Complete && ARMED.swap(false, Ordering::AcqRel) {
+        // SAFETY: strict Complete is decoded and the send scope has ended.
+        unsafe { wait_lifecycle_jump_complete_stage() };
+        return false;
+    }
+    if phase != WaitProbe::Receive
+        || !(if mode == 5 {
+            ARMED.load(Ordering::Acquire)
+        } else {
+            ARMED.swap(false, Ordering::AcqRel)
+        })
+    {
         return false;
     }
     let saved = posix_abi::shared::with_files(|files| {
@@ -30,6 +44,10 @@ fn hook(phase: WaitProbe, token: WaitToken) -> bool {
     }
     // SAFETY: only the dedicated C worker invokes this post-Arm observation.
     unsafe { wait_lifecycle_stage() };
+    if mode == 4 || mode == 5 {
+        // SAFETY: only the jump worker uses this post-Arm observation.
+        unsafe { wait_lifecycle_jump_receive_stage() };
+    }
     if MODE.load(Ordering::Acquire) == 2 {
         // SAFETY: no FILES_LOCK or temporary Arm transfer ownership is held.
         unsafe { wait_lifecycle_exit() };
@@ -333,4 +351,13 @@ pub extern "C" fn wait_process_ticks() -> i32 {
         Ok(())
     })();
     result.err().unwrap_or(0)
+}
+
+/// Read the exact server success before ordinary entries perform cleanup.
+#[unsafe(no_mangle)]
+pub extern "C" fn wait_lifecycle_complete_success() -> i32 {
+    match query_old() {
+        Ok(Ok(reply)) if reply.phase == proto_fs::WaitPhase::Complete && reply.result == 0 => 1,
+        _ => -65,
+    }
 }
