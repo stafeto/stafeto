@@ -103,6 +103,12 @@ impl Recovery {
 }
 pub type Snapshot = WaitSnapshot<Recovery>;
 impl PosixFs {
+    /// Capacity is independent from Open, Control and ordinary I/O holds.
+    pub fn wait_place(&self, owner: OwnerToken, current: Frame) -> posix_fd::WaitPlace {
+        self.waits
+            .place(|s| s.owner == Some(owner) && nested(current, s.recovery.frame()))
+    }
+
     pub fn wait_tokens(&self) -> impl Iterator<Item = WaitToken> + '_ {
         self.waits.tokens()
     }

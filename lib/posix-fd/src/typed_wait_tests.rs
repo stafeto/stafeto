@@ -291,3 +291,31 @@ fn initialized_wait_geometry_is_bounded() {
         14096
     );
 }
+
+#[test]
+fn wait_capacity_is_independent_and_protected_owner_cannot_wait_for_itself() {
+    let (mut files, entry, _, control_input) = fixture();
+    let me = owner();
+    let other = OwnerToken::new(2).unwrap();
+    let here = Frame::main(100);
+    assert_eq!(
+        files.wait_place(me, Frame::main(90)),
+        crate::WaitPlace::Free
+    );
+    for _ in 0..crate::WAIT_RECORDS {
+        files.begin_wait_record(me, entry, here, input()).unwrap();
+    }
+    assert_eq!(
+        files.wait_place(me, Frame::main(90)),
+        crate::WaitPlace::Full { own: true }
+    );
+    assert_eq!(
+        files.wait_place(other, Frame::main(90)),
+        crate::WaitPlace::Full { own: false }
+    );
+    assert!(
+        files
+            .begin_lock_record(other, entry, here, control_input)
+            .is_ok()
+    );
+}
