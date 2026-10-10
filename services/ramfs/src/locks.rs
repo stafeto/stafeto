@@ -4,6 +4,8 @@
 //! Byte ranges for advisory file locks. Arithmetic is independent of the
 //! service's paid records and captures SEEK_CUR and SEEK_END before waiting.
 
+pub mod records;
+
 /// The greatest byte offset representable by relibc's off_t.
 pub const OFFSET_MAX: u64 = i64::MAX as u64;
 
