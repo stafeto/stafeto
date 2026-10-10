@@ -164,6 +164,8 @@ impl Session for Live {
     fn cancel(&mut self) -> Result<LockReply, Failure> {
         self.keyed(Method::LockCancel)
     }
+    // Keep Release storage separate from Cancel and Query cleanup turns.
+    #[inline(never)]
     fn release(&mut self) -> Result<(), Failure> {
         let mut request = Writer::new();
         proto_fs::write_lock_key(Method::LockRelease, self.key(), &mut request).map_err(failure)?;
