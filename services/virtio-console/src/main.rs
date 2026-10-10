@@ -639,7 +639,7 @@ impl Driver {
 
     /// WRITE_SOME (5f), as the PL011's driver answers it.
     /// Observe only an existing paid ROOM and a full terminal operation key.
-    fn drain(&mut self, r: &mut Request<'_>) -> Answer {
+    fn drain_request(&mut self, r: &mut Request<'_>) -> Answer {
         if Method::from_number(r.method()) == Some(Method::DrainState) {
             if r.body().finish().is_err() || !r.handles.is_empty() {
                 return Answer::Status(Status::BadSize);
@@ -890,7 +890,7 @@ impl Service<HELD> for Driver {
             Some(Method::Room) => self.room(r),
             Some(
                 Method::DrainStart | Method::DrainTake | Method::DrainRelease | Method::DrainState,
-            ) => self.drain(r),
+            ) => self.drain_request(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => {
                 self.drain();
