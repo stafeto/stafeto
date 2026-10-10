@@ -49,17 +49,25 @@ static int ring_publish(const char *path) {
 static int ring_setup(unsigned index) {
     ring_index = index;
     unsigned actual[11];
-    if (ring_identity((unsigned)getpid(), actual) || actual[0] != (unsigned)getpid() || !actual[1]) return -1;
+    int observed = ring_identity((unsigned)getpid(), actual);
+    if (observed || actual[0] != (unsigned)getpid() || !actual[1]) {
+        printf("posix-procs: ring setup identity index=%u rc=%d errno=%d\n", index, observed, errno);
+        return -1;
+    }
     char path[64]; ring_path(path, sizeof(path), "file", index);
     ring_a = open(path, O_RDWR);
     ring_path(path, sizeof(path), "file", (index + 1) % 16);
     ring_b = open(path, O_RDWR);
-    if (ring_a < 0 || ring_b < 0 || ring_set(ring_a, F_SETLK, F_WRLCK)) return -1;
+    if (ring_a < 0 || ring_b < 0 || ring_set(ring_a, F_SETLK, F_WRLCK)) {
+        printf("posix-procs: ring setup lock index=%u a=%d b=%d errno=%d\n", index, ring_a, ring_b, errno);
+        return -1;
+    }
     struct ring_record record = {.pid = actual[0], .root = actual[2], .generation = actual[3], .phase = 'H'};
     ring_path(path, sizeof(path), "state", index);
     int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0666);
-    if (fd < 0) return -1;
+    if (fd < 0) { printf("posix-procs: ring setup metadata open index=%u errno=%d\n", index, errno); return -1; }
     int ok = fchmod(fd, 0666) == 0 && write(fd, &record, sizeof(record)) == (ssize_t)sizeof(record);
+    if (!ok) printf("posix-procs: ring setup metadata write index=%u errno=%d\n", index, errno);
     close(fd); return ok ? 0 : -1;
 }
 static int ring_wait(void) {
@@ -149,16 +157,16 @@ static int ring_run(unsigned family) {
     if (!family) {
         for (unsigned i = 0; i < 16; ++i) {
             char path[64]; ring_path(path, sizeof(path), "file", i);
-            if (ring_publish(path)) return 1;
+            if (ring_publish(path)) { printf("posix-procs: ring create file index=%u errno=%d\n", i, errno); return 1; }
         }
-        if (ring_publish("/tmp/lock-ring-files-ready")) return 1;
-    } else if (!ring_gate("/tmp/lock-ring-files-ready")) return 1;
+        if (ring_publish("/tmp/lock-ring-files-ready")) { printf("posix-procs: ring create ready errno=%d\n", errno); return 1; }
+    } else if (!ring_gate("/tmp/lock-ring-files-ready")) { printf("posix-procs: ring files-ready timeout family=%u errno=%d\n", family, errno); return 1; }
     struct sigaction action = {0}; action.sa_handler = ring_signal; sigemptyset(&action.sa_mask);
     if (sigaction(SIGUSR1, &action, NULL)) return 1;
     pid_t children[3];
     for (unsigned i = 0; i < 3; ++i) {
         children[i] = fork();
-        if (children[i] < 0) return 1;
+        if (children[i] < 0) { printf("posix-procs: ring fork family=%u child=%u errno=%d\n", family, i, errno); return 1; }
         if (!children[i]) {
             if (ring_setup(4 * family + i + 1)) _exit(123);
             _exit(ring_wait() ? 124 : 0);
@@ -181,8 +189,14 @@ static int ring_dispatch(int argc, char **argv, int *result) {
     if (!strcmp(argv[1], "ring-run")) { *result = ring_run(family); return 1; }
     char *run_argv[] = {"procs-child", "ring-run", argv[2], NULL}, *env[] = {NULL};
     pid_t child = -1; int status = 0;
-    if (posix_spawn(&child, "/bin/procs-child", NULL, NULL, run_argv, env) ||
-        waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) *result = 1;
-    else *result = process_lifetime(child) != 0;
+    int spawned = posix_spawn(&child, "/bin/procs-child", NULL, NULL, run_argv, env);
+    if (spawned) { printf("posix-procs: ring launch spawn family=%u rc=%d errno=%d\n", family, spawned, errno); *result = 1; }
+    else if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) {
+        printf("posix-procs: ring launch child family=%u pid=%d status=%d errno=%d\n", family, child, status, errno); *result = 1;
+    } else {
+        int live = process_lifetime(child);
+        if (live) printf("posix-procs: ring launch dead Page family=%u rc=%d\n", family, live);
+        *result = live != 0;
+    }
     return 1;
 }
