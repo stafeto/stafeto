@@ -30,6 +30,15 @@ pub struct Record {
     private: bool,
 }
 
+impl Record {
+    pub const fn root(self) -> u16 {
+        self.root
+    }
+    pub const fn is_published(self) -> bool {
+        !self.private
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Slot {
     Fresh,
@@ -194,8 +203,17 @@ impl Publish {
         &mut self,
         pool: &mut Pool<N, ROOTS, SHARE>,
     ) -> Result<PublicationProgress, Error> {
+        self.step_limit(pool, PORTION)
+    }
+
+    /// Spend only the caller's remaining portion, capped by PORTION.
+    pub fn step_limit<const N: usize, const ROOTS: usize, const SHARE: usize>(
+        &mut self,
+        pool: &mut Pool<N, ROOTS, SHARE>,
+        limit: usize,
+    ) -> Result<PublicationProgress, Error> {
         let mut visited = 0;
-        while visited < PORTION {
+        while visited < limit.min(PORTION) {
             let Some(cursor) = self.cursor else { break };
             self.cursor = pool.mark_published(cursor)?;
             visited += 1;
@@ -245,6 +263,15 @@ impl Reclaim {
         &mut self,
         pool: &mut Pool<N, ROOTS, SHARE>,
     ) -> Result<Progress, ReclaimFailure> {
+        self.step_limit(pool, PORTION)
+    }
+
+    /// Group cleanup can reserve part of the portion for its own metadata.
+    pub fn step_limit<const N: usize, const ROOTS: usize, const SHARE: usize>(
+        &mut self,
+        pool: &mut Pool<N, ROOTS, SHARE>,
+        limit: usize,
+    ) -> Result<Progress, ReclaimFailure> {
         if let Some(failure) = self.failure {
             return Err(ReclaimFailure {
                 error: failure.error,
@@ -252,7 +279,7 @@ impl Reclaim {
             });
         }
         let mut released = 0;
-        while released < PORTION {
+        while released < limit.min(PORTION) {
             let Some(head) = self.head else { break };
             match pool.release(head) {
                 Ok(next) => self.head = next,

@@ -6,6 +6,7 @@
 
 pub mod budget;
 pub mod groups;
+pub mod preparation;
 pub mod records;
 
 /// The greatest byte offset representable by relibc's off_t.
