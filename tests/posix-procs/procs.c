@@ -794,10 +794,11 @@ extern int files_names_fork_in_flight(void);
 static int names_role(void) {
     int pipes = files_names_pipe();
     if (pipes) { printf("posix-procs: names on a pipe gave %d\n", pipes); return 2; }
-    int forks = files_names_fork_in_flight();
-    if (forks) { printf("posix-procs: fork in the middle of a rename gave %d\n", forks); return 3; }
+    /* Genuine cancellation runs before the synthetic lost-reply hooks. */
     int signals = names_signals();
     if (signals) { printf("posix-procs: a signal in the middle of a rename gave %d\n", signals); return 4; }
+    int forks = files_names_fork_in_flight();
+    if (forks) { printf("posix-procs: fork in the middle of a rename gave %d\n", forks); return 3; }
     return 0;
 }
 #endif

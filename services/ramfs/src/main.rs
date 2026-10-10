@@ -44,17 +44,31 @@ const BASE_METHODS: &[u16] = &[
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 0xfff7,
     0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
-#[cfg(not(feature = "steps"))]
+#[cfg(not(any(
+    feature = "steps",
+    all(feature = "signal-probe", not(feature = "steps"))
+)))]
 const METHODS: &[u16] = BASE_METHODS;
-#[cfg(feature = "steps")]
+#[cfg(any(
+    feature = "steps",
+    all(feature = "signal-probe", not(feature = "steps"))
+))]
 const METHODS: &[u16] = &{
-    let mut methods = [0; BASE_METHODS.len() + 1];
+    let mut methods = [0; BASE_METHODS.len()
+        + cfg!(feature = "steps") as usize
+        + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
         methods[i] = BASE_METHODS[i];
         i += 1;
     }
-    methods[i] = 0xfff5;
+    if cfg!(feature = "steps") {
+        methods[i] = 0xfff5;
+        i += 1;
+    }
+    if cfg!(all(feature = "signal-probe", not(feature = "steps"))) {
+        methods[i] = 0xfff4;
+    }
     methods
 };
 /// Genuine ordinary and image sessions each retain one exact place.
@@ -1481,6 +1495,36 @@ impl Service<0> for Fs {
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
+        }
+        #[cfg(all(feature = "signal-probe", not(feature = "steps")))]
+        if r.method() == 0xfff4 {
+            if !r.handles.is_empty() || r.body().finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            if s.data.binding.snapshot_ref().is_none() {
+                return status(proto_fs::PERMISSION);
+            }
+            // A private timer wakes this fixture while ordinary requests stay queued.
+            let channel = match sys::channel_create(1) {
+                Ok(channel) => channel,
+                Err(error) => return Answer::Status(Status::Kernel(error)),
+            };
+            let timer = match sys::timer_create(&channel, self.level) {
+                Ok(timer) => timer,
+                Err(error) => return Answer::Status(Status::Kernel(error)),
+            };
+            let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(20_000_000);
+            if let Err(error) = sys::timer_set(&timer, deadline) {
+                return Answer::Status(Status::Kernel(error));
+            }
+            if let Some(pending) = r.defer()
+                && pending
+                    .answer(&proto_wire::reply(Status::Ok), Outgoing::new())
+                    .is_ok()
+            {
+                let _ = sys::receive(&channel);
+            }
+            return Answer::Deferred;
         }
         #[cfg(feature = "steps")]
         if r.method() == 0xfff5 {

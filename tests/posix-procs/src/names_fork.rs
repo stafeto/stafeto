@@ -93,3 +93,22 @@ pub extern "C" fn files_names_fork_in_flight() -> i32 {
 pub extern "C" fn files_names_interrupted() -> u32 {
     posix_abi::change::interrupted_requests()
 }
+
+/// Acknowledgement precedes a bounded receive pause in the probe's RAM service.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_names_pause() -> i32 {
+    let Ok(raw) = posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
+        return -1;
+    };
+    let channel = rt::Handle::<rt::handle::Channel>::borrowed(raw);
+    let request = proto_wire::Header::new(0xfff4, proto_fs::VERSION).bytes();
+    let Ok(reply) = rt::sys::send(&channel, &request) else {
+        return -2;
+    };
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() == Ok(0) {
+        0
+    } else {
+        -3
+    }
+}
