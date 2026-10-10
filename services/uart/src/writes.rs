@@ -62,6 +62,11 @@ impl<T> Writes<T> {
         self.places.iter().all(Option::is_none)
     }
 
+    /// The accepted bytes that have not entered the client ring yet.
+    pub fn queued_bytes(&self) -> usize {
+        self.places.iter().flatten().map(|w| w.len).sum()
+    }
+
     /// A write of `bytes`, at most WRITE_MAX of them, from the client of
     /// label `label`, answered through `token`: into `output` at once when
     /// it fits and no write waits, into a place otherwise, refused with
@@ -126,16 +131,40 @@ impl<T> Writes<T> {
             .map(|(_, i)| i)
     }
 
-    /// The client of label `label` went: its writes that wait leave, and
-    /// their tokens go to `drop`.
-    pub fn gone(&mut self, label: u64, mut drop: impl FnMut(T)) {
-        for place in &mut self.places {
-            if place.as_ref().is_some_and(|w| w.label == label)
-                && let Some(w) = place.take()
-            {
-                drop(w.token);
+    /// Remove a departing client's pending writes, preserving their positions
+    /// for captured drains. At most WAITING records are inspected.
+    pub fn gone_before(
+        &mut self,
+        label: u64,
+        mut start: u64,
+        mut drop: impl FnMut(T),
+        mut removed: impl FnMut(u64, usize),
+    ) {
+        let mut visited = [false; WAITING];
+        for _ in 0..WAITING {
+            let Some(i) = (0..WAITING)
+                .filter(|&i| !visited[i])
+                .filter_map(|i| self.places[i].as_ref().map(|w| (w.turn, i)))
+                .min()
+                .map(|(_, i)| i)
+            else {
+                break;
+            };
+            visited[i] = true;
+            let waiting = self.places[i].as_ref().expect("a pending write");
+            if waiting.label == label {
+                let waiting = self.places[i].take().expect("a pending write");
+                removed(start, waiting.len);
+                drop(waiting.token);
+            } else {
+                start = start.wrapping_add(waiting.len as u64);
             }
         }
+    }
+
+    /// The client went; callers without observers need only its reply tokens.
+    pub fn gone(&mut self, label: u64, drop: impl FnMut(T)) {
+        self.gone_before(label, 0, drop, |_, _| {});
     }
 }
 
@@ -149,6 +178,16 @@ impl<T> Default for Writes<T> {
 struct Room<H> {
     label: u64,
     notify: H,
+    armed: bool,
+    drain: Option<Drain>,
+    last_released: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Drain {
+    key: u64,
+    target: u64,
+    ready: bool,
     armed: bool,
 }
 
@@ -194,6 +233,8 @@ impl<H> Rooms<H> {
                     label,
                     notify,
                     armed: false,
+                    drain: None,
+                    last_released: 0,
                 });
                 i
             }
@@ -219,6 +260,104 @@ impl<H> Rooms<H> {
         }
     }
 
+    /// Capture a prefix with the existing terminal operation's full key.
+    /// A replay of that key observes the same prefix, even after completion.
+    pub fn drain_begin(&mut self, label: u64, key: u64, capture: u64) -> Option<bool> {
+        let room = self
+            .places
+            .iter_mut()
+            .flatten()
+            .find(|r| r.label == label)?;
+        if key == 0 || room.last_released == key {
+            return None;
+        }
+        if let Some(drain) = room.drain.as_mut() {
+            if drain.key == key {
+                drain.armed = !drain.ready;
+                return Some(drain.ready);
+            }
+            if !drain.ready {
+                return None;
+            }
+        }
+        room.drain = Some(Drain {
+            key,
+            target: capture,
+            ready: false,
+            armed: true,
+        });
+        Some(false)
+    }
+
+    /// Poll only this exact operation; notification bits carry no authority.
+    pub fn drain(&mut self, label: u64, key: u64) -> Option<bool> {
+        let room = self
+            .places
+            .iter_mut()
+            .flatten()
+            .find(|r| r.label == label)?;
+        let drain = room.drain.as_mut().filter(|d| d.key == key)?;
+        drain.armed = !drain.ready;
+        Some(drain.ready)
+    }
+
+    /// A removed queued write belongs to each captured prefix containing it.
+    /// Both distances are bounded by the ring plus the four pending records.
+    pub fn drain_discard(&mut self, submitted: u64, start: u64, len: usize) {
+        let start = start.wrapping_sub(submitted);
+        for room in self.places.iter_mut().flatten() {
+            if let Some(drain) = room.drain.as_mut()
+                && !drain.ready
+                && start < drain.target.wrapping_sub(submitted)
+            {
+                drain.target = drain.target.wrapping_sub(len as u64);
+            }
+        }
+    }
+
+    /// The nearest unfinished target. Every live distance fits the fixed queues.
+    pub fn drain_target(&self, submitted: u64) -> Option<u64> {
+        self.places
+            .iter()
+            .flatten()
+            .filter_map(|r| r.drain)
+            .filter(|d| !d.ready)
+            .map(|d| d.target)
+            .min_by_key(|target| target.wrapping_sub(submitted))
+    }
+
+    /// Latch physical completion before any newer hardware loads are allowed.
+    pub fn drain_complete(&mut self, submitted: u64, mut tell: impl FnMut(&H)) {
+        for room in self.places.iter_mut().flatten() {
+            if let Some(drain) = room.drain.as_mut()
+                && drain.target == submitted
+                && !drain.ready
+            {
+                drain.ready = true;
+                if drain.armed {
+                    drain.armed = false;
+                    tell(&room.notify);
+                }
+            }
+        }
+    }
+
+    /// Remove this exact observation while retaining the paid ROOM handle.
+    /// Retain one full key so a lost short reply can be retried without
+    /// removing a newer observation or reopening the released operation.
+    pub fn drain_release(&mut self, label: u64, key: u64) -> bool {
+        let Some(room) = self.places.iter_mut().flatten().find(|r| r.label == label) else {
+            return false;
+        };
+        if room.drain.is_some_and(|d| d.key == key) {
+            room.drain = None;
+            room.last_released = key;
+            true
+        } else {
+            key != 0 && room.last_released == key
+        }
+    }
+
     /// The client of `label` went: its place goes with its handle.
     pub fn gone(&mut self, label: u64) {
         for place in &mut self.places {
@@ -240,6 +379,104 @@ mod tests {
     use super::*;
     use crate::output::TX_RING;
     use std::vec::Vec;
+
+    #[test]
+    fn drain_uses_exact_operation_identity_and_sticky_completion() {
+        let mut rooms = Rooms::new();
+        rooms.room(0x100000001, Some(7), true);
+        assert_eq!(rooms.drain_begin(1, 90, 0), None);
+        assert_eq!(rooms.drain_begin(0x100000001, 90, 0), Some(false));
+        assert_eq!(rooms.drain_begin(0x100000001, 91, 0), None);
+        let mut told = Vec::new();
+        rooms.drain_complete(0, |h| told.push(*h));
+        rooms.drain_complete(0, |h| told.push(*h));
+        assert_eq!(told, [7]);
+        assert_eq!(rooms.drain(0x100000001, 90), Some(true));
+        assert_eq!(rooms.drain_target(u64::MAX), None);
+        // Another drain at the same byte position cannot be polled by old key.
+        assert_eq!(rooms.drain_begin(0x100000001, 91, 0), Some(false));
+        assert_eq!(rooms.drain(0x100000001, 90), None);
+        assert!(!rooms.drain_release(0x100000001, 90));
+        assert!(rooms.drain_release(0x100000001, 91));
+        assert_eq!(rooms.room(0x100000001, None, false), Armed::Armed);
+    }
+
+    #[test]
+    fn released_drain_replays_a_lost_reply_without_touching_new_observers() {
+        let mut rooms = Rooms::new();
+        let old = 0x100000007;
+        let new = 0x200000007;
+        let other = 0x300000007;
+        rooms.room(1, Some(11), true);
+        rooms.room(2, Some(22), true);
+        assert_eq!(rooms.drain_begin(1, old, 3), Some(false));
+        assert_eq!(rooms.drain_begin(2, other, 10), Some(false));
+        rooms.drain_complete(3, |_| {});
+        // The backend accepted RELEASE, but its first short reply was lost.
+        assert!(rooms.drain_release(1, old));
+        assert!(rooms.drain_release(1, old));
+        assert_eq!(rooms.drain_begin(1, old, 100), None);
+        assert_eq!(rooms.drain_begin(1, new, 7), Some(false));
+        // A delayed replay cannot release a different full-generation key.
+        assert!(rooms.drain_release(1, old));
+        assert_eq!(rooms.drain(1, new), Some(false));
+        assert_eq!(rooms.drain_target(3), Some(7));
+        assert_eq!(rooms.drain(2, other), Some(false));
+        assert!(!rooms.drain_release(2, old));
+        assert!(!rooms.drain_release(1, other));
+        assert!(!rooms.drain_release(1, 0));
+        assert_eq!(rooms.drain_begin(1, old, 100), None);
+        assert!(rooms.drain_release(1, new));
+        assert!(rooms.drain_release(1, new));
+        assert!(!rooms.drain_release(1, old));
+        rooms.gone(1);
+        rooms.room(1, Some(33), true);
+        assert!(!rooms.drain_release(1, new));
+        assert_eq!(rooms.drain_begin(1, new, 11), Some(false));
+    }
+
+    #[test]
+    fn drain_frontiers_cross_wrap_and_discard_only_captured_queued_bytes() {
+        let mut rooms = Rooms::new();
+        rooms.room(1, Some(11), true);
+        rooms.room(2, Some(12), true);
+        let submitted = u64::MAX - 3;
+        rooms.drain_begin(1, 101, submitted.wrapping_add(6));
+        rooms.drain_begin(2, 102, submitted.wrapping_add(10));
+        assert_eq!(rooms.drain_target(submitted), Some(2));
+        // A later accepted write is outside the first prefix.
+        rooms.drain_discard(submitted, submitted.wrapping_add(6), 4);
+        assert_eq!(rooms.drain_target(submitted), Some(2));
+        rooms.drain_discard(submitted, submitted.wrapping_add(4), 2);
+        assert_eq!(rooms.drain_target(submitted), Some(0));
+        let mut told = Vec::new();
+        rooms.drain_complete(0, |h| told.push(*h));
+        assert_eq!(told, [11, 12]);
+        rooms.drain_discard(submitted, submitted, 1);
+        assert_eq!(rooms.drain(1, 101), Some(true));
+        assert_eq!(rooms.drain(2, 102), Some(true));
+    }
+
+    #[test]
+    fn departing_pending_writes_adjust_positions_in_fifo_order() {
+        let mut output = full_but(0);
+        let mut writes = Writes::new();
+        assert_eq!(writes.write(&mut output, 1, b"aa", 1), Taken::Waits);
+        assert_eq!(writes.write(&mut output, 2, b"bbb", 2), Taken::Waits);
+        assert_eq!(writes.write(&mut output, 1, b"cccc", 3), Taken::Waits);
+        assert_eq!(writes.write(&mut output, 3, b"d", 4), Taken::Waits);
+        let mut removed = Vec::new();
+        let mut dropped = Vec::new();
+        writes.gone_before(
+            1,
+            u64::MAX - 1,
+            |t| dropped.push(t),
+            |start, len| removed.push((start, len)),
+        );
+        assert_eq!(dropped, [1, 3]);
+        assert_eq!(removed, [(u64::MAX - 1, 2), (1, 4)]);
+        assert_eq!(writes.queued_bytes(), 4);
+    }
 
     /// What `next_byte` gives until it has nothing, 10 000 bytes at most.
     fn drain(o: &mut Output) -> Vec<u8> {

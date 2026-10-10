@@ -599,6 +599,13 @@ pub unsafe extern "C" fn stafeto_ioctl(
     request: c_ulong,
     argument: *mut c_void,
 ) -> c_int {
+    // relibc tcdrain uses precisely this command. Its cancellation point
+    // surrounds the descriptor hold, so cleanup runs after release.
+    if request == TCSBRK && !argument.is_null() {
+        return number(fd)
+            .and_then(posix_abi::terminal::drain_fd)
+            .map_or_else(|errno| -errno, |()| 0);
+    }
     let result = number(fd).and_then(|fd| {
         posix_abi::shared::held(fd, |transport, target| {
             if let Some(terminal) = transport.terminal_number(target) {

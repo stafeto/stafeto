@@ -183,6 +183,7 @@ pub struct Terminal {
     /// (canonical mode); all of them otherwise.
     cooked: usize,
     output: Ring<u8, OUTPUT>,
+    sent_total: u64,
     /// When the last byte of input came: VTIME between bytes runs from it.
     last_input: u64,
     /// The signals asked for, one bit each (Signal::bit).
@@ -207,6 +208,7 @@ impl Terminal {
             queue: Ring::new(0),
             cooked: 0,
             output: Ring::new(0),
+            sent_total: 0,
             last_input: 0,
             signals: 0,
             dropped: 0,
@@ -278,6 +280,7 @@ impl Terminal {
 
     /// The output not taken by the device goes (tcflush with TCOFLUSH).
     pub fn flush_output(&mut self) {
+        self.sent_total = self.sent_total.wrapping_add(self.output.len as u64);
         self.output.clear();
     }
 
@@ -464,7 +467,7 @@ impl Terminal {
     fn signal(&mut self, signal: Signal, b: u8) {
         if !self.local(NOFLSH) {
             self.flush_input();
-            self.output.clear();
+            self.flush_output();
         }
         self.echo(b);
         self.signals |= signal.bit();
@@ -721,7 +724,18 @@ impl Terminal {
 
     /// The device took `n` bytes of `output`.
     pub fn sent(&mut self, n: usize) {
+        self.sent_total = self.sent_total.wrapping_add(n.min(self.output.len) as u64);
         self.output.drop_front(n);
+    }
+
+    /// The resolved original output prefix, modulo 2^64. Existing software
+    /// flush resolves its removed bytes without declaring physical UART drain.
+    pub fn sent_total(&self) -> u64 {
+        self.sent_total
+    }
+
+    pub fn output_target(&self) -> u64 {
+        self.sent_total.wrapping_add(self.output.len as u64)
     }
 
     /// The bytes for the device.
@@ -752,6 +766,22 @@ impl Terminal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_cursor_wraps_and_existing_flush_resolves_only_queued_prefix() {
+        let mut terminal = super::Terminal::new();
+        terminal.sent_total = u64::MAX - 1;
+        terminal.write(b"abcd");
+        assert_eq!(terminal.output_target(), 2);
+        terminal.sent(2);
+        assert_eq!(terminal.sent_total(), 0);
+        terminal.flush_output();
+        assert_eq!(terminal.sent_total(), 2);
+        terminal.write(b"new");
+        assert_eq!(terminal.output_target(), 5);
+        terminal.sent(usize::MAX);
+        assert_eq!(terminal.sent_total(), 5);
+    }
+
     use super::*;
     use proto_tty::VMIN;
     use std::vec::Vec;

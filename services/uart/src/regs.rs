@@ -66,3 +66,22 @@ pub const DR_ERRORS: u32 = 0xF00;
 
 /// The least depth of the FIFOs of a PL011 (QEMU's; 32 from r1p5 on).
 pub const FIFO_DEPTH: usize = 16;
+
+/// FIFO empty alone does not account for the character in the shift register.
+pub fn drained(flags: u32) -> bool {
+    flags & (FR_TXFE | FR_BUSY) == FR_TXFE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_drain_waits_for_fifo_and_final_stop_bits() {
+        assert!(!drained(0));
+        assert!(!drained(FR_BUSY));
+        assert!(!drained(FR_TXFE | FR_BUSY));
+        assert!(drained(FR_TXFE));
+        assert!(drained(FR_TXFE | FR_RXFE));
+    }
+}

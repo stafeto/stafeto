@@ -65,9 +65,11 @@ struct Stub {
     reader: Option<(u64, Option<Handle<Channel>>, bool, usize)>,
     next_key: u64,
     hold: bool,
+    tx_busy: bool,
     room: Option<Handle<Channel>>,
     armed: bool,
     taken: u64,
+    drain_key: Option<u64>,
     rings: &'static mut Rings,
 }
 
@@ -149,7 +151,7 @@ fn long_answer(r: &mut Request<'_>, reply: long::Reply<'_>) -> Answer {
     }
 }
 
-const METHODS: &[u16] = &[7, 8, 9, 11, 12, FEED, HOLD, TAKEN];
+const METHODS: &[u16] = &[7, 8, 9, 11, 12, 13, 14, 15, 19, FEED, HOLD, TAKEN];
 
 impl Service<0> for Stub {
     const VERSION: u16 = VERSION;
@@ -173,7 +175,14 @@ impl Service<0> for Stub {
                 let Ok(hold) = r.body().u32() else {
                     return Answer::Status(Status::BadSize);
                 };
-                self.hold = hold != 0;
+                self.hold = hold == 1;
+                self.tx_busy = hold == 2;
+                if !self.tx_busy
+                    && self.drain_key.is_some()
+                    && let Some(room) = &self.room
+                {
+                    let _ = sys::notify(room, 2);
+                }
                 if !self.hold
                     && core::mem::take(&mut self.armed)
                     && let Some(room) = &self.room
@@ -216,6 +225,43 @@ impl Service<0> for Stub {
                         Err(status) => Answer::Status(status),
                     }
                 }
+                // This measurement stand-in's port transmits accepted bytes
+                // immediately. Real FIFO/shift-register behavior is tested in
+                // the production UART's host tests and the physical driver.
+                Some(Method::DrainState) => {
+                    if r.body().finish().is_err() || !r.handles.is_empty() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    match (proto_uart::DrainReply {
+                        ready: !self.tx_busy,
+                    })
+                    .write(r.reply())
+                    {
+                        Ok(()) => Answer::Reply(Outgoing::new()),
+                        Err(status) => Answer::Status(status),
+                    }
+                }
+                Some(method @ (Method::DrainStart | Method::DrainTake | Method::DrainRelease)) => {
+                    let Ok(request) = proto_uart::DrainKey::read(r.body()) else {
+                        return Answer::Status(Status::BadSize);
+                    };
+                    if method == Method::DrainStart {
+                        self.drain_key = Some(request.key);
+                    } else if self.drain_key != Some(request.key) {
+                        return Answer::Status(Status::Kernel(Error::BadState));
+                    }
+                    if method == Method::DrainRelease {
+                        self.drain_key = None;
+                    }
+                    match (proto_uart::DrainReply {
+                        ready: !self.tx_busy,
+                    })
+                    .write(r.reply())
+                    {
+                        Ok(()) => Answer::Reply(Outgoing::new()),
+                        Err(status) => Answer::Status(status),
+                    }
+                }
                 Some(Method::Room) => {
                     if !r.handles.is_empty()
                         && self.room.is_none()
@@ -254,9 +300,11 @@ pub fn run(s: Startup) -> u64 {
         reader: None,
         next_key: 0,
         hold: false,
+        tx_busy: false,
         room: None,
         armed: false,
         taken: 0,
+        drain_key: None,
         // SAFETY: only this thread reaches RINGS, here once.
         rings: unsafe { &mut *RINGS.0.get() },
     };
