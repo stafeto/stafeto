@@ -126,10 +126,17 @@ fn only_real_expected_change_and_exact_paid_control_advance_the_barrier() {
     c.request.owner = Owner::Process(258);
     c.request.command = Command::Set(Some(Kind::Write));
     let id = q.admit(0, s.owner, wire, c, &mut ram.storage).unwrap();
+    let wrong_id = q.admit(1, s.owner + 1, wire, c, &mut ram.storage).unwrap();
+    g.accepted(wrong_id, c);
+    assert_eq!(g.phase, Phase::Frozen);
     g.accepted(id, c);
     assert_eq!(g.phase, Phase::Selecting);
     assert!(!g.frozen());
     assert!(g.pause_wait());
+    g.visit(wrong_id, 8);
+    assert_eq!(g.visited, 0);
+    g.finish(wrong_id, None);
+    assert_eq!(g.phase, Phase::Selecting);
     g.visit(id, 8);
     assert_eq!(g.visited, 8);
     let mut pool = Pool::new();

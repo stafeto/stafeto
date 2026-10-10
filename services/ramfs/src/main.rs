@@ -3176,6 +3176,11 @@ impl Fs {
             if body.finish().is_err() {
                 return Answer::Status(Status::BadSize);
             }
+            if nonce == 0
+                || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+            {
+                return status(proto_fs::INVALID_ARGUMENT);
+            }
             let source = ramfs::TentativeOpen {
                 fd: proto_fs::DataDescription { packed, generation }.fd(),
                 description: Token {
