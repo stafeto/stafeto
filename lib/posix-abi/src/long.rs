@@ -57,8 +57,11 @@ impl ShortScope {
                 kernel: None,
             });
         }
+        // Lifetime help can run before any TCB is published on a raw worker.
+        // Such a caller cannot take local preparation and must not admit one.
+        let block = unsafe { posix_thread::block().as_ref() }.ok_or(EIO)?;
         let kernel = rt::upcall::defer_entries().map_err(|_| EIO)?;
-        let local = posix_sync::DeliveryPreparation::begin(crate::threads::own_block());
+        let local = posix_sync::DeliveryPreparation::begin(block);
         Ok(Self {
             local: Some(local),
             kernel: Some(kernel),

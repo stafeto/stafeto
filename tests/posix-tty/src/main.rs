@@ -409,3 +409,21 @@ pub extern "C" fn stafeto_probe_drain_read(key: u64) -> u64 {
     })();
     result.unwrap_or(u64::MAX)
 }
+
+/// The fixture waits for an actual accepted production record, not a sleep.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_resident_drains(waiting: i32) -> i32 {
+    posix_abi::shared::with_files(|files| {
+        let mut count = 0;
+        for token in files.control_tokens() {
+            if let Ok(snapshot) = files.drain_snapshot(token) {
+                let debt = snapshot.recovery.drain().expect("drain snapshot");
+                if waiting == 0 || debt.server() == posix_fs::drain::Server::Waiting {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    })
+    .unwrap_or(-1)
+}

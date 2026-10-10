@@ -38,6 +38,25 @@ core::arch::global_asm!(
     "ldp x29, x30, [sp], #32",
     "ret",
 );
+// A raw no-owner worker uses setjmp directly, without sigsetjmp's mask RPC.
+core::arch::global_asm!(
+    ".global native_jump_around_unmasked",
+    ".type native_jump_around_unmasked,%function",
+    "native_jump_around_unmasked:",
+    "stp x29, x30, [sp, #-32]!",
+    "mov x29, sp",
+    "stp x19, x20, [sp, #16]",
+    "mov x19, x0",
+    "mov x20, x1",
+    "bl setjmp",
+    "cbnz w0, 1f",
+    "blr x20",
+    "mov w0, #0",
+    "1:",
+    "ldp x19, x20, [sp, #16]",
+    "ldp x29, x30, [sp], #32",
+    "ret",
+);
 // A jump that restores what setjmp saved and nothing else: it does not
 // know the entry record, so the program calls `abandon` before it.
 core::arch::global_asm!(
@@ -66,6 +85,7 @@ core::arch::global_asm!(
 );
 unsafe extern "C" {
     fn native_jump_garbage(buffer: *mut u64) -> !;
+    fn native_jump_around_unmasked(buffer: *mut u64, body: extern "C" fn()) -> c_int;
     fn native_jump_raw(buffer: *mut u64, value: c_int) -> !;
     /// sigsetjmp(buffer, 1), then body(); 0 when body returns, the value
     /// of siglongjmp otherwise.
@@ -407,6 +427,118 @@ struct Ctx {
 
 fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
+}
+
+static PENDING_MODE: AtomicUsize = AtomicUsize::new(0);
+static PENDING_TARGET: AtomicU64 = AtomicU64::new(0);
+unsafe extern "C" fn pending_primary(context: *mut upcall::Context) {
+    PRIMARY.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: the entry adapter supplies this live context.
+    if unsafe { (*context).sp } != PENDING_TARGET.load(Ordering::Acquire) {
+        fail(21);
+    }
+}
+rt::upcall_entry!(pending_entry, pending_primary, context);
+fn pending_jump_window(target: u64) {
+    let mode = PENDING_MODE.load(Ordering::Acquire);
+    PENDING_TARGET.store(target, Ordering::Release);
+    let block = unsafe { &*posix_thread::block() };
+    if mode & 1 != 0 {
+        // Model the already paid local pending marker. Its publication must
+        // become a real kernel request while assembly still owns Defer.
+        block
+            .flags
+            .fetch_or(posix_thread::flag::ENTRY_DEFERRED, Ordering::SeqCst);
+    }
+    if mode & 2 != 0 {
+        let thread =
+            Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
+        sys::thread_upcall_request(&thread).expect("pending jump request");
+    }
+    if PRIMARY.load(Ordering::SeqCst) != 0 {
+        fail(22);
+    }
+}
+extern "C" fn worker_pending_jump(_: u64) -> ! {
+    // SAFETY: the primary adapter observes the restored interrupted SP.
+    unsafe { upcall::bind(pending_entry) }.expect("pending primary bind");
+    unsafe { upcall::enable() }.expect("pending primary enable");
+    tls::with_process(|| {
+        for mode in 0..4 {
+            PENDING_MODE.store(mode, Ordering::Release);
+            PRIMARY.store(0, Ordering::SeqCst);
+            abi::shared::probe_jump_window(Some(pending_jump_window));
+            if !zero_value() {
+                fail(23);
+            }
+            abi::shared::probe_jump_window(None);
+            let expected = usize::from(mode != 0);
+            if PRIMARY.load(Ordering::SeqCst) != expected {
+                fail(24 + mode);
+            }
+            if unsafe { &*posix_thread::block() }
+                .flags
+                .load(Ordering::SeqCst)
+                & posix_thread::flag::ENTRY_DEFERRED
+                != 0
+            {
+                fail(28 + mode);
+            }
+        }
+    });
+    stage(1);
+    upcall::set_exit_hook(Some(exit_hook));
+    sys::thread_exit()
+}
+extern "C" fn worker_no_owner_jump(_: u64) -> ! {
+    // No TCB or relibc place has been admitted on this raw native worker.
+    if !posix_thread::block().is_null() {
+        fail(32);
+    }
+    let before = abi::relibc::occupied();
+    abi::shared::probe_drain_help_without_admission();
+    GARBAGE_RUNS.store(0, Ordering::SeqCst);
+    // SAFETY: this live pure setjmp frame avoids all signal-mask APIs.
+    let value =
+        unsafe { native_jump_around_unmasked((*BUFFER.0.get()).as_mut_ptr(), body_garbage) };
+    if value != 1 || GARBAGE_RUNS.load(Ordering::SeqCst) != 1 {
+        fail(33);
+    }
+    if !posix_thread::block().is_null() || abi::relibc::occupied() != before {
+        fail(34);
+    }
+    stage(1);
+    upcall::set_exit_hook(Some(exit_hook));
+    sys::thread_exit()
+}
+#[inline(never)]
+fn jump_boundary(ctx: &Ctx, level: u8, base: u8) -> bool {
+    for (slot, entry, name) in [
+        (
+            9,
+            worker_pending_jump as extern "C" fn(u64) -> !,
+            "local, kernel and combined pending jump",
+        ),
+        (
+            10,
+            worker_no_owner_jump as extern "C" fn(u64) -> !,
+            "no-owner jump",
+        ),
+    ] {
+        STAGE.store(0, Ordering::SeqCst);
+        ERROR.store(0, Ordering::SeqCst);
+        HOOK_RAN.store(0, Ordering::SeqCst);
+        let Some((_native, ended)) = spawn(entry, slot, level, base) else {
+            return failed(1610);
+        };
+        if !await_stage(ctx, 1) || !finish(name, 1610, &ended) {
+            return false;
+        }
+    }
+    rt::println!(
+        "native-jump: restored SP receives local, kernel and combined pending; no-owner jump admits nothing"
+    );
+    true
 }
 
 /// The worker of variant 6: no handler of its own; the first attachment of
@@ -791,6 +923,9 @@ pub(super) fn run() -> bool {
         return false;
     }
     if !owed("owed request, abandon", 1, 8, &ctx, level, base) {
+        return false;
+    }
+    if !jump_boundary(&ctx, level, base) {
         return false;
     }
     // longjmp(env, 0) returns 1 with garbage above the low half of x1.
