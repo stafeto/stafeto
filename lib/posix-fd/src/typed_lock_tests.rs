@@ -331,3 +331,183 @@ fn typed_decoded_terminal_constructor_checks_phase_and_blocker_without_wire_buff
         Err(FsError::InvalidArgument)
     );
 }
+
+#[test]
+fn close_fence_retains_working_cleaning_and_complete_debts_until_confirmation() {
+    let (mut files, entry, _, input) = fixture();
+    let (working, working_claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(91), input)
+        .unwrap();
+    let (cleaning, _) = files
+        .begin_lock_record(owner(), entry, Frame::main(92), input)
+        .unwrap();
+    files
+        .begin_lock_cleanup(cleaning, control::CancelReason::Abandoned)
+        .unwrap();
+    let (complete, complete_claim) = files
+        .begin_lock_record(owner(), entry, Frame::main(93), input)
+        .unwrap();
+    files
+        .complete_lock_record(complete_claim, ControlResult::Value(0), terminal(blocker()))
+        .unwrap();
+    let close = match files
+        .descriptors
+        .begin_close(
+            owner(),
+            entry.fd,
+            control::Recovery::change(Frame::main(94)),
+        )
+        .unwrap()
+    {
+        super::CloseAdmission::Started { token, snapshot } => {
+            assert_eq!(snapshot.entry, entry);
+            token
+        }
+        _ => panic!("close admission"),
+    };
+    assert_eq!(files.fence_lock_for_close(entry), Ok(Some(working)));
+    assert!(!files.lock_is_live(working_claim));
+    assert_eq!(
+        files
+            .lock_snapshot(working)
+            .unwrap()
+            .recovery
+            .lock()
+            .unwrap()
+            .cancel_reason(),
+        control::CancelReason::Close
+    );
+    assert_eq!(files.fence_lock_for_close(entry), Ok(Some(working)));
+    files
+        .publish_lock_cleanup(working, ControlResult::Failed(9), terminal(cancelled()))
+        .unwrap();
+    files.finish_lock_cleanup(working).unwrap();
+    assert_eq!(files.fence_lock_for_close(entry), Ok(Some(cleaning)));
+    assert_eq!(
+        files
+            .lock_snapshot(cleaning)
+            .unwrap()
+            .recovery
+            .lock()
+            .unwrap()
+            .cancel_reason(),
+        control::CancelReason::Abandoned
+    );
+    files
+        .publish_lock_cleanup(cleaning, ControlResult::Failed(5), terminal(cancelled()))
+        .unwrap();
+    files.finish_lock_cleanup(cleaning).unwrap();
+    assert_eq!(files.fence_lock_for_close(entry), Ok(Some(complete)));
+    let saved = files.lock_snapshot(complete).unwrap();
+    assert_eq!(
+        (saved.result, saved.recovery.lock().unwrap().outcome()),
+        (Some(ControlResult::Value(0)), Some(blocker()))
+    );
+    assert_eq!(
+        files.publish_lock_cleanup(complete, ControlResult::Failed(9), terminal(cancelled())),
+        Ok(saved)
+    );
+    files.finish_lock_cleanup(complete).unwrap();
+    assert_eq!(files.fence_lock_for_close(entry), Ok(None));
+    assert_eq!(files.control_tokens().count(), 3);
+    assert!(!files.descriptors.close_snapshot(close).unwrap().complete);
+}
+
+#[test]
+fn close_fence_preserves_alias_reused_generation_and_change_family() {
+    let (mut files, entry, target, input) = fixture();
+    let (old, _) = files
+        .begin_lock_record(owner(), entry, Frame::main(91), input)
+        .unwrap();
+    let alias_fd = files
+        .descriptors
+        .duplicate(entry.fd, 0, Flags::default())
+        .unwrap();
+    let alias_entry = files.lock_source(alias_fd).unwrap();
+    let (alias, alias_claim) = files
+        .begin_lock_record(owner(), alias_entry, Frame::main(92), input)
+        .unwrap();
+    let (change, change_claim) = files.begin_change_record(owner(), Frame::main(93)).unwrap();
+    let change_before = files.change_snapshot(change).unwrap();
+    files.descriptors.close(entry.fd).unwrap();
+    let reused_fd = files
+        .descriptors
+        .insert(Target::Ram(target), Flags::default())
+        .unwrap();
+    assert_eq!(reused_fd, entry.fd);
+    let reused_entry = files.lock_source(reused_fd).unwrap();
+    assert_ne!(reused_entry, entry);
+    let (reused, reused_claim) = files
+        .begin_lock_record(owner(), reused_entry, Frame::main(94), input)
+        .unwrap();
+    let alias_before = files.lock_snapshot(alias).unwrap();
+    let reused_before = files.lock_snapshot(reused).unwrap();
+    assert_eq!(files.fence_lock_for_close(entry), Ok(Some(old)));
+    files
+        .publish_lock_cleanup(old, ControlResult::Failed(9), terminal(cancelled()))
+        .unwrap();
+    files.finish_lock_cleanup(old).unwrap();
+    assert_eq!(files.fence_lock_for_close(entry), Ok(None));
+    assert_eq!(files.lock_snapshot(alias).unwrap(), alias_before);
+    assert_eq!(files.lock_snapshot(reused).unwrap(), reused_before);
+    assert_eq!(files.change_snapshot(change).unwrap(), change_before);
+    assert!(files.lock_is_live(alias_claim));
+    assert!(files.lock_is_live(reused_claim));
+    assert!(files.change_is_live(change_claim));
+}
+
+#[test]
+fn full_sixteen_controls_preserve_close_admission_and_all_fence_debts() {
+    let (mut files, entry, _, input) = fixture();
+    let mut tokens = [None; super::JOBS_MAX];
+    for (index, slot) in tokens.iter_mut().enumerate() {
+        *slot = Some(
+            files
+                .begin_lock_record(owner(), entry, Frame::main(100 + index as u64), input)
+                .unwrap()
+                .0,
+        );
+    }
+    assert_eq!(files.control_tokens().count(), 16);
+    assert_eq!(
+        files.begin_change_record(owner(), Frame::main(200)),
+        Err(FsError::TooManyOpenFiles)
+    );
+    let close = match files
+        .descriptors
+        .begin_close(
+            owner(),
+            entry.fd,
+            control::Recovery::change(Frame::main(201)),
+        )
+        .unwrap()
+    {
+        super::CloseAdmission::Started { token, snapshot } => {
+            assert_eq!(snapshot.entry, entry);
+            token
+        }
+        _ => panic!("full resident table retained close admission"),
+    };
+    for slot in tokens {
+        let token = slot.unwrap();
+        assert_eq!(files.fence_lock_for_close(entry), Ok(Some(token)));
+        assert_eq!(files.control_tokens().count(), 16);
+        files
+            .publish_lock_cleanup(token, ControlResult::Failed(9), terminal(cancelled()))
+            .unwrap();
+        files.finish_lock_cleanup(token).unwrap();
+    }
+    assert_eq!(files.fence_lock_for_close(entry), Ok(None));
+    assert_eq!(files.control_tokens().count(), 16);
+    assert_eq!(
+        files.descriptors.close_snapshot(close).unwrap().entry,
+        entry
+    );
+    for slot in tokens {
+        assert_eq!(
+            files.ack_lock_record(slot.unwrap(), owner()),
+            Ok((ControlResult::Failed(9), Some(cancelled())))
+        );
+    }
+    assert_eq!(files.control_tokens().count(), 0);
+}

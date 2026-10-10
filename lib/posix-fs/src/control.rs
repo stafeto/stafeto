@@ -6,7 +6,8 @@
 use super::{FsError, PosixFs, RamTarget, Target};
 use entries::Frame;
 use posix_fd::{
-    ControlClaimToken, ControlResult, ControlSnapshot, ControlToken, EntryToken, OwnerToken,
+    ControlClaimToken, ControlPhase, ControlResult, ControlSnapshot, ControlToken, EntryToken,
+    OwnerToken,
 };
 use proto_fs::{DataDescription, LockCommand, LockKind, LockPhase, LockReply, LockStart, OpenKey};
 use proto_wire::Reader;
@@ -283,6 +284,26 @@ impl PosixFs {
                     .is_some_and(|lock| lock.source() == source)
             })
         })
+    }
+    /// Revoke one exact source's unpaid command before its numeric close event.
+    /// The resident table has sixteen prepaid records; this step performs no RPC.
+    pub fn fence_lock_for_close(
+        &mut self,
+        source: EntryToken,
+    ) -> Result<Option<ControlToken>, FsError> {
+        let token = self.control_tokens().find(|&token| {
+            self.control_snapshot(token).is_ok_and(|snapshot| {
+                snapshot.phase != ControlPhase::Cleaned
+                    && snapshot
+                        .recovery
+                        .lock()
+                        .is_some_and(|lock| lock.source() == source)
+            })
+        });
+        if let Some(token) = token {
+            self.begin_lock_cleanup(token, CancelReason::Close)?;
+        }
+        Ok(token)
     }
     pub fn abandon_lock_owner(
         &mut self,
