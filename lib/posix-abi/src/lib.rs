@@ -18,6 +18,7 @@ pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;
 pub mod fork;
 pub mod loader_probe;
+pub mod lock_fields;
 pub mod long;
 pub mod metadata;
 pub mod names;

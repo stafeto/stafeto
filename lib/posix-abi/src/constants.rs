@@ -44,6 +44,7 @@ pub const ENOSPC: i32 = 28;
 pub const ESPIPE: i32 = 29;
 pub const ERANGE: i32 = 34;
 pub const ENAMETOOLONG: i32 = 36;
+pub const ENOLCK: i32 = 37;
 pub const ENOSYS: i32 = 38;
 pub const EOVERFLOW: i32 = 75;
 pub const EILSEQ: i32 = 84;

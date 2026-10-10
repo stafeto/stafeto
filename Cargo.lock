@@ -935,6 +935,8 @@ dependencies = [
  "abi",
  "bootimg",
  "posix-fd",
+ "posix-types",
+ "proto-fs",
 ]
 
 [[package]]

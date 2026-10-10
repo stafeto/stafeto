@@ -13,3 +13,5 @@ bootimg = { path = "../lib/bootimg", features = ["write"] }
 
 [dev-dependencies]
 posix-fd = { path = "../lib/posix-fd" }
+posix-types = { path = "../lib/posix-types" }
+proto-fs = { path = "../proto/fs" }
