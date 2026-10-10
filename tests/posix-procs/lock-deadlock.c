@@ -99,7 +99,11 @@ static void deadlock_case(int ofd) {
         if (ofd) {
             int reached = deadlock_flag(&deadlock_ready);
             expect("OFD-only blockers leave both PID WAITs Sleeping", reached, 1);
-            /* Keep both genuine OFD holds until both accepted sleeps are observed. */
+            /* Give the bounded proof real turns with the OFD holds unchanged. */
+            struct timespec proof_window = {0, 50000000};
+            nanosleep(&proof_window, NULL);
+            expect("OFD-only cycle cannot finish before real unlock",
+                   __atomic_load_n(&deadlock_done, __ATOMIC_ACQUIRE), 0);
             expect("main explicitly removes OFD A blocker", deadlock_lock(a, 37, F_UNLCK), 0);
         }
         int finished = deadlock_flag(&deadlock_done);
