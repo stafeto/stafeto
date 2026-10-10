@@ -394,3 +394,72 @@ fn ambiguous_query_failure_seeks_canonical_cancel_and_retired_release_is_confirm
 }
 #[path = "../../lib/posix-abi/src/lock_driver/status.rs"]
 mod status;
+
+use abi as inline_abi;
+use constants::EIO;
+#[path = "../../lib/posix-abi/src/lock_driver/reply_bytes.rs"]
+mod reply_bytes;
+
+#[test]
+fn inline_lock_reply_preserves_real_blocker_and_exact_status_prefixes() {
+    let blocker = LockReply {
+        phase: LockPhase::Complete,
+        result: 0,
+        blocker: Some(LockBlocker {
+            kind: LockKind::Write,
+            start: 8,
+            length: 19,
+            pid: -1,
+        }),
+    };
+    for reply in [
+        reply(0),
+        blocker,
+        LockReply {
+            phase: LockPhase::Pending,
+            ..reply(0)
+        },
+    ] {
+        let mut wire = proto_wire::Writer::new();
+        reply.write(&mut wire).unwrap();
+        let bytes = reply_bytes::InlineReply::read(
+            &abi::inline_words(wire.as_bytes()),
+            wire.as_bytes().len(),
+        )
+        .unwrap();
+        assert_eq!(
+            LockReply::read(proto_wire::Reader::new(bytes.as_bytes())),
+            Ok(reply)
+        );
+    }
+    for code in [
+        proto_wire::Status::Ok,
+        proto_wire::Status::Unknown(proto_fs::RESOLVING),
+    ] {
+        let wire = proto_wire::reply(code);
+        let bytes = reply_bytes::InlineReply::read(&abi::inline_words(&wire), wire.len()).unwrap();
+        assert_eq!(status::read(bytes.as_bytes()), Ok(code.code()));
+    }
+}
+
+#[test]
+fn oversized_inline_reply_is_fatal_and_short_or_tailed_prefixes_stay_invalid() {
+    for length in [65, abi::MESSAGE_MAX, usize::MAX] {
+        assert!(matches!(
+            reply_bytes::InlineReply::read(&[0; 8], length),
+            Err(Failure::Fatal(EIO))
+        ));
+    }
+    for length in [0, 4, 12, 64] {
+        let bytes = reply_bytes::InlineReply::read(&[0; 8], length).unwrap();
+        assert!(status::read(bytes.as_bytes()).is_err());
+    }
+    let mut wire = proto_wire::Writer::new();
+    reply(0).write(&mut wire).unwrap();
+    let mut tailed = [0; abi::INLINE_MAX];
+    tailed[..wire.as_bytes().len()].copy_from_slice(wire.as_bytes());
+    let bytes =
+        reply_bytes::InlineReply::read(&abi::inline_words(&tailed), wire.as_bytes().len() + 4)
+            .unwrap();
+    assert!(LockReply::read(proto_wire::Reader::new(bytes.as_bytes())).is_err());
+}

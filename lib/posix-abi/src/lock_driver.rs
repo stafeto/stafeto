@@ -10,8 +10,10 @@ use posix_fs::change::{ControlClaimToken, ControlPhase, ControlResult, ControlTo
 use posix_fs::control::{CancelReason, Input, TerminalReply};
 use proto_fs::{LockReply, Method};
 use proto_wire::{Reader, Status, Writer};
+use rt::abi as inline_abi;
 
 mod core;
+mod reply_bytes;
 mod status;
 use core::{Failure, Phase, Session, State};
 
@@ -90,8 +92,8 @@ impl Live {
         if !response.handles.is_empty() {
             return Err(Failure::Fatal(EIO));
         }
-        let mut bytes = [0; rt::abi::MESSAGE_MAX];
-        let bytes = response.bytes(&mut bytes);
+        let bytes = reply_bytes::InlineReply::read(&response.words, response.len)?;
+        let bytes = bytes.as_bytes();
         let mut status = Reader::new(bytes);
         let code = status.u32().map_err(failure)?;
         if code != 0 {
@@ -173,8 +175,8 @@ impl Session for Live {
         if !response.handles.is_empty() {
             return Err(Failure::Fatal(EIO));
         }
-        let mut bytes = [0; rt::abi::MESSAGE_MAX];
-        let code = status::read(response.bytes(&mut bytes)).map_err(failure)?;
+        let bytes = reply_bytes::InlineReply::read(&response.words, response.len)?;
+        let code = status::read(bytes.as_bytes()).map_err(failure)?;
         if code == 0 {
             Ok(())
         } else {
