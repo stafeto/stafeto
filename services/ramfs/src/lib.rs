@@ -578,6 +578,34 @@ impl<'a> Ram<'a> {
         }
     }
 
+    /// Initialize permanent service storage without a whole Ram stack temporary.
+    ///
+    /// # Safety
+    /// The destination is exclusive aligned writable uninitialized Self storage.
+    pub unsafe fn initialize_at(
+        destination: *mut Self,
+        now: proto_fs::Timestamp,
+        state: &'a mut storage::State,
+        data: &'a mut [u8],
+        tree: Option<Tree<'a>>,
+    ) {
+        // SAFETY: all field destinations lie in the caller's exclusive allocation.
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).storage)
+                .write(Storage::new(state, data, tree, now));
+            let descriptions =
+                core::ptr::addr_of_mut!((*destination).descriptions).cast::<Option<Shared>>();
+            let generations =
+                core::ptr::addr_of_mut!((*destination).description_generations).cast::<u64>();
+            for index in 0..DESCRIPTIONS {
+                descriptions.add(index).write(None);
+                generations.add(index).write(0);
+            }
+            core::ptr::addr_of_mut!((*destination).tree).write(tree);
+            core::ptr::addr_of_mut!((*destination).cancel_refusals).write(0);
+        }
+    }
+
     /// A cancel left something held. A debug build and the host tests stop
     /// here; any build counts it.
     pub fn refused_cancel(&mut self) {
@@ -2327,6 +2355,77 @@ mod tests {
         ])
     }
 
+    fn initialize_in_box<'a>(
+        state: &'a mut storage::State,
+        data: &'a mut [u8],
+        tree: Option<Tree<'a>>,
+    ) -> std::boxed::Box<Ram<'a>> {
+        let mut allocation = std::boxed::Box::<Ram>::new_uninit();
+        // SAFETY: the Box exclusively supplies aligned storage for every Ram field.
+        unsafe {
+            Ram::initialize_at(
+                allocation.as_mut_ptr(),
+                proto_fs::Timestamp::ZERO,
+                state,
+                data,
+                tree,
+            );
+            allocation.assume_init()
+        }
+    }
+    #[test]
+    fn directly_initialized_ram_opens_shared_descriptions_and_reuses_after_close() {
+        // SAFETY: State admits zeroes and initialize establishes its free tables.
+        let mut state = unsafe { std::boxed::Box::<storage::State>::new_zeroed().assume_init() };
+        state.initialize();
+        let mut data = vec![0; storage::PAGES * storage::PAGE];
+        let mut ram = initialize_in_box(&mut state, &mut data, None);
+        let mut fds = Fds::default();
+        let fd = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
+        assert_eq!(fd, 3);
+        assert_eq!(
+            ram.description_token(&fds, fd),
+            Ok(Token {
+                slot: 0,
+                generation: 1
+            })
+        );
+        assert_eq!(ram.write(&mut fds, fd, b"abc"), Ok(3));
+        assert_eq!(ram.seek(&mut fds, fd, 0), Ok(0));
+        let mut copy = ram.clone_fds(&fds, &[fd]).unwrap();
+        ram.close(&mut fds, fd).unwrap();
+        let mut out = [0; 3];
+        assert_eq!(ram.read(&mut copy, fd, &mut out), Ok(3));
+        assert_eq!(&out, b"abc");
+        ram.close(&mut copy, fd).unwrap();
+        let next = ram.open(&mut fds, "/tmp/probe", READ_ONLY).unwrap();
+        assert_eq!(
+            ram.description_token(&fds, next),
+            Ok(Token {
+                slot: 0,
+                generation: 2
+            })
+        );
+        ram.close(&mut fds, next).unwrap();
+    }
+    #[test]
+    fn directly_initialized_ram_keeps_original_boot_tree_bytes() {
+        let bytes = image();
+        let mut index = Index::new();
+        let tree = load(&bytes, &mut index).unwrap();
+        // SAFETY: State admits zeroes and initialize establishes its free tables.
+        let mut state = unsafe { std::boxed::Box::<storage::State>::new_zeroed().assume_init() };
+        state.initialize();
+        let mut data = vec![0; storage::PAGES * storage::PAGE];
+        let mut ram = initialize_in_box(&mut state, &mut data, Some(tree));
+        let mut fds = Fds::default();
+        let fd = ram.open(&mut fds, "/bin/ash", READ_ONLY).unwrap();
+        let mut out = [0; 11];
+        assert_eq!(ram.read(&mut fds, fd, &mut out), Ok(11));
+        assert_eq!(&out, b"alpha bytes");
+        assert_eq!(ram.information("/bin/ash").unwrap().links, 2);
+        ram.close(&mut fds, fd).unwrap();
+    }
     #[test]
     fn image_files_have_the_mode_owner_size_inode_and_links_of_the_table() {
         let bytes = image();

@@ -1656,6 +1656,9 @@ fn write_elf_image(
         let why = |e: String| format!("{}: {e}", elf.display());
         disasm::erratum_835769(elf, &objdump)?;
         disasm::erratum_843419(elf)?;
+        if *file == "ramfs" {
+            disasm::ram_main_frame(elf, &objdump)?;
+        }
         // A program of stack 0 goes into the image as its ELF file alone:
         // the loader, and the programs only files of the table name.
         if *stack == 0 {

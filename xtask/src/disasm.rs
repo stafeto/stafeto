@@ -64,6 +64,85 @@ pub fn shipping(elf: &Path, objdump: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// RAM's service loop leaves room for its nested request and formatter paths.
+/// The permanent descriptor tables must stay outside this persistent frame.
+pub fn ram_main_frame(elf: &Path, objdump: &Path) -> Result<(), String> {
+    let frame = check_ram_main_frame(&disassemble(elf, objdump)?)?;
+    println!("RAM persistent main frame: {frame} bytes (limit 8192)");
+    Ok(())
+}
+
+fn immediate(text: &str) -> Result<usize, String> {
+    let text = text.trim().strip_prefix('#').unwrap_or(text.trim());
+    let (digits, base) = text
+        .strip_prefix("0x")
+        .map_or((text, 10), |digits| (digits, 16));
+    usize::from_str_radix(digits, base).map_err(|_| format!("unknown RAM frame immediate: {text}"))
+}
+
+fn check_ram_main_frame(text: &str) -> Result<usize, String> {
+    let (mut active, mut found, mut frame) = (false, false, 0);
+    let mut probe = None;
+    for line in text.lines() {
+        if let Some((_, name)) = line.split_once(" <")
+            && let Some(name) = name.strip_suffix(">:")
+        {
+            active = name == "__rt_main";
+            found |= active;
+            continue;
+        }
+        if !active {
+            continue;
+        }
+        let Some((mnemonic, operands)) = instruction(line) else {
+            continue;
+        };
+        let operands = operands
+            .split_once("//")
+            .map_or(operands, |(code, _)| code)
+            .trim();
+        let parts: Vec<_> = operands.split(',').map(str::trim).collect();
+        if mnemonic == "sub" && parts.len() >= 3 && parts[1] == "sp" {
+            let value = immediate(parts[2])?;
+            let shift = match parts.get(3).copied() {
+                None => 1,
+                Some("lsl #12") => 4096,
+                Some(other) => return Err(format!("unknown RAM frame shift: {other}")),
+            };
+            if parts[0] == "sp" {
+                frame += value * shift;
+            } else if parts[0].starts_with('x')
+                && shift == 4096
+                && (probe.replace(value).is_some() || value == 0)
+            {
+                return Err("unknown RAM main stack probe".into());
+            }
+        }
+        if matches!(mnemonic, "stp" | "str")
+            && let Some((_, suffix)) = operands.split_once("[sp, #-")
+            && let Some((amount, _)) = suffix.split_once("]!")
+        {
+            frame += immediate(amount)?;
+        }
+        if matches!(mnemonic, "add" | "mov" | "and")
+            && parts.first().copied() == Some("sp")
+            && (mnemonic != "add" || parts.get(2).is_none_or(|part| !part.starts_with('#')))
+        {
+            return Err("dynamic RAM main stack adjustment".into());
+        }
+    }
+    if !found {
+        return Err("RAM main symbol missing".into());
+    }
+    if let Some(pages) = probe {
+        frame += (pages - 1) * 4096;
+    }
+    if frame > 8192 {
+        return Err(format!("RAM main frame {frame} exceeds 8192 bytes"));
+    }
+    Ok(frame)
+}
+
 fn disassemble(elf: &Path, objdump: &Path) -> Result<String, String> {
     let output = Command::new(objdump)
         .args(["--disassemble", "--demangle", "--no-show-raw-insn"])
@@ -341,6 +420,23 @@ pub fn erratum_843419(elf: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ram_main_frame_guard_counts_every_stack_probe_iteration() {
+        let small = "0000000000200000 <__rt_main>:\n200000: \tstp\tx29, x30, [sp, #-0x10]!\n200004: \tsub\tsp, sp, #0x200\n";
+        assert_eq!(super::check_ram_main_frame(small), Ok(528));
+        let large = "0000000000200000 <__rt_main>:\n200000: \tsub\tx9, sp, #0x5, lsl #12\n200004: \tsub\tsp, sp, #0x1, lsl #12\n200008: \tstr\txzr, [sp]\n20000c: \tcmp\tsp, x9\n200010: \tb.ne\t0x200004 <__rt_main+0x4>\n200014: \tsub\tsp, sp, #0x880\n";
+        assert_eq!(
+            super::check_ram_main_frame(large),
+            Err("RAM main frame 22656 exceeds 8192 bytes".into())
+        );
+        assert!(super::check_ram_main_frame("0000000000200000 <other>:\n").is_err());
+        assert!(
+            super::check_ram_main_frame(
+                "0000000000200000 <__rt_main>:\n200000: \tsub\tsp, sp, x9\n"
+            )
+            .is_err()
+        );
+    }
     use super::*;
 
     #[test]

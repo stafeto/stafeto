@@ -103,6 +103,10 @@ struct LocksBss(UnsafeCell<core::mem::MaybeUninit<LockService>>);
 // SAFETY: the sole service thread initializes and owns all lock tables.
 unsafe impl Sync for LocksBss {}
 static LOCKS: LocksBss = LocksBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct RamBss(UnsafeCell<core::mem::MaybeUninit<Ram<'static>>>);
+// SAFETY: the sole service thread initializes and owns the RAM descriptors.
+unsafe impl Sync for RamBss {}
+static RAM: RamBss = RamBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 
 /// The files of the boot image's table: the image is mapped from the
 /// start data (`bootimage`, given to this record by init), and the table is
@@ -172,7 +176,12 @@ fn main(_: u64) -> u64 {
         LockService::initialize_at(pointer);
         &mut *pointer
     };
-    let ram = Ram::with_storage(now, state, data, tree);
+    // SAFETY: RAM is exclusive permanent storage; every field is written first.
+    let ram = unsafe {
+        let pointer = (*RAM.0.get()).as_mut_ptr();
+        Ram::initialize_at(pointer, now, state, data, tree);
+        &mut *pointer
+    };
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
         return 2;
@@ -196,6 +205,7 @@ fn main(_: u64) -> u64 {
             + core::mem::size_of::<Tables>()
             + core::mem::size_of::<Index>()
             + core::mem::size_of::<LockService>()
+            + core::mem::size_of::<Ram<'static>>()
     );
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
@@ -247,7 +257,7 @@ fn main(_: u64) -> u64 {
 }
 
 struct Fs {
-    ram: Ram<'static>,
+    ram: &'static mut Ram<'static>,
     locks: &'static mut LockService,
     lock_dispatch: LockDispatch,
     lifetimes: Option<lifetime_page::Lifetimes>,
@@ -623,7 +633,7 @@ impl Fs {
         if outcome.phase == ramfs::image::ImagePhase::Prepared {
             if let Some(i) = self.birth_slot(outcome.label) {
                 let (_, image) = self.births[i].as_mut().expect("retained image birth");
-                Self::drop_identity_fields(&mut self.ram, self.identities, image);
+                Self::drop_identity_fields(self.ram, self.identities, image);
                 self.ram.release(image);
                 self.births[i] = None;
             }
@@ -2217,7 +2227,7 @@ impl Fs {
         Ok(())
     }
     fn drop_identity(&mut self, fds: &mut Fds) {
-        Self::drop_identity_fields(&mut self.ram, self.identities, fds);
+        Self::drop_identity_fields(self.ram, self.identities, fds);
     }
     fn drop_identity_fields(ram: &mut Ram<'_>, identities: &mut Identities, fds: &mut Fds) {
         if let Some(root) = fds.binding_preparation.take() {
@@ -2364,7 +2374,7 @@ impl Fs {
     }
 
     fn authenticate(&mut self, fds: &mut Fds, label: u64) -> Result<(), u32> {
-        Self::authenticate_fields(&mut self.ram, self.identities, fds, label)
+        Self::authenticate_fields(self.ram, self.identities, fds, label)
     }
     fn authenticate_fields(
         ram: &mut Ram<'_>,
@@ -2884,7 +2894,7 @@ impl Fs {
                 RetainedSourcePhase::Authenticate => {
                     let source = &mut self.births[slot as usize].as_mut().unwrap().1;
                     let result =
-                        Self::authenticate_fields(&mut self.ram, self.identities, source, label);
+                        Self::authenticate_fields(self.ram, self.identities, source, label);
                     let valid = !matches!(source.binding, Binding::Cleanup);
                     return if !valid {
                         self.reject_binding(fds)
@@ -2902,7 +2912,7 @@ impl Fs {
                 return self.reject_binding(fds);
             }
             let source = &mut self.births[slot as usize].as_mut().unwrap().1;
-            Self::drop_identity_fields(&mut self.ram, self.identities, source);
+            Self::drop_identity_fields(self.ram, self.identities, source);
             source.binding = bound;
             source.authority_index = fds.authority_index;
             source.claimed = true;
@@ -3005,7 +3015,7 @@ impl Fs {
                     });
                 }
             };
-            let data = match ramfs::data::Journal::capture(&mut self.ram, fds, args) {
+            let data = match ramfs::data::Journal::capture(self.ram, fds, args) {
                 Ok(data) => data,
                 Err(code) => {
                     self.ram.storage.release_preparation(charge);
@@ -3131,7 +3141,7 @@ impl Fs {
                     Err(code) => status(code),
                 }
             }
-            Method::DataStep => match data.step(&mut self.ram) {
+            Method::DataStep => match data.step(self.ram) {
                 Ok(true) => Answer::Status(Status::Ok),
                 Ok(false) => status(proto_fs::RESOLVING),
                 Err(code) => status(code),
@@ -3150,7 +3160,7 @@ impl Fs {
                 } else {
                     None
                 };
-                if let Err(code) = data.commit(&mut self.ram, now) {
+                if let Err(code) = data.commit(self.ram, now) {
                     return status(code);
                 }
                 data.outcome(id)
@@ -3216,7 +3226,7 @@ impl Fs {
         }
         let mut out = proto_wire::Writer::new();
         let mut ctx = ramfs::change::Ctx {
-            ram: &mut self.ram,
+            ram: self.ram,
             jobs: &mut *self.jobs,
             generations: &mut *self.job_generations,
             seconds: &mut *self.seconds,
@@ -3338,7 +3348,7 @@ impl Fs {
                 Some(JobOperation::Change(_))
             ) {
                 let mut ctx = ramfs::change::Ctx {
-                    ram: &mut self.ram,
+                    ram: self.ram,
                     jobs: &mut *self.jobs,
                     generations: &mut *self.job_generations,
                     seconds: &mut *self.seconds,
@@ -3355,9 +3365,7 @@ impl Fs {
                 operation: JobOperation::Data(data),
                 ..
             }) = self.jobs[i].as_mut()
-                && !data
-                    .cancel_step(&mut self.ram)
-                    .expect("exact data job cleanup")
+                && !data.cancel_step(self.ram).expect("exact data job cleanup")
             {
                 return false;
             }
@@ -3370,7 +3378,7 @@ impl Fs {
                     let fds = fds
                         .as_deref_mut()
                         .expect("open job retains its owning session");
-                    open.cancel(&mut self.ram, fds, &mut j.root)
+                    open.cancel(self.ram, fds, &mut j.root)
                         .expect("exact open job cleanup");
                 }
                 path.resolver.release(&mut self.ram.storage);
@@ -3502,7 +3510,7 @@ impl Fs {
                         Ok(proof) => proof,
                         Err(code) => return status(code),
                     };
-                    let now = match open.needs_time(&self.ram, fds) {
+                    let now = match open.needs_time(self.ram, fds) {
                         Ok(false) => proto_fs::Timestamp::ZERO,
                         Ok(true) => match self.time_source.read_once() {
                             Ok(Some(now)) => now,
@@ -3512,7 +3520,7 @@ impl Fs {
                         Err(code) => return status(code),
                     };
                     if let Err(code) =
-                        open.commit(&mut self.ram, fds, Some(proof), identity, &mut j.root, now)
+                        open.commit(self.ram, fds, Some(proof), identity, &mut j.root, now)
                     {
                         return status(code);
                     }
@@ -3804,7 +3812,7 @@ impl Fs {
                 };
             }
             if !matches!(open.phase, OpenPhase::Resolving)
-                && let Err(code) = open.reset_unpublished(&mut self.ram, fds, &mut j.root)
+                && let Err(code) = open.reset_unpublished(self.ram, fds, &mut j.root)
             {
                 return status(code);
             }
@@ -3920,7 +3928,7 @@ impl Fs {
                 };
             }
             return match open.prepare(
-                &mut self.ram,
+                self.ram,
                 fds,
                 proof.expect("uncommitted path proof"),
                 identity,
@@ -3949,7 +3957,7 @@ impl Fs {
             return Answer::Status(Status::BadSize);
         }
         let now = self.time_source.now();
-        match open.commit(&mut self.ram, fds, proof, identity, &mut j.root, now) {
+        match open.commit(self.ram, fds, proof, identity, &mut j.root, now) {
             Ok(committed) => {
                 debug_assert_eq!(committed, held);
                 Answer::Reply(Outgoing::new())
