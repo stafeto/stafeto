@@ -305,8 +305,7 @@ pub(crate) fn take_place<R>(
     loop {
         collect(Some(owner), here, None, true);
         let step = crate::shared::with_files(|files| match files.job_place(owner) {
-            // An Open may still find every I/O hold occupied. Waiting could
-            // depend on this caller completing another operation.
+            // Every job kind has custody separate from ordinary I/O holds.
             JobPlace::Free => match begin(files) {
                 Ok(taken) => Ok(Step::Taken(taken)),
                 Err(FsError::TooManyOpenFiles) => Err(EAGAIN),

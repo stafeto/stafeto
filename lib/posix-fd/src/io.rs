@@ -432,13 +432,13 @@ mod tests {
         for _ in 0..8 {
             t.begin_scalar(owner(2), 0, 2).unwrap();
         }
-        for _ in 0..16 {
+        for _ in 0..32 {
             t.begin_io(owner(3), 0, 3).unwrap();
         }
         assert_eq!(t.begin_io(owner(3), 0, 4), Err(Error::TooManyOpenFiles));
         assert_eq!(t.begin_scalar(owner(3), 0, 4), Err(Error::TooManyOpenFiles));
         assert_eq!(t.begin_open(owner(3), 4), Err(Error::TooManyOpenFiles));
-        assert_eq!(t.io_tokens().count(), 16);
+        assert_eq!(t.io_tokens().count(), 32);
         assert_eq!(t.get(0), Ok(10));
     }
 
