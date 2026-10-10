@@ -289,7 +289,7 @@ pub struct Fds {
     #[cfg(feature = "auth-probe")]
     pub auth_probe_gc_reservation: Option<storage::Reservation>,
     pub resolvers: [u64; 16],
-    pub open_watermarks: [u64; OPEN_MAX],
+    pub open_watermarks: [u64; proto_fs::JOB_KEY_PLACES],
     pub image_hold: Option<image::ImageHold>,
     pub image_outcome: Option<image::ImageOutcome>,
     /// Exact completed operations survive Close as tombstones until this fd is reused.
@@ -317,7 +317,7 @@ impl Default for Fds {
             #[cfg(feature = "auth-probe")]
             auth_probe_gc_reservation: None,
             resolvers: [0; 16],
-            open_watermarks: [0; OPEN_MAX],
+            open_watermarks: [0; proto_fs::JOB_KEY_PLACES],
             image_hold: None,
             image_outcome: None,
             open_receipts: [OpenReceipt::EMPTY; OPEN_MAX],

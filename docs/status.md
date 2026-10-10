@@ -130,6 +130,10 @@ Bounded paths with interrupts masked are listed in
 
 ## Rust POSIX layer
 
+The [E3 cleanup followups](../notes/e3-followups.md) remove the directory
+restart cap, reserve independent Control custody, separate its FS version 14
+keys, and bound maintenance self-notifications without cleanup progress.
+
 Since step 5a′ the C library is relibc (`tools/build-relibc.py`, the fork
 pinned there): its headers and `libc.a` under `target/relibc/sysroot`, its
 platform the layer's `stafeto_*` functions (`lib/posix-platform`, interface

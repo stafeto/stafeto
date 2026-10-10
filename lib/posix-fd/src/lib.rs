@@ -4,6 +4,7 @@
 //! Process-local descriptors sharing backend open descriptions. The owner
 //! serializes table access and releases backends after unlocking. Ordinary
 //! operation holds and resident Open/Scalar records share the fixed hold budget.
+//! Control records have sixteen additional slots with the common job limit.
 //! A live Open record preserves its completion through fd replacement.
 //! The caller pins this table's address while records or waiters exist.
 
@@ -363,6 +364,8 @@ pub enum JobPlace {
 pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Copy = ()> {
     entries: [EntrySlot<T>; N],
     holds: [HoldSlot<T, R, S, C>; N],
+    /// Control jobs have independent custody while every I/O hold is occupied.
+    controls: [HoldSlot<T, R, S, C>; JOBS_MAX],
     release_early: fn(T) -> bool,
     /// Counts the records of jobs that went; a thread that waits for a place
     /// waits on it. The caller wakes it after unlocking.
@@ -383,6 +386,13 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<
                     held: Held::Empty,
                 }
             }; N],
+            controls: [const {
+                HoldSlot {
+                    generation: 0,
+                    changed: AtomicU32::new(0),
+                    held: Held::Empty,
+                }
+            }; JOBS_MAX],
             release_early: |_| false,
             jobs: AtomicU32::new(0),
         }
@@ -432,6 +442,20 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 });
             }
         }
+        // SAFETY: forming a field address does not read uninitialized storage.
+        let controls =
+            unsafe { core::ptr::addr_of_mut!((*destination).controls) }
+                .cast::<HoldSlot<T, R, S, C>>();
+        for index in 0..JOBS_MAX {
+            // SAFETY: exclusive startup access initializes each additional slot.
+            unsafe {
+                controls.add(index).write(HoldSlot {
+                    generation: 0,
+                    changed: AtomicU32::new(0),
+                    held: Held::Empty,
+                });
+            }
+        }
         // SAFETY: exclusive startup ownership permits initializing this field.
         unsafe {
             core::ptr::addr_of_mut!((*destination).release_early).write(release_early);
@@ -450,6 +474,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     pub fn jobs_in_use(&self) -> usize {
         self.holds
             .iter()
+            .chain(self.controls.iter())
             .filter(|slot| {
                 matches!(
                     slot.held,
@@ -464,6 +489,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     pub fn jobs_owned_by(&self, owner: OwnerToken) -> usize {
         self.holds
             .iter()
+            .chain(self.controls.iter())
             .filter(|slot| match slot.held {
                 Held::Open(record) => record.owner == Some(owner),
                 Held::Scalar(record) => record.owner() == Some(owner),
@@ -475,17 +501,10 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     /// Whether `owner` may take a place for a new job now. The check and the
     /// `begin_*` that follows it run under the same lock of the caller.
-    /// A place needs a free slot of the holds as well as a count of jobs
-    /// under the bound: the slots are shared with the holds of reads and
-    /// writes that wait in other threads, and a slot that goes moves the
-    /// word like a job that goes.
+    /// The resident job count is independent of ordinary I/O holds.
     pub fn job_place(&self, owner: OwnerToken) -> JobPlace {
         let used = self.jobs_in_use();
-        let slot = self
-            .holds
-            .iter()
-            .any(|slot| matches!(slot.held, Held::Empty));
-        if used < JOBS_MAX && slot {
+        if used < JOBS_MAX {
             return JobPlace::Free;
         }
         JobPlace::Full {
@@ -1186,7 +1205,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 entry.state = EntryState::Empty;
             }
         }
-        for slot in &mut self.holds {
+        for slot in self.holds.iter_mut().chain(self.controls.iter_mut()) {
             if matches!(
                 slot.held,
                 Held::Open(_)

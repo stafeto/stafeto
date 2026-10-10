@@ -212,9 +212,8 @@ pub struct PosixFs {
     descriptors: Table<Target, OPEN_MAX, open::Recovery, (), entries::Frame>,
 }
 
-// The record of a Change job (an owner, a claim, the frame of the operation
-// and a result) fits in the payload union of the holds: the table is as large
-// as it was without the record.
+// The record of a Change job fits in the custody payload union.
+// Sixteen dedicated Control slots keep name operations independent of I/O holds.
 const _: () = assert!(
     core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), entries::Frame>>()
         == core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery>>()

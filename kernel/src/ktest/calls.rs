@@ -3095,8 +3095,8 @@ pub fn long_call_polls_end_the_entry_interval(_: &Boot) -> Result<(), &'static s
     with_caller(|c| {
         let kept = sched::entry_timing();
         sched::set_entry_timing((0, 0));
-        sched::entry_started();
         let begun = timer::now();
+        sched::entry_started();
         let made = make_memory(c, 20);
         let whole = timer::now() - begun;
         let (start, longest) = sched::entry_timing();
@@ -3136,8 +3136,8 @@ pub fn long_call_polls_end_the_entry_interval(_: &Boot) -> Result<(), &'static s
                 "mem_create did not stop after a portion",
             )
         })?;
-        sched::entry_started();
         let begun = timer::now();
+        sched::entry_started();
         c.again(Call::ClockNow.number());
         let (start, _) = sched::entry_timing();
         // As exit_loop polls after the call.

@@ -102,7 +102,7 @@ pub use data::{
     data_progress_reply, data_read_reply, data_start_reply, terminal_failure,
 };
 mod directory;
-pub use directory::DirectoryEntry;
+pub use directory::{DirectoryEntry, directory_walk};
 mod info;
 mod time;
 pub use info::NodeInfo;
@@ -115,7 +115,9 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 13;
+pub const VERSION: u16 = 14;
+/// Original descriptor custody keys and sixteen independent Control keys.
+pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
@@ -201,7 +203,7 @@ pub struct OpenKey {
 }
 impl OpenKey {
     pub fn validate(self) -> Result<usize, u32> {
-        if self.slot >= 32 || self.generation == 0 {
+        if self.slot as usize >= JOB_KEY_PLACES || self.generation == 0 {
             return Err(INVALID_ARGUMENT);
         }
         Ok(self.slot as usize)
