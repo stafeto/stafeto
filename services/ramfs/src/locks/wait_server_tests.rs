@@ -165,7 +165,7 @@ fn genuine_actor_internal_cancel_retries_but_client_cancel_is_terminal() {
     );
     assert_eq!(q.query(id).unwrap().phase, WaitPhase::Queued);
     begin(&mut q, &mut table, &mut ram, id, Some(&fds)).unwrap();
-    assert_eq!(cancel(&mut q, 0, 77, wire.key).unwrap().1, true);
+    assert!(cancel(&mut q, 0, 77, wire.key).unwrap().1);
     assert!(table.cancel());
     let result = actor_result(&mut table, &mut ram);
     assert_eq!(
