@@ -283,6 +283,23 @@ impl Queue {
         self.active = Some(id);
         Ok(())
     }
+    /// Retry an internal actor cancellation without recapturing the seek origin.
+    /// An explicit client cancellation always keeps its terminal cancellation path.
+    pub fn retry_active(&mut self) -> Result<bool, u32> {
+        let id = self.active.ok_or(proto_fs::INVALID_ARGUMENT)?;
+        let job = self.job_mut(id)?;
+        if job.cancel_requested {
+            return Ok(false);
+        }
+        assert_eq!(job.phase, Phase::Active);
+        job.phase = Phase::Ready;
+        job.result = WaitReply {
+            phase: WaitPhase::Queued,
+            result: 0,
+        };
+        self.active = None;
+        Ok(true)
+    }
     /// Park a conflict without custody loss; the registration owns notification.
     pub fn sleep(&mut self, id: Id, armed: bool) -> Result<(), u32> {
         let job = self.job_mut(id)?;

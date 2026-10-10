@@ -56,6 +56,30 @@ fn done(result: u32) -> WaitReply {
         result,
     }
 }
+
+#[test]
+fn internal_actor_cancellation_retries_same_capture_but_explicit_cancel_does_not() {
+    let mut ram = Ram::default();
+    let (wire, captured) = fixture(&mut ram);
+    let mut q = queue();
+    let id = q.admit(0, 41, wire, captured, &mut ram.storage).unwrap();
+    q.activate(id).unwrap();
+    assert_eq!(q.retry_active(), Ok(true));
+    assert_eq!(q.active(), None);
+    assert_eq!(q.snapshot(id), Ok((captured, Phase::Ready, false)));
+    assert!(q.has_work());
+    assert_eq!(pins(&ram, captured), 1);
+    q.activate(id).unwrap();
+    assert_eq!(q.request_cancel(id), Ok(true));
+    assert_eq!(q.retry_active(), Ok(false));
+    assert_eq!(q.active(), Some(id));
+    q.complete_active(Err(Error::Cancelled)).unwrap();
+    assert_eq!(q.query(id), Ok(done(proto_fs::LOCK_CANCELLED)));
+    assert!(!q.has_work());
+    assert_eq!(q.retained(), 1);
+    q.release(id, &mut ram.storage).unwrap();
+    assert_eq!(pins(&ram, captured), 0);
+}
 fn pins(ram: &Ram<'_>, captured: Captured) -> u16 {
     ram.storage.node(captured.request.inode).unwrap().pins[Pin::Lock as usize]
 }
