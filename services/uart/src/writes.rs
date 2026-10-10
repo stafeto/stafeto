@@ -180,6 +180,7 @@ struct Room<H> {
     notify: H,
     armed: bool,
     drain: Option<Drain>,
+    last_released: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -233,6 +234,7 @@ impl<H> Rooms<H> {
                     notify,
                     armed: false,
                     drain: None,
+                    last_released: 0,
                 });
                 i
             }
@@ -266,6 +268,9 @@ impl<H> Rooms<H> {
             .iter_mut()
             .flatten()
             .find(|r| r.label == label)?;
+        if key == 0 || room.last_released == key {
+            return None;
+        }
         if let Some(drain) = room.drain.as_mut() {
             if drain.key == key {
                 drain.armed = !drain.ready;
@@ -338,15 +343,18 @@ impl<H> Rooms<H> {
     }
 
     /// Remove this exact observation while retaining the paid ROOM handle.
+    /// Retain one full key so a lost short reply can be retried without
+    /// removing a newer observation or reopening the released operation.
     pub fn drain_release(&mut self, label: u64, key: u64) -> bool {
         let Some(room) = self.places.iter_mut().flatten().find(|r| r.label == label) else {
             return false;
         };
         if room.drain.is_some_and(|d| d.key == key) {
             room.drain = None;
+            room.last_released = key;
             true
         } else {
-            false
+            key != 0 && room.last_released == key
         }
     }
 
@@ -391,6 +399,40 @@ mod tests {
         assert!(!rooms.drain_release(0x100000001, 90));
         assert!(rooms.drain_release(0x100000001, 91));
         assert_eq!(rooms.room(0x100000001, None, false), Armed::Armed);
+    }
+
+    #[test]
+    fn released_drain_replays_a_lost_reply_without_touching_new_observers() {
+        let mut rooms = Rooms::new();
+        let old = 0x100000007;
+        let new = 0x200000007;
+        let other = 0x300000007;
+        rooms.room(1, Some(11), true);
+        rooms.room(2, Some(22), true);
+        assert_eq!(rooms.drain_begin(1, old, 3), Some(false));
+        assert_eq!(rooms.drain_begin(2, other, 10), Some(false));
+        rooms.drain_complete(3, |_| {});
+        // The backend accepted RELEASE, but its first short reply was lost.
+        assert!(rooms.drain_release(1, old));
+        assert!(rooms.drain_release(1, old));
+        assert_eq!(rooms.drain_begin(1, old, 100), None);
+        assert_eq!(rooms.drain_begin(1, new, 7), Some(false));
+        // A delayed replay cannot release a different full-generation key.
+        assert!(rooms.drain_release(1, old));
+        assert_eq!(rooms.drain(1, new), Some(false));
+        assert_eq!(rooms.drain_target(3), Some(7));
+        assert_eq!(rooms.drain(2, other), Some(false));
+        assert!(!rooms.drain_release(2, old));
+        assert!(!rooms.drain_release(1, other));
+        assert!(!rooms.drain_release(1, 0));
+        assert_eq!(rooms.drain_begin(1, old, 100), None);
+        assert!(rooms.drain_release(1, new));
+        assert!(rooms.drain_release(1, new));
+        assert!(!rooms.drain_release(1, old));
+        rooms.gone(1);
+        rooms.room(1, Some(33), true);
+        assert!(!rooms.drain_release(1, new));
+        assert_eq!(rooms.drain_begin(1, new, 11), Some(false));
     }
 
     #[test]
