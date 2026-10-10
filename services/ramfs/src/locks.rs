@@ -61,6 +61,38 @@ impl Range {
         self.first <= other.last && other.first <= self.last
     }
 
+    /// The retained edges after removing a region, in increasing order.
+    /// The caller can reserve both edges before publishing an unlock.
+    pub fn subtract(self, cut: Self) -> [Option<Self>; 2] {
+        if !self.overlaps(cut) {
+            return [Some(self), None];
+        }
+        let left = (self.first < cut.first).then(|| Self {
+            first: self.first,
+            last: cut.first - 1,
+        });
+        let right = (cut.last < self.last).then(|| Self {
+            first: cut.last + 1,
+            last: self.last,
+        });
+        match (left, right) {
+            (None, right) => [right, None],
+            (left, right) => [left, right],
+        }
+    }
+
+    /// Join adjacent or overlapping regions. A gap leaves them separate.
+    pub fn merge(self, other: Self) -> Option<Self> {
+        // Valid offsets are at most i64::MAX, so adding one fits in u64.
+        if self.first > other.last + 1 || other.first > self.last + 1 {
+            return None;
+        }
+        Some(Self {
+            first: self.first.min(other.first),
+            last: self.last.max(other.last),
+        })
+    }
+
     /// The canonical SEEK_SET pair. A range through OFFSET_MAX uses zero
     /// length, including a finite request ending at that same final byte.
     pub const fn start_and_length(self) -> (i64, i64) {
@@ -103,6 +135,27 @@ impl Lock {
         self.owner != request.owner
             && self.range.overlaps(request.range)
             && (matches!(self.kind, Kind::Write) || matches!(request.kind, Kind::Write))
+    }
+
+    /// The old regions to preserve while this owner changes the cut region.
+    /// Existing records of every other owner are preserved in full.
+    pub fn remainder(self, owner: Owner, cut: Range) -> [Option<Self>; 2] {
+        if self.owner != owner {
+            return [Some(self), None];
+        }
+        self.range
+            .subtract(cut)
+            .map(|range| range.map(|range| Self { range, ..self }))
+    }
+
+    /// Canonical coalescing keeps both the lock type and exact owner.
+    pub fn merge(self, other: Self) -> Option<Self> {
+        if self.owner != other.owner || self.kind != other.kind {
+            return None;
+        }
+        self.range
+            .merge(other.range)
+            .map(|range| Self { range, ..self })
     }
 }
 
@@ -222,6 +275,109 @@ mod tests {
         ] {
             assert!(held.conflicts(lock(other, Kind::Read, 10, 20)));
             assert!(lock(other, Kind::Read, 10, 20).conflicts(held));
+        }
+    }
+
+    #[test]
+    fn removing_a_middle_region_retains_both_edges_and_their_type() {
+        let owner = Owner::Process(256);
+        let original = lock(owner, Kind::Write, 10, 30);
+        assert_eq!(
+            original.remainder(owner, Range::relative(0, 20, 10).unwrap()),
+            [
+                Some(lock(owner, Kind::Write, 10, 10)),
+                Some(lock(owner, Kind::Write, 30, 10)),
+            ]
+        );
+        assert_eq!(original.remainder(owner, original.range), [None, None]);
+        assert_eq!(
+            original.remainder(Owner::Process(512), original.range),
+            [Some(original), None]
+        );
+        assert_eq!(
+            original.remainder(owner, Range::relative(0, 40, 1).unwrap()),
+            [Some(original), None]
+        );
+    }
+
+    #[test]
+    fn subtract_handles_the_first_and_last_representable_bytes() {
+        let all = Range::relative(0, 0, 0).unwrap();
+        let first = Range::relative(0, 0, 1).unwrap();
+        let last = Range::relative(0, i64::MAX, 1).unwrap();
+        assert_eq!(all.subtract(first)[0].unwrap().start_and_length(), (1, 0));
+        assert_eq!(
+            all.subtract(last)[0].unwrap().start_and_length(),
+            (0, i64::MAX)
+        );
+        assert_eq!(last.subtract(last), [None, None]);
+        assert_eq!(
+            all.subtract(Range::relative(0, 1, 0).unwrap()),
+            [Some(first), None]
+        );
+    }
+
+    #[test]
+    fn coalescing_preserves_gaps_kinds_and_exact_owners() {
+        let a = lock(Owner::Process(256), Kind::Read, 10, 10);
+        let next = lock(a.owner, a.kind, 20, 10);
+        let expected = Some(lock(a.owner, a.kind, 10, 20));
+        assert_eq!(a.merge(next), expected);
+        assert_eq!(next.merge(a), expected);
+        assert_eq!(
+            a.merge(lock(a.owner, a.kind, 19, 10)),
+            Some(lock(a.owner, a.kind, 10, 19))
+        );
+        assert_eq!(a.merge(lock(a.owner, a.kind, 21, 10)), None);
+        assert_eq!(
+            a.merge(Lock {
+                kind: Kind::Write,
+                ..next
+            }),
+            None
+        );
+        assert_eq!(
+            a.merge(Lock {
+                owner: Owner::Process(512),
+                ..next
+            }),
+            None
+        );
+        let last = lock(a.owner, a.kind, i64::MAX, 1);
+        assert_eq!(last.merge(last), Some(last));
+    }
+
+    #[test]
+    fn range_algebra_matches_a_small_independent_byte_model() {
+        let bits = |range: Range| {
+            (range.first()..=range.last()).fold(0_u32, |bits, byte| bits | (1 << byte))
+        };
+        for first in 0..16 {
+            for last in first..16 {
+                let range = Range::relative(0, first, last - first + 1).unwrap();
+                for cut_first in 0..16 {
+                    for cut_last in cut_first..16 {
+                        let cut = Range::relative(0, cut_first, cut_last - cut_first + 1).unwrap();
+                        let kept = range.subtract(cut);
+                        let actual = kept
+                            .into_iter()
+                            .flatten()
+                            .fold(0, |mask, edge| mask | bits(edge));
+                        assert_eq!(actual, bits(range) & !bits(cut));
+                        assert_eq!(range.overlaps(cut), bits(range) & bits(cut) != 0);
+                        let union = bits(range) | bits(cut);
+                        let contiguous = union.count_ones()
+                            == 32 - union.leading_zeros() - union.trailing_zeros();
+                        assert_eq!(range.merge(cut).is_some(), contiguous);
+                        if let Some(merged) = range.merge(cut) {
+                            assert_eq!(bits(merged), union);
+                        }
+                        if let [Some(left), Some(right)] = kept {
+                            assert!(left.last() < right.first());
+                        }
+                    }
+                }
+            }
         }
     }
 }
