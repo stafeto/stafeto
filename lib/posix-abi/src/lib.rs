@@ -221,7 +221,7 @@ pub fn openat_policy(
 }
 
 pub fn close(number: c_int) -> Result<(), c_int> {
-    shared::unit(Request::Close { fd: fd(number)? })
+    close_driver::close(fd(number)?)
 }
 
 /// Reads into `buffer`: a point of cancellation.
