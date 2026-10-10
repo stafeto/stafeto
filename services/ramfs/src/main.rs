@@ -26,6 +26,7 @@ use ramfs::locks::jobs::Queue as LockQueue;
 use ramfs::locks::service::LockService;
 use ramfs::locks::wait_events::Events as WaitEvents;
 use ramfs::locks::wait_notifications::Notifications as WaitNotifications;
+use ramfs::locks::wait_proof::Proof as WaitProof;
 use ramfs::locks::wait_receipts::Queue as WaitQueue;
 use ramfs::locks::wait_select::{Decision as WaitDecision, Selector as WaitSelector};
 use ramfs::locks::waiters::Pool as WaitPool;
@@ -136,6 +137,10 @@ struct WaitSelectorBss(UnsafeCell<core::mem::MaybeUninit<WaitSelector>>);
 unsafe impl Sync for WaitSelectorBss {}
 static WAIT_SELECTOR: WaitSelectorBss =
     WaitSelectorBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct WaitProofBss(UnsafeCell<core::mem::MaybeUninit<WaitProof>>);
+// SAFETY: the sole service thread owns paid read-only proof scratch.
+unsafe impl Sync for WaitProofBss {}
+static WAIT_PROOF: WaitProofBss = WaitProofBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 // The service loop reserves label zero for its heartbeat timer.
 const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
 const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
@@ -242,6 +247,12 @@ fn main(_: u64) -> u64 {
         Ram::initialize_at(pointer, now, state, data, tree);
         &mut *pointer
     };
+    // SAFETY: exclusive permanent scratch, initialized field by field.
+    let wait_proof = unsafe {
+        let proof = (*WAIT_PROOF.0.get()).as_mut_ptr();
+        WaitProof::initialize_at(proof);
+        &mut *proof
+    };
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
         return 2;
@@ -277,6 +288,7 @@ fn main(_: u64) -> u64 {
             + core::mem::size_of::<WaitPool>()
             + core::mem::size_of::<WaitNotifications<Handle<Channel>>>()
             + core::mem::size_of::<WaitEvents>()
+            + core::mem::size_of::<WaitProof>()
             + core::mem::size_of::<WaitSelector>()
             + core::mem::size_of::<Ram<'static>>()
     );
@@ -293,6 +305,14 @@ fn main(_: u64) -> u64 {
         wait_events,
         wait_selector,
         wait_selection: None,
+        wait_proof,
+        wait_proof_scan: None,
+        wait_proof_scan_remaining: 0,
+        wait_proof_choice: None,
+        wait_proof_active: false,
+        wait_proof_next: 0,
+        wait_proof_serial: 0,
+        wait_proof_disabled: false,
         wait_timer,
         _wait_view: wait_view,
         wait_timer_armed: false,
@@ -354,6 +374,18 @@ struct Fs {
     wait_events: &'static mut WaitEvents,
     wait_selector: &'static mut WaitSelector,
     wait_selection: Option<ramfs::locks::jobs::Id>,
+    wait_proof: &'static mut WaitProof,
+    wait_proof_scan: Option<ramfs::locks::waiters::Cursor>,
+    wait_proof_scan_remaining: u8,
+    wait_proof_choice: Option<(
+        u8,
+        ramfs::locks::waiters::RegistrationToken,
+        ramfs::locks::request::Captured,
+    )>,
+    wait_proof_active: bool,
+    wait_proof_next: u8,
+    wait_proof_serial: u64,
+    wait_proof_disabled: bool,
     wait_timer: Handle<Timer>,
     _wait_view: Handle<Channel>,
     wait_timer_armed: bool,
@@ -2863,6 +2895,174 @@ impl Fs {
         {
             self.publish_wait(id);
         }
+    }
+    /// Schedule one finite optional episode. Events coalesce; completion itself
+    /// never schedules another episode or self-notifies.
+    fn schedule_wait_proof(&mut self) {
+        if self.wait_proof_disabled
+            || self.wait_proof_active
+            || self.wait_proof_scan.is_some()
+            || self.wait_proof_choice.is_some()
+            || self.wait_pool.count() == 0
+        {
+            return;
+        }
+        self.wait_proof_scan = Some(self.wait_pool.cursor());
+        self.wait_proof_scan_remaining = ramfs::locks::waiters::CAPACITY as u8;
+    }
+    fn wait_proof_pending(&self) -> bool {
+        self.wait_proof_active || self.wait_proof_scan.is_some() || self.wait_proof_choice.is_some()
+    }
+    /// Caller gives this helper its own maintenance turn; never follow an
+    /// eight-object Actor/Reader/Selector portion in the same turn.
+    fn tick_wait_proof(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        if self.wait_proof_active {
+            let page = self.lifetimes.as_ref();
+            let (storage, descriptions) = self.ram.lock_parts();
+            let progress = self.wait_proof.step(
+                self.wait_jobs,
+                self.wait_pool,
+                self.locks,
+                storage,
+                |pid| page.is_some_and(|page| page.live(pid)),
+                |ofd| descriptions.live(ofd),
+            );
+            let Some(outcome) = progress.outcome else {
+                return;
+            };
+            self.wait_proof_active = false;
+            if outcome.verdict == ramfs::locks::deadlock::Verdict::Deadlock
+                && self.wait_proof_source_live(sessions, outcome)
+            {
+                self.wait_jobs
+                    .complete(
+                        outcome.candidate,
+                        proto_fs::WaitReply {
+                            phase: proto_fs::WaitPhase::Complete,
+                            result: proto_fs::LOCK_DEADLOCK,
+                        },
+                    )
+                    .expect("exact pending proof candidate canonical completion");
+                self.publish_wait(outcome.candidate);
+            }
+            return;
+        }
+        if let Some(cursor) = &mut self.wait_proof_scan {
+            let queue = &*self.wait_jobs;
+            let next = self.wait_proof_next;
+            let choice = &mut self.wait_proof_choice;
+            let scanned = self.wait_pool.scan(cursor, |token, _, phase| {
+                if phase != ramfs::locks::waiters::Phase::Sleeping {
+                    return;
+                }
+                let Ok((captured, phase, cancelling)) = queue.snapshot(token.receipt()) else {
+                    return;
+                };
+                if phase != ramfs::locks::wait_receipts::Phase::Sleeping
+                    || cancelling
+                    || !matches!(captured.request.owner, ramfs::locks::Owner::Process(_))
+                {
+                    return;
+                }
+                let rank = ((token.slot() + ramfs::locks::waiters::CAPACITY - usize::from(next))
+                    % ramfs::locks::waiters::CAPACITY) as u8;
+                if choice.as_ref().is_none_or(|old| rank < old.0) {
+                    *choice = Some((rank, token, captured));
+                }
+            });
+            if scanned.is_err() {
+                self.wait_proof_scan = None;
+                self.wait_proof_choice = None;
+            } else {
+                self.wait_proof_scan_remaining = self
+                    .wait_proof_scan_remaining
+                    .saturating_sub(scanned.expect("successful finite proof scan") as u8);
+                if cursor.done() || self.wait_proof_scan_remaining == 0 {
+                    self.wait_proof_scan = None;
+                }
+            }
+            return;
+        }
+        let Some((_, token, captured)) = self.wait_proof_choice.take() else {
+            return;
+        };
+        self.wait_proof_next = ((token.slot() + 1) % ramfs::locks::waiters::CAPACITY) as u8;
+        let Some(serial) = self.wait_proof_serial.checked_add(1) else {
+            self.wait_proof_disabled = true;
+            return;
+        };
+        self.wait_proof_serial = serial;
+        let receipt = token.receipt();
+        self.wait_proof_active = self.wait_proof.start(
+            self.wait_jobs,
+            self.wait_pool,
+            token,
+            captured,
+            ramfs::locks::deadlock::Scope {
+                owner: receipt.owner(),
+                key: receipt.key(),
+                scan: serial,
+            },
+        );
+    }
+    /// A proof spans service turns; recheck exact local and genuine RAM source
+    /// authority immediately before publishing an optional terminal error.
+    fn wait_proof_source_live(
+        &self,
+        sessions: &[Option<Session<Fds, 0>>],
+        outcome: ramfs::locks::wait_proof::Outcome,
+    ) -> bool {
+        let id = outcome.candidate;
+        let Some(registration) = self.wait_pool.find(id) else {
+            return false;
+        };
+        if !self
+            .wait_pool
+            .snapshot(registration)
+            .is_ok_and(|(input, phase)| {
+                phase == ramfs::locks::waiters::Phase::Sleeping
+                    && input.root == outcome.captured.root
+                    && input.inode == outcome.captured.request.inode
+                    && input.range == outcome.captured.request.range
+                    && outcome.captured.request.command
+                        == ramfs::locks::actor::Command::Set(Some(input.kind))
+            })
+            || !self
+                .wait_jobs
+                .snapshot(id)
+                .is_ok_and(|(captured, phase, cancelling)| {
+                    captured == outcome.captured
+                        && phase == ramfs::locks::wait_receipts::Phase::Sleeping
+                        && !cancelling
+                })
+        {
+            return false;
+        }
+        let ramfs::locks::Owner::Process(pid) = outcome.captured.request.owner else {
+            return false;
+        };
+        if !self.lifetimes.as_ref().is_some_and(|page| page.live(pid))
+            || !self.locks.pid_visible(pid)
+        {
+            return false;
+        }
+        let place = usize::from(id.slot()) / ramfs::locks::wait_receipts::SHARE;
+        let source = sessions
+            .get(place)
+            .and_then(Option::as_ref)
+            .filter(|session| session.label() == id.owner() && session.data.claimed)
+            .map(|session| &session.data)
+            .or_else(|| {
+                self.births
+                    .get(Self::birth_index(id.owner()))
+                    .and_then(Option::as_ref)
+                    .filter(|(label, _)| *label == id.owner())
+                    .map(|(_, fds)| fds)
+            });
+        source
+            .filter(|fds| !fds.departed)
+            .and_then(|fds| self.ram.live_description(fds, outcome.captured.source).ok())
+            .is_some_and(|(inode, _)| inode == outcome.captured.request.inode)
     }
     fn notify_maintenance(&self) {
         if self.legacy_pending
