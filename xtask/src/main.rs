@@ -3220,6 +3220,8 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: public lock reply loss, exact keys, full GET receipt, numeric close and reuse ok ticks=",
         "posix-procs: lock depth within 16 KiB, nested SIGUSR1 close, siglongjmp and thread departure ok",
         "posix-procs: true WAIT unlock, SIGUSR1, restart, close/reuse and canonical success ok",
+        "posix-procs: genuine FIFO oldest eligible Read, blocked older Write and later PID SET ok",
+        "posix-procs: FIFO own dispatch ",
         "posix-procs: genuine PID cycle EDEADLK and OFD noncycle ok",
     ] {
         qemu::expect_marker(&outcome, marker)?;

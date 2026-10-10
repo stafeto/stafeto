@@ -49,6 +49,39 @@ fn call(bytes: &[u8]) -> Result<([u8; 128], usize), i32> {
     Ok((buffer, len))
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn wait_fifo_ticks() -> i32 {
+    let result = (|| {
+        let mut packet = [0; 20];
+        packet[..8].copy_from_slice(
+            &Header {
+                method: 0xfff2,
+                version: proto_fs::VERSION,
+            }
+            .bytes(),
+        );
+        packet[8..12].copy_from_slice(&63u32.to_le_bytes());
+        packet[12..20].copy_from_slice(&16u64.to_le_bytes());
+        let (bytes, len) = call(&packet)?;
+        let mut reader = Reader::new(&bytes[..len]);
+        if reader.u32().map_err(|_| -26)? != 0 {
+            return Err(-27);
+        }
+        let ticks = reader.u64().map_err(|_| -28)?;
+        let detail = reader.u64().map_err(|_| -29)?;
+        reader.finish().map_err(|_| -30)?;
+        rt::println!(
+            "posix-procs: FIFO own dispatch {} ticks detail {}",
+            ticks,
+            detail
+        );
+        if ticks == 0 || ticks > 20410 || detail != 16 {
+            return Err(-31);
+        }
+        Ok(())
+    })();
+    result.err().unwrap_or(0)
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn wait_fifo_arm(fd: i32, holder: u32, nonce: u64) -> i32 {
     let result = (|| {
         let backend = posix_abi::shared::with_files(|f| {

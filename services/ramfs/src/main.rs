@@ -3168,6 +3168,11 @@ impl Fs {
         let (Ok(action), Ok(nonce)) = (body.u32(), body.u64()) else {
             return Answer::Status(Status::BadSize);
         };
+        #[cfg(feature = "steps")]
+        if action == 63 && nonce == 16 && body.left() == 0 {
+            return rt::service::step_snapshot(r);
+        }
+        rt::service::step_detail(16);
         if action == 1 {
             let (Ok(packed), Ok(generation), Ok(holder)) = (body.u32(), body.u64(), body.u32())
             else {

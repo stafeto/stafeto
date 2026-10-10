@@ -3,6 +3,7 @@
 extern void wait_fifo_hooks_begin(void), wait_fifo_hooks_end(void);
 extern int wait_fifo_arm(int fd, unsigned holder, unsigned long long nonce);
 extern int wait_fifo_selected(unsigned long long nonce, unsigned index);
+extern int wait_fifo_ticks(void);
 static _Thread_local unsigned fifo_index;
 static int fifo_ready[2];
 unsigned wait_fifo_index(void) { return fifo_index; }
@@ -70,5 +71,6 @@ static void public_wait_fifo(void) {
         wait_fifo_hooks_end();expect("clear child FIFO locks",wait_holder_exchange(commands[1],replies[0],'C'),1);
     }
     expect("destroy FIFO attrs",pthread_attr_destroy(&attributes),0);char quit='Q';expect("stop FIFO holder",write(commands[1],&quit,1),1);close(commands[1]);close(replies[0]);reap(holder,0);close(fd);
+    expect("FIFO own dispatch ticks under B",wait_fifo_ticks(),0);
     if(!failures)printf("posix-procs: genuine FIFO oldest eligible Read, blocked older Write and later PID SET ok\n");
 }
