@@ -693,7 +693,7 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
 /// Final lifetime callbacks perform local transitions and retain remote ownership.
 pub fn detach_open_owner(owner: u64) -> bool {
     let opens = crate::open_driver::detach(owner);
-    // Every resident Control family loses this exact native lifetime.
+    // Resident Control and WAIT custody lose this exact native lifetime.
     let changes = crate::change::detach(owner);
     let closes = crate::close_driver::detach(owner);
     opens && changes && closes
