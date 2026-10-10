@@ -2355,7 +2355,9 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
         }
         check_waits(&output.lines, &["1", "5"], "POSIX terminal steps")?;
         let tty = longest_steps(&output.lines, "5");
-        for kind in 16..=20 {
+        // This POSIX fixture calls Acquire, SetPgrp, GetPgrp and GetSid.
+        // The separate native control probe also measures Controlling.
+        for kind in 16..=19 {
             let ticks = tty.iter().find(|row| row.0 == kind).map_or(0, |row| row.1);
             if ticks == 0 {
                 return Err(format!(
