@@ -838,3 +838,7 @@ mod tests {
         assert_eq!(queue.query(id), Ok(complete()));
     }
 }
+
+#[cfg(test)]
+#[path = "internal_cancel_tests.rs"]
+mod internal_cancel_tests;
