@@ -5,20 +5,18 @@ Removing the currently scanned child can restart a walk arbitrarily often.
 A transport failure or interruption terminates the walk with its original status.
 The host probe exercises 64 restarts followed by a result or terminal error.
 
-Control records have sixteen independent custody slots. The ordinary I/O,
-Open and Scalar hold array keeps its original size. Open, Scalar and Control
-records still share the session limit of sixteen outstanding jobs. When a
-job place exists and an Open cannot allocate its ordinary hold, admission
-returns EAGAIN. Waiting on I/O that depends on the calling thread can deadlock.
-The host probe occupies all 32 I/O holds, completes sixteen Control outcomes,
-and checks acknowledgement, cleanup and reuse. Fork discards both arrays of
-resident records while preserving published descriptor references.
+Open, Scalar and Control records share sixteen resident custody slots,
+independent of the 32 ordinary I/O holds. All job kinds retain the session
+limit of sixteen outstanding jobs. A free job place permits an Open or Scalar
+record while all I/O holds are occupied. The host probe occupies 32 I/O holds
+and allocates sixteen Open or Scalar records in separate runs. A full resident
+budget retains acknowledged cleanup debt until remote confirmation. Fork
+clears resident recovery while preserving published descriptor references.
 
-Control wire keys use places 32 through 47. Original Open and Scalar keys
-retain places 0 through 31. FS version 14 and 48 service watermarks keep
-simultaneous Open and Control generations distinct. Each session or retained
-birth has 128 additional watermark bytes. Custody slots retain their existing
-payload union and initialization rules.
+Resident wire keys use places 32 through 47. Recoverable I/O retains places
+0 through 31. The shared resident array assigns distinct keys and generations
+across Open, Scalar and Control. FS version 14, the 48 service watermarks,
+the table size and the allocation size remain unchanged.
 
 Maintenance has 1,792 consecutive own dispatches without confirmed progress:
 four turns per orphan slot and two per session/birth slot fit in that bound. Returning

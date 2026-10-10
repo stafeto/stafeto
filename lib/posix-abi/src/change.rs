@@ -124,6 +124,15 @@ pub fn probe_hook(hook: Option<fn(Probe) -> bool>) {
 #[cfg(feature = "change-probe")]
 static INTERRUPTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Genuine queued Step cancellations, excluding suppressed hook replies.
+#[cfg(feature = "change-probe")]
+static INTERRUPTED_STEPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "change-probe")]
+pub fn interrupted_step_requests() -> u32 {
+    INTERRUPTED_STEPS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// The requests the kernel took back since the start of the process.
 #[cfg(feature = "change-probe")]
 pub fn interrupted_requests() -> u32 {
@@ -135,6 +144,9 @@ pub fn interrupted_requests() -> u32 {
 fn probe<T>(kind: Probe, reply: Result<T, Status>) -> Result<T, Status> {
     if matches!(reply, Err(Status::Kernel(rt::abi::Error::Interrupted))) {
         INTERRUPTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if kind == Probe::Step {
+            INTERRUPTED_STEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
     let hook = HOOK.load(core::sync::atomic::Ordering::Acquire);
     if hook == 0 {
@@ -305,8 +317,7 @@ pub(crate) fn take_place<R>(
     loop {
         collect(Some(owner), here, None, true);
         let step = crate::shared::with_files(|files| match files.job_place(owner) {
-            // An Open may still find every I/O hold occupied. Waiting could
-            // depend on this caller completing another operation.
+            // Every job kind has custody separate from ordinary I/O holds.
             JobPlace::Free => match begin(files) {
                 Ok(taken) => Ok(Step::Taken(taken)),
                 Err(FsError::TooManyOpenFiles) => Err(EAGAIN),

@@ -112,3 +112,34 @@ pub extern "C" fn files_names_pause() -> i32 {
         -3
     }
 }
+
+static SIGNAL_STEP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Pause only after five completed Steps; every driver reply remains intact.
+fn signal_step_hook(kind: posix_abi::change::Probe) -> bool {
+    use core::sync::atomic::Ordering::SeqCst;
+    if kind == posix_abi::change::Probe::Step && SIGNAL_STEP.fetch_add(1, SeqCst) == 4 {
+        let status = files_names_pause();
+        unsafe extern "C" {
+            fn files_names_step_pause_ready(status: c_int);
+        }
+        // SAFETY: the probe publishes a scalar status to its sender thread.
+        unsafe { files_names_step_pause_ready(status) };
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn files_names_step_pause(enabled: c_int) {
+    SIGNAL_STEP.store(0, core::sync::atomic::Ordering::SeqCst);
+    posix_abi::change::probe_hook(if enabled != 0 {
+        Some(signal_step_hook)
+    } else {
+        None
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn files_names_interrupted_steps() -> u32 {
+    posix_abi::change::interrupted_step_requests()
+}

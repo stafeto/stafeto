@@ -13,7 +13,7 @@ pub struct ScalarToken {
 
 impl ScalarToken {
     pub fn slot(self) -> usize {
-        self.slot
+        32 + self.slot
     }
     pub fn generation(self) -> u64 {
         self.generation
@@ -140,13 +140,16 @@ impl<T: Copy, S: Copy> ScalarRecord<T, S> {
 
 impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
     pub(super) fn scalar_pinned(&self, backend: T) -> bool {
-        self.holds
+        self.residents
             .iter()
             .any(|slot| matches!(slot.held, Held::Scalar(r) if r.pin == Some(backend)))
     }
 
     fn scalar_record(&self, token: ScalarToken) -> Result<ScalarRecord<T, S>, Error> {
-        let slot = self.holds.get(token.slot).ok_or(Error::BadFileDescriptor)?;
+        let slot = self
+            .residents
+            .get(token.slot)
+            .ok_or(Error::BadFileDescriptor)?;
         if slot.generation != token.generation {
             return Err(Error::BadFileDescriptor);
         }
@@ -170,13 +173,13 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     fn save_scalar(&mut self, token: ScalarToken, record: ScalarRecord<T, S>) {
-        let slot = &mut self.holds[token.slot];
+        let slot = &mut self.residents[token.slot];
         slot.held = Held::Scalar(record);
         slot.change();
     }
 
     fn free_scalar(&mut self, token: ScalarToken) {
-        let slot = &mut self.holds[token.slot];
+        let slot = &mut self.residents[token.slot];
         slot.held = Held::Empty;
         slot.change();
         self.job_gone();
@@ -195,8 +198,9 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             return Err(Error::InvalidArgument);
         }
         let (index, slot) = self
-            .holds
+            .residents
             .iter_mut()
+            .take(N.min(JOBS_MAX))
             .enumerate()
             .find(|(_, slot)| {
                 matches!(slot.held, Held::Empty)
@@ -236,7 +240,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     pub fn scalar_tokens(&self) -> impl Iterator<Item = ScalarToken> + '_ {
-        self.holds.iter().enumerate().filter_map(|(slot, h)| {
+        self.residents.iter().enumerate().filter_map(|(slot, h)| {
             matches!(h.held, Held::Scalar(_)).then_some(ScalarToken {
                 slot,
                 generation: h.generation,
@@ -395,21 +399,21 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     /// Detach one original or helper reference. Native lifetime checks belong
     /// to the caller, whose final detach precedes reusable thread-place release.
     pub fn abandon_scalar_owner(&mut self, owner: OwnerToken) -> Option<ScalarAbandoned<T, S>> {
-        let (slot, record) = self
-            .holds
-            .iter()
-            .enumerate()
-            .find_map(|(slot, h)| match h.held {
-                Held::Scalar(record)
-                    if record.owner == Some(owner) || record.claimant == Some(owner) =>
-                {
-                    Some((slot, record))
-                }
-                _ => None,
-            })?;
+        let (slot, record) =
+            self.residents
+                .iter()
+                .enumerate()
+                .find_map(|(slot, h)| match h.held {
+                    Held::Scalar(record)
+                        if record.owner == Some(owner) || record.claimant == Some(owner) =>
+                    {
+                        Some((slot, record))
+                    }
+                    _ => None,
+                })?;
         let token = ScalarToken {
             slot,
-            generation: self.holds[slot].generation,
+            generation: self.residents[slot].generation,
         };
         if record.owner == Some(owner) {
             return self.abandon_scalar(token).ok();
@@ -422,7 +426,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     /// Stable hold-header address; wake and all RPC happen after unlocking.
     pub fn scalar_wait_word(&self, token: ScalarToken) -> Result<&AtomicU32, Error> {
-        self.holds
+        self.residents
             .get(token.slot)
             .map(|slot| &slot.changed)
             .ok_or(Error::BadFileDescriptor)
@@ -430,7 +434,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     pub fn scalar_wait_snapshot(&self, token: ScalarToken) -> Result<WaitValue, Error> {
         self.scalar_record(token)?;
-        let sequence = self.holds[token.slot].changed.load(Ordering::Acquire);
+        let sequence = self.residents[token.slot].changed.load(Ordering::Acquire);
         Ok(if sequence == u32::MAX {
             WaitValue::NeverSleep
         } else {
@@ -685,7 +689,7 @@ mod tests {
         let mut t = table();
         let (token, old) = t.begin_scalar(owner(1), 0, 1).unwrap();
         t.release_scalar_claim(old).unwrap();
-        let Held::Scalar(record) = &mut t.holds[token.slot].held else {
+        let Held::Scalar(record) = &mut t.residents[token.slot].held else {
             panic!()
         };
         record.serial = u64::MAX - 1;
@@ -707,10 +711,10 @@ mod tests {
     fn saturated_generations_and_waits_allow_paid_cleanup_and_stable_wait_address() {
         let mut t = Table::<u32, 1, (), u64>::default();
         t.place(0, 10, Flags::default()).unwrap();
-        t.holds[0].generation = u64::MAX - 1;
+        t.residents[0].generation = u64::MAX - 1;
         let (token, _) = t.begin_scalar(owner(1), 0, 1).unwrap();
         let address = t.scalar_wait_word(token).unwrap() as *const AtomicU32;
-        t.holds[0].changed.store(u32::MAX, Ordering::Relaxed);
+        t.residents[0].changed.store(u32::MAX, Ordering::Relaxed);
         assert_eq!(t.scalar_wait_snapshot(token), Ok(WaitValue::NeverSleep));
         t.abandon_scalar(token).unwrap();
         t.scalar_begin_cleanup(token).unwrap();
@@ -719,7 +723,7 @@ mod tests {
             address
         );
         t.scalar_finish_cleanup(token).unwrap();
-        assert_eq!(t.holds[0].changed.load(Ordering::Relaxed), u32::MAX);
+        assert_eq!(t.residents[0].changed.load(Ordering::Relaxed), u32::MAX);
         assert_eq!(t.begin_scalar(owner(2), 0, 2), Err(Error::TooManyOpenFiles));
     }
 
@@ -750,21 +754,21 @@ mod tests {
     }
 
     #[test]
-    fn full_32_last_target_debt_stays_paid_until_remote_confirmation() {
+    fn full_job_budget_last_target_debt_stays_paid_until_remote_confirmation() {
         let mut t = Table::<u32, 32, (), u64>::default();
         let mut chosen = None;
-        for fd in 0..32 {
+        for fd in 0..16 {
             t.place(fd, fd + 10, Flags::default()).unwrap();
             let (token, claim) = t.begin_scalar(owner(1), fd, u64::from(fd)).unwrap();
             t.complete_scalar(claim, ScalarResult::Bytes(1)).unwrap();
-            if fd == 31 {
+            if fd == 15 {
                 chosen = Some(token);
             }
             assert_eq!(t.close(fd), Ok(None));
         }
         let token = chosen.unwrap();
         let cleanup = t.scalar_begin_cleanup(token).unwrap();
-        assert_eq!(cleanup.last_target, Some(41));
+        assert_eq!(cleanup.last_target, Some(25));
         t.abandon_scalar(token).unwrap();
         t.place(0, 100, Flags::default()).unwrap();
         assert_eq!(
@@ -772,7 +776,7 @@ mod tests {
             Err(Error::TooManyOpenFiles)
         );
         assert_eq!(t.scalar_begin_cleanup(token), Ok(cleanup));
-        assert_eq!(t.scalar_tokens().count(), 32);
+        assert_eq!(t.scalar_tokens().count(), 16);
         t.scalar_finish_cleanup(token).unwrap();
         let (next, _) = t.begin_scalar(owner(2), 0, 99).unwrap();
         assert_eq!(next.slot(), token.slot());
@@ -836,7 +840,7 @@ mod tests {
         assert_eq!((&*pinned as *const Large).cast_mut(), address);
         for table in [&mut *pinned, &mut ordinary] {
             assert_eq!(table.open().count(), 0);
-            for slot in &table.holds {
+            for slot in &table.residents {
                 assert_eq!(slot.generation, 0);
                 assert_eq!(slot.changed.load(Ordering::Relaxed), 0);
                 assert!(matches!(slot.held, Held::Empty));

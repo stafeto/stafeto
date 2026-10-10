@@ -12,7 +12,7 @@ pub struct ControlToken {
 }
 impl ControlToken {
     pub fn slot(self) -> usize {
-        // Open and Scalar keys occupy the original 32 wire places.
+        // Ordinary recoverable I/O occupies the original 32 wire places.
         32 + self.slot
     }
     pub fn generation(self) -> u64 {
@@ -124,7 +124,7 @@ impl<C: Copy> ControlRecord<C> {
 impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
     fn control_record(&self, token: ControlToken) -> Result<ControlRecord<C>, Error> {
         let slot = self
-            .controls
+            .residents
             .get(token.slot)
             .ok_or(Error::BadFileDescriptor)?;
         if slot.generation != token.generation {
@@ -149,12 +149,12 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         Ok(record)
     }
     fn save_control(&mut self, token: ControlToken, record: ControlRecord<C>) {
-        let slot = &mut self.controls[token.slot];
+        let slot = &mut self.residents[token.slot];
         slot.held = Held::Control(record);
         slot.change();
     }
     fn free_control(&mut self, token: ControlToken) {
-        let slot = &mut self.controls[token.slot];
+        let slot = &mut self.residents[token.slot];
         slot.held = Held::Empty;
         slot.change();
         self.job_gone();
@@ -166,7 +166,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         recovery: C,
     ) -> Result<(ControlToken, ControlClaimToken), Error> {
         let (index, slot) = self
-            .controls
+            .residents
             .iter_mut()
             .take(N.min(JOBS_MAX))
             .enumerate()
@@ -204,7 +204,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         Ok(self.control_record(token)?.snapshot())
     }
     pub fn control_tokens(&self) -> impl Iterator<Item = ControlToken> + '_ {
-        self.controls.iter().enumerate().filter_map(|(slot, h)| {
+        self.residents.iter().enumerate().filter_map(|(slot, h)| {
             matches!(h.held, Held::Control(_)).then_some(ControlToken {
                 slot,
                 generation: h.generation,
@@ -355,7 +355,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     /// Detach one native lifetime. Cleanup keeps its immutable capabilities and key.
     pub fn abandon_control_owner(&mut self, owner: OwnerToken) -> Option<ControlAbandoned<C>> {
         let (slot, record) =
-            self.controls
+            self.residents
                 .iter()
                 .enumerate()
                 .find_map(|(slot, h)| match h.held {
@@ -368,7 +368,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 })?;
         let token = ControlToken {
             slot,
-            generation: self.controls[slot].generation,
+            generation: self.residents[slot].generation,
         };
         if record.owner == Some(owner) {
             return self.abandon_control(token).ok();
@@ -380,14 +380,14 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
     /// This address remains stable through reuse; wake occurs after unlocking.
     pub fn control_wait_word(&self, token: ControlToken) -> Result<&AtomicU32, Error> {
-        self.controls
+        self.residents
             .get(token.slot)
             .map(|slot| &slot.changed)
             .ok_or(Error::BadFileDescriptor)
     }
     pub fn control_wait_snapshot(&self, token: ControlToken) -> Result<WaitValue, Error> {
         self.control_record(token)?;
-        let sequence = self.controls[token.slot].changed.load(Ordering::Acquire);
+        let sequence = self.residents[token.slot].changed.load(Ordering::Acquire);
         Ok(if sequence == u32::MAX {
             WaitValue::NeverSleep
         } else {
@@ -548,14 +548,17 @@ mod tests {
         let (scalar, _) = table.begin_scalar(owner(1), scalar_fd, 200).unwrap();
         let (open, _) = table.begin_open(owner(1), 300).unwrap();
         let mut last = None;
-        for value in 0..JOBS_MAX {
+        for value in 2..JOBS_MAX {
             last = Some(table.begin_control(owner(1), value as u64).unwrap());
         }
         assert_eq!(
             table.begin_control(owner(2), 999),
             Err(Error::TooManyOpenFiles)
         );
-        assert!(table.begin_open(owner(2), 999).is_ok());
+        assert_eq!(
+            table.begin_open(owner(2), 999),
+            Err(Error::TooManyOpenFiles)
+        );
         let (token, claim) = last.unwrap();
         table
             .complete_control(claim, ControlResult::Value(31))
@@ -619,10 +622,10 @@ mod tests {
     #[test]
     fn terminal_counters_preserve_cleanup_and_stable_wait_address() {
         let mut table = Small::default();
-        table.controls[0].generation = u64::MAX - 1;
+        table.residents[0].generation = u64::MAX - 1;
         let (token, claim) = table.begin_control(owner(1), 70).unwrap();
         let address = table.control_wait_word(token).unwrap() as *const AtomicU32;
-        table.controls[0]
+        table.residents[0]
             .changed
             .store(u32::MAX - 1, Ordering::Relaxed);
         table.release_control_claim(claim).unwrap();
@@ -630,7 +633,7 @@ mod tests {
             table.control_wait_snapshot(token),
             Ok(WaitValue::NeverSleep)
         );
-        let Held::Control(record) = &mut table.controls[0].held else {
+        let Held::Control(record) = &mut table.residents[0].held else {
             panic!("control")
         };
         record.serial = u64::MAX - 1;
@@ -689,8 +692,9 @@ mod tests {
         let (control, _) = table.begin_control(owner(1), 2).unwrap();
         assert_eq!(open.generation(), control.generation());
         assert_ne!(open.slot(), control.slot());
-        assert_eq!(control.slot(), 32);
-        for _ in 1..JOBS_MAX {
+        assert_eq!(open.slot(), 32);
+        assert_eq!(control.slot(), 33);
+        for _ in 2..JOBS_MAX {
             table.begin_control(owner(1), 2).unwrap();
         }
         assert_eq!(table.control_tokens().map(|t| t.slot()).max(), Some(47));
