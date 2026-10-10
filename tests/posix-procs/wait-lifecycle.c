@@ -188,6 +188,7 @@ void public_wait_process_exit(void) {
         struct timespec tick={0,1000000};int discovered=0;
         for(unsigned n=0;n<128;n++){discovered=wait_process_discover(lifecycle_fd,(unsigned)peer,nonce);if(discovered)break;nanosleep(&tick,NULL);}
         expect("discover actual full paid receipt before exit",discovered,1);
+        if(discovered==1)expect("exact saved receipt is present before real exit",wait_process_receipt_gone(lifecycle_fd,(unsigned)peer,nonce),0);
         unsigned long long owner=wait_process_owner();expect("process-exit fresh full PID",(unsigned)peer!=previous_pid,1);expect("process-exit fresh full paid owner",owner!=0&&owner!=previous_owner,1);
         previous_pid=(unsigned)peer;previous_owner=owner;
         expect("authorize actual _exit with pending WAIT",write(control[1],"E",1),1);close(control[1]);close(ready[0]);lifecycle_reap(peer);
