@@ -3,7 +3,7 @@
 
 //! Bounded departure preserves canonical publication and Notify custody order.
 
-use super::waiters::Pool;
+use super::{wait_events::Events, waiters::Pool};
 use super::{
     wait_notifications::Notifications,
     wait_receipts::{Queue, SHARE},
@@ -24,13 +24,14 @@ pub struct Progress {
 /// when requested. Active receipts remain paid until its canonical completion.
 pub fn part<H>(
     queue: &mut Queue,
-    sleepers: &mut Pool,
+    sleeping: (&mut Pool, &mut Events),
     notifications: &mut Notifications<H>,
     ram: &mut Ram<'_>,
     owner: (usize, u64),
     first: usize,
     mut notify: impl FnMut(&H),
 ) -> Result<Progress, u32> {
+    let (sleepers, events) = sleeping;
     let (place, label) = owner;
     if first > SHARE || place >= crate::places::COUNT || label == 0 {
         return Err(proto_fs::INVALID_ARGUMENT);
@@ -45,6 +46,9 @@ pub fn part<H>(
             progress.cancel_actor |= queue.request_cancel(id)?;
         }
         if queue.query(id)?.phase == WaitPhase::Complete {
+            if let Some(registration) = sleepers.find(id) {
+                events.detach(registration)?;
+            }
             notifications.complete(queue, sleepers, id, &mut notify)?;
             queue.release(id, &mut ram.storage)?;
             progress.released += 1;
