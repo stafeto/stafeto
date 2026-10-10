@@ -299,3 +299,38 @@ pub extern "C" fn wait_process_receipt_gone(fd: i32, pid: u32, nonce: u64) -> i3
 pub extern "C" fn wait_process_owner() -> u64 {
     PEER_OWNER.load(Ordering::Acquire)
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wait_process_ticks() -> i32 {
+    let result = (|| {
+        let transport =
+            posix_abi::shared::with_files(|files| Ok(files.transport())).map_err(|_| -55)?;
+        let mut packet = [0; 20];
+        packet[..8].copy_from_slice(&proto_wire::Header::new(0xfff7, proto_fs::VERSION).bytes());
+        packet[8..12].copy_from_slice(&63u32.to_le_bytes());
+        packet[12..].copy_from_slice(&32u64.to_le_bytes());
+        let _scope = rt::upcall::defer_entries().map_err(|_| -56)?;
+        let reply = rt::sys::send(transport.files().sessions().0, &packet).map_err(|_| -57)?;
+        if !reply.handles.is_empty() || reply.len != 20 {
+            return Err(-58);
+        }
+        let bytes = rt::abi::inline_bytes(&reply.words);
+        let mut reader = Reader::new(&bytes[..reply.len]);
+        if reader.u32().map_err(|_| -59)? != 0 {
+            return Err(-60);
+        }
+        let ticks = reader.u64().map_err(|_| -61)?;
+        let detail = reader.u64().map_err(|_| -62)?;
+        reader.finish().map_err(|_| -63)?;
+        rt::println!(
+            "posix-procs: WAIT process observer own dispatch {} ticks detail {}",
+            ticks,
+            detail
+        );
+        if ticks == 0 || ticks > 20410 || detail != 32 {
+            return Err(-64);
+        }
+        Ok(())
+    })();
+    result.err().unwrap_or(0)
+}

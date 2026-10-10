@@ -147,6 +147,7 @@ static void public_wait_lifecycle(void) {
 extern int wait_process_discover(int fd,unsigned pid,unsigned long long nonce);
 extern int wait_process_receipt_gone(int fd,unsigned pid,unsigned long long nonce);
 extern unsigned long long wait_process_owner(void);
+extern int wait_process_ticks(void);
 /* Root wires this only after genuine read-only RAM method 0xfff7 is present. */
 void public_wait_process_exit(void) {
     lifecycle_fd=open("/tmp/public-wait-process-exit",O_CREAT|O_RDWR,0666);
@@ -201,6 +202,7 @@ void public_wait_process_exit(void) {
         struct flock get={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_len=1};expect("original blocker still real after process exit",fcntl(lifecycle_fd,F_GETLK,&get),0);expect("blocker stays Write",get.l_type,F_WRLCK);expect("blocker remains full holder PID",get.l_pid,holder);
         if(discovered!=1||gone!=1)break;
     }
+    expect("process observer own dispatch bound",wait_process_ticks(),0);
     char quit='Q';expect("stop process-exit holder",write(holder_commands[1],&quit,1),1);close(holder_commands[1]);close(holder_replies[0]);lifecycle_reap(holder);
     expect("close process-exit source only after exact debt checks",close(lifecycle_fd),0);
     if(!failures)printf("posix-procs: genuine pending WAIT process exit retires exact paid receipt without rescue close ok\n");
