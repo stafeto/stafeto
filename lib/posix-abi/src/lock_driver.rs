@@ -12,6 +12,7 @@ use proto_fs::{LockReply, Method};
 use proto_wire::{Reader, Status, Writer};
 
 mod core;
+mod status;
 use core::{Failure, Phase, Session, State};
 
 fn failure(status: Status) -> Failure {
@@ -49,7 +50,7 @@ impl Live {
         let mut status = Reader::new(bytes);
         let code = status.u32().map_err(failure)?;
         if code != 0 {
-            status.finish().map_err(failure)?;
+            status::read(bytes).map_err(failure)?;
             return Err(failure(Status::from_code(code)));
         }
         LockReply::read(Reader::new(bytes)).map_err(failure)
@@ -126,9 +127,7 @@ impl Session for Live {
             return Err(Failure::Fatal(EIO));
         }
         let mut bytes = [0; rt::abi::MESSAGE_MAX];
-        let mut body = Reader::new(response.bytes(&mut bytes));
-        let code = body.u32().map_err(failure)?;
-        body.finish().map_err(failure)?;
+        let code = status::read(response.bytes(&mut bytes)).map_err(failure)?;
         if code == 0 {
             Ok(())
         } else {

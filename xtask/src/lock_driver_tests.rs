@@ -392,3 +392,5 @@ fn ambiguous_query_failure_seeks_canonical_cancel_and_retired_release_is_confirm
     assert_eq!(core::cleanup_step(&mut script), Ok(false));
     assert_eq!(script.phase, Phase::Cleaned);
 }
+#[path = "../../lib/posix-abi/src/lock_driver/status.rs"]
+mod status;
