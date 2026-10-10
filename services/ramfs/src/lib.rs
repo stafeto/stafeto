@@ -19,6 +19,8 @@ pub mod data;
 pub mod directory;
 #[cfg(test)]
 mod directory_tests;
+#[cfg(test)]
+mod fd_lifetime_tests;
 pub mod image;
 #[cfg(test)]
 mod image_tests;
@@ -276,6 +278,8 @@ pub struct Fds {
     slots: [Option<u8>; OPEN_MAX],
     /// Reserved descriptions are paid and held, but are not yet public descriptors.
     tentative: u32,
+    /// Published session references, independent of physical operation holds.
+    live_fds: u32,
     pub claimed: bool,
     pub binding: authority::Binding,
     pub authority_index: u16,
@@ -305,6 +309,7 @@ impl Default for Fds {
         Self {
             slots: [None; OPEN_MAX],
             tentative: 0,
+            live_fds: 0,
             claimed: false,
             binding: authority::Binding::Unbound,
             authority_index: storage::NONE,
@@ -344,6 +349,7 @@ impl Fds {
     fn fresh_clone_destination(&self) -> bool {
         if self.slots.iter().any(Option::is_some)
             || self.tentative != 0
+            || self.live_fds != 0
             || self.claimed
             || self.binding != authority::Binding::Unbound
             || self.authority_index != storage::NONE
@@ -427,6 +433,14 @@ pub struct TentativeOpen {
     pub description: Token,
 }
 
+/// The exact OFD close event, independent of retained physical I/O references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorClose {
+    pub inode: Token,
+    pub description: Token,
+    pub last_fd: bool,
+}
+
 /// Move-only publication authority, produced before the file effect.
 /// Apply within the same service step and Fds, without changing its descriptors.
 #[derive(Debug)]
@@ -467,6 +481,7 @@ impl OpenReceipt {
 struct Shared {
     open: Open,
     refs: u16,
+    fd_refs: u16,
     root: storage::Root,
     generation: u64,
 }
@@ -679,6 +694,10 @@ impl<'a> Ram<'a> {
     /// `fds`: TOO_MANY_OPEN_FILES with the session's descriptors or the
     /// service's descriptions taken.
     fn insert(&mut self, fds: &mut Fds, open: Open) -> Result<u32, u32> {
+        self.insert_mode(fds, open, true)
+    }
+
+    fn insert_mode(&mut self, fds: &mut Fds, open: Open, published: bool) -> Result<u32, u32> {
         let slot = fds
             .slots
             .iter()
@@ -700,11 +719,15 @@ impl<'a> Ram<'a> {
         self.descriptions[index] = Some(Shared {
             open,
             refs: 1,
+            fd_refs: u16::from(published),
             root: fds.root,
             generation,
         });
         self.description_generations[index] = generation;
         fds.slots[slot] = Some(index as u8);
+        if published {
+            fds.live_fds |= 1 << slot;
+        }
         Ok(slot as u32 + 3)
     }
 
@@ -780,7 +803,7 @@ impl<'a> Ram<'a> {
         if !created && !identity.permits(node, bits) {
             return Err(proto_fs::ACCESS_DENIED);
         }
-        let fd = self.insert(
+        let fd = self.insert_mode(
             fds,
             Open {
                 file: self.file(token),
@@ -789,6 +812,7 @@ impl<'a> Ram<'a> {
                 scan: crate::storage::NONE,
                 flags: access | (flags & proto_fs::APPEND),
             },
+            false,
         )?;
         let description = self.description_token(fds, fd)?;
         fds.tentative |= 1 << (fd - 3);
@@ -827,6 +851,7 @@ impl<'a> Ram<'a> {
     /// This publication cannot allocate or fail after a successful effect preflight.
     pub fn publish_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<u32, u32> {
         let slot = self.tentative_slot(fds, held)?;
+        self.publish_descriptor(fds, slot);
         fds.tentative &= !(1 << slot);
         Ok(held.fd)
     }
@@ -866,6 +891,7 @@ impl<'a> Ram<'a> {
                 key: proof.key,
                 description: proof.held.description,
             };
+            self.publish_descriptor(fds, proof.slot);
             fds.tentative &= !(1 << proof.slot);
         }
         proof.held
@@ -950,15 +976,83 @@ impl<'a> Ram<'a> {
         true
     }
 
+    fn publish_descriptor(&mut self, fds: &mut Fds, slot: usize) {
+        assert_eq!(fds.live_fds & (1 << slot), 0);
+        let index = fds.slots[slot].expect("prepaid description") as usize;
+        let shared = self.descriptions[index]
+            .as_mut()
+            .expect("prepaid description");
+        shared.fd_refs = shared
+            .fd_refs
+            .checked_add(1)
+            .expect("bounded session references");
+        assert!(shared.fd_refs <= shared.refs);
+        fds.live_fds |= 1 << slot;
+    }
+
+    /// A new lock request names an exact, currently published session reference.
+    pub fn live_description(&self, fds: &Fds, held: TentativeOpen) -> Result<(Token, u32), u32> {
+        let description = self.description_token(fds, held.fd)?;
+        if description != held.description || fds.live_fds & (1 << (held.fd - 3)) == 0 {
+            return Err(BAD_FD);
+        }
+        let shared = self.descriptions[description.slot as usize]
+            .as_ref()
+            .expect("live description");
+        Ok((self.token(shared.open.file), shared.open.flags))
+    }
+
+    /// Retire one exact real fd reference while physical I/O can keep its slot.
+    /// Repeated cleanup and a stale generation leave current references intact.
+    pub fn detach_descriptor(
+        &mut self,
+        fds: &mut Fds,
+        held: TentativeOpen,
+    ) -> Result<Option<DescriptorClose>, u32> {
+        if self.description_token(fds, held.fd) != Ok(held.description) {
+            return Ok(None);
+        }
+        let slot = (held.fd - 3) as usize;
+        if fds.live_fds & (1 << slot) == 0 {
+            return Ok(None);
+        }
+        let index = held.description.slot as usize;
+        let inode = self.token(
+            self.descriptions[index]
+                .as_ref()
+                .expect("retained description")
+                .open
+                .file,
+        );
+        let shared = self.descriptions[index]
+            .as_mut()
+            .expect("retained description");
+        assert!(shared.fd_refs > 0);
+        shared.fd_refs -= 1;
+        fds.live_fds &= !(1 << slot);
+        Ok(Some(DescriptorClose {
+            inode,
+            description: held.description,
+            last_fd: shared.fd_refs == 0,
+        }))
+    }
+
     /// Close: the descriptor goes, and its description with the last one
     /// that names it, in any session.
     pub fn close(&mut self, fds: &mut Fds, fd: u32) -> Result<(), u32> {
         let index = fds.description(fd)?;
+        let held = TentativeOpen {
+            fd,
+            description: self.description_token(fds, fd)?,
+        };
+        self.detach_descriptor(fds, held)?;
         fds.slots[(fd - 3) as usize] = None;
         let shared = self.descriptions[index]
             .as_mut()
             .expect("a named description");
+        assert!(shared.refs > 0);
         shared.refs -= 1;
+        assert!(shared.fd_refs <= shared.refs);
         if shared.refs == 0 {
             let file = shared.open.file;
             let root = shared.root;
@@ -1266,6 +1360,9 @@ impl<'a> Ram<'a> {
         let mut slots = [None; OPEN_MAX];
         for &fd in list {
             let index = fds.description(fd)?;
+            if fds.live_fds & (1 << (fd - 3)) == 0 {
+                return Err(BAD_FD);
+            }
             slots[(fd - 3) as usize] = Some(index as u8);
         }
         if let Some(cwd) = fds.cwd {
@@ -1273,13 +1370,17 @@ impl<'a> Ram<'a> {
         }
         out.root = fds.root;
         out.slots = slots;
+        out.live_fds = out.slots.iter().enumerate().fold(0, |mask, (slot, value)| {
+            mask | (u32::from(value.is_some()) << slot)
+        });
         out.cwd = fds.cwd;
         // At most 641 session/birth records, including this child, own 32 references each.
         for index in out.slots.iter().flatten() {
-            self.descriptions[usize::from(*index)]
+            let shared = self.descriptions[usize::from(*index)]
                 .as_mut()
-                .expect("a named description")
-                .refs += 1;
+                .expect("a named description");
+            shared.refs += 1;
+            shared.fd_refs += 1;
         }
         Ok(())
     }

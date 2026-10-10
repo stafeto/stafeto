@@ -2236,6 +2236,7 @@ fn clone_into_deduplicates_numeric_fds_and_retains_distinct_alias_slots() {
         .as_mut()
         .unwrap()
         .refs += 1;
+    ram.publish_descriptor(&mut source, 1);
     let mut out = Fds::default();
     ram.clone_fds_into(&source, &[fd, fd, 4, 4], &mut out)
         .unwrap();
