@@ -46,6 +46,9 @@ pub struct Watch {
     inode: Token,
 }
 impl Watch {
+    pub const fn slot(self) -> usize {
+        self.index as usize
+    }
     pub const fn inode(self) -> Token {
         self.inode
     }
@@ -86,13 +89,28 @@ enum Resume {
 #[derive(Clone, Copy)]
 enum Phase {
     Vertices,
+    EpisodeReset {
+        first: usize,
+        candidate: u32,
+        scope: Scope,
+    },
+    SeedCandidate {
+        candidate: u32,
+        scope: Scope,
+    },
     Traverse,
     Collect(u8),
-    Expand { from: u8, fresh: u16 },
+    Expand {
+        from: u8,
+        fresh: u16,
+    },
     Trace(u8),
     Inodes(usize),
     Life(u16),
-    Clear { remaining: u16, resume: Resume },
+    Clear {
+        remaining: u16,
+        resume: Resume,
+    },
     Reset(usize),
     Announce,
     Done(Verdict),
@@ -137,6 +155,79 @@ fn pid_place(pid: u32) -> Option<usize> {
     (parsed.pid() == pid).then_some(parsed.index as usize)
 }
 impl Graph {
+    /// Cold startup only. No full Graph temporary or per-search index clearing.
+    ///
+    /// # Safety
+    /// Exclusive aligned writable uninitialized allocation for Self.
+    pub unsafe fn initialize_empty_at(destination: *mut Self) {
+        // SAFETY: all fields are written directly in the exclusive allocation.
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).count).write(0);
+            core::ptr::addr_of_mut!((*destination).ready).write(0);
+            core::ptr::addr_of_mut!((*destination).discovered).write(0);
+            core::ptr::addr_of_mut!((*destination).frontier).write(0);
+            core::ptr::addr_of_mut!((*destination).cycle).write(0);
+            core::ptr::addr_of_mut!((*destination).watch_count).write(0);
+            core::ptr::addr_of_mut!((*destination).watch_cursor).write(None);
+            core::ptr::addr_of_mut!((*destination).round).write(0);
+            core::ptr::addr_of_mut!((*destination).dirty).write(false);
+            core::ptr::addr_of_mut!((*destination).phase).write(Phase::Cleaned);
+            core::ptr::addr_of_mut!((*destination).scope).write(Scope {
+                owner: 0,
+                key: WaitKey {
+                    slot: 0,
+                    generation: 0,
+                },
+                scan: 0,
+            });
+            let cells = core::ptr::addr_of_mut!((*destination).pids).cast::<u32>();
+            for index in 0..CAPACITY {
+                cells.add(index).write(0);
+            }
+            let cells = core::ptr::addr_of_mut!((*destination).index).cast::<u16>();
+            for index in 0..proto_process::RECORDS {
+                cells.add(index).write(0);
+            }
+            let cells = core::ptr::addr_of_mut!((*destination).edges).cast::<u16>();
+            for index in 0..CAPACITY {
+                cells.add(index).write(0);
+            }
+            let cells = core::ptr::addr_of_mut!((*destination).node_watches).cast::<u16>();
+            for index in 0..CAPACITY {
+                cells.add(index).write(0);
+            }
+            let cells = core::ptr::addr_of_mut!((*destination).parents).cast::<u8>();
+            for index in 0..CAPACITY {
+                cells.add(index).write(NONE);
+            }
+            let cells = core::ptr::addr_of_mut!((*destination).watches).cast::<Option<Watch>>();
+            for index in 0..CAPACITY {
+                cells.add(index).write(None);
+            }
+        }
+    }
+    pub fn seed_ready(&self) -> bool {
+        matches!(self.phase, Phase::Vertices)
+    }
+    pub fn restart(&mut self, candidate: u32, scope: Scope) -> Result<(), Error> {
+        if !matches!(self.phase, Phase::Cleaned) {
+            return Err(Error::Phase);
+        }
+        if scope.owner == 0
+            || scope.scan <= self.scope.scan
+            || scope.key.validate().is_err()
+            || pid_place(candidate).is_none()
+        {
+            return Err(Error::Invalid);
+        }
+        self.scope = scope;
+        self.phase = Phase::EpisodeReset {
+            first: 0,
+            candidate,
+            scope,
+        };
+        Ok(())
+    }
     pub fn new(candidate: u32, scope: Scope) -> Result<Self, Error> {
         if scope.owner == 0 || scope.scan == 0 || scope.key.validate().is_err() {
             return Err(Error::Invalid);
@@ -369,8 +460,15 @@ impl Graph {
     /// full snapshots. Watched changes must keep arriving through changed().
     pub fn step(
         &mut self,
-        mut live: impl FnMut(u32) -> bool,
+        live: impl FnMut(u32) -> bool,
         mut inode_valid: impl FnMut(Token) -> bool,
+    ) -> Progress {
+        self.step_watches(live, |watch| inode_valid(watch.inode))
+    }
+    pub fn step_watches(
+        &mut self,
+        mut live: impl FnMut(u32) -> bool,
+        mut watch_valid: impl FnMut(Watch) -> bool,
     ) -> Progress {
         if self.dirty
             && !matches!(
@@ -386,6 +484,44 @@ impl Graph {
         }
         match self.phase {
             Phase::Vertices => Progress::new(0, Work::Progress),
+            Phase::EpisodeReset {
+                first,
+                candidate,
+                scope,
+            } => {
+                let end = self.count.min(first + PORTION);
+                for index in first..end {
+                    if let Some(place) = pid_place(self.pids[index]) {
+                        self.index[place] = 0;
+                    }
+                    self.pids[index] = 0;
+                    self.edges[index] = 0;
+                    self.node_watches[index] = 0;
+                    self.parents[index] = NONE;
+                }
+                self.phase = if end == self.count {
+                    self.count = 0;
+                    self.ready = 0;
+                    self.discovered = 1;
+                    self.frontier = 1;
+                    self.cycle = 0;
+                    self.round = 0;
+                    Phase::SeedCandidate { candidate, scope }
+                } else {
+                    Phase::EpisodeReset {
+                        first: end,
+                        candidate,
+                        scope,
+                    }
+                };
+                Progress::new(end - first, Work::Progress)
+            }
+            Phase::SeedCandidate { candidate, scope } => {
+                self.scope = scope;
+                self.phase = Phase::Vertices;
+                self.register(candidate).expect("validated new candidate");
+                Progress::new(1, Work::Progress)
+            }
             Phase::Collect(index) => {
                 Progress::new(0, Work::NeedEdges(self.vertex(usize::from(index))))
             }
@@ -458,7 +594,7 @@ impl Graph {
                 let end = self.watch_count.min(first + PORTION);
                 for index in first..end {
                     let watch = self.watches[index].expect("watched snapshot");
-                    if !inode_valid(watch.inode) {
+                    if !watch_valid(watch) {
                         self.invalidate();
                         return Progress::new(index - first + 1, Work::Progress);
                     }

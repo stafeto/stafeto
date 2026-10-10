@@ -47,6 +47,7 @@ struct Registration {
     phase: Phase,
     previous: u8,
     next: u8,
+    proof_revision: u64,
 }
 
 pub struct Pool {
@@ -133,6 +134,7 @@ impl Pool {
         self.records[slot as usize] = Some(Registration {
             input,
             phase: Phase::Sleeping,
+            proof_revision: 1,
             previous: self.tail,
             next: NONE,
         });
@@ -173,9 +175,25 @@ impl Pool {
         Ok((record.input, record.phase))
     }
 
+    /// Optional proof authority; saturation never changes normal WAIT behavior.
+    pub fn proof_snapshot(&self, token: RegistrationToken) -> Option<(Input, Phase, u64)> {
+        let record = self.record(token).ok()?;
+        (record.proof_revision != u64::MAX).then_some((
+            record.input,
+            record.phase,
+            record.proof_revision,
+        ))
+    }
+    #[cfg(test)]
+    pub(super) fn set_test_proof_revision(&mut self, token: RegistrationToken, revision: u64) {
+        self.record_mut(token)
+            .expect("test registration")
+            .proof_revision = revision;
+    }
     pub fn ready(&mut self, token: RegistrationToken) -> Result<(), u32> {
         let record = self.record_mut(token)?;
-        if record.phase != Phase::Running {
+        if record.phase == Phase::Sleeping {
+            record.proof_revision = record.proof_revision.saturating_add(1);
             record.phase = Phase::Ready;
         }
         Ok(())
@@ -186,6 +204,7 @@ impl Pool {
         if record.phase != Phase::Ready {
             return Err(proto_fs::JOBS_FULL);
         }
+        record.proof_revision = record.proof_revision.saturating_add(1);
         record.phase = Phase::Running;
         Ok(record.input)
     }
@@ -196,6 +215,7 @@ impl Pool {
         if record.phase != Phase::Running {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
+        record.proof_revision = record.proof_revision.saturating_add(1);
         record.phase = Phase::Sleeping;
         Ok(())
     }
