@@ -3,7 +3,9 @@
 
 //! Permanent group custody joins actor record accounting to exact storage roots.
 
-use super::actor::{Actor, Command, Error, GroupEvent, Progress, Request};
+use super::actor::{
+    Actor, Command, Error, GroupEvent, Progress, ReadProgress, ReadSnapshot, Reader, Request,
+};
 use super::{Owner, budget, groups::Id};
 use crate::storage::{LockAnchor, Pin, Root, Storage, Token};
 pub const GROUPS: usize = 512;
@@ -95,6 +97,42 @@ impl LockService {
         self.request_root = anchor;
         self.request_inode = Some(request.inode);
         Ok(())
+    }
+    /// Caller already owns the paid WAIT inode pin; this creates no worker debt.
+    pub fn reader(
+        &self,
+        storage: &Storage<'_>,
+        mut request: Request,
+    ) -> Result<Option<Reader>, Error> {
+        storage.node(request.inode).map_err(|_| Error::Invalid)?;
+        request.root = 0;
+        self.actor.reader(request)
+    }
+    pub fn reader_snapshot(&self, storage: &Storage<'_>, inode: Token) -> Option<ReadSnapshot> {
+        storage.node(inode).ok()?;
+        self.actor.reader_snapshot(inode)
+    }
+    pub fn reader_snapshot_valid(&self, storage: &Storage<'_>, snapshot: ReadSnapshot) -> bool {
+        storage.node(snapshot.inode()).is_ok() && self.actor.reader_snapshot_valid(snapshot)
+    }
+    pub fn pid_visible(&self, pid: u32) -> bool {
+        self.actor.pid_visible(pid)
+    }
+    pub fn reader_part(
+        &self,
+        storage: &Storage<'_>,
+        reader: &mut Reader,
+        pid_live: impl FnMut(u32) -> bool,
+        ofd_live: impl FnMut(Token) -> bool,
+    ) -> ReadProgress {
+        if storage.node(reader.snapshot().inode()).is_err() {
+            return ReadProgress {
+                visited: 0,
+                blockers: [None; super::records::PORTION],
+                state: super::actor::ReadState::Invalidated,
+            };
+        }
+        self.actor.reader_part(reader, pid_live, ofd_live)
     }
     pub fn cancel(&mut self) -> bool {
         self.actor.cancel()
@@ -1432,6 +1470,55 @@ mod tests {
         ram.storage.release_lock_anchor(replacement).unwrap();
     }
     #[test]
+    fn reader_validates_genuine_storage_generation_without_creating_any_debt() {
+        let (ram, inodes) = fixture();
+        let service = fresh();
+        let counts = service.counts();
+        let mut input = request(
+            inodes[0],
+            256,
+            Command::Get(super::super::Kind::Write),
+            0,
+            1,
+        );
+        let mut reader = service.reader(&ram.storage, input).unwrap().unwrap();
+        assert_eq!(
+            service.reader_snapshot(&ram.storage, input.inode),
+            Some(reader.snapshot())
+        );
+        assert!(service.reader_snapshot_valid(&ram.storage, reader.snapshot()));
+        assert_eq!(
+            service
+                .reader_part(&ram.storage, &mut reader, |_| true, |_| true)
+                .state,
+            super::super::actor::ReadState::Done
+        );
+        input.inode.generation += 1;
+        assert!(service.reader_snapshot(&ram.storage, input.inode).is_none());
+        let wrong_snapshot = service.actor.reader_snapshot(input.inode).unwrap();
+        assert!(!service.reader_snapshot_valid(&ram.storage, wrong_snapshot));
+        let mut raw_input = input;
+        raw_input.root = 0;
+        let mut wrong_reader = service.actor.reader(raw_input).unwrap().unwrap();
+        assert_eq!(
+            service
+                .reader_part(
+                    &ram.storage,
+                    &mut wrong_reader,
+                    |_| panic!("bad source must not reach life checks"),
+                    |_| panic!("bad source must not reach life checks")
+                )
+                .state,
+            super::super::actor::ReadState::Invalidated
+        );
+        assert!(matches!(
+            service.reader(&ram.storage, input),
+            Err(Error::Invalid)
+        ));
+        assert_eq!(service.counts(), counts);
+        check_pins(&service, &ram.storage);
+    }
+    #[test]
     fn service_layout_initializes_directly_and_preserves_accounted_size() {
         let service = fresh();
         let bytes = core::mem::size_of::<LockService>();
@@ -1440,7 +1527,10 @@ mod tests {
             bytes.div_ceil(4096),
             core::mem::size_of::<Option<PaidGroup>>()
         );
-        assert_eq!(bytes, 877120);
+        assert_eq!(
+            bytes,
+            877120 + crate::storage::NODES * core::mem::size_of::<u64>()
+        );
         assert_eq!(core::mem::size_of::<Option<PaidGroup>>(), 56);
         assert!(!service.busy());
         assert!(service.request_root.is_none());
