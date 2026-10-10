@@ -201,7 +201,7 @@ static void *lock_async_sender(void *argument) {
     return (void *)(uintptr_t)pthread_kill(*(pthread_t *)argument, SIGUSR1);
 }
 void lock_probe_exit(void) { pthread_exit(NULL); }
-static void *lock_small_worker(void *argument) {
+static void *lock_small_turn(void *argument) {
     unsigned mode = (unsigned)(uintptr_t)argument;
     if (lock_stack_begin()) return (void *)10;
     int fd = open("/tmp/public-lock-signal", O_CREAT | O_RDWR, 0666);
@@ -241,6 +241,16 @@ static void *lock_small_worker(void *argument) {
     if (peak > 16 * 1024) return (void *)11;
     return NULL;
 }
+static void *lock_small_worker(void *argument) {
+    unsigned mode = (unsigned)(uintptr_t)argument;
+    if (mode != 10) return lock_small_turn(argument);
+    /* A live owner must recover its own Cleaned frames before departure can help. */
+    for (unsigned turn = 0; turn < 20; turn++) {
+        void *result = lock_small_turn((void *)(uintptr_t)2);
+        if (result != NULL) return result;
+    }
+    return NULL;
+}
 static void public_lock_signals(void) {
     struct sigaction action, previous;
     memset(&action, 0, sizeof action);
@@ -250,13 +260,13 @@ static void public_lock_signals(void) {
     pthread_attr_t attributes;
     expect("lock pthread attributes", pthread_attr_init(&attributes), 0);
     expect("lock pthread published minimum", pthread_attr_setstacksize(&attributes, PTHREAD_STACK_MIN), 0);
-    for (unsigned turn = 0; turn < 106; turn++) {
+    for (unsigned turn = 0; turn < 107; turn++) {
         /* Twenty departures and twenty jumps exceed the sixteen Control places.
          * Later phases test signal interruption after the first request. */
         unsigned mode = turn < 4 ? turn + 1 :
                         turn < 24 ? 2 : turn < 44 ? 3 :
                         turn < 45 ? 5 : turn < 46 ? 6 :
-                        turn < 66 ? 7 : turn < 86 ? 8 : 9;
+                        turn < 66 ? 7 : turn < 86 ? 8 : turn < 106 ? 9 : 10;
         pthread_t thread;
         pthread_t sender;
         void *result = (void *)99;
