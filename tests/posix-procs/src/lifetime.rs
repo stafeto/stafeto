@@ -141,10 +141,20 @@ pub extern "C" fn ram_close_event() -> i32 {
             last_alias: true,
         };
         child.close_event_once(event).map_err(|_| -5)?;
+        let earlier_alias = proto_fs::CloseEvent {
+            key: proto_fs::CloseKey {
+                slot: 62,
+                generation: 9,
+            },
+            last_alias: false,
+            ..event
+        };
+        child.close_event_once(earlier_alias).map_err(|_| -25)?;
         if child.close_exact(held[0]).map_err(|_| -6)? != rt::fs::CloseOutcome::Closed {
             return Err(-7);
         }
         child.close_event_once(event).map_err(|_| -8)?;
+        child.close_event_once(earlier_alias).map_err(|_| -26)?;
         let other = proto_fs::CloseEvent {
             packed: held[1].marked_fd(),
             description_generation: held[1].generation,
@@ -189,19 +199,25 @@ pub extern "C" fn ram_close_event() -> i32 {
             }
         }
         drop(child);
-        for item in &mut held {
-            let fd = files
-                .open("/etc/motd", proto_fs::READ_ONLY)
-                .map_err(|_| -20)?;
-            *item = files.capture_description(fd).map_err(|_| -21)?.held;
-        }
-        // An unopened inherited session leaves all 32 references in its birth.
-        let born = rt::fs::Files::clone_exact_on(files.sessions().0, &held).map_err(|_| -22)?;
-        drop(born);
-        for item in &held {
-            if files.close_exact(*item).map_err(|_| -23)? != rt::fs::CloseOutcome::Closed {
-                return Err(-24);
+        for last_references in [false, true] {
+            for item in &mut held {
+                let fd = files
+                    .open("/etc/motd", proto_fs::READ_ONLY)
+                    .map_err(|_| -20)?;
+                *item = files.capture_description(fd).map_err(|_| -21)?.held;
             }
+            // Cover both shared references and all 32 final true OFD references.
+            let mut born =
+                Some(rt::fs::Files::clone_exact_on(files.sessions().0, &held).map_err(|_| -22)?);
+            if !last_references {
+                drop(born.take());
+            }
+            for item in &held {
+                if files.close_exact(*item).map_err(|_| -23)? != rt::fs::CloseOutcome::Closed {
+                    return Err(-24);
+                }
+            }
+            drop(born);
         }
         rt::println!(
             "RAM close event: exact replay, stale body, physical I/O and 32-reference birth cleanup ok, ticks={}",

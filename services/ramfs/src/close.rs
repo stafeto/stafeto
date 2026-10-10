@@ -69,7 +69,16 @@ impl Ram<'_> {
                 generation: event.description_generation,
             },
         };
-        let (inode, _) = self.live_description(fds, held)?;
+        let inode = if event.last_alias {
+            self.live_description(fds, held)?.0
+        } else {
+            // A final alias event may arrive first; other Closing records still
+            // retain this exact physical description until their own replies.
+            if self.capture_description(fds, held.fd)?.0 != held {
+                return Err(proto_fs::BAD_FD);
+            }
+            self.description_node(fds, held.fd, held.description.generation)?
+        };
         if let Some(pid) = fds.binding.close_pid() {
             locks
                 .close(inode, Owner::Process(pid))

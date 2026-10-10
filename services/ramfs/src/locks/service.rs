@@ -489,6 +489,89 @@ mod tests {
         );
     }
     #[test]
+    fn last_alias_can_arrive_before_an_earlier_alias_with_exact_physical_custody() {
+        let (mut ram, inodes) = fixture();
+        let mut service = fresh();
+        let page = page();
+        let payer = root(10, 1);
+        let mut fds = crate::Fds {
+            root: payer,
+            binding: crate::authority::Binding::Active(close_who(257)),
+            ..crate::Fds::default()
+        };
+        let fd = ram.open(&mut fds, "/lock0", proto_fs::READ_ONLY).unwrap();
+        let earlier = close_event(&ram, &fds, fd, 48, 1, false);
+        let last = close_event(&ram, &fds, fd, 49, 1, true);
+        ram.close_event(&mut fds, &mut service, last).unwrap();
+        assert_eq!(fds.live_fds, 0);
+        assert_eq!(ram.read(&mut fds, fd, &mut [0; 1]), Ok(1));
+        let next = ram.open(&mut fds, "/lock0", proto_fs::READ_ONLY).unwrap();
+        assert_ne!(next, fd);
+        real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            request(inodes[0], 257, Command::Set(Some(Kind::Read)), 0, 1),
+            payer,
+        )
+        .unwrap();
+        assert_eq!(service.counts().published, 1);
+        ram.close_event(&mut fds, &mut service, earlier).unwrap();
+        assert_eq!(
+            service.counts().published,
+            0,
+            "late numeric close revokes PID before its reply"
+        );
+        real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            request(inodes[0], 257, Command::Set(Some(Kind::Read)), 0, 1),
+            payer,
+        )
+        .unwrap();
+        ram.close_event(&mut fds, &mut service, earlier).unwrap();
+        assert_eq!(
+            service.counts().published,
+            1,
+            "receipt replay preserves the new PID lock"
+        );
+        assert_eq!(
+            ram.close_event(
+                &mut fds,
+                &mut service,
+                proto_fs::CloseEvent {
+                    key: proto_fs::CloseKey {
+                        generation: 2,
+                        ..last.key
+                    },
+                    ..last
+                }
+            ),
+            Err(proto_fs::BAD_FD)
+        );
+        let stale = proto_fs::CloseEvent {
+            key: proto_fs::CloseKey {
+                generation: 2,
+                ..earlier.key
+            },
+            ..earlier
+        };
+        ram.close(&mut fds, fd).unwrap();
+        let reused = ram.open(&mut fds, "/lock1", proto_fs::READ_ONLY).unwrap();
+        assert_eq!(reused, fd);
+        assert_eq!(
+            ram.close_event(&mut fds, &mut service, stale),
+            Err(proto_fs::BAD_FD)
+        );
+        ram.close_event(&mut fds, &mut service, earlier).unwrap();
+        assert!(
+            ram.live_description(&fds, ram.capture_description(&fds, reused).unwrap().0)
+                .is_ok()
+        );
+        assert_eq!(service.counts().published, 1);
+    }
+    #[test]
     fn inherited_last_fd_close_preserves_parent_pid_and_excludes_ofd_before_physical_io() {
         let (mut ram, inodes) = fixture();
         let mut service = fresh();
