@@ -435,7 +435,27 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             .expect("paid revoked root")
             .root
     }
-    fn scan_step(&self, request: Request, scan: &mut Scan) -> (usize, bool) {
+    /// Audit one PID place even while no client asks for a lock.
+    pub fn audit_pid(
+        &mut self,
+        index: usize,
+        mut live: impl FnMut(u32) -> bool,
+    ) -> Result<bool, Error> {
+        let Some(pid) = self.groups.tracked_pid(index)? else {
+            return Ok(false);
+        };
+        if live(pid) {
+            return Ok(false);
+        }
+        self.depart_pid(pid)?;
+        Ok(true)
+    }
+    fn scan_step(
+        &mut self,
+        request: Request,
+        scan: &mut Scan,
+        live: &mut impl FnMut(u32) -> bool,
+    ) -> (usize, bool) {
         let mut visited = 0;
         loop {
             if scan.entered && scan.record.is_none() {
@@ -452,19 +472,28 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
                 visited += 1;
                 scan.next = self.groups.inode_next(id).expect("retained scan group");
                 scan.entered = true;
-                if self
-                    .groups
-                    .capture(id)
-                    .expect("retained exact scan group")
-                    .is_some()
-                {
-                    let view = self.view(id).expect("retained scan view");
-                    scan.record = view.head;
+                if let Some(capture) = self.groups.capture(id).expect("retained exact scan group") {
+                    let snapshot = self.groups.snapshot(capture).expect("live scan group");
+                    if let Owner::Process(pid) = snapshot.owner
+                        && !live(pid)
+                    {
+                        self.depart_pid(pid).expect("validated dead scan PID");
+                    } else {
+                        let view = self.view(id).expect("retained scan view");
+                        scan.record = view.head;
+                    }
                 }
             } else if let Some(record) = scan.record {
                 visited += 1;
                 let record = self.pool.read(record).expect("retained scan record");
                 scan.record = record.next;
+                if let Owner::Process(pid) = record.lock.owner
+                    && !live(pid)
+                {
+                    self.depart_pid(pid).expect("validated dead record PID");
+                    scan.record = None;
+                    continue;
+                }
                 let kind = match request.command {
                     Command::Get(kind) | Command::Set(Some(kind)) => kind,
                     Command::Set(None) => unreachable!(),
@@ -482,10 +511,31 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             }
         }
     }
+    #[cfg(test)]
     pub fn step(&mut self) -> Progress {
+        self.step_with_life(|_| true)
+    }
+    /// Every production slice confirms complete PID lifetimes through the shared page.
+    pub fn step_with_life(&mut self, mut live: impl FnMut(u32) -> bool) -> Progress {
         let Some(mut worker) = self.worker.take() else {
             return self.cleanup_step();
         };
+        if let Owner::Process(pid) = worker.request.owner {
+            if let Some(old) = self
+                .groups
+                .tracked_pid((pid % 256) as usize)
+                .expect("validated PID place")
+                && old != pid
+                && !live(old)
+            {
+                self.depart_pid(old)
+                    .expect("retire previous PID before admission");
+            }
+            if !live(pid) {
+                self.depart_pid(pid).expect("validated dead worker PID");
+                worker.cancelled = true;
+            }
+        }
         if worker.cancelled {
             if let Phase::Prepare { work, capture } = &mut worker.phase {
                 let retirement = work
@@ -502,7 +552,7 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
         }
         let progress = match &mut worker.phase {
             Phase::Scan(scan) => {
-                let (visited, done) = self.scan_step(worker.request, scan);
+                let (visited, done) = self.scan_step(worker.request, scan, &mut live);
                 if done {
                     if matches!(worker.request.command, Command::Get(_)) {
                         return Progress::complete(visited, Ok(Response::Blocker(scan.blocker)));
@@ -1032,7 +1082,9 @@ mod tests {
     fn fullest_getlk_scan_visits_512_objects_in_64_service_steps() {
         type Full = Actor<512, 1285, 256, 128, 320, 256>;
         let mut a: Box<Full> = fresh();
+        let page = proto_process::lifetimes::Page::new();
         for index in 0..256 {
+            page.publish(256 + index).unwrap();
             run(
                 &mut a,
                 request(
@@ -1063,7 +1115,12 @@ mod tests {
         let mut visited = 0;
         let mut steps = 0;
         loop {
-            let p = a.step();
+            let mut checks = 0;
+            let p = a.step_with_life(|pid| {
+                checks += 1;
+                page.live(pid)
+            });
+            assert_eq!(checks, p.visited);
             assert!(p.visited <= 8);
             visited += p.visited;
             steps += 1;
@@ -1486,5 +1543,294 @@ mod tests {
         let replacement = ram.storage.lock_anchor(next_key).unwrap();
         assert_eq!(replacement.index(), root);
         ram.storage.release_lock_anchor(replacement).unwrap();
+    }
+    fn life_drain(a: &mut Small, page: &proto_process::lifetimes::Page) {
+        for _ in 0..2000 {
+            if !a.busy() {
+                return;
+            }
+            let progress = a.step_with_life(|pid| page.live(pid));
+            assert!(progress.visited <= 8);
+            assert!(progress.completed.is_none());
+            check(a);
+        }
+        panic!("life cleanup did not finish");
+    }
+    fn life_run(
+        a: &mut Small,
+        page: &proto_process::lifetimes::Page,
+        request: Request,
+    ) -> Result<Response, Error> {
+        a.start(request)?;
+        let mut completed = None;
+        for _ in 0..2000 {
+            let progress = a.step_with_life(|pid| page.live(pid));
+            assert!(progress.visited <= 8);
+            check(a);
+            if let Some(result) = progress.completed {
+                assert!(completed.replace(result).is_none());
+            }
+            if !a.busy() {
+                return completed.expect("life request completion");
+            }
+        }
+        panic!("life worker did not finish");
+    }
+    #[test]
+    fn real_pid_page_keeps_uid_changes_and_excludes_death_before_gone() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        let page = proto_process::lifetimes::Page::new();
+        page.publish(256).unwrap();
+        page.publish(257).unwrap();
+        let credentials = AtomicU64::new(1);
+        let mut a: Box<Small> = fresh();
+        assert_eq!(
+            life_run(
+                &mut a,
+                &page,
+                request(0, Owner::Process(256), Some(Kind::Write), 0, 10, 0)
+            ),
+            Ok(Response::Changed)
+        );
+        let ofd = Owner::Description {
+            slot: 0,
+            generation: 1,
+        };
+        assert_eq!(
+            life_run(&mut a, &page, request(0, ofd, Some(Kind::Read), 20, 10, 2)),
+            Ok(Response::Changed)
+        );
+        credentials.fetch_add(7, Ordering::Release);
+        let mut query = request(0, Owner::Process(257), None, 0, 40, 1);
+        query.command = Command::Get(Kind::Write);
+        assert!(matches!(
+            life_run(&mut a, &page, query),
+            Ok(Response::Blocker(Some(Lock {
+                owner: Owner::Process(256),
+                ..
+            })))
+        ));
+        assert!(page.retire(256));
+        a.start(query).unwrap();
+        let progress = a.step_with_life(|pid| page.live(pid));
+        assert!(
+            matches!(progress.completed, Some(Ok(Response::Blocker(Some(Lock { owner, .. })))) if owner == ofd)
+        );
+        assert_eq!(progress.visited, 3);
+        assert_eq!(a.record_charge(0), Some(1));
+        assert_eq!(a.group_charge(0), Some(1));
+        life_drain(&mut a, &page);
+        assert_eq!(a.record_charge(0), Some(0));
+        assert_eq!(a.record_charge(2), Some(1));
+        assert_eq!(
+            life_run(
+                &mut a,
+                &page,
+                request(0, Owner::Process(257), Some(Kind::Write), 0, 10, 1)
+            ),
+            Ok(Response::Changed)
+        );
+    }
+    #[test]
+    fn pid_death_between_group_entry_and_record_read_is_observed() {
+        let page = proto_process::lifetimes::Page::new();
+        page.publish(256).unwrap();
+        page.publish(257).unwrap();
+        let mut a: Box<Small> = fresh();
+        life_run(
+            &mut a,
+            &page,
+            request(0, Owner::Process(256), Some(Kind::Write), 0, 10, 0),
+        )
+        .unwrap();
+        let mut query = request(0, Owner::Process(257), None, 0, 10, 1);
+        query.command = Command::Get(Kind::Read);
+        a.start(query).unwrap();
+        let mut observations = 0;
+        let progress = a.step_with_life(|pid| {
+            let alive = page.live(pid);
+            if pid == 256 {
+                observations += 1;
+                if observations == 1 {
+                    assert!(page.retire(pid));
+                }
+            }
+            alive
+        });
+        assert_eq!(observations, 2);
+        assert_eq!(progress.completed, Some(Ok(Response::Blocker(None))));
+        assert!(progress.visited <= 8);
+        life_drain(&mut a, &page);
+        assert_eq!(a.counts().paid(), 0);
+    }
+    #[test]
+    fn dead_worker_pid_cancels_private_and_ready_copies_before_exchange() {
+        for ready in [false, true] {
+            let page = proto_process::lifetimes::Page::new();
+            page.publish(256).unwrap();
+            page.publish(257).unwrap();
+            let mut a: Box<Small> = fresh();
+            life_run(
+                &mut a,
+                &page,
+                request(1, Owner::Process(257), Some(Kind::Write), 0, 10, 1),
+            )
+            .unwrap();
+            if ready {
+                life_run(
+                    &mut a,
+                    &page,
+                    request(0, Owner::Process(256), Some(Kind::Write), 0, 10, 0),
+                )
+                .unwrap();
+            }
+            a.start(request(
+                0,
+                Owner::Process(256),
+                Some(Kind::Write),
+                10,
+                10,
+                0,
+            ))
+            .unwrap();
+            let mut reached = false;
+            for _ in 0..100 {
+                let progress = a.step_with_life(|pid| page.live(pid));
+                assert!(progress.completed.is_none());
+                reached = if ready {
+                    matches!(a.worker.as_ref().map(|worker| &worker.phase), Some(Phase::Prepare { work, .. }) if work.ready())
+                } else {
+                    a.counts().private != 0
+                };
+                if reached {
+                    break;
+                }
+            }
+            assert!(reached);
+            assert!(page.retire(256));
+            let terminal = a.step_with_life(|pid| page.live(pid));
+            assert_eq!(terminal.completed, Some(Err(Error::Cancelled)));
+            assert!(a.record_charge(0).unwrap() > 0);
+            life_drain(&mut a, &page);
+            assert_eq!(a.record_charge(0), Some(0));
+            assert_eq!(a.group_charge(0), Some(0));
+            assert_eq!(a.record_charge(1), Some(1));
+        }
+    }
+    #[test]
+    fn new_pid_place_cleans_previous_debt_and_survives_late_gone() {
+        let page = proto_process::lifetimes::Page::new();
+        page.publish(256).unwrap();
+        page.publish(257).unwrap();
+        let mut a: Box<Small> = fresh();
+        for node in 0..2 {
+            life_run(
+                &mut a,
+                &page,
+                request(node, Owner::Process(256), Some(Kind::Write), 0, 10, node),
+            )
+            .unwrap();
+        }
+        assert!(page.retire(256));
+        page.publish(512).unwrap();
+        assert_eq!(
+            life_run(
+                &mut a,
+                &page,
+                request(2, Owner::Process(512), Some(Kind::Write), 0, 10, 2)
+            ),
+            Ok(Response::Changed)
+        );
+        assert_eq!(a.record_charge(0), Some(0));
+        assert_eq!(a.record_charge(1), Some(0));
+        assert_eq!(a.group_charge(2), Some(1));
+        a.depart_pid(256).unwrap();
+        assert!(!a.busy());
+        assert_eq!(a.groups.tracked_pid(0), Ok(Some(512)));
+        let mut query = request(2, Owner::Process(257), None, 0, 10, 1);
+        query.command = Command::Get(Kind::Read);
+        assert!(matches!(
+            life_run(&mut a, &page, query),
+            Ok(Response::Blocker(Some(Lock {
+                owner: Owner::Process(512),
+                ..
+            })))
+        ));
+    }
+    #[test]
+    fn pid_audit_returns_debt_without_a_new_client_request() {
+        let page = proto_process::lifetimes::Page::new();
+        page.publish(256).unwrap();
+        page.publish(257).unwrap();
+        let mut a: Box<Small> = fresh();
+        life_run(
+            &mut a,
+            &page,
+            request(0, Owner::Process(256), Some(Kind::Write), 0, 10, 0),
+        )
+        .unwrap();
+        life_run(
+            &mut a,
+            &page,
+            request(1, Owner::Process(257), Some(Kind::Write), 0, 10, 1),
+        )
+        .unwrap();
+        assert_eq!(a.audit_pid(4, |pid| page.live(pid)), Err(Error::Invalid));
+        assert_eq!(a.audit_pid(0, |pid| page.live(pid)), Ok(false));
+        assert!(page.retire(256));
+        assert_eq!(a.audit_pid(0, |pid| page.live(pid)), Ok(true));
+        assert_eq!(a.audit_pid(0, |pid| page.live(pid)), Ok(false));
+        assert_eq!(a.groups.pid_head(256), Ok(None));
+        assert_eq!(a.record_charge(0), Some(1));
+        life_drain(&mut a, &page);
+        assert_eq!(a.record_charge(0), Some(0));
+        assert_eq!(a.record_charge(1), Some(1));
+    }
+    #[test]
+    fn dead_query_caller_never_allocates_a_group_or_returns_a_live_result() {
+        let page = proto_process::lifetimes::Page::new();
+        page.publish(256).unwrap();
+        page.retire(256);
+        let mut a: Box<Small> = fresh();
+        let mut query = request(0, Owner::Process(256), None, 0, 10, 0);
+        query.command = Command::Get(Kind::Read);
+        assert_eq!(life_run(&mut a, &page, query), Err(Error::Cancelled));
+        assert_eq!(a.counts().paid(), 0);
+        assert_eq!(a.group_charge(0), Some(0));
+    }
+    #[test]
+    fn ofd_worker_keeps_description_life_independent_of_dead_pid_page() {
+        let page = proto_process::lifetimes::Page::new();
+        page.publish(256).unwrap();
+        page.retire(256);
+        page.publish(512).unwrap();
+        let mut a: Box<Small> = fresh();
+        let owner = Owner::Description {
+            slot: 0,
+            generation: 1,
+        };
+        assert_eq!(
+            life_run(
+                &mut a,
+                &page,
+                request(0, owner, Some(Kind::Write), 0, 10, 0)
+            ),
+            Ok(Response::Changed)
+        );
+        a.depart_pid(256).unwrap();
+        assert_eq!(a.audit_pid(0, |pid| page.live(pid)), Ok(false));
+        assert_eq!(
+            life_run(
+                &mut a,
+                &page,
+                request(0, owner, Some(Kind::Write), 10, 10, 1)
+            ),
+            Ok(Response::Changed)
+        );
+        assert_eq!(a.record_charge(0), Some(1));
+        assert_eq!(a.record_charge(1), Some(0));
+        a.close(inode(0), owner).unwrap();
+        life_drain(&mut a, &page);
+        assert_eq!(a.counts().paid(), 0);
     }
 }

@@ -341,6 +341,11 @@ impl<
             .then_some(head.head)
             .flatten())
     }
+    /// One direct place for service-driven death observation, independent of credentials.
+    pub fn tracked_pid(&self, index: usize) -> Result<Option<u32>, Error> {
+        let head = self.pid_heads.get(index).ok_or(Error::Invalid)?;
+        Ok((head.live && head.head.is_some()).then_some(head.pid))
+    }
     /// Exclude the complete PID immediately and transfer its head once.
     /// The caller confirms death using the process service's lifetime page.
     pub fn depart_pid(&mut self, pid: u32) -> Result<Departure, Error> {
