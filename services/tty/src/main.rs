@@ -2373,10 +2373,10 @@ impl Tty {
         if set.action > FLUSH {
             return status(INVALID);
         }
-        if set.action == FLUSH {
-            if let Err(code) = self.flush_driver_input() {
-                return status(code);
-            }
+        if set.action == FLUSH
+            && let Err(code) = self.flush_driver_input()
+        {
+            return status(code);
         }
         self.devices[self.active]
             .console
