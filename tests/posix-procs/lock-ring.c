@@ -168,7 +168,7 @@ static int ring_run(unsigned family) {
         children[i] = fork();
         if (children[i] < 0) { printf("posix-procs: ring fork family=%u child=%u errno=%d\n", family, i, errno); return 1; }
         if (!children[i]) {
-            if (ring_setup(4 * family + i + 1)) _exit(123);
+            if (ring_setup(4 * family + i + 1)) { fflush(stdout); _exit(123); }
             _exit(ring_wait() ? 124 : 0);
         }
     }
