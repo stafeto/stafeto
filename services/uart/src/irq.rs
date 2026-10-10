@@ -11,8 +11,9 @@
 //! ICR: reading the FIFO empty clears it, and a clear written after the
 //! last read would drop the interrupt of a byte that came in between. A
 //! full ring masks input until a read takes bytes (`Irq::drained`), and
-//! the transmit interrupt is let out only while output waits; the driver
-//! writes the first bytes of an idle output itself (`Irq::start`). The
+//! transmit stays masked during the absolute retry deadline. New writes
+//! and receive passes preserve that deadline; its timer resumes one
+//! bounded output portion (`Irq::start`). The
 //! program reaches the registers; what it writes there comes from here.
 
 use crate::input::Input;
@@ -23,6 +24,8 @@ use crate::regs::{ERRORS, INPUT, TX};
 pub const RX_PASS: usize = 32;
 /// Each pass fills up to one FIFO, checking TXFF before every byte.
 pub const TX_PASS: usize = 32;
+/// The gap between transmit portions, in absolute timer nanoseconds.
+pub const TX_GAP_NS: u64 = 1_000_000;
 
 /// What the end of a pass writes: ICR first, then IMSC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,13 +37,17 @@ pub struct End {
 /// The driver's copy of IMSC.
 pub struct Irq {
     imsc: u32,
+    tx_deadline: u64,
 }
 
 impl Irq {
     /// Input let out, transmit masked: IMSC once the driver set the PL011
     /// up (spec 13.5).
     pub const fn new() -> Irq {
-        Irq { imsc: INPUT }
+        Irq {
+            imsc: INPUT,
+            tx_deadline: 0,
+        }
     }
 
     /// What IMSC holds.
@@ -48,8 +55,7 @@ impl Irq {
         self.imsc
     }
 
-    /// Whether the transmit interrupt is let out: output waits, and a pass
-    /// comes for it.
+    /// Whether the transmit interrupt is currently enabled.
     pub fn transmitting(&self) -> bool {
         self.imsc & TX != 0
     }
@@ -66,16 +72,20 @@ impl Irq {
     }
 
     /// The most bytes a pass for `mis` writes to the transmit FIFO:
-    /// TX_PASS when `mis` shows transmit, none otherwise.
+    /// TX_PASS when `mis` shows transmit outside its retry deadline.
     pub fn transmit_limit(&self, mis: u32) -> usize {
-        if mis & TX == 0 { 0 } else { TX_PASS }
+        if mis & TX == 0 || self.tx_deadline != 0 {
+            0
+        } else {
+            TX_PASS
+        }
     }
 
     /// The end of a pass for `mis`, with the ring of input full or not and
     /// the output idle or not: ICR clears transmit once the output is idle,
     /// never input. Error interrupts stay masked; Input::push counts byte
     /// errors from DR. IMSC masks input while the ring is full and lets
-    /// transmit out only while output waits. An output that
+    /// transmit out while output waits outside its retry deadline. An output that
     /// was idle outside a pass the program starts itself (`start`).
     pub fn end(&mut self, mis: u32, ring_full: bool, idle: bool) -> End {
         let mut icr = mis & ERRORS;
@@ -84,7 +94,7 @@ impl Irq {
         } else {
             self.imsc |= INPUT;
         }
-        if idle {
+        if idle || self.tx_deadline != 0 {
             self.imsc &= !TX;
             icr |= TX;
         } else {
@@ -102,15 +112,15 @@ impl Irq {
     /// `dr`, and gives the IMSC to write when bytes are left, transmit let
     /// out. A PL011 raises transmit only as its FIFO falls through its
     /// level, never for a FIFO nobody fills. The program calls it after
-    /// each put into the output: a write, the writes that waited, a batch
-    /// of the log, its own line.
+    /// each put into the output and at a transmit expiry. A held retry
+    /// deadline prevents a new write from starting another portion.
     pub fn start(
         &mut self,
         output: &mut Output,
         tx_full: impl FnMut() -> bool,
         dr: impl FnMut(u8),
     ) -> Option<u32> {
-        if self.transmitting() {
+        if self.transmitting() || self.tx_deadline != 0 {
             return None;
         }
         transmit(TX_PASS, tx_full, dr, output);
@@ -119,6 +129,24 @@ impl Irq {
         }
         self.imsc |= TX;
         Some(self.imsc)
+    }
+
+    /// Mask transmit after one portion and keep its absolute retry deadline.
+    /// Input remains enabled according to its ring's state.
+    pub fn defer_transmit(&mut self, now: u64) -> u64 {
+        self.imsc &= !TX;
+        self.tx_deadline = now.saturating_add(TX_GAP_NS);
+        self.tx_deadline
+    }
+
+    /// Resume once the currently held deadline is reached. A stale timer
+    /// notice cannot resume a newer portion or an idle transmitter.
+    pub fn resume_transmit(&mut self, now: u64) -> bool {
+        if self.tx_deadline == 0 || now < self.tx_deadline {
+            return false;
+        }
+        self.tx_deadline = 0;
+        true
     }
 
     /// A read took bytes out of the ring of input: the IMSC to write when
@@ -282,6 +310,133 @@ mod tests {
         let mut irq = Irq::new();
         assert_eq!(irq.start(&mut short, || false, |_| {}), None);
         assert!(short.is_idle() && !irq.transmitting());
+    }
+
+    #[test]
+    fn deferred_transmit_blocks_new_starts_and_stale_tx_interrupts() {
+        let mut irq = Irq::new();
+        let mut output = Output::new();
+        assert!(output.put(&[b'x'; 100]));
+        let mut sent = Vec::new();
+        assert!(irq.start(&mut output, || false, |b| sent.push(b)).is_some());
+        assert_eq!(sent.len(), TX_PASS);
+        let deadline = irq.defer_transmit(700);
+        assert_eq!(deadline, 700 + TX_GAP_NS);
+        assert_eq!(irq.imsc() & TX, 0);
+        assert_eq!(irq.transmit_limit(TX | RX), 0);
+        assert!(output.put(b"new"));
+        assert_eq!(irq.start(&mut output, || false, |b| sent.push(b)), None);
+        assert_eq!(sent.len(), TX_PASS);
+        assert!(!irq.resume_transmit(deadline - 1));
+        assert!(irq.resume_transmit(deadline));
+        assert!(irq.start(&mut output, || false, |b| sent.push(b)).is_some());
+        assert_eq!(sent.len(), 2 * TX_PASS);
+    }
+
+    #[test]
+    fn receive_irq_preserves_transmit_deadline_and_input_progress() {
+        let mut irq = Irq::new();
+        let deadline = irq.defer_transmit(7);
+        let mut input = Input::new();
+        let mut fifo = Fifo::of(4);
+        let (n, end) = receive_pass(&mut irq, RX | RT, &mut fifo, &mut input);
+        assert_eq!(n, 4);
+        assert_eq!(end.imsc, INPUT);
+        let end = irq.end(RX | RT, false, false);
+        assert_eq!(end.imsc, INPUT);
+        assert_eq!(end.icr & INPUT, 0);
+        assert_eq!(irq.transmit_limit(TX), 0);
+        assert!(!irq.resume_transmit(deadline - 1));
+        assert!(irq.resume_transmit(deadline));
+    }
+
+    #[test]
+    fn duplicate_expiry_cannot_advance_a_new_transmit_portion() {
+        let mut irq = Irq::new();
+        let first = irq.defer_transmit(20);
+        assert!(irq.resume_transmit(first));
+        assert!(!irq.resume_transmit(first));
+        let second = irq.defer_transmit(first);
+        assert_eq!(second, first + TX_GAP_NS);
+        assert!(!irq.resume_transmit(first));
+        assert!(!irq.resume_transmit(second - 1));
+        assert!(irq.resume_transmit(second));
+    }
+
+    #[test]
+    fn paced_full_fifo_preserves_all_bytes_until_the_next_deadline() {
+        let mut irq = Irq::new();
+        let mut output = Output::new();
+        let text: Vec<u8> = (0..100).map(|i| b'a' + (i % 26) as u8).collect();
+        assert!(output.put(&text));
+        let mut sent = Vec::new();
+        assert!(irq.start(&mut output, || true, |b| sent.push(b)).is_some());
+        assert!(sent.is_empty());
+        let deadline = irq.defer_transmit(100);
+        assert!(irq.resume_transmit(deadline));
+        assert!(irq.start(&mut output, || false, |b| sent.push(b)).is_some());
+        let mut now = deadline;
+        while !output.is_idle() {
+            now = irq.defer_transmit(now);
+            assert!(!irq.resume_transmit(now - 1));
+            assert!(irq.resume_transmit(now));
+            let before = sent.len();
+            irq.start(&mut output, || false, |b| sent.push(b));
+            assert!(sent.len() - before <= TX_PASS);
+        }
+        assert_eq!(sent, text);
+        assert!(!irq.resume_transmit(now + TX_GAP_NS));
+        assert!(output.put(b"new"));
+        irq.start(&mut output, || false, |b| sent.push(b));
+        assert_eq!(&sent[text.len()..], b"new");
+        assert!(output.is_idle());
+    }
+
+    #[test]
+    fn paced_output_answers_all_waiting_writes_in_order_under_backpressure() {
+        use crate::output::TX_RING;
+        use crate::writes::{Taken, Writes};
+        let mut irq = Irq::new();
+        let mut output = Output::new();
+        let mut writes = Writes::new();
+        let mut expected = vec![b'x'; TX_RING];
+        assert!(output.put(&expected));
+        for token in 0..4 {
+            let bytes = vec![b'a' + token; 128];
+            expected.extend_from_slice(&bytes);
+            assert_eq!(
+                writes.write(&mut output, u64::from(token), &bytes, token),
+                Taken::Waits
+            );
+        }
+        let mut answered = Vec::new();
+        let mut sent = Vec::new();
+        let mut now = 100;
+        for _ in 0..200 {
+            writes.flush(&mut output, |token, count| answered.push((token, count)));
+            let before = sent.len();
+            let waiting = irq.start(&mut output, || false, |b| sent.push(b)).is_some();
+            assert!(sent.len() - before <= TX_PASS);
+            if !waiting {
+                break;
+            }
+            now = irq.defer_transmit(now);
+            assert_eq!(irq.end(RX, false, false).imsc, INPUT);
+            assert!(!irq.resume_transmit(now - 1));
+            assert!(irq.resume_transmit(now));
+        }
+        assert!(writes.is_empty() && output.is_idle());
+        assert!(writes.roomy(&output));
+        assert_eq!(answered, vec![(0, 128), (1, 128), (2, 128), (3, 128)]);
+        assert_eq!(sent, expected);
+    }
+
+    #[test]
+    fn transmit_deadline_saturates_without_wrapping_into_an_early_expiry() {
+        let mut irq = Irq::new();
+        assert_eq!(irq.defer_transmit(u64::MAX - 10), u64::MAX);
+        assert!(!irq.resume_transmit(u64::MAX - 1));
+        assert!(irq.resume_transmit(u64::MAX));
     }
 
     #[test]

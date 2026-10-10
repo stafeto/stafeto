@@ -4757,7 +4757,12 @@ fn tty_probe(vz: bool) -> Result<(), String> {
         run.expect_bytes(b"\nbare-lf\n", DIALOG_STEP)?;
         run.expect("tty-probe: wrote", DIALOG_STEP)?;
         run.expect("tty-probe: ok", DIALOG_STEP)?;
-        run.expect(ENDED_TTY, DIALOG_STEP)
+        run.expect(ENDED_TTY, DIALOG_STEP)?;
+        // The debug completion can precede bytes already accepted by UART.
+        run.expect_seen(
+            "tty-probe line 199 abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            DIALOG_STEP,
+        )
     })();
     let output = run.stop();
     if vz {
