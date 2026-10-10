@@ -11,6 +11,7 @@ pub mod closing;
 pub mod control;
 pub mod open;
 mod target;
+pub mod wait;
 pub use target::RamTarget;
 
 use core::mem::ManuallyDrop;
@@ -212,7 +213,12 @@ pub struct PosixFs {
     terminal: Option<Handle<Channel>>,
     paths: PathState,
     descriptors: Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>,
+    waits: posix_fd::WaitRecords<wait::Recovery>,
 }
+
+const _: () = assert!(core::mem::size_of::<wait::Recovery>() == 88);
+const _: () = assert!(core::mem::size_of::<posix_fd::WaitRecords<wait::Recovery>>() == 2560);
+const _: () = assert!(core::mem::size_of::<PosixFs>() == 17232);
 
 // Typed control receipts retain their complete immutable source and outcome.
 const _: () = assert!(core::mem::size_of::<control::Recovery>() == 120);
@@ -889,6 +895,7 @@ impl PosixFs {
             core::ptr::addr_of_mut!((*destination).pipes).write(pipes);
             core::ptr::addr_of_mut!((*destination).terminal).write(terminal);
             core::ptr::addr_of_mut!((*destination).paths).write(paths);
+            posix_fd::WaitRecords::initialize_at(core::ptr::addr_of_mut!((*destination).waits));
             Table::initialize_at(
                 core::ptr::addr_of_mut!((*destination).descriptors),
                 |target| matches!(target, Target::Tty(_)),
@@ -989,6 +996,7 @@ impl PosixFs {
         core::mem::forget(parent);
         core::mem::forget(core::mem::replace(&mut self.pipes, pipes));
         core::mem::forget(core::mem::replace(&mut self.terminal, terminal));
+        self.discard_wait_after_fork();
         self.descriptors.discard_open_after_fork();
         while self.descriptors.abandon_hold().is_some() {}
         let mut closing = [false; OPEN_MAX];
@@ -1095,6 +1103,7 @@ impl PosixFs {
             terminal: None,
             paths: PathState::new(),
             descriptors,
+            waits: posix_fd::WaitRecords::new(),
         })
     }
 

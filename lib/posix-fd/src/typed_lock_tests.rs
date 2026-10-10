@@ -58,6 +58,7 @@ enum Target {
 }
 struct PosixFs {
     descriptors: Table<Target, 32, (), (), control::Recovery>,
+    waits: super::WaitRecords<wait::Recovery>,
 }
 
 #[allow(dead_code, unused_imports)]
@@ -70,6 +71,7 @@ mod control;
 fn fixture() -> (PosixFs, EntryToken, RamTarget, control::Input) {
     let mut files = PosixFs {
         descriptors: Table::default(),
+        waits: super::WaitRecords::new(),
     };
     let target = RamTarget {
         fd: 3,
@@ -669,3 +671,9 @@ mod lock_collect;
 
 #[path = "typed_lock_helper_tests.rs"]
 mod helper_retirement;
+
+#[allow(dead_code)]
+#[path = "../../posix-fs/src/wait.rs"]
+mod wait;
+#[path = "typed_wait_tests.rs"]
+mod wait_tests;

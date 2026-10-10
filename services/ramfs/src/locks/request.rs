@@ -20,6 +20,32 @@ pub struct Captured {
 }
 
 impl Ram<'_> {
+    /// Capture WAIT using the same genuine SET validation, without Control custody.
+    pub fn capture_wait(&self, fds: &Fds, wire: proto_fs::WaitStart) -> Result<Captured, u32> {
+        wire.validate().map_err(|error| error.code())?;
+        self.capture_lock(
+            fds,
+            LockStart {
+                // This key is local capture input only; no Control queue is touched.
+                key: proto_fs::OpenKey {
+                    slot: 32 + wire.key.slot,
+                    generation: wire.key.generation,
+                },
+                description: wire.description,
+                command: if wire.mode.ofd() {
+                    proto_fs::LockCommand::SetOfd
+                } else {
+                    proto_fs::LockCommand::SetPid
+                },
+                kind: wire.kind,
+                whence: wire.whence,
+                start: wire.start,
+                length: wire.length,
+                pid: wire.pid,
+            },
+        )
+    }
+
     /// Capture once at Start; later preparation preserves the normalized region.
     pub fn capture_lock(&self, fds: &Fds, wire: LockStart) -> Result<Captured, u32> {
         wire.validate().map_err(|error| error.code())?;
