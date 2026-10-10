@@ -21,9 +21,8 @@ use crate::regs::{ERRORS, INPUT, TX};
 
 /// The most bytes a pass reads from the receive FIFO.
 pub const RX_PASS: usize = 32;
-/// The most bytes a pass writes to the transmit FIFO: half the least
-/// depth of a FIFO.
-pub const TX_PASS: usize = 16;
+/// Each pass fills up to one FIFO, checking TXFF before every byte.
+pub const TX_PASS: usize = 32;
 
 /// What the end of a pass writes: ICR first, then IMSC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,22 +256,22 @@ mod tests {
         let mut irq = Irq::new();
         let mut output = Output::new();
         assert!(!irq.transmitting());
-        assert!(output.put(&[b'x'; 20]));
+        assert!(output.put(&[b'x'; TX_PASS + 4]));
         // The driver starts an idle output itself, and only that.
         let mut sent = 0;
         assert_eq!(
             irq.start(&mut output, || false, |_| sent += 1),
             Some(INPUT | TX)
         );
-        assert_eq!(sent, 16);
+        assert_eq!(sent, TX_PASS);
         assert_eq!(irq.start(&mut output, || false, |_| sent += 1), None);
-        assert_eq!(sent, 16);
+        assert_eq!(sent, TX_PASS);
         assert_eq!(transmit(TX_PASS, || false, |_| {}, &mut output), 4);
         let end = irq.end(TX, false, output.is_idle());
         assert_eq!((end.imsc & TX, end.icr & TX), (0, TX));
         assert!(!irq.transmitting());
         // Bytes left after a pass keep it let out, and not cleared.
-        assert!(output.put(&[b'y'; 40]));
+        assert!(output.put(&[b'y'; TX_PASS * 3]));
         irq.start(&mut output, || false, |_| {});
         transmit(TX_PASS, || false, |_| {}, &mut output);
         let end = irq.end(TX, false, output.is_idle());
@@ -286,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transmit_pass_writes_at_most_16_bytes() {
+    fn a_transmit_pass_writes_at_most_32_bytes_and_preserves_fifo_order() {
         let mut output = Output::new();
         let text: Vec<u8> = (0..100).map(|i| b'a' + (i % 26) as u8).collect();
         assert!(output.put(&text));
@@ -294,8 +293,8 @@ mod tests {
         assert_eq!(irq.transmit_limit(RX | RT), 0);
         let limit = irq.transmit_limit(TX);
         let mut sent = Vec::new();
-        assert_eq!(transmit(limit, || false, |b| sent.push(b), &mut output), 16);
-        assert_eq!(sent, text[..16]);
+        assert_eq!(transmit(limit, || false, |b| sent.push(b), &mut output), 32);
+        assert_eq!(sent, text[..32]);
         // A full FIFO stops the pass early.
         let mut polls = 0;
         let n = transmit(
@@ -308,6 +307,10 @@ mod tests {
             &mut output,
         );
         assert_eq!(n, 5);
-        assert_eq!(sent, text[..21]);
+        assert_eq!(sent, text[..37]);
+        while !output.is_idle() {
+            assert!(transmit(TX_PASS, || false, |b| sent.push(b), &mut output) <= 32);
+        }
+        assert_eq!(sent, text);
     }
 }
