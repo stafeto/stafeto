@@ -18,6 +18,7 @@ finish with zero, preserve exactly one name, release its custody record, and
 increase the count of genuine Interrupted replies. Eight attempts bound a
 failure to reach the queued interval. The driver hooks remain disabled during
 this scenario, and fake lost replies never increase its genuine counter.
+The genuine scenario runs first, before the synthetic lost-reply checks.
 
 Failure output includes the rename result, errno and the genuine counter.
 The QEMU process runner observes any termination of its initial process and

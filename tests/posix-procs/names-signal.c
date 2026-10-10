@@ -123,6 +123,7 @@ static int sg_try(long delay_us, int *left, int from_new) {
         result = from_new ? rename(SG_NEW, SG_LAST) : rename(SG_LAST, SG_NEW);
         sg_in_rename = 0;
     } else {
+        sg_in_rename = 0;
         *left = 1;
         sg_jumps++;
         result = 0;
