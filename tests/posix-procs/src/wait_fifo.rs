@@ -111,10 +111,17 @@ pub extern "C" fn wait_fifo_selected(nonce: u64, index: u32) -> i32 {
         packet[12..20].copy_from_slice(&nonce.to_le_bytes());
         let (bytes, len) = call(&packet)?;
         let mut reader = Reader::new(&bytes[..len]);
-        if reader.u32().map_err(|_| -10)? != 0
-            || reader.u32().map_err(|_| -11)? != 4
-            || reader.u64().map_err(|_| -12)? != nonce
-        {
+        let status = reader.u32().map_err(|_| -10)?;
+        let phase = reader.u32().map_err(|_| -11)?;
+        let observed_nonce = reader.u64().map_err(|_| -12)?;
+        rt::println!(
+            "posix-procs: FIFO observation status {} phase {} nonce {} expected {}",
+            status,
+            phase,
+            observed_nonce,
+            nonce
+        );
+        if status != 0 || phase != 4 || observed_nonce != nonce {
             return Err(-13);
         }
         let visited = reader.u32().map_err(|_| -14)?;

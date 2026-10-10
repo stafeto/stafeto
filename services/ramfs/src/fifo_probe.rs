@@ -11,7 +11,7 @@ use ramfs::{
     },
     storage::Token,
 };
-pub const PERIOD_NS: u64 = 100_000_000;
+pub const PERIOD_NS: u64 = 1_000_000_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Phase {
