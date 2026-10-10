@@ -10,6 +10,7 @@ pub mod dispatch;
 pub mod groups;
 pub mod preparation;
 pub mod records;
+pub mod request;
 pub mod service;
 
 /// The greatest byte offset representable by relibc's off_t.

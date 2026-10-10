@@ -204,6 +204,12 @@ pub const NOT_SUPPORTED: u32 = 327;
 /// The request made no effect and raised no mark; the same key can be
 /// sent again after a pause.
 pub const JOBS_FULL: u32 = 328;
+/// ENOLCK: the prepaid lock records cannot admit this change.
+pub const NO_LOCKS: u32 = 329;
+/// EAGAIN: a nonblocking lock conflicts with another owner.
+pub const LOCK_CONFLICT: u32 = 330;
+/// Internal retry: a concurrent close cancelled unpublished preparation.
+pub const LOCK_CANCELLED: u32 = 331;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
