@@ -6,6 +6,7 @@
 
 pub mod actor;
 pub mod budget;
+pub mod dispatch;
 pub mod groups;
 pub mod preparation;
 pub mod records;

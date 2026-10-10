@@ -3,6 +3,64 @@
 
 //! The dedicated guest observes the actual service page and its transferred rights.
 
+static BUDGET_PRINTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ram_lifetime(pid: i32) -> i32 {
+    let result = (|| {
+        let raw =
+            posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())).map_err(|_| -1)?;
+        let channel = rt::Handle::<rt::handle::Channel>::borrowed(raw);
+        let mut request = proto_wire::Writer::new();
+        proto_wire::Header::new(0xfff3, proto_fs::VERSION)
+            .write(&mut request)
+            .map_err(|_| -2)?;
+        request.u32(pid as u32).map_err(|_| -3)?;
+        for _ in 0..128 {
+            let reply = rt::fs::Files::send_on(&channel, request.as_bytes()).map_err(|_| -4)?;
+            if !reply.handles.is_empty() {
+                return Err(-5);
+            }
+            let mut buffer = [0; rt::abi::MESSAGE_MAX];
+            let mut body = proto_wire::Reader::new(reply.bytes(&mut buffer));
+            let status = body.u32().map_err(|_| -6)?;
+            if status == proto_fs::RESOLVING {
+                if body.u32().map_err(|_| -9)? != 0 {
+                    return Err(-9);
+                }
+                body.finish().map_err(|_| -9)?;
+                rt::sys::yield_now().map_err(|_| -11)?;
+                continue;
+            }
+            if status != 0 {
+                return Err(-7);
+            }
+            let live = body.u32().map_err(|_| -8)?;
+            let quota = body.u64().map_err(|_| -13)?;
+            let used = body.u64().map_err(|_| -14)?;
+            body.finish().map_err(|_| -9)?;
+            if quota.saturating_sub(used) < 128 * 4096 {
+                return Err(-15);
+            }
+            if !BUDGET_PRINTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                rt::println!(
+                    "RAM lifetime budget: quota={} used={} free={} pages ticks={}",
+                    quota / 4096,
+                    used / 4096,
+                    quota.saturating_sub(used) / 4096,
+                    rt::time::now()
+                );
+            }
+            if live > 1 {
+                return Err(-10);
+            }
+            return Ok(live as i32);
+        }
+        Err(-12)
+    })();
+    result.unwrap_or_else(|error| error)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn process_lifetime(pid: i32) -> i32 {
     let result = (|| {

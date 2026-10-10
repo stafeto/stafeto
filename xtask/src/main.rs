@@ -571,9 +571,10 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-/// Only the names and real-signal probe can pause the RAM service.
+/// Lifetime observations exist only in this dedicated image.
 const POSIX_LIFETIMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[1].3 = &["lifetime-probe"];
     programs[3].3 = &["lifetime-probe"];
     programs[5].3 = &["lifetime-probe"];
     programs
@@ -7208,6 +7209,7 @@ mod tests {
 
     #[test]
     fn lifetime_probe_has_its_own_process_and_program_features() {
+        assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[5].3, &["lifetime-probe"]);
         for programs in [

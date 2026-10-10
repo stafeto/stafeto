@@ -222,6 +222,74 @@ mod tests {
         panic!("service request did not finish");
     }
     #[test]
+    fn own_dispatches_finish_a_stalled_client_and_reclaim_death_without_take() {
+        use super::super::dispatch::{Dispatch, Work};
+        let mut ram = crate::Ram::new(proto_fs::Timestamp::ZERO);
+        let mut service = fresh();
+        let page = page();
+        let mut dispatch = Dispatch::default();
+        service
+            .start(
+                &mut ram.storage,
+                request(0, 256, Command::Set(Some(Kind::Write)), 0, 1),
+                root(10, 1),
+            )
+            .unwrap();
+        let mut completion = None;
+        let mut legacy = 0;
+        for _ in 0..512 {
+            match dispatch.next(0, service.busy(), true) {
+                Work::Actor => {
+                    let progress = service.step(&mut ram.storage, |pid| page.live(pid));
+                    assert!(progress.visited <= 8);
+                    if let Some(done) = progress.completed {
+                        assert!(completion.replace(done).is_none());
+                    }
+                    check(&service);
+                }
+                Work::Audit { first, end } => {
+                    for index in first..end {
+                        service.audit_pid(index, |pid| page.live(pid)).unwrap();
+                    }
+                }
+                Work::Legacy => legacy += 1,
+            }
+            if !dispatch.pending(service.busy()) {
+                break;
+            }
+        }
+        assert_eq!(completion, Some(Ok(Response::Changed)));
+        assert!(dispatch.audited());
+        assert!(legacy > 0);
+        assert_eq!(service.counts().published, 1);
+        assert!(page.retire(256));
+        for _ in 0..512 {
+            match dispatch.next(250_000_000, service.busy(), true) {
+                Work::Actor => {
+                    let progress = service.step(&mut ram.storage, |pid| page.live(pid));
+                    assert!(progress.visited <= 8);
+                    assert!(progress.completed.is_none());
+                    check(&service);
+                }
+                Work::Audit { first, end } => {
+                    for index in first..end {
+                        service.audit_pid(index, |pid| page.live(pid)).unwrap();
+                    }
+                }
+                Work::Legacy => {}
+            }
+            if !dispatch.pending(service.busy()) {
+                break;
+            }
+        }
+        assert!(!service.busy());
+        assert_eq!(service.counts().paid(), 0);
+        assert!(service.groups.iter().all(Option::is_none));
+        let replacement = ram.storage.lock_anchor(root(99, 1)).unwrap();
+        assert_eq!(replacement.index(), 0);
+        ram.storage.release_lock_anchor(replacement).unwrap();
+    }
+    #[test]
     fn service_layout_initializes_directly_and_preserves_accounted_size() {
         let service = fresh();
         let bytes = core::mem::size_of::<LockService>();

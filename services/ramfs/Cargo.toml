@@ -20,6 +20,8 @@ bench = false
 auth-probe = []
 # A bounded receive pause for genuine queued-request signal cancellation.
 signal-probe = []
+# Read-only observation of the genuine Process page in the dedicated lifetime image.
+lifetime-probe = []
 image-gates = ["auth-probe"]
 image-info-probe = ["auth-probe"]
 # The longest step of the loop for each method, printed when it grows (rt

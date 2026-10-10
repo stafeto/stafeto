@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 extern int process_lifetime(int pid);
+extern int ram_lifetime(int pid);
 static int failures;
 static void expect(const char *what, int actual, int wanted) {
     if (actual != wanted) {
@@ -19,15 +20,19 @@ static void expect(const char *what, int actual, int wanted) {
         failures++;
     }
 }
+static void expect_life(const char *what, pid_t pid, int wanted) {
+    expect(what, process_lifetime(pid), wanted);
+    expect("RAM observes exact PID lifetime", ram_lifetime(pid), wanted);
+}
 static void reap(pid_t child, int killed) {
     int status = 0;
     expect("wait", waitpid(child, &status, 0), child);
     expect("wait status", killed ? WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL
                                 : WIFEXITED(status) && WEXITSTATUS(status) == 0, 1);
-    expect("dead before wait returns", process_lifetime(child), 0);
+    expect_life("dead before wait returns", child, 0);
 }
 int main(int argc, char **argv) {
-    expect("running full PID", process_lifetime(getpid()), 1);
+    expect_life("running full PID", getpid(), 1);
     if (argc > 1 && strcmp(argv[1], "sleep") == 0) {
         for (;;) pause();
     }
@@ -35,7 +40,7 @@ int main(int argc, char **argv) {
         /* Allow the old image's end notification to arrive before checking. */
         struct timespec delay = {0, 10000000};
         nanosleep(&delay, NULL);
-        expect("same PID after old image ended", process_lifetime(getpid()), 1);
+        expect_life("same PID after old image ended", getpid(), 1);
         return failures != 0;
     }
     if (argc == 1) {
@@ -50,23 +55,23 @@ int main(int argc, char **argv) {
         return failures != 0;
     }
     expect("drop effective UID", seteuid(65534), 0);
-    expect("PID lives with changed credentials", process_lifetime(getpid()), 1);
+    expect_life("PID lives with changed credentials", getpid(), 1);
     expect("restore effective UID", seteuid(0), 0);
-    expect("PID lives with restored credentials", process_lifetime(getpid()), 1);
+    expect_life("PID lives with restored credentials", getpid(), 1);
     char *sleep_argv[] = {"procs-child", "sleep", NULL};
     char *environment[] = {NULL};
     pid_t child = -1;
     expect("spawn", posix_spawn(&child, "/bin/procs-child", NULL, NULL,
                                sleep_argv, environment), 0);
     if (child > 0) {
-        expect("published at spawn commit", process_lifetime(child), 1);
+        expect_life("published at spawn commit", child, 1);
         expect("kill", kill(child, SIGKILL), 0);
         reap(child, 1);
     }
     child = fork();
     if (child < 0) printf("PID lifetime: fork failed errno %d\n", errno);
     if (child == 0) {
-        expect("published at fork commit", process_lifetime(getpid()), 1);
+        expect_life("published at fork commit", getpid(), 1);
         _exit(failures != 0);
     }
     expect("fork", child > 0, 1);

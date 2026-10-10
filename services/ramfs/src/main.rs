@@ -21,6 +21,8 @@ use ramfs::authority::{
     RetainedSourcePhase, retained_source_phase,
 };
 use ramfs::job::{JobOperation, PathJob, ResolveJob, Seconds};
+use ramfs::locks::dispatch::{Dispatch as LockDispatch, Work as LockWork};
+use ramfs::locks::service::LockService;
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
 use ramfs::storage::{NONE, Root, Token};
@@ -33,6 +35,7 @@ use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 
 mod clock_page;
+mod lifetime_page;
 
 rt::entry!(main);
 
@@ -46,16 +49,19 @@ const BASE_METHODS: &[u16] = &[
 ];
 #[cfg(not(any(
     feature = "steps",
+    feature = "lifetime-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 )))]
 const METHODS: &[u16] = BASE_METHODS;
 #[cfg(any(
     feature = "steps",
+    feature = "lifetime-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 ))]
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
         + cfg!(feature = "steps") as usize
+        + cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
@@ -68,6 +74,10 @@ const METHODS: &[u16] = &{
     }
     if cfg!(all(feature = "signal-probe", not(feature = "steps"))) {
         methods[i] = 0xfff4;
+        i += 1;
+    }
+    if cfg!(feature = "lifetime-probe") {
+        methods[i] = 0xfff3;
     }
     methods
 };
@@ -89,6 +99,10 @@ struct StorageBss(UnsafeCell<core::mem::MaybeUninit<ramfs::storage::State>>);
 // SAFETY: only the service thread accesses the storage tables.
 unsafe impl Sync for StorageBss {}
 static STORAGE: StorageBss = StorageBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct LocksBss(UnsafeCell<core::mem::MaybeUninit<LockService>>);
+// SAFETY: the sole service thread initializes and owns all lock tables.
+unsafe impl Sync for LocksBss {}
+static LOCKS: LocksBss = LocksBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 
 /// The files of the boot image's table: the image is mapped from the
 /// start data (`bootimage`, given to this record by init), and the table is
@@ -152,6 +166,12 @@ fn main(_: u64) -> u64 {
         &mut *pointer
     };
     state.initialize();
+    // SAFETY: initialization writes directly into exclusive aligned permanent storage.
+    let locks = unsafe {
+        let pointer = (*LOCKS.0.get()).as_mut_ptr();
+        LockService::initialize_at(pointer);
+        &mut *pointer
+    };
     let ram = Ram::with_storage(now, state, data, tree);
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
@@ -175,12 +195,17 @@ fn main(_: u64) -> u64 {
         core::mem::size_of::<ramfs::storage::State>()
             + core::mem::size_of::<Tables>()
             + core::mem::size_of::<Index>()
+            + core::mem::size_of::<LockService>()
     );
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
     let tables = unsafe { &mut *TABLES.0.get() };
     let mut fs = Fs {
         ram,
+        locks,
+        lock_dispatch: LockDispatch::default(),
+        lifetimes: None,
+        legacy_pending: true,
         time_source,
         #[cfg(feature = "image-info-probe")]
         image_info_backing: Handle::borrowed(backing.raw()),
@@ -214,6 +239,7 @@ fn main(_: u64) -> u64 {
     // Prepare the authentic notary page after publishing the RAM endpoint.
     // Standalone boot profiles may have no Process service.
     let _ = fs.notary_register();
+    let _ = fs.register_lifetimes();
     #[cfg(feature = "steps")]
     rt::service::report_steps(2);
     let _ = rt::service::run_in(&channel, &mut fs, config, &mut tables.sessions);
@@ -222,6 +248,10 @@ fn main(_: u64) -> u64 {
 
 struct Fs {
     ram: Ram<'static>,
+    locks: &'static mut LockService,
+    lock_dispatch: LockDispatch,
+    lifetimes: Option<lifetime_page::Lifetimes>,
+    legacy_pending: bool,
     time_source: clock_page::TimeSource,
     // The startup-owned backing outlives this service loop and every outgoing copy.
     #[cfg(feature = "image-info-probe")]
@@ -1052,6 +1082,7 @@ impl Service<0> for Fs {
 
     /// The client of `s` went: its descriptors close.
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
+        self.legacy_pending = true;
         self.clear_image_outcome(&mut s.data);
         for id in s.data.resolvers {
             if id != 0 {
@@ -1066,6 +1097,7 @@ impl Service<0> for Fs {
     /// the descriptors it was born with close.
     fn closed(&mut self, label: u64) {
         self.maintenance_burst.restart();
+        self.legacy_pending = true;
         #[cfg(feature = "steps")]
         if self.steps_reclaim_owner == Some(label) {
             self.steps_reclaim_owner = None;
@@ -1094,6 +1126,7 @@ impl Service<0> for Fs {
     ) {
         if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
             self.maintenance_burst.restart();
+            self.legacy_pending = true;
             let _ = sys::notify(&self.channel, 1);
             return;
         }
@@ -1106,6 +1139,38 @@ impl Service<0> for Fs {
             );
         }
         let now = rt::time::ticks_to_ns(rt::time::now());
+        match self
+            .lock_dispatch
+            .next(now, self.locks.busy(), self.lifetimes.is_some())
+        {
+            LockWork::Actor => {
+                let page = self
+                    .lifetimes
+                    .as_ref()
+                    .expect("authenticated lifetime mapping");
+                let progress = self.locks.step(&mut self.ram.storage, |pid| page.live(pid));
+                debug_assert!(
+                    progress.completed.is_none(),
+                    "no lock requests admitted yet"
+                );
+                self.notify_maintenance();
+                return;
+            }
+            LockWork::Audit { first, end } => {
+                let page = self
+                    .lifetimes
+                    .as_ref()
+                    .expect("authenticated lifetime mapping");
+                for index in first..end {
+                    self.locks
+                        .audit_pid(index, |pid| page.live(pid))
+                        .expect("bounded genuine PID place");
+                }
+                self.notify_maintenance();
+                return;
+            }
+            LockWork::Legacy => {}
+        }
         if now >= self.next_audit_ns && self.maintenance.remaining == 0 {
             self.next_audit_ns = now.saturating_add(250_000_000);
             self.maintenance.remaining = SESSIONS + BIRTHS - 1;
@@ -1133,12 +1198,11 @@ impl Service<0> for Fs {
                     work = self.ram.storage.reclaim_step();
                 }
             }
-            if self.maintenance_burst.again(
+            self.legacy_pending = self.maintenance_burst.again(
                 work,
                 work || self.maintenance.remaining != 0 || self.orphan_count != 0,
-            ) {
-                let _ = sys::notify(&self.channel, 1);
-            }
+            );
+            self.notify_maintenance();
             return;
         }
         let mut client_work = false;
@@ -1155,12 +1219,11 @@ impl Service<0> for Fs {
         work |= client_work;
         self.maintenance.complete(client_work, SESSIONS + BIRTHS);
         // A maintenance notification makes reclamation progress with no client request.
-        if self.maintenance_burst.again(
+        self.legacy_pending = self.maintenance_burst.again(
             work,
             work || self.maintenance.remaining != 0 || self.orphan_count != 0,
-        ) {
-            let _ = sys::notify(&self.channel, 1);
-        }
+        );
+        self.notify_maintenance();
     }
 
     fn between_notifications(&mut self, notice: rt::service::Notice) {
@@ -1178,6 +1241,7 @@ impl Service<0> for Fs {
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
         self.maintenance_burst.restart();
+        self.legacy_pending = true;
         let first = !s.data.claimed;
         if !s.data.claimed {
             // The first request of a session Clone made takes its
@@ -1495,6 +1559,48 @@ impl Service<0> for Fs {
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
+        }
+        #[cfg(feature = "lifetime-probe")]
+        if r.method() == 0xfff3 {
+            if !r.handles.is_empty() || s.data.binding.snapshot_ref().is_none() {
+                return Answer::Status(Status::BadSize);
+            }
+            let mut body = r.body();
+            let Ok(pid) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            if !self.register_lifetimes() {
+                return status(proto_fs::PERMISSION);
+            }
+            if !self.lock_dispatch.audited() {
+                return status(proto_fs::RESOLVING);
+            }
+            let live = self.lifetimes.as_ref().expect("registered page").live(pid);
+            let counts = self.locks.counts();
+            if self.locks.busy() || counts != ramfs::locks::budget::Counts::default() {
+                return status(proto_fs::PERMISSION);
+            }
+            let Ok(memory) = sys::process_memory(&self.process) else {
+                return status(proto_fs::PERMISSION);
+            };
+            let free = memory.quota.saturating_sub(memory.used) / 4096;
+            if free < 128 {
+                return status(proto_fs::NO_SPACE);
+            }
+            let reply = r.reply();
+            if reply
+                .u32(0)
+                .and_then(|()| reply.u32(u32::from(live)))
+                .and_then(|()| reply.u64(memory.quota))
+                .and_then(|()| reply.u64(memory.used))
+                .is_err()
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply(Outgoing::new());
         }
         #[cfg(all(feature = "signal-probe", not(feature = "steps")))]
         if r.method() == 0xfff4 {
@@ -1970,6 +2076,28 @@ fn generation(index: usize) -> u64 {
     }
 }
 impl Fs {
+    fn notify_maintenance(&self) {
+        if self.legacy_pending || self.lock_dispatch.pending(self.locks.busy()) {
+            let _ = sys::notify(&self.channel, 1);
+        }
+    }
+    fn register_lifetimes(&mut self) -> bool {
+        if self.lifetimes.is_some() {
+            return true;
+        }
+        let Some(notary) = self.notary() else {
+            return false;
+        };
+        let Some(page) = lifetime_page::Lifetimes::receive(notary) else {
+            return false;
+        };
+        let Some(page) = lifetime_page::Lifetimes::map(page, &self.process) else {
+            return false;
+        };
+        self.lifetimes = Some(page);
+        let _ = sys::notify(&self.channel, 1);
+        true
+    }
     fn notary_register(&mut self) -> bool {
         if self.generations.is_some() {
             return true;
