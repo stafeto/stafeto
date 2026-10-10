@@ -55,6 +55,10 @@ enum Target {
     Ram(RamTarget),
     Random(RamTarget),
     Other,
+    Tty(u32),
+    Input,
+    Output,
+    Error,
 }
 struct PosixFs {
     descriptors: Table<Target, 32, (), (), control::Recovery>,
@@ -67,6 +71,9 @@ mod change;
 #[allow(dead_code)]
 #[path = "../../posix-fs/src/control.rs"]
 mod control;
+#[allow(dead_code)]
+#[path = "../../posix-fs/src/drain.rs"]
+mod drain;
 
 fn fixture() -> (PosixFs, EntryToken, RamTarget, control::Input) {
     let mut files = PosixFs {
@@ -740,3 +747,312 @@ mod helper_retirement;
 mod wait;
 #[path = "typed_wait_tests.rs"]
 mod wait_tests;
+
+fn drain_fixture(early: bool) -> (PosixFs, EntryToken) {
+    let mut files = PosixFs {
+        descriptors: if early {
+            Table::with_early_release(|target| matches!(target, Target::Tty(_)))
+        } else {
+            Table::default()
+        },
+        waits: super::WaitRecords::new(),
+    };
+    let fd = files
+        .descriptors
+        .insert(Target::Tty(0x1a02), Flags::default())
+        .unwrap();
+    let source = files.descriptors.entry_token(fd).unwrap();
+    (files, source)
+}
+fn paid_drain(
+    files: &mut PosixFs,
+    source: EntryToken,
+) -> (super::ControlToken, super::ControlClaimToken) {
+    files
+        .begin_drain_record(owner(), source, Frame::main(100), 0x1234_0000_0081, 0x1a02)
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn drain_pays_custody_before_wait_and_keeps_full_identity() {
+    let (mut files, source) = drain_fixture(true);
+    let (token, claim) = paid_drain(&mut files, source);
+    let first = files
+        .drain_snapshot(token)
+        .unwrap()
+        .recovery
+        .drain()
+        .unwrap();
+    assert!(first.held());
+    assert_eq!(first.source(), source);
+    assert_eq!(first.session(), 0x1234_0000_0081);
+    assert_eq!(first.terminal(), 0x1a02);
+    assert_eq!(first.server(), drain::Server::Unstarted);
+    assert_eq!(
+        files.publish_drain_wait(claim, 0),
+        Err(FsError::InvalidArgument)
+    );
+    let key = 0xabcd_0000_0000_0007;
+    files.publish_drain_wait(claim, key).unwrap();
+    files.publish_drain_wait(claim, key).unwrap();
+    assert_eq!(
+        files.publish_drain_wait(claim, key ^ (1 << 48)),
+        Err(FsError::InvalidArgument)
+    );
+    let saved = files
+        .drain_snapshot(token)
+        .unwrap()
+        .recovery
+        .drain()
+        .unwrap();
+    assert_eq!(saved.key(), key);
+    assert_eq!(saved.source(), source);
+    assert_eq!(saved.session(), first.session());
+    assert_eq!(saved.server(), drain::Server::Waiting);
+}
+
+#[test]
+fn drain_unpaid_control_refusal_does_not_take_an_io_hold() {
+    let (mut files, source) = drain_fixture(true);
+    for _ in 0..16 {
+        files
+            .begin_change_record(owner(), Frame::main(100))
+            .unwrap();
+    }
+    assert_eq!(
+        files.begin_drain_record(owner(), source, Frame::main(100), 0x8100, 0x1a02),
+        Ok(None)
+    );
+    assert!(
+        !files
+            .descriptors
+            .holds
+            .iter()
+            .any(|slot| matches!(slot.held, super::Held::Io(_)))
+    );
+    assert_eq!(
+        files.descriptors.close(source.fd),
+        Ok(Some(Target::Tty(0x1a02)))
+    );
+    assert_eq!(files.descriptors.unhold(Target::Tty(0x1a02)), None);
+    assert_eq!(files.control_tokens().count(), 16);
+    assert!(
+        !files
+            .descriptors
+            .holds
+            .iter()
+            .any(|slot| matches!(slot.held, super::Held::Io(_)))
+    );
+}
+
+#[test]
+fn drain_rejects_reused_source_and_wrong_terminal_before_payment() {
+    let (mut files, old) = drain_fixture(true);
+    files.descriptors.close(old.fd).unwrap();
+    let fd = files
+        .descriptors
+        .insert(Target::Tty(0x1a02), Flags::default())
+        .unwrap();
+    assert_eq!(fd, old.fd);
+    assert_eq!(
+        files.begin_drain_record(owner(), old, Frame::main(100), 0x8100, 0x1a02),
+        Err(FsError::BadFileDescriptor)
+    );
+    let fresh = files.descriptors.entry_token(fd).unwrap();
+    assert_eq!(
+        files.begin_drain_record(owner(), fresh, Frame::main(100), 0x8100, 0x2a02),
+        Err(FsError::InvalidArgument)
+    );
+    assert_eq!(
+        files.begin_drain_record(owner(), fresh, Frame::main(100), 0, 0x1a02),
+        Err(FsError::InvalidArgument)
+    );
+    assert_eq!(files.control_tokens().count(), 0);
+}
+
+#[test]
+fn drain_canonical_ready_survives_jump_and_reclaims_more_than_the_pool() {
+    let (mut files, source) = drain_fixture(true);
+    for _ in 0..40 {
+        let (token, claim) = paid_drain(&mut files, source);
+        files.publish_drain_wait(claim, 0x1234_0000_0007).unwrap();
+        files.publish_drain_terminal(claim, true).unwrap();
+        files.mark_control_jump(owner(), Frame::main(200));
+        let saved = files.drain_snapshot(token).unwrap();
+        assert_eq!(saved.owner, None);
+        assert_eq!(saved.result, Some(ControlResult::Value(0)));
+        assert_eq!(
+            files.pick_drain_cleanup(Some(owner()), Frame::main(50), None),
+            Ok(Some(token))
+        );
+        assert_eq!(files.release_drain_hold(token).unwrap().release(), None);
+        files.finish_drain_cleanup(token).unwrap();
+        assert_eq!(files.drain_snapshot(token), Err(FsError::BadFileDescriptor));
+    }
+    assert_eq!(files.descriptors.get(source.fd), Ok(Target::Tty(0x1a02)));
+    assert_eq!(files.control_tokens().count(), 0);
+}
+
+#[test]
+fn drain_cancel_confirmation_is_exact_and_never_double_unholds_a_sibling() {
+    let (mut files, source) = drain_fixture(false);
+    files.descriptors.hold(source.fd).unwrap();
+    let (token, claim) = paid_drain(&mut files, source);
+    files.publish_drain_wait(claim, 0xf123_0000_0007).unwrap();
+    let saved = files.begin_drain_cleanup(token).unwrap();
+    assert_eq!(
+        files.release_drain_hold(token),
+        Err(FsError::InvalidArgument)
+    );
+    assert_eq!(
+        files.confirm_drain_gone(token, saved.session() ^ (1 << 48), saved.key()),
+        Err(FsError::InvalidArgument)
+    );
+    assert_eq!(
+        files.confirm_drain_gone(token, saved.session(), saved.key() ^ (1 << 48)),
+        Err(FsError::InvalidArgument)
+    );
+    files
+        .confirm_drain_gone(token, saved.session(), saved.key())
+        .unwrap();
+    files
+        .confirm_drain_gone(token, saved.session(), saved.key())
+        .unwrap();
+    assert_eq!(files.descriptors.close(source.fd), Ok(None));
+    assert_eq!(files.release_drain_hold(token).unwrap().release(), None);
+    assert_eq!(files.release_drain_hold(token).unwrap().release(), None);
+    assert_eq!(
+        files.descriptors.unhold(Target::Tty(0x1a02)),
+        Some(Target::Tty(0x1a02))
+    );
+    files.finish_drain_cleanup(token).unwrap();
+    files.ack_drain_record(token, owner()).unwrap();
+}
+
+#[test]
+fn drain_release_debt_survives_helper_jump_and_late_tokens() {
+    let (mut files, source) = drain_fixture(false);
+    let (token, claim) = paid_drain(&mut files, source);
+    files.publish_drain_wait(claim, 0x1234_0000_0007).unwrap();
+    files.publish_drain_terminal(claim, true).unwrap();
+    files.begin_drain_cleanup(token).unwrap();
+    files.descriptors.close(source.fd).unwrap();
+    let debt = files.release_drain_hold(token).unwrap();
+    assert_eq!(debt.release(), Some(Target::Tty(0x1a02)));
+    assert_eq!(
+        files.finish_drain_cleanup(token),
+        Err(FsError::InvalidArgument)
+    );
+    files.mark_control_jump(owner(), Frame::main(200));
+    assert_eq!(
+        files
+            .drain_snapshot(token)
+            .unwrap()
+            .recovery
+            .drain()
+            .unwrap(),
+        debt
+    );
+    assert_eq!(
+        files.confirm_drain_release(token, Target::Tty(0x2a02)),
+        Err(FsError::InvalidArgument)
+    );
+    files
+        .confirm_drain_release(token, Target::Tty(0x1a02))
+        .unwrap();
+    files.finish_drain_cleanup(token).unwrap();
+    let fd = files
+        .descriptors
+        .insert(Target::Tty(0x1a02), Flags::default())
+        .unwrap();
+    let fresh = files.descriptors.entry_token(fd).unwrap();
+    let (next, _) = paid_drain(&mut files, fresh);
+    assert_ne!(next.generation(), token.generation());
+    assert_eq!(
+        files.confirm_drain_release(token, Target::Tty(0x1a02)),
+        Err(FsError::BadFileDescriptor)
+    );
+    assert!(
+        files
+            .drain_snapshot(next)
+            .unwrap()
+            .recovery
+            .drain()
+            .unwrap()
+            .held()
+    );
+}
+
+#[test]
+fn drain_early_release_preserves_alias_and_replacement_without_new_close_debt() {
+    let (mut files, source) = drain_fixture(true);
+    let alias = files
+        .descriptors
+        .insert(Target::Tty(0x1a02), Flags::default())
+        .unwrap();
+    let (token, claim) = paid_drain(&mut files, source);
+    files.publish_drain_terminal(claim, true).unwrap();
+    assert_eq!(files.descriptors.close(source.fd), Ok(None));
+    let replacement = files
+        .descriptors
+        .insert(Target::Tty(0x2a02), Flags::default())
+        .unwrap();
+    assert_eq!(replacement, source.fd);
+    assert_eq!(
+        files.descriptors.close(alias),
+        Ok(Some(Target::Tty(0x1a02)))
+    );
+    files.begin_drain_cleanup(token).unwrap();
+    assert_eq!(files.release_drain_hold(token).unwrap().release(), None);
+    files.finish_drain_cleanup(token).unwrap();
+    assert_eq!(
+        files.ack_drain_record(token, owner()),
+        Ok(ControlResult::Value(0))
+    );
+    assert_eq!(files.descriptors.get(replacement), Ok(Target::Tty(0x2a02)));
+}
+
+#[test]
+fn drain_genuine_end_detaches_only_the_exact_owner_and_keeps_paid_key() {
+    let (mut files, source) = drain_fixture(true);
+    let (token, claim) = paid_drain(&mut files, source);
+    files.publish_drain_wait(claim, 0xffff_0000_0007).unwrap();
+    assert_eq!(files.abandon_drain_owner(OwnerToken::new(2).unwrap()), None);
+    assert!(files.abandon_drain_owner(owner()).is_some());
+    let saved = files.drain_snapshot(token).unwrap();
+    assert_eq!(saved.owner, None);
+    assert_eq!(saved.recovery.drain().unwrap().key(), 0xffff_0000_0007);
+    assert!(!files.descriptors.control_is_working(claim));
+}
+
+#[test]
+fn drain_payload_fits_the_existing_largest_control_variant() {
+    let bytes = core::mem::size_of::<drain::Recovery>();
+    let largest = core::mem::size_of::<control::LockRecovery>();
+    std::println!(
+        "DrainRecovery {bytes}, LockRecovery {largest}, Recovery {}, Table {}",
+        core::mem::size_of::<control::Recovery>(),
+        core::mem::size_of_val(&drain_fixture(true).0.descriptors)
+    );
+    assert!(
+        bytes <= largest,
+        "drain must not enlarge the paid Control payload"
+    );
+}
+
+#[test]
+fn drain_fork_discards_copied_debt_without_releasing_original_descriptors() {
+    let (mut files, source) = drain_fixture(false);
+    let (token, claim) = paid_drain(&mut files, source);
+    files.publish_drain_wait(claim, 0x1234_0000_0007).unwrap();
+    files.descriptors.discard_open_after_fork();
+    while files.descriptors.abandon_hold().is_some() {}
+    assert_eq!(files.drain_snapshot(token), Err(FsError::BadFileDescriptor));
+    assert_eq!(files.descriptors.get(source.fd), Ok(Target::Tty(0x1a02)));
+    assert_eq!(
+        files.descriptors.close(source.fd),
+        Ok(Some(Target::Tty(0x1a02)))
+    );
+    assert_eq!(files.control_tokens().count(), 0);
+}
