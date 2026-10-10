@@ -213,6 +213,37 @@ fn judge_expectations(files: &[(String, String)], outcome: &str) -> Expectation 
     }
 }
 
+/// These three reopen probes require a genuine OFD conflict. Issue 8 requires
+/// EAGAIN; their pinned Sortix expectations spell that error EWOULDBLOCK.
+/// Keep the raw outcome and constrain the alternate spelling to its exact test,
+/// exit status and defined upstream expectation, without aliasing other errno.
+fn judge_test_expectations(
+    name: &str,
+    files: &[(String, String)],
+    outcome: &str,
+    code: i64,
+) -> Expectation {
+    let ordinary = judge_expectations(files, outcome);
+    if ordinary != Expectation::Unmet {
+        return ordinary;
+    }
+    let conflict_probe = matches!(
+        name,
+        "io/ofd-setlk-rd-reopen-wr" | "io/ofd-setlk-wr-reopen-rd" | "io/ofd-setlk-wr-reopen-wr"
+    );
+    if conflict_probe
+        && code == 1
+        && outcome == "F_OFD_SETLK: EAGAIN\n"
+        && files.iter().any(|(kind, text)| {
+            !kind.starts_with("unknown.") && text == "F_OFD_SETLK: EWOULDBLOCK\n"
+        })
+    {
+        Expectation::Defined
+    } else {
+        Expectation::Unmet
+    }
+}
+
 /// The macros of `<unistd.h>` that claim an option, by the option codes of
 /// os-test's markers and of the standard's inventory (`cargo xtask
 /// coverage` reads it too): the option is claimed when the header defines
@@ -714,7 +745,7 @@ fn source_of(work: &Path, test: &Test) -> Result<String, String> {
 /// How `text`, the outcome of `test`, stands against the test's
 /// expectations: of the suite's `.expect` directory, or `exit: 0` for the
 /// basic suite, which has none.
-fn expectation(work: &Path, test: &Test, text: &str) -> Result<Expectation, String> {
+fn expectation(work: &Path, test: &Test, text: &str, code: i64) -> Result<Expectation, String> {
     let expect = work.join("source").join(format!("{}.expect", test.suite));
     if test.suite == "basic" && !expect.exists() {
         return Ok(if text == "exit: 0\n" {
@@ -725,9 +756,11 @@ fn expectation(work: &Path, test: &Test, text: &str) -> Result<Expectation, Stri
     }
     // The expectations of a test of basic/<part>/<name> do not exist; the
     // others are named by the test alone.
-    Ok(judge_expectations(
+    Ok(judge_test_expectations(
+        &test.name,
         &expectation_files(&expect, &test.test)?,
         text,
+        code,
     ))
 }
 
@@ -742,7 +775,7 @@ fn judge(work: &Path, test: &Test, ended: Ended) -> Result<(Verdict, String), St
         Ended::Failed(text) => (text, false, None),
     };
     let met = if exited {
-        expectation(work, test, &text)?
+        expectation(work, test, &text, code.expect("exited has a status"))?
     } else {
         Expectation::Unmet
     };
@@ -1170,6 +1203,114 @@ mod tests {
     /// A boot's log: the services' lines around the runner's marks.
     fn log(text: &[&str]) -> String {
         text.join("\n") + "\n"
+    }
+
+    fn ofd_conflict_files() -> Vec<(String, String)> {
+        vec![("posix".to_owned(), "F_OFD_SETLK: EWOULDBLOCK\n".to_owned())]
+    }
+
+    #[test]
+    fn ofd_conflict_accepts_normative_errno_for_three_reopen_probes() {
+        for name in [
+            "io/ofd-setlk-rd-reopen-wr",
+            "io/ofd-setlk-wr-reopen-rd",
+            "io/ofd-setlk-wr-reopen-wr",
+        ] {
+            assert_eq!(
+                judge_test_expectations(name, &ofd_conflict_files(), "F_OFD_SETLK: EAGAIN\n", 1),
+                Expectation::Defined
+            );
+        }
+    }
+
+    #[test]
+    fn ofd_conflict_rejects_success_wrong_errno_and_extra_output() {
+        for output in [
+            "exit: 0\n",
+            "F_RDLCK\n",
+            "F_UNLCK\n",
+            "F_WRLCK\n",
+            "F_OFD_SETLK: EBADF\n",
+            "F_OFD_SETLK: EACCES\n",
+            "F_OFD_SETLK: ENOLCK\n",
+            "F_OFD_SETLK: EAGAIN\nextra\n",
+            "fcntl: F_OFD_SETLK: EAGAIN\n",
+        ] {
+            assert_eq!(
+                judge_test_expectations(
+                    "io/ofd-setlk-rd-reopen-wr",
+                    &ofd_conflict_files(),
+                    output,
+                    1
+                ),
+                Expectation::Unmet,
+                "{output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ofd_conflict_rejects_unlisted_tests_and_wrong_exit_status() {
+        for name in [
+            "io/ofd-setlk-rd-reopen-rd",
+            "io/setlk-rd-reopen-wr",
+            "signal/ofd-setlk-rd-reopen-wr",
+        ] {
+            assert_eq!(
+                judge_test_expectations(name, &ofd_conflict_files(), "F_OFD_SETLK: EAGAIN\n", 1),
+                Expectation::Unmet
+            );
+        }
+        for code in [0, 2, 139] {
+            assert_eq!(
+                judge_test_expectations(
+                    "io/ofd-setlk-rd-reopen-wr",
+                    &ofd_conflict_files(),
+                    "F_OFD_SETLK: EAGAIN\n",
+                    code
+                ),
+                Expectation::Unmet
+            );
+        }
+    }
+
+    #[test]
+    fn ofd_conflict_requires_the_exact_defined_upstream_expectation() {
+        for files in [
+            vec![],
+            vec![("posix".to_owned(), "F_OFD_SETLK: EBADF\n".to_owned())],
+            vec![(
+                "unknown.posix".to_owned(),
+                "F_OFD_SETLK: EWOULDBLOCK\n".to_owned(),
+            )],
+        ] {
+            assert_eq!(
+                judge_test_expectations(
+                    "io/ofd-setlk-rd-reopen-wr",
+                    &files,
+                    "F_OFD_SETLK: EAGAIN\n",
+                    1
+                ),
+                Expectation::Unmet
+            );
+        }
+    }
+
+    #[test]
+    fn ofd_conflict_preserves_ordinary_defined_and_unknown_results() {
+        let name = "io/ofd-setlk-rd-reopen-wr";
+        assert_eq!(
+            judge_test_expectations(name, &ofd_conflict_files(), "F_OFD_SETLK: EWOULDBLOCK\n", 1),
+            Expectation::Defined
+        );
+        let files = vec![(
+            "unknown.posix".to_owned(),
+            "F_OFD_SETLK: EAGAIN\n".to_owned(),
+        )];
+        assert_eq!(
+            judge_test_expectations(name, &files, "F_OFD_SETLK: EAGAIN\n", 1),
+            Expectation::Open
+        );
     }
 
     #[test]
