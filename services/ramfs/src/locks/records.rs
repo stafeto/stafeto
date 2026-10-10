@@ -213,26 +213,61 @@ pub struct Progress {
     pub complete: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimFailure {
+    pub error: Error,
+    /// Records freed by this failed invocation, still credited exactly once.
+    pub released: usize,
+}
+
 /// Exclusive custody of a retired chain; retain this cursor while paid
 /// records remain. Each step releases at most PORTION exact lifetimes.
 pub struct Reclaim {
     head: Option<Id>,
+    released_total: usize,
+    failure: Option<ReclaimFailure>,
 }
 
 impl Reclaim {
     pub const fn new(head: Option<Id>) -> Self {
-        Self { head }
+        Self {
+            head,
+            released_total: 0,
+            failure: None,
+        }
+    }
+
+    pub fn failure(&self) -> Option<ReclaimFailure> {
+        self.failure
     }
 
     pub fn step<const N: usize, const ROOTS: usize, const SHARE: usize>(
         &mut self,
         pool: &mut Pool<N, ROOTS, SHARE>,
-    ) -> Result<Progress, Error> {
+    ) -> Result<Progress, ReclaimFailure> {
+        if let Some(failure) = self.failure {
+            return Err(ReclaimFailure {
+                error: failure.error,
+                released: 0,
+            });
+        }
         let mut released = 0;
         while released < PORTION {
             let Some(head) = self.head else { break };
-            self.head = pool.release(head)?;
+            match pool.release(head) {
+                Ok(next) => self.head = next,
+                Err(error) => {
+                    let failure = ReclaimFailure { error, released };
+                    self.failure = Some(failure);
+                    debug_assert!(
+                        self.released_total == 0,
+                        "invalid retired chain after paid progress: {failure:?}"
+                    );
+                    return Err(failure);
+                }
+            }
             released += 1;
+            self.released_total += 1;
         }
         Ok(Progress {
             released,
@@ -243,6 +278,7 @@ impl Reclaim {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use crate::locks::{Kind, Owner, Range};
 
@@ -376,10 +412,63 @@ mod tests {
         let new = pool.prepend(0, lock(1), None).unwrap();
         assert_eq!(old.slot, new.slot);
         assert_ne!(old.generation, new.generation);
-        assert_eq!(Reclaim::new(Some(old)).step(&mut pool), Err(Error::Invalid));
+        assert_eq!(
+            Reclaim::new(Some(old)).step(&mut pool),
+            Err(ReclaimFailure {
+                error: Error::Invalid,
+                released: 0
+            })
+        );
         assert_eq!(pool.prepend(0, lock(2), Some(old)), Err(Error::Invalid));
         assert_eq!(pool.used(0), Some(1));
         assert_eq!(pool.get(new).unwrap().lock, lock(1));
+    }
+
+    #[test]
+    fn invalid_retired_tail_reports_prior_releases_once_and_keeps_new_custody() {
+        let mut pool = Pool::<4, 1, 4>::new();
+        let stale = pool.prepend(0, lock(0), None).unwrap();
+        Reclaim::new(Some(stale)).step(&mut pool).unwrap();
+        let fresh = pool.prepend(0, lock(1), None).unwrap();
+        assert_eq!(fresh.slot, stale.slot);
+        let head = pool.prepend(0, lock(2), None).unwrap();
+        let Slot::Paid(record) = &mut pool.slots[head.slot as usize] else {
+            panic!("paid head")
+        };
+        // Simulate an internal stale link, preserving the newly paid record.
+        record.next = Some(stale);
+        let mut reclaim = Reclaim::new(Some(head));
+        #[cfg(debug_assertions)]
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { reclaim.step(&mut pool) }))
+                .is_err()
+        );
+        #[cfg(not(debug_assertions))]
+        assert_eq!(
+            reclaim.step(&mut pool),
+            Err(ReclaimFailure {
+                error: Error::Invalid,
+                released: 1
+            })
+        );
+        assert_eq!(
+            reclaim.failure(),
+            Some(ReclaimFailure {
+                error: Error::Invalid,
+                released: 1
+            })
+        );
+        assert_eq!(pool.used(0), Some(1));
+        assert_eq!(pool.available(), 3);
+        assert_eq!(pool.read(fresh).unwrap().lock, lock(1));
+        assert_eq!(
+            reclaim.step(&mut pool),
+            Err(ReclaimFailure {
+                error: Error::Invalid,
+                released: 0
+            })
+        );
+        assert_eq!(pool.used(0), Some(1));
     }
 
     #[test]
