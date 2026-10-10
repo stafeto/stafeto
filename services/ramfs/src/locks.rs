@@ -15,6 +15,7 @@ pub mod request;
 pub mod server;
 pub mod service;
 pub mod wait_receipts;
+pub mod wait_server;
 pub mod waiters;
 #[cfg(test)]
 mod waiters_tests;
