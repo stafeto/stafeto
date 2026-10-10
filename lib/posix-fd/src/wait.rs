@@ -339,12 +339,12 @@ impl<W: Copy> WaitRecords<W> {
         self.slots[token.slot()].record = None;
         Ok((r.result.expect("ack result"), r.recovery))
     }
-    /// One bounded detach turn revokes an owner's next resident record.
-    pub fn abandon_owner(&mut self, owner: OwnerToken) -> Option<WaitToken> {
-        let token = self
-            .tokens()
-            .find(|&t| self.record(t).is_ok_and(|r| r.owner == Some(owner)))?;
-        let mut r = self.record(token).expect("exact detach");
+    /// Detach one exact owner and generation without paying any remote debt.
+    pub fn abandon(&mut self, token: WaitToken, owner: OwnerToken) -> Result<(), Error> {
+        let mut r = self.record(token)?;
+        if r.owner != Some(owner) {
+            return Err(Error::BadFileDescriptor);
+        }
         r.owner = None;
         r.claimant = None;
         if r.phase != WaitRecordPhase::Cleaned {
@@ -354,6 +354,14 @@ impl<W: Copy> WaitRecords<W> {
             }
         }
         self.save(token, r);
+        Ok(())
+    }
+    /// One bounded detach turn revokes an owner's next resident record.
+    pub fn abandon_owner(&mut self, owner: OwnerToken) -> Option<WaitToken> {
+        let token = self
+            .tokens()
+            .find(|&t| self.record(t).is_ok_and(|r| r.owner == Some(owner)))?;
+        self.abandon(token, owner).expect("exact detach");
         Some(token)
     }
     /// Child never closes or cancels copied parent IDs; preserve generations.

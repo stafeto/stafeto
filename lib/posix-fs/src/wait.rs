@@ -206,6 +206,25 @@ impl PosixFs {
     pub fn abandon_wait_owner(&mut self, owner: OwnerToken) -> Option<WaitToken> {
         self.waits.abandon_owner(owner)
     }
+    /// Mark only frames left by the jump. The caller holds the descriptor lock
+    /// and defers entry delivery; this transition performs no remote cleanup.
+    pub fn mark_wait_jump(&mut self, owner: OwnerToken, target: Frame) -> usize {
+        let mut departing = [None; posix_fd::WAIT_RECORDS];
+        for (i, token) in self.wait_tokens().enumerate() {
+            if self
+                .wait_snapshot(token)
+                .is_ok_and(|s| s.owner == Some(owner) && nested(s.recovery.frame(), target))
+            {
+                departing[i] = Some(token);
+            }
+        }
+        let mut marked = 0;
+        for token in departing.into_iter().flatten() {
+            self.waits.abandon(token, owner).expect("exact jump detach");
+            marked += 1;
+        }
+        marked
+    }
     /// One exact source debt per bounded scan; all canonical receipts survive.
     pub fn fence_wait_for_close(
         &mut self,

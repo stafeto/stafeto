@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 use super::*;
-use crate::{WaitCancelReason, WaitRecordPhase, WaitRecords, WaitResult};
+use crate::{Error, WaitCancelReason, WaitRecordPhase, WaitRecords, WaitResult};
 use proto_fs::{WaitMode, WaitPhase, WaitReply};
 fn input() -> wait::Input {
     wait::Input {
@@ -28,6 +28,125 @@ fn saved_cleanup(files: &mut PosixFs, t: crate::WaitToken) {
         .publish_wait_cleanup(t, WaitResult::Value(0), done(0))
         .unwrap();
     files.finish_wait_cleanup(t).unwrap();
+}
+#[test]
+fn jump_marks_exact_departing_frames_in_all_sixteen_places_without_paying_debts() {
+    let (mut files, entry, _, _) = fixture();
+    let foreign = OwnerToken::new((1 << 32) | 1).unwrap();
+    let mut saved = std::vec::Vec::new();
+    for i in 0..16 {
+        let who = if i == 2 { foreign } else { owner() };
+        let frame = Frame::main(match i {
+            0 => 220,
+            1 => 200,
+            _ => 100 + i,
+        });
+        let (token, claim) = files.begin_wait_record(who, entry, frame, input()).unwrap();
+        files.attach_wait_channel(claim, 0x12340000 + i).unwrap();
+        match i % 5 {
+            1 => {
+                files
+                    .complete_wait_record(claim, WaitResult::Value(0), done(0))
+                    .unwrap();
+            }
+            2 | 3 => {
+                let reason = if i % 5 == 2 {
+                    WaitCancelReason::Signal
+                } else {
+                    WaitCancelReason::Close
+                };
+                files.begin_wait_cleanup(token, reason).unwrap();
+                files
+                    .publish_wait_cleanup(token, WaitResult::Value(0), done(0))
+                    .unwrap();
+            }
+            4 => {
+                saved_cleanup(&mut files, token);
+                if i == 9 {
+                    let debt = files.wait_channel_debt(token).unwrap().unwrap();
+                    files.confirm_wait_channel_closed(debt).unwrap();
+                }
+            }
+            _ => {}
+        }
+        saved.push((token, claim, files.wait_snapshot(token).unwrap()));
+    }
+    assert_eq!(files.mark_wait_jump(owner(), Frame::main(200)), 13);
+    assert_eq!(files.mark_wait_jump(owner(), Frame::main(200)), 0);
+    for (i, (token, claim, before)) in saved.into_iter().enumerate() {
+        let after = files.wait_snapshot(token).unwrap();
+        if i < 3 {
+            assert_eq!(after, before);
+            continue;
+        }
+        assert_eq!(after.owner, None);
+        assert_eq!(after.claimant, None);
+        assert_eq!(after.recovery, before.recovery);
+        assert_eq!(after.channel, before.channel);
+        assert_eq!(after.result, before.result);
+        assert_eq!(
+            after.reason,
+            before
+                .reason
+                .or_else(|| (before.phase != WaitRecordPhase::Cleaned)
+                    .then_some(WaitCancelReason::Abandoned))
+        );
+        assert_eq!(
+            after.phase,
+            if before.phase == WaitRecordPhase::Cleaned {
+                WaitRecordPhase::Cleaned
+            } else {
+                WaitRecordPhase::Cleaning
+            }
+        );
+        assert!(!files.wait_is_live(claim));
+        assert!(files.attach_wait_channel(claim, 0x56780000).is_err());
+        assert!(
+            files
+                .complete_wait_record(claim, WaitResult::Value(0), done(0))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn exact_jump_debt_retires_and_reuses_more_than_sixteen_generations() {
+    let (mut files, entry, _, _) = fixture();
+    let mut previous = None;
+    for i in 0..40 {
+        let (token, claim) = files
+            .begin_wait_record(owner(), entry, Frame::main(100 - i), input())
+            .unwrap();
+        let raw = 0x12340000 + i;
+        files.attach_wait_channel(claim, raw).unwrap();
+        if let Some(old) = previous {
+            assert_eq!(
+                files.waits.abandon(old, owner()),
+                Err(Error::BadFileDescriptor)
+            );
+            assert!(files.wait_is_live(claim));
+        }
+        assert_eq!(
+            files.waits.abandon(token, OwnerToken::new(2).unwrap()),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(files.mark_wait_jump(owner(), Frame::main(200)), 1);
+        files
+            .publish_wait_cleanup(token, WaitResult::Value(0), done(0))
+            .unwrap();
+        files.finish_wait_cleanup(token).unwrap();
+        let debt = files.wait_channel_debt(token).unwrap().unwrap();
+        assert_eq!(debt.raw(), raw);
+        assert!(files.waits.ack_abandoned(token).is_err());
+        files.confirm_wait_channel_closed(debt).unwrap();
+        assert_eq!(
+            files.waits.ack_abandoned(token).unwrap().0,
+            WaitResult::Value(0)
+        );
+        assert_eq!(files.wait_tokens().count(), 0);
+        previous = Some(token);
+    }
+    assert!(files.descriptors.entry_token(entry.fd).is_ok());
 }
 #[test]
 fn canonical_reply_reason_and_channel_debt_survive_exact_helper_publication() {
