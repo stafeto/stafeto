@@ -270,11 +270,47 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         if matches!(result, ControlResult::Failed(errno) if errno <= 0) {
             return Err(Error::InvalidArgument);
         }
+        self.complete_control_with(claim, result, Ok).map(|_| ())
+    }
+    /// Save the terminal payload and scalar outcome as one table transition.
+    pub fn complete_control_with(
+        &mut self,
+        claim: ControlClaimToken,
+        result: ControlResult,
+        update: impl FnOnce(C) -> Result<C, Error>,
+    ) -> Result<ControlSnapshot<C>, Error> {
+        if matches!(result, ControlResult::Failed(errno) if errno <= 0) {
+            return Err(Error::InvalidArgument);
+        }
         let mut record = self.control_claimed(claim)?;
+        record.recovery = update(record.recovery)?;
         record.result = Some(result);
         record.claimant = None;
         self.save_control(claim.control, record);
-        Ok(())
+        Ok(record.snapshot())
+    }
+    /// Retain a canonical terminal receipt after effect authority was revoked.
+    /// The first receipt remains immutable and no claimant is restored.
+    pub fn control_publish_cleanup(
+        &mut self,
+        token: ControlToken,
+        result: ControlResult,
+        update: impl FnOnce(C) -> Result<C, Error>,
+    ) -> Result<ControlSnapshot<C>, Error> {
+        if matches!(result, ControlResult::Failed(errno) if errno <= 0) {
+            return Err(Error::InvalidArgument);
+        }
+        let mut record = self.control_record(token)?;
+        if !matches!(record.cleanup, Cleanup::Running) {
+            return Err(Error::BadFileDescriptor);
+        }
+        if record.result.is_none() {
+            record.recovery = update(record.recovery)?;
+            record.result = Some(result);
+            record.claimant = None;
+            self.save_control(token, record);
+        }
+        Ok(record.snapshot())
     }
     /// Copy the original outcome while retaining every unpaid cleanup obligation.
     pub fn ack_control(
@@ -301,11 +337,20 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         &mut self,
         token: ControlToken,
     ) -> Result<ControlCleanup<C>, Error> {
+        self.control_begin_cleanup_with(token, Ok)
+    }
+    /// Capture immutable cleanup context when revoking the effect claim.
+    pub fn control_begin_cleanup_with(
+        &mut self,
+        token: ControlToken,
+        update: impl FnOnce(C) -> Result<C, Error>,
+    ) -> Result<ControlCleanup<C>, Error> {
         let mut record = self.control_record(token)?;
         match record.cleanup {
             Cleanup::Done => return Err(Error::BadFileDescriptor),
             Cleanup::Running => {}
             Cleanup::Pending => {
+                record.recovery = update(record.recovery)?;
                 record.claimant = None;
                 record.cleanup = Cleanup::Running;
                 self.save_control(token, record);
@@ -354,13 +399,22 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
     /// Detach one native lifetime. Cleanup keeps its immutable capabilities and key.
     pub fn abandon_control_owner(&mut self, owner: OwnerToken) -> Option<ControlAbandoned<C>> {
+        self.abandon_control_owner_if(owner, |_| true)
+    }
+    /// Detach only records of the recovery family selected by the layer.
+    pub fn abandon_control_owner_if(
+        &mut self,
+        owner: OwnerToken,
+        accepts: impl Fn(C) -> bool,
+    ) -> Option<ControlAbandoned<C>> {
         let (slot, record) =
             self.residents
                 .iter()
                 .enumerate()
                 .find_map(|(slot, h)| match h.held {
                     Held::Control(record)
-                        if record.owner == Some(owner) || record.claimant == Some(owner) =>
+                        if (record.owner == Some(owner) || record.claimant == Some(owner))
+                            && accepts(record.recovery) =>
                     {
                         Some((slot, record))
                     }
@@ -399,6 +453,156 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_payload_and_scalar_commit_atomically_and_rollback_together() {
+        let mut table = Small::default();
+        let (token, claim) = table.begin_control(owner(1), 70).unwrap();
+        let before = table.control_snapshot(token).unwrap();
+        assert_eq!(
+            table.complete_control_with(claim, ControlResult::Value(0), |_| Err(
+                Error::InvalidArgument
+            )),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(table.control_snapshot(token).unwrap(), before);
+        assert_eq!(
+            table.complete_control_with(claim, ControlResult::Failed(0), |_| panic!(
+                "invalid result update"
+            )),
+            Err(Error::InvalidArgument)
+        );
+        let saved = table
+            .complete_control_with(claim, ControlResult::Value(0), |_| Ok(91))
+            .unwrap();
+        assert_eq!(
+            (saved.recovery, saved.result, saved.claimant),
+            (91, Some(ControlResult::Value(0)), None)
+        );
+        assert!(!table.control_is_working(claim));
+        assert_eq!(
+            table.complete_control_with(claim, ControlResult::Value(2), |_| Ok(92)),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.control_snapshot(token).unwrap(), saved);
+    }
+
+    #[test]
+    fn cleanup_receipt_preserves_first_payload_and_revoked_effect_claim() {
+        let mut table = Small::default();
+        let (token, claim) = table.begin_control(owner(1), 70).unwrap();
+        assert_eq!(
+            table.control_publish_cleanup(token, ControlResult::Value(0), |_| Ok(99)),
+            Err(Error::BadFileDescriptor)
+        );
+        table.control_begin_cleanup(token).unwrap();
+        let before = table.control_snapshot(token).unwrap();
+        assert_eq!(
+            table.control_publish_cleanup(token, ControlResult::Value(0), |_| Err(Error::Io)),
+            Err(Error::Io)
+        );
+        assert_eq!(table.control_snapshot(token).unwrap(), before);
+        let first = table
+            .control_publish_cleanup(token, ControlResult::Value(0), |_| Ok(99))
+            .unwrap();
+        assert_eq!(
+            (first.recovery, first.result, first.claimant, first.phase),
+            (
+                99,
+                Some(ControlResult::Value(0)),
+                None,
+                ControlPhase::Cleaning
+            )
+        );
+        assert!(!table.control_is_working(claim));
+        assert_eq!(
+            table.complete_control(claim, ControlResult::Failed(9)),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(
+            table.control_publish_cleanup(token, ControlResult::Failed(9), |_| panic!(
+                "first receipt overwritten"
+            )),
+            Ok(first)
+        );
+        assert_eq!(
+            table.ack_control(token, owner(2)),
+            Err(Error::BadFileDescriptor)
+        );
+        table.control_finish_cleanup(token).unwrap();
+        assert_eq!(
+            table.control_publish_cleanup(token, ControlResult::Failed(9), |_| Ok(100)),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(
+            table.ack_control(token, owner(1)),
+            Ok(ControlResult::Value(0))
+        );
+        let (next, _) = table.begin_control(owner(1), 100).unwrap();
+        let next_before = table.control_snapshot(next).unwrap();
+        assert_eq!(
+            table.control_publish_cleanup(token, ControlResult::Value(0), |_| Ok(101)),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.control_snapshot(next).unwrap(), next_before);
+    }
+
+    #[test]
+    fn cleanup_context_is_captured_once_without_partial_claim_revocation() {
+        let mut table = Small::default();
+        let (token, claim) = table.begin_control(owner(1), 70).unwrap();
+        let before = table.control_snapshot(token).unwrap();
+        assert_eq!(
+            table.control_begin_cleanup_with(token, |_| Err(Error::Io)),
+            Err(Error::Io)
+        );
+        assert_eq!(table.control_snapshot(token).unwrap(), before);
+        assert!(table.control_is_working(claim));
+        let first = table.control_begin_cleanup_with(token, |_| Ok(80)).unwrap();
+        assert_eq!(first.recovery, 80);
+        assert_eq!(
+            table.control_begin_cleanup_with(token, |_| panic!("cleanup context rewritten")),
+            Ok(first)
+        );
+        assert_eq!(table.control_snapshot(token).unwrap().recovery, 80);
+        assert!(!table.control_is_working(claim));
+    }
+
+    #[test]
+    fn family_detach_preserves_foreign_owner_claim_and_retained_cleaned_receipt() {
+        let mut table = Small::default();
+        let (foreign, foreign_claim) = table.begin_control(owner(1), 70).unwrap();
+        let (chosen, _) = table.begin_control(owner(1), 80).unwrap();
+        let before = table.control_snapshot(foreign).unwrap();
+        assert!(
+            matches!(table.abandon_control_owner_if(owner(1), |payload| payload == 80), Some(ControlAbandoned::Recover { token, .. }) if token == chosen)
+        );
+        assert_eq!(table.control_snapshot(foreign).unwrap(), before);
+        assert!(table.control_is_working(foreign_claim));
+        assert_eq!(
+            table.abandon_control_owner_if(owner(1), |payload| payload == 80),
+            None
+        );
+        table.control_begin_cleanup(foreign).unwrap();
+        table
+            .control_publish_cleanup(foreign, ControlResult::Value(0), |_| Ok(91))
+            .unwrap();
+        table.control_finish_cleanup(foreign).unwrap();
+        let cleaned = table.control_snapshot(foreign).unwrap();
+        assert_eq!(
+            (cleaned.phase, cleaned.owner, cleaned.recovery),
+            (ControlPhase::Cleaned, Some(owner(1)), 91)
+        );
+        // A collector of an abandoned same-owner frame can acknowledge locally.
+        assert_eq!(
+            table.ack_control(foreign, owner(1)),
+            Ok(ControlResult::Value(0))
+        );
+        assert_eq!(
+            table.control_snapshot(foreign),
+            Err(Error::BadFileDescriptor)
+        );
+    }
+
     #[test]
     fn control_layout_preserves_existing_payload_union_capacity() {
         use core::mem::size_of;

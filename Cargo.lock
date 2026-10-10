@@ -300,6 +300,11 @@ dependencies = [
 [[package]]
 name = "posix-fd"
 version = "0.1.0"
+dependencies = [
+ "entries",
+ "proto-fs",
+ "proto-wire",
+]
 
 [[package]]
 name = "posix-fs"
