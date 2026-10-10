@@ -13,6 +13,8 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 #[cfg(feature = "lifetime-probe")]
 mod lifetime;
 #[cfg(feature = "lifetime-probe")]
+mod lock_deadlock;
+#[cfg(feature = "lifetime-probe")]
 mod lock_driver;
 #[cfg(feature = "lifetime-probe")]
 mod lock_signal;
