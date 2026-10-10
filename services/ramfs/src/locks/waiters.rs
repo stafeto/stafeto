@@ -16,6 +16,14 @@ pub struct RegistrationToken {
     slot: u8,
     receipt: Id,
 }
+impl RegistrationToken {
+    pub fn slot(self) -> usize {
+        usize::from(self.slot)
+    }
+    pub fn receipt(self) -> Id {
+        self.receipt
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
@@ -84,6 +92,17 @@ impl Pool {
 
     pub fn count(&self) -> usize {
         self.occupied.count_ones() as usize
+    }
+
+    pub fn find(&self, receipt: Id) -> Option<RegistrationToken> {
+        self.records.iter().enumerate().find_map(|(slot, record)| {
+            record
+                .filter(|record| record.input.receipt == receipt)
+                .map(|_| RegistrationToken {
+                    slot: slot as u8,
+                    receipt,
+                })
+        })
     }
 
     /// Duplicate registration preserves its existing place and FIFO links.
