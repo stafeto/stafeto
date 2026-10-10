@@ -19,6 +19,9 @@ pub mod constants;
 pub mod fork;
 pub mod loader_probe;
 pub mod lock_fields;
+// Activated with the descriptor close fence in the following integration stage.
+#[allow(dead_code)]
+mod lock_driver;
 pub mod long;
 pub mod metadata;
 pub mod names;

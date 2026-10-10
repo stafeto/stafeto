@@ -14,6 +14,8 @@ mod futex_deadline;
 #[path = "../../tests/posix-threads/src/futex_watchdog.rs"]
 mod futex_watchdog;
 #[cfg(test)]
+mod lock_driver_tests;
+#[cfg(test)]
 mod lock_fields_tests;
 #[cfg(test)]
 #[path = "../../lib/posix-abi/src/relibc/lifetime.rs"]

@@ -5,7 +5,7 @@
 
 #[allow(dead_code, unused_imports)]
 #[path = "../../lib/posix-abi/src/constants.rs"]
-mod constants;
+pub(super) mod constants;
 #[path = "../../lib/posix-abi/src/lock_fields.rs"]
 mod lock_fields;
 
