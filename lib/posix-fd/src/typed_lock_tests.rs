@@ -1086,3 +1086,39 @@ fn drain_return_hands_off_canonical_result_without_erasing_cleanup_debt() {
     assert_eq!(files.drain_snapshot(token), Err(FsError::BadFileDescriptor));
     assert_eq!(files.descriptors.get(source.fd), Ok(Target::Tty(0x1a02)));
 }
+
+#[test]
+fn drain_rotation_passes_a_retained_wait_to_clean_a_later_ready_record() {
+    let (mut files, source) = drain_fixture(true);
+    let (blocked, first) = paid_drain(&mut files, source);
+    files.publish_drain_wait(first, 0x1234_0000_0007).unwrap();
+    let (ready, second) = paid_drain(&mut files, source);
+    files.publish_drain_terminal(second, true).unwrap();
+    files.mark_control_jump(owner(), Frame::main(200));
+    assert_eq!(
+        files.pick_drain_cleanup_from(None, Frame::main(0), None, blocked.slot()),
+        Ok(Some(blocked))
+    );
+    // The first WAIT's remote confirmation remains unpaid. A later helper
+    // starts after that slot, and can free READY with no remote request.
+    assert_eq!(
+        files.pick_drain_cleanup_from(
+            None,
+            Frame::main(0),
+            None,
+            (blocked.slot() + 1) % crate::JOBS_MAX
+        ),
+        Ok(Some(ready))
+    );
+    assert_eq!(files.release_drain_hold(ready).unwrap().release(), None);
+    files.finish_drain_cleanup(ready).unwrap();
+    assert_eq!(files.drain_snapshot(ready), Err(FsError::BadFileDescriptor));
+    let pending = files
+        .drain_snapshot(blocked)
+        .unwrap()
+        .recovery
+        .drain()
+        .unwrap();
+    assert_eq!(pending.server(), drain::Server::Waiting);
+    assert!(pending.held());
+}

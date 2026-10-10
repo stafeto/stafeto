@@ -304,11 +304,24 @@ impl PosixFs {
         current: Frame,
         skip: Option<ControlToken>,
     ) -> Result<Option<ControlToken>, FsError> {
+        self.pick_drain_cleanup_from(me, current, skip, 0)
+    }
+    pub fn pick_drain_cleanup_from(
+        &mut self,
+        me: Option<OwnerToken>,
+        current: Frame,
+        skip: Option<ControlToken>,
+        cursor: usize,
+    ) -> Result<Option<ControlToken>, FsError> {
         let mut tokens = [None; posix_fd::JOBS_MAX];
-        for (index, token) in self.control_tokens().enumerate() {
-            tokens[index] = Some(token);
+        for token in self.control_tokens() {
+            tokens[token.slot() % posix_fd::JOBS_MAX] = Some(token);
         }
-        for token in tokens.into_iter().flatten() {
+        let cursor = cursor % posix_fd::JOBS_MAX;
+        for offset in 0..posix_fd::JOBS_MAX {
+            let Some(token) = tokens[(cursor + offset) % posix_fd::JOBS_MAX] else {
+                continue;
+            };
             if Some(token) == skip {
                 continue;
             }

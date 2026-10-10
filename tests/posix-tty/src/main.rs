@@ -427,3 +427,77 @@ pub extern "C" fn stafeto_probe_resident_drains(waiting: i32) -> i32 {
     })
     .unwrap_or(-1)
 }
+
+/// A real WAIT cannot duplicate its cancellation identity at the declared
+/// 512-handle process limit. A controlled READY journal must still be freed.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_drain_cleanup_rotation() -> i32 {
+    use rt::abi::{Error, Rights};
+    let owner = match posix_abi::relibc::open_owner()
+        .ok()
+        .and_then(|owner| posix_fs::change::OwnerToken::new(owner).ok())
+    {
+        Some(owner) => owner,
+        None => return 1,
+    };
+    let blocked = posix_abi::shared::with_files(|files| {
+        files
+            .control_tokens()
+            .find_map(|token| {
+                let snapshot = files.drain_snapshot(token).ok()?;
+                (snapshot.recovery.drain()?.server() == posix_fs::drain::Server::Waiting)
+                    .then_some((token, snapshot))
+            })
+            .ok_or(5)
+    });
+    let Ok((blocked, snapshot)) = blocked else {
+        return 2;
+    };
+    let debt = snapshot.recovery.drain().expect("WAIT journal");
+    let Some(identity) = posix_abi::process::identity() else {
+        return 3;
+    };
+    let mut handles = [const { None }; 512];
+    let mut full = false;
+    for slot in &mut handles {
+        match rt::sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER) {
+            Ok(handle) => *slot = Some(handle),
+            Err(Error::LimitReached) => {
+                full = true;
+                break;
+            }
+            Err(_) => return 4,
+        }
+    }
+    if !full {
+        return 5;
+    }
+    posix_abi::shared::help_open_recovery();
+    let ready = posix_abi::shared::with_files(|files| {
+        let (token, claim) = files
+            .begin_drain_record(
+                owner,
+                debt.source(),
+                snapshot.recovery.frame(),
+                debt.session(),
+                debt.terminal(),
+            )
+            .map_err(|_| 5)?
+            .ok_or(5)?;
+        files.publish_drain_terminal(claim, true).map_err(|_| 5)?;
+        files.abandon_drain_owner(owner);
+        Ok(token)
+    });
+    let Ok(ready) = ready else { return 6 };
+    posix_abi::shared::help_open_recovery();
+    let cleared = posix_abi::shared::with_files(|files| {
+        let waiting = files.drain_snapshot(blocked).map_err(|_| 5)?;
+        Ok(files.drain_snapshot(ready).is_err()
+            && waiting.recovery.drain().is_some_and(|debt| {
+                debt.server() == posix_fs::drain::Server::Waiting && debt.held()
+            }))
+    })
+    .unwrap_or(false);
+    drop(handles);
+    if cleared { 0 } else { 7 }
+}

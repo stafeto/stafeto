@@ -413,6 +413,7 @@ static int drain_admission(void) {
 
 /* Exact paid custody must survive a true jump and a deeper subsequent call. */
 extern int stafeto_probe_resident_drains(int waiting);
+extern int stafeto_probe_drain_cleanup_rotation(void);
 static __attribute__((noinline)) int deeper_drain(int depth) {
     volatile int keep = depth;
     int result = depth ? deeper_drain(depth - 1) : tcdrain(1);
@@ -454,6 +455,10 @@ static int drain_abandonment(void) {
         drain_admission_jumping = 0;
         void *sent;
         CHECK(pthread_join(sender, &sent) == 0 && sent == NULL);
+        if (pass == 0) {
+            CHECK(stafeto_probe_drain_cleanup_rotation() == 0);
+            say("posix-tty: handle-limit WAIT cleanup permits later READY local release\n");
+        }
         CHECK(tcflow(1, TCOON) == 0);
         /* The new SP is deeper than the abandoned owner. Ordinary frame-only
          * reclamation cannot establish that the old call was abandoned. */

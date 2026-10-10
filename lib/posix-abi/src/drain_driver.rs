@@ -208,9 +208,20 @@ pub(crate) fn collect(
         return;
     };
     let find = |files: &mut posix_fs::PosixFs| {
-        files
-            .pick_drain_cleanup(me, current, skip)
-            .map_err(crate::error)
+        static CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        let cursor = CURSOR.load(core::sync::atomic::Ordering::Relaxed);
+        let token = files
+            .pick_drain_cleanup_from(me, current, skip, cursor)
+            .map_err(crate::error)?;
+        if let Some(token) = token {
+            // Publish rotation while FILES_LOCK and local/kernel preparation
+            // still hold, even if the following RPC refuses or the helper ends.
+            CURSOR.store(
+                (token.slot() + 1) % 16,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        Ok(token)
     };
     let selected = if blocking {
         crate::shared::with_files(find)
