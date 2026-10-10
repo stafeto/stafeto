@@ -22,6 +22,8 @@ mod lock_driver;
 mod wait_lock_driver;
 #[cfg(feature = "lock-probe")]
 pub use lock_driver::{Probe as LockProbe, probe_hook as probe_lock_hook};
+#[cfg(feature = "wait-probe")]
+pub use wait_lock_driver::{Probe as WaitProbe, probe_hook as probe_wait_hook};
 pub mod lock_fields;
 pub mod long;
 pub mod metadata;

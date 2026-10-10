@@ -16,6 +16,8 @@ mod lifetime;
 mod lock_driver;
 #[cfg(feature = "lifetime-probe")]
 mod lock_signal;
+#[cfg(feature = "lifetime-probe")]
+mod wait_locks;
 
 #[cfg(feature = "pending-open")]
 mod pending_open;

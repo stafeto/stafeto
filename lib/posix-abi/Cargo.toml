@@ -28,6 +28,8 @@ change-probe = []
 # Exact reply-loss and lifecycle hooks in the dedicated lifetime image.
 close-probe = []
 lock-probe = []
+# Real WAIT phase coordination in the dedicated lifetime image only.
+wait-probe = []
 
 [dependencies]
 posix-types = { path = "../posix-types" }

@@ -21,6 +21,35 @@ mod packet;
 mod raw_channel;
 use core::{Failure, Phase, Reason, Session, State};
 
+#[cfg(feature = "wait-probe")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Probe {
+    Start,
+    Arm,
+    Query,
+    Complete,
+    Receive,
+    Cancel,
+    Release,
+    CloseChannel,
+}
+#[cfg(feature = "wait-probe")]
+static PROBE: ::core::sync::atomic::AtomicUsize = ::core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "wait-probe")]
+pub fn probe_hook(hook: Option<fn(Probe, WaitToken) -> bool>) {
+    PROBE.store(hook.map_or(0, |f| f as usize), Ordering::Release);
+}
+#[cfg(feature = "wait-probe")]
+fn probed(phase: Probe, token: WaitToken) -> bool {
+    let raw = PROBE.load(Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: probe_hook stores only functions with this exact signature.
+    let hook: fn(Probe, WaitToken) -> bool = unsafe { ::core::mem::transmute(raw) };
+    hook(phase, token)
+}
+
 fn failure(error: Status) -> Failure {
     match error {
         Status::Kernel(Error::Interrupted) => Failure::Interrupted,
@@ -91,11 +120,31 @@ impl Live {
     }
     fn call(&self, p: &packet::Packet) -> Result<WaitReply, Failure> {
         // Any unexpected owned reply handles are destroyed before a handler can jump.
-        let _scope = rt::upcall::defer_entries().map_err(kernel)?;
-        let response =
-            sys::send(self.transport.files().sessions().0, p.as_bytes()).map_err(kernel)?;
-        let (bytes, len) = Self::inline(response)?;
-        packet::reply(&bytes[..len]).map_err(failure)
+        let reply = {
+            let _scope = rt::upcall::defer_entries().map_err(kernel)?;
+            let response =
+                sys::send(self.transport.files().sessions().0, p.as_bytes()).map_err(kernel)?;
+            let (bytes, len) = Self::inline(response)?;
+            packet::reply(&bytes[..len]).map_err(failure)?
+        };
+        #[cfg(feature = "wait-probe")]
+        {
+            let method = u16::from_le_bytes([p.as_bytes()[0], p.as_bytes()[1]]);
+            let phase = if method == Method::WaitStart as u16 {
+                Probe::Start
+            } else if method == Method::WaitCancel as u16 {
+                Probe::Cancel
+            } else {
+                Probe::Query
+            };
+            if probed(phase, self.token)
+                || (reply.phase == proto_fs::WaitPhase::Complete
+                    && probed(Probe::Complete, self.token))
+            {
+                return Err(Failure::Interrupted);
+            }
+        }
+        Ok(reply)
     }
     fn keyed(&self, method: Method) -> Result<WaitReply, Failure> {
         self.call(&packet::Packet::keyed(method, self.key()).map_err(failure)?)
@@ -167,42 +216,58 @@ impl Session for Live {
     #[inline(never)]
     fn release(&mut self) -> Result<(), Failure> {
         let p = packet::Packet::keyed(Method::WaitRelease, self.key()).map_err(failure)?;
-        let _scope = rt::upcall::defer_entries().map_err(kernel)?;
-        let response =
-            sys::send(self.transport.files().sessions().0, p.as_bytes()).map_err(kernel)?;
-        let (bytes, len) = Self::inline(response)?;
-        packet::released(&bytes[..len]).map_err(failure)
+        let released = (|| {
+            let _scope = rt::upcall::defer_entries().map_err(kernel)?;
+            let response =
+                sys::send(self.transport.files().sessions().0, p.as_bytes()).map_err(kernel)?;
+            let (bytes, len) = Self::inline(response)?;
+            packet::released(&bytes[..len]).map_err(failure)
+        })();
+        #[cfg(feature = "wait-probe")]
+        if released.is_ok() && probed(Probe::Release, self.token) {
+            return Err(Failure::Interrupted);
+        }
+        released
     }
     fn arm(&mut self) -> Result<WaitReply, Failure> {
-        let _scope = rt::upcall::defer_entries().map_err(kernel)?;
-        let raw = self
-            .snapshot()
-            .map_err(Failure::Fatal)?
-            .and_then(|s| s.channel)
-            .ok_or(Failure::Retired)?;
-        let mut args = [0; 10];
-        args[0] = raw;
-        args[1] = u64::from((Rights::NOTIFY | Rights::TRANSFER).0);
-        // SAFETY: generation-safe duplication of the private resident channel only.
-        let result = unsafe { sys::raw::<{ Call::HandleDuplicate.number() }>(args) };
-        let duplicated = raw_channel::duplicate_result(&result).map_err(kernel)?;
-        let copy = Handle::<Channel>::from_raw(rt::abi::Handle(duplicated));
-        let p = packet::Packet::keyed(Method::WaitArm, self.key()).map_err(failure)?;
-        // Moving send reconciles consumed versus Refused.back before scope resumes.
-        let response = sys::send_handles(
-            self.transport.files().sessions().0,
-            p.as_bytes(),
-            [copy.erase()],
-        )
-        .map_err(|refused| {
-            let error = refused.error;
-            drop(refused.back);
-            kernel(error)
-        })?;
-        let (bytes, len) = Self::inline(response)?;
-        packet::reply(&bytes[..len]).map_err(failure)
+        let reply = (|| {
+            let _scope = rt::upcall::defer_entries().map_err(kernel)?;
+            let raw = self
+                .snapshot()
+                .map_err(Failure::Fatal)?
+                .and_then(|s| s.channel)
+                .ok_or(Failure::Retired)?;
+            let mut args = [0; 10];
+            args[0] = raw;
+            args[1] = u64::from((Rights::NOTIFY | Rights::TRANSFER).0);
+            // SAFETY: generation-safe duplication of the private resident channel only.
+            let result = unsafe { sys::raw::<{ Call::HandleDuplicate.number() }>(args) };
+            let duplicated = raw_channel::duplicate_result(&result).map_err(kernel)?;
+            let copy = Handle::<Channel>::from_raw(rt::abi::Handle(duplicated));
+            let p = packet::Packet::keyed(Method::WaitArm, self.key()).map_err(failure)?;
+            // Moving send reconciles consumed versus Refused.back before scope resumes.
+            let response = sys::send_handles(
+                self.transport.files().sessions().0,
+                p.as_bytes(),
+                [copy.erase()],
+            )
+            .map_err(|refused| {
+                let error = refused.error;
+                drop(refused.back);
+                kernel(error)
+            })?;
+            let (bytes, len) = Self::inline(response)?;
+            packet::reply(&bytes[..len]).map_err(failure)
+        })();
+        #[cfg(feature = "wait-probe")]
+        if reply.is_ok() && probed(Probe::Arm, self.token) {
+            return Err(Failure::Interrupted);
+        }
+        reply
     }
     fn receive(&mut self) -> Result<(), Failure> {
+        #[cfg(feature = "wait-probe")]
+        let _ = probed(Probe::Receive, self.token);
         let _scope = rt::upcall::defer_entries().map_err(kernel)?;
         if ending() || crate::signals::pending_unblocked() {
             return Err(Failure::Interrupted);
@@ -235,6 +300,8 @@ impl Session for Live {
                     .map_err(crate::error)
             })?;
         }
+        #[cfg(feature = "wait-probe")]
+        let _ = probed(Probe::CloseChannel, self.token);
         Ok(())
     }
     fn authenticate(&mut self) -> Result<(), Failure> {
