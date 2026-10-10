@@ -45,6 +45,41 @@ impl Capture {
     }
 }
 
+/// Exclusive custody of one departed PID's still-paid group chain.
+/// Each step revokes one group; record cleanup retains its identity separately.
+pub struct Departure {
+    pid: u32,
+    next: Option<Id>,
+}
+impl Departure {
+    pub fn done(&self) -> bool {
+        self.next.is_none()
+    }
+    pub fn step<
+        const N: usize,
+        const I: usize,
+        const P: usize,
+        const D: usize,
+        const R: usize,
+        const S: usize,
+    >(
+        &mut self,
+        groups: &mut Groups<N, I, P, D, R, S>,
+    ) -> Result<Option<(Id, Snapshot)>, Error> {
+        let Some(id) = self.next else { return Ok(None) };
+        let group = *groups.group(id)?;
+        if !group.active
+            || group.snapshot.owner != Owner::Process(self.pid)
+            || groups.owner_live(group.snapshot.owner)
+        {
+            return Err(Error::Invalid);
+        }
+        groups.detach(id, group);
+        self.next = group.owner_next;
+        Ok(Some((id, group.snapshot)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub inode: Token,
@@ -286,6 +321,22 @@ impl<
             .then_some(head.head)
             .flatten())
     }
+    /// Exclude the complete PID immediately and transfer its head once.
+    /// The caller confirms death using the process service's lifetime page.
+    pub fn depart_pid(&mut self, pid: u32) -> Result<Departure, Error> {
+        let Position::Pid(index) = Self::position(Owner::Process(pid))? else {
+            return Err(Error::Invalid);
+        };
+        let head = &mut self.pid_heads[index];
+        let next = if head.pid == pid && head.live {
+            head.live = false;
+            head.head.take()
+        } else {
+            None
+        };
+        Ok(Departure { pid, next })
+    }
+
     pub fn owner_next(&self, id: Id) -> Result<Option<Id>, Error> {
         Ok(self.group(id)?.owner_next)
     }
@@ -305,15 +356,21 @@ impl<
         }
         match position {
             Position::Pid(index) => {
-                if let Owner::Process(pid) = owner
-                    && self.pid_heads[index].head.is_some()
-                    && self.pid_heads[index].pid != pid
-                {
-                    return Err(Error::Invalid);
+                if let Owner::Process(pid) = owner {
+                    let head = self.pid_heads[index];
+                    if pid < head.pid
+                        || (pid == head.pid && !head.live)
+                        || (pid != head.pid && head.head.is_some())
+                    {
+                        return Err(Error::Invalid);
+                    }
                 }
                 if self
                     .id_at(self.pid_index[index][inode.slot as usize])
-                    .is_some_and(|id| self.group(id).is_ok_and(|g| g.active))
+                    .is_some_and(|id| {
+                        self.group(id)
+                            .is_ok_and(|g| g.active && self.owner_live(g.snapshot.owner))
+                    })
                 {
                     return Err(Error::Invalid);
                 }
@@ -668,6 +725,107 @@ mod tests {
             groups.allocate(inode(0), Owner::Process(256), 0),
             Err(Error::NoLocks)
         );
+    }
+
+    #[test]
+    fn departure_excludes_all_pid_groups_before_cleanup_and_preserves_other_owners() {
+        let mut groups: Box<Small> = fresh();
+        let a = groups.allocate(inode(0), Owner::Process(256), 0).unwrap();
+        let b = groups.allocate(inode(1), Owner::Process(256), 0).unwrap();
+        let other = groups.allocate(inode(0), Owner::Process(257), 1).unwrap();
+        let ofd = groups
+            .allocate(
+                inode(0),
+                Owner::Description {
+                    slot: 0,
+                    generation: 1,
+                },
+                1,
+            )
+            .unwrap();
+        let mut cursor = groups.depart_pid(256).unwrap();
+        assert!(!cursor.done());
+        assert!(!groups.valid(a));
+        assert!(!groups.valid(b));
+        assert_eq!(groups.lookup(inode(0), Owner::Process(256)), Ok(None));
+        assert_eq!(groups.lookup(inode(1), Owner::Process(256)), Ok(None));
+        assert!(groups.valid(other));
+        assert!(groups.valid(ofd));
+        assert_eq!(groups.used(0), Some(2));
+        assert_eq!(groups.release(a.id()), Err(Error::Invalid));
+        assert!(groups.depart_pid(256).unwrap().done());
+        assert_eq!(cursor.step(&mut groups).unwrap().unwrap().0, b.id());
+        assert!(!cursor.done());
+        assert_eq!(groups.release(a.id()), Err(Error::Invalid));
+        assert_eq!(groups.used(0), Some(2));
+        groups.release(b.id()).unwrap();
+        assert_eq!(groups.used(0), Some(1));
+        assert_eq!(cursor.step(&mut groups).unwrap().unwrap().0, a.id());
+        assert!(cursor.done());
+        groups.release(a.id()).unwrap();
+        assert_eq!(cursor.step(&mut groups), Ok(None));
+        assert_eq!(groups.used(0), Some(0));
+        assert!(groups.valid(other));
+        assert!(groups.valid(ofd));
+    }
+
+    #[test]
+    fn new_pid_generation_replaces_cells_before_old_cleanup_without_resurrection() {
+        let mut groups: Box<Small> = fresh();
+        let old = groups.allocate(inode(0), Owner::Process(256), 0).unwrap();
+        let mut cursor = groups.depart_pid(256).unwrap();
+        assert_eq!(
+            groups.allocate(inode(1), Owner::Process(256), 0),
+            Err(Error::Invalid)
+        );
+        let new = groups.allocate(inode(0), Owner::Process(512), 1).unwrap();
+        assert!(groups.valid(new));
+        assert!(!groups.valid(old));
+        assert_eq!(
+            groups.allocate(inode(1), Owner::Process(256), 0),
+            Err(Error::Invalid)
+        );
+        assert!(groups.depart_pid(256).unwrap().done());
+        assert_eq!(cursor.step(&mut groups).unwrap().unwrap().0, old.id());
+        groups.release(old.id()).unwrap();
+        assert_eq!(groups.lookup(inode(0), Owner::Process(512)), Ok(Some(new)));
+        assert_eq!(groups.pid_head(512), Ok(Some(new.id())));
+        assert_eq!(groups.owner_next(new.id()), Ok(None));
+        assert_eq!(groups.inode_head(inode(0)), Ok(Some(new.id())));
+        assert_eq!(groups.inode_next(new.id()), Ok(None));
+        assert!(groups.valid(new));
+    }
+
+    #[test]
+    fn departure_reclaims_one_group_per_step_and_retains_the_tail() {
+        let mut groups: Box<Groups<12, 12, 1, 1, 1, 12>> = fresh();
+        let mut ids = std::vec::Vec::new();
+        for slot in 0..12 {
+            ids.push(
+                groups
+                    .allocate(inode(slot), Owner::Process(256), 0)
+                    .unwrap()
+                    .id(),
+            );
+        }
+        let mut cursor = groups.depart_pid(256).unwrap();
+        for expected in ids.into_iter().rev() {
+            let before = groups.used(0).unwrap();
+            let (id, snapshot) = cursor.step(&mut groups).unwrap().unwrap();
+            assert_eq!(id, expected);
+            assert_eq!(snapshot.owner, Owner::Process(256));
+            assert_eq!(groups.used(0), Some(before));
+            let revoked = groups
+                .slots
+                .iter()
+                .filter(|s| matches!(s, Slot::Paid(g) if !g.active))
+                .count();
+            assert_eq!(revoked, 1);
+            groups.release(id).unwrap();
+            assert_eq!(groups.used(0), Some(before - 1));
+        }
+        assert!(cursor.done());
+        assert_eq!(groups.available(), 12);
     }
 
     #[test]
