@@ -27,6 +27,7 @@ pub struct Record {
     pub lock: Lock,
     pub next: Option<Id>,
     root: u16,
+    private: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +82,23 @@ impl<const N: usize, const ROOTS: usize, const SHARE: usize> Pool<N, ROOTS, SHAR
         }
     }
 
+    /// A missing exact lifetime is an error during a chain walk.
+    pub fn read(&self, id: Id) -> Result<&Record, Error> {
+        self.get(id).ok_or(Error::Invalid)
+    }
+
+    fn mark_published(&mut self, id: Id) -> Result<Option<Id>, Error> {
+        let record = *self.read(id)?;
+        if !record.private {
+            return Err(Error::Invalid);
+        }
+        let Slot::Paid(record) = &mut self.slots[id.slot as usize] else {
+            unreachable!("validated paid record")
+        };
+        record.private = false;
+        Ok(record.next)
+    }
+
     /// Prepend to an exclusively owned chain. A record's next link is
     /// immutable; each allocation acquires its charge before returning.
     /// All records of a chain retain the same expenditure root and owner.
@@ -88,7 +106,7 @@ impl<const N: usize, const ROOTS: usize, const SHARE: usize> Pool<N, ROOTS, SHAR
         let used = self.used.get(root as usize).ok_or(Error::Invalid)?;
         if let Some(head) = head {
             let record = self.get(head).ok_or(Error::Invalid)?;
-            if record.root != root || record.lock.owner != lock.owner {
+            if !record.private || record.root != root || record.lock.owner != lock.owner {
                 return Err(Error::Invalid);
             }
         }
@@ -118,6 +136,7 @@ impl<const N: usize, const ROOTS: usize, const SHARE: usize> Pool<N, ROOTS, SHAR
             lock,
             next: head,
             root,
+            private: true,
         });
         self.used[root as usize] += 1;
         self.available -= 1;
@@ -142,6 +161,49 @@ impl<const N: usize, const ROOTS: usize, const SHARE: usize> Pool<N, ROOTS, SHAR
 impl<const N: usize, const ROOTS: usize, const SHARE: usize> Default for Pool<N, ROOTS, SHARE> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationProgress {
+    pub visited: usize,
+    pub complete: bool,
+}
+
+/// Exclusive preparation custody until every record forbids a shared tail.
+/// The group can switch its head only after marking completes.
+pub struct Publish {
+    head: Option<Id>,
+    cursor: Option<Id>,
+}
+
+impl Publish {
+    pub const fn new(head: Option<Id>) -> Self {
+        Self { head, cursor: head }
+    }
+
+    pub fn head(&self) -> Result<Option<Id>, Error> {
+        if self.cursor.is_some() {
+            Err(Error::Invalid)
+        } else {
+            Ok(self.head)
+        }
+    }
+
+    pub fn step<const N: usize, const ROOTS: usize, const SHARE: usize>(
+        &mut self,
+        pool: &mut Pool<N, ROOTS, SHARE>,
+    ) -> Result<PublicationProgress, Error> {
+        let mut visited = 0;
+        while visited < PORTION {
+            let Some(cursor) = self.cursor else { break };
+            self.cursor = pool.mark_published(cursor)?;
+            visited += 1;
+        }
+        Ok(PublicationProgress {
+            visited,
+            complete: self.cursor.is_none(),
+        })
     }
 }
 
@@ -190,6 +252,63 @@ mod tests {
             kind: Kind::Write,
             range: Range::relative(0, start, 1).unwrap(),
         }
+    }
+
+    #[test]
+    fn published_chain_cannot_become_a_private_shared_tail() {
+        let mut pool = Pool::<4, 1, 4>::new();
+        let tail = pool.prepend(0, lock(0), None).unwrap();
+        let head = pool.prepend(0, lock(1), Some(tail)).unwrap();
+        let mut publication = Publish::new(Some(head));
+        assert_eq!(publication.head(), Err(Error::Invalid));
+        assert_eq!(
+            publication.step(&mut pool),
+            Ok(PublicationProgress {
+                visited: 2,
+                complete: true
+            })
+        );
+        assert_eq!(publication.head(), Ok(Some(head)));
+        assert_eq!(pool.prepend(0, lock(2), Some(head)), Err(Error::Invalid));
+        assert_eq!(pool.prepend(0, lock(2), Some(tail)), Err(Error::Invalid));
+        assert_eq!(pool.used(0), Some(2));
+        assert_eq!(pool.available(), 2);
+        assert_eq!(pool.read(head).unwrap().next, Some(tail));
+        Reclaim::new(publication.head().unwrap())
+            .step(&mut pool)
+            .unwrap();
+        assert_eq!(pool.read(head), Err(Error::Invalid));
+        assert_eq!(pool.read(tail), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn publication_marks_at_most_eight_without_releasing_any_charge() {
+        let mut pool = Pool::<20, 1, 20>::new();
+        let mut head = None;
+        for byte in 0..20 {
+            head = Some(pool.prepend(0, lock(byte), head).unwrap());
+        }
+        let mut publication = Publish::new(head);
+        for visited in [8, 8, 4] {
+            let progress = publication.step(&mut pool).unwrap();
+            assert_eq!(progress.visited, visited);
+            assert_eq!(pool.used(0), Some(20));
+            assert_eq!(pool.available(), 0);
+        }
+        assert_eq!(publication.head(), Ok(head));
+        let mut cursor = publication.head().unwrap();
+        while let Some(id) = cursor {
+            let record = pool.read(id).unwrap();
+            assert!(!record.private);
+            cursor = record.next;
+        }
+        assert_eq!(
+            publication.step(&mut pool),
+            Ok(PublicationProgress {
+                visited: 0,
+                complete: true
+            })
+        );
     }
 
     #[test]
