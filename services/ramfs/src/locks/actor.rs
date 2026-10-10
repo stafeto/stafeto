@@ -455,11 +455,35 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
         self.depart_pid(pid)?;
         Ok(true)
     }
+    /// Audit the full description generation through RAM's real fd count.
+    pub fn audit_description(
+        &mut self,
+        index: usize,
+        mut live: impl FnMut(Token) -> bool,
+    ) -> Result<bool, Error> {
+        let Some(snapshot) = self.groups.tracked_description(index)? else {
+            return Ok(false);
+        };
+        let Owner::Description { slot, generation } = snapshot.owner else {
+            unreachable!("OFD index");
+        };
+        if live(Token { slot, generation }) {
+            return Ok(false);
+        }
+        self.close(snapshot.inode, snapshot.owner)?;
+        Ok(true)
+    }
+    fn retire_owner(&mut self, inode: Token, owner: Owner) {
+        match owner {
+            Owner::Process(pid) => self.depart_pid(pid).expect("validated dead PID"),
+            Owner::Description { .. } => self.close(inode, owner).expect("validated dead OFD"),
+        }
+    }
     fn scan_step(
         &mut self,
         request: Request,
         scan: &mut Scan,
-        live: &mut impl FnMut(u32) -> bool,
+        live: &mut impl FnMut(Owner) -> bool,
     ) -> (usize, bool) {
         let mut visited = 0;
         loop {
@@ -479,10 +503,8 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
                 scan.entered = true;
                 if let Some(capture) = self.groups.capture(id).expect("retained exact scan group") {
                     let snapshot = self.groups.snapshot(capture).expect("live scan group");
-                    if let Owner::Process(pid) = snapshot.owner
-                        && !live(pid)
-                    {
-                        self.depart_pid(pid).expect("validated dead scan PID");
+                    if !live(snapshot.owner) {
+                        self.retire_owner(snapshot.inode, snapshot.owner);
                     } else {
                         let view = self.view(id).expect("retained scan view");
                         scan.record = view.head;
@@ -492,10 +514,8 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
                 visited += 1;
                 let record = self.pool.read(record).expect("retained scan record");
                 scan.record = record.next;
-                if let Owner::Process(pid) = record.lock.owner
-                    && !live(pid)
-                {
-                    self.depart_pid(pid).expect("validated dead record PID");
+                if !live(record.lock.owner) {
+                    self.retire_owner(request.inode, record.lock.owner);
                     scan.record = None;
                     continue;
                 }
@@ -520,8 +540,16 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
     pub fn step(&mut self) -> Progress {
         self.step_with_life(|_| true)
     }
-    /// Every production slice confirms complete PID lifetimes through the shared page.
-    pub fn step_with_life(&mut self, mut live: impl FnMut(u32) -> bool) -> Progress {
+    #[cfg(test)]
+    pub fn step_with_life(&mut self, live: impl FnMut(u32) -> bool) -> Progress {
+        self.step_with_owners(live, |_| true)
+    }
+    /// Every production slice confirms full PID and actual open-description lives.
+    pub fn step_with_owners(
+        &mut self,
+        mut live: impl FnMut(u32) -> bool,
+        mut ofd_live: impl FnMut(Token) -> bool,
+    ) -> Progress {
         let Some(mut worker) = self.worker.take() else {
             return self.cleanup_step();
         };
@@ -541,6 +569,27 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
                 worker.cancelled = true;
             }
         }
+        if let Owner::Description { slot, generation } = worker.request.owner {
+            if let Some(old) = self
+                .groups
+                .tracked_description(slot as usize)
+                .expect("validated OFD place")
+                && old.owner != worker.request.owner
+            {
+                let Owner::Description { slot, generation } = old.owner else {
+                    unreachable!("OFD index");
+                };
+                if !ofd_live(Token { slot, generation }) {
+                    self.close(old.inode, old.owner)
+                        .expect("retire previous OFD before admission");
+                }
+            }
+            if !ofd_live(Token { slot, generation }) {
+                self.close(worker.request.inode, worker.request.owner)
+                    .expect("validated dead worker OFD");
+                worker.cancelled = true;
+            }
+        }
         if worker.cancelled {
             if let Phase::Prepare { work, capture } = &mut worker.phase {
                 let retirement = work
@@ -557,7 +606,11 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
         }
         let progress = match &mut worker.phase {
             Phase::Scan(scan) => {
-                let (visited, done) = self.scan_step(worker.request, scan, &mut live);
+                let mut owners = |owner| match owner {
+                    Owner::Process(pid) => live(pid),
+                    Owner::Description { slot, generation } => ofd_live(Token { slot, generation }),
+                };
+                let (visited, done) = self.scan_step(worker.request, scan, &mut owners);
                 if done {
                     if matches!(worker.request.command, Command::Get(_)) {
                         return Progress::complete(visited, Ok(Response::Blocker(scan.blocker)));
@@ -1837,5 +1890,42 @@ mod tests {
         a.close(inode(0), owner).unwrap();
         life_drain(&mut a, &page);
         assert_eq!(a.counts().paid(), 0);
+    }
+    #[test]
+    fn ofd_death_between_entering_group_and_reading_record_excludes_the_blocker() {
+        let mut actor = fresh::<32, 8, 4, 8, 9, 32>();
+        let owner = Owner::Description {
+            slot: 0,
+            generation: 7,
+        };
+        assert_eq!(
+            run(&mut actor, request(0, owner, Some(Kind::Read), 0, 1, 0)),
+            Ok(Response::Changed)
+        );
+        let mut query = request(0, Owner::Process(257), Some(Kind::Write), 0, 1, 0);
+        query.command = Command::Get(Kind::Write);
+        actor.start(query).unwrap();
+        let mut reads = 0;
+        let progress = actor.step_with_owners(
+            |_| true,
+            |token| {
+                assert_eq!(
+                    token,
+                    Token {
+                        slot: 0,
+                        generation: 7
+                    }
+                );
+                reads += 1;
+                reads == 1
+            },
+        );
+        assert!(reads >= 2);
+        assert!(progress.visited <= 8);
+        assert_eq!(progress.completed, Some(Ok(Response::Blocker(None))));
+        assert_eq!(actor.counts().published, 0);
+        drain(&mut actor);
+        assert_eq!(actor.counts(), budget::Counts::default());
+        assert_eq!(actor.audit_description(8, |_| false), Err(Error::Invalid));
     }
 }

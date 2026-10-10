@@ -342,6 +342,15 @@ impl<
             .flatten())
     }
     /// One direct place for service-driven death observation, independent of credentials.
+    /// One OFD place retains the exact live owner and inode for direct audits.
+    pub fn tracked_description(&self, index: usize) -> Result<Option<Snapshot>, Error> {
+        let slot = *self.ofd_index.get(index).ok_or(Error::Invalid)?;
+        let Some(id) = self.id_at(slot) else {
+            return Ok(None);
+        };
+        let group = self.group(id)?;
+        Ok(group.active.then_some(group.snapshot))
+    }
     pub fn tracked_pid(&self, index: usize) -> Result<Option<u32>, Error> {
         let head = self.pid_heads.get(index).ok_or(Error::Invalid)?;
         Ok((head.live && head.head.is_some()).then_some(head.pid))

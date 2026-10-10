@@ -1154,11 +1154,13 @@ impl Service<0> for Fs {
             .next(now, self.locks.busy(), self.lifetimes.is_some())
         {
             LockWork::Actor => {
-                let page = self
-                    .lifetimes
-                    .as_ref()
-                    .expect("authenticated lifetime mapping");
-                let progress = self.locks.step(&mut self.ram.storage, |pid| page.live(pid));
+                let page = self.lifetimes.as_ref();
+                let (storage, descriptions) = self.ram.lock_parts();
+                let progress = self.locks.step_with_owners(
+                    storage,
+                    |pid| page.is_some_and(|page| page.live(pid)),
+                    |token| descriptions.live(token),
+                );
                 debug_assert!(
                     progress.completed.is_none(),
                     "no lock requests admitted yet"
@@ -1167,14 +1169,20 @@ impl Service<0> for Fs {
                 return;
             }
             LockWork::Audit { first, end } => {
-                let page = self
-                    .lifetimes
-                    .as_ref()
-                    .expect("authenticated lifetime mapping");
+                let page = self.lifetimes.as_ref();
+                let (_, descriptions) = self.ram.lock_parts();
                 for index in first..end {
-                    self.locks
-                        .audit_pid(index, |pid| page.live(pid))
-                        .expect("bounded genuine PID place");
+                    if index < proto_process::RECORDS {
+                        self.locks
+                            .audit_pid(index, |pid| page.is_some_and(|page| page.live(pid)))
+                            .expect("bounded genuine PID place");
+                    } else {
+                        self.locks
+                            .audit_description(index - proto_process::RECORDS, |token| {
+                                descriptions.live(token)
+                            })
+                            .expect("bounded actual OFD place");
+                    }
                 }
                 self.notify_maintenance();
                 return;

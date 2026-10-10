@@ -160,3 +160,32 @@ fn real_reference_bookkeeping_has_measured_fixed_layout() {
     assert_eq!(core::mem::size_of::<Shared>(), 72);
     assert_eq!(core::mem::size_of::<Fds>(), 2816);
 }
+
+#[test]
+fn authoritative_ofd_life_checks_slot_generation_and_real_count_independently_of_io() {
+    let mut ram = Ram::default();
+    let mut fds = Fds::default();
+    let fd = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
+    let old = held(&ram, &fds, fd);
+    let (_, descriptions) = ram.lock_parts();
+    assert!(descriptions.live(old.description));
+    assert!(!descriptions.live(Token {
+        slot: old.description.slot,
+        generation: old.description.generation + 1
+    }));
+    assert!(!descriptions.live(Token {
+        slot: u16::MAX,
+        generation: 1
+    }));
+    ram.detach_descriptor(&mut fds, old).unwrap();
+    let (_, descriptions) = ram.lock_parts();
+    assert!(!descriptions.live(old.description));
+    assert_eq!(ram.read(&mut fds, fd, &mut [0; 1]), Ok(1));
+    ram.close(&mut fds, fd).unwrap();
+    let fd = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
+    let next = held(&ram, &fds, fd);
+    assert_eq!(next.description.slot, old.description.slot);
+    let (_, descriptions) = ram.lock_parts();
+    assert!(!descriptions.live(old.description));
+    assert!(descriptions.live(next.description));
+}

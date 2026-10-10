@@ -112,8 +112,24 @@ impl LockService {
     ) -> Result<bool, Error> {
         self.actor.audit_pid(index, live)
     }
+    pub fn audit_description(
+        &mut self,
+        index: usize,
+        live: impl FnMut(Token) -> bool,
+    ) -> Result<bool, Error> {
+        self.actor.audit_description(index, live)
+    }
+    #[cfg(test)]
     pub fn step(&mut self, storage: &mut Storage<'_>, live: impl FnMut(u32) -> bool) -> Progress {
-        let progress = self.actor.step_with_life(live);
+        self.step_with_owners(storage, live, |_| true)
+    }
+    pub fn step_with_owners(
+        &mut self,
+        storage: &mut Storage<'_>,
+        live: impl FnMut(u32) -> bool,
+        ofd_live: impl FnMut(Token) -> bool,
+    ) -> Progress {
+        let progress = self.actor.step_with_owners(live, ofd_live);
         // Group custody is established before a terminal result drops request custody.
         match progress.group_event {
             Some(GroupEvent::Created { id, root }) => {
@@ -291,6 +307,383 @@ mod tests {
             }
         }
         panic!("service request did not finish");
+    }
+    fn real_step(
+        service: &mut LockService,
+        ram: &mut crate::Ram<'_>,
+        page: Option<&proto_process::lifetimes::Page>,
+    ) -> Progress {
+        let (storage, descriptions) = ram.lock_parts();
+        service.step_with_owners(
+            storage,
+            |pid| page.is_some_and(|page| page.live(pid)),
+            |token| descriptions.live(token),
+        )
+    }
+    fn real_run(
+        service: &mut LockService,
+        ram: &mut crate::Ram<'_>,
+        page: Option<&proto_process::lifetimes::Page>,
+        request: Request,
+        payer: Root,
+    ) -> Result<Response, Error> {
+        service.start(&mut ram.storage, request, payer)?;
+        let mut response = None;
+        for _ in 0..4000 {
+            let progress = real_step(service, ram, page);
+            assert!(progress.visited <= 8);
+            check_pins(service, &ram.storage);
+            if let Some(done) = progress.completed {
+                assert!(response.replace(done).is_none());
+            }
+            if !service.busy() {
+                return response.expect("completed real owner request");
+            }
+        }
+        panic!("real owner work did not finish");
+    }
+    fn owned(mut request: Request, description: Token) -> Request {
+        request.owner = Owner::Description {
+            slot: description.slot,
+            generation: description.generation,
+        };
+        request
+    }
+    #[test]
+    fn last_real_ofd_close_excludes_foreign_blocker_while_physical_read_and_payer_remain() {
+        let mut ram = crate::Ram::default();
+        let mut service = fresh();
+        let page = page();
+        let payer = root(10, 1);
+        let mut fds = crate::Fds {
+            root: payer,
+            ..crate::Fds::default()
+        };
+        let fd = ram
+            .open(&mut fds, "/etc/motd", proto_fs::READ_ONLY)
+            .unwrap();
+        let held = ram.capture_description(&fds, fd).unwrap().0;
+        let inode = ram.live_description(&fds, held).unwrap().0;
+        real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            owned(
+                request(inode, 256, Command::Set(Some(Kind::Read)), 0, 1),
+                held.description,
+            ),
+            payer,
+        )
+        .unwrap();
+        assert_eq!(service.counts().published, 1);
+        assert!(
+            ram.detach_descriptor(&mut fds, held)
+                .unwrap()
+                .unwrap()
+                .last_fd
+        );
+        assert_eq!(
+            real_run(
+                &mut service,
+                &mut ram,
+                Some(&page),
+                request(inode, 257, Command::Get(Kind::Write), 0, 1),
+                root(999, 1)
+            ),
+            Ok(Response::Blocker(None))
+        );
+        assert_eq!(service.counts(), budget::Counts::default());
+        assert_eq!(ram.read(&mut fds, fd, &mut [0; 1]), Ok(1));
+        assert_eq!(ram.storage.usage(payer).descriptions, 1);
+        let other = ram.storage.lock_anchor(root(999, 1)).unwrap();
+        assert_eq!(other.index(), 1);
+        ram.storage.release_lock_anchor(other).unwrap();
+        ram.close(&mut fds, fd).unwrap();
+        let other = ram.storage.lock_anchor(root(999, 1)).unwrap();
+        assert_eq!(other.index(), 0);
+        ram.storage.release_lock_anchor(other).unwrap();
+    }
+    #[test]
+    fn boot_ofd_survives_one_fork_reference_then_idle_audit_reclaims_it_without_pid_page() {
+        let mut ram = crate::Ram::default();
+        let mut service = fresh();
+        let payer = root(10, 1);
+        let mut parent = crate::Fds {
+            root: payer,
+            ..crate::Fds::default()
+        };
+        let fd = ram
+            .open(&mut parent, "/etc/motd", proto_fs::READ_ONLY)
+            .unwrap();
+        let held = ram.capture_description(&parent, fd).unwrap().0;
+        let inode = ram.live_description(&parent, held).unwrap().0;
+        let mut child = ram.clone_fds(&parent, &[fd]).unwrap();
+        real_run(
+            &mut service,
+            &mut ram,
+            None,
+            owned(
+                request(inode, 256, Command::Set(Some(Kind::Read)), 0, 1),
+                held.description,
+            ),
+            payer,
+        )
+        .unwrap();
+        assert!(
+            !ram.detach_descriptor(&mut parent, held)
+                .unwrap()
+                .unwrap()
+                .last_fd
+        );
+        let (_, descriptions) = ram.lock_parts();
+        assert!(
+            !service
+                .audit_description(held.description.slot as usize, |token| descriptions
+                    .live(token))
+                .unwrap()
+        );
+        assert_eq!(service.counts().published, 1);
+        assert!(
+            ram.detach_descriptor(&mut child, held)
+                .unwrap()
+                .unwrap()
+                .last_fd
+        );
+        let mut dispatch = super::super::dispatch::Dispatch::default();
+        for _ in 0..512 {
+            match dispatch.next(0, service.busy(), false) {
+                super::super::dispatch::Work::Actor => {
+                    assert!(real_step(&mut service, &mut ram, None).completed.is_none());
+                }
+                super::super::dispatch::Work::Audit { first, end } => {
+                    let (_, descriptions) = ram.lock_parts();
+                    for position in first..end {
+                        assert!(position >= proto_process::RECORDS);
+                        service
+                            .audit_description(position - proto_process::RECORDS, |token| {
+                                descriptions.live(token)
+                            })
+                            .unwrap();
+                    }
+                }
+                _ => {}
+            }
+            check_pins(&service, &ram.storage);
+            if !dispatch.pending(service.busy()) {
+                break;
+            }
+        }
+        assert!(!service.busy());
+        assert_eq!(service.counts(), budget::Counts::default());
+        assert!(!dispatch.audited());
+        assert_eq!(ram.read(&mut parent, fd, &mut [0; 1]), Ok(1));
+        ram.release(&mut parent);
+        ram.release(&mut child);
+    }
+    #[test]
+    fn physical_legacy_close_and_description_reuse_retire_the_exact_old_ofd() {
+        let mut ram = crate::Ram::default();
+        let mut service = fresh();
+        let payer = root(10, 1);
+        let mut fds = crate::Fds {
+            root: payer,
+            ..crate::Fds::default()
+        };
+        let fd = ram
+            .open(&mut fds, "/etc/motd", proto_fs::READ_ONLY)
+            .unwrap();
+        let old = ram.capture_description(&fds, fd).unwrap().0;
+        let inode = ram.live_description(&fds, old).unwrap().0;
+        real_run(
+            &mut service,
+            &mut ram,
+            None,
+            owned(
+                request(inode, 256, Command::Set(Some(Kind::Read)), 0, 1),
+                old.description,
+            ),
+            payer,
+        )
+        .unwrap();
+        ram.close(&mut fds, fd).unwrap();
+        let fd = ram
+            .open(&mut fds, "/tmp/probe", proto_fs::READ_WRITE)
+            .unwrap();
+        let next = ram.capture_description(&fds, fd).unwrap().0;
+        assert_eq!(next.description.slot, old.description.slot);
+        assert!(next.description.generation > old.description.generation);
+        let next_inode = ram.live_description(&fds, next).unwrap().0;
+        real_run(
+            &mut service,
+            &mut ram,
+            None,
+            owned(
+                request(next_inode, 256, Command::Set(Some(Kind::Write)), 0, 1),
+                next.description,
+            ),
+            payer,
+        )
+        .unwrap();
+        assert_eq!(service.counts().published, 1);
+        let page = page();
+        assert_eq!(
+            real_run(
+                &mut service,
+                &mut ram,
+                Some(&page),
+                request(inode, 257, Command::Get(Kind::Write), 0, 1),
+                payer
+            ),
+            Ok(Response::Blocker(None))
+        );
+        let Response::Blocker(Some(blocker)) = real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            request(next_inode, 257, Command::Get(Kind::Read), 0, 1),
+            payer,
+        )
+        .unwrap() else {
+            panic!("new OFD missing");
+        };
+        assert_eq!(
+            blocker.owner,
+            Owner::Description {
+                slot: next.description.slot,
+                generation: next.description.generation
+            }
+        );
+    }
+    #[test]
+    fn closing_ofd_during_private_preparation_cancels_and_returns_all_group_debt() {
+        let mut ram = crate::Ram::default();
+        let mut service = fresh();
+        let payer = root(10, 1);
+        let mut fds = crate::Fds {
+            root: payer,
+            ..crate::Fds::default()
+        };
+        let fd = ram
+            .open(&mut fds, "/tmp/probe", proto_fs::READ_WRITE)
+            .unwrap();
+        let held = ram.capture_description(&fds, fd).unwrap().0;
+        let inode = ram.live_description(&fds, held).unwrap().0;
+        for position in (0..12).step_by(2) {
+            real_run(
+                &mut service,
+                &mut ram,
+                None,
+                owned(
+                    request(inode, 256, Command::Set(Some(Kind::Read)), position, 1),
+                    held.description,
+                ),
+                payer,
+            )
+            .unwrap();
+        }
+        assert_eq!(service.counts().published, 6);
+        service
+            .start(
+                &mut ram.storage,
+                owned(
+                    request(inode, 256, Command::Set(Some(Kind::Write)), 0, 12),
+                    held.description,
+                ),
+                payer,
+            )
+            .unwrap();
+        for _ in 0..32 {
+            let progress = real_step(&mut service, &mut ram, None);
+            assert!(progress.completed.is_none());
+            if service.counts().private != 0 {
+                break;
+            }
+        }
+        assert!(service.counts().private > 0);
+        ram.close(&mut fds, fd).unwrap();
+        assert_eq!(
+            real_step(&mut service, &mut ram, None).completed,
+            Some(Err(Error::Cancelled))
+        );
+        for _ in 0..4000 {
+            if !service.busy() {
+                break;
+            }
+            assert!(real_step(&mut service, &mut ram, None).completed.is_none());
+        }
+        assert!(!service.busy());
+        assert_eq!(service.counts(), budget::Counts::default());
+        check_pins(&service, &ram.storage);
+        let other = ram.storage.lock_anchor(root(999, 1)).unwrap();
+        assert_eq!(other.index(), 0);
+    }
+    #[test]
+    fn all_128_dead_ofds_return_256_records_and_eight_payers_without_new_requests() {
+        let mut ram = crate::Ram::default();
+        let mut service = fresh();
+        let mut fds: [crate::Fds; 8] = core::array::from_fn(|i| crate::Fds {
+            root: root(10 + i as u64, 1),
+            ..crate::Fds::default()
+        });
+        for session in &mut fds {
+            for _ in 0..16 {
+                let fd = ram.open(session, "/etc/motd", proto_fs::READ_ONLY).unwrap();
+                let held = ram.capture_description(session, fd).unwrap().0;
+                let inode = ram.live_description(session, held).unwrap().0;
+                for position in [0, 2] {
+                    real_run(
+                        &mut service,
+                        &mut ram,
+                        None,
+                        owned(
+                            request(inode, 256, Command::Set(Some(Kind::Read)), position, 1),
+                            held.description,
+                        ),
+                        session.root,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        assert_eq!(service.counts().published, 256);
+        for session in &mut fds {
+            ram.release(session);
+        }
+        assert_eq!(ram.open_descriptions(), 0);
+        let mut dispatch = super::super::dispatch::Dispatch::default();
+        let mut audits = [0; crate::DESCRIPTIONS];
+        for _ in 0..4000 {
+            match dispatch.next(0, service.busy(), false) {
+                super::super::dispatch::Work::Actor => {
+                    let progress = real_step(&mut service, &mut ram, None);
+                    assert!(progress.completed.is_none());
+                    assert!(progress.visited <= 8);
+                }
+                super::super::dispatch::Work::Audit { first, end } => {
+                    let (_, descriptions) = ram.lock_parts();
+                    for position in first..end {
+                        let index = position - proto_process::RECORDS;
+                        audits[index] += 1;
+                        service
+                            .audit_description(index, |token| descriptions.live(token))
+                            .unwrap();
+                    }
+                }
+                _ => {}
+            }
+            check_pins(&service, &ram.storage);
+            assert!(service.counts().paid() <= 512);
+            if !dispatch.pending(service.busy()) {
+                break;
+            }
+        }
+        assert!(audits.into_iter().all(|n| n == 1));
+        assert!(!service.busy());
+        assert_eq!(service.counts(), budget::Counts::default());
+        assert_eq!(service.group_charge(0), Some(0));
+        let other = ram.storage.lock_anchor(root(999, 1)).unwrap();
+        assert_eq!(other.index(), 0);
+        ram.storage.release_lock_anchor(other).unwrap();
     }
     #[test]
     fn deleted_inode_stays_paid_until_dead_group_release_then_reuses_its_place() {
@@ -474,7 +867,13 @@ mod tests {
                 }
                 Work::Audit { first, end } => {
                     for index in first..end {
-                        service.audit_pid(index, |pid| page.live(pid)).unwrap();
+                        if index < proto_process::RECORDS {
+                            service.audit_pid(index, |pid| page.live(pid)).unwrap();
+                        } else {
+                            service
+                                .audit_description(index - proto_process::RECORDS, |_| true)
+                                .unwrap();
+                        }
                     }
                 }
                 Work::Legacy => legacy += 1,
@@ -498,7 +897,13 @@ mod tests {
                 }
                 Work::Audit { first, end } => {
                     for index in first..end {
-                        service.audit_pid(index, |pid| page.live(pid)).unwrap();
+                        if index < proto_process::RECORDS {
+                            service.audit_pid(index, |pid| page.live(pid)).unwrap();
+                        } else {
+                            service
+                                .audit_description(index - proto_process::RECORDS, |_| true)
+                                .unwrap();
+                        }
                     }
                 }
                 Work::Legacy => {}

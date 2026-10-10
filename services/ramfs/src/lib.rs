@@ -486,6 +486,19 @@ struct Shared {
     generation: u64,
 }
 
+/// Read-only authoritative OFD generations and actual published fd counts.
+pub struct DescriptionLifetimes<'a> {
+    descriptions: &'a [Option<Shared>; DESCRIPTIONS],
+}
+impl DescriptionLifetimes<'_> {
+    pub fn live(&self, token: Token) -> bool {
+        self.descriptions
+            .get(token.slot as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|shared| shared.generation == token.generation && shared.fd_refs > 0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileTimes {
     access: proto_fs::Timestamp,
@@ -1193,6 +1206,16 @@ impl<'a> Ram<'a> {
             return true;
         }
         false
+    }
+
+    /// Split disjoint storage mutation and authoritative description reads.
+    pub fn lock_parts(&mut self) -> (&mut Storage<'a>, DescriptionLifetimes<'_>) {
+        (
+            &mut self.storage,
+            DescriptionLifetimes {
+                descriptions: &self.descriptions,
+            },
+        )
     }
 
     pub fn description_token(&self, fds: &Fds, fd: u32) -> Result<Token, u32> {
