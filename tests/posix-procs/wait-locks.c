@@ -4,13 +4,14 @@
 extern void wait_driver_arm(unsigned mode);
 extern void wait_driver_disarm(void);
 static int wait_ready, wait_continue;
-static volatile sig_atomic_t wait_seen;
+static int wait_seen;
 static size_t wait_peak;
 static int wait_fd, wait_command, wait_rc, wait_errno;
 void wait_probe_stage(unsigned stage) {
     __atomic_store_n(&wait_ready, (int)stage, __ATOMIC_RELEASE);
     if (stage == 2) {
-        while (!__atomic_load_n(&wait_continue, __ATOMIC_ACQUIRE)) sched_yield();
+        while (!__atomic_load_n(&wait_continue, __ATOMIC_ACQUIRE) ||
+               __atomic_load_n(&wait_seen, __ATOMIC_ACQUIRE) != SIGUSR1) sched_yield();
     }
 }
 static int wait_stage(int stage) {
@@ -21,7 +22,7 @@ static int wait_stage(int stage) {
     }
     return 0;
 }
-static void wait_signal(int signal) { wait_seen = signal; }
+static void wait_signal(int signal) { __atomic_store_n(&wait_seen, signal, __ATOMIC_RELEASE); }
 static void *wait_worker(void *ignored) {
     (void)ignored;
     if (lock_stack_begin()) { wait_rc = 778; return NULL; }
@@ -70,7 +71,8 @@ static void public_wait_locks(void) {
         expect("open WAIT source", wait_fd >= 0, 1);
         if (wait_fd < 0) break;
         wait_command = mode == 1 ? 38 : 7;
-        wait_rc = 777; wait_errno = 0; wait_seen = 0; wait_peak = 0;
+        wait_rc = 777; wait_errno = 0; wait_peak = 0;
+        __atomic_store_n(&wait_seen, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&wait_ready, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&wait_continue, 0, __ATOMIC_RELEASE);
         wait_driver_arm(mode);
@@ -84,6 +86,14 @@ static void public_wait_locks(void) {
         struct timespec settle = {0, 20000000}; nanosleep(&settle, NULL);
         int reused = -1;
         if (mode == 2 || mode == 3) expect("true cross-thread WAIT SIGUSR1", pthread_kill(worker, SIGUSR1), 0);
+        if (mode == 3) {
+            /* Unlock only after the handler actually ran on the waiting owner. */
+            struct timespec tick = {0, 1000000};
+            unsigned turns = 0;
+            while (__atomic_load_n(&wait_seen, __ATOMIC_ACQUIRE) != SIGUSR1 && turns++ < 10000)
+                nanosleep(&tick, NULL);
+            expect("restart signal precedes unblock", __atomic_load_n(&wait_seen, __ATOMIC_ACQUIRE), SIGUSR1);
+        }
         if (mode == 4) {
             expect("close genuinely waiting source", close(wait_fd), 0);
             reused = open("/tmp/public-wait-reused", O_CREAT | O_RDWR, 0666);
@@ -103,7 +113,7 @@ static void public_wait_locks(void) {
         printf("posix-procs: WAIT mode %u stack %zu bytes\n", mode, wait_peak);
         expect("WAIT canonical public result", wait_rc, mode == 2 || mode == 4 ? -1 : 0);
         if (mode == 2 || mode == 4) expect("WAIT cancellation errno", wait_errno, mode == 2 ? EINTR : EBADF);
-        if (mode == 2 || mode == 3 || mode == 5) expect("real WAIT signal delivered", wait_seen, SIGUSR1);
+        if (mode == 2 || mode == 3 || mode == 5) expect("real WAIT signal delivered", __atomic_load_n(&wait_seen, __ATOMIC_ACQUIRE), SIGUSR1);
         if (mode == 2 || mode == 4) expect("unlock still-owned child lock", wait_holder_exchange(commands[1], replies[0], 'U'), 1);
         if (mode == 4) {
             struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_len = 1};
