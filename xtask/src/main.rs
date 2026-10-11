@@ -1224,7 +1224,8 @@ commands:
             files, N boots at a time;
             the table goes to target/measure/os-test.txt; fails when a
             test of tests/os-test/pass.txt does not pass; with
-            --one NAME, one test in a boot of its own, with its log
+            --one NAME, one test in a boot of its own, with its log;
+            a FAIL verdict from --one returns a nonzero exit status
   posix-tty run the C probe of the terminal: termios, isatty, ttyname and the
             names of terminals through the terminal service, with typed input
   posix-tty-control-steps measure full terminal control with sixteen live clients
