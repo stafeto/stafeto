@@ -17,6 +17,9 @@ rustflags = [
 # program format wants (lib/bootimg).
 [target.aarch64-unknown-none]
 rustflags = [
+    # Require substantial instruction savings from each outlined sequence.
+    # This threshold limits extra frame metadata in size-sensitive programs.
+    "-C", "llvm-args=--enable-machine-outliner=always --outliner-benefit-threshold=64",
     "-C", "link-arg=-zmax-page-size=4096",
     "-C", "link-arg=-zseparate-loadable-segments",
     "-C", "link-arg=-znorelro",
