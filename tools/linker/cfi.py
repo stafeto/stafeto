@@ -235,6 +235,7 @@ class Elf:
         self.symbols = {}
         sym = self.sections.get('.symtab')
         require(sym is not None and sym.entry_size == 24, "native CFI verification needs symbols")
+        require(sym.link < count and sym.size % 24 == 0, "invalid symbol table extent/link")
         strings_header = raw[sym.link]
         strings = self.slice(strings_header[4], strings_header[5])
         for at in range(sym.offset, sym.offset + sym.size, 24):
@@ -320,34 +321,49 @@ def branch_targets(instructions):
     return result
 
 
-def preserved_register(body, register):
-    """Only audited straight-line leaf operations may carry a volatile LR copy."""
-    no_write = {'nop', 'cmp', 'cmn', 'tst', 'ret'}
+def written_registers(mnemonic, operands):
+    """Explicit destinations, including paired loads and memory writeback."""
+    no_write = {'nop', 'cmp', 'cmn', 'tst', 'ret', 'b', 'br', 'cbz', 'cbnz',
+                'tbz', 'tbnz', 'dmb', 'dsb', 'isb'}
     one_write = {'add', 'sub', 'and', 'ands', 'orr', 'eor', 'bic', 'mov', 'movk',
                  'movz', 'movn', 'adr', 'adrp', 'lsl', 'lsr', 'asr', 'ubfx', 'bfxil',
                  'sbfiz', 'ubfiz', 'extr', 'csel', 'cset', 'cinc', 'csinc', 'csinv',
-                 'cneg', 'madd', 'umaddl', 'smaddl', 'mul', 'mvn', 'ldr', 'ldrb', 'ldrh', 'ldrsw',
-                 'ldur', 'ldurb', 'ldurh', 'ldar', 'ldarb', 'ldarh', 'ldaxr',
-                 'ldxr', 'stlxr', 'stxr', 'mrs'}
+                 'cneg', 'madd', 'umaddl', 'smaddl', 'mul', 'mvn', 'neg', 'negs',
+                 'ldr', 'ldrb', 'ldrh', 'ldrsw', 'ldur', 'ldurb', 'ldurh', 'ldar',
+                 'ldarb', 'ldarh', 'ldaxr', 'ldxr', 'stlxr', 'stxr', 'mrs'}
     stores = {'str', 'strb', 'strh', 'stur', 'sturb', 'sturh', 'stp', 'stlr', 'stlrb'}
+    paired = {'ldp', 'ldpsw', 'ldxp', 'ldaxp'}
+    destinations = []
+    if mnemonic == 'bl':
+        destinations = ['x30']
+    elif mnemonic in one_write:
+        destinations = operands.split(',', 1)[:1]
+    elif mnemonic in paired:
+        destinations = operands.split(',')[:2]
+    else:
+        require(mnemonic in no_write or mnemonic in stores or mnemonic.startswith('b.'),
+                f"unproved instruction destinations: {mnemonic}")
+    if '!' in operands or re.search(r'\],\s*#', operands):
+        match = re.search(r'\[(x\d+|sp)', operands)
+        require(match is not None, "unrecognized memory writeback")
+        destinations.append(match[1])
+    result = set()
+    for destination in destinations:
+        destination = destination.strip()
+        if destination == 'sp':
+            result.add(31)
+        elif match := re.fullmatch(r'[xw](\d+)', destination):
+            result.add(int(match[1]))
+    return result
+
+
+def preserved_register(body, register):
+    """Only audited straight-line leaf operations may carry a volatile LR copy."""
     for mnemonic, operands in body:
-        if mnemonic in no_write:
-            continue
-        require(mnemonic in one_write or mnemonic in stores or mnemonic == 'ldp',
-                f"unproved saved-register recovery through {mnemonic}")
-        destinations = []
-        if mnemonic in one_write:
-            destinations = operands.split(',', 1)[:1]
-        elif mnemonic == 'ldp':
-            destinations = operands.split(',')[:2]
-        # A pre/post-indexed memory operand also writes its base register.
-        if '!' in operands or re.search(r'\],\s*#', operands):
-            match = re.search(r'\[(x\d+|sp)', operands)
-            require(match is not None, "unrecognized memory writeback")
-            destinations.append(match[1])
-        for destination in destinations:
-            require(destination.strip() not in (f'x{register}', f'w{register}', 'sp'),
-                    "outlined helper destroys saved LR register or SP")
+        require(mnemonic not in ('b', 'bl', 'br', 'blr', 'cbz', 'cbnz', 'tbz', 'tbnz')
+                and not mnemonic.startswith('b.'), "saved LR helper is not straight-line leaf")
+        require(not ({register, 31} & written_registers(mnemonic, operands)),
+                "outlined helper destroys saved LR register or SP")
 
 
 def repair_programs(elf, records, instructions):
@@ -422,9 +438,9 @@ def repair_programs(elf, records, instructions):
                     stack[1][1] == ('ldr', 'x30, [sp], #0x10') and
                     body[-1][1] == ('ret', ''), "unsupported outlined stack frame")
             require(not any(pc in targets for pc, _ in body[1:]), "branch into helper frame interior")
-            require(not any(op[0] in ('br', 'blr', 'svc', 'paciasp', 'autiasp') or
+            require(not any(op[0] in ('b', 'br', 'blr', 'cbz', 'cbnz', 'tbz', 'tbnz', 'svc', 'paciasp', 'autiasp') or
                             op[0].startswith('b.') for _, op in body), "unsupported helper control flow")
-            require(not any(op[0] != 'bl' and re.match(r'[xw]30\s*,', op[1])
+            require(not any(op[0] != 'bl' and 30 in written_registers(*op)
                             for _, op in body[1:-2]), "unexpected helper LR write")
             require((-16) % fde.cie.data == 0, "helper LR offset not representable")
             middle = copy.deepcopy(initial)
@@ -445,6 +461,8 @@ def repair_programs(elf, records, instructions):
         else:
             require(not any(op[0] in ('bl', 'blr', 'br', 'svc', 'paciasp', 'autiasp')
                             for _, op in body), "unproved leaf helper unwind")
+            require(not any({30, 31} & written_registers(*op) for _, op in body),
+                    "leaf helper changes LR or SP")
             require(all(row_at(original, pc, initial, fde.cie.data) == initial for pc, _ in body),
                     "unexpected leaf helper CFI")
     # Every actual call, rather than every symbol spelling, is audited.
@@ -518,6 +536,33 @@ def repair_programs(elf, records, instructions):
     return changed, helpers
 
 
+
+def validate_header(elf, records):
+    require(elf.header is not None and elf.frame is not None, "missing EH header/frame")
+    header = elf.slice(elf.header.offset, elf.header.size)
+    require(len(header) >= 12 and header[:4] == b'\x01\x1b\x03\x3b',
+            "unsupported EH header encoding")
+    pointer = elf.header.address + 4 + struct.unpack_from('<i', header, 4)[0]
+    require(pointer == elf.frame.address, "EH header frame pointer disagrees")
+    fdes = [record for record in records if isinstance(record, Fde)]
+    starts = [record.start for record in fdes]
+    require(len(set(starts)) == len(starts), "duplicate FDE start")
+    by_start = {record.start: record for record in fdes}
+    count = struct.unpack_from('<I', header, 8)[0]
+    require(12 + count * 8 == len(header) and count == len(fdes),
+            "EH header count disagrees with FDEs")
+    previous = -1
+    for i in range(count):
+        pc, reference = struct.unpack_from('<ii', header, 12 + i * 8)
+        start = elf.header.address + pc
+        require(start > previous, "EH header PC entries not strictly ordered")
+        require(start in by_start and
+                elf.header.address + reference == elf.frame.address + by_start[start].offset,
+                "EH header disagrees with FDE identity")
+        previous = start
+    return header
+
+
 def repack(elf, records, changed):
     rebuilt = bytearray()
     positions = {}
@@ -563,7 +608,7 @@ def repack(elf, records, changed):
     struct.pack_into('<Q', result, elf.section_offset + elf.frame.index * 64 + 32, len(rebuilt))
     growth = len(rebuilt) - elf.frame.size
     struct.pack_into('<QQ', result, elf.program_offset + index * 56 + 32, header[5] + growth, header[6] + growth)
-    eh_header = elf.slice(elf.header.offset, elf.header.size)
+    eh_header = validate_header(elf, records)
     require(eh_header[:4] == b'\x01\x1b\x03\x3b' and len(eh_header) >= 12, "unsupported EH header encoding")
     count = struct.unpack_from('<I', eh_header, 8)[0]
     require(12 + count * 8 == len(eh_header) and count == len(fdes), "EH header count disagrees with FDEs")
@@ -578,6 +623,7 @@ def repack(elf, records, changed):
         struct.pack_into('<i', result, elf.header.offset + 16 + i * 8, displacement)
     repaired = Elf(bytes(result))
     check = repaired.records()
+    validate_header(repaired, check)
     require(len(check) == len(records), "EH record count changed")
     for before, after in zip(records, check):
         require(type(before) is type(after), "EH record kinds changed")
@@ -601,6 +647,7 @@ def normalize_bytes(data, instructions):
     if not any(name.startswith('OUTLINED_FUNCTION_') for symbols in elf.symbols.values() for name, _ in symbols):
         return data, {'helpers': 0, 'corrected_fdes': 0, 'growth': 0}
     records = elf.records()
+    validate_header(elf, records)
     changed, helpers = repair_programs(elf, records, instructions)
     if not changed:
         return data, {'helpers': len(helpers), 'corrected_fdes': 0, 'growth': 0}

@@ -8,6 +8,8 @@ import shlex
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+
 from cfi import Invalid, normalize_file, require
 
 
@@ -52,7 +54,7 @@ def main(arguments):
         return status
     try:
         normalize_file(output, objdump)
-    except (Invalid, OSError, subprocess.SubprocessError):
+    except BaseException:
         # A failed link must not leave a usable, unverified final Cargo artifact.
         output.unlink(missing_ok=True)
         raise
@@ -62,6 +64,6 @@ def main(arguments):
 if __name__ == '__main__':
     try:
         sys.exit(main(sys.argv[1:]))
-    except (Invalid, OSError, subprocess.SubprocessError) as error:
+    except Exception as error:
         print(f'native async CFI validation failed: {error}', file=sys.stderr)
         sys.exit(1)

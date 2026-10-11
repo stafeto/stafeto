@@ -7,6 +7,9 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
+
+sys.dont_write_bytecode = True
 
 from cfi import Elf, Fde, Invalid, disassemble, normalize_bytes, normalize_file
 
@@ -193,6 +196,34 @@ class LinkedInstructionTests(unittest.TestCase):
         data, instructions = self.changed_fixture(ASSEMBLY.replace('bl OUTLINED_FUNCTION_2', 'b OUTLINED_FUNCTION_2'))
         with self.assertRaisesRegex(Invalid, 'non-call entry'):
             normalize_bytes(data, instructions)
+
+    def test_leaf_lr_destination_rejects(self):
+        for replacement in ('mov x30,x0', 'ldp x19,x30,[sp]'):
+            with self.subTest(replacement=replacement):
+                data, instructions = self.changed_fixture(ASSEMBLY.replace('mov w8,#4', replacement))
+                with self.assertRaises(Invalid):
+                    normalize_bytes(data, instructions)
+
+    def test_helper_skip_restore_branch_rejects(self):
+        data, instructions = self.changed_fixture(ASSEMBLY.replace('mov w22,w0', 'b .+8'))
+        with self.assertRaisesRegex(Invalid, 'control flow|frame interior'):
+            normalize_bytes(data, instructions)
+
+    def test_eh_header_pointer_rejects_even_idempotent(self):
+        import struct
+        broken = bytearray(self.fixed)
+        elf = Elf(self.fixed)
+        struct.pack_into('<i', broken, elf.header.offset + 4, 0)
+        with self.assertRaisesRegex(Invalid, 'frame pointer'):
+            normalize_bytes(bytes(broken), self.instructions)
+
+    def test_eh_header_duplicate_rejects_even_idempotent(self):
+        broken = bytearray(self.fixed)
+        elf = Elf(self.fixed)
+        at = elf.header.offset + 12
+        broken[at + 8:at + 16] = broken[at:at + 8]
+        with self.assertRaisesRegex(Invalid, 'strictly ordered'):
+            normalize_bytes(bytes(broken), self.instructions)
 
     def test_full_page_budget_rejects(self):
         broken = bytearray(self.original)
