@@ -284,6 +284,8 @@ fn claim_thread(block: &Block, signal: i32) -> Option<u64> {
         (block.pending.fetch_and(!bit, Ordering::SeqCst) & bit != 0).then_some(0)
     }
 }
+// SAFETY: this executable .text section remains in the native RX segment.
+#[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
 fn assign(block: &Block, signal: i32, ticket: u64, process: bool) -> bool {
     let bit = posix_signals::bit(signal).expect("a valid signal");
     if proto_process::job::class(signal as u8).is_some() {
@@ -747,6 +749,8 @@ pub fn leaving() {
 /// even number). On one processor a writer holds the lock at the ceiling,
 /// above every reader, so the loop turns only for a reader preempted
 /// inside it.
+// SAFETY: this executable .text section remains in the native RX segment.
+#[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
 fn action(signal: i32) -> SigAction {
     let words = &PUBLISHED[signal as usize - 1];
     for _ in 0..16 {
@@ -1126,7 +1130,12 @@ pub fn sigtimedwait(
     result
 }
 
-rt::upcall_entry!(entry, dispatch, context);
+// SAFETY: this executable .text section remains in the native RX segment.
+#[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
+unsafe extern "C" fn entry(context: *mut upcall::Context) {
+    // SAFETY: the distributor supplies this thread's live entry frame.
+    unsafe { dispatch(context) }
+}
 
 /// Where the calling thread's C errno lives: relibc's `__errno_location`. The entry saves and gives back
 /// the value there; it never moves the thread pointer (spec 2, 3.5).
@@ -1591,6 +1600,8 @@ impl SignalPreparation {
 /// An entered delivery enables nested entries for each user callback and
 /// masks them on return. A null native frame requests a context-aware entry
 /// for SA_SIGINFO handlers.
+// SAFETY: this executable .text section remains in the native RX segment.
+#[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     marks::mark(3);
     #[cfg(feature = "thread-probe")]
