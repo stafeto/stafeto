@@ -556,10 +556,10 @@ static void *vz_rename_thread(void *argument) {
     return NULL;
 }
 
-static volatile int vz_hold;
+static int vz_hold;
 
 static void *vz_idle(void *unused) {
-    while (!vz_hold) {
+    while (!__atomic_load_n(&vz_hold, __ATOMIC_ACQUIRE)) {
         struct timespec delay = {0, 1000000};
         nanosleep(&delay, NULL);
     }
@@ -580,7 +580,7 @@ static int vz_thread_cost(void) {
     size_t stack_size = 0;
     VZ_CHECK(pthread_attr_getstacksize(&attr, &stack_size) == 0);
     VZ_CHECK(stack_size == 65536);
-    vz_hold = 0;
+    __atomic_store_n(&vz_hold, 0, __ATOMIC_RELEASE);
     unsigned long long first = 0, last = 0, total = 0;
     for (int i = 0; i < COUNT; i++) {
         unsigned long long before = stafeto_probe_memory_used();
@@ -590,7 +590,7 @@ static int vz_thread_cost(void) {
         last = cost;
         total += cost;
     }
-    vz_hold = 1;
+    __atomic_store_n(&vz_hold, 1, __ATOMIC_RELEASE);
     for (int i = 0; i < COUNT; i++) VZ_CHECK(pthread_join(threads[i], NULL) == 0);
     printf("posix-procs: names thread cost: %llu bytes (%llu pages) for the first thread, %llu bytes the last, "
            "%llu bytes for %d, stack %zu bytes\n",
@@ -645,7 +645,7 @@ static int vz_child(void) {
         VZ_CHECK(eighth_stack != MAP_FAILED);
         VZ_CHECK(pthread_attr_init(&eighth_attr) == 0);
         VZ_CHECK(pthread_attr_setstack(&eighth_attr, eighth_stack, stack_size) == 0);
-        vz_hold = 0;
+        __atomic_store_n(&vz_hold, 0, __ATOMIC_RELEASE);
         /* The caller owns this normal 64 KiB stack and releases it after
          * join. Keep all eight threads alive while measuring stack and TLS. */
         VZ_CHECK(pthread_create(&eighth, &eighth_attr, vz_idle, NULL) == 0);
@@ -657,7 +657,7 @@ static int vz_child(void) {
             VZ_CHECK(length > 0 && (size_t)length < sizeof line);
             VZ_CHECK(write(STDOUT_FILENO, line, (size_t)length) == length);
         }
-        vz_hold = 1;
+        __atomic_store_n(&vz_hold, 1, __ATOMIC_RELEASE);
         VZ_CHECK(pthread_join(eighth, NULL) == 0);
         VZ_CHECK(pthread_attr_destroy(&eighth_attr) == 0);
         VZ_CHECK(munmap(eighth_stack, stack_size) == 0);
