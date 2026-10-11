@@ -433,6 +433,9 @@ def prove_finite_prefix_exit(fde, branch_pc, call_pc, instructions):
     target = int(match[1], 16)
     require(call_pc + 4 <= target < fde.start + fde.size, 'prefix exit can reenter prologue')
     original = events(fde.program, fde.start, fde.cie.code)
+    branch_row = row_at(original, branch_pc, fde.cie.initial, fde.cie.data)
+    require(branch_row.cfa == (31, 0) and all(branch_row.rule(r) == ('same', r) for r in range(19, 31)),
+            'prefix branch has non-entry recovery row')
     for pc in range(target, fde.start + fde.size, 4):
         require(pc in instructions, 'missing caller prefix exit instruction')
         row = row_at(original, pc, fde.cie.initial, fde.cie.data)
