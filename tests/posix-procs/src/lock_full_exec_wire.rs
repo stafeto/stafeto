@@ -101,6 +101,7 @@ pub fn ready(s: &[u64], case: u64, nonce: u64) -> bool {
         && r[5] == s[9]
         && r[6] == s[10]
         && r[7] > s[11]
+        && r[8] > s[12]
         && r[9] == s[13]
         && r[10] == s[14]
         && r[13] == s[6]
@@ -185,6 +186,7 @@ pub fn marker(line: &str, profile: u64, case: u64) -> bool {
         && old_credential > 0
         && old_credential >> 63 == 0
         && new_credential > 0
+        && new_credential > old_credential
         && new_credential >> 63 == 0
         && fields.next() == Some("oldscope=denied")
         && fields.next() == Some("published=256")
@@ -247,11 +249,30 @@ mod tests {
         s
     }
     #[test]
+    fn fresh_credentials_reject_old_or_lower_generation_even_with_matching_live() {
+        let s = state();
+        for credential in [s[12], s[12] - 1] {
+            let mut wrong = s;
+            wrong[40] = credential;
+            wrong[44] = credential;
+            assert!(active(&wrong[36..45]));
+            assert!(!ready(&wrong, 1, 99));
+            assert!(!stopped(&wrong, 1, 99));
+        }
+    }
+    #[test]
     fn guest_summary_rejects_missing_wrong_stale_and_extra_fields() {
         let line = "lock-full: exec retained profile=4 mode=1 pid=513 old-image=2 new-image=3 da=769/4294967297 old-credential=7 new-credential=8 oldscope=denied published=256 common=128 payers=8";
         assert!(marker(line, 4, 1));
         assert!(!marker(line, 7, 1));
         assert!(!marker(line, 4, 2));
+        for credential in [7, 6] {
+            assert!(!marker(
+                &line.replace("new-credential=8", &format!("new-credential={credential}")),
+                4,
+                1
+            ));
+        }
         for (before, after) in [
             ("new-image=3", "new-image=2"),
             ("oldscope=denied", "oldscope=granted"),
