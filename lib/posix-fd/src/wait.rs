@@ -5,6 +5,13 @@
 
 use crate::{Error, OwnerToken};
 pub const WAIT_RECORDS: usize = 16;
+/// Independent custody, including permanently exhausted generation places.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitPlace {
+    Free,
+    Full { own: bool },
+    Retired,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WaitToken {
     slot: u8,
@@ -135,6 +142,25 @@ impl<W: Copy> WaitRecords<W> {
     }
     fn save(&mut self, token: WaitToken, record: Record<W>) {
         self.slots[token.slot()].record = Some(record);
+    }
+    /// A protected owner frame cannot wait for its own nested operation.
+    pub fn place(&self, protected: impl Fn(WaitSnapshot<W>) -> bool) -> WaitPlace {
+        let mut reusable = false;
+        let mut own = false;
+        for slot in &self.slots {
+            if slot.generation < u64::MAX {
+                if slot.record.is_none() {
+                    return WaitPlace::Free;
+                }
+                reusable = true;
+            }
+            own |= slot.record.is_some_and(|r| protected(r.snapshot()));
+        }
+        if reusable {
+            WaitPlace::Full { own }
+        } else {
+            WaitPlace::Retired
+        }
     }
     pub fn tokens(&self) -> impl Iterator<Item = WaitToken> + '_ {
         self.slots.iter().enumerate().filter_map(|(i, s)| {
@@ -313,12 +339,12 @@ impl<W: Copy> WaitRecords<W> {
         self.slots[token.slot()].record = None;
         Ok((r.result.expect("ack result"), r.recovery))
     }
-    /// One bounded detach turn revokes an owner's next resident record.
-    pub fn abandon_owner(&mut self, owner: OwnerToken) -> Option<WaitToken> {
-        let token = self
-            .tokens()
-            .find(|&t| self.record(t).is_ok_and(|r| r.owner == Some(owner)))?;
-        let mut r = self.record(token).expect("exact detach");
+    /// Detach one exact owner and generation without paying any remote debt.
+    pub fn abandon(&mut self, token: WaitToken, owner: OwnerToken) -> Result<(), Error> {
+        let mut r = self.record(token)?;
+        if r.owner != Some(owner) {
+            return Err(Error::BadFileDescriptor);
+        }
         r.owner = None;
         r.claimant = None;
         if r.phase != WaitRecordPhase::Cleaned {
@@ -328,6 +354,14 @@ impl<W: Copy> WaitRecords<W> {
             }
         }
         self.save(token, r);
+        Ok(())
+    }
+    /// One bounded detach turn revokes an owner's next resident record.
+    pub fn abandon_owner(&mut self, owner: OwnerToken) -> Option<WaitToken> {
+        let token = self
+            .tokens()
+            .find(|&t| self.record(t).is_ok_and(|r| r.owner == Some(owner)))?;
+        self.abandon(token, owner).expect("exact detach");
         Some(token)
     }
     /// Child never closes or cancels copied parent IDs; preserve generations.
@@ -355,9 +389,12 @@ mod tests {
         for slot in &mut records.slots {
             slot.generation = u64::MAX;
         }
+        assert_eq!(records.place(|_| false), WaitPlace::Retired);
         assert_eq!(records.begin(owner(), 7), Err(Error::TooManyOpenFiles));
         records.slots[0].generation = u64::MAX - 1;
+        assert_eq!(records.place(|_| false), WaitPlace::Free);
         let (t, c) = records.begin(owner(), 7).unwrap();
+        assert_eq!(records.place(|_| false), WaitPlace::Retired);
         assert_eq!(t.generation(), u64::MAX);
         records
             .begin_cleanup(t, WaitCancelReason::Abandoned)

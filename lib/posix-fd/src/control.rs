@@ -312,6 +312,21 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         }
         Ok(record.snapshot())
     }
+    /// Advance paid local cleanup debt without replacing the canonical result.
+    /// Effect claims remain revoked; exact immutable identity belongs to `C`.
+    pub fn update_control_cleanup(
+        &mut self,
+        token: ControlToken,
+        update: impl FnOnce(C) -> Result<C, Error>,
+    ) -> Result<(), Error> {
+        let mut record = self.control_record(token)?;
+        if !matches!(record.cleanup, Cleanup::Running) {
+            return Err(Error::BadFileDescriptor);
+        }
+        record.recovery = update(record.recovery)?;
+        self.save_control(token, record);
+        Ok(())
+    }
     /// Copy the original outcome while retaining every unpaid cleanup obligation.
     pub fn ack_control(
         &mut self,

@@ -37,6 +37,7 @@ table-relibc = []
 table-relibc-threads = []
 # The probe of POSIX processes (posix-procs) and the records it spawns.
 table-posix-procs = []
+table-posix-lock-ring = []
 table-posix-native-vz = []
 table-posix-files = []
 data-carrier-probe = []

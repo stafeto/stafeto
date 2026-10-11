@@ -15,7 +15,12 @@ pub mod records;
 pub mod request;
 pub mod server;
 pub mod service;
+pub mod wait_departure;
+pub mod wait_events;
+pub mod wait_notifications;
+pub mod wait_proof;
 pub mod wait_receipts;
+pub mod wait_select;
 pub mod wait_server;
 pub mod waiters;
 #[cfg(test)]

@@ -138,6 +138,7 @@ pub struct Groups<
     pid_index: [[u16; INODES]; PIDS],
     ofd_index: [u16; DESCRIPTIONS],
     inode_heads: [Option<Id>; INODES],
+    inode_revisions: [u64; INODES],
     pid_heads: [PidHead; PIDS],
     used: [u16; ROOTS],
     fresh: u16,
@@ -187,6 +188,10 @@ impl<
             let index = core::ptr::addr_of_mut!((*destination).ofd_index).cast::<u16>();
             for slot in 0..DESCRIPTIONS {
                 index.add(slot).write(NONE);
+            }
+            let revisions = core::ptr::addr_of_mut!((*destination).inode_revisions).cast::<u64>();
+            for inode in 0..INODES {
+                revisions.add(inode).write(1);
             }
             let heads = core::ptr::addr_of_mut!((*destination).inode_heads).cast::<Option<Id>>();
             for inode in 0..INODES {
@@ -318,6 +323,35 @@ impl<
     }
     pub fn available(&self) -> usize {
         self.available as usize
+    }
+    /// Never resets on inode reuse. Saturation disables optional snapshots only.
+    pub fn inode_revision(&self, inode: Token) -> Option<u64> {
+        if inode.generation == 0 {
+            return None;
+        }
+        self.inode_revisions
+            .get(usize::from(inode.slot))
+            .copied()
+            .filter(|revision| *revision != u64::MAX)
+    }
+    fn change_inode(&mut self, inode: Token) {
+        let revision = &mut self.inode_revisions[usize::from(inode.slot)];
+        *revision = revision.saturating_add(1);
+    }
+    /// Exact local visibility is additional to the genuine Process lifetime.
+    pub fn pid_visible(&self, pid: u32) -> bool {
+        let Ok(Position::Pid(index)) = Self::position(Owner::Process(pid)) else {
+            return false;
+        };
+        self.pid_heads[index].pid == pid && self.pid_heads[index].live
+    }
+    #[cfg(test)]
+    pub(super) fn inode_revisions_for_test(&self, inode: Token) -> u64 {
+        self.inode_revisions[usize::from(inode.slot)]
+    }
+    #[cfg(test)]
+    pub(super) fn set_test_inode_revision(&mut self, inode: Token, revision: u64) {
+        self.inode_revisions[usize::from(inode.slot)] = revision;
     }
     pub fn inode_head(&self, inode: Token) -> Result<Option<Id>, Error> {
         if inode.generation == 0 || inode.slot as usize >= INODES {
@@ -458,6 +492,7 @@ impl<
             }
             _ => None,
         };
+        self.change_inode(inode);
         self.slots[slot as usize] = Slot::Paid(Group {
             snapshot: Snapshot {
                 inode,
@@ -498,8 +533,11 @@ impl<
         if !self.valid(capture) {
             return Err(Error::Invalid);
         }
+        let snapshot = self.group(capture.id)?.snapshot;
+        let epoch = snapshot.epoch.checked_add(1).ok_or(Error::NoLocks)?;
+        self.change_inode(snapshot.inode);
         let group = self.group_mut(capture.id)?;
-        group.snapshot.epoch = group.snapshot.epoch.checked_add(1).ok_or(Error::NoLocks)?;
+        group.snapshot.epoch = epoch;
         Ok(Capture {
             id: capture.id,
             epoch: group.snapshot.epoch,
@@ -515,6 +553,7 @@ impl<
         Ok(group.snapshot)
     }
     fn detach(&mut self, id: Id, group: Group) {
+        self.change_inode(group.snapshot.inode);
         let inode = group.snapshot.inode.slot as usize;
         if let Some(prev) = group.inode_prev {
             self.group_mut(prev)

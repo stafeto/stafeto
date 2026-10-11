@@ -211,6 +211,54 @@ pub fn abandon_holds() {
     }
 }
 
+#[cfg(feature = "thread-probe")]
+pub fn probe_drain_help_without_admission() {
+    crate::drain_driver::help();
+}
+
+#[cfg(feature = "thread-probe")]
+static JUMP_WINDOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "thread-probe")]
+pub fn probe_jump_window(hook: Option<fn(u64)>) {
+    JUMP_WINDOW.store(hook.map_or(0, |hook| hook as usize), Ordering::Release);
+}
+
+/// The assembly longjmp keeps kernel entries deferred until its restored SP.
+/// Preparation also prevents synchronous delivery from FILES_LOCK's unlock.
+pub fn jump_mark(target_sp: u64) {
+    #[cfg(feature = "thread-probe")]
+    {
+        let hook = JUMP_WINDOW.load(Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: probe_jump_window publishes only this function type.
+            let hook: fn(u64) = unsafe { core::mem::transmute(hook) };
+            hook(target_sp);
+        }
+    }
+    // SAFETY: a published current Block lives through this callback.
+    let Some(block) = (unsafe { posix_thread::block().as_ref() }) else {
+        return;
+    };
+    let preparation = posix_sync::DeliveryPreparation::begin(block);
+    if let Some(owner) =
+        crate::relibc::jump_owner().and_then(|owner| posix_fs::change::OwnerToken::new(owner).ok())
+    {
+        let _ = process_state(|files| {
+            files.mark_jump(owner, entries::Frame::main(target_sp));
+            Ok(())
+        });
+    }
+    // Unlock cannot consume this local marker. Give it a real pending entry
+    // before assembly resumes, even when no kernel entry was already pending.
+    if block.flags.load(Ordering::SeqCst) & posix_thread::flag::ENTRY_DEFERRED != 0 {
+        let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
+            block.thread.load(Ordering::Relaxed),
+        ));
+        rt::sys::thread_upcall_request(&thread).expect("jump deferred delivery owner");
+    }
+    drop(preparation);
+}
+
 /// Close of the service's open description `fd`, which the table handed
 /// back to release, outside the lock.
 pub fn release(fd: posix_fs::RamTarget) -> Result<(), i32> {
@@ -693,14 +741,16 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
 /// Final lifetime callbacks perform local transitions and retain remote ownership.
 pub fn detach_open_owner(owner: u64) -> bool {
     let opens = crate::open_driver::detach(owner);
-    // Every resident Control family loses this exact native lifetime.
+    // Resident Control and WAIT custody lose this exact native lifetime.
     let changes = crate::change::detach(owner);
     let closes = crate::close_driver::detach(owner);
-    opens && changes && closes
+    let drains = crate::drain_driver::detach(owner);
+    opens && changes && closes && drains
 }
 /// A surviving caller or collector pays one cleanup phase outside the layer locks.
 pub fn help_open_recovery() {
     crate::open_driver::help();
     crate::change::help();
     crate::close_driver::help();
+    crate::drain_driver::help();
 }

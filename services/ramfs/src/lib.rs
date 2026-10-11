@@ -286,6 +286,8 @@ pub struct Fds {
     pub departed: bool,
     /// Bounded marking of the sixteen native lock requests after endpoint death.
     pub lock_departure: u8,
+    /// Bounded retirement of independent WAIT custody after endpoint death.
+    pub wait_departure: u8,
     pub binding: authority::Binding,
     pub authority_index: u16,
     pub binding_preparation: Option<u16>,
@@ -320,6 +322,7 @@ impl Default for Fds {
             claimed: false,
             departed: false,
             lock_departure: 16,
+            wait_departure: 16,
             binding: authority::Binding::Unbound,
             authority_index: storage::NONE,
             binding_preparation: None,
@@ -3565,3 +3568,7 @@ mod birth_claim_tests {
         assert!(destination.fresh_clone_destination());
     }
 }
+
+#[cfg(all(test, feature = "lifetime-probe"))]
+#[path = "fifo_probe.rs"]
+mod fifo_probe;

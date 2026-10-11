@@ -8,6 +8,7 @@ license = "GPL-3.0-or-later WITH GCC-exception-3.1"
 description = "Bounded descriptor ownership for the Rust stafeto POSIX layer"
 
 [dev-dependencies]
+abi = { path = "../abi" }
 entries = { path = "../entries" }
 proto-fs = { path = "../../proto/fs" }
 proto-wire = { path = "../../proto/wire" }

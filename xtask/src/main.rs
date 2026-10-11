@@ -585,6 +585,11 @@ const POSIX_LIFETIMES_PROGRAMS: [ImageProgram; 10] = {
     programs[5].3 = &["lifetime-probe"];
     programs
 };
+const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_LIFETIMES_PROGRAMS;
+    programs[0].3 = &["table-posix-lock-ring"];
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1316,6 +1321,7 @@ fn main() {
         Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
+        Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
@@ -3191,6 +3197,54 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn posix_lock_ring_probe(machine: &qemu::Machine) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-lock-ring.img",
+        &POSIX_LOCK_RING_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let mut ended = 0u8;
+    let result = (|| {
+        while ended != 15 {
+            let line = run.expect_line(
+                "all four genuine payer families to exit",
+                |line| line.starts_with("init: lock-ring-") && line.contains(" ended:"),
+                Duration::from_secs(30),
+            )?;
+            for family in 0..4 {
+                if line.starts_with(&format!("init: lock-ring-{family} ended:")) {
+                    if line != format!("init: lock-ring-{family} ended: exit code 0, not restarted")
+                    {
+                        return Err(format!("genuine ring family failed: {line}"));
+                    }
+                    ended |= 1 << family;
+                }
+            }
+        }
+        Ok(())
+    })();
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    result?;
+    for family in 0..4 {
+        qemu::expect_marker(
+            &outcome,
+            &format!("posix-procs: genuine ring16 family {family} ok"),
+        )?;
+    }
+    qemu::expect_marker(
+        &outcome,
+        "posix-procs: ring16 result deadlock=1 success=15 vertices=16 registrations=16 watches=16 ticks=",
+    )?;
+    Ok(())
+}
+
 fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
@@ -3219,6 +3273,14 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: public nonblocking locks, canonical fields, PID close and OFD fork ok",
         "posix-procs: public lock reply loss, exact keys, full GET receipt, numeric close and reuse ok ticks=",
         "posix-procs: lock depth within 16 KiB, nested SIGUSR1 close, siglongjmp and thread departure ok",
+        "posix-procs: true WAIT unlock, SIGUSR1, restart, close/reuse and canonical success ok",
+        "posix-procs: genuine FIFO oldest eligible Read, blocked older Write and later PID SET ok",
+        "posix-procs: FIFO own dispatch ",
+        "posix-procs: genuine WAIT End exact debts and live parent fork exec custody ok",
+        "posix-procs: genuine pending WAIT process exit retires exact paid receipt without rescue close ok",
+        "posix-procs: genuine21 arbitrary WAIT jumps same owner and canonical success preserve exact debts ok",
+        "posix-procs: WAIT real deferred pending physical cleanup rotation ok",
+        "posix-procs: genuine PID cycle EDEADLK and OFD noncycle ok",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
@@ -4988,6 +5050,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
+        job("posix-lock-ring", || posix_lock_ring_probe(&qemu::VIRT)),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
@@ -7261,6 +7324,7 @@ mod tests {
         for programs in [
             &POSIX_PROCS_PROGRAMS[..],
             &POSIX_LIFETIMES_PROGRAMS[..],
+            &POSIX_LOCK_RING_PROGRAMS[..],
             &POSIX_NATIVE_SCOPE_PROGRAMS[..],
             &POSIX_VZ_NATIVE_SCOPE_PROGRAMS[..],
             &POSIX_STEPS_PROGRAMS[..],
@@ -7285,6 +7349,11 @@ mod tests {
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe", "steps"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[5].3, &["lifetime-probe"]);
+        assert_eq!(
+            &POSIX_LOCK_RING_PROGRAMS[1..],
+            &POSIX_LIFETIMES_PROGRAMS[1..]
+        );
+        assert_eq!(POSIX_LOCK_RING_PROGRAMS[0].3, &["table-posix-lock-ring"]);
         for programs in [
             &POSIX_PROCS_PROGRAMS[..],
             &POSIX_NAMES_PROGRAMS[..],

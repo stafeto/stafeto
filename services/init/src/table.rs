@@ -719,6 +719,8 @@ fn order(table: &[Record]) -> Order {
 pub mod ceiling;
 pub mod cycle;
 pub mod entropy;
+#[cfg(any(feature = "table-posix-lock-ring", test))]
+pub mod lock_ring;
 pub mod normal;
 pub mod ramfs;
 pub mod test;
@@ -738,6 +740,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-relibc") as usize
     + cfg!(feature = "table-relibc-threads") as usize
     + cfg!(feature = "table-posix-procs") as usize
+    + cfg!(feature = "table-posix-lock-ring") as usize
     + cfg!(feature = "table-posix-native-vz") as usize
     + cfg!(feature = "table-posix-files") as usize
     + cfg!(feature = "table-loader-channels") as usize
@@ -780,6 +783,7 @@ const _: () = assert!(
     feature = "table-relibc",
     feature = "table-relibc-threads",
     feature = "table-posix-procs",
+    feature = "table-posix-lock-ring",
     feature = "table-posix-native-vz",
     feature = "table-posix-files",
     feature = "table-loader-channels",
@@ -816,6 +820,8 @@ pub const TABLE: &[Record] = ramfs::LOADER_CHANNELS_TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_POLL_TABLE;
 #[cfg(feature = "table-posix-pty")]
 pub const TABLE: &[Record] = ramfs::POSIX_PTY_TABLE;
+#[cfg(feature = "table-posix-lock-ring")]
+pub const TABLE: &[Record] = lock_ring::TABLE;
 #[cfg(feature = "table-posix-procs")]
 pub const TABLE: &[Record] = ramfs::POSIX_PROCS_TABLE;
 #[cfg(feature = "table-posix-native-vz")]

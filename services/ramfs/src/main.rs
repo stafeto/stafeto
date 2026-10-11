@@ -10,6 +10,9 @@
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "lifetime-probe")]
+mod fifo_probe;
+
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use proto_fs::{MAX_READ, MAX_WRITE, Method, VERSION};
@@ -24,6 +27,12 @@ use ramfs::job::{JobOperation, PathJob, ResolveJob, Seconds};
 use ramfs::locks::dispatch::{Dispatch as LockDispatch, Work as LockWork};
 use ramfs::locks::jobs::Queue as LockQueue;
 use ramfs::locks::service::LockService;
+use ramfs::locks::wait_events::Events as WaitEvents;
+use ramfs::locks::wait_notifications::Notifications as WaitNotifications;
+use ramfs::locks::wait_proof::Proof as WaitProof;
+use ramfs::locks::wait_receipts::Queue as WaitQueue;
+use ramfs::locks::wait_select::{Decision as WaitDecision, Selector as WaitSelector};
+use ramfs::locks::waiters::Pool as WaitPool;
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
 use ramfs::storage::{NONE, Root, Token};
@@ -31,12 +40,14 @@ use ramfs::tree::{self, Index};
 use ramfs::{Exec, SET_GID, SET_UID};
 use ramfs::{Fds, Ram};
 use rt::abi::{Access, Rights};
-use rt::handle::{Channel, Handle, Memory, Outgoing, Resource};
+use rt::handle::{Channel, Handle, Memory, Outgoing, Resource, Timer};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 
 mod clock_page;
 mod lifetime_page;
+#[cfg(feature = "lifetime-probe")]
+mod ring_probe;
 
 rt::entry!(main);
 
@@ -46,7 +57,7 @@ const BASE_METHODS: &[u16] = proto_fs::METHODS;
 const BASE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    52, 53, 54, 55, 56, 57, 58, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
 ];
 #[cfg(not(any(
     feature = "steps",
@@ -62,7 +73,7 @@ const METHODS: &[u16] = BASE_METHODS;
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
         + cfg!(feature = "steps") as usize
-        + cfg!(feature = "lifetime-probe") as usize
+        + 4 * cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
@@ -79,6 +90,9 @@ const METHODS: &[u16] = &{
     }
     if cfg!(feature = "lifetime-probe") {
         methods[i] = 0xfff3;
+        methods[i + 1] = 0xfff2;
+        methods[i + 2] = 0xfff6;
+        methods[i + 3] = 0xfff7;
     }
     methods
 };
@@ -108,6 +122,36 @@ struct LockJobsBss(UnsafeCell<core::mem::MaybeUninit<LockQueue>>);
 // SAFETY: the sole service thread initializes and owns prepaid request custody.
 unsafe impl Sync for LockJobsBss {}
 static LOCK_JOBS: LockJobsBss = LockJobsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct WaitJobsBss(UnsafeCell<core::mem::MaybeUninit<WaitQueue>>);
+// SAFETY: the sole service thread initializes and owns independent WAIT custody.
+unsafe impl Sync for WaitJobsBss {}
+static WAIT_JOBS: WaitJobsBss = WaitJobsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct WaitPoolBss(UnsafeCell<core::mem::MaybeUninit<WaitPool>>);
+// SAFETY: the sole service thread initializes and owns sleeping registrations.
+unsafe impl Sync for WaitPoolBss {}
+static WAIT_POOL: WaitPoolBss = WaitPoolBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct WaitNotifyBss(UnsafeCell<core::mem::MaybeUninit<WaitNotifications<Handle<Channel>>>>);
+// SAFETY: the sole service thread initializes and owns all Notify copies.
+unsafe impl Sync for WaitNotifyBss {}
+static WAIT_NOTIFY: WaitNotifyBss =
+    WaitNotifyBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct WaitEventsBss(UnsafeCell<core::mem::MaybeUninit<WaitEvents>>);
+// SAFETY: the sole service thread owns all direct inode wake masks.
+unsafe impl Sync for WaitEventsBss {}
+static WAIT_EVENTS: WaitEventsBss =
+    WaitEventsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct WaitSelectorBss(UnsafeCell<core::mem::MaybeUninit<WaitSelector>>);
+// SAFETY: the sole service thread owns read-only FIFO selection scratch.
+unsafe impl Sync for WaitSelectorBss {}
+static WAIT_SELECTOR: WaitSelectorBss =
+    WaitSelectorBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct WaitProofBss(UnsafeCell<core::mem::MaybeUninit<WaitProof>>);
+// SAFETY: the sole service thread owns paid read-only proof scratch.
+unsafe impl Sync for WaitProofBss {}
+static WAIT_PROOF: WaitProofBss = WaitProofBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+// The service loop reserves label zero for its heartbeat timer.
+const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
+const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
 struct RamBss(UnsafeCell<core::mem::MaybeUninit<Ram<'static>>>);
 // SAFETY: the sole service thread initializes and owns the RAM descriptors.
 unsafe impl Sync for RamBss {}
@@ -187,11 +231,35 @@ fn main(_: u64) -> u64 {
         LockQueue::initialize_at(pointer);
         &mut *pointer
     };
+    // SAFETY: independent exclusive permanent allocations are initialized in place.
+    let (wait_jobs, wait_pool, wait_notify, wait_events) = unsafe {
+        let jobs = (*WAIT_JOBS.0.get()).as_mut_ptr();
+        let pool = (*WAIT_POOL.0.get()).as_mut_ptr();
+        let notify = (*WAIT_NOTIFY.0.get()).as_mut_ptr();
+        let events = (*WAIT_EVENTS.0.get()).as_mut_ptr();
+        WaitQueue::initialize_at(jobs);
+        WaitPool::initialize_at(pool);
+        WaitNotifications::initialize_at(notify);
+        WaitEvents::initialize_at(events);
+        (&mut *jobs, &mut *pool, &mut *notify, &mut *events)
+    };
+    // SAFETY: selection scratch is an exclusive permanent aligned allocation.
+    let wait_selector = unsafe {
+        let selector = (*WAIT_SELECTOR.0.get()).as_mut_ptr();
+        WaitSelector::initialize_at(selector);
+        &mut *selector
+    };
     // SAFETY: RAM is exclusive permanent storage; every field is written first.
     let ram = unsafe {
         let pointer = (*RAM.0.get()).as_mut_ptr();
         Ram::initialize_at(pointer, now, state, data, tree);
         &mut *pointer
+    };
+    // SAFETY: exclusive permanent scratch, initialized field by field.
+    let wait_proof = unsafe {
+        let proof = (*WAIT_PROOF.0.get()).as_mut_ptr();
+        WaitProof::initialize_at(proof);
+        &mut *proof
     };
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
@@ -200,6 +268,13 @@ fn main(_: u64) -> u64 {
     if rt::service::register(&start.parent, &channel).is_err() {
         return 3;
     }
+    let Ok(wait_view) = sys::handle_label(&channel, Rights::RECEIVE, WAIT_TIMER_LABEL, level)
+    else {
+        return 3;
+    };
+    let Ok(wait_timer) = sys::timer_create(&wait_view, level) else {
+        return 3;
+    };
     let heartbeat = Heartbeat {
         to: &start.parent,
         period_ns,
@@ -217,6 +292,12 @@ fn main(_: u64) -> u64 {
             + core::mem::size_of::<Index>()
             + core::mem::size_of::<LockService>()
             + core::mem::size_of::<LockQueue>()
+            + core::mem::size_of::<WaitQueue>()
+            + core::mem::size_of::<WaitPool>()
+            + core::mem::size_of::<WaitNotifications<Handle<Channel>>>()
+            + core::mem::size_of::<WaitEvents>()
+            + core::mem::size_of::<WaitProof>()
+            + core::mem::size_of::<WaitSelector>()
             + core::mem::size_of::<Ram<'static>>()
     );
     rt::println!("ramfs: ready");
@@ -226,6 +307,31 @@ fn main(_: u64) -> u64 {
         ram,
         locks,
         lock_jobs,
+        wait_jobs,
+        wait_pool,
+        wait_notify,
+        wait_events,
+        wait_selector,
+        wait_selection: None,
+        wait_proof,
+        wait_proof_scan: None,
+        wait_proof_scan_remaining: 0,
+        wait_proof_choice: None,
+        wait_proof_active: false,
+        wait_proof_next: 0,
+        wait_proof_serial: 0,
+        wait_proof_disabled: false,
+        wait_proof_turn: false,
+        #[cfg(feature = "lifetime-probe")]
+        ring_probe: ring_probe::RingProbe::new(),
+        #[cfg(feature = "lifetime-probe")]
+        fifo_probe: fifo_probe::Gate::new(),
+        wait_timer,
+        _wait_view: wait_view,
+        wait_timer_armed: false,
+        wait_request_turn: false,
+        wait_ready_scan: None,
+        wait_ready_scanned: false,
         lock_dispatch: LockDispatch::default(),
         lifetimes: None,
         legacy_pending: true,
@@ -261,6 +367,11 @@ fn main(_: u64) -> u64 {
         orphan_count: 0,
         cancel_reported: 0,
     };
+    #[cfg(feature = "lifetime-probe")]
+    // SAFETY: cold sole-thread startup owns the unchanged mapped 48 KiB stack.
+    unsafe {
+        fs.ring_probe.paint()
+    };
     // Prepare the authentic notary page after publishing the RAM endpoint.
     // Standalone boot profiles may have no Process service.
     let _ = fs.notary_register();
@@ -275,6 +386,35 @@ struct Fs {
     ram: &'static mut Ram<'static>,
     locks: &'static mut LockService,
     lock_jobs: &'static mut LockQueue,
+    wait_jobs: &'static mut WaitQueue,
+    wait_pool: &'static mut WaitPool,
+    wait_notify: &'static mut WaitNotifications<Handle<Channel>>,
+    wait_events: &'static mut WaitEvents,
+    wait_selector: &'static mut WaitSelector,
+    wait_selection: Option<ramfs::locks::jobs::Id>,
+    wait_proof: &'static mut WaitProof,
+    wait_proof_scan: Option<ramfs::locks::waiters::Cursor>,
+    wait_proof_scan_remaining: u8,
+    wait_proof_choice: Option<(
+        u8,
+        ramfs::locks::waiters::RegistrationToken,
+        ramfs::locks::request::Captured,
+    )>,
+    wait_proof_active: bool,
+    wait_proof_next: u8,
+    wait_proof_serial: u64,
+    wait_proof_disabled: bool,
+    wait_proof_turn: bool,
+    #[cfg(feature = "lifetime-probe")]
+    ring_probe: ring_probe::RingProbe,
+    #[cfg(feature = "lifetime-probe")]
+    fifo_probe: fifo_probe::Gate,
+    wait_timer: Handle<Timer>,
+    _wait_view: Handle<Channel>,
+    wait_timer_armed: bool,
+    wait_request_turn: bool,
+    wait_ready_scan: Option<ramfs::locks::waiters::Cursor>,
+    wait_ready_scanned: bool,
     lock_dispatch: LockDispatch,
     lifetimes: Option<lifetime_page::Lifetimes>,
     legacy_pending: bool,
@@ -448,11 +588,14 @@ impl Fs {
 
     fn lock_custody_empty(
         queue: &LockQueue,
+        wait_queue: &WaitQueue,
         places: &ramfs::places::Places,
         fds: &Fds,
         label: u64,
     ) -> bool {
         ramfs::locks::server::custody_empty(queue, fds, places.place(label), label)
+            && fds.wait_departure == 16
+            && !wait_queue.retains(places.place(label), label)
     }
 
     /// The index of the birth of `label`, if it holds one.
@@ -474,6 +617,31 @@ impl Fs {
             self.places.place(label),
             label,
         ) {
+            return true;
+        }
+        if fds.departed && fds.wait_departure < 16 {
+            let progress = ramfs::locks::wait_departure::part(
+                self.wait_jobs,
+                (self.wait_pool, self.wait_events),
+                self.wait_notify,
+                self.ram,
+                (self.places.place(label), label),
+                usize::from(fds.wait_departure),
+                |handle| {
+                    let _ = sys::notify(handle, 1);
+                },
+            )
+            .expect("exact retained departed WAIT label");
+            if progress.cancel_actor {
+                self.locks.cancel();
+            }
+            fds.wait_departure += 8;
+            self.refresh_wait_timer();
+            return true;
+        }
+        if fds.departed && self.wait_jobs.retains(self.places.place(label), label) {
+            // The sole active attempt may finish after the initial marking pass.
+            fds.wait_departure = 0;
             return true;
         }
         if fds
@@ -1134,14 +1302,27 @@ impl Service<0> for Fs {
         self.maintenance_burst.restart();
         self.legacy_pending = true;
         Self::depart_fields(self.ram, self.locks, self.identities, &mut s.data);
-        if !Self::lock_custody_empty(self.lock_jobs, self.places, &s.data, s.label()) {
+        self.wait_events.poll();
+        if !Self::lock_custody_empty(
+            self.lock_jobs,
+            self.wait_jobs,
+            self.places,
+            &s.data,
+            s.label(),
+        ) {
             self.departures.admit(self.places.place(s.label()));
         }
     }
 
     fn keep_departed(&self, s: &Session<Fds, 0>) -> bool {
         s.data.departed
-            && !Self::lock_custody_empty(self.lock_jobs, self.places, &s.data, s.label())
+            && !Self::lock_custody_empty(
+                self.lock_jobs,
+                self.wait_jobs,
+                self.places,
+                &s.data,
+                s.label(),
+            )
     }
 
     /// A never-used clone retains its paid birth until cleanup finishes.
@@ -1159,7 +1340,8 @@ impl Service<0> for Fs {
         if let Some(i) = self.birth_slot(label) {
             let (_, fds) = self.births[i].as_mut().expect("exact retained birth");
             Self::depart_fields(self.ram, self.locks, self.identities, fds);
-            if !Self::lock_custody_empty(self.lock_jobs, self.places, fds, label) {
+            self.wait_events.poll();
+            if !Self::lock_custody_empty(self.lock_jobs, self.wait_jobs, self.places, fds, label) {
                 self.departures.admit(SESSIONS + i);
                 return;
             }
@@ -1174,6 +1356,20 @@ impl Service<0> for Fs {
         sessions: &mut [Option<Session<Fds, 0>>],
         notice: rt::service::Notice,
     ) {
+        #[cfg(feature = "lifetime-probe")]
+        self.check_fifo_probe(sessions);
+        if notice.source == rt::abi::Source::Timer && notice.label == WAIT_TIMER_LABEL {
+            self.wait_timer_armed = false;
+            if self.wait_pool.count() != 0 {
+                self.wait_events.poll();
+                self.schedule_wait_proof();
+                self.maintenance_burst.restart();
+                self.legacy_pending = true;
+                self.refresh_wait_timer();
+                let _ = sys::notify(&self.channel, 1);
+            }
+            return;
+        }
         if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
             self.maintenance_burst.restart();
             self.legacy_pending = true;
@@ -1192,7 +1388,10 @@ impl Service<0> for Fs {
         match self.lock_dispatch.next_with_requests(
             now,
             self.locks.busy(),
-            self.lock_jobs.has_work(),
+            self.lock_jobs.has_work()
+                || self.wait_jobs.has_work()
+                || self.wait_events.pending()
+                || self.wait_proof_pending(),
             self.lifetimes.is_some(),
         ) {
             LockWork::Actor => {
@@ -1204,7 +1403,59 @@ impl Service<0> for Fs {
                     |token| descriptions.live(token),
                 );
                 if let Some(result) = progress.completed {
+                    if let Some(id) = self.wait_jobs.active() {
+                        if result == Ok(ramfs::locks::actor::Response::Changed) {
+                            let captured =
+                                self.wait_jobs.snapshot(id).expect("exact WAIT capture").0;
+                            self.wait_events.changed(captured.request.inode);
+                        }
+                        let place = usize::from(id.slot()) / ramfs::locks::wait_receipts::SHARE;
+                        let source = sessions
+                            .get(place)
+                            .and_then(Option::as_ref)
+                            .filter(|session| session.label() == id.owner() && session.data.claimed)
+                            .map(|session| &session.data)
+                            .or_else(|| {
+                                self.births
+                                    .get(Self::birth_index(id.owner()))
+                                    .and_then(Option::as_ref)
+                                    .filter(|(label, _)| *label == id.owner())
+                                    .map(|(_, fds)| fds)
+                            });
+                        let finished = ramfs::locks::wait_server::finish(
+                            self.wait_jobs,
+                            self.wait_pool,
+                            self.ram,
+                            result,
+                            source,
+                            |pid| page.is_some_and(|page| page.live(pid)),
+                        )
+                        .expect("exact sole WAIT Actor completion");
+                        if let ramfs::locks::wait_server::Finish::Complete(id) = finished {
+                            self.publish_wait(id);
+                        } else if let ramfs::locks::wait_server::Finish::Sleeping(registration) =
+                            finished
+                        {
+                            self.wait_events
+                                .attach(self.wait_pool, registration)
+                                .expect("paid genuine WAIT inode wake mask");
+                            self.schedule_wait_proof();
+                        }
+                        self.refresh_wait_timer();
+                        self.notify_maintenance();
+                        return;
+                    }
                     let id = self.lock_jobs.active().expect("completed active request");
+                    if result == Ok(ramfs::locks::actor::Response::Changed) {
+                        let captured = self
+                            .lock_jobs
+                            .snapshot(id)
+                            .expect("exact Control capture")
+                            .0;
+                        self.wait_events.changed(captured.request.inode);
+                        #[cfg(feature = "lifetime-probe")]
+                        self.fifo_probe.changed(captured);
+                    }
                     let place = usize::from(id.slot()) / ramfs::locks::jobs::SHARE;
                     let source = sessions
                         .get(place)
@@ -1233,28 +1484,61 @@ impl Service<0> for Fs {
                 return;
             }
             LockWork::Request { cleanup } => {
-                if cleanup {
+                if cleanup && self.wait_proof_pending() {
+                    self.wait_proof_turn = !self.wait_proof_turn;
+                }
+                if self.wait_events.pending() {
+                    self.wait_events
+                        .part(self.wait_jobs, self.wait_pool)
+                        .expect("exact bounded WAIT wake masks");
+                    self.wait_ready_scan = None;
+                    self.wait_ready_scanned = false;
+                } else if cleanup && self.wait_proof_pending() && self.wait_proof_turn {
+                    self.tick_wait_proof(sessions);
+                } else if cleanup {
                     if self.lock_jobs.cleanup_released(&mut self.ram.storage) != 0 {
                         self.maintenance_burst.restart();
                         self.legacy_pending = true;
                     }
                 } else if !self.locks.busy()
-                    && let Some(id) = self.lock_jobs.next_ready()
+                    && !self.fifo_pause_wait()
+                    && self.wait_jobs.has_work()
+                    && (self.wait_request_turn || !self.lock_jobs.has_work())
                 {
-                    let place = usize::from(id.slot()) / ramfs::locks::jobs::SHARE;
-                    let source = sessions
-                        .get(place)
-                        .and_then(Option::as_ref)
-                        .filter(|session| session.label() == id.owner() && session.data.claimed)
-                        .map(|session| &session.data)
-                        .or_else(|| {
-                            self.births
-                                .get(Self::birth_index(id.owner()))
-                                .and_then(Option::as_ref)
-                                .filter(|(label, _)| *label == id.owner())
-                                .map(|(_, fds)| fds)
-                        });
-                    ramfs::locks::server::begin(self.lock_jobs, self.locks, self.ram, id, source);
+                    self.wait_request_turn = false;
+                    if let Some(id) = self.next_wait_ready() {
+                        let place = usize::from(id.slot()) / ramfs::locks::wait_receipts::SHARE;
+                        let source = sessions
+                            .get(place)
+                            .and_then(Option::as_ref)
+                            .filter(|session| session.label() == id.owner() && session.data.claimed)
+                            .map(|session| &session.data)
+                            .or_else(|| {
+                                self.births
+                                    .get(Self::birth_index(id.owner()))
+                                    .and_then(Option::as_ref)
+                                    .filter(|(label, _)| *label == id.owner())
+                                    .map(|(_, fds)| fds)
+                            });
+                        ramfs::locks::wait_server::begin(
+                            self.wait_jobs,
+                            self.locks,
+                            self.ram,
+                            id,
+                            source,
+                        )
+                        .expect("exact queued WAIT attempt");
+                        if self
+                            .wait_jobs
+                            .query(id)
+                            .is_ok_and(|reply| reply.phase == proto_fs::WaitPhase::Complete)
+                        {
+                            self.publish_wait(id);
+                        }
+                    }
+                } else if !self.locks.busy() && !self.fifo_frozen() {
+                    self.wait_request_turn = true;
+                    self.select_control(sessions);
                 }
                 self.notify_maintenance();
                 return;
@@ -1274,6 +1558,9 @@ impl Service<0> for Fs {
                             })
                             .expect("bounded actual OFD place");
                     }
+                }
+                if end == proto_process::RECORDS + ramfs::DESCRIPTIONS {
+                    self.wait_events.poll();
                 }
                 self.notify_maintenance();
                 return;
@@ -1326,13 +1613,25 @@ impl Service<0> for Fs {
                 work = self.cleanup_step(&mut s.data, label);
                 (
                     label,
-                    Self::lock_custody_empty(self.lock_jobs, self.places, &s.data, label),
+                    Self::lock_custody_empty(
+                        self.lock_jobs,
+                        self.wait_jobs,
+                        self.places,
+                        &s.data,
+                        label,
+                    ),
                 )
             } else {
                 let birth = &mut self.births[i - SESSIONS];
                 let (label, mut fds) = birth.take().expect("retained departed birth");
                 work = self.cleanup_step(&mut fds, label);
-                let complete = Self::lock_custody_empty(self.lock_jobs, self.places, &fds, label);
+                let complete = Self::lock_custody_empty(
+                    self.lock_jobs,
+                    self.wait_jobs,
+                    self.places,
+                    &fds,
+                    label,
+                );
                 self.births[i - SESSIONS] = Some((label, fds));
                 (label, complete)
             };
@@ -1647,6 +1946,11 @@ impl Service<0> for Fs {
                         | Method::LockQuery
                         | Method::LockCancel
                         | Method::LockRelease
+                        | Method::WaitStart
+                        | Method::WaitQuery
+                        | Method::WaitArm
+                        | Method::WaitCancel
+                        | Method::WaitRelease
                         | Method::VerifySession
                 )
             )
@@ -1664,6 +1968,18 @@ impl Service<0> for Fs {
             Some(Method::LockStart | Method::LockQuery | Method::LockRelease | Method::LockCancel)
         ) {
             return self.lock_request(&mut s.data, r);
+        }
+        if matches!(
+            Method::from_number(r.method()),
+            Some(
+                Method::WaitStart
+                    | Method::WaitQuery
+                    | Method::WaitCancel
+                    | Method::WaitRelease
+                    | Method::WaitArm
+            )
+        ) {
+            return self.wait_request(&mut s.data, r);
         }
         // Keyed common operations preserve the native lock family's custody.
         if matches!(
@@ -1751,12 +2067,90 @@ impl Service<0> for Fs {
         if proto_fs::is_loaders(r.label()) {
             return status(proto_fs::PERMISSION);
         }
+        #[cfg(feature = "lifetime-probe")]
+        if matches!(
+            Method::from_number(r.method()),
+            Some(Method::Close | Method::CloseExact | Method::CloseEvent)
+        ) {
+            self.fifo_probe.invalidate(r.label());
+        }
         let cleanup = matches!(
             Method::from_number(r.method()),
             Some(Method::Close | Method::CloseExact | Method::CloseEvent | Method::ResolveCancel)
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
+        }
+        #[cfg(feature = "lifetime-probe")]
+        if r.method() == 0xfff2 {
+            return self.fifo_probe_request(&s.data, r);
+        }
+        #[cfg(feature = "lifetime-probe")]
+        if r.method() == 0xfff7 {
+            return self.wait_process_probe_request(&s.data, r);
+        }
+        #[cfg(feature = "lifetime-probe")]
+        if r.method() == 0xfff6 {
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let mut body = r.body();
+            let (Ok(nonce), Ok(target)) = (body.u64(), body.u32()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            if nonce == 0 || body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            let Some(who) = s.data.binding.snapshot_ref() else {
+                return status(proto_fs::PERMISSION);
+            };
+            if !self
+                .lifetimes
+                .as_ref()
+                .is_some_and(|page| page.live(who.pid))
+            {
+                return status(proto_fs::PERMISSION);
+            }
+            let Ok(memory) = sys::process_memory(&self.process) else {
+                return status(proto_fs::PERMISSION);
+            };
+            let free = memory.quota.saturating_sub(memory.used) / 4096;
+            if free < 128 {
+                return status(proto_fs::NO_SPACE);
+            }
+            self.ring_probe.measure_stack();
+            let words = [
+                who.pid,
+                u32::from(
+                    self.lifetimes
+                        .as_ref()
+                        .is_some_and(|page| page.live(target)),
+                ),
+                who.root.pid,
+                who.root.generation,
+                free as u32,
+                self.ring_probe.proved[0],
+                self.ring_probe.proved[1],
+                self.ring_probe.proved[2],
+                self.ring_probe.ticks.min(u64::from(u32::MAX)) as u32,
+                self.ring_probe.visited,
+                self.ring_probe.stack_peak,
+            ];
+            let reply = r.reply();
+            if reply
+                .u32(0)
+                .and_then(|()| reply.u64(nonce))
+                .and_then(|()| reply.u32(target))
+                .is_err()
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            for word in words {
+                if reply.u32(word).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+            }
+            return Answer::Reply(Outgoing::new());
         }
         #[cfg(feature = "lifetime-probe")]
         if r.method() == 0xfff3 {
@@ -2086,6 +2480,7 @@ impl Service<0> for Fs {
                 };
                 match self.ram.close_event(&mut s.data, self.locks, event) {
                     Ok(()) => {
+                        self.wait_events.poll();
                         self.notify_maintenance();
                         Answer::Status(Status::Ok)
                     }
@@ -2301,11 +2696,804 @@ fn generation(index: usize) -> u64 {
     }
 }
 impl Fs {
+    /// FIFO ready selection and prepaid receipt scanning each have their own turn.
+    fn next_wait_ready(&mut self) -> Option<ramfs::locks::wait_receipts::Id> {
+        if self.wait_pool.count() == 0 || self.wait_ready_scanned {
+            self.wait_ready_scanned = false;
+            let id = self.wait_jobs.next_ready()?;
+            if let Some(registration) = self.wait_pool.find(id)
+                && self.wait_pool.snapshot(registration).ok()?.1
+                    == ramfs::locks::waiters::Phase::Ready
+            {
+                self.wait_pool.run(registration).expect("exact ready WAIT");
+            }
+            return Some(id);
+        }
+        let cursor = self
+            .wait_ready_scan
+            .get_or_insert_with(|| self.wait_pool.cursor());
+        let mut chosen = None;
+        let scanned = self.wait_pool.scan(cursor, |token, _, phase| {
+            if chosen.is_none() && phase == ramfs::locks::waiters::Phase::Ready {
+                chosen = Some(token);
+            }
+        });
+        if scanned.is_err() {
+            self.wait_ready_scan = None;
+            return None;
+        }
+        if let Some(registration) = chosen {
+            self.wait_ready_scan = None;
+            self.wait_pool
+                .run(registration)
+                .expect("exact FIFO WAIT attempt");
+            Some(registration.receipt())
+        } else {
+            if cursor.done() {
+                self.wait_ready_scan = None;
+                self.wait_ready_scanned = true;
+            }
+            None
+        }
+    }
+    fn refresh_wait_timer(&mut self) {
+        let pending = self.wait_pool.count() != 0;
+        if pending && !self.wait_timer_armed {
+            let deadline =
+                rt::time::ticks_to_ns(rt::time::now()).saturating_add(WAIT_TIMER_PERIOD_NS);
+            self.wait_timer_armed = sys::timer_set(&self.wait_timer, deadline).is_ok();
+        } else if !pending && self.wait_timer_armed {
+            let _ = sys::timer_cancel(&self.wait_timer);
+            self.wait_timer_armed = false;
+        }
+    }
+    fn publish_wait(&mut self, id: ramfs::locks::wait_receipts::Id) {
+        if let Some(registration) = self.wait_pool.find(id) {
+            self.wait_events
+                .detach(registration)
+                .expect("exact terminal WAIT wake retirement");
+        }
+        self.wait_notify
+            .complete(self.wait_jobs, self.wait_pool, id, |handle| {
+                let _ = sys::notify(handle, 1);
+            })
+            .expect("canonical WAIT before Notify retirement");
+        self.refresh_wait_timer();
+    }
+    /// Positive Proof already retained this exact registration through its gate.
+    fn publish_wait_registration(
+        &mut self,
+        registration: ramfs::locks::waiters::RegistrationToken,
+    ) {
+        self.wait_events
+            .detach(registration)
+            .expect("exact proved WAIT wake retirement");
+        self.wait_notify
+            .complete_registration(self.wait_jobs, self.wait_pool, registration, |handle| {
+                let _ = sys::notify(handle, 1);
+            })
+            .expect("canonical proved WAIT before exact Notify retirement");
+        self.refresh_wait_timer();
+    }
+    fn wait_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        if proto_fs::is_loaders(r.label()) {
+            return status(proto_fs::PERMISSION);
+        }
+        let method = Method::from_number(r.method()).expect("native WAIT method");
+        let arm = method == Method::WaitArm;
+        if (arm && r.handles.len() != 1) || (!arm && !r.handles.is_empty()) {
+            return Answer::Status(Status::BadSize);
+        }
+        let owner = r.label();
+        let place = self.places.place(owner);
+        let result = if method == Method::WaitStart {
+            let wire = match proto_fs::WaitStart::read(r.body()) {
+                Ok(wire) => wire,
+                Err(error) => return Answer::Status(error),
+            };
+            match ramfs::locks::wait_server::replay(self.wait_jobs, place, owner, wire) {
+                Ok(Some(reply)) => Ok(reply),
+                Err(code) => Err(code),
+                Ok(None) => {
+                    if let Err(code) = self.authenticate(fds, owner) {
+                        return status(code);
+                    }
+                    if wire.mode == proto_fs::WaitMode::Pid && !self.register_lifetimes() {
+                        return status(proto_fs::NO_LOCKS);
+                    }
+                    ramfs::locks::wait_server::start(
+                        self.wait_jobs,
+                        self.ram,
+                        fds,
+                        place,
+                        owner,
+                        wire,
+                    )
+                }
+            }
+        } else {
+            let key = match proto_fs::read_wait_key(r.body()) {
+                Ok(key) => key,
+                Err(error) => return Answer::Status(error),
+            };
+            if method == Method::WaitRelease {
+                if let Ok(Some(id)) = self.wait_jobs.occupied(place, owner, key.slot)
+                    && id.key() == key
+                    && self
+                        .wait_jobs
+                        .query(id)
+                        .is_ok_and(|reply| reply.phase == proto_fs::WaitPhase::Complete)
+                {
+                    self.publish_wait(id);
+                }
+                let result =
+                    ramfs::locks::wait_server::release(self.wait_jobs, self.ram, place, owner, key);
+                self.notify_maintenance();
+                return match result {
+                    Ok(()) => Answer::Status(Status::Ok),
+                    Err(code) => status(code),
+                };
+            }
+            if arm {
+                if !matches!(r.handles.info(0), Some((rt::abi::ObjectKind::Channel, rights))
+                    if rights == (Rights::NOTIFY | Rights::TRANSFER))
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                let handle = match r.handles.take::<Channel>(0) {
+                    Ok(handle) => handle,
+                    Err(error) => return Answer::Status(Status::Kernel(error)),
+                };
+                match self.wait_jobs.occupied(place, owner, key.slot) {
+                    Ok(Some(id)) if id.key() == key => {
+                        self.wait_notify
+                            .arm(self.wait_jobs, self.wait_pool, id, handle)
+                    }
+                    Ok(Some(id)) => Err(if key.generation <= id.key().generation {
+                        proto_fs::OPEN_RETIRED
+                    } else {
+                        proto_fs::JOBS_FULL
+                    }),
+                    Ok(None) => Err(
+                        if self.wait_jobs.is_retired(place, owner, key).unwrap_or(true) {
+                            proto_fs::OPEN_RETIRED
+                        } else {
+                            proto_fs::NO_ENTRY
+                        },
+                    ),
+                    Err(code) => Err(code),
+                }
+            } else if method == Method::WaitCancel {
+                match ramfs::locks::wait_server::cancel(self.wait_jobs, place, owner, key) {
+                    Ok((reply, active)) => {
+                        if active {
+                            self.locks.cancel();
+                        }
+                        if reply.phase == proto_fs::WaitPhase::Complete
+                            && let Ok(Some(id)) = self.wait_jobs.occupied(place, owner, key.slot)
+                        {
+                            self.publish_wait(id);
+                        }
+                        Ok(reply)
+                    }
+                    Err(code) => Err(code),
+                }
+            } else {
+                ramfs::locks::wait_server::query(self.wait_jobs, place, owner, key)
+            }
+        };
+        self.notify_maintenance();
+        match result {
+            Ok(reply) => match reply.write(r.reply()) {
+                Ok(()) => Answer::Reply(Outgoing::new()),
+                Err(error) => Answer::Status(error),
+            },
+            Err(code) => status(code),
+        }
+    }
+    /// Retain only the full paid Control key while the finite read-only selector
+    /// runs; its credit survives internal cancellation and another queue turn.
+    fn select_control(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        let id = if let Some(id) = self.wait_selection {
+            id
+        } else {
+            #[cfg(feature = "lifetime-probe")]
+            let chosen = if self.fifo_probe.phase == fifo_probe::Phase::Selecting {
+                self.fifo_probe.control
+            } else {
+                None
+            };
+            #[cfg(not(feature = "lifetime-probe"))]
+            let chosen = None;
+            let Some(id) = chosen.or_else(|| self.lock_jobs.next_ready()) else {
+                return;
+            };
+            let Ok((captured, phase, cancelling)) = self.lock_jobs.snapshot(id) else {
+                return;
+            };
+            if phase != ramfs::locks::jobs::Phase::Queued || cancelling {
+                return;
+            }
+            if self
+                .wait_selector
+                .begin(id, captured, self.wait_pool, self.lock_jobs)
+                .is_err()
+            {
+                return;
+            }
+            self.wait_selection = Some(id);
+            id
+        };
+        if !self
+            .lock_jobs
+            .snapshot(id)
+            .is_ok_and(|(_, phase, cancelling)| {
+                phase == ramfs::locks::jobs::Phase::Queued && !cancelling
+            })
+        {
+            self.wait_selection = None;
+            return;
+        }
+        let page = self.lifetimes.as_ref();
+        let locks = &*self.locks;
+        let (_, descriptions) = self.ram.lock_parts();
+        let progress = locks.select_part(
+            self.wait_selector,
+            self.wait_pool,
+            self.wait_jobs,
+            self.lock_jobs,
+            |pid| page.is_some_and(|page| page.live(pid)) && locks.pid_visible(pid),
+            |ofd| descriptions.live(ofd),
+        );
+        #[cfg(feature = "lifetime-probe")]
+        self.fifo_probe.visit(id, progress.visited);
+        let Some(decision) = progress.decision else {
+            return;
+        };
+        self.wait_selection = None;
+        if let WaitDecision::Wait(candidate) = decision {
+            let receipt = candidate.registration.receipt();
+            // Final full custody/capture gate; actual fd authority is checked by begin.
+            if self
+                .wait_pool
+                .snapshot(candidate.registration)
+                .is_ok_and(|(_, phase)| {
+                    matches!(
+                        phase,
+                        ramfs::locks::waiters::Phase::Ready
+                            | ramfs::locks::waiters::Phase::Sleeping
+                    )
+                })
+                && self
+                    .wait_jobs
+                    .snapshot(receipt)
+                    .is_ok_and(|(captured, phase, cancelling)| {
+                        captured == candidate.captured
+                            && !cancelling
+                            && matches!(
+                                phase,
+                                ramfs::locks::wait_receipts::Phase::Ready
+                                    | ramfs::locks::wait_receipts::Phase::Sleeping
+                            )
+                    })
+            {
+                if self.wait_jobs.snapshot(receipt).is_ok_and(|(_, phase, _)| {
+                    phase == ramfs::locks::wait_receipts::Phase::Sleeping
+                }) {
+                    self.wait_jobs
+                        .ready(receipt)
+                        .expect("exact eligible sleeping receipt");
+                }
+                self.wait_pool
+                    .ready(candidate.registration)
+                    .expect("exact eligible registration");
+                self.wait_pool
+                    .run(candidate.registration)
+                    .expect("eligible registration ready");
+                self.begin_wait(receipt, sessions);
+                #[cfg(feature = "lifetime-probe")]
+                self.fifo_probe.finish(id, Some(candidate.registration));
+                return;
+            }
+        }
+        #[cfg(feature = "lifetime-probe")]
+        self.fifo_probe.finish(id, None);
+        let place = usize::from(id.slot()) / ramfs::locks::jobs::SHARE;
+        let source = sessions
+            .get(place)
+            .and_then(Option::as_ref)
+            .filter(|session| session.label() == id.owner() && session.data.claimed)
+            .map(|session| &session.data)
+            .or_else(|| {
+                self.births
+                    .get(Self::birth_index(id.owner()))
+                    .and_then(Option::as_ref)
+                    .filter(|(label, _)| *label == id.owner())
+                    .map(|(_, fds)| fds)
+            });
+        ramfs::locks::server::begin(self.lock_jobs, self.locks, self.ram, id, source);
+    }
+    fn begin_wait(
+        &mut self,
+        id: ramfs::locks::wait_receipts::Id,
+        sessions: &[Option<Session<Fds, 0>>],
+    ) {
+        let place = usize::from(id.slot()) / ramfs::locks::wait_receipts::SHARE;
+        let source = sessions
+            .get(place)
+            .and_then(Option::as_ref)
+            .filter(|session| session.label() == id.owner() && session.data.claimed)
+            .map(|session| &session.data)
+            .or_else(|| {
+                self.births
+                    .get(Self::birth_index(id.owner()))
+                    .and_then(Option::as_ref)
+                    .filter(|(label, _)| *label == id.owner())
+                    .map(|(_, fds)| fds)
+            });
+        ramfs::locks::wait_server::begin(self.wait_jobs, self.locks, self.ram, id, source)
+            .expect("exact queued WAIT attempt");
+        if self
+            .wait_jobs
+            .query(id)
+            .is_ok_and(|reply| reply.phase == proto_fs::WaitPhase::Complete)
+        {
+            self.publish_wait(id);
+        }
+    }
+    /// Schedule one finite optional episode. Events coalesce; completion itself
+    /// never schedules another episode or self-notifies.
+    fn schedule_wait_proof(&mut self) {
+        if self.wait_proof_disabled
+            || self.wait_proof_active
+            || self.wait_proof_scan.is_some()
+            || self.wait_proof_choice.is_some()
+            || self.wait_pool.count() == 0
+        {
+            return;
+        }
+        self.wait_proof_scan = Some(self.wait_pool.cursor());
+        self.wait_proof_scan_remaining = ramfs::locks::waiters::CAPACITY as u8;
+    }
+    fn wait_proof_pending(&self) -> bool {
+        self.wait_proof_active || self.wait_proof_scan.is_some() || self.wait_proof_choice.is_some()
+    }
+    /// Caller gives this helper its own maintenance turn; never follow an
+    /// eight-object Actor/Reader/Selector portion in the same turn.
+    fn tick_wait_proof(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        #[cfg(feature = "lifetime-probe")]
+        let began = rt::time::now();
+        self.tick_wait_proof_part(sessions);
+        #[cfg(feature = "lifetime-probe")]
+        self.ring_probe
+            .part(rt::time::now().saturating_sub(began), 0);
+    }
+    fn tick_wait_proof_part(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        if self.wait_proof_active {
+            let page = self.lifetimes.as_ref();
+            let (storage, descriptions) = self.ram.lock_parts();
+            let locks = &*self.locks;
+            let progress = self.wait_proof.step(
+                self.wait_jobs,
+                self.wait_pool,
+                self.locks,
+                storage,
+                |pid| page.is_some_and(|page| page.live(pid)) && locks.pid_visible(pid),
+                |ofd| descriptions.live(ofd),
+            );
+            #[cfg(feature = "lifetime-probe")]
+            self.ring_probe.part(0, progress.visited);
+            let Some(outcome) = progress.outcome else {
+                return;
+            };
+            self.wait_proof_active = false;
+            if outcome.verdict == ramfs::locks::deadlock::Verdict::Deadlock
+                && self.wait_proof_source_live(sessions, outcome)
+            {
+                self.wait_jobs
+                    .complete(
+                        outcome.candidate,
+                        proto_fs::WaitReply {
+                            phase: proto_fs::WaitPhase::Complete,
+                            result: proto_fs::LOCK_DEADLOCK,
+                        },
+                    )
+                    .expect("exact pending proof candidate canonical completion");
+                #[cfg(feature = "lifetime-probe")]
+                if let Some(snapshot) = self.wait_proof.probe_snapshot() {
+                    self.ring_probe.proved(snapshot);
+                }
+                self.publish_wait_registration(outcome.registration);
+            }
+            return;
+        }
+        if let Some(cursor) = &mut self.wait_proof_scan {
+            let queue = &*self.wait_jobs;
+            let next = self.wait_proof_next;
+            let choice = &mut self.wait_proof_choice;
+            let scanned = self.wait_pool.scan(cursor, |token, _, phase| {
+                if phase != ramfs::locks::waiters::Phase::Sleeping {
+                    return;
+                }
+                let Ok((captured, phase, cancelling)) = queue.snapshot(token.receipt()) else {
+                    return;
+                };
+                if phase != ramfs::locks::wait_receipts::Phase::Sleeping
+                    || cancelling
+                    || !matches!(captured.request.owner, ramfs::locks::Owner::Process(_))
+                {
+                    return;
+                }
+                let rank = ((token.slot() + ramfs::locks::waiters::CAPACITY - usize::from(next))
+                    % ramfs::locks::waiters::CAPACITY) as u8;
+                if choice.as_ref().is_none_or(|old| rank < old.0) {
+                    *choice = Some((rank, token, captured));
+                }
+            });
+            match scanned {
+                Err(_) => {
+                    self.wait_proof_scan = None;
+                    self.wait_proof_choice = None;
+                }
+                Ok(visited) => {
+                    self.wait_proof_scan_remaining =
+                        self.wait_proof_scan_remaining.saturating_sub(visited as u8);
+                    if cursor.done() || self.wait_proof_scan_remaining == 0 {
+                        self.wait_proof_scan = None;
+                    }
+                }
+            }
+            return;
+        }
+        let Some((_, token, captured)) = self.wait_proof_choice.take() else {
+            return;
+        };
+        self.wait_proof_next = ((token.slot() + 1) % ramfs::locks::waiters::CAPACITY) as u8;
+        let Some(serial) = self.wait_proof_serial.checked_add(1) else {
+            self.wait_proof_disabled = true;
+            return;
+        };
+        self.wait_proof_serial = serial;
+        let receipt = token.receipt();
+        self.wait_proof_active = self.wait_proof.start(
+            self.wait_jobs,
+            self.wait_pool,
+            token,
+            captured,
+            ramfs::locks::deadlock::Scope {
+                owner: receipt.owner(),
+                key: receipt.key(),
+                scan: serial,
+            },
+        );
+    }
+    /// A proof spans service turns; recheck exact local and genuine RAM source
+    /// authority immediately before publishing an optional terminal error.
+    fn wait_proof_source_live(
+        &self,
+        sessions: &[Option<Session<Fds, 0>>],
+        outcome: ramfs::locks::wait_proof::Outcome,
+    ) -> bool {
+        let id = outcome.candidate;
+        if outcome
+            .sleeping_registration(self.wait_jobs, self.wait_pool)
+            .is_none()
+        {
+            return false;
+        }
+        let ramfs::locks::Owner::Process(pid) = outcome.captured.request.owner else {
+            return false;
+        };
+        if !self.lifetimes.as_ref().is_some_and(|page| page.live(pid))
+            || !self.locks.pid_visible(pid)
+        {
+            return false;
+        }
+        let place = usize::from(id.slot()) / ramfs::locks::wait_receipts::SHARE;
+        let source = sessions
+            .get(place)
+            .and_then(Option::as_ref)
+            .filter(|session| session.label() == id.owner() && session.data.claimed)
+            .map(|session| &session.data)
+            .or_else(|| {
+                self.births
+                    .get(Self::birth_index(id.owner()))
+                    .and_then(Option::as_ref)
+                    .filter(|(label, _)| *label == id.owner())
+                    .map(|(_, fds)| fds)
+            });
+        source
+            .filter(|fds| !fds.departed)
+            .and_then(|fds| self.ram.live_description(fds, outcome.captured.source).ok())
+            .is_some_and(|(inode, _)| inode == outcome.captured.request.inode)
+    }
+    fn fifo_frozen(&self) -> bool {
+        #[cfg(feature = "lifetime-probe")]
+        {
+            self.fifo_probe.frozen()
+        }
+        #[cfg(not(feature = "lifetime-probe"))]
+        {
+            false
+        }
+    }
+    fn fifo_pause_wait(&self) -> bool {
+        #[cfg(feature = "lifetime-probe")]
+        {
+            self.fifo_probe.pause_wait()
+        }
+        #[cfg(not(feature = "lifetime-probe"))]
+        {
+            false
+        }
+    }
+    #[cfg(feature = "lifetime-probe")]
+    fn check_fifo_probe(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        self.fifo_probe
+            .expire(rt::time::ticks_to_ns(rt::time::now()));
+        if self.fifo_probe.active()
+            && let Some(scope) = self.fifo_probe.scope
+        {
+            let place = self.places.place(scope.owner);
+            let valid = sessions
+                .get(place)
+                .and_then(Option::as_ref)
+                .filter(|s| s.label() == scope.owner && s.data.claimed)
+                .is_some_and(|s| {
+                    self.ram
+                        .live_description(&s.data, scope.source)
+                        .is_ok_and(|(inode, _)| inode == scope.inode)
+                });
+            if !valid {
+                self.fifo_probe.invalidate(scope.owner);
+            }
+        }
+    }
+    #[cfg(feature = "lifetime-probe")]
+    fn wait_process_probe_request(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
+        use ramfs::locks::{Owner, wait_receipts::Id, waiters::Phase};
+        if !r.handles.is_empty() || fds.binding.snapshot_ref().is_none() {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut body = r.body();
+        let (Ok(action), Ok(nonce)) = (body.u32(), body.u64()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        #[cfg(feature = "steps")]
+        if action == 63 && nonce == 32 && body.left() == 0 {
+            return rt::service::step_snapshot(r);
+        }
+        rt::service::step_detail(32);
+        let (Ok(packed), Ok(generation), Ok(pid), Ok(first)) =
+            (body.u32(), body.u64(), body.u32(), body.u32())
+        else {
+            return Answer::Status(Status::BadSize);
+        };
+        if nonce == 0
+            || pid == 0
+            || generation == 0
+            || !matches!(first, 0 | 8)
+            || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+        {
+            return status(proto_fs::INVALID_ARGUMENT);
+        }
+        let exact = match action {
+            1 => None,
+            2 => {
+                let (Ok(owner), Ok(slot), Ok(generation)) = (body.u64(), body.u32(), body.u64())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Some(place) = ramfs::places::Places::probe_place(owner) else {
+                    return status(proto_fs::INVALID_ARGUMENT);
+                };
+                match Id::new(place, owner, proto_fs::WaitKey { slot, generation }) {
+                    Ok(id) => Some(id),
+                    Err(code) => return status(code),
+                }
+            }
+            _ => return status(proto_fs::INVALID_ARGUMENT),
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let description = proto_fs::DataDescription { packed, generation };
+        let source = ramfs::TentativeOpen {
+            fd: description.fd(),
+            description: Token {
+                slot: description.slot() as u16,
+                generation,
+            },
+        };
+        let inode = match self.ram.live_description(fds, source) {
+            Ok((inode, _)) => inode,
+            Err(code) => return status(code),
+        };
+        if !self.register_lifetimes()
+            || exact.is_none() && !self.lifetimes.as_ref().is_some_and(|page| page.live(pid))
+        {
+            return status(proto_fs::PERMISSION);
+        }
+        let queue = &*self.wait_jobs;
+        let mut found = None;
+        let mut registration = u32::MAX;
+        if let Some(id) = exact
+            && let Ok((captured, _, _)) = queue.snapshot(id)
+        {
+            if captured.request.inode != inode || captured.request.owner != Owner::Process(pid) {
+                return status(proto_fs::PERMISSION);
+            }
+            found = Some(id);
+        }
+        let scanned = self
+            .wait_pool
+            .probe_part(first as usize, |token, input, phase| {
+                let id = token.receipt();
+                if let Some(exact) = exact {
+                    if id == exact {
+                        found = Some(id);
+                        registration = token.slot() as u32;
+                    }
+                } else if input.inode == inode
+                    && phase == Phase::Sleeping
+                    && queue
+                        .snapshot(id)
+                        .is_ok_and(|(captured, phase, cancelling)| {
+                            captured.request.inode == inode
+                                && captured.request.owner == Owner::Process(pid)
+                                && phase == ramfs::locks::wait_receipts::Phase::Sleeping
+                                && !cancelling
+                        })
+                {
+                    found = Some(id);
+                    registration = token.slot() as u32;
+                }
+            });
+        let visited = match scanned {
+            Ok(visited) => visited,
+            Err(code) => return status(code),
+        };
+        let (owner, slot, generation) = found.map_or((0, 0, 0), |id| {
+            (id.owner(), id.key().slot, id.key().generation)
+        });
+        let reply = r.reply();
+        let result = (|| {
+            reply.u32(0)?;
+            reply.u64(nonce)?;
+            reply.u32(pid)?;
+            reply.u32(visited as u32)?;
+            reply.u32(u32::from(found.is_some()))?;
+            reply.u64(owner)?;
+            reply.u32(slot)?;
+            reply.u64(generation)?;
+            reply.u32(if found.is_some() { registration } else { 0 })
+        })();
+        match result {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(code) => Answer::Status(code),
+        }
+    }
+    #[cfg(feature = "lifetime-probe")]
+    fn fifo_probe_request(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty() || fds.binding.snapshot_ref().is_none() {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut body = r.body();
+        let (Ok(action), Ok(nonce)) = (body.u32(), body.u64()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        #[cfg(feature = "steps")]
+        if action == 63 && nonce == 16 && body.left() == 0 {
+            return rt::service::step_snapshot(r);
+        }
+        rt::service::step_detail(16);
+        if action == 1 {
+            let (Ok(packed), Ok(generation), Ok(holder)) = (body.u32(), body.u64(), body.u32())
+            else {
+                return Answer::Status(Status::BadSize);
+            };
+            if body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            if nonce == 0
+                || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+            {
+                return status(proto_fs::INVALID_ARGUMENT);
+            }
+            let source = ramfs::TentativeOpen {
+                fd: proto_fs::DataDescription { packed, generation }.fd(),
+                description: Token {
+                    slot: proto_fs::DataDescription { packed, generation }.slot() as u16,
+                    generation,
+                },
+            };
+            let inode = match self.ram.live_description(fds, source) {
+                Ok((inode, _)) => inode,
+                Err(code) => return status(code),
+            };
+            if !self.register_lifetimes()
+                || !self
+                    .lifetimes
+                    .as_ref()
+                    .is_some_and(|page| page.live(holder))
+            {
+                return status(proto_fs::PERMISSION);
+            }
+            if self.locks.busy() || self.lock_jobs.has_work() {
+                return status(proto_fs::RESOLVING);
+            }
+            if let Err(code) = self.fifo_probe.arm(
+                fifo_probe::Scope {
+                    owner: r.label(),
+                    source,
+                    inode,
+                    holder,
+                },
+                nonce,
+                rt::time::ticks_to_ns(rt::time::now()),
+            ) {
+                return status(code);
+            }
+            if let Err(error) = sys::timer_set(&self.wait_timer, self.fifo_probe.deadline) {
+                self.fifo_probe.invalidate(r.label());
+                return Answer::Status(Status::Kernel(error));
+            }
+            self.wait_timer_armed = true;
+            Answer::Status(Status::Ok)
+        } else if action == 2
+            && body.finish().is_ok()
+            && self.fifo_probe.scope.is_some_and(|s| s.owner == r.label())
+            && self.fifo_probe.nonce == nonce
+        {
+            self.fifo_probe
+                .expire(rt::time::ticks_to_ns(rt::time::now()));
+            let reply = r.reply();
+            let outcome = (|| {
+                reply.u32(0)?;
+                reply.u32(self.fifo_probe.phase as u32)?;
+                reply.u64(nonce)?;
+                reply.u32(self.fifo_probe.visited)?;
+                reply.u32(0)?;
+                if let Some(id) = self.fifo_probe.control {
+                    reply.u64(id.owner())?;
+                    reply.u32(id.key().slot)?;
+                    reply.u64(id.key().generation)?;
+                } else {
+                    reply.u64(0)?;
+                    reply.u32(0)?;
+                    reply.u64(0)?;
+                }
+                if let Some(token) = self.fifo_probe.selected {
+                    let id = token.receipt();
+                    reply.u32(token.slot() as u32)?;
+                    reply.u64(id.owner())?;
+                    reply.u32(id.key().slot)?;
+                    reply.u64(id.key().generation)?;
+                } else {
+                    reply.u32(u32::MAX)?;
+                    reply.u64(0)?;
+                    reply.u32(0)?;
+                    reply.u64(0)?;
+                }
+                Ok::<(), Status>(())
+            })();
+            match outcome {
+                Ok(()) => Answer::Reply(Outgoing::new()),
+                Err(error) => Answer::Status(error),
+            }
+        } else {
+            Answer::Status(Status::BadSize)
+        }
+    }
     fn notify_maintenance(&self) {
         if self.legacy_pending
-            || self
-                .lock_dispatch
-                .pending(self.locks.busy() || self.lock_jobs.has_work())
+            || self.wait_events.pending()
+            || self.wait_proof_pending()
+            || self.lock_dispatch.pending(
+                self.locks.busy()
+                    || (!self.fifo_frozen()
+                        && (self.lock_jobs.has_work() || self.wait_jobs.has_work())),
+            )
         {
             let _ = sys::notify(&self.channel, 1);
         }
@@ -2459,6 +3647,7 @@ impl Fs {
         fds.binding = Binding::Cleanup;
         fds.departed = true;
         fds.lock_departure = 0;
+        fds.wait_departure = 0;
     }
 
     fn drop_identity(&mut self, fds: &mut Fds) {
@@ -3470,7 +4659,23 @@ impl Fs {
                     if self.common_control_busy(fds, owner, wire.key.slot) {
                         return status(proto_fs::JOBS_FULL);
                     }
-                    ramfs::locks::server::start(self.lock_jobs, self.ram, fds, place, owner, wire)
+                    let accepted = ramfs::locks::server::start(
+                        self.lock_jobs,
+                        self.ram,
+                        fds,
+                        place,
+                        owner,
+                        wire,
+                    );
+                    #[cfg(feature = "lifetime-probe")]
+                    if accepted.is_ok()
+                        && wire.command == proto_fs::LockCommand::SetPid
+                        && let Ok(Some(id)) = self.lock_jobs.occupied(place, owner, wire.key.slot)
+                        && let Ok((captured, _, _)) = self.lock_jobs.snapshot(id)
+                    {
+                        self.fifo_probe.accepted(id, captured);
+                    }
+                    accepted
                 }
             }
         } else {

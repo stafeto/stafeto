@@ -13,14 +13,18 @@ pub mod allocation;
 pub mod change;
 pub mod clock;
 mod close_driver;
+mod drain_driver;
 #[cfg(feature = "close-probe")]
 pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;
 pub mod fork;
 pub mod loader_probe;
 mod lock_driver;
+mod wait_lock_driver;
 #[cfg(feature = "lock-probe")]
 pub use lock_driver::{Probe as LockProbe, probe_hook as probe_lock_hook};
+#[cfg(feature = "wait-probe")]
+pub use wait_lock_driver::{Probe as WaitProbe, probe_hook as probe_wait_hook};
 pub mod lock_fields;
 pub mod long;
 pub mod metadata;
@@ -40,18 +44,52 @@ pub mod wait;
 use constants::*;
 use core::ffi::{c_char, c_int};
 
-/// Execute a nonblocking advisory lock command with copied caller fields.
+/// Execute an advisory lock command with copied caller fields.
 ///
 /// # Safety
 /// `pointer` names readable flock fields and writable fields for a successful GET.
 pub unsafe fn file_lock(fd: c_int, command: c_int, pointer: *mut u8) -> Result<c_int, c_int> {
-    let fd = u32::try_from(fd).map_err(|_| constants::EBADF)?;
-    shared::with_fd(fd, |files| files.lock_source(fd).map(|_| ()).map_err(error))?;
-    // SAFETY: the calling platform supplies flock fields for this invocation.
-    let input = unsafe { lock_fields::Input::read(command, pointer) }?;
-    let outcome = lock_driver::operation(fd, input);
-    // SAFETY: successful GET writes fields only in the same active invocation.
-    unsafe { input.finish(pointer, outcome) }
+    let waiting = matches!(command, 7 | 38);
+    let point = waiting.then(threads::cancel::Point::begin);
+    let result = (|| {
+        let fd = u32::try_from(fd).map_err(|_| constants::EBADF)?;
+        shared::with_fd(fd, |files| files.lock_source(fd).map(|_| ()).map_err(error))?;
+        // SAFETY: the calling platform supplies flock fields for this invocation.
+        let input = unsafe { lock_fields::Input::read(command, pointer) }?;
+        if waiting && input.kind != proto_fs::LockKind::Unlock {
+            let reply = wait_lock_driver::operation(
+                fd,
+                posix_fs::wait::Input {
+                    mode: if input.command.ofd() {
+                        proto_fs::WaitMode::Ofd
+                    } else {
+                        proto_fs::WaitMode::Pid
+                    },
+                    kind: input.kind,
+                    whence: input.whence,
+                    start: input.start,
+                    length: input.length,
+                    pid: input.pid,
+                },
+            )?;
+            return if reply.phase == proto_fs::WaitPhase::Complete && reply.result == 0 {
+                Ok(0)
+            } else {
+                Err(constants::EIO)
+            };
+        }
+        let outcome = lock_driver::operation(fd, input);
+        // SAFETY: successful GET writes fields only in the same active invocation.
+        unsafe { input.finish(pointer, outcome) }
+    })();
+    if let Some(point) = point {
+        if result.is_ok() {
+            point.end();
+        } else {
+            point.finish();
+        }
+    }
+    result
 }
 use core::sync::atomic::{AtomicU8, Ordering};
 use posix_fs::{DescriptorFlags, FsError, SeekFrom};

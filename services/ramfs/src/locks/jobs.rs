@@ -47,7 +47,11 @@ struct Job {
     result: LockReply,
     releasing: bool,
     cancel_requested: bool,
+    /// One FIFO WAIT attempt belongs to this full paid Control custody.
+    wait_attempt_spent: bool,
 }
+const _: () = assert!(core::mem::size_of::<Job>() == 248);
+
 impl Job {
     fn id(&self, slot: usize) -> Id {
         Id {
@@ -66,6 +70,8 @@ pub struct Queue {
     work: u16,
     held: u16,
 }
+const _: () = assert!(core::mem::size_of::<Queue>() == 1_269_808);
+
 impl Queue {
     pub const fn new() -> Self {
         Self {
@@ -222,6 +228,7 @@ impl Queue {
             },
             releasing: false,
             cancel_requested: false,
+            wait_attempt_spent: false,
         };
         let id = job.id(slot);
         assert!(self.jobs[slot].is_none());
@@ -233,6 +240,18 @@ impl Queue {
     pub fn snapshot(&self, id: Id) -> Result<(Captured, Phase, bool), u32> {
         let job = self.job(id)?;
         Ok((job.captured, job.phase, job.releasing))
+    }
+    pub fn wait_attempt_spent(&self, id: Id) -> Result<bool, u32> {
+        Ok(self.job(id)?.wait_attempt_spent)
+    }
+    /// Consume at most once; internal Actor cancellation preserves this debt.
+    pub fn spend_wait_attempt(&mut self, id: Id) -> Result<bool, u32> {
+        let job = self.job_mut(id)?;
+        if job.wait_attempt_spent {
+            return Ok(false);
+        }
+        job.wait_attempt_spent = true;
+        Ok(true)
     }
     pub fn query(&self, id: Id) -> Result<LockReply, u32> {
         Ok(self.job(id)?.result)
@@ -842,3 +861,15 @@ mod tests {
 #[cfg(test)]
 #[path = "internal_cancel_tests.rs"]
 mod internal_cancel_tests;
+
+#[cfg(test)]
+#[test]
+fn wait_credit_fits_existing_job_padding() {
+    std::println!(
+        "Control Job {} Queue {}",
+        core::mem::size_of::<Job>(),
+        core::mem::size_of::<Queue>()
+    );
+    assert_eq!(core::mem::size_of::<Job>(), 248);
+    assert_eq!(core::mem::size_of::<Queue>(), 1269808);
+}

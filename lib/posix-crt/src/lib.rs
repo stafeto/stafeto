@@ -34,6 +34,7 @@ unsafe extern "C" {
     /// the offsets of its words `outer`, `owed` and `thread`, as relibc's
     /// long jump has them.
     fn relibc_stafeto_entries_layout_v2(out: *mut usize);
+    fn relibc_stafeto_entries_layout_v3(out: *mut usize);
     /// The process's umask (posix-platform).
     fn stafeto_umask(mask: u32) -> u32;
     /// The ELF header, which lld maps with the read-only data.
@@ -117,6 +118,23 @@ unsafe fn enter_relibc(stack: *const usize) -> ! {
         ]
     {
         rt::println!("POSIX startup: relibc places the entry record elsewhere");
+        rt::sys::process_exit(127);
+    }
+    let mut jump_layout = [0usize; 7];
+    // SAFETY: the matching platform interface fills seven geometry words.
+    unsafe { relibc_stafeto_entries_layout_v3(jump_layout.as_mut_ptr()) };
+    if jump_layout
+        != [
+            layout[0],
+            layout[1],
+            layout[2],
+            layout[3],
+            rt::abi::Call::ThreadUpcallControl.number() as usize,
+            rt::abi::UpcallControl::Defer.raw() as usize,
+            rt::abi::UpcallControl::Resume.raw() as usize,
+        ]
+    {
+        rt::println!("POSIX startup: relibc jump control differs");
         rt::sys::process_exit(127);
     }
     // relibc builds the TCB and the static TLS only when the register is

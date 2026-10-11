@@ -221,6 +221,7 @@ impl Service for Live {
         self.full_repeats = self.full_repeats.saturating_add(1);
         // What this process left behind may be what fills the table.
         collect(self.owner, self.here, Some(self.token), true);
+        crate::wait_lock_driver::collect(self.owner, self.here, None, true);
         // The pause grows from one millisecond to sixteen (a sleep of the
         // timer of the thread, outside the deferral of signals: a handler
         // that runs ends the sleep, the request goes again either way). The
@@ -319,6 +320,8 @@ pub(crate) fn take_place<R>(
     loop {
         collect(Some(owner), here, None, true);
         let lock_pending = collect_lock(Some(owner), here, None, true);
+        crate::wait_lock_driver::collect(Some(owner), here, None, true);
+        crate::drain_driver::collect(Some(owner), here, None, true);
         let step = crate::shared::with_files(|files| match files.job_place(owner) {
             // Every job kind has custody separate from ordinary I/O holds.
             JobPlace::Free => match begin(files) {
@@ -449,6 +452,7 @@ pub(crate) fn detach(owner: u64) -> bool {
     crate::shared::try_with_files(|files| {
         while files.abandon_change_owner(owner).is_some() {}
         while files.abandon_lock_owner(owner).is_some() {}
+        while files.abandon_wait_owner(owner).is_some() {}
         Ok(())
     })
     .is_ok()
@@ -459,6 +463,7 @@ pub(crate) fn detach(owner: u64) -> bool {
 pub(crate) fn help() {
     collect(None, Frame::main(0), None, false);
     collect_lock(None, Frame::main(0), None, false);
+    crate::wait_lock_driver::collect(None, Frame::main(0), None, false);
 }
 
 /// The frame of the caller for an operation that takes a place: the same

@@ -266,6 +266,7 @@ static sigjmp_buf drain_admission_jump;
 static void on_drain_signal(int signal) {
     (void)signal;
     ++drain_signal_count;
+    if (drain_admission_jumping == 2) pthread_exit((void *)0x225);
     if (drain_admission_jumping) siglongjmp(drain_admission_jump, 1);
 }
 struct drain_signal_run { pthread_t to; int restart; };
@@ -410,6 +411,89 @@ static int drain_admission(void) {
     return 0;
 }
 
+/* Exact paid custody must survive a true jump and a deeper subsequent call. */
+extern int stafeto_probe_resident_drains(int waiting);
+extern int stafeto_probe_drain_cleanup_rotation(void);
+static __attribute__((noinline)) int deeper_drain(int depth) {
+    volatile int keep = depth;
+    int result = depth ? deeper_drain(depth - 1) : tcdrain(1);
+    return result + (keep == -1);
+}
+static int wait_for_admitted_drain(void) {
+    for (int turn = 0; turn < 500; ++turn) {
+        if (stafeto_probe_resident_drains(1) == 1) return 0;
+        pause_ms(1);
+    }
+    return 1;
+}
+static void *jump_admitted_drain(void *argument) {
+    pthread_t *main = argument;
+    if (wait_for_admitted_drain()) return (void *)1;
+    return (void *)(long)pthread_kill(*main, SIGUSR1);
+}
+static void *departing_admitted_drain(void *argument) {
+    if (argument && pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL)) return (void *)1;
+    return (void *)(long)(deeper_drain(8) == 0 ? 2 : 3);
+}
+static int drain_abandonment(void) {
+    struct sigaction action = {0}, previous;
+    action.sa_handler = on_drain_signal;
+    CHECK(sigemptyset(&action.sa_mask) == 0);
+    CHECK(sigaction(SIGUSR1, &action, &previous) == 0);
+    CHECK(stafeto_probe_resident_drains(0) == 0);
+    for (volatile int pass = 0; pass < 40; ++pass) {
+        CHECK(tcflow(1, TCOOFF) == 0);
+        CHECK(PUT(1, "posix-tty: jump-held drain prefix\n"));
+        pthread_t main = pthread_self(), sender;
+        CHECK(pthread_create(&sender, NULL, jump_admitted_drain, &main) == 0);
+        if (sigsetjmp(drain_admission_jump, 1) == 0) {
+            drain_admission_jumping = 1;
+            (void)deeper_drain(8);
+            drain_admission_jumping = 0;
+            CHECK(0);
+        }
+        drain_admission_jumping = 0;
+        void *sent;
+        CHECK(pthread_join(sender, &sent) == 0 && sent == NULL);
+        if (pass == 0) {
+            CHECK(stafeto_probe_drain_cleanup_rotation() == 0);
+            say("posix-tty: handle-limit WAIT cleanup permits later READY local release\n");
+        }
+        CHECK(tcflow(1, TCOON) == 0);
+        /* The new SP is deeper than the abandoned owner. Ordinary frame-only
+         * reclamation cannot establish that the old call was abandoned. */
+        CHECK(deeper_drain(16) == 0);
+        CHECK(stafeto_probe_resident_drains(0) == 0);
+    }
+    /* pthread_exit in a signal handler and asynchronous cancellation inside
+     * tcdrain are engineering lifetime stress, outside defined POSIX safety. */
+    for (int asynchronous = 0; asynchronous < 2; ++asynchronous) {
+        CHECK(tcflow(1, TCOOFF) == 0);
+        CHECK(PUT(1, "posix-tty: departing drain prefix\n"));
+        drain_admission_jumping = asynchronous ? 0 : 2;
+        pthread_t owner;
+        CHECK(pthread_create(&owner, NULL, departing_admitted_drain, (void *)(long)asynchronous) == 0);
+        CHECK(wait_for_admitted_drain() == 0);
+        if (asynchronous) CHECK(pthread_cancel(owner) == 0);
+        else CHECK(pthread_kill(owner, SIGUSR1) == 0);
+        void *ended;
+        CHECK(pthread_join(owner, &ended) == 0);
+        CHECK(ended == (asynchronous ? PTHREAD_CANCELED : (void *)0x225));
+        drain_admission_jumping = 0;
+        CHECK(tcflow(1, TCOON) == 0 && deeper_drain(16) == 0);
+        CHECK(stafeto_probe_resident_drains(0) == 0);
+    }
+    unsigned long long readers[8];
+    for (int i = 0; i < 8; ++i) {
+        readers[i] = stafeto_probe_drain_read(0);
+        CHECK(readers[i] != 0 && readers[i] != ~0ULL);
+    }
+    for (int i = 0; i < 8; ++i) CHECK(stafeto_probe_drain_read(readers[i]) == 0);
+    CHECK(sigaction(SIGUSR1, &previous, NULL) == 0);
+    say("posix-tty: 40 admitted drain jumps, deeper calls and genuine End retain no unpaid custody\n");
+    return 0;
+}
+
 static int output(void) {
     /* STOP and START go out as they are, between the bytes written. */
     CHECK(PUT(1, "<") && tcflow(1, TCIOFF) == 0 && PUT(1, ">"));
@@ -440,6 +524,7 @@ static int output(void) {
     CHECK(tcsendbreak(0, 0) == 0);
     CHECK(drain_signals() == 0);
     CHECK(drain_admission() == 0);
+    CHECK(drain_abandonment() == 0);
     say("posix-tty: output ok\n");
     return 0;
 }

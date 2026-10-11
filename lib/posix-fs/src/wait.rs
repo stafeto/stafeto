@@ -6,9 +6,9 @@
 
 use super::{FsError, PosixFs, RamTarget, Target};
 use entries::{Frame, nested};
-use posix_fd::{
-    EntryToken, OwnerToken, WaitCancelReason, WaitChannelDebt, WaitClaim, WaitRecordPhase,
-    WaitResult, WaitSnapshot, WaitToken,
+pub use posix_fd::{
+    EntryToken, OwnerToken, WAIT_RECORDS, WaitCancelReason, WaitChannelDebt, WaitClaim, WaitPlace,
+    WaitRecordPhase, WaitResult, WaitSnapshot, WaitToken,
 };
 use proto_fs::{DataDescription, LockKind, WaitKey, WaitMode, WaitPhase, WaitReply, WaitStart};
 use proto_wire::Reader;
@@ -103,6 +103,12 @@ impl Recovery {
 }
 pub type Snapshot = WaitSnapshot<Recovery>;
 impl PosixFs {
+    /// Capacity is independent from Open, Control and ordinary I/O holds.
+    pub fn wait_place(&self, owner: OwnerToken, current: Frame) -> WaitPlace {
+        self.waits
+            .place(|s| s.owner == Some(owner) && nested(current, s.recovery.frame()))
+    }
+
     pub fn wait_tokens(&self) -> impl Iterator<Item = WaitToken> + '_ {
         self.waits.tokens()
     }
@@ -200,14 +206,40 @@ impl PosixFs {
     pub fn abandon_wait_owner(&mut self, owner: OwnerToken) -> Option<WaitToken> {
         self.waits.abandon_owner(owner)
     }
+    /// Both prepaid families share the same protected jump transaction.
+    pub fn mark_jump(&mut self, owner: OwnerToken, target: Frame) {
+        self.mark_control_jump(owner, target);
+        self.mark_wait_jump(owner, target);
+    }
+    /// Mark only frames left by the jump. The caller holds the descriptor lock
+    /// and defers entry delivery; this transition performs no remote cleanup.
+    pub fn mark_wait_jump(&mut self, owner: OwnerToken, target: Frame) -> usize {
+        let mut departing = [None; posix_fd::WAIT_RECORDS];
+        for (i, token) in self.wait_tokens().enumerate() {
+            if self
+                .wait_snapshot(token)
+                .is_ok_and(|s| s.owner == Some(owner) && nested(s.recovery.frame(), target))
+            {
+                departing[i] = Some(token);
+            }
+        }
+        let mut marked = 0;
+        for token in departing.into_iter().flatten() {
+            self.waits.abandon(token, owner).expect("exact jump detach");
+            marked += 1;
+        }
+        marked
+    }
     /// One exact source debt per bounded scan; all canonical receipts survive.
     pub fn fence_wait_for_close(
         &mut self,
         source: EntryToken,
     ) -> Result<Option<WaitToken>, FsError> {
         let token = self.wait_tokens().find(|&t| {
-            self.wait_snapshot(t)
-                .is_ok_and(|s| s.recovery.source() == source && s.phase != WaitRecordPhase::Cleaned)
+            self.wait_snapshot(t).is_ok_and(|s| {
+                s.recovery.source() == source
+                    && (s.phase != WaitRecordPhase::Cleaned || s.channel.is_some())
+            })
         });
         if let Some(t) = token {
             self.begin_wait_cleanup(t, WaitCancelReason::Close)?;
@@ -222,11 +254,26 @@ impl PosixFs {
         current: Frame,
         skip: Option<WaitToken>,
     ) -> Result<Option<WaitToken>, FsError> {
+        self.pick_wait_cleanup_from(me, current, skip, 0)
+    }
+    /// Visit at most sixteen physical slots from the caller's next position.
+    /// The caller publishes rotation before an unlocked helper can be interrupted.
+    pub fn pick_wait_cleanup_from(
+        &mut self,
+        me: Option<OwnerToken>,
+        current: Frame,
+        skip: Option<WaitToken>,
+        cursor: usize,
+    ) -> Result<Option<WaitToken>, FsError> {
         let mut tokens = [None; posix_fd::WAIT_RECORDS];
-        for (i, t) in self.wait_tokens().enumerate() {
-            tokens[i] = Some(t);
+        for token in self.wait_tokens() {
+            tokens[token.slot()] = Some(token);
         }
-        for token in tokens.into_iter().flatten() {
+        let cursor = cursor % posix_fd::WAIT_RECORDS;
+        for offset in 0..posix_fd::WAIT_RECORDS {
+            let Some(token) = tokens[(cursor + offset) % posix_fd::WAIT_RECORDS] else {
+                continue;
+            };
             if Some(token) == skip {
                 continue;
             }

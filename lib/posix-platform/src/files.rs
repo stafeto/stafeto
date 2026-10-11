@@ -312,7 +312,7 @@ const O_RDWR: c_int = 2;
 /// for the rest.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_int {
-    if matches!(command, 5 | 6 | 36 | 37) {
+    if matches!(command, 5 | 6 | 7 | 36 | 37 | 38) {
         return call(|| {
             // SAFETY: relibc passes the flock address for these commands.
             unsafe { posix_abi::file_lock(fd, command, argument as *mut u8) }

@@ -13,9 +13,17 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 #[cfg(feature = "lifetime-probe")]
 mod lifetime;
 #[cfg(feature = "lifetime-probe")]
+mod lock_deadlock;
+#[cfg(feature = "lifetime-probe")]
 mod lock_driver;
 #[cfg(feature = "lifetime-probe")]
 mod lock_signal;
+#[cfg(feature = "lifetime-probe")]
+mod wait_fifo;
+#[cfg(feature = "lifetime-probe")]
+mod wait_lifecycle;
+#[cfg(feature = "lifetime-probe")]
+mod wait_locks;
 
 #[cfg(feature = "pending-open")]
 mod pending_open;
@@ -164,3 +172,6 @@ extern "C" fn files_full_sessions() -> i32 {
         -1
     }
 }
+
+#[cfg(feature = "lifetime-probe")]
+mod lock_ring;
