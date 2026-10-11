@@ -605,7 +605,9 @@ const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10
         &["table-posix-lock-full7"]
     };
     programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
-    programs[5].3 = if phase == 2 {
+    programs[5].3 = if phase == 3 {
+        &["lock-full-wake"]
+    } else if phase == 2 {
         &["lock-full-capacity"]
     } else if phase == 1 {
         &["lock-full-ring"]
@@ -620,6 +622,8 @@ const POSIX_LOCK_FULL4_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_progr
 const POSIX_LOCK_FULL7_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 1);
 const POSIX_LOCK_FULL4_CAPACITY_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 2);
 const POSIX_LOCK_FULL7_CAPACITY_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 2);
+const POSIX_LOCK_FULL4_WAKE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 3);
+const POSIX_LOCK_FULL7_WAKE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 3);
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1366,7 +1370,10 @@ fn main() {
             [profile, mode] if (profile == "4" || profile == "7") && mode == "capacity" => {
                 posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 2)
             }
-            _ => Err("posix-lock-full 4|7 [ring|capacity]".to_owned()),
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "wake" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 3)
+            }
+            _ => Err("posix-lock-full 4|7 [ring|capacity|wake]".to_owned()),
         },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -3262,9 +3269,17 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
             "boot-posix-lock-full4-capacity.img",
             &POSIX_LOCK_FULL4_CAPACITY_PROGRAMS,
         ),
-        _ => (
+        (7, 2) => (
             "boot-posix-lock-full7-capacity.img",
             &POSIX_LOCK_FULL7_CAPACITY_PROGRAMS,
+        ),
+        (4, 3) => (
+            "boot-posix-lock-full4-wake.img",
+            &POSIX_LOCK_FULL4_WAKE_PROGRAMS,
+        ),
+        _ => (
+            "boot-posix-lock-full7-wake.img",
+            &POSIX_LOCK_FULL7_WAKE_PROGRAMS,
         ),
     };
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
@@ -3313,6 +3328,18 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
             &outcome,
             &format!(
                 "lock-full: capacity profile={profile} sleeping=16 refused=1 cancelled=16 published=256 private=0 retired=0 common=128 payers=8"
+            ),
+        )?;
+    }
+    if phase == 3 {
+        qemu::expect_marker(
+            &outcome,
+            &format!("lock-full: wake handler profile={profile} published=255 common=127"),
+        )?;
+        qemu::expect_marker(
+            &outcome,
+            &format!(
+                "lock-full: wake profile={profile} sleeping=16 successes=16 published=254 private=0 retired=0 common=127 payers=8"
             ),
         )?;
     }

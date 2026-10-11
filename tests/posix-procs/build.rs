@@ -15,6 +15,7 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=lock-full-capacity.c");
+    println!("cargo:rerun-if-changed=lock-full-wake.c");
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=lifetime.c");
     println!("cargo:rerun-if-changed=lock-ring.c");
@@ -80,6 +81,10 @@ fn main() {
         .arg(format!(
             "-DFULL_CAPACITY={}",
             u8::from(env::var_os("CARGO_FEATURE_LOCK_FULL_CAPACITY").is_some())
+        ))
+        .arg(format!(
+            "-DFULL_WAKE={}",
+            u8::from(env::var_os("CARGO_FEATURE_LOCK_FULL_WAKE").is_some())
         ))
         .arg(format!("-DSTEPS_SESSIONS={sessions}"))
         .arg(format!(

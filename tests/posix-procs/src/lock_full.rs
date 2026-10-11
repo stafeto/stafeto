@@ -261,7 +261,7 @@ pub extern "C" fn full_ring_method_mask() -> u32 {
     .fold(0, |mask, method| {
         mask | (1 << (method as u16 - proto_fs::Method::WaitStart as u16))
     });
-    if cfg!(feature = "lock-full-capacity") {
+    if cfg!(feature = "lock-full-capacity") && !cfg!(feature = "lock-full-wake") {
         mask |= 1 << (proto_fs::Method::WaitCancel as u16 - proto_fs::Method::WaitStart as u16);
     }
     mask

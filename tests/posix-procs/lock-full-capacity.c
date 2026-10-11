@@ -6,12 +6,21 @@ extern int full_wait_retired(unsigned, uint64_t);
 extern unsigned full_no_locks(void);
 extern unsigned full_cancelled(void);
 static int ring_phase(unsigned, char, struct record *);
-static volatile sig_atomic_t capacity_signal;
 static void capacity_handler(int signal) {
     int saved = errno;
-    if (signal == SIGUSR1) capacity_signal = 1;
+    if (signal == SIGUSR1) {
+#if FULL_WAKE
+        struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 2, .l_len = 1};
+        int result = fcntl(wake_fd, F_SETLK, &lock);
+        capacity_error = result ? errno : 0;
+        capacity_signal = result ? -1 : 1;
+#else
+        capacity_signal = 1;
+#endif
+    }
     errno = saved;
 }
+#if !FULL_WAKE
 static int capacity_wait(int target, unsigned index, struct record *r) {
     struct sigaction action = {.sa_handler = capacity_handler};
     sigemptyset(&action.sa_mask);
@@ -38,10 +47,12 @@ static int capacity_wait(int target, unsigned index, struct record *r) {
     if (write_record(index, r)) return fail("capacity terminal metadata", index);
     return 0;
 }
+#endif
 static int capacity_exact(const struct record *initial, const struct record *r) {
     return r->label == initial->label && r->pid == initial->pid && r->key_generation
         && r->key_slot < 16 && !memcmp(r->wait_source, initial->wait_source, sizeof(r->wait_source));
 }
+#if !FULL_WAKE
 static int capacity_capture(int fd, int source, uint64_t epoch, const struct record initial[20]) {
     char name[64];
     for (unsigned i = 0; i < 16; ++i) {
@@ -80,3 +91,8 @@ static int capacity_capture(int fd, int source, uint64_t epoch, const struct rec
     printf("lock-full: capacity profile=%u sleeping=16 refused=1 cancelled=16 published=256 private=0 retired=0 common=128 payers=8\n", profile);
     return 0;
 }
+
+#endif
+#if FULL_WAKE
+#include "lock-full-wake.c"
+#endif

@@ -22,6 +22,15 @@ extern int full_source(unsigned, uint64_t[2]);
 #ifndef FULL_CAPACITY
 #define FULL_CAPACITY 0
 #endif
+#ifndef FULL_WAKE
+#define FULL_WAKE 0
+#endif
+#if FULL_CAPACITY
+static volatile sig_atomic_t capacity_signal, capacity_error;
+#if FULL_WAKE
+static int wake_fd = -1;
+#endif
+#endif
 static unsigned profile, family;
 static const uint64_t cookie = UINT64_C(0x66756c6c32353601);
 struct record {
@@ -32,6 +41,7 @@ struct record {
     uint64_t label, wait_source[2], key_slot, key_generation;
     int result, error;
     unsigned complete_seen, release_seen, canonical;
+    int signal_status, signal_error;
 #endif
 };
 static struct timespec tick = {0, 10000000};
@@ -103,6 +113,10 @@ void full_ring_observed(unsigned phase, unsigned slot, uint64_t generation,
         || ring_record.key_generation != generation)) ring_bad = 1;
     ring_record.key_slot = slot; ring_record.key_generation = generation;
     if (phase == 1) ring_record.phase = 'S';
+#if FULL_WAKE
+    ring_record.signal_status = capacity_signal; ring_record.signal_error = capacity_error;
+    if (phase == 1 && capacity_signal) ring_record.phase = 'W';
+#endif
     if (phase == 2) { ring_record.phase = 'C'; ring_record.complete_seen = 1; }
     if (phase == 3) ring_record.release_seen = 1;
     if (canonical != ~0u) ring_record.canonical = canonical;
@@ -203,13 +217,25 @@ static int hold(unsigned local) {
             return fail("authenticated own and WAIT sources", index);
     }
 #endif
+#if FULL_WAKE
+    if (index < 16) {
+        struct sigaction action = {.sa_handler = capacity_handler, .sa_flags = SA_RESTART};
+        sigemptyset(&action.sa_mask);
+        if (!index) wake_fd = fd;
+        if (sigaction(SIGUSR1, &action, NULL)) return fail("pre-Begin wake handler", index);
+    }
+#endif
     for (unsigned s = 0; s < r.count; ++s) {
         if (drained(fd) || set(fd, F_WRLCK, s)) return fail("real SET", index);
     }
     if (drained(fd) || write_record(index, &r) || turn(index, 1)) return fail("publish holder", index);
 #if FULL_RING
     #if FULL_CAPACITY
+    #if FULL_WAKE
+    if (index < 17 && wake_wait(fd, target, index, &r)) return 1;
+#else
     if (index < 17 && capacity_wait(target, index, &r)) return 1;
+#endif
 #else
     if (index < 16 && ring_wait(fd, target, index, &r)) return 1;
 #endif
@@ -396,9 +422,10 @@ static int ring_rows(int fd, uint64_t epoch) {
     unsigned required = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4)
         | (1u << 5) | (1u << 6) | (1u << 7) | (1u << 14);
     if (FULL_CAPACITY) required = (1u << 2) | (1u << 14);
+    if (FULL_WAKE) required |= (1u << 0) | (1u << 1) | (1u << 4);
     if ((covered & required) != required || (methods & full_ring_method_mask()) != full_ring_method_mask() || (!FULL_CAPACITY && !full_deadlock))
         return fail("actual ring required branches and full deadlock", covered);
-    printf("lock-full: %s dispatch profile=%u mask=%u methods=%u full-deadlock=%u\n", FULL_CAPACITY ? "capacity" : "ring", profile, covered, methods, !FULL_CAPACITY);
+    printf("lock-full: %s dispatch profile=%u mask=%u methods=%u full-deadlock=%u\n", FULL_WAKE ? "wake" : FULL_CAPACITY ? "capacity" : "ring", profile, covered, methods, !FULL_CAPACITY);
     return 0;
 }
 
@@ -469,7 +496,11 @@ static int coordinator(void) {
         return fail("retained stable witness", 0);
 #if FULL_RING
     #if FULL_CAPACITY
+    #if FULL_WAKE
+    if (wake_capture(fd, observer_source, epoch, records)) return 1;
+#else
     if (capacity_capture(fd, observer_source, epoch, records)) return 1;
+#endif
 #else
     if (ring_capture(fd, epoch, records)) return 1;
 #endif
