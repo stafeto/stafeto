@@ -24,6 +24,66 @@ use rt::sys;
 /// None leaves the refusal to the kernel's errors (EIO for the rest).
 type Refusal<'a> = &'a dyn Fn(Status) -> Option<i32>;
 
+/// Paid tcdrain record receives accepted keys/results before delivery opens.
+pub(crate) trait Custody {
+    fn record(&self, kind: u32, key: u64) -> Result<(), i32>;
+}
+struct Mode<'a> {
+    point: bool,
+    authenticated: bool,
+    custody: Option<&'a dyn Custody>,
+}
+impl Mode<'_> {
+    fn plain(point: bool, authenticated: bool) -> Self {
+        Self {
+            point,
+            authenticated,
+            custody: None,
+        }
+    }
+}
+
+/// A short custody transition closes kernel and synchronous unlock delivery.
+/// It covers one RPC at most; never the long receive or admission pause.
+pub(crate) struct ShortScope {
+    local: Option<posix_sync::DeliveryPreparation<'static>>,
+    kernel: Option<rt::upcall::DeferredEntry>,
+}
+impl ShortScope {
+    pub(crate) fn enter(enabled: bool) -> Result<Self, i32> {
+        if !enabled {
+            return Ok(Self {
+                local: None,
+                kernel: None,
+            });
+        }
+        // Lifetime help can run before any TCB is published on a raw worker.
+        // Such a caller cannot take local preparation and must not admit one.
+        let block = unsafe { posix_thread::block().as_ref() }.ok_or(EIO)?;
+        let kernel = rt::upcall::defer_entries().map_err(|_| EIO)?;
+        let local = posix_sync::DeliveryPreparation::begin(block);
+        Ok(Self {
+            local: Some(local),
+            kernel: Some(kernel),
+        })
+    }
+}
+impl Drop for ShortScope {
+    fn drop(&mut self) {
+        if self.local.is_some() {
+            let block = crate::threads::own_block();
+            if block.flags.load(Ordering::SeqCst) & flag::ENTRY_DEFERRED != 0 {
+                let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
+                    block.thread.load(Ordering::Relaxed),
+                ));
+                sys::thread_upcall_request(&thread).expect("short custody delivery owner");
+            }
+        }
+        drop(self.local.take());
+        drop(self.kernel.take());
+    }
+}
+
 /// One request to `service` and its long reply, copied into `out`: the
 /// kind and, for READY, the length. EINTR when the kernel interrupted the
 /// request before its reply; a refusal as `refusal` says.
@@ -34,7 +94,9 @@ fn call(
     out: &mut [u8],
     refusal: Refusal<'_>,
     authenticated: bool,
+    custody: Option<&dyn Custody>,
 ) -> Result<(u32, usize, u64), i32> {
+    let _scope = ShortScope::enter(custody.is_some())?;
     let identity = authenticated
         .then(|| {
             crate::process::identity()
@@ -75,6 +137,13 @@ fn call(
     // The reply's copy on the stack goes (a key of the entropy service
     // among them), and a child of fork finds none of it.
     posix_random::erase(&mut buffer[..len]);
+    if let (Some(custody), Ok((kind, _, key))) = (custody, result)
+        && matches!(kind, long::WAIT | long::READY | long::CANCELLED)
+        && custody.record(kind, key).is_err()
+    {
+        // Accepted server state must never escape without its resident owner.
+        sys::process_exit(127);
+    }
     result
 }
 
@@ -95,10 +164,10 @@ impl Errno for Error {
 /// Keeps the caller's NO_RESTART across a nested long operation: a
 /// handler without SA_RESTART that ran while the outer one waited stays
 /// seen by it, whatever the inner one clears (a handler may read too).
-struct OuterRestart(u32);
+pub(crate) struct OuterRestart(u32);
 
 impl OuterRestart {
-    fn enter(flags: &core::sync::atomic::AtomicU32) -> OuterRestart {
+    pub(crate) fn enter(flags: &core::sync::atomic::AtomicU32) -> OuterRestart {
         OuterRestart(flags.fetch_and(!flag::NO_RESTART, Ordering::SeqCst) & flag::NO_RESTART)
     }
 }
@@ -114,7 +183,7 @@ impl Drop for OuterRestart {
 /// Whether the wait of the operation ends with "cancel k": a request of
 /// cancellation when the operation is a point of cancellation (`point`),
 /// or a handler without SA_RESTART ran since it started.
-fn ending(flags: &core::sync::atomic::AtomicU32, point: bool) -> bool {
+pub(crate) fn ending(flags: &core::sync::atomic::AtomicU32, point: bool) -> bool {
     (point && crate::threads::cancel::requested())
         || flags.load(Ordering::SeqCst) & flag::NO_RESTART != 0
 }
@@ -154,8 +223,7 @@ pub fn run_with(
         keyed,
         out,
         refusal,
-        true,
-        false,
+        Mode::plain(true, false),
     )
 }
 
@@ -176,8 +244,7 @@ pub fn run_no_point(
         keyed,
         out,
         refusal,
-        false,
-        false,
+        Mode::plain(false, false),
     )
 }
 
@@ -191,7 +258,14 @@ pub fn run_with_identity(
     out: &mut [u8],
     refusal: Refusal<'_>,
 ) -> Result<usize, i32> {
-    run_in(service, Start::Once(start), keyed, out, refusal, true, true)
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        Mode::plain(true, true),
+    )
 }
 
 /// Terminal slave requests authenticate; master requests use their owning
@@ -210,8 +284,7 @@ pub(crate) fn run_terminal(
         keyed,
         out,
         refusal,
-        true,
-        !master,
+        Mode::plain(true, !master),
     )
 }
 
@@ -231,6 +304,7 @@ pub(crate) fn run_drain(
     start: impl Fn() -> Result<Writer, Status>,
     keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
     refusal: Refusal<'_>,
+    custody: Option<&dyn Custody>,
 ) -> Result<(), i32> {
     run_in(
         service,
@@ -238,15 +312,18 @@ pub(crate) fn run_drain(
         keyed,
         &mut [],
         refusal,
-        true,
-        true,
+        Mode {
+            point: true,
+            authenticated: true,
+            custody,
+        },
     )
     .map(drop)
 }
 
 /// No server state is retained yet. Use the thread's already paid timer;
 /// signal deferral closes the race between the flags check and receive.
-fn admission_pause() -> Result<(), i32> {
+pub(crate) fn admission_pause() -> Result<(), i32> {
     let block = crate::threads::own_block();
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
@@ -286,9 +363,13 @@ fn run_in(
     keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
     out: &mut [u8],
     refusal: Refusal<'_>,
-    point: bool,
-    authenticated: bool,
+    mode: Mode<'_>,
 ) -> Result<usize, i32> {
+    let Mode {
+        point,
+        authenticated,
+        custody,
+    } = mode;
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
     let block = crate::threads::own_block();
@@ -306,7 +387,15 @@ fn run_in(
             return Err(EINTR);
         }
         let reply = match &start {
-            Start::Once(bytes) => call(service, bytes, None, out, &start_refusal, authenticated),
+            Start::Once(bytes) => call(
+                service,
+                bytes,
+                None,
+                out,
+                &start_refusal,
+                authenticated,
+                custody,
+            ),
             Start::Admission(build) => {
                 let request = build().map_err(|_| EIO)?;
                 call(
@@ -316,6 +405,7 @@ fn run_in(
                     out,
                     &start_refusal,
                     authenticated,
+                    custody,
                 )
             }
         };
@@ -354,6 +444,7 @@ fn run_in(
                 out,
                 refusal,
                 authenticated,
+                custody,
             ) {
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => {}
@@ -366,19 +457,29 @@ fn run_in(
         }
         if !armed {
             handled = block.handled.load(Ordering::SeqCst);
+            // No user entry may abandon a newly created transfer clone before
+            // the request has either transferred it or closed the refusal.
+            let clone_guard = if custody.is_some() {
+                Some(rt::upcall::defer_entries().map_err(|_| EIO)?)
+            } else {
+                None
+            };
             let Ok(labelled) =
                 sys::handle_label(&channel, Rights::NOTIFY | Rights::TRANSFER, key, level)
             else {
                 break 'wait Some(EAGAIN);
             };
-            match call(
+            let reply = call(
                 service,
                 request(false).map_err(|_| EIO)?.as_bytes(),
                 Some(labelled),
                 out,
                 refusal,
                 authenticated,
-            ) {
+                custody,
+            );
+            drop(clone_guard);
+            match reply {
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => armed = true,
                 Ok(_) => break 'wait Some(EIO),
@@ -416,6 +517,7 @@ fn run_in(
                     out,
                     refusal,
                     authenticated,
+                    custody,
                 ) {
                     Ok((long::READY, n, _)) => return Ok(n),
                     Ok((long::ARMED, _, _)) => {}
@@ -459,6 +561,7 @@ fn run_in(
             out,
             refusal,
             authenticated,
+            custody,
         ) {
             Ok((long::READY, n, _)) => return Ok(n),
             Ok((long::CANCELLED, _, _)) => return Err(cancel.unwrap_or(EINTR)),

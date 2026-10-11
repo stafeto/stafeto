@@ -564,14 +564,19 @@ static void *vz_idle(void *unused) {
 }
 
 /* What one thread costs the quota of its process: the bytes charged before
- * and after the creation of a thread with a stack of 20480 bytes (the block
+ * and after the creation of a thread with the checked 65536-byte stack (the block
  * of the thread, its TLS and the stack), alone in the process. */
 static int vz_thread_cost(void) {
     enum { COUNT = 3 };
     pthread_t threads[COUNT];
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 20480);
+    /* The old 20 KiB request was below PTHREAD_STACK_MIN and silently
+     * left the effective 64 KiB default. Keep that real size explicit. */
+    VZ_CHECK(pthread_attr_setstacksize(&attr, 65536) == 0);
+    size_t stack_size = 0;
+    VZ_CHECK(pthread_attr_getstacksize(&attr, &stack_size) == 0);
+    VZ_CHECK(stack_size == 65536);
     vz_hold = 0;
     unsigned long long first = 0, last = 0, total = 0;
     for (int i = 0; i < COUNT; i++) {
@@ -585,8 +590,8 @@ static int vz_thread_cost(void) {
     vz_hold = 1;
     for (int i = 0; i < COUNT; i++) VZ_CHECK(pthread_join(threads[i], NULL) == 0);
     printf("posix-procs: names thread cost: %llu bytes (%llu pages) for the first thread, %llu bytes the last, "
-           "%llu bytes for %d, stack 20480 bytes\n",
-           first, first / 4096, last, total, (int)COUNT);
+           "%llu bytes for %d, stack %zu bytes\n",
+           first, first / 4096, last, total, (int)COUNT, stack_size);
     return 0;
 }
 
@@ -606,7 +611,12 @@ static int vz_child(void) {
     pthread_t threads[VZ_THREADS];
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 20480);
+    /* The old 20 KiB request was below PTHREAD_STACK_MIN and silently
+     * left the effective 64 KiB default. Keep that real size explicit. */
+    VZ_CHECK(pthread_attr_setstacksize(&attr, 65536) == 0);
+    size_t stack_size = 0;
+    VZ_CHECK(pthread_attr_getstacksize(&attr, &stack_size) == 0);
+    VZ_CHECK(stack_size == 65536);
     for (int i = 0; i < VZ_THREADS; i++) {
         work[i] = (struct vz_thread){process * VZ_THREADS + i, start, -1, 0, directory};
         int e = pthread_create(&threads[i], &attr, vz_rename_thread, &work[i]);

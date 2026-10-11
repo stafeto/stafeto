@@ -434,10 +434,7 @@ pub fn set_winsize(
 /// transport resources before relibc cancellation runs user cleanup.
 pub fn drain_fd(fd: u32) -> Result<(), i32> {
     let point = crate::threads::cancel::Point::begin();
-    let result = crate::shared::held(fd, |transport, target| {
-        let number = transport.terminal_number(target).ok_or(ENOTTY)?;
-        drain(transport, number)
-    });
+    let result = crate::drain_driver::operation(fd);
     if result.is_ok() {
         point.end();
     } else {
@@ -452,9 +449,26 @@ pub fn drain_fd(fd: u32) -> Result<(), i32> {
 #[inline(never)]
 pub fn drain(transport: Transport, number: u32) -> Result<(), i32> {
     let terminal = transport.terminal().ok_or(EBADF)?;
+    drain_on(&terminal, number, None)
+}
+
+pub(crate) fn drain_owned(
+    session: u64,
+    number: u32,
+    custody: &dyn crate::long::Custody,
+) -> Result<(), i32> {
+    let terminal = Handle::<Channel>::borrowed(rt::abi::Handle(session));
+    drain_on(&terminal, number, Some(custody))
+}
+
+fn drain_on(
+    terminal: &Handle<Channel>,
+    number: u32,
+    custody: Option<&dyn crate::long::Custody>,
+) -> Result<(), i32> {
     retry(|| {
         crate::long::run_drain(
-            &terminal,
+            terminal,
             || {
                 let mut start = Writer::new();
                 Drain {
@@ -482,6 +496,7 @@ pub fn drain(transport: Transport, number: u32) -> Result<(), i32> {
                 }
             },
             &refusal,
+            custody,
         )
     })
 }

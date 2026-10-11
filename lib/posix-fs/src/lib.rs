@@ -9,6 +9,7 @@
 pub mod change;
 pub mod closing;
 pub mod control;
+pub mod drain;
 pub mod open;
 mod target;
 pub mod wait;
