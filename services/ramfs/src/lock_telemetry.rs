@@ -194,6 +194,15 @@ impl Table {
             Err(Error::Authority)
         }
     }
+    /// Physical-description observations allow setup only before the first
+    /// Begin; every later query uses the exact accepted controller and epoch.
+    pub fn authorize_description(&self, scope: Scope, epoch: u64) -> Result<(), Error> {
+        if epoch == 0 {
+            self.authorize_identity(scope, epoch)
+        } else {
+            self.authorize(scope, epoch)
+        }
+    }
     pub fn authorize_oracle(&self, scope: Scope, epoch: u64) -> Result<(), Error> {
         if self.scope.is_none()
             && epoch == 0
@@ -555,6 +564,61 @@ mod tests {
             roots: 8,
         }
     }
+    #[test]
+    fn description_authority_rejects_replay_and_every_changed_scope_field() {
+        let mut table = fresh();
+        assert_eq!(table.authorize_description(scope(), 0), Ok(()));
+        let epoch = table.start(scope(), 0, 4, full()).unwrap();
+        assert_eq!(table.authorize_description(scope(), epoch), Ok(()));
+        assert_eq!(
+            table.authorize_description(scope(), 0),
+            Err(Error::Authority)
+        );
+        assert_eq!(
+            table.authorize_description(scope(), epoch + 1),
+            Err(Error::Authority)
+        );
+        for wrong in [
+            Scope {
+                place: scope().place + 1,
+                ..scope()
+            },
+            Scope {
+                owner: scope().owner + 1,
+                ..scope()
+            },
+            Scope {
+                nonce: scope().nonce + 1,
+                ..scope()
+            },
+            Scope {
+                source: Source {
+                    packed: scope().source.packed + 1,
+                    ..scope().source
+                },
+                ..scope()
+            },
+            Scope {
+                source: Source {
+                    generation: scope().source.generation + (1 << 32),
+                    ..scope().source
+                },
+                ..scope()
+            },
+        ] {
+            assert_eq!(
+                table.authorize_description(wrong, epoch),
+                Err(Error::Authority)
+            );
+        }
+        table.stop(scope(), epoch).unwrap();
+        assert_eq!(table.authorize_description(scope(), epoch), Ok(()));
+        assert_eq!(
+            table.authorize_description(scope(), 0),
+            Err(Error::Authority)
+        );
+    }
+
     fn timing(took: u64) -> Timing {
         Timing {
             kind: 54,

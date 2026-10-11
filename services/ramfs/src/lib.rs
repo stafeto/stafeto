@@ -36,6 +36,8 @@ pub mod maintenance;
 pub mod metadata;
 #[cfg(test)]
 mod metadata_tests;
+#[cfg(all(test, feature = "lock-telemetry"))]
+mod telemetry_description_tests;
 pub use storage::namespace;
 #[cfg(test)]
 mod create_tests;
@@ -1046,6 +1048,48 @@ impl<'a> Ram<'a> {
             .as_ref()
             .expect("live description");
         Ok((self.token(shared.open.file), shared.open.flags))
+    }
+
+    /// Test-image observation of one retained physical description. The live
+    /// controller must name the same inode and original description payer.
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_description(
+        &self,
+        fds: &Fds,
+        source: TentativeOpen,
+        slot: u32,
+        generation: u64,
+    ) -> Result<[u64; 5], u32> {
+        if fds.departed {
+            return Err(proto_fs::PERMISSION);
+        }
+        let inode = self
+            .live_description(fds, source)
+            .map_err(|_| proto_fs::PERMISSION)?
+            .0;
+        let controller = self.descriptions[source.description.slot as usize]
+            .as_ref()
+            .ok_or(proto_fs::PERMISSION)?;
+        let Some(target) = self
+            .descriptions
+            .get(slot as usize)
+            .and_then(Option::as_ref)
+        else {
+            return Ok([0; 5]);
+        };
+        if generation == 0 || target.generation != generation {
+            return Ok([0; 5]);
+        }
+        if self.token(target.open.file) != inode || target.root != controller.root {
+            return Err(proto_fs::PERMISSION);
+        }
+        Ok([
+            1,
+            u64::from(target.refs),
+            u64::from(target.fd_refs),
+            u64::from(slot),
+            target.generation,
+        ])
     }
 
     /// Retire one exact real fd reference while physical I/O can keep its slot.

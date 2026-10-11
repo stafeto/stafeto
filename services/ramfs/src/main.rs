@@ -3121,6 +3121,34 @@ impl Fs {
                     )
                 })
             }
+            7 => {
+                let (Ok(slot), Ok(target_generation)) = (body.u32(), body.u64()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let description = proto_fs::DataDescription { packed, generation };
+                self.telemetry
+                    .authorize_description(scope, epoch)
+                    .and_then(|()| {
+                        self.ram
+                            .telemetry_description(
+                                fds,
+                                ramfs::TentativeOpen {
+                                    fd: description.fd(),
+                                    description: ramfs::storage::Token {
+                                        slot: description.slot() as u16,
+                                        generation,
+                                    },
+                                },
+                                slot,
+                                target_generation,
+                            )
+                            .map_err(|_| Error::Authority)
+                    })
+                    .map(|words| (epoch, words))
+            }
             2 | 3 => {
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
