@@ -629,8 +629,14 @@ static int vz_child(void) {
             return 101;
         }
     }
-    printf("posix-procs: names worker memory: process %d, %llu pages, seven stacks %zu bytes\n",
-           process, stafeto_probe_memory_used() / 4096, stack_size);
+    {
+        char line[512];
+        int length = snprintf(line, sizeof line,
+                              "posix-procs: names worker memory: process %d, %llu pages, seven stacks %zu bytes\n",
+                              process, stafeto_probe_memory_used() / 4096, stack_size);
+        VZ_CHECK(length > 0 && (size_t)length < sizeof line);
+        VZ_CHECK(write(STDOUT_FILENO, line, (size_t)length) == length);
+    }
     {
         pthread_t eighth;
         pthread_attr_t eighth_attr;
@@ -643,8 +649,14 @@ static int vz_child(void) {
         /* The caller owns this normal 64 KiB stack and releases it after
          * join. Keep all eight threads alive while measuring stack and TLS. */
         VZ_CHECK(pthread_create(&eighth, &eighth_attr, vz_idle, NULL) == 0);
-        printf("posix-procs: names eighth memory: %llu pages, quota %llu pages\n",
-               stafeto_probe_memory_used() / 4096, stafeto_probe_memory_quota() / 4096);
+        {
+            char line[512];
+            int length = snprintf(line, sizeof line,
+                                  "posix-procs: names eighth memory: %llu pages, quota %llu pages\n",
+                                  stafeto_probe_memory_used() / 4096, stafeto_probe_memory_quota() / 4096);
+            VZ_CHECK(length > 0 && (size_t)length < sizeof line);
+            VZ_CHECK(write(STDOUT_FILENO, line, (size_t)length) == length);
+        }
         vz_hold = 1;
         VZ_CHECK(pthread_join(eighth, NULL) == 0);
         VZ_CHECK(pthread_attr_destroy(&eighth_attr) == 0);
@@ -657,9 +669,15 @@ static int vz_child(void) {
          * TLS and thread metadata can only increase this request's cost. */
         size_t refused_stack = (size_t)(remaining / 4096 + 1) * 4096;
         VZ_CHECK(refused_stack >= PTHREAD_STACK_MIN);
-        printf("posix-procs: names quota: process %d, quota %llu pages, used %llu pages, "
-               "remaining %llu pages, refused stack %zu bytes, eighth ordinary stack %zu bytes\n",
-               process, quota / 4096, used / 4096, remaining / 4096, refused_stack, stack_size);
+        {
+            char line[512];
+            int length = snprintf(line, sizeof line,
+                                  "posix-procs: names quota: process %d, quota %llu pages, used %llu pages, "
+                                  "remaining %llu pages, refused stack %zu bytes, eighth ordinary stack %zu bytes\n",
+                                  process, quota / 4096, used / 4096, remaining / 4096, refused_stack, stack_size);
+            VZ_CHECK(length > 0 && (size_t)length < sizeof line);
+            VZ_CHECK(write(STDOUT_FILENO, line, (size_t)length) == length);
+        }
         VZ_CHECK(pthread_attr_setstacksize(&attr, refused_stack) == 0);
         int e = pthread_create(&eighth, &attr, vz_idle, NULL);
         if (e != EAGAIN) {
