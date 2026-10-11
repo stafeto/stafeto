@@ -198,6 +198,7 @@ dependencies = [
  "entries",
  "posix-change",
  "posix-clock",
+ "posix-fd",
  "posix-fs",
  "posix-heap",
  "posix-map",
@@ -939,6 +940,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "entries",
  "posix-fd",
  "posix-types",
  "proto-fs",

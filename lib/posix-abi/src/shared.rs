@@ -744,7 +744,7 @@ pub fn detach_open_owner(owner: u64) -> bool {
     // Every resident Control family loses this exact native lifetime.
     let changes = crate::change::detach(owner);
     let closes = crate::close_driver::detach(owner);
-    let drains = crate::drain_driver::detach(owner);
+    let drains = crate::drain_hooks::detach(owner);
     opens && changes && closes && drains
 }
 /// A surviving caller or collector pays one cleanup phase outside the layer locks.
@@ -752,5 +752,5 @@ pub fn help_open_recovery() {
     crate::open_driver::help();
     crate::change::help();
     crate::close_driver::help();
-    crate::drain_driver::help();
+    crate::drain_hooks::help();
 }
