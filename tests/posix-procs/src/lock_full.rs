@@ -266,3 +266,14 @@ pub extern "C" fn full_ring_method_mask() -> u32 {
     }
     mask
 }
+
+/// Close wire domains are independent of local ClosingToken physical slots.
+#[cfg(feature = "lock-full-close")]
+#[unsafe(no_mangle)]
+pub extern "C" fn full_close_key_valid(slot: u32, generation: u64) -> i32 {
+    if (proto_fs::CloseKey { slot, generation }).validate().is_ok() {
+        0
+    } else {
+        -1
+    }
+}

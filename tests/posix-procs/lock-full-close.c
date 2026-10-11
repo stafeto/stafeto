@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 /* Genuine same-PID alias close while an exact unrelated WAIT stays live. */
+extern int full_close_key_valid(unsigned, uint64_t);
 static int close_capture(int fd, int source, int witness, const uint64_t exact_source[2], uint64_t epoch, const struct record initial[20]) {
     char name[64];
     for (unsigned i = 0; i < 16; ++i) {
@@ -68,7 +69,7 @@ static int close_rows(int fd, uint64_t epoch, const struct record *initial) {
         return fail("close bounded unambiguous actual revoke", 0);
     uint64_t *w = pages[17];
     if (w[2] != initial->pid || (uint32_t)w[3] != (uint32_t)initial->source[0]
-        || (w[3] >> 32) >= 16 || w[4] != initial->source[1] || !w[5])
+        || w[4] != initial->source[1] || full_close_key_valid((unsigned)(w[3] >> 32), w[5]))
         return fail("close actual PID source description CloseKey", 0);
     printf("lock-full: close effect profile=%u pid=%llu source=%llu/%llu key=%llu/%llu last-alias=0\n",
            profile, (unsigned long long)w[2], (unsigned long long)(uint32_t)w[3],
