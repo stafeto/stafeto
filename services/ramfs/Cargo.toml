@@ -28,7 +28,6 @@ image-info-probe = ["auth-probe"]
 # feature step-stats; xtask process-steps, under -icount).
 steps = ["rt/step-stats"]
 # Full dispatch samples in the dedicated filled-lock measurement image.
-lock-telemetry = ["rt/step-stats"]
 
 [dependencies]
 abi = { path = "../../lib/abi" }

@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 extern void wait_fifo_hooks_begin(void), wait_fifo_hooks_end(void);
-extern int wait_fifo_arm(int fd, unsigned holder, unsigned long long nonce);
-extern int wait_fifo_selected(unsigned long long nonce, unsigned index);
-extern int wait_fifo_ticks(void);
+extern int wait_fifo_pending(unsigned index);
 static _Thread_local unsigned fifo_index;
 static int fifo_ready[2];
+static void fifo_cancel_signal(int signo) {(void)signo;}
 unsigned wait_fifo_index(void) { return fifo_index; }
 void wait_fifo_ready(unsigned index) { if (index>=1 && index<=2) __atomic_store_n(&fifo_ready[index-1],1,__ATOMIC_RELEASE); }
-struct fifo_worker {unsigned index;int fd;short kind;long long start,length;int result,error;size_t peak;};
+struct fifo_worker {unsigned index;int fd;short kind;long long start,length;int result,error,done;size_t peak;};
 static void *fifo_worker(void *pointer) {
     struct fifo_worker *worker=pointer;fifo_index=worker->index;
     pthread_attr_t attr;void *base=NULL;size_t size=0;
@@ -19,7 +18,7 @@ static void *fifo_worker(void *pointer) {
     struct flock lock={.l_type=worker->kind,.l_whence=SEEK_SET,.l_start=worker->start,.l_len=worker->length};
     errno=0;worker->result=fcntl(worker->fd,38,&lock);worker->error=errno;
     uintptr_t first=(uintptr_t)base;while(first<painted && *(volatile unsigned char *)first==0xa7)first++;
-    worker->peak=top-first;return NULL;
+    worker->peak=top-first;__atomic_store_n(&worker->done,1,__ATOMIC_RELEASE);return NULL;
 }
 static int fifo_stage(unsigned index) {
     struct timespec tick={0,1000000};
@@ -37,6 +36,8 @@ static void public_wait_fifo(void) {
         }_exit(95);
     }
     close(commands[0]);close(replies[1]);if(holder<0){close(commands[1]);close(replies[0]);close(fd);return;}
+    struct sigaction saved_signal, cancel_signal={.sa_handler=fifo_cancel_signal};
+    sigemptyset(&cancel_signal.sa_mask);expect("FIFO cancellation signal handler",sigaction(SIGUSR1,&cancel_signal,&saved_signal),0);
     pthread_attr_t attributes;expect("FIFO attrs",pthread_attr_init(&attributes),0);expect("FIFO actual64K allocation",pthread_attr_setstacksize(&attributes,PTHREAD_STACK_MIN),0);
     for(unsigned mode=1;mode<=2;mode++){
         expect("FIFO child adjacent Read/Write blockers",wait_holder_exchange(commands[1],replies[0],'L'),1);
@@ -48,19 +49,32 @@ static void public_wait_fifo(void) {
             int error=pthread_create(&threads[index],&attributes,fifo_worker,&workers[index]);expect("FIFO worker create",error,0);if(error)break;created++;
             expect("FIFO accepted Sleeping in registration order",fifo_stage(index+1),1);
         }
-        unsigned long long nonce=(1ULL<<32)|mode;
         if(created==2){
-            int armed=wait_fifo_arm(fd,(unsigned)holder,nonce);expect("arm authenticated finite FIFO gate",armed,0);
+            expect("first genuine WAIT receipt sleeps",wait_fifo_pending(1),0);
+            expect("second distinct WAIT receipt sleeps",wait_fifo_pending(2),0);
             expect("single child unlock opens only right range",wait_holder_exchange(commands[1],replies[0],'U'),1);
+            if(mode==2){
+                /* Incompatible FIFO predecessors retain their position until cancellation. */
+                expect("older Write remains blocked on left",wait_fifo_pending(1),0);
+                expect("younger Read stays behind older Write",wait_fifo_pending(2),0);
+            }
             struct flock set={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_start=4,.l_len=4};errno=0;int result=fcntl(fd,F_SETLK,&set),error=errno;
-            expect("later real SET conflicts with selected WAIT",result,-1);expect("later SET genuine EAGAIN",error,EAGAIN);
-            expect("real Selector chooses exact oldest eligible key",wait_fifo_selected(nonce,mode==1?1:2),0);
-            struct flock get={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_start=4,.l_len=4};expect("query granted OFD blocker",fcntl(fd,F_GETLK,&get),0);expect("selected WAIT owns actual Read blocker",get.l_type,F_RDLCK);expect("selected blocker is OFD",get.l_pid,-1);
-            /* Also permits a bypass mutant's newly granted PID lock to be cleaned. */
+            expect("later real SET cannot bypass FIFO or granted Read",result,-1);expect("later SET genuine EAGAIN",error,EAGAIN);
             set.l_type=F_UNLCK;expect("clean late PID SET if mutant granted",fcntl(fd,F_SETLK,&set),0);
         } else expect("unlock incomplete FIFO setup",wait_holder_exchange(commands[1],replies[0],'U'),1);
         if(mode==2 && created>0){expect("close older still-blocked Write WAIT",close(workers[0].fd),0);workers[0].fd=-1;}
         for(unsigned index=0;index<created;index++){
+            struct timespec tick={0,1000000};unsigned n=0;
+            while(n++<3000 && !__atomic_load_n(&workers[index].done,__ATOMIC_ACQUIRE))nanosleep(&tick,NULL);
+            expect("FIFO notification completes or cancels real waiter",__atomic_load_n(&workers[index].done,__ATOMIC_ACQUIRE),1);
+        }
+        if(created==2 && __atomic_load_n(&workers[1].done,__ATOMIC_ACQUIRE)){
+            struct flock get={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_start=4,.l_len=4};expect("query granted OFD blocker",fcntl(fd,F_GETLK,&get),0);expect("selected WAIT owns actual Read blocker",get.l_type,F_RDLCK);expect("selected blocker is OFD",get.l_pid,-1);
+        }
+        /* Release the holder before joining, including failed ordering mutations. */
+        expect("clear child FIFO locks",wait_holder_exchange(commands[1],replies[0],'C'),1);
+        for(unsigned index=0;index<created;index++){
+            if(!__atomic_load_n(&workers[index].done,__ATOMIC_ACQUIRE))pthread_kill(threads[index],SIGUSR1);
             expect("FIFO worker join",pthread_join(threads[index],NULL),0);
             expect("FIFO canonical worker outcome",workers[index].result,mode==2&&index==0?-1:0);
             if(mode==2&&index==0)expect("old blocked WAIT close errno",workers[index].error,EBADF);
@@ -68,9 +82,9 @@ static void public_wait_fifo(void) {
             printf("posix-procs: FIFO case %u worker %u stack %zu bytes\n",mode,index+1,workers[index].peak);
         }
         for(unsigned index=0;index<2;index++)if(workers[index].fd>=0)expect("close FIFO worker OFD",close(workers[index].fd),0);
-        wait_fifo_hooks_end();expect("clear child FIFO locks",wait_holder_exchange(commands[1],replies[0],'C'),1);
+        wait_fifo_hooks_end();
     }
+    expect("restore FIFO signal handler",sigaction(SIGUSR1,&saved_signal,NULL),0);
     expect("destroy FIFO attrs",pthread_attr_destroy(&attributes),0);char quit='Q';expect("stop FIFO holder",write(commands[1],&quit,1),1);close(commands[1]);close(replies[0]);reap(holder,0);close(fd);
-    expect("FIFO own dispatch ticks under B",wait_fifo_ticks(),0);
-    if(!failures)printf("posix-procs: genuine FIFO oldest eligible Read, blocked older Write and later PID SET ok\n");
+    if(!failures)printf("posix-procs: genuine FIFO compatible Reads, blocked older Write cancellation and later PID SET ok\n");
 }

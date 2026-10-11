@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Strict read-only observations of the genuine authenticated payer and proof.
+//! Read-only observations of the authenticated PID, payer and remaining quota.
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use posix_abi::WaitProbe;
 use posix_fs::wait::WaitToken;
@@ -27,7 +27,7 @@ pub extern "C" fn ring_probe_disarm() {
     posix_abi::probe_wait_hook(None);
     ARMED.store(false, Ordering::Release);
 }
-/// C passes eleven u32 cells; no pointer survives this read-only RPC.
+/// C passes five u32 cells; no pointer survives this read-only RPC.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ring_identity(target: u32, output: *mut u32) -> i32 {
     let result = (|| {
@@ -57,9 +57,15 @@ pub unsafe extern "C" fn ring_identity(target: u32, output: *mut u32) -> i32 {
         {
             return Err(-10);
         }
-        let mut words = [0; 11];
+        let mut words = [0; 5];
         for word in &mut words {
             *word = body.u32().map_err(|_| -11)?;
+        }
+        // Older observers append six retired measurement fields.
+        if body.left() == 6 * core::mem::size_of::<u32>() {
+            for _ in 0..6 {
+                let _ = body.u32().map_err(|_| -11)?;
+            }
         }
         body.finish().map_err(|_| -12)?;
         if words[0] == 0 || words[1] > 1 || words[2] == 0 || words[3] == 0 || words[4] < 128 {
@@ -68,7 +74,7 @@ pub unsafe extern "C" fn ring_identity(target: u32, output: *mut u32) -> i32 {
         if output.is_null() {
             return Err(-14);
         }
-        // SAFETY: C provides eleven writable u32 cells for this current call.
+        // SAFETY: C provides five writable u32 cells for this current call.
         unsafe { core::ptr::copy_nonoverlapping(words.as_ptr(), output, words.len()) };
         Ok(())
     })();

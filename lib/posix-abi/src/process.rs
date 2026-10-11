@@ -1459,7 +1459,7 @@ fn exec_stopped<'s>(
     let c = reply.handles.take::<Channel>(0).map_err(|_| EIO)?;
     let ready = image_ready(&c, len, object);
     if let Err(errno) = ready {
-        let _ = ask(&request(Method::ExecAbort, &[])?);
+        let _ = request(Method::ExecAbort, &[]).and_then(|w| ask(&w));
         return Err(errno);
     }
     // The probes of the window: the old image ends before ExecCommit.
@@ -1488,7 +1488,10 @@ fn exec_stopped<'s>(
         // descriptors it cannot use, and this one gave its sessions away.
         rt::sys::process_exit(127);
     }
-    if ask(&request(Method::ExecCommit, &[])?).is_err() {
+    if request(Method::ExecCommit, &[])
+        .and_then(|w| ask(&w))
+        .is_err()
+    {
         // A distinct probe status witnesses refusal while this image still runs.
         if crate::loader_probe::omit_completion() {
             rt::sys::process_exit(126);
@@ -1609,13 +1612,16 @@ fn image_ready(
 fn move_files(c: &Handle<Channel>) -> bool {
     use proto_loader::Slot;
     for fd in 0..posix_fs::OPEN_MAX as u32 {
-        let close_on_exec = crate::shared::with_files(|files| {
-            Ok(files
-                .descriptor_flags(fd)
-                .is_ok_and(|flags| flags.close_on_exec))
+        let close_on_exec = crate::shared::with_files(|files| match files.descriptor_flags(fd) {
+            Ok(flags) => Ok(flags.close_on_exec),
+            Err(posix_fs::FsError::BadFileDescriptor) => Ok(false),
+            Err(error) => Err(crate::error(error)),
         });
-        if close_on_exec == Ok(true) {
-            let _ = crate::close(fd as i32);
+        let Ok(close_on_exec) = close_on_exec else {
+            return false;
+        };
+        if close_on_exec && crate::close(fd as i32).is_err() {
+            return false;
         }
     }
     // A stopped thread never ends the request it holds a description
@@ -1655,13 +1661,14 @@ fn move_files(c: &Handle<Channel>) -> bool {
     // never end them. The sessions of the RAM files and the clock keep no
     // waiting operation, so a general Abandon of long operations has
     // nothing else to do here.
-    let (pipes, terminal) = crate::shared::with_files(|files| {
+    let Ok((pipes, terminal)) = crate::shared::with_files(|files| {
         Ok((
             files.pipes().map(Handle::raw),
             files.terminal().map(Handle::raw),
         ))
-    })
-    .unwrap_or((None, None));
+    }) else {
+        return false;
+    };
     if let Some(pipes) = pipes {
         crate::pipes::abandon(pipes);
     }

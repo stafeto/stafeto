@@ -375,26 +375,6 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
     "boot-posix-lock-ring.img",
-    "boot-posix-lock-full4.img",
-    "boot-posix-lock-full7.img",
-    "boot-posix-lock-full4-ring.img",
-    "boot-posix-lock-full7-ring.img",
-    "boot-posix-lock-full4-capacity.img",
-    "boot-posix-lock-full7-capacity.img",
-    "boot-posix-lock-full4-wake.img",
-    "boot-posix-lock-full7-wake.img",
-    "boot-posix-lock-full4-death.img",
-    "boot-posix-lock-full7-death.img",
-    "boot-posix-lock-full4-ofd.img",
-    "boot-posix-lock-full7-ofd.img",
-    "boot-posix-lock-full4-close.img",
-    "boot-posix-lock-full7-close.img",
-    "boot-posix-lock-full4-dup-pid.img",
-    "boot-posix-lock-full4-dup-last.img",
-    "boot-posix-lock-full4-dup-alias.img",
-    "boot-posix-lock-full7-dup-pid.img",
-    "boot-posix-lock-full7-dup-last.img",
-    "boot-posix-lock-full7-dup-alias.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
     "boot-posix-jobs.img",
@@ -460,27 +440,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-posix-procs.img"
         | "boot-posix-jobs.img"
         | "boot-posix-lifetimes.img"
-        | "boot-posix-lock-ring.img"
-        | "boot-posix-lock-full4.img"
-        | "boot-posix-lock-full7.img"
-        | "boot-posix-lock-full4-ring.img"
-        | "boot-posix-lock-full7-ring.img"
-        | "boot-posix-lock-full4-capacity.img"
-        | "boot-posix-lock-full7-capacity.img"
-        | "boot-posix-lock-full4-wake.img"
-        | "boot-posix-lock-full7-wake.img"
-        | "boot-posix-lock-full4-death.img"
-        | "boot-posix-lock-full7-death.img"
-        | "boot-posix-lock-full4-ofd.img"
-        | "boot-posix-lock-full7-ofd.img"
-        | "boot-posix-lock-full4-close.img"
-        | "boot-posix-lock-full7-close.img"
-        | "boot-posix-lock-full4-dup-pid.img"
-        | "boot-posix-lock-full4-dup-last.img"
-        | "boot-posix-lock-full4-dup-alias.img"
-        | "boot-posix-lock-full7-dup-pid.img"
-        | "boot-posix-lock-full7-dup-last.img"
-        | "boot-posix-lock-full7-dup-alias.img" => procs(),
+        | "boot-posix-lock-ring.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -618,34 +578,6 @@ mod tests {
     }
 
     #[test]
-    fn every_dup_replacement_image_has_the_launcher_executable_and_rootfs() {
-        for name in [
-            "boot-posix-lock-full4-dup-pid.img",
-            "boot-posix-lock-full4-dup-last.img",
-            "boot-posix-lock-full4-dup-alias.img",
-            "boot-posix-lock-full7-dup-pid.img",
-            "boot-posix-lock-full7-dup-last.img",
-            "boot-posix-lock-full7-dup-alias.img",
-        ] {
-            let files = files_of(name);
-            let executable = files
-                .iter()
-                .find(|file| file.path == "/bin/procs-child")
-                .unwrap_or_else(|| panic!("{name}: missing launcher executable"));
-            assert_eq!(executable.source, Some(Source::Elf("posix-procs")));
-            assert_eq!(executable.mode, 0o755);
-            assert_eq!((executable.uid, executable.gid), ROOT);
-            assert!(files.iter().any(|file| file.path == "/bin/data"));
-            assert!(files.iter().any(|file| file.path == "/dev/null"));
-            let wanted = sources(&files);
-            assert!(wanted.contains(&Source::Elf("posix-procs")));
-            let first = 10;
-            let bytes = table(&files, first, first + wanted.len() as u32 + 1).unwrap();
-            assert!(rootfs::Rootfs::parse(&bytes, first + wanted.len() as u32 + 1).is_ok());
-        }
-    }
-
-    #[test]
     fn every_list_names_programs_of_its_image() {
         let programs_of = |image: &str| -> Vec<&str> {
             let list: &[crate::ImageProgram] = match image {
@@ -654,30 +586,6 @@ mod tests {
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-lifetimes.img" => &crate::POSIX_LIFETIMES_PROGRAMS,
                 "boot-posix-lock-ring.img" => &crate::POSIX_LOCK_RING_PROGRAMS,
-                "boot-posix-lock-full4.img" => &crate::POSIX_LOCK_FULL4_PROGRAMS,
-                "boot-posix-lock-full7.img" => &crate::POSIX_LOCK_FULL7_PROGRAMS,
-                "boot-posix-lock-full4-ring.img" => &crate::POSIX_LOCK_FULL4_RING_PROGRAMS,
-                "boot-posix-lock-full7-ring.img" => &crate::POSIX_LOCK_FULL7_RING_PROGRAMS,
-                "boot-posix-lock-full4-capacity.img" => &crate::POSIX_LOCK_FULL4_CAPACITY_PROGRAMS,
-                "boot-posix-lock-full7-capacity.img" => &crate::POSIX_LOCK_FULL7_CAPACITY_PROGRAMS,
-                "boot-posix-lock-full4-wake.img" => &crate::POSIX_LOCK_FULL4_WAKE_PROGRAMS,
-                "boot-posix-lock-full7-wake.img" => &crate::POSIX_LOCK_FULL7_WAKE_PROGRAMS,
-                "boot-posix-lock-full4-death.img" => &crate::POSIX_LOCK_FULL4_DEATH_PROGRAMS,
-                "boot-posix-lock-full7-death.img" => &crate::POSIX_LOCK_FULL7_DEATH_PROGRAMS,
-                "boot-posix-lock-full4-ofd.img" => &crate::POSIX_LOCK_FULL4_OFD_PROGRAMS,
-                "boot-posix-lock-full7-ofd.img" => &crate::POSIX_LOCK_FULL7_OFD_PROGRAMS,
-                "boot-posix-lock-full4-close.img" => &crate::POSIX_LOCK_FULL4_CLOSE_PROGRAMS,
-                "boot-posix-lock-full7-close.img" => &crate::POSIX_LOCK_FULL7_CLOSE_PROGRAMS,
-                "boot-posix-lock-full4-dup-pid.img" => &crate::POSIX_LOCK_FULL4_DUP_PID_PROGRAMS,
-                "boot-posix-lock-full4-dup-last.img" => &crate::POSIX_LOCK_FULL4_DUP_LAST_PROGRAMS,
-                "boot-posix-lock-full4-dup-alias.img" => {
-                    &crate::POSIX_LOCK_FULL4_DUP_ALIAS_PROGRAMS
-                }
-                "boot-posix-lock-full7-dup-pid.img" => &crate::POSIX_LOCK_FULL7_DUP_PID_PROGRAMS,
-                "boot-posix-lock-full7-dup-last.img" => &crate::POSIX_LOCK_FULL7_DUP_LAST_PROGRAMS,
-                "boot-posix-lock-full7-dup-alias.img" => {
-                    &crate::POSIX_LOCK_FULL7_DUP_ALIAS_PROGRAMS
-                }
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
@@ -776,26 +684,6 @@ mod tests {
             "boot-posix-procs.img",
             "boot-posix-lifetimes.img",
             "boot-posix-lock-ring.img",
-            "boot-posix-lock-full4.img",
-            "boot-posix-lock-full7.img",
-            "boot-posix-lock-full4-ring.img",
-            "boot-posix-lock-full7-ring.img",
-            "boot-posix-lock-full4-capacity.img",
-            "boot-posix-lock-full7-capacity.img",
-            "boot-posix-lock-full4-wake.img",
-            "boot-posix-lock-full7-wake.img",
-            "boot-posix-lock-full4-death.img",
-            "boot-posix-lock-full7-death.img",
-            "boot-posix-lock-full4-ofd.img",
-            "boot-posix-lock-full7-ofd.img",
-            "boot-posix-lock-full4-close.img",
-            "boot-posix-lock-full7-close.img",
-            "boot-posix-lock-full4-dup-pid.img",
-            "boot-posix-lock-full4-dup-last.img",
-            "boot-posix-lock-full4-dup-alias.img",
-            "boot-posix-lock-full7-dup-pid.img",
-            "boot-posix-lock-full7-dup-last.img",
-            "boot-posix-lock-full7-dup-alias.img",
             "boot-posix-random.img",
             "boot-posix-pty.img",
             "boot-posix-steps.img",

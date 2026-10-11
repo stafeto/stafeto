@@ -4,27 +4,11 @@
 //! Byte ranges for advisory file locks. Arithmetic is independent of the
 //! service's paid records and captures SEEK_CUR and SEEK_END before waiting.
 
-pub mod actor;
-pub mod budget;
-pub mod deadlock;
-pub mod dispatch;
-pub mod groups;
 pub mod jobs;
-pub mod preparation;
-pub mod records;
 pub mod request;
-pub mod server;
-pub mod service;
-pub mod wait_departure;
-pub mod wait_events;
-pub mod wait_notifications;
-pub mod wait_proof;
+pub mod simple;
+pub mod simple_wait;
 pub mod wait_receipts;
-pub mod wait_select;
-pub mod wait_server;
-pub mod waiters;
-#[cfg(test)]
-mod waiters_tests;
 
 /// The greatest byte offset representable by relibc's off_t.
 pub const OFFSET_MAX: u64 = i64::MAX as u64;
@@ -153,6 +137,7 @@ pub struct Lock {
 
 impl Lock {
     /// Existing regions of the same exact owner are replaced by a request.
+    #[inline(always)]
     pub fn conflicts(self, request: Self) -> bool {
         self.owner != request.owner
             && self.range.overlaps(request.range)

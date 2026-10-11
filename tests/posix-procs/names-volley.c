@@ -21,6 +21,7 @@ extern unsigned long long files_volley_ticks(void);
 extern unsigned long long files_volley_frequency(void);
 extern unsigned files_volley_restarts(int op);
 extern unsigned files_volley_full_repeats(void);
+extern int files_volley_admission(void);
 extern int files_volley_read_dir_index(const char *path, unsigned index);
 
 #include <dirent.h>
@@ -746,6 +747,13 @@ static int names_volley(void) {
     VZ_CHECK(vz_name_bucket(17u, "pending") == 968u);
     VZ_CHECK(vz_name_bucket(29u, "c792") == 968u);
     VZ_CHECK(mkdir(VZ, 0777) == 0);
+    VZ_CHECK(vz_create(VZ "/admission-old") == 0);
+    VZ_CHECK(files_volley_admission() == 0);
+    struct stat admission;
+    VZ_CHECK(stat(VZ "/admission-old", &admission) == -1 && errno == ENOENT);
+    VZ_CHECK(stat(VZ "/admission-new", &admission) == 0);
+    VZ_CHECK(unlink(VZ "/admission-new") == 0);
+    puts("posix-procs: names admission: 24 held renames, JOBS_FULL twice, released one, retry renamed");
     files_volley_start();
     failed = vz_thread_cost();
     if (!failed) failed = vz_quiet();

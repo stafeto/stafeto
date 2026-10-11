@@ -1144,6 +1144,34 @@ static int names_bounds(void) {
 }
 #endif
 
+/* Exercise the full inode list while the measured process crowd is live. */
+static int steps_locks(void) {
+    int fd = open("/tmp/steps-locks", O_CREAT | O_RDWR, 0666), result = 0;
+    if (fd < 0) return 1;
+    struct flock lock = {0};
+    lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET; lock.l_len = 1;
+    for (int n = 0; n < 64; n++) {
+        lock.l_start = 2 * n;
+        if (fcntl(fd, F_SETLK, &lock)) { result = 2; goto done; }
+    }
+    for (int n = 0; n < 64; n++) {
+        lock.l_type = F_WRLCK; lock.l_start = 2 * n; lock.l_pid = 0;
+        if (fcntl(fd, 36, &lock) || lock.l_type != F_WRLCK ||
+            lock.l_pid != getpid() || lock.l_start != 2 * n || lock.l_len != 1) {
+            result = 3; goto done;
+        }
+    }
+    lock.l_type = F_WRLCK; lock.l_start = 128;
+    errno = 0;
+    if (fcntl(fd, F_SETLK, &lock) != -1 || errno != ENOLCK) result = 4;
+done:
+    lock.l_type = F_UNLCK; lock.l_start = 0; lock.l_len = 0; lock.l_pid = 0;
+    if (fcntl(fd, F_SETLK, &lock)) result = 5;
+    if (close(fd)) result = 5;
+    if (!result) puts("posix-procs: full inode lock steps ok");
+    return result;
+}
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
@@ -1206,6 +1234,11 @@ static int steps_run(void) {
         pause_ms(10);
     }
     printf("posix-procs: steps %d children live\n", STEPS_BRANCHES * (STEPS_LEAVES + 1) + own);
+    int locks = steps_locks();
+    if (locks) {
+        printf("posix-procs: steps: locks failed %d errno %d\n", locks, errno);
+        failed++;
+    }
 #if CHANGE_STEPS
     /* The change jobs of the RAM file service among the crowd: every
      * method of the family, and the cancel of a rename in flight. */

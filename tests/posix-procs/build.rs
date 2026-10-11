@@ -14,20 +14,14 @@ fn run(cmd: &mut Command) {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=lock-full-capacity.c");
-    println!("cargo:rerun-if-changed=lock-full-wake.c");
-    println!("cargo:rerun-if-changed=lock-full-death.c");
-    println!("cargo:rerun-if-changed=lock-full-close.c");
-    println!("cargo:rerun-if-changed=lock-full-ofd.c");
-    println!("cargo:rerun-if-changed=lock-full-dup.c");
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=lifetime.c");
     println!("cargo:rerun-if-changed=lock-ring.c");
-    println!("cargo:rerun-if-changed=lock-full.c");
     println!("cargo:rerun-if-changed=wait-locks.c");
     println!("cargo:rerun-if-changed=wait-fifo.c");
     println!("cargo:rerun-if-changed=wait-lifecycle.c");
     println!("cargo:rerun-if-changed=lock-deadlock.c");
+    println!("cargo:rerun-if-changed=lock-simple-wait.c");
     println!("cargo:rerun-if-changed=files.c");
     println!("cargo:rerun-if-changed=names.c");
     println!("cargo:rerun-if-changed=names-loss.c");
@@ -77,43 +71,15 @@ fn main() {
             "-DLOADER_ABORT_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_LOADER_ABORT").is_some())
         ))
+        .arg(format!(
+            "-DLIFETIME_RULES_ONLY={}",
+            u8::from(env::var_os("CARGO_FEATURE_LIFETIME_RULES").is_some())
+        ))
+        .arg(format!(
+            "-DLOCK_CORE_ONLY={}",
+            u8::from(env::var_os("CARGO_FEATURE_LOCK_CORE_PROBE").is_some())
+        ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
-        .arg(format!(
-            "-DFULL_DUP={}",
-            if env::var_os("CARGO_FEATURE_LOCK_FULL_DUP_OFD_ALIAS").is_some() {
-                3
-            } else if env::var_os("CARGO_FEATURE_LOCK_FULL_DUP_OFD_LAST").is_some() {
-                2
-            } else if env::var_os("CARGO_FEATURE_LOCK_FULL_DUP_PID").is_some() {
-                1
-            } else {
-                0
-            }
-        ))
-        .arg(format!(
-            "-DFULL_RING={}",
-            u8::from(env::var_os("CARGO_FEATURE_LOCK_FULL_RING").is_some())
-        ))
-        .arg(format!(
-            "-DFULL_CAPACITY={}",
-            u8::from(env::var_os("CARGO_FEATURE_LOCK_FULL_CAPACITY").is_some())
-        ))
-        .arg(format!(
-            "-DFULL_WAKE={}",
-            u8::from(env::var_os("CARGO_FEATURE_LOCK_FULL_WAKE").is_some())
-        ))
-        .arg(format!(
-            "-DFULL_DEATH={}",
-            u8::from(env::var_os("CARGO_FEATURE_LOCK_FULL_DEATH").is_some())
-        ))
-        .arg(format!(
-            "-DFULL_CLOSE={}",
-            u8::from(env::var_os("CARGO_FEATURE_LOCK_FULL_CLOSE").is_some())
-        ))
-        .arg(format!(
-            "-DFULL_OFD={}",
-            u8::from(env::var_os("CARGO_FEATURE_LOCK_FULL_OFD").is_some())
-        ))
         .arg(format!("-DSTEPS_SESSIONS={sessions}"))
         .arg(format!(
             "-DNATIVE_SCOPES_LAUNCHER={}",
@@ -172,9 +138,7 @@ fn main() {
         .arg(sysroot.join("include"))
         .args([
             "-c",
-            if env::var_os("CARGO_FEATURE_LOCK_FULL_FIXTURE").is_some() {
-                "lock-full.c"
-            } else if env::var_os("CARGO_FEATURE_LIFETIME_PROBE").is_some() {
+            if env::var_os("CARGO_FEATURE_LIFETIME_PROBE").is_some() {
                 "lifetime.c"
             } else if env::var_os("CARGO_FEATURE_IMAGE_GATES").is_some() {
                 "image-gates.c"

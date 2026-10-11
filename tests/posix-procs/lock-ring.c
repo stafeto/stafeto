@@ -3,7 +3,7 @@
 /* Separate profile: four init Create roots, four genuine waiting PIDs each. */
 extern void ring_probe_arm(void);
 extern void ring_probe_disarm(void);
-extern int ring_identity(unsigned target, unsigned output[11]);
+extern int ring_identity(unsigned target, unsigned output[5]);
 struct ring_record { unsigned pid, root, generation; char phase; };
 static unsigned ring_index;
 static int ring_a = -1, ring_b = -1, ring_done;
@@ -48,7 +48,7 @@ static int ring_publish(const char *path) {
 }
 static int ring_setup(unsigned index) {
     ring_index = index;
-    unsigned actual[11];
+    unsigned actual[5];
     int observed = ring_identity((unsigned)getpid(), actual);
     if (observed || actual[0] != (unsigned)getpid() || !actual[1]) {
         printf("posix-procs: ring setup identity index=%u rc=%d errno=%d\n", index, observed, errno);
@@ -104,7 +104,7 @@ static int ring_coordinator(void) {
     struct ring_record records[16];
     unsigned roots[4], generations[4];
     for (unsigned i = 0; i < 16; ++i) {
-        unsigned actual[11];
+        unsigned actual[5];
         if (!ring_read(i, &records[i]) || ring_identity(records[i].pid, actual) || !actual[1]) return -1;
         for (unsigned j = 0; j < i; ++j) if (records[i].pid == records[j].pid) return -1;
         if (i % 4 == 0) {
@@ -144,14 +144,10 @@ static int ring_coordinator(void) {
         }
     }
     if (pthread_join(worker, NULL)) bad = 1;
-    unsigned actual[11] = {0};
-    for (unsigned n = 0; n < 1024; ++n) {
-        if (ring_identity((unsigned)getpid(), actual)) { bad = 1; break; }
-        if (actual[10]) break;
-    }
-    if (actual[5] != 16 || actual[6] != 16 || actual[7] != 16 || actual[8] > 20410 || actual[9] > 8 || !actual[8] || !actual[10] || actual[10] > 48 * 1024) bad = 1;
-    printf("posix-procs: ring16 result deadlock=%u success=%u vertices=%u registrations=%u watches=%u ticks=%u visited=%u stack=%u free=%u\n",
-           deadlocked, succeeded, actual[5], actual[6], actual[7], actual[8], actual[9], actual[10], actual[4]);
+    unsigned actual[5] = {0};
+    if (ring_identity((unsigned)getpid(), actual) || !actual[1]) bad = 1;
+    printf("posix-procs: ring16 result deadlock=%u success=%u free=%u\n",
+           deadlocked, succeeded, actual[4]);
     if (deadlocked != 1 || succeeded != 15) bad = 1;
     return bad ? -1 : 0;
 }

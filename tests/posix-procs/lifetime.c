@@ -10,11 +10,20 @@
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#ifndef LIFETIME_RULES_ONLY
+#define LIFETIME_RULES_ONLY 0
+#endif
+#ifndef LOCK_CORE_ONLY
+#define LOCK_CORE_ONLY 0
+#endif
+
+extern void stafeto_probe_loader_bundle(unsigned mode);
 extern int process_lifetime(int pid);
 extern int ram_lifetime(int pid);
 extern int ram_close_event(void);
@@ -52,6 +61,340 @@ static void reap(pid_t child, int killed) {
                                 : WIFEXITED(status) && WEXITSTATUS(status) == 0, 1);
     expect_life("dead before wait returns", child, 0);
 }
+
+/* Each lifecycle rule uses a public lock and one synchronized child. */
+static int lifecycle_set(int fd, int command) {
+    struct flock lock = {0};
+    lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET; lock.l_len = 1;
+    return fcntl(fd, command, &lock);
+}
+static void lifecycle_query(int fd, int wanted, pid_t owner) {
+    struct flock lock = {0};
+    lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET; lock.l_len = 1;
+    expect("lifecycle GETLK", fcntl(fd, F_GETLK, &lock), 0);
+    expect("lifecycle blocker type", lock.l_type, wanted);
+    if (wanted != F_UNLCK) expect("lifecycle exact blocker", lock.l_pid, owner);
+}
+static void lifecycle_child_wait(int ready, int resume) {
+    char byte = 'r';
+    if (write(ready, &byte, 1) != 1 || read(resume, &byte, 1) != 1) _exit(91);
+}
+static int lifecycle_exec_image(int argc, char **argv) {
+    if (argc != 7) return 92;
+    pid_t original = atoi(argv[2]);
+    int fd = atoi(argv[3]), alias = atoi(argv[4]);
+    int ready = atoi(argv[5]), resume = atoi(argv[6]);
+    /* Let the replaced image's exit notification reach the process service. */
+    const struct timespec delay = {0, 10000000};
+    nanosleep(&delay, NULL);
+    expect("exec retained exact PID", getpid(), original);
+    expect_life("exec retained PID lifetime", original, 1);
+    expect("exec retained descriptor", fcntl(fd, F_GETFD) >= 0, 1);
+    if (alias >= 0) {
+        errno = 0;
+        expect("exec closed CLOEXEC alias", fcntl(alias, F_GETFD), -1);
+        expect("exec CLOEXEC alias errno", errno, EBADF);
+    }
+    lifecycle_child_wait(ready, resume);
+    return failures != 0;
+}
+static void lifecycle_exec(int fd, int alias, int ready, int resume) {
+    char pid_text[16], fd_text[16], alias_text[16], ready_text[16], resume_text[16];
+    snprintf(pid_text, sizeof pid_text, "%d", getpid());
+    snprintf(fd_text, sizeof fd_text, "%d", fd);
+    snprintf(alias_text, sizeof alias_text, "%d", alias);
+    snprintf(ready_text, sizeof ready_text, "%d", ready);
+    snprintf(resume_text, sizeof resume_text, "%d", resume);
+    char *args[] = {"procs-child", "lock-exec-observe", pid_text, fd_text,
+                    alias_text, ready_text, resume_text, NULL};
+    char *env[] = {NULL};
+    execve("/bin/procs-child", args, env);
+    _exit(93);
+}
+static int lifecycle_open(const char *path) {
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0666);
+    expect("open lifecycle file", fd >= 0, 1);
+    return fd;
+}
+static void lifecycle_observe(pid_t child, int fd, int ready[2], int resume[2], int blocked) {
+    close(ready[1]); close(resume[0]);
+    char byte = 0;
+    expect("lifecycle child ready", read(ready[0], &byte, 1), 1);
+    expect("lifecycle ready byte", byte, 'r');
+    lifecycle_query(fd, blocked ? F_WRLCK : F_UNLCK, child);
+    expect("resume lifecycle child", write(resume[1], "c", 1), 1);
+    reap(child, 0);
+    close(ready[0]); close(resume[1]);
+}
+static void lifecycle_exec_rule(int cloexec) {
+    int fd = lifecycle_open(cloexec ? "/tmp/lock-l3" : "/tmp/lock-l2");
+    if (fd < 0) return;
+    int ready[2], resume[2];
+    if (pipe(ready) || pipe(resume)) { failures++; close(fd); return; }
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready[0]); close(resume[1]);
+        if (lifecycle_set(fd, F_SETLK)) _exit(94);
+        int alias = -1;
+        if (cloexec) {
+            alias = dup(fd);
+            if (alias < 0 || fcntl(alias, F_SETFD, FD_CLOEXEC)) _exit(95);
+        }
+        lifecycle_exec(fd, alias, ready[1], resume[0]);
+    }
+    expect("fork lifecycle exec", child > 0, 1);
+    if (child > 0) lifecycle_observe(child, fd, ready, resume, !cloexec);
+    close(fd);
+    if (!failures) printf("posix-procs: lock L%d exec rule ok\n", cloexec ? 3 : 2);
+}
+static void lifecycle_exec_failure(void) {
+    int fd = lifecycle_open("/tmp/lock-l4");
+    if (fd < 0) return;
+    int ready[2], resume[2];
+    if (pipe(ready) || pipe(resume)) { failures++; close(fd); return; }
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready[0]); close(resume[1]);
+        if (lifecycle_set(fd, F_SETLK) || fcntl(fd, F_SETFD, FD_CLOEXEC)) _exit(96);
+        char *args[] = {"missing-lock-image", NULL}, *env[] = {NULL};
+        errno = 0;
+        expect("early exec failure", execve("/no-lock-image", args, env), -1);
+        expect("early exec errno", errno, ENOENT);
+        expect("early exec retained CLOEXEC", fcntl(fd, F_GETFD), FD_CLOEXEC);
+        lifecycle_child_wait(ready[1], resume[0]);
+        _exit(failures != 0);
+    }
+    expect("fork early exec failure", child > 0, 1);
+    if (child > 0) lifecycle_observe(child, fd, ready, resume, 1);
+    child = fork();
+    if (child == 0) {
+        if (lifecycle_set(fd, F_SETLK)) _exit(97);
+        /* Existing omission mode rejects the moved RAM descriptor bundle. */
+        stafeto_probe_loader_bundle(5);
+        char *args[] = {"procs-child", "exec", NULL}, *env[] = {NULL};
+        execve("/bin/procs-child", args, env);
+        _exit(98);
+    }
+    expect("fork late exec failure", child > 0, 1);
+    if (child > 0) {
+        int status = 0;
+        expect("wait late exec failure", waitpid(child, &status, 0), child);
+        expect("late exec exits 127", WIFEXITED(status) ? WEXITSTATUS(status) : -1, 127);
+        expect_life("late exec death published", child, 0);
+        lifecycle_query(fd, F_UNLCK, 0);
+    }
+    close(fd);
+    if (!failures) puts("posix-procs: lock L4 exec failure boundary ok");
+}
+static void lifecycle_clofork(void) {
+    const char *path = "/tmp/lock-l5";
+    int fd = lifecycle_open(path);
+    if (fd < 0) return;
+    expect("parent OFD lock", lifecycle_set(fd, 37), 0);
+    expect("parent CLOFORK descriptor", fcntl(fd, F_SETFD, FD_CLOFORK), 0);
+    int ready[2], resume[2];
+    if (pipe(ready) || pipe(resume)) { failures++; close(fd); return; }
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready[0]); close(resume[1]);
+        errno = 0;
+        expect("CLOFORK child has no descriptor", fcntl(fd, F_GETFD), -1);
+        expect("CLOFORK child descriptor errno", errno, EBADF);
+        int independent = open(path, O_RDWR);
+        expect("CLOFORK child independent open", independent >= 0, 1);
+        if (independent >= 0) lifecycle_query(independent, F_WRLCK, -1);
+        lifecycle_child_wait(ready[1], resume[0]);
+        /* The excluded child cannot retain a hidden reference after parent close. */
+        if (independent >= 0) { lifecycle_query(independent, F_UNLCK, 0); close(independent); }
+        _exit(failures != 0);
+    }
+    expect("fork CLOFORK child", child > 0, 1);
+    close(ready[1]); close(resume[0]);
+    if (child > 0) {
+        char byte = 0;
+        expect("excluded child ready", read(ready[0], &byte, 1), 1);
+        lifecycle_query(fd, F_WRLCK, -1);
+        expect("parent final OFD close while excluded child lives", close(fd), 0);
+        expect("resume excluded child", write(resume[1], "c", 1), 1);
+        reap(child, 0);
+    } else close(fd);
+    close(ready[0]); close(resume[1]);
+    fd = open(path, O_RDWR);
+    if (fd >= 0) { lifecycle_query(fd, F_UNLCK, 0); close(fd); }
+    else failures++;
+    if (!failures) puts("posix-procs: lock L5 excluded child preserves OFD ok");
+}
+static void lifecycle_death(void) {
+    int fd = lifecycle_open("/tmp/lock-l6");
+    if (fd < 0) return;
+    int ready[2], resume[2];
+    if (pipe(ready) || pipe(resume)) { failures++; close(fd); return; }
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready[0]); close(resume[1]);
+        if (lifecycle_set(fd, F_SETLK)) _exit(99);
+        lifecycle_child_wait(ready[1], resume[0]);
+        _exit(100);
+    }
+    expect("fork PID lock death", child > 0, 1);
+    close(ready[1]); close(resume[0]);
+    if (child > 0) {
+        char byte = 0;
+        expect("PID lock owner ready", read(ready[0], &byte, 1), 1);
+        lifecycle_query(fd, F_WRLCK, child);
+        expect("kill PID lock owner", kill(child, SIGKILL), 0);
+        reap(child, 1);
+        lifecycle_query(fd, F_UNLCK, 0);
+    }
+    close(ready[0]); close(resume[1]); close(fd);
+    if (!failures) puts("posix-procs: lock L6 death precedes wait reply ok");
+}
+static void public_lock_lifecycles(void) {
+    lifecycle_exec_rule(0);
+    lifecycle_exec_rule(1);
+    lifecycle_exec_failure();
+    lifecycle_clofork();
+    lifecycle_death();
+}
+
+
+static void public_lock_capacity(void) {
+    enum { INODES = 6, SEGMENTS = 64 };
+    int files[INODES];
+    for (int inode = 0; inode < INODES; inode++) {
+        char path[40];
+        snprintf(path, sizeof path, "/tmp/inode-lock-capacity-%d", inode);
+        files[inode] = lifecycle_open(path);
+        if (files[inode] < 0) {
+            for (int earlier = 0; earlier < inode; earlier++) close(files[earlier]);
+            return;
+        }
+        for (int segment = 0; segment < SEGMENTS; segment++) {
+            struct flock lock = {0};
+            lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET;
+            lock.l_start = segment * 2; lock.l_len = 1;
+            expect("64 segments on each of six inodes", fcntl(files[inode], F_SETLK, &lock), 0);
+        }
+    }
+    struct flock extra = {0};
+    extra.l_type = F_WRLCK; extra.l_whence = SEEK_SET;
+    extra.l_start = SEGMENTS * 2; extra.l_len = 1;
+    errno = 0;
+    expect("65th inode segment fails", fcntl(files[0], F_SETLK, &extra), -1);
+    expect("65th inode segment errno", errno, ENOLCK);
+    for (int segment = 0; segment <= SEGMENTS; segment++) {
+        struct flock query = {0};
+        query.l_type = F_WRLCK; query.l_whence = SEEK_SET;
+        query.l_start = segment * 2; query.l_len = 1;
+        /* OFD GET also observes the caller's PID locks. */
+        expect("capacity snapshot GET", fcntl(files[0], 36, &query), 0);
+        expect("ENOLCK preserves every original segment", query.l_type,
+               segment < SEGMENTS ? F_WRLCK : F_UNLCK);
+        if (segment < SEGMENTS) {
+            expect("capacity snapshot exact PID", query.l_pid, getpid());
+            expect("capacity snapshot exact start", (int)query.l_start, segment * 2);
+            expect("capacity snapshot exact length", (int)query.l_len, 1);
+        }
+    }
+    struct flock released = {0};
+    released.l_type = F_UNLCK; released.l_whence = SEEK_SET; released.l_len = 1;
+    expect("release one full-inode segment", fcntl(files[0], F_SETLK, &released), 0);
+    expect("reuse released inode segment", fcntl(files[0], F_SETLK, &extra), 0);
+    for (int inode = 0; inode < INODES; inode++) expect("close capacity inode", close(files[inode]), 0);
+    int check = open("/tmp/inode-lock-capacity-0", O_RDWR);
+    expect("reopen capacity inode", check >= 0, 1);
+    if (check >= 0) {
+        struct flock query = {0};
+        query.l_type = F_WRLCK; query.l_whence = SEEK_SET;
+        expect("capacity close clears all segments", fcntl(check, F_GETLK, &query), 0);
+        expect("capacity inode unlocked after close", query.l_type, F_UNLCK);
+        close(check);
+    }
+    if (!failures) puts("posix-procs: six inodes retain 384 locks, inode64 ENOLCK is atomic and slots reuse ok");
+}
+
+/* A compact maximum-inode fixture for genuine dispatch budget measurements. */
+static void core_lock_query(int fd, off_t start, off_t length, short kind,
+                            off_t blocker_start, off_t blocker_length) {
+    struct flock query = {0};
+    query.l_type = F_WRLCK; query.l_whence = SEEK_SET;
+    query.l_start = start; query.l_len = length;
+    struct flock unchanged;
+    memcpy(&unchanged, &query, sizeof query);
+    expect("core OFD GET input PID is zero", query.l_pid, 0);
+    expect("core full-inode public GET", fcntl(fd, 36, &query), 0);
+    expect("core exact blocker type", query.l_type, kind);
+    if (kind == F_UNLCK) {
+        unchanged.l_type = F_UNLCK;
+        expect("core unlocked GET changes only type", memcmp(&query, &unchanged, sizeof query), 0);
+    } else {
+        expect("core exact blocker PID", query.l_pid, getpid());
+        expect("core canonical blocker whence", query.l_whence, SEEK_SET);
+        expect("core canonical blocker start", query.l_start == blocker_start, 1);
+        expect("core canonical blocker length", query.l_len == blocker_length, 1);
+    }
+}
+static void public_lock_core(void) {
+    const char *path = "/tmp/full-inode-lock-core";
+    int fd = lifecycle_open(path);
+    if (fd < 0) return;
+    int alias = dup(fd);
+    expect("core ordinary-close alias", alias >= 0, 1);
+    if (alias < 0) { close(fd); return; }
+    for (int segment = 0; segment < 64; segment++) {
+        struct flock lock = {0};
+        lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET;
+        lock.l_start = 4 * segment; lock.l_len = 3;
+        expect("core fill64 disjoint records", fcntl(fd, F_SETLK, &lock), 0);
+    }
+    core_lock_query(fd, 252, 3, F_WRLCK, 252, 3);
+    core_lock_query(fd, 255, 1, F_UNLCK, 0, 0);
+    core_lock_query(fd, 0, 0, F_WRLCK, 0, 3);
+    struct flock replacement = {0};
+    replacement.l_type = F_RDLCK; replacement.l_whence = SEEK_SET;
+    replacement.l_start = 252; replacement.l_len = 3;
+    expect("core replace final record with different kind", fcntl(fd, F_SETLK, &replacement), 0);
+    core_lock_query(fd, 252, 3, F_RDLCK, 252, 3);
+    struct flock cut = {0};
+    cut.l_type = F_UNLCK; cut.l_whence = SEEK_SET;
+    cut.l_start = 125; cut.l_len = 1;
+    struct flock before;
+    memcpy(&before, &cut, sizeof cut);
+    errno = 0;
+    expect("core split at64 fails atomically", fcntl(fd, F_SETLK, &cut), -1);
+    expect("core split capacity errno", errno, ENOLCK);
+    expect("core failed SET preserves input", memcmp(&cut, &before, sizeof cut), 0);
+    for (int segment = 0; segment < 64; segment++)
+        core_lock_query(fd, 4 * segment, 3, segment == 63 ? F_RDLCK : F_WRLCK,
+                        4 * segment, 3);
+    struct flock free_slot = {0};
+    free_slot.l_type = F_UNLCK; free_slot.l_whence = SEEK_SET; free_slot.l_len = 3;
+    expect("core free one record", fcntl(fd, F_SETLK, &free_slot), 0);
+    core_lock_query(fd, 0, 3, F_UNLCK, 0, 0);
+    memcpy(&cut, &before, sizeof cut);
+    expect("core split reuses freed capacity", fcntl(fd, F_SETLK, &cut), 0);
+    core_lock_query(fd, 124, 1, F_WRLCK, 124, 1);
+    core_lock_query(fd, 125, 1, F_UNLCK, 0, 0);
+    core_lock_query(fd, 126, 1, F_WRLCK, 126, 1);
+    expect("core ordinary alias close releases every PID record", close(alias), 0);
+    core_lock_query(fd, 0, 0, F_UNLCK, 0, 0);
+    for (int segment = 0; segment < 64; segment++) {
+        struct flock lock = {0};
+        lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET;
+        lock.l_start = 4 * segment; lock.l_len = 3;
+        expect("core refill64 before full coalesce", fcntl(fd, F_SETLK, &lock), 0);
+    }
+    struct flock whole = {0};
+    whole.l_type = F_WRLCK; whole.l_whence = SEEK_SET; whole.l_len = 255;
+    expect("core coalesces all64 records in one SET", fcntl(fd, F_SETLK, &whole), 0);
+    core_lock_query(fd, 0, 1, F_WRLCK, 0, 255);
+    core_lock_query(fd, 252, 3, F_WRLCK, 0, 255);
+    core_lock_query(fd, 255, 1, F_UNLCK, 0, 0);
+    expect("core final descriptor close", close(fd), 0);
+    expect("core unlink fixture", unlink(path), 0);
+    if (!failures) puts("posix-procs: full inode lock core ok");
+}
+
 static void public_lock_commands(void) {
     int fd = open("/tmp/public-lock-fields", O_CREAT | O_TRUNC | O_RDWR, 0666);
     expect("open public lock file", fd >= 0, 1);
@@ -307,8 +650,37 @@ static void public_lock_signals(void) {
 #include "wait-fifo.c"
 #include "wait-lifecycle.c"
 #include "lock-deadlock.c"
+#include "lock-simple-wait.c"
 
 int main(int argc, char **argv) {
+    char *core_args[] = {"posix-procs", "lock-core", NULL};
+    if (LOCK_CORE_ONLY && argc <= 1) { argc = 2; argv = core_args; }
+    if (argc > 1 && strcmp(argv[1], "lock-core") == 0) {
+        public_lock_core();
+        return failures != 0;
+    }
+    char *rules_args[] = {"posix-procs", "lifetime-rules", NULL};
+    if (LIFETIME_RULES_ONLY && argc <= 1) {
+        argc = 2;
+        argv = rules_args;
+    }
+    if (argc > 1 && strcmp(argv[1], "lock-exec-observe") == 0)
+        return lifecycle_exec_image(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "lifetime-rules-run") == 0) {
+        expect_life("lifecycle supervisor PID", getpid(), 1);
+        public_lock_lifecycles();
+        return failures != 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "lifetime-rules") == 0) {
+        /* The mapped supervisor supplies the region map required by fork. */
+        char *args[] = {"procs-child", "lifetime-rules-run", NULL}, *env[] = {NULL};
+        pid_t child = -1;
+        expect("spawn lifecycle supervisor", posix_spawn(&child, "/bin/procs-child", NULL,
+                                                         NULL, args, env), 0);
+        if (child > 0) reap(child, 0);
+        if (!failures) puts("posix-procs: lock lifecycle rules ok");
+        return failures != 0;
+    }
     int ring_result;
     if (ring_dispatch(argc, argv, &ring_result)) return ring_result;
     if(argc>1 && strcmp(argv[1],"wait-lifecycle-exec")==0)return public_wait_lifecycle_exec(argc,argv);
@@ -338,6 +710,8 @@ int main(int argc, char **argv) {
     expect_life("PID lives with changed credentials", getpid(), 1);
     expect("restore effective UID", seteuid(0), 0);
     expect_life("PID lives with restored credentials", getpid(), 1);
+    public_lock_lifecycles();
+    public_lock_capacity();
     public_lock_commands();
     int receipt_fd = open("/tmp/public-lock-receipts", O_CREAT | O_RDWR, 0666);
     expect("open public lock receipt file", receipt_fd >= 0, 1);
@@ -353,6 +727,7 @@ int main(int argc, char **argv) {
     public_wait_arbitrary_jumps();
     public_wait_pending_rotation();
     public_lock_deadlocks();
+    public_simple_wait_graphs();
     expect("native lock commands and exact custody", ram_lock_commands(getpid()), 0);
     expect("native close receipt and 32-reference birth", ram_close_event(), 0);
     expect("public close receipts and helper reuse", close_driver_receipts(), 0);
