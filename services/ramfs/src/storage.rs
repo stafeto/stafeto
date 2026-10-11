@@ -2234,10 +2234,15 @@ impl<'a> Storage<'a> {
             self.link_page(i, p, page, predecessor);
             self.state.accounts[a].as_mut().unwrap().usage.pages += 1;
         }
-        for (n, b) in bytes.iter().enumerate() {
-            let at = offset + n;
-            let p = self.state.overlays[i].pages[at / PAGE];
-            self.data[p as usize * PAGE + at % PAGE] = *b;
+        let mut copied = 0;
+        while copied < bytes.len() {
+            let at = offset + copied;
+            let within = at % PAGE;
+            let amount = (PAGE - within).min(bytes.len() - copied);
+            let page = self.state.overlays[i].pages[at / PAGE];
+            let start = page as usize * PAGE + within;
+            self.data[start..start + amount].copy_from_slice(&bytes[copied..copied + amount]);
+            copied += amount;
         }
         self.state.nodes[token.slot as usize].length =
             self.state.nodes[token.slot as usize].length.max(end as u64);

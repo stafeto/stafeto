@@ -4314,7 +4314,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // Every newly introduced dispatch is measured, with the part's 10% reserve.
     for (service, measured, kinds) in [
         ("process", &rows, &[55usize, 56, 57][..]),
-        ("RAM", &ram, &[59usize][..]),
+        ("RAM", &ram, &[3usize, 59][..]),
     ] {
         for kind in kinds {
             let ticks = measured.iter().find(|(k, ..)| k == kind).map_or(0, |r| r.1);

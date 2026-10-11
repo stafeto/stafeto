@@ -31,6 +31,29 @@ fn drain(ram: &mut Ram<'_>) -> usize {
     steps
 }
 
+#[test]
+fn offset_write_crosses_pages_without_corrupting_neighbors_or_sparse_bytes() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let file = create(&mut ram, FIRST, b"cross-page");
+    let mut expected = std::vec![0u8; 3 * PAGE + 13];
+    expected[PAGE - 9..2 * PAGE + 17].fill(0x71);
+    assert_eq!(
+        ram.storage
+            .write(file, FIRST, PAGE - 9, &expected[PAGE - 9..2 * PAGE + 17]),
+        Ok(PAGE + 26)
+    );
+    let replacement: std::vec::Vec<u8> = (0..PAGE + 31).map(|n| (n % 251) as u8).collect();
+    expected[2 * PAGE - 18..3 * PAGE + 13].copy_from_slice(&replacement);
+    assert_eq!(
+        ram.storage.write(file, FIRST, 2 * PAGE - 18, &replacement),
+        Ok(PAGE + 31)
+    );
+    let mut actual = std::vec![0xff; expected.len()];
+    assert_eq!(ram.storage.read(file, 0, &mut actual), Ok(expected.len()));
+    assert_eq!(actual, expected);
+    assert_eq!(ram.storage.usage(FIRST).pages, 4);
+}
+
 #[cfg(feature = "auth-probe")]
 #[test]
 fn diagnostic_gc_creation_is_paid_unpublished_and_commits_once() {
