@@ -71,12 +71,17 @@ static int files(void) {
     int seen = 0;
     struct dirent *entry;
     while ((entry = readdir(etc)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0) { CHECK(entry->d_type == DT_DIR); seen |= 1; }
-        else if (strcmp(entry->d_name, "..") == 0) { CHECK(entry->d_type == DT_DIR); seen |= 2; }
-        else if (strcmp(entry->d_name, "motd") == 0) { CHECK(entry->d_type == DT_REG); seen |= 4; }
+        int bit = 0;
+        if (strcmp(entry->d_name, ".") == 0) { CHECK(entry->d_type == DT_DIR); bit = 1; }
+        else if (strcmp(entry->d_name, "..") == 0) { CHECK(entry->d_type == DT_DIR); bit = 2; }
+        else if (strcmp(entry->d_name, "motd") == 0) { CHECK(entry->d_type == DT_REG); bit = 4; }
+        else if (strcmp(entry->d_name, "passwd") == 0) { CHECK(entry->d_type == DT_REG); bit = 8; }
+        else if (strcmp(entry->d_name, "group") == 0) { CHECK(entry->d_type == DT_REG); bit = 16; }
         else CHECK(!"an entry /etc does not have");
+        CHECK((seen & bit) == 0);
+        seen |= bit;
     }
-    CHECK(seen == 7);
+    CHECK(seen == 31);
     rewinddir(etc);
     CHECK(readdir(etc) != NULL);
     CHECK(closedir(etc) == 0);
