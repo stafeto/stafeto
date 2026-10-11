@@ -14,6 +14,7 @@ pub(crate) struct Held {
     description: Token,
     pub(crate) open: Open,
     capacity: u64,
+    file_size_limit: u64,
 }
 
 impl Held {
@@ -76,6 +77,23 @@ impl DataLease {
     }
 }
 
+/// Boot fixtures have no POSIX record; authenticated callers use the admitted snapshot.
+pub(crate) fn file_size_limit(fds: &Fds) -> u64 {
+    fds.binding
+        .snapshot_ref()
+        .map_or(u64::MAX, |who| who.limits.values[proto_process::FSIZE].soft)
+}
+
+fn write_extent(offset: u64, count: usize, physical: u64, limit: u64) -> Result<usize, u32> {
+    if offset >= limit {
+        return Err(proto_fs::FILE_SIZE_LIMIT);
+    }
+    if offset >= physical {
+        return Err(FILE_TOO_LARGE);
+    }
+    Ok(count.min((physical.min(limit) - offset) as usize))
+}
+
 fn io_capacity(file: File) -> u64 {
     if matches!(file, File::Scratch) {
         crate::FILE_CAPACITY as u64
@@ -112,6 +130,7 @@ impl Ram<'_> {
             description,
             open: shared.open,
             capacity: io_capacity(shared.open.file),
+            file_size_limit: file_size_limit(fds),
         })
     }
 
@@ -228,14 +247,13 @@ impl Ram<'_> {
                     lease.held.open.offset as u64
                 }
             });
-            if offset >= lease.held.capacity {
-                return Err(FILE_TOO_LARGE);
-            }
-            Ok(Some((
-                token,
+            let count = write_extent(
                 offset,
-                bytes.len().min((lease.held.capacity - offset) as usize),
-            )))
+                bytes.len(),
+                lease.held.capacity,
+                lease.held.file_size_limit,
+            )?;
+            Ok(Some((token, offset, count)))
         };
         let request = match prepare() {
             Ok(request) => request,
@@ -279,6 +297,8 @@ impl Ram<'_> {
             .and({
                 if length > i64::MAX as u64 {
                     Err(OFFSET_OVERFLOW)
+                } else if length > lease.held.file_size_limit {
+                    Err(proto_fs::FILE_SIZE_LIMIT)
                 } else if length > lease.held.capacity {
                     Err(FILE_TOO_LARGE)
                 } else {
@@ -348,10 +368,8 @@ impl Ram<'_> {
                 }
             });
             let capacity = io_capacity(open.file);
-            if offset >= capacity {
-                return Err(FILE_TOO_LARGE);
-            }
-            data_request = Some((token, offset, bytes.len().min((capacity - offset) as usize)));
+            let count = write_extent(offset, bytes.len(), capacity, file_size_limit(fds))?;
+            data_request = Some((token, offset, count));
         }
         let held = self.io_retain(fds, fd)?;
         if let Some((token, offset, requested)) = data_request {
@@ -392,6 +410,9 @@ impl Ram<'_> {
         }
         if length > i64::MAX as u64 {
             return Err(OFFSET_OVERFLOW);
+        }
+        if length > file_size_limit(fds) {
+            return Err(proto_fs::FILE_SIZE_LIMIT);
         }
         if length > io_capacity(open.file) {
             return Err(FILE_TOO_LARGE);
@@ -434,6 +455,9 @@ impl WritePreparation {
         let held = self.held.as_ref().ok_or(BAD_FD)?;
         ram.io_validate(held)?;
         if let Some(data) = self.data.as_mut() {
+            if data.offset + self.count as u64 > held.file_size_limit {
+                return Err(proto_fs::FILE_SIZE_LIMIT);
+            }
             if data.offset + self.count as u64 > held.capacity {
                 return Err(FILE_TOO_LARGE);
             }
@@ -499,6 +523,9 @@ impl TruncatePreparation {
         }
         let held = self.held.as_ref().ok_or(BAD_FD)?;
         ram.io_validate(held)?;
+        if self.data.length > held.file_size_limit {
+            return Err(proto_fs::FILE_SIZE_LIMIT);
+        }
         if self.data.length > held.capacity {
             return Err(FILE_TOO_LARGE);
         }

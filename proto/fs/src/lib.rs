@@ -218,6 +218,8 @@ pub const LOCK_CONFLICT: u32 = 330;
 pub const LOCK_CANCELLED: u32 = 331;
 /// EDEADLK: a proven PID wait cycle contains this candidate.
 pub const LOCK_DEADLOCK: u32 = 332;
+/// The authenticated process soft FSIZE refused a write (EFBIG and SIGXFSZ).
+pub const FILE_SIZE_LIMIT: u32 = 333;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -372,6 +374,8 @@ pub enum Method {
     WaitRelease = 57,
     /// Exactly one notification channel, without a retained reply capability.
     WaitArm = 58,
+    /// Exact packed fd/slot and generation on an authentic Pending loader session.
+    OpenExecFd = 59,
 }
 
 impl Method {
@@ -438,6 +442,7 @@ impl Method {
             56 => Some(Self::WaitCancel),
             57 => Some(Self::WaitRelease),
             58 => Some(Self::WaitArm),
+            59 => Some(Self::OpenExecFd),
             _ => None,
         }
     }
@@ -446,7 +451,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58,
+    52, 53, 54, 55, 56, 57, 58, 59,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

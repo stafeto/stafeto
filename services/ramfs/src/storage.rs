@@ -1117,14 +1117,29 @@ impl<'a> Storage<'a> {
             };
         }
         if let Some(tree) = tree {
-            out.state.nodes[0].links += u32::from(tree.root_links());
+            let etc = tree.find("/etc");
+            out.state.nodes[0].links += u32::from(tree.root_links()) - u32::from(etc.is_some());
             for n in 0..tree.len() {
                 let entry = tree.entry(n);
                 let slot = 5 + canonical(&tree, n) as usize;
                 let parent = tree.parent(n).map_or(ROOT, |p| Token {
-                    slot: 5 + p,
+                    slot: if Some(p) == etc { 1 } else { 5 + p },
                     generation: 1,
                 });
+                if Some(n) == etc {
+                    // Keep original indexing, but merge the boot directory into
+                    // the genuine fixed inode instead of publishing a second name.
+                    out.state.nodes[1].links += u32::from(tree.links(n)) - 2;
+                    out.state.originals[4 + n as usize] = Original {
+                        parent: ROOT,
+                        node: Token {
+                            slot: 1,
+                            generation: 1,
+                        },
+                        hidden: true,
+                    };
+                    continue;
+                }
                 if out.state.nodes[slot].kind == 0 {
                     let file = crate::image_file(&tree, n);
                     out.state.nodes[slot] = Node {
@@ -1159,6 +1174,9 @@ impl<'a> Storage<'a> {
         }
         for i in 0..out.state.original_len {
             let original = out.state.originals[i];
+            if original.hidden {
+                continue;
+            }
             let node = &mut out.state.nodes[original.node.slot as usize];
             if node.kind == crate::DIR {
                 node.name_entry = i as u16;

@@ -35,6 +35,14 @@ static STATE: Cell = Cell(UnsafeCell::new(State {
 static STARTED: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 static FILES_LOCK: LayerLock = LayerLock::raising();
+/// Apply the authoritative process soft limit under the existing table lock.
+pub fn set_nofile_limit(limit: u64) -> Result<(), i32> {
+    process_state(|files| {
+        files.set_nofile_limit(limit);
+        Ok(())
+    })
+}
+
 pub fn terminals_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
     process_state(|files| Ok(files.terminals_kept_by_fork(out)))
 }
@@ -85,6 +93,14 @@ pub unsafe fn init(
         )
     }
     .map_err(|_| rt::abi::Error::BadState)?;
+    if crate::process::getpid() != 0 {
+        let limit = crate::process::client()
+            .limit(proto_process::NOFILE)
+            .map_err(|_| rt::abi::Error::BadState)?;
+        // SAFETY: startup still owns initialized storage exclusively; TLS and
+        // the raising fd lock are unavailable until CRT registers the thread.
+        unsafe { (*STATE.0.get()).files.assume_init_mut() }.set_nofile_limit(limit.soft);
+    }
     crate::relibc::configure_open_lifetime(detach_open_owner, help_open_recovery);
     READY.store(true, Ordering::Release);
     Ok(())
@@ -101,6 +117,8 @@ pub unsafe fn after_fork(
     pipes: Option<Handle<rt::handle::Channel>>,
     terminal: Option<Handle<rt::handle::Channel>>,
 ) {
+    // SAFETY: fork has one surviving thread; discard the copied parent mutex.
+    unsafe { crate::resources::after_fork() };
     if !READY.load(Ordering::Acquire) {
         return;
     }
@@ -112,6 +130,9 @@ pub unsafe fn after_fork(
         if let Some(identity) = crate::process::identity() {
             let _ = own.bind(identity);
         }
+    }
+    if crate::resources::initialize_nofile().is_err() {
+        rt::sys::process_exit(125);
     }
 }
 

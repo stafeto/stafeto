@@ -384,6 +384,7 @@ pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Co
     /// Counts the records of jobs that went; a thread that waits for a place
     /// waits on it. The caller wakes it after unlocking.
     jobs: AtomicU32,
+    allocation_limit: u32,
 }
 
 impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<T, N, R, S, C> {
@@ -416,6 +417,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<
             }; JOBS_MAX],
             release_early: |_| false,
             jobs: AtomicU32::new(0),
+            allocation_limit: N as u32,
         }
     }
 }
@@ -493,6 +495,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         unsafe {
             core::ptr::addr_of_mut!((*destination).release_early).write(release_early);
             core::ptr::addr_of_mut!((*destination).jobs).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*destination).allocation_limit).write(N as u32);
         }
     }
 
@@ -587,13 +590,19 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             })
     }
 
+    /// Existing descriptors and already reserved Opens retain their custody.
+    pub fn set_allocation_limit(&mut self, limit: u64) {
+        self.allocation_limit = limit.min(N as u64) as u32;
+    }
+
     pub fn vacant(&self, minimum: u32) -> Result<u32, Error> {
-        if minimum as usize >= N {
+        if minimum as usize >= N || minimum >= self.allocation_limit {
             return Err(Error::InvalidArgument);
         }
         self.entries
             .iter()
             .enumerate()
+            .take(self.allocation_limit as usize)
             .skip(minimum as usize)
             .find(|(_, slot)| matches!(slot.state, EntryState::Empty))
             .map(|(fd, _)| fd as u32)
@@ -614,10 +623,16 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     pub fn duplicate(&mut self, fd: u32, minimum: u32, flags: Flags) -> Result<u32, Error> {
         let backend = self.get(fd)?;
+        if minimum >= self.allocation_limit {
+            return Err(Error::InvalidArgument);
+        }
         self.insert_at_free(backend, minimum, flags)
     }
 
     fn insert_at_free(&mut self, backend: T, minimum: u32, flags: Flags) -> Result<u32, Error> {
+        if minimum == 0 && self.allocation_limit == 0 {
+            return Err(Error::TooManyOpenFiles);
+        }
         let fd = self.vacant(minimum)?;
         self.install(fd, backend, flags)?;
         Ok(fd)
@@ -813,6 +828,9 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 Err(Error::InvalidArgument)
             };
         }
+        if target >= self.allocation_limit {
+            return Err(Error::BadFileDescriptor);
+        }
         if let Some(token) = self.pending(target) {
             return Ok(Replacement::Pending(token));
         }
@@ -1007,6 +1025,9 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         let Phase::Preparing(recovery) = record.phase else {
             return Err(Error::InvalidArgument);
         };
+        if minimum == 0 && self.allocation_limit == 0 {
+            return Err(Error::TooManyOpenFiles);
+        }
         let fd = self.vacant(minimum)?;
         let slot = &mut self.entries[fd as usize];
         let generation = slot.generation.checked_add(1).ok_or(Error::Io)?;
@@ -1502,6 +1523,48 @@ mod tests {
         assert_eq!(table.flags(0), Ok(flags));
         assert_eq!(table.set_flags(9, flags), Err(Error::BadFileDescriptor));
         assert_eq!(table.flags(9), Err(Error::BadFileDescriptor));
+    }
+
+    #[test]
+    fn lowered_allocation_ceiling_preserves_high_descriptors_and_imports() {
+        let mut table = Table::<u32, 8>::default();
+        table.place(6, 60, Flags::default()).unwrap();
+        table.set_allocation_limit(2);
+        assert_eq!(table.get(6), Ok(60));
+        assert_eq!(table.dup2(6, 6), Ok((6, None)));
+        assert_eq!(table.dup2(6, 3), Err(Error::BadFileDescriptor));
+        assert_eq!(
+            table.duplicate(6, 2, Flags::default()),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(table.insert(10, Flags::default()), Ok(0));
+        assert_eq!(table.duplicate(6, 0, Flags::default()), Ok(1));
+        assert_eq!(
+            table.insert(20, Flags::default()),
+            Err(Error::TooManyOpenFiles)
+        );
+        table.place(7, 70, Flags::default()).unwrap();
+        table.set_allocation_limit(u64::MAX);
+        assert_eq!(table.insert(20, Flags::default()), Ok(2));
+    }
+
+    #[test]
+    fn reserved_open_linearizes_before_ceiling_change_and_zero_refuses_new_opens() {
+        let mut table = Table::<u32, 8, u64>::default();
+        let (_open, claim) = table.begin_open(owner(1), 17).unwrap();
+        let entry = table.reserve_open(claim, 4, Flags::default()).unwrap();
+        table.set_allocation_limit(0);
+        // The exact paid reservation remains intact; only fresh allocation stops.
+        assert_eq!(table.pending(entry.fd), Some(_open));
+        assert_eq!(
+            table.insert(10, Flags::default()),
+            Err(Error::TooManyOpenFiles)
+        );
+        let (_, second) = table.begin_open(owner(2), 18).unwrap();
+        assert_eq!(
+            table.reserve_open(second, 0, Flags::default()),
+            Err(Error::TooManyOpenFiles)
+        );
     }
 
     fn owner(value: u64) -> OwnerToken {

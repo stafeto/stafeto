@@ -1386,8 +1386,34 @@ pub fn exec<'s>(
     envp: impl Iterator<Item = &'s [u8]> + Clone,
     umask: u32,
 ) -> Result<core::convert::Infallible, i32> {
+    exec_selected(ExecSource::Path(path), argv, envp, umask)
+}
+
+/// Execute the exact retained description; current offset and open mode are ignored.
+pub fn fexec<'s>(
+    fd: i32,
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    umask: u32,
+) -> Result<core::convert::Infallible, i32> {
+    let fd = u32::try_from(fd).map_err(|_| crate::constants::EBADF)?;
+    exec_selected(ExecSource::Descriptor(fd), argv, envp, umask)
+}
+
+#[derive(Clone, Copy)]
+enum ExecSource<'a> {
+    Path(&'a [u8]),
+    Descriptor(u32),
+}
+
+fn exec_selected<'s>(
+    source: ExecSource<'_>,
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    umask: u32,
+) -> Result<core::convert::Infallible, i32> {
     use crate::constants::ENOENT;
-    if path.is_empty() {
+    if matches!(source, ExecSource::Path(path) if path.is_empty()) {
         return Err(ENOENT);
     }
     let block = crate::threads::own_block();
@@ -1401,7 +1427,7 @@ pub fn exec<'s>(
     let pending = block.pending.load(Ordering::SeqCst) & !proto_process::job::MASK;
     let stopped = crate::signals::stop_others();
     let result =
-        stopped.and_then(|()| exec_stopped(path, argv, envp, umask, mask, pending, Probe::None));
+        stopped.and_then(|()| exec_stopped(source, argv, envp, umask, mask, pending, Probe::None));
     // Back from an exec that failed before step 4: all as it was.
     crate::signals::resume_others();
     block.mask.store(mask, Ordering::SeqCst);
@@ -1411,7 +1437,7 @@ pub fn exec<'s>(
 
 /// exec once the process stopped (steps 2 to 7).
 fn exec_stopped<'s>(
-    path: &[u8],
+    source: ExecSource<'_>,
     argv: impl Iterator<Item = &'s [u8]> + Clone,
     envp: impl Iterator<Item = &'s [u8]> + Clone,
     umask: u32,
@@ -1421,6 +1447,25 @@ fn exec_stopped<'s>(
 ) -> Result<core::convert::Infallible, i32> {
     use crate::constants::{EAGAIN, EIO};
     use proto_process::{Method, SpawnStart};
+    // Every other thread is stopped before selecting and retaining the source.
+    let retained = if let ExecSource::Descriptor(fd) = source {
+        let (channel, held) = crate::shared::with_files(|files| {
+            let posix_fs::Target::Ram(target) = files.target(fd).map_err(crate::error)? else {
+                return Err(crate::constants::EACCES);
+            };
+            Ok((files.sessions().0.raw(), target.prepared()))
+        })?;
+        let channel = core::mem::ManuallyDrop::new(Handle::<Channel>::from_raw(channel));
+        let clone = rt::fs::Files::clone_exact_on(&channel, &[held])
+            .map_err(|status| crate::error(posix_fs::FsError::from(status)))?;
+        Some((clone, held))
+    } else {
+        None
+    };
+    let path = match source {
+        ExecSource::Path(path) => path,
+        ExecSource::Descriptor(_) => b"/",
+    };
     let mut shadow = Shadow::take()?;
     let carried = proto_loader::Carried {
         pending,
@@ -1457,7 +1502,7 @@ fn exec_stopped<'s>(
         return Err(start_errno(status));
     }
     let c = reply.handles.take::<Channel>(0).map_err(|_| EIO)?;
-    let ready = image_ready(&c, len, object);
+    let ready = image_ready(&c, len, object, retained);
     if let Err(errno) = ready {
         let _ = request(Method::ExecAbort, &[]).and_then(|w| ask(&w));
         return Err(errno);
@@ -1568,8 +1613,17 @@ pub fn probe_exec_outlive<'s>(path: &[u8], argv: impl Iterator<Item = &'s [u8]> 
 fn probe_exec<'s>(path: &[u8], argv: impl Iterator<Item = &'s [u8]> + Clone, probe: Probe) -> i32 {
     let block = crate::threads::own_block();
     let mask = block.mask.swap(!0, Ordering::SeqCst);
-    let result = crate::signals::stop_others()
-        .and_then(|()| exec_stopped(path, argv, [].into_iter(), 0o022, mask, 0, probe));
+    let result = crate::signals::stop_others().and_then(|()| {
+        exec_stopped(
+            ExecSource::Path(path),
+            argv,
+            [].into_iter(),
+            0o022,
+            mask,
+            0,
+            probe,
+        )
+    });
     crate::signals::resume_others();
     block.mask.store(mask, Ordering::SeqCst);
     match result {
@@ -1584,15 +1638,32 @@ fn image_ready(
     c: &Handle<Channel>,
     len: usize,
     object: Handle<rt::handle::Memory>,
+    source: Option<(Handle<Channel>, rt::fs::PreparedOpen)>,
 ) -> Result<(), i32> {
     use crate::constants::{EIO, ENOMEM};
     use proto_loader::Method;
     let rights = rt::abi::Rights::MAP_READ | rt::abi::Rights::TRANSFER;
     let copy = rt::sys::handle_duplicate(&object, rights).map_err(|_| ENOMEM)?;
     let mut w = Writer::new();
-    Method::Start.header().write(&mut w).map_err(|_| EIO)?;
-    w.u32(len as u32).map_err(|_| EIO)?;
-    if ask_loader(c, &w, Some([copy.erase()].into())) != 0 {
+    let mut outgoing = rt::handle::Outgoing::new();
+    outgoing.push(copy.erase()).map_err(|_| EIO)?;
+    match source {
+        Some((source, held)) => {
+            Method::StartExecFd
+                .header()
+                .write(&mut w)
+                .map_err(|_| EIO)?;
+            w.u32(len as u32).map_err(|_| EIO)?;
+            w.u32(held.marked_fd()).map_err(|_| EIO)?;
+            w.u64(held.generation).map_err(|_| EIO)?;
+            outgoing.push(source.erase()).map_err(|_| EIO)?;
+        }
+        None => {
+            Method::Start.header().write(&mut w).map_err(|_| EIO)?;
+            w.u32(len as u32).map_err(|_| EIO)?;
+        }
+    }
+    if ask_loader(c, &w, Some(outgoing)) != 0 {
         return Err(EIO);
     }
     drop(object);

@@ -196,6 +196,8 @@ pub enum Method {
     Regions = 5,
     TerminalActions = 6,
     HandlesDone = 7,
+    /// Start block plus one exact retained RAM source session for fexecve.
+    StartExecFd = 8,
 }
 
 impl Method {
@@ -215,6 +217,7 @@ impl Method {
             5 => Some(Method::Regions),
             6 => Some(Method::TerminalActions),
             7 => Some(Method::HandlesDone),
+            8 => Some(Method::StartExecFd),
             _ => None,
         }
     }

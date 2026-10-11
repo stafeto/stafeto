@@ -333,11 +333,7 @@ impl Binding {
             || who.generation & proto_process::GENERATION_DEAD != 0
             || who.root.pid == 0
             || who.root.generation == 0
-            || who
-                .limits
-                .values
-                .iter()
-                .any(|l| l.soft > l.hard || l.hard == u64::MAX)
+            || !who.limits.valid()
             || who.image == 0
             || who.index as usize >= proto_process::RECORDS
             || !who.groups.valid()
@@ -480,6 +476,43 @@ impl Identity {
 #[cfg(test)]
 mod retained_source_tests {
     use super::*;
+
+    #[test]
+    fn public_infinity_binds_and_refreshes_without_unbounding_paid_memory() {
+        let mut who = WhoReply {
+            pid: 1,
+            credentials: proto_process::Credentials::ROOT,
+            generation: 1,
+            loader: None,
+            index: 0,
+            ctty: None,
+            image: 1,
+            groups: proto_process::Groups::EMPTY,
+            limits: proto_process::ResourceLimits::initial(4096),
+            root: proto_process::ExpenditureRoot {
+                pid: 1,
+                generation: 1,
+            },
+        };
+        let mut binding = Binding::Active(who);
+        for resource in [
+            proto_process::CORE,
+            proto_process::FSIZE,
+            proto_process::NOFILE,
+        ] {
+            who.limits.values[resource] = proto_process::Limit {
+                soft: u64::MAX,
+                hard: u64::MAX,
+            };
+            who.generation += 1;
+            binding = binding.refreshed(&who).unwrap();
+        }
+        for resource in [proto_process::DATA, proto_process::AS, proto_process::STACK] {
+            let mut invalid = who;
+            invalid.limits.values[resource].hard = u64::MAX;
+            assert_eq!(binding.refreshed(&invalid), Err(proto_fs::PERMISSION));
+        }
+    }
 
     #[test]
     fn retained_wait_requires_the_exact_birth_and_refresh_authority() {

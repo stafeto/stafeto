@@ -25,6 +25,17 @@ impl Groups {
         count: 0,
         ids: [0; SUPPLEMENTARY_MAX],
     };
+    /// Copy a complete supplementary list, or report the required count for
+    /// an empty destination. Insufficient nonempty storage is left untouched.
+    pub fn copy_into(&self, output: &mut [u32]) -> Option<usize> {
+        let count = self.count as usize;
+        if output.is_empty() {
+            return Some(count);
+        }
+        let destination = output.get_mut(..count)?;
+        destination.copy_from_slice(self.ids.get(..count)?);
+        Some(count)
+    }
     pub fn contains(&self, gid: u32) -> bool {
         self.ids[..self.count as usize].contains(&gid)
     }
@@ -101,12 +112,14 @@ impl ResourceLimits {
         };
         Self { values }
     }
+    /// Public limits may be infinite; paid memory limits must remain finite.
+    pub fn valid(&self) -> bool {
+        self.values.iter().enumerate().all(|(i, l)| {
+            l.soft <= l.hard && (l.hard != u64::MAX || matches!(i, CORE | FSIZE | NOFILE))
+        })
+    }
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
-        if self
-            .values
-            .iter()
-            .any(|l| l.soft > l.hard || l.hard == u64::MAX)
-        {
+        if !self.valid() {
             return Err(Status::BadSize);
         }
         #[cfg(target_endian = "little")]
@@ -135,11 +148,12 @@ impl ResourceLimits {
                 soft: r.u64()?,
                 hard: r.u64()?,
             };
-            if l.soft > l.hard || l.hard == u64::MAX {
-                return Err(Status::BadSize);
-            }
         }
-        Ok(Self { values })
+        let limits = Self { values };
+        if !limits.valid() {
+            return Err(Status::BadSize);
+        }
+        Ok(limits)
     }
 }
 
@@ -152,6 +166,41 @@ pub struct ExpenditureRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn undersized_group_copy_preserves_the_entire_caller_buffer() {
+        let mut groups = Groups::EMPTY;
+        groups.count = 2;
+        groups.ids[..2].copy_from_slice(&[0, 100]);
+        assert!(groups.valid());
+        assert_eq!(groups.copy_into(&mut []), Some(2));
+        let mut small = [12345];
+        assert_eq!(groups.copy_into(&mut small), None);
+        assert_eq!(small, [12345]);
+        let mut enough = [12345; 3];
+        assert_eq!(groups.copy_into(&mut enough), Some(2));
+        assert_eq!(enough, [0, 100, 12345]);
+    }
+    #[test]
+    fn supported_infinity_survives_wire_while_memory_limits_stay_finite() {
+        let mut limits = ResourceLimits::initial(4096);
+        for resource in [CORE, FSIZE, NOFILE] {
+            limits.values[resource] = Limit {
+                soft: u64::MAX,
+                hard: u64::MAX,
+            };
+        }
+        let mut w = Writer::new();
+        limits.write(&mut w).unwrap();
+        assert_eq!(
+            ResourceLimits::read(&mut Reader::new(w.as_bytes())),
+            Ok(limits)
+        );
+        for resource in [DATA, AS, STACK] {
+            let mut bad = limits;
+            bad.values[resource].hard = u64::MAX;
+            assert_eq!(bad.write(&mut Writer::new()), Err(Status::BadSize));
+        }
+    }
     #[test]
     fn sixteen_groups_and_finite_limits_round_trip_and_reject_malformed_bounds() {
         let groups = Groups {

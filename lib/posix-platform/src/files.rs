@@ -212,7 +212,7 @@ fn at_offset(
             run(transport, fd.fd(), offset).map_err(posix_abi::error)
         })
     });
-    match result {
+    match posix_abi::finish_file_size(result) {
         Ok(count) => count as isize,
         Err(errno) => -(errno as isize),
     }
@@ -789,32 +789,63 @@ pub struct Rlimit {
     current: u64,
     maximum: u64,
 }
-const RLIMIT_NOFILE: c_int = 7;
-const RLIM_INFINITY: u64 = u64::MAX;
-
-/// getrlimit: RLIMIT_NOFILE is the size of the layer's table of
-/// descriptors; the others have no limit the layer keeps.
-///
 /// # Safety
-/// `out` is writable for a struct rlimit.
+/// `out` is writable for one rlimit.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_getrlimit(resource: c_int, out: *mut Rlimit) -> c_int {
-    if !(0..16).contains(&resource) {
-        return -EINVAL;
-    }
-    let value = if resource == RLIMIT_NOFILE {
-        posix_fs::OPEN_MAX as u64
-    } else {
-        RLIM_INFINITY
-    };
-    // SAFETY: the caller's promise.
-    unsafe {
-        out.write(Rlimit {
-            current: value,
-            maximum: value,
-        })
-    };
-    0
+    value(call(|| {
+        if out.is_null() {
+            return Err(EFAULT);
+        }
+        let limit = posix_abi::resources::get(resource)?;
+        unsafe {
+            out.write(Rlimit {
+                current: limit.soft,
+                maximum: limit.hard,
+            });
+        }
+        Ok(0)
+    })) as c_int
+}
+/// # Safety
+/// `input` is readable for one rlimit.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_setrlimit(resource: c_int, input: *const Rlimit) -> c_int {
+    value(call(|| {
+        let Some(limit) = (unsafe { input.as_ref() }) else {
+            return Err(EFAULT);
+        };
+        posix_abi::resources::set(
+            resource,
+            proto_process::Limit {
+                soft: limit.current,
+                hard: limit.maximum,
+            },
+        )
+        .map(|()| 0)
+    })) as c_int
+}
+/// # Safety
+/// `out` holds `size` writable gid_t values when size is positive.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_getgroups(size: c_int, out: *mut u32) -> c_int {
+    value(call(|| {
+        if size < 0 {
+            return Err(EINVAL);
+        }
+        let groups = posix_abi::resources::groups()?;
+        if size == 0 {
+            return Ok(groups.count as i64);
+        }
+        if groups.count != 0 {
+            if out.is_null() {
+                return Err(EFAULT);
+            }
+            let output = unsafe { core::slice::from_raw_parts_mut(out, size as usize) };
+            groups.copy_into(output).ok_or(EINVAL)?;
+        }
+        Ok(groups.count as i64)
+    })) as c_int
 }
 
 /// relibc's struct utsname: six fields of 65 bytes.
@@ -868,7 +899,17 @@ pub extern "C" fn stafeto_ftruncate(fd: c_int, length: i64) -> c_int {
             posix_abi::change::truncate(target, length)
         })
     });
-    value(result.map(|()| 0)) as c_int
+    value(posix_abi::finish_file_size(result).map(|()| 0)) as c_int
+}
+
+/// # Safety
+/// `path` is a readable terminated C string, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_truncate(path: *const c_char, length: i64) -> c_int {
+    value(call(|| {
+        let path = unsafe { posix_abi::path(path) }?;
+        posix_abi::resources::truncate_path(path, length, umask()).map(|()| 0)
+    })) as c_int
 }
 
 /// posix_getdents: the records of directory `fd` from its offset, in the

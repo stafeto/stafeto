@@ -900,6 +900,47 @@ impl Files {
         prepared.finish_binding()?;
         prepared.open_exec_bound(path)
     }
+    /// Select one retained description using the loader's authentic identity.
+    pub fn open_exec_fd(
+        &self,
+        source: Handle<Channel>,
+        held: PreparedOpen,
+        identity: &Handle<Channel>,
+    ) -> Result<Handle<Channel>, Status> {
+        let identity = sys::handle_duplicate(
+            identity,
+            abi::Rights::NOTIFY | abi::Rights::DUPLICATE | abi::Rights::TRANSFER,
+        )
+        .map_err(Status::Kernel)?;
+        let session = Self::bind_pending_on(&self.channel, true, Some(source), identity)?;
+        let prepared = Self::from_sessions(session, None);
+        prepared.finish_binding()?;
+        let mut w = Writer::new();
+        Method::OpenExecFd.header().write(&mut w)?;
+        w.u32(Self::exact_description_word(held)?)?;
+        w.u64(held.generation)?;
+        loop {
+            let mut reply = Self::send_on(&prepared.channel, w.as_bytes())?;
+            let code = Self::reply_code(&reply)?;
+            if code == proto_fs::RESOLVING || code == proto_fs::AUTHENTICATING {
+                continue;
+            }
+            if code != 0 {
+                Self::open_reply(&reply, 4)?;
+                return Err(Status::BadSize);
+            }
+            if reply.len != 4
+                || reply.handles.len() != 1
+                || !reply.handles.info(0).is_some_and(|(kind, rights)| {
+                    kind == abi::ObjectKind::Channel
+                        && rights.contains(abi::Rights::SEND | abi::Rights::TRANSFER)
+                })
+            {
+                return Err(Status::BadSize);
+            }
+            return reply.handles.take::<Channel>(0).map_err(Status::Kernel);
+        }
+    }
     /// Resolve an executable using this authenticated bound session.
     /// The service requires a genuine Pending loader binding for the image handoff.
     pub fn open_exec_bound(&self, path: &[u8]) -> Result<Handle<Channel>, Status> {

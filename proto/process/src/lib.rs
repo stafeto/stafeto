@@ -474,6 +474,9 @@ pub enum Method {
     RetainedLoader = 53,
     /// Trusted notary request, empty body/handles; one read-only PID lifetime page.
     RegisterLifetimes = 54,
+    GetLimit = 55,
+    SetLimit = 56,
+    GetGroups = 57,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -485,7 +488,7 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -782,11 +785,7 @@ impl WhoReply {
                 hard: wide(39 + 4 * i),
             }),
         };
-        if limits
-            .values
-            .iter()
-            .any(|limit| limit.soft > limit.hard || limit.hard == u64::MAX)
-        {
+        if !limits.valid() {
             return Err(Status::BadSize);
         }
         let root = ExpenditureRoot {
@@ -1369,6 +1368,9 @@ mod tests {
             Method::DisconnectCtty,
             Method::RetainedLoader,
             Method::RegisterLifetimes,
+            Method::GetLimit,
+            Method::SetLimit,
+            Method::GetGroups,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
@@ -1477,6 +1479,22 @@ mod tests {
         reply.write(&mut w).unwrap();
         assert_eq!(w.as_bytes().len(), 252);
         assert_eq!(WhoReply::read(w.as_bytes()), Ok(reply));
+        for resource in [CORE, FSIZE, NOFILE] {
+            let mut infinite = reply;
+            infinite.limits.values[resource] = Limit {
+                soft: u64::MAX,
+                hard: u64::MAX,
+            };
+            let mut encoded = Writer::new();
+            infinite.write(&mut encoded).unwrap();
+            assert_eq!(WhoReply::read(encoded.as_bytes()), Ok(infinite));
+        }
+        for resource in [DATA, STACK, AS] {
+            let mut bad = w.as_bytes().to_vec();
+            let start = (39 + 4 * resource) * 4;
+            bad[start..start + 8].fill(0xff);
+            assert_eq!(WhoReply::read(&bad), Err(Status::BadSize));
+        }
         let mut bytes = w.as_bytes().to_vec();
         bytes[4..8].fill(0);
         assert_eq!(WhoReply::read(&bytes), Err(Status::BadSize), "pid 0");

@@ -602,7 +602,13 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
         return Err("opendir close-on-exec flag");
     }
     let mut name = [0; 32];
-    for expected in [b".".as_slice(), b"..".as_slice(), b"motd".as_slice()] {
+    for expected in [
+        b".".as_slice(),
+        b"..".as_slice(),
+        b"motd".as_slice(),
+        b"group".as_slice(),
+        b"passwd".as_slice(),
+    ] {
         let entry = posix
             .readdir(&mut dir, &mut name)
             .map_err(|_| "POSIX readdir")?

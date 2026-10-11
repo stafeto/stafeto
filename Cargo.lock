@@ -438,6 +438,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-resources-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "posix-shared-probe"
 version = "0.1.0"
 dependencies = [

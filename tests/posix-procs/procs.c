@@ -185,6 +185,7 @@
  * a child (`role`). */
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
@@ -197,6 +198,7 @@
 #include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -1172,6 +1174,58 @@ done:
     return result;
 }
 
+/* A loaded child exercises the new requests while every branch remains live. */
+static int steps_resources(void) {
+    struct rlimit nofile, saved;
+    gid_t groups[16];
+    if (getrlimit(RLIMIT_NOFILE, &nofile) || setrlimit(RLIMIT_NOFILE, &nofile)
+        || getgroups(0, NULL) < 0 || getgroups(16, groups) < 0
+        || getrlimit(RLIMIT_FSIZE, &saved)) return 1;
+    struct sigaction ignored = {.sa_handler = SIG_IGN}, previous;
+    sigemptyset(&ignored.sa_mask);
+    if (sigaction(SIGXFSZ, &ignored, &previous)) return 2;
+    int file = open("/tmp/steps-resource-size", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    if (file < 0) return 3;
+    int result = 0;
+    struct rlimit small = {16, saved.rlim_max};
+    if (setrlimit(RLIMIT_FSIZE, &small)) result = 4;
+    if (!result && (write(file, "abcdefghij", 10) != 10
+        || write(file, "klmnopqrst", 10) != 6)) result = 5;
+    errno = 0;
+    if (!result && (write(file, "x", 1) != -1 || errno != EFBIG)) result = 6;
+    errno = 0;
+    if (!result && (ftruncate(file, 17) != -1 || errno != EFBIG)) result = 7;
+    if (setrlimit(RLIMIT_FSIZE, &saved) || sigaction(SIGXFSZ, &previous, NULL)) result = 8;
+    if (close(file) || unlink("/tmp/steps-resource-size")) result = 9;
+    if (result) return result;
+
+    int input = open("/bin/procs-child", O_RDONLY);
+    if (input < 0) return 10;
+    file = open("/tmp/steps-resource-image", O_CREAT | O_TRUNC | O_RDWR, 0755);
+    if (file < 0) { close(input); return 11; }
+    char bytes[2048];
+    ssize_t amount;
+    while ((amount = read(input, bytes, sizeof bytes)) > 0) {
+        ssize_t copied = 0;
+        while (copied < amount) {
+            ssize_t written = write(file, bytes + copied, (size_t)(amount - copied));
+            if (written <= 0) { result = 12; break; }
+            copied += written;
+        }
+        if (result) break;
+    }
+    if (amount < 0) result = 13;
+    if (close(input) || fchmod(file, 0755)) result = 14;
+    if (result) { close(file); unlink("/tmp/steps-resource-image"); return result; }
+    if (fcntl(file, F_SETFD, FD_CLOEXEC) || lseek(file, 17, SEEK_SET) != 17
+        || unlink("/tmp/steps-resource-image")) { close(file); return 15; }
+    char *argv[] = {"procs-child", "exit7", NULL};
+    char *envp[] = {NULL};
+    fexecve(file, argv, envp);
+    close(file);
+    return 16;
+}
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
@@ -1238,6 +1292,16 @@ static int steps_run(void) {
     if (locks) {
         printf("posix-procs: steps: locks failed %d errno %d\n", locks, errno);
         failed++;
+    }
+    pid_t resource_child = -1;
+    int resource_status = 0;
+    if (steps_spawn(&resource_child, "stepresources", "0") != 0
+        || waitpid(resource_child, &resource_status, 0) != resource_child
+        || !WIFEXITED(resource_status) || WEXITSTATUS(resource_status) != 7) {
+        printf("posix-procs: steps: resources failed status %d errno %d\n", resource_status, errno);
+        failed++;
+    } else {
+        puts("posix-procs: resource and descriptor exec steps ok");
     }
 #if CHANGE_STEPS
     /* The change jobs of the RAM file service among the crowd: every
@@ -2194,6 +2258,7 @@ static int role(const char *name) {
 #endif
     if (strcmp(name, "stepfork") == 0) return steps_fork();
     if (strcmp(name, "steppipes") == 0) return steps_pipes();
+    if (strcmp(name, "stepresources") == 0) return 64 + steps_resources();
     if (strcmp(name, "child") == 0) {
         sigset_t mask;
         sigprocmask(SIG_BLOCK, NULL, &mask);

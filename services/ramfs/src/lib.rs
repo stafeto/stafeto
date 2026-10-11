@@ -1662,7 +1662,7 @@ impl<'a> Ram<'a> {
     /// The information of the program file of an image session.
     pub fn exec_token(&self, token: Token, identity: authority::Identity) -> Result<Exec, u32> {
         let n = self.storage.node(token)?;
-        if n.kind != REG || n.boot == storage::NONE || !identity.permits(n, 1) {
+        if n.kind != REG || !identity.permits(n, 1) {
             return Err(proto_fs::ACCESS_DENIED);
         }
         Ok(Exec {
@@ -2064,6 +2064,13 @@ impl<'a> Ram<'a> {
         } else {
             usize::try_from(open.offset).map_err(|_| NO_SPACE)?
         };
+        let limit = io::file_size_limit(fds);
+        if offset as u64 >= limit {
+            return Err(proto_fs::FILE_SIZE_LIMIT);
+        }
+        let bytes = &bytes[..bytes
+            .len()
+            .min((limit - offset as u64).min(usize::MAX as u64) as usize)];
         let end = offset.checked_add(bytes.len()).ok_or(NO_SPACE)?;
         let capacity = if matches!(open.file, File::Scratch) {
             FILE_CAPACITY

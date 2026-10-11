@@ -476,6 +476,10 @@ impl Processes {
         if let Some(record) = self.records.get_mut(index) {
             record.quota = create.quota;
             record.limits = proto_process::ResourceLimits::initial(create.quota);
+            if create.root {
+                record.groups.count = 1;
+                record.groups.ids[0] = 0;
+            }
             record.handle_limit = create.handle_limit;
         }
         self.witnesses[index] = Some(witness);
@@ -2727,6 +2731,74 @@ impl Service<0> for Processes {
                 }
                 snapshot(r, self.records.get(index).expect("query process"));
                 Answer::Reply(Outgoing::new())
+            }
+            n if n == Method::GetLimit as u16 => {
+                let (Ok(resource), Ok(())) = (body.u32(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Some(value) = self
+                    .records
+                    .get(index)
+                    .expect("limit caller")
+                    .limits
+                    .values
+                    .get(resource as usize)
+                    .copied()
+                else {
+                    return refuse(proto_process::INVALID);
+                };
+                if r.reply()
+                    .u32(0)
+                    .and_then(|()| r.reply().u64(value.soft))
+                    .and_then(|()| r.reply().u64(value.hard))
+                    .is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            n if n == Method::GetGroups as u16 => {
+                let (Ok(first), Ok(())) = (body.u32(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if !matches!(first, 0 | 8) {
+                    return refuse(proto_process::INVALID);
+                }
+                let groups = self.records.get(index).expect("groups caller").groups;
+                if r.reply()
+                    .u32(0)
+                    .and_then(|()| r.reply().u32(groups.count))
+                    .is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                for id in &groups.ids[first as usize..first as usize + 8] {
+                    if r.reply().u32(*id).is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            n if n == Method::SetLimit as u16 => {
+                let (Ok(resource), Ok(soft), Ok(hard), Ok(())) =
+                    (body.u32(), body.u64(), body.u64(), body.finish())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match self.records.set_limit(
+                    index,
+                    resource as usize,
+                    proto_process::Limit { soft, hard },
+                    self.generations.get(index),
+                ) {
+                    Ok(changed) => {
+                        if changed {
+                            self.generations.raise(index);
+                        }
+                        Answer::Status(Status::Ok)
+                    }
+                    Err(code) => refuse(code),
+                }
             }
             n if n == Method::Change as u16 => {
                 let (Ok(operation), Ok(id)) = (body.u32(), body.u32()) else {
