@@ -30,7 +30,7 @@ pub extern "C" fn full_ofd_arm(fd: u32) -> i32 {
             target.fd() | (target.description_slot() << proto_fs::OPEN_DESCRIPTION_SHIFT),
             Ordering::Relaxed,
         );
-        ENTRY.store(entry.generation, Ordering::Relaxed);
+        ENTRY.store(entry.generation(), Ordering::Relaxed);
         GENERATION.store(target.generation(), Ordering::Release);
         Ok(())
     });
@@ -58,7 +58,7 @@ pub unsafe extern "C" fn full_ofd_local_state(output: *mut u64) -> i32 {
     let result = posix_abi::shared::with_files(|files| {
         let original_live = files
             .lock_source(FD.load(Ordering::Relaxed))
-            .is_ok_and(|entry| entry.generation == ENTRY.load(Ordering::Relaxed))
+            .is_ok_and(|entry| entry.generation() == ENTRY.load(Ordering::Relaxed))
             && files.target(FD.load(Ordering::Relaxed)).ok() == Some(Target::Ram(target));
         Ok(files.io_loan_state(Target::Ram(target)).map_or(
             [0, 0, 0, u64::from(original_live)],
