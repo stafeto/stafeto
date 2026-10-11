@@ -453,17 +453,20 @@ def prove_lr_store(fde, call_pc, after, instructions, targets):
             'unsupported delayed LR row')
     sp = 0
     saved = None
+    prefix_writes = set()
     for pc in range(fde.start, call_pc, 4):
         require(pc in instructions, 'missing caller prologue instruction')
         mnemonic, operands = instructions[pc]
         require(pc == fde.start or pc not in targets, 'branch into caller LR prologue')
         if mnemonic.startswith('b.') or mnemonic in ('cbz', 'cbnz', 'tbz', 'tbnz'):
-            require(saved is None and sp == 0, 'prefix branch follows changed caller frame')
+            require(saved is None and sp == 0 and not (prefix_writes & set(range(19, 31))),
+                    'prefix branch follows changed caller entry context')
             prove_finite_prefix_exit(fde, pc, call_pc, instructions)
             continue
         require(mnemonic not in ('b', 'bl', 'br', 'blr', 'ret', 'svc'),
                 f'caller LR provenance crosses control flow at {pc:#x}, entry {fde.start:#x}, call {call_pc:#x}')
         destinations = written_registers(mnemonic, operands)
+        prefix_writes.update(destinations)
         require(30 not in destinations, 'caller entry LR was overwritten before save')
         adjustment = re.fullmatch(r'sp, sp, #0x([0-9a-f]+)', operands)
         if mnemonic in ('add', 'sub') and adjustment:
