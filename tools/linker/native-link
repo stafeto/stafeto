@@ -63,6 +63,7 @@ def main(arguments):
         except SpaceShortage:
             # Exactly one retry, only after complete metadata/instruction validation.
             # The generated script reserves bounded zero capacity in the original EH.
+            output.unlink(missing_ok=True)
             with tempfile.TemporaryDirectory(prefix='stafeto-eh-') as directory:
                 script = Path(directory) / 'reserve.ld'
                 script.write_text('SECTIONS { .eh_frame : { *(.eh_frame) . += 512; } } INSERT AFTER .eh_frame_hdr;\n')

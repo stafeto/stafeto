@@ -783,6 +783,7 @@ def repack(elf, records, changed):
     index, header = matching[0]
     require(header[5] == header[6], "EH read-only file/memory sizes disagree")
     if (new_end + 4095) // 4096 != (old_end + 4095) // 4096:
+        require(0 < new_end - old_end <= 512, "EH repair exceeds bounded reservation")
         raise SpaceShortage("EH repair changes read-only page budget")
     require(new_end <= min(following), "EH repair overlaps another section")
     destination_end = elf.frame.offset + len(rebuilt)
