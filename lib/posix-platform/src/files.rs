@@ -904,3 +904,21 @@ pub extern "C" fn stafeto_dup3(fd: c_int, target: c_int, flags: c_int) -> c_int 
     }
     value(call(|| posix_abi::dup3(fd, target, flags)).map(i64::from)) as c_int
 }
+
+/// Synchronize an exact live RAM file or directory, including readonly opens.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fsync(fd: c_int) -> c_int {
+    call(|| posix_abi::synchronization::synchronize(fd)).map_or_else(|errno| -errno, |()| 0)
+}
+
+/// RAM data and metadata share the same completed-write boundary.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fdatasync(fd: c_int) -> c_int {
+    call(|| posix_abi::synchronization::synchronize(fd)).map_or_else(|errno| -errno, |()| 0)
+}
+
+/// Successful platform completion remains observable beneath libc's void sync.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_sync() -> c_int {
+    call(posix_abi::synchronization::sync).map_or_else(|errno| -errno, |()| 0)
+}

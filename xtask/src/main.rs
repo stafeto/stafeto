@@ -621,6 +621,11 @@ const POSIX_SPAWN_CHURN_PROGRAMS: [ImageProgram; 10] = {
     programs[5].3 = &["spawn-churn"];
     programs
 };
+const POSIX_SYNC_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = ("posix-procs", "posix-sync-probe", POSIX_STACK_SIZE, &[]);
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1233,6 +1238,7 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-sync verify RAM synchronization, descriptor types and cancellation
   posix-spawn-churn verify 1100 consecutive spawn/reap operations in a small image
   posix-lock-pages measure a full inode spread over 64 paid physical pages
   posix-lock-queue-core measure 64 genuine waits together with 64 held regions
@@ -1259,6 +1265,8 @@ commands:
             test of tests/os-test/pass.txt does not pass; with
             --one NAME, one test in a boot of its own, with its log;
             a FAIL verdict from --one returns a nonzero exit status
+            --full-basic runs the complete pinned basic corpus in bounded batches
+  os-test-headers compile and link the pinned include corpus and check namespace
   posix-tty run the C probe of the terminal: termios, isatty, ttyname and the
             names of terminals through the terminal service, with typed input
   posix-tty-control-steps measure full terminal control with sixteen live clients
@@ -1335,6 +1343,9 @@ fn main() {
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
         Some("os-test") => match &args[1..] {
+            [flag, rest @ ..] if flag == "--full-basic" => {
+                jobs::parse_jobs("os-test --full-basic", rest).and_then(ostest::run_full_basic)
+            }
             [flag, name] if flag == "--one" => ostest::run_one(name),
             [flag, name, rest @ ..] if flag == "--suite" => {
                 jobs::parse_jobs("os-test --suite", rest)
@@ -1342,6 +1353,8 @@ fn main() {
             }
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
+        Some("os-test-headers") => os_test_headers(&args[1..]),
+        Some("posix-sync") => posix_sync_probe(),
         Some("layer-names") => layer_c_names(),
         Some("coverage") => coverage::run(&args[1..]),
         Some("relibc-hello") => relibc_hello_probe(),
@@ -3459,6 +3472,35 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     Ok(())
 }
 
+fn posix_sync_probe() -> Result<(), String> {
+    relibc()?;
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-posix-sync.img", &POSIX_SYNC_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "posix-sync: descriptor types and RAM completion ok",
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "posix-sync: 32 held I/O loans preserve sync success",
+    )?;
+    qemu::expect_marker(&outcome, "posix-sync: deferred cancellation points ok")?;
+    Ok(())
+}
+
 fn posix_spawn_churn_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
@@ -5102,6 +5144,30 @@ fn ash_shell() -> Result<(), String> {
     run_interactive_qemu(cmd, &kernel.elf)
 }
 
+fn os_test_headers(args: &[String]) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-os-test.py")))?;
+    let work = target_dir().join("os-test-headers");
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let object = work.join("empty-main.o");
+    let script = root().join("tools/check-os-test-headers.py");
+    run_cmd(
+        Command::new("python3")
+            .arg(&script)
+            .arg("--bootstrap")
+            .arg(&object),
+    )?;
+    let plan = work.join("link-plan");
+    ostest::export_link_plan(&plan, &object.display().to_string())?;
+    run_cmd(
+        Command::new("python3")
+            .arg(&script)
+            .arg("--link-plan")
+            .arg(plan)
+            .args(args),
+    )
+}
+
 fn ls_probe() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -5203,6 +5269,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
+        job("posix-sync", posix_sync_probe),
         job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
         job("posix-lock-ring", || posix_lock_ring_probe(&qemu::VIRT)),
         job("posix-lock-core", || {
@@ -5298,6 +5365,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
 }
 
 fn host_tests() -> Result<(), String> {
+    for script in [
+        "tools/test_os_test_build.py",
+        "tools/test_os_test_headers.py",
+    ] {
+        run_cmd(Command::new("python3").arg(root().join(script)))?;
+    }
     run_cmd(cargo().args([
         "test",
         "--package",
@@ -7246,6 +7319,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-random-probe",
         "--package",
         "posix-pty",
+        "--package",
+        "posix-sync-probe",
         "--target",
         PROGRAM_TARGET,
         "--",

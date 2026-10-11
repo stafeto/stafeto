@@ -112,7 +112,8 @@ pub(crate) fn open(
                 }?;
                 recovery = recovery.remember(finished);
                 save(claim, recovery)?;
-                let target = Transport::opened_target(finished, recovery.access as u32)
+                let target = transport
+                    .capture_opened_target(finished, recovery.access as u32)
                     .map_err(crate::error)?;
                 crate::shared::with_files(|files| {
                     files

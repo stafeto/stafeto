@@ -1,0 +1,19 @@
+[package]
+name = "posix-sync-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+build = "build.rs"
+
+[[bin]]
+name = "posix-sync-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }
+posix-abi = { path = "../../lib/posix-abi" }
+posix-sync = { path = "../../lib/posix-sync" }
+rt = { path = "../../lib/rt" }
