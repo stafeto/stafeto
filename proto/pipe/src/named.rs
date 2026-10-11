@@ -9,6 +9,7 @@ pub const RAM_BROKER: u64 = 1 << 61;
 pub const NAMED_MAX: usize = 128;
 pub const NAMED_ROOT_MAX: usize = 96;
 pub const NAMED_MAX_WRITE: usize = crate::MAX_WRITE - 8;
+const _: () = assert!(crate::ATOMIC <= NAMED_MAX_WRITE);
 pub const APPEND: u32 = 4;
 pub const NO_READER: u32 = 707;
 
@@ -378,7 +379,6 @@ mod tests {
                 assert_eq!(parsed, Err(Status::BadSize));
             }
         }
-        assert!(crate::ATOMIC <= NAMED_MAX_WRITE);
     }
 
     #[test]

@@ -551,6 +551,21 @@ fn full_sixteen_controls_preserve_close_admission_and_all_fence_debts() {
         );
     }
     assert_eq!(files.control_tokens().count(), 16);
+    let sequence = files
+        .descriptors
+        .jobs_wait_word()
+        .load(core::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        files.job_place(owner()),
+        super::JobPlace::Full {
+            sequence,
+            own: true
+        }
+    );
+    assert_eq!(
+        files.jobs_wait_address(),
+        core::ptr::from_ref(files.descriptors.jobs_wait_word()) as usize
+    );
     assert_eq!(
         files.begin_change_record(owner(), Frame::main(200)),
         Err(FsError::TooManyOpenFiles)
@@ -592,6 +607,14 @@ fn full_sixteen_controls_preserve_close_admission_and_all_fence_debts() {
         );
     }
     assert_eq!(files.control_tokens().count(), 0);
+    assert_eq!(files.job_place(owner()), super::JobPlace::Free);
+    assert_ne!(
+        files
+            .descriptors
+            .jobs_wait_word()
+            .load(core::sync::atomic::Ordering::Acquire),
+        sequence
+    );
 }
 
 #[test]
