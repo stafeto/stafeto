@@ -21,9 +21,9 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-# Named FIFO creation forwards to stafeto, tagged pin-c512fe7e.
+# OpenLibm binary128 and fenv fixes, tagged pin-7a4de500.
 # File Synchronization awaits aio_fsync.
-COMMIT = "c512fe7e61de809531d2427b31467968866d0f08"
+COMMIT = "7a4de500e20e602f4ac4d4fc7ad88b3059ce512d"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
@@ -35,9 +35,9 @@ RUSTFLAGS = ("--cfg stafeto -C relocation-model=static -Z tls-model=local-exec"
              " -C llvm-args=--enable-machine-outliner=never")
 CFLAGS = "--target=aarch64-linux-gnu -mfix-cortex-a53-835769"
 BUILD_STD = "core,alloc,compiler_builtins"
-# The C math functions from the Rust libm crate (MIT), declared by
-# openlibm's headers.
-FEATURES = "math_libm"
+# OpenLibm supplies the C math exports, including binary128 long double.
+FEATURES = ""
+MATH_BUILD = "openlibm-0.8.0-linux-aarch64-v1"
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "relibc"
 SOURCE = WORK / "source"
@@ -136,7 +136,7 @@ def config(env: dict) -> str:
     rustflags, cflags = remap(env)
     clang = output(llvm("clang"), "--version", env=env).splitlines()[0]
     return (f"{COMMIT} {TOOLCHAIN} {TARGET} {rustflags} {cflags} build-std={BUILD_STD}"
-            f" features={FEATURES} cbindgen {CBINDGEN} {clang}\n")
+            f" features={FEATURES} math={MATH_BUILD} cbindgen {CBINDGEN} {clang}\n")
 
 
 def build(env: dict) -> None:
@@ -150,8 +150,9 @@ def build(env: dict) -> None:
         "CFLAGS_aarch64_unknown_linux_gnu": cflags,
     })
     library = WORK / "librelibc.a"
+    feature_args = ["--features", FEATURES] if FEATURES else []
     run("cargo", f"+{TOOLCHAIN}", "rustc", "--frozen", "--offline", "--release", "--target",
-        TARGET, f"-Zbuild-std={BUILD_STD}", "--features", FEATURES, "--lib", "--", "--emit",
+        TARGET, f"-Zbuild-std={BUILD_STD}", *feature_args, "--lib", "--", "--emit",
         f"link={library}",
         cwd=SOURCE, env=env)
     # relibc's Rust symbols get its prefix and its copies of core's math
@@ -161,8 +162,26 @@ def build(env: dict) -> None:
     run("bash", SOURCE / "renamesyms.sh", library, BUILD / TARGET / "release" / "deps",
         cwd=SOURCE, env=env)
     run("bash", SOURCE / "stripcore.sh", library, cwd=SOURCE, env=env)
-    (SYSROOT / "lib").mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(library, SYSROOT / "lib" / "libc.a")
+    math = BUILD / "openlibm"
+    shutil.rmtree(math, ignore_errors=True)
+    shutil.copytree(SOURCE / "openlibm", math)
+    # The host is Darwin; the target uses the Linux AArch64 binary128 ABI.
+    run("make", "-j4", "libopenlibm.a", "OS=Linux", "ARCH=aarch64", "USECLANG=1",
+        "USEGCC=0", f"CC={llvm('clang')}", f"AR={llvm('llvm-ar')}",
+        f"CFLAGS={cflags} -ffunction-sections -fdata-sections -fno-stack-protector"
+        f" -I{SYSROOT / 'include'}", cwd=math, env=env)
+    destination = SYSROOT / "lib"
+    destination.mkdir(parents=True, exist_ok=True)
+    math_library = math / "libopenlibm.a"
+    shutil.copyfile(math_library, destination / "libm.a")
+    # Match relibc's archive merge after processing only the Rust symbols.
+    merged = destination / "libc.a"
+    mri = f"create {merged}\naddlib {library}\naddlib {math_library}\nsave\nend\n"
+    subprocess.run([str(llvm("llvm-ar")), "-M"], input=mri, text=True,
+                   env=env, check=True)
+    notices = SYSROOT / "share" / "licenses" / "openlibm"
+    notices.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(SOURCE / "openlibm" / "LICENSE.md", notices / "LICENSE.md")
 
 
 def headers(env: dict, generator: Path) -> None:
@@ -198,8 +217,8 @@ def main() -> None:
     STAMP.unlink(missing_ok=True)
     fetch(env)
     generator = cbindgen(env)
-    build(env)
     headers(env, generator)
+    build(env)
     STAMP.write_text(wanted)
     print(f"relibc ready: {SYSROOT}")
 
