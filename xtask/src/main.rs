@@ -596,6 +596,20 @@ const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
     programs[0].3 = &["table-posix-lock-ring"];
     programs
 };
+/// Dedicated measurement image; no other lifetime fixture owns locks here.
+const fn posix_lock_full_programs(profile: u32) -> [ImageProgram; 10] {
+    let mut programs = POSIX_LIFETIMES_PROGRAMS;
+    programs[0].3 = if profile == 4 {
+        &["table-posix-lock-full4"]
+    } else {
+        &["table-posix-lock-full7"]
+    };
+    programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
+    programs[5].3 = &["lock-full-fixture"];
+    programs
+}
+const POSIX_LOCK_FULL4_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4);
+const POSIX_LOCK_FULL7_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7);
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1208,6 +1222,8 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-lock-full 4|7 verify 256 genuine published segments and eight paid roots
+            in a dedicated measurement image under unchanged quotas
   posix-procs run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
@@ -1328,6 +1344,11 @@ fn main() {
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
         Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
+        Some("posix-lock-full") => match &args[1..] {
+            [profile] if profile == "4" => posix_lock_full_probe(&qemu::VIRT, 4),
+            [profile] if profile == "7" => posix_lock_full_probe(&qemu::VIRT, 7),
+            _ => Err("posix-lock-full 4|7".to_owned()),
+        },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
@@ -3199,6 +3220,68 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
             ));
         }
         println!("RAM credential dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    }
+    Ok(())
+}
+
+fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let (name, programs) = if profile == 4 {
+        ("boot-posix-lock-full4.img", &POSIX_LOCK_FULL4_PROGRAMS)
+    } else {
+        ("boot-posix-lock-full7.img", &POSIX_LOCK_FULL7_PROGRAMS)
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    let mut ended = 0_u8;
+    let result = (|| {
+        while ended != 255 {
+            let line = run.expect_line(
+                "all eight genuine payer families to exit",
+                |line| {
+                    (line.starts_with("init: lock-full-") && line.contains(" ended:"))
+                        || line.starts_with("lock-full: FAIL")
+                },
+                Duration::from_secs(60),
+            )?;
+            if line.starts_with("lock-full: FAIL") {
+                return Err(line);
+            }
+            for family in 0..8 {
+                if line.starts_with(&format!("init: lock-full-{family} ended:")) {
+                    if line != format!("init: lock-full-{family} ended: exit code 0, not restarted")
+                    {
+                        return Err(format!("genuine full-table family failed: {line}"));
+                    }
+                    ended |= 1 << family;
+                }
+            }
+        }
+        Ok(())
+    })();
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    result?;
+    qemu::expect_marker(
+        &outcome,
+        &format!(
+            "lock-full: stable profile={profile} participating={profile} owners={} published=256 private=0 retired=0 common=128 payers=8 epoch=1",
+            if profile == 4 { 20 } else { 17 }
+        ),
+    )?;
+    for family in 0..8 {
+        qemu::expect_marker(
+            &outcome,
+            &format!("lock-full: genuine family {family} profile={profile} ok"),
+        )?;
+        qemu::expect_marker(
+            &outcome,
+            &format!("lock-full: payer profile={profile} family={family} root="),
+        )?;
     }
     Ok(())
 }
@@ -8259,3 +8342,7 @@ mod tests {
         assert!(found.is_empty(), "a test deadline in {found:?}");
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/posix-procs/src/lock_full_wire.rs"]
+mod lock_full_wire;

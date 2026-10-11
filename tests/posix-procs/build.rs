@@ -17,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=lifetime.c");
     println!("cargo:rerun-if-changed=lock-ring.c");
+    println!("cargo:rerun-if-changed=lock-full.c");
     println!("cargo:rerun-if-changed=wait-locks.c");
     println!("cargo:rerun-if-changed=wait-fifo.c");
     println!("cargo:rerun-if-changed=wait-lifecycle.c");
@@ -129,7 +130,9 @@ fn main() {
         .arg(sysroot.join("include"))
         .args([
             "-c",
-            if env::var_os("CARGO_FEATURE_LIFETIME_PROBE").is_some() {
+            if env::var_os("CARGO_FEATURE_LOCK_FULL_FIXTURE").is_some() {
+                "lock-full.c"
+            } else if env::var_os("CARGO_FEATURE_LIFETIME_PROBE").is_some() {
                 "lifetime.c"
             } else if env::var_os("CARGO_FEATURE_IMAGE_GATES").is_some() {
                 "image-gates.c"
