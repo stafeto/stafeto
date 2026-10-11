@@ -28,6 +28,7 @@ static int wake_wait(int own, int target, unsigned index, struct record *r) {
            (unsigned long long)r->wait_source[0], (unsigned long long)r->wait_source[1], r->canonical);
     return write_record(index, r) ? fail("wake terminal metadata", index) : 0;
 }
+#if !FULL_CLOSE
 static int wake_capture(int fd, int source, int witness, const uint64_t exact_source[2], uint64_t epoch, const struct record initial[20]) {
     char name[64];
     for (unsigned i = 0; i < 16; ++i) {
@@ -82,3 +83,5 @@ static int wake_capture(int fd, int source, int witness, const uint64_t exact_so
     printf("lock-full: wake profile=%u sleeping=16 successes=16 published=254 private=0 retired=0 common=127 payers=8\n", profile);
     return 0;
 }
+
+#endif

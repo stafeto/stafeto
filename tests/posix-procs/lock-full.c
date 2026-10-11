@@ -28,6 +28,12 @@ extern int full_source(unsigned, uint64_t[2]);
 #ifndef FULL_DEATH
 #define FULL_DEATH 0
 #endif
+#ifndef FULL_CLOSE
+#define FULL_CLOSE 0
+#endif
+#if FULL_CLOSE
+static int close_alias = -1;
+#endif
 #if FULL_DEATH
 static pid_t death_runner;
 static int death_reaped;
@@ -37,7 +43,7 @@ static volatile sig_atomic_t capacity_signal;
 #if FULL_WAKE
 static volatile sig_atomic_t capacity_error;
 #endif
-#if FULL_WAKE
+#if FULL_WAKE && !FULL_CLOSE
 static int wake_fd = -1;
 #endif
 #endif
@@ -231,7 +237,18 @@ static int hold(unsigned local) {
     if (index < 16) {
         struct sigaction action = {.sa_handler = capacity_handler, .sa_flags = SA_RESTART};
         sigemptyset(&action.sa_mask);
+#if FULL_CLOSE
+        action.sa_flags = index == 0 ? SA_RESTART : 0;
+        if (!index) {
+            uint64_t alias_source[2];
+            close_alias = dup(fd);
+            if (close_alias < 0 || full_source((unsigned)close_alias, alias_source)
+                || memcmp(alias_source, r.source, sizeof(alias_source)))
+                return fail("pre-Begin exact original-description alias", index);
+        }
+#else
         if (!index) wake_fd = fd;
+#endif
         if (sigaction(SIGUSR1, &action, NULL)) return fail("pre-Begin wake handler", index);
     }
 #endif
@@ -443,6 +460,9 @@ static int ring_rows(int fd, uint64_t epoch) {
 #if FULL_DEATH
 #include "lock-full-death.c"
 #endif
+#if FULL_CLOSE
+#include "lock-full-close.c"
+#endif
 static int coordinator(void) {
     int fd = open("/tmp/lock-full-controller", O_RDWR);
     if (fd < 0) return fail("controller open", 0);
@@ -520,7 +540,11 @@ static int coordinator(void) {
 #if FULL_RING
     #if FULL_CAPACITY
     #if FULL_WAKE
+#if FULL_CLOSE
+    if (close_capture(fd, observer_source, wake_witness, wake_source, epoch, records)) return 1;
+#else
     if (wake_capture(fd, observer_source, wake_witness, wake_source, epoch, records)) return 1;
+#endif
 #else
 #if FULL_DEATH
     if (death_capture(fd, observer_source, epoch, records)) return 1;
@@ -541,6 +565,9 @@ static int coordinator(void) {
     if (ring_rows(fd, epoch)) return 1;
 #if FULL_DEATH
     if (death_rows(fd, epoch, &records[0])) return 1;
+#endif
+#if FULL_CLOSE
+    if (close_rows(fd, epoch, &records[0])) return 1;
 #endif
 #endif
     printf("lock-full: %s profile=%u participating=%u owners=%u published=256 private=0 retired=0 common=128 payers=8 epoch=%llu\n",

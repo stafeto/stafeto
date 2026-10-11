@@ -385,6 +385,8 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-lock-full7-wake.img",
     "boot-posix-lock-full4-death.img",
     "boot-posix-lock-full7-death.img",
+    "boot-posix-lock-full4-close.img",
+    "boot-posix-lock-full7-close.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
     "boot-posix-jobs.img",
@@ -460,7 +462,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-lock-full4-wake.img"
         | "boot-posix-lock-full7-wake.img"
         | "boot-posix-lock-full4-death.img"
-        | "boot-posix-lock-full7-death.img" => procs(),
+        | "boot-posix-lock-full7-death.img"
+        | "boot-posix-lock-full4-close.img"
+        | "boot-posix-lock-full7-close.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -616,6 +620,8 @@ mod tests {
                 "boot-posix-lock-full7-wake.img" => &crate::POSIX_LOCK_FULL7_WAKE_PROGRAMS,
                 "boot-posix-lock-full4-death.img" => &crate::POSIX_LOCK_FULL4_DEATH_PROGRAMS,
                 "boot-posix-lock-full7-death.img" => &crate::POSIX_LOCK_FULL7_DEATH_PROGRAMS,
+                "boot-posix-lock-full4-close.img" => &crate::POSIX_LOCK_FULL4_CLOSE_PROGRAMS,
+                "boot-posix-lock-full7-close.img" => &crate::POSIX_LOCK_FULL7_CLOSE_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
@@ -724,6 +730,8 @@ mod tests {
             "boot-posix-lock-full7-wake.img",
             "boot-posix-lock-full4-death.img",
             "boot-posix-lock-full7-death.img",
+            "boot-posix-lock-full4-close.img",
+            "boot-posix-lock-full7-close.img",
             "boot-posix-random.img",
             "boot-posix-pty.img",
             "boot-posix-steps.img",

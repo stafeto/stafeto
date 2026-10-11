@@ -10,8 +10,12 @@ static void capacity_handler(int signal) {
     int saved = errno;
     if (signal == SIGUSR1) {
 #if FULL_WAKE
+#if FULL_CLOSE
+        int result = close(close_alias);
+#else
         struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 2, .l_len = 1};
         int result = fcntl(wake_fd, F_SETLK, &lock);
+#endif
         capacity_error = result ? errno : 0;
         capacity_signal = result ? -1 : 1;
 #else
