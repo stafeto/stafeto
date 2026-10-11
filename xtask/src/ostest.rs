@@ -1141,8 +1141,17 @@ pub fn run_one(name: &str) -> Result<(), String> {
     )?;
     println!("{log}");
     let (verdict, text) = judge(&work, test, outcome(&log, name))?;
+    finish_one(name, verdict, &text)
+}
+
+/// Preserve the displayed classification and propagate a failed single test.
+fn finish_one(name: &str, verdict: Verdict, text: &str) -> Result<(), String> {
     println!("os-test {name}: {}\n{text}", verdict.name());
-    Ok(())
+    if verdict == Verdict::Fail {
+        Err(format!("os-test {name}: FAIL"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Fails unless the boot image at `path` carries os-test's licence.
@@ -1207,6 +1216,57 @@ fn write(rows: &[Row], suite: Option<&str>) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_test_result_preserves_all_five_classifications() {
+        for verdict in [
+            Verdict::Pass,
+            Verdict::Unknown,
+            Verdict::Unsupported,
+            Verdict::Excepted,
+        ] {
+            assert!(finish_one("io/single-host", verdict, "output\n").is_ok());
+        }
+        assert_eq!(
+            finish_one("io/single-host", Verdict::Fail, "partial\n"),
+            Err("os-test io/single-host: FAIL".to_owned())
+        );
+    }
+
+    #[test]
+    fn single_test_missing_start_end_and_timeout_propagate_failure() {
+        let test = Test {
+            name: "io/single-host".to_owned(),
+            suite: "io".to_owned(),
+            test: "single-host".to_owned(),
+            built: String::new(),
+        };
+        for (log, wanted) in [
+            ("init: boot stopped\n", "timeout: the test did not start"),
+            (
+                "@@os-test begin io/single-host\npartial\n",
+                "timeout: no end of the test",
+            ),
+            (
+                "@@os-test begin io/single-host\npartial\n\
+                 @@os-test end io/single-host timeout\n",
+                "exit: timeout",
+            ),
+        ] {
+            let (verdict, text) = judge(
+                Path::new("unused-single-test-expectations"),
+                &test,
+                outcome(log, &test.name),
+            )
+            .unwrap();
+            assert_eq!(verdict, Verdict::Fail);
+            assert!(text.contains(wanted), "{text:?}");
+            assert_eq!(
+                finish_one(&test.name, verdict, &text),
+                Err("os-test io/single-host: FAIL".to_owned())
+            );
+        }
+    }
 
     #[test]
     fn native_outliner_cfi_linked_instructions() {
