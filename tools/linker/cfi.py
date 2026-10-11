@@ -509,7 +509,7 @@ def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
                 else:
                     bases[destination] = None
             elif op not in ('bl',) and not op.startswith('ld'):
-                sources = {int(n) for n in re.findall(r'\bx(\d+)\b', args.split(',', 1)[-1])}
+                sources = {int(n) for n in re.findall(r'\b[xw](\d+)\b', args.split(',', 1)[-1])}
                 if sources & bases.keys() or 'sp' in args.split(',', 1)[-1]:
                     bases[destination] = None
 
@@ -581,6 +581,66 @@ def prove_finite_return(fde, target, limit, instructions):
     raise Invalid('prefix exit has no finite RET')
 
 
+def prove_preframe_graph(fde, first_save, instructions):
+    """Finite acyclic entry paths end in the first LR store or an entry RET."""
+    original = events(fde.program, fde.start, fde.cie.code)
+    graph = {}
+    pending = [fde.start]
+    while pending:
+        pc = pending.pop()
+        if pc in graph:
+            continue
+        require(fde.start <= pc <= first_save and pc in instructions,
+                'preframe graph leaves its exact prefix')
+        row = row_at(original, pc, fde.cie.initial, fde.cie.data)
+        require(row.cfa == (31, 0) and all(row.rule(r) == ('same', r) for r in range(19, 31)),
+                'preframe graph has changed entry recovery row')
+        if pc == first_save:
+            graph[pc] = []
+            continue
+        op, args = instructions[pc]
+        if op == 'ret':
+            require(args in ('', 'x30'), 'preframe graph returns through unknown register')
+            edges = []
+        elif op == 'b' or op.startswith('b.') or op in ('cbz', 'cbnz', 'tbz', 'tbnz'):
+            target = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', args)
+            require(target is not None, 'preframe graph has unknown direct target')
+            edges = [int(target[1], 16)] + ([] if op == 'b' else [pc + 4])
+        else:
+            require(op not in ('bl', 'blr', 'br', 'svc') and
+                    not (written_registers(op, args) & set(range(19, 32))),
+                    'preframe graph changes caller SP/LR/callee context')
+            require(not re.search(r'\b(?:sp|x29|w29)\b', args),
+                    'preframe graph uses a frame-derived address')
+            edges = [pc + 4]
+        graph[pc] = edges
+        pending.extend(edges)
+    require(first_save in graph, 'preframe graph never reaches its LR save')
+    # A backwards edge to a shared RET is valid; any real cycle is rejected.
+    degree = {pc: 0 for pc in graph}
+    for edges in graph.values():
+        for target in edges:
+            degree[target] += 1
+    ready = [pc for pc, count in degree.items() if count == 0]
+    count = 0
+    while ready:
+        pc = ready.pop()
+        count += 1
+        for target in graph[pc]:
+            degree[target] -= 1
+            if degree[target] == 0:
+                ready.append(target)
+    require(count == len(graph), 'preframe graph contains a cycle')
+    for source, (op, args) in instructions.items():
+        if op == 'b' or op == 'bl' or op.startswith('b.') or op in ('cbz', 'cbnz', 'tbz', 'tbnz'):
+            target = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', args)
+            require(target is not None, 'unknown preframe incoming edge')
+            destination = int(target[1], 16)
+            require(destination not in graph or destination == fde.start or source in graph,
+                    'foreign entry into preframe graph')
+    return first_save
+
+
 def prove_lr_store(fde, call_pc, after, instructions, targets):
     """Track the exact straight-line entry frame and all overlapping stores."""
     require(after.cfa[0] == 31 and after.rule(30)[0] == 'offset',
@@ -591,6 +651,21 @@ def prove_lr_store(fde, call_pc, after, instructions, targets):
     prefix_store = False
     skip_until = fde.start
     allowed_entries = set()
+    saves = [pc for pc in range(fde.start, call_pc, 4) if pc in instructions and
+             instructions[pc][0] in ('str', 'stp') and
+             re.search(r'\bx30\b', instructions[pc][1].split('[', 1)[0])]
+    if saves:
+        first = saves[0]
+        internal = False
+        for pc in range(fde.start, first, 4):
+            op, args = instructions.get(pc, ('', ''))
+            if op.startswith('b.') or op in ('cbz', 'cbnz', 'tbz', 'tbnz'):
+                target = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', args)
+                require(target is not None, 'missing preframe conditional target')
+                internal |= fde.start <= int(target[1], 16) < first
+        if internal:
+            skip_until = prove_preframe_graph(fde, first, instructions)
+            allowed_entries.add(first)
     for pc in range(fde.start, call_pc, 4):
         if pc < skip_until:
             continue

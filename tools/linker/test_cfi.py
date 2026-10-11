@@ -490,7 +490,8 @@ ret
         for store in ('stp x19,x20,[sp,#32]', 'str x0,[sp,#40]',
                       'stur x0,[sp,#40]', 'strh w0,[sp,#47]',
                       'mov x8,sp\nstr x0,[x8,#40]',
-                      'str x0,[x29,#24]',
+                      'str x0,[x29,#24]', 'mov w8,w29\nstr x0,[x8,#24]',
+                      'mov w8,wsp\nstr x0,[x8,#40]',
                       'mov x8,sp\nadd x8,x8,#40\nstr x0,[x8],#8',
                       'mov x8,sp\nadd x8,x8,#32\nstp x19,x20,[x8],#16',
                       'add x8,sp,x0\nstr x0,[x8]',
@@ -542,6 +543,59 @@ ret
                               'add x8,sp,#8\nstr x0,[x8],#8')
         data, ins = self.changed_fixture(source)
         normalize_bytes(data, ins)
+
+    def test_finite_preframe_graph_preserves_every_bypass(self):
+        extra = r"""
+.type graph_parent,%function
+graph_parent:
+.cfi_startproc
+cmp w0,#0
+b.eq graph_second
+cmp w0,#1
+b.eq graph_save
+mov w8,#4
+graph_error:
+str w8,[x1]
+ret
+graph_second:
+cmp w0,#2
+b.eq graph_save
+mov w8,#5
+b graph_error
+graph_save:
+str x30,[sp,#-32]!
+.cfi_def_cfa_offset 32
+bl OUTLINED_FUNCTION_0
+.cfi_offset 30,-32
+ldr x30,[sp],#32
+.cfi_def_cfa_offset 0
+.cfi_restore 30
+ret
+.cfi_endproc
+.size graph_parent,.-graph_parent
+"""
+        data, ins = self.changed_fixture(ASSEMBLY + extra)
+        fixed, _ = normalize_bytes(data, ins)
+        from cfi import events, row_at
+        old, new = Elf(data), Elf(fixed)
+        start = next(a for a,names in old.symbols.items() if any(n=='graph_parent' for n,_ in names))
+        before = next(f for f in old.records() if isinstance(f,Fde) and f.start==start)
+        after = next(f for f in new.records() if isinstance(f,Fde) and f.start==start)
+        for pc in range(start, start+44, 4):
+            self.assertEqual(row_at(events(before.program,start,before.cie.code),pc,before.cie.initial,before.cie.data),
+                             row_at(events(after.program,start,after.cie.code),pc,after.cie.initial,after.cie.data))
+        for mutation in ('mov x19,x0', 'sub sp,sp,#16', 'mov x30,x0',
+                         'bl leaf', 'mov x8,sp'):
+            data, ins = self.changed_fixture(ASSEMBLY + extra.replace('cmp w0,#0', mutation+'\ncmp w0,#0'))
+            with self.assertRaises(Invalid):
+                normalize_bytes(data, ins)
+        data, ins = self.changed_fixture(ASSEMBLY + extra.replace('b graph_error', 'b graph_parent'))
+        with self.assertRaisesRegex(Invalid, 'cycle'):
+            normalize_bytes(data, ins)
+        incoming = "\n.type foreign_graph,%function\nforeign_graph:\n.cfi_startproc\ntbnz w0,#0,graph_save\nret\n.cfi_endproc\n.size foreign_graph,.-foreign_graph\n"
+        data, ins = self.changed_fixture(ASSEMBLY + extra + incoming)
+        with self.assertRaisesRegex(Invalid, 'foreign entry'):
+            normalize_bytes(data, ins)
 
     def test_unknown_parent_lr_is_terminal_rejection(self):
         source = ASSEMBLY+"\n.type unknown_parent,%function\nunknown_parent:\n.cfi_startproc\nbl OUTLINED_FUNCTION_0\nret\n.cfi_endproc\n.size unknown_parent,.-unknown_parent\n"
