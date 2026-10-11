@@ -437,7 +437,9 @@ static int coordinator(void) {
 #if FULL_RING
     if (ring_capture(fd, epoch, records)) return 1;
 #endif
-    if (full_telemetry((unsigned)fd, 2, cookie, epoch, 0, out)) return fail("Stop capture", 0);
+    if (full_telemetry((unsigned)fd, 2, cookie, epoch, 0, out) || out[0] != epoch
+        || out[1] != profile || out[2] != 32 || out[3] || out[4] || out[5] != epoch)
+        return fail("Stop capture exact successful state", 0);
 #if FULL_RING
     if (full_telemetry((unsigned)fd, 6, cookie, 0, 0, out) != -310)
         return fail("identity forbidden after Stop", 0);
