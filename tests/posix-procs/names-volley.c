@@ -564,7 +564,7 @@ static void *vz_idle(void *unused) {
 }
 
 /* What one thread costs the quota of its process: the bytes charged before
- * and after the creation of a thread with a stack of 20480 bytes (the block
+ * and after the creation of a thread with the checked 65536-byte stack (the block
  * of the thread, its TLS and the stack), alone in the process. */
 static int vz_thread_cost(void) {
     enum { COUNT = 3 };
@@ -590,8 +590,8 @@ static int vz_thread_cost(void) {
     vz_hold = 1;
     for (int i = 0; i < COUNT; i++) VZ_CHECK(pthread_join(threads[i], NULL) == 0);
     printf("posix-procs: names thread cost: %llu bytes (%llu pages) for the first thread, %llu bytes the last, "
-           "%llu bytes for %d, stack 20480 bytes\n",
-           first, first / 4096, last, total, (int)COUNT);
+           "%llu bytes for %d, stack %zu bytes\n",
+           first, first / 4096, last, total, (int)COUNT, stack_size);
     return 0;
 }
 
