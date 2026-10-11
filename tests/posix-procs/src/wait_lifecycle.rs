@@ -361,3 +361,123 @@ pub extern "C" fn wait_lifecycle_complete_success() -> i32 {
         _ => -65,
     }
 }
+
+// Controlled late journal after real absent Cancel/Release; not a second admitted WAIT.
+fn rotation_send(bytes: &[u8]) -> Result<rt::sys::Reply, rt::abi::Error> {
+    let transport = posix_abi::shared::with_files(|f| Ok(f.transport()))
+        .map_err(|_| rt::abi::Error::BadState)?;
+    rt::sys::send(transport.files().sessions().0, bytes)
+}
+fn rotation_reply(packet: &Writer) -> Result<proto_fs::WaitReply, i32> {
+    let response = rotation_send(packet.as_bytes()).map_err(|_| -101)?;
+    if !response.handles.is_empty() || response.len > rt::abi::INLINE_MAX {
+        return Err(-102);
+    }
+    let bytes = rt::abi::inline_bytes(&response.words);
+    proto_fs::WaitReply::read(Reader::new(&bytes[..response.len])).map_err(|_| -103)
+}
+fn rotation_key(method: proto_fs::Method, token: WaitToken) -> Result<Writer, i32> {
+    let mut packet = Writer::new();
+    proto_fs::write_wait_key(method, proto_fs::WaitKey {
+        slot: token.slot() as u32, generation: token.generation(),
+    }, &mut packet).map_err(|_| -104)?;
+    Ok(packet)
+}
+fn rotation_retired(token: WaitToken) -> Result<bool, i32> {
+    let packet = rotation_key(proto_fs::Method::WaitQuery, token)?;
+    let response = rotation_send(packet.as_bytes()).map_err(|_| -105)?;
+    if !response.handles.is_empty() || response.len > rt::abi::INLINE_MAX { return Err(-106); }
+    let bytes = rt::abi::inline_bytes(&response.words);
+    let mut reader = Reader::new(&bytes[..response.len]);
+    Ok(reader.u32().map_err(|_| -107)? == proto_fs::OPEN_RETIRED
+        && reader.u32().map_err(|_| -108)? == 0 && reader.finish().is_ok())
+}
+/// Main-thread, real blocked source. Native use is held until the callback pin is accepted.
+#[unsafe(no_mangle)]
+pub extern "C" fn wait_cleanup_pending_rotation(fd: u32) -> i32 {
+    let result = (|| {
+        use posix_fs::wait::{Input, OwnerToken, TerminalReply, WaitCancelReason, WaitRecordPhase, WaitResult};
+        if wait_lifecycle_count() != 0 { return Err(-110); }
+        let owner = OwnerToken::new(posix_abi::relibc::open_owner().map_err(|_| -111)?)
+            .map_err(|_| -112)?;
+        let sp: u64;
+        // SAFETY: main fixture remains live through both exact records and Resume.
+        unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)); }
+        let (tokens, raws) = {
+            let _scope = rt::upcall::defer_entries().map_err(|_| -113)?;
+            let mut tokens = [None; 2];
+            let mut raws = [0; 2];
+            for index in 0..2 {
+                let channel = rt::sys::channel_create(1).map_err(|_| -114)?;
+                let raw = channel.raw().0;
+                let token = posix_abi::shared::with_files(|files| {
+                    let source = files.lock_source(fd).map_err(|_| -115)?;
+                    let (token, claim) = files.begin_wait_record(owner, source, entries::Frame::main(sp), Input {
+                        mode: proto_fs::WaitMode::Pid, kind: proto_fs::LockKind::Write,
+                        whence: 0, start: 0, length: 1, pid: 0,
+                    }).map_err(|_| -116)?;
+                    files.attach_wait_channel(claim, raw).map_err(|_| -117)?;
+                    Ok(token)
+                })?;
+                let _ = channel.into_raw(); // Transfer completed before any entry can run.
+                tokens[index] = Some(token); raws[index] = raw;
+            }
+            ([tokens[0].ok_or(-118)?, tokens[1].ok_or(-119)?], raws)
+        };
+        let early = tokens[0]; let late = tokens[1];
+        let mut start = Writer::new();
+        posix_abi::shared::with_files(|files| {
+            files.wait_snapshot(early).map_err(|_| -120)?.recovery.request(early)
+                .write(&mut start).map_err(|_| -121)
+        })?;
+        let mut reply = rotation_reply(&start)?;
+        for _ in 0..64 {
+            if matches!(reply.phase, proto_fs::WaitPhase::Sleeping | proto_fs::WaitPhase::NeedsArm) { break; }
+            if reply.phase == proto_fs::WaitPhase::Complete { return Err(-122); }
+            reply = rotation_reply(&rotation_key(proto_fs::Method::WaitQuery, early)?)?;
+        }
+        if !matches!(reply.phase, proto_fs::WaitPhase::Sleeping | proto_fs::WaitPhase::NeedsArm) { return Err(-123); }
+        let terminal = rotation_reply(&rotation_key(proto_fs::Method::WaitCancel, late)?)?;
+        if terminal.phase != proto_fs::WaitPhase::Complete || terminal.result != proto_fs::LOCK_CANCELLED { return Err(-124); }
+        let release = rotation_key(proto_fs::Method::WaitRelease, late)?;
+        {
+            let response = rotation_send(release.as_bytes()).map_err(|_| -125)?;
+            if !response.handles.is_empty() || response.len != 8 { return Err(-126); }
+            let bytes = rt::abi::inline_bytes(&response.words);
+            let mut r = Reader::new(&bytes[..8]);
+            if r.u32().map_err(|_| -127)? != 0 || r.u32().map_err(|_| -128)? != 0 || r.finish().is_err() { return Err(-129); }
+        }
+        let early_before = posix_abi::shared::with_files(|files| {
+            files.begin_wait_cleanup(early, WaitCancelReason::Abandoned).map_err(|_| -130)?;
+            files.begin_wait_cleanup(late, WaitCancelReason::Abandoned).map_err(|_| -131)?;
+            files.publish_wait_cleanup(late, WaitResult::Failed(4), TerminalReply::from_reply(terminal).map_err(|_| -132)?)
+                .map_err(|_| -133)?;
+            files.finish_wait_cleanup(late).map_err(|_| -134)?;
+            files.abandon_wait_owner(owner);
+            files.wait_snapshot(early).map_err(|_| -135)
+        })?;
+        if early_before.phase != WaitRecordPhase::Cleaning || early_before.result.is_some()
+            || early_before.channel != Some(raws[0]) { return Err(-136); }
+        let cancel = rotation_key(proto_fs::Method::WaitCancel, early)?;
+        {
+            let _defer = rt::upcall::defer_entries().map_err(|_| -137)?;
+            rt::sys::thread_upcall_request(&posix_abi::threads::main_handle()).map_err(|_| -138)?;
+            // Mandatory real kernel calibration, never a synthesized probe result.
+            if !matches!(rotation_send(cancel.as_bytes()), Err(rt::abi::Error::Interrupted)) { return Err(-139); }
+            for _ in 0..16 { posix_abi::shared::help_open_recovery(); }
+            let exact = posix_abi::shared::with_files(|files| Ok(
+                files.wait_snapshot(early).ok() == Some(early_before)
+                    && files.wait_snapshot(late).is_err()))?;
+            if !exact || raw_info(raws[1]) != Err(rt::abi::Error::BadHandle)
+                || raw_info(raws[0]).is_err() { return Err(-140); }
+        } // Real Resume delivers the genuine pending entry before ordinary helping.
+        for _ in 0..64 {
+            posix_abi::shared::help_open_recovery();
+            if wait_lifecycle_count() == 0 { break; }
+        }
+        if wait_lifecycle_count() != 0 || raw_info(raws[0]) != Err(rt::abi::Error::BadHandle)
+            || !rotation_retired(early)? || !rotation_retired(late)? { return Err(-141); }
+        Ok(1)
+    })();
+    result.unwrap_or_else(|error| error)
+}

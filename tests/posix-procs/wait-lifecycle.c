@@ -334,3 +334,29 @@ void public_wait_arbitrary_jumps(void) {
     expect("close unchanged jump source after all exact debts",close(lifecycle_fd),0);
     if(!failures)printf("posix-procs: genuine21 arbitrary WAIT jumps same owner and canonical success preserve exact debts ok\n");
 }
+
+/* Separately activated only after the corrected callback pin is accepted. */
+extern int wait_cleanup_pending_rotation(unsigned fd);
+void public_wait_pending_rotation(void) {
+    int fd=open("/tmp/public-wait-pending-rotation",O_CREAT|O_RDWR,0666);
+    expect("pending rotation actual source",fd>=0,1);if(fd<0)return;
+    int commands[2],replies[2];
+    if(pipe(commands)||pipe(replies)){expect("pending rotation pipes",0,1);close(fd);return;}
+    pid_t holder=fork();expect("pending rotation blocker PID",holder>=0,1);
+    if(holder==0){close(commands[1]);close(replies[0]);char command;
+        while(read(commands[0],&command,1)==1){if(command=='Q')_exit(0);
+            struct flock lock={.l_type=command=='L'?F_WRLCK:F_UNLCK,.l_whence=SEEK_SET,.l_len=1};
+            if(fcntl(fd,F_SETLK,&lock)||write(replies[1],&command,1)!=1)_exit(108);
+        }_exit(109);
+    }
+    close(commands[0]);close(replies[1]);
+    if(holder<0){close(commands[1]);close(replies[0]);close(fd);return;}
+    expect("pending rotation genuine held blocker",wait_holder_exchange(commands[1],replies[0],'L'),1);
+    expect("real Interrupted preserves early debt while paying later channel",wait_cleanup_pending_rotation((unsigned)fd),1);
+    expect("pending source survives without rescue close",fcntl(fd,F_GETFD)>=0,1);
+    expect("pending rotation normal unlock",wait_holder_exchange(commands[1],replies[0],'U'),1);
+    char quit='Q';expect("pending rotation holder stop",write(commands[1],&quit,1),1);
+    close(commands[1]);close(replies[0]);lifecycle_reap(holder);
+    expect("pending rotation final source close",close(fd),0);
+    if(!failures)printf("posix-procs: WAIT real deferred pending physical cleanup rotation ok\n");
+}
