@@ -156,6 +156,11 @@ impl Conflicts {
 pub struct SweepCursor {
     pub inode: usize,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryDetails {
+    pub blocker: Option<Lock>,
+    pub owns_overlap: bool,
+}
 pub struct Sweep {
     pub visited: usize,
     pub removed: usize,
@@ -274,11 +279,25 @@ impl SimpleLocks {
         &self,
         storage: &Storage<'_>,
         request: Request,
-        mut live: impl FnMut(Owner) -> bool,
+        live: impl FnMut(Owner) -> bool,
     ) -> Result<Option<Lock>, Error> {
+        self.query_details(storage, request, live)
+            .map(|details| details.blocker)
+    }
+    pub fn query_details(
+        &self,
+        storage: &Storage<'_>,
+        request: Request,
+        mut live: impl FnMut(Owner) -> bool,
+    ) -> Result<QueryDetails, Error> {
         let kind = match request.command {
             Command::Get(kind) | Command::Set(Some(kind)) => kind,
-            Command::Set(None) => return Ok(None),
+            Command::Set(None) => {
+                return Ok(QueryDetails {
+                    blocker: None,
+                    owns_overlap: false,
+                });
+            }
         };
         storage.node(request.inode).map_err(|_| Error::Invalid)?;
         let head = self.heads[request.inode.slot as usize];
@@ -291,19 +310,25 @@ impl SimpleLocks {
             range: request.range,
         };
         let mut blocker: Option<Lock> = None;
+        let mut owns_overlap = false;
         let mut id = head.first;
         for _ in 0..head.count {
             let (lock, next) = self.read(storage, id);
             id = next;
-            if live(lock.owner)
-                && lock.conflicts(wanted)
-                && blocker.is_none_or(|old| lock.range.first() < old.range.first())
-            {
-                blocker = Some(lock);
+            if live(lock.owner) {
+                owns_overlap |= lock.owner == request.owner && lock.range.overlaps(request.range);
+                if lock.conflicts(wanted)
+                    && blocker.is_none_or(|old| lock.range.first() < old.range.first())
+                {
+                    blocker = Some(lock);
+                }
             }
         }
         assert_eq!(id, NONE);
-        Ok(blocker)
+        Ok(QueryDetails {
+            blocker,
+            owns_overlap,
+        })
     }
     /// Preflight every new slot before changing any published record.
     pub fn set(
@@ -809,6 +834,40 @@ mod tests {
     }
     fn payer(id: u64) -> Root {
         Root { id, generation: 7 }
+    }
+
+    #[test]
+    fn query_details_requires_live_same_owner_overlap_and_retains_foreign_blocker() {
+        let mut ram = crate::Ram::default();
+        let file = inode(&mut ram, b"query-holder");
+        let mut table = fresh();
+        for (pid, first) in [(256, 0), (257, 3)] {
+            table
+                .set(
+                    &mut ram.storage,
+                    payer(1),
+                    request(file, Owner::Process(pid), first, 2, Some(Kind::Read)),
+                    |_| true,
+                )
+                .unwrap();
+        }
+        let asked = request(file, Owner::Process(256), 1, 4, Some(Kind::Write));
+        let details = table.query_details(&ram.storage, asked, |_| true).unwrap();
+        assert!(details.owns_overlap);
+        assert_eq!(details.blocker.unwrap().owner, Owner::Process(257));
+        assert!(
+            !table
+                .query_details(&ram.storage, asked, |owner| owner != Owner::Process(256))
+                .unwrap()
+                .owns_overlap
+        );
+        let disjoint = request(file, Owner::Process(256), 10, 1, Some(Kind::Write));
+        assert!(
+            !table
+                .query_details(&ram.storage, disjoint, |_| true)
+                .unwrap()
+                .owns_overlap
+        );
     }
 
     #[test]
