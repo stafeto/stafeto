@@ -347,3 +347,48 @@ fn dead_pid_with_retained_source_cannot_publish_set_and_cancel_replays() {
     f.waits.release_registration(id);
     f.queue.release(id, &mut f.ram.storage).unwrap();
 }
+
+#[test]
+fn retained_wait_quiesces_own_work_and_timer_restarts_a_finite_sweep() {
+    let mut f = Fixture::new();
+    f.hold(257, 0, Kind::Write);
+    let id = f.wait(0, 256, 0);
+    assert_eq!(f.query(id).phase, WaitPhase::Queued);
+    f.waits.arm(&mut f.queue, id, 19).unwrap();
+    for _ in 0..4096 {
+        if !f.waits.needs_work() {
+            break;
+        }
+        f.tick();
+    }
+    assert!(
+        f.waits.pending(),
+        "retained receipt still requires periodic death polling"
+    );
+    assert!(
+        !f.waits.needs_work(),
+        "blocked custody cannot perpetually preempt the caller"
+    );
+    assert_eq!(f.queue.query(id).unwrap().phase, WaitPhase::Sleeping);
+    f.waits.poll();
+    assert!(f.waits.needs_work());
+    for _ in 0..CAPACITY {
+        f.waits.poll(); // Repeated timer hints cannot refill the active sweep.
+        f.tick();
+    }
+    assert!(!f.waits.needs_work());
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(257),
+        )
+        .unwrap();
+    f.waits.changed(f.captured.request.inode);
+    for _ in 0..CAPACITY {
+        f.tick();
+    }
+    assert!(!f.waits.needs_work());
+    assert_eq!(f.query(id).result, 0);
+    assert_eq!(f.queue.query(id).unwrap().phase, WaitPhase::Complete);
+}

@@ -2733,7 +2733,7 @@ impl Fs {
     fn notify_maintenance(&self) {
         if self.legacy_pending
             || self.lock_jobs.has_work()
-            || self.waits.pending()
+            || self.waits.needs_work()
             || self.lock_sweep_pending
         {
             let _ = sys::notify(&self.channel, 1);

@@ -321,7 +321,11 @@ impl SimpleLocks {
         let count = old.len();
         let mut work: Buffer<Work, { PER_INODE + 2 }> = Buffer::new();
         let mut patches: Buffer<Lock, { PER_INODE + 2 }> = Buffer::new();
+        // Work references never move after append. Only these entries can need
+        // a reused or newly paid slot; unchanged records require neither scan.
+        let mut unallocated: Buffer<u8, { PER_INODE + 2 }> = Buffer::new();
         let mut len = 0;
+        let mut retained = 0u64;
         let mut added = kind.map(|kind| Lock {
             owner: request.owner,
             kind,
@@ -368,6 +372,7 @@ impl SimpleLocks {
                     payer: original,
                     patch: u8::MAX,
                 });
+                retained |= 1u64 << original;
                 len += 1;
                 continue;
             }
@@ -394,6 +399,11 @@ impl SimpleLocks {
                 }
                 let patch = patches.len() as u8;
                 patches.push(lock);
+                if edge != 0 {
+                    unallocated.push(len as u8);
+                } else {
+                    retained |= 1u64 << original;
+                }
                 work.push(Work {
                     id: if edge == 0 { entry.id } else { NONE },
                     original: if edge == 0 { original } else { u8::MAX },
@@ -410,6 +420,7 @@ impl SimpleLocks {
         if let Some(added) = added {
             let patch = patches.len() as u8;
             patches.push(added);
+            unallocated.push(len as u8);
             work.push(Work {
                 id: NONE,
                 original: u8::MAX,
@@ -423,19 +434,14 @@ impl SimpleLocks {
         }
         // Reuse unpublished old slots belonging to the same payer before
         // asking the page pool for capacity. Their bytes change only at commit.
-        let mut retained = 0u64;
-        for entry in &work[..len] {
-            if entry.original != u8::MAX {
-                retained |= 1u64 << entry.original;
-            }
-        }
         let all_old = if count == PER_INODE {
             u64::MAX
         } else {
             (1u64 << count) - 1
         };
-        for entry in &mut work[..len] {
-            if entry.id == NONE && retained != all_old {
+        for &index in &unallocated[..] {
+            let entry = &mut work[index as usize];
+            if retained != all_old {
                 if let Some((index, previous)) =
                     old[..count].iter().enumerate().find(|(index, previous)| {
                         retained & (1u64 << index) == 0
@@ -455,7 +461,8 @@ impl SimpleLocks {
                 .map_err(|_| Error::NoLocks)?;
         }
         let mut reserved: Buffer<u32, PER_INODE> = Buffer::new();
-        for entry in &mut work[..len] {
+        for &index in &unallocated[..] {
+            let entry = &mut work[index as usize];
             if entry.id != NONE {
                 continue;
             }
@@ -698,7 +705,12 @@ impl SimpleLocks {
             self.unlink_available(physical);
             let page = self.pages[physical as usize].paid.take().unwrap();
             storage.release_lock_page(page);
-            self.pages[physical as usize] = Page::EMPTY;
+            // take already cleared paid. Reset only the remaining live fields;
+            // no full-page metadata copy is needed for its now-free slot.
+            let empty = &mut self.pages[physical as usize];
+            empty.free = 0;
+            empty.previous = NO_PAGE;
+            empty.next = NO_PAGE;
         }
     }
     #[inline(always)]

@@ -2,6 +2,13 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Copied AArch64 LP64 flock fields for advisory lock commands.
+//!
+//! RAM admits 64 canonical regions per inode, including unlock fragments.
+//! Region or paid-storage exhaustion returns ENOLCK without changing the list.
+//! Blocking locks admit 64 waiters per inode and 256 service registrations;
+//! exhausted registration space or PID dependency search (16 links) returns
+//! ENOLCK. EDEADLK requires a detected PID cycle. Nonblocking SET returns EAGAIN
+//! when an older incompatible queued request has priority on that range.
 
 use super::constants::{EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOLCK, EOVERFLOW};
 use proto_fs::{LockCommand, LockKind, LockPhase, LockReply};

@@ -142,6 +142,7 @@ pub struct Waits<H> {
     number: u64,
     count: usize,
     cursor: usize,
+    remaining: usize,
     check: Check,
     active: bool,
     graph_turn: bool,
@@ -170,6 +171,7 @@ impl<H> Waits<H> {
             core::ptr::addr_of_mut!((*destination).number).write(0);
             core::ptr::addr_of_mut!((*destination).count).write(0);
             core::ptr::addr_of_mut!((*destination).cursor).write(0);
+            core::ptr::addr_of_mut!((*destination).remaining).write(0);
             Check::initialize_at(core::ptr::addr_of_mut!((*destination).check));
             core::ptr::addr_of_mut!((*destination).active).write(false);
             core::ptr::addr_of_mut!((*destination).graph_turn).write(true);
@@ -209,8 +211,21 @@ impl<H> Waits<H> {
     pub fn pending(&self) -> bool {
         self.count != 0
     }
-    /// Timer turns use the same bounded cursor; polling never walks all waiters.
-    pub fn poll(&mut self) {}
+    /// Retained custody keeps the timer alive, but never an endless own notice.
+    pub fn needs_work(&self) -> bool {
+        self.active || self.remaining != 0
+    }
+    fn schedule(&mut self) {
+        self.remaining = if self.count == 0 { 0 } else { CAPACITY };
+    }
+    /// Schedule one finite bounded sweep; polling itself visits no registrations.
+    pub fn poll(&mut self) {
+        // A timer cannot replenish an in-flight sweep forever. Changed custody
+        // and graph completion separately schedule a fresh notification sweep.
+        if self.remaining == 0 {
+            self.schedule();
+        }
+    }
     fn slot(&self, id: Id) -> Result<usize, u32> {
         let slot = self.receipt[id.slot() as usize];
         if slot == NONE
@@ -275,6 +290,7 @@ impl<H> Waits<H> {
             self.registrations[tail as usize].as_mut().unwrap().next = slot as u16;
         }
         self.count += 1;
+        self.schedule();
         if let Owner::Process(pid) = captured.request.owner {
             let bucket = pid as usize % CAPACITY;
             if self.pid_waiters[bucket] == 0 {
@@ -325,9 +341,11 @@ impl<H> Waits<H> {
         self.count -= 1;
         if self.active && self.check.target == id {
             self.active = false;
+            self.schedule();
         }
     }
     pub fn changed(&mut self, inode: Token) {
+        self.schedule();
         let mut at = self.heads[inode.slot as usize];
         while at != NONE {
             let r = self.registrations[at as usize].as_mut().unwrap();
@@ -389,6 +407,7 @@ impl<H> Waits<H> {
         }
         if self.active && self.check.target == id {
             self.active = false;
+            self.schedule();
         }
         queue.query(id)
     }
@@ -467,7 +486,9 @@ impl<H> Waits<H> {
             r.handle = Some(handle);
         }
         queue.arm_registration(id)?;
-        if r.checking {
+        let checking = r.checking;
+        self.schedule();
+        if checking {
             Ok(WaitReply {
                 phase: WaitPhase::Queued,
                 result: 0,
@@ -520,6 +541,10 @@ impl<H> Waits<H> {
             return 1;
         }
         self.graph_turn = true;
+        if self.remaining == 0 {
+            return 0;
+        }
+        self.remaining -= 1;
         let slot = self.cursor;
         self.cursor = (self.cursor + 1) % CAPACITY;
         if let Some(r) = self.registrations[slot].as_ref() {
@@ -580,6 +605,7 @@ impl<H> Waits<H> {
                 .is_ok_and(|r| r.phase == WaitPhase::Complete)
         {
             self.active = false;
+            self.schedule();
             return;
         }
         if let Some(edge) = self.check.candidate {
@@ -727,6 +753,7 @@ impl<H> Waits<H> {
                 r.dirty = true;
             }
             self.active = false;
+            self.schedule();
             return;
         }
         let pid = if self.check.vertex == 0 {
@@ -822,6 +849,7 @@ impl<H> Waits<H> {
             // Yield the single checker after invalidation. The receipt cursor
             // selects the next pending check, so one changing inode cannot own it.
             self.active = false;
+            self.schedule();
         }
     }
 }
