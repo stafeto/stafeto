@@ -128,3 +128,84 @@ fn external_defer_receive_interrupt_does_not_release_stopper() {
     let before_commit = closure_progress.get();
     assert_eq!(closure_progress.get(), before_commit);
 }
+
+#[test]
+fn release_keeps_new_stopper_out_until_wakes_and_close_finish() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    assert!(barrier::must_park(stop.owner(), 11));
+    let woke = Cell::new(false);
+    let closed = Cell::new(0);
+    assert!(stop.release(
+        7,
+        || {
+            assert!(!barrier::must_park(stop.owner(), 11));
+            assert!(
+                !stop.try_begin(11, 202),
+                "new stop waits for every peer wake"
+            );
+            assert_eq!(stop.channel(), 101);
+            woke.set(true);
+        },
+        |channel| {
+            assert!(woke.get());
+            assert_eq!(channel, 101, "close belongs to the releasing owner");
+            assert!(!barrier::must_park(stop.owner(), 11));
+            assert!(!stop.try_begin(11, 202), "new stop waits for channel close");
+            closed.set(channel);
+        },
+    ));
+    assert_eq!(closed.get(), 101);
+    assert!(stop.try_begin(11, 202));
+    assert_eq!(stop.owner(), 11);
+    assert_eq!(stop.channel(), 202);
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}
+
+#[test]
+fn interleaved_release_cannot_close_the_next_stoppers_channel() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    let claimed_during_wake = Cell::new(false);
+    assert!(stop.release(
+        7,
+        || claimed_during_wake.set(stop.try_begin(11, 202)),
+        |channel| assert_eq!(channel, 101, "release must close its own channel"),
+    ));
+    assert!(!claimed_during_wake.get());
+    assert!(stop.try_begin(11, 202));
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}
+
+#[test]
+fn failed_contender_cannot_release_another_stop_or_its_channel() {
+    let stop = barrier::StopControl::new();
+    assert!(!stop.try_begin(0, 101));
+    assert!(!stop.try_begin(7, 0));
+    assert!(stop.try_begin(7, 101));
+    assert!(!stop.try_begin(11, 202));
+    assert!(!stop.release(
+        11,
+        || panic!("foreign peer wake"),
+        |_| panic!("foreign close")
+    ));
+    assert_eq!(stop.owner(), 7);
+    assert_eq!(stop.channel(), 101);
+    assert!(stop.release(7, || {}, |channel| assert_eq!(channel, 101)));
+    assert!(!stop.release(
+        7,
+        || panic!("duplicate wake"),
+        |_| panic!("duplicate close")
+    ));
+}
+
+#[test]
+fn child_discards_parent_lifecycle_and_accepts_its_own_stop() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    stop.reset_after_fork();
+    assert_eq!(stop.owner(), 0);
+    assert_eq!(stop.channel(), 0);
+    assert!(stop.try_begin(11, 202));
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}
