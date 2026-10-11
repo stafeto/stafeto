@@ -214,7 +214,7 @@ impl PosixFs {
     /// Mark only frames left by the jump. The caller holds the descriptor lock
     /// and defers entry delivery; this transition performs no remote cleanup.
     pub fn mark_wait_jump(&mut self, owner: OwnerToken, target: Frame) -> usize {
-        let mut departing = [None; posix_fd::WAIT_RECORDS];
+        let mut departing = [None; WAIT_RECORDS];
         for (i, token) in self.wait_tokens().enumerate() {
             if self
                 .wait_snapshot(token)
@@ -265,13 +265,13 @@ impl PosixFs {
         skip: Option<WaitToken>,
         cursor: usize,
     ) -> Result<Option<WaitToken>, FsError> {
-        let mut tokens = [None; posix_fd::WAIT_RECORDS];
+        let mut tokens = [None; WAIT_RECORDS];
         for token in self.wait_tokens() {
             tokens[token.slot()] = Some(token);
         }
-        let cursor = cursor % posix_fd::WAIT_RECORDS;
-        for offset in 0..posix_fd::WAIT_RECORDS {
-            let Some(token) = tokens[(cursor + offset) % posix_fd::WAIT_RECORDS] else {
+        let cursor = cursor % WAIT_RECORDS;
+        for offset in 0..WAIT_RECORDS {
+            let Some(token) = tokens[(cursor + offset) % WAIT_RECORDS] else {
                 continue;
             };
             if Some(token) == skip {
