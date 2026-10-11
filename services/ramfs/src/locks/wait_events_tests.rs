@@ -176,3 +176,37 @@ fn sixteen_paid_waits_on_four_billing_roots_wake_in_two_eight_cell_portions() {
     std::println!("WAIT Events {} bytes", core::mem::size_of::<Events>());
     assert!(core::mem::size_of::<Events>() <= 24 * 1024);
 }
+
+#[cfg(feature = "lock-telemetry")]
+#[test]
+fn measured_real_wake_and_idle_preserve_exact_registration() {
+    let (_, mut queue, mut pool, ids) = super::super::wait_departure::tests::fixture();
+    let registration = pool.find(ids[0]).unwrap();
+    let mut events = events();
+    assert_eq!(events.telemetry_first(), None);
+    let progress = events.part(&mut queue, &mut pool).unwrap();
+    let (row, _) =
+        crate::lock_telemetry::test_record(4, |table| table.portion(4, progress.visited, [0; 4]));
+    assert_eq!(row, [0; 5]);
+    events.attach(&pool, registration).unwrap();
+    events.changed(pool.snapshot(registration).unwrap().0.inode);
+    let actual = events.telemetry_first().unwrap();
+    assert_eq!(actual, registration);
+    let progress = events.part(&mut queue, &mut pool).unwrap();
+    assert_eq!(progress.visited, 1);
+    let expected = [
+        ids[0].owner(),
+        u64::from(ids[0].key().slot),
+        ids[0].key().generation,
+        registration.slot() as u64,
+    ];
+    let (row, witness) = crate::lock_telemetry::test_record(4, |table| {
+        table.portion(
+            4,
+            progress.visited,
+            crate::lock_telemetry::registration(actual),
+        )
+    });
+    assert_eq!((row[1] >> 32) & 255, 1);
+    assert_eq!(&witness[1..], &expected);
+}

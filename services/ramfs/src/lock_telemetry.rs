@@ -6,6 +6,21 @@ pub const METHOD: u16 = 0xfff1;
 pub const ROWS: usize = 32;
 pub const BRANCHES: usize = 16;
 pub const PAGES: u32 = 20;
+pub fn control(id: crate::locks::jobs::Id) -> [u64; 4] {
+    [id.owner(), u64::from(id.key().slot), id.key().generation, 0]
+}
+pub fn wait(id: crate::locks::wait_receipts::Id) -> [u64; 4] {
+    [id.owner(), u64::from(id.key().slot), id.key().generation, 1]
+}
+pub fn registration(token: crate::locks::waiters::RegistrationToken) -> [u64; 4] {
+    let id = token.receipt();
+    [
+        id.owner(),
+        u64::from(id.key().slot),
+        id.key().generation,
+        token.slot() as u64,
+    ]
+}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Occupancy {
     pub published: u16,
@@ -246,6 +261,37 @@ impl Table {
     pub fn mark(&mut self, bit: usize, visited: u8, witness: [u64; 4]) -> bool {
         self.dispatch.mark(bit, visited, witness)
     }
+    /// Counts only an executed portion, never an idle call.
+    pub fn portion(&mut self, bit: usize, visited: usize, witness: [u64; 4]) {
+        if visited == 0 {
+            return;
+        }
+        let Ok(visited) = u8::try_from(visited) else {
+            self.active = false;
+            self.failed = true;
+            return;
+        };
+        self.mark(bit, visited, witness);
+    }
+    pub fn actor(
+        &mut self,
+        progress: crate::locks::actor::Progress,
+        stage: u8,
+        receipt: Option<[u64; 4]>,
+    ) {
+        let mut witness = receipt.unwrap_or([0; 4]);
+        witness[3] |= u64::from(stage) << 32;
+        // Production charged bounds for these two single-cell transitions are eight.
+        let visits = if matches!(stage, 17 | 18) {
+            1
+        } else {
+            progress.visited
+        };
+        self.portion(0, visits, witness);
+        if progress.completed.is_some() {
+            self.mark(1, 0, witness);
+        }
+    }
     pub fn finish(&mut self, timing: Timing, after: Occupancy) {
         if !self.active || self.dispatch.observer {
             return;
@@ -363,6 +409,55 @@ impl Table {
             _ => Err(Error::Invalid),
         }
     }
+}
+#[cfg(test)]
+pub(crate) fn test_record(bit: usize, apply: impl FnOnce(&mut Table)) -> ([u64; 5], [u64; 5]) {
+    let mut allocation = Box::<Table>::new_uninit();
+    // SAFETY: exclusive aligned heap allocation initialized in place.
+    let mut table = unsafe {
+        Table::initialize_at(allocation.as_mut_ptr());
+        allocation.assume_init()
+    };
+    let occupancy = Occupancy {
+        published: 256,
+        private: 0,
+        retired: 0,
+        common: 128,
+        roots: 8,
+    };
+    table
+        .start(
+            Scope {
+                place: 0,
+                owner: 1,
+                nonce: 1,
+                source: Source {
+                    packed: 3,
+                    generation: 1,
+                },
+            },
+            0,
+            4,
+            occupancy,
+        )
+        .unwrap();
+    table.begin_dispatch(occupancy);
+    apply(&mut table);
+    table.finish(
+        Timing {
+            kind: 2,
+            detail: 0,
+            whole: 1,
+            waited: 0,
+            took: 1,
+            valid: true,
+        },
+        occupancy,
+    );
+    (
+        table.page(10 + bit, 19).unwrap_or([0; 5]),
+        table.page(10 + bit, 2 + bit as u32).unwrap_or([0; 5]),
+    )
 }
 #[cfg(test)]
 mod tests {

@@ -104,6 +104,13 @@ impl Events {
     pub fn poll(&mut self) {
         self.pending |= self.occupied;
     }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_first(&self) -> Option<RegistrationToken> {
+        if self.pending == 0 {
+            return None;
+        }
+        self.registrations[self.pending.trailing_zeros() as usize].map(|entry| entry.0)
+    }
     pub fn pending(&self) -> bool {
         self.pending != 0
     }

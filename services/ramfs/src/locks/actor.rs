@@ -166,6 +166,8 @@ pub struct Actor<
     departures: [Option<Departure>; P],
     departure_head: u16,
     departure_tail: u16,
+    #[cfg(feature = "lock-telemetry")]
+    telemetry_stage: u8,
 }
 impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: usize, const S: usize>
     Actor<G, I, P, D, R, S>
@@ -196,6 +198,8 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             core::ptr::addr_of_mut!((*destination).group_cleanup).write(None);
             core::ptr::addr_of_mut!((*destination).departure_head).write(NONE);
             core::ptr::addr_of_mut!((*destination).departure_tail).write(NONE);
+            #[cfg(feature = "lock-telemetry")]
+            core::ptr::addr_of_mut!((*destination).telemetry_stage).write(0);
         }
     }
     fn view(&self, id: Id) -> Result<View, Error> {
@@ -210,6 +214,22 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             || self.revoked.is_some()
             || self.empty.is_some()
             || self.departure_head != NONE
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_stage(&self) -> u8 {
+        self.telemetry_stage
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_pid(&self, index: usize) -> Option<u32> {
+        self.groups.tracked_pid(index).ok().flatten()
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_description(&self, index: usize) -> Option<Token> {
+        let snapshot = self.groups.tracked_description(index).ok().flatten()?;
+        let Owner::Description { slot, generation } = snapshot.owner else {
+            return None;
+        };
+        Some(Token { slot, generation })
     }
     pub fn busy(&self) -> bool {
         self.worker.is_some() || self.debt()
@@ -363,7 +383,15 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
     }
 
     fn cleanup_step(&mut self) -> Progress {
+        #[cfg(feature = "lock-telemetry")]
+        {
+            self.telemetry_stage = 0;
+        }
         if let Some(cleanup) = &mut self.previous {
+            #[cfg(feature = "lock-telemetry")]
+            {
+                self.telemetry_stage = 16;
+            }
             let progress = cleanup
                 .cursor
                 .step(&mut self.pool)
@@ -384,6 +412,10 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             return Progress::pending(progress.released);
         }
         if let Some(capture) = self.empty.take() {
+            #[cfg(feature = "lock-telemetry")]
+            {
+                self.telemetry_stage = 17;
+            }
             if self.groups.valid(capture) {
                 let snapshot = self.groups.revoke(capture).expect("empty candidate");
                 self.retire_view(capture.id(), snapshot.root)
@@ -392,6 +424,10 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             return Progress::pending(records::PORTION);
         }
         if self.departure_head != NONE {
+            #[cfg(feature = "lock-telemetry")]
+            {
+                self.telemetry_stage = 18;
+            }
             let index = self.departure_head as usize;
             let departure = self.departures[index]
                 .as_mut()
@@ -415,6 +451,10 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             return Progress::pending(records::PORTION);
         }
         if let Some(id) = self.revoked {
+            #[cfg(feature = "lock-telemetry")]
+            {
+                self.telemetry_stage = 19;
+            }
             let view = self.view(id).expect("paid revoked view");
             if self.group_cleanup.is_none() {
                 let root = self.groups.capture(id).expect("paid revoked group");
@@ -612,6 +652,10 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             }
         }
         if worker.cancelled {
+            #[cfg(feature = "lock-telemetry")]
+            {
+                self.telemetry_stage = 4;
+            }
             if let Phase::Prepare { work, capture } = &mut worker.phase {
                 let retirement = work
                     .cancel(&mut self.budget)
@@ -624,6 +668,14 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
         if matches!(worker.phase, Phase::Admit) && self.debt() {
             self.worker = Some(worker);
             return self.cleanup_step();
+        }
+        #[cfg(feature = "lock-telemetry")]
+        {
+            self.telemetry_stage = match worker.phase {
+                Phase::Scan(_) => 1,
+                Phase::Admit => 2,
+                Phase::Prepare { .. } => 3,
+            };
         }
         let progress = match &mut worker.phase {
             Phase::Scan(scan) => {

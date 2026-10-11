@@ -79,6 +79,8 @@ pub struct Proof {
     #[cfg(feature = "lifetime-probe")]
     probe_snapshot: Option<[u32; 3]>,
     candidate: Option<Seed>,
+    #[cfg(feature = "lock-telemetry")]
+    telemetry_seed_visits: Option<usize>,
     seeds: [Option<Seed>; CAPACITY],
     watches: [Option<SavedWatch>; CAPACITY],
     reader: Option<Reader>,
@@ -137,6 +139,8 @@ impl Proof {
                 watches.add(index).write(None);
             }
             core::ptr::addr_of_mut!((*destination).candidate).write(None);
+            #[cfg(feature = "lock-telemetry")]
+            core::ptr::addr_of_mut!((*destination).telemetry_seed_visits).write(None);
             core::ptr::addr_of_mut!((*destination).reader).write(None);
             core::ptr::addr_of_mut!((*destination).reader_watch).write(None);
             core::ptr::addr_of_mut!((*destination).used).write(0);
@@ -216,6 +220,14 @@ impl Proof {
             outcome: None,
         }
     }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_candidate(&self) -> Option<Id> {
+        self.candidate.map(|seed| seed.token.receipt())
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_visits(&self, progress: Progress) -> usize {
+        self.telemetry_seed_visits.unwrap_or(progress.visited)
+    }
     pub fn step(
         &mut self,
         queue: &Queue,
@@ -225,6 +237,10 @@ impl Proof {
         mut pid_live: impl FnMut(u32) -> bool,
         mut ofd_live: impl FnMut(Token) -> bool,
     ) -> Progress {
+        #[cfg(feature = "lock-telemetry")]
+        {
+            self.telemetry_seed_visits = None;
+        }
         if !matches!(
             self.phase,
             Phase::Idle | Phase::Cleanup(_) | Phase::Finished(_)
@@ -270,7 +286,13 @@ impl Proof {
                 let graph = &mut self.graph;
                 let seeds = &mut self.seeds;
                 let mut invalid = false;
+                #[cfg(feature = "lock-telemetry")]
+                let mut actual = 0;
                 let result = pool.scan(cursor, |token, _, _| {
+                    #[cfg(feature = "lock-telemetry")]
+                    {
+                        actual += 1;
+                    }
                     let Some(item) = seed(queue, pool, token) else {
                         return;
                     };
@@ -286,6 +308,10 @@ impl Proof {
                     }
                     seeds[token.slot()] = Some(item);
                 });
+                #[cfg(feature = "lock-telemetry")]
+                {
+                    self.telemetry_seed_visits = Some(actual + usize::from(result.is_err()));
+                }
                 let visited = result.unwrap_or(PORTION);
                 if result.is_err() || invalid {
                     self.abort();

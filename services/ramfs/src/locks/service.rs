@@ -157,6 +157,18 @@ impl LockService {
     ) -> super::wait_select::Progress {
         selector.part(pool, waits, jobs, &self.actor, pid_live, ofd_live)
     }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_stage(&self) -> u8 {
+        self.actor.telemetry_stage()
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_pid(&self, index: usize) -> Option<u32> {
+        self.actor.telemetry_pid(index)
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_description(&self, index: usize) -> Option<Token> {
+        self.actor.telemetry_description(index)
+    }
     pub fn cancel(&mut self) -> bool {
         self.actor.cancel()
     }
@@ -1540,6 +1552,134 @@ mod tests {
         ));
         assert_eq!(service.counts(), counts);
         check_pins(&service, &ram.storage);
+    }
+    #[cfg(feature = "lock-telemetry")]
+    #[test]
+    fn measured_real_actor_terminal_idle_and_single_empty_cleanup() {
+        let (mut ram, inodes) = fixture();
+        let page = page();
+        let mut service = fresh();
+        let progress = service.step(&mut ram.storage, |pid| page.live(pid));
+        assert_eq!(service.telemetry_stage(), 0);
+        let (row, _) = crate::lock_telemetry::test_record(0, |table| {
+            table.actor(progress, service.telemetry_stage(), None)
+        });
+        assert_eq!(row, [0; 5]);
+        service
+            .start(
+                &mut ram.storage,
+                request(inodes[0], 256, Command::Get(Kind::Write), 0, 1),
+                root(10, 1),
+            )
+            .unwrap();
+        let progress = service.step(&mut ram.storage, |pid| page.live(pid));
+        assert_eq!(progress.visited, 0);
+        assert_eq!(progress.completed, Some(Ok(Response::Blocker(None))));
+        let (row, _) = crate::lock_telemetry::test_record(1, |table| {
+            table.actor(progress, service.telemetry_stage(), None)
+        });
+        assert_eq!(row[4], 1 << 1);
+        assert_eq!(row[1] & 0xff00, 0);
+        run(
+            &mut service,
+            &mut ram.storage,
+            &page,
+            request(inodes[0], 256, Command::Set(Some(Kind::Write)), 0, 1),
+            root(10, 1),
+        )
+        .unwrap();
+        drain(&mut service, &mut ram.storage, &page);
+        service
+            .start(
+                &mut ram.storage,
+                request(inodes[0], 256, Command::Set(None), 0, 1),
+                root(10, 1),
+            )
+            .unwrap();
+        let mut found = false;
+        while service.busy() {
+            let progress = service.step(&mut ram.storage, |pid| page.live(pid));
+            if service.telemetry_stage() == 17 {
+                assert_eq!(progress.visited, 8); // old charged bound stays untouched.
+                let (row, witness) = crate::lock_telemetry::test_record(0, |table| {
+                    table.actor(progress, service.telemetry_stage(), None)
+                });
+                assert_eq!(row[1] & 255, 1);
+                assert_eq!(&witness[1..], &[0, 0, 0, 17_u64 << 32]);
+                found = true;
+            }
+        }
+        assert!(found);
+        check(&service);
+        check_pins(&service, &ram.storage);
+    }
+    #[cfg(feature = "lock-telemetry")]
+    #[test]
+    fn measured_audit_sources_are_current_full_pid_and_true_description() {
+        let (mut ram, inodes) = fixture();
+        let page = page();
+        let mut service = fresh();
+        run(
+            &mut service,
+            &mut ram.storage,
+            &page,
+            request(inodes[0], 256, Command::Set(Some(Kind::Write)), 0, 1),
+            root(10, 1),
+        )
+        .unwrap();
+        assert_eq!(service.telemetry_pid(0), Some(256));
+        assert_eq!(service.telemetry_pid(1), None);
+        assert!(!service.audit_pid(0, |pid| page.live(pid)).unwrap());
+        assert_eq!(service.telemetry_pid(0), Some(256));
+        assert!(page.retire(256));
+        assert!(service.audit_pid(0, |pid| page.live(pid)).unwrap());
+        assert_eq!(service.telemetry_pid(0), None);
+        drain(&mut service, &mut ram.storage, &page);
+        let mut ram = crate::Ram::default();
+        let mut service = fresh();
+        let mut fds = crate::Fds {
+            root: root(10, 1),
+            ..crate::Fds::default()
+        };
+        let fd = ram
+            .open(&mut fds, "/etc/motd", proto_fs::READ_ONLY)
+            .unwrap();
+        let held = ram.capture_description(&fds, fd).unwrap().0;
+        let inode = ram.live_description(&fds, held).unwrap().0;
+        real_run(
+            &mut service,
+            &mut ram,
+            None,
+            owned(
+                request(inode, 256, Command::Set(Some(Kind::Read)), 0, 1),
+                held.description,
+            ),
+            root(10, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            service.telemetry_description(held.description.slot as usize),
+            Some(held.description)
+        );
+        let (_, descriptions) = ram.lock_parts();
+        assert!(
+            !service
+                .audit_description(held.description.slot as usize, |token| descriptions
+                    .live(token))
+                .unwrap()
+        );
+        ram.close(&mut fds, fd).unwrap();
+        let (_, descriptions) = ram.lock_parts();
+        assert!(
+            service
+                .audit_description(held.description.slot as usize, |token| descriptions
+                    .live(token))
+                .unwrap()
+        );
+        assert_eq!(
+            service.telemetry_description(held.description.slot as usize),
+            None
+        );
     }
     #[test]
     fn service_layout_initializes_directly_and_preserves_accounted_size() {
