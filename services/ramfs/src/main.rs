@@ -1301,7 +1301,7 @@ impl Service<0> for Fs {
             }
             if self.lock_maintenance_work == 2 {
                 let births = &*self.births;
-                let places = &*self.places;
+                let places = self.places;
                 self.waits.maintenance(
                     self.wait_jobs,
                     self.locks,

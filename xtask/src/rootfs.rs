@@ -374,6 +374,10 @@ pub const IMAGES: &[&str] = &[
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
+    "boot-posix-lock-rules.img",
+    "boot-posix-lock-core.img",
+    "boot-posix-lock-pages.img",
+    "boot-posix-lock-fifo.img",
     "boot-posix-lock-ring.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
@@ -440,6 +444,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-posix-procs.img"
         | "boot-posix-jobs.img"
         | "boot-posix-lifetimes.img"
+        | "boot-posix-lock-rules.img"
+        | "boot-posix-lock-core.img"
+        | "boot-posix-lock-pages.img"
+        | "boot-posix-lock-fifo.img"
         | "boot-posix-lock-ring.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
@@ -578,6 +586,22 @@ mod tests {
     }
 
     #[test]
+    fn lock_probe_images_include_the_mapped_child() {
+        for image in [
+            "boot-posix-lock-rules.img",
+            "boot-posix-lock-core.img",
+            "boot-posix-lock-pages.img",
+            "boot-posix-lock-fifo.img",
+        ] {
+            let files = files_of(image);
+            assert!(
+                files.iter().any(|file| file.path == "/bin/procs-child"),
+                "{image}"
+            );
+        }
+    }
+
+    #[test]
     fn every_list_names_programs_of_its_image() {
         let programs_of = |image: &str| -> Vec<&str> {
             let list: &[crate::ImageProgram] = match image {
@@ -585,6 +609,10 @@ mod tests {
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-lifetimes.img" => &crate::POSIX_LIFETIMES_PROGRAMS,
+                "boot-posix-lock-rules.img" => &crate::POSIX_LOCK_LIFECYCLE_PROGRAMS,
+                "boot-posix-lock-core.img" => &crate::POSIX_LOCK_CORE_PROGRAMS,
+                "boot-posix-lock-pages.img" => &crate::POSIX_LOCK_PAGE_PROGRAMS,
+                "boot-posix-lock-fifo.img" => &crate::POSIX_LOCK_FIFO_PROGRAMS,
                 "boot-posix-lock-ring.img" => &crate::POSIX_LOCK_RING_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
@@ -683,6 +711,10 @@ mod tests {
             "boot-ash-dialog.img",
             "boot-posix-procs.img",
             "boot-posix-lifetimes.img",
+            "boot-posix-lock-rules.img",
+            "boot-posix-lock-core.img",
+            "boot-posix-lock-pages.img",
+            "boot-posix-lock-fifo.img",
             "boot-posix-lock-ring.img",
             "boot-posix-random.img",
             "boot-posix-pty.img",
