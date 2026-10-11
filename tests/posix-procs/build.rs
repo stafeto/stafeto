@@ -20,6 +20,8 @@ fn main() {
     println!("cargo:rerun-if-changed=lock-full-close.c");
     println!("cargo:rerun-if-changed=lock-full-ofd.c");
     println!("cargo:rerun-if-changed=lock-full-dup.c");
+    println!("cargo:rerun-if-changed=lock-full-exec.c");
+    println!("cargo:rerun-if-changed=lock-full-exec-io.h");
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=lifetime.c");
     println!("cargo:rerun-if-changed=lock-ring.c");
@@ -78,6 +80,16 @@ fn main() {
             u8::from(env::var_os("CARGO_FEATURE_LOADER_ABORT").is_some())
         ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
+        .arg(format!(
+            "-DFULL_EXEC={}",
+            if env::var_os("CARGO_FEATURE_LOCK_FULL_EXEC_OFD").is_some() {
+                2
+            } else if env::var_os("CARGO_FEATURE_LOCK_FULL_EXEC_PID").is_some() {
+                1
+            } else {
+                0
+            }
+        ))
         .arg(format!(
             "-DFULL_DUP={}",
             if env::var_os("CARGO_FEATURE_LOCK_FULL_DUP_OFD_ALIAS").is_some() {

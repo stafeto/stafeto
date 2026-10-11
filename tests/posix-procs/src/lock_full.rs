@@ -4,7 +4,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use posix_fs::Target;
 static NONCE: AtomicU64 = AtomicU64::new(1);
-fn nonce() -> Result<u64, i32> {
+pub(super) fn nonce() -> Result<u64, i32> {
     NONCE
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
         .map_err(|_| -1)

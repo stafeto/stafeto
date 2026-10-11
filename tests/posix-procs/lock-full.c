@@ -16,6 +16,19 @@
 extern int full_telemetry(unsigned, unsigned, uint64_t, uint64_t, unsigned, uint64_t[6]);
 extern int full_identity(unsigned, uint64_t[4]);
 extern int full_source(unsigned, uint64_t[2]);
+#ifndef FULL_EXEC
+#define FULL_EXEC 0
+#endif
+#if FULL_EXEC
+struct record;
+static int exec_primary = -1, exec_state_fd = -1, exec_foreign_b = -1;
+_Alignas(4096) static uint64_t exec_state[512];
+static uint64_t exec_initial_header[32];
+static uint64_t exec_nonce;
+static int exec_setup(int fd, struct record *record);
+static int exec_hold(int fd, unsigned index, struct record *record);
+static int exec_after(int state_fd);
+#endif
 #ifndef FULL_DUP
 #define FULL_DUP 0
 #endif
@@ -222,6 +235,9 @@ static int drained(int fd) {
 }
 static int set(int fd, short kind, unsigned segment) {
     struct flock lock = {.l_type = kind, .l_whence = SEEK_SET, .l_start = (off_t)(2 * segment), .l_len = 1};
+#if FULL_EXEC == 2
+    if (fd == exec_primary) return fcntl(fd, F_OFD_SETLK, &lock);
+#endif
 #if FULL_OFD
     if (fd == ofd_primary) return fcntl(fd, F_OFD_SETLK, &lock);
 #endif
@@ -289,6 +305,9 @@ static int hold(unsigned local) {
 #if FULL_DUP
     if (!index && dup_setup(fd)) return fail("pre-Begin replacement descriptors", index);
 #endif
+#if FULL_EXEC
+    if (!index && exec_setup(fd, &r)) return fail("pre-Begin retained exec state", index);
+#endif
     for (unsigned s = 0; s < r.count; ++s) {
         if (drained(fd) || set(fd, F_WRLCK, s)) return fail("real SET", index);
     }
@@ -309,6 +328,9 @@ static int hold(unsigned local) {
 #endif
 #if FULL_DUP
     if (!index) return dup_hold(fd, index, &r);
+#endif
+#if FULL_EXEC
+    if (!index) return exec_hold(fd, index, &r);
 #endif
     if (gate("/tmp/lock-full-stop")) return fail("Stop gate", index);
     uint64_t exact[2];
@@ -362,6 +384,9 @@ static int create_files(void) {
     }
 #if FULL_DUP
     if (publish("/tmp/lock-full-dup-state", NULL, 0)) return fail("create replacement metadata", 0);
+#endif
+#if FULL_EXEC
+    if (publish("/tmp/lock-full-exec-state", exec_state, sizeof(exec_state))) return fail("prepay exec state page", 0);
 #endif
     if (publish("/tmp/lock-full-controller", NULL, 0) || publish("/tmp/lock-full-turn", &zero, sizeof(zero))) return fail("create gates", 0);
     int fd = open("/tmp/lock-full-controller", O_RDWR); uint64_t actual[6];
@@ -515,6 +540,9 @@ static int ring_rows(int fd, uint64_t epoch) {
 #if FULL_DUP
 #include "lock-full-dup.c"
 #endif
+#if FULL_EXEC
+#include "lock-full-exec.c"
+#endif
 static int coordinator(void) {
     int fd = open("/tmp/lock-full-controller", O_RDWR);
     if (fd < 0) return fail("controller open", 0);
@@ -533,7 +561,7 @@ static int coordinator(void) {
         for (unsigned old = 0; old < f; ++old) if (launchers[old] == r.pid) return fail("distinct launchers", f);
     }
     struct record records[20] = {{0}};
-#if FULL_WAKE || FULL_OFD || FULL_DUP
+#if FULL_WAKE || FULL_OFD || FULL_DUP || FULL_EXEC
     int wake_witness = -1;
     uint64_t wake_source[2] = {0};
 #endif
@@ -553,10 +581,10 @@ static int coordinator(void) {
         if (source < 0 || fstat(source, &st) || (uint64_t)st.st_ino != r->inode) return fail("witness inode", i);
         for (unsigned edge = 0; edge < 2; ++edge) {
             struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = (off_t)(edge ? 2 * (r->count - 1) : 0), .l_len = 1};
-            if (fcntl(source, F_GETLK, &lock) || lock.l_type != F_WRLCK || lock.l_pid != ((FULL_OFD || FULL_DUP > 1) && !i ? -1 : (pid_t)r->pid))
+            if (fcntl(source, F_GETLK, &lock) || lock.l_type != F_WRLCK || lock.l_pid != ((FULL_OFD || FULL_DUP > 1 || FULL_EXEC == 2) && !i ? -1 : (pid_t)r->pid))
                 return fail("foreign PID GETLK real critical/filler", i);
         }
-#if FULL_WAKE || FULL_OFD || FULL_DUP
+#if FULL_WAKE || FULL_OFD || FULL_DUP || FULL_EXEC
         if (!i) {
             if (full_source((unsigned)source, wake_source)) return fail("wake witness full source", i);
             wake_witness = source;
@@ -564,6 +592,10 @@ static int coordinator(void) {
 #endif
 #if FULL_DUP
         if (i == 1) dup_foreign_b = source;
+        else
+#endif
+#if FULL_EXEC
+        if (i == 1) exec_foreign_b = source;
         else
 #endif
         if (close(source)) return fail("witness close", i);
@@ -596,6 +628,9 @@ static int coordinator(void) {
         || duplicate_who[3] != records[0].generation || close(fd)) return fail("actual foreign replacement payer", 0);
     fd = dup(wake_witness);
     if (fd < 0) return fail("replacement exact Scope alias", 0);
+#endif
+#if FULL_EXEC
+    if (exec_before(fd, wake_witness, records)) return 1;
 #endif
     if (full_telemetry((unsigned)fd, 0, cookie, 0, profile, out) || out[0] != 1 || out[1] != profile || out[2] != 32 || out[3] != 1 || out[4] || out[5] != 1)
         return fail("Begin stable witness", 0);
@@ -632,9 +667,13 @@ static int coordinator(void) {
 #if FULL_DUP
     if (dup_capture(fd, wake_witness, epoch, records)) return 1;
 #endif
+#if FULL_EXEC
+    if (exec_capture(fd, wake_witness, epoch, records)) return 1;
+#else
     if (full_telemetry((unsigned)fd, 2, cookie, epoch, 0, out) || out[0] != epoch
         || out[1] != profile || out[2] != 32 || out[3] || out[4] || out[5] != epoch)
         return fail("Stop capture exact successful state", 0);
+#endif
 #if FULL_RING
     if (full_telemetry((unsigned)fd, 6, cookie, 0, 0, out) != -310)
         return fail("identity forbidden after Stop", 0);
@@ -653,17 +692,29 @@ static int coordinator(void) {
     if (dup_rows(fd, epoch)) return 1;
 #endif
     printf("lock-full: %s profile=%u participating=%u owners=%u published=256 private=0 retired=0 common=128 payers=8 epoch=%llu\n",
-           (FULL_RING | FULL_OFD | FULL_DUP) ? "initial" : "stable", profile, profile, first(8), (unsigned long long)epoch);
+           (FULL_RING | FULL_OFD | FULL_DUP | FULL_EXEC) ? "initial" : "stable", profile, profile, first(8), (unsigned long long)epoch);
     #if FULL_CAPACITY
     if (close(observer_source)) return fail("observer close after Stop", 16);
 #endif
-#if FULL_WAKE || FULL_OFD || FULL_DUP
+#if FULL_WAKE || FULL_OFD || FULL_DUP || FULL_EXEC
     if (close(wake_witness)) return fail("wake witness close after Stop", 0);
+#endif
+#if FULL_EXEC
+    if (close(exec_foreign_b) || close(exec_state_fd)) return fail("exec observer cleanup after Stop", 0);
 #endif
     if (close(fd) || publish("/tmp/lock-full-stop", NULL, 0)) return fail("release owners after Stop", 0);
     return 0;
 }
 int main(int argc, char **argv) {
+#if FULL_EXEC
+    if (argc == 5 && !strcmp(argv[1], "full-after-exec")) {
+        profile = (unsigned)(argv[2][0] - '0'); family = (unsigned)(argv[3][0] - '0');
+        if ((profile != 4 && profile != 7) || family || argv[2][1] || argv[3][1]) return 1;
+        char *end; long state_fd = strtol(argv[4], &end, 10);
+        if (!argv[4][0] || *end || state_fd < 0 || state_fd >= 32) return 1;
+        return exec_after((int)state_fd);
+    }
+#endif
     if (argc != 4 || (strcmp(argv[1], "full-launch") && strcmp(argv[1], "full-run"))) return 1;
     profile = (unsigned)(argv[2][0] - '0'); family = (unsigned)(argv[3][0] - '0');
     if ((profile != 4 && profile != 7) || family > 7 || argv[2][1] || argv[3][1]) return 1;

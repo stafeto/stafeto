@@ -76,7 +76,7 @@ const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
         + cfg!(feature = "lock-telemetry") as usize
         + cfg!(feature = "steps") as usize
-        + 4 * cfg!(feature = "lifetime-probe") as usize
+        + 5 * cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
@@ -100,6 +100,7 @@ const METHODS: &[u16] = &{
         methods[i + 1] = 0xfff2;
         methods[i + 2] = 0xfff6;
         methods[i + 3] = 0xfff7;
+        methods[i + 4] = 0xfff8;
     }
     methods
 };
@@ -2315,6 +2316,45 @@ impl Service<0> for Fs {
         #[cfg(feature = "lifetime-probe")]
         if r.method() == 0xfff7 {
             return self.wait_process_probe_request(&s.data, r);
+        }
+        #[cfg(feature = "lifetime-probe")]
+        if r.method() == 0xfff8 {
+            let mut body = r.body();
+            let Ok(nonce) = body.u64() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if nonce == 0 || body.finish().is_err() || !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let Binding::Active(who) = &s.data.binding else {
+                return status(proto_fs::PERMISSION);
+            };
+            let live = generation(who.index as usize);
+            if who.loader.is_some()
+                || live != who.generation
+                || live == 0
+                || live & proto_process::GENERATION_DEAD != 0
+            {
+                return status(proto_fs::PERMISSION);
+            }
+            let reply = r.reply();
+            if reply
+                .u32(0)
+                .and_then(|()| reply.u64(nonce))
+                .and_then(|()| reply.u32(1))
+                .and_then(|()| reply.u32(who.pid))
+                .and_then(|()| reply.u32(who.index))
+                .and_then(|()| reply.u32(who.image))
+                .and_then(|()| reply.u64(who.generation))
+                .and_then(|()| reply.u32(who.root.pid))
+                .and_then(|()| reply.u32(who.root.generation))
+                .and_then(|()| reply.u32(0))
+                .and_then(|()| reply.u64(live))
+                .is_err()
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply(Outgoing::new());
         }
         #[cfg(feature = "lifetime-probe")]
         if r.method() == 0xfff6 {

@@ -605,7 +605,11 @@ const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10
         &["table-posix-lock-full7"]
     };
     programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
-    programs[5].3 = if phase == 9 {
+    programs[5].3 = if phase == 11 {
+        &["lock-full-exec-ofd"]
+    } else if phase == 10 {
+        &["lock-full-exec-pid"]
+    } else if phase == 9 {
         &["lock-full-dup-ofd-alias"]
     } else if phase == 8 {
         &["lock-full-dup-ofd-last"]
@@ -629,6 +633,10 @@ const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10
     programs
 }
 const POSIX_LOCK_FULL4_DUP_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 7);
+const POSIX_LOCK_FULL4_EXEC_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 10);
+const POSIX_LOCK_FULL7_EXEC_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 10);
+const POSIX_LOCK_FULL4_EXEC_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 11);
+const POSIX_LOCK_FULL7_EXEC_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 11);
 const POSIX_LOCK_FULL7_DUP_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 7);
 const POSIX_LOCK_FULL4_DUP_LAST_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 8);
 const POSIX_LOCK_FULL7_DUP_LAST_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 8);
@@ -1417,7 +1425,13 @@ fn main() {
             [profile, mode] if (profile == "4" || profile == "7") && mode == "dup-ofd-alias" => {
                 posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 9)
             }
-            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd|dup-pid|dup-ofd-last|dup-ofd-alias]".to_owned()),
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-pid" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 10)
+            }
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-ofd" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 11)
+            }
+            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd|dup-pid|dup-ofd-last|dup-ofd-alias|exec-pid|exec-ofd]".to_owned()),
         },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -3299,6 +3313,22 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let (name, programs) = match (profile, phase) {
+        (4, 10) => (
+            "boot-posix-lock-full4-exec-pid.img",
+            &POSIX_LOCK_FULL4_EXEC_PID_PROGRAMS,
+        ),
+        (7, 10) => (
+            "boot-posix-lock-full7-exec-pid.img",
+            &POSIX_LOCK_FULL7_EXEC_PID_PROGRAMS,
+        ),
+        (4, 11) => (
+            "boot-posix-lock-full4-exec-ofd.img",
+            &POSIX_LOCK_FULL4_EXEC_OFD_PROGRAMS,
+        ),
+        (7, 11) => (
+            "boot-posix-lock-full7-exec-ofd.img",
+            &POSIX_LOCK_FULL7_EXEC_OFD_PROGRAMS,
+        ),
         (4, 7) => (
             "boot-posix-lock-full4-dup-pid.img",
             &POSIX_LOCK_FULL4_DUP_PID_PROGRAMS,
@@ -3454,6 +3484,16 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
                 phase - 6
             ),
         )?;
+    }
+    if (10..=11).contains(&phase) {
+        let marker = outcome
+            .lines
+            .iter()
+            .find(|line| line.starts_with("lock-full: exec retained "))
+            .ok_or_else(|| "retained exec witness is missing".to_owned())?;
+        if !lock_full_exec_wire::marker(marker, u64::from(profile), u64::from(phase - 9)) {
+            return Err(format!("invalid retained exec witness: {marker}"));
+        }
     }
     if phase == 6 {
         qemu::expect_marker(
@@ -8591,3 +8631,7 @@ mod lock_full_wire;
 #[cfg(test)]
 #[path = "../../tests/posix-procs/src/lock_full_dup_wire.rs"]
 mod lock_full_dup_wire;
+
+#[path = "../../tests/posix-procs/src/lock_full_exec_wire.rs"]
+#[allow(dead_code)]
+mod lock_full_exec_wire;

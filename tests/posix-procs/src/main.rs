@@ -18,6 +18,10 @@ mod lock_full_capacity;
 mod lock_full_dup;
 #[cfg(feature = "lock-full-dup")]
 mod lock_full_dup_wire;
+#[cfg(feature = "lock-full-exec")]
+mod lock_full_exec;
+#[cfg(feature = "lock-full-exec")]
+mod lock_full_exec_wire;
 #[cfg(feature = "lock-full-ofd")]
 mod lock_full_ofd;
 #[cfg(feature = "lock-full-fixture")]

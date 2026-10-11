@@ -1601,11 +1601,30 @@ fn image_ready(
     }
 }
 
-/// Step 4 of exec: the descriptors with FD_CLOEXEC close (their
-/// descriptions with the last of them), then a fresh RAM session sharing
-/// retained descriptions and the clock and console sessions go to the Loader.
-/// The new image keeps descriptions and offsets under its authenticated binding.
-/// Whether the Loader took them.
+#[cfg(feature = "exec-close-probe")]
+static EXEC_CLOSE_OBSERVER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// An isolated fixture can observe an acknowledged successful numeric close.
+#[cfg(feature = "exec-close-probe")]
+pub fn probe_exec_close(hook: Option<fn(u32) -> bool>) {
+    EXEC_CLOSE_OBSERVER.store(hook.map_or(0, |hook| hook as usize), Ordering::Release);
+}
+
+#[cfg(feature = "exec-close-probe")]
+fn exec_close_observed(fd: u32) -> bool {
+    let raw = EXEC_CLOSE_OBSERVER.load(Ordering::Acquire);
+    if raw == 0 {
+        return true;
+    }
+    // SAFETY: probe_exec_close stores only this function-pointer type.
+    let hook: fn(u32) -> bool = unsafe { core::mem::transmute(raw) };
+    hook(fd)
+}
+
+/// Step 4 of exec: CLOEXEC descriptors close before sessions reach the Loader.
+/// A fresh unclaimed RAM clone retains the descriptions under its new binding.
+/// The result says whether the Loader took the sessions.
 fn move_files(c: &Handle<Channel>) -> bool {
     use proto_loader::Slot;
     for fd in 0..posix_fs::OPEN_MAX as u32 {
@@ -1615,7 +1634,13 @@ fn move_files(c: &Handle<Channel>) -> bool {
                 .is_ok_and(|flags| flags.close_on_exec))
         });
         if close_on_exec == Ok(true) {
-            let _ = crate::close(fd as i32);
+            let _closed = crate::close(fd as i32);
+            // The table guard has been released, and the public close has returned.
+            // An ordinary close error keeps the existing production policy.
+            #[cfg(feature = "exec-close-probe")]
+            if _closed.is_ok() && !exec_close_observed(fd) {
+                return false;
+            }
         }
     }
     // A stopped thread never ends the request it holds a description
