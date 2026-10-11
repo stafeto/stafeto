@@ -840,7 +840,7 @@ fn quoted_words(line: &str) -> Vec<String> {
 }
 
 /// The arguments of the linker in the `--print link-args` text `text`:
-/// the words after its `rust-lld`.
+/// the words after its native linker driver.
 fn linker_arguments(text: &str) -> Result<Vec<String>, String> {
     let line = text
         .lines()
@@ -865,6 +865,18 @@ fn check_link_line(args: &[String]) -> Result<(), String> {
         return Err("the link line of os-test-probe lacks --fix-cortex-a53-843419".into());
     }
     Ok(())
+}
+
+/// Keep the test archive's search directory ahead of all existing paths.
+/// rustc's GNU ld driver omits LLD's explicit flavor selector.
+fn probe_search_start(args: &[String]) -> Result<usize, String> {
+    let flavors = args.iter().enumerate().filter(|(_, a)| *a == "-flavor");
+    let mut flavors = flavors.map(|(at, _)| at);
+    match (flavors.next(), flavors.next()) {
+        (None, None) => Ok(0),
+        (Some(0), None) if args.get(1).is_some_and(|a| a == "gnu") => Ok(2),
+        _ => Err("os-test-probe requires GNU linker arguments".into()),
+    }
 }
 
 impl ProbeLink {
@@ -908,11 +920,7 @@ impl ProbeLink {
             .position(|a| a == "-o")
             .ok_or("no -o in the link line")?
             + 1;
-        let search = args
-            .iter()
-            .position(|a| a == "-flavor")
-            .ok_or("no -flavor in the link line")?
-            + 2;
+        let search = probe_search_start(&args)?;
         args.splice(search..search, ["-L".to_owned(), String::new()]);
         Ok(ProbeLink {
             lld: llvm_tool("rust-lld")?,
@@ -1345,6 +1353,40 @@ mod tests {
             ]
         );
         assert!(linker_arguments("no link line here\n").is_err());
+    }
+
+    #[test]
+    fn probe_archive_precedes_search_paths_for_both_gnu_drivers() {
+        let parse = |driver: &str, flavor: &str| {
+            linker_arguments(&format!(
+                "\"/tools/{driver}\" {flavor} \"a.rcgu.o\" \"-L\" \"/old path\" \
+                 \"-lostest\" \"--fix-cortex-a53-843419\" \"-o\" \"old.elf\""
+            ))
+            .unwrap()
+        };
+        for mut args in [
+            parse("rust-lld", "\"-flavor\" \"gnu\""),
+            parse("native-link", ""),
+        ] {
+            check_link_line(&args).unwrap();
+            let search = probe_search_start(&args).unwrap();
+            args.splice(search..search, ["-L".to_owned(), "/test path".to_owned()]);
+            let paths = args
+                .windows(2)
+                .filter(|pair| pair[0] == "-L")
+                .map(|pair| pair[1].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(paths, ["/test path", "/old path"]);
+        }
+        for words in [
+            vec!["-flavor"],
+            vec!["-flavor", "darwin"],
+            vec!["a.o", "-flavor", "gnu"],
+            vec!["-flavor", "gnu", "-flavor", "gnu"],
+        ] {
+            let args = words.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(probe_search_start(&args).is_err());
+        }
     }
 
     #[test]
