@@ -589,6 +589,7 @@ static int coordinator(void) {
     if (fd < 0) return fail("exact witness Scope local alias", 0);
 #endif
 #if FULL_DUP
+    if (dup_before(wake_witness, records)) return 1;
     uint64_t duplicate_who[4];
     if (full_identity((unsigned)getpid(), duplicate_who) || duplicate_who[0] == records[0].pid
         || duplicate_who[0] == records[1].pid || duplicate_who[2] != records[0].root

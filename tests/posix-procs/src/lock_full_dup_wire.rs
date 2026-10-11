@@ -36,6 +36,21 @@ pub fn key(slot: u64, generation: u64) -> bool {
         .is_ok_and(|slot| (proto_fs::CloseKey { slot, generation }).validate().is_ok())
 }
 
+pub fn unchanged(before: &[u64; 12], after: &[u64; 12], flags: [i32; 2], next: [i32; 2]) -> bool {
+    before == after && flags == next
+}
+
+pub fn inodes(expected: u64, source: u64, target: u64) -> bool {
+    expected != 0 && source == expected && target == expected
+}
+
+pub fn effect(pages: &[[u64; 6]; 20], expected: &[u64; 4]) -> bool {
+    pages[0][5] == 49
+        && pages[0][4] & (1 << 15) != 0
+        && pages[19][4] & (1 << 15) == 0
+        && pages[17][2..6] == *expected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +90,48 @@ mod tests {
             0x300000003,
         ];
         (before, after, event)
+    }
+    #[test]
+    fn rejected_replacements_preserve_both_flags_and_full_entries() {
+        let (before, _, _) = fixture(false);
+        let flags = [3, 1];
+        assert!(unchanged(&before, &before, flags, flags));
+        for index in 0..2 {
+            let mut wrong = flags;
+            wrong[index] ^= 1;
+            assert!(!unchanged(&before, &before, flags, wrong));
+        }
+        let mut wrong = before;
+        wrong[7] ^= 1 << 32;
+        assert!(!unchanged(&before, &wrong, flags, flags));
+    }
+    #[test]
+    fn same_wrong_inode_does_not_replace_the_frozen_b() {
+        assert!(inodes(101, 101, 101));
+        assert!(!inodes(101, 102, 102));
+        assert!(!inodes(101, 101, 102));
+        assert!(!inodes(0, 0, 0));
+    }
+    #[test]
+    fn close_effect_requires_exact_full_witness_and_unambiguous_kind() {
+        let expected = [0x100000001, 0xc000003000030001, 0x200000002, 0x300000003];
+        let mut pages = [[0; 6]; 20];
+        pages[0][5] = 49;
+        pages[0][4] = 1 << 15;
+        pages[17][2..6].copy_from_slice(&expected);
+        assert!(effect(&pages, &expected));
+        for index in 2..6 {
+            let mut wrong = pages;
+            wrong[17][index] ^= 1 << 32;
+            assert!(!effect(&wrong, &expected), "witness {index}");
+        }
+        for (page, column, value) in [(0, 5, 50), (0, 4, 0), (19, 4, 1 << 15)] {
+            let mut wrong = pages;
+            wrong[page][column] = value;
+            assert!(!effect(&wrong, &expected));
+        }
+        pages[19][4] = 1 << 14;
+        assert!(effect(&pages, &expected));
     }
     #[test]
     fn replacement_checks_each_frozen_identity_and_surviving_alias() {

@@ -145,3 +145,57 @@ pub extern "C" fn full_dup_key_valid(slot: u64, generation: u64) -> i32 {
         -1
     }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn full_dup_unchanged(
+    before: *const u64,
+    after: *const u64,
+    source: i32,
+    target: i32,
+    next_source: i32,
+    next_target: i32,
+) -> i32 {
+    if before.is_null() || after.is_null() {
+        return -1;
+    }
+    // SAFETY: C retains both complete arrays during this synchronous call.
+    let (before, after) = unsafe { (&*before.cast::<[u64; 12]>(), &*after.cast::<[u64; 12]>()) };
+    if super::lock_full_dup_wire::unchanged(
+        before,
+        after,
+        [source, target],
+        [next_source, next_target],
+    ) {
+        0
+    } else {
+        -1
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn full_dup_inodes(expected: u64, source: u64, target: u64) -> i32 {
+    if super::lock_full_dup_wire::inodes(expected, source, target) {
+        0
+    } else {
+        -1
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn full_dup_effect(pages: *const u64, expected: *const u64) -> i32 {
+    if pages.is_null() || expected.is_null() {
+        return -1;
+    }
+    // SAFETY: C retains twenty complete telemetry pages and four expected cells.
+    let (pages, expected) = unsafe {
+        (
+            &*pages.cast::<[[u64; 6]; 20]>(),
+            &*expected.cast::<[u64; 4]>(),
+        )
+    };
+    if super::lock_full_dup_wire::effect(pages, expected) {
+        0
+    } else {
+        -1
+    }
+}
