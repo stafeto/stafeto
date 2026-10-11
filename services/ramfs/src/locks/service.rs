@@ -188,6 +188,18 @@ impl LockService {
     pub fn telemetry_description(&self, index: usize) -> Option<Token> {
         self.actor.telemetry_description(index)
     }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_close_reset(&mut self) {
+        self.actor.telemetry_close_reset();
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_close_effect(&self) -> Option<((Owner, Token), bool)> {
+        self.actor.telemetry_close_effect()
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_departure(&self) -> Option<[u64; 4]> {
+        self.actor.telemetry_departure()
+    }
     pub fn cancel(&mut self) -> bool {
         self.actor.cancel()
     }
@@ -1802,7 +1814,13 @@ mod tests {
         );
         assert_eq!(
             bytes,
-            877120 + crate::storage::NODES * core::mem::size_of::<u64>()
+            877120
+                + crate::storage::NODES * core::mem::size_of::<u64>()
+                + if cfg!(feature = "lock-telemetry") {
+                    72
+                } else {
+                    0
+                }
         );
         assert_eq!(core::mem::size_of::<Option<PaidGroup>>(), 56);
         assert!(!service.busy());
@@ -2056,5 +2074,46 @@ mod tests {
         let other = ram.storage.lock_anchor(root(11, 2)).unwrap();
         assert_eq!(other.index(), 0);
         ram.storage.release_lock_anchor(other).unwrap();
+    }
+    #[cfg(feature = "lock-telemetry")]
+    #[test]
+    fn fresh_close_effect_requires_actual_revoke_and_replay_cannot_fake_it() {
+        let (mut ram, inodes) = fixture();
+        let mut service = fresh();
+        let page = page();
+        let payer = root(10, 1);
+        let mut fds = crate::Fds {
+            root: payer,
+            binding: crate::authority::Binding::Active(close_who(257)),
+            ..crate::Fds::default()
+        };
+        let fd = ram.open(&mut fds, "/lock0", proto_fs::READ_ONLY).unwrap();
+        let event = close_event(&ram, &fds, fd, 48, 1, false);
+        real_run(
+            &mut service,
+            &mut ram,
+            Some(&page),
+            request(inodes[0], 257, Command::Set(Some(Kind::Read)), 0, 1),
+            payer,
+        )
+        .unwrap();
+        service.telemetry_close_reset();
+        ram.close_event(&mut fds, &mut service, event).unwrap();
+        assert_eq!(
+            service.telemetry_close_effect(),
+            Some(((Owner::Process(257), inodes[0]), false))
+        );
+        service.telemetry_close_reset();
+        ram.close_event(&mut fds, &mut service, event).unwrap();
+        assert_eq!(service.telemetry_close_effect(), None);
+        let later = close_event(&ram, &fds, fd, 48, 2, false);
+        ram.close_event(&mut fds, &mut service, later).unwrap();
+        assert_eq!(service.telemetry_close_effect(), None);
+        std::println!(
+            "exact lifecycle Actor={} LockService={} Progress={}",
+            core::mem::size_of_val(&service.actor),
+            core::mem::size_of::<LockService>(),
+            core::mem::size_of::<super::super::wait_departure::Progress>()
+        );
     }
 }

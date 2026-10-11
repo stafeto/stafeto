@@ -847,7 +847,7 @@ mod exact_effect_tests {
         assert_eq!(t.page(26, 0), Err(Error::Invalid));
         t.begin_dispatch(Occupancy::default());
         t.portion(8, 8, [0, 8, 0, 1]);
-        t.effect(0, 8, [264, 0 | (8 << 32), 1, 1]);
+        t.effect(0, 8, [264, 8 << 32, 1, 1]);
         finish(&mut t, 7);
         assert_eq!(t.page(26, 10).unwrap()[1..], [264, 8 << 32, 1, 1]);
         assert_eq!(t.page(26, 18).unwrap()[1], 7);

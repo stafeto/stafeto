@@ -1472,6 +1472,10 @@ impl Service<0> for Fs {
                 #[cfg(feature = "lock-telemetry")]
                 self.telemetry
                     .actor(progress, self.locks.telemetry_stage(), receipt);
+                #[cfg(feature = "lock-telemetry")]
+                if let Some(effect) = self.locks.telemetry_departure() {
+                    self.telemetry.effect(4, 1, effect);
+                }
                 if let Some(result) = progress.completed {
                     if let Some(id) = self.wait_jobs.active() {
                         if result == Ok(ramfs::locks::actor::Response::Changed) {
@@ -1692,11 +1696,13 @@ impl Service<0> for Fs {
                         let _ = removed;
                     } else {
                         #[cfg(feature = "lock-telemetry")]
+                        let exact_description = self
+                            .locks
+                            .telemetry_description(index - proto_process::RECORDS);
+                        #[cfg(feature = "lock-telemetry")]
                         {
                             if ofd_visits == 0 {
-                                let token = self
-                                    .locks
-                                    .telemetry_description(index - proto_process::RECORDS);
+                                let token = exact_description;
                                 ofd_witness = [
                                     (index - proto_process::RECORDS) as u64,
                                     0,
@@ -1707,11 +1713,28 @@ impl Service<0> for Fs {
                             ofd_visits += 1;
                             ofd_witness[1] = (index - proto_process::RECORDS + 1) as u64;
                         }
-                        self.locks
+                        let removed = self
+                            .locks
                             .audit_description(index - proto_process::RECORDS, |token| {
                                 descriptions.live(token)
                             })
                             .expect("bounded actual OFD place");
+                        #[cfg(feature = "lock-telemetry")]
+                        if removed {
+                            let token = exact_description.expect("actual removed description");
+                            self.telemetry.effect(
+                                3,
+                                end - first,
+                                [
+                                    u64::from(token.slot),
+                                    token.generation,
+                                    first as u64 | ((end as u64) << 32),
+                                    1,
+                                ],
+                            );
+                        }
+                        #[cfg(not(feature = "lock-telemetry"))]
+                        let _ = removed;
                     }
                 }
                 #[cfg(feature = "lock-telemetry")]
@@ -2684,6 +2707,8 @@ impl Service<0> for Fs {
                 };
                 #[cfg(feature = "lock-telemetry")]
                 let pid = s.data.binding.snapshot_ref().map_or(0, |who| who.pid);
+                #[cfg(feature = "lock-telemetry")]
+                self.locks.telemetry_close_reset();
                 match self.ram.close_event(&mut s.data, self.locks, event) {
                     Ok(inode) => {
                         #[cfg(feature = "lock-telemetry")]
@@ -2697,6 +2722,26 @@ impl Service<0> for Fs {
                                 0,
                             ],
                         );
+                        #[cfg(feature = "lock-telemetry")]
+                        if let Some(((owner, _), ambiguous)) = self.locks.telemetry_close_effect() {
+                            let ofd = matches!(owner, ramfs::locks::Owner::Description { .. });
+                            self.telemetry.effect(
+                                2,
+                                1,
+                                [
+                                    u64::from(pid),
+                                    u64::from(event.packed)
+                                        | (u64::from(event.key.slot) << 32)
+                                        | (u64::from(ofd) << 62)
+                                        | (u64::from(event.last_alias) << 63),
+                                    event.description_generation,
+                                    event.key.generation,
+                                ],
+                            );
+                            if ambiguous {
+                                self.telemetry.effect_ambiguous(2);
+                            }
+                        }
                         if let Some(inode) = inode {
                             self.wait_events.changed(inode);
                         }

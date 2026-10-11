@@ -168,6 +168,12 @@ pub struct Actor<
     departure_tail: u16,
     #[cfg(feature = "lock-telemetry")]
     telemetry_stage: u8,
+    #[cfg(feature = "lock-telemetry")]
+    telemetry_close: Option<(Owner, Token)>,
+    #[cfg(feature = "lock-telemetry")]
+    telemetry_close_ambiguous: bool,
+    #[cfg(feature = "lock-telemetry")]
+    telemetry_departure: Option<[u64; 4]>,
 }
 impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: usize, const S: usize>
     Actor<G, I, P, D, R, S>
@@ -199,7 +205,12 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             core::ptr::addr_of_mut!((*destination).departure_head).write(NONE);
             core::ptr::addr_of_mut!((*destination).departure_tail).write(NONE);
             #[cfg(feature = "lock-telemetry")]
-            core::ptr::addr_of_mut!((*destination).telemetry_stage).write(0);
+            {
+                core::ptr::addr_of_mut!((*destination).telemetry_stage).write(0);
+                core::ptr::addr_of_mut!((*destination).telemetry_close).write(None);
+                core::ptr::addr_of_mut!((*destination).telemetry_close_ambiguous).write(false);
+                core::ptr::addr_of_mut!((*destination).telemetry_departure).write(None);
+            }
         }
     }
     fn view(&self, id: Id) -> Result<View, Error> {
@@ -230,6 +241,20 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             return None;
         };
         Some(Token { slot, generation })
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_close_reset(&mut self) {
+        self.telemetry_close = None;
+        self.telemetry_close_ambiguous = false;
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_close_effect(&self) -> Option<((Owner, Token), bool)> {
+        self.telemetry_close
+            .map(|effect| (effect, self.telemetry_close_ambiguous))
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_departure(&self) -> Option<[u64; 4]> {
+        self.telemetry_departure
     }
     pub fn busy(&self) -> bool {
         self.worker.is_some() || self.debt()
@@ -310,6 +335,15 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
         if let Some(capture) = capture {
             let snapshot = self.groups.revoke(capture)?;
             self.retire_view(capture.id(), snapshot.root)?;
+            #[cfg(feature = "lock-telemetry")]
+            {
+                let effect = (snapshot.owner, snapshot.inode);
+                if let Some(previous) = self.telemetry_close {
+                    self.telemetry_close_ambiguous |= previous != effect;
+                } else {
+                    self.telemetry_close = Some(effect);
+                }
+            }
         }
         Ok(())
     }
@@ -441,6 +475,18 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             let next = departure.next;
             self.retire_view(id, snapshot.root)
                 .expect("departed paid view");
+            #[cfg(feature = "lock-telemetry")]
+            {
+                let Owner::Process(pid) = snapshot.owner else {
+                    unreachable!("PID departure");
+                };
+                self.telemetry_departure = Some([
+                    u64::from(pid),
+                    u64::from(snapshot.inode.slot) | ((id.slot() as u64) << 32),
+                    snapshot.inode.generation,
+                    id.generation(),
+                ]);
+            }
             if done {
                 self.departures[index] = None;
                 self.departure_head = next;
@@ -611,6 +657,10 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
         mut live: impl FnMut(u32) -> bool,
         mut ofd_live: impl FnMut(Token) -> bool,
     ) -> Progress {
+        #[cfg(feature = "lock-telemetry")]
+        {
+            self.telemetry_departure = None;
+        }
         let Some(mut worker) = self.worker.take() else {
             return self.cleanup_step();
         };
