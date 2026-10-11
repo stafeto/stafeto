@@ -137,7 +137,10 @@ fn departure_releases_eight_places_after_notify_but_keeps_active_actor_paid() {
             visited: 8,
             released: 7,
             cancel_actor: true,
-            ..Progress::default()
+            #[cfg(feature = "lock-telemetry")]
+            effect: None,
+            #[cfg(feature = "lock-telemetry")]
+            ambiguous: false,
         }
     );
     assert_eq!(*events.borrow(), [100, 0, 101, 1]);
@@ -179,7 +182,10 @@ fn departure_releases_eight_places_after_notify_but_keeps_active_actor_paid() {
             visited: 8,
             released: 1,
             cancel_actor: false,
-            ..Progress::default()
+            #[cfg(feature = "lock-telemetry")]
+            effect: None,
+            #[cfg(feature = "lock-telemetry")]
+            ambiguous: false,
         }
     );
     part(
