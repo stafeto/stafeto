@@ -209,3 +209,60 @@ fn child_discards_parent_lifecycle_and_accepts_its_own_stop() {
     assert!(stop.try_begin(11, 202));
     assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
 }
+
+#[test]
+fn cleanup_contender_sleeps_so_lower_priority_owner_can_finish() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    let slept = Cell::new(false);
+    let lower_owner_finished = Cell::new(false);
+    assert!(stop.release(
+        7,
+        || {
+            assert!(!stop.try_begin(11, 202));
+            stop.wait_for_claim(
+                || panic!("cleanup has no active owner to park behind"),
+                || {
+                    slept.set(true);
+                    Ok::<(), i32>(())
+                },
+            )
+            .unwrap();
+        },
+        |channel| {
+            // A higher-priority contender must relinquish its runnable turn.
+            assert!(slept.get(), "cleanup contention requires a blocking wait");
+            assert_eq!(channel, 101);
+            lower_owner_finished.set(true);
+        },
+    ));
+    assert!(lower_owner_finished.get());
+    assert!(stop.try_begin(11, 202));
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}
+
+#[test]
+fn claim_wait_parks_active_stop_and_preserves_cleanup_wait_errors() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    let parked = Cell::new(false);
+    stop.wait_for_claim(
+        || parked.set(true),
+        || panic!("active stop uses its ordinary park"),
+    )
+    .unwrap_or_else(|_: i32| panic!("park does not fail"));
+    assert!(parked.get());
+    assert!(stop.release(
+        7,
+        || {
+            assert_eq!(
+                stop.wait_for_claim(|| panic!("cleanup park"), || Err(11)),
+                Err(11),
+            );
+            assert!(!stop.try_begin(11, 202));
+        },
+        |channel| assert_eq!(channel, 101),
+    ));
+    assert!(stop.try_begin(11, 202));
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}

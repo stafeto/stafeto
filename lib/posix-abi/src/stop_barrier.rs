@@ -43,6 +43,20 @@ impl StopControl {
         self.active.store(owner, Ordering::Release);
         true
     }
+    /// Contenders park behind an active stop and sleep during its cleanup.
+    /// Sleeping permits a lower-priority owner to finish releasing the claim.
+    pub(crate) fn wait_for_claim<E>(
+        &self,
+        park: impl FnOnce(),
+        sleep: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if self.owner() != 0 {
+            park();
+            Ok(())
+        } else {
+            sleep()
+        }
+    }
     pub(crate) fn release(
         &self,
         owner: usize,

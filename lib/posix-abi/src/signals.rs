@@ -1193,10 +1193,20 @@ pub(crate) fn stop_others() -> Result<(), i32> {
     let channel = sys::channel_create(level.max(1)).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, level.max(1)).map_err(|_| EAGAIN)?;
     while !STOP.try_begin(me, channel.raw().0) {
-        if STOP.owner() != 0 {
-            park();
-        }
-        let _ = sys::yield_now();
+        STOP.wait_for_claim(
+            || {
+                park();
+                let _ = sys::yield_now();
+            },
+            || {
+                let deadline = rt::time::ticks_to_ns(rt::time::now()) + LOOK_AGAIN_NS;
+                sys::timer_set(&timer, deadline).map_err(|_| EAGAIN)?;
+                match sys::receive(&channel) {
+                    Ok(_) | Err(Error::Interrupted) => Ok(()),
+                    Err(_) => Err(EAGAIN),
+                }
+            },
+        )?;
     }
     let mut asked = 0u64;
     loop {
