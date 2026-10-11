@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 /* Real published segments; metadata and gates never alias a locked inode. */
 #include <errno.h>
 #include <fcntl.h>
