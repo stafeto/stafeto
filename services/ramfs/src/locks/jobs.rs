@@ -4,8 +4,8 @@
 //! Each prepaid genuine session retains sixteen exact lock outcomes and debts.
 
 use super::{
-    actor::{Error, Response},
     request::{Captured, reply},
+    simple::{Error, Response},
 };
 use crate::storage::{LockAnchor, Pin, Storage};
 use proto_fs::{LockPhase, LockReply, LockStart, OpenKey};
@@ -69,13 +69,8 @@ pub struct Queue {
     active: Option<Id>,
     work: u16,
     held: u16,
-    #[cfg(feature = "lock-telemetry")]
-    telemetry_part: [u16; 3],
 }
-#[cfg(not(feature = "lock-telemetry"))]
 const _: () = assert!(core::mem::size_of::<Queue>() == 1_269_808);
-#[cfg(feature = "lock-telemetry")]
-const _: () = assert!(core::mem::size_of::<Queue>() <= 1_269_816);
 
 impl Queue {
     pub const fn new() -> Self {
@@ -86,8 +81,6 @@ impl Queue {
             active: None,
             work: 0,
             held: 0,
-            #[cfg(feature = "lock-telemetry")]
-            telemetry_part: [0; 3],
         }
     }
     ///
@@ -105,8 +98,6 @@ impl Queue {
             core::ptr::addr_of_mut!((*destination).active).write(None);
             core::ptr::addr_of_mut!((*destination).work).write(0);
             core::ptr::addr_of_mut!((*destination).held).write(0);
-            #[cfg(feature = "lock-telemetry")]
-            core::ptr::addr_of_mut!((*destination).telemetry_part).write([0; 3]);
         }
     }
     fn job(&self, id: Id) -> Result<&Job, u32> {
@@ -150,23 +141,10 @@ impl Queue {
             .any(|job| job.owner == owner)
     }
     /// Mark one half of a departed session; active preparation cancels separately.
-    #[cfg(feature = "lock-telemetry")]
-    pub fn telemetry_part(&self) -> [u16; 3] {
-        self.telemetry_part
-    }
     pub fn depart(&mut self, place: usize, owner: u64, first: usize) -> bool {
         assert!(place < crate::places::COUNT && matches!(first, 0 | 8));
-        #[cfg(feature = "lock-telemetry")]
-        {
-            self.telemetry_part = [first as u16, first as u16, 0];
-        }
         let mut cancel_active = false;
         for local in first..first + PORTION {
-            #[cfg(feature = "lock-telemetry")]
-            {
-                self.telemetry_part[1] = (local + 1) as u16;
-                self.telemetry_part[2] += 1;
-            }
             let slot = place * SHARE + local;
             if let Some(job) = &self.jobs[slot]
                 && job.owner == owner
@@ -218,7 +196,7 @@ impl Queue {
         }
         let anchor = if matches!(
             captured.request.command,
-            super::actor::Command::Set(Some(_))
+            super::simple::Command::Set(Some(_))
         ) {
             Some(
                 storage
@@ -389,19 +367,10 @@ impl Queue {
     }
     /// Cleanup of departed or cancelled clients also advances with no further RPC.
     pub fn cleanup_released(&mut self, storage: &mut Storage<'_>) -> usize {
-        #[cfg(feature = "lock-telemetry")]
-        {
-            self.telemetry_part = [self.cleanup, self.cleanup, 0];
-        }
         let mut released = 0;
         for _ in 0..PORTION {
             let slot = self.cleanup as usize;
             self.cleanup = ((slot + 1) % PLACES) as u16;
-            #[cfg(feature = "lock-telemetry")]
-            {
-                self.telemetry_part[1] = self.cleanup;
-                self.telemetry_part[2] += 1;
-            }
             let candidate = self.jobs[slot]
                 .as_ref()
                 .filter(|job| job.releasing && job.phase != Phase::Active)
@@ -465,34 +434,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "lock-telemetry")]
-    #[test]
-    fn measured_actual_cleanup_and_departure_physical_ranges() {
-        let mut ram = Ram::default();
-        let mut queue = queue();
-        assert_eq!(queue.telemetry_part(), [0; 3]);
-        assert!(!queue.depart(0, 41, 8));
-        assert_eq!(queue.telemetry_part(), [8, 16, 8]);
-        assert_eq!(queue.cleanup_released(&mut ram.storage), 0);
-        assert_eq!(queue.telemetry_part(), [0, 8, 8]);
-        for _ in 0..(PLACES / PORTION) - 1 {
-            queue.cleanup_released(&mut ram.storage);
-        }
-        assert_eq!(queue.telemetry_part(), [(PLACES - PORTION) as u16, 0, 8]);
-        let (mut wire, captured) = fixture(&mut ram);
-        wire.key.generation = 0x100000001;
-        let id = queue
-            .admit(0, 0x100000029, wire, captured, &mut ram.storage)
-            .unwrap();
-        let witness = crate::lock_telemetry::control(id);
-        assert_eq!(witness, [0x100000029, 32, 0x100000001, 0]);
-        queue.depart(0, id.owner(), 0);
-        for _ in 0..5 {
-            queue.cleanup_released(&mut ram.storage);
-        }
-        assert_eq!(queue.retained(), 0);
-        assert_eq!(queue.telemetry_part()[2], 8);
-    }
     #[test]
     fn direct_control_family_lookup_retains_complete_label_and_current_generation() {
         let mut ram = Ram::default();
@@ -799,9 +740,9 @@ mod tests {
             };
             let mut captured = captured;
             captured.request.command = if command.get() {
-                super::super::actor::Command::Get(super::super::Kind::Read)
+                super::super::simple::Command::Get(super::super::Kind::Read)
             } else {
-                super::super::actor::Command::Set(None)
+                super::super::simple::Command::Set(None)
             };
             let id = queue
                 .admit(0, 41, wire, captured, &mut ram.storage)
@@ -844,7 +785,7 @@ mod tests {
         };
         let mut captured = Captured { root, ..captured };
         captured.request.command =
-            super::super::actor::Command::Set(Some(super::super::Kind::Read));
+            super::super::simple::Command::Set(Some(super::super::Kind::Read));
         let id = queue
             .admit(0, 41, wire, captured, &mut ram.storage)
             .unwrap();
@@ -918,10 +859,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "internal_cancel_tests.rs"]
-mod internal_cancel_tests;
-
-#[cfg(test)]
 #[test]
 fn wait_credit_fits_existing_job_padding() {
     std::println!(
@@ -930,13 +867,5 @@ fn wait_credit_fits_existing_job_padding() {
         core::mem::size_of::<Queue>()
     );
     assert_eq!(core::mem::size_of::<Job>(), 248);
-    assert_eq!(
-        core::mem::size_of::<Queue>(),
-        1269808
-            + if cfg!(feature = "lock-telemetry") {
-                8
-            } else {
-                0
-            }
-    );
+    assert_eq!(core::mem::size_of::<Queue>(), 1269808);
 }

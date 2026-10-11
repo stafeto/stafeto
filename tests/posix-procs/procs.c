@@ -40,8 +40,8 @@
  * gives it back, and setuid(65534) takes it for good: the call right after
  * a change of the credentials sees the new ones.
  *
- * Stage 6, churn: 1100 children one after the other, so that the
- * identity sessions of the ended do not fill the service's channel.
+ * Stage 6, churn: 16 sequential children in the ordinary probe. The
+ * spawn-churn image runs 1100 to check retirement beyond 1024 sessions.
  *
  * Stage 7, posix_spawn from files (5c): the loader in the child opens the
  * program through the RAM file service. /bin/ls lists /etc (the first goal
@@ -1144,6 +1144,34 @@ static int names_bounds(void) {
 }
 #endif
 
+/* Exercise the full inode list while the measured process crowd is live. */
+static int steps_locks(void) {
+    int fd = open("/tmp/steps-locks", O_CREAT | O_RDWR, 0666), result = 0;
+    if (fd < 0) return 1;
+    struct flock lock = {0};
+    lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET; lock.l_len = 1;
+    for (int n = 0; n < 64; n++) {
+        lock.l_start = 2 * n;
+        if (fcntl(fd, F_SETLK, &lock)) { result = 2; goto done; }
+    }
+    for (int n = 0; n < 64; n++) {
+        lock.l_type = F_WRLCK; lock.l_start = 2 * n; lock.l_pid = 0;
+        if (fcntl(fd, 36, &lock) || lock.l_type != F_WRLCK ||
+            lock.l_pid != getpid() || lock.l_start != 2 * n || lock.l_len != 1) {
+            result = 3; goto done;
+        }
+    }
+    lock.l_type = F_WRLCK; lock.l_start = 128;
+    errno = 0;
+    if (fcntl(fd, F_SETLK, &lock) != -1 || errno != ENOLCK) result = 4;
+done:
+    lock.l_type = F_UNLCK; lock.l_start = 0; lock.l_len = 0; lock.l_pid = 0;
+    if (fcntl(fd, F_SETLK, &lock)) result = 5;
+    if (close(fd)) result = 5;
+    if (!result) puts("posix-procs: full inode lock steps ok");
+    return result;
+}
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
@@ -1206,6 +1234,11 @@ static int steps_run(void) {
         pause_ms(10);
     }
     printf("posix-procs: steps %d children live\n", STEPS_BRANCHES * (STEPS_LEAVES + 1) + own);
+    int locks = steps_locks();
+    if (locks) {
+        printf("posix-procs: steps: locks failed %d errno %d\n", locks, errno);
+        failed++;
+    }
 #if CHANGE_STEPS
     /* The change jobs of the RAM file service among the crowd: every
      * method of the family, and the cancel of a rename in flight. */
@@ -2443,19 +2476,27 @@ static void waits(pid_t child) {
     expect("waitpid(-1, WNOHANG) with the sleeper alive", (int)waitpid(-1, &status, WNOHANG), 0);
 }
 
-/* Stage 6: more children than the service has places for sessions, one
- * after the other (1100; the identity sessions of the ended stay in the
- * service until it receives their ends: its 1024 places fill without it). */
-static void churn(void) {
-    for (int i = 0; i < 1100; i++) {
+/* The small ordinary sample preserves spawn/reap coverage. A dedicated
+ * image runs 1100: ended identity sessions must retire beyond the service's
+ * 1024 channel places, and reuse must give the next child a fresh full PID. */
+static unsigned churn(unsigned count) {
+    pid_t previous = -1;
+    for (unsigned i = 0; i < count; i++) {
         pid_t pid = start("exit7");
         if (pid < 0) {
-            printf("posix-procs: the %dth child did not start\n", i);
-            return;
+            printf("posix-procs: the %uth child did not start\n", i);
+            return i;
         }
+        expect("sequential spawn has a fresh full PID", pid != previous, 1);
+        previous = pid;
         reap("a child of the churn", pid, 7, 0);
-        if (failures) return;
+        if (failures) return i;
+        if (SPAWN_CHURN_ONLY && ((i + 1) % 128 == 0)) {
+            printf("posix-procs: spawn churn progress %u/%u PID %d\n", i + 1, count, (int)pid);
+            fflush(stdout);
+        }
     }
+    return count;
 }
 
 /* posix_spawn of the file `path` with `argv` and `envp`: the error, the
@@ -4269,6 +4310,17 @@ int main(int argc, char **argv) {
 #endif
     argc_seen = argc;
     argv_seen = argv;
+    if (SPAWN_CHURN_ONLY) {
+        /* Keep the stress ELF small: no edge reaches the large generic role. */
+        if (argc > 1) return strcmp(argv[1], "exit7") == 0 ? 7 : 2;
+        printf("posix-procs: spawn churn start 1100\n");
+        fflush(stdout);
+        unsigned completed = churn(1100);
+        expect("all sequential spawn children reaped", completed, 1100);
+        if (!failures)
+            printf("posix-procs: spawn churn: %u children reaped with fresh full PIDs\n", completed);
+        return failures != 0;
+    }
     if (argc > 1) return role(argv[1]);
     if (JOB_CONTROL_PROBE) {
         pid_t child = -1;
@@ -4298,7 +4350,7 @@ int main(int argc, char **argv) {
     printf("posix-procs: stage groups\n");
     groups();
     printf("posix-procs: stage churn\n");
-    churn();
+    churn(16);
     printf("posix-procs: stage files\n");
     files();
     printf("posix-procs: stage descriptors\n");

@@ -583,7 +583,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-/// Lifetime observations exist only in this dedicated image.
+/// Lifetime observations are enabled in the dedicated lock-probe images.
 const POSIX_LIFETIMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["lifetime-probe", "steps"];
@@ -591,63 +591,36 @@ const POSIX_LIFETIMES_PROGRAMS: [ImageProgram; 10] = {
     programs[5].3 = &["lifetime-probe"];
     programs
 };
+const POSIX_LOCK_LIFECYCLE_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_LIFETIMES_PROGRAMS;
+    programs[5].3 = &["lifetime-rules"];
+    programs
+};
+const POSIX_LOCK_CORE_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_LIFETIMES_PROGRAMS;
+    programs[5].3 = &["lock-core-probe"];
+    programs
+};
+const POSIX_LOCK_PAGE_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_LIFETIMES_PROGRAMS;
+    programs[5].3 = &["page-fragments"];
+    programs
+};
+const POSIX_LOCK_FIFO_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_LIFETIMES_PROGRAMS;
+    programs[5].3 = &["lock-fifo-full"];
+    programs
+};
 const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_LIFETIMES_PROGRAMS;
     programs[0].3 = &["table-posix-lock-ring"];
     programs
 };
-/// Dedicated measurement image; no other lifetime fixture owns locks here.
-const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10] {
-    let mut programs = POSIX_LIFETIMES_PROGRAMS;
-    programs[0].3 = if profile == 4 {
-        &["table-posix-lock-full4"]
-    } else {
-        &["table-posix-lock-full7"]
-    };
-    programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
-    programs[5].3 = if phase == 9 {
-        &["lock-full-dup-ofd-alias"]
-    } else if phase == 8 {
-        &["lock-full-dup-ofd-last"]
-    } else if phase == 7 {
-        &["lock-full-dup-pid"]
-    } else if phase == 6 {
-        &["lock-full-ofd"]
-    } else if phase == 5 {
-        &["lock-full-close"]
-    } else if phase == 4 {
-        &["lock-full-death"]
-    } else if phase == 3 {
-        &["lock-full-wake"]
-    } else if phase == 2 {
-        &["lock-full-capacity"]
-    } else if phase == 1 {
-        &["lock-full-ring"]
-    } else {
-        &["lock-full-fixture"]
-    };
+const POSIX_SPAWN_CHURN_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5].3 = &["spawn-churn"];
     programs
-}
-const POSIX_LOCK_FULL4_DUP_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 7);
-const POSIX_LOCK_FULL7_DUP_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 7);
-const POSIX_LOCK_FULL4_DUP_LAST_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 8);
-const POSIX_LOCK_FULL7_DUP_LAST_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 8);
-const POSIX_LOCK_FULL4_DUP_ALIAS_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 9);
-const POSIX_LOCK_FULL7_DUP_ALIAS_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 9);
-const POSIX_LOCK_FULL4_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 0);
-const POSIX_LOCK_FULL7_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 0);
-const POSIX_LOCK_FULL4_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 1);
-const POSIX_LOCK_FULL7_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 1);
-const POSIX_LOCK_FULL4_CAPACITY_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 2);
-const POSIX_LOCK_FULL7_CAPACITY_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 2);
-const POSIX_LOCK_FULL4_WAKE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 3);
-const POSIX_LOCK_FULL7_WAKE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 3);
-const POSIX_LOCK_FULL4_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 6);
-const POSIX_LOCK_FULL7_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 6);
-const POSIX_LOCK_FULL4_CLOSE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 5);
-const POSIX_LOCK_FULL7_CLOSE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 5);
-const POSIX_LOCK_FULL4_DEATH_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 4);
-const POSIX_LOCK_FULL7_DEATH_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 4);
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1260,9 +1233,11 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
-  posix-lock-full 4|7 [dup-pid|dup-ofd-last|dup-ofd-alias]
-            verify 256 genuine published segments and eight paid roots
-            in a dedicated measurement image under unchanged quotas
+  posix-spawn-churn verify 1100 consecutive spawn/reap operations in a small image
+  posix-lock-pages measure a full inode spread over 64 paid physical pages
+  posix-lock-queue-core measure 64 genuine waits together with 64 held regions
+  posix-lock-core measure public locks at the full inode64 limit
+  posix-lock-lifecycle-rules verify the five L2-L6 lock lifecycle rules
   posix-procs run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
@@ -1381,44 +1356,16 @@ fn main() {
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-data-steps") => posix_files_run_profile(true, true),
+        Some("posix-spawn-churn") => posix_spawn_churn_probe(&qemu::VIRT),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
+        Some("posix-lock-lifecycle-rules") => {
+            posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Rules)
+        }
+        Some("posix-lock-core") => posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Core),
+        Some("posix-lock-pages") => posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Pages),
+        Some("posix-lock-queue-core") => posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Fifo),
         Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
-        Some("posix-lock-full") => match &args[1..] {
-            [profile] if profile == "4" => posix_lock_full_probe(&qemu::VIRT, 4, 0),
-            [profile] if profile == "7" => posix_lock_full_probe(&qemu::VIRT, 7, 0),
-            [profile, mode] if profile == "4" && mode == "ring" => {
-                posix_lock_full_probe(&qemu::VIRT, 4, 1)
-            }
-            [profile, mode] if profile == "7" && mode == "ring" => {
-                posix_lock_full_probe(&qemu::VIRT, 7, 1)
-            }
-            [profile, mode] if (profile == "4" || profile == "7") && mode == "capacity" => {
-                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 2)
-            }
-            [profile, mode] if (profile == "4" || profile == "7") && mode == "death" => {
-                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 4)
-            }
-            [profile, mode] if (profile == "4" || profile == "7") && mode == "wake" => {
-                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 3)
-            }
-            [profile, mode] if (profile == "4" || profile == "7") && mode == "close" => {
-                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 5)
-            }
-            [profile, mode] if (profile == "4" || profile == "7") && mode == "ofd" => {
-                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 6)
-            }
-            [profile, mode] if (profile == "4" || profile == "7") && mode == "dup-pid" => {
-                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 7)
-            }
-            [profile, mode] if (profile == "4" || profile == "7") && mode == "dup-ofd-last" => {
-                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 8)
-            }
-            [profile, mode] if (profile == "4" || profile == "7") && mode == "dup-ofd-alias" => {
-                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 9)
-            }
-            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd|dup-pid|dup-ofd-last|dup-ofd-alias]".to_owned()),
-        },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
@@ -3300,230 +3247,6 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> Result<(), String> {
-    relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
-    let kernel = build(Variant::Normal)?;
-    let (name, programs) = match (profile, phase) {
-        (4, 7) => (
-            "boot-posix-lock-full4-dup-pid.img",
-            &POSIX_LOCK_FULL4_DUP_PID_PROGRAMS,
-        ),
-        (7, 7) => (
-            "boot-posix-lock-full7-dup-pid.img",
-            &POSIX_LOCK_FULL7_DUP_PID_PROGRAMS,
-        ),
-        (4, 8) => (
-            "boot-posix-lock-full4-dup-last.img",
-            &POSIX_LOCK_FULL4_DUP_LAST_PROGRAMS,
-        ),
-        (7, 8) => (
-            "boot-posix-lock-full7-dup-last.img",
-            &POSIX_LOCK_FULL7_DUP_LAST_PROGRAMS,
-        ),
-        (4, 9) => (
-            "boot-posix-lock-full4-dup-alias.img",
-            &POSIX_LOCK_FULL4_DUP_ALIAS_PROGRAMS,
-        ),
-        (7, 9) => (
-            "boot-posix-lock-full7-dup-alias.img",
-            &POSIX_LOCK_FULL7_DUP_ALIAS_PROGRAMS,
-        ),
-        (4, 0) => ("boot-posix-lock-full4.img", &POSIX_LOCK_FULL4_PROGRAMS),
-        (7, 0) => ("boot-posix-lock-full7.img", &POSIX_LOCK_FULL7_PROGRAMS),
-        (4, 1) => (
-            "boot-posix-lock-full4-ring.img",
-            &POSIX_LOCK_FULL4_RING_PROGRAMS,
-        ),
-        (7, 1) => (
-            "boot-posix-lock-full7-ring.img",
-            &POSIX_LOCK_FULL7_RING_PROGRAMS,
-        ),
-        (4, 2) => (
-            "boot-posix-lock-full4-capacity.img",
-            &POSIX_LOCK_FULL4_CAPACITY_PROGRAMS,
-        ),
-        (7, 2) => (
-            "boot-posix-lock-full7-capacity.img",
-            &POSIX_LOCK_FULL7_CAPACITY_PROGRAMS,
-        ),
-        (4, 3) => (
-            "boot-posix-lock-full4-wake.img",
-            &POSIX_LOCK_FULL4_WAKE_PROGRAMS,
-        ),
-        (4, 6) => (
-            "boot-posix-lock-full4-ofd.img",
-            &POSIX_LOCK_FULL4_OFD_PROGRAMS,
-        ),
-        (7, 6) => (
-            "boot-posix-lock-full7-ofd.img",
-            &POSIX_LOCK_FULL7_OFD_PROGRAMS,
-        ),
-        (4, 5) => (
-            "boot-posix-lock-full4-close.img",
-            &POSIX_LOCK_FULL4_CLOSE_PROGRAMS,
-        ),
-        (7, 5) => (
-            "boot-posix-lock-full7-close.img",
-            &POSIX_LOCK_FULL7_CLOSE_PROGRAMS,
-        ),
-        (4, 4) => (
-            "boot-posix-lock-full4-death.img",
-            &POSIX_LOCK_FULL4_DEATH_PROGRAMS,
-        ),
-        (7, 4) => (
-            "boot-posix-lock-full7-death.img",
-            &POSIX_LOCK_FULL7_DEATH_PROGRAMS,
-        ),
-        _ => (
-            "boot-posix-lock-full7-wake.img",
-            &POSIX_LOCK_FULL7_WAKE_PROGRAMS,
-        ),
-    };
-    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
-    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
-    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
-    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
-    let mut ended = 0_u8;
-    let result = (|| {
-        while ended != 255 {
-            let line = run.expect_line(
-                "all eight genuine payer families to exit",
-                |line| {
-                    (line.starts_with("init: lock-full-") && line.contains(" ended:"))
-                        || line.starts_with("lock-full: FAIL")
-                },
-                Duration::from_secs(60),
-            )?;
-            if line.starts_with("lock-full: FAIL") {
-                return Err(line);
-            }
-            for family in 0..8 {
-                if line.starts_with(&format!("init: lock-full-{family} ended:")) {
-                    if line != format!("init: lock-full-{family} ended: exit code 0, not restarted")
-                    {
-                        return Err(format!("genuine full-table family failed: {line}"));
-                    }
-                    ended |= 1 << family;
-                }
-            }
-        }
-        Ok(())
-    })();
-    let outcome = run.stop();
-    symbolize::backtrace(&outcome.lines, &kernel.elf);
-    result?;
-    qemu::expect_marker(
-        &outcome,
-        &format!(
-            "lock-full: {} profile={profile} participating={profile} owners={} published=256 private=0 retired=0 common=128 payers=8 epoch=1",
-            if phase != 0 { "initial" } else { "stable" },
-            if profile == 4 { 20 } else { 17 }
-        ),
-    )?;
-    if phase == 2 {
-        qemu::expect_marker(
-            &outcome,
-            &format!(
-                "lock-full: capacity profile={profile} sleeping=16 refused=1 cancelled=16 published=256 private=0 retired=0 common=128 payers=8"
-            ),
-        )?;
-    }
-    if phase == 3 {
-        qemu::expect_marker(
-            &outcome,
-            &format!("lock-full: wake handler profile={profile} published=255 common=127"),
-        )?;
-        qemu::expect_marker(
-            &outcome,
-            &format!(
-                "lock-full: wake profile={profile} sleeping=16 successes=16 published=254 private=0 retired=0 common=127 payers=8"
-            ),
-        )?;
-    }
-    if (7..=9).contains(&phase) {
-        qemu::expect_marker(
-            &outcome,
-            &format!(
-                "lock-full: dup profile={profile} mode={} published=256 private=0 retired=0 common=128 payers=8 restored=12",
-                phase - 6
-            ),
-        )?;
-        qemu::expect_marker(
-            &outcome,
-            &format!("lock-full: dup effect profile={profile} mode={}", phase - 6),
-        )?;
-        qemu::expect_marker(
-            &outcome,
-            &format!(
-                "lock-full: dup measured profile={profile} mode={}",
-                phase - 6
-            ),
-        )?;
-    }
-    if phase == 6 {
-        qemu::expect_marker(
-            &outcome,
-            &format!(
-                "lock-full: ofd loan profile={profile} published=244 private=0 retired=0 common=116 payers=8 first-alias=retained last-fd=retired read=Q replay=2"
-            ),
-        )?;
-        qemu::expect_marker(
-            &outcome,
-            &format!("lock-full: ofd effect profile={profile}"),
-        )?;
-    }
-    if phase == 5 {
-        qemu::expect_marker(
-            &outcome,
-            &format!("lock-full: close handler profile={profile} published=244 common=116"),
-        )?;
-        qemu::expect_marker(
-            &outcome,
-            &format!(
-                "lock-full: close profile={profile} sleeping=16 successes=16 published=243 private=0 retired=0 common=116 payers=8"
-            ),
-        )?;
-        qemu::expect_marker(
-            &outcome,
-            &format!("lock-full: close effect profile={profile}"),
-        )?;
-    }
-    if phase == 4 {
-        qemu::expect_marker(
-            &outcome,
-            &format!(
-                "lock-full: death profile={profile} sleeping=16 departed=1 cancelled=15 published=244 private=0 retired=0 common=116 payers=8"
-            ),
-        )?;
-    }
-    if phase == 1 {
-        qemu::expect_marker(
-            &outcome,
-            &format!(
-                "lock-full: ring profile={profile} successes=15 deadlock=1 published=240 private=0 retired=0 common=112 payers=8"
-            ),
-        )?;
-        for owner in 0..16 {
-            qemu::expect_marker(
-                &outcome,
-                &format!("lock-full: ring key profile={profile} owner={owner} label="),
-            )?;
-        }
-    }
-    for family in 0..8 {
-        qemu::expect_marker(
-            &outcome,
-            &format!("lock-full: genuine family {family} profile={profile} ok"),
-        )?;
-        qemu::expect_marker(
-            &outcome,
-            &format!("lock-full: payer profile={profile} family={family} root="),
-        )?;
-    }
-    Ok(())
-}
-
 fn posix_lock_ring_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
@@ -3565,22 +3288,70 @@ fn posix_lock_ring_probe(machine: &qemu::Machine) -> Result<(), String> {
             &format!("posix-procs: genuine ring16 family {family} ok"),
         )?;
     }
-    qemu::expect_marker(
-        &outcome,
-        "posix-procs: ring16 result deadlock=1 success=15 vertices=16 registrations=16 watches=16 ticks=",
-    )?;
+    qemu::expect_marker(&outcome, "posix-procs: ring16 result deadlock=1 success=15")?;
+    let steps = longest_steps(&outcome.lines, "2");
+    println!("RAM ring16 dispatches (B {RAM_STEP_MAX}): {steps:?}");
+    if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!("ring16 dispatch exceeds {RAM_STEP_MAX}: {steps:?}"));
+    }
     Ok(())
 }
 
 fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
+    posix_lifetimes_run(machine, LifetimeProbe::Full)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LifetimeProbe {
+    Full,
+    Rules,
+    Core,
+    Pages,
+    Fifo,
+}
+
+fn check_lock_steps(
+    name: &str,
+    steps: &[(usize, u64, u64)],
+    required: &[usize],
+) -> Result<(), String> {
+    for kind in required {
+        if !steps
+            .iter()
+            .any(|(measured, ticks, _)| measured == kind && *ticks != 0)
+        {
+            return Err(format!(
+                "{name}: missing positive RAM method {kind} measurement"
+            ));
+        }
+    }
+    if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "{name}: dispatch exceeds {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(
-        "boot-posix-lifetimes.img",
-        &POSIX_LIFETIMES_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
+    let programs = match probe {
+        LifetimeProbe::Full => &POSIX_LIFETIMES_PROGRAMS,
+        LifetimeProbe::Rules => &POSIX_LOCK_LIFECYCLE_PROGRAMS,
+        LifetimeProbe::Core => &POSIX_LOCK_CORE_PROGRAMS,
+        LifetimeProbe::Pages => &POSIX_LOCK_PAGE_PROGRAMS,
+        LifetimeProbe::Fifo => &POSIX_LOCK_FIFO_PROGRAMS,
+    };
+    let image_name = match probe {
+        LifetimeProbe::Full => "boot-posix-lifetimes.img",
+        LifetimeProbe::Rules => "boot-posix-lock-rules.img",
+        LifetimeProbe::Core => "boot-posix-lock-core.img",
+        LifetimeProbe::Pages => "boot-posix-lock-pages.img",
+        LifetimeProbe::Fifo => "boot-posix-lock-fifo.img",
+    };
+    let image = build_boot_image(image_name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::ICOUNT);
@@ -3595,19 +3366,52 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
     if ended? != "init: posix-procs ended: exit code 0, not restarted" {
         return Err("the PID lifetime probe failed".into());
     }
+    if probe == LifetimeProbe::Fifo {
+        qemu::expect_marker(
+            &outcome,
+            "posix-procs: full lock FIFO: genuine 65th WAIT refused with NO_LOCKS",
+        )?;
+        qemu::expect_marker(
+            &outcome,
+            "posix-procs: full lock FIFO: 64 compatible queued OFDs, 64 held PID records, GET canonical and SET ENOLCK atomic",
+        )?;
+        let steps = longest_steps(&outcome.lines, "2");
+        println!("RAM full FIFO and inode dispatches (B {RAM_STEP_MAX}): {steps:?}");
+        return check_lock_steps("full FIFO and inode", &steps, &[50, 54, 65]);
+    }
+    if probe == LifetimeProbe::Pages {
+        qemu::expect_marker(
+            &outcome,
+            "posix-procs: fragmented lock pages: 64 paid pages, 64 target records, one PID death, all pages reclaimed",
+        )?;
+        let steps = longest_steps(&outcome.lines, "2");
+        println!("RAM fragmented lock page dispatches (B {RAM_STEP_MAX}): {steps:?}");
+        return check_lock_steps("fragmented lock page", &steps, &[50, 65]);
+    }
+    if probe == LifetimeProbe::Core {
+        qemu::expect_marker(&outcome, "posix-procs: full inode lock core ok")?;
+        let steps = longest_steps(&outcome.lines, "2");
+        println!("RAM full inode lock dispatches (B {RAM_STEP_MAX}): {steps:?}");
+        return check_lock_steps("full inode lock", &steps, &[50, 49]);
+    }
+    if probe == LifetimeProbe::Rules {
+        qemu::expect_marker(&outcome, "posix-procs: lock lifecycle rules ok")?;
+        return Ok(());
+    }
     qemu::expect_marker(&outcome, "posix-procs: PID lifetime page ok")?;
     for marker in [
         "posix-procs: public nonblocking locks, canonical fields, PID close and OFD fork ok",
         "posix-procs: public lock reply loss, exact keys, full GET receipt, numeric close and reuse ok ticks=",
         "posix-procs: lock depth within 16 KiB, nested SIGUSR1 close, siglongjmp and thread departure ok",
         "posix-procs: true WAIT unlock, SIGUSR1, restart, close/reuse and canonical success ok",
-        "posix-procs: genuine FIFO oldest eligible Read, blocked older Write and later PID SET ok",
-        "posix-procs: FIFO own dispatch ",
+        "posix-procs: genuine FIFO compatible Reads, blocked older Write cancellation and later PID SET ok",
         "posix-procs: genuine WAIT End exact debts and live parent fork exec custody ok",
         "posix-procs: genuine pending WAIT process exit retires exact paid receipt without rescue close ok",
         "posix-procs: genuine21 arbitrary WAIT jumps same owner and canonical success preserve exact debts ok",
         "posix-procs: WAIT real deferred pending physical cleanup rotation ok",
         "posix-procs: genuine PID cycle EDEADLK and OFD noncycle ok",
+        "posix-procs: PID deadlock explores every reader and every waiter ok",
+        "posix-procs: six inodes retain 384 locks, inode64 ENOLCK is atomic and slots reuse ok",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
@@ -3652,6 +3456,34 @@ fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
         ));
     }
     println!("RAM close event dispatches under icount (B {RAM_STEP_MAX}): {steps:?}");
+    Ok(())
+}
+
+fn posix_spawn_churn_probe(machine: &qemu::Machine) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-spawn-churn.img",
+        &POSIX_SPAWN_CHURN_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "posix-procs: spawn churn: 1100 children reaped with fresh full PIDs",
+    )?;
     Ok(())
 }
 
@@ -4143,9 +3975,8 @@ const VOLLEY_REPEATS_MAX: u64 = 64;
 /// crowd (names-volley.c): the times of the operations alone, the long rmdir
 /// against the loop of utimensat (its restarts and whether it ended within ten
 /// seconds), the long operations against the other floods (G2 to G5), and the
-/// volley of 112 renames, which
-/// all end and in which a Start is refused with JOBS_FULL and repeated. The
-/// lines go to the output for the report.
+/// volley of 112 completed renames and the held-job case that repeats a
+/// refused Start after releasing capacity. The lines go to the report output.
 fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     let shown: Vec<&String> = lines
         .iter()
@@ -4259,17 +4090,7 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
             ));
         }
     }
-    let repeats = qemu::number_after(
-        &[find("names volley:")?.to_owned()],
-        "repeats of JOBS_FULL of one thread ",
-    )
-    .unwrap_or(0);
-    if repeats == 0 {
-        return Err(format!(
-            "no thread of the volley met JOBS_FULL, the refused Start was not exercised: {}",
-            find("names volley:")?
-        ));
-    }
+    find("names admission: 24 held renames, JOBS_FULL twice, released one, retry renamed")?;
     find("names volley ok")?;
     // A process that goes in the middle of a prepaid rename, by _exit and by
     // execve: the names stay, and the places of the root come back.
@@ -4360,6 +4181,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         ));
     }
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
+    qemu::expect_marker(&outcome, "posix-procs: full inode lock steps ok")?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
     }
@@ -5327,13 +5149,17 @@ fn test(jobs: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The boots of `test` whose verdicts depend on the host's time (the test
-/// init's heartbeats on their absolute deadlines without -icount, the
-/// monitor of QEMU for the ELF boot): they run one at a time once the
-/// others have ended, so that the load of the others cannot fail them.
+/// The boots of `test` that need controlled host load: wall-clock checks
+/// and process measurements with external virtio interrupts run one at a time
+/// after the independent functional boots.
 fn timing_jobs() -> Vec<jobs::Job> {
     use jobs::job;
     vec![
+        // External virtio interrupts shift heartbeat release phase under
+        // concurrent TCG load. Preserve both measured crowds without competing
+        // QEMU instances; the service budgets and wait limits stay unchanged.
+        job("process-steps 4", || process_steps(&qemu::VIRT_2G, 4)),
+        job("process-steps 7", || process_steps(&qemu::VIRT_2G, 7)),
         // A hung test is killed after a second of the host's time.
         ostest::runner_check_job(),
         job(
@@ -5376,16 +5202,23 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files", posix_files_probe),
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
+        job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
         job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
         job("posix-lock-ring", || posix_lock_ring_probe(&qemu::VIRT)),
+        job("posix-lock-core", || {
+            posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Core)
+        }),
+        job("posix-lock-pages", || {
+            posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Pages)
+        }),
+        job("posix-lock-queue-core", || {
+            posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Fifo)
+        }),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
         job("posix-pty", posix_pty_probe),
         job("posix-pty-steps", posix_pty_steps),
-        // The longest step of the process service with 248 children, under
-        // -icount: the host's time changes none of its numbers.
-        job("process-steps", || process_steps(&qemu::VIRT_2G, 7)),
         // BusyBox on relibc guards the C surface (5a').
         job("busybox", busybox_probe),
         job("ash", ash_probe),
@@ -7459,6 +7292,18 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lock_budget_requires_actual_measurements() {
+        let measured = [(50, 18_336, 0), (65, 15_419, 0)];
+        assert!(super::check_lock_steps("pages", &measured, &[50, 65]).is_ok());
+        assert!(super::check_lock_steps("pages", &[], &[50, 65]).is_err());
+        assert!(super::check_lock_steps("pages", &measured[..1], &[50, 65]).is_err());
+        let zero = [(50, 0, 0), (65, 15_419, 0)];
+        assert!(super::check_lock_steps("pages", &zero, &[50, 65]).is_err());
+        let over = [(50, super::RAM_STEP_MAX + 1, 0), (65, 15_419, 0)];
+        assert!(super::check_lock_steps("pages", &over, &[50, 65]).is_err());
+    }
+
     fn names_log(repeats: &str) -> Vec<String> {
         [
             "posix-procs: names time a missing component: 73 requests, 617628 ticks",
@@ -7477,6 +7322,7 @@ mod tests {
             "posix-procs: names interference G4: a rename over a name that is made and removed in the same directory: 3042 restarts, finished within 10 s: no, result 0, took 624667089 ticks, alone 145549 ticks",
             "posix-procs: names interference G5: the canonical path of a directory 64 deep against directories that move: 1602 restarts, finished within 10 s: no, result 0, took 625555306 ticks, alone 1172516 ticks",
             repeats,
+            "posix-procs: names admission: 24 held renames, JOBS_FULL twice, released one, retry renamed",
             "posix-procs: names volley in directories: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 12, the most restarts of one rename 2, the longest rename 25107135 ticks, 177424279 ticks",
             "posix-procs: names volley ok",
             "posix-procs: names gone ok",
@@ -7491,13 +7337,16 @@ mod tests {
     }
 
     /// The lines of the names volley are all there, the volley ended in 112
-    /// renames and some thread met JOBS_FULL.
+    /// renames and the separate held-job case exercised refused Start.
     #[test]
     fn the_names_volley_lines_are_read_strictly() {
         let good = "posix-procs: names volley: 16 processes of 7 threads, 112 renames, all done, the most repeats of JOBS_FULL of one thread 13, the most restarts of one rename 4, the longest rename 99000000 ticks, 6879297680 ticks";
         assert!(super::names_lines(&names_log(good)).is_ok());
         let none = good.replace("thread 13", "thread 0");
-        assert!(super::names_lines(&names_log(&none)).is_err());
+        assert!(super::names_lines(&names_log(&none)).is_ok());
+        let mut missing_refusal = names_log(&none);
+        missing_refusal.retain(|line| !line.contains("names admission:"));
+        assert!(super::names_lines(&missing_refusal).is_err());
         let slow_publish: Vec<String> = names_log(good)
             .iter()
             .map(|line| line.replace("commit 14000 ticks", "commit 15401 ticks"))
@@ -7673,10 +7522,7 @@ mod tests {
             .map(|line| line.split_once(" = ").unwrap().0)
             .collect();
         close_features.sort_unstable();
-        assert_eq!(
-            close_features,
-            ["lifetime-probe", "lock-full-dup", "lock-full-ofd"]
-        );
+        assert_eq!(close_features, ["lifetime-probe"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe", "steps"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[5].3, &["lifetime-probe"]);
@@ -8584,11 +8430,3 @@ mod tests {
         assert!(found.is_empty(), "a test deadline in {found:?}");
     }
 }
-
-#[cfg(test)]
-#[path = "../../tests/posix-procs/src/lock_full_wire.rs"]
-mod lock_full_wire;
-
-#[cfg(test)]
-#[path = "../../tests/posix-procs/src/lock_full_dup_wire.rs"]
-mod lock_full_dup_wire;

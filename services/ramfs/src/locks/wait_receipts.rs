@@ -5,8 +5,8 @@
 //! Genuine Places/label authentication precedes every call from the service.
 
 use super::{
-    actor::{Error, Response},
     request::{Captured, reply},
+    simple::{Error, Response},
 };
 use crate::storage::{LockAnchor, Pin, Storage};
 use proto_fs::{WaitKey, WaitPhase, WaitReply, WaitStart};
@@ -207,7 +207,7 @@ impl Queue {
         }
         if !matches!(
             captured.request.command,
-            super::actor::Command::Set(Some(_))
+            super::simple::Command::Set(Some(_))
         ) || captured.unlocked_query
         {
             return Err(proto_fs::INVALID_ARGUMENT);

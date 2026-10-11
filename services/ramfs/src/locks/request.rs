@@ -5,7 +5,7 @@
 
 use super::{
     Kind, Owner, Range, RangeError,
-    actor::{Command, Error, Request, Response},
+    simple::{Command, Error, Request, Response},
 };
 use crate::{Fds, Ram, TentativeOpen, storage::Root};
 use proto_fs::{LockBlocker, LockKind, LockPhase, LockReply, LockStart};

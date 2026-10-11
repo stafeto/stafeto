@@ -88,6 +88,87 @@ pub extern "C" fn files_volley_full_repeats() -> u32 {
     stats::FULL_REPEATS.load(Relaxed)
 }
 
+/// Hold real, unadvanced renames until the root's second-path share is full.
+/// The next Start must fail without retaining its key, then succeed with that
+/// exact key after a Release. No scheduler timing or private service method
+/// participates in this admission witness.
+#[unsafe(no_mangle)]
+pub extern "C" fn files_volley_admission() -> i32 {
+    use core::mem::ManuallyDrop;
+    use proto_fs::{Base, ChangeOp, ChangeStart, OpenKey};
+    use proto_wire::Status;
+    use rt::fs::Files;
+
+    fn run() -> Result<(), i32> {
+        let raw =
+            posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw())).map_err(|_| 1)?;
+        let original = ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+        let a = super::open_stages::clone_bound(&original, &[]).map_err(|_| 2)?;
+        let b = super::open_stages::clone_bound(&original, &[]).map_err(|_| 3)?;
+        let retry = super::open_stages::clone_bound(&original, &[]).map_err(|_| 4)?;
+        let request = |slot| ChangeStart {
+            key: OpenKey {
+                slot,
+                generation: 1,
+            },
+            op: ChangeOp::Rename,
+            flags: 0,
+            base: Base::Absolute,
+            args: [0; 4],
+            path: b"/tmp/vz/admission-old" as &[u8],
+        };
+        let mut held = [None; 24];
+        let attempted = request(0);
+        let outcome = (|| {
+            for (index, entry) in held.iter_mut().enumerate() {
+                let (files, slot) = if index < 16 {
+                    (&a, index as u32)
+                } else {
+                    (&b, (index - 16) as u32)
+                };
+                let job = request(slot);
+                files.change_start_once(&job).map_err(|_| 5)?;
+                *entry = Some((files, job.key));
+            }
+            for _ in 0..2 {
+                if retry.change_start_once(&attempted) != Err(Status::Unknown(proto_fs::JOBS_FULL))
+                {
+                    return Err(6);
+                }
+            }
+            let (files, key) = held[0].ok_or(7)?;
+            files.change_release_once(key).map_err(|_| 8)?;
+            held[0] = None;
+            retry.change_start_once(&attempted).map_err(|_| 9)?;
+            retry
+                .change_second_once(attempted.key, Base::Absolute, b"/tmp/vz/admission-new")
+                .map_err(|_| 10)?;
+            let mut result = [0; proto_fs::RESULT_MAX];
+            for _ in 0..100_000 {
+                if let Some(done) = retry
+                    .change_step_once(attempted.key, &mut result)
+                    .map_err(|_| 11)?
+                {
+                    return if done.result == 0 { Ok(()) } else { Err(12) };
+                }
+            }
+            Err(13)
+        })();
+        // Cleanup includes the refused key: a buggy admission must not leave
+        // paid jobs behind when this probe reports its failure.
+        let mut cleanup_ok = retry.change_release_once(attempted.key).is_ok();
+        for (files, key) in held.into_iter().flatten() {
+            cleanup_ok &= files.change_release_once(key).is_ok();
+        }
+        outcome?;
+        if !cleanup_ok {
+            return Err(14);
+        }
+        Ok(())
+    }
+    run().err().unwrap_or(0)
+}
+
 /// Entry `index` of the directory `path` by the call of the service that
 /// counts the entries from the head of the list (the call of the tests of
 /// the service, not used by the layer): the length of the name, 0 at the end

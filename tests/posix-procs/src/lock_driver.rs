@@ -21,6 +21,56 @@ static LOST: AtomicBool = AtomicBool::new(false);
 static CLOSED: AtomicBool = AtomicBool::new(false);
 static CLOSE_ERROR: AtomicI32 = AtomicI32::new(0);
 static NUMBER: AtomicI32 = AtomicI32::new(-1);
+static QUERY_ERROR: AtomicBool = AtomicBool::new(false);
+
+// Synchronous Start already carries Complete, so a successful public driver
+// need not send Query. Exercise lost-Query recovery on its genuine paid key
+// before the driver publishes and releases that same canonical receipt.
+#[inline(never)]
+fn query_loss(token: ControlToken) -> Result<(), proto_wire::Status> {
+    use core::mem::ManuallyDrop;
+    use proto_fs::{LockBlocker, LockKind, LockPhase, LockReply, Method, OpenKey};
+    use proto_wire::{Reader, Status, Writer};
+    use rt::fs::Files;
+    let raw = posix_abi::shared::with_files(|files| Ok(files.sessions().0.raw()))
+        .map_err(|_| Status::BadSize)?;
+    let files = ManuallyDrop::new(Files::from_sessions(rt::Handle::from_raw(raw), None));
+    let mut request = Writer::new();
+    proto_fs::write_lock_key(
+        Method::LockQuery,
+        OpenKey {
+            slot: token.slot() as u32,
+            generation: token.generation(),
+        },
+        &mut request,
+    )?;
+    let first = Files::send_on(files.sessions().0, request.as_bytes())?;
+    COUNTS[1].fetch_add(1, Ordering::SeqCst);
+    drop(first); // The actual service reply is deliberately unread.
+    LOST.store(true, Ordering::SeqCst);
+    let second = Files::send_on(files.sessions().0, request.as_bytes())?;
+    COUNTS[1].fetch_add(1, Ordering::SeqCst);
+    if !second.handles.is_empty() {
+        return Err(Status::BadSize);
+    }
+    let mut bytes = [0; rt::abi::MESSAGE_MAX];
+    let reply = LockReply::read(Reader::new(second.bytes(&mut bytes)))?;
+    if reply
+        != (LockReply {
+            phase: LockPhase::Complete,
+            result: 0,
+            blocker: Some(LockBlocker {
+                kind: LockKind::Read,
+                start: 117,
+                length: 0,
+                pid: -1,
+            }),
+        })
+    {
+        return Err(Status::BadSize);
+    }
+    Ok(())
+}
 
 fn index(stage: LockProbe) -> usize {
     match stage {
@@ -44,6 +94,9 @@ fn hook(stage: LockProbe, token: ControlToken) -> bool {
         BAD_KEYS.fetch_add(1, Ordering::SeqCst);
     }
     let mode = MODE.load(Ordering::SeqCst);
+    if mode == LOSS_QUERY && stage == LockProbe::Start && query_loss(token).is_err() {
+        QUERY_ERROR.store(true, Ordering::SeqCst);
+    }
     let close_here = mode == CLOSE_START && stage == LockProbe::Start
         || mode == CLOSE_RELEASE && stage == LockProbe::Release;
     if close_here
@@ -69,6 +122,7 @@ fn begin(mode: u8, fd: i32) {
     LOST.store(false, Ordering::SeqCst);
     CLOSED.store(false, Ordering::SeqCst);
     CLOSE_ERROR.store(0, Ordering::SeqCst);
+    QUERY_ERROR.store(false, Ordering::SeqCst);
     NUMBER.store(fd, Ordering::SeqCst);
     posix_abi::probe_lock_hook(Some(hook));
 }
@@ -123,7 +177,12 @@ fn run(fd: i32) -> Result<(), i32> {
             begin(mode, fd);
             let (result, bytes) = request(fd, 5, 1, 0, 0);
             let stable = end();
-            if result != Ok(0) || !full_blocker(&bytes) || !stable || !LOST.load(Ordering::SeqCst) {
+            if result != Ok(0)
+                || !full_blocker(&bytes)
+                || !stable
+                || !LOST.load(Ordering::SeqCst)
+                || QUERY_ERROR.load(Ordering::SeqCst)
+            {
                 return Err(-10 - i32::from(mode));
             }
             let target = match mode {

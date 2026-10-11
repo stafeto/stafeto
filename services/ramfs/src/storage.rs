@@ -173,6 +173,23 @@ impl LockAnchor {
         self.key
     }
 }
+/// One physically allocated page retains its exact expenditure account.
+#[derive(Debug)]
+pub struct LockPage {
+    physical: u16,
+    anchor: LockAnchor,
+}
+impl LockPage {
+    pub const fn physical(&self) -> u16 {
+        self.physical
+    }
+    pub const fn payer(&self) -> u16 {
+        self.anchor.index()
+    }
+    pub const fn root(&self) -> Root {
+        self.anchor.root()
+    }
+}
 #[derive(Clone, Copy)]
 struct Account {
     key: Root,
@@ -1259,17 +1276,6 @@ impl<'a> Storage<'a> {
         });
         Ok(i)
     }
-    /// Measurement-only exact current account, without allocating or retaining it.
-    #[cfg(feature = "lock-telemetry")]
-    pub fn telemetry_lock_root(&self, index: usize) -> Option<Root> {
-        self.state
-            .accounts
-            .get(index)
-            .copied()
-            .flatten()
-            .filter(|account| account.lock_refs != 0)
-            .map(|account| account.key)
-    }
     pub fn lock_anchor(&mut self, root: Root) -> Result<LockAnchor, u32> {
         let index = self.account(root)?;
         let account = self.state.accounts[index]
@@ -1310,6 +1316,44 @@ impl<'a> Storage<'a> {
             self.state.accounts[anchor.index as usize] = None;
         }
         Ok(())
+    }
+    /// Locks share the paid page pool with file contents and path results.
+    pub fn allocate_lock_page(&mut self, root: Root) -> Result<LockPage, u32> {
+        let anchor = self.lock_anchor(root)?;
+        let index = anchor.index() as usize;
+        if self.state.page_len == 0
+            || self.state.accounts[index].as_ref().unwrap().usage.pages >= PAGE_SHARE
+        {
+            self.release_lock_anchor(anchor)?;
+            return Err(NO_SPACE);
+        }
+        let page = self.io_take_page(index as u16, 0);
+        Ok(LockPage {
+            physical: page.physical,
+            anchor,
+        })
+    }
+    /// Consumption prevents a second release and preserves account identity.
+    pub fn release_lock_page(&mut self, page: LockPage) {
+        let mut temporary = TempPage {
+            physical: page.physical,
+            logical: 0,
+            ready: false,
+        };
+        self.io_free_page(page.anchor.index(), &mut temporary);
+        self.release_lock_anchor(page.anchor)
+            .expect("exact paid lock page");
+    }
+    #[inline(always)]
+    pub(crate) fn lock_page_words(&self, page: &LockPage, offset: usize) -> [u64; 5] {
+        assert!(offset <= PAGE - 40);
+        let start = page.physical as usize * PAGE + offset;
+        lock_words(&self.data[start..start + 40])
+    }
+    pub(crate) fn lock_page_write(&mut self, page: &LockPage, offset: usize, bytes: &[u8]) {
+        assert!(offset <= PAGE && bytes.len() <= PAGE - offset);
+        let start = page.physical as usize * PAGE + offset;
+        self.data[start..start + bytes.len()].copy_from_slice(bytes);
     }
     pub fn usage(&self, root: Root) -> Usage {
         self.state
@@ -3552,4 +3596,44 @@ mod lock_anchor_tests {
         ram.storage.release_lock_anchor(new).unwrap();
         assert!(ram.storage.state.accounts.iter().all(Option::is_none));
     }
+}
+
+/// Alignment is checked for this borrow, without imposing an alignment contract
+/// on Storage's arbitrary byte backing. The returned words own their values.
+#[inline(always)]
+fn lock_words(bytes: &[u8]) -> [u64; 5] {
+    assert_eq!(bytes.len(), 40);
+    // SAFETY: every u64 bit pattern is valid; align_to returns only aligned words
+    // and shares the immutable borrow without retaining a pointer beyond it.
+    let (prefix, words, suffix) = unsafe { bytes.align_to::<u64>() };
+    if prefix.is_empty() && suffix.is_empty() {
+        return [
+            u64::from_le(words[0]),
+            u64::from_le(words[1]),
+            u64::from_le(words[2]),
+            u64::from_le(words[3]),
+            u64::from_le(words[4]),
+        ];
+    }
+    let mut words = [0; 5];
+    for (word, bytes) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *word = u64::from_le_bytes(*bytes);
+    }
+    words
+}
+#[cfg(test)]
+#[test]
+fn aligned_and_unaligned_lock_backing_decode_identical_words() {
+    #[repr(align(8))]
+    struct Aligned([u8; 48]);
+    let mut backing = Aligned([0; 48]);
+    for i in 0..40 {
+        backing.0[i] = i as u8;
+    }
+    let aligned = lock_words(&backing.0[..40]);
+    backing.0.copy_within(..40, 1);
+    let unaligned = lock_words(&backing.0[1..41]);
+    assert_eq!(aligned, unaligned);
+    assert_eq!(aligned[0], 0x0706050403020100);
+    assert_eq!(aligned[4], 0x2726252423222120);
 }
