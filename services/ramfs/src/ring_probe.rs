@@ -45,7 +45,14 @@ impl RingProbe {
         }
         for address in (low..high).step_by(8) {
             // SAFETY: caller guarantees this interval is mapped and free stack.
-            unsafe { (address as *mut u64).write_volatile(0xded1_cafe_52aa_7e19) };
+            unsafe {
+                core::arch::asm!(
+                    "str {value}, [{address}]",
+                    value = in(reg) 0xded1_cafe_52aa_7e19u64,
+                    address = in(reg) address,
+                    options(nostack, preserves_flags)
+                )
+            };
         }
         self.paint_low = low;
         self.paint_high = high;
@@ -70,7 +77,16 @@ impl RingProbe {
         let end = (self.scan + 8 * 8).min(self.paint_high);
         for address in (self.scan..end).step_by(8) {
             // SAFETY: paint retained this sole-thread mapped stack interval.
-            if unsafe { (address as *const u64).read_volatile() } != 0xded1_cafe_52aa_7e19 {
+            let value: u64;
+            unsafe {
+                core::arch::asm!(
+                    "ldr {value}, [{address}]",
+                    value = out(reg) value,
+                    address = in(reg) address,
+                    options(nostack, preserves_flags)
+                )
+            };
+            if value != 0xded1_cafe_52aa_7e19 {
                 self.scan_lowest = self.scan_lowest.min(address);
             }
         }
