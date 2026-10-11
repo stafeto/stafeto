@@ -423,16 +423,20 @@ def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
     """Every helper store preserves all suspended caller stack recovery cells."""
     cells = [(row.rule(r)[1], row.rule(r)[1] + 8) for r in range(19, 31)
              if row.rule(r)[0] == 'offset']
-    if not cells or not any(op.startswith('st') for _, (op, _) in body):
+    if not any(op.startswith('st') for _, (op, _) in body):
         return
     physical_cells = None
     # None denotes a frame-derived address whose exact displacement was lost.
     bases = {31: 0, 29: None}
+    own_lr = None
     stores = {'str', 'strb', 'strh', 'stur', 'sturb', 'sturh', 'stp', 'stlr', 'stlrb', 'stlxr'}
     for pc, (op, args) in body:
         require(op != 'stxr', 'unsupported helper atomic store')
         destinations = written_registers(op, args)
         updates = {}
+        if op == 'bl':
+            for register in set(bases) & set(range(19)):
+                bases[register] = None
         if op in stores:
             memory = re.fullmatch(r'(.*), \[(sp|x\d+)(?:, (#-?0x[0-9a-f]+|x\d+))?\](!)?(?:, #(-?0x[0-9a-f]+))?', args)
             require(memory is not None, 'unproved helper store address')
@@ -463,6 +467,8 @@ def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
                 for width in widths:
                     require(all(address + width <= begin or address >= end for begin, end in physical_cells),
                             'helper store overlaps parent recovery cell')
+                    require(own_lr is None or address + width <= own_lr[0] or address >= own_lr[1],
+                            'helper store overlaps its own live LR cell')
                     address += width
             else:
                 # The unchanged typed source objects are disjoint from compiler
@@ -489,6 +495,10 @@ def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
                         bases[29] = fp
                     amount = int(match[3] or '0', 0) * (-1 if op == 'sub' else 1)
                     updates[destination] = None if bases[source] is None else bases[source] + amount
+        if pc == body[0][0] and (op, args) == ('str', 'x30, [sp, #-0x10]!'):
+            own_lr = (-16, -8)
+        if (op, args) == ('ldr', 'x30, [sp], #0x10'):
+            own_lr = None
         for destination in destinations:
             if destination in updates:
                 bases[destination] = updates[destination]
@@ -696,7 +706,8 @@ def repair_programs(elf, records, instructions):
     for address, body in helpers.items():
         fde = fdes[address]
         initial = fde.cie.initial
-        require(initial.cfa == (31, 0) and initial.rule(30) == ('same', 30),
+        require(initial.cfa == (31, 0) and initial.rule(30) == ('same', 30) and
+                all(initial.rule(r) == ('same', r) for r in range(19, 30)),
                 "unsupported initial helper CFA/LR")
         original = events(fde.program, address, fde.cie.code)
         stack = [(pc, op) for pc, op in body if 'sp' in op[1] and

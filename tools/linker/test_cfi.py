@@ -491,6 +491,8 @@ ret
                       'stur x0,[sp,#40]', 'strh w0,[sp,#47]',
                       'mov x8,sp\nstr x0,[x8,#40]',
                       'str x0,[x29,#24]',
+                      'mov x8,sp\nadd x8,x8,#40\nstr x0,[x8],#8',
+                      'mov x8,sp\nadd x8,x8,#32\nstp x19,x20,[x8],#16',
                       'add x8,sp,x0\nstr x0,[x8]',
                       'stp x19,x20,[sp,#32]!', 'stlxr w12,x10,[sp]',
                       'mov x8,sp\nadd x8,x8,#40\nstlxr w12,x10,[x8]'):
@@ -520,6 +522,26 @@ ret
             'stp x19,x20,[sp,#16]\nret', 'stur x0,[x8,#40]\nret'))
         with self.assertRaisesRegex(Invalid, 'source-object'):
             normalize_bytes(data, ins)
+
+    def test_own_helper_lr_and_volatile_frame_alias_are_live(self):
+        caller = "\n.type own_parent,%function\nown_parent:\n.cfi_startproc\nstr x30,[sp,#-48]!\n.cfi_def_cfa_offset 48\n.cfi_offset 30,-48\nbl OUTLINED_FUNCTION_1\nldr x30,[sp],#48\n.cfi_def_cfa_offset 0\n.cfi_restore 30\nret\n.cfi_endproc\n.size own_parent,.-own_parent\n"
+        base = ASSEMBLY + caller
+        for store in ('str x0,[sp]', 'mov x8,sp\nstr x0,[x8]',
+                      'sub x8,sp,#8\nstp x0,x1,[x8],#16'):
+            data, ins = self.changed_fixture(base.replace(
+                'mov w22,w0\nmov w21,#1', store))
+            with self.assertRaisesRegex(Invalid, 'own live LR'):
+                normalize_bytes(data, ins)
+        source = base.replace('bl leaf\nmov w22,w0\nmov w21,#1',
+                              'add x8,sp,#32\nbl leaf\nstr x0,[x8]')
+        data, ins = self.changed_fixture(source)
+        with self.assertRaisesRegex(Invalid, 'unknown frame-derived'):
+            normalize_bytes(data, ins)
+        # The spare upper half of the paid 16-byte helper frame is disjoint.
+        source = base.replace('mov w22,w0\nmov w21,#1',
+                              'add x8,sp,#8\nstr x0,[x8],#8')
+        data, ins = self.changed_fixture(source)
+        normalize_bytes(data, ins)
 
     def test_unknown_parent_lr_is_terminal_rejection(self):
         source = ASSEMBLY+"\n.type unknown_parent,%function\nunknown_parent:\n.cfi_startproc\nbl OUTLINED_FUNCTION_0\nret\n.cfi_endproc\n.size unknown_parent,.-unknown_parent\n"
