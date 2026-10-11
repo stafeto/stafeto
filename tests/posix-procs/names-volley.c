@@ -540,6 +540,8 @@ static void vz_volley_name(char *name, size_t size, int directory, char kind, in
 }
 
 static int vz_workers_go;
+static int vz_workers_leave;
+static unsigned vz_workers_finished;
 
 static void *vz_rename_thread(void *argument) {
     struct vz_thread *work = argument;
@@ -553,6 +555,11 @@ static void *vz_rename_thread(void *argument) {
     unsigned long long begin = files_volley_ticks();
     work->result = rename(from, to) == 0 ? 0 : errno;
     work->ticks = files_volley_ticks() - begin;
+    __atomic_add_fetch(&vz_workers_finished, 1, __ATOMIC_ACQ_REL);
+    while (!__atomic_load_n(&vz_workers_leave, __ATOMIC_ACQUIRE)) {
+        struct timespec delay = {0, 1000000};
+        nanosleep(&delay, NULL);
+    }
     return NULL;
 }
 
@@ -605,7 +612,7 @@ static int vz_thread_cost(void) {
  * and exits with 0, or 100 and more for a failure. */
 #define VZ_REPEATS 64
 #define VZ_RECORD 16
-static int vz_child(void) {
+static int vz_child_run(void) {
     int process = atoi(argv_seen[2]);
     unsigned long long start = strtoull(argv_seen[3], NULL, 10);
     /* A fifth argument "d" gives the process a directory of its own. */
@@ -621,6 +628,8 @@ static int vz_child(void) {
     VZ_CHECK(pthread_attr_getstacksize(&attr, &stack_size) == 0);
     VZ_CHECK(stack_size == 65536);
     __atomic_store_n(&vz_workers_go, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&vz_workers_leave, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&vz_workers_finished, 0, __ATOMIC_RELEASE);
     for (int i = 0; i < VZ_THREADS; i++) {
         work[i] = (struct vz_thread){process * VZ_THREADS + i, start, -1, 0, directory};
         int e = pthread_create(&threads[i], &attr, vz_rename_thread, &work[i]);
@@ -637,6 +646,25 @@ static int vz_child(void) {
         VZ_CHECK(length > 0 && (size_t)length < sizeof line);
         VZ_CHECK(write(STDOUT_FILENO, line, (size_t)length) == length);
     }
+    __atomic_store_n(&vz_workers_go, 1, __ATOMIC_RELEASE);
+    unsigned long long waiting = vz_now_ns();
+    while (__atomic_load_n(&vz_workers_finished, __ATOMIC_ACQUIRE) != VZ_THREADS &&
+           vz_now_ns() - waiting < 10000000000ull) {
+        struct timespec delay = {0, 1000000};
+        nanosleep(&delay, NULL);
+    }
+    VZ_CHECK(__atomic_load_n(&vz_workers_finished, __ATOMIC_ACQUIRE) == VZ_THREADS);
+    for (int i = 0; i < VZ_THREADS; i++) VZ_CHECK(work[i].result == 0);
+    {
+        char line[512];
+        int length = snprintf(line, sizeof line,
+                              "posix-procs: names workload memory: %llu pages, quota %llu pages\n",
+                              stafeto_probe_memory_used() / 4096, stafeto_probe_memory_quota() / 4096);
+        VZ_CHECK(length > 0 && (size_t)length < sizeof line);
+        VZ_CHECK(write(STDOUT_FILENO, line, (size_t)length) == length);
+    }
+    /* Capacity checks follow the measured workload with all seven workers
+     * still alive. They deliberately approach the unchanged hard quota. */
     {
         pthread_t eighth;
         __atomic_store_n(&vz_hold, 0, __ATOMIC_RELEASE);
@@ -646,7 +674,7 @@ static int vz_child(void) {
         {
             char line[512];
             int length = snprintf(line, sizeof line,
-                                  "posix-procs: names eighth memory: %llu pages, quota %llu pages\n",
+                                  "posix-procs: names capacity memory: %llu pages, quota %llu pages\n",
                                   stafeto_probe_memory_used() / 4096, stafeto_probe_memory_quota() / 4096);
             VZ_CHECK(length > 0 && (size_t)length < sizeof line);
             VZ_CHECK(write(STDOUT_FILENO, line, (size_t)length) == length);
@@ -678,7 +706,7 @@ static int vz_child(void) {
             return 105;
         }
     }
-    __atomic_store_n(&vz_workers_go, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&vz_workers_leave, 1, __ATOMIC_RELEASE);
     unsigned long long longest = 0;
     for (int i = 0; i < VZ_THREADS; i++) {
         if (pthread_join(threads[i], NULL) != 0) return 102;
@@ -696,6 +724,15 @@ static int vz_child(void) {
     if (fd < 0 || pwrite(fd, bytes, VZ_RECORD, VZ_REPEATS + VZ_RECORD * process) != VZ_RECORD || close(fd))
         return 104;
     return 0;
+}
+
+/* A failed child releases every probe gate before its process exits. */
+static int vz_child(void) {
+    int result = vz_child_run();
+    __atomic_store_n(&vz_workers_go, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&vz_workers_leave, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&vz_hold, 1, __ATOMIC_RELEASE);
+    return result;
 }
 
 /* The volley of 112 renames. With `per_directory` each process renames in a
