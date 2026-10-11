@@ -648,6 +648,9 @@ static int coordinator(void) {
 #if FULL_OFD
     if (ofd_rows(fd, epoch, &records[0])) return 1;
 #endif
+#if FULL_DUP
+    if (dup_rows(fd, epoch)) return 1;
+#endif
     printf("lock-full: %s profile=%u participating=%u owners=%u published=256 private=0 retired=0 common=128 payers=8 epoch=%llu\n",
            (FULL_RING | FULL_OFD | FULL_DUP) ? "initial" : "stable", profile, profile, first(8), (unsigned long long)epoch);
     #if FULL_CAPACITY

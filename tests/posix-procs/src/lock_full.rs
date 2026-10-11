@@ -238,7 +238,11 @@ mod ring {
     }
 }
 
-#[cfg(any(feature = "lock-full-ring", feature = "lock-full-ofd"))]
+#[cfg(any(
+    feature = "lock-full-ring",
+    feature = "lock-full-ofd",
+    feature = "lock-full-dup"
+))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn full_row_valid(pages: *const [[u64; 6]; 20]) -> i32 {
     if pages.is_null() {

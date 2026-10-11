@@ -20,8 +20,7 @@ pub fn replacement(before: &[u64; 12], after: &[u64; 12], event: &[u64; 10], las
         && event[..4] == *target
         && event[4..6] == source[2..4]
         && event[7] == u64::from(last)
-        && (48..64).contains(&event[8])
-        && event[9] != 0
+        && key(event[8], event[9])
         && if last {
             alias == [0; 4]
         } else {
@@ -30,6 +29,11 @@ pub fn replacement(before: &[u64; 12], after: &[u64; 12], event: &[u64; 10], las
                 && alias[1] != 0
                 && alias[2..] == target[2..]
         }
+}
+
+pub fn key(slot: u64, generation: u64) -> bool {
+    u32::try_from(slot)
+        .is_ok_and(|slot| (proto_fs::CloseKey { slot, generation }).validate().is_ok())
 }
 
 #[cfg(test)]

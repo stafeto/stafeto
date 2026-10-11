@@ -4,6 +4,8 @@
 extern int full_dup_sample(unsigned, uint64_t[4]);
 extern void full_dup_arm(void);
 extern int full_dup_no_event(void);
+extern int full_dup_key_valid(uint64_t, uint64_t);
+extern int full_row_valid(const uint64_t[20][6]);
 extern int full_dup_event(uint64_t[10]);
 extern int full_dup_check(const uint64_t[12], const uint64_t[12], const uint64_t[10], unsigned);
 struct dup_state { uint64_t before[12], after[12], event[10], final_event[10]; int source_flags, target_flags; char phase; };
@@ -75,8 +77,7 @@ static int dup_hold(int fd, unsigned index, struct record *record) {
         if (close(dup_alias) || full_dup_event(state.final_event)
             || memcmp(state.final_event, state.before + 8, 4 * sizeof(uint64_t))
             || state.final_event[4] || state.final_event[5] || state.final_event[6]
-            || state.final_event[7] != 1 || state.final_event[8] < 48 || state.final_event[8] >= 64
-            || !state.final_event[9]) return fail("surviving OFD final exact alias close", index);
+            || state.final_event[7] != 1 || full_dup_key_valid(state.final_event[8], state.final_event[9])) return fail("surviving OFD final exact alias close", index);
         dup_alias = -1;
     }
     state.phase = 'D';
@@ -169,5 +170,28 @@ static int dup_capture(int controller, int witness, uint64_t epoch, struct recor
         || memcmp(exact, other_source, sizeof(exact)) || full_source((unsigned)witness, exact)
         || memcmp(exact, source, sizeof(exact)) || close(other)) return fail("replacement full restored witness", 0);
     printf("lock-full: dup profile=%u mode=%u published=256 private=0 retired=0 common=128 payers=8 restored=12\n", profile, FULL_DUP);
+    return 0;
+}
+
+static int dup_rows(int fd, uint64_t epoch) {
+    unsigned seen = 0, close_effect = 0;
+    for (unsigned row = 0; row < 32; ++row) {
+        uint64_t pages[20][6] = {{0}};
+        int code = full_telemetry((unsigned)fd, 1, cookie, epoch, row << 16, pages[0]);
+        if (code == -304) continue;
+        if (code) return fail("replacement strict row header", row);
+        for (unsigned page = 1; page < 20; ++page)
+            if (full_telemetry((unsigned)fd, 1, cookie, epoch, (row << 16) | page, pages[page]))
+                return fail("replacement strict row page", row);
+        if (full_row_valid(pages)) return fail("replacement complete dispatch bound", row);
+        if (row == 28 && (pages[0][4] & (1u << 15))) close_effect = 1;
+        ++seen;
+        printf("lock-full: dup dispatch profile=%u mode=%u row=%u kind=%llu took=%llu whole=%llu waited=%llu mask=%llu ambiguous=%llu\n",
+            profile, FULL_DUP, row, (unsigned long long)pages[0][5], (unsigned long long)pages[0][3],
+            (unsigned long long)pages[18][2], (unsigned long long)pages[18][3],
+            (unsigned long long)pages[0][4], (unsigned long long)pages[19][4]);
+    }
+    if (!close_effect || !seen) return fail("replacement actual CloseEvent dispatch missing", 0);
+    printf("lock-full: dup measured profile=%u mode=%u rows=%u CloseEvent=1 B=20410\n", profile, FULL_DUP, seen);
     return 0;
 }

@@ -3446,6 +3446,13 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
             &outcome,
             &format!("lock-full: dup effect profile={profile} mode={}", phase - 6),
         )?;
+        qemu::expect_marker(
+            &outcome,
+            &format!(
+                "lock-full: dup measured profile={profile} mode={}",
+                phase - 6
+            ),
+        )?;
     }
     if phase == 6 {
         qemu::expect_marker(

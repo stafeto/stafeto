@@ -136,3 +136,12 @@ pub unsafe extern "C" fn full_dup_check(
         -1
     }
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn full_dup_key_valid(slot: u64, generation: u64) -> i32 {
+    if super::lock_full_dup_wire::key(slot, generation) {
+        0
+    } else {
+        -1
+    }
+}
