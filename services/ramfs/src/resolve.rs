@@ -74,6 +74,7 @@ pub enum Intent {
     Open { flags: u32 },
     Metadata { path: MetadataPath },
     DirectoryCreate,
+    FifoCreate,
     SymbolicLinkCreate,
     Namespace { path: NamespacePath },
 }
@@ -87,7 +88,7 @@ impl Intent {
                     && flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE)
                         != proto_fs::CREATE | proto_fs::EXCLUSIVE
             }
-            Self::DirectoryCreate | Self::SymbolicLinkCreate => false,
+            Self::DirectoryCreate | Self::FifoCreate | Self::SymbolicLinkCreate => false,
             Self::Namespace { path } => matches!(path, NamespacePath::LinkSource { follow: true }),
         }
     }
@@ -95,6 +96,7 @@ impl Intent {
         matches!(
             self,
             Self::DirectoryCreate
+                | Self::FifoCreate
                 | Self::SymbolicLinkCreate
                 | Self::Namespace {
                     path: NamespacePath::Destination
@@ -374,7 +376,7 @@ impl Resolve {
                     && storage.node(self.current)?.kind != crate::DIR
                     && !matches!(
                         self.intent,
-                        Intent::DirectoryCreate | Intent::SymbolicLinkCreate
+                        Intent::DirectoryCreate | Intent::FifoCreate | Intent::SymbolicLinkCreate
                     )
                     && !matches!(self.intent, Intent::Open { flags }
                         if flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE) == proto_fs::CREATE | proto_fs::EXCLUSIVE)
@@ -455,7 +457,9 @@ impl Resolve {
                         || (self.end < self.length
                             && !matches!(
                                 self.intent,
-                                Intent::DirectoryCreate | Intent::SymbolicLinkCreate
+                                Intent::DirectoryCreate
+                                    | Intent::FifoCreate
+                                    | Intent::SymbolicLinkCreate
                             )
                             && !matches!(self.intent, Intent::Open { flags }
                                 if flags & (proto_fs::CREATE | proto_fs::EXCLUSIVE)
@@ -506,6 +510,7 @@ impl Resolve {
     ) -> Result<NamespaceProof<'_>, u32> {
         let intent = match path {
             NamespacePath::CreateDirectory => Intent::DirectoryCreate,
+            NamespacePath::CreateFifo => Intent::FifoCreate,
             NamespacePath::CreateSymbolicLink => Intent::SymbolicLinkCreate,
             NamespacePath::ReadLink => Intent::Lookup { follow: false },
             _ => Intent::Namespace { path },

@@ -173,6 +173,10 @@ impl Ram<'_> {
         if self.description_token(fds, fd)? != expected {
             return Err(BAD_FD);
         }
+        let open = self.get(fds, fd)?;
+        if self.storage.node(self.token(open.file))?.kind == storage::FIFO {
+            return Err(INVALID_ARGUMENT);
+        }
         Ok(DataLease {
             held: self.io_retain(fds, fd)?,
             originating_root: fds.root,
@@ -332,6 +336,10 @@ impl Ram<'_> {
         position: Option<u64>,
     ) -> Result<WritePreparation, u32> {
         let open = self.get(fds, fd)?;
+        if self.storage.node(self.token(open.file))?.kind == storage::FIFO {
+            return Err(INVALID_ARGUMENT);
+        }
+
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
         }
@@ -399,6 +407,10 @@ impl Ram<'_> {
         length: u64,
     ) -> Result<TruncatePreparation, u32> {
         let open = self.get(fds, fd)?;
+        if self.storage.node(self.token(open.file))?.kind == storage::FIFO {
+            return Err(INVALID_ARGUMENT);
+        }
+
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
         }

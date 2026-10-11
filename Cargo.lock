@@ -113,6 +113,7 @@ dependencies = [
  "bootimg",
  "proto-fs",
  "proto-init",
+ "proto-pipe",
  "proto-process",
  "proto-wire",
  "rt",
@@ -667,6 +668,7 @@ dependencies = [
  "proto-clock",
  "proto-fs",
  "proto-init",
+ "proto-pipe",
  "proto-process",
  "proto-wire",
  "rt",
@@ -729,6 +731,7 @@ dependencies = [
  "entries",
  "proto-fs",
  "proto-init",
+ "proto-pipe",
  "proto-uart",
  "proto-wire",
 ]

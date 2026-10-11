@@ -1235,6 +1235,10 @@ static int steps_resources(void) {
     return 16;
 }
 
+#if FIFO_STEPS
+#include "stepfifo.inc"
+#endif
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
@@ -1312,6 +1316,11 @@ static int steps_run(void) {
     } else {
         puts("posix-procs: resource and descriptor exec steps ok");
     }
+#if FIFO_STEPS
+    pid_t fifo_child = -1;
+    if (steps_spawn(&fifo_child, "stepfifo", "0") != 0) return 8;
+    reap("a child of FIFO among the crowd", fifo_child, 0, 0);
+#endif
 #if CHANGE_STEPS
     /* The change jobs of the RAM file service among the crowd: every
      * method of the family, and the cancel of a rename in flight. */
@@ -2423,6 +2432,9 @@ static int role(const char *name) {
 #endif
     if (strcmp(name, "stepfork") == 0) return steps_fork();
     if (strcmp(name, "steppipes") == 0) return steps_pipes();
+#if FIFO_STEPS
+    if (strcmp(name, "stepfifo") == 0) return steps_fifo();
+#endif
     if (strcmp(name, "stepresources") == 0) return 64 + steps_resources();
     if (strcmp(name, "child") == 0) {
         sigset_t mask;

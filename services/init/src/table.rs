@@ -50,6 +50,15 @@ pub const BOOT_IMAGE: &str = "bootimage";
 /// The name of the RAM file service's record: it gets the boot image.
 pub const RAM_SERVICE: &str = "ramfs";
 pub const CLOCK_SERVICE: &str = "clock";
+pub const PIPE_SERVICE: &str = "pipe";
+
+/// Only the RAM service receives the named-pipe broker authority.
+pub fn fifo_broker_grant(client: &Record, service: &[u8]) -> bool {
+    client.name == RAM_SERVICE
+        && !client.is_client()
+        && !client.is_posix()
+        && service == PIPE_SERVICE.as_bytes()
+}
 
 /// These connections obtain roots for loaders at service startup.
 /// Processes keeps these endpoints solely to give narrowed loader copies.
@@ -1551,6 +1560,22 @@ mod tests {
     }
 
     #[test]
+    fn fifo_broker_authority_is_limited_to_the_ram_service() {
+        let ram = ramfs::POSIX_PROCS_TABLE[0];
+        assert!(fifo_broker_grant(&ram, PIPE_SERVICE.as_bytes()));
+        assert!(!fifo_broker_grant(&ram, RAM_SERVICE.as_bytes()));
+        for record in ramfs::POSIX_PROCS_TABLE.iter().skip(1) {
+            assert!(!fifo_broker_grant(record, PIPE_SERVICE.as_bytes()));
+        }
+        let counterfeit = Record {
+            kind: Kind::Client,
+            ..ram
+        };
+        assert!(!fifo_broker_grant(&counterfeit, PIPE_SERVICE.as_bytes()));
+        assert_eq!(proto_pipe::RAM_BROKER & proto_pipe::OWN, 0);
+    }
+
+    #[test]
     fn ram_time_profiles_require_clock_before_ram_and_process() {
         assert_eq!(ramfs::TABLE[0].args, proto_fs::RAM_TIME_LEGACY);
         assert!(ramfs::TABLE[0].connects.is_empty());
@@ -1582,11 +1607,25 @@ mod tests {
             let ram = table.iter().find(|r| r.name == "ramfs").unwrap();
             let clock = table.iter().find(|r| r.name == "clock").unwrap();
             assert_eq!(ram.args, proto_fs::RAM_TIME_CLOCKED);
-            assert_eq!(ram.connects, &["clock"]);
+            let has_pipe = table.iter().any(|r| r.name == PIPE_SERVICE);
+            assert_eq!(
+                ram.connects,
+                if has_pipe {
+                    &["clock", "pipe"][..]
+                } else {
+                    &["clock"][..]
+                }
+            );
+            if has_pipe {
+                assert!(fifo_broker_grant(ram, PIPE_SERVICE.as_bytes()));
+            }
             assert!(clock.connects.is_empty());
             let order = order_of(table);
             let position = |name| order.iter().position(|n| *n == name).unwrap();
             assert!(position("clock") < position("ramfs"));
+            if has_pipe {
+                assert!(position("pipe") < position("ramfs"));
+            }
             assert!(position("ramfs") < position("posix"));
         }
         let bad: Vec<_> = ramfs::POSIX_FILES_TABLE
@@ -1616,9 +1655,9 @@ mod tests {
                 "uart",
                 "tty",
                 "clock",
+                "pipe",
                 "ramfs",
                 "posix",
-                "pipe",
                 "rng",
                 "entropy",
                 "posix-procs"
@@ -1646,9 +1685,9 @@ mod tests {
                     "uart",
                     "tty",
                     "clock",
+                    "pipe",
                     "ramfs",
                     "posix",
-                    "pipe",
                     "posix-tty"
                 ]
             );
@@ -1662,9 +1701,9 @@ mod tests {
                 "uart",
                 "tty",
                 "clock",
+                "pipe",
                 "ramfs",
                 "posix",
-                "pipe",
                 "busybox-probe"
             ]
         );
@@ -1674,9 +1713,9 @@ mod tests {
                 "uart",
                 "tty",
                 "clock",
+                "pipe",
                 "ramfs",
                 "posix",
-                "pipe",
                 "rng",
                 "entropy",
                 "busybox-probe"
@@ -1688,9 +1727,9 @@ mod tests {
                 "uart",
                 "tty",
                 "clock",
+                "pipe",
                 "ramfs",
                 "posix",
-                "pipe",
                 "rng",
                 "entropy",
                 "os-test-run"
@@ -1717,9 +1756,9 @@ mod tests {
             order_of(ramfs::POSIX_PROCS_TABLE),
             [
                 "clock",
+                "pipe",
                 "ramfs",
                 "posix",
-                "pipe",
                 "rng",
                 "entropy",
                 "posix-procs"
@@ -1732,9 +1771,9 @@ mod tests {
                     "uart",
                     "tty",
                     "clock",
+                    "pipe",
                     "ramfs",
                     "posix",
-                    "pipe",
                     "bench-uart",
                     "rtbench-load",
                     "rng",

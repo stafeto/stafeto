@@ -30,12 +30,14 @@ pub fn now() -> u64 {
 
 struct Pins {
     targets: [Option<Target>; watch::MAX],
+    loans: [Option<(posix_fd::IoToken, posix_fd::OwnerToken)>; watch::MAX],
     transport: Option<Transport>,
 }
 impl Pins {
     fn snapshot(items: &[PollFd], ready: &mut [u32; watch::MAX]) -> Result<Self, i32> {
         let mut pins = Self {
             targets: [None; watch::MAX],
+            loans: [None; watch::MAX],
             transport: None,
         };
         let mut numbers = [u32::MAX; watch::MAX];
@@ -44,11 +46,28 @@ impl Pins {
                 *number = item.fd as u32;
             }
         }
+        let owner = crate::relibc::open_owner()
+            .ok()
+            .and_then(|owner| posix_fd::OwnerToken::new(owner).ok());
+        let frame = crate::change::frame();
         shared::with_descriptors(&numbers[..items.len()], |files| {
             pins.transport = Some(files.transport());
             for (index, item) in items.iter().enumerate() {
                 if item.fd >= 0 {
-                    match files.hold(item.fd as u32).map_err(crate::error) {
+                    let held = match files.target(item.fd as u32) {
+                        Ok(Target::Fifo(_)) => {
+                            let owner = owner.ok_or(EIO)?;
+                            files.begin_fifo_io(owner, item.fd as u32, frame).map(
+                                |(token, target)| {
+                                    pins.loans[index] = Some((token, owner));
+                                    target
+                                },
+                            )
+                        }
+                        Ok(_) => files.hold(item.fd as u32),
+                        Err(error) => Err(error),
+                    };
+                    match held.map_err(crate::error) {
                         Ok(target) => pins.targets[index] = Some(target),
                         Err(EBADF) => ready[index] = watch::NVAL,
                         Err(error) => return Err(error),
@@ -65,8 +84,13 @@ impl Drop for Pins {
         let Some(transport) = self.transport else {
             return;
         };
-        for target in self.targets.iter_mut().filter_map(Option::take) {
-            if let Ok(Some(release)) = shared::with_files(|files| Ok(files.unhold(target))) {
+        for (index, target) in self.targets.iter_mut().enumerate() {
+            let Some(target) = target.take() else {
+                continue;
+            };
+            if let Some((token, owner)) = self.loans[index].take() {
+                crate::fifo_io::finish(token, owner);
+            } else if let Ok(Some(release)) = shared::with_files(|files| Ok(files.unhold(target))) {
                 while transport.release(Some(release)).map_err(crate::error) == Err(EINTR) {}
             }
         }
@@ -99,7 +123,7 @@ struct Subscription {
     key: u64,
     armed: bool,
     label: u64,
-    set: watch::Set,
+    set: proto_pipe::WatchSet,
     original: [usize; watch::MAX],
 }
 impl Subscription {
@@ -110,12 +134,24 @@ impl Subscription {
             key: 0,
             armed: false,
             label,
-            set: watch::Set::new(),
+            set: proto_pipe::WatchSet::new(),
             original: [0; watch::MAX],
         }
     }
     fn add(&mut self, description: u32, events: u32, index: usize) {
+        self.add_endpoint(
+            proto_pipe::Endpoint {
+                id: description,
+                generation: 0,
+            },
+            events,
+            index,
+        );
+    }
+    fn add_endpoint(&mut self, endpoint: proto_pipe::Endpoint, events: u32, index: usize) {
         self.original[self.set.len] = index;
+        self.set.generations[self.set.len] = endpoint.generation;
+        let description = endpoint.id;
         self.set.items[self.set.len] = watch::Item {
             description,
             events,
@@ -159,7 +195,15 @@ impl Subscription {
         }
         let mut body = Writer::new();
         self.service.method(0).write(&mut body).map_err(|_| EIO)?;
-        self.set.write(&mut body).map_err(|_| EIO)?;
+        match self.service {
+            Service::Pipe => self.set.write(&mut body),
+            Service::Terminal => watch::Set {
+                len: self.set.len,
+                items: self.set.items,
+            }
+            .write(&mut body),
+        }
+        .map_err(|_| EIO)?;
         match self.call(body.as_bytes(), None)? {
             Reply::Wait(key) => {
                 self.key = key;
@@ -310,6 +354,10 @@ fn run(
             Some(Target::Pipe(end)) => {
                 subscriptions[0].owner = transport.pipes().map_err(crate::error)?.raw().0;
                 subscriptions[0].add(*end, requested, index);
+            }
+            Some(Target::Fifo(target)) => {
+                subscriptions[0].owner = transport.pipes().map_err(crate::error)?.raw().0;
+                subscriptions[0].add_endpoint(target.endpoint(), requested, index);
             }
             Some(Target::Tty(terminal)) => {
                 let group =

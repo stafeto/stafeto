@@ -44,6 +44,7 @@ fn resolve(
 ) -> Result<Resolve, u32> {
     let intent = match role {
         NamespacePath::CreateDirectory => Intent::DirectoryCreate,
+        NamespacePath::CreateFifo => Intent::FifoCreate,
         NamespacePath::CreateSymbolicLink => Intent::SymbolicLinkCreate,
         NamespacePath::ReadLink => Intent::Lookup { follow: false },
         _ => unreachable!(),
@@ -509,4 +510,157 @@ fn target_bounds_and_final_role_preserve_unpublished_creation_and_readlink() {
     assert_eq!(read.result(), Some(target.as_slice()));
     read.cancel_step(&mut ram.storage).unwrap();
     r.release(&mut ram.storage);
+}
+
+#[test]
+fn fifo_creation_is_paid_and_preserves_metadata_through_unlink() {
+    let mut ram = writable_root(1);
+    let before = ram.storage.available();
+    let mut journal = CreateJournal::fifo(0o666, 0o027);
+    let resolver = resolve(&mut ram, b"/queue", NamespacePath::CreateFifo, OWNER).unwrap();
+    let mut charge = ram.storage.charge_preparation(ROOT_ACCOUNT).unwrap();
+    prepare(&mut ram, &mut journal, &resolver, &mut charge, OWNER).unwrap();
+    assert_eq!(ram.storage.lookup(ROOT, b"queue"), Err(NO_ENTRY));
+    commit(&mut ram, &mut journal, &resolver, &mut charge, OWNER, 91).unwrap();
+    let token = ram.storage.lookup(ROOT, b"queue").unwrap();
+    let node = ram.storage.node(token).unwrap();
+    assert_eq!(
+        (node.kind, node.mode, node.uid, node.gid),
+        (FIFO, 0o640, 37, 43)
+    );
+    assert_eq!(node.times, [proto_fs::Timestamp::legacy_ns(91); 3]);
+    assert_eq!(node.length, 0);
+    assert_eq!(ram.storage.available().pages, before.pages);
+    assert_eq!(ram.lookup("/queue").unwrap().kind, FIFO);
+    assert_eq!(
+        ram.storage.read(token, 0, &mut [0; 1]),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        ram.storage.write(token, ROOT_ACCOUNT, 0, b"x"),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        ram.storage.truncate_zero(token, proto_fs::Timestamp::ZERO),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    assert_eq!(ram.storage.node(token).unwrap().length, 0);
+    let mut fds = crate::Fds {
+        root: ROOT_ACCOUNT,
+        ..Default::default()
+    };
+    let held = ram
+        .prepare_open_token(
+            &mut fds,
+            token,
+            proto_fs::READ_ONLY | proto_fs::TRUNCATE,
+            OWNER,
+            None,
+        )
+        .unwrap();
+    let key = proto_fs::OpenKey {
+        slot: 32,
+        generation: 41,
+    };
+    ram.finish_open(&mut fds, key, held).unwrap();
+    let ack = proto_fs::FifoAck {
+        key,
+        ticket_slot: 127,
+        ticket_generation: u64::MAX,
+    };
+    assert_eq!(ram.fifo_acked(&fds, ack), Ok(false));
+    assert_eq!(ram.ack_fifo(&mut fds, ack), Ok(()));
+    assert_eq!(ram.fifo_acked(&fds, ack), Ok(true));
+    assert_eq!(ram.ack_fifo(&mut fds, ack), Ok(()));
+    assert_eq!(
+        ram.fifo_acked(
+            &fds,
+            proto_fs::FifoAck {
+                ticket_generation: 1,
+                ..ack
+            }
+        ),
+        Err(proto_fs::PERMISSION)
+    );
+    assert_eq!(ram.finished_open(&fds, key), Ok(held));
+    // A second independent Open still owns broker cancellation custody.
+    let pending_held = ram
+        .prepare_open_token(&mut fds, token, proto_fs::READ_ONLY, OWNER, None)
+        .unwrap();
+    let pending_key = proto_fs::OpenKey {
+        slot: 33,
+        generation: 42,
+    };
+    ram.finish_open(&mut fds, pending_key, pending_held)
+        .unwrap();
+    finish(&mut ram, &mut journal, resolver, &mut charge);
+    let pending = crate::fifo::Receipt {
+        request: proto_fs::FifoGrant {
+            key: pending_key,
+            fd: ram.marked_open(&fds, pending_held).unwrap(),
+            generation: pending_held.description.generation,
+            ticket_slot: 127,
+            ticket_generation: u64::MAX,
+            flags: 0,
+        },
+        broker: proto_pipe::BrokerPrepare {
+            ticket: proto_pipe::NamedTicket {
+                slot: 127,
+                generation: u64::MAX,
+            },
+            client: 77,
+            open: proto_pipe::NamedTicket {
+                slot: pending_key.slot,
+                generation: pending_key.generation,
+            },
+            inode: proto_pipe::NamedTicket {
+                slot: u32::from(token.slot),
+                generation: token.generation,
+            },
+            flags: 0,
+        },
+        phase: crate::fifo::Phase::Pending,
+    };
+    pending.retain(&mut ram.storage).unwrap();
+    ram.storage.unlink(ROOT, b"queue", ROOT_ACCOUNT).unwrap();
+    assert_eq!(
+        ram.descriptor_information(&fds, held.fd).unwrap().kind,
+        FIFO
+    );
+    assert_eq!(
+        ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None),
+        Err(proto_fs::INVALID_ARGUMENT)
+    );
+    ram.close(&mut fds, held.fd).unwrap();
+    ram.close(&mut fds, pending_held.fd).unwrap();
+    while ram.storage.reclaim_step() {}
+
+    assert_eq!(
+        ram.storage.node(token).unwrap().kind,
+        FIFO,
+        "pending broker survives raw Close and unlink"
+    );
+    pending.release(&mut ram.storage).unwrap();
+
+    assert_eq!(ram.fifo_acked(&fds, ack), Err(proto_fs::OPEN_RETIRED));
+    let replacement = ram
+        .prepare_open_token(
+            &mut fds,
+            crate::storage::ROOT,
+            proto_fs::READ_ONLY,
+            OWNER,
+            None,
+        )
+        .unwrap();
+    let new_key = proto_fs::OpenKey {
+        slot: 32,
+        generation: 42,
+    };
+    ram.finish_open(&mut fds, new_key, replacement).unwrap();
+    assert_eq!(ram.ack_fifo(&mut fds, ack), Err(proto_fs::OPEN_RETIRED));
+    assert_eq!(ram.finished_open(&fds, new_key), Ok(replacement));
+    ram.close(&mut fds, replacement.fd).unwrap();
+
+    while ram.storage.reclaim_step() {}
+    assert_eq!(ram.storage.available(), before);
 }

@@ -48,7 +48,8 @@ const BASE_METHODS: &[u16] = proto_fs::METHODS;
 const BASE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd, 0xfffe,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd,
+    0xfffe,
 ];
 #[cfg(not(any(
     feature = "steps",
@@ -277,6 +278,7 @@ fn main(_: u64) -> u64 {
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
         notary: None,
+        pipe_broker: None,
         given: 0,
         level,
         births: &mut tables.births,
@@ -340,6 +342,8 @@ struct Fs {
     /// The notary session with the process service (init's VOUCHERS),
     /// asked for at the first OPEN_EXEC.
     notary: Option<Handle<Channel>>,
+    /// Init authorizes this service alone to prepare exact named pipe grants.
+    pipe_broker: Option<Handle<Channel>>,
     /// The sessions the service gave itself so far.
     given: u64,
     level: u8,
@@ -507,6 +511,268 @@ impl Fs {
             && !wait_queue.retains(places.place(label), label)
     }
 
+    fn pipe_broker(&mut self) -> Result<&Handle<Channel>, u32> {
+        if self.pipe_broker.is_none() {
+            self.pipe_broker = rt::service::connect(&self.parent, "pipe").ok();
+        }
+        self.pipe_broker.as_ref().ok_or(proto_fs::RESOLVING)
+    }
+    fn fifo_slot(&self, fds: &Fds, label: u64, key: proto_fs::OpenKey) -> Option<usize> {
+        fds.resolvers.iter().filter(|&&id| id != 0).find_map(|&id| {
+            let i = self.job_slot(id, label).ok()?;
+            let job = self.jobs[i].as_ref()?;
+            (job.open_key == Some(key) && matches!(job.operation, JobOperation::Fifo(_)))
+                .then_some(i)
+        })
+    }
+    /// One exact broker cancellation completes before the hidden RAM fd can retire.
+    fn cancel_fifo(
+        &mut self,
+        fds: &mut Fds,
+        label: u64,
+        key: proto_fs::OpenKey,
+    ) -> Result<(), u32> {
+        let Some(i) = self.fifo_slot(fds, label, key) else {
+            return Ok(());
+        };
+        let JobOperation::Fifo(receipt) = &self.jobs[i].as_ref().unwrap().operation else {
+            unreachable!()
+        };
+        let open = receipt.open();
+        let mut request = proto_wire::Writer::new();
+        proto_pipe::BrokerCancel {
+            client: label,
+            open,
+        }
+        .write(&mut request)
+        .map_err(|_| proto_wire::BAD_SIZE)?;
+        let reply =
+            sys::send(self.pipe_broker()?, request.as_bytes()).map_err(|_| proto_fs::RESOLVING)?;
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        ramfs::fifo::cancel_status(reply.bytes(&mut buffer), reply.handles.len())?;
+        self.retire_fifo(fds, i);
+        Ok(())
+    }
+    fn retire_fifo(&mut self, fds: &mut Fds, i: usize) {
+        let job = self.jobs[i].take().expect("paid FIFO job");
+        let JobOperation::Fifo(receipt) = job.operation else {
+            unreachable!()
+        };
+        receipt
+            .release(&mut self.ram.storage)
+            .expect("retained FIFO inode");
+        self.ram.storage.release_preparation(job.root);
+        *fds.resolvers
+            .iter_mut()
+            .find(|id| **id == job.id)
+            .expect("own preparation") = 0;
+    }
+    fn fifo_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
+        if proto_fs::is_loaders(r.label()) {
+            return status(proto_fs::PERMISSION);
+        }
+        if r.method() == Method::OpenFifoAck as u16 {
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let ack = match proto_fs::FifoAck::read(r.body()) {
+                Ok(ack) => ack,
+                Err(error) => return Answer::Status(error),
+            };
+            if let Some(i) = self.fifo_slot(fds, r.label(), ack.key) {
+                let JobOperation::Fifo(receipt) = &mut self.jobs[i].as_mut().unwrap().operation
+                else {
+                    unreachable!()
+                };
+                if let Err(code) = receipt.ack(ack) {
+                    return status(code);
+                }
+                if let Err(code) = self.ram.ack_fifo(fds, ack) {
+                    return status(code);
+                }
+                self.retire_fifo(fds, i);
+                return Answer::Status(Status::Ok);
+            }
+            return match self.ram.fifo_acked(fds, ack) {
+                Ok(true) => Answer::Status(Status::Ok),
+                Ok(false) => status(proto_fs::OPEN_RETIRED),
+                Err(code) => status(code),
+            };
+        }
+        let request = match proto_fs::FifoGrant::read(r.body()) {
+            Ok(request) => request,
+            Err(error) => return Answer::Status(error),
+        };
+        if r.handles.len() > 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        if let Err(code) = self.authenticate(fds, r.label()) {
+            if r.handles.len() == 1
+                && let Ok(offered) = r.handles.take::<Channel>(0)
+            {
+                let _ = r.reply().u32(code);
+                return Answer::Reply([offered.erase()].into());
+            }
+            return status(code);
+        }
+        let broker = if let Some(i) = self.fifo_slot(fds, r.label(), request.key) {
+            let JobOperation::Fifo(receipt) = &self.jobs[i].as_ref().unwrap().operation else {
+                unreachable!()
+            };
+            if receipt.request != request {
+                return status(proto_fs::PERMISSION);
+            }
+            receipt.broker
+        } else {
+            let ack = proto_fs::FifoAck {
+                key: request.key,
+                ticket_slot: request.ticket_slot,
+                ticket_generation: request.ticket_generation,
+            };
+            match self.ram.fifo_acked(fds, ack) {
+                Ok(false) => (),
+                Ok(true) => return status(proto_fs::OPEN_RETIRED),
+                Err(code) => return status(code),
+            }
+            if r.handles.len() != 1 {
+                return status(proto_fs::OPEN_RETIRED);
+            }
+            if !fds.preparation_available() {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            }
+            if self.jobs.iter().flatten().any(|j| {
+                j.owner == r.label() && j.open_key.is_some_and(|key| key.slot == request.key.slot)
+            }) {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            }
+            let Some(place) = fds.resolvers.iter().position(|&id| id == 0) else {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            };
+            let Some(i) = self.jobs.iter().position(Option::is_none) else {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            };
+            let Some(next) = self.job_generations[i]
+                .checked_add(1)
+                .filter(|&n| n < 1 << 56)
+            else {
+                return status(proto_fs::TOO_MANY_OPEN_FILES);
+            };
+            let inode = match self.ram.fifo_open(fds, request) {
+                Ok(inode) => inode,
+                Err(code) => return status(code),
+            };
+            // No request reached the broker yet. A missing connection must
+            // not leave a preparation whose cancellation can never be sent.
+            if let Err(code) = self.pipe_broker() {
+                if let Ok(offered) = r.handles.take::<Channel>(0) {
+                    let _ = r.reply().u32(code);
+                    return Answer::Reply([offered.erase()].into());
+                }
+                return status(proto_fs::PERMISSION);
+            }
+            let broker = proto_pipe::BrokerPrepare {
+                ticket: proto_pipe::NamedTicket {
+                    slot: request.ticket_slot,
+                    generation: request.ticket_generation,
+                },
+                client: r.label(),
+                open: proto_pipe::NamedTicket {
+                    slot: request.key.slot,
+                    generation: request.key.generation,
+                },
+                inode: proto_pipe::NamedTicket {
+                    slot: u32::from(inode.slot),
+                    generation: inode.generation,
+                },
+                flags: request.flags,
+            };
+            let charge = match self.ram.storage.charge_preparation(fds.root) {
+                Ok(charge) => charge,
+                Err(code) => return status(code),
+            };
+            let receipt = ramfs::fifo::Receipt {
+                request,
+                broker,
+                phase: ramfs::fifo::Phase::Pending,
+            };
+            if let Err(code) = receipt.retain(&mut self.ram.storage) {
+                self.ram.storage.release_preparation(charge);
+                return status(code);
+            }
+            let id = next << 8 | i as u64;
+            self.job_generations[i] = next;
+            self.jobs[i] = Some(ResolveJob {
+                id,
+                owner: r.label(),
+                root: charge,
+                real: false,
+                authority: fds.binding.stamp(),
+                operation: JobOperation::Fifo(receipt),
+                open_key: Some(request.key),
+                raw_base: (0, 0),
+                abandoned: false,
+            });
+            fds.resolvers[place] = id;
+            broker
+        };
+        let mut wire = proto_wire::Writer::new();
+        if broker.write(&mut wire).is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let channel = match self.pipe_broker() {
+            Ok(channel) => channel,
+            Err(code) => {
+                if r.handles.len() == 1
+                    && let Ok(offered) = r.handles.take::<Channel>(0)
+                {
+                    let _ = r.reply().u32(code);
+                    return Answer::Reply([offered.erase()].into());
+                }
+                return status(code);
+            }
+        };
+        let mut reply = if r.handles.len() == 1 {
+            let offered = match r.handles.take::<Channel>(0) {
+                Ok(offered) => offered,
+                Err(_) => return status(proto_fs::PERMISSION),
+            };
+            match sys::send_handles(channel, wire.as_bytes(), [offered.erase()]) {
+                Ok(reply) => reply,
+                Err(refused) => {
+                    if let Some(back) = refused.back {
+                        let _ = r.reply().u32(proto_fs::RESOLVING);
+                        return Answer::Reply(back);
+                    }
+                    return status(proto_fs::RESOLVING);
+                }
+            }
+        } else {
+            match sys::send(channel, wire.as_bytes()) {
+                Ok(reply) => reply,
+                Err(_) => return status(proto_fs::RESOLVING),
+            }
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let outcome = match proto_pipe::NamedReply::parse(proto_wire::Reader::new(
+            reply.bytes(&mut buffer),
+        )) {
+            Ok(outcome) => outcome,
+            Err(error) => return Answer::Status(error),
+        };
+        if outcome.ticket != broker.ticket || reply.handles.len() > 1 {
+            return status(proto_fs::PERMISSION);
+        }
+        if outcome.write(r.reply()).is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        if reply.handles.is_empty() {
+            return Answer::Reply(Outgoing::new());
+        }
+        match reply.handles.take::<Channel>(0) {
+            Ok(grant) => Answer::Reply([grant.erase()].into()),
+            Err(_) => status(proto_fs::PERMISSION),
+        }
+    }
     /// The index of the birth of `label`, if it holds one.
     fn birth_slot(&self, label: u64) -> Option<usize> {
         let i = Self::birth_index(label);
@@ -1759,6 +2025,8 @@ impl Service<0> for Fs {
                         | Method::CloseEvent
                         | Method::ResolveCancel
                         | Method::OpenCancel
+                        | Method::OpenFifoGrant
+                        | Method::OpenFifoAck
                         | Method::DataCancel
                         | Method::DataAck
                         | Method::ChangeRelease
@@ -1800,6 +2068,12 @@ impl Service<0> for Fs {
             )
         ) {
             return self.wait_request(&mut s.data, r);
+        }
+        if matches!(
+            Method::from_number(r.method()),
+            Some(Method::OpenFifoGrant | Method::OpenFifoAck)
+        ) {
+            return self.fifo_request(&mut s.data, r);
         }
         // Keyed common operations preserve the native lock family's custody.
         if matches!(
@@ -2064,6 +2338,8 @@ impl Service<0> for Fs {
             Some(
                 Method::OpenExec
                 | Method::OpenExecFd
+                | Method::OpenFifoGrant
+                | Method::OpenFifoAck
                 | Method::ReadInto
                 | Method::VerifySession
                 | Method::Bind
@@ -4230,6 +4506,17 @@ impl Fs {
         }
         if let Ok(i) = self.job_slot(id, owner) {
             if matches!(
+                self.jobs[i].as_ref().unwrap().operation,
+                JobOperation::Fifo(_)
+            ) {
+                let key = self.jobs[i].as_ref().unwrap().open_key.unwrap();
+                let Some(fds) = fds.as_deref_mut() else {
+                    return false;
+                };
+                return self.cancel_fifo(fds, owner, key).is_ok();
+            }
+
+            if matches!(
                 self.jobs[i].as_ref().map(|job| &job.operation),
                 Some(JobOperation::Change(_))
             ) {
@@ -4314,6 +4601,9 @@ impl Fs {
             });
             let Some(i) = found else {
                 if r.method() == Method::OpenCancel as u16 {
+                    if let Err(code) = self.cancel_fifo(fds, r.label(), key) {
+                        return status(code);
+                    }
                     let watermark = &mut fds.open_watermarks[key.slot as usize];
                     *watermark = (*watermark).max(key.generation);
                     return match self.ram.cancel_finished_open(fds, key) {
@@ -4331,6 +4621,26 @@ impl Fs {
                     Err(code) => status(code),
                 };
             };
+            if matches!(
+                self.jobs[i].as_ref().unwrap().operation,
+                JobOperation::Fifo(_)
+            ) {
+                if r.method() == Method::OpenCancel as u16 {
+                    if let Err(code) = self.cancel_fifo(fds, r.label(), key) {
+                        return status(code);
+                    }
+                    return match self.ram.cancel_finished_open(fds, key) {
+                        Ok(()) => Answer::Status(Status::Ok),
+                        Err(code) => status(code),
+                    };
+                }
+                return match self.ram.finished_open(fds, key) {
+                    Ok(held) => {
+                        self.finished_reply(fds, r, held, r.method() == Method::OpenQuery as u16)
+                    }
+                    Err(code) => status(code),
+                };
+            }
             let j = self.jobs[i].as_ref().expect("exact client key");
             if !matches!(j.operation, JobOperation::Path(_)) {
                 return status(proto_fs::PERMISSION);
@@ -4456,7 +4766,7 @@ impl Fs {
                         .as_ref()
                         .expect("exact canceled job")
                         .operation,
-                    JobOperation::Data(_) | JobOperation::Change(_)
+                    JobOperation::Data(_) | JobOperation::Change(_) | JobOperation::Fifo(_)
                 )
             {
                 return status(proto_fs::PERMISSION);

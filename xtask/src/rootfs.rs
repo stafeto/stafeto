@@ -402,6 +402,8 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-lock-fifo.img",
     "boot-posix-spawn-churn.img",
     "boot-posix-sync.img",
+    "boot-posix-fifo.img",
+    "boot-posix-fifo-steps.img",
     "boot-posix-resources.img",
     "boot-posix-lock-ring.img",
     "boot-posix-native-scopes.img",
@@ -475,6 +477,8 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-lock-fifo.img"
         | "boot-posix-spawn-churn.img"
         | "boot-posix-sync.img"
+        | "boot-posix-fifo.img"
+        | "boot-posix-fifo-steps.img"
         | "boot-posix-resources.img"
         | "boot-posix-lock-ring.img" => procs(),
         "boot-posix-poll.img" => {

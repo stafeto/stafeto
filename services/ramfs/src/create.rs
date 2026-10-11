@@ -10,6 +10,7 @@ use proto_fs::{MAX_PATH, NAME_TOO_LONG, RESOLVING};
 #[derive(Clone, Copy)]
 enum Kind {
     Directory { mode: u32, umask: u32 },
+    Fifo { mode: u32, umask: u32 },
     SymbolicLink,
 }
 #[derive(Clone, Copy)]
@@ -43,6 +44,11 @@ impl CreateJournal {
             outcome: None,
         }
     }
+    pub fn fifo(mode: u32, umask: u32) -> Self {
+        let mut result = Self::directory(mode, umask);
+        result.kind = Kind::Fifo { mode, umask };
+        result
+    }
     pub fn symlink(target: &[u8]) -> Result<Self, u32> {
         if target.len() > MAX_PATH {
             return Err(NAME_TOO_LONG);
@@ -59,6 +65,7 @@ impl CreateJournal {
     pub fn role(&self) -> NamespacePath {
         match self.kind {
             Kind::Directory { .. } => NamespacePath::CreateDirectory,
+            Kind::Fifo { .. } => NamespacePath::CreateFifo,
             Kind::SymbolicLink => NamespacePath::CreateSymbolicLink,
         }
     }
@@ -115,6 +122,9 @@ impl CreateJournal {
                 let attributes = match self.kind {
                     Kind::Directory { mode, umask } => {
                         identity.creation(parent, crate::DIR, mode, umask)
+                    }
+                    Kind::Fifo { mode, umask } => {
+                        identity.creation(parent, crate::storage::FIFO, mode, umask)
                     }
                     Kind::SymbolicLink => identity.creation(parent, SYMLINK, 0o777, 0),
                 };

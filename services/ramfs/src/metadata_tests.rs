@@ -764,3 +764,46 @@ fn directory_access_counter_wrap_raises_epoch_and_exhaustion_preserves_metadata(
     assert_eq!(ram.storage.node(dir).unwrap().mode, 0o700);
     assert_eq!(ram.storage.node(dir).unwrap().times, times);
 }
+
+#[test]
+fn fifo_descriptor_chmod_retains_metadata_without_admitting_ram_data() {
+    let mut ram = Ram::new(Timestamp::ZERO);
+    let token = file(&mut ram, ROOT, b"fifo", crate::storage::FIFO, 0o640);
+    let mut fds = Fds {
+        root: EXPENSE,
+        ..Fds::default()
+    };
+    let fd = ram
+        .open_token(&mut fds, token, proto_fs::READ_ONLY, OWNER)
+        .unwrap();
+    let description = ram.description_token(&fds, fd).unwrap();
+    let charge = ram.storage.charge_preparation(EXPENSE).unwrap();
+    let mut journal = ram
+        .prepare_metadata(&fds, fd, charge, OWNER, MetadataIntent::Chmod(0o600))
+        .unwrap();
+    assert_eq!(
+        journal.commit(&mut ram, EXPENSE, OWNER, None, Some(NOW)),
+        Ok(MetadataOutcome::Applied)
+    );
+    cleanup(&mut ram, journal, None, charge);
+    let info = ram.descriptor_information(&fds, fd).unwrap();
+    assert_eq!((info.kind, info.permissions), (crate::storage::FIFO, 0o600));
+    assert!(matches!(
+        ram.capture_data_lease(&fds, fd, description),
+        Err(proto_fs::INVALID_ARGUMENT)
+    ));
+    let writer = ram
+        .open_token(&mut fds, token, proto_fs::WRITE_ONLY, OWNER)
+        .unwrap();
+    assert!(matches!(
+        ram.prepare_write(&fds, writer, b"x", None),
+        Err(proto_fs::INVALID_ARGUMENT)
+    ));
+    assert!(matches!(
+        ram.prepare_truncate(&fds, writer, 1),
+        Err(proto_fs::INVALID_ARGUMENT)
+    ));
+    assert_eq!(ram.storage.node(token).unwrap().length, 0);
+    ram.release(&mut fds);
+    assert_eq!(ram.open_descriptions(), 0);
+}

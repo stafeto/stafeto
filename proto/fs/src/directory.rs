@@ -25,7 +25,7 @@ pub struct DirectoryEntry<'a> {
 
 impl<'a> DirectoryEntry<'a> {
     fn valid(&self) -> bool {
-        (1..=3).contains(&self.kind)
+        (1..=5).contains(&self.kind)
             && self.inode != 0
             && !self.name.is_empty()
             && !self.name.contains(&0)
@@ -99,6 +99,15 @@ mod tests {
             DirectoryEntry::read(&mut Reader::new(out.as_bytes())),
             Ok(Some(entry))
         );
+        for kind in [4, 5] {
+            let special = DirectoryEntry { kind, ..entry };
+            let mut record = Writer::new();
+            DirectoryEntry::write(Some(special), &mut record).unwrap();
+            assert_eq!(
+                DirectoryEntry::read(&mut Reader::new(record.as_bytes())),
+                Ok(Some(special))
+            );
+        }
         let mut end = Writer::new();
         DirectoryEntry::write(None, &mut end).unwrap();
         assert_eq!(
@@ -116,7 +125,7 @@ mod tests {
     #[test]
     fn malformed_entries_and_false_end_markers_are_rejected() {
         for (kind, inode, name) in [
-            (4, 1, b"a".as_slice()),
+            (6, 1, b"a".as_slice()),
             (2, 0, b"a"),
             (2, 1, b""),
             (1, 1, b"a/b"),

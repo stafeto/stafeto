@@ -12,6 +12,8 @@ test = false
 bench = false
 
 [features]
+# Read-only resident named-open witness, absent from shipped builds.
+fifo-probe = []
 # threads::set_level, the levels of rtbench 2's threads (tests/rtbench-posix).
 rtbench = []
 # What the thread probes look at and steer from outside the layer: a

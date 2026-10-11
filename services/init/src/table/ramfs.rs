@@ -53,6 +53,12 @@ pub const RAM_CLOCKED: Record = Record {
     ..RAM_BASE
 };
 
+/// RAM connects to the named-pipe broker before it starts serving.
+pub const RAM_FIFO_CLOCKED: Record = Record {
+    connects: &["clock", "pipe"],
+    ..RAM_CLOCKED
+};
+
 pub const TABLE: &[Record] = &[
     RAM_LEGACY,
     Record {
@@ -118,7 +124,7 @@ pub const BUSYBOX_TABLE: &[Record] = &[
 /// serves the shell's pipelines, the terminal service (5f) its console.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
-    RAM_CLOCKED,
+    RAM_FIFO_CLOCKED,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 5 * DIALOG_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
@@ -146,7 +152,7 @@ const DIALOG_QUOTA: u64 = 512 * PAGE;
 /// live members for the terminal-signal walk. Spawn and exec run separately.
 pub const POSIX_TTY_TABLE: &[Record] = &[
     super::normal::TABLE[0],
-    RAM_CLOCKED,
+    RAM_FIFO_CLOCKED,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 18 * DIALOG_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
@@ -431,7 +437,7 @@ pub const PIPE: Record = Record {
 /// start from files (5c): the table has the pool for 33 of them and holds
 /// no record of theirs.
 pub const POSIX_PROCS_TABLE: &[Record] = &[
-    RAM_CLOCKED,
+    RAM_FIFO_CLOCKED,
     Record {
         // The pool of the children from files (5c): 32 of the probe's
         // quota at once and one that fails its load, with the service's
@@ -464,8 +470,8 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
 pub const POSIX_STEPS_TABLE: &[Record] = &[
     // Room for the crowd's descriptions in the RAM file service.
     Record {
-        quota: RAM_CLOCKED.quota,
-        ..RAM_CLOCKED
+        quota: RAM_FIFO_CLOCKED.quota,
+        ..RAM_FIFO_CLOCKED
     },
     Record {
         quota: POSIX_ABI_TABLE[1].quota + (STEPS_CHILDREN + 2) * STEPS_QUOTA + 384 * PAGE,
@@ -524,7 +530,7 @@ const PROCS_QUOTA: u64 = 704 * PAGE;
 pub const OS_TEST_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     TTY,
-    RAM_CLOCKED,
+    RAM_FIFO_CLOCKED,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 10 * OS_TEST_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
@@ -630,7 +636,7 @@ pub const RTBENCH: Record = Record {
 /// children (S10 to S13) are files of the image started from the loader.
 pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     super::normal::TABLE[0],
-    RAM_CLOCKED,
+    RAM_FIFO_CLOCKED,
     RTBENCH_POOL,
     POSIX_ABI_TABLE[2],
     PIPE,
@@ -715,7 +721,7 @@ pub const TTY_STEPS_TABLE: &[Record] = &[
 /// entropy device's driver and the entropy service; the probe starts its
 /// own file once, whose copy forks.
 pub const POSIX_RANDOM_TABLE: &[Record] = &[
-    RAM_CLOCKED,
+    RAM_FIFO_CLOCKED,
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 3 * PROCS_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]

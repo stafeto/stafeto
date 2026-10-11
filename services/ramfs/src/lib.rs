@@ -22,6 +22,7 @@ pub mod directory;
 mod directory_tests;
 #[cfg(test)]
 mod fd_lifetime_tests;
+pub mod fifo;
 pub mod image;
 #[cfg(test)]
 mod image_tests;
@@ -492,9 +493,24 @@ enum FinishMode {
 struct OpenReceipt {
     key: proto_fs::OpenKey,
     description: Token,
+    fifo_generation: u64,
 }
-const _: () = assert!(core::mem::size_of::<OpenReceipt>() == 32);
+const _: () = assert!(core::mem::size_of::<OpenReceipt>() == 40);
 impl OpenReceipt {
+    // Description slots occupy seven bits. The upper byte stores the exact
+    // acknowledged named-ticket slot plus one, never a wire description slot.
+    fn description(self) -> Token {
+        Token {
+            slot: self.description.slot & 127,
+            generation: self.description.generation,
+        }
+    }
+    fn fifo_ticket(self) -> Option<proto_pipe::NamedTicket> {
+        (self.fifo_generation != 0).then(|| proto_pipe::NamedTicket {
+            slot: u32::from((self.description.slot >> 8) - 1),
+            generation: self.fifo_generation,
+        })
+    }
     const EMPTY: Self = Self {
         key: proto_fs::OpenKey {
             slot: 0,
@@ -504,6 +520,7 @@ impl OpenReceipt {
             slot: 0,
             generation: 0,
         },
+        fifo_generation: 0,
     };
 }
 
@@ -818,6 +835,9 @@ impl<'a> Ram<'a> {
         }
         let node = self.storage.node(token)?;
         let access = flags & 3;
+        if node.kind == storage::FIFO && access == proto_fs::READ_WRITE {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
         if created && node.links != 0 {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
@@ -943,6 +963,7 @@ impl<'a> Ram<'a> {
             fds.open_receipts[proof.slot] = OpenReceipt {
                 key: proof.key,
                 description: proof.held.description,
+                fifo_generation: 0,
             };
             self.publish_descriptor(fds, proof.slot);
             fds.tentative &= !(1 << proof.slot);
@@ -969,17 +990,74 @@ impl<'a> Ram<'a> {
             .position(|receipt| receipt.key == key)
             .ok_or(proto_fs::OPEN_RETIRED)?;
         let receipt = fds.open_receipts[slot];
+        let description = receipt.description();
         if fds.tentative & (1 << slot) != 0
-            || fds.slots[slot] != u8::try_from(receipt.description.slot).ok()
-            || !self.descriptions[receipt.description.slot as usize]
-                .is_some_and(|shared| shared.generation == receipt.description.generation)
+            || fds.slots[slot] != u8::try_from(description.slot).ok()
+            || !self.descriptions[description.slot as usize]
+                .is_some_and(|shared| shared.generation == description.generation)
         {
             return Err(proto_fs::OPEN_RETIRED);
         }
         Ok(TentativeOpen {
             fd: slot as u32 + 3,
-            description: receipt.description,
+            description,
         })
+    }
+    /// Terminal acknowledgement belongs to this exact finished Open, not a reused fd.
+    pub fn fifo_acked(&self, fds: &Fds, ack: proto_fs::FifoAck) -> Result<bool, u32> {
+        self.finished_open(fds, ack.key)?;
+        let receipt = fds
+            .open_receipts
+            .iter()
+            .find(|receipt| receipt.key == ack.key)
+            .ok_or(proto_fs::OPEN_RETIRED)?;
+        match receipt.fifo_ticket() {
+            None => Ok(false),
+            Some(ticket)
+                if ticket.slot == ack.ticket_slot && ticket.generation == ack.ticket_generation =>
+            {
+                Ok(true)
+            }
+            Some(_) => Err(proto_fs::PERMISSION),
+        }
+    }
+    pub fn ack_fifo(&mut self, fds: &mut Fds, ack: proto_fs::FifoAck) -> Result<(), u32> {
+        if self.fifo_acked(fds, ack)? {
+            return Ok(());
+        }
+        if ack.ticket_slot >= 128 || ack.ticket_generation == 0 {
+            return Err(proto_fs::PERMISSION);
+        }
+        let receipt = fds
+            .open_receipts
+            .iter_mut()
+            .find(|receipt| receipt.key == ack.key)
+            .ok_or(proto_fs::OPEN_RETIRED)?;
+        receipt.description.slot |= ((ack.ticket_slot + 1) as u16) << 8;
+        receipt.fifo_generation = ack.ticket_generation;
+        Ok(())
+    }
+    /// Validate the exact finished FIFO and its immutable access direction.
+    pub fn fifo_open(&self, fds: &Fds, request: proto_fs::FifoGrant) -> Result<Token, u32> {
+        request.validate().map_err(|_| proto_fs::INVALID_ARGUMENT)?;
+        let held = self.finished_open(fds, request.key)?;
+        if held.description.generation != request.generation
+            || self.marked_open(fds, held)? != request.fd
+        {
+            return Err(proto_fs::PERMISSION);
+        }
+        let open = self.get(fds, held.fd)?;
+        let token = self.token(open.file);
+        if self.storage.node(token)?.kind != storage::FIFO {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let write = request.flags & proto_pipe::WRITE_END != 0;
+        let append = request.flags & proto_pipe::APPEND != 0;
+        if write != (open.flags & 3 == WRITE_ONLY) || append != (open.flags & proto_fs::APPEND != 0)
+        {
+            return Err(proto_fs::PERMISSION);
+        }
+        Ok(token)
     }
     /// Preserve the exact description's device type through Commit and final handoff.
     pub fn marked_open(&self, fds: &Fds, held: TentativeOpen) -> Result<u32, u32> {
@@ -1522,6 +1600,9 @@ impl<'a> Ram<'a> {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         let node = self.storage.node(token)?;
+        if node.kind == storage::FIFO && flags & 3 == proto_fs::READ_WRITE {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
         let bits = match flags & 3 {
             proto_fs::READ_ONLY => 4,
             proto_fs::WRITE_ONLY => 2,
@@ -1895,7 +1976,11 @@ impl<'a> Ram<'a> {
             _ => {
                 let (_, name, token) = self.storage.entry_record(entry as usize)?;
                 let file = self.file(token);
-                Some(DirectoryRecord::new(name, file.kind(), self.inode(file)))
+                Some(DirectoryRecord::new(
+                    name,
+                    self.storage.node(token).ok()?.kind,
+                    self.inode(file),
+                ))
             }
         }
     }
@@ -1963,7 +2048,7 @@ impl<'a> Ram<'a> {
     pub fn lookup(&self, path: &str) -> Result<Metadata, u32> {
         let file = self.resolve(path)?;
         Ok(Metadata {
-            kind: file.kind(),
+            kind: self.storage.node(self.token(file))?.kind,
             size: self.length(file) as u32,
         })
     }

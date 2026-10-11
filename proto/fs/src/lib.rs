@@ -120,6 +120,9 @@ pub use wait::{
     WaitMode, WaitPhase, WaitReply, WaitStart, read_wait_key, write_wait_key,
 };
 
+mod fifo;
+pub use fifo::{FifoAck, FifoGrant};
+
 mod close;
 pub use close::{CLOSE_KEY_FIRST, CLOSE_KEY_PLACES, CloseEvent, CloseKey};
 
@@ -376,6 +379,10 @@ pub enum Method {
     WaitArm = 58,
     /// Exact packed fd/slot and generation on an authentic Pending loader session.
     OpenExecFd = 59,
+    /// Exact finished hidden FIFO, early pipe ticket and one witness on first admission.
+    OpenFifoGrant = 60,
+    /// Exact OpenKey and pipe ticket transfer pending-grant custody to the client.
+    OpenFifoAck = 61,
 }
 
 impl Method {
@@ -443,6 +450,8 @@ impl Method {
             57 => Some(Self::WaitRelease),
             58 => Some(Self::WaitArm),
             59 => Some(Self::OpenExecFd),
+            60 => Some(Self::OpenFifoGrant),
+            61 => Some(Self::OpenFifoAck),
             _ => None,
         }
     }
@@ -451,7 +460,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

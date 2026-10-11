@@ -14,6 +14,8 @@ test = false
 bench = false
 
 [features]
+fifo-probe = ["dep:posix-abi", "posix-abi/fifo-probe"]
+fifo-steps = ["dep:posix-abi", "posix-abi/fifo-probe"]
 spawn-churn = []
 lifetime-rules = ["lifetime-probe"]
 lock-core-probe = ["lifetime-probe"]

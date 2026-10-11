@@ -36,9 +36,17 @@ pub struct Recovery {
     /// Captured before Start; writable-only Random uses the RAM route.
     pub access: u8,
     descriptor_flags: DescriptorFlags,
+    /// Full paid pipe admission, retained in the same sixteen Open places.
+    pub fifo_ticket_generation: u64,
+    pub fifo_endpoint_generation: u64,
+    pub fifo_capability: u64,
+    pub fifo_ticket_slot: u32,
+    pub fifo_endpoint_id: u32,
+    pub fifo_stage: u8,
+    pub fifo_flags: u8,
 }
 
-const _: () = assert!(core::mem::size_of::<Recovery>() == 24);
+const _: () = assert!(core::mem::size_of::<Recovery>() == 64);
 
 /// Validated remote preparation tied to one exact local final phase.
 /// Its producer belongs to the trusted reply path once that protocol is connected.
@@ -163,7 +171,15 @@ impl Recovery {
     }
 
     fn progresses_from(self, previous: Self) -> bool {
-        if self.access != previous.access
+        if (previous.phase != Phase::Starting && self.fifo_flags != previous.fifo_flags)
+            || self.fifo_stage < previous.fifo_stage
+            || (previous.fifo_ticket_generation != 0
+                && (self.fifo_ticket_generation != previous.fifo_ticket_generation
+                    || self.fifo_ticket_slot != previous.fifo_ticket_slot))
+            || (previous.fifo_endpoint_generation != 0
+                && (self.fifo_endpoint_generation != previous.fifo_endpoint_generation
+                    || self.fifo_endpoint_id != previous.fifo_endpoint_id))
+            || self.access != previous.access
             || self.descriptor_flags != previous.descriptor_flags
             || (previous.job != 0 && self.job != previous.job)
             || (previous.backend_fd != 0 || previous.description_generation != 0)
@@ -225,6 +241,15 @@ impl PosixFs {
     ) -> Result<Claim<Recovery>, FsError> {
         self.descriptors
             .claim_open(token, helper)
+            .map_err(FsError::from)
+    }
+
+    /// Cancel helpers extract the saved capability once, before any RPC.
+    pub fn take_open_capability(&mut self, token: OpenToken) -> Result<u64, FsError> {
+        self.descriptors
+            .update_open_cleanup(token, |recovery| {
+                core::mem::take(&mut recovery.fifo_capability)
+            })
             .map_err(FsError::from)
     }
 
@@ -487,6 +512,12 @@ impl PosixFs {
                 return Err(FsError::Io);
             }
             let target = transport.capture_opened_target(finished, recovery.access as u32)?;
+            if target
+                .ram_target()
+                .is_some_and(|target| target.kind() == Ok(super::FileKind::Fifo))
+            {
+                return Err(FsError::InvalidArgument);
+            }
             self.stage_open_record(claim, target)?;
             self.publish_open_record(claim)?;
             self.ack_open_record(token, owner)?
@@ -517,14 +548,19 @@ impl PosixFs {
         if self.descriptors.entry_token(entry.fd).ok() != Some(entry) {
             return Ok(Recovery::default());
         }
-        let exact = match self.descriptors.get(entry.fd).map_err(|_| 5)? {
-            Target::Ram(exact) | Target::Random(exact) => exact,
-            _ => return Err(5),
-        };
+        let target = self.descriptors.get(entry.fd).map_err(|_| 5)?;
+        let exact = target.ram_target().ok_or(5)?;
         let flags = self.descriptors.flags(entry.fd).map_err(|_| 5)?;
-        Ok(Recovery::starting(proto_fs::READ_ONLY, flags)
+        let mut recovery = Recovery::starting(proto_fs::READ_ONLY, flags)
             .map_err(|_| 5)?
-            .remember(exact.prepared()))
+            .remember(exact.prepared());
+        if let Target::Fifo(pair) = target {
+            // The pipe Ack already retired the ticket before publication.
+            recovery.fifo_stage = 6;
+            recovery.fifo_endpoint_id = pair.endpoint().id;
+            recovery.fifo_endpoint_generation = pair.endpoint().generation;
+        }
+        Ok(recovery)
     }
 }
 
@@ -833,38 +869,14 @@ mod tests {
     }
 
     #[test]
-    fn captured_flags_fill_existing_recovery_padding_and_table_union() {
-        #[derive(Clone, Copy)]
-        #[repr(C)]
-        struct Legacy {
-            job: u64,
-            generation: u64,
-            fd: u32,
-            phase: Phase,
-            access: u8,
-        }
-        #[allow(dead_code)]
-        struct LegacyFs {
-            files: Files,
-            pipes: Option<Handle<Channel>>,
-            terminal: Option<Handle<Channel>>,
-            paths: crate::PathState,
-            descriptors: posix_fd::Table<Target, 32, Legacy>,
-        }
-        assert_eq!(size_of::<Recovery>(), 24);
-        assert_eq!(size_of::<PosixFs>(), size_of::<LegacyFs>());
-        assert_eq!(
-            core::mem::align_of::<PosixFs>(),
-            core::mem::align_of::<LegacyFs>()
-        );
-        assert_eq!(size_of::<posix_fd::Table<Target, 32, Recovery>>(), 4880);
-        assert_eq!(
-            size_of::<posix_fd::Table<Target, 32, Recovery>>(),
-            size_of::<posix_fd::Table<Target, 32, Legacy>>()
-        );
-        assert_eq!(
-            size_of::<posix_fd::Table<Target, 32, Recovery, [u8; 1016]>>(),
-            37136
-        );
+    fn fifo_full_generations_fit_the_existing_resident_table() {
+        assert_eq!(size_of::<Recovery>(), 64);
+        assert_eq!(size_of::<super::super::FifoTarget>(), 24);
+        assert_eq!(size_of::<Target>(), 32);
+        // Both full backend generations and the ticket are charged in existing
+        // resident records, without an extra admission pool or per-fd buffer.
+        assert!(size_of::<PosixFs>() <= 20480);
+        assert!(size_of::<posix_fd::Table<Target, 32, Recovery>>() <= 8192);
+        assert!(size_of::<posix_fd::Table<Target, 32, Recovery, [u8; 1016]>>() <= 40960);
     }
 }

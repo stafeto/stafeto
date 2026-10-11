@@ -73,6 +73,7 @@ abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 proto-fs = { path = "../../proto/fs" }
 proto-init = { path = "../../proto/init" }
+proto-pipe = { path = "../../proto/pipe" }
 proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
 # The text of a batch of the kernel log (uart::log), which the worker

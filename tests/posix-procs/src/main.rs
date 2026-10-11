@@ -177,3 +177,10 @@ extern "C" fn files_full_sessions() -> i32 {
 mod lock_fifo_full;
 #[cfg(feature = "lifetime-probe")]
 mod lock_ring;
+
+/// Observes a real retained FIFO wait before the C guest sends a signal.
+#[cfg(any(feature = "fifo-probe", feature = "fifo-steps"))]
+#[unsafe(no_mangle)]
+extern "C" fn stafeto_fifo_waiting() -> i32 {
+    i32::from(posix_abi::fifo_waiting())
+}

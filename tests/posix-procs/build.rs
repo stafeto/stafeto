@@ -15,6 +15,7 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
+    println!("cargo:rerun-if-changed=fifo.c");
     println!("cargo:rerun-if-changed=lifetime.c");
     println!("cargo:rerun-if-changed=lock-holder.c");
     println!("cargo:rerun-if-changed=lock-ring.c");
@@ -26,6 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=lock-page-fragments.c");
     println!("cargo:rerun-if-changed=lock-fifo-full.c");
     println!("cargo:rerun-if-changed=files.c");
+    println!("cargo:rerun-if-changed=stepfifo.inc");
     println!("cargo:rerun-if-changed=names.c");
     println!("cargo:rerun-if-changed=names-loss.c");
     println!("cargo:rerun-if-changed=names-volley.c");
@@ -117,6 +119,10 @@ fn main() {
             u8::from(env::var_os("CARGO_FEATURE_CHANGE_STEPS").is_some())
         ))
         .arg(format!(
+            "-DFIFO_STEPS={}",
+            u8::from(env::var_os("CARGO_FEATURE_FIFO_STEPS").is_some())
+        ))
+        .arg(format!(
             "-DPENDING_OPEN_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_PENDING_OPEN").is_some())
         ))
@@ -153,7 +159,9 @@ fn main() {
         .arg(sysroot.join("include"))
         .args([
             "-c",
-            if env::var_os("CARGO_FEATURE_LIFETIME_PROBE").is_some() {
+            if env::var_os("CARGO_FEATURE_FIFO_PROBE").is_some() {
+                "fifo.c"
+            } else if env::var_os("CARGO_FEATURE_LIFETIME_PROBE").is_some() {
                 "lifetime.c"
             } else if env::var_os("CARGO_FEATURE_IMAGE_GATES").is_some() {
                 "image-gates.c"

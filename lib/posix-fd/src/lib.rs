@@ -1014,6 +1014,25 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         Ok(())
     }
 
+    /// Extract a local capability only from an exact cancellation record.
+    /// The caller releases its table guard before closing the extracted handle.
+    pub fn update_open_cleanup<V>(
+        &mut self,
+        token: OpenToken,
+        update: impl FnOnce(&mut R) -> V,
+    ) -> Result<V, Error> {
+        let mut record = self.record(token)?;
+        let Phase::Canceling {
+            ref mut recovery, ..
+        } = record.phase
+        else {
+            return Err(Error::InvalidArgument);
+        };
+        let value = update(recovery);
+        self.save(token, record);
+        Ok(value)
+    }
+
     /// Reserve after fallible preparation. Installation reuses this generation.
     pub fn reserve_open(
         &mut self,

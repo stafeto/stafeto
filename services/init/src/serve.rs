@@ -1203,6 +1203,11 @@ impl Init {
                 mark,
                 duplicate: false,
             }
+        } else if table::fifo_broker_grant(client, name.as_bytes()) {
+            Grant {
+                mark: proto_pipe::RAM_BROKER,
+                duplicate: false,
+            }
         } else if table::loader_grant(client.name, name.as_bytes()) {
             Grant {
                 mark: if name.as_bytes() == table::RAM_SERVICE.as_bytes() {

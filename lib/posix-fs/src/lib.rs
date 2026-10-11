@@ -10,10 +10,11 @@ pub mod change;
 pub mod closing;
 pub mod control;
 pub mod drain;
+pub mod fifo;
 pub mod open;
 mod target;
 pub mod wait;
-pub use target::RamTarget;
+pub use target::{FifoTarget, RamTarget};
 
 use core::mem::ManuallyDrop;
 pub use posix_fd::Flags as DescriptorFlags;
@@ -190,11 +191,31 @@ pub enum Target {
     Error,
     Ram(RamTarget),
     Pipe(u32),
+    Fifo(FifoTarget),
     Tty(u32),
     /// A random device (`/dev/random`, `/dev/urandom`, 5e'): the service's
     /// open description of this number takes the writes, the closes and
     /// the `fstat`, and the layer serves the reads from its generator.
     Random(RamTarget),
+}
+
+impl Target {
+    /// Exact metadata custody, including the RAM half of a named pipe.
+    pub fn ram_target(self) -> Option<RamTarget> {
+        match self {
+            Self::Ram(target) | Self::Random(target) => Some(target),
+            Self::Fifo(target) => Some(target.ram()),
+            _ => None,
+        }
+    }
+
+    pub fn pipe_endpoint(self) -> Option<proto_pipe::Endpoint> {
+        match self {
+            Self::Pipe(end) => Some(proto_pipe::Endpoint::anonymous(end)),
+            Self::Fifo(target) => Some(target.endpoint()),
+            _ => None,
+        }
+    }
 }
 
 /// The name `ttyname` gives the terminal `terminal`.
@@ -222,12 +243,12 @@ pub struct PosixFs {
 
 const _: () = assert!(core::mem::size_of::<wait::Recovery>() == 88);
 const _: () = assert!(core::mem::size_of::<posix_fd::WaitRecords<wait::Recovery>>() == 2560);
-const _: () = assert!(core::mem::size_of::<PosixFs>() == 17232);
+const _: () = assert!(core::mem::size_of::<PosixFs>() <= 20480);
 
 // Typed control receipts retain their complete immutable source and outcome.
-const _: () = assert!(core::mem::size_of::<control::Recovery>() == 120);
+const _: () = assert!(core::mem::size_of::<control::Recovery>() == 128);
 const _: () = assert!(
-    core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>>() == 14096
+    core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>>() <= 17408
 );
 
 /// Owned startup transports, prepared before the pinned descriptor table exists.
@@ -373,6 +394,13 @@ impl Transport {
         match target {
             Some(Target::Ram(fd) | Target::Random(fd)) => self.close_file(fd),
             Some(Target::Pipe(end)) => self.close_pipe(end),
+            Some(Target::Fifo(pair)) => {
+                match self.pipe_endpoint_call(proto_pipe::Method::Close, pair.endpoint(), None) {
+                    Ok(_) | Err(FsError::BadFileDescriptor) => {}
+                    Err(error) => return Err(error),
+                }
+                self.close_file(pair.ram())
+            }
             Some(Target::Tty(id)) => self.close_terminal(id),
             _ => Ok(()),
         }
@@ -424,8 +452,21 @@ impl Transport {
         end: u32,
         word: Option<u32>,
     ) -> Result<[u32; 2], FsError> {
+        self.pipe_endpoint_call(method, proto_pipe::Endpoint::anonymous(end), word)
+    }
+
+    pub fn pipe_endpoint_call(
+        &self,
+        method: proto_pipe::Method,
+        end: proto_pipe::Endpoint,
+        word: Option<u32>,
+    ) -> Result<[u32; 2], FsError> {
         let mut w = proto_wire::Writer::new();
-        proto_pipe::end_request(method, end, word, &mut w).map_err(|_| FsError::Io)?;
+        method.header().write(&mut w).map_err(|_| FsError::Io)?;
+        end.write(&mut w).map_err(|_| FsError::Io)?;
+        if let Some(word) = word {
+            w.u32(word).map_err(|_| FsError::Io)?;
+        }
         self.pipe_send(w.as_bytes())
     }
 
@@ -586,6 +627,10 @@ impl Transport {
 
     pub fn descriptor_information(&self, target: Target) -> Result<NodeInfo, FsError> {
         match target {
+            Target::Fifo(target) => self
+                .files()
+                .descriptor_information(target.ram().fd())
+                .map_err(FsError::from),
             Target::Ram(fd) | Target::Random(fd) => self
                 .files()
                 .descriptor_information(fd.fd())
@@ -863,10 +908,7 @@ impl PosixFs {
             for (index, item) in list.iter().enumerate() {
                 let ram_fd = |target| match target {
                     InheritedTarget::RawRam { fd, .. } => Some(fd),
-                    InheritedTarget::Ready(Target::Ram(exact) | Target::Random(exact)) => {
-                        Some(exact.fd())
-                    }
-                    _ => None,
+                    InheritedTarget::Ready(target) => target.ram_target().map(|exact| exact.fd()),
                 };
                 let target = if let Some(fd) = ram_fd(item.target) {
                     let previous = list[..index]
@@ -882,6 +924,25 @@ impl PosixFs {
                     };
                     let target = Transport(startup.files.view(), None, None)
                         .capture_opened_target(info.held, info.flags & 3)?;
+                    let target = if let InheritedTarget::Ready(Target::Fifo(pair)) = item.target {
+                        let actual = target.ram_target().ok_or(FsError::Io)?;
+                        if actual != pair.ram() || actual.kind() != Ok(FileKind::Fifo) {
+                            return Err(FsError::Io);
+                        }
+                        Transport(
+                            startup.files.view(),
+                            startup.pipes.as_ref().map(Handle::raw),
+                            None,
+                        )
+                        .pipe_endpoint_call(
+                            proto_pipe::Method::GetFlags,
+                            pair.endpoint(),
+                            None,
+                        )?;
+                        Target::Fifo(pair)
+                    } else {
+                        target
+                    };
                     if let (
                         InheritedTarget::Ready(Target::Ram(previous) | Target::Random(previous)),
                         Target::Ram(current) | Target::Random(current),
@@ -1051,7 +1112,7 @@ impl PosixFs {
     pub fn kept_by_fork(&self, out: &mut [rt::fs::PreparedOpen; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
-            if let Target::Ram(n) | Target::Random(n) = target
+            if let Some(n) = target.ram_target()
                 && !flags.close_on_fork
                 && !out[..count].contains(&n.prepared())
             {
@@ -1066,7 +1127,7 @@ impl PosixFs {
     pub fn kept_by_exec(&self, out: &mut [rt::fs::PreparedOpen; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, _) in self.descriptors.open() {
-            if let Target::Ram(n) | Target::Random(n) = target
+            if let Some(n) = target.ram_target()
                 && !out[..count].contains(&n.prepared())
             {
                 out[count] = n.prepared();
@@ -1092,10 +1153,10 @@ impl PosixFs {
     }
 
     /// Pipe ends retained by a forked child, each once.
-    pub fn pipes_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+    pub fn pipes_kept_by_fork(&self, out: &mut [proto_pipe::Endpoint; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
-            if let Target::Pipe(n) = target
+            if let Some(n) = target.pipe_endpoint()
                 && !flags.close_on_fork
                 && !out[..count].contains(&n)
             {

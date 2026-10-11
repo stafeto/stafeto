@@ -587,9 +587,14 @@ pub enum FileAction<'a> {
 /// files of the service the caller holds until the child's session shares
 /// them, and the descriptors the actions opened in the caller, which close
 /// after the spawn.
+#[derive(Clone, Copy)]
+enum ShadowHold {
+    Ordinary(posix_fs::Target),
+    Fifo(posix_fd::IoToken, posix_fd::OwnerToken),
+}
 struct Shadow {
     entries: [Option<(posix_fs::Target, bool)>; posix_fs::OPEN_MAX],
-    held: [Option<posix_fs::Target>; posix_fs::OPEN_MAX],
+    held: [Option<ShadowHold>; posix_fs::OPEN_MAX],
     opened: [Option<u32>; posix_fs::OPEN_MAX],
     cwd: [u8; proto_loader::PATH_MAX],
     cwd_len: usize,
@@ -628,15 +633,29 @@ impl Shadow {
             real_ids: false,
         };
         let numbers = core::array::from_fn::<_, { posix_fs::OPEN_MAX }, _>(|fd| fd as u32);
-        crate::shared::with_descriptors(&numbers, |files| {
+        let owner = crate::relibc::open_owner()
+            .ok()
+            .and_then(|owner| posix_fd::OwnerToken::new(owner).ok());
+        let frame = crate::change::frame();
+        let captured = crate::shared::with_descriptors(&numbers, |files| {
             let mut open = [None; posix_fs::OPEN_MAX];
             for (fd, target, flags) in files.descriptors() {
                 open[fd as usize] = Some((target, flags.close_on_exec));
             }
             for (fd, entry) in open.iter().enumerate() {
                 if let Some((_, close_on_exec)) = entry {
-                    let target = files.hold(fd as u32).map_err(crate::error)?;
-                    shadow.held[fd] = Some(target);
+                    let (target, held) =
+                        if matches!(files.target(fd as u32), Ok(posix_fs::Target::Fifo(_))) {
+                            let owner = owner.ok_or(crate::constants::EIO)?;
+                            let (token, target) = files
+                                .begin_fifo_io(owner, fd as u32, frame)
+                                .map_err(crate::error)?;
+                            (target, ShadowHold::Fifo(token, owner))
+                        } else {
+                            let target = files.hold(fd as u32).map_err(crate::error)?;
+                            (target, ShadowHold::Ordinary(target))
+                        };
+                    shadow.held[fd] = Some(held);
                     shadow.entries[fd] = Some((target, *close_on_exec));
                 }
             }
@@ -645,7 +664,11 @@ impl Shadow {
             shadow.cwd[..n].copy_from_slice(&own[..n]);
             shadow.cwd_len = n;
             Ok(())
-        })?;
+        });
+        if let Err(error) = captured {
+            shadow.finish();
+            return Err(error);
+        }
         Ok(shadow)
     }
 
@@ -870,6 +893,11 @@ impl Shadow {
                     posix_fs::Target::Error => Names::Error,
                     posix_fs::Target::Ram(n) => Names::File(n.fd()),
                     posix_fs::Target::Pipe(n) => Names::Pipe(n),
+                    posix_fs::Target::Fifo(n) => Names::Fifo {
+                        packed: n.packed(),
+                        ram_generation: n.ram_generation(),
+                        pipe_generation: n.pipe_generation(),
+                    },
                     posix_fs::Target::Tty(n) => Names::Terminal(n),
                     posix_fs::Target::Random(n) => Names::Random(n.fd()),
                 }
@@ -902,22 +930,33 @@ impl Shadow {
     /// The service's descriptions the child's session shares, each once.
     fn shared(&self) -> impl Iterator<Item = rt::fs::PreparedOpen> + Clone + '_ {
         (0..self.entries.len()).filter_map(move |index| {
-            let Some((posix_fs::Target::Ram(target) | posix_fs::Target::Random(target), false)) = self.entries[index] else { return None; };
-            let captured = target.prepared();
+            let Some((target, false)) = self.entries[index] else { return None; };
+            let captured = target.ram_target()?.prepared();
             let duplicate = self.entries[..index].iter().any(|entry| {
-                matches!(entry, Some((posix_fs::Target::Ram(old) | posix_fs::Target::Random(old), false)) if old.prepared() == captured)
+                matches!(entry, Some((old, false)) if old.ram_target().is_some_and(|old| old.prepared() == captured))
             });
             (!duplicate).then_some(captured)
         })
     }
 
     /// The ends of pipes the child's session shares, each once.
-    fn shared_pipes(&self) -> ([u32; posix_fs::OPEN_MAX], usize) {
+    fn shared_pipes(&self) -> ([proto_pipe::Endpoint; posix_fs::OPEN_MAX], usize) {
         let (list, count) = self.descriptors();
-        let mut ends = [0; posix_fs::OPEN_MAX];
+        let mut ends = [proto_pipe::Endpoint::anonymous(0); posix_fs::OPEN_MAX];
         let mut found = 0;
         for d in &list[..count] {
-            if let proto_loader::Names::Pipe(n) = d.names
+            let endpoint = match d.names {
+                proto_loader::Names::Pipe(n) => Some(proto_pipe::Endpoint::anonymous(n)),
+                proto_loader::Names::Fifo {
+                    packed,
+                    ram_generation,
+                    pipe_generation,
+                } => posix_fs::FifoTarget::from_packed(packed, ram_generation, pipe_generation)
+                    .ok()
+                    .map(|target| target.endpoint()),
+                _ => None,
+            };
+            if let Some(n) = endpoint
                 && !ends[..found].contains(&n)
             {
                 ends[found] = n;
@@ -930,10 +969,15 @@ impl Shadow {
     /// The caller lets go: its holds end and the descriptors the actions
     /// opened close (the child's session keeps the descriptions it shares).
     fn finish(&mut self) {
-        for target in self.held.iter_mut().filter_map(Option::take) {
-            let release = crate::shared::with_files(|files| Ok(files.unhold(target)));
-            if let Ok(Some(target)) = release {
-                let _ = crate::shared::release_target(target);
+        for held in self.held.iter_mut().filter_map(Option::take) {
+            match held {
+                ShadowHold::Fifo(token, owner) => crate::fifo_io::finish(token, owner),
+                ShadowHold::Ordinary(target) => {
+                    let release = crate::shared::with_files(|files| Ok(files.unhold(target)));
+                    if let Ok(Some(target)) = release {
+                        let _ = crate::shared::release_target(target);
+                    }
+                }
             }
         }
         for fd in self.opened.iter_mut().filter_map(Option::take) {
@@ -1702,7 +1746,9 @@ fn move_files(c: &Handle<Channel>) -> bool {
     if !crate::relibc::detach_for_exec() {
         return false;
     }
-    crate::shared::abandon_holds();
+    if !crate::shared::abandon_holds() {
+        return false;
+    }
     let mut kept = [rt::fs::PreparedOpen {
         fd: 0,
         slot: 0,

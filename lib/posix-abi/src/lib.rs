@@ -18,6 +18,7 @@ mod drain_hooks;
 #[cfg(feature = "close-probe")]
 pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;
+mod fifo_io;
 pub mod fork;
 pub mod loader_probe;
 mod lock_driver;
@@ -211,6 +212,19 @@ pub fn open(name: &[u8], flags: c_int) -> Result<c_int, c_int> {
 
 /// Opens a path under its captured creation mode and process mask.
 pub fn open_policy(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c_int, c_int> {
+    let point = threads::cancel::Point::begin();
+    let result = open_policy_inner(name, flags, mode, umask);
+    // Successful publication returns its descriptor to the caller. Failed
+    // opens finish cancellation only after their exact paid cleanup survives.
+    if result.is_ok() {
+        point.end();
+    } else {
+        point.finish();
+    }
+    result
+}
+
+fn open_policy_inner(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c_int, c_int> {
     if flags
         & !(O_ACCMODE
             | O_DIRECTORY
@@ -253,13 +267,22 @@ pub fn openat_policy(
     if dirfd == names::AT_FDCWD || name.first() == Some(&b'/') {
         return open_policy(name, flags, mode, umask);
     }
-    if name.is_empty() {
-        return Err(ENOENT);
+    let point = threads::cancel::Point::begin();
+    let result = (|| {
+        if name.is_empty() {
+            return Err(ENOENT);
+        }
+        let proto_fs::Base::Fd { fd, generation } = names::descriptor_base(dirfd)? else {
+            return Err(EBADF);
+        };
+        shared::open_from(Some((fd, generation)), name, flags, mode, umask).map(|fd| fd as c_int)
+    })();
+    if result.is_ok() {
+        point.end();
+    } else {
+        point.finish();
     }
-    let proto_fs::Base::Fd { fd, generation } = names::descriptor_base(dirfd)? else {
-        return Err(EBADF);
-    };
-    shared::open_from(Some((fd, generation)), name, flags, mode, umask).map(|fd| fd as c_int)
+    result
 }
 
 pub fn close(number: c_int) -> Result<(), c_int> {
@@ -441,6 +464,11 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
             None => pipes::status_flags(transport, end).map(Some),
             Some(flags) => pipes::set_status_flags(transport, end, flags).map(|()| Some(0)),
         },
+        posix_fs::Target::Fifo(target) => match set {
+            None => pipes::status_flags_endpoint(transport, target.endpoint()).map(Some),
+            Some(flags) => pipes::set_status_flags_endpoint(transport, target.endpoint(), flags)
+                .map(|()| Some(0)),
+        },
         posix_fs::Target::Tty(id) => match set {
             None => terminal::description(transport, id, proto_tty::Method::GetFlags, None)
                 .map(|flags| Some(flags as c_int)),
@@ -502,4 +530,18 @@ pub fn getcwd(buffer: &mut [u8]) -> Result<usize, c_int> {
 /// Ends the process with `status`; its threads and resources go with it.
 pub fn exit(status: c_int) -> ! {
     rt::sys::process_exit((status & 255) as u64)
+}
+
+#[cfg(feature = "fifo-probe")]
+pub fn fifo_waiting() -> bool {
+    shared::with_files(|files| {
+        Ok(files.open_tokens().any(|token| {
+            files.open_snapshot(token).is_ok_and(|snapshot| {
+                snapshot.recovery.is_some_and(|recovery| {
+                    recovery.fifo_stage == 3 && recovery.fifo_ticket_generation != 0
+                })
+            })
+        }))
+    })
+    .unwrap_or(false)
 }

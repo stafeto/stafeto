@@ -26,6 +26,7 @@ step-stats = []
 abi = { path = "../abi" }
 entries = { path = "../entries" }
 bootimg = { path = "../bootimg" }
+proto-pipe = { path = "../../proto/pipe" }
 proto-fs = { path = "../../proto/fs" }
 proto-init = { path = "../../proto/init" }
 proto-uart = { path = "../../proto/uart" }
