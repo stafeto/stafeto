@@ -1681,6 +1681,97 @@ mod tests {
             None
         );
     }
+    #[cfg(feature = "lock-telemetry")]
+    #[test]
+    fn measured_background_with_actual_active_worker_does_not_claim_its_receipt() {
+        let mut ram = crate::Ram::default();
+        let page = page();
+        let mut service = fresh();
+        let mut fds = crate::Fds {
+            root: root(10, 1),
+            binding: crate::authority::Binding::Active(close_who(257)),
+            ..crate::Fds::default()
+        };
+        let fd = ram
+            .open(&mut fds, "/tmp/probe", proto_fs::READ_WRITE)
+            .unwrap();
+        let held = ram.capture_description(&fds, fd).unwrap().0;
+        let inode = ram.live_description(&fds, held).unwrap().0;
+        run(
+            &mut service,
+            &mut ram.storage,
+            &page,
+            request(inode, 256, Command::Set(Some(Kind::Write)), 0, 1),
+            root(10, 1),
+        )
+        .unwrap();
+        assert!(page.retire(256));
+        let wire = proto_fs::LockStart {
+            key: proto_fs::OpenKey {
+                slot: 32,
+                generation: 0x100000001,
+            },
+            description: proto_fs::DataDescription {
+                packed: ram.marked_open(&fds, held).unwrap(),
+                generation: held.description.generation,
+            },
+            command: proto_fs::LockCommand::SetPid,
+            kind: proto_fs::LockKind::Read,
+            whence: 0,
+            start: 0,
+            length: 1,
+            pid: 0,
+        };
+        let captured = ram.capture_lock(&fds, wire).unwrap();
+        let mut allocation = Box::<super::super::jobs::Queue>::new_uninit();
+        // SAFETY: exact exclusive aligned queue allocation initialized in place.
+        let mut queue = unsafe {
+            super::super::jobs::Queue::initialize_at(allocation.as_mut_ptr());
+            allocation.assume_init()
+        };
+        let id = queue
+            .admit(0, 0x100000029, wire, captured, &mut ram.storage)
+            .unwrap();
+        queue.activate(id).unwrap();
+        service
+            .start(&mut ram.storage, captured.request, captured.root)
+            .unwrap();
+        let mut background = false;
+        let mut worker = false;
+        for _ in 0..256 {
+            let progress = service.step(&mut ram.storage, |pid| page.live(pid));
+            let stage = service.telemetry_stage();
+            let active = queue.active().unwrap();
+            assert_eq!(active, id);
+            if progress.visited != 0 {
+                let (_, witness) = crate::lock_telemetry::test_record(0, |table| {
+                    table.actor(
+                        progress,
+                        stage,
+                        Some(crate::lock_telemetry::control(active)),
+                    )
+                });
+                if stage >= 16 {
+                    assert_eq!(&witness[1..], &[0, 0, 0, u64::from(stage) << 32]);
+                    assert!(progress.completed.is_none());
+                    background = true;
+                } else {
+                    assert_eq!(&witness[1..4], &[id.owner(), 32, 0x100000001]);
+                    worker = true;
+                }
+            }
+            if let Some(result) = progress.completed {
+                assert_eq!(queue.complete_active(result).unwrap(), id);
+                assert!(queue.release(id, &mut ram.storage).unwrap());
+                drain(&mut service, &mut ram.storage, &page);
+                break;
+            }
+        }
+        assert!(background && worker);
+        assert!(!service.busy());
+        check(&service);
+        check_pins(&service, &ram.storage);
+    }
     #[test]
     fn service_layout_initializes_directly_and_preserves_accounted_size() {
         let service = fresh();

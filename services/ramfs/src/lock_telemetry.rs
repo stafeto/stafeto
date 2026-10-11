@@ -279,6 +279,8 @@ impl Table {
         stage: u8,
         receipt: Option<[u64; 4]>,
     ) {
+        // Cleanup may run while a pending worker still retains an active receipt.
+        let receipt = receipt.filter(|_| matches!(stage, 1..=4));
         let mut witness = receipt.unwrap_or([0; 4]);
         witness[3] |= u64::from(stage) << 32;
         // Production charged bounds for these two single-cell transitions are eight.
