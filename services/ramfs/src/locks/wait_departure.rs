@@ -18,6 +18,10 @@ pub struct Progress {
     pub visited: usize,
     pub released: usize,
     pub cancel_actor: bool,
+    #[cfg(feature = "lock-telemetry")]
+    pub effect: Option<[u64; 4]>,
+    #[cfg(feature = "lock-telemetry")]
+    pub ambiguous: bool,
 }
 
 /// The caller authenticates the full Places/label and cancels the sole Actor
@@ -46,12 +50,32 @@ pub fn part<H>(
             progress.cancel_actor |= queue.request_cancel(id)?;
         }
         if queue.query(id)?.phase == WaitPhase::Complete {
-            if let Some(registration) = sleepers.find(id) {
+            let registration = sleepers.find(id);
+            #[cfg(feature = "lock-telemetry")]
+            let exact = registration.map(|registration| {
+                [
+                    id.owner(),
+                    u64::from(id.key().slot) | ((registration.slot() as u64 + 1) << 32),
+                    id.key().generation,
+                    u64::from(queue.query(id).expect("validated terminal").result)
+                        | ((first as u64) << 32)
+                        | ((id.slot() as u64) << 40),
+                ]
+            });
+            if let Some(registration) = registration {
                 events.detach(registration)?;
             }
             notifications.complete(queue, sleepers, id, &mut notify)?;
             queue.release(id, &mut ram.storage)?;
             progress.released += 1;
+            #[cfg(feature = "lock-telemetry")]
+            if let Some(exact) = exact {
+                if let Some(previous) = progress.effect {
+                    progress.ambiguous |= previous != exact;
+                } else {
+                    progress.effect = Some(exact);
+                }
+            }
         }
     }
     Ok(progress)

@@ -317,6 +317,12 @@ impl Table {
         mark.visited = mark.visited.max(visited);
         self.dispatch.effects |= flag;
     }
+    /// A bounded portion observed more than one distinct effect identity.
+    pub fn effect_ambiguous(&mut self, index: usize) {
+        if let Some(mark) = self.dispatch.exact.get_mut(index) {
+            mark.ambiguous = true;
+        }
+    }
     pub fn actor(
         &mut self,
         progress: crate::locks::actor::Progress,

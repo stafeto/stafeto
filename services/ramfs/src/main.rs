@@ -683,6 +683,13 @@ impl Fs {
                     progress.released as u64,
                 ],
             );
+            #[cfg(feature = "lock-telemetry")]
+            if let Some(effect) = progress.effect {
+                self.telemetry.effect(1, progress.visited, effect);
+                if progress.ambiguous {
+                    self.telemetry.effect_ambiguous(1);
+                }
+            }
             if progress.cancel_actor {
                 self.locks.cancel();
             }
@@ -1659,6 +1666,8 @@ impl Service<0> for Fs {
                             pid_visits += 1;
                             pid_witness[1] = (index + 1) as u64;
                         }
+                        #[cfg(feature = "lock-telemetry")]
+                        let exact_pid = self.locks.telemetry_pid(index);
                         let removed = self
                             .locks
                             .audit_pid(index, |pid| page.is_some_and(|page| page.live(pid)))
@@ -1666,6 +1675,18 @@ impl Service<0> for Fs {
                         #[cfg(feature = "lock-telemetry")]
                         {
                             pid_witness[3] += u64::from(removed);
+                            if removed {
+                                self.telemetry.effect(
+                                    0,
+                                    end - first,
+                                    [
+                                        u64::from(exact_pid.expect("actual removed PID")),
+                                        first as u64 | ((end as u64) << 32),
+                                        index as u64,
+                                        1,
+                                    ],
+                                );
+                            }
                         }
                         #[cfg(not(feature = "lock-telemetry"))]
                         let _ = removed;

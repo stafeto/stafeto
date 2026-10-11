@@ -126,11 +126,18 @@ fn departure_releases_eight_places_after_notify_but_keeps_active_actor_paid() {
     )
     .unwrap();
     assert_eq!(
-        progress,
+        Progress {
+            #[cfg(feature = "lock-telemetry")]
+            effect: None,
+            #[cfg(feature = "lock-telemetry")]
+            ambiguous: false,
+            ..progress
+        },
         Progress {
             visited: 8,
             released: 7,
-            cancel_actor: true
+            cancel_actor: true,
+            ..Progress::default()
         }
     );
     assert_eq!(*events.borrow(), [100, 0, 101, 1]);
@@ -161,11 +168,18 @@ fn departure_releases_eight_places_after_notify_but_keeps_active_actor_paid() {
     )
     .unwrap();
     assert_eq!(
-        last,
+        Progress {
+            #[cfg(feature = "lock-telemetry")]
+            effect: None,
+            #[cfg(feature = "lock-telemetry")]
+            ambiguous: false,
+            ..last
+        },
         Progress {
             visited: 8,
             released: 1,
-            cancel_actor: false
+            cancel_actor: false,
+            ..Progress::default()
         }
     );
     part(
@@ -344,4 +358,46 @@ fn departed_event_is_detached_before_inode_reuse_in_a_different_pool_slot() {
         queue.snapshot(id).unwrap().1,
         crate::locks::wait_receipts::Phase::Ready
     );
+}
+
+#[cfg(feature = "lock-telemetry")]
+#[test]
+fn departure_effect_preserves_canonical_success_and_complete_registration_identity() {
+    let (mut ram, mut queue, mut pool, ids) = fixture();
+    let mut events = inode_events();
+    for id in &ids[..2] {
+        events.attach(&pool, pool.find(*id).unwrap()).unwrap();
+    }
+    let registration = pool.find(ids[0]).unwrap();
+    queue
+        .complete(
+            ids[0],
+            WaitReply {
+                phase: WaitPhase::Complete,
+                result: 0,
+            },
+        )
+        .unwrap();
+    let progress = part(
+        &mut queue,
+        (&mut pool, &mut events),
+        &mut Notifications::<u8>::new(),
+        &mut ram,
+        (0, 77),
+        0,
+        |_| panic!("unarmed"),
+    )
+    .unwrap();
+    let effect = progress.effect.unwrap();
+    assert_eq!(effect[0], ids[0].owner());
+    assert_eq!(
+        effect[1],
+        u64::from(ids[0].key().slot) | ((registration.slot() as u64 + 1) << 32)
+    );
+    assert_eq!(effect[2], ids[0].key().generation);
+    assert_eq!(effect[3] as u32, 0);
+    assert_eq!(effect[3] >> 40, ids[0].slot() as u64);
+    assert!(progress.ambiguous);
+    assert!(queue.query(ids[0]).is_err());
+    assert!(pool.find(ids[0]).is_none());
 }
