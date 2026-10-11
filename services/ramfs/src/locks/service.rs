@@ -41,6 +41,17 @@ impl LockService {
     pub fn busy(&self) -> bool {
         self.actor.busy()
     }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_root(&self, index: usize) -> Option<budget::Counts> {
+        if index >= crate::storage::ROOTS {
+            return None;
+        }
+        self.actor.telemetry_root(index)
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_accounting(&self) -> (budget::Counts, usize, usize) {
+        self.actor.telemetry_accounting()
+    }
     pub fn counts(&self) -> budget::Counts {
         self.actor.counts()
     }

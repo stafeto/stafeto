@@ -214,6 +214,23 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
     pub fn busy(&self) -> bool {
         self.worker.is_some() || self.debt()
     }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_root(&self, index: usize) -> Option<budget::Counts> {
+        if index >= crate::storage::ROOTS {
+            return None;
+        }
+        self.budget
+            .root(index as u16)
+            .filter(|counts| counts.paid() != 0)
+    }
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_accounting(&self) -> (budget::Counts, usize, usize) {
+        (
+            self.budget.totals(),
+            self.budget.common(),
+            self.budget.active(),
+        )
+    }
     pub fn counts(&self) -> budget::Counts {
         self.budget.totals()
     }

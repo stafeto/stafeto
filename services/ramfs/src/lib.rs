@@ -29,6 +29,8 @@ pub mod io;
 #[cfg(test)]
 mod io_tests;
 pub mod job;
+#[cfg(feature = "lock-telemetry")]
+pub mod lock_telemetry;
 pub mod locks;
 pub mod maintenance;
 pub mod metadata;

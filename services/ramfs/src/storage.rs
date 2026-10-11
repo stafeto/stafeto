@@ -1259,6 +1259,17 @@ impl<'a> Storage<'a> {
         });
         Ok(i)
     }
+    /// Measurement-only exact current account, without allocating or retaining it.
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_lock_root(&self, index: usize) -> Option<Root> {
+        self.state
+            .accounts
+            .get(index)
+            .copied()
+            .flatten()
+            .filter(|account| account.lock_refs != 0)
+            .map(|account| account.key)
+    }
     pub fn lock_anchor(&mut self, root: Root) -> Result<LockAnchor, u32> {
         let index = self.account(root)?;
         let account = self.state.accounts[index]

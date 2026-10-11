@@ -61,23 +61,30 @@ const BASE_METHODS: &[u16] = &[
 ];
 #[cfg(not(any(
     feature = "steps",
+    feature = "lock-telemetry",
     feature = "lifetime-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 )))]
 const METHODS: &[u16] = BASE_METHODS;
 #[cfg(any(
     feature = "steps",
+    feature = "lock-telemetry",
     feature = "lifetime-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 ))]
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
+        + cfg!(feature = "lock-telemetry") as usize
         + cfg!(feature = "steps") as usize
         + 4 * cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
         methods[i] = BASE_METHODS[i];
+        i += 1;
+    }
+    if cfg!(feature = "lock-telemetry") {
+        methods[i] = 0xfff1;
         i += 1;
     }
     if cfg!(feature = "steps") {
@@ -150,6 +157,13 @@ struct WaitProofBss(UnsafeCell<core::mem::MaybeUninit<WaitProof>>);
 unsafe impl Sync for WaitProofBss {}
 static WAIT_PROOF: WaitProofBss = WaitProofBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 // The service loop reserves label zero for its heartbeat timer.
+#[cfg(feature = "lock-telemetry")]
+struct TelemetryBss(UnsafeCell<core::mem::MaybeUninit<ramfs::lock_telemetry::Table>>);
+// SAFETY: only the sole service thread initializes and accesses this test table.
+#[cfg(feature = "lock-telemetry")]
+unsafe impl Sync for TelemetryBss {}
+#[cfg(feature = "lock-telemetry")]
+static TELEMETRY: TelemetryBss = TelemetryBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
 const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
 struct RamBss(UnsafeCell<core::mem::MaybeUninit<Ram<'static>>>);
@@ -303,7 +317,17 @@ fn main(_: u64) -> u64 {
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
     let tables = unsafe { &mut *TABLES.0.get() };
+    #[cfg(feature = "lock-telemetry")]
+    // SAFETY: exclusive permanent storage, initialized before any reference.
+    let telemetry = unsafe {
+        let pointer = (*TELEMETRY.0.get()).as_mut_ptr();
+        ramfs::lock_telemetry::Table::initialize_at(pointer);
+        &mut *pointer
+    };
     let mut fs = Fs {
+        #[cfg(feature = "lock-telemetry")]
+        telemetry,
+
         ram,
         locks,
         lock_jobs,
@@ -383,6 +407,8 @@ fn main(_: u64) -> u64 {
 }
 
 struct Fs {
+    #[cfg(feature = "lock-telemetry")]
+    telemetry: &'static mut ramfs::lock_telemetry::Table,
     ram: &'static mut Ram<'static>,
     locks: &'static mut LockService,
     lock_jobs: &'static mut LockQueue,
@@ -1327,6 +1353,8 @@ impl Service<0> for Fs {
 
     /// A never-used clone retains its paid birth until cleanup finishes.
     fn closed(&mut self, label: u64) {
+        #[cfg(feature = "lock-telemetry")]
+        self.telemetry.invalidate_owner(label);
         self.maintenance_burst.restart();
         self.legacy_pending = true;
         #[cfg(feature = "steps")]
@@ -1680,6 +1708,41 @@ impl Service<0> for Fs {
         self.notify_maintenance();
     }
 
+    #[cfg(feature = "lock-telemetry")]
+    fn measured_begin(&mut self) {
+        let before = self.telemetry_occupancy();
+        self.telemetry.begin_dispatch(before);
+    }
+    #[cfg(feature = "lock-telemetry")]
+    fn measured_step(
+        &mut self,
+        sample: rt::service::StepSample,
+        sessions: &[Option<Session<Fds, 0>>],
+    ) {
+        let after = self.telemetry_occupancy();
+        self.telemetry.finish(
+            ramfs::lock_telemetry::Timing {
+                kind: sample.kind,
+                detail: sample.detail,
+                whole: sample.whole,
+                waited: sample.waited,
+                took: sample.took,
+                valid: sample.accounting_valid,
+            },
+            after,
+        );
+        if let Some(scope) = self.telemetry.scope() {
+            let place = scope.place;
+            let valid = sessions
+                .get(place)
+                .and_then(Option::as_ref)
+                .filter(|s| s.label() == scope.owner && s.data.claimed)
+                .is_some_and(|s| self.telemetry_source_live(&s.data, scope.source));
+            if !valid {
+                self.telemetry.invalidate();
+            }
+        }
+    }
     fn between_notifications(&mut self, notice: rt::service::Notice) {
         if notice.source == rt::abi::Source::Unlabeled && notice.label == 0 {
             // The one cursor dispatch and its statistics have ended. An own
@@ -1694,6 +1757,11 @@ impl Service<0> for Fs {
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        #[cfg(feature = "lock-telemetry")]
+        if r.method() == ramfs::lock_telemetry::METHOD {
+            self.telemetry.observer();
+        }
+
         self.maintenance_burst.restart();
         self.legacy_pending = true;
         let first = !s.data.claimed;
@@ -2080,6 +2148,10 @@ impl Service<0> for Fs {
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
+        }
+        #[cfg(feature = "lock-telemetry")]
+        if r.method() == ramfs::lock_telemetry::METHOD {
+            return self.telemetry_request(&s.data, r);
         }
         #[cfg(feature = "lifetime-probe")]
         if r.method() == 0xfff2 {
@@ -2697,6 +2769,177 @@ fn generation(index: usize) -> u64 {
 }
 impl Fs {
     /// FIFO ready selection and prepaid receipt scanning each have their own turn.
+    #[cfg(feature = "lock-telemetry")]
+    fn telemetry_occupancy(&self) -> ramfs::lock_telemetry::Occupancy {
+        let (counts, common, roots) = self.locks.telemetry_accounting();
+        ramfs::lock_telemetry::Occupancy {
+            published: counts.published as u16,
+            private: counts.private as u16,
+            retired: counts.retired as u16,
+            common: common as u16,
+            roots: roots as u8,
+        }
+    }
+    #[cfg(feature = "lock-telemetry")]
+    fn telemetry_source_live(&self, fds: &Fds, source: ramfs::lock_telemetry::Source) -> bool {
+        if fds.departed || fds.binding.snapshot_ref().is_none() {
+            return false;
+        }
+        let description = proto_fs::DataDescription {
+            packed: source.packed,
+            generation: source.generation,
+        };
+        self.ram
+            .live_description(
+                fds,
+                ramfs::TentativeOpen {
+                    fd: description.fd(),
+                    description: ramfs::storage::Token {
+                        slot: description.slot() as u16,
+                        generation: source.generation,
+                    },
+                },
+            )
+            .is_ok()
+    }
+    #[cfg(feature = "lock-telemetry")]
+    fn telemetry_request(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
+        use ramfs::lock_telemetry::{Error, PAGES, ROWS, Scope, Source};
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if proto_fs::is_loaders(r.label()) || fds.binding.snapshot_ref().is_none() {
+            return status(proto_fs::PERMISSION);
+        }
+        let mut body = r.body();
+        let (Ok(action), Ok(nonce), Ok(epoch), Ok(packed), Ok(generation)) =
+            (body.u32(), body.u64(), body.u64(), body.u32(), body.u64())
+        else {
+            return Answer::Status(Status::BadSize);
+        };
+        if nonce == 0
+            || generation == 0
+            || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+        {
+            return status(proto_fs::INVALID_ARGUMENT);
+        }
+        let scope = Scope {
+            place: self.places.place(r.label()),
+            owner: r.label(),
+            nonce,
+            source: Source { packed, generation },
+        };
+        if !self.telemetry_source_live(fds, scope.source) {
+            return status(proto_fs::PERMISSION);
+        }
+        let result: Result<(u64, [u64; 5]), Error> = match action {
+            0 => {
+                let Ok(profile) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let occupancy = self.telemetry_occupancy();
+                self.telemetry
+                    .start(scope, epoch, profile, occupancy)
+                    .map(|new| (new, self.telemetry.header()))
+            }
+            1 => {
+                let (Ok(row), Ok(page)) = (body.u32(), body.u32()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                if row as usize >= ROWS || page >= PAGES {
+                    return status(proto_fs::INVALID_ARGUMENT);
+                }
+                self.telemetry
+                    .authorize(scope, epoch)
+                    .and_then(|()| self.telemetry.page(row as usize, page))
+                    .map(|words| (epoch, words))
+            }
+            4 => {
+                let Ok(first) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                self.telemetry
+                    .authorize_oracle(scope, epoch)
+                    .and_then(|()| {
+                        ramfs::lock_telemetry::census(
+                            first as usize,
+                            ramfs::storage::ROOTS,
+                            |index| {
+                                let root = self.ram.storage.telemetry_lock_root(index)?;
+                                let counts = self.locks.telemetry_root(index)?;
+                                Some(ramfs::lock_telemetry::Payer {
+                                    id: root.id,
+                                    generation: root.generation,
+                                    published: counts.published as u16,
+                                    private: counts.private as u16,
+                                    retired: counts.retired as u16,
+                                })
+                            },
+                        )
+                    })
+                    .map(|words| (epoch, words))
+            }
+            5 => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                self.telemetry.authorize_oracle(scope, epoch).map(|()| {
+                    let counts = self.telemetry_occupancy();
+                    (
+                        epoch,
+                        [
+                            u64::from(counts.published),
+                            u64::from(counts.private),
+                            u64::from(counts.retired),
+                            u64::from(counts.common),
+                            u64::from(counts.roots),
+                        ],
+                    )
+                })
+            }
+            2 | 3 => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let checked = if action == 2 {
+                    self.telemetry.stop(scope, epoch)
+                } else {
+                    self.telemetry.authorize(scope, epoch)
+                };
+                checked.map(|()| (epoch, self.telemetry.header()))
+            }
+            _ => return status(proto_fs::INVALID_ARGUMENT),
+        };
+        let (epoch, words) = match result {
+            Ok(row) => row,
+            Err(Error::Authority) => return status(proto_fs::PERMISSION),
+            Err(Error::Invalid) => return status(proto_fs::INVALID_ARGUMENT),
+            Err(Error::Exhausted) => return status(proto_fs::NO_LOCKS),
+        };
+        let reply = r.reply();
+        let written = (|| {
+            reply.u32(0)?;
+            reply.u64(nonce)?;
+            reply.u64(epoch)?;
+            for word in words {
+                reply.u64(word)?;
+            }
+            Ok::<(), Status>(())
+        })();
+        match written {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(code) => Answer::Status(code),
+        }
+    }
     fn next_wait_ready(&mut self) -> Option<ramfs::locks::wait_receipts::Id> {
         if self.wait_pool.count() == 0 || self.wait_ready_scanned {
             self.wait_ready_scanned = false;

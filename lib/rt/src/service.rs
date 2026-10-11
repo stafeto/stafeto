@@ -26,6 +26,11 @@ use abi::{CLIENT_GONE, Error, INLINE_MAX, MESSAGE_MAX, Rights, Source};
 use proto_init::{Connect, Method, RegisterReply, START_NAMES};
 use proto_wire::{HEADER_LEN, Header, Name, Reader, Status, Writer};
 
+#[cfg(feature = "step-stats")]
+mod sample;
+#[cfg(feature = "step-stats")]
+pub use sample::StepSample;
+
 /// A service: the handlers `run` calls, with K handles and deferred
 /// replies at most in each session.
 pub trait Service<const K: usize> {
@@ -93,6 +98,16 @@ pub trait Service<const K: usize> {
 
     /// A scheduling handoff after a measured notification dispatch has ended.
     /// A service with a queue of own cursor notices may yield to FIFO peers here.
+    /// Measurement-only constant work, before any dispatch handler.
+    #[cfg(feature = "step-stats")]
+    fn measured_begin(&mut self) {}
+
+    /// A complete dispatch sample, after the clock boundary. Must not perform IPC.
+    #[cfg(feature = "step-stats")]
+    fn measured_step(&mut self, sample: StepSample, sessions: &[Option<Session<Self::Data, K>>]) {
+        let _ = (sample, sessions);
+    }
+
     fn between_notifications(&mut self, notice: Notice) {
         let _ = notice;
     }
@@ -414,6 +429,8 @@ pub fn run_in<S: Service<K>, const K: usize>(
         #[cfg(not(feature = "step-stats"))]
         let incoming = sys::receive(channel);
         steps::restart();
+        #[cfg(feature = "step-stats")]
+        service.measured_begin();
         let notice = match incoming {
             Err(e) => return e,
             Ok(Received::Message {
@@ -432,8 +449,19 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 let kind = steps::kind_of(bytes);
                 #[cfg(not(feature = "step-stats"))]
                 let began = steps::begin();
-                request(service, table, config.issued, label, bytes, handles, token);
-                steps::end(began, kind);
+                #[cfg(feature = "step-stats")]
+                {
+                    let sample = sample::finish_after(
+                        || request(service, table, config.issued, label, bytes, handles, token),
+                        || steps::end(began, kind),
+                    );
+                    service.measured_step(sample, table);
+                }
+                #[cfg(not(feature = "step-stats"))]
+                {
+                    request(service, table, config.issued, label, bytes, handles, token);
+                    steps::end(began, kind);
+                }
                 continue;
             }
             Ok(Received::Notification {
@@ -450,36 +478,48 @@ pub fn run_in<S: Service<K>, const K: usize>(
         };
         #[cfg(not(feature = "step-stats"))]
         let began = steps::begin();
-        match (notice.source, notice.label, &mut beat) {
-            (Source::Timer, 0, Some(beat)) => beat.expired(),
-            (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
-                steps::gone();
-                let bits = notice.bits & !CLIENT_GONE;
-                if bits != 0 {
-                    service.notification(Notice { bits, ..notice });
-                }
-                let placed = service.place(label);
-                let found = match placed {
-                    Some(i) => table
-                        .get_mut(i)
-                        .filter(|s| s.as_ref().is_none_or(|s| s.label == label)),
-                    None => table
-                        .iter_mut()
-                        .skip(S::PLACED)
-                        .find(|s| s.as_ref().is_some_and(|s| s.label == label)),
-                };
-                if let Some(slot) = found {
-                    if placed.is_some() && slot.is_none() {
-                        *slot = Some(Session::new(label, S::Data::default(), config.issued));
+        let dispatch = || {
+            match (notice.source, notice.label, &mut beat) {
+                (Source::Timer, 0, Some(beat)) => beat.expired(),
+                (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
+                    steps::gone();
+                    let bits = notice.bits & !CLIENT_GONE;
+                    if bits != 0 {
+                        service.notification(Notice { bits, ..notice });
                     }
-                    depart_session(service, slot);
+                    let placed = service.place(label);
+                    let found = match placed {
+                        Some(i) => table
+                            .get_mut(i)
+                            .filter(|s| s.as_ref().is_none_or(|s| s.label == label)),
+                        None => table
+                            .iter_mut()
+                            .skip(S::PLACED)
+                            .find(|s| s.as_ref().is_some_and(|s| s.label == label)),
+                    };
+                    if let Some(slot) = found {
+                        if placed.is_some() && slot.is_none() {
+                            *slot = Some(Session::new(label, S::Data::default(), config.issued));
+                        }
+                        depart_session(service, slot);
+                    }
+                    service.closed(label);
                 }
-                service.closed(label);
+                _ => service.notification(notice),
             }
-            _ => service.notification(notice),
+            service.maintenance(table, notice);
+        };
+        #[cfg(feature = "step-stats")]
+        {
+            let sample = sample::finish_after(dispatch, || steps::end(began, steps::NOTICE));
+            service.measured_step(sample, table);
         }
-        service.maintenance(table, notice);
-        steps::end(began, steps::NOTICE);
+        #[cfg(not(feature = "step-stats"))]
+        {
+            let mut dispatch = dispatch;
+            dispatch();
+            steps::end(began, steps::NOTICE);
+        }
         service.between_notifications(notice);
     }
 }
@@ -590,11 +630,10 @@ mod steps {
         }
     }
 
-    pub fn end(began: u64, kind: usize) {
+    pub fn end(began: u64, kind: usize) -> super::StepSample {
         let whole = super::time::now().saturating_sub(began);
         let counted = WAITED.swap(0, Ordering::Relaxed);
-        let waited = counted.min(whole);
-        let took = whole - waited;
+
         let kind = if OWNED.swap(false, Ordering::Relaxed) {
             OWN
         } else if DEPARTED.swap(false, Ordering::Relaxed) {
@@ -603,6 +642,8 @@ mod steps {
             kind
         };
         let detail = DETAIL.swap(0, Ordering::Relaxed);
+        let sample = super::StepSample::measured(kind, detail, whole, counted);
+        let (waited, took) = (sample.waited, sample.took);
         if detail == 32 {
             FULL[kind].fetch_max(took, Ordering::Relaxed);
         } else if detail == 16 {
@@ -624,6 +665,7 @@ mod steps {
         if waited > WAITS[kind].fetch_max(waited, Ordering::Relaxed) && printing {
             crate::println!("service wait: {tag} kind {kind} {waited} ticks of {whole}");
         }
+        sample
     }
 }
 

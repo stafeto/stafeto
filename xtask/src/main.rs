@@ -25,6 +25,9 @@ mod lock_fields_tests;
 #[cfg(test)]
 #[path = "../../lib/posix-abi/src/relibc/lifetime.rs"]
 mod owner_lifetime;
+#[cfg(test)]
+#[path = "../../lib/rt/src/service/sample.rs"]
+mod service_sample;
 
 mod disasm;
 mod entropy;
