@@ -630,7 +630,7 @@ fn return_before_leaving(block: &Block, bits: u64) {
 pub(crate) fn route() {
     // While an exec stops the process, the signals of the process wait on
     // the page for the new image's router (spec 2, 3.2 step 1).
-    if STOPPING.load(Ordering::Acquire) != 0 {
+    if STOP.owner() != 0 {
         return;
     }
     let mut pending = process_pending();
@@ -1165,8 +1165,7 @@ pub fn carry_pending(bits: u64) {
 /// address), 0 for none; the channel the stopper waits on; and, by place
 /// of the table of threads, the channel of each parked thread, its own
 /// (0 for a thread that is not parked).
-static STOPPING: AtomicUsize = AtomicUsize::new(0);
-static STOPPER: AtomicU64 = AtomicU64::new(0);
+static STOP: stop_barrier::StopControl = stop_barrier::StopControl::new();
 static PARKING: [AtomicU64; crate::relibc::PLACES] =
     [const { AtomicU64::new(0) }; crate::relibc::PLACES];
 
@@ -1193,14 +1192,22 @@ pub(crate) fn stop_others() -> Result<(), i32> {
     let me = own() as *const Block as usize;
     let channel = sys::channel_create(level.max(1)).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, level.max(1)).map_err(|_| EAGAIN)?;
-    while STOPPING
-        .compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        park();
-        let _ = sys::yield_now();
+    while !STOP.try_begin(me, channel.raw().0) {
+        STOP.wait_for_claim(
+            || {
+                park();
+                let _ = sys::yield_now();
+            },
+            || {
+                let deadline = rt::time::ticks_to_ns(rt::time::now()) + LOOK_AGAIN_NS;
+                sys::timer_set(&timer, deadline).map_err(|_| EAGAIN)?;
+                match sys::receive(&channel) {
+                    Ok(_) | Err(Error::Interrupted) => Ok(()),
+                    Err(_) => Err(EAGAIN),
+                }
+            },
+        )?;
     }
-    STOPPER.store(channel.raw().0, Ordering::Release);
     let mut asked = 0u64;
     loop {
         let mut waiting = false;
@@ -1282,8 +1289,7 @@ pub(crate) fn stop_others() -> Result<(), i32> {
 /// The child's only thread, once its block has its handles
 /// (crate::threads::after_fork).
 pub(crate) unsafe fn after_fork() -> Result<(), i32> {
-    STOPPING.store(0, Ordering::Release);
-    STOPPER.store(0, Ordering::Release);
+    STOP.reset_after_fork();
     RETURNING.store(0, Ordering::Release);
     for place in &PARKING {
         place.store(0, Ordering::Relaxed);
@@ -1308,22 +1314,22 @@ pub(crate) fn resume_others() {
     // Only the stopper ends its stop: a caller whose stop never began
     // leaves another's as it is.
     let me = own() as *const Block as usize;
-    if STOPPING
-        .compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    for place in &PARKING {
-        let raw = place.swap(0, Ordering::AcqRel);
-        if raw != 0 {
-            let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(raw)), 1);
-        }
-    }
-    let stopper = STOPPER.swap(0, Ordering::AcqRel);
-    if stopper != 0 {
-        drop(Handle::<Channel>::from_raw(rt::abi::Handle(stopper)));
-    }
+    STOP.release(
+        me,
+        || {
+            for place in &PARKING {
+                let raw = place.swap(0, Ordering::AcqRel);
+                if raw != 0 {
+                    let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(raw)), 1);
+                }
+            }
+        },
+        |stopper| {
+            if stopper != 0 {
+                drop(Handle::<Channel>::from_raw(rt::abi::Handle(stopper)));
+            }
+        },
+    );
 }
 
 /// Parks the calling thread while another thread stops the process for
@@ -1348,14 +1354,14 @@ fn park() {
         place.store(raw, Ordering::SeqCst);
         #[cfg(feature = "thread-probe")]
         native_stop_probe::park(block, raw);
-        if STOPPING.load(Ordering::SeqCst) == 0 {
+        if STOP.owner() == 0 {
             break;
         }
-        let stopper = STOPPER.load(Ordering::Acquire);
+        let stopper = STOP.channel();
         if stopper != 0 {
             let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(stopper)), 1);
         }
-        while place.load(Ordering::SeqCst) == raw && STOPPING.load(Ordering::SeqCst) != 0 {
+        while place.load(Ordering::SeqCst) == raw && STOP.owner() != 0 {
             if sys::receive(&channel).is_err() {
                 let _ = sys::yield_now();
             }
@@ -1367,7 +1373,7 @@ fn park() {
 /// Whether the calling thread is to park: another thread stops the
 /// process for an exec.
 fn stopped_by_other() -> bool {
-    let stopping = STOPPING.load(Ordering::Acquire);
+    let stopping = STOP.owner();
     stop_barrier::must_park(stopping, own() as *const Block as usize)
 }
 

@@ -128,3 +128,141 @@ fn external_defer_receive_interrupt_does_not_release_stopper() {
     let before_commit = closure_progress.get();
     assert_eq!(closure_progress.get(), before_commit);
 }
+
+#[test]
+fn release_keeps_new_stopper_out_until_wakes_and_close_finish() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    assert!(barrier::must_park(stop.owner(), 11));
+    let woke = Cell::new(false);
+    let closed = Cell::new(0);
+    assert!(stop.release(
+        7,
+        || {
+            assert!(!barrier::must_park(stop.owner(), 11));
+            assert!(
+                !stop.try_begin(11, 202),
+                "new stop waits for every peer wake"
+            );
+            assert_eq!(stop.channel(), 101);
+            woke.set(true);
+        },
+        |channel| {
+            assert!(woke.get());
+            assert_eq!(channel, 101, "close belongs to the releasing owner");
+            assert!(!barrier::must_park(stop.owner(), 11));
+            assert!(!stop.try_begin(11, 202), "new stop waits for channel close");
+            closed.set(channel);
+        },
+    ));
+    assert_eq!(closed.get(), 101);
+    assert!(stop.try_begin(11, 202));
+    assert_eq!(stop.owner(), 11);
+    assert_eq!(stop.channel(), 202);
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}
+
+#[test]
+fn interleaved_release_cannot_close_the_next_stoppers_channel() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    let claimed_during_wake = Cell::new(false);
+    assert!(stop.release(
+        7,
+        || claimed_during_wake.set(stop.try_begin(11, 202)),
+        |channel| assert_eq!(channel, 101, "release must close its own channel"),
+    ));
+    assert!(!claimed_during_wake.get());
+    assert!(stop.try_begin(11, 202));
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}
+
+#[test]
+fn failed_contender_cannot_release_another_stop_or_its_channel() {
+    let stop = barrier::StopControl::new();
+    assert!(!stop.try_begin(0, 101));
+    assert!(!stop.try_begin(7, 0));
+    assert!(stop.try_begin(7, 101));
+    assert!(!stop.try_begin(11, 202));
+    assert!(!stop.release(
+        11,
+        || panic!("foreign peer wake"),
+        |_| panic!("foreign close")
+    ));
+    assert_eq!(stop.owner(), 7);
+    assert_eq!(stop.channel(), 101);
+    assert!(stop.release(7, || {}, |channel| assert_eq!(channel, 101)));
+    assert!(!stop.release(
+        7,
+        || panic!("duplicate wake"),
+        |_| panic!("duplicate close")
+    ));
+}
+
+#[test]
+fn child_discards_parent_lifecycle_and_accepts_its_own_stop() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    stop.reset_after_fork();
+    assert_eq!(stop.owner(), 0);
+    assert_eq!(stop.channel(), 0);
+    assert!(stop.try_begin(11, 202));
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}
+
+#[test]
+fn cleanup_contender_sleeps_so_lower_priority_owner_can_finish() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    let slept = Cell::new(false);
+    let lower_owner_finished = Cell::new(false);
+    assert!(stop.release(
+        7,
+        || {
+            assert!(!stop.try_begin(11, 202));
+            stop.wait_for_claim(
+                || panic!("cleanup has no active owner to park behind"),
+                || {
+                    slept.set(true);
+                    Ok::<(), i32>(())
+                },
+            )
+            .unwrap();
+        },
+        |channel| {
+            // A higher-priority contender must relinquish its runnable turn.
+            assert!(slept.get(), "cleanup contention requires a blocking wait");
+            assert_eq!(channel, 101);
+            lower_owner_finished.set(true);
+        },
+    ));
+    assert!(lower_owner_finished.get());
+    assert!(stop.try_begin(11, 202));
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}
+
+#[test]
+fn claim_wait_parks_active_stop_and_preserves_cleanup_wait_errors() {
+    let stop = barrier::StopControl::new();
+    assert!(stop.try_begin(7, 101));
+    let parked = Cell::new(false);
+    stop.wait_for_claim(
+        || parked.set(true),
+        || panic!("active stop uses its ordinary park"),
+    )
+    .unwrap_or_else(|_: i32| panic!("park does not fail"));
+    assert!(parked.get());
+    assert!(stop.release(
+        7,
+        || {
+            assert_eq!(
+                stop.wait_for_claim(|| panic!("cleanup park"), || Err(11)),
+                Err(11),
+            );
+            assert!(!stop.try_begin(11, 202));
+        },
+        |channel| assert_eq!(channel, 101),
+    ));
+    assert!(stop.try_begin(11, 202));
+    assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
+}

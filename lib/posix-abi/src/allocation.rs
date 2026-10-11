@@ -245,10 +245,17 @@ fn grow(state: &mut State, needed: usize, alignment: usize) -> Result<(), Error>
 /// lock held by a thread that waits in the kernel outside the layer's
 /// sections).
 static PROBE_SLEEP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PROBE_SLEEP_ENTERED: AtomicBool = AtomicBool::new(false);
 
 /// The next `map_pages` sleeps `ns` nanoseconds first, for the probes.
 pub fn probe_sleep_next(ns: u64) {
+    PROBE_SLEEP_ENTERED.store(false, Ordering::Release);
     PROBE_SLEEP.store(ns, Ordering::Release);
+}
+
+/// Whether an actual mapping consumed the armed allocator sleep probe.
+pub fn probe_sleep_entered() -> bool {
+    PROBE_SLEEP_ENTERED.load(Ordering::Acquire)
 }
 
 /// Whether heap ownership was published by startup.
@@ -293,6 +300,7 @@ pub(crate) unsafe fn try_unmap_pages(pointer: NonNull<u8>, size: usize) -> bool 
 pub fn map_pages(size: usize) -> Result<NonNull<u8>, i32> {
     let ns = PROBE_SLEEP.swap(0, Ordering::AcqRel);
     if ns != 0 {
+        PROBE_SLEEP_ENTERED.store(true, Ordering::Release);
         crate::threads::sleep::probe_pause(ns);
     }
     let pointer = heap(|state| {

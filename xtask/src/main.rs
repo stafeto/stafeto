@@ -35,6 +35,9 @@ mod image;
 mod jobs;
 mod measure;
 mod native_scopes;
+#[cfg(test)]
+#[path = "../../lib/posix-thread/tests/native_stop_barrier.rs"]
+mod native_stop_barrier_tests;
 mod ostest;
 mod qemu;
 mod ring;
@@ -1255,7 +1258,7 @@ commands:
   posix-lock-queue-core measure 64 genuine waits together with 64 held regions
   posix-lock-core measure public locks at the full inode64 limit
   posix-lock-lifecycle-rules verify the five L2-L6 lock lifecycle rules
-  posix-procs run the C probe of POSIX processes: posix_spawn from the
+  posix-procs [--repeat N] run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
   loader-channels verify ordinary loader channel provenance and descriptor transfer
@@ -1296,6 +1299,10 @@ commands:
   help      this text";
 
 fn main() {
+    if let Err(error) = workspace_root() {
+        eprintln!("xtask: {error}");
+        std::process::exit(1);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("build") => build(Variant::Normal).map(|_| ()),
@@ -1382,7 +1389,9 @@ fn main() {
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-spawn-churn") => posix_spawn_churn_probe(&qemu::VIRT),
-        Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("posix-procs") => {
+            posix_procs_count(&args[1..]).and_then(|count| posix_procs_repeat(&qemu::VIRT, count))
+        }
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
         Some("posix-lock-lifecycle-rules") => {
             posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Rules)
@@ -1466,11 +1475,31 @@ fn main() {
     }
 }
 
+fn workspace_root_from(directory: &Path) -> Result<PathBuf, String> {
+    directory
+        .ancestors()
+        .find(|path| {
+            ["Cargo.toml", "xtask/Cargo.toml", "tools/build-relibc.py"]
+                .iter()
+                .all(|marker| path.join(marker).is_file())
+        })
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            format!(
+                "{} is outside a stafeto source workspace",
+                directory.display()
+            )
+        })
+}
+
+fn workspace_root() -> Result<PathBuf, String> {
+    let directory =
+        std::env::current_dir().map_err(|error| format!("current directory: {error}"))?;
+    workspace_root_from(&directory)
+}
+
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask lives in the workspace")
-        .to_path_buf()
+    workspace_root().expect("xtask requires a current stafeto source workspace")
 }
 
 /// Where cargo writes its builds: CARGO_TARGET_DIR when it is set, else
@@ -3583,13 +3612,95 @@ fn posix_spawn_churn_probe(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
+fn posix_procs_count(args: &[String]) -> Result<usize, String> {
+    match args {
+        [] => Ok(1),
+        [flag, count] if flag == "--repeat" => count
+            .parse::<usize>()
+            .ok()
+            .filter(|count| (1..=50).contains(count))
+            .ok_or_else(|| "posix-procs --repeat expects 1..50".into()),
+        _ => Err("usage: posix-procs [--repeat N]".into()),
+    }
+}
+
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
+    posix_procs_repeat(machine, 1)
+}
+
+fn process_repeat_each(
+    count: usize,
+    mut run: impl FnMut(usize) -> Result<(), String>,
+) -> Result<(), String> {
+    for iteration in 1..=count {
+        run(iteration).map_err(|error| format!("posix-procs run {iteration}/{count}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn posix_procs_repeat(machine: &qemu::Machine, count: usize) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-posix-procs.img", &POSIX_NAMES_PROGRAMS, BOOT_PROFILE)?;
-    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    let directory = if count > 1 {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "stafeto-posix-procs-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).map_err(|error| error.to_string())?;
+        println!("posix-procs repeated console logs: {}", path.display());
+        Some(path)
+    } else {
+        None
+    };
+    process_repeat_each(count, |iteration| {
+        let started = std::time::Instant::now();
+        let (outcome, ended) = match posix_procs_prebuilt(machine, &kernel, &image) {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(directory) = &directory {
+                    let path = directory.join(format!("run-{iteration:02}.log"));
+                    std::fs::write(
+                        &path,
+                        format!("runner: iteration={iteration}/{count} seconds={:.3} QEMU start failed: {error}\n", started.elapsed().as_secs_f64()),
+                    ).map_err(|write_error| format!("{}: {write_error}", path.display()))?;
+                }
+                return Err(error);
+            }
+        };
+        let verdict = ended.and_then(|()| posix_procs_verdict(&outcome));
+        let seconds = started.elapsed().as_secs_f64();
+        if let Some(directory) = &directory {
+            let path = directory.join(format!("run-{iteration:02}.log"));
+            let mut text = outcome.lines.join("\n");
+            text.push_str(&format!("\nrunner: iteration={iteration}/{count} seconds={seconds:.3} qemu_status={:?} verdict={verdict:?}\n", outcome.status));
+            std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+        let last = outcome
+            .lines
+            .iter()
+            .rev()
+            .find(|line| line.contains("fork trace") || line.starts_with("posix-procs: stage"));
+        println!(
+            "posix-procs run {iteration}/{count}: {seconds:.3}s, QEMU {:?}, last stage {last:?}, {verdict:?}",
+            outcome.status
+        );
+        verdict
+    })
+}
+
+fn posix_procs_prebuilt(
+    machine: &qemu::Machine,
+    kernel: &Artifacts,
+    image: &Path,
+) -> Result<(qemu::Outcome, Result<(), String>), String> {
+    let mut cmd = qemu::command(machine, &kernel.image, Some(image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
     // The probe is the table's only record: its end is init's line, and
@@ -3612,13 +3723,16 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         });
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
-    ended?;
-    qemu::expect_marker(&outcome, "posix-procs: names ok")?;
-    qemu::expect_marker(&outcome, "posix-procs: the names of posix_spawn ok")?;
-    qemu::expect_marker(&outcome, "posix-procs: dup3 with O_CLOFORK across fork ok")?;
-    qemu::expect_marker(&outcome, "posix-procs: ok")?;
-    qemu::expect_marker(&outcome, "posix-procs: the last image ran")?;
-    qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
+    Ok((outcome, ended))
+}
+
+fn posix_procs_verdict(outcome: &qemu::Outcome) -> Result<(), String> {
+    qemu::expect_marker(outcome, "posix-procs: names ok")?;
+    qemu::expect_marker(outcome, "posix-procs: the names of posix_spawn ok")?;
+    qemu::expect_marker(outcome, "posix-procs: dup3 with O_CLOFORK across fork ok")?;
+    qemu::expect_marker(outcome, "posix-procs: ok")?;
+    qemu::expect_marker(outcome, "posix-procs: the last image ran")?;
+    qemu::expect_marker(outcome, "posix-procs: orphan saw ppid 1")?;
     // The first goal of 5c: /bin/ls from a file lists the complete /etc
     // directory from both a spawn and an exec.
     let listings = outcome
@@ -3694,7 +3808,7 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: ash -c ran ls | cat",
         "posix-procs: pipes across spawn and exec",
     ] {
-        qemu::expect_marker(&outcome, marker)?;
+        qemu::expect_marker(outcome, marker)?;
     }
     let number = |prefix: &str| -> Result<Vec<i64>, String> {
         let line = outcome
@@ -8718,5 +8832,104 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert!(found.is_empty(), "a test deadline in {found:?}");
+    }
+}
+
+#[cfg(test)]
+mod process_repeat_tests {
+    use super::*;
+
+    #[test]
+    fn counts_are_bounded_and_default_is_one() {
+        assert_eq!(posix_procs_count(&[]).unwrap(), 1);
+        for count in ["0", "51", "-1", "x"] {
+            assert!(posix_procs_count(&["--repeat".into(), count.into()]).is_err());
+        }
+        assert_eq!(
+            posix_procs_count(&["--repeat".into(), "50".into()]).unwrap(),
+            50
+        );
+        assert!(posix_procs_count(&["--repeat".into()]).is_err());
+    }
+
+    #[test]
+    fn a_later_run_still_requires_the_full_guest_verdict() {
+        let missing = qemu::Outcome {
+            lines: vec!["init: posix-procs ended: exit code 42, not restarted".into()],
+            status: None,
+            timed_out: false,
+            stopped_on_marker: false,
+        };
+        let mut visited = Vec::new();
+        let result = process_repeat_each(4, |iteration| {
+            visited.push(iteration);
+            if iteration == 1 {
+                Ok(())
+            } else {
+                posix_procs_verdict(&missing)
+            }
+        });
+        let error = result.unwrap_err();
+        assert_eq!(visited, [1, 2]);
+        assert!(error.contains("run 2/4"), "{error}");
+        assert!(error.contains("posix-procs: names ok"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod workspace_root_tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "stafeto-xtask-roots-{}-{stamp}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+        fn checkout(&self, name: &str) -> PathBuf {
+            let root = self.0.join(name);
+            for marker in ["Cargo.toml", "xtask/Cargo.toml", "tools/build-relibc.py"] {
+                let path = root.join(marker);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "source marker\n").unwrap();
+            }
+            root
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resolves_the_current_checkout_beside_another_origin() {
+        let fixture = Fixture::new();
+        let origin = fixture.checkout("compiled-a");
+        let current = fixture.checkout("current-b");
+        let nested = current.join("tests/probe/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(workspace_root_from(&nested).unwrap(), current);
+        assert_eq!(workspace_root_from(&origin).unwrap(), origin);
+        assert_ne!(workspace_root_from(&nested).unwrap(), origin);
+    }
+
+    #[test]
+    fn rejects_outside_or_incomplete_source_markers() {
+        let fixture = Fixture::new();
+        assert!(workspace_root_from(&fixture.0).is_err());
+        let partial = fixture.0.join("partial");
+        std::fs::create_dir_all(partial.join("xtask")).unwrap();
+        std::fs::write(partial.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(partial.join("xtask/Cargo.toml"), "[package]\n").unwrap();
+        assert!(workspace_root_from(&partial).is_err());
     }
 }

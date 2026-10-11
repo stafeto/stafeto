@@ -946,6 +946,12 @@ pub extern "C" fn stafeto_probe_mmap_sleep(us: u64) {
     posix_abi::allocation::probe_sleep_next(us.saturating_mul(1000));
 }
 
+/// An actual mapping consumed the allocator sleep probe.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_mmap_sleep_entered() -> c_int {
+    i32::from(posix_abi::allocation::probe_sleep_entered())
+}
+
 /// How many threads the process's table holds
 /// (posix_abi::fork::probe_threads).
 #[unsafe(no_mangle)]
