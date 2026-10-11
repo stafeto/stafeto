@@ -32,6 +32,7 @@ lock-probe = []
 wait-probe = []
 
 [dependencies]
+posix-fd = { path = "../posix-fd" }
 posix-types = { path = "../posix-types" }
 posix-fs = { path = "../posix-fs" }
 posix-change = { path = "../posix-change" }

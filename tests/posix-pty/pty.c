@@ -75,6 +75,20 @@ static int wait_ok(pid_t pid) {
     return 0;
 }
 
+static int getter_paths(int fd) {
+    struct termios direct, generic;
+    CHECK(tcgetattr(fd, &direct) == 0 && ioctl(fd, TCGETS, &generic) == 0);
+    CHECK(direct.c_iflag == generic.c_iflag && direct.c_oflag == generic.c_oflag);
+    CHECK(direct.c_cflag == generic.c_cflag && direct.c_lflag == generic.c_lflag);
+    CHECK(direct.c_line == 0 && generic.c_line == 0);
+    CHECK(memcmp(direct.c_cc, generic.c_cc, NCCS) == 0);
+    CHECK(cfgetispeed(&direct) == cfgetispeed(&generic));
+    CHECK(cfgetospeed(&direct) == cfgetospeed(&generic));
+    errno = 0; CHECK(tcgetattr(fd, NULL) == -1 && errno == EFAULT);
+    errno = 0; CHECK(ioctl(fd, TCGETS, NULL) == -1 && errno == EFAULT);
+    return 0;
+}
+
 static int names_grants(void) {
     struct pair p;
     p.master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
@@ -92,6 +106,18 @@ static int names_grants(void) {
     CHECK(grantpt(p.master) == 0);
     CHECK(seteuid(0) == 0 && fstat(p.slave, &st) == 0 && st.st_uid == 0);
     CHECK((st.st_mode & 0777) == 0620);
+    CHECK(getter_paths(p.master) == 0 && getter_paths(p.slave) == 0);
+    struct termios saved, changed;
+    CHECK(tcgetattr(p.slave, &saved) == 0);
+    changed = saved;
+    changed.c_cc[VMIN] = 7;
+    CHECK(cfsetispeed(&changed, B9600) == 0);
+    CHECK(tcsetattr(p.slave, TCSANOW, &changed) == 0);
+    CHECK(getter_paths(p.master) == 0 && getter_paths(p.slave) == 0);
+    struct termios observed;
+    CHECK(tcgetattr(p.slave, &observed) == 0 && observed.c_cc[VMIN] == 7);
+    CHECK(cfgetispeed(&observed) == B9600);
+    CHECK(tcsetattr(p.slave, TCSANOW, &saved) == 0);
     errno = 0; CHECK(grantpt(-1) == -1 && errno == EBADF);
     int pipefd[2]; CHECK(pipe(pipefd) == 0);
     errno = 0; CHECK(grantpt(pipefd[0]) == -1 && errno == EINVAL);

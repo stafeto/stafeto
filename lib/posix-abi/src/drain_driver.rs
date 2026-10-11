@@ -29,6 +29,12 @@ impl crate::long::Custody for Record {
 
 /// The C boundary keeps its Point outside this resident resource owner.
 pub(crate) fn operation(fd: u32) -> Result<(), i32> {
+    static HOOKS: crate::drain_hooks::Hooks = crate::drain_hooks::Hooks {
+        detach,
+        help,
+        collect: |owner, frame| collect(Some(owner), frame, None, true),
+    };
+    crate::drain_hooks::register(&HOOKS);
     let block = crate::threads::own_block();
     let _outer = crate::long::OuterRestart::enter(&block.flags);
     let owner = OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)?;

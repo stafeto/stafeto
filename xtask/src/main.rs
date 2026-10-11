@@ -10,6 +10,9 @@ mod out;
 mod change_release_reply_tests;
 mod coverage;
 #[cfg(test)]
+#[path = "../../lib/posix-abi/src/drain_hooks.rs"]
+mod drain_hooks;
+#[cfg(test)]
 #[path = "../../tests/posix-threads/src/futex_deadline.rs"]
 mod futex_deadline;
 #[cfg(test)]

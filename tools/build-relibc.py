@@ -21,9 +21,9 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-# Published fork topic codex/drain-longjmp-custody, tagged pin-a57b328.
+# Published fork topic codex/tcgetattr-direct, tagged pin-e1e52d9.
 # The checked topic is independent of the fork's stafeto merge branch.
-COMMIT = "a57b328debc84cfaf8b08804d71b32f8be783fd0"
+COMMIT = "e1e52d9e8ed54bc5ddce869d886943816c9cd233"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
