@@ -147,13 +147,16 @@ static int dup_budget(int controller, uint64_t epoch, unsigned published, unsign
     return 0;
 }
 static int dup_before(int witness, const struct record records[20]) {
-    struct stat a, b;
-    if (dup_phase('S', &dup_initial) || fstat(witness, &a) || fstat(dup_foreign_b, &b)
+    struct stat a, b; uint64_t foreign_a[2], foreign_b[2];
+    if (full_source((unsigned)witness, foreign_a) || full_source((unsigned)dup_foreign_b, foreign_b)
+        || dup_phase('S', &dup_initial) || fstat(witness, &a) || fstat(dup_foreign_b, &b)
         || (uint64_t)a.st_ino != records[0].inode || (uint64_t)b.st_ino != records[1].inode
         || dup_initial.a_inode != records[0].inode || dup_initial.b_inode != records[1].inode
         || dup_initial.a_inode == dup_initial.b_inode
         || dup_initial.before[2] != records[0].source[0] || dup_initial.before[3] != records[0].source[1]
-        || dup_initial.before[6] == 0 || dup_initial.before[7] == 0)
+        || dup_initial.before[6] == 0 || dup_initial.before[7] == 0
+        || (foreign_a[0] == dup_initial.before[2] && foreign_a[1] == dup_initial.before[3])
+        || (foreign_b[0] == dup_initial.before[6] && foreign_b[1] == dup_initial.before[7]))
         return fail("replacement exact A/B before Begin", 0);
     dup_expected_pid = records[0].pid;
     return 0;
