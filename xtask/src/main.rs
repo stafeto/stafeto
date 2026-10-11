@@ -2968,10 +2968,19 @@ fn loader_channels_probe() -> Result<(), String> {
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
-    let ended = run.expect_seen(
-        "init: posix-procs ended: exit code 0, not restarted",
-        BOOT_TIMEOUT,
-    );
+    let deadline = std::time::Instant::now() + BOOT_TIMEOUT;
+    let ended = (|| {
+        run.expect_seen(
+            "init: posix-procs ended: exit code 0, not restarted",
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )?;
+        // Init's debug exit can precede output already queued through TTY.
+        // Search all collected lines so either arrival order is valid.
+        run.expect_seen(
+            "loader-channels: ok (spawn exec fork, RAM/Clock 48, inherited offsets, closed endpoints)",
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )
+    })();
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;
