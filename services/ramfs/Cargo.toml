@@ -34,6 +34,7 @@ abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 proto-clock = { path = "../../proto/clock" }
 proto-fs = { path = "../../proto/fs" }
+proto-pipe = { path = "../../proto/pipe" }
 proto-init = { path = "../../proto/init" }
 proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }

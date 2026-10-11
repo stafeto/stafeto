@@ -210,6 +210,7 @@ impl PosixFs {
     pub fn mark_jump(&mut self, owner: OwnerToken, target: Frame) {
         self.mark_control_jump(owner, target);
         self.mark_wait_jump(owner, target);
+        self.mark_fifo_io_jump(owner, target);
     }
     /// Mark only frames left by the jump. The caller holds the descriptor lock
     /// and defers entry delivery; this transition performs no remote cleanup.

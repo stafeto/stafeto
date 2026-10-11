@@ -14,6 +14,12 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod admissions;
+pub mod named;
+pub mod watches;
+pub use named::NamedInode;
+use proto_pipe::{Endpoint, NAMED_END, NAMED_MAX};
+
 pub use proto_pipe::{
     AGAIN, ATOMIC, BAD_FD, BROKEN, CAPACITY, CREATED_MAX, HELD_MAX, INVALID, MFILE, NFILE,
     NONBLOCK, PIPES, WAITERS, WRITE_END,
@@ -29,15 +35,21 @@ pub type Waiter = (u64, u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Held {
     bits: u128,
+    named: u128,
 }
 
 impl Held {
     pub fn holds(&self, description: u32) -> bool {
-        (description as usize) < DESCRIPTIONS && self.bits & 1 << description != 0
+        if description & NAMED_END != 0 {
+            let slot = (description & !NAMED_END) as usize;
+            slot < NAMED_MAX && self.named & 1 << slot != 0
+        } else {
+            (description as usize) < DESCRIPTIONS && self.bits & 1 << description != 0
+        }
     }
 
     pub fn count(&self) -> usize {
-        self.bits.count_ones() as usize
+        (self.bits.count_ones() + self.named.count_ones()) as usize
     }
 
     /// The exact subset of live descriptions this session already holds.
@@ -48,7 +60,7 @@ impl Held {
             if !self.holds(description) {
                 return Err(BAD_FD);
             }
-            selected.bits |= 1u128 << description;
+            selected.add(description as usize);
         }
         Ok(selected)
     }
@@ -56,22 +68,39 @@ impl Held {
     /// Each held end once. Original watch items retain their individual masks.
     pub fn descriptions(self) -> impl Iterator<Item = u32> {
         let mut bits = self.bits;
-        core::iter::from_fn(move || {
+        let anonymous = core::iter::from_fn(move || {
             if bits == 0 {
                 return None;
             }
             let description = bits.trailing_zeros();
             bits &= bits - 1;
             Some(description)
-        })
+        });
+        let mut named = self.named;
+        anonymous.chain(core::iter::from_fn(move || {
+            if named == 0 {
+                return None;
+            }
+            let slot = named.trailing_zeros();
+            named &= named - 1;
+            Some(NAMED_END | slot)
+        }))
     }
 
     fn add(&mut self, description: usize) {
-        self.bits |= 1 << description;
+        if description & NAMED_END as usize != 0 {
+            self.named |= 1 << (description & !(NAMED_END as usize));
+        } else {
+            self.bits |= 1 << description;
+        }
     }
 
     fn remove(&mut self, description: usize) {
-        self.bits &= !(1 << description);
+        if description & NAMED_END as usize != 0 {
+            self.named &= !(1 << (description & !(NAMED_END as usize)));
+        } else {
+            self.bits &= !(1 << description);
+        }
     }
 }
 
@@ -108,6 +137,8 @@ struct Pipe {
     head: u16,
     len: u16,
     ends: [End; 2],
+    named: Option<NamedInode>,
+    grants: u16,
 }
 
 impl End {
@@ -174,6 +205,8 @@ impl Pipe {
         head: 0,
         len: 0,
         ends: [End::NONE; 2],
+        named: None,
+        grants: 0,
     };
 }
 
@@ -187,6 +220,9 @@ pub struct Pipes {
     /// one description at a time.
     dropping: [u16; DESCRIPTIONS],
     dirty: u128,
+    named_descriptions: [named::Description; NAMED_MAX],
+    named_dropping: [u16; NAMED_MAX],
+    named_dirty: u128,
 }
 
 /// The pipe and the end of `description`, a held one of the kind asked.
@@ -214,6 +250,9 @@ impl Pipes {
             rings: [[0; CAPACITY]; PIPES],
             dropping: [0; DESCRIPTIONS],
             dirty: 0,
+            named_descriptions: [named::Description::FREE; NAMED_MAX],
+            named_dropping: [0; NAMED_MAX],
+            named_dirty: 0,
         }
     }
 
@@ -255,6 +294,8 @@ impl Pipes {
             head: 0,
             len: 0,
             ends: [end; 2],
+            named: None,
+            grants: 0,
         };
         held.add(2 * index);
         held.add(2 * index + 1);
@@ -273,12 +314,23 @@ impl Pipes {
         wakes: &mut Wakes,
     ) -> Result<Option<usize>, u32> {
         let (index, end) = split(held, description, Some(false))?;
+        self.read_at(index, end, self.pipes[index].ends[end].nonblock, out, wakes)
+    }
+
+    fn read_at(
+        &mut self,
+        index: usize,
+        _end: usize,
+        nonblock: bool,
+        out: &mut [u8],
+        wakes: &mut Wakes,
+    ) -> Result<Option<usize>, u32> {
         let pipe = &mut self.pipes[index];
         if pipe.len == 0 {
             if pipe.ends[1].refs == 0 {
                 return Ok(Some(0));
             }
-            if pipe.ends[end].nonblock {
+            if nonblock {
                 return Err(AGAIN);
             }
             return Ok(None);
@@ -307,6 +359,23 @@ impl Pipes {
         wakes: &mut Wakes,
     ) -> Result<Option<usize>, u32> {
         let (index, end) = split(held, description, Some(true))?;
+        self.write_at(
+            index,
+            end,
+            self.pipes[index].ends[end].nonblock,
+            bytes,
+            wakes,
+        )
+    }
+
+    fn write_at(
+        &mut self,
+        index: usize,
+        _end: usize,
+        nonblock: bool,
+        bytes: &[u8],
+        wakes: &mut Wakes,
+    ) -> Result<Option<usize>, u32> {
         let pipe = &mut self.pipes[index];
         if pipe.ends[0].refs == 0 {
             return Err(BROKEN);
@@ -318,7 +387,7 @@ impl Pipes {
             room.min(bytes.len())
         };
         if n == 0 && !bytes.is_empty() {
-            if pipe.ends[end].nonblock {
+            if nonblock {
                 return Err(AGAIN);
             }
             return Ok(None);
@@ -379,6 +448,11 @@ impl Pipes {
         let Ok((index, end)) = split(held, description, None) else {
             return watch::NVAL;
         };
+        self.readiness_at(index, end)
+    }
+
+    fn readiness_at(&self, index: usize, end: usize) -> u32 {
+        use proto_wire::watch;
         let pipe = &self.pipes[index];
         if end == 0 {
             let closed = pipe.ends[1].refs == 0;
@@ -438,6 +512,7 @@ impl Pipes {
         end.check();
         wakes.list = pipe.ends[!is_write as usize].waiters;
         if pipe.ends.iter().all(|e| e.refs == 0)
+            && pipe.grants == 0
             && self.dropping[2 * index] == 0
             && self.dropping[2 * index + 1] == 0
         {
@@ -455,21 +530,29 @@ impl Pipes {
             self.dropping[d] += 1;
             self.dirty |= 1 << d;
         }
+        let mut named = held.named;
+        while named != 0 {
+            let slot = named.trailing_zeros() as usize;
+            named &= named - 1;
+            self.named_dropping[slot] += 1;
+            self.named_dirty |= 1 << slot;
+        }
         held.bits = 0;
-        self.dirty != 0
+        held.named = 0;
+        self.dirty != 0 || self.named_dirty != 0
     }
 
     /// One description that sessions which went let go of: its references
     /// go (`unref`). Whether another step is due.
     pub fn step(&mut self, wakes: &mut Wakes) -> bool {
         if self.dirty == 0 {
-            return false;
+            return self.named_step(wakes);
         }
         let d = self.dirty.trailing_zeros() as usize;
         self.dirty &= !(1 << d);
         let count = core::mem::take(&mut self.dropping[d]);
         self.unref(d, count, wakes);
-        self.dirty != 0
+        self.dirty != 0 || self.named_dirty != 0
     }
 
     /// Clone: a new session's holding of the descriptions `list` of

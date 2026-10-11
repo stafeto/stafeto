@@ -52,6 +52,7 @@ pub enum ChangeOp {
     Access = 10,
     StatVfs = 11,
     Path = 12,
+    Mkfifo = 13,
 }
 impl ChangeOp {
     pub fn from_number(number: u32) -> Option<Self> {
@@ -68,6 +69,7 @@ impl ChangeOp {
             10 => Self::Access,
             11 => Self::StatVfs,
             12 => Self::Path,
+            13 => Self::Mkfifo,
             _ => return None,
         })
     }
@@ -162,7 +164,9 @@ impl ChangeStart<'_> {
         }
         let a = self.args;
         let valid = match self.op {
-            ChangeOp::Mkdir => a[0] <= MODE_MASK && a[1] <= 0o777 && a[2] == 0 && a[3] == 0,
+            ChangeOp::Mkdir | ChangeOp::Mkfifo => {
+                a[0] <= MODE_MASK && a[1] <= 0o777 && a[2] == 0 && a[3] == 0
+            }
             ChangeOp::Chmod => a[0] <= MODE_MASK && a[1..] == [0; 3],
             ChangeOp::Chown => a[0] <= ID_UNCHANGED && a[1] <= ID_UNCHANGED && a[2..] == [0; 2],
             ChangeOp::Access => a[0] <= 7 && a[1..] == [0; 3],
@@ -431,6 +435,8 @@ mod tests {
         let mut mkdir = start(ChangeOp::Mkdir, b"/tmp/d");
         mkdir.args = [0o755, 0o22, 0, 0];
         round(mkdir);
+        mkdir.op = ChangeOp::Mkfifo;
+        round(mkdir);
         let mut unlink = start(ChangeOp::Unlink, b"/tmp/d");
         unlink.flags = UNLINK_REMOVEDIR;
         round(unlink);
@@ -535,7 +541,7 @@ mod tests {
         let mut bytes = [0; 128];
         let n = out.as_bytes().len();
         bytes[..n].copy_from_slice(out.as_bytes());
-        for op in [0u32, 13, u32::MAX] {
+        for op in [0u32, 14, u32::MAX] {
             bytes[12..16].copy_from_slice(&op.to_le_bytes());
             assert_eq!(
                 ChangeStart::read(Reader::new(&bytes[..n])),

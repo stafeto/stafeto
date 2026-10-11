@@ -97,7 +97,7 @@ pub const BLOCK_MAX: usize = HEADER + 2 * PATH_MAX + DESCRIPTORS * DESCRIPTOR + 
 /// number u32, what it names u32 (`Names`) and the service's number of its
 /// open description u32.
 pub const DESCRIPTORS: usize = 32;
-pub const DESCRIPTOR: usize = 12;
+pub const DESCRIPTOR: usize = 28;
 
 /// What a descriptor of a block names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +123,11 @@ pub enum Names {
     /// A terminal action's temporary token; the loader replaces every
     /// alias before writing the start area. Never a service description.
     PendingTerminal(u32),
+    Fifo {
+        packed: u32,
+        ram_generation: u64,
+        pipe_generation: u64,
+    },
 }
 
 /// A descriptor the child starts with.
@@ -134,28 +139,42 @@ pub struct Descriptor {
 
 impl Descriptor {
     fn bytes(&self) -> [u8; DESCRIPTOR] {
-        let (kind, file) = match self.names {
-            Names::Input => (0, 0),
-            Names::Output => (1, 0),
-            Names::Error => (2, 0),
-            Names::File(n) => (3, n),
-            Names::Pipe(n) => (4, n),
-            Names::Terminal(n) => (5, n),
-            Names::Random(n) => (6, n),
-            Names::PendingTerminal(n) => (7, n),
+        let (kind, file, ram_generation, pipe_generation) = match self.names {
+            Names::Input => (0, 0, 0, 0),
+            Names::Output => (1, 0, 0, 0),
+            Names::Error => (2, 0, 0, 0),
+            Names::File(n) => (3, n, 0, 0),
+            Names::Pipe(n) => (4, n, 0, 0),
+            Names::Terminal(n) => (5, n, 0, 0),
+            Names::Random(n) => (6, n, 0, 0),
+            Names::PendingTerminal(n) => (7, n, 0, 0),
+            Names::Fifo {
+                packed,
+                ram_generation,
+                pipe_generation,
+            } => (8, packed, ram_generation, pipe_generation),
         };
         let mut out = [0; DESCRIPTOR];
         out[..4].copy_from_slice(&self.fd.to_le_bytes());
         out[4..8].copy_from_slice(&u32::to_le_bytes(kind));
-        out[8..].copy_from_slice(&file.to_le_bytes());
+        out[8..12].copy_from_slice(&file.to_le_bytes());
+        out[12..20].copy_from_slice(&ram_generation.to_le_bytes());
+        out[20..28].copy_from_slice(&pipe_generation.to_le_bytes());
         out
     }
 
-    /// The descriptor in `bytes`: a number below DESCRIPTORS and a kind it
-    /// knows, or None.
+    /// Strictly decode one descriptor with both full FIFO generations.
     pub fn read(bytes: &[u8]) -> Option<Descriptor> {
+        if bytes.len() != DESCRIPTOR {
+            return None;
+        }
         let word = |i: usize| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap());
         let fd = word(0);
+        let ram_generation = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+        let pipe_generation = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
+        if word(1) != 8 && (ram_generation != 0 || pipe_generation != 0) {
+            return None;
+        }
         let names = match (word(1), word(2)) {
             (0, 0) => Names::Input,
             (1, 0) => Names::Output,
@@ -165,6 +184,18 @@ impl Descriptor {
             (5, n) => Names::Terminal(n),
             (6, n) => Names::Random(n),
             (7, n) if (n as usize) < TERMINAL_OPENS => Names::PendingTerminal(n),
+            (8, packed)
+                if packed & !0x003fff3f == 0
+                    && (3..35).contains(&(packed & 63))
+                    && ram_generation != 0
+                    && pipe_generation != 0 =>
+            {
+                Names::Fifo {
+                    packed,
+                    ram_generation,
+                    pipe_generation,
+                }
+            }
             _ => return None,
         };
         ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
@@ -423,7 +454,7 @@ pub enum BlockError {
 }
 
 const MAGIC: [u8; 8] = *b"STAFSPWN";
-const BLOCK_VERSION: u32 = 2;
+const BLOCK_VERSION: u32 = 3;
 
 /// The bytes of `argv` and `envp` as {ARG_MAX} counts them: their
 /// strings with the NULs and a pointer for each and for the two NULLs.
@@ -468,9 +499,11 @@ impl<'a> Block<'a> {
         self.descriptors().any(|d| {
             matches!(
                 (slot, d.names),
-                (Slot::Files, Names::File(_) | Names::Random(_))
-                    | (Slot::Entropy, Names::Random(_))
-                    | (Slot::Pipes, Names::Pipe(_))
+                (
+                    Slot::Files,
+                    Names::File(_) | Names::Random(_) | Names::Fifo { .. }
+                ) | (Slot::Entropy, Names::Random(_))
+                    | (Slot::Pipes, Names::Pipe(_) | Names::Fifo { .. })
                     | (
                         Slot::Terminal,
                         Names::Terminal(_) | Names::PendingTerminal(_)
@@ -2086,5 +2119,67 @@ mod terminal_tests {
         let block = Block::read(&bytes[..len]).unwrap();
         assert_eq!(block.pending_terminals(), 0);
         write_area(&mut area, START_AREA, &block, 0, [0; SLOTS], &[]).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fifo_identity_tests {
+    use super::*;
+    fn fifo(fd: u32) -> Descriptor {
+        Descriptor {
+            fd,
+            names: Names::Fifo {
+                packed: 34 | (127 << 8) | (127 << 15),
+                ram_generation: 0x1234567800000001,
+                pipe_generation: 0xabcdef1200000001,
+            },
+        }
+    }
+    #[test]
+    fn fifo_inheritance_requires_both_sessions_and_full_generations() {
+        let descriptor = fifo(31);
+        let bytes = descriptor.bytes();
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(Descriptor::read(&bytes), Some(descriptor));
+        assert_eq!(Descriptor::read(&bytes[..27]), None);
+        for range in [12..20, 20..28] {
+            let mut malformed = bytes;
+            malformed[range].fill(0);
+            assert_eq!(Descriptor::read(&malformed), None);
+        }
+        let mut changed = bytes;
+        changed[19] ^= 1;
+        assert_ne!(Descriptor::read(&changed), Some(descriptor));
+        let mut changed = bytes;
+        changed[27] ^= 1;
+        assert_ne!(Descriptor::read(&changed), Some(descriptor));
+        let mut ordinary = Descriptor {
+            fd: 3,
+            names: Names::File(3),
+        }
+        .bytes();
+        ordinary[20] = 1;
+        assert_eq!(Descriptor::read(&ordinary), None);
+        let mut block = [0; BLOCK_MAX];
+        let descriptors = core::array::from_fn::<_, 32, _>(|fd| fifo(fd as u32));
+        let size = Block::write_with(
+            &mut block,
+            b"/bin/fifo",
+            b"/",
+            0,
+            [&b"fifo"[..]].into_iter(),
+            [].into_iter(),
+            &descriptors,
+        )
+        .unwrap();
+        let read = Block::read(&block[..size]).unwrap();
+        assert!(read.needs(Slot::Files));
+        assert!(read.needs(Slot::Pipes));
+        assert!(!read.needs(Slot::Terminal));
+        assert_eq!(read.descriptors().count(), 32);
+        for (actual, expected) in read.descriptors().zip(descriptors) {
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(DESCRIPTOR * DESCRIPTORS, 896);
     }
 }

@@ -64,6 +64,17 @@ pub unsafe extern "C" fn stafeto_mkdirat(dirfd: c_int, path: *const c_char, mode
     unit(call(|| posix_abi::names::mkdirat(dirfd, path, mode, mask)))
 }
 
+/// Create a named pipe with the process creation mask.
+///
+/// # Safety
+/// `path` is a live C string or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_mkfifoat(dirfd: c_int, path: *const c_char, mode: u32) -> c_int {
+    let path = path!(path);
+    let mask = files::umask();
+    unit(call(|| posix_abi::names::mkfifoat(dirfd, path, mode, mask)))
+}
+
 /// access and faccessat (`flags` 0 or AT_EACCESS).
 ///
 /// # Safety

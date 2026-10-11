@@ -402,6 +402,8 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-lock-fifo.img",
     "boot-posix-spawn-churn.img",
     "boot-posix-sync.img",
+    "boot-posix-fifo.img",
+    "boot-posix-fifo-steps.img",
     "boot-posix-resources.img",
     "boot-posix-lock-ring.img",
     "boot-posix-native-scopes.img",
@@ -475,6 +477,8 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-lock-fifo.img"
         | "boot-posix-spawn-churn.img"
         | "boot-posix-sync.img"
+        | "boot-posix-fifo.img"
+        | "boot-posix-fifo-steps.img"
         | "boot-posix-resources.img"
         | "boot-posix-lock-ring.img" => procs(),
         "boot-posix-poll.img" => {
@@ -641,6 +645,8 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-posix-fifo.img" => &crate::POSIX_FIFO_PROGRAMS,
+                "boot-posix-fifo-steps.img" => &crate::POSIX_FIFO_STEPS_PROGRAMS,
                 "boot-posix-lifetimes.img" => &crate::POSIX_LIFETIMES_PROGRAMS,
                 "boot-posix-lock-rules.img" => &crate::POSIX_LOCK_LIFECYCLE_PROGRAMS,
                 "boot-posix-lock-core.img" => &crate::POSIX_LOCK_CORE_PROGRAMS,

@@ -63,10 +63,13 @@ fn error(error: FsError) -> c_int {
 pub(crate) fn descriptor_base(dirfd: c_int) -> Result<Base, c_int> {
     let fd = u32::try_from(dirfd).map_err(|_| EBADF)?;
     crate::shared::with_fd(fd, |files| match files.target(fd).map_err(error)? {
-        Target::Ram(target) | Target::Random(target) => Ok(Base::Fd {
-            fd: target.fd(),
-            generation: target.generation(),
-        }),
+        target if target.ram_target().is_some() => {
+            let target = target.ram_target().ok_or(ENOTDIR)?;
+            Ok(Base::Fd {
+                fd: target.fd(),
+                generation: target.generation(),
+            })
+        }
         _ => Err(ENOTDIR),
     })
 }
@@ -202,6 +205,15 @@ pub fn mkdirat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c
     let mut mkdir = request(ChangeOp::Mkdir, &placed);
     mkdir.args = [u64::from(mode & 0o7777), u64::from(umask & 0o777), 0, 0];
     run_unit(&mkdir)
+}
+
+/// Create a FIFO inode; its ring is allocated only by a later open.
+pub fn mkfifoat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+    let placed = place(dirfd, path)?;
+    check_virtual(Named::Mkdir, &placed, None, false)?;
+    let mut create = request(ChangeOp::Mkfifo, &placed);
+    create.args = [u64::from(mode & 0o7777), u64::from(umask & 0o777), 0, 0];
+    run_unit(&create)
 }
 
 /// access and faccessat: the real IDs, the effective with AT_EACCESS.
@@ -342,7 +354,8 @@ fn metadata_target(dirfd: c_int, path: &[u8], at_flags: c_int) -> Result<(Placed
     let fd = u32::try_from(dirfd).map_err(|_| EBADF)?;
     let target = crate::shared::with_fd(fd, |files| files.target(fd).map_err(error))?;
     match target {
-        Target::Ram(target) | Target::Random(target) => {
+        target if target.ram_target().is_some() => {
+            let target = target.ram_target().ok_or(ENOTDIR)?;
             placed.base = Base::Fd {
                 fd: target.fd(),
                 generation: target.generation(),
@@ -510,10 +523,13 @@ pub fn directory_path(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize
 /// the root, without links, `.` and `..`.
 pub fn descriptor_path(target: Target, out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_int> {
     let base = match target {
-        Target::Ram(target) | Target::Random(target) => Base::Fd {
-            fd: target.fd(),
-            generation: target.generation(),
-        },
+        target if target.ram_target().is_some() => {
+            let target = target.ram_target().ok_or(ENOTDIR)?;
+            Base::Fd {
+                fd: target.fd(),
+                generation: target.generation(),
+            }
+        }
         _ => return Err(ENOTDIR),
     };
     let placed = Placed {
@@ -639,10 +655,13 @@ pub fn fstatvfs(fd: c_int) -> Result<Statvfs, c_int> {
     let fd = u32::try_from(fd).map_err(|_| EBADF)?;
     let target = crate::shared::with_fd(fd, |files| files.target(fd).map_err(error))?;
     let base = match target {
-        Target::Ram(target) | Target::Random(target) => Base::Fd {
-            fd: target.fd(),
-            generation: target.generation(),
-        },
+        target if target.ram_target().is_some() => {
+            let target = target.ram_target().ok_or(ENOTDIR)?;
+            Base::Fd {
+                fd: target.fd(),
+                generation: target.generation(),
+            }
+        }
         _ => return Ok(NO_FILESYSTEM),
     };
     let placed = Placed {

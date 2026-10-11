@@ -623,7 +623,7 @@ fn sessions() -> Result<Sessions, i32> {
             .map_err(clone_errno)?;
             out.uart = clone.into_raw().0;
         }
-        let mut ends = [0; posix_fs::OPEN_MAX];
+        let mut ends = [proto_pipe::Endpoint::anonymous(0); posix_fs::OPEN_MAX];
         let count = crate::shared::pipes_kept_by_fork(&mut ends)?;
         if let Some(pipes) = crate::shared::with_files(|fs| Ok(fs.pipes().map(Handle::raw)))? {
             let clone = pipes_clone(pipes, &ends[..count])?;
@@ -631,6 +631,7 @@ fn sessions() -> Result<Sessions, i32> {
         }
         if let Some(terminal) = crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))?
         {
+            let mut ends = [0; posix_fs::OPEN_MAX];
             let count = crate::shared::terminals_kept_by_fork(&mut ends)?;
             out.terminal = crate::terminal::clone_kept(terminal, Some(&ends[..count]))?
                 .into_raw()
@@ -672,7 +673,10 @@ pub(crate) fn entropy_clone() -> Option<Handle<Channel>> {
 
 /// Clone of the session `pipes` with the pipe service for a child: a
 /// session that holds the ends `ends` (proto_pipe CLONE).
-pub(crate) fn pipes_clone(pipes: rt::abi::Handle, ends: &[u32]) -> Result<Handle<Channel>, i32> {
+pub(crate) fn pipes_clone(
+    pipes: rt::abi::Handle,
+    ends: &[proto_pipe::Endpoint],
+) -> Result<Handle<Channel>, i32> {
     use crate::process::clone_errno;
     let mut w = Writer::new();
     proto_pipe::Method::Clone
@@ -681,7 +685,7 @@ pub(crate) fn pipes_clone(pipes: rt::abi::Handle, ends: &[u32]) -> Result<Handle
         .and_then(|()| w.u32(ends.len() as u32))
         .map_err(|_| EIO)?;
     for end in ends {
-        w.u32(*end).map_err(|_| EIO)?;
+        end.write(&mut w).map_err(|_| EIO)?;
     }
     // The session lives as long as the process's files.
     rt::service::clone_session(&Handle::<Channel>::borrowed(pipes), w.as_bytes())

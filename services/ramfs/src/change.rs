@@ -108,6 +108,7 @@ fn first_intent(op: ChangeOp, flags: u32) -> Intent {
             path: NamespacePath::Victim,
         },
         ChangeOp::Mkdir => Intent::DirectoryCreate,
+        ChangeOp::Mkfifo => Intent::FifoCreate,
         ChangeOp::Symlink => Intent::SymbolicLinkCreate,
         ChangeOp::Link => Intent::Namespace {
             path: NamespacePath::LinkSource {
@@ -504,6 +505,13 @@ impl ChangeJob {
             }
             ChangeOp::Mkdir => {
                 self.work = Work::Create(CreateJournal::directory(
+                    self.args[0] as u32,
+                    self.args[1] as u32,
+                ));
+                self.stage = Stage::Prepare;
+            }
+            ChangeOp::Mkfifo => {
+                self.work = Work::Create(CreateJournal::fifo(
                     self.args[0] as u32,
                     self.args[1] as u32,
                 ));

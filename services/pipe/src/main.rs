@@ -28,6 +28,27 @@ use rt::service::{
 };
 use rt::sys;
 
+mod named_open;
+use pipe::admissions::Admissions;
+use proto_pipe::Endpoint;
+
+#[derive(Clone, Copy)]
+struct IoCapture {
+    key: u64,
+    endpoint: Endpoint,
+    queue: u32,
+}
+impl IoCapture {
+    const EMPTY: Self = Self {
+        key: 0,
+        endpoint: Endpoint {
+            id: 0,
+            generation: 0,
+        },
+        queue: 0,
+    };
+}
+
 rt::entry!(main);
 
 /// The sessions: room for the 255 records of the process service and the
@@ -75,9 +96,11 @@ struct Tables {
     births: [Option<Birth>; BIRTHS],
     pipes: Pipes,
     ops: LongOps<OPERATIONS>,
-    watches: watch::Pool<OPERATIONS>,
+    watches: pipe::watches::Pool<OPERATIONS>,
     roots: Roots<OPERATIONS>,
     clones: Clones<CLONES>,
+    named: Admissions<Handle<Channel>>,
+    io: [IoCapture; OPERATIONS],
 }
 struct Bss(UnsafeCell<Tables>);
 // SAFETY: only the main thread reaches it, once (`main`).
@@ -87,9 +110,11 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     births: [None; BIRTHS],
     pipes: Pipes::new(),
     ops: LongOps::new(),
-    watches: watch::Pool::new(),
+    watches: pipe::watches::Pool::new(),
     roots: Roots::new(),
     clones: Clones::new(),
+    named: Admissions::new(),
+    io: [IoCapture::EMPTY; OPERATIONS],
 }));
 
 fn main(_: u64) -> u64 {
@@ -129,6 +154,8 @@ fn main(_: u64) -> u64 {
         level,
         births: &mut tables.births,
         clones: &mut tables.clones,
+        named: &mut tables.named,
+        io: &mut tables.io,
         step,
         step_told: false,
         step_due: false,
@@ -145,7 +172,7 @@ fn main(_: u64) -> u64 {
 struct PipeService {
     pipes: &'static mut Pipes,
     ops: &'static mut LongOps<OPERATIONS>,
-    watches: &'static mut watch::Pool<OPERATIONS>,
+    watches: &'static mut pipe::watches::Pool<OPERATIONS>,
     /// The operations that wait, for each root.
     roots: &'static mut Roots<OPERATIONS>,
     /// The service's channel, which its own sessions are copies of.
@@ -156,6 +183,8 @@ struct PipeService {
     /// end of its last copy lets go of them.
     births: &'static mut [Option<Birth>; BIRTHS],
     clones: &'static mut Clones<CLONES>,
+    named: &'static mut Admissions<Handle<Channel>>,
+    io: &'static mut [IoCapture; OPERATIONS],
     /// The copy of the service's channel with NOTIFY, label STEP, and
     /// whether a step was told and not taken.
     step: Handle<Channel>,
@@ -180,7 +209,9 @@ impl PipeService {
     /// Tells each operation `wakes` names that its end changed.
     fn tell(&mut self, wakes: &Wakes) {
         for (label, key) in wakes.iter() {
-            self.ops.tell(label, key);
+            if !self.named_tell(label, key) {
+                self.ops.tell(label, key);
+            }
         }
     }
 
@@ -220,7 +251,8 @@ impl PipeService {
         if let Some((label, key, end)) = self.watches.cleanup() {
             self.pipes.unwait(end, (label, key));
         }
-        self.pipes.step(wakes) || self.watches.cleanup_due()
+        let named_due = self.named_cleanup();
+        self.pipes.step(wakes) || self.watches.cleanup_due() || named_due
     }
 
     /// One operation of the session `s` is over (`finished`): it waits no
@@ -234,6 +266,10 @@ impl PipeService {
 
     /// Every operation of the session `s` goes (it went, or Abandon).
     fn abandon(&mut self, s: &mut Session<Client, 0>) {
+        self.named.retire(s.label());
+        if self.named.cleanup_due() {
+            self.kick();
+        }
         self.watches.retire(s.label());
         if self.watches.cleanup_due() {
             self.kick();
@@ -260,7 +296,15 @@ impl PipeService {
             let label = s.label();
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
-            self.pipes.unwait(end, (label, key));
+            let capture = &mut self.io[((key & 0xffff_ffff) - 1) as usize];
+            let queue = if capture.key == key {
+                let queue = capture.queue;
+                *capture = IoCapture::EMPTY;
+                queue
+            } else {
+                end
+            };
+            self.pipes.unwait(queue, (label, key));
         }
     }
 
@@ -272,12 +316,19 @@ impl PipeService {
         s: &mut Session<Client, 0>,
         r: &mut Request<'_>,
         key: Option<u64>,
-        end: u32,
+        endpoint: Endpoint,
         notify: Option<Handle<Channel>>,
     ) -> Answer {
         let label = s.label();
+        let end = match self.pipes.queue_end(endpoint) {
+            Ok(end) => end,
+            Err(code) => return status(code),
+        };
         match key {
             None => {
+                if !self.named_room() {
+                    return status(proto_pipe::AGAIN);
+                }
                 if let Err(code) = self.roots.take(s.data.root) {
                     return status(code);
                 }
@@ -289,8 +340,16 @@ impl PipeService {
                     }
                 };
                 s.data.waiting += 1;
+                self.io[((key & 0xffff_ffff) - 1) as usize] = IoCapture {
+                    key,
+                    endpoint,
+                    queue: end,
+                };
                 let ops = &self.ops;
-                if let Err(code) = self.pipes.wait(end, (label, key), |(l, k)| ops.waits(l, k)) {
+                let named = &self.named;
+                if let Err(code) = self.pipes.wait(end, (label, key), |(l, k)| {
+                    ops.waits(l, k) || named.alive(l, k)
+                }) {
                     let finished = self.ops.finish(&mut s.data.long, label, key);
                     self.over(s, finished);
                     return status(code);
@@ -313,7 +372,7 @@ impl PipeService {
 
     /// READ_START (`take` false) or READ_TAKE.
     fn read(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
-        let read = match Read::parse(r.body(), take) {
+        let (read, endpoint) = match Read::parse_endpoint(r.body(), take) {
             Ok(read) => read,
             Err(status) => return Answer::Status(status),
         };
@@ -322,15 +381,18 @@ impl PipeService {
             Err(answer) => return answer,
         };
         if let Some(key) = read.key
-            && (!self.ops.waits(s.label(), key) || self.watches.get(s.label(), key).is_some())
+            && (!self.ops.waits(s.label(), key)
+                || self.watches.get(s.label(), key).is_some()
+                || (endpoint.is_named()
+                    && self.io[((key & 0xffff_ffff) - 1) as usize].endpoint != endpoint))
         {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         let mut out = [0; MAX_READ];
         let mut wakes = Wakes::default();
-        let got = self.pipes.read(
+        let got = self.pipes.read_endpoint(
             &s.data.held,
-            read.end,
+            endpoint,
             &mut out[..read.count as usize],
             &mut wakes,
         );
@@ -344,13 +406,13 @@ impl PipeService {
                 self.finish(s, read.key, read.end);
                 status(code)
             }
-            Ok(None) => self.wait(s, r, read.key, read.end, notify),
+            Ok(None) => self.wait(s, r, read.key, endpoint, notify),
         }
     }
 
     /// WRITE_START (`take` false) or WRITE_TAKE.
     fn write(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
-        let write = match Write::parse(r.body(), take) {
+        let (write, endpoint) = match Write::parse_endpoint(r.body(), take) {
             Ok(write) => write,
             Err(status) => return Answer::Status(status),
         };
@@ -359,14 +421,17 @@ impl PipeService {
             Err(answer) => return answer,
         };
         if let Some(key) = write.key
-            && (!self.ops.waits(s.label(), key) || self.watches.get(s.label(), key).is_some())
+            && (!self.ops.waits(s.label(), key)
+                || self.watches.get(s.label(), key).is_some()
+                || (endpoint.is_named()
+                    && self.io[((key & 0xffff_ffff) - 1) as usize].endpoint != endpoint))
         {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         let mut wakes = Wakes::default();
         let put = self
             .pipes
-            .write(&s.data.held, write.end, write.bytes, &mut wakes);
+            .write_endpoint(&s.data.held, endpoint, write.bytes, &mut wakes);
         self.tell(&wakes);
         match put {
             Ok(Some(n)) => {
@@ -377,13 +442,13 @@ impl PipeService {
                 self.finish(s, write.key, write.end);
                 status(code)
             }
-            Ok(None) => self.wait(s, r, write.key, write.end, notify),
+            Ok(None) => self.wait(s, r, write.key, endpoint, notify),
         }
     }
 
     /// READ_CANCEL or WRITE_CANCEL: the operation goes, with no effect.
     fn cancel(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
-        let cancel = match Cancel::parse(r.body()) {
+        let (cancel, endpoint) = match Cancel::parse_endpoint(r.body()) {
             Ok(cancel) => cancel,
             Err(status) => return Answer::Status(status),
         };
@@ -397,8 +462,16 @@ impl PipeService {
         self.over(s, true);
         // The end the operation waits at is the one its start named; a
         // cancel that names the other leaves no waiter behind either.
-        self.pipes.unwait(cancel.end, (label, cancel.key));
-        self.pipes.unwait(cancel.end ^ 1, (label, cancel.key));
+        let capture = &mut self.io[((cancel.key & 0xffff_ffff) - 1) as usize];
+        let queue = if capture.key == cancel.key {
+            let queue = capture.queue;
+            *capture = IoCapture::EMPTY;
+            queue
+        } else {
+            endpoint.id
+        };
+        self.pipes.unwait(queue, (label, cancel.key));
+        self.pipes.unwait(queue ^ 1, (label, cancel.key));
         long_answer(r, long::Reply::Cancelled)
     }
 
@@ -411,22 +484,30 @@ impl PipeService {
     }
 
     fn watch_start(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
-        let set = match watch::Set::parse(r.body()) {
+        let set = match proto_pipe::WatchSet::parse(r.body()) {
             Ok(set) if r.handles.is_empty() => set,
             _ => return Answer::Status(Status::BadSize),
         };
-        let descriptions = match s
-            .data
-            .held
-            .select(set.items[..set.len].iter().map(|item| item.description))
-        {
-            Ok(descriptions) => descriptions,
-            Err(code) => return status(code),
+        let mut queues = [0u8; watch::MAX];
+        let mut ready = watch::Ready {
+            len: set.len,
+            events: [0; watch::MAX],
         };
+        for (i, queue) in queues.iter_mut().enumerate().take(set.len) {
+            let endpoint = set.endpoint(i);
+            let (canonical, events) = match self.pipes.watch_endpoint(&s.data.held, endpoint) {
+                Ok(value) => value,
+                Err(code) => return status(code),
+            };
+            *queue = canonical as u8;
+            ready.events[i] = events & (set.items[i].events | watch::ALWAYS);
+        }
         rt::service::step_detail(set.len as u64);
-        let ready = set.ready(|end| self.pipes.readiness(&s.data.held, end));
         if ready.any() {
             return Self::watch_ready(r, ready);
+        }
+        if !self.named_room() {
+            return status(proto_pipe::AGAIN);
         }
         if let Err(code) = self.roots.take(s.data.root) {
             return status(code);
@@ -440,27 +521,27 @@ impl PipeService {
             }
         };
         s.data.waiting += 1;
-        let registered = self.watches.insert(label, key, set);
+        let registered = self.watches.insert(label, key, set, queues);
         let mut refusal = if registered {
             None
         } else {
             Some(proto_pipe::AGAIN)
         };
         if registered {
-            for description in descriptions.descriptions() {
+            for description in pipe::watches::unique_queues(&queues[..set.len]) {
                 let ops = &self.ops;
-                if let Err(code) = self
-                    .pipes
-                    .wait_new(description, (label, key), |(l, k)| ops.waits(l, k))
-                {
+                let named = &self.named;
+                if let Err(code) = self.pipes.wait_new(description, (label, key), |(l, k)| {
+                    ops.waits(l, k) || named.alive(l, k)
+                }) {
                     refusal = Some(code);
                     break;
                 }
             }
         }
         if let Some(code) = refusal {
-            for description in descriptions.descriptions() {
-                self.pipes.unwait(description, (label, key));
+            for &queue in &queues[..set.len] {
+                self.pipes.unwait(u32::from(queue), (label, key));
             }
             self.watches.remove(label, key);
             let finished = self.ops.finish(&mut s.data.long, label, key);
@@ -516,10 +597,11 @@ impl PipeService {
             }
         }
         rt::service::step_detail(set.len as u64);
-        let ready = set.ready(|end| self.pipes.readiness(&s.data.held, end));
+        let ready = set.ready(|endpoint| self.pipes.readiness_endpoint(&s.data.held, endpoint));
         if cancel {
-            for description in set.descriptions() {
-                self.pipes.unwait(description, (label, key));
+            let queues = *self.watches.queues(label, key).unwrap();
+            for &queue in &queues[..set.len] {
+                self.pipes.unwait(u32::from(queue), (label, key));
             }
             self.watches.remove(label, key);
             let finished = self.ops.finish(&mut s.data.long, label, key);
@@ -538,13 +620,13 @@ impl PipeService {
     /// that sent nothing yet or the clones of its root at their most.
     fn clone_session(&mut self, held: &Held, root: u64, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
-        let mut list = [0u32; HELD_MAX];
+        let mut list = [Endpoint::default(); HELD_MAX];
         let count = body.u32().unwrap_or(u32::MAX) as usize;
         if count > list.len() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
         for d in &mut list[..count] {
-            let Ok(n) = body.u32() else {
+            let Ok(n) = Endpoint::parse(&mut body) else {
                 return Answer::Status(Status::BadSize);
             };
             *d = n;
@@ -555,7 +637,7 @@ impl PipeService {
         if self.clones.room_within(root, ROOT_CLONES).is_err() {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
-        let mut child = match self.pipes.clone_held(held, &list[..count]) {
+        let mut child = match self.pipes.clone_endpoints(held, &list[..count]) {
             Ok(child) => child,
             Err(code) => return status(code),
         };
@@ -604,9 +686,9 @@ fn words(r: &mut Request<'_>, words: &[u32]) -> Answer {
 }
 
 /// The end of a request of one end alone (and a word for SET_FLAGS).
-fn end_body(r: &Request<'_>, word: bool) -> Result<(u32, u32), Answer> {
+fn end_body(r: &Request<'_>, word: bool) -> Result<(Endpoint, u32), Answer> {
     let mut body = r.body();
-    let end = body.u32().map_err(Answer::Status)?;
+    let end = Endpoint::parse(&mut body).map_err(Answer::Status)?;
     let value = if word {
         body.u32().map_err(Answer::Status)?
     } else {
@@ -621,7 +703,10 @@ impl Service<0> for PipeService {
     const METHODS: &'static [u16] = {
         #[cfg(feature = "steps")]
         {
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25,
+            ]
         }
         #[cfg(not(feature = "steps"))]
         {
@@ -654,10 +739,14 @@ impl Service<0> for PipeService {
         }
         match Method::from_number(r.method()) {
             Some(Method::Create) => {
-                let (flags, _) = match end_body(r, false) {
-                    Ok(body) => body,
-                    Err(answer) => return answer,
+                let mut body = r.body();
+                let flags = match body.u32() {
+                    Ok(flags) if body.finish().is_ok() => flags,
+                    _ => return Answer::Status(Status::BadSize),
                 };
+                if s.data.held.count() + self.named.reservations(s.label()) + 2 > HELD_MAX {
+                    return status(proto_pipe::MFILE);
+                }
                 match self
                     .pipes
                     .create(&mut s.data.held, r.label(), s.data.root, flags)
@@ -680,7 +769,7 @@ impl Service<0> for PipeService {
                     Err(answer) => return answer,
                 };
                 let mut wakes = Wakes::default();
-                let closed = self.pipes.close(&mut s.data.held, end, &mut wakes);
+                let closed = self.pipes.close_endpoint(&mut s.data.held, end, &mut wakes);
                 self.tell(&wakes);
                 match closed {
                     Ok(()) => Answer::Status(Status::Ok),
@@ -692,21 +781,21 @@ impl Service<0> for PipeService {
                 self.clone_session(&held, root, r)
             }
             Some(Method::GetFlags) => match end_body(r, false) {
-                Ok((end, _)) => match self.pipes.flags(&s.data.held, end) {
+                Ok((end, _)) => match self.pipes.flags_endpoint(&s.data.held, end) {
                     Ok(flags) => words(r, &[flags]),
                     Err(code) => status(code),
                 },
                 Err(answer) => answer,
             },
             Some(Method::SetFlags) => match end_body(r, true) {
-                Ok((end, flags)) => match self.pipes.set_flags(&s.data.held, end, flags) {
+                Ok((end, flags)) => match self.pipes.set_flags_endpoint(&s.data.held, end, flags) {
                     Ok(()) => Answer::Status(Status::Ok),
                     Err(code) => status(code),
                 },
                 Err(answer) => answer,
             },
             Some(Method::Stat) => match end_body(r, false) {
-                Ok((end, _)) => match self.pipes.stat(&s.data.held, end) {
+                Ok((end, _)) => match self.pipes.stat_endpoint(&s.data.held, end) {
                     Ok((pipe, len)) => words(r, &[pipe, len]),
                     Err(code) => status(code),
                 },
@@ -719,6 +808,16 @@ impl Service<0> for PipeService {
                 self.abandon(s);
                 Answer::Status(Status::Ok)
             }
+            Some(
+                method @ (Method::PayerWitness
+                | Method::BrokerPrepare
+                | Method::BrokerCancel
+                | Method::NamedAttach
+                | Method::NamedQuery
+                | Method::NamedTake
+                | Method::NamedCancel
+                | Method::NamedAck),
+            ) => self.named_request(s, r, method),
             None => Answer::Status(Status::UnknownMethod),
         }
     }

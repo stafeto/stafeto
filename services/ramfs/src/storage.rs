@@ -31,6 +31,7 @@ pub const BUCKETS: usize = 2048;
 pub const CHAIN_PORTION: usize = 8;
 /// Entries of the name index: the boot entries then the dynamic ones.
 const NAME_ENTRIES: usize = ORIGINALS + DENTRIES;
+pub const FIFO: u32 = 4;
 pub const SYMLINK: u32 = 5;
 /// Links of the list of the names of a directory a step walks to find a position.
 pub const LIST_PORTION: usize = 256;
@@ -1831,7 +1832,7 @@ impl<'a> Storage<'a> {
         if self.lookup(parent, name).is_ok() {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
-        if ![crate::DIR, crate::REG, SYMLINK].contains(&kind) {
+        if ![crate::DIR, crate::REG, FIFO, SYMLINK].contains(&kind) {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         let a = self.account(root)?;
@@ -2119,6 +2120,9 @@ impl<'a> Storage<'a> {
     }
     pub fn read(&self, token: Token, offset: u64, out: &mut [u8]) -> Result<usize, u32> {
         let n = self.node(token)?;
+        if n.kind == FIFO {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
         let count = out.len().min(n.length.saturating_sub(offset) as usize);
         let boot = self.boot_bytes(token);
         if n.overlay == NONE && offset <= boot.len() as u64 && count <= boot.len() - offset as usize
@@ -2181,6 +2185,9 @@ impl<'a> Storage<'a> {
         offset: usize,
         bytes: &[u8],
     ) -> Result<usize, u32> {
+        if self.node(token)?.kind == FIFO {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
         let end = offset
             .checked_add(bytes.len())
             .filter(|&n| n <= FILE_PAGES * PAGE)

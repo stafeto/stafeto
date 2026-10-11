@@ -30,6 +30,7 @@ pub enum NamespacePath {
     Destination,
     LinkSource { follow: bool },
     CreateDirectory,
+    CreateFifo,
     CreateSymbolicLink,
     ReadLink,
 }

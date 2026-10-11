@@ -60,6 +60,14 @@
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
+pub mod named;
+pub use named::{
+    APPEND, BrokerCancel, BrokerPrepare, Endpoint, NAMED_END, NAMED_MAX, NAMED_MAX_WRITE,
+    NAMED_ROOT_MAX, NO_READER, NamedPhase, NamedReply, NamedTicket, RAM_BROKER,
+};
+
+pub use named::WatchSet;
+
 pub const VERSION: u16 = 1;
 
 /// The pipes of the service.
@@ -127,10 +135,18 @@ pub enum Method {
     WatchStart = 14,
     WatchTake = 15,
     WatchCancel = 16,
+    PayerWitness = 18,
+    BrokerPrepare = 19,
+    BrokerCancel = 20,
+    NamedAttach = 21,
+    NamedQuery = 22,
+    NamedTake = 23,
+    NamedCancel = 24,
+    NamedAck = 25,
 }
 
 impl Method {
-    pub const ALL: [Method; 16] = [
+    pub const ALL: [Method; 24] = [
         Method::Create,
         Method::ReadStart,
         Method::ReadTake,
@@ -147,6 +163,14 @@ impl Method {
         Method::WatchStart,
         Method::WatchTake,
         Method::WatchCancel,
+        Method::PayerWitness,
+        Method::BrokerPrepare,
+        Method::BrokerCancel,
+        Method::NamedAttach,
+        Method::NamedQuery,
+        Method::NamedTake,
+        Method::NamedCancel,
+        Method::NamedAck,
     ];
 
     pub const fn number(self) -> u16 {
@@ -162,7 +186,9 @@ impl Method {
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+pub const METHODS: &[u16] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25,
+];
 
 /// READ_START or READ_TAKE: the key of a take, the end and the count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,15 +217,25 @@ impl Read {
     }
 
     /// The body of READ_START (`take` false) or READ_TAKE.
-    pub fn parse(mut body: Reader<'_>, take: bool) -> Result<Read, Status> {
+    pub fn parse(body: Reader<'_>, take: bool) -> Result<Read, Status> {
+        Self::parse_endpoint(body, take).and_then(|(read, endpoint)| {
+            if endpoint.is_named() {
+                Err(Status::BadSize)
+            } else {
+                Ok(read)
+            }
+        })
+    }
+    pub fn parse_endpoint(mut body: Reader<'_>, take: bool) -> Result<(Read, Endpoint), Status> {
         let key = if take { Some(body.u64()?) } else { None };
-        let (end, count) = (body.u32()?, body.u32()?);
+        let endpoint = Endpoint::parse(&mut body)?;
+        let (end, count) = (endpoint.id, body.u32()?);
         body.finish()?;
         let read = Read { key, end, count };
         if read.count == 0 || read.count as usize > MAX_READ || key == Some(0) {
             return Err(Status::BadSize);
         }
-        Ok(read)
+        Ok((read, endpoint))
     }
 }
 
@@ -227,16 +263,37 @@ impl<'a> Write<'a> {
         w.bytes(self.bytes)
     }
 
-    pub fn parse(mut body: Reader<'a>, take: bool) -> Result<Write<'a>, Status> {
+    pub fn parse(body: Reader<'a>, take: bool) -> Result<Write<'a>, Status> {
+        Self::parse_endpoint(body, take).and_then(|(write, endpoint)| {
+            if endpoint.is_named() {
+                Err(Status::BadSize)
+            } else {
+                Ok(write)
+            }
+        })
+    }
+    pub fn parse_endpoint(
+        mut body: Reader<'a>,
+        take: bool,
+    ) -> Result<(Write<'a>, Endpoint), Status> {
         let key = if take { Some(body.u64()?) } else { None };
-        let end = body.u32()?;
+        let endpoint = Endpoint::parse(&mut body)?;
+        let end = endpoint.id;
         let len = body.left();
-        if len == 0 || len > MAX_WRITE || key == Some(0) {
+        if len == 0
+            || len
+                > if endpoint.is_named() {
+                    NAMED_MAX_WRITE
+                } else {
+                    MAX_WRITE
+                }
+            || key == Some(0)
+        {
             return Err(Status::BadSize);
         }
         let bytes = body.bytes(len)?;
         body.finish()?;
-        Ok(Write { key, end, bytes })
+        Ok((Write { key, end, bytes }, endpoint))
     }
 }
 
@@ -257,13 +314,24 @@ impl Cancel {
         w.u32(self.end)
     }
 
-    pub fn parse(mut body: Reader<'_>) -> Result<Cancel, Status> {
-        let (key, end) = (body.u64()?, body.u32()?);
+    pub fn parse(body: Reader<'_>) -> Result<Cancel, Status> {
+        Self::parse_endpoint(body).and_then(|(cancel, endpoint)| {
+            if endpoint.is_named() {
+                Err(Status::BadSize)
+            } else {
+                Ok(cancel)
+            }
+        })
+    }
+    pub fn parse_endpoint(mut body: Reader<'_>) -> Result<(Cancel, Endpoint), Status> {
+        let key = body.u64()?;
+        let endpoint = Endpoint::parse(&mut body)?;
+        let end = endpoint.id;
         body.finish()?;
         if key == 0 {
             return Err(Status::BadSize);
         }
-        Ok(Cancel { key, end })
+        Ok((Cancel { key, end }, endpoint))
     }
 }
 
@@ -297,7 +365,7 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed_and_listed() {
-        for number in 0..=14u16 {
+        for number in 0..=26u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(m) = method {

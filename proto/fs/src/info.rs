@@ -6,7 +6,7 @@
 use crate::Timestamp;
 use proto_wire::{Reader, Status, Writer};
 
-/// Kind is 1 directory, 2 regular, 3 character, 5 symbolic link. Permissions contain only the
+/// Kind is 1 directory, 2 regular, 3 character, 4 FIFO, 5 symbolic link. Permissions contain only the
 /// low twelve mode bits. Times use signed seconds and normalized nanoseconds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NodeInfo {
@@ -61,10 +61,7 @@ impl NodeInfo {
             modify_time: Timestamp::read(input)?,
             change_time: Timestamp::read(input)?,
         };
-        if !matches!(info.kind, 1 | 2 | 3 | 5)
-            || info.permissions & !0o7777 != 0
-            || info.block_size == 0
-        {
+        if !matches!(info.kind, 1..=5) || info.permissions & !0o7777 != 0 || info.block_size == 0 {
             return Err(Status::BadSize);
         }
         Ok(info)
@@ -108,13 +105,22 @@ mod tests {
                 Err(Status::BadSize)
             );
         }
-        for (offset, value) in [(0, 4u32), (4, 0o10000), (56, 0)] {
+        for (offset, value) in [(0, 6u32), (4, 0o10000), (56, 0)] {
             let mut invalid = [0; 116];
             invalid.copy_from_slice(bytes);
             invalid[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             assert_eq!(
                 NodeInfo::read(&mut Reader::new(&invalid)),
                 Err(Status::BadSize)
+            );
+        }
+        for kind in [4u32, 5] {
+            let mut accepted = [0; 116];
+            accepted.copy_from_slice(bytes);
+            accepted[..4].copy_from_slice(&kind.to_le_bytes());
+            assert_eq!(
+                NodeInfo::read(&mut Reader::new(&accepted)),
+                Ok(NodeInfo { kind, ..info })
             );
         }
         writer.u32(0).unwrap();

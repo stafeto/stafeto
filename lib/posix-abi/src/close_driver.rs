@@ -42,10 +42,7 @@ fn protocol(status: Status) -> i32 {
     }
 }
 fn ram(target: Target) -> Option<posix_fs::RamTarget> {
-    match target {
-        Target::Ram(held) | Target::Random(held) => Some(held),
-        _ => None,
-    }
+    target.ram_target()
 }
 
 enum Admission {
@@ -188,6 +185,13 @@ fn step(token: CloseToken) -> Result<bool, i32> {
     }
     if let Some(target) = snapshot.release {
         let held = ram(target).ok_or(EIO)?;
+        if let Target::Fifo(pair) = target {
+            match transport.pipe_endpoint_call(proto_pipe::Method::Close, pair.endpoint(), None) {
+                Ok(_) | Err(FsError::BadFileDescriptor) => {}
+                Err(FsError::Interrupted) => return Ok(false),
+                Err(error) => return Err(crate::error(error)),
+            }
+        }
         let receipt = transport.files().close_exact(held.prepared());
         #[cfg(feature = "close-probe")]
         let mut receipt = receipt;

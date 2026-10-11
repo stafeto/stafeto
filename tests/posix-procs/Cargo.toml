@@ -14,6 +14,8 @@ test = false
 bench = false
 
 [features]
+fifo-probe = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
+fifo-steps = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
 spawn-churn = []
 lifetime-rules = ["lifetime-probe"]
 lock-core-probe = ["lifetime-probe"]
@@ -41,6 +43,7 @@ posix-crt = { path = "../../lib/posix-crt" }
 
 posix-abi = { path = "../../lib/posix-abi", optional = true }
 proto-fs = { path = "../../proto/fs", optional = true }
+proto-init = { path = "../../proto/init", optional = true }
 proto-wire = { path = "../../proto/wire", optional = true }
 rt = { path = "../../lib/rt", optional = true }
 proto-process = { path = "../../proto/process", optional = true }

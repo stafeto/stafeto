@@ -266,6 +266,14 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
                 random_hint: false,
             },
             Names::Pipe(n) => InheritedTarget::Ready(Target::Pipe(n)),
+            Names::Fifo {
+                packed,
+                ram_generation,
+                pipe_generation,
+            } => InheritedTarget::Ready(Target::Fifo(
+                posix_fs::FifoTarget::from_packed(packed, ram_generation, pipe_generation)
+                    .expect("validated FIFO descriptor"),
+            )),
             Names::Terminal(n) => InheritedTarget::Ready(Target::Tty(n)),
             Names::Random(n) => InheritedTarget::RawRam {
                 fd: n,

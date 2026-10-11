@@ -32,6 +32,7 @@ pub enum JobOperation {
     Path(PathJob),
     Data(data::Journal),
     Change(ChangeJob),
+    Fifo(crate::fifo::Receipt),
 }
 impl ResolveJob {
     pub fn path(&self) -> &PathJob {

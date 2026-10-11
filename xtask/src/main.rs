@@ -624,6 +624,17 @@ const POSIX_SPAWN_CHURN_PROGRAMS: [ImageProgram; 10] = {
     programs[5].3 = &["spawn-churn"];
     programs
 };
+const POSIX_FIFO_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5].3 = &["fifo-probe"];
+    programs
+};
+const POSIX_FIFO_STEPS_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_FIFO_PROGRAMS;
+    programs[1].3 = &["steps"];
+    programs[2].3 = &["steps"];
+    programs
+};
 const POSIX_SYNC_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[5] = ("posix-procs", "posix-sync-probe", POSIX_STACK_SIZE, &[]);
@@ -691,7 +702,7 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
         "posix-procs",
         "posix-procs",
         POSIX_STACK_SIZE,
-        &["change-steps"],
+        &["change-steps", "fifo-steps"],
     ),
     ("loader", "loader", 0, &["steps"]),
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
@@ -1252,6 +1263,8 @@ commands:
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
   posix-resources verify account files, limits, groups and descriptor exec
+  posix-fifo verify named FIFO creation, rendezvous, independent opens and inheritance
+  posix-fifo-steps measure named FIFO service dispatches under icount
   posix-sync verify RAM synchronization, descriptor types and cancellation
   posix-spawn-churn verify 1100 consecutive spawn/reap operations in a small image
   posix-lock-pages measure a full inode spread over 64 paid physical pages
@@ -1388,6 +1401,8 @@ fn main() {
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-data-steps") => posix_files_run_profile(true, true),
+        Some("posix-fifo") => posix_fifo_probe(),
+        Some("posix-fifo-steps") => posix_fifo_run(true),
         Some("posix-spawn-churn") => posix_spawn_churn_probe(&qemu::VIRT),
         Some("posix-procs") => {
             posix_procs_count(&args[1..]).and_then(|count| posix_procs_repeat(&qemu::VIRT, count))
@@ -3523,6 +3538,99 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     Ok(())
 }
 
+fn posix_fifo_probe() -> Result<(), String> {
+    posix_fifo_run(false)
+}
+
+fn posix_fifo_run(steps: bool) -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        if steps {
+            "boot-posix-fifo-steps.img"
+        } else {
+            "boot-posix-fifo.img"
+        },
+        if steps {
+            &POSIX_FIFO_STEPS_PROGRAMS
+        } else {
+            &POSIX_FIFO_PROGRAMS
+        },
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    if steps {
+        cmd.args(qemu::ICOUNT);
+    }
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    for marker in [
+        "posix-fifo: creation and nonblocking rendezvous ok",
+        "posix-fifo: independent opens, atomic data, EOF and SIGPIPE ok",
+        "posix-fifo: poll and select readiness ok",
+        "posix-fifo: blocking rendezvous and cancellation ok",
+        "posix-fifo: unlink generation and fork exec custody ok",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
+    if steps {
+        const FIFO_STEP_MAX: u64 = RAM_STEP_MAX * 9 / 10;
+        check_waits(&outcome.lines, &["2", "4"], "FIFO service steps")?;
+        let own = longest_steps(&outcome.lines, "2")
+            .into_iter()
+            .find(|row| row.0 == 60)
+            .map_or(0, |row| row.1);
+        let waiting = longest_waits(&outcome.lines, "2")
+            .into_iter()
+            .find(|row| row.0 == 60)
+            .map_or(0, |row| row.1);
+        if waiting == 0 {
+            return Err(format!(
+                "FIFO grant own {own} ticks has no measured broker wait"
+            ));
+        }
+        println!(
+            "FIFO grant own {own} ticks, broker wait {waiting} ticks, conservative combined {} ticks",
+            own + waiting
+        );
+        for (tag, required) in [
+            ("2", &[60, 61][..]),
+            ("4", &[18, 19, 20, 21, 22, 23, 24, 25][..]),
+        ] {
+            let measured = longest_steps(&outcome.lines, tag);
+            for kind in required {
+                if !measured.iter().any(|row| row.0 == *kind && row.1 != 0) {
+                    return Err(format!(
+                        "FIFO service {tag} has no method {kind} measurement: {measured:?}"
+                    ));
+                }
+            }
+            if let Some(row) = measured.iter().find(|row| row.1 > FIFO_STEP_MAX) {
+                return Err(format!(
+                    "FIFO service {tag} method {} took {} ticks, reserve bound {FIFO_STEP_MAX}",
+                    row.0, row.1
+                ));
+            }
+            println!(
+                "FIFO service {tag} dispatch ticks (reserve bound {FIFO_STEP_MAX}): {measured:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn posix_resources_probe() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -4426,7 +4534,9 @@ fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
 }
 
 fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
-    relibc()?;
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
     let kernel = build(Variant::Normal)?;
     let image = write_boot_image_with(
         "boot-posix-steps.img",
@@ -4608,6 +4718,20 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             return Err(format!(
                 "the pipe service: kind {kind} took {ticks} ticks, past {RAM_STEP_MAX} or none: {pipe:?}"
             ));
+        }
+    }
+    for (name, steps, kinds) in [
+        ("RAM FIFO", &ram, &[60, 61][..]),
+        ("pipe FIFO", &pipe, &[18, 19, 20, 21, 22, 23, 24, 25][..]),
+    ] {
+        for kind in kinds {
+            let ticks = steps.iter().find(|(k, ..)| k == kind).map_or(0, |r| r.1);
+            if ticks == 0 || ticks > RAM_STEP_MAX * 9 / 10 {
+                return Err(format!(
+                    "{name} among {branches} branches: method {kind} took {ticks} ticks, no measurement or insufficient reserve"
+                ));
+            }
+            println!("{name} among {branches} branches: method {kind}, {ticks} ticks");
         }
     }
     // Every kind counts the own part of the step, the heartbeat too: its
@@ -5550,6 +5674,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
+        job("posix-fifo", posix_fifo_probe),
+        job("posix-fifo steps", || posix_fifo_run(true)),
         job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
         job("posix-lock-ring", || posix_lock_ring_probe(&qemu::VIRT)),
         job("posix-lock-core", || {
@@ -5663,6 +5789,8 @@ fn host_tests() -> Result<(), String> {
         "posix-path",
         "--package",
         "posix-fd",
+        "--package",
+        "posix-fs",
         "--package",
         "posix-change",
         "--package",
@@ -7348,6 +7476,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-path",
         "--package",
         "posix-fd",
+        "--package",
+        "posix-fs",
         "--package",
         "posix-change",
         "--package",

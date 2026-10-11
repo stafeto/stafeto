@@ -5,7 +5,8 @@
 
 extern crate std;
 
-use super::{ControlPhase, ControlResult, EntryToken, Flags, OwnerToken, Table};
+use super::{ControlResult, EntryToken, Flags, OwnerToken, Table};
+use change::ControlPhase;
 use entries::Frame;
 use proto_fs::{LockBlocker, LockCommand, LockKind, LockPhase, LockReply};
 use proto_wire::{Status, Writer};
@@ -66,6 +67,12 @@ struct PosixFs {
 }
 
 #[allow(dead_code, unused_imports)]
+impl PosixFs {
+    // This host container has only scalar mock targets. Actual paired FIFO
+    // jump custody is exercised in posix-fs::fifo's production-table tests.
+    fn mark_fifo_io_jump(&mut self, _owner: OwnerToken, _target: Frame) {}
+}
+
 #[path = "../../posix-fs/src/change.rs"]
 mod change;
 #[allow(dead_code)]
@@ -535,7 +542,7 @@ fn close_fence_preserves_alias_reused_generation_and_change_family() {
 #[test]
 fn full_sixteen_controls_preserve_close_admission_and_all_fence_debts() {
     let (mut files, entry, _, input) = fixture();
-    let mut tokens = [None; super::JOBS_MAX];
+    let mut tokens = [None; change::JOBS_MAX];
     for (index, slot) in tokens.iter_mut().enumerate() {
         *slot = Some(
             files
@@ -545,6 +552,21 @@ fn full_sixteen_controls_preserve_close_admission_and_all_fence_debts() {
         );
     }
     assert_eq!(files.control_tokens().count(), 16);
+    let sequence = files
+        .descriptors
+        .jobs_wait_word()
+        .load(core::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        files.job_place(owner()),
+        super::JobPlace::Full {
+            sequence,
+            own: true
+        }
+    );
+    assert_eq!(
+        files.jobs_wait_address(),
+        core::ptr::from_ref(files.descriptors.jobs_wait_word()) as usize
+    );
     assert_eq!(
         files.begin_change_record(owner(), Frame::main(200)),
         Err(FsError::TooManyOpenFiles)
@@ -586,6 +608,14 @@ fn full_sixteen_controls_preserve_close_admission_and_all_fence_debts() {
         );
     }
     assert_eq!(files.control_tokens().count(), 0);
+    assert_eq!(files.job_place(owner()), super::JobPlace::Free);
+    assert_ne!(
+        files
+            .descriptors
+            .jobs_wait_word()
+            .load(core::sync::atomic::Ordering::Acquire),
+        sequence
+    );
 }
 
 #[test]
@@ -645,7 +675,7 @@ fn lock_collector_preserves_nested_foreign_skipped_and_change_records() {
 #[test]
 fn lock_collector_acknowledges_sixteen_cleaned_longjmp_frames_without_rpc() {
     let (mut files, entry, _, input) = fixture();
-    let mut tokens = [None; super::JOBS_MAX];
+    let mut tokens = [None; change::JOBS_MAX];
     for slot in &mut tokens {
         let (token, claim) = files
             .begin_lock_record(owner(), entry, Frame::main(100), input)

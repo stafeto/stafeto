@@ -21,8 +21,9 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-# File Synchronization awaits aio_fsync on stafeto, tagged pin-6a09f1e.
-COMMIT = "6a09f1e91ebce137d30fd4ba942b9f93ee9e4eb6"
+# Named FIFO creation forwards to stafeto, tagged pin-c512fe7e.
+# File Synchronization awaits aio_fsync.
+COMMIT = "c512fe7e61de809531d2427b31467968866d0f08"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

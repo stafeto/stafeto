@@ -144,7 +144,9 @@ pub fn kept_by_fork(out: &mut [rt::fs::PreparedOpen; posix_fs::OPEN_MAX]) -> Res
 
 /// The ends of pipes a forked child's session shares
 /// (posix_fs::PosixFs::pipes_kept_by_fork), into `out`; how many.
-pub fn pipes_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+pub fn pipes_kept_by_fork(
+    out: &mut [proto_pipe::Endpoint; posix_fs::OPEN_MAX],
+) -> Result<usize, i32> {
     process_state(|files| Ok(files.pipes_kept_by_fork(out)))
 }
 
@@ -196,13 +198,34 @@ fn window() {
 /// RAM and pipe close waits until `run` is over. Terminal last-fd close
 /// releases the real hold immediately; armed I/O retains a service pin.
 pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -> Result<R, i32> {
-    let (transport, target) = with_fd(fd, |files| {
-        Ok((files.transport(), files.hold(fd).map_err(crate::error)?))
+    let owner = crate::relibc::open_owner()
+        .ok()
+        .and_then(|owner| posix_fd::OwnerToken::new(owner).ok());
+    let frame = crate::change::frame();
+    let (transport, target, loan) = with_fd(fd, |files| {
+        let target = files.target(fd).map_err(crate::error)?;
+        if matches!(target, Target::Fifo(_)) {
+            let owner = owner.ok_or(EIO)?;
+            let (token, target) = files
+                .begin_fifo_io(owner, fd, frame)
+                .map_err(crate::error)?;
+            Ok((files.transport(), target, Some((token, owner))))
+        } else {
+            Ok((
+                files.transport(),
+                files.hold(fd).map_err(crate::error)?,
+                None,
+            ))
+        }
     })?;
     window();
     let result = run(transport, target);
-    let release = process_state(|files| Ok(files.unhold(target)))?;
-    let _ = transport.release(release);
+    if let Some((token, owner)) = loan {
+        crate::fifo_io::finish(token, owner);
+    } else {
+        let release = process_state(|files| Ok(files.unhold(target)))?;
+        let _ = transport.release(release);
+    }
     result
 }
 
@@ -224,12 +247,13 @@ pub fn resolved<R>(
 
 /// The holds of the threads an exec stopped go, and the descriptions
 /// whose last descriptor went while one was held close in the service.
-pub fn abandon_holds() {
+pub fn abandon_holds() -> bool {
     while let Ok(Some((transport, target))) =
         process_state(|files| Ok(files.abandon_hold().map(|t| (files.transport(), t))))
     {
         let _ = transport.release(Some(target));
     }
+    crate::fifo_io::drain_for_exec()
 }
 
 #[cfg(feature = "thread-probe")]
@@ -363,6 +387,15 @@ fn terminal_reply(
 fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
     held(fd, |transport, target| match target {
         Target::Pipe(end) => pipe_reply(transport, end, count, &mut *out),
+        Target::Fifo(target) => {
+            let mut bytes = [0; proto_pipe::MAX_READ];
+            let n = crate::pipes::read_endpoint(
+                transport,
+                target.endpoint(),
+                &mut bytes[..(count as usize).min(proto_pipe::MAX_READ)],
+            )?;
+            Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
+        }
         Target::Input if transport.terminal().is_some() => {
             terminal_reply(transport, proto_tty::CONSOLE, count, &mut *out)
         }
@@ -456,10 +489,13 @@ pub(crate) fn open_from(
                 transport,
                 base,
                 bytes,
-                policy,
-                mode,
-                umask,
-                crate::descriptor_flags(flags),
+                crate::open_driver::Options {
+                    flags: policy,
+                    nonblock: flags & O_NONBLOCK != 0,
+                    mode,
+                    umask,
+                    descriptor_flags: crate::descriptor_flags(flags),
+                },
             )?;
             Ok((transport, Opened::Resident(fd)))
         };
@@ -546,6 +582,10 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                     .map_err(|status| crate::error(posix_fs::FsError::from(status))),
                 // The write of a pipe waits here, outside the lock.
                 Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
+                Target::Fifo(target) => {
+                    crate::pipes::write_endpoint(transport, target.endpoint(), bytes)
+                        .map(|n| n as u64)
+                }
                 target => transport
                     .write(target, extent)
                     .map(|n| n as u64)
@@ -766,7 +806,8 @@ pub fn detach_open_owner(owner: u64) -> bool {
     let changes = crate::change::detach(owner);
     let closes = crate::close_driver::detach(owner);
     let drains = crate::drain_hooks::detach(owner);
-    opens && changes && closes && drains
+    let fifo_io = crate::fifo_io::detach(owner);
+    opens && changes && closes && drains && fifo_io
 }
 /// A surviving caller or collector pays one cleanup phase outside the layer locks.
 pub fn help_open_recovery() {
@@ -774,4 +815,5 @@ pub fn help_open_recovery() {
     crate::change::help();
     crate::close_driver::help();
     crate::drain_hooks::help();
+    crate::fifo_io::help();
 }

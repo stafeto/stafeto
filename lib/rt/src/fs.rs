@@ -1008,6 +1008,29 @@ impl Files {
     }
 
     /// The session with the RAM file service and the console's driver's.
+    /// Grant follows the canonical hidden RAM Finish and never publishes a client fd.
+    pub fn fifo_grant(
+        &self,
+        grant: proto_fs::FifoGrant,
+        witness: Option<Handle<Channel>>,
+    ) -> Result<crate::pipe::NamedResponse, crate::pipe::NamedRefused> {
+        let mut writer = Writer::new();
+        if let Err(status) = grant.write(&mut writer) {
+            return Err(crate::pipe::NamedRefused {
+                status,
+                capability: witness,
+            });
+        }
+        crate::pipe::send_preserving(&self.channel, writer.as_bytes(), witness)
+    }
+
+    pub fn fifo_ack(&self, ack: proto_fs::FifoAck) -> Result<(), Status> {
+        let mut writer = Writer::new();
+        ack.write(&mut writer)?;
+        let reply = Self::send_on(&self.channel, writer.as_bytes())?;
+        Self::open_reply(&reply, proto_wire::HEADER_LEN)
+    }
+
     pub fn sessions(&self) -> (&Handle<Channel>, Option<&Handle<Channel>>) {
         (&self.channel, self.uart.as_ref())
     }
