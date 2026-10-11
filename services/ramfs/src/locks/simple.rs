@@ -441,17 +441,16 @@ impl SimpleLocks {
         };
         for &index in &unallocated[..] {
             let entry = &mut work[index as usize];
-            if retained != all_old {
-                if let Some((index, previous)) =
+            if retained != all_old
+                && let Some((index, previous)) =
                     old[..count].iter().enumerate().find(|(index, previous)| {
                         retained & (1u64 << index) == 0
                             && self.page(previous.id).root() == entry.root(self, &old, root)
                     })
-                {
-                    entry.id = previous.id;
-                    entry.original = index as u8;
-                    retained |= 1u64 << index;
-                }
+            {
+                entry.id = previous.id;
+                entry.original = index as u8;
+                retained |= 1u64 << index;
             }
         }
         let first_pin = count == 0 && len != 0;

@@ -3303,6 +3303,29 @@ enum LifetimeProbe {
     Fifo,
 }
 
+fn check_lock_steps(
+    name: &str,
+    steps: &[(usize, u64, u64)],
+    required: &[usize],
+) -> Result<(), String> {
+    for kind in required {
+        if !steps
+            .iter()
+            .any(|(measured, ticks, _)| measured == kind && *ticks != 0)
+        {
+            return Err(format!(
+                "{name}: missing positive RAM method {kind} measurement"
+            ));
+        }
+    }
+    if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+        return Err(format!(
+            "{name}: dispatch exceeds {RAM_STEP_MAX}: {steps:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
@@ -3347,12 +3370,7 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
         )?;
         let steps = longest_steps(&outcome.lines, "2");
         println!("RAM full FIFO and inode dispatches (B {RAM_STEP_MAX}): {steps:?}");
-        if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
-            return Err(format!(
-                "full FIFO and inode dispatch exceeds {RAM_STEP_MAX}: {steps:?}"
-            ));
-        }
-        return Ok(());
+        return check_lock_steps("full FIFO and inode", &steps, &[50, 54, 65]);
     }
     if probe == LifetimeProbe::Pages {
         qemu::expect_marker(
@@ -3361,23 +3379,13 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
         )?;
         let steps = longest_steps(&outcome.lines, "2");
         println!("RAM fragmented lock page dispatches (B {RAM_STEP_MAX}): {steps:?}");
-        if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
-            return Err(format!(
-                "fragmented lock page dispatch exceeds {RAM_STEP_MAX}: {steps:?}"
-            ));
-        }
-        return Ok(());
+        return check_lock_steps("fragmented lock page", &steps, &[50, 65]);
     }
     if probe == LifetimeProbe::Core {
         qemu::expect_marker(&outcome, "posix-procs: full inode lock core ok")?;
         let steps = longest_steps(&outcome.lines, "2");
         println!("RAM full inode lock dispatches (B {RAM_STEP_MAX}): {steps:?}");
-        if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
-            return Err(format!(
-                "full inode lock dispatch exceeds {RAM_STEP_MAX}: {steps:?}"
-            ));
-        }
-        return Ok(());
+        return check_lock_steps("full inode lock", &steps, &[50, 49]);
     }
     if probe == LifetimeProbe::Rules {
         qemu::expect_marker(&outcome, "posix-procs: lock lifecycle rules ok")?;
@@ -7247,6 +7255,18 @@ fn ci(jobs: usize) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lock_budget_requires_actual_measurements() {
+        let measured = [(50, 18_336, 0), (65, 15_419, 0)];
+        assert!(super::check_lock_steps("pages", &measured, &[50, 65]).is_ok());
+        assert!(super::check_lock_steps("pages", &[], &[50, 65]).is_err());
+        assert!(super::check_lock_steps("pages", &measured[..1], &[50, 65]).is_err());
+        let zero = [(50, 0, 0), (65, 15_419, 0)];
+        assert!(super::check_lock_steps("pages", &zero, &[50, 65]).is_err());
+        let over = [(50, super::RAM_STEP_MAX + 1, 0), (65, 15_419, 0)];
+        assert!(super::check_lock_steps("pages", &over, &[50, 65]).is_err());
+    }
+
     fn names_log(repeats: &str) -> Vec<String> {
         [
             "posix-procs: names time a missing component: 73 requests, 617628 ticks",

@@ -576,17 +576,18 @@ impl<H> Waits<H> {
                 let _ = self.finish(queue, id, proto_fs::LOCK_CANCELLED);
             }
             let r = self.registrations[slot].as_mut().unwrap();
-            if r.checking && !self.active {
-                if let Owner::Process(pid) = r.captured.request.owner {
-                    self.check.start(id, pid);
-                    self.active = true;
-                }
+            if r.checking
+                && !self.active
+                && let Owner::Process(pid) = r.captured.request.owner
+            {
+                self.check.start(id, pid);
+                self.active = true;
             }
-            if r.dirty {
-                if let Some(handle) = r.handle.as_ref() {
-                    notify(handle);
-                    r.dirty = false;
-                }
+            if r.dirty
+                && let Some(handle) = r.handle.as_ref()
+            {
+                notify(handle);
+                r.dirty = false;
             }
         }
         1
@@ -798,14 +799,13 @@ impl<H> Waits<H> {
                 if older.number >= r.number {
                     break;
                 }
-                if Self::incompatible(&older.captured.request, &request) {
-                    if let Owner::Process(blocker) = older.captured.request.owner {
-                        if live(Owner::Process(blocker)) {
-                            self.check.blockers[self.check.blockers_len] =
-                                Some((blocker, at, older.number));
-                            self.check.blockers_len += 1;
-                        }
-                    }
+                if Self::incompatible(&older.captured.request, &request)
+                    && let Owner::Process(blocker) = older.captured.request.owner
+                    && live(Owner::Process(blocker))
+                {
+                    self.check.blockers[self.check.blockers_len] =
+                        Some((blocker, at, older.number));
+                    self.check.blockers_len += 1;
                 }
                 at = older.next;
             }

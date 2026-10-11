@@ -3616,8 +3616,8 @@ fn lock_words(bytes: &[u8]) -> [u64; 5] {
         ];
     }
     let mut words = [0; 5];
-    for (word, bytes) in words.iter_mut().zip(bytes.chunks_exact(8)) {
-        *word = u64::from_le_bytes(bytes.try_into().unwrap());
+    for (word, bytes) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *word = u64::from_le_bytes(*bytes);
     }
     words
 }
