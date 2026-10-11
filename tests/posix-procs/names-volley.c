@@ -639,16 +639,10 @@ static int vz_child(void) {
     }
     {
         pthread_t eighth;
-        pthread_attr_t eighth_attr;
-        void *eighth_stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
-                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        VZ_CHECK(eighth_stack != MAP_FAILED);
-        VZ_CHECK(pthread_attr_init(&eighth_attr) == 0);
-        VZ_CHECK(pthread_attr_setstack(&eighth_attr, eighth_stack, stack_size) == 0);
         __atomic_store_n(&vz_hold, 0, __ATOMIC_RELEASE);
-        /* The caller owns this normal 64 KiB stack and releases it after
-         * join. Keep all eight threads alive while measuring stack and TLS. */
-        VZ_CHECK(pthread_create(&eighth, &eighth_attr, vz_idle, NULL) == 0);
+        /* Keep all eight threads alive while measuring the normal 64 KiB
+         * stack, TLS and native thread allocation overhead. */
+        VZ_CHECK(pthread_create(&eighth, &attr, vz_idle, NULL) == 0);
         {
             char line[512];
             int length = snprintf(line, sizeof line,
@@ -659,8 +653,6 @@ static int vz_child(void) {
         }
         __atomic_store_n(&vz_hold, 1, __ATOMIC_RELEASE);
         VZ_CHECK(pthread_join(eighth, NULL) == 0);
-        VZ_CHECK(pthread_attr_destroy(&eighth_attr) == 0);
-        VZ_CHECK(munmap(eighth_stack, stack_size) == 0);
         unsigned long long quota = stafeto_probe_memory_quota();
         unsigned long long used = stafeto_probe_memory_used();
         VZ_CHECK(quota >= used && quota != 0);
