@@ -559,7 +559,7 @@ def compact_changed_events(event_list, fde):
 
 
 def prove_finite_prefix_exit(fde, branch_pc, call_pc, instructions):
-    """A forward pre-frame branch may only bypass to MOV/NOP then RET."""
+    """A forward pre-frame branch has a proved finite entry-context exit."""
     mnemonic, operands = instructions[branch_pc]
     require(mnemonic.startswith('b.') or mnemonic in ('cbz', 'cbnz', 'tbz', 'tbnz'),
             'unsupported caller prefix branch')
@@ -571,11 +571,61 @@ def prove_finite_prefix_exit(fde, branch_pc, call_pc, instructions):
     branch_row = row_at(original, branch_pc, fde.cie.initial, fde.cie.data)
     require(branch_row.cfa == (31, 0) and all(branch_row.rule(r) == ('same', r) for r in range(19, 31)),
             'prefix branch has non-entry recovery row')
-    prove_finite_return(fde, target, fde.start + fde.size, instructions)
+    prove_finite_return(fde, target, fde.start + fde.size, instructions, branch_pc)
 
 
-def prove_finite_return(fde, target, limit, instructions):
+def prove_object_exit_store(fde, branch_pc, target, store_pc, instructions):
+    """One typed-object STRH follows an exact volatile argument/ADD path."""
+    require(branch_pc is not None, 'object exit lacks exact branch provenance')
+    path = [*range(fde.start, branch_pc, 4), *range(target, store_pc, 4)]
     original = events(fde.program, fde.start, fde.cie.code)
+    bases = {r: False for r in range(8)}
+    for pc in path:
+        require(pc in instructions, 'missing object exit provenance instruction')
+        row = row_at(original, pc, fde.cie.initial, fde.cie.data)
+        require(row.cfa == (31, 0) and all(row.rule(r) == ('same', r) for r in range(19, 31)),
+                'object exit provenance has changed recovery row')
+        op, args = instructions[pc]
+        require(op not in ('b', 'bl', 'br', 'blr', 'ret', 'svc', 'cbz', 'cbnz', 'tbz', 'tbnz') and
+                not op.startswith('b.') and not op.startswith('st'),
+                'object exit provenance is not straight-line')
+        require(not re.search(r'\b(?:sp|wsp|x29|w29)\b', args),
+                'object exit provenance uses a frame source')
+        destinations = written_registers(op, args)
+        require(destinations <= set(range(19)), 'object exit provenance changes entry context')
+        derived = None
+        add = re.fullmatch(r'x(\d+), x(\d+), #0x([0-9a-f]+)(?:, lsl #12)?', args)
+        move = re.fullmatch(r'x(\d+), x(\d+)', args)
+        if op == 'add' and add and int(add[2]) in bases:
+            derived = (int(add[1]), True)
+        elif op == 'mov' and move and int(move[2]) in bases:
+            derived = (int(move[1]), bases[int(move[2])])
+        for register in destinations:
+            bases.pop(register, None)
+        if derived:
+            bases[derived[0]] = derived[1]
+    op, args = instructions[store_pc]
+    memory = re.fullmatch(r'w(\d+), \[x(\d+), #0x([0-9a-f]+)\]', args)
+    require(op == 'strh' and memory is not None and int(memory[1]) < 19 and
+            int(memory[2]) < 19 and bases.get(int(memory[2])) is True,
+            'unsupported or unproved object exit STRH')
+    return_pc = next((pc for pc in range(store_pc + 4, fde.start + fde.size, 4)
+                      if instructions.get(pc, ('', ''))[0] == 'ret'), None)
+    require(return_pc is not None, 'object exit lacks a finite RET')
+    protected = set(path) | {branch_pc} | set(range(target, return_pc + 4, 4))
+    protected.discard(fde.start)
+    for source, (op, args) in instructions.items():
+        if op in ('b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz') or op.startswith('b.'):
+            edge = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', args)
+            require(edge is not None, 'unknown object exit incoming branch')
+            destination = int(edge[1], 16)
+            require(destination not in protected or (source == branch_pc and destination == target),
+                    'foreign entry into object exit provenance')
+
+
+def prove_finite_return(fde, target, limit, instructions, branch_pc=None):
+    original = events(fde.program, fde.start, fde.cie.code)
+    object_store = False
     for pc in range(target, limit, 4):
         require(pc in instructions, 'missing caller prefix exit instruction')
         row = row_at(original, pc, fde.cie.initial, fde.cie.data)
@@ -585,6 +635,11 @@ def prove_finite_return(fde, target, limit, instructions):
         if op == 'ret':
             require(args in ('', 'x30'), 'prefix exit returns through unknown register')
             return
+        if op == 'strh':
+            require(not object_store, 'multiple object exit stores')
+            prove_object_exit_store(fde, branch_pc, target, pc, instructions)
+            object_store = True
+            continue
         require(op in ('mov', 'movz', 'movn', 'movk', 'nop') and
                 written_registers(op, args) <= set(range(19)), 'prefix exit is not volatile-only finite return')
     raise Invalid('prefix exit has no finite RET')
@@ -715,7 +770,7 @@ def prove_lr_store(fde, call_pc, after, instructions, targets):
                     row = row_at(original, boundary, fde.cie.initial, fde.cie.data)
                     require(row.cfa == (31, 0) and all(row.rule(r) == ('same', r) for r in range(19, 31)),
                             'inverse prefix has non-entry recovery row')
-                prove_finite_return(fde, pc + 4, target, instructions)
+                prove_finite_return(fde, pc + 4, target, instructions, pc)
                 allowed_entries.add(target)
                 skip_until = target
             else:
