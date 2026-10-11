@@ -4,10 +4,37 @@
 //! Exact inode wake masks advance independently of optional proof snapshots.
 
 use super::{
+    actor::{Command, ReadState, Reader},
+    request::Captured,
+    service::LockService,
+};
+use super::{
     wait_receipts::{Phase as ReceiptPhase, Queue},
     waiters::{CAPACITY, Phase, Pool, RegistrationToken},
 };
-use crate::storage::{NODES, Token};
+use crate::storage::{NODES, Storage, Token};
+
+struct Recheck {
+    registration: RegistrationToken,
+    captured: Captured,
+    reader: Reader,
+}
+fn sleeping(queue: &Queue, pool: &Pool, token: RegistrationToken) -> Option<Captured> {
+    let (input, phase) = pool.snapshot(token).ok()?;
+    let (captured, receipt_phase, cancelling) = queue.snapshot(token.receipt()).ok()?;
+    if phase != Phase::Sleeping
+        || receipt_phase != ReceiptPhase::Sleeping
+        || cancelling
+        || input.receipt != token.receipt()
+        || input.root != captured.root
+        || input.inode != captured.request.inode
+        || input.range != captured.request.range
+        || !matches!(captured.request.command, Command::Set(Some(kind)) if kind == input.kind)
+    {
+        return None;
+    }
+    Some(captured)
+}
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -26,6 +53,9 @@ pub struct Events {
     registrations: [Option<(RegistrationToken, Token)>; CAPACITY],
     occupied: u16,
     pending: u16,
+    rechecks: u16,
+    recheck_next: u8,
+    recheck: Option<Recheck>,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Progress {
@@ -50,6 +80,9 @@ impl Events {
             }
             core::ptr::addr_of_mut!((*destination).occupied).write(0);
             core::ptr::addr_of_mut!((*destination).pending).write(0);
+            core::ptr::addr_of_mut!((*destination).rechecks).write(0);
+            core::ptr::addr_of_mut!((*destination).recheck_next).write(0);
+            core::ptr::addr_of_mut!((*destination).recheck).write(None);
         }
     }
     pub fn attach(&mut self, pool: &Pool, registration: RegistrationToken) -> Result<(), u32> {
@@ -91,6 +124,14 @@ impl Events {
         *cell = None;
         self.occupied &= !(1 << registration.slot());
         self.pending &= !(1 << registration.slot());
+        self.rechecks &= !(1 << registration.slot());
+        if self
+            .recheck
+            .as_ref()
+            .is_some_and(|r| r.registration == registration)
+        {
+            self.recheck = None;
+        }
         Ok(())
     }
     pub fn changed(&mut self, inode: Token) {
@@ -100,9 +141,102 @@ impl Events {
             self.pending |= entry.registrations;
         }
     }
-    /// Logical PID removal and the private life timer can affect several inodes.
+    /// Logical PID removal and the private life timer request real read-only checks.
     pub fn poll(&mut self) {
-        self.pending |= self.occupied;
+        // Read-only life/eligibility revalidation must not manufacture a new phase.
+        self.rechecks |= self.occupied;
+    }
+
+    pub fn recheck_pending(&self) -> bool {
+        self.rechecks != 0 || self.recheck.is_some()
+    }
+
+    fn ready_exact(
+        queue: &mut Queue,
+        pool: &mut Pool,
+        token: RegistrationToken,
+    ) -> Result<usize, u32> {
+        if sleeping(queue, pool, token).is_none() {
+            return Ok(0);
+        }
+        pool.ready(token)?;
+        queue.ready(token.receipt())?;
+        Ok(1)
+    }
+    /// One exact registration barrier and at most seven real Reader visits.
+    /// Source checks use the actual session/FD/PID/OFD state supplied by the service.
+    pub fn recheck_part(
+        &mut self,
+        queue: &mut Queue,
+        pool: &mut Pool,
+        locks: &LockService,
+        storage: &Storage<'_>,
+        mut source_live: impl FnMut(super::wait_receipts::Id, Captured) -> bool,
+        life: (impl FnMut(u32) -> bool, impl FnMut(Token) -> bool),
+    ) -> Result<Progress, u32> {
+        let (pid_live, ofd_live) = life;
+        if let Some(mut active) = self.recheck.take() {
+            let mut progress = Progress {
+                visited: 1,
+                readied: 0,
+            };
+            let token = active.registration;
+            if sleeping(queue, pool, token) != Some(active.captured) {
+                return Ok(progress);
+            }
+            if !source_live(token.receipt(), active.captured) {
+                progress.readied = Self::ready_exact(queue, pool, token)?;
+                return Ok(progress);
+            }
+            let read = locks.reader_part_limit(storage, &mut active.reader, 7, pid_live, ofd_live);
+            progress.visited += read.visited;
+            if read.blockers.iter().any(Option::is_some) {
+                // This proves only blocked WAIT. Proof still validates its own edges,
+                // watched inode revisions, exact registrations and genuine owner life.
+                return Ok(progress);
+            }
+            match read.state {
+                ReadState::More => self.recheck = Some(active),
+                ReadState::Done | ReadState::Invalidated => {
+                    progress.readied = Self::ready_exact(queue, pool, token)?;
+                }
+            }
+            return Ok(progress);
+        }
+        let rotated = self.rechecks.rotate_right(u32::from(self.recheck_next));
+        if rotated == 0 {
+            return Ok(Progress::default());
+        }
+        let slot = (rotated.trailing_zeros() as usize + usize::from(self.recheck_next)) % CAPACITY;
+        self.recheck_next = ((slot + 1) % CAPACITY) as u8;
+        self.rechecks &= !(1 << slot);
+        let mut progress = Progress {
+            visited: 1,
+            readied: 0,
+        };
+        let Some((token, _)) = self.registrations[slot] else {
+            return Ok(progress);
+        };
+        let Some(captured) = sleeping(queue, pool, token) else {
+            return Ok(progress);
+        };
+        if !source_live(token.receipt(), captured) {
+            progress.readied = Self::ready_exact(queue, pool, token)?;
+            return Ok(progress);
+        }
+        match locks.reader(storage, captured.request) {
+            Ok(Some(reader)) => {
+                self.recheck = Some(Recheck {
+                    registration: token,
+                    captured,
+                    reader,
+                })
+            }
+            // Optional saturated snapshots and real invalidation use the ordinary
+            // Actor admission/source checks, without any new canonical error.
+            Ok(None) | Err(_) => progress.readied = Self::ready_exact(queue, pool, token)?,
+        }
+        Ok(progress)
     }
     pub fn pending(&self) -> bool {
         self.pending != 0
@@ -142,3 +276,5 @@ impl Events {
 #[cfg(test)]
 #[path = "wait_events_tests.rs"]
 mod tests;
+
+const _: () = assert!(core::mem::size_of::<Recheck>() < 1024);

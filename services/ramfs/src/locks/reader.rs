@@ -80,6 +80,15 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
     pub fn reader_part(
         &self,
         reader: &mut Reader,
+        pid_live: impl FnMut(u32) -> bool,
+        ofd_live: impl FnMut(Token) -> bool,
+    ) -> ReadProgress {
+        self.reader_part_limit(reader, records::PORTION, pid_live, ofd_live)
+    }
+    pub fn reader_part_limit(
+        &self,
+        reader: &mut Reader,
+        limit: usize,
         mut pid_live: impl FnMut(u32) -> bool,
         mut ofd_live: impl FnMut(Token) -> bool,
     ) -> ReadProgress {
@@ -106,7 +115,7 @@ impl<const G: usize, const I: usize, const P: usize, const D: usize, const R: us
             range: reader.request.range,
         };
         let mut count = 0;
-        while result.visited < records::PORTION {
+        while result.visited < limit.min(records::PORTION) {
             if reader.entered && reader.record.is_none() {
                 reader.group = reader.next;
                 reader.entered = false;

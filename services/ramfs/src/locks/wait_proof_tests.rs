@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 extern crate std;
 use super::*;
+use crate::locks::waiters::Phase as SleepPhase;
 use crate::locks::{
     Kind,
     actor::{Command, Error, Response},
@@ -587,4 +588,325 @@ fn positive_outcome_carries_direct_registration_and_never_other_receipt_or_reuse
     assert_eq!(reused.slot(), a.slot());
     assert_ne!(reused.receipt(), a.receipt());
     assert_eq!(outcome.sleeping_registration(&f.queue, &f.pool), None);
+}
+
+fn new_events() -> Box<super::super::wait_events::Events> {
+    let mut events = Box::<super::super::wait_events::Events>::new_uninit();
+    // SAFETY: exclusive aligned permanent allocation initialized directly.
+    unsafe {
+        super::super::wait_events::Events::initialize_at(events.as_mut_ptr());
+        events.assume_init()
+    }
+}
+fn recheck(
+    f: &mut Fixture,
+    events: &mut super::super::wait_events::Events,
+) -> super::super::wait_events::Progress {
+    let (storage, descriptions) = f.ram.lock_parts_ref();
+    let progress = events
+        .recheck_part(
+            &mut f.queue,
+            &mut f.pool,
+            &f.locks,
+            storage,
+            |id, captured| {
+                let index = usize::from(id.slot()) / super::super::wait_receipts::SHARE;
+                f.fds.get(index).is_some_and(|fds| {
+                    let live = match captured.request.owner {
+                        crate::locks::Owner::Process(pid) => {
+                            f.page.live(pid)
+                                && fds.binding.snapshot_ref().is_some_and(|who| who.pid == pid)
+                        }
+                        crate::locks::Owner::Description { slot, generation } => {
+                            descriptions.live(Token { slot, generation })
+                        }
+                    };
+                    live && !fds.departed
+                        && f.ram
+                            .live_description(fds, captured.source)
+                            .ok()
+                            .is_some_and(|(inode, _)| inode == captured.request.inode)
+                })
+            },
+            (|pid| f.page.live(pid), |ofd| descriptions.live(ofd)),
+        )
+        .unwrap();
+    assert!(progress.visited <= 8);
+    progress
+}
+#[test]
+fn heartbeat_keeps_blocked_proof_authority_and_full_cycle_progress_at_256() {
+    use crate::locks::dispatch::{CleanupDispatch, CleanupWork};
+    let mut f = Fixture::new();
+    for index in 0..20_u32 {
+        let pid = 256 + index;
+        if index >= 16 {
+            f.page.publish(pid).unwrap();
+            let name = std::format!("background{index}");
+            let mut fds = Fds::default();
+            let parent = f.ram.storage.resolve(b"/").unwrap();
+            let reservation = f
+                .ram
+                .reserve_create(&mut fds, parent, name.as_bytes(), crate::REG)
+                .unwrap();
+            f.ram.commit_create(&mut fds, reservation).unwrap();
+        }
+        let name = if index < 16 {
+            std::format!("/ring{index}")
+        } else {
+            std::format!("/background{index}")
+        };
+        let (fd_index, mut wire, _) = f.captured(pid, &name, LockKind::Write, 0);
+        if index >= 16 {
+            f.fds[fd_index].root = crate::storage::Root {
+                id: 1000 + u64::from(index),
+                generation: 1,
+            };
+        }
+        let count = if index < 16 { 12 } else { 16 };
+        for segment in 0..count {
+            wire.start = if segment == 0 { 0 } else { 20 + 2 * segment };
+            wire.length = if segment == 0 { 10 } else { 1 };
+            let captured = f.ram.capture_wait(&f.fds[fd_index], wire).unwrap();
+            assert_eq!(f.actor(captured), Ok(Response::Changed));
+            f.drain();
+        }
+    }
+    assert_eq!(f.locks.counts().published, 256);
+    let tokens: std::vec::Vec<_> = (0..16)
+        .map(|index| {
+            f.wait(
+                256 + index,
+                &std::format!("/ring{}", (index + 1) % 16),
+                index,
+            )
+        })
+        .collect();
+    let revisions: std::vec::Vec<_> = tokens
+        .iter()
+        .map(|&token| f.pool.proof_snapshot(token).unwrap())
+        .collect();
+    let mut events = new_events();
+    for &token in &tokens {
+        events.attach(&f.pool, token).unwrap();
+    }
+    assert!(f.start(tokens[0], 1));
+    let mut dispatch = CleanupDispatch::default();
+    let mut coordinator = Fds {
+        binding: Binding::Active(who(300)),
+        ..Fds::default()
+    };
+    let mut result = None;
+    let mut rechecked = 0;
+    for turn in 0..32768_u64 {
+        // Genuine unrelated close/replay every turn, plus an unchanged-life heartbeat.
+        let fd = f
+            .ram
+            .open(&mut coordinator, "/unrelated", proto_fs::READ_WRITE)
+            .unwrap();
+        let held = f.ram.capture_description(&coordinator, fd).unwrap().0;
+        let event = proto_fs::CloseEvent {
+            key: proto_fs::CloseKey {
+                slot: 48,
+                generation: turn + 1,
+            },
+            packed: f.ram.marked_open(&coordinator, held).unwrap(),
+            description_generation: held.description.generation,
+            last_alias: true,
+        };
+        if let Some(inode) = f
+            .ram
+            .close_event(&mut coordinator, &mut f.locks, event)
+            .unwrap()
+        {
+            events.changed(inode);
+        }
+        assert_eq!(
+            f.ram
+                .close_event(&mut coordinator, &mut f.locks, event)
+                .unwrap(),
+            None
+        );
+        f.ram.close(&mut coordinator, fd).unwrap();
+        events.poll();
+        match dispatch.next(events.pending(), result.is_none(), events.recheck_pending()) {
+            CleanupWork::Events => {
+                assert_eq!(events.part(&mut f.queue, &mut f.pool).unwrap().readied, 0);
+            }
+            CleanupWork::Proof => {
+                result = f.step().outcome;
+            }
+            CleanupWork::Recheck => {
+                assert_eq!(recheck(&mut f, &mut events).readied, 0);
+                rechecked += 1;
+            }
+            CleanupWork::Receipts => {}
+        }
+        for (&token, &before) in tokens.iter().zip(&revisions) {
+            assert_eq!(f.pool.proof_snapshot(token), Some(before));
+        }
+        if result.is_some() {
+            break;
+        }
+    }
+    assert!(rechecked >= 16);
+    assert_eq!(result.unwrap().verdict, Verdict::Deadlock);
+    assert_eq!(f.locks.counts().published, 256);
+    std::println!(
+        "WAIT Events={} Reader={}",
+        core::mem::size_of::<super::super::wait_events::Events>(),
+        core::mem::size_of::<Reader>()
+    );
+}
+
+#[test]
+fn live_blocker_recheck_preserves_fifo_then_real_unlock_readies_exact_request() {
+    let (mut f, a, b) = Fixture::cycle();
+    let mut events = new_events();
+    events.attach(&f.pool, a).unwrap();
+    events.attach(&f.pool, b).unwrap();
+    let before = f.pool.proof_snapshot(a).unwrap();
+    events.poll();
+    for _ in 0..64 {
+        if !events.recheck_pending() {
+            break;
+        }
+        assert_eq!(recheck(&mut f, &mut events).readied, 0);
+    }
+    assert_eq!(f.pool.proof_snapshot(a), Some(before));
+    let (_, wire, _) = f.captured(257, "/b", LockKind::Write, 0);
+    let mut captured = f.ram.capture_wait(f.fds.last().unwrap(), wire).unwrap();
+    captured.request.command = Command::Set(None);
+    assert_eq!(f.actor(captured), Ok(Response::Changed));
+    f.drain();
+    events.poll();
+    for _ in 0..64 {
+        if !events.recheck_pending() {
+            break;
+        }
+        events.poll();
+        recheck(&mut f, &mut events);
+    }
+    assert_eq!(f.pool.snapshot(a).unwrap().1, SleepPhase::Ready);
+    assert_eq!(f.pool.snapshot(b).unwrap().1, SleepPhase::Sleeping);
+    assert_eq!(f.pool.snapshot(a).unwrap().0.range, before.0.range);
+    assert_eq!(f.pool.find(a.receipt()), Some(a));
+}
+
+#[test]
+fn reused_backend_and_dead_owner_do_not_hide_behind_live_blocker() {
+    for reused in [false, true] {
+        let (mut f, a, _) = Fixture::cycle();
+        let mut events = new_events();
+        events.attach(&f.pool, a).unwrap();
+        events.poll();
+        recheck(&mut f, &mut events);
+        if reused {
+            let index = usize::from(a.receipt().slot()) / super::super::wait_receipts::SHARE;
+            let source = f.queue.snapshot(a.receipt()).unwrap().0.source;
+            f.ram.close(&mut f.fds[index], source.fd).unwrap();
+            let next = f
+                .ram
+                .open(&mut f.fds[index], "/b", proto_fs::READ_WRITE)
+                .unwrap();
+            assert_eq!(next, source.fd);
+            assert_ne!(
+                f.ram
+                    .capture_description(&f.fds[index], next)
+                    .unwrap()
+                    .0
+                    .description,
+                source.description
+            );
+        } else {
+            assert!(f.page.retire(256));
+        }
+        assert_eq!(recheck(&mut f, &mut events).readied, 1);
+        assert_eq!(f.pool.snapshot(a).unwrap().1, SleepPhase::Ready);
+        if reused {
+            let index = usize::from(a.receipt().slot()) / super::super::wait_receipts::SHARE;
+            wait_server::begin(
+                &mut f.queue,
+                &mut f.locks,
+                &mut f.ram,
+                a.receipt(),
+                Some(&f.fds[index]),
+            )
+            .unwrap();
+            assert_eq!(f.queue.query(a.receipt()).unwrap().result, proto_fs::BAD_FD);
+        }
+    }
+}
+
+#[test]
+fn canonical_success_during_recheck_keeps_original_result_and_custody() {
+    let (mut f, a, _) = Fixture::cycle();
+    let mut events = new_events();
+    events.attach(&f.pool, a).unwrap();
+    events.poll();
+    assert_eq!(recheck(&mut f, &mut events).readied, 0);
+    let success = proto_fs::WaitReply {
+        phase: proto_fs::WaitPhase::Complete,
+        result: 0,
+    };
+    f.queue.complete(a.receipt(), success).unwrap();
+    assert!(f.page.retire(256));
+    assert_eq!(recheck(&mut f, &mut events).readied, 0);
+    assert_eq!(f.queue.query(a.receipt()).unwrap(), success);
+    assert_eq!(f.pool.count(), 2);
+}
+
+#[test]
+fn dead_previous_pid_blocker_is_not_proved_by_another_remaining_live_blocker() {
+    let mut f = Fixture::new();
+    f.hold(256, "/a", LockKind::Write);
+    f.hold(257, "/b", LockKind::Read);
+    f.hold(258, "/b", LockKind::Read);
+    let a = f.wait(256, "/b", 0);
+    f.wait(257, "/a", 1);
+    let mut events = new_events();
+    events.attach(&f.pool, a).unwrap();
+    let before = f.pool.proof_snapshot(a).unwrap();
+    assert!(f.start(a, 1));
+    assert!(f.page.retire(257));
+    events.poll();
+    for _ in 0..64 {
+        if !events.recheck_pending() {
+            break;
+        }
+        assert_eq!(recheck(&mut f, &mut events).readied, 0);
+    }
+    assert_eq!(f.pool.proof_snapshot(a), Some(before));
+    assert_ne!(f.finish().verdict, Verdict::Deadlock);
+}
+
+#[test]
+fn first_blocked_pid_without_own_group_keeps_sleeping_until_true_death() {
+    let mut f = Fixture::new();
+    f.hold(257, "/b", LockKind::Write);
+    let token = f.wait(256, "/b", 0);
+    // Conflict finishes before group admission. A live first requester therefore
+    // has no logical lock head; that absence is not Process death.
+    assert!(f.page.live(256));
+    assert!(!f.locks.pid_visible(256));
+    let before = f.pool.proof_snapshot(token).unwrap();
+    let mut events = new_events();
+    events.attach(&f.pool, token).unwrap();
+    for _ in 0..32 {
+        events.poll();
+        assert_eq!(recheck(&mut f, &mut events).readied, 0);
+        assert_eq!(f.pool.proof_snapshot(token), Some(before));
+    }
+    // Real death remains authoritative even though the other PID's blocker lives.
+    assert!(f.page.retire(256));
+    events.poll();
+    let mut readied = 0;
+    for _ in 0..32 {
+        readied += recheck(&mut f, &mut events).readied;
+        if readied != 0 {
+            break;
+        }
+    }
+    assert_eq!(readied, 1);
+    assert_eq!(f.pool.snapshot(token).unwrap().1, SleepPhase::Ready);
 }

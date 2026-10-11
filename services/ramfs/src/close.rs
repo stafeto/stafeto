@@ -43,17 +43,18 @@ impl Ram<'_> {
     }
 
     /// Apply one genuine alias close exactly once while preserving physical custody.
+    /// A fresh event identifies its validated inode; exact replay has no new effect.
     pub fn close_event(
         &mut self,
         fds: &mut Fds,
         locks: &mut LockService,
         event: CloseEvent,
-    ) -> Result<(), u32> {
+    ) -> Result<Option<Token>, u32> {
         let index = event.validate()?;
         if let Some(previous) = fds.close_receipts[index] {
             if previous.key.generation == event.key.generation {
                 return if previous == event {
-                    Ok(())
+                    Ok(None)
                 } else {
                     Err(proto_fs::INVALID_ARGUMENT)
                 };
@@ -102,6 +103,6 @@ impl Ram<'_> {
             }
         }
         fds.close_receipts[index] = Some(event);
-        Ok(())
+        Ok(Some(inode))
     }
 }

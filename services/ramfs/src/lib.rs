@@ -1249,6 +1249,16 @@ impl<'a> Ram<'a> {
         )
     }
 
+    /// Borrow genuine fd counts without acquiring mutable storage for a read-only pass.
+    pub fn lock_parts_ref(&self) -> (&Storage<'a>, DescriptionLifetimes<'_>) {
+        (
+            &self.storage,
+            DescriptionLifetimes {
+                descriptions: &self.descriptions,
+            },
+        )
+    }
+
     pub fn description_token(&self, fds: &Fds, fd: u32) -> Result<Token, u32> {
         let slot = fds.description(fd)?;
         Ok(Token {
