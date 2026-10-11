@@ -464,7 +464,7 @@ const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 10] = {
 const POSIX_TTY_CONTROL_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_TTY_STEPS_PROGRAMS;
     programs[2].3 = &["quiet-steps"];
-    programs[5].3 = &["tty-probe"];
+    programs[5].3 = &[];
     programs[8].3 = &["quiet-control"];
     programs[9].3 = &["quiet-control"];
     programs

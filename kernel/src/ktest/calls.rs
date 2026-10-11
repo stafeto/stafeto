@@ -3108,7 +3108,7 @@ pub fn long_call_polls_end_the_entry_interval(_: &Boot) -> Result<(), &'static s
             "the portions of mem_create did not end the entry interval",
         )?;
         check(
-            start != 0 && start != initial_start,
+            start > initial_start,
             "a portion of mem_create after a poll started no interval",
         )?;
         c.close(h)?;
@@ -3148,7 +3148,7 @@ pub fn long_call_polls_end_the_entry_interval(_: &Boot) -> Result<(), &'static s
             "another call did not give the long call up",
         )?;
         check(
-            start != 0 && start != initial_start,
+            start > initial_start,
             "the call after a long call given up ran in no interval",
         )
     })
