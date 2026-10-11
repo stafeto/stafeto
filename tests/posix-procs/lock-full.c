@@ -25,6 +25,13 @@ extern int full_source(unsigned, uint64_t[2]);
 #ifndef FULL_WAKE
 #define FULL_WAKE 0
 #endif
+#ifndef FULL_DEATH
+#define FULL_DEATH 0
+#endif
+#if FULL_DEATH
+static pid_t death_runner;
+static int death_reaped;
+#endif
 #if FULL_CAPACITY
 static volatile sig_atomic_t capacity_signal;
 #if FULL_WAKE
@@ -237,7 +244,7 @@ static int hold(unsigned local) {
     #if FULL_WAKE
     if (index < 17 && wake_wait(fd, target, index, &r)) return 1;
 #else
-    if (index < 17 && capacity_wait(target, index, &r)) return 1;
+    if (index < (FULL_DEATH ? 16u : 17u) && capacity_wait(target, index, &r)) return 1;
 #endif
 #else
     if (index < 16 && ring_wait(fd, target, index, &r)) return 1;
@@ -433,6 +440,9 @@ static int ring_rows(int fd, uint64_t epoch) {
 }
 
 #endif
+#if FULL_DEATH
+#include "lock-full-death.c"
+#endif
 static int coordinator(void) {
     int fd = open("/tmp/lock-full-controller", O_RDWR);
     if (fd < 0) return fail("controller open", 0);
@@ -512,7 +522,11 @@ static int coordinator(void) {
     #if FULL_WAKE
     if (wake_capture(fd, observer_source, wake_witness, wake_source, epoch, records)) return 1;
 #else
+#if FULL_DEATH
+    if (death_capture(fd, observer_source, epoch, records)) return 1;
+#else
     if (capacity_capture(fd, observer_source, epoch, records)) return 1;
+#endif
 #endif
 #else
     if (ring_capture(fd, epoch, records)) return 1;
@@ -525,6 +539,9 @@ static int coordinator(void) {
     if (full_telemetry((unsigned)fd, 6, cookie, 0, 0, out) != -310)
         return fail("identity forbidden after Stop", 0);
     if (ring_rows(fd, epoch)) return 1;
+#if FULL_DEATH
+    if (death_rows(fd, epoch, &records[0])) return 1;
+#endif
 #endif
     printf("lock-full: %s profile=%u participating=%u owners=%u published=256 private=0 retired=0 common=128 payers=8 epoch=%llu\n",
            FULL_RING ? "initial" : "stable", profile, profile, first(8), (unsigned long long)epoch);
@@ -554,8 +571,16 @@ int main(int argc, char **argv) {
     pid_t child = -1;
     int spawned = posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, env);
     if (spawned) { errno = spawned; return fail("spawn mapped runner", family); }
+#if FULL_DEATH
+    death_runner = child;
+#endif
     int bad = !family ? coordinator() : 0;
-    if (reap(child)) bad = fail("runner Page dead", family);
+#if FULL_DEATH
+    if ((!family && death_reaped) ? 0 : reap(child))
+#else
+    if (reap(child))
+#endif
+        bad = fail("runner Page dead", family);
     if (!bad) printf("lock-full: genuine family %u profile=%u ok\n", family, profile);
     return bad;
 }

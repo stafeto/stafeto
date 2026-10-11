@@ -15,6 +15,7 @@ bench = false
 
 [features]
 lock-full-wake = ["lock-full-capacity"]
+lock-full-death = ["lock-full-capacity"]
 lock-full-capacity = ["lock-full-ring"]
 lock-full-ring = ["lock-full-fixture", "posix-abi/wait-probe"]
 lock-full-fixture = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt", "dep:posix-fs"]

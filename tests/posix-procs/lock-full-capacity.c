@@ -52,7 +52,7 @@ static int capacity_exact(const struct record *initial, const struct record *r) 
     return r->label == initial->label && r->pid == initial->pid && r->key_generation
         && r->key_slot < 16 && !memcmp(r->wait_source, initial->wait_source, sizeof(r->wait_source));
 }
-#if !FULL_WAKE
+#if !FULL_WAKE && !FULL_DEATH
 static int capacity_capture(int fd, int source, uint64_t epoch, const struct record initial[20]) {
     char name[64];
     for (unsigned i = 0; i < 16; ++i) {
