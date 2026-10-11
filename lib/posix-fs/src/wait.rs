@@ -7,7 +7,7 @@
 use super::{FsError, PosixFs, RamTarget, Target};
 use entries::{Frame, nested};
 pub use posix_fd::{
-    EntryToken, OwnerToken, WaitCancelReason, WaitChannelDebt, WaitClaim, WaitPlace,
+    EntryToken, OwnerToken, WAIT_RECORDS, WaitCancelReason, WaitChannelDebt, WaitClaim, WaitPlace,
     WaitRecordPhase, WaitResult, WaitSnapshot, WaitToken,
 };
 use proto_fs::{DataDescription, LockKind, WaitKey, WaitMode, WaitPhase, WaitReply, WaitStart};
@@ -254,11 +254,26 @@ impl PosixFs {
         current: Frame,
         skip: Option<WaitToken>,
     ) -> Result<Option<WaitToken>, FsError> {
+        self.pick_wait_cleanup_from(me, current, skip, 0)
+    }
+    /// Visit at most sixteen physical slots from the caller's next position.
+    /// The caller publishes rotation before an unlocked helper can be interrupted.
+    pub fn pick_wait_cleanup_from(
+        &mut self,
+        me: Option<OwnerToken>,
+        current: Frame,
+        skip: Option<WaitToken>,
+        cursor: usize,
+    ) -> Result<Option<WaitToken>, FsError> {
         let mut tokens = [None; posix_fd::WAIT_RECORDS];
-        for (i, t) in self.wait_tokens().enumerate() {
-            tokens[i] = Some(t);
+        for token in self.wait_tokens() {
+            tokens[token.slot()] = Some(token);
         }
-        for token in tokens.into_iter().flatten() {
+        let cursor = cursor % posix_fd::WAIT_RECORDS;
+        for offset in 0..posix_fd::WAIT_RECORDS {
+            let Some(token) = tokens[(cursor + offset) % posix_fd::WAIT_RECORDS] else {
+                continue;
+            };
             if Some(token) == skip {
                 continue;
             }

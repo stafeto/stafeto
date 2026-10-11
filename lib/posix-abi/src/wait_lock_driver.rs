@@ -414,9 +414,21 @@ pub(crate) fn collect(
     blocking: bool,
 ) -> bool {
     let find = |files: &mut posix_fs::PosixFs| {
-        files
-            .pick_wait_cleanup(me, current, skip)
-            .map_err(crate::error)
+        static CURSOR: ::core::sync::atomic::AtomicUsize =
+            ::core::sync::atomic::AtomicUsize::new(0);
+        let cursor = CURSOR.load(Ordering::Relaxed);
+        let token = files
+            .pick_wait_cleanup_from(me, current, skip, cursor)
+            .map_err(crate::error)?;
+        if let Some(token) = token {
+            // FILES_LOCK still protects selection: a pending handler, refused
+            // Send or departing helper cannot repeatedly hide later local debts.
+            CURSOR.store(
+                (token.slot() + 1) % posix_fs::wait::WAIT_RECORDS,
+                Ordering::Relaxed,
+            );
+        }
+        Ok(token)
     };
     let picked = if blocking {
         crate::shared::with_files(find)

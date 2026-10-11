@@ -3,6 +3,8 @@
 use super::*;
 use crate::{Error, WaitCancelReason, WaitRecordPhase, WaitRecords, WaitResult};
 use proto_fs::{WaitMode, WaitPhase, WaitReply};
+#[path = "wait_cleanup_rotation_tests.rs"]
+mod cleanup_rotation;
 fn input() -> wait::Input {
     wait::Input {
         mode: WaitMode::Ofd,
