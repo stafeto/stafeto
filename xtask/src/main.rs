@@ -4247,9 +4247,13 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 /// Published concurrent snapshots must preserve the part's memory reserve.
 fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
     let mut snapshots = 0;
+    let mut names_workload = false;
+    let mut names_capacity = false;
     for line in lines {
         let capacity = line.starts_with("posix-procs: names quota:")
             || line.starts_with("posix-procs: names capacity memory:");
+        names_workload |= line.starts_with("posix-procs: names workload memory:");
+        names_capacity |= capacity;
         let (used, quota) = if line.starts_with("posix-procs: names quota:") {
             let number = |tag| qemu::number_after(std::slice::from_ref(line), tag);
             let (Some(quota), Some(used), Some(remaining), Some(refused), Some(ordinary)) = (
@@ -4297,6 +4301,9 @@ fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
             ));
         }
         snapshots += usize::from(!capacity);
+    }
+    if names_capacity && !names_workload {
+        return Err("names capacity probe printed no seven-worker workload snapshot".into());
     }
     if snapshots == 0 {
         return Err("process probe printed no concurrent memory snapshots".into());
@@ -7585,6 +7592,13 @@ mod tests {
         assert!(check_process_memory_reserve(&[workload(0, 0)]).is_err());
         assert!(check_process_memory_reserve(&[]).is_err());
         assert!(check_process_memory_reserve(&[boundary(99, 100)]).is_err());
+        assert!(
+            check_process_memory_reserve(&[
+                "posix-procs: slow malloc memory: 577 pages, quota 704 pages".into(),
+                boundary(99, 100)
+            ])
+            .is_err()
+        );
         assert!(check_process_memory_reserve(&[workload(90, 100), boundary(99, 100)]).is_ok());
         assert!(check_process_memory_reserve(&[workload(90, 100), boundary(101, 100)]).is_err());
         let quota = "posix-procs: names quota: process 3, quota 100 pages, used 95 pages, remaining 5 pages, refused stack 24576 bytes, eighth ordinary stack 65536 bytes";
