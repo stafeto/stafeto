@@ -524,6 +524,27 @@ ret
         with self.assertRaisesRegex(Invalid, 'source-object'):
             normalize_bytes(data, ins)
 
+    def test_scaled_object_store_preserves_frame_cells(self):
+        # Checked test-init uses STR X with a typed object and an eight-byte index.
+        original = 'stp x19,x20,[sp,#16]\nret'
+        safe = 'str x0,[x8,x9,lsl #3]\nret'
+        data, instructions = self.changed_fixture(ASSEMBLY.replace(original, safe))
+        normalize_bytes(data, instructions)
+        for store in ('str x0,[sp,x9,lsl #3]', 'str x0,[x29,x9,lsl #3]',
+                      'mov x8,sp\nstr x0,[x8,x9,lsl #3]',
+                      'mov w8,wsp\nstr x0,[x8,x9,lsl #3]',
+                      'mov w8,w29\nstr x0,[x8,x9,lsl #3]',
+                      'add x8,sp,#32\nstr x0,[x8,x9,lsl #3]',
+                      'mov x9,sp\nstr x0,[x8,x9,lsl #3]',
+                      'mov w9,w29\nstr x0,[x8,x9,lsl #3]',
+                      'sub x9,x29,#16\nstr x0,[x8,x9,lsl #3]',
+                      'str w0,[x8,x9,lsl #2]', 'strb w0,[x8,x9,lsl #0]'):
+            with self.subTest(store=store):
+                data, instructions = self.changed_fixture(
+                    ASSEMBLY.replace(original, store + '\nret'))
+                with self.assertRaises(Invalid):
+                    normalize_bytes(data, instructions)
+
     def test_own_helper_lr_and_volatile_frame_alias_are_live(self):
         caller = "\n.type own_parent,%function\nown_parent:\n.cfi_startproc\nstr x30,[sp,#-48]!\n.cfi_def_cfa_offset 48\n.cfi_offset 30,-48\nbl OUTLINED_FUNCTION_1\nldr x30,[sp],#48\n.cfi_def_cfa_offset 0\n.cfi_restore 30\nret\n.cfi_endproc\n.size own_parent,.-own_parent\n"
         base = ASSEMBLY + caller
@@ -621,6 +642,8 @@ ret
              'adrp x8,valid_atomic\nadd x8,x8,:lo12:valid_atomic'),
             ('str x9,[x10,x8]\nadd x8,x8,#8',
              'adrp x10,valid_array\nadd x10,x10,:lo12:valid_array\nmov x8,#0\nmov x9,#1'),
+            ('str x9,[x10,x8,lsl #3]',
+             'adrp x10,valid_array\nadd x10,x10,:lo12:valid_array\nmov x8,#0\nmov x9,#1'),
             ('str w9,[x10,x8]',
              'adrp x10,valid_array\nadd x10,x10,:lo12:valid_array\nmov x8,#0\nmov w9,#1'),
         ]:
@@ -633,7 +656,7 @@ ret
                        'mov w8,wsp\nstxr w10,x9,[x8]',
                        'mov x8,sp\nstr x9,[x10,x8]',
                        'mov x10,sp\nstr x9,[x10,x8]',
-                       'str x9,[x10,x8,lsl #3]',
+                       'str w9,[x10,x8,lsl #2]',
                        'str x9,[x10,w8,uxtw #3]',
                        'stxp w10,x9,x11,[x8]', 'stxr w0,x9,[x8]'):
             data, ins = self.changed_fixture(ASSEMBLY.replace('mov w8,#4', helper) + parent)

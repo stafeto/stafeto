@@ -440,7 +440,7 @@ def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
             for register in set(bases) & set(range(19)):
                 bases[register] = None
         if op in stores:
-            memory = re.fullmatch(r'(.*), \[(sp|x\d+)(?:, (#-?0x[0-9a-f]+|x\d+))?\](!)?(?:, #(-?0x[0-9a-f]+))?', args)
+            memory = re.fullmatch(r'(.*), \[(sp|x\d+)(?:, (#-?0x[0-9a-f]+|x\d+))?(?:, lsl #3)?\](!)?(?:, #(-?0x[0-9a-f]+))?', args)
             require(memory is not None, 'unproved helper store address')
             names = [name.strip() for name in memory[1].split(',')]
             if op in ('stlxr', 'stxr'):
@@ -449,6 +449,12 @@ def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
                         'unsupported helper exclusive store form')
                 names = names[1:]
             require(len(names) == (2 if op == 'stp' else 1), 'unproved helper store arity')
+            if ', lsl #3' in args:
+                require(op == 'str' and len(names) == 1 and
+                        re.fullmatch(r'x(?:\d+|zr)', names[0]) and
+                        memory[3] is not None and memory[3].startswith('x') and
+                        not memory[4] and not memory[5],
+                        'unsupported scaled source-object store form')
             base = 31 if memory[2] == 'sp' else int(memory[2][1:])
             index = memory[3]
             displacement = int(index[1:], 0) if index and index.startswith('#') else 0
