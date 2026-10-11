@@ -1296,6 +1296,10 @@ commands:
   help      this text";
 
 fn main() {
+    if let Err(error) = workspace_root() {
+        eprintln!("xtask: {error}");
+        std::process::exit(1);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("build") => build(Variant::Normal).map(|_| ()),
@@ -1468,11 +1472,31 @@ fn main() {
     }
 }
 
+fn workspace_root_from(directory: &Path) -> Result<PathBuf, String> {
+    directory
+        .ancestors()
+        .find(|path| {
+            ["Cargo.toml", "xtask/Cargo.toml", "tools/build-relibc.py"]
+                .iter()
+                .all(|marker| path.join(marker).is_file())
+        })
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            format!(
+                "{} is outside a stafeto source workspace",
+                directory.display()
+            )
+        })
+}
+
+fn workspace_root() -> Result<PathBuf, String> {
+    let directory =
+        std::env::current_dir().map_err(|error| format!("current directory: {error}"))?;
+    workspace_root_from(&directory)
+}
+
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask lives in the workspace")
-        .to_path_buf()
+    workspace_root().expect("xtask requires a current stafeto source workspace")
 }
 
 /// Where cargo writes its builds: CARGO_TARGET_DIR when it is set, else
@@ -8846,5 +8870,63 @@ mod process_repeat_tests {
         assert_eq!(visited, [1, 2]);
         assert!(error.contains("run 2/4"), "{error}");
         assert!(error.contains("posix-procs: names ok"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod workspace_root_tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "stafeto-xtask-roots-{}-{stamp}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+        fn checkout(&self, name: &str) -> PathBuf {
+            let root = self.0.join(name);
+            for marker in ["Cargo.toml", "xtask/Cargo.toml", "tools/build-relibc.py"] {
+                let path = root.join(marker);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "source marker\n").unwrap();
+            }
+            root
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resolves_the_current_checkout_beside_another_origin() {
+        let fixture = Fixture::new();
+        let origin = fixture.checkout("compiled-a");
+        let current = fixture.checkout("current-b");
+        let nested = current.join("tests/probe/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(workspace_root_from(&nested).unwrap(), current);
+        assert_eq!(workspace_root_from(&origin).unwrap(), origin);
+        assert_ne!(workspace_root_from(&nested).unwrap(), origin);
+    }
+
+    #[test]
+    fn rejects_outside_or_incomplete_source_markers() {
+        let fixture = Fixture::new();
+        assert!(workspace_root_from(&fixture.0).is_err());
+        let partial = fixture.0.join("partial");
+        std::fs::create_dir_all(partial.join("xtask")).unwrap();
+        std::fs::write(partial.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(partial.join("xtask/Cargo.toml"), "[package]\n").unwrap();
+        assert!(workspace_root_from(&partial).is_err());
     }
 }
