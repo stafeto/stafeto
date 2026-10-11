@@ -40,8 +40,8 @@
  * gives it back, and setuid(65534) takes it for good: the call right after
  * a change of the credentials sees the new ones.
  *
- * Stage 6, churn: 1100 children one after the other, so that the
- * identity sessions of the ended do not fill the service's channel.
+ * Stage 6, churn: 16 sequential children in the ordinary probe. The
+ * spawn-churn image runs 1100 to check retirement beyond 1024 sessions.
  *
  * Stage 7, posix_spawn from files (5c): the loader in the child opens the
  * program through the RAM file service. /bin/ls lists /etc (the first goal
@@ -2476,19 +2476,27 @@ static void waits(pid_t child) {
     expect("waitpid(-1, WNOHANG) with the sleeper alive", (int)waitpid(-1, &status, WNOHANG), 0);
 }
 
-/* Stage 6: more children than the service has places for sessions, one
- * after the other (1100; the identity sessions of the ended stay in the
- * service until it receives their ends: its 1024 places fill without it). */
-static void churn(void) {
-    for (int i = 0; i < 1100; i++) {
+/* The small ordinary sample preserves spawn/reap coverage. A dedicated
+ * image runs 1100: ended identity sessions must retire beyond the service's
+ * 1024 channel places, and reuse must give the next child a fresh full PID. */
+static unsigned churn(unsigned count) {
+    pid_t previous = -1;
+    for (unsigned i = 0; i < count; i++) {
         pid_t pid = start("exit7");
         if (pid < 0) {
-            printf("posix-procs: the %dth child did not start\n", i);
-            return;
+            printf("posix-procs: the %uth child did not start\n", i);
+            return i;
         }
+        expect("sequential spawn has a fresh full PID", pid != previous, 1);
+        previous = pid;
         reap("a child of the churn", pid, 7, 0);
-        if (failures) return;
+        if (failures) return i;
+        if (SPAWN_CHURN_ONLY && ((i + 1) % 128 == 0)) {
+            printf("posix-procs: spawn churn progress %u/%u PID %d\n", i + 1, count, (int)pid);
+            fflush(stdout);
+        }
     }
+    return count;
 }
 
 /* posix_spawn of the file `path` with `argv` and `envp`: the error, the
@@ -4302,6 +4310,17 @@ int main(int argc, char **argv) {
 #endif
     argc_seen = argc;
     argv_seen = argv;
+    if (SPAWN_CHURN_ONLY) {
+        /* Keep the stress ELF small: no edge reaches the large generic role. */
+        if (argc > 1) return strcmp(argv[1], "exit7") == 0 ? 7 : 2;
+        printf("posix-procs: spawn churn start 1100\n");
+        fflush(stdout);
+        unsigned completed = churn(1100);
+        expect("all sequential spawn children reaped", completed, 1100);
+        if (!failures)
+            printf("posix-procs: spawn churn: %u children reaped with fresh full PIDs\n", completed);
+        return failures != 0;
+    }
     if (argc > 1) return role(argv[1]);
     if (JOB_CONTROL_PROBE) {
         pid_t child = -1;
@@ -4331,7 +4350,7 @@ int main(int argc, char **argv) {
     printf("posix-procs: stage groups\n");
     groups();
     printf("posix-procs: stage churn\n");
-    churn();
+    churn(16);
     printf("posix-procs: stage files\n");
     files();
     printf("posix-procs: stage descriptors\n");

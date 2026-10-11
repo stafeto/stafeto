@@ -616,6 +616,11 @@ const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
     programs[0].3 = &["table-posix-lock-ring"];
     programs
 };
+const POSIX_SPAWN_CHURN_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5].3 = &["spawn-churn"];
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1228,6 +1233,7 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-spawn-churn verify 1100 consecutive spawn/reap operations in a small image
   posix-lock-pages measure a full inode spread over 64 paid physical pages
   posix-lock-queue-core measure 64 genuine waits together with 64 held regions
   posix-lock-core measure public locks at the full inode64 limit
@@ -1350,6 +1356,7 @@ fn main() {
         Some("loader-abort-steps") => loader_abort_probe(true),
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-data-steps") => posix_files_run_profile(true, true),
+        Some("posix-spawn-churn") => posix_spawn_churn_probe(&qemu::VIRT),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
         Some("posix-lock-lifecycle-rules") => {
@@ -3452,6 +3459,34 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     Ok(())
 }
 
+fn posix_spawn_churn_probe(machine: &qemu::Machine) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-spawn-churn.img",
+        &POSIX_SPAWN_CHURN_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "posix-procs: spawn churn: 1100 children reaped with fresh full PIDs",
+    )?;
+    Ok(())
+}
+
 fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
@@ -5114,13 +5149,17 @@ fn test(jobs: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The boots of `test` whose verdicts depend on the host's time (the test
-/// init's heartbeats on their absolute deadlines without -icount, the
-/// monitor of QEMU for the ELF boot): they run one at a time once the
-/// others have ended, so that the load of the others cannot fail them.
+/// The boots of `test` that need controlled host load: wall-clock checks
+/// and process measurements with external virtio interrupts run one at a time
+/// after the independent functional boots.
 fn timing_jobs() -> Vec<jobs::Job> {
     use jobs::job;
     vec![
+        // External virtio interrupts shift heartbeat release phase under
+        // concurrent TCG load. Preserve both measured crowds without competing
+        // QEMU instances; the service budgets and wait limits stay unchanged.
+        job("process-steps 4", || process_steps(&qemu::VIRT_2G, 4)),
+        job("process-steps 7", || process_steps(&qemu::VIRT_2G, 7)),
         // A hung test is killed after a second of the host's time.
         ostest::runner_check_job(),
         job(
@@ -5163,6 +5202,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files", posix_files_probe),
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
+        job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
         job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
         job("posix-lock-ring", || posix_lock_ring_probe(&qemu::VIRT)),
         job("posix-lock-core", || {
@@ -5179,9 +5219,6 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-poll", posix_poll_probe),
         job("posix-pty", posix_pty_probe),
         job("posix-pty-steps", posix_pty_steps),
-        // The longest step of the process service with 248 children, under
-        // -icount: the host's time changes none of its numbers.
-        job("process-steps", || process_steps(&qemu::VIRT_2G, 7)),
         // BusyBox on relibc guards the C surface (5a').
         job("busybox", busybox_probe),
         job("ash", ash_probe),

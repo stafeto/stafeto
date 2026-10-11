@@ -89,6 +89,10 @@ fn main() {
             "-DLOCK_FIFO_FULL_ONLY={}",
             u8::from(env::var_os("CARGO_FEATURE_LOCK_FIFO_FULL").is_some())
         ))
+        .arg(format!(
+            "-DSPAWN_CHURN_ONLY={}",
+            u8::from(env::var_os("CARGO_FEATURE_SPAWN_CHURN").is_some())
+        ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
         .arg(format!("-DSTEPS_SESSIONS={sessions}"))
         .arg(format!(

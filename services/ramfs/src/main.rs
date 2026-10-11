@@ -1200,7 +1200,7 @@ impl Service<0> for Fs {
         self.legacy_pending = true;
         Self::depart_fields(self.ram, self.locks, self.identities, &mut s.data);
         self.waits.poll();
-        self.lock_sweep_pending = true;
+        self.lock_sweep_pending = self.locks.has_locks();
         if !Self::lock_custody_empty(
             self.lock_jobs,
             self.wait_jobs,
@@ -1239,7 +1239,7 @@ impl Service<0> for Fs {
             let (_, fds) = self.births[i].as_mut().expect("exact retained birth");
             Self::depart_fields(self.ram, self.locks, self.identities, fds);
             self.waits.poll();
-            self.lock_sweep_pending = true;
+            self.lock_sweep_pending = self.locks.has_locks();
             if !Self::lock_custody_empty(self.lock_jobs, self.wait_jobs, self.places, fds, label) {
                 self.departures.admit(SESSIONS + i);
                 return;
@@ -1258,7 +1258,7 @@ impl Service<0> for Fs {
         if notice.source == rt::abi::Source::Timer && notice.label == WAIT_TIMER_LABEL {
             self.wait_timer_armed = false;
             self.waits.poll();
-            self.lock_sweep_pending = true;
+            self.lock_sweep_pending = self.locks.has_locks();
             self.maintenance_burst.restart();
             self.legacy_pending = true;
             self.refresh_wait_timer();
@@ -1297,7 +1297,7 @@ impl Service<0> for Fs {
                                 descriptions.live(Token { slot, generation })
                             }
                         });
-                self.lock_sweep_pending = !sweep.wrapped;
+                self.lock_sweep_pending = self.locks.has_locks() && !sweep.wrapped;
             }
             if self.lock_maintenance_work == 2 {
                 let births = &*self.births;
