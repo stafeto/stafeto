@@ -453,7 +453,10 @@ pub extern "C" fn wait_cleanup_pending_rotation(fd: u32) -> i32 {
             files.publish_wait_cleanup(late, WaitResult::Failed(4), TerminalReply::from_reply(terminal).map_err(|_| -132)?)
                 .map_err(|_| -133)?;
             files.finish_wait_cleanup(late).map_err(|_| -134)?;
-            files.abandon_wait_owner(owner);
+            let first = files.abandon_wait_owner(owner).ok_or(-142)?;
+            let second = files.abandon_wait_owner(owner).ok_or(-143)?;
+            if first == second || ![early, late].contains(&first)
+                || ![early, late].contains(&second) { return Err(-144); }
             files.wait_snapshot(early).map_err(|_| -135)
         })?;
         if early_before.phase != WaitRecordPhase::Cleaning || early_before.result.is_some()
