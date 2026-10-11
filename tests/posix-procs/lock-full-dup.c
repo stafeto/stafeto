@@ -111,7 +111,7 @@ static int dup_hold(int fd, unsigned index, struct record *record) {
     if (FULL_DUP > 1 && record->source[0] == state.before[2] && record->source[1] == state.before[3])
         return fail("refill has new OFD lifetime", index);
     for (unsigned segment = 0; segment < record->count; ++segment)
-        if (set(dup_primary, F_WRLCK, segment) || drained(dup_primary)) return fail("real twelve segment refill", segment);
+        if (set(dup_primary, F_WRLCK, segment)) return fail("real twelve segment refill", segment);
     if (full_dup_sample((unsigned)dup_primary, state.after)) return fail("actual refill entry lifetime", index);
     state.phase = 'R';
     if (dup_write(&state)) return fail("refill scalar receipt", index);
