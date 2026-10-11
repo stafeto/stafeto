@@ -4271,6 +4271,7 @@ fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
         } else if let Some(tail) = line
             .strip_prefix("posix-procs: slow malloc memory: ")
             .or_else(|| line.strip_prefix("posix-procs: fork child malloc memory: "))
+            .or_else(|| line.strip_prefix("posix-procs: names eighth memory: "))
         {
             (
                 tail.split_whitespace()
@@ -7581,6 +7582,18 @@ mod tests {
             .is_err()
         );
         assert!(check_process_memory_reserve(&[row(0, 0)]).is_err());
+        assert!(
+            check_process_memory_reserve(&[
+                "posix-procs: names eighth memory: 455 pages, quota 512 pages".into()
+            ])
+            .is_ok()
+        );
+        assert!(
+            check_process_memory_reserve(&[
+                "posix-procs: names eighth memory: 472 pages, quota 512 pages".into()
+            ])
+            .is_err()
+        );
         assert!(check_process_memory_reserve(&[]).is_err());
         assert!(
             check_process_memory_reserve(&[
