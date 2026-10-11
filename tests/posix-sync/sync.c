@@ -17,6 +17,7 @@
 extern char **environ;
 extern int stafeto_sync(void);
 extern int sync_full_io(int, int);
+_Static_assert(_POSIX_FSYNC == 202405L, "claimed POSIX fsync version");
 static int failures;
 static void check(const char *what, int good) {
     if (!good) { printf("posix-sync: %s failed (errno %d)\n", what, errno); failures++; }
@@ -114,6 +115,7 @@ int main(int argc, char **argv) {
         int file = atoi(argv[2]), directory = atoi(argv[3]);
         return fsync(file) || fdatasync(file) || fsync(directory) || fdatasync(directory) ? 8 : 9;
     }
+    check("FSYNC option matches the header", sysconf(_SC_FSYNC) == _POSIX_FSYNC);
     int writable = open("/tmp/sync-probe", O_CREAT | O_TRUNC | O_RDWR, 0600);
     check("create regular RAM file", writable >= 0);
     if (writable < 0) return 1;
