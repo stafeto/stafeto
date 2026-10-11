@@ -395,6 +395,10 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-lock-full7-dup-pid.img",
     "boot-posix-lock-full7-dup-last.img",
     "boot-posix-lock-full7-dup-alias.img",
+    "boot-posix-lock-full4-exec-pid.img",
+    "boot-posix-lock-full7-exec-pid.img",
+    "boot-posix-lock-full4-exec-ofd.img",
+    "boot-posix-lock-full7-exec-ofd.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
     "boot-posix-jobs.img",
@@ -480,7 +484,11 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-lock-full4-dup-alias.img"
         | "boot-posix-lock-full7-dup-pid.img"
         | "boot-posix-lock-full7-dup-last.img"
-        | "boot-posix-lock-full7-dup-alias.img" => procs(),
+        | "boot-posix-lock-full7-dup-alias.img"
+        | "boot-posix-lock-full4-exec-pid.img"
+        | "boot-posix-lock-full7-exec-pid.img"
+        | "boot-posix-lock-full4-exec-ofd.img"
+        | "boot-posix-lock-full7-exec-ofd.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -646,6 +654,32 @@ mod tests {
     }
 
     #[test]
+    fn every_retained_exec_image_has_the_launcher_executable_and_rootfs() {
+        for name in [
+            "boot-posix-lock-full4-exec-pid.img",
+            "boot-posix-lock-full7-exec-pid.img",
+            "boot-posix-lock-full4-exec-ofd.img",
+            "boot-posix-lock-full7-exec-ofd.img",
+        ] {
+            let files = files_of(name);
+            let executable = files
+                .iter()
+                .find(|file| file.path == "/bin/procs-child")
+                .unwrap_or_else(|| panic!("{name}: missing launcher executable"));
+            assert_eq!(executable.source, Some(Source::Elf("posix-procs")));
+            assert_eq!(executable.mode, 0o755);
+            assert_eq!((executable.uid, executable.gid), ROOT);
+            assert!(files.iter().any(|file| file.path == "/bin/data"));
+            assert!(files.iter().any(|file| file.path == "/dev/null"));
+            let wanted = sources(&files);
+            assert!(wanted.contains(&Source::Elf("posix-procs")));
+            let first = 10;
+            let bytes = table(&files, first, first + wanted.len() as u32 + 1).unwrap();
+            assert!(rootfs::Rootfs::parse(&bytes, first + wanted.len() as u32 + 1).is_ok());
+        }
+    }
+
+    #[test]
     fn every_list_names_programs_of_its_image() {
         let programs_of = |image: &str| -> Vec<&str> {
             let list: &[crate::ImageProgram] = match image {
@@ -678,6 +712,10 @@ mod tests {
                 "boot-posix-lock-full7-dup-alias.img" => {
                     &crate::POSIX_LOCK_FULL7_DUP_ALIAS_PROGRAMS
                 }
+                "boot-posix-lock-full4-exec-pid.img" => &crate::POSIX_LOCK_FULL4_EXEC_PID_PROGRAMS,
+                "boot-posix-lock-full7-exec-pid.img" => &crate::POSIX_LOCK_FULL7_EXEC_PID_PROGRAMS,
+                "boot-posix-lock-full4-exec-ofd.img" => &crate::POSIX_LOCK_FULL4_EXEC_OFD_PROGRAMS,
+                "boot-posix-lock-full7-exec-ofd.img" => &crate::POSIX_LOCK_FULL7_EXEC_OFD_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
