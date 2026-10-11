@@ -279,9 +279,16 @@ static pid_t start(const char *role) {
 
 /* Waits for `pid` and checks its end: exited with `code`, or killed by
  * `signal` when it is not 0. */
+static void fork_trace(const char *stage, int iteration, long long value);
+
 static void reap(const char *what, pid_t pid, int code, int signal) {
     int status = -1;
     pid_t got = waitpid(pid, &status, 0);
+    if (strcmp(what, "forkthreads") == 0 || strcmp(what, "the first of a pair of forks") == 0 ||
+        strcmp(what, "the second of a pair of forks") == 0) {
+        fork_trace("reap-return", -1, got);
+        fork_trace("reap-status", -1, status);
+    }
     if (got != pid) {
         printf("posix-procs: waitpid of %s gave %d (%s)\n", what, (int)got, strerror(errno));
         failures++;
@@ -1853,7 +1860,45 @@ static void threads_window(void) {
     if (__atomic_load_n(&ticks, __ATOMIC_SEQ_CST) != before) moved_in_window++;
 }
 
+/* Test-only breadcrumbs: fixed stack, no stdio/allocator calls, and no
+ * errno change. The fork result is traced only after fork has returned. */
+static char *fork_trace_literal(char *at, const char *text) {
+    while (*text) *at++ = *text++;
+    return at;
+}
+
+static char *fork_trace_number(char *at, long long value) {
+    char digits[20];
+    unsigned n = 0;
+    unsigned long long number;
+    if (value < 0) {
+        *at++ = '-';
+        number = 0ull - (unsigned long long)value;
+    } else number = (unsigned long long)value;
+    do {
+        digits[n++] = (char)('0' + number % 10);
+        number /= 10;
+    } while (number);
+    while (n) *at++ = digits[--n];
+    return at;
+}
+
+static void fork_trace(const char *stage, int iteration, long long value) {
+    int saved_errno = errno;
+    char line[160];
+    char *at = fork_trace_literal(line, "posix-procs: fork trace ");
+    at = fork_trace_literal(at, stage);
+    at = fork_trace_literal(at, " iteration ");
+    at = fork_trace_number(at, iteration);
+    at = fork_trace_literal(at, " value ");
+    at = fork_trace_number(at, value);
+    *at++ = '\n';
+    (void)write(STDOUT_FILENO, line, (size_t)(at - line));
+    errno = saved_errno;
+}
+
 static int threads_child(const char *kept) {
+    fork_trace("child-entry", -1, 0);
     int bad = 0;
     if (stafeto_probe_threads() != 1) bad |= 1;
     char *p = malloc(256 * 1024);
@@ -1862,23 +1907,36 @@ static int threads_child(const char *kept) {
         memset(p, 7, 256 * 1024);
         free(p);
     }
+    fork_trace("child-heap-done", -1, bad);
     int fd = open("/etc/motd", O_RDONLY);
     char b[7];
     if (fd < 0 || read(fd, b, 7) != 7 || memcmp(b, "stafeto", 7) != 0) bad |= 4;
     close(fd);
+    fork_trace("child-file-done", -1, bad);
     if (pthread_mutex_lock(&churn_mutex) != 0 || pthread_mutex_unlock(&churn_mutex) != 0) bad |= 8;
+    fork_trace("child-mutex-done", -1, bad);
     if (strcmp(kept, "kept") != 0) bad |= 16;
     /* relibc's table of threads holds the child's one: a thread comes
      * and goes. */
     pthread_t t;
     void *back = NULL;
-    if (pthread_create(&t, NULL, full_thread, (void *)41) != 0 || pthread_join(t, &back) != 0 ||
-        back != (void *)42)
-        bad |= 32;
+    fork_trace("child-create-before", -1, bad);
+    int created = pthread_create(&t, NULL, full_thread, (void *)41);
+    fork_trace("child-create-return", -1, created);
+    if (created != 0) bad |= 32;
+    else {
+        fork_trace("child-join-before", -1, bad);
+        int joined = pthread_join(t, &back);
+        fork_trace("child-join-return", -1, joined);
+        if (joined != 0 || back != (void *)42) bad |= 32;
+    }
+    fork_trace("child-thread-done", -1, bad);
+    fork_trace("child-exit", -1, bad);
     return bad;
 }
 
 static int fork_threads(void) {
+    fork_trace("role-entry", -1, 0);
     pthread_atfork(lock_churn, unlock_churn, unlock_churn);
     char *kept = strdup("kept");
     pthread_t t[6];
@@ -1887,20 +1945,27 @@ static int fork_threads(void) {
     for (int i = 0; i < 6; i++) {
         expect("a churning thread", pthread_create(&t[i], NULL, bodies[i], NULL), 0);
     }
+    fork_trace("six-workers-ready", -1, 6);
     pause_ms(20);
     stafeto_probe_fork_window(threads_window);
     int forks = 0;
     for (; forks < 40; forks++) {
         fflush(stdout);
+        fork_trace("single-fork-before", forks, 0);
         pid_t pid = fork();
         if (pid == 0) _exit(threads_child(kept));
+        fork_trace("single-fork-return", forks, pid);
         if (pid < 0) {
             printf("posix-procs: fork %d of a multithreaded parent gave %d\n", forks, errno);
             failures++;
             break;
         }
         int status = -1;
-        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fork_trace("single-wait-before", forks, pid);
+        pid_t waited = waitpid(pid, &status, 0);
+        fork_trace("single-wait-return", forks, waited);
+        fork_trace("single-wait-status", forks, status);
+        if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             printf("posix-procs: the child of fork %d ended with status %#x\n", forks, status);
             failures++;
             break;
@@ -1911,15 +1976,28 @@ static int fork_threads(void) {
      * first stop parked parks again for the second. */
     for (int i = 0; i < 20 && failures == 0; i++) {
         fflush(stdout);
+        fork_trace("pair-a-fork-before", i, 0);
         pid_t a = fork();
         if (a == 0) _exit(0);
+        fork_trace("pair-a-fork-return", i, a);
+        fork_trace("pair-b-fork-before", i, 0);
         pid_t b = fork();
         if (b == 0) _exit(0);
+        fork_trace("pair-b-fork-return", i, b);
+        fork_trace("pair-a-wait-before", i, a);
         reap("the first of a pair of forks", a, 0, 0);
+        fork_trace("pair-a-wait-done", i, failures);
+        fork_trace("pair-b-wait-before", i, b);
         reap("the second of a pair of forks", b, 0, 0);
+        fork_trace("pair-b-wait-done", i, failures);
     }
     churn_stop = 1;
-    for (int i = 0; i < 6; i++) pthread_join(t[i], NULL);
+    fork_trace("workers-stop", -1, 1);
+    for (int i = 0; i < 6; i++) {
+        fork_trace("worker-join-before", i, 0);
+        int joined = pthread_join(t[i], NULL);
+        fork_trace("worker-join-return", i, joined);
+    }
     expect("threads that moved in a fork's window", moved_in_window, 0);
     if (failures == 0) printf("posix-procs: %d forks of a parent with six threads\n", forks);
     return failures;
@@ -2577,13 +2655,21 @@ static void run_role(const char *path, const char *name, const posix_spawnattr_t
     char *argv[] = {"procs-child", (char *)name, NULL};
     char *envp[] = {NULL};
     pid_t pid = -1;
+    int traced = strcmp(name, "forkthreads") == 0;
+    if (traced) fork_trace("role-spawn-before", -1, 0);
     int e = spawn_file(&pid, path, argv, envp, attr);
+    if (traced) {
+        fork_trace("role-spawn-return", -1, e);
+        fork_trace("role-spawn-pid", -1, pid);
+    }
     if (e != 0) {
         printf("posix-procs: spawn of %s for %s gave %d (%s)\n", path, name, e, strerror(e));
         failures++;
         return;
     }
+    if (traced) fork_trace("role-wait-before", -1, pid);
     reap(name, pid, 0, 0);
+    if (traced) fork_trace("role-wait-done", -1, failures);
 }
 
 /* A spawn that fails with `want`, and leaves no PID. */
