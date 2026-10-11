@@ -376,6 +376,8 @@ def written_registers(mnemonic, operands):
             result.add(31)
         elif match := re.fullmatch(r'[xw](\d+)', destination):
             result.add(int(match[1]))
+        else:
+            require(destination in ('xzr', 'wzr'), f'unproved destination spelling: {destination}')
     return result
 
 

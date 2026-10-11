@@ -339,6 +339,14 @@ class LinkedInstructionTests(unittest.TestCase):
                 with self.assertRaises(Invalid):
                     normalize_bytes(bad, instructions)
 
+    def test_unsupported_simd_prefix_destination_rejects(self):
+        prefix = 'mov v8.16b,v0.16b\ncmp w0,#0\nb.eq prefix_exit\n'
+        source = ASSEMBLY.replace('spill_caller:\n.cfi_startproc\n', 'spill_caller:\n.cfi_startproc\n'+prefix)
+        source = source.replace('.cfi_restore 20\nret\n.cfi_endproc', '.cfi_restore 20\nret\nprefix_exit:\nret\n.cfi_endproc')
+        data, instructions = self.changed_fixture(source)
+        with self.assertRaisesRegex(Invalid, 'unproved destination spelling'):
+            normalize_bytes(data, instructions)
+
     def test_inverse_prefix_unique_first_save(self):
         prefix = 'cmp w0,#0\nb.ne prefix_frame\nmov w0,#1\nret\nprefix_frame:\n'
         source = ASSEMBLY.replace('spill_caller:\n.cfi_startproc\n', 'spill_caller:\n.cfi_startproc\n'+prefix)
