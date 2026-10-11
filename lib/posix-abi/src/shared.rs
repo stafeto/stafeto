@@ -489,11 +489,13 @@ pub(crate) fn open_from(
                 transport,
                 base,
                 bytes,
-                policy,
-                flags & O_NONBLOCK != 0,
-                mode,
-                umask,
-                crate::descriptor_flags(flags),
+                crate::open_driver::Options {
+                    flags: policy,
+                    nonblock: flags & O_NONBLOCK != 0,
+                    mode,
+                    umask,
+                    descriptor_flags: crate::descriptor_flags(flags),
+                },
             )?;
             Ok((transport, Opened::Resident(fd)))
         };

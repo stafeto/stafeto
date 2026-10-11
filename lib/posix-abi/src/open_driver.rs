@@ -37,17 +37,28 @@ impl Drop for Defer {
     }
 }
 
+pub(crate) struct Options {
+    pub flags: u32,
+    pub nonblock: bool,
+    pub mode: u32,
+    pub umask: u32,
+    pub descriptor_flags: DescriptorFlags,
+}
+
 /// All closure bodies inspect local state; requests execute after releasing FILES_LOCK.
 pub(crate) fn open(
     transport: Transport,
     base: Option<(u32, u64)>,
     path: &[u8],
-    flags: u32,
-    nonblock: bool,
-    mode: u32,
-    umask: u32,
-    descriptor_flags: DescriptorFlags,
+    options: Options,
 ) -> Result<u32, i32> {
+    let Options {
+        flags,
+        nonblock,
+        mode,
+        umask,
+        descriptor_flags,
+    } = options;
     let owner = OwnerToken::new(crate::relibc::open_owner()?).map_err(|_| EIO)?;
     // The record stands for one job of the session: a place of the table of
     // sixteen is taken first, and waited for when none is free.
