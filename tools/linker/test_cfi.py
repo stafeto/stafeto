@@ -76,6 +76,30 @@ add sp,sp,#16
 ret
 .cfi_endproc
 .size OUTLINED_FUNCTION_2,.-OUTLINED_FUNCTION_2
+.type spill_caller,%function
+spill_caller:
+.cfi_startproc
+str x30,[sp,#-48]!
+.cfi_def_cfa_offset 48
+bl OUTLINED_FUNCTION_3
+.cfi_offset 30,-48
+.cfi_offset 19,-32
+.cfi_offset 20,-24
+ldr x30,[sp],#48
+.cfi_def_cfa_offset 0
+.cfi_restore 30
+.cfi_restore 19
+.cfi_restore 20
+ret
+.cfi_endproc
+.size spill_caller,.-spill_caller
+.type OUTLINED_FUNCTION_3,%function
+OUTLINED_FUNCTION_3:
+.cfi_startproc
+stp x19,x20,[sp,#16]
+ret
+.cfi_endproc
+.size OUTLINED_FUNCTION_3,.-OUTLINED_FUNCTION_3
 '''
 
 
@@ -195,6 +219,42 @@ class LinkedInstructionTests(unittest.TestCase):
     def test_borrowed_tail_entry_rejects(self):
         data, instructions = self.changed_fixture(ASSEMBLY.replace('bl OUTLINED_FUNCTION_2', 'b OUTLINED_FUNCTION_2'))
         with self.assertRaisesRegex(Invalid, 'non-call entry'):
+            normalize_bytes(data, instructions)
+
+    def test_genuine_spill_lr_published_before_call(self):
+        caller = self.symbols['spill_caller']
+        self.assertNotIn('W30=', llvm_row(self.old_rows, caller + 4))
+        self.assertIn('W30=[CFA-48]', llvm_row(self.new_rows, caller + 4))
+        self.assertNotIn('W19=', llvm_row(self.new_rows, caller + 4))
+        self.assertIn('W19=[CFA-32]', llvm_row(self.new_rows, caller + 8))
+
+    def test_delayed_lr_requires_entry_provenance_and_intact_cell(self):
+        mutations = [
+            ('str x30,[sp,#-48]!', 'bl leaf\nstr x30,[sp,#-48]!'),
+            ('str x30,[sp,#-48]!', 'str x30,[sp,#-64]!'),
+            ('.cfi_def_cfa_offset 48\nbl OUTLINED_FUNCTION_3',
+             '.cfi_def_cfa_offset 48\nstr x19,[sp]\nbl OUTLINED_FUNCTION_3'),
+            ('.cfi_def_cfa_offset 48\nbl OUTLINED_FUNCTION_3',
+             '.cfi_def_cfa_offset 48\nb .+4\nbl OUTLINED_FUNCTION_3'),
+        ]
+        for old, new in mutations:
+            with self.subTest(new=new):
+                data, instructions = self.changed_fixture(ASSEMBLY.replace(old, new))
+                with self.assertRaises(Invalid):
+                    normalize_bytes(data, instructions)
+
+    def test_pair_second_slot_lr_provenance(self):
+        data, instructions = self.changed_fixture(ASSEMBLY.replace(
+            'str x30,[sp,#-48]!', 'stp x29,x30,[sp,#-48]!').replace(
+            '.cfi_offset 30,-48', '.cfi_offset 30,-40'))
+        fixed, _ = normalize_bytes(data, instructions)
+        target = self.root / 'pair-fixed.elf'
+        target.write_bytes(fixed)
+        rows = subprocess.check_output([self.dwarfdump, '--eh-frame', str(target)], text=True)
+        symbols = {name: address for address, syms in Elf(data).symbols.items() for name, _ in syms}
+        self.assertIn('W30=[CFA-40]', llvm_row(rows, symbols['spill_caller'] + 4))
+        data, instructions = self.changed_fixture(ASSEMBLY.replace('str x30,[sp,#-48]!', 'stp x29,x30,[sp,#-48]!'))
+        with self.assertRaisesRegex(Invalid, 'saved cell'):
             normalize_bytes(data, instructions)
 
     def test_leaf_lr_destination_rejects(self):

@@ -337,8 +337,8 @@ def branch_targets(instructions):
 def written_registers(mnemonic, operands):
     """Explicit destinations, including paired loads and memory writeback."""
     no_write = {'nop', 'cmp', 'cmn', 'tst', 'ret', 'b', 'br', 'cbz', 'cbnz',
-                'tbz', 'tbnz', 'dmb', 'dsb', 'isb'}
-    one_write = {'add', 'sub', 'and', 'ands', 'orr', 'eor', 'bic', 'mov', 'movk',
+                'tbz', 'tbnz', 'dmb', 'dsb', 'isb', 'clrex'}
+    one_write = {'add', 'adds', 'sub', 'subs', 'bics', 'and', 'ands', 'orr', 'eor', 'bic', 'mov', 'movk',
                  'movz', 'movn', 'adr', 'adrp', 'lsl', 'lsr', 'asr', 'ubfx', 'bfxil',
                  'sbfiz', 'ubfiz', 'extr', 'csel', 'cset', 'cinc', 'csinc', 'csinv',
                  'cneg', 'madd', 'umaddl', 'smaddl', 'mul', 'mvn', 'neg', 'negs',
@@ -377,6 +377,73 @@ def preserved_register(body, register):
                 and not mnemonic.startswith('b.'), "saved LR helper is not straight-line leaf")
         require(not ({register, 31} & written_registers(mnemonic, operands)),
                 "outlined helper destroys saved LR register or SP")
+
+
+def prove_lr_store(fde, call_pc, after, instructions, targets):
+    """Track the exact straight-line entry frame and all overlapping stores."""
+    require(after.cfa[0] == 31 and after.rule(30)[0] == 'offset',
+            'unsupported delayed LR row')
+    sp = 0
+    saved = None
+    for pc in range(fde.start, call_pc, 4):
+        require(pc in instructions, 'missing caller prologue instruction')
+        mnemonic, operands = instructions[pc]
+        require(mnemonic not in ('b', 'bl', 'br', 'blr', 'ret', 'cbz', 'cbnz', 'tbz', 'tbnz', 'svc')
+                and not mnemonic.startswith('b.'), f'caller LR provenance crosses control flow at {pc:#x}, entry {fde.start:#x}, call {call_pc:#x}')
+        require(pc == fde.start or pc not in targets, 'branch into caller LR prologue')
+        destinations = written_registers(mnemonic, operands)
+        require(30 not in destinations, 'caller entry LR was overwritten before save')
+        adjustment = re.fullmatch(r'sp, sp, #0x([0-9a-f]+)', operands)
+        if mnemonic in ('add', 'sub') and adjustment:
+            sp += int(adjustment[1], 16) * (1 if mnemonic == 'add' else -1)
+            require(saved is None, 'SP changed after proved LR store')
+            continue
+        stores = {'str', 'strb', 'strh', 'stur', 'sturb', 'sturh', 'stp', 'stlr', 'stlrb'}
+        if mnemonic not in stores:
+            require(31 not in destinations, 'unproved caller SP change')
+            continue
+        memory = re.fullmatch(r'(.*), \[sp(?:, #(-?0x[0-9a-f]+))?\](!)?(?:, #(-?0x[0-9a-f]+))?', operands)
+        if memory is None:
+            require(saved is None, 'unknown store may alias saved LR cell')
+            require(31 not in destinations, 'unknown caller store writeback')
+            continue
+        names = [name.strip() for name in memory[1].split(',')]
+        require(len(names) == (2 if mnemonic == 'stp' else 1), 'invalid caller store operands')
+        offset = int(memory[2] or '0', 0)
+        address = sp + offset
+        if memory[3]:
+            sp += offset
+            require(saved is None, 'SP changed after proved LR store')
+        widths = []
+        for name in names:
+            if mnemonic.endswith('b'):
+                width = 1
+            elif mnemonic.endswith('h'):
+                width = 2
+            else:
+                match = re.fullmatch(r'([xwdqsbh])(?:\d+|zr)', name)
+                require(match is not None, 'unproved caller store width')
+                width = {'x': 8, 'w': 4, 'd': 8, 'q': 16, 's': 4, 'b': 1, 'h': 2}[match[1]]
+            widths.append(width)
+        for name, width in zip(names, widths):
+            if saved is not None:
+                require(address + width <= saved[1] or address >= saved[1] + 8,
+                        'intervening store overlaps saved LR cell')
+            if name == 'x30':
+                saved = (pc + 4, address)
+            address += width
+        if memory[4]:
+            sp += int(memory[4], 0)
+            require(saved is None, 'post-index SP change after proved LR store')
+    require(fde.cie.initial.cfa == (31, 0) and sp + after.cfa[1] == 0,
+            'caller actual SP disagrees with original CFA')
+    require(saved is not None and saved[1] == sp + after.cfa[1] + after.rule(30)[1],
+            'genuine LR store disagrees with original saved cell')
+    original = events(fde.program, fde.start, fde.cie.code)
+    publish_row = row_at(original, saved[0], fde.cie.initial, fde.cie.data)
+    require(publish_row.cfa == after.cfa and publish_row.rule(30) == ('same', 30),
+            'caller LR publication has unsupported CFA or existing LR rule')
+    return saved[0]
 
 
 def repair_programs(elf, records, instructions):
@@ -479,6 +546,55 @@ def repair_programs(elf, records, instructions):
                     "leaf helper changes LR or SP")
             require(all(row_at(original, pc, initial, fde.cie.data) == initial for pc, _ in body),
                     "unexpected leaf helper CFI")
+    # Publish a genuine caller LR store before entering a spill helper.
+    for call_pc, (mnemonic, operands) in instructions.items():
+        if mnemonic != 'bl':
+            continue
+        target = re.search(r'0x([0-9a-f]+)', operands)
+        if target is None or int(target[1], 16) not in helpers:
+            continue
+        matching = [fde for fde in fdes.values() if fde.start <= call_pc and call_pc + 4 <= fde.start + fde.size]
+        require(len(matching) == 1, 'outlined caller lacks exact FDE')
+        caller = matching[0]
+        original = events(caller.program, caller.start, caller.cie.code)
+        before = row_at(original, call_pc, caller.cie.initial, caller.cie.data)
+        after = row_at(original, call_pc + 4, caller.cie.initial, caller.cie.data)
+        if before.rule(30) != ('same', 30) or after.rule(30)[0] != 'offset':
+            continue
+        publish = prove_lr_store(caller, call_pc, after, instructions, targets)
+        offset = after.rule(30)[1]
+        require(offset % caller.cie.data == 0 and offset // caller.cie.data >= 0,
+                'caller LR offset does not match CIE factor')
+        operation = b'\x9e' + leb(offset // caller.cie.data)
+        repaired = sorted(original + [(publish, operation)], key=lambda event: event[0])
+        for pc in range(caller.start, caller.start + caller.size, 4):
+            expected = row_at(original, pc, caller.cie.initial, caller.cie.data)
+            if publish <= pc <= call_pc:
+                expected.registers[30] = after.rule(30)
+            require(row_at(repaired, pc, caller.cie.initial, caller.cie.data) == expected,
+                    'caller non-target row changed during LR publication')
+        require(caller.offset not in changed, 'overlapping caller CFI repairs')
+        changed[caller.offset] = repaired
+
+    # A helper's same-value rules must preserve the caller registers they feed.
+    for call_pc, (mnemonic, operands) in instructions.items():
+        if mnemonic != 'bl':
+            continue
+        target = re.search(r'0x([0-9a-f]+)', operands)
+        if target is None or int(target[1], 16) not in helpers:
+            continue
+        address = int(target[1], 16)
+        matching = [fde for fde in fdes.values() if fde.start <= call_pc < fde.start + fde.size]
+        require(len(matching) == 1, 'helper register custody lacks caller FDE')
+        caller = matching[0]
+        caller_events = changed.get(caller.offset, events(caller.program, caller.start, caller.cie.code))
+        row = row_at(caller_events, call_pc, caller.cie.initial, caller.cie.data)
+        writes = set().union(*(written_registers(*operation) for _, operation in helpers[address]))
+        for register in range(19, 30):
+            require(register not in writes or
+                    (row.rule(register)[0] == 'offset' and row.cfa[0] != register),
+                    'helper overwrites an unrecoverable caller callee-saved register')
+
     # Every actual call, rather than every symbol spelling, is audited.
     site_ranges = {}
     for pc, (mnemonic, operands) in instructions.items():
@@ -503,7 +619,7 @@ def repair_programs(elf, records, instructions):
         matching = [record for record in fdes.values() if record.start <= pc - 4 and pc + 8 <= record.start + record.size]
         require(len(matching) == 1, "caller lacks unambiguous FDE")
         fde = matching[0]
-        original = events(fde.program, fde.start, fde.cie.code)
+        original = changed.get(fde.offset, events(fde.program, fde.start, fde.cie.code))
         start_row = row_at(original, pc - 4, fde.cie.initial, fde.cie.data)
         at_call = row_at(original, pc, fde.cie.initial, fde.cie.data)
         at_restore = row_at(original, pc + 4, fde.cie.initial, fde.cie.data)
@@ -529,7 +645,7 @@ def repair_programs(elf, records, instructions):
         site_ranges.setdefault(fde.offset, []).append((pc, pc + 8, register, start_row))
     for offset, intervals in site_ranges.items():
         fde = next(record for record in fdes.values() if record.offset == offset)
-        original = events(fde.program, fde.start, fde.cie.code)
+        original = changed.get(fde.offset, events(fde.program, fde.start, fde.cie.code))
         extra = []
         intervals.sort()
         require(all(a[1] <= b[0] for a, b in zip(intervals, intervals[1:])), "overlapping LR intervals")
