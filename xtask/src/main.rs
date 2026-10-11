@@ -3288,7 +3288,8 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, ring: bool) -> R
     qemu::expect_marker(
         &outcome,
         &format!(
-            "lock-full: stable profile={profile} participating={profile} owners={} published=256 private=0 retired=0 common=128 payers=8 epoch=1",
+            "lock-full: {} profile={profile} participating={profile} owners={} published=256 private=0 retired=0 common=128 payers=8 epoch=1",
+            if ring { "initial" } else { "stable" },
             if profile == 4 { 20 } else { 17 }
         ),
     )?;

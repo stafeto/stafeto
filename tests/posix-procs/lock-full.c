@@ -445,8 +445,8 @@ static int coordinator(void) {
         return fail("identity forbidden after Stop", 0);
     if (ring_rows(fd, epoch)) return 1;
 #endif
-    printf("lock-full: stable profile=%u participating=%u owners=%u published=256 private=0 retired=0 common=128 payers=8 epoch=%llu\n",
-           profile, profile, first(8), (unsigned long long)epoch);
+    printf("lock-full: %s profile=%u participating=%u owners=%u published=256 private=0 retired=0 common=128 payers=8 epoch=%llu\n",
+           FULL_RING ? "initial" : "stable", profile, profile, first(8), (unsigned long long)epoch);
     if (close(fd) || publish("/tmp/lock-full-stop", NULL, 0)) return fail("release owners after Stop", 0);
     return 0;
 }
