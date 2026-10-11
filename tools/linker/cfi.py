@@ -990,8 +990,6 @@ def repair_programs(elf, records, instructions):
         expected.registers[30] = ('register', register)
         require(at_call in (start_row, expected) and at_restore in (start_row, expected),
                 "unknown caller CFI overlay")
-        require(row_at(original, pc + 8, fde.cie.initial, fde.cie.data) == start_row,
-                "original caller row changes at restoration")
         if at_call == expected and at_restore == expected:
             continue
         require(not any(pc <= at < pc + 8 for at, _ in original),

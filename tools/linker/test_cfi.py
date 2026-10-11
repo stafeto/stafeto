@@ -640,6 +640,50 @@ ret
             with self.assertRaises(Invalid):
                 normalize_bytes(data, ins)
 
+    def test_transient_lr_endpoint_keeps_original_complete_row(self):
+        caller = r'''caller:
+.cfi_startproc
+stp x29,x30,[sp,#-32]!
+.cfi_def_cfa_offset 32
+mov x0,x30
+bl OUTLINED_FUNCTION_0
+mov x30,x0
+.cfi_offset 29,-32
+.cfi_offset 30,-24
+ldp x29,x30,[sp],#32
+.cfi_def_cfa_offset 0
+.cfi_restore 29
+.cfi_restore 30
+ret
+.cfi_endproc
+.size caller,.-caller'''
+        old = ASSEMBLY[ASSEMBLY.index('caller:'):ASSEMBLY.index('.size caller,.-caller') + len('.size caller,.-caller')]
+        fixture = ASSEMBLY.replace(old, caller, 1)
+        data, instructions = self.changed_fixture(fixture)
+        fixed, report = normalize_bytes(data, instructions)
+        self.assertGreater(report['corrected_fdes'], 0)
+        self.assertEqual(normalize_bytes(fixed, instructions)[0], fixed)
+        before, after = Elf(data), Elf(fixed)
+        from cfi import events, row_at
+        start = next(address for address, names in before.symbols.items() if any(name == 'caller' for name, _ in names))
+        original = next(f for f in before.records() if isinstance(f, Fde) and f.start == start)
+        repaired = next(f for f in after.records() if isinstance(f, Fde) and f.start == start)
+        for offset in range(0, original.size, 4):
+            expected = row_at(events(original.program, start, original.cie.code), start + offset, original.cie.initial, original.cie.data)
+            if offset in (8, 12):
+                expected.registers[30] = ('register', 0)
+            actual = row_at(events(repaired.program, start, repaired.cie.code), start + offset, repaired.cie.initial, repaired.cie.data)
+            self.assertEqual(actual, expected)
+        for broken in (
+            fixture.replace('bl OUTLINED_FUNCTION_0\nmov x30,x0', 'bl OUTLINED_FUNCTION_0\n.cfi_offset 19,-8\nmov x30,x0', 1),
+            fixture.replace('mov x30,x0', 'mov x30,x1', 1),
+            fixture.replace('mov x0,x30\nbl OUTLINED_FUNCTION_0', 'mov x0,x30\ninside_endpoint:\nbl OUTLINED_FUNCTION_0', 1) + '\n.global foreign_endpoint\nforeign_endpoint:\nb inside_endpoint\n',
+        ):
+            with self.subTest(broken=broken):
+                image, operations = self.changed_fixture(broken)
+                with self.assertRaises(Invalid):
+                    normalize_bytes(image, operations)
+
     def test_unknown_parent_lr_is_terminal_rejection(self):
         source = ASSEMBLY+"\n.type unknown_parent,%function\nunknown_parent:\n.cfi_startproc\nbl OUTLINED_FUNCTION_0\nret\n.cfi_endproc\n.size unknown_parent,.-unknown_parent\n"
         data, instructions = self.changed_fixture(source)
