@@ -4915,9 +4915,17 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("# ", DIALOG_STEP)?;
         // A job in the background reads /dev/null; `wait` returns when it
         // ends and gives its status.
-        run.send("/bin/ls /etc & wait")?;
-        run.expect("/bin/ls /etc & wait", DIALOG_STEP)?;
-        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.send("/bin/ls -1 /etc & wait")?;
+        run.expect("/bin/ls -1 /etc & wait", DIALOG_STEP)?;
+        let mut accounts = vec!["motd", "passwd", "group"];
+        while !accounts.is_empty() {
+            let name = run.expect_line(
+                "a remaining /etc account file",
+                |line| accounts.contains(&line),
+                DIALOG_STEP,
+            )?;
+            accounts.retain(|account| *account != name);
+        }
         run.expect("# ", DIALOG_STEP)?;
         run.send("echo job-ended & wait; echo wait $?")?;
         run.expect_line("job-ended", |line| line == "job-ended", DIALOG_STEP)?;
