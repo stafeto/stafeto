@@ -236,6 +236,7 @@ int stafeto_probe_hold(int which, unsigned long long us);
 int stafeto_probe_threads(void);
 void stafeto_probe_fork_early(void (*window)(void));
 void stafeto_probe_mmap_sleep(unsigned long long us);
+int stafeto_probe_mmap_sleep_entered(void);
 unsigned long long stafeto_probe_pool(void);
 void stafeto_probe_decoy(int on);
 void stafeto_probe_no_pipes_session(int on);
@@ -2146,19 +2147,39 @@ static int fork_waits(void) {
     return failures;
 }
 
-/* Role forkmalloc: a thread's malloc holds relibc's allocator lock while
- * its mapping sleeps 300 ms in the layer (outside the layer's sections),
- * and the main thread forks meanwhile: fork's prepare handler waits for
- * the lock, so the malloc is over before the copy, and the child's malloc
- * finds the lock free. */
-static volatile int slow_done;
+/* Role forkmalloc: confirm that the mapping actually entered the existing
+ * allocator sleep hook. Keep the worker after malloc returns and before its
+ * C publication, so fork does not assume that publication follows lock release. */
+static int slow_start, slow_publish, slow_returned, slow_done, slow_error;
+
+static int slow_wait(const int *flag) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return errno;
+    unsigned long long begin = (unsigned long long)now.tv_sec * 1000000000ull + now.tv_nsec;
+    while (!(flag ? __atomic_load_n(flag, __ATOMIC_ACQUIRE) : stafeto_probe_mmap_sleep_entered())) {
+        if (!flag && __atomic_load_n(&slow_returned, __ATOMIC_ACQUIRE)) return EINVAL;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return errno;
+        unsigned long long current = (unsigned long long)now.tv_sec * 1000000000ull + now.tv_nsec;
+        if (current - begin >= 10000000000ull) return ETIMEDOUT;
+        pause_ms(1);
+    }
+    return 0;
+}
+
 static void *malloc_slowly(void *arg) {
     (void)arg;
-    /* After pthread_create of the main thread is over: it mallocs too. */
-    pause_ms(20);
+    int e = slow_wait(&slow_start);
+    if (e) {
+        __atomic_store_n(&slow_error, e, __ATOMIC_RELEASE);
+        return NULL;
+    }
     stafeto_probe_mmap_sleep(300000);
     char *p = malloc(1024 * 1024);
-    slow_done = 1;
+    if (!p) __atomic_store_n(&slow_error, errno, __ATOMIC_RELEASE);
+    __atomic_store_n(&slow_returned, 1, __ATOMIC_RELEASE);
+    e = slow_wait(&slow_publish);
+    if (e) __atomic_store_n(&slow_error, e, __ATOMIC_RELEASE);
+    __atomic_store_n(&slow_done, 1, __ATOMIC_RELEASE);
     if (p) {
         printf("posix-procs: slow malloc memory: %llu pages, quota %llu pages\n",
                stafeto_probe_memory_used() / 4096, stafeto_probe_memory_quota() / 4096);
@@ -2169,22 +2190,68 @@ static void *malloc_slowly(void *arg) {
 
 static int fork_malloc(void) {
     pthread_t slow;
-    pthread_create(&slow, NULL, malloc_slowly, NULL);
-    pause_ms(100);
-    fflush(stdout);
-    pid_t pid = fork();
-    if (pid == 0) {
-        char *p = malloc(64);
-        _exit(p != NULL ? 0 : 1);
+    __atomic_store_n(&slow_start, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&slow_publish, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&slow_returned, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&slow_done, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&slow_error, 0, __ATOMIC_RELEASE);
+    int created = pthread_create(&slow, NULL, malloc_slowly, NULL);
+    fork_trace("malloc-create", -1, created);
+    if (created) return 1;
+    __atomic_store_n(&slow_start, 1, __ATOMIC_RELEASE);
+    int hook_error = slow_wait(NULL);
+    int entered = stafeto_probe_mmap_sleep_entered();
+    fork_trace("malloc-hook-entered", -1, entered);
+    pid_t pid = -1;
+    if (hook_error || !entered) {
+        fork_trace("malloc-hook-error", -1, hook_error ? hook_error : EINVAL);
+        failures++;
+    } else {
+        fork_trace("malloc-fork-before", -1, 0);
+        pid = fork();
+        int fork_errno = errno;
+        if (pid == 0) {
+            char *p = malloc(64);
+            int e = p ? 0 : (errno ? errno : ENOMEM);
+            fork_trace("malloc-child-allocation", -1, e);
+            free(p);
+            _exit(e ? 1 : 0);
+        }
+        fork_trace("malloc-fork-return", -1, pid);
+        if (pid < 0) {
+            fork_trace("malloc-fork-errno", -1, fork_errno);
+            failures++;
+        } else {
+            /* The controlled publication is still blocked even though fork
+             * copied an allocator whose lock is available to the child. */
+            expect("malloc C publication remains deferred", __atomic_load_n(&slow_done, __ATOMIC_ACQUIRE), 0);
+        }
     }
-    /* The prepare handler waited for the allocator's lock: the slow
-     * malloc was over before the copy. */
-    expect("the slow malloc before the copy", slow_done, 1);
-    reap("a fork while another thread's malloc waits", pid, 0, 0);
+    /* Every error path releases the worker before joining it. */
+    __atomic_store_n(&slow_publish, 1, __ATOMIC_RELEASE);
+    if (pid > 0) {
+        int status = -1;
+        pid_t waited = waitpid(pid, &status, 0);
+        int wait_errno = errno;
+        fork_trace("malloc-wait-return", -1, waited);
+        fork_trace("malloc-wait-status", -1, status);
+        if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fork_trace("malloc-wait-errno", -1, wait_errno);
+            failures++;
+        }
+    }
     void *got = NULL;
-    pthread_join(slow, &got);
-    expect("the slow malloc", got != NULL, 1);
-    free(got);
+    int joined = pthread_join(slow, &got);
+    fork_trace("malloc-join-return", -1, joined);
+    if (joined) failures++;
+    else {
+        int worker_error = __atomic_load_n(&slow_error, __ATOMIC_ACQUIRE);
+        fork_trace("malloc-worker-error", -1, worker_error);
+        expect("the slow malloc worker", worker_error, 0);
+        expect("the slow malloc", got != NULL, 1);
+        expect("malloc C publication after join", __atomic_load_n(&slow_done, __ATOMIC_ACQUIRE), 1);
+        free(got);
+    }
     return failures;
 }
 
