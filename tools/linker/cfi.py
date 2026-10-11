@@ -423,6 +423,30 @@ def compact_changed_events(event_list, fde):
     return result
 
 
+def prove_finite_prefix_exit(fde, branch_pc, call_pc, instructions):
+    """A forward pre-frame branch may only bypass to MOV/NOP then RET."""
+    mnemonic, operands = instructions[branch_pc]
+    require(mnemonic.startswith('b.') or mnemonic in ('cbz', 'cbnz', 'tbz', 'tbnz'),
+            'unsupported caller prefix branch')
+    match = re.search(r'0x([0-9a-f]+)', operands)
+    require(match is not None, 'missing caller prefix target')
+    target = int(match[1], 16)
+    require(call_pc + 4 <= target < fde.start + fde.size, 'prefix exit can reenter prologue')
+    original = events(fde.program, fde.start, fde.cie.code)
+    for pc in range(target, fde.start + fde.size, 4):
+        require(pc in instructions, 'missing caller prefix exit instruction')
+        row = row_at(original, pc, fde.cie.initial, fde.cie.data)
+        require(row.cfa == (31, 0) and all(row.rule(r) == ('same', r) for r in range(19, 31)),
+                'prefix exit has non-entry recovery row')
+        op, args = instructions[pc]
+        if op == 'ret':
+            require(args in ('', 'x30'), 'prefix exit returns through unknown register')
+            return
+        require(op in ('mov', 'movz', 'movn', 'movk', 'nop') and
+                written_registers(op, args) <= set(range(19)), 'prefix exit is not volatile-only finite return')
+    raise Invalid('prefix exit has no finite RET')
+
+
 def prove_lr_store(fde, call_pc, after, instructions, targets):
     """Track the exact straight-line entry frame and all overlapping stores."""
     require(after.cfa[0] == 31 and after.rule(30)[0] == 'offset',
@@ -432,9 +456,13 @@ def prove_lr_store(fde, call_pc, after, instructions, targets):
     for pc in range(fde.start, call_pc, 4):
         require(pc in instructions, 'missing caller prologue instruction')
         mnemonic, operands = instructions[pc]
-        require(mnemonic not in ('b', 'bl', 'br', 'blr', 'ret', 'cbz', 'cbnz', 'tbz', 'tbnz', 'svc')
-                and not mnemonic.startswith('b.'), f'caller LR provenance crosses control flow at {pc:#x}, entry {fde.start:#x}, call {call_pc:#x}')
         require(pc == fde.start or pc not in targets, 'branch into caller LR prologue')
+        if mnemonic.startswith('b.') or mnemonic in ('cbz', 'cbnz', 'tbz', 'tbnz'):
+            require(saved is None and sp == 0, 'prefix branch follows changed caller frame')
+            prove_finite_prefix_exit(fde, pc, call_pc, instructions)
+            continue
+        require(mnemonic not in ('b', 'bl', 'br', 'blr', 'ret', 'svc'),
+                f'caller LR provenance crosses control flow at {pc:#x}, entry {fde.start:#x}, call {call_pc:#x}')
         destinations = written_registers(mnemonic, operands)
         require(30 not in destinations, 'caller entry LR was overwritten before save')
         adjustment = re.fullmatch(r'sp, sp, #0x([0-9a-f]+)', operands)

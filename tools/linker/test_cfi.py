@@ -323,6 +323,18 @@ class LinkedInstructionTests(unittest.TestCase):
         with self.assertRaisesRegex(Invalid, 'overlaps another section'):
             normalize_bytes(bytes(broken), self.instructions)
 
+    def test_finite_prefix_exit_and_reentry_negatives(self):
+        prefix = 'cmp w0,#0\nb.eq prefix_exit\n'
+        source = ASSEMBLY.replace('spill_caller:\n.cfi_startproc\n', 'spill_caller:\n.cfi_startproc\n'+prefix)
+        source = source.replace('.cfi_restore 20\nret\n.cfi_endproc', '.cfi_restore 20\nret\nprefix_exit:\nmov w0,#1\nret\n.cfi_endproc')
+        data, instructions = self.changed_fixture(source)
+        fixed, _ = normalize_bytes(data, instructions)
+        for wrong in ('b spill_caller', 'sub sp,sp,#16', 'mov x19,x0', 'mov x30,x0', 'bl leaf'):
+            with self.subTest(wrong=wrong):
+                bad, instructions = self.changed_fixture(source.replace('prefix_exit:\nmov w0,#1', 'prefix_exit:\n'+wrong))
+                with self.assertRaises(Invalid):
+                    normalize_bytes(bad, instructions)
+
     def test_linker_zero_reservation_preserves_envelope(self):
         script = self.root / 'reserve.ld'
         script.write_text('SECTIONS { .eh_frame : { *(.eh_frame) . += 512; } } INSERT AFTER .eh_frame_hdr;\n')
