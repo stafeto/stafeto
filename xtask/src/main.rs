@@ -605,7 +605,11 @@ const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10
         &["table-posix-lock-full7"]
     };
     programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
-    programs[5].3 = if phase == 14 {
+    programs[5].3 = if phase == 16 {
+        &["lock-full-exec-failed-ofd"]
+    } else if phase == 15 {
+        &["lock-full-exec-failed-pid"]
+    } else if phase == 14 {
         &["lock-full-exec-cloexec-last"]
     } else if phase == 13 {
         &["lock-full-exec-cloexec-surviving"]
@@ -643,6 +647,14 @@ const POSIX_LOCK_FULL4_EXEC_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_p
 const POSIX_LOCK_FULL7_EXEC_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 10);
 const POSIX_LOCK_FULL4_EXEC_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 11);
 const POSIX_LOCK_FULL7_EXEC_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 11);
+const POSIX_LOCK_FULL4_EXEC_FAILED_PID_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(4, 15);
+const POSIX_LOCK_FULL7_EXEC_FAILED_PID_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(7, 15);
+const POSIX_LOCK_FULL4_EXEC_FAILED_OFD_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(4, 16);
+const POSIX_LOCK_FULL7_EXEC_FAILED_OFD_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(7, 16);
 const POSIX_LOCK_FULL4_EXEC_CLOEXEC_PID_PROGRAMS: [ImageProgram; 10] =
     posix_lock_full_programs(4, 12);
 const POSIX_LOCK_FULL7_EXEC_CLOEXEC_PID_PROGRAMS: [ImageProgram; 10] =
@@ -1449,6 +1461,12 @@ fn main() {
             [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-ofd" => {
                 posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 11)
             }
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-failed-pid" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 15)
+            }
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-failed-ofd" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 16)
+            }
             [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-cloexec-pid" => {
                 posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 12)
             }
@@ -1458,7 +1476,7 @@ fn main() {
             [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-cloexec-last" => {
                 posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 14)
             }
-            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd|dup-pid|dup-ofd-last|dup-ofd-alias|exec-pid|exec-ofd|exec-cloexec-pid|exec-cloexec-surviving|exec-cloexec-last]".to_owned()),
+            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd|dup-pid|dup-ofd-last|dup-ofd-alias|exec-pid|exec-ofd|exec-cloexec-pid|exec-cloexec-surviving|exec-cloexec-last|exec-failed-pid|exec-failed-ofd]".to_owned()),
         },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -3340,6 +3358,22 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let (name, programs) = match (profile, phase) {
+        (4, 15) => (
+            "boot-posix-lock-full4-exec-failed-pid.img",
+            &POSIX_LOCK_FULL4_EXEC_FAILED_PID_PROGRAMS,
+        ),
+        (4, 16) => (
+            "boot-posix-lock-full4-exec-failed-ofd.img",
+            &POSIX_LOCK_FULL4_EXEC_FAILED_OFD_PROGRAMS,
+        ),
+        (7, 15) => (
+            "boot-posix-lock-full7-exec-failed-pid.img",
+            &POSIX_LOCK_FULL7_EXEC_FAILED_PID_PROGRAMS,
+        ),
+        (7, 16) => (
+            "boot-posix-lock-full7-exec-failed-ofd.img",
+            &POSIX_LOCK_FULL7_EXEC_FAILED_OFD_PROGRAMS,
+        ),
         (4, 12) => (
             "boot-posix-lock-full4-exec-cloexec-pid.img",
             &POSIX_LOCK_FULL4_EXEC_CLOEXEC_PID_PROGRAMS,
@@ -3536,6 +3570,16 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
                 phase - 6
             ),
         )?;
+    }
+    if (15..=16).contains(&phase) {
+        let marker = outcome
+            .lines
+            .iter()
+            .find(|line| line.starts_with("lock-full: exec failed "))
+            .ok_or_else(|| "failed exec witness is missing".to_owned())?;
+        if !lock_full_failed_wire::marker(marker, u64::from(profile), u64::from(phase - 9)) {
+            return Err(format!("invalid failed exec witness: {marker}"));
+        }
     }
     if (12..=14).contains(&phase) {
         let marker = outcome
@@ -8704,3 +8748,7 @@ mod exec_receipt_probe;
 #[path = "../../tests/posix-procs/src/lock_full_cloexec_wire.rs"]
 #[allow(dead_code)]
 mod lock_full_cloexec_wire;
+
+#[path = "../../tests/posix-procs/src/lock_full_failed_wire.rs"]
+#[allow(dead_code)]
+mod lock_full_failed_wire;

@@ -22,6 +22,7 @@ fn main() {
     println!("cargo:rerun-if-changed=lock-full-dup.c");
     println!("cargo:rerun-if-changed=lock-full-exec.c");
     println!("cargo:rerun-if-changed=lock-full-exec-cloexec.c");
+    println!("cargo:rerun-if-changed=lock-full-exec-failed.c");
     println!("cargo:rerun-if-changed=lock-full-exec-io.h");
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=lifetime.c");
@@ -83,7 +84,11 @@ fn main() {
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
         .arg(format!(
             "-DFULL_EXEC={}",
-            if env::var_os("CARGO_FEATURE_LOCK_FULL_EXEC_CLOEXEC_LAST").is_some() {
+            if env::var_os("CARGO_FEATURE_LOCK_FULL_EXEC_FAILED_OFD").is_some() {
+                7
+            } else if env::var_os("CARGO_FEATURE_LOCK_FULL_EXEC_FAILED_PID").is_some() {
+                6
+            } else if env::var_os("CARGO_FEATURE_LOCK_FULL_EXEC_CLOEXEC_LAST").is_some() {
                 5
             } else if env::var_os("CARGO_FEATURE_LOCK_FULL_EXEC_CLOEXEC_SURVIVING").is_some() {
                 4

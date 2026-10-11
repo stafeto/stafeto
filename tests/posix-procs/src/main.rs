@@ -26,6 +26,8 @@ mod lock_full_dup_wire;
 mod lock_full_exec;
 #[cfg(feature = "lock-full-exec")]
 mod lock_full_exec_wire;
+#[cfg(feature = "lock-full-exec-failed")]
+mod lock_full_failed_wire;
 #[cfg(feature = "lock-full-ofd")]
 mod lock_full_ofd;
 #[cfg(feature = "lock-full-fixture")]

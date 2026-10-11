@@ -89,7 +89,7 @@ pub unsafe extern "C" fn full_cloexec_arm(state: *const u64) -> i32 {
     }
     // SAFETY: C supplies its complete static state during the stopped exec phase.
     let s = unsafe { core::slice::from_raw_parts(state, 352) };
-    if !(3..=5).contains(&s[2]) {
+    if !(3..=7).contains(&s[2]) {
         return -1;
     }
     for i in 0..wire::count(s[2]) {
@@ -177,5 +177,32 @@ pub extern "C" fn full_cloexec_pending(marker: u64, wanted: u64, previous: u64) 
         Ok(true) => 0,
         Ok(false) => 1,
         Err(()) => -1,
+    }
+}
+
+#[cfg(feature = "lock-full-exec-failed")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn full_failed_valid(
+    state: *const u64,
+    expected: *const u64,
+    saved: *const u64,
+    stage: u32,
+    profile: u64,
+) -> i32 {
+    if state.is_null() || expected.is_null() || saved.is_null() {
+        return -1;
+    }
+    // SAFETY: C retains the complete static state and both independent snapshots.
+    let (s, e, b) = unsafe {
+        (
+            core::slice::from_raw_parts(state, 352),
+            core::slice::from_raw_parts(expected, 80),
+            core::slice::from_raw_parts(saved, 160),
+        )
+    };
+    if super::lock_full_failed_wire::valid(s, e, b, stage, profile) {
+        0
+    } else {
+        -1
     }
 }

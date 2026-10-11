@@ -398,7 +398,11 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-lock-full4-exec-pid.img",
     "boot-posix-lock-full7-exec-pid.img",
     "boot-posix-lock-full4-exec-ofd.img",
+    "boot-posix-lock-full4-exec-failed-pid.img",
+    "boot-posix-lock-full4-exec-failed-ofd.img",
     "boot-posix-lock-full7-exec-ofd.img",
+    "boot-posix-lock-full7-exec-failed-pid.img",
+    "boot-posix-lock-full7-exec-failed-ofd.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
     "boot-posix-jobs.img",
@@ -488,7 +492,11 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-lock-full4-exec-pid.img"
         | "boot-posix-lock-full7-exec-pid.img"
         | "boot-posix-lock-full4-exec-ofd.img"
-        | "boot-posix-lock-full7-exec-ofd.img" => procs(),
+        | "boot-posix-lock-full4-exec-failed-pid.img"
+        | "boot-posix-lock-full4-exec-failed-ofd.img"
+        | "boot-posix-lock-full7-exec-ofd.img"
+        | "boot-posix-lock-full7-exec-failed-pid.img"
+        | "boot-posix-lock-full7-exec-failed-ofd.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -597,6 +605,46 @@ mod tests {
     use super::*;
     use bootimg::rootfs::Rootfs;
 
+    #[test]
+    fn failed_exec_has_an_executable_bad_image_and_the_retained_child() {
+        for (name, programs, feature) in [
+            (
+                "boot-posix-lock-full4-exec-failed-pid.img",
+                &crate::POSIX_LOCK_FULL4_EXEC_FAILED_PID_PROGRAMS,
+                "lock-full-exec-failed-pid",
+            ),
+            (
+                "boot-posix-lock-full7-exec-failed-pid.img",
+                &crate::POSIX_LOCK_FULL7_EXEC_FAILED_PID_PROGRAMS,
+                "lock-full-exec-failed-pid",
+            ),
+            (
+                "boot-posix-lock-full4-exec-failed-ofd.img",
+                &crate::POSIX_LOCK_FULL4_EXEC_FAILED_OFD_PROGRAMS,
+                "lock-full-exec-failed-ofd",
+            ),
+            (
+                "boot-posix-lock-full7-exec-failed-ofd.img",
+                &crate::POSIX_LOCK_FULL7_EXEC_FAILED_OFD_PROGRAMS,
+                "lock-full-exec-failed-ofd",
+            ),
+        ] {
+            assert!(IMAGES.contains(&name));
+            let files = files_of(name);
+            let script = files.iter().find(|f| f.path == "/bin/script").unwrap();
+            assert_eq!(script.mode & 0o7777, 0o755);
+            assert_eq!(
+                script.source,
+                Some(Source::Bytes("script", b"#!/bin/sh\necho no\n"))
+            );
+            let child = files.iter().find(|f| f.path == "/bin/procs-child").unwrap();
+            assert_eq!(child.mode & 0o7777, 0o755);
+            assert_eq!(child.source, Some(Source::Elf("posix-procs")));
+            assert_eq!(programs[5].3, &[feature]);
+            let data = files.iter().find(|f| f.path == "/bin/data").unwrap();
+            assert_eq!(data.mode & 0o7777, 0o644);
+        }
+    }
     #[test]
     fn hard_links_of_a_program_share_one_file_and_the_table_reads_back() {
         let bytes = table(&ramfs(), 5, 9).unwrap();
@@ -711,6 +759,18 @@ mod tests {
                 "boot-posix-lock-full7-dup-last.img" => &crate::POSIX_LOCK_FULL7_DUP_LAST_PROGRAMS,
                 "boot-posix-lock-full7-dup-alias.img" => {
                     &crate::POSIX_LOCK_FULL7_DUP_ALIAS_PROGRAMS
+                }
+                "boot-posix-lock-full4-exec-failed-pid.img" => {
+                    &crate::POSIX_LOCK_FULL4_EXEC_FAILED_PID_PROGRAMS
+                }
+                "boot-posix-lock-full4-exec-failed-ofd.img" => {
+                    &crate::POSIX_LOCK_FULL4_EXEC_FAILED_OFD_PROGRAMS
+                }
+                "boot-posix-lock-full7-exec-failed-pid.img" => {
+                    &crate::POSIX_LOCK_FULL7_EXEC_FAILED_PID_PROGRAMS
+                }
+                "boot-posix-lock-full7-exec-failed-ofd.img" => {
+                    &crate::POSIX_LOCK_FULL7_EXEC_FAILED_OFD_PROGRAMS
                 }
                 "boot-posix-lock-full4-exec-pid.img" => &crate::POSIX_LOCK_FULL4_EXEC_PID_PROGRAMS,
                 "boot-posix-lock-full7-exec-pid.img" => &crate::POSIX_LOCK_FULL7_EXEC_PID_PROGRAMS,

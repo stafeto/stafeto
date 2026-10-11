@@ -27,6 +27,9 @@ _Alignas(4096) static uint64_t exec_state[512];
 static uint64_t exec_initial_header[32];
 #else
 static uint64_t exec_frozen[80], exec_closed_receipts[48];
+#if FULL_EXEC >= 6
+static uint64_t exec_failed_saved[160];
+#endif
 #endif
 static uint64_t exec_nonce;
 static int exec_setup(int fd, struct record *record);
@@ -239,7 +242,7 @@ static int drained(int fd) {
 }
 static int set(int fd, short kind, unsigned segment) {
     struct flock lock = {.l_type = kind, .l_whence = SEEK_SET, .l_start = (off_t)(2 * segment), .l_len = 1};
-#if FULL_EXEC == 2 || FULL_EXEC >= 4
+#if FULL_EXEC == 2 || (FULL_EXEC >= 4 && FULL_EXEC != 6)
     if (fd == exec_primary) return fcntl(fd, F_OFD_SETLK, &lock);
 #endif
 #if FULL_OFD
@@ -547,8 +550,10 @@ static int ring_rows(int fd, uint64_t epoch) {
 #if FULL_EXEC
 #if FULL_EXEC <= 2
 #include "lock-full-exec.c"
-#else
+#elif FULL_EXEC <= 5
 #include "lock-full-exec-cloexec.c"
+#else
+#include "lock-full-exec-failed.c"
 #endif
 #endif
 static int coordinator(void) {
@@ -589,7 +594,7 @@ static int coordinator(void) {
         if (source < 0 || fstat(source, &st) || (uint64_t)st.st_ino != r->inode) return fail("witness inode", i);
         for (unsigned edge = 0; edge < 2; ++edge) {
             struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = (off_t)(edge ? 2 * (r->count - 1) : 0), .l_len = 1};
-            if (fcntl(source, F_GETLK, &lock) || lock.l_type != F_WRLCK || lock.l_pid != ((FULL_OFD || FULL_DUP > 1 || (FULL_EXEC == 2 || FULL_EXEC >= 4)) && !i ? -1 : (pid_t)r->pid))
+            if (fcntl(source, F_GETLK, &lock) || lock.l_type != F_WRLCK || lock.l_pid != ((FULL_OFD || FULL_DUP > 1 || (FULL_EXEC == 2 || (FULL_EXEC >= 4 && FULL_EXEC != 6))) && !i ? -1 : (pid_t)r->pid))
                 return fail("foreign PID GETLK real critical/filler", i);
         }
 #if FULL_WAKE || FULL_OFD || FULL_DUP || FULL_EXEC

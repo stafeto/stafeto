@@ -204,7 +204,7 @@ pub fn row_slot(s: &[u64], expected: &[u64], n: usize) -> bool {
     let r = &s[at..at + 24];
     let p = &s[at + 24..at + 144];
     let c = &s[at + 144..at + 160];
-    let present = expected[2] == 3 || expected[2] == 5 && n == 2;
+    let present = matches!(expected[2], 3 | 6) || expected[2] == 5 && n == 2;
     if !present {
         return c[2] == 0
             && c[3] == 0xfffff_u64 << 32
