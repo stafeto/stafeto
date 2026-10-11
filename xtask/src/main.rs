@@ -35,6 +35,9 @@ mod image;
 mod jobs;
 mod measure;
 mod native_scopes;
+#[cfg(test)]
+#[path = "../../lib/posix-thread/tests/native_stop_barrier.rs"]
+mod native_stop_barrier_tests;
 mod ostest;
 mod qemu;
 mod ring;
