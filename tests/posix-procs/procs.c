@@ -1757,7 +1757,7 @@ static int fork_full(void) {
 
 /* Role forkthreads: fork from a parent with six more threads, at its
  * level under FIFO, so each yields after a turn, which mallocs with no
- * lock of its own, execs a file that is no program, and
+ * lock of its own, execs a file without execute permission, and
  * churn the heap under a mutex, open and close files, make and join
  * threads, and hold the layer's locks of the heap, the files and a bucket
  * of the table of waits in turn. Each fork stops them all: in its window
@@ -1768,6 +1768,8 @@ static volatile int churn_stop;
 static unsigned long ticks;
 static pthread_mutex_t churn_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int moved_in_window;
+static unsigned churn_exec_completed;
+static int churn_exec_error;
 static void tick(void) { __atomic_fetch_add(&ticks, 1, __ATOMIC_SEQ_CST); }
 static void lock_churn(void) { pthread_mutex_lock(&churn_mutex); }
 static void unlock_churn(void) { pthread_mutex_unlock(&churn_mutex); }
@@ -1815,14 +1817,20 @@ static void *churn_files(void *arg) {
     return NULL;
 }
 
-/* exec of a file that is no program: each stops the process, fails and
+/* exec of a file without execute permission: each stops the process, fails and
  * resumes it, between the stops of the forks. */
 static void *churn_exec(void *arg) {
     (void)arg;
     char *argv[] = {"data", NULL};
     char *env[] = {NULL};
     while (!churn_stop) {
-        execve("/bin/data", argv, env);
+        int returned = execve("/bin/data", argv, env);
+        int error = errno;
+        if (returned != -1 || error != EACCES) {
+            if (!churn_exec_error) churn_exec_error = error ? error : EINVAL;
+        } else {
+            churn_exec_completed++;
+        }
         tick();
         sched_yield();
     }
@@ -1938,6 +1946,8 @@ static int threads_child(const char *kept) {
 
 static int fork_threads(void) {
     fork_trace("role-entry", -1, 0);
+    churn_exec_completed = 0;
+    churn_exec_error = 0;
     pthread_atfork(lock_churn, unlock_churn, unlock_churn);
     char *kept = strdup("kept");
     pthread_t t[6];
@@ -1994,10 +2004,19 @@ static int fork_threads(void) {
     }
     churn_stop = 1;
     fork_trace("workers-stop", -1, 1);
+    int exec_joined = 0;
     for (int i = 0; i < 6; i++) {
         fork_trace("worker-join-before", i, 0);
         int joined = pthread_join(t[i], NULL);
         fork_trace("worker-join-return", i, joined);
+        expect("join a churning thread", joined, 0);
+        if (i == 5 && joined == 0) exec_joined = 1;
+    }
+    if (exec_joined) {
+        fork_trace("failed-exec-completed", -1, churn_exec_completed);
+        fork_trace("failed-exec-error", -1, churn_exec_error);
+        expect("failed exec error", churn_exec_error, 0);
+        expect("failed exec completed during forks", churn_exec_completed > 0, 1);
     }
     expect("threads that moved in a fork's window", moved_in_window, 0);
     if (failures == 0) printf("posix-procs: %d forks of a parent with six threads\n", forks);
