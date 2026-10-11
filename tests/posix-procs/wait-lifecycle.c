@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 /* Only included by lifetime.c. No test-issued Cancel/Release or rescue close. */
 extern int wait_lifecycle_arm(unsigned mode), wait_lifecycle_count(void);
 extern int wait_lifecycle_recovered(void), wait_lifecycle_still_sleeping(void);

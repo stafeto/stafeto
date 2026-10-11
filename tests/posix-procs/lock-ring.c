@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 /* Separate profile: four init Create roots, four genuine waiting PIDs each. */
 extern void ring_probe_arm(void);
 extern void ring_probe_disarm(void);

@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 extern void wait_fifo_hooks_begin(void), wait_fifo_hooks_end(void);
 extern int wait_fifo_arm(int fd, unsigned holder, unsigned long long nonce);
 extern int wait_fifo_selected(unsigned long long nonce, unsigned index);

@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 /* Included only by lifetime.c: one real child PID blocker for public WAIT. */
 extern void wait_driver_arm(unsigned mode);
 extern void wait_driver_disarm(void);
