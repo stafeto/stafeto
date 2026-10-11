@@ -5,7 +5,8 @@
 
 extern crate std;
 
-use super::{ControlPhase, ControlResult, EntryToken, Flags, OwnerToken, Table};
+use super::{ControlResult, EntryToken, Flags, OwnerToken, Table};
+use change::ControlPhase;
 use entries::Frame;
 use proto_fs::{LockBlocker, LockCommand, LockKind, LockPhase, LockReply};
 use proto_wire::{Status, Writer};
@@ -541,7 +542,7 @@ fn close_fence_preserves_alias_reused_generation_and_change_family() {
 #[test]
 fn full_sixteen_controls_preserve_close_admission_and_all_fence_debts() {
     let (mut files, entry, _, input) = fixture();
-    let mut tokens = [None; super::JOBS_MAX];
+    let mut tokens = [None; change::JOBS_MAX];
     for (index, slot) in tokens.iter_mut().enumerate() {
         *slot = Some(
             files
@@ -674,7 +675,7 @@ fn lock_collector_preserves_nested_foreign_skipped_and_change_records() {
 #[test]
 fn lock_collector_acknowledges_sixteen_cleaned_longjmp_frames_without_rpc() {
     let (mut files, entry, _, input) = fixture();
-    let mut tokens = [None; super::JOBS_MAX];
+    let mut tokens = [None; change::JOBS_MAX];
     for slot in &mut tokens {
         let (token, claim) = files
             .begin_lock_record(owner(), entry, Frame::main(100), input)

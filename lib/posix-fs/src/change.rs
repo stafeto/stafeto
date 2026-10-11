@@ -10,8 +10,8 @@
 use super::{FsError, PosixFs};
 use entries::Frame;
 pub use posix_fd::{
-    ControlAbandoned, ControlClaimToken, ControlCleanup, ControlResult, ControlSnapshot,
-    ControlToken, JobPlace, OwnerToken,
+    ControlAbandoned, ControlClaimToken, ControlCleanup, ControlPhase, ControlResult,
+    ControlSnapshot, ControlToken, JOBS_MAX, JobPlace, OwnerToken,
 };
 
 impl PosixFs {
