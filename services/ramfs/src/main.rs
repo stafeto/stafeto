@@ -3021,6 +3021,29 @@ impl Fs {
                     )
                 })
             }
+            6 => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let Some(who) = fds.binding.snapshot_ref() else {
+                    return status(proto_fs::PERMISSION);
+                };
+                if who.pid == 0 || fds.root.id == 0 || fds.root.generation == 0 {
+                    return status(proto_fs::PERMISSION);
+                }
+                self.telemetry.authorize_identity(scope, epoch).map(|()| {
+                    (
+                        epoch,
+                        [
+                            scope.owner,
+                            u64::from(who.pid),
+                            fds.root.id,
+                            fds.root.generation,
+                            scope.source.generation,
+                        ],
+                    )
+                })
+            }
             2 | 3 => {
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);

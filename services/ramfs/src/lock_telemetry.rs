@@ -176,6 +176,20 @@ impl Table {
             }
         }
     }
+    /// Identity observations belong to setup before the first capture.
+    pub fn authorize_identity(&self, scope: Scope, epoch: u64) -> Result<(), Error> {
+        if self.scope.is_none()
+            && self.epoch == 0
+            && epoch == 0
+            && scope.owner != 0
+            && scope.nonce != 0
+            && scope.source.generation != 0
+        {
+            Ok(())
+        } else {
+            Err(Error::Authority)
+        }
+    }
     pub fn authorize_oracle(&self, scope: Scope, epoch: u64) -> Result<(), Error> {
         if self.scope.is_none()
             && epoch == 0
@@ -500,6 +514,48 @@ mod tests {
             took,
             valid: true,
         }
+    }
+    #[test]
+    fn setup_identity_closes_permanently_when_capture_begins() {
+        let mut table = fresh();
+        assert_eq!(table.authorize_identity(scope(), 0), Ok(()));
+        assert_eq!(table.authorize_identity(scope(), 1), Err(Error::Authority));
+        for malformed in [
+            Scope {
+                owner: 0,
+                ..scope()
+            },
+            Scope {
+                nonce: 0,
+                ..scope()
+            },
+            Scope {
+                source: Source {
+                    generation: 0,
+                    ..scope().source
+                },
+                ..scope()
+            },
+        ] {
+            assert_eq!(
+                table.authorize_identity(malformed, 0),
+                Err(Error::Authority)
+            );
+        }
+        let epoch = table.start(scope(), 0, 4, full()).unwrap();
+        assert_eq!(table.authorize_identity(scope(), 0), Err(Error::Authority));
+        assert_eq!(
+            table.authorize_identity(scope(), epoch),
+            Err(Error::Authority)
+        );
+        table.stop(scope(), epoch).unwrap();
+        assert_eq!(table.authorize_identity(scope(), 0), Err(Error::Authority));
+        assert_eq!(
+            table.authorize_identity(scope(), epoch),
+            Err(Error::Authority)
+        );
+        table.invalidate();
+        assert_eq!(table.authorize_identity(scope(), 0), Err(Error::Authority));
     }
     #[test]
     fn complete_dispatch_keeps_same_step_occupancy_and_all_branch_witnesses() {
