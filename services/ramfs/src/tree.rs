@@ -433,13 +433,11 @@ mod tests {
             load(&bad, &mut Index::new()),
             Err(Error::Table(_))
         ));
-        for path in ["/tmp"] {
-            let bytes = test_image(&[entry(path, DIRECTORY | 0o755, 0)]);
-            assert!(matches!(
-                load(&bytes, &mut Index::new()),
-                Err(Error::Reserved(0))
-            ));
-        }
+        let bytes = test_image(&[entry("/tmp", DIRECTORY | 0o755, 0)]);
+        assert!(matches!(
+            load(&bytes, &mut Index::new()),
+            Err(Error::Reserved(0))
+        ));
         for path in ["/etc/motd", "/tmp/y"] {
             let parent = &path[..4];
             let bytes = test_image(&[
