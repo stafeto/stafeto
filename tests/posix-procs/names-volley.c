@@ -12,6 +12,7 @@
  * restarts of one rename and longest rename, and the restarts of the long
  * rmdir. Included by procs.c. */
 
+extern unsigned long long stafeto_probe_memory_quota(void);
 extern void files_volley_start(void);
 extern void files_volley_stop(void);
 extern unsigned files_volley_requests(void);
@@ -538,12 +539,14 @@ static void vz_volley_name(char *name, size_t size, int directory, char kind, in
     else snprintf(name, size, VZ "/d%02d/%c%03d", directory, kind, index);
 }
 
+static int vz_workers_go;
+
 static void *vz_rename_thread(void *argument) {
     struct vz_thread *work = argument;
     char from[40], to[40];
     vz_volley_name(from, sizeof from, work->directory, 'f', work->index);
     vz_volley_name(to, sizeof to, work->directory, 'g', work->index);
-    while (vz_now_ns() < work->start) {
+    while (!__atomic_load_n(&vz_workers_go, __ATOMIC_ACQUIRE) || vz_now_ns() < work->start) {
         struct timespec delay = {0, 1000000};
         nanosleep(&delay, NULL);
     }
@@ -617,6 +620,7 @@ static int vz_child(void) {
     size_t stack_size = 0;
     VZ_CHECK(pthread_attr_getstacksize(&attr, &stack_size) == 0);
     VZ_CHECK(stack_size == 65536);
+    __atomic_store_n(&vz_workers_go, 0, __ATOMIC_RELEASE);
     for (int i = 0; i < VZ_THREADS; i++) {
         work[i] = (struct vz_thread){process * VZ_THREADS + i, start, -1, 0, directory};
         int e = pthread_create(&threads[i], &attr, vz_rename_thread, &work[i]);
@@ -627,12 +631,25 @@ static int vz_child(void) {
     }
     printf("posix-procs: names worker memory: process %d, %llu pages, seven stacks %zu bytes\n",
            process, stafeto_probe_memory_used() / 4096, stack_size);
-    /* A 2 MiB stack plus the loaded image exceeds the child quota. Resource
-     * exhaustion remains EAGAIN while the ordinary workers have reserve. */
     {
         pthread_t eighth;
         vz_hold = 1;
-        VZ_CHECK(pthread_attr_setstacksize(&attr, 2 * 1024 * 1024) == 0);
+        /* All seven workers stay alive behind their gate. A normal eighth
+         * stack fits, including its TLS and thread allocation overhead. */
+        VZ_CHECK(pthread_create(&eighth, &attr, vz_idle, NULL) == 0);
+        VZ_CHECK(pthread_join(eighth, NULL) == 0);
+        unsigned long long quota = stafeto_probe_memory_quota();
+        unsigned long long used = stafeto_probe_memory_used();
+        VZ_CHECK(quota >= used && quota != 0);
+        unsigned long long remaining = quota - used;
+        /* The stack alone exceeds the real remaining quota by one page;
+         * TLS and thread metadata can only increase this request's cost. */
+        size_t refused_stack = (size_t)(remaining / 4096 + 1) * 4096;
+        VZ_CHECK(refused_stack >= PTHREAD_STACK_MIN);
+        printf("posix-procs: names quota: process %d, quota %llu pages, used %llu pages, "
+               "remaining %llu pages, refused stack %zu bytes, eighth ordinary stack %zu bytes\n",
+               process, quota / 4096, used / 4096, remaining / 4096, refused_stack, stack_size);
+        VZ_CHECK(pthread_attr_setstacksize(&attr, refused_stack) == 0);
         int e = pthread_create(&eighth, &attr, vz_idle, NULL);
         if (e != EAGAIN) {
             printf("posix-procs: volley: the eighth thread of process %d gave %d, wanted EAGAIN\n", process, e);
@@ -640,6 +657,7 @@ static int vz_child(void) {
             return 105;
         }
     }
+    __atomic_store_n(&vz_workers_go, 1, __ATOMIC_RELEASE);
     unsigned long long longest = 0;
     for (int i = 0; i < VZ_THREADS; i++) {
         if (pthread_join(threads[i], NULL) != 0) return 102;
