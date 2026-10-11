@@ -33,6 +33,35 @@ pub fn census(first: u32, words: [u64; 5]) -> Result<bool, ()> {
     }
     Ok(found)
 }
+/// Validate one complete immutable post-Stop witness, not a mix of page revisions.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn row(pages: &[[u64; 6]; 20]) -> Result<(), ()> {
+    let epoch = pages[0][0];
+    let serial = pages[0][1];
+    let mask = pages[0][4];
+    if epoch == 0
+        || serial == 0
+        || pages[0][2] == 0
+        || mask > 65535
+        || pages.iter().any(|p| p[0] != epoch || p[1] != serial)
+        || pages[19][5] != mask
+        || pages[19][4] & !mask != 0
+        || pages[18][5] != 1
+        || pages[18][2].checked_sub(pages[18][3]) != Some(pages[0][3])
+        || pages[0][3] > 20410
+    {
+        return Err(());
+    }
+    for bit in 0..16 {
+        let visits = (pages[19][2 + bit / 8] >> ((bit % 8) * 8)) & 255;
+        // These are explicit marked work portions; hidden sixteen-cell lookups
+        // remain part of the measured complete dispatch timing.
+        if visits > 8 || (mask & (1 << bit) == 0 && visits != 0) {
+            return Err(());
+        }
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +99,32 @@ mod tests {
         }
         assert!(census(300, [309, 9, 0, 0, 0]).is_err());
         assert!(census(320, [320, 0, 0, 0, 0]).is_err());
+    }
+    #[test]
+    fn row_rejects_mixed_revision_unbounded_portion_and_forged_timing() {
+        let mut pages = [[1, 9, 0, 0, 0, 0]; 20];
+        pages[0] = [1, 9, 3, 20410, 1, 54];
+        pages[18] = [1, 9, 20417, 7, 0, 1];
+        pages[19] = [1, 9, 8, 0, 0, 1];
+        assert_eq!(row(&pages), Ok(()));
+        let original = pages;
+        pages[7][1] += 1;
+        assert!(row(&pages).is_err());
+        pages = original;
+        pages[3][0] += 1;
+        assert!(row(&pages).is_err());
+        pages = original;
+        pages[19][2] = 9;
+        assert!(row(&pages).is_err());
+        pages = original;
+        pages[18][2] += 1;
+        assert!(row(&pages).is_err());
+        pages = original;
+        pages[19][5] = 0;
+        assert!(row(&pages).is_err());
+        pages = original;
+        pages[0][3] += 1;
+        pages[18][2] += 1;
+        assert!(row(&pages).is_err());
     }
 }

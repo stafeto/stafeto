@@ -597,7 +597,7 @@ const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
     programs
 };
 /// Dedicated measurement image; no other lifetime fixture owns locks here.
-const fn posix_lock_full_programs(profile: u32) -> [ImageProgram; 10] {
+const fn posix_lock_full_programs(profile: u32, ring: bool) -> [ImageProgram; 10] {
     let mut programs = POSIX_LIFETIMES_PROGRAMS;
     programs[0].3 = if profile == 4 {
         &["table-posix-lock-full4"]
@@ -605,11 +605,17 @@ const fn posix_lock_full_programs(profile: u32) -> [ImageProgram; 10] {
         &["table-posix-lock-full7"]
     };
     programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
-    programs[5].3 = &["lock-full-fixture"];
+    programs[5].3 = if ring {
+        &["lock-full-ring"]
+    } else {
+        &["lock-full-fixture"]
+    };
     programs
 }
-const POSIX_LOCK_FULL4_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4);
-const POSIX_LOCK_FULL7_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7);
+const POSIX_LOCK_FULL4_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, false);
+const POSIX_LOCK_FULL7_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, false);
+const POSIX_LOCK_FULL4_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, true);
+const POSIX_LOCK_FULL7_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, true);
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1345,9 +1351,15 @@ fn main() {
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
         Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
         Some("posix-lock-full") => match &args[1..] {
-            [profile] if profile == "4" => posix_lock_full_probe(&qemu::VIRT, 4),
-            [profile] if profile == "7" => posix_lock_full_probe(&qemu::VIRT, 7),
-            _ => Err("posix-lock-full 4|7".to_owned()),
+            [profile] if profile == "4" => posix_lock_full_probe(&qemu::VIRT, 4, false),
+            [profile] if profile == "7" => posix_lock_full_probe(&qemu::VIRT, 7, false),
+            [profile, mode] if profile == "4" && mode == "ring" => {
+                posix_lock_full_probe(&qemu::VIRT, 4, true)
+            }
+            [profile, mode] if profile == "7" && mode == "ring" => {
+                posix_lock_full_probe(&qemu::VIRT, 7, true)
+            }
+            _ => Err("posix-lock-full 4|7 [ring]".to_owned()),
         },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -3224,14 +3236,21 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32) -> Result<(), String> {
+fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, ring: bool) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
-    let (name, programs) = if profile == 4 {
-        ("boot-posix-lock-full4.img", &POSIX_LOCK_FULL4_PROGRAMS)
-    } else {
-        ("boot-posix-lock-full7.img", &POSIX_LOCK_FULL7_PROGRAMS)
+    let (name, programs) = match (profile, ring) {
+        (4, false) => ("boot-posix-lock-full4.img", &POSIX_LOCK_FULL4_PROGRAMS),
+        (7, false) => ("boot-posix-lock-full7.img", &POSIX_LOCK_FULL7_PROGRAMS),
+        (4, true) => (
+            "boot-posix-lock-full4-ring.img",
+            &POSIX_LOCK_FULL4_RING_PROGRAMS,
+        ),
+        _ => (
+            "boot-posix-lock-full7-ring.img",
+            &POSIX_LOCK_FULL7_RING_PROGRAMS,
+        ),
     };
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
@@ -3273,6 +3292,20 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32) -> Result<(), St
             if profile == 4 { 20 } else { 17 }
         ),
     )?;
+    if ring {
+        qemu::expect_marker(
+            &outcome,
+            &format!(
+                "lock-full: ring profile={profile} successes=15 deadlock=1 published=240 private=0 retired=0 common=112 payers=8"
+            ),
+        )?;
+        for owner in 0..16 {
+            qemu::expect_marker(
+                &outcome,
+                &format!("lock-full: ring key profile={profile} owner={owner} label="),
+            )?;
+        }
+    }
     for family in 0..8 {
         qemu::expect_marker(
             &outcome,

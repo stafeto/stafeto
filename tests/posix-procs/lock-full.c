@@ -15,12 +15,20 @@
 extern int full_telemetry(unsigned, unsigned, uint64_t, uint64_t, unsigned, uint64_t[6]);
 extern int full_identity(unsigned, uint64_t[4]);
 extern int full_source(unsigned, uint64_t[2]);
+#ifndef FULL_RING
+#define FULL_RING 0
+#endif
 static unsigned profile, family;
 static const uint64_t cookie = UINT64_C(0x66756c6c32353601);
 struct record {
     uint64_t pid, root, generation, inode, source[2];
     unsigned family, count;
     char phase;
+#if FULL_RING
+    uint64_t label, wait_source[2], key_slot, key_generation;
+    int result, error;
+    unsigned complete_seen;
+#endif
 };
 static struct timespec tick = {0, 10000000};
 static unsigned owners(unsigned f) {
@@ -71,6 +79,61 @@ static int write_record(unsigned index, const struct record *r) {
     int ok = pwrite(fd, r, sizeof(*r), 0) == (ssize_t)sizeof(*r);
     close(fd); return ok ? 0 : -1;
 }
+#if FULL_RING
+static int set(int fd, short kind, unsigned segment);
+extern void full_ring_arm(void);
+extern void full_ring_disarm(void);
+extern int full_row_valid(const uint64_t[20][6]);
+static struct record ring_results[16];
+static struct record ring_record;
+static unsigned ring_index;
+static int ring_bad;
+/* Observational hook after actual Start/Arm or strict terminal decoding. */
+void full_ring_observed(unsigned phase, unsigned slot, uint64_t generation,
+                        unsigned packed, uint64_t description_generation) {
+    int saved = errno;
+    if (!generation || slot >= 16 || packed != ring_record.wait_source[0]
+        || description_generation != ring_record.wait_source[1]) ring_bad = 1;
+    if (ring_record.key_generation && (ring_record.key_slot != slot
+        || ring_record.key_generation != generation)) ring_bad = 1;
+    ring_record.key_slot = slot; ring_record.key_generation = generation;
+    if (phase == 1) ring_record.phase = 'S';
+    if (phase == 2) { ring_record.phase = 'C'; ring_record.complete_seen = 1; }
+    if (write_record(ring_index, &ring_record)) ring_bad = 1;
+    errno = saved;
+}
+static int ring_identity(int fd, struct record *r, int target) {
+    uint64_t out[6], source[2];
+    if (full_source((unsigned)fd, source) || full_telemetry((unsigned)fd, 6, cookie, 0, 0, out)
+        || out[0] || !out[1] || out[2] != r->pid || out[3] != r->root
+        || out[4] != r->generation || out[5] != source[1]) return -1;
+    if (target) {
+        if (r->label != out[1]) return -1;
+        memcpy(r->wait_source, source, sizeof(source));
+    } else r->label = out[1];
+    return 0;
+}
+static int ring_wait(int own, int target, unsigned index, struct record *r) {
+    char name[64]; path(name, "go", index);
+    if (gate(name)) return fail("ring Start gate", index);
+    ring_record = *r; ring_index = index; ring_bad = 0;
+    full_ring_arm();
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+    errno = 0;
+    int result = fcntl(target, F_SETLKW, &lock), error = errno;
+    full_ring_disarm();
+    *r = ring_record;
+    if (ring_bad || !r->complete_seen || !r->key_generation
+        || (index == 15 ? (result != -1 || error != EDEADLK) : result != 0))
+        return fail("ring canonical result", index);
+    /* Keep fillers and both descriptors; remove only each critical segment. */
+    if (!result && set(target, F_UNLCK, 0)) return fail("ring acquired unlock", index);
+    if (set(own, F_UNLCK, 0)) return fail("ring original unlock", index);
+    r->result = result; r->error = error; r->phase = result ? 'D' : 'O';
+    if (write_record(index, r)) return fail("ring terminal metadata", index);
+    return 0;
+}
+#endif
 static int turn(unsigned index, int advance) {
     for (unsigned n = 0; n < 3000; ++n) {
         int fd = open("/tmp/lock-full-turn", O_RDWR);
@@ -112,16 +175,33 @@ static int hold(unsigned local) {
     if (fd < 0 || full_identity((unsigned)getpid(), who) || who[0] != (uint64_t)getpid() || who[1] != 1
         || fstat(fd, &st) || full_source((unsigned)fd, r.source)) return fail("self source identity", index);
     r.pid = who[0]; r.root = who[2]; r.generation = who[3]; r.inode = (uint64_t)st.st_ino;
+#if FULL_RING
+    int target = -1;
+    if (index < 16) {
+        path(name, "file", (index + 1) % 16); target = open(name, O_RDWR);
+        if (target < 0 || ring_identity(fd, &r, 0) || ring_identity(target, &r, 1))
+            return fail("authenticated own and WAIT sources", index);
+    }
+#endif
     for (unsigned s = 0; s < r.count; ++s) {
         if (drained(fd) || set(fd, F_WRLCK, s)) return fail("real SET", index);
     }
     if (drained(fd) || write_record(index, &r) || turn(index, 1)) return fail("publish holder", index);
+#if FULL_RING
+    if (index < 16 && ring_wait(fd, target, index, &r)) return 1;
+#endif
     if (gate("/tmp/lock-full-stop")) return fail("Stop gate", index);
     uint64_t exact[2];
     if (full_source((unsigned)fd, exact) || memcmp(exact, r.source, sizeof(exact)) || fstat(fd, &st)
         || (uint64_t)st.st_ino != r.inode) return fail("retained source generation", index);
     /* No source close or broad unlock occurs before the capture Stop. */
     for (unsigned s = 0; s < r.count; ++s) if (set(fd, F_UNLCK, s)) return fail("teardown unlock", index);
+#if FULL_RING
+    if (target >= 0) {
+        if (full_source((unsigned)target, exact) || memcmp(exact, r.wait_source, sizeof(exact))
+            || close(target)) return fail("retained WAIT source generation", index);
+    }
+#endif
     if (close(fd)) return fail("teardown close", index);
     return 0;
 }
@@ -200,6 +280,96 @@ static int census(int fd, const struct record records[20], uint64_t epoch) {
     }
     return found != 8 || seen != 255 || first_slot != 320 ? fail("all eight actual payers", found) : 0;
 }
+#if FULL_RING
+static int ring_phase(unsigned index, char wanted, struct record *out) {
+    for (unsigned n = 0; n < 3000; ++n) {
+        if (read_record(index, out)) return -1;
+        if (out->phase == wanted) return 0;
+        if (out->phase == 'D' || out->phase == 'O' || (wanted == 'S' && out->phase == 'C')) return -1;
+        nanosleep(&tick, NULL);
+    }
+    return -1;
+}
+static int ring_capture(int fd, uint64_t epoch, const struct record initial[20]) {
+    for (unsigned i = 0; i < 16; ++i) {
+        char name[64]; path(name, "go", i);
+        if (publish(name, NULL, 0)) return fail("release exact ring owner", i);
+        if (i < 15) {
+            struct record r;
+            if (ring_phase(i, 'S', &r) || !r.key_generation || r.key_slot >= 16
+                || r.label != initial[i].label || r.pid != initial[i].pid
+                || memcmp(r.wait_source, initial[i].wait_source, sizeof(r.wait_source)))
+                return fail("actual first fifteen sleeping keys", i);
+        }
+    }
+    unsigned success = 0, deadlock = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+        struct record r;
+        if (ring_phase(i, i == 15 ? 'D' : 'O', &r) || !r.complete_seen || !r.key_generation
+            || r.label != initial[i].label || r.pid != initial[i].pid
+            || memcmp(r.wait_source, initial[i].wait_source, sizeof(r.wait_source))
+            || (i == 15 ? (r.result != -1 || r.error != EDEADLK) : r.result != 0))
+            return fail("all exact ring terminal receipts", i);
+        ring_results[i] = r;
+        success += r.result == 0; deadlock += r.result == -1 && r.error == EDEADLK;
+        printf("lock-full: ring key profile=%u owner=%u label=%llu slot=%llu gen=%llu source=%llu/%llu result=%d errno=%d\n",
+               profile, i, (unsigned long long)r.label, (unsigned long long)r.key_slot,
+               (unsigned long long)r.key_generation, (unsigned long long)r.wait_source[0],
+               (unsigned long long)r.wait_source[1], r.result, r.error);
+    }
+    uint64_t out[6];
+    for (unsigned n = 0; n < 1024; ++n) {
+        if (totals(fd, epoch, out)) return fail("ring occupancy RPC", n);
+        if (!out[2] && !out[3]) break;
+    }
+    if (out[1] != 240 || out[2] || out[3] || out[4] != 112 || out[5] != 8
+        || success != 15 || deadlock != 1) return fail("honest ring 240/0/0/112/8 transition", 0);
+    printf("lock-full: ring profile=%u successes=15 deadlock=1 published=240 private=0 retired=0 common=112 payers=8\n", profile);
+    return 0;
+}
+static int ring_rows(int fd, uint64_t epoch) {
+    unsigned covered = 0, methods = 0, full_deadlock = 0;
+    for (unsigned row = 0; row < 32; ++row) {
+        uint64_t pages[20][6] = {{0}};
+        int code = full_telemetry((unsigned)fd, 1, cookie, epoch, row << 16, pages[0]);
+        if (code == -304) continue;
+        if (code) return fail("strict row header", row);
+        for (unsigned page = 1; page < 20; ++page)
+            if (full_telemetry((unsigned)fd, 1, cookie, epoch, (row << 16) | page, pages[page]))
+                return fail("strict row page", row);
+        if (full_row_valid(pages)) return fail("complete bounded row", row);
+        unsigned mask = (unsigned)pages[0][4], kind = (unsigned)pages[0][5];
+        covered |= mask;
+        if (kind >= 54 && kind <= 58) methods |= 1u << (kind - 54);
+        for (unsigned bit = 0; bit < 16; ++bit) {
+            if (!(mask & (1u << bit))) continue;
+            uint64_t *w = pages[2 + bit];
+            unsigned visits = (unsigned)((pages[19][2 + bit / 8] >> ((bit % 8) * 8)) & 255);
+            if ((bit == 2 || bit == 5 || bit == 7 || bit == 14) && !(pages[19][4] & (1u << bit))) {
+                unsigned owner;
+                for (owner = 0; owner < 16; ++owner)
+                    if (ring_results[owner].label == w[2] && ring_results[owner].key_slot == w[3]
+                        && ring_results[owner].key_generation == w[4]) break;
+                if (owner == 16) return fail("row full WAIT receipt identity", bit);
+            }
+            if (bit == 7 && pages[1][2] == (UINT64_C(256) | (UINT64_C(128) << 48))
+                && pages[1][4] == 8 && !(pages[19][4] & (1u << bit))) full_deadlock = 1;
+            printf("lock-full: dispatch profile=%u row=%u kind=%u bit=%u visited=%u before=%llu after=%llu took=%llu whole=%llu waited=%llu serial=%llu ambiguous=%u\n",
+                   profile, row, kind, bit, visits, (unsigned long long)pages[1][2],
+                   (unsigned long long)pages[1][3], (unsigned long long)pages[0][3],
+                   (unsigned long long)pages[18][2], (unsigned long long)pages[18][3],
+                   (unsigned long long)pages[0][1], (unsigned)((pages[19][4] >> bit) & 1));
+        }
+    }
+    unsigned required = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4)
+        | (1u << 5) | (1u << 6) | (1u << 7) | (1u << 14);
+    if ((covered & required) != required || (methods & 23) != 23 || !full_deadlock)
+        return fail("actual ring required branches and full deadlock", covered);
+    printf("lock-full: ring dispatch profile=%u mask=%u methods=%u full-deadlock=1\n", profile, covered, methods);
+    return 0;
+}
+
+#endif
 static int coordinator(void) {
     int fd = open("/tmp/lock-full-controller", O_RDWR);
     if (fd < 0) return fail("controller open", 0);
@@ -224,6 +394,9 @@ static int coordinator(void) {
         if (read_record(i, r) || r->phase != 'H' || r->family != f || r->count != segments(f, i - first(f))
             || !r->pid || r->pid == (uint64_t)getpid() || !r->root || !r->generation || !r->source[1]
             || alive((unsigned)r->pid, 1)) return fail("real owner metadata/Page", i);
+#if FULL_RING
+        if (i < 16 && (!r->label || !r->wait_source[1])) return fail("authenticated WAIT metadata", i);
+#endif
         for (unsigned f = 0; f < 8; ++f) if (launchers[f] == r->pid) return fail("holder differs from launcher", i);
         for (unsigned old = 0; old < i; ++old) if (records[old].pid == r->pid || records[old].inode == r->inode) return fail("distinct owner/source", i);
         char name[64]; path(name, "file", i);
@@ -238,13 +411,30 @@ static int coordinator(void) {
     }
     printf("lock-full: live Pages profile=%u launchers=8 holders=%u total=%u\n", profile, first(8), 8 + first(8));
     if (census(fd, records, 0)) return 1;
+#if FULL_RING
+    if (full_telemetry((unsigned)fd, 6, 0, 0, 0, out) != -304
+        || full_telemetry((unsigned)fd, 6, cookie, 0, 1, out) != -310)
+        return fail("identity rejects zero nonce and stale source", 0);
+#endif
     if (full_telemetry((unsigned)fd, 0, cookie, 0, profile, out) || out[0] != 1 || out[1] != profile || out[2] != 32 || out[3] != 1 || out[4] || out[5] != 1)
         return fail("Begin stable witness", 0);
     uint64_t epoch = out[0];
+#if FULL_RING
+    if (full_telemetry((unsigned)fd, 6, cookie, 0, 0, out) != -310)
+        return fail("identity forbidden after Begin", 0);
+#endif
     if (full_telemetry((unsigned)fd, 3, cookie, epoch, 0, out) || out[3] != 1 || out[4]) return fail("Header capture live", 0);
     if (totals(fd, epoch, out) || out[1] != 256 || out[2] || out[3] || out[4] != 128 || out[5] != 8 || census(fd, records, epoch))
         return fail("retained stable witness", 0);
+#if FULL_RING
+    if (ring_capture(fd, epoch, records)) return 1;
+#endif
     if (full_telemetry((unsigned)fd, 2, cookie, epoch, 0, out)) return fail("Stop capture", 0);
+#if FULL_RING
+    if (full_telemetry((unsigned)fd, 6, cookie, 0, 0, out) != -310)
+        return fail("identity forbidden after Stop", 0);
+    if (ring_rows(fd, epoch)) return 1;
+#endif
     printf("lock-full: stable profile=%u participating=%u owners=%u published=256 private=0 retired=0 common=128 payers=8 epoch=%llu\n",
            profile, profile, first(8), (unsigned long long)epoch);
     if (close(fd) || publish("/tmp/lock-full-stop", NULL, 0)) return fail("release owners after Stop", 0);

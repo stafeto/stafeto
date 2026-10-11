@@ -72,6 +72,10 @@ fn main() {
             u8::from(env::var_os("CARGO_FEATURE_LOADER_ABORT").is_some())
         ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
+        .arg(format!(
+            "-DFULL_RING={}",
+            u8::from(env::var_os("CARGO_FEATURE_LOCK_FULL_RING").is_some())
+        ))
         .arg(format!("-DSTEPS_SESSIONS={sessions}"))
         .arg(format!(
             "-DNATIVE_SCOPES_LAUNCHER={}",

@@ -14,6 +14,7 @@ test = false
 bench = false
 
 [features]
+lock-full-ring = ["lock-full-fixture", "posix-abi/wait-probe"]
 lock-full-fixture = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt", "dep:posix-fs"]
 lifetime-probe = ["pending-open", "dep:proto-process", "posix-abi/close-probe", "posix-abi/lock-probe", "posix-abi/wait-probe"]
 jobs = []
