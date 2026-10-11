@@ -169,6 +169,12 @@ static void independent(void) {
     errno = 0;
     CHECK(read(r, received, 1) == -1 && errno == EAGAIN);
     CHECK(write(w, buffer, 0) == 0);
+    for (int i = 0; i < 7; ++i) CHECK(write(w, buffer, 512) == 512);
+    CHECK(write(w, buffer, 256) == 256);
+    errno = 0;
+    CHECK(write(w, buffer, 512) == -1 && errno == EAGAIN);
+    for (int i = 0; i < 7; ++i) CHECK(read(r, received, 512) == 512);
+    CHECK(read(r, received, 512) == 256);
     atomic_records(r);
     CHECK(close(w) == 0);
     CHECK(read(r, received, 1) == 0);

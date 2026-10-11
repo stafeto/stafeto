@@ -7477,6 +7477,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "posix-fd",
         "--package",
+        "posix-fs",
+        "--package",
         "posix-change",
         "--package",
         "posix-types",
