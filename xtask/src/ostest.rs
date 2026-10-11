@@ -944,6 +944,9 @@ impl ProbeLink {
         args[self.search] = dir.display().to_string();
         args[self.output] = elf.display().to_string();
         let mut lld = Command::new(&self.lld);
+        if args.first().is_none_or(|arg| arg != "-flavor") {
+            lld.args(["-flavor", "gnu"]);
+        }
         lld.args(&args);
         crate::run_cmd(&mut lld)
     }

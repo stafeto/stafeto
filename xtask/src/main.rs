@@ -1267,7 +1267,7 @@ commands:
             boot image and from files through the process service
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
   loader-channels verify ordinary loader channel provenance and descriptor transfer
-  process-steps run the probe of the longest step of the process service
+  process-steps [branches [machine]] measure process service steps (2G by default)
             under -icount with a crowd of children
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
@@ -1426,14 +1426,20 @@ fn main() {
         Some("posix-pty-steps") => posix_pty_probe_in(true),
         Some("posix-jobs") => posix_jobs_probe(),
         Some("process-steps") => match &args[1..] {
-            [] => process_steps(&qemu::VIRT, 7),
-            [n] => n
+            [] => process_steps(&qemu::VIRT_2G, 7),
+            [n, machine @ ..] if machine.len() <= 1 => n
                 .parse()
                 .ok()
                 .filter(|n| (1..=7).contains(n))
                 .ok_or_else(|| "process-steps expects 1..=7 branches".to_owned())
-                .and_then(|n| process_steps(&qemu::VIRT, n)),
-            _ => Err("process-steps [branches]".to_owned()),
+                .and_then(|n| {
+                    let machine = match machine.first() {
+                        Some(name) => qemu::machine(Some(name))?,
+                        None => &qemu::VIRT_2G,
+                    };
+                    process_steps(machine, n)
+                }),
+            _ => Err("process-steps [branches [machine]]".to_owned()),
         },
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
         Some("relibc-threads-hvf") => match hvf_host() {
@@ -5379,7 +5385,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-pty-steps", posix_pty_steps),
         // The longest step of the process service with 248 children, under
         // -icount: the host's time changes none of its numbers.
-        job("process-steps", || process_steps(&qemu::VIRT, 7)),
+        job("process-steps", || process_steps(&qemu::VIRT_2G, 7)),
         // BusyBox on relibc guards the C surface (5a').
         job("busybox", busybox_probe),
         job("ash", ash_probe),

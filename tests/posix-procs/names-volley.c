@@ -27,9 +27,8 @@ extern int files_volley_read_dir_index(const char *path, unsigned index);
 
 #define VZ "/tmp/vz"
 #define VZ_PAD 120
-/* A spawned process creates seven threads (the eighth gives EAGAIN: the
- * quota of the process in the steps mode, STEPS_QUOTA, 429 pages), so 112
- * renames take sixteen processes. */
+/* Sixteen processes each create seven 64 KiB workers for 112 renames.
+ * A separate oversized-stack request exercises quota exhaustion. */
 #define VZ_PROCESSES 16
 #define VZ_THREADS 7
 #define VZ_DEPTH 64
@@ -625,12 +624,14 @@ static int vz_child(void) {
             return 101;
         }
     }
-    /* The eighth thread does not fit the quota of the process: the lack of a
-     * resource for a thread is EAGAIN (XSH pthread_create), the code a pool
-     * of threads retries on. */
+    printf("posix-procs: names worker memory: process %d, %llu pages, seven stacks %zu bytes\n",
+           process, stafeto_probe_memory_used() / 4096, stack_size);
+    /* A 2 MiB stack plus the loaded image exceeds the child quota. Resource
+     * exhaustion remains EAGAIN while the ordinary workers have reserve. */
     {
         pthread_t eighth;
         vz_hold = 1;
+        VZ_CHECK(pthread_attr_setstacksize(&attr, 2 * 1024 * 1024) == 0);
         int e = pthread_create(&eighth, &attr, vz_idle, NULL);
         if (e != EAGAIN) {
             printf("posix-procs: volley: the eighth thread of process %d gave %d, wanted EAGAIN\n", process, e);

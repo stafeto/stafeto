@@ -17,6 +17,8 @@ rustflags = [
 # program format wants (lib/bootimg).
 [target.aarch64-unknown-none]
 rustflags = [
+    # Keep standard compiler unwind tables without machine outlining.
+    "-C", "llvm-args=--enable-machine-outliner=never",
     "-C", "link-arg=-zmax-page-size=4096",
     "-C", "link-arg=-zseparate-loadable-segments",
     "-C", "link-arg=-znorelro",
