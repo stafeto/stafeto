@@ -469,6 +469,22 @@ impl Transport {
         })
     }
 
+    /// Classify an exact retained backend before its local publication.
+    /// The native Finish already made its descriptor available to InfoFd.
+    pub fn capture_opened_target(
+        &self,
+        held: rt::fs::PreparedOpen,
+        access: u32,
+    ) -> Result<Target, FsError> {
+        let target = Self::opened_target(held, access)?;
+        let kind = FileKind::from_wire(self.descriptor_information(target)?.kind)?;
+        Ok(match target {
+            Target::Ram(exact) => Target::Ram(exact.with_kind(kind)),
+            Target::Random(exact) => Target::Random(exact.with_kind(kind)),
+            _ => unreachable!("an opened RAM backend"),
+        })
+    }
+
     /// The console's input route of the process.
     pub fn input(&self) -> rt::fs::Input {
         self.files().input()
@@ -861,7 +877,17 @@ impl PosixFs {
                             .capture_description(fd)
                             .map_err(FsError::from)?
                     };
-                    let target = Transport::opened_target(info.held, info.flags & 3)?;
+                    let target = Transport(startup.files.view(), None, None)
+                        .capture_opened_target(info.held, info.flags & 3)?;
+                    if let (
+                        InheritedTarget::Ready(Target::Ram(previous) | Target::Random(previous)),
+                        Target::Ram(current) | Target::Random(current),
+                    ) = (item.target, target)
+                        && let Ok(kind) = previous.kind()
+                        && current.kind() != Ok(kind)
+                    {
+                        return Err(FsError::Io);
+                    }
                     match item.target {
                         InheritedTarget::RawRam { random_hint, .. } => {
                             if matches!(target, Target::Random(_)) != random_hint {

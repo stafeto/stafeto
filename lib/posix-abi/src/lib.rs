@@ -37,6 +37,7 @@ pub mod random;
 pub mod relibc;
 pub mod shared;
 pub mod signals;
+pub mod synchronization;
 pub mod terminal;
 pub mod threads;
 pub mod tls;

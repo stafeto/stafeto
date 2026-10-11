@@ -23,6 +23,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+mod full;
+pub use full::run as run_full_basic;
+
 use crate::jobs::Job;
 use crate::{
     BOOT_PROFILE, BUILD_LOCK, ImageProgram, PROGRAM_TARGET, Variant, build, cargo, llvm_tool, qemu,
@@ -948,8 +951,82 @@ impl ProbeLink {
             lld.args(["-flavor", "gnu"]);
         }
         lld.args(&args);
-        crate::run_cmd(&mut lld)
+        let output = lld
+            .output()
+            .map_err(|e| format!("run native linker: {e}"))?;
+        crate::out::write(&String::from_utf8_lossy(&output.stdout), false);
+        crate::out::write(&String::from_utf8_lossy(&output.stderr), true);
+        if output.status.success() {
+            Ok(())
+        } else {
+            let diagnostics = String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(16_384)
+                .collect::<String>();
+            Err(format!(
+                "native linker exited {}:\n{diagnostics}",
+                output.status
+            ))
+        }
     }
+}
+
+/// Export an exact native link template for the host header census. `object`
+/// is a known empty C main, not a potentially unsupported corpus test.
+pub(crate) fn export_link_plan(directory: &Path, object: &str) -> Result<(), String> {
+    std::fs::create_dir_all(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+    let directory = directory
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", directory.display()))?;
+    let link = ProbeLink::new(object, &directory)?;
+    let args = exported_link_arguments(&link.args, link.output, link.search)?;
+    for (name, path) in [
+        ("lld", link.lld),
+        ("ar", link.ar),
+        ("nm", llvm_tool("llvm-nm")?),
+    ] {
+        let path = path
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        std::fs::write(directory.join(name), path.as_os_str().as_encoded_bytes())
+            .map_err(|e| format!("write link tool {name}: {e}"))?;
+    }
+    std::fs::write(directory.join("args.nul"), args)
+        .map_err(|e| format!("write link arguments: {e}"))
+}
+
+/// NUL-separated argv preserves spaces and escapes without shell evaluation.
+fn exported_link_arguments(
+    args: &[String],
+    output: usize,
+    search: usize,
+) -> Result<Vec<u8>, String> {
+    const OUTPUT: &str = "{OUTPUT}";
+    const ARCHIVE: &str = "{ARCHIVE_DIR}";
+    if output == 0
+        || search == 0
+        || args.get(output - 1).is_none_or(|arg| arg != "-o")
+        || args.get(search - 1).is_none_or(|arg| arg != "-L")
+        || output >= args.len()
+        || search >= args.len()
+        || args
+            .iter()
+            .any(|arg| arg.as_bytes().contains(&0) || matches!(arg.as_str(), OUTPUT | ARCHIVE))
+    {
+        return Err("invalid output/archive positions in the link plan".into());
+    }
+    let mut args = args.to_vec();
+    args[output] = OUTPUT.into();
+    args[search] = ARCHIVE.into();
+    if args.first().is_none_or(|arg| arg != "-flavor") {
+        args.splice(0..0, ["-flavor".into(), "gnu".into()]);
+    }
+    let mut encoded = Vec::new();
+    for arg in args {
+        encoded.extend_from_slice(arg.as_bytes());
+        encoded.push(0);
+    }
+    Ok(encoded)
 }
 
 /// The ELF file of `test`, its object linked with the layer and relibc
@@ -1219,6 +1296,44 @@ fn write(rows: &[Row], suite: Option<&str>) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_plan_preserves_literal_arguments_and_exact_replacement_positions() {
+        let args = [
+            "-L",
+            "",
+            "a space/$(literal)`file.o",
+            "-o",
+            "old output",
+            "-lostest",
+        ]
+        .map(String::from)
+        .to_vec();
+        let encoded = exported_link_arguments(&args, 4, 1).unwrap();
+        let decoded = encoded
+            .strip_suffix(&[0])
+            .unwrap()
+            .split(|byte| *byte == 0)
+            .map(|word| std::str::from_utf8(word).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decoded,
+            [
+                "-flavor",
+                "gnu",
+                "-L",
+                "{ARCHIVE_DIR}",
+                "a space/$(literal)`file.o",
+                "-o",
+                "{OUTPUT}",
+                "-lostest"
+            ]
+        );
+        assert!(exported_link_arguments(&args, 3, 1).is_err());
+        let mut colliding = args;
+        colliding.push("{OUTPUT}".into());
+        assert!(exported_link_arguments(&colliding, 4, 1).is_err());
+    }
 
     #[test]
     fn single_test_result_preserves_all_five_classifications() {

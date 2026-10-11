@@ -482,12 +482,12 @@ impl PosixFs {
             let held = files.open_commit(recovery.job)?;
             recovery = recovery.remember(held);
             self.update_open_record(claim, recovery)?;
-            let target = super::Transport::opened_target(held, recovery.access as u32)?;
-            self.stage_open_record(claim, target)?;
             let finished = files.open_finish(key)?;
             if finished != held {
                 return Err(FsError::Io);
             }
+            let target = transport.capture_opened_target(finished, recovery.access as u32)?;
+            self.stage_open_record(claim, target)?;
             self.publish_open_record(claim)?;
             self.ack_open_record(token, owner)?
                 .into_result()

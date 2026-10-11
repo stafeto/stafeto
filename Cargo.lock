@@ -475,6 +475,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-sync-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+ "posix-sync",
+ "rt",
+]
+
+[[package]]
 name = "posix-thread"
 version = "0.1.0"
 

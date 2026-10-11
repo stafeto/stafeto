@@ -14,15 +14,22 @@ target/os-test/tests.txt, a line a test: `suite/test object-path` or
 `suite/test !outcome` (basic tests are named basic/<part>/<test>); the
 expectations stay in target/os-test/source/<suite>.expect, which the basic
 suite has none of: its tests pass with the outcome `exit: 0`. A stamp of
-both commits makes a second run do nothing."""
+both commits makes a second run do nothing.
+
+--full-basic compiles all 1187 basic sources from the pinned Git objects
+into a separate target/os-test-full. Numbered sources/objects, exact Git
+inventory, source mapping and compilation diagnostics preserve every row
+without changing the ordinary composition or its stamp."""
 
 import importlib.util
+import hashlib
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import time
 
 
 REPOSITORY = "https://gitlab.com/sortix/os-test.git"
@@ -117,12 +124,113 @@ def fetch() -> None:
         raise SystemExit(f"os-test is at {head}, expected {COMMIT}")
 
 
+def git_inventory(repository: Path, prefix: str) -> list[str]:
+    """Read exact case-sensitive names from Git, not the host checkout."""
+    result = subprocess.run(["git", "ls-tree", "-r", "--name-only", COMMIT,
+                             "--", prefix], cwd=repository, check=True,
+                            capture_output=True, text=True)
+    return sorted(result.stdout.splitlines())
+
+
+def git_blobs(repository: Path, paths: list[str]) -> dict[str, bytes]:
+    requests = "".join(f"{COMMIT}:{path}\n" for path in paths).encode()
+    result = subprocess.run(["git", "cat-file", "--batch"], cwd=repository,
+                            input=requests, capture_output=True, check=True)
+    blobs = {}
+    cursor = 0
+    for path in paths:
+        end = result.stdout.index(b"\n", cursor)
+        header = result.stdout[cursor:end].split()
+        if len(header) != 3 or header[1] != b"blob":
+            raise RuntimeError(f"os-test Git blob missing: {path}")
+        size = int(header[2])
+        cursor = end + 1
+        blobs[path] = result.stdout[cursor:cursor + size]
+        cursor += size + 1
+    if cursor != len(result.stdout):
+        raise RuntimeError("unexpected trailing os-test Git blobs")
+    return blobs
+
+
+def compile_full_basic(repository: Path, work: Path, compiler: str,
+                       expected: int = 1187) -> None:
+    paths = git_inventory(repository, "basic")
+    tests = [path for path in paths if path.endswith(".c")]
+    if len(tests) != expected or len(set(tests)) != expected:
+        raise RuntimeError(f"os-test basic inventory: {len(tests)}, expected {expected}")
+    inventory = "".join(f"{number:06d}\t{path}\n" for number, path in enumerate(tests))
+    flags = (*FLAGS, "-fno-builtin")
+    config = (f"full-basic {COMMIT} relibc {relibc_commit()} {' '.join(flags)} "
+              f"builder {hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}\n")
+    stamp = work / "stamp"
+    if stamp.exists() and stamp.read_text() == config \
+            and (work / "inventory.tsv").exists() \
+            and (work / "inventory.tsv").read_text() == inventory \
+            and (work / "tests.txt").exists() and (work / "sources.txt").exists():
+        rows = (work / "tests.txt").read_text().splitlines()
+        names = [str(Path(path).with_suffix("")) for path in tests]
+        if [row.split(" ", 1)[0] for row in rows] == names:
+            print(f"os-test full basic objects ready: {work / 'tests.txt'}")
+            return
+    work.mkdir(parents=True, exist_ok=True)
+    for directory in (work / "source", work / "objects"):
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir()
+    # Preserve all genuine relative includes (including ../sys_select/select.c),
+    # while each separately compiled test has its own numbered source path.
+    dependencies = work / "source" / "dependencies"
+    blobs = git_blobs(repository, paths + git_inventory(repository, "misc") + ["LICENSE"])
+    for path, body in blobs.items():
+        target = dependencies / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+    (work / "source" / "LICENSE").write_bytes(blobs["LICENSE"])
+    rows, sources, diagnostics = [], [], []
+    environment = os.environ.copy()
+    for variable in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH"):
+        environment.pop(variable, None)
+    for number, path in enumerate(tests):
+        name = str(Path(path).with_suffix(""))
+        source = work / "source" / f"{number:06d}" / Path(path).name
+        source.parent.mkdir()
+        source.write_bytes(blobs[path])
+        target = work / "objects" / f"{number:06d}.o"
+        began = time.monotonic()
+        result = subprocess.run([compiler, *flags, "-iquote",
+                                 str(dependencies / Path(path).parent),
+                                 "-c", str(source), "-o", str(target)],
+                                cwd=dependencies / Path(path).parent,
+                                capture_output=True, text=True, env=environment)
+        elapsed = time.monotonic() - began
+        classification = "good" if result.returncode == 0 else outcome(
+            result.stderr, blobs[path].decode())
+        rows.append(f"{name} {target}" if result.returncode == 0 else
+                    f"{name} !{classification}")
+        sources.append(f"{name}\t{source.resolve()}")
+        # Full diagnostics remain beside each object; the map carries a bounded
+        # single-line tail, so one failure cannot consume the whole census.
+        target.with_suffix(".err").write_text(result.stderr)
+        tail = result.stderr[-2048:].replace("\t", " ").replace("\n", "\\n")
+        diagnostics.append(f"{name}\t{classification}\t{elapsed:.6f}\t{tail}")
+    (work / "inventory.tsv").write_text(inventory)
+    (work / "tests.txt").write_text("\n".join(rows) + "\n")
+    (work / "sources.txt").write_text("\n".join(sources) + "\n")
+    (work / "compile.tsv").write_text("\n".join(diagnostics) + "\n")
+    stamp.write_text(config)
+    print(f"os-test full basic objects ready: {work / 'tests.txt'} ({len(rows)} rows)")
+
+
 def main() -> None:
     if not (INCLUDE / "stdio.h").exists():
         raise SystemExit("build relibc with cargo xtask relibc first")
     args = sys.argv[1:]
+    if args == ["--full-basic"]:
+        fetch()
+        compile_full_basic(SOURCE, ROOT / "target" / "os-test-full", clang())
+        return
     if args and (len(args) != 2 or args[0] != "--suite"):
-        raise SystemExit("usage: build-os-test.py [--suite NAME]")
+        raise SystemExit("usage: build-os-test.py [--suite NAME | --full-basic]")
     selected = args[1] if args else None
     parts = [(suite, suite, "*.c") for suite in SUITES]
     parts += [(f"basic/{part}", f"basic/{part}", pattern) for part, pattern in BASIC]
