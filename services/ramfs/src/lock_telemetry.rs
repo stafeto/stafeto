@@ -6,6 +6,8 @@ pub const METHOD: u16 = 0xfff1;
 pub const ROWS: usize = 32;
 pub const BRANCHES: usize = 16;
 pub const PAGES: u32 = 20;
+/// Exact effects use the previously unused rows, separate from branch maxima.
+pub const EFFECT_BRANCHES: [usize; 6] = [8, 12, 15, 9, 0, 0];
 pub fn control(id: crate::locks::jobs::Id) -> [u64; 4] {
     [id.owner(), u64::from(id.key().slot), id.key().generation, 0]
 }
@@ -115,6 +117,8 @@ pub struct Dispatch {
     pub mask: u16,
     pub marks: [Branch; BRANCHES],
     observer: bool,
+    effects: u8,
+    exact: [Branch; 6],
 }
 impl Dispatch {
     pub fn mark(&mut self, bit: usize, visited: u8, witness: [u64; 4]) -> bool {
@@ -287,6 +291,32 @@ impl Table {
         };
         self.mark(bit, visited, witness);
     }
+    /// Publish only after an actual effect; repeated distinct identities are ambiguous.
+    pub fn effect(&mut self, index: usize, visited: usize, witness: [u64; 4]) {
+        let Some(mark) = self.dispatch.exact.get_mut(index) else {
+            self.failed = true;
+            self.active = false;
+            return;
+        };
+        let Ok(visited) = u8::try_from(visited) else {
+            self.failed = true;
+            self.active = false;
+            return;
+        };
+        if visited == 0 || visited > 8 {
+            self.failed = true;
+            self.active = false;
+            return;
+        }
+        let flag = 1_u8 << index;
+        if self.dispatch.effects & flag == 0 {
+            mark.witness = witness;
+        } else if mark.witness != witness {
+            mark.ambiguous = true;
+        }
+        mark.visited = mark.visited.max(visited);
+        self.dispatch.effects |= flag;
+    }
     pub fn actor(
         &mut self,
         progress: crate::locks::actor::Progress,
@@ -330,6 +360,20 @@ impl Table {
             if self.dispatch.mask & (1 << bit) != 0 {
                 self.record(10 + bit, timing, after);
             }
+        }
+        for (index, &bit) in EFFECT_BRANCHES.iter().enumerate() {
+            if self.dispatch.effects & (1 << index) == 0 {
+                continue;
+            }
+            // No callback/RPC runs while substituting this exact mark. Keep the
+            // ordinary branch maxima and their original witness unchanged.
+            let previous = self.dispatch.marks[bit];
+            let mask = self.dispatch.mask;
+            self.dispatch.marks[bit] = self.dispatch.exact[index];
+            self.dispatch.mask |= 1 << bit;
+            self.record(26 + index, timing, after);
+            self.dispatch.marks[bit] = previous;
+            self.dispatch.mask = mask;
         }
     }
     fn record(&mut self, index: usize, timing: Timing, after: Occupancy) {
@@ -740,5 +784,90 @@ mod tests {
         assert!(!t.active);
         assert!(t.failed);
         assert_eq!(t.rows[5].unwrap().count, u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod exact_effect_tests {
+    use super::*;
+    fn table() -> Box<Table> {
+        let mut allocation = Box::<Table>::new_uninit();
+        // SAFETY: exclusive aligned complete allocation.
+        let mut table = unsafe {
+            Table::initialize_at(allocation.as_mut_ptr());
+            allocation.assume_init()
+        };
+        table
+            .start(
+                Scope {
+                    place: 0,
+                    owner: 77,
+                    nonce: 1,
+                    source: Source {
+                        packed: 3,
+                        generation: 1,
+                    },
+                },
+                0,
+                4,
+                Occupancy {
+                    published: 256,
+                    common: 128,
+                    roots: 8,
+                    ..Occupancy::default()
+                },
+            )
+            .unwrap();
+        table
+    }
+    fn finish(table: &mut Table, took: u64) {
+        table.finish(
+            Timing {
+                kind: 2,
+                whole: took,
+                took,
+                valid: true,
+                ..Timing::default()
+            },
+            Occupancy::default(),
+        );
+    }
+    #[test]
+    fn empty_sweep_cannot_replace_actual_removed_pid_with_faster_or_slower_work() {
+        let mut t = table();
+        t.begin_dispatch(Occupancy::default());
+        t.portion(8, 8, [0, 8, 0, 0]);
+        finish(&mut t, 99);
+        assert_eq!(t.page(26, 0), Err(Error::Invalid));
+        t.begin_dispatch(Occupancy::default());
+        t.portion(8, 8, [0, 8, 0, 1]);
+        t.effect(0, 8, [264, 0 | (8 << 32), 1, 1]);
+        finish(&mut t, 7);
+        assert_eq!(t.page(26, 10).unwrap()[1..], [264, 8 << 32, 1, 1]);
+        assert_eq!(t.page(26, 18).unwrap()[1], 7);
+        t.begin_dispatch(Occupancy::default());
+        t.portion(8, 8, [0, 8, 0, 0]);
+        finish(&mut t, 200);
+        assert_eq!(t.page(26, 10).unwrap()[1], 264);
+    }
+    #[test]
+    fn two_distinct_full_keys_are_ambiguous_and_geometry_growth_is_bounded() {
+        let mut t = table();
+        t.begin_dispatch(Occupancy::default());
+        t.effect(1, 8, [77, 1 << 32, 9, 330]);
+        t.effect(1, 8, [77, 1 << 32, 10, 330]);
+        finish(&mut t, 9);
+        assert_ne!(t.page(27, 19).unwrap()[3] & (1 << 12), 0);
+        assert_eq!(t.page(27, 14).unwrap()[3], 9);
+        assert!(
+            core::mem::size_of::<Dispatch>()
+                - (core::mem::size_of::<Occupancy>() + 8 + core::mem::size_of::<[Branch; 16]>())
+                <= 256
+        );
+        std::println!(
+            "exact effect layout Dispatch={} Table={}",
+            core::mem::size_of::<Dispatch>(),
+            core::mem::size_of::<Table>()
+        );
     }
 }
