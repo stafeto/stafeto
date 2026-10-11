@@ -935,7 +935,7 @@ impl ProbeLink {
         let mut args = self.args.clone();
         args[self.search] = dir.display().to_string();
         args[self.output] = elf.display().to_string();
-        let mut lld = Command::new(root().join("tools/linker/native-link"));
+        let mut lld = Command::new(crate::root().join("tools/linker/native-link"));
         lld.arg("--stafeto-real-linker").arg(&self.lld).args(&args);
         crate::run_cmd(&mut lld)
     }
