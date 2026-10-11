@@ -844,12 +844,12 @@ fn quoted_words(line: &str) -> Vec<String> {
 fn linker_arguments(text: &str) -> Result<Vec<String>, String> {
     let line = text
         .lines()
-        .find(|l| l.contains("rust-lld\""))
+        .find(|l| l.contains("rust-lld\"") || l.contains("native-link\""))
         .ok_or("the build of os-test-probe printed no link line")?;
     let words = quoted_words(line);
     let at = words
         .iter()
-        .position(|w| w.ends_with("rust-lld"))
+        .position(|w| w.ends_with("rust-lld") || w.ends_with("native-link"))
         .ok_or("no rust-lld in the link line")?;
     Ok(words[at + 1..].to_vec())
 }
@@ -935,8 +935,8 @@ impl ProbeLink {
         let mut args = self.args.clone();
         args[self.search] = dir.display().to_string();
         args[self.output] = elf.display().to_string();
-        let mut lld = Command::new(&self.lld);
-        lld.args(&args);
+        let mut lld = Command::new(root().join("tools/linker/native-link"));
+        lld.arg("--stafeto-real-linker").arg(&self.lld).args(&args);
         crate::run_cmd(&mut lld)
     }
 }

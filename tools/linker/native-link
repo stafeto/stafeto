@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Link each native Cargo/ProbeLink ELF and verify its async unwind metadata."""
+from pathlib import Path
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+from cfi import Invalid, normalize_file, require
+
+
+def llvm_tools(explicit):
+    if explicit:
+        linker = Path(explicit).resolve()
+        return linker, linker.with_name('llvm-objdump')
+    compiler = os.environ.get('RUSTC', 'rustc')
+    sysroot = subprocess.check_output([compiler, '--print', 'sysroot'], text=True).strip()
+    version = subprocess.check_output([compiler, '-vV'], text=True)
+    host = re.search(r'^host: (.+)$', version, re.M)
+    require(host is not None, 'selected rustc has no host triple')
+    directory = Path(sysroot) / 'lib/rustlib' / host[1] / 'bin'
+    return directory / 'rust-lld', directory / 'llvm-objdump'
+
+
+def expand_response(arguments, depth=0):
+    require(depth < 16, 'linker response files nest too deeply')
+    result = []
+    for argument in arguments:
+        if argument.startswith('@'):
+            result.extend(expand_response(shlex.split(Path(argument[1:]).read_text()), depth + 1))
+        else:
+            result.append(argument)
+    return result
+
+
+def main(arguments):
+    explicit = None
+    if arguments[:1] == ['--stafeto-real-linker']:
+        require(len(arguments) >= 3, 'missing explicit linker or linker arguments')
+        explicit, arguments = arguments[1], arguments[2:]
+    linker, objdump = llvm_tools(explicit)
+    require(linker.is_file() and objdump.is_file(), 'run rustup component add llvm-tools for the selected rustc')
+    expanded = expand_response(arguments)
+    outputs = [expanded[i + 1] for i, argument in enumerate(expanded[:-1]) if argument == '-o']
+    require(len(outputs) == 1, 'native link requires exactly one -o output')
+    require(expanded[:2] == ['-flavor', 'gnu'], 'native link requires the GNU LLD flavor')
+    output = Path(outputs[0])
+    status = subprocess.run([str(linker), *arguments]).returncode
+    if status:
+        return status
+    try:
+        normalize_file(output, objdump)
+    except (Invalid, OSError, subprocess.SubprocessError):
+        # A failed link must not leave a usable, unverified final Cargo artifact.
+        output.unlink(missing_ok=True)
+        raise
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (Invalid, OSError, subprocess.SubprocessError) as error:
+        print(f'native async CFI validation failed: {error}', file=sys.stderr)
+        sys.exit(1)
