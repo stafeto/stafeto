@@ -14,6 +14,10 @@ test = false
 bench = false
 
 [features]
+lock-full-dup = ["lock-full-fixture", "posix-abi/close-probe"]
+lock-full-dup-pid = ["lock-full-dup"]
+lock-full-dup-ofd-last = ["lock-full-dup"]
+lock-full-dup-ofd-alias = ["lock-full-dup"]
 lock-full-ofd = ["lock-full-fixture", "posix-abi/thread-probe", "posix-abi/close-probe"]
 lock-full-close = ["lock-full-wake"]
 lock-full-wake = ["lock-full-capacity"]

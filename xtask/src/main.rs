@@ -605,7 +605,13 @@ const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10
         &["table-posix-lock-full7"]
     };
     programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
-    programs[5].3 = if phase == 6 {
+    programs[5].3 = if phase == 9 {
+        &["lock-full-dup-ofd-alias"]
+    } else if phase == 8 {
+        &["lock-full-dup-ofd-last"]
+    } else if phase == 7 {
+        &["lock-full-dup-pid"]
+    } else if phase == 6 {
         &["lock-full-ofd"]
     } else if phase == 5 {
         &["lock-full-close"]
@@ -622,6 +628,12 @@ const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10
     };
     programs
 }
+const POSIX_LOCK_FULL4_DUP_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 7);
+const POSIX_LOCK_FULL7_DUP_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 7);
+const POSIX_LOCK_FULL4_DUP_LAST_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 8);
+const POSIX_LOCK_FULL7_DUP_LAST_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 8);
+const POSIX_LOCK_FULL4_DUP_ALIAS_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 9);
+const POSIX_LOCK_FULL7_DUP_ALIAS_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 9);
 const POSIX_LOCK_FULL4_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 0);
 const POSIX_LOCK_FULL7_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 0);
 const POSIX_LOCK_FULL4_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 1);
@@ -1248,7 +1260,8 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
-  posix-lock-full 4|7 verify 256 genuine published segments and eight paid roots
+  posix-lock-full 4|7 [dup-pid|dup-ofd-last|dup-ofd-alias]
+            verify 256 genuine published segments and eight paid roots
             in a dedicated measurement image under unchanged quotas
   posix-procs run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
@@ -1394,7 +1407,16 @@ fn main() {
             [profile, mode] if (profile == "4" || profile == "7") && mode == "ofd" => {
                 posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 6)
             }
-            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd]".to_owned()),
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "dup-pid" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 7)
+            }
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "dup-ofd-last" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 8)
+            }
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "dup-ofd-alias" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 9)
+            }
+            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd|dup-pid|dup-ofd-last|dup-ofd-alias]".to_owned()),
         },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -3276,6 +3298,30 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let (name, programs) = match (profile, phase) {
+        (4, 7) => (
+            "boot-posix-lock-full4-dup-pid.img",
+            &POSIX_LOCK_FULL4_DUP_PID_PROGRAMS,
+        ),
+        (7, 7) => (
+            "boot-posix-lock-full7-dup-pid.img",
+            &POSIX_LOCK_FULL7_DUP_PID_PROGRAMS,
+        ),
+        (4, 8) => (
+            "boot-posix-lock-full4-dup-last.img",
+            &POSIX_LOCK_FULL4_DUP_LAST_PROGRAMS,
+        ),
+        (7, 8) => (
+            "boot-posix-lock-full7-dup-last.img",
+            &POSIX_LOCK_FULL7_DUP_LAST_PROGRAMS,
+        ),
+        (4, 9) => (
+            "boot-posix-lock-full4-dup-alias.img",
+            &POSIX_LOCK_FULL4_DUP_ALIAS_PROGRAMS,
+        ),
+        (7, 9) => (
+            "boot-posix-lock-full7-dup-alias.img",
+            &POSIX_LOCK_FULL7_DUP_ALIAS_PROGRAMS,
+        ),
         (4, 0) => ("boot-posix-lock-full4.img", &POSIX_LOCK_FULL4_PROGRAMS),
         (7, 0) => ("boot-posix-lock-full7.img", &POSIX_LOCK_FULL7_PROGRAMS),
         (4, 1) => (
@@ -3386,6 +3432,19 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
             &format!(
                 "lock-full: wake profile={profile} sleeping=16 successes=16 published=254 private=0 retired=0 common=127 payers=8"
             ),
+        )?;
+    }
+    if (7..=9).contains(&phase) {
+        qemu::expect_marker(
+            &outcome,
+            &format!(
+                "lock-full: dup profile={profile} mode={} published=256 private=0 retired=0 common=128 payers=8 restored=12",
+                phase - 6
+            ),
+        )?;
+        qemu::expect_marker(
+            &outcome,
+            &format!("lock-full: dup effect profile={profile} mode={}", phase - 6),
         )?;
     }
     if phase == 6 {
@@ -8520,3 +8579,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../../tests/posix-procs/src/lock_full_wire.rs"]
 mod lock_full_wire;
+
+#[cfg(test)]
+#[path = "../../tests/posix-procs/src/lock_full_dup_wire.rs"]
+mod lock_full_dup_wire;
