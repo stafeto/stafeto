@@ -46,6 +46,11 @@ fn record(
     rows.push((name.to_owned(), result, phase, text));
 }
 
+fn batch_finished(log: &str) -> bool {
+    log.lines()
+        .any(|line| line == "init: os-test-run ended: exit code 0, not restarted")
+}
+
 fn write_rows(rows: &[CensusRow]) -> Result<(), String> {
     let mut ordered = rows.to_vec();
     ordered.sort_by(|a, b| a.0.cmp(&b.0));
@@ -229,6 +234,14 @@ pub fn run(jobs: usize) -> Result<(), String> {
                         String::new()
                     }
                 };
+                if !batch_finished(&log) {
+                    failures
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(format!(
+                            "full basic batch {number} did not finish successfully"
+                        ));
+                }
                 let mut rows = rows.lock().unwrap_or_else(PoisonError::into_inner);
                 for (name, _) in files {
                     record(
@@ -246,6 +259,15 @@ pub fn run(jobs: usize) -> Result<(), String> {
     }
     crate::jobs::run_all(boots, jobs)?;
     let rows = rows.lock().unwrap_or_else(PoisonError::into_inner);
+    let did_not_start = rows
+        .iter()
+        .filter(|row| row.3.contains("the test did not start"))
+        .count();
+    let no_end = rows
+        .iter()
+        .filter(|row| row.3.contains("no end of the test"))
+        .count();
+    println!("os-test full basic incomplete: {did_not_start} did not start, {no_end} no end");
     validate_rows(
         &rows,
         &tests.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
@@ -339,6 +361,121 @@ mod tests {
         ] {
             assert_eq!(classify(name, phase, ended).1, "FAIL");
         }
+    }
+
+    #[test]
+    fn census_classification_preserves_output_status_and_optional_boundaries() {
+        for (phase, source, macros, ended, wanted) in [
+            (
+                "RUNTIME",
+                "",
+                "",
+                Ended::Exited("exit: 0\n".into(), 0),
+                "PASS",
+            ),
+            (
+                "RUNTIME",
+                "",
+                "",
+                Ended::Exited("unexpected output\n".into(), 0),
+                "FAIL",
+            ),
+            (
+                "RUNTIME",
+                "",
+                "",
+                Ended::Exited("failure\n".into(), 1),
+                "FAIL",
+            ),
+            (
+                "RUNTIME",
+                "/*[XSI]*/",
+                "",
+                Ended::Exited("failure\n".into(), 1),
+                "UNSUPPORTED",
+            ),
+            (
+                "RUNTIME",
+                "/*[XSI]*/",
+                "#define _XOPEN_UNIX 1\n",
+                Ended::Exited("failure\n".into(), 1),
+                "FAIL",
+            ),
+            (
+                "RUNTIME",
+                "/*[XSI]*/",
+                "",
+                Ended::Exited("signal\n".into(), 134),
+                "FAIL",
+            ),
+            (
+                "RUNTIME",
+                "/*[XSI]*/",
+                "",
+                Ended::Failed("timeout: the test did not start\n".into()),
+                "FAIL",
+            ),
+            (
+                "RUNTIME",
+                "/*[XSI]*/",
+                "",
+                Ended::Failed("timeout: no end of the test\n".into()),
+                "FAIL",
+            ),
+            (
+                "COMPILE",
+                "",
+                "",
+                Ended::Exited("undeclared\n".into(), 1),
+                "FAIL",
+            ),
+            (
+                "COMPILE",
+                "/*[XSI]*/",
+                "",
+                Ended::Exited("undeclared\n".into(), 1),
+                "UNSUPPORTED",
+            ),
+            (
+                "LINK",
+                "",
+                "",
+                Ended::Exited("undefined\n".into(), 1),
+                "FAIL",
+            ),
+            (
+                "LINK",
+                "/*[XSI]*/",
+                "",
+                Ended::Exited("undefined\n".into(), 1),
+                "UNSUPPORTED",
+            ),
+        ] {
+            let mut rows = Vec::new();
+            record(
+                &mut rows,
+                "basic/check/ordinary",
+                phase,
+                ended,
+                source,
+                macros,
+            );
+            assert_eq!(rows[0].1, wanted, "{phase} {source} {macros}");
+        }
+    }
+
+    #[test]
+    fn full_batch_requires_successful_runner_completion() {
+        assert!(batch_finished(
+            "test output\ninit: os-test-run ended: exit code 0, not restarted\n"
+        ));
+        assert!(!batch_finished("@@os-test end basic/check exit 0\n"));
+        assert!(!batch_finished(
+            "init: os-test-run ended: exit code 1, not restarted\n"
+        ));
+        assert!(!batch_finished(
+            "init: os-test-run ended: signal 6, not restarted\n"
+        ));
     }
 
     #[test]

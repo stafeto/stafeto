@@ -990,6 +990,12 @@ pub extern "C" fn stafeto_probe_memory_used() -> u64 {
     rt::sys::process_memory(posix_abi::allocation::process()).map_or(0, |memory| memory.used)
 }
 
+/// The actual process memory ceiling used by the quota exhaustion probe.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_memory_quota() -> u64 {
+    rt::sys::process_memory(posix_abi::allocation::process()).map_or(0, |memory| memory.quota)
+}
+
 const PAGE: usize = 4096;
 
 /// The anonymous mappings relibc holds: (first page, pages) of each, in

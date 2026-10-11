@@ -79,11 +79,19 @@ impl Fixture {
             .unwrap();
     }
     fn wait(&mut self, place: usize, pid: u32, byte: i64) -> Id {
+        self.wait_kind(place, pid, byte, Kind::Write)
+    }
+    fn wait_kind(&mut self, place: usize, pid: u32, byte: i64, kind: Kind) -> Id {
         let mut captured = self.captured;
+        captured.request.command = Command::Set(Some(kind));
         captured.request.owner = Owner::Process(pid);
         captured.request.range = Range::relative(0, byte, 1).unwrap();
         let wire = WaitStart {
             pid: pid as i32,
+            kind: match kind {
+                Kind::Read => LockKind::Read,
+                Kind::Write => LockKind::Write,
+            },
             start: byte,
             ..self.wire
         };
@@ -184,17 +192,15 @@ fn cancel_between_cycle_validation_and_publication_discards_stale_edge() {
 #[test]
 fn writer_fifo_prevents_reader_bypass_and_notification_never_grants() {
     let mut f = Fixture::new();
-    f.hold(256, 0, Kind::Read);
+    f.hold(256, 0, Kind::Write);
     let first = f.wait(0, 257, 0);
     assert_eq!(f.settle(first).phase, WaitPhase::NeedsArm);
-    let second = f.wait(1, 258, 0);
+    let second = f.wait_kind(1, 258, 0, Kind::Read);
     let slot = f.waits.slot(second).unwrap();
-    f.waits.registrations[slot]
-        .as_mut()
-        .unwrap()
-        .captured
-        .request
-        .command = Command::Set(Some(Kind::Read));
+    assert_eq!(f.settle(second).phase, WaitPhase::NeedsArm);
+    f.hold(256, 0, Kind::Read);
+    f.waits.changed(f.captured.request.inode);
+    assert_eq!(f.settle(second).phase, WaitPhase::NeedsArm);
     let reader = f.waits.registrations[slot]
         .as_ref()
         .unwrap()
@@ -299,7 +305,7 @@ fn recycled_pid_bucket_without_exact_waiter_is_not_a_depth_limit_error() {
 }
 
 #[test]
-fn released_fifo_blocker_between_snapshot_and_visit_cannot_alias_new_registration() {
+fn queued_writer_is_not_a_held_graph_dependency() {
     let mut f = Fixture::new();
     f.hold(256, 0, Kind::Write);
     let older = f.wait(0, 257, 0);
@@ -308,7 +314,7 @@ fn released_fifo_blocker_between_snapshot_and_visit_cannot_alias_new_registratio
     for _ in 0..4096 {
         if f.waits
             .check_ref()
-            .is_some_and(|check| check.blockers_len == 2 && check.blocker == 1)
+            .is_some_and(|check| check.blockers_len == 1 && check.blocker == 0)
         {
             break;
         }
@@ -317,7 +323,7 @@ fn released_fifo_blocker_between_snapshot_and_visit_cannot_alias_new_registratio
     assert!(
         f.waits
             .check_ref()
-            .is_some_and(|check| check.blockers_len == 2 && check.blocker == 1)
+            .is_some_and(|check| check.blockers_len == 1 && check.blocker == 0)
     );
     f.waits.cancel(&mut f.queue, older).unwrap();
     f.waits.release_registration(older);
@@ -391,4 +397,112 @@ fn retained_wait_quiesces_own_work_and_timer_restarts_a_finite_sweep() {
     assert!(!f.waits.needs_work());
     assert_eq!(f.query(id).result, 0);
     assert_eq!(f.queue.query(id).unwrap().phase, WaitPhase::Complete);
+}
+
+#[test]
+fn initial_reader_and_holder_conversion_ignore_queued_writer() {
+    let mut f = Fixture::new();
+    f.hold(256, 0, Kind::Read);
+    let writer = f.wait(0, 257, 0);
+    assert_eq!(f.settle(writer).phase, WaitPhase::NeedsArm);
+    let reader = f.wait_kind(1, 258, 0, Kind::Read);
+    assert_eq!(
+        f.query(reader),
+        WaitReply {
+            phase: WaitPhase::Complete,
+            result: 0
+        }
+    );
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(258),
+        )
+        .unwrap();
+    let upgrade = f.wait(2, 256, 0);
+    assert_eq!(
+        f.query(upgrade),
+        WaitReply {
+            phase: WaitPhase::Complete,
+            result: 0
+        }
+    );
+    assert_ne!(f.queue.query(writer).unwrap().phase, WaitPhase::Complete);
+}
+
+#[test]
+fn sleeping_conversion_is_not_trapped_by_writer_waiting_on_its_hold() {
+    let mut f = Fixture::new();
+    f.hold(256, 0, Kind::Read);
+    f.hold(258, 0, Kind::Read);
+    let writer = f.wait(0, 257, 0);
+    assert_eq!(f.settle(writer).phase, WaitPhase::NeedsArm);
+    let upgrade = f.wait(1, 256, 0);
+    assert_eq!(f.settle(upgrade).phase, WaitPhase::NeedsArm);
+    f.waits.arm(&mut f.queue, upgrade, 71).unwrap();
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(258),
+        )
+        .unwrap();
+    f.waits.changed(f.captured.request.inode);
+    let mut notified = false;
+    for _ in 0..2 * CAPACITY {
+        f.waits.maintenance(
+            &mut f.queue,
+            &mut f.locks,
+            &mut f.ram.storage,
+            |_, _| true,
+            |_| true,
+            |handle| notified |= *handle == 71,
+        );
+    }
+    assert!(
+        notified,
+        "holder conversion must receive its real readiness notification"
+    );
+    assert_eq!(
+        f.query(upgrade),
+        WaitReply {
+            phase: WaitPhase::Complete,
+            result: 0
+        }
+    );
+    assert_ne!(f.queue.query(writer).unwrap().phase, WaitPhase::Complete);
+}
+
+#[test]
+fn acyclic_seventeen_edge_chain_remains_waiting_without_resource_error() {
+    let mut f = Fixture::new();
+    for byte in 0..=17 {
+        f.hold(256 + byte, byte as i64, Kind::Write);
+    }
+    let target = f.wait(0, 256, 1);
+    for byte in 1..=16 {
+        f.wait(byte as usize, 256 + byte, byte as i64 + 1);
+    }
+    assert_eq!(f.settle(target).phase, WaitPhase::NeedsArm);
+    assert_eq!(f.queue.query(target).unwrap().result, 0);
+}
+
+#[test]
+fn depth_limit_skips_one_blocker_and_follows_cycle_sibling() {
+    let mut f = Fixture::new();
+    for byte in 0..=15 {
+        f.hold(256 + byte, byte as i64, Kind::Write);
+    }
+    f.hold(400, 16, Kind::Read);
+    f.hold(256, 16, Kind::Read);
+    let target = f.wait(0, 256, 1);
+    for byte in 1..=15 {
+        f.wait(byte as usize, 256 + byte, byte as i64 + 1);
+    }
+    f.hold(500, 18, Kind::Write);
+    f.wait(16, 400, 18);
+    let reply = f.settle(target);
+    assert_eq!(reply.phase, WaitPhase::Complete);
+    assert_eq!(reply.result, proto_fs::LOCK_DEADLOCK);
 }

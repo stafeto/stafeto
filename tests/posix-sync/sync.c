@@ -17,6 +17,9 @@
 extern char **environ;
 extern int stafeto_sync(void);
 extern int sync_full_io(int, int);
+#if defined(_POSIX_FSYNC) && _POSIX_FSYNC > 0
+#error File Synchronization requires the missing aio_fsync interface
+#endif
 static int failures;
 static void check(const char *what, int good) {
     if (!good) { printf("posix-sync: %s failed (errno %d)\n", what, errno); failures++; }
@@ -114,6 +117,7 @@ int main(int argc, char **argv) {
         int file = atoi(argv[2]), directory = atoi(argv[3]);
         return fsync(file) || fdatasync(file) || fsync(directory) || fdatasync(directory) ? 8 : 9;
     }
+    check("FSYNC option awaits the asynchronous interface", sysconf(_SC_FSYNC) == -1);
     int writable = open("/tmp/sync-probe", O_CREAT | O_TRUNC | O_RDWR, 0600);
     check("create regular RAM file", writable >= 0);
     if (writable < 0) return 1;

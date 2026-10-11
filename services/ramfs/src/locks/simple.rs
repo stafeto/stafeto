@@ -155,6 +155,30 @@ impl Conflicts {
 #[derive(Default)]
 pub struct SweepCursor {
     pub inode: usize,
+    remaining: usize,
+}
+impl SweepCursor {
+    /// A new death owes a complete circle from the current physical position.
+    pub fn restart(&mut self) {
+        self.remaining = storage::NODES;
+    }
+    /// Periodic polling never replenishes an unfinished circle.
+    pub fn poll(&mut self) {
+        if !self.pending() {
+            self.restart();
+        }
+    }
+    pub fn pending(&self) -> bool {
+        self.remaining != 0
+    }
+    pub fn stop(&mut self) {
+        self.remaining = 0;
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryDetails {
+    pub blocker: Option<Lock>,
+    pub owns_overlap: bool,
 }
 pub struct Sweep {
     pub visited: usize,
@@ -274,11 +298,25 @@ impl SimpleLocks {
         &self,
         storage: &Storage<'_>,
         request: Request,
-        mut live: impl FnMut(Owner) -> bool,
+        live: impl FnMut(Owner) -> bool,
     ) -> Result<Option<Lock>, Error> {
+        self.query_details(storage, request, live)
+            .map(|details| details.blocker)
+    }
+    pub fn query_details(
+        &self,
+        storage: &Storage<'_>,
+        request: Request,
+        mut live: impl FnMut(Owner) -> bool,
+    ) -> Result<QueryDetails, Error> {
         let kind = match request.command {
             Command::Get(kind) | Command::Set(Some(kind)) => kind,
-            Command::Set(None) => return Ok(None),
+            Command::Set(None) => {
+                return Ok(QueryDetails {
+                    blocker: None,
+                    owns_overlap: false,
+                });
+            }
         };
         storage.node(request.inode).map_err(|_| Error::Invalid)?;
         let head = self.heads[request.inode.slot as usize];
@@ -291,19 +329,25 @@ impl SimpleLocks {
             range: request.range,
         };
         let mut blocker: Option<Lock> = None;
+        let mut owns_overlap = false;
         let mut id = head.first;
         for _ in 0..head.count {
             let (lock, next) = self.read(storage, id);
             id = next;
-            if live(lock.owner)
-                && lock.conflicts(wanted)
-                && blocker.is_none_or(|old| lock.range.first() < old.range.first())
-            {
-                blocker = Some(lock);
+            if live(lock.owner) {
+                owns_overlap |= lock.owner == request.owner && lock.range.overlaps(request.range);
+                if lock.conflicts(wanted)
+                    && blocker.is_none_or(|old| lock.range.first() < old.range.first())
+                {
+                    blocker = Some(lock);
+                }
             }
         }
         assert_eq!(id, NONE);
-        Ok(blocker)
+        Ok(QueryDetails {
+            blocker,
+            owns_overlap,
+        })
     }
     /// Preflight every new slot before changing any published record.
     pub fn set(
@@ -609,7 +653,7 @@ impl SimpleLocks {
             removed: 0,
             wrapped: false,
         };
-        for _ in 0..max_inodes.min(storage::NODES) {
+        for _ in 0..max_inodes.min(cursor.remaining) {
             let slot = cursor.inode;
             let head = self.heads[slot];
             if head.count != 0 {
@@ -622,11 +666,11 @@ impl SimpleLocks {
                 result.removed += head.count as usize - self.heads[slot].count as usize;
             }
             result.visited += 1;
+            cursor.remaining -= 1;
             cursor.inode += 1;
             if cursor.inode == storage::NODES {
                 cursor.inode = 0;
                 result.wrapped = true;
-                break;
             }
         }
         result
@@ -809,6 +853,114 @@ mod tests {
     }
     fn payer(id: u64) -> Root {
         Root { id, generation: 7 }
+    }
+
+    #[test]
+    fn death_mid_sweep_revisits_earlier_inodes_and_releases_every_paid_pin() {
+        let mut ram = crate::Ram::default();
+        let a = inode(&mut ram, b"sweep-a");
+        let b = inode(&mut ram, b"sweep-b");
+        let [low, high] = if a.slot < b.slot { [a, b] } else { [b, a] };
+        let mut table = fresh();
+        let owner = Owner::Process(256);
+        for file in [low, high] {
+            table
+                .set(
+                    &mut ram.storage,
+                    payer(1),
+                    request(file, owner, 0, 1, Some(Kind::Write)),
+                    |_| true,
+                )
+                .unwrap();
+        }
+        let mut cursor = SweepCursor::default();
+        cursor.restart();
+        let passed = table.sweep(&mut ram.storage, &mut cursor, low.slot as usize + 1, |_| {
+            true
+        });
+        assert_eq!(passed.removed, 0);
+        assert_eq!(cursor.inode, low.slot as usize + 1);
+        // The owner dies after its lower inode was already visited.
+        cursor.restart();
+        let mut visited = 0;
+        let mut removed = 0;
+        while cursor.pending() {
+            let result = table.sweep(&mut ram.storage, &mut cursor, 1, |_| false);
+            assert_eq!(result.visited, 1);
+            visited += result.visited;
+            removed += result.removed;
+            assert!(visited <= storage::NODES);
+        }
+        assert_eq!(visited, storage::NODES);
+        assert_eq!(removed, 2);
+        for file in [low, high] {
+            assert_eq!(table.count(file), 0);
+            assert_eq!(
+                ram.storage.node(file).unwrap().pins,
+                [0; storage::PIN_KINDS]
+            );
+        }
+        assert_eq!(ram.storage.usage(payer(1)), storage::Usage::default());
+    }
+
+    #[test]
+    fn periodic_poll_preserves_debt_but_a_new_death_restarts_one_circle() {
+        let mut ram = crate::Ram::default();
+        let mut table = fresh();
+        let mut cursor = SweepCursor::default();
+        assert_eq!(
+            table
+                .sweep(&mut ram.storage, &mut cursor, 1, |_| true)
+                .visited,
+            0
+        );
+        cursor.poll();
+        table.sweep(&mut ram.storage, &mut cursor, 3, |_| true);
+        let position = cursor.inode;
+        assert_eq!(cursor.remaining, storage::NODES - 3);
+        cursor.poll();
+        assert_eq!(cursor.remaining, storage::NODES - 3);
+        cursor.restart();
+        assert_eq!(cursor.remaining, storage::NODES);
+        assert_eq!(cursor.inode, position);
+        cursor.stop();
+        assert!(!cursor.pending());
+        cursor.poll();
+        assert_eq!(cursor.remaining, storage::NODES);
+    }
+
+    #[test]
+    fn query_details_requires_live_same_owner_overlap_and_retains_foreign_blocker() {
+        let mut ram = crate::Ram::default();
+        let file = inode(&mut ram, b"query-holder");
+        let mut table = fresh();
+        for (pid, first) in [(256, 0), (257, 3)] {
+            table
+                .set(
+                    &mut ram.storage,
+                    payer(1),
+                    request(file, Owner::Process(pid), first, 2, Some(Kind::Read)),
+                    |_| true,
+                )
+                .unwrap();
+        }
+        let asked = request(file, Owner::Process(256), 1, 4, Some(Kind::Write));
+        let details = table.query_details(&ram.storage, asked, |_| true).unwrap();
+        assert!(details.owns_overlap);
+        assert_eq!(details.blocker.unwrap().owner, Owner::Process(257));
+        assert!(
+            !table
+                .query_details(&ram.storage, asked, |owner| owner != Owner::Process(256))
+                .unwrap()
+                .owns_overlap
+        );
+        let disjoint = request(file, Owner::Process(256), 10, 1, Some(Kind::Write));
+        assert!(
+            !table
+                .query_details(&ram.storage, disjoint, |_| true)
+                .unwrap()
+                .owns_overlap
+        );
     }
 
     #[test]
@@ -1026,6 +1178,7 @@ mod tests {
             .unwrap();
         assert_eq!(table.count(file), 64);
         let mut cursor = SweepCursor::default();
+        cursor.restart();
         let result = table.sweep(&mut ram.storage, &mut cursor, storage::NODES, |owner| {
             matches!(owner, Owner::Description { .. })
         });
@@ -1069,6 +1222,7 @@ mod tests {
             assert_eq!(ram.storage.usage(payer(id)).pages, 1);
         }
         let mut cursor = SweepCursor::default();
+        cursor.restart();
         table.sweep(&mut ram.storage, &mut cursor, storage::NODES, |_| false);
         for id in 1..=9 {
             assert_eq!(ram.storage.usage(payer(id)), storage::Usage::default());
@@ -1122,6 +1276,7 @@ mod tests {
             ram.storage.release_lock_page(page);
         }
         let mut cursor = SweepCursor::default();
+        cursor.restart();
         table.sweep(&mut ram.storage, &mut cursor, storage::NODES, |_| false);
         assert_eq!(ram.storage.usage(payer(1)), storage::Usage::default());
     }

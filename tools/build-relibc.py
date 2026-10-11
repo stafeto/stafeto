@@ -21,8 +21,8 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-# Published resource and account hooks on stafeto, tagged pin-9d10c55.
-COMMIT = "9d10c553c1a75ccb24ba243d37e4e1c421004367"
+# File Synchronization awaits aio_fsync on stafeto, tagged pin-6a09f1e.
+COMMIT = "6a09f1e91ebce137d30fd4ba942b9f93ee9e4eb6"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

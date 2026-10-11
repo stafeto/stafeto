@@ -57,10 +57,15 @@ static void public_wait_fifo(void) {
                 /* Incompatible FIFO predecessors retain their position until cancellation. */
                 expect("older Write remains blocked on left",wait_fifo_pending(1),0);
                 expect("younger Read stays behind older Write",wait_fifo_pending(2),0);
+                struct flock right={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_start=4,.l_len=4};
+                expect("queued requests leave right range unheld",fcntl(fd,F_GETLK,&right),0);
+                expect("queued requests are not GETLK blockers",right.l_type,F_UNLCK);
+                right.l_type=F_WRLCK;
+                expect("new nonblocking SET uses free held range",fcntl(fd,F_SETLK,&right),0);
+                right.l_type=F_UNLCK;
+                expect("release new nonblocking SET",fcntl(fd,F_SETLK,&right),0);
+                expect("younger genuine waiter keeps FIFO after new SET",wait_fifo_pending(2),0);
             }
-            struct flock set={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_start=4,.l_len=4};errno=0;int result=fcntl(fd,F_SETLK,&set),error=errno;
-            expect("later real SET cannot bypass FIFO or granted Read",result,-1);expect("later SET genuine EAGAIN",error,EAGAIN);
-            set.l_type=F_UNLCK;expect("clean late PID SET if mutant granted",fcntl(fd,F_SETLK,&set),0);
         } else expect("unlock incomplete FIFO setup",wait_holder_exchange(commands[1],replies[0],'U'),1);
         if(mode==2 && created>0){expect("close older still-blocked Write WAIT",close(workers[0].fd),0);workers[0].fd=-1;}
         for(unsigned index=0;index<created;index++){
@@ -70,6 +75,10 @@ static void public_wait_fifo(void) {
         }
         if(created==2 && __atomic_load_n(&workers[1].done,__ATOMIC_ACQUIRE)){
             struct flock get={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_start=4,.l_len=4};expect("query granted OFD blocker",fcntl(fd,F_GETLK,&get),0);expect("selected WAIT owns actual Read blocker",get.l_type,F_RDLCK);expect("selected blocker is OFD",get.l_pid,-1);
+            /* The completed WAIT holds a real lock before the nonblocking SET. */
+            struct flock set={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_start=4,.l_len=4};errno=0;int result=fcntl(fd,F_SETLK,&set),error=errno;
+            expect("later real SET conflicts with granted Read",result,-1);expect("later SET genuine EAGAIN",error,EAGAIN);
+            set.l_type=F_UNLCK;expect("clean late PID SET if mutant granted",fcntl(fd,F_SETLK,&set),0);
         }
         /* Release the holder before joining, including failed ordering mutations. */
         expect("clear child FIFO locks",wait_holder_exchange(commands[1],replies[0],'C'),1);

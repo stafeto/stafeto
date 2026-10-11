@@ -338,9 +338,9 @@ mod tests {
         let (storage, descriptions) = ram.lock_parts();
         assert!(!descriptions.live(held.description));
         assert!(!descriptions.source_live(&fds, held));
-        let mut cursor = SweepCursor {
-            inode: inode.slot as usize,
-        };
+        let mut cursor = SweepCursor::default();
+        cursor.inode = inode.slot as usize;
+        cursor.restart();
         let result = locks.sweep(storage, &mut cursor, 1, |owner| match owner {
             Owner::Process(_) => true,
             Owner::Description { slot, generation } => {
