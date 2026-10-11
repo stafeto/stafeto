@@ -21,8 +21,8 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-# Published POSIX fsync option on stafeto, tagged pin-5209e58.
-COMMIT = "5209e580e7d8d1cafac6cb07be4a6a318a1a09e6"
+# File Synchronization awaits aio_fsync on stafeto, tagged pin-6a09f1e.
+COMMIT = "6a09f1e91ebce137d30fd4ba942b9f93ee9e4eb6"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

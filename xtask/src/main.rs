@@ -2721,7 +2721,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: fread ",
         "relibc-hello: monotonic ",
         "relibc-hello: directories, stat, descriptors, mmap, math",
-        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 12 options claimed, timers -1",
+        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 11 options claimed, timers -1",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
         "Assertion `how == NULL` failed.",
