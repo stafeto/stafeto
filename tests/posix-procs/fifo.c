@@ -18,6 +18,7 @@
 
 extern unsigned long long stafeto_probe_memory_used(void);
 extern unsigned long long stafeto_probe_memory_quota(void);
+extern int stafeto_fifo_service_reserve(void);
 static int failures;
 
 static void memory(const char *phase) {
@@ -97,6 +98,11 @@ static void creation(void) {
     CHECK(fstat(r, &st) == 0 && S_ISFIFO(st.st_mode));
     CHECK(fchmod(r, 0600) == 0);
     CHECK(fstat(w, &st) == 0 && (st.st_mode & 0777) == 0600);
+    CHECK(fchown(r, geteuid(), getegid()) == 0);
+    struct timespec times[2] = {{123, 456}, {789, 123}};
+    CHECK(futimens(r, times) == 0);
+    CHECK(fstat(w, &st) == 0 && st.st_atim.tv_sec == 123 && st.st_atim.tv_nsec == 456
+        && st.st_mtim.tv_sec == 789 && st.st_mtim.tv_nsec == 123);
     CHECK(fcntl(w, F_SETFL, O_APPEND | O_NONBLOCK) == 0);
     CHECK((fcntl(w, F_GETFL) & (O_APPEND | O_NONBLOCK)) == (O_APPEND | O_NONBLOCK));
     CHECK(close(w) == 0);
@@ -201,6 +207,21 @@ static void readiness(void) {
     CHECK(close(w) == 0);
     CHECK(poll(&item, 1, 0) == 1 && (item.revents & POLLHUP));
     CHECK(close(r) == 0);
+    struct pollfd many[9];
+    for (int i = 0; i < 9; ++i) {
+        many[i].fd = reader("/tmp/fifo-a");
+        many[i].events = POLLIN;
+        many[i].revents = 0;
+    }
+    w = writer("/tmp/fifo-a");
+    CHECK(poll(many, 9, 1) == 0);
+    CHECK(write(w, "M", 1) == 1);
+    CHECK(poll(many, 9, 0) == 9);
+    for (int i = 0; i < 9; ++i) {
+        CHECK(many[i].revents & POLLIN);
+        CHECK(close(many[i].fd) == 0);
+    }
+    CHECK(close(w) == 0);
     puts("posix-fifo: poll and select readiness ok");
 }
 
@@ -318,6 +339,7 @@ static void custody(void) {
 
 int main(int argc, char **argv) {
     if (argc == 1) {
+        CHECK(stafeto_fifo_service_reserve() == 0);
         pid_t child = -1;
         char *arguments[] = {"procs-child", "fifo-run", NULL};
         char *environment[] = {NULL};
@@ -325,6 +347,7 @@ int main(int argc, char **argv) {
         int status = 0;
         CHECK(waitpid(child, &status, 0) == child);
         CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(stafeto_fifo_service_reserve() == 0);
         return 0;
     }
     if (argc == 3 && strcmp(argv[1], "fifo-child") == 0) {

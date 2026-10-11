@@ -16,6 +16,8 @@ bench = false
 # One count of each kernel call the process makes (sys::calls), for the
 # images of measurements and tests only (rtbench 2).
 [features]
+# Host harnesses use std; bare-metal programs always retain their panic handler.
+host-tests = []
 count-calls = []
 # The longest step of a service's loop for each method, which a service
 # that asks (`service::report_steps`) prints when it grows; off in every

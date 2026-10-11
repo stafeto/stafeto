@@ -158,6 +158,7 @@ pub enum NamedPhase {
     Taken = 4,
     Failed = 5,
     Cancelled = 6,
+    Preparing = 7,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NamedReply {
@@ -189,6 +190,7 @@ impl NamedReply {
             4 => NamedPhase::Taken,
             5 => NamedPhase::Failed,
             6 => NamedPhase::Cancelled,
+            7 => NamedPhase::Preparing,
             _ => return Err(Status::BadSize),
         };
         let result = r.u32()?;

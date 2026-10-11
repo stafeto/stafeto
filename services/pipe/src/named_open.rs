@@ -85,13 +85,9 @@ impl PipeService {
         true
     }
     fn cancel_candidate(&mut self, ticket: NamedTicket) {
-        let Some(record) = self.named.get(ticket) else {
+        let Some(endpoint) = self.named.get_mut(ticket).and_then(|r| r.cancel()) else {
             return;
         };
-        if matches!(record.phase, NamedPhase::Failed | NamedPhase::Cancelled) {
-            return;
-        }
-        let endpoint = record.endpoint;
         if endpoint.is_named() {
             if let Ok(end) = self.pipes.queue_end(endpoint) {
                 self.pipes
@@ -101,10 +97,6 @@ impl PipeService {
             let _ = self.pipes.cancel_named(endpoint, &mut wakes);
             self.tell(&wakes);
         }
-        let record = self.named.get_mut(ticket).unwrap();
-        record.phase = NamedPhase::Cancelled;
-        record.endpoint = Endpoint::default();
-        record.handle = None;
     }
     fn witness(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let open = match NamedTicket::parse(r.body()) {
@@ -184,14 +176,23 @@ impl PipeService {
         if sys::copy_label(&self.channel, &offered).ok() != Some(record.cap_label) {
             return status(proto_pipe::BAD_FD);
         }
-        let (creator, root) = (record.creator, record.root);
         let record = self.named.get_mut(body.ticket).unwrap();
         record.capture = Some(body);
         record.broker = r.label();
         record.handle = None;
+        record.phase = NamedPhase::Preparing;
+        self.named_answer(body.ticket, r, false)
+    }
+    /// The original payer progresses its paid candidate outside the RAM step.
+    fn prepare_candidate(&mut self, ticket: NamedTicket) {
+        let record = self.named.get(ticket).expect("authorized paid candidate");
+        let Some(body) = record.preparing() else {
+            return;
+        };
+        let (creator, root, broker) = (record.creator, record.root, record.broker);
         let endpoint = self.pipes.reserve_named(
             NamedInode {
-                broker: r.label(),
+                broker,
                 inode: body.inode,
             },
             creator,
@@ -200,12 +201,12 @@ impl PipeService {
         );
         match endpoint {
             Err(code) => {
-                let record = self.named.get_mut(body.ticket).unwrap();
+                let record = self.named.get_mut(ticket).unwrap();
                 record.phase = NamedPhase::Failed;
                 record.result = code;
             }
             Ok(endpoint) => {
-                let record = self.named.get_mut(body.ticket).unwrap();
+                let record = self.named.get_mut(ticket).unwrap();
                 record.endpoint = endpoint;
                 let cap = self
                     .named
@@ -222,7 +223,7 @@ impl PipeService {
                     });
                 match cap {
                     Ok((label, handle)) => {
-                        let record = self.named.get_mut(body.ticket).unwrap();
+                        let record = self.named.get_mut(ticket).unwrap();
                         record.cap_label = label;
                         record.handle = Some(handle);
                         record.phase = NamedPhase::Grant;
@@ -231,7 +232,7 @@ impl PipeService {
                         let mut wakes = Wakes::default();
                         let _ = self.pipes.cancel_named(endpoint, &mut wakes);
                         self.tell(&wakes);
-                        let record = self.named.get_mut(body.ticket).unwrap();
+                        let record = self.named.get_mut(ticket).unwrap();
                         record.phase = NamedPhase::Failed;
                         record.result = Status::Kernel(error).code();
                         record.endpoint = Endpoint::default();
@@ -239,7 +240,6 @@ impl PipeService {
                 }
             }
         }
-        self.named_answer(body.ticket, r, true)
     }
     fn broker_cancel(&mut self, r: &mut Request<'_>) -> Answer {
         if r.label() & (RAM_BROKER | OWN) != RAM_BROKER || !r.handles.is_empty() {
@@ -380,6 +380,13 @@ impl PipeService {
                         self.named.get_mut(ticket).unwrap().handle = Some(notify);
                     }
                 }
+                if self
+                    .named
+                    .get(ticket)
+                    .is_some_and(|r| r.preparing().is_some())
+                {
+                    self.prepare_candidate(ticket);
+                }
                 let (label, key) = Admissions::<Handle<Channel>>::waiter(ticket);
                 self.named_tell(label, key);
             }
@@ -422,6 +429,11 @@ impl PipeService {
             }
             _ => return Answer::Status(Status::UnknownMethod),
         }
-        self.named_answer(ticket, r, false)
+        let grant = method == Method::NamedQuery
+            && self
+                .named
+                .get(ticket)
+                .is_some_and(|r| r.phase == NamedPhase::Grant);
+        self.named_answer(ticket, r, grant)
     }
 }

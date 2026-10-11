@@ -2121,3 +2121,65 @@ mod terminal_tests {
         write_area(&mut area, START_AREA, &block, 0, [0; SLOTS], &[]).unwrap();
     }
 }
+
+#[cfg(test)]
+mod fifo_identity_tests {
+    use super::*;
+    fn fifo(fd: u32) -> Descriptor {
+        Descriptor {
+            fd,
+            names: Names::Fifo {
+                packed: 34 | (127 << 8) | (127 << 15),
+                ram_generation: 0x1234567800000001,
+                pipe_generation: 0xabcdef1200000001,
+            },
+        }
+    }
+    #[test]
+    fn fifo_inheritance_requires_both_sessions_and_full_generations() {
+        let descriptor = fifo(31);
+        let bytes = descriptor.bytes();
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(Descriptor::read(&bytes), Some(descriptor));
+        assert_eq!(Descriptor::read(&bytes[..27]), None);
+        for range in [12..20, 20..28] {
+            let mut malformed = bytes;
+            malformed[range].fill(0);
+            assert_eq!(Descriptor::read(&malformed), None);
+        }
+        let mut changed = bytes;
+        changed[19] ^= 1;
+        assert_ne!(Descriptor::read(&changed), Some(descriptor));
+        let mut changed = bytes;
+        changed[27] ^= 1;
+        assert_ne!(Descriptor::read(&changed), Some(descriptor));
+        let mut ordinary = Descriptor {
+            fd: 3,
+            names: Names::File(3),
+        }
+        .bytes();
+        ordinary[20] = 1;
+        assert_eq!(Descriptor::read(&ordinary), None);
+        let mut block = [0; BLOCK_MAX];
+        let descriptors = core::array::from_fn::<_, 32, _>(|fd| fifo(fd as u32));
+        let size = Block::write_with(
+            &mut block,
+            b"/bin/fifo",
+            b"/",
+            0,
+            [&b"fifo"[..]].into_iter(),
+            [].into_iter(),
+            &descriptors,
+        )
+        .unwrap();
+        let read = Block::read(&block[..size]).unwrap();
+        assert!(read.needs(Slot::Files));
+        assert!(read.needs(Slot::Pipes));
+        assert!(!read.needs(Slot::Terminal));
+        assert_eq!(read.descriptors().count(), 32);
+        for (actual, expected) in read.descriptors().zip(descriptors) {
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(DESCRIPTOR * DESCRIPTORS, 896);
+    }
+}

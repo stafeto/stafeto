@@ -554,6 +554,47 @@ mod tests {
     }
 
     #[test]
+    fn nine_independent_read_descriptions_subscribe_once_and_each_reports_ready() {
+        let mut p = Box::new(Pipes::new());
+        let mut held = Held::default();
+        let mut wakes = Wakes::default();
+        let mut set = proto_pipe::WatchSet::new();
+        set.len = 9;
+        let mut queues = [0; proto_wire::watch::MAX];
+        for (i, queue) in queues.iter_mut().enumerate().take(set.len) {
+            let endpoint = p.reserve_named(key(), 1, 1, NONBLOCK).unwrap();
+            p.attach_named(endpoint, &mut wakes).unwrap();
+            p.take_named(&mut held, endpoint).unwrap();
+            set.items[i] = proto_wire::watch::Item {
+                description: endpoint.id,
+                events: proto_wire::watch::IN,
+            };
+            set.generations[i] = endpoint.generation;
+            *queue = p.queue_end(endpoint).unwrap() as u8;
+        }
+        let writer = p.reserve_named(key(), 1, 1, WRITE_END | NONBLOCK).unwrap();
+        p.attach_named(writer, &mut wakes).unwrap();
+        p.take_named(&mut held, writer).unwrap();
+        assert_eq!(set.endpoints().count(), 9);
+        assert!(!set.ready(|e| p.readiness_endpoint(&held, e)).any());
+        let unique: Vec<_> = crate::watches::unique_queues(&queues[..set.len]).collect();
+        assert_eq!(unique.len(), 1);
+        for &queue in &unique {
+            p.wait_new(queue, (1, 100), |_| true).unwrap();
+        }
+        for key in 0..WAITERS - 1 {
+            p.wait_new(unique[0], (2, key as u64), |_| true).unwrap();
+        }
+        assert_eq!(p.wait_new(unique[0], (2, 99), |_| true), Err(AGAIN));
+        p.write_endpoint(&held, writer, b"x", &mut wakes).unwrap();
+        let ready = set.ready(|e| p.readiness_endpoint(&held, e));
+        assert_eq!(&ready.events[..set.len], &[proto_wire::watch::IN; 9]);
+        for i in 0..set.len {
+            assert_eq!(set.endpoint(i).generation, set.generations[i]);
+        }
+    }
+
+    #[test]
     fn named_and_anonymous_holds_share_session_limit() {
         let mut p = Box::new(Pipes::new());
         let mut held = Held::default();

@@ -526,8 +526,7 @@ impl PipeService {
             Some(proto_pipe::AGAIN)
         };
         if registered {
-            for endpoint in set.endpoints() {
-                let description = self.pipes.queue_end(endpoint).unwrap();
+            for description in pipe::watches::unique_queues(&queues[..set.len]) {
                 let ops = &self.ops;
                 let named = &self.named;
                 if let Err(code) = self.pipes.wait_new(description, (label, key), |(l, k)| {

@@ -18,6 +18,22 @@ pub struct Admission<H> {
     pub handle: Option<H>,
 }
 impl<H> Admission<H> {
+    pub fn preparing(&self) -> Option<BrokerPrepare> {
+        (self.phase == NamedPhase::Preparing)
+            .then_some(self.capture)
+            .flatten()
+    }
+    /// Terminal failures preserve their saved result; an active candidate is retired once.
+    pub fn cancel(&mut self) -> Option<Endpoint> {
+        if matches!(self.phase, NamedPhase::Failed | NamedPhase::Cancelled) {
+            return None;
+        }
+        let endpoint = core::mem::take(&mut self.endpoint);
+        self.phase = NamedPhase::Cancelled;
+        self.handle = None;
+        Some(endpoint)
+    }
+
     pub fn reply(&self, ticket: NamedTicket) -> NamedReply {
         NamedReply {
             ticket,
@@ -207,6 +223,54 @@ impl<H> Admissions<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelling_captured_preparation_prevents_allocation_on_query_replay() {
+        let mut records = Admissions::<()>::new();
+        let open = NamedTicket {
+            slot: 32,
+            generation: 0x2_0000_0001,
+        };
+        let ticket = records.give(10, 20, open).unwrap();
+        let body = BrokerPrepare {
+            ticket,
+            client: 44,
+            open,
+            inode: NamedTicket {
+                slot: 7,
+                generation: 99,
+            },
+            flags: 0,
+        };
+        let record = records.get_mut(ticket).unwrap();
+        record.capture = Some(body);
+        record.broker = 55;
+        record.phase = NamedPhase::Preparing;
+        assert_eq!(record.preparing(), Some(body));
+        assert_eq!(record.cancel(), Some(Endpoint::default()));
+        assert_eq!(record.cancel(), None);
+        assert_eq!(record.reply(ticket).phase, NamedPhase::Cancelled);
+        let mut pipes = Box::new(crate::Pipes::new());
+        if let Some(replayed) = records.get(ticket).unwrap().preparing() {
+            pipes
+                .reserve_named(
+                    crate::NamedInode {
+                        broker: 55,
+                        inode: replayed.inode,
+                    },
+                    10,
+                    20,
+                    replayed.flags,
+                )
+                .unwrap();
+        }
+        assert_eq!(pipes.live(), 0);
+        assert_eq!(records.broker_ticket(55, 44, open), Some(ticket));
+        assert_eq!(records.reservations(10), 0);
+        assert_eq!(records.count(), 1);
+        records.free(ticket).unwrap();
+        assert_eq!(records.count(), 0);
+    }
 
     #[test]
     fn exact_generation_owner_and_broker_capture_survive_replay_and_slot_reuse() {

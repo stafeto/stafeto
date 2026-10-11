@@ -400,6 +400,7 @@ dependencies = [
  "posix-fs",
  "posix-sync",
  "proto-fs",
+ "proto-init",
  "proto-loader",
  "proto-process",
  "proto-wire",

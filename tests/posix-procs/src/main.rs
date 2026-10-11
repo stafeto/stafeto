@@ -184,3 +184,57 @@ mod lock_ring;
 extern "C" fn stafeto_fifo_waiting() -> i32 {
     i32::from(posix_abi::fifo_waiting())
 }
+
+/// Read existing init records while the FIFO guest holds live endpoints.
+#[cfg(any(feature = "fifo-probe", feature = "fifo-steps"))]
+#[unsafe(no_mangle)]
+extern "C" fn stafeto_fifo_service_reserve() -> i32 {
+    let parent = posix_crt::parent();
+    let mut first = 0;
+    let mut found = 0;
+    loop {
+        let mut writer = proto_wire::Writer::new();
+        if (proto_init::ListRequest { first })
+            .write(&mut writer)
+            .is_err()
+        {
+            return -1;
+        }
+        let Ok(reply) = rt::sys::send(&parent, writer.as_bytes()) else {
+            return -2;
+        };
+        let mut bytes = [0; rt::abi::MESSAGE_MAX];
+        let Ok(page) = proto_init::ListReply::read(reply.bytes(&mut bytes)) else {
+            return -3;
+        };
+        for record in page.records() {
+            let name = record.name.as_bytes();
+            if name == b"ramfs" || name == b"pipe" {
+                rt::println!(
+                    "posix-fifo: service {} memory {} pages quota {} pages handles {} limit {}",
+                    core::str::from_utf8(name).unwrap_or("?"),
+                    record.used_pages,
+                    record.quota_pages,
+                    record.live,
+                    record.limit
+                );
+                if record.quota_pages == 0
+                    || u64::from(record.used_pages) * 10 > u64::from(record.quota_pages) * 9
+                    || record.limit == 0
+                    || u64::from(record.live) * 10 > u64::from(record.limit) * 9
+                {
+                    return -4;
+                }
+                found += 1;
+            }
+        }
+        if page.is_empty() {
+            return -5;
+        }
+        first += page.len() as u16;
+        if first >= page.total {
+            break;
+        }
+    }
+    if found == 2 { 0 } else { -6 }
+}

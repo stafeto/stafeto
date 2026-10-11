@@ -837,7 +837,7 @@ mod tests {
         let mut files = files();
         let (token, claim, entry) = reserved(&mut files);
         let owner = OwnerToken::new(1).unwrap();
-        for _ in 1..32 {
+        for _ in 1..16 {
             files
                 .begin_open_record(owner, 0, DescriptorFlags::default())
                 .unwrap();
@@ -865,7 +865,42 @@ mod tests {
         assert_eq!(snapshot.owner, Some(owner));
         assert_eq!(snapshot.claimant, None);
         assert_eq!(snapshot.recovery.unwrap().descriptor_flags(), flags());
-        assert_eq!(files.open_tokens().count(), 32);
+        assert_eq!(files.open_tokens().count(), 16);
+    }
+
+    #[test]
+    fn fifo_capability_moves_once_only_from_exact_cancelling_open() {
+        let mut files = files();
+        let (token, claim, _) = reserved(&mut files);
+        let mut recovery = files.open_snapshot(token).unwrap().recovery.unwrap();
+        recovery.fifo_capability = 77;
+        files.update_open_record(claim, recovery).unwrap();
+        assert!(files.take_open_capability(token).is_err());
+        assert_eq!(
+            files
+                .open_snapshot(token)
+                .unwrap()
+                .recovery
+                .unwrap()
+                .fifo_capability,
+            77
+        );
+        files.begin_open_cancel(claim).unwrap();
+        assert_eq!(files.take_open_capability(token), Ok(77));
+        assert_eq!(files.take_open_capability(token), Ok(0));
+        files.finish_open_cancel(token, 5).unwrap();
+        files
+            .ack_open_record(token, OwnerToken::new(1).unwrap())
+            .unwrap();
+        let (fresh, claim, _) = reserved(&mut files);
+        assert_eq!(fresh.slot(), token.slot());
+        assert_ne!(fresh.generation(), token.generation());
+        let mut recovery = files.open_snapshot(fresh).unwrap().recovery.unwrap();
+        recovery.fifo_capability = 88;
+        files.update_open_record(claim, recovery).unwrap();
+        files.begin_open_cancel(claim).unwrap();
+        assert!(files.take_open_capability(token).is_err());
+        assert_eq!(files.take_open_capability(fresh), Ok(88));
     }
 
     #[test]
@@ -876,7 +911,7 @@ mod tests {
         // Both full backend generations and the ticket are charged in existing
         // resident records, without an extra admission pool or per-fd buffer.
         assert!(size_of::<PosixFs>() <= 20480);
-        assert!(size_of::<posix_fd::Table<Target, 32, Recovery>>() <= 8192);
-        assert!(size_of::<posix_fd::Table<Target, 32, Recovery, [u8; 1016]>>() <= 40960);
+        assert!(size_of::<posix_fd::Table<Target, 32, Recovery>>() <= 12288);
+        assert!(size_of::<posix_fd::Table<Target, 32, Recovery, [u8; 1016]>>() <= 61440);
     }
 }

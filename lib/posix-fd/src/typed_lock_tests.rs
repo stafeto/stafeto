@@ -66,6 +66,12 @@ struct PosixFs {
 }
 
 #[allow(dead_code, unused_imports)]
+impl PosixFs {
+    // This host container has only scalar mock targets. Actual paired FIFO
+    // jump custody is exercised in posix-fs::fifo's production-table tests.
+    fn mark_fifo_io_jump(&mut self, _owner: OwnerToken, _target: Frame) {}
+}
+
 #[path = "../../posix-fs/src/change.rs"]
 mod change;
 #[allow(dead_code)]

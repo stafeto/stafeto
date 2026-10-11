@@ -278,7 +278,9 @@ fn main(_: u64) -> u64 {
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
         notary: None,
-        pipe_broker: None,
+        // Optional dependency is resolved before serving; request steps never
+        // include an init connection round trip. Standalone profiles omit it.
+        pipe_broker: rt::service::connect(&start.parent, "pipe").ok(),
         given: 0,
         level,
         births: &mut tables.births,
@@ -511,10 +513,7 @@ impl Fs {
             && !wait_queue.retains(places.place(label), label)
     }
 
-    fn pipe_broker(&mut self) -> Result<&Handle<Channel>, u32> {
-        if self.pipe_broker.is_none() {
-            self.pipe_broker = rt::service::connect(&self.parent, "pipe").ok();
-        }
+    fn pipe_broker(&self) -> Result<&Handle<Channel>, u32> {
         self.pipe_broker.as_ref().ok_or(proto_fs::RESOLVING)
     }
     fn fifo_slot(&self, fds: &Fds, label: u64, key: proto_fs::OpenKey) -> Option<usize> {

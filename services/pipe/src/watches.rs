@@ -13,6 +13,15 @@ struct Registration {
     retired: bool,
     cleaned: u8,
 }
+/// Each readiness operation subscribes once to an underlying ring end.
+pub fn unique_queues(queues: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    queues
+        .iter()
+        .enumerate()
+        .filter(|(i, queue)| !queues[..*i].contains(queue))
+        .map(|(_, &queue)| u32::from(queue))
+}
+
 pub struct Pool<const N: usize> {
     list: [Option<Registration>; N],
 }

@@ -517,31 +517,34 @@ fn fifo_open(
         ticket_generation: recovery.fifo_ticket_generation,
         flags: recovery.fifo_flags as u32,
     };
-    let mut attached = false;
+    let mut brokered = false;
     loop {
         if crate::long::ending(&block.flags, true) {
             return Err(EINTR);
         }
         let _short = crate::long::ShortScope::enter(true)?;
-        let response = if !attached {
+        let response = if !brokered {
             let raw = core::mem::take(&mut recovery.fifo_capability);
             let witness = (raw != 0).then(|| Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
             save(claim, *recovery)?;
             match transport.files().fifo_grant(grant, witness) {
-                Ok(response) => match response.capability {
-                    Some(capability) => rt::pipe::request(
-                        &session,
-                        Method::NamedAttach,
-                        fifo_ticket(*recovery),
-                        Some(capability),
-                    ),
-                    None => rt::pipe::request(
-                        &session,
-                        Method::NamedQuery,
-                        fifo_ticket(*recovery),
-                        None,
-                    ),
-                },
+                Ok(response) => {
+                    brokered = true;
+                    match response.capability {
+                        Some(capability) => rt::pipe::request(
+                            &session,
+                            Method::NamedAttach,
+                            fifo_ticket(*recovery),
+                            Some(capability),
+                        ),
+                        None => rt::pipe::request(
+                            &session,
+                            Method::NamedQuery,
+                            fifo_ticket(*recovery),
+                            None,
+                        ),
+                    }
+                }
                 Err(refused) => {
                     save_fifo_capability(claim, recovery, refused.capability)?;
                     match refused.status {
@@ -559,15 +562,30 @@ fn fifo_open(
         let response = match response {
             Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
             Err(error) => return Err(protocol(error)),
-            Ok(response) => response.state,
+            Ok(response) => response,
         };
+        // The paid ticket is resident before Query advances allocation. A
+        // returned grant moves straight to Attach, without another RAM hop.
+        if let Some(capability) = response.capability {
+            if response.state.phase != NamedPhase::Grant {
+                return Err(EIO);
+            }
+            match rt::pipe::request(
+                &session,
+                Method::NamedAttach,
+                fifo_ticket(*recovery),
+                Some(capability),
+            ) {
+                Ok(_) | Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
+                Err(error) => return Err(protocol(error)),
+            }
+        }
+        let response = response.state;
         match response.phase {
-            NamedPhase::Witness | NamedPhase::Grant => {
-                attached = false;
+            NamedPhase::Witness | NamedPhase::Preparing | NamedPhase::Grant => {
                 continue;
             }
             NamedPhase::Waiting => {
-                attached = true;
                 recovery.fifo_stage = 3;
                 save(claim, *recovery)?;
             }
