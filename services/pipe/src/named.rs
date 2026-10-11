@@ -346,12 +346,21 @@ impl Pipes {
         Ok(2 * u32::from(record.ring) + u32::from(record.flags & WRITE_END != 0))
     }
     pub fn readiness_endpoint(&self, held: &Held, endpoint: Endpoint) -> u32 {
-        let Ok((index, end, _)) = self.resolve_endpoint(held, endpoint, None) else {
-            return proto_wire::watch::NVAL;
-        };
-        let mut ring_held = Held::default();
-        ring_held.add(2 * index + end);
-        self.readiness(&ring_held, (2 * index + end) as u32)
+        self.watch_endpoint(held, endpoint)
+            .map_or(proto_wire::watch::NVAL, |(_, ready)| ready)
+    }
+
+    /// One exact held-description lookup supplies its canonical queue and readiness.
+    pub fn watch_endpoint(&self, held: &Held, endpoint: Endpoint) -> Result<(u32, u32), u32> {
+        if !endpoint.is_named() {
+            if endpoint.generation != 0 {
+                return Err(BAD_FD);
+            }
+            let (index, end) = split(held, endpoint.id, None)?;
+            return Ok((endpoint.id, self.readiness_at(index, end)));
+        }
+        let (index, end, _) = self.resolve_endpoint(held, endpoint, None)?;
+        Ok(((2 * index + end) as u32, self.readiness_at(index, end)))
     }
 }
 
@@ -373,6 +382,49 @@ mod tests {
             slot: 1,
             generation: 0x2_0000_0001,
         }
+    }
+
+    #[test]
+    fn watch_lookup_checks_custody_and_generation_before_readiness() {
+        use proto_wire::watch;
+        let mut p = Box::new(Pipes::new());
+        let mut held = Held::default();
+        let mut wakes = Wakes::default();
+        let (rd, wr) = p.create(&mut held, 1, 1, 0).unwrap();
+        let read = Endpoint::anonymous(rd);
+        assert_eq!(p.watch_endpoint(&held, read), Ok((rd, 0)));
+        assert_eq!(
+            p.watch_endpoint(
+                &held,
+                Endpoint {
+                    generation: 1,
+                    ..read
+                }
+            ),
+            Err(BAD_FD)
+        );
+        p.close(&mut held, wr, &mut wakes).unwrap();
+        assert_eq!(
+            p.watch_endpoint(&held, read),
+            Ok((rd, watch::READ | watch::HUP))
+        );
+        let named = p.reserve_named(key(), 2, 1, NONBLOCK).unwrap();
+        assert_eq!(p.watch_endpoint(&held, named), Err(BAD_FD));
+        p.attach_named(named, &mut wakes).unwrap();
+        p.take_named(&mut held, named).unwrap();
+        let queue = p.queue_end(named).unwrap();
+        assert_eq!(
+            p.watch_endpoint(&held, named),
+            Ok((queue, watch::READ | watch::HUP))
+        );
+        p.close_endpoint(&mut held, named, &mut wakes).unwrap();
+        let fresh = p.reserve_named(key(), 2, 1, NONBLOCK).unwrap();
+        p.attach_named(fresh, &mut wakes).unwrap();
+        p.take_named(&mut held, fresh).unwrap();
+        assert_eq!(named.slot(), fresh.slot());
+        assert_ne!(named.generation, fresh.generation);
+        assert_eq!(p.watch_endpoint(&held, named), Err(BAD_FD));
+        assert_eq!(p.readiness_endpoint(&held, named), watch::NVAL);
     }
 
     #[test]

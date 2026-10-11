@@ -489,18 +489,20 @@ impl PipeService {
             _ => return Answer::Status(Status::BadSize),
         };
         let mut queues = [0u8; watch::MAX];
+        let mut ready = watch::Ready {
+            len: set.len,
+            events: [0; watch::MAX],
+        };
         for (i, queue) in queues.iter_mut().enumerate().take(set.len) {
             let endpoint = set.endpoint(i);
-            if self.pipes.flags_endpoint(&s.data.held, endpoint).is_err() {
-                return status(proto_pipe::BAD_FD);
-            }
-            *queue = match self.pipes.queue_end(endpoint) {
-                Ok(queue) => queue as u8,
+            let (canonical, events) = match self.pipes.watch_endpoint(&s.data.held, endpoint) {
+                Ok(value) => value,
                 Err(code) => return status(code),
             };
+            *queue = canonical as u8;
+            ready.events[i] = events & (set.items[i].events | watch::ALWAYS);
         }
         rt::service::step_detail(set.len as u64);
-        let ready = set.ready(|endpoint| self.pipes.readiness_endpoint(&s.data.held, endpoint));
         if ready.any() {
             return Self::watch_ready(r, ready);
         }

@@ -448,6 +448,11 @@ impl Pipes {
         let Ok((index, end)) = split(held, description, None) else {
             return watch::NVAL;
         };
+        self.readiness_at(index, end)
+    }
+
+    fn readiness_at(&self, index: usize, end: usize) -> u32 {
+        use proto_wire::watch;
         let pipe = &self.pipes[index];
         if end == 0 {
             let closed = pipe.ends[1].refs == 0;

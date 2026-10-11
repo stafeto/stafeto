@@ -15,11 +15,19 @@ struct Registration {
 }
 /// Each readiness operation subscribes once to an underlying ring end.
 pub fn unique_queues(queues: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    let mut seen = 0u128;
     queues
         .iter()
-        .enumerate()
-        .filter(|(i, queue)| !queues[..*i].contains(queue))
-        .map(|(_, &queue)| u32::from(queue))
+        .copied()
+        .filter(move |&queue| {
+            let Some(bit) = 1u128.checked_shl(u32::from(queue)) else {
+                return false;
+            };
+            let fresh = seen & bit == 0;
+            seen |= bit;
+            fresh
+        })
+        .map(u32::from)
 }
 
 pub struct Pool<const N: usize> {
@@ -97,6 +105,15 @@ impl<const N: usize> Pool<N> {
 mod tests {
     use super::*;
     use proto_pipe::Endpoint;
+
+    #[test]
+    fn canonical_queues_preserve_first_occurrence_and_last_end() {
+        assert_eq!(
+            unique_queues(&[127, 0, 127, 64, 0, 63, 64]).collect::<Vec<_>>(),
+            [127, 0, 64, 63]
+        );
+        assert_eq!(unique_queues(&[128, 255]).count(), 0);
+    }
 
     #[test]
     fn retired_watch_cleans_captured_ring_not_reused_named_slot() {
