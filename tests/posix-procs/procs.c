@@ -3599,7 +3599,8 @@ static void pipes_inherited(void) {
     close(out[0]);
     if (n == -1 && shell > 0) kill(shell, SIGKILL);
     if (shell > 0) reap("ash -c with ls | cat", shell, 0, 0);
-    if (n != 5 || strcmp(listing, "motd\n") != 0) {
+    if (n != 18 || !strstr(listing, "passwd\n") || !strstr(listing, "group\n")
+        || !strstr(listing, "motd\n")) {
         printf("posix-procs: the pipeline of ash printed %d bytes [%s]\n", n, n > 0 ? listing : "");
         failures++;
     } else {
