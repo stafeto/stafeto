@@ -241,6 +241,7 @@ void stafeto_probe_decoy(int on);
 void stafeto_probe_no_pipes_session(int on);
 size_t stafeto_probe_memory_map(unsigned long long *out, size_t max);
 unsigned long long stafeto_probe_memory_used(void);
+unsigned long long stafeto_probe_memory_quota(void);
 
 static void expect(const char *what, int got, int want) {
     if (got != want) {
@@ -1654,8 +1655,8 @@ static int full_child(pid_t parent, int fd, int cloexec, int clofork, volatile i
     char *more = malloc(grow);
     expect("1 MiB more heap in the child", more != NULL, 1);
     if (more) {
-        printf("posix-procs: fork child malloc memory: %llu pages\n",
-               stafeto_probe_memory_used() / 4096);
+        printf("posix-procs: fork child malloc memory: %llu pages, quota %llu pages\n",
+               stafeto_probe_memory_used() / 4096, stafeto_probe_memory_quota() / 4096);
         memset(more, 0x5a, grow);
         free(more);
     }
@@ -2081,8 +2082,8 @@ static void *malloc_slowly(void *arg) {
     char *p = malloc(1024 * 1024);
     slow_done = 1;
     if (p) {
-        printf("posix-procs: slow malloc memory: %llu pages\n",
-               stafeto_probe_memory_used() / 4096);
+        printf("posix-procs: slow malloc memory: %llu pages, quota %llu pages\n",
+               stafeto_probe_memory_used() / 4096, stafeto_probe_memory_quota() / 4096);
         memset(p, 1, 1024 * 1024);
     }
     return p;

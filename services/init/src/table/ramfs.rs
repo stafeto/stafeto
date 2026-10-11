@@ -503,10 +503,9 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
 /// each, and 24 of its own (tests/posix-procs STEPS_BRANCHES).
 const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 
-/// The steps probe and each spawned child: the enlarged image plus its
-/// checked 64 KiB malloc, including the allocator mapping and alignment.
-// The rebuilt volley retains 430 pages with all seven 64 KiB workers.
-// This quota leaves 16.0% reserve for the measured concurrent workload.
+/// The steps probe and each spawned child retain at most 430 pages with
+/// all seven 64 KiB workers, including allocator mapping and alignment.
+/// The 512-page quota leaves 16.0% reserve for that measured workload.
 const STEPS_QUOTA: u64 = 512 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB

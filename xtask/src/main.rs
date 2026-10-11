@@ -3434,6 +3434,7 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     }
     qemu::expect_marker(&outcome, "posix-procs: PID lifetime page ok")?;
     for marker in [
+        "posix-procs: holder conversions bypass queued PID and OFD writers ok",
         "posix-procs: public nonblocking locks, canonical fields, PID close and OFD fork ok",
         "posix-procs: public lock reply loss, exact keys, full GET receipt, numeric close and reuse ok ticks=",
         "posix-procs: lock depth within 16 KiB, nested SIGUSR1 close, siglongjmp and thread departure ok",
@@ -3634,6 +3635,7 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     if listings < 2 {
         return Err("ls of /etc printed the three account-file names fewer than twice".into());
     }
+    check_process_memory_reserve(&outcome.lines)?;
     // The new image of an exec whose old image ended first never runs.
     if outcome
         .lines
@@ -4242,6 +4244,57 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
     Ok(shown.iter().map(|line| (*line).clone()).collect())
 }
 
+/// Published concurrent snapshots must preserve the part's memory reserve.
+fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
+    let mut snapshots = 0;
+    for line in lines {
+        let (used, quota) = if line.starts_with("posix-procs: names quota:") {
+            let number = |tag| qemu::number_after(std::slice::from_ref(line), tag);
+            let (Some(quota), Some(used), Some(remaining), Some(refused), Some(ordinary)) = (
+                number("quota "),
+                number("used "),
+                number("remaining "),
+                number("refused stack "),
+                number("eighth ordinary stack "),
+            ) else {
+                return Err(format!("malformed names quota snapshot: {line}"));
+            };
+            if quota.checked_sub(used) != Some(remaining)
+                || u128::from(refused) != (u128::from(remaining) + 1) * 4096
+                || ordinary != 65536
+            {
+                return Err(format!(
+                    "names quota probe used an incorrect residual stack: {line}"
+                ));
+            }
+            (Some(used), Some(quota))
+        } else if let Some(tail) = line
+            .strip_prefix("posix-procs: slow malloc memory: ")
+            .or_else(|| line.strip_prefix("posix-procs: fork child malloc memory: "))
+        {
+            (
+                tail.split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok()),
+                qemu::number_after(std::slice::from_ref(line), "quota "),
+            )
+        } else {
+            continue;
+        };
+        let (Some(used), Some(quota)) = (used, quota) else {
+            return Err(format!("malformed process memory snapshot: {line}"));
+        };
+        if quota == 0 || u128::from(used) * 10 > u128::from(quota) * 9 {
+            return Err(format!("process memory reserve below 10%: {line}"));
+        }
+        snapshots += 1;
+    }
+    if snapshots == 0 {
+        return Err("process probe printed no concurrent memory snapshots".into());
+    }
+    Ok(())
+}
+
 fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
@@ -4296,6 +4349,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         &outcome,
         "posix-procs: resource and descriptor exec steps ok",
     )?;
+    check_process_memory_reserve(&outcome.lines)?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
     }
@@ -7507,6 +7561,37 @@ mod tests {
         .iter()
         .map(|line| (*line).to_owned())
         .collect()
+    }
+
+    #[test]
+    fn process_memory_requires_measured_ten_percent_reserve() {
+        let row = |used: u64, quota: u64| {
+            format!(
+                "posix-procs: names quota: process 3, quota {quota} pages, used {used} pages, remaining {} pages, refused stack {} bytes, eighth ordinary stack 65536 bytes",
+                quota.saturating_sub(used),
+                (quota.saturating_sub(used) + 1) * 4096
+            )
+        };
+        assert!(check_process_memory_reserve(&[row(90, 100)]).is_ok());
+        assert!(check_process_memory_reserve(&[row(91, 100)]).is_err());
+        assert!(
+            check_process_memory_reserve(&[
+                row(90, 100).replace("refused stack 45056", "refused stack 2097152")
+            ])
+            .is_err()
+        );
+        assert!(check_process_memory_reserve(&[row(0, 0)]).is_err());
+        assert!(check_process_memory_reserve(&[]).is_err());
+        assert!(
+            check_process_memory_reserve(&[
+                "posix-procs: slow malloc memory: 577 pages, quota 704 pages".into()
+            ])
+            .is_ok()
+        );
+        assert!(
+            check_process_memory_reserve(&["posix-procs: slow malloc memory: 577 pages".into()])
+                .is_err()
+        );
     }
 
     /// The lines of the names volley are all there, the volley ended in 112

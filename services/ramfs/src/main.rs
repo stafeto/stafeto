@@ -1243,6 +1243,7 @@ impl Service<0> for Fs {
         self.legacy_pending = true;
         Self::depart_fields(self.ram, self.locks, self.identities, &mut s.data);
         self.waits.poll();
+        self.lock_sweep.restart();
         self.lock_sweep_pending = self.locks.has_locks();
         if !Self::lock_custody_empty(
             self.lock_jobs,
@@ -1282,6 +1283,7 @@ impl Service<0> for Fs {
             let (_, fds) = self.births[i].as_mut().expect("exact retained birth");
             Self::depart_fields(self.ram, self.locks, self.identities, fds);
             self.waits.poll();
+            self.lock_sweep.restart();
             self.lock_sweep_pending = self.locks.has_locks();
             if !Self::lock_custody_empty(self.lock_jobs, self.wait_jobs, self.places, fds, label) {
                 self.departures.admit(SESSIONS + i);
@@ -1301,7 +1303,11 @@ impl Service<0> for Fs {
         if notice.source == rt::abi::Source::Timer && notice.label == WAIT_TIMER_LABEL {
             self.wait_timer_armed = false;
             self.waits.poll();
+            self.lock_sweep.poll();
             self.lock_sweep_pending = self.locks.has_locks();
+            if !self.lock_sweep_pending {
+                self.lock_sweep.stop();
+            }
             self.maintenance_burst.restart();
             self.legacy_pending = true;
             self.refresh_wait_timer();
@@ -1332,15 +1338,17 @@ impl Service<0> for Fs {
             let page = self.lifetimes.as_ref();
             let (storage, descriptions) = self.ram.lock_parts();
             if self.lock_maintenance_work == 1 && self.lock_sweep_pending {
-                let sweep =
-                    self.locks
-                        .sweep(storage, &mut self.lock_sweep, 1, |owner| match owner {
-                            Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
-                            Owner::Description { slot, generation } => {
-                                descriptions.live(Token { slot, generation })
-                            }
-                        });
-                self.lock_sweep_pending = self.locks.has_locks() && !sweep.wrapped;
+                self.locks
+                    .sweep(storage, &mut self.lock_sweep, 1, |owner| match owner {
+                        Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
+                        Owner::Description { slot, generation } => {
+                            descriptions.live(Token { slot, generation })
+                        }
+                    });
+                self.lock_sweep_pending = self.locks.has_locks() && self.lock_sweep.pending();
+                if !self.locks.has_locks() {
+                    self.lock_sweep.stop();
+                }
             }
             if self.lock_maintenance_work == 2 {
                 let births = &*self.births;
@@ -3976,15 +3984,10 @@ impl Fs {
                     .locks
                     .query(storage, captured.request, live)
                     .map(Response::Blocker),
-                Command::Set(_) => {
-                    if let Some(blocker) = self.waits.older_conflict(captured.request, None, live) {
-                        Err(LockError::Conflict(blocker))
-                    } else {
-                        self.locks
-                            .set(storage, captured.root, captured.request, live)
-                            .map(|()| Response::Changed)
-                    }
-                }
+                Command::Set(_) => self
+                    .locks
+                    .set(storage, captured.root, captured.request, live)
+                    .map(|()| Response::Changed),
             }
         };
         let reply = ramfs::locks::request::reply(result);

@@ -221,7 +221,14 @@ fn pairs_835769(text: &str) -> Vec<String> {
 /// and every program of a boot image goes through it, whichever command
 /// made them.
 pub fn erratum_835769(elf: &Path, objdump: &Path) -> Result<(), String> {
-    let found = pairs_835769(&disassemble(elf, objdump)?);
+    let text = disassemble(elf, objdump)?;
+    if text.contains("OUTLINED_FUNCTION_") {
+        return Err(format!(
+            "{}: machine-outlined functions in native ELF",
+            elf.display()
+        ));
+    }
+    let found = pairs_835769(&text);
     if !found.is_empty() {
         return Err(format!(
             "{}: {} erratum 835769 pairs (memory access, then a 64-bit multiply-accumulate):\n{}",
