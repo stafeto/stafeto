@@ -181,6 +181,7 @@ mod ring {
             generation: u64,
             packed: u32,
             description_generation: u64,
+            canonical: u32,
         );
     }
     fn hook(phase: WaitProbe, token: WaitToken) -> bool {
@@ -191,19 +192,25 @@ mod ring {
             WaitProbe::Start => 0,
             WaitProbe::Receive => 1,
             WaitProbe::Complete => 2,
+            #[cfg(feature = "lock-full-capacity")]
+            WaitProbe::Release => 3,
             _ => return false,
         };
         let snapshot =
             posix_abi::shared::with_files(|files| files.wait_snapshot(token).map_err(|_| -1));
-        let (packed, generation) = match snapshot {
+        let (packed, generation, canonical) = match snapshot {
             Ok(snapshot) => {
                 let backend = snapshot.recovery.backend();
                 (
                     backend.fd() | (backend.description_slot() << proto_fs::OPEN_DESCRIPTION_SHIFT),
                     backend.generation(),
+                    snapshot
+                        .recovery
+                        .outcome()
+                        .map_or(u32::MAX, |reply| reply.result),
                 )
             }
-            Err(_) => (0, 0),
+            Err(_) => (0, 0, u32::MAX),
         };
         // SAFETY: the dedicated single-thread C owner supplies an observational callback;
         // scalar copied identities survive this call, with no borrowed pointer or capability.
@@ -214,6 +221,7 @@ mod ring {
                 token.generation(),
                 packed,
                 generation,
+                canonical,
             )
         };
         false
@@ -243,7 +251,7 @@ pub unsafe extern "C" fn full_row_valid(pages: *const [[u64; 6]; 20]) -> i32 {
 #[cfg(feature = "lock-full-ring")]
 #[unsafe(no_mangle)]
 pub extern "C" fn full_ring_method_mask() -> u32 {
-    [
+    let mut mask = [
         proto_fs::Method::WaitStart,
         proto_fs::Method::WaitArm,
         proto_fs::Method::WaitQuery,
@@ -252,5 +260,9 @@ pub extern "C" fn full_ring_method_mask() -> u32 {
     .into_iter()
     .fold(0, |mask, method| {
         mask | (1 << (method as u16 - proto_fs::Method::WaitStart as u16))
-    })
+    });
+    if cfg!(feature = "lock-full-capacity") {
+        mask |= 1 << (proto_fs::Method::WaitCancel as u16 - proto_fs::Method::WaitStart as u16);
+    }
+    mask
 }

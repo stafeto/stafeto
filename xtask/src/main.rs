@@ -597,7 +597,7 @@ const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
     programs
 };
 /// Dedicated measurement image; no other lifetime fixture owns locks here.
-const fn posix_lock_full_programs(profile: u32, ring: bool) -> [ImageProgram; 10] {
+const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10] {
     let mut programs = POSIX_LIFETIMES_PROGRAMS;
     programs[0].3 = if profile == 4 {
         &["table-posix-lock-full4"]
@@ -605,17 +605,21 @@ const fn posix_lock_full_programs(profile: u32, ring: bool) -> [ImageProgram; 10
         &["table-posix-lock-full7"]
     };
     programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
-    programs[5].3 = if ring {
+    programs[5].3 = if phase == 2 {
+        &["lock-full-capacity"]
+    } else if phase == 1 {
         &["lock-full-ring"]
     } else {
         &["lock-full-fixture"]
     };
     programs
 }
-const POSIX_LOCK_FULL4_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, false);
-const POSIX_LOCK_FULL7_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, false);
-const POSIX_LOCK_FULL4_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, true);
-const POSIX_LOCK_FULL7_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, true);
+const POSIX_LOCK_FULL4_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 0);
+const POSIX_LOCK_FULL7_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 0);
+const POSIX_LOCK_FULL4_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 1);
+const POSIX_LOCK_FULL7_RING_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 1);
+const POSIX_LOCK_FULL4_CAPACITY_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 2);
+const POSIX_LOCK_FULL7_CAPACITY_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 2);
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1351,15 +1355,18 @@ fn main() {
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
         Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
         Some("posix-lock-full") => match &args[1..] {
-            [profile] if profile == "4" => posix_lock_full_probe(&qemu::VIRT, 4, false),
-            [profile] if profile == "7" => posix_lock_full_probe(&qemu::VIRT, 7, false),
+            [profile] if profile == "4" => posix_lock_full_probe(&qemu::VIRT, 4, 0),
+            [profile] if profile == "7" => posix_lock_full_probe(&qemu::VIRT, 7, 0),
             [profile, mode] if profile == "4" && mode == "ring" => {
-                posix_lock_full_probe(&qemu::VIRT, 4, true)
+                posix_lock_full_probe(&qemu::VIRT, 4, 1)
             }
             [profile, mode] if profile == "7" && mode == "ring" => {
-                posix_lock_full_probe(&qemu::VIRT, 7, true)
+                posix_lock_full_probe(&qemu::VIRT, 7, 1)
             }
-            _ => Err("posix-lock-full 4|7 [ring]".to_owned()),
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "capacity" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 2)
+            }
+            _ => Err("posix-lock-full 4|7 [ring|capacity]".to_owned()),
         },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -3236,20 +3243,28 @@ fn posix_files_run_profile(measured: bool, data: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, ring: bool) -> Result<(), String> {
+fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
-    let (name, programs) = match (profile, ring) {
-        (4, false) => ("boot-posix-lock-full4.img", &POSIX_LOCK_FULL4_PROGRAMS),
-        (7, false) => ("boot-posix-lock-full7.img", &POSIX_LOCK_FULL7_PROGRAMS),
-        (4, true) => (
+    let (name, programs) = match (profile, phase) {
+        (4, 0) => ("boot-posix-lock-full4.img", &POSIX_LOCK_FULL4_PROGRAMS),
+        (7, 0) => ("boot-posix-lock-full7.img", &POSIX_LOCK_FULL7_PROGRAMS),
+        (4, 1) => (
             "boot-posix-lock-full4-ring.img",
             &POSIX_LOCK_FULL4_RING_PROGRAMS,
         ),
-        _ => (
+        (7, 1) => (
             "boot-posix-lock-full7-ring.img",
             &POSIX_LOCK_FULL7_RING_PROGRAMS,
+        ),
+        (4, 2) => (
+            "boot-posix-lock-full4-capacity.img",
+            &POSIX_LOCK_FULL4_CAPACITY_PROGRAMS,
+        ),
+        _ => (
+            "boot-posix-lock-full7-capacity.img",
+            &POSIX_LOCK_FULL7_CAPACITY_PROGRAMS,
         ),
     };
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
@@ -3289,11 +3304,19 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, ring: bool) -> R
         &outcome,
         &format!(
             "lock-full: {} profile={profile} participating={profile} owners={} published=256 private=0 retired=0 common=128 payers=8 epoch=1",
-            if ring { "initial" } else { "stable" },
+            if phase != 0 { "initial" } else { "stable" },
             if profile == 4 { 20 } else { 17 }
         ),
     )?;
-    if ring {
+    if phase == 2 {
+        qemu::expect_marker(
+            &outcome,
+            &format!(
+                "lock-full: capacity profile={profile} sleeping=16 refused=1 cancelled=16 published=256 private=0 retired=0 common=128 payers=8"
+            ),
+        )?;
+    }
+    if phase == 1 {
         qemu::expect_marker(
             &outcome,
             &format!(

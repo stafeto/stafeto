@@ -12,6 +12,8 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
 #[cfg(feature = "lock-full-fixture")]
 mod lock_full;
+#[cfg(feature = "lock-full-capacity")]
+mod lock_full_capacity;
 #[cfg(feature = "lock-full-fixture")]
 mod lock_full_wire;
 

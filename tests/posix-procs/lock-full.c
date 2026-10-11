@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <spawn.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,9 @@ extern int full_source(unsigned, uint64_t[2]);
 #ifndef FULL_RING
 #define FULL_RING 0
 #endif
+#ifndef FULL_CAPACITY
+#define FULL_CAPACITY 0
+#endif
 static unsigned profile, family;
 static const uint64_t cookie = UINT64_C(0x66756c6c32353601);
 struct record {
@@ -27,7 +31,7 @@ struct record {
 #if FULL_RING
     uint64_t label, wait_source[2], key_slot, key_generation;
     int result, error;
-    unsigned complete_seen;
+    unsigned complete_seen, release_seen, canonical;
 #endif
 };
 static struct timespec tick = {0, 10000000};
@@ -85,13 +89,13 @@ extern void full_ring_arm(void);
 extern void full_ring_disarm(void);
 extern int full_row_valid(const uint64_t[20][6]);
 extern unsigned full_ring_method_mask(void);
-static struct record ring_results[16];
+static struct record ring_results[17];
 static struct record ring_record;
 static unsigned ring_index;
 static int ring_bad;
 /* Observational hook after actual Start/Arm or strict terminal decoding. */
 void full_ring_observed(unsigned phase, unsigned slot, uint64_t generation,
-                        unsigned packed, uint64_t description_generation) {
+                        unsigned packed, uint64_t description_generation, unsigned canonical) {
     int saved = errno;
     if (!generation || slot >= 16 || packed != ring_record.wait_source[0]
         || description_generation != ring_record.wait_source[1]) ring_bad = 1;
@@ -100,6 +104,8 @@ void full_ring_observed(unsigned phase, unsigned slot, uint64_t generation,
     ring_record.key_slot = slot; ring_record.key_generation = generation;
     if (phase == 1) ring_record.phase = 'S';
     if (phase == 2) { ring_record.phase = 'C'; ring_record.complete_seen = 1; }
+    if (phase == 3) ring_record.release_seen = 1;
+    if (canonical != ~0u) ring_record.canonical = canonical;
     if (write_record(ring_index, &ring_record)) ring_bad = 1;
     errno = saved;
 }
@@ -114,6 +120,7 @@ static int ring_identity(int fd, struct record *r, int target) {
     } else r->label = out[1];
     return 0;
 }
+#if !FULL_CAPACITY
 static int ring_wait(int own, int target, unsigned index, struct record *r) {
     char name[64]; path(name, "go", index);
     if (gate(name)) return fail("ring Start gate", index);
@@ -142,6 +149,7 @@ static int ring_wait(int own, int target, unsigned index, struct record *r) {
     if (write_record(index, r)) return fail("ring terminal metadata", index);
     return 0;
 }
+#endif
 #endif
 static int turn(unsigned index, int advance) {
     for (unsigned n = 0; n < 3000; ++n) {
@@ -174,6 +182,9 @@ static int set(int fd, short kind, unsigned segment) {
     struct flock lock = {.l_type = kind, .l_whence = SEEK_SET, .l_start = (off_t)(2 * segment), .l_len = 1};
     return fcntl(fd, F_SETLK, &lock);
 }
+#if FULL_CAPACITY
+#include "lock-full-capacity.c"
+#endif
 static int hold(unsigned local) {
     unsigned index = first(family) + local;
     if (turn(index, 0)) return fail("setup turn", index);
@@ -186,8 +197,8 @@ static int hold(unsigned local) {
     r.pid = who[0]; r.root = who[2]; r.generation = who[3]; r.inode = (uint64_t)st.st_ino;
 #if FULL_RING
     int target = -1;
-    if (index < 16) {
-        path(name, "file", (index + 1) % 16); target = open(name, O_RDWR);
+    if (index < (FULL_CAPACITY ? 17u : 16u)) {
+        path(name, "file", FULL_CAPACITY ? (index < 16 ? 16 : 0) : (index + 1) % 16); target = open(name, O_RDWR);
         if (target < 0 || ring_identity(fd, &r, 0) || ring_identity(target, &r, 1))
             return fail("authenticated own and WAIT sources", index);
     }
@@ -197,7 +208,11 @@ static int hold(unsigned local) {
     }
     if (drained(fd) || write_record(index, &r) || turn(index, 1)) return fail("publish holder", index);
 #if FULL_RING
+    #if FULL_CAPACITY
+    if (index < 17 && capacity_wait(target, index, &r)) return 1;
+#else
     if (index < 16 && ring_wait(fd, target, index, &r)) return 1;
+#endif
 #endif
     if (gate("/tmp/lock-full-stop")) return fail("Stop gate", index);
     uint64_t exact[2];
@@ -293,12 +308,13 @@ static int census(int fd, const struct record records[20], uint64_t epoch) {
 static int ring_phase(unsigned index, char wanted, struct record *out) {
     for (unsigned n = 0; n < 3000; ++n) {
         if (read_record(index, out)) return -1;
-        if (out->phase == wanted || (wanted == 'T' && (out->phase == 'D' || out->phase == 'O'))) return 0;
+        if (out->phase == wanted || (wanted == 'T' && (out->phase == 'D' || out->phase == 'O' || out->phase == 'E' || out->phase == 'N'))) return 0;
         if (out->phase == 'D' || out->phase == 'O' || (wanted == 'S' && out->phase == 'C')) return -1;
         nanosleep(&tick, NULL);
     }
     return -1;
 }
+#if !FULL_CAPACITY
 static int ring_capture(int fd, uint64_t epoch, const struct record initial[20]) {
     for (unsigned i = 0; i < 16; ++i) {
         char name[64]; path(name, "go", i);
@@ -341,6 +357,7 @@ static int ring_capture(int fd, uint64_t epoch, const struct record initial[20])
     printf("lock-full: ring profile=%u successes=15 deadlock=1 published=240 private=0 retired=0 common=112 payers=8\n", profile);
     return 0;
 }
+#endif
 static int ring_rows(int fd, uint64_t epoch) {
     unsigned covered = 0, methods = 0, full_deadlock = 0;
     for (unsigned row = 0; row < 32; ++row) {
@@ -361,10 +378,10 @@ static int ring_rows(int fd, uint64_t epoch) {
             unsigned visits = (unsigned)((pages[19][2 + bit / 8] >> ((bit % 8) * 8)) & 255);
             if ((bit == 2 || bit == 5 || bit == 7 || bit == 14) && !(pages[19][4] & (1u << bit))) {
                 unsigned owner;
-                for (owner = 0; owner < 16; ++owner)
+                for (owner = 0; owner < (FULL_CAPACITY ? 17u : 16u); ++owner)
                     if (ring_results[owner].label == w[2] && ring_results[owner].key_slot == w[3]
                         && ring_results[owner].key_generation == w[4]) break;
-                if (owner == 16) return fail("row full WAIT receipt identity", bit);
+                if (owner == (FULL_CAPACITY ? 17u : 16u)) return fail("row full WAIT receipt identity", bit);
             }
             if (bit == 7 && pages[1][2] == (UINT64_C(256) | (UINT64_C(128) << 48))
                 && pages[1][4] == 8 && !(pages[19][4] & (1u << bit))) full_deadlock = 1;
@@ -378,9 +395,10 @@ static int ring_rows(int fd, uint64_t epoch) {
     }
     unsigned required = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4)
         | (1u << 5) | (1u << 6) | (1u << 7) | (1u << 14);
-    if ((covered & required) != required || (methods & full_ring_method_mask()) != full_ring_method_mask() || !full_deadlock)
+    if (FULL_CAPACITY) required = (1u << 2) | (1u << 14);
+    if ((covered & required) != required || (methods & full_ring_method_mask()) != full_ring_method_mask() || (!FULL_CAPACITY && !full_deadlock))
         return fail("actual ring required branches and full deadlock", covered);
-    printf("lock-full: ring dispatch profile=%u mask=%u methods=%u full-deadlock=1\n", profile, covered, methods);
+    printf("lock-full: %s dispatch profile=%u mask=%u methods=%u full-deadlock=%u\n", FULL_CAPACITY ? "capacity" : "ring", profile, covered, methods, !FULL_CAPACITY);
     return 0;
 }
 
@@ -410,7 +428,7 @@ static int coordinator(void) {
             || !r->pid || r->pid == (uint64_t)getpid() || !r->root || !r->generation || !r->source[1]
             || alive((unsigned)r->pid, 1)) return fail("real owner metadata/Page", i);
 #if FULL_RING
-        if (i < 16 && (!r->label || !r->wait_source[1])) return fail("authenticated WAIT metadata", i);
+        if (i < (FULL_CAPACITY ? 17u : 16u) && (!r->label || !r->wait_source[1])) return fail("authenticated WAIT metadata", i);
 #endif
         for (unsigned f = 0; f < 8; ++f) if (launchers[f] == r->pid) return fail("holder differs from launcher", i);
         for (unsigned old = 0; old < i; ++old) if (records[old].pid == r->pid || records[old].inode == r->inode) return fail("distinct owner/source", i);
@@ -426,6 +444,14 @@ static int coordinator(void) {
     }
     printf("lock-full: live Pages profile=%u launchers=8 holders=%u total=%u\n", profile, first(8), 8 + first(8));
     if (census(fd, records, 0)) return 1;
+#if FULL_CAPACITY
+    char observer_name[64]; path(observer_name, "file", 16);
+    int observer_source = open(observer_name, O_RDWR);
+    struct stat observer_stat;
+    if (observer_source < 0 || fstat(observer_source, &observer_stat)
+        || (uint64_t)observer_stat.st_ino != records[16].inode)
+        return fail("pre-Begin exact observer source", 16);
+#endif
 #if FULL_RING
     if (full_telemetry((unsigned)fd, 6, 0, 0, 0, out) != -304
         || full_telemetry((unsigned)fd, 6, cookie, 0, 1, out) != -310)
@@ -442,7 +468,11 @@ static int coordinator(void) {
     if (totals(fd, epoch, out) || out[1] != 256 || out[2] || out[3] || out[4] != 128 || out[5] != 8 || census(fd, records, epoch))
         return fail("retained stable witness", 0);
 #if FULL_RING
+    #if FULL_CAPACITY
+    if (capacity_capture(fd, observer_source, epoch, records)) return 1;
+#else
     if (ring_capture(fd, epoch, records)) return 1;
+#endif
 #endif
     if (full_telemetry((unsigned)fd, 2, cookie, epoch, 0, out) || out[0] != epoch
         || out[1] != profile || out[2] != 32 || out[3] || out[4] || out[5] != epoch)
@@ -454,6 +484,9 @@ static int coordinator(void) {
 #endif
     printf("lock-full: %s profile=%u participating=%u owners=%u published=256 private=0 retired=0 common=128 payers=8 epoch=%llu\n",
            FULL_RING ? "initial" : "stable", profile, profile, first(8), (unsigned long long)epoch);
+    #if FULL_CAPACITY
+    if (close(observer_source)) return fail("observer close after Stop", 16);
+#endif
     if (close(fd) || publish("/tmp/lock-full-stop", NULL, 0)) return fail("release owners after Stop", 0);
     return 0;
 }

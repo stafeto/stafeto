@@ -128,3 +128,109 @@ mod tests {
         assert!(row(&pages).is_err());
     }
 }
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct WaitObservation {
+    pub nonce: u64,
+    pub pid: u32,
+    pub owner: u64,
+    pub slot: u32,
+    pub generation: u64,
+    pub first: u32,
+    pub discover: bool,
+}
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn wait_observation(bytes: &[u8], expected: WaitObservation) -> Result<bool, ()> {
+    let mut r = proto_wire::Reader::new(bytes);
+    if expected.nonce == 0
+        || expected.pid == 0
+        || expected.owner == 0
+        || expected.slot >= 16
+        || expected.generation == 0
+        || !matches!(expected.first, 0 | 8)
+        || r.u32().map_err(|_| ())? != 0
+        || r.u64().map_err(|_| ())? != expected.nonce
+        || r.u32().map_err(|_| ())? != expected.pid
+    {
+        return Err(());
+    }
+    let visited = r.u32().map_err(|_| ())?;
+    let present = r.u32().map_err(|_| ())?;
+    let owner = r.u64().map_err(|_| ())?;
+    let slot = r.u32().map_err(|_| ())?;
+    let generation = r.u64().map_err(|_| ())?;
+    let registration = r.u32().map_err(|_| ())?;
+    r.finish().map_err(|_| ())?;
+    if !(1..=8).contains(&visited) || present > 1 {
+        return Err(());
+    }
+    if present == 0 {
+        if owner != 0 || slot != 0 || generation != 0 || registration != 0 {
+            return Err(());
+        }
+        return Ok(false);
+    }
+    if owner != expected.owner
+        || slot != expected.slot
+        || generation != expected.generation
+        || !(expected.first..expected.first + 8).contains(&registration)
+            && (expected.discover || registration != u32::MAX)
+    {
+        return Err(());
+    }
+    Ok(true)
+}
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    fn response(registration: u32) -> (Vec<u8>, WaitObservation) {
+        let expected = WaitObservation {
+            nonce: 33,
+            pid: 257,
+            owner: (1 << 63) | 99,
+            slot: 3,
+            generation: 1 << 40,
+            first: 8,
+            discover: false,
+        };
+        let mut w = proto_wire::Writer::new();
+        w.u32(0).unwrap();
+        w.u64(expected.nonce).unwrap();
+        w.u32(expected.pid).unwrap();
+        w.u32(8).unwrap();
+        w.u32(1).unwrap();
+        w.u64(expected.owner).unwrap();
+        w.u32(expected.slot).unwrap();
+        w.u64(expected.generation).unwrap();
+        w.u32(registration).unwrap();
+        (w.as_bytes().to_vec(), expected)
+    }
+    #[test]
+    fn exact_queue_only_is_present_but_not_discovered_sleeping() {
+        let (bytes, mut expected) = response(u32::MAX);
+        assert_eq!(wait_observation(&bytes, expected), Ok(true));
+        expected.discover = true;
+        assert_eq!(wait_observation(&bytes, expected), Err(()));
+    }
+    #[test]
+    fn full_generation_and_physical_half_cannot_be_substituted() {
+        let (mut bytes, expected) = response(9);
+        assert_eq!(wait_observation(&bytes, expected), Ok(true));
+        bytes[36..44].copy_from_slice(&1_u64.to_le_bytes());
+        assert_eq!(wait_observation(&bytes, expected), Err(()));
+        let (bytes, mut expected) = response(9);
+        expected.first = 0;
+        assert_eq!(wait_observation(&bytes, expected), Err(()));
+    }
+    #[test]
+    fn absence_requires_zero_identity_and_bounded_actual_visits() {
+        let (mut bytes, expected) = response(9);
+        bytes[20..24].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(wait_observation(&bytes, expected), Err(()));
+        bytes[24..48].fill(0);
+        assert_eq!(wait_observation(&bytes, expected), Ok(false));
+        bytes[16..20].copy_from_slice(&9_u32.to_le_bytes());
+        assert_eq!(wait_observation(&bytes, expected), Err(()));
+    }
+}
