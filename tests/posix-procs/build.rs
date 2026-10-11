@@ -15,6 +15,7 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=procs.c");
+    println!("cargo:rerun-if-changed=math.c");
     println!("cargo:rerun-if-changed=fifo.c");
     println!("cargo:rerun-if-changed=lifetime.c");
     println!("cargo:rerun-if-changed=lock-holder.c");
@@ -71,7 +72,12 @@ fn main() {
     );
     println!("cargo:rerun-if-changed={}", lib.join("libc.a").display());
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    run(Command::new(tools.join("clang"))
+    let math = env::var_os("CARGO_FEATURE_MATH_PROBE").is_some();
+    let mut compiler = Command::new(tools.join("clang"));
+    if math {
+        compiler.args(["-frounding-math", "-ffp-contract=off"]);
+    }
+    run(compiler
         .arg(format!(
             "-DLOADER_ABORT_PROBE={}",
             u8::from(env::var_os("CARGO_FEATURE_LOADER_ABORT").is_some())
@@ -159,7 +165,9 @@ fn main() {
         .arg(sysroot.join("include"))
         .args([
             "-c",
-            if env::var_os("CARGO_FEATURE_FIFO_PROBE").is_some() {
+            if math {
+                "math.c"
+            } else if env::var_os("CARGO_FEATURE_FIFO_PROBE").is_some() {
                 "fifo.c"
             } else if env::var_os("CARGO_FEATURE_LIFETIME_PROBE").is_some() {
                 "lifetime.c"
