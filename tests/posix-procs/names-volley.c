@@ -571,7 +571,12 @@ static int vz_thread_cost(void) {
     pthread_t threads[COUNT];
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 20480);
+    /* The old 20 KiB request was below PTHREAD_STACK_MIN and silently
+     * left the effective 64 KiB default. Keep that real size explicit. */
+    VZ_CHECK(pthread_attr_setstacksize(&attr, 65536) == 0);
+    size_t stack_size = 0;
+    VZ_CHECK(pthread_attr_getstacksize(&attr, &stack_size) == 0);
+    VZ_CHECK(stack_size == 65536);
     vz_hold = 0;
     unsigned long long first = 0, last = 0, total = 0;
     for (int i = 0; i < COUNT; i++) {
@@ -606,7 +611,12 @@ static int vz_child(void) {
     pthread_t threads[VZ_THREADS];
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 20480);
+    /* The old 20 KiB request was below PTHREAD_STACK_MIN and silently
+     * left the effective 64 KiB default. Keep that real size explicit. */
+    VZ_CHECK(pthread_attr_setstacksize(&attr, 65536) == 0);
+    size_t stack_size = 0;
+    VZ_CHECK(pthread_attr_getstacksize(&attr, &stack_size) == 0);
+    VZ_CHECK(stack_size == 65536);
     for (int i = 0; i < VZ_THREADS; i++) {
         work[i] = (struct vz_thread){process * VZ_THREADS + i, start, -1, 0, directory};
         int e = pthread_create(&threads[i], &attr, vz_rename_thread, &work[i]);
