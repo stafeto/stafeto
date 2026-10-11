@@ -26,7 +26,10 @@ extern int full_source(unsigned, uint64_t[2]);
 #define FULL_WAKE 0
 #endif
 #if FULL_CAPACITY
-static volatile sig_atomic_t capacity_signal, capacity_error;
+static volatile sig_atomic_t capacity_signal;
+#if FULL_WAKE
+static volatile sig_atomic_t capacity_error;
+#endif
 #if FULL_WAKE
 static int wake_fd = -1;
 #endif
