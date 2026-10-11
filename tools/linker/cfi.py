@@ -436,7 +436,12 @@ def prove_finite_prefix_exit(fde, branch_pc, call_pc, instructions):
     branch_row = row_at(original, branch_pc, fde.cie.initial, fde.cie.data)
     require(branch_row.cfa == (31, 0) and all(branch_row.rule(r) == ('same', r) for r in range(19, 31)),
             'prefix branch has non-entry recovery row')
-    for pc in range(target, fde.start + fde.size, 4):
+    prove_finite_return(fde, target, fde.start + fde.size, instructions)
+
+
+def prove_finite_return(fde, target, limit, instructions):
+    original = events(fde.program, fde.start, fde.cie.code)
+    for pc in range(target, limit, 4):
         require(pc in instructions, 'missing caller prefix exit instruction')
         row = row_at(original, pc, fde.cie.initial, fde.cie.data)
         require(row.cfa == (31, 0) and all(row.rule(r) == ('same', r) for r in range(19, 31)),
@@ -458,14 +463,45 @@ def prove_lr_store(fde, call_pc, after, instructions, targets):
     saved = None
     prefix_writes = set()
     prefix_store = False
+    skip_until = fde.start
+    allowed_entries = set()
     for pc in range(fde.start, call_pc, 4):
+        if pc < skip_until:
+            continue
         require(pc in instructions, 'missing caller prologue instruction')
         mnemonic, operands = instructions[pc]
-        require(pc == fde.start or pc not in targets, 'branch into caller LR prologue')
+        require(pc == fde.start or pc not in targets or pc in allowed_entries, 'branch into caller LR prologue')
         if mnemonic.startswith('b.') or mnemonic in ('cbz', 'cbnz', 'tbz', 'tbnz'):
             require(saved is None and sp == 0 and not prefix_store and not (prefix_writes & set(range(19, 32))),
                     'prefix branch follows changed caller entry context')
-            prove_finite_prefix_exit(fde, pc, call_pc, instructions)
+            match = re.search(r'0x([0-9a-f]+)', operands)
+            require(match is not None, 'missing caller prefix target')
+            target = int(match[1], 16)
+            if target <= call_pc:
+                require(pc + 4 < target <= call_pc and target in instructions,
+                        'inverse prefix target is not first save')
+                save_op, save_args = instructions[target]
+                names = save_args.split('[', 1)[0]
+                require(save_op in ('str', 'stp') and re.search(r'\bx30\b', names),
+                        'inverse prefix target is not first LR store')
+                incoming = []
+                for source, (op, args) in instructions.items():
+                    if op in ('b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz') or op.startswith('b.'):
+                        edge = re.search(r'0x([0-9a-f]+)', args)
+                        require(edge is not None, 'unrecognized inverse prefix incoming branch')
+                        if int(edge[1], 16) == target:
+                            incoming.append(source)
+                require(incoming == [pc], 'inverse prefix has another incoming edge')
+                original = events(fde.program, fde.start, fde.cie.code)
+                for boundary in (pc, target):
+                    row = row_at(original, boundary, fde.cie.initial, fde.cie.data)
+                    require(row.cfa == (31, 0) and all(row.rule(r) == ('same', r) for r in range(19, 31)),
+                            'inverse prefix has non-entry recovery row')
+                prove_finite_return(fde, pc + 4, target, instructions)
+                allowed_entries.add(target)
+                skip_until = target
+            else:
+                prove_finite_prefix_exit(fde, pc, call_pc, instructions)
             continue
         require(mnemonic not in ('b', 'bl', 'br', 'blr', 'ret', 'svc'),
                 f'caller LR provenance crosses control flow at {pc:#x}, entry {fde.start:#x}, call {call_pc:#x}')

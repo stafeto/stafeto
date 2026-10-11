@@ -339,6 +339,26 @@ class LinkedInstructionTests(unittest.TestCase):
                 with self.assertRaises(Invalid):
                     normalize_bytes(bad, instructions)
 
+    def test_inverse_prefix_unique_first_save(self):
+        prefix = 'cmp w0,#0\nb.ne prefix_frame\nmov w0,#1\nret\nprefix_frame:\n'
+        source = ASSEMBLY.replace('spill_caller:\n.cfi_startproc\n', 'spill_caller:\n.cfi_startproc\n'+prefix)
+        data, instructions = self.changed_fixture(source)
+        fixed, _ = normalize_bytes(data, instructions)
+        variants = [
+            source+'\nextra_incoming: b prefix_frame\n',
+            source.replace('b.ne prefix_frame', 'b.ne prefix_frame+4'),
+            source.replace('mov w0,#1\nret\nprefix_frame:', 'mov w0,#1\nb prefix_frame\nprefix_frame:'),
+            source.replace(prefix, 'mov x19,x0\n'+prefix),
+            source.replace('prefix_frame:\nstr', 'prefix_frame:\n.cfi_def_cfa_offset 16\nstr'),
+            source.replace('mov w0,#1\nret\nprefix_frame:', 'bl leaf\nret\nprefix_frame:'),
+            source.replace(prefix, 'sub sp,sp,#16\n'+prefix),
+        ]
+        for index, bad_source in enumerate(variants):
+            with self.subTest(index=index):
+                bad, bad_instructions = self.changed_fixture(bad_source)
+                with self.assertRaises(Invalid):
+                    normalize_bytes(bad, bad_instructions)
+
     def test_linker_zero_reservation_preserves_envelope(self):
         script = self.root / 'reserve.ld'
         script.write_text('SECTIONS { .eh_frame : { *(.eh_frame) . += 512; } } INSERT AFTER .eh_frame_hdr;\n')
