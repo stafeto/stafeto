@@ -337,7 +337,7 @@ def branch_targets(instructions):
     result = set()
     for mnemonic, operands in instructions.values():
         if mnemonic in ('b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz') or mnemonic.startswith('b.'):
-            match = re.search(r'0x([0-9a-f]+)', operands)
+            match = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', operands)
             require(match is not None, "unrecognized direct branch")
             result.add(int(match[1], 16))
     return result
@@ -390,6 +390,120 @@ def preserved_register(body, register):
                 "outlined helper destroys saved LR register or SP")
 
 
+def physical_cfa(fde, call_pc, row, instructions, targets):
+    """Translate the real caller FP into current-SP coordinates."""
+    if row.cfa[0] == 31:
+        return row.cfa[1], None
+    require(row.cfa[0] == 29, 'unsupported physical caller CFA')
+    setup = None
+    for pc in range(fde.start, call_pc, 4):
+        require(pc in instructions, 'missing physical FP instruction')
+        op, args = instructions[pc]
+        if 29 in written_registers(op, args):
+            delta = 0 if (op, args) == ('mov', 'x29, sp') else None
+            match = re.fullmatch(r'x29, sp, #0x([0-9a-f]+)', args) if op == 'add' else None
+            if match:
+                delta = int(match[1], 16)
+            setup = (pc, delta) if delta is not None else None
+    require(setup is not None, 'caller FP lacks physical SP establishment')
+    begin, delta = setup
+    original = events(fde.program, fde.start, fde.cie.code)
+    require(row_at(original, begin + 4, fde.cie.initial, fde.cie.data).cfa == row.cfa,
+            'physical FP establishment lacks matching original CFA transition')
+    for pc in range(begin + 4, call_pc + 4, 4):
+        op, args = instructions[pc]
+        require(not ({29, 31} & written_registers(op, args)), 'caller FP/SP changes after setup')
+        require(op not in ('b', 'br', 'blr', 'cbz', 'cbnz', 'tbz', 'tbnz', 'ret') and
+                not op.startswith('b.') and pc not in targets,
+                'caller physical FP path has another entry or control flow')
+    return row.cfa[1] + delta, delta
+
+
+def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
+    """Every helper store preserves all suspended caller stack recovery cells."""
+    cells = [(row.rule(r)[1], row.rule(r)[1] + 8) for r in range(19, 31)
+             if row.rule(r)[0] == 'offset']
+    if not cells or not any(op.startswith('st') for _, (op, _) in body):
+        return
+    physical_cells = None
+    # None denotes a frame-derived address whose exact displacement was lost.
+    bases = {31: 0, 29: None}
+    stores = {'str', 'strb', 'strh', 'stur', 'sturb', 'sturh', 'stp', 'stlr', 'stlrb', 'stlxr'}
+    for pc, (op, args) in body:
+        require(op != 'stxr', 'unsupported helper atomic store')
+        destinations = written_registers(op, args)
+        updates = {}
+        if op in stores:
+            memory = re.fullmatch(r'(.*), \[(sp|x\d+)(?:, (#-?0x[0-9a-f]+|x\d+))?\](!)?(?:, #(-?0x[0-9a-f]+))?', args)
+            require(memory is not None, 'unproved helper store address')
+            names = [name.strip() for name in memory[1].split(',')]
+            if op == 'stlxr':
+                require(len(names) == 2 and re.fullmatch(r'w\d+', names[0]) and
+                        memory[3] is None and not memory[4] and not memory[5],
+                        'unsupported helper exclusive store form')
+                names = names[1:]
+            require(len(names) == (2 if op == 'stp' else 1), 'unproved helper store arity')
+            base = 31 if memory[2] == 'sp' else int(memory[2][1:])
+            index = memory[3]
+            displacement = int(index[1:], 0) if index and index.startswith('#') else 0
+            widths = []
+            for name in names:
+                match = re.fullmatch(r'([xw])(?:\d+|zr)', name)
+                require(match is not None, 'unproved helper store register width')
+                widths.append(1 if op.endswith('b') else 2 if op.endswith('h') else
+                              8 if match[1] == 'x' else 4)
+            if base in bases:
+                if physical_cells is None:
+                    cfa, fp = physical_cfa(fde, call_pc, row, instructions, targets)
+                    physical_cells = [(cfa + begin, cfa + end) for begin, end in cells]
+                    bases[29] = fp
+                require(bases[base] is not None and not (index and index.startswith('x')),
+                        'unknown frame-derived helper store address')
+                address = bases[base] + displacement
+                for width in widths:
+                    require(all(address + width <= begin or address >= end for begin, end in physical_cells),
+                            'helper store overlaps parent recovery cell')
+                    address += width
+            else:
+                # The unchanged typed source objects are disjoint from compiler
+                # frame cells under the original AArch64 ABI contract.
+                require(op in ('str', 'strb', 'stp', 'stlr', 'stlxr') and displacement >= 0 and
+                        (not index or index.startswith('#') or op == 'strb') and
+                        (not memory[4] or op == 'strb') and not memory[5],
+                        'unsupported source-object helper store form')
+                if index and index.startswith('x'):
+                    require(int(index[1:]) not in bases, 'object index derives from frame')
+            if memory[4] or memory[5]:
+                amount = displacement if memory[4] else int(memory[5], 0)
+                if base in bases:
+                    updates[base] = None if bases[base] is None else bases[base] + amount
+        elif op in ('mov', 'add', 'sub'):
+            match = re.fullmatch(r'(x\d+|sp), (x\d+|sp)(?:, #(-?0x[0-9a-f]+))?', args)
+            if match:
+                destination = 31 if match[1] == 'sp' else int(match[1][1:])
+                source = 31 if match[2] == 'sp' else int(match[2][1:])
+                if source in bases:
+                    if source == 29 and bases[29] is None:
+                        cfa, fp = physical_cfa(fde, call_pc, row, instructions, targets)
+                        physical_cells = [(cfa + begin, cfa + end) for begin, end in cells]
+                        bases[29] = fp
+                    amount = int(match[3] or '0', 0) * (-1 if op == 'sub' else 1)
+                    updates[destination] = None if bases[source] is None else bases[source] + amount
+        for destination in destinations:
+            if destination in updates:
+                bases[destination] = updates[destination]
+            elif destination in bases:
+                # A load reads a typed value, rather than the address of its slot.
+                if op.startswith('ld') and destination not in (29, 31):
+                    del bases[destination]
+                else:
+                    bases[destination] = None
+            elif op not in ('bl',) and not op.startswith('ld'):
+                sources = {int(n) for n in re.findall(r'\bx(\d+)\b', args.split(',', 1)[-1])}
+                if sources & bases.keys() or 'sp' in args.split(',', 1)[-1]:
+                    bases[destination] = None
+
+
 def compact_changed_events(event_list, fde):
     """Remove only proved redundant LR rules in an already repaired FDE."""
     kept = []
@@ -430,7 +544,7 @@ def prove_finite_prefix_exit(fde, branch_pc, call_pc, instructions):
     mnemonic, operands = instructions[branch_pc]
     require(mnemonic.startswith('b.') or mnemonic in ('cbz', 'cbnz', 'tbz', 'tbnz'),
             'unsupported caller prefix branch')
-    match = re.search(r'0x([0-9a-f]+)', operands)
+    match = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', operands)
     require(match is not None, 'missing caller prefix target')
     target = int(match[1], 16)
     require(call_pc + 4 <= target < fde.start + fde.size, 'prefix exit can reenter prologue')
@@ -476,7 +590,7 @@ def prove_lr_store(fde, call_pc, after, instructions, targets):
         if mnemonic.startswith('b.') or mnemonic in ('cbz', 'cbnz', 'tbz', 'tbnz'):
             require(saved is None and sp == 0 and not prefix_store and not (prefix_writes & set(range(19, 32))),
                     'prefix branch follows changed caller entry context')
-            match = re.search(r'0x([0-9a-f]+)', operands)
+            match = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', operands)
             require(match is not None, 'missing caller prefix target')
             target = int(match[1], 16)
             if target <= call_pc:
@@ -489,7 +603,7 @@ def prove_lr_store(fde, call_pc, after, instructions, targets):
                 incoming = []
                 for source, (op, args) in instructions.items():
                     if op in ('b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz') or op.startswith('b.'):
-                        edge = re.search(r'0x([0-9a-f]+)', args)
+                        edge = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', args)
                         require(edge is not None, 'unrecognized inverse prefix incoming branch')
                         if int(edge[1], 16) == target:
                             incoming.append(source)
@@ -605,7 +719,7 @@ def repair_programs(elf, records, instructions):
             for pc, (mnemonic, operands) in instructions.items():
                 if mnemonic not in ('b', 'bl', 'cbz', 'cbnz', 'tbz', 'tbnz') and not mnemonic.startswith('b.'):
                     continue
-                target = re.search(r'0x([0-9a-f]+)', operands)
+                target = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', operands)
                 if target is None or int(target[1], 16) != address:
                     continue
                 require(mnemonic == 'bl', "borrowed-SP helper has a non-call entry")
@@ -668,7 +782,7 @@ def repair_programs(elf, records, instructions):
     for call_pc, (mnemonic, operands) in instructions.items():
         if mnemonic != 'bl':
             continue
-        target = re.search(r'0x([0-9a-f]+)', operands)
+        target = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', operands)
         if target is None or int(target[1], 16) not in helpers:
             continue
         matching = [fde for fde in fdes.values() if fde.start <= call_pc and call_pc + 4 <= fde.start + fde.size]
@@ -721,7 +835,7 @@ def repair_programs(elf, records, instructions):
     for call_pc, (mnemonic, operands) in instructions.items():
         if mnemonic != 'bl':
             continue
-        target = re.search(r'0x([0-9a-f]+)', operands)
+        target = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', operands)
         if target is None or int(target[1], 16) not in helpers:
             continue
         address = int(target[1], 16)
@@ -742,7 +856,7 @@ def repair_programs(elf, records, instructions):
     for pc, (mnemonic, operands) in instructions.items():
         if mnemonic != 'bl':
             continue
-        target = re.search(r'0x([0-9a-f]+)', operands)
+        target = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', operands)
         if target is None or int(target[1], 16) not in helpers:
             continue
         before = instructions.get(pc - 4)
@@ -813,7 +927,7 @@ def repair_programs(elf, records, instructions):
     for pc, (op, args) in instructions.items():
         if op != 'bl':
             continue
-        edge = re.search(r'0x([0-9a-f]+)', args)
+        edge = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', args)
         if edge is None or int(edge[1], 16) not in helpers:
             continue
         matching = [fde for fde in fdes.values() if fde.start <= pc < fde.start + fde.size]
@@ -827,6 +941,7 @@ def repair_programs(elf, records, instructions):
         else:
             require(rule[0] == 'offset' and row.cfa[0] in (29, 31),
                     f'terminal outlined BL has unrecoverable parent LR at {pc:#x}')
+        protect_parent_cells(fde, pc, row, helpers[int(edge[1], 16)], instructions, targets)
     return changed, helpers
 
 

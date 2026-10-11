@@ -461,6 +461,66 @@ ret
         with self.assertRaises(Invalid):
             normalize_bytes(bad, bad_instructions)
 
+    def test_physical_parent_cells_survive_real_helper_stores(self):
+        extra = r"""
+.type physical_parent,%function
+physical_parent:
+.cfi_startproc
+sub sp,sp,#112
+.cfi_def_cfa_offset 112
+stp x29,x30,[sp,#32]
+.cfi_offset 29,-80
+.cfi_offset 30,-72
+add x29,sp,#16
+.cfi_def_cfa 29,96
+bl OUTLINED_FUNCTION_3
+.cfi_def_cfa 31,112
+ldp x29,x30,[sp,#32]
+.cfi_restore 29
+.cfi_restore 30
+add sp,sp,#112
+.cfi_def_cfa_offset 0
+ret
+.cfi_endproc
+.size physical_parent,.-physical_parent
+"""
+        # The actual frame relation is FP=SP+16; the LR cell is SP+40.
+        data, ins = self.changed_fixture(ASSEMBLY + extra)
+        normalize_bytes(data, ins)
+        for store in ('stp x19,x20,[sp,#32]', 'str x0,[sp,#40]',
+                      'stur x0,[sp,#40]', 'strh w0,[sp,#47]',
+                      'mov x8,sp\nstr x0,[x8,#40]',
+                      'str x0,[x29,#24]',
+                      'add x8,sp,x0\nstr x0,[x8]',
+                      'stp x19,x20,[sp,#32]!', 'stlxr w12,x10,[sp]',
+                      'mov x8,sp\nadd x8,x8,#40\nstlxr w12,x10,[x8]'):
+            with self.subTest(store=store):
+                source = (ASSEMBLY + extra).replace('stp x19,x20,[sp,#16]\nret', store + '\nret')
+                data, ins = self.changed_fixture(source)
+                with self.assertRaises(Invalid):
+                    normalize_bytes(data, ins)
+        for mutation in ('add sp,sp,#16\nbl OUTLINED_FUNCTION_3',
+                         'mov x29,x0\nbl OUTLINED_FUNCTION_3'):
+            data, ins = self.changed_fixture((ASSEMBLY + extra).replace(
+                '.cfi_def_cfa 29,96\nbl OUTLINED_FUNCTION_3', '.cfi_def_cfa 29,96\n' + mutation))
+            with self.assertRaises(Invalid):
+                normalize_bytes(data, ins)
+        incoming = "\n.type tbz_entry,%function\ntbz_entry:\n.cfi_startproc\ntbz w0,#0,physical_inside\nret\n.cfi_endproc\n.size tbz_entry,.-tbz_entry\n"
+        data, ins = self.changed_fixture(ASSEMBLY + extra.replace(
+            '.cfi_def_cfa 29,96\nbl OUTLINED_FUNCTION_3',
+            '.cfi_def_cfa 29,96\nphysical_inside:\nbl OUTLINED_FUNCTION_3') + incoming)
+        with self.assertRaisesRegex(Invalid, 'another entry'):
+            normalize_bytes(data, ins)
+        # Original typed object stores remain supported; new store forms fail closed.
+        for store in ('str x0,[x8,#40]', 'strb w0,[x8,x9]', 'stlr w0,[x8]', 'stlxr w12,x10,[x8]', 'stlxr w10,w9,[x8]'):
+            data, ins = self.changed_fixture((ASSEMBLY + extra).replace(
+                'stp x19,x20,[sp,#16]\nret', store + '\nret'))
+            normalize_bytes(data, ins)
+        data, ins = self.changed_fixture((ASSEMBLY + extra).replace(
+            'stp x19,x20,[sp,#16]\nret', 'stur x0,[x8,#40]\nret'))
+        with self.assertRaisesRegex(Invalid, 'source-object'):
+            normalize_bytes(data, ins)
+
     def test_unknown_parent_lr_is_terminal_rejection(self):
         source = ASSEMBLY+"\n.type unknown_parent,%function\nunknown_parent:\n.cfi_startproc\nbl OUTLINED_FUNCTION_0\nret\n.cfi_endproc\n.size unknown_parent,.-unknown_parent\n"
         data, instructions = self.changed_fixture(source)
