@@ -37,7 +37,7 @@ CFLAGS = "--target=aarch64-linux-gnu -mfix-cortex-a53-835769"
 BUILD_STD = "core,alloc,compiler_builtins"
 # OpenLibm supplies the C math exports, including binary128 long double.
 FEATURES = ""
-MATH_BUILD = "openlibm-0.8.0-linux-aarch64-v1"
+MATH_BUILD = "openlibm-0.8.0-linux-aarch64-strict-v2"
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "relibc"
 SOURCE = WORK / "source"
@@ -168,7 +168,7 @@ def build(env: dict) -> None:
     # The host is Darwin; the target uses the Linux AArch64 binary128 ABI.
     run("make", "-j4", "libopenlibm.a", "OS=Linux", "ARCH=aarch64", "USECLANG=1",
         "USEGCC=0", f"CC={llvm('clang')}", f"AR={llvm('llvm-ar')}",
-        f"CFLAGS={cflags} -ffunction-sections -fdata-sections -fno-stack-protector"
+        f"CFLAGS={cflags} -ffp-model=strict -ffunction-sections -fdata-sections -fno-stack-protector"
         f" -I{SYSROOT / 'include'}", cwd=math, env=env)
     destination = SYSROOT / "lib"
     destination.mkdir(parents=True, exist_ok=True)

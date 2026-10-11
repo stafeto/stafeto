@@ -81,6 +81,16 @@ static void environment(void) {
         CHECK((fetestexcept(FE_INEXACT) & FE_INEXACT) != 0);
     }
     CHECK(fesetround(FE_TONEAREST) == 0 && feclearexcept(FE_ALL_EXCEPT) == 0);
+    volatile double pole_zero = 0.0;
+    volatile double logarithm = log(pole_zero);
+    CHECK(isinf(logarithm) && signbit(logarithm));
+    CHECK((fetestexcept(FE_DIVBYZERO) & FE_DIVBYZERO) != 0);
+    CHECK(feclearexcept(FE_ALL_EXCEPT) == 0);
+    volatile double positive_exponent = 13.37;
+    volatile double zero_power = pow(pole_zero, positive_exponent);
+    CHECK(zero_power == 0.0 && !signbit(zero_power));
+    CHECK((fetestexcept(FE_DIVBYZERO) & FE_DIVBYZERO) == 0);
+    CHECK(feclearexcept(FE_ALL_EXCEPT) == 0);
     volatile double negative_one = -1.0;
     CHECK(isnan(sqrt(negative_one)));
     CHECK((fetestexcept(FE_INVALID) & FE_INVALID) != 0);
