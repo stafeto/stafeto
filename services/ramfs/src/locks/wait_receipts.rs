@@ -332,6 +332,20 @@ impl Queue {
         job.result.phase = WaitPhase::Sleeping;
         Ok(())
     }
+
+    /// A proved sleep registration can receive a late Arm during its next attempt.
+    /// The caller retains the exact registration and transfers its Notify first.
+    pub fn arm_registration(&mut self, id: Id) -> Result<(), u32> {
+        let job = self.job_mut(id)?;
+        if job.phase == Phase::Complete {
+            return Err(proto_fs::OPEN_RETIRED);
+        }
+        job.armed = true;
+        if job.phase == Phase::Sleeping {
+            job.result.phase = WaitPhase::Sleeping;
+        }
+        Ok(())
+    }
     pub fn ready(&mut self, id: Id) -> Result<(), u32> {
         let job = self.job_mut(id)?;
         if job.phase != Phase::Sleeping {

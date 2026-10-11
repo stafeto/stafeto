@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Copied AArch64 LP64 flock fields for the four nonblocking commands.
+//! Copied AArch64 LP64 flock fields for advisory lock commands.
 
 use super::constants::{EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOLCK, EOVERFLOW};
 use proto_fs::{LockCommand, LockKind, LockPhase, LockReply};
@@ -45,9 +45,9 @@ impl Input {
     pub unsafe fn read(command: i32, pointer: *const u8) -> Result<Self, i32> {
         let command = match command {
             5 => LockCommand::GetPid,
-            6 => LockCommand::SetPid,
+            6 | 7 => LockCommand::SetPid,
             36 => LockCommand::GetOfd,
-            37 => LockCommand::SetOfd,
+            37 | 38 => LockCommand::SetOfd,
             _ => return Err(EINVAL),
         };
         if pointer.is_null() {

@@ -203,3 +203,30 @@ fn wait_registration_preserves_captured_inode_range_and_full_receipt_label() {
     invalid.inode.generation = 0;
     assert_eq!(pool.register(invalid), Err(proto_fs::INVALID_ARGUMENT));
 }
+
+#[test]
+fn wait_proof_stamp_tracks_phase_round_trip_and_saturation_declines_optional_proof() {
+    let mut pool = Pool::new();
+    let token = pool.register(input(0, 10)).unwrap();
+    assert_eq!(pool.proof_snapshot(token).unwrap().2, 1);
+    pool.ready(token).unwrap();
+    assert_eq!(pool.proof_snapshot(token).unwrap().2, 2);
+    pool.ready(token).unwrap();
+    assert_eq!(pool.proof_snapshot(token).unwrap().2, 2);
+    pool.run(token).unwrap();
+    assert_eq!(pool.proof_snapshot(token).unwrap().2, 3);
+    pool.ready(token).unwrap();
+    assert_eq!(pool.proof_snapshot(token).unwrap().2, 3);
+    pool.sleep(token).unwrap();
+    assert_eq!(pool.proof_snapshot(token).unwrap().2, 4);
+    pool.set_test_proof_revision(token, u64::MAX - 1);
+    pool.ready(token).unwrap();
+    assert!(pool.proof_snapshot(token).is_none());
+    // Saturation refuses optional proof; the actual waiter still progresses.
+    pool.run(token).unwrap();
+    pool.sleep(token).unwrap();
+    assert_eq!(pool.snapshot(token).unwrap().1, Phase::Sleeping);
+    assert!(pool.proof_snapshot(token).is_none());
+    pool.complete(token).unwrap();
+    assert!(pool.proof_snapshot(token).is_none());
+}

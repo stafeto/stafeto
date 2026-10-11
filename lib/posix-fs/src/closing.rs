@@ -9,8 +9,41 @@ pub use posix_fd::{CloseAdmission, CloseSnapshot, CloseToken, JobPlace, OwnerTok
 
 pub type Snapshot = CloseSnapshot<Target, Frame>;
 pub type Admission = CloseAdmission<Target, Frame>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseCommandFence {
+    Control(super::change::ControlToken),
+    Wait(super::wait::WaitToken),
+}
 
 impl PosixFs {
+    /// Revoke both exact-source families and select one fair unlocked helper turn.
+    pub fn close_command_fence(
+        &mut self,
+        token: CloseToken,
+    ) -> Result<Option<CloseCommandFence>, FsError> {
+        let snapshot = self.close_snapshot(token)?;
+        if snapshot.complete {
+            return Ok(None);
+        }
+        let control = self.fence_lock_for_close(snapshot.entry)?;
+        let wait = self.fence_wait_for_close(snapshot.entry)?;
+        match (control, wait) {
+            (Some(c), Some(w)) => {
+                let prefer_wait = self
+                    .descriptors
+                    .update_close_metadata(token, |r| r.next_close_fence())
+                    .map_err(FsError::from)?;
+                Ok(Some(if prefer_wait {
+                    CloseCommandFence::Wait(w)
+                } else {
+                    CloseCommandFence::Control(c)
+                }))
+            }
+            (Some(c), None) => Ok(Some(CloseCommandFence::Control(c))),
+            (None, Some(w)) => Ok(Some(CloseCommandFence::Wait(w))),
+            (None, None) => Ok(None),
+        }
+    }
     pub fn pending_open(&self, fd: u32) -> Option<posix_fd::OpenToken> {
         self.descriptors.pending(fd)
     }
@@ -45,11 +78,11 @@ impl PosixFs {
         match owner {
             Some(owner) => {
                 self.descriptors
-                    .begin_close(owner, fd, super::control::Recovery::change(frame))
+                    .begin_close(owner, fd, super::control::Recovery::closing(frame))
             }
             None => self
                 .descriptors
-                .begin_close_unowned(fd, super::control::Recovery::change(frame)),
+                .begin_close_unowned(fd, super::control::Recovery::closing(frame)),
         }
         .map(admission_frame)
         .map_err(FsError::from)
@@ -68,13 +101,13 @@ impl PosixFs {
                 source,
                 target,
                 flags,
-                super::control::Recovery::change(frame),
+                super::control::Recovery::closing(frame),
             ),
             None => self.descriptors.begin_replace_unowned(
                 source,
                 target,
                 flags,
-                super::control::Recovery::change(frame),
+                super::control::Recovery::closing(frame),
             ),
         }
         .map(admission_frame)

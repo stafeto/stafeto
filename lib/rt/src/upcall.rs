@@ -59,6 +59,8 @@ fn word(offset: usize) -> &'static AtomicU64 {
     unsafe { &*((msgbuf::address() + ENTRIES + offset) as *const AtomicU64) }
 }
 
+// SAFETY: this executable .text section remains in the native RX segment.
+#[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
 fn control(operation: UpcallControl) -> Result<bool, Error> {
     // SAFETY: control touches only current-thread delivery state.
     let result = unsafe {

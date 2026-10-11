@@ -219,3 +219,71 @@ mod tests {
         assert_eq!((next, portions), (384, 48));
     }
 }
+
+/// Receipt cleanup retains half the cleanup turns; bounded peers share the rest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupWork {
+    Receipts,
+    Events,
+    Proof,
+    Recheck,
+}
+#[derive(Default)]
+pub struct CleanupDispatch {
+    receipts: bool,
+    next: u8,
+}
+impl CleanupDispatch {
+    pub fn next(&mut self, events: bool, proof: bool, recheck: bool) -> CleanupWork {
+        self.receipts = !self.receipts;
+        if !self.receipts {
+            for _ in 0..3 {
+                let chosen = self.next;
+                self.next = (self.next + 1) % 3;
+                match chosen {
+                    0 if events => return CleanupWork::Events,
+                    1 if proof => return CleanupWork::Proof,
+                    2 if recheck => return CleanupWork::Recheck,
+                    _ => {}
+                }
+            }
+        }
+        CleanupWork::Receipts
+    }
+}
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    #[test]
+    fn constant_busy_events_do_not_take_proof_or_receipt_turns() {
+        let mut dispatch = CleanupDispatch::default();
+        let mut counts = [0; 4];
+        let mut last_proof = None;
+        for turn in 0..48 {
+            let work = dispatch.next(true, true, true);
+            let index = match work {
+                CleanupWork::Receipts => 0,
+                CleanupWork::Events => 1,
+                CleanupWork::Proof => 2,
+                CleanupWork::Recheck => 3,
+            };
+            counts[index] += 1;
+            if work == CleanupWork::Proof {
+                if let Some(last) = last_proof {
+                    assert!(turn - last <= 6);
+                }
+                last_proof = Some(turn);
+            }
+        }
+        assert_eq!(counts, [24, 8, 8, 8]);
+    }
+    #[test]
+    fn empty_classes_do_not_delay_receipt_cleanup() {
+        let mut dispatch = CleanupDispatch::default();
+        for _ in 0..24 {
+            assert_eq!(dispatch.next(false, false, false), CleanupWork::Receipts);
+        }
+        assert_eq!(dispatch.next(false, true, false), CleanupWork::Receipts);
+        assert_eq!(dispatch.next(false, true, false), CleanupWork::Proof);
+    }
+}

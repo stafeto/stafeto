@@ -14,6 +14,8 @@
 extern crate self as posix_fd;
 #[cfg(test)]
 mod typed_lock_tests;
+#[cfg(test)]
+mod wait_driver_tests;
 
 mod wait;
 pub use wait::*;

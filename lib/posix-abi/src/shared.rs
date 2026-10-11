@@ -244,7 +244,7 @@ pub fn jump_mark(target_sp: u64) {
         crate::relibc::jump_owner().and_then(|owner| posix_fs::change::OwnerToken::new(owner).ok())
     {
         let _ = process_state(|files| {
-            files.mark_control_jump(owner, entries::Frame::main(target_sp));
+            files.mark_jump(owner, entries::Frame::main(target_sp));
             Ok(())
         });
     }
@@ -741,7 +741,7 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
 /// Final lifetime callbacks perform local transitions and retain remote ownership.
 pub fn detach_open_owner(owner: u64) -> bool {
     let opens = crate::open_driver::detach(owner);
-    // Every resident Control family loses this exact native lifetime.
+    // Resident Control and WAIT custody lose this exact native lifetime.
     let changes = crate::change::detach(owner);
     let closes = crate::close_driver::detach(owner);
     let drains = crate::drain_hooks::detach(owner);

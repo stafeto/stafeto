@@ -3,6 +3,10 @@
 
 //! A single service-driven worker owns scans, preparation and paid cleanup.
 
+#[path = "reader.rs"]
+mod reader;
+pub use reader::{ReadProgress, ReadSnapshot, ReadState, Reader};
+
 use super::{Kind, Lock, Owner, Range, budget, groups, preparation, records};
 use crate::storage::Token;
 use groups::{Capture, Groups, Id};

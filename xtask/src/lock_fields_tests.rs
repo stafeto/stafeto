@@ -43,8 +43,10 @@ fn copied_signed_ranges_preserve_extremes_and_survive_caller_changes() {
     for (command, native) in [
         (5, LockCommand::GetPid),
         (6, LockCommand::SetPid),
+        (7, LockCommand::SetPid),
         (36, LockCommand::GetOfd),
         (37, LockCommand::SetOfd),
+        (38, LockCommand::SetOfd),
     ] {
         for whence in 0..=2 {
             for (start, length) in [(i64::MIN, -19), (i64::MAX, 2), (-2, 0), (17, i64::MIN)] {
@@ -61,15 +63,15 @@ fn copied_signed_ranges_preserve_extremes_and_survive_caller_changes() {
 }
 
 #[test]
-fn malformed_fields_and_partial_wait_commands_leave_input_unchanged() {
+fn malformed_fields_leave_input_unchanged() {
     for (command, bytes) in [
         (5, input(-1, 0, 0, 1, 0)),
         (6, input(3, 0, 0, 1, 0)),
         (5, input(0, -1, 0, 1, 0)),
         (37, input(0, 3, 0, 1, 0)),
         (5, input(2, 0, 0, 1, 0)),
-        (7, input(0, 0, 0, 1, 0)),
-        (38, input(1, 0, 0, 1, 0)),
+        (7, input(0, 3, 0, 1, 0)),
+        (38, input(1, 0, 0, 1, 1)),
         (999, input(0, 0, 0, 1, 0)),
     ] {
         let before = bytes;
@@ -83,10 +85,10 @@ fn malformed_fields_and_partial_wait_commands_leave_input_unchanged() {
 #[test]
 fn process_pid_is_ignored_and_ofd_pid_is_strict() {
     for pid in [i32::MIN, -1, 1, i32::MAX] {
-        for command in [5, 6] {
+        for command in [5, 6, 7] {
             assert_eq!(read(command, &input(0, 0, 4, -2, pid)).unwrap().pid, 0);
         }
-        for command in [36, 37] {
+        for command in [36, 37, 38] {
             assert_eq!(read(command, &input(0, 0, 4, -2, pid)), Err(EINVAL));
         }
     }

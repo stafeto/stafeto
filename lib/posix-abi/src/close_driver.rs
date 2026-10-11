@@ -154,20 +154,21 @@ fn step(token: CloseToken) -> Result<bool, i32> {
         let Ok(snapshot) = files.close_snapshot(token) else {
             return Ok(None);
         };
-        let fence = if snapshot.complete {
-            None
-        } else {
-            files
-                .fence_lock_for_close(snapshot.entry)
-                .map_err(crate::error)?
-        };
+        let fence = files.close_command_fence(token).map_err(crate::error)?;
         Ok(Some((files.transport(), snapshot, fence)))
     })?;
     let Some((transport, snapshot, fence)) = state else {
         return Ok(true);
     };
     if let Some(debt) = fence {
-        crate::lock_driver::cleanup_step(debt)?;
+        match debt {
+            posix_fs::closing::CloseCommandFence::Control(token) => {
+                crate::lock_driver::cleanup_step(token)?;
+            }
+            posix_fs::closing::CloseCommandFence::Wait(token) => {
+                crate::wait_lock_driver::cleanup_step(token)?;
+            }
+        }
         return Ok(false);
     }
     if !snapshot.complete {

@@ -69,8 +69,12 @@ struct PosixFs {
 #[path = "../../posix-fs/src/change.rs"]
 mod change;
 #[allow(dead_code)]
+#[path = "../../posix-fs/src/closing.rs"]
+mod closing;
+#[allow(dead_code)]
 #[path = "../../posix-fs/src/control.rs"]
 mod control;
+type DescriptorFlags = Flags;
 #[allow(dead_code)]
 #[path = "../../posix-fs/src/drain.rs"]
 mod drain;

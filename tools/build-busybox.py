@@ -30,6 +30,9 @@ STAMP = WORK / "config"
 # access and a 64-bit multiply-accumulate. The objects go into a Rust
 # program, whose aarch64-unknown-none link passes --fix-cortex-a53-843419.
 A53_ERRATA = "-mfix-cortex-a53-835769"
+# Keep compiler-generated async rows for C frames; outlining is reserved
+# for the native Rust policy, whose helper rows the linker validates.
+UNWIND_CFLAGS = ("-fasynchronous-unwind-tables", "-mllvm", "-enable-machine-outliner=never")
 # BusyBox's main becomes busybox_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
 PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-traps names-nofork-cat math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769"
@@ -96,7 +99,7 @@ def tool(name: str, brew_formula: str | None = None) -> Path:
 def main() -> None:
     headers = sorted(COMPAT.rglob("*.h"))
     compatibility = sha256(b"".join(path.read_bytes() for path in headers)).hexdigest()
-    config_stamp = f"{VERSION} {SHA256} {PATCH} {sha256(" ".join(OBJECTS).encode()).hexdigest()} {compatibility} relibc {relibc_commit()}\n"
+    config_stamp = f"{VERSION} {SHA256} {PATCH} {sha256(" ".join(OBJECTS).encode()).hexdigest()} {compatibility} relibc {relibc_commit()} unwind {" ".join(UNWIND_CFLAGS)}\n"
     if (STAMP.exists() and STAMP.read_text() == config_stamp
             and (SOURCE / "libbb/lib.a").exists()
             and (SOURCE / "coreutils/lib.a").exists()
@@ -225,7 +228,7 @@ def main() -> None:
         "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-linux-gnu", "-nostdinc",
             f"-isystem {include}", f"-idirafter {COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
             "-ffunction-sections", "-fdata-sections", "-Dmain=busybox_main",
-            A53_ERRATA)), cwd=SOURCE)
+            A53_ERRATA, *UNWIND_CFLAGS)), cwd=SOURCE)
     for archive in [SOURCE / "libbb/lib.a", SOURCE / "coreutils/lib.a",
                     SOURCE / "shell/lib.a", SOURCE / "procps/lib.a",
                     SOURCE / "coreutils/libcoreutils/lib.a"]:

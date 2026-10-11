@@ -90,6 +90,7 @@ process/zombie-setpgid-leader
 process/zombie-setpgid-move
 basic/unistd/fork
 basic/unistd/getentropy
+basic/unistd/lockf
 basic/unistd/pause
 basic/unistd/setpgid
 basic/unistd/setsid

@@ -610,3 +610,62 @@ fn defer_during_partial_unwatch_preserves_acknowledged_retirement() {
     }
     panic!("deferral lost an acknowledgement");
 }
+
+#[test]
+fn permanent_graph_initialization_and_episode_restart_clear_sixteen_in_two_portions() {
+    let mut allocation = std::boxed::Box::<Graph>::new_uninit();
+    // SAFETY: exclusive aligned writable graph allocation.
+    let mut graph = unsafe {
+        Graph::initialize_empty_at(allocation.as_mut_ptr());
+        allocation.assume_init()
+    };
+    assert_eq!(graph.step(|_| false, |_| false).work, Work::Cleaned);
+    graph.restart(256, scope(1)).unwrap();
+    assert!(!graph.seed_ready());
+    assert_eq!(graph.step(|_| false, |_| false).visited, 0);
+    assert_eq!(graph.step(|_| false, |_| false).visited, 1);
+    assert!(graph.seed_ready());
+    for pid in 257..272 {
+        graph.register(pid).unwrap();
+    }
+    graph.begin().unwrap();
+    let Work::NeedEdges(vertex) = graph.step(|_| true, |_| true).work else {
+        panic!("missing vertex")
+    };
+    let old_watch = watch(&mut graph, vertex, inode(0));
+    assert_eq!(graph.restart(512, scope(2)), Err(Error::Phase));
+    graph.defer().unwrap();
+    assert_eq!(
+        graph.step(|_| true, |_| true).work,
+        Work::ClearWatch(old_watch)
+    );
+    assert_eq!(graph.restart(512, scope(2)), Err(Error::Phase));
+    graph.unwatched(old_watch).unwrap();
+    graph.step(|_| true, |_| true);
+    assert_eq!(
+        graph.step(|_| true, |_| true).work,
+        Work::Done(Verdict::Deferred)
+    );
+    graph.cleanup().unwrap();
+    graph.step(|_| true, |_| true);
+    assert_eq!(graph.step(|_| true, |_| true).work, Work::Cleaned);
+    assert_eq!(graph.restart(512, scope(1)), Err(Error::Invalid));
+    graph.restart(512, scope(2)).unwrap();
+    assert_eq!(graph.step(|_| false, |_| false).visited, 8);
+    assert!(!graph.seed_ready());
+    assert_eq!(graph.step(|_| false, |_| false).visited, 8);
+    assert!(!graph.seed_ready());
+    assert_eq!(graph.step(|_| false, |_| false).visited, 1);
+    assert!(graph.seed_ready());
+    assert_eq!(graph.register(512).unwrap().pid(), 512);
+    for pid in 513..528 {
+        graph.register(pid).unwrap();
+    }
+    graph.begin().unwrap();
+    assert!(!graph.changed(old_watch));
+    println!(
+        "permanent Graph={} Pool={}",
+        core::mem::size_of::<Graph>(),
+        core::mem::size_of::<crate::locks::waiters::Pool>()
+    );
+}
