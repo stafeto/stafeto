@@ -124,8 +124,14 @@ static int ring_wait(int own, int target, unsigned index, struct record *r) {
     full_ring_disarm();
     *r = ring_record;
     if (ring_bad || !r->complete_seen || !r->key_generation
-        || (index == 15 ? (result != -1 || error != EDEADLK) : result != 0))
+        || (result != 0 && (result != -1 || error != EDEADLK))) {
+        printf("lock-full: ring diagnostic owner=%u result=%d error=%d bad=%d complete=%u phase=%c label=%llu key=%llu/%llu target=%llu/%llu\n",
+               index, result, error, ring_bad, r->complete_seen, r->phase,
+               (unsigned long long)r->label, (unsigned long long)r->key_slot,
+               (unsigned long long)r->key_generation, (unsigned long long)r->wait_source[0],
+               (unsigned long long)r->wait_source[1]);
         return fail("ring canonical result", index);
+    }
     /* Keep fillers and both descriptors; remove only each critical segment. */
     if (!result && set(target, F_UNLCK, 0)) return fail("ring acquired unlock", index);
     if (set(own, F_UNLCK, 0)) return fail("ring original unlock", index);
@@ -284,7 +290,7 @@ static int census(int fd, const struct record records[20], uint64_t epoch) {
 static int ring_phase(unsigned index, char wanted, struct record *out) {
     for (unsigned n = 0; n < 3000; ++n) {
         if (read_record(index, out)) return -1;
-        if (out->phase == wanted) return 0;
+        if (out->phase == wanted || (wanted == 'T' && (out->phase == 'D' || out->phase == 'O'))) return 0;
         if (out->phase == 'D' || out->phase == 'O' || (wanted == 'S' && out->phase == 'C')) return -1;
         nanosleep(&tick, NULL);
     }
@@ -305,10 +311,10 @@ static int ring_capture(int fd, uint64_t epoch, const struct record initial[20])
     unsigned success = 0, deadlock = 0;
     for (unsigned i = 0; i < 16; ++i) {
         struct record r;
-        if (ring_phase(i, i == 15 ? 'D' : 'O', &r) || !r.complete_seen || !r.key_generation
+        if (ring_phase(i, 'T', &r) || !r.complete_seen || !r.key_generation
             || r.label != initial[i].label || r.pid != initial[i].pid
             || memcmp(r.wait_source, initial[i].wait_source, sizeof(r.wait_source))
-            || (i == 15 ? (r.result != -1 || r.error != EDEADLK) : r.result != 0))
+            || (r.phase == 'D' ? (r.result != -1 || r.error != EDEADLK) : r.result != 0))
             return fail("all exact ring terminal receipts", i);
         ring_results[i] = r;
         success += r.result == 0; deadlock += r.result == -1 && r.error == EDEADLK;
