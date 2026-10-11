@@ -26,6 +26,7 @@ struct Registration<H> {
     next: u16,
     linked: bool,
     checking: bool,
+    waited: bool,
     checked: bool,
     invalidated: bool,
     dirty: bool,
@@ -49,11 +50,9 @@ impl Vertex {
 #[derive(Clone, Copy)]
 struct Edge {
     number: u64,
-    older_number: u64,
     revision: u64,
     blocker: u32,
     waiter: u16,
-    older: u16,
 }
 
 struct Check {
@@ -63,7 +62,7 @@ struct Check {
     len: usize,
     vertex: usize,
     registration: usize,
-    blockers: [Option<(u32, u16, u64)>; 128],
+    blockers: [Option<u32>; 64],
     blocker: usize,
     blockers_len: usize,
     edge: Option<Edge>,
@@ -82,9 +81,8 @@ impl Check {
             for i in 0..CAPACITY {
                 vertices.add(i).write(Vertex::EMPTY);
             }
-            let blockers =
-                core::ptr::addr_of_mut!((*destination).blockers).cast::<Option<(u32, u16, u64)>>();
-            for i in 0..128 {
+            let blockers = core::ptr::addr_of_mut!((*destination).blockers).cast::<Option<u32>>();
+            for i in 0..64 {
                 blockers.add(i).write(None);
             }
             let path = core::ptr::addr_of_mut!((*destination).path).cast::<Option<Edge>>();
@@ -278,6 +276,7 @@ impl<H> Waits<H> {
             next: NONE,
             linked: true,
             checking: false,
+            waited: false,
             checked: false,
             invalidated: true,
             dirty: false,
@@ -435,11 +434,17 @@ impl<H> Waits<H> {
         self.register(queue, id)?;
         let slot = self.slot(id)?;
         let request = captured.request;
-        let blocked = self.older_conflict(request, Some(id), &mut live).is_some()
-            || match locks.query(storage, request, &mut live) {
-                Ok(blocker) => blocker.is_some(),
-                Err(error) => return self.finish(queue, id, reply(Err(error)).result),
-            };
+        let held = match locks.query_details(storage, request, &mut live) {
+            Ok(held) => held,
+            Err(error) => return self.finish(queue, id, reply(Err(error)).result),
+        };
+        let older = self.registrations[slot].as_ref().unwrap().waited
+            && !held.owns_overlap
+            && self.older_conflict(request, Some(id), &mut live).is_some();
+        let blocked = held.blocker.is_some() || older;
+        if held.blocker.is_some() {
+            self.registrations[slot].as_mut().unwrap().waited = true;
+        }
         if !blocked {
             match locks.set(storage, captured.root, request, &mut live) {
                 Ok(()) => {
@@ -553,12 +558,16 @@ impl<H> Waits<H> {
             let captured = r.captured;
             if r.linked
                 && r.handle.is_some()
-                && self
-                    .older_conflict(captured.request, Some(id), &mut live)
-                    .is_none()
                 && locks
-                    .query(storage, captured.request, &mut live)
-                    .is_ok_and(|lock| lock.is_none())
+                    .query_details(storage, captured.request, &mut live)
+                    .is_ok_and(|held| {
+                        held.blocker.is_none()
+                            && (!r.waited
+                                || held.owns_overlap
+                                || self
+                                    .older_conflict(captured.request, Some(id), &mut live)
+                                    .is_none())
+                    })
             {
                 self.registrations[slot].as_mut().unwrap().dirty = true;
             }
@@ -639,27 +648,13 @@ impl<H> Waits<H> {
                         .snapshot(r.id)
                         .is_ok_and(|(_, phase, _)| phase != Phase::Complete)
                         && source_live(r.captured, r.id.owner())
-                        && if edge.older != NONE {
-                            self.registrations[edge.older as usize]
-                                .as_ref()
-                                .is_some_and(|older| {
-                                    older.number == edge.older_number
-                                        && older.linked
-                                        && older.captured.request.owner
-                                            == Owner::Process(edge.blocker)
-                                        && live(Owner::Process(edge.blocker))
-                                        && Self::incompatible(&older.captured.request, &request)
-                                        && source_live(older.captured, older.id.owner())
-                                })
-                        } else {
-                            locks
-                                .conflicts(storage, request, &mut *live)
-                                .is_ok_and(|conflicts| {
-                                    conflicts
-                                        .iter()
-                                        .any(|lock| lock.owner == Owner::Process(edge.blocker))
-                                })
-                        }
+                        && locks
+                            .conflicts(storage, request, &mut *live)
+                            .is_ok_and(|conflicts| {
+                                conflicts
+                                    .iter()
+                                    .any(|lock| lock.owner == Owner::Process(edge.blocker))
+                            })
                 });
                 if !valid {
                     self.restart(self.check.target);
@@ -679,15 +674,7 @@ impl<H> Waits<H> {
                         self.edge_registration(*edge).is_some_and(|r| {
                             locks.revision(r.captured.request.inode) == edge.revision
                                 && source_live(r.captured, r.id.owner())
-                        }) && (edge.older == NONE
-                            || self.registrations[edge.older as usize]
-                                .as_ref()
-                                .is_some_and(|r| {
-                                    r.number == edge.older_number
-                                        && r.linked
-                                        && source_live(r.captured, r.id.owner())
-                                }))
-                            && live(Owner::Process(edge.blocker))
+                        }) && live(Owner::Process(edge.blocker))
                     })
                 {
                     let _ = self.finish(queue, self.check.target, proto_fs::LOCK_DEADLOCK);
@@ -699,30 +686,21 @@ impl<H> Waits<H> {
             return;
         }
         if self.check.blocker < self.check.blockers_len {
-            let (pid, older, older_number) = self.check.blockers[self.check.blocker].unwrap();
+            let pid = self.check.blockers[self.check.blocker].unwrap();
             self.check.blocker += 1;
             if !live(Owner::Process(pid)) {
                 return;
             }
             let mut edge = self.check.edge.unwrap();
             edge.blocker = pid;
-            edge.older = older;
-            edge.older_number = older_number;
-            if older != NONE
-                && self.registrations[older as usize]
-                    .as_ref()
-                    .is_none_or(|r| !r.linked || r.number != older_number)
-            {
-                return;
-            }
             if pid == self.check.origin {
                 self.check.path[0] = Some(edge);
                 self.check.path_len = 1;
                 let mut vertex = self.check.vertex;
                 while self.check.vertices[vertex].parent != NONE {
                     if self.check.path_len == CHAIN {
-                        let _ = self.finish(queue, self.check.target, proto_fs::NO_LOCKS);
-                        return;
+                        self.check.path_len = 0;
+                        break;
                     }
                     self.check.path[self.check.path_len] = self.check.vertices[vertex].edge;
                     self.check.path_len += 1;
@@ -787,35 +765,16 @@ impl<H> Waits<H> {
             if let Ok(conflicts) = locks.conflicts(storage, request, &mut *live) {
                 for lock in conflicts.iter() {
                     if let Owner::Process(blocker) = lock.owner {
-                        self.check.blockers[self.check.blockers_len] = Some((blocker, NONE, 0));
+                        self.check.blockers[self.check.blockers_len] = Some(blocker);
                         self.check.blockers_len += 1;
                     }
                 }
-            }
-            // FIFO dependencies are real waits even before the older SET owns a lock.
-            let mut at = self.heads[request.inode.slot as usize];
-            while at != NONE {
-                let older = self.registrations[at as usize].as_ref().unwrap();
-                if older.number >= r.number {
-                    break;
-                }
-                if Self::incompatible(&older.captured.request, &request)
-                    && let Owner::Process(blocker) = older.captured.request.owner
-                    && live(Owner::Process(blocker))
-                {
-                    self.check.blockers[self.check.blockers_len] =
-                        Some((blocker, at, older.number));
-                    self.check.blockers_len += 1;
-                }
-                at = older.next;
             }
             self.check.edge = Some(Edge {
                 waiter: slot as u16,
                 number: r.number,
                 blocker: 0,
                 revision: locks.revision(request.inode),
-                older: NONE,
-                older_number: 0,
             });
             break;
         }
@@ -826,9 +785,10 @@ impl<H> Waits<H> {
             .filter(|r| r.linked && r.number == edge.number)
     }
     fn add_vertex(&mut self, edge: Edge, queue: &mut Queue) -> bool {
-        if self.check.len == CAPACITY
-            || self.check.vertices[self.check.vertex].depth as usize + 1 >= CHAIN
-        {
+        if self.check.vertices[self.check.vertex].depth as usize + 1 >= CHAIN {
+            return true;
+        }
+        if self.check.len == CAPACITY {
             let _ = self.finish(queue, self.check.target, proto_fs::NO_LOCKS);
             return false;
         }

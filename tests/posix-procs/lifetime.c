@@ -657,6 +657,7 @@ static void public_lock_signals(void) {
 #include "wait-lifecycle.c"
 #include "lock-deadlock.c"
 #include "lock-simple-wait.c"
+#include "lock-holder.c"
 #include "lock-page-fragments.c"
 #if LOCK_FIFO_FULL_ONLY
 #include "lock-fifo-full.c"
@@ -683,6 +684,10 @@ int main(int argc, char **argv) {
         expect("spawn mapped page fragments supervisor",
                posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, env), 0);
         if (child > 0) reap(child, 0);
+        return failures != 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "lock-holder-run") == 0) {
+        public_lock_holders();
         return failures != 0;
     }
     char *core_args[] = {"posix-procs", "lock-core", NULL};
@@ -760,6 +765,7 @@ int main(int argc, char **argv) {
     public_wait_pending_rotation();
     public_lock_deadlocks();
     public_simple_wait_graphs();
+    public_lock_holders();
     expect("native lock commands and exact custody", ram_lock_commands(getpid()), 0);
     expect("native close receipt and 32-reference birth", ram_close_event(), 0);
     expect("public close receipts and helper reuse", close_driver_receipts(), 0);
