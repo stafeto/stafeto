@@ -361,11 +361,12 @@ static int ring_rows(int fd, uint64_t epoch) {
             }
             if (bit == 7 && pages[1][2] == (UINT64_C(256) | (UINT64_C(128) << 48))
                 && pages[1][4] == 8 && !(pages[19][4] & (1u << bit))) full_deadlock = 1;
-            printf("lock-full: dispatch profile=%u row=%u kind=%u bit=%u visited=%u before=%llu after=%llu took=%llu whole=%llu waited=%llu serial=%llu ambiguous=%u\n",
+            printf("lock-full: dispatch profile=%u row=%u kind=%u bit=%u visited=%u before=%llu after=%llu took=%llu whole=%llu waited=%llu serial=%llu ambiguous=%u witness=%llu/%llu/%llu/%llu\n",
                    profile, row, kind, bit, visits, (unsigned long long)pages[1][2],
                    (unsigned long long)pages[1][3], (unsigned long long)pages[0][3],
                    (unsigned long long)pages[18][2], (unsigned long long)pages[18][3],
-                   (unsigned long long)pages[0][1], (unsigned)((pages[19][4] >> bit) & 1));
+                   (unsigned long long)pages[0][1], (unsigned)((pages[19][4] >> bit) & 1), (unsigned long long)w[2],
+                   (unsigned long long)w[3], (unsigned long long)w[4], (unsigned long long)w[5]);
         }
     }
     unsigned required = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4)
