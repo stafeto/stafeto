@@ -1557,6 +1557,8 @@ static int full_child(pid_t parent, int fd, int cloexec, int clofork, volatile i
     char *more = malloc(grow);
     expect("1 MiB more heap in the child", more != NULL, 1);
     if (more) {
+        printf("posix-procs: fork child malloc memory: %llu pages\n",
+               stafeto_probe_memory_used() / 4096);
         memset(more, 0x5a, grow);
         free(more);
     }
@@ -1981,7 +1983,11 @@ static void *malloc_slowly(void *arg) {
     stafeto_probe_mmap_sleep(300000);
     char *p = malloc(1024 * 1024);
     slow_done = 1;
-    if (p) memset(p, 1, 1024 * 1024);
+    if (p) {
+        printf("posix-procs: slow malloc memory: %llu pages\n",
+               stafeto_probe_memory_used() / 4096);
+        memset(p, 1, 1024 * 1024);
+    }
     return p;
 }
 

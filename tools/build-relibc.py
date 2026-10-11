@@ -29,8 +29,10 @@ CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
 # Cortex-A53 erratum 835769 (the PinePhone's A64): the Rust and the C of
 # relibc both get the fix; xtask's disasm check fails a program without it.
+# Keep the compiler's unwind tables by disabling machine outlining.
 RUSTFLAGS = ("--cfg stafeto -C relocation-model=static -Z tls-model=local-exec"
-             " -C target-feature=+fix-cortex-a53-835769")
+             " -C target-feature=+fix-cortex-a53-835769"
+             " -C llvm-args=--enable-machine-outliner=never")
 CFLAGS = "--target=aarch64-linux-gnu -mfix-cortex-a53-835769"
 BUILD_STD = "core,alloc,compiler_builtins"
 # The C math functions from the Rust libm crate (MIT), declared by
