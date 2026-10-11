@@ -3609,10 +3609,21 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
     qemu::expect_marker(&outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
-    // The first goal of 5c: /bin/ls from a file lists /etc, a line alone,
-    // from a spawn and from an exec.
-    if outcome.lines.iter().filter(|l| l.trim() == "motd").count() < 2 {
-        return Err("ls of /etc printed `motd` fewer than twice".into());
+    // The first goal of 5c: /bin/ls from a file lists the complete /etc
+    // directory from both a spawn and an exec.
+    let listings = outcome
+        .lines
+        .iter()
+        .filter(|line| {
+            let names: Vec<_> = line.split_whitespace().collect();
+            names.len() == 3
+                && ["motd", "passwd", "group"]
+                    .iter()
+                    .all(|name| names.contains(name))
+        })
+        .count();
+    if listings < 2 {
+        return Err("ls of /etc printed the three account-file names fewer than twice".into());
     }
     // The new image of an exec whose old image ended first never runs.
     if outcome
