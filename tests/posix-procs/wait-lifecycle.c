@@ -211,6 +211,7 @@ void public_wait_process_exit(void) {
 
 /* Genuine arbitrary siglongjmp consumer; Root enables only with accepted pin. */
 extern int wait_lifecycle_complete_success(void);
+extern int wait_lifecycle_jump_marked(void);
 static sigjmp_buf lifecycle_jump_target;
 static volatile sig_atomic_t lifecycle_jump_seen;
 static unsigned lifecycle_jump_turn, lifecycle_jump_ready, lifecycle_jump_complete;
@@ -262,6 +263,7 @@ static void *lifecycle_jump_worker(void *ignored) {
         unsigned long long generation=wait_lifecycle_generation();
         if(generation<=lifecycle_jump_previous_generation){__atomic_store_n(&lifecycle_jump_error,106,__ATOMIC_RELEASE);return (void *)106;}
         lifecycle_jump_previous_generation=generation;
+        if(wait_lifecycle_jump_marked()!=1){__atomic_store_n(&lifecycle_jump_error,114,__ATOMIC_RELEASE);return (void *)114;}
         if(turn==20&&wait_lifecycle_complete_success()!=1){__atomic_store_n(&lifecycle_jump_error,107,__ATOMIC_RELEASE);return (void *)107;}
         int recovered=lifecycle_collect();
         if(recovered!=1){__atomic_store_n(&lifecycle_jump_error,108,__ATOMIC_RELEASE);return (void *)108;}

@@ -76,6 +76,26 @@ pub extern "C" fn wait_lifecycle_disarm() {
 pub extern "C" fn wait_lifecycle_generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }
+/// Observe the callback's exact local effect before any ordinary entry helps.
+#[unsafe(no_mangle)]
+pub extern "C" fn wait_lifecycle_jump_marked() -> i32 {
+    posix_abi::shared::with_files(|files| {
+        let token = files
+            .wait_tokens()
+            .find(|token| {
+                token.slot() as u32 == SLOT.load(Ordering::Acquire)
+                    && token.generation() == GENERATION.load(Ordering::Acquire)
+            })
+            .ok_or(-1)?;
+        let snapshot = files.wait_snapshot(token).map_err(|_| -2)?;
+        Ok(i32::from(
+            snapshot.owner.is_none()
+                && snapshot.channel == Some(RAW.load(Ordering::Acquire))
+                && snapshot.phase == posix_fs::wait::WaitRecordPhase::Cleaning,
+        ))
+    })
+    .unwrap_or_else(|error| error)
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn wait_lifecycle_count() -> i32 {
     posix_abi::shared::with_files(|files| Ok(files.wait_tokens().count() as i32)).unwrap_or(-1)
