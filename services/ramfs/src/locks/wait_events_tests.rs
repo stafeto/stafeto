@@ -161,7 +161,12 @@ fn sixteen_paid_waits_on_four_billing_roots_wake_in_two_eight_cell_portions() {
             .unwrap();
         events.attach(&pool, registration).unwrap();
     }
-    events.poll();
+    let inode = pool
+        .snapshot(events.registrations[0].unwrap().0)
+        .unwrap()
+        .0
+        .inode;
+    events.changed(inode);
     for _ in 0..2 {
         assert_eq!(
             events.part(&mut queue, &mut pool).unwrap(),
@@ -209,4 +214,52 @@ fn measured_real_wake_and_idle_preserve_exact_registration() {
     });
     assert_eq!((row[1] >> 32) & 255, 1);
     assert_eq!(&witness[1..], &expected);
+}
+
+#[test]
+fn periodic_recheck_rotation_reaches_second_slot_under_continuous_first_poll() {
+    let (ram, mut queue, mut pool, ids) = super::super::wait_departure::tests::fixture();
+    let mut allocation = std::boxed::Box::<LockService>::new_uninit();
+    // SAFETY: exclusive aligned service storage initialized directly.
+    let locks = unsafe {
+        LockService::initialize_at(allocation.as_mut_ptr());
+        allocation.assume_init()
+    };
+    let mut events = events();
+    for &id in &ids[..2] {
+        events.attach(&pool, pool.find(id).unwrap()).unwrap();
+    }
+    for _ in 0..32 {
+        events.poll();
+        let progress = events
+            .recheck_part(
+                &mut queue,
+                &mut pool,
+                &locks,
+                &ram.storage,
+                |_, _| false,
+                (|_| true, |_| true),
+            )
+            .unwrap();
+        assert!(progress.visited <= 8);
+    }
+    for &id in &ids[..2] {
+        assert_eq!(
+            pool.snapshot(pool.find(id).unwrap()).unwrap().1,
+            Phase::Ready
+        );
+    }
+    let original_size = (core::mem::size_of::<[Entry; NODES]>()
+        + core::mem::size_of::<[Option<(RegistrationToken, Token)>; CAPACITY]>()
+        + 2 * core::mem::size_of::<u16>())
+    .next_multiple_of(core::mem::align_of::<Events>());
+    let growth = core::mem::size_of::<Events>() - original_size;
+    std::println!(
+        "WAIT recheck scratch={} Events={} original={} growth={}",
+        core::mem::size_of::<Recheck>(),
+        core::mem::size_of::<Events>(),
+        original_size,
+        growth
+    );
+    assert!(growth < 1024);
 }

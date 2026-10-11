@@ -345,7 +345,7 @@ fn main(_: u64) -> u64 {
         wait_proof_next: 0,
         wait_proof_serial: 0,
         wait_proof_disabled: false,
-        wait_proof_turn: false,
+        wait_cleanup: ramfs::locks::dispatch::CleanupDispatch::default(),
         #[cfg(feature = "lifetime-probe")]
         ring_probe: ring_probe::RingProbe::new(),
         #[cfg(feature = "lifetime-probe")]
@@ -430,7 +430,7 @@ struct Fs {
     wait_proof_next: u8,
     wait_proof_serial: u64,
     wait_proof_disabled: bool,
-    wait_proof_turn: bool,
+    wait_cleanup: ramfs::locks::dispatch::CleanupDispatch,
     #[cfg(feature = "lifetime-probe")]
     ring_probe: ring_probe::RingProbe,
     #[cfg(feature = "lifetime-probe")]
@@ -1444,7 +1444,8 @@ impl Service<0> for Fs {
             self.lock_jobs.has_work()
                 || self.wait_jobs.has_work()
                 || self.wait_events.pending()
-                || self.wait_proof_pending(),
+                || self.wait_proof_pending()
+                || self.wait_events.recheck_pending(),
             self.lifetimes.is_some(),
         ) {
             LockWork::Actor => {
@@ -1546,10 +1547,16 @@ impl Service<0> for Fs {
                 return;
             }
             LockWork::Request { cleanup } => {
-                if cleanup && self.wait_proof_pending() {
-                    self.wait_proof_turn = !self.wait_proof_turn;
-                }
-                if self.wait_events.pending() {
+                let cleanup_work = if cleanup {
+                    Some(self.wait_cleanup.next(
+                        self.wait_events.pending(),
+                        self.wait_proof_pending(),
+                        self.wait_events.recheck_pending(),
+                    ))
+                } else {
+                    None
+                };
+                if cleanup_work == Some(ramfs::locks::dispatch::CleanupWork::Events) {
                     #[cfg(feature = "lock-telemetry")]
                     let witness = self
                         .wait_events
@@ -1566,8 +1573,10 @@ impl Service<0> for Fs {
                     let _ = progress;
                     self.wait_ready_scan = None;
                     self.wait_ready_scanned = false;
-                } else if cleanup && self.wait_proof_pending() && self.wait_proof_turn {
+                } else if cleanup_work == Some(ramfs::locks::dispatch::CleanupWork::Proof) {
                     self.tick_wait_proof(sessions);
+                } else if cleanup_work == Some(ramfs::locks::dispatch::CleanupWork::Recheck) {
+                    self.tick_wait_recheck(sessions);
                 } else if cleanup {
                     let released = self.lock_jobs.cleanup_released(&mut self.ram.storage);
                     #[cfg(feature = "lock-telemetry")]
@@ -2655,7 +2664,7 @@ impl Service<0> for Fs {
                 #[cfg(feature = "lock-telemetry")]
                 let pid = s.data.binding.snapshot_ref().map_or(0, |who| who.pid);
                 match self.ram.close_event(&mut s.data, self.locks, event) {
-                    Ok(()) => {
+                    Ok(inode) => {
                         #[cfg(feature = "lock-telemetry")]
                         self.telemetry.portion(
                             15,
@@ -2667,7 +2676,9 @@ impl Service<0> for Fs {
                                 0,
                             ],
                         );
-                        self.wait_events.poll();
+                        if let Some(inode) = inode {
+                            self.wait_events.changed(inode);
+                        }
                         self.notify_maintenance();
                         Answer::Status(Status::Ok)
                     }
@@ -3443,6 +3454,71 @@ impl Fs {
             self.publish_wait(id);
         }
     }
+    fn tick_wait_recheck(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        #[cfg(feature = "lock-telemetry")]
+        let witness = self
+            .wait_events
+            .telemetry_recheck()
+            .map(ramfs::lock_telemetry::registration)
+            .unwrap_or([0; 4]);
+        let page = self.lifetimes.as_ref();
+        let ram = &*self.ram;
+        let births = &self.births;
+        let locks = &*self.locks;
+        let (_, descriptions) = ram.lock_parts_ref();
+        let progress = self
+            .wait_events
+            .recheck_part(
+                self.wait_jobs,
+                self.wait_pool,
+                locks,
+                &ram.storage,
+                |id, captured| {
+                    let place = usize::from(id.slot()) / ramfs::locks::wait_receipts::SHARE;
+                    let source = sessions
+                        .get(place)
+                        .and_then(Option::as_ref)
+                        .filter(|s| s.label() == id.owner() && s.data.claimed)
+                        .map(|s| &s.data)
+                        .or_else(|| {
+                            births
+                                .get(Self::birth_index(id.owner()))
+                                .and_then(Option::as_ref)
+                                .filter(|(label, _)| *label == id.owner())
+                                .map(|(_, fds)| fds)
+                        });
+                    source.filter(|fds| !fds.departed).is_some_and(|fds| {
+                        let owner_live = match captured.request.owner {
+                            ramfs::locks::Owner::Process(pid) => {
+                                fds.binding.snapshot_ref().is_some_and(|who| who.pid == pid)
+                                    && page.is_some_and(|page| page.live(pid))
+                            }
+                            ramfs::locks::Owner::Description { slot, generation } => {
+                                captured.source.description
+                                    == ramfs::storage::Token { slot, generation }
+                                    && descriptions.live(ramfs::storage::Token { slot, generation })
+                            }
+                        };
+                        owner_live
+                            && ram
+                                .live_description(fds, captured.source)
+                                .ok()
+                                .is_some_and(|(inode, _)| inode == captured.request.inode)
+                    })
+                },
+                (
+                    |pid| page.is_some_and(|page| page.live(pid)),
+                    |ofd| descriptions.live(ofd),
+                ),
+            )
+            .expect("exact bounded WAIT recheck");
+        #[cfg(feature = "lock-telemetry")]
+        self.telemetry.portion(4, progress.visited, witness);
+        if progress.readied != 0 {
+            self.wait_ready_scan = None;
+            self.wait_ready_scanned = false;
+        }
+    }
     /// Schedule one finite optional episode. Events coalesce; completion itself
     /// never schedules another episode or self-notifies.
     fn schedule_wait_proof(&mut self) {
@@ -3923,6 +3999,7 @@ impl Fs {
         if self.legacy_pending
             || self.wait_events.pending()
             || self.wait_proof_pending()
+            || self.wait_events.recheck_pending()
             || self.lock_dispatch.pending(
                 self.locks.busy()
                     || (!self.fifo_frozen()

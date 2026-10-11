@@ -145,6 +145,25 @@ impl LockService {
         }
         self.actor.reader_part(reader, pid_live, ofd_live)
     }
+    /// A recheck reserves one counted slot for exact registration/source validation.
+    pub fn reader_part_limit(
+        &self,
+        storage: &Storage<'_>,
+        reader: &mut Reader,
+        limit: usize,
+        pid_live: impl FnMut(u32) -> bool,
+        ofd_live: impl FnMut(Token) -> bool,
+    ) -> ReadProgress {
+        if storage.node(reader.snapshot().inode()).is_err() {
+            return ReadProgress {
+                visited: 0,
+                blockers: [None; super::records::PORTION],
+                state: super::actor::ReadState::Invalidated,
+            };
+        }
+        self.actor
+            .reader_part_limit(reader, limit, pid_live, ofd_live)
+    }
     /// A read-only FIFO eligibility portion owns no Actor reservation.
     pub fn select_part(
         &self,
@@ -743,7 +762,7 @@ mod tests {
             payer,
         )
         .unwrap();
-        assert_eq!(ram.close_event(&mut fds, &mut service, original), Ok(()));
+        assert_eq!(ram.close_event(&mut fds, &mut service, original), Ok(None));
         assert_eq!(
             ram.close_event(
                 &mut fds,
@@ -780,7 +799,7 @@ mod tests {
             ),
             Err(proto_fs::BAD_FD)
         );
-        assert_eq!(ram.close_event(&mut fds, &mut service, original), Ok(()));
+        assert_eq!(ram.close_event(&mut fds, &mut service, original), Ok(None));
         assert_eq!(
             close_blocker(&mut service, &mut ram, &page, inodes[1], 0),
             Some(Owner::Process(257))
