@@ -172,15 +172,15 @@ class LinkedInstructionTests(unittest.TestCase):
         helper = self.symbols['OUTLINED_FUNCTION_2']
         self.assertEqual(llvm_row(self.old_rows, helper), 'CFA=WSP')
         for offset in (0, 4, 8):
-            self.assertEqual(llvm_row(self.new_rows, helper + offset), 'CFA=WSP+16')
-        self.assertEqual(llvm_row(self.new_rows, helper + 12), 'CFA=WSP')
+            self.assertEqual(llvm_row(self.new_rows, helper + offset), 'CFA=WSP')
+        self.assertEqual(llvm_row(self.new_rows, helper + 12), 'CFA=WSP-16')
         caller = self.symbols['borrowed_caller']
         self.assertIn('CFA=WSP+32', llvm_row(self.new_rows, caller + 4))
         self.assertIn('CFA=WSP+16', llvm_row(self.new_rows, caller + 8))
         # Start SP is 0x1000 after the caller allocated its frame.
-        # Both points unwind through the continuation to the same caller CFA.
-        self.assertEqual(0x1000 + 16 + 16, 0x1020)
-        self.assertEqual((0x1000 + 16) + 0 + 16, 0x1020)
+        # A suspended call uses its BL row, preserving the pre-call SP.
+        self.assertEqual(0x1000 + 0 + 32, 0x1020)
+        self.assertEqual((0x1000 + 16) - 16 + 32, 0x1020)
 
     def test_borrowed_delta_rejects(self):
         data, instructions = self.changed_fixture(ASSEMBLY.replace('mov x1,x22\nadd sp,sp,#16', 'mov x1,x22\nadd sp,sp,#32'))

@@ -44,6 +44,17 @@ def leb(value):
             return bytes(result)
 
 
+def sleb(value):
+    result = bytearray()
+    while True:
+        byte = value & 127
+        value >>= 7
+        done = (value == 0 and not byte & 64) or (value == -1 and byte & 64)
+        result.append(byte if done else byte | 128)
+        if done:
+            return bytes(result)
+
+
 @dataclass(eq=True)
 class Row:
     cfa: tuple = (31, 0)
@@ -78,8 +89,8 @@ def events(program, start, code_alignment):
         elif opcode in (5, 9, 12):
             _, at = uleb(program, at)
             _, at = uleb(program, at)
-        elif opcode in (6, 7, 8, 13, 14):
-            _, at = uleb(program, at)
+        elif opcode in (6, 7, 8, 13, 14, 19):
+            _, at = uleb(program, at, signed=opcode == 19)
         else:
             raise Invalid(f"unsupported targeted CFI opcode {opcode:#x}")
         if opcode:
@@ -114,8 +125,8 @@ def apply(row, operation, initial, saved, data_alignment):
             row.registers[first] = ("register", second)
         else:
             row.cfa = (first, second)
-    elif opcode in (6, 7, 8, 13, 14):
-        value, _ = uleb(operation, at)
+    elif opcode in (6, 7, 8, 13, 14, 19):
+        value, _ = uleb(operation, at, signed=opcode == 19)
         if opcode == 6:
             if value in initial.registers:
                 row.registers[value] = initial.registers[value]
@@ -127,6 +138,8 @@ def apply(row, operation, initial, saved, data_alignment):
             row.registers[value] = ("same", value)
         elif opcode == 13:
             row.cfa = (value, row.cfa[1])
+        elif opcode == 19:
+            row.cfa = (row.cfa[0], value * data_alignment)
         else:
             row.cfa = (row.cfa[0], value)
     else:
@@ -423,10 +436,11 @@ def repair_programs(elf, records, instructions):
                         "borrowed-SP caller row/delta disagrees")
                 incoming.append(pc)
             require(incoming, "borrowed-SP helper has no proved call entry")
-            before_add = copy.deepcopy(initial)
-            before_add.cfa = (31, delta)
-            desired = [(address, b'\x0e' + leb(delta)), (addition_pc + 4, b'\x0e' + leb(0))]
-            expected = [before_add if pc <= addition_pc else initial for pc, _ in body]
+            after_add = copy.deepcopy(initial)
+            after_add.cfa = (31, -delta)
+            require(-delta % fde.cie.data == 0, 'borrowed-SP delta does not match CIE factor')
+            desired = [(addition_pc + 4, b'\x13' + sleb(-delta // fde.cie.data))]
+            expected = [initial if pc <= addition_pc else after_add for pc, _ in body]
             current = [row_at(original, pc, initial, fde.cie.data) for pc, _ in body]
             if current != expected:
                 require(all(row == initial for row in current), "unknown borrowed-SP CFI mismatch")
