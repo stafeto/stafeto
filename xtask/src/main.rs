@@ -4248,6 +4248,8 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
     let mut snapshots = 0;
     for line in lines {
+        let capacity = line.starts_with("posix-procs: names quota:")
+            || line.starts_with("posix-procs: names capacity memory:");
         let (used, quota) = if line.starts_with("posix-procs: names quota:") {
             let number = |tag| qemu::number_after(std::slice::from_ref(line), tag);
             let (Some(quota), Some(used), Some(remaining), Some(refused), Some(ordinary)) = (
@@ -4271,7 +4273,8 @@ fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
         } else if let Some(tail) = line
             .strip_prefix("posix-procs: slow malloc memory: ")
             .or_else(|| line.strip_prefix("posix-procs: fork child malloc memory: "))
-            .or_else(|| line.strip_prefix("posix-procs: names eighth memory: "))
+            .or_else(|| line.strip_prefix("posix-procs: names workload memory: "))
+            .or_else(|| line.strip_prefix("posix-procs: names capacity memory: "))
         {
             (
                 tail.split_whitespace()
@@ -4285,10 +4288,15 @@ fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
         let (Some(used), Some(quota)) = (used, quota) else {
             return Err(format!("malformed process memory snapshot: {line}"));
         };
-        if quota == 0 || u128::from(used) * 10 > u128::from(quota) * 9 {
-            return Err(format!("process memory reserve below 10%: {line}"));
+        if quota == 0
+            || used > quota
+            || (!capacity && u128::from(used) * 10 > u128::from(quota) * 9)
+        {
+            return Err(format!(
+                "process memory snapshot exceeds its checked budget: {line}"
+            ));
         }
-        snapshots += 1;
+        snapshots += usize::from(!capacity);
     }
     if snapshots == 0 {
         return Err("process probe printed no concurrent memory snapshots".into());
@@ -7566,35 +7574,32 @@ mod tests {
 
     #[test]
     fn process_memory_requires_measured_ten_percent_reserve() {
-        let row = |used: u64, quota: u64| {
-            format!(
-                "posix-procs: names quota: process 3, quota {quota} pages, used {used} pages, remaining {} pages, refused stack {} bytes, eighth ordinary stack 65536 bytes",
-                quota.saturating_sub(used),
-                (quota.saturating_sub(used) + 1) * 4096
-            )
+        let workload = |used, quota| {
+            format!("posix-procs: names workload memory: {used} pages, quota {quota} pages")
         };
-        assert!(check_process_memory_reserve(&[row(90, 100)]).is_ok());
-        assert!(check_process_memory_reserve(&[row(91, 100)]).is_err());
-        assert!(
-            check_process_memory_reserve(&[
-                row(90, 100).replace("refused stack 45056", "refused stack 2097152")
-            ])
-            .is_err()
-        );
-        assert!(check_process_memory_reserve(&[row(0, 0)]).is_err());
-        assert!(
-            check_process_memory_reserve(&[
-                "posix-procs: names eighth memory: 455 pages, quota 512 pages".into()
-            ])
-            .is_ok()
-        );
-        assert!(
-            check_process_memory_reserve(&[
-                "posix-procs: names eighth memory: 472 pages, quota 512 pages".into()
-            ])
-            .is_err()
-        );
+        let boundary = |used, quota| {
+            format!("posix-procs: names capacity memory: {used} pages, quota {quota} pages")
+        };
+        assert!(check_process_memory_reserve(&[workload(90, 100)]).is_ok());
+        assert!(check_process_memory_reserve(&[workload(91, 100)]).is_err());
+        assert!(check_process_memory_reserve(&[workload(0, 0)]).is_err());
         assert!(check_process_memory_reserve(&[]).is_err());
+        assert!(check_process_memory_reserve(&[boundary(99, 100)]).is_err());
+        assert!(check_process_memory_reserve(&[workload(90, 100), boundary(99, 100)]).is_ok());
+        assert!(check_process_memory_reserve(&[workload(90, 100), boundary(101, 100)]).is_err());
+        let quota = "posix-procs: names quota: process 3, quota 100 pages, used 95 pages, remaining 5 pages, refused stack 24576 bytes, eighth ordinary stack 65536 bytes";
+        assert!(check_process_memory_reserve(&[workload(90, 100), quota.into()]).is_ok());
+        assert!(
+            check_process_memory_reserve(&[workload(90, 100), quota.replace("24576", "2097152")])
+                .is_err()
+        );
+        assert!(
+            check_process_memory_reserve(&[
+                workload(90, 100),
+                quota.replace("remaining 5", "remaining 6")
+            ])
+            .is_err()
+        );
         assert!(
             check_process_memory_reserve(&[
                 "posix-procs: slow malloc memory: 577 pages, quota 704 pages".into()
