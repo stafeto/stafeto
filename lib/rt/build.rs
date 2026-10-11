@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 fn main() {
     if std::env::var("TARGET").as_deref() == Ok("aarch64-unknown-none") {
