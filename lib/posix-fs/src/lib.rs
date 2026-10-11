@@ -1152,6 +1152,11 @@ impl PosixFs {
 
     /// The request on `target` is over: what to release, when its last
     /// descriptor went meanwhile.
+    /// A scalar observation of one exact ordinary I/O loan; it creates no hold.
+    pub fn io_loan_state(&self, target: Target) -> Option<(u16, bool, bool)> {
+        self.descriptors.io_loan_state(target)
+    }
+
     pub fn unhold(&mut self, target: Target) -> Option<Target> {
         self.descriptors.unhold(target)
     }

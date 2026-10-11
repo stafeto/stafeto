@@ -675,6 +675,17 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         Ok(backend)
     }
 
+    /// Read the exact ordinary I/O loan without changing its custody.
+    /// At most the existing bounded I/O hold array is inspected.
+    pub fn io_loan_state(&self, backend: T) -> Option<(u16, bool, bool)> {
+        self.holds.iter().find_map(|slot| match &slot.held {
+            Held::Io(hold) if hold.backend == backend => {
+                Some((hold.count, hold.closed, hold.released))
+            }
+            _ => None,
+        })
+    }
+
     pub fn unhold(&mut self, backend: T) -> Option<T> {
         let slot = self
             .holds
@@ -1405,6 +1416,24 @@ mod tests {
 
     /// Holds nobody will end go: a held backend whose descriptors went is
     /// handed back to release, once; one with a descriptor left stays.
+    #[test]
+    fn io_loan_observation_preserves_exact_backend_and_closed_custody() {
+        let mut table = Table::<(u32, u64), 8>::default();
+        let backend = (3, 1_u64 << 32);
+        let fd = table.insert(backend, Flags::default()).unwrap();
+        assert_eq!(table.io_loan_state(backend), None);
+        table.hold(fd).unwrap();
+        table.hold(fd).unwrap();
+        assert_eq!(table.io_loan_state(backend), Some((2, false, false)));
+        assert_eq!(table.io_loan_state((3, 0)), None);
+        assert_eq!(table.close(fd).unwrap(), None);
+        assert_eq!(table.io_loan_state(backend), Some((2, true, false)));
+        assert_eq!(table.unhold(backend), None);
+        assert_eq!(table.io_loan_state(backend), Some((1, true, false)));
+        assert_eq!(table.unhold(backend), Some(backend));
+        assert_eq!(table.io_loan_state(backend), None);
+    }
+
     #[test]
     fn abandoned_holds_hand_back_what_was_closed() {
         let mut table = Table::<u32, 4>::default();
