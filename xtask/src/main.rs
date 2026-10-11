@@ -7661,20 +7661,15 @@ mod tests {
     #[test]
     fn lifetime_probe_has_its_own_process_and_program_features() {
         let manifest = include_str!("../../tests/posix-procs/Cargo.toml");
-        let close_features: Vec<_> = manifest
+        let mut close_features: Vec<_> = manifest
             .lines()
             .filter(|line| line.contains("posix-abi/close-probe"))
+            .map(|line| line.split_once(" = ").unwrap().0)
             .collect();
-        assert_eq!(close_features.len(), 2);
-        assert!(
-            close_features
-                .iter()
-                .any(|line| line.starts_with("lifetime-probe = "))
-        );
-        assert!(
-            close_features
-                .iter()
-                .any(|line| line.starts_with("lock-full-ofd = "))
+        close_features.sort_unstable();
+        assert_eq!(
+            close_features,
+            ["lifetime-probe", "lock-full-dup", "lock-full-ofd"]
         );
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe", "steps"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
