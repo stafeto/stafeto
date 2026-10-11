@@ -645,6 +645,8 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-posix-fifo.img" => &crate::POSIX_FIFO_PROGRAMS,
+                "boot-posix-fifo-steps.img" => &crate::POSIX_FIFO_STEPS_PROGRAMS,
                 "boot-posix-lifetimes.img" => &crate::POSIX_LIFETIMES_PROGRAMS,
                 "boot-posix-lock-rules.img" => &crate::POSIX_LOCK_LIFECYCLE_PROGRAMS,
                 "boot-posix-lock-core.img" => &crate::POSIX_LOCK_CORE_PROGRAMS,
