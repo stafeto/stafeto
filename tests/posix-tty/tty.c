@@ -128,11 +128,47 @@ static int identity(void) {
     return 0;
 }
 
+static int ioctl_getattr(int fd, struct termios *out) {
+    return ioctl(fd, TCGETS, out);
+}
+
+/* Both public paths retain classification-before-null and leave output alone
+ * on refusal. Compare fields on success: padding is not an ABI value. */
+static int getter_paths(int regular, int pipe_fd) {
+    int (*getters[])(int, struct termios *) = { tcgetattr, ioctl_getattr };
+    const int fds[] = { -1, 99, regular, pipe_fd, 0 };
+    const int errors[] = { EBADF, EBADF, ENOTTY, ENOTTY, EFAULT };
+    for (size_t g = 0; g < sizeof getters / sizeof getters[0]; g++) {
+        for (size_t i = 0; i < sizeof fds / sizeof fds[0]; i++) {
+            errno = 0;
+            CHECK(getters[g](fds[i], NULL) == -1 && errno == errors[i]);
+        }
+        struct termios untouched, before;
+        memset(&untouched, 0xa5, sizeof untouched);
+        memcpy(&before, &untouched, sizeof before);
+        errno = 0;
+        CHECK(getters[g](regular, &untouched) == -1 && errno == ENOTTY);
+        CHECK(memcmp(&untouched, &before, sizeof before) == 0);
+        errno = 0;
+        CHECK(getters[g](99, &untouched) == -1 && errno == EBADF);
+        CHECK(memcmp(&untouched, &before, sizeof before) == 0);
+    }
+    struct termios direct, generic;
+    CHECK(tcgetattr(0, &direct) == 0 && ioctl_getattr(0, &generic) == 0);
+    CHECK(same(&direct, &generic) && direct.c_line == 0 && generic.c_line == 0);
+    return 0;
+}
+
 /* The errors of the termios functions. */
 static int errors(void) {
     struct termios t;
     int p[2];
     CHECK(pipe(p) == 0);
+    int regular = open("/getter-paths-check", O_CREAT | O_EXCL | O_RDWR, 0600);
+    CHECK(regular >= 0);
+    int getter_result = getter_paths(regular, p[0]);
+    CHECK(close(regular) == 0 && unlink("/getter-paths-check") == 0);
+    if (getter_result) return getter_result;
     CHECK(tcgetattr(0, &t) == 0);
     errno = 0;
     CHECK(tcgetattr(p[0], &t) == -1 && errno == ENOTTY);
@@ -182,6 +218,8 @@ static int settings(struct termios *saved) {
     memset(&back, 0, sizeof back);
     CHECK(tcgetattr(0, &back) == 0);
     CHECK(same(&back, &t));
+    struct termios generic;
+    CHECK(ioctl_getattr(0, &generic) == 0 && same(&generic, &t) && generic.c_line == 0);
     CHECK(cfgetispeed(&back) == B9600 && cfgetospeed(&back) == B115200);
     CHECK(cfsetspeed(&t, B38400) == 0 && cfgetispeed(&t) == B38400 && cfgetospeed(&t) == B38400);
     CHECK(tcsetattr(0, TCSADRAIN, saved) == 0);
@@ -547,6 +585,8 @@ static int names(const struct termios *saved) {
     CHECK(name != NULL && strcmp(name, "/dev/console") == 0);
     struct termios t;
     CHECK(tcgetattr(fd, &t) == 0 && same(&t, saved));
+    struct termios generic;
+    CHECK(ioctl_getattr(fd, &generic) == 0 && same(&generic, &t) && generic.c_line == 0);
     CHECK(PUT(fd, "posix-tty: written through /dev/console\n"));
     /* /dev/tty is the controlling terminal of the caller's session, and
      * this session has none: ENXIO (sessions() opens it with one). */

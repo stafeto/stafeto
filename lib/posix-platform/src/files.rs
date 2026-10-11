@@ -474,15 +474,6 @@ fn terminal_ioctl(
     use posix_abi::terminal;
     let word = argument as usize;
     match request {
-        TCGETS => {
-            if argument.is_null() {
-                return Err(EFAULT);
-            }
-            let settings = terminal::get_attr(transport, terminal)?;
-            // SAFETY: the caller's promise: writable for a struct termios.
-            unsafe { argument.cast::<Termios>().write(Termios::of(&settings)) };
-            Ok(0)
-        }
         TCSETS | TCSETSW | TCSETSF => {
             if argument.is_null() {
                 return Err(EFAULT);
@@ -583,6 +574,45 @@ fn terminal_ioctl(
     }
 }
 
+/// The exact TCGETS path, shared by libc's narrow getter and generic ioctl.
+/// It deliberately does not reference the generic terminal command driver.
+fn get_termios_fd(fd: c_int, argument: *mut c_void) -> Result<c_int, c_int> {
+    number(fd).and_then(|fd| {
+        posix_abi::shared::held(fd, |transport, target| {
+            if let Some(terminal) = transport.terminal_number(target) {
+                if argument.is_null() {
+                    return Err(EFAULT);
+                }
+                let settings = posix_abi::terminal::get_attr(transport, terminal)?;
+                // SAFETY: both C entry points require writable termios storage.
+                unsafe { argument.cast::<Termios>().write(Termios::of(&settings)) };
+                return Ok(0);
+            }
+            if !matches!(target, Target::Input | Target::Output | Target::Error) {
+                return Err(ENOTTY);
+            }
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            // SAFETY: the entry point's caller promises writable termios storage.
+            unsafe {
+                argument
+                    .cast::<Termios>()
+                    .write(Termios::of(&proto_tty::Termios::opened()))
+            };
+            Ok(0)
+        })
+    })
+}
+
+/// Read terminal settings without rooting unrelated generic ioctl commands.
+/// # Safety
+/// `argument` is writable and aligned for relibc's struct termios on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_tcgetattr(fd: c_int, argument: *mut c_void) -> c_int {
+    get_termios_fd(fd, argument).unwrap_or_else(|errno| -errno)
+}
+
 /// ioctl: the terminal requests of a descriptor that is a terminal
 /// (`terminal_ioctl`); ENOTTY for a descriptor of any other kind. A
 /// process with no session with the terminal service (its console is the
@@ -599,6 +629,9 @@ pub unsafe extern "C" fn stafeto_ioctl(
     request: c_ulong,
     argument: *mut c_void,
 ) -> c_int {
+    if request == TCGETS {
+        return get_termios_fd(fd, argument).unwrap_or_else(|errno| -errno);
+    }
     // relibc tcdrain uses precisely this command. Its cancellation point
     // surrounds the descriptor hold, so cleanup runs after release.
     if request == TCSBRK && !argument.is_null() {
@@ -616,18 +649,6 @@ pub unsafe extern "C" fn stafeto_ioctl(
                 posix_fs::Target::Input | posix_fs::Target::Output | posix_fs::Target::Error
             );
             match (request, console) {
-                (TCGETS, true) => {
-                    if argument.is_null() {
-                        return Err(EFAULT);
-                    }
-                    // SAFETY: the caller's promise.
-                    unsafe {
-                        argument
-                            .cast::<Termios>()
-                            .write(Termios::of(&proto_tty::Termios::opened()))
-                    };
-                    Ok(0)
-                }
                 (TCSETS | TCSETSW | TCSETSF, true) => Err(ENOSYS),
                 _ => Err(ENOTTY),
             }
