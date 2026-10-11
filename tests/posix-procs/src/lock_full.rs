@@ -239,3 +239,18 @@ pub unsafe extern "C" fn full_row_valid(pages: *const [[u64; 6]; 20]) -> i32 {
     // SAFETY: C supplies twenty initialized aligned pages, borrowed only in this call.
     super::lock_full_wire::row(unsafe { &*pages }).map_or(-1, |()| 0)
 }
+
+#[cfg(feature = "lock-full-ring")]
+#[unsafe(no_mangle)]
+pub extern "C" fn full_ring_method_mask() -> u32 {
+    [
+        proto_fs::Method::WaitStart,
+        proto_fs::Method::WaitArm,
+        proto_fs::Method::WaitQuery,
+        proto_fs::Method::WaitRelease,
+    ]
+    .into_iter()
+    .fold(0, |mask, method| {
+        mask | (1 << (method as u16 - proto_fs::Method::WaitStart as u16))
+    })
+}

@@ -84,6 +84,7 @@ static int set(int fd, short kind, unsigned segment);
 extern void full_ring_arm(void);
 extern void full_ring_disarm(void);
 extern int full_row_valid(const uint64_t[20][6]);
+extern unsigned full_ring_method_mask(void);
 static struct record ring_results[16];
 static struct record ring_record;
 static unsigned ring_index;
@@ -369,7 +370,7 @@ static int ring_rows(int fd, uint64_t epoch) {
     }
     unsigned required = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 4)
         | (1u << 5) | (1u << 6) | (1u << 7) | (1u << 14);
-    if ((covered & required) != required || (methods & 23) != 23 || !full_deadlock)
+    if ((covered & required) != required || (methods & full_ring_method_mask()) != full_ring_method_mask() || !full_deadlock)
         return fail("actual ring required branches and full deadlock", covered);
     printf("lock-full: ring dispatch profile=%u mask=%u methods=%u full-deadlock=1\n", profile, covered, methods);
     return 0;
