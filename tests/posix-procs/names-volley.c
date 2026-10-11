@@ -633,11 +633,22 @@ static int vz_child(void) {
            process, stafeto_probe_memory_used() / 4096, stack_size);
     {
         pthread_t eighth;
+        pthread_attr_t eighth_attr;
+        void *eighth_stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        VZ_CHECK(eighth_stack != MAP_FAILED);
+        VZ_CHECK(pthread_attr_init(&eighth_attr) == 0);
+        VZ_CHECK(pthread_attr_setstack(&eighth_attr, eighth_stack, stack_size) == 0);
+        vz_hold = 0;
+        /* The caller owns this normal 64 KiB stack and releases it after
+         * join. Keep all eight threads alive while measuring stack and TLS. */
+        VZ_CHECK(pthread_create(&eighth, &eighth_attr, vz_idle, NULL) == 0);
+        printf("posix-procs: names eighth memory: %llu pages, quota %llu pages\n",
+               stafeto_probe_memory_used() / 4096, stafeto_probe_memory_quota() / 4096);
         vz_hold = 1;
-        /* All seven workers stay alive behind their gate. A normal eighth
-         * stack fits, including its TLS and thread allocation overhead. */
-        VZ_CHECK(pthread_create(&eighth, &attr, vz_idle, NULL) == 0);
         VZ_CHECK(pthread_join(eighth, NULL) == 0);
+        VZ_CHECK(pthread_attr_destroy(&eighth_attr) == 0);
+        VZ_CHECK(munmap(eighth_stack, stack_size) == 0);
         unsigned long long quota = stafeto_probe_memory_quota();
         unsigned long long used = stafeto_probe_memory_used();
         VZ_CHECK(quota >= used && quota != 0);
