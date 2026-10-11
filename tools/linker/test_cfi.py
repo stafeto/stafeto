@@ -612,6 +612,34 @@ ret
             with self.assertRaises(Invalid):
                 normalize_bytes(data, ins)
 
+    def test_actual_probe_object_stores_have_finite_address_forms(self):
+        objects = "\n.data\n.balign 8\nvalid_atomic: .quad 0\nvalid_array: .zero 80\n.text\n"
+        for helper, setup in [
+            ('ldxr x9,[x8]\nadd x9,x9,#1\nstxr w10,x9,[x8]',
+             'adrp x8,valid_atomic\nadd x8,x8,:lo12:valid_atomic'),
+            ('ldxr w9,[x8]\nadd w9,w9,#1\nstxr w10,w9,[x8]',
+             'adrp x8,valid_atomic\nadd x8,x8,:lo12:valid_atomic'),
+            ('str x9,[x10,x8]\nadd x8,x8,#8',
+             'adrp x10,valid_array\nadd x10,x10,:lo12:valid_array\nmov x8,#0\nmov x9,#1'),
+            ('str w9,[x10,x8]',
+             'adrp x10,valid_array\nadd x10,x10,:lo12:valid_array\nmov x8,#0\nmov w9,#1'),
+        ]:
+            source = ASSEMBLY.replace('mov w8,#4', helper).replace(
+                '.cfi_startproc\nmov x0,x30', '.cfi_startproc\n'+setup+'\nmov x0,x30') + objects
+            data, ins = self.changed_fixture(source)
+            normalize_bytes(data, ins)
+        parent = "\n.type probe_parent,%function\nprobe_parent:\n.cfi_startproc\nstr x30,[sp,#-32]!\n.cfi_def_cfa_offset 32\n.cfi_offset 30,-32\nbl OUTLINED_FUNCTION_0\nldr x30,[sp],#32\n.cfi_def_cfa_offset 0\n.cfi_restore 30\nret\n.cfi_endproc\n.size probe_parent,.-probe_parent\n"
+        for helper in ('mov x8,sp\nstxr w10,x9,[x8]',
+                       'mov w8,wsp\nstxr w10,x9,[x8]',
+                       'mov x8,sp\nstr x9,[x10,x8]',
+                       'mov x10,sp\nstr x9,[x10,x8]',
+                       'str x9,[x10,x8,lsl #3]',
+                       'str x9,[x10,w8,uxtw #3]',
+                       'stxp w10,x9,x11,[x8]', 'stxr w0,x9,[x8]'):
+            data, ins = self.changed_fixture(ASSEMBLY.replace('mov w8,#4', helper) + parent)
+            with self.assertRaises(Invalid):
+                normalize_bytes(data, ins)
+
     def test_unknown_parent_lr_is_terminal_rejection(self):
         source = ASSEMBLY+"\n.type unknown_parent,%function\nunknown_parent:\n.cfi_startproc\nbl OUTLINED_FUNCTION_0\nret\n.cfi_endproc\n.size unknown_parent,.-unknown_parent\n"
         data, instructions = self.changed_fixture(source)

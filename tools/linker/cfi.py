@@ -432,9 +432,8 @@ def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
     # None denotes a frame-derived address whose exact displacement was lost.
     bases = {31: 0, 29: None}
     own_lr = None
-    stores = {'str', 'strb', 'strh', 'stur', 'sturb', 'sturh', 'stp', 'stlr', 'stlrb', 'stlxr'}
+    stores = {'str', 'strb', 'strh', 'stur', 'sturb', 'sturh', 'stp', 'stlr', 'stlrb', 'stlxr', 'stxr'}
     for pc, (op, args) in body:
-        require(op != 'stxr', 'unsupported helper atomic store')
         destinations = written_registers(op, args)
         updates = {}
         if op == 'bl':
@@ -444,7 +443,7 @@ def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
             memory = re.fullmatch(r'(.*), \[(sp|x\d+)(?:, (#-?0x[0-9a-f]+|x\d+))?\](!)?(?:, #(-?0x[0-9a-f]+))?', args)
             require(memory is not None, 'unproved helper store address')
             names = [name.strip() for name in memory[1].split(',')]
-            if op == 'stlxr':
+            if op in ('stlxr', 'stxr'):
                 require(len(names) == 2 and re.fullmatch(r'w\d+', names[0]) and
                         memory[3] is None and not memory[4] and not memory[5],
                         'unsupported helper exclusive store form')
@@ -476,9 +475,10 @@ def protect_parent_cells(fde, call_pc, row, body, instructions, targets):
             else:
                 # The unchanged typed source objects are disjoint from compiler
                 # frame cells under the original AArch64 ABI contract.
-                require(op in ('str', 'strb', 'stp', 'stlr', 'stlxr') and displacement >= 0 and
-                        (not index or index.startswith('#') or op == 'strb') and
-                        (not memory[4] or op == 'strb') and not memory[5],
+                require(op in ('str', 'strb', 'stp', 'stlr', 'stlxr', 'stxr') and displacement >= 0 and
+                        (not index or index.startswith('#') or op in ('str', 'strb')) and
+                        (not memory[4] or op == 'strb') and not memory[5] and
+                        (not index or not index.startswith('x') or not memory[4]),
                         'unsupported source-object helper store form')
                 if index and index.startswith('x'):
                     require(int(index[1:]) not in bases, 'object index derives from frame')
