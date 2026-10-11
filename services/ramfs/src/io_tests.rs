@@ -791,3 +791,116 @@ fn regression_held_truncate_after_fd_reuse_retains_inode_and_cleanup() {
     while !prep.cancel(&mut ram).unwrap() {}
     assert!(ram.descriptions[id.slot as usize].is_none());
 }
+
+fn process_fsize(fds: &mut Fds, soft: u64) {
+    use crate::authority::Binding;
+    use proto_process::{Credentials, ExpenditureRoot, Groups, ResourceLimits, WhoReply};
+    let mut limits = ResourceLimits::initial(2 * 1024 * 1024);
+    limits.values[proto_process::FSIZE].soft = soft;
+    limits.values[proto_process::FSIZE].hard = u64::MAX;
+    fds.binding = Binding::Active(WhoReply {
+        pid: 300,
+        credentials: Credentials::ROOT,
+        generation: 1,
+        loader: None,
+        index: 44,
+        ctty: None,
+        image: 1,
+        groups: Groups::EMPTY,
+        limits,
+        root: ExpenditureRoot {
+            pid: 300,
+            generation: 1,
+        },
+    });
+}
+
+#[test]
+fn process_fsize_legacy_partial_append_positioned_and_zero_write() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (mut fds, fd, token) = create(&mut ram, FIRST, b"fsize-legacy");
+    process_fsize(&mut fds, 5);
+    assert_eq!(
+        ram.write_at(&mut fds, fd, b"1234567", proto_fs::Timestamp::ZERO),
+        Ok(5)
+    );
+    assert_eq!(ram.storage.node(token).unwrap().length, 5);
+    assert_eq!(
+        ram.write_at(&mut fds, fd, b"x", proto_fs::Timestamp::ZERO),
+        Err(proto_fs::FILE_SIZE_LIMIT)
+    );
+    assert_eq!(
+        ram.write_at(&mut fds, fd, b"", proto_fs::Timestamp::ZERO),
+        Ok(0)
+    );
+    assert_eq!(
+        ram.pwrite(&mut fds, fd, 3, b"ABCD", proto_fs::Timestamp::ZERO),
+        Ok(2)
+    );
+    assert_eq!(ram.get(&fds, fd).unwrap().offset, 5);
+    append(&mut ram, &fds, fd);
+    let mut open = ram.get(&fds, fd).unwrap();
+    open.offset = 0;
+    ram.put(&fds, fd, open).unwrap();
+    assert_eq!(
+        ram.write_at(&mut fds, fd, b"x", proto_fs::Timestamp::ZERO),
+        Err(proto_fs::FILE_SIZE_LIMIT)
+    );
+    let mut out = [0; 5];
+    assert_eq!(bytes(&ram, token, 0, &mut out), 5);
+    assert_eq!(&out, b"123AB");
+}
+
+#[test]
+fn process_fsize_truncate_is_atomic_and_physical_refusal_is_distinct() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (mut fds, fd, token) = create(&mut ram, FIRST, b"fsize-truncate");
+    write(&mut ram, &fds, fd, None, b"original", 1);
+    process_fsize(&mut fds, 5);
+    let before = ram.storage.usage(FIRST);
+    assert!(matches!(
+        ram.prepare_truncate(&fds, fd, 6),
+        Err(proto_fs::FILE_SIZE_LIMIT)
+    ));
+    assert_eq!(ram.storage.node(token).unwrap().length, 8);
+    assert_eq!(ram.storage.usage(FIRST), before);
+    truncate(&mut ram, &fds, fd, 4, 2);
+    assert_eq!(ram.storage.node(token).unwrap().length, 4);
+    process_fsize(&mut fds, u64::MAX);
+    assert!(matches!(
+        ram.prepare_truncate(&fds, fd, (FILE_PAGES * PAGE + 1) as u64),
+        Err(FILE_TOO_LARGE)
+    ));
+}
+
+#[test]
+fn process_fsize_admission_snapshot_survives_new_limits_and_restart() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (mut fds, fd, token) = create(&mut ram, FIRST, b"fsize-restart");
+    process_fsize(&mut fds, 5);
+    let description = ram.description_token(&fds, fd).unwrap();
+    let lease = ram.capture_data_lease(&fds, fd, description).unwrap();
+    process_fsize(&mut fds, 1);
+    let mut prep = match ram.prepare_write_held(lease, b"1234567", None) {
+        Ok(prep) => prep,
+        Err(_) => panic!("the admitted old limit remains valid"),
+    };
+    let lease = loop {
+        if let Some(lease) = prep.restart_step(&mut ram).unwrap() {
+            break lease;
+        }
+    };
+    let mut prep = match ram.prepare_write_held(lease, b"1234567", None) {
+        Ok(prep) => prep,
+        Err(_) => panic!("restart preserves the admitted old limit"),
+    };
+    while !prep.step(&mut ram).unwrap() {}
+    assert_eq!(prep.commit(&mut ram, proto_fs::Timestamp::ZERO), Ok(5));
+    while !prep.cancel(&mut ram).unwrap() {}
+    assert_eq!(ram.storage.node(token).unwrap().length, 5);
+    // A fresh request sees the lower authenticated limit.
+    assert!(matches!(
+        ram.prepare_write(&fds, fd, b"x", Some(1)),
+        Err(proto_fs::FILE_SIZE_LIMIT)
+    ));
+}

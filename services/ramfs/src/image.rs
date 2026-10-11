@@ -6,7 +6,7 @@
 
 use crate::{
     Fds, REG, Ram,
-    storage::{NONE, Pin, Root, Token},
+    storage::{Pin, Root, Token},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +41,7 @@ impl Ram<'_> {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         let node = self.storage.node(token)?;
-        if node.kind != REG || node.boot == NONE || node.boot != entry {
+        if node.kind != REG || node.boot != entry {
             return Err(proto_fs::ACCESS_DENIED);
         }
         self.storage.charge_description(fds.root)?;
@@ -55,6 +55,16 @@ impl Ram<'_> {
             root: fds.root,
         });
         Ok(())
+    }
+    /// Retire the temporary loader reference without a public PID close event.
+    /// The separately paid image pin remains responsible for executable bytes.
+    pub fn retire_exec_source(
+        &mut self,
+        fds: &mut Fds,
+        held: crate::TentativeOpen,
+    ) -> Result<(), u32> {
+        self.live_description(fds, held)?;
+        self.close(fds, held.fd)
     }
     /// One exact reference and its root charge are released in the same cleanup step.
     pub fn release_image(&mut self, fds: &mut Fds) -> bool {

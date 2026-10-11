@@ -13,6 +13,14 @@ const BATCH_ENTRIES: usize = 900;
 
 type CensusRow = (String, &'static str, &'static str, String);
 
+const ABORT_DIAGNOSTIC: &str = "[ERROR abort@src/header/stdlib/mod.rs:120] Abort\n";
+
+fn expected_abort_diagnostic(name: &str, phase: &str, text: &str, code: i64) -> bool {
+    // The parent checks WIFSIGNALED and SIGABRT; libc logs in the child.
+    // Preserve that exact diagnostic without accepting arbitrary exit-0 output.
+    name == "basic/stdlib/abort" && phase == "RUNTIME" && text == ABORT_DIAGNOSTIC && code == 0
+}
+
 fn record(
     rows: &mut Vec<CensusRow>,
     name: &str,
@@ -23,6 +31,9 @@ fn record(
 ) {
     let (result, text) = match ended {
         Ended::Exited(text, 0) if text == "exit: 0\n" => ("PASS", text),
+        Ended::Exited(text, code) if expected_abort_diagnostic(name, phase, &text, code) => {
+            ("PASS", text)
+        }
         Ended::Exited(text, code) if code < 128 && unclaimed_option(source, macros).is_some() => {
             ("UNSUPPORTED", text)
         }
@@ -269,6 +280,66 @@ fn validate_rows(rows: &[CensusRow], expected: &[String]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abort_diagnostic_requires_exact_case_phase_and_successful_parent() {
+        let classify = |name, phase, ended| {
+            let mut rows = Vec::new();
+            record(&mut rows, name, phase, ended, "", "");
+            rows.pop().unwrap()
+        };
+        let row = classify(
+            "basic/stdlib/abort",
+            "RUNTIME",
+            Ended::Exited(ABORT_DIAGNOSTIC.into(), 0),
+        );
+        assert_eq!(row.1, "PASS");
+        assert_eq!(row.3, ABORT_DIAGNOSTIC);
+        for (name, phase, ended) in [
+            (
+                "basic/stdlib/abort",
+                "RUNTIME",
+                Ended::Exited(format!("{ABORT_DIAGNOSTIC}extra\n"), 0),
+            ),
+            (
+                "basic/stdlib/abort",
+                "RUNTIME",
+                Ended::Exited("Abort\n".into(), 0),
+            ),
+            (
+                "basic/stdlib/exit",
+                "RUNTIME",
+                Ended::Exited(ABORT_DIAGNOSTIC.into(), 0),
+            ),
+            (
+                "basic/stdlib/abort",
+                "LINK",
+                Ended::Exited(ABORT_DIAGNOSTIC.into(), 0),
+            ),
+            (
+                "basic/stdlib/abort",
+                "COMPILE",
+                Ended::Exited(ABORT_DIAGNOSTIC.into(), 0),
+            ),
+            (
+                "basic/stdlib/abort",
+                "RUNTIME",
+                Ended::Exited(ABORT_DIAGNOSTIC.into(), 1),
+            ),
+            (
+                "basic/stdlib/abort",
+                "RUNTIME",
+                Ended::Exited(ABORT_DIAGNOSTIC.into(), 134),
+            ),
+            (
+                "basic/stdlib/abort",
+                "RUNTIME",
+                Ended::Failed(ABORT_DIAGNOSTIC.into()),
+            ),
+        ] {
+            assert_eq!(classify(name, phase, ended).1, "FAIL");
+        }
+    }
 
     #[test]
     fn census_requires_each_expected_terminal_row_exactly_once() {

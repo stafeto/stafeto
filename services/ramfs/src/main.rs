@@ -768,9 +768,37 @@ impl Fs {
             return Answer::Status(Status::BadSize);
         }
         let mut body = r.body();
-        let (Ok(job), Ok(())) = (body.u64(), body.finish()) else {
-            return Answer::Status(Status::BadSize);
+        let descriptor = r.method() == Method::OpenExecFd as u16;
+        let held = if descriptor {
+            let (Ok(packed), Ok(generation)) = (body.u32(), body.u64()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            if generation == 0
+                || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            Some(ramfs::TentativeOpen {
+                fd: packed & proto_fs::OPEN_FD_MASK,
+                description: ramfs::storage::Token {
+                    slot: ((packed & proto_fs::OPEN_DESCRIPTION_MASK)
+                        >> proto_fs::OPEN_DESCRIPTION_SHIFT) as u16,
+                    generation,
+                },
+            })
+        } else {
+            None
         };
+        let job = match held {
+            Some(held) => held.description.generation,
+            None => match body.u64() {
+                Ok(job) => job,
+                Err(_) => return Answer::Status(Status::BadSize),
+            },
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
         if let Some(outcome) = fds.image_outcome {
             if outcome.phase == ramfs::image::ImagePhase::Retired {
                 return status(proto_fs::OPEN_RETIRED);
@@ -813,15 +841,22 @@ impl Fs {
         if let Err(code) = self.authenticate(fds, r.label()) {
             return status(code);
         }
-        if self.path_slot(job, r.label()).is_err() {
-            return status(proto_fs::OPEN_RETIRED);
-        }
-        let token = match self.proof(job, r.label(), Some(fds)) {
-            Ok((token, None)) => token,
-            Ok(_) => return status(proto_fs::PERMISSION),
-            Err(code) => {
-                self.clear_image_outcome(fds);
-                return status(code);
+        let token = if let Some(held) = held {
+            match self.ram.live_description(fds, held) {
+                Ok((token, _)) => token,
+                Err(code) => return status(code),
+            }
+        } else {
+            if self.path_slot(job, r.label()).is_err() {
+                return status(proto_fs::OPEN_RETIRED);
+            }
+            match self.proof(job, r.label(), Some(fds)) {
+                Ok((token, None)) => token,
+                Ok(_) => return status(proto_fs::PERMISSION),
+                Err(code) => {
+                    self.clear_image_outcome(fds);
+                    return status(code);
+                }
             }
         };
         let who = fds.binding.snapshot().expect("authenticated pending image");
@@ -868,7 +903,15 @@ impl Fs {
             return status(proto_fs::IMAGE_ABORT_REQUIRED);
         }
         // Every resource and reply field was prepaid before the first SetId attempt.
-        self.finish_image_job(fds, job, r.label());
+        if let Some(held) = held {
+            // The paid image pin owns the bytes before temporary descriptor retirement.
+            // This internal retirement carries no public PID close event.
+            self.ram
+                .retire_exec_source(fds, held)
+                .expect("prevalidated exact executable source");
+        } else {
+            self.finish_image_job(fds, job, r.label());
+        }
         fds.image_outcome.as_mut().unwrap().phase = ramfs::image::ImagePhase::Ready;
         let at = self.image_identity(&outcome).unwrap();
         let image = self.identities[at]
@@ -1826,7 +1869,10 @@ impl Service<0> for Fs {
         ) {
             return self.resolve_request(&mut s.data, r);
         }
-        if r.method() == Method::OpenExec as u16 {
+        if matches!(
+            Method::from_number(r.method()),
+            Some(Method::OpenExec | Method::OpenExecFd)
+        ) {
             return self.open_exec(&mut s.data, r);
         }
         if r.method() == Method::VerifySession as u16 {
@@ -2009,6 +2055,7 @@ impl Service<0> for Fs {
             Some(Method::Clone | Method::CloneExact) => self.clone_session(&s.data, r),
             Some(
                 Method::OpenExec
+                | Method::OpenExecFd
                 | Method::ReadInto
                 | Method::VerifySession
                 | Method::Bind
@@ -2117,6 +2164,9 @@ impl Service<0> for Fs {
                 }
             }
             Some(Method::Write) => {
+                if let Err(code) = self.authenticate(&mut s.data, r.label()) {
+                    return status(code);
+                }
                 let Ok(fd) = body.u32() else {
                     return Answer::Status(Status::BadSize);
                 };
@@ -2135,6 +2185,9 @@ impl Service<0> for Fs {
                 }
             }
             Some(Method::WriteAt) => {
+                if let Err(code) = self.authenticate(&mut s.data, r.label()) {
+                    return status(code);
+                }
                 let (Ok(fd), Ok(offset)) = (body.u32(), body.u64()) else {
                     return Answer::Status(Status::BadSize);
                 };

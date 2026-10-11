@@ -454,6 +454,6 @@ mod tests {
             assert_eq!(Method::from_number(number), Some(method));
             assert!(crate::METHODS.contains(&number));
         }
-        assert_eq!(Method::from_number(59), None);
+        assert_eq!(Method::from_number(60), None);
     }
 }

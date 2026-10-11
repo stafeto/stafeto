@@ -35,6 +35,7 @@ pub mod pipes;
 pub mod process;
 pub mod random;
 pub mod relibc;
+pub mod resources;
 pub mod shared;
 pub mod signals;
 pub mod synchronization;
@@ -153,6 +154,7 @@ pub fn error(error: FsError) -> c_int {
         FsError::NotDirectory => ENOTDIR,
         FsError::NoSpace => ENOSPC,
         FsError::FileTooLarge => EFBIG,
+        FsError::FileSizeLimit => FILE_SIZE_REFUSAL,
         FsError::TooManyOpenFiles => EMFILE,
         FsError::NotSeekable => ESPIPE,
         FsError::OffsetOverflow => EOVERFLOW,
@@ -351,6 +353,22 @@ fn console_read(uart: Option<u64>, buffer: &mut [u8]) -> Result<usize, i32> {
     Ok(length)
 }
 
+// Internal result only: never published as errno. Conversion runs after custody guards.
+const FILE_SIZE_REFUSAL: i32 = 0x10000;
+
+/// Publish the process-limit refusal after all fd/cleanup locks were released.
+pub fn finish_file_size<T>(result: Result<T, i32>) -> Result<T, i32> {
+    if result
+        .as_ref()
+        .is_err_and(|error| *error == FILE_SIZE_REFUSAL)
+    {
+        let _ = signals::raise(SIGXFSZ);
+        Err(EFBIG)
+    } else {
+        result
+    }
+}
+
 /// Writes `bytes`: to a file or the console at most the transport's
 /// extent, to a pipe all of them unless a signal or O_NONBLOCK stops it
 /// (pipes::write). EPIPE comes after SIGPIPE went to the calling thread,
@@ -360,6 +378,7 @@ pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
     let result = fd(number)
         .and_then(|fd| shared::number(Request::Write { fd, bytes }))
         .map(|n| n as usize);
+    let result = finish_file_size(result);
     if result == Err(EPIPE) {
         let _ = signals::raise(SIGPIPE);
     }

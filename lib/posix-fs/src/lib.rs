@@ -42,6 +42,8 @@ pub enum FsError {
     NotDirectory,
     NoSpace,
     FileTooLarge,
+    /// Process FSIZE refusal, distinct from physical file capacity.
+    FileSizeLimit,
     TooManyOpenFiles,
     NotSeekable,
     OffsetOverflow,
@@ -106,6 +108,7 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::NOT_DIRECTORY) => Self::NotDirectory,
             Status::Unknown(proto_fs::NO_SPACE) => Self::NoSpace,
             Status::Unknown(proto_fs::FILE_TOO_LARGE) => Self::FileTooLarge,
+            Status::Unknown(proto_fs::FILE_SIZE_LIMIT) => Self::FileSizeLimit,
             Status::Unknown(proto_fs::NAME_TOO_LONG) => Self::NameTooLong,
             Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES) => Self::TooManyOpenFiles,
             Status::Unknown(proto_fs::INVALID_ARGUMENT) | Status::BadSize => Self::InvalidArgument,
@@ -1040,6 +1043,11 @@ impl PosixFs {
     /// The service's descriptions a forked child's session shares with
     /// its parent's: those of the descriptors without FD_CLOFORK, each
     /// once, into `out`; how many.
+    /// Bound only subsequent allocations, preserving imported/open descriptors.
+    pub fn set_nofile_limit(&mut self, limit: u64) {
+        self.descriptors.set_allocation_limit(limit);
+    }
+
     pub fn kept_by_fork(&self, out: &mut [rt::fs::PreparedOpen; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
@@ -1277,6 +1285,13 @@ impl PosixFs {
 
     pub fn dup(&mut self, fd: u32) -> Result<u32, FsError> {
         self.dup_from(fd, 0, DescriptorFlags::default())
+            .map_err(|error| {
+                if error == FsError::InvalidArgument {
+                    FsError::TooManyOpenFiles
+                } else {
+                    error
+                }
+            })
     }
 
     pub fn dup_from(

@@ -626,6 +626,16 @@ const POSIX_SYNC_PROGRAMS: [ImageProgram; 10] = {
     programs[5] = ("posix-procs", "posix-sync-probe", POSIX_STACK_SIZE, &[]);
     programs
 };
+const POSIX_RESOURCES_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = (
+        "posix-procs",
+        "posix-resources-probe",
+        POSIX_STACK_SIZE,
+        &[],
+    );
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1238,6 +1248,7 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-resources verify account files, limits, groups and descriptor exec
   posix-sync verify RAM synchronization, descriptor types and cancellation
   posix-spawn-churn verify 1100 consecutive spawn/reap operations in a small image
   posix-lock-pages measure a full inode spread over 64 paid physical pages
@@ -1354,6 +1365,7 @@ fn main() {
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
         Some("os-test-headers") => os_test_headers(&args[1..]),
+        Some("posix-resources") => posix_resources_probe(),
         Some("posix-sync") => posix_sync_probe(),
         Some("layer-names") => layer_c_names(),
         Some("coverage") => coverage::run(&args[1..]),
@@ -2956,10 +2968,19 @@ fn loader_channels_probe() -> Result<(), String> {
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
-    let ended = run.expect_seen(
-        "init: posix-procs ended: exit code 0, not restarted",
-        BOOT_TIMEOUT,
-    );
+    let deadline = std::time::Instant::now() + BOOT_TIMEOUT;
+    let ended = (|| {
+        run.expect_seen(
+            "init: posix-procs ended: exit code 0, not restarted",
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )?;
+        // Init's debug exit can precede output already queued through TTY.
+        // Search all collected lines so either arrival order is valid.
+        run.expect_seen(
+            "loader-channels: ok (spawn exec fork, RAM/Clock 48, inherited offsets, closed endpoints)",
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )
+    })();
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;
@@ -3472,6 +3493,38 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     Ok(())
 }
 
+fn posix_resources_probe() -> Result<(), String> {
+    relibc()?;
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-resources.img",
+        &POSIX_RESOURCES_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    for marker in [
+        "posix-resources: accounts and supplementary groups ok",
+        "posix-resources: NOFILE allocation and inherited limits ok",
+        "posix-resources: FSIZE writes append and SIGXFSZ ok",
+        "posix-resources: fexecve exact inode offset and CLOEXEC ok",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
+    Ok(())
+}
+
 fn posix_sync_probe() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -3565,10 +3618,21 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
     qemu::expect_marker(&outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
-    // The first goal of 5c: /bin/ls from a file lists /etc, a line alone,
-    // from a spawn and from an exec.
-    if outcome.lines.iter().filter(|l| l.trim() == "motd").count() < 2 {
-        return Err("ls of /etc printed `motd` fewer than twice".into());
+    // The first goal of 5c: /bin/ls from a file lists the complete /etc
+    // directory from both a spawn and an exec.
+    let listings = outcome
+        .lines
+        .iter()
+        .filter(|line| {
+            let names: Vec<_> = line.split_whitespace().collect();
+            names.len() == 3
+                && ["motd", "passwd", "group"]
+                    .iter()
+                    .all(|name| names.contains(name))
+        })
+        .count();
+    if listings < 2 {
+        return Err("ls of /etc printed the three account-file names fewer than twice".into());
     }
     // The new image of an exec whose old image ended first never runs.
     if outcome
@@ -3796,10 +3860,11 @@ const NOISE_MARGIN: u64 = 1_500;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 21] = [
+const RAM_STEP_KINDS: [(usize, &str); 22] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
+    (59, "OpenExecFd"),
     (15, "Clone"),
     (17, "ReadInto"),
     (19, "Bind"),
@@ -3862,11 +3927,14 @@ const PIPE_STEP_KINDS: [(usize, &str); 15] = [
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
-const STEP_KINDS: [(usize, &str); 17] = [
+const STEP_KINDS: [(usize, &str); 20] = [
     (1, "Create"),
     (13, "Kill"),
     (21, "Vouch"),
     (53, "RetainedLoader"),
+    (55, "GetLimit"),
+    (56, "SetLimit"),
+    (57, "GetGroups"),
     (22, "SpawnStart"),
     (23, "Boot"),
     (24, "Take"),
@@ -4224,6 +4292,10 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     }
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
     qemu::expect_marker(&outcome, "posix-procs: full inode lock steps ok")?;
+    qemu::expect_marker(
+        &outcome,
+        "posix-procs: resource and descriptor exec steps ok",
+    )?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
     }
@@ -4257,6 +4329,21 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         return Err(format!(
             "RetainedLoader took {retained} ticks with {live} children, past {VOUCH_TICKS_MAX} or none"
         ));
+    }
+    // The resource and descriptor-exec exercise runs while the crowd is live.
+    // Every newly introduced dispatch is measured, with the part's 10% reserve.
+    for (service, measured, kinds) in [
+        ("process", &rows, &[55usize, 56, 57][..]),
+        ("RAM", &ram, &[3usize, 59][..]),
+    ] {
+        for kind in kinds {
+            let ticks = measured.iter().find(|(k, ..)| k == kind).map_or(0, |r| r.1);
+            if ticks == 0 || ticks > TERM_B * 9 / 10 {
+                return Err(format!(
+                    "{service} method {kind} took {ticks} ticks; require a measurement with 10% reserve below B {TERM_B}"
+                ));
+            }
+        }
     }
     // One READ_INTO is a step of the RAM file service at level 40 whose
     // copy is bounded by READ_INTO_MAX; it stays under term B.
@@ -4837,9 +4924,17 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("# ", DIALOG_STEP)?;
         // A job in the background reads /dev/null; `wait` returns when it
         // ends and gives its status.
-        run.send("/bin/ls /etc & wait")?;
-        run.expect("/bin/ls /etc & wait", DIALOG_STEP)?;
-        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.send("/bin/ls -1 /etc & wait")?;
+        run.expect("/bin/ls -1 /etc & wait", DIALOG_STEP)?;
+        let mut accounts = vec!["motd", "passwd", "group"];
+        while !accounts.is_empty() {
+            let name = run.expect_line(
+                "a remaining /etc account file",
+                |line| accounts.contains(&line),
+                DIALOG_STEP,
+            )?;
+            accounts.retain(|account| *account != name);
+        }
         run.expect("# ", DIALOG_STEP)?;
         run.send("echo job-ended & wait; echo wait $?")?;
         run.expect_line("job-ended", |line| line == "job-ended", DIALOG_STEP)?;
@@ -5269,6 +5364,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
+        job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
         job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
         job("posix-lock-ring", || posix_lock_ring_probe(&qemu::VIRT)),
@@ -7321,6 +7417,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-pty",
         "--package",
         "posix-sync-probe",
+        "--package",
+        "posix-resources-probe",
         "--target",
         PROGRAM_TARGET,
         "--",

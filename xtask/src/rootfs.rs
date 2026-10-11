@@ -131,6 +131,28 @@ const ROOT: (u32, u32) = (0, 0);
 /// An owner other than root, for the checks of owners in listings.
 const USER: (u32, u32) = (1000, 100);
 
+/// Account databases are ordinary root-owned files in each shipped image.
+fn accounts() -> [RootFile; 3] {
+    [
+        dir("/etc"),
+        of(
+            "/etc/passwd",
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "passwd",
+                b"root:x:0:0:root:/root:/bin/ash\nuser:x:1000:100:user:/home/user:/bin/ash\nnobody:x:65534:65534:nobody:/:/bin/ash\n",
+            ),
+        ),
+        of(
+            "/etc/group",
+            0o644,
+            ROOT,
+            Source::Bytes("group", b"root:x:0:root\nuser:x:100:user\nnobody:x:65534:nobody\n"),
+        ),
+    ]
+}
+
 /// The probe of the RAM service: itself as a program and as a hard link,
 /// the service as a set-user-ID file of another owner, and a link of the
 /// probe at the longest path (a directory name of 255 bytes, then a file
@@ -380,6 +402,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-lock-fifo.img",
     "boot-posix-spawn-churn.img",
     "boot-posix-sync.img",
+    "boot-posix-resources.img",
     "boot-posix-lock-ring.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
@@ -396,7 +419,7 @@ pub const IMAGES: &[&str] = &[
 
 /// The list of the image `name`: none for an image with no table.
 pub fn files_of(name: &str) -> Vec<RootFile> {
-    match name {
+    let mut files = match name {
         "boot-ramfs.img" => ramfs(),
         "boot-ramfs-cleanup.img"
         | "boot-loader-abort.img"
@@ -452,6 +475,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-lock-fifo.img"
         | "boot-posix-spawn-churn.img"
         | "boot-posix-sync.img"
+        | "boot-posix-resources.img"
         | "boot-posix-lock-ring.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
@@ -498,7 +522,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-tty-vz.img" => posix_tty(),
         "rtbench-posix.img" | "rtbench-posix-vz.img" | "rtbench-posix-short.img" => rtbench(),
         _ => Vec::new(),
-    }
+    };
+    files.extend(accounts());
+    files
 }
 
 /// The sources of the image files the table needs, each once, in the
@@ -598,6 +624,7 @@ mod tests {
             "boot-posix-lock-fifo.img",
             "boot-posix-spawn-churn.img",
             "boot-posix-sync.img",
+            "boot-posix-resources.img",
         ] {
             let files = files_of(image);
             assert!(
@@ -621,6 +648,7 @@ mod tests {
                 "boot-posix-lock-fifo.img" => &crate::POSIX_LOCK_FIFO_PROGRAMS,
                 "boot-posix-spawn-churn.img" => &crate::POSIX_SPAWN_CHURN_PROGRAMS,
                 "boot-posix-sync.img" => &crate::POSIX_SYNC_PROGRAMS,
+                "boot-posix-resources.img" => &crate::POSIX_RESOURCES_PROGRAMS,
                 "boot-posix-lock-ring.img" => &crate::POSIX_LOCK_RING_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
@@ -642,7 +670,7 @@ mod tests {
                 assert!(have.contains(&program), "{image}: {program}");
             }
             // Build and parse each image's real file table, including devices.
-            let total = have.len() as u32;
+            let total = sources(&files).len() as u32;
             let bytes = table(&files, 0, total).unwrap_or_else(|error| panic!("{image}: {error}"));
             Rootfs::parse(&bytes, total).unwrap_or_else(|error| panic!("{image}: {error}"));
             // Every entry has its parent directory in the list.
@@ -651,7 +679,6 @@ mod tests {
                 assert!(parent.is_empty() || files.iter().any(|d| d.path == parent));
             }
         }
-        assert!(files_of("boot.img").is_empty());
         // The longest path of the probe's list is the longest there is.
         let deep = ramfs().iter().map(|f| f.path.len()).max();
         assert_eq!(deep, Some(bootimg::rootfs::PATH_MAX));
@@ -725,6 +752,7 @@ mod tests {
             "boot-posix-lock-fifo.img",
             "boot-posix-spawn-churn.img",
             "boot-posix-sync.img",
+            "boot-posix-resources.img",
             "boot-posix-lock-ring.img",
             "boot-posix-random.img",
             "boot-posix-pty.img",

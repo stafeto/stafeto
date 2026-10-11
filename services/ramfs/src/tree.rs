@@ -27,7 +27,7 @@ pub enum Error {
     /// The image or the table is not well formed.
     Image(bootimg::Error),
     Table(bootimg::rootfs::Error),
-    /// An entry lies at or under `/etc` or `/tmp`, which the service owns.
+    /// An entry replaces fixed `/etc/motd` or lies at or under `/tmp`.
     Reserved(u32),
 }
 
@@ -75,7 +75,10 @@ impl Index {
                         .strip_prefix(root)
                         .is_some_and(|rest| rest.starts_with('/'))
             };
-            if reserved("/etc") || reserved("/tmp") {
+            if reserved("/etc/motd")
+                || reserved("/tmp")
+                || (entry.path == "/etc" && !entry.is_directory())
+            {
                 return Err(Error::Reserved(n as u32));
             }
             let slash = entry.path.rfind('/').unwrap_or(0);
@@ -311,6 +314,110 @@ mod tests {
     }
 
     #[test]
+    fn account_boot_files_merge_into_the_one_fixed_etc_inode() {
+        let entries = [
+            Entry {
+                path: "/etc",
+                mode: DIRECTORY | 0o755,
+                uid: 0,
+                gid: 0,
+                file: 0,
+            },
+            Entry {
+                path: "/etc/conf",
+                mode: DIRECTORY | 0o755,
+                uid: 0,
+                gid: 0,
+                file: 0,
+            },
+            Entry {
+                path: "/etc/group",
+                mode: REGULAR | 0o644,
+                uid: 0,
+                gid: 0,
+                file: 2,
+            },
+            Entry {
+                path: "/etc/passwd",
+                mode: REGULAR | 0o644,
+                uid: 0,
+                gid: 0,
+                file: 1,
+            },
+        ];
+        let passwd = b"root:x:0:0:root:/:/bin/ash\n";
+        let group = b"root:x:0:root\n";
+        let table = bootimg::rootfs::write::rootfs(&entries, 4).unwrap();
+        let bytes = bootimg::write::image(&[
+            ("init", b"init"),
+            ("passwd", passwd),
+            ("group", group),
+            (ROOTFS, &table),
+        ])
+        .unwrap();
+        let mut index = Index::new();
+        let mut ram =
+            crate::Ram::with_tree(proto_fs::Timestamp::ZERO, load(&bytes, &mut index).unwrap());
+        let mut fds = crate::Fds::default();
+        for (path, expected) in [
+            ("/etc/passwd", passwd.as_slice()),
+            ("/etc/group", group.as_slice()),
+            ("/etc/motd", crate::MOTD),
+        ] {
+            let fd = ram.open(&mut fds, path, proto_fs::READ_ONLY).unwrap();
+            let mut out = [0; 128];
+            assert_eq!(
+                ram.read_at(&mut fds, fd, &mut out, proto_fs::Timestamp::ZERO),
+                Ok(expected.len())
+            );
+            assert_eq!(&out[..expected.len()], expected);
+            ram.close(&mut fds, fd).unwrap();
+        }
+        let list = |ram: &mut crate::Ram<'_>, path| {
+            let fd = ram.open(&mut fds, path, proto_fs::READ_ONLY).unwrap();
+            let mut names = alloc::vec::Vec::new();
+            while let Some(record) = ram
+                .directory_read(&mut fds, fd, proto_fs::Timestamp::ZERO)
+                .unwrap()
+            {
+                names.push(record.name().to_vec());
+            }
+            ram.close(&mut fds, fd).unwrap();
+            names
+        };
+        let mut list = list;
+        assert_eq!(
+            list(&mut ram, "/"),
+            [
+                b".".to_vec(),
+                b"..".to_vec(),
+                b"etc".to_vec(),
+                b"tmp".to_vec()
+            ]
+        );
+        assert_eq!(
+            list(&mut ram, "/etc"),
+            [
+                b".".to_vec(),
+                b"..".to_vec(),
+                b"motd".to_vec(),
+                b"conf".to_vec(),
+                b"group".to_vec(),
+                b"passwd".to_vec()
+            ]
+        );
+        assert_eq!(ram.information("/").unwrap().links, 4);
+        assert_eq!(ram.information("/etc").unwrap().links, 3);
+        assert_eq!(ram.information("/etc").unwrap().inode, 2);
+        let info = ram.information("/etc/passwd").unwrap();
+        assert_eq!((info.permissions, info.uid, info.gid), (0o644, 0, 0));
+        assert_eq!(
+            ram.open(&mut fds, "/etc/passwd", proto_fs::WRITE_ONLY),
+            Err(proto_fs::ACCESS_DENIED)
+        );
+    }
+
+    #[test]
     fn a_missing_or_bad_table_and_the_services_own_paths_are_refused() {
         let no_table = bootimg::write::image(&[("init", b"init")]).unwrap();
         assert!(matches!(
@@ -326,14 +433,12 @@ mod tests {
             load(&bad, &mut Index::new()),
             Err(Error::Table(_))
         ));
-        for path in ["/etc", "/tmp"] {
-            let bytes = test_image(&[entry(path, DIRECTORY | 0o755, 0)]);
-            assert!(matches!(
-                load(&bytes, &mut Index::new()),
-                Err(Error::Reserved(0))
-            ));
-        }
-        for path in ["/etc/x", "/tmp/y"] {
+        let bytes = test_image(&[entry("/tmp", DIRECTORY | 0o755, 0)]);
+        assert!(matches!(
+            load(&bytes, &mut Index::new()),
+            Err(Error::Reserved(0))
+        ));
+        for path in ["/etc/motd", "/tmp/y"] {
             let parent = &path[..4];
             let bytes = test_image(&[
                 entry(parent, DIRECTORY | 0o755, 0),

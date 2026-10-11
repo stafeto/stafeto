@@ -645,6 +645,25 @@ pub unsafe extern "C" fn stafeto_exec(
     }
 }
 
+/// Execute one retained file description, returning only a negated errno.
+///
+/// # Safety
+/// `argv` and `envp` are null or NULL-ended arrays of C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fexecve(
+    fd: c_int,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let (argv, envp) = unsafe { (strings(argv), strings(envp)) };
+    let umask = files::umask();
+    match call(|| posix_abi::process::fexec(fd, argv.clone(), envp.clone(), umask)) {
+        Ok(never) => match never {},
+        Err(errno) => -errno,
+    }
+}
+
 /// fork (posix_abi::fork::fork): the child's PID in the parent, 0 in the
 /// child, or the negated errno. The window a probe set
 /// (`stafeto_probe_fork_window`) runs in the parent before ForkCommit.

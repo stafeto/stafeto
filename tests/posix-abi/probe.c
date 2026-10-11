@@ -229,9 +229,23 @@ static int directories(void) {
     if (!entry || !same(entry->d_name, "..", 3) || entry->d_ino != 1) return 67;
     entry = readdir(dir);
     if (!entry || !same(entry->d_name, "motd", 5) || entry->d_ino != 4 || entry->d_type != DT_REG) return 68;
+    unsigned accounts = 0;
+    for (int i = 0; i < 2; i++) {
+        entry = readdir(dir);
+        if (!entry || entry->d_type != DT_REG) return 69;
+        unsigned account = same(entry->d_name, "group", 6) ? 1
+            : same(entry->d_name, "passwd", 7) ? 2 : 0;
+        if (!account || (accounts & account) || stat(entry->d_name, &info)
+                || !S_ISREG(info.st_mode) || entry->d_ino != info.st_ino) return 69;
+        accounts |= account;
+    }
+    long final_cookie = telldir(dir);
+    if (accounts != 3 || final_cookie <= cookie) return 69;
     errno = 123;
-    /* The position after `motd` is its cookie: the third entry of the table, 3 + 2. */
-    if (readdir(dir) != NULL || errno != 123 || telldir(dir) != 5) return 69;
+    if (readdir(dir) != NULL || errno != 123 || telldir(dir) != final_cookie) return 69;
+    seekdir(dir, final_cookie);
+    errno = 123;
+    if (readdir(dir) != NULL || errno != 123 || telldir(dir) != final_cookie) return 69;
     seekdir(dir, cookie);
     entry = readdir(dir);
     if (!entry || !same(entry->d_name, "..", 3)) return 70;

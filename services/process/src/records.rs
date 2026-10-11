@@ -214,6 +214,38 @@ impl<P> Records<P> {
         record.credentials = next;
         Ok(())
     }
+    /// Validate every failure before publishing the process's new limit.
+    pub fn set_limit(
+        &mut self,
+        index: usize,
+        resource: usize,
+        value: proto_process::Limit,
+        generation: u64,
+    ) -> Result<bool, u32> {
+        if !matches!(
+            resource,
+            proto_process::CORE | proto_process::FSIZE | proto_process::NOFILE
+        ) || value.soft > value.hard
+        {
+            return Err(proto_process::INVALID);
+        }
+        if generation & proto_process::GENERATION_DEAD != 0 {
+            return Err(proto_process::NO_PROCESS);
+        }
+        let record = self.get_mut(index).ok_or(proto_process::NO_PROCESS)?;
+        let old = record.limits.values[resource];
+        if value.hard > old.hard && record.credentials.euid != 0 {
+            return Err(proto_process::PERMISSION);
+        }
+        if value == old {
+            return Ok(false);
+        }
+        if !proto_process::generation_room(generation, 1) {
+            return Err(proto_process::AGAIN);
+        }
+        record.limits.values[resource] = value;
+        Ok(true)
+    }
     /// No record, every index free, index 0 on top.
     pub const fn new() -> Self {
         let mut free = [0; RECORDS];
@@ -1746,6 +1778,62 @@ mod tests {
         assert_eq!(t.find_identity(live.identity_at(2)), Some(i));
         assert_eq!(t.find_loader(live.loader_at(3)), Some(i));
         assert_eq!(t.find_pid(live.pid()), Some(i));
+    }
+    #[test]
+    fn limits_privilege_infinity_noop_and_failure_are_atomic() {
+        use proto_process::{CORE, FSIZE, Limit, NOFILE};
+        let mut records = Records::<u32>::new();
+        let parent = add(&mut records).unwrap();
+        let i = parent.index as usize;
+        let initial = records.get(i).unwrap().limits;
+        records.get_mut(i).unwrap().credentials.euid = 1000;
+        assert_eq!(
+            records.set_limit(i, NOFILE, Limit { soft: 32, hard: 33 }, 1),
+            Err(proto_process::PERMISSION)
+        );
+        assert_eq!(records.get(i).unwrap().limits, initial);
+        assert_eq!(
+            records.set_limit(i, NOFILE, Limit { soft: 17, hard: 16 }, 1),
+            Err(proto_process::INVALID)
+        );
+        assert_eq!(records.get(i).unwrap().limits, initial);
+        assert_eq!(
+            records.set_limit(
+                i,
+                NOFILE,
+                initial.values[NOFILE],
+                proto_process::GENERATION_DEAD - 1
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            records.set_limit(
+                i,
+                NOFILE,
+                Limit { soft: 16, hard: 32 },
+                proto_process::GENERATION_DEAD - 1
+            ),
+            Err(proto_process::AGAIN)
+        );
+        assert_eq!(records.get(i).unwrap().limits, initial);
+        records.get_mut(i).unwrap().credentials.euid = 0;
+        for resource in [NOFILE, FSIZE, CORE] {
+            let infinity = Limit {
+                soft: u64::MAX,
+                hard: u64::MAX,
+            };
+            assert_eq!(records.set_limit(i, resource, infinity, 1), Ok(true));
+            assert_eq!(records.get(i).unwrap().limits.values[resource], infinity);
+            assert_eq!(records.set_limit(i, resource, infinity, 1), Ok(false));
+        }
+        let inherited = records.get(i).unwrap().limits;
+        let child = child(&mut records, parent);
+        let ci = child.index as usize;
+        assert_eq!(records.get(ci).unwrap().limits, inherited);
+        records
+            .set_limit(ci, NOFILE, Limit { soft: 16, hard: 16 }, 1)
+            .unwrap();
+        assert_eq!(records.get(i).unwrap().limits, inherited);
     }
     #[test]
     fn child_inherits_groups_finite_limits_and_the_original_expenditure_root() {

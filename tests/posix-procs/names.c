@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <sys/statvfs.h>
+#include <sys/resource.h>
 
 #define NAMES_ROOT "/tmp/nm"
 
@@ -573,7 +574,21 @@ static int names_truncate(void) {
     CHECK(st.st_size == 0);
     /* The errors. */
     FAILS(ftruncate(fd, -1), EINVAL);
-    FAILS(ftruncate(fd, 1LL << 40), EFBIG);
+    /* This assertion tests physical file capacity, independently of FSIZE. */
+    struct rlimit saved_size, restored_size;
+    OK(getrlimit(RLIMIT_FSIZE, &saved_size));
+    const struct rlimit physical_size = {1ULL << 40,
+        saved_size.rlim_max > (1ULL << 40) ? saved_size.rlim_max : (1ULL << 40)};
+    OK(setrlimit(RLIMIT_FSIZE, &physical_size));
+    errno = 0;
+    int oversized = ftruncate(fd, 1LL << 40);
+    int oversized_errno = errno;
+    /* Restore before checking the outcome, including an unexpected success. */
+    OK(setrlimit(RLIMIT_FSIZE, &saved_size));
+    OK(getrlimit(RLIMIT_FSIZE, &restored_size));
+    CHECK(restored_size.rlim_cur == saved_size.rlim_cur
+        && restored_size.rlim_max == saved_size.rlim_max);
+    CHECK(oversized == -1 && oversized_errno == EFBIG);
     OK(fstat(fd, &st));
     CHECK(st.st_size == 0);
     CHECK(close(fd) == 0);
@@ -775,7 +790,8 @@ static int names_directories(void) {
 }
 
 /* The records of posix_getdents. The directories that the service lists
- * are the fixed ones and those of the boot image: /etc holds `motd`, the root
+ * are the fixed ones and those of the boot image: /etc holds `motd`, `group`
+ * and `passwd`; the root
  * holds `etc` and `tmp`. The listing of a directory made at run time is the
  * next section. */
 static int names_entries(void) {
@@ -808,37 +824,58 @@ static int names_entries(void) {
     CHECK(lseek(fd, 0, SEEK_SET) == 0);
     ssize_t total = posix_getdents(fd, buffer.bytes, sizeof buffer, 0);
     CHECK(total > 0);
-    int dots = 0, dotdots = 0, motds = 0, count = 0;
+    int dots = 0, dotdots = 0, motds = 0, groups = 0, passwds = 0, count = 0;
     ssize_t used = 0;
     while (used < total) {
         record = (struct posix_dent *)(buffer.bytes + used);
-        CHECK(record->d_reclen >= 24 && record->d_reclen % 8 == 0);
+        CHECK(total - used >= 24);
+        CHECK(record->d_reclen >= 24 && record->d_reclen % 8 == 0
+            && record->d_reclen <= total - used);
+        CHECK(memchr(record->d_name, 0, record->d_reclen - 19) != NULL);
         CHECK(record->d_reclen >= 19 + strlen(record->d_name) + 1);
         CHECK(record->d_ino != 0);
         if (!strcmp(record->d_name, ".")) { dots++; CHECK(record->d_type == DT_DIR); }
         else if (!strcmp(record->d_name, "..")) { dotdots++; CHECK(record->d_type == DT_DIR); }
         else if (!strcmp(record->d_name, "motd")) { motds++; CHECK(record->d_type == DT_REG); }
+        else if (!strcmp(record->d_name, "group")) { groups++; CHECK(record->d_type == DT_REG); }
+        else if (!strcmp(record->d_name, "passwd")) { passwds++; CHECK(record->d_type == DT_REG); }
         else CHECK(0);
         used += record->d_reclen;
         count++;
     }
-    CHECK(used == total && count == 3 && dots == 1 && dotdots == 1 && motds == 1);
-    /* The end is 0, and stays. */
-    CHECK(posix_getdents(fd, buffer.bytes, sizeof buffer, 0) == 0);
-    CHECK(posix_getdents(fd, buffer.bytes, sizeof buffer, 0) == 0);
-    /* One record at a time reaches the same three. */
+    CHECK(used == total && count == 5 && dots == 1 && dotdots == 1
+        && motds == 1 && groups == 1 && passwds == 1);
+    /* The end is 0, and the offset and errno stay. */
+    at = lseek(fd, 0, SEEK_CUR);
+    CHECK(at > 0);
+    errno = 123;
+    CHECK(posix_getdents(fd, buffer.bytes, sizeof buffer, 0) == 0 && errno == 123);
+    CHECK(lseek(fd, 0, SEEK_CUR) == at);
+    CHECK(posix_getdents(fd, buffer.bytes, sizeof buffer, 0) == 0 && errno == 123);
+    CHECK(lseek(fd, 0, SEEK_CUR) == at);
+    /* One record at a time reaches the same five exactly once. */
     CHECK(lseek(fd, 0, SEEK_SET) == 0);
-    count = 0;
+    count = dots = dotdots = motds = groups = passwds = 0;
     for (;;) {
         ssize_t got = posix_getdents(fd, buffer.bytes, 32, 0);
         CHECK(got >= 0);
         if (got == 0) break;
         record = (struct posix_dent *)buffer.bytes;
-        CHECK((size_t)got == record->d_reclen);
+        CHECK(got >= 24 && got <= 32 && (size_t)got == record->d_reclen
+            && record->d_reclen % 8 == 0);
+        CHECK(memchr(record->d_name, 0, record->d_reclen - 19) != NULL);
+        CHECK(record->d_ino != 0);
+        if (!strcmp(record->d_name, ".")) { dots++; CHECK(record->d_type == DT_DIR); }
+        else if (!strcmp(record->d_name, "..")) { dotdots++; CHECK(record->d_type == DT_DIR); }
+        else if (!strcmp(record->d_name, "motd")) { motds++; CHECK(record->d_type == DT_REG); }
+        else if (!strcmp(record->d_name, "group")) { groups++; CHECK(record->d_type == DT_REG); }
+        else if (!strcmp(record->d_name, "passwd")) { passwds++; CHECK(record->d_type == DT_REG); }
+        else CHECK(0);
         count++;
-        CHECK(count < 20);
+        CHECK(count <= 5);
     }
-    CHECK(count == 3);
+    CHECK(count == 5 && dots == 1 && dotdots == 1
+        && motds == 1 && groups == 1 && passwds == 1);
     CHECK(close(fd) == 0);
     FAILS(posix_getdents(fd, buffer.bytes, sizeof buffer, 0), EBADF);
     /* The root: `etc` and `tmp` are directories. */

@@ -58,16 +58,25 @@ enum Admission {
 
 /// Admission and backend selection share one table lock.
 pub(crate) fn close(fd: u32) -> Result<(), i32> {
-    operation(fd, None).map(|_| ())
+    operation(fd, None, false).map(|_| ())
 }
 pub(crate) fn replace(
     source: u32,
     target: u32,
     flags: Option<DescriptorFlags>,
 ) -> Result<u32, i32> {
-    operation(target, Some((source, flags)))
+    operation(target, Some((source, flags)), false)
 }
-fn operation(fd: u32, replacement: Option<(u32, Option<DescriptorFlags>)>) -> Result<u32, i32> {
+/// An implementation-owned descriptor must publish cleanup before its caller
+/// releases signal deferral. Retry only Full, never a post-admission error.
+pub(crate) fn close_owned(fd: u32) -> Result<(), i32> {
+    operation(fd, None, true).map(|_| ())
+}
+fn operation(
+    fd: u32,
+    replacement: Option<(u32, Option<DescriptorFlags>)>,
+    wait_for_admission: bool,
+) -> Result<u32, i32> {
     let owner = crate::relibc::open_owner()
         .ok()
         .and_then(|owner| OwnerToken::new(owner).ok());
@@ -131,7 +140,10 @@ fn operation(fd: u32, replacement: Option<(u32, Option<DescriptorFlags>)>) -> Re
             }
             Admission::Full => {
                 if !help_once() {
-                    return Err(EMFILE);
+                    if !wait_for_admission {
+                        return Err(EMFILE);
+                    }
+                    let _ = rt::sys::yield_now();
                 }
             }
         }

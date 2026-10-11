@@ -91,6 +91,60 @@ impl Client {
         let mut buffer = [0; 64];
         Self::snapshot(self.call(&Method::Query.header().bytes(), &mut buffer)?)
     }
+    pub fn limit(&self, resource: usize) -> Result<proto_process::Limit, Status> {
+        let mut w = Writer::new();
+        Method::GetLimit.header().write(&mut w)?;
+        w.u32(resource as u32)?;
+        let mut buffer = [0; 64];
+        let mut r = Reader::new(self.call(w.as_bytes(), &mut buffer)?);
+        r.u32()?;
+        let value = proto_process::Limit {
+            soft: r.u64()?,
+            hard: r.u64()?,
+        };
+        r.finish()?;
+        if value.soft > value.hard {
+            return Err(Status::BadSize);
+        }
+        Ok(value)
+    }
+    pub fn set_limit(&self, resource: usize, value: proto_process::Limit) -> Result<(), Status> {
+        let mut w = Writer::new();
+        Method::SetLimit.header().write(&mut w)?;
+        w.u32(resource as u32)?;
+        w.u64(value.soft)?;
+        w.u64(value.hard)?;
+        let mut buffer = [0; 64];
+        if self.call(w.as_bytes(), &mut buffer)? != proto_wire::reply(Status::Ok) {
+            return Err(Status::BadSize);
+        }
+        Ok(())
+    }
+    pub fn groups(&self) -> Result<proto_process::Groups, Status> {
+        let mut groups = proto_process::Groups::EMPTY;
+        for first in [0, 8] {
+            let mut w = Writer::new();
+            Method::GetGroups.header().write(&mut w)?;
+            w.u32(first as u32)?;
+            let mut buffer = [0; 64];
+            let mut r = Reader::new(self.call(w.as_bytes(), &mut buffer)?);
+            r.u32()?;
+            let count = r.u32()?;
+            if first == 0 {
+                groups.count = count;
+            } else if count != groups.count {
+                return Err(Status::BadSize);
+            }
+            for id in &mut groups.ids[first..first + 8] {
+                *id = r.u32()?;
+            }
+            r.finish()?;
+        }
+        if !groups.valid() {
+            return Err(Status::BadSize);
+        }
+        Ok(groups)
+    }
     /// Change: the service changes the record's credentials once, whatever
     /// signals come while the caller waits for the reply.
     pub fn change(&self, operation: Change, id: u32) -> Result<(), Status> {

@@ -331,6 +331,7 @@ mod auth_probe;
 /// is ready and the record too. None when the loader gives up.
 fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Option<Done> {
     let mut block_len = None;
+    let mut exec_source: Option<(Handle<Channel>, rt::fs::PreparedOpen)> = None;
     let mut loaded: Option<(u64, Handle<Channel>, Maps)> = None;
     let mut fork: Option<(Fork, &'static mut Scratch)> = None;
     let mut copied = false;
@@ -438,6 +439,45 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             _ => Status::BadSize.code(),
                         }
                     }
+                    Some(Method::StartExecFd) if first && terminal_actions.is_none() => {
+                        let memory = handles.take::<Memory>(0).ok();
+                        let source = handles.take::<Channel>(1).ok();
+                        match (r.u32(), r.u32(), r.u64(), memory, source, r.finish()) {
+                            (
+                                Ok(len),
+                                Ok(packed),
+                                Ok(generation),
+                                Some(memory),
+                                Some(source),
+                                Ok(()),
+                            ) if handles.len() == 2
+                                && generation != 0
+                                && packed
+                                    & !(proto_fs::OPEN_FD_MASK
+                                        | proto_fs::OPEN_DESCRIPTION_MASK)
+                                    == 0 =>
+                            {
+                                match stage(own, &memory, len as usize) {
+                                    Ok(len) => {
+                                        block_len = Some(len);
+                                        exec_source = Some((
+                                            source,
+                                            rt::fs::PreparedOpen {
+                                                fd: packed & proto_fs::OPEN_FD_MASK,
+                                                slot: (packed & proto_fs::OPEN_DESCRIPTION_MASK)
+                                                    >> proto_fs::OPEN_DESCRIPTION_SHIFT,
+                                                generation,
+                                                random: false,
+                                            },
+                                        ));
+                                        0
+                                    }
+                                    Err(status) => status.code(),
+                                }
+                            }
+                            _ => Status::BadSize.code(),
+                        }
+                    }
                     Some(Method::Fork) if first => match Fork::read(r) {
                         Ok(body) if handles.is_empty() => match scratch(own) {
                             Ok(scratch) => {
@@ -530,7 +570,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             reply(token, Status::BadSize.code());
                             return None;
                         }
-                        match load(own, &block).and_then(|done| {
+                        match load(own, &block, exec_source.take()).and_then(|done| {
                             if completed {
                                 tell_ready(session)?;
                             }
@@ -1162,13 +1202,27 @@ fn code(e: Error) -> u32 {
 /// its stack and its start area: the program's entry, the image session
 /// and the memory map (a narrowed handle of each object it mapped), or the
 /// code of why not.
-fn load(own: &Own, block: &Block<'_>) -> Result<(u64, Handle<Channel>, Maps), u32> {
-    let mut path = [0; pl::PATH_MAX];
-    let path = block.full_path(&mut path).map_err(|e| match e {
-        BlockError::NameTooLong => pl::NAME_TOO_LONG,
-        _ => pl::NO_ENTRY,
-    })?;
-    let image = open(own, path)?;
+fn load(
+    own: &Own,
+    block: &Block<'_>,
+    source: Option<(Handle<Channel>, rt::fs::PreparedOpen)>,
+) -> Result<(u64, Handle<Channel>, Maps), u32> {
+    let image = if let Some((source, held)) = source {
+        let files = core::mem::ManuallyDrop::new(rt::fs::Files::from_sessions(
+            Handle::from_raw(own.files.raw()),
+            None,
+        ));
+        files
+            .open_exec_fd(source, held, &own.identity)
+            .map_err(exec_status)?
+    } else {
+        let mut path = [0; pl::PATH_MAX];
+        let path = block.full_path(&mut path).map_err(|e| match e {
+            BlockError::NameTooLong => pl::NAME_TOO_LONG,
+            _ => pl::NO_ENTRY,
+        })?;
+        open(own, path)?
+    };
     let size = file_size(own, &image)?;
     let mut head = [0; PAGE as usize];
     let read = read_at(&image, 0, &mut head[..size.min(PAGE) as usize])?;
@@ -1217,14 +1271,18 @@ fn open(own: &Own, path: &[u8]) -> Result<Handle<Channel>, u32> {
         Handle::from_raw(own.files.raw()),
         None,
     ));
-    files.open_exec(path, &own.identity).map_err(|s| match s {
+    files.open_exec(path, &own.identity).map_err(exec_status)
+}
+
+fn exec_status(s: Status) -> u32 {
+    match s {
         Status::Unknown(proto_fs::NO_ENTRY) => pl::NO_ENTRY,
         Status::Unknown(proto_fs::ACCESS_DENIED) => pl::ACCESS,
         Status::Unknown(proto_fs::NOT_DIRECTORY) => pl::NOT_DIRECTORY,
         Status::Unknown(proto_fs::PERMISSION) => pl::PERMISSION,
         Status::Unknown(proto_fs::NAME_TOO_LONG) => pl::NAME_TOO_LONG,
         _ => pl::IO,
-    })
+    }
 }
 
 /// The size of the file of the image session.
