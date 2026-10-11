@@ -238,7 +238,7 @@ mod ring {
     }
 }
 
-#[cfg(feature = "lock-full-ring")]
+#[cfg(any(feature = "lock-full-ring", feature = "lock-full-ofd"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn full_row_valid(pages: *const [[u64; 6]; 20]) -> i32 {
     if pages.is_null() {
@@ -268,7 +268,7 @@ pub extern "C" fn full_ring_method_mask() -> u32 {
 }
 
 /// Close wire domains are independent of local ClosingToken physical slots.
-#[cfg(feature = "lock-full-close")]
+#[cfg(any(feature = "lock-full-close", feature = "lock-full-ofd"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn full_close_key_valid(slot: u32, generation: u64) -> i32 {
     if (proto_fs::CloseKey { slot, generation }).validate().is_ok() {

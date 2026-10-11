@@ -16,6 +16,12 @@
 extern int full_telemetry(unsigned, unsigned, uint64_t, uint64_t, unsigned, uint64_t[6]);
 extern int full_identity(unsigned, uint64_t[4]);
 extern int full_source(unsigned, uint64_t[2]);
+#ifndef FULL_OFD
+#define FULL_OFD 0
+#endif
+#if FULL_OFD
+static int ofd_primary = -1, ofd_alias = -1;
+#endif
 #ifndef FULL_RING
 #define FULL_RING 0
 #endif
@@ -210,10 +216,16 @@ static int drained(int fd) {
 }
 static int set(int fd, short kind, unsigned segment) {
     struct flock lock = {.l_type = kind, .l_whence = SEEK_SET, .l_start = (off_t)(2 * segment), .l_len = 1};
+#if FULL_OFD
+    if (fd == ofd_primary) return fcntl(fd, F_OFD_SETLK, &lock);
+#endif
     return fcntl(fd, F_SETLK, &lock);
 }
 #if FULL_CAPACITY
 #include "lock-full-capacity.c"
+#endif
+#if FULL_OFD
+static int ofd_hold(int fd, unsigned index, struct record *record);
 #endif
 static int hold(unsigned local) {
     unsigned index = first(family) + local;
@@ -252,6 +264,15 @@ static int hold(unsigned local) {
         if (sigaction(SIGUSR1, &action, NULL)) return fail("pre-Begin wake handler", index);
     }
 #endif
+#if FULL_OFD
+    if (!index) {
+        uint64_t alias_source[2];
+        ofd_primary = fd; ofd_alias = dup(fd);
+        if (ofd_alias < 0 || full_source((unsigned)ofd_alias, alias_source)
+            || memcmp(alias_source, r.source, sizeof(alias_source)) || pwrite(fd, "Q", 1, 0) != 1)
+            return fail("real OFD alias and read byte", index);
+    }
+#endif
     for (unsigned s = 0; s < r.count; ++s) {
         if (drained(fd) || set(fd, F_WRLCK, s)) return fail("real SET", index);
     }
@@ -266,6 +287,9 @@ static int hold(unsigned local) {
 #else
     if (index < 16 && ring_wait(fd, target, index, &r)) return 1;
 #endif
+#endif
+#if FULL_OFD
+    if (!index) return ofd_hold(fd, index, &r);
 #endif
     if (gate("/tmp/lock-full-stop")) return fail("Stop gate", index);
     uint64_t exact[2];
@@ -463,6 +487,9 @@ static int ring_rows(int fd, uint64_t epoch) {
 #if FULL_CLOSE
 #include "lock-full-close.c"
 #endif
+#if FULL_OFD
+#include "lock-full-ofd.c"
+#endif
 static int coordinator(void) {
     int fd = open("/tmp/lock-full-controller", O_RDWR);
     if (fd < 0) return fail("controller open", 0);
@@ -481,7 +508,7 @@ static int coordinator(void) {
         for (unsigned old = 0; old < f; ++old) if (launchers[old] == r.pid) return fail("distinct launchers", f);
     }
     struct record records[20] = {{0}};
-#if FULL_WAKE
+#if FULL_WAKE || FULL_OFD
     int wake_witness = -1;
     uint64_t wake_source[2] = {0};
 #endif
@@ -501,10 +528,10 @@ static int coordinator(void) {
         if (source < 0 || fstat(source, &st) || (uint64_t)st.st_ino != r->inode) return fail("witness inode", i);
         for (unsigned edge = 0; edge < 2; ++edge) {
             struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = (off_t)(edge ? 2 * (r->count - 1) : 0), .l_len = 1};
-            if (fcntl(source, F_GETLK, &lock) || lock.l_type != F_WRLCK || lock.l_pid != (pid_t)r->pid)
+            if (fcntl(source, F_GETLK, &lock) || lock.l_type != F_WRLCK || lock.l_pid != (FULL_OFD && !i ? -1 : (pid_t)r->pid))
                 return fail("foreign PID GETLK real critical/filler", i);
         }
-#if FULL_WAKE
+#if FULL_WAKE || FULL_OFD
         if (!i) {
             if (full_source((unsigned)source, wake_source)) return fail("wake witness full source", i);
             wake_witness = source;
@@ -526,6 +553,11 @@ static int coordinator(void) {
     if (full_telemetry((unsigned)fd, 6, 0, 0, 0, out) != -304
         || full_telemetry((unsigned)fd, 6, cookie, 0, 1, out) != -310)
         return fail("identity rejects zero nonce and stale source", 0);
+#endif
+#if FULL_OFD
+    if (ofd_before(wake_witness, &records[0]) || close(fd)) return 1;
+    fd = dup(wake_witness);
+    if (fd < 0) return fail("exact witness Scope local alias", 0);
 #endif
     if (full_telemetry((unsigned)fd, 0, cookie, 0, profile, out) || out[0] != 1 || out[1] != profile || out[2] != 32 || out[3] != 1 || out[4] || out[5] != 1)
         return fail("Begin stable witness", 0);
@@ -556,6 +588,9 @@ static int coordinator(void) {
     if (ring_capture(fd, epoch, records)) return 1;
 #endif
 #endif
+#if FULL_OFD
+    if (ofd_capture(fd, wake_witness, epoch, &records[0])) return 1;
+#endif
     if (full_telemetry((unsigned)fd, 2, cookie, epoch, 0, out) || out[0] != epoch
         || out[1] != profile || out[2] != 32 || out[3] || out[4] || out[5] != epoch)
         return fail("Stop capture exact successful state", 0);
@@ -570,12 +605,15 @@ static int coordinator(void) {
     if (close_rows(fd, epoch, &records[0])) return 1;
 #endif
 #endif
+#if FULL_OFD
+    if (ofd_rows(fd, epoch, &records[0])) return 1;
+#endif
     printf("lock-full: %s profile=%u participating=%u owners=%u published=256 private=0 retired=0 common=128 payers=8 epoch=%llu\n",
-           FULL_RING ? "initial" : "stable", profile, profile, first(8), (unsigned long long)epoch);
+           (FULL_RING || FULL_OFD) ? "initial" : "stable", profile, profile, first(8), (unsigned long long)epoch);
     #if FULL_CAPACITY
     if (close(observer_source)) return fail("observer close after Stop", 16);
 #endif
-#if FULL_WAKE
+#if FULL_WAKE || FULL_OFD
     if (close(wake_witness)) return fail("wake witness close after Stop", 0);
 #endif
     if (close(fd) || publish("/tmp/lock-full-stop", NULL, 0)) return fail("release owners after Stop", 0);

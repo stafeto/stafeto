@@ -605,7 +605,9 @@ const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10
         &["table-posix-lock-full7"]
     };
     programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
-    programs[5].3 = if phase == 5 {
+    programs[5].3 = if phase == 6 {
+        &["lock-full-ofd"]
+    } else if phase == 5 {
         &["lock-full-close"]
     } else if phase == 4 {
         &["lock-full-death"]
@@ -628,6 +630,8 @@ const POSIX_LOCK_FULL4_CAPACITY_PROGRAMS: [ImageProgram; 10] = posix_lock_full_p
 const POSIX_LOCK_FULL7_CAPACITY_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 2);
 const POSIX_LOCK_FULL4_WAKE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 3);
 const POSIX_LOCK_FULL7_WAKE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 3);
+const POSIX_LOCK_FULL4_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 6);
+const POSIX_LOCK_FULL7_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 6);
 const POSIX_LOCK_FULL4_CLOSE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 5);
 const POSIX_LOCK_FULL7_CLOSE_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 5);
 const POSIX_LOCK_FULL4_DEATH_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 4);
@@ -1387,7 +1391,10 @@ fn main() {
             [profile, mode] if (profile == "4" || profile == "7") && mode == "close" => {
                 posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 5)
             }
-            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close]".to_owned()),
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "ofd" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 6)
+            }
+            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd]".to_owned()),
         },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -3291,6 +3298,14 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
             "boot-posix-lock-full4-wake.img",
             &POSIX_LOCK_FULL4_WAKE_PROGRAMS,
         ),
+        (4, 6) => (
+            "boot-posix-lock-full4-ofd.img",
+            &POSIX_LOCK_FULL4_OFD_PROGRAMS,
+        ),
+        (7, 6) => (
+            "boot-posix-lock-full7-ofd.img",
+            &POSIX_LOCK_FULL7_OFD_PROGRAMS,
+        ),
         (4, 5) => (
             "boot-posix-lock-full4-close.img",
             &POSIX_LOCK_FULL4_CLOSE_PROGRAMS,
@@ -3371,6 +3386,18 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
             &format!(
                 "lock-full: wake profile={profile} sleeping=16 successes=16 published=254 private=0 retired=0 common=127 payers=8"
             ),
+        )?;
+    }
+    if phase == 6 {
+        qemu::expect_marker(
+            &outcome,
+            &format!(
+                "lock-full: ofd loan profile={profile} published=244 private=0 retired=0 common=116 payers=8 first-alias=retained last-fd=retired read=Q replay=2"
+            ),
+        )?;
+        qemu::expect_marker(
+            &outcome,
+            &format!("lock-full: ofd effect profile={profile}"),
         )?;
     }
     if phase == 5 {
@@ -7571,8 +7598,17 @@ mod tests {
             .lines()
             .filter(|line| line.contains("posix-abi/close-probe"))
             .collect();
-        assert_eq!(close_features.len(), 1);
-        assert!(close_features[0].starts_with("lifetime-probe = "));
+        assert_eq!(close_features.len(), 2);
+        assert!(
+            close_features
+                .iter()
+                .any(|line| line.starts_with("lifetime-probe = "))
+        );
+        assert!(
+            close_features
+                .iter()
+                .any(|line| line.starts_with("lock-full-ofd = "))
+        );
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe", "steps"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[5].3, &["lifetime-probe"]);
