@@ -14,6 +14,12 @@ class Invalid(ValueError):
     pass
 
 
+class SpaceShortage(Invalid):
+    """Validated CFI cannot fit the original read-only envelope."""
+
+    pass
+
+
 def require(condition, message):
     if not condition:
         raise Invalid(message)
@@ -278,11 +284,13 @@ class Elf:
         at = 0
         cies = {}
         result = []
+        terminated = False
         while at < len(frame):
             require(at + 4 <= len(frame), "truncated EH frame")
             size = struct.unpack_from('<I', frame, at)[0]
             if not size:
                 require(not any(frame[at:]), "data after EH terminator")
+                terminated = True
                 break
             require(size != 0xffffffff and size >= 4 and at + size + 4 <= len(frame), "unsupported EH record")
             raw = frame[at:at + size + 4]
@@ -310,6 +318,7 @@ class Elf:
                 require(augmentation == 0 and span > 0, "unsupported FDE augmentation/range")
                 result.append(Fde(at, raw, cie, start, span, raw[cursor:]))
             at += size + 4
+        require(terminated, "missing EH terminator")
         return result
 
 
@@ -757,17 +766,25 @@ def repack(elf, records, changed):
             rebuilt.extend(raw)
             fdes[record.start] = (record, position)
     rebuilt.extend(b'\0' * 4)
+    used = sum(len(record.raw) for record in records) + 4
+    reserved = elf.frame.size - used
+    require(0 <= reserved <= 512, 'unsupported EH zero reservation')
+    # A linker-reserved envelope remains allocated in its entirety.
+    if reserved and len(rebuilt) <= elf.frame.size:
+        rebuilt.extend(b'\0' * (elf.frame.size - len(rebuilt)))
     # No allocated address, text byte, writable byte or page allocation may move.
     old_end = elf.frame.address + elf.frame.size
     new_end = elf.frame.address + len(rebuilt)
     require(new_end >= old_end, "unexpected EH shrink")
     following = [s.address for s in elf.sections.values() if s.flags & 2 and s.address >= old_end and s.index != elf.frame.index]
-    require(following and new_end <= min(following), "EH repair overlaps another section")
+    require(following and old_end <= min(following), "EH input overlaps another section")
     matching = [(i, h) for i, h in enumerate(elf.headers) if h[0] == 1 and h[1] == 4 and h[3] <= elf.frame.address and old_end == h[3] + h[6]]
     require(len(matching) == 1, "EH section is not final read-only segment data")
     index, header = matching[0]
-    require(header[5] == header[6] and (new_end + 4095) // 4096 == (old_end + 4095) // 4096,
-            "EH repair changes read-only page budget")
+    require(header[5] == header[6], "EH read-only file/memory sizes disagree")
+    if (new_end + 4095) // 4096 != (old_end + 4095) // 4096:
+        raise SpaceShortage("EH repair changes read-only page budget")
+    require(new_end <= min(following), "EH repair overlaps another section")
     destination_end = elf.frame.offset + len(rebuilt)
     require(destination_end <= len(elf.data) and not any(elf.data[elf.frame.offset + elf.frame.size:destination_end]),
             "EH repair needs unavailable zero padding")

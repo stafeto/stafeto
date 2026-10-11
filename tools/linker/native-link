@@ -7,10 +7,11 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
 sys.dont_write_bytecode = True
 
-from cfi import Invalid, normalize_file, require
+from cfi import Invalid, SpaceShortage, normalize_file, require
 
 
 def llvm_tools(explicit):
@@ -57,7 +58,19 @@ def main(arguments):
     if status:
         return status
     try:
-        normalize_file(output, objdump)
+        try:
+            normalize_file(output, objdump)
+        except SpaceShortage:
+            # Exactly one retry, only after complete metadata/instruction validation.
+            # The generated script reserves bounded zero capacity in the original EH.
+            with tempfile.TemporaryDirectory(prefix='stafeto-eh-') as directory:
+                script = Path(directory) / 'reserve.ld'
+                script.write_text('SECTIONS { .eh_frame : { *(.eh_frame) . += 512; } } INSERT AFTER .eh_frame_hdr;\n')
+                status = subprocess.run([str(linker), *arguments, '-T', str(script)]).returncode
+                if status:
+                    output.unlink(missing_ok=True)
+                    return status
+                normalize_file(output, objdump)
     except BaseException:
         # A failed link must not leave a usable, unverified final Cargo artifact.
         output.unlink(missing_ok=True)

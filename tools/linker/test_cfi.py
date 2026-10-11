@@ -323,6 +323,38 @@ class LinkedInstructionTests(unittest.TestCase):
         with self.assertRaisesRegex(Invalid, 'overlaps another section'):
             normalize_bytes(bytes(broken), self.instructions)
 
+    def test_linker_zero_reservation_preserves_envelope(self):
+        script = self.root / 'reserve.ld'
+        script.write_text('SECTIONS { .eh_frame : { *(.eh_frame) . += 512; } } INSERT AFTER .eh_frame_hdr;\n')
+        target = self.root / 'reserved.elf'
+        subprocess.run([*self.linker, '-e', 'caller', '--eh-frame-hdr', '-zseparate-loadable-segments', '-zmax-page-size=4096', '-T', str(script), str(self.root / 'fixture.o'), '-o', str(target)], check=True)
+        original = target.read_bytes()
+        elf = Elf(original)
+        used = sum(len(record.raw) for record in elf.records()) + 4
+        self.assertEqual(elf.frame.size - used, 512)
+        fixed, _ = normalize_bytes(original, disassemble(target, self.objdump))
+        repaired = Elf(fixed)
+        self.assertEqual(elf.headers, repaired.headers)
+        self.assertEqual(elf.frame.size, repaired.frame.size)
+        for name in ('.text', '.data', '.bss'):
+            if name in elf.sections and elf.sections[name].kind != 8:
+                before, after = elf.sections[name], repaired.sections[name]
+                self.assertEqual((before.address, before.size), (after.address, after.size))
+                self.assertEqual(elf.slice(before.offset, before.size), repaired.slice(after.offset, after.size))
+        self.assertEqual(normalize_bytes(fixed, disassemble(target, self.objdump))[0], fixed)
+        target.write_bytes(fixed)
+        subprocess.run([self.dwarfdump, '--verify', str(target)], check=True, stdout=subprocess.DEVNULL)
+        broken = bytearray(original)
+        broken[elf.frame.offset + elf.frame.size - 1] = 1
+        with self.assertRaisesRegex(Invalid, 'data after EH terminator'):
+            normalize_bytes(bytes(broken), self.instructions)
+        # Removing the original terminator must not turn the reserve into a record.
+        import struct
+        broken = bytearray(original)
+        struct.pack_into('<I', broken, elf.frame.offset + used - 4, 0xffffffff)
+        with self.assertRaisesRegex(Invalid, 'unsupported EH record'):
+            normalize_bytes(bytes(broken), self.instructions)
+
     def test_atomic_file_result(self):
         target = self.root / 'atomic.elf'
         target.write_bytes(self.original)
