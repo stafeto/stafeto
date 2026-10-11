@@ -329,9 +329,10 @@ class LinkedInstructionTests(unittest.TestCase):
         source = source.replace('.cfi_restore 20\nret\n.cfi_endproc', '.cfi_restore 20\nret\nprefix_exit:\nmov w0,#1\nret\n.cfi_endproc')
         data, instructions = self.changed_fixture(source)
         fixed, _ = normalize_bytes(data, instructions)
-        bad, bad_instructions = self.changed_fixture(source.replace(prefix, 'mov x19,x0\n'+prefix))
-        with self.assertRaisesRegex(Invalid, 'changed caller entry context'):
-            normalize_bytes(bad, bad_instructions)
+        for before in ('mov x19,x0', 'str x9,[x0]', 'sub sp,sp,#16\nadd sp,sp,#16'):
+            bad, bad_instructions = self.changed_fixture(source.replace(prefix, before+'\n'+prefix))
+            with self.assertRaisesRegex(Invalid, 'changed caller entry context'):
+                normalize_bytes(bad, bad_instructions)
         for wrong in ('b spill_caller', 'sub sp,sp,#16', 'mov x19,x0', 'mov x30,x0', 'bl leaf'):
             with self.subTest(wrong=wrong):
                 bad, instructions = self.changed_fixture(source.replace('prefix_exit:\nmov w0,#1', 'prefix_exit:\n'+wrong))

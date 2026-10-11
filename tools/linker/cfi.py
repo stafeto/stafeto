@@ -454,12 +454,13 @@ def prove_lr_store(fde, call_pc, after, instructions, targets):
     sp = 0
     saved = None
     prefix_writes = set()
+    prefix_store = False
     for pc in range(fde.start, call_pc, 4):
         require(pc in instructions, 'missing caller prologue instruction')
         mnemonic, operands = instructions[pc]
         require(pc == fde.start or pc not in targets, 'branch into caller LR prologue')
         if mnemonic.startswith('b.') or mnemonic in ('cbz', 'cbnz', 'tbz', 'tbnz'):
-            require(saved is None and sp == 0 and not (prefix_writes & set(range(19, 31))),
+            require(saved is None and sp == 0 and not prefix_store and not (prefix_writes & set(range(19, 32))),
                     'prefix branch follows changed caller entry context')
             prove_finite_prefix_exit(fde, pc, call_pc, instructions)
             continue
@@ -474,6 +475,7 @@ def prove_lr_store(fde, call_pc, after, instructions, targets):
             require(saved is None, 'SP changed after proved LR store')
             continue
         stores = {'str', 'strb', 'strh', 'stur', 'sturb', 'sturh', 'stp', 'stlr', 'stlrb'}
+        prefix_store |= mnemonic in stores
         if mnemonic not in stores:
             require(31 not in destinations, 'unproved caller SP change')
             continue
