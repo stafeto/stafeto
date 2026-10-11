@@ -345,6 +345,9 @@ def branch_targets(instructions):
 
 def written_registers(mnemonic, operands):
     """Explicit destinations, including paired loads and memory writeback."""
+    if mnemonic == 'movi':
+        require(operands == 'v0.2d, #0000000000000000', 'unsupported vector MOVI destination or value')
+        return {64}
     no_write = {'nop', 'cmp', 'cmn', 'tst', 'ret', 'b', 'br', 'cbz', 'cbnz',
                 'tbz', 'tbnz', 'dmb', 'dsb', 'isb', 'clrex'}
     one_write = {'add', 'adds', 'sub', 'subs', 'bics', 'and', 'ands', 'orr', 'eor', 'bic', 'mov', 'movk',
@@ -610,8 +613,16 @@ def prove_preframe_graph(fde, first_save, instructions):
             require(op not in ('bl', 'blr', 'br', 'svc') and
                     not (written_registers(op, args) & set(range(19, 32))),
                     'preframe graph changes caller SP/LR/callee context')
-            require(not re.search(r'\b(?:sp|x29|w29)\b', args),
+            require(not re.search(r'\b(?:sp|wsp|x29|w29)\b', args),
                     'preframe graph uses a frame-derived address')
+            if op.startswith('st'):
+                memory = re.fullmatch(r'(.*), \[(x\d+)(?:, #0x[0-9a-f]+)?\]', args)
+                require(op in ('str', 'strb', 'stp', 'stlr') and memory is not None,
+                        'unsupported preframe object-store form')
+                names = [name.strip() for name in memory[1].split(',')]
+                require(len(names) == (2 if op == 'stp' else 1) and
+                        all(re.fullmatch(r'[xw](?:\d+|zr)', name) for name in names),
+                        'unsupported preframe object-store width')
             edges = [pc + 4]
         graph[pc] = edges
         pending.extend(edges)
@@ -636,7 +647,7 @@ def prove_preframe_graph(fde, first_save, instructions):
             target = re.search(r'0x([0-9a-f]+)(?=\s*(?:<|$))', args)
             require(target is not None, 'unknown preframe incoming edge')
             destination = int(target[1], 16)
-            require(destination not in graph or destination == fde.start or source in graph,
+            require(not (fde.start < destination <= first_save) or source in graph,
                     'foreign entry into preframe graph')
     return first_save
 

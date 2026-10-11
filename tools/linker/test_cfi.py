@@ -585,7 +585,7 @@ ret
             self.assertEqual(row_at(events(before.program,start,before.cie.code),pc,before.cie.initial,before.cie.data),
                              row_at(events(after.program,start,after.cie.code),pc,after.cie.initial,after.cie.data))
         for mutation in ('mov x19,x0', 'sub sp,sp,#16', 'mov x30,x0',
-                         'bl leaf', 'mov x8,sp'):
+                         'bl leaf', 'mov x8,sp', 'mov w8,wsp'):
             data, ins = self.changed_fixture(ASSEMBLY + extra.replace('cmp w0,#0', mutation+'\ncmp w0,#0'))
             with self.assertRaises(Invalid):
                 normalize_bytes(data, ins)
@@ -596,6 +596,21 @@ ret
         data, ins = self.changed_fixture(ASSEMBLY + extra + incoming)
         with self.assertRaisesRegex(Invalid, 'foreign entry'):
             normalize_bytes(data, ins)
+        island = extra.replace('graph_second:', 'graph_island:\nnop\ngraph_second:')
+        data, ins = self.changed_fixture(ASSEMBLY + island + incoming.replace('graph_save', 'graph_island'))
+        with self.assertRaisesRegex(Invalid, 'foreign entry'):
+            normalize_bytes(data, ins)
+
+    def test_exact_volatile_vector_zero_preserves_saved_simd_boundary(self):
+        source = ASSEMBLY.replace('mov w8,#4', 'movi v0.2d,#0')
+        data, ins = self.changed_fixture(source)
+        normalize_bytes(data, ins)
+        for replacement in ('movi v8.2d,#0', 'movi v0.2d,#0xff',
+                            'movi v0.4s,#0', 'movi v1.2d,#0',
+                            'mov v8.16b,v0.16b'):
+            data, ins = self.changed_fixture(ASSEMBLY.replace('mov w8,#4', replacement))
+            with self.assertRaises(Invalid):
+                normalize_bytes(data, ins)
 
     def test_unknown_parent_lr_is_terminal_rejection(self):
         source = ASSEMBLY+"\n.type unknown_parent,%function\nunknown_parent:\n.cfi_startproc\nbl OUTLINED_FUNCTION_0\nret\n.cfi_endproc\n.size unknown_parent,.-unknown_parent\n"
