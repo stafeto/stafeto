@@ -19,7 +19,7 @@ rustflags = [
 linker = "tools/linker/native-link"
 rustflags = [
     # Run the native wrapper with the same LLD argument convention as rust-lld.
-    "-C", "linker-flavor=gnu-lld",
+    "-C", "linker-flavor=ld",
     # Require substantial instruction savings from each outlined sequence.
     # This threshold limits extra frame metadata in size-sensitive programs.
     "-C", "llvm-args=--enable-machine-outliner=always --outliner-benefit-threshold=64",

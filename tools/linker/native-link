@@ -47,7 +47,11 @@ def main(arguments):
     expanded = expand_response(arguments)
     outputs = [expanded[i + 1] for i, argument in enumerate(expanded[:-1]) if argument == '-o']
     require(len(outputs) == 1, 'native link requires exactly one -o output')
-    require(expanded[:2] == ['-flavor', 'gnu'], 'native link requires the GNU LLD flavor')
+    if expanded[:1] == ['-flavor']:
+        require(expanded[:2] == ['-flavor', 'gnu'], 'native link requires the GNU LLD flavor')
+    else:
+        # Stable rustc's ld flavor sends GNU arguments without a driver selector.
+        arguments = ['-flavor', 'gnu', *arguments]
     output = Path(outputs[0])
     status = subprocess.run([str(linker), *arguments]).returncode
     if status:
