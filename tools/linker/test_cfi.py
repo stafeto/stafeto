@@ -114,22 +114,34 @@ def llvm_row(text, pc):
     raise AssertionError(f'no independently decoded row for {pc:#x}')
 
 
+def llvm_tool(name, override):
+    if value := os.environ.get(override):
+        return value
+    homebrew = Path('/opt/homebrew/opt/llvm/bin') / name
+    if homebrew.is_file():
+        return str(homebrew)
+    return shutil.which(name)
+
+
 class LinkedInstructionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
         cls.root = Path(cls.directory.name)
-        cls.objdump = shutil.which('llvm-objdump')
-        cls.dwarfdump = shutil.which('llvm-dwarfdump')
-        cls.clang = shutil.which('clang')
-        cls.lld = shutil.which('ld.lld')
-        if not all((cls.objdump, cls.dwarfdump, cls.clang, cls.lld)):
-            raise unittest.SkipTest('LLVM tools required for linked instruction tests')
+        cls.objdump = llvm_tool('llvm-objdump', 'STAFETO_CFI_OBJDUMP')
+        cls.dwarfdump = llvm_tool('llvm-dwarfdump', 'STAFETO_CFI_DWARFDUMP')
+        cls.clang = llvm_tool('clang', 'STAFETO_CFI_CLANG')
+        cls.lld = llvm_tool('ld.lld', 'STAFETO_CFI_LLD')
+        if not all(tool and Path(tool).is_file() for tool in (cls.objdump, cls.dwarfdump, cls.clang, cls.lld)):
+            raise RuntimeError('linked CFI policy tests require Clang/LLVM, LLD and rustup llvm-tools')
+        cls.linker = [cls.lld]
+        if Path(cls.lld).name == 'rust-lld':
+            cls.linker += ['-flavor', 'gnu']
         source = cls.root / 'fixture.s'
         source.write_text(ASSEMBLY)
         subprocess.run([cls.clang, '--target=aarch64-none-elf', '-c', str(source), '-o', str(cls.root / 'fixture.o')], check=True)
         cls.path = cls.root / 'fixture.elf'
-        subprocess.run([cls.lld, '-e', 'caller', '--eh-frame-hdr', '-zseparate-loadable-segments', '-zmax-page-size=4096', str(cls.root / 'fixture.o'), '-o', str(cls.path)], check=True)
+        subprocess.run([*cls.linker, '-e', 'caller', '--eh-frame-hdr', '-zseparate-loadable-segments', '-zmax-page-size=4096', str(cls.root / 'fixture.o'), '-o', str(cls.path)], check=True)
         cls.original = cls.path.read_bytes()
         cls.instructions = disassemble(cls.path, cls.objdump)
         cls.fixed, cls.report = normalize_bytes(cls.original, cls.instructions)
@@ -179,7 +191,7 @@ class LinkedInstructionTests(unittest.TestCase):
         source.write_text(assembly)
         subprocess.run([self.clang, '--target=aarch64-none-elf', '-c', str(source), '-o', str(self.root / 'changed.o')], check=True)
         target = self.root / 'changed.elf'
-        subprocess.run([self.lld, '-e', 'caller', '--eh-frame-hdr', '-zseparate-loadable-segments', '-zmax-page-size=4096', str(self.root / 'changed.o'), '-o', str(target)], check=True)
+        subprocess.run([*self.linker, '-e', 'caller', '--eh-frame-hdr', '-zseparate-loadable-segments', '-zmax-page-size=4096', str(self.root / 'changed.o'), '-o', str(target)], check=True)
         return target.read_bytes(), disassemble(target, self.objdump)
 
     def test_saved_register_corruption_rejects(self):
@@ -255,6 +267,20 @@ class LinkedInstructionTests(unittest.TestCase):
         self.assertIn('W30=[CFA-40]', llvm_row(rows, symbols['spill_caller'] + 4))
         data, instructions = self.changed_fixture(ASSEMBLY.replace('str x30,[sp,#-48]!', 'stp x29,x30,[sp,#-48]!'))
         with self.assertRaisesRegex(Invalid, 'saved cell'):
+            normalize_bytes(data, instructions)
+
+    def test_compaction_rejects_intersecting_caller_rule(self):
+        data, instructions = self.changed_fixture(ASSEMBLY.replace(
+            'bl OUTLINED_FUNCTION_0\nmov x30,x0',
+            'bl OUTLINED_FUNCTION_0\n.cfi_def_cfa_offset 16\nmov x30,x0'))
+        with self.assertRaises(Invalid):
+            normalize_bytes(data, instructions)
+
+    def test_compaction_rejects_changed_helper_initial_lr(self):
+        data, instructions = self.changed_fixture(ASSEMBLY.replace(
+            'OUTLINED_FUNCTION_0:\n.cfi_startproc',
+            'OUTLINED_FUNCTION_0:\n.cfi_startproc\n.cfi_register 30,1'))
+        with self.assertRaises(Invalid):
             normalize_bytes(data, instructions)
 
     def test_leaf_lr_destination_rejects(self):

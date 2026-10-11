@@ -1200,6 +1200,22 @@ fn write(rows: &[Row], suite: Option<&str>) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_outliner_cfi_linked_instructions() {
+        let status = Command::new("python3")
+            .arg(crate::root().join("tools/linker/test_cfi.py"))
+            .arg("-v")
+            .env("STAFETO_CFI_LLD", crate::llvm_tool("rust-lld").unwrap())
+            .env(
+                "STAFETO_CFI_OBJDUMP",
+                crate::llvm_tool("llvm-objdump").unwrap(),
+            )
+            .current_dir(crate::root())
+            .status()
+            .expect("run the linked CFI policy tests with Python 3");
+        assert!(status.success(), "linked CFI policy tests failed");
+    }
+
     /// A boot's log: the services' lines around the runner's marks.
     fn log(text: &[&str]) -> String {
         text.join("\n") + "\n"

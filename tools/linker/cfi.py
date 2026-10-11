@@ -379,6 +379,41 @@ def preserved_register(body, register):
                 "outlined helper destroys saved LR register or SP")
 
 
+def compact_changed_events(event_list, fde):
+    """Remove only proved redundant LR rules in an already repaired FDE."""
+    kept = []
+    row = copy.deepcopy(fde.cie.initial)
+    saved = []
+    for pc, operation in event_list:
+        following = apply(row, operation, fde.cie.initial, saved, fde.cie.data)
+        if not (operation[0] == 0x9e and following == row):
+            kept.append((pc, operation))
+        row = following
+    require(not saved, 'compaction encountered unbalanced remembered row')
+    result = []
+    index = 0
+    while index < len(kept):
+        if (index + 2 < len(kept) and kept[index][1] == b'\x0a' and
+                kept[index + 1][0] == kept[index][0] and
+                kept[index + 1][1][:2] == b'\x09\x1e' and kept[index + 2][1] == b'\x0b'):
+            begin, end = kept[index][0], kept[index + 2][0]
+            before = row_at(kept, begin - 1, fde.cie.initial, fde.cie.data)
+            if 30 not in before.registers and 30 not in fde.cie.initial.registers:
+                result.extend([kept[index + 1], (end, b'\xde')])
+                index += 3
+                continue
+        result.append(kept[index])
+        index += 1
+    points = set(range(fde.start, fde.start + fde.size, 4))
+    points.update(pc for pc, _ in event_list)
+    points.update(pc for pc, _ in result)
+    for pc in points:
+        require(row_at(event_list, pc, fde.cie.initial, fde.cie.data) ==
+                row_at(result, pc, fde.cie.initial, fde.cie.data),
+                'compaction changed a complete CFI row')
+    return result
+
+
 def prove_lr_store(fde, call_pc, after, instructions, targets):
     """Track the exact straight-line entry frame and all overlapping stores."""
     require(after.cfa[0] == 31 and after.rule(30)[0] == 'offset',
@@ -663,6 +698,9 @@ def repair_programs(elf, records, instructions):
             require(row_at(repaired, pc, fde.cie.initial, fde.cie.data) == expected,
                     "caller complete CFI row was not preserved")
         changed[offset] = repaired
+    for fde in fdes.values():
+        if fde.offset in changed:
+            changed[fde.offset] = compact_changed_events(changed[fde.offset], fde)
     return changed, helpers
 
 
