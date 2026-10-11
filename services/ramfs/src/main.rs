@@ -61,23 +61,30 @@ const BASE_METHODS: &[u16] = &[
 ];
 #[cfg(not(any(
     feature = "steps",
+    feature = "lock-telemetry",
     feature = "lifetime-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 )))]
 const METHODS: &[u16] = BASE_METHODS;
 #[cfg(any(
     feature = "steps",
+    feature = "lock-telemetry",
     feature = "lifetime-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 ))]
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
+        + cfg!(feature = "lock-telemetry") as usize
         + cfg!(feature = "steps") as usize
         + 4 * cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
     let mut i = 0;
     while i < BASE_METHODS.len() {
         methods[i] = BASE_METHODS[i];
+        i += 1;
+    }
+    if cfg!(feature = "lock-telemetry") {
+        methods[i] = 0xfff1;
         i += 1;
     }
     if cfg!(feature = "steps") {
@@ -150,6 +157,13 @@ struct WaitProofBss(UnsafeCell<core::mem::MaybeUninit<WaitProof>>);
 unsafe impl Sync for WaitProofBss {}
 static WAIT_PROOF: WaitProofBss = WaitProofBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 // The service loop reserves label zero for its heartbeat timer.
+#[cfg(feature = "lock-telemetry")]
+struct TelemetryBss(UnsafeCell<core::mem::MaybeUninit<ramfs::lock_telemetry::Table>>);
+// SAFETY: only the sole service thread initializes and accesses this test table.
+#[cfg(feature = "lock-telemetry")]
+unsafe impl Sync for TelemetryBss {}
+#[cfg(feature = "lock-telemetry")]
+static TELEMETRY: TelemetryBss = TelemetryBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
 const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
 struct RamBss(UnsafeCell<core::mem::MaybeUninit<Ram<'static>>>);
@@ -303,7 +317,17 @@ fn main(_: u64) -> u64 {
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
     let tables = unsafe { &mut *TABLES.0.get() };
+    #[cfg(feature = "lock-telemetry")]
+    // SAFETY: exclusive permanent storage, initialized before any reference.
+    let telemetry = unsafe {
+        let pointer = (*TELEMETRY.0.get()).as_mut_ptr();
+        ramfs::lock_telemetry::Table::initialize_at(pointer);
+        &mut *pointer
+    };
     let mut fs = Fs {
+        #[cfg(feature = "lock-telemetry")]
+        telemetry,
+
         ram,
         locks,
         lock_jobs,
@@ -383,6 +407,8 @@ fn main(_: u64) -> u64 {
 }
 
 struct Fs {
+    #[cfg(feature = "lock-telemetry")]
+    telemetry: &'static mut ramfs::lock_telemetry::Table,
     ram: &'static mut Ram<'static>,
     locks: &'static mut LockService,
     lock_jobs: &'static mut LockQueue,
@@ -617,6 +643,20 @@ impl Fs {
             self.places.place(label),
             label,
         ) {
+            #[cfg(feature = "lock-telemetry")]
+            {
+                let [first, next, visits] = self.lock_jobs.telemetry_part();
+                self.telemetry.portion(
+                    11,
+                    usize::from(visits),
+                    [
+                        label,
+                        self.places.place(label) as u64,
+                        u64::from(first),
+                        u64::from(next),
+                    ],
+                );
+            }
             return true;
         }
         if fds.departed && fds.wait_departure < 16 {
@@ -632,6 +672,24 @@ impl Fs {
                 },
             )
             .expect("exact retained departed WAIT label");
+            #[cfg(feature = "lock-telemetry")]
+            self.telemetry.portion(
+                12,
+                progress.visited,
+                [
+                    label,
+                    self.places.place(label) as u64,
+                    u64::from(fds.wait_departure),
+                    progress.released as u64,
+                ],
+            );
+            #[cfg(feature = "lock-telemetry")]
+            if let Some(effect) = progress.effect {
+                self.telemetry.effect(1, progress.visited, effect);
+                if progress.ambiguous {
+                    self.telemetry.effect_ambiguous(1);
+                }
+            }
             if progress.cancel_actor {
                 self.locks.cancel();
             }
@@ -1327,6 +1385,8 @@ impl Service<0> for Fs {
 
     /// A never-used clone retains its paid birth until cleanup finishes.
     fn closed(&mut self, label: u64) {
+        #[cfg(feature = "lock-telemetry")]
+        self.telemetry.invalidate_owner(label);
         self.maintenance_burst.restart();
         self.legacy_pending = true;
         #[cfg(feature = "steps")]
@@ -1398,11 +1458,24 @@ impl Service<0> for Fs {
             LockWork::Actor => {
                 let page = self.lifetimes.as_ref();
                 let (storage, descriptions) = self.ram.lock_parts();
+                #[cfg(feature = "lock-telemetry")]
+                let receipt = self
+                    .wait_jobs
+                    .active()
+                    .map(ramfs::lock_telemetry::wait)
+                    .or_else(|| self.lock_jobs.active().map(ramfs::lock_telemetry::control));
                 let progress = self.locks.step_with_owners(
                     storage,
                     |pid| page.is_some_and(|page| page.live(pid)),
                     |token| descriptions.live(token),
                 );
+                #[cfg(feature = "lock-telemetry")]
+                self.telemetry
+                    .actor(progress, self.locks.telemetry_stage(), receipt);
+                #[cfg(feature = "lock-telemetry")]
+                if let Some(effect) = self.locks.telemetry_departure() {
+                    self.telemetry.effect(4, 1, effect);
+                }
                 if let Some(result) = progress.completed {
                     if let Some(id) = self.wait_jobs.active() {
                         if result == Ok(ramfs::locks::actor::Response::Changed) {
@@ -1495,9 +1568,20 @@ impl Service<0> for Fs {
                     None
                 };
                 if cleanup_work == Some(ramfs::locks::dispatch::CleanupWork::Events) {
-                    self.wait_events
+                    #[cfg(feature = "lock-telemetry")]
+                    let witness = self
+                        .wait_events
+                        .telemetry_first()
+                        .map(ramfs::lock_telemetry::registration)
+                        .unwrap_or([0; 4]);
+                    let progress = self
+                        .wait_events
                         .part(self.wait_jobs, self.wait_pool)
                         .expect("exact bounded WAIT wake masks");
+                    #[cfg(feature = "lock-telemetry")]
+                    self.telemetry.portion(4, progress.visited, witness);
+                    #[cfg(not(feature = "lock-telemetry"))]
+                    let _ = progress;
                     self.wait_ready_scan = None;
                     self.wait_ready_scanned = false;
                 } else if cleanup_work == Some(ramfs::locks::dispatch::CleanupWork::Proof) {
@@ -1505,7 +1589,17 @@ impl Service<0> for Fs {
                 } else if cleanup_work == Some(ramfs::locks::dispatch::CleanupWork::Recheck) {
                     self.tick_wait_recheck(sessions);
                 } else if cleanup {
-                    if self.lock_jobs.cleanup_released(&mut self.ram.storage) != 0 {
+                    let released = self.lock_jobs.cleanup_released(&mut self.ram.storage);
+                    #[cfg(feature = "lock-telemetry")]
+                    {
+                        let [first, next, visits] = self.lock_jobs.telemetry_part();
+                        self.telemetry.portion(
+                            10,
+                            usize::from(visits),
+                            [u64::from(first), u64::from(next), released as u64, 0],
+                        );
+                    }
+                    if released != 0 {
                         self.maintenance_burst.restart();
                         self.legacy_pending = true;
                     }
@@ -1537,6 +1631,9 @@ impl Service<0> for Fs {
                             source,
                         )
                         .expect("exact queued WAIT attempt");
+                        #[cfg(feature = "lock-telemetry")]
+                        self.telemetry
+                            .portion(2, 1, ramfs::lock_telemetry::wait(id));
                         if self
                             .wait_jobs
                             .query(id)
@@ -1555,18 +1652,95 @@ impl Service<0> for Fs {
             LockWork::Audit { first, end } => {
                 let page = self.lifetimes.as_ref();
                 let (_, descriptions) = self.ram.lock_parts();
+                #[cfg(feature = "lock-telemetry")]
+                let (mut pid_visits, mut ofd_visits, mut pid_witness, mut ofd_witness) =
+                    (0, 0, [0; 4], [0; 4]);
                 for index in first..end {
                     if index < proto_process::RECORDS {
-                        self.locks
+                        #[cfg(feature = "lock-telemetry")]
+                        {
+                            if pid_visits == 0 {
+                                pid_witness = [
+                                    index as u64,
+                                    0,
+                                    self.locks.telemetry_pid(index).map_or(0, u64::from),
+                                    0,
+                                ];
+                            }
+                            pid_visits += 1;
+                            pid_witness[1] = (index + 1) as u64;
+                        }
+                        #[cfg(feature = "lock-telemetry")]
+                        let exact_pid = self.locks.telemetry_pid(index);
+                        let removed = self
+                            .locks
                             .audit_pid(index, |pid| page.is_some_and(|page| page.live(pid)))
                             .expect("bounded genuine PID place");
+                        #[cfg(feature = "lock-telemetry")]
+                        {
+                            pid_witness[3] += u64::from(removed);
+                            if removed {
+                                self.telemetry.effect(
+                                    0,
+                                    end - first,
+                                    [
+                                        u64::from(exact_pid.expect("actual removed PID")),
+                                        first as u64 | ((end as u64) << 32),
+                                        index as u64,
+                                        1,
+                                    ],
+                                );
+                            }
+                        }
+                        #[cfg(not(feature = "lock-telemetry"))]
+                        let _ = removed;
                     } else {
-                        self.locks
+                        #[cfg(feature = "lock-telemetry")]
+                        let exact_description = self
+                            .locks
+                            .telemetry_description(index - proto_process::RECORDS);
+                        #[cfg(feature = "lock-telemetry")]
+                        {
+                            if ofd_visits == 0 {
+                                let token = exact_description;
+                                ofd_witness = [
+                                    (index - proto_process::RECORDS) as u64,
+                                    0,
+                                    token.map_or(0, |token| u64::from(token.slot)),
+                                    token.map_or(0, |token| token.generation),
+                                ];
+                            }
+                            ofd_visits += 1;
+                            ofd_witness[1] = (index - proto_process::RECORDS + 1) as u64;
+                        }
+                        let removed = self
+                            .locks
                             .audit_description(index - proto_process::RECORDS, |token| {
                                 descriptions.live(token)
                             })
                             .expect("bounded actual OFD place");
+                        #[cfg(feature = "lock-telemetry")]
+                        if removed {
+                            let token = exact_description.expect("actual removed description");
+                            self.telemetry.effect(
+                                3,
+                                end - first,
+                                [
+                                    u64::from(token.slot),
+                                    token.generation,
+                                    first as u64 | ((end as u64) << 32),
+                                    1,
+                                ],
+                            );
+                        }
+                        #[cfg(not(feature = "lock-telemetry"))]
+                        let _ = removed;
                     }
+                }
+                #[cfg(feature = "lock-telemetry")]
+                {
+                    self.telemetry.portion(8, pid_visits, pid_witness);
+                    self.telemetry.portion(9, ofd_visits, ofd_witness);
                 }
                 if end == proto_process::RECORDS + ramfs::DESCRIPTIONS {
                     self.wait_events.poll();
@@ -1689,6 +1863,41 @@ impl Service<0> for Fs {
         self.notify_maintenance();
     }
 
+    #[cfg(feature = "lock-telemetry")]
+    fn measured_begin(&mut self) {
+        let before = self.telemetry_occupancy();
+        self.telemetry.begin_dispatch(before);
+    }
+    #[cfg(feature = "lock-telemetry")]
+    fn measured_step(
+        &mut self,
+        sample: rt::service::StepSample,
+        sessions: &[Option<Session<Fds, 0>>],
+    ) {
+        let after = self.telemetry_occupancy();
+        self.telemetry.finish(
+            ramfs::lock_telemetry::Timing {
+                kind: sample.kind,
+                detail: sample.detail,
+                whole: sample.whole,
+                waited: sample.waited,
+                took: sample.took,
+                valid: sample.accounting_valid,
+            },
+            after,
+        );
+        if let Some(scope) = self.telemetry.scope() {
+            let place = scope.place;
+            let valid = sessions
+                .get(place)
+                .and_then(Option::as_ref)
+                .filter(|s| s.label() == scope.owner && s.data.claimed)
+                .is_some_and(|s| self.telemetry_source_live(&s.data, scope.source));
+            if !valid {
+                self.telemetry.invalidate();
+            }
+        }
+    }
     fn between_notifications(&mut self, notice: rt::service::Notice) {
         if notice.source == rt::abi::Source::Unlabeled && notice.label == 0 {
             // The one cursor dispatch and its statistics have ended. An own
@@ -1703,6 +1912,11 @@ impl Service<0> for Fs {
     }
 
     fn request(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        #[cfg(feature = "lock-telemetry")]
+        if r.method() == ramfs::lock_telemetry::METHOD {
+            self.telemetry.observer();
+        }
+
         self.maintenance_burst.restart();
         self.legacy_pending = true;
         let first = !s.data.claimed;
@@ -2089,6 +2303,10 @@ impl Service<0> for Fs {
         );
         if !cleanup && let Err(code) = self.authenticate(&mut s.data, r.label()) {
             return status(code);
+        }
+        #[cfg(feature = "lock-telemetry")]
+        if r.method() == ramfs::lock_telemetry::METHOD {
+            return self.telemetry_request(&s.data, r);
         }
         #[cfg(feature = "lifetime-probe")]
         if r.method() == 0xfff2 {
@@ -2487,8 +2705,43 @@ impl Service<0> for Fs {
                     Ok(event) => event,
                     Err(error) => return Answer::Status(error),
                 };
+                #[cfg(feature = "lock-telemetry")]
+                let pid = s.data.binding.snapshot_ref().map_or(0, |who| who.pid);
+                #[cfg(feature = "lock-telemetry")]
+                self.locks.telemetry_close_reset();
                 match self.ram.close_event(&mut s.data, self.locks, event) {
                     Ok(inode) => {
+                        #[cfg(feature = "lock-telemetry")]
+                        self.telemetry.portion(
+                            15,
+                            1,
+                            [
+                                u64::from(pid),
+                                u64::from(event.packed),
+                                event.description_generation,
+                                0,
+                            ],
+                        );
+                        #[cfg(feature = "lock-telemetry")]
+                        if let Some(((owner, _), ambiguous)) = self.locks.telemetry_close_effect() {
+                            let ofd = matches!(owner, ramfs::locks::Owner::Description { .. });
+                            self.telemetry.effect(
+                                2,
+                                1,
+                                [
+                                    u64::from(pid),
+                                    u64::from(event.packed)
+                                        | (u64::from(event.key.slot) << 32)
+                                        | (u64::from(ofd) << 62)
+                                        | (u64::from(event.last_alias) << 63),
+                                    event.description_generation,
+                                    event.key.generation,
+                                ],
+                            );
+                            if ambiguous {
+                                self.telemetry.effect_ambiguous(2);
+                            }
+                        }
                         if let Some(inode) = inode {
                             self.wait_events.changed(inode);
                         }
@@ -2708,6 +2961,228 @@ fn generation(index: usize) -> u64 {
 }
 impl Fs {
     /// FIFO ready selection and prepaid receipt scanning each have their own turn.
+    #[cfg(feature = "lock-telemetry")]
+    fn telemetry_occupancy(&self) -> ramfs::lock_telemetry::Occupancy {
+        let (counts, common, roots) = self.locks.telemetry_accounting();
+        ramfs::lock_telemetry::Occupancy {
+            published: counts.published as u16,
+            private: counts.private as u16,
+            retired: counts.retired as u16,
+            common: common as u16,
+            roots: roots as u8,
+        }
+    }
+    #[cfg(feature = "lock-telemetry")]
+    fn telemetry_source_live(&self, fds: &Fds, source: ramfs::lock_telemetry::Source) -> bool {
+        if fds.departed || fds.binding.snapshot_ref().is_none() {
+            return false;
+        }
+        let description = proto_fs::DataDescription {
+            packed: source.packed,
+            generation: source.generation,
+        };
+        self.ram
+            .live_description(
+                fds,
+                ramfs::TentativeOpen {
+                    fd: description.fd(),
+                    description: ramfs::storage::Token {
+                        slot: description.slot() as u16,
+                        generation: source.generation,
+                    },
+                },
+            )
+            .is_ok()
+    }
+    #[cfg(feature = "lock-telemetry")]
+    fn telemetry_request(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
+        use ramfs::lock_telemetry::{Error, PAGES, ROWS, Scope, Source};
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if proto_fs::is_loaders(r.label()) || fds.binding.snapshot_ref().is_none() {
+            return status(proto_fs::PERMISSION);
+        }
+        let mut body = r.body();
+        let (Ok(action), Ok(nonce), Ok(epoch), Ok(packed), Ok(generation)) =
+            (body.u32(), body.u64(), body.u64(), body.u32(), body.u64())
+        else {
+            return Answer::Status(Status::BadSize);
+        };
+        if nonce == 0
+            || generation == 0
+            || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+        {
+            return status(proto_fs::INVALID_ARGUMENT);
+        }
+        let scope = Scope {
+            place: self.places.place(r.label()),
+            owner: r.label(),
+            nonce,
+            source: Source { packed, generation },
+        };
+        if !self.telemetry_source_live(fds, scope.source) {
+            return status(proto_fs::PERMISSION);
+        }
+        let result: Result<(u64, [u64; 5]), Error> = match action {
+            0 => {
+                let Ok(profile) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let occupancy = self.telemetry_occupancy();
+                self.telemetry
+                    .start(scope, epoch, profile, occupancy)
+                    .map(|new| (new, self.telemetry.header()))
+            }
+            1 => {
+                let (Ok(row), Ok(page)) = (body.u32(), body.u32()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                if row as usize >= ROWS || page >= PAGES {
+                    return status(proto_fs::INVALID_ARGUMENT);
+                }
+                self.telemetry
+                    .authorize(scope, epoch)
+                    .and_then(|()| self.telemetry.page(row as usize, page))
+                    .map(|words| (epoch, words))
+            }
+            4 => {
+                let Ok(first) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                self.telemetry
+                    .authorize_oracle(scope, epoch)
+                    .and_then(|()| {
+                        ramfs::lock_telemetry::census(
+                            first as usize,
+                            ramfs::storage::ROOTS,
+                            |index| {
+                                let root = self.ram.storage.telemetry_lock_root(index)?;
+                                let counts = self.locks.telemetry_root(index)?;
+                                Some(ramfs::lock_telemetry::Payer {
+                                    id: root.id,
+                                    generation: root.generation,
+                                    published: counts.published as u16,
+                                    private: counts.private as u16,
+                                    retired: counts.retired as u16,
+                                })
+                            },
+                        )
+                    })
+                    .map(|words| (epoch, words))
+            }
+            5 => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                self.telemetry.authorize_oracle(scope, epoch).map(|()| {
+                    let counts = self.telemetry_occupancy();
+                    (
+                        epoch,
+                        [
+                            u64::from(counts.published),
+                            u64::from(counts.private),
+                            u64::from(counts.retired),
+                            u64::from(counts.common),
+                            u64::from(counts.roots),
+                        ],
+                    )
+                })
+            }
+            6 => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let Some(who) = fds.binding.snapshot_ref() else {
+                    return status(proto_fs::PERMISSION);
+                };
+                if who.pid == 0 || fds.root.id == 0 || fds.root.generation == 0 {
+                    return status(proto_fs::PERMISSION);
+                }
+                self.telemetry.authorize_identity(scope, epoch).map(|()| {
+                    (
+                        epoch,
+                        [
+                            scope.owner,
+                            u64::from(who.pid),
+                            fds.root.id,
+                            fds.root.generation,
+                            scope.source.generation,
+                        ],
+                    )
+                })
+            }
+            7 => {
+                let (Ok(slot), Ok(target_generation)) = (body.u32(), body.u64()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let description = proto_fs::DataDescription { packed, generation };
+                self.telemetry
+                    .authorize_description(scope, epoch)
+                    .and_then(|()| {
+                        self.ram
+                            .telemetry_description(
+                                fds,
+                                ramfs::TentativeOpen {
+                                    fd: description.fd(),
+                                    description: ramfs::storage::Token {
+                                        slot: description.slot() as u16,
+                                        generation,
+                                    },
+                                },
+                                slot,
+                                target_generation,
+                            )
+                            .map_err(|_| Error::Authority)
+                    })
+                    .map(|words| (epoch, words))
+            }
+            2 | 3 => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let checked = if action == 2 {
+                    self.telemetry.stop(scope, epoch)
+                } else {
+                    self.telemetry.authorize(scope, epoch)
+                };
+                checked.map(|()| (epoch, self.telemetry.header()))
+            }
+            _ => return status(proto_fs::INVALID_ARGUMENT),
+        };
+        let (epoch, words) = match result {
+            Ok(row) => row,
+            Err(Error::Authority) => return status(proto_fs::PERMISSION),
+            Err(Error::Invalid) => return status(proto_fs::INVALID_ARGUMENT),
+            Err(Error::Exhausted) => return status(proto_fs::NO_LOCKS),
+        };
+        let reply = r.reply();
+        let written = (|| {
+            reply.u32(0)?;
+            reply.u64(nonce)?;
+            reply.u64(epoch)?;
+            for word in words {
+                reply.u64(word)?;
+            }
+            Ok::<(), Status>(())
+        })();
+        match written {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(code) => Answer::Status(code),
+        }
+    }
     fn next_wait_ready(&mut self) -> Option<ramfs::locks::wait_receipts::Id> {
         if self.wait_pool.count() == 0 || self.wait_ready_scanned {
             self.wait_ready_scanned = false;
@@ -2797,11 +3272,17 @@ impl Fs {
         }
         let owner = r.label();
         let place = self.places.place(owner);
+        #[cfg(feature = "lock-telemetry")]
+        let witness;
         let result = if method == Method::WaitStart {
             let wire = match proto_fs::WaitStart::read(r.body()) {
                 Ok(wire) => wire,
                 Err(error) => return Answer::Status(error),
             };
+            #[cfg(feature = "lock-telemetry")]
+            {
+                witness = [owner, u64::from(wire.key.slot), wire.key.generation, 1];
+            }
             match ramfs::locks::wait_server::replay(self.wait_jobs, place, owner, wire) {
                 Ok(Some(reply)) => Ok(reply),
                 Err(code) => Err(code),
@@ -2827,6 +3308,10 @@ impl Fs {
                 Ok(key) => key,
                 Err(error) => return Answer::Status(error),
             };
+            #[cfg(feature = "lock-telemetry")]
+            {
+                witness = [owner, u64::from(key.slot), key.generation, 1];
+            }
             if method == Method::WaitRelease {
                 if let Ok(Some(id)) = self.wait_jobs.occupied(place, owner, key.slot)
                     && id.key() == key
@@ -2839,6 +3324,10 @@ impl Fs {
                 }
                 let result =
                     ramfs::locks::wait_server::release(self.wait_jobs, self.ram, place, owner, key);
+                #[cfg(feature = "lock-telemetry")]
+                if result.is_ok() {
+                    self.telemetry.portion(14, 1, witness);
+                }
                 self.notify_maintenance();
                 return match result {
                     Ok(()) => Answer::Status(Status::Ok),
@@ -2893,6 +3382,10 @@ impl Fs {
                 ramfs::locks::wait_server::query(self.wait_jobs, place, owner, key)
             }
         };
+        #[cfg(feature = "lock-telemetry")]
+        if result.is_ok() {
+            self.telemetry.portion(14, 1, witness);
+        }
         self.notify_maintenance();
         match result {
             Ok(reply) => match reply.write(r.reply()) {
@@ -2956,6 +3449,9 @@ impl Fs {
             |pid| page.is_some_and(|page| page.live(pid)) && locks.pid_visible(pid),
             |ofd| descriptions.live(ofd),
         );
+        #[cfg(feature = "lock-telemetry")]
+        self.telemetry
+            .portion(3, progress.visited, ramfs::lock_telemetry::control(id));
         #[cfg(feature = "lifetime-probe")]
         self.fifo_probe.visit(id, progress.visited);
         let Some(decision) = progress.decision else {
@@ -3053,6 +3549,12 @@ impl Fs {
         }
     }
     fn tick_wait_recheck(&mut self, sessions: &[Option<Session<Fds, 0>>]) {
+        #[cfg(feature = "lock-telemetry")]
+        let witness = self
+            .wait_events
+            .telemetry_recheck()
+            .map(ramfs::lock_telemetry::registration)
+            .unwrap_or([0; 4]);
         let page = self.lifetimes.as_ref();
         let ram = &*self.ram;
         let births = &self.births;
@@ -3104,7 +3606,8 @@ impl Fs {
                 ),
             )
             .expect("exact bounded WAIT recheck");
-
+        #[cfg(feature = "lock-telemetry")]
+        self.telemetry.portion(4, progress.visited, witness);
         if progress.readied != 0 {
             self.wait_ready_scan = None;
             self.wait_ready_scanned = false;
@@ -3142,6 +3645,12 @@ impl Fs {
             let page = self.lifetimes.as_ref();
             let (storage, descriptions) = self.ram.lock_parts();
             let locks = &*self.locks;
+            #[cfg(feature = "lock-telemetry")]
+            let witness = self
+                .wait_proof
+                .telemetry_candidate()
+                .map(ramfs::lock_telemetry::wait)
+                .unwrap_or([0; 4]);
             let progress = self.wait_proof.step(
                 self.wait_jobs,
                 self.wait_pool,
@@ -3150,6 +3659,9 @@ impl Fs {
                 |pid| page.is_some_and(|page| page.live(pid)) && locks.pid_visible(pid),
                 |ofd| descriptions.live(ofd),
             );
+            #[cfg(feature = "lock-telemetry")]
+            self.telemetry
+                .portion(5, self.wait_proof.telemetry_visits(progress), witness);
             #[cfg(feature = "lifetime-probe")]
             self.ring_probe.part(0, progress.visited);
             let Some(outcome) = progress.outcome else {
@@ -3168,6 +3680,12 @@ impl Fs {
                         },
                     )
                     .expect("exact pending proof candidate canonical completion");
+                #[cfg(feature = "lock-telemetry")]
+                self.telemetry.portion(
+                    7,
+                    1,
+                    ramfs::lock_telemetry::registration(outcome.registration),
+                );
                 #[cfg(feature = "lifetime-probe")]
                 if let Some(snapshot) = self.wait_proof.probe_snapshot() {
                     self.ring_probe.proved(snapshot);
@@ -3180,7 +3698,13 @@ impl Fs {
             let queue = &*self.wait_jobs;
             let next = self.wait_proof_next;
             let choice = &mut self.wait_proof_choice;
+            #[cfg(feature = "lock-telemetry")]
+            let mut actual = 0;
             let scanned = self.wait_pool.scan(cursor, |token, _, phase| {
+                #[cfg(feature = "lock-telemetry")]
+                {
+                    actual += 1;
+                }
                 if phase != ramfs::locks::waiters::Phase::Sleeping {
                     return;
                 }
@@ -3199,6 +3723,17 @@ impl Fs {
                     *choice = Some((rank, token, captured));
                 }
             });
+            #[cfg(feature = "lock-telemetry")]
+            self.telemetry.portion(
+                6,
+                actual + usize::from(scanned.is_err()),
+                [
+                    self.wait_proof_serial,
+                    u64::from(self.wait_proof_scan_remaining),
+                    u64::from(self.wait_proof_scan_remaining.saturating_sub(actual as u8)),
+                    u64::from(scanned.is_err()),
+                ],
+            );
             match scanned {
                 Err(_) => {
                     self.wait_proof_scan = None;
@@ -4711,11 +5246,17 @@ impl Fs {
         let owner = r.label();
         let place = self.places.place(owner);
         let method = Method::from_number(r.method()).expect("native lock method");
+        #[cfg(feature = "lock-telemetry")]
+        let witness;
         let result = if method == Method::LockStart {
             let wire = match proto_fs::LockStart::read(r.body()) {
                 Ok(wire) => wire,
                 Err(error) => return Answer::Status(error),
             };
+            #[cfg(feature = "lock-telemetry")]
+            {
+                witness = [owner, u64::from(wire.key.slot), wire.key.generation, 0];
+            }
             match ramfs::locks::server::replay(self.lock_jobs, place, owner, wire) {
                 Ok(Some(result)) => Ok(result),
                 Err(code) => Err(code),
@@ -4756,9 +5297,17 @@ impl Fs {
             if self.common_control_busy(fds, owner, key.slot) {
                 return status(proto_fs::PERMISSION);
             }
+            #[cfg(feature = "lock-telemetry")]
+            {
+                witness = [owner, u64::from(key.slot), key.generation, 0];
+            }
             if method == Method::LockRelease {
                 let result =
                     ramfs::locks::server::release(self.lock_jobs, self.ram, fds, place, owner, key);
+                #[cfg(feature = "lock-telemetry")]
+                if result.is_ok() {
+                    self.telemetry.portion(13, 1, witness);
+                }
                 let answer = match result {
                     Ok(true) => {
                         self.locks.cancel();
@@ -4784,6 +5333,10 @@ impl Fs {
                 ramfs::locks::server::query(self.lock_jobs, fds, place, owner, key)
             }
         };
+        #[cfg(feature = "lock-telemetry")]
+        if result.is_ok() {
+            self.telemetry.portion(13, 1, witness);
+        }
         self.notify_maintenance();
         match result {
             Ok(result) => match result.write(r.reply()) {

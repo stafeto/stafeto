@@ -590,6 +590,74 @@ fn positive_outcome_carries_direct_registration_and_never_other_receipt_or_reuse
     assert_eq!(outcome.sleeping_registration(&f.queue, &f.pool), None);
 }
 
+#[cfg(feature = "lock-telemetry")]
+#[test]
+fn measured_actual_proof_parts_keep_exact_candidate_and_registration() {
+    let (mut f, a, _) = Fixture::cycle();
+    assert_eq!(f.proof.telemetry_candidate(), None);
+    assert!(f.start(a, 77));
+    assert_eq!(f.proof.telemetry_candidate(), Some(a.receipt()));
+    let expected = [
+        a.receipt().owner(),
+        u64::from(a.receipt().key().slot),
+        a.receipt().key().generation,
+        1,
+    ];
+    let progress = f.step();
+    assert_eq!(progress.visited, 8);
+    let (row, witness) = crate::lock_telemetry::test_record(5, |table| {
+        table.portion(
+            5,
+            progress.visited,
+            crate::lock_telemetry::wait(f.proof.telemetry_candidate().unwrap()),
+        )
+    });
+    assert_eq!((row[1] >> 40) & 255, 8);
+    assert_eq!(&witness[1..], &expected);
+    let outcome = f.finish();
+    assert_eq!(outcome.verdict, Verdict::Deadlock);
+    assert_eq!(outcome.sleeping_registration(&f.queue, &f.pool), Some(a));
+    let (row, witness) = crate::lock_telemetry::test_record(7, |table| {
+        table.portion(
+            7,
+            1,
+            crate::lock_telemetry::registration(outcome.registration),
+        )
+    });
+    assert_eq!((row[1] >> 56) & 255, 1);
+    assert_eq!(
+        &witness[1..],
+        &[expected[0], expected[1], expected[2], a.slot() as u64]
+    );
+}
+
+#[cfg(feature = "lock-telemetry")]
+#[test]
+fn measured_stale_seed_counts_one_failed_lookup_without_changing_charged_bound() {
+    let (mut f, a, b) = Fixture::cycle();
+    assert!(f.start(b, 78));
+    for _ in 0..256 {
+        if matches!(f.proof.phase, Phase::Seed(_)) {
+            break;
+        }
+        f.step();
+    }
+    assert!(matches!(f.proof.phase, Phase::Seed(_)));
+    f.pool.complete(a).unwrap();
+    let progress = f.step();
+    assert_eq!(progress.visited, 8);
+    assert_eq!(f.proof.telemetry_visits(progress), 1);
+    let (row, _) = crate::lock_telemetry::test_record(5, |table| {
+        table.portion(
+            5,
+            f.proof.telemetry_visits(progress),
+            crate::lock_telemetry::wait(b.receipt()),
+        )
+    });
+    assert_eq!((row[1] >> 40) & 255, 1);
+    assert_eq!(f.finish().verdict, Verdict::Deferred);
+}
+
 fn new_events() -> Box<super::super::wait_events::Events> {
     let mut events = Box::<super::super::wait_events::Events>::new_uninit();
     // SAFETY: exclusive aligned permanent allocation initialized directly.

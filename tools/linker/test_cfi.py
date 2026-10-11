@@ -367,6 +367,61 @@ class LinkedInstructionTests(unittest.TestCase):
                 with self.assertRaises(Invalid):
                     normalize_bytes(bad, bad_instructions)
 
+    def test_inverse_prefix_typed_object_strh_and_negatives(self):
+        prefix = ('cmp x2,#256\nadd x8,x0,#0x5000\nb.lo prefix_frame\n'
+                  'mov w9,#256\nstrh w9,[x8,#0xebc]\nret\nprefix_frame:\n')
+        source = ASSEMBLY.replace('spill_caller:\n.cfi_startproc\n',
+                                  'spill_caller:\n.cfi_startproc\n'+prefix)
+        data, instructions = self.changed_fixture(source)
+        fixed, report = normalize_bytes(data, instructions)
+        self.assertGreater(report['corrected_fdes'], 0)
+        self.assertEqual(normalize_bytes(fixed, instructions)[0], fixed)
+        before, after = Elf(data), Elf(fixed)
+        section = before.sections['.text']
+        self.assertEqual(before.slice(section.offset, section.size),
+                         after.slice(section.offset, section.size))
+        caller = next(address for address, symbols in before.symbols.items()
+                      if any(name == 'spill_caller' for name, _ in symbols))
+        old = next(r for r in before.records() if isinstance(r, Fde) and r.start == caller)
+        new = next(r for r in after.records() if isinstance(r, Fde) and r.start == caller)
+        from cfi import events, row_at
+        for offset in range(0, 28, 4):
+            self.assertEqual(row_at(events(old.program, caller, old.cie.code), caller + offset,
+                                    old.cie.initial, old.cie.data),
+                             row_at(events(new.program, caller, new.cie.code), caller + offset,
+                                    new.cie.initial, new.cie.data))
+        variants = [
+            source.replace('add x8,x0,#0x5000', 'add x8,sp,#0x5000'),
+            source.replace('add x8,x0,#0x5000', 'add x8,x29,#0x5000'),
+            source.replace('add x8,x0,#0x5000', 'mov w8,w29'),
+            source.replace('add x8,x0,#0x5000', 'add w8,wsp,#4'),
+            source.replace('add x8,x0,#0x5000', 'mov w8,w0\nadd x8,x8,#0x5000'),
+            source.replace('cmp x2,#256', 'mov w0,#1\ncmp x2,#256'),
+            source.replace('add x8,x0,#0x5000', 'mov x8,#0x5000'),
+            source.replace('add x8,x0,#0x5000', 'add x8,x0,#0x5000\nmov x8,x18'),
+            source.replace('cmp x2,#256', 'mov x19,x0\ncmp x2,#256'),
+            source.replace('cmp x2,#256', 'mov x30,x0\ncmp x2,#256'),
+            source.replace('strh w9,[x8,#0xebc]', 'strh w19,[x8,#0xebc]'),
+            source.replace('strh w9,[x8,#0xebc]', 'str w9,[x8,#0xebc]'),
+            source.replace('strh w9,[x8,#0xebc]', 'strh w9,[x8,#-2]'),
+            source.replace('strh w9,[x8,#0xebc]', 'strh w9,[x8,#2]!'),
+            source.replace('strh w9,[x8,#0xebc]', 'strh w9,[x8],#2'),
+            source.replace('strh w9,[x8,#0xebc]', 'strh w9,[x8,x1]'),
+            source.replace('strh w9,[x8,#0xebc]', 'strh w9,[x8,#0xebc]\nstrh w9,[x8,#2]'),
+            source.replace('strh w9,[x8,#0xebc]', '.cfi_def_cfa_offset 16\nstrh w9,[x8,#0xebc]'),
+            source.replace('mov w9,#256', 'bl leaf\nmov w9,#256'),
+            source.replace('strh w9,[x8,#0xebc]\nret', 'strh w9,[x8,#0xebc]\nb prefix_frame'),
+            source+'\nforeign_entry: b spill_caller+16\n',
+            source+'\nforeign_entry: b spill_caller+4\n',
+            source+'\nforeign_entry: b spill_caller+20\n',
+            source+'\nforeign_entry: b prefix_frame\n',
+        ]
+        for index, bad_source in enumerate(variants):
+            with self.subTest(index=index):
+                bad, bad_instructions = self.changed_fixture(bad_source)
+                with self.assertRaises(Invalid):
+                    normalize_bytes(bad, bad_instructions)
+
     def test_linker_zero_reservation_preserves_envelope(self):
         script = self.root / 'reserve.ld'
         script.write_text('SECTIONS { .eh_frame : { *(.eh_frame) . += 512; } } INSERT AFTER .eh_frame_hdr;\n')

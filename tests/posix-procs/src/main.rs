@@ -10,6 +10,19 @@
 #[used]
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
+#[cfg(feature = "lock-full-fixture")]
+mod lock_full;
+#[cfg(feature = "lock-full-capacity")]
+mod lock_full_capacity;
+#[cfg(feature = "lock-full-dup")]
+mod lock_full_dup;
+#[cfg(feature = "lock-full-dup")]
+mod lock_full_dup_wire;
+#[cfg(feature = "lock-full-ofd")]
+mod lock_full_ofd;
+#[cfg(feature = "lock-full-fixture")]
+mod lock_full_wire;
+
 #[cfg(feature = "lifetime-probe")]
 mod lifetime;
 #[cfg(feature = "lifetime-probe")]

@@ -146,11 +146,28 @@ impl Events {
         // Read-only life/eligibility revalidation must not manufacture a new phase.
         self.rechecks |= self.occupied;
     }
-
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_first(&self) -> Option<RegistrationToken> {
+        if self.pending == 0 {
+            return None;
+        }
+        self.registrations[self.pending.trailing_zeros() as usize].map(|entry| entry.0)
+    }
     pub fn recheck_pending(&self) -> bool {
         self.rechecks != 0 || self.recheck.is_some()
     }
-
+    #[cfg(feature = "lock-telemetry")]
+    pub fn telemetry_recheck(&self) -> Option<RegistrationToken> {
+        self.recheck.as_ref().map(|r| r.registration).or_else(|| {
+            let rotated = self.rechecks.rotate_right(u32::from(self.recheck_next));
+            if rotated == 0 {
+                return None;
+            }
+            let slot =
+                (rotated.trailing_zeros() as usize + usize::from(self.recheck_next)) % CAPACITY;
+            self.registrations[slot].map(|entry| entry.0)
+        })
+    }
     fn ready_exact(
         queue: &mut Queue,
         pool: &mut Pool,
