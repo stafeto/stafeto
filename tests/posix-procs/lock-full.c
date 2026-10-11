@@ -136,6 +136,8 @@ static int ring_wait(int own, int target, unsigned index, struct record *r) {
     /* Keep fillers and both descriptors; remove only each critical segment. */
     if (!result && set(target, F_UNLCK, 0)) return fail("ring acquired unlock", index);
     if (set(own, F_UNLCK, 0)) return fail("ring original unlock", index);
+    printf("lock-full: ring terminal owner=%u result=%d errno=%d key=%llu/%llu\n", index,
+           result, error, (unsigned long long)r->key_slot, (unsigned long long)r->key_generation);
     r->result = result; r->error = error; r->phase = result ? 'D' : 'O';
     if (write_record(index, r)) return fail("ring terminal metadata", index);
     return 0;
@@ -301,17 +303,22 @@ static int ring_capture(int fd, uint64_t epoch, const struct record initial[20])
     for (unsigned i = 0; i < 16; ++i) {
         char name[64]; path(name, "go", i);
         if (publish(name, NULL, 0)) return fail("release exact ring owner", i);
+        printf("lock-full: ring await Sleeping owner=%u\n", i);
         if (i < 15) {
             struct record r;
             if (ring_phase(i, 'S', &r) || !r.key_generation || r.key_slot >= 16
                 || r.label != initial[i].label || r.pid != initial[i].pid
                 || memcmp(r.wait_source, initial[i].wait_source, sizeof(r.wait_source)))
                 return fail("actual first fifteen sleeping keys", i);
-        }
+            printf("lock-full: ring Sleeping owner=%u label=%llu key=%llu/%llu\n", i,
+                   (unsigned long long)r.label, (unsigned long long)r.key_slot,
+                   (unsigned long long)r.key_generation);
+        } else printf("lock-full: ring final Start released\n");
     }
     unsigned success = 0, deadlock = 0;
     for (unsigned i = 0; i < 16; ++i) {
         struct record r;
+        printf("lock-full: ring await terminal owner=%u\n", i);
         if (ring_phase(i, 'T', &r) || !r.complete_seen || !r.key_generation
             || r.label != initial[i].label || r.pid != initial[i].pid
             || memcmp(r.wait_source, initial[i].wait_source, sizeof(r.wait_source))
