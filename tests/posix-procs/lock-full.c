@@ -448,6 +448,10 @@ static int coordinator(void) {
         for (unsigned old = 0; old < f; ++old) if (launchers[old] == r.pid) return fail("distinct launchers", f);
     }
     struct record records[20] = {{0}};
+#if FULL_WAKE
+    int wake_witness = -1;
+    uint64_t wake_source[2] = {0};
+#endif
     for (unsigned i = 0; i < first(8); ++i) {
         struct record *r = &records[i];
         unsigned f = 0; while (first(f + 1) <= i) ++f;
@@ -467,6 +471,12 @@ static int coordinator(void) {
             if (fcntl(source, F_GETLK, &lock) || lock.l_type != F_WRLCK || lock.l_pid != (pid_t)r->pid)
                 return fail("foreign PID GETLK real critical/filler", i);
         }
+#if FULL_WAKE
+        if (!i) {
+            if (full_source((unsigned)source, wake_source)) return fail("wake witness full source", i);
+            wake_witness = source;
+        } else
+#endif
         if (close(source)) return fail("witness close", i);
     }
     printf("lock-full: live Pages profile=%u launchers=8 holders=%u total=%u\n", profile, first(8), 8 + first(8));
@@ -497,7 +507,7 @@ static int coordinator(void) {
 #if FULL_RING
     #if FULL_CAPACITY
     #if FULL_WAKE
-    if (wake_capture(fd, observer_source, epoch, records)) return 1;
+    if (wake_capture(fd, observer_source, wake_witness, wake_source, epoch, records)) return 1;
 #else
     if (capacity_capture(fd, observer_source, epoch, records)) return 1;
 #endif
@@ -517,6 +527,9 @@ static int coordinator(void) {
            FULL_RING ? "initial" : "stable", profile, profile, first(8), (unsigned long long)epoch);
     #if FULL_CAPACITY
     if (close(observer_source)) return fail("observer close after Stop", 16);
+#endif
+#if FULL_WAKE
+    if (close(wake_witness)) return fail("wake witness close after Stop", 0);
 #endif
     if (close(fd) || publish("/tmp/lock-full-stop", NULL, 0)) return fail("release owners after Stop", 0);
     return 0;

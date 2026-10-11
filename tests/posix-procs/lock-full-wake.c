@@ -28,7 +28,7 @@ static int wake_wait(int own, int target, unsigned index, struct record *r) {
            (unsigned long long)r->wait_source[0], (unsigned long long)r->wait_source[1], r->canonical);
     return write_record(index, r) ? fail("wake terminal metadata", index) : 0;
 }
-static int wake_capture(int fd, int source, uint64_t epoch, const struct record initial[20]) {
+static int wake_capture(int fd, int source, int witness, const uint64_t exact_source[2], uint64_t epoch, const struct record initial[20]) {
     char name[64];
     for (unsigned i = 0; i < 16; ++i) {
         struct record r; path(name, "go", i);
@@ -49,6 +49,15 @@ static int wake_capture(int fd, int source, uint64_t epoch, const struct record 
         return fail("handler unlock keeps exact live WAIT", 0);
     if (totals(fd, epoch, out) || out[1] != 255 || out[2] || out[3] || out[4] != 127 || out[5] != 8)
         return fail("actual handler255 common127", 0);
+    uint64_t actual_source[2];
+    if (full_source((unsigned)witness, actual_source) || memcmp(actual_source, exact_source, sizeof(actual_source)))
+        return fail("wake retained exact range source", 0);
+    struct flock critical = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+    struct flock filler = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 2, .l_len = 1};
+    if (fcntl(witness, F_GETLK, &critical) || critical.l_type != F_WRLCK
+        || critical.l_pid != (pid_t)initial[0].pid || critical.l_start != 0 || critical.l_len != 1
+        || fcntl(witness, F_GETLK, &filler) || filler.l_type != F_UNLCK)
+        return fail("handler removed exact filler and preserved critical", 0);
     printf("lock-full: wake handler profile=%u published=255 common=127 label=%llu key=%llu/%llu\n", profile,
            (unsigned long long)after.label, (unsigned long long)after.key_slot, (unsigned long long)after.key_generation);
     path(name, "go", 16);
