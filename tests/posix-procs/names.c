@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <sys/statvfs.h>
+#include <sys/resource.h>
 
 #define NAMES_ROOT "/tmp/nm"
 
@@ -573,7 +574,21 @@ static int names_truncate(void) {
     CHECK(st.st_size == 0);
     /* The errors. */
     FAILS(ftruncate(fd, -1), EINVAL);
-    FAILS(ftruncate(fd, 1LL << 40), EFBIG);
+    /* This assertion tests physical file capacity, independently of FSIZE. */
+    struct rlimit saved_size, restored_size;
+    OK(getrlimit(RLIMIT_FSIZE, &saved_size));
+    const struct rlimit physical_size = {1ULL << 40,
+        saved_size.rlim_max > (1ULL << 40) ? saved_size.rlim_max : (1ULL << 40)};
+    OK(setrlimit(RLIMIT_FSIZE, &physical_size));
+    errno = 0;
+    int oversized = ftruncate(fd, 1LL << 40);
+    int oversized_errno = errno;
+    /* Restore before checking the outcome, including an unexpected success. */
+    OK(setrlimit(RLIMIT_FSIZE, &saved_size));
+    OK(getrlimit(RLIMIT_FSIZE, &restored_size));
+    CHECK(restored_size.rlim_cur == saved_size.rlim_cur
+        && restored_size.rlim_max == saved_size.rlim_max);
+    CHECK(oversized == -1 && oversized_errno == EFBIG);
     OK(fstat(fd, &st));
     CHECK(st.st_size == 0);
     CHECK(close(fd) == 0);
