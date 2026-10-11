@@ -947,3 +947,34 @@ fn dead_previous_pid_blocker_is_not_proved_by_another_remaining_live_blocker() {
     assert_eq!(f.pool.proof_snapshot(a), Some(before));
     assert_ne!(f.finish().verdict, Verdict::Deadlock);
 }
+
+#[test]
+fn first_blocked_pid_without_own_group_keeps_sleeping_until_true_death() {
+    let mut f = Fixture::new();
+    f.hold(257, "/b", LockKind::Write);
+    let token = f.wait(256, "/b", 0);
+    // Conflict finishes before group admission. A live first requester therefore
+    // has no logical lock head; that absence is not Process death.
+    assert!(f.page.live(256));
+    assert!(!f.locks.pid_visible(256));
+    let before = f.pool.proof_snapshot(token).unwrap();
+    let mut events = new_events();
+    events.attach(&f.pool, token).unwrap();
+    for _ in 0..32 {
+        events.poll();
+        assert_eq!(recheck(&mut f, &mut events).readied, 0);
+        assert_eq!(f.pool.proof_snapshot(token), Some(before));
+    }
+    // Real death remains authoritative even though the other PID's blocker lives.
+    assert!(f.page.retire(256));
+    events.poll();
+    let mut readied = 0;
+    for _ in 0..32 {
+        readied += recheck(&mut f, &mut events).readied;
+        if readied != 0 {
+            break;
+        }
+    }
+    assert_eq!(readied, 1);
+    assert_eq!(f.pool.snapshot(token).unwrap().1, SleepPhase::Ready);
+}

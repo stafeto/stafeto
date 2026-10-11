@@ -388,6 +388,8 @@ pub fn thread_interrupt(thread: &Handle<Thread>) -> Result<(), Error> {
 }
 
 /// Request the entry installed by the target itself; coalesces while masked.
+// SAFETY: this executable .text section remains in the native RX segment.
+#[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
 pub fn thread_upcall_request(thread: &Handle<Thread>) -> Result<(), Error> {
     call::<{ Call::ThreadUpcallRequest.number() }>(&[thread.raw().0]).map(|_| ())
 }
