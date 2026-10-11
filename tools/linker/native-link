@@ -14,13 +14,13 @@ sys.dont_write_bytecode = True
 from cfi import Invalid, SpaceShortage, normalize_file, require
 
 
-def llvm_tools(explicit):
+def llvm_tools(explicit, inherited):
     if explicit:
         linker = Path(explicit).resolve()
         return linker, linker.with_name('llvm-objdump')
     compiler = os.environ.get('RUSTC', 'rustc')
-    sysroot = subprocess.check_output([compiler, '--print', 'sysroot'], text=True).strip()
-    version = subprocess.check_output([compiler, '-vV'], text=True)
+    sysroot = subprocess.check_output([compiler, '--print', 'sysroot'], text=True, pass_fds=inherited).strip()
+    version = subprocess.check_output([compiler, '-vV'], text=True, pass_fds=inherited)
     host = re.search(r'^host: (.+)$', version, re.M)
     require(host is not None, 'selected rustc has no host triple')
     directory = Path(sysroot) / 'lib/rustlib' / host[1] / 'bin'
@@ -38,13 +38,34 @@ def expand_response(arguments, depth=0):
     return result
 
 
+def jobserver_fds(value):
+    records = []
+    for argument in shlex.split(value):
+        if argument.startswith(('--jobserver-fds=', '--jobserver-auth=')):
+            pair = argument.split('=', 1)[1]
+            if match := re.fullmatch(r'(\d+),(\d+)', pair):
+                records.append(tuple(map(int, match.groups())))
+            else:
+                require(argument.startswith('--jobserver-auth=fifo:') and len(pair) > 5,
+                        'unsupported Cargo jobserver descriptor spelling')
+                records.append(pair)
+    if not records:
+        return ()
+    require(all(record == records[0] for record in records), 'contradictory Cargo jobserver descriptors')
+    pair = records[0]
+    if isinstance(pair, str):
+        return ()
+    require(pair[0] > 2 and pair[1] > 2 and pair[0] != pair[1], 'invalid Cargo jobserver descriptors')
+    for descriptor in pair:
+        os.fstat(descriptor)
+    return pair
+
+
 def main(arguments):
     explicit = None
     if arguments[:1] == ['--stafeto-real-linker']:
         require(len(arguments) >= 3, 'missing explicit linker or linker arguments')
         explicit, arguments = arguments[1], arguments[2:]
-    linker, objdump = llvm_tools(explicit)
-    require(linker.is_file() and objdump.is_file(), 'run rustup component add llvm-tools for the selected rustc')
     expanded = expand_response(arguments)
     outputs = [expanded[i + 1] for i, argument in enumerate(expanded[:-1]) if argument == '-o']
     require(len(outputs) == 1, 'native link requires exactly one -o output')
@@ -54,7 +75,14 @@ def main(arguments):
         # Stable rustc's ld flavor sends GNU arguments without a driver selector.
         arguments = ['-flavor', 'gnu', *arguments]
     output = Path(outputs[0])
-    status = subprocess.run([str(linker), *arguments]).returncode
+    try:
+        inherited = jobserver_fds(os.environ.get('CARGO_MAKEFLAGS', ''))
+        linker, objdump = llvm_tools(explicit, inherited)
+        require(linker.is_file() and objdump.is_file(), 'run rustup component add llvm-tools for the selected rustc')
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
+    status = subprocess.run([str(linker), *arguments], pass_fds=inherited).returncode
     if status:
         return status
     try:
@@ -67,7 +95,7 @@ def main(arguments):
             with tempfile.TemporaryDirectory(prefix='stafeto-eh-') as directory:
                 script = Path(directory) / 'reserve.ld'
                 script.write_text('SECTIONS { .eh_frame : { *(.eh_frame) . += 512; } } INSERT AFTER .eh_frame_hdr;\n')
-                status = subprocess.run([str(linker), *arguments, '-T', str(script)]).returncode
+                status = subprocess.run([str(linker), *arguments, '-T', str(script)], pass_fds=inherited).returncode
                 if status:
                     output.unlink(missing_ok=True)
                     return status
