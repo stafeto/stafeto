@@ -23,7 +23,7 @@ import sys
 REPOSITORY = "https://github.com/stafeto/relibc.git"
 # Published fork topic codex/tcgetattr-direct, tagged pin-e1e52d9.
 # The checked topic is independent of the fork's stafeto merge branch.
-COMMIT = "e1e52d9e8ed54bc5ddce869d886943816c9cd233"
+COMMIT = "d86c617775f89d9111909b9f52e6a3829cd36f4f"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
