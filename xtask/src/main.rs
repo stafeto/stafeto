@@ -583,7 +583,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
-/// Lifetime observations exist only in this dedicated image.
+/// Lifetime observations are enabled in the dedicated lock-probe images.
 const POSIX_LIFETIMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["lifetime-probe", "steps"];
@@ -599,6 +599,16 @@ const POSIX_LOCK_LIFECYCLE_PROGRAMS: [ImageProgram; 10] = {
 const POSIX_LOCK_CORE_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_LIFETIMES_PROGRAMS;
     programs[5].3 = &["lock-core-probe"];
+    programs
+};
+const POSIX_LOCK_PAGE_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_LIFETIMES_PROGRAMS;
+    programs[5].3 = &["page-fragments"];
+    programs
+};
+const POSIX_LOCK_FIFO_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_LIFETIMES_PROGRAMS;
+    programs[5].3 = &["lock-fifo-full"];
     programs
 };
 const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
@@ -1218,6 +1228,8 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-lock-pages measure a full inode spread over 64 paid physical pages
+  posix-lock-queue-core measure 64 genuine waits together with 64 held regions
   posix-lock-core measure public locks at the full inode64 limit
   posix-lock-lifecycle-rules verify the five L2-L6 lock lifecycle rules
   posix-procs run the C probe of POSIX processes: posix_spawn from the
@@ -1340,8 +1352,12 @@ fn main() {
         Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
-        Some("posix-lock-lifecycle-rules") => posix_lifetimes_run(&qemu::VIRT, true, false),
-        Some("posix-lock-core") => posix_lifetimes_run(&qemu::VIRT, false, true),
+        Some("posix-lock-lifecycle-rules") => {
+            posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Rules)
+        }
+        Some("posix-lock-core") => posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Core),
+        Some("posix-lock-pages") => posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Pages),
+        Some("posix-lock-queue-core") => posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Fifo),
         Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -3275,25 +3291,37 @@ fn posix_lock_ring_probe(machine: &qemu::Machine) -> Result<(), String> {
 }
 
 fn posix_lifetimes_probe(machine: &qemu::Machine) -> Result<(), String> {
-    posix_lifetimes_run(machine, false, false)
+    posix_lifetimes_run(machine, LifetimeProbe::Full)
 }
 
-fn posix_lifetimes_run(
-    machine: &qemu::Machine,
-    rules_only: bool,
-    core_only: bool,
-) -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LifetimeProbe {
+    Full,
+    Rules,
+    Core,
+    Pages,
+    Fifo,
+}
+
+fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
-    let programs = if core_only {
-        &POSIX_LOCK_CORE_PROGRAMS
-    } else if rules_only {
-        &POSIX_LOCK_LIFECYCLE_PROGRAMS
-    } else {
-        &POSIX_LIFETIMES_PROGRAMS
+    let programs = match probe {
+        LifetimeProbe::Full => &POSIX_LIFETIMES_PROGRAMS,
+        LifetimeProbe::Rules => &POSIX_LOCK_LIFECYCLE_PROGRAMS,
+        LifetimeProbe::Core => &POSIX_LOCK_CORE_PROGRAMS,
+        LifetimeProbe::Pages => &POSIX_LOCK_PAGE_PROGRAMS,
+        LifetimeProbe::Fifo => &POSIX_LOCK_FIFO_PROGRAMS,
     };
-    let image = build_boot_image("boot-posix-lifetimes.img", programs, BOOT_PROFILE)?;
+    let image_name = match probe {
+        LifetimeProbe::Full => "boot-posix-lifetimes.img",
+        LifetimeProbe::Rules => "boot-posix-lock-rules.img",
+        LifetimeProbe::Core => "boot-posix-lock-core.img",
+        LifetimeProbe::Pages => "boot-posix-lock-pages.img",
+        LifetimeProbe::Fifo => "boot-posix-lock-fifo.img",
+    };
+    let image = build_boot_image(image_name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::ICOUNT);
@@ -3308,7 +3336,39 @@ fn posix_lifetimes_run(
     if ended? != "init: posix-procs ended: exit code 0, not restarted" {
         return Err("the PID lifetime probe failed".into());
     }
-    if core_only {
+    if probe == LifetimeProbe::Fifo {
+        qemu::expect_marker(
+            &outcome,
+            "posix-procs: full lock FIFO: genuine 65th WAIT refused with NO_LOCKS",
+        )?;
+        qemu::expect_marker(
+            &outcome,
+            "posix-procs: full lock FIFO: 64 compatible queued OFDs, 64 held PID records, GET canonical and SET ENOLCK atomic",
+        )?;
+        let steps = longest_steps(&outcome.lines, "2");
+        println!("RAM full FIFO and inode dispatches (B {RAM_STEP_MAX}): {steps:?}");
+        if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "full FIFO and inode dispatch exceeds {RAM_STEP_MAX}: {steps:?}"
+            ));
+        }
+        return Ok(());
+    }
+    if probe == LifetimeProbe::Pages {
+        qemu::expect_marker(
+            &outcome,
+            "posix-procs: fragmented lock pages: 64 paid pages, 64 target records, one PID death, all pages reclaimed",
+        )?;
+        let steps = longest_steps(&outcome.lines, "2");
+        println!("RAM fragmented lock page dispatches (B {RAM_STEP_MAX}): {steps:?}");
+        if steps.iter().any(|(_, ticks, _)| *ticks > RAM_STEP_MAX) {
+            return Err(format!(
+                "fragmented lock page dispatch exceeds {RAM_STEP_MAX}: {steps:?}"
+            ));
+        }
+        return Ok(());
+    }
+    if probe == LifetimeProbe::Core {
         qemu::expect_marker(&outcome, "posix-procs: full inode lock core ok")?;
         let steps = longest_steps(&outcome.lines, "2");
         println!("RAM full inode lock dispatches (B {RAM_STEP_MAX}): {steps:?}");
@@ -3319,7 +3379,7 @@ fn posix_lifetimes_run(
         }
         return Ok(());
     }
-    if rules_only {
+    if probe == LifetimeProbe::Rules {
         qemu::expect_marker(&outcome, "posix-procs: lock lifecycle rules ok")?;
         return Ok(());
     }
@@ -5098,7 +5158,13 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),
         job("posix-lock-ring", || posix_lock_ring_probe(&qemu::VIRT)),
         job("posix-lock-core", || {
-            posix_lifetimes_run(&qemu::VIRT, false, true)
+            posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Core)
+        }),
+        job("posix-lock-pages", || {
+            posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Pages)
+        }),
+        job("posix-lock-queue-core", || {
+            posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Fifo)
         }),
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),

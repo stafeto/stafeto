@@ -22,6 +22,8 @@ fn main() {
     println!("cargo:rerun-if-changed=wait-lifecycle.c");
     println!("cargo:rerun-if-changed=lock-deadlock.c");
     println!("cargo:rerun-if-changed=lock-simple-wait.c");
+    println!("cargo:rerun-if-changed=lock-page-fragments.c");
+    println!("cargo:rerun-if-changed=lock-fifo-full.c");
     println!("cargo:rerun-if-changed=files.c");
     println!("cargo:rerun-if-changed=names.c");
     println!("cargo:rerun-if-changed=names-loss.c");
@@ -78,6 +80,14 @@ fn main() {
         .arg(format!(
             "-DLOCK_CORE_ONLY={}",
             u8::from(env::var_os("CARGO_FEATURE_LOCK_CORE_PROBE").is_some())
+        ))
+        .arg(format!(
+            "-DPAGE_FRAGMENTS_ONLY={}",
+            u8::from(env::var_os("CARGO_FEATURE_PAGE_FRAGMENTS").is_some())
+        ))
+        .arg(format!(
+            "-DLOCK_FIFO_FULL_ONLY={}",
+            u8::from(env::var_os("CARGO_FEATURE_LOCK_FIFO_FULL").is_some())
         ))
         .arg(format!("-DSTEPS_BRANCHES={branches}"))
         .arg(format!("-DSTEPS_SESSIONS={sessions}"))

@@ -22,6 +22,12 @@
 #ifndef LOCK_CORE_ONLY
 #define LOCK_CORE_ONLY 0
 #endif
+#ifndef PAGE_FRAGMENTS_ONLY
+#define PAGE_FRAGMENTS_ONLY 0
+#endif
+#ifndef LOCK_FIFO_FULL_ONLY
+#define LOCK_FIFO_FULL_ONLY 0
+#endif
 
 extern void stafeto_probe_loader_bundle(unsigned mode);
 extern int process_lifetime(int pid);
@@ -651,8 +657,34 @@ static void public_lock_signals(void) {
 #include "wait-lifecycle.c"
 #include "lock-deadlock.c"
 #include "lock-simple-wait.c"
+#include "lock-page-fragments.c"
+#if LOCK_FIFO_FULL_ONLY
+#include "lock-fifo-full.c"
+#endif
 
 int main(int argc, char **argv) {
+#if LOCK_FIFO_FULL_ONLY
+    if (argc > 1 && strcmp(argv[1], "lock-fifo-full-run") == 0)
+        return public_lock_fifo_full();
+    if (argc <= 1) {
+        char *args[] = {"procs-child", "lock-fifo-full-run", NULL}, *env[] = {NULL};
+        pid_t child = -1;
+        expect("spawn mapped full FIFO supervisor",
+               posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, env), 0);
+        if (child > 0) reap(child, 0);
+        return failures != 0;
+    }
+#endif
+    if (argc > 1 && strcmp(argv[1], "page-fragments-run") == 0)
+        return public_lock_page_fragments();
+    if (PAGE_FRAGMENTS_ONLY && argc <= 1) {
+        char *args[] = {"procs-child", "page-fragments-run", NULL}, *env[] = {NULL};
+        pid_t child = -1;
+        expect("spawn mapped page fragments supervisor",
+               posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, env), 0);
+        if (child > 0) reap(child, 0);
+        return failures != 0;
+    }
     char *core_args[] = {"posix-procs", "lock-core", NULL};
     if (LOCK_CORE_ONLY && argc <= 1) { argc = 2; argv = core_args; }
     if (argc > 1 && strcmp(argv[1], "lock-core") == 0) {

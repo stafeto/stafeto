@@ -356,7 +356,8 @@ impl<H> Waits<H> {
             at = r.next;
         }
     }
-    fn incompatible(a: Request, b: Request) -> bool {
+    #[inline(always)]
+    fn incompatible(a: &Request, b: &Request) -> bool {
         matches!((a.command, b.command), (Command::Set(Some(ak)), Command::Set(Some(bk)))
             if a.owner != b.owner && (ak == Kind::Write || bk == Kind::Write) && a.range.overlaps(b.range))
     }
@@ -377,10 +378,10 @@ impl<H> Waits<H> {
             if r.number >= number {
                 break;
             }
-            let older = r.captured.request;
+            let older = &r.captured.request;
             if older.inode == request.inode
+                && Self::incompatible(older, &request)
                 && live(older.owner)
-                && Self::incompatible(older, request)
             {
                 let Command::Set(Some(kind)) = older.command else {
                     unreachable!()
@@ -646,7 +647,7 @@ impl<H> Waits<H> {
                                         && older.captured.request.owner
                                             == Owner::Process(edge.blocker)
                                         && live(Owner::Process(edge.blocker))
-                                        && Self::incompatible(older.captured.request, request)
+                                        && Self::incompatible(&older.captured.request, &request)
                                         && source_live(older.captured, older.id.owner())
                                 })
                         } else {
@@ -797,7 +798,7 @@ impl<H> Waits<H> {
                 if older.number >= r.number {
                     break;
                 }
-                if Self::incompatible(older.captured.request, request) {
+                if Self::incompatible(&older.captured.request, &request) {
                     if let Owner::Process(blocker) = older.captured.request.owner {
                         if live(Owner::Process(blocker)) {
                             self.check.blockers[self.check.blockers_len] =

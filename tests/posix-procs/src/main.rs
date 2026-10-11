@@ -173,5 +173,7 @@ extern "C" fn files_full_sessions() -> i32 {
     }
 }
 
+#[cfg(feature = "lock-fifo-full")]
+mod lock_fifo_full;
 #[cfg(feature = "lifetime-probe")]
 mod lock_ring;

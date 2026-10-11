@@ -16,6 +16,8 @@ bench = false
 [features]
 lifetime-rules = ["lifetime-probe"]
 lock-core-probe = ["lifetime-probe"]
+page-fragments = ["lifetime-probe"]
+lock-fifo-full = ["lifetime-probe"]
 lifetime-probe = ["pending-open", "dep:proto-process", "posix-abi/close-probe", "posix-abi/lock-probe", "posix-abi/wait-probe"]
 jobs = []
 native-scopes-launcher = []
