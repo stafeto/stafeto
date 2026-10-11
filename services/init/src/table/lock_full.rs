@@ -10,49 +10,49 @@ pub const TABLE4: &[Record] = &[
     BASE[3],
     Record {
         name: "lock-full-0",
-        args: b"posix-procs\0full-launch\04\00\0",
+        args: b"posix-procs\0full-launch\x004\x000\0",
         root: true,
         ..BASE[4]
     },
     Record {
         name: "lock-full-1",
-        args: b"posix-procs\0full-launch\04\01\0",
+        args: b"posix-procs\0full-launch\x004\x001\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-2",
-        args: b"posix-procs\0full-launch\04\02\0",
+        args: b"posix-procs\0full-launch\x004\x002\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-3",
-        args: b"posix-procs\0full-launch\04\03\0",
+        args: b"posix-procs\0full-launch\x004\x003\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-4",
-        args: b"posix-procs\0full-launch\04\04\0",
+        args: b"posix-procs\0full-launch\x004\x004\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-5",
-        args: b"posix-procs\0full-launch\04\05\0",
+        args: b"posix-procs\0full-launch\x004\x005\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-6",
-        args: b"posix-procs\0full-launch\04\06\0",
+        args: b"posix-procs\0full-launch\x004\x006\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-7",
-        args: b"posix-procs\0full-launch\04\07\0",
+        args: b"posix-procs\0full-launch\x004\x007\0",
         root: false,
         ..BASE[4]
     },
@@ -66,49 +66,49 @@ pub const TABLE7: &[Record] = &[
     BASE[3],
     Record {
         name: "lock-full-0",
-        args: b"posix-procs\0full-launch\07\00\0",
+        args: b"posix-procs\0full-launch\x007\x000\0",
         root: true,
         ..BASE[4]
     },
     Record {
         name: "lock-full-1",
-        args: b"posix-procs\0full-launch\07\01\0",
+        args: b"posix-procs\0full-launch\x007\x001\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-2",
-        args: b"posix-procs\0full-launch\07\02\0",
+        args: b"posix-procs\0full-launch\x007\x002\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-3",
-        args: b"posix-procs\0full-launch\07\03\0",
+        args: b"posix-procs\0full-launch\x007\x003\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-4",
-        args: b"posix-procs\0full-launch\07\04\0",
+        args: b"posix-procs\0full-launch\x007\x004\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-5",
-        args: b"posix-procs\0full-launch\07\05\0",
+        args: b"posix-procs\0full-launch\x007\x005\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-6",
-        args: b"posix-procs\0full-launch\07\06\0",
+        args: b"posix-procs\0full-launch\x007\x006\0",
         root: false,
         ..BASE[4]
     },
     Record {
         name: "lock-full-7",
-        args: b"posix-procs\0full-launch\07\07\0",
+        args: b"posix-procs\0full-launch\x007\x007\0",
         root: false,
         ..BASE[4]
     },
