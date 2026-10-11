@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
- * Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 /* Included only by lifetime.c. All lock results are genuine public fcntl calls. */
 extern void deadlock_probe_arm(void);
 extern void deadlock_probe_disarm(void);
