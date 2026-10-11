@@ -16,6 +16,26 @@ pub enum Probe {
 }
 #[cfg(feature = "close-probe")]
 static HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "exec-close-probe")]
+static ACCEPTED_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Observe an actual successful event receipt before a probe discards it.
+#[cfg(feature = "exec-close-probe")]
+pub fn accepted_hook(hook: Option<fn(CloseToken) -> bool>) {
+    ACCEPTED_HOOK.store(
+        hook.map_or(0, |hook| hook as usize),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+#[cfg(feature = "exec-close-probe")]
+fn accepted(token: CloseToken) -> bool {
+    let raw = ACCEPTED_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: accepted_hook stores only this function-pointer type.
+    let hook: fn(CloseToken) -> bool = unsafe { core::mem::transmute(raw) };
+    hook(token)
+}
 #[cfg(feature = "close-probe")]
 pub fn probe_hook(hook: Option<fn(Probe, CloseToken) -> bool>) {
     HOOK.store(
@@ -240,10 +260,18 @@ fn event_step(
         last_alias: snapshot.last_alias,
     };
     let receipt = transport.files().close_event_once(event);
-    #[cfg(feature = "close-probe")]
+    #[cfg(any(feature = "close-probe", feature = "exec-close-probe"))]
     let mut receipt = receipt;
     #[cfg(feature = "close-probe")]
-    if probed(Probe::Event, token) && receipt.is_ok() {
+    let drop_attempt = probed(Probe::Event, token);
+    #[cfg(all(not(feature = "close-probe"), feature = "exec-close-probe"))]
+    let drop_attempt = false;
+    #[cfg(feature = "exec-close-probe")]
+    let drop_accepted = crate::exec_receipt_probe::on_accepted(receipt.is_ok(), || accepted(token));
+    #[cfg(all(not(feature = "exec-close-probe"), feature = "close-probe"))]
+    let drop_accepted = false;
+    #[cfg(any(feature = "close-probe", feature = "exec-close-probe"))]
+    if (drop_attempt || drop_accepted) && receipt.is_ok() {
         receipt = Err(Status::Kernel(rt::abi::Error::Interrupted));
     }
     let confirmed = crate::shared::with_files(|files| {

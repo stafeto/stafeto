@@ -605,7 +605,13 @@ const fn posix_lock_full_programs(profile: u32, phase: u32) -> [ImageProgram; 10
         &["table-posix-lock-full7"]
     };
     programs[1].3 = &["lifetime-probe", "steps", "lock-telemetry"];
-    programs[5].3 = if phase == 11 {
+    programs[5].3 = if phase == 14 {
+        &["lock-full-exec-cloexec-last"]
+    } else if phase == 13 {
+        &["lock-full-exec-cloexec-surviving"]
+    } else if phase == 12 {
+        &["lock-full-exec-cloexec-pid"]
+    } else if phase == 11 {
         &["lock-full-exec-ofd"]
     } else if phase == 10 {
         &["lock-full-exec-pid"]
@@ -637,6 +643,18 @@ const POSIX_LOCK_FULL4_EXEC_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_p
 const POSIX_LOCK_FULL7_EXEC_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 10);
 const POSIX_LOCK_FULL4_EXEC_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 11);
 const POSIX_LOCK_FULL7_EXEC_OFD_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 11);
+const POSIX_LOCK_FULL4_EXEC_CLOEXEC_PID_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(4, 12);
+const POSIX_LOCK_FULL7_EXEC_CLOEXEC_PID_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(7, 12);
+const POSIX_LOCK_FULL4_EXEC_CLOEXEC_SURVIVING_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(4, 13);
+const POSIX_LOCK_FULL7_EXEC_CLOEXEC_SURVIVING_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(7, 13);
+const POSIX_LOCK_FULL4_EXEC_CLOEXEC_LAST_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(4, 14);
+const POSIX_LOCK_FULL7_EXEC_CLOEXEC_LAST_PROGRAMS: [ImageProgram; 10] =
+    posix_lock_full_programs(7, 14);
 const POSIX_LOCK_FULL7_DUP_PID_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 7);
 const POSIX_LOCK_FULL4_DUP_LAST_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(4, 8);
 const POSIX_LOCK_FULL7_DUP_LAST_PROGRAMS: [ImageProgram; 10] = posix_lock_full_programs(7, 8);
@@ -1431,7 +1449,16 @@ fn main() {
             [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-ofd" => {
                 posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 11)
             }
-            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd|dup-pid|dup-ofd-last|dup-ofd-alias|exec-pid|exec-ofd]".to_owned()),
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-cloexec-pid" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 12)
+            }
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-cloexec-surviving" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 13)
+            }
+            [profile, mode] if (profile == "4" || profile == "7") && mode == "exec-cloexec-last" => {
+                posix_lock_full_probe(&qemu::VIRT, if profile == "4" { 4 } else { 7 }, 14)
+            }
+            _ => Err("posix-lock-full 4|7 [ring|capacity|wake|death|close|ofd|dup-pid|dup-ofd-last|dup-ofd-alias|exec-pid|exec-ofd|exec-cloexec-pid|exec-cloexec-surviving|exec-cloexec-last]".to_owned()),
         },
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
@@ -3313,6 +3340,31 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let (name, programs) = match (profile, phase) {
+        (4, 12) => (
+            "boot-posix-lock-full4-exec-cloexec-pid.img",
+            &POSIX_LOCK_FULL4_EXEC_CLOEXEC_PID_PROGRAMS,
+        ),
+        (7, 12) => (
+            "boot-posix-lock-full7-exec-cloexec-pid.img",
+            &POSIX_LOCK_FULL7_EXEC_CLOEXEC_PID_PROGRAMS,
+        ),
+        (4, 13) => (
+            "boot-posix-lock-full4-exec-cloexec-surviving.img",
+            &POSIX_LOCK_FULL4_EXEC_CLOEXEC_SURVIVING_PROGRAMS,
+        ),
+        (7, 13) => (
+            "boot-posix-lock-full7-exec-cloexec-surviving.img",
+            &POSIX_LOCK_FULL7_EXEC_CLOEXEC_SURVIVING_PROGRAMS,
+        ),
+        (4, 14) => (
+            "boot-posix-lock-full4-exec-cloexec-last.img",
+            &POSIX_LOCK_FULL4_EXEC_CLOEXEC_LAST_PROGRAMS,
+        ),
+        (7, 14) => (
+            "boot-posix-lock-full7-exec-cloexec-last.img",
+            &POSIX_LOCK_FULL7_EXEC_CLOEXEC_LAST_PROGRAMS,
+        ),
+
         (4, 10) => (
             "boot-posix-lock-full4-exec-pid.img",
             &POSIX_LOCK_FULL4_EXEC_PID_PROGRAMS,
@@ -3484,6 +3536,16 @@ fn posix_lock_full_probe(machine: &qemu::Machine, profile: u32, phase: u32) -> R
                 phase - 6
             ),
         )?;
+    }
+    if (12..=14).contains(&phase) {
+        let marker = outcome
+            .lines
+            .iter()
+            .find(|line| line.starts_with("lock-full: exec cloexec "))
+            .ok_or_else(|| "CLOEXEC witness is missing".to_owned())?;
+        if !lock_full_cloexec_wire::marker(marker, u64::from(profile), u64::from(phase - 9)) {
+            return Err(format!("invalid CLOEXEC witness: {marker}"));
+        }
     }
     if (10..=11).contains(&phase) {
         let marker = outcome
@@ -7709,7 +7771,12 @@ mod tests {
         close_features.sort_unstable();
         assert_eq!(
             close_features,
-            ["lifetime-probe", "lock-full-dup", "lock-full-ofd"]
+            [
+                "lifetime-probe",
+                "lock-full-dup",
+                "lock-full-exec-cloexec",
+                "lock-full-ofd"
+            ]
         );
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[1].3, &["lifetime-probe", "steps"]);
         assert_eq!(POSIX_LIFETIMES_PROGRAMS[3].3, &["lifetime-probe"]);
@@ -8630,3 +8697,10 @@ mod lock_full_dup_wire;
 #[path = "../../tests/posix-procs/src/lock_full_exec_wire.rs"]
 #[allow(dead_code)]
 mod lock_full_exec_wire;
+
+#[cfg(test)]
+#[path = "../../lib/posix-abi/src/exec_receipt_probe.rs"]
+mod exec_receipt_probe;
+#[path = "../../tests/posix-procs/src/lock_full_cloexec_wire.rs"]
+#[allow(dead_code)]
+mod lock_full_cloexec_wire;

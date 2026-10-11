@@ -15,9 +15,13 @@ pub mod clock;
 mod close_driver;
 mod drain_driver;
 mod drain_hooks;
+#[cfg(feature = "exec-close-probe")]
+pub use close_driver::accepted_hook as probe_close_accepted;
 #[cfg(feature = "close-probe")]
 pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;
+#[cfg(feature = "exec-close-probe")]
+mod exec_receipt_probe;
 pub mod fork;
 pub mod loader_probe;
 mod lock_driver;
