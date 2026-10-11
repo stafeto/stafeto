@@ -399,6 +399,96 @@ class LinkedInstructionTests(unittest.TestCase):
         with self.assertRaisesRegex(Invalid, 'unsupported EH record'):
             normalize_bytes(bytes(broken), self.instructions)
 
+    def test_delayed_fp_parent_lr_at_real_spill_call(self):
+        extra = r"""
+.type delayed_fp_caller,%function
+delayed_fp_caller:
+.cfi_startproc
+sub sp,sp,#112
+.cfi_def_cfa_offset 112
+stp x29,x30,[sp,#32]
+bl OUTLINED_FUNCTION_3
+add x29,sp,#32
+.cfi_def_cfa 29,80
+.cfi_offset 29,-80
+.cfi_offset 30,-72
+.cfi_offset 19,-96
+.cfi_offset 20,-88
+ldp x19,x20,[sp,#16]
+.cfi_restore 19
+.cfi_restore 20
+.cfi_def_cfa 31,112
+ldp x29,x30,[sp,#32]
+.cfi_restore 29
+.cfi_restore 30
+add sp,sp,#112
+.cfi_def_cfa_offset 0
+ret
+.cfi_endproc
+.size delayed_fp_caller,.-delayed_fp_caller
+"""
+        data, instructions = self.changed_fixture(ASSEMBLY+extra)
+        fixed, _ = normalize_bytes(data, instructions)
+        from cfi import events, row_at
+        before, after = Elf(data), Elf(fixed)
+        start = next(a for a,names in before.symbols.items() if any(n=='delayed_fp_caller' for n,_ in names))
+        old = next(f for f in before.records() if isinstance(f,Fde) and f.start==start)
+        new = next(f for f in after.records() if isinstance(f,Fde) and f.start==start)
+        call = start+8
+        oldrow = row_at(events(old.program, start, old.cie.code), call, old.cie.initial, old.cie.data)
+        newrow = row_at(events(new.program, start, new.cie.code), call, new.cie.initial, new.cie.data)
+        self.assertEqual(oldrow.rule(30), ('same',30))
+        self.assertEqual(newrow.cfa, (31,112))
+        self.assertEqual(newrow.rule(30), ('offset',-72))
+        self.assertEqual(newrow.rule(29), ('same',29))
+        parent_sp, parent_lr = 0x10000, 0xa55a55
+        physical_sp = parent_sp-112
+        memory = {physical_sp+40:parent_lr}
+        self.assertEqual(memory[physical_sp+newrow.cfa[1]+newrow.rule(30)[1]], parent_lr)
+        self.assertNotEqual(call+4, parent_lr)
+        variants = [
+            extra.replace('add x29,sp,#32', 'add x29,sp,#16'),
+            extra.replace('stp x29,x30,[sp,#32]', 'stp x29,x30,[sp,#24]'),
+            extra.replace('add x29,sp,#32', 'nop\nadd x29,sp,#32'),
+            extra.replace('stp x29,x30,[sp,#32]', 'b delayed_skip\nstp x29,x30,[sp,#32]\ndelayed_skip:'),
+        ]
+        for index, wrong in enumerate(variants):
+            with self.subTest(index=index):
+                bad, bad_instructions = self.changed_fixture(ASSEMBLY+wrong)
+                with self.assertRaises(Invalid):
+                    normalize_bytes(bad, bad_instructions)
+        bad, bad_instructions = self.changed_fixture((ASSEMBLY+extra).replace('stp x19,x20,[sp,#16]\nret', 'stp x19,x20,[sp,#16]\nmov x29,x0\nret'))
+        with self.assertRaises(Invalid):
+            normalize_bytes(bad, bad_instructions)
+
+    def test_unknown_parent_lr_is_terminal_rejection(self):
+        source = ASSEMBLY+"\n.type unknown_parent,%function\nunknown_parent:\n.cfi_startproc\nbl OUTLINED_FUNCTION_0\nret\n.cfi_endproc\n.size unknown_parent,.-unknown_parent\n"
+        data, instructions = self.changed_fixture(source)
+        with self.assertRaisesRegex(Invalid, 'unrecoverable parent LR'):
+            normalize_bytes(data, instructions)
+
+    def test_real_jobserver_pipes_and_closed_extra(self):
+        import runpy
+        helper = runpy.run_path(str(Path(__file__).with_name('native-link')))['jobserver_fds']
+        read, write = os.pipe()
+        extra_read, extra_write = os.pipe()
+        try:
+            os.set_inheritable(extra_read, True)
+            pair = helper(f'-j --jobserver-fds={read},{write} --jobserver-auth={read},{write}')
+            self.assertEqual(pair, (read, write))
+            subprocess.run([sys.executable, '-c',
+                'import os,sys\nr,w,e=map(int,sys.argv[1:])\nos.write(w,b"x")\nassert os.read(r,1)==b"x"\n'
+                'try: os.fstat(e)\nexcept OSError: pass\nelse: raise AssertionError("extra fd leaked")',
+                str(read), str(write), str(extra_read)], pass_fds=pair, check=True)
+            for value in (f'--jobserver-fds={read},{write} --jobserver-auth={write},{read}',
+                          f'--jobserver-auth={read},{read}', '--jobserver-fds=1,2', '--jobserver-auth=3,no'):
+                with self.subTest(value=value), self.assertRaises(Invalid):
+                    helper(value)
+            self.assertEqual(helper('--jobserver-auth=fifo:/tmp/existing-cargo'), ())
+        finally:
+            for descriptor in (read, write, extra_read, extra_write):
+                os.close(descriptor)
+
     def test_atomic_file_result(self):
         target = self.root / 'atomic.elf'
         target.write_bytes(self.original)

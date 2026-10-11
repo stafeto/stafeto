@@ -677,18 +677,41 @@ def repair_programs(elf, records, instructions):
         original = events(caller.program, caller.start, caller.cie.code)
         before = row_at(original, call_pc, caller.cie.initial, caller.cie.data)
         after = row_at(original, call_pc + 4, caller.cie.initial, caller.cie.data)
-        if before.rule(30) != ('same', 30) or after.rule(30)[0] != 'offset':
+        if before.rule(30) != ('same', 30):
             continue
-        publish = prove_lr_store(caller, call_pc, after, instructions, targets)
-        offset = after.rule(30)[1]
+        late_pc = call_pc + 4
+        proof_row = after
+        if after.rule(30) == ('same', 30):
+            following = instructions.get(call_pc + 4)
+            frame_delta = None
+            if following == ('mov', 'x29, sp'):
+                frame_delta = 0
+            elif following and following[0] == 'add':
+                setup = re.fullmatch(r'x29, sp, #0x([0-9a-f]+)', following[1])
+                if setup:
+                    frame_delta = int(setup[1], 16)
+            if frame_delta is not None:
+                require(call_pc + 8 < caller.start + caller.size, 'delayed FP row outside caller')
+                future = row_at(original, call_pc + 8, caller.cie.initial, caller.cie.data)
+                require(future.cfa[0] == 29 and future.rule(30)[0] == 'offset',
+                        'unsupported delayed FP recovery row')
+                proof_row = copy.deepcopy(future)
+                proof_row.cfa = (31, future.cfa[1] + frame_delta)
+                require(before.cfa == proof_row.cfa and after.cfa == before.cfa,
+                        'delayed FP setup disagrees with physical SP CFA')
+                late_pc = call_pc + 8
+        if proof_row.rule(30)[0] != 'offset':
+            continue
+        publish = prove_lr_store(caller, call_pc, proof_row, instructions, targets)
+        offset = proof_row.rule(30)[1]
         require(offset % caller.cie.data == 0 and offset // caller.cie.data >= 0,
                 'caller LR offset does not match CIE factor')
         operation = b'\x9e' + leb(offset // caller.cie.data)
         repaired = sorted(original + [(publish, operation)], key=lambda event: event[0])
         for pc in range(caller.start, caller.start + caller.size, 4):
             expected = row_at(original, pc, caller.cie.initial, caller.cie.data)
-            if publish <= pc <= call_pc:
-                expected.registers[30] = after.rule(30)
+            if publish <= pc < late_pc:
+                expected.registers[30] = proof_row.rule(30)
             require(row_at(repaired, pc, caller.cie.initial, caller.cie.data) == expected,
                     'caller non-target row changed during LR publication')
         require(caller.offset not in changed, 'overlapping caller CFI repairs')
@@ -715,6 +738,7 @@ def repair_programs(elf, records, instructions):
 
     # Every actual call, rather than every symbol spelling, is audited.
     site_ranges = {}
+    proven_transient = set()
     for pc, (mnemonic, operands) in instructions.items():
         if mnemonic != 'bl':
             continue
@@ -750,6 +774,7 @@ def repair_programs(elf, records, instructions):
         require(helper_fde.cie.initial.rule(register) == ('same', register),
                 "saved LR register has no recoverable helper rule")
         preserved_register([operation for _, operation in helpers[int(target[1], 16)]], register)
+        proven_transient.add(pc)
         expected = copy.deepcopy(start_row)
         expected.registers[30] = ('register', register)
         require(at_call in (start_row, expected) and at_restore in (start_row, expected),
@@ -784,6 +809,24 @@ def repair_programs(elf, records, instructions):
     for fde in fdes.values():
         if fde.offset in changed:
             changed[fde.offset] = compact_changed_events(changed[fde.offset], fde)
+    # A strict suspended caller must always describe its own incoming parent LR.
+    for pc, (op, args) in instructions.items():
+        if op != 'bl':
+            continue
+        edge = re.search(r'0x([0-9a-f]+)', args)
+        if edge is None or int(edge[1], 16) not in helpers:
+            continue
+        matching = [fde for fde in fdes.values() if fde.start <= pc < fde.start + fde.size]
+        require(len(matching) == 1, 'terminal caller LR lacks exact FDE')
+        fde = matching[0]
+        program = changed.get(fde.offset, events(fde.program, fde.start, fde.cie.code))
+        row = row_at(program, pc, fde.cie.initial, fde.cie.data)
+        rule = row.rule(30)
+        if rule[0] == 'register':
+            require(pc in proven_transient, 'terminal caller LR has unproved register custody')
+        else:
+            require(rule[0] == 'offset' and row.cfa[0] in (29, 31),
+                    f'terminal outlined BL has unrecoverable parent LR at {pc:#x}')
     return changed, helpers
 
 
