@@ -21,9 +21,9 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-# OpenLibm binary128 and fenv fixes, tagged pin-7a4de500.
+# Stafeto link limit and integer parsing, tagged pin-d7ce7908.
 # File Synchronization awaits aio_fsync.
-COMMIT = "7a4de500e20e602f4ac4d4fc7ad88b3059ce512d"
+COMMIT = "d7ce790822f138f982b3c3173731a99daca1fa94"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
@@ -203,6 +203,12 @@ def headers(env: dict, generator: Path) -> None:
                         "--config=/dev/stdin", "--output", str(out)],
                        input=config.read_text() + defaults, cwd=SOURCE, env=env, check=True,
                        text=True)
+    # This sysroot uses stafeto's link limit; other relibc headers keep 127.
+    limits = include / "limits.h"
+    text = limits.read_text()
+    if text.count("#define LINK_MAX 127") != 1:
+        raise SystemExit("generated limits.h lacks the expected link limit")
+    limits.write_text(text.replace("#define LINK_MAX 127", "#define LINK_MAX 384"))
 
 
 def main() -> None:
