@@ -65,9 +65,9 @@ UNLABELLED_SHA256 = {
     "vendor/redox-rings-0.1.0/LICENCE":
         "ceee4630ce05fd02513c2df17e89e82ba92a70cf54618fe3f641f0867e1c9970",
 }
-# openlibm, of which relibc takes the headers alone: LICENSE.md names the
-# BSD, ISC and MIT licences, FDLIBM's notice (SunPro) and public domain for
-# the code; the LGPL files are the tests in test/, which nothing builds.
+# OpenLibm supplies headers and the static C math runtime: LICENSE.md
+# names BSD, ISC, MIT, FDLIBM (SunPro) and public-domain code. Its LGPL
+# tests must never enter the selected Linux/AArch64 archive sources.
 OPENLIBM = ("openlibm/LICENSE.md",
             "b1843fbf5b03f519a5f0a44fce751bdd1022ae7148614923f9d6293e17a18b17",
             "BSD-2-Clause AND ISC AND MIT AND SunPro AND LicenseRef-public-domain")
@@ -292,7 +292,7 @@ def layer_outside() -> list:
 
 def relibc() -> None:
     """Item 6: relibc's closure on the target, the crates -Z build-std
-    builds, openlibm's headers."""
+    builds, OpenLibm's headers and static C runtime."""
     if not (RELIBC / "Cargo.lock").exists():
         fail(f"no relibc at {RELIBC}; run cargo xtask relibc first")
     # The fork as build-relibc.py pins it, with no change in the tree.
@@ -345,11 +345,29 @@ def relibc() -> None:
     path, digest, license_name = OPENLIBM
     if sha256(RELIBC / path) != digest:
         fail(f"{path} changed: read it again")
-    for header in [*(RELIBC / "openlibm/include").glob("*.h"),
-                   *(RELIBC / "openlibm/src").glob("*.h")]:
-        if "General Public License" in header.read_text(errors="replace"):
-            fail(f"openlibm header {header.name} is under a GNU licence")
-    notices.append(("openlibm (headers)", license_name, [RELIBC / path]))
+    math = RELIBC / "openlibm"
+    # Ask the actual Makefile for the same static runtime source selection
+    # as build-relibc.py; print-SRCS prints a variable and compiles nothing.
+    sources = subprocess.check_output(
+        ["make", "--no-print-directory", "-s", "print-SRCS", "OS=Linux",
+         "ARCH=aarch64", "USECLANG=1", "USEGCC=0"], cwd=math, text=True).strip()
+    if not sources.startswith("SRCS="):
+        fail("OpenLibm Makefile did not report its static runtime sources")
+    selected = sources.removeprefix("SRCS=").split()
+    if not selected:
+        fail("OpenLibm static runtime source list is empty")
+    for name in selected:
+        source = Path(name)
+        if (source.is_absolute() or ".." in source.parts or not source.parts
+                or source.parts[0] not in {"src", "aarch64", "bsdsrc", "ld128"}):
+            fail(f"OpenLibm static archive selects test or unexpected source {name}")
+    headers = [header for directory in ("include", "src", "aarch64", "bsdsrc", "ld128")
+               for header in (math / directory).glob("*.h")]
+    for source in [*headers, *(math / name for name in selected)]:
+        text = source.read_text(errors="replace")
+        if "General Public License" in text or re.search(r"SPDX-License-Identifier:.*(?:GPL|LGPL)", text):
+            fail(f"OpenLibm linked source or header {source.relative_to(math)} is under a GNU licence")
+    notices.append(("OpenLibm (static C runtime and headers)", license_name, [RELIBC / path]))
     write_notices(notices + layer_outside())
     print(f"relibc links {len(linked)} crates and {len(notices) - len(linked)} more parts,"
           " all under licences GPL-2.0-only takes")

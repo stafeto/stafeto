@@ -402,6 +402,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-lock-fifo.img",
     "boot-posix-spawn-churn.img",
     "boot-posix-sync.img",
+    "boot-posix-math.img",
     "boot-posix-fifo.img",
     "boot-posix-fifo-steps.img",
     "boot-posix-resources.img",
@@ -477,6 +478,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-lock-fifo.img"
         | "boot-posix-spawn-churn.img"
         | "boot-posix-sync.img"
+        | "boot-posix-math.img"
         | "boot-posix-fifo.img"
         | "boot-posix-fifo-steps.img"
         | "boot-posix-resources.img"
@@ -645,6 +647,7 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-posix-math.img" => &crate::POSIX_MATH_PROGRAMS,
                 "boot-posix-fifo.img" => &crate::POSIX_FIFO_PROGRAMS,
                 "boot-posix-fifo-steps.img" => &crate::POSIX_FIFO_STEPS_PROGRAMS,
                 "boot-posix-lifetimes.img" => &crate::POSIX_LIFETIMES_PROGRAMS,

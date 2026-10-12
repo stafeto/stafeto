@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The probe of POSIX processes: a C main on relibc (procs.c); posix-crt
-//! starts the layer, relibc starts C.
+//! starts the layer, relibc starts C. The math-probe feature selects math.c.
 
 #![no_std]
 #![no_main]
