@@ -655,9 +655,12 @@ static int names_statvfs(void) {
     FAILS(statvfs(NAMES_ROOT "/v/none", &file), ENOENT);
     FAILS(statvfs(NAMES_ROOT "/v/zero/x", &file), ENOTDIR);
     FAILS(statvfs("", &file), ENOENT);
-    /* The console has no blocks; its names are 255 bytes. */
+    /* A virtual descriptor uses page-size units and reports no names. */
     OK(fstatvfs(1, &file));
-    CHECK(file.f_blocks == 0 && file.f_files == 0 && file.f_namemax == 255);
+    CHECK(file.f_bsize == 4096 && file.f_frsize == 4096
+        && file.f_blocks == 0 && file.f_bfree == 0 && file.f_bavail == 0
+        && file.f_files == 0 && file.f_ffree == 0 && file.f_favail == 0
+        && file.f_fsid == 0 && file.f_flag == 0 && file.f_namemax == 0);
     return 0;
 }
 

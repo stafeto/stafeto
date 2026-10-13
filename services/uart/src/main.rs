@@ -475,6 +475,43 @@ impl Uart {
         }
     }
 
+    /// Acknowledge only the captured software output of the owning console.
+    fn flush_output(&mut self, r: &mut Request<'_>) -> Answer {
+        let request = match proto_uart::OutputFlush::read(r.body()) {
+            Ok(request) if r.handles.is_empty() => request,
+            Ok(_) => return Answer::Status(Status::BadSize),
+            Err(status) => return Answer::Status(status),
+        };
+        let State {
+            input,
+            output,
+            writes,
+            rooms,
+            ..
+        } = &mut *self.state;
+        if !input.claim_console(r.label()) {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        match output.flush_clients(r.label(), request.nonce) {
+            Ok(Some(removed)) => {
+                rooms.drain_discard(
+                    output.submitted(),
+                    output.submitted(),
+                    removed + writes.queued_bytes(),
+                );
+                writes.discard(answer_write);
+                rooms.to_tell(true, |notify| {
+                    let _ = sys::notify(notify, 1);
+                });
+                self.refresh_drain();
+                self.defer_output(false);
+                Answer::Status(Status::Ok)
+            }
+            Ok(None) => Answer::Status(Status::Ok),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
     /// Observe only an existing paid ROOM and a full terminal operation key.
     fn drain(&mut self, r: &mut Request<'_>) -> Answer {
         if Method::from_number(r.method()) == Some(Method::DrainState) {
@@ -713,6 +750,7 @@ const METHODS: &[u16] = &[
     Method::DrainRelease.number(),
     Method::DrainState.number(),
     Method::InputFlush.number(),
+    Method::OutputFlush.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -730,6 +768,7 @@ const METHODS: &[u16] = &[
     Method::DrainRelease.number(),
     Method::DrainState.number(),
     Method::InputFlush.number(),
+    Method::OutputFlush.number(),
 ];
 
 impl Service<HELD> for Uart {
@@ -748,6 +787,7 @@ impl Service<HELD> for Uart {
             Some(Method::WriteSome) => self.write_some(r),
             Some(Method::Room) => self.room(r),
             Some(Method::InputFlush) => self.flush_input(r),
+            Some(Method::OutputFlush) => self.flush_output(r),
             Some(
                 Method::DrainStart | Method::DrainTake | Method::DrainRelease | Method::DrainState,
             ) => self.drain(r),
@@ -772,6 +812,7 @@ impl Service<HELD> for Uart {
         writes.gone_before(label, output.target(), drop, |start, len| {
             rooms.drain_discard(output.submitted(), start, len);
         });
+        output.forget_flush(label);
         rooms.gone(label);
         drop(input.gone(label));
         self.kick();

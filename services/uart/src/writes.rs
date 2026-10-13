@@ -123,6 +123,16 @@ impl<T> Writes<T> {
         }
     }
 
+    /// Complete accepted writes discarded by a console output flush.
+    /// Their reply tokens leave in FIFO order within the four paid places.
+    pub fn discard(&mut self, mut answer: impl FnMut(T, u32)) {
+        for _ in 0..WAITING {
+            let Some(i) = self.first() else { break };
+            let waiting = self.places[i].take().expect("a pending write");
+            answer(waiting.token, waiting.len as u32);
+        }
+    }
+
     /// The place of the write that waits longest.
     fn first(&self) -> Option<usize> {
         (0..WAITING)
@@ -310,7 +320,8 @@ impl<H> Rooms<H> {
                 && !drain.ready
                 && start < drain.target.wrapping_sub(submitted)
             {
-                drain.target = drain.target.wrapping_sub(len as u64);
+                let remaining = drain.target.wrapping_sub(submitted) - start;
+                drain.target = drain.target.wrapping_sub((len as u64).min(remaining));
             }
         }
     }
@@ -379,6 +390,40 @@ mod tests {
     use super::*;
     use crate::output::TX_RING;
     use std::vec::Vec;
+
+    #[test]
+    fn software_flush_adjusts_partial_prefix_and_completes_four_pending_writes() {
+        let mut output = Output::new();
+        let mut writes = Writes::new();
+        let mut rooms = Rooms::new();
+        assert!(output.put_raw(&[b'x'; TX_RING]));
+        for i in 0..WAITING {
+            assert_eq!(writes.write(&mut output, 1, b"pending", i), Taken::Waits);
+        }
+        rooms.room(1, Some(1), false);
+        rooms.room(2, Some(2), false);
+        rooms.drain_begin(1, 10, 3);
+        rooms.drain_begin(2, 20, output.target() + writes.queued_bytes() as u64);
+        let removed = output.flush_clients(1, 7).unwrap().unwrap();
+        rooms.drain_discard(
+            output.submitted(),
+            output.submitted(),
+            removed + writes.queued_bytes(),
+        );
+        let mut completed = Vec::new();
+        writes.discard(|token, count| completed.push((token, count)));
+        assert_eq!(completed, [(0, 7), (1, 7), (2, 7), (3, 7)]);
+        assert!(writes.is_empty());
+        assert_eq!(
+            rooms.drain_target(output.submitted()),
+            Some(output.submitted())
+        );
+        let mut told = Vec::new();
+        rooms.drain_complete(output.submitted(), |handle| told.push(*handle));
+        assert_eq!(told, [1, 2]);
+        assert_eq!(rooms.drain(1, 10), Some(true));
+        assert_eq!(rooms.drain(2, 20), Some(true));
+    }
 
     #[test]
     fn drain_uses_exact_operation_identity_and_sticky_completion() {

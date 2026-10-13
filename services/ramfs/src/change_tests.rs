@@ -1420,6 +1420,44 @@ fn symlink_keeps_its_contents_raw_and_readlink_returns_them_cut_to_the_buffer() 
 }
 
 #[test]
+fn directory_chown_preserves_setgid_inheritance_and_regular_files_clear_setid() {
+    let mut env = Env::new();
+    let directory = env.node(ROOT, b"d", DIR, 0o2775);
+    let file = env.node(ROOT, b"f", REG, 0o6755);
+    let mut root = session();
+    let chown = |path, uid, gid| with_args(ChangeOp::Chown, path, 0, [uid, gid, 0, 0]);
+    assert_eq!(env.go_result(&mut root, chown(b"/d", 100, 77), None), 0);
+    let node = env.ram.storage.node(directory).unwrap();
+    assert_eq!((node.uid, node.gid, node.mode), (100, 77, 0o2775));
+    assert_eq!(
+        env.go_result(
+            &mut root,
+            chown(b"/d", proto_fs::ID_UNCHANGED, proto_fs::ID_UNCHANGED),
+            None,
+        ),
+        0
+    );
+    assert_eq!(env.ram.storage.node(directory).unwrap().mode, 0o2775);
+    assert_eq!(
+        env.go_result(&mut root, mkdir(0, 1, b"/d/child", 0o755, 0), None),
+        0
+    );
+    let child = env.lookup_link(b"/d/child").unwrap();
+    assert_eq!(env.ram.storage.node(child).unwrap().gid, 77);
+    assert_eq!(env.ram.storage.node(child).unwrap().mode, 0o2755);
+    assert_eq!(
+        env.go_result(
+            &mut root,
+            chown(b"/f", proto_fs::ID_UNCHANGED, proto_fs::ID_UNCHANGED),
+            None,
+        ),
+        0
+    );
+    assert_eq!(env.ram.storage.node(file).unwrap().mode, 0o755);
+    env.assert_quiet();
+}
+
+#[test]
 fn chmod_chown_and_times_follow_the_ownership_rules() {
     let mut env = Env::new();
     let file = env.node(ROOT, b"f", REG, 0o644);

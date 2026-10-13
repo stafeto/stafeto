@@ -286,7 +286,19 @@ pub fn run(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> 
 /// A request that answers with a status alone.
 fn status_call(probe: &Probe, request: &[u8]) -> Result<(), &'static str> {
     let mut buffer = [0; MESSAGE_MAX];
-    status_of(Probe::call_on(&probe.tty, request, None, &mut buffer).map_err(fail)?).map_err(fail)
+    let result = Probe::call_on(&probe.tty, request, None, &mut buffer).and_then(status_of);
+    if let Err(status) = result {
+        let method = request
+            .get(..2)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map_or(u16::MAX, u16::from_le_bytes);
+        let word = request
+            .get(16..20)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map_or(u32::MAX, u32::from_le_bytes);
+        rt::println!("tty-probe: method {method} word {word} returned {status:?}");
+    }
+    result.map_err(fail)
 }
 
 /// tcdrain, tcflush and tcflow with output in the terminal: the driver

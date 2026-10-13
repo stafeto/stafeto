@@ -2441,6 +2441,11 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
         // STOP and START go out between the bytes written.
         run.expect("<\x13>(\x11)", DIALOG_STEP)?;
         run.expect("posix-tty: output flushed", DIALOG_STEP)?;
+        run.expect("posix-tty: fresh UART software tail", DIALOG_STEP)?;
+        run.expect(
+            "posix-tty: UART software output flush acknowledged",
+            DIALOG_STEP,
+        )?;
         run.expect("posix-tty: output ok", DIALOG_STEP)?;
         run.expect(
             "posix-tty: the layer refused the operations on the names of the terminal",
@@ -2550,6 +2555,14 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
         }
     }
     // What tcflush dropped never shows, and what tcflow held shows once.
+    if !vz
+        && output
+            .lines
+            .iter()
+            .any(|line| line.contains("posix-tty: stale UART software tail"))
+    {
+        return Err("the flushed UART software tail reached the console".to_owned());
+    }
     if output
         .lines
         .iter()
@@ -3692,6 +3705,8 @@ fn posix_resources_probe() -> Result<(), String> {
         "posix-resources: NOFILE allocation and inherited limits ok",
         "posix-resources: FSIZE writes append and SIGXFSZ ok",
         "posix-resources: fexecve exact inode offset and CLOEXEC ok",
+        "posix-resources: F6 link limit and integer base ok",
+        "posix-resources: F6 metadata statvfs and PATH ok",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }

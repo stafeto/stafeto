@@ -2803,9 +2803,9 @@ static void thirty_two(void) {
 
 /* Stage 7, as root. */
 static void files(void) {
-    /* An open action makes its descriptor in the parent with FD_CLOEXEC, so
-     * that another thread's spawn or exec does not inherit it meanwhile. */
-    expect("the parent's descriptor of addopen has FD_CLOEXEC",
+    /* An open action makes its parent descriptor FD_CLOEXEC and FD_CLOFORK,
+     * so another thread's spawn, exec or fork does not inherit it meanwhile. */
+    expect("the parent's descriptor of addopen has FD_CLOEXEC and FD_CLOFORK",
            stafeto_probe_addopen_cloexec("/etc/motd"), 1);
     thirty_two();
     /* The first goal of 5c: ls of /etc from a file, waited for. */

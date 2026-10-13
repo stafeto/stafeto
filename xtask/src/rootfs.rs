@@ -328,6 +328,14 @@ fn rtbench() -> Vec<RootFile> {
 /// (`/os-test/<suite>`) and its path from there. Names and bytes live for
 /// the rest of the run of xtask.
 pub fn os_test(tests: &[(String, Vec<u8>)]) -> Vec<RootFile> {
+    os_test_with_fixtures(tests, &[])
+}
+
+/// Source fixtures remain regular data files outside the executable runner list.
+pub fn os_test_with_fixtures(
+    tests: &[(String, Vec<u8>)],
+    fixtures: &[(String, Vec<u8>)],
+) -> Vec<RootFile> {
     fn leak(text: String) -> &'static str {
         Box::leak(text.into_boxed_str())
     }
@@ -356,6 +364,22 @@ pub fn os_test(tests: &[(String, Vec<u8>)]) -> Vec<RootFile> {
             0o755,
             ROOT,
             Source::Bytes(file_name, bytes),
+        ));
+    }
+    for (n, (name, contents)) in fixtures.iter().enumerate() {
+        let parts: Vec<&str> = name.split('/').collect();
+        for depth in 1..parts.len() {
+            let path = leak(format!("/os-test/{}", parts[..depth].join("/")));
+            if !files.iter().any(|f| f.path == path) {
+                files.push(dir(path));
+            }
+        }
+        let bytes: &'static [u8] = Box::leak(contents.clone().into_boxed_slice());
+        files.push(of(
+            leak(format!("/os-test/{name}")),
+            0o644,
+            ROOT,
+            Source::Bytes(leak(format!("fixture{n}")), bytes),
         ));
     }
     let list: &'static [u8] = Box::leak(list.into_bytes().into_boxed_slice());
@@ -592,6 +616,48 @@ pub fn table(files: &[RootFile], first: u32, total: u32) -> Result<Vec<u8>, Stri
 mod tests {
     use super::*;
     use bootimg::rootfs::Rootfs;
+
+    #[test]
+    fn source_fixtures_keep_exact_bytes_and_permissions_without_runner_rows() {
+        let tests = vec![
+            ("basic/unistd/faccessat".into(), vec![1]),
+            ("basic/unistd/fchownat".into(), vec![2]),
+        ];
+        let fixtures = vec![
+            (
+                "basic/unistd/faccessat.c".into(),
+                b"/* faccessat */\n".to_vec(),
+            ),
+            (
+                "basic/unistd/fchownat.c".into(),
+                b"/* fchownat */\n".to_vec(),
+            ),
+        ];
+        let files = os_test_with_fixtures(&tests, &fixtures);
+        let Some(Source::Bytes(_, list)) = files
+            .iter()
+            .find(|f| f.path == "/os-test/list")
+            .unwrap()
+            .source
+        else {
+            panic!("list bytes");
+        };
+        assert_eq!(
+            std::str::from_utf8(list).unwrap(),
+            "basic/unistd/faccessat /os-test/basic unistd/faccessat\nbasic/unistd/fchownat /os-test/basic unistd/fchownat\n"
+        );
+        for (name, expected) in fixtures {
+            let path = format!("/os-test/{name}");
+            let file = files.iter().find(|f| f.path == path).unwrap();
+            assert_eq!(file.mode, 0o644);
+            let Some(Source::Bytes(_, bytes)) = file.source else {
+                panic!("fixture bytes");
+            };
+            assert_eq!(bytes, expected);
+        }
+        let total = sources(&files).len() as u32 + 3;
+        assert!(Rootfs::parse(&table(&files, 3, total).unwrap(), total).is_ok());
+    }
 
     #[test]
     fn hard_links_of_a_program_share_one_file_and_the_table_reads_back() {

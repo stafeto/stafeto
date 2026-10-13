@@ -239,6 +239,7 @@ fn main(_: u64) -> u64 {
         driver,
         room_given: false,
         input_flush: 0,
+        output_flush: 0,
         draining: None,
         devices: &mut tables.devices,
         active: 0,
@@ -342,6 +343,7 @@ struct Tty {
     room_given: bool,
     /// Last validated input-flush acknowledgment on this driver session.
     input_flush: u64,
+    output_flush: u64,
     draining: Option<u64>,
     devices: &'static mut [Device; TERMINALS],
     active: usize,
@@ -1074,6 +1076,7 @@ impl Tty {
         if let Ok(driver) = rt::service::connect(&self.parent, "uart") {
             self.driver = driver;
             self.input_flush = 0;
+            self.output_flush = 0;
         }
         self.room_given = false;
         self.draining = None;
@@ -1104,6 +1107,26 @@ impl Tty {
         match call(&self.driver, request.as_bytes(), None, &mut buffer) {
             Ok(reply) if proto_uart::InputFlush::acknowledged(reply) => {
                 self.input_flush = nonce;
+                Ok(())
+            }
+            _ => Err(proto_tty::IO_ERROR),
+        }
+    }
+
+    /// Flush the UART software prefix before retiring local terminal output.
+    fn flush_driver_output(&mut self) -> Result<(), u32> {
+        if self.active != 0 {
+            return Ok(());
+        }
+        let nonce = self.output_flush.wrapping_add(1).max(1);
+        let mut request = Writer::new();
+        let mut buffer = [0; MESSAGE_MAX];
+        proto_uart::OutputFlush { nonce }
+            .write(&mut request)
+            .map_err(|_| proto_tty::IO_ERROR)?;
+        match call(&self.driver, request.as_bytes(), None, &mut buffer) {
+            Ok(reply) if proto_uart::OutputFlush::acknowledged(reply) => {
+                self.output_flush = nonce;
                 Ok(())
             }
             _ => Err(proto_tty::IO_ERROR),
@@ -2306,6 +2329,9 @@ impl Tty {
             self.tell_readers();
         }
         if control.word != QUEUE_IN {
+            if let Err(code) = self.flush_driver_output() {
+                return status(code);
+            }
             self.devices[self.active].console.flush_output();
             self.tell_output();
         }

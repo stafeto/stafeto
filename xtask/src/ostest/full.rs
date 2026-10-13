@@ -66,14 +66,36 @@ fn write_rows(rows: &[CensusRow]) -> Result<(), String> {
     std::fs::write(dir.join("os-test-full-basic.tsv"), text).map_err(|e| e.to_string())
 }
 
-fn fits(files: &[(String, Vec<u8>)], name: &str, bytes: usize) -> bool {
-    files.len() < BATCH_TESTS
-        && files.iter().map(|f| f.1.len()).sum::<usize>() + bytes <= BATCH_BYTES
+#[derive(Default)]
+struct Batch {
+    tests: Vec<(String, Vec<u8>)>,
+    fixtures: Vec<(String, Vec<u8>)>,
+}
+
+fn source_fixture(name: &str, source: &str) -> Option<(String, Vec<u8>)> {
+    matches!(name, "basic/unistd/faccessat" | "basic/unistd/fchownat")
+        .then(|| (format!("{name}.c"), source.as_bytes().to_vec()))
+}
+
+fn fits(batch: &Batch, name: &str, bytes: usize, fixture: Option<&(String, Vec<u8>)>) -> bool {
+    batch.tests.len() < BATCH_TESTS
+        && batch
+            .tests
+            .iter()
+            .chain(&batch.fixtures)
+            .map(|f| f.1.len())
+            .sum::<usize>()
+            + bytes
+            + fixture.map_or(0, |f| f.1.len())
+            <= BATCH_BYTES
         && entries(
-            files
+            batch
+                .tests
                 .iter()
+                .chain(&batch.fixtures)
                 .map(|f| f.0.as_str())
-                .chain(std::iter::once(name)),
+                .chain(std::iter::once(name))
+                .chain(fixture.map(|f| f.0.as_str())),
         ) <= BATCH_ENTRIES
 }
 
@@ -131,7 +153,7 @@ pub fn run(jobs: usize) -> Result<(), String> {
     let objdump = llvm_tool("llvm-objdump")?;
     let mut rows = Vec::new();
     let mut batches = Vec::new();
-    let mut files = Vec::new();
+    let mut files = Batch::default();
     let mut contents = std::collections::BTreeMap::new();
     for (number, test) in tests.iter().enumerate() {
         let path = sources
@@ -182,24 +204,28 @@ pub fn run(jobs: usize) -> Result<(), String> {
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
         }
         std::fs::remove_dir_all(&scratch).map_err(|e| e.to_string())?;
-        if !fits(&files, &test.name, bytes.len()) && !files.is_empty() {
+        let fixture = source_fixture(&test.name, &source);
+        if !fits(&files, &test.name, bytes.len(), fixture.as_ref()) && !files.tests.is_empty() {
             batches.push(std::mem::take(&mut files));
         }
-        if !fits(&files, &test.name, bytes.len()) {
+        if !fits(&files, &test.name, bytes.len(), fixture.as_ref()) {
             record(
                 &mut rows,
                 &test.name,
                 "IMAGE",
-                Ended::Failed("single ELF exceeds existing image budget".to_owned()),
+                Ended::Failed("single ELF and fixtures exceed existing image budget".to_owned()),
                 &source,
                 &macros,
             );
             continue;
         }
         contents.insert(test.name.clone(), source);
-        files.push((test.name.clone(), bytes));
+        files.tests.push((test.name.clone(), bytes));
+        if let Some(fixture) = fixture {
+            files.fixtures.push(fixture);
+        }
     }
-    if !files.is_empty() {
+    if !files.tests.is_empty() {
         batches.push(files);
     }
     write_rows(&rows)?;
@@ -221,7 +247,7 @@ pub fn run(jobs: usize) -> Result<(), String> {
                 let result = boot(
                     &kernel,
                     &format!("os-test-full-{number}.img"),
-                    rootfs::os_test(&files),
+                    rootfs::os_test_with_fixtures(&files.tests, &files.fixtures),
                     TIMEOUT,
                 );
                 let log = match result {
@@ -243,7 +269,7 @@ pub fn run(jobs: usize) -> Result<(), String> {
                         ));
                 }
                 let mut rows = rows.lock().unwrap_or_else(PoisonError::into_inner);
-                for (name, _) in files {
+                for (name, _) in files.tests {
                     record(
                         &mut rows,
                         &name,
@@ -489,13 +515,59 @@ mod tests {
     }
 
     #[test]
+    fn source_fixtures_are_exact_and_only_for_two_path_tests() {
+        let source = "/* normalized pinned bytes */\nint main(void) { return 0; }\n";
+        for name in ["basic/unistd/faccessat", "basic/unistd/fchownat"] {
+            assert_eq!(
+                source_fixture(name, source),
+                Some((format!("{name}.c"), source.as_bytes().to_vec()))
+            );
+        }
+        for name in [
+            "basic/unistd/access",
+            "basic/unistd/faccessat.c",
+            "io/faccessat",
+        ] {
+            assert!(source_fixture(name, source).is_none());
+        }
+    }
+
+    #[test]
+    fn fixture_bytes_and_entries_consume_budget_without_consuming_test_slots() {
+        let fixture = ("basic/new.c".to_owned(), vec![0]);
+        let bytes = Batch {
+            fixtures: vec![("basic/existing.c".into(), vec![0; BATCH_BYTES - 2])],
+            ..Batch::default()
+        };
+        assert!(fits(&bytes, "basic/new", 1, Some(&fixture)));
+        assert!(!fits(&bytes, "basic/new", 2, Some(&fixture)));
+        let slots = Batch {
+            tests: (0..47).map(|n| (format!("basic/t{n}"), vec![])).collect(),
+            fixtures: vec![("basic/a.c".into(), vec![]), ("basic/b.c".into(), vec![])],
+        };
+        assert!(fits(&slots, "basic/new", 1, Some(&fixture)));
+        let entries = Batch {
+            fixtures: (0..866).map(|n| (format!("basic/f{n}"), vec![])).collect(),
+            ..Batch::default()
+        };
+        assert!(fits(&entries, "basic/new", 0, None));
+        assert!(!fits(&entries, "basic/new", 0, Some(&fixture)));
+    }
+
+    #[test]
     fn batch_reserves_existing_storage_and_bounds_guest_deadlines() {
-        let files = vec![("basic/a/small".into(), vec![0; BATCH_BYTES - 1])];
-        assert!(fits(&files, "basic/b/other", 1));
-        assert!(!fits(&files, "basic/b/other", 2));
-        let files = (0..BATCH_TESTS)
-            .map(|n| (format!("basic/a/t{n}"), vec![]))
-            .collect::<Vec<_>>();
-        assert!(!fits(&files, "basic/b/other", 1));
+        let files = Batch {
+            tests: vec![("basic/a/small".into(), vec![0; BATCH_BYTES - 1])],
+            ..Batch::default()
+        };
+        assert!(fits(&files, "basic/b/other", 1, None));
+        assert!(!fits(&files, "basic/b/other", 2, None));
+        let files = Batch {
+            tests: (0..BATCH_TESTS)
+                .map(|n| (format!("basic/a/t{n}"), vec![]))
+                .collect(),
+            ..Batch::default()
+        };
+        assert!(!fits(&files, "basic/b/other", 1, None));
     }
 }
