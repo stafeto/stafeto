@@ -103,6 +103,10 @@ pub(crate) fn confirmed_terminal(state: State) -> bool {
     matches!(state, State::Terminal)
 }
 
+pub(crate) fn confirmed_parked(marker: bool, state: State) -> bool {
+    marker && matches!(state, State::KernelWait)
+}
+
 pub(crate) fn quiescent(
     resident: bool,
     state: State,

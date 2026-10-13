@@ -1212,11 +1212,10 @@ pub(crate) fn stop_others() -> Result<(), i32> {
     loop {
         let mut waiting = false;
         crate::relibc::each_live(|index, native, block| {
-            if core::ptr::from_ref(block) as usize == me
-                || PARKING[index].load(Ordering::Acquire) != 0
-            {
+            if core::ptr::from_ref(block) as usize == me {
                 return;
             }
+            let parked = PARKING[index].load(Ordering::Acquire) != 0;
             let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(native));
             let state = match sys::thread_info(&thread).map(|info| info.state) {
                 Ok(ThreadState::Ended | ThreadState::Stopped) => stop_barrier::State::Terminal,
@@ -1226,7 +1225,9 @@ pub(crate) fn stop_others() -> Result<(), i32> {
                 Ok(_) => stop_barrier::State::Running,
                 Err(_) => stop_barrier::State::Unknown,
             };
-            if stop_barrier::confirmed_terminal(state) {
+            if stop_barrier::confirmed_terminal(state)
+                || stop_barrier::confirmed_parked(parked, state)
+            {
                 return;
             }
             let flags = block.flags.load(Ordering::SeqCst);

@@ -102,6 +102,39 @@ fn native_wait_and_unknown_info_preserve_stop_debt() {
 }
 
 #[test]
+fn park_marker_requires_a_confirmed_kernel_wait() {
+    use barrier::State::*;
+    assert!(barrier::confirmed_parked(true, KernelWait));
+    assert!(!barrier::confirmed_parked(true, Running));
+    assert!(!barrier::confirmed_parked(true, Unknown));
+    assert!(!barrier::confirmed_parked(false, KernelWait));
+}
+
+#[test]
+fn wake_republication_during_stop_handoff_is_not_a_park() {
+    let stop = barrier::StopControl::new();
+    let marker = Cell::new(true);
+    assert!(stop.try_begin(7, 101));
+    assert!(stop.release(
+        7,
+        || {
+            marker.set(false); // The old stopper takes X's place and wakes it.
+        },
+        |channel| assert_eq!(channel, 101),
+    ));
+    marker.set(true); // X republishes before clearing its marker.
+    assert!(stop.try_begin(11, 202));
+    assert!(
+        !barrier::confirmed_parked(marker.get(), barrier::State::Running),
+        "the new stopper must wait for X's upcall"
+    );
+    assert!(barrier::confirmed_parked(
+        marker.get(),
+        barrier::State::KernelWait
+    ));
+}
+
+#[test]
 fn external_defer_receive_interrupt_does_not_release_stopper() {
     use barrier::State::*;
     let owner_effects = Cell::new(0usize);
