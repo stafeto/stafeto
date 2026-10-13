@@ -82,17 +82,21 @@ impl Fixture {
         self.wait_kind(place, pid, byte, Kind::Write)
     }
     fn wait_kind(&mut self, place: usize, pid: u32, byte: i64, kind: Kind) -> Id {
+        self.wait_range(place, pid, byte, 1, kind)
+    }
+    fn wait_range(&mut self, place: usize, pid: u32, start: i64, length: i64, kind: Kind) -> Id {
         let mut captured = self.captured;
         captured.request.command = Command::Set(Some(kind));
         captured.request.owner = Owner::Process(pid);
-        captured.request.range = Range::relative(0, byte, 1).unwrap();
+        captured.request.range = Range::relative(0, start, length).unwrap();
         let wire = WaitStart {
             pid: pid as i32,
             kind: match kind {
                 Kind::Read => LockKind::Read,
                 Kind::Write => LockKind::Write,
             },
-            start: byte,
+            start,
+            length,
             ..self.wire
         };
         let id = self
@@ -208,7 +212,7 @@ fn writer_fifo_prevents_reader_bypass_and_notification_never_grants() {
         .request;
     assert!(
         f.waits
-            .older_conflict(reader, Some(second), |_| true)
+            .older_conflict(reader, Some(second), &f.locks, &f.ram.storage, |_| true,)
             .is_some()
     );
     f.waits.arm(&mut f.queue, first, 7).unwrap();
@@ -272,10 +276,18 @@ fn same_owner_replacement_does_not_wait_behind_its_own_fifo_entry() {
     let mut f = Fixture::new();
     let id = f.wait(0, 256, 0);
     let request = f.queue.snapshot(id).unwrap().0.request;
-    assert!(f.waits.older_conflict(request, None, |_| true).is_none());
+    assert!(
+        f.waits
+            .older_conflict(request, None, &f.locks, &f.ram.storage, |_| true)
+            .is_none()
+    );
     let mut different = request;
     different.owner = Owner::Process(257);
-    assert!(f.waits.older_conflict(different, None, |_| true).is_some());
+    assert!(
+        f.waits
+            .older_conflict(different, None, &f.locks, &f.ram.storage, |_| true)
+            .is_some()
+    );
     let slot = f.waits.slot(id).unwrap();
     let owner = Owner::Description {
         slot: 7,
@@ -288,7 +300,61 @@ fn same_owner_replacement_does_not_wait_behind_its_own_fifo_entry() {
         .request
         .owner = owner;
     different.owner = owner;
-    assert!(f.waits.older_conflict(different, None, |_| true).is_none());
+    assert!(
+        f.waits
+            .older_conflict(different, None, &f.locks, &f.ram.storage, |_| true)
+            .is_none()
+    );
+}
+
+#[test]
+fn older_waiter_blocked_by_requester_does_not_stall_lock_conversion() {
+    let mut f = Fixture::new();
+    f.hold(258, 5, Kind::Read);
+    f.hold(259, 0, Kind::Read);
+    let older = f.wait_range(0, 257, 0, 6, Kind::Write);
+    assert_eq!(f.settle(older).phase, WaitPhase::NeedsArm);
+    let younger = f.wait_range(1, 258, 0, 1, Kind::Write);
+    assert_eq!(f.settle(younger).phase, WaitPhase::NeedsArm);
+    f.waits.arm(&mut f.queue, younger, 71).unwrap();
+
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(259),
+        )
+        .unwrap();
+    f.waits.changed(f.captured.request.inode);
+    let younger_request = f.queue.snapshot(younger).unwrap().0.request;
+    assert!(
+        f.waits
+            .older_conflict(
+                younger_request,
+                Some(younger),
+                &f.locks,
+                &f.ram.storage,
+                |_| true,
+            )
+            .is_none()
+    );
+    let mut notified = false;
+    for _ in 0..CAPACITY {
+        f.waits.maintenance(
+            &mut f.queue,
+            &mut f.locks,
+            &mut f.ram.storage,
+            |_, _| true,
+            |_| true,
+            |handle| notified |= *handle == 71,
+        );
+    }
+    assert!(
+        notified,
+        "the younger waiter is notified after the direct cycle breaks"
+    );
+    assert_eq!(f.query(younger).result, 0);
+    assert_ne!(f.queue.query(older).unwrap().phase, WaitPhase::Complete);
 }
 
 #[test]

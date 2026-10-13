@@ -364,6 +364,8 @@ impl<H> Waits<H> {
         &self,
         request: Request,
         id: Option<Id>,
+        locks: &SimpleLocks,
+        storage: &Storage<'_>,
         mut live: impl FnMut(Owner) -> bool,
     ) -> Option<Lock> {
         let number = id
@@ -382,6 +384,17 @@ impl<H> Waits<H> {
                 && Self::incompatible(older, &request)
                 && live(older.owner)
             {
+                // FIFO must not add a wait edge back to a lock held by this
+                // requester. The held-lock graph does not include queued edges.
+                let requester_blocks_older =
+                    locks
+                        .conflicts(storage, *older, &mut live)
+                        .is_ok_and(|conflicts| {
+                            conflicts.iter().any(|lock| lock.owner == request.owner)
+                        });
+                if requester_blocks_older {
+                    return None;
+                }
                 let Command::Set(Some(kind)) = older.command else {
                     unreachable!()
                 };
@@ -440,7 +453,9 @@ impl<H> Waits<H> {
         };
         let older = self.registrations[slot].as_ref().unwrap().waited
             && !held.owns_overlap
-            && self.older_conflict(request, Some(id), &mut live).is_some();
+            && self
+                .older_conflict(request, Some(id), locks, storage, &mut live)
+                .is_some();
         let blocked = held.blocker.is_some() || older;
         if held.blocker.is_some() {
             self.registrations[slot].as_mut().unwrap().waited = true;
@@ -565,7 +580,13 @@ impl<H> Waits<H> {
                             && (!r.waited
                                 || held.owns_overlap
                                 || self
-                                    .older_conflict(captured.request, Some(id), &mut live)
+                                    .older_conflict(
+                                        captured.request,
+                                        Some(id),
+                                        locks,
+                                        storage,
+                                        &mut live,
+                                    )
                                     .is_none())
                     })
             {
