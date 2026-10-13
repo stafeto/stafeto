@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <pwd.h>
 #include <signal.h>
@@ -16,6 +17,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -41,6 +43,126 @@ static int same_limit(int resource, const struct rlimit *expected) {
         && actual.rlim_cur == expected->rlim_cur
         && actual.rlim_max == expected->rlim_max;
 }
+static int ram_filesystem(const struct statvfs *fs) {
+    return fs->f_bsize == 4096 && fs->f_frsize == 4096
+        && fs->f_blocks > 0 && fs->f_files > 0 && fs->f_namemax == 255;
+}
+
+static int virtual_filesystem(const struct statvfs *fs) {
+    return fs->f_bsize == 4096 && fs->f_frsize == 4096
+        && fs->f_blocks == 0 && fs->f_bfree == 0 && fs->f_bavail == 0
+        && fs->f_files == 0 && fs->f_ffree == 0 && fs->f_favail == 0
+        && fs->f_fsid == 0 && fs->f_flag == 0 && fs->f_namemax == 0;
+}
+
+static void metadata_acceptance(void) {
+    int before = failures;
+    const char *directory = "/tmp/resource-sgid";
+    check("setgid directory creation", mkdir(directory, 02775) == 0);
+    check("setgid directory mode", chmod(directory, 02775) == 0);
+    check("privileged directory chown", chown(directory, 0, 100) == 0);
+    struct stat st;
+    check("directory chown preserves setgid", stat(directory, &st) == 0
+        && (st.st_mode & 07777) == 02775 && st.st_gid == 100);
+    check("no-op directory chown", chown(directory, (uid_t)-1, (gid_t)-1) == 0);
+    check("no-op directory chown preserves setgid", stat(directory, &st) == 0
+        && (st.st_mode & 07777) == 02775 && st.st_gid == 100);
+    check("child directory creation", mkdir("/tmp/resource-sgid/child", 0755) == 0);
+    check("child inherits directory group and setgid", stat("/tmp/resource-sgid/child", &st) == 0
+        && st.st_gid == 100 && (st.st_mode & S_ISGID));
+    check("setgid child cleanup", rmdir("/tmp/resource-sgid/child") == 0);
+    check("setgid directory cleanup", rmdir(directory) == 0);
+    struct statvfs fs;
+    // This image has no terminal service: /dev/null belongs to RAM,
+    // while stdout and pipe descriptors belong to other backends.
+    check("RAM device pathname statvfs", statvfs("/dev/null", &fs) == 0
+        && ram_filesystem(&fs));
+    check("output descriptor statvfs block sizes", fstatvfs(STDOUT_FILENO, &fs) == 0
+        && virtual_filesystem(&fs));
+    int null = open("/dev/null", O_RDONLY);
+    check("null descriptor creation", null >= 0);
+    if (null >= 0) {
+        check("RAM null descriptor statvfs", fstatvfs(null, &fs) == 0
+            && ram_filesystem(&fs));
+        close(null);
+    }
+    int ends[2];
+    if (pipe(ends) == 0) {
+        check("pipe descriptor statvfs block sizes", fstatvfs(ends[0], &fs) == 0
+            && virtual_filesystem(&fs));
+        close(ends[0]); close(ends[1]);
+    } else check("statvfs pipe creation", 0);
+    check("inaccessible PATH directory", mkdir("/tmp/resource-denied", 0700) == 0);
+    int file = open("/tmp/resource-denied/procs-child", O_CREAT | O_EXCL | O_WRONLY, 0755);
+    check("inaccessible PATH candidate", file >= 0);
+    if (file >= 0) close(file);
+    pid_t tester = fork();
+    if (tester == 0) {
+        if (setgid(100) || setuid(1000)) _exit(30);
+        char *args[] = {"resources", "f6-path-child", NULL};
+        pid_t child;
+        if (setenv("PATH", "/tmp/resource-denied:/tmp/resource-missing", 1)) _exit(31);
+        if (posix_spawnp(&child, "procs-child", NULL, NULL, args, environ) != EACCES) _exit(32);
+        if (setenv("PATH", "/tmp/resource-denied:/bin", 1)) _exit(33);
+        if (posix_spawnp(&child, "procs-child", NULL, NULL, args, environ) || !reaped(child, 0)) _exit(34);
+        _exit(0);
+    }
+    check("PATH remembers EACCES and continues to later executable", tester > 0 && reaped(tester, 0));
+    check("PATH candidate cleanup", unlink("/tmp/resource-denied/procs-child") == 0);
+    check("PATH directory cleanup", rmdir("/tmp/resource-denied") == 0);
+    if (failures == before) puts("posix-resources: F6 metadata statvfs and PATH ok");
+}
+
+static void acceptance(void) {
+    int before = failures;
+    check("LINK_MAX reflects the RAM name limit", LINK_MAX == 384);
+    static const struct { const char *input, *tail; long value; } numbers[] = {
+        {"08", "8", 0}, {"09", "9", 0}, {"077x", "x", 63},
+        {"0", "", 0}, {"0x", "x", 0}, {"0Xg", "Xg", 0},
+        {"0x20z", "z", 32}
+    };
+    for (unsigned i = 0; i < sizeof numbers / sizeof numbers[0]; i++) {
+        char *end;
+        errno = EDOM;
+        long value = strtol(numbers[i].input, &end, 0);
+        check("strtol base zero stops at the first invalid digit", value == numbers[i].value
+            && strcmp(end, numbers[i].tail) == 0 && errno == EDOM);
+        check("strtoul base zero", strtoul(numbers[i].input, &end, 0) == (unsigned long)numbers[i].value
+            && strcmp(end, numbers[i].tail) == 0);
+        check("strtoll base zero", strtoll(numbers[i].input, &end, 0) == numbers[i].value
+            && strcmp(end, numbers[i].tail) == 0);
+        check("strtoull base zero", strtoull(numbers[i].input, &end, 0) == (unsigned long long)numbers[i].value
+            && strcmp(end, numbers[i].tail) == 0);
+        check("strtoimax base zero", strtoimax(numbers[i].input, &end, 0) == numbers[i].value
+            && strcmp(end, numbers[i].tail) == 0);
+        check("strtoumax base zero", strtoumax(numbers[i].input, &end, 0) == (uintmax_t)numbers[i].value
+            && strcmp(end, numbers[i].tail) == 0);
+    }
+    char *end;
+    check("signed octal prefix", strtol("-08", &end, 0) == 0 && strcmp(end, "8") == 0);
+    const char *source = "/tmp/resource-links";
+    int fd = open(source, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    check("link-limit source", fd >= 0);
+    if (fd >= 0) {
+        unsigned made = 0;
+        char path[64];
+        for (; made < 128; made++) {
+            snprintf(path, sizeof path, "/tmp/resource-link-%u", made);
+            if (link(source, path) != 0) break;
+        }
+        struct stat st;
+        check("more links than the old advertised limit", made == 128
+            && fstat(fd, &st) == 0 && st.st_nlink == 129);
+        for (unsigned i = 0; i < made; i++) {
+            snprintf(path, sizeof path, "/tmp/resource-link-%u", i);
+            check("link-limit cleanup", unlink(path) == 0);
+        }
+        close(fd);
+        check("link-limit source cleanup", unlink(source) == 0);
+    }
+    if (failures == before) puts("posix-resources: F6 link limit and integer base ok");
+}
+
 static void accounts(void) {
     int before = failures;
     static const struct { const char *name; uid_t uid; gid_t gid; } entries[] = {
@@ -439,6 +561,9 @@ int main(int argc, char **argv) {
         }
         return fcntl(fd, F_GETFD) >= 0 && lseek(fd, 0, SEEK_CUR) == 17 ? 0 : 22;
     }
+    if (argc == 2 && strcmp(argv[1], "f6-path-child") == 0) return 0;
+    acceptance();
+    metadata_acceptance();
     accounts();
     nofile();
     fsize();

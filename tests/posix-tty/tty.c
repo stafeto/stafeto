@@ -546,6 +546,21 @@ static int output(void) {
     CHECK(tcdrain(1) == 0);
     say("posix-tty: output flushed\n");
 
+    /* A completed write leaves a paced UART software tail as well as any
+     * local terminal bytes. Flushing drops the captured tail; the next
+     * write remains visible through the same public terminal descriptor. */
+    CHECK(tcdrain(1) == 0);
+    char backlog[896];
+    memset(backlog, '.', sizeof backlog);
+    const char forbidden[] = "posix-tty: stale UART software tail\n";
+    memcpy(backlog + sizeof backlog - sizeof forbidden + 1, forbidden, sizeof forbidden - 1);
+    CHECK(write(1, backlog, sizeof backlog) == (ssize_t)sizeof backlog);
+    CHECK(tcflush(1, TCOFLUSH) == 0);
+    CHECK(PUT(1, "\nposix-tty: fresh UART software tail\n"));
+    CHECK(tcdrain(1) == 0);
+    say("posix-tty: UART software output flush acknowledged\n");
+
+
     /* tcdrain waits while the output is stopped, and returns once it
      * went. */
     pthread_t releasing;

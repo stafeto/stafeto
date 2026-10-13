@@ -4,7 +4,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use proto_fs::Timestamp;
 use proto_wire::Status;
-use ramfs::time_source::Mode;
+use ramfs::time_source::{Calendar, Mode};
 use rt::handle::{Channel, Handle, Memory, Process};
 use rt::{abi::Access, sys};
 
@@ -13,6 +13,7 @@ const ADDRESS: usize = 0x5c_0000_0000;
 
 pub struct TimeSource {
     memory: Option<Handle<Memory>>,
+    calendar: Calendar,
 }
 
 impl TimeSource {
@@ -37,7 +38,10 @@ impl TimeSource {
                 Some(memory)
             }
         };
-        Ok(Self { memory })
+        Ok(Self {
+            memory,
+            calendar: Calendar::default(),
+        })
     }
 
     pub fn read_once(&self) -> Result<Option<Timestamp>, Status> {
@@ -45,34 +49,25 @@ impl TimeSource {
         if self.memory.is_none() {
             return Ok(Some(Timestamp::legacy_ns(now)));
         }
-        ramfs::time_source::read_timestamp_once(
-            |offset, ordering: Ordering| {
-                // SAFETY: PAGE validated Memory/rights/size before this read-only
-                // mapping. The six offsets are aligned within it; self owns Memory.
-                unsafe { &*((ADDRESS + offset) as *const AtomicU64) }.load(ordering)
-            },
-            now,
-        )
+        self.calendar.read_once(Self::load, now)
     }
 
-    /// The time for a method that sets times and has no reply to ask again
-    /// (Read, Write, ReadDir and the older Open): the clock of the mode, the
-    /// one Change and Data use, so that the times of every method order
-    /// together. A snapshot of the page that the clock service is changing
-    /// is read again after a yield; the monotonic reading stands in only
-    /// when the page stays unstable for 64 tries (or its value is out of
-    /// range).
+    fn load(offset: usize, ordering: Ordering) -> u64 {
+        // SAFETY: attach validated the page and made this read-only mapping.
+        // The six offsets are aligned within it; TimeSource owns its Memory.
+        unsafe { &*((ADDRESS + offset) as *const AtomicU64) }.load(ordering)
+    }
+
+    /// One page snapshot per dispatch. An unstable or invalid snapshot uses
+    /// the last validated anchor, preserving the calendar epoch without yields.
     pub fn now(&self) -> Timestamp {
-        for _ in 0..64 {
-            match self.read_once() {
-                Ok(Some(timestamp)) => return timestamp,
-                Ok(None) => {
-                    let _ = sys::yield_now();
-                }
-                Err(_) => break,
-            }
+        let now = rt::time::ticks_to_ns(rt::time::now());
+        if self.memory.is_none() {
+            return Timestamp::legacy_ns(now);
         }
-        Timestamp::legacy_ns(rt::time::ticks_to_ns(rt::time::now()))
+        self.calendar
+            .now(Self::load, now)
+            .expect("clocked startup validates an anchor before Ready")
     }
 
     /// Each unstable startup attempt yields before reading again; Ready follows

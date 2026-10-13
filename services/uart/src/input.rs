@@ -100,6 +100,15 @@ impl<T, H> Input<T, H> {
         }
     }
 
+    /// Bind an unowned console or authenticate its existing owner.
+    pub fn claim_console(&mut self, label: u64) -> bool {
+        if self.owner.is_some_and(|owner| owner != label) {
+            return false;
+        }
+        self.owner = Some(label);
+        true
+    }
+
     /// Flush only the owning console. The backend discards its received prefix
     /// before the software ring is cleared. An exact retry never calls it twice.
     /// A waiting reader retains its key and notification, which fresh input rearms.
@@ -326,6 +335,22 @@ impl<T, H> Default for Input<T, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_flush_owner_binding_preserves_received_input_and_waiter() {
+        let mut input: Input<(), ()> = Input::new();
+        assert!(input.push(b'x' as u32));
+        assert!(input.claim_console(1));
+        assert!(!input.claim_console(2));
+        let mut bytes = [0; 1];
+        assert_eq!(input.read(1, 1, (), &mut bytes), Taken::Now(1, ()));
+        assert_eq!(bytes, *b"x");
+        assert_eq!(input.read(1, 1, (), &mut bytes), Taken::Waits);
+        assert!(input.claim_console(1));
+        assert!(input.push(b'y' as u32));
+        assert_eq!(input.answer(&mut bytes), Some(((), 1)));
+        assert_eq!(bytes, *b"y");
+    }
 
     #[test]
     fn input_flush_keeps_waiter_rearms_and_replays_without_discarding_fresh_bytes() {

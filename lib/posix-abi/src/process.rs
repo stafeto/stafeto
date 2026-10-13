@@ -827,12 +827,11 @@ impl Shadow {
                     self.real_open_allowed(full, flags)?;
                 }
                 // The caller's own descriptor lives only for the spawn: with
-                // FD_CLOEXEC, so that an exec or spawn of another thread in
-                // the meantime does not inherit it. The child's flag is the
-                // action's.
+                // FD_CLOEXEC and FD_CLOFORK, so concurrent exec, spawn and
+                // fork keep it private. The child's flag is the action's.
                 let own = crate::open_policy(
                     full,
-                    flags | crate::constants::O_CLOEXEC,
+                    flags | crate::constants::O_CLOEXEC | crate::constants::O_CLOFORK,
                     mode,
                     self.umask,
                 )?;
@@ -1330,6 +1329,10 @@ impl Shadow {
             match crate::names::fstatat(crate::names::AT_FDCWD, Some(full), 0) {
                 Ok(info) if info.kind == 2 => {}
                 Ok(_) => {
+                    denied = true;
+                    continue;
+                }
+                Err(EACCES) => {
                     denied = true;
                     continue;
                 }
@@ -2079,8 +2082,8 @@ pub fn probe_pool() -> u64 {
 }
 
 /// The probe of `addopen`: the descriptor an open action makes in the
-/// caller's table while the spawn goes on has FD_CLOEXEC whatever the
-/// action's flags say. 1 when it does, 0 when it does not, the negated
+/// caller's table while the spawn goes on has FD_CLOEXEC and FD_CLOFORK
+/// whatever the action's flags say. 1 when it does, 0 when it does not, the negated
 /// errno of a failure.
 pub fn probe_addopen_cloexec(path: &[u8]) -> i32 {
     let Ok(mut shadow) = Shadow::take() else {
@@ -2098,7 +2101,9 @@ pub fn probe_addopen_cloexec(path: &[u8]) -> i32 {
                 Ok(own.map(|own| {
                     files
                         .descriptors()
-                        .any(|(fd, _, flags)| fd == own && flags.close_on_exec)
+                        .any(|(fd, _, flags)| {
+                            fd == own && flags.close_on_exec && flags.close_on_fork
+                        })
                 }))
             });
             match seen {

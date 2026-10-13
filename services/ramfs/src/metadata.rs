@@ -187,7 +187,11 @@ impl MetadataJournal {
             } => {
                 uid = requested_uid.unwrap_or(uid);
                 gid = requested_gid.unwrap_or(gid);
-                mode &= !0o6000;
+                // Directory set-ID bits retain group inheritance, including
+                // privileged changes and requests retaining both IDs.
+                if node.kind != crate::DIR {
+                    mode &= !0o6000;
+                }
                 identity.uid == 0
                     || (owner
                         && uid == node.uid

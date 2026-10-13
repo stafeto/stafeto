@@ -115,10 +115,11 @@ pub enum Method {
     DrainRelease = 15,
     DrainState = 19,
     InputFlush = 20,
+    OutputFlush = 21,
 }
 
 impl Method {
-    pub const ALL: [Method; 14] = [
+    pub const ALL: [Method; 15] = [
         Method::Write,
         Method::Read,
         Method::Crash,
@@ -133,6 +134,7 @@ impl Method {
         Method::DrainRelease,
         Method::DrainState,
         Method::InputFlush,
+        Method::OutputFlush,
     ];
 
     pub const fn number(self) -> u16 {
@@ -374,6 +376,31 @@ impl InputFlush {
     }
 }
 
+/// Discard the owning console's software output once for this nonce.
+/// Hardware FIFO bytes retain their existing transmission and drain semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputFlush {
+    pub nonce: u64,
+}
+
+impl OutputFlush {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        if self.nonce == 0 {
+            return Err(Status::BadSize);
+        }
+        Method::OutputFlush.header().write(w)?;
+        w.u64(self.nonce)
+    }
+
+    pub fn read(body: Reader<'_>) -> Result<Self, Status> {
+        ReadKey::read(body).map(|request| Self { nonce: request.key })
+    }
+
+    pub fn acknowledged(bytes: &[u8]) -> bool {
+        InputFlush::acknowledged(bytes)
+    }
+}
+
 /// Physical completion of the captured prefix, including the shift register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrainReply {
@@ -501,10 +528,32 @@ mod tests {
     }
 
     #[test]
+    fn output_flush_nonce_and_ack_are_exact() {
+        let request = OutputFlush { nonce: u64::MAX };
+        let mut writer = Writer::new();
+        request.write(&mut writer).unwrap();
+        assert_eq!(
+            &writer.as_bytes()[..8],
+            &Method::OutputFlush.header().bytes()
+        );
+        assert_eq!(
+            OutputFlush::read(Reader::new(&writer.as_bytes()[8..])),
+            Ok(request)
+        );
+        assert!(OutputFlush::read(Reader::new(&[0; 8])).is_err());
+        assert!(OutputFlush::read(Reader::new(&[1; 9])).is_err());
+        assert!(OutputFlush::acknowledged(&proto_wire::reply(Status::Ok)));
+        assert!(!OutputFlush::acknowledged(&[0; 4]));
+        assert!(!OutputFlush::acknowledged(&proto_wire::reply(
+            Status::BadSize
+        )));
+    }
+
+    #[test]
     fn method_numbers_are_fixed() {
         assert_eq!(
             Method::ALL.map(Method::number),
-            [1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20]
+            [1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20, 21]
         );
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));

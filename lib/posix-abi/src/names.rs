@@ -622,8 +622,8 @@ pub fn realpath(path: &[u8], out: &mut [u8; MAX_PATH + 1]) -> Result<usize, c_in
 pub type Statvfs = [u64; 11];
 
 /// What a descriptor or a name of another service reports: no blocks, no
-/// files, names of 255 bytes.
-const NO_FILESYSTEM: Statvfs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255];
+/// files. Both block units remain the system's 4096-byte page size.
+const NO_FILESYSTEM: Statvfs = [4096, 4096, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 fn statvfs_words(request: &Request<'_>) -> Result<Statvfs, c_int> {
     let mut buffer = [0; RESULT_MAX];

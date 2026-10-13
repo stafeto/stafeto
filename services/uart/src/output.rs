@@ -48,6 +48,8 @@ pub struct Output {
     /// Bytes that go before all others: the CR LF that ends a line cut
     /// short, the LF after the CR of a newline.
     pending: &'static [u8],
+    pending_client: bool,
+    last_flush: Option<(u64, u64)>,
     /// The part of the line of the clients that went out since its start,
     /// up to REPEAT_MAX bytes; `long` once more went.
     line: [u8; REPEAT_MAX],
@@ -77,6 +79,8 @@ impl Output {
             log_len: 0,
             at: At::Start,
             pending: &[],
+            pending_client: false,
+            last_flush: None,
             line: [0; REPEAT_MAX],
             line_len: 0,
             long: false,
@@ -180,6 +184,42 @@ impl Output {
         self.submitted = self.submitted.wrapping_add(self.ring_len as u64);
         self.ring_start = (self.ring_start + self.ring_len) % TX_RING;
         self.ring_len = 0;
+    }
+
+    /// Discard the captured software queue and client continuation once.
+    /// The submitted position and kernel-log continuation remain unchanged.
+    pub fn flush_clients(
+        &mut self,
+        label: u64,
+        nonce: u64,
+    ) -> Result<Option<usize>, proto_wire::Status> {
+        if nonce == 0 {
+            return Err(proto_wire::Status::BadSize);
+        }
+        if self.last_flush == Some((label, nonce)) {
+            return Ok(None);
+        }
+        let removed = self.ring_len;
+        self.ring_start = (self.ring_start + removed) % TX_RING;
+        self.ring_len = 0;
+        if self.pending_client {
+            self.pending = &[];
+        }
+        self.line_len = 0;
+        self.long = false;
+        self.cut = false;
+        self.repeat = None;
+        if self.at == At::Client {
+            self.at = At::Start;
+        }
+        self.last_flush = Some((label, nonce));
+        Ok(Some(removed))
+    }
+
+    pub fn forget_flush(&mut self, label: u64) {
+        if self.last_flush.is_some_and(|(owner, _)| owner == label) {
+            self.last_flush = None;
+        }
     }
 
     /// Whether the text of the last batch of the log went out whole: the
@@ -293,6 +333,7 @@ impl Output {
                         if b == b'\n' {
                             self.at = At::Start;
                             self.pending = b"\n";
+                            self.pending_client = false;
                             return Some(b'\r');
                         }
                         return Some(b);
@@ -318,6 +359,7 @@ impl Output {
                 return b'\n';
             }
             self.pending = b"\n";
+            self.pending_client = true;
             return b'\r';
         }
         if self.line_len < REPEAT_MAX {
@@ -331,6 +373,7 @@ impl Output {
 
     /// A line cut short ends with CR LF; the next starts after them.
     fn end_line(&mut self) {
+        self.pending_client = self.at == At::Client;
         self.pending = b"\r\n";
         self.at = At::Start;
     }
@@ -346,6 +389,45 @@ impl Default for Output {
 mod tests {
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn software_flush_preserves_log_and_replay_preserves_new_output() {
+        let mut output = Output::new();
+        assert!(output.put_raw(b"old"));
+        assert_eq!(take(&mut output, 3), b"old");
+        assert!(output.put_log(b"log\n"));
+        assert_eq!(take(&mut output, 3), b"\r\nl");
+        assert!(output.put_raw(b"discard"));
+        let submitted = output.submitted();
+        assert_eq!(output.flush_clients(1, u64::MAX), Ok(Some(7)));
+        assert_eq!(output.submitted(), submitted);
+        assert!(output.put_raw(b"new\n"));
+        assert_eq!(output.flush_clients(1, u64::MAX), Ok(None));
+        assert_eq!(drain(&mut output), b"og\r\nnew\n");
+        assert!(output.clients_empty());
+    }
+
+    #[test]
+    fn software_flush_removes_client_lf_and_partial_repeat_keeps_log_lf() {
+        let mut output = Output::new();
+        assert!(output.put(b"old\n"));
+        assert_eq!(take(&mut output, 4), b"old\r");
+        assert_eq!(output.flush_clients(1, 1), Ok(Some(0)));
+        assert_eq!(drain(&mut output), b"");
+        assert!(output.put_raw(b"repeat"));
+        assert_eq!(take(&mut output, 6), b"repeat");
+        assert!(output.put_log(b"log\n"));
+        assert_eq!(take(&mut output, 6), b"\r\nlog\r");
+        assert_eq!(output.flush_clients(1, 2), Ok(Some(0)));
+        assert_eq!(drain(&mut output), b"\n");
+        assert!(output.put_raw(b"repeat"));
+        assert_eq!(take(&mut output, 6), b"repeat");
+        assert!(output.put_log(b"log\n"));
+        assert_eq!(take(&mut output, 9), b"\r\nlog\r\nre");
+        assert_eq!(output.flush_clients(1, 3), Ok(Some(0)));
+        assert_eq!(drain(&mut output), b"");
+        assert!(output.clients_empty());
+    }
 
     #[test]
     fn paced_fence_resolves_exhausted_replay_at_exact_tx_portion_boundary() {
