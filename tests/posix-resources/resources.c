@@ -146,13 +146,13 @@ static void acceptance(void) {
     if (fd >= 0) {
         unsigned made = 0;
         char path[64];
-        for (; made < 128; made++) {
+        for (; made < (unsigned)LINK_MAX - 1; made++) {
             snprintf(path, sizeof path, "/tmp/resource-link-%u", made);
             if (link(source, path) != 0) break;
         }
         struct stat st;
-        check("more links than the old advertised limit", made == 128
-            && fstat(fd, &st) == 0 && st.st_nlink == 129);
+        check("links reach the advertised limit", made == (unsigned)LINK_MAX - 1
+            && fstat(fd, &st) == 0 && st.st_nlink == LINK_MAX);
         for (unsigned i = 0; i < made; i++) {
             snprintf(path, sizeof path, "/tmp/resource-link-%u", i);
             check("link-limit cleanup", unlink(path) == 0);
