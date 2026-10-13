@@ -154,7 +154,22 @@ fn long_answer(r: &mut Request<'_>, reply: long::Reply<'_>) -> Answer {
     }
 }
 
-const METHODS: &[u16] = &[7, 8, 9, 11, 12, 13, 14, 15, 19, 20, FEED, HOLD, TAKEN];
+const METHODS: &[u16] = &[
+    7,
+    8,
+    9,
+    11,
+    12,
+    13,
+    14,
+    15,
+    19,
+    20,
+    proto_uart::Method::OutputFlush.number(),
+    FEED,
+    HOLD,
+    TAKEN,
+];
 
 impl Service<0> for Stub {
     const VERSION: u16 = VERSION;
@@ -253,6 +268,21 @@ impl Service<0> for Stub {
                         self.last_flush = request.nonce;
                     }
                     Answer::Status(Status::Ok)
+                }
+                Some(Method::OutputFlush) => {
+                    let request = match proto_uart::OutputFlush::read(r.body()) {
+                        Ok(request) if r.handles.is_empty() => request,
+                        _ => return Answer::Status(Status::BadSize),
+                    };
+                    let Rings { output, writes } = &mut *self.rings;
+                    match output.flush_clients(r.label(), request.nonce) {
+                        Ok(Some(_)) => {
+                            writes.discard(|_, _| {});
+                            Answer::Status(Status::Ok)
+                        }
+                        Ok(None) => Answer::Status(Status::Ok),
+                        Err(status) => Answer::Status(status),
+                    }
                 }
                 Some(Method::DrainState) => {
                     if r.body().finish().is_err() || !r.handles.is_empty() {
