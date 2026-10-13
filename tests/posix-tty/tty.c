@@ -286,6 +286,7 @@ static int flushing(const struct termios *saved) {
     say("posix-tty: type k\n");
     CHECK(read(0, c, sizeof c) == 1 && c[0] == 'k');
     say("posix-tty: input after a flush is read\n");
+    CHECK(tcdrain(1) == 0);
     CHECK(tcsetattr(0, TCSANOW, saved) == 0);
     CHECK(tcgetattr(0, &back) == 0 && same(&back, saved));
     return 0;
