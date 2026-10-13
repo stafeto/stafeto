@@ -2099,11 +2099,9 @@ pub fn probe_addopen_cloexec(path: &[u8]) -> i32 {
             let own = shadow.opened.iter().flatten().next().copied();
             let seen = crate::shared::with_files(|files| {
                 Ok(own.map(|own| {
-                    files
-                        .descriptors()
-                        .any(|(fd, _, flags)| {
-                            fd == own && flags.close_on_exec && flags.close_on_fork
-                        })
+                    files.descriptors().any(|(fd, _, flags)| {
+                        fd == own && flags.close_on_exec && flags.close_on_fork
+                    })
                 }))
             });
             match seen {

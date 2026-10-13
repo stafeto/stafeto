@@ -2442,7 +2442,10 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
         run.expect("<\x13>(\x11)", DIALOG_STEP)?;
         run.expect("posix-tty: output flushed", DIALOG_STEP)?;
         run.expect("posix-tty: fresh UART software tail", DIALOG_STEP)?;
-        run.expect("posix-tty: UART software output flush acknowledged", DIALOG_STEP)?;
+        run.expect(
+            "posix-tty: UART software output flush acknowledged",
+            DIALOG_STEP,
+        )?;
         run.expect("posix-tty: output ok", DIALOG_STEP)?;
         run.expect(
             "posix-tty: the layer refused the operations on the names of the terminal",
