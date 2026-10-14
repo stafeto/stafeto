@@ -407,6 +407,19 @@ static void fsize(void) {
     if (after_jump >= 0) close(after_jump);
     check("path truncate refusals preserve file size", fstat(file, &info) == 0 && info.st_size == 16);
     check("restore size handler after jumps", sigaction(SIGXFSZ, &action, NULL) == 0);
+    struct rlimit wide = {64, saved.rlim_max};
+    check("set FSIZE64", setrlimit(RLIMIT_FSIZE, &wide) == 0);
+    check("grow past the later limit", ftruncate(file, 40) == 0);
+    check("set FSIZE16 again", setrlimit(RLIMIT_FSIZE, &small) == 0);
+    int signals = size_signals;
+    check("shrink above the limit succeeds", ftruncate(file, 30) == 0 && size_signals == signals
+        && fstat(file, &info) == 0 && info.st_size == 30);
+    check("path shrink above the limit succeeds", truncate("/tmp/resource-fsize", 20) == 0
+        && size_signals == signals && fstat(file, &info) == 0 && info.st_size == 20);
+    errno = 0;
+    check("growth above the limit is refused", ftruncate(file, 21) == -1
+        && errno == EFBIG && size_signals == signals + 1 && fstat(file, &info) == 0
+        && info.st_size == 20);
     struct rlimit infinity = {RLIM_INFINITY, RLIM_INFINITY};
     check("FSIZE infinity roundtrip", setrlimit(RLIMIT_FSIZE, &infinity) == 0
         && same_limit(RLIMIT_FSIZE, &infinity));

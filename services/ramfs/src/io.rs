@@ -295,13 +295,17 @@ impl Ram<'_> {
         lease: DataLease,
         length: u64,
     ) -> Result<TruncatePreparation, (u32, DataLease)> {
+        let current = self
+            .storage
+            .node(self.token(lease.held.open.file))
+            .map_or(0, |node| node.length);
         let valid = lease
             .validate_kind(proto_fs::DataKind::Truncate)
             .and_then(|()| self.io_validate(&lease.held))
             .and({
                 if length > i64::MAX as u64 {
                     Err(OFFSET_OVERFLOW)
-                } else if length > lease.held.file_size_limit {
+                } else if length > current && length > lease.held.file_size_limit {
                     Err(proto_fs::FILE_SIZE_LIMIT)
                 } else if length > lease.held.capacity {
                     Err(FILE_TOO_LARGE)
@@ -423,7 +427,11 @@ impl Ram<'_> {
         if length > i64::MAX as u64 {
             return Err(OFFSET_OVERFLOW);
         }
-        if length > file_size_limit(fds) {
+        // The process limit applies to growth only; shrinking a file that is already over the
+        // limit succeeds.
+        if length > self.storage.node(self.token(open.file))?.length
+            && length > file_size_limit(fds)
+        {
             return Err(proto_fs::FILE_SIZE_LIMIT);
         }
         if length > io_capacity(open.file) {
@@ -535,7 +543,11 @@ impl TruncatePreparation {
         }
         let held = self.held.as_ref().ok_or(BAD_FD)?;
         ram.io_validate(held)?;
-        if self.data.length > held.file_size_limit {
+        let current = ram
+            .storage
+            .node(ram.token(held.open.file))
+            .map_or(0, |node| node.length);
+        if self.data.length > current && self.data.length > held.file_size_limit {
             return Err(proto_fs::FILE_SIZE_LIMIT);
         }
         if self.data.length > held.capacity {
