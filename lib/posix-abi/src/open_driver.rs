@@ -529,7 +529,13 @@ fn fifo_open(
         flags: recovery.fifo_flags as u32,
     };
     let mut brokered = false;
+    let mut full = false;
     loop {
+        if core::mem::take(&mut full) {
+            // The end's queue of waiters is full: try again shortly. A caught signal ends the
+            // pause and the check below decides about it.
+            let _ = crate::threads::sleep::pause(1_000_000);
+        }
         if crate::long::ending(&block.flags, true) {
             return Err(EINTR);
         }
@@ -587,7 +593,11 @@ fn fifo_open(
                 fifo_ticket(*recovery),
                 Some(capability),
             ) {
-                Ok(_) | Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
+                Ok(attached) => {
+                    full = attached.state.phase == NamedPhase::Grant;
+                    continue;
+                }
+                Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
                 Err(error) => return Err(protocol(error)),
             }
         }

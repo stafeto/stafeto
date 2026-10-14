@@ -324,11 +324,16 @@ impl PipeService {
                     return status(proto_pipe::BAD_FD);
                 }
                 if record.phase == NamedPhase::Grant {
-                    self.named.get_mut(ticket).unwrap().handle = None;
                     let mut wakes = Wakes::default();
                     let result = self.pipes.attach_named(endpoint, &mut wakes);
+                    // A full waiter queue keeps the ticket in Grant with its capability: the
+                    // attachment is idempotent and the client tries again after a short sleep.
                     match result {
-                        Ok(true) => self.named.get_mut(ticket).unwrap().phase = NamedPhase::Ready,
+                        Ok(true) => {
+                            let record = self.named.get_mut(ticket).unwrap();
+                            record.handle = None;
+                            record.phase = NamedPhase::Ready;
+                        }
                         Ok(false) => {
                             let end = self.pipes.queue_end(endpoint).unwrap();
                             let ops = &self.ops;
@@ -339,11 +344,15 @@ impl PipeService {
                                 |(l, k)| ops.waits(l, k) || named.alive(l, k),
                             ) {
                                 Ok(()) => {
-                                    self.named.get_mut(ticket).unwrap().phase = NamedPhase::Waiting
+                                    let record = self.named.get_mut(ticket).unwrap();
+                                    record.handle = None;
+                                    record.phase = NamedPhase::Waiting;
                                 }
+                                Err(proto_pipe::AGAIN) => {}
                                 Err(code) => {
                                     self.cancel_candidate(ticket);
                                     let record = self.named.get_mut(ticket).unwrap();
+                                    record.handle = None;
                                     record.phase = NamedPhase::Failed;
                                     record.result = code;
                                 }
@@ -352,6 +361,7 @@ impl PipeService {
                         Err(code) => {
                             self.cancel_candidate(ticket);
                             let record = self.named.get_mut(ticket).unwrap();
+                            record.handle = None;
                             record.phase = NamedPhase::Failed;
                             record.result = code;
                         }

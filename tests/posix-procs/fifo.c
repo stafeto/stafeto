@@ -313,6 +313,46 @@ static void rendezvous(void) {
     puts("posix-fifo: blocking rendezvous and cancellation ok");
 }
 
+#define CROWD 12
+static int crowd_started;
+static int crowd_open[CROWD];
+static int crowd_error[CROWD];
+static void *blocking_writer(void *index) {
+    int i = (int)(intptr_t)index;
+    __atomic_add_fetch(&crowd_started, 1, __ATOMIC_ACQ_REL);
+    crowd_open[i] = open("/tmp/fifo-c", O_WRONLY);
+    crowd_error[i] = errno;
+    return NULL;
+}
+
+/* More blocked opens than the eight places of an end's queue of waiters: none fails. */
+static void crowd(void) {
+    CHECK(mkfifo("/tmp/fifo-c", 0600) == 0);
+    pthread_t threads[CROWD];
+    for (int i = 0; i < CROWD; i++) {
+        crowd_open[i] = -2;
+        CHECK(pthread_create(&threads[i], NULL, blocking_writer, (void *)(intptr_t)i) == 0);
+    }
+    while (__atomic_load_n(&crowd_started, __ATOMIC_ACQUIRE) < CROWD) {
+        struct timespec delay = {0, 1000000};
+        nanosleep(&delay, NULL);
+    }
+    struct timespec settle = {0, 50000000};
+    nanosleep(&settle, NULL);
+    for (int i = 0; i < CROWD; i++) CHECK(crowd_open[i] == -2);
+    int r = open("/tmp/fifo-c", O_RDONLY);
+    CHECK(r >= 0);
+    for (int i = 0; i < CROWD; i++) CHECK(pthread_join(threads[i], NULL) == 0);
+    for (int i = 0; i < CROWD; i++) {
+        if (crowd_open[i] < 0) printf("posix-fifo: open %d failed, errno %d\n", i, crowd_error[i]);
+        CHECK(crowd_open[i] >= 0);
+        if (crowd_open[i] >= 0) CHECK(close(crowd_open[i]) == 0);
+    }
+    CHECK(close(r) == 0);
+    CHECK(unlink("/tmp/fifo-c") == 0);
+    puts("posix-fifo: twelve blocked opens of one end ok");
+}
+
 static void custody(void) {
     int r = reader("/tmp/fifo-a");
     int w = writer("/tmp/fifo-a");
@@ -365,6 +405,7 @@ int main(int argc, char **argv) {
     independent();
     readiness();
     rendezvous();
+    crowd();
     custody();
     memory("complete");
     printf("posix-fifo: done failures %d\n", failures);
