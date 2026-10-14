@@ -331,6 +331,45 @@ pub fn os_test(tests: &[(String, Vec<u8>)]) -> Vec<RootFile> {
     os_test_with_fixtures(tests, &[])
 }
 
+/// The databases of `netdb.h` that the images of os-test carry in `/etc`.
+fn network_databases() -> [RootFile; 4] {
+    [
+        of(
+            "/etc/hosts",
+            0o644,
+            ROOT,
+            Source::Bytes("hosts", b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n"),
+        ),
+        of(
+            "/etc/services",
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "services",
+                b"echo\t\t7/tcp\necho\t\t7/udp\nftp\t\t21/tcp\nssh\t\t22/tcp\ntelnet\t\t23/tcp\n\
+smtp\t\t25/tcp\t\tmail\ndomain\t\t53/tcp\ndomain\t\t53/udp\nhttp\t\t80/tcp\t\twww\n\
+pop3\t\t110/tcp\nntp\t\t123/udp\nimap\t\t143/tcp\nhttps\t\t443/tcp\n",
+            ),
+        ),
+        of(
+            "/etc/protocols",
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "protocols",
+                b"ip\t0\tIP\nicmp\t1\tICMP\ntcp\t6\tTCP\nudp\t17\tUDP\nipv6\t41\tIPv6\n\
+ipv6-icmp\t58\tIPv6-ICMP\n",
+            ),
+        ),
+        of(
+            "/etc/networks",
+            0o644,
+            ROOT,
+            Source::Bytes("networks", b"loopback\t127\n"),
+        ),
+    ]
+}
+
 /// Source fixtures remain regular data files outside the executable runner list.
 pub fn os_test_with_fixtures(
     tests: &[(String, Vec<u8>)],
@@ -341,6 +380,14 @@ pub fn os_test_with_fixtures(
     }
     let mut files = vec![dir("/dev")];
     files.extend(devices());
+    files.extend(network_databases());
+    files.push(dir("/bin"));
+    files.push(of(
+        "/bin/sh",
+        0o755,
+        ROOT,
+        Source::Elf("busybox-probe"),
+    ));
     files.push(dir("/os-test"));
     let mut list = String::new();
     for (n, (name, elf)) in tests.iter().enumerate() {
@@ -633,7 +680,9 @@ mod tests {
                 b"/* fchownat */\n".to_vec(),
             ),
         ];
-        let files = os_test_with_fixtures(&tests, &fixtures);
+        let mut files = os_test_with_fixtures(&tests, &fixtures);
+        // The accounts bring /etc, as in an image.
+        files.extend(accounts());
         let Some(Source::Bytes(_, list)) = files
             .iter()
             .find(|f| f.path == "/os-test/list")
@@ -769,7 +818,9 @@ mod tests {
             ("basic/spawn/posix_spawn".to_owned(), vec![4, 5]),
             ("basic/unistd/execl".to_owned(), vec![6]),
         ];
-        let files = os_test(&tests);
+        let mut files = os_test(&tests);
+        // The accounts bring /etc, as in an image.
+        files.extend(accounts());
         // The directories are listed once, the runner's list is a file.
         let paths: Vec<&str> = files.iter().map(|f| f.path).collect();
         for dir in [
@@ -795,7 +846,7 @@ mod tests {
         // the directories above them (it refuses a file without its
         // parent).
         let wanted = sources(&files);
-        assert_eq!(wanted.len(), 7);
+        assert_eq!(wanted.len(), 14);
         let bytes = table(&files, 3, 3 + wanted.len() as u32 + 1).unwrap();
         let read = Rootfs::parse(&bytes, 3 + wanted.len() as u32 + 1).unwrap();
         for path in [

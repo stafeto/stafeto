@@ -116,6 +116,7 @@ fn entries<'a>(names: impl Iterator<Item = &'a str>) -> usize {
 pub fn run(jobs: usize) -> Result<(), String> {
     let begun = Instant::now();
     crate::relibc()?;
+    crate::busybox_build()?;
     crate::run_cmd(
         Command::new("python3")
             .arg(crate::root().join("tools/build-os-test.py"))

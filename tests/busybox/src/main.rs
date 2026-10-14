@@ -149,6 +149,13 @@ extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> 
     if argc > 0 && unsafe { core::ffi::CStr::from_ptr(*argv) } == GETTY {
         getty();
     }
+    // The configuration has no applet named `sh` (the shell is `ash`), and
+    // `system`, `popen` and `wordexp` start `/bin/sh` with that name.
+    // SAFETY: as above.
+    if argc > 0 && unsafe { core::ffi::CStr::from_ptr(*argv) } == c"sh" {
+        // SAFETY: argv[0] exists; the string is static.
+        unsafe { *argv = c"ash".as_ptr().cast_mut() };
+    }
     // SAFETY: relibc's start gives argv with argc strings and a final null
     // pointer; BusyBox's dispatcher takes the applet from argv[0].
     unsafe { busybox_main(argc as c_int, argv.cast()) }
