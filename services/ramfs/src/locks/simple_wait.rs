@@ -355,17 +355,41 @@ impl<H> Waits<H> {
             at = r.next;
         }
     }
+    /// The owner's lock count went from zero to one: its waits no longer
+    /// yield to the writer FIFO and must be evaluated again.
+    pub fn owner_started(&mut self, owner: Owner) {
+        if self.count == 0 {
+            return;
+        }
+        self.schedule();
+        for r in self.registrations.iter_mut().flatten() {
+            if r.linked && r.captured.request.owner == owner {
+                r.dirty = true;
+                r.invalidated = true;
+            }
+        }
+    }
     #[inline(always)]
     fn incompatible(a: &Request, b: &Request) -> bool {
         matches!((a.command, b.command), (Command::Set(Some(ak)), Command::Set(Some(bk)))
             if a.owner != b.owner && (ak == Kind::Write || bk == Kind::Write) && a.range.overlaps(b.range))
     }
+    /// Writer FIFO: a requester that holds no lock on any inode yields to the
+    /// first older incompatible waiter. A holder yields to nobody. A holder
+    /// has an incoming held-lock edge, a non-holder has none, so no FIFO edge
+    /// enters a process that has one and every cycle consists of held-lock
+    /// edges, which the graph walk finds. At most 64 registrations are
+    /// visited and the holder test is O(1).
     pub fn older_conflict(
         &self,
         request: Request,
         id: Option<Id>,
+        locks: &SimpleLocks,
         mut live: impl FnMut(Owner) -> bool,
     ) -> Option<Lock> {
+        if locks.holds(request.owner) {
+            return None;
+        }
         let number = id
             .and_then(|id| self.slot(id).ok())
             .map_or(u64::MAX, |slot| {
@@ -440,7 +464,9 @@ impl<H> Waits<H> {
         };
         let older = self.registrations[slot].as_ref().unwrap().waited
             && !held.owns_overlap
-            && self.older_conflict(request, Some(id), &mut live).is_some();
+            && self
+                .older_conflict(request, Some(id), locks, &mut live)
+                .is_some();
         let blocked = held.blocker.is_some() || older;
         if held.blocker.is_some() {
             self.registrations[slot].as_mut().unwrap().waited = true;
@@ -448,6 +474,9 @@ impl<H> Waits<H> {
         if !blocked {
             match locks.set(storage, captured.root, request, &mut live) {
                 Ok(()) => {
+                    if let Some(owner) = locks.take_started() {
+                        self.owner_started(owner);
+                    }
                     self.changed(request.inode);
                     return self.finish(queue, id, 0);
                 }
@@ -565,7 +594,7 @@ impl<H> Waits<H> {
                             && (!r.waited
                                 || held.owns_overlap
                                 || self
-                                    .older_conflict(captured.request, Some(id), &mut live)
+                                    .older_conflict(captured.request, Some(id), locks, &mut live)
                                     .is_none())
                     })
             {

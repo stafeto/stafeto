@@ -142,6 +142,7 @@ static void metadata_acceptance(void) {
 static void acceptance(void) {
     int before = failures;
     check("LINK_MAX reflects the RAM name limit", LINK_MAX == 384);
+    check("pathconf LINK_MAX agrees with the header", pathconf("/tmp", _PC_LINK_MAX) == LINK_MAX);
     static const struct { const char *input, *tail; long value; } numbers[] = {
         {"08", "8", 0}, {"09", "9", 0}, {"077x", "x", 63},
         {"0", "", 0}, {"0x", "x", 0}, {"0Xg", "Xg", 0},
@@ -172,13 +173,13 @@ static void acceptance(void) {
     if (fd >= 0) {
         unsigned made = 0;
         char path[64];
-        for (; made < 128; made++) {
+        for (; made < (unsigned)LINK_MAX - 1; made++) {
             snprintf(path, sizeof path, "/tmp/resource-link-%u", made);
             if (link(source, path) != 0) break;
         }
         struct stat st;
-        check("more links than the old advertised limit", made == 128
-            && fstat(fd, &st) == 0 && st.st_nlink == 129);
+        check("links reach the advertised limit", made == (unsigned)LINK_MAX - 1
+            && fstat(fd, &st) == 0 && st.st_nlink == LINK_MAX);
         for (unsigned i = 0; i < made; i++) {
             snprintf(path, sizeof path, "/tmp/resource-link-%u", i);
             check("link-limit cleanup", unlink(path) == 0);

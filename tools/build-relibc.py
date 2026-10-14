@@ -14,10 +14,11 @@ speed counts (rtbench). A stamp of the commit, the toolchain, the flags,
 clang and the cbindgen version makes a second run do nothing."""
 
 import os
-from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
@@ -38,6 +39,7 @@ BUILD_STD = "core,alloc,compiler_builtins"
 # OpenLibm supplies the C math exports, including binary128 long double.
 FEATURES = ""
 MATH_BUILD = "openlibm-0.8.0-linux-aarch64-strict-v2"
+HEADER_POLICY = "limits-link-max-from-rust-v1"
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "relibc"
 SOURCE = WORK / "source"
@@ -136,7 +138,20 @@ def config(env: dict) -> str:
     rustflags, cflags = remap(env)
     clang = output(llvm("clang"), "--version", env=env).splitlines()[0]
     return (f"{COMMIT} {TOOLCHAIN} {TARGET} {rustflags} {cflags} build-std={BUILD_STD}"
-            f" features={FEATURES} math={MATH_BUILD} cbindgen {CBINDGEN} {clang}\n")
+            f" features={FEATURES} math={MATH_BUILD} cbindgen {CBINDGEN}"
+            f" headers={HEADER_POLICY} {clang}\n")
+
+
+def stafeto_link_max() -> int:
+    """Read the stafeto limit used by both pathconf and generated limits.h."""
+    source = (SOURCE / "src/header/limits/mod.rs").read_text()
+    values = re.findall(
+        r"#\[cfg\(stafeto\)\]\s*pub const LINK_MAX:\s*c_long\s*=\s*(\d+);",
+        source,
+    )
+    if len(values) != 1:
+        raise SystemExit("relibc limits/mod.rs lacks one stafeto LINK_MAX")
+    return int(values[0])
 
 
 def build(env: dict) -> None:
@@ -199,16 +214,19 @@ def headers(env: dict, generator: Path) -> None:
             continue
         out = include / (directory.name.replace("_", "/") + ".h")
         out.parent.mkdir(parents=True, exist_ok=True)
+        config_text = config.read_text()
+        if directory.name == "limits":
+            config_text, count = re.subn(
+                r"(?m)^#define LINK_MAX \d+$",
+                f"#define LINK_MAX {stafeto_link_max()}",
+                config_text,
+            )
+            if count != 1:
+                raise SystemExit("limits cbindgen config lacks one LINK_MAX")
         subprocess.run([str(generator), "--quiet", str(directory / "mod.rs"),
                         "--config=/dev/stdin", "--output", str(out)],
-                       input=config.read_text() + defaults, cwd=SOURCE, env=env, check=True,
+                       input=config_text + defaults, cwd=SOURCE, env=env, check=True,
                        text=True)
-    # This sysroot uses stafeto's link limit; other relibc headers keep 127.
-    limits = include / "limits.h"
-    text = limits.read_text()
-    if text.count("#define LINK_MAX 127") != 1:
-        raise SystemExit("generated limits.h lacks the expected link limit")
-    limits.write_text(text.replace("#define LINK_MAX 127", "#define LINK_MAX 384"))
 
 
 def main() -> None:
