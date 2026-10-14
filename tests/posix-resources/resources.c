@@ -116,6 +116,7 @@ static void metadata_acceptance(void) {
 static void acceptance(void) {
     int before = failures;
     check("LINK_MAX reflects the RAM name limit", LINK_MAX == 384);
+    check("pathconf LINK_MAX agrees with the header", pathconf("/tmp", _PC_LINK_MAX) == LINK_MAX);
     static const struct { const char *input, *tail; long value; } numbers[] = {
         {"08", "8", 0}, {"09", "9", 0}, {"077x", "x", 63},
         {"0", "", 0}, {"0x", "x", 0}, {"0Xg", "Xg", 0},
