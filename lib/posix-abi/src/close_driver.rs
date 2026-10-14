@@ -4,7 +4,7 @@
 //! Immutable numeric close events retain physical debt through canonical confirmation.
 
 use crate::constants::*;
-use posix_fs::closing::{CloseAdmission, CloseToken, OwnerToken};
+use posix_fs::closing::{CloseAdmission, CloseCommandFence, CloseToken, OwnerToken};
 use posix_fs::{DescriptorFlags, FsError, Target, Transport};
 use proto_wire::Status;
 
@@ -46,7 +46,15 @@ fn ram(target: Target) -> Option<posix_fs::RamTarget> {
 }
 
 enum Admission {
-    Started(CloseToken, u32),
+    /// The record this call started, its snapshot and fence read under the
+    /// admitting lock: the first turn needs no second look.
+    Started(
+        CloseToken,
+        u32,
+        Transport,
+        posix_fs::closing::Snapshot,
+        Option<CloseCommandFence>,
+    ),
     Pending(CloseToken),
     Open(posix_fs::open::OpenToken),
     Legacy(u32, Transport, Option<Target>),
@@ -112,7 +120,16 @@ fn operation(
                 None => files.begin_close_record(owner, fd, frame),
             };
             match result {
-                Ok(CloseAdmission::Started { token, .. }) => Ok(Admission::Started(token, fd)),
+                Ok(CloseAdmission::Started { token, snapshot }) => {
+                    let fence = files.close_command_fence(token).map_err(crate::error)?;
+                    Ok(Admission::Started(
+                        token,
+                        fd,
+                        files.transport(),
+                        snapshot,
+                        fence,
+                    ))
+                }
                 Ok(CloseAdmission::PendingClose(token)) => Ok(Admission::Pending(token)),
                 Ok(CloseAdmission::PendingOpen(token)) => Ok(Admission::Open(token)),
                 Ok(CloseAdmission::Replaced(number)) => {
@@ -123,9 +140,12 @@ fn operation(
             }
         })?;
         match step {
-            Admission::Started(token, number) => {
+            Admission::Started(token, number, transport, snapshot, fence) => {
                 // Only this admitted continuation may infer success after an exact
                 // helper retires the confirmed record, including a delayed reply.
+                if first_turn(token, transport, snapshot, fence)? {
+                    return Ok(number);
+                }
                 drive(token)?;
                 return Ok(number);
             }
@@ -145,6 +165,32 @@ fn operation(
             }
         }
     }
+}
+
+/// One unlocked helper turn on the lock debt that fences the record.
+fn fence_turn(debt: CloseCommandFence) -> Result<(), i32> {
+    match debt {
+        CloseCommandFence::Control(token) => crate::lock_driver::cleanup_step(token).map(drop),
+        CloseCommandFence::Wait(token) => crate::wait_lock_driver::cleanup_step(token).map(drop),
+    }
+}
+
+/// The first turn of the record this call admitted, from the state the
+/// admission read: Ok(true) when the record is retired.
+fn first_turn(
+    token: CloseToken,
+    transport: Transport,
+    snapshot: posix_fs::closing::Snapshot,
+    fence: Option<CloseCommandFence>,
+) -> Result<bool, i32> {
+    if let Some(debt) = fence {
+        fence_turn(debt)?;
+        return Ok(false);
+    }
+    if snapshot.complete {
+        return Ok(false);
+    }
+    event_step(token, transport, snapshot)
 }
 
 fn drive(token: CloseToken) -> Result<(), i32> {
@@ -170,14 +216,7 @@ fn step(token: CloseToken) -> Result<bool, i32> {
         return Ok(true);
     };
     if let Some(debt) = fence {
-        match debt {
-            posix_fs::closing::CloseCommandFence::Control(token) => {
-                crate::lock_driver::cleanup_step(token)?;
-            }
-            posix_fs::closing::CloseCommandFence::Wait(token) => {
-                crate::wait_lock_driver::cleanup_step(token)?;
-            }
-        }
+        fence_turn(debt)?;
         return Ok(false);
     }
     if !snapshot.complete {
@@ -218,24 +257,36 @@ fn step(token: CloseToken) -> Result<bool, i32> {
             }
         });
     }
-    let address = crate::shared::with_files(|files| {
-        let Ok(current) = files.close_snapshot(token) else {
-            return Ok(None);
-        };
-        if !current.complete || current.release.is_some() {
-            return Ok(None);
-        }
-        let address = files.close_wait_address(token).map_err(crate::error)?;
-        files
-            .ack_close_record(token, current.owner)
-            .map_err(crate::error)?;
-        Ok(Some(address))
-    })?;
-    if let Some(address) = address {
-        posix_sync::futex_wake(address as *const core::sync::atomic::AtomicU32, u32::MAX);
-        crate::change::wake_places();
+    let addresses = crate::shared::with_files(|files| retire(files, token))?;
+    if let Some(addresses) = addresses {
+        wake(addresses);
     }
     Ok(true)
+}
+
+/// Acknowledges a confirmed record that holds nothing physical, under the
+/// lock: the addresses its waiters and the waiters for a place of a job
+/// sleep on, or None when the record is gone or still owes its release.
+fn retire(files: &mut posix_fs::PosixFs, token: CloseToken) -> Result<Option<[usize; 2]>, i32> {
+    let Ok(current) = files.close_snapshot(token) else {
+        return Ok(None);
+    };
+    if !current.complete || current.release.is_some() {
+        return Ok(None);
+    }
+    let address = files.close_wait_address(token).map_err(crate::error)?;
+    files
+        .ack_close_record(token, current.owner)
+        .map_err(crate::error)?;
+    Ok(Some([address, files.jobs_wait_address()]))
+}
+
+/// Wakes both sets of waiters with no further look at the files: with no
+/// waiter neither wake calls the kernel.
+fn wake(addresses: [usize; 2]) {
+    for address in addresses {
+        posix_sync::futex_wake(address as *const core::sync::atomic::AtomicU32, u32::MAX);
+    }
 }
 
 // Keep the event request storage out of Lock cleanup and physical release.
@@ -262,24 +313,32 @@ fn event_step(
     if probed(Probe::Event, token) && receipt.is_ok() {
         receipt = Err(Status::Kernel(rt::abi::Error::Interrupted));
     }
-    let confirmed = crate::shared::with_files(|files| {
+    // The record that holds nothing physical is acknowledged under the same
+    // lock that confirms the event.
+    let (done, addresses) = crate::shared::with_files(|files| {
         // A concurrent helper can retire this exact generation during send.
         let Ok(current) = files.close_snapshot(token) else {
-            return Ok(true);
+            return Ok((true, None));
         };
         if current.complete {
-            return Ok(false);
+            return Ok((false, None));
         }
         match receipt {
             Ok(()) => {
                 files.finish_close_record(token).map_err(crate::error)?;
-                Ok(false)
+                match retire(files, token)? {
+                    Some(addresses) => Ok((true, Some(addresses))),
+                    None => Ok((false, None)),
+                }
             }
-            Err(Status::BadSize | Status::Kernel(rt::abi::Error::Interrupted)) => Ok(false),
+            Err(Status::BadSize | Status::Kernel(rt::abi::Error::Interrupted)) => Ok((false, None)),
             Err(error) => Err(protocol(error)),
         }
     })?;
-    Ok(confirmed)
+    if let Some(addresses) = addresses {
+        wake(addresses);
+    }
+    Ok(done)
 }
 
 fn help_once() -> bool {
