@@ -748,7 +748,7 @@ mod tests {
     #[test]
     fn the_guard_of_s4_holds_at_its_number_and_fires_over_it() {
         assert_eq!(S4_ICOUNT_MAX, 2_783 * 125 / 100);
-        assert!(3_110 * 11 <= S4_ICOUNT_MAX * 10);
+        const { assert!(3_110 * 11 <= S4_ICOUNT_MAX * 10) };
         let at = run_with_row(S4_ROW, S4_ICOUNT_MAX * 16);
         assert_eq!(s4_room(&at, S4_ICOUNT_MAX), Ok(0));
         let head = run_with_row(S4_ROW, 3_110 * 16);
@@ -778,7 +778,7 @@ mod tests {
         let head = run_with_s5(2_759 * 16);
         assert_eq!(s5_room(&head, S5_ICOUNT_MAX), Ok(276));
         // The room at the measure is a tenth of it.
-        assert!(2_759 * 11 <= S5_ICOUNT_MAX * 10);
+        const { assert!(2_759 * 11 <= S5_ICOUNT_MAX * 10) };
         let over = run_with_s5((S5_ICOUNT_MAX + 1) * 16);
         let error = s5_room(&over, S5_ICOUNT_MAX).unwrap_err();
         assert!(
