@@ -21,9 +21,9 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-# Stafeto link limit and integer parsing, tagged pin-d7ce7908.
+# Stafeto link limit, integer parsing and mknodat of FIFOs, tagged pin-576fc51e.
 # File Synchronization awaits aio_fsync.
-COMMIT = "d7ce790822f138f982b3c3173731a99daca1fa94"
+COMMIT = "576fc51e80506c6d081b137fff9d38360ef06d6b"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
