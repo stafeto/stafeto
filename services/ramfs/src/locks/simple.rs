@@ -186,10 +186,109 @@ pub struct Sweep {
     pub wrapped: bool,
 }
 
+/// Distinct owners that hold at least one lock record at the same time.
+const OWNERS: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct Holder {
+    owner: Option<Owner>,
+    records: u32,
+}
+impl Holder {
+    const EMPTY: Self = Self {
+        owner: None,
+        records: 0,
+    };
+}
+
+/// Lock records per owner across all inodes: an open-addressed table with
+/// backward-shift deletion, so lookups never see tombstones.
+struct Holders {
+    slots: [Holder; OWNERS],
+    used: usize,
+}
+impl Holders {
+    fn home(owner: Owner) -> usize {
+        let key = match owner {
+            Owner::Process(pid) => u64::from(pid),
+            Owner::Description { slot, generation } => {
+                generation.rotate_left(17) ^ u64::from(slot) ^ (1 << 63)
+            }
+        };
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize % OWNERS
+    }
+    fn find(&self, owner: Owner) -> Option<usize> {
+        let mut at = Self::home(owner);
+        for _ in 0..OWNERS {
+            match self.slots[at].owner {
+                None => return None,
+                Some(found) if found == owner => return Some(at),
+                Some(_) => at = (at + 1) % OWNERS,
+            }
+        }
+        None
+    }
+    fn holds(&self, owner: Owner) -> bool {
+        self.find(owner).is_some()
+    }
+    /// A new owner needs a free slot.
+    fn admits(&self, owner: Owner) -> bool {
+        self.used < OWNERS || self.holds(owner)
+    }
+    /// Returns true when the owner goes from no records to some.
+    fn add(&mut self, owner: Owner, records: u32) -> bool {
+        if let Some(at) = self.find(owner) {
+            self.slots[at].records += records;
+            return false;
+        }
+        let mut at = Self::home(owner);
+        while self.slots[at].owner.is_some() {
+            at = (at + 1) % OWNERS;
+        }
+        self.slots[at] = Holder {
+            owner: Some(owner),
+            records,
+        };
+        self.used += 1;
+        true
+    }
+    fn sub(&mut self, owner: Owner, records: u32) {
+        let at = self.find(owner).expect("counted owner");
+        self.slots[at].records -= records;
+        if self.slots[at].records != 0 {
+            return;
+        }
+        let mut hole = at;
+        let mut next = at;
+        loop {
+            next = (next + 1) % OWNERS;
+            let Some(moved) = self.slots[next].owner else {
+                break;
+            };
+            let home = Self::home(moved);
+            // The entry may fill the hole only when its home is not inside the
+            // cyclic interval (hole, next].
+            let inside = if hole <= next {
+                hole < home && home <= next
+            } else {
+                hole < home || home <= next
+            };
+            if !inside {
+                self.slots[hole] = self.slots[next];
+                hole = next;
+            }
+        }
+        self.slots[hole] = Holder::EMPTY;
+        self.used -= 1;
+    }
+}
+
 pub struct SimpleLocks {
     heads: [Head; storage::NODES],
     pages: [Page; storage::PAGES],
     available: [u16; storage::ROOTS],
+    holders: Holders,
+    started: Option<Owner>,
     total: usize,
 }
 impl SimpleLocks {
@@ -198,6 +297,11 @@ impl SimpleLocks {
             heads: [Head::EMPTY; storage::NODES],
             pages: [const { Page::EMPTY }; storage::PAGES],
             available: [NO_PAGE; storage::ROOTS],
+            holders: Holders {
+                slots: [Holder::EMPTY; OWNERS],
+                used: 0,
+            },
+            started: None,
             total: 0,
         }
     }
@@ -209,6 +313,12 @@ impl SimpleLocks {
         // SAFETY: all destinations belong to the exclusive caller allocation.
         unsafe {
             core::ptr::addr_of_mut!((*destination).total).write(0);
+            core::ptr::addr_of_mut!((*destination).started).write(None);
+            core::ptr::addr_of_mut!((*destination).holders.used).write(0);
+            let slots = core::ptr::addr_of_mut!((*destination).holders.slots).cast::<Holder>();
+            for i in 0..OWNERS {
+                slots.add(i).write(Holder::EMPTY);
+            }
             let heads = core::ptr::addr_of_mut!((*destination).heads).cast::<Head>();
             for i in 0..storage::NODES {
                 heads.add(i).write(Head::EMPTY);
@@ -225,6 +335,14 @@ impl SimpleLocks {
     }
     pub fn has_locks(&self) -> bool {
         self.total != 0
+    }
+    /// Whether `owner` holds at least one lock record on any inode. O(1).
+    pub fn holds(&self, owner: Owner) -> bool {
+        self.holders.holds(owner)
+    }
+    /// The owner whose lock count went from zero to one since the last call.
+    pub fn take_started(&mut self) -> Option<Owner> {
+        self.started.take()
     }
     pub fn count(&self, inode: Token) -> usize {
         self.heads
@@ -293,29 +411,6 @@ impl SimpleLocks {
         }
         assert_eq!(id, NONE);
         Ok(out)
-    }
-    /// Whether a live `owner` holds any lock on `inode`.
-    pub fn holds_any(
-        &self,
-        storage: &Storage<'_>,
-        inode: Token,
-        owner: Owner,
-        mut live: impl FnMut(Owner) -> bool,
-    ) -> Result<bool, Error> {
-        storage.node(inode).map_err(|_| Error::Invalid)?;
-        let head = self.heads[inode.slot as usize];
-        if head.count != 0 && head.generation != inode.generation {
-            return Err(Error::Invalid);
-        }
-        let mut id = head.first;
-        let mut found = false;
-        for _ in 0..head.count {
-            let (lock, next) = self.read(storage, id);
-            id = next;
-            found |= lock.owner == owner && live(owner);
-        }
-        assert_eq!(id, NONE);
-        Ok(found)
     }
     pub fn query(
         &self,
@@ -393,6 +488,8 @@ impl SimpleLocks {
         let mut unallocated: Buffer<u8, { PER_INODE + 2 }> = Buffer::new();
         let mut len = 0;
         let mut retained = 0u64;
+        // Owners whose records are dropped as dead.
+        let mut dead: Buffer<Owner, PER_INODE> = Buffer::new();
         let mut added = kind.map(|kind| Lock {
             owner: request.owner,
             kind,
@@ -401,6 +498,7 @@ impl SimpleLocks {
         for (index, entry) in old[..count].iter().enumerate() {
             let original = index as u8;
             if !live(entry.lock.owner) {
+                dead.push(entry.lock.owner);
                 continue;
             }
             if let Some(kind) = kind
@@ -520,6 +618,12 @@ impl SimpleLocks {
                 retained |= 1u64 << index;
             }
         }
+        // Only the requester's records change besides the dead ones dropped,
+        // so the list length gives the requester's net change.
+        let net = (len + dead.len()) as i64 - count as i64;
+        if net > 0 && !self.holders.admits(request.owner) {
+            return Err(Error::NoLocks);
+        }
         let first_pin = count == 0 && len != 0;
         if first_pin {
             storage
@@ -576,6 +680,16 @@ impl SimpleLocks {
         }
         changed |= self.heads[request.inode.slot as usize].first
             != if len == 0 { NONE } else { work[0].id };
+        for &owner in &dead[..] {
+            self.holders.sub(owner, 1);
+        }
+        if net > 0 {
+            if self.holders.add(request.owner, net as u32) {
+                self.started = Some(request.owner);
+            }
+        } else if net < 0 {
+            self.holders.sub(request.owner, (-net) as u32);
+        }
         self.total = self.total - count + len;
         self.heads[request.inode.slot as usize] = Head {
             generation: request.inode.generation,
@@ -636,6 +750,7 @@ impl SimpleLocks {
         let mut len = 0;
         for entry in &old[..count] {
             if remove(entry.lock) {
+                self.holders.sub(entry.lock.owner, 1);
                 self.free(storage, entry.id);
             } else {
                 kept.push(*entry);
@@ -1302,5 +1417,52 @@ mod tests {
         cursor.restart();
         table.sweep(&mut ram.storage, &mut cursor, storage::NODES, |_| false);
         assert_eq!(ram.storage.usage(payer(1)), storage::Usage::default());
+    }
+
+    #[test]
+    fn holders_table_matches_a_reference_through_collisions_and_deletions() {
+        extern crate std;
+        let mut table = std::boxed::Box::new(Holders {
+            slots: [Holder::EMPTY; OWNERS],
+            used: 0,
+        });
+        let mut reference = std::collections::BTreeMap::<u32, u32>::new();
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let owner = |n: u32| {
+            if n.is_multiple_of(5) {
+                Owner::Description {
+                    slot: (n / 5) as u16,
+                    generation: u64::from(n),
+                }
+            } else {
+                Owner::Process(n)
+            }
+        };
+        for step in 0..200_000u32 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // About 1500 distinct owners keep the table dense and clustered.
+            let n = ((state >> 33) % 1500) as u32;
+            let have = reference.get(&n).copied().unwrap_or(0);
+            if (state >> 20) & 3 != 0 && table.admits(owner(n)) {
+                let started = table.add(owner(n), 1);
+                assert_eq!(started, have == 0, "step {step}");
+                *reference.entry(n).or_insert(0) += 1;
+            } else if have != 0 {
+                table.sub(owner(n), 1);
+                if have == 1 {
+                    reference.remove(&n);
+                } else {
+                    reference.insert(n, have - 1);
+                }
+            }
+            assert_eq!(table.used, reference.len());
+            if step % 997 == 0 {
+                for n in 0..1500 {
+                    assert_eq!(table.holds(owner(n)), reference.contains_key(&n));
+                }
+            }
+        }
     }
 }
