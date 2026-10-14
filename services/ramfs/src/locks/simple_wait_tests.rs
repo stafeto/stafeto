@@ -202,13 +202,7 @@ fn writer_fifo_prevents_reader_bypass_and_notification_never_grants() {
     let second = f.wait_kind(1, 258, 0, Kind::Read);
     let slot = f.waits.slot(second).unwrap();
     assert_eq!(f.settle(second).phase, WaitPhase::NeedsArm);
-    f.locks
-        .close(
-            &mut f.ram.storage,
-            f.captured.request.inode,
-            Owner::Process(256),
-        )
-        .unwrap();
+    f.hold(256, 0, Kind::Read);
     f.waits.changed(f.captured.request.inode);
     assert_eq!(f.settle(second).phase, WaitPhase::NeedsArm);
     let reader = f.waits.registrations[slot]
@@ -222,6 +216,13 @@ fn writer_fifo_prevents_reader_bypass_and_notification_never_grants() {
             .is_some()
     );
     f.waits.arm(&mut f.queue, first, 7).unwrap();
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(256),
+        )
+        .unwrap();
     f.waits.changed(f.captured.request.inode);
     let mut notifications = 0;
     for _ in 0..CAPACITY {

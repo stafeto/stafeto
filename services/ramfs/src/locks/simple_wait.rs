@@ -373,6 +373,7 @@ impl<H> Waits<H> {
             .map_or(u64::MAX, |slot| {
                 self.registrations[slot].as_ref().unwrap().number
             });
+        let mut holds = None;
         let mut at = self.heads[request.inode.slot as usize];
         while at != NONE {
             let r = self.registrations[at as usize].as_ref().unwrap();
@@ -384,16 +385,26 @@ impl<H> Waits<H> {
                 && Self::incompatible(older, &request)
                 && live(older.owner)
             {
-                // Yield only to an older waiter that no held lock blocks. A
-                // blocked older waiter adds a wait edge that the held-lock graph
-                // does not contain, so a cycle through several owners could form.
-                // FIFO edges then lead to ready, strictly older entries only.
-                let blocked = locks
-                    .conflicts(storage, *older, &mut live)
-                    .map_or(true, |conflicts| conflicts.len() != 0);
-                if blocked {
-                    at = r.next;
-                    continue;
+                // Writer FIFO: the requester yields to an older incompatible
+                // waiter. A blocked older waiter adds a wait edge that the
+                // held-lock graph does not contain, and the edge can close a
+                // cycle only through a lock the requester holds on this inode.
+                // A requester that holds one yields to ready waiters only and
+                // looks past blocked ones, so FIFO edges lead to ready, strictly
+                // older entries and no cycle forms.
+                let holds = *holds.get_or_insert_with(|| {
+                    locks
+                        .holds_any(storage, request.inode, request.owner, &mut live)
+                        .unwrap_or(true)
+                });
+                if holds {
+                    let ready = locks
+                        .conflicts(storage, *older, &mut live)
+                        .is_ok_and(|conflicts| conflicts.is_empty());
+                    if !ready {
+                        at = r.next;
+                        continue;
+                    }
                 }
                 let Command::Set(Some(kind)) = older.command else {
                     unreachable!()

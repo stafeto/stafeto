@@ -294,6 +294,29 @@ impl SimpleLocks {
         assert_eq!(id, NONE);
         Ok(out)
     }
+    /// Whether a live `owner` holds any lock on `inode`.
+    pub fn holds_any(
+        &self,
+        storage: &Storage<'_>,
+        inode: Token,
+        owner: Owner,
+        mut live: impl FnMut(Owner) -> bool,
+    ) -> Result<bool, Error> {
+        storage.node(inode).map_err(|_| Error::Invalid)?;
+        let head = self.heads[inode.slot as usize];
+        if head.count != 0 && head.generation != inode.generation {
+            return Err(Error::Invalid);
+        }
+        let mut id = head.first;
+        let mut found = false;
+        for _ in 0..head.count {
+            let (lock, next) = self.read(storage, id);
+            id = next;
+            found |= lock.owner == owner && live(owner);
+        }
+        assert_eq!(id, NONE);
+        Ok(found)
+    }
     pub fn query(
         &self,
         storage: &Storage<'_>,
