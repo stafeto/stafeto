@@ -1215,19 +1215,23 @@ pub(crate) fn stop_others() -> Result<(), i32> {
             if core::ptr::from_ref(block) as usize == me {
                 return;
             }
-            let parked = PARKING[index].load(Ordering::Acquire) != 0;
             let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(native));
-            let state = match sys::thread_info(&thread).map(|info| info.state) {
-                Ok(ThreadState::Ended | ThreadState::Stopped) => stop_barrier::State::Terminal,
-                Ok(ThreadState::Receiving | ThreadState::Sending | ThreadState::AwaitingReply) => {
-                    stop_barrier::State::KernelWait
-                }
-                Ok(_) => stop_barrier::State::Running,
-                Err(_) => stop_barrier::State::Unknown,
-            };
-            if stop_barrier::confirmed_terminal(state)
-                || stop_barrier::confirmed_parked(parked, state)
-            {
+            let (state, parked) = stop_barrier::observe(
+                || match sys::thread_info(&thread).map(|info| info.state) {
+                    Ok(ThreadState::Ended | ThreadState::Stopped) => {
+                        (stop_barrier::State::Terminal, false)
+                    }
+                    Ok(ThreadState::Receiving) => (stop_barrier::State::KernelWait, true),
+                    Ok(ThreadState::Sending | ThreadState::AwaitingReply) => {
+                        (stop_barrier::State::KernelWait, false)
+                    }
+                    Ok(_) => (stop_barrier::State::Running, false),
+                    Err(_) => (stop_barrier::State::Unknown, false),
+                },
+                || PARKING[index].load(Ordering::Acquire),
+                block.channel.load(Ordering::Relaxed),
+            );
+            if stop_barrier::confirmed_terminal(state) || parked {
                 return;
             }
             let flags = block.flags.load(Ordering::SeqCst);
