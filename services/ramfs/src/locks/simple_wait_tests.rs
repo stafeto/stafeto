@@ -202,7 +202,13 @@ fn writer_fifo_prevents_reader_bypass_and_notification_never_grants() {
     let second = f.wait_kind(1, 258, 0, Kind::Read);
     let slot = f.waits.slot(second).unwrap();
     assert_eq!(f.settle(second).phase, WaitPhase::NeedsArm);
-    f.hold(256, 0, Kind::Read);
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(256),
+        )
+        .unwrap();
     f.waits.changed(f.captured.request.inode);
     assert_eq!(f.settle(second).phase, WaitPhase::NeedsArm);
     let reader = f.waits.registrations[slot]
@@ -216,13 +222,6 @@ fn writer_fifo_prevents_reader_bypass_and_notification_never_grants() {
             .is_some()
     );
     f.waits.arm(&mut f.queue, first, 7).unwrap();
-    f.locks
-        .close(
-            &mut f.ram.storage,
-            f.captured.request.inode,
-            Owner::Process(256),
-        )
-        .unwrap();
     f.waits.changed(f.captured.request.inode);
     let mut notifications = 0;
     for _ in 0..CAPACITY {
@@ -355,6 +354,59 @@ fn older_waiter_blocked_by_requester_does_not_stall_lock_conversion() {
     );
     assert_eq!(f.query(younger).result, 0);
     assert_ne!(f.queue.query(older).unwrap().phase, WaitPhase::Complete);
+}
+
+#[test]
+fn three_owner_fifo_cycle_does_not_stall_lock_conversion() {
+    // P3 and P5 hold readers, P4 holds a reader of byte 0. Waiters in order:
+    // P2 write [0,6), P3 write [0,1), P5 write [10,11). When P4 closes, P3 is
+    // ready; P2 is blocked by P5, P5 is blocked by P3. P3 must not queue
+    // behind P2.
+    let mut f = Fixture::new();
+    f.hold(258, 10, Kind::Read);
+    f.hold(260, 5, Kind::Read);
+    f.hold(259, 0, Kind::Read);
+    let p2 = f.wait_range(0, 257, 0, 6, Kind::Write);
+    assert_eq!(f.settle(p2).phase, WaitPhase::NeedsArm);
+    let p3 = f.wait_range(1, 258, 0, 1, Kind::Write);
+    assert_eq!(f.settle(p3).phase, WaitPhase::NeedsArm);
+    f.waits.arm(&mut f.queue, p3, 71).unwrap();
+    let p5 = f.wait_range(2, 260, 10, 1, Kind::Write);
+    assert_eq!(f.settle(p5).phase, WaitPhase::NeedsArm);
+
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(259),
+        )
+        .unwrap();
+    f.waits.changed(f.captured.request.inode);
+    let mut notified = false;
+    for _ in 0..4096 {
+        f.waits.maintenance(
+            &mut f.queue,
+            &mut f.locks,
+            &mut f.ram.storage,
+            |_, _| true,
+            |_| true,
+            |handle| notified |= *handle == 71,
+        );
+        if notified {
+            break;
+        }
+    }
+    assert!(notified, "P3 is ready and must not wait behind blocked P2");
+    assert_eq!(
+        f.query(p3),
+        WaitReply {
+            phase: WaitPhase::Complete,
+            result: 0
+        }
+    );
+    for id in [p2, p5] {
+        assert_ne!(f.queue.query(id).unwrap().phase, WaitPhase::Complete);
+    }
 }
 
 #[test]

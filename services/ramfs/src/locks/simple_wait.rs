@@ -384,16 +384,16 @@ impl<H> Waits<H> {
                 && Self::incompatible(older, &request)
                 && live(older.owner)
             {
-                // FIFO must not add a wait edge back to a lock held by this
-                // requester. The held-lock graph does not include queued edges.
-                let requester_blocks_older =
-                    locks
-                        .conflicts(storage, *older, &mut live)
-                        .is_ok_and(|conflicts| {
-                            conflicts.iter().any(|lock| lock.owner == request.owner)
-                        });
-                if requester_blocks_older {
-                    return None;
+                // Yield only to an older waiter that no held lock blocks. A
+                // blocked older waiter adds a wait edge that the held-lock graph
+                // does not contain, so a cycle through several owners could form.
+                // FIFO edges then lead to ready, strictly older entries only.
+                let blocked = locks
+                    .conflicts(storage, *older, &mut live)
+                    .map_or(true, |conflicts| conflicts.len() != 0);
+                if blocked {
+                    at = r.next;
+                    continue;
                 }
                 let Command::Set(Some(kind)) = older.command else {
                     unreachable!()
