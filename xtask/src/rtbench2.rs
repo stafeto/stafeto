@@ -16,9 +16,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::{
-    BOOT_PROFILE, ImageProgram, RTBENCH_POSIX_PROGRAMS, RTBENCH_POSIX_VZ_PROGRAMS, S5_ICOUNT_KEEP,
-    S5_ICOUNT_MAX, S5_ICOUNT_SLACK, Variant, build, guard_lower_hint, guard_margin, hvf_host, qemu,
-    target_dir, vz, write_boot_image_with,
+    BOOT_PROFILE, ImageProgram, RTBENCH_POSIX_PROGRAMS, RTBENCH_POSIX_VZ_PROGRAMS, S4_ICOUNT_MAX,
+    S5_ICOUNT_KEEP, S5_ICOUNT_MAX, S5_ICOUNT_SLACK, Variant, build, guard_lower_hint, guard_margin,
+    hvf_host, qemu, target_dir, vz, write_boot_image_with,
 };
 
 /// The rows of a run, in its order: each comes once, as numbers or as
@@ -413,20 +413,38 @@ pub enum Short {
     Marks,
 }
 
-/// The instructions of the three rows of S5: the `min` of each, in ticks of
-/// the counter, which under -icount are instructions.
-fn s5_ticks(run: &Run) -> Result<Vec<u64>, String> {
-    S5_ROWS
-        .iter()
-        .map(|name| match run.rows.iter().find(|(n, _)| n == name) {
-            // The file keeps nanoseconds: a tick is 1e9 / hz of them.
-            Some((_, Row::Numbers(r))) => {
-                Ok((u128::from(r.min) * u128::from(run.hz) + 500_000_000) as u64 / 1_000_000_000)
-            }
-            _ => Err(format!("no numbers for {name}")),
-        })
-        .collect()
+/// The instructions of a row: its `min`, in ticks of the counter, which
+/// under -icount are instructions.
+fn row_ticks(run: &Run, name: &str) -> Result<u64, String> {
+    match run.rows.iter().find(|(n, _)| *n == name) {
+        // The file keeps nanoseconds: a tick is 1e9 / hz of them.
+        Some((_, Row::Numbers(r))) => {
+            Ok((u128::from(r.min) * u128::from(run.hz) + 500_000_000) as u64 / 1_000_000_000)
+        }
+        _ => Err(format!("no numbers for {name}")),
+    }
 }
+
+/// The instructions of the three rows of S5.
+fn s5_ticks(run: &Run) -> Result<Vec<u64>, String> {
+    S5_ROWS.iter().map(|name| row_ticks(run, name)).collect()
+}
+
+/// The room the row `s4_dup_close` of an -icount run leaves under `max`, or
+/// the error that says it is past it. A row under a tenth of `max` is no
+/// instruction count.
+fn s4_room(run: &Run, max: u64) -> Result<u64, String> {
+    let n = row_ticks(run, S4_ROW)?;
+    if n < max / 10 {
+        return Err(format!(
+            "S4 under icount {S4_ROW}={n} is under a tenth of its guard {max}: \
+             the run is not under -icount"
+        ));
+    }
+    guard_margin("S4 under icount", &[S4_ROW], &[n], S4_ROW, max)
+}
+
+const S4_ROW: &str = "s4_dup_close";
 
 const S5_ROWS: [&str; 3] = ["s5_kill_sleeping", "s5_kill_reading", "s5_kill_busy_25"];
 
@@ -524,6 +542,11 @@ pub fn short(how: Short) -> Result<(), String> {
         }
         return Ok(());
     }
+    let s4 = s4_room(&run, S4_ICOUNT_MAX)?;
+    println!(
+        "S4 instructions under icount: {} of S4_ICOUNT_MAX {S4_ICOUNT_MAX}, room {s4}",
+        row_ticks(&run, S4_ROW)?
+    );
     let room = s5_room(&run, S5_ICOUNT_MAX)?;
     println!(
         "S5 instructions under icount: {} of S5_ICOUNT_MAX {S5_ICOUNT_MAX}, room {room}",
@@ -707,18 +730,59 @@ mod tests {
         parse(&lines).unwrap()
     }
 
-    /// 16 ns a tick under -icount: 2 770 instructions are 44 320 ns.
+    fn run_with_row(name: &str, min_ns: u64) -> Run {
+        let mut lines = lines();
+        lines[0] = "RTB2 START hz=62500000 seconds=0".to_owned();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with(&format!("RTB2 {name} ")))
+            .unwrap();
+        lines[at] =
+            format!("RTB2 {name} n=3 min={min_ns} p50={min_ns} p99={min_ns} max={min_ns} h=3");
+        parse(&lines).unwrap()
+    }
+
+    /// The guard of the dup and close of a descriptor stands 10 % above the
+    /// measure and 1.25 times the figure before the accounting of
+    /// descriptions; a close that asks the service again (18 278) fires it.
+    #[test]
+    fn the_guard_of_s4_holds_at_its_number_and_fires_over_it() {
+        assert_eq!(S4_ICOUNT_MAX, 2_783 * 125 / 100);
+        assert!(3_110 * 11 <= S4_ICOUNT_MAX * 10);
+        let at = run_with_row(S4_ROW, S4_ICOUNT_MAX * 16);
+        assert_eq!(s4_room(&at, S4_ICOUNT_MAX), Ok(0));
+        let head = run_with_row(S4_ROW, 3_110 * 16);
+        assert_eq!(s4_room(&head, S4_ICOUNT_MAX), Ok(368));
+        let over = run_with_row(S4_ROW, (S4_ICOUNT_MAX + 1) * 16);
+        assert!(
+            s4_room(&over, S4_ICOUNT_MAX)
+                .unwrap_err()
+                .contains("s4_dup_close=3479 is 1 past its guard 3478")
+        );
+        let asks = run_with_row(S4_ROW, 18_278 * 16);
+        assert!(s4_room(&asks, S4_ICOUNT_MAX).is_err());
+        let own = run_with_row(S4_ROW, 190 * 16);
+        assert!(
+            s4_room(&own, S4_ICOUNT_MAX)
+                .unwrap_err()
+                .contains("the run is not under -icount")
+        );
+    }
+
+    /// 16 ns a tick under -icount: 3 035 instructions are 48 560 ns.
     #[test]
     fn the_guard_of_s5_holds_at_its_number_and_fires_one_over() {
         let at = run_with_s5(S5_ICOUNT_MAX * 16);
         assert_eq!(s5_ticks(&at).unwrap(), [S5_ICOUNT_MAX; 3]);
         assert_eq!(s5_room(&at, S5_ICOUNT_MAX), Ok(0));
-        let head = run_with_s5(2_754 * 16);
-        assert_eq!(s5_room(&head, S5_ICOUNT_MAX), Ok(16));
+        let head = run_with_s5(2_759 * 16);
+        assert_eq!(s5_room(&head, S5_ICOUNT_MAX), Ok(276));
+        // The room at the measure is a tenth of it.
+        assert!(2_759 * 11 <= S5_ICOUNT_MAX * 10);
         let over = run_with_s5((S5_ICOUNT_MAX + 1) * 16);
         let error = s5_room(&over, S5_ICOUNT_MAX).unwrap_err();
         assert!(
-            error.contains("s5_kill_sleeping=2771") && error.contains("1 past its guard 2770"),
+            error.contains("s5_kill_sleeping=3036") && error.contains("1 past its guard 3035"),
             "{error}"
         );
         // A run at its own speed shows a few hundred ticks, not instructions.
@@ -729,19 +793,19 @@ mod tests {
                 .contains("the run is not under -icount")
         );
         // One row alone over the number fires too.
-        let mut one = run_with_s5(2_754 * 16);
+        let mut one = run_with_s5(2_759 * 16);
         let at = one
             .rows
             .iter()
             .position(|(n, _)| *n == "s5_kill_busy_25")
             .unwrap();
         if let Row::Numbers(r) = &mut one.rows[at].1 {
-            r.min = 2_790 * 16;
+            r.min = 3_100 * 16;
         }
         assert!(
             s5_room(&one, S5_ICOUNT_MAX)
                 .unwrap_err()
-                .contains("s5_kill_busy_25=2790")
+                .contains("s5_kill_busy_25=3100")
         );
     }
 
