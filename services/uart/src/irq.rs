@@ -18,7 +18,7 @@
 
 use crate::input::Input;
 use crate::output::Output;
-use crate::regs::{ERRORS, INPUT, TX};
+use crate::regs::{CR_ON, ERRORS, INPUT, LCR_H_FEN, LCR_H_WLEN_8, TX};
 
 /// The most bytes a pass reads from the receive FIFO.
 pub const RX_PASS: usize = 32;
@@ -217,6 +217,31 @@ pub fn flush_input<T, H>(
     Ok(irqs.drained(input.is_full()))
 }
 
+/// Drop the bytes that wait in the transmit FIFO (tcflush TCOFLUSH): the PL011
+/// empties both FIFOs when LCR_H.FEN falls (TRM, "disabling the UART"), so the
+/// receive FIFO goes into the ring first and the UART is off while the bit
+/// changes. Gives false and touches nothing when the ring cannot take the whole
+/// receive FIFO: the bytes of the FIFO outlive the flush then. A byte that
+/// arrives between the last read and the end of the sequence is lost, and the
+/// character the shifter is sending ends on the line.
+pub fn flush_transmit_fifo<T, H>(
+    input: &mut Input<T, H>,
+    mut rx_empty: impl FnMut() -> bool,
+    dr: impl FnMut() -> u32,
+    mut cr: impl FnMut(u32),
+    mut lcr_h: impl FnMut(u32),
+) -> bool {
+    receive(RX_PASS.min(input.room()), &mut rx_empty, dr, input);
+    if !rx_empty() {
+        return false;
+    }
+    cr(0);
+    lcr_h(LCR_H_WLEN_8);
+    lcr_h(LCR_H_FEN | LCR_H_WLEN_8);
+    cr(CR_ON);
+    true
+}
+
 /// Writes bytes of `output` to the transmit FIFO: up to `limit`, while
 /// `tx_full` (FR.TXFF) says there is room, each as `dr` writes DR. Gives
 /// the count.
@@ -304,6 +329,84 @@ mod tests {
 
     use std::collections::VecDeque;
     use std::vec::Vec;
+
+    /// The PL011 as far as the flush needs it: both FIFOs, the register
+    /// writes in order, and the emptying of the FIFOs when FEN falls.
+    struct Chip {
+        rx: VecDeque<u32>,
+        tx: Vec<u8>,
+        fen: bool,
+        writes: Vec<(&'static str, u32)>,
+    }
+
+    fn flush_with(chip: &core::cell::RefCell<Chip>, input: &mut Input<()>) -> bool {
+        flush_transmit_fifo(
+            input,
+            || chip.borrow().rx.is_empty(),
+            || chip.borrow_mut().rx.pop_front().unwrap(),
+            |v| chip.borrow_mut().writes.push(("CR", v)),
+            |v| {
+                let mut chip = chip.borrow_mut();
+                chip.writes.push(("LCR_H", v));
+                let fen = v & LCR_H_FEN != 0;
+                if chip.fen && !fen {
+                    chip.rx.clear();
+                    chip.tx.clear();
+                }
+                chip.fen = fen;
+            },
+        )
+    }
+
+    #[test]
+    fn transmit_flush_drops_the_transmit_fifo_and_keeps_received_bytes() {
+        let chip = core::cell::RefCell::new(Chip {
+            rx: (0..16).map(|i| u32::from(b'a' + i as u8)).collect(),
+            tx: (0..16).collect(),
+            fen: true,
+            writes: Vec::new(),
+        });
+        let mut input: Input<()> = Input::new();
+        assert!(flush_with(&chip, &mut input));
+        let chip = chip.borrow();
+        assert!(chip.tx.is_empty(), "the transmit FIFO is empty");
+        assert!(chip.rx.is_empty());
+        assert_eq!(
+            input.room(),
+            crate::input::RX_RING - 16,
+            "the receive bytes are in the ring"
+        );
+        assert!(chip.fen, "the FIFOs are on again");
+        assert_eq!(
+            chip.writes,
+            [
+                ("CR", 0),
+                ("LCR_H", LCR_H_WLEN_8),
+                ("LCR_H", LCR_H_FEN | LCR_H_WLEN_8),
+                ("CR", CR_ON)
+            ]
+        );
+    }
+
+    #[test]
+    fn transmit_flush_leaves_a_full_ring_and_its_fifos_alone() {
+        let chip = core::cell::RefCell::new(Chip {
+            rx: (0..16).map(|i| u32::from(i as u8)).collect(),
+            tx: (0..16).collect(),
+            fen: true,
+            writes: Vec::new(),
+        });
+        let mut input: Input<()> = Input::new();
+        for _ in 0..crate::input::RX_RING - 4 {
+            assert!(input.push(u32::from(b'o')));
+        }
+        assert!(!flush_with(&chip, &mut input));
+        let chip = chip.borrow();
+        assert_eq!(chip.tx.len(), 16);
+        assert_eq!(chip.rx.len(), 12);
+        assert!(chip.writes.is_empty());
+        assert_eq!(input.room(), 0);
+    }
 
     /// A receive FIFO of the model: the bytes that wait.
     struct Fifo(VecDeque<u32>);

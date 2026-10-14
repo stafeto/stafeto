@@ -859,11 +859,14 @@ fn process_fsize_truncate_is_atomic_and_physical_refusal_is_distinct() {
     process_fsize(&mut fds, 5);
     let before = ram.storage.usage(FIRST);
     assert!(matches!(
-        ram.prepare_truncate(&fds, fd, 6),
+        ram.prepare_truncate(&fds, fd, 9),
         Err(proto_fs::FILE_SIZE_LIMIT)
     ));
     assert_eq!(ram.storage.node(token).unwrap().length, 8);
     assert_eq!(ram.storage.usage(FIRST), before);
+    // Shrinking a file that is above the limit is not growth and succeeds.
+    truncate(&mut ram, &fds, fd, 6, 2);
+    assert_eq!(ram.storage.node(token).unwrap().length, 6);
     truncate(&mut ram, &fds, fd, 4, 2);
     assert_eq!(ram.storage.node(token).unwrap().length, 4);
     process_fsize(&mut fds, u64::MAX);
@@ -871,6 +874,28 @@ fn process_fsize_truncate_is_atomic_and_physical_refusal_is_distinct() {
         ram.prepare_truncate(&fds, fd, (FILE_PAGES * PAGE + 1) as u64),
         Err(FILE_TOO_LARGE)
     ));
+}
+
+#[test]
+fn process_fsize_applies_to_held_truncate_growth_only() {
+    let mut ram = Ram::new(proto_fs::Timestamp::ZERO);
+    let (mut fds, fd, token) = create(&mut ram, FIRST, b"fsize-held-truncate");
+    write(&mut ram, &fds, fd, None, b"original", 1);
+    process_fsize(&mut fds, 5);
+    let description = ram.description_token(&fds, fd).unwrap();
+    let lease = ram.capture_data_lease(&fds, fd, description).unwrap();
+    let lease = match ram.prepare_truncate_held(lease, 9) {
+        Err((proto_fs::FILE_SIZE_LIMIT, lease)) => lease,
+        _ => panic!("growth above the limit is refused"),
+    };
+    let mut prep = match ram.prepare_truncate_held(lease, 6) {
+        Ok(prep) => prep,
+        Err((code, _)) => panic!("shrinking is not growth: {code}"),
+    };
+    while !prep.step(&mut ram).unwrap() {}
+    assert_eq!(prep.commit(&mut ram, proto_fs::Timestamp::ZERO), Ok(6));
+    while !prep.cancel(&mut ram).unwrap() {}
+    assert_eq!(ram.storage.node(token).unwrap().length, 6);
 }
 
 #[test]
