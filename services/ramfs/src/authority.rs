@@ -463,12 +463,17 @@ impl Identity {
         } else {
             self.gid
         };
-        let mode = (mode & 0o7777 & !(umask & 0o777))
+        let mut mode = (mode & 0o7777 & !(umask & 0o777))
             | if kind == crate::DIR {
                 parent.mode & 0o2000
             } else {
                 0
             };
+        // A non-directory created in a group the creator does not belong to (inherited from
+        // a set-group-ID parent) loses its own set-group-ID bit, as chmod does.
+        if kind != crate::DIR && self.uid != 0 && gid != self.gid && !self.groups.contains(gid) {
+            mode &= !0o2000;
+        }
         (kind, mode, self.uid, gid)
     }
 }

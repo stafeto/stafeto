@@ -664,3 +664,35 @@ fn fifo_creation_is_paid_and_preserves_metadata_through_unlink() {
     while ram.storage.reclaim_step() {}
     assert_eq!(ram.storage.available(), before);
 }
+
+#[test]
+fn creation_drops_set_group_id_for_a_group_the_creator_is_not_in() {
+    let mut ram = writable_root(7);
+    let parent = create(&mut ram, ROOT, b"sgid", DIR);
+    ram.storage.node_mut(parent).unwrap().gid = 99;
+    ram.storage.node_mut(parent).unwrap().mode = 0o2777;
+    let node = *ram.storage.node(parent).unwrap();
+    // Not a member of group 99: the inherited group keeps no set-group-ID bit on a file.
+    let (_, mode, _, gid) = OWNER.creation(&node, REG, 0o2755, 0);
+    assert_eq!((mode, gid), (0o755, 99));
+    // A directory keeps the bit through inheritance.
+    let (_, mode, _, _) = OWNER.creation(&node, DIR, 0o755, 0);
+    assert_eq!(mode, 0o2755);
+    // A member of the group, by the supplementary list, keeps the requested bit.
+    let member = Identity {
+        groups: {
+            let mut groups = Groups::EMPTY;
+            groups.count = 1;
+            groups.ids[0] = 99;
+            groups
+        },
+        ..OWNER
+    };
+    let (_, mode, _, _) = member.creation(&node, REG, 0o2755, 0);
+    assert_eq!(mode, 0o2755);
+    // Without set-group-ID on the parent the creator's own group applies and the bit stays.
+    ram.storage.node_mut(parent).unwrap().mode = 0o777;
+    let plain = *ram.storage.node(parent).unwrap();
+    let (_, mode, _, gid) = OWNER.creation(&plain, REG, 0o2755, 0);
+    assert_eq!((mode, gid), (0o2755, 43));
+}

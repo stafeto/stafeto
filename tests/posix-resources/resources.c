@@ -70,6 +70,32 @@ static void metadata_acceptance(void) {
     check("child directory creation", mkdir("/tmp/resource-sgid/child", 0755) == 0);
     check("child inherits directory group and setgid", stat("/tmp/resource-sgid/child", &st) == 0
         && st.st_gid == 100 && (st.st_mode & S_ISGID));
+    check("setgid directory opens to others", chmod(directory, 02777) == 0);
+    for (int member = 0; member < 2; member++) {
+        pid_t creator = fork();
+        if (creator == 0) {
+            if (setgid(member ? 100 : 200) || setuid(1000)) _exit(40);
+            int made = open(member ? "/tmp/resource-sgid/member" : "/tmp/resource-sgid/foreign",
+                O_CREAT | O_EXCL | O_WRONLY, 02755);
+            if (made < 0) _exit(41);
+            close(made);
+            if (mkfifo(member ? "/tmp/resource-sgid/member-fifo" : "/tmp/resource-sgid/foreign-fifo",
+                    02755)) _exit(42);
+            _exit(0);
+        }
+        check("creator under a set-group-ID directory", creator > 0 && reaped(creator, 0));
+    }
+    check("file of a foreign group loses set-group-ID", stat("/tmp/resource-sgid/foreign", &st) == 0
+        && st.st_gid == 100 && !(st.st_mode & S_ISGID) && (st.st_mode & 0777) == 0755);
+    check("fifo of a foreign group loses set-group-ID", stat("/tmp/resource-sgid/foreign-fifo", &st) == 0
+        && st.st_gid == 100 && !(st.st_mode & S_ISGID));
+    check("file of a member group keeps set-group-ID", stat("/tmp/resource-sgid/member", &st) == 0
+        && st.st_gid == 100 && (st.st_mode & S_ISGID));
+    check("fifo of a member group keeps set-group-ID", stat("/tmp/resource-sgid/member-fifo", &st) == 0
+        && (st.st_mode & S_ISGID));
+    check("set-group-ID files cleanup", unlink("/tmp/resource-sgid/foreign") == 0
+        && unlink("/tmp/resource-sgid/foreign-fifo") == 0 && unlink("/tmp/resource-sgid/member") == 0
+        && unlink("/tmp/resource-sgid/member-fifo") == 0);
     check("setgid child cleanup", rmdir("/tmp/resource-sgid/child") == 0);
     check("setgid directory cleanup", rmdir(directory) == 0);
     struct statvfs fs;
