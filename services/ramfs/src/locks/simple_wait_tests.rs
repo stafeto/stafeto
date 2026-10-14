@@ -70,7 +70,11 @@ impl Fixture {
         }
     }
     fn hold(&mut self, pid: u32, byte: i64, kind: Kind) {
+        self.hold_on(self.captured.request.inode, pid, byte, kind);
+    }
+    fn hold_on(&mut self, inode: Token, pid: u32, byte: i64, kind: Kind) {
         let mut request = self.captured.request;
+        request.inode = inode;
         request.owner = Owner::Process(pid);
         request.range = Range::relative(0, byte, 1).unwrap();
         request.command = Command::Set(Some(kind));
@@ -82,17 +86,42 @@ impl Fixture {
         self.wait_kind(place, pid, byte, Kind::Write)
     }
     fn wait_kind(&mut self, place: usize, pid: u32, byte: i64, kind: Kind) -> Id {
+        self.wait_range(place, pid, byte, 1, kind)
+    }
+    fn wait_range(&mut self, place: usize, pid: u32, start: i64, length: i64, kind: Kind) -> Id {
+        self.wait_at(self.captured.request.inode, place, pid, start, length, kind)
+    }
+    fn second_inode(&mut self) -> Token {
+        let mut fds = Fds::default();
+        let fd = self
+            .ram
+            .open(&mut fds, "/tmp/probe", proto_fs::READ_WRITE)
+            .unwrap();
+        let (source, _) = self.ram.capture_description(&fds, fd).unwrap();
+        self.ram.live_description(&fds, source).unwrap().0
+    }
+    fn wait_at(
+        &mut self,
+        inode: Token,
+        place: usize,
+        pid: u32,
+        start: i64,
+        length: i64,
+        kind: Kind,
+    ) -> Id {
         let mut captured = self.captured;
+        captured.request.inode = inode;
         captured.request.command = Command::Set(Some(kind));
         captured.request.owner = Owner::Process(pid);
-        captured.request.range = Range::relative(0, byte, 1).unwrap();
+        captured.request.range = Range::relative(0, start, length).unwrap();
         let wire = WaitStart {
             pid: pid as i32,
             kind: match kind {
                 Kind::Read => LockKind::Read,
                 Kind::Write => LockKind::Write,
             },
-            start: byte,
+            start,
+            length,
             ..self.wire
         };
         let id = self
@@ -208,7 +237,7 @@ fn writer_fifo_prevents_reader_bypass_and_notification_never_grants() {
         .request;
     assert!(
         f.waits
-            .older_conflict(reader, Some(second), |_| true)
+            .older_conflict(reader, Some(second), &f.locks, |_| true)
             .is_some()
     );
     f.waits.arm(&mut f.queue, first, 7).unwrap();
@@ -272,10 +301,18 @@ fn same_owner_replacement_does_not_wait_behind_its_own_fifo_entry() {
     let mut f = Fixture::new();
     let id = f.wait(0, 256, 0);
     let request = f.queue.snapshot(id).unwrap().0.request;
-    assert!(f.waits.older_conflict(request, None, |_| true).is_none());
+    assert!(
+        f.waits
+            .older_conflict(request, None, &f.locks, |_| true)
+            .is_none()
+    );
     let mut different = request;
     different.owner = Owner::Process(257);
-    assert!(f.waits.older_conflict(different, None, |_| true).is_some());
+    assert!(
+        f.waits
+            .older_conflict(different, None, &f.locks, |_| true)
+            .is_some()
+    );
     let slot = f.waits.slot(id).unwrap();
     let owner = Owner::Description {
         slot: 7,
@@ -288,7 +325,108 @@ fn same_owner_replacement_does_not_wait_behind_its_own_fifo_entry() {
         .request
         .owner = owner;
     different.owner = owner;
-    assert!(f.waits.older_conflict(different, None, |_| true).is_none());
+    assert!(
+        f.waits
+            .older_conflict(different, None, &f.locks, |_| true)
+            .is_none()
+    );
+}
+
+#[test]
+fn older_waiter_blocked_by_requester_does_not_stall_lock_conversion() {
+    let mut f = Fixture::new();
+    f.hold(258, 5, Kind::Read);
+    f.hold(259, 0, Kind::Read);
+    let older = f.wait_range(0, 257, 0, 6, Kind::Write);
+    assert_eq!(f.settle(older).phase, WaitPhase::NeedsArm);
+    let younger = f.wait_range(1, 258, 0, 1, Kind::Write);
+    assert_eq!(f.settle(younger).phase, WaitPhase::NeedsArm);
+    f.waits.arm(&mut f.queue, younger, 71).unwrap();
+
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(259),
+        )
+        .unwrap();
+    f.waits.changed(f.captured.request.inode);
+    let younger_request = f.queue.snapshot(younger).unwrap().0.request;
+    assert!(
+        f.waits
+            .older_conflict(younger_request, Some(younger), &f.locks, |_| true,)
+            .is_none()
+    );
+    let mut notified = false;
+    for _ in 0..CAPACITY {
+        f.waits.maintenance(
+            &mut f.queue,
+            &mut f.locks,
+            &mut f.ram.storage,
+            |_, _| true,
+            |_| true,
+            |handle| notified |= *handle == 71,
+        );
+    }
+    assert!(
+        notified,
+        "the younger waiter is notified after the direct cycle breaks"
+    );
+    assert_eq!(f.query(younger).result, 0);
+    assert_ne!(f.queue.query(older).unwrap().phase, WaitPhase::Complete);
+}
+
+#[test]
+fn three_owner_fifo_cycle_does_not_stall_lock_conversion() {
+    // P3 and P5 hold readers, P4 holds a reader of byte 0. Waiters in order:
+    // P2 write [0,6), P3 write [0,1), P5 write [10,11). When P4 closes, P3 is
+    // ready; P2 is blocked by P5, P5 is blocked by P3. P3 must not queue
+    // behind P2.
+    let mut f = Fixture::new();
+    f.hold(258, 10, Kind::Read);
+    f.hold(260, 5, Kind::Read);
+    f.hold(259, 0, Kind::Read);
+    let p2 = f.wait_range(0, 257, 0, 6, Kind::Write);
+    assert_eq!(f.settle(p2).phase, WaitPhase::NeedsArm);
+    let p3 = f.wait_range(1, 258, 0, 1, Kind::Write);
+    assert_eq!(f.settle(p3).phase, WaitPhase::NeedsArm);
+    f.waits.arm(&mut f.queue, p3, 71).unwrap();
+    let p5 = f.wait_range(2, 260, 10, 1, Kind::Write);
+    assert_eq!(f.settle(p5).phase, WaitPhase::NeedsArm);
+
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(259),
+        )
+        .unwrap();
+    f.waits.changed(f.captured.request.inode);
+    let mut notified = false;
+    for _ in 0..4096 {
+        f.waits.maintenance(
+            &mut f.queue,
+            &mut f.locks,
+            &mut f.ram.storage,
+            |_, _| true,
+            |_| true,
+            |handle| notified |= *handle == 71,
+        );
+        if notified {
+            break;
+        }
+    }
+    assert!(notified, "P3 is ready and must not wait behind blocked P2");
+    assert_eq!(
+        f.query(p3),
+        WaitReply {
+            phase: WaitPhase::Complete,
+            result: 0
+        }
+    );
+    for id in [p2, p5] {
+        assert_ne!(f.queue.query(id).unwrap().phase, WaitPhase::Complete);
+    }
 }
 
 #[test]
@@ -505,4 +643,126 @@ fn depth_limit_skips_one_blocker_and_follows_cycle_sibling() {
     let reply = f.settle(target);
     assert_eq!(reply.phase, WaitPhase::Complete);
     assert_eq!(reply.result, proto_fs::LOCK_DEADLOCK);
+}
+
+#[test]
+fn holder_with_a_ready_older_waiter_in_front_is_not_stalled_in_a_four_party_cycle() {
+    // T holds W[1], Q holds R[0], Y holds R[5]. O W[0,2), R R[1,2) and Y W[1,2)
+    // wait behind T, then Q waits for W[5] behind Y. When T closes, a holder
+    // that yielded to a "ready" older waiter would close the cycle
+    // Y -> R -> O -> Q -> Y with no held-lock edge to detect.
+    let mut f = Fixture::new();
+    let (t, q, y, o, r) = (300, 301, 302, 303, 304);
+    f.hold(t, 1, Kind::Write);
+    f.hold(q, 0, Kind::Read);
+    f.hold(y, 5, Kind::Read);
+    let wo = f.wait_range(0, o, 0, 2, Kind::Write);
+    let wr = f.wait_range(1, r, 1, 1, Kind::Read);
+    let wy = f.wait_range(2, y, 1, 1, Kind::Write);
+    let wq = f.wait_range(3, q, 5, 1, Kind::Write);
+    for id in [wo, wr, wy, wq] {
+        assert_eq!(f.settle(id).phase, WaitPhase::NeedsArm);
+    }
+    // A requester without locks queues behind the older writer, a holder does not.
+    let request = |f: &Fixture, id| f.queue.snapshot(id).unwrap().0.request;
+    assert!(
+        f.waits
+            .older_conflict(request(&f, wr), Some(wr), &f.locks, |_| true)
+            .is_some()
+    );
+    assert!(
+        f.waits
+            .older_conflict(request(&f, wy), Some(wy), &f.locks, |_| true)
+            .is_none()
+    );
+    f.locks
+        .close(
+            &mut f.ram.storage,
+            f.captured.request.inode,
+            Owner::Process(t),
+        )
+        .unwrap();
+    f.waits.changed(f.captured.request.inode);
+    assert_eq!(
+        f.settle(wy),
+        WaitReply {
+            phase: WaitPhase::Complete,
+            result: 0
+        }
+    );
+    for id in [wo, wr, wq] {
+        assert_eq!(f.settle(id).phase, WaitPhase::NeedsArm);
+        assert_ne!(f.queue.query(id).unwrap().result, proto_fs::LOCK_DEADLOCK);
+    }
+}
+
+#[test]
+fn holder_on_another_inode_does_not_queue_behind_a_blocked_writer() {
+    // X holds W[1] and Q holds R[0] on A; R holds W on B. O W[0,2) and R R[1,2)
+    // wait on A behind X, and Q waits for W on B behind R. When X closes, a
+    // requester that counted only locks on A would let R yield to O and close
+    // the cycle R -> O -> Q -> R.
+    let mut f = Fixture::new();
+    let a = f.captured.request.inode;
+    let b = f.second_inode();
+    let (x, q, o, r) = (300, 301, 303, 304);
+    f.hold_on(a, x, 1, Kind::Write);
+    f.hold_on(a, q, 0, Kind::Read);
+    f.hold_on(b, r, 0, Kind::Write);
+    let wo = f.wait_at(a, 0, o, 0, 2, Kind::Write);
+    let wr = f.wait_at(a, 1, r, 1, 1, Kind::Read);
+    let wq = f.wait_at(b, 2, q, 0, 1, Kind::Write);
+    for id in [wo, wr, wq] {
+        assert_eq!(f.settle(id).phase, WaitPhase::NeedsArm);
+    }
+    f.locks
+        .close(&mut f.ram.storage, a, Owner::Process(x))
+        .unwrap();
+    f.waits.changed(a);
+    assert_eq!(
+        f.settle(wr),
+        WaitReply {
+            phase: WaitPhase::Complete,
+            result: 0
+        }
+    );
+    for id in [wo, wq] {
+        assert_ne!(f.queue.query(id).unwrap().result, proto_fs::LOCK_DEADLOCK);
+    }
+}
+
+#[test]
+fn first_lock_of_an_owner_marks_only_its_waits_dirty() {
+    let mut f = Fixture::new();
+    let a = f.captured.request.inode;
+    let b = f.second_inode();
+    f.hold_on(a, 300, 0, Kind::Write);
+    let _ = f.locks.take_started();
+    let other = f.wait_at(a, 0, 301, 0, 1, Kind::Write);
+    let z = f.wait_at(a, 1, 302, 0, 1, Kind::Write);
+    let (other_slot, z_slot) = (f.waits.slot(other).unwrap(), f.waits.slot(z).unwrap());
+    let flags = |f: &Fixture, slot: usize| {
+        let r = f.waits.registrations[slot].as_ref().unwrap();
+        (r.dirty, r.invalidated)
+    };
+    for slot in [other_slot, z_slot] {
+        let r = f.waits.registrations[slot].as_mut().unwrap();
+        r.dirty = false;
+        r.invalidated = false;
+    }
+    f.hold_on(b, 302, 0, Kind::Read);
+    assert_eq!(f.locks.take_started(), Some(Owner::Process(302)));
+    f.waits.owner_started(Owner::Process(302));
+    assert_eq!(flags(&f, z_slot), (true, true));
+    assert_eq!(flags(&f, other_slot), (false, false));
+    // A second record of a holder is not a start.
+    f.hold_on(b, 302, 4, Kind::Read);
+    assert_eq!(f.locks.take_started(), None);
+    // Closing the last record forgets the owner; the next lock starts it again.
+    f.locks
+        .close(&mut f.ram.storage, b, Owner::Process(302))
+        .unwrap();
+    assert!(!f.locks.holds(Owner::Process(302)));
+    f.hold_on(b, 302, 0, Kind::Read);
+    assert_eq!(f.locks.take_started(), Some(Owner::Process(302)));
 }

@@ -4274,6 +4274,9 @@ impl Fs {
         {
             self.waits.changed(captured.request.inode);
         }
+        if let Some(owner) = self.locks.take_started() {
+            self.waits.owner_started(owner);
+        }
         Ok(reply)
     }
 

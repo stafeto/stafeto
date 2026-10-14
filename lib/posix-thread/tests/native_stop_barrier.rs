@@ -102,6 +102,128 @@ fn native_wait_and_unknown_info_preserve_stop_debt() {
 }
 
 #[test]
+fn park_marker_requires_own_channel_and_a_receiving_thread() {
+    assert!(barrier::confirmed_parked(9, 9, true));
+    assert!(
+        !barrier::confirmed_parked(9, 9, false),
+        "Sending or AwaitingReply"
+    );
+    assert!(!barrier::confirmed_parked(9, 8, true), "another channel");
+    assert!(!barrier::confirmed_parked(0, 0, true), "no marker");
+    assert!(!barrier::confirmed_parked(0, 9, true));
+}
+
+/// One step of a thread's history seen by the scan: the marker in PARKING,
+/// the kernel state, and whether the thread is parked or parking for the
+/// stop that scans it.
+#[derive(Clone, Copy)]
+struct Step {
+    marker: u64,
+    state: barrier::State,
+    receiving: bool,
+    in_park: bool,
+}
+
+const C: u64 = 9;
+const fn step(marker: u64, receiving: bool, running: bool, in_park: bool) -> Step {
+    Step {
+        marker,
+        state: if running {
+            barrier::State::Running
+        } else {
+            barrier::State::KernelWait
+        },
+        receiving,
+        in_park,
+    }
+}
+
+/// Histories of a thread X while a stopper scans. Variant 1: the old stop
+/// ended, X republishes its marker and sees no stopper, clears it and goes
+/// on into a wait of its own code; the new stopper began after that check, so
+/// it reads from the republished marker on. Variant 2: the new stopper began
+/// first, so X's republished marker means a park for the new stop.
+fn histories() -> [&'static [Step]; 2] {
+    static LEAVING: [Step; 6] = [
+        step(C, false, true, false),  // marker republished, stop already over
+        step(0, false, true, false),  // marker cleared
+        step(0, false, false, false), // AwaitingReply in its own code
+        step(0, true, false, false),  // Receiving on its own channel
+        step(0, false, true, false),
+        step(C, true, false, true), // a later stop parks it
+    ];
+    static PARKING_AGAIN: [Step; 5] = [
+        step(0, true, false, false), // woken by the old stopper, not yet running
+        step(0, false, true, false),
+        step(C, false, true, true), // republished under the new stopper
+        step(C, true, false, true),
+        step(C, true, false, true),
+    ];
+    [&LEAVING, &PARKING_AGAIN]
+}
+
+/// Every pair of read times (first read at t1, second at t2 >= t1) over every
+/// history: `observe` may report a park only for a thread that is parked or
+/// parking at the time of its second read.
+fn model_holds(
+    scan: impl Fn(&dyn Fn() -> (barrier::State, bool), &dyn Fn() -> u64) -> (barrier::State, bool),
+) -> bool {
+    for history in histories() {
+        for t1 in 0..history.len() {
+            for t2 in t1..history.len() {
+                let calls = Cell::new(0usize);
+                let at = || {
+                    let k = calls.get();
+                    calls.set(k + 1);
+                    history[if k == 0 { t1 } else { t2 }]
+                };
+                let state = || {
+                    let h = at();
+                    (h.state, h.receiving)
+                };
+                let marker = || at().marker;
+                let (_, parked) = scan(&state, &marker);
+                if parked && !history[t2].in_park {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+#[test]
+fn stop_scan_never_counts_a_thread_that_left_its_park() {
+    assert!(model_holds(|state, marker| barrier::observe(
+        state, marker, C
+    )));
+}
+
+#[test]
+fn stop_others_reads_the_marker_only_through_observe() {
+    let source = include_str!("../../posix-abi/src/signals.rs");
+    assert!(source.contains("stop_barrier::observe("));
+    assert_eq!(source.matches("PARKING[index]").count(), 1);
+}
+
+#[test]
+fn model_rejects_marker_only_and_marker_first_scans() {
+    // Marker alone: the republished marker of a leaving thread counts.
+    assert!(!model_holds(|_, marker| {
+        (
+            barrier::State::Running,
+            barrier::confirmed_parked(marker(), C, true),
+        )
+    }));
+    // Marker read before the kernel state.
+    assert!(!model_holds(|state, marker| {
+        let m = marker();
+        let (s, receiving) = state();
+        (s, barrier::confirmed_parked(m, C, receiving))
+    }));
+}
+
+#[test]
 fn external_defer_receive_interrupt_does_not_release_stopper() {
     use barrier::State::*;
     let owner_effects = Cell::new(0usize);

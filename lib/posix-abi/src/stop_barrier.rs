@@ -103,6 +103,27 @@ pub(crate) fn confirmed_terminal(state: State) -> bool {
     matches!(state, State::Terminal)
 }
 
+/// A thread counts as parked when its place in PARKING holds its own
+/// channel (read after the kernel state) and the kernel shows it receiving.
+/// Sending and AwaitingReply belong to waits of the thread's own code.
+pub(crate) fn confirmed_parked(marker: u64, channel: u64, receiving: bool) -> bool {
+    marker != 0 && marker == channel && receiving
+}
+
+/// One thread of the stop scan: reads the kernel state first and the park
+/// marker second, so a marker that is set when the second read happens
+/// belongs to a thread that is parking or parked for this stop. Returns the
+/// state and whether the thread is confirmed parked.
+pub(crate) fn observe(
+    read_state: impl FnOnce() -> (State, bool),
+    read_marker: impl FnOnce() -> u64,
+    channel: u64,
+) -> (State, bool) {
+    let (state, receiving) = read_state();
+    let marker = read_marker();
+    (state, confirmed_parked(marker, channel, receiving))
+}
+
 pub(crate) fn quiescent(
     resident: bool,
     state: State,
