@@ -78,6 +78,7 @@ basic/unistd/execlp
 basic/unistd/execv
 basic/unistd/execve
 basic/unistd/execvp
+basic/unistd/fexecve
 process/fork-exec-setpgid-in-child
 process/fork-setpgid
 process/fork-setpgid-invalid
