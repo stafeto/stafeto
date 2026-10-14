@@ -9,6 +9,28 @@ pub use posix_fd::{CloseAdmission, CloseSnapshot, CloseToken, JobPlace, OwnerTok
 
 pub type Snapshot = CloseSnapshot<Target, Frame>;
 pub type Admission = CloseAdmission<Target, Frame>;
+/// What the process knows about its record locks. A close of any descriptor
+/// releases the locks of the process on the file, so the close of an alias
+/// owes the service a message only while the process may hold one. The
+/// service answers every close event with whether the process holds none.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecordLocks {
+    none: bool,
+    epoch: u64,
+}
+impl RecordLocks {
+    pub(crate) const fn new() -> Self {
+        Self {
+            none: false,
+            epoch: 0,
+        }
+    }
+}
+
+/// A question about the record locks, put with a close event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Asked(u64);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloseCommandFence {
     Control(super::change::ControlToken),
@@ -43,6 +65,40 @@ impl PosixFs {
             (None, Some(w)) => Ok(Some(CloseCommandFence::Wait(w))),
             (None, None) => Ok(None),
         }
+    }
+    /// Whether closing `fd` only drops a name of a description that another
+    /// descriptor keeps while the process is known to hold no record lock and
+    /// no lock command is outstanding: the close then owes the service
+    /// nothing and is as local as the close of a pipe.
+    pub fn closes_alias_with_no_record_lock(&self, fd: u32) -> bool {
+        self.record_locks.none && self.descriptors.has_open_alias(fd) && self.no_lock_command()
+    }
+    /// Whether the process is known to hold no record lock.
+    pub fn knows_no_record_lock(&self) -> bool {
+        self.record_locks.none
+    }
+    /// Whether no lock command of the files is outstanding.
+    pub fn no_lock_command(&self) -> bool {
+        self.control_tokens().next().is_none() && self.wait_tokens().next().is_none()
+    }
+    /// The question to put with a close event: the count of lock commands
+    /// begun so far.
+    pub fn record_locks_question(&self) -> Asked {
+        Asked(self.record_locks.epoch)
+    }
+    /// The service answered a close event that the process holds no record
+    /// lock: kept only if no lock command is outstanding and none has begun
+    /// since the question.
+    pub fn record_locks_answered_none(&mut self, asked: Asked) {
+        if self.record_locks.epoch == asked.0 && self.no_lock_command() {
+            self.record_locks.none = true;
+        }
+    }
+    /// A lock command begins: the process may hold a record lock from now
+    /// until the service says otherwise.
+    pub(crate) fn record_lock_command_begins(&mut self) {
+        self.record_locks.none = false;
+        self.record_locks.epoch = self.record_locks.epoch.wrapping_add(1);
     }
     pub fn pending_open(&self, fd: u32) -> Option<posix_fd::OpenToken> {
         self.descriptors.pending(fd)

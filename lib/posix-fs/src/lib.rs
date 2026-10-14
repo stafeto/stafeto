@@ -239,6 +239,8 @@ pub struct PosixFs {
     paths: PathState,
     descriptors: Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>,
     waits: posix_fd::WaitRecords<wait::Recovery>,
+    /// What the process knows about its record locks (`closing`).
+    record_locks: closing::RecordLocks,
 }
 
 const _: () = assert!(core::mem::size_of::<wait::Recovery>() == 88);
@@ -1200,6 +1202,7 @@ impl PosixFs {
             paths: PathState::new(),
             descriptors,
             waits: posix_fd::WaitRecords::new(),
+            record_locks: closing::RecordLocks::new(),
         })
     }
 

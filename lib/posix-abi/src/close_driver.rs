@@ -4,7 +4,7 @@
 //! Immutable numeric close events retain physical debt through canonical confirmation.
 
 use crate::constants::*;
-use posix_fs::closing::{CloseAdmission, CloseCommandFence, CloseToken, OwnerToken};
+use posix_fs::closing::{Asked, CloseAdmission, CloseCommandFence, CloseToken, OwnerToken};
 use posix_fs::{DescriptorFlags, FsError, Target, Transport};
 use proto_wire::Status;
 
@@ -54,6 +54,7 @@ enum Admission {
         Transport,
         posix_fs::closing::Snapshot,
         Option<CloseCommandFence>,
+        Asked,
     ),
     Pending(CloseToken),
     Open(posix_fs::open::OpenToken),
@@ -98,7 +99,12 @@ fn operation(
             }
             let backend = files.target(fd);
             let remote = backend.is_ok_and(|target| ram(target).is_some());
-            if !remote {
+            // The close of an alias of a description holds nothing physical
+            // and owes the service only the release of record locks: with
+            // none held, it is as local as the close of a pipe.
+            let local =
+                !remote || (replacement.is_none() && files.closes_alias_with_no_record_lock(fd));
+            if local {
                 let (number, release) = match replacement {
                     Some((source, flags)) => match files
                         .try_take_dup3(source, fd, flags)
@@ -128,6 +134,7 @@ fn operation(
                         files.transport(),
                         snapshot,
                         fence,
+                        files.record_locks_question(),
                     ))
                 }
                 Ok(CloseAdmission::PendingClose(token)) => Ok(Admission::Pending(token)),
@@ -140,10 +147,10 @@ fn operation(
             }
         })?;
         match step {
-            Admission::Started(token, number, transport, snapshot, fence) => {
+            Admission::Started(token, number, transport, snapshot, fence, asked) => {
                 // Only this admitted continuation may infer success after an exact
                 // helper retires the confirmed record, including a delayed reply.
-                if first_turn(token, transport, snapshot, fence)? {
+                if first_turn(token, transport, snapshot, fence, asked)? {
                     return Ok(number);
                 }
                 drive(token)?;
@@ -182,6 +189,7 @@ fn first_turn(
     transport: Transport,
     snapshot: posix_fs::closing::Snapshot,
     fence: Option<CloseCommandFence>,
+    asked: Asked,
 ) -> Result<bool, i32> {
     if let Some(debt) = fence {
         fence_turn(debt)?;
@@ -190,7 +198,7 @@ fn first_turn(
     if snapshot.complete {
         return Ok(false);
     }
-    event_step(token, transport, snapshot)
+    event_step(token, transport, snapshot, Some(asked))
 }
 
 fn drive(token: CloseToken) -> Result<(), i32> {
@@ -220,7 +228,7 @@ fn step(token: CloseToken) -> Result<bool, i32> {
         return Ok(false);
     }
     if !snapshot.complete {
-        return event_step(token, transport, snapshot);
+        return event_step(token, transport, snapshot, None);
     }
     if let Some(target) = snapshot.release {
         let held = ram(target).ok_or(EIO)?;
@@ -295,6 +303,7 @@ fn event_step(
     token: CloseToken,
     transport: Transport,
     snapshot: posix_fs::closing::Snapshot,
+    asked: Option<Asked>,
 ) -> Result<bool, i32> {
     let held = ram(snapshot.backend).ok_or(EIO)?;
     let event = proto_fs::CloseEvent {
@@ -306,7 +315,9 @@ fn event_step(
         description_generation: held.generation(),
         last_alias: snapshot.last_alias,
     };
-    let receipt = transport.files().close_event_once(event);
+    let answer = transport.files().close_event_answer(event);
+    let none = matches!(answer, Ok(true));
+    let receipt = answer.map(drop);
     #[cfg(feature = "close-probe")]
     let mut receipt = receipt;
     #[cfg(feature = "close-probe")]
@@ -326,6 +337,11 @@ fn event_step(
         match receipt {
             Ok(()) => {
                 files.finish_close_record(token).map_err(crate::error)?;
+                // No lock command is outstanding at the answer, and none began
+                // since the question: the process holds no record lock.
+                if none && let Some(asked) = asked {
+                    files.record_locks_answered_none(asked);
+                }
                 match retire(files, token)? {
                     Some(addresses) => Ok((true, Some(addresses))),
                     None => Ok((false, None)),
