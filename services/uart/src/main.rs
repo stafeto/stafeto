@@ -503,6 +503,19 @@ impl Uart {
                 rooms.to_tell(true, |notify| {
                     let _ = sys::notify(notify, 1);
                 });
+                // The bytes already in the transmit FIFO go too; the receive FIFO moves into the
+                // ring first.
+                let regs = &self.regs;
+                irq::flush_transmit_fifo(
+                    input,
+                    || regs.read(FR) & FR_RXFE != 0,
+                    || regs.read(DR),
+                    |v| regs.write(CR, v),
+                    |v| regs.write(LCR_H, v),
+                );
+                regs.read(CR);
+                self.answer_read();
+                self.tell();
                 self.refresh_drain();
                 self.defer_output(false);
                 Answer::Status(Status::Ok)
