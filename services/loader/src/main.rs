@@ -283,7 +283,7 @@ struct Scratch {
     regions: [MaybeUninit<Region>; REGIONS_MAX],
     parents: [u64; REGIONS_MAX],
     kept: usize,
-    map: [MaybeUninit<MapEntry>; REGIONS_MAX],
+    map: [MaybeUninit<pl::ForkEntry>; REGIONS_MAX],
 }
 
 impl Scratch {
@@ -294,7 +294,7 @@ impl Scratch {
     }
 
     /// The entries of the child's map.
-    fn map(&self) -> &[MapEntry] {
+    fn map(&self) -> &[pl::ForkEntry] {
         // SAFETY: `copy` wrote the first `kept` entries.
         unsafe { core::slice::from_raw_parts(self.map.as_ptr().cast(), self.kept) }
     }
@@ -969,9 +969,12 @@ fn take_regions(
     for (i, region) in regions.iter().enumerate().take(count) {
         let region = region.ok_or(Status::BadSize)?;
         let memory = handles.take::<Memory>(i).map_err(Status::Kernel)?;
-        let long =
-            sys::memory_info(&memory).is_ok_and(|info| info.size >= u64::from(region.pages) * PAGE);
-        let admitted = long && pl::admit(scratch.regions(), &region).is_ok();
+        let long = sys::memory_info(&memory).is_ok_and(|info| {
+            info.size >= (u64::from(region.pages) + u64::from(region.offset)) * PAGE
+        });
+        let admitted = long
+            && !(region.shared && region.access == Access::ReadExec)
+            && pl::admit(scratch.regions(), &region).is_ok();
         if !admitted {
             // The regions of this message go again.
             for parent in &mut scratch.parents[held..scratch.count] {
@@ -1022,6 +1025,10 @@ fn copy(own: &Own, fork: &Fork, scratch: &mut Scratch) -> Result<(), u32> {
             scratch.regions()[group.start],
             scratch.regions()[group.end - 1],
         );
+        if first.shared {
+            share(own, scratch, group.start)?;
+            continue;
+        }
         let len = last.end() - first.address;
         let at = first.address as usize;
         let m = steps::timed(kind::MEM_CREATE, len, || sys::mem_create(len)).map_err(code)?;
@@ -1034,37 +1041,126 @@ fn copy(own: &Own, fork: &Fork, scratch: &mut Scratch) -> Result<(), u32> {
             let parent =
                 Handle::<Memory>::from_raw(abi::Handle(core::mem::take(&mut scratch.parents[i])));
             let bytes = u64::from(region.pages) * PAGE;
-            fill(own, &parent, bytes, region.address)?;
+            fill(
+                own,
+                &parent,
+                u64::from(region.offset) * PAGE,
+                bytes,
+                region.address,
+            )?;
         }
-        if first.access != Access::ReadWrite {
+        // The handle the child's map keeps: it maps through it, so that a
+        // later `mem_protect` may go as far as the rights of the object
+        // (a read-only piece may become writable again); code is mapped
+        // through a narrowed one without MAP_WRITE.
+        let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+        if first.access != Access::ReadExec {
+            rights = rights | Rights::MAP_WRITE;
+        }
+        let kept = steps::timed(kind::DUPLICATE, len, || sys::handle_duplicate(&m, rights))
+            .map_err(code)?;
+        if first.access == Access::ReadExec {
             steps::timed(kind::REMAP, len, || {
                 // SAFETY: the new object's mapping, which nothing uses now.
                 unsafe { sys::mem_unmap(&own.process, at, len) }.map_err(code)?;
                 loader::map_narrowed(&own.process, &m, 0, len, at, first.access).map_err(code)
             })?;
+        } else if first.access == Access::Read {
+            steps::timed(kind::REMAP, len, || {
+                // SAFETY: as above.
+                unsafe { sys::mem_unmap(&own.process, at, len) }.map_err(code)?;
+                sys::mem_map(&own.process, &kept, 0, len, at, Access::Read).map_err(code)
+            })?;
         }
-        let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
-        if first.access == Access::ReadWrite {
-            rights = rights | Rights::MAP_WRITE;
+        // The pieces of the group, by the runs of one access: a run
+        // without access is protected, and each run is one entry of the
+        // child's map, as the kernel's table will have it.
+        let mut run = group.start;
+        let mut done = 0u32;
+        while run < group.end {
+            let access = scratch.regions()[run].access;
+            let mut stop = run + 1;
+            while stop < group.end && scratch.regions()[stop].access == access {
+                stop += 1;
+            }
+            let from = scratch.regions()[run].address;
+            let to = scratch.regions()[stop - 1].end();
+            if access == Access::None {
+                steps::timed(kind::REMAP, to - from, || {
+                    // SAFETY: the child's own mapping, which nothing uses.
+                    unsafe { sys::mem_protect(&own.process, from as usize, to - from, access) }
+                        .map_err(code)
+                })?;
+            }
+            let pages = u32::try_from((to - from) / PAGE).map_err(|_| pl::TOO_BIG)?;
+            scratch.map[scratch.kept].write(pl::ForkEntry {
+                address: from,
+                pages,
+                access,
+                handle: if done == 0 { kept.raw().0 } else { 0 },
+                offset: done,
+                continues: done != 0,
+                shared: false,
+            });
+            scratch.kept += 1;
+            done += pages;
+            run = stop;
         }
-        let kept = steps::timed(kind::DUPLICATE, len, || sys::handle_duplicate(&m, rights))
-            .map_err(code)?;
-        let pages = u32::try_from(len / PAGE).map_err(|_| pl::TOO_BIG)?;
-        scratch.map[scratch.kept].write(MapEntry {
-            address: first.address,
-            pages,
-            access: first.access,
-            handle: kept.into_raw().0,
-        });
-        scratch.kept += 1;
+        // The handle's value lives in the first entry; the Handle itself
+        // goes to the child's table as a raw value.
+        let _ = kept.into_raw();
     }
+    Ok(())
+}
+
+/// A shared region: the child maps the parent's object itself at the
+/// parent's address, from the region's offset, and keeps the handle in its
+/// map.
+fn share(own: &Own, scratch: &mut Scratch, index: usize) -> Result<(), u32> {
+    let region = scratch.regions()[index];
+    let handle =
+        Handle::<Memory>::from_raw(abi::Handle(core::mem::take(&mut scratch.parents[index])));
+    let len = u64::from(region.pages) * PAGE;
+    let first = if region.access == Access::None {
+        Access::Read
+    } else {
+        region.access
+    };
+    steps::timed(kind::MAP_NEW, len, || {
+        sys::mem_map(
+            &own.process,
+            &handle,
+            u64::from(region.offset) * PAGE,
+            len,
+            region.address as usize,
+            first,
+        )
+    })
+    .map_err(code)?;
+    if region.access == Access::None {
+        steps::timed(kind::REMAP, len, || {
+            // SAFETY: the child's own mapping, which nothing uses.
+            unsafe { sys::mem_protect(&own.process, region.address as usize, len, Access::None) }
+                .map_err(code)
+        })?;
+    }
+    scratch.map[scratch.kept].write(pl::ForkEntry {
+        address: region.address,
+        pages: region.pages,
+        access: region.access,
+        handle: handle.into_raw().0,
+        offset: region.offset,
+        continues: false,
+        shared: true,
+    });
+    scratch.kept += 1;
     Ok(())
 }
 
 /// `bytes` of the parent's object `parent` into the new process at `at`,
 /// mapped writable there: PIECE bytes at a time through WINDOW, each
 /// piece unmapped once copied.
-fn fill(own: &Own, parent: &Handle<Memory>, bytes: u64, at: u64) -> Result<(), u32> {
+fn fill(own: &Own, parent: &Handle<Memory>, from: u64, bytes: u64, at: u64) -> Result<(), u32> {
     let mut offset = 0;
     while offset < bytes {
         let piece = (bytes - offset).min(PIECE);
@@ -1072,7 +1168,7 @@ fn fill(own: &Own, parent: &Handle<Memory>, bytes: u64, at: u64) -> Result<(), u
             sys::mem_map(
                 &own.process,
                 parent,
-                offset,
+                from + offset,
                 piece,
                 WINDOW as usize,
                 Access::Read,

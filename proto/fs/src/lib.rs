@@ -383,6 +383,11 @@ pub enum Method {
     OpenFifoGrant = 60,
     /// Exact OpenKey and pipe ticket transfer pending-grant custody to the client.
     OpenFifoAck = 61,
+    /// Published fd u32. The file service tells the process service, through its
+    /// notary session, that the caller may map the file's shared memory: for
+    /// reading when the description is open for reading, and for writing when
+    /// it is open for writing and not for appending. Reply: status.
+    ShareGrant = 62,
 }
 
 impl Method {
@@ -452,6 +457,7 @@ impl Method {
             59 => Some(Self::OpenExecFd),
             60 => Some(Self::OpenFifoGrant),
             61 => Some(Self::OpenFifoAck),
+            62 => Some(Self::ShareGrant),
             _ => None,
         }
     }
@@ -460,7 +466,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

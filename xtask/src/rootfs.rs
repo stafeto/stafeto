@@ -182,9 +182,17 @@ fn null_device() -> RootFile {
 /// layer reads them from its generator), so the bytes are none. With
 /// `/dev/null` they are the device nodes of an image where POSIX programs
 /// run, and the image has the entropy service for them.
-fn devices() -> [RootFile; 4] {
+fn devices() -> [RootFile; 5] {
     [
         dir("/dev/pts"),
+        // The names of shm_open: files here are the shared memory objects.
+        RootFile {
+            path: "/dev/shm",
+            mode: 0o1777,
+            uid: 0,
+            gid: 0,
+            source: None,
+        },
         null_device(),
         of("/dev/random", 0o666, ROOT, Source::Bytes("random", b"")),
         of("/dev/urandom", 0o666, ROOT, Source::Bytes("urandom", b"")),
@@ -480,6 +488,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-fifo.img",
     "boot-posix-fifo-steps.img",
     "boot-posix-resources.img",
+    "boot-posix-map.img",
     "boot-posix-lock-ring.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
@@ -557,6 +566,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-fifo.img"
         | "boot-posix-fifo-steps.img"
         | "boot-posix-resources.img"
+        | "boot-posix-map.img"
         | "boot-posix-lock-ring.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
@@ -760,6 +770,7 @@ mod tests {
             "boot-posix-spawn-churn.img",
             "boot-posix-sync.img",
             "boot-posix-resources.img",
+            "boot-posix-map.img",
         ] {
             let files = files_of(image);
             assert!(
@@ -788,6 +799,7 @@ mod tests {
                 "boot-posix-spawn-churn.img" => &crate::POSIX_SPAWN_CHURN_PROGRAMS,
                 "boot-posix-sync.img" => &crate::POSIX_SYNC_PROGRAMS,
                 "boot-posix-resources.img" => &crate::POSIX_RESOURCES_PROGRAMS,
+                "boot-posix-map.img" => &crate::POSIX_MAP_PROGRAMS,
                 "boot-posix-lock-ring.img" => &crate::POSIX_LOCK_RING_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
@@ -894,6 +906,7 @@ mod tests {
             "boot-posix-spawn-churn.img",
             "boot-posix-sync.img",
             "boot-posix-resources.img",
+            "boot-posix-map.img",
             "boot-posix-lock-ring.img",
             "boot-posix-random.img",
             "boot-posix-pty.img",
@@ -906,6 +919,7 @@ mod tests {
             for path in [
                 "/dev",
                 "/dev/pts",
+                "/dev/shm",
                 "/dev/null",
                 "/dev/random",
                 "/dev/urandom",
@@ -921,6 +935,7 @@ mod tests {
         for path in [
             "/dev",
             "/dev/pts",
+            "/dev/shm",
             "/dev/null",
             "/dev/random",
             "/dev/urandom",

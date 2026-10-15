@@ -28,6 +28,7 @@ use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
 use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
+use posix_process_service::shares::{Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
 use posix_process_service::terminals::Terminals;
 use posix_process_service::timers::{self, Timers};
@@ -212,6 +213,8 @@ struct Processes {
     /// The thread of each record's process whose entry the service asks
     /// for once it set a signal on the page (Router).
     routers: [Option<Handle<Thread>>; RECORDS],
+    /// The objects of shared memory the processes map as the same pages.
+    shares: Shares<Handle<Memory>>,
     /// The witness of each record's process, which init gave with ADOPT:
     /// it closes once the process ended, and init hears of the end.
     witnesses: [Option<Handle<Channel>>; RECORDS],
@@ -270,6 +273,7 @@ impl Processes {
             lifetimes: lifetime_page::Lifetimes::new(),
             witnesses: [const { None }; RECORDS],
             routers: [const { None }; RECORDS],
+            shares: Shares::new(),
             ops: LongOps::new(),
             waits: Waits::new(),
             walks: [const { None }; RECORDS],
@@ -850,6 +854,9 @@ impl Processes {
         if method == Method::SetId as u16 {
             return self.set_id(r);
         }
+        if method == Method::ShareGrant as u16 {
+            return self.share_grant(r);
+        }
         let terminal = [
             Method::TtySignal,
             Method::SetCtty,
@@ -1064,6 +1071,90 @@ impl Processes {
             self.request_router(index);
         }
         Answer::Status(Status::Ok)
+    }
+
+    /// Share: the rendezvous of shared memory (`Method::Share`). Put and
+    /// Attach take the object, Get answers with a copy of it; the table
+    /// is searched through, 16 entries.
+    fn share(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let (Ok(operation), Ok(key), Ok(pages), Ok(())) =
+            (body.u32(), body.u64(), body.u32(), body.finish())
+        else {
+            return Answer::Status(Status::BadSize);
+        };
+        // The file service vouched that the caller has the file open (a
+        // ShareGrant); without it nothing of the file's memory is the
+        // caller's. A caller that may not write gets no right to write.
+        // A Put needs none: the caller reserved the entry as a writer. The
+        // other two use up the grant.
+        let granted = self.shares.granted(index, key);
+        let needs_grant = matches!(
+            operation,
+            proto_process::SHARE_GET | proto_process::SHARE_ATTACH
+        );
+        let Some(write) = granted.or((!needs_grant).then_some(true)) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        match operation {
+            proto_process::SHARE_GET if r.handles.is_empty() => {
+                let result = self.shares.get(key, index, write);
+                let busy = matches!(result, Got::Busy);
+                let (kind, found) = match result {
+                    Got::Found(pages, memory) => {
+                        let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+                        if write {
+                            rights = rights | Rights::MAP_WRITE;
+                        }
+                        match sys::handle_duplicate(memory, rights) {
+                            Ok(copy) => (proto_process::SHARED_FOUND, Some((pages, copy))),
+                            Err(e) => return kernel(e),
+                        }
+                    }
+                    Got::Reserved => (proto_process::SHARED_RESERVED, None),
+                    Got::Full => (proto_process::SHARED_FULL, None),
+                    Got::Busy => (proto_process::SHARED_BUSY, None),
+                };
+                if !busy {
+                    self.shares.revoke(index, key);
+                }
+                let pages = found.as_ref().map_or(0, |(pages, _)| *pages);
+                if r.reply().u32(0).is_err()
+                    || r.reply().u32(kind).is_err()
+                    || r.reply().u32(pages).is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                match found {
+                    Some((_, copy)) => Answer::Reply([copy.erase()].into()),
+                    None => Answer::Reply(Outgoing::new()),
+                }
+            }
+            proto_process::SHARE_PUT | proto_process::SHARE_ATTACH if r.handles.len() == 1 => {
+                let kind = r.handles.info(0);
+                let wanted = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+                if !matches!(kind, Some((ObjectKind::Memory, rights)) if rights.contains(wanted)) {
+                    return refuse(proto_process::PERMISSION);
+                }
+                let Ok(memory) = r.handles.take::<Memory>(0) else {
+                    return refuse(proto_process::PERMISSION);
+                };
+                if operation == proto_process::SHARE_PUT {
+                    if self.shares.put(key, index, pages, memory).is_err() {
+                        return refuse(proto_process::PERMISSION);
+                    }
+                } else {
+                    self.shares.attach(key, index, pages, memory, write);
+                    self.shares.revoke(index, key);
+                }
+                Answer::Status(Status::Ok)
+            }
+            proto_process::SHARE_DETACH if r.handles.is_empty() => {
+                self.shares.detach(key, index);
+                Answer::Status(Status::Ok)
+            }
+            _ => refuse(proto_process::INVALID),
+        }
     }
 
     /// Posts `signal` with `info` to the process of the record in `target`
@@ -2398,6 +2489,8 @@ impl Processes {
         record.credentials = credentials;
         self.generations.raise(index);
         // The timers of timer_create go with the old image; the alarm goes on.
+        // So do its mappings: it uses no shared memory any more.
+        self.shares.drop_user(index);
         self.timers.clear(index as u8, false);
         if let Some(page) = self.pages.page(index) {
             page.caught.store(0, core::sync::atomic::Ordering::Release);
@@ -2830,6 +2923,37 @@ impl Processes {
         Answer::Status(Status::Ok)
     }
 
+    /// ShareGrant through a notary session with SET_ID (a file service): the
+    /// process `pid` has the file of `key` open, for writing or not.
+    fn share_grant(&mut self, r: &mut Request<'_>) -> Answer {
+        if !proto_process::may_set_id(r.label()) || !r.handles.is_empty() {
+            return refuse(proto_process::PERMISSION);
+        }
+        let mut body = r.body();
+        let (Ok(pid), Ok(key), Ok(write), Ok(image), Ok(())) = (
+            body.u32(),
+            body.u64(),
+            body.u32(),
+            body.u32(),
+            body.finish(),
+        ) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let Some(record) = self.records.find_pid(pid) else {
+            return refuse(proto_process::NO_PROCESS);
+        };
+        // The grant of an image that exec replaced while the request was on
+        // its way is not the new image's.
+        if self.records.get(record).map(|r| r.image) != Some(image) {
+            return refuse(proto_process::PERMISSION);
+        }
+        if self.shares.grant(record, key, write != 0) {
+            Answer::Status(Status::Ok)
+        } else {
+            refuse(proto_process::AGAIN)
+        }
+    }
+
     /// SetId through a notary session with SET_ID: kept for the loader's
     /// place the ticket names, while it loads the record and image the
     /// body names (loaders.rs); PERMISSION otherwise.
@@ -3001,6 +3125,9 @@ impl Service<0> for Processes {
         }
         if method == Method::Router as u16 {
             return self.router(index, r);
+        }
+        if method == Method::Share as u16 {
+            return self.share(index, r);
         }
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
@@ -3242,6 +3369,7 @@ impl Service<0> for Processes {
             }
         }
         self.routers[index] = None;
+        self.shares.drop_user(index);
         self.timers.clear(index as u8, true);
         if let Exit::Zombie { parent } = exit {
             self.child_ended(parent, index, end);

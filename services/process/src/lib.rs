@@ -17,6 +17,7 @@ pub mod image_probe;
 pub mod loaders;
 pub mod queue;
 pub mod records;
+pub mod shares;
 pub mod signals;
 pub mod terminals;
 pub mod timers;

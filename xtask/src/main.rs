@@ -660,6 +660,11 @@ const POSIX_RESOURCES_PROGRAMS: [ImageProgram; 10] = {
     );
     programs
 };
+const POSIX_MAP_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = ("posix-procs", "posix-map-probe", POSIX_STACK_SIZE, &[]);
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1272,6 +1277,7 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-map  verify mmap, munmap, mprotect, madvise and the faults of unmapped pages
   posix-resources verify account files, limits, groups and descriptor exec
   posix-math   verify scalar math, binary128 and thread floating-point state
   posix-park verify that waits survive a park for the stop of a fork
@@ -1399,6 +1405,7 @@ fn main() {
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
         Some("os-test-headers") => os_test_headers(&args[1..]),
+        Some("posix-map") => posix_map_probe(),
         Some("posix-resources") => posix_resources_probe(),
         Some("posix-sync") => posix_sync_probe(),
         Some("layer-names") => layer_c_names(),
@@ -3804,6 +3811,32 @@ fn posix_fifo_run(steps: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn posix_map_probe() -> Result<(), String> {
+    relibc()?;
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-posix-map.img", &POSIX_MAP_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    for marker in [
+        "posix-map: mprotect, munmap and faults ok",
+        "posix-map: shared memory, files and shm ok",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
+    Ok(())
+}
+
 fn posix_resources_probe() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -4799,6 +4832,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         "posix-procs: resource and descriptor exec steps ok",
     )?;
     qemu::expect_marker(&outcome, "posix-procs: timer steps ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: shared memory steps ok")?;
     check_process_memory_reserve(&outcome.lines)?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
@@ -4837,10 +4871,10 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // The resource and descriptor-exec exercise runs while the crowd is live.
     // Every newly introduced dispatch is measured, with the part's 10% reserve.
     for (service, measured, kinds) in [
-        // 58 Timer, 59 Queue and 65, the expiry of timers (a notice the
-        // service counts apart).
-        ("process", &rows, &[55usize, 56, 57, 58, 59, 65][..]),
-        ("RAM", &ram, &[3usize, 59][..]),
+        // 58 Timer, 59 Queue, 60 Share, 61 ShareGrant and 65, the expiry of
+        // timers (a notice the service counts apart).
+        ("process", &rows, &[55usize, 56, 57, 58, 59, 60, 61, 65][..]),
+        ("RAM", &ram, &[3usize, 59, 62][..]),
     ] {
         for kind in kinds {
             let ticks = measured.iter().find(|(k, ..)| k == kind).map_or(0, |r| r.1);
@@ -5915,6 +5949,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
+        job("posix-map", posix_map_probe),
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
         job("posix-math", posix_math_probe),
@@ -7980,6 +8015,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-sync-probe",
         "--package",
         "posix-resources-probe",
+        "--package",
+        "posix-map-probe",
         "--package",
         "posix-sock",
         "--target",

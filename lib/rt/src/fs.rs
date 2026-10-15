@@ -415,6 +415,20 @@ impl Files {
         Ok(CapturedDescription { held, flags })
     }
 
+    /// The file service tells the process service that the caller has the
+    /// published `fd` open and may map the file's shared memory
+    /// (`Method::ShareGrant`); the status of the refusal otherwise.
+    pub fn share_grant(&self, fd: u32) -> Result<(), Status> {
+        let mut w = Writer::new();
+        Method::ShareGrant.header().write(&mut w)?;
+        w.u32(fd)?;
+        let reply = Self::send_on(&self.channel, w.as_bytes())?;
+        match Status::from_code(Self::reply_code(&reply)?) {
+            Status::Ok => Ok(()),
+            status => Err(status),
+        }
+    }
+
     /// Canonical exact cleanup preserves a replacement at the same numeric fd.
     pub fn close_exact(&self, held: PreparedOpen) -> Result<CloseOutcome, Status> {
         let mut w = Writer::new();
