@@ -123,6 +123,11 @@ unsafe impl Sync for WaitsBss {}
 static WAITS: WaitsBss = WaitsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
 const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
+/// Inodes without locks that one turn of the lock sweep passes. The circle
+/// has 1285 inodes and restarts every period of the wait timer; a turn per
+/// inode kept the service runnable for the whole period and held back the
+/// timers of every client below its priority.
+const SWEEP_EMPTY_RUN: usize = 64;
 struct RamBss(UnsafeCell<core::mem::MaybeUninit<Ram<'static>>>);
 // SAFETY: the sole service thread initializes and owns the RAM descriptors.
 unsafe impl Sync for RamBss {}
@@ -1637,7 +1642,7 @@ impl Service<0> for Fs {
             let (storage, descriptions) = self.ram.lock_parts();
             if self.lock_maintenance_work == 1 && self.lock_sweep_pending {
                 self.locks
-                    .sweep(storage, &mut self.lock_sweep, 1, |owner| match owner {
+                    .sweep_run(storage, &mut self.lock_sweep, SWEEP_EMPTY_RUN, |owner| match owner {
                         Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
                         Owner::Description { slot, generation } => {
                             descriptions.live(Token { slot, generation })

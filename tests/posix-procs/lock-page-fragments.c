@@ -90,6 +90,19 @@ static int pf_exchange(struct pf_child *child, unsigned operation, unsigned page
         || pf_receive(child->reply[0], &result, sizeof result)) return -1;
     return result;
 }
+/* The file service keeps sweeping while records exist. Its maintenance must
+ * leave the processor to the clients: a one-millisecond sleep of a client
+ * ends within a bounded delay however long the records have been held. */
+static int pf_sleep_latency(void) {
+    for (unsigned i = 0; i < 8; i++) {
+        long long start = pf_now();
+        const struct timespec delay = {0, 1000000};
+        if (start < 0 || nanosleep(&delay, NULL)) return -1;
+        long long end = pf_now();
+        if (end < 0 || end - start > 100000000LL) return -1;
+    }
+    return 0;
+}
 static int pf_pages(int target, unsigned long long *pages) {
     struct statvfs usage;
     if (fstatvfs(target, &usage) || usage.f_frsize != 4096) return -1;
@@ -147,6 +160,7 @@ static int public_lock_page_fragments(void) {
     for (unsigned page = 0; page < PF_PAGES; page++) {
         PF_CHECK(pf_exchange(&children[PF_WORKERS], 1, page) == 0);
         PF_CHECK(pf_exchange(&children[page % PF_WORKERS], 1, page) == 0);
+        if (page % 16 == 15) PF_CHECK(pf_sleep_latency() == 0);
     }
     for (unsigned worker = 0; worker < PF_WORKERS; worker++)
         PF_CHECK(pf_exchange(&children[worker], 2, 0) == 0);
