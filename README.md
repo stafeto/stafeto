@@ -313,7 +313,7 @@ Bounded kernel paths and their costs:
 | Cleanup E1 | honest os-test and coverage counts, the services' budget of 20,410 ticks and the kernel's of 18,000 in `xtask`, a faster `ci`, clone counting in O(1), the IPC loss probe removed, erratum 843419 check, terminal `Watch` of at most 16 elements | 🚧 on `cleanup-1008`, ready to merge |
 | POSIX: conformance | the full os-test suite and Open POSIX in `ci`, honest headers and `sysconf`, `cargo xtask coverage` checking the standard's interface list against the C library at every step | ⬜ |
 | POSIX: timers and scheduling | POSIX timers, CPU time, `SCHED_FIFO` and `SCHED_RR`, queued signals | ⬜ |
-| POSIX: shared memory | file `mmap`, `mprotect`, `shm_open`, named semaphores | ⬜ |
+| POSIX: shared memory | file `mmap`, `mprotect`, `msync`, `shm_open` (done); named semaphores | 🚧 |
 | POSIX: rest of the C library | complex and long double math, `fenv`, `iconv`, message catalogues, `wordexp`, user and group databases | ⬜ |
 | POSIX: local sockets | AF_UNIX sockets; IPv4 comes with the network subproject | ⬜ |
 | POSIX: utilities | the POSIX utilities from BusyBox and the missing ones | ⬜ |
