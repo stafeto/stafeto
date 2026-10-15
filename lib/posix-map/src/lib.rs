@@ -101,19 +101,24 @@ pub struct Back {
     /// The descriptor the layer holds for it.
     pub fd: i32,
     page: u32,
-    /// The key of the file at the process service's rendezvous of shared
-    /// memory, 0 for an object that is not registered there.
+    /// The identity of the file (device and inode, never 0): the layer
+    /// checks it before it writes through `fd` or closes it, because a
+    /// program may have put another file on that number.
     pub key: u64,
+    /// The object is registered at the process service's rendezvous of
+    /// shared memory under `key`.
+    pub registered: bool,
 }
 
 impl Back {
     /// `offset` is the byte of the file the object's first byte shows, a
     /// multiple of the page.
-    pub fn new(fd: i32, offset: u64, key: u64) -> Back {
+    pub fn new(fd: i32, offset: u64, key: u64, registered: bool) -> Back {
         Back {
             fd,
             page: u32::try_from(offset / PAGE as u64).expect("offset of a mapped file"),
             key,
+            registered,
         }
     }
 
@@ -129,6 +134,24 @@ pub struct Object<H> {
     /// Shared with other processes and with a forked child (MAP_SHARED).
     pub shared: bool,
     pub back: Option<Back>,
+    /// The program may map the object writable (the descriptor was open
+    /// for writing); `mprotect` to write is EACCES otherwise.
+    pub may_write: bool,
+    /// A piece of the object was writable: only then are its pages written
+    /// back to the file.
+    pub dirty: bool,
+}
+
+impl<H> Object<H> {
+    pub fn new(handle: H, shared: bool, back: Option<Back>) -> Self {
+        Object {
+            handle,
+            shared,
+            back,
+            may_write: true,
+            dirty: false,
+        }
+    }
 }
 
 /// Why a map refused a change.
@@ -494,11 +517,7 @@ mod tests {
     use super::*;
 
     fn object(handle: u32, _pages: usize) -> Object<u32> {
-        Object {
-            handle,
-            shared: false,
-            back: None,
-        }
+        Object::new(handle, false, None)
     }
 
     fn held(map: &Map<u32>) -> Vec<(usize, usize, Access, usize, u32)> {
@@ -586,11 +605,7 @@ mod tests {
         use std::rc::Rc;
         let handle = Rc::new(());
         let mut map = Map::new();
-        let make = || Object {
-            handle: handle.clone(),
-            shared: false,
-            back: None,
-        };
+        let make = || Object::new(handle.clone(), false, None);
         map.push(0x1000, 1, Access::Read, 0, make()).unwrap();
         assert_eq!(Rc::strong_count(&handle), 2);
         assert_eq!(
@@ -617,11 +632,7 @@ mod tests {
                 1,
                 Access::Read,
                 0,
-                Object {
-                    handle: handle.clone(),
-                    shared: false,
-                    back: None,
-                },
+                Object::new(handle.clone(), false, None),
             )
             .unwrap();
         }
@@ -633,11 +644,7 @@ mod tests {
             1,
             Access::Read,
             0,
-            Object {
-                handle: Rc::new(()),
-                shared: false,
-                back: None,
-            },
+            Object::new(Rc::new(()), false, None),
         )
         .unwrap();
         assert_eq!(map.len(), 1);

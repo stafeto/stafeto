@@ -508,7 +508,153 @@ static void fragmentation(void) {
     check("fragmentation: the freed pages fault", last && read_faults(last));
 }
 
+/* A process that maps a file, writes and leaves without msync: by exit, by
+ * _exit or by exec. */
+static int leaver(const char *how) {
+    int fd = open(scratch, O_RDWR);
+    if (fd < 0) return 1;
+    char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) return 2;
+    close(fd);
+    p[3] = 'L';
+    if (strcmp(how, "exit") == 0) exit(0);
+    if (strcmp(how, "_exit") == 0) _exit(0);
+    char *args[] = {"map", "peer", "/none", NULL};
+    char *env[] = {NULL};
+    execve("/bin/procs-child", args, env);
+    return 3;
+}
+
+static void leaving(void) {
+    const char *how[] = {"exit", "_exit", "exec"};
+    for (int i = 0; i < 3; i++) {
+        int fd = fill_file(PAGE);
+        check("leave: create", fd >= 0);
+        if (fd < 0) return;
+        close(fd);
+        char *args[] = {"map", "leave", (char *)how[i], NULL};
+        pid_t child;
+        int status = 0;
+        int error = posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ);
+        if (!error) waitpid(child, &status, 0);
+        char what[64];
+        snprintf(what, sizeof what, "leave: a write is kept by %s", how[i]);
+        check(what, !error && WIFEXITED(status) && file_byte(3) == 'L');
+        unlink(scratch);
+    }
+}
+
+/* What the mapping may write back and where, and what the program may map. */
+static void review(void) {
+    int fd = fill_file(2 * PAGE);
+    check("review: create", fd >= 0);
+    if (fd < 0) return;
+    /* A read-only shared mapping never writes the file: a pwrite after the
+     * mmap stays. */
+    char *r = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, fd, 0);
+    check("review: read-only mmap", r != MAP_FAILED);
+    check("review: pwrite", pwrite(fd, "Z", 1, 0) == 1);
+    if (r != MAP_FAILED) {
+        check("review: msync of a read-only mapping", msync(r, PAGE, MS_SYNC) == 0);
+        check("review: munmap of a read-only mapping", munmap(r, PAGE) == 0);
+    }
+    check("review: the pwrite is not overwritten", file_byte(0) == 'Z');
+    /* A mapping that became writable does write. */
+    r = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, fd, 0);
+    check("review: mprotect to write", r != MAP_FAILED && mprotect(r, PAGE, PROT_READ | PROT_WRITE) == 0);
+    if (r != MAP_FAILED) {
+        r[1] = 'W';
+        munmap(r, PAGE);
+        check("review: and is written back", file_byte(1) == 'W');
+    }
+    /* MS_INVALIDATE reads the file again. */
+    char *w = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check("review: mmap", w != MAP_FAILED);
+    if (w != MAP_FAILED) {
+        check("review: pwrite behind the mapping", pwrite(fd, "Q", 1, 2) == 1);
+        check("review: invalidate", msync(w, PAGE, MS_SYNC | MS_INVALIDATE) == 0);
+        check("review: the mapping shows the file", w[2] == 'Q');
+        char *ro = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, fd, 0);
+        if (ro != MAP_FAILED) {
+            pwrite(fd, "R", 1, 4);
+            check("review: invalidate of a read-only mapping", msync(ro, PAGE, MS_SYNC | MS_INVALIDATE) == 0 && ro[4] == 'R');
+            check("review: and it stays read-only", write_faults(ro) && mprotect(ro, PAGE, PROT_READ | PROT_WRITE) == 0);
+            munmap(ro, PAGE);
+        }
+        /* The descriptor the layer keeps: another file put on its number is
+         * not written to and not closed. */
+        int other = open("/tmp/posix-map-other", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        check("review: another file", other >= 0 && ftruncate(other, PAGE) == 0);
+        int kept = -1;
+        for (int n = 3; n < 32; n++) {
+            if (n != fd && n != other && fcntl(n, F_GETFD) >= 0 && (fcntl(n, F_GETFD) & FD_CLOEXEC)) kept = n;
+        }
+        check("review: the layer keeps a descriptor", kept > 2);
+        if (kept > 2 && other >= 0) {
+            check("review: dup2 over it", dup2(other, kept) == kept);
+            w[5] = 'S';
+            msync(w, PAGE, MS_SYNC);
+            char c = 0;
+            check("review: msync does not write to the other file", pread(other, &c, 1, 5) == 1 && c == 0);
+            check("review: and the file is not written either", file_byte(5) != 'S');
+            munmap(w, PAGE);
+            check("review: munmap does not close the program's descriptor", fcntl(kept, F_GETFD) >= 0);
+            w = MAP_FAILED;
+        }
+        if (w != MAP_FAILED) munmap(w, PAGE);
+        if (other >= 0) close(other);
+        unlink("/tmp/posix-map-other");
+    }
+    close(fd);
+    /* The mode of the descriptor. */
+    fd = open(scratch, O_RDONLY);
+    errno = 0;
+    check("access: shared write on a read-only descriptor is EACCES",
+          mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED && errno == EACCES);
+    char *ro = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, fd, 0);
+    check("access: shared read on a read-only descriptor", ro != MAP_FAILED);
+    errno = 0;
+    check("access: and it does not become writable", ro != MAP_FAILED
+          && mprotect(ro, PAGE, PROT_READ | PROT_WRITE) == -1 && errno == EACCES);
+    if (ro != MAP_FAILED) munmap(ro, PAGE);
+    char *pr = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    check("access: private write on a read-only descriptor", pr != MAP_FAILED);
+    if (pr != MAP_FAILED) munmap(pr, PAGE);
+    close(fd);
+    fd = open(scratch, O_WRONLY);
+    errno = 0;
+    check("access: a write-only descriptor is EACCES",
+          mmap(NULL, PAGE, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED && errno == EACCES);
+    close(fd);
+    fd = open(scratch, O_RDWR | O_APPEND);
+    errno = 0;
+    check("access: an append descriptor is EACCES for a shared write",
+          mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED && errno == EACCES);
+    close(fd);
+    /* An error of the write back is the error of msync. */
+    fd = open(scratch, O_RDWR);
+    char *e = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (e != MAP_FAILED) {
+        struct sigaction ignore = {.sa_handler = SIG_IGN}, old;
+        sigaction(SIGXFSZ, &ignore, &old);
+        struct rlimit saved, small;
+        getrlimit(RLIMIT_FSIZE, &saved);
+        small = saved;
+        small.rlim_cur = 100;
+        setrlimit(RLIMIT_FSIZE, &small);
+        e[7] = 'E';
+        errno = 0;
+        check("access: msync reports a failed write", msync(e, PAGE, MS_SYNC) == -1 && errno != 0);
+        setrlimit(RLIMIT_FSIZE, &saved);
+        sigaction(SIGXFSZ, &old, NULL);
+        munmap(e, PAGE);
+    }
+    close(fd);
+    unlink(scratch);
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "leave") == 0) return leaver(argv[2]);
     if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
     if (argc == 1) {
         /* fork needs a program the process service started. */
@@ -539,6 +685,8 @@ int main(int argc, char **argv) {
     shared_anonymous();
     files();
     shared_names();
+    review();
+    leaving();
     unrelated_processes();
     limits();
     if (failures) {

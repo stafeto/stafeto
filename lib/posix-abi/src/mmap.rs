@@ -153,6 +153,11 @@ pub struct FileSource {
     pub existing: Option<rt::handle::Handle<rt::handle::Memory>>,
     pub offset_pages: usize,
     pub back: Back,
+    /// The descriptor was open for writing: the program may map the object
+    /// writable now or by `mprotect`.
+    pub may_write: bool,
+    /// The mapping asks for write access: its pages go back to the file.
+    pub writable: bool,
 }
 
 /// A duplicate of the object that shows the page at `address` and the pages
@@ -222,8 +227,10 @@ fn mmap0(
             existing: file.existing,
             offset: file.offset_pages,
             back: Some(file.back),
+            may_write: file.may_write,
+            dirty: file.writable,
         },
-        None => Source::default(),
+        None => Source::anonymous(),
     };
     heap(|state| {
         state.within_data(pages)?;
@@ -273,7 +280,7 @@ pub(crate) fn attach_shared() {
     heap(|state| {
         let mut n = 0;
         for (index, object) in state.map.objects() {
-            let Some(back) = object.back.filter(|b| b.key != 0) else {
+            let Some(back) = object.back.filter(|b| b.registered) else {
                 continue;
             };
             let pages = state
@@ -303,20 +310,50 @@ pub(crate) fn attach_shared() {
 /// A piece of a shared mapping of a file in a range: its address, its
 /// pages, the descriptor the layer holds and the byte of the file it starts
 /// at.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct FilePiece {
     pub address: usize,
     pub pages: usize,
     pub fd: i32,
     pub offset: u64,
+    /// The identity of the file the descriptor must still show.
+    pub key: u64,
+    /// The access of the piece now.
+    pub access: Access,
+}
+
+impl Default for FilePiece {
+    fn default() -> Self {
+        FilePiece {
+            address: 0,
+            pages: 0,
+            fd: -1,
+            offset: 0,
+            key: 0,
+            access: Access::Read,
+        }
+    }
 }
 
 /// The pieces of shared mappings of files in the range, up to `out.len()`:
-/// how many.
-pub fn file_pieces(addr: usize, len: usize, out: &mut [FilePiece]) -> usize {
+/// how many. With `dirty` only those of objects the program had writable
+/// (what a write back writes); else all (what a refresh reads).
+pub fn file_pieces(addr: usize, len: usize, dirty: bool, out: &mut [FilePiece]) -> usize {
     let Ok(pages) = whole_pages(len) else {
         return 0;
     };
+    pieces_in(addr, pages, dirty, out)
+}
+
+/// As `file_pieces` for every page of the room from `addr` on, for the
+/// write back at `exit` and `exec`.
+pub fn file_pieces_from(addr: usize, out: &mut [FilePiece]) -> usize {
+    let (base, limit) = heap(|state| (state.space.base(), state.space.limit()));
+    let from = addr.max(base);
+    pieces_in(from, (limit - from) / PAGE, true, out)
+}
+
+fn pieces_in(addr: usize, pages: usize, dirty: bool, out: &mut [FilePiece]) -> usize {
     heap(|state| {
         let mut n = 0;
         for (index, from, count) in state.map.walk(addr, pages) {
@@ -325,6 +362,9 @@ pub fn file_pieces(addr: usize, len: usize, out: &mut [FilePiece]) -> usize {
             let Some(back) = object.back.filter(|_| object.shared) else {
                 continue;
             };
+            if dirty && !object.dirty {
+                continue;
+            }
             if n < out.len() {
                 out[n] = FilePiece {
                     address: from,
@@ -332,6 +372,8 @@ pub fn file_pieces(addr: usize, len: usize, out: &mut [FilePiece]) -> usize {
                     fd: back.fd,
                     offset: back.offset()
                         + ((piece.offset() + (from - piece.address) / PAGE) * PAGE) as u64,
+                    key: back.key,
+                    access: piece.access(),
                 };
                 n += 1;
             }
@@ -348,7 +390,7 @@ pub fn fd_of_key(key: u64) -> Option<i32> {
 /// The descriptors and keys of the files whose last mapping `munmap` took since
 /// the last call, up to `out.len()`: how many. The caller closes the
 /// descriptors and tells the process service of the keys.
-pub fn closed_files(out: &mut [(i32, u64)]) -> usize {
+pub fn closed_files(out: &mut [(i32, u64, bool)]) -> usize {
     heap(|state| state.take_closed(out))
 }
 
@@ -389,6 +431,14 @@ pub fn mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
     heap(|state| {
         if !mapped(state, addr, pages) {
             return Err(ENOMEM);
+        }
+        if access == Access::ReadWrite
+            && state
+                .map
+                .walk(addr, pages)
+                .any(|(i, ..)| !state.map.object(state.map.piece(i).object()).may_write)
+        {
+            return Err(EACCES);
         }
         state.protect(addr, pages, access)
     })

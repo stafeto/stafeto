@@ -273,6 +273,7 @@ pub extern "C" fn stafeto_lseek(fd: c_int, offset: i64, whence: c_int) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_exit(status: c_int) -> ! {
+    mapping::flush_all();
     posix_abi::exit(status)
 }
 
@@ -657,6 +658,7 @@ pub unsafe extern "C" fn stafeto_exec(
     // SAFETY: as above.
     let (argv, envp) = unsafe { (strings(argv), strings(envp)) };
     let umask = files::umask();
+    mapping::flush_all();
     match call(|| posix_abi::process::exec(path, argv.clone(), envp.clone(), umask)) {
         Ok(never) => match never {},
         Err(errno) => -errno,
@@ -676,6 +678,7 @@ pub unsafe extern "C" fn stafeto_fexecve(
     // SAFETY: the caller's promise.
     let (argv, envp) = unsafe { (strings(argv), strings(envp)) };
     let umask = files::umask();
+    mapping::flush_all();
     match call(|| posix_abi::process::fexec(fd, argv.clone(), envp.clone(), umask)) {
         Ok(never) => match never {},
         Err(errno) => -errno,

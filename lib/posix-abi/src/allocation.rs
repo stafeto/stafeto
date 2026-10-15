@@ -67,7 +67,7 @@ pub(crate) struct State {
     hidden: usize,
     /// The descriptors of files whose last shared mapping went, until the
     /// caller closes them (`take_closed`).
-    closed: [(i32, u64); 16],
+    closed: [(i32, u64, bool); 16],
     closed_len: usize,
 }
 
@@ -92,7 +92,7 @@ static HEAP: Heap = Heap(UnsafeCell::new(State {
     map: Map::new(),
     chunk: 0,
     hidden: HIDDEN,
-    closed: [(0, 0); 16],
+    closed: [(0, 0, false); 16],
     closed_len: 0,
 }));
 static HEAP_LOCK: LayerLock = LayerLock::raising();
@@ -187,11 +187,7 @@ pub unsafe fn adopt(
             pages,
             access,
             0,
-            Object {
-                handle,
-                shared: false,
-                back: None,
-            },
+            Object::new(handle, false, None),
         )
         .map(drop)
 }
@@ -199,11 +195,27 @@ pub unsafe fn adopt(
 /// Where a mapping of its own gets its object: a handle the process service
 /// gave (`existing`) or a new object, covering `offset` pages before the
 /// mapping's own, and the file a shared object writes back to.
-#[derive(Default)]
 pub(crate) struct Source {
     pub existing: Option<Handle<Memory>>,
     pub offset: usize,
     pub back: Option<posix_map::Back>,
+    /// The program may map the object writable.
+    pub may_write: bool,
+    /// The mapping asked for write access: its pages go back to the file.
+    pub dirty: bool,
+}
+
+impl Source {
+    /// A new object, nothing behind it.
+    pub fn anonymous() -> Source {
+        Source {
+            existing: None,
+            offset: 0,
+            back: None,
+            may_write: true,
+            dirty: false,
+        }
+    }
 }
 
 /// One entry of a forked child's memory map (the loader's `ForkEntry`): the
@@ -237,9 +249,10 @@ pub unsafe fn after_fork(
     }
     // The files the parent's shared mappings write to: the child's
     // descriptors are the parent's numbers.
-    let mut backs = [(0usize, None::<posix_map::Back>); posix_map::MAX_PIECES];
+    let mut backs = [(0usize, None::<posix_map::Back>, true, false); posix_map::MAX_PIECES];
     for (slot, piece) in backs.iter_mut().zip(state.map.iter()) {
-        *slot = (piece.address, state.map.object(piece.object()).back);
+        let object = state.map.object(piece.object());
+        *slot = (piece.address, object.back, object.may_write, object.dirty);
     }
     state.map.forget();
     let mut last = None;
@@ -251,13 +264,20 @@ pub unsafe fn after_fork(
                     entry.pages,
                     entry.access,
                     entry.offset,
-                    Object {
-                        handle,
-                        shared: entry.shared,
-                        back: backs
+                    {
+                        let inherited = backs
                             .iter()
-                            .find(|(address, _)| entry.shared && *address == entry.address)
-                            .and_then(|(_, back)| *back),
+                            .find(|(address, ..)| entry.shared && *address == entry.address);
+                        let mut object = Object::new(
+                            handle,
+                            entry.shared,
+                            inherited.and_then(|(_, back, ..)| *back),
+                        );
+                        if let Some(&(_, _, may_write, dirty)) = inherited {
+                            object.may_write = may_write;
+                            object.dirty = dirty;
+                        }
+                        object
                     },
                 )?;
                 last = Some(object);
@@ -402,6 +422,9 @@ impl State {
                     .protect(index, at, (to - at) / PAGE, access)
                     .map_err(|_| ENOMEM)?;
             }
+            if access == Access::ReadWrite && self.map.object(piece.object()).shared {
+                self.map.object_mut(piece.object()).dirty = true;
+            }
             at = to;
         }
         Ok(())
@@ -436,16 +459,16 @@ impl State {
                     .map
                     .objects()
                     .any(|(_, o)| o.back.is_some_and(|b| b.fd == back.fd));
-                let key_used = back.key != 0
-                    && self
-                        .map
-                        .objects()
-                        .any(|(_, o)| o.back.is_some_and(|b| b.key == back.key));
+                let key_used = self
+                    .map
+                    .objects()
+                    .any(|(_, o)| o.back.is_some_and(|b| b.key == back.key && b.registered));
                 let entry = (
                     if fd_used { -1 } else { back.fd },
-                    if key_used { 0 } else { back.key },
+                    back.key,
+                    back.registered && !key_used,
                 );
-                if entry != (-1, 0) && self.closed_len < self.closed.len() {
+                if (entry.0 >= 0 || entry.2) && self.closed_len < self.closed.len() {
                     self.closed[self.closed_len] = entry;
                     self.closed_len += 1;
                 }
@@ -460,11 +483,11 @@ impl State {
     pub(crate) fn fd_of_key(&self, key: u64) -> Option<i32> {
         self.map
             .objects()
-            .find_map(|(_, o)| o.back.filter(|b| b.key == key && key != 0).map(|b| b.fd))
+            .find_map(|(_, o)| o.back.filter(|b| b.key == key).map(|b| b.fd))
     }
 
     /// The descriptors of `closed`, moved to `out`: how many.
-    pub(crate) fn take_closed(&mut self, out: &mut [(i32, u64)]) -> usize {
+    pub(crate) fn take_closed(&mut self, out: &mut [(i32, u64, bool)]) -> usize {
         let n = self.closed_len.min(out.len());
         out[..n].copy_from_slice(&self.closed[..n]);
         self.closed.copy_within(n..self.closed_len, 0);
@@ -542,11 +565,7 @@ impl State {
                 pages,
                 Access::ReadWrite,
                 0,
-                Object {
-                    handle: kept,
-                    shared: false,
-                    back: None,
-                },
+                Object::new(kept, false, None),
             )
             .map_err(|_| ENOMEM)?;
         self.space.set(address, pages, Page::Free);
@@ -612,6 +631,8 @@ impl State {
             existing,
             offset,
             back,
+            may_write,
+            dirty,
         } = source;
         let kept = match existing {
             Some(kept) => kept,
@@ -645,10 +666,11 @@ impl State {
                 pages,
                 first,
                 offset,
-                Object {
-                    handle: kept,
-                    shared,
-                    back,
+                {
+                    let mut object = Object::new(kept, shared, back);
+                    object.may_write = may_write;
+                    object.dirty = dirty;
+                    object
                 },
             )
             .map_err(|_| ENOMEM)?;
