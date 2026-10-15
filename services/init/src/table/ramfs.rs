@@ -554,7 +554,11 @@ pub const OS_TEST_TABLE: &[Record] = &[
 ];
 
 /// The quota of the runner of os-test, which each test it starts gets too.
-const OS_TEST_QUOTA: u64 = 512 * PAGE;
+/// 544 pages: the layer's image grew by about 5 pages with the mappings of
+/// files, shared memory and the process service's rendezvous, and
+/// basic/time/strftime_l, whose heap needs a second chunk, had under 17 pages
+/// left of 512.
+const OS_TEST_QUOTA: u64 = 544 * PAGE;
 
 /// relibc-hello's record, for the records of its other runs.
 const RELIBC_HELLO: Record = Record {
