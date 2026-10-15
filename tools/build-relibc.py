@@ -22,9 +22,9 @@ from pathlib import Path
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-# Stafeto link limit, integer parsing and mknodat of FIFOs, tagged pin-576fc51e.
-# File Synchronization awaits aio_fsync.
-COMMIT = "576fc51e80506c6d081b137fff9d38360ef06d6b"
+# Library completion (F11a): wide streams, memory streams, libintl, uchar, iconv,
+# search, ndbm, ftw, wordexp, aio, utmpx, math exceptions and accuracy; tagged pin-695d0d9c.
+COMMIT = "695d0d9c9a59f3b78f92240a01da23a7f1b0067f"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
