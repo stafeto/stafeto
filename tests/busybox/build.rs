@@ -58,6 +58,21 @@ fn main() {
     if env::var_os("CARGO_FEATURE_UTILITIES").is_some() {
         println!("cargo:rustc-link-arg-bins=--strip-debug");
     }
+    // The ready-made utilities of the shell image (tools/build-ready-utils.py):
+    // the mains BusyBox's applet table names.
+    println!("cargo:rerun-if-env-changed=STAFETO_READY_UTILS");
+    if env::var_os("CARGO_FEATURE_UTILITIES").is_some() {
+        let ready = env::var_os("STAFETO_READY_UTILS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| manifest.join("../../target/ready-utils/ready.a"));
+        assert!(
+            ready.exists(),
+            "build the ready-made utilities with tools/build-busybox.py first"
+        );
+        println!("cargo:rerun-if-changed={}", ready.display());
+        std::fs::copy(&ready, out.join("libbusybox_ready.a")).expect("copy the ready utilities");
+        println!("cargo:rustc-link-lib=static=busybox_ready");
+    }
     println!("cargo:rustc-link-search=native={}", out.display());
     let sysroot = env::var_os("STAFETO_RELIBC_SYSROOT")
         .map(PathBuf::from)

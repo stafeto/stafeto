@@ -227,7 +227,7 @@ Apple silicon. A full `cargo xtask ci` takes 3 min 34 s on a warm cache
 You need rustup, QEMU and dtc (on macOS: `brew install qemu dtc`); rustup
 installs the toolchain from `rust-toolchain.toml`. The POSIX probes in
 `test` and `ci` also need Clang/LLVM, LLD, Python 3, GNU Make and Git (for
-relibc and BusyBox; on macOS: `brew install llvm lld make`). The VZ commands need the Xcode
+relibc and BusyBox; GNU sed for toybox's generator; on macOS: `brew install llvm lld make gnu-sed`). The VZ commands need the Xcode
 command line tools for `swiftc` and `codesign`.
 
 ```sh
@@ -343,6 +343,13 @@ programs under any licence, including GPL-2.0-only BusyBox, may link it.
 Services stay GPL-3.0-or-later. relibc and its dependencies keep their own
 licences (THIRD-PARTY-NOTICES, which `tools/check-licenses.py` writes to
 `target/relibc/` and every boot image with a program on relibc carries).
+
+The shell image also holds ready-made utilities, built from their own
+sources unchanged by `tools/build-ready-utils.py`: `getconf`, `join` and
+`pathchk` of sbase (MIT), `file` and `iconv` of toybox (0BSD) and `compress`
+of ncompress (public domain). Their licence texts and the exact sources
+travel in the image next to BusyBox's (`BUSYBOX-LICENSE`, `BUSYBOX-SOURCE`,
+`UTILITIES-LICENSE`).
 
 Every source file carries an `SPDX-License-Identifier` line. `cargo xtask
 ci` checks the licence of every crate and file, that the GPL-2.0-only
