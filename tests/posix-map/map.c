@@ -679,6 +679,156 @@ static int intruder(const char *name) {
     return 0;
 }
 
+int stafeto_probe_share_grant(int fd);
+int stafeto_probe_share_plant(int fd, unsigned long long key);
+int stafeto_probe_share_map_write(int fd, unsigned long long key);
+
+static unsigned long long key_of_fd(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return 0;
+    return stafeto_probe_share_key(st.st_dev, st.st_ino);
+}
+
+/* The roles of the children below. */
+static int role(const char *which, const char *name, int a, int b) {
+    int fd;
+    if (strcmp(which, "plant") == 0) {
+        /* A reader hands the rendezvous an object of its own as the file's. */
+        fd = shm_open(name, O_RDONLY, 0);
+        if (fd < 0) return 1;
+        char result = (char)stafeto_probe_share_plant(fd, key_of_fd(fd));
+        if (write(b, &result, 1) != 1) return 2;
+        char go;
+        if (read(a, &go, 1) != 1) return 3;
+        return 0;
+    }
+    if (strcmp(which, "readerhandle") == 0 || strcmp(which, "writerhandle") == 0) {
+        int reader = which[0] == 'r';
+        fd = shm_open(name, reader ? O_RDONLY : O_RDWR, 0);
+        if (fd < 0) return 1;
+        int got = stafeto_probe_share_map_write(fd, key_of_fd(fd));
+        /* The reader's handle cannot map for writing; the writer's can. */
+        return reader ? (got == 200 ? 0 : 2) : (got == 0 ? 0 : 3);
+    }
+    if (strcmp(which, "once") == 0) {
+        fd = shm_open(name, O_RDONLY, 0);
+        if (fd < 0) return 1;
+        unsigned long long key = key_of_fd(fd);
+        if (stafeto_probe_share_grant(fd) != 0) return 2;
+        if (stafeto_probe_share_get(key) != 0) return 3;
+        /* Used: a second ask, with the file still open, is refused. */
+        return stafeto_probe_share_get(key) == 0 ? 4 : 0;
+    }
+    if (strcmp(which, "grants") == 0) {
+        /* Three files, two grants a process: the third takes the oldest's
+         * place and the oldest is gone. */
+        char names[3][48];
+        int fds[3];
+        unsigned long long keys[3];
+        for (int i = 0; i < 3; i++) {
+            snprintf(names[i], sizeof names[i], "%s%d", name, i);
+            fds[i] = shm_open(names[i], O_RDONLY, 0);
+            if (fds[i] < 0) return 1;
+            keys[i] = key_of_fd(fds[i]);
+        }
+        for (int i = 0; i < 3; i++)
+            if (stafeto_probe_share_grant(fds[i]) != 0) return 2;
+        if (stafeto_probe_share_get(keys[0]) == 0) return 3;
+        if (stafeto_probe_share_get(keys[2]) != 0) return 4;
+        return 0;
+    }
+    return 9;
+}
+
+static int spawn_role(const char *which, const char *name, int a, int b) {
+    char x[16], y[16];
+    snprintf(x, sizeof x, "%d", a);
+    snprintf(y, sizeof y, "%d", b);
+    char *args[] = {"map", "role", (char *)which, (char *)name, x, y, NULL};
+    pid_t child;
+    int status = 0;
+    if (posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ) != 0) return -1;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -2;
+    return WEXITSTATUS(status);
+}
+
+/* What a process vouched for as a reader can and cannot do with the
+ * rendezvous: the right of a writer is not in its hands. */
+static void rights(void) {
+    const char *name = "/posix-map-rights";
+    shm_unlink(name);
+    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    check("rights: shm_open", fd >= 0 && write(fd, "W", 1) == 1 && ftruncate(fd, PAGE) == 0);
+    if (fd < 0) return;
+    char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check("rights: mmap", p != MAP_FAILED);
+    if (p != MAP_FAILED) {
+        int rc = spawn_role("readerhandle", name, 0, 0);
+        if (rc) printf("posix-map: reader handle step %d\n", rc);
+        check("rights: a reader's handle cannot map for writing", rc == 0);
+        rc = spawn_role("writerhandle", name, 0, 0);
+        if (rc) printf("posix-map: writer handle step %d\n", rc);
+        check("rights: a writer's handle can", rc == 0);
+        rc = spawn_role("once", name, 0, 0);
+        if (rc) printf("posix-map: once step %d\n", rc);
+        check("rights: a vouching serves one ask", rc == 0);
+        munmap(p, PAGE);
+    }
+    close(fd);
+    shm_unlink(name);
+    /* Three files for the limit of the vouchings a process holds. */
+    const char *base = "/posix-map-g";
+    int ok = 1;
+    for (int i = 0; i < 3; i++) {
+        char n[48];
+        snprintf(n, sizeof n, "%s%d", base, i);
+        shm_unlink(n);
+        int f = shm_open(n, O_RDWR | O_CREAT | O_EXCL, 0600);
+        ok &= f >= 0;
+        if (f >= 0) close(f);
+    }
+    check("rights: files", ok);
+    int rc = spawn_role("grants", base, 0, 0);
+    if (rc) printf("posix-map: grants step %d\n", rc);
+    check("rights: a process holds two vouchings", rc == 0);
+    for (int i = 0; i < 3; i++) {
+        char n[48];
+        snprintf(n, sizeof n, "%s%d", base, i);
+        shm_unlink(n);
+    }
+    /* A reader's object is not planted in place of the writers'. */
+    const char *sub = "/posix-map-sub";
+    shm_unlink(sub);
+    fd = shm_open(sub, O_RDWR | O_CREAT | O_EXCL, 0600);
+    check("plant: shm_open", fd >= 0 && write(fd, "W", 1) == 1 && ftruncate(fd, PAGE) == 0);
+    if (fd < 0) return;
+    int up[2], down[2];
+    check("plant: pipes", pipe(up) == 0 && pipe(down) == 0);
+    char x[16], y[16];
+    snprintf(x, sizeof x, "%d", down[0]);
+    snprintf(y, sizeof y, "%d", up[1]);
+    char *args[] = {"map", "role", "plant", (char *)sub, x, y, NULL};
+    pid_t child;
+    int started = posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ) == 0;
+    check("plant: spawn", started);
+    if (started) {
+        char planted = 99;
+        check("plant: the reader planted", read(up[0], &planted, 1) == 1);
+        char *q = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        check("plant: mmap", q != MAP_FAILED);
+        if (q != MAP_FAILED) {
+            check("plant: a writer gets the file, not the reader's object", q[0] == 'W');
+            munmap(q, PAGE);
+        }
+        char go = 1;
+        write(down[1], &go, 1);
+        int status = 0;
+        waitpid(child, &status, 0);
+    }
+    close(fd);
+    shm_unlink(sub);
+}
+
 static void foreign_processes(void) {
     const char *name = "/posix-map-guard";
     shm_unlink(name);
@@ -705,6 +855,8 @@ static void foreign_processes(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 6 && strcmp(argv[1], "role") == 0)
+        return role(argv[2], argv[3], atoi(argv[4]), atoi(argv[5]));
     if (argc == 3 && strcmp(argv[1], "intruder") == 0) return intruder(argv[2]);
     if (argc == 3 && strcmp(argv[1], "leave") == 0) return leaver(argv[2]);
     if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
@@ -741,6 +893,7 @@ int main(int argc, char **argv) {
     leaving();
     unrelated_processes();
     foreign_processes();
+    rights();
     limits();
     if (failures) {
         printf("posix-map: %d failures\n", failures);

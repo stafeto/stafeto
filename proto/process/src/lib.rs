@@ -491,7 +491,9 @@ pub enum Method {
     Share = 60,
     /// Through a notary session of a file service (SET_ID): the process
     /// `pid` may map the shared memory of the file `key` (`share_key`), for
-    /// writing when `write` is 1. Body pid u32, key u64, write u32.
+    /// writing when `write` is 1, as the image `image` of that process (a
+    /// grant of an image that exec replaced is refused). Body pid u32, key
+    /// u64, write u32, image u32.
     ShareGrant = 61,
 }
 

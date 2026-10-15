@@ -84,13 +84,14 @@ pub fn grant(fd: i32) -> Result<(), i32> {
         let posix_fs::Target::Ram(ram) = target else {
             return Err(ENODEV);
         };
-        transport.files().share_grant(ram.fd()).map_err(|status| {
-            if status.code() == proto_fs::ACCESS_DENIED {
-                EACCES
-            } else {
-                EIO
-            }
-        })
+        transport
+            .files()
+            .share_grant(ram.fd())
+            .map_err(|status| match status.code() {
+                proto_fs::ACCESS_DENIED => EACCES,
+                proto_fs::NO_SPACE => ENOMEM,
+                _ => EIO,
+            })
     })
 }
 

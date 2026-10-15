@@ -10,7 +10,7 @@
 
 use super::call;
 use core::ffi::{c_int, c_void};
-use posix_abi::constants::{EACCES, EBADF, EINVAL, EIO, ENODEV};
+use posix_abi::constants::{EACCES, EBADF, EINVAL, EIO, ENODEV, ENOMEM};
 use posix_abi::mmap::{self, Back, FilePiece, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE};
 
 const PAGE: usize = 4096;
@@ -287,7 +287,12 @@ fn shared_file(
     // waited for.
     // The file service vouches first that this process has the file open;
     // without that the object is this mapping's alone.
-    let granted = posix_abi::shares::grant(fd).is_ok();
+    let granted = match posix_abi::shares::grant(fd) {
+        Ok(()) => true,
+        // The service has no place for one more vouching of this process.
+        Err(errno) if errno == ENOMEM => return Err(ENOMEM),
+        Err(_) => false,
+    };
     let mut asks = 0;
     let got = loop {
         if !granted {

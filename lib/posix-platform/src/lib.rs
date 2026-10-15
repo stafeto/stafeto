@@ -1005,6 +1005,66 @@ pub extern "C" fn stafeto_probe_share_get(key: u64) -> c_int {
     }
 }
 
+/// The vouching of the file service for the file of `fd` (ShareGrant): 0, or
+/// the errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_grant(fd: c_int) -> c_int {
+    match posix_abi::shares::grant(fd) {
+        Ok(()) => 0,
+        Err(errno) => errno,
+    }
+}
+
+/// A process with the file of `fd` open (vouched for) hands the rendezvous
+/// an object of its own as the shared memory of the file, as a forked
+/// child does: 0 when it did, else the errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_plant(fd: c_int, key: u64) -> c_int {
+    if let Err(errno) = posix_abi::shares::grant(fd) {
+        return errno;
+    }
+    let Ok(object) = rt::sys::mem_create(4096) else {
+        return 12;
+    };
+    match posix_abi::shares::attach(key, 1, &object) {
+        Ok(()) => 0,
+        Err(errno) => errno,
+    }
+}
+
+/// Vouched for the file of `fd`, asks the rendezvous for its object and tries
+/// to map it for writing past the layer at a free address: 0 when the
+/// kernel mapped it, 100 + errno when the rendezvous gave none, else 200 + the
+/// kernel's error.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_map_write(fd: c_int, key: u64) -> c_int {
+    use posix_abi::shares::Got;
+    if let Err(errno) = posix_abi::shares::grant(fd) {
+        return 100 + errno;
+    }
+    let memory = match posix_abi::shares::get(key) {
+        Ok(Got::Found(memory, _)) => memory,
+        Ok(_) => return 101,
+        Err(errno) => return 100 + errno,
+    };
+    let process = posix_abi::allocation::process();
+    match rt::sys::mem_map(
+        process,
+        &memory,
+        0,
+        4096,
+        0x3000_0000,
+        rt::abi::Access::ReadWrite,
+    ) {
+        Ok(()) => {
+            // SAFETY: the mapping was made just now, and nothing uses it.
+            let _ = unsafe { rt::sys::mem_unmap(process, 0x3000_0000, 4096) };
+            0
+        }
+        Err(_) => 200,
+    }
+}
+
 /// The shared objects the layer's map holds (posix_abi::fork::probe_shared_objects).
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_probe_shared_objects() -> u64 {

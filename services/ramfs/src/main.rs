@@ -1251,7 +1251,14 @@ impl Fs {
 
     /// ShareGrant through the notary session: the process service keeps
     /// that the process `pid` has the file open, for writing when `write`.
-    fn tell_share_grant(&mut self, pid: u32, device: u64, inode: u64, write: bool) -> bool {
+    fn tell_share_grant(
+        &mut self,
+        pid: u32,
+        image: u32,
+        device: u64,
+        inode: u64,
+        write: bool,
+    ) -> u32 {
         let mut w = proto_wire::Writer::new();
         if proto_process::Method::ShareGrant
             .header()
@@ -1260,15 +1267,19 @@ impl Fs {
             || w.u32(pid).is_err()
             || w.u64(proto_process::share_key(device, inode)).is_err()
             || w.u32(u32::from(write)).is_err()
+            || w.u32(image).is_err()
         {
-            return false;
+            return proto_process::INVALID;
         }
         let Some(notary) = self.notary() else {
-            return false;
+            return proto_process::PERMISSION;
         };
-        sys::send(notary, w.as_bytes()).is_ok_and(|reply| {
-            reply.len == proto_wire::HEADER_LEN && reply.words[0] == 0 && reply.handles.is_empty()
-        })
+        match sys::send(notary, w.as_bytes()) {
+            Ok(reply) if reply.len >= proto_wire::HEADER_LEN && reply.handles.is_empty() => {
+                reply.words[0] as u32
+            }
+            _ => proto_process::PERMISSION,
+        }
     }
 
     /// READ_AT, READ_INTO and INFO_FD use the image session's retained inode at fd0.
@@ -2603,13 +2614,19 @@ impl Service<0> for Fs {
                     return status(proto_fs::ACCESS_DENIED);
                 }
                 let write = mode == 2 && flags & proto_fs::APPEND == 0;
-                let Some(pid) = s.data.binding.snapshot_ref().map(|who| who.pid) else {
+                let Some((pid, image)) = s
+                    .data
+                    .binding
+                    .snapshot_ref()
+                    .map(|who| (who.pid, who.image))
+                else {
                     return status(proto_fs::PERMISSION);
                 };
-                if !self.tell_share_grant(pid, info.device, info.inode, write) {
-                    return status(proto_fs::PERMISSION);
+                match self.tell_share_grant(pid, image, info.device, info.inode, write) {
+                    0 => Answer::Status(Status::Ok),
+                    code if code == proto_process::AGAIN => status(proto_fs::NO_SPACE),
+                    _ => status(proto_fs::PERMISSION),
                 }
-                Answer::Status(Status::Ok)
             }
             Some(Method::CloseEvent) => {
                 if !r.handles.is_empty() {

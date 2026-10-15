@@ -1086,12 +1086,18 @@ impl Processes {
         // The file service vouched that the caller has the file open (a
         // ShareGrant); without it nothing of the file's memory is the
         // caller's. A caller that may not write gets no right to write.
-        let Some(write) = self.shares.granted(index, key) else {
+        // A Put needs none: the caller reserved the entry as a writer. The
+        // other two use up the grant.
+        let granted = self.shares.granted(index, key);
+        let Some(write) = granted.or((operation == proto_process::SHARE_PUT).then_some(true))
+        else {
             return refuse(proto_process::PERMISSION);
         };
         match operation {
             proto_process::SHARE_GET if r.handles.is_empty() => {
-                let (kind, found) = match self.shares.get(key, index, write) {
+                let result = self.shares.get(key, index, write);
+                let busy = matches!(result, Got::Busy);
+                let (kind, found) = match result {
                     Got::Found(pages, memory) => {
                         let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
                         if write {
@@ -1106,6 +1112,9 @@ impl Processes {
                     Got::Full => (proto_process::SHARED_FULL, None),
                     Got::Busy => (proto_process::SHARED_BUSY, None),
                 };
+                if !busy {
+                    self.shares.revoke(index, key);
+                }
                 let pages = found.as_ref().map_or(0, |(pages, _)| *pages);
                 if r.reply().u32(0).is_err()
                     || r.reply().u32(kind).is_err()
@@ -1128,11 +1137,12 @@ impl Processes {
                     return refuse(proto_process::PERMISSION);
                 };
                 if operation == proto_process::SHARE_PUT {
-                    if !write || self.shares.put(key, index, pages, memory).is_err() {
+                    if self.shares.put(key, index, pages, memory).is_err() {
                         return refuse(proto_process::PERMISSION);
                     }
                 } else {
-                    self.shares.attach(key, index, pages, memory);
+                    self.shares.attach(key, index, pages, memory, write);
+                    self.shares.revoke(index, key);
                 }
                 Answer::Status(Status::Ok)
             }
@@ -2917,16 +2927,28 @@ impl Processes {
             return refuse(proto_process::PERMISSION);
         }
         let mut body = r.body();
-        let (Ok(pid), Ok(key), Ok(write), Ok(())) =
-            (body.u32(), body.u64(), body.u32(), body.finish())
-        else {
+        let (Ok(pid), Ok(key), Ok(write), Ok(image), Ok(())) = (
+            body.u32(),
+            body.u64(),
+            body.u32(),
+            body.u32(),
+            body.finish(),
+        ) else {
             return Answer::Status(Status::BadSize);
         };
         let Some(record) = self.records.find_pid(pid) else {
             return refuse(proto_process::NO_PROCESS);
         };
-        self.shares.grant(record, key, write != 0);
-        Answer::Status(Status::Ok)
+        // The grant of an image that exec replaced while the request was on
+        // its way is not the new image's.
+        if self.records.get(record).map(|r| r.image) != Some(image) {
+            return refuse(proto_process::PERMISSION);
+        }
+        if self.shares.grant(record, key, write != 0) {
+            Answer::Status(Status::Ok)
+        } else {
+            refuse(proto_process::AGAIN)
+        }
     }
 
     /// SetId through a notary session with SET_ID: kept for the loader's

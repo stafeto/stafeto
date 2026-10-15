@@ -47,23 +47,27 @@ struct Entry<T> {
     users: [u64; WORDS],
 }
 
-/// The grants at most; a grant that finds the table full takes the place of
-/// the oldest.
+/// The grants at most, and the most one process holds: a grant is for one
+/// Get or Attach that follows at once, so two serve the threads of a
+/// process, and a process never takes the places of the others.
 pub const GRANTS: usize = 64;
+pub const GRANTS_PER_PROCESS: usize = 2;
 
 /// What a file service said of a process: it may map the shared memory of
-/// the file of `key`, for writing when `write`.
+/// the file of `key`, for writing when `write`. Used once.
 #[derive(Clone, Copy)]
 struct Grant {
     record: u16,
     key: u64,
     write: bool,
+    /// When it came, to find a process's oldest.
+    age: u32,
 }
 
 pub struct Shares<T> {
     entries: [Option<Entry<T>>; SHARES],
     grants: [Option<Grant>; GRANTS],
-    next_grant: usize,
+    ages: u32,
 }
 
 impl<T> Shares<T> {
@@ -71,25 +75,54 @@ impl<T> Shares<T> {
         Shares {
             entries: [const { None }; SHARES],
             grants: [const { None }; GRANTS],
-            next_grant: 0,
+            ages: 0,
         }
     }
 
     /// The file service vouches that the process in `record` has the file
-    /// of `key` open: for reading, and for writing when `write`.
-    pub fn grant(&mut self, record: usize, key: u64, write: bool) {
+    /// of `key` open: for reading, and for writing when `write`. A process
+    /// that holds its two grants loses its oldest to the new one; the table
+    /// full of other processes' grants refuses (false), and none of theirs
+    /// is touched.
+    pub fn grant(&mut self, record: usize, key: u64, write: bool) -> bool {
         let record = record as u16;
+        self.ages = self.ages.wrapping_add(1);
+        let own = |g: &Option<Grant>| g.is_some_and(|g| g.record == record);
         let place = self
             .grants
             .iter()
             .position(|g| g.is_some_and(|g| g.record == record && g.key == key))
-            .or_else(|| self.grants.iter().position(Option::is_none))
-            .unwrap_or_else(|| {
-                let place = self.next_grant;
-                self.next_grant = (place + 1) % GRANTS;
-                place
-            });
-        self.grants[place] = Some(Grant { record, key, write });
+            .or_else(|| {
+                (self.grants.iter().filter(|g| own(g)).count() >= GRANTS_PER_PROCESS).then(|| {
+                    self.grants
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, g)| own(g))
+                        .max_by_key(|(_, g)| self.ages.wrapping_sub(g.expect("own").age))
+                        .map(|(i, _)| i)
+                        .expect("two own grants")
+                })
+            })
+            .or_else(|| self.grants.iter().position(Option::is_none));
+        let Some(place) = place else {
+            return false;
+        };
+        self.grants[place] = Some(Grant {
+            record,
+            key,
+            write,
+            age: self.ages,
+        });
+        true
+    }
+
+    /// The grant is used: it is gone.
+    pub fn revoke(&mut self, record: usize, key: u64) {
+        for grant in &mut self.grants {
+            if grant.is_some_and(|g| usize::from(g.record) == record && g.key == key) {
+                *grant = None;
+            }
+        }
     }
 
     /// Whether the process in `record` may map the file of `key`: Some(write).
@@ -163,8 +196,10 @@ impl<T> Shares<T> {
     }
 
     /// A process that maps an object it has already (a forked child) joins
-    /// the entry of its key, which it makes when the entry went meanwhile.
-    pub fn attach(&mut self, key: u64, record: usize, pages: u32, memory: T) {
+    /// the entry of its key. It makes the entry when that went meanwhile, but
+    /// only if it may write the file: a reader's object, whatever rights its
+    /// handle has, is not what writers are to get.
+    pub fn attach(&mut self, key: u64, record: usize, pages: u32, memory: T, write: bool) {
         match self.find(key) {
             Some(i) => {
                 let entry = self.entries[i].as_mut().expect("an entry");
@@ -173,6 +208,9 @@ impl<T> Shares<T> {
                 }
             }
             None => {
+                if !write {
+                    return;
+                }
                 if let Some(place) = self.entries.iter().position(Option::is_none) {
                     let mut entry = Entry {
                         key,
@@ -283,23 +321,47 @@ mod tests {
     fn grants_belong_to_a_process_and_a_file() {
         let mut t = Shares::<u32>::new();
         assert_eq!(t.granted(1, 9), None);
-        t.grant(1, 9, false);
-        t.grant(2, 9, true);
+        assert!(t.grant(1, 9, false));
+        assert!(t.grant(2, 9, true));
         assert_eq!(t.granted(1, 9), Some(false));
         assert_eq!(t.granted(2, 9), Some(true));
         assert_eq!(t.granted(1, 8), None);
-        t.grant(1, 9, true);
+        assert!(t.grant(1, 9, true));
         assert_eq!(t.granted(1, 9), Some(true));
         assert_eq!(t.get(9, 1, false), Got::Full, "a reader makes no entry");
         assert!(t.is_empty());
         t.drop_user(1);
         assert_eq!(t.granted(1, 9), None);
         assert_eq!(t.granted(2, 9), Some(true));
-        for key in 0..GRANTS as u64 + 3 {
-            t.grant(5, 1000 + key, false);
+        // A process holds two; its third takes the place of its oldest.
+        assert!(t.grant(5, 1000, false));
+        assert!(t.grant(5, 1001, false));
+        assert!(t.grant(5, 1002, false));
+        assert_eq!(t.granted(5, 1000), None);
+        assert_eq!(t.granted(5, 1001), Some(false));
+        assert_eq!(t.granted(5, 1002), Some(false));
+        // A grant is used once.
+        t.revoke(5, 1001);
+        assert_eq!(t.granted(5, 1001), None);
+        // The table full of other processes' grants refuses a new process
+        // and takes nothing of theirs.
+        let mut t = Shares::<u32>::new();
+        for record in 0..GRANTS / GRANTS_PER_PROCESS {
+            for k in 0..GRANTS_PER_PROCESS as u64 {
+                assert!(t.grant(record, 500 + k, true));
+            }
         }
-        assert_eq!(t.granted(5, 1000), None, "the oldest made room");
-        assert_eq!(t.granted(5, 1000 + GRANTS as u64 + 2), Some(false));
+        assert!(!t.grant(200, 1, false), "no place");
+        for record in 0..GRANTS / GRANTS_PER_PROCESS {
+            assert_eq!(t.granted(record, 500), Some(true));
+            assert_eq!(t.granted(record, 501), Some(true));
+        }
+        // A reader's attach makes no entry; a writer's does.
+        let mut t = Shares::<u32>::new();
+        t.attach(7, 1, 1, 70, false);
+        assert!(t.is_empty());
+        t.attach(7, 1, 1, 70, true);
+        assert_eq!(t.len(), 1);
     }
 
     /// A full table makes the caller go without registering; an attach of a
@@ -312,9 +374,9 @@ mod tests {
         }
         assert_eq!(t.get(1, 1, true), Got::Full);
         t.detach(100, 1);
-        t.attach(100, 2, 3, 33);
+        t.attach(100, 2, 3, 33, true);
         assert_eq!(t.get(100, 3, true), Got::Found(3, &33));
-        t.attach(100, 4, 9, 77);
+        t.attach(100, 4, 9, 77, true);
         assert_eq!(
             t.get(100, 5, true),
             Got::Found(3, &33),
