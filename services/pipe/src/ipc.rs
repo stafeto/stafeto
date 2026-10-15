@@ -483,6 +483,12 @@ fn split_id(id: u64) -> Option<(usize, u32)> {
     (v < 1 << 21).then_some(((v & 31) as usize, (v >> 5) as u32))
 }
 
+impl Default for Ipc {
+    fn default() -> Self {
+        Ipc::new()
+    }
+}
+
 impl Ipc {
     pub const fn new() -> Ipc {
         Ipc {
@@ -1243,11 +1249,12 @@ impl Ipc {
         let era = self.sems[s].era;
         let undo_before = self.undo;
         for &(num, delta, flags) in &ops[..count] {
-            if flags & SEM_UNDO != 0 && delta != 0 {
-                if let Err(e) = self.undo_add(label, s, era, num, -(delta as i32)) {
-                    self.undo = undo_before;
-                    return Err(e);
-                }
+            if flags & SEM_UNDO != 0
+                && delta != 0
+                && let Err(e) = self.undo_add(label, s, era, num, -(delta as i32))
+            {
+                self.undo = undo_before;
+                return Err(e);
             }
         }
         let set = &mut self.sems[s];
@@ -2541,7 +2548,7 @@ mod tests {
         assert_eq!(st.words[1], 1000);
         assert_eq!(st.words[4], 100);
         assert_eq!(st.words[5], 0o640);
-        assert_eq!(st.words[11 + 0], 0);
+        assert_eq!(st.words[11], 0);
         r.ok(&mut p, op::MSG_CTL, &with_cred(&[id, IPC_RMID]), b"");
         assert_eq!(
             r.err(&mut p, op::MSG_CTL, &with_cred(&[id, IPC_STAT]), b""),
