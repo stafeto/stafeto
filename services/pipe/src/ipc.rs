@@ -444,6 +444,8 @@ pub struct Ipc {
     undo: [Undo; UNDO_MAX],
     holds: [Hold; HOLD_MAX],
     blocked: [Blocked; BLOCKED_MAX],
+    /// The places of `blocked` in use: the common case, none, costs nothing.
+    counted: u8,
     dying: u16,
     serial: u32,
 }
@@ -499,6 +501,7 @@ impl Ipc {
             undo: [UNDO_FREE; UNDO_MAX],
             holds: [HOLD_FREE; HOLD_MAX],
             blocked: [BLOCKED_FREE; BLOCKED_MAX],
+            counted: 0,
             dying: 0,
             serial: 0,
         }
@@ -833,6 +836,7 @@ impl Ipc {
             return;
         }
         if let Some(at) = self.blocked.iter().position(|b| !b.used) {
+            self.counted += 1;
             self.blocked[at] = Blocked {
                 used: true,
                 label,
@@ -845,18 +849,26 @@ impl Ipc {
 
     /// The operation (`label`, `key`) waits no more.
     pub fn wait_done(&mut self, label: u64, key: u64) {
+        if self.counted == 0 {
+            return;
+        }
         for b in &mut self.blocked {
             if b.used && b.label == label && b.key == key {
                 *b = BLOCKED_FREE;
+                self.counted -= 1;
             }
         }
     }
 
     /// Every operation of the session waits no more.
     pub fn forget(&mut self, label: u64) {
+        if self.counted == 0 {
+            return;
+        }
         for b in &mut self.blocked {
             if b.used && b.label == label {
                 *b = BLOCKED_FREE;
+                self.counted -= 1;
             }
         }
     }
