@@ -616,7 +616,10 @@ static int longest_steps(void) {
         CHECK(socketpair(AF_UNIX, kind, 0, pair) == 0);
         for (int round = 0; round < 3; round++) {
             for (int i = 0; i < 4; i++) CHECK(send_rights(pair[0], fds, 8, big, sizeof big) == (int)sizeof big);
+            /* The fifth message: a non-blocking socket is refused (a blocking one waits, see blocking_waits). */
+            CHECK(fcntl(pair[0], F_SETFL, O_NONBLOCK) == 0);
             CHECK(send_rights(pair[0], fds, 8, big, sizeof big) == -1 && errno == EAGAIN);
+            CHECK(fcntl(pair[0], F_SETFL, 0) == 0);
             for (int i = 0; i < 4; i++) {
                 CHECK(recv_rights(pair[1], fds, &n, back, sizeof back) == (int)sizeof back && n == 8);
                 for (int k = 0; k < n; k++) if (fds[k] != pp[1]) close(fds[k]);
@@ -726,6 +729,102 @@ static int names_of_the_net(void) {
     return 0;
 }
 
+/* A pipe end sent in a message and a socket that sends a socket: no cycle keeps a slot. */
+static int rights_cycle(void) {
+    int sv[2];
+    for (int round = 0; round < 40; round++) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        int y = sv[1];
+        CHECK(send_rights(sv[0], &y, 1, "c", 1) == -1 && errno == ETOOMANYREFS);
+        close(sv[0]); close(sv[1]);
+    }
+    /* y holds a message with a description: it does not travel on. */
+    int ab[2], cd[2], pp[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, ab) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, cd) == 0 && pipe(pp) == 0);
+    CHECK(send_rights(ab[0], &pp[1], 1, "1", 1) == 1);
+    CHECK(send_rights(cd[0], &ab[1], 1, "2", 1) == -1 && errno == ETOOMANYREFS);
+    /* A socket in flight does not receive one: cd[1] travels over ab; cd[0] cannot carry anything to it. */
+    CHECK(send_rights(ab[0], &cd[1], 1, "3", 1) == 1);
+    CHECK(send_rights(cd[0], &ab[0], 1, "4", 1) == -1 && errno == ETOOMANYREFS);
+    close(ab[0]); close(ab[1]); close(cd[0]); close(cd[1]); close(pp[0]); close(pp[1]);
+    pause_ms(100);
+    /* Every slot is back: eight pairs at least fit the share of a session. */
+    int held[20];
+    int made = 0;
+    for (int i = 0; i < 10; i++) { if (socketpair(AF_UNIX, SOCK_DGRAM, 0, &held[2 * i]) != 0) break; made++; }
+    for (int i = 0; i < 2 * made; i++) close(held[i]);
+    CHECK(made >= 8);
+    return 0;
+}
+
+/* A blocking send waits where a non-blocking one is refused: a datagram into a full buffer, a message
+   with descriptions behind four others, and a long write to a slow reader. */
+static int blocking_waits(void) {
+    int sv[2], pp[2], status;
+    char block[800], back[800];
+    memset(block, 'd', sizeof block);
+    CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        close(sv[0]);
+        pause_ms(100);
+        for (int i = 0; i < 12; i++) if (read(sv[1], back, sizeof back) != 800) _exit(1);
+        _exit(0);
+    }
+    close(sv[1]);
+    for (int i = 0; i < 12; i++) CHECK(send(sv[0], block, sizeof block, 0) == 800);
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(sv[0]);
+    CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    for (int i = 0; i < 5; i++) CHECK(send(sv[0], block, sizeof block, MSG_DONTWAIT) == 800 || i == 4);
+    CHECK(send(sv[0], block, sizeof block, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    close(sv[0]); close(sv[1]);
+    /* Messages with descriptions: the sixth waits for the reader. */
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && pipe(pp) == 0);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        close(sv[0]);
+        pause_ms(100);
+        for (int i = 0; i < 6; i++) {
+            int fd[1], n;
+            char c;
+            if (recv_rights(sv[1], fd, &n, &c, 1) != 1 || n != 1) _exit(1);
+            close(fd[0]);
+        }
+        _exit(0);
+    }
+    close(sv[1]);
+    for (int i = 0; i < 6; i++) CHECK(send_rights(sv[0], &pp[1], 1, "m", 1) == 1);
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(sv[0]); close(pp[0]); close(pp[1]);
+    /* 64 KiB in one call to a reader that is slow, by write and by send. */
+    static char data[65536], got[65536];
+    for (unsigned i = 0; i < sizeof data; i++) data[i] = (char)(i * 7 + (i >> 8));
+    for (int how = 0; how < 2; how++) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            close(sv[0]);
+            unsigned total = 0;
+            ssize_t k;
+            while (total < sizeof got && (k = read(sv[1], got + total, 1000)) > 0) {
+                total += (unsigned)k;
+                pause_ms(1);
+            }
+            _exit(total == sizeof got && memcmp(got, data, sizeof data) == 0 ? 0 : 1);
+        }
+        close(sv[1]);
+        ssize_t sent = how ? send(sv[0], data, sizeof data, 0) : write(sv[0], data, sizeof data);
+        CHECK(sent == (ssize_t)sizeof data);
+        CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        close(sv[0]);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argv;
     /* A file-loaded image supplies the region map required by fork. */
@@ -748,6 +847,8 @@ int main(int argc, char **argv) {
     RUN(readiness);
     RUN(scm_rights);
     RUN(across_fork);
+    RUN(rights_cycle);
+    RUN(blocking_waits);
     RUN(names_of_the_net);
     RUN(longest_steps);
     printf("posix-sock: ok\n");

@@ -101,6 +101,8 @@ pub const NOT_SOCKET: u32 = 719;
 pub const UNREACHABLE: u32 = 720;
 /// EAFNOSUPPORT.
 pub const NO_FAMILY: u32 = 721;
+/// ETOOMANYREFS: a send that would make a cycle of descriptions in flight.
+pub const TOO_MANY_REFS: u32 = 722;
 
 pub const ADDR_NONE: u32 = 0;
 pub const ADDR_INET: u32 = 1;

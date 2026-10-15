@@ -319,9 +319,10 @@ impl PipeService {
         key: Option<u64>,
         endpoint: Endpoint,
         notify: Option<Handle<Channel>>,
+        queue: Option<u32>,
     ) -> Answer {
         let label = s.label();
-        let end = match self.pipes.queue_end(endpoint) {
+        let end = match queue.map_or_else(|| self.pipes.queue_end(endpoint), Ok) {
             Ok(end) => end,
             Err(code) => return status(code),
         };
@@ -407,7 +408,7 @@ impl PipeService {
                 self.finish(s, read.key, read.end);
                 status(code)
             }
-            Ok(None) => self.wait(s, r, read.key, endpoint, notify),
+            Ok(None) => self.wait(s, r, read.key, endpoint, notify, None),
         }
     }
 
@@ -443,7 +444,7 @@ impl PipeService {
                 self.finish(s, write.key, write.end);
                 status(code)
             }
-            Ok(None) => self.wait(s, r, write.key, endpoint, notify),
+            Ok(None) => self.wait(s, r, write.key, endpoint, notify, None),
         }
     }
 
@@ -795,7 +796,7 @@ impl PipeService {
                 self.finish(s, key, endpoint.id);
                 status(code)
             }
-            Ok(None) => self.wait(s, r, key, endpoint, notify),
+            Ok(None) => self.wait(s, r, key, endpoint, notify, None),
         }
     }
 
@@ -838,7 +839,10 @@ impl PipeService {
                 self.finish(s, send.key, endpoint.id);
                 status(code)
             }
-            Ok(None) => self.wait(s, r, send.key, endpoint, notify),
+            Ok(None) => {
+                let queue = self.pipes.send_queue(&s.data.held, endpoint, &send.to).ok();
+                self.wait(s, r, send.key, endpoint, notify, queue)
+            }
         }
     }
 
@@ -892,7 +896,7 @@ impl PipeService {
                 self.finish(s, recv.key, endpoint.id);
                 status(code)
             }
-            Ok(None) => self.wait(s, r, recv.key, endpoint, notify),
+            Ok(None) => self.wait(s, r, recv.key, endpoint, notify, None),
         }
     }
 

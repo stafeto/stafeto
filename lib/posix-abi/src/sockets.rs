@@ -67,6 +67,7 @@ const EPROTOTYPE: i32 = 91;
 const ENOPROTOOPT: i32 = 92;
 const EPROTONOSUPPORT: i32 = 93;
 const EAFNOSUPPORT: i32 = 97;
+const ETOOMANYREFS: i32 = 109;
 const EADDRINUSE: i32 = 98;
 const EADDRNOTAVAIL: i32 = 99;
 const ENETUNREACH: i32 = 101;
@@ -101,6 +102,7 @@ pub(crate) fn refusal(status: Status) -> Option<i32> {
         proto_pipe::sock::NOT_SOCKET => ENOTSOCK,
         proto_pipe::sock::UNREACHABLE => ENETUNREACH,
         proto_pipe::sock::NO_FAMILY => EAFNOSUPPORT,
+        proto_pipe::sock::TOO_MANY_REFS => ETOOMANYREFS,
         _ => return None,
     })
 }
@@ -723,12 +725,10 @@ pub fn send(
             let n = gather(iov, done, &mut piece);
             let with = if done == 0 { &ids[..nfds] } else { &[][..] };
             match send_once(&pipes, end, wire, with, &to, &piece[..n]) {
-                Ok(sent) => {
-                    done += sent;
-                    if sent < n {
-                        break;
-                    }
-                }
+                // A short count goes on: the next call waits for room, or says
+                // EAGAIN (a non-blocking socket), which ends the send with
+                // the bytes that went.
+                Ok(sent) => done += sent,
                 Err(_) if done > 0 => break,
                 Err(errno) => return Err(errno),
             }

@@ -23,7 +23,7 @@ use proto_pipe::sock::{
     DONTWAIT, FDS_MAX, IN_USE, INET, NO_BUFFERS, NO_DESTINATION, NO_FAMILY, NO_OPTION,
     NOT_CONNECTED, NOT_SUPPORTED, OOB, OPT_ACCEPTCONN, OPT_ATMARK, OPT_BROADCAST, OPT_DOMAIN,
     OPT_ERROR, OPT_KEEPALIVE, OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC,
-    OUT_TRUNC, PEEK, REFUSED, RING, SEND_MAX, STREAM, TOO_BIG, UNIX,
+    OUT_TRUNC, PEEK, REFUSED, RING, SEND_MAX, STREAM, TOO_BIG, TOO_MANY_REFS, UNIX,
 };
 use proto_wire::{Reader, Writer};
 
@@ -104,6 +104,8 @@ pub(super) struct Sock {
     oob: bool,
     oob_byte: u8,
     oob_at: u32,
+    /// How many messages in flight carry this socket.
+    flying: u16,
 }
 
 impl Sock {
@@ -144,6 +146,7 @@ impl Sock {
         oob: false,
         oob_byte: 0,
         oob_at: 0,
+        flying: 0,
     };
 }
 
@@ -224,6 +227,16 @@ impl Sockets {
         let s = &mut self.s[i];
         s.head = ((usize::from(s.head) + n) % RING) as u16;
         s.len -= n as u16;
+    }
+
+    /// The message `anc` is out of flight.
+    fn unfly(&mut self, anc: &Anc) {
+        for &id in &anc.ids[..usize::from(anc.n)] {
+            if id & SOCK_END != 0 {
+                let s = &mut self.s[(id & !SOCK_END) as usize];
+                s.flying = s.flying.saturating_sub(1);
+            }
+        }
     }
 
     fn anc_pop(&mut self, i: usize) -> Anc {
@@ -770,7 +783,7 @@ impl Pipes {
     ) -> Result<Option<usize>, u32> {
         let i = self.sock_slot(held, endpoint)?;
         let nonblock = self.sockets.s[i].nonblock || flags & DONTWAIT != 0;
-        if bytes.len() > SEND_MAX {
+        if self.sockets.s[i].kind == DGRAM && bytes.len() > SEND_MAX {
             return Err(TOO_BIG);
         }
         if !fds.is_empty() {
@@ -790,7 +803,7 @@ impl Pipes {
         } else if flags & OOB != 0 {
             Err(NOT_SUPPORTED)
         } else {
-            self.dgram_send(i, fds, to, bytes, wakes)
+            self.dgram_send(i, nonblock, fds, to, bytes, wakes)
         }
     }
 
@@ -838,7 +851,10 @@ impl Pipes {
             return if nonblock { Err(AGAIN) } else { Ok(None) };
         }
         if !fds.is_empty() {
-            self.enqueue_fds(p, fds)?;
+            match self.enqueue_fds(p, fds) {
+                Err(AGAIN) if !nonblock => return Ok(None),
+                other => other?,
+            }
         }
         self.sockets.put(p, &bytes[..n]);
         self.sockets.s[p].tx_total = self.sockets.s[p].tx_total.wrapping_add(n as u32);
@@ -855,6 +871,17 @@ impl Pipes {
     /// The message of `fds` for `p`: AGAIN where its list of messages or the
     /// service's room for descriptions in flight is full.
     fn enqueue_fds(&mut self, p: usize, fds: &[u32]) -> Result<(), u32> {
+        // A socket cannot travel in its own message, with descriptions of its
+        // own in flight, or to a socket that travels itself: such a cycle
+        // would keep its sockets for ever.
+        for &id in fds {
+            if id & SOCK_END != 0 {
+                let s = (id & !SOCK_END) as usize;
+                if s == p || self.sockets.s[s].anc_len != 0 || self.sockets.s[p].flying != 0 {
+                    return Err(TOO_MANY_REFS);
+                }
+            }
+        }
         if usize::from(self.sockets.s[p].anc_len) >= ANC_MAX {
             return Err(AGAIN);
         }
@@ -869,6 +896,9 @@ impl Pipes {
         for (slot, &id) in anc.ids.iter_mut().zip(fds) {
             *slot = id;
             self.desc_ref(id);
+            if id & SOCK_END != 0 {
+                self.sockets.s[(id & !SOCK_END) as usize].flying += 1;
+            }
         }
         self.sockets.inflight += fds.len();
         let s = &mut self.sockets.s[p];
@@ -880,6 +910,7 @@ impl Pipes {
     fn dgram_send(
         &mut self,
         i: usize,
+        nonblock: bool,
         fds: &[u32],
         to: &Addr,
         bytes: &[u8],
@@ -917,12 +948,18 @@ impl Pipes {
         if self.sockets.room(t) < total {
             return if self.sockets.s[i].domain == INET {
                 Ok(Some(bytes.len()))
-            } else {
+            } else if nonblock {
                 Err(AGAIN)
+            } else {
+                // Waits at the receiver, whose reads tell it.
+                Ok(None)
             };
         }
         if !fds.is_empty() {
-            self.enqueue_fds(t, fds)?;
+            match self.enqueue_fds(t, fds) {
+                Err(AGAIN) if !nonblock => return Ok(None),
+                other => other?,
+            }
         }
         let mut record = [0u8; 4];
         record[..2].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
@@ -933,6 +970,20 @@ impl Pipes {
         self.sockets.s[t].tx_total = self.sockets.s[t].tx_total.wrapping_add(1);
         wakes.add(self.sockets.s[t].waiters.waiters);
         Ok(Some(bytes.len()))
+    }
+
+    /// The queue a send that waits is told at: the receiver's, for a
+    /// datagram, whose reads free the room; else the socket's own.
+    pub fn send_queue(&self, held: &Held, endpoint: Endpoint, to: &Addr) -> Result<u32, u32> {
+        let i = self.sock_slot(held, endpoint)?;
+        let target = if self.sockets.s[i].kind != DGRAM {
+            None
+        } else if to.kind != ADDR_NONE {
+            self.lookup(i, to)
+        } else {
+            self.sockets.peer_of(i)
+        };
+        Ok(DESCRIPTIONS as u32 + target.unwrap_or(i) as u32)
     }
 
     /// RECV into `out`: None to wait. The descriptions that arrive join
@@ -1039,6 +1090,7 @@ impl Pipes {
             s.rx_total = s.rx_total.wrapping_add(step);
             if has_fds {
                 let anc = self.sockets.anc_pop(i);
+                self.sockets.unfly(&anc);
                 self.sockets.inflight -= usize::from(anc.n);
                 for (k, &id) in anc.ids[..usize::from(anc.n)].iter().enumerate() {
                     if k >= max_fds {
@@ -1060,6 +1112,10 @@ impl Pipes {
             }
             if let Some(p) = self.sockets.peer_of(i) {
                 wakes.add(self.sockets.s[p].waiters.waiters);
+            }
+            if self.sockets.s[i].kind == DGRAM {
+                // Senders that wait for room in this buffer wait here.
+                wakes.add(self.sockets.s[i].waiters.waiters);
             }
         }
         result.fds = deliver;
@@ -1197,6 +1253,7 @@ impl Pipes {
             }
         }
         for a in &anc[..anc_len] {
+            self.sockets.unfly(a);
             for &id in &a.ids[..usize::from(a.n)] {
                 self.sockets.limbo_push(id);
             }
@@ -1669,11 +1726,94 @@ mod tests {
             p.sock_send(&held, sock(a), 0, &[rd], &Addr::NONE, b"m", &mut w)
                 .unwrap();
         }
+        // A blocking send waits for the reader; a non-blocking one is refused.
         assert_eq!(
             p.sock_send(&held, sock(a), 0, &[rd], &Addr::NONE, b"m", &mut w),
+            Ok(None)
+        );
+        assert_eq!(
+            p.sock_send(&held, sock(a), DONTWAIT, &[rd], &Addr::NONE, b"m", &mut w),
             Err(AGAIN)
         );
         assert_eq!(p.in_flight(), ANC_MAX);
+    }
+
+    #[test]
+    fn a_cycle_of_sockets_in_flight_is_refused() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let mut w = Wakes::default();
+        let (x, y) = p.sock_pair(&mut held, 1, 1, UNIX, STREAM, 0).unwrap();
+        let (x, y) = (sock(x), sock(y));
+        // y in a message to y itself.
+        assert_eq!(
+            p.sock_send(&held, x, 0, &[y.id], &Addr::NONE, b"c", &mut w),
+            Err(TOO_MANY_REFS)
+        );
+        // y holds an unread message with a description: y cannot travel.
+        let (u, v) = p.sock_pair(&mut held, 1, 1, UNIX, STREAM, 0).unwrap();
+        let (u, v) = (sock(u), sock(v));
+        let (rd, wr) = p.create(&mut held, 1, 1, 0).unwrap();
+        let _ = rd;
+        p.sock_send(&held, x, 0, &[wr], &Addr::NONE, b"1", &mut w)
+            .unwrap();
+        assert_eq!(
+            p.sock_send(&held, u, 0, &[y.id], &Addr::NONE, b"2", &mut w),
+            Err(TOO_MANY_REFS)
+        );
+        // A socket in flight cannot receive one: n travels to v, and m,
+        // its peer, cannot carry u to it.
+        let (m, n) = p.sock_pair(&mut held, 1, 1, UNIX, STREAM, 0).unwrap();
+        let (m, n) = (sock(m), sock(n));
+        assert_eq!(
+            p.sock_send(&held, u, 0, &[n.id], &Addr::NONE, b"3", &mut w),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            p.sock_send(&held, m, 0, &[u.id], &Addr::NONE, b"4", &mut w),
+            Err(TOO_MANY_REFS)
+        );
+        let _ = v;
+        // Everything goes with the sockets.
+        for e in [x, y, u, v, m, n] {
+            p.sock_close(&mut held, e, &mut w).unwrap();
+        }
+        while p.work_due() {
+            p.step(&mut w);
+        }
+        assert_eq!((p.live_sockets(), p.in_flight()), (0, 0));
+    }
+
+    #[test]
+    fn a_blocking_datagram_send_to_a_full_buffer_waits_at_the_receiver() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let mut w = Wakes::default();
+        let (c, d) = p.sock_pair(&mut held, 1, 1, UNIX, DGRAM, 0).unwrap();
+        let (c, d) = (sock(c), sock(d));
+        let big = [1u8; SEND_MAX];
+        let mut sent = 0;
+        while let Ok(Some(_)) = p.sock_write(&held, c, &big, &mut w) {
+            sent += 1;
+        }
+        assert!(sent >= 4);
+        assert_eq!(p.sock_write(&held, c, &big, &mut w), Ok(None));
+        assert_eq!(
+            p.send_queue(&held, c, &Addr::NONE),
+            Ok(DESCRIPTIONS as u32 + d.slot() as u32)
+        );
+        p.sock_set_flags(&held, c, NONBLOCK).unwrap();
+        assert_eq!(p.sock_write(&held, c, &big, &mut w), Err(AGAIN));
+        p.wait_new(DESCRIPTIONS as u32 + d.slot() as u32, (4, 4), |_| true)
+            .unwrap();
+        let mut out = [0; SEND_MAX];
+        let mut w2 = Wakes::default();
+        assert!(
+            p.sock_recv(&mut held, d, 0, &mut out, 0, &mut w2)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(woke(&w2), [(4, 4)], "the read tells the waiting sender");
     }
 
     #[test]
