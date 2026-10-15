@@ -785,7 +785,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 11] = [
         "busybox-probe",
         "busybox-probe",
         POSIX_STACK_SIZE,
-        &["ash-interactive"],
+        &["ash-interactive", "utilities"],
     ),
     ("tty", "tty", TTY_STACK_SIZE, &[]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),

@@ -17,7 +17,7 @@ fn main() {
         .unwrap_or_else(|| {
             // The shell image of the utilities has the BusyBox of all the
             // applets of XCU (tools/build-busybox.py); the probes the small one.
-            let utilities = env::var_os("CARGO_FEATURE_ASH_INTERACTIVE").is_some();
+            let utilities = env::var_os("CARGO_FEATURE_UTILITIES").is_some();
             let name = if utilities {
                 "busybox-utils"
             } else {
@@ -55,7 +55,7 @@ fn main() {
     // program keeps no debug sections, which would be most of an ELF file that
     // has to fit the RAM file service (8 MiB at most). The small one of the
     // probes keeps them, as before.
-    if env::var_os("CARGO_FEATURE_ASH_INTERACTIVE").is_some() {
+    if env::var_os("CARGO_FEATURE_UTILITIES").is_some() {
         println!("cargo:rustc-link-arg-bins=--strip-debug");
     }
     println!("cargo:rustc-link-search=native={}", out.display());

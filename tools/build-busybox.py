@@ -58,6 +58,35 @@ def relibc_commit() -> str:
 # Nothing of BusyBox's own is written here: an applet BusyBox lacks is not
 # provided (login-probe, the guest test of the C library, is the exception).
 EXCLUDED_OBJECTS = ("alloc_affinity.o",)
+# The small build keeps the objects of libbb it always had: the others pull
+# in more of relibc (syslog, and with it the time zone data) than the probes
+# have room for.
+BASE_OBJECTS = (
+    "appletlib.o", "xfuncs_printf.o", "xfuncs.o", "full_write.o",
+    "process_escape_sequence.o", "ptr_to_globals.o", "messages.o",
+    "verror_msg.o", "compare_string_array.o", "xfunc_die.o",
+    "perror_msg.o", "safe_write.o", "default_error_retval.o",
+    "bb_cat.o", "copyfd.o", "getopt32.o", "wfopen_input.o",
+    "read.o", "safe_strncpy.o", "llist.o", "xatonum.o",
+    "get_last_path_component.o",
+    "const_hack.o", "endofname.o", "bb_strtonum.o", "sysconf.o",
+    "parse_mode.o", "time.o", "signals.o", "read_printf.o",
+    "u_signal_names.o",
+    "safe_poll.o", "single_argv.o", "skip_whitespace.o", "bb_getgroups.o",
+    "common_bufsiz.o", "concat_path_file.o", "printable_string.o",
+    "xreadlink.o", "mode_string.o",
+    "last_char_is.o", "auto_string.o",
+    "vfork_daemon_rexec.o",
+    "wfopen.o", "fclose_nonstdin.o", "fflush_stdout_and_exit.o",
+    "perror_nomsg_and_die.o", "get_line_from_file.o",
+    # The applets on names (mv, rm, mkdir, ln, readlink).
+    "ask_confirmation.o", "make_directory.o", "copy_file.o", "inode_hash.o",
+    "concat_subpath_file.o", "isdirectory.o", "recursive_action.o", "xgetcwd.o",
+    "remove_file.o",
+    # nc: connections over the loopback of the socket service (Ф9).
+    "xconnect.o", "inet_common.o", "executable.o", "bb_do_delay.o",
+)
+
 # The directories BusyBox's archives come from; build.rs links each.
 DIRECTORIES = ("libbb", "coreutils", "coreutils/libcoreutils", "shell", "procps",
                "networking", "archival", "archival/libarchive", "editors",
@@ -137,7 +166,7 @@ def build(utilities: bool) -> None:
     script = sha256(Path(__file__).read_bytes()).hexdigest()
     own = sorted(OWN.rglob("*.c")) if utilities else []
     own_sources = sha256(b"".join(path.read_bytes() for path in own)).hexdigest()
-    config_stamp = f"{VERSION} {SHA256} {PATCH} {sha256(" ".join(EXCLUDED_OBJECTS + DIRECTORIES + names).encode()).hexdigest()} {compatibility} {own_sources} {script} relibc {relibc_commit()} unwind {" ".join(UNWIND_CFLAGS)}\n"
+    config_stamp = f"{VERSION} {SHA256} {PATCH} {sha256(" ".join(EXCLUDED_OBJECTS + BASE_OBJECTS + DIRECTORIES + names).encode()).hexdigest()} {compatibility} {own_sources} {script} relibc {relibc_commit()} unwind {" ".join(UNWIND_CFLAGS)}\n"
     if (STAMP.exists() and STAMP.read_text() == config_stamp
             and all((SOURCE / d / "lib.a").exists() for d in DIRECTORIES)):
         print(f"BusyBox objects ready: {SOURCE}")
@@ -212,9 +241,19 @@ def build(utilities: bool) -> None:
     for source in own:
         shutil.copy(source, SOURCE / source.relative_to(OWN))
     kbuild = SOURCE / "libbb/Kbuild.src"
-    dropped = {f"lib-y += {name}" for name in EXCLUDED_OBJECTS}
-    kbuild.write_text("\n".join(
-        line for line in kbuild.read_text().splitlines() if line.strip() not in dropped) + "\n")
+    if utilities:
+        dropped = {f"lib-y += {name}" for name in EXCLUDED_OBJECTS}
+        kbuild.write_text("\n".join(
+            line for line in kbuild.read_text().splitlines() if line.strip() not in dropped) + "\n")
+    else:
+        lines = [line for line in kbuild.read_text().splitlines()
+                 if not line.startswith("lib-y +=")]
+        lines.append("lib-y += " + " ".join(BASE_OBJECTS))
+        kbuild.write_text("\n".join(lines) + "\n")
+        for source in (SOURCE / "libbb").glob("*.c"):
+            content = source.read_text()
+            if "//kbuild:lib-y +=" in content:
+                source.write_text(content.replace("//kbuild:lib-y +=", "//disabled-kbuild:lib-y +="))
     run("make", "allnoconfig", cwd=SOURCE)
     config = SOURCE / ".config"
     replace(config, "# CONFIG_ECHO is not set", "CONFIG_ECHO=y")
@@ -271,10 +310,10 @@ def build(utilities: bool) -> None:
         "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-linux-gnu", "-nostdinc",
             f"-isystem {include}", f"-idirafter {COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
             "-ffunction-sections", "-fdata-sections", "-Dmain=applets_main",
+            A53_ERRATA, *UNWIND_CFLAGS,
             # clang reads a global that is const only once, before BusyBox sets
             # ptr_to_globals (awk, among others, then ran with a null pointer).
-            "-DBB_GLOBAL_CONST=",
-            A53_ERRATA, *UNWIND_CFLAGS)), cwd=SOURCE)
+            *(("-DBB_GLOBAL_CONST=",) if utilities else ()))), cwd=SOURCE)
     for archive in [SOURCE / d / "lib.a" for d in DIRECTORIES]:
         if not archive.exists():
             raise SystemExit(f"BusyBox did not produce {archive}")

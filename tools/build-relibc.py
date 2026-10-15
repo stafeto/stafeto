@@ -35,11 +35,11 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # the checks of mlock through the layer; tagged pin-42b71064.
 # F10 utilities: getlogin and getlogin_r from utmpx, syslog into
 # /var/log/messages, utmpx over /var/run/utmpx, the flush of every stream at
-# exit, the default PATH of execvp, mntent, wait3, sysinfo; tagged pin-cf5c9ccc.
+# exit, the default PATH of execvp, mntent, wait3, sysinfo; tagged pin-1187dd96.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "cf5c9cccf0ef5678668536f9413abdbee0733c11"
+COMMIT = "1187dd964416672a79b05469ddbf8aa0f1ff2c36"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
