@@ -5968,6 +5968,12 @@ fn ash_dialog() -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
+        // Every search through PATH tries each directory in turn, and the
+        // images of the failed attempts go back to the pool of the process
+        // service: 40 searches with three misses each end as the first did.
+        run.send("saved=$PATH; PATH=/miss1:/miss2:/miss3:$saved; i=0; while [ $i -lt 40 ]; do uname > /dev/null || break; i=$((i+1)); done; PATH=$saved; echo path-misses $i")?;
+        run.expect_line("path-misses 40", |line| line == "path-misses 40", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
         run.send("exit")?;
         run.expect("exit", DIALOG_STEP)?;
         run.expect(
