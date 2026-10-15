@@ -619,7 +619,6 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-spawn-churn.img",
     "boot-posix-sync.img",
     "boot-posix-math.img",
-    "boot-posix-ipc.img",
     "boot-posix-park.img",
     "boot-posix-fifo.img",
     "boot-posix-fifo-steps.img",
@@ -1018,7 +1017,7 @@ mod tests {
         // the directories above them (it refuses a file without its
         // parent).
         let wanted = sources(&files);
-        assert_eq!(wanted.len(), 14);
+        assert_eq!(wanted.len(), 15);
         let bytes = table(&files, 3, 3 + wanted.len() as u32 + 1).unwrap();
         let read = Rootfs::parse(&bytes, 3 + wanted.len() as u32 + 1).unwrap();
         for path in [
