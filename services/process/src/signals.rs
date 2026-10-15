@@ -79,6 +79,8 @@ pub struct Info {
     pub pid: u32,
     pub uid: u32,
     pub status: i32,
+    /// The bytes of sigval for SI_QUEUE and SI_TIMER, else 0.
+    pub value: u64,
 }
 
 /// Posts `signal` (1 to SIGNAL_MAX except SIGKILL, which the service carries
@@ -104,6 +106,7 @@ pub fn post(page: &Page, signal: u8, info: Info) -> Posted {
     slot.pid.store(info.pid, Ordering::Relaxed);
     slot.uid.store(info.uid, Ordering::Relaxed);
     slot.status.store(info.status, Ordering::Relaxed);
+    slot.value.store(info.value, Ordering::Relaxed);
     let previous = if let Some(c) = proto_process::job::class(signal) {
         let word = if signal == SIGCONT {
             &page.cont_word
@@ -240,6 +243,7 @@ mod tests {
             pid,
             uid: 1000,
             status: 0,
+            value: 0,
         };
         assert_eq!(post(&p, SIGCHLD, info(300)), Posted::Ignored);
         assert_eq!(p.pending.load(Ordering::Relaxed), 0);
@@ -288,11 +292,13 @@ mod tests {
             pid: 300,
             uid: 1000,
             status: 5,
+            value: 0,
         };
         let fresh = Info {
             pid: 301,
             uid: 1001,
             status: 6,
+            value: 0,
             ..old
         };
         assert_eq!(return_signal(&p, SIGUSR1, 8, old), None);
@@ -318,6 +324,7 @@ mod tests {
             pid: 300,
             uid: 1000,
             status: 0,
+            value: 0,
         };
         let fresh = Info { pid: 301, ..old };
         let (mut stop, mut cont) = (0, 0);
@@ -370,6 +377,7 @@ mod tests {
             pid: 2,
             uid: 0,
             status: 0,
+            value: 0,
         };
         assert_eq!(post(&forked, SIGHUP, info), Posted::Ignored);
         assert_eq!(forked.pending.load(Ordering::Relaxed), 0);

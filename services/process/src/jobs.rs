@@ -89,6 +89,7 @@ impl Processes {
                 pid,
                 uid,
                 status: i32::from(signal.unwrap_or(SIGCONT)),
+                value: 0,
             },
         );
     }
@@ -121,13 +122,14 @@ impl Processes {
     /// the sole publisher of process information, including this slow path.
     pub(super) fn return_signal(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
-        let (Ok(signal), Ok(ticket), Ok(code), Ok(pid), Ok(uid), Ok(status), Ok(())) = (
+        let (Ok(signal), Ok(ticket), Ok(code), Ok(pid), Ok(uid), Ok(status), Ok(value), Ok(())) = (
             body.u32(),
             body.u64(),
             body.u32(),
             body.u32(),
             body.u32(),
             body.u32(),
+            body.u64(),
             body.finish(),
         ) else {
             return Answer::Status(Status::BadSize);
@@ -153,6 +155,7 @@ impl Processes {
                 pid,
                 uid,
                 status: status as i32,
+                value,
             },
         ) == Some(Posted::Pending)
         {

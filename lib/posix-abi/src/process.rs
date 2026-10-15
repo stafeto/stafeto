@@ -80,6 +80,21 @@ pub unsafe fn after_fork(
 /// by the service and goes again; an accepted request that waits for its
 /// reply (a walk of a group) is not taken back by a signal.
 pub(crate) fn ask(w: &Writer) -> Result<u32, i32> {
+    answer(w, |bytes| bytes.u32().unwrap_or(0))
+}
+
+/// `ask` for the reply of a timer's setting: the time left and the
+/// interval, in nanoseconds.
+pub(crate) fn ask_setting(w: &Writer) -> Result<[u64; 2], i32> {
+    answer(w, |bytes| match (bytes.u64(), bytes.u64()) {
+        (Ok(remaining), Ok(interval)) => Ok([remaining, interval]),
+        _ => Err(crate::constants::EIO),
+    })?
+}
+
+/// The service's answer to `w`, the body of its reply read by `read` once
+/// its status is 0; else the errno of the status.
+fn answer<T>(w: &Writer, read: impl FnOnce(&mut proto_wire::Reader<'_>) -> T) -> Result<T, i32> {
     use crate::constants::{EACCES, EAGAIN, EINVAL, EIO, EPERM, ESRCH};
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
     let (status, value) = loop {
@@ -89,12 +104,15 @@ pub(crate) fn ask(w: &Writer) -> Result<u32, i32> {
             Ok(reply) => {
                 let mut bytes = proto_wire::Reader::new(reply.bytes(&mut buffer));
                 let status = bytes.u32().map_err(|_| EIO)?;
-                break (status, bytes.u32().unwrap_or(0));
+                if status != 0 {
+                    break (status, None);
+                }
+                break (0, Some(read(&mut bytes)));
             }
         }
     };
     match status {
-        0 => Ok(value),
+        0 => value.ok_or(EIO),
         proto_process::NO_PROCESS => Err(ESRCH),
         proto_process::PERMISSION => Err(EPERM),
         proto_process::INVALID => Err(EINVAL),
@@ -167,6 +185,7 @@ pub(crate) fn return_signal(
         .and_then(|()| w.u32(info.si_pid as u32))
         .and_then(|()| w.u32(info.si_uid))
         .and_then(|()| w.u32(info.si_status as u32))
+        .and_then(|()| w.u64(info.si_value))
         .map_err(|_| crate::constants::EIO)?;
     ask(&w).map(|_| ())
 }
@@ -239,6 +258,30 @@ pub fn kill(pid: i32, signal: i32) -> Result<(), i32> {
         &[pid as u32, signal],
     )?)?;
     if signal != 0 && (pid == getpid() || (pid <= 0 && pid != -1)) {
+        crate::signals::route();
+        crate::signals::deliver_now();
+    }
+    Ok(())
+}
+
+/// sigqueue of `signal` with the bytes `value` of the C union sigval to
+/// the process `pid` (above 0): the rules of kill, the signals the layer has
+/// (1 to 31), and 0 for a check alone. The information the receiver takes
+/// carries SI_QUEUE, the caller's PID and real UID, and the value. The
+/// service keeps one place for a signal: EAGAIN while it waits already.
+/// A signal to the caller's own process comes to a thread of it before the
+/// return.
+pub fn sigqueue(pid: i32, signal: i32, value: u64) -> Result<(), i32> {
+    if !(0..=31).contains(&signal) {
+        return Err(crate::constants::EINVAL);
+    }
+    if pid <= 0 {
+        return Err(crate::constants::ESRCH);
+    }
+    let mut w = request(proto_process::Method::Queue, &[pid as u32, signal as u32])?;
+    w.u64(value).map_err(|_| crate::constants::EIO)?;
+    ask(&w)?;
+    if signal != 0 && pid == getpid() {
         crate::signals::route();
         crate::signals::deliver_now();
     }

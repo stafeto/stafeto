@@ -30,18 +30,19 @@ use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
 use posix_process_service::terminals::Terminals;
+use posix_process_service::timers::{self, Timers};
 use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
 use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
-    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_KERNEL, SI_USER, SIGCHLD,
-    SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart, WCONTINUED, WEXITED,
-    WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
+    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
+    SI_USER, SIGCHLD, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart,
+    WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
 };
 use proto_wire::{Status, Writer, long};
 use rt::{
     abi::{self, Access, ObjectKind, Rights, Source},
-    handle::{Channel, Handle, Memory, Outgoing, Process, Resource, Thread},
+    handle::{Channel, Handle, Memory, Outgoing, Process, Resource, Thread, Timer},
     service::{
         Answer, Config, Heartbeat, LongOps, LongSession, Notice, Pending, Request, Service, Session,
     },
@@ -151,6 +152,9 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
 /// the next step of a walk: a service label no record has (its index
 /// is past RECORDS).
 const STEP: u64 = 1 << 63 | 0xFFFF;
+/// The label of the service's timer of the processes' timers (`timers`),
+/// a service label no record has. The heartbeat's timer has label 0.
+const TIMERS: u64 = 1 << 63 | 0xFFFE;
 /// What the service holds for a loader (loaders.rs): its thread, the
 /// router of the program's signals once the record lives; the copy of its
 /// start channel C with NOTIFY, label 2, through which it hears that the
@@ -180,6 +184,8 @@ enum Delivery {
     Done,
     Denied,
     Refused,
+    /// sigqueue found its signal waiting: no place for another.
+    Again,
 }
 struct Processes {
     /// The service's channel, which the sessions are copies of.
@@ -242,6 +248,11 @@ struct Processes {
     /// Trusted Clock root, obtained from init before the request loop.
     clock: Option<Handle<Channel>>,
     console: Option<Handle<Resource>>,
+    /// The timers of the processes and the kernel's timer that serves them
+    /// all, with the deadline it is armed at (u64::MAX: not armed).
+    timers: Timers,
+    timer: Option<Handle<Timer>>,
+    timer_armed: u64,
 }
 impl Processes {
     const fn new() -> Self {
@@ -278,6 +289,9 @@ impl Processes {
             files: None,
             clock: None,
             console: None,
+            timers: Timers::new(),
+            timer: None,
+            timer_armed: u64::MAX,
         }
     }
 }
@@ -371,6 +385,16 @@ fn main(_: u64) -> u64 {
         return 7;
     };
     owner.step = Some(step);
+    // The timers of the processes: one timer of the kernel on a labelled
+    // copy of the channel, so that its notice comes apart from the
+    // heartbeat's (label 0).
+    let Ok(timers) = sys::handle_label(&channel, Rights::RECEIVE, TIMERS, level) else {
+        return 7;
+    };
+    let Ok(timer) = sys::timer_create(&timers, level) else {
+        return 7;
+    };
+    owner.timer = Some(timer);
     #[cfg(feature = "steps")]
     rt::service::report_steps(1);
     rt::println!("posix-process: ready (records with their processes, root by init's table)");
@@ -1043,22 +1067,23 @@ impl Processes {
     }
 
     /// Posts `signal` with `info` to the process of the record in `target`
-    /// and asks for its router's entry when it waits now (O(1)).
-    fn signal(&mut self, target: usize, signal: u8, info: Info) {
+    /// and asks for its router's entry when it waits now (O(1)). What
+    /// became of it: Ignored for one that went without a page or a job
+    /// generation.
+    fn signal(&mut self, target: usize, signal: u8, info: Info) -> Posted {
         if proto_process::job::class(signal).is_some() || signal == SIGSTOP {
-            if self.generate_job(target, signal).is_none() {
-                return;
-            }
-            if signal == SIGSTOP {
-                return;
+            if self.generate_job(target, signal).is_none() || signal == SIGSTOP {
+                return Posted::Ignored;
             }
         }
         let Some(page) = self.pages.page(target) else {
-            return;
+            return Posted::Ignored;
         };
-        if signals::post(page, signal, info) == Posted::Pending {
+        let posted = signals::post(page, signal, info);
+        if posted == Posted::Pending {
             self.request_router(target);
         }
+        posted
     }
 
     /// Delivers `signal` from the record in `sender` to the process of the
@@ -1069,6 +1094,20 @@ impl Processes {
     /// (process_kill_at); any other is posted on the target's page
     /// (`signal`). O(1).
     fn deliver(&mut self, sender: usize, target: usize, signal: u8) -> Delivery {
+        self.deliver_with(sender, target, signal, SI_USER, 0)
+    }
+
+    /// `deliver` with the code and the value of the information. A code of
+    /// SI_QUEUE says sigqueue: a signal that waits already (one place a
+    /// signal, the value of the first stays) is Again, never lost silently.
+    fn deliver_with(
+        &mut self,
+        sender: usize,
+        target: usize,
+        signal: u8,
+        code: i32,
+        value: u64,
+    ) -> Delivery {
         let from = self.records.get(sender).expect("the sender");
         let (from_pid, creds, from_session) = (from.label.pid(), from.credentials, from.sid);
         let record = self.records.get(target).expect("a target");
@@ -1095,12 +1134,19 @@ impl Processes {
             return Delivery::Refused;
         }
         let info = Info {
-            code: SI_USER,
+            code,
             pid: from_pid,
             uid: creds.uid,
             status: 0,
+            value,
         };
-        self.signal(target, signal, info);
+        let posted = self.signal(target, signal, info);
+        if code == SI_QUEUE
+            && posted == Posted::Merged
+            && proto_process::job::class(signal).is_none()
+        {
+            return Delivery::Again;
+        }
         Delivery::Done
     }
 
@@ -1138,9 +1184,221 @@ impl Processes {
             return refuse(proto_process::NO_PROCESS);
         };
         match self.deliver(index, target, signal) {
+            Delivery::Done | Delivery::Again => Answer::Status(Status::Ok),
+            Delivery::Denied => refuse(proto_process::PERMISSION),
+            Delivery::Refused => refuse(proto_process::INVALID),
+        }
+    }
+
+    /// sigqueue of the record in `index`: pid u32, signal u32 and the value
+    /// u64. One process only (NO_PROCESS for a PID of 0 or below), the
+    /// rules of kill; AGAIN when the signal waits already and no other
+    /// place is there.
+    fn queue(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let (Ok(pid), Ok(signal), Ok(value), Ok(())) =
+            (body.u32(), body.u32(), body.u64(), body.finish())
+        else {
+            return Answer::Status(Status::BadSize);
+        };
+        let Ok(signal) = u8::try_from(signal) else {
+            return refuse(proto_process::INVALID);
+        };
+        let pid = pid as i32;
+        let Some(target) = self.records.find_pid(pid as u32).filter(|&t| {
+            pid > 0
+                && self.records.get(t).is_some_and(|r| {
+                    r.state != State::Loading
+                        || signal == SIGKILL
+                        || signal == SIGSTOP
+                        || proto_process::job::class(signal).is_some()
+                })
+        }) else {
+            return refuse(proto_process::NO_PROCESS);
+        };
+        match self.deliver_with(index, target, signal, SI_QUEUE, value) {
             Delivery::Done => Answer::Status(Status::Ok),
             Delivery::Denied => refuse(proto_process::PERMISSION),
             Delivery::Refused => refuse(proto_process::INVALID),
+            Delivery::Again => refuse(proto_process::AGAIN),
+        }
+    }
+
+    /// The time now on the scale of the kernel's timers.
+    fn timer_now() -> u64 {
+        rt::time::ticks_to_ns(rt::time::now())
+    }
+
+    /// Arms the kernel's timer at the nearest deadline of the table when
+    /// that is nearer than the one it is armed at. A deadline that moved
+    /// away leaves its wake-up, which finds nothing due and arms again.
+    fn timer_arm(&mut self) {
+        let (Some(timer), Some(deadline)) = (self.timer.as_ref(), self.timers.earliest()) else {
+            return;
+        };
+        if deadline < self.timer_armed && sys::timer_set(timer, deadline).is_ok() {
+            self.timer_armed = deadline;
+        }
+    }
+
+    /// Sends the signal of an expiration to the process of the record in
+    /// `owner`, as the process service sends one. SIGKILL ends it.
+    fn timer_signal(&mut self, owner: usize, signal: u8, info: Info) -> Posted {
+        if signal == SIGKILL {
+            if let Some(record) = self.records.get(owner) {
+                let _ = sys::process_kill_at(&record.process, record.ceiling);
+            }
+            return Posted::Pending;
+        }
+        if self
+            .pages
+            .page(owner)
+            .is_none_or(|p| signals::refused(signal, p))
+            || !self.can_generate_job(owner, signal)
+        {
+            return Posted::Ignored;
+        }
+        self.signal(owner, signal, info)
+    }
+
+    /// The notice of the kernel's timer: up to EXPIRIES_PER_STEP due
+    /// timers send their signals, and the timer is armed again for the
+    /// nearest of the rest. A step takes constant time however many are due.
+    fn timer_step(&mut self) {
+        self.timer_armed = u64::MAX;
+        let now = Self::timer_now();
+        for _ in 0..timers::EXPIRIES_PER_STEP {
+            let Some(slot) = self.timers.next(now) else {
+                break;
+            };
+            let due = self.timers.expire(slot, now);
+            if due.signal == 0 {
+                continue;
+            }
+            let info = Info {
+                code: if due.alarm { SI_KERNEL } else { SI_TIMER },
+                pid: 0,
+                uid: 0,
+                status: 0,
+                value: due.value,
+            };
+            let posted = self.timer_signal(usize::from(due.owner), due.signal, info);
+            self.timers
+                .account(due.slot, due.count, posted == Posted::Merged);
+        }
+        self.timer_arm();
+    }
+
+    /// Timer (label of a record): the operation u32 of `timer_op` and its
+    /// arguments. The times are on the scale of the kernel's timers (the
+    /// layer turns a calendar time into it).
+    fn timer(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        use proto_process::timer_op as op;
+        use timers::Fail;
+        let owner = index as u8;
+        let mut body = r.body();
+        let Ok(operation) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        let now = Self::timer_now();
+        let failed = |fail: Fail| match fail {
+            Fail::Again => refuse(proto_process::AGAIN),
+            Fail::Invalid => refuse(proto_process::INVALID),
+        };
+        // The setting before, as the reply: status, time left, interval.
+        let setting = |r: &mut Request<'_>, s: timers::Setting| {
+            let w = r.reply();
+            if w.u32(0)
+                .and_then(|()| w.u64(s.remaining))
+                .and_then(|()| w.u64(s.interval))
+                .is_err()
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            Answer::Reply(Outgoing::new())
+        };
+        match operation {
+            op::CREATE => {
+                let (Ok(signal), Ok(value), Ok(())) = (body.u32(), body.u64(), body.finish())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                // Bit 8 of the signal says the value is the timer's own id.
+                let own_id = signal & 0x100 != 0;
+                let Some(signal) = u8::try_from(signal & 0xFF)
+                    .ok()
+                    .filter(|&s| s <= SIGNAL_MAX)
+                else {
+                    return refuse(proto_process::INVALID);
+                };
+                match self.timers.create(owner, signal, value, own_id) {
+                    Ok(id) => number(r, id),
+                    Err(fail) => failed(fail),
+                }
+            }
+            op::SET | op::ALARM_SET => {
+                let id = if operation == op::SET {
+                    match body.u32() {
+                        Ok(id) => id,
+                        Err(_) => return Answer::Status(Status::BadSize),
+                    }
+                } else {
+                    0
+                };
+                let (Ok(armed), Ok(deadline), Ok(interval), Ok(())) =
+                    (body.u32(), body.u64(), body.u64(), body.finish())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let deadline = (armed != 0).then_some(deadline);
+                let before = if operation == op::SET {
+                    self.timers.set(owner, id, deadline, interval, now)
+                } else {
+                    self.timers.alarm(owner, deadline, interval, now)
+                };
+                match before {
+                    Ok(before) => {
+                        self.timer_arm();
+                        setting(r, before)
+                    }
+                    Err(fail) => failed(fail),
+                }
+            }
+            op::GET => {
+                let (Ok(id), Ok(())) = (body.u32(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match self.timers.get(owner, id, now) {
+                    Ok(s) => setting(r, s),
+                    Err(fail) => failed(fail),
+                }
+            }
+            op::ALARM_GET => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let s = self.timers.alarm_setting(owner, now);
+                setting(r, s)
+            }
+            op::DELETE => {
+                let (Ok(id), Ok(())) = (body.u32(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match self.timers.delete(owner, id) {
+                    Ok(()) => Answer::Status(Status::Ok),
+                    Err(fail) => failed(fail),
+                }
+            }
+            op::OVERRUN => {
+                let (Ok(id), Ok(())) = (body.u32(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match self.timers.overrun(owner, id) {
+                    Ok(n) => number(r, n),
+                    Err(fail) => failed(fail),
+                }
+            }
+            _ => refuse(proto_process::INVALID),
         }
     }
 
@@ -1263,7 +1521,7 @@ impl Processes {
         };
         match w.walk.step(&self.records) {
             Step::Found(target) => match self.deliver(index, target, w.signal) {
-                Delivery::Done => w.delivered = true,
+                Delivery::Done | Delivery::Again => w.delivered = true,
                 Delivery::Denied => w.denied = true,
                 Delivery::Refused => w.refused = true,
             },
@@ -1305,7 +1563,7 @@ impl Processes {
             let delivery = self.deliver_terminal(index, signal);
             if let Some(w) = self.tty_walk.as_mut() {
                 match delivery {
-                    Delivery::Done => w.delivered = true,
+                    Delivery::Done | Delivery::Again => w.delivered = true,
                     Delivery::Denied => w.denied = true,
                     Delivery::Refused => w.refused = true,
                 }
@@ -1326,7 +1584,7 @@ impl Processes {
             let delivery = self.deliver(sender, index, signal);
             if let Some(w) = self.walks[sender].as_mut() {
                 match delivery {
-                    Delivery::Done => w.delivered = true,
+                    Delivery::Done | Delivery::Again => w.delivered = true,
                     Delivery::Denied => w.denied = true,
                     Delivery::Refused => w.refused = true,
                 }
@@ -1566,6 +1824,7 @@ impl Processes {
             pid: 0,
             uid: 0,
             status: 0,
+            value: 0,
         };
         self.signal(target, signal, info);
         Delivery::Done
@@ -1578,7 +1837,7 @@ impl Processes {
         };
         match w.walk.step(&self.records) {
             Step::Found(target) => match self.deliver_terminal(target, w.signal) {
-                Delivery::Done => w.delivered = true,
+                Delivery::Done | Delivery::Again => w.delivered = true,
                 Delivery::Denied => w.denied = true,
                 Delivery::Refused => w.refused = true,
             },
@@ -1751,6 +2010,7 @@ impl Processes {
             pid,
             uid,
             status,
+            value: 0,
         };
         self.signal(parent, SIGCHLD, info);
     }
@@ -2117,6 +2377,8 @@ impl Processes {
         }
         record.credentials = credentials;
         self.generations.raise(index);
+        // The timers of timer_create go with the old image; the alarm goes on.
+        self.timers.clear(index as u8, false);
         if let Some(page) = self.pages.page(index) {
             page.caught.store(0, core::sync::atomic::Ordering::Release);
         }
@@ -2837,6 +3099,8 @@ impl Service<0> for Processes {
             n if n == Method::WaitStart as u16 => self.wait_start(index, s, r),
             n if n == Method::WaitCancel as u16 => self.wait_cancel(s, r),
             n if n == Method::Kill as u16 => self.kill(index, r),
+            n if n == Method::Queue as u16 => self.queue(index, r),
+            n if n == Method::Timer as u16 => self.timer(index, r),
             n if n == Method::SignalGeneration as u16 => self.signal_generation(index, r),
             n if n == Method::StopSelf as u16 => self.stop_self(index, r),
             n if n == Method::ReturnSignal as u16 => self.return_signal(index, r),
@@ -2873,6 +3137,10 @@ impl Service<0> for Processes {
     fn notification(&mut self, n: Notice) {
         if n.source == Source::Session && n.label == STEP {
             self.walk_step();
+            return;
+        }
+        if n.source == Source::Timer && n.label == TIMERS {
+            self.timer_step();
             return;
         }
         if n.source != Source::Exit {
@@ -2954,6 +3222,7 @@ impl Service<0> for Processes {
             }
         }
         self.routers[index] = None;
+        self.timers.clear(index as u8, true);
         if let Exit::Zombie { parent } = exit {
             self.child_ended(parent, index, end);
         }

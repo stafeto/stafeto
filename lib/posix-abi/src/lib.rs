@@ -48,6 +48,7 @@ pub mod signals;
 pub mod synchronization;
 pub mod terminal;
 pub mod threads;
+pub mod timers;
 pub mod tls;
 pub mod wait;
 
