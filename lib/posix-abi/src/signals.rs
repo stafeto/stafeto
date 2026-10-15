@@ -1411,6 +1411,36 @@ pub(crate) fn native_scope_barrier(block: &Block) -> Result<(), i32> {
     )
 }
 
+/// The nesting of the forking thread's entry (depth and deferrals), noted
+/// by the parent just before the copy and read in the child, whose kernel
+/// thread starts at depth 0: the child returns from the handlers the copy of
+/// its stack holds, and the kernel counts the levels it leaves (`Adopt`).
+static NESTING: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The parent notes its nesting before a fork copies its memory.
+pub(crate) fn note_nesting() {
+    let (depth, deferred) = upcall::query().map_or((0, 0), |q| (q.depth, q.deferred));
+    NESTING[0].store(depth, Ordering::Relaxed);
+    NESTING[1].store(deferred, Ordering::Relaxed);
+}
+
+/// The note goes once the copy is made (the parent) or taken (the child).
+pub(crate) fn clear_nesting() {
+    NESTING[0].store(0, Ordering::Relaxed);
+    NESTING[1].store(0, Ordering::Relaxed);
+}
+
+/// The child of a fork made inside a handler takes the parent's nesting. A
+/// thread that is no such child finds none.
+fn adopt_nesting() -> Result<(), Error> {
+    let depth = NESTING[0].swap(0, Ordering::Relaxed);
+    let deferred = NESTING[1].swap(0, Ordering::Relaxed);
+    if depth == 0 {
+        return Ok(());
+    }
+    upcall::adopt(depth, deferred)
+}
+
 /// Binds and enables the calling thread's entry, then delivers what came
 /// before it.
 pub(crate) fn attach() -> Result<(), i32> {
@@ -1419,6 +1449,7 @@ pub(crate) fn attach() -> Result<(), i32> {
     unsafe { upcall::bind(entry) }.map_err(|_| EIO)?;
     upcall::faults(true).map_err(|_| EIO)?;
     crate::altstack::reinstate()?;
+    adopt_nesting().map_err(|_| EIO)?;
     own().flags.fetch_or(flag::SIGNALS_READY, Ordering::SeqCst);
     unsafe { upcall::enable() }.map_err(|_| EIO)?;
     // A thread whose start ends while another stops the process parks
@@ -1463,6 +1494,9 @@ pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
     let mut result: Result<(), Error> = upcall::faults(true);
     if result.is_ok() {
         result = crate::altstack::reinstate().map_err(|_| Error::BadState);
+    }
+    if result.is_ok() {
+        result = adopt_nesting();
     }
     // The layer lets entries in only when it bound the first handler of the
     // thread: a handler the program bound before keeps the program's mask.

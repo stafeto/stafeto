@@ -115,13 +115,60 @@ static int f_recurse(int n) {
 static int f_overflow_caught(void) {
     if (f_set_alt()) return 1;
     if (f_catch(SIGSEGV, f_h_segv, SA_ONSTACK)) return 2;
-    if (sigsetjmp(f_env, 1) == 0) {
-        int r = f_recurse(0);
-        return 3 + (r & 1);
+    /* Three times: the jump out of the handler on the alternate stack leaves
+     * no entry of the thread behind (the frames of both stacks are told apart). */
+    for (int round = 0; round < 3; round++) {
+        f_stage = 0;
+        if (sigsetjmp(f_env, 1) == 0) {
+            int r = f_recurse(0);
+            return 3 + (r & 1);
+        }
+        /* The jump left the alternate stack: the mask is back and so is the state. */
+        if (f_on_alt() != 0) return 4;
+        if (f_stage != 2) return 20 + f_stage % 70;
     }
-    /* The jump left the alternate stack: the mask is back and so is the state. */
-    if (f_on_alt() != 0) return 4;
-    return f_stage == 2 ? 0 : 20 + f_stage % 70;
+    return 0;
+}
+
+/* A child of fork keeps the alternate stack: the layer asks the kernel for it
+ * again, and the child's overflow is caught on it. */
+static int f_forked_alt(void) {
+    if (f_set_alt()) return 1;
+    if (f_catch(SIGSEGV, f_h_segv, SA_ONSTACK)) return 2;
+    pid_t pid = fork();
+    if (pid < 0) return 3;
+    if (pid == 0) {
+        stack_t o;
+        if (sigaltstack(NULL, &o) || o.ss_sp != f_area || o.ss_size != F_STACK || o.ss_flags != 0) _exit(4);
+        f_stage = 0;
+        if (sigsetjmp(f_env, 1) == 0) {
+            int r = f_recurse(0);
+            _exit(5 + (r & 1));
+        }
+        _exit(f_stage == 2 ? 0 : 20 + f_stage % 70);
+    }
+    int status = -1;
+    if (waitpid(pid, &status, 0) != pid) return 7;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 100 + WTERMSIG(status);
+}
+
+/* The handler on the alternate stack runs out of it: the fault finds the
+ * stack pointer below the range, the kernel would start over at the top on
+ * the live frames, and the layer ends the process by SIGSEGV. */
+static void f_h_deep(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    (void)f_recurse(0);
+}
+static int f_alt_overflow(void) {
+    char *region = mmap(NULL, F_STACK + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED) return 1;
+    /* A hole below the stack. */
+    if (munmap(region, 4096)) return 2;
+    stack_t ss = {.ss_sp = region + 4096, .ss_size = F_STACK, .ss_flags = 0};
+    if (sigaltstack(&ss, NULL)) return 3;
+    if (f_catch(SIGSEGV, f_h_deep, SA_ONSTACK | SA_NODEFER)) return 4;
+    *(volatile int *)0x10 = 1;
+    return 5;
 }
 
 /* The same without an alternate stack, and no handler: the signal ends it. */
@@ -322,6 +369,8 @@ static void f_child(const char *what, int (*fn)(void), int code, int sig) {
 static int faults_role(void) {
     f_child("sigaltstack state and errors", f_api, 0, 0);
     f_child("overflow caught on the alternate stack", f_overflow_caught, 0, 0);
+    f_child("overflow in a child of fork with the alternate stack", f_forked_alt, 0, 0);
+    f_child("overflow of the alternate stack itself", f_alt_overflow, 0, SIGSEGV);
     f_child("overflow without an alternate stack", f_overflow_default, 0, SIGSEGV);
     f_child("a signal inside the handler on the alternate stack", f_nested_on_alt, 0, 0);
     f_child("a handler off the alternate stack", f_off_stack_plain, 0, 0);

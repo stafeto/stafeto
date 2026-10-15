@@ -250,8 +250,13 @@ pub fn copy(window: Option<fn()>, sessions: Sessions) -> Result<Forked, i32> {
         sessions,
         result: Err(EIO),
     };
+    // The child starts at depth 0 in the kernel: it takes the nesting noted here.
+    crate::signals::note_nesting();
     // SAFETY: one fork at a time (FORKING); `work` writes only `w`.
     let from = unsafe { point(work, (&raw mut w) as u64) };
+    if from != 0 {
+        crate::signals::clear_nesting();
+    }
     if from == 0 {
         // The child's own flag, which the copy took raised.
         FORKING.store(false, Ordering::Release);
