@@ -3893,6 +3893,10 @@ fn posix_procs_verdict(outcome: &qemu::Outcome) -> Result<(), String> {
         outcome,
         "posix-procs: faults: sigaltstack, SA_ONSTACK, classes of faults, nesting ok",
     )?;
+    qemu::expect_marker(
+        outcome,
+        "posix-procs: timers: sigqueue, timers, alarm, itimer, clock ok",
+    )?;
     qemu::expect_marker(outcome, "posix-procs: ok")?;
     qemu::expect_marker(outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(outcome, "posix-procs: orphan saw ppid 1")?;
