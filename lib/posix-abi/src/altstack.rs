@@ -346,11 +346,11 @@ pub(crate) fn jump(outer: u64, target: u64) -> bool {
 /// back to the caller's stack.
 fn on_stack<F: FnOnce()>(sp: u64, body: F) {
     let mut slot = Some(body);
-    // SAFETY: `thunk` runs the closure once, on the new stack; `call_on`
+    // SAFETY: `thunk` runs the closure once, on the new stack; `stafeto_call_on`
     // restores the old stack pointer. A body that leaves by a long jump
     // never returns here.
     unsafe {
-        call_on(
+        stafeto_call_on(
             sp & !15,
             thunk::<F> as *const () as usize,
             core::ptr::from_mut(&mut slot) as usize,
@@ -369,12 +369,12 @@ unsafe extern "C" fn thunk<F: FnOnce()>(slot: *mut Option<F>) {
 unsafe extern "C" {
     /// Runs `function(argument)` with the stack pointer at `sp` and
     /// returns to the caller's stack afterwards.
-    fn call_on(sp: u64, function: usize, argument: usize);
+    fn stafeto_call_on(sp: u64, function: usize, argument: usize);
 }
 
 /// On a host the stack is not switched (the tests do not run handlers).
 #[cfg(not(target_os = "none"))]
-unsafe fn call_on(_sp: u64, function: usize, argument: usize) {
+unsafe fn stafeto_call_on(_sp: u64, function: usize, argument: usize) {
     // SAFETY: `function` is a `thunk`.
     let function: unsafe extern "C" fn(usize) = unsafe { core::mem::transmute(function) };
     unsafe { function(argument) }
@@ -383,9 +383,9 @@ unsafe fn call_on(_sp: u64, function: usize, argument: usize) {
 #[cfg(target_os = "none")]
 core::arch::global_asm!(
     ".text",
-    ".global call_on",
-    ".type call_on,%function",
-    "call_on:",
+    ".global stafeto_call_on",
+    ".type stafeto_call_on,%function",
+    "stafeto_call_on:",
     "stp x29, x30, [sp, #-16]!",
     "mov x29, sp",
     "mov x9, sp",
