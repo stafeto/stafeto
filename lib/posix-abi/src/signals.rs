@@ -1369,6 +1369,24 @@ pub(crate) fn parks() -> u64 {
         .map_or(0, |count| count.load(Ordering::Acquire))
 }
 
+/// The probe of a park with a request pending: the calling thread defers
+/// entries and waits for a stop of another thread, so that the stopper's
+/// request stays pending, then parks as `deliver_now` does.
+pub fn probe_park_now() {
+    let Ok(_deferred) = upcall::defer_entries() else {
+        return;
+    };
+    // Waits under the deferral for a stop, 1 s at most.
+    let end = rt::time::ticks_to_ns(rt::time::now()) + 1_000_000_000;
+    while !rt::time::reached(end) {
+        if stopped_by_other() {
+            park();
+            return;
+        }
+        let _ = sys::yield_now();
+    }
+}
+
 /// Parks the calling thread while another thread stops the process for
 /// an exec or a fork: its process signals go back to the page, it puts its
 /// own channel in its place of PARKING, says so to the stopper and waits
@@ -1387,6 +1405,13 @@ fn park() {
         return;
     };
     let channel = Handle::<Channel>::borrowed(rt::abi::Handle(raw));
+    // A thread that parks inside a deferral of entries (the barrier of a
+    // native scope) may have the stopper's request pending: a receive with
+    // entries open then returns Interrupted at once, the thread never
+    // blocks, and the stopper, which counts only a receiving thread as
+    // parked, never goes on. With entries masked the receive blocks, and
+    // the request waits for the deferral's end.
+    let was_masked = upcall::mask().unwrap_or(true);
     loop {
         place.store(raw, Ordering::SeqCst);
         #[cfg(feature = "thread-probe")]
@@ -1413,6 +1438,12 @@ fn park() {
         .and_then(|i| PARKED.get(i))
     {
         count.fetch_add(1, Ordering::Release);
+    }
+    if !was_masked {
+        // SAFETY: the thread's entries were open when it came here, so
+        // whatever it interrupts permits their return; with a deferral held
+        // a pending request enters only when the deferral ends.
+        let _ = unsafe { upcall::enable() };
     }
 }
 

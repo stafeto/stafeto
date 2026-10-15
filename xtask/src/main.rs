@@ -3961,6 +3961,7 @@ fn posix_procs_verdict(outcome: &qemu::Outcome) -> Result<(), String> {
         "posix-procs: ash -c ran /bin/ls",
         "posix-procs: 40 forks of a parent with six threads",
         "posix-procs: a wait survives a park of a stop",
+        "posix-procs: a park with a request pending blocks",
         // Pipes (5e): within a process and across fork.
         "posix-procs: pipes within a process and across fork",
         // The signals of the shell and setpgid of a child of fork (5e).
