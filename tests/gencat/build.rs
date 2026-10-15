@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: BSD-2-Clause
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Compiles gencat.c with relibc's headers and links relibc's libc.a, both
