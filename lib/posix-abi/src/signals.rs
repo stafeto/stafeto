@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 pub use posix_signals::{DEFAULT, IGNORE};
 use posix_sync::LayerLock;
 use posix_thread::{Block, flag};
-use posix_types::constants::{SA_NOCLDSTOP, SA_NOCLDWAIT};
+use posix_types::constants::{SA_NOCLDSTOP, SA_NOCLDWAIT, SA_ONSTACK};
 pub use posix_types::{SigAction, SigInfo, SigSet};
 use rt::abi::{Error, Source};
 use rt::handle::{Channel, Handle, Timer};
@@ -201,6 +201,7 @@ pub(crate) fn reset_taken_before_live(id: u64) {
     let _guard = INFO_LOCK.lock();
     clear_taken(&TAKEN[id as usize]);
     CLAIMING[id as usize].store(0, Ordering::Relaxed);
+    crate::altstack::reset(id);
 }
 
 fn clear_taken(row: &[Taken; 31]) {
@@ -1132,9 +1133,9 @@ pub fn sigtimedwait(
 
 // SAFETY: this executable .text section remains in the native RX segment.
 #[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
-unsafe extern "C" fn entry(context: *mut upcall::Context) {
+unsafe extern "C" fn entry(context: *mut upcall::Context, flags: u64) {
     // SAFETY: the distributor supplies this thread's live entry frame.
-    unsafe { dispatch(context) }
+    unsafe { dispatch(context, flags) }
 }
 
 /// Where the calling thread's C errno lives: relibc's `__errno_location`. The entry saves and gives back
@@ -1308,6 +1309,7 @@ pub(crate) fn stop_others() -> Result<(), i32> {
 /// The child's only thread, once its block has its handles
 /// (crate::threads::after_fork).
 pub(crate) unsafe fn after_fork() -> Result<(), i32> {
+    crate::altstack::after_fork();
     STOP.reset_after_fork();
     RETURNING.store(0, Ordering::Release);
     for place in &PARKING {
@@ -1415,6 +1417,8 @@ pub(crate) fn attach() -> Result<(), i32> {
     // SAFETY: the dispatcher holds no interrupted Rust references or locks
     // and enters only caller-supplied C code.
     unsafe { upcall::bind(entry) }.map_err(|_| EIO)?;
+    upcall::faults(true).map_err(|_| EIO)?;
+    crate::altstack::reinstate()?;
     own().flags.fetch_or(flag::SIGNALS_READY, Ordering::SeqCst);
     unsafe { upcall::enable() }.map_err(|_| EIO)?;
     // A thread whose start ends while another stops the process parks
@@ -1456,10 +1460,13 @@ pub(crate) fn attach_native(page: *mut u8) -> Result<(), i32> {
     // SAFETY: admission owns this page through End and uses the fixed dispatcher.
     let owns_mask = unsafe { upcall::bind_resident(entry, page as usize, rt::abi::Handle(thread)) }
         .map_err(|_| EIO)?;
+    let mut result: Result<(), Error> = upcall::faults(true);
+    if result.is_ok() {
+        result = crate::altstack::reinstate().map_err(|_| Error::BadState);
+    }
     // The layer lets entries in only when it bound the first handler of the
     // thread: a handler the program bound before keeps the program's mask.
     // A failed step removes the handler before bootstrap cleanup.
-    let mut result: Result<(), Error> = Ok(());
     #[cfg(feature = "thread-probe")]
     if PROBE_FAIL_ATTACH.swap(false, Ordering::SeqCst) {
         result = Err(Error::BadState);
@@ -1500,8 +1507,13 @@ pub(crate) fn deliver_deferred() {
     unsafe { deliver(core::ptr::null_mut(), false) };
 }
 
-unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
+unsafe extern "C" fn dispatch(native: *mut upcall::Context, flags: u64) {
     marks::mark(2);
+    if flags & upcall::ENTRY_FAULT != 0 {
+        // SAFETY: the entry's frame; the entry is a fault of the thread.
+        unsafe { fault_entry(native) };
+        return;
+    }
     #[cfg(feature = "thread-probe")]
     native_stop_probe::entry(own());
     // Inside a critical section of the layer the entry only marks itself
@@ -1517,6 +1529,40 @@ unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
     }
     // SAFETY: the entry's frame.
     unsafe { deliver(native, true) };
+}
+
+/// The entry of a fault of the thread's code: its signal (SIGSEGV, SIGBUS,
+/// SIGILL, SIGTRAP or SIGFPE by the class of the syndrome, XSH 2.4.3) runs
+/// its handler now, on the stack the handler asks for. A fault in a critical
+/// section of the layer, with the signal blocked, ignored or at its default,
+/// or after an overflow of the alternate stack ends the process by the signal:
+/// returning would repeat the fault for ever.
+///
+/// `Query` comes first, before any nested entry can replace the cause.
+///
+/// # Safety
+/// `native` is the live frame of this entry.
+unsafe fn fault_entry(native: *mut upcall::Context) {
+    let Ok(cause) = upcall::query() else {
+        sys_exit_signal(SIGSEGV)
+    };
+    // SAFETY: the entry's frame.
+    let (sp, pc) = unsafe { ((*native).sp, (*native).pc) };
+    let fault = posix_signals::fault(cause.esr, cause.far, pc);
+    let block = own();
+    let bit = posix_signals::bit(fault.signal).expect("a signal of the table");
+    if crate::altstack::overflowed(sp)
+        || posix_sync::critical()
+        || block.mask.load(Ordering::SeqCst) & bit != 0
+    {
+        sys_exit_signal(fault.signal)
+    }
+    let action = action(fault.signal);
+    if action.handler == DEFAULT || ignored(fault.signal, &action) {
+        sys_exit_signal(fault.signal)
+    }
+    // SAFETY: the entry's frame.
+    unsafe { deliver_signal(native, true, Some(fault)) };
 }
 
 /// The entries that went past the fast path of `idle` into `deliver`, for the
@@ -1566,29 +1612,54 @@ fn take(block: &Block) -> Option<(i32, SigAction, Option<SigInfo>, u64)> {
         let Some((ticket, from_process)) = claim_thread_info(block, signal) else {
             continue;
         };
-        // Read without the lock; SA_RESETHAND alone writes, under it.
-        let read = action(signal);
-        let action = if ignored(signal, &read) {
-            None
-        } else if read.flags & SA_RESETHAND != 0 && signal != SIGILL && signal != SIGTRAP {
-            actions(|table| {
-                if table.ignored(signal) {
-                    return None;
-                }
-                let action = table.get(signal).expect("pending signal");
-                if action.flags & SA_RESETHAND != 0 {
-                    table
-                        .replace(signal, posix_signals::INITIAL)
-                        .expect("reset action");
-                }
-                Some(action)
-            })
-        } else {
-            Some(read)
-        };
+        let action = effective_action(signal);
         if let Some(action) = action {
             return Some((signal, action, from_process, ticket));
         }
+    }
+}
+
+/// The place of a handler with `flags` for a delivery with the entry frame
+/// `native` (null for a delivery with no entry).
+fn handler_place(
+    flags: i32,
+    native: *mut upcall::Context,
+    entered: bool,
+) -> crate::altstack::Place {
+    if crate::altstack::range().is_none() {
+        return crate::altstack::Place::Here;
+    }
+    let (frame, sp) = if entered && !native.is_null() {
+        // SAFETY: the entry's live frame.
+        (native as u64, unsafe { (*native).sp })
+    } else {
+        (0, 0)
+    };
+    crate::altstack::place(flags & SA_ONSTACK != 0, frame, sp)
+}
+
+/// The action of `signal` for a delivery now, `None` when it is ignored;
+/// SA_RESETHAND applied (SIGILL and SIGTRAP keep their action).
+fn effective_action(signal: i32) -> Option<SigAction> {
+    // Read without the lock; SA_RESETHAND alone writes, under it.
+    let read = action(signal);
+    if ignored(signal, &read) {
+        None
+    } else if read.flags & SA_RESETHAND != 0 && signal != SIGILL && signal != SIGTRAP {
+        actions(|table| {
+            if table.ignored(signal) {
+                return None;
+            }
+            let action = table.get(signal).expect("pending signal");
+            if action.flags & SA_RESETHAND != 0 {
+                table
+                    .replace(signal, posix_signals::INITIAL)
+                    .expect("reset action");
+            }
+            Some(action)
+        })
+    } else {
+        Some(read)
     }
 }
 
@@ -1625,9 +1696,21 @@ impl SignalPreparation {
 /// An entered delivery enables nested entries for each user callback and
 /// masks them on return. A null native frame requests a context-aware entry
 /// for SA_SIGINFO handlers.
+#[inline(always)]
+unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
+    // SAFETY: as for `deliver_signal`.
+    unsafe { deliver_signal(native, entered, None) }
+}
+
+/// `deliver`, with the synchronous signal of a fault (`forced`) before the
+/// pending ones: its handler gets the cause as `si_addr` and `si_code`.
 // SAFETY: this executable .text section remains in the native RX segment.
 #[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
-unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
+unsafe fn deliver_signal(
+    native: *mut upcall::Context,
+    entered: bool,
+    mut forced: Option<posix_signals::Fault>,
+) {
     marks::mark(3);
     #[cfg(feature = "thread-probe")]
     if entered {
@@ -1671,7 +1754,12 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             let _ = sys::thread_upcall_request(&thread);
             break;
         }
-        let Some((signal, action, from_process, ticket)) = take(block) else {
+        let fault = forced.take();
+        let taken = match fault {
+            Some(fault) => effective_action(fault.signal).map(|a| (fault.signal, a, None, 0)),
+            None => take(block),
+        };
+        let Some((signal, action, from_process, ticket)) = taken else {
             if preparation.as_ref().unwrap().local.take_deferred() {
                 route();
                 continue;
@@ -1713,26 +1801,33 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             // SAFETY: the context-aware trampoline owns this unique live frame.
             let frame = unsafe { native.read() };
             let mut context = LinuxContext::new(&frame, old_mask);
+            if let Some(fault) = fault {
+                context.fault_address = fault.address;
+            }
             // A signal of the process carries its sender's information
             // (XSH 2.4.3): SI_USER with the PID and UID, or SIGCHLD's code
             // and status.
-            let mut info = match from_process {
-                Some(taken) => LinuxSigInfo::process(&taken),
-                None => LinuxSigInfo::thread(signal),
+            let mut info = match (fault, from_process) {
+                (Some(fault), _) => LinuxSigInfo::fault(&fault),
+                (None, Some(taken)) => LinuxSigInfo::process(&taken),
+                (None, None) => LinuxSigInfo::thread(signal),
             };
             // SAFETY: SA_SIGINFO registers this live three-argument C address.
             let callback: unsafe extern "C" fn(i32, *mut LinuxSigInfo, *mut core::ffi::c_void) =
                 unsafe { core::mem::transmute(handler as usize) };
             drop(preparation.take());
-            if entered {
-                unsafe { upcall::enable() }.expect("nested signal entry");
-            }
-            marks::mark(4);
-            unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
-            marks::report();
-            if entered {
-                upcall::mask().expect("signal handler mask restoration");
-            }
+            let place = handler_place(action.flags, native, entered);
+            crate::altstack::run(place, || {
+                if entered {
+                    unsafe { upcall::enable() }.expect("nested signal entry");
+                }
+                marks::mark(4);
+                unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
+                marks::report();
+                if entered {
+                    upcall::mask().expect("signal handler mask restoration");
+                }
+            });
             preparation = Some(SignalPreparation::begin(entered));
             block.handled.fetch_add(1, Ordering::SeqCst);
             // The callback may edit the return context. Preserve private native
@@ -1746,15 +1841,18 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             let callback: unsafe extern "C" fn(i32) =
                 unsafe { core::mem::transmute(handler as usize) };
             drop(preparation.take());
-            if entered {
-                unsafe { upcall::enable() }.expect("nested signal entry");
-            }
-            marks::mark(4);
-            unsafe { callback(signal) };
-            marks::report();
-            if entered {
-                upcall::mask().expect("signal handler mask restoration");
-            }
+            let place = handler_place(action.flags, native, entered);
+            crate::altstack::run(place, || {
+                if entered {
+                    unsafe { upcall::enable() }.expect("nested signal entry");
+                }
+                marks::mark(4);
+                unsafe { callback(signal) };
+                marks::report();
+                if entered {
+                    upcall::mask().expect("signal handler mask restoration");
+                }
+            });
             preparation = Some(SignalPreparation::begin(entered));
             block.handled.fetch_add(1, Ordering::SeqCst);
         }
@@ -1802,6 +1900,21 @@ impl LinuxSigInfo {
         }
     }
 
+    /// The information of a fault: its code and the address in `si_addr`
+    /// (where Linux keeps the sender's pid and uid).
+    pub const fn fault(fault: &posix_signals::Fault) -> Self {
+        Self {
+            signo: fault.signal,
+            errno: 0,
+            code: fault.code,
+            pad: 0,
+            pid: fault.address as u32 as i32,
+            uid: (fault.address >> 32) as u32,
+            value: 0,
+            rest: [0; 96],
+        }
+    }
+
     /// The information of `signal` sent by pthread_kill or raise.
     pub const fn thread(signal: i32) -> Self {
         Self {
@@ -1832,7 +1945,7 @@ pub struct LinuxContext {
     unused: [u8; 120],
     /// uc_mcontext is 16-byte aligned.
     pad0: u64,
-    fault_address: u64,
+    pub fault_address: u64,
     pub registers: [u64; 31],
     pub sp: u64,
     pub pc: u64,
@@ -1862,12 +1975,13 @@ const FPSIMD_MAGIC: u32 = 0x4650_8001;
 
 impl LinuxContext {
     fn new(frame: &upcall::Context, mask: u64) -> Self {
+        let (base, size, flags) = crate::altstack::state();
         Self {
             flags: 0,
             link: core::ptr::null_mut(),
-            stack_pointer: core::ptr::null_mut(),
-            stack_flags: SS_DISABLE,
-            stack_size: 0,
+            stack_pointer: base as *mut core::ffi::c_void,
+            stack_flags: flags,
+            stack_size: size as usize,
             mask,
             unused: [0; 120],
             pad0: 0,

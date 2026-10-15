@@ -74,6 +74,9 @@ pub const SA_NOCLDSTOP: i32 = 32;
 /// SIGCHLD only: the children leave no zombies (the process service
 /// reads it from the record's page).
 pub const SA_NOCLDWAIT: i32 = 64;
+/// The handler of the signal runs on the alternate signal stack when there is one.
+pub const SA_ONSTACK: i32 = 8;
+pub const SS_ONSTACK: i32 = 1;
 pub const SS_DISABLE: i32 = 2;
 // Source codes are implementation-defined numbers. Reserved standard sources
 // are declared for C applications before their generators are implemented.
@@ -100,6 +103,9 @@ pub const FPE_FLTINV: i32 = 7;
 pub const FPE_FLTSUB: i32 = 8;
 pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
+pub const TRAP_BRKPT: i32 = 1;
+pub const TRAP_TRACE: i32 = 2;
+pub const TRAP_HWBKPT: i32 = 4;
 pub const BUS_ADRALN: i32 = 1;
 pub const BUS_ADRERR: i32 = 2;
 pub const BUS_OBJERR: i32 = 3;

@@ -130,7 +130,7 @@ impl Reply {
 
 /// Bit 1 of the first value of `Take`: the entry is the fault of the
 /// interrupted code, whose ESR and FAR `Query` gives.
-pub const TAKE_FAULT: u64 = 2;
+pub const TAKE_FAULT: u64 = abi::UPCALL_TAKE_FAULT;
 
 impl Default for State {
     fn default() -> Self {

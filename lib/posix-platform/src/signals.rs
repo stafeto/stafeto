@@ -25,7 +25,8 @@ pub struct LinuxSigaction {
 const _: () = assert!(core::mem::size_of::<LinuxSigaction>() == 32);
 
 /// Linux's SA_ flags the layer has, with the layer's values.
-const FLAGS: [(u32, i32); 6] = [
+const FLAGS: [(u32, i32); 7] = [
+    (0x0800_0000, posix_types::constants::SA_ONSTACK),
     (0x4000_0000, posix_types::constants::SA_NODEFER),
     (0x8000_0000, posix_types::constants::SA_RESETHAND),
     (0x0000_0004, posix_types::constants::SA_SIGINFO),
@@ -76,6 +77,44 @@ pub unsafe extern "C" fn stafeto_sigaction(
             flags: to_linux_flags(previous.flags),
             restorer: 0,
             mask: previous.mask,
+        };
+    }
+    0
+}
+
+/// relibc's `stack_t` (Linux AArch64): base, flags, size.
+#[repr(C)]
+pub struct LinuxStack {
+    sp: usize,
+    flags: c_int,
+    size: usize,
+}
+const _: () = assert!(core::mem::size_of::<LinuxStack>() == 24);
+
+/// sigaltstack: the alternate signal stack of the calling thread
+/// (posix_abi::altstack). The stack before goes to `old`, even when the
+/// change fails.
+///
+/// # Safety
+/// `new` is null or readable, `old` null or writable, relibc's layout.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_sigaltstack(
+    new: *const LinuxStack,
+    old: *mut LinuxStack,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let new =
+        unsafe { new.as_ref() }.map(|stack| (stack.sp as u64, stack.size as u64, stack.flags));
+    let before = match call(|| posix_abi::altstack::sigaltstack(new)) {
+        Ok(before) => before,
+        Err(errno) => return -errno,
+    };
+    // SAFETY: the caller's promise.
+    if let Some(old) = unsafe { old.as_mut() } {
+        *old = LinuxStack {
+            sp: before.0 as usize,
+            flags: before.2,
+            size: before.1 as usize,
         };
     }
     0

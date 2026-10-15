@@ -1203,6 +1203,11 @@ pub const PRIORITY_LEVELS: u8 = 64;
 /// The round-robin quantum (spec 8).
 pub const RR_QUANTUM_NS: u64 = 4_000_000;
 
+/// Bit 1 of the first value of `UpcallControl::Take`, and of the second
+/// argument of a handler of an entry: the entry is a fault of the
+/// interrupted code.
+pub const UPCALL_TAKE_FAULT: u64 = 2;
+
 /// The operations of `thread_upcall_control` (x0), each on the current
 /// thread's entry state; any other value is INVALID_ARGS. The numbers 5 to
 /// 12 were retired in epoch 2 and are never issued again: a new operation

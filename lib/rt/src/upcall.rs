@@ -43,8 +43,18 @@ const _: () = {
 };
 
 /// A handler of an entry: it gets the saved context of the interrupted
-/// code, live until it returns.
-pub type Dispatch = unsafe extern "C" fn(*mut Context);
+/// code, live until it returns, and the first value of `Take`: the previous
+/// mask in bit 0 and `ENTRY_FAULT` when a fault of the code made the entry.
+pub type Dispatch = unsafe extern "C" fn(*mut Context, u64);
+
+/// The bytes the distributor takes below the stack pointer of its entry: the
+/// saved context, the registers of the interrupted buffer and the rest.
+pub const FRAME_SIZE: usize = 1904;
+
+/// Bit 1 of the second argument of a handler: the entry is a fault of the
+/// interrupted code. `fault_cause` gives its ESR and FAR, and must be called
+/// before the handler enables nested entries (a nested fault replaces them).
+pub const ENTRY_FAULT: u64 = abi::UPCALL_TAKE_FAULT;
 
 // The record fills its eight words.
 const _: () = assert!(ENTRY_WORDS_END <= ENTRIES_SIZE);
@@ -62,12 +72,20 @@ fn word(offset: usize) -> &'static AtomicU64 {
 // SAFETY: this executable .text section remains in the native RX segment.
 #[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
 fn control(operation: UpcallControl) -> Result<bool, Error> {
+    control_with(operation, 0, 0).map(|result| result[1] != 0)
+}
+
+// SAFETY: this executable .text section remains in the native RX segment.
+#[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
+/// The registers x0 to x9 of a `ThreadUpcallControl` with the arguments
+/// x1 and x2; the error of x0 is the result.
+fn control_with(operation: UpcallControl, x1: u64, x2: u64) -> Result<[u64; 10], Error> {
     // SAFETY: control touches only current-thread delivery state.
     let result = unsafe {
         sys::raw::<{ Call::ThreadUpcallControl.number() }>([
             operation.raw(),
-            0,
-            0,
+            x1,
+            x2,
             0,
             0,
             0,
@@ -79,8 +97,47 @@ fn control(operation: UpcallControl) -> Result<bool, Error> {
     };
     match Error::from_code(result[0]) {
         Some(error) => Err(error),
-        None => Ok(result[1] != 0),
+        None => Ok(result),
     }
+}
+
+/// Makes a fault of this thread's code enter its open entry (`on`) or end the
+/// process as before; off at the start. The layer asks once, as it binds.
+pub fn faults(on: bool) -> Result<(), Error> {
+    control_with(UpcallControl::Faults, u64::from(on), 0).map(drop)
+}
+
+/// The alternate stack of the entry: `size` bytes from `base` (both multiples
+/// of 16, in user space), 0 for none. An entry that interrupts code whose
+/// stack pointer lies outside it starts at its top (spec 11).
+pub fn set_stack(base: u64, size: u64) -> Result<(), Error> {
+    control_with(UpcallControl::Stack, base, size).map(drop)
+}
+
+/// The cause of the last fault that entered, and the nesting of the thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Query {
+    pub esr: u64,
+    pub far: u64,
+    pub depth: u64,
+    pub deferred: u64,
+}
+
+/// `Query`: call it first in a handler of a fault entry, before `enable`.
+pub fn query() -> Result<Query, Error> {
+    let r = control_with(UpcallControl::Query, 0, 0)?;
+    Ok(Query {
+        esr: r[2],
+        far: r[3],
+        depth: r[4],
+        deferred: r[5],
+    })
+}
+
+/// `Adopt`: a thread that never entered takes the nesting `Query` gave for
+/// the thread it copies (a child of `fork` inside a handler).
+pub fn adopt(depth: u64, deferred: u64) -> Result<(), Error> {
+    control_with(UpcallControl::Adopt, depth, deferred).map(drop)
 }
 
 /// Binds the distributor in the kernel. The kernel keeps the thread's
@@ -228,9 +285,18 @@ pub unsafe fn enable() -> Result<bool, Error> {
 /// # Safety
 /// The jump to `target_sp` follows at once.
 pub unsafe fn abandon(target_sp: usize) {
+    // SAFETY: as for `abandon_frames`.
+    unsafe { abandon_frames(|outer| entries::jump_clears(outer, target_sp as u64)) }
+}
+
+/// `abandon` for a thread with an alternate signal stack: `leaves` says,
+/// from the frame `outer` of the live resident call, whether the jump
+/// abandons it (entries::jump_clears_frames).
+/// # Safety
+/// The jump to the target follows at once.
+pub unsafe fn abandon_frames(leaves: impl FnOnce(u64) -> bool) {
     let outer = word(ENTRY_OUTER);
-    let target = target_sp as u64;
-    if !entries::jump_clears(outer.load(Ordering::Relaxed), target) {
+    if !leaves(outer.load(Ordering::Relaxed)) {
         return;
     }
     // The order is the one of the hook in relibc's `longjmp`: clear `outer`
@@ -310,13 +376,13 @@ impl Drop for DeferredEntry {
 #[macro_export]
 macro_rules! upcall_entry {
     ($visibility:vis $name:ident, $dispatch:path) => {
-        $visibility unsafe extern "C" fn $name(_context: *mut $crate::upcall::Context) {
+        $visibility unsafe extern "C" fn $name(_context: *mut $crate::upcall::Context, _flags: u64) {
             // SAFETY: the distributor calls this adapter on the thread's stack.
             unsafe { $dispatch() }
         }
     };
     ($visibility:vis $name:ident, $dispatch:path, context) => {
-        $visibility unsafe extern "C" fn $name(context: *mut $crate::upcall::Context) {
+        $visibility unsafe extern "C" fn $name(context: *mut $crate::upcall::Context, _flags: u64) {
             // SAFETY: as above; the context is the live frame of the entry.
             unsafe { $dispatch(context) }
         }
@@ -337,7 +403,7 @@ macro_rules! upcall_entry {
 #[unsafe(naked)]
 unsafe extern "C" fn entry() {
     core::arch::naked_asm!(
-        "sub sp, sp, #1904",
+        "sub sp, sp, #{frame}",
         "stp x0, x1, [sp, #0]", "stp x2, x3, [sp, #16]",
         "stp x4, x5, [sp, #32]", "stp x6, x7, [sp, #48]",
         "stp x8, x9, [sp, #64]", "stp x10, x11, [sp, #80]",
@@ -365,6 +431,9 @@ unsafe extern "C" fn entry() {
         // The interrupted PC, PSTATE (flags included) and SP come from Take:
         // the kernel may have moved SP to the alternate stack.
         "str x2, [sp, #256]", "str x3, [sp, #264]", "str x4, [sp, #248]",
+        // x23: the mask and fault bits of Take, the second argument of the
+        // handlers (callee-saved, like x20 to x22).
+        "mov x23, x1",
         // x20: the entry record; x21: a handler; x22: the frame this entry
         // recorded in `outer`, or 0. Callee-saved, so the handlers keep them.
         "mrs x20, tpidrro_el0", "add x20, x20, #{entries}",
@@ -374,7 +443,7 @@ unsafe extern "C" fn entry() {
         "mov x22, sp", "str x22, [x20, #{outer}]",
         "4:",
         "ldr x9, [x20, #{tls}]", "msr tpidr_el0, x9",
-        "mov x0, sp", "blr x21",
+        "mov x0, sp", "mov x1, x23", "blr x21",
         "ldr x9, [sp, #272]", "msr tpidr_el0, x9",
         "cbz x22, 5f",
         "ldr x9, [x20, #{outer}]", "cmp x9, x22", "b.ne 5f",
@@ -382,7 +451,7 @@ unsafe extern "C" fn entry() {
         "5:",
         "ldr x21, [x20, #{own}]", "cbz x21, 6f",
         "ldr x9, [x20, #{outer}]", "cbnz x9, 8f",
-        "mov x0, sp", "blr x21",
+        "mov x0, sp", "mov x1, x23", "blr x21",
         "6:",
         "mov x0, #{mask}", "svc #{control}", "cbnz x0, 9f",
         "mrs x9, tpidrro_el0", "add x10, sp, #816", "mov x11, #1088",
@@ -399,6 +468,7 @@ unsafe extern "C" fn entry() {
         // spent (it clears `owed` with `outer`). Out of line, so that the
         // path of a thread without a resident handler stays as it was.
         "8:", "mov x9, #1", "str x9, [x20, #{owed}]", "b 6b",
+        frame = const FRAME_SIZE,
         control = const Call::ThreadUpcallControl.number(),
         take = const UpcallControl::Take.raw(),
         mask = const UpcallControl::Mask.raw(),
