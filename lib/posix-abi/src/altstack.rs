@@ -44,6 +44,9 @@ struct Alt {
     /// The stack pointer a handler without SA_ONSTACK started with while
     /// the dispatcher's frame is at the top of the alternate stack, else 0.
     floor: AtomicU64,
+    /// Where the kernel's range ends while a handler off the stack runs
+    /// (below the live frame); 0 when it ends at `high`.
+    cut: AtomicU64,
 }
 
 impl Alt {
@@ -55,9 +58,11 @@ impl Alt {
             high: AtomicU64::new(0),
             active: AtomicBool::new(false),
             floor: AtomicU64::new(0),
+            cut: AtomicU64::new(0),
         }
     }
     fn clear(&self) {
+        self.cut.store(0, Ordering::Relaxed);
         self.base.store(0, Ordering::Relaxed);
         self.size.store(0, Ordering::Relaxed);
         self.low.store(0, Ordering::Relaxed);
@@ -259,12 +264,19 @@ pub(crate) fn run(place: Place, body: impl FnOnce()) {
         }
         Place::Interrupted { sp, frame } => {
             let (low, high) = range().expect("a range for an interrupted place");
-            // The range ends below the live frame while the handler runs.
-            let _ = rt::upcall::set_stack(low, frame.saturating_sub(low) & !15);
+            // The range ends below everything live on the alternate stack
+            // while the handler runs: the dispatcher's frame at the top and
+            // the delivery of the layer under it, down to this frame.
+            let _ = frame;
+            let end = (stack_pointer() & !15).saturating_sub(64);
+            let cut = alt.cut.swap(end, Ordering::Relaxed);
+            let _ = rt::upcall::set_stack(low, end.saturating_sub(low));
             let before = alt.floor.swap(sp, Ordering::Relaxed);
             on_stack(sp, body);
             alt.floor.store(before, Ordering::Relaxed);
-            let _ = rt::upcall::set_stack(low, high - low);
+            alt.cut.store(cut, Ordering::Relaxed);
+            let back = if cut == 0 { high } else { cut };
+            let _ = rt::upcall::set_stack(low, back - low);
         }
     }
 }
@@ -286,6 +298,7 @@ pub(crate) fn jump(outer: u64, target: u64) -> bool {
     let leaves = entries::jump_clears_frames(outer, call, entries::frame_in(target, range));
     if let Some((low, high)) = range {
         if leaves && alt.floor.swap(0, Ordering::Relaxed) != 0 {
+            alt.cut.store(0, Ordering::Relaxed);
             let _ = rt::upcall::set_stack(low, high - low);
         }
         if !(low..high).contains(&target) {
@@ -305,7 +318,7 @@ fn on_stack<F: FnOnce()>(sp: u64, body: F) {
     unsafe {
         call_on(
             sp & !15,
-            thunk::<F> as usize,
+            thunk::<F> as *const () as usize,
             core::ptr::from_mut(&mut slot) as usize,
         )
     }

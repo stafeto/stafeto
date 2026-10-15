@@ -3889,6 +3889,10 @@ fn posix_procs_verdict(outcome: &qemu::Outcome) -> Result<(), String> {
     qemu::expect_marker(outcome, "posix-procs: names ok")?;
     qemu::expect_marker(outcome, "posix-procs: the names of posix_spawn ok")?;
     qemu::expect_marker(outcome, "posix-procs: dup3 with O_CLOFORK across fork ok")?;
+    qemu::expect_marker(
+        outcome,
+        "posix-procs: faults: sigaltstack, SA_ONSTACK, classes of faults, nesting ok",
+    )?;
     qemu::expect_marker(outcome, "posix-procs: ok")?;
     qemu::expect_marker(outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(outcome, "posix-procs: orphan saw ppid 1")?;
