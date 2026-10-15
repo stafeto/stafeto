@@ -46,6 +46,8 @@ loader-abort = []
 loader-info = ["loader-abort"]
 table-loader-channels = []
 table-posix-poll = []
+# The C probe of sockets (xtask posix-sock).
+table-posix-sock = []
 table-posix-pty = []
 # The probe of the longest step of the process service (posix-procs in the
 # steps mode, xtask process-steps).

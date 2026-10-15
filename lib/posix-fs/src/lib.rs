@@ -131,10 +131,14 @@ pub enum FileKind {
     Regular,
     Character,
     Fifo,
+    Socket,
 }
 
 /// The kind of a pipe's node information (NodeInfo::kind).
 pub const FIFO: u32 = 4;
+/// The kind of a socket's node information: a socket of the pipe service,
+/// or the node a bound socket names in the file service.
+pub const SOCKET: u32 = 6;
 
 impl FileKind {
     fn from_wire(kind: u32) -> Result<Self, FsError> {
@@ -143,6 +147,7 @@ impl FileKind {
             2 => Ok(Self::Regular),
             3 => Ok(Self::Character),
             FIFO => Ok(Self::Fifo),
+            SOCKET => Ok(Self::Socket),
             _ => Err(FsError::Io),
         }
     }
@@ -641,7 +646,11 @@ impl Transport {
             Target::Pipe(end) => {
                 let [pipe, _] = self.pipe_call(proto_pipe::Method::Stat, end, None)?;
                 Ok(NodeInfo {
-                    kind: FIFO,
+                    kind: if end & proto_pipe::sock::SOCK_END != 0 {
+                        SOCKET
+                    } else {
+                        FIFO
+                    },
                     permissions: 0o600,
                     device: 3,
                     special_device: 0,

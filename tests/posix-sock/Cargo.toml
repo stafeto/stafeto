@@ -1,0 +1,17 @@
+[package]
+name = "posix-sock"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The C probe of sockets: AF_UNIX, the IPv4 loopback, descriptors in flight, readiness"
+build = "build.rs"
+
+[[bin]]
+name = "posix-sock"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }

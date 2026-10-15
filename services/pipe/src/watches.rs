@@ -13,18 +13,18 @@ struct Registration {
     retired: bool,
     cleaned: u8,
 }
-/// Each readiness operation subscribes once to an underlying ring end.
+/// Each readiness operation subscribes once to an underlying queue: a ring
+/// end (0 to 127) or a socket (128 to 255).
 pub fn unique_queues(queues: &[u8]) -> impl Iterator<Item = u32> + '_ {
-    let mut seen = 0u128;
+    let mut seen = [0u128; 2];
     queues
         .iter()
         .copied()
         .filter(move |&queue| {
-            let Some(bit) = 1u128.checked_shl(u32::from(queue)) else {
-                return false;
-            };
-            let fresh = seen & bit == 0;
-            seen |= bit;
+            let bit = 1u128 << (queue % 128);
+            let word = &mut seen[usize::from(queue / 128)];
+            let fresh = *word & bit == 0;
+            *word |= bit;
             fresh
         })
         .map(u32::from)
@@ -112,7 +112,10 @@ mod tests {
             unique_queues(&[127, 0, 127, 64, 0, 63, 64]).collect::<Vec<_>>(),
             [127, 0, 64, 63]
         );
-        assert_eq!(unique_queues(&[128, 255]).count(), 0);
+        assert_eq!(
+            unique_queues(&[128, 255, 128, 0, 255]).collect::<Vec<_>>(),
+            [128, 255, 0]
+        );
     }
 
     #[test]

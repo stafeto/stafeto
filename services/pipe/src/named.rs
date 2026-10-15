@@ -54,6 +54,9 @@ impl Pipes {
         endpoint: Endpoint,
         write: Option<bool>,
     ) -> Result<(usize, usize, bool), u32> {
+        if endpoint.is_sock() {
+            return Err(BAD_FD);
+        }
         if !endpoint.is_named() {
             if endpoint.generation != 0 {
                 return Err(BAD_FD);
@@ -246,6 +249,9 @@ impl Pipes {
         endpoint: Endpoint,
         wakes: &mut Wakes,
     ) -> Result<(), u32> {
+        if endpoint.is_sock() {
+            return self.sock_close(held, endpoint, wakes);
+        }
         if !endpoint.is_named() {
             return self.close(held, endpoint.id, wakes);
         }
@@ -268,14 +274,20 @@ impl Pipes {
     pub fn clone_endpoints(&mut self, held: &Held, endpoints: &[Endpoint]) -> Result<Held, u32> {
         let mut out = Held::default();
         for &endpoint in endpoints {
-            self.resolve_endpoint(held, endpoint, None)?;
+            if endpoint.is_sock() {
+                self.sock_slot(held, endpoint)?;
+            } else {
+                self.resolve_endpoint(held, endpoint, None)?;
+            }
             out.add(endpoint.id as usize);
         }
         if out.count() > HELD_MAX {
             return Err(MFILE);
         }
         for id in out.descriptions() {
-            if id & NAMED_END != 0 {
+            if id & NAMED_END == 0 && id & SOCK_END != 0 {
+                self.sockets.s[(id & !SOCK_END) as usize].refs += 1;
+            } else if id & NAMED_END != 0 {
                 let slot = (id & !NAMED_END) as usize;
                 let record = &mut self.named_descriptions[slot];
                 record.refs += 1;
@@ -297,6 +309,9 @@ impl Pipes {
         out: &mut [u8],
         wakes: &mut Wakes,
     ) -> Result<Option<usize>, u32> {
+        if endpoint.is_sock() {
+            return self.sock_read(held, endpoint, out, wakes);
+        }
         let (index, end, nonblock) = self.resolve_endpoint(held, endpoint, Some(false))?;
         self.read_at(index, end, nonblock, out, wakes)
     }
@@ -307,10 +322,16 @@ impl Pipes {
         bytes: &[u8],
         wakes: &mut Wakes,
     ) -> Result<Option<usize>, u32> {
+        if endpoint.is_sock() {
+            return self.sock_write(held, endpoint, bytes, wakes);
+        }
         let (index, end, nonblock) = self.resolve_endpoint(held, endpoint, Some(true))?;
         self.write_at(index, end, nonblock, bytes, wakes)
     }
     pub fn flags_endpoint(&self, held: &Held, endpoint: Endpoint) -> Result<u32, u32> {
+        if endpoint.is_sock() {
+            return self.sock_flags(held, endpoint);
+        }
         if !endpoint.is_named() {
             return self.flags(held, endpoint.id);
         }
@@ -323,6 +344,9 @@ impl Pipes {
         endpoint: Endpoint,
         flags: u32,
     ) -> Result<(), u32> {
+        if endpoint.is_sock() {
+            return self.sock_set_flags(held, endpoint, flags);
+        }
         if !endpoint.is_named() {
             return self.set_flags(held, endpoint.id, flags);
         }
@@ -335,10 +359,16 @@ impl Pipes {
         Ok(())
     }
     pub fn stat_endpoint(&self, held: &Held, endpoint: Endpoint) -> Result<(u32, u32), u32> {
+        if endpoint.is_sock() {
+            return self.sock_stat(held, endpoint);
+        }
         let (index, _, _) = self.resolve_endpoint(held, endpoint, None)?;
         Ok((index as u32, u32::from(self.pipes[index].len)))
     }
     pub fn queue_end(&self, endpoint: Endpoint) -> Result<u32, u32> {
+        if endpoint.is_sock() {
+            return Ok(DESCRIPTIONS as u32 + endpoint.slot() as u32);
+        }
         if !endpoint.is_named() {
             return Ok(endpoint.id);
         }
@@ -352,6 +382,10 @@ impl Pipes {
 
     /// One exact held-description lookup supplies its canonical queue and readiness.
     pub fn watch_endpoint(&self, held: &Held, endpoint: Endpoint) -> Result<(u32, u32), u32> {
+        if endpoint.is_sock() {
+            let slot = self.sock_slot(held, endpoint)?;
+            return Ok((DESCRIPTIONS as u32 + slot as u32, self.sock_readiness(slot)));
+        }
         if !endpoint.is_named() {
             if endpoint.generation != 0 {
                 return Err(BAD_FD);

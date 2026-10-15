@@ -33,6 +33,8 @@ pub const CHAIN_PORTION: usize = 8;
 const NAME_ENTRIES: usize = ORIGINALS + DENTRIES;
 pub const FIFO: u32 = 4;
 pub const SYMLINK: u32 = 5;
+/// A node a bound socket of the pipe service names (stat: S_IFSOCK).
+pub const SOCK: u32 = 6;
 /// Links of the list of the names of a directory a step walks to find a position.
 pub const LIST_PORTION: usize = 256;
 
@@ -1832,7 +1834,7 @@ impl<'a> Storage<'a> {
         if self.lookup(parent, name).is_ok() {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
-        if ![crate::DIR, crate::REG, FIFO, SYMLINK].contains(&kind) {
+        if ![crate::DIR, crate::REG, FIFO, SYMLINK, SOCK].contains(&kind) {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
         let a = self.account(root)?;

@@ -50,10 +50,12 @@ const S_IFREG: u32 = 0o100_000;
 const S_IFCHR: u32 = 0o020_000;
 const S_IFLNK: u32 = 0o120_000;
 const S_IFIFO: u32 = 0o010_000;
+const S_IFSOCK: u32 = 0o140_000;
 /// Linux's dirent64 d_type.
 const DT_FIFO: u8 = 1;
 const DT_CHR: u8 = 2;
 const DT_DIR: u8 = 4;
+const DT_SOCK: u8 = 12;
 const DT_REG: u8 = 8;
 
 fn time(time: posix_fs::Timestamp) -> [i64; 2] {
@@ -66,6 +68,7 @@ fn linux_stat(info: &NodeInfo) -> LinuxStat {
         2 => S_IFREG,
         5 => S_IFLNK,
         posix_fs::FIFO => S_IFIFO,
+        posix_fs::SOCKET => S_IFSOCK,
         _ => S_IFCHR,
     };
     LinuxStat {
@@ -150,6 +153,7 @@ fn entries(files: Transport, fd: Target, out: &mut [u8], position: u64) -> Resul
                 FileKind::Regular => DT_REG,
                 FileKind::Character => DT_CHR,
                 FileKind::Fifo => DT_FIFO,
+                FileKind::Socket => DT_SOCK,
             };
             Ok(Some(posix_change::dirent::Item {
                 inode: entry.inode,

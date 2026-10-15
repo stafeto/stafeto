@@ -61,7 +61,7 @@ impl NodeInfo {
             modify_time: Timestamp::read(input)?,
             change_time: Timestamp::read(input)?,
         };
-        if !matches!(info.kind, 1..=5) || info.permissions & !0o7777 != 0 || info.block_size == 0 {
+        if !matches!(info.kind, 1..=6) || info.permissions & !0o7777 != 0 || info.block_size == 0 {
             return Err(Status::BadSize);
         }
         Ok(info)
@@ -105,7 +105,7 @@ mod tests {
                 Err(Status::BadSize)
             );
         }
-        for (offset, value) in [(0, 6u32), (4, 0o10000), (56, 0)] {
+        for (offset, value) in [(0, 7u32), (4, 0o10000), (56, 0)] {
             let mut invalid = [0; 116];
             invalid.copy_from_slice(bytes);
             invalid[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -114,7 +114,7 @@ mod tests {
                 Err(Status::BadSize)
             );
         }
-        for kind in [4u32, 5] {
+        for kind in [4u32, 5, 6] {
             let mut accepted = [0; 116];
             accepted.copy_from_slice(bytes);
             accepted[..4].copy_from_slice(&kind.to_le_bytes());

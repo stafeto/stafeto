@@ -207,6 +207,8 @@ fn dialog() -> Vec<RootFile> {
         file("/bin/sleep", 0o755, ROOT, "busybox-probe"),
         file("/bin/head", 0o755, ROOT, "busybox-probe"),
         file("/bin/mktemp", 0o755, ROOT, "busybox-probe"),
+        file("/bin/nc", 0o755, ROOT, "busybox-probe"),
+        file("/bin/timeout", 0o755, ROOT, "busybox-probe"),
         file("/bin/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
     ];
@@ -561,6 +563,16 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 dir("/dev"),
             ];
             files.extend(devices());
+            files
+        }
+        "boot-posix-sock.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-sock", 0o755, ROOT, "posix-sock"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files.extend(network_databases());
             files
         }
         "boot-posix-pty.img" | "boot-posix-pty-steps.img" => {

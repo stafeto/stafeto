@@ -216,6 +216,16 @@ pub fn mkfifoat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), 
     run_unit(&create)
 }
 
+/// Create the node of kind socket that a bound socket of the pipe service
+/// names; EEXIST for a name in use.
+pub fn mksockat(dirfd: c_int, path: &[u8], mode: u32, umask: u32) -> Result<(), c_int> {
+    let placed = place(dirfd, path)?;
+    check_virtual(Named::Mkdir, &placed, None, false)?;
+    let mut create = request(ChangeOp::Mksock, &placed);
+    create.args = [u64::from(mode & 0o7777), u64::from(umask & 0o777), 0, 0];
+    run_unit(&create)
+}
+
 /// access and faccessat: the real IDs, the effective with AT_EACCESS.
 pub fn faccessat(dirfd: c_int, path: &[u8], mode: c_int, flags: c_int) -> Result<(), c_int> {
     if flags & !AT_EACCESS != 0 || !(0..=7).contains(&mode) {

@@ -35,7 +35,7 @@ A53_ERRATA = "-mfix-cortex-a53-835769"
 UNWIND_CFLAGS = ("-fasynchronous-unwind-tables", "-mllvm", "-enable-machine-outliner=never")
 # BusyBox's main becomes busybox_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
-PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-traps names-nofork-cat math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769"
+PATCH = "echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-traps names-nofork-cat math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769 sockets nc timeout"
 
 
 def relibc_commit() -> str:
@@ -67,6 +67,8 @@ OBJECTS = (
     "ask_confirmation.o", "make_directory.o", "copy_file.o", "inode_hash.o",
     "concat_subpath_file.o", "isdirectory.o", "recursive_action.o", "xgetcwd.o",
     "remove_file.o",
+    # nc: connections over the loopback of the socket service (Ф9).
+    "xconnect.o", "inet_common.o", "executable.o", "bb_do_delay.o",
 )
 
 
@@ -105,6 +107,7 @@ def main() -> None:
             and (SOURCE / "coreutils/lib.a").exists()
             and (SOURCE / "shell/lib.a").exists()
             and (SOURCE / "procps/lib.a").exists()
+            and (SOURCE / "networking/lib.a").exists()
             and (SOURCE / "coreutils/libcoreutils/lib.a").exists()):
         print(f"BusyBox objects ready: {SOURCE}")
         return
@@ -194,6 +197,9 @@ def main() -> None:
         replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
     replace(config, "# CONFIG_WC is not set", "CONFIG_WC=y")
     replace(config, "# CONFIG_SLEEP is not set", "CONFIG_SLEEP=y")
+    # timeout, and nc with its server and its -e (Ф9: sockets).
+    for name in ("TIMEOUT", "NC", "NC_SERVER", "NC_EXTRA"):
+        replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
     # The applets that take bytes or names from the random devices (5e').
     replace(config, "# CONFIG_HEAD is not set", "CONFIG_HEAD=y")
     replace(config, "# CONFIG_FEATURE_FANCY_HEAD is not set", "CONFIG_FEATURE_FANCY_HEAD=y")
@@ -223,14 +229,14 @@ def main() -> None:
     include = RELIBC / "include"
     if not (include / "stdio.h").exists():
         raise SystemExit("build relibc with cargo xtask relibc first")
-    run("make", "-j4", "libbb", "coreutils", "coreutils/libcoreutils/", "shell", "procps", f"CC={clang}", f"LD={lld}",
+    run("make", "-j4", "libbb", "coreutils", "coreutils/libcoreutils/", "shell", "procps", "networking", f"CC={clang}", f"LD={lld}",
         f"AR={ar}", "HOSTCC=cc",
         "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-linux-gnu", "-nostdinc",
             f"-isystem {include}", f"-idirafter {COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
             "-ffunction-sections", "-fdata-sections", "-Dmain=busybox_main",
             A53_ERRATA, *UNWIND_CFLAGS)), cwd=SOURCE)
     for archive in [SOURCE / "libbb/lib.a", SOURCE / "coreutils/lib.a",
-                    SOURCE / "shell/lib.a", SOURCE / "procps/lib.a",
+                    SOURCE / "shell/lib.a", SOURCE / "procps/lib.a", SOURCE / "networking/lib.a",
                     SOURCE / "coreutils/libcoreutils/lib.a"]:
         if not archive.exists():
             raise SystemExit(f"BusyBox did not produce {archive}")

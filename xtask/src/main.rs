@@ -1315,6 +1315,8 @@ commands:
             steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
   entropy-vz run the probe of the entropy device's driver on Apple VZ
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
+  posix-sock run the C probe of sockets in QEMU
+  posix-sock-steps measure the steps of the socket calls under -icount, against term B
   help      this text";
 
 fn main() {
@@ -1424,6 +1426,8 @@ fn main() {
         Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
+        Some("posix-sock") => posix_sock_probe(),
+        Some("posix-sock-steps") => posix_sock_steps(),
         Some("posix-pty") => posix_pty_probe(),
         Some("posix-tty-control-steps") => posix_tty_control_steps(),
         Some("posix-pty-steps") => posix_pty_probe_in(true),
@@ -2834,6 +2838,90 @@ fn posix_poll_probe() -> Result<(), String> {
         "init: posix-poll ended: exit code 0, not restarted",
     )?;
     check_watch_steps(&output.lines)
+}
+
+/// The probe of sockets (tests/posix-sock): AF_UNIX and the loopback, by
+/// the property, each with the breakage that makes its check fail.
+fn posix_sock_probe() -> Result<(), String> {
+    posix_sock_run(false).map(drop)
+}
+
+/// The same probe with the pipe service's step statistics: the longest step
+/// of each kind stays under term B.
+fn posix_sock_steps() -> Result<(), String> {
+    let lines = posix_sock_run(true)?;
+    let rows = longest_steps(&lines, "4");
+    let mut text = String::new();
+    for (kind, ticks, detail) in &rows {
+        let name = match kind {
+            26..=39 => format!("socket call {kind}"),
+            64 => "heartbeat".to_owned(),
+            65 => "own step".to_owned(),
+            _ => format!("method {kind}"),
+        };
+        text += &format!("pipe {kind} {name} {ticks} {detail}\n");
+        println!("pipe service {name}: {ticks} ticks, detail {detail}, B {TERM_B}");
+    }
+    let sockets = rows.iter().filter(|r| (26..=39).contains(&r.0)).count();
+    if sockets < 8 {
+        return Err(format!("the socket calls ran too few kinds: {rows:?}"));
+    }
+    if let Some(row) = rows.iter().find(|r| r.0 != 64 && r.1 > TERM_B) {
+        return Err(format!("the pipe service: a step past term B: {row:?}"));
+    }
+    let worst = rows
+        .iter()
+        .filter(|r| r.0 != 64)
+        .map(|r| r.1)
+        .max()
+        .unwrap_or(0);
+    println!("posix-sock-steps: the worst step {worst} of B {TERM_B}");
+    Ok(())
+}
+
+const fn sock_programs(steps: &'static [&'static str]) -> [ImageProgram; 11] {
+    [
+        ("init", "init", INIT_STACK_SIZE, &["table-posix-sock"]),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        ("tty", "tty", TTY_STACK_SIZE, &["quiet-steps"]),
+        POSIX_PROCS_PROGRAMS[1],
+        ("pipe", "pipe", PIPE_STACK_SIZE, steps),
+        POSIX_PROCS_PROGRAMS[3],
+        POSIX_PROCS_PROGRAMS[4],
+        ("posix-sock", "posix-sock", POSIX_STACK_SIZE, &[]),
+        POSIX_PROCS_PROGRAMS[6],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ]
+}
+static SOCK_PROGRAMS: [ImageProgram; 11] = sock_programs(&[]);
+static SOCK_PROGRAMS_STEPS: [ImageProgram; 11] = sock_programs(&["steps"]);
+
+fn posix_sock_run(steps: bool) -> Result<Vec<String>, String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let kernel = build(Variant::Normal)?;
+    let programs: &[ImageProgram] = if steps {
+        &SOCK_PROGRAMS_STEPS
+    } else {
+        &SOCK_PROGRAMS
+    };
+    let image = build_boot_image("boot-posix-sock.img", programs, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: posix-sock ended: "),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(&output, "posix-sock: ok")?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: posix-sock ended: exit code 0, not restarted",
+    )?;
+    Ok(output.lines)
 }
 
 fn posix_pty_probe() -> Result<(), String> {
@@ -5048,15 +5136,17 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "9", "ash", busybox.clone()),
-        ("-rwxr-xr-x", "9", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "9", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "9", "head", busybox.clone()),
-        ("-rwxr-xr-x", "9", "ls", busybox.clone()),
-        ("-rwxr-xr-x", "9", "mktemp", busybox.clone()),
-        ("-rwxr-xr-x", "9", "sh", busybox.clone()),
-        ("-rwxr-xr-x", "9", "sleep", busybox.clone()),
-        ("-rwxr-xr-x", "9", "wc", busybox),
+        ("-rwxr-xr-x", "11", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "11", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "11", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "11", "head", busybox.clone()),
+        ("-rwxr-xr-x", "11", "ls", busybox.clone()),
+        ("-rwxr-xr-x", "11", "mktemp", busybox.clone()),
+        ("-rwxr-xr-x", "11", "nc", busybox.clone()),
+        ("-rwxr-xr-x", "11", "sh", busybox.clone()),
+        ("-rwxr-xr-x", "11", "sleep", busybox.clone()),
+        ("-rwxr-xr-x", "11", "timeout", busybox.clone()),
+        ("-rwxr-xr-x", "11", "wc", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
@@ -5317,6 +5407,26 @@ fn ash_dialog() -> Result<(), String> {
             |line| line.trim() == bin_count,
             DIALOG_STEP,
         )?;
+        run.expect("# ", DIALOG_STEP)?;
+        // Time and sockets (Ф9): sleep and timeout, and nc over the
+        // loopback of the socket service, a server in the background and a
+        // client that sends it a line.
+        run.send("sleep 1; echo slept $?")?;
+        run.expect_line("slept 0", |line| line == "slept 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("timeout 5 /bin/ls /bin/nc; echo in-time-status $?")?;
+        run.expect_line("in-time", |line| line == "/bin/nc", DIALOG_STEP)?;
+        run.expect_line(
+            "in-time-status 0",
+            |line| line == "in-time-status 0",
+            DIALOG_STEP,
+        )?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("timeout 1 /bin/sleep 30; echo cut-short $?")?;
+        run.expect_line("cut-short 143", |line| line == "cut-short 143", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("nc -l -p 4040 > /tmp/nc.out & sleep 1; echo hello-nc | nc 127.0.0.1 4040; wait; cat /tmp/nc.out")?;
+        run.expect_line("nc line", |line| line == "hello-nc", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         // A writer that writes nothing and outlasts its reader's start: the
         // reader sits in `read` on the empty pipe when the last end of the
@@ -5788,6 +5898,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
+        job("posix-sock", posix_sock_probe),
+        job("posix-sock-steps", posix_sock_steps),
         job("posix-pty", posix_pty_probe),
         job("posix-pty-steps", posix_pty_steps),
         // BusyBox on relibc guards the C surface (5a').
@@ -7831,6 +7943,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-sync-probe",
         "--package",
         "posix-resources-probe",
+        "--package",
+        "posix-sock",
         "--target",
         PROGRAM_TARGET,
         "--",

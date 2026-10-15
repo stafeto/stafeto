@@ -16,8 +16,10 @@
 
 pub mod admissions;
 pub mod named;
+pub mod sockets;
 pub mod watches;
 pub use named::NamedInode;
+use proto_pipe::sock::{SOCK_END, SOCKETS};
 use proto_pipe::{Endpoint, NAMED_END, NAMED_MAX};
 
 pub use proto_pipe::{
@@ -36,6 +38,7 @@ pub type Waiter = (u64, u64);
 pub struct Held {
     bits: u128,
     named: u128,
+    socks: u64,
 }
 
 impl Held {
@@ -43,13 +46,16 @@ impl Held {
         if description & NAMED_END != 0 {
             let slot = (description & !NAMED_END) as usize;
             slot < NAMED_MAX && self.named & 1 << slot != 0
+        } else if description & SOCK_END != 0 {
+            let slot = (description & !SOCK_END) as usize;
+            slot < SOCKETS && self.socks & 1 << slot != 0
         } else {
             (description as usize) < DESCRIPTIONS && self.bits & 1 << description != 0
         }
     }
 
     pub fn count(&self) -> usize {
-        (self.bits.count_ones() + self.named.count_ones()) as usize
+        (self.bits.count_ones() + self.named.count_ones() + self.socks.count_ones()) as usize
     }
 
     /// The exact subset of live descriptions this session already holds.
@@ -77,19 +83,30 @@ impl Held {
             Some(description)
         });
         let mut named = self.named;
-        anonymous.chain(core::iter::from_fn(move || {
+        let named = core::iter::from_fn(move || {
             if named == 0 {
                 return None;
             }
             let slot = named.trailing_zeros();
             named &= named - 1;
             Some(NAMED_END | slot)
+        });
+        let mut socks = self.socks;
+        anonymous.chain(named).chain(core::iter::from_fn(move || {
+            if socks == 0 {
+                return None;
+            }
+            let slot = socks.trailing_zeros();
+            socks &= socks - 1;
+            Some(SOCK_END | slot)
         }))
     }
 
     fn add(&mut self, description: usize) {
         if description & NAMED_END as usize != 0 {
             self.named |= 1 << (description & !(NAMED_END as usize));
+        } else if description & SOCK_END as usize != 0 {
+            self.socks |= 1 << (description & !(SOCK_END as usize));
         } else {
             self.bits |= 1 << description;
         }
@@ -98,6 +115,8 @@ impl Held {
     fn remove(&mut self, description: usize) {
         if description & NAMED_END as usize != 0 {
             self.named &= !(1 << (description & !(NAMED_END as usize)));
+        } else if description & SOCK_END as usize != 0 {
+            self.socks &= !(1 << (description & !(SOCK_END as usize)));
         } else {
             self.bits &= !(1 << description);
         }
@@ -108,11 +127,31 @@ impl Held {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Wakes {
     list: [Option<Waiter>; WAITERS],
+    /// A second list: a socket's change wakes its peer and itself.
+    extra: [Option<Waiter>; WAITERS],
 }
 
 impl Wakes {
     pub fn iter(&self) -> impl Iterator<Item = Waiter> + '_ {
-        self.list.iter().flatten().copied()
+        self.list.iter().chain(self.extra.iter()).flatten().copied()
+    }
+
+    /// Adds the operations of `list` to the first of the two lists that is
+    /// free; nothing to add adds nothing.
+    fn add(&mut self, list: [Option<Waiter>; WAITERS]) {
+        if list[0].is_none() {
+            return;
+        }
+        if self.list[0].is_none() {
+            self.list = list;
+        } else {
+            self.extra = list;
+        }
+    }
+
+    fn merge(&mut self, other: &Wakes) {
+        self.add(other.list);
+        self.add(other.extra);
     }
 }
 
@@ -223,6 +262,7 @@ pub struct Pipes {
     named_descriptions: [named::Description; NAMED_MAX],
     named_dropping: [u16; NAMED_MAX],
     named_dirty: u128,
+    sockets: sockets::Sockets,
 }
 
 /// The pipe and the end of `description`, a held one of the kind asked.
@@ -253,6 +293,7 @@ impl Pipes {
             named_descriptions: [named::Description::FREE; NAMED_MAX],
             named_dropping: [0; NAMED_MAX],
             named_dirty: 0,
+            sockets: sockets::Sockets::new(),
         }
     }
 
@@ -410,6 +451,14 @@ impl Pipes {
         waiter: Waiter,
         alive: impl Fn(Waiter) -> bool,
     ) -> Result<(), u32> {
+        if description as usize >= DESCRIPTIONS {
+            let end = self.sockets.queue(description)?;
+            if end.waiters[..usize::from(end.count)].contains(&Some(waiter)) {
+                return Ok(());
+            }
+            end.keep(alive);
+            return end.push(waiter);
+        }
         let (index, is_write) = proto_pipe::end_of(description);
         let end = self
             .pipes
@@ -431,6 +480,11 @@ impl Pipes {
         waiter: Waiter,
         alive: impl Fn(Waiter) -> bool,
     ) -> Result<(), u32> {
+        if description as usize >= DESCRIPTIONS {
+            let end = self.sockets.queue(description)?;
+            end.keep(alive);
+            return end.push(waiter);
+        }
         let (index, is_write) = proto_pipe::end_of(description);
         let end = self
             .pipes
@@ -476,6 +530,12 @@ impl Pipes {
 
     /// The operation `waiter` waits at `description` no more.
     pub fn unwait(&mut self, description: u32, waiter: Waiter) {
+        if description as usize >= DESCRIPTIONS {
+            if let Ok(end) = self.sockets.queue(description) {
+                end.keep(|w| w != waiter);
+            }
+            return;
+        }
         let (index, is_write) = proto_pipe::end_of(description);
         if let Some(pipe) = self.pipes.get_mut(index) {
             pipe.ends[is_write as usize].keep(|w| w != waiter);
@@ -537,22 +597,33 @@ impl Pipes {
             self.named_dropping[slot] += 1;
             self.named_dirty |= 1 << slot;
         }
+        let mut socks = held.socks;
+        while socks != 0 {
+            let slot = socks.trailing_zeros() as usize;
+            socks &= socks - 1;
+            self.sockets.dropping[slot] += 1;
+            self.sockets.dirty |= 1 << slot;
+        }
         held.bits = 0;
         held.named = 0;
-        self.dirty != 0 || self.named_dirty != 0
+        held.socks = 0;
+        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due()
     }
 
     /// One description that sessions which went let go of: its references
     /// go (`unref`). Whether another step is due.
     pub fn step(&mut self, wakes: &mut Wakes) -> bool {
-        if self.dirty == 0 {
-            return self.named_step(wakes);
+        if self.dirty != 0 {
+            let d = self.dirty.trailing_zeros() as usize;
+            self.dirty &= !(1 << d);
+            let count = core::mem::take(&mut self.dropping[d]);
+            self.unref(d, count, wakes);
+        } else if self.named_dirty != 0 {
+            self.named_step(wakes);
+        } else {
+            self.sock_step(wakes);
         }
-        let d = self.dirty.trailing_zeros() as usize;
-        self.dirty &= !(1 << d);
-        let count = core::mem::take(&mut self.dropping[d]);
-        self.unref(d, count, wakes);
-        self.dirty != 0 || self.named_dirty != 0
+        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due()
     }
 
     /// Clone: a new session's holding of the descriptions `list` of
@@ -600,6 +671,11 @@ impl Pipes {
     pub fn stat(&self, held: &Held, description: u32) -> Result<(u32, u32), u32> {
         let (index, _) = split(held, description, None)?;
         Ok((index as u32, u32::from(self.pipes[index].len)))
+    }
+
+    /// Whether `step` has work.
+    pub fn work_due(&self) -> bool {
+        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due()
     }
 
     /// The pipes in use.

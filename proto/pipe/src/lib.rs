@@ -61,6 +61,7 @@ use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
 pub mod named;
+pub mod sock;
 pub use named::{
     APPEND, BrokerCancel, BrokerPrepare, Endpoint, NAMED_END, NAMED_MAX, NAMED_MAX_WRITE,
     NAMED_ROOT_MAX, NO_READER, NamedPhase, NamedReply, NamedTicket, RAM_BROKER,
@@ -94,6 +95,8 @@ pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 12;
 pub const NONBLOCK: u32 = 1;
 /// GET_FLAGS: the description is a write end.
 pub const WRITE_END: u32 = 2;
+/// GET_FLAGS: the description is a socket, open for reading and writing.
+pub const RDWR: u32 = 8;
 
 /// EBADF.
 pub const BAD_FD: u32 = 701;
@@ -143,10 +146,24 @@ pub enum Method {
     NamedTake = 23,
     NamedCancel = 24,
     NamedAck = 25,
+    SockCreate = 26,
+    SockPair = 27,
+    SockBind = 28,
+    SockListen = 29,
+    SockConnect = 30,
+    SockAccept = 31,
+    SockAcceptTake = 32,
+    SockShutdown = 33,
+    SockName = 34,
+    SockOpt = 35,
+    SockSend = 36,
+    SockSendTake = 37,
+    SockRecv = 38,
+    SockRecvTake = 39,
 }
 
 impl Method {
-    pub const ALL: [Method; 24] = [
+    pub const ALL: [Method; 38] = [
         Method::Create,
         Method::ReadStart,
         Method::ReadTake,
@@ -171,6 +188,20 @@ impl Method {
         Method::NamedTake,
         Method::NamedCancel,
         Method::NamedAck,
+        Method::SockCreate,
+        Method::SockPair,
+        Method::SockBind,
+        Method::SockListen,
+        Method::SockConnect,
+        Method::SockAccept,
+        Method::SockAcceptTake,
+        Method::SockShutdown,
+        Method::SockName,
+        Method::SockOpt,
+        Method::SockSend,
+        Method::SockSendTake,
+        Method::SockRecv,
+        Method::SockRecvTake,
     ];
 
     pub const fn number(self) -> u16 {
@@ -187,7 +218,8 @@ impl Method {
 }
 
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
 ];
 
 /// READ_START or READ_TAKE: the key of a take, the end and the count.
@@ -365,7 +397,7 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed_and_listed() {
-        for number in 0..=26u16 {
+        for number in 0..=40u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(m) = method {

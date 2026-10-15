@@ -28,10 +28,13 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # its kin with timer_getoverrun, sigqueue, clock, _POSIX_TIMERS and the timer
 # limits of sysconf, SI_TIMER, _POSIX_REALTIME_SIGNALS not claimed; tagged
 # pin-52ebecff.
+# F9 sockets: AF_UNIX and the IPv4 loopback through the layer, accept4,
+# sockatmark, service names in getaddrinfo and getnameinfo, reverse lookup
+# from /etc/hosts; tagged pin-a5096e2d.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "52ebecffdcc19cb49f103c84ec0a5e7336d5d280"
+COMMIT = "a5096e2dd41b957559c97d7c77fa3268a1840472"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

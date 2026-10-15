@@ -45,6 +45,7 @@ pub mod relibc;
 pub mod resources;
 pub mod shared;
 pub mod signals;
+pub mod sockets;
 pub mod synchronization;
 pub mod terminal;
 pub mod threads;

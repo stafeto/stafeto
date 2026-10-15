@@ -53,6 +53,8 @@ pub enum ChangeOp {
     StatVfs = 11,
     Path = 12,
     Mkfifo = 13,
+    /// A node of kind socket: the name a bound socket of the pipe service keeps.
+    Mksock = 14,
 }
 impl ChangeOp {
     pub fn from_number(number: u32) -> Option<Self> {
@@ -70,6 +72,7 @@ impl ChangeOp {
             11 => Self::StatVfs,
             12 => Self::Path,
             13 => Self::Mkfifo,
+            14 => Self::Mksock,
             _ => return None,
         })
     }
@@ -164,7 +167,7 @@ impl ChangeStart<'_> {
         }
         let a = self.args;
         let valid = match self.op {
-            ChangeOp::Mkdir | ChangeOp::Mkfifo => {
+            ChangeOp::Mkdir | ChangeOp::Mkfifo | ChangeOp::Mksock => {
                 a[0] <= MODE_MASK && a[1] <= 0o777 && a[2] == 0 && a[3] == 0
             }
             ChangeOp::Chmod => a[0] <= MODE_MASK && a[1..] == [0; 3],
@@ -437,6 +440,8 @@ mod tests {
         round(mkdir);
         mkdir.op = ChangeOp::Mkfifo;
         round(mkdir);
+        mkdir.op = ChangeOp::Mksock;
+        round(mkdir);
         let mut unlink = start(ChangeOp::Unlink, b"/tmp/d");
         unlink.flags = UNLINK_REMOVEDIR;
         round(unlink);
@@ -541,7 +546,7 @@ mod tests {
         let mut bytes = [0; 128];
         let n = out.as_bytes().len();
         bytes[..n].copy_from_slice(out.as_bytes());
-        for op in [0u32, 14, u32::MAX] {
+        for op in [0u32, 15, u32::MAX] {
             bytes[12..16].copy_from_slice(&op.to_le_bytes());
             assert_eq!(
                 ChangeStart::read(Reader::new(&bytes[..n])),

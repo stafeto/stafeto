@@ -838,6 +838,9 @@ impl<'a> Ram<'a> {
         if node.kind == storage::FIFO && access == proto_fs::READ_WRITE {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
+        if node.kind == storage::SOCK {
+            return Err(proto_fs::NO_DATA);
+        }
         if created && node.links != 0 {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
@@ -1602,6 +1605,9 @@ impl<'a> Ram<'a> {
         let node = self.storage.node(token)?;
         if node.kind == storage::FIFO && flags & 3 == proto_fs::READ_WRITE {
             return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        if node.kind == storage::SOCK {
+            return Err(proto_fs::NO_DATA);
         }
         let bits = match flags & 3 {
             proto_fs::READ_ONLY => 4,
