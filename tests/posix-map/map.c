@@ -484,6 +484,30 @@ static void unrelated_processes(void) {
     shm_unlink(name);
 }
 
+/* Many cuts of the heap's pages: the table of the kernel stays short of
+ * places, the free runs are joined, and a freed page still faults. */
+static void fragmentation(void) {
+    char *kept[40] = {0};
+    int fine = 1;
+    char *last = NULL;
+    for (int round = 0; round < 600 && fine; round++) {
+        char *a = anon(PAGE, PROT_READ | PROT_WRITE);
+        char *b = anon(PAGE, PROT_READ | PROT_WRITE);
+        if (!a || !b) { fine = 0; break; }
+        a[0] = 1;
+        b[0] = 2;
+        munmap(a, PAGE);
+        last = a;
+        int slot = round % 40;
+        if (kept[slot]) munmap(kept[slot], PAGE);
+        kept[slot] = b;
+    }
+    check("fragmentation: 600 rounds", fine);
+    check("fragmentation: a freed page still faults", last && read_faults(last));
+    for (int i = 0; i < 40; i++) if (kept[i]) munmap(kept[i], PAGE);
+    check("fragmentation: the freed pages fault", last && read_faults(last));
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
     if (argc == 1) {
@@ -511,6 +535,7 @@ int main(int argc, char **argv) {
     errors();
     forked();
     churn();
+    fragmentation();
     shared_anonymous();
     files();
     shared_names();

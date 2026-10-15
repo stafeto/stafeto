@@ -35,7 +35,10 @@ pub enum Got<'a, T> {
 enum State<T> {
     /// A process makes the object: the record of that process.
     Making(usize),
-    Ready { pages: u32, memory: T },
+    Ready {
+        pages: u32,
+        memory: T,
+    },
 }
 
 struct Entry<T> {
@@ -200,7 +203,11 @@ mod tests {
         assert_eq!(t.len(), 1);
         t.detach(7, 2);
         assert!(t.is_empty());
-        assert_eq!(t.get(7, 3), Got::Reserved, "a new object after the last went");
+        assert_eq!(
+            t.get(7, 3),
+            Got::Reserved,
+            "a new object after the last went"
+        );
     }
 
     /// A maker that ended before its Put leaves nothing, and a process that

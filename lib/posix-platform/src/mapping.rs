@@ -34,7 +34,10 @@ fn file_info(fd: c_int) -> Result<(u64, u64), c_int> {
     if info.kind != 2 {
         return Err(ENODEV);
     }
-    Ok((info.size, posix_abi::shares::key_of(info.device, info.inode)))
+    Ok((
+        info.size,
+        posix_abi::shares::key_of(info.device, info.inode),
+    ))
 }
 
 fn file_size(fd: c_int) -> Result<u64, c_int> {
@@ -156,8 +159,7 @@ fn file_mapping(
     let (kept, new) = match mmap::fd_of_key(key) {
         Some(kept) => (kept, false),
         None => {
-            let mut kept =
-                super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, u64::from(KEEP_FROM));
+            let mut kept = super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, u64::from(KEEP_FROM));
             if kept < 0 {
                 kept = super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, 3);
             }

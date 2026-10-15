@@ -31,6 +31,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # F9 sockets: AF_UNIX and the IPv4 loopback through the layer, accept4,
 # sockatmark, service names in getaddrinfo and getnameinfo, reverse lookup
 # from /etc/hosts; tagged pin-a5096e2d.
+# F8 mappings: mmap of files and shared memory, mprotect, msync, madvise and
+# the checks of mlock through the layer; tagged pin-42b71064.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.

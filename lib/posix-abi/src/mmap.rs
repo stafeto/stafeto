@@ -114,8 +114,7 @@ fn load_limits() {
     }
     // The service starts both at the process's quota, which the kernel
     // enforces on its own; the layer counts only a limit below it.
-    let quota =
-        rt::sys::process_memory(crate::allocation::process()).map_or(u64::MAX, |m| m.quota);
+    let quota = rt::sys::process_memory(crate::allocation::process()).map_or(u64::MAX, |m| m.quota);
     for (resource, cell) in [(2, &LIMIT_DATA), (9, &LIMIT_AS)] {
         if let Ok(limit) = crate::resources::get(resource) {
             cell.store(
@@ -134,7 +133,11 @@ fn load_limits() {
 /// `setrlimit` of RLIMIT_DATA or RLIMIT_AS (Linux's 2 and 9): the soft
 /// limit the heap's section checks.
 pub(crate) fn set_limit(resource: i32, soft: u64) {
-    let cell = if resource == 2 { &LIMIT_DATA } else { &LIMIT_AS };
+    let cell = if resource == 2 {
+        &LIMIT_DATA
+    } else {
+        &LIMIT_AS
+    };
     cell.store(soft, Ordering::Relaxed);
 }
 
@@ -154,9 +157,7 @@ pub struct FileSource {
 
 /// A duplicate of the object that shows the page at `address` and the pages
 /// it covers, for the process service (Put, Attach).
-pub fn object_at(
-    address: usize,
-) -> Option<(rt::handle::Handle<rt::handle::Memory>, usize)> {
+pub fn object_at(address: usize) -> Option<(rt::handle::Handle<rt::handle::Memory>, usize)> {
     use rt::abi::Rights;
     let (raw, pages) = heap(|state| {
         let index = state.map.find(address)?;
