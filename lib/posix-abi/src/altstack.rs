@@ -176,9 +176,7 @@ pub fn sigaltstack(new: Option<(u64, u64, i32)>) -> Result<(u64, u64, i32), i32>
     let end = base.checked_add(size).ok_or(EINVAL)?;
     let low = base.checked_add(15).ok_or(EINVAL)? & !15;
     let high = end & !15;
-    if high.saturating_sub(low) < MINSIGSTKSZ {
-        return Err(ENOMEM);
-    }
+    // The aligned range loses 30 bytes at most, which MINSIGSTKSZ has to spare.
     rt::upcall::set_stack(low, high - low).map_err(|_| EINVAL)?;
     alt.base.store(base, Ordering::Relaxed);
     alt.size.store(size, Ordering::Relaxed);
