@@ -37,7 +37,9 @@
    The call stack runs from the emergency stack on into the kernel stack,
    so it shows the function that overflowed the stack.
 
-4. A program fault at EL0 terminates only that process; the machine keeps
+4. A program fault at EL0 terminates only that process, unless the thread
+   asked for faults and its entry is open (the layer's signal entry): then the
+   fault enters the entry and nothing is logged. The machine keeps
    running. The kernel writes a single line
    `process fault: <class> (EC 0x..) ESR=0x... FAR=0x... ELR=0x...` into
    its log, which shows it on the console at once while no device window
