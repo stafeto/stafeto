@@ -338,7 +338,10 @@ fn network_databases() -> [RootFile; 4] {
             "/etc/hosts",
             0o644,
             ROOT,
-            Source::Bytes("hosts", b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n"),
+            Source::Bytes(
+                "hosts",
+                b"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n",
+            ),
         ),
         of(
             "/etc/services",
@@ -382,12 +385,7 @@ pub fn os_test_with_fixtures(
     files.extend(devices());
     files.extend(network_databases());
     files.push(dir("/bin"));
-    files.push(of(
-        "/bin/sh",
-        0o755,
-        ROOT,
-        Source::Elf("busybox-probe"),
-    ));
+    files.push(of("/bin/sh", 0o755, ROOT, Source::Elf("busybox-probe")));
     files.push(dir("/os-test"));
     let mut list = String::new();
     for (n, (name, elf)) in tests.iter().enumerate() {
