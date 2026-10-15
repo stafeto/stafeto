@@ -730,6 +730,25 @@ rings, the descriptions, the sessions and the waiters live in the
 service's `.bss`. The kernel did not change, and B stays 20,536. Details
 are in [notes/m5e-pipes.md](../notes/m5e-pipes.md).
 
+### The socket calls of the pipe service
+
+The sockets (Ф9) live in the pipe service, so their steps run at its level
+and are bounded by B like the pipes'. `cargo xtask posix-sock-steps` boots
+the service with the feature `steps` under -icount and runs the probe
+`posix-sock`, whose last section (`longest_steps`) makes the calls at their
+longest: messages of 800 bytes with 8 descriptions on both kinds of socket,
+four such messages in flight when the socket goes, a child with 11 sockets
+and a connection in each queue that goes, a poll over every description
+the table holds, a fork with 26 descriptions. Longest steps, ticks, of
+B 20,410: SockAccept 10,526, SockSend 10,594, Create 11,415 (the
+pipes' scans with 26 descriptions held), SockRecv 9,750, SockOpt 9,031,
+Watch start of 24 elements 8,190, SockCreate 6,928, SockConnect 6,400,
+SockBind 4,338, the others under 4,000. The calls scan the 40 sockets at
+most (a name, a port, a free place); what a socket that goes leaves (the
+connections nobody accepted, the descriptions of its messages) goes in
+steps of one description or one socket each, told to the loop after the
+call that left it.
+
 ### Terminal control with live clients
 
 `cargo xtask posix-tty-control-steps` uses a PTY in memory and sixteen live
