@@ -17,6 +17,7 @@ fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-changed=math.c");
     println!("cargo:rerun-if-changed=fifo.c");
+    println!("cargo:rerun-if-changed=park.c");
     println!("cargo:rerun-if-changed=lifetime.c");
     println!("cargo:rerun-if-changed=lock-holder.c");
     println!("cargo:rerun-if-changed=lock-ring.c");
@@ -169,6 +170,8 @@ fn main() {
             "-c",
             if math {
                 "math.c"
+            } else if env::var_os("CARGO_FEATURE_PARK_PROBE").is_some() {
+                "park.c"
             } else if env::var_os("CARGO_FEATURE_FIFO_PROBE").is_some() {
                 "fifo.c"
             } else if env::var_os("CARGO_FEATURE_LIFETIME_PROBE").is_some() {

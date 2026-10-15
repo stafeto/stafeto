@@ -437,6 +437,7 @@ fn run(
             if ready_count(&ready[..items.len()]) != 0 {
                 continue;
             }
+            signals::probe_window(signals::window::POLL);
             let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
             if block.handled.load(Ordering::SeqCst) != handled
                 || signals::pending_unblocked()

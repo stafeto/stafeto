@@ -964,6 +964,21 @@ pub extern "C" fn stafeto_probe_park_now() {
     posix_abi::signals::probe_park_now();
 }
 
+/// The calling thread's next wait at `site` (1 poll, 2 open of a FIFO, 3
+/// wait by address, 4 sigwait) stops after its last check until it has
+/// parked for a stop of another thread (posix_abi::signals::probe_window_arm).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_window(site: c_int) {
+    posix_abi::signals::probe_window_arm(site as u32);
+}
+
+/// Whether the wait `stafeto_probe_window` armed stands at its site (1) or
+/// not yet (0).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_window_reached() -> c_int {
+    posix_abi::signals::probe_window_reached() as c_int
+}
+
 /// The next anonymous mapping of the layer sleeps `us` microseconds first
 /// (posix_abi::allocation::probe_sleep_next), for the probe of relibc's
 /// allocator across a fork.

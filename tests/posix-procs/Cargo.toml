@@ -15,6 +15,7 @@ bench = false
 
 [features]
 math-probe = []
+park-probe = []
 fifo-probe = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
 fifo-steps = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
 spawn-churn = []
