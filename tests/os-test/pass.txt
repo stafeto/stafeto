@@ -233,3 +233,5 @@ io/ofd-setlk-wr-un-dup-wr
 io/ofd-setlk-wr-un-reopen
 io/ofd-setlk-wr-un-reopen-rd
 io/ofd-setlk-wr-un-reopen-wr
+basic/wchar/vwscanf
+basic/wchar/wscanf

@@ -34,7 +34,7 @@ use crate::{
 
 /// The image of a suite: the RAM files with the tests, pipes, the console
 /// and terminal, process and clock services, the loader and the runner.
-const PROGRAMS: [ImageProgram; 11] = [
+const PROGRAMS: [ImageProgram; 12] = [
     ("init", "init", crate::INIT_STACK_SIZE, &["table-os-test"]),
     ("uart", "uart", crate::UART_STACK_SIZE, &[]),
     ("tty", "tty", crate::TTY_STACK_SIZE, &[]),
@@ -49,6 +49,7 @@ const PROGRAMS: [ImageProgram; 11] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("os-test-run", "os-test-run", crate::POSIX_STACK_SIZE, &[]),
     ("loader", "loader", 0, &[]),
+    ("busybox-probe", "busybox-probe", 0, &["applets"]),
     (
         "virtio-rng",
         "virtio-rng",
@@ -558,6 +559,7 @@ fn select_suite(tests: Vec<Test>, suite: &str) -> Result<Vec<Test>, String> {
 fn plan_suite(suite: Option<&str>) -> Result<(Vec<Job>, Plan), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         crate::relibc()?;
+        crate::busybox_build()?;
     }
     let mut compile = Command::new("python3");
     compile.arg(crate::root().join("tools/build-os-test.py"));
@@ -1186,6 +1188,7 @@ pub fn runner_check_job() -> Job {
     crate::jobs::job("os-test runner check", || {
         if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
             crate::relibc()?;
+            crate::busybox_build()?;
         }
         runner_check(&build(Variant::Normal)?)
     })
@@ -1196,6 +1199,7 @@ pub fn runner_check_job() -> Job {
 pub fn run_one(name: &str) -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         crate::relibc()?;
+        crate::busybox_build()?;
     }
     crate::run_cmd(
         std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
