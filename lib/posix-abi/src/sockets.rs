@@ -624,8 +624,8 @@ fn rights(control: &[u8], ids: &mut [u32; FDS_MAX]) -> Result<usize, i32> {
         if level != SOL_SOCKET || ty != SCM_RIGHTS {
             return Err(EOPNOTSUPP);
         }
-        for chunk in control[at + CMSG_HEADER..at + len].chunks_exact(4) {
-            let fd = i32::from_ne_bytes(chunk.try_into().unwrap());
+        for chunk in control[at + CMSG_HEADER..at + len].as_chunks::<4>().0 {
+            let fd = i32::from_ne_bytes(*chunk);
             let fd = u32::try_from(fd).map_err(|_| EBADF)?;
             let target = shared::with_fd(fd, |files| files.target(fd).map_err(crate::error))?;
             let Target::Pipe(id) = target else {

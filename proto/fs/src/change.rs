@@ -546,7 +546,7 @@ mod tests {
         let mut bytes = [0; 128];
         let n = out.as_bytes().len();
         bytes[..n].copy_from_slice(out.as_bytes());
-        for op in [0u32, 14, u32::MAX] {
+        for op in [0u32, 15, u32::MAX] {
             bytes[12..16].copy_from_slice(&op.to_le_bytes());
             assert_eq!(
                 ChangeStart::read(Reader::new(&bytes[..n])),

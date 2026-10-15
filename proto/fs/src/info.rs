@@ -105,7 +105,7 @@ mod tests {
                 Err(Status::BadSize)
             );
         }
-        for (offset, value) in [(0, 6u32), (4, 0o10000), (56, 0)] {
+        for (offset, value) in [(0, 7u32), (4, 0o10000), (56, 0)] {
             let mut invalid = [0; 116];
             invalid.copy_from_slice(bytes);
             invalid[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
