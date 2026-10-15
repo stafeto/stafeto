@@ -21,11 +21,10 @@ mod signals;
 mod sockets;
 mod wait;
 
-use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use core::sync::atomic::AtomicU32;
-use posix_abi::constants::{EFAULT, EINVAL, ENOMEM};
+use posix_abi::constants::{EFAULT, EINVAL};
 use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
@@ -1028,116 +1027,47 @@ pub extern "C" fn stafeto_probe_memory_quota() -> u64 {
     rt::sys::process_memory(posix_abi::allocation::process()).map_or(0, |memory| memory.quota)
 }
 
-const PAGE: usize = 4096;
-
-/// The anonymous mappings relibc holds: (first page, pages) of each, in
-/// pages of the address space (32 bits each reach 16 TiB), 0 pages for a
-/// free record. The pages come from the layer's heap (no header), so
-/// munmap gives back the whole mapping, pages from either edge, or pages
-/// from the middle, which splits the record in two.
-const MAPPINGS: usize = 256;
-type Records = [(u32, u32); MAPPINGS];
-struct Mappings(UnsafeCell<Records>);
-// SAFETY: only `mappings` borrows the records, under MAPPINGS_LOCK.
-unsafe impl Sync for Mappings {}
-static MAPS: Mappings = Mappings(UnsafeCell::new([(0, 0); MAPPINGS]));
-static MAPPINGS_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::new();
-
-/// A record of the bytes from `start` to `end`, both page-aligned.
-fn record(start: usize, end: usize) -> (u32, u32) {
-    ((start / PAGE) as u32, ((end - start) / PAGE) as u32)
-}
-
-/// The bytes a record holds: its start and end.
-fn bounds((page, pages): (u32, u32)) -> (usize, usize) {
-    let start = page as usize * PAGE;
-    (start, start + pages as usize * PAGE)
-}
-
-fn mappings<R>(f: impl FnOnce(&mut Records) -> R) -> R {
-    let _guard = MAPPINGS_LOCK.lock();
-    // SAFETY: the lock gives this borrow alone.
-    f(unsafe { &mut *MAPS.0.get() })
-}
-
-/// Zeroed, page-aligned memory for `len` bytes from the layer's heap, or
-/// null, which relibc reports as ENOMEM.
+/// `mmap` through the layer (posix_abi::mmap): the address, or the negative
+/// of an errno.
 #[unsafe(no_mangle)]
-pub extern "C" fn stafeto_mmap_anonymous(len: usize) -> *mut c_void {
-    let Some(size) = len.checked_next_multiple_of(PAGE).filter(|&size| size != 0) else {
-        return ptr::null_mut();
-    };
-    let Ok(pointer) = posix_abi::allocation::map_pages(size) else {
-        return ptr::null_mut();
-    };
-    let start = pointer.as_ptr() as usize;
-    let recorded = mappings(|maps| {
-        maps.iter_mut()
-            .find(|free| free.1 == 0)
-            .map(|free| *free = record(start, start + size))
-            .is_some()
-    });
-    if !recorded {
-        // SAFETY: the pages are this call's, and nobody saw them.
-        unsafe { posix_abi::allocation::unmap_pages(pointer, size) };
-        return ptr::null_mut();
+pub extern "C" fn stafeto_mmap(
+    addr: *mut c_void,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: i64,
+) -> isize {
+    match posix_abi::mmap::mmap(addr as usize, len, prot, flags, fd, offset) {
+        Ok(address) => address as isize,
+        Err(errno) => -(errno as isize),
     }
-    pointer.as_ptr().cast()
 }
 
-/// Unmaps whole pages of a mapping of `stafeto_mmap_anonymous`: all of it,
-/// pages from an edge, or pages from the middle. A range that meets no
-/// mapping is left alone (POSIX: success); EINVAL for one that is part in
-/// a mapping and part outside or across two, ENOMEM when a split finds no
-/// free record.
+/// `munmap` through the layer: 0, or the negative of an errno.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_munmap(addr: *mut c_void, len: usize) -> c_int {
-    let start = addr as usize;
-    let Some(size) = len.checked_next_multiple_of(PAGE).filter(|&size| size != 0) else {
-        return -EINVAL;
-    };
-    let Some(end) = start
-        .checked_add(size)
-        .filter(|_| start.is_multiple_of(PAGE))
-    else {
-        return -EINVAL;
-    };
-    let result: Result<bool, c_int> = mappings(|maps| {
-        let Some(index) = maps.iter().position(|&held| {
-            let (first, last) = bounds(held);
-            held.1 != 0 && first <= start && end <= last
-        }) else {
-            let meets = maps.iter().any(|&held| {
-                let (first, last) = bounds(held);
-                held.1 != 0 && first < end && start < last
-            });
-            return if meets { Err(EINVAL) } else { Ok(false) };
-        };
-        let (first, last) = bounds(maps[index]);
-        match (start == first, end == last) {
-            (true, true) => maps[index] = (0, 0),
-            (true, false) => maps[index] = record(end, last),
-            (false, true) => maps[index] = record(first, start),
-            (false, false) => {
-                let free = maps.iter().position(|free| free.1 == 0).ok_or(ENOMEM)?;
-                maps[index] = record(first, start);
-                maps[free] = record(end, last);
-            }
-        }
-        Ok(true)
-    });
-    match result {
-        Ok(false) => 0,
-        Ok(true) => {
-            // SAFETY: the pages left the records: relibc gave them up.
-            unsafe {
-                posix_abi::allocation::unmap_pages(
-                    core::ptr::NonNull::new_unchecked(addr.cast()),
-                    size,
-                )
-            };
-            0
-        }
+    match posix_abi::mmap::munmap(addr as usize, len) {
+        Ok(()) => 0,
+        Err(errno) => -errno,
+    }
+}
+
+/// `mprotect` through the layer: 0, or the negative of an errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int {
+    match posix_abi::mmap::mprotect(addr as usize, len, prot) {
+        Ok(()) => 0,
+        Err(errno) => -errno,
+    }
+}
+
+/// The checks of `madvise`, `posix_madvise` and `mlock` on a range: 0, or
+/// the negative of an errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_map_check(addr: *const c_void, len: usize) -> c_int {
+    match posix_abi::mmap::check_range(addr as usize, len) {
+        Ok(()) => 0,
         Err(errno) => -errno,
     }
 }

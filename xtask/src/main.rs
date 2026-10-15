@@ -655,6 +655,11 @@ const POSIX_RESOURCES_PROGRAMS: [ImageProgram; 10] = {
     );
     programs
 };
+const POSIX_MAP_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = ("posix-procs", "posix-map-probe", POSIX_STACK_SIZE, &[]);
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1267,6 +1272,7 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-map  verify mmap, munmap, mprotect, madvise and the faults of unmapped pages
   posix-resources verify account files, limits, groups and descriptor exec
   posix-math   verify scalar math, binary128 and thread floating-point state
   posix-fifo verify named FIFO creation, rendezvous, independent opens and inheritance
@@ -1393,6 +1399,7 @@ fn main() {
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
         Some("os-test-headers") => os_test_headers(&args[1..]),
+        Some("posix-map") => posix_map_probe(),
         Some("posix-resources") => posix_resources_probe(),
         Some("posix-sync") => posix_sync_probe(),
         Some("layer-names") => layer_c_names(),
@@ -3768,6 +3775,29 @@ fn posix_fifo_run(steps: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn posix_map_probe() -> Result<(), String> {
+    relibc()?;
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-posix-map.img", &POSIX_MAP_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    for marker in ["posix-map: mprotect, munmap and faults ok"] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
+    Ok(())
+}
+
 fn posix_resources_probe() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -5879,6 +5909,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
+        job("posix-map", posix_map_probe),
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
         job("posix-math", posix_math_probe),
@@ -7943,6 +7974,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-sync-probe",
         "--package",
         "posix-resources-probe",
+        "--package",
+        "posix-map-probe",
         "--package",
         "posix-sock",
         "--target",

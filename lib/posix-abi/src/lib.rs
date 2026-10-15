@@ -36,6 +36,7 @@ pub fn record_locks_none() -> bool {
 pub mod lock_fields;
 pub mod long;
 pub mod metadata;
+pub mod mmap;
 pub mod names;
 mod open_driver;
 pub mod pipes;

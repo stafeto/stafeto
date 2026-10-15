@@ -992,9 +992,10 @@ impl Start {
 /// The regions a copy takes at most: the kernel's mappings of a process
 /// (abi::MAX_MAPPINGS), which the layer's map holds at most (posix-map).
 pub const REGIONS_MAX: usize = abi::MAX_MAPPINGS as usize;
-/// The bytes of an entry of Regions: the address u64, the pages u32 and
-/// the access u32 (abi::Access).
-pub const REGION: usize = 16;
+/// The bytes of an entry of Regions: the address u64, the pages u32, the
+/// access u32 (abi::Access), the first page of the object the region shows
+/// u32 and the flags u32 (`REGION_SHARED`).
+pub const REGION: usize = 24;
 /// The heap of the POSIX layer, where the chunks of its map lie.
 pub const HEAP_ROOM: Range<u64> = 0x1000_0000..0x2000_0000;
 /// The rooms of a program's layout a region of a copy lies in, each whole
@@ -1015,7 +1016,15 @@ pub struct Region {
     pub address: u64,
     pub pages: u32,
     pub access: abi::Access,
+    /// The first page of the handle's object the region shows.
+    pub offset: u32,
+    /// The region is shared (MAP_SHARED): the child maps the object itself
+    /// and copies nothing.
+    pub shared: bool,
 }
+
+/// Flag of an entry of Regions: the object is shared with the child.
+pub const REGION_SHARED: u32 = 1;
 
 impl Region {
     /// The first address past the region.
@@ -1026,21 +1035,25 @@ impl Region {
     pub fn write(&self, w: &mut proto_wire::Writer) -> Result<(), Status> {
         w.u64(self.address)?;
         w.u32(self.pages)?;
-        w.u32(self.access.raw() as u32)
+        w.u32(self.access.raw() as u32)?;
+        w.u32(self.offset)?;
+        w.u32(if self.shared { REGION_SHARED } else { 0 })
     }
 
-    /// BAD_SIZE out of the layout, for no pages or an access that is
-    /// none.
+    /// BAD_SIZE out of the layout, for no pages or an unknown flag.
     pub fn read(r: &mut Reader<'_>) -> Result<Region, Status> {
         let (address, pages, access) = (r.u64()?, r.u32()?, r.u32()?);
+        let (offset, flags) = (r.u32()?, r.u32()?);
         let access = abi::Access::from_raw(access.into()).ok_or(Status::BadSize)?;
-        if pages == 0 {
+        if pages == 0 || flags & !REGION_SHARED != 0 {
             return Err(Status::BadSize);
         }
         Ok(Region {
             address,
             pages,
             access,
+            offset,
+            shared: flags & REGION_SHARED != 0,
         })
     }
 
@@ -1160,18 +1173,25 @@ pub fn check_fork(fork: &Fork, held: &[Region]) -> Result<(), Status> {
     if fits { Ok(()) } else { Err(Status::BadSize) }
 }
 
+/// Whether a private region joins a group: writable, or without access
+/// (copied writable, protected once filled).
+pub fn groupable(region: &Region) -> bool {
+    !region.shared && matches!(region.access, abi::Access::ReadWrite | abi::Access::None)
+}
+
 /// The objects of a copy of `sorted`, regions sorted by address: the
-/// range of the regions each takes, adjacent writable regions one object
-/// (the chunks of the layer's heap), any other region one of its own.
+/// range of the regions each takes, adjacent private writable regions
+/// (and those without access) one object (the chunks of the layer's heap),
+/// any other region one of its own.
 pub fn groups(sorted: &[Region]) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut at = 0;
     core::iter::from_fn(move || {
         let first = sorted.get(at)?;
         let start = at;
         at += 1;
-        if first.access == abi::Access::ReadWrite {
+        if groupable(first) {
             while let Some(next) = sorted.get(at) {
-                if next.access != abi::Access::ReadWrite || next.address != sorted[at - 1].end() {
+                if !groupable(next) || next.address != sorted[at - 1].end() {
                     break;
                 }
                 at += 1;
@@ -1185,8 +1205,63 @@ pub fn groups(sorted: &[Region]) -> impl Iterator<Item = Range<usize>> + '_ {
 pub const TRANSFER_MAGIC: [u8; 8] = *b"STAFFORK";
 /// The bytes of a transfer: the signature, the child's handles by `Slot`
 /// (u64 each, 0 for none), the count u32 of the entries of its memory
-/// map and 4 zero bytes, then REGIONS_MAX entries (`MapEntry`).
-pub const TRANSFER_SIZE: usize = 8 + 8 * SLOTS + 8 + REGIONS_MAX * MAP_ENTRY;
+/// map and 4 zero bytes, then REGIONS_MAX entries (`ForkEntry`).
+pub const TRANSFER_SIZE: usize = 8 + 8 * SLOTS + 8 + REGIONS_MAX * FORK_ENTRY;
+
+/// The bytes of an entry of a transfer: the address u64, the pages u32, the
+/// access u32 (abi::Access), the handle's value u64, the first page of
+/// the object the entry shows u32 and the flags u32 (`ENTRY_CONTINUES`,
+/// `ENTRY_SHARED`).
+pub const FORK_ENTRY: usize = 32;
+/// Flag of a `ForkEntry`: the entry shows the object of the entry before it
+/// (the handle is 0 and the offset counts in that object).
+pub const ENTRY_CONTINUES: u32 = 1;
+/// Flag of a `ForkEntry`: the object is shared with other processes.
+pub const ENTRY_SHARED: u32 = 2;
+
+/// One entry (one kernel mapping) of a copy's memory map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForkEntry {
+    pub address: u64,
+    pub pages: u32,
+    pub access: abi::Access,
+    pub handle: u64,
+    pub offset: u32,
+    pub continues: bool,
+    pub shared: bool,
+}
+
+impl ForkEntry {
+    pub fn to_bytes(self) -> [u8; FORK_ENTRY] {
+        let mut out = [0; FORK_ENTRY];
+        out[..8].copy_from_slice(&self.address.to_le_bytes());
+        out[8..12].copy_from_slice(&self.pages.to_le_bytes());
+        out[12..16].copy_from_slice(&(self.access.raw() as u32).to_le_bytes());
+        out[16..24].copy_from_slice(&self.handle.to_le_bytes());
+        out[24..28].copy_from_slice(&self.offset.to_le_bytes());
+        let flags =
+            u32::from(self.continues) * ENTRY_CONTINUES | u32::from(self.shared) * ENTRY_SHARED;
+        out[28..].copy_from_slice(&flags.to_le_bytes());
+        out
+    }
+
+    /// The entry of `bytes`; None for no pages, an unknown access or flag.
+    pub fn read(bytes: &[u8; FORK_ENTRY]) -> Option<ForkEntry> {
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let long = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let access = abi::Access::from_raw(word(12).into())?;
+        let flags = word(28);
+        (word(8) > 0 && flags & !(ENTRY_CONTINUES | ENTRY_SHARED) == 0).then_some(ForkEntry {
+            address: long(0),
+            pages: word(8),
+            access,
+            handle: long(16),
+            offset: word(24),
+            continues: flags & ENTRY_CONTINUES != 0,
+            shared: flags & ENTRY_SHARED != 0,
+        })
+    }
+}
 
 /// Writes the transfer of a copy into `out`: the child's `handles` by
 /// `Slot` and the objects of its memory map, `map`, REGIONS_MAX at most;
@@ -1194,7 +1269,7 @@ pub const TRANSFER_SIZE: usize = 8 + 8 * SLOTS + 8 + REGIONS_MAX * MAP_ENTRY;
 pub fn write_transfer(
     out: &mut [u8],
     handles: [u64; SLOTS],
-    map: &[MapEntry],
+    map: &[ForkEntry],
 ) -> Result<(), BlockError> {
     let out = out.get_mut(..TRANSFER_SIZE).ok_or(BlockError::Malformed)?;
     if map.len() > REGIONS_MAX {
@@ -1208,8 +1283,8 @@ pub fn write_transfer(
     let count = 8 + 8 * SLOTS;
     out[count..count + 4].copy_from_slice(&(map.len() as u32).to_le_bytes());
     for (i, entry) in map.iter().enumerate() {
-        let at = count + 8 + i * MAP_ENTRY;
-        out[at..at + MAP_ENTRY].copy_from_slice(&entry.to_bytes());
+        let at = count + 8 + i * FORK_ENTRY;
+        out[at..at + FORK_ENTRY].copy_from_slice(&entry.to_bytes());
     }
     Ok(())
 }
@@ -1241,17 +1316,17 @@ impl<'a> Transfer<'a> {
         }
         Some(Transfer {
             handles,
-            map: &bytes[at + 8..at + 8 + count * MAP_ENTRY],
+            map: &bytes[at + 8..at + 8 + count * FORK_ENTRY],
         })
     }
 
     /// The entries of the child's memory map; a malformed one is left out.
-    pub fn map(&self) -> impl Iterator<Item = MapEntry> + 'a {
+    pub fn map(&self) -> impl Iterator<Item = ForkEntry> + 'a {
         self.map
-            .as_chunks::<MAP_ENTRY>()
+            .as_chunks::<FORK_ENTRY>()
             .0
             .iter()
-            .filter_map(MapEntry::read)
+            .filter_map(ForkEntry::read)
     }
 }
 
@@ -1731,6 +1806,8 @@ mod tests {
             address,
             pages,
             access,
+            offset: 0,
+            shared: false,
         }
     }
 
@@ -1986,11 +2063,18 @@ mod tests {
     fn the_transfer_round_trips() {
         use abi::Access;
         let map: Vec<_> = (0..REGIONS_MAX as u64)
-            .map(|i| MapEntry {
+            .map(|i| ForkEntry {
                 address: 0x1000_0000 + i * 0x1000,
                 pages: 1,
-                access: Access::ReadWrite,
+                access: if i % 3 == 0 {
+                    Access::None
+                } else {
+                    Access::ReadWrite
+                },
                 handle: 100 + i,
+                offset: i as u32,
+                continues: i % 2 == 1,
+                shared: i % 5 == 0,
             })
             .collect();
         let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11];
@@ -2007,6 +2091,38 @@ mod tests {
         assert_eq!(Transfer::read(&out).unwrap().map().count(), 2);
         out[0] = b'x';
         assert_eq!(Transfer::read(&out), None);
+    }
+
+    /// A region of Regions carries its offset and whether it is shared; an
+    /// unknown flag is refused.
+    #[test]
+    fn a_region_carries_offset_and_sharing() {
+        let r = Region {
+            address: 0x1100_0000,
+            pages: 3,
+            access: abi::Access::None,
+            offset: 5,
+            shared: true,
+        };
+        let mut w = Writer::new();
+        r.write(&mut w).unwrap();
+        let bytes = w.as_bytes().to_vec();
+        assert_eq!(bytes.len(), REGION);
+        assert_eq!(Region::read(&mut Reader::new(&bytes)), Ok(r));
+        let mut bad = bytes.clone();
+        bad[20] = 2;
+        assert!(Region::read(&mut Reader::new(&bad)).is_err());
+        // Shared and no-access regions group as the table says.
+        let held = [
+            region(0x1000, 1, abi::Access::ReadWrite),
+            region(0x2000, 1, abi::Access::None),
+            Region {
+                shared: true,
+                ..region(0x3000, 1, abi::Access::ReadWrite)
+            },
+            region(0x4000, 1, abi::Access::ReadWrite),
+        ];
+        assert_eq!(groups(&held).collect::<Vec<_>>(), [0..2, 2..3, 3..4]);
     }
 }
 

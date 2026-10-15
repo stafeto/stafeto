@@ -479,6 +479,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-fifo.img",
     "boot-posix-fifo-steps.img",
     "boot-posix-resources.img",
+    "boot-posix-map.img",
     "boot-posix-lock-ring.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
@@ -555,6 +556,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-fifo.img"
         | "boot-posix-fifo-steps.img"
         | "boot-posix-resources.img"
+        | "boot-posix-map.img"
         | "boot-posix-lock-ring.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
@@ -758,6 +760,7 @@ mod tests {
             "boot-posix-spawn-churn.img",
             "boot-posix-sync.img",
             "boot-posix-resources.img",
+            "boot-posix-map.img",
         ] {
             let files = files_of(image);
             assert!(
@@ -785,6 +788,7 @@ mod tests {
                 "boot-posix-spawn-churn.img" => &crate::POSIX_SPAWN_CHURN_PROGRAMS,
                 "boot-posix-sync.img" => &crate::POSIX_SYNC_PROGRAMS,
                 "boot-posix-resources.img" => &crate::POSIX_RESOURCES_PROGRAMS,
+                "boot-posix-map.img" => &crate::POSIX_MAP_PROGRAMS,
                 "boot-posix-lock-ring.img" => &crate::POSIX_LOCK_RING_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
@@ -891,6 +895,7 @@ mod tests {
             "boot-posix-spawn-churn.img",
             "boot-posix-sync.img",
             "boot-posix-resources.img",
+            "boot-posix-map.img",
             "boot-posix-lock-ring.img",
             "boot-posix-random.img",
             "boot-posix-pty.img",

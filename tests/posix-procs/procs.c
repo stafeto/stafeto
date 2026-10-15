@@ -1406,7 +1406,7 @@ static int steps_run(void) {
 
 /* The layer's memory map (5d): the regions it keeps handles of, three
  * words each (address, pages, access: 1 R, 3 RW, 5 RX). */
-#define MAP_MAX 64
+#define MAP_MAX 128
 #define PAGE 4096ull
 static unsigned long long regions[3 * MAP_MAX];
 
@@ -1421,18 +1421,15 @@ static unsigned long long map_pages(size_t n) {
     return pages;
 }
 
-/* Three growths of the heap add three regions, each of the pages the
- * layer took, RW, one after the other in the heap's range, and the bytes
- * charged to the process grow by at least those pages. */
+/* Three mappings of 320 KiB add three pieces, each an object of its own of
+ * the pages asked for, RW, in the layer's room, and the bytes charged to
+ * the process grow by at least those pages. */
 static int map_growth(const char *who) {
     size_t before = map_read();
     unsigned long long pages = map_pages(before), used = stafeto_probe_memory_used();
-    unsigned long long last_end = 0;
-    if (before > 0 && regions[3 * (before - 1)] >= 0x10000000ull)
-        last_end = regions[3 * (before - 1)] + regions[3 * (before - 1) + 1] * PAGE;
     void *held[3];
     for (int i = 0; i < 3; i++) {
-        held[i] = mmap(NULL, 192 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        held[i] = mmap(NULL, 320 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (held[i] == MAP_FAILED) {
             printf("posix-procs: %s: mmap of 192 KiB gave %d\n", who, errno);
             return 1;
@@ -1445,22 +1442,26 @@ static int map_growth(const char *who) {
                (int)after);
         return 2;
     }
-    for (size_t i = before; i < after; i++) {
-        unsigned long long at = regions[3 * i];
-        if (regions[3 * i + 2] != 3 || at % PAGE != 0 || at < 0x10000000ull || at >= 0x20000000ull ||
-            (last_end != 0 && at != last_end) || regions[3 * i + 1] < 48) {
-            printf("posix-procs: %s: region %d at %llx of %llu pages access %llu\n", who, (int)i, at,
-                   regions[3 * i + 1], regions[3 * i + 2]);
+    /* Each held mapping is a piece of its own, 80 pages, RW, in the room. */
+    for (int k = 0; k < 3; k++) {
+        int found = 0;
+        for (size_t i = 0; i < after; i++) {
+            unsigned long long at = regions[3 * i];
+            if (at == (unsigned long long)(uintptr_t)held[k] && regions[3 * i + 1] == 80 &&
+                regions[3 * i + 2] == 3 && at >= 0x10000000ull && at < 0x20000000ull)
+                found = 1;
+        }
+        if (!found) {
+            printf("posix-procs: %s: the mapping %d at %p is no piece of 80 pages RW\n", who, k, held[k]);
             return 3;
         }
-        last_end = at + regions[3 * i + 1] * PAGE;
     }
     if (charged < grown * PAGE || charged > (grown + 16) * PAGE) {
         printf("posix-procs: %s: the map grew %llu pages, the process is charged %llu bytes\n", who,
                grown, charged);
         return 4;
     }
-    for (int i = 0; i < 3; i++) munmap(held[i], 192 * 1024);
+    for (int i = 0; i < 3; i++) munmap(held[i], 320 * 1024);
     return 0;
 }
 
