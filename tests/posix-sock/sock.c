@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -521,6 +522,170 @@ static int across_fork(void) {
     return 0;
 }
 
+static int send_rights(int s, const int *fds, int n, const void *data, int len) {
+    union { struct cmsghdr h; char b[CMSG_SPACE(8 * sizeof(int))]; } u;
+    memset(&u, 0, sizeof u);
+    struct iovec iov = {(void *)data, (size_t)len};
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    if (n > 0) {
+        m.msg_control = u.b;
+        m.msg_controllen = CMSG_SPACE(n * sizeof(int));
+        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+        h->cmsg_level = SOL_SOCKET;
+        h->cmsg_type = SCM_RIGHTS;
+        h->cmsg_len = CMSG_LEN(n * sizeof(int));
+        memcpy(CMSG_DATA(h), fds, n * sizeof(int));
+    }
+    return (int)sendmsg(s, &m, 0);
+}
+
+static int recv_rights(int s, int *fds, int *n, void *data, int len) {
+    union { struct cmsghdr h; char b[CMSG_SPACE(8 * sizeof(int))]; } u;
+    memset(&u, 0, sizeof u);
+    struct iovec iov = {data, (size_t)len};
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = u.b;
+    m.msg_controllen = sizeof u.b;
+    int got = (int)recvmsg(s, &m, 0);
+    *n = 0;
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    if (got >= 0 && h) {
+        *n = (int)((h->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+        memcpy(fds, CMSG_DATA(h), *n * sizeof(int));
+    }
+    return got;
+}
+
+/* The longest steps of the socket calls, for the service built with its step
+   statistics (xtask posix-sock-steps): the largest messages with the most
+   descriptions, a crowded table, a session that goes with messages in flight. */
+static int longest_steps(void) {
+    static char big[800], back[800];
+    memset(big, 'L', sizeof big);
+    int pp[2], sv[2], dg[2], fds[8], n;
+    CHECK(pipe(pp) == 0);
+    for (int i = 0; i < 8; i++) fds[i] = pp[1];
+    for (int kind = SOCK_STREAM; kind <= SOCK_DGRAM; kind++) {
+        int pair[2];
+        CHECK(socketpair(AF_UNIX, kind, 0, pair) == 0);
+        for (int round = 0; round < 3; round++) {
+            for (int i = 0; i < 4; i++) CHECK(send_rights(pair[0], fds, 8, big, sizeof big) == (int)sizeof big);
+            CHECK(send_rights(pair[0], fds, 8, big, sizeof big) == -1 && errno == EAGAIN);
+            for (int i = 0; i < 4; i++) {
+                CHECK(recv_rights(pair[1], fds, &n, back, sizeof back) == (int)sizeof back && n == 8);
+                for (int k = 0; k < n; k++) if (fds[k] != pp[1]) close(fds[k]);
+                for (int k = 0; k < 8; k++) fds[k] = pp[1];
+            }
+        }
+        /* The socket that goes with four messages in flight. */
+        for (int i = 0; i < 4; i++) CHECK(send_rights(pair[0], fds, 8, big, sizeof big) == (int)sizeof big);
+        close(pair[0]); close(pair[1]);
+        pause_ms(100);
+    }
+    /* A child holds a crowd of sockets and descriptions and goes. */
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        int mine[24], count = 0;
+        struct sockaddr_in a = loop(0);
+        for (int i = 0; i < 11; i++) {
+            int s = socket(AF_INET, i % 2 ? SOCK_DGRAM : SOCK_STREAM, 0);
+            if (s < 0) _exit(1);
+            mine[count++] = s;
+            if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) _exit(2);
+            if (i % 2 == 0 && listen(s, 4) < 0) _exit(3);
+        }
+        struct pollfd p[11];
+        for (int i = 0; i < 11; i++) { p[i].fd = mine[i]; p[i].events = POLLIN | POLLOUT; p[i].revents = 0; }
+        if (poll(p, 11, 0) < 0) _exit(4);
+        for (int i = 0; i < 4; i++) {
+            int c = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in to;
+            socklen_t len = sizeof to;
+            if (c < 0 || getsockname(mine[0], (struct sockaddr *)&to, &len) < 0) _exit(5);
+            if (connect(c, (struct sockaddr *)&to, sizeof to) < 0) _exit(6);
+            mine[count++] = c;
+        }
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    /* A fork that clones a full table of descriptions, sockets among them. */
+    int crowd[32], held = 0;
+    for (int i = 0; i < 8; i++) {
+        int pr[2];
+        CHECK(pipe(pr) == 0);
+        crowd[held++] = pr[0];
+        crowd[held++] = pr[1];
+    }
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && socketpair(AF_UNIX, SOCK_DGRAM, 0, dg) == 0);
+    crowd[held++] = sv[0]; crowd[held++] = sv[1]; crowd[held++] = dg[0]; crowd[held++] = dg[1];
+    /* A poll over every description the table holds, a wake from one of them. */
+    struct pollfd wide[30];
+    for (int i = 0; i < held; i++) { wide[i].fd = crowd[i]; wide[i].events = POLLIN; wide[i].revents = 0; }
+    CHECK(write(sv[0], "w", 1) == 1);
+    CHECK(poll(wide, held, 1000) >= 1);
+    char drain;
+    CHECK(read(sv[1], &drain, 1) == 1);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        char c;
+        if (write(sv[0], "x", 1) != 1 || read(sv[1], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    for (int i = 0; i < held; i++) close(crowd[i]);
+    close(pp[0]); close(pp[1]);
+    return 0;
+}
+
+/* The name databases of the image, and a connection to what they name. */
+static int names_of_the_net(void) {
+    struct addrinfo hints, *list = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    CHECK(getaddrinfo("localhost", "http", &hints, &list) == 0 && list != NULL);
+    struct sockaddr_in *sin = (struct sockaddr_in *)list->ai_addr;
+    CHECK(list->ai_family == AF_INET && sin->sin_port == htons(80) && sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    freeaddrinfo(list);
+    char host[64], service[32];
+    struct sockaddr_in a = loop(443);
+    CHECK(getnameinfo((struct sockaddr *)&a, sizeof a, host, sizeof host, service, sizeof service, 0) == 0);
+    CHECK(strcmp(host, "localhost") == 0 && strcmp(service, "https") == 0);
+    CHECK(getnameinfo((struct sockaddr *)&a, sizeof a, host, sizeof host, service, sizeof service, NI_NUMERICHOST | NI_NUMERICSERV) == 0);
+    CHECK(strcmp(host, "127.0.0.1") == 0 && strcmp(service, "443") == 0);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    struct hostent *h = gethostbyname("localhost");
+#pragma clang diagnostic pop
+    CHECK(h != NULL && h->h_addrtype == AF_INET && h->h_length == 4);
+    struct servent *s = getservbyname("echo", "udp");
+    CHECK(s != NULL && s->s_port == htons(7));
+    struct protoent *p = getprotobyname("udp");
+    CHECK(p != NULL && p->p_proto == 17);
+    CHECK(getaddrinfo("nowhere.invalid", NULL, &hints, &list) != 0);
+    /* A listener found by name. */
+    struct sockaddr_in at;
+    int l = listener(0, SOCK_STREAM, &at);
+    CHECK(l >= 0);
+    char port[8];
+    snprintf(port, sizeof port, "%u", ntohs(at.sin_port));
+    CHECK(getaddrinfo("localhost", port, &hints, &list) == 0);
+    int c = socket(list->ai_family, list->ai_socktype, list->ai_protocol);
+    CHECK(c >= 0 && connect(c, list->ai_addr, list->ai_addrlen) == 0);
+    freeaddrinfo(list);
+    close(c); close(l);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argv;
     /* A file-loaded image supplies the region map required by fork. */
@@ -539,6 +704,8 @@ int main(int argc, char **argv) {
     RUN(readiness);
     RUN(scm_rights);
     RUN(across_fork);
+    RUN(names_of_the_net);
+    RUN(longest_steps);
     printf("posix-sock: ok\n");
     fflush(stdout);
     return 0;

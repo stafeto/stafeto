@@ -28,9 +28,9 @@ use proto_pipe::sock::{
 use proto_wire::{Reader, Writer};
 
 /// The live sockets one session made at most.
-pub const SOCK_CREATED_MAX: usize = 12;
+pub const SOCK_CREATED_MAX: usize = 20;
 /// The live sockets one root has at most, a pending connection among them.
-pub const ROOT_SOCKS: usize = 24;
+pub const ROOT_SOCKS: usize = 28;
 /// The messages with descriptions one socket holds at most.
 const ANC_MAX: usize = 4;
 /// The descriptions in flight in the service at most.

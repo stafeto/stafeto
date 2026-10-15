@@ -572,6 +572,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 dir("/dev"),
             ];
             files.extend(devices());
+            files.extend(network_databases());
             files
         }
         "boot-posix-pty.img" | "boot-posix-pty-steps.img" => {

@@ -1316,6 +1316,7 @@ commands:
   entropy-vz run the probe of the entropy device's driver on Apple VZ
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-sock run the C probe of sockets in QEMU
+  posix-sock-steps measure the steps of the socket calls under -icount, against term B
   help      this text";
 
 fn main() {
@@ -1426,6 +1427,7 @@ fn main() {
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-sock") => posix_sock_probe(),
+        Some("posix-sock-steps") => posix_sock_steps(),
         Some("posix-pty") => posix_pty_probe(),
         Some("posix-tty-control-steps") => posix_tty_control_steps(),
         Some("posix-pty-steps") => posix_pty_probe_in(true),
@@ -2841,24 +2843,71 @@ fn posix_poll_probe() -> Result<(), String> {
 /// The probe of sockets (tests/posix-sock): AF_UNIX and the loopback, by
 /// the property, each with the breakage that makes its check fail.
 fn posix_sock_probe() -> Result<(), String> {
-    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
-        relibc()?;
+    posix_sock_run(false).map(drop)
+}
+
+/// The same probe with the pipe service's step statistics: the longest step
+/// of each kind stays under term B.
+fn posix_sock_steps() -> Result<(), String> {
+    let lines = posix_sock_run(true)?;
+    let rows = longest_steps(&lines, "4");
+    let mut text = String::new();
+    for (kind, ticks, detail) in &rows {
+        let name = match kind {
+            26..=39 => format!("socket call {kind}"),
+            64 => "heartbeat".to_owned(),
+            65 => "own step".to_owned(),
+            _ => format!("method {kind}"),
+        };
+        text += &format!("pipe {kind} {name} {ticks} {detail}\n");
+        println!("pipe service {name}: {ticks} ticks, detail {detail}, B {TERM_B}");
     }
-    let kernel = build(Variant::Normal)?;
-    const PROGRAMS: [ImageProgram; 11] = [
+    let sockets = rows.iter().filter(|r| (26..=39).contains(&r.0)).count();
+    if sockets < 8 {
+        return Err(format!("the socket calls ran too few kinds: {rows:?}"));
+    }
+    if let Some(row) = rows.iter().find(|r| r.0 != 64 && r.1 > TERM_B) {
+        return Err(format!("the pipe service: a step past term B: {row:?}"));
+    }
+    let worst = rows
+        .iter()
+        .filter(|r| r.0 != 64)
+        .map(|r| r.1)
+        .max()
+        .unwrap_or(0);
+    println!("posix-sock-steps: the worst step {worst} of B {TERM_B}");
+    Ok(())
+}
+
+const fn sock_programs(steps: &'static [&'static str]) -> [ImageProgram; 11] {
+    [
         ("init", "init", INIT_STACK_SIZE, &["table-posix-sock"]),
         ("uart", "uart", UART_STACK_SIZE, &[]),
         ("tty", "tty", TTY_STACK_SIZE, &["quiet-steps"]),
         POSIX_PROCS_PROGRAMS[1],
-        ("pipe", "pipe", PIPE_STACK_SIZE, &["quiet-steps"]),
+        ("pipe", "pipe", PIPE_STACK_SIZE, steps),
         POSIX_PROCS_PROGRAMS[3],
         POSIX_PROCS_PROGRAMS[4],
         ("posix-sock", "posix-sock", POSIX_STACK_SIZE, &[]),
         POSIX_PROCS_PROGRAMS[6],
         POSIX_PROCS_PROGRAMS[8],
         POSIX_PROCS_PROGRAMS[9],
-    ];
-    let image = build_boot_image("boot-posix-sock.img", &PROGRAMS, BOOT_PROFILE)?;
+    ]
+}
+static SOCK_PROGRAMS: [ImageProgram; 11] = sock_programs(&[]);
+static SOCK_PROGRAMS_STEPS: [ImageProgram; 11] = sock_programs(&["steps"]);
+
+fn posix_sock_run(steps: bool) -> Result<Vec<String>, String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let kernel = build(Variant::Normal)?;
+    let programs: &[ImageProgram] = if steps {
+        &SOCK_PROGRAMS_STEPS
+    } else {
+        &SOCK_PROGRAMS
+    };
+    let image = build_boot_image("boot-posix-sock.img", programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
     let output = run_until(
@@ -2871,7 +2920,8 @@ fn posix_sock_probe() -> Result<(), String> {
     qemu::expect_stopped_on(
         &output,
         "init: posix-sock ended: exit code 0, not restarted",
-    )
+    )?;
+    Ok(output.lines)
 }
 
 fn posix_pty_probe() -> Result<(), String> {
@@ -5847,6 +5897,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
         job("posix-sock", posix_sock_probe),
+        job("posix-sock-steps", posix_sock_steps),
         job("posix-pty", posix_pty_probe),
         job("posix-pty-steps", posix_pty_steps),
         // BusyBox on relibc guards the C surface (5a').

@@ -1019,7 +1019,7 @@ impl Service<0> for PipeService {
             }
             s.data.claimed = true;
         }
-        match Method::from_number(r.method()) {
+        let answer = match Method::from_number(r.method()) {
             Some(Method::Create) => {
                 let mut body = r.body();
                 let flags = match body.u32() {
@@ -1117,7 +1117,13 @@ impl Service<0> for PipeService {
                 | Method::NamedAck),
             ) => self.named_request(s, r, method),
             None => Answer::Status(Status::UnknownMethod),
+        };
+        // What the call left to let go of (descriptions a message held, a
+        // connection nobody accepted) goes in steps of its own.
+        if self.pipes.work_due() {
+            self.kick();
         }
+        answer
     }
 
     /// The client of `s` went: its operations go, and its descriptions

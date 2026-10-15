@@ -673,6 +673,11 @@ impl Pipes {
         Ok((index as u32, u32::from(self.pipes[index].len)))
     }
 
+    /// Whether `step` has work.
+    pub fn work_due(&self) -> bool {
+        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due()
+    }
+
     /// The pipes in use.
     pub fn live(&self) -> usize {
         self.pipes.iter().filter(|p| p.live).count()
