@@ -490,10 +490,26 @@ fn excepted(list: &[Exception], name: &str, code: i64, output: &str) -> bool {
 /// The name of os-test's licence (ISC) in an image with a test.
 pub const LICENCE: &str = "OS-TEST-LICENSE";
 
-/// os-test's LICENSE (tools/build-os-test.py fetches the source).
-pub fn licence() -> Result<Vec<u8>, String> {
-    let path = target_dir().join("os-test/source/LICENSE");
-    std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+/// The licence file another suite that uses this runner puts into its
+/// images in place of os-test's: its name in the image and its path.
+static OTHER_LICENCE: OnceLock<(&'static str, PathBuf)> = OnceLock::new();
+
+/// Makes the images of this run of xtask carry the file `path` as `name`.
+pub(crate) fn use_licence(name: &'static str, path: PathBuf) {
+    let _ = OTHER_LICENCE.set((name, path));
+}
+
+/// The name and bytes of the licence the images of this run carry:
+/// os-test's LICENSE (tools/build-os-test.py fetches the source) unless
+/// `use_licence` named another.
+pub fn licence() -> Result<(&'static str, Vec<u8>), String> {
+    let (name, path) = OTHER_LICENCE
+        .get()
+        .cloned()
+        .unwrap_or((LICENCE, target_dir().join("os-test/source/LICENSE")));
+    std::fs::read(&path)
+        .map(|bytes| (name, bytes))
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The suites within BUDGET (`cargo xtask os-test`), `jobs` boots at a
@@ -805,7 +821,7 @@ fn judge(work: &Path, test: &Test, ended: Ended) -> Result<(Verdict, String), St
 /// a tenth of one, so the other tests are linked by the linker itself
 /// with the same arguments, their own archive of one object first on the
 /// search path.
-struct ProbeLink {
+pub(crate) struct ProbeLink {
     lld: PathBuf,
     ar: PathBuf,
     /// The arguments for rust-lld: the output file is at `output`, and
@@ -888,7 +904,7 @@ fn probe_search_start(args: &[String]) -> Result<usize, String> {
 impl ProbeLink {
     /// Builds the probe with `object` and reads how it was linked; `dir`
     /// keeps the object of the program.
-    fn new(object: &str, dir: &Path) -> Result<ProbeLink, String> {
+    pub(crate) fn new(object: &str, dir: &Path) -> Result<ProbeLink, String> {
         let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         // A new cfg flag makes cargo compile and link the probe again
         // even when nothing else changed, so that its link line prints.
@@ -940,11 +956,21 @@ impl ProbeLink {
     /// The program of `object`, linked into `elf`; `dir` is the place of
     /// its archive.
     fn link(&self, object: &str, dir: &Path, elf: &Path) -> Result<(), String> {
+        self.link_objects(&[object], dir, elf)
+    }
+
+    /// The program of the `objects` (one archive), as `link` makes it.
+    pub(crate) fn link_objects(
+        &self,
+        objects: &[&str],
+        dir: &Path,
+        elf: &Path,
+    ) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let archive = dir.join("libostest.a");
         let _ = std::fs::remove_file(&archive);
         let mut ar = Command::new(&self.ar);
-        ar.arg("crs").arg(&archive).arg(object);
+        ar.arg("crs").arg(&archive).args(objects);
         crate::run_cmd(&mut ar)?;
         let mut args = self.args.clone();
         args[self.search] = dir.display().to_string();
@@ -1060,7 +1086,7 @@ fn test_elf(test: &Test, object: &str, elfs: &Path) -> Result<Vec<u8>, String> {
 
 /// The runner's boot of an image with `files`, its log joined into one
 /// text and as lines; an error when the image does not carry the licence.
-fn boot(
+pub(crate) fn boot(
     kernel: &crate::Artifacts,
     image: &str,
     files: Vec<rootfs::RootFile>,
@@ -1244,14 +1270,14 @@ fn carries_licence(path: &Path) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let image =
         bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let licence = licence()?;
+    let (name, licence) = licence()?;
     if image
         .files()
-        .any(|file| file.name == LICENCE && file.data == licence.as_slice())
+        .any(|file| file.name == name && file.data == licence.as_slice())
     {
         Ok(())
     } else {
-        Err(format!("{} carries no {LICENCE}", path.display()))
+        Err(format!("{} carries no {name}", path.display()))
     }
 }
 

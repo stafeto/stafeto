@@ -590,6 +590,34 @@ pub fn os_test_with_fixtures(
     files
 }
 
+/// The files of an image of the Open POSIX Test Suite (Ф12): the tests of
+/// `os_test` (`/tmp` is the RAM service's own), and a list that runs each in the directory
+/// of its own file with its time limit in milliseconds (`limits`, one for
+/// each test).
+pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> {
+    assert_eq!(tests.len(), limits.len());
+    let mut files = os_test_with_fixtures(tests, &[]);
+    files.retain(|f| f.path != "/os-test/list");
+    let mut list = String::new();
+    let mut limit = None;
+    for ((name, _), ms) in tests.iter().zip(limits) {
+        if limit != Some(*ms) {
+            list.push_str(&format!("limit {ms}\n"));
+            limit = Some(*ms);
+        }
+        let (directory, file) = name.rsplit_once('/').unwrap_or(("", name));
+        list.push_str(&format!("{name} /os-test/{directory} {file}\n"));
+    }
+    let list: &'static [u8] = Box::leak(list.into_bytes().into_boxed_slice());
+    files.push(of(
+        "/os-test/list",
+        0o644,
+        ROOT,
+        Source::Bytes("list", list),
+    ));
+    files
+}
+
 /// The files of the check of the runner of os-test: two files that are the
 /// runner itself, `hang` (never ends) and `quick` (exits with 7), and a
 /// list that gives each a second (`limit`).
