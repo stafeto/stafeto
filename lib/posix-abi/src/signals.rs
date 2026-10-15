@@ -1846,8 +1846,7 @@ unsafe fn deliver_signal(
         let mut restore_mask = old_mask;
         if action.flags & SA_SIGINFO != 0 {
             // SAFETY: the context-aware trampoline owns this unique live frame.
-            let frame = unsafe { native.read() };
-            let mut context = LinuxContext::new(&frame, old_mask);
+            let mut context = LinuxContext::new(unsafe { &*native }, old_mask);
             if let Some(fault) = fault {
                 context.fault_address = fault.address;
             }
@@ -1880,7 +1879,7 @@ unsafe fn deliver_signal(
             // The callback may edit the return context. Preserve private native
             // metadata and let the kernel validate machine state on return.
             // SAFETY: the frame is the entry's.
-            unsafe { native.write(context.frame(frame)) };
+            context.apply(unsafe { &mut *native });
             restore_mask = posix_signals::mask(context.mask & posix_signals::VALID)
                 .expect("valid signal return mask");
         } else {
@@ -2047,18 +2046,16 @@ impl LinuxContext {
         }
     }
 
-    /// The entry's frame with the registers the handler left here.
-    fn frame(&self, frame: upcall::Context) -> upcall::Context {
-        upcall::Context {
-            registers: self.registers,
-            sp: self.sp,
-            pc: self.pc,
-            pstate: self.pstate,
-            vectors: self.vectors,
-            fpcr: u64::from(self.fpcr),
-            fpsr: u64::from(self.fpsr),
-            ..frame
-        }
+    /// Puts the registers the handler left here into the entry's frame; the
+    /// private words of the frame (TLS, IPC address) stay.
+    fn apply(&self, frame: &mut upcall::Context) {
+        frame.registers = self.registers;
+        frame.sp = self.sp;
+        frame.pc = self.pc;
+        frame.pstate = self.pstate;
+        frame.vectors = self.vectors;
+        frame.fpcr = u64::from(self.fpcr);
+        frame.fpsr = u64::from(self.fpsr);
     }
 }
 
