@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # the others pull in.
 WORK = ROOT / "target" / "busybox"
 WORK_UTILITIES = ROOT / "target" / "busybox-utils"
+# The ready-made utilities BusyBox lacks (tools/build-ready-utils.py), built
+# from their own sources apart from BusyBox's and linked with its second build.
+WORK_READY = ROOT / "target" / "ready-utils"
 SOURCE = WORK / "source"
 ARCHIVE = WORK / f"busybox-{VERSION}.tar.bz2"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
@@ -150,9 +153,21 @@ def tool(name: str, brew_formula: str | None = None) -> Path:
     return Path(found).resolve()
 
 
+def ready_utilities() -> None:
+    """The archive of getconf, join, pathchk, file, iconv and compress, whose
+    flags are those of BusyBox's objects."""
+    spec = importlib.util.spec_from_file_location(
+        "build_ready_utils", ROOT / "tools" / "build-ready-utils.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.build(WORK_READY, WORK_READY / "ready.a", [A53_ERRATA, *UNWIND_CFLAGS],
+                 RELIBC / "include", f"relibc {relibc_commit()}")
+
+
 def main() -> None:
     build(utilities=False)
     build(utilities=True)
+    ready_utilities()
 
 
 def build(utilities: bool) -> None:

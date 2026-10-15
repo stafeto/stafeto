@@ -1851,14 +1851,35 @@ fn write_elf_image(
     let busybox = sources
         .iter()
         .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "busybox-probe"));
-    let busybox_files = if busybox {
+    let mut busybox_files = if busybox {
         Some(busybox_terms()?)
     } else {
         None
     };
+    // The BusyBox of the shell image holds ready-made utilities too (MIT,
+    // 0BSD, public domain): their licence texts and exact sources go in the
+    // image with BusyBox's.
+    let mut ready_licence = None;
+    for (_, elf, _) in sources {
+        if elf.file_name().is_some_and(|n| n == "busybox-probe")
+            && std::fs::read(elf)
+                .map_err(|e| format!("{}: {e}", elf.display()))?
+                .windows(READY_MARK.len())
+                .any(|w| w == READY_MARK)
+        {
+            let (licence, source) = ready_terms()?;
+            if let Some((_, note)) = &mut busybox_files {
+                note.push_str(&source);
+            }
+            ready_licence = Some(licence);
+        }
+    }
     if let Some((licence, source)) = &busybox_files {
         list.push((BUSYBOX_LICENSE, licence.as_slice()));
         list.push((BUSYBOX_SOURCE, source.as_bytes()));
+    }
+    if let Some(licence) = &ready_licence {
+        list.push((READY_LICENSE, licence.as_slice()));
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -2663,6 +2684,45 @@ const NOTICES: &str = "THIRD-PARTY-NOTICES";
 const BUSYBOX_LICENSE: &str = "BUSYBOX-LICENSE";
 const BUSYBOX_SOURCE: &str = "BUSYBOX-SOURCE";
 
+/// The licence texts of the ready-made utilities in an image, and the symbol
+/// a BusyBox that holds them has.
+const READY_LICENSE: &str = "UTILITIES-LICENSE";
+const READY_MARK: &[u8] = b"ready_getconf_main";
+
+/// The licence texts of the ready-made utilities (tools/build-ready-utils.py)
+/// and the note of where their exact sources are, from the manifest the
+/// script writes.
+fn ready_terms() -> Result<(Vec<u8>, String), String> {
+    let work = target_dir().join("ready-utils");
+    let manifest = std::fs::read_to_string(work.join("manifest")).map_err(|e| {
+        format!("ready-utils/manifest: {e}: python3 tools/build-busybox.py writes it")
+    })?;
+    let mut licence = Vec::new();
+    let mut note = String::from(
+        "\nThe same BusyBox holds ready-made utilities, built unchanged from their own\n\
+         sources by tools/build-ready-utils.py (UTILITIES-LICENSE has their licences):\n",
+    );
+    for line in manifest.lines() {
+        let [name, url, sha256, spdx, file, applets] = line.split('\t').collect::<Vec<_>>()[..]
+        else {
+            return Err(format!("ready-utils/manifest: bad line {line:?}"));
+        };
+        let text = std::fs::read(work.join(file)).map_err(|e| format!("{file}: {e}"))?;
+        licence.extend(format!("==== {name} ({spdx}): {applets} ====\n\n").into_bytes());
+        licence.extend(text);
+        licence.extend(b"\n\n");
+        note.push_str(&format!(
+            "{applets}: {name}, {spdx}, {url} (SHA-256 of the unpacked tar stream {sha256})\n"
+        ));
+    }
+    // The notices of the files of sbase's libutil that carry their own.
+    let notices = std::fs::read(work.join("notices")).map_err(|e| {
+        format!("ready-utils/notices: {e}: python3 tools/build-busybox.py writes it")
+    })?;
+    licence.extend(notices);
+    Ok((licence, note))
+}
+
 /// The value of `NAME = "value"` in the Python script `script`.
 fn script_value(script: &str, name: &str) -> Result<String, String> {
     let text =
@@ -2758,6 +2818,32 @@ fn image_has_busybox_terms(path: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("{} carries no BusyBox terms", path.display()))
+    }
+}
+
+/// Fails unless the boot image at `path` carries the licences of the
+/// ready-made utilities and the note of where their sources are.
+fn image_has_ready_terms(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image =
+        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (licence, note) = ready_terms()?;
+    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
+        image
+            .files()
+            .any(|file| file.name == name && check(file.data))
+    };
+    if carries(READY_LICENSE, &|data| data == licence.as_slice())
+        && carries(BUSYBOX_SOURCE, &|data| {
+            data.windows(note.len()).any(|w| w == note.as_bytes())
+        })
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} carries no terms of the ready-made utilities",
+            path.display()
+        ))
     }
 }
 
@@ -5283,19 +5369,15 @@ fn expect_ash_names(lines: &[String]) -> Result<(), String> {
     }
 }
 
-/// The 24 of those 112 that neither BusyBox nor the shell has. Nothing of
-/// our own stands in for them (the report names ready implementations).
-const XCU_MISSING: [&str; 24] = [
+/// The 18 of those 112 that neither BusyBox, nor the ready-made utilities of
+/// tools/build-ready-utils.py, nor the shell has. Nothing of our own stands in
+/// for them (the report names ready implementations).
+const XCU_MISSING: [&str; 18] = [
     "at",
     "batch",
-    "compress",
     "csplit",
-    "file",
     "gencat",
-    "getconf",
     "gettext",
-    "iconv",
-    "join",
     "locale",
     "localedef",
     "lp",
@@ -5304,7 +5386,6 @@ const XCU_MISSING: [&str; 24] = [
     "msgfmt",
     "newgrp",
     "ngettext",
-    "pathchk",
     "pax",
     "pr",
     "tabs",
@@ -5521,6 +5602,32 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         r#"tty; stty -a >/dev/null; echo stty:$?"#,
         &[r#"/dev/console"#, r#"stty:0"#],
     ),
+    // The ready-made utilities BusyBox lacks (Ф10b): sbase's getconf, join
+    // and pathchk, toybox's file and iconv, ncompress's compress.
+    (
+        r#"getconf PATH; getconf PAGESIZE"#,
+        &[r#"/bin:/usr/bin"#, r#"4096"#],
+    ),
+    (
+        r#"printf 'a 1\nb 2\n' > /tmp/jn1; printf 'a x\nb y\n' > /tmp/jn2; join /tmp/jn1 /tmp/jn2"#,
+        &[r#"a 1 x"#, r#"b 2 y"#],
+    ),
+    (
+        r#"pathchk -p /tmp/ok; echo pathchk-ok:$?; pathchk -p '/tmp/a b' 2>/dev/null; echo pathchk-bad:$?"#,
+        &[r#"pathchk-ok:0"#, r#"pathchk-bad:1"#],
+    ),
+    (
+        r#"file /etc /etc/motd"#,
+        &[r#"~/etc: "#, r#"~/etc/motd: ASCII text"#],
+    ),
+    (
+        r#"printf 'caf\303\251\n' | iconv -f UTF-8 -t ISO-8859-1 | od -An -tx1"#,
+        &[r#"=63 61 66 e9 0a"#],
+    ),
+    (
+        r#"echo hello > /tmp/cz; compress -f /tmp/cz; ls /tmp/cz.Z; head -c3 /tmp/cz.Z | od -An -tx1; compress -dc /tmp/cz.Z"#,
+        &[r#"/tmp/cz.Z"#, r#"=1f 9d 8e"#, r#"hello"#],
+    ),
     (
         r#"logname; login-probe login"#,
         &[
@@ -5581,6 +5688,7 @@ fn ash_dialog() -> Result<(), String> {
         &ASH_INTERACTIVE_PROGRAMS,
         BOOT_PROFILE,
     )?;
+    image_has_ready_terms(&image)?;
     // What `ls -l` shows of the files of /bin: the mode, the links and the
     // size of the ELF file of the program the file holds (rootfs.rs).
     let elf_size = |program: &str| -> Result<String, String> {
