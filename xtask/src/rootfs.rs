@@ -531,6 +531,8 @@ pub fn os_test_with_fixtures(
     files.extend(network_databases());
     files.push(dir("/bin"));
     files.push(of("/bin/sh", 0o755, ROOT, Source::Elf("busybox-probe")));
+    // The message catalog compiler of the tests of nl_types.
+    files.push(of("/bin/gencat", 0o755, ROOT, Source::Elf("gencat")));
     files.push(dir("/os-test"));
     let mut list = String::new();
     for (n, (name, elf)) in tests.iter().enumerate() {
@@ -617,6 +619,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-spawn-churn.img",
     "boot-posix-sync.img",
     "boot-posix-math.img",
+    "boot-posix-ipc.img",
     "boot-posix-park.img",
     "boot-posix-fifo.img",
     "boot-posix-fifo-steps.img",
@@ -718,6 +721,15 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ];
             files.extend(devices());
             files.extend(network_databases());
+            files
+        }
+        "boot-posix-ipc.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-ipc", 0o755, ROOT, "posix-ipc"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
             files
         }
         "boot-posix-pty.img" | "boot-posix-pty-steps.img" => {

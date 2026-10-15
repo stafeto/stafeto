@@ -818,6 +818,24 @@ pub const POSIX_SOCK_TABLE: &[Record] = &[
     LOADER_CHANNELS_TABLE[8],
 ];
 
+/// The probe of message queues, semaphores and shared memory uses the loader probe's ordinary services and pool.
+pub const POSIX_IPC_TABLE: &[Record] = &[
+    LOADER_CHANNELS_TABLE[0],
+    LOADER_CHANNELS_TABLE[1],
+    LOADER_CHANNELS_TABLE[2],
+    LOADER_CHANNELS_TABLE[3],
+    LOADER_CHANNELS_TABLE[4],
+    LOADER_CHANNELS_TABLE[5],
+    Record {
+        name: "posix-ipc",
+        program: "posix-ipc",
+        args: b"posix-ipc\0",
+        ..LOADER_CHANNELS_TABLE[6]
+    },
+    LOADER_CHANNELS_TABLE[7],
+    LOADER_CHANNELS_TABLE[8],
+];
+
 /// Functional PTY probe with the process probe's ordinary services.
 pub const POSIX_PTY_TABLE: &[Record] = &[
     LOADER_CHANNELS_TABLE[0],

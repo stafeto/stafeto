@@ -1844,7 +1844,8 @@ impl Pipes {
                         return Err(fail(EBUSY));
                     }
                     x.notify = Notify::Armed(i as u8);
-                } else if matches!(x.notify, Notify::Armed(d) | Notify::Fired(d) if usize::from(d) == i) {
+                } else if matches!(x.notify, Notify::Armed(d) | Notify::Fired(d) if usize::from(d) == i)
+                {
                     x.notify = Notify::None;
                     Ipc::wake(x.waiters.waiters, wakes);
                 }

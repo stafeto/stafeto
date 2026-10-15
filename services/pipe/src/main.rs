@@ -629,6 +629,7 @@ impl PipeService {
             Err(status) => return Answer::Status(status),
         };
         let long = ipc_op::is_long(call.op);
+        rt::service::step_detail(u64::from(call.op));
         if take && !long {
             return Answer::Status(Status::BadSize);
         }
@@ -754,8 +755,11 @@ impl PipeService {
             Err(status) => return Answer::Status(status),
         };
         let label = s.label();
+        // An operation that ended with an error is over already, and the
+        // client's cancel after that error finds nothing to cancel: it is
+        // answered all the same, and the client returns its error.
         if !self.ops.finish(&mut s.data.long, label, key) {
-            return Answer::Status(Status::Kernel(Error::BadState));
+            return long_answer(r, long::Reply::Cancelled);
         }
         self.over(s, true);
         self.pipes.ipc_wait_done(label, key);

@@ -15,10 +15,10 @@ use crate::constants::*;
 use crate::long;
 use crate::shared;
 use posix_fs::{DescriptorFlags, Target, Transport};
+use proto_pipe::Method;
 pub use proto_pipe::ipc::WORDS_MAX;
 use proto_pipe::ipc::{Answer, Call, Cred, errno_of, op};
 use proto_pipe::sock::SOCK_END;
-use proto_pipe::Method;
 use proto_wire::{Reader, Status, Writer};
 use rt::abi::MESSAGE_MAX;
 
@@ -115,7 +115,14 @@ fn long_call(
     let n = if deadline == NO_DEADLINE {
         long::run_with(&pipes, start.as_bytes(), keyed, &mut buffer, &refusal)?
     } else {
-        long::run_until(&pipes, start.as_bytes(), keyed, &mut buffer, &refusal, deadline)?
+        long::run_until(
+            &pipes,
+            start.as_bytes(),
+            keyed,
+            &mut buffer,
+            &refusal,
+            deadline,
+        )?
     };
     parse(&buffer[..n], out)
 }
@@ -191,7 +198,15 @@ pub fn call_fd(
         let mut all = [0u64; WORDS_MAX];
         all[..words.len()].copy_from_slice(words);
         all[0] = u64::from(id);
-        run(transport, operation, &all[..words.len()], cred_at, bytes, out, deadline)
+        run(
+            transport,
+            operation,
+            &all[..words.len()],
+            cred_at,
+            bytes,
+            out,
+            deadline,
+        )
     });
     if let Some(point) = point {
         if result.is_ok() {
@@ -229,7 +244,15 @@ pub fn mq_open(
         0,
     ];
     let mut out = [0u8; 0];
-    let reply = run(transport, op::MQ_OPEN, &words, Some(5), name, &mut out, NO_DEADLINE)?;
+    let reply = run(
+        transport,
+        op::MQ_OPEN,
+        &words,
+        Some(5),
+        name,
+        &mut out,
+        NO_DEADLINE,
+    )?;
     let id = u32::try_from(reply.words[0]).map_err(|_| EIO)?;
     let flags = DescriptorFlags {
         close_on_exec: cloexec,

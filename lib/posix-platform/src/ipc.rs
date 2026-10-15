@@ -8,9 +8,9 @@
 
 use super::{call, files, value};
 use core::ffi::{c_char, c_int};
+use layer::WORDS_MAX;
 use posix_abi::constants::{EFAULT, EINVAL};
 use posix_abi::ipc as layer;
-use layer::WORDS_MAX;
 
 // relibc's flags of open (Linux's, the platform's).
 const O_ACCMODE: c_int = 3;
