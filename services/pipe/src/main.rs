@@ -16,8 +16,10 @@
 
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
+use pipe::ipc::{Block, Flow, IPC_TAG, Out};
 use pipe::{Held, Pipes, Roots, Wakes};
 use proto_init::ServiceArgs;
+use proto_pipe::ipc::{Call, op as ipc_op};
 use proto_pipe::sock::{Addr, Received, Recv, SEND_MAX, Send};
 use proto_pipe::{Cancel, HELD_MAX, MAX_READ, Method, OWN, Read, VERSION, Write};
 use proto_wire::clones::Clones;
@@ -276,6 +278,7 @@ impl PipeService {
             self.kick();
         }
         self.ops.gone(&mut s.data.long);
+        self.pipes.ipc_forget(s.label());
         self.roots
             .give(s.data.root, core::mem::take(&mut s.data.waiting));
     }
@@ -297,6 +300,7 @@ impl PipeService {
             let label = s.label();
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
+            self.pipes.ipc_wait_done(label, key);
             let capture = &mut self.io[((key & 0xffff_ffff) - 1) as usize];
             let queue = if capture.key == key {
                 let queue = capture.queue;
@@ -462,6 +466,7 @@ impl PipeService {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         self.over(s, true);
+        self.pipes.ipc_wait_done(label, cancel.key);
         // The end the operation waits at is the one its start named; a
         // cancel that names the other leaves no waiter behind either.
         let capture = &mut self.io[((cancel.key & 0xffff_ffff) - 1) as usize];
@@ -614,6 +619,167 @@ impl PipeService {
         } else {
             long_answer(r, long::Reply::Armed)
         }
+    }
+
+    /// Whether the operation is a long one (IPC with a WAIT, IPC_TAKE).
+    fn ipc_long(op: u32) -> bool {
+        matches!(
+            op,
+            ipc_op::MQ_SEND
+                | ipc_op::MQ_RECV
+                | ipc_op::MQ_NOTIFY_WAIT
+                | ipc_op::MSG_SND
+                | ipc_op::MSG_RCV
+                | ipc_op::SEM_OP
+                | ipc_op::NSEM_WAIT
+        )
+    }
+
+    /// IPC (`take` false) or IPC_TAKE: the message queues, semaphores and
+    /// shared memory segments (proto_pipe::ipc).
+    fn ipc(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
+        let call = match Call::parse(r.body(), take) {
+            Ok(call) => call,
+            Err(status) => return Answer::Status(status),
+        };
+        let long = Self::ipc_long(call.op);
+        if take && !long {
+            return Answer::Status(Status::BadSize);
+        }
+        let endpoint = Endpoint::anonymous(IPC_TAG | call.op);
+        let notify = match Self::notify_of(r, take) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        if !self.take_ok(s, call.key, endpoint) {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        if call.op == ipc_op::MQ_OPEN
+            && s.data.held.count() + self.named.reservations(s.label()) + 1 > HELD_MAX
+        {
+            return status(proto_pipe::MFILE);
+        }
+        let mut out = Out::new();
+        let mut wakes = Wakes::default();
+        let (label, root) = (r.label(), s.data.root);
+        let flow = self
+            .pipes
+            .ipc_call(&mut s.data.held, label, root, &call, &mut out, &mut wakes);
+        self.tell(&wakes);
+        match flow {
+            Ok(Flow::Done) => {
+                if long {
+                    self.finish(s, call.key, endpoint.id);
+                    let mut w = proto_wire::Writer::new();
+                    if out.answer().write(&mut w).is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    long_answer(r, long::Reply::Ready(w.as_bytes()))
+                } else {
+                    let w = r.reply();
+                    if w.u32(0).is_err() || out.answer().write(w).is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    Answer::Reply(Outgoing::new())
+                }
+            }
+            Ok(Flow::Wait { queue, block }) => {
+                if !long {
+                    return Answer::Status(Status::BadSize);
+                }
+                self.ipc_wait(s, r, call.key, endpoint, notify, queue, block)
+            }
+            Err(code) => {
+                if long {
+                    self.finish(s, call.key, endpoint.id);
+                }
+                status(code)
+            }
+        }
+    }
+
+    /// A call of the IPC methods that found it must wait: a start makes the
+    /// operation and has it wait at `queue` (WAIT k); a take keeps the
+    /// handle it brought (ARMED) or waits on with the one it has.
+    #[allow(clippy::too_many_arguments)]
+    fn ipc_wait(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        key: Option<u64>,
+        endpoint: Endpoint,
+        notify: Option<Handle<Channel>>,
+        queue: u32,
+        block: Block,
+    ) -> Answer {
+        let label = s.label();
+        match key {
+            None => {
+                if !self.named_room() {
+                    return status(proto_pipe::AGAIN);
+                }
+                if let Err(code) = self.roots.take(s.data.root) {
+                    return status(code);
+                }
+                let key = match self.ops.start(&mut s.data.long, label) {
+                    Ok(key) => key,
+                    Err(e) => {
+                        self.roots.give(s.data.root, 1);
+                        return Answer::Status(Status::Kernel(e));
+                    }
+                };
+                s.data.waiting += 1;
+                self.io[((key & 0xffff_ffff) - 1) as usize] = IoCapture {
+                    key,
+                    endpoint,
+                    queue,
+                };
+                let ops = &self.ops;
+                let named = &self.named;
+                if let Err(code) = self.pipes.wait(queue, (label, key), |(l, k)| {
+                    ops.waits(l, k) || named.alive(l, k)
+                }) {
+                    self.io[((key & 0xffff_ffff) - 1) as usize] = IoCapture::EMPTY;
+                    let finished = self.ops.finish(&mut s.data.long, label, key);
+                    self.over(s, finished);
+                    return status(code);
+                }
+                self.pipes.ipc_note_wait(label, key, queue, block);
+                long_answer(r, long::Reply::Wait(key))
+            }
+            Some(key) => {
+                match notify {
+                    Some(handle) => {
+                        if let Err(e) = self.ops.arm(label, key, handle) {
+                            return Answer::Status(Status::Kernel(e));
+                        }
+                    }
+                    None => self.ops.untell(label, key),
+                }
+                long_answer(r, long::Reply::Armed)
+            }
+        }
+    }
+
+    /// IPC_CANCEL: the operation goes, with no effect.
+    fn ipc_cancel(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        let key = match proto_pipe::ipc::cancel_key(r.body()) {
+            Ok(key) => key,
+            Err(status) => return Answer::Status(status),
+        };
+        let label = s.label();
+        if !self.ops.finish(&mut s.data.long, label, key) {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        self.over(s, true);
+        self.pipes.ipc_wait_done(label, key);
+        let capture = &mut self.io[((key & 0xffff_ffff) - 1) as usize];
+        if capture.key == key {
+            let queue = capture.queue;
+            *capture = IoCapture::EMPTY;
+            self.pipes.unwait(queue, (label, key));
+        }
+        long_answer(r, long::Reply::Cancelled)
     }
 
     /// The socket calls that answer at once: the body after the socket.
@@ -991,7 +1157,7 @@ impl Service<0> for PipeService {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
             ]
         }
         #[cfg(not(feature = "steps"))]
@@ -1103,6 +1269,9 @@ impl Service<0> for PipeService {
             Some(Method::SockSendTake) => self.sock_send(s, r, true),
             Some(Method::SockRecv) => self.sock_recv(s, r, false),
             Some(Method::SockRecvTake) => self.sock_recv(s, r, true),
+            Some(Method::Ipc) => self.ipc(s, r, false),
+            Some(Method::IpcTake) => self.ipc(s, r, true),
+            Some(Method::IpcCancel) => self.ipc_cancel(s, r),
             Some(Method::Abandon) => {
                 if r.body().finish().is_err() {
                     return Answer::Status(Status::BadSize);
@@ -1135,6 +1304,7 @@ impl Service<0> for PipeService {
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         rt::service::step_own();
         self.abandon(s);
+        self.pipes.ipc_gone(s.label());
         if self.pipes.gone(&mut s.data.held) {
             self.kick();
         }

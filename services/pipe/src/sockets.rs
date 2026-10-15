@@ -18,12 +18,13 @@
 //! SOCKETS, FDS_MAX or the size of one message.
 
 use super::*;
+use proto_pipe::ipc::MQ_KIND;
 use proto_pipe::sock::{
     ADDR_INET, ADDR_MAX, ADDR_NONE, ADDR_UNIX, Addr, BACKLOG_MAX, BAD_TYPE, CONNECTED, DGRAM,
     DONTWAIT, FDS_MAX, IN_USE, INET, NO_BUFFERS, NO_DESTINATION, NO_FAMILY, NO_OPTION,
-    NOT_CONNECTED, NOT_SUPPORTED, OOB, OPT_ACCEPTCONN, OPT_ATMARK, OPT_BROADCAST, OPT_DOMAIN,
-    OPT_ERROR, OPT_KEEPALIVE, OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC,
-    OUT_TRUNC, PEEK, REFUSED, RING, SEND_MAX, STREAM, TOO_BIG, TOO_MANY_REFS, UNIX,
+    NOT_CONNECTED, NOT_SOCKET, NOT_SUPPORTED, OOB, OPT_ACCEPTCONN, OPT_ATMARK, OPT_BROADCAST,
+    OPT_DOMAIN, OPT_ERROR, OPT_KEEPALIVE, OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE,
+    OUT_CTRUNC, OUT_TRUNC, PEEK, REFUSED, RING, SEND_MAX, STREAM, TOO_BIG, TOO_MANY_REFS, UNIX,
 };
 use proto_wire::{Reader, Writer};
 
@@ -286,8 +287,9 @@ impl RecvOut {
 }
 
 impl Pipes {
-    /// The slot of the socket `endpoint`, which `held` holds.
-    pub(super) fn sock_slot(&self, held: &Held, endpoint: Endpoint) -> Result<usize, u32> {
+    /// The slot of the description of the third kind `endpoint`, which
+    /// `held` holds: a socket or an open message queue.
+    pub(super) fn desc_slot(&self, held: &Held, endpoint: Endpoint) -> Result<usize, u32> {
         if !endpoint.is_sock() || !held.holds(endpoint.id) {
             return Err(BAD_FD);
         }
@@ -296,6 +298,75 @@ impl Pipes {
             return Err(BAD_FD);
         }
         Ok(slot)
+    }
+
+    /// The slot of the socket `endpoint`, which `held` holds: NOT_SOCKET for
+    /// an open message queue.
+    pub(super) fn sock_slot(&self, held: &Held, endpoint: Endpoint) -> Result<usize, u32> {
+        let slot = self.desc_slot(held, endpoint)?;
+        if self.sockets.s[slot].kind == MQ_KIND {
+            return Err(NOT_SOCKET);
+        }
+        Ok(slot)
+    }
+
+    /// A description for an open message queue `queue` (its slot and era
+    /// in the table of queues) with the access `access` (0 read, 1 write,
+    /// 2 both). The limits are a socket's.
+    pub(super) fn mq_alloc(
+        &mut self,
+        held: &mut Held,
+        creator: u64,
+        root: u64,
+        nonblock: bool,
+        access: u32,
+        queue: (u8, u32),
+    ) -> Result<u32, u32> {
+        if held.count() + 1 > HELD_MAX
+            || self.live_socks(|s| s.creator == creator && s.refs != 0) >= SOCK_CREATED_MAX
+        {
+            return Err(MFILE);
+        }
+        if self.live_socks(|s| s.root == root) >= ROOT_SOCKS {
+            return Err(NFILE);
+        }
+        let i = self.sockets.s.iter().position(|s| !s.live).ok_or(NFILE)?;
+        let era = self.sockets.s[i].era.wrapping_add(1);
+        self.sockets.s[i] = Sock {
+            live: true,
+            era,
+            refs: 1,
+            nonblock,
+            domain: access,
+            kind: MQ_KIND,
+            creator,
+            root,
+            peer: Some(queue),
+            ..Sock::FREE
+        };
+        self.sockets.dropping[i] = 0;
+        let id = SOCK_END | i as u32;
+        held.add(id as usize);
+        Ok(id)
+    }
+
+    /// The open message queue `endpoint` names: its description's slot, its
+    /// queue (slot and era), its access and its NONBLOCK.
+    pub(super) fn mq_slot(
+        &self,
+        held: &Held,
+        endpoint: Endpoint,
+    ) -> Result<(usize, (u8, u32), u32, bool), u32> {
+        let i = self.desc_slot(held, endpoint)?;
+        let s = &self.sockets.s[i];
+        match s.peer {
+            Some(queue) if s.kind == MQ_KIND => Ok((i, queue, s.domain, s.nonblock)),
+            _ => Err(BAD_FD),
+        }
+    }
+
+    pub(super) fn mq_set_nonblock(&mut self, i: usize, nonblock: bool) {
+        self.sockets.s[i].nonblock = nonblock;
     }
 
     fn live_socks(&self, f: impl Fn(&Sock) -> bool) -> usize {
@@ -1148,7 +1219,7 @@ impl Pipes {
     }
 
     pub(super) fn sock_flags(&self, held: &Held, endpoint: Endpoint) -> Result<u32, u32> {
-        let i = self.sock_slot(held, endpoint)?;
+        let i = self.desc_slot(held, endpoint)?;
         Ok(proto_pipe::RDWR
             | if self.sockets.s[i].nonblock {
                 NONBLOCK
@@ -1163,7 +1234,7 @@ impl Pipes {
         endpoint: Endpoint,
         flags: u32,
     ) -> Result<(), u32> {
-        let i = self.sock_slot(held, endpoint)?;
+        let i = self.desc_slot(held, endpoint)?;
         if flags & !NONBLOCK != 0 {
             return Err(INVALID);
         }
@@ -1172,13 +1243,17 @@ impl Pipes {
     }
 
     pub(super) fn sock_stat(&self, held: &Held, endpoint: Endpoint) -> Result<(u32, u32), u32> {
-        let i = self.sock_slot(held, endpoint)?;
+        let i = self.desc_slot(held, endpoint)?;
         Ok((PIPES as u32 + i as u32, u32::from(self.sockets.s[i].len)))
     }
 
     pub(super) fn sock_readiness(&self, i: usize) -> u32 {
         use proto_wire::watch;
         let s = &self.sockets.s[i];
+        if s.kind == MQ_KIND {
+            // Not waited for: a queue's changes do not wake a poll.
+            return watch::NVAL;
+        }
         let mut ready = 0;
         if s.len != 0 || s.rx_eof || s.rd_shut || (s.listening && s.queued != 0) {
             ready |= watch::READ;
@@ -1212,7 +1287,7 @@ impl Pipes {
         endpoint: Endpoint,
         wakes: &mut Wakes,
     ) -> Result<(), u32> {
-        let i = self.sock_slot(held, endpoint)?;
+        let i = self.desc_slot(held, endpoint)?;
         held.remove(endpoint.id as usize);
         self.sock_unref(i, 1, wakes);
         Ok(())
@@ -1224,6 +1299,16 @@ impl Pipes {
         debug_assert!(s.refs >= count, "the references of a socket");
         s.refs = s.refs.saturating_sub(count);
         if s.refs != 0 || !s.live {
+            return;
+        }
+        if s.kind == MQ_KIND {
+            // An open message queue: the queue loses an opener.
+            let queue = s.peer;
+            s.live = false;
+            s.peer = None;
+            if let Some(queue) = queue {
+                self.mq_closed(i, queue, wakes);
+            }
             return;
         }
         wakes.add(s.waiters.waiters);

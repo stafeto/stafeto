@@ -275,7 +275,7 @@ impl Pipes {
         let mut out = Held::default();
         for &endpoint in endpoints {
             if endpoint.is_sock() {
-                self.sock_slot(held, endpoint)?;
+                self.desc_slot(held, endpoint)?;
             } else {
                 self.resolve_endpoint(held, endpoint, None)?;
             }
@@ -383,7 +383,7 @@ impl Pipes {
     /// One exact held-description lookup supplies its canonical queue and readiness.
     pub fn watch_endpoint(&self, held: &Held, endpoint: Endpoint) -> Result<(u32, u32), u32> {
         if endpoint.is_sock() {
-            let slot = self.sock_slot(held, endpoint)?;
+            let slot = self.desc_slot(held, endpoint)?;
             return Ok((DESCRIPTIONS as u32 + slot as u32, self.sock_readiness(slot)));
         }
         if !endpoint.is_named() {

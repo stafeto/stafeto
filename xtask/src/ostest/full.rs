@@ -127,7 +127,7 @@ pub fn run(jobs: usize) -> Result<(), String> {
             .arg("--full-basic"),
     )?;
     let work = target_dir().join("os-test-full");
-    let tests = tests_of(&work)?;
+    let mut tests = tests_of(&work)?;
     let unique: std::collections::BTreeSet<_> = tests.iter().map(|t| &t.name).collect();
     if tests.len() != TEST_COUNT || unique.len() != TEST_COUNT {
         return Err(format!(
@@ -135,6 +135,14 @@ pub fn run(jobs: usize) -> Result<(), String> {
             tests.len(),
             unique.len()
         ));
+    }
+    // OS_TEST_FILTER=a,b runs only the tests whose names contain one of the
+    // pieces, for work on a part; the census is then incomplete and neither
+    // the totals nor the list of passing tests are checked.
+    let filter = std::env::var("OS_TEST_FILTER").ok();
+    if let Some(filter) = &filter {
+        let pieces: Vec<&str> = filter.split(',').collect();
+        tests.retain(|t| pieces.iter().any(|p| t.name.contains(p)));
     }
     let sources = std::fs::read_to_string(work.join("sources.txt")).map_err(|e| e.to_string())?;
     let sources: std::collections::BTreeMap<_, _> = sources
@@ -305,7 +313,11 @@ pub fn run(jobs: usize) -> Result<(), String> {
     )?;
     let list = std::fs::read_to_string(crate::root().join(FULL_PASSING))
         .map_err(|e| format!("{FULL_PASSING}: {e}"))?;
-    let (lost, new) = compare_full(&list, &rows);
+    let (lost, new) = if filter.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        compare_full(&list, &rows)
+    };
     for name in &new {
         println!("os-test full {name} passes and is not in {FULL_PASSING}");
     }
