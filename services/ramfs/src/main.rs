@@ -1642,12 +1642,17 @@ impl Service<0> for Fs {
             let (storage, descriptions) = self.ram.lock_parts();
             if self.lock_maintenance_work == 1 && self.lock_sweep_pending {
                 self.locks
-                    .sweep_run(storage, &mut self.lock_sweep, SWEEP_EMPTY_RUN, |owner| match owner {
-                        Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
-                        Owner::Description { slot, generation } => {
-                            descriptions.live(Token { slot, generation })
-                        }
-                    });
+                    .sweep_run(
+                        storage,
+                        &mut self.lock_sweep,
+                        SWEEP_EMPTY_RUN,
+                        |owner| match owner {
+                            Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
+                            Owner::Description { slot, generation } => {
+                                descriptions.live(Token { slot, generation })
+                            }
+                        },
+                    );
                 self.lock_sweep_pending = self.locks.has_locks() && self.lock_sweep.pending();
                 if !self.locks.has_locks() {
                     self.lock_sweep.stop();

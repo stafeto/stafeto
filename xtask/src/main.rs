@@ -5843,7 +5843,11 @@ fn ash_dialog() -> Result<(), String> {
             "ls -1 /proc/$$ | sort | tr '\\n' ' '; echo",
             &["~cmdline stat status"],
         )?;
-        dialog_command(&mut run, "ls /proc/999999; echo missing $?", &["~missing 1"])?;
+        dialog_command(
+            &mut run,
+            "ls /proc/999999; echo missing $?",
+            &["~missing 1"],
+        )?;
         // Behind the names are the applets: of the 112 names, ten are
         // builtins of the shell and `sh` is the shell's second name, and the
         // other 101 are applets BusyBox lists, less the 24 it lacks.
@@ -5985,7 +5989,11 @@ fn ash_dialog() -> Result<(), String> {
         // images of the failed attempts go back to the pool of the process
         // service: 40 searches with three misses each end as the first did.
         run.send("saved=$PATH; PATH=/miss1:/miss2:/miss3:$saved; i=0; while [ $i -lt 40 ]; do uname > /dev/null || break; i=$((i+1)); done; PATH=$saved; echo path-misses $i")?;
-        run.expect_line("path-misses 40", |line| line == "path-misses 40", DIALOG_STEP)?;
+        run.expect_line(
+            "path-misses 40",
+            |line| line == "path-misses 40",
+            DIALOG_STEP,
+        )?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("exit")?;
         run.expect("exit", DIALOG_STEP)?;
