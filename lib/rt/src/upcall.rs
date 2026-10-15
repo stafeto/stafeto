@@ -72,7 +72,25 @@ fn word(offset: usize) -> &'static AtomicU64 {
 // SAFETY: this executable .text section remains in the native RX segment.
 #[cfg_attr(target_os = "none", unsafe(link_section = ".text.stafeto_signal_hot"))]
 fn control(operation: UpcallControl) -> Result<bool, Error> {
-    control_with(operation, 0, 0).map(|result| result[1] != 0)
+    // SAFETY: control touches only current-thread delivery state.
+    let result = unsafe {
+        sys::raw::<{ Call::ThreadUpcallControl.number() }>([
+            operation.raw(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ])
+    };
+    match Error::from_code(result[0]) {
+        Some(error) => Err(error),
+        None => Ok(result[1] != 0),
+    }
 }
 
 // SAFETY: this executable .text section remains in the native RX segment.

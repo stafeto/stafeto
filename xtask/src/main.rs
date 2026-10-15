@@ -4072,14 +4072,14 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    turn into room for later growth.
 const NULL_MAX: u64 = 266;
 const THREADS_READY_MAX: u64 = 12_768;
-const S5_ICOUNT_MAX: u64 = 3_035;
+const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
 const NULL_SLACK: u64 = 16;
 /// The room each guard keeps above its measure when it is set or lowered.
 const NULL_KEEP: u64 = 4;
 const THREADS_READY_KEEP: u64 = 4;
-const S5_ICOUNT_KEEP: u64 = 276;
+const S5_ICOUNT_KEEP: u64 = 279;
 const THREADS_READY_SLACK: u64 = 128;
 const S5_ICOUNT_SLACK: u64 = 300;
 
@@ -7004,7 +7004,7 @@ fn guard_margin(
 /// The line that asks to lower the guard `name` when its `room` under `max`
 /// is larger than `slack`: the new number is the measure plus `keep` ticks,
 /// the room the rule of that guard keeps (`NULL_KEEP` and `THREADS_READY_KEEP`
-/// 4, `S5_ICOUNT_KEEP` 276, 10 % of the measure).
+/// 4, `S5_ICOUNT_KEEP` 279, 10 % of the measure).
 fn guard_lower_hint(name: &str, room: u64, slack: u64, max: u64, keep: u64) -> Option<String> {
     (room > slack).then(|| format!("lower {name} to {}", max - room + keep))
 }
@@ -8908,7 +8908,7 @@ mod tests {
             Some("lower THREADS_READY_MAX to 12643".to_owned())
         );
         // S5 keeps 10 % above its measure: a measure 301 under the number
-        // (room 301) asks for the measure plus 276, which leaves room 276.
+        // (room 301) asks for the measure plus 279, which leaves room 279.
         assert_eq!(
             guard_lower_hint(
                 "S5_ICOUNT_MAX",
@@ -8917,7 +8917,7 @@ mod tests {
                 S5_ICOUNT_MAX,
                 S5_ICOUNT_KEEP
             ),
-            Some("lower S5_ICOUNT_MAX to 3010".to_owned())
+            Some("lower S5_ICOUNT_MAX to 3041".to_owned())
         );
         assert_eq!(
             guard_lower_hint(

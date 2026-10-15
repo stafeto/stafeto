@@ -1576,6 +1576,7 @@ unsafe extern "C" fn dispatch(native: *mut upcall::Context, flags: u64) {
 ///
 /// # Safety
 /// `native` is the live frame of this entry.
+#[inline(never)]
 unsafe fn fault_entry(native: *mut upcall::Context) {
     let Ok(cause) = upcall::query() else {
         sys_exit_signal(SIGSEGV)
@@ -1654,15 +1655,26 @@ fn take(block: &Block) -> Option<(i32, SigAction, Option<SigInfo>, u64)> {
 }
 
 /// The place of a handler with `flags` for a delivery with the entry frame
-/// `native` (null for a delivery with no entry).
+/// `native` (null for a delivery with no entry). One load for a thread with
+/// no alternate stack.
+#[inline(always)]
 fn handler_place(
     flags: i32,
     native: *mut upcall::Context,
     entered: bool,
 ) -> crate::altstack::Place {
-    if crate::altstack::range().is_none() {
-        return crate::altstack::Place::Here;
+    if !crate::altstack::has_stack() {
+        return crate::altstack::Place::Plain;
     }
+    handler_place_on_stack(flags, native, entered)
+}
+
+#[inline(never)]
+fn handler_place_on_stack(
+    flags: i32,
+    native: *mut upcall::Context,
+    entered: bool,
+) -> crate::altstack::Place {
     let (frame, sp) = if entered && !native.is_null() {
         // SAFETY: the entry's live frame.
         (native as u64, unsafe { (*native).sp })
@@ -1674,6 +1686,7 @@ fn handler_place(
 
 /// The action of `signal` for a delivery now, `None` when it is ignored;
 /// SA_RESETHAND applied (SIGILL and SIGTRAP keep their action).
+#[inline(always)]
 fn effective_action(signal: i32) -> Option<SigAction> {
     // Read without the lock; SA_RESETHAND alone writes, under it.
     let read = action(signal);

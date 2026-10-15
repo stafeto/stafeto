@@ -769,20 +769,20 @@ mod tests {
         );
     }
 
-    /// 16 ns a tick under -icount: 3 035 instructions are 48 560 ns.
+    /// 16 ns a tick under -icount: 3 063 instructions are 49 008 ns.
     #[test]
     fn the_guard_of_s5_holds_at_its_number_and_fires_one_over() {
         let at = run_with_s5(S5_ICOUNT_MAX * 16);
         assert_eq!(s5_ticks(&at).unwrap(), [S5_ICOUNT_MAX; 3]);
         assert_eq!(s5_room(&at, S5_ICOUNT_MAX), Ok(0));
-        let head = run_with_s5(2_759 * 16);
-        assert_eq!(s5_room(&head, S5_ICOUNT_MAX), Ok(276));
+        let head = run_with_s5(2_784 * 16);
+        assert_eq!(s5_room(&head, S5_ICOUNT_MAX), Ok(279));
         // The room at the measure is a tenth of it.
-        const { assert!(2_759 * 11 <= S5_ICOUNT_MAX * 10) };
+        const { assert!(2_784 * 11 <= S5_ICOUNT_MAX * 10) };
         let over = run_with_s5((S5_ICOUNT_MAX + 1) * 16);
         let error = s5_room(&over, S5_ICOUNT_MAX).unwrap_err();
         assert!(
-            error.contains("s5_kill_sleeping=3036") && error.contains("1 past its guard 3035"),
+            error.contains("s5_kill_sleeping=3064") && error.contains("1 past its guard 3063"),
             "{error}"
         );
         // A run at its own speed shows a few hundred ticks, not instructions.
@@ -793,7 +793,7 @@ mod tests {
                 .contains("the run is not under -icount")
         );
         // One row alone over the number fires too.
-        let mut one = run_with_s5(2_759 * 16);
+        let mut one = run_with_s5(2_784 * 16);
         let at = one
             .rows
             .iter()

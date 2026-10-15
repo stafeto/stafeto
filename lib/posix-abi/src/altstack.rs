@@ -72,6 +72,10 @@ impl Alt {
     }
 }
 
+/// Some thread set an alternate stack once: until then no thread has one, and
+/// the path of every signal skips the table (the flag never goes back).
+static EVER: AtomicBool = AtomicBool::new(false);
+
 static ALT: [Alt; crate::relibc::PLACES + 1] = [const { Alt::new() }; crate::relibc::PLACES + 1];
 
 /// A thread with no block (before its attachment) has no stack: its row is
@@ -102,6 +106,19 @@ pub(crate) fn after_fork() {
     }
 }
 
+/// Whether the calling thread has an alternate stack: one load.
+#[inline(always)]
+pub(crate) fn has_stack() -> bool {
+    if !EVER.load(Ordering::Relaxed) {
+        return false;
+    }
+    // SAFETY: a published block lives as long as its thread.
+    match unsafe { posix_thread::block().as_ref() } {
+        Some(block) => ALT[block.thread_id as usize].high.load(Ordering::Relaxed) != 0,
+        None => false,
+    }
+}
+
 /// The range the kernel holds for the calling thread.
 pub(crate) fn range() -> Option<(u64, u64)> {
     let alt = row();
@@ -127,11 +144,17 @@ pub(crate) fn on_alternate() -> bool {
 
 /// The state of the stack for a handler's `uc_stack`: the base the program
 /// gave, its size and `ss_flags` as sigaltstack gives them.
+#[inline(always)]
 pub(crate) fn state() -> (u64, u64, i32) {
-    let alt = row();
-    if alt.high.load(Ordering::Relaxed) == 0 {
+    if !has_stack() {
         return (0, 0, SS_DISABLE);
     }
+    state_on_stack()
+}
+
+#[inline(never)]
+fn state_on_stack() -> (u64, u64, i32) {
+    let alt = row();
     let flags = if on_alternate() { SS_ONSTACK } else { 0 };
     (
         alt.base.load(Ordering::Relaxed),
@@ -178,6 +201,7 @@ pub fn sigaltstack(new: Option<(u64, u64, i32)>) -> Result<(u64, u64, i32), i32>
     let high = end & !15;
     // The aligned range loses 30 bytes at most, which MINSIGSTKSZ has to spare.
     rt::upcall::set_stack(low, high - low).map_err(|_| EINVAL)?;
+    EVER.store(true, Ordering::Relaxed);
     alt.base.store(base, Ordering::Relaxed);
     alt.size.store(size, Ordering::Relaxed);
     alt.low.store(low, Ordering::Relaxed);
@@ -207,6 +231,8 @@ pub(crate) fn overflowed(sp: u64) -> bool {
 /// Where a handler runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Place {
+    /// On the stack of the caller; the thread has no alternate stack.
+    Plain,
     /// On the stack of the caller.
     Here,
     /// On the alternate stack, from its top (a delivery with no entry).
@@ -221,7 +247,7 @@ pub(crate) enum Place {
 /// interrupted stack pointer is `sp`.
 pub(crate) fn place(on_stack: bool, frame: u64, sp: u64) -> Place {
     let Some((low, high)) = range() else {
-        return Place::Here;
+        return Place::Plain;
     };
     let here = on_alternate();
     if on_stack {
@@ -243,9 +269,19 @@ pub(crate) fn place(on_stack: bool, frame: u64, sp: u64) -> Place {
 }
 
 /// Runs `body` at `place`.
+#[inline(always)]
 pub(crate) fn run(place: Place, body: impl FnOnce()) {
+    if place == Place::Plain {
+        // The path of every signal of a thread with no alternate stack.
+        return body();
+    }
+    run_placed(place, body)
+}
+
+fn run_placed(place: Place, body: impl FnOnce()) {
     let alt = row();
     match place {
+        Place::Plain => body(),
         Place::Here => {
             if on_alternate() {
                 let before = alt.active.swap(true, Ordering::Relaxed);
