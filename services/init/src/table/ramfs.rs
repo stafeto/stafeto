@@ -511,10 +511,13 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
 /// each, and 24 of its own (tests/posix-procs STEPS_BRANCHES).
 const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 
-/// The steps probe and each spawned child retain at most 430 pages with
-/// all seven 64 KiB workers, including allocator mapping and alignment.
-/// The 512-page quota leaves 16.0% reserve for that measured workload.
-const STEPS_QUOTA: u64 = 512 * PAGE;
+/// The steps probe and each spawned child retain at most 474 pages with
+/// all seven 64 KiB workers, including allocator mapping and alignment
+/// (measured on the part that added the memory map's tables, the shared
+/// memory and the files of mappings: 459 pages on main before it, of which
+/// the program's image grew by 5 pages and the layer's by 8). The probe
+/// requires 10% reserve; 528 pages leave 10.2%.
+const STEPS_QUOTA: u64 = 528 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
 /// allocator growth retains 572 charged pages. Up to four prepaid mapping
@@ -553,7 +556,11 @@ pub const OS_TEST_TABLE: &[Record] = &[
 ];
 
 /// The quota of the runner of os-test, which each test it starts gets too.
-const OS_TEST_QUOTA: u64 = 512 * PAGE;
+/// 544 pages: the layer's image grew by about 5 pages with the mappings of
+/// files, shared memory and the process service's rendezvous, and
+/// basic/time/strftime_l, whose heap needs a second chunk, had under 17 pages
+/// left of 512.
+const OS_TEST_QUOTA: u64 = 544 * PAGE;
 
 /// relibc-hello's record, for the records of its other runs.
 const RELIBC_HELLO: Record = Record {

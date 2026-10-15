@@ -171,7 +171,12 @@ fn content(node: &Node) -> Result<Text, i32> {
     match *node {
         Node::Uptime => {
             let ns = rt::time::ticks_to_ns(rt::time::now());
-            let _ = writeln!(text, "{}.{:02} 0.00", ns / 1_000_000_000, (ns / 10_000_000) % 100);
+            let _ = writeln!(
+                text,
+                "{}.{:02} 0.00",
+                ns / 1_000_000_000,
+                (ns / 10_000_000) % 100
+            );
         }
         Node::File(pid, kind) => {
             let l = find(pid)?;
@@ -274,7 +279,13 @@ pub fn stat(path: &[u8]) -> Result<NodeInfo, i32> {
         }
         Node::File(pid, file) => {
             let l = find(pid)?;
-            (2, 0o444, l.euid, l.egid, (u64::from(pid) << 4) | (1 + file as u64))
+            (
+                2,
+                0o444,
+                l.euid,
+                l.egid,
+                (u64::from(pid) << 4) | (1 + file as u64),
+            )
         }
         Node::Uptime => (2, 0o444, 0, 0, 1),
     };

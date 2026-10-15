@@ -16,16 +16,16 @@
 #![no_std]
 
 mod files;
+mod mapping;
 mod names;
 mod signals;
 mod sockets;
 mod wait;
 
-use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use core::sync::atomic::AtomicU32;
-use posix_abi::constants::{EFAULT, EINVAL, ENOMEM};
+use posix_abi::constants::{EFAULT, EINVAL};
 use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
@@ -273,6 +273,7 @@ pub extern "C" fn stafeto_lseek(fd: c_int, offset: i64, whence: c_int) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_exit(status: c_int) -> ! {
+    mapping::flush_all();
     posix_abi::exit(status)
 }
 
@@ -657,6 +658,7 @@ pub unsafe extern "C" fn stafeto_exec(
     // SAFETY: as above.
     let (argv, envp) = unsafe { (strings(argv), strings(envp)) };
     let umask = files::umask();
+    mapping::flush_all();
     match call(|| posix_abi::process::exec(path, argv.clone(), envp.clone(), umask)) {
         Ok(never) => match never {},
         Err(errno) => -errno,
@@ -676,6 +678,7 @@ pub unsafe extern "C" fn stafeto_fexecve(
     // SAFETY: the caller's promise.
     let (argv, envp) = unsafe { (strings(argv), strings(envp)) };
     let umask = files::umask();
+    mapping::flush_all();
     match call(|| posix_abi::process::fexec(fd, argv.clone(), envp.clone(), umask)) {
         Ok(never) => match never {},
         Err(errno) => -errno,
@@ -1000,6 +1003,89 @@ pub extern "C" fn stafeto_probe_threads() -> c_int {
     posix_abi::fork::probe_threads() as c_int
 }
 
+/// The key of the shared memory of the file with this device and inode, for
+/// the probes of the process service's rendezvous.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_key(device: u64, inode: u64) -> u64 {
+    posix_abi::shares::key_of(device, inode)
+}
+
+/// A Get of the rendezvous for `key` with no vouching of a file service
+/// first: 0 when it answered, else the errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_get(key: u64) -> c_int {
+    match posix_abi::shares::get(key) {
+        Ok(_) => 0,
+        Err(errno) => errno,
+    }
+}
+
+/// The vouching of the file service for the file of `fd` (ShareGrant): 0, or
+/// the errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_grant(fd: c_int) -> c_int {
+    match posix_abi::shares::grant(fd) {
+        Ok(()) => 0,
+        Err(errno) => errno,
+    }
+}
+
+/// A process with the file of `fd` open (vouched for) hands the rendezvous
+/// an object of its own as the shared memory of the file, as a forked
+/// child does: 0 when it did, else the errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_plant(fd: c_int, key: u64) -> c_int {
+    if let Err(errno) = posix_abi::shares::grant(fd) {
+        return errno;
+    }
+    let Ok(object) = rt::sys::mem_create(4096) else {
+        return 12;
+    };
+    match posix_abi::shares::attach(key, 1, &object) {
+        Ok(()) => 0,
+        Err(errno) => errno,
+    }
+}
+
+/// Vouched for the file of `fd`, asks the rendezvous for its object and tries
+/// to map it for writing past the layer at a free address: 0 when the
+/// kernel mapped it, 100 + errno when the rendezvous gave none, else 200 + the
+/// kernel's error.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_map_write(fd: c_int, key: u64) -> c_int {
+    use posix_abi::shares::Got;
+    if let Err(errno) = posix_abi::shares::grant(fd) {
+        return 100 + errno;
+    }
+    let memory = match posix_abi::shares::get(key) {
+        Ok(Got::Found(memory, _)) => memory,
+        Ok(_) => return 101,
+        Err(errno) => return 100 + errno,
+    };
+    let process = posix_abi::allocation::process();
+    match rt::sys::mem_map(
+        process,
+        &memory,
+        0,
+        4096,
+        0x3000_0000,
+        rt::abi::Access::ReadWrite,
+    ) {
+        Ok(()) => {
+            // SAFETY: the mapping was made just now, and nothing uses it.
+            let _ = unsafe { rt::sys::mem_unmap(process, 0x3000_0000, 4096) };
+            0
+        }
+        Err(_) => 200,
+    }
+}
+
+/// The shared objects the layer's map holds (posix_abi::fork::probe_shared_objects).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_shared_objects() -> u64 {
+    posix_abi::fork::probe_shared_objects()
+}
+
 /// The most mappings an object of the layer's map has
 /// (posix_abi::fork::probe_mappings).
 #[unsafe(no_mangle)]
@@ -1020,8 +1106,8 @@ pub unsafe extern "C" fn stafeto_probe_memory_map(out: *mut u64, max: usize) -> 
         for (i, region) in map.iter().take(max).enumerate() {
             let words = [
                 region.address as u64,
-                region.pages as u64,
-                region.access.raw(),
+                region.pages() as u64,
+                region.access().raw(),
             ];
             // SAFETY: the caller gives room for `3 * max` words.
             unsafe { out.add(3 * i).copy_from_nonoverlapping(words.as_ptr(), 3) };
@@ -1043,123 +1129,9 @@ pub extern "C" fn stafeto_probe_memory_quota() -> u64 {
     rt::sys::process_memory(posix_abi::allocation::process()).map_or(0, |memory| memory.quota)
 }
 
-const PAGE: usize = 4096;
-
-/// The anonymous mappings relibc holds: (first page, pages) of each, in
-/// pages of the address space (32 bits each reach 16 TiB), 0 pages for a
-/// free record. The pages come from the layer's heap (no header), so
-/// munmap gives back the whole mapping, pages from either edge, or pages
-/// from the middle, which splits the record in two.
-const MAPPINGS: usize = 256;
-type Records = [(u32, u32); MAPPINGS];
-struct Mappings(UnsafeCell<Records>);
-// SAFETY: only `mappings` borrows the records, under MAPPINGS_LOCK.
-unsafe impl Sync for Mappings {}
-static MAPS: Mappings = Mappings(UnsafeCell::new([(0, 0); MAPPINGS]));
-static MAPPINGS_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::new();
-
-/// A record of the bytes from `start` to `end`, both page-aligned.
-fn record(start: usize, end: usize) -> (u32, u32) {
-    ((start / PAGE) as u32, ((end - start) / PAGE) as u32)
-}
-
-/// The bytes a record holds: its start and end.
-fn bounds((page, pages): (u32, u32)) -> (usize, usize) {
-    let start = page as usize * PAGE;
-    (start, start + pages as usize * PAGE)
-}
-
-fn mappings<R>(f: impl FnOnce(&mut Records) -> R) -> R {
-    let _guard = MAPPINGS_LOCK.lock();
-    // SAFETY: the lock gives this borrow alone.
-    f(unsafe { &mut *MAPS.0.get() })
-}
-
-/// Zeroed, page-aligned memory for `len` bytes from the layer's heap, or
-/// null, which relibc reports as ENOMEM.
-#[unsafe(no_mangle)]
-pub extern "C" fn stafeto_mmap_anonymous(len: usize) -> *mut c_void {
-    let Some(size) = len.checked_next_multiple_of(PAGE).filter(|&size| size != 0) else {
-        return ptr::null_mut();
-    };
-    let Ok(pointer) = posix_abi::allocation::map_pages(size) else {
-        return ptr::null_mut();
-    };
-    let start = pointer.as_ptr() as usize;
-    let recorded = mappings(|maps| {
-        maps.iter_mut()
-            .find(|free| free.1 == 0)
-            .map(|free| *free = record(start, start + size))
-            .is_some()
-    });
-    if !recorded {
-        // SAFETY: the pages are this call's, and nobody saw them.
-        unsafe { posix_abi::allocation::unmap_pages(pointer, size) };
-        return ptr::null_mut();
-    }
-    pointer.as_ptr().cast()
-}
-
-/// Unmaps whole pages of a mapping of `stafeto_mmap_anonymous`: all of it,
-/// pages from an edge, or pages from the middle. A range that meets no
-/// mapping is left alone (POSIX: success); EINVAL for one that is part in
-/// a mapping and part outside or across two, ENOMEM when a split finds no
-/// free record.
-#[unsafe(no_mangle)]
-pub extern "C" fn stafeto_munmap(addr: *mut c_void, len: usize) -> c_int {
-    let start = addr as usize;
-    let Some(size) = len.checked_next_multiple_of(PAGE).filter(|&size| size != 0) else {
-        return -EINVAL;
-    };
-    let Some(end) = start
-        .checked_add(size)
-        .filter(|_| start.is_multiple_of(PAGE))
-    else {
-        return -EINVAL;
-    };
-    let result: Result<bool, c_int> = mappings(|maps| {
-        let Some(index) = maps.iter().position(|&held| {
-            let (first, last) = bounds(held);
-            held.1 != 0 && first <= start && end <= last
-        }) else {
-            let meets = maps.iter().any(|&held| {
-                let (first, last) = bounds(held);
-                held.1 != 0 && first < end && start < last
-            });
-            return if meets { Err(EINVAL) } else { Ok(false) };
-        };
-        let (first, last) = bounds(maps[index]);
-        match (start == first, end == last) {
-            (true, true) => maps[index] = (0, 0),
-            (true, false) => maps[index] = record(end, last),
-            (false, true) => maps[index] = record(first, start),
-            (false, false) => {
-                let free = maps.iter().position(|free| free.1 == 0).ok_or(ENOMEM)?;
-                maps[index] = record(first, start);
-                maps[free] = record(end, last);
-            }
-        }
-        Ok(true)
-    });
-    match result {
-        Ok(false) => 0,
-        Ok(true) => {
-            // SAFETY: the pages left the records: relibc gave them up.
-            unsafe {
-                posix_abi::allocation::unmap_pages(
-                    core::ptr::NonNull::new_unchecked(addr.cast()),
-                    size,
-                )
-            };
-            0
-        }
-        Err(errno) => -errno,
-    }
-}
-
 /// Takes back one of relibc's mappings for the thread table.
 fn unmap(address: usize, length: usize) {
-    let _ = stafeto_munmap(address as *mut c_void, length);
+    let _ = mapping::stafeto_munmap(address as *mut c_void, length);
 }
 
 /// A new thread's first instructions: the stack holds what relibc pushed

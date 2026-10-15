@@ -182,9 +182,17 @@ fn null_device() -> RootFile {
 /// layer reads them from its generator), so the bytes are none. With
 /// `/dev/null` they are the device nodes of an image where POSIX programs
 /// run, and the image has the entropy service for them.
-fn devices() -> [RootFile; 4] {
+fn devices() -> [RootFile; 5] {
     [
         dir("/dev/pts"),
+        // The names of shm_open: files here are the shared memory objects.
+        RootFile {
+            path: "/dev/shm",
+            mode: 0o1777,
+            uid: 0,
+            gid: 0,
+            source: None,
+        },
         null_device(),
         of("/dev/random", 0o666, ROOT, Source::Bytes("random", b"")),
         of("/dev/urandom", 0o666, ROOT, Source::Bytes("urandom", b"")),
@@ -195,14 +203,86 @@ fn devices() -> [RootFile; 4] {
 /// programs (the other ten of the 112 are builtins of the shell, `sh` is
 /// listed with the shell) and the applets the probes use (`mktemp`, `nc`).
 pub const UTILITIES: [&str; 80] = [
-    "awk", "basename", "bc", "cat", "chgrp", "chmod", "chown", "cksum", "cmp", "comm", "cp",
-    "crontab", "cut", "date", "dd", "df", "diff", "dirname", "du", "echo", "ed", "env",
-    "expand", "expr", "false", "find", "fold", "grep", "head", "id", "kill", "ln", "logger",
-    "login-probe", "logname", "ls", "mesg", "mkdir", "mkfifo", "mktemp", "mv", "nc", "nice",
-    "nohup", "od", "paste", "patch", "printf", "ps", "pwd", "readlink", "realpath", "renice",
-    "rm", "rmdir", "sed", "sleep", "sort", "split", "strings", "stty", "tail", "tee", "test",
-    "time", "timeout", "touch", "tr", "true", "tsort", "tty", "uname", "uncompress", "unexpand",
-    "uniq", "uudecode", "uuencode", "wc", "xargs", "zcat",
+    "awk",
+    "basename",
+    "bc",
+    "cat",
+    "chgrp",
+    "chmod",
+    "chown",
+    "cksum",
+    "cmp",
+    "comm",
+    "cp",
+    "crontab",
+    "cut",
+    "date",
+    "dd",
+    "df",
+    "diff",
+    "dirname",
+    "du",
+    "echo",
+    "ed",
+    "env",
+    "expand",
+    "expr",
+    "false",
+    "find",
+    "fold",
+    "grep",
+    "head",
+    "id",
+    "kill",
+    "ln",
+    "logger",
+    "login-probe",
+    "logname",
+    "ls",
+    "mesg",
+    "mkdir",
+    "mkfifo",
+    "mktemp",
+    "mv",
+    "nc",
+    "nice",
+    "nohup",
+    "od",
+    "paste",
+    "patch",
+    "printf",
+    "ps",
+    "pwd",
+    "readlink",
+    "realpath",
+    "renice",
+    "rm",
+    "rmdir",
+    "sed",
+    "sleep",
+    "sort",
+    "split",
+    "strings",
+    "stty",
+    "tail",
+    "tee",
+    "test",
+    "time",
+    "timeout",
+    "touch",
+    "tr",
+    "true",
+    "tsort",
+    "tty",
+    "uname",
+    "uncompress",
+    "unexpand",
+    "uniq",
+    "uudecode",
+    "uuencode",
+    "wc",
+    "xargs",
+    "zcat",
 ];
 
 /// The user accounting file of the dialog's image: one record of relibc's
@@ -260,8 +340,18 @@ fn dialog() -> Vec<RootFile> {
         dir("/var/spool"),
         dir("/var/spool/at"),
         dir("/var/spool/lp"),
-        of("/etc/mtab", 0o644, ROOT, Source::Bytes("mtab", b"ramfs / ramfs rw 0 0\n")),
-        of("/var/run/utmpx", 0o644, ROOT, Source::Bytes("utmpx", &UTMPX)),
+        of(
+            "/etc/mtab",
+            0o644,
+            ROOT,
+            Source::Bytes("mtab", b"ramfs / ramfs rw 0 0\n"),
+        ),
+        of(
+            "/var/run/utmpx",
+            0o644,
+            ROOT,
+            Source::Bytes("utmpx", &UTMPX),
+        ),
     ]);
     files.extend(devices());
     files
@@ -531,6 +621,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-fifo.img",
     "boot-posix-fifo-steps.img",
     "boot-posix-resources.img",
+    "boot-posix-map.img",
     "boot-posix-lock-ring.img",
     "boot-posix-native-scopes.img",
     "boot-posix-native-scopes-vz.img",
@@ -608,6 +699,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-fifo.img"
         | "boot-posix-fifo-steps.img"
         | "boot-posix-resources.img"
+        | "boot-posix-map.img"
         | "boot-posix-lock-ring.img" => procs(),
         "boot-posix-poll.img" => {
             let mut files = vec![
@@ -811,6 +903,7 @@ mod tests {
             "boot-posix-spawn-churn.img",
             "boot-posix-sync.img",
             "boot-posix-resources.img",
+            "boot-posix-map.img",
         ] {
             let files = files_of(image);
             assert!(
@@ -839,6 +932,7 @@ mod tests {
                 "boot-posix-spawn-churn.img" => &crate::POSIX_SPAWN_CHURN_PROGRAMS,
                 "boot-posix-sync.img" => &crate::POSIX_SYNC_PROGRAMS,
                 "boot-posix-resources.img" => &crate::POSIX_RESOURCES_PROGRAMS,
+                "boot-posix-map.img" => &crate::POSIX_MAP_PROGRAMS,
                 "boot-posix-lock-ring.img" => &crate::POSIX_LOCK_RING_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
                 "boot-posix-native-scopes-vz.img" => &crate::POSIX_VZ_NATIVE_SCOPE_PROGRAMS,
@@ -945,6 +1039,7 @@ mod tests {
             "boot-posix-spawn-churn.img",
             "boot-posix-sync.img",
             "boot-posix-resources.img",
+            "boot-posix-map.img",
             "boot-posix-lock-ring.img",
             "boot-posix-random.img",
             "boot-posix-pty.img",
@@ -957,6 +1052,7 @@ mod tests {
             for path in [
                 "/dev",
                 "/dev/pts",
+                "/dev/shm",
                 "/dev/null",
                 "/dev/random",
                 "/dev/urandom",
@@ -972,6 +1068,7 @@ mod tests {
         for path in [
             "/dev",
             "/dev/pts",
+            "/dev/shm",
             "/dev/null",
             "/dev/random",
             "/dev/urandom",

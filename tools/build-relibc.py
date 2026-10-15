@@ -31,13 +31,15 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # F9 sockets: AF_UNIX and the IPv4 loopback through the layer, accept4,
 # sockatmark, service names in getaddrinfo and getnameinfo, reverse lookup
 # from /etc/hosts; tagged pin-a5096e2d.
+# F8 mappings: mmap of files and shared memory, mprotect, msync, madvise and
+# the checks of mlock through the layer; tagged pin-42b71064.
 # F10 utilities: getlogin and getlogin_r from utmpx, syslog into
 # /var/log/messages, utmpx over /var/run/utmpx, the flush of every stream at
-# exit, the default PATH of execvp, mntent, wait3, sysinfo; tagged pin-d5054f04.
+# exit, the default PATH of execvp, mntent, wait3, sysinfo; tagged pin-cf5c9ccc.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "d5054f046b549d1abfa7840b2ae0620b62edc02b"
+COMMIT = "cf5c9cccf0ef5678668536f9413abdbee0733c11"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

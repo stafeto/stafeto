@@ -229,7 +229,12 @@ impl<P> Records<P> {
     ) -> Result<bool, u32> {
         if !matches!(
             resource,
-            proto_process::CORE | proto_process::FSIZE | proto_process::NOFILE
+            proto_process::CORE
+                | proto_process::DATA
+                | proto_process::FSIZE
+                | proto_process::NOFILE
+                | proto_process::STACK
+                | proto_process::AS
         ) || value.soft > value.hard
         {
             return Err(proto_process::INVALID);

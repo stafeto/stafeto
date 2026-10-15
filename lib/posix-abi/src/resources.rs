@@ -4,7 +4,7 @@
 use crate::constants::{EAGAIN, EINVAL, EIO, ENOSYS, EPERM};
 use core::sync::atomic::{AtomicU32, Ordering};
 pub use proto_process::Limit;
-use proto_process::{CORE, FSIZE, NOFILE};
+use proto_process::{AS, CORE, DATA, FSIZE, NOFILE, STACK};
 static SETTER: AtomicU32 = AtomicU32::new(0);
 struct Guard;
 impl Guard {
@@ -46,8 +46,11 @@ fn resource(value: i32) -> Result<usize, i32> {
     match value {
         0..=15 => match value {
             1 => Ok(FSIZE),
+            2 => Ok(DATA),
+            3 => Ok(STACK),
             4 => Ok(CORE),
             7 => Ok(NOFILE),
+            9 => Ok(AS),
             _ => Err(ENOSYS),
         },
         _ => Err(EINVAL),
@@ -72,6 +75,9 @@ pub fn set(value: i32, limit: Limit) -> Result<(), i32> {
         .map_err(errno)?;
     if index == NOFILE {
         crate::shared::set_nofile_limit(limit.soft)?;
+    }
+    if index == DATA || index == AS {
+        crate::mmap::set_limit(value, limit.soft);
     }
     Ok(())
 }

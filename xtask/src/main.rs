@@ -660,6 +660,11 @@ const POSIX_RESOURCES_PROGRAMS: [ImageProgram; 10] = {
     );
     programs
 };
+const POSIX_MAP_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = ("posix-procs", "posix-map-probe", POSIX_STACK_SIZE, &[]);
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1272,6 +1277,7 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-map  verify mmap, munmap, mprotect, madvise and the faults of unmapped pages
   posix-resources verify account files, limits, groups and descriptor exec
   posix-math   verify scalar math, binary128 and thread floating-point state
   posix-park verify that waits survive a park for the stop of a fork
@@ -1399,6 +1405,7 @@ fn main() {
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
         Some("os-test-headers") => os_test_headers(&args[1..]),
+        Some("posix-map") => posix_map_probe(),
         Some("posix-resources") => posix_resources_probe(),
         Some("posix-sync") => posix_sync_probe(),
         Some("layer-names") => layer_c_names(),
@@ -3804,6 +3811,32 @@ fn posix_fifo_run(steps: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn posix_map_probe() -> Result<(), String> {
+    relibc()?;
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-posix-map.img", &POSIX_MAP_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    for marker in [
+        "posix-map: mprotect, munmap and faults ok",
+        "posix-map: shared memory, files and shm ok",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
+    Ok(())
+}
+
 fn posix_resources_probe() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -4367,7 +4400,7 @@ const STEP_KINDS: [(usize, &str); 24] = [
     (57, "GetGroups"),
     (58, "Timer"),
     (59, "Queue"),
-    (60, "List"),
+    (62, "List"),
     (22, "SpawnStart"),
     (23, "Boot"),
     (24, "Take"),
@@ -4800,6 +4833,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         "posix-procs: resource and descriptor exec steps ok",
     )?;
     qemu::expect_marker(&outcome, "posix-procs: timer steps ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: shared memory steps ok")?;
     check_process_memory_reserve(&outcome.lines)?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
@@ -4838,10 +4872,14 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // The resource and descriptor-exec exercise runs while the crowd is live.
     // Every newly introduced dispatch is measured, with the part's 10% reserve.
     for (service, measured, kinds) in [
-        // 58 Timer, 59 Queue and 65, the expiry of timers (a notice the
-        // service counts apart).
-        ("process", &rows, &[55usize, 56, 57, 58, 59, 65][..]),
-        ("RAM", &ram, &[3usize, 59][..]),
+        // 58 Timer, 59 Queue, 60 Share, 61 ShareGrant, 62 List and 65, the
+        // expiry of timers (a notice the service counts apart).
+        (
+            "process",
+            &rows,
+            &[55usize, 56, 57, 58, 59, 60, 61, 62, 65][..],
+        ),
+        ("RAM", &ram, &[3usize, 59, 62][..]),
     ] {
         for kind in kinds {
             let ticks = measured.iter().find(|(k, ..)| k == kind).map_or(0, |r| r.1);
@@ -5158,26 +5196,148 @@ fn expect_ash_names(lines: &[String]) -> Result<(), String> {
 /// The 24 of those 112 that neither BusyBox nor the shell has. Nothing of
 /// our own stands in for them (the report names ready implementations).
 const XCU_MISSING: [&str; 24] = [
-    "at", "batch", "compress", "csplit", "file", "gencat", "getconf", "gettext", "iconv", "join",
-    "locale", "localedef", "lp", "m4", "mailx", "msgfmt", "newgrp", "ngettext", "pathchk", "pax",
-    "pr", "tabs", "tput", "write",
+    "at",
+    "batch",
+    "compress",
+    "csplit",
+    "file",
+    "gencat",
+    "getconf",
+    "gettext",
+    "iconv",
+    "join",
+    "locale",
+    "localedef",
+    "lp",
+    "m4",
+    "mailx",
+    "msgfmt",
+    "newgrp",
+    "ngettext",
+    "pathchk",
+    "pax",
+    "pr",
+    "tabs",
+    "tput",
+    "write",
 ];
 
 /// The 112 utilities POSIX.1-2024 XCU requires (the pages whose SYNOPSIS
 /// carries no option code, and `df ls ps xargs pr tabs sh`, whose option
 /// codes mark a part of the forms): each answers `command -v` in the shell.
 const XCU_UTILITIES: [&str; 112] = [
-    "alias", "at", "awk", "basename", "batch", "bc", "cat", "cd", "chgrp", "chmod", "chown",
-    "cksum", "cmp", "comm", "command", "compress", "cp", "crontab", "csplit", "cut", "date",
-    "dd", "df", "diff", "dirname", "du", "echo", "ed", "env", "expand", "expr", "false",
-    "file", "find", "fold", "gencat", "getconf", "getopts", "gettext", "grep", "hash", "head",
-    "iconv", "id", "join", "kill", "ln", "locale", "localedef", "logger", "logname", "lp",
-    "ls", "m4", "mailx", "mesg", "mkdir", "mkfifo", "msgfmt", "mv", "newgrp", "ngettext",
-    "nice", "nohup", "od", "paste", "patch", "pathchk", "pax", "pr", "printf", "ps", "pwd",
-    "read", "readlink", "realpath", "renice", "rm", "rmdir", "sed", "sh", "sleep", "sort",
-    "split", "strings", "stty", "tabs", "tail", "tee", "test", "time", "timeout", "touch",
-    "tput", "tr", "true", "tsort", "tty", "ulimit", "umask", "unalias", "uname", "uncompress",
-    "unexpand", "uniq", "uudecode", "uuencode", "wait", "wc", "write", "xargs", "zcat",
+    "alias",
+    "at",
+    "awk",
+    "basename",
+    "batch",
+    "bc",
+    "cat",
+    "cd",
+    "chgrp",
+    "chmod",
+    "chown",
+    "cksum",
+    "cmp",
+    "comm",
+    "command",
+    "compress",
+    "cp",
+    "crontab",
+    "csplit",
+    "cut",
+    "date",
+    "dd",
+    "df",
+    "diff",
+    "dirname",
+    "du",
+    "echo",
+    "ed",
+    "env",
+    "expand",
+    "expr",
+    "false",
+    "file",
+    "find",
+    "fold",
+    "gencat",
+    "getconf",
+    "getopts",
+    "gettext",
+    "grep",
+    "hash",
+    "head",
+    "iconv",
+    "id",
+    "join",
+    "kill",
+    "ln",
+    "locale",
+    "localedef",
+    "logger",
+    "logname",
+    "lp",
+    "ls",
+    "m4",
+    "mailx",
+    "mesg",
+    "mkdir",
+    "mkfifo",
+    "msgfmt",
+    "mv",
+    "newgrp",
+    "ngettext",
+    "nice",
+    "nohup",
+    "od",
+    "paste",
+    "patch",
+    "pathchk",
+    "pax",
+    "pr",
+    "printf",
+    "ps",
+    "pwd",
+    "read",
+    "readlink",
+    "realpath",
+    "renice",
+    "rm",
+    "rmdir",
+    "sed",
+    "sh",
+    "sleep",
+    "sort",
+    "split",
+    "strings",
+    "stty",
+    "tabs",
+    "tail",
+    "tee",
+    "test",
+    "time",
+    "timeout",
+    "touch",
+    "tput",
+    "tr",
+    "true",
+    "tsort",
+    "tty",
+    "ulimit",
+    "umask",
+    "unalias",
+    "uname",
+    "uncompress",
+    "unexpand",
+    "uniq",
+    "uudecode",
+    "uuencode",
+    "wait",
+    "wc",
+    "write",
+    "xargs",
+    "zcat",
 ];
 
 /// The commands of the utilities' dialog (Ф10) and the lines each must print
@@ -5185,34 +5345,125 @@ const XCU_UTILITIES: [&str; 112] = [
 /// contains it). A command is shorter than the 255 characters of a line of
 /// the terminal.
 const UTILITY_DIALOG: &[(&str, &[&str])] = &[
-    (r#"printf 'b\na\nb\n' | sort | uniq -c | sed 's/^ *//'"#, &[r#"1 a"#, r#"2 b"#]),
-    (r#"echo a:b:c | cut -d: -f2; echo abc | tr a-c A-C"#, &[r#"b"#, r#"ABC"#]),
-    (r#"awk 'BEGIN{print 6*7}'; echo 'x 5' | awk '{print $2+1}'"#, &[r#"42"#, r#"6"#]),
-    (r#"expr 2 + 3; basename /a/b.c .c; dirname /a/b/c"#, &[r#"5"#, r#"b"#, r#"/a/b"#]),
-    (r#"echo hi | tee /tmp/t1 >/dev/null; cp /tmp/t1 /tmp/t2; cmp /tmp/t1 /tmp/t2; echo cmp:$?"#, &[r#"cmp:0"#]),
-    (r#"echo other > /tmp/t3; diff /tmp/t1 /tmp/t3 >/dev/null; echo diff:$?"#, &[r#"diff:1"#]),
-    (r#"echo a b c | xargs -n1 echo | wc -l; find /etc -name motd"#, &[r#"=3"#, r#"/etc/motd"#]),
-    (r#"echo abcdef | fold -w 3; printf '1 2\n2 3\n' | tsort"#, &[r#"abc"#, r#"def"#, r#"1"#, r#"2"#, r#"3"#]),
+    (
+        r#"printf 'b\na\nb\n' | sort | uniq -c | sed 's/^ *//'"#,
+        &[r#"1 a"#, r#"2 b"#],
+    ),
+    (
+        r#"echo a:b:c | cut -d: -f2; echo abc | tr a-c A-C"#,
+        &[r#"b"#, r#"ABC"#],
+    ),
+    (
+        r#"awk 'BEGIN{print 6*7}'; echo 'x 5' | awk '{print $2+1}'"#,
+        &[r#"42"#, r#"6"#],
+    ),
+    (
+        r#"expr 2 + 3; basename /a/b.c .c; dirname /a/b/c"#,
+        &[r#"5"#, r#"b"#, r#"/a/b"#],
+    ),
+    (
+        r#"echo hi | tee /tmp/t1 >/dev/null; cp /tmp/t1 /tmp/t2; cmp /tmp/t1 /tmp/t2; echo cmp:$?"#,
+        &[r#"cmp:0"#],
+    ),
+    (
+        r#"echo other > /tmp/t3; diff /tmp/t1 /tmp/t3 >/dev/null; echo diff:$?"#,
+        &[r#"diff:1"#],
+    ),
+    (
+        r#"echo a b c | xargs -n1 echo | wc -l; find /etc -name motd"#,
+        &[r#"=3"#, r#"/etc/motd"#],
+    ),
+    (
+        r#"echo abcdef | fold -w 3; printf '1 2\n2 3\n' | tsort"#,
+        &[r#"abc"#, r#"def"#, r#"1"#, r#"2"#, r#"3"#],
+    ),
     (r#"echo hello | cksum"#, &[r#"3015617425 6"#]),
-    (r#"dd if=/dev/urandom bs=1 count=5 2>/dev/null | wc -c; printf 'ab' | od -An -tx1"#, &[r#"=5"#, r#"=61 62"#]),
-    (r#"uname -s; id -u; id -un"#, &[r#"stafeto"#, r#"0"#, r#"root"#]),
+    (
+        r#"dd if=/dev/urandom bs=1 count=5 2>/dev/null | wc -c; printf 'ab' | od -An -tx1"#,
+        &[r#"=5"#, r#"=61 62"#],
+    ),
+    (
+        r#"uname -s; id -u; id -un"#,
+        &[r#"stafeto"#, r#"0"#, r#"root"#],
+    ),
     (r#"env A=1 env | grep -c '^A=1'"#, &[r#"=1"#]),
-    (r#"echo 3+4 | bc; printf 'a\nb\n' > /tmp/ed1; printf '1d\nw\nq\n' | ed -s /tmp/ed1; cat /tmp/ed1"#, &[r#"7"#, r#"b"#]),
-    (r#"echo hello | uuencode x | uudecode -o /tmp/uu; cat /tmp/uu"#, &[r#"hello"#]),
-    (r#"printf 'abc\000defgh\000' | strings; printf 'a 1\nb 2\nc 3\n' > /tmp/j1"#, &[r#"defgh"#]),
-    (r#"split -l 1 /tmp/j1 /tmp/sp_; ls /tmp | grep -c '^sp_'"#, &[r#"=3"#]),
-    (r#"realpath /tmp/../etc; printf '1\n2\n3\n' | tail -n 1; printf '1\n2\n3\n' | head -n 1"#, &[r#"/etc"#, r#"3"#, r#"1"#]),
-    (r#"printf 'a\nb\n' > /tmp/c1; printf 'b\nc\n' > /tmp/c2; comm -12 /tmp/c1 /tmp/c2; paste -d, /tmp/c1 /tmp/c2"#, &[r#"b"#, r#"a,b"#, r#"b,c"#]),
-    (r#"printf 'a\tb\n' | expand | wc -c; printf 'a       b\n' | unexpand -a | wc -c"#, &[r#"=10"#, r#"=4"#]),
-    (r#"chown user /tmp/t1; chgrp user /tmp/t1; ls -l /tmp/t1 | awk '{print $3,$4}'"#, &[r#"user user"#]),
-    (r#"mkfifo /tmp/ff; test -p /tmp/ff && echo fifo-ok; nohup echo nohup-ok > /tmp/nh 2>/dev/null; cat /tmp/nh"#, &[r#"fifo-ok"#, r#"nohup-ok"#]),
-    (r#"time true 2>&1 | grep -c real; kill -0 $$; echo kill:$?"#, &[r#"=1"#, r#"kill:0"#]),
-    (r#"tty; stty -a >/dev/null; echo stty:$?"#, &[r#"/dev/console"#, r#"stty:0"#]),
-    (r#"logname; login-probe login"#, &[r#"user"#, r#"~login-probe: getlogin user"#, r#"~login-probe: getlogin_r 0 user"#, r#"login-probe: getlogin and getlogin_r agree: ok"#, r#"login-probe: getlogin_r with a buffer of 2 bytes gives ERANGE: ok"#, r#"login-probe: 0 failures"#]),
-    (r#"logger -t tagx hello-journal; login-probe syslog"#, &[r#"~login-probe: setlogmask returned 255"#, r#"login-probe: syslog written"#]),
-    (r#"grep -c tagx /var/log/messages; grep -c hidden /var/log/messages; grep -c shown /var/log/messages"#, &[r#"=1"#, r#"=0"#, r#"=2"#]),
-    (r#"grep -c 'probe\[[0-9]*\]: shown 2' /var/log/messages; grep -c 'after-close 4' /var/log/messages"#, &[r#"=1"#, r#"=1"#]),
-    (r#"login-probe utmpx"#, &[r#"login-probe: entries at the start 0"#, r#"login-probe: 0 failures"#]),
+    (
+        r#"echo 3+4 | bc; printf 'a\nb\n' > /tmp/ed1; printf '1d\nw\nq\n' | ed -s /tmp/ed1; cat /tmp/ed1"#,
+        &[r#"7"#, r#"b"#],
+    ),
+    (
+        r#"echo hello | uuencode x | uudecode -o /tmp/uu; cat /tmp/uu"#,
+        &[r#"hello"#],
+    ),
+    (
+        r#"printf 'abc\000defgh\000' | strings; printf 'a 1\nb 2\nc 3\n' > /tmp/j1"#,
+        &[r#"defgh"#],
+    ),
+    (
+        r#"split -l 1 /tmp/j1 /tmp/sp_; ls /tmp | grep -c '^sp_'"#,
+        &[r#"=3"#],
+    ),
+    (
+        r#"realpath /tmp/../etc; printf '1\n2\n3\n' | tail -n 1; printf '1\n2\n3\n' | head -n 1"#,
+        &[r#"/etc"#, r#"3"#, r#"1"#],
+    ),
+    (
+        r#"printf 'a\nb\n' > /tmp/c1; printf 'b\nc\n' > /tmp/c2; comm -12 /tmp/c1 /tmp/c2; paste -d, /tmp/c1 /tmp/c2"#,
+        &[r#"b"#, r#"a,b"#, r#"b,c"#],
+    ),
+    (
+        r#"printf 'a\tb\n' | expand | wc -c; printf 'a       b\n' | unexpand -a | wc -c"#,
+        &[r#"=10"#, r#"=4"#],
+    ),
+    (
+        r#"chown user /tmp/t1; chgrp user /tmp/t1; ls -l /tmp/t1 | awk '{print $3,$4}'"#,
+        &[r#"user user"#],
+    ),
+    (
+        r#"mkfifo /tmp/ff; test -p /tmp/ff && echo fifo-ok; nohup echo nohup-ok > /tmp/nh 2>/dev/null; cat /tmp/nh"#,
+        &[r#"fifo-ok"#, r#"nohup-ok"#],
+    ),
+    (
+        r#"time true 2>&1 | grep -c real; kill -0 $$; echo kill:$?"#,
+        &[r#"=1"#, r#"kill:0"#],
+    ),
+    (
+        r#"tty; stty -a >/dev/null; echo stty:$?"#,
+        &[r#"/dev/console"#, r#"stty:0"#],
+    ),
+    (
+        r#"logname; login-probe login"#,
+        &[
+            r#"user"#,
+            r#"~login-probe: getlogin user"#,
+            r#"~login-probe: getlogin_r 0 user"#,
+            r#"login-probe: getlogin and getlogin_r agree: ok"#,
+            r#"login-probe: getlogin_r with a buffer of 2 bytes gives ERANGE: ok"#,
+            r#"login-probe: 0 failures"#,
+        ],
+    ),
+    (
+        r#"logger -t tagx hello-journal; login-probe syslog"#,
+        &[
+            r#"~login-probe: setlogmask returned 255"#,
+            r#"login-probe: syslog written"#,
+        ],
+    ),
+    (
+        r#"grep -c tagx /var/log/messages; grep -c hidden /var/log/messages; grep -c shown /var/log/messages"#,
+        &[r#"=1"#, r#"=0"#, r#"=2"#],
+    ),
+    (
+        r#"grep -c 'probe\[[0-9]*\]: shown 2' /var/log/messages; grep -c 'after-close 4' /var/log/messages"#,
+        &[r#"=1"#, r#"=1"#],
+    ),
+    (
+        r#"login-probe utmpx"#,
+        &[
+            r#"login-probe: entries at the start 0"#,
+            r#"login-probe: 0 failures"#,
+        ],
+    ),
 ];
 
 /// Types `command` and waits for the lines `lines` and the prompt.
@@ -5570,7 +5821,11 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("# ", DIALOG_STEP)?;
         dialog_command(&mut run, "ps -o comm | grep -c '^sleep$'", &["=1"])?;
         dialog_command(&mut run, "ps | head -1", &["~PID"])?;
-        dialog_command(&mut run, "ps -o pid,stat | awk -v p=$! '$1==p {print $2}'", &["RW"])?;
+        dialog_command(
+            &mut run,
+            "ps -o pid,stat | awk -v p=$! '$1==p {print $2}'",
+            &["RW"],
+        )?;
         dialog_command(
             &mut run,
             "kill $!; wait $!; ps -o pid | awk -v p=$! '$1==p' | wc -l",
@@ -6060,6 +6315,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
+        job("posix-map", posix_map_probe),
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
         job("posix-math", posix_math_probe),
@@ -8125,6 +8381,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-sync-probe",
         "--package",
         "posix-resources-probe",
+        "--package",
+        "posix-map-probe",
         "--package",
         "posix-sock",
         "--target",

@@ -1184,6 +1184,47 @@ done:
     return result;
 }
 
+/* The rendezvous of shared memory among the crowd: the longest Get is the one
+ * that scans all the entries (a table full of them), Put hands an object
+ * over, Attach comes from a forked child, Detach from the last munmap. */
+static int steps_share(void) {
+    enum { OBJECTS = 17 };
+    char name[40];
+    int fds[OBJECTS];
+    char *maps[OBJECTS];
+    for (int i = 0; i < OBJECTS; i++) {
+        snprintf(name, sizeof name, "/steps-share-%d", i);
+        shm_unlink(name);
+        fds[i] = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fds[i] < 0 || ftruncate(fds[i], 4096) != 0) return 1;
+        maps[i] = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fds[i], 0);
+        if (maps[i] == MAP_FAILED) {
+            printf("posix-procs: steps: shared mapping %d gave %d\n", i, errno);
+            return 2;
+        }
+        maps[i][0] = (char)(i + 1);
+        close(fds[i]);
+    }
+    /* A second mapping of an entry is a Get that finds it. */
+    snprintf(name, sizeof name, "/steps-share-%d", OBJECTS - 2);
+    int again_fd = shm_open(name, O_RDWR, 0);
+    char *again = again_fd < 0 ? MAP_FAILED : mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, again_fd, 0);
+    if (again == MAP_FAILED || again[0] != OBJECTS - 1) return 3;
+    close(again_fd);
+    pid_t child = fork();
+    if (child == 0) _exit(maps[5][0] == 6 ? 0 : 1);
+    int status = 0;
+    if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status)
+        || WEXITSTATUS(status) != 0) return 4;
+    munmap(again, 4096);
+    for (int i = 0; i < OBJECTS; i++) {
+        if (munmap(maps[i], 4096) != 0) return 5;
+        snprintf(name, sizeof name, "/steps-share-%d", i);
+        shm_unlink(name);
+    }
+    return 0;
+}
+
 /* A loaded child exercises the new requests while every branch remains live. */
 static int steps_resources(void) {
     struct rlimit nofile, saved;
@@ -1331,6 +1372,16 @@ static int steps_run(void) {
     } else {
         puts("posix-procs: resource and descriptor exec steps ok");
     }
+    pid_t share_child = -1;
+    int share_status = 0;
+    if (steps_spawn(&share_child, "stepshare", "0") != 0
+        || waitpid(share_child, &share_status, 0) != share_child
+        || !WIFEXITED(share_status) || WEXITSTATUS(share_status) != 64) {
+        printf("posix-procs: steps: shared memory failed status %d errno %d\n", share_status, errno);
+        failed++;
+    } else {
+        puts("posix-procs: shared memory steps ok");
+    }
 #if FIFO_STEPS
     pid_t fifo_child = -1;
     if (steps_spawn(&fifo_child, "stepfifo", "0") != 0) return 8;
@@ -1411,7 +1462,7 @@ static int steps_run(void) {
 
 /* The layer's memory map (5d): the regions it keeps handles of, three
  * words each (address, pages, access: 1 R, 3 RW, 5 RX). */
-#define MAP_MAX 64
+#define MAP_MAX 128
 #define PAGE 4096ull
 static unsigned long long regions[3 * MAP_MAX];
 
@@ -1426,18 +1477,15 @@ static unsigned long long map_pages(size_t n) {
     return pages;
 }
 
-/* Three growths of the heap add three regions, each of the pages the
- * layer took, RW, one after the other in the heap's range, and the bytes
- * charged to the process grow by at least those pages. */
+/* Three mappings of 320 KiB add three pieces, each an object of its own of
+ * the pages asked for, RW, in the layer's room, and the bytes charged to
+ * the process grow by at least those pages. */
 static int map_growth(const char *who) {
     size_t before = map_read();
     unsigned long long pages = map_pages(before), used = stafeto_probe_memory_used();
-    unsigned long long last_end = 0;
-    if (before > 0 && regions[3 * (before - 1)] >= 0x10000000ull)
-        last_end = regions[3 * (before - 1)] + regions[3 * (before - 1) + 1] * PAGE;
     void *held[3];
     for (int i = 0; i < 3; i++) {
-        held[i] = mmap(NULL, 192 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        held[i] = mmap(NULL, 320 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (held[i] == MAP_FAILED) {
             printf("posix-procs: %s: mmap of 192 KiB gave %d\n", who, errno);
             return 1;
@@ -1450,22 +1498,26 @@ static int map_growth(const char *who) {
                (int)after);
         return 2;
     }
-    for (size_t i = before; i < after; i++) {
-        unsigned long long at = regions[3 * i];
-        if (regions[3 * i + 2] != 3 || at % PAGE != 0 || at < 0x10000000ull || at >= 0x20000000ull ||
-            (last_end != 0 && at != last_end) || regions[3 * i + 1] < 48) {
-            printf("posix-procs: %s: region %d at %llx of %llu pages access %llu\n", who, (int)i, at,
-                   regions[3 * i + 1], regions[3 * i + 2]);
+    /* Each held mapping is a piece of its own, 80 pages, RW, in the room. */
+    for (int k = 0; k < 3; k++) {
+        int found = 0;
+        for (size_t i = 0; i < after; i++) {
+            unsigned long long at = regions[3 * i];
+            if (at == (unsigned long long)(uintptr_t)held[k] && regions[3 * i + 1] == 80 &&
+                regions[3 * i + 2] == 3 && at >= 0x10000000ull && at < 0x20000000ull)
+                found = 1;
+        }
+        if (!found) {
+            printf("posix-procs: %s: the mapping %d at %p is no piece of 80 pages RW\n", who, k, held[k]);
             return 3;
         }
-        last_end = at + regions[3 * i + 1] * PAGE;
     }
     if (charged < grown * PAGE || charged > (grown + 16) * PAGE) {
         printf("posix-procs: %s: the map grew %llu pages, the process is charged %llu bytes\n", who,
                grown, charged);
         return 4;
     }
-    for (int i = 0; i < 3; i++) munmap(held[i], 192 * 1024);
+    for (int i = 0; i < 3; i++) munmap(held[i], 320 * 1024);
     return 0;
 }
 
@@ -2528,6 +2580,7 @@ static int role(const char *name) {
     if (strcmp(name, "stepfifo") == 0) return steps_fifo();
 #endif
     if (strcmp(name, "stepresources") == 0) return 64 + steps_resources();
+    if (strcmp(name, "stepshare") == 0) return 64 + steps_share();
     if (strcmp(name, "child") == 0) {
         sigset_t mask;
         sigprocmask(SIG_BLOCK, NULL, &mask);
@@ -3258,11 +3311,11 @@ static void files_nobody(void) {
 
 /* The layer's memory map and mmap (5d). */
 static void memory(void) {
-    /* A shared anonymous mapping must stay shared with a forked child, and
-     * the layer has no shared memory: mmap says it does not support it
-     * (POSIX mmap, ENOTSUP). No kind at all is EINVAL. */
+    /* A shared anonymous mapping is memory (the probe posix-map checks that
+     * a forked child shares it). No kind at all is EINVAL. */
     void *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    expect("mmap MAP_SHARED", shared == MAP_FAILED ? errno : 0, ENOTSUP);
+    expect("mmap MAP_SHARED", shared == MAP_FAILED ? errno : 0, 0);
+    if (shared != MAP_FAILED) munmap(shared, 4096);
     void *none = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS, -1, 0);
     expect("mmap with no kind", none == MAP_FAILED ? errno : 0, EINVAL);
     void *own = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

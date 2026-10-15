@@ -73,7 +73,7 @@ pub(super) fn run() -> bool {
         let used = sys::process_memory(&process)
             .expect("capacity quota baseline")
             .used;
-        let regions = posix_abi::allocation::regions(|map| map.len());
+        let regions = posix_abi::allocation::regions(|map| map.objects().count());
         let mut children = [0; CHILDREN];
         for (index, child) in children.iter_mut().enumerate() {
             if unsafe {
@@ -138,7 +138,7 @@ pub(super) fn run() -> bool {
         // A chunk the heap took for the threads' stacks keeps its handle in
         // the layer's memory map: the live handles grow by those and by
         // nothing else (the second round takes no chunk).
-        let chunks = posix_abi::allocation::regions(|map| map.len()) - regions;
+        let chunks = posix_abi::allocation::regions(|map| map.objects().count()) - regions;
         if sys::process_handles(&process)
             .expect("capacity handles after join")
             .live

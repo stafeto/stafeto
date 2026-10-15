@@ -303,25 +303,30 @@ fn regions() -> Result<Regions, i32> {
     };
     let at = resume as *const () as u64;
     // The values under the heap's lock, the copies of the handles out of
-    // it: the map only grows, so each value stays its region's.
+    // it: every other thread is stopped, so the map stays as it is.
     let mut seen = [(
         Region {
             address: 0,
             pages: 0,
             access: Access::Read,
+            offset: 0,
+            shared: false,
         },
         0u64,
     ); REGIONS_MAX];
     let count = crate::allocation::regions(|map| {
         let mut count = 0;
-        for (place, region) in seen.iter_mut().zip(map.iter()) {
+        for (place, piece) in seen.iter_mut().zip(map.iter()) {
+            let object = map.object(piece.object());
             *place = (
                 Region {
-                    address: region.address as u64,
-                    pages: u32::try_from(region.pages).map_err(|_| ENOMEM)?,
-                    access: region.access,
+                    address: piece.address as u64,
+                    pages: u32::try_from(piece.pages()).map_err(|_| ENOMEM)?,
+                    access: piece.access(),
+                    offset: u32::try_from(piece.offset()).map_err(|_| ENOMEM)?,
+                    shared: object.shared,
                 },
-                region.handle.raw().0,
+                object.handle.raw().0,
             );
             count += 1;
         }
@@ -331,8 +336,23 @@ fn regions() -> Result<Regions, i32> {
     for (region, raw) in &seen[..count] {
         code |= region.access == Access::ReadExec && region.holds(at);
         let held = Handle::<Memory>::borrowed(rt::abi::Handle(*raw));
-        let copy = rt::sys::handle_duplicate(&*held, Rights::MAP_READ | Rights::TRANSFER)
-            .map_err(|_| ENOMEM)?;
+        let copy = if region.shared {
+            // A shared object goes on to the child with the right to write
+            // it when the parent's handle has it, and to be copied again.
+            rt::sys::handle_duplicate(
+                &*held,
+                Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+            .or_else(|_| {
+                rt::sys::handle_duplicate(
+                    &*held,
+                    Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER,
+                )
+            })
+        } else {
+            rt::sys::handle_duplicate(&*held, Rights::MAP_READ | Rights::TRANSFER)
+        }
+        .map_err(|_| ENOMEM)?;
         out.regions[out.count] = Some((*region, copy));
         out.count += 1;
     }
@@ -524,12 +544,17 @@ pub fn probe_abort(pid: &mut i32) -> i32 {
     }
 }
 
+/// How many shared objects the memory map holds, for the probes.
+pub fn probe_shared_objects() -> u64 {
+    crate::allocation::regions(|map| map.objects().filter(|(_, o)| o.shared).count() as u64)
+}
+
 /// The most mappings an object of the memory map has, for the probe that
 /// a child's loader leaves no mapping of the parent's objects behind.
 pub fn probe_mappings() -> u64 {
     crate::allocation::regions(|map| {
-        map.iter()
-            .filter_map(|r| rt::sys::memory_info(&r.handle).ok())
+        map.objects()
+            .filter_map(|(_, o)| rt::sys::memory_info(&o.handle).ok())
             .map(|info| info.mappings)
             .max()
             .unwrap_or(0)
@@ -552,8 +577,8 @@ pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
     let at = resume as *const () as u64;
     let code = crate::allocation::regions(|map| {
         map.iter().any(|r| {
-            r.access == Access::ReadExec
-                && (r.address as u64..r.address as u64 + r.pages as u64 * 4096).contains(&at)
+            r.access() == Access::ReadExec
+                && (r.address as u64..r.address as u64 + r.pages() as u64 * 4096).contains(&at)
         })
     });
     if !code {
@@ -703,8 +728,8 @@ pub fn probe_resume_read_exec() -> bool {
     let at = resume as *const () as u64;
     crate::allocation::regions(|map| {
         map.iter().any(|r| {
-            r.access == Access::ReadExec
-                && (r.address as u64..r.address as u64 + r.pages as u64 * 4096).contains(&at)
+            r.access() == Access::ReadExec
+                && (r.address as u64..r.address as u64 + r.pages() as u64 * 4096).contains(&at)
         })
     })
 }
@@ -751,13 +776,13 @@ fn child() -> Result<(), &'static str> {
     let process = handle(raw(Slot::Process)).ok_or("its process")?;
     let thread = handle(raw(Slot::Thread)).ok_or("its thread")?;
     let posix = handle(raw(Slot::Posix)).ok_or("its record")?;
-    let map = transfer.map().map(|entry| {
-        (
-            entry.address as usize,
-            entry.pages as usize,
-            entry.access,
-            Handle::from_raw(rt::abi::Handle(entry.handle)),
-        )
+    let map = transfer.map().map(|entry| crate::allocation::ChildEntry {
+        address: entry.address as usize,
+        pages: entry.pages as usize,
+        access: entry.access,
+        offset: entry.offset as usize,
+        handle: (!entry.continues).then(|| Handle::from_raw(rt::abi::Handle(entry.handle))),
+        shared: entry.shared,
     });
     // SAFETY: the child's only thread, before anything else of the layer.
     unsafe {
@@ -785,6 +810,7 @@ fn child() -> Result<(), &'static str> {
         let (_, native) = crate::relibc::target(id).map_err(|_| "its place")?;
         crate::process::register_router(&native).map_err(|_| "its router")?;
     }
+    crate::mmap::attach_shared();
     let hook = AT_CHILD.load(Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `at_child` stores a value, a `fn()`.
