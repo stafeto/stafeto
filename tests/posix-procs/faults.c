@@ -323,6 +323,58 @@ static int f_plain_on_in_off(void) {
     return f_stage == 2 ? 0 : 20 + f_stage % 70;
 }
 
+/* The alternate stack above the main stack (a buffer in a frame of the
+ * caller): a handler off the stack runs below it. Inside that handler B a
+ * handler A with SA_ONSTACK jumps within its own frame, A
+ * returns, and a further SA_ONSTACK signal D must still start under the live
+ * frame of B's entry, not at the top of the stack. */
+static sigjmp_buf f_env2;
+static void f_h_c(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    siglongjmp(f_env2, 1);
+}
+static void f_h_a2(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    if (f_mode >= 1) {
+        if (sigsetjmp(f_env2, 1) == 0) siglongjmp(f_env2, 1);
+    }
+    f_stage++;
+}
+static void f_h_d(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    volatile unsigned char junk[3072];
+    for (unsigned i = 0; i < sizeof(junk); i++) junk[i] = 0xEE;
+    f_stage++;
+}
+static void f_h_b2(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    volatile unsigned char sentinel[128];
+    for (unsigned i = 0; i < sizeof(sentinel); i++) sentinel[i] = 0x44;
+    raise(SIGUSR2);
+    if (f_mode >= 2) raise(SIGPIPE);
+    for (unsigned i = 0; i < sizeof(sentinel); i++)
+        if (sentinel[i] != 0x44) f_stage = 99;
+    f_stage++;
+}
+static int f_high_alt_run(char *area, size_t size) {
+    stack_t ss = {.ss_sp = area, .ss_size = size, .ss_flags = 0};
+    if (area && sigaltstack(&ss, NULL)) return 1;
+    if (f_catch(SIGUSR1, f_h_b2, 0) || f_catch(SIGUSR2, f_h_a2, SA_ONSTACK)
+        || f_catch(SIGALRM, f_h_c, SA_ONSTACK) || f_catch(SIGPIPE, f_h_d, SA_ONSTACK)) return 2;
+    f_stage = 0;
+    raise(SIGUSR1);
+    /* A returned (1), D ran (2), B finished (3). */
+    return f_stage == (f_mode >= 2 ? 3 : 2) ? 0 : 20 + f_stage % 70;
+}
+static int f_high_alt(void) {
+    char area[28672] __attribute__((aligned(16)));
+    return f_high_alt_run(area, sizeof(area));
+}
+static int f_high_noalt(void) { f_mode = 1; return f_high_alt_run(NULL, 0); }
+static int f_high_alt_0(void) { f_mode = 0; return f_high_alt(); }
+static int f_high_alt_1(void) { f_mode = 1; return f_high_alt(); }
+static int f_high_alt_2(void) { f_mode = 2; return f_high_alt(); }
+
 static volatile int f_code, f_signo;
 static volatile unsigned long f_addr, f_pc;
 static void f_h_class(int sig, siginfo_t *info, void *ctx) {
@@ -441,6 +493,10 @@ static int faults_role(void) {
     f_child("overflow without an alternate stack", f_overflow_default, 0, SIGSEGV);
     f_child("a signal inside the handler on the alternate stack", f_nested_on_alt, 0, 0);
     f_child("100 jumps out of a handler off the alternate stack", f_many_jumps, 0, 0);
+    f_child("jump inside, no alternate stack", f_high_noalt, 0, 0);
+    f_child("high stack, plain", f_high_alt_0, 0, 0);
+    f_child("high stack, jump inside", f_high_alt_1, 0, 0);
+    f_child("high stack, jump and a further signal", f_high_alt_2, 0, 0);
     f_child("a plain SA_ONSTACK signal inside a handler off the stack", f_plain_on_in_off, 0, 0);
     f_child("a handler off the alternate stack", f_off_stack_plain, 0, 0);
     f_child("a handler off the alternate stack with a signal off it", f_off_stack_both, 0, 0);

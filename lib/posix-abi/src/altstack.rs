@@ -306,7 +306,9 @@ fn run_placed(place: Place, body: impl FnOnce()) {
             // while the handler runs: the dispatcher's frame at the top and
             // the delivery of the layer under it, down to this frame.
             let _ = frame;
-            let end = (stack_pointer() & !15).saturating_sub(64);
+            // The frames of `on_stack` and of the switch lie under this frame: 512
+            // bytes keep a nested entry off them.
+            let end = (stack_pointer() & !15).saturating_sub(512);
             let cut = alt.cut.swap(end, Ordering::Relaxed);
             let _ = rt::upcall::set_stack(low, end.saturating_sub(low));
             let before = alt.floor.swap(sp, Ordering::Relaxed);
@@ -336,10 +338,11 @@ pub(crate) fn jump(outer: u64, target: u64) -> bool {
     let leaves = entries::jump_clears_frames(outer, call, entries::frame_in(target, range));
     if let Some((low, high)) = range {
         // A handler off the stack is left by a jump to a target outside the
-        // range or above its start; relibc's threads keep `outer` at 0, so
+        // range and above its start (a target on the alternate stack is a
+        // handler under it, whose address says nothing of `floor`); relibc's threads keep `outer` at 0, so
         // this does not depend on `leaves`.
         let floor = alt.floor.load(Ordering::Relaxed);
-        if floor != 0 && (!(low..high).contains(&target) || target > floor) {
+        if floor != 0 && !(low..high).contains(&target) && target > floor {
             alt.floor.store(0, Ordering::Relaxed);
             alt.cut.store(0, Ordering::Relaxed);
             let _ = rt::upcall::set_stack(low, high - low);
