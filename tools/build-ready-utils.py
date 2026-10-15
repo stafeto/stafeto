@@ -30,11 +30,12 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 COMPAT = ROOT / "tools" / "ready-utils" / "compat"
 # The headers of BusyBox's build that relibc lacks (byteswap.h among them),
-# searched after relibc's own.
+# searched after relibc's own, as are those of COMPAT: a header relibc gets
+# later takes their place.
 BUSYBOX_COMPAT = ROOT / "tools" / "busybox" / "compat"
 
 # name: (archive URL, SHA-256 of the archive after gunzip (the tar stream, which
-# a server may compress differently), the licence file, its SHA-256)
+# a server may compress differently), the licence file, its SPDX identifier)
 SOURCES = {
     "sbase": (
         "https://github.com/michaelforney/sbase/archive/"
@@ -55,6 +56,10 @@ SBASE_APPLETS = ("getconf", "join", "pathchk")
 TOYBOX_APPLETS = ("file", "iconv")
 NCOMPRESS_APPLETS = ("compress",)
 APPLETS = SBASE_APPLETS + TOYBOX_APPLETS + NCOMPRESS_APPLETS
+# Files of sbase's libutil with a notice of their own (BSD-3-Clause, ISC) that
+# comes with a binary copy: the programs link them (join: memmem; the others:
+# strtonum, reallocarray).
+SBASE_NOTICES = ("libutil/memmem.c", "libutil/strtonum.c", "libutil/reallocarray.c")
 # What sbase's Makefile defines for its programs (CPPFLAGS).
 SBASE_DEFINES = ("-D_DEFAULT_SOURCE", "-D_NETBSD_SOURCE", "-D_BSD_SOURCE",
                  "-D_XOPEN_SOURCE=700", "-D_FILE_OFFSET_BITS=64")
@@ -84,6 +89,21 @@ def licence_files(work: Path) -> dict[str, Path]:
     """The licence file of each program's source, by program."""
     return {name: next((work / "build" / name).glob("source*")) / SOURCES[name][2]
             for name in SOURCES}
+
+
+def notices(source: Path) -> str:
+    """The leading comment of each file of SBASE_NOTICES: its copyright, its
+    terms."""
+    out = []
+    for name in SBASE_NOTICES:
+        text = (source / name).read_text()
+        start, end = text.index("/*", text.index("*/") if text.startswith("/*\t$") else 0), None
+        end = text.index("*/", start) + 2
+        block = text[start:end]
+        if "Copyright" not in block or "ermission" not in block and "edistribution" not in block:
+            raise SystemExit(f"sbase {name} has no notice at its start")
+        out.append(f"==== sbase {name} ====\n\n{block}\n\n")
+    return "".join(out)
 
 
 def fetch(work: Path, name: str, suffix: str = "") -> Path:
@@ -122,7 +142,7 @@ class Build:
         self.build = work / "build"
         self.clang, self.lld, self.ar, self.objcopy = clang, lld, ar, objcopy
         self.base = ["--target=aarch64-linux-gnu", "-nostdinc", f"-isystem{include}",
-                     f"-I{COMPAT}", f"-idirafter{BUSYBOX_COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
+                     f"-idirafter{COMPAT}", f"-idirafter{BUSYBOX_COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
                      "-ffunction-sections", "-fdata-sections", "-Os", "-w", *flags]
         self.log = work / "build" / "build.log"
 
@@ -258,5 +278,6 @@ def build(work: Path, archive: Path, flags: list[str], include: Path, stamp_extr
         lines.append("\t".join((name, url, digest, spdx, str(path.relative_to(work)),
                                " ".join(applets))))
     (work / "manifest").write_text("\n".join(lines) + "\n")
+    (work / "notices").write_text(notices(work / "build" / "sbase" / "source"))
     stamp.write_text(text)
     print(f"ready-made utilities ready: {archive}")

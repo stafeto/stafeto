@@ -191,6 +191,18 @@ static int errors(void) {
     errno = 0;
     CHECK(tcflow(0, 9) == -1 && errno == EINVAL);
     errno = 0;
+    /* An int argument of ioctl has undefined high 32 bits (AAPCS64): the
+     * requests that take one by value read the low half. Called here as a
+     * long with bit 32 set and the int in the low half. */
+    {
+        int (*dirty)(int, unsigned long, long) = (int (*)(int, unsigned long, long))ioctl;
+        long high = 1L << 32;
+        CHECK(dirty(0, TCFLSH, high | TCIFLUSH) == 0);
+        CHECK(dirty(0, TCXONC, high | TCOON) == 0);
+        CHECK(dirty(0, TCSBRK, high) == 0);
+        CHECK(dirty(0, TCFLSH, high | 7) == -1 && errno == EINVAL);
+        errno = 0;
+    }
     CHECK(cfsetispeed(&t, 0777777) == -1 && errno == EINVAL);
     errno = 0;
     CHECK(cfsetospeed(&t, 0777777) == -1 && errno == EINVAL);

@@ -2711,6 +2711,11 @@ fn ready_terms() -> Result<(Vec<u8>, String), String> {
             "{applets}: {name}, {spdx}, {url} (SHA-256 of the unpacked tar stream {sha256})\n"
         ));
     }
+    // The notices of the files of sbase's libutil that carry their own.
+    let notices = std::fs::read(work.join("notices")).map_err(|e| {
+        format!("ready-utils/notices: {e}: python3 tools/build-busybox.py writes it")
+    })?;
+    licence.extend(notices);
     Ok((licence, note))
 }
 
