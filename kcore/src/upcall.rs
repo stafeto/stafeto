@@ -298,7 +298,6 @@ impl State {
         self.depth = depth;
         self.deferred = deferred;
         self.masked = true;
-        self.pending = false;
         self.faulted = false;
         Ok(())
     }
@@ -307,9 +306,11 @@ impl State {
     /// and open and no deferral holds it; ESR and FAR (0 where the fault
     /// sets none) wait for `Query`. A fault under a closed entry ends the
     /// process as before: the dispatcher itself faulted, and entering again
-    /// would loop.
-    pub fn fault(&mut self, esr: u64, far: u64) -> bool {
-        if !self.faults || self.entry == 0 || self.masked || self.deferred != 0 {
+    /// would loop. So does a fault while a long call goes on: `prepare`
+    /// refuses an entry then, the call returns to its own `svc`, and the
+    /// thread would fault there for ever.
+    pub fn fault(&mut self, esr: u64, far: u64, long_call: bool) -> bool {
+        if !self.faults || self.entry == 0 || self.masked || self.deferred != 0 || long_call {
             return false;
         }
         self.esr = esr;
@@ -662,19 +663,19 @@ mod tests {
         // Faults is off at the start.
         state.bind(0x1000).unwrap();
         state.control(ENABLE, 0, 0).unwrap();
-        assert!(!state.fault(ESR_DABT, 0x10));
+        assert!(!state.fault(ESR_DABT, 0x10, false));
         assert_eq!(state.prepare(0x2000, 0, 0, false), None);
         assert_eq!(state.control(FAULTS, 2, 0), Err(Error::InvalidArgs));
         assert_eq!(state.control(FAULTS, 1, 0), Ok(Reply::new([0, 0, 0])));
         // Masked: the dispatcher faulted.
         state.control(MASK, 0, 0).unwrap();
-        assert!(!state.fault(ESR_DABT, 0x10));
+        assert!(!state.fault(ESR_DABT, 0x10, false));
         state.control(ENABLE, 0, 0).unwrap();
         state.control(DEFER, 0, 0).unwrap();
-        assert!(!state.fault(ESR_DABT, 0x10));
+        assert!(!state.fault(ESR_DABT, 0x10, false));
         state.control(RESUME, 0, 0).unwrap();
         // Open: the entry comes with no request.
-        assert!(state.fault(ESR_DABT, 0x10));
+        assert!(state.fault(ESR_DABT, 0x10, false));
         assert_eq!(
             state.prepare(0x2000, 0xa000_0000, 0x7000, false),
             Some(0x1000)
@@ -698,11 +699,11 @@ mod tests {
         state.control(MASK, 0, 0).unwrap();
         state.returned().unwrap();
         state.control(FAULTS, 0, 0).unwrap();
-        assert!(!state.fault(ESR_DABT, 0));
+        assert!(!state.fault(ESR_DABT, 0, false));
         let mut bare = State::new();
         bare.control(FAULTS, 1, 0).unwrap();
         bare.control(ENABLE, 0, 0).unwrap();
-        assert!(!bare.fault(ESR_DABT, 0));
+        assert!(!bare.fault(ESR_DABT, 0, false));
     }
     /// A new binding forgets a fault no entry has taken.
     #[test]
@@ -711,7 +712,7 @@ mod tests {
         state.bind(0x1000).unwrap();
         state.control(FAULTS, 1, 0).unwrap();
         state.control(ENABLE, 0, 0).unwrap();
-        assert!(state.fault(ESR_DABT, 0));
+        assert!(state.fault(ESR_DABT, 0, false));
         state.bind(0x3000).unwrap();
         state.control(ENABLE, 0, 0).unwrap();
         state.request().unwrap();
@@ -782,5 +783,60 @@ mod tests {
     #[test]
     fn the_state_takes_80_bytes() {
         assert_eq!(core::mem::size_of::<State>(), 80);
+    }
+    /// A request that came between the binding and `Adopt` stays: the entry
+    /// is shut, and the first return opens it for the request.
+    #[test]
+    fn adopt_keeps_a_request_that_came_before() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.control(ENABLE, 0, 0).unwrap();
+        state.request().unwrap();
+        state.control(ADOPT, 1, 0).unwrap();
+        assert_eq!(state.prepare(0x2000, 0, 0, false), None);
+        state.returned().unwrap();
+        assert_eq!(state.prepare(0x2000, 0, 0, false), Some(0x1000));
+    }
+    /// A fault during a long call ends the process: the call returns to its
+    /// own `svc`, no entry can come, and the thread would fault there for ever.
+    #[test]
+    fn a_fault_during_a_long_call_does_not_enter() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.control(FAULTS, 1, 0).unwrap();
+        state.control(ENABLE, 0, 0).unwrap();
+        assert!(!state.fault(ESR_DABT, 0x10, true));
+        assert_eq!(state.prepare(0x2000, 0, 0, false), None);
+        assert!(state.fault(ESR_DABT, 0x10, false));
+    }
+    /// A fault inside the handler of a fault, once the handler opened its
+    /// entry, enters at depth 2 and gives its own ESR and FAR to `Query`.
+    #[test]
+    fn a_nested_fault_gives_its_own_cause() {
+        const ESR_UDF: u64 = 0x0200_0000;
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.control(FAULTS, 1, 0).unwrap();
+        state.control(ENABLE, 0, 0).unwrap();
+        assert!(state.fault(ESR_DABT, 0x10, false));
+        assert_eq!(state.prepare(0x2000, 0, 0x7000, false), Some(0x1000));
+        assert_eq!(
+            state.control(TAKE, 0, 0).unwrap().values()[0],
+            1 | TAKE_FAULT
+        );
+        state.control(ENABLE, 0, 0).unwrap();
+        assert!(state.fault(ESR_UDF, 0, false));
+        assert_eq!(state.prepare(0x3000, 0, 0x6000, false), Some(0x1000));
+        assert_eq!(
+            state.control(TAKE, 0, 0),
+            Ok(Reply::new([1 | TAKE_FAULT, 0x3000, 0, 0x6000]))
+        );
+        assert_eq!(
+            state.control(QUERY, 0, 0),
+            Ok(Reply::new([1, ESR_UDF, 0, 2, 0]))
+        );
+        state.control(MASK, 0, 0).unwrap();
+        state.returned().unwrap();
+        assert_eq!(state.control(QUERY, 0, 0).unwrap().values()[3], 1);
     }
 }

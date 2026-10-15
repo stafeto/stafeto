@@ -152,6 +152,17 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
     crate::sched::resume()
 }
 
+/// Whether the fault of `thread`, the running one, enters its entry
+/// (kcore::upcall::State::fault): not during a long call, whose way back to
+/// its `svc` no entry can precede.
+pub fn fault_enters(mut thread: NonNull<Thread>, syndrome: u64, far: u64) -> bool {
+    let long = thread::long(thread).is_some();
+    // SAFETY: the running thread is alive; only its own entry state changes.
+    unsafe { thread.as_mut() }
+        .upcall
+        .fault(syndrome, esr::fault_address(syndrome, far), long)
+}
+
 /// A fault of the program at EL0 enters the thread's open entry when the
 /// thread asked for faults (`ThreadUpcallControl` Faults): the thread goes
 /// on at the entry, with ESR and FAR for `Query` and the faulting PC for
@@ -164,13 +175,9 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
 /// fault the running test does not expect stops the machine with the full
 /// report on the port instead, as before: a mistake in a test program
 /// shows at once.
-fn user_fault(mut thread: NonNull<Thread>, syndrome: u64) {
+fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
     let far = registers::far_el1();
-    // SAFETY: the running thread is alive; only its own entry state changes.
-    if unsafe { thread.as_mut() }
-        .upcall
-        .fault(syndrome, esr::fault_address(syndrome, far))
-    {
+    if fault_enters(thread, syndrome, far) {
         return;
     }
     if !crate::testpoint::expects_fault() {

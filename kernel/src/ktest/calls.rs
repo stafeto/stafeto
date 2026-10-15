@@ -2754,6 +2754,42 @@ pub fn upcall_fault_stack_adopt_and_query_check_their_arguments(
     })
 }
 
+/// A fault during a long call does not enter the entry (the call returns to
+/// its own `svc`, and no entry can precede that way back); once the call is
+/// given up, the same fault enters.
+pub fn fault_during_a_long_call_does_not_enter(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        use abi::UpcallControl as C;
+        const ESR_ABORT: u64 = 0x24 << 26;
+        thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
+        let control = Call::ThreadUpcallControl.number();
+        c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
+        c.succeeds(control, &[C::Faults.raw(), 1], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Enable.raw()], &[1, 0, 0])?;
+        with_interrupt_pending(|| {
+            c.call(Call::MemCreate.number(), &[20 * PAGE_SIZE, 0]);
+            check(
+                thread::long(c.thread).is_some(),
+                "mem_create did not stop after a portion",
+            )?;
+            check(
+                !arch::exceptions::fault_enters(c.thread, ESR_ABORT, 0x10),
+                "a fault entered during a long call",
+            )?;
+            sched::entry_started();
+            c.again(Call::ClockNow.number());
+            check(
+                thread::long(c.thread).is_none(),
+                "another call did not give the long call up",
+            )
+        })?;
+        check(
+            arch::exceptions::fault_enters(c.thread, ESR_ABORT, 0x10),
+            "a fault did not enter once the long call was given up",
+        )
+    })
+}
+
 /// A return restores the exact native context: every general register, the
 /// stack pointer, the program counter, the flags of PSTATE, TPIDR_EL0 and the
 /// FP registers with FPCR and FPSR. The thread starts with all of those at

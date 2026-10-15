@@ -33,6 +33,8 @@
 .equ CALL_YIELD, 19                     // abi::Call::Yield
 .equ CALL_OBJECT_INFO, 27               // abi::Call::ObjectInfo
 .equ CALL_UPCALL_CONTROL, 32            // abi::Call::ThreadUpcallControl
+.equ UPCALL_ENABLE, 1                   // abi::UpcallControl::Enable
+.equ UPCALL_DEFER, 3                    // abi::UpcallControl::Defer
 .equ UPCALL_TAKE, 2                     // abi::UpcallControl::Take
 .equ UPCALL_QUERY, 16                   // abi::UpcallControl::Query
 .equ P_SP, 248                          // offsets in ktest::el0::Pattern; x0-x30 come first
@@ -250,6 +252,53 @@ el0_fault_load:
 el0_fault_pc:
     ldr     x1, [x0]
     svc     #SVC_DONE
+
+// Defers entries, then loads from the address in x0: a fault under a
+// deferral.
+.global el0_fault_deferred
+el0_fault_deferred:
+    mov     x9, x0
+    mov     x0, #UPCALL_DEFER
+    svc     #CALL_UPCALL_CONTROL
+    ldr     x1, [x9]
+    svc     #SVC_DONE
+
+// An undefined instruction and a breakpoint, with the same entry.
+.global el0_fault_udf, el0_fault_brk
+el0_fault_udf:
+    udf     #0
+    svc     #SVC_DONE
+el0_fault_brk:
+    brk     #5
+    svc     #SVC_DONE
+
+// Faults, and again inside its own entry: x20 counts the entries, the
+// first opens the entry and faults with an undefined instruction. The
+// first fault's ESR stays in x21, the second's in x15, the depth of the
+// second in x17.
+.global el0_fault_nested, el0_fault_nested_entry
+el0_fault_nested:
+    mov     x20, #0
+    ldr     x1, [x0]
+    svc     #SVC_DONE
+el0_fault_nested_entry:
+    add     x20, x20, #1
+    mov     x0, #UPCALL_TAKE
+    svc     #CALL_UPCALL_CONTROL
+    mov     x10, x1
+    mov     x0, #UPCALL_QUERY
+    svc     #CALL_UPCALL_CONTROL
+    mov     x14, x1
+    mov     x15, x2
+    mov     x16, x3
+    mov     x17, x4
+    cmp     x20, #1
+    b.ne    1f
+    mov     x21, x2
+    mov     x0, #UPCALL_ENABLE
+    svc     #CALL_UPCALL_CONTROL
+    udf     #0
+1:  svc     #SVC_DONE
 
 // The entry of el0_fault_load: notes SP, then the values of Take (x1 mask
 // and fault flag, x2 PC, x3 PSTATE, x4 SP) and of Query (x1 mask, x2 ESR,
