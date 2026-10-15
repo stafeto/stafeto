@@ -254,11 +254,11 @@ fn mmap0(
             unsafe { core::ptr::write_bytes(at as *mut u8, 0, pages * PAGE) };
             Ok(at)
         }?;
-        if access != Access::ReadWrite {
-            if let Err(error) = state.protect(result, pages, access) {
-                release(state, result, pages)?;
-                return Err(error);
-            }
+        if access != Access::ReadWrite
+            && let Err(error) = state.protect(result, pages, access)
+        {
+            release(state, result, pages)?;
+            return Err(error);
         }
         Ok(result)
     })

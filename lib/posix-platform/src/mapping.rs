@@ -187,11 +187,11 @@ fn private_file(
 ) -> Result<usize, c_int> {
     let address = mmap::mmap(addr, len, prot | PROT_WRITE, flags, None)?;
     fill(fd, address, len, offset);
-    if prot & PROT_WRITE == 0 {
-        if let Err(errno) = mmap::mprotect(address, len, prot) {
-            let _ = mmap::munmap(address, len);
-            return Err(errno);
-        }
+    if prot & PROT_WRITE == 0
+        && let Err(errno) = mmap::mprotect(address, len, prot)
+    {
+        let _ = mmap::munmap(address, len);
+        return Err(errno);
     }
     Ok(address)
 }
@@ -260,12 +260,12 @@ fn shared_file(
             posix_abi::shares::detach(key);
         }
     }
-    if prot & PROT_WRITE == 0 {
-        if let Err(errno) = mmap::mprotect(address, len, prot) {
-            let _ = mmap::munmap(address, len);
-            close_released();
-            return Err(errno);
-        }
+    if prot & PROT_WRITE == 0
+        && let Err(errno) = mmap::mprotect(address, len, prot)
+    {
+        let _ = mmap::munmap(address, len);
+        close_released();
+        return Err(errno);
     }
     let _ = fd;
     Ok(address)

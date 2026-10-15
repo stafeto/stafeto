@@ -1240,7 +1240,7 @@ impl ForkEntry {
         out[16..24].copy_from_slice(&self.handle.to_le_bytes());
         out[24..28].copy_from_slice(&self.offset.to_le_bytes());
         let flags =
-            u32::from(self.continues) * ENTRY_CONTINUES | u32::from(self.shared) * ENTRY_SHARED;
+            (u32::from(self.continues) * ENTRY_CONTINUES) | (u32::from(self.shared) * ENTRY_SHARED);
         out[28..].copy_from_slice(&flags.to_le_bytes());
         out
     }
