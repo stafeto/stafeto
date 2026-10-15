@@ -35,3 +35,10 @@ debug-assertions = true
 
 [profile.dev]
 panic = "abort"
+
+# The probe of processes copies its own ELF file into the RAM file service,
+# whose files hold 8 MiB at most (and RLIMIT_FSIZE is 8 MiB): the layer, which
+# every program carries, keeps the line tables of its code in its debug
+# information, which leaves the room the probe needs.
+[profile.release.package.posix-abi]
+debug = "line-tables-only"
