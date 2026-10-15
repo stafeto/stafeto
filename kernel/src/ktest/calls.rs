@@ -2710,6 +2710,50 @@ pub fn upcall_operations_5_to_12_are_invalid_and_change_nothing(
     })
 }
 
+/// The operations 13 to 16 of thread_upcall_control through the call:
+/// Faults takes 0 or 1, Stack a range of multiples of 16 inside user space
+/// (size 0 removes it), Adopt only a thread that never entered and has its
+/// entry bound, and Query returns the nesting Adopt took; 17 and up are
+/// INVALID_ARGS like the retired numbers.
+pub fn upcall_fault_stack_adopt_and_query_check_their_arguments(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_caller(|c| {
+        use abi::UpcallControl as C;
+        let control = Call::ThreadUpcallControl.number();
+        let end = kcore::layout::USER_END as u64;
+        c.fails(control, &[C::Adopt.raw(), 1, 0], Error::BadState)?;
+        thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
+        c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
+        c.fails(control, &[C::Faults.raw(), 2], Error::InvalidArgs)?;
+        c.succeeds(control, &[C::Faults.raw(), 1], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Faults.raw(), 0], &[1, 0, 0])?;
+        for (base, size) in [
+            (0x1008, 0x1000),
+            (0x1000, 0x1008),
+            (end - 0x1000, 0x2000),
+            (u64::MAX - 15, 32),
+        ] {
+            c.fails(control, &[C::Stack.raw(), base, size], Error::InvalidArgs)?;
+        }
+        c.succeeds(control, &[C::Stack.raw(), end - 0x2000, 0x2000], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Stack.raw(), 0x1008, 0], &[1, 0, 0])?;
+        for raw in [17, 1 << 32] {
+            c.fails(control, &[raw, 0, 0], Error::InvalidArgs)?;
+        }
+        c.fails(control, &[C::Adopt.raw(), 1 << 32, 0], Error::InvalidArgs)?;
+        c.succeeds(control, &[C::Adopt.raw(), 2, 1], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Query.raw()], &[1, 0, 0, 2, 1])?;
+        // The thread has a depth now: no second adoption, no new binding.
+        c.fails(control, &[C::Adopt.raw(), 1, 0], Error::BadState)?;
+        c.fails(
+            Call::ThreadUpcallBind.number(),
+            &[USER_VA as u64],
+            Error::BadState,
+        )
+    })
+}
+
 /// A return restores the exact native context: every general register, the
 /// stack pointer, the program counter, the flags of PSTATE, TPIDR_EL0 and the
 /// FP registers with FPCR and FPSR. The thread starts with all of those at

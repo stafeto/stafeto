@@ -382,6 +382,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::upcall_operations_5_to_12_are_invalid_and_change_nothing,
     ),
     (
+        "upcall_fault_stack_adopt_and_query_check_their_arguments",
+        calls::upcall_fault_stack_adopt_and_query_check_their_arguments,
+    ),
+    (
         "upcall_return_restores_the_native_context_exactly",
         calls::upcall_return_restores_the_native_context_exactly,
     ),

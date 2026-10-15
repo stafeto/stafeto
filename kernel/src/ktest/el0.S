@@ -32,6 +32,9 @@
 .equ CALL_THREAD_SET_PRIORITY, 18       // abi::Call::ThreadSetPriority
 .equ CALL_YIELD, 19                     // abi::Call::Yield
 .equ CALL_OBJECT_INFO, 27               // abi::Call::ObjectInfo
+.equ CALL_UPCALL_CONTROL, 32            // abi::Call::ThreadUpcallControl
+.equ UPCALL_TAKE, 2                     // abi::UpcallControl::Take
+.equ UPCALL_QUERY, 16                   // abi::UpcallControl::Query
 .equ P_SP, 248                          // offsets in ktest::el0::Pattern; x0-x30 come first
 .equ P_NZCV, 256
 .equ P_TPIDR, 264
@@ -238,6 +241,33 @@ el0_set_priority_after_peer:
 .global el0_wfi
 el0_wfi:
     wfi
+    svc     #SVC_DONE
+
+// Loads from the address in x0, which nothing maps: a fault. The kernel
+// binds el0_fault_entry as the thread's entry before the thread starts.
+.global el0_fault_load, el0_fault_pc, el0_fault_entry
+el0_fault_load:
+el0_fault_pc:
+    ldr     x1, [x0]
+    svc     #SVC_DONE
+
+// The entry of el0_fault_load: notes SP, then the values of Take (x1 mask
+// and fault flag, x2 PC, x3 PSTATE, x4 SP) and of Query (x1 mask, x2 ESR,
+// x3 FAR, x4 depth) in x18 and x10-x17, and ends.
+el0_fault_entry:
+    mov     x18, sp
+    mov     x0, #UPCALL_TAKE
+    svc     #CALL_UPCALL_CONTROL
+    mov     x10, x1
+    mov     x11, x2
+    mov     x12, x3
+    mov     x13, x4
+    mov     x0, #UPCALL_QUERY
+    svc     #CALL_UPCALL_CONTROL
+    mov     x14, x1
+    mov     x15, x2
+    mov     x16, x3
+    mov     x17, x4
     svc     #SVC_DONE
 
 // process_kill with the handle in x0 and the level in x1.
