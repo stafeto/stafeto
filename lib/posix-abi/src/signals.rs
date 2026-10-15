@@ -990,15 +990,25 @@ pub fn suspend(mask: SigSet) -> i32 {
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     loop {
+        // Read before `route()`: a handler that runs from here on (while
+        // the entries are open, up to the deferral below) counts against
+        // this value.
+        let handled = block.handled.load(Ordering::SeqCst);
         route();
         if thread_pending(block) & !mask != 0 {
             deliver_now();
             break;
         }
-        // An entry between the check and `receive` stays pending and makes
-        // `receive` return at once; it runs when the guard goes.
-        let handled = block.handled.load(Ordering::SeqCst);
+        probe_window(window::SUSPEND);
+        // An entry after the deferral stays pending and makes `receive`
+        // return at once; it runs when the guard goes.
         let guard = rt::upcall::defer_entries().expect("sigsuspend entry deferral");
+        // A handler that ran before the deferral left no entry behind:
+        // `receive` would wait for the next signal.
+        if block.handled.load(Ordering::SeqCst) != handled {
+            drop(guard);
+            break;
+        }
         let got = sys::receive(&channel);
         drop(guard);
         match got {
@@ -1401,6 +1411,7 @@ pub mod window {
     pub const FIFO: u32 = 2;
     pub const FUTEX: u32 = 3;
     pub const SIGWAIT: u32 = 4;
+    pub const SUSPEND: u32 = 5;
 }
 /// The site the calling thread's next wait stops at, 0 for none, and the
 /// thread (its block) the arming was for.
