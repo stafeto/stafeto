@@ -8,7 +8,7 @@
 //! returns. A range across several pieces of the memory map is walked one
 //! piece at a time (`State::protect`, `State::unmap`).
 
-use crate::allocation::{LIMIT_AS, LIMIT_DATA, State, heap};
+use crate::allocation::{LIMIT_AS, LIMIT_DATA, Source, State, heap};
 use crate::constants::*;
 use core::sync::atomic::{AtomicBool, Ordering};
 use posix_map::space::State as Page;
@@ -104,10 +104,6 @@ fn release(state: &mut State, address: usize, pages: usize) -> Result<(), i32> {
     Ok(())
 }
 
-/// What a mapping of a file keeps to write its pages back: the descriptor
-/// the layer holds for it and the byte of the file the mapping starts at.
-pub use posix_map::Back;
-
 static LIMITS_LOADED: AtomicBool = AtomicBool::new(false);
 
 /// Reads RLIMIT_DATA and RLIMIT_AS from the process service once, outside the
@@ -118,7 +114,8 @@ fn load_limits() {
     }
     // The service starts both at the process's quota, which the kernel
     // enforces on its own; the layer counts only a limit below it.
-    let quota = rt::sys::process_memory(crate::allocation::process()).map_or(u64::MAX, |m| m.quota);
+    let quota =
+        rt::sys::process_memory(crate::allocation::process()).map_or(u64::MAX, |m| m.quota);
     for (resource, cell) in [(2, &LIMIT_DATA), (9, &LIMIT_AS)] {
         if let Ok(limit) = crate::resources::get(resource) {
             cell.store(
@@ -137,18 +134,53 @@ fn load_limits() {
 /// `setrlimit` of RLIMIT_DATA or RLIMIT_AS (Linux's 2 and 9): the soft
 /// limit the heap's section checks.
 pub(crate) fn set_limit(resource: i32, soft: u64) {
-    let cell = if resource == 2 {
-        &LIMIT_DATA
-    } else {
-        &LIMIT_AS
-    };
+    let cell = if resource == 2 { &LIMIT_DATA } else { &LIMIT_AS };
     cell.store(soft, Ordering::Relaxed);
+}
+
+/// What a mapping of a file keeps to write its pages back: the descriptor
+/// the layer holds for it and the byte of the file the object starts at.
+pub use posix_map::Back;
+
+/// The object of a shared mapping of a file: one the process service gave
+/// (`existing`, whose first page is the file's first page), or a new one
+/// that covers the file from its first page; `offset_pages` is where the
+/// mapping starts in it; `back` is the file it writes to.
+pub struct FileSource {
+    pub existing: Option<rt::handle::Handle<rt::handle::Memory>>,
+    pub offset_pages: usize,
+    pub back: Back,
+}
+
+/// A duplicate of the object that shows the page at `address` and the pages
+/// it covers, for the process service (Put, Attach).
+pub fn object_at(
+    address: usize,
+) -> Option<(rt::handle::Handle<rt::handle::Memory>, usize)> {
+    use rt::abi::Rights;
+    let (raw, pages) = heap(|state| {
+        let index = state.map.find(address)?;
+        let object = state.map.piece(index).object();
+        let pages = state
+            .map
+            .pieces_of(object)
+            .map(|p| p.offset() + p.pages())
+            .max()?;
+        Some((state.map.object(object).handle.raw(), pages))
+    })?;
+    let held = rt::handle::Handle::<rt::handle::Memory>::borrowed(raw);
+    rt::sys::handle_duplicate(
+        &*held,
+        Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+    )
+    .ok()
+    .map(|copy| (copy, pages))
 }
 
 /// `mmap`: the address, or an errno. A shared mapping has an object of
 /// its own and goes to a forked child as the same pages; a private one is
-/// pages of the heap, or an object of its own from 256 KiB. `back` is the
-/// file a shared mapping writes to (`msync`, `munmap`); the pages are zeros
+/// pages of the heap, or an object of its own from 256 KiB. `file` is the
+/// object and the file of a shared mapping of a file; the pages are zeros
 /// and the caller fills a mapping of a file and then gives it its access
 /// (`mprotect`), so `prot` of such a mapping includes PROT_WRITE.
 pub fn mmap(
@@ -156,12 +188,18 @@ pub fn mmap(
     len: usize,
     prot: i32,
     flags: i32,
-    back: Option<Back>,
+    file: Option<FileSource>,
 ) -> Result<usize, i32> {
-    mmap0(addr, len, prot, flags, back)
+    mmap0(addr, len, prot, flags, file)
 }
 
-fn mmap0(addr: usize, len: usize, prot: i32, flags: i32, back: Option<Back>) -> Result<usize, i32> {
+fn mmap0(
+    addr: usize,
+    len: usize,
+    prot: i32,
+    flags: i32,
+    file: Option<FileSource>,
+) -> Result<usize, i32> {
     crate::allocation::probe_pause();
     load_limits();
     let access = access_of(prot)?;
@@ -178,6 +216,14 @@ fn mmap0(addr: usize, len: usize, prot: i32, flags: i32, back: Option<Back>) -> 
     if fixed && !addr.is_multiple_of(PAGE) {
         return Err(EINVAL);
     }
+    let source = match file.filter(|_| shared) {
+        Some(file) => Source {
+            existing: file.existing,
+            offset: file.offset_pages,
+            back: Some(file.back),
+        },
+        None => Source::default(),
+    };
     heap(|state| {
         state.within_data(pages)?;
         let result = if fixed {
@@ -194,12 +240,12 @@ fn mmap0(addr: usize, len: usize, prot: i32, flags: i32, back: Option<Back>) -> 
                 })
             } else {
                 state
-                    .make_own(Some(addr), pages, Access::ReadWrite, shared)
+                    .make_own(Some(addr), pages, Access::ReadWrite, shared, source)
                     .map(|(_, at)| at)
             }
         } else if shared || pages >= OWN_FROM {
             state
-                .make_own(None, pages, Access::ReadWrite, shared)
+                .make_own(None, pages, Access::ReadWrite, shared, source)
                 .map(|(_, at)| at)
         } else {
             let at = state.take(pages)?;
@@ -207,12 +253,6 @@ fn mmap0(addr: usize, len: usize, prot: i32, flags: i32, back: Option<Back>) -> 
             unsafe { core::ptr::write_bytes(at as *mut u8, 0, pages * PAGE) };
             Ok(at)
         }?;
-        if let Some(back) = back.filter(|_| shared) {
-            if let Some(index) = state.map.find(result) {
-                let object = state.map.piece(index).object();
-                state.map.object_mut(object).back = Some(back);
-            }
-        }
         if access != Access::ReadWrite {
             if let Err(error) = state.protect(result, pages, access) {
                 release(state, result, pages)?;
@@ -221,6 +261,42 @@ fn mmap0(addr: usize, len: usize, prot: i32, flags: i32, back: Option<Back>) -> 
         }
         Ok(result)
     })
+}
+
+/// A forked child joins the process service's entries of the shared objects
+/// it inherited, so that they live as long as it maps them.
+pub(crate) fn attach_shared() {
+    use rt::handle::{Handle, Memory};
+    let mut found: [Option<(u64, usize, Handle<Memory>)>; posix_map::MAX_OBJECTS] =
+        [const { None }; posix_map::MAX_OBJECTS];
+    heap(|state| {
+        let mut n = 0;
+        for (index, object) in state.map.objects() {
+            let Some(back) = object.back.filter(|b| b.key != 0) else {
+                continue;
+            };
+            let pages = state
+                .map
+                .pieces_of(index)
+                .map(|p| p.offset() + p.pages())
+                .max()
+                .unwrap_or(0);
+            let held = Handle::<Memory>::borrowed(object.handle.raw());
+            if let Ok(copy) = rt::sys::handle_duplicate(
+                &*held,
+                rt::abi::Rights::MAP_READ
+                    | rt::abi::Rights::MAP_WRITE
+                    | rt::abi::Rights::DUPLICATE
+                    | rt::abi::Rights::TRANSFER,
+            ) {
+                found[n] = Some((back.key, pages, copy));
+                n += 1;
+            }
+        }
+    });
+    for (key, pages, copy) in found.iter().flatten() {
+        let _ = crate::shares::attach(*key, *pages, copy);
+    }
 }
 
 /// A piece of a shared mapping of a file in a range: its address, its
@@ -263,9 +339,10 @@ pub fn file_pieces(addr: usize, len: usize, out: &mut [FilePiece]) -> usize {
     })
 }
 
-/// The descriptors of the files whose last mapping `munmap` took since the
-/// last call, up to `out.len()`: how many. The caller closes them.
-pub fn closed_files(out: &mut [i32]) -> usize {
+/// The descriptors and keys of the files whose last mapping `munmap` took since
+/// the last call, up to `out.len()`: how many. The caller closes the
+/// descriptors and tells the process service of the keys.
+pub fn closed_files(out: &mut [(i32, u64)]) -> usize {
     heap(|state| state.take_closed(out))
 }
 

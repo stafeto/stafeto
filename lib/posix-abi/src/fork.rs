@@ -810,6 +810,7 @@ fn child() -> Result<(), &'static str> {
         let (_, native) = crate::relibc::target(id).map_err(|_| "its place")?;
         crate::process::register_router(&native).map_err(|_| "its router")?;
     }
+    crate::mmap::attach_shared();
     let hook = AT_CHILD.load(Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `at_child` stores a value, a `fn()`.

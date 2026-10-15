@@ -437,8 +437,55 @@ static void time_functions(void) {
     check("strftime", parts && strftime(buffer, sizeof buffer, "%Y", parts) == 4);
 }
 
+/* A process of its own maps the shm object of the parent: the same pages,
+ * not a copy of the file. */
+static int peer(const char *name) {
+    int fd = shm_open(name, O_RDWR, 0);
+    if (fd < 0) return 1;
+    char *p = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) return 2;
+    if (p[0] != 7) return 3;
+    p[1] = 9;
+    if (munmap(p, 2 * PAGE)) return 4;
+    return 0;
+}
+
+static void unrelated_processes(void) {
+    const char *name = "/posix-map-peer";
+    shm_unlink(name);
+    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    check("peer: shm_open", fd >= 0);
+    if (fd < 0) return;
+    check("peer: ftruncate", ftruncate(fd, 2 * PAGE) == 0);
+    char *p = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check("peer: mmap", p != MAP_FAILED);
+    if (p == MAP_FAILED) return;
+    p[0] = 7;
+    char *args[] = {"map", "peer", (char *)name, NULL};
+    pid_t child;
+    int error = posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ);
+    check("peer: spawn", error == 0);
+    int status = 0;
+    if (!error) check("peer: waitpid", waitpid(child, &status, 0) == child);
+    if (!error && WIFEXITED(status) && WEXITSTATUS(status))
+        printf("posix-map: peer step %d\n", WEXITSTATUS(status));
+    check("peer: the other process saw the pages", !error && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    check("peer: and wrote them", p[1] == 9);
+    check("peer: munmap", munmap(p, 2 * PAGE) == 0);
+    /* No one maps the object now: a new mapping reads the file, which the
+     * last munmap wrote. */
+    char *q = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check("peer: mmap again", q != MAP_FAILED);
+    if (q != MAP_FAILED) {
+        check("peer: the file has the pages", q[0] == 7 && q[1] == 9);
+        munmap(q, 2 * PAGE);
+    }
+    close(fd);
+    shm_unlink(name);
+}
+
 int main(int argc, char **argv) {
-    (void)argv;
+    if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
     if (argc == 1) {
         /* fork needs a program the process service started. */
         char *args[] = {"map", "run", NULL};
@@ -467,6 +514,7 @@ int main(int argc, char **argv) {
     shared_anonymous();
     files();
     shared_names();
+    unrelated_processes();
     limits();
     if (failures) {
         printf("posix-map: %d failures\n", failures);

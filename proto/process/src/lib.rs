@@ -483,7 +483,32 @@ pub enum Method {
     Timer = 58,
     /// sigqueue: pid u32, signal u32, value u64.
     Queue = 59,
+    /// The rendezvous of shared memory: a body of the operation u32 (`SHARE_GET`
+    /// ...), the key u64 and the pages u32. Put and Attach carry a memory
+    /// object (MAP_READ, MAP_WRITE, DUPLICATE and TRANSFER); a Get that finds
+    /// the object answers with a copy of it. The reply to Get: status, the
+    /// kind u32 (`SHARED_FOUND` ...) and the pages u32.
+    Share = 60,
 }
+
+/// Share: the object of a key, or the right to make it (Get).
+pub const SHARE_GET: u32 = 1;
+/// Share: the maker of an object hands it over (Put).
+pub const SHARE_PUT: u32 = 2;
+/// Share: a process that maps an object it has (a forked child) joins its
+/// key (Attach).
+pub const SHARE_ATTACH: u32 = 3;
+/// Share: the caller maps the object no more, or could not make it (Detach).
+pub const SHARE_DETACH: u32 = 4;
+/// Reply to Get: the object comes with the reply.
+pub const SHARED_FOUND: u32 = 0;
+/// Reply to Get: the caller makes the object and then Puts it.
+pub const SHARED_RESERVED: u32 = 1;
+/// Reply to Get: the service keeps no more entries; the caller makes an
+/// object nobody else will find.
+pub const SHARED_FULL: u32 = 2;
+/// Reply to Get: another process is making the object; ask again.
+pub const SHARED_BUSY: u32 = 3;
 impl Method {
     pub const fn header(self) -> Header {
         Header {
@@ -495,7 +520,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
     31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
-    59,
+    59, 60,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1410,6 +1435,7 @@ mod tests {
             Method::GetGroups,
             Method::Timer,
             Method::Queue,
+            Method::Share,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {

@@ -67,7 +67,7 @@ pub(crate) struct State {
     hidden: usize,
     /// The descriptors of files whose last shared mapping went, until the
     /// caller closes them (`take_closed`).
-    closed: [i32; 16],
+    closed: [(i32, u64); 16],
     closed_len: usize,
 }
 
@@ -92,7 +92,7 @@ static HEAP: Heap = Heap(UnsafeCell::new(State {
     map: Map::new(),
     chunk: 0,
     hidden: HIDDEN,
-    closed: [0; 16],
+    closed: [(0, 0); 16],
     closed_len: 0,
 }));
 static HEAP_LOCK: LayerLock = LayerLock::raising();
@@ -194,6 +194,16 @@ pub unsafe fn adopt(
             },
         )
         .map(drop)
+}
+
+/// Where a mapping of its own gets its object: a handle the process service
+/// gave (`existing`) or a new object, covering `offset` pages before the
+/// mapping's own, and the file a shared object writes back to.
+#[derive(Default)]
+pub(crate) struct Source {
+    pub existing: Option<Handle<Memory>>,
+    pub offset: usize,
+    pub back: Option<posix_map::Back>,
 }
 
 /// One entry of a forked child's memory map (the loader's `ForkEntry`): the
@@ -421,7 +431,7 @@ impl State {
                 .map_err(|_| ENOMEM)?;
             if let Some(back) = gone.and_then(|object| object.back) {
                 if self.closed_len < self.closed.len() {
-                    self.closed[self.closed_len] = back.fd;
+                    self.closed[self.closed_len] = (back.fd, back.key);
                     self.closed_len += 1;
                 }
             }
@@ -431,7 +441,7 @@ impl State {
     }
 
     /// The descriptors of `closed`, moved to `out`: how many.
-    pub(crate) fn take_closed(&mut self, out: &mut [i32]) -> usize {
+    pub(crate) fn take_closed(&mut self, out: &mut [(i32, u64)]) -> usize {
         let n = self.closed_len.min(out.len());
         out[..n].copy_from_slice(&self.closed[..n]);
         self.closed.copy_within(n..self.closed_len, 0);
@@ -562,6 +572,7 @@ impl State {
         pages: usize,
         access: Access,
         shared: bool,
+        source: Source,
     ) -> Result<(usize, usize), i32> {
         let address = match at {
             Some(address) if self.space.all(address, pages, Page::Unbacked) => address,
@@ -573,27 +584,47 @@ impl State {
         }
         self.within_address_space(pages)?;
         let length = (pages * PAGE) as u64;
-        let memory = sys::mem_create(length).map_err(|_| ENOMEM)?;
-        let kept = sys::handle_duplicate(&memory, KEPT).map_err(|_| ENOMEM)?;
-        drop(memory);
+        let Source {
+            existing,
+            offset,
+            back,
+        } = source;
+        let kept = match existing {
+            Some(kept) => kept,
+            None => {
+                // An object for a file covers it from its first page.
+                let memory =
+                    sys::mem_create(((offset + pages) * PAGE) as u64).map_err(|_| ENOMEM)?;
+                let kept = sys::handle_duplicate(&memory, KEPT).map_err(|_| ENOMEM)?;
+                drop(memory);
+                kept
+            }
+        };
         let first = if access == Access::None {
             Access::ReadWrite
         } else {
             access
         };
-        sys::mem_map(&config().process, &kept, 0, length, address, first)
-            .map_err(|e| self.refused(e))?;
+        sys::mem_map(
+            &config().process,
+            &kept,
+            (offset * PAGE) as u64,
+            length,
+            address,
+            first,
+        )
+        .map_err(|e| self.refused(e))?;
         let index = self
             .map
             .push(
                 address,
                 pages,
                 first,
-                0,
+                offset,
                 Object {
                     handle: kept,
                     shared,
-                    back: None,
+                    back,
                 },
             )
             .map_err(|_| ENOMEM)?;

@@ -26,14 +26,19 @@ const MS_SYNC: c_int = 4;
 /// Pieces of shared mappings of files one call handles at most.
 const PIECES: usize = 32;
 
-/// The size of the regular file `fd` names, or an errno (ENODEV for any
-/// other kind: only files are mapped).
-fn file_size(fd: c_int) -> Result<u64, c_int> {
+/// What the regular file `fd` names: its size, and the key of the process
+/// service's rendezvous of shared memory (ENODEV for any other kind: only
+/// files are mapped).
+fn file_info(fd: c_int) -> Result<(u64, u64), c_int> {
     let info = call(|| posix_abi::names::fstatat(fd, None, 0))?;
     if info.kind != 2 {
         return Err(ENODEV);
     }
-    Ok(info.size)
+    Ok((info.size, posix_abi::shares::key_of(info.device, info.inode)))
+}
+
+fn file_size(fd: c_int) -> Result<u64, c_int> {
+    file_info(fd).map(|(size, _)| size)
 }
 
 /// Reads the file from `offset` into `address`, `len` bytes at most, up
@@ -88,12 +93,16 @@ fn write_back(pieces: &[FilePiece]) {
     }
 }
 
-/// Closes the descriptors of the files whose last mapping went.
+/// Closes the descriptors of the files whose last mapping went, and tells
+/// the process service that this process maps their objects no more.
 fn close_released() {
-    let mut fds = [0; 16];
-    let n = mmap::closed_files(&mut fds);
-    for &fd in &fds[..n] {
+    let mut files = [(0, 0); 16];
+    let n = mmap::closed_files(&mut files);
+    for &(fd, key) in &files[..n] {
         super::stafeto_close(fd);
+        if key != 0 {
+            posix_abi::shares::detach(key);
+        }
     }
 }
 
@@ -133,32 +142,110 @@ fn file_mapping(
     if !offset.is_multiple_of(PAGE as u64) {
         return Err(EINVAL);
     }
-    file_size(fd)?;
-    let shared = flags & MAP_SHARED != 0;
+    if len == 0 {
+        return Err(EINVAL);
+    }
+    let (_, key) = file_info(fd)?;
+    if flags & MAP_SHARED == 0 {
+        return private_file(addr, len, prot, flags, fd, offset);
+    }
     // A shared mapping writes through a descriptor of its own, which stays
     // when the program closes `fd`.
-    let keep = if shared {
-        let kept = super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, u64::from(KEEP_FROM));
-        if kept < 0 {
-            return Err(-kept);
-        }
-        Some(kept)
-    } else {
-        None
-    };
-    let back = keep.map(|fd| Back::new(fd, offset));
-    // The pages are written first and get the access asked for after.
-    let made = mmap::mmap(addr, len, prot | PROT_WRITE, flags, back);
-    let address = match made {
-        Ok(address) => address,
-        Err(errno) => {
-            if let Some(kept) = keep {
-                super::stafeto_close(kept);
-            }
+    let kept = super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, u64::from(KEEP_FROM));
+    if kept < 0 {
+        return Err(-kept);
+    }
+    let result = shared_file(addr, len, prot, flags, fd, kept, offset, key);
+    if result.is_err() {
+        super::stafeto_close(kept);
+    }
+    result
+}
+
+/// A private mapping of a file: pages of the layer's own, read from the file.
+fn private_file(
+    addr: usize,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: u64,
+) -> Result<usize, c_int> {
+    let address = mmap::mmap(addr, len, prot | PROT_WRITE, flags, None)?;
+    fill(fd, address, len, offset);
+    if prot & PROT_WRITE == 0 {
+        if let Err(errno) = mmap::mprotect(address, len, prot) {
+            let _ = mmap::munmap(address, len);
             return Err(errno);
         }
+    }
+    Ok(address)
+}
+
+/// A shared mapping of a file: the object the process service keeps for the
+/// file when another process maps it, else a new one, read from the file and
+/// registered there.
+#[allow(clippy::too_many_arguments)]
+fn shared_file(
+    addr: usize,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    kept: c_int,
+    offset: u64,
+    key: u64,
+) -> Result<usize, c_int> {
+    use posix_abi::shares::Got;
+    let first = (offset / PAGE as u64) as usize;
+    let pages = len.div_ceil(PAGE);
+    let source = |existing, key| mmap::FileSource {
+        existing,
+        offset_pages: first,
+        back: Back::new(kept, 0, key),
     };
-    fill(keep.unwrap_or(fd), address, len, offset);
+    // Ask the rendezvous; a process that makes the object meanwhile is
+    // waited for.
+    let mut asks = 0;
+    let got = loop {
+        match posix_abi::shares::get(key) {
+            Ok(Got::Busy) if asks < 2000 => {
+                asks += 1;
+                let _ = rt::sys::yield_now();
+            }
+            Ok(got) => break Some(got),
+            Err(_) => break None,
+        }
+    };
+    let address = match got {
+        Some(Got::Found(memory, covers)) if covers >= first + pages => {
+            let address = mmap::mmap(addr, len, prot, flags, Some(source(Some(memory), key)))?;
+            return Ok(address);
+        }
+        // An object too short for the mapping (the file grew) is not used:
+        // this mapping makes its own, apart from the others.
+        Some(Got::Found(..)) | Some(Got::Full) | Some(Got::Busy) | None => {
+            mmap::mmap(addr, len, prot | PROT_WRITE, flags, Some(source(None, 0)))?
+        }
+        Some(Got::Reserved) => {
+            match mmap::mmap(addr, len, prot | PROT_WRITE, flags, Some(source(None, key))) {
+                Ok(address) => address,
+                Err(errno) => {
+                    posix_abi::shares::detach(key);
+                    return Err(errno);
+                }
+            }
+        }
+    };
+    fill(kept, address, len, offset);
+    if matches!(got, Some(Got::Reserved)) {
+        // The file is read: the others may map the object.
+        let handed = mmap::object_at(address)
+            .map(|(memory, covers)| posix_abi::shares::put(key, covers, &memory));
+        if !matches!(handed, Some(Ok(()))) {
+            posix_abi::shares::detach(key);
+        }
+    }
     if prot & PROT_WRITE == 0 {
         if let Err(errno) = mmap::mprotect(address, len, prot) {
             let _ = mmap::munmap(address, len);
@@ -166,6 +253,7 @@ fn file_mapping(
             return Err(errno);
         }
     }
+    let _ = fd;
     Ok(address)
 }
 

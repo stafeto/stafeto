@@ -101,15 +101,19 @@ pub struct Back {
     /// The descriptor the layer holds for it.
     pub fd: i32,
     page: u32,
+    /// The key of the file at the process service's rendezvous of shared
+    /// memory, 0 for an object that is not registered there.
+    pub key: u64,
 }
 
 impl Back {
     /// `offset` is the byte of the file the object's first byte shows, a
     /// multiple of the page.
-    pub fn new(fd: i32, offset: u64) -> Back {
+    pub fn new(fd: i32, offset: u64, key: u64) -> Back {
         Back {
             fd,
             page: u32::try_from(offset / PAGE as u64).expect("offset of a mapped file"),
+            key,
         }
     }
 
