@@ -20,6 +20,7 @@ pub use proto_pipe::ipc::WORDS_MAX;
 use proto_pipe::ipc::{Answer, Call, Cred, errno_of, op};
 use proto_pipe::sock::SOCK_END;
 use proto_wire::{Reader, Status, Writer};
+use core::sync::atomic::{AtomicBool, Ordering};
 use rt::abi::MESSAGE_MAX;
 
 /// No deadline.
@@ -44,15 +45,19 @@ fn transport() -> Result<Transport, i32> {
     })
 }
 
-/// The credentials, the process number and the time of the caller.
-fn credentials() -> Cred {
-    Cred {
-        uid: crate::process::geteuid(),
-        gid: crate::process::getegid(),
-        pid: crate::process::getpid() as u32,
-        now: crate::clock::gettime(crate::clock::CLOCK_REALTIME).map_or(0, |t| t.seconds),
-    }
+/// The time of the caller in seconds: the one word of a request that stands
+/// for the caller (the service learns who it is from the process service).
+fn now() -> u64 {
+    crate::clock::gettime(crate::clock::CLOCK_REALTIME).map_or(0, |t| t.seconds as u64)
 }
+
+/// Whether the session with the pipe service has been given the identity
+/// session of this image (a child of fork, whose session is new, is told
+/// NEED_ID and sends it).
+static IDENTITY_SENT: AtomicBool = AtomicBool::new(false);
+
+/// What NEED_ID of the service is as an errno.
+const NEED_ID: i32 = (proto_pipe::ipc::NEED_ID - proto_pipe::ipc::ERRNO) as i32;
 
 fn parse(bytes: &[u8], out: &mut [u8]) -> Result<Reply, i32> {
     let answer = Answer::parse(Reader::new(bytes)).map_err(|_| EIO)?;
@@ -72,7 +77,22 @@ fn short(transport: Transport, call: &Call<'_>, out: &mut [u8]) -> Result<Reply,
     let mut w = Writer::new();
     call.write(&mut w).map_err(|_| EIO)?;
     let reply = loop {
-        match rt::sys::send(&pipes, w.as_bytes()) {
+        let sent = if call.id {
+            let copy = crate::process::identity()
+                .and_then(|identity| {
+                    rt::sys::handle_duplicate(
+                        identity,
+                        rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER | rt::abi::Rights::DUPLICATE,
+                    )
+                    .ok()
+                })
+                .ok_or(EIO)?;
+            rt::sys::send_handles(&pipes, w.as_bytes(), [copy.erase()])
+                .map_err(|refused| refused.error)
+        } else {
+            rt::sys::send(&pipes, w.as_bytes())
+        };
+        match sent {
             Err(rt::abi::Error::Interrupted) => continue,
             other => break other.map_err(|_| EIO)?,
         }
@@ -112,7 +132,9 @@ fn long_call(
             again.write(w)
         }
     };
-    let n = if deadline == NO_DEADLINE {
+    let n = if deadline == NO_DEADLINE && call.id {
+        long::run_with_duplicable_identity(&pipes, start.as_bytes(), keyed, &mut buffer, &refusal)?
+    } else if deadline == NO_DEADLINE {
         long::run_with(&pipes, start.as_bytes(), keyed, &mut buffer, &refusal)?
     } else {
         long::run_until(
@@ -122,6 +144,7 @@ fn long_call(
             &mut buffer,
             &refusal,
             deadline,
+            call.id,
         )?
     };
     parse(&buffer[..n], out)
@@ -142,13 +165,30 @@ fn run(
     let mut all = [0u64; WORDS_MAX];
     all[..words.len()].copy_from_slice(words);
     if let Some(at) = cred_at {
-        all[at..at + Cred::WORDS].copy_from_slice(&credentials().words());
+        all[at] = now();
     }
-    let call = Call::new(operation, &all[..words.len()], bytes);
-    if op::is_long(operation) {
-        long_call(transport, &call, out, deadline)
-    } else {
-        short(transport, &call, out)
+    // The identity session goes with the first request, and again where the
+    // service says it has none (the session of a child of fork).
+    let mut send_identity = !IDENTITY_SENT.load(Ordering::Acquire);
+    loop {
+        let mut call = Call::new(operation, &all[..words.len()], bytes);
+        call.id = send_identity;
+        let result = if op::is_long(operation) {
+            long_call(transport, &call, out, deadline)
+        } else {
+            short(transport, &call, out)
+        };
+        match result {
+            Err(NEED_ID) if !send_identity => {
+                IDENTITY_SENT.store(false, Ordering::Release);
+                send_identity = true;
+            }
+            Ok(_) if send_identity => {
+                IDENTITY_SENT.store(true, Ordering::Release);
+                return result;
+            }
+            other => return other,
+        }
     }
 }
 
@@ -238,9 +278,6 @@ pub fn mq_open(
         maxmsg,
         msgsize,
         u64::from(attr.is_some()),
-        0,
-        0,
-        0,
         0,
     ];
     let mut out = [0u8; 0];

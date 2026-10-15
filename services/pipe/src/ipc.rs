@@ -21,7 +21,7 @@
 //! of one in a step. Every operation here is O(1) or bounded by the tables.
 
 use super::*;
-use proto_pipe::ipc::{Answer, Call, Cred, MQ_KIND, NAME_MAX, TEXT_MAX, WORDS_MAX, op};
+use proto_pipe::ipc::{Answer, Call, Cred, MQ_KIND, NAME_MAX, TEXT_MAX, WORDS_MAX, Who, op};
 
 /// The queues of POSIX and XSI together.
 pub const QUEUES: usize = 16;
@@ -53,7 +53,13 @@ pub const HOLD_MAX: usize = 48;
 /// The number of the queue of the waits: after the pipes' and the sockets'.
 pub const QUEUE_BASE: u32 = (DESCRIPTIONS + SOCKETS) as u32;
 /// The waits of IPC objects: a queue each, then a semaphore set each.
-pub const WAIT_QUEUES: usize = QUEUES + SEMSETS;
+pub const WAIT_QUEUES: usize = QUEUES + SEMSETS + 1;
+/// The messages the queues of one root hold at most, of the 64: a root that
+/// has its share waits for the pool, which any release wakes.
+pub const ROOT_MSGS: usize = 32;
+/// The files of freed segments a session that did not remove them is told
+/// of (so that it removes them).
+pub const REAP_MAX: usize = 16;
 
 /// The id of the endpoint an IPC operation is taken for: no real
 /// description has bit 29.
@@ -61,7 +67,7 @@ pub const IPC_TAG: u32 = 1 << 29;
 
 /// The operations that wait the service counts: receivers (a notification
 /// of a queue is not sent while one waits) and `semop`s (GETNCNT, GETZCNT).
-pub const BLOCKED_MAX: usize = 48;
+pub const BLOCKED_MAX: usize = 128;
 
 // Linux's numbers, relibc's.
 const EPERM: u32 = 1;
@@ -446,6 +452,11 @@ pub struct Ipc {
     blocked: [Blocked; BLOCKED_MAX],
     /// The places of `blocked` in use: the common case, none, costs nothing.
     counted: u8,
+    /// The senders that wait for the pool of messages.
+    pool: End,
+    /// The serial and the creator's uid of freed segments whose file is left.
+    reap: [(u32, u32); REAP_MAX],
+    reaped: u8,
     dying: u16,
     serial: u32,
 }
@@ -502,6 +513,9 @@ impl Ipc {
             holds: [HOLD_FREE; HOLD_MAX],
             blocked: [BLOCKED_FREE; BLOCKED_MAX],
             counted: 0,
+            pool: End::NONE,
+            reap: [(0, 0); REAP_MAX],
+            reaped: 0,
             dying: 0,
             serial: 0,
         }
@@ -513,7 +527,9 @@ impl Ipc {
             .checked_sub(QUEUE_BASE as usize)
             .filter(|&at| at < WAIT_QUEUES)
             .ok_or(BAD_FD)?;
-        if at < QUEUES {
+        if at == QUEUES + SEMSETS {
+            Ok(&mut self.pool)
+        } else if at < QUEUES {
             let q = &mut self.queues[at];
             if !q.live {
                 return Err(BAD_FD);
@@ -544,6 +560,55 @@ impl Ipc {
 
     fn live_msgs(&self) -> usize {
         self.msgs.iter().filter(|m| m.used).count()
+    }
+
+    /// The wait queue of the pool of messages.
+    fn pool_number() -> u32 {
+        QUEUE_BASE + (QUEUES + SEMSETS) as u32
+    }
+
+    /// Whether the pool has no place for another message of the queue `q`:
+    /// all 64 are in use, or the queues of its root hold their share.
+    fn pool_full(&self, q: usize) -> bool {
+        let root = self.queues[q].root;
+        let held: usize = self
+            .queues
+            .iter()
+            .filter(|x| x.live && x.root == root)
+            .map(|x| usize::from(x.count))
+            .sum();
+        held >= ROOT_MSGS || self.live_msgs() >= MSGS
+    }
+
+    /// The senders that wait for the pool wake: a message went.
+    fn wake_pool(&self, wakes: &mut Wakes) {
+        Self::wake(self.pool.waiters, wakes);
+    }
+
+    /// The freed segment `serial`, of the creator `uid`, has its file left.
+    fn reap_push(&mut self, serial: u32, uid: u32) {
+        if usize::from(self.reaped) == REAP_MAX {
+            self.reap.copy_within(1.., 0);
+            self.reaped -= 1;
+        }
+        self.reap[usize::from(self.reaped)] = (serial, uid);
+        self.reaped += 1;
+    }
+
+    /// The serial of a freed segment the caller may remove the file of (its
+    /// creator, or the superuser), or 0.
+    fn reap_take(&mut self, c: &Cred) -> u64 {
+        let n = usize::from(self.reaped);
+        let Some(at) = self.reap[..n]
+            .iter()
+            .position(|&(_, uid)| c.uid == 0 || c.uid == uid)
+        else {
+            return 0;
+        };
+        let (serial, _) = self.reap[at];
+        self.reap.copy_within(at + 1..n, at);
+        self.reaped -= 1;
+        u64::from(serial)
     }
 
     /// Puts a message at the end of the list of queue `q`, or before the
@@ -815,6 +880,9 @@ impl Ipc {
     }
 
     fn semwait_count(&self, set: usize, num: usize, zero: bool) -> u64 {
+        if self.counted == 0 {
+            return 0;
+        }
         let queue = Self::set_number(set);
         self.blocked
             .iter()
@@ -824,10 +892,20 @@ impl Ipc {
 
     /// Whether a receiver waits at queue `q`.
     fn recv_waiting(&self, q: usize) -> bool {
+        if self.counted == 0 {
+            return false;
+        }
         let queue = Self::queue_number(q);
         self.blocked
             .iter()
             .any(|b| b.used && b.queue == queue && b.block == Block::Recv)
+    }
+
+    /// The place of the operation `key` in `blocked`: the service's keys
+    /// carry the number of the operation (1 to 128) in their low half.
+    fn blocked_place(key: u64) -> Option<usize> {
+        let at = (key & 0xffff_ffff).checked_sub(1)? as usize;
+        (at < BLOCKED_MAX).then_some(at)
     }
 
     /// Notes that the operation (`label`, `key`) waits, for the counts.
@@ -835,8 +913,10 @@ impl Ipc {
         if block == Block::Plain {
             return;
         }
-        if let Some(at) = self.blocked.iter().position(|b| !b.used) {
-            self.counted += 1;
+        if let Some(at) = Self::blocked_place(key) {
+            if !self.blocked[at].used {
+                self.counted += 1;
+            }
             self.blocked[at] = Blocked {
                 used: true,
                 label,
@@ -849,10 +929,8 @@ impl Ipc {
 
     /// The operation (`label`, `key`) waits no more.
     pub fn wait_done(&mut self, label: u64, key: u64) {
-        if self.counted == 0 {
-            return;
-        }
-        for b in &mut self.blocked {
+        if let Some(at) = Self::blocked_place(key) {
+            let b = &mut self.blocked[at];
             if b.used && b.label == label && b.key == key {
                 *b = BLOCKED_FREE;
                 self.counted -= 1;
@@ -937,11 +1015,55 @@ impl Ipc {
                 if seg.live && seg.era == h.era {
                     seg.nattch = seg.nattch.saturating_sub(h.count);
                     if seg.removed && seg.nattch == 0 {
-                        let era = seg.era;
+                        let (era, serial, uid) = (seg.era, seg.serial, seg.perm.cuid);
                         *seg = Seg::FREE;
                         seg.era = era;
+                        self.reap_push(serial, uid);
                     }
                 }
+            }
+        }
+        self.dying != 0
+    }
+
+    /// The holds of `parent` the child `child` gets at fork (shared segments
+    /// stay attached, named semaphores stay open); whether there is room.
+    pub fn inherit_room(&self, parent: u64) -> bool {
+        let need = self
+            .holds
+            .iter()
+            .filter(|h| h.used && !h.dying && h.label == parent)
+            .count();
+        self.holds.iter().filter(|h| !h.used).count() >= need
+    }
+
+    pub fn inherit(&mut self, parent: u64, child: u64) {
+        for i in 0..HOLD_MAX {
+            let h = self.holds[i];
+            if !h.used || h.dying || h.label != parent {
+                continue;
+            }
+            let Some(at) = self.holds.iter().position(|x| !x.used) else {
+                return;
+            };
+            self.holds[at] = Hold { label: child, ..h };
+            let o = usize::from(h.obj);
+            if h.sem {
+                self.sems[o].opens += h.count;
+            } else {
+                self.segs[o].nattch += h.count;
+            }
+        }
+    }
+
+    /// The image of the session `label` was replaced (exec): its segments are
+    /// detached and its named semaphores closed, one in each step. Whether a
+    /// step is due.
+    pub fn exec(&mut self, label: u64) -> bool {
+        for h in &mut self.holds {
+            if h.used && !h.dying && h.label == label {
+                h.dying = true;
+                self.dying += 1;
             }
         }
         self.dying != 0
@@ -1001,15 +1123,19 @@ impl Ipc {
         if bytes.len() as u32 > queue.qbytes {
             return Err(fail(EINVAL));
         }
-        let room = queue.bytes + bytes.len() as u32 <= queue.qbytes
-            && usize::from(queue.count) < QUEUE_MSGS
-            && self.live_msgs() < MSGS;
-        if !room {
+        let queue_full =
+            queue.bytes + bytes.len() as u32 > queue.qbytes || usize::from(queue.count) >= QUEUE_MSGS;
+        if queue_full || self.pool_full(q) {
             if w[2] != 0 {
                 return Err(fail(EAGAIN));
             }
+            // The queue's own room comes with a receive, the pool's with any.
             return Ok(Flow::Wait {
-                queue: Self::queue_number(q),
+                queue: if queue_full {
+                    Self::queue_number(q)
+                } else {
+                    Self::pool_number()
+                },
                 block: Block::Plain,
             });
         }
@@ -1090,6 +1216,7 @@ impl Ipc {
         queue.lrpid = c.pid;
         queue.rtime = c.now;
         Self::wake(queue.waiters.waiters, wakes);
+        self.wake_pool(wakes);
         Ok(Flow::Done)
     }
 
@@ -1145,6 +1272,7 @@ impl Ipc {
                 }
                 let waiters = self.queue_free(q);
                 Self::wake(waiters, wakes);
+                self.wake_pool(wakes);
                 Ok(())
             }
             _ => Err(fail(EINVAL)),
@@ -1449,6 +1577,8 @@ impl Ipc {
             out.word(id_of(g, self.segs[g].era));
             out.word(u64::from(self.segs[g].serial));
             out.word(0);
+            let reap = self.reap_take(c);
+            out.word(reap);
             return Ok(());
         }
         if key != 0 && flags & IPC_CREAT == 0 {
@@ -1483,6 +1613,8 @@ impl Ipc {
         out.word(id_of(g, era));
         out.word(u64::from(self.serial));
         out.word(1);
+        let reap = self.reap_take(c);
+        out.word(reap);
         Ok(())
     }
 
@@ -1503,6 +1635,8 @@ impl Ipc {
         seg.lpid = c.pid;
         out.word(u64::from(seg.serial));
         out.word(seg.size);
+        let reap = self.reap_take(c);
+        out.word(reap);
         Ok(())
     }
 
@@ -1517,14 +1651,21 @@ impl Ipc {
             seg.lpid = c.pid;
         }
         if seg.removed && seg.nattch == 0 {
+            let (serial, creator) = (seg.serial, seg.perm.cuid);
             out.word(1);
-            out.word(u64::from(seg.serial));
+            out.word(u64::from(serial));
             *seg = Seg::FREE;
             seg.era = era;
+            // The caller removes the file; another user's, left to its creator.
+            if c.uid != creator && c.uid != 0 {
+                self.reap_push(serial, creator);
+            }
         } else {
             out.word(0);
             out.word(u64::from(seg.serial));
         }
+        let reap = self.reap_take(c);
+        out.word(reap);
         Ok(())
     }
 
@@ -1548,6 +1689,8 @@ impl Ipc {
                 ] {
                     out.word(v);
                 }
+                let reap = self.reap_take(c);
+                out.word(reap);
                 Ok(())
             }
             IPC_SET => {
@@ -1560,7 +1703,9 @@ impl Ipc {
                 seg.perm.mode = (w[7] & 0o777) as u16;
                 seg.ctime = c.now;
                 out.word(0);
-                out.word(0);
+                out.word(u64::from(seg.serial));
+                let reap = self.reap_take(c);
+                out.word(reap);
                 Ok(())
             }
             IPC_RMID => {
@@ -1569,11 +1714,14 @@ impl Ipc {
                     return Err(fail(EPERM));
                 }
                 if seg.nattch == 0 {
-                    let (serial, era) = (seg.serial, seg.era);
+                    let (serial, era, creator) = (seg.serial, seg.era, seg.perm.cuid);
                     *seg = Seg::FREE;
                     seg.era = era;
                     out.word(1);
                     out.word(u64::from(serial));
+                    if c.uid != creator && c.uid != 0 {
+                        self.reap_push(serial, creator);
+                    }
                 } else {
                     // The key goes now; the segment goes with its last detach.
                     seg.removed = true;
@@ -1581,6 +1729,8 @@ impl Ipc {
                     out.word(0);
                     out.word(u64::from(seg.serial));
                 }
+                let reap = self.reap_take(c);
+                out.word(reap);
                 Ok(())
             }
             _ => Err(fail(EINVAL)),
@@ -1647,7 +1797,7 @@ impl Ipc {
         Ok(id_of(s, era))
     }
 
-    fn nsem_unlink(&mut self, name: &[u8], wakes: &mut Wakes) -> Result<(), u32> {
+    fn nsem_unlink(&mut self, name: &[u8], c: &Cred, wakes: &mut Wakes) -> Result<(), u32> {
         let s = self
             .sems
             .iter()
@@ -1656,6 +1806,9 @@ impl Ipc {
             })
             .ok_or(fail(ENOENT))?;
         let set = &mut self.sems[s];
+        if !set.perm.owns(c) {
+            return Err(fail(EACCES));
+        }
         set.unlinked = true;
         if set.opens == 0 {
             Self::wake(set.waiters.waiters, wakes);
@@ -1767,10 +1920,12 @@ impl Pipes {
         if matches!(x.notify, Notify::Armed(d) | Notify::Fired(d) if usize::from(d) == slot) {
             x.notify = Notify::None;
         }
-        Ipc::wake(x.waiters.waiters, wakes);
         if x.unlinked && x.opens == 0 {
             let waiters = self.ipc.queue_free(q);
             Ipc::wake(waiters, wakes);
+            self.ipc.wake_pool(wakes);
+        } else {
+            Ipc::wake(x.waiters.waiters, wakes);
         }
     }
 
@@ -1783,6 +1938,7 @@ impl Pipes {
         label: u64,
         root: u64,
         call: &Call<'_>,
+        who: Who,
         out: &mut Out,
         wakes: &mut Wakes,
     ) -> Result<Flow, u32> {
@@ -1801,7 +1957,7 @@ impl Pipes {
             if w.len() < at + Cred::WORDS {
                 Err(fail(EINVAL))
             } else {
-                Ok(Cred::from_words(&w[at..at + Cred::WORDS]))
+                Ok(Cred::of(who, &w[at..at + Cred::WORDS]))
             }
         };
         match call.op {
@@ -1813,6 +1969,7 @@ impl Pipes {
             }
             op::MQ_UNLINK => {
                 need(Cred::WORDS)?;
+                let c = cred(0)?;
                 let name = Ipc::name_ok(call.bytes)?;
                 let q = self
                     .ipc
@@ -1821,10 +1978,15 @@ impl Pipes {
                     .position(|q| q.has_name(name))
                     .ok_or(fail(ENOENT))?;
                 let x = &mut self.ipc.queues[q];
+                // The name is the owner's to take away (EACCES otherwise).
+                if !x.perm.owns(&c) {
+                    return Err(fail(EACCES));
+                }
                 x.unlinked = true;
                 if x.opens == 0 {
                     let waiters = self.ipc.queue_free(q);
                     Ipc::wake(waiters, wakes);
+                    self.ipc.wake_pool(wakes);
                 }
                 Ok(Flow::Done)
             }
@@ -1978,8 +2140,9 @@ impl Pipes {
             }
             op::NSEM_UNLINK => {
                 need(Cred::WORDS)?;
+                let c = cred(0)?;
                 let name = Ipc::name_ok(call.bytes)?;
-                self.ipc.nsem_unlink(name, wakes)?;
+                self.ipc.nsem_unlink(name, &c, wakes)?;
                 Ok(Flow::Done)
             }
             op::NSEM_CLOSE => {
@@ -2105,12 +2268,17 @@ impl Pipes {
         if bytes.len() > usize::from(x.msgsize) {
             return Err(fail(EMSGSIZE));
         }
-        if usize::from(x.count) >= usize::from(x.maxmsg) || self.ipc.live_msgs() >= MSGS {
+        let queue_full = usize::from(x.count) >= usize::from(x.maxmsg);
+        if queue_full || self.ipc.pool_full(q) {
             if nonblock {
                 return Err(fail(EAGAIN));
             }
             return Ok(Flow::Wait {
-                queue: Ipc::queue_number(q),
+                queue: if queue_full {
+                    Ipc::queue_number(q)
+                } else {
+                    Ipc::pool_number()
+                },
                 block: Block::Plain,
             });
         }
@@ -2166,6 +2334,7 @@ impl Pipes {
         x.lrpid = c.pid;
         x.rtime = c.now;
         Ipc::wake(x.waiters.waiters, wakes);
+        self.ipc.wake_pool(wakes);
         Ok(Flow::Done)
     }
 
@@ -2189,6 +2358,22 @@ impl Pipes {
         self.ipc.forget(label);
     }
 
+    /// Whether a child of `parent` can get the holds of `parent`.
+    pub fn ipc_inherit_room(&self, parent: u64) -> bool {
+        self.ipc.inherit_room(parent)
+    }
+
+    /// A child of fork gets the attachments and opens of its parent.
+    pub fn ipc_inherit(&mut self, parent: u64, child: u64) {
+        self.ipc.inherit(parent, child);
+    }
+
+    /// The session's image was replaced (exec): its holds go. Whether a step
+    /// is due.
+    pub fn ipc_exec(&mut self, label: u64) -> bool {
+        self.ipc.exec(label)
+    }
+
     pub fn ipc_step(&mut self, wakes: &mut Wakes) -> bool {
         self.ipc.step(wakes)
     }
@@ -2210,19 +2395,25 @@ const _: () = assert!(MQ_KIND != proto_pipe::sock::STREAM && MQ_KIND != proto_pi
 mod tests {
     use super::*;
 
-    const C: [u64; 4] = [1000, 100, 7, 50];
+    const WHO: Who = Who {
+        uid: 1000,
+        gid: 100,
+        pid: 7,
+    };
+    const NOW: u64 = 50;
 
     fn pipes() -> Box<Pipes> {
         Box::new(Pipes::new())
     }
 
     fn cred() -> Vec<u64> {
-        C.to_vec()
+        vec![NOW]
     }
 
     struct Run {
         held: Held,
         wakes: Wakes,
+        who: Who,
     }
 
     impl Run {
@@ -2230,6 +2421,7 @@ mod tests {
             Run {
                 held: Held::default(),
                 wakes: Wakes::default(),
+                who: WHO,
             }
         }
 
@@ -2251,6 +2443,7 @@ mod tests {
                 label,
                 label,
                 &call,
+                self.who,
                 &mut out,
                 &mut self.wakes,
             );
@@ -2381,12 +2574,18 @@ mod tests {
         let w = with_cred(&[O_CREAT | O_EXCL | 2, 0o600, 1, 1, 1]);
         assert_eq!(r.err(&mut p, op::MQ_OPEN, &w, b"/q"), 17);
         // Another user finds no permission in a mode of 0600.
-        let mut other = vec![2, 0, 0, 0, 0, 2000, 200, 8, 50];
-        other[0] = 2;
+        let other = with_cred(&[2, 0, 0, 0, 0]);
+        r.who = Who {
+            uid: 2000,
+            gid: 200,
+            pid: 8,
+        };
         assert_eq!(r.err(&mut p, op::MQ_OPEN, &other, b"/q"), 13);
-        let mut root = other.clone();
-        root[5] = 0;
-        r.ok(&mut p, op::MQ_OPEN, &root, b"/q");
+        // Nor may it take the name away.
+        assert_eq!(r.err(&mut p, op::MQ_UNLINK, &cred(), b"/q"), 13);
+        r.who.uid = 0;
+        r.ok(&mut p, op::MQ_OPEN, &other, b"/q");
+        r.ok(&mut p, op::MQ_UNLINK, &cred(), b"/q");
     }
 
     #[test]
@@ -2583,9 +2782,14 @@ mod tests {
         let id = r
             .ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o666]), b"")
             .words[0];
-        let mut other = vec![id, IPC_RMID, 2000, 200, 9, 60];
+        let other = with_cred(&[id, IPC_RMID]);
+        r.who = Who {
+            uid: 2000,
+            gid: 200,
+            pid: 9,
+        };
         assert_eq!(r.err(&mut p, op::MSG_CTL, &other, b""), 1);
-        other[2] = 0;
+        r.who.uid = 0;
         r.ok(&mut p, op::MSG_CTL, &other, b"");
     }
 
@@ -2989,7 +3193,7 @@ mod tests {
             call.key = None;
             let mut out = Out::new();
             let mut w = Wakes::default();
-            (p.ipc_call(&mut r.held, 1, 2, &call, &mut out, &mut w), out)
+            (p.ipc_call(&mut r.held, 1, 2, &call, WHO, &mut out, &mut w), out)
         };
         assert_eq!(flow, Ok(Flow::Done));
     }
@@ -3009,5 +3213,142 @@ mod tests {
                 .is_err()
         );
         p.unwait(QUEUE_BASE, (1, 1));
+    }
+
+    #[test]
+    fn a_sender_that_waits_for_the_pool_wakes_when_any_message_goes() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(r.ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o600]), b"").words[0]);
+        }
+        // Two queues of 16 take the share of the root (32 of 64).
+        for id in &ids[..2] {
+            for _ in 0..QUEUE_MSGS {
+                r.ok(&mut p, op::MSG_SND, &with_cred(&[*id, 1, 1]), b"x");
+            }
+        }
+        assert_eq!(r.err(&mut p, op::MSG_SND, &with_cred(&[ids[2], 1, 1]), b"x"), 11);
+        let (flow, _) = r.call(&mut p, 1, op::MSG_SND, &with_cred(&[ids[2], 1, 0]), b"x", None);
+        let Ok(Flow::Wait { queue, .. }) = flow else {
+            panic!("{flow:?}")
+        };
+        assert_eq!(queue, Ipc::pool_number(), "its own queue has room: the pool is what it waits for");
+        p.wait(queue, (7, 7), |_| true).unwrap();
+        // A receive from another queue of the tree frees a place and wakes it.
+        r.ok(&mut p, op::MSG_RCV, &with_cred(&[ids[0], 8, 0, 0]), b"");
+        assert!(r.wakes.iter().any(|w| w == (7, 7)));
+        // The same for a queue of POSIX.
+        r.ok(&mut p, op::MSG_SND, &with_cred(&[ids[0], 1, 1]), b"x");
+        let d = open(&mut r, &mut p, b"/pool", O_CREAT | 2, 4, 1);
+        let (flow, _) = r.call(&mut p, 1, op::MQ_SEND, &with_cred(&[d, 0, 0]), b"z", None);
+        assert!(matches!(flow, Ok(Flow::Wait { queue, .. }) if queue == Ipc::pool_number()));
+    }
+
+    #[test]
+    fn a_root_that_used_its_share_leaves_the_pool_to_the_others() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let a = r.ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o600]), b"").words[0];
+        let b = r.ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o600]), b"").words[0];
+        for id in [a, b] {
+            for _ in 0..QUEUE_MSGS {
+                r.ok(&mut p, op::MSG_SND, &with_cred(&[id, 1, 1]), b"x");
+            }
+        }
+        // Another root, its own queue: the pool has room for it.
+        let mut call = Call::new(op::MSG_GET, &with_cred(&[0, 0o600]), b"");
+        call.key = None;
+        let (mut out, mut w) = (Out::new(), Wakes::default());
+        p.ipc_call(&mut r.held, 5, 5, &call, WHO, &mut out, &mut w).unwrap();
+        let other = out.words[0];
+        let call = Call::new(op::MSG_SND, &with_cred(&[other, 1, 1]), b"y");
+        assert_eq!(
+            p.ipc_call(&mut r.held, 5, 5, &call, WHO, &mut out, &mut w),
+            Ok(Flow::Done)
+        );
+    }
+
+    #[test]
+    fn a_child_holds_what_its_parent_holds_and_exec_lets_it_go() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        let id = out.words[0];
+        let (flow, _) = r.call(&mut p, 10, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
+        assert_eq!(flow, Ok(Flow::Done));
+        let (flow, _) = r.call(&mut p, 10, op::NSEM_OPEN, &with_cred(&[O_CREAT, 0o600, 1]), b"/s", None);
+        assert_eq!(flow, Ok(Flow::Done));
+        let stat = |r: &mut Run, p: &mut Pipes| r.ok(p, op::SHM_CTL, &with_cred(&[id, IPC_STAT]), b"").words[13];
+        assert_eq!(stat(&mut r, &mut p), 1);
+        assert!(p.ipc_inherit_room(10));
+        p.ipc_inherit(10, 11);
+        assert_eq!(stat(&mut r, &mut p), 2, "the child is counted");
+        // The child detaches: it had the hold.
+        let (flow, _) = r.call(&mut p, 11, op::SHM_DT, &with_cred(&[id]), b"", None);
+        assert_eq!(flow, Ok(Flow::Done));
+        assert_eq!(stat(&mut r, &mut p), 1);
+        // An exec lets go of the image's holds, in steps.
+        assert!(p.ipc_exec(10));
+        assert!(p.ipc_gone(11));
+        let mut w = Wakes::default();
+        while p.ipc_step(&mut w) {}
+        assert_eq!(stat(&mut r, &mut p), 0);
+        assert!(p.ipc.sems.iter().any(|s| s.live && s.opens == 0));
+    }
+
+    #[test]
+    fn a_child_is_refused_when_the_holds_have_no_room() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let id = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"").words[0];
+        for label in 100..100 + HOLD_MAX as u64 {
+            let (flow, _) = r.call(&mut p, label, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
+            assert_eq!(flow, Ok(Flow::Done));
+        }
+        assert!(!p.ipc_inherit_room(100), "no hold is free for a copy");
+    }
+
+    #[test]
+    fn a_freed_segment_names_its_file_to_its_creator_until_it_is_removed() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        let (id, serial) = (out.words[0], out.words[1]);
+        let (flow, _) = r.call(&mut p, 77, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
+        assert_eq!(flow, Ok(Flow::Done));
+        let rm = r.ok(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_RMID]), b"");
+        assert_eq!((rm.words[0], rm.words[2]), (0, 0), "attached: nothing to remove yet");
+        // The attaching process is killed: its hold goes in a step.
+        assert!(p.ipc_gone(77));
+        let mut w = Wakes::default();
+        while p.ipc_step(&mut w) {}
+        // Another user is not told of the file; its creator is, once.
+        r.who.uid = 2000;
+        let other = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        assert_eq!(other.words[3], 0);
+        r.who = WHO;
+        let again = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        assert_eq!(again.words[3], serial);
+        let third = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        assert_eq!(third.words[3], 0);
+    }
+
+    #[test]
+    fn the_counted_waits_are_found_by_the_number_of_their_operation() {
+        let mut ipc = Box::new(Ipc::new());
+        let key = (7u64 << 32) | 5;
+        ipc.note_wait(3, key, QUEUE_BASE, Block::Recv);
+        assert_eq!(ipc.counted, 1);
+        // Another label with the same place finds nothing to take away.
+        ipc.wait_done(4, key);
+        assert_eq!(ipc.counted, 1);
+        ipc.wait_done(3, key);
+        assert_eq!(ipc.counted, 0);
+        ipc.note_wait(3, (1 << 32) | 9, QUEUE_BASE, Block::Recv);
+        ipc.note_wait(3, (1 << 32) | 10, QUEUE_BASE, Block::Recv);
+        ipc.note_wait(8, (1 << 32) | 11, QUEUE_BASE, Block::Recv);
+        ipc.forget(3);
+        assert_eq!(ipc.counted, 1);
+        // A key that names no place is ignored.
+        ipc.note_wait(3, 0, QUEUE_BASE, Block::Recv);
+        ipc.note_wait(3, (1 << 32) | 100_000, QUEUE_BASE, Block::Recv);
+        assert_eq!(ipc.counted, 1);
     }
 }

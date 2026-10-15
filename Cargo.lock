@@ -193,8 +193,10 @@ name = "pipe"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "posix-credentials",
  "proto-init",
  "proto-pipe",
+ "proto-process",
  "proto-wire",
  "rt",
 ]

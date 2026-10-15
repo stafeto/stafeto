@@ -16,16 +16,18 @@
 
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
+use core::sync::atomic::{AtomicU64, Ordering};
+use posix_credentials::known::Known;
 use pipe::ipc::{Block, Flow, IPC_TAG, Out};
 use pipe::{Held, Pipes, Roots, Wakes};
 use proto_init::ServiceArgs;
-use proto_pipe::ipc::{Call, op as ipc_op};
+use proto_pipe::ipc::{Call, NEED_ID, Who, op as ipc_op};
 use proto_pipe::sock::{Addr, Received, Recv, SEND_MAX, Send};
 use proto_pipe::{Cancel, HELD_MAX, MAX_READ, Method, OWN, Read, VERSION, Write};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, long, watch};
 use rt::abi::{Error, Rights, Source};
-use rt::handle::{Channel, Handle, Outgoing, Resource};
+use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Resource};
 use rt::service::{
     Answer, Config, Heartbeat, LongOps, LongSession, Notice, Request, Service, Session,
 };
@@ -86,6 +88,10 @@ struct Client {
     waiting: u16,
     claimed: bool,
     root: u64,
+    /// A copy of the identity session of the client's process, which the
+    /// process service vouched for (IPC calls only), and the answer.
+    identity: Option<Handle<Channel>>,
+    known: Known,
 }
 
 /// A clone that sent nothing yet: its label, its descriptions and the
@@ -160,6 +166,10 @@ fn main(_: u64) -> u64 {
         named: &mut tables.named,
         io: &mut tables.io,
         step,
+        process: Handle::borrowed(start.process.raw()),
+        parent: Handle::borrowed(start.parent.raw()),
+        notary: None,
+        generations: None,
         step_told: false,
         step_due: false,
     };
@@ -191,11 +201,48 @@ struct PipeService {
     /// The copy of the service's channel with NOTIFY, label STEP, and
     /// whether a step was told and not taken.
     step: Handle<Channel>,
+    /// The service's own process, to map the page of the generations in,
+    /// and its connection to init, which gives the notary session.
+    process: ManuallyDrop<Handle<Process>>,
+    parent: ManuallyDrop<Handle<Channel>>,
+    /// The notary session with the process service (init's VOUCHERS), asked
+    /// for at the first IPC call, and the page of the credentials
+    /// generations through it.
+    notary: Option<Handle<Channel>>,
+    generations: Option<Handle<Memory>>,
     step_told: bool,
     /// A step is due that no notification told: the next request or
     /// notification makes it and tries to tell again.
     step_due: bool,
 }
+
+/// Where the service maps the process service's page of the credentials
+/// generations, read-only.
+const GENERATIONS_ADDRESS: usize = 0x0F00_0000;
+
+/// The generation of the credentials of the record at `index`, read from
+/// the page with no call (Acquire); the page is mapped.
+fn generation(index: usize) -> u64 {
+    // SAFETY: the page is mapped for reading at GENERATIONS_ADDRESS for the
+    // service's life once `generations` is set, which every caller checked;
+    // an index below RECORDS is a u64 word inside it.
+    unsafe { &*((GENERATIONS_ADDRESS + index * 8) as *const AtomicU64) }.load(Ordering::Acquire)
+}
+
+/// Vouch through the notary session: what the process service says of the
+/// client whose identity session `identity` is a copy of (none for a
+/// channel of anyone else).
+fn vouch(notary: &Handle<Channel>, identity: &Handle<Channel>) -> Option<proto_process::WhoReply> {
+    let rights = Rights::NOTIFY | Rights::TRANSFER;
+    let copy = sys::handle_duplicate(identity, rights).ok()?;
+    let request = proto_process::Method::Vouch.header().bytes();
+    let reply = sys::send_handles(notary, &request, [copy.erase()]).ok()?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    proto_process::WhoReply::read(reply.bytes(&mut buffer)).ok()
+}
+
+/// EACCES as the code of a refusal of the IPC calls.
+const NOT_ALLOWED: u32 = proto_pipe::ipc::ERRNO + 13;
 
 fn status(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
@@ -209,6 +256,79 @@ fn long_answer(r: &mut Request<'_>, reply: long::Reply<'_>) -> Answer {
 }
 
 impl PipeService {
+    /// The notary session (asked of init once) and the page of the
+    /// generations mapped through it (Register), once.
+    fn notary_ready(&mut self) -> bool {
+        if self.notary.is_none() {
+            self.notary = rt::service::connect(&self.parent, "posix").ok();
+        }
+        let Some(notary) = self.notary.as_ref() else {
+            return false;
+        };
+        if self.generations.is_some() {
+            return true;
+        }
+        let request = proto_process::Method::Register.header().bytes();
+        let Ok(mut reply) = sys::send(notary, &request) else {
+            return false;
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+            return false;
+        }
+        let Ok(memory) = reply.handles.take::<Memory>(0) else {
+            return false;
+        };
+        let mapped = sys::mem_map(
+            &self.process,
+            &memory,
+            0,
+            4096,
+            GENERATIONS_ADDRESS,
+            rt::abi::Access::Read,
+        );
+        if mapped.is_err() {
+            return false;
+        }
+        self.generations = Some(memory);
+        true
+    }
+
+    /// Who the client of `s` is, by the process service: `offered` is the
+    /// identity session a request brought, which the session keeps in place
+    /// of the one before (an exec moved it to a new image). The answer is
+    /// remembered with the generation of the credentials and asked again
+    /// only when the page's word moved. NEED_ID for a session that never
+    /// brought a copy.
+    fn who(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        offered: Option<Handle<Channel>>,
+    ) -> Result<Who, u32> {
+        if let Some(channel) = offered {
+            s.data.identity = Some(channel);
+            s.data.known = Known::new();
+        }
+        if s.data.identity.is_none() {
+            return Err(NEED_ID);
+        }
+        if !self.notary_ready() {
+            return Err(NOT_ALLOWED);
+        }
+        let notary = self.notary.as_ref().expect("the notary session");
+        let identity = s.data.identity.as_ref().expect("the identity session");
+        let credentials = s
+            .data
+            .known
+            .credentials(generation, || vouch(notary, identity))
+            .ok_or(NOT_ALLOWED)?;
+        Ok(Who {
+            uid: credentials.euid,
+            gid: credentials.egid,
+            pid: s.data.known.pid().unwrap_or(0),
+        })
+    }
+
     /// Tells each operation `wakes` names that its end changed.
     fn tell(&mut self, wakes: &Wakes) {
         for (label, key) in wakes.iter() {
@@ -634,13 +754,50 @@ impl PipeService {
             return Answer::Status(Status::BadSize);
         }
         let endpoint = Endpoint::anonymous(IPC_TAG | call.op);
-        let notify = match Self::notify_of(r, take) {
-            Ok(notify) => notify,
-            Err(answer) => return answer,
+        // The handles: the caller's identity session when the request says
+        // so, then the labelled copy of a first take.
+        let (offered, notify) = {
+            let count = r.handles.len();
+            let (identity, notify) = (usize::from(call.id), usize::from(take));
+            if count > identity + notify || (count < identity) || (notify == 0 && count > identity)
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            let first = |r: &mut Request<'_>, i: usize| {
+                r.handles
+                    .take::<Channel>(i)
+                    .map_err(|e| Answer::Status(Status::Kernel(e)))
+            };
+            let offered = if call.id {
+                match first(r, 0) {
+                    Ok(h) => Some(h),
+                    Err(a) => return a,
+                }
+            } else {
+                None
+            };
+            let notify = if count > identity {
+                match first(r, identity) {
+                    Ok(h) => Some(h),
+                    Err(a) => return a,
+                }
+            } else {
+                None
+            };
+            (offered, notify)
         };
         if !self.take_ok(s, call.key, endpoint) {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
+        let who = match self.who(s, offered) {
+            Ok(who) => who,
+            Err(code) => {
+                if long {
+                    self.finish(s, call.key, endpoint.id);
+                }
+                return status(code);
+            }
+        };
         if call.op == ipc_op::MQ_OPEN
             && s.data.held.count() + self.named.reservations(s.label()) + 1 > HELD_MAX
         {
@@ -651,7 +808,7 @@ impl PipeService {
         let (label, root) = (r.label(), s.data.root);
         let flow = self
             .pipes
-            .ipc_call(&mut s.data.held, label, root, &call, &mut out, &mut wakes);
+            .ipc_call(&mut s.data.held, label, root, &call, who, &mut out, &mut wakes);
         self.tell(&wakes);
         match flow {
             Ok(Flow::Done) => {
@@ -1076,7 +1233,9 @@ impl PipeService {
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        if self.clones.room_within(root, ROOT_CLONES).is_err() {
+        if self.clones.room_within(root, ROOT_CLONES).is_err()
+            || !self.pipes.ipc_inherit_room(r.label())
+        {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
         let mut child = match self.pipes.clone_endpoints(held, &list[..count]) {
@@ -1099,6 +1258,8 @@ impl PipeService {
         );
         match session {
             Ok(session) if r.reply().u32(0).is_ok() => {
+                // The child holds the segments and semaphores its parent does.
+                self.pipes.ipc_inherit(r.label(), label);
                 if let Some(place) = self.clones.place_of(label) {
                     self.births[place] = Some((label, child, root));
                 }
@@ -1267,6 +1428,10 @@ impl Service<0> for PipeService {
                     return Answer::Status(Status::BadSize);
                 }
                 self.abandon(s);
+                // An exec: the old image's segments are detached with it.
+                if self.pipes.ipc_exec(s.label()) {
+                    self.kick();
+                }
                 Answer::Status(Status::Ok)
             }
             Some(
@@ -1309,6 +1474,9 @@ impl Service<0> for PipeService {
             .place_of(label)
             .and_then(|place| self.births[place].take_if(|b| b.0 == label));
         self.clones.gone(label);
+        if self.pipes.ipc_gone(label) {
+            self.kick();
+        }
         if let Some((_, mut held, _)) = birth
             && self.pipes.gone(&mut held)
         {

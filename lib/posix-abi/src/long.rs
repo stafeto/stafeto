@@ -31,6 +31,9 @@ pub(crate) trait Custody {
 struct Mode<'a> {
     point: bool,
     authenticated: bool,
+    /// The copy of the identity session may be duplicated by the service
+    /// (it keeps it and has it vouched again when the credentials change).
+    duplicable: bool,
     custody: Option<&'a dyn Custody>,
     /// The monotonic time in ns at which the wait ends with ETIMEDOUT.
     deadline: Option<u64>,
@@ -40,6 +43,7 @@ impl Mode<'_> {
         Self {
             point,
             authenticated,
+            duplicable: false,
             custody: None,
             deadline: None,
         }
@@ -108,6 +112,7 @@ fn call(
     out: &mut [u8],
     refusal: Refusal<'_>,
     authenticated: bool,
+    duplicable: bool,
     custody: Option<&dyn Custody>,
 ) -> Result<(u32, usize, u64), i32> {
     let _scope = ShortScope::enter(custody.is_some())?;
@@ -115,7 +120,15 @@ fn call(
         .then(|| {
             crate::process::identity()
                 .and_then(|identity| {
-                    sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER).ok()
+                    sys::handle_duplicate(
+                        identity,
+                        if duplicable {
+                            Rights::NOTIFY | Rights::TRANSFER | Rights::DUPLICATE
+                        } else {
+                            Rights::NOTIFY | Rights::TRANSFER
+                        },
+                    )
+                    .ok()
                 })
                 .ok_or(EIO)
         })
@@ -251,6 +264,7 @@ pub fn run_until(
     out: &mut [u8],
     refusal: Refusal<'_>,
     deadline: u64,
+    authenticated: bool,
 ) -> Result<usize, i32> {
     run_in(
         service,
@@ -260,7 +274,8 @@ pub fn run_until(
         refusal,
         Mode {
             deadline: Some(deadline),
-            ..Mode::plain(true, false)
+            duplicable: true,
+            ..Mode::plain(true, authenticated)
         },
     )
 }
@@ -303,6 +318,28 @@ pub fn run_with_identity(
         out,
         refusal,
         Mode::plain(true, true),
+    )
+}
+
+/// `run_with_identity` with a copy of the identity session that the service
+/// may duplicate, to keep and have vouched again (the IPC calls).
+pub fn run_with_duplicable_identity(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+) -> Result<usize, i32> {
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        Mode {
+            duplicable: true,
+            ..Mode::plain(true, true)
+        },
     )
 }
 
@@ -353,6 +390,7 @@ pub(crate) fn run_drain(
         Mode {
             point: true,
             authenticated: true,
+            duplicable: false,
             custody,
             deadline: None,
         },
@@ -407,6 +445,7 @@ fn run_in(
     let Mode {
         point,
         authenticated,
+        duplicable,
         custody,
         deadline,
     } = mode;
@@ -434,6 +473,7 @@ fn run_in(
                 out,
                 &start_refusal,
                 authenticated,
+                duplicable,
                 custody,
             ),
             Start::Admission(build) => {
@@ -445,6 +485,7 @@ fn run_in(
                     out,
                     &start_refusal,
                     authenticated,
+                    duplicable,
                     custody,
                 )
             }
@@ -495,6 +536,7 @@ fn run_in(
                 out,
                 refusal,
                 authenticated,
+                duplicable,
                 custody,
             ) {
                 Ok((long::READY, n, _)) => return Ok(n),
@@ -528,6 +570,7 @@ fn run_in(
                 out,
                 refusal,
                 authenticated,
+                duplicable,
                 custody,
             );
             drop(clone_guard);
@@ -577,6 +620,7 @@ fn run_in(
                     out,
                     refusal,
                     authenticated,
+                    duplicable,
                     custody,
                 ) {
                     Ok((long::READY, n, _)) => return Ok(n),
@@ -621,6 +665,7 @@ fn run_in(
             out,
             refusal,
             authenticated,
+            duplicable,
             custody,
         ) {
             Ok((long::READY, n, _)) => return Ok(n),

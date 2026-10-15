@@ -6,6 +6,7 @@
  * section checks a property and says which line failed. */
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mqueue.h>
@@ -20,6 +21,7 @@
 #include <sys/msg.h>
 #include <sys/sem.h>
 #include <sys/shm.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -53,6 +55,32 @@ static struct timespec after_ms(long ms) {
 static int wait_ok(pid_t pid) {
     int status = 0;
     return waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* Waits (a second at most) until the segment is attached `n` times: the
+ * attachments of a process that went are let go of in steps of the service. */
+static int nattch_is(int id, unsigned long n) {
+    struct shmid_ds ds;
+    for (int i = 0; i < 100; i++) {
+        if (shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == n) return 1;
+        pause_ms(10);
+    }
+    return 0;
+}
+
+/* The files of segments in /dev/shm: how many, and the first one's name. */
+static int sysv_files(char *first, size_t size) {
+    DIR *dir = opendir("/dev/shm");
+    int n = 0;
+    struct dirent *e;
+    if (!dir) return -1;
+    while ((e = readdir(dir)) != NULL) {
+        if (strncmp(e->d_name, ".sysv", 5) != 0) continue;
+        if (n == 0 && first) snprintf(first, size, "/dev/shm/%s", e->d_name);
+        n++;
+    }
+    closedir(dir);
+    return n;
 }
 
 static mqd_t make(const char *name, long maxmsg, long msgsize, int flags) {
@@ -642,7 +670,7 @@ static int shm_basics(void) {
     }
     CHECK(wait_ok(pid));
     CHECK(p[6] == 'c');
-    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 2);
+    CHECK(nattch_is(id, 2));
     CHECK(shmdt(q) == 0);
     CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1 && ds.shm_dtime != 0);
     errno = 0;
@@ -690,9 +718,272 @@ static int shm_processes(void) {
     CHECK(wait_ok(pid));
     CHECK(strcmp(p, "written by the child") == 0);
     /* The child went with its attachment: only the parent's is counted. */
-    struct shmid_ds ds;
-    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1);
+    CHECK(nattch_is(id, 1));
     CHECK(shmdt(p) == 0 && shmctl(id, IPC_RMID, NULL) == 0);
+    return 0;
+}
+
+
+/* Who a caller is comes from the process service, not from the request: the
+ * same call changes its answer when the process gives up its rights, and the
+ * names of queues and semaphores are the owner's to take away. */
+static int identity(void) {
+    int id = msgget(IPC_PRIVATE, 0600);
+    CHECK(id > 0);
+    mqd_t q = make("/ipc-ident", 1, 1, 0);
+    CHECK(q != (mqd_t)-1);
+    sem_unlink("/ipc-ident-sem");
+    sem_t *s = sem_open("/ipc-ident-sem", O_CREAT, 0600, 1);
+    CHECK(s != SEM_FAILED);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct msqid_ds ds;
+        /* As the superuser the queue is open to it. */
+        if (msgctl(id, IPC_STAT, &ds) != 0) _exit(1);
+        if (setuid(1234) != 0) _exit(2);
+        /* The new rights count at once, with no new call to hide behind. */
+        errno = 0;
+        if (msgctl(id, IPC_STAT, &ds) != -1 || errno != EACCES) _exit(3);
+        errno = 0;
+        if (msgctl(id, IPC_RMID, NULL) != -1 || errno != EPERM) _exit(4);
+        errno = 0;
+        if (mq_unlink("/ipc-ident") != -1 || errno != EACCES) _exit(5);
+        errno = 0;
+        if (sem_unlink("/ipc-ident-sem") != -1 || errno != EACCES) _exit(6);
+        errno = 0;
+        if (mq_open("/ipc-ident", O_RDWR) != (mqd_t)-1 || errno != EACCES) _exit(7);
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status));
+    if (WEXITSTATUS(status) != 0) {
+        printf("posix-ipc: the child of identity ended with %d\n", WEXITSTATUS(status));
+        return 20;
+    }
+    CHECK(sem_close(s) == 0 && sem_unlink("/ipc-ident-sem") == 0);
+    CHECK(mq_close(q) == 0 && mq_unlink("/ipc-ident") == 0);
+    CHECK(msgctl(id, IPC_RMID, NULL) == 0);
+    return 0;
+}
+
+/* The pages of a segment are the segment's: the file belongs to its creator
+ * with the mode of the segment, and a freed segment leaves no file, also
+ * when the process that held it was killed. */
+static int shm_pages(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    char path[64];
+    int before = sysv_files(NULL, 0);
+    CHECK(before >= 0);
+    int id = shmget(IPC_PRIVATE, page, 0600);
+    CHECK(id > 0 && sysv_files(path, sizeof path) == before + 1);
+    struct stat st;
+    CHECK(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600 && st.st_uid == geteuid());
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        if (setgid(1234) != 0 || setuid(1234) != 0) _exit(2);
+        /* Neither the segment nor its file lets another user in. */
+        errno = 0;
+        if (shmat(id, NULL, 0) != (void *)-1 || errno != EACCES) _exit(3);
+        errno = 0;
+        if (open(path, O_RDWR) != -1 || errno != EACCES) _exit(4);
+        errno = 0;
+        if (open(path, O_RDONLY) != -1 || errno != EACCES) _exit(5);
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status));
+    if (WEXITSTATUS(status) != 0) {
+        printf("posix-ipc: the child of shm_pages ended with %d\n", WEXITSTATUS(status));
+        return 20;
+    }
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    CHECK(sysv_files(NULL, 0) == before);
+    /* A new mode follows to the file. */
+    id = shmget(IPC_PRIVATE, page, 0600);
+    CHECK(id > 0 && sysv_files(path, sizeof path) == before + 1);
+    struct shmid_ds ds;
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0);
+    ds.shm_perm.mode = 0644;
+    CHECK(shmctl(id, IPC_SET, &ds) == 0);
+    CHECK(stat(path, &st) == 0 && (st.st_mode & 0777) == 0644);
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    /* A process killed with the segment attached, after the removal. */
+    id = shmget(IPC_PRIVATE, page, 0600);
+    CHECK(id > 0);
+    int ready[2];
+    CHECK(pipe(ready) == 0);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        close(ready[0]);
+        if (shmat(id, NULL, 0) == (void *)-1) _exit(1);
+        char byte = 'x';
+        if (write(ready[1], &byte, 1) != 1) _exit(2);
+        for (;;) pause();
+    }
+    close(ready[1]);
+    char byte;
+    CHECK(read(ready[0], &byte, 1) == 1);
+    close(ready[0]);
+    CHECK(nattch_is(id, 1));
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    CHECK(sysv_files(NULL, 0) == before + 1);
+    CHECK(kill(pid, SIGKILL) == 0 && waitpid(pid, &status, 0) == pid);
+    /* The service lets go of the dead one's attachment, and its next answer
+     * to this user names the file that is left. */
+    int again = -1;
+    for (int i = 0; i < 100 && sysv_files(NULL, 0) != before; i++) {
+        pause_ms(10);
+        again = shmget(IPC_PRIVATE, page, 0600);
+        if (again > 0) CHECK(shmctl(again, IPC_RMID, NULL) == 0);
+    }
+    CHECK(sysv_files(NULL, 0) == before);
+    return 0;
+}
+
+/* A sender that waits for the pool of messages wakes when a message goes,
+ * whatever queue it was in. */
+static int pool_waits(void) {
+    int q[3];
+    for (int i = 0; i < 3; i++) {
+        q[i] = msgget(IPC_PRIVATE, 0600);
+        CHECK(q[i] > 0);
+    }
+    struct text m = {1, "x"};
+    /* Two queues of 16 take the share of this tree. */
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 16; k++) CHECK(msgsnd(q[i], &m, 1, IPC_NOWAIT) == 0);
+    errno = 0;
+    CHECK(msgsnd(q[2], &m, 1, IPC_NOWAIT) == -1 && errno == EAGAIN);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        pause_ms(40);
+        _exit(msgrcv(q[0], &m, 1, 0, 0) == 1 ? 0 : 1);
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alarm;
+    CHECK(sigaction(SIGALRM, &sa, NULL) == 0);
+    alarm(3);
+    long long began = now_ms();
+    int sent = msgsnd(q[2], &m, 1, 0);
+    alarm(0);
+    CHECK(sent == 0 && now_ms() - began >= 30);
+    CHECK(wait_ok(pid));
+    for (int i = 0; i < 3; i++) CHECK(msgctl(q[i], IPC_RMID, NULL) == 0);
+    return 0;
+}
+
+/* A segment attached before fork stays attached in the child: the count
+ * grows, and falls when the child goes. */
+static int shm_fork(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    int id = shmget(IPC_PRIVATE, page, 0600);
+    CHECK(id > 0);
+    char *p = shmat(id, NULL, 0);
+    CHECK(p != (char *)-1);
+    int go[2];
+    CHECK(pipe(go) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct shmid_ds ds;
+        char byte;
+        int ok = shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 2;
+        if (read(go[0], &byte, 1) != 1) _exit(2);
+        _exit(ok ? 0 : 1);
+    }
+    CHECK(nattch_is(id, 2));
+    CHECK(write(go[1], "g", 1) == 1);
+    CHECK(wait_ok(pid));
+    CHECK(nattch_is(id, 1));
+    CHECK(shmdt(p) == 0 && shmctl(id, IPC_RMID, NULL) == 0);
+    close(go[0]);
+    close(go[1]);
+    return 0;
+}
+
+#define WAIT_SETS 6
+static int wait_sets[WAIT_SETS];
+
+static void *blocked_thread(void *arg) {
+    struct sembuf take = {0, -1, 0};
+    semop(wait_sets[(uintptr_t)arg % WAIT_SETS], &take, 1);
+    return NULL;
+}
+
+/* Starts `n` threads, numbered from `first`, that each wait on the semaphore
+ * of one set (a set holds eight waiting operations); how many started. */
+static int start_blocked(pthread_t *threads, int first, int n) {
+    int made = 0;
+    for (int i = 0; i < n; i++) {
+        if (pthread_create(&threads[i], NULL, blocked_thread, (void *)(uintptr_t)(first + i)) != 0) break;
+        made++;
+    }
+    return made;
+}
+
+static int waiting_in_sets(void) {
+    int n = 0;
+    for (int i = 0; i < WAIT_SETS; i++) n += semctl(wait_sets[i], 0, GETNCNT);
+    return n;
+}
+
+/* Forty-eight operations wait in the service (three processes with sixteen
+ * threads each) while the other calls go on: the pipes and the sockets keep
+ * their steps (xtask measures the longest). */
+static int many_waits(void) {
+    enum { EACH = 16, CHILDREN = 2 };
+    for (int i = 0; i < WAIT_SETS; i++) {
+        wait_sets[i] = semget(IPC_PRIVATE, 1, 0600);
+        CHECK(wait_sets[i] > 0);
+    }
+    pid_t pids[CHILDREN];
+    for (int c = 0; c < CHILDREN; c++) {
+        pids[c] = fork();
+        CHECK(pids[c] >= 0);
+        if (pids[c] == 0) {
+            pthread_t threads[EACH];
+            int made = start_blocked(threads, (c + 1) * EACH, EACH);
+            for (int i = 0; i < made; i++) pthread_join(threads[i], NULL);
+            _exit(made == EACH ? 0 : 1);
+        }
+    }
+    pthread_t threads[EACH];
+    int made = start_blocked(threads, 0, EACH);
+    CHECK(made == EACH);
+    int ncnt = 0;
+    for (int i = 0; i < 100 && ncnt != 3 * EACH; i++) {
+        pause_ms(20);
+        ncnt = waiting_in_sets();
+    }
+    if (ncnt != 3 * EACH) printf("posix-ipc: %d waiting\n", ncnt);
+    CHECK(ncnt == 3 * EACH);
+    /* Pipes and sockets under that load. */
+    int fds[2], sv[2];
+    char buf[64];
+    CHECK(pipe(fds) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    for (int i = 0; i < 20; i++) {
+        CHECK(write(fds[1], "pipe", 4) == 4 && read(fds[0], buf, sizeof buf) == 4);
+        CHECK(send(sv[0], "sock", 4, 0) == 4 && recv(sv[1], buf, sizeof buf, 0) == 4);
+    }
+    close(fds[0]); close(fds[1]); close(sv[0]); close(sv[1]);
+    /* One wakes, the others stay. */
+    struct sembuf give = {0, 1, 0};
+    CHECK(semop(wait_sets[0], &give, 1) == 0);
+    int after = ncnt;
+    for (int i = 0; i < 100 && after != ncnt - 1; i++) {
+        pause_ms(20);
+        after = waiting_in_sets();
+    }
+    CHECK(after == ncnt - 1);
+    /* The removal wakes all of them. */
+    for (int i = 0; i < WAIT_SETS; i++) CHECK(semctl(wait_sets[i], 0, IPC_RMID) == 0);
+    for (int i = 0; i < made; i++) CHECK(pthread_join(threads[i], NULL) == 0);
+    for (int c = 0; c < CHILDREN; c++) CHECK(wait_ok(pids[c]));
     return 0;
 }
 
@@ -846,6 +1137,11 @@ int main(int argc, char **argv) {
     RUN(sem_processes);
     RUN(shm_basics);
     RUN(shm_processes);
+    RUN(identity);
+    RUN(shm_pages);
+    RUN(pool_waits);
+    RUN(shm_fork);
+    RUN(many_waits);
     RUN(named_semaphores);
     RUN(limits);
     RUN(longest_steps);

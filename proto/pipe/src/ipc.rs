@@ -22,9 +22,12 @@
 //!
 //! The words of each operation are in the table of [op]. A failure of an
 //! operation answers the code `ERRNO + errno` (Linux's numbers, relibc's).
-//! Credentials, the clock and the process number come with the request,
-//! since the service asks no other service for them: the layer takes them
-//! from the process.
+//! The service learns who a caller is from the process service: a session
+//! brings a copy of the identity session of its process (`posix-id`, as for
+//! the clock and the file service) as the first handle of a request, and
+//! the service has it vouched (Vouch) and remembers the answer with the
+//! generation of the credentials. Only the time, in seconds, comes in the
+//! words. A session without a copy gets NEED_ID.
 //!
 //! A message queue of POSIX is opened for a descriptor, a description of
 //! the service of the third kind (`SOCK_END | slot`): fork, exec, dup,
@@ -50,8 +53,8 @@ pub const TEXT_MAX: usize = 512;
 pub const NAME_MAX: usize = 47;
 
 /// The operations. Words of the request (`w0` ...) and of the answer
-/// (`=>`); `cred` is the caller's euid, egid, process number and time in
-/// seconds, four words.
+/// (`=>`); `cred` is the time of the caller in
+/// seconds, one word.
 pub mod op {
     /// mq_open: w0 oflag, w1 mode, w2 maxmsg, w3 msgsize (0 for the
     /// defaults), w4 attr given, then cred; bytes the name. => the
@@ -109,7 +112,8 @@ pub mod op {
     /// shmdt: w0 id, cred. => 1 when the segment is gone and its file is
     /// to be removed, w1 its serial.
     pub const SHM_DT: u32 = 26;
-    /// shmctl: w0 id, w1 cmd, cred, then for IPC_SET w uid, gid, mode. =>
+    /// shmctl: w0 id, w1 cmd, cred, then for IPC_SET w uid, gid, mode. Every
+    /// answer ends with a serial whose file is left to remove, or 0. =>
     /// the status, w[0] 1 when the segment is gone and its file is to be
     /// removed, w[1] the serial.
     pub const SHM_CTL: u32 = 27;
@@ -145,7 +149,16 @@ pub mod stat {
     pub const PERM: usize = 7;
 }
 
-/// The caller's credentials and clock that come with a request.
+/// Who the caller is, as the process service vouched for it (Vouch): the
+/// service never takes the credentials from a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Who {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+}
+
+/// The caller as an operation sees it: who, and the time the layer read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cred {
     pub uid: u32,
@@ -155,32 +168,36 @@ pub struct Cred {
 }
 
 impl Cred {
-    pub const WORDS: usize = 4;
+    /// The words of a request that stand for the caller: the time in seconds.
+    pub const WORDS: usize = 1;
 
-    pub fn from_words(w: &[u64]) -> Cred {
+    /// `who` and the time `w` carries.
+    pub fn of(who: Who, w: &[u64]) -> Cred {
         Cred {
-            uid: w[0] as u32,
-            gid: w[1] as u32,
-            pid: w[2] as u32,
-            now: w[3] as i64,
+            uid: who.uid,
+            gid: who.gid,
+            pid: who.pid,
+            now: w[0] as i64,
         }
     }
-
-    pub fn words(self) -> [u64; 4] {
-        [
-            u64::from(self.uid),
-            u64::from(self.gid),
-            u64::from(self.pid),
-            self.now as u64,
-        ]
-    }
 }
+
+/// Bit 31 of the operation on the wire: the request carries the identity
+/// session of the caller's process as its first handle.
+pub const ID_ATTACHED: u32 = 1 << 31;
+
+/// The status of a refusal for a session that has not shown its identity
+/// session yet: the layer sends it with the request again.
+pub const NEED_ID: u32 = ERRNO + 999;
 
 /// An IPC or IPC_TAKE request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Call<'a> {
     pub key: Option<u64>,
     pub op: u32,
+    /// The request carries a copy of the identity session of the caller's
+    /// process as its first handle (bit 31 of the operation on the wire).
+    pub id: bool,
     pub words: [u64; WORDS_MAX],
     pub n: usize,
     pub bytes: &'a [u8],
@@ -193,6 +210,7 @@ impl<'a> Call<'a> {
         Call {
             key: None,
             op,
+            id: false,
             words: all,
             n: words.len(),
             bytes,
@@ -217,7 +235,7 @@ impl<'a> Call<'a> {
                 w.u64(key)?;
             }
         }
-        w.u32(self.op)?;
+        w.u32(self.op | if self.id { ID_ATTACHED } else { 0 })?;
         w.u32(self.n as u32)?;
         for &word in self.words() {
             w.u64(word)?;
@@ -228,6 +246,7 @@ impl<'a> Call<'a> {
     pub fn parse(mut body: Reader<'a>, take: bool) -> Result<Call<'a>, Status> {
         let key = if take { Some(body.u64()?) } else { None };
         let op = body.u32()?;
+        let (op, id) = (op & !ID_ATTACHED, op & ID_ATTACHED != 0);
         let n = body.u32()? as usize;
         if n > WORDS_MAX || key == Some(0) {
             return Err(Status::BadSize);
@@ -242,6 +261,7 @@ impl<'a> Call<'a> {
         Ok(Call {
             key,
             op,
+            id,
             words,
             n,
             bytes,
