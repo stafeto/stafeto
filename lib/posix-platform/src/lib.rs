@@ -297,6 +297,23 @@ pub unsafe extern "C" fn stafeto_clock_gettime(clock: c_int, out: *mut Timespec)
     }
 }
 
+/// The time the process has run, for `clock` (posix_abi::clock::process_time).
+///
+/// # Safety
+/// `out` is writable for a timespec.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_clock_process(out: *mut Timespec) -> c_int {
+    let time = posix_abi::clock::process_time();
+    // SAFETY: the caller's promise.
+    unsafe {
+        out.write(Timespec {
+            tv_sec: time.seconds,
+            tv_nsec: time.nanos,
+        })
+    };
+    0
+}
+
 /// # Safety
 /// `out` is null or writable for a timespec.
 #[unsafe(no_mangle)]

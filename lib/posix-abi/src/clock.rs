@@ -13,6 +13,25 @@ use proto_clock::page;
 use proto_wire::Status;
 use rt::handle::{Channel, Handle};
 
+/// The monotonic instant the process began at (nanoseconds): `process_time`
+/// counts from it.
+static PROCESS_START: AtomicU64 = AtomicU64::new(0);
+
+fn restart_process_time() {
+    PROCESS_START.store(
+        rt::time::ticks_to_ns(rt::time::now()).max(1),
+        Ordering::Release,
+    );
+}
+
+/// The time the process has run, for C `clock`: the kernel accounts no
+/// processor time, so this is the time since the process began (its start,
+/// or the fork that made it), an upper bound of the processor time used.
+pub fn process_time() -> Time {
+    let start = PROCESS_START.load(Ordering::Acquire);
+    Time::from_mono(rt::time::ticks_to_ns(rt::time::now()).saturating_sub(start))
+}
+
 pub const CLOCK_REALTIME: c_int = 0;
 pub const CLOCK_MONOTONIC: c_int = 1;
 struct State(UnsafeCell<Option<Client>>);
@@ -30,6 +49,7 @@ pub unsafe fn init(parent: &Handle<Channel>) -> Result<(), Status> {
         return Err(Status::Kernel(rt::abi::Error::BadState));
     }
     *slot = Some(Client::connect(parent)?);
+    restart_process_time();
     Ok(())
 }
 /// The clock through `session`, a session the program was given (its
@@ -44,6 +64,7 @@ pub unsafe fn init_with(session: Handle<Channel>) -> Result<(), Status> {
         return Err(Status::Kernel(rt::abi::Error::BadState));
     }
     *slot = Some(Client::from_session(session));
+    restart_process_time();
     Ok(())
 }
 
@@ -63,6 +84,8 @@ pub unsafe fn after_fork(
     if let Some(parent) = core::mem::replace(slot, session.map(Client::from_session)) {
         core::mem::forget(parent);
     }
+    // The processor time of a child counts from its fork.
+    restart_process_time();
     let attached = PAGE.swap(false, Ordering::AcqRel);
     if attached && slot.is_some() {
         // SAFETY: the caller's promise; the copy left PAGE_ADDRESS free.

@@ -477,6 +477,12 @@ pub enum Method {
     GetLimit = 55,
     SetLimit = 56,
     GetGroups = 57,
+    /// The timers of the process (`TimerOp`): a body of the operation u32
+    /// and its arguments. Numbers 64 and above name the service's own
+    /// lines in the step log, so the methods stay below them.
+    Timer = 58,
+    /// sigqueue: pid u32, signal u32, value u64.
+    Queue = 59,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -488,7 +494,8 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
+    59,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1007,6 +1014,27 @@ pub struct Page {
     pub info: [PageInfo; 64],
 }
 
+/// The operations of `Method::Timer`, the first u32 of its body. The times
+/// are nanoseconds on the scale of the kernel's `clock_now`; a reply of a
+/// setting is the status, then the time left u64 and the interval u64.
+pub mod timer_op {
+    /// signal u32 (0: none), value u64 -> id u32.
+    pub const CREATE: u32 = 1;
+    /// id u32, armed u32, deadline u64, interval u64 -> the setting before.
+    pub const SET: u32 = 2;
+    /// id u32 -> the setting.
+    pub const GET: u32 = 3;
+    /// id u32.
+    pub const DELETE: u32 = 4;
+    /// id u32 -> the overrun count u32.
+    pub const OVERRUN: u32 = 5;
+    /// armed u32, deadline u64, interval u64 -> the setting before: the
+    /// alarm of the process (it survives exec).
+    pub const ALARM_SET: u32 = 6;
+    /// -> the setting of the alarm.
+    pub const ALARM_GET: u32 = 7;
+}
+
 /// SA_NOCLDWAIT on SIGCHLD.
 pub const PAGE_NOCLDWAIT: u64 = 1;
 /// SA_NOCLDSTOP on SIGCHLD.
@@ -1015,19 +1043,27 @@ pub const PAGE_NOCLDSTOP: u64 = 2;
 pub const PAGE_CHLD_IGNORED: u64 = 4;
 
 /// The information of a signal sent to a process (siginfo_t): its code,
-/// the sender's PID and real UID, and for SIGCHLD the child's status.
+/// the sender's PID and real UID, for SIGCHLD the child's status, and for
+/// sigqueue and a timer (SI_QUEUE, SI_TIMER) the value (the bytes of the
+/// C union sigval).
 #[repr(C)]
 pub struct PageInfo {
     pub code: AtomicI32,
     pub pid: AtomicU32,
     pub uid: AtomicU32,
     pub status: AtomicI32,
+    pub value: AtomicU64,
 }
 
 const _: () = assert!(core::mem::size_of::<Page>() <= 4096);
 
 /// si_code of a signal kill sent, and of SIGCHLD.
 pub const SI_USER: i32 = 0;
+/// The code of a signal sigqueue sent (SI_QUEUE of relibc's signal.h).
+pub const SI_QUEUE: i32 = -1;
+/// The code of a signal a timer sent (SI_TIMER of relibc's signal.h on
+/// stafeto: Linux's -2, apart from the codes of SIGCHLD).
+pub const SI_TIMER: i32 = -2;
 /// The code of a signal of the terminal (INTR, QUIT, SUSP): Linux's SI_KERNEL.
 pub const SI_KERNEL: i32 = 0x80;
 pub const CLD_EXITED: i32 = 1;
@@ -1182,6 +1218,7 @@ pub const SIGBUS: u8 = 7;
 pub const SIGFPE: u8 = 8;
 pub const SIGKILL: u8 = 9;
 pub const SIGUSR1: u8 = 10;
+pub const SIGALRM: u8 = 14;
 pub const SIGSEGV: u8 = 11;
 pub const SIGTERM: u8 = 15;
 pub const SIGCHLD: u8 = 17;
@@ -1371,6 +1408,8 @@ mod tests {
             Method::GetLimit,
             Method::SetLimit,
             Method::GetGroups,
+            Method::Timer,
+            Method::Queue,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {

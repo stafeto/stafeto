@@ -518,8 +518,11 @@ basic/signal/sigismember
 basic/signal/signal
 basic/signal/sigpending
 basic/signal/sigprocmask
+basic/signal/sigqueue
 basic/signal/sigsuspend
+basic/signal/sigtimedwait
 basic/signal/sigwait
+basic/signal/sigwaitinfo
 basic/signal/str2sig
 basic/spawn/posix_spawn
 basic/spawn/posix_spawn_file_actions_addchdir
@@ -816,6 +819,7 @@ basic/threads/tss_delete
 basic/threads/tss_get
 basic/threads/tss_set
 basic/time/asctime
+basic/time/clock
 basic/time/clock_getres
 basic/time/clock_gettime
 basic/time/clock_nanosleep
@@ -832,6 +836,11 @@ basic/time/strftime
 basic/time/strftime_l
 basic/time/strptime
 basic/time/time
+basic/time/timer_create
+basic/time/timer_delete
+basic/time/timer_getoverrun
+basic/time/timer_gettime
+basic/time/timer_settime
 basic/time/timespec_get
 basic/time/tzset
 basic/uchar/c16rtomb
@@ -841,6 +850,7 @@ basic/uchar/mbrtoc32
 basic/unistd/_Fork
 basic/unistd/_exit
 basic/unistd/access
+basic/unistd/alarm
 basic/unistd/chdir
 basic/unistd/chown
 basic/unistd/close

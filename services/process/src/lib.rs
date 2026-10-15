@@ -5,7 +5,8 @@
 //! the table of its records (`records`), the queue of the spawns that
 //! wait (`queue`), the waits that wait (`waits`) and the rules of
 //! signals (`signals`), the steps of the walks over the records
-//! (`walk`), and the controlling terminals of the sessions (`terminals`). The program creates the
+//! (`walk`), the controlling terminals of the sessions (`terminals`) and the timers
+//! of the processes (`timers`). The program creates the
 //! processes and keeps their handles; everything here builds for the host
 //! too, where `cargo test -p posix-process-service` exercises it.
 
@@ -18,5 +19,6 @@ pub mod queue;
 pub mod records;
 pub mod signals;
 pub mod terminals;
+pub mod timers;
 pub mod waits;
 pub mod walk;

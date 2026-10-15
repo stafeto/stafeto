@@ -209,7 +209,14 @@ pub unsafe extern "C" fn stafeto_sigtimedwait(
             info.cast::<c_int>().add(2).write(code);
             info.cast::<c_int>().add(4).write(taken.si_pid);
             info.cast::<u32>().add(5).write(taken.si_uid);
-            info.cast::<c_int>().add(6).write(taken.si_status);
+            // Linux keeps SIGCHLD's status, a queued signal's value
+            // and a timer's value at the same place.
+            if taken.si_code == proto_process::SI_QUEUE || taken.si_code == proto_process::SI_TIMER
+            {
+                info.add(24).cast::<u64>().write_unaligned(taken.si_value);
+            } else {
+                info.cast::<c_int>().add(6).write(taken.si_status);
+            }
         }
     }
     status as c_int
@@ -231,6 +238,13 @@ pub extern "C" fn stafeto_kill(pid: c_int, signal: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_killpg(pgrp: c_int, signal: c_int) -> c_int {
     value(call(|| posix_abi::process::killpg(pgrp, signal)).map(|()| 0)) as c_int
+}
+
+/// sigqueue through the process service: `value` is the bytes of the C
+/// union sigval (a pointer or an int, as the caller stored it).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_sigqueue(pid: c_int, signal: c_int, sigval: u64) -> c_int {
+    value(call(|| posix_abi::process::sigqueue(pid, signal, sigval)).map(|()| 0)) as c_int
 }
 
 /// setpgid of `pid` to `pgid` through the process service.
@@ -336,4 +350,138 @@ pub extern "C" fn stafeto_probe_route_newborn(id: u64, signal: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_probe_local_claim(hook: Option<extern "C" fn(c_int)>) {
     posix_abi::signals::probe_local_claim_window(hook);
+}
+
+/// relibc's `struct itimerspec`: the interval first.
+#[repr(C)]
+pub struct LinuxItimerspec {
+    interval: Timespec,
+    value: Timespec,
+}
+const _: () = assert!(core::mem::size_of::<LinuxItimerspec>() == 32);
+
+fn spec(spec: &LinuxItimerspec) -> posix_abi::timers::Spec {
+    posix_abi::timers::Spec {
+        interval: spec.interval,
+        value: spec.value,
+    }
+}
+
+fn linux_spec(spec: posix_abi::timers::Spec) -> LinuxItimerspec {
+    LinuxItimerspec {
+        interval: spec.interval,
+        value: spec.value,
+    }
+}
+
+/// timer_create through the process service: `notify` is SIGEV_SIGNAL (0)
+/// or SIGEV_NONE (1) of relibc's signal.h, `sigval` the bytes of the
+/// event's value; the timer_t goes to `out`. 0 or the negated errno.
+///
+/// # Safety
+/// `out` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_timer_create(
+    clock: c_int,
+    notify: c_int,
+    signal: c_int,
+    sigval: u64,
+    out: *mut usize,
+) -> c_int {
+    // Bit 8 of the type (relibc's default event): the value is the timer's number.
+    let own_id = notify & 0x100 != 0;
+    let signal = match notify & 0xFF {
+        posix_abi::timers::SIGEV_SIGNAL if signal != 0 => signal,
+        posix_abi::timers::SIGEV_NONE => 0,
+        _ => return -EINVAL,
+    };
+    match call(|| posix_abi::timers::create(clock, signal, sigval, own_id)) {
+        Ok(timer) => {
+            // SAFETY: the caller's promise.
+            unsafe { out.write(timer) };
+            0
+        }
+        Err(errno) => -errno,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_timer_delete(timer: usize) -> c_int {
+    value(call(|| posix_abi::timers::delete(timer)).map(|()| 0)) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_timer_getoverrun(timer: usize) -> c_int {
+    value(call(|| posix_abi::timers::overrun(timer).map(i64::from))) as c_int
+}
+
+/// # Safety
+/// `out` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_timer_gettime(timer: usize, out: *mut LinuxItimerspec) -> c_int {
+    match call(|| posix_abi::timers::gettime(timer)) {
+        Ok(setting) => {
+            // SAFETY: the caller's promise.
+            unsafe { out.write(linux_spec(setting)) };
+            0
+        }
+        Err(errno) => -errno,
+    }
+}
+
+/// # Safety
+/// `new` is readable, `old` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_timer_settime(
+    timer: usize,
+    flags: c_int,
+    new: *const LinuxItimerspec,
+    old: *mut LinuxItimerspec,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let new = spec(unsafe { &*new });
+    match call(|| posix_abi::timers::settime(timer, flags, new)) {
+        Ok(before) => {
+            if !old.is_null() {
+                // SAFETY: the caller's promise.
+                unsafe { old.write(linux_spec(before)) };
+            }
+            0
+        }
+        Err(errno) => -errno,
+    }
+}
+
+/// The alarm of the process (ITIMER_REAL): arms it `value_ns` nanoseconds
+/// from now and then every `interval_ns` when `set` (a value 0 disarms it),
+/// reads it otherwise; the setting before goes to `out`, the time left and
+/// the interval in nanoseconds. 0 or the negated errno.
+///
+/// # Safety
+/// `out` is writable for two words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_alarm(
+    set: c_int,
+    value_ns: u64,
+    interval_ns: u64,
+    out: *mut u64,
+) -> c_int {
+    let result = call(|| {
+        if set != 0 {
+            posix_abi::timers::set_alarm(value_ns, interval_ns)
+        } else {
+            posix_abi::timers::get_alarm()
+        }
+    });
+    match result {
+        Ok(setting) => {
+            // SAFETY: the caller's promise.
+            unsafe {
+                out.write(setting[0]);
+                out.add(1).write(setting[1]);
+            }
+            0
+        }
+        Err(errno) => -errno,
+    }
 }

@@ -139,7 +139,11 @@ pub(crate) fn publish_initial() {
 /// The short lock orders table -> INFO; INFO is released before actions,
 /// routing, entry requests and RPC, so no opposite nesting is possible.
 static INFO_LOCK: LayerLock = LayerLock::raising();
+/// The top bit of the PID in `Taken::from`: the signal carries a value.
+const VALUED: u32 = 1 << 31;
 struct Taken {
+    /// The code and the status; for a signal that carries a value
+    /// (sigqueue, a timer: `VALUED` in `from`) the bytes of sigval.
     code_status: AtomicU64,
     from: AtomicU64,
 }
@@ -345,7 +349,7 @@ fn page_info(signal: i32) -> Option<(u64, SigInfo)> {
             si_uid: slot.uid.load(Ordering::Acquire),
             si_status: slot.status.load(Ordering::Acquire),
             si_addr: 0,
-            si_value: 0,
+            si_value: slot.value.load(Ordering::Acquire),
         };
         if page_word(signal).load(Ordering::Acquire) == before {
             let ticket = proto_process::job::class(signal as u8).map_or(0, |c| before & !c.low);
@@ -357,12 +361,21 @@ fn page_info(signal: i32) -> Option<(u64, SigInfo)> {
 /// Keep the claimed sender before publishing its thread bit, under INFO_LOCK.
 fn keep_taken(block: &Block, signal: i32, info: &SigInfo) {
     let slot = &taken_row(block)[signal as usize - 1];
-    slot.code_status.store(
-        u64::from(info.si_code as u32) | u64::from(info.si_status as u32) << 32,
-        Ordering::Relaxed,
-    );
+    // A signal with a value has no status: the word holds the value, and
+    // the top bit of the PID (PIDs stay below 2^31) says so. A timer has no
+    // sender, so its PID 0 tells it from sigqueue.
+    let valued = info.si_code == proto_process::SI_QUEUE || info.si_code == proto_process::SI_TIMER;
+    let (word, mark) = if valued {
+        (info.si_value, u64::from(VALUED))
+    } else {
+        (
+            u64::from(info.si_code as u32) | u64::from(info.si_status as u32) << 32,
+            0,
+        )
+    };
+    slot.code_status.store(word, Ordering::Relaxed);
     slot.from.store(
-        u64::from(info.si_pid as u32) | u64::from(info.si_uid) << 32,
+        u64::from(info.si_pid as u32 & !VALUED) | mark | u64::from(info.si_uid) << 32,
         Ordering::Release,
     );
 }
@@ -372,15 +385,27 @@ fn taken(block: &Block, signal: i32) -> SigInfo {
     let slot = &taken_row(block)[signal as usize - 1];
     let from = slot.from.load(Ordering::Acquire);
     let code_status = slot.code_status.load(Ordering::Relaxed);
+    let pid = from as u32 & !VALUED;
+    let valued = from as u32 & VALUED != 0;
     SigInfo {
         si_signo: signal,
         si_errno: 0,
-        si_code: code_status as u32 as i32,
-        si_pid: from as u32 as i32,
+        si_code: if !valued {
+            code_status as u32 as i32
+        } else if pid == 0 {
+            proto_process::SI_TIMER
+        } else {
+            proto_process::SI_QUEUE
+        },
+        si_pid: pid as i32,
         si_uid: (from >> 32) as u32,
-        si_status: (code_status >> 32) as u32 as i32,
+        si_status: if valued {
+            0
+        } else {
+            (code_status >> 32) as u32 as i32
+        },
         si_addr: 0,
-        si_value: 0,
+        si_value: if valued { code_status } else { 0 },
     }
 }
 
@@ -1941,7 +1966,13 @@ impl LinuxSigInfo {
             pad: 0,
             pid: info.si_pid,
             uid: info.si_uid,
-            value: info.si_status as u32 as u64,
+            value: if info.si_code == proto_process::SI_QUEUE
+                || info.si_code == proto_process::SI_TIMER
+            {
+                info.si_value
+            } else {
+                info.si_status as u32 as u64
+            },
             rest: [0; 96],
         }
     }

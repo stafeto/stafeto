@@ -2786,7 +2786,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: monotonic ",
         "relibc-hello: directories, stat, descriptors, mmap, math",
         "relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec",
-        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 11 options claimed, timers -1",
+        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 11 options claimed, timers 202405",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
         "Assertion `how == NULL` failed.",
@@ -3893,6 +3893,10 @@ fn posix_procs_verdict(outcome: &qemu::Outcome) -> Result<(), String> {
         outcome,
         "posix-procs: faults: sigaltstack, SA_ONSTACK, classes of faults, nesting ok",
     )?;
+    qemu::expect_marker(
+        outcome,
+        "posix-procs: timers: sigqueue, timers, alarm, itimer, clock ok",
+    )?;
     qemu::expect_marker(outcome, "posix-procs: ok")?;
     qemu::expect_marker(outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(outcome, "posix-procs: orphan saw ppid 1")?;
@@ -4227,7 +4231,7 @@ const PIPE_STEP_KINDS: [(usize, &str); 15] = [
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
-const STEP_KINDS: [(usize, &str); 20] = [
+const STEP_KINDS: [(usize, &str); 23] = [
     (1, "Create"),
     (13, "Kill"),
     (21, "Vouch"),
@@ -4235,6 +4239,8 @@ const STEP_KINDS: [(usize, &str); 20] = [
     (55, "GetLimit"),
     (56, "SetLimit"),
     (57, "GetGroups"),
+    (58, "Timer"),
+    (59, "Queue"),
     (22, "SpawnStart"),
     (23, "Boot"),
     (24, "Take"),
@@ -4247,6 +4253,7 @@ const STEP_KINDS: [(usize, &str); 20] = [
     (36, "ForkAbort"),
     (10, "WaitStart"),
     (64, "notification"),
+    (65, "expiry of timers"),
     (66, "session gone"),
 ];
 
@@ -4665,6 +4672,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         &outcome,
         "posix-procs: resource and descriptor exec steps ok",
     )?;
+    qemu::expect_marker(&outcome, "posix-procs: timer steps ok")?;
     check_process_memory_reserve(&outcome.lines)?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
@@ -4703,7 +4711,9 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // The resource and descriptor-exec exercise runs while the crowd is live.
     // Every newly introduced dispatch is measured, with the part's 10% reserve.
     for (service, measured, kinds) in [
-        ("process", &rows, &[55usize, 56, 57][..]),
+        // 58 Timer, 59 Queue and 65, the expiry of timers (a notice the
+        // service counts apart).
+        ("process", &rows, &[55usize, 56, 57, 58, 59, 65][..]),
         ("RAM", &ram, &[3usize, 59][..]),
     ] {
         for kind in kinds {

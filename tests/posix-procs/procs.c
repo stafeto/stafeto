@@ -1239,6 +1239,8 @@ static int steps_resources(void) {
 #include "stepfifo.inc"
 #endif
 
+static int steps_timers(void);
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
@@ -1281,6 +1283,13 @@ static int steps_run(void) {
             printf("posix-procs: steps: branch %d gave %d (%s)\n", b, e, strerror(e));
             return 3;
         }
+    }
+    int timer_steps = steps_timers();
+    if (timer_steps) {
+        printf("posix-procs: steps: timers failed %d errno %d\n", timer_steps, errno);
+        return 9;
+    } else {
+        puts("posix-procs: timer steps ok");
     }
     /* The probe's own children, up to the 31 it may keep beside the one
      * that comes and goes (the service allows 32 to a process). */
@@ -2409,6 +2418,7 @@ static int setid_spawn(void) {
 }
 
 #include "faults.c"
+#include "timers.c"
 
 static int role(const char *name) {
 #if PENDING_OPEN_PROBE
@@ -2420,6 +2430,11 @@ static int role(const char *name) {
     if (strcmp(name, "jobexec-process") == 0) return job_after_exec(1);
 #endif
     if (strcmp(name, "faults") == 0) return faults_role();
+#if !CHANGE_STEPS
+    if (strcmp(name, "timers") == 0) return timers_role();
+    if (strcmp(name, "timers-exec") == 0) return timers_exec_role();
+#endif
+    if (strcmp(name, "steptimer") == 0) return steptimer_role();
     if (strcmp(name, "loaderchannels") == 0) return loader_channels();
     if (strncmp(name, "channels_", 9) == 0) return channel_child(name);
     if (strcmp(name, "steps") == 0) return steps_run();
@@ -4631,6 +4646,10 @@ int main(int argc, char **argv) {
     wave();
     printf("posix-procs: stage faults\n");
     run_role("/bin/procs-child", "faults", NULL);
+#if !CHANGE_STEPS
+    printf("posix-procs: stage timers\n");
+    run_role("/bin/procs-child", "timers", NULL);
+#endif
 #if NAMES_PROBE
     printf("posix-procs: stage names\n");
     names();
