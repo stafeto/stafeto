@@ -605,6 +605,20 @@ static void review(void) {
         if (other >= 0) close(other);
         unlink("/tmp/posix-map-other");
     }
+    /* The last munmap ends the object: the next mapping is the file's pages,
+     * not the object the service kept. */
+    {
+        char *a = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        check("detach: mmap", a != MAP_FAILED);
+        if (a != MAP_FAILED) {
+            a[9] = 'A';
+            munmap(a, PAGE);
+            check("detach: pwrite behind the ended object", pwrite(fd, "B", 1, 9) == 1);
+            char *b = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, fd, 0);
+            check("detach: the new mapping shows the file", b != MAP_FAILED && b[9] == 'B');
+            if (b != MAP_FAILED) munmap(b, PAGE);
+        }
+    }
     close(fd);
     /* The mode of the descriptor. */
     fd = open(scratch, O_RDONLY);

@@ -1089,8 +1089,11 @@ impl Processes {
         // A Put needs none: the caller reserved the entry as a writer. The
         // other two use up the grant.
         let granted = self.shares.granted(index, key);
-        let Some(write) = granted.or((operation == proto_process::SHARE_PUT).then_some(true))
-        else {
+        let needs_grant = matches!(
+            operation,
+            proto_process::SHARE_GET | proto_process::SHARE_ATTACH
+        );
+        let Some(write) = granted.or((!needs_grant).then_some(true)) else {
             return refuse(proto_process::PERMISSION);
         };
         match operation {
