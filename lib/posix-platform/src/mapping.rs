@@ -231,7 +231,7 @@ fn file_mapping(
             (kept, true)
         }
     };
-    let result = shared_file(addr, len, prot, flags, kept, offset, key, writing);
+    let result = shared_file(addr, len, prot, flags, fd, kept, offset, key, writing);
     if result.is_err() && new {
         super::stafeto_close(kept);
     }
@@ -267,6 +267,7 @@ fn shared_file(
     len: usize,
     prot: c_int,
     flags: c_int,
+    fd: c_int,
     kept: c_int,
     offset: u64,
     key: u64,
@@ -284,8 +285,14 @@ fn shared_file(
     };
     // Ask the rendezvous; a process that makes the object meanwhile is
     // waited for.
+    // The file service vouches first that this process has the file open;
+    // without that the object is this mapping's alone.
+    let granted = posix_abi::shares::grant(fd).is_ok();
     let mut asks = 0;
     let got = loop {
+        if !granted {
+            break None;
+        }
         match posix_abi::shares::get(key) {
             Ok(Got::Busy) if asks < 2000 => {
                 asks += 1;
@@ -302,11 +309,21 @@ fn shared_file(
         }
         // An object too short for the mapping (the file grew) is not used:
         // this mapping makes its own, apart from the others.
-        Some(Got::Found(..)) | Some(Got::Full) | Some(Got::Busy) | None => {
-            mmap::mmap(addr, len, prot | PROT_WRITE, flags, Some(source(None, false)))?
-        }
+        Some(Got::Found(..)) | Some(Got::Full) | Some(Got::Busy) | None => mmap::mmap(
+            addr,
+            len,
+            prot | PROT_WRITE,
+            flags,
+            Some(source(None, false)),
+        )?,
         Some(Got::Reserved) => {
-            match mmap::mmap(addr, len, prot | PROT_WRITE, flags, Some(source(None, true))) {
+            match mmap::mmap(
+                addr,
+                len,
+                prot | PROT_WRITE,
+                flags,
+                Some(source(None, true)),
+            ) {
                 Ok(address) => address,
                 Err(errno) => {
                     posix_abi::shares::detach(key);

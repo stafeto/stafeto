@@ -232,6 +232,13 @@ fn mmap0(
         },
         None => Source::anonymous(),
     };
+    // An object that is there already is mapped as asked at once; a new one
+    // is written first (zeros, or the file) and gets its access after.
+    let first = if source.existing.is_some() {
+        access
+    } else {
+        Access::ReadWrite
+    };
     heap(|state| {
         state.within_data(pages)?;
         let result = if fixed {
@@ -248,12 +255,12 @@ fn mmap0(
                 })
             } else {
                 state
-                    .make_own(Some(addr), pages, Access::ReadWrite, shared, source)
+                    .make_own(Some(addr), pages, first, shared, source)
                     .map(|(_, at)| at)
             }
         } else if shared || pages >= OWN_FROM {
             state
-                .make_own(None, pages, Access::ReadWrite, shared, source)
+                .make_own(None, pages, first, shared, source)
                 .map(|(_, at)| at)
         } else {
             let at = state.take(pages)?;
@@ -261,7 +268,7 @@ fn mmap0(
             unsafe { core::ptr::write_bytes(at as *mut u8, 0, pages * PAGE) };
             Ok(at)
         }?;
-        if access != Access::ReadWrite
+        if access != first
             && let Err(error) = state.protect(result, pages, access)
         {
             release(state, result, pages)?;
@@ -275,7 +282,7 @@ fn mmap0(
 /// it inherited, so that they live as long as it maps them.
 pub(crate) fn attach_shared() {
     use rt::handle::{Handle, Memory};
-    let mut found: [Option<(u64, usize, Handle<Memory>)>; posix_map::MAX_OBJECTS] =
+    let mut found: [Option<(u64, usize, Handle<Memory>, i32)>; posix_map::MAX_OBJECTS] =
         [const { None }; posix_map::MAX_OBJECTS];
     heap(|state| {
         let mut n = 0;
@@ -290,20 +297,20 @@ pub(crate) fn attach_shared() {
                 .max()
                 .unwrap_or(0);
             let held = Handle::<Memory>::borrowed(object.handle.raw());
-            if let Ok(copy) = rt::sys::handle_duplicate(
-                &*held,
-                rt::abi::Rights::MAP_READ
-                    | rt::abi::Rights::MAP_WRITE
-                    | rt::abi::Rights::DUPLICATE
-                    | rt::abi::Rights::TRANSFER,
-            ) {
-                found[n] = Some((back.key, pages, copy));
+            let rights =
+                rt::abi::Rights::MAP_READ | rt::abi::Rights::DUPLICATE | rt::abi::Rights::TRANSFER;
+            if let Ok(copy) = rt::sys::handle_duplicate(&*held, rights | rt::abi::Rights::MAP_WRITE)
+                .or_else(|_| rt::sys::handle_duplicate(&*held, rights))
+            {
+                found[n] = Some((back.key, pages, copy, back.fd));
                 n += 1;
             }
         }
     });
-    for (key, pages, copy) in found.iter().flatten() {
-        let _ = crate::shares::attach(*key, *pages, copy);
+    for (key, pages, copy, fd) in found.iter().flatten() {
+        if crate::shares::grant(*fd).is_ok() {
+            let _ = crate::shares::attach(*key, *pages, copy);
+        }
     }
 }
 

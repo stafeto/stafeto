@@ -854,6 +854,9 @@ impl Processes {
         if method == Method::SetId as u16 {
             return self.set_id(r);
         }
+        if method == Method::ShareGrant as u16 {
+            return self.share_grant(r);
+        }
         let terminal = [
             Method::TtySignal,
             Method::SetCtty,
@@ -1080,14 +1083,20 @@ impl Processes {
         else {
             return Answer::Status(Status::BadSize);
         };
+        // The file service vouched that the caller has the file open (a
+        // ShareGrant); without it nothing of the file's memory is the
+        // caller's. A caller that may not write gets no right to write.
+        let Some(write) = self.shares.granted(index, key) else {
+            return refuse(proto_process::PERMISSION);
+        };
         match operation {
             proto_process::SHARE_GET if r.handles.is_empty() => {
-                let (kind, found) = match self.shares.get(key, index) {
+                let (kind, found) = match self.shares.get(key, index, write) {
                     Got::Found(pages, memory) => {
-                        let rights = Rights::MAP_READ
-                            | Rights::MAP_WRITE
-                            | Rights::DUPLICATE
-                            | Rights::TRANSFER;
+                        let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+                        if write {
+                            rights = rights | Rights::MAP_WRITE;
+                        }
                         match sys::handle_duplicate(memory, rights) {
                             Ok(copy) => (proto_process::SHARED_FOUND, Some((pages, copy))),
                             Err(e) => return kernel(e),
@@ -1119,7 +1128,7 @@ impl Processes {
                     return refuse(proto_process::PERMISSION);
                 };
                 if operation == proto_process::SHARE_PUT {
-                    if self.shares.put(key, index, pages, memory).is_err() {
+                    if !write || self.shares.put(key, index, pages, memory).is_err() {
                         return refuse(proto_process::PERMISSION);
                     }
                 } else {
@@ -2898,6 +2907,25 @@ impl Processes {
             return refuse(proto_process::NO_PROCESS);
         };
         self.abort_load(child, Status::from_code(proto_process::AGAIN));
+        Answer::Status(Status::Ok)
+    }
+
+    /// ShareGrant through a notary session with SET_ID (a file service): the
+    /// process `pid` has the file of `key` open, for writing or not.
+    fn share_grant(&mut self, r: &mut Request<'_>) -> Answer {
+        if !proto_process::may_set_id(r.label()) || !r.handles.is_empty() {
+            return refuse(proto_process::PERMISSION);
+        }
+        let mut body = r.body();
+        let (Ok(pid), Ok(key), Ok(write), Ok(())) =
+            (body.u32(), body.u64(), body.u32(), body.finish())
+        else {
+            return Answer::Status(Status::BadSize);
+        };
+        let Some(record) = self.records.find_pid(pid) else {
+            return refuse(proto_process::NO_PROCESS);
+        };
+        self.shares.grant(record, key, write != 0);
         Answer::Status(Status::Ok)
     }
 

@@ -29,7 +29,7 @@ pub enum Got {
 
 /// The key of a file: the device and the inode, never 0.
 pub fn key_of(device: u64, inode: u64) -> u64 {
-    ((device << 32) | (inode & 0xffff_ffff)) | 1 << 63
+    proto_process::share_key(device, inode)
 }
 
 fn request(operation: u32, key: u64, pages: u32) -> Result<Writer, i32> {
@@ -76,6 +76,24 @@ fn status_errno(status: u32) -> i32 {
     }
 }
 
+/// The file service vouches to the process service that this process has
+/// the file of `fd` open (ShareGrant): it comes before Get, Put and Attach.
+pub fn grant(fd: i32) -> Result<(), i32> {
+    let number = u32::try_from(fd).map_err(|_| EBADF)?;
+    crate::shared::held(number, |transport, target| {
+        let posix_fs::Target::Ram(ram) = target else {
+            return Err(ENODEV);
+        };
+        transport.files().share_grant(ram.fd()).map_err(|status| {
+            if status.code() == proto_fs::ACCESS_DENIED {
+                EACCES
+            } else {
+                EIO
+            }
+        })
+    })
+}
+
 /// The object of `key`, or the right to make it.
 pub fn get(key: u64) -> Result<Got, i32> {
     let w = request(proto_process::SHARE_GET, key, 0)?;
@@ -102,11 +120,10 @@ pub fn get(key: u64) -> Result<Got, i32> {
 
 fn hand_over(operation: u32, key: u64, pages: usize, memory: &Handle<Memory>) -> Result<(), i32> {
     let w = request(operation, key, u32::try_from(pages).map_err(|_| EINVAL)?)?;
-    let copy = rt::sys::handle_duplicate(
-        memory,
-        Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE | Rights::TRANSFER,
-    )
-    .map_err(|_| ENOMEM)?;
+    let rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+    let copy = rt::sys::handle_duplicate(memory, rights | Rights::MAP_WRITE)
+        .or_else(|_| rt::sys::handle_duplicate(memory, rights))
+        .map_err(|_| ENOMEM)?;
     let reply = exchange(&w, Some([copy.erase()].into()))?;
     let mut buffer = [0; MESSAGE_MAX];
     match Reader::new(reply.bytes(&mut buffer)).u32() {

@@ -988,6 +988,23 @@ pub extern "C" fn stafeto_probe_threads() -> c_int {
     posix_abi::fork::probe_threads() as c_int
 }
 
+/// The key of the shared memory of the file with this device and inode, for
+/// the probes of the process service's rendezvous.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_key(device: u64, inode: u64) -> u64 {
+    posix_abi::shares::key_of(device, inode)
+}
+
+/// A Get of the rendezvous for `key` with no vouching of a file service
+/// first: 0 when it answered, else the errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_share_get(key: u64) -> c_int {
+    match posix_abi::shares::get(key) {
+        Ok(_) => 0,
+        Err(errno) => errno,
+    }
+}
+
 /// The shared objects the layer's map holds (posix_abi::fork::probe_shared_objects).
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_probe_shared_objects() -> u64 {

@@ -4835,10 +4835,10 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // The resource and descriptor-exec exercise runs while the crowd is live.
     // Every newly introduced dispatch is measured, with the part's 10% reserve.
     for (service, measured, kinds) in [
-        // 58 Timer, 59 Queue, 60 Share and 65, the expiry of timers (a
-        // notice the service counts apart).
-        ("process", &rows, &[55usize, 56, 57, 58, 59, 60, 65][..]),
-        ("RAM", &ram, &[3usize, 59][..]),
+        // 58 Timer, 59 Queue, 60 Share, 61 ShareGrant and 65, the expiry of
+        // timers (a notice the service counts apart).
+        ("process", &rows, &[55usize, 56, 57, 58, 59, 60, 61, 65][..]),
+        ("RAM", &ram, &[3usize, 59, 62][..]),
     ] {
         for kind in kinds {
             let ticks = measured.iter().find(|(k, ..)| k == kind).map_or(0, |r| r.1);

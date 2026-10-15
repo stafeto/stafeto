@@ -489,6 +489,15 @@ pub enum Method {
     /// the object answers with a copy of it. The reply to Get: status, the
     /// kind u32 (`SHARED_FOUND` ...) and the pages u32.
     Share = 60,
+    /// Through a notary session of a file service (SET_ID): the process
+    /// `pid` may map the shared memory of the file `key` (`share_key`), for
+    /// writing when `write` is 1. Body pid u32, key u64, write u32.
+    ShareGrant = 61,
+}
+
+/// The key of the shared memory of a file: its device and inode, never 0.
+pub const fn share_key(device: u64, inode: u64) -> u64 {
+    ((device << 32) | (inode & 0xffff_ffff)) | 1 << 63
 }
 
 /// Share: the object of a key, or the right to make it (Get).
@@ -520,7 +529,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
     31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
-    59, 60,
+    59, 60, 61,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1436,6 +1445,7 @@ mod tests {
             Method::Timer,
             Method::Queue,
             Method::Share,
+            Method::ShareGrant,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {

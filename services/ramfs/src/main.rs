@@ -48,8 +48,8 @@ const BASE_METHODS: &[u16] = proto_fs::METHODS;
 const BASE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc, 0xfffd,
-    0xfffe,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc,
+    0xfffd, 0xfffe,
 ];
 #[cfg(not(any(
     feature = "steps",
@@ -1238,6 +1238,28 @@ impl Fs {
         let mut w = proto_wire::Writer::new();
         if proto_process::Method::SetId.header().write(&mut w).is_err()
             || set.write(&mut w).is_err()
+        {
+            return false;
+        }
+        let Some(notary) = self.notary() else {
+            return false;
+        };
+        sys::send(notary, w.as_bytes()).is_ok_and(|reply| {
+            reply.len == proto_wire::HEADER_LEN && reply.words[0] == 0 && reply.handles.is_empty()
+        })
+    }
+
+    /// ShareGrant through the notary session: the process service keeps
+    /// that the process `pid` has the file open, for writing when `write`.
+    fn tell_share_grant(&mut self, pid: u32, device: u64, inode: u64, write: bool) -> bool {
+        let mut w = proto_wire::Writer::new();
+        if proto_process::Method::ShareGrant
+            .header()
+            .write(&mut w)
+            .is_err()
+            || w.u32(pid).is_err()
+            || w.u64(proto_process::share_key(device, inode)).is_err()
+            || w.u32(u32::from(write)).is_err()
         {
             return false;
         }
@@ -2555,6 +2577,39 @@ impl Service<0> for Fs {
                     return Answer::Status(Status::BadSize);
                 }
                 Answer::Reply(Outgoing::new())
+            }
+            Some(Method::ShareGrant) => {
+                let Ok(fd) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() || !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let flags = match self.ram.capture_description(&s.data, fd) {
+                    Ok((_, flags)) => flags,
+                    Err(code) => return status(code),
+                };
+                let info = match self.ram.descriptor_information(&s.data, fd) {
+                    Ok(info) => info,
+                    Err(code) => return status(code),
+                };
+                // Only a regular file has shared memory, and a description
+                // open for writing alone gives no right to read it.
+                if info.kind != 2 {
+                    return status(proto_fs::INVALID_ARGUMENT);
+                }
+                let mode = flags & 3;
+                if mode == 1 {
+                    return status(proto_fs::ACCESS_DENIED);
+                }
+                let write = mode == 2 && flags & proto_fs::APPEND == 0;
+                let Some(pid) = s.data.binding.snapshot_ref().map(|who| who.pid) else {
+                    return status(proto_fs::PERMISSION);
+                };
+                if !self.tell_share_grant(pid, info.device, info.inode, write) {
+                    return status(proto_fs::PERMISSION);
+                }
+                Answer::Status(Status::Ok)
             }
             Some(Method::CloseEvent) => {
                 if !r.handles.is_empty() {

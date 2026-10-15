@@ -653,7 +653,59 @@ static void review(void) {
     unlink(scratch);
 }
 
+unsigned long long stafeto_probe_share_key(unsigned long long device, unsigned long long inode);
+int stafeto_probe_share_get(unsigned long long key);
+
+/* A process that has not the file open asks the rendezvous for its memory:
+ * refused, whatever it knows of the file's numbers. With the file open for
+ * reading it asks, and gets no right to write. */
+static int intruder(const char *name) {
+    char path[96];
+    snprintf(path, sizeof path, "/dev/shm%s", name);
+    struct stat st;
+    if (stat(path, &st) != 0) return 1;
+    unsigned long long key = stafeto_probe_share_key(st.st_dev, st.st_ino);
+    if (stafeto_probe_share_get(key) == 0) return 2;
+    int fd = shm_open(name, O_RDONLY, 0);
+    if (fd < 0) return 3;
+    char *p = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) return 4;
+    if (p[0] != 7) return 5;
+    errno = 0;
+    if (mprotect(p, PAGE, PROT_READ | PROT_WRITE) == 0) return 6;
+    /* Closed again: the vouching is for this process alone. */
+    munmap(p, PAGE);
+    close(fd);
+    return 0;
+}
+
+static void foreign_processes(void) {
+    const char *name = "/posix-map-guard";
+    shm_unlink(name);
+    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    check("guard: shm_open", fd >= 0 && ftruncate(fd, PAGE) == 0);
+    if (fd < 0) return;
+    char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check("guard: mmap", p != MAP_FAILED);
+    if (p != MAP_FAILED) {
+        p[0] = 7;
+        char *args[] = {"map", "intruder", (char *)name, NULL};
+        pid_t child;
+        int status = 0;
+        int error = posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ);
+        if (!error) waitpid(child, &status, 0);
+        if (!error && WIFEXITED(status) && WEXITSTATUS(status))
+            printf("posix-map: intruder step %d\n", WEXITSTATUS(status));
+        check("guard: no file, no memory; a reader reads only",
+              !error && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        munmap(p, PAGE);
+    }
+    close(fd);
+    shm_unlink(name);
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "intruder") == 0) return intruder(argv[2]);
     if (argc == 3 && strcmp(argv[1], "leave") == 0) return leaver(argv[2]);
     if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
     if (argc == 1) {
@@ -688,6 +740,7 @@ int main(int argc, char **argv) {
     review();
     leaving();
     unrelated_processes();
+    foreign_processes();
     limits();
     if (failures) {
         printf("posix-map: %d failures\n", failures);

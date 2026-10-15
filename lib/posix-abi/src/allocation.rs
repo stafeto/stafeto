@@ -182,13 +182,7 @@ pub unsafe fn adopt(
     let state = unsafe { &mut *HEAP.0.get() };
     state
         .map
-        .push(
-            address,
-            pages,
-            access,
-            0,
-            Object::new(handle, false, None),
-        )
+        .push(address, pages, access, 0, Object::new(handle, false, None))
         .map(drop)
 }
 
@@ -259,27 +253,24 @@ pub unsafe fn after_fork(
     for entry in map {
         let object = match (entry.handle, last) {
             (Some(handle), _) => {
-                let object = state.map.push(
-                    entry.address,
-                    entry.pages,
-                    entry.access,
-                    entry.offset,
-                    {
-                        let inherited = backs
-                            .iter()
-                            .find(|(address, ..)| entry.shared && *address == entry.address);
-                        let mut object = Object::new(
-                            handle,
-                            entry.shared,
-                            inherited.and_then(|(_, back, ..)| *back),
-                        );
-                        if let Some(&(_, _, may_write, dirty)) = inherited {
-                            object.may_write = may_write;
-                            object.dirty = dirty;
-                        }
-                        object
-                    },
-                )?;
+                let object =
+                    state
+                        .map
+                        .push(entry.address, entry.pages, entry.access, entry.offset, {
+                            let inherited = backs
+                                .iter()
+                                .find(|(address, ..)| entry.shared && *address == entry.address);
+                            let mut object = Object::new(
+                                handle,
+                                entry.shared,
+                                inherited.and_then(|(_, back, ..)| *back),
+                            );
+                            if let Some(&(_, _, may_write, dirty)) = inherited {
+                                object.may_write = may_write;
+                                object.dirty = dirty;
+                            }
+                            object
+                        })?;
                 last = Some(object);
                 continue;
             }
@@ -661,18 +652,12 @@ impl State {
         .map_err(|e| self.refused(e))?;
         let index = self
             .map
-            .push(
-                address,
-                pages,
-                first,
-                offset,
-                {
-                    let mut object = Object::new(kept, shared, back);
-                    object.may_write = may_write;
-                    object.dirty = dirty;
-                    object
-                },
-            )
+            .push(address, pages, first, offset, {
+                let mut object = Object::new(kept, shared, back);
+                object.may_write = may_write;
+                object.dirty = dirty;
+                object
+            })
             .map_err(|_| ENOMEM)?;
         self.space.set(address, pages, Page::Own);
         if access == Access::None {
