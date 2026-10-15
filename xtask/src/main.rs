@@ -3792,7 +3792,10 @@ fn posix_map_probe() -> Result<(), String> {
         &outcome,
         "init: posix-procs ended: exit code 0, not restarted",
     )?;
-    for marker in ["posix-map: mprotect, munmap and faults ok"] {
+    for marker in [
+        "posix-map: mprotect, munmap and faults ok",
+        "posix-map: shared memory, files and shm ok",
+    ] {
         qemu::expect_marker(&outcome, marker)?;
     }
     Ok(())

@@ -544,6 +544,11 @@ pub fn probe_abort(pid: &mut i32) -> i32 {
     }
 }
 
+/// How many shared objects the memory map holds, for the probes.
+pub fn probe_shared_objects() -> u64 {
+    crate::allocation::regions(|map| map.objects().filter(|(_, o)| o.shared).count() as u64)
+}
+
 /// The most mappings an object of the memory map has, for the probe that
 /// a child's loader leaves no mapping of the parent's objects behind.
 pub fn probe_mappings() -> u64 {

@@ -65,6 +65,10 @@ pub(crate) struct State {
     /// started by init maps its own segments, every program the clock's
     /// page and its record's. A guess that the kernel's refusals raise.
     hidden: usize,
+    /// The descriptors of files whose last shared mapping went, until the
+    /// caller closes them (`take_closed`).
+    closed: [i32; 16],
+    closed_len: usize,
 }
 
 /// The entries of the kernel's table not in the map, until a refusal says
@@ -79,6 +83,8 @@ static HEAP: Heap = Heap(UnsafeCell::new(State {
     map: Map::new(),
     chunk: 0,
     hidden: HIDDEN,
+    closed: [0; 16],
+    closed_len: 0,
 }));
 static HEAP_LOCK: LayerLock = LayerLock::raising();
 /// Set while a thread is inside the heap's section, for the probes.
@@ -211,6 +217,12 @@ pub unsafe fn after_fork(
     if let Some(parent) = config.replace(Config { process }) {
         core::mem::forget(parent);
     }
+    // The files the parent's shared mappings write to: the child's
+    // descriptors are the parent's numbers.
+    let mut backs = [(0usize, None::<posix_map::Back>); posix_map::MAX_PIECES];
+    for (slot, piece) in backs.iter_mut().zip(state.map.iter()) {
+        *slot = (piece.address, state.map.object(piece.object).back);
+    }
     state.map.forget();
     let mut last = None;
     for entry in map {
@@ -225,7 +237,10 @@ pub unsafe fn after_fork(
                         handle,
                         pages: entry.offset + entry.pages,
                         shared: entry.shared,
-                        back: None,
+                        back: backs
+                            .iter()
+                            .find(|(address, _)| entry.shared && *address == entry.address)
+                            .and_then(|(_, back)| *back),
                     },
                 )?;
                 last = Some(object);
@@ -394,13 +409,28 @@ impl State {
             // SAFETY: the caller gives up these pages.
             unsafe { sys::mem_unmap(&config().process, at, (to - at) as u64) }
                 .map_err(|e| self.refused(e))?;
-            let _gone = self
+            let gone = self
                 .map
                 .unmap(index, at, (to - at) / PAGE)
                 .map_err(|_| ENOMEM)?;
+            if let Some(back) = gone.and_then(|object| object.back) {
+                if self.closed_len < self.closed.len() {
+                    self.closed[self.closed_len] = back.fd;
+                    self.closed_len += 1;
+                }
+            }
             at = to;
         }
         Ok(())
+    }
+
+    /// The descriptors of `closed`, moved to `out`: how many.
+    pub(crate) fn take_closed(&mut self, out: &mut [i32]) -> usize {
+        let n = self.closed_len.min(out.len());
+        out[..n].copy_from_slice(&self.closed[..n]);
+        self.closed.copy_within(n..self.closed_len, 0);
+        self.closed_len -= n;
+        n
     }
 
     /// A new chunk of the heap with room for `needed` pages: twice the last

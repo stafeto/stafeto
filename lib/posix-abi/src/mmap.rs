@@ -103,27 +103,23 @@ fn release(state: &mut State, address: usize, pages: usize) -> Result<(), i32> {
     Ok(())
 }
 
-/// `mmap` of anonymous private memory: the address, or an errno.
+/// What a mapping of a file keeps to write its pages back: the descriptor
+/// the layer holds for it and the byte of the file the mapping starts at.
+pub use posix_map::Back;
+
+/// `mmap`: the address, or an errno. A shared mapping has an object of
+/// its own and goes to a forked child as the same pages; a private one is
+/// pages of the heap, or an object of its own from 256 KiB. `back` is the
+/// file a shared mapping writes to (`msync`, `munmap`); the pages are zeros
+/// and the caller fills a mapping of a file and then gives it its access
+/// (`mprotect`), so `prot` of such a mapping includes PROT_WRITE.
 pub fn mmap(
     addr: usize,
     len: usize,
     prot: i32,
     flags: i32,
-    fd: i32,
-    offset: i64,
+    back: Option<Back>,
 ) -> Result<usize, i32> {
-    mmap_inner(addr, len, prot, flags, fd, offset)
-}
-
-fn mmap_inner(
-    addr: usize,
-    len: usize,
-    prot: i32,
-    flags: i32,
-    fd: i32,
-    offset: i64,
-) -> Result<usize, i32> {
-    let _ = (fd, offset);
     crate::allocation::probe_pause();
     let access = access_of(prot)?;
     if len == 0 {
@@ -133,12 +129,7 @@ fn mmap_inner(
     if kind == 0 || kind == (MAP_SHARED | MAP_PRIVATE) {
         return Err(EINVAL);
     }
-    if flags & MAP_ANONYMOUS == 0 {
-        return Err(ENOSYS);
-    }
-    if kind == MAP_SHARED {
-        return Err(ENOTSUP);
-    }
+    let shared = kind == MAP_SHARED;
     let pages = whole_pages(len)?;
     let fixed = flags & MAP_FIXED != 0;
     if fixed && !addr.is_multiple_of(PAGE) {
@@ -151,16 +142,20 @@ fn mmap_inner(
                 return Err(ENOMEM);
             }
             release(state, addr, pages)?;
-            if state.space.all(addr, pages, Page::Free) {
-                state.take_at(addr, pages).map(|()| addr)
+            if !shared && state.space.all(addr, pages, Page::Free) {
+                state.take_at(addr, pages).map(|()| {
+                    // SAFETY: the heap gave these pages to this caller alone.
+                    unsafe { core::ptr::write_bytes(addr as *mut u8, 0, pages * PAGE) };
+                    addr
+                })
             } else {
                 state
-                    .make_own(Some(addr), pages, Access::ReadWrite, false)
+                    .make_own(Some(addr), pages, Access::ReadWrite, shared)
                     .map(|(_, at)| at)
             }
-        } else if pages >= OWN_FROM {
+        } else if shared || pages >= OWN_FROM {
             state
-                .make_own(None, pages, Access::ReadWrite, false)
+                .make_own(None, pages, Access::ReadWrite, shared)
                 .map(|(_, at)| at)
         } else {
             let at = state.take(pages)?;
@@ -168,6 +163,12 @@ fn mmap_inner(
             unsafe { core::ptr::write_bytes(at as *mut u8, 0, pages * PAGE) };
             Ok(at)
         }?;
+        if let Some(back) = back.filter(|_| shared) {
+            if let Some(index) = state.map.find(result) {
+                let object = state.map.piece(index).object;
+                state.map.object_mut(object).back = Some(back);
+            }
+        }
         if access != Access::ReadWrite {
             if let Err(error) = state.protect(result, pages, access) {
                 release(state, result, pages)?;
@@ -176,6 +177,52 @@ fn mmap_inner(
         }
         Ok(result)
     })
+}
+
+/// A piece of a shared mapping of a file in a range: its address, its
+/// pages, the descriptor the layer holds and the byte of the file it starts
+/// at.
+#[derive(Clone, Copy, Default)]
+pub struct FilePiece {
+    pub address: usize,
+    pub pages: usize,
+    pub fd: i32,
+    pub offset: u64,
+}
+
+/// The pieces of shared mappings of files in the range, up to `out.len()`:
+/// how many.
+pub fn file_pieces(addr: usize, len: usize, out: &mut [FilePiece]) -> usize {
+    let Ok(pages) = whole_pages(len) else {
+        return 0;
+    };
+    heap(|state| {
+        let mut n = 0;
+        for (index, from, count) in state.map.walk(addr, pages) {
+            let piece = state.map.piece(index);
+            let object = state.map.object(piece.object);
+            let Some(back) = object.back.filter(|_| object.shared) else {
+                continue;
+            };
+            if n < out.len() {
+                out[n] = FilePiece {
+                    address: from,
+                    pages: count,
+                    fd: back.fd,
+                    offset: back.offset
+                        + ((piece.offset + (from - piece.address) / PAGE) * PAGE) as u64,
+                };
+                n += 1;
+            }
+        }
+        n
+    })
+}
+
+/// The descriptors of the files whose last mapping `munmap` took since the
+/// last call, up to `out.len()`: how many. The caller closes them.
+pub fn closed_files(out: &mut [i32]) -> usize {
+    heap(|state| state.take_closed(out))
 }
 
 /// `munmap`: the pages of the range lose their mapping; a range with no

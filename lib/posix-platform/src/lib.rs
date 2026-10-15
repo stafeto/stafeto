@@ -16,6 +16,7 @@
 #![no_std]
 
 mod files;
+mod mapping;
 mod names;
 mod signals;
 mod sockets;
@@ -984,6 +985,12 @@ pub extern "C" fn stafeto_probe_threads() -> c_int {
     posix_abi::fork::probe_threads() as c_int
 }
 
+/// The shared objects the layer's map holds (posix_abi::fork::probe_shared_objects).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_shared_objects() -> u64 {
+    posix_abi::fork::probe_shared_objects()
+}
+
 /// The most mappings an object of the layer's map has
 /// (posix_abi::fork::probe_mappings).
 #[unsafe(no_mangle)]
@@ -1027,54 +1034,9 @@ pub extern "C" fn stafeto_probe_memory_quota() -> u64 {
     rt::sys::process_memory(posix_abi::allocation::process()).map_or(0, |memory| memory.quota)
 }
 
-/// `mmap` through the layer (posix_abi::mmap): the address, or the negative
-/// of an errno.
-#[unsafe(no_mangle)]
-pub extern "C" fn stafeto_mmap(
-    addr: *mut c_void,
-    len: usize,
-    prot: c_int,
-    flags: c_int,
-    fd: c_int,
-    offset: i64,
-) -> isize {
-    match posix_abi::mmap::mmap(addr as usize, len, prot, flags, fd, offset) {
-        Ok(address) => address as isize,
-        Err(errno) => -(errno as isize),
-    }
-}
-
-/// `munmap` through the layer: 0, or the negative of an errno.
-#[unsafe(no_mangle)]
-pub extern "C" fn stafeto_munmap(addr: *mut c_void, len: usize) -> c_int {
-    match posix_abi::mmap::munmap(addr as usize, len) {
-        Ok(()) => 0,
-        Err(errno) => -errno,
-    }
-}
-
-/// `mprotect` through the layer: 0, or the negative of an errno.
-#[unsafe(no_mangle)]
-pub extern "C" fn stafeto_mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int {
-    match posix_abi::mmap::mprotect(addr as usize, len, prot) {
-        Ok(()) => 0,
-        Err(errno) => -errno,
-    }
-}
-
-/// The checks of `madvise`, `posix_madvise` and `mlock` on a range: 0, or
-/// the negative of an errno.
-#[unsafe(no_mangle)]
-pub extern "C" fn stafeto_map_check(addr: *const c_void, len: usize) -> c_int {
-    match posix_abi::mmap::check_range(addr as usize, len) {
-        Ok(()) => 0,
-        Err(errno) => -errno,
-    }
-}
-
 /// Takes back one of relibc's mappings for the thread table.
 fn unmap(address: usize, length: usize) {
-    let _ = stafeto_munmap(address as *mut c_void, length);
+    let _ = mapping::stafeto_munmap(address as *mut c_void, length);
 }
 
 /// A new thread's first instructions: the stack holds what relibc pushed
