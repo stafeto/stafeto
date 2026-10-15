@@ -21,6 +21,8 @@
  * - futex: pthread_cond_wait, pthread_cond_signal in the window;
  * - futextimed: pthread_cond_timedwait with a deadline inside the window;
  * - sigwait: sigwait, pthread_kill in the window;
+ * - sigsuspend: sigsuspend, a handler that runs in the window (it must
+ *   return, not wait for the next signal);
  * - cancel: sigwait, pthread_cancel in the window (the request of
  *   cancellation, its notification and its interrupt, come while parked).
  */
@@ -62,7 +64,8 @@ static void expect(const char *what, long got, long want) {
 #define PARK_FIFO 2
 #define PARK_FUTEX 3
 #define PARK_SIGWAIT 4
-#define PARK_CANCEL 5
+#define PARK_SUSPEND 5
+#define PARK_CANCEL 6
 
 static volatile int pw_done, pw_result;
 static int pw_pipe[2];
@@ -74,6 +77,12 @@ static const char pw_fifo[] = "/tmp/park-fifo";
 static int pw_site;
 static int pw_writer = -1;
 static long pw_deadline_ms;
+static volatile int pw_handled;
+
+static void pw_handler(int sig) {
+    (void)sig;
+    __atomic_store_n(&pw_handled, 1, __ATOMIC_RELEASE);
+}
 
 static void pw_finish(int result) {
     pw_result = result;
@@ -128,6 +137,13 @@ static void *pw_wait(void *arg) {
         pw_finish(sigwait(&set, &sig) == 0 && sig == SIGUSR1 ? 0 : 1);
         break;
     }
+    case PARK_SUSPEND: {
+        sigset_t none;
+        sigemptyset(&none);
+        int r = sigsuspend(&none);
+        pw_finish(r == -1 && errno == EINTR && __atomic_load_n(&pw_handled, __ATOMIC_ACQUIRE) ? 0 : 1);
+        break;
+    }
     case PARK_CANCEL: {
         sigset_t set;
         int sig = 0;
@@ -166,6 +182,7 @@ static void pw_window(void) {
         }
         break;
     case PARK_SIGWAIT:
+    case PARK_SUSPEND:
         pthread_kill(pw_waiter, SIGUSR1);
         break;
     case PARK_CANCEL:
@@ -189,6 +206,7 @@ static int park_wait_role(int site, long deadline_ms, const char *what) {
         expect("mkfifo", mkfifo(pw_fifo, 0600), 0);
     }
     __atomic_store_n(&pw_posted, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&pw_handled, 0, __ATOMIC_RELEASE);
     pthread_create(&pw_waiter, NULL, pw_wait, NULL);
     for (int i = 0; i < 5000 && !stafeto_probe_window_reached(); i++) pause_ms(1);
     expect("the wait reached its site", stafeto_probe_window_reached(), 1);
@@ -217,6 +235,10 @@ static int park_wait_role(int site, long deadline_ms, const char *what) {
  * runs the cases in a child that /bin/procs-child starts (this program). */
 int main(int argc, char **argv) {
     (void)argv;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = pw_handler;
+    sigaction(SIGUSR1, &sa, NULL);
     if (argc == 1) {
         char *child[] = {"posix-park", "run", NULL};
         char *env[] = {NULL};
@@ -233,6 +255,7 @@ int main(int argc, char **argv) {
     if (!failures) park_wait_role(PARK_FUTEX, 0, "a wait by address");
     if (!failures) park_wait_role(PARK_FUTEX, 60, "a timed wait by address");
     if (!failures) park_wait_role(PARK_SIGWAIT, 0, "sigwait");
+    if (!failures) park_wait_role(PARK_SUSPEND, 0, "sigsuspend");
     if (!failures) park_wait_role(PARK_CANCEL, 0, "a cancelled sigwait");
     if (!failures) printf("posix-park: done failures 0\n");
     fflush(stdout);
