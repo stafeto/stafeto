@@ -17,7 +17,12 @@ from urllib.request import urlopen
 VERSION = "1.37.0"
 SHA256 = "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
 ROOT = Path(__file__).resolve().parents[1]
+# Two builds of the same source: the one the probes use (the applets they
+# run) and the one of the shell image of the utilities (the applets of XCU),
+# which is much bigger: it carries the time zone data of relibc that date and
+# the others pull in.
 WORK = ROOT / "target" / "busybox"
+WORK_UTILITIES = ROOT / "target" / "busybox-utils"
 SOURCE = WORK / "source"
 ARCHIVE = WORK / f"busybox-{VERSION}.tar.bz2"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
@@ -117,17 +122,27 @@ def tool(name: str, brew_formula: str | None = None) -> Path:
 
 
 def main() -> None:
+    build(utilities=False)
+    build(utilities=True)
+
+
+def build(utilities: bool) -> None:
+    global SOURCE, LOG, STAMP
+    work = WORK_UTILITIES if utilities else WORK
+    SOURCE, LOG, STAMP = work / "source", work / "build.log", work / "config"
+    names = UTILITIES if utilities else ()
     headers = sorted(COMPAT.rglob("*.h"))
     compatibility = sha256(b"".join(path.read_bytes() for path in headers)).hexdigest()
     # The script is part of the stamp: a patch it makes changes the objects.
     script = sha256(Path(__file__).read_bytes()).hexdigest()
-    own_sources = sha256(b"".join(path.read_bytes() for path in sorted(OWN.rglob("*.c")))).hexdigest()
-    config_stamp = f"{VERSION} {SHA256} {PATCH} {sha256(" ".join(EXCLUDED_OBJECTS + DIRECTORIES + UTILITIES).encode()).hexdigest()} {compatibility} {own_sources} {script} relibc {relibc_commit()} unwind {" ".join(UNWIND_CFLAGS)}\n"
+    own = sorted(OWN.rglob("*.c")) if utilities else []
+    own_sources = sha256(b"".join(path.read_bytes() for path in own)).hexdigest()
+    config_stamp = f"{VERSION} {SHA256} {PATCH} {sha256(" ".join(EXCLUDED_OBJECTS + DIRECTORIES + names).encode()).hexdigest()} {compatibility} {own_sources} {script} relibc {relibc_commit()} unwind {" ".join(UNWIND_CFLAGS)}\n"
     if (STAMP.exists() and STAMP.read_text() == config_stamp
             and all((SOURCE / d / "lib.a").exists() for d in DIRECTORIES)):
         print(f"BusyBox objects ready: {SOURCE}")
         return
-    WORK.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
     LOG.write_text("")
     if not ARCHIVE.exists():
         with urlopen(f"https://busybox.net/downloads/busybox-{VERSION}.tar.bz2") as response:
@@ -136,8 +151,8 @@ def main() -> None:
         raise SystemExit("BusyBox source archive has an unexpected SHA-256")
     if SOURCE.exists():
         shutil.rmtree(SOURCE)
-    run("tar", "-xjf", str(ARCHIVE), "-C", str(WORK))
-    (WORK / f"busybox-{VERSION}").rename(SOURCE)
+    run("tar", "-xjf", str(ARCHIVE), "-C", str(work))
+    (work / f"busybox-{VERSION}").rename(SOURCE)
     replace(SOURCE / "coreutils/cat.c",
             "APPLET(cat, BB_DIR_BIN, BB_SUID_DROP)",
             "APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat)")
@@ -194,7 +209,7 @@ def main() -> None:
     # Our own applets and library functions go into the directory of the
     # same name, where BusyBox's build finds their //applet: and //kbuild:
     # lines like any other source.
-    for source in sorted(OWN.rglob("*.c")):
+    for source in own:
         shutil.copy(source, SOURCE / source.relative_to(OWN))
     kbuild = SOURCE / "libbb/Kbuild.src"
     dropped = {f"lib-y += {name}" for name in EXCLUDED_OBJECTS}
@@ -232,7 +247,7 @@ def main() -> None:
     replace(config, "# CONFIG_KILL is not set", "CONFIG_KILL=y")
     # The utilities of XCU that BusyBox has (Ф10), with the features their
     # pages ask for; ps is ours (tools/busybox/stafeto/procps/ps.c).
-    for name in UTILITIES:
+    for name in names:
         text = config.read_text()
         if f"# CONFIG_{name} is not set" in text:
             config.write_text(text.replace(f"# CONFIG_{name} is not set", f"CONFIG_{name}=y"))

@@ -1191,6 +1191,11 @@ static int steps_resources(void) {
     if (getrlimit(RLIMIT_NOFILE, &nofile) || setrlimit(RLIMIT_NOFILE, &nofile)
         || getgroups(0, NULL) < 0 || getgroups(16, groups) < 0
         || getrlimit(RLIMIT_FSIZE, &saved)) return 1;
+    /* /proc/<pid>/stat is made from the List requests of the process service. */
+    char path[40], text[256];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)getpid());
+    int stat_fd = open(path, O_RDONLY);
+    if (stat_fd < 0 || read(stat_fd, text, sizeof text) <= 0 || close(stat_fd)) return 12;
     struct sigaction ignored = {.sa_handler = SIG_IGN}, previous;
     sigemptyset(&ignored.sa_mask);
     if (sigaction(SIGXFSZ, &ignored, &previous)) return 2;

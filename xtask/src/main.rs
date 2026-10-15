@@ -4357,7 +4357,7 @@ const PIPE_STEP_KINDS: [(usize, &str); 15] = [
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
-const STEP_KINDS: [(usize, &str); 23] = [
+const STEP_KINDS: [(usize, &str); 24] = [
     (1, "Create"),
     (13, "Kill"),
     (21, "Vouch"),
@@ -4367,6 +4367,7 @@ const STEP_KINDS: [(usize, &str); 23] = [
     (57, "GetGroups"),
     (58, "Timer"),
     (59, "Queue"),
+    (60, "List"),
     (22, "SpawnStart"),
     (23, "Boot"),
     (24, "Take"),

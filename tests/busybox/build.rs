@@ -14,7 +14,13 @@ fn main() {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
     let root = env::var_os("STAFETO_BUSYBOX_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| manifest.join("../../target/busybox/source"));
+        .unwrap_or_else(|| {
+            // The shell image of the utilities has the BusyBox of all the
+            // applets of XCU (tools/build-busybox.py); the probes the small one.
+            let utilities = env::var_os("CARGO_FEATURE_ASH_INTERACTIVE").is_some();
+            let name = if utilities { "busybox-utils" } else { "busybox" };
+            manifest.join(format!("../../target/{name}/source"))
+        });
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     for (archive, name) in [
         ("libbb/lib.a", "busybox_bb"),
