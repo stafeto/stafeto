@@ -278,11 +278,15 @@ fn mmap0(
     })
 }
 
+/// The key, the pages, a copy of the object and the descriptor of a shared
+/// object a forked child joins.
+type Attach = (u64, usize, rt::handle::Handle<rt::handle::Memory>, i32);
+
 /// A forked child joins the process service's entries of the shared objects
 /// it inherited, so that they live as long as it maps them.
 pub(crate) fn attach_shared() {
     use rt::handle::{Handle, Memory};
-    let mut found: [Option<(u64, usize, Handle<Memory>, i32)>; posix_map::MAX_OBJECTS] =
+    let mut found: [Option<Attach>; posix_map::MAX_OBJECTS] =
         [const { None }; posix_map::MAX_OBJECTS];
     heap(|state| {
         let mut n = 0;
