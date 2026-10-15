@@ -32,11 +32,12 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # sockatmark, service names in getaddrinfo and getnameinfo, reverse lookup
 # from /etc/hosts; tagged pin-a5096e2d.
 # F10 utilities: getlogin and getlogin_r from utmpx, syslog into
-# /var/log/messages, utmpx over /var/run/utmpx; tagged pin-c413647c.
+# /var/log/messages, utmpx over /var/run/utmpx, the flush of every stream at
+# exit, the default PATH of execvp, mntent, wait3, sysinfo; tagged pin-d5054f04.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "c413647c7721b55686f4f73defcc36a97c903330"
+COMMIT = "d5054f046b549d1abfa7840b2ae0620b62edc02b"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

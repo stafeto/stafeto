@@ -5212,6 +5212,7 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
     (r#"logger -t tagx hello-journal; login-probe syslog"#, &[r#"~login-probe: setlogmask returned 255"#, r#"login-probe: syslog written"#]),
     (r#"grep -c tagx /var/log/messages; grep -c hidden /var/log/messages; grep -c shown /var/log/messages"#, &[r#"=1"#, r#"=0"#, r#"=2"#]),
     (r#"grep -c 'probe\[[0-9]*\]: shown 2' /var/log/messages; grep -c 'after-close 4' /var/log/messages"#, &[r#"=1"#, r#"=1"#]),
+    (r#"login-probe utmpx"#, &[r#"login-probe: entries at the start 0"#, r#"login-probe: 0 failures"#]),
 ];
 
 /// Types `command` and waits for the lines `lines` and the prompt.
@@ -5268,9 +5269,6 @@ fn ash_dialog() -> Result<(), String> {
     let bin_count = (bin_listing.len() + rootfs::UTILITIES.len() - 8).to_string();
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    if let Ok(log) = std::env::var("STAFETO_QEMU_LOG") {
-        cmd.args(["-d", "int,guest_errors", "-D", log.as_str()]);
-    }
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let talked = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
@@ -5538,13 +5536,6 @@ fn ash_dialog() -> Result<(), String> {
             let expected = format!("found:{}", names.len() - missing);
             run.expect_line(&expected, |line| line == expected, DIALOG_STEP)?;
             run.expect("# ", DIALOG_STEP)?;
-        }
-        if let Ok(commands) = std::env::var("STAFETO_DIALOG_TRY") {
-            for command in commands.split('\n').filter(|c| !c.is_empty()) {
-                run.send(command)?;
-                run.expect("# ", Duration::from_secs(60))?;
-            }
-            return Err("STAFETO_DIALOG_TRY done".to_string());
         }
         // What the utilities do (Ф10).
         for (command, lines) in UTILITY_DIALOG {
