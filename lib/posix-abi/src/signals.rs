@@ -1353,6 +1353,22 @@ pub(crate) fn resume_others() {
     );
 }
 
+/// How many times the thread of each place of the table of threads has
+/// parked for a stop. A park receives from the thread's own channel and
+/// may take the notification of an operation the thread waits for; a wait
+/// that reads this count before and after a park knows to ask the service
+/// again (`long::run_in`).
+static PARKED: [AtomicU64; crate::relibc::PLACES] =
+    [const { AtomicU64::new(0) }; crate::relibc::PLACES];
+
+/// The parks of the calling thread so far.
+pub(crate) fn parks() -> u64 {
+    (own().thread_id as usize)
+        .checked_sub(1)
+        .and_then(|i| PARKED.get(i))
+        .map_or(0, |count| count.load(Ordering::Acquire))
+}
+
 /// Parks the calling thread while another thread stops the process for
 /// an exec or a fork: its process signals go back to the page, it puts its
 /// own channel in its place of PARKING, says so to the stopper and waits
@@ -1389,6 +1405,15 @@ fn park() {
         }
     }
     let _ = place.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Acquire);
+    // The receives above took whatever came to the thread's channel, a
+    // notification of a long operation of the thread among it, which the
+    // service tells once: the thread's waits look again (`parks`).
+    if let Some(count) = (block.thread_id as usize)
+        .checked_sub(1)
+        .and_then(|i| PARKED.get(i))
+    {
+        count.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Whether the calling thread is to park: another thread stops the
