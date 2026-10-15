@@ -82,9 +82,12 @@ impl PosixFs {
         self.control_tokens().next().is_none() && self.wait_tokens().next().is_none()
     }
     /// The question to put with a close event: the count of lock commands
-    /// begun so far.
-    pub fn record_locks_question(&self) -> Asked {
-        Asked(self.record_locks.epoch)
+    /// begun so far, or None while a lock command is outstanding, when no
+    /// answer can settle it (the service may answer before a command that
+    /// is under way reaches it).
+    pub fn record_locks_question(&self) -> Option<Asked> {
+        self.no_lock_command()
+            .then_some(Asked(self.record_locks.epoch))
     }
     /// The service answered a close event that the process holds no record
     /// lock: kept only if no lock command is outstanding and none has begun

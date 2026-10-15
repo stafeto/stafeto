@@ -1172,7 +1172,7 @@ fn an_alias_close_is_local_only_while_the_process_is_known_to_hold_no_record_loc
     // Nothing is known at the start: the first close asks the service.
     assert!(!files.knows_no_record_lock());
     assert!(!files.closes_alias_with_no_record_lock(alias));
-    let asked = files.record_locks_question();
+    let asked = files.record_locks_question().unwrap();
     files.record_locks_answered_none(asked);
     assert!(files.knows_no_record_lock());
     assert!(files.closes_alias_with_no_record_lock(alias));
@@ -1186,7 +1186,7 @@ fn an_alias_close_is_local_only_while_the_process_is_known_to_hold_no_record_loc
         .descriptors
         .duplicate(fd, 0, Flags::default())
         .unwrap();
-    let stale = files.record_locks_question();
+    let stale = files.record_locks_question().unwrap();
     let token = files
         .begin_lock_record(owner(), source, Frame::main(91), input)
         .unwrap()
@@ -1195,9 +1195,7 @@ fn an_alias_close_is_local_only_while_the_process_is_known_to_hold_no_record_loc
     files.record_locks_answered_none(stale);
     assert!(!files.knows_no_record_lock());
     // With the command outstanding even a fresh answer does not count.
-    let fresh = files.record_locks_question();
-    files.record_locks_answered_none(fresh);
-    assert!(!files.knows_no_record_lock());
+    assert_eq!(files.record_locks_question(), None);
     assert!(!files.closes_alias_with_no_record_lock(alias));
     // Once the command is over the question put before it stays stale, and
     // a new question settles.
@@ -1212,9 +1210,31 @@ fn an_alias_close_is_local_only_while_the_process_is_known_to_hold_no_record_loc
     assert!(files.no_lock_command());
     files.record_locks_answered_none(stale);
     assert!(!files.knows_no_record_lock());
-    let fresh = files.record_locks_question();
+    let fresh = files.record_locks_question().unwrap();
     files.record_locks_answered_none(fresh);
     assert!(files.knows_no_record_lock());
     assert!(files.closes_alias_with_no_record_lock(alias));
     let _ = target;
+}
+
+#[test]
+fn an_answer_cannot_hide_a_lock_command_that_began_before_the_question() {
+    // B begins F_SETLK on Y; A closes an alias of X and asks while B's command
+    // is under way; the service answers "none" before it reaches the lock of B.
+    let (mut files, source, _, input) = fixture();
+    let token = files
+        .begin_lock_record(owner(), source, Frame::main(91), input)
+        .unwrap()
+        .0;
+    assert_eq!(files.record_locks_question(), None);
+    // The command ends; no question exists to carry the early answer.
+    files.abandon_lock_owner(owner()).unwrap();
+    files
+        .begin_lock_cleanup(token, control::CancelReason::Abandoned)
+        .unwrap();
+    files
+        .publish_lock_cleanup(token, ControlResult::Value(0), terminal(blocker()))
+        .unwrap();
+    files.finish_lock_cleanup(token).unwrap();
+    assert!(!files.knows_no_record_lock());
 }

@@ -1209,13 +1209,18 @@ pub(crate) fn stop_others() -> Result<(), i32> {
         )?;
     }
     let mut asked = 0u64;
+    let mut short_wait = 0u64;
     loop {
         let mut waiting = false;
+        // Whether a thread the stopper waits for is not merely on its way
+        // into its park.
+        let mut other = false;
         crate::relibc::each_live(|index, native, block| {
             if core::ptr::from_ref(block) as usize == me {
                 return;
             }
             let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(native));
+            let seen = core::cell::Cell::new(0u64);
             let (state, parked) = stop_barrier::observe(
                 || match sys::thread_info(&thread).map(|info| info.state) {
                     Ok(ThreadState::Ended | ThreadState::Stopped) => {
@@ -1228,15 +1233,21 @@ pub(crate) fn stop_others() -> Result<(), i32> {
                     Ok(_) => (stop_barrier::State::Running, false),
                     Err(_) => (stop_barrier::State::Unknown, false),
                 },
-                || PARKING[index].load(Ordering::Acquire),
+                || {
+                    seen.set(PARKING[index].load(Ordering::Acquire));
+                    seen.get()
+                },
                 block.channel.load(Ordering::Relaxed),
             );
             if stop_barrier::confirmed_terminal(state) || parked {
                 return;
             }
+            let parking =
+                stop_barrier::is_parking(state, seen.get(), block.channel.load(Ordering::Relaxed));
             let flags = block.flags.load(Ordering::SeqCst);
             if flags & flag::SIGNALS_READY == 0 {
                 waiting = true;
+                other = true;
                 return;
             }
             if asked & 1 << index == 0 {
@@ -1266,12 +1277,15 @@ pub(crate) fn stop_others() -> Result<(), i32> {
             native_stop_probe::scan(block, native, state, quiet);
             if !quiet {
                 waiting = true;
+                other |= !parking;
             }
         });
         if !waiting {
             break;
         }
-        let deadline = rt::time::ticks_to_ns(rt::time::now()) + LOOK_AGAIN_NS;
+        let wait = stop_barrier::next_wait(!other, short_wait, LOOK_AGAIN_NS);
+        short_wait = if other { 0 } else { wait };
+        let deadline = rt::time::ticks_to_ns(rt::time::now()) + wait;
         let _ = sys::timer_set(&timer, deadline);
         // An interrupted wait looks again: the stop holds until every
         // other thread is stopped.

@@ -54,7 +54,7 @@ enum Admission {
         Transport,
         posix_fs::closing::Snapshot,
         Option<CloseCommandFence>,
-        Asked,
+        Option<Asked>,
     ),
     Pending(CloseToken),
     Open(posix_fs::open::OpenToken),
@@ -189,7 +189,7 @@ fn first_turn(
     transport: Transport,
     snapshot: posix_fs::closing::Snapshot,
     fence: Option<CloseCommandFence>,
-    asked: Asked,
+    asked: Option<Asked>,
 ) -> Result<bool, i32> {
     if let Some(debt) = fence {
         fence_turn(debt)?;
@@ -198,7 +198,7 @@ fn first_turn(
     if snapshot.complete {
         return Ok(false);
     }
-    event_step(token, transport, snapshot, Some(asked))
+    event_step(token, transport, snapshot, asked)
 }
 
 fn drive(token: CloseToken) -> Result<(), i32> {
