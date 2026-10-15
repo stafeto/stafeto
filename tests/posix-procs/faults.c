@@ -30,7 +30,9 @@
 _Static_assert(MINSIGSTKSZ >= 1904 + 4096, "the stack holds the entry frame and the delivery");
 
 #define F_STACK 65536
-static char f_area[F_STACK] __attribute__((aligned(16)));
+/* Mapped by the role (a static array would charge every role of this program
+ * with its pages, and the quota probes of the names count them). */
+static char *f_area;
 static sigjmp_buf f_env;
 static volatile int f_stage;
 static volatile unsigned long f_where[4];
@@ -367,6 +369,11 @@ static void f_child(const char *what, int (*fn)(void), int code, int sig) {
 }
 
 static int faults_role(void) {
+    f_area = mmap(NULL, F_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (f_area == MAP_FAILED) {
+        printf("posix-procs: faults: no memory for the alternate stack (%s)\n", strerror(errno));
+        return 1;
+    }
     f_child("sigaltstack state and errors", f_api, 0, 0);
     f_child("overflow caught on the alternate stack", f_overflow_caught, 0, 0);
     f_child("overflow in a child of fork with the alternate stack", f_forked_alt, 0, 0);
