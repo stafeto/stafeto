@@ -621,20 +621,6 @@ impl PipeService {
         }
     }
 
-    /// Whether the operation is a long one (IPC with a WAIT, IPC_TAKE).
-    fn ipc_long(op: u32) -> bool {
-        matches!(
-            op,
-            ipc_op::MQ_SEND
-                | ipc_op::MQ_RECV
-                | ipc_op::MQ_NOTIFY_WAIT
-                | ipc_op::MSG_SND
-                | ipc_op::MSG_RCV
-                | ipc_op::SEM_OP
-                | ipc_op::NSEM_WAIT
-        )
-    }
-
     /// IPC (`take` false) or IPC_TAKE: the message queues, semaphores and
     /// shared memory segments (proto_pipe::ipc).
     fn ipc(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
@@ -642,7 +628,7 @@ impl PipeService {
             Ok(call) => call,
             Err(status) => return Answer::Status(status),
         };
-        let long = Self::ipc_long(call.op);
+        let long = ipc_op::is_long(call.op);
         if take && !long {
             return Answer::Status(Status::BadSize);
         }

@@ -32,6 +32,8 @@ struct Mode<'a> {
     point: bool,
     authenticated: bool,
     custody: Option<&'a dyn Custody>,
+    /// The monotonic time in ns at which the wait ends with ETIMEDOUT.
+    deadline: Option<u64>,
 }
 impl Mode<'_> {
     fn plain(point: bool, authenticated: bool) -> Self {
@@ -39,6 +41,18 @@ impl Mode<'_> {
             point,
             authenticated,
             custody: None,
+            deadline: None,
+        }
+    }
+}
+
+/// The thread's timer, set for a deadline and cancelled when the wait is over.
+struct Alarm(core::mem::ManuallyDrop<Handle<Timer>>, bool);
+
+impl Drop for Alarm {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = sys::timer_cancel(&self.0);
         }
     }
 }
@@ -227,6 +241,30 @@ pub fn run_with(
     )
 }
 
+/// `run_with` that ends with ETIMEDOUT at the monotonic time `deadline` (ns)
+/// if the service has not answered: the thread's timer wakes its wait, and
+/// "cancel k" ends the operation in the service.
+pub fn run_until(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+    deadline: u64,
+) -> Result<usize, i32> {
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        Mode {
+            deadline: Some(deadline),
+            ..Mode::plain(true, false)
+        },
+    )
+}
+
 /// `run_with` for an operation that is no point of cancellation
 /// (getentropy, getrandom, arc4random; XSH 2.9.5 allows no new points): a
 /// request of cancellation leaves the wait alone and stays for the next
@@ -316,6 +354,7 @@ pub(crate) fn run_drain(
             point: true,
             authenticated: true,
             custody,
+            deadline: None,
         },
     )
     .map(drop)
@@ -369,6 +408,7 @@ fn run_in(
         point,
         authenticated,
         custody,
+        deadline,
     } = mode;
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
@@ -425,6 +465,10 @@ fn run_in(
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     let level = block.base_level.load(Ordering::Relaxed) as u8;
+    let mut alarm = Alarm(
+        Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed))),
+        false,
+    );
     // The first take brings the labelled copy: the service keeps it while
     // the operation waits. A take the kernel took back left the service
     // without it, and the next one brings a new copy.
@@ -509,6 +553,13 @@ fn run_in(
         if block.handled.load(Ordering::SeqCst) != handled || crate::signals::parks() != parked {
             drop(guard);
             continue;
+        }
+        if let Some(deadline) = deadline {
+            if rt::time::reached(deadline) {
+                drop(guard);
+                break 'wait Some(ETIMEDOUT);
+            }
+            alarm.1 = sys::timer_set(&alarm.0, deadline).is_ok();
         }
         let got = sys::receive(&channel);
         drop(guard);

@@ -43,7 +43,7 @@ pub const MQ_KIND: u32 = 99;
 pub const ERRNO: u32 = 2000;
 
 /// The words of a request or an answer at most.
-pub const WORDS_MAX: usize = 20;
+pub const WORDS_MAX: usize = 32;
 /// The bytes of a message of a queue at most (`mq_msgsize`, `msgsz`).
 pub const TEXT_MAX: usize = 512;
 /// The bytes of a name at most.
@@ -100,7 +100,8 @@ pub mod op {
     /// the values of GETALL.
     pub const SEM_CTL: u32 = 22;
 
-    /// shmget: w0 key, w1 size, w2 flags, cred. => the id, the serial.
+    /// shmget: w0 key, w1 size, w2 flags, cred. => the id, the serial, 1
+    /// when the segment is new (its file is to be made).
     pub const SHM_GET: u32 = 24;
     /// shmat: w0 id, w1 flags (SHM_RDONLY), cred. => the serial, the
     /// size.
@@ -126,6 +127,15 @@ pub mod op {
     pub const NSEM_POST: u32 = 36;
     /// sem_getvalue: w0 id. => the value.
     pub const NSEM_VALUE: u32 = 37;
+
+    /// Whether the operation is a long one: a start that may answer WAIT
+    /// and the takes that follow.
+    pub const fn is_long(op: u32) -> bool {
+        matches!(
+            op,
+            MQ_SEND | MQ_RECV | MQ_NOTIFY_WAIT | MSG_SND | MSG_RCV | SEM_OP | NSEM_WAIT
+        )
+    }
 }
 
 /// The words of the stat answers: the permission part, then the fields of
