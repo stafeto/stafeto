@@ -71,6 +71,15 @@ pub(crate) struct State {
     closed_len: usize,
 }
 
+/// RLIMIT_AS and RLIMIT_DATA, soft, in bytes (u64::MAX for none): the
+/// layer reads them from the process service at its first mapping and
+/// `setrlimit` keeps them (`resources::set`), so that the heap's lock never
+/// waits for a message.
+pub(crate) static LIMIT_AS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+pub(crate) static LIMIT_DATA: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// The entries of the kernel's table not in the map, until a refusal says
 /// there are more.
 const HIDDEN: usize = 8;
@@ -180,7 +189,6 @@ pub unsafe fn adopt(
             0,
             Object {
                 handle,
-                pages,
                 shared: false,
                 back: None,
             },
@@ -221,7 +229,7 @@ pub unsafe fn after_fork(
     // descriptors are the parent's numbers.
     let mut backs = [(0usize, None::<posix_map::Back>); posix_map::MAX_PIECES];
     for (slot, piece) in backs.iter_mut().zip(state.map.iter()) {
-        *slot = (piece.address, state.map.object(piece.object).back);
+        *slot = (piece.address, state.map.object(piece.object()).back);
     }
     state.map.forget();
     let mut last = None;
@@ -235,7 +243,6 @@ pub unsafe fn after_fork(
                     entry.offset,
                     Object {
                         handle,
-                        pages: entry.offset + entry.pages,
                         shared: entry.shared,
                         back: backs
                             .iter()
@@ -256,7 +263,6 @@ pub unsafe fn after_fork(
             entry.offset,
             object,
         )?;
-        state.map.object_mut(object).pages = entry.offset + entry.pages;
     }
     Ok(())
 }
@@ -322,8 +328,8 @@ impl State {
         while at < end {
             let index = self.map.find(at).ok_or(ENOMEM)?;
             let piece = *self.map.piece(index);
-            if piece.access != Access::ReadWrite {
-                if !self.space.all(piece.address, piece.pages, Page::Free) {
+            if piece.access() != Access::ReadWrite {
+                if !self.space.all(piece.address, piece.pages(), Page::Free) {
                     return Err(ENOMEM);
                 }
                 // SAFETY: free pages, which nothing uses.
@@ -331,13 +337,13 @@ impl State {
                     sys::mem_protect(
                         &config().process,
                         piece.address,
-                        (piece.pages * PAGE) as u64,
+                        (piece.pages() * PAGE) as u64,
                         Access::ReadWrite,
                     )
                 }
                 .map_err(|e| self.refused(e))?;
                 self.map
-                    .protect(index, piece.address, piece.pages, Access::ReadWrite)
+                    .protect(index, piece.address, piece.pages(), Access::ReadWrite)
                     .map_err(|_| ENOMEM)?;
             }
             at = piece.end();
@@ -362,7 +368,7 @@ impl State {
         let mut needed = 0;
         for (index, from, count) in self.map.walk(address, pages) {
             let piece = self.map.piece(index);
-            if piece.access != access {
+            if piece.access() != access {
                 needed += usize::from(from > piece.address)
                     + usize::from(from + count * PAGE < piece.end());
             }
@@ -376,7 +382,7 @@ impl State {
             let index = self.map.find(at).ok_or(ENOMEM)?;
             let piece = *self.map.piece(index);
             let to = end.min(piece.end());
-            if piece.access != access {
+            if piece.access() != access {
                 // SAFETY: the callers give up what the new access takes away
                 // (they hand out or take back whole pages of the program's own
                 // mappings).
@@ -435,8 +441,39 @@ impl State {
 
     /// A new chunk of the heap with room for `needed` pages: twice the last
     /// one, 64 KiB to 4 MiB, or less when the room has no run so long.
+    /// ENOMEM when `pages` more pages would pass RLIMIT_AS.
+    fn within_address_space(&self, pages: usize) -> Result<(), i32> {
+        let limit = LIMIT_AS.load(Ordering::Relaxed);
+        if limit != u64::MAX && ((self.map.pages() + pages) * PAGE) as u64 > limit {
+            return Err(ENOMEM);
+        }
+        Ok(())
+    }
+
+    /// ENOMEM when `pages` more pages of the program's mappings would pass
+    /// RLIMIT_DATA.
+    pub(crate) fn within_data(&self, pages: usize) -> Result<(), i32> {
+        let limit = LIMIT_DATA.load(Ordering::Relaxed);
+        if limit != u64::MAX {
+            let used = self.space.count(Page::User) + self.space.count(Page::Own);
+            if ((used + pages) * PAGE) as u64 > limit {
+                return Err(ENOMEM);
+            }
+        }
+        Ok(())
+    }
+
     fn grow(&mut self, needed: usize) -> Result<(), i32> {
-        let wanted = (self.chunk * 2).clamp(FIRST_CHUNK, MAX_CHUNK).max(needed);
+        // Twice the last chunk, but no more than a quarter of what the
+        // process's quota has left: a small process does not pay for a big
+        // chunk it never fills.
+        let spare = sys::process_memory(&config().process).map_or(MAX_CHUNK, |m| {
+            (m.quota.saturating_sub(m.used) as usize / PAGE / 4).max(FIRST_CHUNK)
+        });
+        let wanted = (self.chunk * 2)
+            .clamp(FIRST_CHUNK, MAX_CHUNK)
+            .min(spare)
+            .max(needed);
         let (pages, address) = [wanted, needed]
             .into_iter()
             .find_map(|pages| {
@@ -447,9 +484,10 @@ impl State {
             .ok_or(ENOMEM)?;
         // A chunk the map has no room for is not made: the kernel's limit
         // of mappings is the map's.
-        if self.room() == 0 {
+        if self.room() == 0 || !self.map.has_room_for_object() {
             return Err(ENOMEM);
         }
+        self.within_address_space(pages)?;
         let length = pages * PAGE;
         let memory = sys::mem_create(length as u64).map_err(|_| ENOMEM)?;
         // The map keeps a narrowed copy, and the full handle goes.
@@ -472,7 +510,6 @@ impl State {
                 0,
                 Object {
                     handle: kept,
-                    pages,
                     shared: false,
                     back: None,
                 },
@@ -531,9 +568,10 @@ impl State {
             Some(_) => return Err(ENOMEM),
             None => self.space.find(pages, Page::Unbacked, true).ok_or(ENOMEM)?,
         };
-        if self.room() == 0 {
+        if self.room() == 0 || !self.map.has_room_for_object() {
             return Err(ENOMEM);
         }
+        self.within_address_space(pages)?;
         let length = (pages * PAGE) as u64;
         let memory = sys::mem_create(length).map_err(|_| ENOMEM)?;
         let kept = sys::handle_duplicate(&memory, KEPT).map_err(|_| ENOMEM)?;
@@ -554,7 +592,6 @@ impl State {
                 0,
                 Object {
                     handle: kept,
-                    pages,
                     shared,
                     back: None,
                 },
@@ -608,7 +645,7 @@ impl State {
                 .walk(at, pages)
                 .filter(|&(i, from, count)| {
                     let piece = self.map.piece(i);
-                    piece.address == from && piece.pages == count
+                    piece.address == from && piece.pages() == count
                 })
                 .count();
             if inside >= 2 && self.map.edges(at, pages) <= self.room() {
@@ -635,7 +672,7 @@ impl State {
             let piece = *self.map.piece(index);
             let to = end.min(piece.end());
             let count = (to - at) / PAGE;
-            let first = piece.offset + (at - piece.address) / PAGE;
+            let first = piece.offset() + (at - piece.address) / PAGE;
             // SAFETY: free pages, which nothing uses.
             if unsafe { sys::mem_unmap(&config().process, at, (to - at) as u64) }.is_err() {
                 // Nothing of this piece changed; what was unmapped before
@@ -645,7 +682,7 @@ impl State {
             if self.map.unmap_keep(index, at, count).is_err() {
                 return;
             }
-            seen[n] = (at, count, piece.object, first);
+            seen[n] = (at, count, piece.object(), first);
             n += 1;
             at = to;
         }

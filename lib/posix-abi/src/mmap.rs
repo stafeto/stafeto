@@ -8,8 +8,9 @@
 //! returns. A range across several pieces of the memory map is walked one
 //! piece at a time (`State::protect`, `State::unmap`).
 
-use crate::allocation::{State, heap};
+use crate::allocation::{LIMIT_AS, LIMIT_DATA, State, heap};
 use crate::constants::*;
+use core::sync::atomic::{AtomicBool, Ordering};
 use posix_map::space::State as Page;
 use rt::abi::Access;
 
@@ -107,6 +108,43 @@ fn release(state: &mut State, address: usize, pages: usize) -> Result<(), i32> {
 /// the layer holds for it and the byte of the file the mapping starts at.
 pub use posix_map::Back;
 
+static LIMITS_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// Reads RLIMIT_DATA and RLIMIT_AS from the process service once, outside the
+/// heap's lock.
+fn load_limits() {
+    if LIMITS_LOADED.load(Ordering::Acquire) {
+        return;
+    }
+    // The service starts both at the process's quota, which the kernel
+    // enforces on its own; the layer counts only a limit below it.
+    let quota = rt::sys::process_memory(crate::allocation::process()).map_or(u64::MAX, |m| m.quota);
+    for (resource, cell) in [(2, &LIMIT_DATA), (9, &LIMIT_AS)] {
+        if let Ok(limit) = crate::resources::get(resource) {
+            cell.store(
+                if limit.soft >= quota {
+                    u64::MAX
+                } else {
+                    limit.soft
+                },
+                Ordering::Relaxed,
+            );
+        }
+    }
+    LIMITS_LOADED.store(true, Ordering::Release);
+}
+
+/// `setrlimit` of RLIMIT_DATA or RLIMIT_AS (Linux's 2 and 9): the soft
+/// limit the heap's section checks.
+pub(crate) fn set_limit(resource: i32, soft: u64) {
+    let cell = if resource == 2 {
+        &LIMIT_DATA
+    } else {
+        &LIMIT_AS
+    };
+    cell.store(soft, Ordering::Relaxed);
+}
+
 /// `mmap`: the address, or an errno. A shared mapping has an object of
 /// its own and goes to a forked child as the same pages; a private one is
 /// pages of the heap, or an object of its own from 256 KiB. `back` is the
@@ -120,7 +158,12 @@ pub fn mmap(
     flags: i32,
     back: Option<Back>,
 ) -> Result<usize, i32> {
+    mmap0(addr, len, prot, flags, back)
+}
+
+fn mmap0(addr: usize, len: usize, prot: i32, flags: i32, back: Option<Back>) -> Result<usize, i32> {
     crate::allocation::probe_pause();
+    load_limits();
     let access = access_of(prot)?;
     if len == 0 {
         return Err(EINVAL);
@@ -136,6 +179,7 @@ pub fn mmap(
         return Err(EINVAL);
     }
     heap(|state| {
+        state.within_data(pages)?;
         let result = if fixed {
             let end = addr.checked_add(pages * PAGE).ok_or(ENOMEM)?;
             if addr < state.space.base() || end > state.space.limit() {
@@ -165,7 +209,7 @@ pub fn mmap(
         }?;
         if let Some(back) = back.filter(|_| shared) {
             if let Some(index) = state.map.find(result) {
-                let object = state.map.piece(index).object;
+                let object = state.map.piece(index).object();
                 state.map.object_mut(object).back = Some(back);
             }
         }
@@ -200,7 +244,7 @@ pub fn file_pieces(addr: usize, len: usize, out: &mut [FilePiece]) -> usize {
         let mut n = 0;
         for (index, from, count) in state.map.walk(addr, pages) {
             let piece = state.map.piece(index);
-            let object = state.map.object(piece.object);
+            let object = state.map.object(piece.object());
             let Some(back) = object.back.filter(|_| object.shared) else {
                 continue;
             };
@@ -209,8 +253,8 @@ pub fn file_pieces(addr: usize, len: usize, out: &mut [FilePiece]) -> usize {
                     address: from,
                     pages: count,
                     fd: back.fd,
-                    offset: back.offset
-                        + ((piece.offset + (from - piece.address) / PAGE) * PAGE) as u64,
+                    offset: back.offset()
+                        + ((piece.offset() + (from - piece.address) / PAGE) * PAGE) as u64,
                 };
                 n += 1;
             }
@@ -267,8 +311,8 @@ pub fn mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
     })
 }
 
-/// Checks the range of `madvise`, `posix_madvise` and `mlock`: aligned,
-/// and in mappings of the program (ENOMEM otherwise).
+/// Checks the range of `madvise`, `posix_madvise`, `mlock` and `msync`:
+/// aligned, and in mappings (ENOMEM otherwise).
 pub fn check_range(addr: usize, len: usize) -> Result<(), i32> {
     if !addr.is_multiple_of(PAGE) {
         return Err(EINVAL);
@@ -279,7 +323,7 @@ pub fn check_range(addr: usize, len: usize) -> Result<(), i32> {
     let pages = whole_pages(len)?;
     addr.checked_add(pages * PAGE).ok_or(ENOMEM)?;
     heap(|state| {
-        if mapped(state, addr, pages) {
+        if state.map.covers(addr, pages) {
             Ok(())
         } else {
             Err(ENOMEM)

@@ -1011,8 +1011,8 @@ pub unsafe extern "C" fn stafeto_probe_memory_map(out: *mut u64, max: usize) -> 
         for (i, region) in map.iter().take(max).enumerate() {
             let words = [
                 region.address as u64,
-                region.pages as u64,
-                region.access.raw(),
+                region.pages() as u64,
+                region.access().raw(),
             ];
             // SAFETY: the caller gives room for `3 * max` words.
             unsafe { out.add(3 * i).copy_from_nonoverlapping(words.as_ptr(), 3) };

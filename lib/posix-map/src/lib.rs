@@ -25,26 +25,72 @@ use core::mem::MaybeUninit;
 /// process.
 pub const MAX_PIECES: usize = MAX_MAPPINGS as usize;
 
+/// The objects of a map at most. Few pieces show an object of their own: the
+/// heap's chunks, the loader's segments and the large, shared and file
+/// mappings.
+pub const MAX_OBJECTS: usize = 32;
+
 /// The page of the map.
 pub const PAGE: usize = 4096;
 
 /// One entry of the kernel's table: `pages` pages from `address` show the
-/// pages of `object` from page `offset` on, with `access`.
+/// pages of `object` from page `offset` on, with `access`. 24 bytes: the
+/// map lies in the program's data, which the quota pays for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Piece {
     pub address: usize,
-    pub pages: usize,
-    pub access: Access,
-    /// The first page of the object the piece shows.
-    pub offset: usize,
+    pages: u32,
+    offset: u32,
+    access: u8,
     /// The index of the object in the map.
-    pub object: usize,
+    object: u8,
 }
 
 impl Piece {
+    pub fn new(
+        address: usize,
+        pages: usize,
+        access: Access,
+        offset: usize,
+        object: usize,
+    ) -> Piece {
+        Piece {
+            address,
+            pages: u32::try_from(pages).expect("pages of a piece"),
+            offset: u32::try_from(offset).expect("offset of a piece"),
+            access: access.raw() as u8,
+            object: u8::try_from(object).expect("object of a piece"),
+        }
+    }
+
+    pub const fn pages(&self) -> usize {
+        self.pages as usize
+    }
+
+    /// The first page of the object the piece shows.
+    pub const fn offset(&self) -> usize {
+        self.offset as usize
+    }
+
+    pub fn access(&self) -> Access {
+        Access::from_raw(u64::from(self.access)).expect("an access of a piece")
+    }
+
+    pub fn with_access(self, access: Access) -> Piece {
+        Piece {
+            access: access.raw() as u8,
+            ..self
+        }
+    }
+
+    /// The object of the piece.
+    pub const fn object(&self) -> usize {
+        self.object as usize
+    }
+
     /// The first address past the piece.
     pub const fn end(&self) -> usize {
-        self.address + self.pages * PAGE
+        self.address + self.pages as usize * PAGE
     }
 }
 
@@ -54,16 +100,28 @@ impl Piece {
 pub struct Back {
     /// The descriptor the layer holds for it.
     pub fd: i32,
-    /// The byte of the file the object's first byte shows.
-    pub offset: u64,
+    page: u32,
+}
+
+impl Back {
+    /// `offset` is the byte of the file the object's first byte shows, a
+    /// multiple of the page.
+    pub fn new(fd: i32, offset: u64) -> Back {
+        Back {
+            fd,
+            page: u32::try_from(offset / PAGE as u64).expect("offset of a mapped file"),
+        }
+    }
+
+    pub fn offset(&self) -> u64 {
+        u64::from(self.page) * PAGE as u64
+    }
 }
 
 /// One memory object the process has mapped.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Object<H> {
     pub handle: H,
-    /// The pages of the object.
-    pub pages: usize,
     /// Shared with other processes and with a forked child (MAP_SHARED).
     pub shared: bool,
     pub back: Option<Back>,
@@ -85,7 +143,7 @@ pub enum Refused {
 /// map is all zeros and lies in the program's zeroed data.
 pub struct Map<H> {
     pieces: [MaybeUninit<Piece>; MAX_PIECES],
-    objects: [Option<Object<H>>; MAX_PIECES],
+    objects: [Option<Object<H>>; MAX_OBJECTS],
     len: usize,
 }
 
@@ -93,7 +151,7 @@ impl<H> Map<H> {
     pub const fn new() -> Self {
         Map {
             pieces: [const { MaybeUninit::uninit() }; MAX_PIECES],
-            objects: [const { None }; MAX_PIECES],
+            objects: [const { None }; MAX_OBJECTS],
             len: 0,
         }
     }
@@ -109,6 +167,11 @@ impl<H> Map<H> {
 
     pub const fn is_full(&self) -> bool {
         self.len == MAX_PIECES
+    }
+
+    /// Whether the map has a place for one more object.
+    pub fn has_room_for_object(&self) -> bool {
+        self.objects.iter().any(Option::is_none)
     }
 
     /// The places left for pieces.
@@ -155,12 +218,12 @@ impl<H> Map<H> {
 
     /// The pieces of all the objects, in pages.
     pub fn pages(&self) -> usize {
-        self.iter().map(|piece| piece.pages).sum()
+        self.iter().map(|piece| piece.pages()).sum()
     }
 
     /// The pieces of an object.
     pub fn pieces_of(&self, object: usize) -> impl Iterator<Item = &Piece> {
-        self.iter().filter(move |piece| piece.object == object)
+        self.iter().filter(move |piece| piece.object() == object)
     }
 
     /// The index of the piece that holds `address`.
@@ -210,16 +273,7 @@ impl<H> Map<H> {
             .iter()
             .take_while(|held| held.address < address)
             .count();
-        self.insert_piece(
-            at,
-            Piece {
-                address,
-                pages,
-                access,
-                offset,
-                object: index,
-            },
-        );
+        self.insert_piece(at, Piece::new(address, pages, access, offset, index));
         Ok(index)
     }
 
@@ -249,16 +303,7 @@ impl<H> Map<H> {
             .iter()
             .take_while(|held| held.address < address)
             .count();
-        self.insert_piece(
-            at,
-            Piece {
-                address,
-                pages,
-                access,
-                offset,
-                object,
-            },
-        );
+        self.insert_piece(at, Piece::new(address, pages, access, offset, object));
         Ok(())
     }
 
@@ -336,31 +381,37 @@ impl<H> Map<H> {
             return Err(Refused::Full);
         }
         let mut at = index;
+        let object = piece.object();
         if before != 0 {
             self.insert_piece(
                 at,
-                Piece {
-                    pages: before,
-                    ..piece
-                },
+                Piece::new(
+                    piece.address,
+                    before,
+                    piece.access(),
+                    piece.offset(),
+                    object,
+                ),
             );
             at += 1;
         }
-        *self.piece_mut(at) = Piece {
+        *self.piece_mut(at) = Piece::new(
             address,
             pages,
-            offset: piece.offset + before,
-            ..piece
-        };
+            piece.access(),
+            piece.offset() + before,
+            object,
+        );
         if after != 0 {
             self.insert_piece(
                 at + 1,
-                Piece {
-                    address: end,
-                    pages: after,
-                    offset: piece.offset + before + pages,
-                    ..piece
-                },
+                Piece::new(
+                    end,
+                    after,
+                    piece.access(),
+                    piece.offset() + before + pages,
+                    object,
+                ),
             );
         }
         Ok(at)
@@ -378,7 +429,8 @@ impl<H> Map<H> {
         access: Access,
     ) -> Result<(), Refused> {
         let at = self.cut(index, address, pages)?;
-        self.piece_mut(at).access = access;
+        let cut = *self.piece(at);
+        *self.piece_mut(at) = cut.with_access(access);
         Ok(())
     }
 
@@ -392,9 +444,9 @@ impl<H> Map<H> {
         pages: usize,
     ) -> Result<Option<Object<H>>, Refused> {
         let at = self.cut(index, address, pages)?;
-        let object = self.piece(at).object;
+        let object = self.piece(at).object();
         self.remove_piece(at);
-        if self.iter().any(|piece| piece.object == object) {
+        if self.iter().any(|piece| piece.object() == object) {
             Ok(None)
         } else {
             Ok(self.objects[object].take())
@@ -437,10 +489,9 @@ impl<H> Default for Map<H> {
 mod tests {
     use super::*;
 
-    fn object(handle: u32, pages: usize) -> Object<u32> {
+    fn object(handle: u32, _pages: usize) -> Object<u32> {
         Object {
             handle,
-            pages,
             shared: false,
             back: None,
         }
@@ -451,10 +502,10 @@ mod tests {
             .map(|p| {
                 (
                     p.address,
-                    p.pages,
-                    p.access,
-                    p.offset,
-                    map.object(p.object).handle,
+                    p.pages(),
+                    p.access(),
+                    p.offset(),
+                    map.object(p.object()).handle,
                 )
             })
             .collect()
@@ -483,29 +534,45 @@ mod tests {
         assert_eq!(map.iter().last().unwrap().end(), 0x1006_4000);
     }
 
-    /// The 129th piece is refused, and the map still holds the 128.
+    /// The 129th piece is refused, and the map still holds the 128; the 33rd
+    /// object is refused too.
     #[test]
-    fn a_map_holds_128_pieces() {
-        assert_eq!(MAX_PIECES, 128);
+    fn a_map_holds_128_pieces_and_32_objects() {
+        assert_eq!((MAX_PIECES, MAX_OBJECTS), (128, 32));
         let mut map = Map::new();
-        for i in 0..MAX_PIECES {
-            assert!(!map.is_full());
-            map.push(
-                0x1000_0000 + i * PAGE,
-                1,
-                Access::ReadWrite,
-                0,
-                object(i as u32, 1),
-            )
+        let one = map
+            .push(0x1000_0000, 1, Access::ReadWrite, 0, object(0, 1))
             .unwrap();
+        for i in 1..MAX_PIECES {
+            assert!(!map.is_full());
+            map.push_piece(0x1000_0000 + i * PAGE, 1, Access::ReadWrite, i, one)
+                .unwrap();
         }
         assert!(map.is_full());
         assert_eq!(
             map.push(0x2000_0000, 1, Access::ReadWrite, 0, object(999, 1)),
             Err(Refused::Full)
         );
+        assert_eq!(
+            map.push_piece(0x2000_0000, 1, Access::ReadWrite, 0, one),
+            Err(Refused::Full)
+        );
         assert_eq!(map.len(), 128);
-        assert_eq!(map.object(map.iter().last().unwrap().object).handle, 127);
+        let mut map = Map::new();
+        for i in 0..MAX_OBJECTS {
+            map.push(
+                0x1000_0000 + i * PAGE,
+                1,
+                Access::Read,
+                0,
+                object(i as u32, 1),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            map.push(0x3000_0000, 1, Access::Read, 0, object(99, 1)),
+            Err(Refused::Full)
+        );
     }
 
     /// A refused object and a dropped map give their handles back once
@@ -517,7 +584,6 @@ mod tests {
         let mut map = Map::new();
         let make = || Object {
             handle: handle.clone(),
-            pages: 1,
             shared: false,
             back: None,
         };
@@ -549,7 +615,6 @@ mod tests {
                 0,
                 Object {
                     handle: handle.clone(),
-                    pages: 1,
                     shared: false,
                     back: None,
                 },
@@ -566,7 +631,6 @@ mod tests {
             0,
             Object {
                 handle: Rc::new(()),
-                pages: 1,
                 shared: false,
                 back: None,
             },
@@ -609,12 +673,12 @@ mod tests {
         // The same range again changes only its access.
         map.protect(1, 0x12000, 2, Access::ReadWrite).unwrap();
         assert_eq!(map.len(), 3);
-        assert_eq!(map.piece(1).access, Access::ReadWrite);
+        assert_eq!(map.piece(1).access(), Access::ReadWrite);
         // An edge cuts in two.
         map.protect(2, 0x14000, 1, Access::Read).unwrap();
         assert_eq!(map.len(), 4);
-        assert_eq!(map.piece(2).offset, 4);
-        assert_eq!(map.piece(3).offset, 5);
+        assert_eq!(map.piece(2).offset(), 4);
+        assert_eq!(map.piece(3).offset(), 5);
     }
 
     /// With 127 pieces a cut in the middle needs two places and finds one:
@@ -625,14 +689,8 @@ mod tests {
         map.push(0x10000, 8, Access::ReadWrite, 0, object(7, 8))
             .unwrap();
         for i in 0..126 {
-            map.push(
-                0x100000 + i * 2 * PAGE,
-                1,
-                Access::Read,
-                0,
-                object(i as u32, 1),
-            )
-            .unwrap();
+            map.push_piece(0x100000 + i * 2 * PAGE, 1, Access::Read, i, 0)
+                .unwrap();
         }
         assert_eq!(map.len(), 127);
         let before = held(&map);

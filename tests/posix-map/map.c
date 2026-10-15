@@ -16,8 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PAGE 4096UL
@@ -161,7 +163,7 @@ static void errors(void) {
 /* Every other page of a mapping cut off: the map fills, mprotect says
  * ENOMEM and changes nothing, munmap still succeeds. */
 static void table_full(void) {
-    size_t pages = 240;
+    size_t pages = 124;
     char *p = anon(pages * PAGE, PROT_READ | PROT_WRITE);
     check("full: mmap", p != NULL);
     if (!p) return;
@@ -175,7 +177,7 @@ static void table_full(void) {
             break;
         }
     }
-    check("full: the table fills with ENOMEM", refused && cut > 40 && cut < 128);
+    check("full: the table fills with ENOMEM", refused && cut > 20 && cut < 128);
     int same = 1;
     for (size_t i = 0; i < pages && same; i += 2) same &= !write_faults(p + i * PAGE);
     check("full: the pages before stay writable", same);
@@ -393,6 +395,48 @@ static void shared_names(void) {
 
 extern char **environ;
 
+/* RLIMIT_DATA and RLIMIT_AS count the program's mappings; RLIMIT_STACK is
+ * kept. */
+static void limits(void) {
+    struct rlimit old_data, old_as, stack, low;
+    check("getrlimit DATA", getrlimit(RLIMIT_DATA, &old_data) == 0);
+    check("getrlimit AS", getrlimit(RLIMIT_AS, &old_as) == 0);
+    check("getrlimit STACK", getrlimit(RLIMIT_STACK, &stack) == 0 && stack.rlim_cur > 0);
+    low = old_data;
+    low.rlim_cur = PAGE;
+    check("setrlimit DATA", setrlimit(RLIMIT_DATA, &low) == 0);
+    errno = 0;
+    check("DATA stops mmap", mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED
+          && errno == ENOMEM);
+    check("DATA is read back", getrlimit(RLIMIT_DATA, &low) == 0 && low.rlim_cur == PAGE);
+    check("restore DATA", setrlimit(RLIMIT_DATA, &old_data) == 0);
+    char *p = anon(2 * PAGE, PROT_READ | PROT_WRITE);
+    check("DATA restored", p != NULL);
+    if (p) munmap(p, 2 * PAGE);
+    low = old_as;
+    low.rlim_cur = PAGE;
+    check("setrlimit AS", setrlimit(RLIMIT_AS, &low) == 0);
+    errno = 0;
+    check("AS stops a large mapping", mmap(NULL, 512 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED
+          && errno == ENOMEM);
+    errno = 0;
+    check("AS stops a shared mapping", mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0) == MAP_FAILED
+          && errno == ENOMEM);
+    check("restore AS", setrlimit(RLIMIT_AS, &old_as) == 0);
+    p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check("AS restored", p != MAP_FAILED);
+    if (p != MAP_FAILED) munmap(p, PAGE);
+}
+
+/* The time functions allocate through the same mappings. */
+static void time_functions(void) {
+    time_t t = 86400 * 365;
+    struct tm *parts = localtime(&t);
+    check("localtime", parts && parts->tm_year == 71);
+    char buffer[64];
+    check("strftime", parts && strftime(buffer, sizeof buffer, "%Y", parts) == 4);
+}
+
 int main(int argc, char **argv) {
     (void)argv;
     if (argc == 1) {
@@ -409,6 +453,8 @@ int main(int argc, char **argv) {
     }
     struct sigaction action = {.sa_handler = on_fault};
     sigaction(SIGSEGV, &action, NULL);
+    time_functions();
+    table_full();
     protect_whole(PAGE, "small");
     protect_whole(5 * PAGE, "five pages");
     protect_whole(32 * PAGE, "32 pages");
@@ -418,10 +464,10 @@ int main(int argc, char **argv) {
     errors();
     forked();
     churn();
-    table_full();
     shared_anonymous();
     files();
     shared_names();
+    limits();
     if (failures) {
         printf("posix-map: %d failures\n", failures);
         return 1;

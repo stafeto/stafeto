@@ -146,7 +146,7 @@ fn file_mapping(
     } else {
         None
     };
-    let back = keep.map(|fd| Back { fd, offset });
+    let back = keep.map(|fd| Back::new(fd, offset));
     // The pages are written first and get the access asked for after.
     let made = mmap::mmap(addr, len, prot | PROT_WRITE, flags, back);
     let address = match made {

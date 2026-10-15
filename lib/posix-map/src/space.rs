@@ -9,8 +9,11 @@
 
 use crate::PAGE;
 
-/// The pages of the room: 256 MiB.
-pub const ROOM_PAGES: usize = 65536;
+/// The pages of the room: 32 MiB, the first of the 256 MiB the loader
+/// admits for the layer's heap. A process pays for what it maps from its
+/// quota (2 MiB by default), and the bitmap lies in the program's data,
+/// which the quota pays for.
+pub const ROOM_PAGES: usize = 8192;
 
 /// What a page is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,11 +175,11 @@ mod tests {
     #[test]
     fn a_new_room_is_unbacked_and_a_run_is_found_from_either_end() {
         let mut space = Space::new(BASE);
-        assert_eq!(space.limit(), 0x2000_0000);
+        assert_eq!(space.limit(), BASE + ROOM_PAGES * PAGE);
         assert_eq!(space.find(16, State::Unbacked, false), Some(BASE));
         assert_eq!(
             space.find(16, State::Unbacked, true),
-            Some(0x2000_0000 - 16 * PAGE)
+            Some(space.limit() - 16 * PAGE)
         );
         assert!(space.set(BASE, 16, State::Free));
         assert_eq!(space.get(BASE + 15 * PAGE), Some(State::Free));
@@ -198,8 +201,8 @@ mod tests {
         assert_eq!(space.find(3, State::Free, false), Some(BASE));
         assert_eq!(space.longest(State::Free), 4);
         assert!(!space.set(BASE - PAGE, 1, State::User));
-        assert!(!space.set(0x2000_0000 - PAGE, 2, State::User));
-        assert_eq!(space.get(0x2000_0000), None);
+        assert!(!space.set(space.limit() - PAGE, 2, State::User));
+        assert_eq!(space.get(space.limit()), None);
         assert!(space.all(BASE + 4 * PAGE, 4, State::Free));
         assert!(!space.all(BASE, 8, State::Free));
         assert_eq!(space.count(State::User), 1);

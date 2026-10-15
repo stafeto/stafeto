@@ -317,13 +317,13 @@ fn regions() -> Result<Regions, i32> {
     let count = crate::allocation::regions(|map| {
         let mut count = 0;
         for (place, piece) in seen.iter_mut().zip(map.iter()) {
-            let object = map.object(piece.object);
+            let object = map.object(piece.object());
             *place = (
                 Region {
                     address: piece.address as u64,
-                    pages: u32::try_from(piece.pages).map_err(|_| ENOMEM)?,
-                    access: piece.access,
-                    offset: u32::try_from(piece.offset).map_err(|_| ENOMEM)?,
+                    pages: u32::try_from(piece.pages()).map_err(|_| ENOMEM)?,
+                    access: piece.access(),
+                    offset: u32::try_from(piece.offset()).map_err(|_| ENOMEM)?,
                     shared: object.shared,
                 },
                 object.handle.raw().0,
@@ -577,8 +577,8 @@ pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
     let at = resume as *const () as u64;
     let code = crate::allocation::regions(|map| {
         map.iter().any(|r| {
-            r.access == Access::ReadExec
-                && (r.address as u64..r.address as u64 + r.pages as u64 * 4096).contains(&at)
+            r.access() == Access::ReadExec
+                && (r.address as u64..r.address as u64 + r.pages() as u64 * 4096).contains(&at)
         })
     });
     if !code {
@@ -728,8 +728,8 @@ pub fn probe_resume_read_exec() -> bool {
     let at = resume as *const () as u64;
     crate::allocation::regions(|map| {
         map.iter().any(|r| {
-            r.access == Access::ReadExec
-                && (r.address as u64..r.address as u64 + r.pages as u64 * 4096).contains(&at)
+            r.access() == Access::ReadExec
+                && (r.address as u64..r.address as u64 + r.pages() as u64 * 4096).contains(&at)
         })
     })
 }
