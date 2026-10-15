@@ -254,7 +254,11 @@ pub(crate) fn place(on_stack: bool, frame: u64, sp: u64) -> Place {
         if here {
             Place::Here
         } else {
-            Place::Alternate { top: high }
+            // Under the live frames while a handler off the stack runs.
+            let cut = row().cut.load(Ordering::Relaxed);
+            Place::Alternate {
+                top: if cut != 0 { cut } else { high },
+            }
         }
     } else if frame != 0 && here && !(low..=high).contains(&sp) {
         // The dispatcher's frame is at the top and the interrupted code is
@@ -331,7 +335,12 @@ pub(crate) fn jump(outer: u64, target: u64) -> bool {
     let call = entries::call_frame(outer, floor(), range);
     let leaves = entries::jump_clears_frames(outer, call, entries::frame_in(target, range));
     if let Some((low, high)) = range {
-        if leaves && alt.floor.swap(0, Ordering::Relaxed) != 0 {
+        // A handler off the stack is left by a jump to a target outside the
+        // range or above its start; relibc's threads keep `outer` at 0, so
+        // this does not depend on `leaves`.
+        let floor = alt.floor.load(Ordering::Relaxed);
+        if floor != 0 && (!(low..high).contains(&target) || target > floor) {
+            alt.floor.store(0, Ordering::Relaxed);
             alt.cut.store(0, Ordering::Relaxed);
             let _ = rt::upcall::set_stack(low, high - low);
         }

@@ -263,6 +263,66 @@ static int f_off_stack_nested(void) {
     return sum == 8 * 0x1234 + 28 ? 0 : 6;
 }
 
+/* 100 jumps out of a handler without SA_ONSTACK entered at the top of the
+ * alternate stack: each leaves the kernel's range whole, and the stack still
+ * serves a handler with SA_ONSTACK at the end. */
+static void f_h_jump(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    siglongjmp(f_env, 1);
+}
+static void f_h_last(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    volatile char here = 0;
+    f_stage = f_in_alt(&here) && f_on_alt() == 1 ? 2 : 90;
+}
+static int f_many_jumps(void) {
+    if (f_set_alt()) return 1;
+    if (f_catch(SIGUSR1, f_h_jump, 0)) return 2;
+    if (f_catch(SIGUSR2, f_h_last, SA_ONSTACK)) return 3;
+    for (int i = 0; i < 100; i++) {
+        if (sigsetjmp(f_env, 1) == 0) {
+            raise(SIGUSR1);
+            return 4;
+        }
+    }
+    f_stage = 0;
+    raise(SIGUSR2);
+    return f_stage == 2 ? 0 : 20 + f_stage % 70;
+}
+
+/* A plain handler (no SA_SIGINFO) without SA_ONSTACK raises a signal whose
+ * plain handler has SA_ONSTACK: no entry of the kernel serves it, and the
+ * stack it takes lies under the live frame of the first entry. */
+static void f_h_plain_on(int sig) {
+    (void)sig;
+    volatile unsigned char junk[3072];
+    for (unsigned i = 0; i < sizeof(junk); i++) junk[i] = 0xEE;
+    f_stage = f_in_alt(&junk[0]) ? 2 : 90;
+}
+static void f_h_plain_off(int sig) {
+    (void)sig;
+    raise(SIGUSR2);
+}
+static void f_h_info_off(int sig, siginfo_t *info, void *ctx) {
+    (void)info; (void)ctx;
+    f_h_plain_off(sig);
+}
+static int f_plain_on_in_off(void) {
+    if (f_set_alt()) return 1;
+    /* The outer handler has SA_SIGINFO, so that its entry comes to the top
+     * of the alternate stack; the inner one is plain. */
+    if (f_catch(SIGUSR1, f_h_info_off, 0)) return 2;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = f_h_plain_on;
+    sa.sa_flags = SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGUSR2, &sa, NULL)) return 3;
+    f_stage = 0;
+    raise(SIGUSR1);
+    return f_stage == 2 ? 0 : 20 + f_stage % 70;
+}
+
 static volatile int f_code, f_signo;
 static volatile unsigned long f_addr, f_pc;
 static void f_h_class(int sig, siginfo_t *info, void *ctx) {
@@ -380,6 +440,8 @@ static int faults_role(void) {
     f_child("overflow of the alternate stack itself", f_alt_overflow, 0, SIGSEGV);
     f_child("overflow without an alternate stack", f_overflow_default, 0, SIGSEGV);
     f_child("a signal inside the handler on the alternate stack", f_nested_on_alt, 0, 0);
+    f_child("100 jumps out of a handler off the alternate stack", f_many_jumps, 0, 0);
+    f_child("a plain SA_ONSTACK signal inside a handler off the stack", f_plain_on_in_off, 0, 0);
     f_child("a handler off the alternate stack", f_off_stack_plain, 0, 0);
     f_child("a handler off the alternate stack with a signal off it", f_off_stack_both, 0, 0);
     f_child("a handler off the alternate stack with a signal on it", f_off_stack_on, 0, 0);
