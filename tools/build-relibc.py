@@ -26,11 +26,12 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # streams close on exec, posix-regex is a path package; tagged pin-af950908.
 # F7 services: alarm, setitimer and getitimer (ITIMER_REAL), timer_create and
 # its kin with timer_getoverrun, sigqueue, clock, _POSIX_TIMERS and the timer
-# limits of sysconf, SI_TIMER; tagged pin-acb7dd66.
+# limits of sysconf, SI_TIMER, _POSIX_REALTIME_SIGNALS not claimed; tagged
+# pin-52ebecff.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "acb7dd6689fa9748bcfde6f6c20347ef659a9985"
+COMMIT = "52ebecffdcc19cb49f103c84ec0a5e7336d5d280"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
