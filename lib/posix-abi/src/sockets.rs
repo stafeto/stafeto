@@ -17,10 +17,10 @@ use crate::names::AT_FDCWD;
 use crate::shared;
 use posix_fs::{Target, Transport};
 use proto_pipe::sock::{
-    ADDR_INET, ADDR_NONE, ADDR_UNIX, Addr, DGRAM, DONTWAIT, FDS_MAX, INET, NAME_MAX,
-    OPT_ACCEPTCONN, OPT_BROADCAST, OPT_DOMAIN, OPT_ERROR, OPT_KEEPALIVE, OPT_RCVBUF, OPT_REUSEADDR,
-    OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC, OUT_TRUNC, PEEK, Received, Recv, SEND_MAX, SOCK_END, STREAM,
-    Send, UNIX,
+    ADDR_INET, ADDR_NONE, ADDR_UNIX, Addr, DGRAM, DONTWAIT, FDS_MAX, INET, NAME_MAX, OOB,
+    OPT_ACCEPTCONN, OPT_ATMARK, OPT_BROADCAST, OPT_DOMAIN, OPT_ERROR, OPT_KEEPALIVE, OPT_RCVBUF,
+    OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC, OUT_TRUNC, PEEK, Received, Recv, SEND_MAX,
+    SOCK_END, STREAM, Send, UNIX,
 };
 use proto_pipe::{Endpoint, Method};
 use proto_wire::{Reader, Status, Writer};
@@ -580,7 +580,9 @@ pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
 
 /// sockatmark: no socket has out-of-band data.
 pub fn sockatmark(fd: i32) -> Result<i32, i32> {
-    with_socket(fd, |_, _| Ok(0))
+    with_socket(fd, |transport, end| {
+        option(transport, end, OPT_ATMARK, false, 0).map(|mark| mark as i32)
+    })
 }
 
 fn wire_flags(flags: i32) -> Result<u32, i32> {
@@ -591,7 +593,8 @@ fn wire_flags(flags: i32) -> Result<u32, i32> {
             | MSG_EOR
             | MSG_WAITALL
             | MSG_CMSG_CLOEXEC
-            | MSG_TRUNC)
+            | MSG_TRUNC
+            | MSG_OOB)
         != 0
     {
         return Err(EOPNOTSUPP);
@@ -601,7 +604,8 @@ fn wire_flags(flags: i32) -> Result<u32, i32> {
             DONTWAIT
         } else {
             0
-        })
+        }
+        | if flags & MSG_OOB != 0 { OOB } else { 0 })
 }
 
 /// The descriptions the SCM_RIGHTS messages of `control` carry: the numbers
@@ -695,9 +699,6 @@ pub fn send(
 ) -> Result<usize, i32> {
     let size: usize = iov.iter().map(|part| part.len()).sum();
     let wire = wire_flags(flags)?;
-    if flags & MSG_OOB != 0 {
-        return Err(EOPNOTSUPP);
-    }
     let point = crate::threads::cancel::Point::begin();
     let result = with_socket(fd, |transport, end| {
         let to = match name {
@@ -804,9 +805,6 @@ pub fn recv(
 ) -> Result<Message, i32> {
     let size: usize = iov.iter().map(|part| part.len()).sum();
     let wire = wire_flags(flags)?;
-    if flags & MSG_OOB != 0 {
-        return Err(EOPNOTSUPP);
-    }
     let point = crate::threads::cancel::Point::begin();
     let result = with_socket(fd, |transport, end| {
         let pipes = pipes_of(transport)?;

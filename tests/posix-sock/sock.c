@@ -140,6 +140,18 @@ static int inet_stream(void) {
     CHECK(recv(c, buf, sizeof buf, MSG_PEEK) == 5);
     CHECK(recv(c, buf, sizeof buf, 0) == 5 && memcmp(buf, "hello", 5) == 0);
     CHECK(recv(c, buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    /* An out-of-band byte: apart from the stream, with a mark in it. */
+    CHECK(sockatmark(c) == 0);
+    CHECK(send(s, "ab", 2, 0) == 2 && send(s, "X", 1, MSG_OOB) == 1 && send(s, "cd", 2, 0) == 2);
+    CHECK(sockatmark(c) == 0);
+    struct pollfd pri = {c, POLLPRI, 0};
+    CHECK(poll(&pri, 1, 0) == 1 && (pri.revents & POLLPRI));
+    CHECK(recv(c, buf, sizeof buf, 0) == 2 && memcmp(buf, "ab", 2) == 0);
+    CHECK(sockatmark(c) == 1);
+    CHECK(recv(c, buf, sizeof buf, MSG_OOB) == 1 && buf[0] == 'X');
+    CHECK(sockatmark(c) == 0);
+    CHECK(recv(c, buf, sizeof buf, MSG_OOB) == -1 && errno == EINVAL);
+    CHECK(recv(c, buf, sizeof buf, 0) == 2 && memcmp(buf, "cd", 2) == 0);
     /* The address is in use; the port that nobody listens at refuses. */
     int d = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(bind(d, (struct sockaddr *)&addr, sizeof addr) == -1 && errno == EADDRINUSE);

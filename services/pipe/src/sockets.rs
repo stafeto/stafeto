@@ -21,9 +21,9 @@ use super::*;
 use proto_pipe::sock::{
     ADDR_INET, ADDR_MAX, ADDR_NONE, ADDR_UNIX, Addr, BACKLOG_MAX, BAD_TYPE, CONNECTED, DGRAM,
     DONTWAIT, FDS_MAX, IN_USE, INET, NO_BUFFERS, NO_DESTINATION, NO_FAMILY, NO_OPTION,
-    NOT_CONNECTED, NOT_SUPPORTED, OPT_ACCEPTCONN, OPT_BROADCAST, OPT_DOMAIN, OPT_ERROR,
-    OPT_KEEPALIVE, OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC, OUT_TRUNC, PEEK,
-    REFUSED, RING, SEND_MAX, STREAM, TOO_BIG, UNIX,
+    NOT_CONNECTED, NOT_SUPPORTED, OOB, OPT_ACCEPTCONN, OPT_ATMARK, OPT_BROADCAST, OPT_DOMAIN,
+    OPT_ERROR, OPT_KEEPALIVE, OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC,
+    OUT_TRUNC, PEEK, REFUSED, RING, SEND_MAX, STREAM, TOO_BIG, UNIX,
 };
 use proto_wire::{Reader, Writer};
 
@@ -99,6 +99,11 @@ pub(super) struct Sock {
     tx_total: u32,
     anc: [Anc; ANC_MAX],
     anc_len: u8,
+    /// An out-of-band byte of the peer, taken by a receive with OOB, and
+    /// where in the stream (the bytes received before it) its mark is.
+    oob: bool,
+    oob_byte: u8,
+    oob_at: u32,
 }
 
 impl Sock {
@@ -136,6 +141,9 @@ impl Sock {
         tx_total: 0,
         anc: [Anc::NONE; ANC_MAX],
         anc_len: 0,
+        oob: false,
+        oob_byte: 0,
+        oob_at: 0,
     };
 }
 
@@ -702,10 +710,13 @@ impl Pipes {
             OPT_BROADCAST => Ok(flag(&mut s.broadcast)),
             OPT_RCVBUF => Ok(size(&mut s.rcvbuf)),
             OPT_SNDBUF => Ok(size(&mut s.sndbuf)),
-            OPT_TYPE | OPT_ERROR | OPT_ACCEPTCONN | OPT_DOMAIN if set => Err(NO_OPTION),
+            OPT_TYPE | OPT_ERROR | OPT_ACCEPTCONN | OPT_DOMAIN | OPT_ATMARK if set => {
+                Err(NO_OPTION)
+            }
             OPT_TYPE => Ok(s.kind),
             OPT_ERROR => Ok(0),
             OPT_ACCEPTCONN => Ok(u32::from(s.listening)),
+            OPT_ATMARK => Ok(u32::from(s.oob && s.oob_at == s.rx_total)),
             OPT_DOMAIN => Ok(s.domain),
             _ => Err(NO_OPTION),
         }
@@ -771,17 +782,24 @@ impl Pipes {
             }
             self.travelers(held, fds)?;
         }
+        if flags & OOB != 0 && (!fds.is_empty() || bytes.is_empty()) {
+            return Err(INVALID);
+        }
         if self.sockets.s[i].kind == STREAM {
-            self.stream_send(i, nonblock, fds, to, bytes, wakes)
+            self.stream_send(i, nonblock, flags & OOB != 0, fds, to, bytes, wakes)
+        } else if flags & OOB != 0 {
+            Err(NOT_SUPPORTED)
         } else {
             self.dgram_send(i, fds, to, bytes, wakes)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stream_send(
         &mut self,
         i: usize,
         nonblock: bool,
+        oob: bool,
         fds: &[u32],
         to: &Addr,
         bytes: &[u8],
@@ -804,6 +822,12 @@ impl Pipes {
         let Some(p) = self.sockets.peer_of(i) else {
             return Err(BROKEN);
         };
+        // The last byte of an out-of-band send is the byte itself, apart
+        // from the stream.
+        let (bytes, oob_byte) = match (oob, bytes.split_last()) {
+            (true, Some((last, rest))) => (rest, Some(*last)),
+            _ => (bytes, None),
+        };
         let room = self.sockets.room(p);
         let n = if bytes.len() <= ATOMIC_SEND {
             if room >= bytes.len() { bytes.len() } else { 0 }
@@ -818,8 +842,14 @@ impl Pipes {
         }
         self.sockets.put(p, &bytes[..n]);
         self.sockets.s[p].tx_total = self.sockets.s[p].tx_total.wrapping_add(n as u32);
+        if let Some(byte) = oob_byte {
+            let o = &mut self.sockets.s[p];
+            o.oob = true;
+            o.oob_byte = byte;
+            o.oob_at = o.tx_total;
+        }
         wakes.add(self.sockets.s[p].waiters.waiters);
-        Ok(Some(n))
+        Ok(Some(n + usize::from(oob_byte.is_some())))
     }
 
     /// The message of `fds` for `p`: AGAIN where its list of messages or the
@@ -923,6 +953,19 @@ impl Pipes {
         if s.listening {
             return Err(INVALID);
         }
+        if flags & OOB != 0 {
+            if s.kind != STREAM || !s.oob {
+                return Err(INVALID);
+            }
+            if out.is_empty() {
+                return Ok(Some(RecvOut::new(0)));
+            }
+            out[0] = s.oob_byte;
+            if !peek {
+                self.sockets.s[i].oob = false;
+            }
+            return Ok(Some(RecvOut::new(1)));
+        }
         if s.rd_shut {
             return Ok(Some(RecvOut::new(0)));
         }
@@ -943,7 +986,11 @@ impl Pipes {
         let has_fds = s.anc_len > 0 && s.anc[0].at == s.rx_total;
         if s.kind == STREAM {
             let mut n = out.len().min(usize::from(s.len));
-            // The bytes stop where the next message with descriptions starts.
+            // The bytes stop at the mark of an out-of-band byte, and where
+            // the next message with descriptions starts.
+            if s.oob && s.oob_at != s.rx_total {
+                n = n.min(s.oob_at.wrapping_sub(s.rx_total) as usize);
+            }
             let next = usize::from(has_fds);
             if usize::from(s.anc_len) > next {
                 let at = s.anc[next].at.wrapping_sub(s.rx_total) as usize;
@@ -1079,6 +1126,9 @@ impl Pipes {
         let mut ready = 0;
         if s.len != 0 || s.rx_eof || s.rd_shut || (s.listening && s.queued != 0) {
             ready |= watch::READ;
+        }
+        if s.oob {
+            ready |= watch::PRI;
         }
         if s.rx_eof && s.tx_broken {
             ready |= watch::HUP;
@@ -1250,6 +1300,52 @@ mod tests {
         let mut out = [0; 8];
         assert_eq!(p.sock_read(&held, c, &mut out, &mut w), Ok(Some(3)));
         assert_eq!(p.sock_read(&held, c, &mut out, &mut w), Ok(Some(0)));
+    }
+
+    #[test]
+    fn an_out_of_band_byte_has_a_mark_in_the_stream() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let mut w = Wakes::default();
+        let (_, c, s) = stream_pair(&mut p, &mut held, 5005);
+        let option = |p: &mut Pipes, h: &Held, e| p.sock_option(h, e, OPT_ATMARK, false, 0);
+        assert_eq!(option(&mut p, &held, c), Ok(0));
+        let send = |p: &mut Pipes, flags, bytes: &[u8], w: &mut Wakes| {
+            p.sock_send(&held, s, flags, &[], &Addr::NONE, bytes, w)
+        };
+        assert_eq!(send(&mut p, 0, b"ab", &mut w), Ok(Some(2)));
+        assert_eq!(send(&mut p, OOB, b"X", &mut w), Ok(Some(1)));
+        assert_eq!(send(&mut p, 0, b"cd", &mut w), Ok(Some(2)));
+        assert_eq!(send(&mut p, OOB, b"", &mut w), Err(INVALID));
+        assert_eq!(option(&mut p, &held, c), Ok(0));
+        assert_eq!(
+            p.readiness_endpoint(&held, c),
+            watch::READ | watch::WRITE | watch::PRI,
+            "the byte is an exceptional condition"
+        );
+        let mut out = [0; 8];
+        let got = p.sock_recv(&mut held, c, 0, &mut out, 0, &mut w);
+        assert_eq!(
+            got.map(|g| g.map(|g| g.n)),
+            Ok(Some(2)),
+            "stops at the mark"
+        );
+        assert_eq!(option(&mut p, &held, c), Ok(1));
+        let got = p.sock_recv(&mut held, c, OOB, &mut out, 0, &mut w);
+        assert_eq!((got.map(|g| g.map(|g| g.n)), out[0]), (Ok(Some(1)), b'X'));
+        assert_eq!(option(&mut p, &held, c), Ok(0));
+        assert_eq!(
+            p.sock_recv(&mut held, c, OOB, &mut out, 0, &mut w),
+            Err(INVALID)
+        );
+        let got = p.sock_recv(&mut held, c, 0, &mut out, 0, &mut w);
+        assert_eq!(got.map(|g| g.map(|g| g.n)), Ok(Some(2)));
+        // A datagram socket has none.
+        let d = make(&mut p, &mut held, INET, DGRAM);
+        assert_eq!(
+            p.sock_send(&held, d, OOB, &[], &inet(1), b"x", &mut w),
+            Err(NOT_SUPPORTED)
+        );
     }
 
     #[test]

@@ -55,6 +55,8 @@ pub const DGRAM: u32 = 2;
 /// Flags of a send or receive (the layer maps MSG_* to them).
 pub const PEEK: u32 = 1;
 pub const DONTWAIT: u32 = 2;
+/// The last byte of a send is out of band; a receive takes that byte.
+pub const OOB: u32 = 4;
 /// Flags of a received message.
 pub const OUT_TRUNC: u32 = 1;
 pub const OUT_CTRUNC: u32 = 2;
@@ -68,6 +70,8 @@ pub const OPT_ACCEPTCONN: u32 = 6;
 pub const OPT_DOMAIN: u32 = 7;
 pub const OPT_KEEPALIVE: u32 = 8;
 pub const OPT_BROADCAST: u32 = 9;
+/// Whether the next byte to read is the mark of a pending out-of-band byte.
+pub const OPT_ATMARK: u32 = 10;
 
 /// EADDRINUSE.
 pub const IN_USE: u32 = 708;
@@ -218,7 +222,7 @@ impl<'a> Send<'a> {
         let end = body.u32()?;
         let flags = body.u32()?;
         let nfds = body.u32()? as usize;
-        if nfds > FDS_MAX || key == Some(0) || flags & !(PEEK | DONTWAIT) != 0 {
+        if nfds > FDS_MAX || key == Some(0) || flags & !(PEEK | DONTWAIT | OOB) != 0 {
             return Err(Status::BadSize);
         }
         let mut fds = [0; FDS_MAX];
@@ -285,7 +289,7 @@ impl Recv {
         if r.count as usize > SEND_MAX
             || r.max_fds as usize > FDS_MAX
             || key == Some(0)
-            || r.flags & !(PEEK | DONTWAIT) != 0
+            || r.flags & !(PEEK | DONTWAIT | OOB) != 0
         {
             return Err(Status::BadSize);
         }
