@@ -38,6 +38,7 @@ fn main() {
     println!("cargo:rerun-if-changed=pending-fork.c");
     println!("cargo:rerun-if-changed=cleanup.c");
     println!("cargo:rerun-if-changed=jobs.c");
+    println!("cargo:rerun-if-changed=faults.c");
     println!("cargo:rerun-if-changed=loader-abort.c");
     println!("cargo:rerun-if-changed=image-gates.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");

@@ -53,13 +53,15 @@ pub struct Outcome {
     pub length: usize,
 }
 
-/// The range of the alternate signal stack of the calling thread. It is empty
-/// while `sigaltstack` answers ENOSYS, so `z` is 0 for every frame and the
-/// order of the frames is that of the main stack. The call that fills the
-/// range (5g or 5h) adds the probe of a handler on the alternate stack that
-/// calls `unlink` in the middle of a long `rename` of the main thread.
+/// The range of the alternate signal stack of the calling thread (empty
+/// without one, so `z` is 0 for every frame).
 fn alternate_stack() -> Option<(u64, u64)> {
-    None
+    crate::altstack::range()
+}
+
+/// The frame at the stack pointer `sp` of the calling thread.
+pub(crate) fn frame_at(sp: u64) -> Frame {
+    entries::frame_in(sp, alternate_stack())
 }
 
 /// The frame of the caller, as the position of its stack pointer.
@@ -70,11 +72,7 @@ fn here() -> Frame {
     unsafe {
         core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
     }
-    let z = match alternate_stack() {
-        Some((low, high)) if (low..high).contains(&sp) => 1,
-        _ => 0,
-    };
-    Frame { z, sp }
+    frame_at(sp)
 }
 
 fn errno_of(status: Status) -> i32 {

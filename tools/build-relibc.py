@@ -24,7 +24,10 @@ from pathlib import Path
 REPOSITORY = "https://github.com/stafeto/relibc.git"
 # Follow-ups of F11a: fmemopen ends with its buffer (ENOSPC, EINVAL), memory
 # streams close on exec, posix-regex is a path package; tagged pin-af950908.
-COMMIT = "af950908a83ac6f38ed376c52c1294473afe556b"
+# F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
+# long jump leaves the entry record to the layer's mark (platform interface
+# 17); tagged pin-65a12bf6.
+COMMIT = "65a12bf6855dc8cfe4ed02fd2e7f2c4b99dd3793"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

@@ -289,10 +289,16 @@ pub fn jump_mark(target_sp: u64) {
         crate::relibc::jump_owner().and_then(|owner| posix_fs::change::OwnerToken::new(owner).ok())
     {
         let _ = process_state(|files| {
-            files.mark_jump(owner, entries::Frame::main(target_sp));
+            files.mark_jump(owner, crate::change::frame_at(target_sp));
             Ok(())
         });
     }
+    // A target above the frame of a live resident call abandons it (the
+    // frames of two stacks are compared with their z); a request the
+    // abandoned entry owed goes back to the kernel. The deferral keeps any
+    // entry out meanwhile.
+    // SAFETY: the jump to the target follows at once.
+    unsafe { rt::upcall::abandon_frames(|outer| crate::altstack::jump(outer, target_sp)) };
     // Unlock cannot consume this local marker. Give it a real pending entry
     // before assembly resumes, even when no kernel entry was already pending.
     if block.flags.load(Ordering::SeqCst) & posix_thread::flag::ENTRY_DEFERRED != 0 {

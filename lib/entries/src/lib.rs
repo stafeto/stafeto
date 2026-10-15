@@ -93,6 +93,35 @@ pub const fn nested(inner: Frame, outer: Frame) -> bool {
     inner.z > outer.z || (inner.z == outer.z && inner.sp < outer.sp)
 }
 
+/// The frame at the stack pointer `sp` when the thread's alternate signal
+/// stack covers `alt` (low, high): `z` is 1 inside it.
+pub const fn frame_in(sp: u64, alt: Option<(u64, u64)>) -> Frame {
+    match alt {
+        Some((low, high)) if low <= sp && sp < high => Frame { z: 1, sp },
+        _ => Frame::main(sp),
+    }
+}
+
+/// The frame of the live resident call whose entry frame is `outer`. The
+/// entry frame lies at the top of the alternate stack whenever the kernel
+/// switched there, but the handler runs on the interrupted stack when it
+/// has no SA_ONSTACK: `floor` (not 0) is the stack pointer that handler
+/// started with, and it is the frame of the call then.
+pub const fn call_frame(outer: u64, floor: u64, alt: Option<(u64, u64)>) -> Frame {
+    if floor != 0 {
+        frame_in(floor, alt)
+    } else {
+        frame_in(outer, alt)
+    }
+}
+
+/// `jump_clears` for frames on two stacks: the word `outer` is cleared when
+/// the live resident call (its frame `call`) lies inside the frame of the
+/// jump target.
+pub const fn jump_clears_frames(outer: u64, call: Frame, target: Frame) -> bool {
+    outer != 0 && nested(call, target)
+}
+
 /// The hook of a long jump to the stack pointer `target`: whether the
 /// word `outer` is cleared. The resident call is abandoned when the target
 /// lies above its frame; a target at the frame or below it (a jump inside the
@@ -433,5 +462,50 @@ mod tests {
             [0, 8, 16, 24, 32, 40, 48, 56]
         );
         assert_eq!(ENTRY_WORDS_END, 64);
+    }
+
+    #[test]
+    fn frames_on_the_alternate_stack_lie_inside_the_main_ones() {
+        let alt = Some((0x10_0000, 0x10_4000));
+        // A call whose entry frame is on the alternate stack, handler too.
+        let call = call_frame(0x10_3000, 0, alt);
+        assert_eq!(
+            call,
+            Frame {
+                z: 1,
+                sp: 0x10_3000
+            }
+        );
+        // A jump to any main-stack frame leaves it, whatever the addresses.
+        for target in [0x8000, 0x7f_0000, 0x10_5000] {
+            assert!(jump_clears_frames(0x10_3000, call, frame_in(target, alt)));
+        }
+        // A jump to a lower place of the alternate stack stays inside.
+        assert!(!jump_clears_frames(
+            0x10_3000,
+            call,
+            frame_in(0x10_2000, alt)
+        ));
+        assert!(jump_clears_frames(
+            0x10_3000,
+            call,
+            frame_in(0x10_3800, alt)
+        ));
+        // The word is clear: nothing to settle.
+        assert!(!jump_clears_frames(0, call, frame_in(0x8000, alt)));
+    }
+    #[test]
+    fn a_handler_without_the_flag_keeps_its_call_on_the_main_stack() {
+        let alt = Some((0x10_0000, 0x10_4000));
+        // The entry frame is at the top of the alternate stack, the
+        // handler started at 0x7000 on the main stack.
+        let call = call_frame(0x10_3000, 0x7000, alt);
+        assert_eq!(call, Frame::main(0x7000));
+        // A jump inside the handler (below its start) keeps the word.
+        assert!(!jump_clears_frames(0x10_3000, call, frame_in(0x6800, alt)));
+        // A jump above it leaves the call.
+        assert!(jump_clears_frames(0x10_3000, call, frame_in(0x9000, alt)));
+        // Without an alternate stack the order is the one of the main stack.
+        assert_eq!(call_frame(0x9000, 0, None), Frame::main(0x9000));
     }
 }

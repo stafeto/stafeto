@@ -55,12 +55,23 @@ static volatile sig_atomic_t sg_leaves;
 static volatile sig_atomic_t sg_hits;
 static volatile sig_atomic_t sg_handler_bad;
 static volatile sig_atomic_t sg_jumps;
+static volatile sig_atomic_t sg_forks;
+static volatile sig_atomic_t sg_child;
+static volatile pid_t sg_child_pid;
 
 static void sg_handler(int signal) {
     (void)signal;
     if (!sg_in_rename) return;
     sg_in_rename = 0;
     sg_hits++;
+    if (sg_forks) {
+        /* A fork in the handler, inside the rename: the child returns from the
+         * handler into its copy of the rename. */
+        pid_t pid = fork();
+        if (pid == 0) sg_child = 1;
+        else sg_child_pid = pid;
+        return;
+    }
     if (sg_leaves) siglongjmp(sg_jump, 1);
     /* An operation of the handler inside the operation it interrupted. */
     if (mkdir("/tmp/sgh", 0700) != 0 || rmdir("/tmp/sgh") != 0) sg_handler_bad++;
@@ -131,6 +142,11 @@ static int sg_try(long delay_us, int *left, int from_new) {
         __atomic_store_n(&sg_entered, 1, __ATOMIC_RELEASE);
         result = from_new ? rename(SG_NEW, SG_LAST) : rename(SG_LAST, SG_NEW);
         sg_in_rename = 0;
+        if (sg_child) {
+            /* The child of the fork in the handler: its rename answers EIO and
+             * sent nothing; the job belongs to the parent. */
+            _exit(result == -1 && errno == EIO ? 0 : result == -1 ? 100 + errno : 99);
+        }
     } else {
         sg_in_rename = 0;
         *left = 1;
@@ -247,6 +263,31 @@ static int names_signals(void) {
     printf("posix-procs: names signal: %d handlers ran inside a rename that ended with 0, "
            "%u requests taken back by the kernel\n",
            (int)sg_hits, files_names_interrupted());
+
+    /* d. A fork in the handler: the child returns from the handler, its
+     * rename is EIO, the parent's ends with 0 once, and no place stays taken. */
+    sg_forks = 1;
+    int forked = 0;
+    for (int attempt = 0; attempt < 200 && forked < 2; attempt++) {
+        long delay = whole * (attempt % 9 + 1) / 10;
+        int left = 0;
+        sg_child_pid = 0;
+        int result = sg_try(delay, &left, sg_exists(SG_NEW));
+        SG_CHECK(result == 0 && !left);
+        if (sg_child_pid > 0) {
+            int status = -1;
+            SG_CHECK(waitpid(sg_child_pid, &status, 0) == sg_child_pid);
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                printf("posix-procs: names signal: the child of a fork in the handler ended with status %#x\n", status);
+            SG_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+            forked++;
+        }
+        SG_CHECK(sg_one_name());
+        SG_CHECK(files_names_places_in_use() == 0);
+    }
+    sg_forks = 0;
+    SG_CHECK(forked >= 2);
+    printf("posix-procs: names signal: %d children of a fork in a handler returned EIO from their rename\n", forked);
 
     /* b and c. Leaving by siglongjmp. Seventeen exits make the sixteen
      * places of the thread run out when nothing collects the records. */

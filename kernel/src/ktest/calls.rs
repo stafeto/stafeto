@@ -2703,10 +2703,90 @@ pub fn upcall_operations_5_to_12_are_invalid_and_change_nothing(
         let pc = (USER_VA + PAGE) as u64;
         check(
             // SAFETY: the held stopped Thread runs no user code.
-            unsafe { t.as_mut() }.upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
+            unsafe { t.as_mut() }.upcall.prepare(pc, 0, 0, false) == Some(USER_VA as u64),
             "the entry did not survive the retired numbers",
         )?;
-        c.succeeds(control, &[C::Take.raw()], &[1, pc, 0])
+        c.succeeds(control, &[C::Take.raw()], &[1, pc, 0, 0])
+    })
+}
+
+/// The operations 13 to 16 of thread_upcall_control through the call:
+/// Faults takes 0 or 1, Stack a range of multiples of 16 inside user space
+/// (size 0 removes it), Adopt only a thread that never entered and has its
+/// entry bound, and Query returns the nesting Adopt took; 17 and up are
+/// INVALID_ARGS like the retired numbers.
+pub fn upcall_fault_stack_adopt_and_query_check_their_arguments(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_caller(|c| {
+        use abi::UpcallControl as C;
+        let control = Call::ThreadUpcallControl.number();
+        let end = kcore::layout::USER_END as u64;
+        c.fails(control, &[C::Adopt.raw(), 1, 0], Error::BadState)?;
+        thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
+        c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
+        c.fails(control, &[C::Faults.raw(), 2], Error::InvalidArgs)?;
+        c.succeeds(control, &[C::Faults.raw(), 1], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Faults.raw(), 0], &[1, 0, 0])?;
+        for (base, size) in [
+            (0x1008, 0x1000),
+            (0x1000, 0x1008),
+            (end - 0x1000, 0x2000),
+            (u64::MAX - 15, 32),
+        ] {
+            c.fails(control, &[C::Stack.raw(), base, size], Error::InvalidArgs)?;
+        }
+        c.succeeds(control, &[C::Stack.raw(), end - 0x2000, 0x2000], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Stack.raw(), 0x1008, 0], &[1, 0, 0])?;
+        for raw in [17, 1 << 32] {
+            c.fails(control, &[raw, 0, 0], Error::InvalidArgs)?;
+        }
+        c.fails(control, &[C::Adopt.raw(), 1 << 32, 0], Error::InvalidArgs)?;
+        c.succeeds(control, &[C::Adopt.raw(), 2, 1], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Query.raw()], &[1, 0, 0, 2, 1])?;
+        // The thread has a depth now: no second adoption, no new binding.
+        c.fails(control, &[C::Adopt.raw(), 1, 0], Error::BadState)?;
+        c.fails(
+            Call::ThreadUpcallBind.number(),
+            &[USER_VA as u64],
+            Error::BadState,
+        )
+    })
+}
+
+/// A fault during a long call does not enter the entry (the call returns to
+/// its own `svc`, and no entry can precede that way back); once the call is
+/// given up, the same fault enters.
+pub fn fault_during_a_long_call_does_not_enter(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        use abi::UpcallControl as C;
+        const ESR_ABORT: u64 = 0x24 << 26;
+        thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
+        let control = Call::ThreadUpcallControl.number();
+        c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
+        c.succeeds(control, &[C::Faults.raw(), 1], &[1, 0, 0])?;
+        c.succeeds(control, &[C::Enable.raw()], &[1, 0, 0])?;
+        with_interrupt_pending(|| {
+            c.call(Call::MemCreate.number(), &[20 * PAGE_SIZE, 0]);
+            check(
+                thread::long(c.thread).is_some(),
+                "mem_create did not stop after a portion",
+            )?;
+            check(
+                !arch::exceptions::fault_enters(c.thread, ESR_ABORT, 0x10),
+                "a fault entered during a long call",
+            )?;
+            sched::entry_started();
+            c.again(Call::ClockNow.number());
+            check(
+                thread::long(c.thread).is_none(),
+                "another call did not give the long call up",
+            )
+        })?;
+        check(
+            arch::exceptions::fault_enters(c.thread, ESR_ABORT, 0x10),
+            "a fault did not enter once the long call was given up",
+        )
     })
 }
 
@@ -2731,10 +2811,10 @@ pub fn upcall_return_restores_the_native_context_exactly(_: &Boot) -> Result<(),
         check(
             // SAFETY: Caller holds this stopped Thread; no user code runs,
             // and the preceding local mutable borrow has ended.
-            unsafe { t.as_mut() }.upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
+            unsafe { t.as_mut() }.upcall.prepare(pc, 0, 0, false) == Some(USER_VA as u64),
             "no entry",
         )?;
-        c.succeeds(control, &[C::Take.raw()], &[1, pc, 0])?;
+        c.succeeds(control, &[C::Take.raw()], &[1, pc, 0, 0])?;
         c.succeeds(control, &[C::Mask.raw()], &[1, 0, 0])?;
         let mut context = [0u64; 102];
         for (i, value) in context.iter_mut().enumerate() {
@@ -2778,13 +2858,13 @@ pub fn upcall_request_refuses_a_stopped_thread(_: &Boot) -> Result<(), &'static 
         let upcall = || unsafe { &mut (*t.as_ptr()).upcall };
         upcall().bind(USER_VA as u64).map_err(|_| "bind failed")?;
         upcall()
-            .control(abi::UpcallControl::Enable)
+            .control(abi::UpcallControl::Enable, 0, 0)
             .map_err(|_| "enable failed")?;
         // SAFETY: the test holds the thread.
         let stopped = unsafe { t.as_ref() }.sched.state() == State::Stopped;
         // SAFETY: as above.
         let result = unsafe { sched::request_upcall(t, CAUSE) };
-        let entered = upcall().prepare(USER_VA as u64, 0, false);
+        let entered = upcall().prepare(USER_VA as u64, 0, 0, false);
         check(
             stopped && result == Err(Error::BadState) && entered.is_none(),
             "a request for a stopped thread was taken",
@@ -2866,7 +2946,7 @@ fn with_reply_wait(
                 let upcall = unsafe { &mut (*t.as_ptr()).upcall };
                 upcall.bind(USER_VA as u64).map_err(|_| "bind failed")?;
                 upcall
-                    .control(abi::UpcallControl::Enable)
+                    .control(abi::UpcallControl::Enable, 0, 0)
                     .map_err(|_| "enable failed")?;
             }
             let sent = channel::send(
@@ -2944,7 +3024,7 @@ pub fn upcall_request_waits_for_the_reply(_: &Boot) -> Result<(), &'static str> 
         let t = unsafe { &mut *w.t.as_ptr() };
         let pc = t.regs.elr;
         check(
-            t.upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
+            t.upcall.prepare(pc, 0, 0, false) == Some(USER_VA as u64),
             "no entry came after the reply",
         )?;
         check(w.has_reply(w.t), "the entry changed the reply's registers")
@@ -3050,10 +3130,10 @@ pub fn upcall_return_keeps_unimplemented_flags_off(_: &Boot) -> Result<(), &'sta
         let upcall = unsafe { &mut t.as_mut().upcall };
         upcall.request().map_err(|_| "no request")?;
         check(
-            upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
+            upcall.prepare(pc, 0, 0, false) == Some(USER_VA as u64),
             "the caller's thread did not enter its handler",
         )?;
-        c.succeeds(control, &[abi::UpcallControl::Take.raw()], &[1, pc, 0])?;
+        c.succeeds(control, &[abi::UpcallControl::Take.raw()], &[1, pc, 0, 0])?;
         let returns = |flags| {
             let mut context = [0u64; 102];
             context[31] = 0x80_1000;
@@ -5262,7 +5342,7 @@ fn upcall_calls(
     let upcall = unsafe { &mut (*target.as_ptr()).upcall };
     upcall.bind(USER_VA as u64).map_err(|_| "bind failed")?;
     upcall
-        .control(abi::UpcallControl::Enable)
+        .control(abi::UpcallControl::Enable, 0, 0)
         .map_err(|_| "enable failed")?;
     sender_in_transit(other, l, 0, &mut threads[1])?;
     let thread_handle =
@@ -5296,10 +5376,10 @@ fn upcall_calls(
     upcall.request().map_err(|_| "no request")?;
     let pc = (USER_VA + PAGE) as u64;
     check(
-        upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
+        upcall.prepare(pc, 0, 0, false) == Some(USER_VA as u64),
         "the caller's thread did not enter its handler",
     )?;
-    c.succeeds(control, &[abi::UpcallControl::Take.raw()], &[1, pc, 0])?;
+    c.succeeds(control, &[abi::UpcallControl::Take.raw()], &[1, pc, 0, 0])?;
     let mut context = [0u64; 102];
     for (i, w) in context.iter_mut().enumerate() {
         *w = 0xC0DE_0000 + i as u64;
@@ -6603,7 +6683,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
             (*t.as_ptr()).upcall.bind(USER_VA as u64).unwrap();
             (*t.as_ptr())
                 .upcall
-                .control(abi::UpcallControl::Enable)
+                .control(abi::UpcallControl::Enable, 0, 0)
                 .unwrap();
         }
         check(

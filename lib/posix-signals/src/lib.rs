@@ -10,7 +10,7 @@ pub const IGNORE: u64 = 1;
 pub const VALID: SigSet = (1 << 31) - 1;
 pub const UNBLOCKABLE: SigSet = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
 pub const FLAGS: i32 =
-    SA_NODEFER | SA_RESETHAND | SA_SIGINFO | SA_RESTART | SA_NOCLDSTOP | SA_NOCLDWAIT;
+    SA_NODEFER | SA_RESETHAND | SA_SIGINFO | SA_RESTART | SA_NOCLDSTOP | SA_NOCLDWAIT | SA_ONSTACK;
 pub const INITIAL: SigAction = SigAction {
     handler: DEFAULT,
     mask: 0,
@@ -103,6 +103,62 @@ impl Actions {
             || (action.handler == DEFAULT && default_action(signal) == DefaultAction::Ignore)
     }
 }
+/// The signal a synchronous exception at EL0 stands for (XSH 2.4.3 and the
+/// causes of `siginfo_t`): its number, `si_code` and `si_addr`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fault {
+    pub signal: i32,
+    pub code: i32,
+    pub address: u64,
+}
+
+/// The signal of the exception with syndrome `esr`, the faulting address
+/// `far` (0 where the exception sets none, spec 7.9) and the interrupted
+/// PC `pc`. Aborts become SIGSEGV (a translation or address size fault
+/// SEGV_MAPERR, an access flag or permission fault SEGV_ACCERR) or SIGBUS
+/// (alignment, external abort); an undefined instruction and the rest of
+/// the exceptions SIGILL; BRK, breakpoints and single steps SIGTRAP; a
+/// trapped floating-point exception SIGFPE with the cause its ISS names.
+pub fn fault(esr: u64, far: u64, pc: u64) -> Fault {
+    let class = (esr >> 26) & 0x3f;
+    let status = esr & 0x3f;
+    let (signal, code, address) = match class {
+        0x20 | 0x24 => match status {
+            0x00..=0x07 => (SIGSEGV, SEGV_MAPERR, far),
+            0x09..=0x0b | 0x0d..=0x0f => (SIGSEGV, SEGV_ACCERR, far),
+            0x21 => (SIGBUS, BUS_ADRALN, far),
+            0x10 | 0x14..=0x17 | 0x18 | 0x1c..=0x1f => (SIGBUS, BUS_OBJERR, far),
+            _ => (SIGSEGV, SEGV_MAPERR, far),
+        },
+        0x22 => (SIGBUS, BUS_ADRALN, far),
+        0x26 => (SIGBUS, BUS_ADRALN, 0),
+        0x2c => {
+            let code = if esr & 2 != 0 {
+                FPE_FLTDIV
+            } else if esr & 4 != 0 {
+                FPE_FLTOVF
+            } else if esr & 8 != 0 {
+                FPE_FLTUND
+            } else if esr & 16 != 0 {
+                FPE_FLTRES
+            } else {
+                FPE_FLTINV
+            };
+            (SIGFPE, code, pc)
+        }
+        0x30 | 0x31 | 0x3c => (SIGTRAP, TRAP_BRKPT, pc),
+        0x32 | 0x33 => (SIGTRAP, TRAP_TRACE, pc),
+        0x34 | 0x35 => (SIGTRAP, TRAP_HWBKPT, far),
+        0x07 => (SIGILL, ILL_COPROC, pc),
+        _ => (SIGILL, ILL_ILLOPC, pc),
+    };
+    Fault {
+        signal,
+        code,
+        address,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Thread {
     pub mask: SigSet,
@@ -227,7 +283,7 @@ mod tests {
             assert!(actions.replace(signal, caught(0, 0)).is_err());
         }
         for action in [
-            caught(8, 0),
+            caught(128, 0),
             caught(0, 1 << 63),
             SigAction {
                 handler: u64::MAX,
@@ -408,5 +464,79 @@ mod accept_tests {
         assert_eq!(thread.accept(set), Ok(Some(SIGUSR2)));
         assert_eq!(thread.accept(set), Ok(None));
         assert_eq!(thread.mask, set);
+    }
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+    const fn syndrome(class: u64, iss: u64) -> u64 {
+        class << 26 | 1 << 25 | iss
+    }
+    #[test]
+    fn aborts_become_segv_and_bus_with_the_address() {
+        // Data abort from EL0 (0x24) with a translation fault at level 3,
+        // a permission fault at level 3 and an alignment fault.
+        let f = |class, status| fault(syndrome(class, status), 0x1234, 0x400);
+        let expect = |signal, code| Fault {
+            signal,
+            code,
+            address: 0x1234,
+        };
+        assert_eq!(f(0x24, 0x07), expect(SIGSEGV, SEGV_MAPERR));
+        assert_eq!(f(0x20, 0x05), expect(SIGSEGV, SEGV_MAPERR));
+        assert_eq!(f(0x24, 0x0f), expect(SIGSEGV, SEGV_ACCERR));
+        assert_eq!(f(0x20, 0x0d), expect(SIGSEGV, SEGV_ACCERR));
+        assert_eq!(f(0x24, 0x09), expect(SIGSEGV, SEGV_ACCERR));
+        assert_eq!(f(0x24, 0x21), expect(SIGBUS, BUS_ADRALN));
+        assert_eq!(f(0x24, 0x10), expect(SIGBUS, BUS_OBJERR));
+        assert_eq!(f(0x22, 0), expect(SIGBUS, BUS_ADRALN));
+        assert_eq!(
+            fault(syndrome(0x26, 0), 0x77, 0x400),
+            Fault {
+                signal: SIGBUS,
+                code: BUS_ADRALN,
+                address: 0
+            }
+        );
+    }
+    #[test]
+    fn undefined_instruction_and_traps_name_their_pc() {
+        let at_pc = |signal, code| Fault {
+            signal,
+            code,
+            address: 0x400,
+        };
+        for class in [0x00, 0x01, 0x0e, 0x18] {
+            assert_eq!(
+                fault(syndrome(class, 0), 0x99, 0x400),
+                at_pc(SIGILL, ILL_ILLOPC),
+                "{class:#x}"
+            );
+        }
+        assert_eq!(
+            fault(syndrome(0x07, 0), 0, 0x400),
+            at_pc(SIGILL, ILL_COPROC)
+        );
+        // BRK #5 and a software step.
+        assert_eq!(
+            fault(syndrome(0x3c, 5), 0, 0x400),
+            at_pc(SIGTRAP, TRAP_BRKPT)
+        );
+        assert_eq!(
+            fault(syndrome(0x32, 0), 0, 0x400),
+            at_pc(SIGTRAP, TRAP_TRACE)
+        );
+    }
+    #[test]
+    fn a_trapped_float_exception_names_its_cause() {
+        let f = |iss| fault(syndrome(0x2c, iss), 0, 0x400);
+        assert_eq!((f(2).signal, f(2).code), (SIGFPE, FPE_FLTDIV));
+        assert_eq!(f(4).code, FPE_FLTOVF);
+        assert_eq!(f(8).code, FPE_FLTUND);
+        assert_eq!(f(16).code, FPE_FLTRES);
+        assert_eq!(f(1).code, FPE_FLTINV);
+        // Division first when several bits are set.
+        assert_eq!(f(2 | 4 | 16).code, FPE_FLTDIV);
     }
 }

@@ -152,7 +152,21 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
     crate::sched::resume()
 }
 
-/// A fault of the program at EL0 ends its process (spec 7.9): the reason
+/// Whether the fault of `thread`, the running one, enters its entry
+/// (kcore::upcall::State::fault): not during a long call, whose way back to
+/// its `svc` no entry can precede.
+pub fn fault_enters(mut thread: NonNull<Thread>, syndrome: u64, far: u64) -> bool {
+    let long = thread::long(thread).is_some();
+    // SAFETY: the running thread is alive; only its own entry state changes.
+    unsafe { thread.as_mut() }
+        .upcall
+        .fault(syndrome, esr::fault_address(syndrome, far), long)
+}
+
+/// A fault of the program at EL0 enters the thread's open entry when the
+/// thread asked for faults (`ThreadUpcallControl` Faults): the thread goes
+/// on at the entry, with ESR and FAR for `Query` and the faulting PC for
+/// `Take` (spec 7.9). Any other fault ends its process (spec 7.9): the reason
 /// goes into the process, with FAR only where the fault sets it
 /// (kcore::esr::fault_address), and the kernel writes it on one line into
 /// its log, which shows it on the port while the kernel has the port
@@ -163,6 +177,9 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
 /// shows at once.
 fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
     let far = registers::far_el1();
+    if fault_enters(thread, syndrome, far) {
+        return;
+    }
     if !crate::testpoint::expects_fault() {
         report_el0(thread, "program fault", VECTOR_EL0_SYNC, syndrome, far)
     }

@@ -10,6 +10,7 @@
 #![no_std]
 
 pub mod allocation;
+pub mod altstack;
 pub mod change;
 pub mod clock;
 mod close_driver;

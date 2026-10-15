@@ -2408,6 +2408,8 @@ static int setid_spawn(void) {
     return bad;
 }
 
+#include "faults.c"
+
 static int role(const char *name) {
 #if PENDING_OPEN_PROBE
     if (strcmp(name, "pendingfork") == 0) return check_pending_fork();
@@ -2417,6 +2419,7 @@ static int role(const char *name) {
     if (strcmp(name, "jobexec-local") == 0) return job_after_exec(0);
     if (strcmp(name, "jobexec-process") == 0) return job_after_exec(1);
 #endif
+    if (strcmp(name, "faults") == 0) return faults_role();
     if (strcmp(name, "loaderchannels") == 0) return loader_channels();
     if (strncmp(name, "channels_", 9) == 0) return channel_child(name);
     if (strcmp(name, "steps") == 0) return steps_run();
@@ -4626,6 +4629,8 @@ int main(int argc, char **argv) {
     null_device();
     printf("posix-procs: stage wave\n");
     wave();
+    printf("posix-procs: stage faults\n");
+    run_role("/bin/procs-child", "faults", NULL);
 #if NAMES_PROBE
     printf("posix-procs: stage names\n");
     names();

@@ -54,6 +54,14 @@ unsafe extern "C" {
     static el0_wait_loop: u8;
     static el0_pattern_yield: u8;
     static el0_mark: u8;
+    static el0_fault_load: u8;
+    static el0_fault_pc: u8;
+    static el0_fault_entry: u8;
+    static el0_fault_deferred: u8;
+    static el0_fault_udf: u8;
+    static el0_fault_brk: u8;
+    static el0_fault_nested: u8;
+    static el0_fault_nested_entry: u8;
     static el0_count_until: u8;
     static el0_count_to: u8;
     static el0_spin_then_yield: u8;
@@ -469,6 +477,51 @@ const EL0_TESTS: &[El0Test] = &[
         name: "own_kill_writes_no_result",
         start: start_own_kill,
         done: done_own_kill,
+    },
+    El0Test {
+        name: "fault_enters_the_open_entry_of_a_thread_that_asked",
+        start: start_fault_entry,
+        done: done_fault_entry,
+    },
+    El0Test {
+        name: "fault_without_the_request_ends_the_process",
+        start: start_fault_unasked,
+        done: done_fault_ends,
+    },
+    El0Test {
+        name: "fault_under_a_closed_entry_ends_the_process",
+        start: start_fault_closed,
+        done: done_fault_ends,
+    },
+    El0Test {
+        name: "fault_under_a_deferral_ends_the_process",
+        start: start_fault_deferred,
+        done: done_fault_ends,
+    },
+    El0Test {
+        name: "undefined_instruction_enters_with_its_class",
+        start: start_fault_udf,
+        done: done_fault_udf,
+    },
+    El0Test {
+        name: "breakpoint_enters_with_its_class_and_number",
+        start: start_fault_brk,
+        done: done_fault_brk,
+    },
+    El0Test {
+        name: "nested_fault_enters_at_depth_2_with_its_own_cause",
+        start: start_fault_nested,
+        done: done_fault_nested,
+    },
+    El0Test {
+        name: "fault_entry_starts_on_the_alternate_stack",
+        start: start_fault_outside,
+        done: done_fault_outside,
+    },
+    El0Test {
+        name: "fault_entry_inside_the_alternate_stack_keeps_the_pointer",
+        start: start_fault_inside,
+        done: done_fault_inside,
     },
     El0Test {
         name: "init_fault_stops_the_machine",
@@ -1913,6 +1966,272 @@ fn done_own_kill(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(
         Some(slot_thread(f, 0).regs.x[0]) == own,
         "process_kill of its own process wrote a result",
+    )
+}
+
+/// The address the fault tests load from; nothing maps it.
+const FAULT_ADDRESS: u64 = 0x2000;
+
+/// A thread of slot 0 that loads from FAULT_ADDRESS with its entry
+/// el0_fault_entry bound, as the kernel binds it before the thread runs:
+/// `faults` is the request for entries on faults, `open` the state of the
+/// entry, `stack` an alternate stack. The judge in slot 1 runs only when the
+/// thread ended its process.
+fn faulting_thread(
+    f: &mut Fixture,
+    faults: bool,
+    open: bool,
+    stack: Option<(usize, usize)>,
+) -> Result<(), &'static str> {
+    faulting_program(
+        f,
+        &raw const el0_fault_load,
+        &raw const el0_fault_entry,
+        faults,
+        open,
+        stack,
+    )
+}
+
+/// `faulting_thread` for the program `program` and the entry `entry`.
+fn faulting_program(
+    f: &mut Fixture,
+    program: *const u8,
+    entry: *const u8,
+    faults: bool,
+    open: bool,
+    stack: Option<(usize, usize)>,
+) -> Result<(), &'static str> {
+    use abi::UpcallControl as C;
+    f.faults = true;
+    let t = spawn(f, 0, program, FAULT_ADDRESS)?;
+    // SAFETY: the thread was just created and does not run yet.
+    let upcall = unsafe { &mut (*t.as_ptr()).upcall };
+    upcall
+        .bind(user_address(entry) as u64)
+        .map_err(|_| "no entry")?;
+    let mut control = |operation, x1, x2| {
+        upcall
+            .control(operation, x1, x2)
+            .map(drop)
+            .map_err(|_| "no control")
+    };
+    if faults {
+        control(C::Faults, 1, 0)?;
+    }
+    if open {
+        control(C::Enable, 0, 0)?;
+    }
+    if let Some((base, size)) = stack {
+        control(C::Stack, base as u64, size as u64)?;
+    }
+    judge(f, 1)
+}
+
+fn start_fault_entry(f: &mut Fixture) -> Result<(), &'static str> {
+    faulting_thread(f, true, true, None)
+}
+
+/// The entry of the fault, as el0_fault_entry noted it: the values of
+/// Take (mask 1 and the fault flag, the faulting PC, the interrupted SP)
+/// and of Query (the abort's ESR, FAR and depth 1).
+fn judge_fault_entry(t: &Thread) -> Result<(), &'static str> {
+    judge_entry(
+        t,
+        &raw const el0_fault_pc,
+        esr::EC_DABT_LOWER,
+        FAULT_ADDRESS,
+    )
+}
+
+/// As `judge_fault_entry` for the faulting instruction at `pc` of the
+/// class `class` with the address `far`.
+fn judge_entry(t: &Thread, pc: *const u8, class: u8, far: u64) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    check(
+        x[10] == 1 | kcore::upcall::TAKE_FAULT,
+        "Take did not report the fault",
+    )?;
+    check(
+        x[11] == user_address(pc) as u64,
+        "Take gave another PC than the faulting one",
+    )?;
+    check(
+        x[13] == (DATA_VA + PAGE) as u64,
+        "Take gave another SP than the interrupted one",
+    )?;
+    check(
+        x[14] == 1 && x[17] == 1,
+        "Query did not see the closed entry at depth 1",
+    )?;
+    check(
+        esr::ec(x[15]) == class && x[16] == far,
+        "Query did not give the ESR and FAR of the fault",
+    )
+}
+
+fn done_fault_entry(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 1 {
+        return check(f.passed[0], "the fault ended the process, not entered");
+    }
+    judge_fault_entry(t)?;
+    check(
+        x_sp(t) == (DATA_VA + PAGE) as u64,
+        "the entry moved the stack pointer without an alternate stack",
+    )
+}
+
+/// The stack pointer the entry started with (el0_fault_entry kept it in x18).
+fn x_sp(t: &Thread) -> u64 {
+    t.regs.x[18]
+}
+
+/// A fault under a deferral: the entry is open and asked for, and the
+/// deferral holds it.
+fn start_fault_deferred(f: &mut Fixture) -> Result<(), &'static str> {
+    f.ends[0] = true;
+    faulting_program(
+        f,
+        &raw const el0_fault_deferred,
+        &raw const el0_fault_entry,
+        true,
+        true,
+        None,
+    )
+}
+
+/// The programs el0_fault_udf and el0_fault_brk, whose entry notes the
+/// classes of ESR 0 (an undefined instruction) and 0x3C with the number.
+fn start_fault_udf(f: &mut Fixture) -> Result<(), &'static str> {
+    faulting_program(
+        f,
+        &raw const el0_fault_udf,
+        &raw const el0_fault_entry,
+        true,
+        true,
+        None,
+    )
+}
+fn done_fault_udf(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 1 {
+        return check(f.passed[0], "the undefined instruction ended the process");
+    }
+    judge_entry(t, &raw const el0_fault_udf, esr::EC_UNKNOWN, 0)
+}
+fn start_fault_brk(f: &mut Fixture) -> Result<(), &'static str> {
+    faulting_program(
+        f,
+        &raw const el0_fault_brk,
+        &raw const el0_fault_entry,
+        true,
+        true,
+        None,
+    )
+}
+fn done_fault_brk(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 1 {
+        return check(f.passed[0], "the breakpoint ended the process");
+    }
+    judge_entry(t, &raw const el0_fault_brk, esr::EC_BRK64, 0)?;
+    check(
+        esr::brk_immediate(t.regs.x[15]) == Some(5),
+        "Query lost the number of the breakpoint",
+    )
+}
+
+/// An abort, and inside its entry (opened again) an undefined instruction:
+/// the second entry is at depth 2 and `Query` gives the second cause.
+fn start_fault_nested(f: &mut Fixture) -> Result<(), &'static str> {
+    faulting_program(
+        f,
+        &raw const el0_fault_nested,
+        &raw const el0_fault_nested_entry,
+        true,
+        true,
+        None,
+    )
+}
+fn done_fault_nested(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 1 {
+        return check(f.passed[0], "a nested fault ended the process");
+    }
+    let x = &t.regs.x;
+    check(x[20] == 2, "the entry did not come twice")?;
+    check(
+        esr::ec(x[21]) == esr::EC_DABT_LOWER,
+        "the first entry had another class than the abort",
+    )?;
+    check(
+        x[10] == 1 | kcore::upcall::TAKE_FAULT && x[17] == 2,
+        "the second entry is not a fault at depth 2",
+    )?;
+    check(
+        esr::ec(x[15]) == esr::EC_UNKNOWN && x[16] == 0,
+        "Query gave the first cause at depth 2",
+    )
+}
+
+/// A thread that did not ask for faults.
+fn start_fault_unasked(f: &mut Fixture) -> Result<(), &'static str> {
+    f.ends[0] = true;
+    faulting_thread(f, false, true, None)
+}
+
+/// A thread that asked, whose entry is closed: a fault of the entry itself.
+fn start_fault_closed(f: &mut Fixture) -> Result<(), &'static str> {
+    f.ends[0] = true;
+    faulting_thread(f, true, false, None)
+}
+
+/// The fault ended the process as before (spec 7.9), and the judge runs.
+fn done_fault_ends(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(
+        f.slot(t) == 1,
+        "the fault entered an entry that is not open",
+    )?;
+    let ProcessState::Fault { esr, far, .. } = state(f, 0) else {
+        return Err("the process did not end with its fault");
+    };
+    check(
+        esr::ec(esr) == esr::EC_DABT_LOWER && far == FAULT_ADDRESS,
+        "the process ended with another fault",
+    )
+}
+
+/// The alternate stack lies in the data page, below the thread's SP at the
+/// top of the page.
+const ALT_BASE: usize = DATA_VA + 0x400;
+const ALT_SIZE: usize = 0x400;
+
+fn start_fault_outside(f: &mut Fixture) -> Result<(), &'static str> {
+    faulting_thread(f, true, true, Some((ALT_BASE, ALT_SIZE)))
+}
+
+fn done_fault_outside(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 1 {
+        return check(f.passed[0], "the fault ended the process, not entered");
+    }
+    judge_fault_entry(t)?;
+    check(
+        x_sp(t) == (ALT_BASE + ALT_SIZE) as u64,
+        "the entry did not start at the top of the alternate stack",
+    )
+}
+
+/// The thread's SP (the top of its page) lies in the middle of the alternate
+/// stack, which reaches past the page: nothing maps the stack.
+fn start_fault_inside(f: &mut Fixture) -> Result<(), &'static str> {
+    faulting_thread(f, true, true, Some((DATA_VA + PAGE - 0x400, 0x800)))
+}
+
+fn done_fault_inside(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 1 {
+        return check(f.passed[0], "the fault ended the process, not entered");
+    }
+    judge_fault_entry(t)?;
+    check(
+        x_sp(t) == (DATA_VA + PAGE) as u64,
+        "the entry left the pointer that lies in the alternate stack",
     )
 }
 

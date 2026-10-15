@@ -510,6 +510,7 @@ basic/signal/raise
 basic/signal/sig2str
 basic/signal/sigaction
 basic/signal/sigaddset
+basic/signal/sigaltstack
 basic/signal/sigdelset
 basic/signal/sigemptyset
 basic/signal/sigfillset

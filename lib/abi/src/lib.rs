@@ -291,8 +291,8 @@ pub enum Call {
     ThreadUpcallBind = 31,
     /// Current upcall control: x0 is an `UpcallControl`. Deferral preserves
     /// the mask and interrupts enabled IPC waits while delaying dispatcher
-    /// execution. x1 returns the previous mask; TAKE returns PC in x2 and
-    /// PSTATE in x3.
+    /// execution. x1 returns the previous mask; TAKE returns PC in x2,
+    /// PSTATE in x3 and SP in x4; QUERY returns more (see `UpcallControl`).
     ThreadUpcallControl = 32,
     /// Request an upcall through a MANAGE thread handle. An enabled
     /// request ends a send or receive as ThreadInterrupt does; a wait for
@@ -1203,6 +1203,11 @@ pub const PRIORITY_LEVELS: u8 = 64;
 /// The round-robin quantum (spec 8).
 pub const RR_QUANTUM_NS: u64 = 4_000_000;
 
+/// Bit 1 of the first value of `UpcallControl::Take`, and of the second
+/// argument of a handler of an entry: the entry is a fault of the
+/// interrupted code.
+pub const UPCALL_TAKE_FAULT: u64 = 2;
+
 /// The operations of `thread_upcall_control` (x0), each on the current
 /// thread's entry state; any other value is INVALID_ARGS. The numbers 5 to
 /// 12 were retired in epoch 2 and are never issued again: a new operation
@@ -1214,12 +1219,35 @@ pub enum UpcallControl {
     Mask = 0,
     /// Allow entries; BAD_STATE while an entry waits for TAKE.
     Enable = 1,
-    /// Take the PC and PSTATE an entry interrupted; BAD_STATE without one.
+    /// Take what an entry interrupted; BAD_STATE without one. Returns the
+    /// previous mask in x1, with bit 1 set when a fault of the code made the
+    /// entry (`Query` gives its ESR and FAR), then the PC in x2, the PSTATE
+    /// in x3 and the stack pointer in x4.
     Take = 2,
     /// Start one level of entry deferral.
     Defer = 3,
     /// End one level of entry deferral; BAD_STATE without one.
     Resume = 4,
+    /// x1 = 1: a fault of the thread's code at EL0 enters its open entry
+    /// like a request; x1 = 0 (the start): it ends the process. A fault
+    /// under a closed entry or a deferral ends it either way. Any other x1
+    /// is INVALID_ARGS.
+    Faults = 13,
+    /// The alternate stack of the entry: x1 = base, x2 = size, both
+    /// multiples of 16, the range inside user space; size 0 removes it.
+    /// When an entry interrupts code whose stack pointer lies outside
+    /// [base, base + size], it starts with SP = base + size; inside, SP stays.
+    /// The kernel maps nothing. The interrupted SP comes back from `Take`.
+    Stack = 14,
+    /// x1 = depth, x2 = deferral count, both below 2^32: a thread that was
+    /// never entered and has its entry bound takes the nesting of the thread
+    /// it copies (a child of `fork` inside a handler); BAD_STATE otherwise.
+    /// The entry stays shut.
+    Adopt = 15,
+    /// Returns the previous mask in x1, the ESR of the last fault that
+    /// entered in x2, its FAR in x3 (0 where the fault sets none), the depth in
+    /// x4 and the deferral count in x5.
+    Query = 16,
 }
 
 impl UpcallControl {
@@ -1231,6 +1259,10 @@ impl UpcallControl {
             2 => Some(UpcallControl::Take),
             3 => Some(UpcallControl::Defer),
             4 => Some(UpcallControl::Resume),
+            13 => Some(UpcallControl::Faults),
+            14 => Some(UpcallControl::Stack),
+            15 => Some(UpcallControl::Adopt),
+            16 => Some(UpcallControl::Query),
             _ => None,
         }
     }
@@ -1597,20 +1629,24 @@ mod tests {
     }
 
     #[test]
-    fn upcall_control_keeps_five_operations_and_retires_the_rest() {
+    fn upcall_control_has_nine_operations_and_retires_the_rest() {
         let operations = [
             (UpcallControl::Mask, 0),
             (UpcallControl::Enable, 1),
             (UpcallControl::Take, 2),
             (UpcallControl::Defer, 3),
             (UpcallControl::Resume, 4),
+            (UpcallControl::Faults, 13),
+            (UpcallControl::Stack, 14),
+            (UpcallControl::Adopt, 15),
+            (UpcallControl::Query, 16),
         ];
         for (operation, raw) in operations {
             assert_eq!(operation.raw(), raw);
             assert_eq!(UpcallControl::from_raw(raw), Some(operation));
         }
         // 5 to 12 are retired numbers, never issued again.
-        for raw in (5..=12).chain([13, 1 << 32, u64::MAX]) {
+        for raw in (5..=12).chain([17, 1 << 32, u64::MAX]) {
             assert_eq!(UpcallControl::from_raw(raw), None, "{raw:#x}");
         }
     }

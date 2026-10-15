@@ -149,6 +149,8 @@ signal/ppoll-block-raise
 signal/ppoll-block-sleep-raise-write
 signal/ppoll-block-sleep-raise
 signal/ppoll-block-sleep-write-raise
+signal/sigaltstack-exec
+signal/sigaltstack-raise-exec
 signal/sigaltstack-raise
 basic/poll/poll
 basic/poll/ppoll
