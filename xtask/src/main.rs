@@ -5101,6 +5101,10 @@ fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
         &output,
         "relibc-threads: a thread ran on the stack given to pthread_attr_setstack",
     )?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: 300 rounds of fflush(NULL) among streams that open and close ok",
+    )?;
     qemu::expect_marker(&output, "relibc-threads: ok")?;
     println!("relibc pthread guest probe passed");
     Ok(())

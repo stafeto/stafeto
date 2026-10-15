@@ -575,6 +575,47 @@ static void stack_address(void) {
     printf("relibc-threads: a thread ran on the stack given to pthread_attr_setstack\n");
 }
 
+/* H: fflush(NULL) while other threads open and close streams. Main keeps a
+ * memory stream with one more byte pending each round, and every round of
+ * fflush(NULL) must make all of them visible, however the list of the open
+ * streams changes meanwhile: a stream that closes moves the last one into
+ * its place in the list, and must neither be freed under the walk nor make
+ * it skip a neighbour. */
+static volatile int churning;
+static void *opens_and_closes(void *arg) {
+    (void)arg;
+    char buffer[16];
+    while (churning) {
+        FILE *stream = fmemopen(buffer, sizeof buffer, "w");
+        if (stream == NULL) FAIL("fmemopen failed: %d", errno);
+        fputc('y', stream);
+        if (fclose(stream) != 0) FAIL("fclose failed");
+    }
+    return NULL;
+}
+#define FLUSH_ROUNDS 300
+static void flush_all_streams(void) {
+    char *text = NULL;
+    size_t size = 0;
+    FILE *kept = open_memstream(&text, &size);
+    CHECK(kept != NULL);
+    pthread_t threads[3];
+    churning = 1;
+    for (int i = 0; i < 3; i++)
+        CHECK(pthread_create(&threads[i], &small, opens_and_closes, NULL) == 0);
+    for (int round = 1; round <= FLUSH_ROUNDS; round++) {
+        CHECK(fputc('x', kept) == 'x');
+        CHECK(fflush(NULL) == 0);
+        if (size != (size_t)round)
+            FAIL("fflush(NULL) round %d left %zu bytes visible", round, size);
+    }
+    churning = 0;
+    for (int i = 0; i < 3; i++) CHECK(pthread_join(threads[i], NULL) == 0);
+    CHECK(fclose(kept) == 0);
+    free(text);
+    printf("relibc-threads: %d rounds of fflush(NULL) among streams that open and close ok\n", FLUSH_ROUNDS);
+}
+
 int main(void) {
     stack_address();
     CHECK(pthread_attr_init(&small) == 0);
@@ -600,6 +641,8 @@ int main(void) {
     leave_sigwait();
     stage = 9;
     detach_after_end();
+    stage = 10;
+    flush_all_streams();
     printf("relibc-threads: ok\n");
     return 0;
 }
