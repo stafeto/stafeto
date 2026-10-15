@@ -118,15 +118,16 @@ pub const BUSYBOX_TABLE: &[Record] = &[
 /// services and the launcher (the program of `busybox-probe`, whose
 /// argument `ash-launch` makes it start `/bin/ash` from its file, 5d). The
 /// shell is a child, and so is each command it forks: the pool of the
-/// process service holds the quota of five more processes of the
-/// launcher's size (the shell, the three of a pipeline of three, and a
-/// nested shell's command), and the reserve of its loaders. The pipe service (5e)
+/// process service holds the processes of the shell, of a pipeline of
+/// three, of a nested shell's command and of the failed attempts of a
+/// search through PATH, which wait to be reclaimed, and the reserve of
+/// its loaders (BUSYBOX_DIALOG_POOL). The pipe service (5e)
 /// serves the shell's pipelines, the terminal service (5f) its console.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     RAM_FIFO_CLOCKED,
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 5 * DIALOG_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota + BUSYBOX_DIALOG_POOL,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],
@@ -134,7 +135,7 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     Record {
         args: b"ash-launch\0",
         connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
-        quota: DIALOG_QUOTA,
+        quota: BUSYBOX_DIALOG_QUOTA,
         ..BUSYBOX_TABLE[3]
     },
     TTY,
@@ -144,6 +145,19 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
 
 /// The quota of the launcher, which the shell and its children get too.
 const DIALOG_QUOTA: u64 = 512 * PAGE;
+
+/// The quota of the launcher of the dialog with the big BusyBox, which the
+/// shell and its children get too. The image of the utilities feature is
+/// 2.9 MB; the dialog needs 730 pages of it at most (730 passes, 725 does
+/// not, bisected on ash-dialog), and 812 pages leave 10.1%.
+const BUSYBOX_DIALOG_QUOTA: u64 = 812 * PAGE;
+
+/// What the process service adds to its own quota for the dialog: the
+/// children of the shell, the failed attempts of a search through PATH
+/// (forty searches with three misses each run in the dialog) and the reserve
+/// of the loaders. The dialog needs 4 720 pages at most (4 720 passes, 4 705
+/// does not, bisected on ash-dialog); 5 246 pages leave 10.0%.
+const BUSYBOX_DIALOG_POOL: u64 = 5246 * PAGE;
 
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the process,
@@ -509,13 +523,16 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
 /// each, and 24 of its own (tests/posix-procs STEPS_BRANCHES).
 const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 
-/// The steps probe and each spawned child retain at most 474 pages with
+/// The steps probe and each spawned child retain at most 477 pages with
 /// all seven 64 KiB workers, including allocator mapping and alignment
 /// (measured on the part that added the memory map's tables, the shared
 /// memory and the files of mappings: 459 pages on main before it, of which
 /// the program's image grew by 5 pages and the layer's by 8). The probe
-/// requires 10% reserve; 528 pages leave 10.2%.
-const STEPS_QUOTA: u64 = 528 * PAGE;
+/// requires 10% reserve; 528 pages leave 10.2%. The utilities part (the
+/// layer's /proc, the registry of open streams, the utmpx, syslog and
+/// getlogin code) added 3 pages to the 474: 477 measured, and 532 pages leave
+/// 10.3%.
+const STEPS_QUOTA: u64 = 532 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
 /// allocator growth retains 572 charged pages. Up to four prepaid mapping

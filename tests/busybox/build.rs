@@ -14,7 +14,17 @@ fn main() {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
     let root = env::var_os("STAFETO_BUSYBOX_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| manifest.join("../../target/busybox/source"));
+        .unwrap_or_else(|| {
+            // The shell image of the utilities has the BusyBox of all the
+            // applets of XCU (tools/build-busybox.py); the probes the small one.
+            let utilities = env::var_os("CARGO_FEATURE_UTILITIES").is_some();
+            let name = if utilities {
+                "busybox-utils"
+            } else {
+                "busybox"
+            };
+            manifest.join(format!("../../target/{name}/source"))
+        });
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     for (archive, name) in [
         ("libbb/lib.a", "busybox_bb"),
@@ -23,6 +33,14 @@ fn main() {
         ("procps/lib.a", "busybox_procps"),
         ("networking/lib.a", "busybox_networking"),
         ("coreutils/libcoreutils/lib.a", "busybox_libcoreutils"),
+        ("archival/lib.a", "busybox_archival"),
+        ("archival/libarchive/lib.a", "busybox_libarchive"),
+        ("editors/lib.a", "busybox_editors"),
+        ("findutils/lib.a", "busybox_findutils"),
+        ("miscutils/lib.a", "busybox_miscutils"),
+        ("util-linux/lib.a", "busybox_util_linux"),
+        ("sysklogd/lib.a", "busybox_sysklogd"),
+        ("libpwdgrp/lib.a", "busybox_libpwdgrp"),
     ] {
         let path = root.join(archive);
         assert!(
@@ -32,6 +50,13 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
         std::fs::copy(&path, out.join(format!("lib{name}.a"))).expect("copy BusyBox objects");
         println!("cargo:rustc-link-lib=static={name}");
+    }
+    // The BusyBox of the utilities is a blob of C with every applet in it: its
+    // program keeps no debug sections, which would be most of an ELF file that
+    // has to fit the RAM file service (8 MiB at most). The small one of the
+    // probes keeps them, as before.
+    if env::var_os("CARGO_FEATURE_UTILITIES").is_some() {
+        println!("cargo:rustc-link-arg-bins=--strip-debug");
     }
     println!("cargo:rustc-link-search=native={}", out.display());
     let sysroot = env::var_os("STAFETO_RELIBC_SYSROOT")

@@ -22,3 +22,6 @@ rt = { path = "../rt" }
 posix-fs = { path = "../posix-fs" }
 proto-process = { path = "../../proto/process" }
 proto-tty = { path = "../../proto/tty" }
+
+[features]
+procfs = ["posix-abi/procfs"]

@@ -813,6 +813,35 @@ impl SimpleLocks {
         }
         result
     }
+    /// One maintenance turn of the circle: it passes up to `max_empty`
+    /// inodes without locks, which cost a few instructions each, and ends
+    /// after the first inode that holds locks. A turn per inode would spend
+    /// a whole round of maintenance on each empty one and keep the service
+    /// busy for most of the period that restarts the circle.
+    pub fn sweep_run(
+        &mut self,
+        storage: &mut Storage<'_>,
+        cursor: &mut SweepCursor,
+        max_empty: usize,
+        mut live: impl FnMut(Owner) -> bool,
+    ) -> Sweep {
+        let mut total = Sweep {
+            visited: 0,
+            removed: 0,
+            wrapped: false,
+        };
+        while cursor.pending() {
+            let held = self.heads[cursor.inode].count != 0;
+            let step = self.sweep(storage, cursor, 1, &mut live);
+            total.visited += step.visited;
+            total.removed += step.removed;
+            total.wrapped |= step.wrapped;
+            if held || total.visited >= max_empty {
+                break;
+            }
+        }
+        total
+    }
     fn page(&self, id: u32) -> &LockPage {
         self.pages[id as usize / SLOTS]
             .paid
@@ -1039,6 +1068,46 @@ mod tests {
             );
         }
         assert_eq!(ram.storage.usage(payer(1)), storage::Usage::default());
+    }
+
+    #[test]
+    fn a_circle_of_runs_passes_empty_inodes_in_bulk_and_ends_after_each_held_one() {
+        let mut ram = crate::Ram::default();
+        let a = inode(&mut ram, b"run-a");
+        let b = inode(&mut ram, b"run-b");
+        let mut table = fresh();
+        let owner = Owner::Process(256);
+        for file in [a, b] {
+            table
+                .set(
+                    &mut ram.storage,
+                    payer(1),
+                    request(file, owner, 0, 1, Some(Kind::Write)),
+                    |_| true,
+                )
+                .unwrap();
+        }
+        let mut cursor = SweepCursor::default();
+        cursor.restart();
+        let (mut turns, mut visited, mut removed) = (0, 0, 0);
+        while cursor.pending() {
+            let before = cursor.inode;
+            let result = table.sweep_run(&mut ram.storage, &mut cursor, 64, |_| false);
+            assert!(result.visited >= 1 && result.visited <= 64);
+            if table.count(a) + table.count(b) != 0 || result.removed != 0 {
+                // A turn that met a held inode ends on it.
+                assert!(result.visited <= 64, "{before}");
+            }
+            turns += 1;
+            visited += result.visited;
+            removed += result.removed;
+            assert!(turns <= storage::NODES);
+        }
+        assert_eq!(visited, storage::NODES);
+        assert_eq!(removed, 2);
+        // Two held inodes and the empty ones in runs of at most 64.
+        assert!(turns <= 2 + storage::NODES / 64 + 2, "{turns}");
+        assert_eq!(table.count(a) + table.count(b), 0);
     }
 
     #[test]

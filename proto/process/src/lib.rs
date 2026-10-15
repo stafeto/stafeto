@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Process protocol v10 (spec 2, section 3.1). The service creates every
+//! Process protocol v11 (spec 2, section 3.1). The service creates every
 //! POSIX process itself, so that a record comes with its process and goes
 //! only with the notification of its end. The label of a session names
 //! the caller's record (`Label`), never the body.
@@ -196,7 +196,11 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Reader, Status, Writer};
 pub mod lifetimes;
 
-pub const VERSION: u16 = 10;
+pub const VERSION: u16 = 11;
+
+/// The bytes of the name a record keeps for `ps` (the last component of
+/// the path of its program, cut to fit, with a terminating zero).
+pub const NAME_LEN: usize = 16;
 
 mod limits;
 mod retained;
@@ -495,6 +499,12 @@ pub enum Method {
     /// grant of an image that exec replaced is refused). Body pid u32, key
     /// u64, write u32, image u32.
     ShareGrant = 61,
+    /// The list of processes (Ф10, `ps`): a body of the cursor u32, a
+    /// record index; the reply is the status u32, the cursor to ask next
+    /// u32 (`LIST_END` for no more), and, when the window of at most
+    /// `LIST_WINDOW` records from the cursor holds a live one, `1` u32 and
+    /// its `Listing`; otherwise `0` u32. Any process may ask.
+    List = 62,
 }
 
 /// The key of the shared memory of a file: its device and inode, never 0.
@@ -531,7 +541,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
     31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
-    59, 60, 61,
+    59, 60, 61, 62,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1119,6 +1129,9 @@ pub struct SpawnStart {
     pub level: u8,
     pub mask: u64,
     pub default: u64,
+    /// The name the record shows: the last component of the program's
+    /// path, with a terminating zero; all zeros keeps the parent's.
+    pub name: [u8; NAME_LEN],
 }
 
 impl SpawnStart {
@@ -1127,13 +1140,16 @@ impl SpawnStart {
         w.u32(self.pgroup)?;
         w.u32(self.level.into())?;
         w.u64(self.mask)?;
-        w.u64(self.default)
+        w.u64(self.default)?;
+        w.bytes(&self.name)
     }
 
     /// BAD_SIZE out of the layout or with a level past 63.
     pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
         let (flags, pgroup, level) = (r.u32()?, r.u32()?, r.u32()?);
         let (mask, default) = (r.u64()?, r.u64()?);
+        let mut name = [0; NAME_LEN];
+        name.copy_from_slice(r.bytes(NAME_LEN)?);
         r.finish()?;
         let level = u8::try_from(level)
             .ok()
@@ -1145,6 +1161,85 @@ impl SpawnStart {
             level,
             mask,
             default,
+            name,
+        })
+    }
+}
+
+/// The name of a record from the path of its program: the last
+/// component, at most `NAME_LEN - 1` bytes, then zeros.
+pub fn name_of(path: &[u8]) -> [u8; NAME_LEN] {
+    let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    let path = &path[..end];
+    let start = path.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
+    let base = &path[start..];
+    let mut name = [0; NAME_LEN];
+    let n = base.len().min(NAME_LEN - 1);
+    name[..n].copy_from_slice(&base[..n]);
+    name
+}
+
+/// The records a List request looks at.
+pub const LIST_WINDOW: u32 = 64;
+/// The cursor of a List reply that has no more records.
+pub const LIST_END: u32 = u32::MAX;
+
+/// What a List reply tells of a live record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Listing {
+    pub pid: u32,
+    pub parent: u32,
+    pub pgid: u32,
+    pub sid: u32,
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    /// 0 running, 1 stopped, 2 a zombie.
+    pub state: u32,
+    /// The terminal plus one (0 for none): the console is 1.
+    pub tty: u32,
+    pub name: [u8; NAME_LEN],
+}
+
+impl Listing {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        for word in [
+            self.pid,
+            self.parent,
+            self.pgid,
+            self.sid,
+            self.uid,
+            self.euid,
+            self.gid,
+            self.egid,
+            self.state,
+            self.tty,
+        ] {
+            w.u32(word)?;
+        }
+        w.bytes(&self.name)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
+        let mut words = [0; 10];
+        for word in &mut words {
+            *word = r.u32()?;
+        }
+        let mut name = [0; NAME_LEN];
+        name.copy_from_slice(r.bytes(NAME_LEN)?);
+        Ok(Self {
+            pid: words[0],
+            parent: words[1],
+            pgid: words[2],
+            sid: words[3],
+            uid: words[4],
+            euid: words[5],
+            gid: words[6],
+            egid: words[7],
+            state: words[8],
+            tty: words[9],
+            name,
         })
     }
 }
@@ -1448,6 +1543,7 @@ mod tests {
             Method::Queue,
             Method::Share,
             Method::ShareGrant,
+            Method::List,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
@@ -1686,6 +1782,31 @@ mod tests {
     }
 
     #[test]
+    fn names_and_listings_round_trip() {
+        assert_eq!(&name_of(b"/bin/sleep")[..6], b"sleep\0");
+        assert_eq!(&name_of(b"sleep")[..6], b"sleep\0");
+        assert_eq!(&name_of(b"/bin/dir/")[..4], b"dir\0");
+        assert_eq!(name_of(b"/bin/a-very-long-program-name")[15], 0);
+        assert_eq!(name_of(b"/"), [0; NAME_LEN]);
+        let listing = Listing {
+            pid: 300,
+            parent: 257,
+            pgid: 300,
+            sid: 256,
+            uid: 1000,
+            euid: 0,
+            gid: 100,
+            egid: 0,
+            state: 1,
+            tty: 1,
+            name: name_of(b"/bin/sleep"),
+        };
+        let mut w = Writer::new();
+        listing.write(&mut w).unwrap();
+        assert_eq!(Listing::read(&mut Reader::new(w.as_bytes())), Ok(listing));
+    }
+
+    #[test]
     fn spawn_start_and_set_id_round_trip() {
         let start = SpawnStart {
             flags: SPAWN_SETSIGMASK | SPAWN_RESETIDS,
@@ -1693,10 +1814,12 @@ mod tests {
             level: 30,
             mask: 1 << 9,
             default: 1 << 14,
+            name: name_of(b"/bin/sleep"),
         };
         let mut w = Writer::new();
         start.write(&mut w).unwrap();
         assert_eq!(SpawnStart::read(Reader::new(w.as_bytes())), Ok(start));
+        assert_eq!(&start.name[..6], b"sleep\0");
         let mut high = w.as_bytes().to_vec();
         high[8] = 64;
         assert_eq!(SpawnStart::read(Reader::new(&high)), Err(Status::BadSize));

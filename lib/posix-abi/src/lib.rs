@@ -41,6 +41,8 @@ pub mod names;
 mod open_driver;
 pub mod pipes;
 pub mod process;
+#[cfg(feature = "procfs")]
+pub mod procfs;
 pub mod random;
 pub mod relibc;
 pub mod resources;
@@ -235,6 +237,16 @@ pub fn open_policy(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c
 }
 
 fn open_policy_inner(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c_int, c_int> {
+    // The files under /proc are made when they are opened (procfs).
+    #[cfg(feature = "procfs")]
+    if procfs::is_under(name) {
+        return procfs::open(name, flags);
+    }
+    open_image(name, flags, mode, umask)
+}
+
+/// Opens a path of the image's file service.
+pub(crate) fn open_image(name: &[u8], flags: c_int, mode: u32, umask: u32) -> Result<c_int, c_int> {
     if flags
         & !(O_ACCMODE
             | O_DIRECTORY
