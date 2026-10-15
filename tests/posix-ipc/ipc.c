@@ -350,6 +350,9 @@ static int mq_notifies(void) {
     struct timespec until = after_ms(2000);
     CHECK(mq_timedreceive(q, buf, sizeof buf, NULL, &until) == 1);
     CHECK(wait_ok(pid));
+    pause_ms(40);
+    sigpending(&wait);
+    CHECK(!sigismember(&wait, SIGUSR1));
     CHECK(mq_notify(q, NULL) == 0);
     /* A function in a thread. */
     memset(&ev, 0, sizeof ev);
