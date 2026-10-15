@@ -604,7 +604,25 @@ fn volume_and_paths(files: &Files) -> Result<(), i32> {
     };
     // statvfs: the numbers, and one directory less of free inodes.
     let mut stat = req(4, next(), ChangeOp::StatVfs, b"/tmp");
-    let before = run(files, &stat, None).map_err(|_| 201)?;
+    let mut before = run(files, &stat, None).map_err(|_| 201)?;
+    // The files the earlier stages let go of are freed by the service a little
+    // after the last close; the count is read again until it stands still, so
+    // that the exit of a slower child does not fall between the two reads (eight
+    // equal reads in a row).
+    let mut still = 0;
+    for _ in 0..400 {
+        stat.key = key(4, next());
+        let again = run(files, &stat, None).map_err(|_| 201)?;
+        still = if word(&again.bytes, 6) == word(&before.bytes, 6) {
+            still + 1
+        } else {
+            0
+        };
+        before = again;
+        if still == 8 {
+            break;
+        }
+    }
     if before.result != 0 || before.length != proto_fs::STATVFS_BYTES {
         return Err(202);
     }
