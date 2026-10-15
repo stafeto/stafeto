@@ -717,7 +717,7 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
         "posix-procs",
         "posix-procs",
         POSIX_STACK_SIZE,
-        &["change-steps", "fifo-steps"],
+        &["change-steps", "fifo-steps", "procfs"],
     ),
     ("loader", "loader", 0, &["steps"]),
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),

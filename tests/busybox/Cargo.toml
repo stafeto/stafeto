@@ -13,7 +13,7 @@ ash-probe = []
 # The dialog: the applets build whose launcher mode (the argument
 # `ash-launch`, which init gives) starts /bin/ash from its file, with the
 # console of the process.
-ash-interactive = ["applets", "posix-crt/uart-input"]
+ash-interactive = ["applets", "posix-crt/uart-input", "posix-crt/procfs"]
 ls-probe = []
 # BusyBox as the program of a file (posix_spawn, 5c): the applet and its
 # arguments are the program's own argv.

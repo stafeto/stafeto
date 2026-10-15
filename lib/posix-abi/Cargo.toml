@@ -12,6 +12,9 @@ test = false
 bench = false
 
 [features]
+# /proc made from the process service (procfs.rs), for the shell image of the
+# utilities.
+procfs = []
 # Read-only resident named-open witness, absent from shipped builds.
 fifo-probe = []
 # threads::set_level, the levels of rtbench 2's threads (tests/rtbench-posix).

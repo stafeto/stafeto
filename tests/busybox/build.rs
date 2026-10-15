@@ -51,10 +51,13 @@ fn main() {
         std::fs::copy(&path, out.join(format!("lib{name}.a"))).expect("copy BusyBox objects");
         println!("cargo:rustc-link-lib=static={name}");
     }
-    // BusyBox is a blob of C: its program keeps no debug sections, which
-    // would be most of an ELF file that has to fit the RAM file service
-    // (8 MiB at most) with every utility linked in.
-    println!("cargo:rustc-link-arg-bins=--strip-debug");
+    // The BusyBox of the utilities is a blob of C with every applet in it: its
+    // program keeps no debug sections, which would be most of an ELF file that
+    // has to fit the RAM file service (8 MiB at most). The small one of the
+    // probes keeps them, as before.
+    if env::var_os("CARGO_FEATURE_ASH_INTERACTIVE").is_some() {
+        println!("cargo:rustc-link-arg-bins=--strip-debug");
+    }
     println!("cargo:rustc-link-search=native={}", out.display());
     let sysroot = env::var_os("STAFETO_RELIBC_SYSROOT")
         .map(PathBuf::from)

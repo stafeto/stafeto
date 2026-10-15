@@ -29,6 +29,8 @@ native-scopes-launcher = []
 auth-probe = ["files"]
 data-carrier-probe = ["files"]
 files = ["pending-open", "stages"]
+# /proc in the layer (the steps of List are measured with it).
+procfs = ["posix-crt/procfs"]
 stages = ["pending-open"]
 change-steps = ["stages", "posix-abi/change-probe"]
 names-probe = ["stages", "posix-abi/change-probe"]

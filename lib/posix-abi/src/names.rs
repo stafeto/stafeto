@@ -478,6 +478,7 @@ pub fn fstatat(
     }
     let nonempty = path.filter(|path| !path.is_empty());
     if let Some(path) = nonempty {
+        #[cfg(feature = "procfs")]
         if crate::procfs::is_under(path) {
             return crate::procfs::stat(path);
         }

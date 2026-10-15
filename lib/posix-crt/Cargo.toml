@@ -18,6 +18,8 @@ bench = false
 # (rt::fs::Files::connect_with_uart); the RAM files beside them.
 [features]
 uart-input = []
+# /proc in the layer, for the shell image of the utilities.
+procfs = ["posix-abi/procfs", "posix-platform/procfs"]
 
 [dependencies]
 entries = { path = "../entries" }
