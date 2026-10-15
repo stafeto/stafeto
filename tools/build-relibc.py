@@ -22,9 +22,9 @@ from pathlib import Path
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-# Library completion (F11a): wide streams, memory streams, libintl, uchar, iconv,
-# search, ndbm, ftw, wordexp, aio, utmpx, math exceptions and accuracy; tagged pin-695d0d9c.
-COMMIT = "695d0d9c9a59f3b78f92240a01da23a7f1b0067f"
+# Follow-ups of F11a: fmemopen ends with its buffer (ENOSPC, EINVAL), memory
+# streams close on exec, posix-regex is a path package; tagged pin-af950908.
+COMMIT = "af950908a83ac6f38ed376c52c1294473afe556b"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
