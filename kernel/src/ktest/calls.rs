@@ -4363,7 +4363,7 @@ fn abandoned_range(c: &Caller) -> Result<(), &'static str> {
         )?;
         let rest = process::mapping(t, at(3 * portion), 2 * portion);
         check(
-            rest.is_some_and(|k| !k.is_busy() && u64::from(k.offset) == done),
+            rest.is_some_and(|k| !k.is_busy() && k.object == m && u64::from(k.offset) == done),
             "the middle did not keep the pages the call did not unmap, idle",
         )?;
         check(
