@@ -198,6 +198,8 @@ fn dialog() -> Vec<RootFile> {
     let mut files = vec![
         dir("/bin"),
         file("/bin/ash", 0o755, ROOT, "busybox-probe"),
+        // The shell of `system`, `popen` and `wordexp`.
+        file("/bin/sh", 0o755, ROOT, "busybox-probe"),
         file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),

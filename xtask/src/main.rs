@@ -2785,6 +2785,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: fread ",
         "relibc-hello: monotonic ",
         "relibc-hello: directories, stat, descriptors, mmap, math",
+        "relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec",
         "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 11 options claimed, timers -1",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
@@ -5031,14 +5032,15 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "8", "ash", busybox.clone()),
-        ("-rwxr-xr-x", "8", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "8", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "8", "head", busybox.clone()),
-        ("-rwxr-xr-x", "8", "ls", busybox.clone()),
-        ("-rwxr-xr-x", "8", "mktemp", busybox.clone()),
-        ("-rwxr-xr-x", "8", "sleep", busybox.clone()),
-        ("-rwxr-xr-x", "8", "wc", busybox),
+        ("-rwxr-xr-x", "9", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "9", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "9", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "9", "head", busybox.clone()),
+        ("-rwxr-xr-x", "9", "ls", busybox.clone()),
+        ("-rwxr-xr-x", "9", "mktemp", busybox.clone()),
+        ("-rwxr-xr-x", "9", "sh", busybox.clone()),
+        ("-rwxr-xr-x", "9", "sleep", busybox.clone()),
+        ("-rwxr-xr-x", "9", "wc", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
@@ -5283,6 +5285,14 @@ fn ash_dialog() -> Result<(), String> {
         run.send("echo hello | cat | cat")?;
         run.expect("echo hello | cat | cat", DIALOG_STEP)?;
         run.expect_line("hello", |line| line == "hello", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // The shell of `system` and `popen` is in the image: /bin/sh runs a
+        // command of its own and reads one from a pipe.
+        run.send("/bin/sh -c 'echo shell-ran $0 $((6*7))'")?;
+        run.expect_line("sh ran", |line| line == "shell-ran ash 42", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo 'echo piped-sh' | /bin/sh")?;
+        run.expect_line("sh from a pipe", |line| line == "piped-sh", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("ls /bin | wc -l")?;
         run.expect("ls /bin | wc -l", DIALOG_STEP)?;
@@ -7845,6 +7855,9 @@ fn ci(jobs: usize) -> Result<(), String> {
         ]))?;
     }
     test(jobs)?;
+    // The complete basic suite: every test of tests/os-test/basic-pass.txt
+    // still passes.
+    ostest::run_full_basic(jobs)?;
     let a = build(Variant::Normal)?;
     disasm::shipping(&a.elf, &llvm_tool("llvm-objdump")?)
 }

@@ -150,9 +150,15 @@ extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> 
         getty();
     }
     // The configuration has no applet named `sh` (the shell is `ash`), and
-    // `system`, `popen` and `wordexp` start `/bin/sh` with that name.
+    // `system`, `popen` and `wordexp` start `/bin/sh` with the name `sh`, a
+    // shell's user with the path.
     // SAFETY: as above.
-    if argc > 0 && unsafe { core::ffi::CStr::from_ptr(*argv) } == c"sh" {
+    if argc > 0
+        && matches!(
+            unsafe { core::ffi::CStr::from_ptr(*argv) }.to_bytes(),
+            b"sh" | b"/bin/sh"
+        )
+    {
         // SAFETY: argv[0] exists; the string is static.
         unsafe { *argv = c"ash".as_ptr().cast_mut() };
     }
