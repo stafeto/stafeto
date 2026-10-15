@@ -1501,8 +1501,6 @@ mod tests {
         p.sock_set_flags(&held, s, NONBLOCK).unwrap();
         assert_eq!(p.sock_write(&held, s, b"x", &mut w), Err(AGAIN));
         assert_eq!(p.readiness_endpoint(&held, s) & watch::WRITE, 0);
-        p.wait_new(DESCRIPTIONS as u32 + c.slot() as u32 ^ 0, (3, 3), |_| true)
-            .unwrap();
         let mut out = [0; 100];
         let mut w2 = Wakes::default();
         // A read by c wakes whoever waits at s, the peer.

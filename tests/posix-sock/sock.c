@@ -9,6 +9,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -513,6 +514,33 @@ static int across_fork(void) {
     int status;
     CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     close(sv[0]);
+    /* A socket across exec and posix_spawn: the program writes through the descriptor it was given. */
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        char fd[16];
+        snprintf(fd, sizeof fd, "%d", sv[1]);
+        char *next[] = {"posix-sock", "inherit", fd, NULL}, *env[] = {NULL};
+        execve("/bin/posix-sock", next, env);
+        _exit(9);
+    }
+    close(sv[1]);
+    CHECK(read(sv[0], buf, sizeof buf) == 4 && memcmp(buf, "exec", 4) == 0);
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(read(sv[0], buf, sizeof buf) == 0);
+    close(sv[0]);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    posix_spawn_file_actions_t actions;
+    CHECK(posix_spawn_file_actions_init(&actions) == 0);
+    CHECK(posix_spawn_file_actions_adddup2(&actions, sv[1], 7) == 0);
+    CHECK(posix_spawn_file_actions_addclose(&actions, sv[0]) == 0);
+    char *spawned[] = {"posix-sock", "inherit", "7", NULL}, *none[] = {NULL};
+    CHECK(posix_spawn(&pid, "/bin/posix-sock", &actions, NULL, spawned, none) == 0);
+    close(sv[1]);
+    CHECK(read(sv[0], buf, sizeof buf) == 4 && memcmp(buf, "exec", 4) == 0);
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(sv[0]);
     /* A blocked accept is woken by a connect from another process. */
     struct sockaddr_in addr;
     int l = listener(0, SOCK_STREAM, &addr);
@@ -705,6 +733,10 @@ int main(int argc, char **argv) {
         char *next[] = {"posix-sock", "loaded", NULL}, *env[] = {NULL};
         execve("/bin/posix-sock", next, env);
         CHECK(0);
+    }
+    if (argc == 3) {
+        int fd = atoi(argv[2]);
+        return write(fd, "exec", 4) == 4 ? 0 : 1;
     }
     printf("posix-sock: start\n");
     fflush(stdout);
