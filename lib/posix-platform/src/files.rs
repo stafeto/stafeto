@@ -194,7 +194,17 @@ pub unsafe extern "C" fn stafeto_getdents(
         if let Ok(info) = posix_abi::names::fstatat(fd, None, 0)
             && posix_abi::procfs::is_directory(&info)
         {
-            return posix_abi::procfs::entries(out, position);
+            let pid = posix_abi::shared::held(number, |_, target| {
+                Ok(match target {
+                    Target::Ram(ram) => {
+                        posix_abi::procfs::directory_pid(ram.description_slot(), ram.generation())
+                    }
+                    _ => None,
+                })
+            })
+            .ok()
+            .flatten();
+            return posix_abi::procfs::entries(out, position, pid);
         }
         posix_abi::shared::held(number, |transport, target| {
             entries(transport, target, out, position)

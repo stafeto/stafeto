@@ -71,24 +71,18 @@ fn parse(path: &[u8]) -> Option<Node> {
     }
 }
 
-/// Whether a path is under `/proc` (not `/proc` itself).
+/// Whether a path is under `/proc` (not `/proc` itself, with or without a
+/// slash at its end: the image's directory serves those).
 pub fn is_under(path: &[u8]) -> bool {
-    path.starts_with(b"/proc/")
+    path.len() > b"/proc/".len() && path.starts_with(b"/proc/")
 }
 
-/// The process `pid` in the service's table.
+/// The process `pid` in the service's table: its record is `pid % RECORDS`,
+/// and the first live record from that index is the record itself when it
+/// is live, so one request answers.
 fn find(pid: u32) -> Result<Listing, i32> {
-    let mut cursor = 0;
-    loop {
-        let (next, found) = crate::process::list(cursor)?;
-        if let Some(listing) = found.filter(|l| l.pid == pid) {
-            return Ok(listing);
-        }
-        match next {
-            Some(next) => cursor = next,
-            None => return Err(ENOENT),
-        }
-    }
+    let (_, found) = crate::process::list(pid % PROCESSES as u32)?;
+    found.filter(|l| l.pid == pid).ok_or(ENOENT)
 }
 
 /// The live PIDs, in the order of the table: how many went into `pids`.
@@ -240,13 +234,11 @@ pub fn open(path: &[u8], flags: i32) -> Result<i32, i32> {
     if flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
         return Err(EROFS);
     }
-    if matches!(node, Node::Process(_)) {
-        // The directory of a process is not opened, only its files.
-        find(match node {
-            Node::Process(pid) => pid,
-            _ => 0,
-        })?;
-        return Err(ENOTDIR);
+    if let Node::Process(pid) = node {
+        // The directory of a process: a descriptor of the image's /proc
+        // that remembers whose files `getdents` lists.
+        find(pid)?;
+        return open_directory(pid, flags);
     }
     if flags & O_DIRECTORY != 0 {
         return Err(ENOTDIR);
@@ -266,6 +258,87 @@ pub fn open(path: &[u8], flags: i32) -> Result<i32, i32> {
             Err(if errno == EMFILE { EMFILE } else { errno })
         }
     }
+}
+
+/// A descriptor of the directory `/proc` of the image, which `getdents`
+/// lists as the directory of `pid` (see `directory_pid`).
+fn open_directory(pid: u32, flags: i32) -> Result<i32, i32> {
+    use posix_fs::Target;
+    let fd = crate::open_image(b"/proc", flags | O_DIRECTORY, 0, 0)?;
+    let named = crate::shared::held(fd as u32, |_, target| match target {
+        Target::Ram(ram) => Ok((ram.description_slot(), ram.generation())),
+        _ => Err(EIO),
+    });
+    match named {
+        Ok((slot, generation)) => {
+            remember(slot, generation, pid);
+            Ok(fd)
+        }
+        Err(errno) => {
+            let _ = crate::close(fd);
+            Err(errno)
+        }
+    }
+}
+
+/// How many directories of processes stay open at once with their PID; an
+/// older one beyond that lists `/proc` itself.
+const DIRECTORIES: usize = 8;
+/// The directories of processes that are open: the description of the
+/// image's `/proc` (its slot and generation in the file service) and the
+/// PID, `0` for a free place. A spin flag guards the places.
+static DIRECTORY_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DIRECTORY_SLOT: [core::sync::atomic::AtomicU32; DIRECTORIES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; DIRECTORIES];
+static DIRECTORY_GENERATION: [core::sync::atomic::AtomicU64; DIRECTORIES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DIRECTORIES];
+static DIRECTORY_PID: [core::sync::atomic::AtomicU32; DIRECTORIES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; DIRECTORIES];
+static DIRECTORY_NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn directories<R>(run: impl FnOnce() -> R) -> R {
+    use core::sync::atomic::Ordering;
+    while DIRECTORY_BUSY
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let result = run();
+    DIRECTORY_BUSY.store(false, Ordering::Release);
+    result
+}
+
+fn remember(slot: u32, generation: u64, pid: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    directories(|| {
+        let place = (0..DIRECTORIES)
+            .find(|&i| {
+                DIRECTORY_PID[i].load(Relaxed) != 0
+                    && DIRECTORY_SLOT[i].load(Relaxed) == slot
+                    && DIRECTORY_GENERATION[i].load(Relaxed) == generation
+            })
+            .or_else(|| (0..DIRECTORIES).find(|&i| DIRECTORY_PID[i].load(Relaxed) == 0))
+            .unwrap_or_else(|| DIRECTORY_NEXT.fetch_add(1, Relaxed) % DIRECTORIES);
+        DIRECTORY_SLOT[place].store(slot, Relaxed);
+        DIRECTORY_GENERATION[place].store(generation, Relaxed);
+        DIRECTORY_PID[place].store(pid, Relaxed);
+    });
+}
+
+/// The PID whose directory the description of the image's `/proc` with this
+/// slot and generation was opened for, if it was opened for one.
+pub fn directory_pid(slot: u32, generation: u64) -> Option<u32> {
+    use core::sync::atomic::Ordering::Relaxed;
+    directories(|| {
+        (0..DIRECTORIES)
+            .find(|&i| {
+                DIRECTORY_PID[i].load(Relaxed) != 0
+                    && DIRECTORY_SLOT[i].load(Relaxed) == slot
+                    && DIRECTORY_GENERATION[i].load(Relaxed) == generation
+            })
+            .map(|i| DIRECTORY_PID[i].load(Relaxed))
+    })
 }
 
 /// `stat` of `/proc/<pid>` (a directory of the process's effective user),
@@ -330,11 +403,18 @@ pub fn is_directory(info: &NodeInfo) -> bool {
 
 /// The entries of the listing of `/proc` in Linux's dirent64 records from
 /// `position` (the number of entries taken before): ".", "..", "uptime" and
-/// the live PIDs.
-pub fn entries(out: &mut [u8], position: u64) -> Result<usize, i32> {
+/// the live PIDs; for the directory of a process (`pid`), ".", ".." and its
+/// three files.
+pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize, i32> {
     let mut list = [0u32; PROCESSES];
-    let count = pids(&mut list)?;
-    let total = 3 + count;
+    let count = match pid {
+        Some(_) => 0,
+        None => pids(&mut list)?,
+    };
+    let total = match pid {
+        Some(_) => 5,
+        None => 3 + count,
+    };
     let at = core::cell::Cell::new(usize::try_from(position).map_err(|_| EINVAL)?);
     posix_change::dirent::fill(
         out,
@@ -343,13 +423,30 @@ pub fn entries(out: &mut [u8], position: u64) -> Result<usize, i32> {
             if here >= total {
                 return Ok(None);
             }
-            let (text, kind, inode): (&[u8], u8, u64) = match here {
-                0 => (b".", 4, 2),
-                1 => (b"..", 4, 2),
-                2 => (b"uptime", 8, 1),
-                n => (&[], 4, u64::from(list[n - 3]) << 4),
-            };
-            let len = if here >= 3 {
+            let (len, kind, inode) = if let Some(pid) = pid {
+                let (text, kind, inode): (&[u8], u8, u64) = match here {
+                    0 => (b".", 4, u64::from(pid) << 4),
+                    1 => (b"..", 4, 2),
+                    n => {
+                        let (text, file): (&[u8], File) = match n {
+                            2 => (b"cmdline", File::Cmdline),
+                            3 => (b"stat", File::Stat),
+                            _ => (b"status", File::Status),
+                        };
+                        (text, 8, (u64::from(pid) << 4) | (1 + file as u64))
+                    }
+                };
+                name[..text.len()].copy_from_slice(text);
+                (text.len(), kind, inode)
+            } else if here < 3 {
+                let (text, kind, inode): (&[u8], u8, u64) = match here {
+                    0 => (b".", 4, 2),
+                    1 => (b"..", 4, 2),
+                    _ => (b"uptime", 8, 1),
+                };
+                name[..text.len()].copy_from_slice(text);
+                (text.len(), kind, inode)
+            } else {
                 let mut digits = [0u8; 10];
                 let mut n = list[here - 3];
                 let mut start = digits.len();
@@ -363,10 +460,7 @@ pub fn entries(out: &mut [u8], position: u64) -> Result<usize, i32> {
                 }
                 let len = digits.len() - start;
                 name[..len].copy_from_slice(&digits[start..]);
-                len
-            } else {
-                name[..text.len()].copy_from_slice(text);
-                text.len()
+                (len, 4, u64::from(list[here - 3]) << 4)
             };
             let item = posix_change::dirent::Item {
                 inode,

@@ -5835,6 +5835,15 @@ fn ash_dialog() -> Result<(), String> {
             "kill $!; wait $!; ps -o pid | awk -v p=$! '$1==p' | wc -l",
             &["=0"],
         )?;
+        // The directory of /proc with a slash lists as without, and the
+        // directory of a process lists its three files.
+        dialog_command(&mut run, "ls -1 /proc/ | grep -cx uptime", &["=1"])?;
+        dialog_command(
+            &mut run,
+            "ls -1 /proc/$$ | sort | tr '\\n' ' '; echo",
+            &["~cmdline stat status"],
+        )?;
+        dialog_command(&mut run, "ls /proc/999999; echo missing $?", &["~missing 1"])?;
         // Behind the names are the applets: of the 112 names, ten are
         // builtins of the shell and `sh` is the shell's second name, and the
         // other 101 are applets BusyBox lists, less the 24 it lacks.
