@@ -4025,10 +4025,26 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// and on the benchmark's image (`rtbench --short --icount`, the `min` of
 /// the three `s5_*` rows: the whole path of `pthread_kill` to the handler
 /// of the target, in instructions). The first two sit four ticks above the
-/// measure at the end of epoch 2 (262 and 12 764), the third sixteen above
-/// the measure (2 754; 2 756 at e0c670e, when the distributor saved the
-/// flags twice, and 4f3c7d0 had 2 562); a higher number needs a decision
-/// with its reason written down.
+/// measure at the end of epoch 2 (262 and 12 764); a higher number needs a
+/// decision with its reason written down.
+///
+/// The third is a guard against a path that grows by accident, and the
+/// requirement of S5 is the p50 in nanoseconds on HVF and on VZ
+/// (`rtbench_check::S5_P50_MAX_NS`, the sessions of `rtbench-check`). The
+/// guard stands 10 % above the measure (2 759 at cacfad79, so 3 035; the
+/// measure was 2 754 at the end of epoch 2, 2 756 at e0c670e, when the
+/// distributor saved the flags twice, and 2 562 at 4f3c7d0): a margin of
+/// eleven ticks fails with the first change to the path of a signal, and
+/// a guard that fires at once says nothing of the requirement. A path that
+/// grows past the 10 % is a decision of the realtime reviewer; one that
+/// grows by less is read in the p50 of the sessions.
+///
+/// `S4_ICOUNT_MAX` guards the row `s4_dup_close` of the same run: the
+/// `min` of the dup and close of a descriptor of a file, in instructions.
+/// The close of a descriptor that another keeps costs no message to the
+/// service while the process holds no record lock; the guard is 1.25 times
+/// the 2 783 instructions of 0c13427a (3 478), 3 110 at cacfad79 with
+/// that close (10 % room), and 18 278 before it.
 ///
 /// Rules for a guard that fires (the paths are deterministic under -icount,
 /// so a firing is no noise and a repeat does not clear it):
@@ -4038,9 +4054,9 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// 2. When the source of the path did not change (the compiler moved the
 ///    code) and the excess is at most `NULL_SLACK` for `null`,
 ///    `THREADS_READY_SLACK` for `threads_ready` (one instruction a thread)
-///    or `S5_ICOUNT_SLACK` for the S5 rows, the author raises it with that
-///    line; a larger excess or a changed path needs the decision of the
-///    reviewer of the kernel (for the S5 rows, of the realtime reviewer:
+///    the author raises it with that line; a larger excess or a changed
+///    path needs the decision of the reviewer of the kernel (for the S5
+///    rows, which stand 10 % above the measure, of the realtime reviewer:
 ///    `rtbench --short --icount --marks` prints the segments of the path).
 /// 3. A change of the Rust toolchain measures both rows again and sets the
 ///    constants anew in the same commit.
@@ -4051,15 +4067,16 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    turn into room for later growth.
 const NULL_MAX: u64 = 266;
 const THREADS_READY_MAX: u64 = 12_768;
-const S5_ICOUNT_MAX: u64 = 2_770;
+const S5_ICOUNT_MAX: u64 = 3_035;
+const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
 const NULL_SLACK: u64 = 16;
 /// The room each guard keeps above its measure when it is set or lowered.
 const NULL_KEEP: u64 = 4;
 const THREADS_READY_KEEP: u64 = 4;
-const S5_ICOUNT_KEEP: u64 = 16;
+const S5_ICOUNT_KEEP: u64 = 276;
 const THREADS_READY_SLACK: u64 = 128;
-const S5_ICOUNT_SLACK: u64 = 16;
+const S5_ICOUNT_SLACK: u64 = 300;
 
 /// The most one step of a service may take (one READ_INTO of up to
 /// proto_fs::READ_INTO_MAX bytes in the RAM file service's loop, for
@@ -4173,11 +4190,15 @@ const WAIT_MAX: u64 = 500_000;
 /// no heartbeat, in ticks under -icount: one round trip (C_ipc about
 /// 2,000), the longest step of the process service that may be running
 /// (SpawnStart, 95,634 with its margin), and the step of the request
-/// itself (term B), with room: 95,634 + 20,410 + 2,034 = 118,078 under
-/// 120,000, 1,922 of room, so a next rise of SpawnStart needs a new look
-/// at this limit. Seen at most 9,946 (ramfs FinishBinding with 248
-/// children).
-const CALL_WAIT_MAX: u64 = 120_000;
+/// itself (term B), with a room of 10 %: 95,634 + 20,410 + 2,034 = 118,078,
+/// and 118,078 + 10 % = 129,886 under 130,000, 11,922 of room. The room was
+/// 1,922 (1.6 %) under 120,000, and a next rise of SpawnStart would have
+/// failed every service; this limit moves with the sum, so a rise of
+/// SpawnStart by more than 10,000 needs a new look at it, and the cuts of
+/// Create, SpawnStart, ExecStart and ForkStart into pieces no longer than B
+/// (part 13) take the first term out of the sum. Seen at most 9,946 (ramfs
+/// FinishBinding with 248 children).
+const CALL_WAIT_MAX: u64 = 130_000;
 
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
 /// proto_pipe::Method.
@@ -6969,7 +6990,7 @@ fn guard_margin(
 /// The line that asks to lower the guard `name` when its `room` under `max`
 /// is larger than `slack`: the new number is the measure plus `keep` ticks,
 /// the room the rule of that guard keeps (`NULL_KEEP` and `THREADS_READY_KEEP`
-/// 4, `S5_ICOUNT_KEEP` 16).
+/// 4, `S5_ICOUNT_KEEP` 276, 10 % of the measure).
 fn guard_lower_hint(name: &str, room: u64, slack: u64, max: u64, keep: u64) -> Option<String> {
     (room > slack).then(|| format!("lower {name} to {}", max - room + keep))
 }
@@ -8209,7 +8230,8 @@ mod tests {
             .find(|(k, ..)| *k == 22)
             .expect("SpawnStart is in the list");
         assert!(spawn.3 >= 94_134 + NOISE_MARGIN);
-        assert!(spawn.3 + TERM_B + 2_034 <= CALL_WAIT_MAX);
+        // The limit stands at least 10 % above the sum.
+        assert!((spawn.3 + TERM_B + 2_034) * 11 <= CALL_WAIT_MAX * 10);
     }
 
     #[test]
@@ -8868,17 +8890,27 @@ mod tests {
             ),
             Some("lower THREADS_READY_MAX to 12643".to_owned())
         );
-        // S5 keeps 16 above its measure: a measure 17 under the number
-        // (room 17) asks for the measure plus 16, which leaves room 16.
+        // S5 keeps 10 % above its measure: a measure 301 under the number
+        // (room 301) asks for the measure plus 276, which leaves room 276.
         assert_eq!(
             guard_lower_hint(
                 "S5_ICOUNT_MAX",
-                17,
+                301,
                 S5_ICOUNT_SLACK,
                 S5_ICOUNT_MAX,
                 S5_ICOUNT_KEEP
             ),
-            Some("lower S5_ICOUNT_MAX to 2769".to_owned())
+            Some("lower S5_ICOUNT_MAX to 3010".to_owned())
+        );
+        assert_eq!(
+            guard_lower_hint(
+                "S5_ICOUNT_MAX",
+                300,
+                S5_ICOUNT_SLACK,
+                S5_ICOUNT_MAX,
+                S5_ICOUNT_KEEP
+            ),
+            None
         );
     }
 

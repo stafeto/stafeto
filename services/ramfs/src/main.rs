@@ -2569,8 +2569,20 @@ impl Service<0> for Fs {
                         if let Some(inode) = inode {
                             self.waits.changed(inode);
                         }
-                        self.notify_maintenance();
-                        Answer::Status(Status::Ok)
+                        // The close of an alias leaves nothing to reclaim: only
+                        // lock work calls for a turn of maintenance.
+                        if event.last_alias {
+                            self.notify_maintenance();
+                        } else {
+                            self.notify_lock_work();
+                        }
+                        // The answer: the process holds no record lock now.
+                        let none = s
+                            .data
+                            .binding
+                            .close_pid()
+                            .is_some_and(|pid| !self.locks.holds(Owner::Process(pid)));
+                        value(r, u32::from(none))
                     }
                     Err(code) => status(code),
                 }
@@ -3067,13 +3079,18 @@ impl Fs {
         }
     }
     fn notify_maintenance(&self) {
-        if self.legacy_pending
-            || self.lock_jobs.has_work()
-            || self.waits.needs_work()
-            || self.lock_sweep_pending
-        {
+        if self.legacy_pending || self.lock_work_pending() {
             let _ = sys::notify(&self.channel, 1);
         }
+    }
+    /// A turn of maintenance for the work of locks alone.
+    fn notify_lock_work(&self) {
+        if self.lock_work_pending() {
+            let _ = sys::notify(&self.channel, 1);
+        }
+    }
+    fn lock_work_pending(&self) -> bool {
+        self.lock_jobs.has_work() || self.waits.needs_work() || self.lock_sweep_pending
     }
     fn register_lifetimes(&mut self) -> bool {
         if self.lifetimes.is_some() {

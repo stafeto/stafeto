@@ -64,6 +64,7 @@ enum Target {
 struct PosixFs {
     descriptors: Table<Target, 32, (), (), control::Recovery>,
     waits: super::WaitRecords<wait::Recovery>,
+    record_locks: closing::RecordLocks,
 }
 
 #[allow(dead_code, unused_imports)]
@@ -90,6 +91,7 @@ fn fixture() -> (PosixFs, EntryToken, RamTarget, control::Input) {
     let mut files = PosixFs {
         descriptors: Table::default(),
         waits: super::WaitRecords::new(),
+        record_locks: closing::RecordLocks::new(),
     };
     let target = RamTarget {
         fd: 3,
@@ -790,6 +792,7 @@ fn drain_fixture(early: bool) -> (PosixFs, EntryToken) {
             Table::default()
         },
         waits: super::WaitRecords::new(),
+        record_locks: closing::RecordLocks::new(),
     };
     let fd = files
         .descriptors
@@ -1155,4 +1158,83 @@ fn drain_rotation_passes_a_retained_wait_to_clean_a_later_ready_record() {
         .unwrap();
     assert_eq!(pending.server(), drain::Server::Waiting);
     assert!(pending.held());
+}
+
+#[test]
+fn an_alias_close_is_local_only_while_the_process_is_known_to_hold_no_record_lock() {
+    let (mut files, source, target, input) = fixture();
+    let fd = source.fd;
+    assert!(!files.closes_alias_with_no_record_lock(fd));
+    let alias = files
+        .descriptors
+        .duplicate(fd, 0, Flags::default())
+        .unwrap();
+    // Nothing is known at the start: the first close asks the service.
+    assert!(!files.knows_no_record_lock());
+    assert!(!files.closes_alias_with_no_record_lock(alias));
+    let asked = files.record_locks_question().unwrap();
+    files.record_locks_answered_none(asked);
+    assert!(files.knows_no_record_lock());
+    assert!(files.closes_alias_with_no_record_lock(alias));
+    // The last descriptor of a description always asks.
+    assert!(files.closes_alias_with_no_record_lock(fd));
+    files.descriptors.close(alias).unwrap();
+    assert!(!files.closes_alias_with_no_record_lock(fd));
+    // A lock command forgets the answer, and an answer to a question put
+    // before it is stale.
+    let alias = files
+        .descriptors
+        .duplicate(fd, 0, Flags::default())
+        .unwrap();
+    let stale = files.record_locks_question().unwrap();
+    let token = files
+        .begin_lock_record(owner(), source, Frame::main(91), input)
+        .unwrap()
+        .0;
+    assert!(!files.knows_no_record_lock());
+    files.record_locks_answered_none(stale);
+    assert!(!files.knows_no_record_lock());
+    // With the command outstanding even a fresh answer does not count.
+    assert_eq!(files.record_locks_question(), None);
+    assert!(!files.closes_alias_with_no_record_lock(alias));
+    // Once the command is over the question put before it stays stale, and
+    // a new question settles.
+    files.abandon_lock_owner(owner()).unwrap();
+    files
+        .begin_lock_cleanup(token, control::CancelReason::Abandoned)
+        .unwrap();
+    files
+        .publish_lock_cleanup(token, ControlResult::Value(0), terminal(blocker()))
+        .unwrap();
+    files.finish_lock_cleanup(token).unwrap();
+    assert!(files.no_lock_command());
+    files.record_locks_answered_none(stale);
+    assert!(!files.knows_no_record_lock());
+    let fresh = files.record_locks_question().unwrap();
+    files.record_locks_answered_none(fresh);
+    assert!(files.knows_no_record_lock());
+    assert!(files.closes_alias_with_no_record_lock(alias));
+    let _ = target;
+}
+
+#[test]
+fn an_answer_cannot_hide_a_lock_command_that_began_before_the_question() {
+    // B begins F_SETLK on Y; A closes an alias of X and asks while B's command
+    // is under way; the service answers "none" before it reaches the lock of B.
+    let (mut files, source, _, input) = fixture();
+    let token = files
+        .begin_lock_record(owner(), source, Frame::main(91), input)
+        .unwrap()
+        .0;
+    assert_eq!(files.record_locks_question(), None);
+    // The command ends; no question exists to carry the early answer.
+    files.abandon_lock_owner(owner()).unwrap();
+    files
+        .begin_lock_cleanup(token, control::CancelReason::Abandoned)
+        .unwrap();
+    files
+        .publish_lock_cleanup(token, ControlResult::Value(0), terminal(blocker()))
+        .unwrap();
+    files.finish_lock_cleanup(token).unwrap();
+    assert!(!files.knows_no_record_lock());
 }

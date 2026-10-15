@@ -124,6 +124,34 @@ pub(crate) fn observe(
     (state, confirmed_parked(marker, channel, receiving))
 }
 
+/// A thread that has set its park marker and is still running: it is on
+/// its way into the receive of its park, between the wake of the stopper
+/// and the wait, and shows as parked within microseconds. It is no parked
+/// thread (the rule of `confirmed_parked` stands), but the stopper need
+/// not sleep a whole look-again period for it.
+pub(crate) fn is_parking(state: State, marker: u64, channel: u64) -> bool {
+    marker != 0 && marker == channel && matches!(state, State::Running)
+}
+
+/// The first and the least wait of the stopper when every thread it waits
+/// for is on its way into its park.
+pub(crate) const PARKING_WAIT_NS: u64 = 20_000;
+
+/// How long the stopper waits before it looks again: the short wait,
+/// doubling with each look, while all the threads it waits for are parking
+/// (`previous` is the last wait of that kind, 0 after any other), and
+/// `look_again` otherwise.
+pub(crate) fn next_wait(all_parking: bool, previous: u64, look_again: u64) -> u64 {
+    if !all_parking {
+        return look_again;
+    }
+    if previous == 0 {
+        PARKING_WAIT_NS.min(look_again)
+    } else {
+        previous.saturating_mul(2).min(look_again)
+    }
+}
+
 pub(crate) fn quiescent(
     resident: bool,
     state: State,

@@ -111,6 +111,57 @@ static void holder_case(int ofd, int third_reader) {
     close(upgrade_reports[0]); close(upgrade_reports[1]);
     unlink(path);
 }
+extern int record_locks_none(void);
+/* The close of an alias asks the service only while the process may hold a record lock. */
+static void holder_warm_alias_closes(int fd) {
+    for (int i = 0; i < 2; i++) {
+        int alias = dup(fd);
+        if (alias < 0 || close(alias)) failures++;
+    }
+}
+/* A second process takes the write lock on the file: 0 when it is free. */
+static int holder_rival_locks(const char *path) {
+    pid_t rival = fork();
+    if (!rival) {
+        int fd = open(path, O_RDWR);
+        _exit(fd < 0 ? 2 : deadlock_lock(fd, F_SETLK, F_WRLCK) ? 1 : 0);
+    }
+    int status = -1;
+    if (rival < 0 || waitpid(rival, &status, 0) != rival || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+static void holder_alias_knowledge(void) {
+    const char *path = "/tmp/holder-knowledge";
+    int fd = lifecycle_open(path);
+    if (fd < 0) return;
+    holder_warm_alias_closes(fd);
+    expect("alias closes learn that no record lock is held", record_locks_none(), 1);
+    expect("lock command takes a record lock", deadlock_lock(fd, F_SETLK, F_WRLCK), 0);
+    expect("lock command forgets that none is held", record_locks_none(), 0);
+    expect("rival is refused while the lock is held", holder_rival_locks(path), 1);
+    int alias = dup(fd);
+    expect("alias for the lock release", alias >= 0, 1);
+    expect("close of an alias asks the service and releases the lock", close(alias), 0);
+    expect("rival takes the file once the alias is closed", holder_rival_locks(path), 0);
+    holder_warm_alias_closes(fd);
+    expect("alias closes learn it again after the release", record_locks_none(), 1);
+    /* A lock on another file keeps the answer "not none" through closes of aliases of this one. */
+    const char *other_path = "/tmp/holder-knowledge-other";
+    int other = lifecycle_open(other_path);
+    if (other >= 0) {
+        expect("lock on the other file", deadlock_lock(other, F_SETLK, F_WRLCK), 0);
+        holder_warm_alias_closes(fd);
+        expect("a lock on another file keeps the process asking", record_locks_none(), 0);
+        int other_alias = dup(other);
+        expect("alias of the other file", other_alias >= 0, 1);
+        expect("close of its alias releases its lock", close(other_alias), 0);
+        expect("rival takes the other file", holder_rival_locks(other_path), 0);
+        close(other);
+        unlink(other_path);
+    }
+    close(fd);
+    unlink(path);
+}
 static void holder_close_case(int replacement) {
     const char *path = replacement ? "/tmp/holder-dup2-a" : "/tmp/holder-alias-a";
     int fd = lifecycle_open(path), other = lifecycle_open("/tmp/holder-dup2-b");
@@ -119,6 +170,7 @@ static void holder_close_case(int replacement) {
         if (other >= 0) close(other);
         return;
     }
+    holder_warm_alias_closes(fd);
     int alias = dup(fd), reports[2];
     expect("retain alias for public close release", alias >= 0, 1);
     if (alias < 0 || !simple_wait_pipe(reports)) { close(fd); close(other); return; }
@@ -157,6 +209,7 @@ static void public_lock_holders(void) {
     holder_case(0, 0);
     holder_case(1, 0);
     holder_case(0, 1);
+    holder_alias_knowledge();
     holder_close_case(1);
     holder_close_case(0);
     expect("restore holder conversion signal", sigaction(SIGUSR1, &previous, NULL), 0);

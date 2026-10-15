@@ -638,6 +638,17 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         Ok(fd)
     }
 
+    /// Whether another open descriptor names what `fd` names.
+    pub fn has_open_alias(&self, fd: u32) -> bool {
+        let Ok(backend) = self.get(fd) else {
+            return false;
+        };
+        self.entries.iter().enumerate().any(|(number, slot)| {
+            number != fd as usize
+                && matches!(slot.state, EntryState::Open(e) if e.backend == backend)
+        })
+    }
+
     fn referenced(&self, backend: T) -> bool {
         self.entries
             .iter()

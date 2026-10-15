@@ -388,3 +388,35 @@ fn claim_wait_parks_active_stop_and_preserves_cleanup_wait_errors() {
     assert!(stop.try_begin(11, 202));
     assert!(stop.release(11, || {}, |channel| assert_eq!(channel, 202)));
 }
+
+#[test]
+fn a_thread_on_its_way_into_the_park_is_not_parked_and_shortens_the_wait() {
+    use barrier::State;
+    // Marker of its own channel, kernel state Running: parking, not parked.
+    assert!(barrier::is_parking(State::Running, 7, 7));
+    assert!(!barrier::is_parking(State::Running, 0, 7));
+    assert!(!barrier::is_parking(State::Running, 8, 7));
+    assert!(!barrier::is_parking(State::KernelWait, 7, 7));
+    assert!(!barrier::confirmed_parked(7, 7, false));
+    // The wait: 20 microseconds, doubling to the look-again period; any
+    // other thread gives the period back.
+    let again = 1_000_000;
+    let mut wait = barrier::next_wait(true, 0, again);
+    assert_eq!(wait, 20_000);
+    let mut total = 0;
+    while wait < again {
+        total += 1;
+        wait = barrier::next_wait(true, wait, again);
+    }
+    assert_eq!((wait, total), (again, 6));
+    assert_eq!(barrier::next_wait(false, 40_000, again), again);
+    assert_eq!(barrier::next_wait(true, again, again), again);
+}
+
+#[test]
+fn stop_others_waits_briefly_only_when_every_waited_thread_is_parking() {
+    let source = include_str!("../../posix-abi/src/signals.rs");
+    assert!(source.contains("stop_barrier::is_parking("));
+    assert!(source.contains("stop_barrier::next_wait(!other, short_wait, LOOK_AGAIN_NS)"));
+    assert!(source.contains("other |= !parking;"));
+}

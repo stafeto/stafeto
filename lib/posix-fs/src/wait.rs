@@ -126,6 +126,7 @@ impl PosixFs {
         if self.descriptors.entry_token(source.fd).ok() != Some(source) {
             return Err(FsError::BadFileDescriptor);
         }
+        self.record_lock_command_begins();
         let backend = match self.descriptors.get(source.fd).map_err(FsError::from)? {
             Target::Ram(b) | Target::Random(b) => b,
             _ => return Err(FsError::InvalidArgument),

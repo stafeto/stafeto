@@ -590,10 +590,22 @@ impl Files {
     }
     /// Replay one exact close event independently of physical backend cleanup.
     pub fn close_event_once(&self, event: proto_fs::CloseEvent) -> Result<(), Status> {
+        self.close_event_answer(event).map(drop)
+    }
+    /// The same event, with the service's answer whether the process holds
+    /// no record lock after it.
+    pub fn close_event_answer(&self, event: proto_fs::CloseEvent) -> Result<bool, Status> {
         let mut request = Writer::new();
         event.write(&mut request)?;
         let reply = sys::send(&self.channel, request.as_bytes()).map_err(Status::Kernel)?;
-        Self::open_reply(&reply, 8)
+        if Self::reply_code(&reply)? == 0
+            && reply.len == 8
+            && reply.handles.is_empty()
+            && reply.words[0] >> 32 <= 1
+        {
+            return Ok(reply.words[0] >> 32 == 1);
+        }
+        Self::open_reply(&reply, 8).map(|()| false)
     }
 
     /// Renew an unpublished path proof using the same paid operation.

@@ -27,3 +27,9 @@ pub extern "C" fn deadlock_probe_disarm() {
     posix_abi::probe_wait_hook(None);
     ARMED.store(false, Ordering::Release);
 }
+
+/// 1 when the layer knows the process holds no record lock, else 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn record_locks_none() -> i32 {
+    i32::from(posix_abi::record_locks_none())
+}
