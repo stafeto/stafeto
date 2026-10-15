@@ -203,6 +203,31 @@ pub fn find_mapping(target: NonNull<Process>, va: u64, pages: u64) -> Result<(u3
     Ok((index as u32, table.get(index).rights))
 }
 
+/// Begins a mem_unmap of `pages` pages from `va` in the table of `target`,
+/// which the caller holds (spec 7.4, 7.7, step (5)): INVALID_ARGS when no
+/// mapping holds the whole range, BAD_STATE when a long call works on that
+/// mapping, LIMIT_REACHED when the table lacks the places for the edges
+/// the range leaves; nothing changes then. Else the mapping is cut so that
+/// the range is an entry of its own (`kcore::maps::Maps::split`), busy,
+/// and each edge that is left holds a new reference to the object. The
+/// edges stay whole and idle for the rest of the call, whatever stops it.
+pub fn begin_unmap(target: NonNull<Process>, va: u64, pages: u64) -> Result<Change, Error> {
+    // SAFETY: the caller holds a reference to the process; only the table
+    // is changed.
+    let table = unsafe { table(target) }.ok_or(Error::InvalidArgs)?;
+    let index = table.find_inside(va, pages)?;
+    let object = table.get(index).object;
+    for _ in 0..table.split(index, va, pages)? {
+        memory::retain_mapping(object);
+    }
+    Ok(Change {
+        target,
+        index: index as u32,
+        done: 0,
+        op: Op::Unmap,
+    })
+}
+
 /// Marks entry `index` of the table of `target`, which `find_mapping`
 /// found, busy for a long call that does `op`, and returns the change it
 /// begins.

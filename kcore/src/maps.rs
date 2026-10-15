@@ -132,6 +132,20 @@ impl<T: Copy> Maps<T> {
             .ok_or(Error::InvalidArgs)
     }
 
+    /// The index of the mapping that holds all of `pages` pages from
+    /// `start`; INVALID_ARGS when none does: the range reaches past a
+    /// mapping, covers more than one, or is free (spec 7.4).
+    pub fn find_inside(&self, start: u64, pages: u64) -> Result<usize, Error> {
+        let end = pages
+            .checked_mul(1 << PAGE_SHIFT)
+            .and_then(|len| start.checked_add(len))
+            .ok_or(Error::InvalidArgs)?;
+        self.entries
+            .iter()
+            .position(|m| m.is_some_and(|m| m.start <= start && end <= m.end()))
+            .ok_or(Error::InvalidArgs)
+    }
+
     /// As `find`, and BAD_STATE when a long call works on the mapping
     /// (spec 7.7).
     pub fn find_idle(&self, start: u64, pages: u64) -> Result<usize, Error> {
@@ -384,6 +398,41 @@ mod tests {
         let mut drained = 0;
         maps.drain(|_| drained += 1);
         assert_eq!((drained, maps.is_empty()), (128, true));
+    }
+
+    #[test]
+    fn lookup_inside_takes_a_range_of_one_mapping() {
+        let mut maps = Maps::new();
+        let a = maps.insert(mapping(0x10 * PAGE, 4, 1)).unwrap();
+        let b = maps.insert(mapping(0x14 * PAGE, 2, 2)).unwrap();
+        for (start, pages, want) in [
+            (0x10, 4, a),
+            (0x11, 2, a),
+            (0x13, 1, a),
+            (0x14, 2, b),
+            (0x15, 1, b),
+        ] {
+            assert_eq!(
+                maps.find_inside(start * PAGE, pages),
+                Ok(want),
+                "{start:#x}"
+            );
+        }
+        // Across two mappings, past the end, before the start, free, wrapped.
+        for (start, pages) in [
+            (0x13, 2),
+            (0x10, 6),
+            (0x0F, 2),
+            (0x16, 1),
+            (0x20, 1),
+            (0x10, u64::MAX),
+        ] {
+            assert_eq!(
+                maps.find_inside(start * PAGE, pages),
+                Err(Error::InvalidArgs),
+                "{start:#x}, {pages}"
+            );
+        }
     }
 
     #[test]

@@ -4147,6 +4147,238 @@ fn abandoned_unmap(c: &Caller) -> Result<(), &'static str> {
     result
 }
 
+/// mem_unmap of a range inside a mapping (spec 7.4): 6 pages of an object,
+/// each with its own pattern, are mapped RW into the caller's process,
+/// whose space runs in TTBR0, and the 2 in the middle are read to bring
+/// them into the TLB. mem_unmap takes them: neither EL0 nor the kernel
+/// translates them, the tables hold nothing there, the 2 pages on either
+/// side still read their patterns, from the right pages of the object,
+/// and the mappings count 2 for the object. A second call over the hole
+/// fails with INVALID_ARGS. Each edge unmaps on its own, and the object
+/// goes with the last reference: a reference the cut did not take would
+/// let it go with the first edge.
+pub fn unmap_of_a_range_leaves_the_edges(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let (h, m) = make_memory(c, 6)?;
+        for i in 0..6 {
+            let pa = memory::frame(m, i);
+            for j in 0..PAGE_SIZE / 8 {
+                // SAFETY: the frame is the object's, which the test holds,
+                // and the linear map reaches it.
+                unsafe {
+                    ((LINEAR_BASE + (pa + j * 8) as usize) as *mut u64).write(0xA0 + i as u64)
+                };
+            }
+        }
+        map_whole(c, own, h, 6, USER_VA, Access::ReadWrite)?;
+        // SAFETY: the process is the test's, and nothing runs it.
+        unsafe { (*c.process.as_ptr()).activate() };
+        let at = |page: usize| USER_VA + page * PAGE;
+        check(
+            read_user(at(2)) == 0xA2 && read_user(at(3)) == 0xA3,
+            "the pages to unmap miss their contents",
+        )?;
+        unmap_whole(c, own, 2, at(2))?;
+        check(
+            [2, 3].iter().all(|&i| {
+                !translates(registers::at_s1e0r(at(i)))
+                    && !translates(registers::at_s1e1r(at(i)))
+                    && !mapped(c.process, at(i))
+            }),
+            "a page of the range still translates",
+        )?;
+        check(
+            [(0, 0xA0), (1, 0xA1), (4, 0xA4), (5, 0xA5)]
+                .iter()
+                .all(|&(i, pattern)| read_user(at(i)) == pattern),
+            "an edge does not show its pages of the object",
+        )?;
+        let (left, right) = (
+            process::mapping(c.process, at(0), 2),
+            process::mapping(c.process, at(4), 2),
+        );
+        check(
+            left.is_some_and(|k| !k.is_busy() && k.object == m && k.offset == 0)
+                && right.is_some_and(|k| !k.is_busy() && k.object == m && k.offset == 4),
+            "the edges are not idle entries with the offsets of their pages",
+        )?;
+        check(
+            memory::info(m).mappings == 2 && process::mappings(c.process) == 2,
+            "the object does not count one mapping for each edge",
+        )?;
+        let n = Call::MemUnmap.number();
+        let hole = c.call(n, &[own.0, at(2) as u64, 2 * PAGE_SIZE]);
+        check(
+            hole[0] == Error::InvalidArgs.code(),
+            "a second unmap of the hole did not fail",
+        )?;
+        c.close(h)?;
+        unmap_whole(c, own, 2, at(0))?;
+        cleanup::drain();
+        check(
+            memory::in_use() == objects + 1 && memory::info(m).mappings == 1,
+            "the object went with the first edge",
+        )?;
+        unmap_whole(c, own, 2, at(4))?;
+        c.close(own)?;
+        cleanup::drain();
+        check(
+            memory::in_use() == objects,
+            "the object stayed after its last mapping",
+        )
+    })
+}
+
+/// A cut mapping obeys the busy mark and the table's room (spec 7.4, 7.7):
+/// an entry that begins a mem_unmap of the middle of a mapping of 8 pages
+/// leaves 3 entries, the middle busy, and a second begin over the middle or
+/// a part of it fails with BAD_STATE and changes nothing. Once the call
+/// stops with nothing done the middle is idle again, and the edges never
+/// stopped being whole. In a table with one free place the middle fails
+/// with LIMIT_REACHED, with the table and the object's count as before,
+/// while a range at an end of the mapping goes.
+pub fn cut_mapping_is_busy_and_needs_room(_: &Boot) -> Result<(), &'static str> {
+    let c = Caller::new()?;
+    let result = cut_busy(&c);
+    c.release();
+    result
+}
+
+fn cut_busy(c: &Caller) -> Result<(), &'static str> {
+    let (h, m) = make_memory(c, 8)?;
+    let (t, th) = target_of(c)?;
+    let at = |page: usize| USER_VA + page * PAGE;
+    let result = map_whole(c, th, h, 8, USER_VA, Access::ReadWrite).and_then(|()| {
+        let on = process::begin_unmap(t, at(2) as u64, 4).map_err(|_| "no cut")?;
+        check(
+            process::mappings(t) == 3 && memory::info(m).mappings == 3,
+            "the cut did not make three entries, each with a reference",
+        )?;
+        let busy = process::mapping(t, at(2), 4).is_some_and(|k| k.is_busy());
+        check(busy, "the middle is not busy")?;
+        for (page, pages) in [(2, 4), (3, 2), (5, 1)] {
+            check(
+                process::begin_unmap(t, at(page) as u64, pages).err() == Some(Error::BadState),
+                "a second unmap over the middle did not fail with BAD_STATE",
+            )?;
+        }
+        check(
+            process::mappings(t) == 3,
+            "a refused unmap changed the table",
+        )?;
+        // SAFETY: the call stops with nothing done; nothing uses it again.
+        unsafe { process::abandon_change(on, CAUSE) };
+        check(
+            process::mapping(t, at(2), 4).is_some_and(|k| !k.is_busy() && k.offset == 2)
+                && process::mapping(t, at(0), 2).is_some_and(|k| !k.is_busy())
+                && process::mapping(t, at(6), 2).is_some_and(|k| k.offset == 6),
+            "the stopped call did not leave idle entries",
+        )?;
+        check(
+            memory::info(m).mappings == 3,
+            "an unmap that did nothing changed the references",
+        )?;
+        // Fill the table but one place with one-page mappings.
+        let one = memory::create_whole(t, 1).map_err(|_| "no memory object")?;
+        let far = 1 << 32;
+        let filled = (0..abi::MAX_MAPPINGS as usize - 4).try_for_each(|i| {
+            process::map_whole(t, one, far + i * PAGE, Access::Read)
+                .map_err(|_| "a page did not map")
+        });
+        // SAFETY: the reference `create_whole` handed out goes; the
+        // mappings hold the object.
+        unsafe { memory::release(one, CAUSE) };
+        filled?;
+        // The three entries and the filler: 127 of 128.
+        check(
+            process::mappings(t) == abi::MAX_MAPPINGS as usize - 1,
+            "the table is not one short of full",
+        )?;
+        let before = memory::info(m).mappings;
+        check(
+            process::begin_unmap(t, at(3) as u64, 2).err() == Some(Error::LimitReached),
+            "a cut without places for both edges did not fail with LIMIT_REACHED",
+        )?;
+        check(
+            process::mappings(t) == abi::MAX_MAPPINGS as usize - 1
+                && memory::info(m).mappings == before
+                && process::mapping(t, at(2), 4).is_some_and(|k| !k.is_busy()),
+            "a refused cut changed the table or the references",
+        )?;
+        let on =
+            process::begin_unmap(t, at(2) as u64, 2).map_err(|_| "the cut at an end failed")?;
+        check(
+            process::mappings(t) == abi::MAX_MAPPINGS as usize,
+            "the cut at an end did not add its edge",
+        )?;
+        // SAFETY: as above.
+        unsafe { process::abandon_change(on, CAUSE) };
+        Ok(())
+    });
+    c.close(th).and(c.close(h))?;
+    release_target(t);
+    result
+}
+
+/// A mem_unmap of a range whose caller's process ends between two portions
+/// leaves the edges whole and the rest of the range (spec 7.7): with an
+/// interrupt pending all along, two entries unmap two portions of the
+/// middle of a mapping of 6 portions, 4 of them; once the caller's process
+/// went, the mapping starts at the pages after them, with their offset in
+/// the object, idle, the edges are idle entries as the cut made them, and
+/// only the pages after the unmapped ones translate.
+pub fn abandoned_range_unmap_keeps_the_edges(_: &Boot) -> Result<(), &'static str> {
+    let c = Caller::new()?;
+    let result = abandoned_range(&c);
+    c.release();
+    result
+}
+
+fn abandoned_range(c: &Caller) -> Result<(), &'static str> {
+    let portion = u64::from(process::PORTION);
+    let total = 6 * portion;
+    let (h, m) = make_memory(c, total)?;
+    let (t, th) = target_of(c)?;
+    let at = |page: u64| USER_VA + page as usize * PAGE;
+    // Pages portion to 5 * portion of the mapping, the middle.
+    let n = Call::MemUnmap.number();
+    let args = [th.0, at(portion) as u64, 4 * portion * PAGE_SIZE];
+    let result = map_whole(c, th, h, total, USER_VA, Access::ReadWrite).and_then(|()| {
+        with_interrupt_pending(|| {
+            c.call(n, &args);
+            c.again(n);
+            Ok(())
+        })?;
+        // SAFETY: the test holds a reference to the process.
+        unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+        cleanup::drain();
+        let done = 3 * portion;
+        check(
+            process::mapping(t, at(0), portion).is_some_and(|k| !k.is_busy() && k.offset == 0)
+                && process::mapping(t, at(5 * portion), portion)
+                    .is_some_and(|k| !k.is_busy() && u64::from(k.offset) == 5 * portion),
+            "the edges did not stay whole and idle",
+        )?;
+        let rest = process::mapping(t, at(3 * portion), 2 * portion);
+        check(
+            rest.is_some_and(|k| !k.is_busy() && u64::from(k.offset) == done),
+            "the middle did not keep the pages the call did not unmap, idle",
+        )?;
+        check(
+            mapped(t, at(0))
+                && !mapped(t, at(portion))
+                && !mapped(t, at(3 * portion - 1))
+                && mapped(t, at(3 * portion))
+                && mapped(t, at(6 * portion - 1)),
+            "the pages of the range do not translate as the portions left them",
+        )
+    });
+    release_target(t);
+    result
+}
+
 /// A mem_protect whose caller's process ends between two portions leaves
 /// its mapping idle (spec 7.7): with an interrupt pending all along, two
 /// entries give two portions of a mapping of LONG_PAGES pages, RW, access
@@ -6139,6 +6371,19 @@ fn changes_ticks(c: &Caller, ticks: &mut [u64; 6]) -> Result<(), &'static str> {
         ticks[3] = change(Call::MemProtect, va, Access::Read.raw())?;
         ticks[4] = change(Call::MemProtect, va, Access::ReadExec.raw())?;
         ticks[2] = change(Call::MemUnmap, va, 0)?;
+        // The cut: the table holds MAX_MAPPINGS - 2 mappings, and mem_unmap
+        // of 32 pages in the middle of the mapping of 64 pages leaves
+        // MAX_MAPPINGS, the two edges new. Its first entry cuts and takes
+        // the first portion of the range; the longest of its entries
+        // counts for the row.
+        let filler = |i: usize| 4 * REGION + (1 << 20) + i * PAGE;
+        map_whole(c, th, h, 64, va, Access::ReadWrite)?;
+        unmap_whole(c, th, 1, filler(0))?;
+        unmap_whole(c, th, 1, filler(1))?;
+        let args = [th.0, (va + 16 * PAGE) as u64, 32 * PAGE_SIZE];
+        let (first, rest, _) = timed_entries(c, Call::MemUnmap.number(), &args)?;
+        kprintln!("unmap cut ticks: first={first} rest={rest}");
+        ticks[2] = ticks[2].max(first).max(rest);
         Ok(())
     });
     for t in threads.into_iter().flatten() {

@@ -68,7 +68,7 @@ pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
-    Change, Op, abandon_change, add_mapping, begin_change, check_free, device_windows,
+    Change, Op, abandon_change, add_mapping, begin_change, begin_unmap, check_free, device_windows,
     find_mapping, finish_change, in_mapping, map_whole, step_change,
 };
 #[cfg(not(feature = "ktest"))]

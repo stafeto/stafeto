@@ -672,8 +672,10 @@ pub fn mem_map(
     call::<{ Call::MemMap.number() }>(&args).map(drop)
 }
 
-/// mem_unmap: the mapping of `process` that is exactly `len` bytes from
-/// `addr` goes (spec 7.4).
+/// mem_unmap: the `len` bytes from `addr`, whole pages inside one mapping
+/// of `process`, go (spec 7.4); the pages on either side stay mapped, as
+/// entries of their own. LIMIT_REACHED when the table lacks the places for
+/// them.
 ///
 /// # Safety
 /// Nothing the caller uses lies in the mapping, when it is the caller's
