@@ -6,8 +6,8 @@
 //! object, in a table of 4 KiB. A mapping holds a counted reference to its
 //! object, `T`, and the rights of the handle it was made through; a long
 //! call that works on it marks it busy, and the other calls on it get
-//! BAD_STATE until the mark goes. `mem_unmap` and `mem_protect` take
-//! exactly one whole mapping. Every operation walks the table once: O(1)
+//! BAD_STATE until the mark goes. `mem_protect` takes exactly one whole
+//! mapping, `mem_unmap` a range of whole pages inside one (`split`). Every operation walks the table once: O(1)
 //! with the constant MAX_MAPPINGS.
 
 use crate::PAGE_SHIFT;
@@ -132,6 +132,20 @@ impl<T: Copy> Maps<T> {
             .ok_or(Error::InvalidArgs)
     }
 
+    /// The index of the mapping that holds all of `pages` pages from
+    /// `start`; INVALID_ARGS when none does: the range reaches past a
+    /// mapping, covers more than one, or is free (spec 7.4).
+    pub fn find_inside(&self, start: u64, pages: u64) -> Result<usize, Error> {
+        let end = pages
+            .checked_mul(1 << PAGE_SHIFT)
+            .and_then(|len| start.checked_add(len))
+            .ok_or(Error::InvalidArgs)?;
+        self.entries
+            .iter()
+            .position(|m| m.is_some_and(|m| m.start <= start && end <= m.end()))
+            .ok_or(Error::InvalidArgs)
+    }
+
     /// As `find`, and BAD_STATE when a long call works on the mapping
     /// (spec 7.7).
     pub fn find_idle(&self, start: u64, pages: u64) -> Result<usize, Error> {
@@ -156,6 +170,71 @@ impl<T: Copy> Maps<T> {
             .as_mut()
             .expect("a mapping at the index")
             .busy = busy;
+    }
+
+    /// Cuts the mapping at `index` so that exactly `pages` pages from
+    /// `start` are an entry of their own (spec 7.4): the pages before the
+    /// range stay an idle entry, the pages after it become another, and the
+    /// entry at `index` shows the range, marked busy, ready for a long
+    /// call. The edges keep the rights and the object, with the offsets of
+    /// their pages. Returns the number of entries added (0 to 2, one for
+    /// each edge that is not empty): the caller takes a reference to the
+    /// object for each of them.
+    ///
+    /// INVALID_ARGS when the range is empty or reaches outside the mapping,
+    /// BAD_STATE when a long call works on the mapping, LIMIT_REACHED when
+    /// fewer than that many places are free; nothing changes then. The
+    /// table is walked once.
+    pub fn split(&mut self, index: usize, start: u64, pages: u64) -> Result<u32, Error> {
+        let m = *self.entries[index]
+            .as_ref()
+            .expect("a mapping at the index");
+        let end = start
+            .checked_add(pages << PAGE_SHIFT)
+            .filter(|_| pages != 0 && pages <= u64::from(m.pages))
+            .ok_or(Error::InvalidArgs)?;
+        if start < m.start || end > m.end() {
+            return Err(Error::InvalidArgs);
+        }
+        if m.busy {
+            return Err(Error::BadState);
+        }
+        let before = ((start - m.start) >> PAGE_SHIFT) as u32;
+        let after = ((m.end() - end) >> PAGE_SHIFT) as u32;
+        let edges = u32::from(before != 0) + u32::from(after != 0);
+        let mut free = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.is_none())
+            .map(|(i, _)| i);
+        let places = [free.next(), free.next()];
+        if places.iter().flatten().count() < edges as usize {
+            return Err(Error::LimitReached);
+        }
+        let mut places = places.into_iter().flatten();
+        let middle = Mapping {
+            start,
+            pages: pages as u32,
+            offset: m.offset + before,
+            busy: true,
+            ..m
+        };
+        if before != 0 {
+            let at = places.next().expect("a place for the left edge");
+            self.entries[at] = Some(Mapping { pages: before, ..m });
+        }
+        if after != 0 {
+            let at = places.next().expect("a place for the right edge");
+            self.entries[at] = Some(Mapping {
+                start: end,
+                pages: after,
+                offset: middle.offset + middle.pages,
+                ..m
+            });
+        }
+        self.entries[index] = Some(middle);
+        Ok(edges)
     }
 
     /// A `mem_map` that stopped midway (spec 7.7): the mapping at `index`
@@ -322,6 +401,41 @@ mod tests {
     }
 
     #[test]
+    fn lookup_inside_takes_a_range_of_one_mapping() {
+        let mut maps = Maps::new();
+        let a = maps.insert(mapping(0x10 * PAGE, 4, 1)).unwrap();
+        let b = maps.insert(mapping(0x14 * PAGE, 2, 2)).unwrap();
+        for (start, pages, want) in [
+            (0x10, 4, a),
+            (0x11, 2, a),
+            (0x13, 1, a),
+            (0x14, 2, b),
+            (0x15, 1, b),
+        ] {
+            assert_eq!(
+                maps.find_inside(start * PAGE, pages),
+                Ok(want),
+                "{start:#x}"
+            );
+        }
+        // Across two mappings, past the end, before the start, free, wrapped.
+        for (start, pages) in [
+            (0x13, 2),
+            (0x10, 6),
+            (0x0F, 2),
+            (0x16, 1),
+            (0x20, 1),
+            (0x10, u64::MAX),
+        ] {
+            assert_eq!(
+                maps.find_inside(start * PAGE, pages),
+                Err(Error::InvalidArgs),
+                "{start:#x}, {pages}"
+            );
+        }
+    }
+
+    #[test]
     fn busy_mapping_refuses_other_calls() {
         let mut maps = Maps::new();
         let i = maps.insert(mapping(0x10 * PAGE, 4, 1)).unwrap();
@@ -374,5 +488,115 @@ mod tests {
         maps.set_busy(i, true);
         assert_eq!(maps.drop_prefix(i, 6), Some(1));
         assert!(maps.is_empty());
+    }
+
+    #[test]
+    fn splitting_cuts_a_mapping_in_three() {
+        let mut maps = Maps::new();
+        let i = maps
+            .insert(Mapping::new(0x10 * PAGE, 10, 3, 1, RW))
+            .unwrap();
+        // Pages 4 to 6 of the mapping.
+        assert_eq!(maps.split(i, 0x14 * PAGE, 3), Ok(2));
+        let m = *maps.get(i);
+        assert_eq!(
+            (m.start, m.pages, m.offset, m.is_busy(), m.object, m.rights),
+            (0x14 * PAGE, 3, 7, true, 1, RW)
+        );
+        let left = maps.find_idle(0x10 * PAGE, 4).unwrap();
+        let right = maps.find_idle(0x17 * PAGE, 3).unwrap();
+        assert_eq!((maps.get(left).offset, maps.get(right).offset), (3, 10));
+        for e in [left, right] {
+            assert_eq!((maps.get(e).object, maps.get(e).rights), (1, RW));
+        }
+        assert_eq!(maps.len(), 3);
+        // The pieces cover the old range and nothing else.
+        assert_eq!(maps.check_free(0x0F * PAGE, 1), Ok(()));
+        assert_eq!(maps.check_free(0x1A * PAGE, 1), Ok(()));
+        assert_eq!(maps.check_free(0x10 * PAGE, 10), Err(Error::InvalidArgs));
+        // The middle is busy: a second call over it, whole or in part.
+        assert_eq!(maps.find_idle(0x14 * PAGE, 3), Err(Error::BadState));
+        assert_eq!(maps.split(i, 0x14 * PAGE, 3), Err(Error::BadState));
+        assert_eq!(maps.len(), 3);
+    }
+
+    #[test]
+    fn splitting_at_an_edge_adds_one_entry_and_the_whole_adds_none() {
+        let mut maps = Maps::new();
+        let i = maps
+            .insert(Mapping::new(0x10 * PAGE, 10, 3, 1, RW))
+            .unwrap();
+        assert_eq!(maps.split(i, 0x10 * PAGE, 4), Ok(1));
+        assert_eq!(maps.len(), 2);
+        let rest = maps.find_idle(0x14 * PAGE, 6).unwrap();
+        assert_eq!(maps.get(rest).offset, 7);
+        assert_eq!(maps.get(i).offset, 3);
+        assert!(maps.get(i).is_busy());
+        // The last pages.
+        assert_eq!(maps.split(rest, 0x18 * PAGE, 2), Ok(1));
+        let end = maps.find(0x18 * PAGE, 2).unwrap();
+        assert_eq!((maps.get(end).offset, maps.get(end).is_busy()), (11, true));
+        let mid = maps.find_idle(0x14 * PAGE, 4).unwrap();
+        assert_eq!(maps.get(mid).offset, 7);
+        // The whole of an entry.
+        let one = maps.insert(mapping(0x30 * PAGE, 5, 2)).unwrap();
+        assert_eq!(maps.split(one, 0x30 * PAGE, 5), Ok(0));
+        assert!(maps.get(one).is_busy());
+        assert_eq!(maps.len(), 4);
+    }
+
+    #[test]
+    fn splitting_needs_a_place_for_each_edge() {
+        let mut maps = Maps::new();
+        let i = maps.insert(mapping(0x1000 * PAGE, 10, 1)).unwrap();
+        for k in 0..MAX_MAPPINGS as u64 - 2 {
+            maps.insert(mapping(k * PAGE, 1, 2)).unwrap();
+        }
+        assert_eq!(maps.len(), 127);
+        let before: Vec<_> = maps.iter().copied().collect();
+        // One place is free: the middle needs two, nothing changes.
+        assert_eq!(maps.split(i, 0x1003 * PAGE, 4), Err(Error::LimitReached));
+        assert_eq!(maps.iter().copied().collect::<Vec<_>>(), before);
+        assert!(!maps.get(i).is_busy());
+        // An edge or the whole fits.
+        assert_eq!(maps.split(i, 0x1000 * PAGE, 4), Ok(1));
+        assert_eq!(maps.len(), 128);
+        // The table is full: the whole of an entry still goes.
+        let other = maps.find(0, 1).unwrap();
+        assert_eq!(maps.split(other, 0, 1), Ok(0));
+        let rest = maps.find_idle(0x1004 * PAGE, 6).unwrap();
+        assert_eq!(maps.split(rest, 0x1005 * PAGE, 1), Err(Error::LimitReached));
+        assert_eq!(maps.split(rest, 0x1004 * PAGE, 6), Ok(0));
+    }
+
+    #[test]
+    fn splitting_refuses_a_range_outside_the_mapping() {
+        let mut maps = Maps::new();
+        let i = maps.insert(mapping(0x10 * PAGE, 4, 1)).unwrap();
+        for (start, pages) in [
+            (0x10, 0),
+            (0x0F, 2),
+            (0x13, 2),
+            (0x10, 5),
+            (0x14, 1),
+            (0x20, 1),
+            (0x10, u64::MAX >> PAGE_SHIFT),
+        ] {
+            assert_eq!(
+                maps.split(i, start * PAGE, pages),
+                Err(Error::InvalidArgs),
+                "{start:#x}, {pages}"
+            );
+        }
+        assert_eq!(maps.len(), 1);
+        assert!(!maps.get(i).is_busy());
+        // After an interrupted call the middle loses its done prefix as
+        // any entry does.
+        assert_eq!(maps.split(i, 0x11 * PAGE, 2), Ok(2));
+        let mid = maps.find(0x11 * PAGE, 2).unwrap();
+        assert_eq!(maps.drop_prefix(mid, 1), None);
+        assert_eq!(maps.get(mid).start, 0x12 * PAGE);
+        assert!(!maps.get(mid).is_busy());
+        assert_eq!(maps.len(), 3);
     }
 }

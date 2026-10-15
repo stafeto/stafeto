@@ -190,32 +190,57 @@ pub fn add_mapping(
     })
 }
 
-/// The entry of exactly `pages` pages from `va` in the table of `target`,
-/// which the caller holds, that no long call works on: its index and the
-/// rights it was mapped with (spec 7.4, 7.7). INVALID_ARGS when no mapping
-/// is that range, BAD_STATE when a long call works on it: steps (5) of
-/// mem_unmap and mem_protect.
-pub fn find_mapping(target: NonNull<Process>, va: u64, pages: u64) -> Result<(u32, Rights), Error> {
-    // SAFETY: the caller holds a reference to the process; only the table
-    // is read.
-    let table = unsafe { table(target) }.ok_or(Error::InvalidArgs)?;
-    let index = table.find_idle(va, pages)?;
-    Ok((index as u32, table.get(index).rights))
+/// Begins a mem_unmap of `pages` pages from `va` in the table of `target`,
+/// which the caller holds (spec 7.4, 7.7, step (5)): see `cut`.
+pub fn begin_unmap(target: NonNull<Process>, va: u64, pages: u64) -> Result<Change, Error> {
+    cut(target, va, pages, Op::Unmap)
 }
 
-/// Marks entry `index` of the table of `target`, which `find_mapping`
-/// found, busy for a long call that does `op`, and returns the change it
-/// begins.
-pub fn begin_change(target: NonNull<Process>, index: u32, op: Op) -> Change {
-    // SAFETY: the caller holds a reference to the process, which lives.
-    let table = unsafe { table(target) }.expect("a table with the entry");
-    table.set_busy(index as usize, true);
-    Change {
+/// Begins a mem_protect of `pages` pages from `va` to `access` in the
+/// table of `target`, which the caller holds (spec 7.4, 7.7, step (5)):
+/// see `cut`; ACCESS_DENIED, after BAD_STATE and before the places, when
+/// the access needs a right the mapping was not made with.
+pub fn begin_protect(
+    target: NonNull<Process>,
+    va: u64,
+    pages: u64,
+    access: Access,
+) -> Result<Change, Error> {
+    cut(target, va, pages, Op::Protect { access })
+}
+
+/// Begins the long call `op` on `pages` pages from `va`, which have to lie
+/// inside one mapping of `target`: INVALID_ARGS when no mapping holds the
+/// whole range, BAD_STATE when a long call works on that mapping,
+/// ACCESS_DENIED for a protect beyond the rights of the mapping,
+/// LIMIT_REACHED when the table lacks the places for the edges the range
+/// leaves; nothing changes then. Else the mapping is cut so that the range
+/// is an entry of its own (`kcore::maps::Maps::split`), busy, and each
+/// edge that is left, idle and unchanged, holds a new reference to the
+/// object. Whatever stops the call, the edges stay whole.
+fn cut(target: NonNull<Process>, va: u64, pages: u64, op: Op) -> Result<Change, Error> {
+    // SAFETY: the caller holds a reference to the process; only the table
+    // is changed.
+    let table = unsafe { table(target) }.ok_or(Error::InvalidArgs)?;
+    let index = table.find_inside(va, pages)?;
+    let m = *table.get(index);
+    if m.is_busy() {
+        return Err(Error::BadState);
+    }
+    if let Op::Protect { access } = op
+        && !m.rights.contains(access.rights())
+    {
+        return Err(Error::AccessDenied);
+    }
+    for _ in 0..table.split(index, va, pages)? {
+        memory::retain_mapping(m.object);
+    }
+    Ok(Change {
         target,
-        index,
+        index: index as u32,
         done: 0,
         op,
-    }
+    })
 }
 
 /// One portion of `on`, a mem_map, mem_unmap or mem_protect (spec 7.4,
@@ -289,6 +314,7 @@ pub unsafe fn finish_change(on: Change, cause: u8) {
         Op::Protect { .. } => table.set_busy(index, false),
         Op::Unmap => {
             let m = table.remove(index);
+            crate::testpoint::mapping_released();
             // SAFETY: the entry went, and its reference with it.
             unsafe { memory::release_mapping(m.object, cause) };
         }

@@ -82,6 +82,21 @@ mod points {
     /// `frames` were written (process::maps).
     #[inline(always)]
     pub fn code_mapped(_: &[u64]) {}
+
+    /// After the stores of a change to user descriptors reached the table
+    /// walker (Mmu::tables_written).
+    #[inline(always)]
+    pub fn tables_stored() {}
+
+    /// After the `dsb ish` that completed the TLBIs of a batch of user
+    /// pages (Mmu::user_pages_invalidated).
+    #[inline(always)]
+    pub fn pages_invalidated() {}
+
+    /// Before the reference of a mapping that mem_unmap took out of the
+    /// table goes (process::maps).
+    #[inline(always)]
+    pub fn mapping_released() {}
 }
 
 /// The test build: each point goes to the tests.
@@ -141,5 +156,17 @@ mod points {
 
     pub fn code_mapped(frames: &[u64]) {
         ktest::calls::code_mapped(frames);
+    }
+
+    pub fn tables_stored() {
+        ktest::calls::tables_stored();
+    }
+
+    pub fn pages_invalidated() {
+        ktest::calls::pages_invalidated();
+    }
+
+    pub fn mapping_released() {
+        ktest::calls::mapping_released();
     }
 }

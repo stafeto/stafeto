@@ -237,6 +237,14 @@ const _: () = assert!(MAX_PAGES as u64 * PAGE_SIZE == abi::MAX_MEMORY);
 /// (abi::Access). INVALID_ARGS for any other value, write and execute
 /// together among them.
 pub fn access_arg(raw: u64) -> Result<Access, Error> {
+    Access::from_raw(raw)
+        .filter(|a| *a != Access::None)
+        .ok_or(Error::InvalidArgs)
+}
+
+/// The access of `mem_protect` from a register (spec 7.4): None (0), R, RW
+/// or RX. INVALID_ARGS for any other value.
+pub fn protect_access_arg(raw: u64) -> Result<Access, Error> {
     Access::from_raw(raw).ok_or(Error::InvalidArgs)
 }
 
@@ -538,6 +546,12 @@ mod tests {
         assert_eq!(access_arg(5), Ok(Access::ReadExec));
         for raw in [0, 2, 4, 6, 7, 8, 9, 1 << 32 | 1, u64::MAX] {
             assert_eq!(access_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
+        }
+        // mem_protect adds None.
+        assert_eq!(protect_access_arg(0), Ok(Access::None));
+        assert_eq!(protect_access_arg(5), Ok(Access::ReadExec));
+        for raw in [2, 4, 6, 7, 8, 1 << 32, u64::MAX] {
+            assert_eq!(protect_access_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
         }
     }
 

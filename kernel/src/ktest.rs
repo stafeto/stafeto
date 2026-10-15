@@ -480,6 +480,26 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::abandoned_unmap_keeps_the_rest,
     ),
     (
+        "unmap_of_a_range_leaves_the_edges",
+        calls::unmap_of_a_range_leaves_the_edges,
+    ),
+    (
+        "protect_of_a_range_gives_none_to_the_middle",
+        calls::protect_of_a_range_gives_none_to_the_middle,
+    ),
+    (
+        "mapping_reference_goes_after_the_barrier",
+        calls::mapping_reference_goes_after_the_barrier,
+    ),
+    (
+        "cut_mapping_is_busy_and_needs_room",
+        calls::cut_mapping_is_busy_and_needs_room,
+    ),
+    (
+        "abandoned_range_unmap_keeps_the_edges",
+        calls::abandoned_range_unmap_keeps_the_edges,
+    ),
+    (
         "abandoned_protect_goes_idle",
         calls::abandoned_protect_goes_idle,
     ),

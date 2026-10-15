@@ -452,4 +452,100 @@ mod tests {
             asids.generation()
         );
     }
+
+    /// One mem_unmap of `pages` pages from `start`, inside one mapping of
+    /// `maps` over an object whose frames go when `refs` falls to 0: the
+    /// cut (the edges take a reference each), portions of 2 pages that
+    /// clear descriptors and end with `forget_range`, and the reference of
+    /// the middle once its last page is done. `early` lets that reference
+    /// go between the stores of the last portion and its `forget_range`.
+    /// Err when the frames go while a TLB entry or an unfinished TLBI may
+    /// still reach them.
+    #[allow(clippy::too_many_arguments)]
+    fn unmap_call(
+        m: &mut Model,
+        asids: &AsidAllocator,
+        tag: &AsidTag,
+        maps: &mut crate::maps::Maps<u32>,
+        refs: &mut u32,
+        (root, start, pages): (u64, u64, u64),
+        early: bool,
+    ) -> Result<(), String> {
+        let index = maps.find_inside(start, pages).unwrap();
+        *refs += maps.split(index, start, pages).unwrap();
+        let release = |m: &Model, refs: &mut u32| {
+            *refs -= 1;
+            if *refs == 0 && (!m.stale.is_empty() || !m.pending.is_empty() || !m.tlb.is_empty()) {
+                return Err(format!(
+                    "the frames went with {} stale, {} pending and {} cached",
+                    m.stale.len(),
+                    m.pending.len(),
+                    m.tlb.len()
+                ));
+            }
+            Ok(())
+        };
+        let mut done = 0;
+        while done < pages {
+            let n = (pages - done).min(2);
+            let va = start + (done << 12);
+            for i in 0..n {
+                assert!(m.unmap(root, va + (i << 12)));
+            }
+            let last = maps.drop_prefix(index, n as u32).is_some();
+            if last && early {
+                release(m, refs)?;
+            }
+            forget_range(asids, tag, va, n, m);
+            if last && !early {
+                release(m, refs)?;
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// A mapping of 6 pages is unmapped in three calls, the middle 2
+    /// pages, then each edge: no frame goes while the TLB or a pending
+    /// TLBI may still reach it, and the reference of the last call goes
+    /// only after its final `dsb ish`. An early release is caught.
+    #[test]
+    fn the_reference_goes_after_the_last_dsb_ish() {
+        for early in [false, true] {
+            let mut asids = AsidAllocator::new(8);
+            let mut m = Model::new();
+            let base = 0x40_0000;
+            m.tables
+                .insert(0x5000, (1, (0..6).map(|i| base + (i << 12)).collect()));
+            let mut tag = AsidTag::default();
+            switch_to(&mut asids, &mut tag, 0x5000, EMPTY, &mut m);
+            let mut maps = crate::maps::Maps::new();
+            maps.insert(crate::maps::Mapping::new(
+                base,
+                6,
+                0,
+                1u32,
+                abi::Rights::MAP_READ,
+            ))
+            .unwrap();
+            let mut refs = 1;
+            let calls = [(2, 2), (0, 2), (4, 2)];
+            let mut outcome = Ok(());
+            for (page, pages) in calls {
+                let args = (0x5000, base + (page << 12), pages);
+                outcome = outcome.and_then(|()| {
+                    unmap_call(&mut m, &asids, &tag, &mut maps, &mut refs, args, early)
+                });
+            }
+            if early {
+                assert!(
+                    outcome.is_err(),
+                    "a reference that went early was not caught"
+                );
+            } else {
+                assert_eq!(outcome, Ok(()));
+                assert_eq!((refs, maps.len()), (0, 0));
+            }
+        }
+    }
 }

@@ -672,8 +672,10 @@ pub fn mem_map(
     call::<{ Call::MemMap.number() }>(&args).map(drop)
 }
 
-/// mem_unmap: the mapping of `process` that is exactly `len` bytes from
-/// `addr` goes (spec 7.4).
+/// mem_unmap: the `len` bytes from `addr`, whole pages inside one mapping
+/// of `process`, go (spec 7.4); the pages on either side stay mapped, as
+/// entries of their own. LIMIT_REACHED when the table lacks the places for
+/// them.
 ///
 /// # Safety
 /// Nothing the caller uses lies in the mapping, when it is the caller's
@@ -682,9 +684,11 @@ pub unsafe fn mem_unmap(process: &Handle<Process>, addr: usize, len: u64) -> Res
     call::<{ Call::MemUnmap.number() }>(&[process.raw().0, addr as u64, len]).map(drop)
 }
 
-/// mem_protect: the pages of the mapping of `process` that is exactly
-/// `len` bytes from `addr` get `access`, within the rights the object was
-/// mapped with (spec 7.4). A program that wrote code through another
+/// mem_protect: the `len` bytes from `addr`, whole pages inside one
+/// mapping of `process`, get `access` (Access::None leaves EL0 no access
+/// and keeps the pages), within the rights the object was mapped with
+/// (spec 7.4). The pages on either side stay as they were, as entries of
+/// their own; LIMIT_REACHED when the table lacks the places for them. A program that wrote code through another
 /// mapping, one with write access, calls it with RX on the mapping the
 /// code runs from, so that the instruction cache sees the code there
 /// (spec 7.4); its own `ic ivau` at the address of the write is not

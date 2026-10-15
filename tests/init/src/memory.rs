@@ -42,12 +42,12 @@ pub(crate) const TESTS: [Test; 22] = [
         two_mappings_show_the_same_pages,
     ),
     (
-        "mem_unmap_takes_whole_mappings",
-        mem_unmap_takes_whole_mappings,
+        "mem_unmap_takes_a_range_inside_one_mapping",
+        mem_unmap_takes_a_range_inside_one_mapping,
     ),
     (
-        "mem_protect_takes_whole_mappings_within_their_rights",
-        mem_protect_takes_whole_mappings_within_their_rights,
+        "mem_protect_takes_a_range_inside_one_mapping",
+        mem_protect_takes_a_range_inside_one_mapping,
     ),
     ("mapping_limit_is_128", mapping_limit_is_128),
     (
@@ -519,15 +519,17 @@ fn two_mappings_show_the_same_pages() -> Outcome {
     )
 }
 
-/// mem_unmap(x0 process with MANAGE, x1 address, x2 length) takes exactly
-/// one whole mapping (spec 7.4) and changes x0 alone on an error: an
+/// mem_unmap(x0 process with MANAGE, x1 address, x2 length) takes a range
+/// of whole pages inside one mapping (spec 7.4) and changes x0 alone on an
+/// error: an
 /// address or a length off whole pages, a length of 0 and a range past the
 /// lower half fail with INVALID_ARGS, through a closed handle too; then x0
 /// (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without MANAGE); a process that
-/// ended fails with BAD_STATE; a part of a mapping, more than it, and a
-/// range that starts inside it fail with INVALID_ARGS and unmap nothing.
-/// The whole mapping goes with 0 in x0 alone, and a second time fails.
-fn mem_unmap_takes_whole_mappings() -> Outcome {
+/// ended fails with BAD_STATE; a range past the end of the mapping fails
+/// with INVALID_ARGS and unmaps nothing. The 2 pages in the middle of a
+/// mapping of 4 go with 0 in x0 alone, and a second time they fail; the
+/// pages on either side go one at a time, and a mapping goes at last.
+fn mem_unmap_takes_a_range_inside_one_mapping() -> Outcome {
     let m = memory_object(4)?;
     let no_manage = copy(&own(), Rights::NONE)?;
     let ended = ended_child()?;
@@ -553,9 +555,9 @@ fn unmap_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
         ([mem, at, 4 * page], Error::WrongType),
         ([no_manage, at, 4 * page], Error::AccessDenied),
         ([ended, at, 4 * page], Error::BadState),
-        ([own, at, page], Error::InvalidArgs),
         ([own, at, 8 * page], Error::InvalidArgs),
-        ([own, at + page, 3 * page], Error::InvalidArgs),
+        ([own, at + 2 * page, 3 * page], Error::InvalidArgs),
+        ([own, at - page, 2 * page], Error::InvalidArgs),
     ]
     .into_iter()
     .all(|(args, error)| x0_alone::<N>(&args, error.code()));
@@ -567,26 +569,43 @@ fn unmap_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
     )?;
     check(kept, "a refused mem_unmap took the mapping")?;
     check(
-        x0_alone::<N>(&[own, at, 4 * page], 0),
-        "the whole mapping did not go with 0 alone",
+        x0_alone::<N>(&[own, at + page, 2 * page], 0),
+        "the middle of the mapping did not go with 0 alone",
+    )?;
+    // SAFETY: the first and the last page are init's, which the cut left.
+    let edges = unsafe {
+        ((WINDOW) as *const u64).read_volatile() == 0
+            && ((WINDOW + 3 * PAGE) as *const u64).read_volatile() == 0
+    };
+    check(edges, "an edge of the cut mapping does not read")?;
+    check(
+        x0_alone::<N>(&[own, at + page, page], Error::InvalidArgs.code())
+            && x0_alone::<N>(&[own, at, 4 * page], Error::InvalidArgs.code()),
+        "the hole of a cut mapping was a mapping",
     )?;
     check(
-        x0_alone::<N>(&[own, at, 4 * page], Error::InvalidArgs.code()),
-        "a mapping went twice",
+        x0_alone::<N>(&[own, at, page], 0) && x0_alone::<N>(&[own, at + 3 * page, page], 0),
+        "an edge did not go with 0 alone",
+    )?;
+    check(
+        x0_alone::<N>(&[own, at, page], Error::InvalidArgs.code()),
+        "a page went twice",
     )
 }
 
 /// mem_protect(x0 process with MANAGE, x1 address, x2 length, x3 access)
-/// takes exactly one whole mapping within the rights it was mapped with
-/// (spec 5.2, 7.4), and changes x0 alone on an error: the range as
-/// mem_unmap checks it and an access other than R, RW or RX fail with
-/// INVALID_ARGS, through a closed handle too; then x0 (BAD_HANDLE,
-/// WRONG_TYPE, ACCESS_DENIED without MANAGE); a process that ended fails
-/// with BAD_STATE; a part of a mapping fails with INVALID_ARGS; RX of a
-/// mapping made through a copy without MAP_EXEC fails with ACCESS_DENIED.
-/// R and then RW again change the access with 0 alone, and the pages keep
-/// their contents.
-fn mem_protect_takes_whole_mappings_within_their_rights() -> Outcome {
+/// takes a range of whole pages inside one mapping, within the rights it
+/// was mapped with (spec 5.2, 7.4), and changes x0 alone on an error: the
+/// range as mem_unmap checks it and an access other than None, R, RW or RX
+/// fail with INVALID_ARGS, through a closed handle too; then x0
+/// (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without MANAGE); a process that
+/// ended fails with BAD_STATE; a range past the mapping fails with
+/// INVALID_ARGS; RX of a mapping made through a copy without MAP_EXEC fails
+/// with ACCESS_DENIED. R and then RW again change the access with 0 alone,
+/// and the pages keep their contents. One page of the two goes to None and
+/// back with 0 alone and its contents kept; the cut leaves two mappings,
+/// so the range of both fails with INVALID_ARGS.
+fn mem_protect_takes_a_range_inside_one_mapping() -> Outcome {
     let m = memory_object(2)?;
     let read_write = copy(&m, Rights::MAP_READ | Rights::MAP_WRITE)?;
     let no_manage = copy(&own(), Rights::NONE)?;
@@ -596,7 +615,7 @@ fn mem_protect_takes_whole_mappings_within_their_rights() -> Outcome {
     // SAFETY: the page is init's mapping, read and write.
     unsafe { ((WINDOW + 8) as *mut u64).write_volatile(0x7E57) };
     let result = protect_cases(m.raw().0, no_manage.raw().0, ended.raw().0, gone);
-    let unmapped = unmap(WINDOW, 2 * PAGE as u64);
+    let unmapped = unmap(WINDOW, PAGE as u64).and(unmap(WINDOW + PAGE, PAGE as u64));
     close(read_write)?;
     close(no_manage)?;
     close(ended)?;
@@ -615,14 +634,15 @@ fn protect_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
     let cases = [
         ([own, at + 8, 2 * page, r], Error::InvalidArgs),
         ([own, at, 0, r], Error::InvalidArgs),
+        ([own, at, 2 * page, 2], Error::InvalidArgs),
         ([own, at, 2 * page, 6], Error::InvalidArgs),
         ([gone, at, 2 * page, 7], Error::InvalidArgs),
         ([gone, at, 2 * page, r], Error::BadHandle),
         ([mem, at, 2 * page, r], Error::WrongType),
         ([no_manage, at, 2 * page, r], Error::AccessDenied),
         ([ended, at, 2 * page, r], Error::BadState),
-        ([own, at, page, r], Error::InvalidArgs),
-        ([own, at + page, page, r], Error::InvalidArgs),
+        ([own, at + page, 2 * page, r], Error::InvalidArgs),
+        ([own, at - page, 2 * page, r], Error::InvalidArgs),
         ([own, at, 2 * page, rx], Error::AccessDenied),
     ]
     .into_iter()
@@ -649,7 +669,28 @@ fn protect_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
     check(
         read == 0x7E57 && written == 0x7E58,
         "the pages lost their contents or their access",
-    )
+    )?;
+    let none = Access::None.raw();
+    check(
+        x0_alone::<N>(&[own, at + page, page, none], 0),
+        "None for one page failed or changed registers past x0",
+    )?;
+    check(
+        x0_alone::<N>(&[own, at, 2 * page, rw], Error::InvalidArgs.code()),
+        "a range of two mappings was taken",
+    )?;
+    check(
+        x0_alone::<N>(&[own, at + page, page, rw], 0),
+        "RW for the page without access failed",
+    )?;
+    // SAFETY: the first page was never touched, and the second has its
+    // access back.
+    let kept = unsafe {
+        ((WINDOW + page as usize + 8) as *mut u64).write_volatile(0x7E59);
+        ((WINDOW + 8) as *const u64).read_volatile() == 0x7E57
+            && ((WINDOW + page as usize + 8) as *const u64).read_volatile() == 0x7E59
+    };
+    check(kept, "the pages lost their contents across None")
 }
 
 /// A process has abi::MAX_MAPPINGS mappings at most (spec 7.4): the next fails with
