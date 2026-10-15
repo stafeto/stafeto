@@ -38,10 +38,14 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # exit, the default PATH of execvp, mntent, wait3, sysinfo; tagged pin-1187dd96.
 # F10 review: fflush(NULL) holds the list of open streams for its walk and
 # fclose takes the list after it lets its stream go; tagged pin-95d97c68.
+# F11b: message queues and named semaphores, the XSI queues, semaphore sets and
+# segments over the pipe service, nl_types, DES crypt, setkey and encrypt,
+# getdate, if_indextoname, dlopen(NULL) with honest errors, _POSIX_MESSAGE_PASSING
+# and _POSIX_SEMAPHORES; tagged pin-5c368940.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "a79ef728b2af7d94794006398f931c108878f6a9"
+COMMIT = "5c36894085e1c1032e751758a178a49490a767f0"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
