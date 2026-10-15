@@ -3306,11 +3306,11 @@ static void files_nobody(void) {
 
 /* The layer's memory map and mmap (5d). */
 static void memory(void) {
-    /* A shared anonymous mapping must stay shared with a forked child, and
-     * the layer has no shared memory: mmap says it does not support it
-     * (POSIX mmap, ENOTSUP). No kind at all is EINVAL. */
+    /* A shared anonymous mapping is memory (the probe posix-map checks that
+     * a forked child shares it). No kind at all is EINVAL. */
     void *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    expect("mmap MAP_SHARED", shared == MAP_FAILED ? errno : 0, ENOTSUP);
+    expect("mmap MAP_SHARED", shared == MAP_FAILED ? errno : 0, 0);
+    if (shared != MAP_FAILED) munmap(shared, 4096);
     void *none = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS, -1, 0);
     expect("mmap with no kind", none == MAP_FAILED ? errno : 0, EINVAL);
     void *own = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
