@@ -220,8 +220,8 @@ static int end_badly(const char *how) {
 #ifndef _POSIX_SUBPROFILE
 #error "unistd.h does not define _POSIX_SUBPROFILE"
 #endif
-#ifdef _POSIX_TIMERS
-#error "unistd.h defines _POSIX_TIMERS while timer_create answers ENOSYS"
+#ifndef _POSIX_TIMERS
+#error "unistd.h does not define _POSIX_TIMERS while the process service keeps timers"
 #endif
 #if defined(_XOPEN_UNIX) || defined(_XOPEN_VERSION) || defined(_XOPEN_SHM)
 #error "unistd.h claims the XSI option"

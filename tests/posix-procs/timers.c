@@ -32,9 +32,6 @@
 
 #define T_MS 1000000LL
 
-static volatile int t_got;
-static siginfo_t t_info;
-
 static long long t_now(clockid_t clock) {
     struct timespec t;
     clock_gettime(clock, &t);
@@ -43,27 +40,6 @@ static long long t_now(clockid_t clock) {
 static struct timespec t_spec(long long ns) {
     struct timespec t = {.tv_sec = ns / 1000000000LL, .tv_nsec = ns % 1000000000LL};
     return t;
-}
-static void t_nap(long ms) {
-    struct timespec d = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
-    while (nanosleep(&d, &d) < 0 && errno == EINTR) {}
-}
-static void t_handler(int sig, siginfo_t *info, void *ctx) {
-    (void)sig; (void)ctx;
-    t_info = *info;
-    t_got++;
-}
-static void t_plain(int sig) {
-    (void)sig;
-    t_got++;
-}
-static int t_catch(int sig) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = t_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    return sigaction(sig, &sa, NULL);
 }
 static int t_block(int sig) {
     sigset_t s;
@@ -92,6 +68,93 @@ static struct itimerspec t_its(long long value, long long interval) {
     return its;
 }
 
+/* The steps mode: a process that sets a timer for the instant in its second
+ * argument (CLOCK_MONOTONIC, nanoseconds) and waits for the signal. */
+static int steptimer_role(void) {
+    long long at = strtoll(argv_seen[2], NULL, 10);
+    t_block(SIGUSR1);
+    struct sigevent e = t_event(SIGUSR1, 1);
+    timer_t t;
+    if (timer_create(CLOCK_MONOTONIC, &e, &t)) return 1;
+    struct itimerspec its = t_its(at, 0);
+    if (timer_settime(t, TIMER_ABSTIME, &its, NULL)) return 2;
+    siginfo_t info;
+    if (t_take(SIGUSR1, &info, 120000) != SIGUSR1) return 3;
+    return info.si_code == SI_TIMER ? 0 : 4;
+}
+
+/* The timer steps of the process service among the crowd (xtask
+ * process-steps): three processes and the probe wait for one instant, so
+ * that one notice of the kernel's timer sends four signals to four
+ * processes; the probe holds a full share of timers and the alarm and
+ * queues a signal. */
+static int steps_timers(void) {
+    pid_t kids[3];
+    char at[32];
+    long long due = t_now(CLOCK_MONOTONIC) + 6000 * T_MS;
+    snprintf(at, sizeof at, "%lld", due);
+    for (int i = 0; i < 3; i++)
+        if (steps_spawn(&kids[i], "steptimer", at) != 0) return 1;
+    /* The probe goes on with the signals it had (the FIFO steps send SIGUSR1). */
+    sigset_t saved;
+    sigprocmask(SIG_SETMASK, NULL, &saved);
+    t_block(SIGUSR1);
+    t_block(SIGUSR2);
+    struct sigevent e = t_event(SIGUSR1, 1);
+    timer_t own[32];
+    struct itimerspec far = t_its(100000 * T_MS, 50000 * T_MS);
+    for (int i = 0; i < 32; i++) {
+        if (timer_create(CLOCK_MONOTONIC, &e, &own[i])) return 2;
+        if (timer_settime(own[i], 0, &far, NULL)) return 3;
+    }
+    struct itimerspec soon = t_its(due, 0);
+    if (timer_settime(own[0], TIMER_ABSTIME, &soon, NULL)) return 4;
+    alarm(1000);
+    union sigval v;
+    v.sival_int = 1;
+    if (sigqueue(getpid(), SIGUSR2, v)) return 5;
+    siginfo_t info;
+    if (t_take(SIGUSR2, &info, 1000) != SIGUSR2) return 6;
+    if (t_take(SIGUSR1, &info, 120000) != SIGUSR1 || info.si_code != SI_TIMER) return 7;
+    for (int i = 0; i < 3; i++) {
+        int status = -1;
+        if (waitpid(kids[i], &status, 0) != kids[i] || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 8;
+    }
+    struct itimerspec none = t_its(0, 0);
+    for (int i = 0; i < 32; i++) {
+        struct itimerspec got;
+        if (timer_gettime(own[i], &got) || timer_settime(own[i], 0, &none, NULL) || timer_delete(own[i])) return 9;
+    }
+    if (alarm(0) == 0) return 10;
+    sigprocmask(SIG_SETMASK, &saved, NULL);
+    return 0;
+}
+
+#if !CHANGE_STEPS
+static volatile int t_got;
+static siginfo_t t_info;
+
+static void t_nap(long ms) {
+    struct timespec d = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
+    while (nanosleep(&d, &d) < 0 && errno == EINTR) {}
+}
+static void t_handler(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)ctx;
+    t_info = *info;
+    t_got++;
+}
+static void t_plain(int sig) {
+    (void)sig;
+    t_got++;
+}
+static int t_catch(int sig) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = t_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    return sigaction(sig, &sa, NULL);
+}
 static int t_c_sigqueue(void) {
     if (t_catch(SIGUSR1)) return 1;
     union sigval v;
@@ -630,4 +693,5 @@ static int timers_role(void) {
     if (!failures) printf("posix-procs: timers: sigqueue, timers, alarm, itimer, clock ok\n");
     return failures != 0;
 }
+#endif
 #pragma clang diagnostic pop

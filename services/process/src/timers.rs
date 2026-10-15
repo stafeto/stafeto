@@ -496,4 +496,13 @@ mod tests {
         assert_eq!(t.expire(second, 100 * MS).value, 1);
         assert_eq!(t.next(100 * MS), None);
     }
+
+    #[test]
+    fn a_timer_can_carry_its_own_id_as_the_value() {
+        let mut t = Timers::new();
+        let id = t.create(1, 14, 0xdead, true).unwrap();
+        t.set(1, id, Some(5), 0, 0).unwrap();
+        let slot = t.next(5).unwrap();
+        assert_eq!(t.expire(slot, 5).value, u64::from(id));
+    }
 }

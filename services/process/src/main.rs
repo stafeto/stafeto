@@ -1071,10 +1071,10 @@ impl Processes {
     /// became of it: Ignored for one that went without a page or a job
     /// generation.
     fn signal(&mut self, target: usize, signal: u8, info: Info) -> Posted {
-        if proto_process::job::class(signal).is_some() || signal == SIGSTOP {
-            if self.generate_job(target, signal).is_none() || signal == SIGSTOP {
-                return Posted::Ignored;
-            }
+        if (proto_process::job::class(signal).is_some() || signal == SIGSTOP)
+            && (self.generate_job(target, signal).is_none() || signal == SIGSTOP)
+        {
+            return Posted::Ignored;
         }
         let Some(page) = self.pages.page(target) else {
             return Posted::Ignored;
@@ -1265,6 +1265,8 @@ impl Processes {
     /// timers send their signals, and the timer is armed again for the
     /// nearest of the rest. A step takes constant time however many are due.
     fn timer_step(&mut self) {
+        // Counted apart from the other notices in the steps mode.
+        rt::service::step_own();
         self.timer_armed = u64::MAX;
         let now = Self::timer_now();
         for _ in 0..timers::EXPIRIES_PER_STEP {
