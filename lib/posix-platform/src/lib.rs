@@ -956,6 +956,14 @@ pub extern "C" fn stafeto_probe_hold(which: c_int, us: u64) -> c_int {
     posix_abi::fork::probe_hold(which as u32, us.saturating_mul(1000))
 }
 
+/// Waits with entries deferred for another thread to stop the process and
+/// parks, with the stopper's request pending, as `deliver_now` does
+/// (posix_abi::signals::probe_park_now).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_park_now() {
+    posix_abi::signals::probe_park_now();
+}
+
 /// The next anonymous mapping of the layer sleeps `us` microseconds first
 /// (posix_abi::allocation::probe_sleep_next), for the probe of relibc's
 /// allocator across a fork.

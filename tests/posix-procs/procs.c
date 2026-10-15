@@ -233,6 +233,7 @@ int stafeto_probe_fork_abort(int *pid);
 unsigned long long stafeto_probe_map_mappings(void);
 void stafeto_probe_fork_window(void (*window)(void));
 int stafeto_probe_hold(int which, unsigned long long us);
+void stafeto_probe_park_now(void);
 int stafeto_probe_threads(void);
 void stafeto_probe_fork_early(void (*window)(void));
 void stafeto_probe_mmap_sleep(unsigned long long us);
@@ -2184,6 +2185,74 @@ static int fork_waits(void) {
     return failures;
 }
 
+/* Role forkparkwait: a thread waits in waitpid for a child that ends while
+ * the thread is parked for the stop of a fork. The window of the fork keeps
+ * the stop on for 450 ms, so the child's end (300 ms) comes meanwhile; the
+ * service tells the thread once, and the park receives from the same
+ * channel. The wait still returns the child's status. */
+static volatile int park_done;
+static volatile int park_status;
+static void *park_waiter(void *arg) {
+    pid_t nap = (pid_t)(long)arg;
+    int status = -1;
+    pid_t got = waitpid(nap, &status, 0);
+    park_status = got == nap && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    __atomic_store_n(&park_done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+static void park_window(void) { pause_ms(450); }
+
+static int fork_park_wait(void) {
+    pid_t nap = start("nap");
+    pthread_t waiter;
+    pthread_create(&waiter, NULL, park_waiter, (void *)(long)nap);
+    pause_ms(20);
+    fflush(stdout);
+    stafeto_probe_fork_window(park_window);
+    pid_t pid = fork();
+    if (pid == 0) _exit(0);
+    stafeto_probe_fork_window(NULL);
+    reap("a fork while a thread waits for a child", pid, 0, 0);
+    for (int i = 0; i < 5000 && !__atomic_load_n(&park_done, __ATOMIC_ACQUIRE); i++) pause_ms(1);
+    int done = __atomic_load_n(&park_done, __ATOMIC_ACQUIRE);
+    expect("a wait for a child that ended in a park returned", done, 1);
+    if (done) {
+        expect("its status", park_status, 3);
+        pthread_join(waiter, NULL);
+        printf("posix-procs: a wait survives a park of a stop\n");
+    }
+    return failures;
+}
+
+/* Role forkparkdefer: threads park for the stop of a fork with entries
+ * deferred and a request of an entry pending, as the stopper's request is
+ * when it comes after the thread took a deferral (deliver_now). The park
+ * must still block, or the fork never gets its stop. */
+static volatile int defer_stop;
+static void *defer_worker(void *arg) {
+    (void)arg;
+    while (!__atomic_load_n(&defer_stop, __ATOMIC_ACQUIRE)) {
+        stafeto_probe_park_now();
+    }
+    return NULL;
+}
+
+static int fork_park_defer(void) {
+    pthread_t workers[3];
+    for (int i = 0; i < 3; i++) pthread_create(&workers[i], NULL, defer_worker, NULL);
+    pause_ms(20);
+    for (int i = 0; i < 10; i++) {
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) _exit(0);
+        reap("a fork while threads call the layer", pid, 0, 0);
+    }
+    __atomic_store_n(&defer_stop, 1, __ATOMIC_RELEASE);
+    for (int i = 0; i < 3; i++) pthread_join(workers[i], NULL);
+    if (!failures) printf("posix-procs: a park with a request pending blocks\n");
+    return failures;
+}
+
 /* Role forkmalloc: confirm that the mapping actually entered the existing
  * allocator sleep hook. Keep the worker after malloc returns and before its
  * C publication, so fork does not assume that publication follows lock release. */
@@ -2496,6 +2565,8 @@ static int role(const char *name) {
     if (strcmp(name, "forkthreads") == 0) return fork_threads();
     if (strcmp(name, "forkthread") == 0) return fork_thread();
     if (strcmp(name, "forkwaits") == 0) return fork_waits();
+    if (strcmp(name, "forkparkwait") == 0) return fork_park_wait();
+    if (strcmp(name, "forkparkdefer") == 0) return fork_park_defer();
     if (strcmp(name, "forkspin") == 0) return fork_spin();
     if (strcmp(name, "forkmalloc") == 0) return fork_malloc();
     if (strcmp(name, "forkmany") == 0) return fork_many();
@@ -3210,6 +3281,8 @@ static void forks(void) {
     run_role("/bin/procs-child", "forkthreads", NULL);
     run_role("/bin/procs-child", "forkthread", NULL);
     run_role("/bin/procs-child", "forkwaits", NULL);
+    run_role("/bin/procs-child", "forkparkwait", NULL);
+    run_role("/bin/procs-child", "forkparkdefer", NULL);
     run_role("/bin/procs-child", "forkspin", NULL);
     run_role("/bin/procs-child", "forkmalloc", NULL);
     run_role("/bin/procs-child", "forkmany", NULL);
