@@ -130,6 +130,18 @@ impl Values {
         }
     }
 
+    /// Five words of which the first `len` count: the copy is the same five
+    /// words whatever `len` is, so it needs no loop (`len` is at most 5).
+    #[inline(always)]
+    pub fn of_five(words: [u64; 5], len: usize) -> Values {
+        assert!(len <= 5);
+        let mut x = [MaybeUninit::uninit(); abi::RESULT_VALUES];
+        for (to, word) in x.iter_mut().zip(words) {
+            to.write(word);
+        }
+        Values { x, len }
+    }
+
     /// At most abi::RESULT_VALUES values, for x1 and up. Every call site
     /// passes an array of known length, so a longer slice is a bug there;
     /// it stops the kernel and never drops values silently while `len` still claims the full count.

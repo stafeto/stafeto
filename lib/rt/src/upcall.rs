@@ -346,7 +346,6 @@ unsafe extern "C" fn entry() {
         "stp x20, x21, [sp, #160]", "stp x22, x23, [sp, #176]",
         "stp x24, x25, [sp, #192]", "stp x26, x27, [sp, #208]",
         "stp x28, x29, [sp, #224]", "str x30, [sp, #240]",
-        "add x9, sp, #1904", "str x9, [sp, #248]",
         "mrs x9, tpidr_el0", "str x9, [sp, #272]",
         "mrs x9, tpidrro_el0", "str x9, [sp, #280]",
         "stp q0, q1, [sp, #288]", "stp q2, q3, [sp, #320]",
@@ -363,8 +362,9 @@ unsafe extern "C" fn entry() {
         "2:", "ldp x12, x13, [x9], #16", "stp x12, x13, [x10], #16",
         "subs x11, x11, #16", "b.ne 2b",
         "mov x0, #{take}", "svc #{control}", "cbnz x0, 9f",
-        // The interrupted PC and PSTATE (flags included) come from Take.
-        "str x2, [sp, #256]", "str x3, [sp, #264]",
+        // The interrupted PC, PSTATE (flags included) and SP come from Take:
+        // the kernel may have moved SP to the alternate stack.
+        "str x2, [sp, #256]", "str x3, [sp, #264]", "str x4, [sp, #248]",
         // x20: the entry record; x21: a handler; x22: the frame this entry
         // recorded in `outer`, or 0. Callee-saved, so the handlers keep them.
         "mrs x20, tpidrro_el0", "add x20, x20, #{entries}",
