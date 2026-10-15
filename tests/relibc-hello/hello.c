@@ -151,6 +151,42 @@ static int files(void) {
     return 0;
 }
 
+/* Streams over memory: an fmemopen stream ends with its buffer (a write
+ * past it is short with ENOSPC, a seek past it EINVAL), and the file behind
+ * a memory stream does not outlive an exec. */
+static int memory_streams(void) {
+    char buffer[8];
+    memset(buffer, 'x', sizeof buffer);
+    FILE *fixed = fmemopen(buffer, sizeof buffer, "w");
+    CHECK(fixed != NULL);
+    errno = 0;
+    CHECK(fwrite("0123456789ab", 1, 12, fixed) == 8 && ferror(fixed) && errno == ENOSPC);
+    CHECK(fflush(fixed) == 0);
+    CHECK(memcmp(buffer, "01234567", 8) == 0);
+    CHECK(fclose(fixed) == 0);
+
+    char update[8] = "abc";
+    FILE *seekable = fmemopen(update, sizeof update, "r+");
+    CHECK(seekable != NULL);
+    errno = 0;
+    CHECK(fseek(seekable, 9, SEEK_SET) == -1 && errno == EINVAL);
+    CHECK(fseek(seekable, 8, SEEK_SET) == 0 && ftell(seekable) == 8);
+    CHECK(fseek(seekable, 2, SEEK_SET) == 0 && fgetc(seekable) == 'c');
+    CHECK(fclose(seekable) == 0);
+
+    char *text = NULL;
+    size_t length = 0;
+    FILE *growing = open_memstream(&text, &length);
+    CHECK(growing != NULL && fprintf(growing, "grown %d", 7) > 0 && fflush(growing) == 0);
+    CHECK(length == 7 && strcmp(text, "grown 7") == 0);
+    int behind = fileno(growing);
+    CHECK(behind >= 0 && (fcntl(behind, F_GETFD) & FD_CLOEXEC) != 0);
+    CHECK(fclose(growing) == 0);
+    free(text);
+    printf("relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec\n");
+    return 0;
+}
+
 /* The ways a C program ends badly: each ends the process with status
  * 134, as SIGABRT would, after a word on fd 2 where there is one. */
 static int end_badly(const char *how) {
@@ -492,6 +528,8 @@ int main(int argc, char **argv) {
     if (clock_gettime(CLOCK_MONOTONIC, &now)) return 8;
     printf("relibc-hello: monotonic %lld.%09ld\n", (long long)now.tv_sec, now.tv_nsec);
     int status = files();
+    if (status) return status;
+    status = memory_streams();
     if (status) return status;
     status = constants();
     if (status) return status;
