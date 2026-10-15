@@ -46,6 +46,7 @@ impl Attempt {
             level: 1,
             mask: 0,
             default: 0,
+            name: [0; proto_process::NAME_LEN],
         }
         .write(&mut w)?;
         let mut reply = sys::send(process(), w.as_bytes()).map_err(Status::Kernel)?;

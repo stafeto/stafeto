@@ -5154,6 +5154,81 @@ fn expect_ash_names(lines: &[String]) -> Result<(), String> {
     }
 }
 
+/// The 24 of those 112 that neither BusyBox nor the shell has. Nothing of
+/// our own stands in for them (the report names ready implementations).
+const XCU_MISSING: [&str; 24] = [
+    "at", "batch", "compress", "csplit", "file", "gencat", "getconf", "gettext", "iconv", "join",
+    "locale", "localedef", "lp", "m4", "mailx", "msgfmt", "newgrp", "ngettext", "pathchk", "pax",
+    "pr", "tabs", "tput", "write",
+];
+
+/// The 112 utilities POSIX.1-2024 XCU requires (the pages whose SYNOPSIS
+/// carries no option code, and `df ls ps xargs pr tabs sh`, whose option
+/// codes mark a part of the forms): each answers `command -v` in the shell.
+const XCU_UTILITIES: [&str; 112] = [
+    "alias", "at", "awk", "basename", "batch", "bc", "cat", "cd", "chgrp", "chmod", "chown",
+    "cksum", "cmp", "comm", "command", "compress", "cp", "crontab", "csplit", "cut", "date",
+    "dd", "df", "diff", "dirname", "du", "echo", "ed", "env", "expand", "expr", "false",
+    "file", "find", "fold", "gencat", "getconf", "getopts", "gettext", "grep", "hash", "head",
+    "iconv", "id", "join", "kill", "ln", "locale", "localedef", "logger", "logname", "lp",
+    "ls", "m4", "mailx", "mesg", "mkdir", "mkfifo", "msgfmt", "mv", "newgrp", "ngettext",
+    "nice", "nohup", "od", "paste", "patch", "pathchk", "pax", "pr", "printf", "ps", "pwd",
+    "read", "readlink", "realpath", "renice", "rm", "rmdir", "sed", "sh", "sleep", "sort",
+    "split", "strings", "stty", "tabs", "tail", "tee", "test", "time", "timeout", "touch",
+    "tput", "tr", "true", "tsort", "tty", "ulimit", "umask", "unalias", "uname", "uncompress",
+    "unexpand", "uniq", "uudecode", "uuencode", "wait", "wc", "write", "xargs", "zcat",
+];
+
+/// The commands of the utilities' dialog (Ф10) and the lines each must print
+/// (a whole line; "=" before a text: the line trimmed is it; "~": the line
+/// contains it). A command is shorter than the 255 characters of a line of
+/// the terminal.
+const UTILITY_DIALOG: &[(&str, &[&str])] = &[
+    (r#"printf 'b\na\nb\n' | sort | uniq -c | sed 's/^ *//'"#, &[r#"1 a"#, r#"2 b"#]),
+    (r#"echo a:b:c | cut -d: -f2; echo abc | tr a-c A-C"#, &[r#"b"#, r#"ABC"#]),
+    (r#"awk 'BEGIN{print 6*7}'; echo 'x 5' | awk '{print $2+1}'"#, &[r#"42"#, r#"6"#]),
+    (r#"expr 2 + 3; basename /a/b.c .c; dirname /a/b/c"#, &[r#"5"#, r#"b"#, r#"/a/b"#]),
+    (r#"echo hi | tee /tmp/t1 >/dev/null; cp /tmp/t1 /tmp/t2; cmp /tmp/t1 /tmp/t2; echo cmp:$?"#, &[r#"cmp:0"#]),
+    (r#"echo other > /tmp/t3; diff /tmp/t1 /tmp/t3 >/dev/null; echo diff:$?"#, &[r#"diff:1"#]),
+    (r#"echo a b c | xargs -n1 echo | wc -l; find /etc -name motd"#, &[r#"=3"#, r#"/etc/motd"#]),
+    (r#"echo abcdef | fold -w 3; printf '1 2\n2 3\n' | tsort"#, &[r#"abc"#, r#"def"#, r#"1"#, r#"2"#, r#"3"#]),
+    (r#"echo hello | cksum"#, &[r#"3015617425 6"#]),
+    (r#"dd if=/dev/urandom bs=1 count=5 2>/dev/null | wc -c; printf 'ab' | od -An -tx1"#, &[r#"=5"#, r#"=61 62"#]),
+    (r#"uname -s; id -u; id -un"#, &[r#"stafeto"#, r#"0"#, r#"root"#]),
+    (r#"env A=1 env | grep -c '^A=1'"#, &[r#"=1"#]),
+    (r#"echo 3+4 | bc; printf 'a\nb\n' > /tmp/ed1; printf '1d\nw\nq\n' | ed -s /tmp/ed1; cat /tmp/ed1"#, &[r#"7"#, r#"b"#]),
+    (r#"echo hello | uuencode x | uudecode -o /tmp/uu; cat /tmp/uu"#, &[r#"hello"#]),
+    (r#"printf 'abc\000defgh\000' | strings; printf 'a 1\nb 2\nc 3\n' > /tmp/j1"#, &[r#"defgh"#]),
+    (r#"split -l 1 /tmp/j1 /tmp/sp_; ls /tmp | grep -c '^sp_'"#, &[r#"=3"#]),
+    (r#"realpath /tmp/../etc; printf '1\n2\n3\n' | tail -n 1; printf '1\n2\n3\n' | head -n 1"#, &[r#"/etc"#, r#"3"#, r#"1"#]),
+    (r#"printf 'a\nb\n' > /tmp/c1; printf 'b\nc\n' > /tmp/c2; comm -12 /tmp/c1 /tmp/c2; paste -d, /tmp/c1 /tmp/c2"#, &[r#"b"#, r#"a,b"#, r#"b,c"#]),
+    (r#"printf 'a\tb\n' | expand | wc -c; printf 'a       b\n' | unexpand -a | wc -c"#, &[r#"=10"#, r#"=4"#]),
+    (r#"chown user /tmp/t1; chgrp user /tmp/t1; ls -l /tmp/t1 | awk '{print $3,$4}'"#, &[r#"user user"#]),
+    (r#"mkfifo /tmp/ff; test -p /tmp/ff && echo fifo-ok; nohup echo nohup-ok > /tmp/nh 2>/dev/null; cat /tmp/nh"#, &[r#"fifo-ok"#, r#"nohup-ok"#]),
+    (r#"time true 2>&1 | grep -c real; kill -0 $$; echo kill:$?"#, &[r#"=1"#, r#"kill:0"#]),
+    (r#"tty; stty -a >/dev/null; echo stty:$?"#, &[r#"/dev/console"#, r#"stty:0"#]),
+    (r#"logname; login-probe login"#, &[r#"user"#, r#"~login-probe: getlogin user"#, r#"~login-probe: getlogin_r 0 user"#, r#"login-probe: getlogin and getlogin_r agree: ok"#, r#"login-probe: getlogin_r with a buffer of 2 bytes gives ERANGE: ok"#, r#"login-probe: 0 failures"#]),
+    (r#"logger -t tagx hello-journal; login-probe syslog"#, &[r#"~login-probe: setlogmask returned 255"#, r#"login-probe: syslog written"#]),
+    (r#"grep -c tagx /var/log/messages; grep -c hidden /var/log/messages; grep -c shown /var/log/messages"#, &[r#"=1"#, r#"=0"#, r#"=2"#]),
+    (r#"grep -c 'probe\[[0-9]*\]: shown 2' /var/log/messages; grep -c 'after-close 4' /var/log/messages"#, &[r#"=1"#, r#"=1"#]),
+];
+
+/// Types `command` and waits for the lines `lines` and the prompt.
+fn dialog_command(run: &mut qemu::Run, command: &str, lines: &[&str]) -> Result<(), String> {
+    run.send(command)?;
+    for expected in lines {
+        if let Some(text) = expected.strip_prefix('=') {
+            run.expect_line(expected, |line| line.trim() == text, DIALOG_STEP)?;
+        } else if let Some(text) = expected.strip_prefix('~') {
+            run.expect_line(expected, |line| line.contains(text), DIALOG_STEP)?;
+        } else {
+            run.expect_line(expected, |line| line == *expected, DIALOG_STEP)?;
+        }
+    }
+    run.expect("# ", DIALOG_STEP)?;
+    Ok(())
+}
+
 fn ash_dialog() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -5171,24 +5246,30 @@ fn ash_dialog() -> Result<(), String> {
         Ok(meta.len().to_string())
     };
     let busybox = elf_size("busybox-probe")?;
+    // One file of BusyBox under each of its names: ash, sh, busybox and
+    // the utilities (rootfs.rs), all links of one file.
+    let links = (3 + rootfs::UTILITIES.len()).to_string();
     let bin_listing = [
-        ("-rwxr-xr-x", "11", "ash", busybox.clone()),
-        ("-rwxr-xr-x", "11", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "11", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "11", "head", busybox.clone()),
-        ("-rwxr-xr-x", "11", "ls", busybox.clone()),
-        ("-rwxr-xr-x", "11", "mktemp", busybox.clone()),
-        ("-rwxr-xr-x", "11", "nc", busybox.clone()),
-        ("-rwxr-xr-x", "11", "sh", busybox.clone()),
-        ("-rwxr-xr-x", "11", "sleep", busybox.clone()),
-        ("-rwxr-xr-x", "11", "timeout", busybox.clone()),
-        ("-rwxr-xr-x", "11", "wc", busybox),
-        ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
+        ("-rwxr-xr-x", links.clone(), "ash", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "busybox", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "cat", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "head", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "ls", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "mktemp", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "nc", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "sh", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "sleep", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "timeout", busybox.clone()),
+        ("-rwxr-xr-x", links.clone(), "wc", busybox),
+        ("-rwsr-x---", "1".to_string(), "ramfs", elf_size("ramfs")?),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
-    let bin_count = bin_listing.len().to_string();
+    let bin_count = (bin_listing.len() + rootfs::UTILITIES.len() - 8).to_string();
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
+    if let Ok(log) = std::env::var("STAFETO_QEMU_LOG") {
+        cmd.args(["-d", "int,guest_errors", "-D", log.as_str()]);
+    }
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let talked = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
@@ -5315,7 +5396,7 @@ fn ash_dialog() -> Result<(), String> {
                 |line| {
                     let words: Vec<_> = line.split_whitespace().collect();
                     line.starts_with(mode)
-                        && words.get(1) == Some(links)
+                        && words.get(1).copied() == Some(links.as_str())
                         && words.contains(&size.as_str())
                         && words.last() == Some(&format!("/bin/{name}").as_str())
                 },
@@ -5443,6 +5524,78 @@ fn ash_dialog() -> Result<(), String> {
             |line| line.trim() == bin_count,
             DIALOG_STEP,
         )?;
+        run.expect("# ", DIALOG_STEP)?;
+        // The utilities of XCU (Ф10): each of the 112 answers `command -v`,
+        // 28 names a line.
+        for names in XCU_UTILITIES.chunks(28) {
+            let command = format!(
+                "n=0; for u in {}; do command -v $u >/dev/null && n=$((n+1)); done; echo found:$n",
+                names.join(" ")
+            );
+            run.send(&command)?;
+            let missing = names.iter().filter(|n| XCU_MISSING.contains(n)).count();
+            let expected = format!("found:{}", names.len() - missing);
+            run.expect_line(&expected, |line| line == expected, DIALOG_STEP)?;
+            run.expect("# ", DIALOG_STEP)?;
+        }
+        if let Ok(commands) = std::env::var("STAFETO_DIALOG_TRY") {
+            for command in commands.split('\n').filter(|c| !c.is_empty()) {
+                run.send(command)?;
+                run.expect("# ", Duration::from_secs(60))?;
+            }
+            return Err("STAFETO_DIALOG_TRY done".to_string());
+        }
+        // What the utilities do (Ф10).
+        for (command, lines) in UTILITY_DIALOG {
+            dialog_command(&mut run, command, lines)?;
+        }
+        // ps (Ф10): the process service lists a background sleep with its
+        // parent, the shell, and no longer once it is gone.
+        run.send("/bin/sleep 100 & echo pids:$$:$!")?;
+        let pids = run.expect_line("pids", |line| line.starts_with("pids:"), DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        let mut pids = pids.trim().split(':').skip(1);
+        let (shell, child) = (
+            pids.next().ok_or("no shell pid")?.to_string(),
+            pids.next().ok_or("no child pid")?.to_string(),
+        );
+        // The child execs the program a moment after the fork.
+        dialog_command(&mut run, "sleep 2", &[])?;
+        run.send("ps -o pid,ppid,comm")?;
+        run.expect_line(
+            "the header of ps",
+            |line| line.split_whitespace().collect::<Vec<_>>() == ["PID", "PPID", "COMMAND"],
+            DIALOG_STEP,
+        )?;
+        run.expect_line(
+            "sleep in ps",
+            |line| {
+                line.split_whitespace().collect::<Vec<_>>()
+                    == [child.as_str(), shell.as_str(), "sleep"]
+            },
+            DIALOG_STEP,
+        )?;
+        run.expect("# ", DIALOG_STEP)?;
+        dialog_command(&mut run, "ps -o comm | grep -c '^sleep$'", &["=1"])?;
+        dialog_command(&mut run, "ps | head -1", &["~PID"])?;
+        dialog_command(&mut run, "ps -o pid,stat | awk -v p=$! '$1==p {print $2}'", &["RW"])?;
+        dialog_command(
+            &mut run,
+            "kill $!; wait $!; ps -o pid | awk -v p=$! '$1==p' | wc -l",
+            &["=0"],
+        )?;
+        // Behind the names are the applets: of the 112 names, ten are
+        // builtins of the shell and `sh` is the shell's second name, and the
+        // other 101 are applets BusyBox lists, less the 24 it lacks.
+        run.send("busybox --list >/tmp/applets; : >/tmp/want")?;
+        run.expect("# ", DIALOG_STEP)?;
+        for names in XCU_UTILITIES.chunks(28) {
+            run.send(&format!("printf '%s\\n' {} >>/tmp/want", names.join(" ")))?;
+            run.expect("# ", DIALOG_STEP)?;
+        }
+        run.send("grep -cxF -f /tmp/want /tmp/applets")?;
+        let applets = (101 - XCU_MISSING.len()).to_string();
+        run.expect_line("applets", |line| line == applets, DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         // Time and sockets (Ф9): sleep and timeout, and nc over the
         // loopback of the socket service, a server in the background and a

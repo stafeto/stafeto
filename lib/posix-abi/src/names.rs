@@ -478,6 +478,9 @@ pub fn fstatat(
     }
     let nonempty = path.filter(|path| !path.is_empty());
     if let Some(path) = nonempty {
+        if crate::procfs::is_under(path) {
+            return crate::procfs::stat(path);
+        }
         let placed = place(dirfd, path)?;
         let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
         if let Some((kind, number)) = transport

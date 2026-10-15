@@ -23,6 +23,14 @@ fn main() {
         ("procps/lib.a", "busybox_procps"),
         ("networking/lib.a", "busybox_networking"),
         ("coreutils/libcoreutils/lib.a", "busybox_libcoreutils"),
+        ("archival/lib.a", "busybox_archival"),
+        ("archival/libarchive/lib.a", "busybox_libarchive"),
+        ("editors/lib.a", "busybox_editors"),
+        ("findutils/lib.a", "busybox_findutils"),
+        ("miscutils/lib.a", "busybox_miscutils"),
+        ("util-linux/lib.a", "busybox_util_linux"),
+        ("sysklogd/lib.a", "busybox_sysklogd"),
+        ("libpwdgrp/lib.a", "busybox_libpwdgrp"),
     ] {
         let path = root.join(archive);
         assert!(
@@ -33,6 +41,10 @@ fn main() {
         std::fs::copy(&path, out.join(format!("lib{name}.a"))).expect("copy BusyBox objects");
         println!("cargo:rustc-link-lib=static={name}");
     }
+    // BusyBox is a blob of C: its program keeps no debug sections, which
+    // would be most of an ELF file that has to fit the RAM file service
+    // (8 MiB at most) with every utility linked in.
+    println!("cargo:rustc-link-arg-bins=--strip-debug");
     println!("cargo:rustc-link-search=native={}", out.display());
     let sysroot = env::var_os("STAFETO_RELIBC_SYSROOT")
         .map(PathBuf::from)

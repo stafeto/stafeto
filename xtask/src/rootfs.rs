@@ -191,6 +191,49 @@ fn devices() -> [RootFile; 4] {
     ]
 }
 
+/// The names of /bin that hold BusyBox (Ф10): the utilities of XCU that are
+/// programs (the other ten of the 112 are builtins of the shell, `sh` is
+/// listed with the shell) and the applets the probes use (`mktemp`, `nc`).
+pub const UTILITIES: [&str; 80] = [
+    "awk", "basename", "bc", "cat", "chgrp", "chmod", "chown", "cksum", "cmp", "comm", "cp",
+    "crontab", "cut", "date", "dd", "df", "diff", "dirname", "du", "echo", "ed", "env",
+    "expand", "expr", "false", "find", "fold", "grep", "head", "id", "kill", "ln", "logger",
+    "login-probe", "logname", "ls", "mesg", "mkdir", "mkfifo", "mktemp", "mv", "nc", "nice",
+    "nohup", "od", "paste", "patch", "printf", "ps", "pwd", "readlink", "realpath", "renice",
+    "rm", "rmdir", "sed", "sleep", "sort", "split", "strings", "stty", "tail", "tee", "test",
+    "time", "timeout", "touch", "tr", "true", "tsort", "tty", "uname", "uncompress", "unexpand",
+    "uniq", "uudecode", "uuencode", "wc", "xargs", "zcat",
+];
+
+/// The user accounting file of the dialog's image: one record of relibc's
+/// struct utmpx (96 bytes: user 32, id 4, line 32, pid 4, type 2, padding
+/// to 8, the time as two 64-bit words): USER_PROCESS, "user" on the line
+/// "console", id "c1", process 1.
+static UTMPX: [u8; 96] = {
+    let mut record = [0u8; 96];
+    let user = b"user";
+    let id = b"c1";
+    let line = b"console";
+    let mut i = 0;
+    while i < user.len() {
+        record[i] = user[i];
+        i += 1;
+    }
+    i = 0;
+    while i < id.len() {
+        record[32 + i] = id[i];
+        i += 1;
+    }
+    i = 0;
+    while i < line.len() {
+        record[36 + i] = line[i];
+        i += 1;
+    }
+    record[68] = 1; // ut_pid
+    record[72] = 7; // ut_type: USER_PROCESS
+    record
+};
+
 /// The shell's image: BusyBox with its applet names (the shell, `ash`,
 /// among them) as hard links, and the service as a set-user-ID file of
 /// another owner.
@@ -201,17 +244,25 @@ fn dialog() -> Vec<RootFile> {
         // The shell of `system`, `popen` and `wordexp`.
         file("/bin/sh", 0o755, ROOT, "busybox-probe"),
         file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
-        file("/bin/ls", 0o755, ROOT, "busybox-probe"),
-        file("/bin/cat", 0o755, ROOT, "busybox-probe"),
-        file("/bin/wc", 0o755, ROOT, "busybox-probe"),
-        file("/bin/sleep", 0o755, ROOT, "busybox-probe"),
-        file("/bin/head", 0o755, ROOT, "busybox-probe"),
-        file("/bin/mktemp", 0o755, ROOT, "busybox-probe"),
-        file("/bin/nc", 0o755, ROOT, "busybox-probe"),
-        file("/bin/timeout", 0o755, ROOT, "busybox-probe"),
+    ];
+    files.extend(UTILITIES.iter().map(|name| {
+        let path: &'static str = Box::leak(format!("/bin/{name}").into_boxed_str());
+        file(path, 0o755, ROOT, "busybox-probe")
+    }));
+    files.extend([
         file("/bin/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
-    ];
+        dir("/proc"),
+        dir("/var"),
+        dir("/var/log"),
+        dir("/var/run"),
+        dir("/var/mail"),
+        dir("/var/spool"),
+        dir("/var/spool/at"),
+        dir("/var/spool/lp"),
+        of("/etc/mtab", 0o644, ROOT, Source::Bytes("mtab", b"ramfs / ramfs rw 0 0\n")),
+        of("/var/run/utmpx", 0o644, ROOT, Source::Bytes("utmpx", &UTMPX)),
+    ]);
     files.extend(devices());
     files
 }

@@ -114,6 +114,11 @@ pub struct Record<P> {
     pub pgid: u32,
     pub sid: u32,
     pub ctty: Option<(u32, u64)>,
+    /// The name `ps` shows: the last component of the path of its program
+    /// (SpawnStart, ExecCommit), its parent's until then.
+    pub name: [u8; proto_process::NAME_LEN],
+    /// The name of the exec that ExecStart began.
+    pub next_name: [u8; proto_process::NAME_LEN],
     /// The index of its parent's record while the parent lives.
     pub parent_index: Option<u16>,
     /// Whether it counts in `Numbers::links` of its group: its parent is
@@ -432,6 +437,10 @@ impl<P> Records<P> {
             pgid,
             sid,
             ctty: None,
+            name: parent.map_or([0; proto_process::NAME_LEN], |p| {
+                self.records[p].as_ref().unwrap().name
+            }),
+            next_name: [0; proto_process::NAME_LEN],
             parent_index: parent.map(|p| p as u16),
             linked,
             execed: false,

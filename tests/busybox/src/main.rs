@@ -25,7 +25,7 @@ static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
 unsafe extern "C" {
     /// BusyBox's main, renamed when tools/build-busybox.py compiles it.
-    fn busybox_main(argc: c_int, argv: *const *const c_char) -> c_int;
+    fn applets_main(argc: c_int, argv: *const *const c_char) -> c_int;
 }
 
 /// The first argument of the launcher: the program init starts for the
@@ -164,7 +164,7 @@ extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> 
     }
     // SAFETY: relibc's start gives argv with argc strings and a final null
     // pointer; BusyBox's dispatcher takes the applet from argv[0].
-    unsafe { busybox_main(argc as c_int, argv.cast()) }
+    unsafe { applets_main(argc as c_int, argv.cast()) }
 }
 
 /// The script of the ash probe: the builtins, then the applets on names run
@@ -229,7 +229,7 @@ extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int 
     ];
     // SAFETY: BusyBox and relibc are statically linked; argv has
     // NUL-terminated strings and a final null pointer.
-    let code = unsafe { busybox_main((argv.len() - 1) as c_int, argv.as_ptr()) };
+    let code = unsafe { applets_main((argv.len() - 1) as c_int, argv.as_ptr()) };
     if code == 0 {
         rt::println!("busybox-probe: ok");
     } else {

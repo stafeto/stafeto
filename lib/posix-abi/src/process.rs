@@ -324,6 +324,24 @@ pub fn getpgid(pid: i32) -> Result<i32, i32> {
     i32::try_from(pgid).map_err(|_| crate::constants::EIO)
 }
 
+/// One step of the list of processes (`ps`): from the record index
+/// `cursor`, the cursor to ask next (`None` once the table is over) and the
+/// first live process the service found in its window of records, if any.
+pub fn list(cursor: u32) -> Result<(Option<u32>, Option<proto_process::Listing>), i32> {
+    use crate::constants::EIO;
+    let w = request(proto_process::Method::List, &[cursor])?;
+    answer(&w, |bytes| {
+        let next = bytes.u32().map_err(|_| EIO)?;
+        let found = bytes.u32().map_err(|_| EIO)?;
+        let listing = if found == 0 {
+            None
+        } else {
+            Some(proto_process::Listing::read(bytes).map_err(|_| EIO)?)
+        };
+        Ok(((next != proto_process::LIST_END).then_some(next), listing))
+    })?
+}
+
 /// getsid of `pid`: the caller's own session from its page with no call.
 pub fn getsid(pid: i32) -> Result<i32, i32> {
     let pid = u32::try_from(pid).map_err(|_| crate::constants::EINVAL)?;
@@ -1432,6 +1450,7 @@ fn spawn_shadowed<'s>(
         level,
         mask,
         default: attributes.default,
+        name: proto_process::name_of(path),
     };
     let mut w = Writer::new();
     Method::SpawnStart.header().write(&mut w).map_err(|_| EIO)?;
@@ -1574,6 +1593,10 @@ fn exec_stopped<'s>(
         level,
         mask,
         default: 0,
+        name: match source {
+            ExecSource::Path(path) => proto_process::name_of(path),
+            ExecSource::Descriptor(_) => [0; proto_process::NAME_LEN],
+        },
     };
     let mut w = Writer::new();
     Method::ExecStart.header().write(&mut w).map_err(|_| EIO)?;
@@ -2043,6 +2066,7 @@ fn start_bare() -> Result<(u32, Handle<Channel>), i32> {
         level,
         mask: 0,
         default: 0,
+        name: [0; proto_process::NAME_LEN],
     };
     let mut w = Writer::new();
     Method::SpawnStart.header().write(&mut w).map_err(|_| EIO)?;

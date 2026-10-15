@@ -118,15 +118,17 @@ pub const BUSYBOX_TABLE: &[Record] = &[
 /// services and the launcher (the program of `busybox-probe`, whose
 /// argument `ash-launch` makes it start `/bin/ash` from its file, 5d). The
 /// shell is a child, and so is each command it forks: the pool of the
-/// process service holds the quota of five more processes of the
-/// launcher's size (the shell, the three of a pipeline of three, and a
-/// nested shell's command), and the reserve of its loaders. The pipe service (5e)
+/// process service holds the quota of eight more processes of the
+/// launcher's size (the shell, the three of a pipeline of three, a
+/// nested shell's command, and the images of the failed attempts of a
+/// search through PATH, which wait to be reclaimed), and the reserve of
+/// its loaders. The pipe service (5e)
 /// serves the shell's pipelines, the terminal service (5f) its console.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     RAM_FIFO_CLOCKED,
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 5 * DIALOG_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota + 8 * DIALOG_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],
@@ -143,7 +145,7 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
 ];
 
 /// The quota of the launcher, which the shell and its children get too.
-const DIALOG_QUOTA: u64 = 512 * PAGE;
+const DIALOG_QUOTA: u64 = 1024 * PAGE;
 
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the process,

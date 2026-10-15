@@ -172,6 +172,7 @@ struct Held {
 /// What a child of SpawnStart or ForkStart starts with: its spawn-flags
 /// and group, the level of its loader, its credentials and its page.
 struct Birth {
+    name: [u8; proto_process::NAME_LEN],
     flags: u32,
     pgroup: u32,
     level: u8,
@@ -2061,6 +2062,7 @@ impl Processes {
         }
         let parent = self.records.get(index).expect("the caller");
         let birth = Birth {
+            name: start.name,
             flags: start.flags,
             pgroup: start.pgroup,
             level: start.level,
@@ -2086,6 +2088,7 @@ impl Processes {
         }
         let parent = self.records.get(index).expect("the caller");
         let birth = Birth {
+            name: [0; proto_process::NAME_LEN],
             flags: 0,
             pgroup: 0,
             level: start.level,
@@ -2198,6 +2201,11 @@ impl Processes {
             record.quota = create.quota;
             record.handle_limit = create.handle_limit;
             record.ctty = inherited_ctty;
+            // A child of a file shows its program's name; a child of fork
+            // keeps its parent's.
+            if birth.name[0] != 0 {
+                record.name = birth.name;
+            }
         }
         self.generations.raise(child);
         self.publish_groups(child);
@@ -2248,6 +2256,76 @@ impl Processes {
         Answer::Deferred
     }
 
+    /// List (Ф10): the first live record of the window of `LIST_WINDOW`
+    /// records from the cursor, and the cursor after it (or after the
+    /// window, with `0` for no record). O(LIST_WINDOW).
+    fn list(&mut self, r: &mut Request<'_>, mut body: proto_wire::Reader<'_>) -> Answer {
+        let (Ok(cursor), Ok(())) = (body.u32(), body.finish()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let cursor = cursor as usize;
+        if cursor >= RECORDS {
+            let w = r.reply();
+            return if w
+                .u32(0)
+                .and_then(|()| w.u32(proto_process::LIST_END))
+                .and_then(|()| w.u32(0))
+                .is_ok()
+            {
+                Answer::Reply(Outgoing::new())
+            } else {
+                Answer::Status(Status::BadSize)
+            };
+        }
+        let window_end = (cursor + proto_process::LIST_WINDOW as usize).min(RECORDS);
+        let mut found = None;
+        for i in cursor..window_end {
+            if let Some(record) = self.records.get(i)
+                && !matches!(record.state, State::Loading)
+            {
+                found = Some(i);
+                break;
+            }
+        }
+        let next = found.map_or(window_end, |i| i + 1);
+        let next = if next >= RECORDS {
+            proto_process::LIST_END
+        } else {
+            next as u32
+        };
+        let w = r.reply();
+        let ok = w.u32(0).and_then(|()| w.u32(next)).and_then(|()| match found {
+            None => w.u32(0),
+            Some(i) => {
+                let record = self.records.get(i).expect("a listed record");
+                w.u32(1).and_then(|()| {
+                    proto_process::Listing {
+                        pid: record.label.pid(),
+                        parent: record.parent,
+                        pgid: record.pgid,
+                        sid: record.sid,
+                        uid: record.credentials.words()[0],
+                        euid: record.credentials.words()[1],
+                        gid: record.credentials.words()[3],
+                        egid: record.credentials.words()[4],
+                        state: match record.state {
+                            State::Zombie(_) => 2,
+                            _ if record.stopped.is_some() => 1,
+                            _ => 0,
+                        },
+                        tty: record.ctty.map_or(0, |(terminal, _)| terminal + 1),
+                        name: record.name,
+                    }
+                    .write(w)
+                })
+            }
+        });
+        if ok.is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
+    }
+
     /// ExecStart of the record in `index` (5c, spec 2, 3.2 step 2): a new
     /// process for the record, image one past its own, with the record's
     /// quota, room for handles and ceiling, its page as it is, the loader
@@ -2281,7 +2359,11 @@ impl Processes {
         let (label, image, ceiling) = (record.label, record.tried + 1, record.ceiling);
         let (quota, handle_limit) = (record.quota, record.handle_limit);
         // The number goes to this attempt whatever comes of it.
-        self.records.get_mut(index).expect("the caller").tried = image;
+        {
+            let record = self.records.get_mut(index).expect("the caller");
+            record.tried = image;
+            record.next_name = start.name;
+        }
         let priority = start.level.clamp(1, ceiling);
         let rights = Rights::SEND | Rights::TRANSFER;
         let made = sys::handle_label(&self.channel, rights, label.loader_at(image), self.level)
@@ -2391,6 +2473,9 @@ impl Processes {
         record.image = image;
         record.committed_loader_ticket = committed_ticket;
         record.execed = true;
+        if record.next_name[0] != 0 {
+            record.name = record.next_name;
+        }
         let mut credentials = loaders::child_credentials(record.credentials, 0);
         if let Some(ids) = set_id {
             credentials = loaders::set_ids(credentials, ids);
@@ -3014,6 +3099,7 @@ impl Service<0> for Processes {
                 snapshot(r, self.records.get(index).expect("query process"));
                 Answer::Reply(Outgoing::new())
             }
+            n if n == Method::List as u16 => self.list(r, body),
             n if n == Method::GetLimit as u16 => {
                 let (Ok(resource), Ok(())) = (body.u32(), body.finish()) else {
                     return Answer::Status(Status::BadSize);

@@ -188,8 +188,14 @@ pub unsafe extern "C" fn stafeto_getdents(
 ) -> isize {
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    let result = number(fd).and_then(|fd| {
-        posix_abi::shared::held(fd, |transport, target| {
+    let result = number(fd).and_then(|number| {
+        // The directory /proc lists the live processes (procfs).
+        if let Ok(info) = posix_abi::names::fstatat(fd, None, 0)
+            && posix_abi::procfs::is_directory(&info)
+        {
+            return posix_abi::procfs::entries(out, position);
+        }
+        posix_abi::shared::held(number, |transport, target| {
             entries(transport, target, out, position)
         })
     });
