@@ -38,6 +38,7 @@ mod native_scopes;
 #[cfg(test)]
 #[path = "../../lib/posix-thread/tests/native_stop_barrier.rs"]
 mod native_stop_barrier_tests;
+mod openposix;
 mod ostest;
 mod qemu;
 mod ring;
@@ -1311,6 +1312,11 @@ commands:
             --one NAME, one test in a boot of its own, with its log;
             a FAIL verdict from --one returns a nonzero exit status
             --full-basic runs the complete pinned basic corpus in bounded batches
+  open-posix [--full | --only PREFIX] [--jobs N] run the Open POSIX Test Suite (LTP 20260930)
+            on relibc in bounded batches, N boots at a time; without --full only
+            the tests of tests/open-posix/pass.txt, which must all pass; --only
+            runs the tests whose names start with PREFIX and shows their logs; the
+            table goes to target/measure/open-posix.tsv
   os-test-headers compile and link the pinned include corpus and check namespace
   posix-tty run the C probe of the terminal: termios, isatty, ttyname and the
             names of terminals through the terminal service, with typed input
@@ -1405,6 +1411,16 @@ fn main() {
             rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
         },
         Some("os-test-headers") => os_test_headers(&args[1..]),
+        Some("open-posix") => {
+            let (select, rest) = match &args[1..] {
+                [flag, rest @ ..] if flag == "--full" => (openposix::Select::Full, rest),
+                [flag, prefix, rest @ ..] if flag == "--only" => {
+                    (openposix::Select::Prefix(prefix.clone()), rest)
+                }
+                rest => (openposix::Select::Pinned, rest),
+            };
+            jobs::parse_jobs("open-posix", rest).and_then(|jobs| openposix::run(select, jobs))
+        }
         Some("posix-map") => posix_map_probe(),
         Some("posix-resources") => posix_resources_probe(),
         Some("posix-sync") => posix_sync_probe(),
@@ -1886,8 +1902,8 @@ fn write_elf_image(
     } else {
         None
     };
-    if let Some(licence) = &os_test_licence {
-        list.push((ostest::LICENCE, licence.as_slice()));
+    if let Some((name, licence)) = &os_test_licence {
+        list.push((name, licence.as_slice()));
     }
     // The files of the RAM file service: the files its table names, the
     // ELF files of programs as the linker wrote them among them, then the
@@ -6556,6 +6572,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
 fn host_tests() -> Result<(), String> {
     for script in [
         "tools/test_os_test_build.py",
+        "tools/test_open_posix_build.py",
         "tools/test_os_test_headers.py",
     ] {
         run_cmd(Command::new("python3").arg(root().join(script)))?;
@@ -8563,6 +8580,9 @@ fn ci(jobs: usize) -> Result<(), String> {
     // The complete basic suite: every test of tests/os-test/basic-pass.txt
     // still passes.
     ostest::run_full_basic(jobs)?;
+    // The tests of the Open POSIX Test Suite that pass still pass
+    // (tests/open-posix/pass.txt); `open-posix --full` runs all of them.
+    openposix::run(openposix::Select::Pinned, jobs)?;
     let a = build(Variant::Normal)?;
     disasm::shipping(&a.elf, &llvm_tool("llvm-objdump")?)
 }
