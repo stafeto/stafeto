@@ -5084,15 +5084,17 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "9", "ash", busybox.clone()),
-        ("-rwxr-xr-x", "9", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "9", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "9", "head", busybox.clone()),
-        ("-rwxr-xr-x", "9", "ls", busybox.clone()),
-        ("-rwxr-xr-x", "9", "mktemp", busybox.clone()),
-        ("-rwxr-xr-x", "9", "sh", busybox.clone()),
-        ("-rwxr-xr-x", "9", "sleep", busybox.clone()),
-        ("-rwxr-xr-x", "9", "wc", busybox),
+        ("-rwxr-xr-x", "11", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "11", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "11", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "11", "head", busybox.clone()),
+        ("-rwxr-xr-x", "11", "ls", busybox.clone()),
+        ("-rwxr-xr-x", "11", "mktemp", busybox.clone()),
+        ("-rwxr-xr-x", "11", "nc", busybox.clone()),
+        ("-rwxr-xr-x", "11", "sh", busybox.clone()),
+        ("-rwxr-xr-x", "11", "sleep", busybox.clone()),
+        ("-rwxr-xr-x", "11", "timeout", busybox.clone()),
+        ("-rwxr-xr-x", "11", "wc", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
@@ -5353,6 +5355,26 @@ fn ash_dialog() -> Result<(), String> {
             |line| line.trim() == bin_count,
             DIALOG_STEP,
         )?;
+        run.expect("# ", DIALOG_STEP)?;
+        // Time and sockets (Ф9): sleep and timeout, and nc over the
+        // loopback of the socket service, a server in the background and a
+        // client that sends it a line.
+        run.send("sleep 1; echo slept $?")?;
+        run.expect_line("slept 0", |line| line == "slept 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("timeout 5 /bin/ls /bin/nc; echo in-time-status $?")?;
+        run.expect_line("in-time", |line| line == "/bin/nc", DIALOG_STEP)?;
+        run.expect_line(
+            "in-time-status 0",
+            |line| line == "in-time-status 0",
+            DIALOG_STEP,
+        )?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("timeout 1 /bin/sleep 30; echo cut-short $?")?;
+        run.expect_line("cut-short 143", |line| line == "cut-short 143", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("nc -l -p 4040 > /tmp/nc.out & sleep 1; echo hello-nc | nc 127.0.0.1 4040; wait; cat /tmp/nc.out")?;
+        run.expect_line("nc line", |line| line == "hello-nc", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         // A writer that writes nothing and outlasts its reader's start: the
         // reader sits in `read` on the empty pipe when the last end of the

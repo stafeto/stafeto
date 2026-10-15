@@ -207,6 +207,8 @@ fn dialog() -> Vec<RootFile> {
         file("/bin/sleep", 0o755, ROOT, "busybox-probe"),
         file("/bin/head", 0o755, ROOT, "busybox-probe"),
         file("/bin/mktemp", 0o755, ROOT, "busybox-probe"),
+        file("/bin/nc", 0o755, ROOT, "busybox-probe"),
+        file("/bin/timeout", 0o755, ROOT, "busybox-probe"),
         file("/bin/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
     ];
