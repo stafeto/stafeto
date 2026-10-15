@@ -434,9 +434,16 @@ fn run_in(
     // channel and may take this one's notification, so once a handler ran
     // the wait asks again ("take k" with no handle) before it blocks.
     let mut handled = block.handled.load(Ordering::SeqCst);
+    // The same for a park of a stop (exec, fork), which receives from the
+    // channel too and takes a notification without running a handler.
+    let mut parked = crate::signals::parks();
     let cancel = 'wait: loop {
-        if armed && block.handled.load(Ordering::SeqCst) != handled {
+        if armed
+            && (block.handled.load(Ordering::SeqCst) != handled
+                || crate::signals::parks() != parked)
+        {
             handled = block.handled.load(Ordering::SeqCst);
+            parked = crate::signals::parks();
             match call(
                 service,
                 request(false).map_err(|_| EIO)?.as_bytes(),
@@ -457,6 +464,7 @@ fn run_in(
         }
         if !armed {
             handled = block.handled.load(Ordering::SeqCst);
+            parked = crate::signals::parks();
             // No user entry may abandon a newly created transfer clone before
             // the request has either transferred it or closed the refusal.
             let clone_guard = if custody.is_some() {
@@ -496,8 +504,9 @@ fn run_in(
             drop(guard);
             break 'wait None;
         }
-        // A handler that ran since the look above: look again first.
-        if block.handled.load(Ordering::SeqCst) != handled {
+        // A handler that ran, or a park, since the look above: look again
+        // first.
+        if block.handled.load(Ordering::SeqCst) != handled || crate::signals::parks() != parked {
             drop(guard);
             continue;
         }
