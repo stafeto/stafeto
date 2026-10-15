@@ -28,14 +28,30 @@ impl Endpoint {
             generation,
         }
     }
+    /// A socket of the service: `SOCK_END | slot`, no generation.
+    pub const fn socket(slot: u32) -> Self {
+        Self {
+            id: crate::sock::SOCK_END | slot,
+            generation: 0,
+        }
+    }
     pub const fn is_named(self) -> bool {
         self.id & NAMED_END != 0
     }
+    pub const fn is_sock(self) -> bool {
+        self.id & crate::sock::SOCK_END != 0 && self.id & NAMED_END == 0
+    }
     pub const fn slot(self) -> usize {
-        (self.id & !NAMED_END) as usize
+        (self.id & !(NAMED_END | crate::sock::SOCK_END)) as usize
+    }
+    const fn valid(self) -> bool {
+        self.slot() < NAMED_MAX
+            && self.is_named() == (self.generation != 0)
+            && (self.id & crate::sock::SOCK_END == 0
+                || (self.id & NAMED_END == 0 && self.slot() < crate::sock::SOCKETS))
     }
     pub fn write(self, w: &mut Writer) -> Result<(), Status> {
-        if self.slot() >= NAMED_MAX || self.is_named() != (self.generation != 0) {
+        if !self.valid() {
             return Err(Status::BadSize);
         }
         w.u32(self.id)?;
@@ -48,7 +64,7 @@ impl Endpoint {
         let id = r.u32()?;
         let generation = if id & NAMED_END != 0 { r.u64()? } else { 0 };
         let endpoint = Self { id, generation };
-        if endpoint.slot() >= NAMED_MAX || endpoint.is_named() != (generation != 0) {
+        if !endpoint.valid() {
             return Err(Status::BadSize);
         }
         Ok(endpoint)

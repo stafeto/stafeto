@@ -18,6 +18,7 @@ use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use pipe::{Held, Pipes, Roots, Wakes};
 use proto_init::ServiceArgs;
+use proto_pipe::sock::{Addr, Received, Recv, SEND_MAX, Send};
 use proto_pipe::{Cancel, HELD_MAX, MAX_READ, Method, OWN, Read, VERSION, Write};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, long, watch};
@@ -383,7 +384,7 @@ impl PipeService {
         if let Some(key) = read.key
             && (!self.ops.waits(s.label(), key)
                 || self.watches.get(s.label(), key).is_some()
-                || (endpoint.is_named()
+                || ((endpoint.is_named() || endpoint.is_sock())
                     && self.io[((key & 0xffff_ffff) - 1) as usize].endpoint != endpoint))
         {
             return Answer::Status(Status::Kernel(Error::BadState));
@@ -423,7 +424,7 @@ impl PipeService {
         if let Some(key) = write.key
             && (!self.ops.waits(s.label(), key)
                 || self.watches.get(s.label(), key).is_some()
-                || (endpoint.is_named()
+                || ((endpoint.is_named() || endpoint.is_sock())
                     && self.io[((key & 0xffff_ffff) - 1) as usize].endpoint != endpoint))
         {
             return Answer::Status(Status::Kernel(Error::BadState));
@@ -614,6 +615,287 @@ impl PipeService {
         }
     }
 
+    /// The socket calls that answer at once: the body after the socket.
+    fn sock_call(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, m: Method) -> Answer {
+        let mut body = r.body();
+        let label = r.label();
+        let mut wakes = Wakes::default();
+        let answer = (|| -> Result<Answer, Answer> {
+            let held_room = s.data.held.count() + self.named.reservations(s.label());
+            match m {
+                Method::SockCreate | Method::SockPair => {
+                    let domain = body.u32().map_err(Answer::Status)?;
+                    let kind = body.u32().map_err(Answer::Status)?;
+                    let flags = body.u32().map_err(Answer::Status)?;
+                    body.finish().map_err(Answer::Status)?;
+                    let pair = m == Method::SockPair;
+                    if held_room + 1 + usize::from(pair) > HELD_MAX {
+                        return Ok(status(proto_pipe::MFILE));
+                    }
+                    let root = s.data.root;
+                    if pair {
+                        match self.pipes.sock_pair(
+                            &mut s.data.held,
+                            label,
+                            root,
+                            domain,
+                            kind,
+                            flags,
+                        ) {
+                            Ok((a, b)) => Ok(words(r, &[a, b])),
+                            Err(code) => Ok(status(code)),
+                        }
+                    } else {
+                        match self.pipes.sock_create(
+                            &mut s.data.held,
+                            label,
+                            root,
+                            domain,
+                            kind,
+                            flags,
+                        ) {
+                            Ok(id) => Ok(words(r, &[id])),
+                            Err(code) => Ok(status(code)),
+                        }
+                    }
+                }
+                _ => {
+                    let end = Endpoint::parse(&mut body).map_err(Answer::Status)?;
+                    let held = &s.data.held;
+                    let result: Result<Option<u32>, u32> = match m {
+                        Method::SockBind => {
+                            let addr = Addr::read(&mut body).map_err(Answer::Status)?;
+                            body.finish().map_err(Answer::Status)?;
+                            self.pipes.sock_bind(held, end, addr).map(|()| None)
+                        }
+                        Method::SockListen => {
+                            let backlog = body.u32().map_err(Answer::Status)?;
+                            body.finish().map_err(Answer::Status)?;
+                            self.pipes.sock_listen(held, end, backlog).map(|()| None)
+                        }
+                        Method::SockConnect => {
+                            let addr = Addr::read(&mut body).map_err(Answer::Status)?;
+                            body.finish().map_err(Answer::Status)?;
+                            self.pipes
+                                .sock_connect(held, end, addr, &mut wakes)
+                                .map(|()| None)
+                        }
+                        Method::SockShutdown => {
+                            let how = body.u32().map_err(Answer::Status)?;
+                            body.finish().map_err(Answer::Status)?;
+                            self.pipes
+                                .sock_shutdown(held, end, how, &mut wakes)
+                                .map(|()| None)
+                        }
+                        Method::SockName => {
+                            let peer = body.u32().map_err(Answer::Status)?;
+                            body.finish().map_err(Answer::Status)?;
+                            return match self.pipes.sock_name(held, end, peer != 0) {
+                                Ok(addr) => {
+                                    let w = r.reply();
+                                    if w.u32(0).is_err() || addr.write(w).is_err() {
+                                        return Ok(Answer::Status(Status::BadSize));
+                                    }
+                                    Ok(Answer::Reply(Outgoing::new()))
+                                }
+                                Err(code) => Ok(status(code)),
+                            };
+                        }
+                        _ => {
+                            let option = body.u32().map_err(Answer::Status)?;
+                            let set = body.u32().map_err(Answer::Status)?;
+                            let value = body.u32().map_err(Answer::Status)?;
+                            body.finish().map_err(Answer::Status)?;
+                            self.pipes
+                                .sock_option(held, end, option, set != 0, value)
+                                .map(Some)
+                        }
+                    };
+                    Ok(match result {
+                        Ok(None) => Answer::Status(Status::Ok),
+                        Ok(Some(value)) => words(r, &[value]),
+                        Err(code) => status(code),
+                    })
+                }
+            }
+        })();
+        self.tell(&wakes);
+        answer.unwrap_or_else(|a| a)
+    }
+
+    /// The key of a take and the socket of a long socket call's body.
+    fn sock_key(
+        &mut self,
+        s: &Session<Client, 0>,
+        body: &mut proto_wire::Reader<'_>,
+        take: bool,
+    ) -> Result<(Option<u64>, Endpoint), Answer> {
+        let key = if take {
+            Some(body.u64().map_err(Answer::Status)?)
+        } else {
+            None
+        };
+        let _ = s;
+        let end = Endpoint::parse(body).map_err(Answer::Status)?;
+        Ok((key, end))
+    }
+
+    /// Whether a take names an operation this session waits in, at this end.
+    fn take_ok(&self, s: &Session<Client, 0>, key: Option<u64>, endpoint: Endpoint) -> bool {
+        match key {
+            None => true,
+            Some(key) => {
+                self.ops.waits(s.label(), key)
+                    && self.watches.get(s.label(), key).is_none()
+                    && self.io[((key & 0xffff_ffff) - 1) as usize].endpoint == endpoint
+            }
+        }
+    }
+
+    /// SOCK_ACCEPT (`take` false) or SOCK_ACCEPT_TAKE.
+    fn sock_accept(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        take: bool,
+    ) -> Answer {
+        let mut body = r.body();
+        let (key, endpoint) = match self.sock_key(s, &mut body, take) {
+            Ok(v) => v,
+            Err(a) => return a,
+        };
+        if body.finish().is_err() || !endpoint.is_sock() {
+            return Answer::Status(Status::BadSize);
+        }
+        let notify = match Self::notify_of(r, take) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        if !self.take_ok(s, key, endpoint) {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        if s.data.held.count() + self.named.reservations(s.label()) + 1 > HELD_MAX {
+            self.finish(s, key, endpoint.id);
+            return status(proto_pipe::MFILE);
+        }
+        let (label, root) = (r.label(), s.data.root);
+        let got = self
+            .pipes
+            .sock_accept(&mut s.data.held, endpoint, label, root);
+        match got {
+            Ok(Some((id, addr))) => {
+                self.finish(s, key, endpoint.id);
+                let mut w = proto_wire::Writer::new();
+                if w.u32(id).is_err() || addr.write(&mut w).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                long_answer(r, long::Reply::Ready(w.as_bytes()))
+            }
+            Err(code) => {
+                self.finish(s, key, endpoint.id);
+                status(code)
+            }
+            Ok(None) => self.wait(s, r, key, endpoint, notify),
+        }
+    }
+
+    /// SOCK_SEND (`take` false) or SOCK_SEND_TAKE.
+    fn sock_send(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
+        let send = match Send::parse(r.body(), take) {
+            Ok(send) => send,
+            Err(status) => return Answer::Status(status),
+        };
+        let endpoint = Endpoint::socket(send.end & !proto_pipe::sock::SOCK_END);
+        if send.end & proto_pipe::sock::SOCK_END == 0
+            || (send.end & !proto_pipe::sock::SOCK_END) as usize >= proto_pipe::sock::SOCKETS
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        let notify = match Self::notify_of(r, take) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        if !self.take_ok(s, send.key, endpoint) {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        let mut wakes = Wakes::default();
+        let put = self.pipes.sock_send(
+            &s.data.held,
+            endpoint,
+            send.flags,
+            &send.fds[..send.nfds],
+            &send.to,
+            send.bytes,
+            &mut wakes,
+        );
+        self.tell(&wakes);
+        match put {
+            Ok(Some(n)) => {
+                self.finish(s, send.key, endpoint.id);
+                long_answer(r, long::Reply::Ready(&(n as u32).to_le_bytes()))
+            }
+            Err(code) => {
+                self.finish(s, send.key, endpoint.id);
+                status(code)
+            }
+            Ok(None) => self.wait(s, r, send.key, endpoint, notify),
+        }
+    }
+
+    /// SOCK_RECV (`take` false) or SOCK_RECV_TAKE.
+    fn sock_recv(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
+        let recv = match Recv::parse(r.body(), take) {
+            Ok(recv) => recv,
+            Err(status) => return Answer::Status(status),
+        };
+        if recv.end & proto_pipe::sock::SOCK_END == 0
+            || (recv.end & !proto_pipe::sock::SOCK_END) as usize >= proto_pipe::sock::SOCKETS
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        let endpoint = Endpoint::socket(recv.end & !proto_pipe::sock::SOCK_END);
+        let notify = match Self::notify_of(r, take) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        if !self.take_ok(s, recv.key, endpoint) {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        let mut out = [0; SEND_MAX];
+        let mut wakes = Wakes::default();
+        let got = self.pipes.sock_recv(
+            &mut s.data.held,
+            endpoint,
+            recv.flags,
+            &mut out[..recv.count as usize],
+            recv.max_fds as usize,
+            &mut wakes,
+        );
+        self.tell(&wakes);
+        match got {
+            Ok(Some(got)) => {
+                self.finish(s, recv.key, endpoint.id);
+                let mut w = proto_wire::Writer::new();
+                let message = Received {
+                    flags: got.flags,
+                    fds: got.fds,
+                    nfds: got.nfds,
+                    from: got.from,
+                    bytes: &out[..got.n],
+                };
+                if message.write(&mut w).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                long_answer(r, long::Reply::Ready(w.as_bytes()))
+            }
+            Err(code) => {
+                self.finish(s, recv.key, endpoint.id);
+                status(code)
+            }
+            Ok(None) => self.wait(s, r, recv.key, endpoint, notify),
+        }
+    }
+
     /// CLONE with a list of the session's descriptions (count u32, then
     /// each u32): a session of the service's own label that holds them;
     /// BAD_FD for one it does not hold, LIMIT_REACHED with BIRTHS clones
@@ -705,7 +987,7 @@ impl Service<0> for PipeService {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25,
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
             ]
         }
         #[cfg(not(feature = "steps"))]
@@ -801,6 +1083,22 @@ impl Service<0> for PipeService {
                 },
                 Err(answer) => answer,
             },
+            Some(
+                m @ (Method::SockCreate
+                | Method::SockPair
+                | Method::SockBind
+                | Method::SockListen
+                | Method::SockConnect
+                | Method::SockShutdown
+                | Method::SockName
+                | Method::SockOpt),
+            ) => self.sock_call(s, r, m),
+            Some(Method::SockAccept) => self.sock_accept(s, r, false),
+            Some(Method::SockAcceptTake) => self.sock_accept(s, r, true),
+            Some(Method::SockSend) => self.sock_send(s, r, false),
+            Some(Method::SockSendTake) => self.sock_send(s, r, true),
+            Some(Method::SockRecv) => self.sock_recv(s, r, false),
+            Some(Method::SockRecvTake) => self.sock_recv(s, r, true),
             Some(Method::Abandon) => {
                 if r.body().finish().is_err() {
                     return Answer::Status(Status::BadSize);

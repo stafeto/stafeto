@@ -52,6 +52,7 @@ impl RamTarget {
             FileKind::Regular => 2,
             FileKind::Character => 3,
             FileKind::Fifo => 4,
+            FileKind::Socket => 5,
         };
         self.packed = (self.packed & !KIND_MASK) | (tag << KIND_SHIFT);
         self
@@ -64,6 +65,7 @@ impl RamTarget {
             2 => Ok(FileKind::Regular),
             3 => Ok(FileKind::Character),
             4 => Ok(FileKind::Fifo),
+            5 => Ok(FileKind::Socket),
             _ => Err(FsError::Io),
         }
     }

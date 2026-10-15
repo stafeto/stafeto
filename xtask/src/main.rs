@@ -1315,6 +1315,7 @@ commands:
             steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
   entropy-vz run the probe of the entropy device's driver on Apple VZ
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
+  posix-sock run the C probe of sockets in QEMU
   help      this text";
 
 fn main() {
@@ -1424,6 +1425,7 @@ fn main() {
         Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
+        Some("posix-sock") => posix_sock_probe(),
         Some("posix-pty") => posix_pty_probe(),
         Some("posix-tty-control-steps") => posix_tty_control_steps(),
         Some("posix-pty-steps") => posix_pty_probe_in(true),
@@ -2834,6 +2836,42 @@ fn posix_poll_probe() -> Result<(), String> {
         "init: posix-poll ended: exit code 0, not restarted",
     )?;
     check_watch_steps(&output.lines)
+}
+
+/// The probe of sockets (tests/posix-sock): AF_UNIX and the loopback, by
+/// the property, each with the breakage that makes its check fail.
+fn posix_sock_probe() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 11] = [
+        ("init", "init", INIT_STACK_SIZE, &["table-posix-sock"]),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        ("tty", "tty", TTY_STACK_SIZE, &["quiet-steps"]),
+        POSIX_PROCS_PROGRAMS[1],
+        ("pipe", "pipe", PIPE_STACK_SIZE, &["quiet-steps"]),
+        POSIX_PROCS_PROGRAMS[3],
+        POSIX_PROCS_PROGRAMS[4],
+        ("posix-sock", "posix-sock", POSIX_STACK_SIZE, &[]),
+        POSIX_PROCS_PROGRAMS[6],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    let image = build_boot_image("boot-posix-sock.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: posix-sock ended: "),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(&output, "posix-sock: ok")?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: posix-sock ended: exit code 0, not restarted",
+    )
 }
 
 fn posix_pty_probe() -> Result<(), String> {
@@ -5786,6 +5824,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
+        job("posix-sock", posix_sock_probe),
         job("posix-pty", posix_pty_probe),
         job("posix-pty-steps", posix_pty_steps),
         // BusyBox on relibc guards the C surface (5a').
@@ -7829,6 +7868,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-sync-probe",
         "--package",
         "posix-resources-probe",
+        "--package",
+        "posix-sock",
         "--target",
         PROGRAM_TARGET,
         "--",

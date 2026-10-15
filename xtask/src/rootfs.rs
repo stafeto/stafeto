@@ -563,6 +563,15 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        "boot-posix-sock.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-sock", 0o755, ROOT, "posix-sock"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-posix-pty.img" | "boot-posix-pty-steps.img" => {
             let mut files = vec![
                 dir("/bin"),

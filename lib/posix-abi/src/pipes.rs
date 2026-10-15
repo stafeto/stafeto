@@ -25,7 +25,7 @@ fn refusal(status: Status) -> Option<i32> {
         proto_pipe::NFILE => Some(ENFILE),
         proto_pipe::MFILE => Some(EMFILE),
         proto_pipe::INVALID => Some(EINVAL),
-        _ => None,
+        _ => crate::sockets::refusal(status),
     }
 }
 
@@ -148,7 +148,9 @@ pub fn status_flags_endpoint(transport: Transport, end: Endpoint) -> Result<i32,
     let [flags, _] = transport
         .pipe_endpoint_call(Method::GetFlags, end, None)
         .map_err(crate::error)?;
-    let access = if flags & proto_pipe::WRITE_END != 0 {
+    let access = if flags & proto_pipe::RDWR != 0 {
+        O_RDWR
+    } else if flags & proto_pipe::WRITE_END != 0 {
         O_WRONLY
     } else {
         O_RDONLY
