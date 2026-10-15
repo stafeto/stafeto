@@ -400,6 +400,7 @@ basic/pthread/pthread_barrier_wait
 basic/pthread/pthread_barrierattr_destroy
 basic/pthread/pthread_barrierattr_getpshared
 basic/pthread/pthread_barrierattr_init
+basic/pthread/pthread_barrierattr_setpshared
 basic/pthread/pthread_cancel
 basic/pthread/pthread_cleanup_pop
 basic/pthread/pthread_cleanup_push
@@ -415,6 +416,7 @@ basic/pthread/pthread_condattr_getclock
 basic/pthread/pthread_condattr_getpshared
 basic/pthread/pthread_condattr_init
 basic/pthread/pthread_condattr_setclock
+basic/pthread/pthread_condattr_setpshared
 basic/pthread/pthread_create
 basic/pthread/pthread_detach
 basic/pthread/pthread_equal
@@ -439,6 +441,7 @@ basic/pthread/pthread_mutexattr_gettype
 basic/pthread/pthread_mutexattr_init
 basic/pthread/pthread_mutexattr_setprioceiling
 basic/pthread/pthread_mutexattr_setprotocol
+basic/pthread/pthread_mutexattr_setpshared
 basic/pthread/pthread_mutexattr_setrobust
 basic/pthread/pthread_mutexattr_settype
 basic/pthread/pthread_once
@@ -456,6 +459,7 @@ basic/pthread/pthread_rwlock_wrlock
 basic/pthread/pthread_rwlockattr_destroy
 basic/pthread/pthread_rwlockattr_getpshared
 basic/pthread/pthread_rwlockattr_init
+basic/pthread/pthread_rwlockattr_setpshared
 basic/pthread/pthread_self
 basic/pthread/pthread_setcancelstate
 basic/pthread/pthread_setspecific
@@ -737,10 +741,14 @@ basic/sys_ipc/ftok
 basic/sys_mman/mlock
 basic/sys_mman/mlockall
 basic/sys_mman/mmap
+basic/sys_mman/mprotect
+basic/sys_mman/msync
 basic/sys_mman/munlock
 basic/sys_mman/munlockall
 basic/sys_mman/munmap
 basic/sys_mman/posix_madvise
+basic/sys_mman/shm_open
+basic/sys_mman/shm_unlink
 basic/sys_resource/getrlimit
 basic/sys_resource/setrlimit
 basic/sys_select/FD_CLR
