@@ -30,7 +30,7 @@ RELIBC = ROOT / "target" / "relibc" / "sysroot"
 # relibc's own (-idirafter).
 COMPAT = ROOT / "tools" / "busybox" / "compat"
 # BusyBox sources of our own, copied into the tree by directory: the
-# applets BusyBox 1.37 lacks and the library functions its applets need.
+# applet login-probe, which the tests of getlogin and utmpx run.
 OWN = ROOT / "tools" / "busybox" / "stafeto"
 LOG = WORK / "build.log"
 STAMP = WORK / "config"
@@ -285,7 +285,7 @@ def build(utilities: bool) -> None:
         replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
     replace(config, "# CONFIG_KILL is not set", "CONFIG_KILL=y")
     # The utilities of XCU that BusyBox has (Ф10), with the features their
-    # pages ask for; ps is ours (tools/busybox/stafeto/procps/ps.c).
+    # pages ask for; ps is the BusyBox one, over the /proc of the layer.
     for name in names:
         text = config.read_text()
         if f"# CONFIG_{name} is not set" in text:
