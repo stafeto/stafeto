@@ -339,6 +339,11 @@ pub fn file_pieces(addr: usize, len: usize, out: &mut [FilePiece]) -> usize {
     })
 }
 
+/// The descriptor the layer already holds for the file of `key`.
+pub fn fd_of_key(key: u64) -> Option<i32> {
+    heap(|state| state.fd_of_key(key))
+}
+
 /// The descriptors and keys of the files whose last mapping `munmap` took since
 /// the last call, up to `out.len()`: how many. The caller closes the
 /// descriptors and tells the process service of the keys.

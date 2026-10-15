@@ -4796,6 +4796,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         "posix-procs: resource and descriptor exec steps ok",
     )?;
     qemu::expect_marker(&outcome, "posix-procs: timer steps ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: shared memory steps ok")?;
     check_process_memory_reserve(&outcome.lines)?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
@@ -4834,9 +4835,9 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // The resource and descriptor-exec exercise runs while the crowd is live.
     // Every newly introduced dispatch is measured, with the part's 10% reserve.
     for (service, measured, kinds) in [
-        // 58 Timer, 59 Queue and 65, the expiry of timers (a notice the
-        // service counts apart).
-        ("process", &rows, &[55usize, 56, 57, 58, 59, 65][..]),
+        // 58 Timer, 59 Queue, 60 Share and 65, the expiry of timers (a
+        // notice the service counts apart).
+        ("process", &rows, &[55usize, 56, 57, 58, 59, 60, 65][..]),
         ("RAM", &ram, &[3usize, 59][..]),
     ] {
         for kind in kinds {

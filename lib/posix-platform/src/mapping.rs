@@ -16,7 +16,7 @@ use posix_abi::mmap::{self, Back, FilePiece, MAP_ANONYMOUS, MAP_SHARED, PROT_WRI
 const PAGE: usize = 4096;
 /// The lowest number the layer's descriptors of mapped files take: near the
 /// top of the table, away from the numbers a program picks.
-const KEEP_FROM: u32 = posix_fs::OPEN_MAX as u32 - 8;
+const KEEP_FROM: u32 = posix_fs::OPEN_MAX as u32 / 2;
 /// relibc's F_DUPFD_CLOEXEC.
 const F_DUPFD_CLOEXEC: c_int = 1030;
 /// relibc's MS_ASYNC, MS_INVALIDATE and MS_SYNC.
@@ -99,7 +99,9 @@ fn close_released() {
     let mut files = [(0, 0); 16];
     let n = mmap::closed_files(&mut files);
     for &(fd, key) in &files[..n] {
-        super::stafeto_close(fd);
+        if fd >= 0 {
+            super::stafeto_close(fd);
+        }
         if key != 0 {
             posix_abi::shares::detach(key);
         }
@@ -150,13 +152,23 @@ fn file_mapping(
         return private_file(addr, len, prot, flags, fd, offset);
     }
     // A shared mapping writes through a descriptor of its own, which stays
-    // when the program closes `fd`.
-    let kept = super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, u64::from(KEEP_FROM));
-    if kept < 0 {
-        return Err(-kept);
-    }
+    // when the program closes `fd`; mappings of one file share it.
+    let (kept, new) = match mmap::fd_of_key(key) {
+        Some(kept) => (kept, false),
+        None => {
+            let mut kept =
+                super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, u64::from(KEEP_FROM));
+            if kept < 0 {
+                kept = super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, 3);
+            }
+            if kept < 0 {
+                return Err(-kept);
+            }
+            (kept, true)
+        }
+    };
     let result = shared_file(addr, len, prot, flags, fd, kept, offset, key);
-    if result.is_err() {
+    if result.is_err() && new {
         super::stafeto_close(kept);
     }
     result

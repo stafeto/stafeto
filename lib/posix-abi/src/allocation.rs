@@ -430,14 +430,37 @@ impl State {
                 .unmap(index, at, (to - at) / PAGE)
                 .map_err(|_| ENOMEM)?;
             if let Some(back) = gone.and_then(|object| object.back) {
-                if self.closed_len < self.closed.len() {
-                    self.closed[self.closed_len] = (back.fd, back.key);
+                // The descriptor and the key go with the last object that
+                // has them.
+                let fd_used = self
+                    .map
+                    .objects()
+                    .any(|(_, o)| o.back.is_some_and(|b| b.fd == back.fd));
+                let key_used = back.key != 0
+                    && self
+                        .map
+                        .objects()
+                        .any(|(_, o)| o.back.is_some_and(|b| b.key == back.key));
+                let entry = (
+                    if fd_used { -1 } else { back.fd },
+                    if key_used { 0 } else { back.key },
+                );
+                if entry != (-1, 0) && self.closed_len < self.closed.len() {
+                    self.closed[self.closed_len] = entry;
                     self.closed_len += 1;
                 }
             }
             at = to;
         }
         Ok(())
+    }
+
+    /// The descriptor the layer holds for the shared mapping of the file of
+    /// `key`, if this process maps it.
+    pub(crate) fn fd_of_key(&self, key: u64) -> Option<i32> {
+        self.map
+            .objects()
+            .find_map(|(_, o)| o.back.filter(|b| b.key == key && key != 0).map(|b| b.fd))
     }
 
     /// The descriptors of `closed`, moved to `out`: how many.
@@ -474,11 +497,12 @@ impl State {
     }
 
     fn grow(&mut self, needed: usize) -> Result<(), i32> {
-        // Twice the last chunk, but no more than a quarter of what the
+        // Twice the last chunk, but no more than a sixteenth of what the
         // process's quota has left: a small process does not pay for a big
-        // chunk it never fills.
+        // chunk it never fills (it keeps 64 KiB chunks), and a process with
+        // megabytes grows by doubling.
         let spare = sys::process_memory(&config().process).map_or(MAX_CHUNK, |m| {
-            (m.quota.saturating_sub(m.used) as usize / PAGE / 4).max(FIRST_CHUNK)
+            (m.quota.saturating_sub(m.used) as usize / PAGE / 16).max(FIRST_CHUNK)
         });
         let wanted = (self.chunk * 2)
             .clamp(FIRST_CHUNK, MAX_CHUNK)

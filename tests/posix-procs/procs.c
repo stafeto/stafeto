@@ -1184,6 +1184,47 @@ done:
     return result;
 }
 
+/* The rendezvous of shared memory among the crowd: the longest Get is the one
+ * that scans all the entries (a table full of them), Put hands an object
+ * over, Attach comes from a forked child, Detach from the last munmap. */
+static int steps_share(void) {
+    enum { OBJECTS = 17 };
+    char name[40];
+    int fds[OBJECTS];
+    char *maps[OBJECTS];
+    for (int i = 0; i < OBJECTS; i++) {
+        snprintf(name, sizeof name, "/steps-share-%d", i);
+        shm_unlink(name);
+        fds[i] = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fds[i] < 0 || ftruncate(fds[i], 4096) != 0) return 1;
+        maps[i] = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fds[i], 0);
+        if (maps[i] == MAP_FAILED) {
+            printf("posix-procs: steps: shared mapping %d gave %d\n", i, errno);
+            return 2;
+        }
+        maps[i][0] = (char)(i + 1);
+        close(fds[i]);
+    }
+    /* A second mapping of an entry is a Get that finds it. */
+    snprintf(name, sizeof name, "/steps-share-%d", OBJECTS - 2);
+    int again_fd = shm_open(name, O_RDWR, 0);
+    char *again = again_fd < 0 ? MAP_FAILED : mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, again_fd, 0);
+    if (again == MAP_FAILED || again[0] != OBJECTS - 1) return 3;
+    close(again_fd);
+    pid_t child = fork();
+    if (child == 0) _exit(maps[5][0] == 6 ? 0 : 1);
+    int status = 0;
+    if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status)
+        || WEXITSTATUS(status) != 0) return 4;
+    munmap(again, 4096);
+    for (int i = 0; i < OBJECTS; i++) {
+        if (munmap(maps[i], 4096) != 0) return 5;
+        snprintf(name, sizeof name, "/steps-share-%d", i);
+        shm_unlink(name);
+    }
+    return 0;
+}
+
 /* A loaded child exercises the new requests while every branch remains live. */
 static int steps_resources(void) {
     struct rlimit nofile, saved;
@@ -1325,6 +1366,16 @@ static int steps_run(void) {
         failed++;
     } else {
         puts("posix-procs: resource and descriptor exec steps ok");
+    }
+    pid_t share_child = -1;
+    int share_status = 0;
+    if (steps_spawn(&share_child, "stepshare", "0") != 0
+        || waitpid(share_child, &share_status, 0) != share_child
+        || !WIFEXITED(share_status) || WEXITSTATUS(share_status) != 64) {
+        printf("posix-procs: steps: shared memory failed status %d errno %d\n", share_status, errno);
+        failed++;
+    } else {
+        puts("posix-procs: shared memory steps ok");
     }
 #if FIFO_STEPS
     pid_t fifo_child = -1;
@@ -2524,6 +2575,7 @@ static int role(const char *name) {
     if (strcmp(name, "stepfifo") == 0) return steps_fifo();
 #endif
     if (strcmp(name, "stepresources") == 0) return 64 + steps_resources();
+    if (strcmp(name, "stepshare") == 0) return 64 + steps_share();
     if (strcmp(name, "child") == 0) {
         sigset_t mask;
         sigprocmask(SIG_BLOCK, NULL, &mask);
