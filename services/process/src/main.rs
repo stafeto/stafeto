@@ -1232,8 +1232,8 @@ impl Processes {
     /// Arms the kernel's timer at the nearest deadline of the table when
     /// that is nearer than the one it is armed at. A deadline that moved
     /// away leaves its wake-up, which finds nothing due and arms again.
-    fn timer_arm(&mut self) {
-        let (Some(timer), Some(deadline)) = (self.timer.as_ref(), self.timers.earliest()) else {
+    fn timer_arm(&mut self, deadline: Option<u64>) {
+        let (Some(timer), Some(deadline)) = (self.timer.as_ref(), deadline) else {
             return;
         };
         if deadline < self.timer_armed && sys::timer_set(timer, deadline).is_ok() {
@@ -1261,7 +1261,7 @@ impl Processes {
         self.signal(owner, signal, info)
     }
 
-    /// The notice of the kernel's timer: up to EXPIRIES_PER_STEP due
+    /// The notice of the kernel's timer: a budget (EXPIRY_BUDGET) of due
     /// timers send their signals, and the timer is armed again for the
     /// nearest of the rest. A step takes constant time however many are due.
     fn timer_step(&mut self) {
@@ -1269,10 +1269,22 @@ impl Processes {
         rt::service::step_own();
         self.timer_armed = u64::MAX;
         let now = Self::timer_now();
-        for _ in 0..timers::EXPIRIES_PER_STEP {
-            let Some(slot) = self.timers.next(now) else {
-                break;
+        let mut budget = timers::EXPIRY_BUDGET;
+        let (list, listed) = self.timers.due(now);
+        for &slot in &list[..listed] {
+            let signal = self.timers.signal_of(slot);
+            let cost = if signal == SIGKILL
+                || signal == SIGSTOP
+                || proto_process::job::class(signal).is_some()
+            {
+                timers::DEAR_COST
+            } else {
+                1
             };
+            if cost > budget {
+                break;
+            }
+            budget -= cost;
             let due = self.timers.expire(slot, now);
             if due.signal == 0 {
                 continue;
@@ -1288,7 +1300,8 @@ impl Processes {
             self.timers
                 .account(due.slot, due.count, posted == Posted::Merged);
         }
-        self.timer_arm();
+        let nearest = self.timers.earliest();
+        self.timer_arm(nearest);
     }
 
     /// Timer (label of a record): the operation u32 of `timer_op` and its
@@ -1360,7 +1373,12 @@ impl Processes {
                 };
                 match before {
                     Ok(before) => {
-                        self.timer_arm();
+                        // A nearer deadline arms the kernel's timer at it; a
+                        // disarmed or later one leaves a wake-up that finds
+                        // nothing due.
+                        self.timer_arm(
+                            deadline.map(|d| d.min(now.saturating_add(timers::HORIZON))),
+                        );
                         setting(r, before)
                     }
                     Err(fail) => failed(fail),

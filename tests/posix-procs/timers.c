@@ -71,13 +71,21 @@ static struct itimerspec t_its(long long value, long long interval) {
 /* The steps mode: a process that sets a timer for the instant in its second
  * argument (CLOCK_MONOTONIC, nanoseconds) and waits for the signal. */
 static int steptimer_role(void) {
-    long long at = strtoll(argv_seen[2], NULL, 10);
+    char *end;
+    long long at = strtoll(argv_seen[2], &end, 10);
+    /* After a comma, the signal the timer sends: SIGSTOP or SIGKILL end
+     * (or stop) the process itself, the dearest steps of the expiry. */
+    int sig = *end == ',' ? atoi(end + 1) : SIGUSR1;
     t_block(SIGUSR1);
-    struct sigevent e = t_event(SIGUSR1, 1);
+    struct sigevent e = t_event(sig, 1);
     timer_t t;
     if (timer_create(CLOCK_MONOTONIC, &e, &t)) return 1;
     struct itimerspec its = t_its(at, 0);
     if (timer_settime(t, TIMER_ABSTIME, &its, NULL)) return 2;
+    if (sig != SIGUSR1) {
+        sleep(120);
+        return 5;
+    }
     siginfo_t info;
     if (t_take(SIGUSR1, &info, 120000) != SIGUSR1) return 3;
     return info.si_code == SI_TIMER ? 0 : 4;
@@ -98,6 +106,26 @@ static int steps_timers(void) {
     /* The probe goes on with the signals it had (the FIFO steps send SIGUSR1). */
     sigset_t saved;
     sigprocmask(SIG_SETMASK, NULL, &saved);
+    /* Four processes stop themselves at one instant, four more are killed:
+     * the expiry with a call of the kernel and a report to the parent. */
+    static const int dear[2] = {SIGSTOP, SIGKILL};
+    for (int round = 0; round < 2; round++) {
+        pid_t four[4];
+        char arg[48];
+        snprintf(arg, sizeof arg, "%lld,%d", t_now(CLOCK_MONOTONIC) + 6000 * T_MS, dear[round]);
+        for (int i = 0; i < 4; i++)
+            if (steps_spawn(&four[i], "steptimer", arg) != 0) return 20;
+        for (int i = 0; i < 4; i++) {
+            int status = -1;
+            if (waitpid(four[i], &status, round == 0 ? WUNTRACED : 0) != four[i]) return 21;
+            if (round == 0) {
+                if (!WIFSTOPPED(status)) return 22;
+                kill(four[i], SIGKILL);
+                if (waitpid(four[i], &status, 0) != four[i]) return 23;
+            }
+            if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) return 24;
+        }
+    }
     t_block(SIGUSR1);
     t_block(SIGUSR2);
     struct sigevent e = t_event(SIGUSR1, 1);
@@ -492,6 +520,47 @@ static int t_c_alarm(void) {
     return 0;
 }
 
+static int t_c_alarm_full_table(void) {
+    int fds[2];
+    if (pipe(fds)) return 1;
+    pid_t kids[6];
+    struct sigevent e = t_event(SIGUSR1, 1);
+    for (int i = 0; i < 6; i++) {
+        kids[i] = fork();
+        if (kids[i] < 0) return 2;
+        if (kids[i] == 0) {
+            timer_t t;
+            for (int n = 0; n < 32; n++)
+                if (timer_create(CLOCK_MONOTONIC, &e, &t)) _exit(10);
+            if (write(fds[1], "f", 1) != 1) _exit(11);
+            sleep(60);
+            _exit(0);
+        }
+    }
+    char c;
+    for (int i = 0; i < 6; i++)
+        if (read(fds[0], &c, 1) != 1) return 3;
+    int result = 0;
+    timer_t extra;
+    /* The table of 192 places is full ... */
+    if (timer_create(CLOCK_MONOTONIC, &e, &extra) != -1 || errno != EAGAIN) result = 4;
+    /* ... and the alarm of this process has a place of its own. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = t_plain;
+    sigemptyset(&sa.sa_mask);
+    if (!result && sigaction(SIGALRM, &sa, NULL)) result = 5;
+    t_got = 0;
+    if (!result) alarm(1);
+    for (int i = 0; !result && !t_got && i < 5; i++) sleep(1);
+    if (!result && t_got != 1) result = 6;
+    for (int i = 0; i < 6; i++) {
+        kill(kids[i], SIGKILL);
+        waitpid(kids[i], NULL, 0);
+    }
+    return result;
+}
+
 static int t_c_alarm_kills(void) {
     signal(SIGALRM, SIG_DFL);
     alarm(1);
@@ -683,6 +752,7 @@ static int timers_role(void) {
     t_child("eight timers due at once", t_c_burst, 0, 0);
     t_child("an interval below the least is raised", t_c_least_interval, 0, 0);
     t_child("alarm", t_c_alarm, 0, 0);
+    t_child("the alarm has a place when the table of timers is full", t_c_alarm_full_table, 0, 0);
     t_child("SIGALRM ends a process that does not catch it", t_c_alarm_kills, 0, SIGALRM);
     t_child("setitimer and getitimer", t_c_itimer, 0, 0);
     t_child("sigwaitinfo takes the alarm", t_c_sigwaitinfo_alarm, 0, 0);

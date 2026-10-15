@@ -11,3 +11,9 @@ The extractor reconciles NAME and indexed SYNOPSIS declarations with the [alphab
 An `exported-symbol` row has a linker-visible entry point. A `header-macro` row names a macro seen when compiling the listed header for AArch64. An `unresolved` row needs review for missing headers, preprocessing failures, inline functions, or implementation work. The command prints the header scan counts. Guest tests establish behavior, error handling, and service availability. The complete conformance gate will combine this inventory with os-test and Open POSIX results.
 
 This tooling does not complete stage 5j / issue #145. The `unistd.h` macros and `sysconf` agree with each other; the complete os-test/Open POSIX gate, the full conformance of the options (stage 5k), and synchronous faults delivered as signals remain separate work after the file-service stage.
+
+## Departures from POSIX.1-2024
+
+- **Real-time signals.** Issue 8 puts the real-time signals in the base. The layer has the signals 1 to 31 and refuses SIGRTMIN to SIGRTMAX (EINVAL), and the process service keeps one place for each signal: `sigqueue` answers EAGAIN while the signal waits, so at most 31 signals are queued ({SIGQUEUE_MAX} should be 32 at least) and two timers that send the same number share one place (the second counts as an overrun). `_POSIX_REALTIME_SIGNALS` is not defined and `sysconf(_SC_REALTIME_SIGNALS)` is -1; `sysconf(_SC_SIGQUEUE_MAX)` gives the 31 there are.
+- **Absolute times.** A CLOCK_REALTIME timer set with TIMER_ABSTIME turns its time into the monotonic scale when it is armed; a later `clock_settime` does not move it.
+- **Processor time.** There is none: `clock()` gives the time since the process began, ITIMER_VIRTUAL and ITIMER_PROF are EINVAL.

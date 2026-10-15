@@ -7,17 +7,26 @@
 //! (nanoseconds); the layer turns a calendar time into that scale when it
 //! arms a timer. One kernel timer serves the whole table: the service arms
 //! it at the earliest deadline (`earliest`) and, when it fires, takes at
-//! most EXPIRIES_PER_STEP expired timers a step (`next`, `expire`), so a
+//! most EXPIRY_BUDGET of expired timers a step (`next`, `expire`), so a
 //! step stays bounded however many are due. Every operation is a scan of
 //! the table (SLOTS places), constant in time and with no call of the
 //! kernel.
 
 /// The places of the table, for the timers of all processes.
 pub const SLOTS: usize = 192;
+/// The alarm of each record has a place of its own after the table, so that
+/// no number of timers takes it (`alarm` has no error to give).
+pub const ALARMS: usize = 256;
 /// The timers a process makes with `timer_create` (the alarm is one more).
 pub const PER_PROCESS: usize = 32;
-/// The most expirations a notification of the kernel's timer takes.
-pub const EXPIRIES_PER_STEP: usize = 4;
+/// What a notification of the kernel's timer may spend: an ordinary signal
+/// costs 1, a signal that stops or ends a process (SIGKILL, SIGSTOP, the
+/// job signals: a call of the kernel and a report to the parent) costs
+/// DEAR_COST. Four of the first took about 11,000 ticks, four of the second
+/// 24,000 (term B is 20,410); with the cost of 2 a step takes two of them at
+/// most and 16,197 ticks in the steps probe (the limit with a reserve is 18,369).
+pub const EXPIRY_BUDGET: usize = 4;
+pub const DEAR_COST: usize = 2;
 /// DELAYTIMER_MAX: the overrun count stops here.
 pub const DELAYTIMER_MAX: u32 = i32::MAX as u32;
 /// The least interval of a periodic timer, in nanoseconds: a timer that
@@ -72,7 +81,7 @@ const FREE: Slot = Slot {
 
 /// The table.
 pub struct Timers {
-    slots: [Slot; SLOTS],
+    slots: [Slot; SLOTS + ALARMS],
     /// The generation of each place, in the high bits of an id: an id of a
     /// timer that went names nothing even when its place is used again.
     generation: [u32; SLOTS],
@@ -104,7 +113,7 @@ impl Default for Timers {
 impl Timers {
     pub const fn new() -> Self {
         Self {
-            slots: [FREE; SLOTS],
+            slots: [FREE; SLOTS + ALARMS],
             generation: [0; SLOTS],
         }
     }
@@ -117,18 +126,33 @@ impl Timers {
     /// The place of the timer `id` of `owner`.
     fn find(&self, owner: u8, id: u32) -> Option<usize> {
         let slot = (id & 0xFF) as usize;
-        let s = self.slots.get(slot)?;
+        if slot >= SLOTS {
+            return None;
+        }
+        let s = &self.slots[slot];
         (s.used && !s.alarm && s.owner == owner && self.id(slot) == id).then_some(slot)
     }
 
     fn alarm_of(&self, owner: u8) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|s| s.used && s.alarm && s.owner == owner)
+        let slot = SLOTS + usize::from(owner);
+        self.slots[slot].used.then_some(slot)
     }
 
     fn take(&mut self, owner: u8, alarm: bool) -> Result<usize, Fail> {
-        let slot = self.slots.iter().position(|s| !s.used).ok_or(Fail::Again)?;
+        if alarm {
+            let slot = SLOTS + usize::from(owner);
+            self.slots[slot] = Slot {
+                used: true,
+                alarm,
+                owner,
+                ..FREE
+            };
+            return Ok(slot);
+        }
+        let slot = self.slots[..SLOTS]
+            .iter()
+            .position(|s| !s.used)
+            .ok_or(Fail::Again)?;
         // The generation counts 24 bits and skips 0, so that an id is never 0.
         let mut generation = (self.generation[slot] + 1) & 0x00FF_FFFF;
         if generation == 0 {
@@ -285,17 +309,45 @@ impl Timers {
     /// The place of the armed timer with the nearest deadline at or before
     /// `now`.
     pub fn next(&self, now: u64) -> Option<usize> {
-        let mut found: Option<usize> = None;
+        self.due(now)
+            .0
+            .first()
+            .copied()
+            .filter(|_| self.due(now).1 > 0)
+    }
+
+    /// The places of up to EXPIRY_BUDGET armed timers due at or before
+    /// `now`, the nearest deadline first, and how many: one pass over the
+    /// table. A timer's expiry changes no other, so the list stays good
+    /// through the step.
+    pub fn due(&self, now: u64) -> ([usize; EXPIRY_BUDGET], usize) {
+        let mut found = [0usize; EXPIRY_BUDGET];
+        let mut count = 0;
         for (i, s) in self.slots.iter().enumerate() {
-            if s.used
-                && s.armed
-                && s.deadline <= now
-                && found.is_none_or(|f| s.deadline < self.slots[f].deadline)
-            {
-                found = Some(i);
+            if !(s.used && s.armed && s.deadline <= now) {
+                continue;
             }
+            // Insert by deadline into the short list.
+            let mut at = count;
+            while at > 0 && self.slots[found[at - 1]].deadline > s.deadline {
+                at -= 1;
+            }
+            if at >= EXPIRY_BUDGET {
+                continue;
+            }
+            let end = count.min(EXPIRY_BUDGET - 1);
+            for k in (at..end).rev() {
+                found[k + 1] = found[k];
+            }
+            found[at] = i;
+            count = (count + 1).min(EXPIRY_BUDGET);
         }
-        found
+        (found, count)
+    }
+
+    /// The signal the timer in `slot` sends (0: none).
+    pub fn signal_of(&self, slot: usize) -> u8 {
+        self.slots[slot].signal
     }
 
     /// Takes the expirations of the due timer in `slot`: a periodic timer
@@ -343,9 +395,9 @@ impl Timers {
         .min(DELAYTIMER_MAX);
     }
 
-    /// The timers in use, for tests.
+    /// The places of the table in use (not the alarms), for tests.
     pub fn used(&self) -> usize {
-        self.slots.iter().filter(|s| s.used).count()
+        self.slots[..SLOTS].iter().filter(|s| s.used).count()
     }
 }
 
@@ -453,7 +505,14 @@ mod tests {
             owner += 1;
         }
         assert_eq!(t.create(owner, 12, 0, false), Err(Fail::Again));
-        assert_eq!(t.alarm(owner, Some(5), 0, 0), Err(Fail::Again));
+        // The alarm has its own place: a full table does not take it, and
+        // every record has one.
+        for process in 0..=255u8 {
+            assert_eq!(
+                t.alarm(process, Some(5), 0, 0).map(|s| s.remaining),
+                Ok(if process == 1 { 5 } else { 0 })
+            );
+        }
     }
 
     #[test]
@@ -504,5 +563,21 @@ mod tests {
         t.set(1, id, Some(5), 0, 0).unwrap();
         let slot = t.next(5).unwrap();
         assert_eq!(t.expire(slot, 5).value, u64::from(id));
+    }
+
+    #[test]
+    fn due_gives_the_nearest_four_in_order() {
+        let mut t = Timers::new();
+        for (i, at) in [90u64, 10, 70, 30, 50, 20, 80, 60].into_iter().enumerate() {
+            let id = t.create(1, 10, i as u64, false).unwrap();
+            t.set(1, id, Some(at), 0, 0).unwrap();
+        }
+        let (list, count) = t.due(75);
+        assert_eq!(count, EXPIRY_BUDGET);
+        let values: Vec<u64> = list.iter().map(|&s| t.slots[s].value).collect();
+        // Deadlines 10, 20, 30, 50 are the values 1, 5, 3, 4.
+        assert_eq!(values, [1, 5, 3, 4]);
+        assert_eq!(t.due(5).1, 0);
+        assert_eq!(t.due(15).1, 1);
     }
 }
