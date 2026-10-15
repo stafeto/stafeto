@@ -1102,6 +1102,7 @@ fn wait(
         if let Some(signal) = take() {
             break Ok(signal);
         }
+        probe_window(window::SIGWAIT);
         // As in a sleep: an entry between the timer and `receive` stays
         // pending and makes `receive` return at once.
         let guard = rt::upcall::defer_entries().expect("sigwait entry deferral");
@@ -1394,6 +1395,58 @@ pub(crate) fn parks() -> u64 {
         .map_or(0, |count| count.load(Ordering::Acquire))
 }
 
+/// Sites of the probes of a park inside a wait (`probe_window`).
+pub mod window {
+    pub const POLL: u32 = 1;
+    pub const FIFO: u32 = 2;
+    pub const FUTEX: u32 = 3;
+    pub const SIGWAIT: u32 = 4;
+}
+/// The site the calling thread's next wait stops at, 0 for none, and the
+/// thread (its block) the arming was for.
+static WINDOW_SITE: AtomicU32 = AtomicU32::new(0);
+static WINDOW_THREAD: AtomicUsize = AtomicUsize::new(0);
+static WINDOW_REACHED: AtomicU32 = AtomicU32::new(0);
+
+/// The probe of a park inside a wait: the calling thread's next wait at
+/// `site` stops after its last check, with entries open, until it has
+/// parked for a stop of another thread (1 s at most) and the stop ended.
+pub fn probe_window_arm(site: u32) {
+    WINDOW_REACHED.store(0, Ordering::SeqCst);
+    WINDOW_THREAD.store(own() as *const Block as usize, Ordering::SeqCst);
+    WINDOW_SITE.store(site, Ordering::SeqCst);
+    posix_sync::set_probe(futex_window);
+}
+
+/// Whether the armed wait stands at its site now (`probe_window`): the
+/// probe forks only after that, so that the park falls in the window.
+pub fn probe_window_reached() -> bool {
+    WINDOW_REACHED.load(Ordering::SeqCst) != 0
+}
+
+fn futex_window() {
+    probe_window(window::FUTEX);
+}
+
+/// Where a wait of `site` has made its last check and has not yet
+/// received: the armed thread waits here for its park.
+pub(crate) fn probe_window(site: u32) {
+    if WINDOW_SITE.load(Ordering::Relaxed) != site
+        || WINDOW_THREAD.load(Ordering::SeqCst) != own() as *const Block as usize
+        || WINDOW_SITE
+            .compare_exchange(site, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        return;
+    }
+    let before = parks();
+    WINDOW_REACHED.store(1, Ordering::SeqCst);
+    let end = rt::time::ticks_to_ns(rt::time::now()) + 5_000_000_000;
+    while parks() == before && !rt::time::reached(end) {
+        let _ = sys::yield_now();
+    }
+}
+
 /// The probe of a park with a request pending: the calling thread defers
 /// entries and waits for a stop of another thread, so that the stopper's
 /// request stays pending, then parks as `deliver_now` does.
@@ -1464,6 +1517,20 @@ fn park() {
     {
         count.fetch_add(1, Ordering::Release);
     }
+    // The same receives may have taken a notification that ends the wait
+    // the thread was in when the park began, or that the wait just
+    // checked for: a wake of a wait by address, a poll's readiness, the
+    // timer of a deadline. Whatever it was, the notification is gone and
+    // the wait would block for good, so the thread sends itself WAKE (and
+    // CANCEL when a request of cancellation stands): every wait on the
+    // channel looks at its state again after a notification, and a wake with
+    // nothing behind it costs one pass of the loop. The slot holds one
+    // bit per kind, so repeats do not pile up.
+    let mut bits = posix_sync::bit::WAKE;
+    if threads::cancel::requested() {
+        bits |= posix_sync::bit::CANCEL;
+    }
+    let _ = sys::notify(&channel, bits);
     if !was_masked {
         // SAFETY: the thread's entries were open when it came here, so
         // whatever it interrupts permits their return; with a deferral held

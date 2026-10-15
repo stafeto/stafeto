@@ -645,6 +645,7 @@ fn fifo_open(
         if arm.state.phase != NamedPhase::Waiting {
             continue;
         }
+        crate::signals::probe_window(crate::signals::window::FIFO);
         let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
         if crate::long::ending(&block.flags, true) {
             drop(guard);

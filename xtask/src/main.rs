@@ -629,6 +629,11 @@ const POSIX_MATH_PROGRAMS: [ImageProgram; 10] = {
     programs[5].3 = &["math-probe"];
     programs
 };
+const POSIX_PARK_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5].3 = &["park-probe"];
+    programs
+};
 const POSIX_FIFO_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[5].3 = &["fifo-probe"];
@@ -1269,6 +1274,7 @@ commands:
             over the Rust POSIX layer
   posix-resources verify account files, limits, groups and descriptor exec
   posix-math   verify scalar math, binary128 and thread floating-point state
+  posix-park verify that waits survive a park for the stop of a fork
   posix-fifo verify named FIFO creation, rendezvous, independent opens and inheritance
   posix-fifo-steps measure named FIFO service dispatches under icount
   posix-sync verify RAM synchronization, descriptor types and cancellation
@@ -1408,6 +1414,7 @@ fn main() {
         Some("posix-files-steps") => posix_files_run(true),
         Some("posix-data-steps") => posix_files_run_profile(true, true),
         Some("posix-math") => posix_math_probe(),
+        Some("posix-park") => posix_park_probe(),
         Some("posix-fifo") => posix_fifo_probe(),
         Some("posix-fifo-steps") => posix_fifo_run(true),
         Some("posix-spawn-churn") => posix_spawn_churn_probe(&qemu::VIRT),
@@ -3580,6 +3587,35 @@ fn posix_math_probe() -> Result<(), String> {
         "posix-math: rounding and exceptions ok",
         "posix-math: thread floating-point isolation ok",
         "posix-math: done failures 0",
+        "init: posix-procs ended: exit code 0, not restarted",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
+    Ok(())
+}
+
+fn posix_park_probe() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-posix-park.img", &POSIX_PARK_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    for marker in [
+        "posix-park: a park does not lose the end of poll",
+        "posix-park: a park does not lose the end of the open of a FIFO",
+        "posix-park: a park does not lose the end of a wait by address",
+        "posix-park: a park does not lose the end of a timed wait by address",
+        "posix-park: a park does not lose the end of sigwait",
+        "posix-park: a park does not lose the end of a cancelled sigwait",
+        "posix-park: done failures 0",
         "init: posix-procs ended: exit code 0, not restarted",
     ] {
         qemu::expect_marker(&outcome, marker)?;
@@ -5772,6 +5808,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
         job("posix-math", posix_math_probe),
+        job("posix-park", posix_park_probe),
         job("posix-fifo", posix_fifo_probe),
         job("posix-fifo steps", || posix_fifo_run(true)),
         job("posix-lifetimes", || posix_lifetimes_probe(&qemu::VIRT)),

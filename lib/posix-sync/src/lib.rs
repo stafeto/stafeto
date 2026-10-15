@@ -294,6 +294,23 @@ fn remove(held: &Held<'_>, block: &Block) {
     held.bucket.waiters.fetch_sub(1, Ordering::SeqCst);
 }
 
+static PROBE: AtomicUsize = AtomicUsize::new(0);
+
+/// The function a probe runs in every wait by address after the node is
+/// linked and before the wait receives (for the probe of a park there).
+pub fn set_probe(hook: fn()) {
+    PROBE.store(hook as usize, Ordering::Release);
+}
+
+fn probe() {
+    let hook = PROBE.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_probe` stores a value, a `fn()`.
+        let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(hook) };
+        hook();
+    }
+}
+
 /// How a wait ended without an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Woken {
@@ -348,6 +365,7 @@ pub fn futex_wait(
     if let Some(deadline) = deadline {
         let _ = sys::timer_set(&timer, deadline);
     }
+    probe();
     let outcome = loop {
         match sys::receive(&channel) {
             Ok(sys::Received::Notification {
