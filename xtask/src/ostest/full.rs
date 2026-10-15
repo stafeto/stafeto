@@ -11,6 +11,10 @@ const BATCH_TESTS: usize = 48;
 const BATCH_BYTES: usize = 8 * 1024 * 1024;
 const BATCH_ENTRIES: usize = 900;
 
+/// The tests of the census that pass on stafeto: the run fails when one of
+/// them does not.
+const FULL_PASSING: &str = "tests/os-test/basic-pass.txt";
+
 type CensusRow = (String, &'static str, &'static str, String);
 
 const ABORT_DIAGNOSTIC: &str = "[ERROR abort@src/header/stdlib/mod.rs:120] Abort\n";
@@ -299,6 +303,12 @@ pub fn run(jobs: usize) -> Result<(), String> {
         &rows,
         &tests.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
     )?;
+    let list = std::fs::read_to_string(crate::root().join(FULL_PASSING))
+        .map_err(|e| format!("{FULL_PASSING}: {e}"))?;
+    let (lost, new) = compare_full(&list, &rows);
+    for name in &new {
+        println!("os-test full {name} passes and is not in {FULL_PASSING}");
+    }
     let failures = failures.lock().unwrap_or_else(PoisonError::into_inner);
     println!(
         "os-test full basic: {} PASS, {} FAIL, {} UNSUPPORTED of {}, {:.3}s",
@@ -314,7 +324,38 @@ pub fn run(jobs: usize) -> Result<(), String> {
             failures.join("; ")
         ));
     }
+    if !lost.is_empty() {
+        return Err(format!(
+            "os-test full basic: {} of {FULL_PASSING} no longer pass: {}",
+            lost.len(),
+            lost.join(", ")
+        ));
+    }
     Ok(())
+}
+
+/// The names of `list` (one a line, `#` for a comment) whose row of the
+/// census is not PASS (or is missing), and the PASS rows that `list` lacks.
+fn compare_full(list: &str, rows: &[CensusRow]) -> (Vec<String>, Vec<String>) {
+    let listed: std::collections::BTreeSet<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let passing: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter(|row| row.1 == "PASS")
+        .map(|row| row.0.as_str())
+        .collect();
+    let lost = listed
+        .difference(&passing)
+        .map(|name| (*name).to_owned())
+        .collect();
+    let new = passing
+        .difference(&listed)
+        .map(|name| (*name).to_owned())
+        .collect();
+    (lost, new)
 }
 
 fn validate_rows(rows: &[CensusRow], expected: &[String]) -> Result<(), String> {
@@ -329,6 +370,35 @@ fn validate_rows(rows: &[CensusRow], expected: &[String]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(name: &str, result: &'static str) -> CensusRow {
+        (name.to_owned(), result, "RUNTIME", String::new())
+    }
+
+    #[test]
+    fn a_listed_test_that_does_not_pass_is_lost() {
+        let rows = [
+            row("basic/a/x", "PASS"),
+            row("basic/a/y", "FAIL"),
+            row("basic/a/z", "PASS"),
+        ];
+        let (lost, new) = compare_full("# c\nbasic/a/x\nbasic/a/y\nbasic/a/gone\n", &rows);
+        assert_eq!(lost, ["basic/a/gone", "basic/a/y"]);
+        assert_eq!(new, ["basic/a/z"]);
+        assert_eq!(
+            compare_full("basic/a/x\nbasic/a/z\n", &rows),
+            (vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn the_list_of_the_census_is_sorted_and_of_basic() {
+        let text = std::fs::read_to_string(crate::root().join(FULL_PASSING)).unwrap();
+        let names: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert!(names.len() > 1000);
+        assert!(names.iter().all(|name| name.starts_with("basic/")));
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+    }
 
     #[test]
     fn abort_diagnostic_requires_exact_case_phase_and_successful_parent() {

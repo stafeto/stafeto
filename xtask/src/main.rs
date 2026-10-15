@@ -7834,6 +7834,9 @@ fn ci(jobs: usize) -> Result<(), String> {
         ]))?;
     }
     test(jobs)?;
+    // The complete basic suite: every test of tests/os-test/basic-pass.txt
+    // still passes.
+    ostest::run_full_basic(jobs)?;
     let a = build(Variant::Normal)?;
     disasm::shipping(&a.elf, &llvm_tool("llvm-objdump")?)
 }
