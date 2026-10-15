@@ -7,13 +7,15 @@ use super::{Args, Values, caller, cause, dispatch, lookup, restart, run_portions
 use crate::arch::timer as clock;
 use crate::memory::{self, Memory};
 use crate::object::Object;
-use crate::process::{self, Change, Op};
+use crate::process::{self, Change};
 use crate::thread::{self, Long, Thread};
 use crate::{arch, cleanup, sched};
 use abi::{DMA_MEMORY_RIGHTS, Error, Handle, MEMORY_RIGHTS, Rights};
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
-use kcore::args::{MemoryKind, access_arg, memory_kind_arg, memory_size_arg, range_arg};
+use kcore::args::{
+    MemoryKind, access_arg, memory_kind_arg, memory_size_arg, protect_access_arg, range_arg,
+};
 use kcore::maps::Mapping;
 
 /// The next entry of the long call `long` of `thread` (spec 7.7), which
@@ -203,25 +205,24 @@ pub(super) fn mem_unmap(thread: NonNull<Thread>, a: &Args) -> Result<Change, Err
 }
 
 /// mem_protect(x0 process with MANAGE, x1 address, x2 length, x3 access):
-/// the pages of the mapping of the process that is exactly that range get
-/// access R, RW or RX (spec 7.4); only x0 returns. The checks in the order
+/// the pages of that range, inside one mapping of the process, get access
+/// None, R, RW or RX (spec 7.4); only x0 returns. The checks in the order
 /// of spec 11: the range as mem_unmap takes it and the access
 /// (INVALID_ARGS); x0 (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without
-/// MANAGE); the process lives (BAD_STATE); a mapping is that range
-/// (INVALID_ARGS), no long call works on it (BAD_STATE), and the access
-/// needs no right the mapping was not made with (ACCESS_DENIED). Then the
-/// portions.
+/// MANAGE); the process lives (BAD_STATE); one mapping holds the whole
+/// range (INVALID_ARGS), no long call works on it (BAD_STATE), the access
+/// needs no right the mapping was not made with (ACCESS_DENIED), and the
+/// table has the places for the edges the range leaves, each a new entry
+/// (LIMIT_REACHED). Then the first entry cuts the mapping and the portions
+/// change the range.
 pub(super) fn mem_protect(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
     let pages = range_arg(a[1], a[2])?;
-    let access = access_arg(a[3])?;
+    let access = protect_access_arg(a[3])?;
     let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
     process::check_alive(target)?;
-    let (index, rights) = process::find_mapping(target, a[1], pages)?;
-    if !rights.contains(access.rights()) {
-        return Err(Error::AccessDenied);
-    }
+    let on = process::begin_protect(target, a[1], pages, access)?;
     process::retain(target);
-    Ok(process::begin_change(target, index, Op::Protect { access }))
+    Ok(on)
 }
 
 /// The first entry of mem_map, mem_unmap or mem_protect, whose checks and

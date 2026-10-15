@@ -68,8 +68,8 @@ pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
-    Change, Op, abandon_change, add_mapping, begin_change, begin_unmap, check_free, device_windows,
-    find_mapping, finish_change, in_mapping, map_whole, step_change,
+    Change, abandon_change, add_mapping, begin_protect, begin_unmap, check_free, device_windows,
+    finish_change, in_mapping, map_whole, step_change,
 };
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;

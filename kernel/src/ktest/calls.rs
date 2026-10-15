@@ -4231,6 +4231,114 @@ pub fn unmap_of_a_range_leaves_the_edges(_: &Boot) -> Result<(), &'static str> {
     })
 }
 
+/// mem_protect of a range inside a mapping, with access None (spec 7.4):
+/// 6 pages RW, each with its pattern; the 2 in the middle go to None. They
+/// stay in the tables, which the kernel reads and EL0 does not (neither
+/// reads nor writes); the 2 pages on either side are RW still, with their
+/// patterns and the right offsets in the object; the three entries are
+/// idle and the object counts three mappings. The old range of all 6 pages
+/// spans three entries and fails with INVALID_ARGS; the middle goes to RW
+/// again and shows its patterns to EL0, and one page of it to R: its
+/// writes fail.
+pub fn protect_of_a_range_gives_none_to_the_middle(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let (h, m) = make_memory(c, 6)?;
+        for i in 0..6 {
+            let pa = memory::frame(m, i);
+            for j in 0..PAGE_SIZE / 8 {
+                // SAFETY: the frame is the object's, which the test holds,
+                // and the linear map reaches it.
+                unsafe {
+                    ((LINEAR_BASE + (pa + j * 8) as usize) as *mut u64).write(0xB0 + i as u64)
+                };
+            }
+        }
+        map_whole(c, own, h, 6, USER_VA, Access::ReadWrite)?;
+        c.close(h)?;
+        // SAFETY: the process is the test's, and nothing runs it.
+        unsafe { (*c.process.as_ptr()).activate() };
+        let at = |page: usize| USER_VA + page * PAGE;
+        check(
+            read_user(at(2)) == 0xB2 && read_user(at(3)) == 0xB3,
+            "the pages to protect miss their contents",
+        )?;
+        let n = Call::MemProtect.number();
+        let protect = |va: usize, pages: u64, access: Access| {
+            let got = c.call(n, &[own.0, va as u64, pages * PAGE_SIZE, access.raw()]);
+            got[0]
+        };
+        check(
+            protect(at(2), 2, Access::None) == 0,
+            "None for the middle failed",
+        )?;
+        let el0 = |page: usize| {
+            (
+                translates(registers::at_s1e0r(at(page))),
+                translates(registers::at_s1e0w(at(page))),
+            )
+        };
+        check(
+            [2, 3].iter().all(|&i| {
+                el0(i) == (false, false)
+                    && mapped(c.process, at(i))
+                    && translates(registers::at_s1e1r(at(i)))
+            }),
+            "a page without access still reaches EL0, or left the tables",
+        )?;
+        check(
+            [0, 1, 4, 5].iter().all(|&i| el0(i) == (true, true)),
+            "an edge lost its access",
+        )?;
+        check(
+            [(0, 0xB0), (1, 0xB1), (4, 0xB4), (5, 0xB5)]
+                .iter()
+                .all(|&(i, pattern)| read_user(at(i)) == pattern),
+            "an edge does not show its pages of the object",
+        )?;
+        let idle = |va: usize, pages: u64, offset: u32| {
+            process::mapping(c.process, va, pages)
+                .is_some_and(|k| !k.is_busy() && k.object == m && k.offset == offset)
+        };
+        check(
+            idle(at(0), 2, 0) && idle(at(2), 2, 2) && idle(at(4), 2, 4),
+            "the cut did not leave three idle entries with their offsets",
+        )?;
+        check(
+            memory::info(m).mappings == 3,
+            "the object does not count a mapping for each entry",
+        )?;
+        check(
+            protect(at(0), 6, Access::Read) == Error::InvalidArgs.code(),
+            "a range over three mappings was taken",
+        )?;
+        check(
+            protect(at(2), 2, Access::ReadWrite) == 0 && el0(2) == (true, true),
+            "RW for the middle failed",
+        )?;
+        check(
+            read_user(at(2)) == 0xB2 && read_user(at(3)) == 0xB3,
+            "the middle lost its contents across None",
+        )?;
+        check(
+            protect(at(3), 1, Access::Read) == 0
+                && el0(3) == (true, false)
+                && el0(2) == (true, true),
+            "R for one page of the middle failed",
+        )?;
+        let entries = process::mappings(c.process);
+        check(
+            protect(at(0), 2, Access::None) == 0 && process::mappings(c.process) == entries,
+            "None for a whole entry cut it",
+        )?;
+        c.close(own)?;
+        Ok(())
+    })?;
+    cleanup::drain();
+    check(memory::in_use() == objects, "the object stayed")
+}
+
 /// A cut mapping obeys the busy mark and the table's room (spec 7.4, 7.7):
 /// an entry that begins a mem_unmap of the middle of a mapping of 8 pages
 /// leaves 3 entries, the middle busy, and a second begin over the middle or
@@ -4267,6 +4375,10 @@ fn cut_busy(c: &Caller) -> Result<(), &'static str> {
         check(
             process::mappings(t) == 3,
             "a refused unmap changed the table",
+        )?;
+        check(
+            process::begin_protect(t, at(2) as u64, 4, Access::None).err() == Some(Error::BadState),
+            "a protect over a busy middle did not fail with BAD_STATE",
         )?;
         // SAFETY: the call stops with nothing done; nothing uses it again.
         unsafe { process::abandon_change(on, CAUSE) };
@@ -4306,6 +4418,13 @@ fn cut_busy(c: &Caller) -> Result<(), &'static str> {
                 && memory::info(m).mappings == before
                 && process::mapping(t, at(2), 4).is_some_and(|k| !k.is_busy()),
             "a refused cut changed the table or the references",
+        )?;
+        check(
+            process::begin_protect(t, at(3) as u64, 2, Access::None).err()
+                == Some(Error::LimitReached)
+                && process::mappings(t) == abi::MAX_MAPPINGS as usize - 1
+                && memory::info(m).mappings == before,
+            "a protect cut without places did not fail with LIMIT_REACHED alone",
         )?;
         let on =
             process::begin_unmap(t, at(2) as u64, 2).map_err(|_| "the cut at an end failed")?;
@@ -4377,6 +4496,86 @@ fn abandoned_range(c: &Caller) -> Result<(), &'static str> {
     });
     release_target(t);
     result
+}
+
+/// What the release of a mapping's reference saw of the TLB batches
+/// (testpoint::tables_stored, pages_invalidated, mapping_released): whether
+/// the last event was the `dsb ish` that completed the TLBIs, and how many
+/// releases came with it and without it, since the test armed the watch.
+struct ReleaseWatch {
+    on: bool,
+    barrier_done: bool,
+    after_barrier: u32,
+    before_barrier: u32,
+}
+
+static RELEASES: Lock<ReleaseWatch> = Lock::new(ReleaseWatch {
+    on: false,
+    barrier_done: false,
+    after_barrier: 0,
+    before_barrier: 0,
+});
+
+pub fn tables_stored() {
+    RELEASES.lock().barrier_done = false;
+}
+
+pub fn pages_invalidated() {
+    RELEASES.lock().barrier_done = true;
+}
+
+pub fn mapping_released() {
+    let mut w = RELEASES.lock();
+    if w.on {
+        if w.barrier_done {
+            w.after_barrier += 1;
+        } else {
+            w.before_barrier += 1;
+        }
+    }
+}
+
+/// The reference of the entry mem_unmap takes out goes only after the
+/// `dsb ish` of the last portion (spec 7.7): a frame may go back to the
+/// allocator once the object's last reference goes, and a TLB entry must
+/// not outlive it. A mapping of 4 pages of an object the caller closed is
+/// unmapped whole in one portion, and its middle 2 pages in another, with
+/// the caller's process running on the tables: the release comes once for
+/// each call, each time with the barrier of the final TLBIs the last event.
+/// Moving the release before the stores or the barrier turns it up in
+/// `before_barrier`.
+pub fn mapping_reference_goes_after_the_barrier(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let (h, _) = make_memory(c, 4)?;
+        map_whole(c, own, h, 4, USER_VA, Access::ReadWrite)?;
+        c.close(h)?;
+        // SAFETY: the process is the test's, and nothing runs it.
+        unsafe { (*c.process.as_ptr()).activate() };
+        let pages_read = (0..4).all(|i| read_user(USER_VA + i * PAGE) == 0);
+        check(pages_read, "the pages do not read")?;
+        *RELEASES.lock() = ReleaseWatch {
+            on: true,
+            barrier_done: false,
+            after_barrier: 0,
+            before_barrier: 0,
+        };
+        let middle = unmap_whole(c, own, 2, USER_VA + PAGE);
+        let rest = middle
+            .and_then(|()| unmap_whole(c, own, 1, USER_VA))
+            .and_then(|()| unmap_whole(c, own, 1, USER_VA + 3 * PAGE));
+        let (after, before) = {
+            let mut w = RELEASES.lock();
+            w.on = false;
+            (w.after_barrier, w.before_barrier)
+        };
+        c.close(own)?;
+        rest?;
+        check(
+            (after, before) == (3, 0),
+            "a mapping's reference went before the barrier of its last TLBIs",
+        )
+    })
 }
 
 /// A mem_protect whose caller's process ends between two portions leaves
@@ -6371,16 +6570,28 @@ fn changes_ticks(c: &Caller, ticks: &mut [u64; 6]) -> Result<(), &'static str> {
         ticks[3] = change(Call::MemProtect, va, Access::Read.raw())?;
         ticks[4] = change(Call::MemProtect, va, Access::ReadExec.raw())?;
         ticks[2] = change(Call::MemUnmap, va, 0)?;
-        // The cut: the table holds MAX_MAPPINGS - 2 mappings, and mem_unmap
-        // of 32 pages in the middle of the mapping of 64 pages leaves
-        // MAX_MAPPINGS, the two edges new. Its first entry cuts and takes
-        // the first portion of the range; the longest of its entries
-        // counts for the row.
+        // The cut, in the worst case for the search of free places: the
+        // last two places of the table are the free ones (the crowd's
+        // fillers 125 and 126), so that the table of MAX_MAPPINGS - 2
+        // mappings and the one of 64 pages is cut to MAX_MAPPINGS. The
+        // middle 32 pages of the mapping go to R, then the pieces unmap, the
+        // mapping is made whole again and its middle 32 pages unmap. The
+        // first entry cuts and takes the first portion of the range; the
+        // longest of the entries counts for the row.
         let filler = |i: usize| 4 * REGION + (1 << 20) + i * PAGE;
+        let middle = (va + 16 * PAGE) as u64;
         map_whole(c, th, h, 64, va, Access::ReadWrite)?;
-        unmap_whole(c, th, 1, filler(0))?;
-        unmap_whole(c, th, 1, filler(1))?;
-        let args = [th.0, (va + 16 * PAGE) as u64, 32 * PAGE_SIZE];
+        unmap_whole(c, th, 1, filler(125))?;
+        unmap_whole(c, th, 1, filler(126))?;
+        let args = [th.0, middle, 32 * PAGE_SIZE, Access::Read.raw()];
+        let (first, rest, _) = timed_entries(c, Call::MemProtect.number(), &args)?;
+        kprintln!("protect cut ticks: first={first} rest={rest}");
+        ticks[3] = ticks[3].max(first).max(rest);
+        unmap_whole(c, th, 16, va)?;
+        unmap_whole(c, th, 32, va + 16 * PAGE)?;
+        unmap_whole(c, th, 16, va + 48 * PAGE)?;
+        map_whole(c, th, h, 64, va, Access::ReadWrite)?;
+        let args = [th.0, middle, 32 * PAGE_SIZE];
         let (first, rest, _) = timed_entries(c, Call::MemUnmap.number(), &args)?;
         kprintln!("unmap cut ticks: first={first} rest={rest}");
         ticks[2] = ticks[2].max(first).max(rest);

@@ -94,10 +94,20 @@ impl Attrs {
         ..Attrs::USER_RODATA
     };
 
+    /// A program's pages with no access: only mem_protect gives them (spec
+    /// 7.4). The kernel alone reads them; EL0 faults on any access.
+    pub const USER_NONE: Attrs = Attrs {
+        user: false,
+        user_exec: false,
+        ..Attrs::USER_TEXT
+    };
+
     /// The attributes of a program's pages with `access` (spec 7.4, [G9]):
-    /// R as USER_RODATA, RW as USER_DATA, RX as USER_TEXT.
+    /// None as USER_NONE, R as USER_RODATA, RW as USER_DATA, RX as
+    /// USER_TEXT.
     pub const fn user(access: Access) -> Attrs {
         match access {
+            Access::None => Attrs::USER_NONE,
             Access::Read => Attrs::USER_RODATA,
             Access::ReadWrite => Attrs::USER_DATA,
             Access::ReadExec => Attrs::USER_TEXT,
@@ -122,9 +132,15 @@ impl Attrs {
             memory: Memory::Device,
             write: matches!(access, Access::ReadWrite),
             kernel_exec: false,
-            user: true,
+            user: !matches!(access, Access::None),
             user_exec: false,
         }
+    }
+
+    /// Whether these are a program's pages with no access (`USER_NONE`,
+    /// of any memory type): not for EL0, read-only, never executable.
+    pub fn is_user_none(&self) -> bool {
+        !self.user && !self.write && !self.kernel_exec && !self.user_exec
     }
 
     /// W^X, no executable device memory, EL0 execution only on EL0 pages,
@@ -420,7 +436,7 @@ impl PageTable {
         if !attrs.is_valid() {
             return Err(MapError::WriteAndExecute);
         }
-        if !attrs.user {
+        if !attrs.user && !attrs.is_user_none() {
             return Err(MapError::NotUser);
         }
         if !va.is_multiple_of(PAGE_SIZE) {
@@ -1173,6 +1189,50 @@ mod tests {
             t.allocated(),
             tables_before,
             "a change of access took a table"
+        );
+    }
+
+    /// Access None (spec 7.4) keeps the page in the tables with no EL0
+    /// access: AP has no EL0 bit, UXN and PXN are set, nG stays so that the
+    /// entry still belongs to one ASID, and a change to RW and back rewrites
+    /// only those bits. The attributes of an uncached object and of a
+    /// device window follow, in their memory type.
+    #[test]
+    fn access_none_keeps_the_page_and_drops_el0() {
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        let (va, pa) = (0x40_0000, 0x4567_8000);
+        pt.map_user(&mut t, va, pa, PAGE_SIZE, Attrs::USER_DATA)
+            .unwrap();
+        for _ in 0..2 {
+            pt.protect_page(&mut t, va, Attrs::user(Access::None))
+                .unwrap();
+            let (frame, d) = pt.translate(&t, va).unwrap();
+            assert_eq!(frame, pa);
+            assert_eq!(
+                d & (AP_EL0 | NG | PXN | UXN | AP_READ_ONLY),
+                NG | PXN | UXN | AP_READ_ONLY
+            );
+            // nG stays from the mapping: the new attributes carry none.
+            assert_eq!(d, page_descriptor(pa, Attrs::USER_NONE) | NG);
+            pt.protect_page(&mut t, va, Attrs::USER_DATA).unwrap();
+            let d = pt.translate(&t, va).unwrap().1;
+            assert_eq!(d, page_descriptor(pa, Attrs::USER_DATA));
+        }
+        // The kernel's own attributes stay refused.
+        assert_eq!(
+            pt.protect_page(&mut t, va, Attrs::KERNEL_DATA),
+            Err(MapError::NotUser)
+        );
+        for attrs in [
+            Attrs::user_uncached(Access::None),
+            Attrs::user_device(Access::None),
+        ] {
+            assert!(attrs.is_valid() && attrs.is_user_none());
+            assert!(!attrs.user && !attrs.write && !attrs.user_exec);
+        }
+        assert!(
+            !Attrs::USER_DATA.is_user_none() && !Attrs::user_device(Access::Read).is_user_none()
         );
     }
 

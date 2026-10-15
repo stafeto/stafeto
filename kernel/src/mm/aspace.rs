@@ -174,7 +174,8 @@ impl Mmu for Cpu {
     }
 
     fn tables_written(&mut self) {
-        mmu::tables_written()
+        mmu::tables_written();
+        crate::testpoint::tables_stored();
     }
 
     fn invalidate_user_page(&mut self, operand: u64) {
@@ -182,7 +183,8 @@ impl Mmu for Cpu {
     }
 
     fn user_pages_invalidated(&mut self) {
-        mmu::user_pages_invalidated()
+        mmu::user_pages_invalidated();
+        crate::testpoint::pages_invalidated();
     }
 }
 

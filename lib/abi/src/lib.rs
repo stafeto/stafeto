@@ -189,13 +189,16 @@ pub const MEM_UNCACHED: u64 = 1 << 1;
 /// block of the frame allocator.
 pub const MAX_CONTIGUOUS_PAGES: u64 = 1 << 10;
 
-/// What a mapping lets a program do with its pages (spec 7.4): read, read
-/// and write, or read and execute. A register holds the sum of the bits
-/// R = 1, W = 2 and X = 4; write and execute together (W^X) and every
-/// other value are refused with INVALID_ARGS.
+/// What a mapping lets a program do with its pages (spec 7.4): nothing,
+/// read, read and write, or read and execute. A register holds the sum of
+/// the bits R = 1, W = 2 and X = 4; write and execute together (W^X) and
+/// every other value are refused with INVALID_ARGS. None (0) is for
+/// mem_protect alone: the pages stay in the mapping and EL0 faults on any
+/// access; mem_map refuses it.
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
+    None = 0,
     Read = 1,
     ReadWrite = 3,
     ReadExec = 5,
@@ -205,6 +208,7 @@ impl Access {
     /// The access a register holds; None for any other value.
     pub const fn from_raw(raw: u64) -> Option<Access> {
         match raw {
+            0 => Some(Access::None),
             1 => Some(Access::Read),
             3 => Some(Access::ReadWrite),
             5 => Some(Access::ReadExec),
@@ -221,6 +225,7 @@ impl Access {
     /// needs (spec 5.2): MAP_READ, with MAP_WRITE for W and MAP_EXEC for X.
     pub const fn rights(self) -> Rights {
         match self {
+            Access::None => Rights::NONE,
             Access::Read => Rights::MAP_READ,
             Access::ReadWrite => Rights::MAP_READ.union(Rights::MAP_WRITE),
             Access::ReadExec => Rights::MAP_READ.union(Rights::MAP_EXEC),
@@ -1662,6 +1667,7 @@ mod tests {
     fn mappings_have_a_fixed_bound_and_three_accesses() {
         assert_eq!(MAX_MAPPINGS, 128);
         let accesses = [
+            (Access::None, 0, Rights::NONE),
             (Access::Read, 1, Rights::MAP_READ),
             (Access::ReadWrite, 3, Rights::MAP_READ | Rights::MAP_WRITE),
             (Access::ReadExec, 5, Rights::MAP_READ | Rights::MAP_EXEC),
@@ -1670,7 +1676,7 @@ mod tests {
             assert_eq!((access.raw(), access.rights()), (raw, rights));
             assert_eq!(Access::from_raw(raw), Some(access));
         }
-        for raw in [0, 2, 4, 6, 7, 8, 1 << 32 | 1, u64::MAX] {
+        for raw in [2, 4, 6, 7, 8, 1 << 32 | 1, u64::MAX] {
             assert_eq!(Access::from_raw(raw), None, "{raw:#x}");
         }
     }
