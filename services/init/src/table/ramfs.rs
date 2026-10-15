@@ -148,16 +148,18 @@ const DIALOG_QUOTA: u64 = 512 * PAGE;
 
 /// The quota of the launcher of the dialog with the big BusyBox, which the
 /// shell and its children get too. The image of the utilities feature is
-/// 2.9 MB; the dialog needs 730 pages of it at most (730 passes, 725 does
-/// not, bisected on ash-dialog), and 812 pages leave 10.1%.
-const BUSYBOX_DIALOG_QUOTA: u64 = 812 * PAGE;
+/// 3.2 MB, with the ready-made utilities (tools/build-ready-utils.py) in it;
+/// the dialog needs 803 pages of it at most (803 passes, 800 does not,
+/// bisected on ash-dialog), and 884 pages leave 10.1%.
+const BUSYBOX_DIALOG_QUOTA: u64 = 884 * PAGE;
 
 /// What the process service adds to its own quota for the dialog: the
 /// children of the shell, the failed attempts of a search through PATH
 /// (forty searches with three misses each run in the dialog) and the reserve
-/// of the loaders. The dialog needs 4 720 pages at most (4 720 passes, 4 705
-/// does not, bisected on ash-dialog); 5 246 pages leave 10.0%.
-const BUSYBOX_DIALOG_POOL: u64 = 5246 * PAGE;
+/// of the loaders. The dialog needs 5 145 pages at most with the quota above
+/// (5 145 passes, 5 138 does not, bisected on ash-dialog); 5 660 pages leave
+/// 10.0%.
+const BUSYBOX_DIALOG_POOL: u64 = 5660 * PAGE;
 
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the process,

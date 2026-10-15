@@ -38,10 +38,13 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # exit, the default PATH of execvp, mntent, wait3, sysinfo; tagged pin-1187dd96.
 # F10 review: fflush(NULL) holds the list of open streams for its walk and
 # fclose takes the list after it lets its stream go; tagged pin-95d97c68.
+# F10b ready-made utilities: ioctl takes a variable argument list as on Linux
+# and reads an int argument from the low 32 bits,
+# paths.h has _PATH_DEFPATH and _PATH_STDPATH; tagged pin-6e21bd05.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "95d97c68db84ffcf8b7f505d7d104eace5168100"
+COMMIT = "6e21bd05d4c672551f512400faa824e10ea70a06"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
