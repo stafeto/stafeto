@@ -366,7 +366,7 @@ struct Seg {
     era: u32,
     perm: Perm,
     size: u64,
-    serial: u32,
+    serial: u64,
     cpid: u32,
     lpid: u32,
     nattch: u16,
@@ -455,10 +455,9 @@ pub struct Ipc {
     /// The senders that wait for the pool of messages.
     pool: End,
     /// The serial and the creator's uid of freed segments whose file is left.
-    reap: [(u32, u32); REAP_MAX],
+    reap: [(u64, u32); REAP_MAX],
     reaped: u8,
     dying: u16,
-    serial: u32,
 }
 
 const UNDO_FREE: Undo = Undo {
@@ -517,7 +516,6 @@ impl Ipc {
             reap: [(0, 0); REAP_MAX],
             reaped: 0,
             dying: 0,
-            serial: 0,
         }
     }
 
@@ -586,7 +584,7 @@ impl Ipc {
     }
 
     /// The freed segment `serial`, of the creator `uid`, has its file left.
-    fn reap_push(&mut self, serial: u32, uid: u32) {
+    fn reap_push(&mut self, serial: u64, uid: u32) {
         if usize::from(self.reaped) == REAP_MAX {
             self.reap.copy_within(1.., 0);
             self.reaped -= 1;
@@ -608,7 +606,7 @@ impl Ipc {
         let (serial, _) = self.reap[at];
         self.reap.copy_within(at + 1..n, at);
         self.reaped -= 1;
-        u64::from(serial)
+        serial
     }
 
     /// Puts a message at the end of the list of queue `q`, or before the
@@ -1575,7 +1573,7 @@ impl Ipc {
                 return Err(fail(EACCES));
             }
             out.word(id_of(g, self.segs[g].era));
-            out.word(u64::from(self.segs[g].serial));
+            out.word(self.segs[g].serial);
             out.word(0);
             let reap = self.reap_take(c);
             out.word(reap);
@@ -1596,22 +1594,30 @@ impl Ipc {
         {
             return Err(fail(ENOSPC));
         }
+        // The name of the file of the pages is the creator's random number:
+        // nobody else knows it before the file is there.
+        let nonce = w[3];
+        if nonce == 0 {
+            return Err(fail(EINVAL));
+        }
+        if self.segs.iter().any(|g| g.live && g.serial == nonce) {
+            return Err(fail(EEXIST));
+        }
         let g = self.segs.iter().position(|g| !g.live).ok_or(fail(ENOSPC))?;
         let era = self.segs[g].era.wrapping_add(1);
-        self.serial = self.serial.wrapping_add(1).max(1);
         self.segs[g] = Seg {
             live: true,
             era,
             perm: Perm::new(key, c, flags),
             size,
-            serial: self.serial,
+            serial: nonce,
             cpid: c.pid,
             ctime: c.now,
             root,
             ..Seg::FREE
         };
         out.word(id_of(g, era));
-        out.word(u64::from(self.serial));
+        out.word(nonce);
         out.word(1);
         let reap = self.reap_take(c);
         out.word(reap);
@@ -1633,8 +1639,10 @@ impl Ipc {
         seg.nattch += 1;
         seg.atime = c.now;
         seg.lpid = c.pid;
-        out.word(u64::from(seg.serial));
+        out.word(seg.serial);
         out.word(seg.size);
+        out.word(u64::from(seg.perm.uid));
+        out.word(u64::from(seg.perm.cuid));
         let reap = self.reap_take(c);
         out.word(reap);
         Ok(())
@@ -1653,7 +1661,7 @@ impl Ipc {
         if seg.removed && seg.nattch == 0 {
             let (serial, creator) = (seg.serial, seg.perm.cuid);
             out.word(1);
-            out.word(u64::from(serial));
+            out.word(serial);
             *seg = Seg::FREE;
             seg.era = era;
             // The caller removes the file; another user's, left to its creator.
@@ -1662,7 +1670,7 @@ impl Ipc {
             }
         } else {
             out.word(0);
-            out.word(u64::from(seg.serial));
+            out.word(seg.serial);
         }
         let reap = self.reap_take(c);
         out.word(reap);
@@ -1686,6 +1694,7 @@ impl Ipc {
                     u64::from(seg.cpid),
                     u64::from(seg.lpid),
                     u64::from(seg.nattch),
+                    seg.serial,
                 ] {
                     out.word(v);
                 }
@@ -1703,7 +1712,7 @@ impl Ipc {
                 seg.perm.mode = (w[7] & 0o777) as u16;
                 seg.ctime = c.now;
                 out.word(0);
-                out.word(u64::from(seg.serial));
+                out.word(seg.serial);
                 let reap = self.reap_take(c);
                 out.word(reap);
                 Ok(())
@@ -1718,7 +1727,7 @@ impl Ipc {
                     *seg = Seg::FREE;
                     seg.era = era;
                     out.word(1);
-                    out.word(u64::from(serial));
+                    out.word(serial);
                     if c.uid != creator && c.uid != 0 {
                         self.reap_push(serial, creator);
                     }
@@ -1727,7 +1736,7 @@ impl Ipc {
                     seg.removed = true;
                     seg.perm.key = 0;
                     out.word(0);
-                    out.word(u64::from(seg.serial));
+                    out.word(seg.serial);
                 }
                 let reap = self.reap_take(c);
                 out.word(reap);
@@ -2101,8 +2110,8 @@ impl Pipes {
                 Ok(Flow::Done)
             }
             op::SHM_GET => {
-                need(3 + Cred::WORDS)?;
-                let c = cred(3)?;
+                need(4 + Cred::WORDS)?;
+                let c = cred(4)?;
                 self.ipc.shm_get(root, w, &c, out)?;
                 Ok(Flow::Done)
             }
@@ -2401,6 +2410,12 @@ mod tests {
         pid: 7,
     };
     const NOW: u64 = 50;
+
+    /// A name for the file of a new segment, as the library draws one.
+    fn nonce() -> u64 {
+        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x5eed_0000);
+        NEXT.fetch_add(0x9e37, core::sync::atomic::Ordering::Relaxed)
+    }
 
     fn pipes() -> Box<Pipes> {
         Box::new(Pipes::new())
@@ -3066,7 +3081,7 @@ mod tests {
     #[test]
     fn a_segment_is_counted_attached_and_goes_with_its_last_detach() {
         let (mut p, mut r) = (pipes(), Run::new());
-        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
         let (id, serial) = (out.words[0], out.words[1]);
         let st = r.ok(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_STAT]), b"");
         assert_eq!(
@@ -3102,21 +3117,21 @@ mod tests {
             .ok(
                 &mut p,
                 op::SHM_GET,
-                &with_cred(&[9, 4096, IPC_CREAT | 0o600]),
+                &with_cred(&[9, 4096, IPC_CREAT | 0o600, nonce()]),
                 b"",
             )
             .words[0];
         assert_eq!(
-            r.ok(&mut p, op::SHM_GET, &with_cred(&[9, 100, 0o600]), b"")
+            r.ok(&mut p, op::SHM_GET, &with_cred(&[9, 100, 0o600, nonce()]), b"")
                 .words[0],
             id
         );
         assert_eq!(
-            r.err(&mut p, op::SHM_GET, &with_cred(&[9, 8192, 0o600]), b""),
+            r.err(&mut p, op::SHM_GET, &with_cred(&[9, 8192, 0o600, nonce()]), b""),
             22
         );
         assert_eq!(
-            r.err(&mut p, op::SHM_GET, &with_cred(&[0, 0, 0o600]), b""),
+            r.err(&mut p, op::SHM_GET, &with_cred(&[0, 0, 0o600, nonce()]), b""),
             22
         );
         let (flow, _) = r.call(&mut p, 77, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
@@ -3296,7 +3311,7 @@ mod tests {
     #[test]
     fn a_child_holds_what_its_parent_holds_and_exec_lets_it_go() {
         let (mut p, mut r) = (pipes(), Run::new());
-        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
         let id = out.words[0];
         let (flow, _) = r.call(&mut p, 10, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
         assert_eq!(flow, Ok(Flow::Done));
@@ -3333,7 +3348,7 @@ mod tests {
     fn a_child_is_refused_when_the_holds_have_no_room() {
         let (mut p, mut r) = (pipes(), Run::new());
         let id = r
-            .ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"")
+            .ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"")
             .words[0];
         for label in 100..100 + HOLD_MAX as u64 {
             let (flow, _) = r.call(&mut p, label, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
@@ -3345,7 +3360,7 @@ mod tests {
     #[test]
     fn a_freed_segment_names_its_file_to_its_creator_until_it_is_removed() {
         let (mut p, mut r) = (pipes(), Run::new());
-        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
         let (id, serial) = (out.words[0], out.words[1]);
         let (flow, _) = r.call(&mut p, 77, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
         assert_eq!(flow, Ok(Flow::Done));
@@ -3361,12 +3376,12 @@ mod tests {
         while p.ipc_step(&mut w) {}
         // Another user is not told of the file; its creator is, once.
         r.who.uid = 2000;
-        let other = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        let other = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
         assert_eq!(other.words[3], 0);
         r.who = WHO;
-        let again = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        let again = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
         assert_eq!(again.words[3], serial);
-        let third = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"");
+        let third = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
         assert_eq!(third.words[3], 0);
     }
 

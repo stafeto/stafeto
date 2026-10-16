@@ -843,6 +843,111 @@ static int shm_pages(void) {
     return 0;
 }
 
+
+static unsigned long long name_number(const char *path) {
+    const char *dot = strstr(path, ".sysv");
+    return dot ? strtoull(dot + 5, NULL, 16) : 0;
+}
+
+/* The file of the pages is the segment's own: its name is not to be guessed,
+ * a file put in its place is refused, and a new owner or mode reaches the
+ * file before the segment (or the change is refused). */
+static int shm_names(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    char first[64], second[64], both[64];
+    int before = sysv_files(NULL, 0);
+    CHECK(before >= 0);
+    /* Names that do not follow one another. */
+    int a = shmget(IPC_PRIVATE, page, 0600);
+    CHECK(a > 0 && sysv_files(first, sizeof first) == before + 1);
+    int b = shmget(IPC_PRIVATE, page, 0600);
+    CHECK(b > 0 && sysv_files(NULL, 0) == before + 2);
+    DIR *dir = opendir("/dev/shm");
+    CHECK(dir != NULL);
+    unsigned long long n[2] = {0, 0};
+    int k = 0;
+    struct dirent *e;
+    while ((e = readdir(dir)) != NULL && k < 2)
+        if (strncmp(e->d_name, ".sysv", 5) == 0) n[k++] = name_number(e->d_name);
+    closedir(dir);
+    CHECK(k == 2);
+    unsigned long long gap = n[0] > n[1] ? n[0] - n[1] : n[1] - n[0];
+    CHECK(gap > 1000000ULL);
+    CHECK(shmctl(a, IPC_RMID, NULL) == 0 && shmctl(b, IPC_RMID, NULL) == 0);
+    CHECK(sysv_files(NULL, 0) == before);
+    /* A file put in the place of the real one. */
+    int id = shmget(IPC_PRIVATE, page, 0600);
+    CHECK(id > 0 && sysv_files(first, sizeof first) == before + 1);
+    snprintf(second, sizeof second, "%s.other", first);
+    snprintf(both, sizeof both, "%s.both", first);
+    CHECK(unlink(first) == 0);
+    int fd = open(first, O_RDWR | O_CREAT | O_EXCL, 0666);
+    CHECK(fd >= 0 && ftruncate(fd, page) == 0 && fchown(fd, 1234, 1234) == 0);
+    errno = 0;
+    CHECK(shmat(id, NULL, 0) == (void *)-1 && errno == EACCES);
+    CHECK(fchown(fd, 0, 0) == 0 && fchmod(fd, 0600) == 0);
+    /* The right owner and size: the file is taken. */
+    void *p = shmat(id, NULL, 0);
+    CHECK(p != (void *)-1 && shmdt(p) == 0);
+    /* A second link, or another size: refused. */
+    CHECK(link(first, second) == 0);
+    errno = 0;
+    CHECK(shmat(id, NULL, 0) == (void *)-1 && errno == EACCES);
+    CHECK(unlink(second) == 0 && ftruncate(fd, page + 1) == 0);
+    errno = 0;
+    CHECK(shmat(id, NULL, 0) == (void *)-1 && errno == EACCES);
+    close(fd);
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    unlink(first);
+    CHECK(sysv_files(NULL, 0) == before);
+    (void)both;
+    /* A new owner by the superuser reaches the file; the mode too. */
+    id = shmget(IPC_PRIVATE, page, 0600);
+    CHECK(id > 0 && sysv_files(first, sizeof first) == before + 1);
+    struct shmid_ds ds;
+    struct stat st;
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0);
+    ds.shm_perm.uid = 1234;
+    ds.shm_perm.gid = 1234;
+    ds.shm_perm.mode = 0640;
+    CHECK(shmctl(id, IPC_SET, &ds) == 0);
+    CHECK(stat(first, &st) == 0 && st.st_uid == 1234 && st.st_gid == 1234 && (st.st_mode & 0777) == 0640);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_perm.uid == 1234 && (ds.shm_perm.mode & 0777) == 0640);
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    /* An owner that is no superuser cannot give the segment away: the file
+     * could not follow, so the segment stays as it is. */
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        if (setgid(1234) != 0 || setuid(1234) != 0) _exit(2);
+        int mine = shmget(IPC_PRIVATE, page, 0600);
+        char path[64];
+        if (mine < 0 || sysv_files(path, sizeof path) != before + 1) _exit(3);
+        struct shmid_ds d;
+        if (shmctl(mine, IPC_STAT, &d) != 0) _exit(4);
+        d.shm_perm.uid = 4321;
+        errno = 0;
+        if (shmctl(mine, IPC_SET, &d) != -1 || errno != EPERM) _exit(5);
+        if (shmctl(mine, IPC_STAT, &d) != 0 || d.shm_perm.uid != 1234) _exit(6);
+        struct stat s2;
+        if (stat(path, &s2) != 0 || s2.st_uid != 1234) _exit(7);
+        /* A mode it may give, the file follows. */
+        d.shm_perm.uid = 1234;
+        d.shm_perm.mode = 0640;
+        if (shmctl(mine, IPC_SET, &d) != 0) _exit(8);
+        if (stat(path, &s2) != 0 || (s2.st_mode & 0777) != 0640) _exit(9);
+        _exit(shmctl(mine, IPC_RMID, NULL) == 0 ? 0 : 10);
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status));
+    if (WEXITSTATUS(status) != 0) {
+        printf("posix-ipc: the child of shm_names ended with %d\n", WEXITSTATUS(status));
+        return 20;
+    }
+    CHECK(sysv_files(NULL, 0) == before);
+    return 0;
+}
+
 /* A sender that waits for the pool of messages wakes when a message goes,
  * whatever queue it was in. */
 static int pool_waits(void) {
@@ -1139,6 +1244,7 @@ int main(int argc, char **argv) {
     RUN(shm_processes);
     RUN(identity);
     RUN(shm_pages);
+    RUN(shm_names);
     RUN(pool_waits);
     RUN(shm_fork);
     RUN(many_waits);

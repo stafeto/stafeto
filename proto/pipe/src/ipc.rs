@@ -103,11 +103,15 @@ pub mod op {
     /// the values of GETALL.
     pub const SEM_CTL: u32 = 22;
 
-    /// shmget: w0 key, w1 size, w2 flags, cred. => the id, the serial, 1
-    /// when the segment is new (its file is to be made).
+    /// shmget: w0 key, w1 size, w2 flags, w3 a random number the caller
+    /// drew (the name of the file of the pages; EEXIST for one in use, EINVAL
+    /// for 0), cred. => the id, the serial (that number), 1 when the segment
+    /// is new (its file is to be made), a serial whose file is left to remove
+    /// or 0.
     pub const SHM_GET: u32 = 24;
-    /// shmat: w0 id, w1 flags (SHM_RDONLY), cred. => the serial, the
-    /// size.
+    /// shmat: w0 id, w1 flags (SHM_RDONLY), cred. => the serial, the size, the
+    /// owner's uid, the creator's uid (the file is to be theirs), a serial
+    /// whose file is left to remove or 0.
     pub const SHM_AT: u32 = 25;
     /// shmdt: w0 id, cred. => 1 when the segment is gone and its file is
     /// to be removed, w1 its serial.
