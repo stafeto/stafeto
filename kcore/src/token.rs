@@ -226,6 +226,29 @@ impl<T, const N: usize> Table<T, N> {
         Ok(unsafe { e.holder.thread })
     }
 
+    /// The thread on number `index` while the number is taken (a service
+    /// that raises the client's server looks it up, spec 6.6); None for a
+    /// free number.
+    pub fn thread(&self, index: u16) -> Option<NonNull<T>> {
+        let e = self.entries.get(usize::from(index))?;
+        if e.word & TAKEN == 0 {
+            return None;
+        }
+        // SAFETY: a taken entry holds its thread.
+        Some(unsafe { e.holder.thread })
+    }
+
+    /// The token of the last request accepted from the thread on the taken
+    /// number `index`; 0 when none was.
+    pub fn last_token(&self, index: u16) -> u64 {
+        let count = self.taken(index).word & MAX_COUNT;
+        if count == 0 {
+            0
+        } else {
+            count << INDEX_BITS | u64::from(index)
+        }
+    }
+
     /// Moves the count of the taken number `index` forward to `count`, at
     /// most MAX_COUNT, so that the kernel's tests reach the end of a count
     /// (spec 15.2); a token is still given out once.
@@ -272,6 +295,26 @@ mod tests {
         assert_eq!(table.check(second), Err(Error::PeerClosed));
         table.free(index);
         assert_eq!(table.check(second), Err(Error::PeerClosed));
+    }
+
+    /// A thread is found by its number while the number is taken, and the
+    /// token of its last request is the one `accept` gave.
+    #[test]
+    fn a_number_names_its_thread_and_its_last_token() {
+        let mut table = Table::<u8, 2>::new();
+        let client = thread(0);
+        let index = table.alloc(client).unwrap();
+        assert_eq!(table.thread(index), Some(client));
+        assert_eq!(table.thread(index + 1), None);
+        assert_eq!(table.thread(9), None);
+        assert_eq!(table.last_token(index), 0);
+        let token = table.accept(index);
+        assert_eq!(table.last_token(index), token);
+        let next = table.accept(index);
+        assert_eq!(table.last_token(index), next);
+        assert_ne!(token, next);
+        table.free(index);
+        assert_eq!(table.thread(index), None);
     }
 
     #[test]

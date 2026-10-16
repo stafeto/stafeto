@@ -266,14 +266,6 @@ impl<T> Node<T> {
 /// at, valid as long as that object lives.
 pub unsafe trait Schedulable: Sized {
     fn node(this: NonNull<Self>) -> NonNull<Node<Self>>;
-
-    /// A stint of `ticks` ended: the object adds it to the sum of the
-    /// thread's process. Called once for each stint, as the thread leaves
-    /// the CPU; idle time and cleanup are in no stint.
-    ///
-    /// # Safety
-    /// `this` is alive.
-    unsafe fn charge(this: NonNull<Self>, ticks: u64);
 }
 
 // SAFETY: the link is a field of the node, which lives as long as the
@@ -517,21 +509,18 @@ impl<T: Schedulable> Scheduler<T> {
     }
 
     /// The stint of the running thread `r` ends at `now`: its length goes
-    /// to the thread and to the sum of its process (`Schedulable::charge`).
-    /// Every way off the CPU comes here, once.
+    /// to the thread's `ran` and nowhere else; the time of a process is the
+    /// sum of its threads', which the process adds up when it is asked and
+    /// when a thread leaves it. Every way off the CPU comes here, once.
     ///
     /// # Safety
     /// `r` is alive and was the running thread.
     unsafe fn charge(r: NonNull<T>, now: u64) {
         // SAFETY: the caller's promise.
-        let ticks = unsafe {
+        unsafe {
             let n = node(r);
-            let ticks = now.saturating_sub(n.since);
-            n.ran = n.ran.saturating_add(ticks);
-            ticks
-        };
-        // SAFETY: as above.
-        unsafe { T::charge(r, ticks) };
+            n.ran = n.ran.saturating_add(now.saturating_sub(n.since));
+        }
     }
 
     /// The thread on the CPU; None while the kernel idles.
@@ -1097,9 +1086,6 @@ mod tests {
     struct Fake {
         node: Node<Fake>,
         name: char,
-        /// What `charge` added: the sum of the thread's stints, as its
-        /// process would keep it.
-        charged: u64,
     }
 
     // SAFETY: the node is a field of the fake thread.
@@ -1107,11 +1093,6 @@ mod tests {
         fn node(this: NonNull<Fake>) -> NonNull<Node<Fake>> {
             // SAFETY: `this` points at a live fake thread.
             unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).node) }
-        }
-
-        unsafe fn charge(this: NonNull<Fake>, ticks: u64) {
-            // SAFETY: `this` points at a live fake thread.
-            unsafe { (*this.as_ptr()).charged += ticks };
         }
     }
 
@@ -1143,7 +1124,6 @@ mod tests {
             let mut b = Box::new(Fake {
                 node: Node::new(priority, policy),
                 name,
-                charged: 0,
             });
             let t = NonNull::from(&mut *b);
             self.threads.push(b);
@@ -1267,7 +1247,6 @@ mod tests {
         let mut a = Box::new(Fake {
             node: Node::new(10, RR),
             name: 'a',
-            charged: 0,
         });
         let t = NonNull::from(&mut *a);
         // SAFETY: the thread outlives its time in the scheduler.
@@ -2387,7 +2366,7 @@ mod tests {
     /// the way off the CPU, and what the threads were charged equals the
     /// time something ran. Idle time belongs to nobody.
     fn charged(w: &World) -> u64 {
-        w.threads.iter().map(|t| t.charged).sum()
+        w.threads.iter().map(|t| t.node.ran()).sum()
     }
 
     #[test]
@@ -2422,7 +2401,12 @@ mod tests {
     }
 
     fn a_charged(w: &World, name: char) -> u64 {
-        w.threads.iter().find(|t| t.name == name).unwrap().charged
+        w.threads
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .node
+            .ran()
     }
 
     #[test]

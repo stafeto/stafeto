@@ -9,6 +9,10 @@
 
 #![no_std]
 #![no_main]
+// A test image holds half of the kernel tests (ktest::run), so the test
+// support the other half uses stands unused in it. The build that ships
+// keeps both lints.
+#![cfg_attr(feature = "ktest", allow(dead_code, unused_imports))]
 
 #[macro_use]
 mod console;

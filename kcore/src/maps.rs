@@ -6,9 +6,10 @@
 //! object, in a table of 4 KiB. A mapping holds a counted reference to its
 //! object, `T`, and the rights of the handle it was made through; a long
 //! call that works on it marks it busy, and the other calls on it get
-//! BAD_STATE until the mark goes. `mem_protect` takes exactly one whole
-//! mapping, `mem_unmap` a range of whole pages inside one (`split`). Every operation walks the table once: O(1)
-//! with the constant MAX_MAPPINGS.
+//! BAD_STATE until the mark goes. `mem_protect` and `mem_unmap` take a
+//! range of whole pages inside one mapping (`split` cuts the mapping at the
+//! ends of the range). Every operation walks the table once: O(1) with the
+//! constant MAX_MAPPINGS.
 
 use crate::PAGE_SHIFT;
 use abi::{Error, Rights};

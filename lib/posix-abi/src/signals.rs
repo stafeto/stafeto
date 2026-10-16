@@ -247,6 +247,10 @@ pub(crate) fn thread_pending(block: &Block) -> u64 {
 /// Whether a signal is pending that `mask` would let through and that a
 /// delivery would not discard: SIG_IGN and a default action of ignoring
 /// (SIGCHLD, SIGWINCH, SIGURG) end no wait.
+// Out of line: inlined into its callers, the code of the hot signal path
+// (section .text.stafeto_signal_hot) takes another layout, and the cold
+// tail of the path of a signal (S5, p99) grows with it.
+#[inline(never)]
 pub(crate) fn pending_acting(mask: SigSet) -> bool {
     let open = (thread_pending(own()) | process_pending()) & !mask;
     (1..=31).any(|signal| open & (1 << (signal - 1)) != 0 && !ignored(signal, &action(signal)))
@@ -254,6 +258,8 @@ pub(crate) fn pending_acting(mask: SigSet) -> bool {
 
 /// Drops the signals of this thread that `mask` lets through and that a
 /// delivery would discard, so that their entries wake no wait again.
+// Out of line, as `pending_acting`.
+#[inline(never)]
 pub(crate) fn discard_ignored(mask: SigSet) {
     let block = own();
     loop {

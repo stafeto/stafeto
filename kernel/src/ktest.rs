@@ -7,7 +7,32 @@
 //! that never returns here.
 
 pub mod calls;
+#[cfg(feature = "el0-half")]
 pub mod el0;
+/// The hooks of the EL0 tests (testpoint) in the image that has none: no
+/// test is running, so each does nothing, and the fast path stays on.
+#[cfg(not(feature = "el0-half"))]
+pub mod el0 {
+    use crate::thread::Thread;
+    use core::ptr::NonNull;
+
+    pub fn portion_done() {}
+    pub fn heads_taken(_level: u8, _heads: usize) {}
+    pub fn timer_fired() {}
+    pub fn note_idle_stack() {}
+    pub fn expects_fault() -> bool {
+        false
+    }
+    pub fn syscall(_thread: NonNull<Thread>, _number: u16) -> bool {
+        false
+    }
+    pub fn init_ended() -> ! {
+        panic!("init ended in an image without the EL0 tests")
+    }
+    pub fn fast_path() -> bool {
+        true
+    }
+}
 mod registers;
 
 use crate::arch::symbols;
@@ -402,6 +427,18 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::interrupt_leaves_an_accepted_request,
     ),
     (
+        "raising_a_client_raises_the_thread_that_serves_it",
+        calls::raising_a_client_raises_the_thread_that_serves_it,
+    ),
+    (
+        "a_rise_stops_at_a_server_that_went_back_to_receive",
+        calls::a_rise_stops_at_a_server_that_went_back_to_receive,
+    ),
+    (
+        "a_rise_climbs_a_chain_of_requests_eight_deep",
+        calls::a_rise_climbs_a_chain_of_requests_eight_deep,
+    ),
+    (
         "upcall_request_waits_for_the_reply",
         calls::upcall_request_waits_for_the_reply,
     ),
@@ -595,6 +632,25 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 /// counts mean instructions only there (spec 15.3).
 const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 8 } else { 0 };
 
+/// The tests of a build come in two images, which keep each under the size
+/// a test image may have: the first runs TESTS and, with `icount`, the
+/// measurements of the portions; the second, built with the feature
+/// `el0-half`, runs the EL0 tests alone. Together they are the whole set,
+/// and xtask runs both for each kind of build (`Variant::el0_half`).
+#[cfg(feature = "el0-half")]
+pub fn run(_: &Boot) -> ! {
+    el0::run()
+}
+
+/// How many TEST lines this image prints.
+fn count() -> usize {
+    #[cfg(feature = "el0-half")]
+    return el0::count();
+    #[cfg(not(feature = "el0-half"))]
+    return ICOUNT_ONLY + TESTS.len();
+}
+
+#[cfg(not(feature = "el0-half"))]
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
     report(
@@ -605,41 +661,37 @@ pub fn run(boot: &Boot) -> ! {
         report(name, test(boot));
     }
     #[cfg(feature = "icount")]
-    report(
-        "memory_portions_are_measured",
-        calls::memory_portions_are_measured(boot),
-    );
-    #[cfg(feature = "icount")]
-    report(
-        "teardown_portions_are_measured",
-        calls::teardown_portions_are_measured(boot),
-    );
-    #[cfg(feature = "icount")]
-    report(
-        "timer_firing_is_measured",
-        calls::timer_firing_is_measured(boot),
-    );
-    #[cfg(feature = "icount")]
-    report(
-        "device_windows_are_measured",
-        calls::device_windows_are_measured(boot),
-    );
-    #[cfg(feature = "icount")]
-    report(
-        "upcall_calls_are_measured",
-        calls::upcall_calls_are_measured(boot),
-    );
-    #[cfg(feature = "icount")]
-    report(
-        "process_kill_with_a_level_is_measured",
-        calls::process_kill_with_a_level_is_measured(boot),
-    );
-    #[cfg(feature = "icount")]
-    report(
-        "suspension_paths_are_measured",
-        calls::suspension_paths_are_measured(boot),
-    );
-    el0::run()
+    {
+        report(
+            "memory_portions_are_measured",
+            calls::memory_portions_are_measured(boot),
+        );
+        report(
+            "teardown_portions_are_measured",
+            calls::teardown_portions_are_measured(boot),
+        );
+        report(
+            "timer_firing_is_measured",
+            calls::timer_firing_is_measured(boot),
+        );
+        report(
+            "device_windows_are_measured",
+            calls::device_windows_are_measured(boot),
+        );
+        report(
+            "upcall_calls_are_measured",
+            calls::upcall_calls_are_measured(boot),
+        );
+        report(
+            "process_kill_with_a_level_is_measured",
+            calls::process_kill_with_a_level_is_measured(boot),
+        );
+        report(
+            "suspension_paths_are_measured",
+            calls::suspension_paths_are_measured(boot),
+        );
+    }
+    finish()
 }
 
 fn report(name: &str, result: Result<(), &'static str>) {
@@ -657,7 +709,7 @@ fn report(name: &str, result: Result<(), &'static str>) {
 /// xtask notices a TEST line lost in the output.
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
-    let total = ICOUNT_ONLY + TESTS.len() + el0::count();
+    let total = count();
     // A call no test of the build made has no maximum: "not measured", so
     // that 0 does not read as a free call (debug_write, and 29, a retired
     // number).

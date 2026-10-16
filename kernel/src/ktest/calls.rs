@@ -2793,8 +2793,16 @@ pub fn fault_during_a_long_call_does_not_enter(_: &Boot) -> Result<(), &'static 
 /// A return restores the exact native context: every general register, the
 /// stack pointer, the program counter, the flags of PSTATE, TPIDR_EL0 and the
 /// FP registers with FPCR and FPSR. The thread starts with all of those at
-/// zero, so the context sets each of them to a value that differs.
+/// zero, so the context sets each of them to a value that differs. A stack
+/// pointer that is not a multiple of 16 comes back as it was: code that
+/// faulted with an unaligned SP (the entry ran on it aligned down) must
+/// resume on it.
 pub fn upcall_return_restores_the_native_context_exactly(_: &Boot) -> Result<(), &'static str> {
+    restore_native_context(0x80_1000)?;
+    restore_native_context(0x80_1008)
+}
+
+fn restore_native_context(sp: u64) -> Result<(), &'static str> {
     with_caller(|c| {
         use abi::UpcallControl as C;
         thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
@@ -2820,7 +2828,7 @@ pub fn upcall_return_restores_the_native_context_exactly(_: &Boot) -> Result<(),
         for (i, value) in context.iter_mut().enumerate() {
             *value = 0xABCD_0000 + i as u64;
         }
-        context[31] = 0x80_1000;
+        context[31] = sp;
         context[32] = pc;
         // N and C of NZCV, a thread pointer, FPCR.DN and FPSR.IOC.
         context[33] = 0xA000_0000;
@@ -3028,6 +3036,153 @@ pub fn upcall_request_waits_for_the_reply(_: &Boot) -> Result<(), &'static str> 
             "no entry came after the reply",
         )?;
         check(w.has_reply(w.t), "the entry changed the reply's registers")
+    })
+}
+
+/// The priority of the thread `t`, which the test holds.
+fn level_of(t: NonNull<Thread>) -> u8 {
+    // SAFETY: the test holds the thread.
+    unsafe { t.as_ref() }.priority()
+}
+
+/// A client that waits for the reply to its request is raised
+/// (thread_set_priority, as the layer's inheritance does): the thread that
+/// works on the request is raised to the same level, as at `accept`; a
+/// thread that does not work on it, the other receiver, is not.
+pub fn raising_a_client_raises_the_thread_that_serves_it(_: &Boot) -> Result<(), &'static str> {
+    with_reply_wait(false, |w| {
+        let (served, spare) = (level_of(w.r), level_of(w.spare));
+        check(
+            level_of(w.t) == 5 && served == 5,
+            "the request did not boost its server to the client's level",
+        )?;
+        sched::set_priority(w.t, 40, Policy::Fifo, false).map_err(|_| "no priority 40")?;
+        check(level_of(w.t) == 40, "the client did not rise")?;
+        check(
+            level_of(w.r) == 40,
+            "the thread that works on the request did not rise with its client",
+        )?;
+        check(level_of(w.spare) == spare, "another receiver rose")?;
+        check(w.reply(w.r, w.token) == Ok(()), "the reply did not go")?;
+        check(
+            level_of(w.r) == 5,
+            "the reply did not end the boost the rise made",
+        )
+    })
+}
+
+/// A rise reaches the thread that works on the request only while it works
+/// on it: after its next receive the request is nobody's work, and a rise
+/// of the client leaves that thread where it is.
+pub fn a_rise_stops_at_a_server_that_went_back_to_receive(_: &Boot) -> Result<(), &'static str> {
+    with_reply_wait(false, |w| {
+        channel::receive(w.r, w.channel, true).map_err(|_| "the server did not receive")?;
+        check(level_of(w.r) == 5, "the next receive did not end the boost")?;
+        sched::set_priority(w.t, 40, Policy::Fifo, false).map_err(|_| "no priority 40")?;
+        check(level_of(w.t) == 40, "the client did not rise")?;
+        check(
+            level_of(w.r) == 5,
+            "a thread that left the request was raised with its client",
+        )
+    })
+}
+
+/// The longest chain of requests the tests build: `CHAIN - 1` hops.
+const CHAIN: usize = 11;
+
+/// A chain of `hops` requests (spec 6.1): thread 0 sent a request that
+/// thread 1 accepted; thread 1, running, sent a request that thread 2
+/// accepted, and so on; every thread but the last waits for a reply. Each
+/// thread has a process and a priority of 5. Runs `body` on the threads and
+/// lets everything go.
+fn with_chain(
+    hops: usize,
+    body: impl FnOnce(&[NonNull<Thread>]) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    assert!(hops < CHAIN);
+    let counts = (process::in_use(), thread::in_use(), channel::in_use());
+    let mut processes = [None; CHAIN];
+    let mut threads = [None; CHAIN];
+    let result = (|| {
+        for p in processes.iter_mut().take(hops + 1) {
+            *p = Some(process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?);
+        }
+        let mut channels = [None; CHAIN];
+        for i in 1..=hops {
+            let p = processes[i].ok_or("no process")?;
+            let c = owned_channel(p)?;
+            channels[i] = Some(c);
+            threads[i] = Some(waiting(p, c)?);
+        }
+        threads[0] = Some(running(processes[0].ok_or("no process")?)?);
+        let mut list = [NonNull::dangling(); CHAIN];
+        for i in 0..=hops {
+            list[i] = threads[i].ok_or("no thread")?;
+        }
+        for i in 1..=hops {
+            let c = channels[i].ok_or("no channel")?;
+            let sent = channel::send(
+                list[i - 1],
+                Via::Channel(c),
+                Desc::from_send(0).expect("a send"),
+                &[],
+            );
+            check(
+                sent == Ok(Some(list[i])),
+                "the receiver did not take the request",
+            )?;
+            if i < hops {
+                // SAFETY: the scheduler's threads are alive.
+                let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+                check(
+                    matches!(picked, kcore::sched::Decision::Run(r) if r == list[i]),
+                    "the server did not run",
+                )?;
+            }
+        }
+        body(&list[..=hops])
+    })();
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the test's references go, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    for p in processes.into_iter().flatten() {
+        // SAFETY: the test's reference goes.
+        unsafe { process::release(p, CAUSE) };
+    }
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use(), channel::in_use()) == counts,
+        "a process, a thread or a channel of the chain stayed",
+    )
+}
+
+/// A rise goes down the chain of requests: the client's server, that
+/// server's own server, and on, up to eight threads (the depth of the
+/// layer's inheritance); the threads past the eighth stay where they are,
+/// and the work of the rise is bounded.
+pub fn a_rise_climbs_a_chain_of_requests_eight_deep(_: &Boot) -> Result<(), &'static str> {
+    with_chain(3, |t| {
+        sched::set_priority(t[0], 40, Policy::Fifo, false).map_err(|_| "no priority 40")?;
+        check(
+            t.iter().all(|&x| level_of(x) == 40),
+            "a rise did not reach every thread of a chain of three hops",
+        )
+    })?;
+    with_chain(10, |t| {
+        sched::set_priority(t[0], 40, Policy::Fifo, false).map_err(|_| "no priority 40")?;
+        check(
+            t[..=8].iter().all(|&x| level_of(x) == 40),
+            "a rise did not reach the eight threads behind the client",
+        )?;
+        check(
+            t[9..].iter().all(|&x| level_of(x) == 5),
+            "a rise went past the depth of eight",
+        )
     })
 }
 

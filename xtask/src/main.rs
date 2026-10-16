@@ -876,6 +876,10 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// left or on where a timer fires, which only -icount makes repeatable;
 /// and the teardown of a big process in hundreds of portions with
 /// interrupts between them.
+/// The test that ends the EL0 tests, and one of the tests of the calls: each
+/// image of the kernel tests (`Variant::el0_half`) must have run.
+const EL0_LAST_TEST: &str = "el0_tests_return_their_objects";
+const CALLS_LAST_TEST: &str = "device_tree_matches_qemu_virt";
 const ICOUNT_TESTS: [&str; 17] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
@@ -1159,16 +1163,24 @@ enum Variant {
     TraceNormal,
     /// The kernel tests with those that need QEMU's `-icount` (qemu::ICOUNT).
     TestIcount,
+    /// The second image of each kind of test build: the EL0 tests alone
+    /// (`el0_half`), so that no test image comes near the limit.
+    TestEl0,
+    BaselineEl0,
+    TraceEl0,
+    TestIcountEl0,
     FaultProbe,
     OverflowProbe,
 }
 
 impl Variant {
-    const ALL: [Variant; 6] = [
+    const ALL: [Variant; 8] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
+        Variant::TestEl0,
         Variant::TestIcount,
+        Variant::TestIcountEl0,
         Variant::FaultProbe,
         Variant::OverflowProbe,
     ];
@@ -1181,6 +1193,10 @@ impl Variant {
             Variant::Trace => Some("trace-test"),
             Variant::TraceNormal => Some("trace"),
             Variant::TestIcount => Some("icount"),
+            Variant::TestEl0 => Some("ktest,el0-half"),
+            Variant::BaselineEl0 => Some("baseline,el0-half"),
+            Variant::TraceEl0 => Some("trace-test,el0-half"),
+            Variant::TestIcountEl0 => Some("icount,el0-half"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
         }
@@ -1193,9 +1209,26 @@ impl Variant {
             | Variant::TraceNormal
             | Variant::FaultProbe
             | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
-            Variant::Test | Variant::Baseline | Variant::Trace | Variant::TestIcount => {
-                (TEST_KERNEL_LIMIT, "test builds")
-            }
+            Variant::Test
+            | Variant::Baseline
+            | Variant::Trace
+            | Variant::TestIcount
+            | Variant::TestEl0
+            | Variant::BaselineEl0
+            | Variant::TraceEl0
+            | Variant::TestIcountEl0 => (TEST_KERNEL_LIMIT, "test builds"),
+        }
+    }
+
+    /// The variant that runs the EL0 tests of this kind of test build, which
+    /// the build itself leaves out (kernel feature `el0-half`).
+    fn el0_half(self) -> Option<Variant> {
+        match self {
+            Variant::Test => Some(Variant::TestEl0),
+            Variant::Baseline => Some(Variant::BaselineEl0),
+            Variant::Trace => Some(Variant::TraceEl0),
+            Variant::TestIcount => Some(Variant::TestIcountEl0),
+            _ => None,
         }
     }
 
@@ -1207,6 +1240,10 @@ impl Variant {
             Variant::Trace => "stafeto-trace",
             Variant::TraceNormal => "stafeto-trace-normal",
             Variant::TestIcount => "stafeto-ktest-icount",
+            Variant::TestEl0 => "stafeto-ktest-el0",
+            Variant::BaselineEl0 => "stafeto-baseline-el0",
+            Variant::TraceEl0 => "stafeto-trace-el0",
+            Variant::TestIcountEl0 => "stafeto-ktest-icount-el0",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
         }
@@ -1276,6 +1313,8 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-el2  run the probes of POSIX processes, mprotect and interrupted IPC on the
+            Cortex-A53 with the kernel entered at EL2 (as ci does)
   posix-map  verify mmap, munmap, mprotect, madvise and the faults of unmapped pages
   posix-resources verify account files, limits, groups and descriptor exec
   posix-math   verify scalar math, binary128 and thread floating-point state
@@ -1424,6 +1463,7 @@ fn main() {
             jobs::parse_jobs("open-posix", rest).and_then(|jobs| openposix::run(select, jobs))
         }
         Some("posix-map") => posix_map_probe(),
+        Some("posix-el2") => posix_el2_probes(),
         Some("posix-resources") => posix_resources_probe(),
         Some("posix-sync") => posix_sync_probe(),
         Some("layer-names") => layer_c_names(),
@@ -2263,15 +2303,26 @@ fn posix_abi_boots() -> Result<(), String> {
 /// `image`: on Apple VZ when `vz` (vz::command), in QEMU headless
 /// otherwise; and the kernel's artifacts.
 fn probe_command(image: &Path, vz: bool) -> Result<(Command, Artifacts), String> {
+    probe_command_on(image, vz, None)
+}
+
+/// `probe_command` on `machine` when one is given (not with `vz`).
+fn probe_command_on(
+    image: &Path,
+    vz: bool,
+    machine: Option<&qemu::Machine>,
+) -> Result<(Command, Artifacts), String> {
     let kernel = build(Variant::Normal)?;
     let cmd = if vz {
         vz::command(&kernel.image, image)?
     } else {
-        let machine = if PROBES_ON_HVF.load(std::sync::atomic::Ordering::Relaxed) {
-            &qemu::HVF_V3
-        } else {
-            &qemu::VIRT
-        };
+        let machine = machine.unwrap_or(
+            if PROBES_ON_HVF.load(std::sync::atomic::Ordering::Relaxed) {
+                &qemu::HVF_V3
+            } else {
+                &qemu::VIRT
+            },
+        );
         let mut cmd = qemu::command(machine, &kernel.image, Some(image));
         cmd.args(qemu::HEADLESS);
         cmd
@@ -2721,6 +2772,10 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
 }
 
 fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
+    posix_interrupt_on(vz, None)
+}
+
+fn posix_interrupt_on(vz: bool, machine: Option<&qemu::Machine>) -> Result<(), String> {
     let image = if vz {
         build_boot_image(
             "boot-posix-interrupt-vz.img",
@@ -2734,7 +2789,7 @@ fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
             BOOT_PROFILE,
         )?
     };
-    let (cmd, _) = probe_command(&image, vz)?;
+    let (cmd, _) = probe_command_on(&image, vz, machine)?;
     const ENDED: &str = "init: posix-probe ended: exit code 0, not restarted";
     // Inject no input until cleanup and recovery have completed.
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
@@ -2753,8 +2808,9 @@ fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
         result?;
     }
     println!(
-        "Rust POSIX interruption guest probe passed on {}",
-        if vz { "the Virtio console" } else { "the UART" }
+        "Rust POSIX interruption guest probe passed on {}{}",
+        if vz { "the Virtio console" } else { "the UART" },
+        machine.map_or(String::new(), |m| format!(" ({})", m.name))
     );
     Ok(())
 }
@@ -4067,12 +4123,24 @@ fn posix_fifo_run(steps: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The probes of faults, signals and `mprotect` on the Cortex-A53 with the
+/// kernel entered at EL2, as on the PinePhone.
+fn posix_el2_probes() -> Result<(), String> {
+    posix_procs_probe(&qemu::VIRT_EL2)?;
+    posix_map_on(&qemu::VIRT_EL2)?;
+    posix_interrupt_on(false, Some(&qemu::VIRT_EL2))
+}
+
 fn posix_map_probe() -> Result<(), String> {
+    posix_map_on(&qemu::VIRT)
+}
+
+fn posix_map_on(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     busybox_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-posix-map.img", &POSIX_MAP_PROGRAMS, BOOT_PROFILE)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let outcome = run_until(
         cmd,
@@ -4453,8 +4521,8 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// decision with its reason written down.
 ///
 /// The third is a guard against a path that grows by accident, and the
-/// requirement of S5 is the p50 in nanoseconds on HVF and on VZ
-/// (`rtbench_check::S5_P50_MAX_NS`, the sessions of `rtbench-check`). The
+/// requirement of S5 is the p50 in ticks of the counter on HVF and on VZ
+/// (`rtbench_check::S5_P50_MAX_TICKS`, the sessions of `rtbench-check`). The
 /// guard stands 10 % above the measure (2 759 at cacfad79, so 3 035; the
 /// measure was 2 754 at the end of epoch 2, 2 756 at e0c670e, when the
 /// distributor saved the flags twice, and 2 562 at 4f3c7d0): a margin of
@@ -6696,7 +6764,13 @@ fn test(jobs: usize) -> Result<(), String> {
         // that the log tells where each line comes from.
         relibc()?;
         busybox_build()?;
-        for variant in [Variant::Normal, Variant::Test, Variant::TestIcount] {
+        for variant in [
+            Variant::Normal,
+            Variant::Test,
+            Variant::TestEl0,
+            Variant::TestIcount,
+            Variant::TestIcountEl0,
+        ] {
             build(variant)?;
         }
         build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
@@ -6766,6 +6840,13 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-files", posix_files_probe),
         job("posix-files steps", || posix_files_run(true)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
+        // The probes of faults, signals and mprotect on the Cortex-A53 with
+        // the kernel entered at EL2, as on the PinePhone.
+        job("posix-procs EL2", || posix_procs_probe(&qemu::VIRT_EL2)),
+        job("posix-map EL2", || posix_map_on(&qemu::VIRT_EL2)),
+        job("posix-interrupt EL2", || {
+            posix_interrupt_on(false, Some(&qemu::VIRT_EL2))
+        }),
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
         job("posix-map", posix_map_probe),
         job("posix-resources", posix_resources_probe),
@@ -7869,36 +7950,49 @@ fn stack_overflow_report() -> Result<(), String> {
 /// of tests that passed. The boot report names `m`'s PSCI conduit, as
 /// the kernel took it from the device tree (on VIRT_EL2 SMC).
 fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
-    let a = build(variant)?;
-    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
-    cmd.args(qemu::HEADLESS);
     let icount = variant == Variant::TestIcount;
-    if icount {
-        cmd.args(qemu::ICOUNT);
+    // The tests of a kind of build run in two images: the first holds the
+    // tests of the calls, the second the EL0 tests (Variant::el0_half).
+    // Each is judged by its own count; the lines and the passes join.
+    let mut lines = Vec::new();
+    let mut passed = Vec::new();
+    for half in std::iter::once(variant).chain(variant.el0_half()) {
+        let a = build(half)?;
+        let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+        cmd.args(qemu::HEADLESS);
+        if icount {
+            cmd.args(qemu::ICOUNT);
+        }
+        let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
+        let r = qemu::parse_report(&o.lines);
+        qemu::counted_verdict(&o, &r, None)?;
+        qemu::expect_line(&o, &format!("psci       {}", m.psci()))?;
+        lines.extend(o.lines);
+        passed.extend(r.passed);
     }
-    let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
-    let r = qemu::parse_report(&o.lines);
-    qemu::counted_verdict(&o, &r, None)?;
-    qemu::expect_line(&o, &format!("psci       {}", m.psci()))?;
     for name in ICOUNT_TESTS {
         if name == "ipc_round_trip_is_measured" {
             continue;
         }
-        if r.passed.iter().any(|p| p == name) != icount {
+        if passed.iter().any(|p| p == name) != icount {
             return Err(format!(
                 "{name} must pass in the icount build and only there"
             ));
         }
     }
-    if !r.passed.iter().any(|p| p == "ipc_round_trip_is_measured") {
+    if !passed.iter().any(|p| p == "ipc_round_trip_is_measured") {
         return Err("the round-trip measurement did not pass".into());
     }
+    // The last test of each image: a run that left a whole image out fails.
+    for last in [EL0_LAST_TEST, CALLS_LAST_TEST] {
+        if !passed.iter().any(|p| p == last) {
+            return Err(format!(
+                "{last} did not pass: an image of the tests did not run"
+            ));
+        }
+    }
     let under = if icount { " under icount" } else { "" };
-    println!(
-        "kernel tests{under} on {}: {} passed",
-        m.name,
-        r.passed.len()
-    );
+    println!("kernel tests{under} on {}: {} passed", m.name, passed.len());
     if icount {
         let mut measured = Vec::new();
         for (what, rows) in [
@@ -7911,7 +8005,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             ("teardown portions", &TEARDOWN_ROWS[..]),
             ("suspension scopes", &SUSPENSION_ROWS[..]),
         ] {
-            let ticks = ticks_of(&o.lines, what, rows)?;
+            let ticks = ticks_of(&lines, what, rows)?;
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
             measured.push((what, rows, ticks));
         }
@@ -7946,12 +8040,12 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         }
     }
     match variant {
-        Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
-        Variant::Trace => measure::record_as(m, &o.lines, "trace "),
-        Variant::TestIcount => measure::record_as(m, &o.lines, measure::ICOUNT),
-        _ => measure::record(m, &o.lines),
+        Variant::Baseline => measure::record_as(m, &lines, "baseline "),
+        Variant::Trace => measure::record_as(m, &lines, "trace "),
+        Variant::TestIcount => measure::record_as(m, &lines, measure::ICOUNT),
+        _ => measure::record(m, &lines),
     }
-    Ok(r.passed.len())
+    Ok(passed.len())
 }
 
 /// Measured portions and scoped components compared against B (spec 15.3).
@@ -8566,6 +8660,7 @@ fn ci(jobs: usize) -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/check-licenses.py")))?;
     no_transport_probe()?;
+    disasm::check_counter_read_sites(&root())?;
     layer_c_names()?;
     run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
     run_cmd(cargo().args([
@@ -9422,12 +9517,39 @@ mod tests {
 
     /// The build that ships and its probes keep the limit of spec 3.4; the
     /// builds with the kernel tests have one of their own.
+    /// Every kind of test build has a second image with the EL0 tests alone,
+    /// and no other build has one.
+    #[test]
+    fn each_kind_of_test_build_has_an_el0_image() {
+        for (whole, half) in [
+            (Variant::Test, Variant::TestEl0),
+            (Variant::Baseline, Variant::BaselineEl0),
+            (Variant::Trace, Variant::TraceEl0),
+            (Variant::TestIcount, Variant::TestIcountEl0),
+        ] {
+            assert_eq!(whole.el0_half(), Some(half));
+            assert_eq!(
+                half.feature(),
+                Some(format!("{},el0-half", whole.feature().unwrap()).as_str())
+            );
+            assert_eq!(half.el0_half(), None);
+        }
+        for other in [Variant::Normal, Variant::TraceNormal, Variant::FaultProbe] {
+            assert_eq!(other.el0_half(), None);
+        }
+    }
+
     #[test]
     fn test_builds_have_a_limit_of_their_own() {
         for variant in [Variant::Normal, Variant::FaultProbe, Variant::OverflowProbe] {
             assert_eq!(variant.limit(), (204_800, "spec 3.4"));
         }
-        for variant in [Variant::Test, Variant::TestIcount] {
+        for variant in [
+            Variant::Test,
+            Variant::TestIcount,
+            Variant::TestEl0,
+            Variant::TestIcountEl0,
+        ] {
             assert_eq!(variant.limit(), (524_288, "test builds"));
         }
     }
@@ -10179,6 +10301,21 @@ mod workspace_root_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The probes of Phases 7, 8 and 13 run on the Cortex-A53 with the
+    /// kernel entered at EL2, as on the PinePhone.
+    #[test]
+    fn the_boot_jobs_run_the_posix_probes_on_the_a53_at_el2() {
+        let names: Vec<_> = boot_jobs(Vec::new())
+            .iter()
+            .map(|j| j.name().to_owned())
+            .collect();
+        for name in ["posix-procs EL2", "posix-map EL2", "posix-interrupt EL2"] {
+            assert!(names.iter().any(|n| n == name), "{name}");
+        }
+        assert_eq!(qemu::VIRT_EL2.cpu, "cortex-a53");
+        assert!(qemu::VIRT_EL2.machine.contains("virtualization=on"));
     }
 
     #[test]
