@@ -662,6 +662,7 @@ static void public_lock_signals(void) {
 #include "lock-simple-wait.c"
 #include "lock-holder.c"
 #include "lock-page-fragments.c"
+#include "lock-sweep-share.c"
 #if LOCK_FIFO_FULL_ONLY
 #include "lock-fifo-full.c"
 #endif
@@ -680,7 +681,7 @@ int main(int argc, char **argv) {
     }
 #endif
     if (argc > 1 && strcmp(argv[1], "page-fragments-run") == 0)
-        return public_lock_page_fragments();
+        return public_lock_page_fragments() || public_lock_sweep_share();
     if (PAGE_FRAGMENTS_ONLY && argc <= 1) {
         char *args[] = {"procs-child", "page-fragments-run", NULL}, *env[] = {NULL};
         pid_t child = -1;

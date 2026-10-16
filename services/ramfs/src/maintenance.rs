@@ -27,6 +27,36 @@ impl<const STEPS: usize> Burst<STEPS> {
     }
 }
 
+/// A share of the service's time for one kind of work: at most `budget`
+/// nanoseconds of every `window`. The service sleeps when the work has used
+/// its budget, and the clients below its priority run.
+pub struct Share {
+    window: u64,
+    budget: u64,
+    end: u64,
+    spent: u64,
+}
+impl Share {
+    pub const fn new(window: u64, budget: u64) -> Self {
+        Self {
+            window,
+            budget,
+            end: 0,
+            spent: 0,
+        }
+    }
+    /// The work cost `cost` nanoseconds and ended at `now`. The result is the
+    /// time until which the work waits, when this window's budget is used up.
+    pub fn charge(&mut self, now: u64, cost: u64) -> Option<u64> {
+        if now >= self.end {
+            self.end = now.saturating_add(self.window);
+            self.spent = 0;
+        }
+        self.spent = self.spent.saturating_add(cost);
+        (self.spent >= self.budget).then_some(self.end)
+    }
+}
+
 /// Trying a cancellation proves progress only when it retires a job or
 /// returns a page. A partial data cancellation returns one page per portion.
 pub fn orphan_progress(before: (u16, u16), after: (u16, u16)) -> bool {
@@ -57,6 +87,36 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_share_lets_work_run_until_its_budget_and_waits_for_the_window_to_end() {
+        let mut share = Share::new(10_000, 2_500);
+        assert_eq!(share.charge(1_000, 600), None);
+        assert_eq!(share.charge(1_800, 800), None);
+        // The window opened at 1000 and ends at 11000.
+        assert_eq!(share.charge(2_600, 1_100), Some(11_000));
+        assert_eq!(share.charge(2_700, 100), Some(11_000));
+        // After the end a new window opens with a fresh budget.
+        assert_eq!(share.charge(11_000, 200), None);
+        assert_eq!(share.charge(11_300, 2_400), Some(21_000));
+    }
+
+    #[test]
+    fn work_that_never_stops_gets_the_share_and_no_more() {
+        let mut share = Share::new(10_000, 2_500);
+        let (mut now, mut worked, mut slept) = (0u64, 0u64, 0u64);
+        while now < 1_000_000 {
+            now += 300;
+            worked += 300;
+            if let Some(until) = share.charge(now, 300) {
+                slept += until - now;
+                now = until;
+            }
+        }
+        // A quarter of the time, within one step of rounding.
+        assert!(worked * 100 / now <= 28, "{worked} of {now}");
+        assert!(slept > 0);
+    }
 
     #[test]
     fn stuck_orphan_stops_own_dispatches_after_reaching_every_slot() {

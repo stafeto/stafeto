@@ -118,6 +118,13 @@ unsafe impl Sync for WaitsBss {}
 static WAITS: WaitsBss = WaitsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
 const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
+const PACE_TIMER_LABEL: u64 = 0x5041_4345;
+/// The share of its time that the service gives to the maintenance of locks
+/// (the sweep of the table and the evaluation of waits): at most a quarter of
+/// every window. Beyond it the service sleeps to the end of the window and
+/// the clients below its priority run, however many inodes hold locks.
+const LOCK_WINDOW_NS: u64 = 10_000_000;
+const LOCK_BUDGET_NS: u64 = 2_500_000;
 /// Inodes without locks that one turn of the lock sweep passes. The circle
 /// has 1285 inodes and restarts every period of the wait timer; a turn per
 /// inode kept the service runnable for the whole period and held back the
@@ -224,6 +231,13 @@ fn main(_: u64) -> u64 {
     let Ok(wait_timer) = sys::timer_create(&wait_view, level) else {
         return 3;
     };
+    let Ok(pace_view) = sys::handle_label(&channel, Rights::RECEIVE, PACE_TIMER_LABEL, level)
+    else {
+        return 3;
+    };
+    let Ok(pace_timer) = sys::timer_create(&pace_view, level) else {
+        return 3;
+    };
     let heartbeat = Heartbeat {
         to: &start.parent,
         period_ns,
@@ -255,6 +269,10 @@ fn main(_: u64) -> u64 {
         wait_timer,
         _wait_view: wait_view,
         wait_timer_armed: false,
+        pace_timer,
+        _pace_view: pace_view,
+        lock_share: ramfs::maintenance::Share::new(LOCK_WINDOW_NS, LOCK_BUDGET_NS),
+        lock_paused: false,
         lock_sweep: SweepCursor::default(),
         lock_sweep_pending: false,
         lock_maintenance_turn: false,
@@ -314,6 +332,11 @@ struct Fs {
     wait_timer: Handle<Timer>,
     _wait_view: Handle<Channel>,
     wait_timer_armed: bool,
+    /// Ends the pause of lock maintenance at the end of its window.
+    pace_timer: Handle<Timer>,
+    _pace_view: Handle<Channel>,
+    lock_share: ramfs::maintenance::Share,
+    lock_paused: bool,
     lock_sweep: SweepCursor,
     lock_sweep_pending: bool,
     lock_maintenance_turn: bool,
@@ -1579,6 +1602,11 @@ impl Service<0> for Fs {
             self.notify_maintenance();
             return;
         }
+        if notice.source == rt::abi::Source::Timer && notice.label == PACE_TIMER_LABEL {
+            self.lock_paused = false;
+            self.notify_maintenance();
+            return;
+        }
         if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
             self.maintenance_burst.restart();
             self.legacy_pending = true;
@@ -1594,8 +1622,9 @@ impl Service<0> for Fs {
             );
         }
         let now = rt::time::ticks_to_ns(rt::time::now());
-        self.lock_maintenance_turn = !self.lock_maintenance_turn;
+        self.lock_maintenance_turn = !self.lock_maintenance_turn && !self.lock_paused;
         if self.lock_maintenance_turn {
+            let began = rt::time::ticks_to_ns(rt::time::now());
             self.lock_maintenance_work = (self.lock_maintenance_work + 1) % 2;
             let page = self.lifetimes.as_ref();
             let (storage, descriptions) = self.ram.lock_parts();
@@ -1649,6 +1678,13 @@ impl Service<0> for Fs {
                         let _ = sys::notify(handle, 1);
                     },
                 );
+            }
+            let ended = rt::time::ticks_to_ns(rt::time::now());
+            if let Some(until) = self.lock_share.charge(ended, ended.saturating_sub(began))
+                && self.lock_work_pending()
+            {
+                // The budget of this window is spent: sleep to its end.
+                self.lock_paused = sys::timer_set(&self.pace_timer, until).is_ok();
             }
             self.refresh_wait_timer();
             self.notify_maintenance();
@@ -3077,7 +3113,7 @@ impl Fs {
         }
     }
     fn lock_work_pending(&self) -> bool {
-        self.waits.needs_work() || self.lock_sweep_pending
+        !self.lock_paused && (self.waits.needs_work() || self.lock_sweep_pending)
     }
     fn register_lifetimes(&mut self) -> bool {
         if self.lifetimes.is_some() {

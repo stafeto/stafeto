@@ -3771,6 +3771,10 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
             &outcome,
             "posix-procs: fragmented lock pages: 64 paid pages, 64 target records, one PID death, all pages reclaimed",
         )?;
+        qemu::expect_marker(
+            &outcome,
+            "posix-procs: lock sweep share: clients below the service keep their time through the sweep of locked inodes",
+        )?;
         let steps = longest_steps(&outcome.lines, "2");
         println!("RAM fragmented lock page dispatches (B {RAM_STEP_MAX}): {steps:?}");
         return check_lock_steps("fragmented lock page", &steps, &[50, 65]);
