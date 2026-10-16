@@ -124,6 +124,36 @@ fn series(lines: &[String], prefix: &str, row: &str) -> Option<(usize, u64, u64,
     ))
 }
 
+/// The two images of a ktest run each print the whole table of
+/// `call maximum ticks`: one row per call keeps the larger value, and a
+/// number measured in one image only keeps that value.
+fn merge_call_maxima(lines: Vec<String>) -> Vec<String> {
+    const KEY: &str = "call maximum ticks: ";
+    let value = |r: &str| r.split_once('=').and_then(|(_, v)| v.parse::<u64>().ok());
+    let mut out: Vec<String> = Vec::new();
+    for line in lines {
+        let Some((head, row)) = line.split_once(KEY) else {
+            out.push(line);
+            continue;
+        };
+        let number = row.split('=').next().unwrap_or_default();
+        let same = out.iter().position(|l| {
+            l.split_once(KEY)
+                .is_some_and(|(h, r)| h == head && r.split('=').next() == Some(number))
+        });
+        match same {
+            None => out.push(line),
+            Some(i) => {
+                let old = out[i].split_once(KEY).and_then(|(_, r)| value(r));
+                if value(row) > old {
+                    out[i] = line;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn content(
     name: &str,
     report: &Report,
@@ -140,7 +170,7 @@ fn content(
     );
     let mut kept = report.lines.clone();
     kept.sort_by_key(|(order, _)| *order);
-    let lines: Vec<String> = kept.into_iter().map(|(_, line)| line).collect();
+    let lines = merge_call_maxima(kept.into_iter().map(|(_, line)| line).collect());
     if report.accel.starts_with("hvf") {
         for (label, prefix) in [
             ("", "ipc round trip ticks: "),
@@ -188,6 +218,29 @@ pub fn write_all(target: &Path, kernel: u64, boot: u64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_maxima_of_two_images_join_by_maximum() {
+        let line = |s: &str| s.to_owned();
+        let merged = merge_call_maxima(vec![
+            line("call maximum ticks: 1=5"),
+            line("call maximum ticks: 2=not measured"),
+            line("call maximum ticks: 3=9"),
+            line("icount call maximum ticks: 1=7"),
+            line("call maximum ticks: 1=8"),
+            line("call maximum ticks: 2=4"),
+            line("call maximum ticks: 3=not measured"),
+        ]);
+        assert_eq!(
+            merged,
+            [
+                "call maximum ticks: 1=8",
+                "call maximum ticks: 2=4",
+                "call maximum ticks: 3=9",
+                "icount call maximum ticks: 1=7",
+            ]
+        );
+    }
 
     #[test]
     fn icount_lines_carry_their_label() {

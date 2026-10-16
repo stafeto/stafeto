@@ -82,11 +82,69 @@ impl Cursor {
             self.remaining = self.remaining.saturating_sub(1);
         }
     }
+    /// Passes the slots that `empty` names, at most `limit` of them and never
+    /// the last step of the round: it stays for an ordinary step. Stops at the
+    /// first slot in use. The number of slots passed.
+    pub fn skip_empty(
+        &mut self,
+        slots: usize,
+        limit: usize,
+        empty: impl Fn(usize) -> bool,
+    ) -> usize {
+        let mut passed = 0;
+        while passed < limit && self.remaining > 1 && empty(self.position) {
+            self.complete(false, slots);
+            passed += 1;
+        }
+        passed
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_empty_stops_at_a_slot_in_use_and_at_the_limit() {
+        let mut cursor = Cursor {
+            remaining: 10,
+            ..Cursor::default()
+        };
+        // Slots 1 to 4 are empty, 5 is in use.
+        assert_eq!(cursor.skip_empty(20, 160, |i| i < 5), 4);
+        assert_eq!((cursor.position, cursor.remaining), (5, 6));
+        // The limit ends a run of empty slots early.
+        let mut cursor = Cursor {
+            remaining: 10,
+            ..Cursor::default()
+        };
+        assert_eq!(cursor.skip_empty(20, 3, |_| true), 3);
+        assert_eq!((cursor.position, cursor.remaining), (4, 7));
+    }
+
+    #[test]
+    fn skip_empty_leaves_the_last_step_of_the_round() {
+        let mut cursor = Cursor {
+            remaining: 3,
+            ..Cursor::default()
+        };
+        assert_eq!(cursor.skip_empty(20, 160, |_| true), 2);
+        assert_eq!(cursor.remaining, 1);
+        assert_eq!(cursor.skip_empty(20, 160, |_| true), 0);
+        // An idle cursor passes nothing.
+        let mut idle = Cursor::default();
+        assert_eq!(idle.skip_empty(20, 160, |_| true), 0);
+    }
+
+    #[test]
+    fn skip_empty_wraps_past_the_last_slot() {
+        let mut cursor = Cursor {
+            position: 19,
+            remaining: 10,
+        };
+        assert_eq!(cursor.skip_empty(20, 2, |_| true), 2);
+        assert_eq!(cursor.position, 2);
+    }
 
     #[test]
     fn a_share_lets_work_run_until_its_budget_and_waits_for_the_window_to_end() {

@@ -119,6 +119,14 @@ static WAITS: WaitsBss = WaitsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit
 const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
 const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
 const PACE_TIMER_LABEL: u64 = 0x5041_4345;
+const AUDIT_TIMER_LABEL: u64 = 0x4155_4454;
+/// The time between two steps of the audit. The audit runs on a timer
+/// between them, so that the clients below the service keep their time while
+/// it goes round: a turn after turn of the whole round held them back for as
+/// long as it took.
+const AUDIT_STEP_NS: u64 = 1_000_000;
+/// The slots with no session and no birth that one step of the audit passes.
+const AUDIT_EMPTY_RUN: usize = 160;
 /// The share of its time that the service gives to the maintenance of locks
 /// (the sweep of the table and the evaluation of waits): at most a quarter of
 /// every window. Beyond it the service sleeps to the end of the window and
@@ -238,6 +246,13 @@ fn main(_: u64) -> u64 {
     let Ok(pace_timer) = sys::timer_create(&pace_view, level) else {
         return 3;
     };
+    let Ok(audit_view) = sys::handle_label(&channel, Rights::RECEIVE, AUDIT_TIMER_LABEL, level)
+    else {
+        return 3;
+    };
+    let Ok(audit_timer) = sys::timer_create(&audit_view, level) else {
+        return 3;
+    };
     let heartbeat = Heartbeat {
         to: &start.parent,
         period_ns,
@@ -271,6 +286,11 @@ fn main(_: u64) -> u64 {
         wait_timer_armed: false,
         pace_timer,
         _pace_view: pace_view,
+        audit_timer,
+        _audit_view: audit_view,
+        audit_ready_ns: 0,
+        audit_armed: false,
+        audit_rounds: 0,
         lock_share: ramfs::maintenance::Share::new(LOCK_WINDOW_NS, LOCK_BUDGET_NS),
         lock_paused: false,
         lock_sweep: SweepCursor::default(),
@@ -335,6 +355,15 @@ struct Fs {
     /// Ends the pause of lock maintenance at the end of its window.
     pace_timer: Handle<Timer>,
     _pace_view: Handle<Channel>,
+    /// Ends the wait of the audit between two of its steps.
+    audit_timer: Handle<Timer>,
+    _audit_view: Handle<Channel>,
+    /// The time from which the audit may take its next step.
+    audit_ready_ns: u64,
+    /// Whether the audit waits for its timer.
+    audit_armed: bool,
+    /// The rounds of the audit that ended.
+    audit_rounds: u32,
     lock_share: ramfs::maintenance::Share,
     lock_paused: bool,
     lock_sweep: SweepCursor,
@@ -1602,6 +1631,13 @@ impl Service<0> for Fs {
             self.notify_maintenance();
             return;
         }
+        if notice.source == rt::abi::Source::Timer && notice.label == AUDIT_TIMER_LABEL {
+            self.audit_armed = false;
+            self.maintenance_burst.restart();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
         if notice.source == rt::abi::Source::Timer && notice.label == PACE_TIMER_LABEL {
             self.lock_paused = false;
             self.notify_maintenance();
@@ -1719,9 +1755,7 @@ impl Service<0> for Fs {
             }
             self.legacy_pending = self.maintenance_burst.again(
                 work,
-                work || self.departures.pending()
-                    || self.maintenance.remaining != 0
-                    || self.orphan_count != 0,
+                work || self.departures.pending() || self.audit_pending() || self.orphan_count != 0,
             );
             self.notify_maintenance();
             return;
@@ -1759,13 +1793,33 @@ impl Service<0> for Fs {
             }
             self.legacy_pending = self.maintenance_burst.again(
                 work,
-                work || self.departures.pending()
-                    || self.maintenance.remaining != 0
-                    || self.orphan_count != 0,
+                work || self.departures.pending() || self.audit_pending() || self.orphan_count != 0,
             );
             self.notify_maintenance();
             return;
         }
+        if self.maintenance.remaining != 0
+            && now < self.audit_ready_ns
+            && (self.audit_armed || sys::timer_set(&self.audit_timer, self.audit_ready_ns).is_ok())
+        {
+            // The next step of the audit waits for its time: the service
+            // idles, and the clients below it run.
+            self.audit_armed = true;
+            self.legacy_pending = self.maintenance_burst.again(
+                work,
+                work || self.departures.pending() || self.orphan_count != 0,
+            );
+            self.notify_maintenance();
+            return;
+        }
+        // The slots with no session and no birth pass in this step.
+        let departures = &self.departures;
+        let births = &*self.births;
+        self.maintenance
+            .skip_empty(SESSIONS + BIRTHS, AUDIT_EMPTY_RUN, |i| {
+                Self::slot_empty(departures, births, sessions, i)
+            });
+        self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
         let mut client_work = false;
         let i = self.maintenance.position;
         if self.departures.contains(i) {
@@ -1780,13 +1834,17 @@ impl Service<0> for Fs {
             self.births[i - SESSIONS] = Some((label, fds));
         }
         work |= client_work;
+        let round_open = self.maintenance.remaining != 0;
         self.maintenance.complete(client_work, SESSIONS + BIRTHS);
+        if round_open && self.maintenance.remaining == 0 {
+            self.audit_rounds = self.audit_rounds.wrapping_add(1);
+            #[cfg(feature = "steps")]
+            rt::println!("ramfs: audit round {}", self.audit_rounds);
+        }
         // A maintenance notification makes reclamation progress with no client request.
         self.legacy_pending = self.maintenance_burst.again(
             work,
-            work || self.departures.pending()
-                || self.maintenance.remaining != 0
-                || self.orphan_count != 0,
+            work || self.departures.pending() || self.audit_pending() || self.orphan_count != 0,
         );
         self.notify_maintenance();
     }
@@ -3100,6 +3158,26 @@ impl Fs {
             Ok(()) => Answer::Reply(Outgoing::new()),
             Err(code) => Answer::Status(code),
         }
+    }
+    /// Whether the audit has a step to take now (it does not while it waits
+    /// for its timer).
+    fn audit_pending(&self) -> bool {
+        self.maintenance.remaining != 0 && !self.audit_armed
+    }
+    /// Whether the slot `i` of the audit holds nothing to look at: no
+    /// session, no birth, or a cell that has its own turns of cleanup.
+    fn slot_empty(
+        departures: &ramfs::maintenance::Departures<{ (SESSIONS + BIRTHS).div_ceil(64) }>,
+        births: &[Option<(u64, Fds)>],
+        sessions: &[Option<Session<Fds, 0>>],
+        i: usize,
+    ) -> bool {
+        departures.contains(i)
+            || if i < SESSIONS {
+                sessions.get(i).is_none_or(Option::is_none)
+            } else {
+                births[i - SESSIONS].is_none()
+            }
     }
     fn notify_maintenance(&self) {
         if self.legacy_pending || self.lock_work_pending() {
