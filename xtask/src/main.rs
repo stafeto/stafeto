@@ -5749,6 +5749,43 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         r#"grep -c 'probe\[[0-9]*\]: shown 2' /var/log/messages; grep -c 'after-close 4' /var/log/messages"#,
         &[r#"=1"#, r#"=1"#],
     ),
+    // The habits of ls, du and df (BusyBox's defconfig features, and the
+    // /proc they read): names in order, the date of `ls -l`, no error of du
+    // on /proc by an absolute or a relative path, df's file systems from
+    // /proc/mounts.
+    (
+        r#"mkdir /tmp/lsd; touch /tmp/lsd/b /tmp/lsd/a /tmp/lsd/c; ls /tmp/lsd | tr '\n' ' '; echo; ls -r /tmp/lsd | tr '\n' ' '; echo"#,
+        &[r#"=a b c"#, r#"=c b a"#],
+    ),
+    (
+        r#"ls -l /tmp/lsd | awk 'NR>1 {print $NF}' | tr '\n' ' '; echo; ls -l /tmp/lsd/a | awk '{print NF}'; ls -lt /tmp/lsd | wc -l"#,
+        &[r#"=a b c"#, r#"=9"#, r#"=4"#],
+    ),
+    (
+        r#"cd /; du 2>&1 | grep -c '^du:'; du /proc 2>&1 | grep -c '^du:'; du -s /bin | awk '$2=="/bin" && $1>0 {print "du-s-ok"}'; du -sh /bin | awk '$1~/[MK]$/ {print "du-h-ok"}'"#,
+        &[r#"=0"#, r#"=0"#, r#"du-s-ok"#, r#"du-h-ok"#],
+    ),
+    (
+        r#"cd /proc; du -a . 2>&1 | grep -c '^du:'; cd /; du /etc/../proc 2>&1 | grep -c '^du:'; du -s /tmp /bin | wc -l"#,
+        &[r#"=0"#, r#"=0"#, r#"=2"#],
+    ),
+    (
+        r#"df >/dev/null 2>&1; echo df:$?; df | awk 'NR==2 {print $1, $NF}'; df -h | awk 'NR==2 {print $NF}'; df -k /tmp | awk 'NR==2 {print $6}'; head -1 /proc/mounts"#,
+        &[
+            r#"df:0"#,
+            r#"ramfs /"#,
+            r#"/"#,
+            r#"/"#,
+            r#"ramfs / ramfs rw 0 0"#,
+        ],
+    ),
+    // An applet the shell runs itself leaves its state in the shared buffer
+    // of BusyBox, and ps, forked by the shell, reads it: the shell image
+    // forks ls and cat.
+    (
+        r#"ls / >/dev/null; cat -v /etc/passwd >/dev/null; ls /missing 2>/dev/null; ps -o comm | head -1; ps | head -1"#,
+        &[r#"COMMAND"#, r#"~PID"#],
+    ),
     (
         r#"login-probe utmpx"#,
         &[

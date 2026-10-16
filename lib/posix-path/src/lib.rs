@@ -15,6 +15,41 @@ pub enum PathError {
     Invalid,
 }
 
+/// The simplest form of the absolute path `from`: the empty and `.` parts
+/// dropped and each `..` taking the part before it (the root has none), a
+/// slash at the end kept. The length of the form in `out`; `from` is no
+/// longer than MAX_PATH.
+pub fn simplify(from: &[u8], out: &mut [u8; MAX_PATH + 1]) -> usize {
+    out[0] = b'/';
+    let mut length = 1;
+    for part in from.split(|&byte| byte == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                let mut at = length;
+                while at > 1 && out[at - 1] != b'/' {
+                    at -= 1;
+                }
+                length = (at - 1).max(1);
+            }
+            _ => {
+                if length > 1 {
+                    out[length] = b'/';
+                    length += 1;
+                }
+                out[length..length + part.len()].copy_from_slice(part);
+                length += part.len();
+            }
+        }
+    }
+    if from.last() == Some(&b'/') && length > 1 {
+        out[length] = b'/';
+        length += 1;
+    }
+    out[length] = 0;
+    length
+}
+
 pub struct PathState {
     cwd: [u8; MAX_PATH + 1],
     length: usize,
@@ -72,6 +107,31 @@ impl PathState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn simple(path: &[u8]) -> ([u8; MAX_PATH + 1], usize) {
+        let mut out = [0; MAX_PATH + 1];
+        let length = simplify(path, &mut out);
+        (out, length)
+    }
+
+    macro_rules! assert_simple {
+        ($path:expr, $want:expr) => {{
+            let (out, length) = simple($path);
+            assert_eq!(&out[..length], $want);
+        }};
+    }
+
+    #[test]
+    fn simplify_applies_dots_slashes_and_parents() {
+        assert_simple!(b"/proc/1", b"/proc/1");
+        assert_simple!(b"/./proc//1/", b"/proc/1/");
+        assert_simple!(b"/etc/../proc/uptime", b"/proc/uptime");
+        assert_simple!(b"/a/b/../../proc", b"/proc");
+        assert_simple!(b"/../../proc/1", b"/proc/1");
+        assert_simple!(b"/", b"/");
+        assert_simple!(b"/a/..", b"/");
+        assert_simple!(b"/a/../", b"/");
+    }
 
     fn resolved(state: &PathState, path: &[u8]) -> Result<([u8; MAX_PATH + 1], usize), PathError> {
         let mut out = [0; MAX_PATH + 1];

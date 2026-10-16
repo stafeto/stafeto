@@ -479,8 +479,11 @@ pub fn fstatat(
     let nonempty = path.filter(|path| !path.is_empty());
     if let Some(path) = nonempty {
         #[cfg(feature = "procfs")]
-        if crate::procfs::is_under(path) {
-            return crate::procfs::stat(path);
+        if (path[0] == b'/' || dirfd == AT_FDCWD)
+            && let Some(path) =
+                crate::procfs::absolute(path).filter(crate::procfs::Absolute::is_under)
+        {
+            return crate::procfs::stat(path.bytes());
         }
         let placed = place(dirfd, path)?;
         let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
@@ -656,6 +659,16 @@ fn statvfs_words(request: &Request<'_>) -> Result<Statvfs, c_int> {
 /// statvfs: the file system of `path`. The right to search the directories
 /// above it is all it needs: a file of mode 0 answers.
 pub fn statvfs(path: &[u8]) -> Result<Statvfs, c_int> {
+    // /proc is no file system of the file service: it has no blocks.
+    #[cfg(feature = "procfs")]
+    if let Some(path) = crate::procfs::absolute(path) {
+        if path.is_proc() {
+            return Ok(NO_FILESYSTEM);
+        }
+        if path.is_under() {
+            return crate::procfs::stat(path.bytes()).map(|_| NO_FILESYSTEM);
+        }
+    }
     let placed = place(AT_FDCWD, path)?;
     let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
     if virtual_leaf(transport, &placed, true)?.is_some() {

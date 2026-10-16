@@ -124,6 +124,20 @@ UTILITIES = tuple(name.upper() for name in (
     "feature_tr_equiv feature_xargs_support_args_file feature_xargs_support_confirmation "
     "feature_xargs_support_quotes feature_xargs_support_repl_str feature_xargs_support_termopt "
     "feature_xargs_support_zero_term feature_preserve_hardlinks feature_human_readable "
+    # The features BusyBox's defconfig turns on for these utilities and that
+    # fit the layer. ls sorts its names, shows the times (-c -t -u, the date of
+    # -l), marks the types (-F -p), follows links (-H -L) and recurses (-R);
+    # -w and -T take the width;
+    # du counts in 1K blocks; the others are the usual extras of cat, cp,
+    # cut, dd, echo, mesg, sleep, tail, tee, wc, xargs and ash's arithmetic.
+    "feature_ls_sortfiles feature_ls_timestamps feature_ls_filetypes "
+    "feature_ls_followlinks feature_ls_recursive feature_ls_width "
+    "feature_du_default_blocksize_1k feature_fancy_echo feature_fancy_sleep "
+    "feature_fancy_tail feature_catn feature_catv feature_cut_regex "
+    "feature_dd_signal_handling feature_dd_third_status_line "
+    "feature_tee_use_block_io feature_wc_large feature_xargs_support_parallel "
+    "feature_mesg_enable_only_group feature_bc_interactive feature_sh_math_64 "
+    "feature_sh_math_base feature_sh_read_frac feature_sh_histfilesize "
     "").split()) + OWN_CONFIGS
 
 
@@ -197,19 +211,19 @@ def build(utilities: bool) -> None:
         shutil.rmtree(SOURCE)
     run("tar", "-xjf", str(ARCHIVE), "-C", str(work))
     (work / f"busybox-{VERSION}").rename(SOURCE)
-    replace(SOURCE / "coreutils/cat.c",
-            "APPLET(cat, BB_DIR_BIN, BB_SUID_DROP)",
-            "APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat)")
-    replace(SOURCE / "coreutils/ls.c",
-            "APPLET_NOEXEC(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)",
-            "APPLET_NOFORK(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)")
-    # The applets of names run inside ash without a fork, as ls does: the
-    # probe's image has no process to fork for them.
-    for applet, directory in (("mv", "BB_DIR_BIN"), ("rm", "BB_DIR_BIN"),
-                              ("ln", "BB_DIR_BIN"), ("chmod", "BB_DIR_BIN")):
-        replace(SOURCE / f"coreutils/{applet}.c",
-                f"APPLET_NOEXEC({applet}, {applet}, {directory}, BB_SUID_DROP, {applet})",
-                f"APPLET_NOFORK({applet}, {applet}, {directory}, BB_SUID_DROP, {applet})")
+    # The small build of the probes has no process to fork for these
+    # applets, so they run inside ash without a fork. The shell image forks
+    # them like BusyBox does: an applet that runs in the shell leaves its
+    # state in bb_common_bufsiz1 (ls, cat -v), and the applets the shell
+    # forks (ps) start from a buffer they take for zero.
+    if not utilities:
+        replace(SOURCE / "coreutils/cat.c",
+                "APPLET(cat, BB_DIR_BIN, BB_SUID_DROP)",
+                "APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat)")
+        for applet in ("ls", "mv", "rm", "ln", "chmod"):
+            replace(SOURCE / f"coreutils/{applet}.c",
+                    f"APPLET_NOEXEC({applet}, {applet}, BB_DIR_BIN, BB_SUID_DROP, {applet})",
+                    f"APPLET_NOFORK({applet}, {applet}, BB_DIR_BIN, BB_SUID_DROP, {applet})")
     # relibc next to the other C libraries of platform.h: the glibc
     # extensions it lacks, alloca from its own header, and the declaration
     replace(SOURCE / "include/platform.h",
@@ -303,8 +317,10 @@ def build(utilities: bool) -> None:
     # image only: the small build of the probes has no room for it (the
     # quota of a test of os-test holds the shell of popen with 10% to
     # spare). Cursor keys, Home, End, Delete, Ctrl-A/E/K/U/W, history with
-    # Ctrl-R search, Tab completion of names and the escapes of PS1; the
-    # terminal answers TIOCGWINSZ, so the editor asks it for the screen.
+    # Ctrl-R search, Tab completion of names and the escapes of PS1. The
+    # terminal answers TIOCGWINSZ with a screen of 0 by 0 and BusyBox reads
+    # that as unknown: the editor and ls take the 80 by 24 of its default
+    # (or the sizes of LINES and COLUMNS).
     if utilities:
         replace(config, "# CONFIG_FEATURE_EDITING is not set", "CONFIG_FEATURE_EDITING=y")
         replace(config, "CONFIG_FEATURE_EDITING_MAX_LEN=0", "CONFIG_FEATURE_EDITING_MAX_LEN=1024")
