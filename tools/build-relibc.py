@@ -54,7 +54,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # Then the checks of F13: the ceiling replaced at the old one, nice EPERM,
 # the scheduling attributes of posix_spawn, an own PRIO_INHERIT mutex; tagged
 # pin-b5af44ca.
-COMMIT = "b5af44ca5c688b2b5c9b55a471a4a4fba01bb8f4"
+# Terminal size: the standard error is not buffered, so that resize's question
+# to the terminal goes out before it reads the answer; tagged pin-e4311c19.
+COMMIT = "e4311c199e2c13a6f406bbbf4928c1661b6a6332"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

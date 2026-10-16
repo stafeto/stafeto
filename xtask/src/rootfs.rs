@@ -202,7 +202,7 @@ fn devices() -> [RootFile; 5] {
 /// The names of /bin that hold BusyBox (Ф10): the utilities of XCU that are
 /// programs (the other ten of the 112 are builtins of the shell, `sh` is
 /// listed with the shell) and the applets the probes use (`mktemp`, `nc`).
-pub const UTILITIES: [&str; 86] = [
+pub const UTILITIES: [&str; 88] = [
     "awk",
     "basename",
     "bc",
@@ -262,6 +262,7 @@ pub const UTILITIES: [&str; 86] = [
     "readlink",
     "realpath",
     "renice",
+    "resize",
     "rm",
     "rmdir",
     "sed",
@@ -275,6 +276,7 @@ pub const UTILITIES: [&str; 86] = [
     "test",
     "time",
     "timeout",
+    "top",
     "touch",
     "tr",
     "true",

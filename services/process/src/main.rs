@@ -2385,6 +2385,16 @@ fn kernel(e: abi::Error) -> Answer {
     Answer::Status(Status::Kernel(e))
 }
 
+/// The pool a List reply ends with: the service's quota, and what of it is
+/// left to give to children (as `free_quota`).
+fn pool() -> proto_process::Pool {
+    let memory = sys::process_memory(&make::own()).ok();
+    proto_process::Pool {
+        total: memory.map_or(0, |m| m.quota),
+        free: memory.map_or(0, |m| m.quota.saturating_sub(m.used)),
+    }
+}
+
 /// The service's quota left, of which the children's quotas come past
 /// its reserve (loaders::pool_allows).
 fn free_quota() -> u64 {
@@ -2712,6 +2722,7 @@ impl Processes {
                 .u32(0)
                 .and_then(|()| w.u32(proto_process::LIST_END))
                 .and_then(|()| w.u32(0))
+                .and_then(|()| pool().write(w))
                 .is_ok()
             {
                 Answer::Reply(Outgoing::new())
@@ -2763,12 +2774,14 @@ impl Processes {
                             ticks: record
                                 .carried_ticks
                                 .saturating_add(sys::process_time(&record.process).unwrap_or(0)),
+                            memory: sys::process_memory(&record.process).map_or(0, |m| m.used),
                             name: record.name,
                         }
                         .write(w)
                     })
                 }
-            });
+            })
+            .and_then(|()| pool().write(w));
         if ok.is_err() {
             return Answer::Status(Status::BadSize);
         }
