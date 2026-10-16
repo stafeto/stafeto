@@ -5990,11 +5990,12 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
         "awk '$1==\"VmRSS:\" {print ($2>0)}' /proc/$$/status",
         &["1"],
     )?;
-    // The counters only grow: the time of a child that ran and ended stays
-    // in the sum of the cpu line and out of the idle time of uptime.
+    // The counters only grow: the time of a child that ran, seen while it
+    // lived, stays in the sum of the cpu line (and out of the idle time of
+    // uptime) once it ended.
     dialog_command(
         run,
-        "a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); awk 'BEGIN {for (i = 0; i < 2000000; i++) x += i}'; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
+        "awk 'BEGIN {for (i = 0; i < 1000000; i++) x += i}' & p=$!; sleep 1.5; a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); wait $p; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
         &["cpu-grew", "idle-grew"],
     )
 }
