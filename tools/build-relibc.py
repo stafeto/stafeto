@@ -44,11 +44,11 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # F11b: message queues and named semaphores, the XSI queues, semaphore sets and
 # segments over the pipe service, nl_types, DES crypt, setkey and encrypt,
 # getdate, if_indextoname, dlopen(NULL) with honest errors, _POSIX_MESSAGE_PASSING
-# and _POSIX_SEMAPHORES; tagged pin-ccd88b59.
+# and _POSIX_SEMAPHORES; tagged pin-c0293c50.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "16b22b98b4b1b64520d7d63704404ac4520a9c7c"
+COMMIT = "c0293c503c1f46bf5a5221606de145d9b2806f4b"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

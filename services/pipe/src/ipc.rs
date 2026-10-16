@@ -2413,7 +2413,8 @@ mod tests {
 
     /// A name for the file of a new segment, as the library draws one.
     fn nonce() -> u64 {
-        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x5eed_0000);
+        static NEXT: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0x5eed_0000);
         NEXT.fetch_add(0x9e37, core::sync::atomic::Ordering::Relaxed)
     }
 
@@ -3081,7 +3082,12 @@ mod tests {
     #[test]
     fn a_segment_is_counted_attached_and_goes_with_its_last_detach() {
         let (mut p, mut r) = (pipes(), Run::new());
-        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
+        let out = r.ok(
+            &mut p,
+            op::SHM_GET,
+            &with_cred(&[0, 4096, 0o600, nonce()]),
+            b"",
+        );
         let (id, serial) = (out.words[0], out.words[1]);
         let st = r.ok(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_STAT]), b"");
         assert_eq!(
@@ -3122,16 +3128,31 @@ mod tests {
             )
             .words[0];
         assert_eq!(
-            r.ok(&mut p, op::SHM_GET, &with_cred(&[9, 100, 0o600, nonce()]), b"")
-                .words[0],
+            r.ok(
+                &mut p,
+                op::SHM_GET,
+                &with_cred(&[9, 100, 0o600, nonce()]),
+                b""
+            )
+            .words[0],
             id
         );
         assert_eq!(
-            r.err(&mut p, op::SHM_GET, &with_cred(&[9, 8192, 0o600, nonce()]), b""),
+            r.err(
+                &mut p,
+                op::SHM_GET,
+                &with_cred(&[9, 8192, 0o600, nonce()]),
+                b""
+            ),
             22
         );
         assert_eq!(
-            r.err(&mut p, op::SHM_GET, &with_cred(&[0, 0, 0o600, nonce()]), b""),
+            r.err(
+                &mut p,
+                op::SHM_GET,
+                &with_cred(&[0, 0, 0o600, nonce()]),
+                b""
+            ),
             22
         );
         let (flow, _) = r.call(&mut p, 77, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
@@ -3311,7 +3332,12 @@ mod tests {
     #[test]
     fn a_child_holds_what_its_parent_holds_and_exec_lets_it_go() {
         let (mut p, mut r) = (pipes(), Run::new());
-        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
+        let out = r.ok(
+            &mut p,
+            op::SHM_GET,
+            &with_cred(&[0, 4096, 0o600, nonce()]),
+            b"",
+        );
         let id = out.words[0];
         let (flow, _) = r.call(&mut p, 10, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
         assert_eq!(flow, Ok(Flow::Done));
@@ -3348,7 +3374,12 @@ mod tests {
     fn a_child_is_refused_when_the_holds_have_no_room() {
         let (mut p, mut r) = (pipes(), Run::new());
         let id = r
-            .ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"")
+            .ok(
+                &mut p,
+                op::SHM_GET,
+                &with_cred(&[0, 4096, 0o600, nonce()]),
+                b"",
+            )
             .words[0];
         for label in 100..100 + HOLD_MAX as u64 {
             let (flow, _) = r.call(&mut p, label, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
@@ -3360,7 +3391,12 @@ mod tests {
     #[test]
     fn a_freed_segment_names_its_file_to_its_creator_until_it_is_removed() {
         let (mut p, mut r) = (pipes(), Run::new());
-        let out = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
+        let out = r.ok(
+            &mut p,
+            op::SHM_GET,
+            &with_cred(&[0, 4096, 0o600, nonce()]),
+            b"",
+        );
         let (id, serial) = (out.words[0], out.words[1]);
         let (flow, _) = r.call(&mut p, 77, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
         assert_eq!(flow, Ok(Flow::Done));
@@ -3376,12 +3412,27 @@ mod tests {
         while p.ipc_step(&mut w) {}
         // Another user is not told of the file; its creator is, once.
         r.who.uid = 2000;
-        let other = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
+        let other = r.ok(
+            &mut p,
+            op::SHM_GET,
+            &with_cred(&[0, 4096, 0o600, nonce()]),
+            b"",
+        );
         assert_eq!(other.words[3], 0);
         r.who = WHO;
-        let again = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
+        let again = r.ok(
+            &mut p,
+            op::SHM_GET,
+            &with_cred(&[0, 4096, 0o600, nonce()]),
+            b"",
+        );
         assert_eq!(again.words[3], serial);
-        let third = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600, nonce()]), b"");
+        let third = r.ok(
+            &mut p,
+            op::SHM_GET,
+            &with_cred(&[0, 4096, 0o600, nonce()]),
+            b"",
+        );
         assert_eq!(third.words[3], 0);
     }
 
@@ -3417,8 +3468,16 @@ mod tests {
         assert_eq!(r.err(&mut p, op::SHM_GET, &w(0xabcdef), b""), 17);
         // The answers of an attach name who may own the file.
         let at = r.ok(&mut p, op::SHM_AT, &with_cred(&[out.words[0], 0]), b"");
-        assert_eq!((at.words[0], at.words[1], at.words[2], at.words[3]), (0xabcdef, 4096, 1000, 1000));
-        let st = r.ok(&mut p, op::SHM_CTL, &with_cred(&[out.words[0], IPC_STAT]), b"");
+        assert_eq!(
+            (at.words[0], at.words[1], at.words[2], at.words[3]),
+            (0xabcdef, 4096, 1000, 1000)
+        );
+        let st = r.ok(
+            &mut p,
+            op::SHM_CTL,
+            &with_cred(&[out.words[0], IPC_STAT]),
+            b"",
+        );
         assert_eq!(st.words[14], 0xabcdef);
     }
 }
