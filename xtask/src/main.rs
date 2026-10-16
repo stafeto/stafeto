@@ -28,11 +28,11 @@ mod owner_lifetime;
 mod service_sample;
 
 mod disasm;
-mod nano_dialog;
 mod entropy;
 mod image;
 mod jobs;
 mod measure;
+mod nano_dialog;
 mod native_scopes;
 #[cfg(test)]
 #[path = "../../lib/posix-thread/tests/native_stop_barrier.rs"]
