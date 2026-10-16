@@ -3036,10 +3036,12 @@ fn busybox_build() -> Result<(), String> {
     })
 }
 
-/// ncurses, nano and htop built (the objects tests/nano and tests/htop link
-/// and the terminfo entries of the image), once in a run of xtask.
+/// ncurses, nano, htop and bash built (the objects tests/nano, tests/htop and
+/// tests/bash link, and the terminfo entries of the image), once in a run of
+/// xtask. The shell image holds all of them, so each dialog needs all.
 fn nano_build() -> Result<(), String> {
     once(&NANO_BUILT, (), || {
+        bash_build()?;
         run_cmd(Command::new("python3").arg(root().join("tools/build-ncurses.py")))?;
         run_cmd(Command::new("python3").arg(root().join("tools/build-nano.py")))?;
         run_cmd(Command::new("python3").arg(root().join("tools/build-htop.py")))
