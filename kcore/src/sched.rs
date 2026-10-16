@@ -177,6 +177,12 @@ pub struct Node<T> {
     /// The boost by a notification slot or a request (spec 6.6), already
     /// cut down to the ceiling of the thread's process; 0 for none.
     boost: u8,
+    /// Ticks the thread has run, summed over its finished stints on the
+    /// CPU (spec 8: the CPU time `object_info` reports).
+    ran: u64,
+    /// The counter value at which the current stint began; meaningful
+    /// while the thread is the running one.
+    since: u64,
     /// The level is the effective priority.
     link: Link<T>,
 }
@@ -191,6 +197,8 @@ impl<T> Node<T> {
             slice_left: 0,
             base: priority,
             boost: 0,
+            ran: 0,
+            since: 0,
             link: Link::new(priority),
         }
     }
@@ -221,6 +229,26 @@ impl<T> Node<T> {
         self.policy
     }
 
+    /// Ticks of the finished stints on the CPU, without the current one.
+    pub fn ran(&self) -> u64 {
+        self.ran
+    }
+
+    /// The counter value at which the current stint began.
+    pub fn since(&self) -> u64 {
+        self.since
+    }
+
+    /// Ticks the thread has run at `now`: the finished stints and, for the
+    /// running thread, the current one. O(1).
+    pub fn ran_at(&self, now: u64) -> u64 {
+        if self.state == State::Running {
+            self.ran.saturating_add(now.saturating_sub(self.since))
+        } else {
+            self.ran
+        }
+    }
+
     pub fn state(&self) -> State {
         self.state
     }
@@ -238,6 +266,14 @@ impl<T> Node<T> {
 /// at, valid as long as that object lives.
 pub unsafe trait Schedulable: Sized {
     fn node(this: NonNull<Self>) -> NonNull<Node<Self>>;
+
+    /// A stint of `ticks` ended: the object adds it to the sum of the
+    /// thread's process. Called once for each stint, as the thread leaves
+    /// the CPU; idle time and cleanup are in no stint.
+    ///
+    /// # Safety
+    /// `this` is alive.
+    unsafe fn charge(this: NonNull<Self>, ticks: u64);
 }
 
 // SAFETY: the link is a field of the node, which lives as long as the
@@ -480,6 +516,24 @@ impl<T: Schedulable> Scheduler<T> {
         &self.ready
     }
 
+    /// The stint of the running thread `r` ends at `now`: its length goes
+    /// to the thread and to the sum of its process (`Schedulable::charge`).
+    /// Every way off the CPU comes here, once.
+    ///
+    /// # Safety
+    /// `r` is alive and was the running thread.
+    unsafe fn charge(r: NonNull<T>, now: u64) {
+        // SAFETY: the caller's promise.
+        let ticks = unsafe {
+            let n = node(r);
+            let ticks = now.saturating_sub(n.since);
+            n.ran = n.ran.saturating_add(ticks);
+            ticks
+        };
+        // SAFETY: as above.
+        unsafe { T::charge(r, ticks) };
+    }
+
     /// The thread on the CPU; None while the kernel idles.
     pub fn running(&self) -> Option<NonNull<T>> {
         self.running
@@ -563,6 +617,7 @@ impl<T: Schedulable> Scheduler<T> {
             self.ready.remove(next);
             let n = node(next);
             n.state = State::Running;
+            n.since = now;
             self.slice_end = now.saturating_add(n.slice_left);
             // The field counts only while the thread is ready: whatever
             // puts it back gives it a quantum or the rest of this one.
@@ -590,6 +645,7 @@ impl<T: Schedulable> Scheduler<T> {
         // SAFETY: the caller's promise; the node's borrow ends before the
         // list takes the thread.
         unsafe {
+            Self::charge(r, now);
             let n = node(r);
             let ended = n.policy == Policy::RoundRobin && rest == 0;
             n.state = State::Ready;
@@ -620,6 +676,8 @@ impl<T: Schedulable> Scheduler<T> {
             if n.policy != Policy::RoundRobin || now < self.slice_end {
                 return;
             }
+            Self::charge(r, now);
+            let n = node(r);
             n.state = State::Ready;
             n.slice_left = self.quantum;
             self.ready.push_tail(r);
@@ -634,12 +692,13 @@ impl<T: Schedulable> Scheduler<T> {
     ///
     /// # Safety
     /// As for `pick`.
-    pub unsafe fn yield_running(&mut self) {
+    pub unsafe fn yield_running(&mut self, now: u64) {
         let Some(r) = self.running.take() else {
             return;
         };
         // SAFETY: the running thread is alive.
         unsafe {
+            Self::charge(r, now);
             let n = node(r);
             n.state = State::Ready;
             n.slice_left = self.quantum;
@@ -776,10 +835,13 @@ impl<T: Schedulable> Scheduler<T> {
     ///
     /// # Safety
     /// As for `pick`.
-    pub unsafe fn block(&mut self) -> NonNull<T> {
+    pub unsafe fn block(&mut self, now: u64) -> NonNull<T> {
         let r = self.running.take().expect("no thread runs to wait");
         // SAFETY: the running thread is alive.
-        unsafe { node(r) }.state = State::Waiting;
+        unsafe {
+            Self::charge(r, now);
+            node(r).state = State::Waiting;
+        }
         r
     }
 
@@ -809,11 +871,14 @@ impl<T: Schedulable> Scheduler<T> {
     ///
     /// # Safety
     /// The scheduler's threads are alive; `t` is the running thread.
-    pub unsafe fn park(&mut self, t: NonNull<T>) {
+    pub unsafe fn park(&mut self, t: NonNull<T>, now: u64) {
         assert!(self.running == Some(t), "parking a thread off the CPU");
         self.running = None;
         // SAFETY: the caller holds the running thread.
-        unsafe { node(t) }.state = State::Parked;
+        unsafe {
+            Self::charge(t, now);
+            node(t).state = State::Parked;
+        }
     }
 
     /// Continues a parked thread at its current level with a new quantum.
@@ -852,6 +917,7 @@ impl<T: Schedulable> Scheduler<T> {
             "a hand-off passes a ready thread"
         );
         n.state = State::Running;
+        n.since = now;
         n.slice_left = 0;
         self.slice_end = now.saturating_add(self.quantum);
         self.running = Some(t);
@@ -864,7 +930,7 @@ impl<T: Schedulable> Scheduler<T> {
     ///
     /// # Safety
     /// `t` is alive; after this the scheduler no longer refers to it.
-    pub unsafe fn exit(&mut self, t: NonNull<T>) {
+    pub unsafe fn exit(&mut self, t: NonNull<T>, now: u64) {
         // SAFETY: the caller's promise.
         let (state, queued) = unsafe {
             let n = node(t);
@@ -877,6 +943,8 @@ impl<T: Schedulable> Scheduler<T> {
                     "a running thread is not the running one"
                 );
                 self.running = None;
+                // SAFETY: the caller's promise.
+                unsafe { Self::charge(t, now) };
             }
             // SAFETY: a ready thread is in the queue.
             State::Ready => unsafe { self.ready.remove(t) },
@@ -957,7 +1025,7 @@ mod tests {
                 let Decision::Run(t) = w.s.pick(0, None) else {
                     panic!("no thread")
                 };
-                w.s.park(t);
+                w.s.park(t, 0);
                 parked.push(t);
             }
         }
@@ -1001,6 +1069,9 @@ mod tests {
     struct Fake {
         node: Node<Fake>,
         name: char,
+        /// What `charge` added: the sum of the thread's stints, as its
+        /// process would keep it.
+        charged: u64,
     }
 
     // SAFETY: the node is a field of the fake thread.
@@ -1008,6 +1079,11 @@ mod tests {
         fn node(this: NonNull<Fake>) -> NonNull<Node<Fake>> {
             // SAFETY: `this` points at a live fake thread.
             unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).node) }
+        }
+
+        unsafe fn charge(this: NonNull<Fake>, ticks: u64) {
+            // SAFETY: `this` points at a live fake thread.
+            unsafe { (*this.as_ptr()).charged += ticks };
         }
     }
 
@@ -1020,6 +1096,9 @@ mod tests {
         )]
         threads: Vec<Box<Fake>>,
         s: Scheduler<Fake>,
+        /// The time of the last decision, tick or yield: the moment the
+        /// helpers that take no time end a stint at.
+        now: u64,
     }
 
     impl World {
@@ -1027,6 +1106,7 @@ mod tests {
             World {
                 threads: Vec::new(),
                 s: Scheduler::new(Q),
+                now: 0,
             }
         }
 
@@ -1035,6 +1115,7 @@ mod tests {
             let mut b = Box::new(Fake {
                 node: Node::new(priority, policy),
                 name,
+                charged: 0,
             });
             let t = NonNull::from(&mut *b);
             self.threads.push(b);
@@ -1063,6 +1144,7 @@ mod tests {
         /// `cleanup`: the name of the thread that runs, '*' for a portion
         /// of cleanup, '-' for idle.
         fn decide(&mut self, now: u64, cleanup: Option<u8>) -> char {
+            self.now = now;
             // SAFETY: as above.
             match unsafe { self.s.pick(now, cleanup) } {
                 Decision::Run(t) => name(t),
@@ -1073,6 +1155,7 @@ mod tests {
 
         /// The timer's interrupt at `now`, then a decision.
         fn tick(&mut self, now: u64) -> char {
+            self.now = now;
             // SAFETY: as above.
             unsafe { self.s.tick(now) };
             self.pick(now)
@@ -1080,7 +1163,7 @@ mod tests {
 
         fn yield_at(&mut self, now: u64) -> char {
             // SAFETY: as above.
-            unsafe { self.s.yield_running() };
+            unsafe { self.s.yield_running(now) };
             self.pick(now)
         }
 
@@ -1091,13 +1174,13 @@ mod tests {
 
         fn exit(&mut self, t: NonNull<Fake>) {
             // SAFETY: as above.
-            unsafe { self.s.exit(t) };
+            unsafe { self.s.exit(t, self.now) };
         }
 
         /// The running thread waits, as in `receive` with nothing to take.
         fn block(&mut self) -> NonNull<Fake> {
             // SAFETY: as above.
-            unsafe { self.s.block() }
+            unsafe { self.s.block(self.now) }
         }
 
         fn wake(&mut self, t: NonNull<Fake>) {
@@ -1156,6 +1239,7 @@ mod tests {
         let mut a = Box::new(Fake {
             node: Node::new(10, RR),
             name: 'a',
+            charged: 0,
         });
         let t = NonNull::from(&mut *a);
         // SAFETY: the thread outlives its time in the scheduler.
@@ -1163,7 +1247,7 @@ mod tests {
             s.start(t).unwrap();
             assert!(matches!(s.pick(MS, None), Decision::Run(r) if r == t));
             assert_eq!(s.deadline(None), Some(5 * MS));
-            s.exit(t);
+            s.exit(t, 2 * MS);
         }
     }
 
@@ -2269,5 +2353,97 @@ mod tests {
         // SAFETY: the item stays alive and in place while queued.
         unsafe { q.push_tail(i) };
         item.link.set_level(4);
+    }
+
+    /// The CPU time of a thread (spec 8): every stint is charged once, at
+    /// the way off the CPU, and what the threads were charged equals the
+    /// time something ran. Idle time belongs to nobody.
+    fn charged(w: &World) -> u64 {
+        w.threads.iter().map(|t| t.charged).sum()
+    }
+
+    #[test]
+    fn charges_equal_the_time_outside_idle() {
+        let mut w = World::new();
+        let a = w.started('a', 10, RR);
+        let b = w.started('b', 10, RR);
+        // a runs 0..4 ms, then its quantum ends and b runs 4..6 ms and
+        // waits; a runs 6..7 ms and exits; then idle 7..9 ms.
+        assert_eq!(w.pick(0), 'a');
+        assert_eq!(w.tick(4 * MS), 'b');
+        assert_eq!(node(a).ran(), 4 * MS);
+        assert_eq!(node(b).ran_at(5 * MS), MS);
+        w.now = 6 * MS;
+        let blocked = w.block();
+        assert_eq!(blocked, b);
+        assert_eq!(w.pick(6 * MS), 'a');
+        w.now = 7 * MS;
+        w.exit(a);
+        assert_eq!(w.pick(7 * MS), '-');
+        // Two idle ms later b wakes at 9 ms and runs to 10 ms.
+        w.wake(b);
+        assert_eq!(w.pick(9 * MS), 'b');
+        assert_eq!(node(b).ran_at(10 * MS), 2 * MS + MS);
+        w.now = 10 * MS;
+        w.exit(b);
+        assert_eq!(node(a).ran(), 5 * MS);
+        assert_eq!(node(b).ran(), 3 * MS);
+        assert_eq!(a_charged(&w, 'a'), 5 * MS);
+        // Busy time: 0..7 ms and 9..10 ms.
+        assert_eq!(charged(&w), 8 * MS);
+    }
+
+    fn a_charged(w: &World, name: char) -> u64 {
+        w.threads.iter().find(|t| t.name == name).unwrap().charged
+    }
+
+    #[test]
+    fn a_preempted_thread_is_charged_once_and_a_picked_one_not_at_all() {
+        let mut w = World::new();
+        let low = w.started('l', 10, FIFO);
+        assert_eq!(w.pick(0), 'l');
+        // A thread above it becomes ready at 3 ms; the decision takes the
+        // CPU from `low`, which is charged 3 ms; a second decision
+        // charges nothing more.
+        let high = w.started('h', 20, FIFO);
+        assert_eq!(w.pick(3 * MS), 'h');
+        assert_eq!(w.pick(3 * MS), 'h');
+        assert_eq!(w.pick(4 * MS), 'h');
+        assert_eq!(node(low).ran(), 3 * MS);
+        assert_eq!(node(high).ran(), 0);
+        assert_eq!(node(high).ran_at(4 * MS), MS);
+        assert_eq!(charged(&w), 3 * MS);
+    }
+
+    #[test]
+    fn parking_and_yielding_charge_the_stint() {
+        let mut w = World::new();
+        let a = w.started('a', 10, FIFO);
+        assert_eq!(w.pick(MS), 'a');
+        assert_eq!(w.yield_at(3 * MS), 'a');
+        assert_eq!(node(a).ran(), 2 * MS);
+        // SAFETY: the world owns the thread, which runs.
+        unsafe { w.s.park(a, 5 * MS) };
+        assert_eq!(node(a).ran(), 4 * MS);
+        assert_eq!(node(a).ran_at(9 * MS), 4 * MS);
+        assert_eq!(charged(&w), 4 * MS);
+    }
+
+    #[test]
+    fn a_hand_off_starts_the_stint_of_the_receiver() {
+        let mut w = World::new();
+        let sender = w.started('s', 10, FIFO);
+        let receiver = w.started('r', 20, FIFO);
+        assert_eq!(w.pick(0), 'r');
+        w.now = MS;
+        assert_eq!(w.block(), receiver);
+        assert_eq!(w.pick(MS), 's');
+        w.now = 2 * MS;
+        assert_eq!(w.block(), sender);
+        // The sender sent, so the receiver runs at once.
+        // SAFETY: the receiver waits, above every ready thread.
+        unsafe { w.s.hand_off(receiver, 2 * MS) };
+        assert_eq!(node(receiver).ran_at(5 * MS), MS + 3 * MS);
+        assert_eq!(node(sender).ran(), MS);
     }
 }

@@ -138,6 +138,10 @@ pub struct Process {
     pools: Pools,
     /// No thread of the process gets a base priority above it (spec 8).
     ceiling: u8,
+    /// Counter ticks its threads have run, finished stints of threads that
+    /// ended included; the scheduler adds each stint as the thread leaves
+    /// the CPU (`Schedulable::charge`), under its lock.
+    cpu_ticks: u64,
     /// The threads it started and whether it ended, and why. A process
     /// lives exactly while it is whole (`stage`).
     life: Life,
@@ -283,6 +287,17 @@ impl Process {
     pub fn ceiling(&self) -> u8 {
         self.ceiling
     }
+
+    /// Ticks the process's threads have run, the stint of the running one
+    /// not included.
+    pub fn cpu_ticks(&self) -> u64 {
+        self.cpu_ticks
+    }
+
+    /// A stint of `ticks` ended (`Schedulable::charge`).
+    pub(crate) fn charge(&mut self, ticks: u64) {
+        self.cpu_ticks = self.cpu_ticks.saturating_add(ticks);
+    }
 }
 
 /// A process with a quota of `quota` bytes, an empty address space, an
@@ -327,6 +342,7 @@ fn create(
             irqs: Pool::new(),
         },
         ceiling,
+        cpu_ticks: 0,
         life: Life::new(),
         threads: None,
         thread_count: 0,
