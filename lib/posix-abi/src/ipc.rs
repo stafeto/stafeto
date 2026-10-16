@@ -14,13 +14,13 @@
 use crate::constants::*;
 use crate::long;
 use crate::shared;
+use core::sync::atomic::{AtomicBool, Ordering};
 use posix_fs::{DescriptorFlags, Target, Transport};
 use proto_pipe::Method;
 pub use proto_pipe::ipc::WORDS_MAX;
 use proto_pipe::ipc::{Answer, Call, Cred, errno_of, op};
 use proto_pipe::sock::SOCK_END;
 use proto_wire::{Reader, Status, Writer};
-use core::sync::atomic::{AtomicBool, Ordering};
 use rt::abi::MESSAGE_MAX;
 
 /// No deadline.
@@ -82,7 +82,9 @@ fn short(transport: Transport, call: &Call<'_>, out: &mut [u8]) -> Result<Reply,
                 .and_then(|identity| {
                     rt::sys::handle_duplicate(
                         identity,
-                        rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER | rt::abi::Rights::DUPLICATE,
+                        rt::abi::Rights::NOTIFY
+                            | rt::abi::Rights::TRANSFER
+                            | rt::abi::Rights::DUPLICATE,
                     )
                     .ok()
                 })

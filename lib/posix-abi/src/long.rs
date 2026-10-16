@@ -105,6 +105,7 @@ impl Drop for ShortScope {
 /// One request to `service` and its long reply, copied into `out`: the
 /// kind and, for READY, the length. EINTR when the kernel interrupted the
 /// request before its reply; a refusal as `refusal` says.
+#[allow(clippy::too_many_arguments)]
 fn call(
     service: &Handle<Channel>,
     request: &[u8],

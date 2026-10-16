@@ -17,9 +17,9 @@
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
-use posix_credentials::known::Known;
 use pipe::ipc::{Block, Flow, IPC_TAG, Out};
 use pipe::{Held, Pipes, Roots, Wakes};
+use posix_credentials::known::Known;
 use proto_init::ServiceArgs;
 use proto_pipe::ipc::{Call, NEED_ID, Who, op as ipc_op};
 use proto_pipe::sock::{Addr, Received, Recv, SEND_MAX, Send};
@@ -806,9 +806,15 @@ impl PipeService {
         let mut out = Out::new();
         let mut wakes = Wakes::default();
         let (label, root) = (r.label(), s.data.root);
-        let flow = self
-            .pipes
-            .ipc_call(&mut s.data.held, label, root, &call, who, &mut out, &mut wakes);
+        let flow = self.pipes.ipc_call(
+            &mut s.data.held,
+            label,
+            root,
+            &call,
+            who,
+            &mut out,
+            &mut wakes,
+        );
         self.tell(&wakes);
         match flow {
             Ok(Flow::Done) => {

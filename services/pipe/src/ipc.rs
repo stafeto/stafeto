@@ -1123,8 +1123,8 @@ impl Ipc {
         if bytes.len() as u32 > queue.qbytes {
             return Err(fail(EINVAL));
         }
-        let queue_full =
-            queue.bytes + bytes.len() as u32 > queue.qbytes || usize::from(queue.count) >= QUEUE_MSGS;
+        let queue_full = queue.bytes + bytes.len() as u32 > queue.qbytes
+            || usize::from(queue.count) >= QUEUE_MSGS;
         if queue_full || self.pool_full(q) {
             if w[2] != 0 {
                 return Err(fail(EAGAIN));
@@ -3193,7 +3193,10 @@ mod tests {
             call.key = None;
             let mut out = Out::new();
             let mut w = Wakes::default();
-            (p.ipc_call(&mut r.held, 1, 2, &call, WHO, &mut out, &mut w), out)
+            (
+                p.ipc_call(&mut r.held, 1, 2, &call, WHO, &mut out, &mut w),
+                out,
+            )
         };
         assert_eq!(flow, Ok(Flow::Done));
     }
@@ -3220,7 +3223,10 @@ mod tests {
         let (mut p, mut r) = (pipes(), Run::new());
         let mut ids = Vec::new();
         for _ in 0..3 {
-            ids.push(r.ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o600]), b"").words[0]);
+            ids.push(
+                r.ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o600]), b"")
+                    .words[0],
+            );
         }
         // Two queues of 16 take the share of the root (32 of 64).
         for id in &ids[..2] {
@@ -3228,12 +3234,26 @@ mod tests {
                 r.ok(&mut p, op::MSG_SND, &with_cred(&[*id, 1, 1]), b"x");
             }
         }
-        assert_eq!(r.err(&mut p, op::MSG_SND, &with_cred(&[ids[2], 1, 1]), b"x"), 11);
-        let (flow, _) = r.call(&mut p, 1, op::MSG_SND, &with_cred(&[ids[2], 1, 0]), b"x", None);
+        assert_eq!(
+            r.err(&mut p, op::MSG_SND, &with_cred(&[ids[2], 1, 1]), b"x"),
+            11
+        );
+        let (flow, _) = r.call(
+            &mut p,
+            1,
+            op::MSG_SND,
+            &with_cred(&[ids[2], 1, 0]),
+            b"x",
+            None,
+        );
         let Ok(Flow::Wait { queue, .. }) = flow else {
             panic!("{flow:?}")
         };
-        assert_eq!(queue, Ipc::pool_number(), "its own queue has room: the pool is what it waits for");
+        assert_eq!(
+            queue,
+            Ipc::pool_number(),
+            "its own queue has room: the pool is what it waits for"
+        );
         p.wait(queue, (7, 7), |_| true).unwrap();
         // A receive from another queue of the tree frees a place and wakes it.
         r.ok(&mut p, op::MSG_RCV, &with_cred(&[ids[0], 8, 0, 0]), b"");
@@ -3248,8 +3268,12 @@ mod tests {
     #[test]
     fn a_root_that_used_its_share_leaves_the_pool_to_the_others() {
         let (mut p, mut r) = (pipes(), Run::new());
-        let a = r.ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o600]), b"").words[0];
-        let b = r.ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o600]), b"").words[0];
+        let a = r
+            .ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o600]), b"")
+            .words[0];
+        let b = r
+            .ok(&mut p, op::MSG_GET, &with_cred(&[0, 0o600]), b"")
+            .words[0];
         for id in [a, b] {
             for _ in 0..QUEUE_MSGS {
                 r.ok(&mut p, op::MSG_SND, &with_cred(&[id, 1, 1]), b"x");
@@ -3259,7 +3283,8 @@ mod tests {
         let mut call = Call::new(op::MSG_GET, &with_cred(&[0, 0o600]), b"");
         call.key = None;
         let (mut out, mut w) = (Out::new(), Wakes::default());
-        p.ipc_call(&mut r.held, 5, 5, &call, WHO, &mut out, &mut w).unwrap();
+        p.ipc_call(&mut r.held, 5, 5, &call, WHO, &mut out, &mut w)
+            .unwrap();
         let other = out.words[0];
         let call = Call::new(op::MSG_SND, &with_cred(&[other, 1, 1]), b"y");
         assert_eq!(
@@ -3275,9 +3300,18 @@ mod tests {
         let id = out.words[0];
         let (flow, _) = r.call(&mut p, 10, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
         assert_eq!(flow, Ok(Flow::Done));
-        let (flow, _) = r.call(&mut p, 10, op::NSEM_OPEN, &with_cred(&[O_CREAT, 0o600, 1]), b"/s", None);
+        let (flow, _) = r.call(
+            &mut p,
+            10,
+            op::NSEM_OPEN,
+            &with_cred(&[O_CREAT, 0o600, 1]),
+            b"/s",
+            None,
+        );
         assert_eq!(flow, Ok(Flow::Done));
-        let stat = |r: &mut Run, p: &mut Pipes| r.ok(p, op::SHM_CTL, &with_cred(&[id, IPC_STAT]), b"").words[13];
+        let stat = |r: &mut Run, p: &mut Pipes| {
+            r.ok(p, op::SHM_CTL, &with_cred(&[id, IPC_STAT]), b"").words[13]
+        };
         assert_eq!(stat(&mut r, &mut p), 1);
         assert!(p.ipc_inherit_room(10));
         p.ipc_inherit(10, 11);
@@ -3298,7 +3332,9 @@ mod tests {
     #[test]
     fn a_child_is_refused_when_the_holds_have_no_room() {
         let (mut p, mut r) = (pipes(), Run::new());
-        let id = r.ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"").words[0];
+        let id = r
+            .ok(&mut p, op::SHM_GET, &with_cred(&[0, 4096, 0o600]), b"")
+            .words[0];
         for label in 100..100 + HOLD_MAX as u64 {
             let (flow, _) = r.call(&mut p, label, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
             assert_eq!(flow, Ok(Flow::Done));
@@ -3314,7 +3350,11 @@ mod tests {
         let (flow, _) = r.call(&mut p, 77, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
         assert_eq!(flow, Ok(Flow::Done));
         let rm = r.ok(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_RMID]), b"");
-        assert_eq!((rm.words[0], rm.words[2]), (0, 0), "attached: nothing to remove yet");
+        assert_eq!(
+            (rm.words[0], rm.words[2]),
+            (0, 0),
+            "attached: nothing to remove yet"
+        );
         // The attaching process is killed: its hold goes in a step.
         assert!(p.ipc_gone(77));
         let mut w = Wakes::default();
