@@ -390,11 +390,11 @@ static int f_one(int sig, int code, unsigned long addr, int kind) {
     if (f_catch(sig, f_h_class, 0)) return 1;
     f_signo = 0;
     if (sigsetjmp(f_env, 1) == 0) {
-        unsigned char word[16] __attribute__((aligned(8)));
+        unsigned char word[32] __attribute__((aligned(16)));
         switch (kind) {
         case 0: __asm__ volatile("udf #0"); break;
         case 1: __asm__ volatile("brk #7"); break;
-        case 2: __asm__ volatile("ldxr w9, [%0]" ::"r"(word + 1) : "x9", "memory"); break;
+        case 2: __asm__ volatile("ldxr w9, [%0]" ::"r"(word + 14) : "x9", "memory"); break;
         case 3: (void)*(volatile int *)0x10; break;
         case 4: *(volatile unsigned char *)(void *)f_one = 0; break;
         }
@@ -420,8 +420,8 @@ static int f_classes(void) {
 static int f_default_udf(void) { __asm__ volatile("udf #0"); return 0; }
 static int f_default_brk(void) { __asm__ volatile("brk #1"); return 0; }
 static int f_default_bus(void) {
-    unsigned char word[16] __attribute__((aligned(8)));
-    __asm__ volatile("ldxr w9, [%0]" ::"r"(word + 1) : "x9", "memory");
+    unsigned char word[32] __attribute__((aligned(16)));
+    __asm__ volatile("ldxr w9, [%0]" ::"r"(word + 14) : "x9", "memory");
     return 0;
 }
 static int f_default_null(void) { return *(volatile int *)0; }
