@@ -134,7 +134,7 @@ UTILITIES = tuple(name.upper() for name in (
     "feature_ls_followlinks feature_ls_recursive feature_ls_width "
     "feature_du_default_blocksize_1k feature_fancy_echo feature_fancy_sleep "
     "feature_fancy_tail feature_catn feature_catv feature_cut_regex "
-    "feature_dd_signal_handling feature_dd_third_status_line feature_non_posix_cp "
+    "feature_dd_signal_handling feature_dd_third_status_line "
     "feature_tee_use_block_io feature_wc_large feature_xargs_support_parallel "
     "feature_mesg_enable_only_group feature_bc_interactive feature_sh_math_64 "
     "feature_sh_math_base feature_sh_read_frac feature_sh_histfilesize "
@@ -211,30 +211,19 @@ def build(utilities: bool) -> None:
         shutil.rmtree(SOURCE)
     run("tar", "-xjf", str(ARCHIVE), "-C", str(work))
     (work / f"busybox-{VERSION}").rename(SOURCE)
-    replace(SOURCE / "coreutils/cat.c",
-            "APPLET(cat, BB_DIR_BIN, BB_SUID_DROP)",
-            "APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat)")
-    replace(SOURCE / "coreutils/ls.c",
-            "APPLET_NOEXEC(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)",
-            "APPLET_NOFORK(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)")
-    # ls keeps its state in bb_common_bufsiz1, the buffer every applet of
-    # the multi-call binary shares, and an applet that runs in the shell
-    # leaves that state there. The applets the shell forks (ps, among them)
-    # start from a zero buffer, so the shell zeroes it after each applet it
-    # runs itself.
-    replace(SOURCE / "libbb/vfork_daemon_rexec.c", '#include "busybox.h"',
-            '#include "busybox.h"\n#include "common_bufsiz.h"')
-    replace(SOURCE / "libbb/vfork_daemon_rexec.c",
-            "\t/* Restoring some globals */\n\trestore_nofork_data(&old);\n",
-            "\t/* Restoring some globals */\n\trestore_nofork_data(&old);\n"
-            "\tmemset(bb_common_bufsiz1, 0, COMMON_BUFSIZE);\n")
-    # The applets of names run inside ash without a fork, as ls does: the
-    # probe's image has no process to fork for them.
-    for applet, directory in (("mv", "BB_DIR_BIN"), ("rm", "BB_DIR_BIN"),
-                              ("ln", "BB_DIR_BIN"), ("chmod", "BB_DIR_BIN")):
-        replace(SOURCE / f"coreutils/{applet}.c",
-                f"APPLET_NOEXEC({applet}, {applet}, {directory}, BB_SUID_DROP, {applet})",
-                f"APPLET_NOFORK({applet}, {applet}, {directory}, BB_SUID_DROP, {applet})")
+    # The small build of the probes has no process to fork for these
+    # applets, so they run inside ash without a fork. The shell image forks
+    # them like BusyBox does: an applet that runs in the shell leaves its
+    # state in bb_common_bufsiz1 (ls, cat -v), and the applets the shell
+    # forks (ps) start from a buffer they take for zero.
+    if not utilities:
+        replace(SOURCE / "coreutils/cat.c",
+                "APPLET(cat, BB_DIR_BIN, BB_SUID_DROP)",
+                "APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat)")
+        for applet in ("ls", "mv", "rm", "ln", "chmod"):
+            replace(SOURCE / f"coreutils/{applet}.c",
+                    f"APPLET_NOEXEC({applet}, {applet}, BB_DIR_BIN, BB_SUID_DROP, {applet})",
+                    f"APPLET_NOFORK({applet}, {applet}, BB_DIR_BIN, BB_SUID_DROP, {applet})")
     # relibc next to the other C libraries of platform.h: the glibc
     # extensions it lacks, alloca from its own header, and the declaration
     replace(SOURCE / "include/platform.h",

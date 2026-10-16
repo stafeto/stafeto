@@ -5779,6 +5779,13 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
             r#"ramfs / ramfs rw 0 0"#,
         ],
     ),
+    // An applet the shell runs itself leaves its state in the shared buffer
+    // of BusyBox, and ps, forked by the shell, reads it: the shell image
+    // forks ls and cat.
+    (
+        r#"ls / >/dev/null; cat -v /etc/passwd >/dev/null; ls /missing 2>/dev/null; ps -o comm | head -1; ps | head -1"#,
+        &[r#"COMMAND"#, r#"~PID"#],
+    ),
     (
         r#"login-probe utmpx"#,
         &[
