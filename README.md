@@ -1,11 +1,14 @@
 # stafeto
 
-A learning phone OS built on its own microkernel, written in Rust for
-AArch64. The kernel keeps only what must run privileged: address spaces,
+A POSIX operating system on a capability-based microkernel, written in
+Rust for AArch64. Its kernel paths are bounded, which keeps timing
+predictable, and every driver runs isolated in user space: properties
+that matter for embedded, robotic and mobile devices.
+The kernel keeps only what must run privileged: address spaces,
 threads, scheduling, handles and messages. Drivers, file systems and the
 POSIX layer run as ordinary processes that talk through synchronous
 messages. The system boots in QEMU and on Apple silicon today; the
-PinePhone is the first real phone it targets.
+PinePhone is its first hardware target.
 
 *Stafeto* is Esperanto for "messenger" and "relay". The system is built
 around messages that pass control from hand to hand.

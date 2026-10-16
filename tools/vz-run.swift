@@ -4,16 +4,20 @@
 import Foundation
 import Virtualization
 
-guard CommandLine.arguments.count == 3 else {
-    fputs("usage: vz-run KERNEL_IMAGE BOOT_IMAGE\n", stderr)
+// --window-reports: the guest's console is served by the terminal service,
+// which takes the size of the window of the runner's terminal as a report.
+let windowReports = CommandLine.arguments.contains("--window-reports")
+let arguments = CommandLine.arguments.filter { $0 != "--window-reports" }
+guard arguments.count == 3 else {
+    fputs("usage: vz-run [--window-reports] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
     exit(2)
 }
 
 let configuration = VZVirtualMachineConfiguration()
 configuration.cpuCount = 1
 configuration.memorySize = 512 * 1024 * 1024
-let boot = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: CommandLine.arguments[1]))
-boot.initialRamdiskURL = URL(fileURLWithPath: CommandLine.arguments[2])
+let boot = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: arguments[1]))
+boot.initialRamdiskURL = URL(fileURLWithPath: arguments[2])
 boot.commandLine = "console=hvc0"
 configuration.bootLoader = boot
 // The guest reads a pipe of the runner's, which the runner fills from its
@@ -36,6 +40,34 @@ Thread.detachNewThread {
     }
 }
 configuration.serialPorts = [serial]
+// The size of the window of the runner's terminal goes into the guest's
+// input as a report (services/tty/src/window.rs): GS, "W", the rows, ";",
+// the columns, GS. VZ has no side channel for it, and the guest's terminal
+// service takes the report out of the input and sends SIGWINCH to its
+// foreground group where the size changed. The first report goes at the
+// start and one more with every SIGWINCH of the runner. A stdin that is no
+// terminal has no size and no report, and so has a runner that was not
+// started with --window-reports (a guest with no terminal service takes
+// the report for input).
+func windowReport() -> Data? {
+    var size = winsize()
+    guard ioctl(STDIN_FILENO, TIOCGWINSZ, &size) == 0, size.ws_row > 0, size.ws_col > 0 else {
+        return nil
+    }
+    return Data([0x1d]) + "W\(size.ws_row);\(size.ws_col)".data(using: .utf8)! + Data([0x1d])
+}
+func sendWindowReport() {
+    if let report = windowReport() {
+        input.fileHandleForWriting.write(report)
+    }
+}
+signal(SIGWINCH, SIG_IGN)
+let windowChanged = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .main)
+windowChanged.setEventHandler { sendWindowReport() }
+if windowReports {
+    windowChanged.resume()
+    sendWindowReport()
+}
 // A Virtio entropy device: the driver of services/virtio-rng finds it at
 // device 6 of bus 0, after the console.
 configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]

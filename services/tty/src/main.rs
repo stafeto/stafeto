@@ -252,6 +252,8 @@ fn main(_: u64) -> u64 {
         disconnect_work_due: false,
         pump: Pump::new(),
         input: Input::Idle,
+        report: tty::window::Reader::new(),
+        report_due: None,
         timer,
         _view: view,
         armed: None,
@@ -355,6 +357,9 @@ struct Tty {
     watch_cleanup_due: bool,
     disconnect_work_due: bool,
     pump: Pump,
+    report: tty::window::Reader,
+    /// When the bytes the reader holds go on as input, if it holds any.
+    report_due: Option<u64>,
     input: Input,
     /// The timer of VTIME and the deadline it is armed for.
     timer: Handle<Timer>,
@@ -1375,7 +1380,24 @@ impl Tty {
                 return false;
             }
         };
-        self.devices[self.active].console.input(&bytes[..n], now());
+        // The host's reports of its window's size are taken out of the
+        // input (tty::window) before the discipline sees it.
+        let mut kept = [0; CHUNK as usize + tty::window::REPORT_MAX];
+        let (kept_len, size) = self.report.filter(&bytes[..n], &mut kept);
+        self.devices[self.active]
+            .console
+            .input(&kept[..kept_len], now());
+        self.report_due = self.report.pending().then(|| now() + tty::window::HOLD_NS);
+        self.arm_timer();
+        if let Some(size) = size {
+            // A refused signal leaves the size as it was; the host's next
+            // report brings it again.
+            let _ = self.change_winsize(proto_tty::Winsize {
+                row: size.rows,
+                column: size.columns,
+                ..self.devices[self.active].winsize
+            });
+        }
         let mut signals = [None; 3];
         for (place, signal) in signals
             .iter_mut()
@@ -1458,6 +1480,7 @@ impl Tty {
             .devices
             .iter()
             .filter_map(|d| d.readers.deadline())
+            .chain(self.report_due)
             .min();
         if deadline == self.armed {
             return;
@@ -2288,17 +2311,27 @@ impl Tty {
         {
             return status(code);
         }
+        match self.change_winsize(set.size) {
+            Ok(()) => Answer::Status(Status::Ok),
+            Err(code) => status(code),
+        }
+    }
+
+    /// The window of the active terminal gets `size`; where it differs from
+    /// the old one the foreground group hears SIGWINCH. A signal that
+    /// cannot be sent leaves the old size.
+    fn change_winsize(&mut self, size: proto_tty::Winsize) -> Result<(), u32> {
         let before = self.devices[self.active].winsize;
-        if before != set.size {
-            self.devices[self.active].winsize = set.size;
+        if before != size {
+            self.devices[self.active].winsize = size;
             if let Some(group) = self.devices[self.active].jobs.foreground()
                 && let Err(code) = self.try_signal_group(group, 28)
             {
                 self.devices[self.active].winsize = before;
-                return status(code);
+                return Err(code);
             }
         }
-        Answer::Status(Status::Ok)
+        Ok(())
     }
 
     /// FLUSH_QUEUES: the input not read, or the output the driver did not
@@ -3067,6 +3100,15 @@ impl Service<0> for Tty {
                 let ops = &mut *self.ops;
                 for device in self.devices.iter_mut() {
                     device.readers.expire(now(), |w| ops.tell(w.label, w.key));
+                }
+                if self.report_due.is_some_and(|due| due <= now()) {
+                    // No rest of a report came: the held bytes are input.
+                    self.report_due = None;
+                    self.select(0);
+                    let mut held = [0; tty::window::REPORT_MAX];
+                    let n = self.report.flush(&mut held);
+                    self.devices[0].console.input(&held[..n], now());
+                    self.tell_readers();
                 }
                 self.arm_timer();
             }

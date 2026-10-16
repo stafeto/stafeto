@@ -331,8 +331,18 @@ pub fn getpgid(pid: i32) -> Result<i32, i32> {
 
 /// One step of the list of processes (`ps`): from the record index
 /// `cursor`, the cursor to ask next (`None` once the table is over) and the
-/// first live process the service found in its window of records, if any.
-pub fn list(cursor: u32) -> Result<(Option<u32>, Option<proto_process::Listing>), i32> {
+/// first live process the service found in its window of records, if any,
+/// and the service's pool of memory.
+pub fn list(
+    cursor: u32,
+) -> Result<
+    (
+        Option<u32>,
+        Option<proto_process::Listing>,
+        proto_process::Pool,
+    ),
+    i32,
+> {
     use crate::constants::EIO;
     let w = request(proto_process::Method::List, &[cursor])?;
     answer(&w, |bytes| {
@@ -343,7 +353,12 @@ pub fn list(cursor: u32) -> Result<(Option<u32>, Option<proto_process::Listing>)
         } else {
             Some(proto_process::Listing::read(bytes).map_err(|_| EIO)?)
         };
-        Ok(((next != proto_process::LIST_END).then_some(next), listing))
+        let pool = proto_process::Pool::read(bytes).map_err(|_| EIO)?;
+        Ok((
+            (next != proto_process::LIST_END).then_some(next),
+            listing,
+            pool,
+        ))
     })?
 }
 

@@ -48,6 +48,7 @@ mod rtbench_check;
 mod stubs;
 mod symbolize;
 mod vz;
+mod window;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -5978,6 +5979,103 @@ fn dialog_command(run: &mut qemu::Run, command: &str, lines: &[&str]) -> Result<
     Ok(())
 }
 
+/// The size of the window and the files of /proc `top` reads: the terminal
+/// has no size until the host reports its window (the bytes a terminal
+/// of the host would send, window.rs); a report sets the size `stty size`
+/// shows and gives the foreground group SIGWINCH; `resize` asks the terminal
+/// and sets what it answers; `top -b -n 1` lists the shell, and the files of
+/// /proc come in the shapes Linux gives them.
+fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
+    // Before the report the size is unknown, and stty says so.
+    dialog_command(run, "stty size 2>&1 | grep -c 'standard input'", &["1"])?;
+    run.type_raw(&window::report(40, 132))?;
+    dialog_command(run, "stty size", &["40 132"])?;
+    // A change reaches the foreground group as SIGWINCH: `wait` ends when
+    // the trap ran.
+    run.send("trap 'echo winch-trapped' WINCH; sleep 30 & wait; echo winch-wait-ended")?;
+    std::thread::sleep(Duration::from_secs(1));
+    run.type_raw(&window::report(50, 100))?;
+    run.expect_line("winch trapped", |l| l == "winch-trapped", DIALOG_STEP)?;
+    run.expect_line("winch wait", |l| l == "winch-wait-ended", DIALOG_STEP)?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.send("kill %1; trap - WINCH")?;
+    run.expect("# ", DIALOG_STEP)?;
+    dialog_command(run, "stty size", &["50 100"])?;
+    // stty sets the size too, and a size that did not change signals nothing.
+    dialog_command(run, "stty rows 30 cols 90; stty size", &["30 90"])?;
+    // The terminal answers resize's question with a position, as a
+    // terminal does.
+    run.send("resize; echo resize-status $?")?;
+    run.expect("\x1b[6n", DIALOG_STEP)?;
+    run.type_raw(b"\x1b[24;80R")?;
+    run.expect("COLUMNS=80;LINES=24;", DIALOG_STEP)?;
+    run.expect_line("resize status", |l| l == "resize-status 0", DIALOG_STEP)?;
+    run.expect("# ", DIALOG_STEP)?;
+    dialog_command(run, "stty size", &["24 80"])?;
+    // top lists the processes: the table has a line of the shell, and the
+    // header the memory and the load.
+    run.send("top -b -n 1")?;
+    run.expect_line("top memory", |l| l.starts_with("Mem: "), DIALOG_STEP)?;
+    run.expect_line("top cpu", |l| l.starts_with("CPU: "), DIALOG_STEP)?;
+    run.expect_line(
+        "top load",
+        |l| l.starts_with("Load average: 0.00"),
+        DIALOG_STEP,
+    )?;
+    run.expect_line(
+        "top process table",
+        |l| l.trim_start().starts_with("PID") && l.contains("COMMAND"),
+        DIALOG_STEP,
+    )?;
+    run.expect_line(
+        "the shell in top",
+        |l| l.split_whitespace().last() == Some("ash") && l.contains('R'),
+        DIALOG_STEP,
+    )?;
+    run.expect("# ", DIALOG_STEP)?;
+    // The files in the shapes of Linux.
+    dialog_command(
+        run,
+        "head -1 /proc/meminfo | tr -s ' ' | cut -d' ' -f1",
+        &["MemTotal:"],
+    )?;
+    dialog_command(
+        run,
+        "awk '$1==\"MemTotal:\" {t=$2} $1==\"MemFree:\" {f=$2} END {print (t>0 && f>0 && f<=t) ? \"memory-ok\" : \"memory-bad\"}' /proc/meminfo",
+        &["memory-ok"],
+    )?;
+    dialog_command(run, "head -1 /proc/stat | cut -d' ' -f1", &["cpu"])?;
+    dialog_command(run, "awk '/^cpu / {print NF}' /proc/stat", &["11"])?;
+    dialog_command(
+        run,
+        "awk '$1==\"processes\" {print ($2>0)}' /proc/stat",
+        &["1"],
+    )?;
+    dialog_command(run, "awk '{print NF}' /proc/loadavg", &["5"])?;
+    dialog_command(run, "awk '{print NF}' /proc/uptime", &["2"])?;
+    dialog_command(run, "awk '{print NF}' /proc/$$/statm", &["7"])?;
+    dialog_command(run, "awk '{print ($1>0 && $1==$2)}' /proc/$$/statm", &["1"])?;
+    dialog_command(run, "grep -c '^Name:.ash$' /proc/$$/status", &["1"])?;
+    dialog_command(
+        run,
+        "awk '$1==\"State:\" {print $2 $3}' /proc/$$/status",
+        &["R(running)"],
+    )?;
+    dialog_command(
+        run,
+        "awk '$1==\"VmRSS:\" {print ($2>0)}' /proc/$$/status",
+        &["1"],
+    )?;
+    // The counters only grow: the time of a child that ran, seen while it
+    // lived, stays in the sum of the cpu line (and out of the idle time of
+    // uptime) once it ended.
+    dialog_command(
+        run,
+        "awk 'BEGIN {for (i = 0; i < 1000000; i++) x += i}' & p=$!; sleep 1.5; a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); wait $p; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
+        &["cpu-grew", "idle-grew"],
+    )
+}
+
 /// The keys of the line editor of the interactive shell, sent as a
 /// terminal sends them: each probe ends with the line the shell ran.
 fn line_editing(run: &mut qemu::Run) -> Result<(), String> {
@@ -6373,7 +6471,7 @@ fn ash_dialog() -> Result<(), String> {
         dialog_command(
             &mut run,
             "ps -o pid,stat | awk -v p=$! '$1==p {print $2}'",
-            &["RW"],
+            &["R"],
         )?;
         dialog_command(
             &mut run,
@@ -6392,7 +6490,7 @@ fn ash_dialog() -> Result<(), String> {
         dialog_command(
             &mut run,
             "ls -1 /proc/$$ | sort | tr '\\n' ' '; echo",
-            &["~cmdline stat status"],
+            &["~cmdline stat statm status"],
         )?;
         dialog_command(
             &mut run,
@@ -6546,6 +6644,7 @@ fn ash_dialog() -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
+        window_and_top(&mut run)?;
         // Ctrl-D on an empty line ends the shell.
         run.type_raw(b"\x04")?;
         run.expect(
@@ -6643,6 +6742,15 @@ fn tty_probe(vz: bool) -> Result<(), String> {
             run.expect(&format!("tty-probe: raw read {i} gave {b}"), DIALOG_STEP)?;
         }
         run.expect("tty-probe: raw reads gave each byte", DIALOG_STEP)?;
+        // The report of the host's window, then a byte for the read to give.
+        run.expect("tty-probe: window report waits", DIALOG_STEP)?;
+        run.type_raw(&window::report(40, 132))?;
+        run.type_raw(b"w")?;
+        run.expect("tty-probe: window report set 40 by 132", DIALOG_STEP)?;
+        // One Ctrl-] alone, with nothing after it.
+        run.expect("tty-probe: lone GS waits", DIALOG_STEP)?;
+        run.type_raw(b"\x1d")?;
+        run.expect("tty-probe: lone GS came", DIALOG_STEP)?;
         // ONLCR clear: the console's driver adds no CR either.
         run.expect_bytes(b"\nbare-lf\n", DIALOG_STEP)?;
         run.expect("tty-probe: wrote", DIALOG_STEP)?;
@@ -6767,8 +6875,19 @@ fn ash_shell() -> Result<(), String> {
     )?;
     let cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     // The end of the shell ends the machine, and the command returns the
-    // shell's status to the terminal of the host.
-    match interactive_qemu(cmd, &kernel.elf, Stdio::inherit(), None, true, None)? {
+    // shell's status to the terminal of the host. The keys go to the machine
+    // through a pipe with the size of the host's window (window.rs).
+    let terminal = window::RawTerminal::enter();
+    let ended = interactive_qemu(
+        cmd,
+        &kernel.elf,
+        Stdio::piped(),
+        Some(window::feeder()),
+        true,
+        None,
+    );
+    drop(terminal);
+    match ended? {
         Some(code) if code != 0 => exit(code),
         _ => Ok(()),
     }
