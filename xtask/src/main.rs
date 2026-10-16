@@ -27,6 +27,7 @@ mod owner_lifetime;
 #[path = "../../lib/rt/src/service/sample.rs"]
 mod service_sample;
 
+mod bash_dialog;
 mod disasm;
 mod entropy;
 mod image;
@@ -768,7 +769,7 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 11] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 12] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -787,6 +788,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 11] = [
         POSIX_STACK_SIZE,
         &["ash-interactive", "utilities"],
     ),
+    ("bash", "bash", POSIX_STACK_SIZE, &["interactive"]),
     ("tty", "tty", TTY_STACK_SIZE, &[]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
@@ -1341,6 +1343,8 @@ commands:
             the shell ends the machine and gives its status)
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
+  bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
+  bash-dialog  check an interactive GNU bash dialog in QEMU (bash started from ash)
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
   coverage  compare POSIX.1-2024 XSH names with relibc and the POSIX startup archive
@@ -1548,6 +1552,8 @@ fn main() {
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
         Some("ash-shell-exit") => ash_shell_exit(),
+        Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),
+        Some("bash-dialog") => bash_dialog::bash_dialog(),
         Some("ash-dialog") => ash_dialog(),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
@@ -1938,6 +1944,20 @@ fn write_elf_image(
     }
     if let Some(licence) = &ready_licence {
         list.push((READY_LICENSE, licence.as_slice()));
+    }
+    // An image with bash (GPL-3.0-or-later) carries its licence and where its
+    // exact source is.
+    let bash_files = if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "bash"))
+    {
+        Some(bash_terms()?)
+    } else {
+        None
+    };
+    if let Some((licence, source)) = &bash_files {
+        list.push((BASH_LICENSE, licence.as_slice()));
+        list.push((BASH_SOURCE, source.as_bytes()));
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -2829,6 +2849,9 @@ const NOTICES: &str = "THIRD-PARTY-NOTICES";
 /// BusyBox's licence and the note of its notice and source in an image.
 const BUSYBOX_LICENSE: &str = "BUSYBOX-LICENSE";
 const BUSYBOX_SOURCE: &str = "BUSYBOX-SOURCE";
+/// bash's licence and the note of its source in an image.
+const BASH_LICENSE: &str = "BASH-LICENSE";
+const BASH_SOURCE: &str = "BASH-SOURCE";
 
 /// The licence texts of the ready-made utilities in an image, and the symbol
 /// a BusyBox that holds them has.
@@ -2904,10 +2927,56 @@ fn busybox_terms() -> Result<(Vec<u8>, String), String> {
     Ok((licence, source))
 }
 
+/// bash's licence and the note of its copyright and of the exact source of
+/// the program in the image.
+fn bash_terms() -> Result<(Vec<u8>, String), String> {
+    let version = script_value("tools/build-bash.py", "VERSION")?;
+    let sha256 = script_value("tools/build-bash.py", "SHA256")?;
+    let path = target_dir().join(format!("bash/bash-{version}/COPYING"));
+    let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
+    let source = format!(
+        "bash holds GNU bash {version}, Copyright (C) the Free Software Foundation, Inc.\n\
+         Licensed under GPLv3 or later (BASH-LICENSE).\n\n\
+         Its source: https://ftp.gnu.org/gnu/bash/bash-{version}.tar.gz\n\
+         (SHA-256 {sha256}), built unchanged by tools/build-bash.py\n\
+         of https://github.com/stafeto/stafeto at commit {}; linked with relibc\n\
+         https://github.com/stafeto/relibc at commit {relibc}\n\
+         (THIRD-PARTY-NOTICES).\n",
+        rtbench2::commit()
+    );
+    Ok((licence, source))
+}
+
+/// Fails unless the boot image at `path` carries bash's licence and the
+/// note of its source.
+fn image_has_bash_terms(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image =
+        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (licence, _) = bash_terms()?;
+    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
+        image
+            .files()
+            .any(|file| file.name == name && check(file.data))
+    };
+    if carries(BASH_LICENSE, &|data| data == licence.as_slice())
+        && carries(BASH_SOURCE, &|data| {
+            data.windows(15).any(|w| w == b"bash-5.3.tar.gz")
+                && data.windows(5).any(|w| w == b"GPLv3")
+        })
+    {
+        Ok(())
+    } else {
+        Err(format!("{} carries no bash terms", path.display()))
+    }
+}
+
 /// The builds of relibc and of BusyBox of this run of xtask: one is
 /// enough for every check that takes them.
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static BASH_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 
 /// relibc built, once in a run of xtask.
 fn relibc() -> Result<(), String> {
@@ -2918,6 +2987,13 @@ fn relibc() -> Result<(), String> {
 fn busybox_build() -> Result<(), String> {
     once(&BUSYBOX_BUILT, (), || {
         run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))
+    })
+}
+
+/// bash built (the object tests/bash links), once in a run of xtask.
+fn bash_build() -> Result<(), String> {
+    once(&BASH_BUILT, (), || {
+        run_cmd(Command::new("python3").arg(root().join("tools/build-bash.py")))
     })
 }
 
@@ -6051,6 +6127,7 @@ fn line_editing(run: &mut qemu::Run) -> Result<(), String> {
 fn ash_dialog() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
+    bash_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-ash-dialog.img",
@@ -6058,6 +6135,7 @@ fn ash_dialog() -> Result<(), String> {
         BOOT_PROFILE,
     )?;
     image_has_ready_terms(&image)?;
+    image_has_bash_terms(&image)?;
     // What `ls -l` shows of the files of /bin: the mode, the links and the
     // size of the ELF file of the program the file holds (rootfs.rs).
     let elf_size = |program: &str| -> Result<String, String> {
@@ -6072,6 +6150,7 @@ fn ash_dialog() -> Result<(), String> {
     let bin_listing = [
         ("-rwxr-xr-x", links.clone(), "ash", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "1".to_string(), "bash", elf_size("bash")?),
         ("-rwxr-xr-x", links.clone(), "cat", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "head", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "ls", busybox.clone()),
@@ -6787,6 +6866,7 @@ fn tty_steps() -> Result<(), String> {
 fn ash_shell() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
+    bash_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-ash-dialog.img",
@@ -6818,6 +6898,7 @@ fn ash_shell() -> Result<(), String> {
 fn ash_shell_exit() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
+    bash_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-ash-dialog.img",
@@ -7022,6 +7103,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("ash", ash_probe),
         job("ash-dialog", ash_dialog),
         job("ash-shell-exit", ash_shell_exit),
+        job("bash-shell-exit", bash_dialog::bash_shell_exit),
+        job("bash-dialog", bash_dialog::bash_dialog),
         job("ls", ls_probe),
         // One round of the benchmark under -icount: its rows are whole and
         // the path of pthread_kill stays under S5_ICOUNT_MAX.

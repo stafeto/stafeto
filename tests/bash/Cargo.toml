@@ -1,0 +1,23 @@
+[package]
+name = "bash"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "GNU bash on relibc in a stafeto boot image"
+build = "build.rs"
+
+# Standard input and output through the terminal service, as the BusyBox of
+# the dialog (posix-crt/uart-input).
+[features]
+interactive = ["posix-crt/uart-input"]
+
+[[bin]]
+name = "bash"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }
+rt = { path = "../../lib/rt" }

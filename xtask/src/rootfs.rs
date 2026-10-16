@@ -332,6 +332,8 @@ fn dialog() -> Vec<RootFile> {
         // The shell of `system`, `popen` and `wordexp`.
         file("/bin/sh", 0o755, ROOT, "busybox-probe"),
         file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
+        // GNU bash beside ash (tools/build-bash.py); `sh` stays ash.
+        file("/bin/bash", 0o755, ROOT, "bash"),
     ];
     files.extend(UTILITIES.iter().map(|name| {
         let path: &'static str = Box::leak(format!("/bin/{name}").into_boxed_str());
@@ -360,10 +362,28 @@ fn dialog() -> Vec<RootFile> {
             ROOT,
             Source::Bytes("utmpx", &UTMPX),
         ),
+        // The keys of bash's line editor (readline reads /etc/inputrc): the
+        // sequences of the console terminal that the editor takes for
+        // Home, End and Delete when the terminal's name is not known.
+        of(
+            "/etc/inputrc",
+            0o644,
+            ROOT,
+            Source::Bytes("inputrc", INPUTRC),
+        ),
     ]);
     files.extend(devices());
     files
 }
+
+/// /etc/inputrc of the shell image.
+const INPUTRC: &[u8] = b"\"\\e[1~\": beginning-of-line\n\
+\"\\e[H\": beginning-of-line\n\
+\"\\eOH\": beginning-of-line\n\
+\"\\e[4~\": end-of-line\n\
+\"\\e[F\": end-of-line\n\
+\"\\eOF\": end-of-line\n\
+\"\\e[3~\": delete-char\n";
 
 /// The probe of POSIX processes (5c): BusyBox as `/bin/ls`, the probe as
 /// a child, a set-user-ID copy of it of root, a copy whose data asks for
