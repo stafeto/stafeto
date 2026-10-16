@@ -13,9 +13,9 @@
 //! 3. with ICANON off, VMIN 1 and VTIME 0, three reads each give the one
 //!    byte xtask typed before it;
 //! 4. with ONLCR clear, an LF goes out with no CR before it;
-//! 4a. the host's report of its window, typed before a "w", sets the size
+//! 5. the host's report of its window, typed before a "w", sets the size
 //!    and does not reach the read, which gives the "w";
-//! 5. LINES numbered lines in writes of MAX_WRITE bytes, which xtask finds
+//! 6. LINES numbered lines in writes of MAX_WRITE bytes, which xtask finds
 //!    whole and in their order.
 //!
 //! `S` is a quiet driver of the console (stub.rs) and `s` the client that
