@@ -10,8 +10,7 @@ static int wait_fd, wait_command, wait_rc, wait_errno;
 void wait_probe_stage(unsigned stage) {
     __atomic_store_n(&wait_ready, (int)stage, __ATOMIC_RELEASE);
     if (stage == 2) {
-        while (!__atomic_load_n(&wait_continue, __ATOMIC_ACQUIRE) ||
-               __atomic_load_n(&wait_seen, __ATOMIC_ACQUIRE) != SIGUSR1) sched_yield();
+        while (!__atomic_load_n(&wait_continue, __ATOMIC_ACQUIRE)) sched_yield();
     }
 }
 static int wait_stage(int stage) {

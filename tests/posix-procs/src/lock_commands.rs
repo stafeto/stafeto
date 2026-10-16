@@ -119,6 +119,7 @@ pub extern "C" fn ram_lock_commands(pid: i32) -> i32 {
         }
         // A description that was closed refuses a late request.
         parent.close_exact(held[1]).map_err(|_| -40)?;
+        files.close_exact(held[1]).map_err(|_| -39)?;
         wire.command = LockCommand::GetOfd;
         wire.kind = LockKind::Write;
         match send(&files, wire) {
@@ -126,6 +127,7 @@ pub extern "C" fn ram_lock_commands(pid: i32) -> i32 {
             Err(Status::Unknown(proto_fs::BAD_FD)) => {}
             _ => return Err(-41),
         }
+        files.close_exact(held[0]).map_err(|_| -43)?;
         drop(files);
         parent.close_exact(held[0]).map_err(|_| -42)?;
         rt::println!(

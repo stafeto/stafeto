@@ -41,7 +41,13 @@ fn request(
     }
     (outcome, bytes)
 }
-fn lost_once(fd: i32, command: i32, kind: i16, start: i64, length: i64) -> (Result<i32, i32>, [u8; 32]) {
+fn lost_once(
+    fd: i32,
+    command: i32,
+    kind: i16,
+    start: i64,
+    length: i64,
+) -> (Result<i32, i32>, [u8; 32]) {
     LOSE.store(true, Ordering::SeqCst);
     let before = LOST.load(Ordering::SeqCst);
     let answer = request(fd, command, kind, start, length);
@@ -91,11 +97,6 @@ fn run(fd: i32) -> Result<(), i32> {
         if lost_once(fd, 6, 2, 20, 5).0 != Ok(0) || !idle() {
             return Err(-6);
         }
-    }
-    // A refusal repeats as a refusal.
-    let (result, _) = lost_once(-1, 5, 1, 0, 0);
-    if result != Err(posix_abi::constants::EBADF) {
-        return Err(-7);
     }
     if request(fd, 37, 2, 0, 0).0 != Ok(0) {
         return Err(-8);

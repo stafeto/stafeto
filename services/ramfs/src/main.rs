@@ -1522,24 +1522,14 @@ impl Service<0> for Fs {
         self.waits.poll();
         self.lock_sweep.restart();
         self.lock_sweep_pending = self.locks.has_locks();
-        if !Self::lock_custody_empty(
-            self.wait_jobs,
-            self.places,
-            &s.data,
-            s.label(),
-        ) {
+        if !Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label()) {
             self.departures.admit(self.places.place(s.label()));
         }
     }
 
     fn keep_departed(&self, s: &Session<Fds, 0>) -> bool {
         s.data.departed
-            && !Self::lock_custody_empty(
-                    self.wait_jobs,
-                self.places,
-                &s.data,
-                s.label(),
-            )
+            && !Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label())
     }
 
     /// A never-used clone retains its paid birth until cleanup finishes.
@@ -1710,23 +1700,13 @@ impl Service<0> for Fs {
                 work = self.cleanup_step(&mut s.data, label);
                 (
                     label,
-                    Self::lock_custody_empty(
-                                    self.wait_jobs,
-                        self.places,
-                        &s.data,
-                        label,
-                    ),
+                    Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, label),
                 )
             } else {
                 let birth = &mut self.births[i - SESSIONS];
                 let (label, mut fds) = birth.take().expect("retained departed birth");
                 work = self.cleanup_step(&mut fds, label);
-                let complete = Self::lock_custody_empty(
-                            self.wait_jobs,
-                    self.places,
-                    &fds,
-                    label,
-                );
+                let complete = Self::lock_custody_empty(self.wait_jobs, self.places, &fds, label);
                 self.births[i - SESSIONS] = Some((label, fds));
                 (label, complete)
             };
@@ -2057,10 +2037,7 @@ impl Service<0> for Fs {
         if r.method() == Method::BindPending as u16 {
             return self.bind_pending(r);
         }
-        if matches!(
-            Method::from_number(r.method()),
-            Some(Method::LockStart)
-        ) {
+        if matches!(Method::from_number(r.method()), Some(Method::LockStart)) {
             return self.lock_request(&mut s.data, r);
         }
         if matches!(
@@ -4237,7 +4214,9 @@ impl Fs {
         let (storage, descriptions) = self.ram.lock_parts();
         let live = |owner| match owner {
             Owner::Process(pid) => page.is_some_and(|page| page.live(pid)),
-            Owner::Description { slot, generation } => descriptions.live(Token { slot, generation }),
+            Owner::Description { slot, generation } => {
+                descriptions.live(Token { slot, generation })
+            }
         };
         let previous_revision = self.locks.revision(captured.request.inode);
         let result = if captured.unlocked_query {

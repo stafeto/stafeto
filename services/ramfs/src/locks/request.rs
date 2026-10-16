@@ -148,10 +148,7 @@ pub fn reply(result: Result<Response, Error>) -> LockReply {
             None,
         ),
     };
-    LockReply {
-        result,
-        blocker,
-    }
+    LockReply { result, blocker }
 }
 
 #[cfg(test)]
@@ -462,7 +459,7 @@ mod tests {
             assert_eq!(
                 reply(Err(error)),
                 LockReply {
-                                result: code,
+                    result: code,
                     blocker: None
                 }
             );

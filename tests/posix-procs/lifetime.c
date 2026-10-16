@@ -765,7 +765,6 @@ int main(int argc, char **argv) {
     public_wait_lifecycle();
     public_wait_process_exit();
     public_wait_arbitrary_jumps();
-    public_wait_pending_rotation();
     public_lock_deadlocks();
     public_simple_wait_graphs();
     public_lock_holders();

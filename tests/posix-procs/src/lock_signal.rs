@@ -42,5 +42,9 @@ pub extern "C" fn lock_driver_signal_disarm() -> u32 {
     posix_abi::probe_lock_hook(None);
     ARMED.store(false, Ordering::Release);
     let idle = posix_abi::shared::with_files(|files| Ok(files.no_lock_command())).unwrap_or(false);
-    if idle { SEEN.load(Ordering::Acquire) } else { 2 }
+    if idle {
+        SEEN.load(Ordering::Acquire)
+    } else {
+        2
+    }
 }

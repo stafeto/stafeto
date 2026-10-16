@@ -46,11 +46,7 @@ pub(crate) fn operation(fd: u32) -> Result<(), i32> {
         let transport = files.transport();
         let terminal = transport.terminal_number(target).ok_or(ENOTTY)?;
         let session = transport.terminal().ok_or(EBADF)?.raw().0;
-        Ok((
-            files.lock_source(fd).map_err(crate::error)?,
-            session,
-            terminal,
-        ))
+        Ok((files.entry_of(fd).map_err(crate::error)?, session, terminal))
     })?;
     let (token, claim) = loop {
         if crate::long::ending(&block.flags, true) {

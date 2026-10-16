@@ -161,10 +161,7 @@ impl LockReply {
             _ => return Err(Status::BadSize),
         };
         input.finish()?;
-        let reply = Self {
-            result,
-            blocker,
-        };
+        let reply = Self { result, blocker };
         reply.validate()?;
         Ok(reply)
     }

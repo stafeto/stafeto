@@ -4,13 +4,12 @@
 //! Coordinates genuine sleeping WAITs; never substitutes a service outcome.
 use core::sync::atomic::{AtomicBool, Ordering};
 use posix_abi::WaitProbe;
-use posix_fs::wait::WaitToken;
 
 static ARMED: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" {
     fn deadlock_wait_sleeping();
 }
-fn hook(phase: WaitProbe, _: WaitToken) -> bool {
+fn hook(phase: WaitProbe, _: proto_fs::WaitKey) -> bool {
     if phase == WaitProbe::Receive && ARMED.swap(false, Ordering::AcqRel) {
         // SAFETY: lifetime.c includes the coordinating fixture; no FILES_LOCK is held.
         unsafe { deadlock_wait_sleeping() };

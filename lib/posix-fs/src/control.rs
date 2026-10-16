@@ -5,7 +5,7 @@
 
 use super::{FsError, PosixFs};
 use entries::{Frame, nested};
-use posix_fd::{ControlSnapshot, ControlToken, OwnerToken};
+use posix_fd::{ControlSnapshot, ControlToken, EntryToken, OwnerToken};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
@@ -78,6 +78,16 @@ impl PosixFs {
                 let _ = self.descriptors.abandon_control(token);
             }
         }
+    }
+
+    /// The jump transaction: every record and loan the left frames owned.
+    pub fn mark_jump(&mut self, owner: OwnerToken, target: Frame) {
+        self.mark_control_jump(owner, target);
+        self.mark_fifo_io_jump(owner, target);
+    }
+    /// The exact entry of an open descriptor number.
+    pub fn entry_of(&self, fd: u32) -> Result<EntryToken, FsError> {
+        self.descriptors.entry_token(fd).map_err(FsError::from)
     }
 
     pub fn control_tokens(&self) -> impl Iterator<Item = ControlToken> + '_ {

@@ -4,13 +4,12 @@
 //! Read-only observations of the authenticated PID, payer and remaining quota.
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use posix_abi::WaitProbe;
-use posix_fs::wait::WaitToken;
 static ARMED: AtomicBool = AtomicBool::new(false);
 static NONCE: AtomicU64 = AtomicU64::new(1);
 unsafe extern "C" {
     fn ring_wait_sleeping();
 }
-fn hook(phase: WaitProbe, _: WaitToken) -> bool {
+fn hook(phase: WaitProbe, _: proto_fs::WaitKey) -> bool {
     if phase == WaitProbe::Receive && ARMED.swap(false, Ordering::AcqRel) {
         // SAFETY: the isolated ring C fixture supplies the callback.
         unsafe { ring_wait_sleeping() };

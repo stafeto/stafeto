@@ -31,10 +31,7 @@ fn finish(input: Input, bytes: &mut [u8; 32], reply: Result<LockReply, i32>) -> 
     unsafe { input.finish(bytes.as_mut_ptr(), reply) }
 }
 fn success(blocker: Option<LockBlocker>) -> LockReply {
-    LockReply {
-        result: 0,
-        blocker,
-    }
+    LockReply { result: 0, blocker }
 }
 
 #[test]
@@ -196,4 +193,14 @@ fn failed_outcome_never_changes_caller_fields() {
         Err(EIO)
     );
     assert_eq!(bytes, before);
+}
+
+#[test]
+fn service_refusals_become_the_errno_of_their_code() {
+    assert_eq!(lock_fields::refusal(proto_fs::BAD_FD), EBADF);
+    assert_eq!(lock_fields::refusal(proto_fs::NO_LOCKS), ENOLCK);
+    assert_eq!(lock_fields::refusal(proto_fs::LOCK_CONFLICT), EAGAIN);
+    assert_eq!(lock_fields::refusal(proto_fs::INVALID_ARGUMENT), EINVAL);
+    assert_eq!(lock_fields::refusal(proto_fs::OFFSET_OVERFLOW), EOVERFLOW);
+    assert_eq!(lock_fields::refusal(proto_fs::PERMISSION), EIO);
 }

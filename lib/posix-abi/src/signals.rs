@@ -244,6 +244,11 @@ pub(crate) fn thread_pending(block: &Block) -> u64 {
         )
 }
 
+/// Whether a signal is pending that `mask` would let through.
+pub(crate) fn pending_beyond(mask: SigSet) -> bool {
+    (thread_pending(own()) | process_pending()) & !mask != 0
+}
+
 pub fn pending_unblocked() -> bool {
     let mask = own().mask.load(Ordering::SeqCst);
     (thread_pending(own()) | process_pending()) & !mask != 0
