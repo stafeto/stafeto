@@ -375,6 +375,14 @@ fn dialog() -> Vec<RootFile> {
     // The terminfo entries of ncurses' database that the image holds
     // (tools/build-ncurses.py), where the library looks.
     files.extend([
+        // The terminal of the programs that draw on the console (ncurses
+        // reads its entry from /usr/share/terminfo): an xterm-compatible one.
+        of(
+            "/etc/profile",
+            0o644,
+            ROOT,
+            Source::Bytes("profile", b"export TERM=xterm-256color\n"),
+        ),
         dir("/usr"),
         dir("/usr/share"),
         dir("/usr/share/terminfo"),

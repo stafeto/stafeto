@@ -358,9 +358,9 @@ from its release archive, by `tools/build-nano.py` and `tools/build-ncurses.py`
 (the archives are fetched at build time and their SHA-256 checked, as
 BusyBox's is). The image carries the terminfo entries `xterm-256color`,
 `xterm`, `vt100` and `linux` in `/usr/share/terminfo`, compiled from the
-`terminfo.src` of the ncurses archive, and the shell sets `TERM` to
-`xterm-256color`. It carries the licences and the addresses of the exact
-sources (`NANO-LICENSE`, `NCURSES-LICENSE`, `NANO-SOURCE`).
+`terminfo.src` of the ncurses archive, and `/etc/profile` (the shell
+of the image is a login shell) sets `TERM` to `xterm-256color`. It carries
+the licences and the addresses of the exact sources (`NANO-LICENSE`, `NCURSES-LICENSE`, `NANO-SOURCE`).
 
 Every source file carries an `SPDX-License-Identifier` line. `cargo xtask
 ci` checks the licence of every crate and file, that the GPL-2.0-only
