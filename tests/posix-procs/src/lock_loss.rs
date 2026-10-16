@@ -3,16 +3,22 @@
 
 //! A reply lost to a signal costs a repeat, and the repeat gives the same result.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use posix_abi::lock_fields::Flock;
 
 static LOSE: AtomicBool = AtomicBool::new(false);
 static LOST: AtomicUsize = AtomicUsize::new(0);
+/// A number to close while the reply is lost, as another thread would.
+static CLOSE: AtomicI32 = AtomicI32::new(-1);
 
 fn hook() -> bool {
     let lose = LOSE.swap(false, Ordering::SeqCst);
     if lose {
         LOST.fetch_add(1, Ordering::SeqCst);
+        let number = CLOSE.swap(-1, Ordering::SeqCst);
+        if number >= 0 {
+            let _ = posix_abi::close(number);
+        }
     }
     lose
 }
@@ -69,7 +75,31 @@ fn full_blocker(bytes: &[u8; 32]) -> bool {
 fn idle() -> bool {
     posix_abi::shared::with_files(|files| Ok(files.no_lock_command())).unwrap_or(false)
 }
-fn run(fd: i32) -> Result<(), i32> {
+/// The number is closed while the reply is lost; a copy of its description
+/// lives on. The repeat must give the answer of the first try, and a query
+/// from another description sees what the call reported.
+fn closed_number(fd: i32, copy: i32, other: i32) -> Result<(), i32> {
+    CLOSE.store(fd, Ordering::SeqCst);
+    let (result, _) = lost_once(fd, 37, 1, 200, 5);
+    CLOSE.store(-1, Ordering::SeqCst);
+    let (seen, bytes) = request(other, 36, 1, 200, 5);
+    let held = i16::from_ne_bytes(bytes[..2].try_into().unwrap()) == 1;
+    if seen != Ok(0) || held != (result == Ok(0)) {
+        return Err(-10);
+    }
+    if result != Ok(0) {
+        return Err(-11);
+    }
+    if request(copy, 37, 2, 200, 5).0 != Ok(0) {
+        return Err(-12);
+    }
+    let (seen, bytes) = request(other, 36, 1, 200, 5);
+    if seen != Ok(0) || i16::from_ne_bytes(bytes[..2].try_into().unwrap()) != 2 {
+        return Err(-13);
+    }
+    Ok(())
+}
+fn run(fd: i32, copy: i32, other: i32) -> Result<(), i32> {
     if request(fd, 37, 2, 0, 0).0 != Ok(0) {
         return Err(-1);
     }
@@ -101,14 +131,14 @@ fn run(fd: i32) -> Result<(), i32> {
     if request(fd, 37, 2, 0, 0).0 != Ok(0) {
         return Err(-8);
     }
-    Ok(())
+    closed_number(fd, copy, other)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn lock_loss_run(fd: i32) -> i32 {
+extern "C" fn lock_loss_run(fd: i32, copy: i32, other: i32) -> i32 {
     let began = rt::time::now();
     posix_abi::probe_lock_hook(Some(hook));
-    let result = run(fd);
+    let result = run(fd, copy, other);
     posix_abi::probe_lock_hook(None);
     if result.is_ok() {
         rt::println!(

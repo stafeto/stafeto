@@ -36,7 +36,7 @@ extern int ram_close_event(void);
 extern int ram_lock_commands(int pid);
 extern int close_driver_receipts(void);
 extern int close_driver_full_places(void);
-extern int lock_loss_run(int fd);
+extern int lock_loss_run(int fd, int copy, int other);
 extern void lock_signal_arm(unsigned mode);
 extern unsigned lock_signal_disarm(void);
 extern void close_driver_jump_arm(int fd);
@@ -757,11 +757,17 @@ int main(int argc, char **argv) {
     int receipt_fd = open("/tmp/public-lock-receipts", O_CREAT | O_RDWR, 0666);
     expect("open public lock receipt file", receipt_fd >= 0, 1);
     if (receipt_fd >= 0) {
-        expect("public lock replies lost to a signal", lock_loss_run(receipt_fd), 0);
-        expect("close public lock receipt file", close(receipt_fd), 0);
+        /* The probe closes receipt_fd itself, while a reply is lost. */
+        int copy = dup(receipt_fd);
+        int other = open("/tmp/public-lock-receipts", O_RDWR);
+        expect("copy and second description of the receipt file", copy >= 0 && other >= 0, 1);
+        expect("public lock replies lost to a signal", lock_loss_run(receipt_fd, copy, other), 0);
+        if (copy >= 0) expect("close copy of the receipt file", close(copy), 0);
+        if (other >= 0) expect("close second receipt description", close(other), 0);
     }
     public_lock_signals();
     public_wait_locks();
+    public_wait_quiet_signals();
     public_wait_fifo();
     public_wait_lifecycle();
     public_wait_process_exit();

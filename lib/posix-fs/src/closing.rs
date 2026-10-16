@@ -82,6 +82,12 @@ impl PosixFs {
             generation: backend.generation(),
         })
     }
+    /// A repeat of a command that `lock_begins` named a description for:
+    /// the counts are those of a new command, the description is the first.
+    pub fn lock_begins_again(&mut self) {
+        self.record_lock_command_begins();
+        self.record_locks.commands += 1;
+    }
     /// A lock command begins: the process may hold a record lock from now
     /// until the service says otherwise.
     pub(crate) fn record_lock_command_begins(&mut self) {
