@@ -2064,6 +2064,9 @@ fn run_interactive_qemu(cmd: Command, elf: &Path) -> Result<(), String> {
     interactive_qemu(cmd, elf, Stdio::inherit(), None, false, None).map(|_| ())
 }
 
+/// What types into the stdin pipe of a run once the flag says a prompt has appeared.
+type Feeder = Box<dyn FnOnce(std::process::ChildStdin, &std::sync::atomic::AtomicBool) + Send>;
+
 /// The status init reports for the shell of the interactive image when its
 /// line `line` says the shell ended: the exit code, or 128 plus the signal.
 fn shell_status(line: &str) -> Option<i32> {
@@ -2088,7 +2091,7 @@ fn interactive_qemu(
     mut cmd: Command,
     elf: &Path,
     stdin: Stdio,
-    feed: Option<Box<dyn FnOnce(std::process::ChildStdin, &std::sync::atomic::AtomicBool) + Send>>,
+    feed: Option<Feeder>,
     follow: bool,
     limit: Option<Duration>,
 ) -> Result<Option<i32>, String> {
