@@ -28,6 +28,7 @@ mod owner_lifetime;
 mod service_sample;
 
 mod disasm;
+mod nano_dialog;
 mod entropy;
 mod image;
 mod jobs;
@@ -767,7 +768,7 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 11] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 12] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -786,6 +787,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 11] = [
         POSIX_STACK_SIZE,
         &["ash-interactive", "utilities"],
     ),
+    ("nano", "nano", POSIX_STACK_SIZE, &["interactive"]),
     ("tty", "tty", TTY_STACK_SIZE, &[]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
@@ -1340,6 +1342,7 @@ commands:
             the shell ends the machine and gives its status)
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
+  nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
   coverage  compare POSIX.1-2024 XSH names with relibc and the POSIX startup archive
@@ -1548,6 +1551,7 @@ fn main() {
         Some("ash-shell") => ash_shell(),
         Some("ash-shell-exit") => ash_shell_exit(),
         Some("ash-dialog") => ash_dialog(),
+        Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
         Some("posix-tty-vz") => posix_tty_probe(true, false),
@@ -1937,6 +1941,21 @@ fn write_elf_image(
     }
     if let Some(licence) = &ready_licence {
         list.push((READY_LICENSE, licence.as_slice()));
+    }
+    // An image with nano (GPL-3.0-or-later) carries its licence, ncurses'
+    // (MIT) and where the exact sources are.
+    let nano_files = if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "nano"))
+    {
+        Some(nano_dialog::nano_terms()?)
+    } else {
+        None
+    };
+    if let Some((licence, ncurses, source)) = &nano_files {
+        list.push((NANO_LICENSE, licence.as_slice()));
+        list.push((NCURSES_LICENSE, ncurses.as_slice()));
+        list.push((NANO_SOURCE, source.as_bytes()));
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -2829,6 +2848,11 @@ const NOTICES: &str = "THIRD-PARTY-NOTICES";
 const BUSYBOX_LICENSE: &str = "BUSYBOX-LICENSE";
 const BUSYBOX_SOURCE: &str = "BUSYBOX-SOURCE";
 
+/// nano's and ncurses' licences and the note of their sources in an image.
+const NANO_LICENSE: &str = "NANO-LICENSE";
+const NCURSES_LICENSE: &str = "NCURSES-LICENSE";
+const NANO_SOURCE: &str = "NANO-SOURCE";
+
 /// The licence texts of the ready-made utilities in an image, and the symbol
 /// a BusyBox that holds them has.
 const READY_LICENSE: &str = "UTILITIES-LICENSE";
@@ -2907,6 +2931,7 @@ fn busybox_terms() -> Result<(Vec<u8>, String), String> {
 /// enough for every check that takes them.
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static NANO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 
 /// relibc built, once in a run of xtask.
 fn relibc() -> Result<(), String> {
@@ -2917,6 +2942,15 @@ fn relibc() -> Result<(), String> {
 fn busybox_build() -> Result<(), String> {
     once(&BUSYBOX_BUILT, (), || {
         run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))
+    })
+}
+
+/// ncurses and nano built (the object tests/nano links and the terminfo
+/// entries of the image), once in a run of xtask.
+fn nano_build() -> Result<(), String> {
+    once(&NANO_BUILT, (), || {
+        run_cmd(Command::new("python3").arg(root().join("tools/build-ncurses.py")))?;
+        run_cmd(Command::new("python3").arg(root().join("tools/build-nano.py")))
     })
 }
 
@@ -5953,6 +5987,7 @@ fn line_editing(run: &mut qemu::Run) -> Result<(), String> {
 fn ash_dialog() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
+    nano_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-ash-dialog.img",
@@ -5978,6 +6013,7 @@ fn ash_dialog() -> Result<(), String> {
         ("-rwxr-xr-x", links.clone(), "head", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "ls", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "mktemp", busybox.clone()),
+        ("-rwxr-xr-x", "1".to_string(), "nano", elf_size("nano")?),
         ("-rwxr-xr-x", links.clone(), "nc", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "sh", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "sleep", busybox.clone()),
@@ -6679,6 +6715,7 @@ fn tty_steps() -> Result<(), String> {
 fn ash_shell() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
+    nano_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-ash-dialog.img",
@@ -6699,6 +6736,7 @@ fn ash_shell() -> Result<(), String> {
 fn ash_shell_exit() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
+    nano_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-ash-dialog.img",
@@ -6902,6 +6940,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("busybox", busybox_probe),
         job("ash", ash_probe),
         job("ash-dialog", ash_dialog),
+        job("nano-dialog", nano_dialog::nano_dialog),
         job("ash-shell-exit", ash_shell_exit),
         job("ls", ls_probe),
         // One round of the benchmark under -icount: its rows are whole and
