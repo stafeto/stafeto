@@ -106,22 +106,28 @@ mod tests {
 
     #[test]
     fn skip_empty_stops_at_a_slot_in_use_and_at_the_limit() {
-        let mut cursor = Cursor::default();
-        cursor.remaining = 10;
+        let mut cursor = Cursor {
+            remaining: 10,
+            ..Cursor::default()
+        };
         // Slots 1 to 4 are empty, 5 is in use.
         assert_eq!(cursor.skip_empty(20, 160, |i| i < 5), 4);
         assert_eq!((cursor.position, cursor.remaining), (5, 6));
         // The limit ends a run of empty slots early.
-        let mut cursor = Cursor::default();
-        cursor.remaining = 10;
+        let mut cursor = Cursor {
+            remaining: 10,
+            ..Cursor::default()
+        };
         assert_eq!(cursor.skip_empty(20, 3, |_| true), 3);
         assert_eq!((cursor.position, cursor.remaining), (4, 7));
     }
 
     #[test]
     fn skip_empty_leaves_the_last_step_of_the_round() {
-        let mut cursor = Cursor::default();
-        cursor.remaining = 3;
+        let mut cursor = Cursor {
+            remaining: 3,
+            ..Cursor::default()
+        };
         assert_eq!(cursor.skip_empty(20, 160, |_| true), 2);
         assert_eq!(cursor.remaining, 1);
         assert_eq!(cursor.skip_empty(20, 160, |_| true), 0);
@@ -132,9 +138,10 @@ mod tests {
 
     #[test]
     fn skip_empty_wraps_past_the_last_slot() {
-        let mut cursor = Cursor::default();
-        cursor.position = 19;
-        cursor.remaining = 10;
+        let mut cursor = Cursor {
+            position: 19,
+            remaining: 10,
+        };
         assert_eq!(cursor.skip_empty(20, 2, |_| true), 2);
         assert_eq!(cursor.position, 2);
     }
