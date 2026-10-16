@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# ncurses and the terminfo entries the image holds.
+# Format: docs/packages.md.
+
+name = "ncurses"
+version = "6.6"
+kind = "addon"
+url = "https://ftp.gnu.org/gnu/ncurses/ncurses-6.6.tar.gz"
+sha256 = "355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11"
+license = "MIT"
+depends = ["busybox"]
+build = "tools/build-ncurses.py"
+dirs = [
+  "/usr",
+  "/usr/share",
+  "/usr/share/terminfo",
+  "/usr/share/terminfo/l",
+  "/usr/share/terminfo/v",
+  "/usr/share/terminfo/x",
+]
+files = [
+  # The terminal of the programs that draw on the console.
+  "/etc/profile = bytes:profile",
+  "/usr/share/terminfo/l/linux = terminfo:linux",
+  "/usr/share/terminfo/v/vt100 = terminfo:vt100",
+  "/usr/share/terminfo/x/xterm = terminfo:xterm",
+  "/usr/share/terminfo/x/xterm-256color = terminfo:xterm-256color",
+]

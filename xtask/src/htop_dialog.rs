@@ -10,14 +10,14 @@ use super::*;
 
 /// The version `tools/build-htop.py` builds.
 fn version() -> Result<String, String> {
-    script_value("tools/build-htop.py", "VERSION")
+    packages::value("htop", "version")
 }
 
 /// htop's licence text and the note of its copyright and of the exact source
 /// of the program in the image.
 pub fn htop_terms() -> Result<(Vec<u8>, String), String> {
     let version = version()?;
-    let sha256 = script_value("tools/build-htop.py", "SHA256")?;
+    let sha256 = packages::value("htop", "sha256")?;
     let path = target_dir().join(format!("htop/htop-{version}/COPYING"));
     let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
@@ -65,11 +65,7 @@ pub fn htop_dialog() -> Result<(), String> {
     busybox_build()?;
     nano_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(
-        "boot-ash-dialog.img",
-        &ASH_INTERACTIVE_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
+    let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
     image_has_htop_terms(&image)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);

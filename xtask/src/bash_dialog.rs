@@ -260,14 +260,10 @@ pub fn bash_dialog() -> Result<(), String> {
     bash_build()?;
     nano_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(
-        "boot-ash-dialog.img",
-        &ASH_INTERACTIVE_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
+    let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
     image_has_bash_terms(&image)?;
     // The entries of /bin: the table of the image lists them (rootfs.rs).
-    let bin_count = (rootfs::UTILITIES.len() + 7).to_string();
+    let bin_count = (rootfs::utilities() + 7).to_string();
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
@@ -331,11 +327,7 @@ pub fn bash_shell_exit() -> Result<(), String> {
     bash_build()?;
     nano_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(
-        "boot-ash-dialog.img",
-        &ASH_INTERACTIVE_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
+    let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
     let cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     let feed = Box::new(
         |mut pipe: std::process::ChildStdin, prompt: &std::sync::atomic::AtomicBool| {

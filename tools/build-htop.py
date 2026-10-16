@@ -28,12 +28,15 @@ import subprocess
 import tarfile
 from urllib.request import urlopen
 
+import pkgdesc
+
 import importlib.util
 
 
-VERSION = "3.5.3"
-SHA256 = "a8b164386494cb85bb255a415a3f5f80afe7a0c4491da5d113b3a0f951087e65"
-URL = f"https://github.com/htop-dev/htop/releases/download/{VERSION}/htop-{VERSION}.tar.xz"
+PACKAGE = pkgdesc.load("htop")
+VERSION = PACKAGE["version"]
+SHA256 = PACKAGE["sha256"]
+URL = PACKAGE["url"]
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "htop"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"

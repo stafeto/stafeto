@@ -210,100 +210,6 @@ fn devices() -> [RootFile; 5] {
     ]
 }
 
-/// The names of /bin that hold BusyBox (Ф10): the utilities of XCU that are
-/// programs (the other ten of the 112 are builtins of the shell, `sh` is
-/// listed with the shell) and the applets the probes use (`mktemp`, `nc`).
-pub const UTILITIES: [&str; 88] = [
-    "awk",
-    "basename",
-    "bc",
-    "cat",
-    "chgrp",
-    "chmod",
-    "chown",
-    "cksum",
-    "cmp",
-    "comm",
-    "compress",
-    "cp",
-    "crontab",
-    "cut",
-    "date",
-    "dd",
-    "df",
-    "diff",
-    "dirname",
-    "du",
-    "echo",
-    "ed",
-    "env",
-    "expand",
-    "expr",
-    "false",
-    "file",
-    "find",
-    "fold",
-    "getconf",
-    "grep",
-    "head",
-    "iconv",
-    "id",
-    "join",
-    "kill",
-    "ln",
-    "logger",
-    "login-probe",
-    "logname",
-    "ls",
-    "mesg",
-    "mkdir",
-    "mkfifo",
-    "mktemp",
-    "mv",
-    "nc",
-    "nice",
-    "nohup",
-    "od",
-    "paste",
-    "patch",
-    "pathchk",
-    "printf",
-    "ps",
-    "pwd",
-    "readlink",
-    "realpath",
-    "renice",
-    "resize",
-    "rm",
-    "rmdir",
-    "sed",
-    "sleep",
-    "sort",
-    "split",
-    "strings",
-    "stty",
-    "tail",
-    "tee",
-    "test",
-    "time",
-    "timeout",
-    "top",
-    "touch",
-    "tr",
-    "true",
-    "tsort",
-    "tty",
-    "uname",
-    "uncompress",
-    "unexpand",
-    "uniq",
-    "uudecode",
-    "uuencode",
-    "wc",
-    "xargs",
-    "zcat",
-];
-
 /// The user accounting file of the dialog's image: one record of relibc's
 /// struct utmpx (96 bytes: user 32, id 4, line 32, pid 4, type 2, padding
 /// to 8, the time as two 64-bit words): USER_PROCESS, "user" on the line
@@ -333,28 +239,93 @@ static UTMPX: [u8; 96] = {
     record
 };
 
-/// The shell's image: BusyBox with its applet names (the shell, `ash`,
-/// among them) as hard links, and the service as a set-user-ID file of
-/// another owner.
+/// The files the base system owns in the shell image (init and the
+/// services): their directories, the RAM service and the files of the
+/// accounts and the device nodes. Every other file belongs to a package.
+const SYSTEM_PATHS: [&str; 16] = [
+    "/bin",
+    "/bin/ramfs",
+    "/dev",
+    "/proc",
+    "/var",
+    "/var/log",
+    "/var/run",
+    "/var/mail",
+    "/var/spool",
+    "/var/spool/at",
+    "/var/spool/lp",
+    "/var/run/utmpx",
+    "/etc",
+    "/etc/mtab",
+    "/etc/passwd",
+    "/etc/group",
+];
+
+/// Whether the base system owns `path`: the paths above and the device
+/// nodes below /dev.
+fn is_system(path: &str) -> bool {
+    SYSTEM_PATHS.contains(&path) || path.starts_with("/dev/")
+}
+
+/// The bytes of the files that packages name as `bytes:<name>`.
+fn named_bytes(name: &str) -> Result<&'static [u8], String> {
+    match name {
+        "inputrc" => Ok(INPUTRC),
+        "profile" => Ok(b"export TERM=xterm-256color\n"),
+        other => Err(format!("no bytes are named {other}")),
+    }
+}
+
+/// The directories and files of `packages`, with the owner root.
+pub fn package_files(packages: &[crate::packages::Package]) -> Result<Vec<RootFile>, String> {
+    fn leak(text: &str) -> &'static str {
+        Box::leak(text.to_owned().into_boxed_str())
+    }
+    let mut files = Vec::new();
+    for package in packages {
+        files.extend(package.dirs.iter().map(|d| dir(leak(d))));
+        for (path, from) in &package.files {
+            let (kind, name) = from
+                .split_once(':')
+                .ok_or(format!("{from}: no source kind"))?;
+            files.push(match kind {
+                "elf" => file(leak(path), 0o755, ROOT, leak(name)),
+                "terminfo" => of(leak(path), 0o644, ROOT, Source::Terminfo(leak(name))),
+                "bytes" => of(
+                    leak(path),
+                    0o644,
+                    ROOT,
+                    Source::Bytes(leak(name), named_bytes(name)?),
+                ),
+                other => return Err(format!("{from}: {other} is no source kind")),
+            });
+        }
+    }
+    Ok(files)
+}
+
+/// How many names of /bin beyond `ash`, `sh` and `busybox` hold the BusyBox
+/// program in the shell image: the utilities of the packages that BusyBox
+/// carries.
+pub fn utilities() -> usize {
+    files_of("boot-ash-dialog.img")
+        .iter()
+        .filter(|f| f.source == Some(Source::Elf("busybox-probe")))
+        .count()
+        - 3
+}
+
+/// The shell's image: the base system (the RAM service, its directories and
+/// files) and the files of the packages in `packages/`: BusyBox with its
+/// applet names (the shell, `ash`, among them) as hard links, and the
+/// add-ons. The service is a set-user-ID file of another owner.
 fn dialog() -> Vec<RootFile> {
+    shell_files().unwrap_or_else(|e| panic!("the shell image: {e}"))
+}
+
+fn shell_files() -> Result<Vec<RootFile>, String> {
     let mut files = vec![
         dir("/bin"),
-        file("/bin/ash", 0o755, ROOT, "busybox-probe"),
-        // The shell of `system`, `popen` and `wordexp`.
-        file("/bin/sh", 0o755, ROOT, "busybox-probe"),
-        file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
-        // GNU nano (tools/build-nano.py).
-        file("/bin/nano", 0o755, ROOT, "nano"),
-        // GNU bash beside ash (tools/build-bash.py); `sh` stays ash.
-        file("/bin/bash", 0o755, ROOT, "bash"),
-        // htop (tools/build-htop.py).
-        file("/bin/htop", 0o755, ROOT, "htop"),
-    ];
-    files.extend(UTILITIES.iter().map(|name| {
-        let path: &'static str = Box::leak(format!("/bin/{name}").into_boxed_str());
-        file(path, 0o755, ROOT, "busybox-probe")
-    }));
-    files.extend([
         file("/bin/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
         dir("/proc"),
@@ -377,60 +348,124 @@ fn dialog() -> Vec<RootFile> {
             ROOT,
             Source::Bytes("utmpx", &UTMPX),
         ),
-        // The keys of bash's line editor (readline reads /etc/inputrc): the
-        // sequences of the console terminal that the editor takes for
-        // Home, End and Delete when the terminal's name is not known.
-        of(
-            "/etc/inputrc",
-            0o644,
-            ROOT,
-            Source::Bytes("inputrc", INPUTRC),
-        ),
-    ]);
-    // The terminfo entries of ncurses' database that the image holds
-    // (tools/build-ncurses.py), where the library looks.
-    files.extend([
-        // The terminal of the programs that draw on the console (ncurses
-        // reads its entry from /usr/share/terminfo): an xterm-compatible one.
-        of(
-            "/etc/profile",
-            0o644,
-            ROOT,
-            Source::Bytes("profile", b"export TERM=xterm-256color\n"),
-        ),
-        dir("/usr"),
-        dir("/usr/share"),
-        dir("/usr/share/terminfo"),
-        dir("/usr/share/terminfo/l"),
-        dir("/usr/share/terminfo/v"),
-        dir("/usr/share/terminfo/x"),
-        of(
-            "/usr/share/terminfo/l/linux",
-            0o644,
-            ROOT,
-            Source::Terminfo("linux"),
-        ),
-        of(
-            "/usr/share/terminfo/v/vt100",
-            0o644,
-            ROOT,
-            Source::Terminfo("vt100"),
-        ),
-        of(
-            "/usr/share/terminfo/x/xterm",
-            0o644,
-            ROOT,
-            Source::Terminfo("xterm"),
-        ),
-        of(
-            "/usr/share/terminfo/x/xterm-256color",
-            0o644,
-            ROOT,
-            Source::Terminfo("xterm-256color"),
-        ),
-    ]);
+    ];
+    files.extend(package_files(&crate::packages::of_image(
+        "boot-ash-dialog.img",
+    )?)?);
     files.extend(devices());
-    files
+    Ok(files)
+}
+
+/// Fails unless each file of the image `name` belongs to exactly one
+/// package or to the base system, and each file a package names is in the
+/// image. `files` is the list of the image.
+pub fn check_owners(
+    name: &str,
+    files: &[RootFile],
+    packages: &[crate::packages::Package],
+) -> Result<(), String> {
+    let mut wrong = Vec::new();
+    for f in files {
+        let owners: Vec<&str> = packages
+            .iter()
+            .filter(|p| {
+                p.files.iter().any(|(path, _)| path == f.path) || p.dirs.iter().any(|d| d == f.path)
+            })
+            .map(|p| p.name.as_str())
+            .chain(is_system(f.path).then_some("system"))
+            .collect();
+        if owners.len() != 1 {
+            wrong.push(format!("{} ({})", f.path, owners.join(", ")));
+        }
+    }
+    for p in packages {
+        for path in p.files.iter().map(|f| &f.0).chain(&p.dirs) {
+            if !files.iter().any(|f| f.path == path) {
+                wrong.push(format!("{path} of {} is not in the image", p.name));
+            }
+        }
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name}: files without exactly one owner: {}",
+            wrong.join("; ")
+        ))
+    }
+}
+
+/// The table of the packages of the image `name`: name, version, licence,
+/// kind, files and bytes, with `size` giving the bytes of a source. A
+/// source that several paths name (the hard links of BusyBox) counts once,
+/// for the first package that names it.
+pub fn package_table(
+    name: &str,
+    size: impl Fn(&Source) -> Result<u64, String>,
+) -> Result<String, String> {
+    let packages = crate::packages::of_image(name)?;
+    let files = files_of(name);
+    check_owners(name, &files, &packages)?;
+    let mut counted: Vec<Source> = Vec::new();
+    let mut rows = Vec::new();
+    let mut tally = |owns: &dyn Fn(&str) -> bool| -> Result<(usize, u64), String> {
+        let (mut count, mut bytes) = (0, 0);
+        for f in files.iter().filter(|f| owns(f.path)) {
+            let Some(source) = f.source else { continue };
+            count += 1;
+            if !counted.contains(&source) {
+                counted.push(source);
+                bytes += size(&source)?;
+            }
+        }
+        Ok((count, bytes))
+    };
+    for p in &packages {
+        let owns =
+            |path: &str| p.files.iter().any(|(f, _)| f == path) || p.dirs.iter().any(|d| d == path);
+        let (count, bytes) = tally(&owns)?;
+        let kind = if p.kind == crate::packages::Kind::Base {
+            "base"
+        } else {
+            "addon"
+        };
+        rows.push((
+            p.name.clone(),
+            p.version.clone(),
+            p.license.clone(),
+            kind,
+            count,
+            bytes,
+        ));
+    }
+    let (count, bytes) = tally(&|path| is_system(path))?;
+    rows.push((
+        "(system)".into(),
+        "-".into(),
+        "-".into(),
+        "system",
+        count,
+        bytes,
+    ));
+    let mut out = format!(
+        "{:<12} {:<14} {:<17} {:<7} {:>6} {:>10}\n",
+        "package", "version", "license", "kind", "files", "bytes"
+    );
+    for (name, version, license, kind, count, bytes) in &rows {
+        out +=
+            &format!("{name:<12} {version:<14} {license:<17} {kind:<7} {count:>6} {bytes:>10}\n");
+    }
+    let total: u64 = rows.iter().map(|r| r.5).sum();
+    out += &format!(
+        "{:<12} {:<14} {:<17} {:<7} {:>6} {:>10}\n",
+        "total",
+        "",
+        "",
+        "",
+        rows.iter().map(|r| r.4).sum::<usize>(),
+        total
+    );
+    Ok(out)
 }
 
 /// /etc/inputrc of the shell image.
@@ -1037,12 +1072,69 @@ mod tests {
         }
     }
 
+    /// Each file of the shell image has one owner; a file nobody owns, a
+    /// file two packages claim and a file a package lacks are refused.
+    #[test]
+    fn every_file_of_the_shell_image_has_one_owner() {
+        let image = "boot-ash-dialog.img";
+        let packages = crate::packages::of_image(image).unwrap();
+        let files = files_of(image);
+        check_owners(image, &files, &packages).unwrap();
+        // A file no package and no system path owns.
+        let mut stray = files_of(image);
+        stray.push(file("/bin/stray", 0o755, ROOT, "ramfs"));
+        let error = check_owners(image, &stray, &packages).unwrap_err();
+        assert!(error.contains("/bin/stray"), "{error}");
+        // A path two packages name.
+        let mut twice = packages.clone();
+        let path = twice[1].files[0].clone();
+        twice[2].files.push(path.clone());
+        let error = check_owners(image, &files, &twice).unwrap_err();
+        assert!(error.contains(&path.0), "{error}");
+        // A file a package names and the image lacks.
+        let mut lacking = packages.clone();
+        lacking[1]
+            .files
+            .push(("/bin/ghost".into(), "elf:busybox-probe".into()));
+        let error = check_owners(image, &files, &lacking).unwrap_err();
+        assert!(error.contains("/bin/ghost"), "{error}");
+        // A package that installs nothing leaves nothing to own: its row
+        // has no files.
+        assert!(packages.iter().all(|p| !p.files.is_empty()));
+    }
+
+    /// The table counts the BusyBox program once for its many names.
+    #[test]
+    fn the_table_counts_a_shared_program_once() {
+        let table = package_table("boot-ash-dialog.img", |source| {
+            Ok(match source {
+                Source::Elf("busybox-probe") => 1000,
+                Source::Elf(_) => 10,
+                _ => 1,
+            })
+        })
+        .unwrap();
+        let row = |name: &str| {
+            table
+                .lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("no row {name}: {table}"))
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(row("busybox").last().unwrap(), "1000");
+        assert_eq!(row("sbase").last().unwrap(), "0");
+        assert_eq!(row("nano").last().unwrap(), "10");
+    }
+
     #[test]
     fn every_list_names_programs_of_its_image() {
+        let shell = crate::shell_programs();
         let programs_of = |image: &str| -> Vec<&str> {
             let list: &[crate::ImageProgram] = match image {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
-                "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
+                "boot-ash-dialog.img" => shell,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-math.img" => &crate::POSIX_MATH_PROGRAMS,
                 "boot-posix-park.img" => &crate::POSIX_PARK_PROGRAMS,

@@ -41,6 +41,7 @@ mod native_scopes;
 mod native_stop_barrier_tests;
 mod openposix;
 mod ostest;
+mod packages;
 mod qemu;
 mod ring;
 mod rootfs;
@@ -768,10 +769,9 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
         &["ash-probe"],
     ),
 ];
-/// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
-/// through the process service and the loader, the way every child starts
-/// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 14] = [
+/// The programs of the shell image besides those of its packages: the
+/// services that start before the packages' programs.
+const SHELL_SERVICES: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -784,19 +784,50 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 14] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
+];
+/// The services after the programs of the packages.
+const SHELL_SERVICES_LAST: [ImageProgram; 3] = [
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
+];
+/// How the program a package names (`program` in packages/<name>.toml) is
+/// built for the image: its stack and the features of its crate.
+const PACKAGE_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "busybox-probe",
         POSIX_STACK_SIZE,
         &["ash-interactive", "utilities"],
     ),
-    ("nano", "nano", POSIX_STACK_SIZE, &["interactive"]),
     ("bash", "bash", POSIX_STACK_SIZE, &["interactive"]),
     ("htop", "htop", POSIX_STACK_SIZE, &["interactive", "procfs"]),
-    ("tty", "tty", TTY_STACK_SIZE, &[]),
-    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
-    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
+    ("nano", "nano", POSIX_STACK_SIZE, &["interactive"]),
 ];
+/// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
+/// through the process service and the loader, the way every child starts
+/// (5d); the files of /bin are BusyBox's applets build. The programs are
+/// the services and those of the packages of the shell image
+/// (packages/*.toml): the base set and the add-ons.
+fn shell_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(shell_program_list)
+}
+
+fn shell_program_list() -> Vec<ImageProgram> {
+    let packages = packages::of_image("boot-ash-dialog.img")
+        .unwrap_or_else(|e| panic!("the shell image: {e}"));
+    let mut programs = SHELL_SERVICES.to_vec();
+    for program in packages.iter().filter_map(|p| p.program.as_deref()) {
+        let entry = PACKAGE_PROGRAMS
+            .iter()
+            .find(|p| p.0 == program)
+            .unwrap_or_else(|| panic!("no build of the program {program} (PACKAGE_PROGRAMS)"));
+        programs.push(*entry);
+    }
+    programs.extend(SHELL_SERVICES_LAST);
+    programs
+}
 /// The probe of the terminal service (xtask tty): the PL011's driver, the
 /// service, which prints each new longest step, and the probe.
 const TTY_PROGRAMS: [ImageProgram; 4] = [
@@ -1347,6 +1378,9 @@ commands:
             the shell ends the machine and gives its status)
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
+  packages  check the package descriptions (packages/*.toml) and that every file
+            of the shell image has one owner; with `table` builds the image and
+            prints its packages with their sizes
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
@@ -1561,6 +1595,7 @@ fn main() {
         Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),
         Some("bash-dialog") => bash_dialog::bash_dialog(),
         Some("ash-dialog") => ash_dialog(),
+        Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),
         Some("ls") => ls_probe(),
@@ -2953,8 +2988,8 @@ fn script_value(script: &str, name: &str) -> Result<String, String> {
 fn busybox_terms() -> Result<(Vec<u8>, String), String> {
     let path = target_dir().join("busybox/source/LICENSE");
     let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let version = script_value("tools/build-busybox.py", "VERSION")?;
-    let sha256 = script_value("tools/build-busybox.py", "SHA256")?;
+    let version = packages::value("busybox", "version")?;
+    let sha256 = packages::value("busybox", "sha256")?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
     let source = format!(
         "busybox-probe holds BusyBox {version}.\n\
@@ -2975,8 +3010,8 @@ fn busybox_terms() -> Result<(Vec<u8>, String), String> {
 /// bash's licence and the note of its copyright and of the exact source of
 /// the program in the image.
 fn bash_terms() -> Result<(Vec<u8>, String), String> {
-    let version = script_value("tools/build-bash.py", "VERSION")?;
-    let sha256 = script_value("tools/build-bash.py", "SHA256")?;
+    let version = packages::value("bash", "version")?;
+    let sha256 = packages::value("bash", "sha256")?;
     let path = target_dir().join(format!("bash/bash-{version}/COPYING"));
     let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
@@ -3022,37 +3057,42 @@ fn image_has_bash_terms(path: &Path) -> Result<(), String> {
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static NANO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
-static BASH_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static PACKAGE_SCRIPTS_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
 
 /// relibc built, once in a run of xtask.
 fn relibc() -> Result<(), String> {
     once(&RELIBC_BUILT, (), build_relibc)
 }
 
-/// BusyBox built, once in a run of xtask.
+/// The scripts of the packages of `kind` run, each once in a run of xtask
+/// and in the order of the packages (a package after its dependencies).
+fn packages_built(kind: packages::Kind) -> Result<(), String> {
+    for package in packages::load()?.iter().filter(|p| p.kind == kind) {
+        once(&PACKAGE_SCRIPTS_BUILT, package.build.clone(), || {
+            run_cmd(Command::new("python3").arg(root().join(&package.build)))
+        })?;
+    }
+    Ok(())
+}
+
+/// BusyBox and the other packages of the base set built, once in a run of
+/// xtask.
 fn busybox_build() -> Result<(), String> {
-    once(&BUSYBOX_BUILT, (), || {
-        run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))
-    })
+    once(&BUSYBOX_BUILT, (), || packages_built(packages::Kind::Base))
 }
 
-/// ncurses, nano, htop and bash built (the objects tests/nano, tests/htop and
-/// tests/bash link, and the terminfo entries of the image), once in a run of
-/// xtask. The shell image holds all of them, so each dialog needs all.
+/// The add-on packages built (ncurses, nano, htop and bash: the objects
+/// tests/nano, tests/htop and tests/bash link, and the terminfo entries of
+/// the image), once in a run of xtask. The shell image holds all of them,
+/// so each dialog needs all.
 fn nano_build() -> Result<(), String> {
-    once(&NANO_BUILT, (), || {
-        bash_build()?;
-        run_cmd(Command::new("python3").arg(root().join("tools/build-ncurses.py")))?;
-        run_cmd(Command::new("python3").arg(root().join("tools/build-nano.py")))?;
-        run_cmd(Command::new("python3").arg(root().join("tools/build-htop.py")))
-    })
+    once(&NANO_BUILT, (), || packages_built(packages::Kind::Addon))
 }
 
-/// bash built (the object tests/bash links), once in a run of xtask.
+/// bash built (the object tests/bash links), once in a run of xtask. It is
+/// an add-on like the others, so this builds them all.
 fn bash_build() -> Result<(), String> {
-    once(&BASH_BUILT, (), || {
-        run_cmd(Command::new("python3").arg(root().join("tools/build-bash.py")))
-    })
+    nano_build()
 }
 
 fn build_relibc() -> Result<(), String> {
@@ -6182,19 +6222,34 @@ fn line_editing(run: &mut qemu::Run) -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask packages`: the check of the descriptions; with `table`, the
+/// shell image built and its packages printed with their sizes.
+fn packages_command(mode: Option<&str>) -> Result<(), String> {
+    packages::check()?;
+    match mode {
+        None => Ok(()),
+        Some("table") => {
+            relibc()?;
+            busybox_build()?;
+            nano_build()?;
+            build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
+            packages::table("boot-ash-dialog.img")
+        }
+        Some(other) => Err(format!("packages: unknown argument {other}")),
+    }
+}
+
 fn ash_dialog() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
     nano_build()?;
     bash_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(
-        "boot-ash-dialog.img",
-        &ASH_INTERACTIVE_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
+    let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
     image_has_ready_terms(&image)?;
     image_has_bash_terms(&image)?;
+    packages::check()?;
+    packages::table("boot-ash-dialog.img")?;
     // What `ls -l` shows of the files of /bin: the mode, the links and the
     // size of the ELF file of the program the file holds (rootfs.rs).
     let elf_size = |program: &str| -> Result<String, String> {
@@ -6205,7 +6260,7 @@ fn ash_dialog() -> Result<(), String> {
     let busybox = elf_size("busybox-probe")?;
     // One file of BusyBox under each of its names: ash, sh, busybox and
     // the utilities (rootfs.rs), all links of one file.
-    let links = (3 + rootfs::UTILITIES.len()).to_string();
+    let links = (3 + rootfs::utilities()).to_string();
     let bin_listing = [
         ("-rwxr-xr-x", links.clone(), "ash", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "busybox", busybox.clone()),
@@ -6224,7 +6279,7 @@ fn ash_dialog() -> Result<(), String> {
         ("-rwsr-x---", "1".to_string(), "ramfs", elf_size("ramfs")?),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
-    let bin_count = (bin_listing.len() + rootfs::UTILITIES.len() - 8).to_string();
+    let bin_count = (bin_listing.len() + rootfs::utilities() - 8).to_string();
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
@@ -6930,11 +6985,7 @@ fn ash_shell() -> Result<(), String> {
     nano_build()?;
     bash_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(
-        "boot-ash-dialog.img",
-        &ASH_INTERACTIVE_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
+    let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
     let cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     // The end of the shell ends the machine, and the command returns the
     // shell's status to the terminal of the host. The keys go to the machine
@@ -6963,11 +7014,7 @@ fn ash_shell_exit() -> Result<(), String> {
     nano_build()?;
     bash_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(
-        "boot-ash-dialog.img",
-        &ASH_INTERACTIVE_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
+    let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
     let cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     let feed = Box::new(
         |mut pipe: std::process::ChildStdin, prompt: &std::sync::atomic::AtomicBool| {
@@ -8946,6 +8993,9 @@ fn no_transport_probe() -> Result<(), String> {
 }
 
 fn ci(jobs: usize) -> Result<(), String> {
+    // The descriptions of the packages and the owners of the files of the
+    // shell image: cheap, so first.
+    packages::check()?;
     // First: the licence check and the C programs take relibc's build.
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/check-licenses.py")))?;

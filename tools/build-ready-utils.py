@@ -26,6 +26,8 @@ import subprocess
 import tarfile
 from urllib.request import urlopen
 
+import pkgdesc
+
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPAT = ROOT / "tools" / "ready-utils" / "compat"
@@ -35,21 +37,11 @@ COMPAT = ROOT / "tools" / "ready-utils" / "compat"
 BUSYBOX_COMPAT = ROOT / "tools" / "busybox" / "compat"
 
 # name: (archive URL, SHA-256 of the archive after gunzip (the tar stream, which
-# a server may compress differently), the licence file, its SPDX identifier)
+# a server may compress differently), the licence file, its SPDX identifier),
+# from the descriptions in packages/
 SOURCES = {
-    "sbase": (
-        "https://github.com/michaelforney/sbase/archive/"
-        "b30fb56804bfed69b45ef0e944d2e029e4d26258.tar.gz",
-        "cab64e700200548a081e7ef24d2a40b04b15eda4de4495f130d4c65d5fa9f401",
-        "LICENSE", "MIT"),
-    "toybox": (
-        "https://landley.net/toybox/downloads/toybox-0.8.15.tar.gz",
-        "323e8466849c40740ed1a061aa63260b72c6c4ab797858fedbd7028d256c28f9",
-        "LICENSE", "0BSD"),
-    "ncompress": (
-        "https://github.com/vapier/ncompress/archive/refs/tags/v5.0.tar.gz",
-        "976c267b1c1f3d2a6a66903142472184efd49b8691b07c50811b6599a449142b",
-        "UNLICENSE", "Unlicense"),
+    name: (d["url"], d["sha256"], d["license_file"], d["license"])
+    for name, d in ((n, pkgdesc.load(n)) for n in ("sbase", "toybox", "ncompress"))
 }
 # The applets: the program they come from and the name of its main.
 SBASE_APPLETS = ("getconf", "join", "pathchk")

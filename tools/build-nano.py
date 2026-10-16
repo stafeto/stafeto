@@ -25,12 +25,15 @@ import subprocess
 import tarfile
 from urllib.request import urlopen
 
+import pkgdesc
+
 import importlib.util
 
 
-VERSION = "9.2"
-SHA256 = "05ecb99247b782e8a5b3a25ed4101dd034b0236902f7449bc9795b717642f7e9"
-URL = f"https://ftp.gnu.org/gnu/nano/nano-{VERSION}.tar.xz"
+PACKAGE = pkgdesc.load("nano")
+VERSION = PACKAGE["version"]
+SHA256 = PACKAGE["sha256"]
+URL = PACKAGE["url"]
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "nano"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
