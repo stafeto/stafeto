@@ -4402,6 +4402,12 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// the 2 783 instructions of 0c13427a (3 478), 3 110 at cacfad79 with
 /// that close (10 % room), and 18 278 before it.
 ///
+/// `THREADS_READY_MAX` 12 768 -> 12 896 (F13, K1): the scheduler charges the
+/// stint of a thread to its process as the thread ends (one read of the
+/// counter and one addition), 12 892 measured; that is one tick for each of
+/// the 128 threads of the portion, the cost the CPU time of a process
+/// (`getrusage`, `times`) needs.
+///
 /// Rules for a guard that fires (the paths are deterministic under -icount,
 /// so a firing is no noise and a repeat does not clear it):
 /// 1. The commit that trips a guard either gives the path back or raises
@@ -4422,7 +4428,7 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    the next commit lowers the constant, so that a shorter path does not
 ///    turn into room for later growth.
 const NULL_MAX: u64 = 266;
-const THREADS_READY_MAX: u64 = 12_768;
+const THREADS_READY_MAX: u64 = 12_896;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
@@ -9690,7 +9696,7 @@ mod tests {
             THREADS_READY_MAX,
         )
         .unwrap_err();
-        assert!(error.contains("threads_ready=12776"), "{error}");
+        assert!(error.contains("threads_ready=12904"), "{error}");
         assert!(guard_margin("x", &NORMAL_BUILD_ROWS, &[0; 5], "none", 1).is_err());
     }
 
@@ -9718,7 +9724,7 @@ mod tests {
                 THREADS_READY_MAX,
                 THREADS_READY_KEEP
             ),
-            Some("lower THREADS_READY_MAX to 12643".to_owned())
+            Some("lower THREADS_READY_MAX to 12771".to_owned())
         );
         // S5 keeps 10 % above its measure: a measure 301 under the number
         // (room 301) asks for the measure plus 279, which leaves room 279.
